@@ -155,10 +155,36 @@ if (( ! fail )); then
     "EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64" \
     "EXIT_TASK_RESTORE_OWNER arch=x86_64 owner=replacement exiting_tid"
 
-  need_once "$NORM" "$L" \
-    "EXIT_TASK_USER_ENTERED role=disposable arch=x86_64" \
+  # ── U9-EXIT1 §6 — THE terminal-edge retirement ────────────────────────────────────
+  #
+  # Stage 200D-0B3 proved the BROAD pipeline: NR 16 reached the terminal broad-locked
+  # dispatcher, published a typed `CurrentTaskExited` disposition, and the in-lock consumer got
+  # the exiting task off the CPU before the epilogue committed a replacement frame. U9-EXIT1
+  # retires that edge, so every one of those markers is now REQUIRED ABSENT rather than reworded:
+  # a run still emitting them is a run whose exit still reached the acquisition this stage exists
+  # to remove, and no re-phrasing of the acceptance would make that a pass.
+  #
+  # Each retired assertion is replaced by the one that states the admission it used to forbid,
+  # below — the same discipline U9-REAP1 applied to its 21 NR-31 guards.
+  broad_enters=$(count_of "$NORM" "EXIT_TASK_BROAD_ENTER")
+  split_enters=$(count_of "$NORM" "EXIT_TASK_SPLIT_ENTER")
+  split_declines=$(count_of "$NORM" "EXIT_TASK_SPLIT_DECLINED")
+  claims=$(count_of "$NORM" "EXIT_TASK_CLAIM_RETIRED")
+  dispatches=$(count_of "$NORM" "EXIT_TASK_SYSCALL_DISPATCHED nr=16")
+  note "terminal edge: broad=$broad_enters split=$split_enters declined=$split_declines claims=$claims dispatches=$dispatches"
+  [[ "$broad_enters" == "0" ]] \
+    || die "[$L] NR 16 still reached the terminal broad dispatcher ($broad_enters entries)"
+  [[ "$split_enters" == "1" ]] \
+    || die "[$L] split-route entries != 1 (got $split_enters)"
+  [[ "$split_declines" == "0" ]] \
+    || die "[$L] the split route declined an admitted exit ($split_declines)"
+  [[ "$claims" == "1" ]] \
+    || die "[$L] exit claims retired != 1 (got $claims)"
+  [[ "$dispatches" == "1" ]] || die "[$L] NR16 dispatches != 1 (got $dispatches)"
+
+  # The retired broad pipeline, marker for marker. Its ABSENCE is the retirement.
+  need_absent "$NORM" "$L" \
     "EXIT_TASK_PREFLIGHT_OK" \
-    "EXIT_TASK_LIFECYCLE_TRANSITION" \
     "EXIT_TASK_DISPOSITION_PUBLISHED" \
     "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64" \
     "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64" \
@@ -167,83 +193,85 @@ if (( ! fail )); then
     "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64" \
     "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64" \
     "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64" \
+    "EXIT_TASK_SPLIT_FAILED_CLOSED" \
+    "EXIT_TASK_DUPLICATE_DEFERRAL"
+
+  need_once "$NORM" "$L" \
+    "EXIT_TASK_USER_ENTERED role=disposable arch=x86_64" \
+    "EXIT_TASK_SPLIT_ENTER" \
+    "EXIT_TASK_CLAIM_RETIRED" \
+    "EXIT_TASK_LIFECYCLE_TRANSITION" \
+    "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=exit_current_task_switch_required" \
+    "YARM_LOCK_SPLIT_DISPATCH arch=x86_64 nr=16 cpu=0 result=queue_advance_committed" \
     "EXIT_TASK_SURVIVOR_PROGRESS_OK"
-  [[ "$(count_of "$NORM" "EXIT_TASK_SYSCALL_DISPATCHED nr=16")" == "1" ]] \
-    || die "[$L] NR16 dispatches != 1"
 
-  # ── lock-state correctness, marker by marker ──────────────────────────────────────
-  # Every in-lock marker must say broad_lock=1 and every post-lock marker broad_lock=0. A
-  # marker carrying the wrong value is the exact defect this stage corrects, so each is
-  # checked as a WHOLE line rather than by name.
-  for m in "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64" \
-           "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64" \
-           "EXIT_TASK_ABSENCE_VALIDATED arch=x86_64" \
-           "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64"; do
-    rg -a -F "$m" "$NORM" | rg -a -q -F "broad_lock=1" \
-      || die "[$L] in-lock marker does not state broad_lock=1: $m"
-    rg -a -F "$m" "$NORM" | rg -a -q -F "broad_lock=0" \
-      && die "[$L] in-lock marker falsely claims broad_lock=0: $m"
-  done
-  for m in "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64" \
-           "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64" \
-           "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64"; do
-    rg -a -F "$m" "$NORM" | rg -a -q -F "broad_lock=0" \
-      || die "[$L] post-lock marker does not state broad_lock=0: $m"
-  done
-  # The drain marker must attest that ALL drains ran, not merely that a drain point exists.
-  rg -a -q -F "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64" "$NORM" \
-    && rg -a -F "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64" "$NORM" | rg -a -q -F "drains=all" \
-    || die "[$L] post-lock drain marker does not attest drains=all"
-  # Exactly one prepared owner, and it is a replacement or idle — never the exiting task.
-  [[ "$(count_of "$NORM" "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64")" == "1" ]] \
-    || die "[$L] prepared restore-owner attestations != 1"
-  rg -a -F "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64" "$NORM" \
-    | rg -a -q -e "owner=replacement" -e "owner=idle" \
-    || die "[$L] prepared restore owner is neither replacement nor idle"
-  # The epilogue owns exactly one depth clear.
-  [[ "$(count_of "$NORM" "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64")" == "1" ]] \
-    || die "[$L] common-epilogue ownership attestations != 1"
-  rg -a -F "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64" "$NORM" | rg -a -q -F "clears=1" \
-    || die "[$L] common-epilogue marker does not attest clears=1"
-  # The user return actually happened after the drains: the epilogue marker only fires once
-  # the iret frame has been committed on a path reached after the shared handler returned.
-  rg -a -F "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64" "$NORM" | rg -a -q -F "frame_committed=1" \
-    || die "[$L] common-epilogue marker does not attest the real frame commit"
+  # ── the exiting task's identity, read from the log rather than assumed ─────────────
+  EXITING_TID=$(rg -a -o -r '$1' "EXIT_TASK_SYSCALL_DISPATCHED nr=16 tid=([0-9]+)" "$NORM" | head -1)
+  [[ -n "$EXITING_TID" ]] || die "[$L] could not resolve the exiting tid"
+  note "exiting tid=$EXITING_TID"
+  # The claim retired is the SAME incarnation the syscall dispatched, not merely some exit.
+  rg -a -q -F "EXIT_TASK_CLAIM_RETIRED tid=$EXITING_TID " "$NORM" \
+    || die "[$L] the retired claim does not name the dispatched tid"
+  rg -a -q -F "EXIT_TASK_SPLIT_ENTER tid=$EXITING_TID " "$NORM" \
+    || die "[$L] the split edge does not name the dispatched tid"
 
-  # ── corrected semantic ordering of the whole chain ────────────────────────────────
+  # ── the exiting frame is never saved, and never returned through ───────────────────
+  # `captured=0` is the live form of §3's "do not save or later restore the exiting frame":
+  # the shared bridge skips the outgoing capture when this CPU carries an exit deferral.
+  rg -a -F "YARM_LOCK_SPLIT_DISPATCH arch=x86_64 nr=16 cpu=0 result=queue_advance_committed" "$NORM" \
+    | rg -a -q -F "captured=0" \
+    || die "[$L] the exiting frame was captured — §3 forbids saving it"
+  rg -a -F "YARM_LOCK_SPLIT_DISPATCH arch=x86_64 nr=16 cpu=0 result=queue_advance_committed" "$NORM" \
+    | rg -a -q -F "outgoing=$EXITING_TID" \
+    || die "[$L] the committed advance names a different outgoing task"
+
+  # ── the ONE queue advance, checked in the slice that belongs to this exit ──────────
   #
-  # DOCUMENTED DEVIATION from the proposed Stage 200D-0B3 list: ABSENCE_VALIDATED is required
-  # BEFORE the lock-release marker, not after the epilogue marker. Absence is identity work and
-  # is performed by the in-lock consumer, alongside the not-current check it belongs with.
-  # Emitting it from the epilogue would attest the exiting task's absence AFTER the replacement
-  # frame had already been committed — validating a precondition after acting on it. The source
-  # was not adjusted to fit the list; the list is adjusted to the real source path.
+  # The drain's own markers are SHARED with FutexWait and blocking recv, which fire hundreds of
+  # times before the exit. A whole-log ordering claim about them would be satisfied by somebody
+  # else's advance, so every claim below is made against the slice of the boot log that begins at
+  # the accepted exit.
+  SLICE="$LOGDIR/exit.after.log"
+  awk 'index($0,"EXIT_TASK_SYSCALL_DISPATCHED nr=16"){f=1} f' "$NORM" >"$SLICE"
+  [[ -s "$SLICE" ]] || die "[$L] could not slice the log at the accepted exit"
+
+  need_order "$SLICE" "$L" "EXIT_TASK_SYSCALL_DISPATCHED nr=16" "EXIT_TASK_LIFECYCLE_TRANSITION" \
+    "the dispatched exit precedes its lifecycle transition"
+  need_order "$SLICE" "$L" "EXIT_TASK_LIFECYCLE_TRANSITION" \
+    "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=exit_current_task_switch_required" \
+    "the transition precedes the queue-advance deferral it commits"
+  need_order "$SLICE" "$L" "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=exit_current_task_switch_required" \
+    "YARM_LOCK_SPLIT_DISPATCH arch=x86_64 nr=16 cpu=0 result=queue_advance_committed" \
+    "the deferral is published before the seam answers QueueAdvanceCommitted"
+  need_order "$SLICE" "$L" "YARM_LOCK_SPLIT_DISPATCH arch=x86_64 nr=16 cpu=0 result=queue_advance_committed" \
+    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed" \
+    "the committed advance skips the broad dispatch exactly once"
+  need_order "$SLICE" "$L" "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=publication_committed" \
+    "QUEUE_ADVANCING_DISPATCH_BEGIN cpu=0" \
+    "the EXISTING post-lock drain runs after the broad dispatch is skipped"
+  need_order "$SLICE" "$L" "QUEUE_ADVANCING_DISPATCH_BEGIN cpu=0" \
+    "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu=0" \
+    "the drain selects and installs an incoming task"
+  need_order "$SLICE" "$L" "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu=0" \
+    "QUEUE_ADVANCING_DISPATCH_DONE result=ok" \
+    "the drain completes"
+  need_order "$SLICE" "$L" "QUEUE_ADVANCING_DISPATCH_DONE result=ok" "EXIT_TASK_SURVIVOR_PROGRESS_OK" \
+    "a surviving task makes progress after the exit"
+  need_order "$SLICE" "$L" "EXIT_TASK_SURVIVOR_PROGRESS_OK" "EXIT_TASK_SYSTEM_HEALTH_OK" \
+    "terminal health is the last thing proven"
   need_order "$NORM" "$L" "EXIT_TASK_USER_ENTERED" "EXIT_TASK_SYSCALL_DISPATCHED nr=16" \
     "userspace entry precedes the syscall"
-  need_order "$NORM" "$L" "EXIT_TASK_SYSCALL_DISPATCHED nr=16" "EXIT_TASK_PREFLIGHT_OK" \
-    "dispatch precedes preflight"
-  need_order "$NORM" "$L" "EXIT_TASK_PREFLIGHT_OK" "EXIT_TASK_LIFECYCLE_TRANSITION" \
-    "preflight precedes the lifecycle transition"
-  need_order "$NORM" "$L" "EXIT_TASK_LIFECYCLE_TRANSITION" "EXIT_TASK_DISPOSITION_PUBLISHED" \
-    "teardown precedes the disposition"
-  need_order "$NORM" "$L" "EXIT_TASK_DISPOSITION_PUBLISHED" "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64" \
-    "the disposition is consumed after it is published, both under the broad lock"
-  need_order "$NORM" "$L" "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64" "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64" \
-    "identity is validated after consumption"
-  need_order "$NORM" "$L" "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64" "EXIT_TASK_ABSENCE_VALIDATED arch=x86_64" \
-    "full-identity absence follows the not-current check"
-  need_order "$NORM" "$L" "EXIT_TASK_ABSENCE_VALIDATED arch=x86_64" "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64" \
-    "the restore owner is prepared after absence is established"
-  need_order "$NORM" "$L" "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64" "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64" \
-    "owner preparation happens under the lock, the release is attested after"
-  need_order "$NORM" "$L" "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64" "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64" \
-    "the post-lock drains run after the broad lock is actually released"
-  need_order "$NORM" "$L" "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64" "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64" \
-    "the epilogue commits the user frame only after every drain completed"
-  need_order "$NORM" "$L" "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64" "EXIT_TASK_SURVIVOR_PROGRESS_OK" \
-    "a surviving task makes progress after the exit"
-  need_order "$NORM" "$L" "EXIT_TASK_SURVIVOR_PROGRESS_OK" "EXIT_TASK_SYSTEM_HEALTH_OK" \
-    "terminal health is the last thing proven"
+  need_order "$NORM" "$L" "EXIT_TASK_SPLIT_ENTER" "EXIT_TASK_SYSCALL_DISPATCHED nr=16" \
+    "the split edge is counted at the route's entry"
+
+  # ── the dead task is never reselected, and the advance lands on somebody else ──────
+  RESUMED=$(rg -a -o -r '$1' "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu=0 tid=([0-9]+)" "$SLICE" | head -1)
+  [[ -n "$RESUMED" ]] || die "[$L] the drain installed no incoming task"
+  note "advance resumed tid=$RESUMED (exiting tid=$EXITING_TID)"
+  [[ "$RESUMED" != "$EXITING_TID" ]] \
+    || die "[$L] the drain reselected the EXITING task"
+  rg -a -q -F "USER_CR3_PRE_IRET_CHECK tid=$EXITING_TID" "$SLICE" \
+    && die "[$L] a dead task was returned to userspace"
 
   # Single boot instance.
   launches=$(count_of "$CORE" "[info] qemu command:")
@@ -277,25 +305,29 @@ arch=x86_64
 syscall_nr=16
 user_entries=1
 accepted_exits=1
-dispositions_published=1
-dispositions_consumed=1
-consumer_inside_broad_lock=1
-consumer_side_effects_under_broad_lock=0
-broad_lock_release_after_consumer=1
-post_lock_drains_after_release=1
-actual_user_returns_after_drains=1
-normal_result_writes_to_old_frame=0
-old_frame_restores=0
+terminal_broad_dispatcher_entries=0
+split_route_entries=1
+split_route_declines=0
+exit_claims_retired=1
+dispositions_published=0
+dispositions_consumed=0
+consumer_inside_broad_lock=0
+queue_advance_deferrals_committed=1
+exiting_frames_captured=0
+broad_dispatch_skips_after_commit=1
+post_lock_drain_selections=1
+exiting_task_reselections=0
+dead_task_user_returns=0
 syscall_returns_after_accept=0
+old_frame_restores=0
 trap_depth_errors=0
 wrong_current_task=0
-exiting_task_reselections=0
-replacement_or_idle=1
-absence_validations=1
+survivor_progress=1
 system_health_completions=1
-duplicate_dispositions=0
+duplicate_deferrals=0
+split_failed_closed=0
 single_boot_failures=0
-false_ordering_markers_remaining=0
+retired_broad_pipeline_markers_remaining=0
 exact_commit=${SHA0}
 exact_tree=${TREE0}
 result=ok

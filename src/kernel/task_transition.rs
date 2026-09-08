@@ -62,6 +62,17 @@ pub(crate) enum TaskTransition {
     PreemptOutgoing,
     /// Exact rollback of a dispatch this transaction performed: `Running → Runnable`.
     RollbackDispatchedIncoming,
+    /// U9-RESIDUAL1 §3 — exact rollback of a preempt this transaction performed:
+    /// `Runnable → Running`. The mirror of [`Self::RollbackDispatchedIncoming`], and needed for
+    /// the same reason: the split Yield route writes `Running → Runnable` before it asks the
+    /// scheduler to re-enqueue the caller, and a refused re-enqueue must leave the world exactly
+    /// as it found it. Without a named inverse the only way back would be
+    /// [`Self::DispatchIncoming`], which has the right mechanics and the wrong meaning — it says
+    /// "the scheduler selected this task", which is not what happened.
+    ///
+    /// It is NOT a dispatch: it never runs from a selection, has no idle twin, and is reachable
+    /// only from a rollback whose forward half this same transaction performed.
+    RollbackPreemptOutgoing,
     /// The current task faults: `Running → Faulted`, and nothing else.
     FaultRunningCurrent,
     /// **Idle only.** The idle task ([`IDLE_TID`]) is made `current` by the rank-1 scheduler
@@ -87,7 +98,7 @@ impl TaskTransition {
     /// The single status this transition may be applied from.
     pub(crate) const fn expected_from(self) -> TaskStatus {
         match self {
-            Self::DispatchIncoming => TaskStatus::Runnable,
+            Self::DispatchIncoming | Self::RollbackPreemptOutgoing => TaskStatus::Runnable,
             Self::PreemptOutgoingIdle | Self::ContinueCurrentIdle => TaskStatus::Runnable,
             Self::ContinueCurrent
             | Self::PreemptOutgoing
@@ -100,9 +111,10 @@ impl TaskTransition {
     /// The status the task ends in.
     pub(crate) const fn resulting(self) -> TaskStatus {
         match self {
-            Self::DispatchIncoming | Self::ContinueCurrent | Self::RedispatchIdleAlreadyRunning => {
-                TaskStatus::Running
-            }
+            Self::DispatchIncoming
+            | Self::ContinueCurrent
+            | Self::RedispatchIdleAlreadyRunning
+            | Self::RollbackPreemptOutgoing => TaskStatus::Running,
             Self::PreemptOutgoing
             | Self::RollbackDispatchedIncoming
             | Self::PreemptOutgoingIdle
@@ -118,6 +130,7 @@ impl TaskTransition {
             Self::ContinueCurrent => "continue_current",
             Self::PreemptOutgoing => "preempt_outgoing",
             Self::RollbackDispatchedIncoming => "rollback_dispatched_incoming",
+            Self::RollbackPreemptOutgoing => "rollback_preempt_outgoing",
             Self::FaultRunningCurrent => "fault_running_current",
             Self::PreemptOutgoingIdle => "preempt_outgoing_idle",
             Self::ContinueCurrentIdle => "continue_current_idle",
@@ -213,6 +226,27 @@ pub(crate) fn apply_dispatch_transition(
             Some(idle) => apply_task_transition(tcbs, tid, None, idle).map_err(|_| first),
             None => Err(first),
         },
+    }
+}
+
+/// U9-DISPATCH-CPU1 §1 — read-only sibling of [`apply_dispatch_transition`], idle twin included.
+///
+/// [`task_transition_would_be_accepted`] answers for ONE transition; a dispatch mark also has an
+/// idle-only fallback, so asking only the primary question would reject the idle task and asking
+/// only the twin would admit an ordinary one. This mirrors the apply exactly, which is what lets
+/// the scheduler pick a candidate it KNOWS the mark will take — instead of dequeuing one, failing
+/// to mark it, and rolling the dequeue back.
+pub(crate) fn dispatch_transition_would_be_accepted(
+    tcbs: &[Option<ThreadControlBlock>],
+    tid: u64,
+    transition: TaskTransition,
+) -> bool {
+    if task_transition_would_be_accepted(tcbs, tid, None, transition).is_ok() {
+        return true;
+    }
+    match transition.idle_twin() {
+        Some(idle) => task_transition_would_be_accepted(tcbs, tid, None, idle).is_ok(),
+        None => false,
     }
 }
 

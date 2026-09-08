@@ -96,26 +96,21 @@ impl KernelState {
                 .flatten()
                 .find(|tcb| tcb.tid.0 == tid)
                 .ok_or(KernelError::TaskMissing)?;
-            if tcb.blocked_recv_state.take().is_some() {
-                crate::yarm_log!("IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=cancel", tid);
-            }
-            tcb.status = TaskStatus::Exited(code);
-            tcb.restart.token = Some(RestartToken(token));
-            // Canonical 199E-R1D: a dead task's asynchronously preempted register file is dead
-            // with it. Dropping the tag here makes the snapshot UNREACHABLE at the moment the
-            // task stops being resumable, so nothing can later restore a corpse's registers.
+            // U9-EXIT1 §4 — THE self-exit writes, delegated to the one body the split route's
+            // claim also runs. Canonical 199E-R1D's `async_preempted` clear moved with them; the
+            // order, the log line and the four fields are byte-for-byte what this closure always
+            // performed, and now neither route can drift from the other.
             //
-            // This is defence in depth rather than the primary guarantee: the tag is validated
-            // against the exact `{tid, asid, generation}` incarnation at every consumer, so a
-            // replacement task reusing the numeric TID would be refused even without this. It is
-            // cleared anyway, because "cannot match" and "is not there" are different strengths
-            // of the same claim and the cheaper one belongs at the point of death.
-            //
-            // Placed AFTER the status/restart writes on purpose: the Stage 199D-WA2B wake-owner
-            // census fingerprints each status assignment by its immediate neighbourhood, and
-            // this clear has no ordering requirement of its own — it runs in the same closure,
-            // under the same lock, before anything can observe the exit.
-            tcb.async_preempted = None;
+            // The status PRECONDITION stays a difference between the two routes, deliberately:
+            // `claim_self_exit_locked` admits `Running` and nothing else, because a split exit is
+            // a task's first terminal edge, while this path is also reached for a task some other
+            // owner has already moved. Sharing the writes does not share a precondition neither
+            // route wants the other's.
+            crate::kernel::boot::exit_claim::apply_self_exit_writes_locked(
+                tcb,
+                code,
+                RestartToken(token),
+            );
             Ok::<_, KernelError>(())
         })?;
         // Stage 173 (CAP-CNODE): default-off on-exit cap-revoke markers. Diagnostic
@@ -410,53 +405,82 @@ impl KernelState {
         Ok(())
     }
 
+    /// U9-REAP1 §3 — the broad NR31 owner, now a thin caller of THE reap transaction.
+    ///
+    /// Every step this used to perform inline — the rank-2 mark-dead, the two reply-record
+    /// sweeps, the waiter detach, the kernel-context release and the last-thread process teardown
+    /// — now lives in `syscall::reap_txn::run_reap_transaction`, which the split NR31 route drives
+    /// through its own owners. The order, the conditions and the no-allocation discipline are
+    /// therefore stated exactly once, and the two routes cannot diverge.
+    ///
+    /// Two things changed shape, and both are deliberate:
+    ///
+    /// * The status read and the status write are now ONE rank-2 acquisition (the claim). Under
+    ///   the broad lock that is indistinguishable from the split pair it replaces; off it, it is
+    ///   what makes the reap linearizable against restart, exit and a duplicate reap.
+    /// * A target that is ALREADY `Dead` loses the claim instead of re-running the cleanup. The
+    ///   syscall's return is unchanged (`Ok`), and the skipped work was a no-op sweep of records
+    ///   a previous reap had already retired — a duplicate reap now costs nothing and mutates
+    ///   nothing. The process-wide teardown is not lost with it: the last thread of a group to
+    ///   die always reaches the same last-thread rule through its own death path.
     pub fn reap_faulted_task_noalloc_cleanup(&mut self, tid: u64) -> Result<(), KernelError> {
-        let process_pid = self
-            .thread_group_id(tid)
-            .map(|group| group.0)
-            .ok_or(KernelError::TaskMissing)?;
+        use crate::kernel::boot::reap_claim::ReapRefusal;
+        use crate::kernel::syscall::reap_txn::{BroadReapOwners, run_reap_transaction};
+
         crate::yarm_log!("TASK_REAP_FAULTED_NOALLOC_CLEANUP_BEGIN target_tid={}", tid);
-        crate::yarm_log!(
-            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=mark_dead_clear_restart",
-            tid
-        );
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Dead;
-            tcb.restart.token = None;
-            Ok::<_, KernelError>(())
-        })?;
-        crate::yarm_log!(
-            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=reply_caps",
-            tid
-        );
-        // Stage 199A2B1: authoritative-identity reply-record cleanup at faulted reap.
-        let reap_identity = crate::kernel::boot::ReceiverWaiterIdentity::new(
-            crate::kernel::ipc::ThreadId(tid),
-            self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0)),
-        );
-        let _ = self.revoke_reply_caps_for_caller_identity(reap_identity);
-        let _ = self.revoke_reply_caps_for_replier_identity(reap_identity);
-        crate::yarm_log!(
-            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=ipc_waiters",
-            tid
-        );
-        self.clear_ipc_waiters_for_tid(tid);
-        crate::yarm_log!(
-            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=kernel_context",
-            tid
-        );
-        let _ = self.release_kernel_context(tid);
-        crate::yarm_log!(
-            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=process_cnode_noalloc",
-            tid
-        );
-        let _ = self.maybe_cleanup_process_cnode_for_pid_noalloc_reap(process_pid);
-        crate::yarm_log!("TASK_REAP_FAULTED_NOALLOC_CLEANUP_OK target_tid={}", tid);
-        Ok(())
+        let mut owners = BroadReapOwners { kernel: self };
+        match run_reap_transaction(&mut owners, tid) {
+            Ok(outcome) => {
+                crate::yarm_log!(
+                    "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=mark_dead_clear_restart",
+                    tid
+                );
+                crate::yarm_log!(
+                    "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=reply_caps caller={} replier={} links={}",
+                    tid,
+                    outcome.caller_reply_records_revoked,
+                    outcome.replier_reply_records_revoked,
+                    outcome.reverse_links_detached
+                );
+                crate::yarm_log!(
+                    "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=ipc_waiters settled={}",
+                    tid,
+                    outcome.orphaned_senders_settled
+                );
+                crate::yarm_log!(
+                    "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=kernel_context",
+                    tid
+                );
+                crate::yarm_log!(
+                    "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=process_cnode_noalloc reaped={} asids={} mappings={}",
+                    tid,
+                    u8::from(outcome.process_reaped),
+                    outcome.address_spaces_destroyed,
+                    outcome.transfer_mappings_unmapped
+                );
+                crate::yarm_log!("TASK_REAP_FAULTED_NOALLOC_CLEANUP_OK target_tid={}", tid);
+                Ok(())
+            }
+            // Already reaped, or never there: the base disposition for a target that is gone.
+            Err(refusal) if refusal.is_already_reaped() => {
+                crate::yarm_log!(
+                    "TASK_REAP_FAULTED_NOALLOC_CLEANUP_SKIPPED target_tid={} reason={}",
+                    tid,
+                    refusal.marker()
+                );
+                match refusal {
+                    ReapRefusal::TaskGone => Err(KernelError::TaskMissing),
+                    _ => Ok(()),
+                }
+            }
+            Err(refusal) => {
+                crate::yarm_log!(
+                    "TASK_REAP_FAULTED_NOALLOC_CLEANUP_REFUSED target_tid={} reason={} task_mutation=none",
+                    tid,
+                    refusal.marker()
+                );
+                Err(KernelError::WrongObject)
+            }
+        }
     }
 }

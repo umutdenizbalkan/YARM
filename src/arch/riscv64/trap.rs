@@ -48,6 +48,17 @@ pub enum RiscvIdleReason {
     /// from `BlockedIpcNoRunnable` because nothing is blocked — the task is gone — so the
     /// blocking-seam provenance token that branch requires is legitimately absent.
     ExitCurrentTaskNoRunnable,
+    /// U9-DISPATCH-CPU1 §2: a post-lock queue-advancing drain ended with NOTHING current because
+    /// its selection REFUSED — a stale/offline authority, a queue-neutral mark refusal, or every
+    /// runnable candidate refusing the mark.
+    ///
+    /// Deliberately distinct from all three above, because none of them is true here: the caller
+    /// is not blocked, it is not gone, and the runqueue is not necessarily empty. Idling is the
+    /// correct SETTLEMENT rather than a claim about the workload — `current` is empty, so there is
+    /// nothing to `sret` to — and it is recoverable, because the periodic timer re-dispatches this
+    /// CPU. Keeping it separate is what stops a refusal being read later as a real blocking or
+    /// exiting outcome; the genuine `Idle` selections keep their own reasons above.
+    QueueAdvanceNoIncoming,
 }
 
 /// Stage 197B: the explicit, typed result of the RISC-V shared trap-entry wrapper. It replaces the
@@ -703,6 +714,70 @@ pub fn handle_riscv_trap_entry_shared(
                 post_work_committed = true;
             }
             crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
+            crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted => {
+                // U9-TIMER1: the PREEMPTING tick, converted. Same contract as the shared bridge —
+                // one tick, ack, re-arm and the NR 0 deferral — so the broad dispatcher is skipped
+                // and the existing post-lock Yield drain performs the switch.
+                //
+                // THE ASYNC-PREEMPTION SNAPSHOT, and why the converted route has to take it.
+                //
+                // RISC-V names three mutually exclusive resume conventions (199E-R1D), and the
+                // third one is this stage's: FRESH/STARTUP takes `a0..a5` from the argument
+                // mirror; SYSCALL CONTINUATION takes the result lane; ASYNCHRONOUSLY PREEMPTED
+                // restores the integer register file verbatim and must NOT touch the mirror. The
+                // boundary reads that state from an EXPLICIT tag — `riscv_async_resume_take` — and
+                // never infers it.
+                //
+                // The tag is published by `snapshot_async_preempted_current`, which this bridge
+                // calls INSIDE the broad handler, at what its own comment calls the earliest
+                // correct point: strictly before the scheduler tick that can yield. The converted
+                // preempting timer runs entirely BEFORE that lock is taken, so on this route the
+                // broad snapshot never fires. Without a tag the write-back takes the STARTUP arm
+                // and installs the argument mirror — for a timer frame, all zeros — over a live
+                // computation, and forces `a7 = 0`.
+                //
+                // Measured on the RISC-V exit oracle, where the production quantum is 10
+                // interrupts and the preempting branch is therefore live at the DEFAULT cadence:
+                // the process manager was preempted mid-startup, resumed through the startup arm,
+                // and never re-entered its receive loop; init stalled forever waiting for a spawn
+                // reply. A plain `capture_outgoing_user_context_split` here is not the repair and
+                // is actively worse — it overwrites the syscall-argument lane the ordinary resume
+                // arms treat as authoritative, which is the defect 199E-R1D's mirror preservation
+                // exists to prevent.
+                //
+                // So this calls the SAME owner the broad path calls, through its rank-2 split
+                // twin, keyed on the exact identity the deferral names rather than on `current`,
+                // which the transaction has already cleared.
+                //
+                // The frame is the right one for an INTERRUPT: `advance` is `4` only for
+                // `EXC_USER_ECALL`, so `saved_pc` is the interrupted instruction, and all 31 GPRs
+                // were mirrored on entry.
+                //
+                // Gated on the frame actually carrying a user context. The S-mode-origin timer
+                // path (`riscv_s_mode_timer_trap`) builds a `TrapFrame::zeroed()` with only
+                // `saved_pc` set — it has no register file to save — and is reached only with
+                // `current` already cleared, so the transaction declines `NoCurrent` there and no
+                // snapshot is owed. `is_restorable` is the existing predicate for exactly this
+                // property, so a zeroed frame can never authorize a verbatim restore.
+                let outgoing = crate::kernel::boot::yield_dispatch_outgoing(cpu_idx);
+                let restorable = frame.capture_user_context().is_restorable();
+                let tagged = match (outgoing, restorable) {
+                    (Some(tid), true) => shared.snapshot_async_preempted_split(tid, frame),
+                    _ => false,
+                };
+                crate::yarm_log!(
+                    "TIMER_SPLIT_PREEMPT_ASYNC_TAGGED cpu={} outgoing={} tagged={} restorable={}",
+                    cpu.0,
+                    outgoing.unwrap_or(u64::MAX),
+                    u8::from(tagged),
+                    u8::from(restorable)
+                );
+                queue_advance_committed = true;
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=timer_preempt_committed",
+                    cpu.0
+                );
+            }
             other => {
                 crate::yarm_log!(
                     "TIMER_SPLIT_UNEXPECTED_DISPOSITION cpu={} value={:?}",
@@ -711,7 +786,7 @@ pub fn handle_riscv_trap_entry_shared(
                 );
                 debug_assert!(
                     false,
-                    "the timer route yields NotHandled or PostWorkCommitted"
+                    "the timer route yields NotHandled, PostWorkCommitted or QueueAdvanceCommitted"
                 );
             }
         }
@@ -807,6 +882,34 @@ pub fn handle_riscv_trap_entry_shared(
             // sstatus preserved, a0 from `set_ok`), and enqueues the child rather than
             // dispatching it, so the caller is still current when this trap returns.
             || nr == crate::kernel::syscall::SYSCALL_FORK_NR
+            // U9-REAP1 §4: ReapFaultedTask (NR 31). Same shape as the classes above — it neither
+            // blocks nor switches (the target was released by the scheduler at fault time, long
+            // before this call), so it finalizes through the same same-task ecall writeback
+            // (sepc+4 once, sstatus preserved, a0 from `set_ok`) and the calling PM is still
+            // current when this trap returns.
+            || nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
+            // U9-EXIT1 §5: ExitCurrentTask (NR 16). Unlike every other class on this list it is
+            // SWITCHING and never returns: it finalizes no frame, advances no sepc and writes no
+            // a0, because the task it belonged to is gone. Its queue advance is the existing
+            // deferral + drain, exactly as FutexWait's is.
+            || nr == crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR
+            // U9-RESIDUAL1 §3: Yield (NR 0). Same reason as every class above — the route is
+            // architecture-neutral but reachable here only for a listed NR, and without this line
+            // NR 0 would keep its terminal broad edge on this architecture no matter what the route
+            // admits. Its absence was measured, not assumed: three qualifying RISC-V boots showed
+            // `YIELD_SPLIT_COMMITTED = 0` AND `YIELD_SPLIT_REFUSED = 0` — the route was not
+            // declining, it was never being reached.
+            //
+            // It is SWITCHING, like NR 16 and NR 9: it finalizes the caller's own frame (a0 = 0
+            // from `set_ok`, with `sepc` already pre-advanced by this bridge) and then hands the
+            // CPU to the post-lock Yield drain, which performs the authoritative queue-advancing
+            // dispatch, the SATP activation and the incoming frame restore. That drain
+            // (`RISCV_YIELD_DISPATCH_*`, Stage 196G) has been live and default-on here since it
+            // landed, so what the class needs from this architecture it demonstrably has.
+            //
+            // Unlike NR 16, the caller IS resumed later, so its frame must be finalized — which is
+            // the same requirement FutexWait has, and it is met the same way.
+            || nr == crate::kernel::syscall::SYSCALL_YIELD_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -819,6 +922,11 @@ pub fn handle_riscv_trap_entry_shared(
         } else if nr == crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR
             || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
             || nr == crate::kernel::syscall::SYSCALL_FORK_NR
+            // U9-REAP1 §4/§6: NR 31 joins the per-invocation list for the same reason. §6 asserts
+            // that split NR 31 equals the successful-reap count, which a one-shot latch could not
+            // express: after the first reap the marker would stop, and three working reaps would
+            // look identical to one.
+            || nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
         {
             // U9-SPAWN-TXN3 §4/§6: NOT latched, deliberately.
             //
@@ -868,11 +976,38 @@ pub fn handle_riscv_trap_entry_shared(
             disposition,
             crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted
         ) {
+            //
+            // U9-RESIDUAL1 §3: the Yield deferral joins the chain, and it had to. This bridge does
+            // NOT call `finalize_split_handled_syscall` — RISC-V pre-advances `sepc` before this
+            // point, so THIS CAPTURE is the only thing that carries the advanced pc into the
+            // outgoing task's TCB. With NR 0 published on a deferral no accessor here read,
+            // `outgoing` was `None`, `captured=0`, and the yielding caller's saved context still
+            // named its own `ecall`; the drain's exact-token resume then re-entered at that `ecall`
+            // and the task yielded again, forever. Live: three yields and the boot made no further
+            // progress.
+            //
+            // That is the third time this exact chain has been the defect — FutexWait alone missed
+            // the blocking receive (199G-B §2) and the blocking send (199D-DW2) the same way — and
+            // it is why the shared x86_64/AArch64 bridge survives the same omission while this one
+            // does not: there `finalize_split_handled_syscall` commits the advanced PC separately,
+            // so the capture is the register file only. That bridge is deliberately left unchanged;
+            // its Yield path is proven live over 4096 yields per boot on both architectures.
             let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
-                .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx));
-            let captured = outgoing
-                .map(|t| shared.capture_outgoing_user_context_split(t, frame))
-                .unwrap_or(false);
+                .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx))
+                .or_else(|| crate::kernel::boot::yield_dispatch_outgoing(cpu_idx));
+            // U9-EXIT1 §3: never save the exiting frame. This capture exists so a task that will
+            // be RESUMED restarts at the right pc; an exiting task is never resumed, so capturing
+            // would at best be pointless and at worst record a corpse's registers into a TCB a
+            // later reap still reads.
+            let exiting = crate::kernel::boot::exit_queue_advance_pending(cpu_idx)
+                .is_some_and(|(et, _)| Some(et) == outgoing);
+            let captured = if exiting {
+                false
+            } else {
+                outgoing
+                    .map(|t| shared.capture_outgoing_user_context_split(t, frame))
+                    .unwrap_or(false)
+            };
             crate::yarm_log!(
                 "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu={} result=queue_advance_committed outgoing={} captured={}",
                 nr,
@@ -1190,8 +1325,41 @@ pub fn handle_riscv_trap_entry_shared(
         );
         if reverify_ok {
             // Queue-advancing dequeue of the FIFO head (the incoming task B).
-            let dispatch = shared.yield_dispatch_step_mut(cpu);
-            if let Some(inc) = dispatch.tid().map(|t| t.0) {
+            let acquired = shared.queue_advance_acquire_incoming_split(
+                trap_path.authority(),
+                "riscv_queue_switch_foundation_dispatch",
+                |k, a| k.yield_dispatch_step_mut(a),
+            );
+            // U9-DISPATCH-CPU1 §2 — the settlement, replacing U9-YIELD2 §3's clear-cell +
+            // `ReturnToCurrent`. That was insufficient, and `RefusedRolledBack` is why: undoing
+            // the incoming dequeue puts that task BACK on the runqueue and leaves NOTHING
+            // current, so "return to current" returned through a frame belonging to a task that
+            // was simultaneously queued. The obligation is to end this trap with a task running
+            // or with a genuinely idle CPU.
+            //
+            // A REFUSAL is settled HERE, with its own reason and its own idle provenance. The
+            // GENUINE `Idle` selection is left to the established idle tail below, unchanged — so
+            // a refusal never wears idle's name, and idle never loses its own.
+            if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                trap_path.retire();
+                dispatch_torn_fatal(cpu, tid, "riscv_queue_switch_foundation_dispatch");
+            }
+            if !matches!(acquired, crate::runtime::DispatchAcquire::Idle)
+                && acquired.token().is_none()
+            {
+                crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
+                crate::yarm_log!(
+                    "RISCV_QUEUE_SWITCH_FOUNDATION_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                    cpu.0,
+                    acquired.marker()
+                );
+                return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                    reason: RiscvIdleReason::QueueAdvanceNoIncoming,
+                });
+            }
+            if let Some(token) = acquired.token() {
+                let inc = token.tid();
+
                 crate::yarm_log!(
                     "RISCV_QUEUE_SWITCH_FOUNDATION_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
@@ -1202,41 +1370,13 @@ pub fn handle_riscv_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                // Stage 199D-WA3A-R2-SEAL (item E): exact `Runnable → Running` (or the
-                // queue-neutral `Running → Running`), with all five outcomes matched
-                // explicitly. A refusal has already undone exactly what the selection did, so
-                // this drain returns to the unchanged current — except `RefusedTorn`, which is
-                // fatal and must never return to userspace or continue scheduling.
-                let token = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                    Mark::Marked(token) => token,
-                    Mark::Idle => {
-                        crate::yarm_log!(
-                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
-                            cpu.0,
-                            inc
-                        );
-                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
-                    }
-                    Mark::RefusedRolledBack => {
-                        crate::yarm_log!(
-                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_dequeue_undone",
-                            cpu.0,
-                            inc
-                        );
-                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
-                    }
-                    Mark::RefusedNoSchedulerChange => {
-                        crate::yarm_log!(
-                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_scheduler_untouched",
-                            cpu.0,
-                            inc
-                        );
-                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
-                    }
-                    Mark::RefusedTorn => {
-                        dispatch_torn_fatal(cpu, inc, "riscv_queue_switch_foundation_dispatch")
-                    }
-                };
+                // U9-DISPATCH-CPU1 §2: the exact `Runnable → Running` mark now runs inside
+                // `queue_advance_acquire_incoming_split`, which owns all five WA3A outcomes and
+                // hands back only the two this drain can act on — a resumable token, or a
+                // settlement. The transition itself, its provenance and its exact inverse are
+                // unchanged; what moved is where they are matched.
+                //
+
                 crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}", inc);
                 // U3 (canonical 203C): the EXACT-TOKEN resume transaction — real
                 // `map_kernel_shared_into_asid` + page-table root + `write_satp` (which issues
@@ -1313,7 +1453,7 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_REVERIFY_OK tid={}", out);
             }
             crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
-            let dispatch = shared.d2_send_dispatch_step_mut(cpu);
+            let dispatch = shared.d2_send_dispatch_step_mut(trap_path.authority());
             // All five WA3A outcomes matched explicitly, each with its own evidence.
             let marked = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
                 Mark::Marked(token) => Some(token),
@@ -1418,7 +1558,7 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid={}", out);
             }
             crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
-            let dispatch = shared.d2_recv_dispatch_step_mut(cpu);
+            let dispatch = shared.d2_recv_dispatch_step_mut(trap_path.authority());
             // All five WA3A outcomes matched explicitly, each with its own evidence.
             // 199E-R1(A): only a CLEAN idle outcome may publish return provenance. The two
             // refusal outcomes below also produce `None`, and they are errors — they must
@@ -1562,7 +1702,12 @@ pub fn handle_riscv_trap_entry_shared(
         // above — a still-held guard would deadlock) AND confirms the waiter is still
         // `Blocked(Futex)` (guards against a FutexWake race before dispatch).
         let reverify_ok = outgoing
-            .map(|t| shared.futex_wait_reverify_blocked(t))
+            // U9-EXIT1 §3: the third admitted outgoing state, verified by its own predicate.
+            .map(|t| {
+                shared.futex_wait_reverify_blocked(t)
+                    || crate::kernel::boot::exit_queue_advance_pending(cpu_idx)
+                        .is_some_and(|(et, _)| et == t && shared.exit_reverify_ok(t))
+            })
             .unwrap_or(false);
         crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_LOCK_DROPPED_OK cpu={}", cpu.0);
         if reverify_ok {
@@ -1570,8 +1715,41 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}", out);
             }
             // Queue-advancing dequeue of the FIFO head (the incoming task B).
-            let dispatch = shared.futex_wait_dispatch_step_mut(cpu);
-            if let Some(inc) = dispatch.tid().map(|t| t.0) {
+            let acquired = shared.queue_advance_acquire_incoming_split(
+                trap_path.authority(),
+                "riscv_futex_wait_dispatch",
+                |k, a| k.futex_wait_dispatch_step_mut(a),
+            );
+            // U9-DISPATCH-CPU1 §2 — the settlement, replacing U9-YIELD2 §3's clear-cell +
+            // `ReturnToCurrent`. That was insufficient, and `RefusedRolledBack` is why: undoing
+            // the incoming dequeue puts that task BACK on the runqueue and leaves NOTHING
+            // current, so "return to current" returned through a frame belonging to a task that
+            // was simultaneously queued. The obligation is to end this trap with a task running
+            // or with a genuinely idle CPU.
+            //
+            // A REFUSAL is settled HERE, with its own reason and its own idle provenance. The
+            // GENUINE `Idle` selection is left to the established idle tail below, unchanged — so
+            // a refusal never wears idle's name, and idle never loses its own.
+            if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                trap_path.retire();
+                dispatch_torn_fatal(cpu, tid, "riscv_futex_wait_dispatch");
+            }
+            if !matches!(acquired, crate::runtime::DispatchAcquire::Idle)
+                && acquired.token().is_none()
+            {
+                crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                crate::yarm_log!(
+                    "RISCV_FUTEX_WAIT_DISPATCH_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                    cpu.0,
+                    acquired.marker()
+                );
+                return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                    reason: RiscvIdleReason::QueueAdvanceNoIncoming,
+                });
+            }
+            if let Some(token) = acquired.token() {
+                let inc = token.tid();
+
                 crate::yarm_log!(
                     "RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
@@ -1582,39 +1760,12 @@ pub fn handle_riscv_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                // Stage 199D-WA3A-R2-SEAL (item E): exact `Runnable → Running` (or the
-                // queue-neutral `Running → Running`), with all five outcomes matched
-                // explicitly. A refusal has already undone exactly what the selection did, so
-                // this drain returns to the unchanged current — except `RefusedTorn`, which is
-                // fatal and must never return to userspace or continue scheduling.
-                let token = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                    Mark::Marked(token) => token,
-                    Mark::Idle => {
-                        crate::yarm_log!(
-                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
-                            cpu.0,
-                            inc
-                        );
-                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
-                    }
-                    Mark::RefusedRolledBack => {
-                        crate::yarm_log!(
-                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_dequeue_undone",
-                            cpu.0,
-                            inc
-                        );
-                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
-                    }
-                    Mark::RefusedNoSchedulerChange => {
-                        crate::yarm_log!(
-                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_scheduler_untouched",
-                            cpu.0,
-                            inc
-                        );
-                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
-                    }
-                    Mark::RefusedTorn => dispatch_torn_fatal(cpu, inc, "riscv_futex_wait_dispatch"),
-                };
+                // U9-DISPATCH-CPU1 §2: the exact `Runnable → Running` mark now runs inside
+                // `queue_advance_acquire_incoming_split`, which owns all five WA3A outcomes and
+                // hands back only the two this drain can act on — a resumable token, or a
+                // settlement. The transition itself, its provenance and its exact inverse are
+                // unchanged; what moved is where they are matched.
+
                 crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming={}", inc);
                 // U3 (canonical 203C): the EXACT-TOKEN resume transaction — real
                 // `map_kernel_shared_into_asid` + page-table root + `write_satp` (which issues
@@ -1748,8 +1899,41 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_REVERIFY_OK outgoing={}", out);
             }
             // Queue-advancing dequeue of the FIFO head.
-            let dispatch = shared.yield_dispatch_step_mut(cpu);
-            if let Some(inc) = dispatch.tid().map(|t| t.0) {
+            let acquired = shared.queue_advance_acquire_incoming_split(
+                trap_path.authority(),
+                "riscv_yield_dispatch",
+                |k, a| k.yield_dispatch_step_mut(a),
+            );
+            // U9-DISPATCH-CPU1 §2 — the settlement, replacing U9-YIELD2 §3's clear-cell +
+            // `ReturnToCurrent`. That was insufficient, and `RefusedRolledBack` is why: undoing
+            // the incoming dequeue puts that task BACK on the runqueue and leaves NOTHING
+            // current, so "return to current" returned through a frame belonging to a task that
+            // was simultaneously queued. The obligation is to end this trap with a task running
+            // or with a genuinely idle CPU.
+            //
+            // A REFUSAL is settled HERE, with its own reason and its own idle provenance. The
+            // GENUINE `Idle` selection is left to the established idle tail below, unchanged — so
+            // a refusal never wears idle's name, and idle never loses its own.
+            if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                trap_path.retire();
+                dispatch_torn_fatal(cpu, tid, "riscv_yield_dispatch");
+            }
+            if !matches!(acquired, crate::runtime::DispatchAcquire::Idle)
+                && acquired.token().is_none()
+            {
+                crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                crate::yarm_log!(
+                    "RISCV_YIELD_DISPATCH_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                    cpu.0,
+                    acquired.marker()
+                );
+                return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                    reason: RiscvIdleReason::QueueAdvanceNoIncoming,
+                });
+            }
+            if let Some(token) = acquired.token() {
+                let inc = token.tid();
+
                 crate::yarm_log!(
                     "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
@@ -1760,39 +1944,12 @@ pub fn handle_riscv_trap_entry_shared(
                     cpu.0,
                     inc
                 );
-                // Stage 199D-WA3A-R2-SEAL (item E): exact `Runnable → Running` (or the
-                // queue-neutral `Running → Running`), with all five outcomes matched
-                // explicitly. A refusal has already undone exactly what the selection did, so
-                // this drain returns to the unchanged current — except `RefusedTorn`, which is
-                // fatal and must never return to userspace or continue scheduling.
-                let token = match shared.d6_genuine_mark_running_via_task_seam(dispatch) {
-                    Mark::Marked(token) => token,
-                    Mark::Idle => {
-                        crate::yarm_log!(
-                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=idle",
-                            cpu.0,
-                            inc
-                        );
-                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
-                    }
-                    Mark::RefusedRolledBack => {
-                        crate::yarm_log!(
-                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_dequeue_undone",
-                            cpu.0,
-                            inc
-                        );
-                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
-                    }
-                    Mark::RefusedNoSchedulerChange => {
-                        crate::yarm_log!(
-                            "RISCV_DISPATCH_DECLINED cpu={} incoming={} reason=refused_scheduler_untouched",
-                            cpu.0,
-                            inc
-                        );
-                        return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
-                    }
-                    Mark::RefusedTorn => dispatch_torn_fatal(cpu, inc, "riscv_yield_dispatch"),
-                };
+                // U9-DISPATCH-CPU1 §2: the exact `Runnable → Running` mark now runs inside
+                // `queue_advance_acquire_incoming_split`, which owns all five WA3A outcomes and
+                // hands back only the two this drain can act on — a resumable token, or a
+                // settlement. The transition itself, its provenance and its exact inverse are
+                // unchanged; what moved is where they are matched.
+
                 crate::yarm_log!("RISCV_YIELD_DISPATCH_RUNNING_OK incoming={}", inc);
                 // U3 (canonical 203C): the EXACT-TOKEN resume transaction — real
                 // `map_kernel_shared_into_asid` + page-table root + `write_satp` (which issues

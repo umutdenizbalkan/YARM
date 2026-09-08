@@ -13233,3 +13233,2676 @@ RISC-V, at base or now, and its isolation witness is intact in every run.
 The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
 their other residual classes, so ***U9 remains OPEN***: this increment empties the AArch64 write-COW
 population that reached them, it does not delete them.
+
+## U9-REAP1 — ReapFaultedTask (NR31)
+
+### §1 — the reap closure, and where a real witness lives
+
+`handle_reap_faulted_task` (`src/kernel/syscall/process.rs`) is a five-gate preamble in front of
+one cleanup owner. It authorizes on `caller == PM_BOOTSTRAP_TID` (`MissingRight`), refuses
+self-targeting (`InvalidArgs`), returns `Ok(0,0,0)` with `TASK_REAP_FAULTED_ALREADY_GONE` when the
+TID names no TCB, rejects `Runnable | Running | Blocked(_) | Reserved` (`WrongObject`), and only
+then calls `reap_faulted_task_noalloc_cleanup`. Everything before the cleanup is pre-mutation, and
+the ABI is `ret0=0` with no other return lane used.
+
+The cleanup (`src/kernel/boot/restart_state.rs`) is five steps: mark the TCB `Dead` and drop its
+restart token (rank 2); revoke reply records on both the caller and replier sides of the exact
+`{tid, asid}` identity; `clear_ipc_waiters_for_tid`; `release_kernel_context`; and
+`maybe_cleanup_process_cnode_for_pid_noalloc_reap`, which is the only step that can reach the VM.
+
+**The closure is narrower than the syscall's name suggests, and the recomputation matters.** No
+general-revocation branch runs: `revoke_capability_in_cnode` is never reached, and — unlike the
+sibling `mark_task_dead` — neither `retire_reply_deadline_for_tid` nor `revoke_driver_runtime_caps`
+is on this path. What *is* reachable, and only under the existing last-thread rule (`return false`
+if any TCB in the group is not `Dead`), is the whole process teardown:
+`destroy_user_address_space_by_asid` per distinct ASID, transfer-envelope purge, active-transfer
+unmaps via `unmap_range_two_phase`, delegation-link removal at rank 4, and `reap_process_cspace_locked`.
+So the closure is narrow per *thread* and wide per *process*, and the width is gated, not optional.
+
+Two properties the existing code already has, and which §3 must not lose: it allocates nothing
+(fixed `[Option<_>; MAX_REPLY_CAPS]` / `[None; MAX_TASKS]` snapshots throughout), and it already
+snapshots under a claim and settles after releasing it, so no rank is ever nested inside another.
+
+**No missing semantic primitive.** Every seam the split side needs already exists —
+`with_task_tcbs_split_mut`, `with_ipc_split_mut`, `with_capability_split_mut`,
+`with_vm_then_memory_split_mut`, `with_memory_split_mut`, `with_scheduler_split_mut`,
+`unmap_range_two_phase_split` — and every body is already factored as a `*_locked` helper over
+borrowed subsystem state. The work is adapters, not a new primitive.
+
+**The linearization point** is today split across two rank-2 acquisitions: the handler reads
+`task_status(target)`, and the cleanup separately writes `status = Dead`. That is sound under the
+broad lock and unsound off it, so §2's claim collapses the two into one compare-and-claim inside a
+single acquisition — which is also what arbitrates restart, exit, duplicate reap and replacement
+under a reused TID.
+
+**Scheduler residency needs no removal, only proof.** A task reaches `Faulted` only through
+`TaskTransition::FaultRunningCurrent`, and both the broad path and
+`commit_terminal_fault_transition_shared` clear `current` (`block_current_on_cpu`) *before* applying
+it; nothing re-enqueues a `Faulted` task, and `CrossCpuWakeApplyResult::SkippedFaulted` refuses to.
+`Exited`/`Dead` are likewise off-queue. So the transaction proves absence rather than performing a
+removal — and refuses pre-mutation if it ever finds otherwise.
+
+#### Base measurement: where NR31 actually fires
+
+Fresh artifacts at `70327f7`, all three manifests attesting
+`commit=70327f7b5ae5bf6e7fe4fa9e75c5e66bd74f35b4`.
+
+The **server-death** profiles are not witnesses. All three produce
+`TASK_REAP_FAULTED_BEGIN = TASK_REAP_FAULTED_OK = PM_RESTART_TEARDOWN_OLD_BEGIN = 0`; server death
+tears a server down without PM ever reaping a faulted task. (x86_64 passes; aarch64 and riscv64 are
+red at base with `RUN_B expected exactly one captured reverse link, saw 0` — a pre-existing failure
+unrelated to NR31, unchanged here.)
+
+The **crash/restart** profile is the witness, by design: its marker oracle already requires
+`TASK_REAP_FAULTED_OK`. Its sole production caller is
+`teardown_old_restart_target(old_tid, replacement_tid)` in the process manager, reached only after a
+replacement has been spawned.
+
+| | x86_64 | aarch64 | riscv64 |
+|---|---|---|---|
+| `CRASH_TEST_SRV_FAULT_NOW` | 4 | 4 | 5 |
+| `PM_RESTART_TEARDOWN_OLD_BEGIN / _OK` | 3 / 3 | 3 / 3 | 4 / 4 |
+| **`TASK_REAP_FAULTED_BEGIN / _OK`** | **3 / 3** | **3 / 3** | **4 / 4** |
+| distinct reaped targets | 3 | 3 | 4 |
+| refusals (`REJECT`, `ALREADY_GONE`) | 0, 0 | 0, 0 | 0, 0 |
+
+riscv64 had no witness only because `scripts/qemu-supervisor-crash-restart-smoke.sh` had no
+`riscv64` arm — not because the chain was missing. The RISC-V artifact builder already stages the
+gated `crash_test_srv`, and the chain runs end to end there:
+`CRASH_TEST_SRV_FAULT_NOW` → `SUPERVISOR_FAULT_LOOKUP_OK` → `SUPERVISOR_RESTART_SCHEDULED` →
+`PM_RESTART_REPLY_ACCEPTED` → `PM_RESTART_TEARDOWN_OLD_BEGIN` → `TASK_REAP_FAULTED_OK`, four times,
+on targets 10008, 10009, 10010 and 10011. So the profile was extended, not invented: no synthetic
+kernel event, no new ABI, no unrelated workload.
+
+The riscv64 arm gets its own acceptance shape (`ARCH_ORACLE=reap_chain`) for one honest reason. On
+x86_64 and aarch64 the supervisor's restart-attempt counter advances monotonically and the chain
+converges on `RESTART_LIMIT_EXCEEDED` + `SERVICE_DEGRADED_FINAL` after exactly four instances. On
+riscv64 that counter **resets** mid-chain — `ATTEMPT_ADVANCE old=2 new=3` is followed by
+`old=0 new=1` — so the limit is never reached and the run is bounded by the clock instead. That
+accounting difference is pre-existing and out of scope (§4 forbids redesigning restart), so the
+riscv64 oracle asserts the reap chain itself and nothing about terminal degradation: at least three
+complete cycles, `teardown_begin == reap_begin == reap_ok == teardown_ok`, one distinct target per
+success, zero refusals, and the fault count bracketing the reap count.
+
+The controlled witness on RISC-V is the deliberate `crash_test_srv` fault, **not** the known
+intermittent RISC-V supervisor fault, which stays exactly as classified.
+
+### §2 — the claim, and the window it closes
+
+The reap's defect was never a missing mechanism. It was that the status which *decides* the reap
+and the status the reap *writes* were read in two different rank-2 acquisitions —
+`handle_reap_faulted_task` reading `task_status(target)`, and `reap_faulted_task_noalloc_cleanup`
+writing `status = Dead` several steps later. Under the broad lock nothing can happen in between.
+Off it, that pair is a check-then-act race against four concurrent lifecycle edges: a scheduled
+restart flipping the same TCB back to `Runnable`, the task's own exit, a second NR 31, and a
+replacement that reuses the numeric TID.
+
+`claim_faulted_task_for_reap_locked` collapses the pair into one acquisition. It resolves the TCB,
+captures the exact incarnation and process, classifies the status, and only then writes `Dead` and
+takes the restart token — every refusal above the write, so a refused claim mutates nothing at all.
+What it returns is a `ReapClaim` with no public constructor: after this point the target can only
+be named by the claim, never by the number PM passed in.
+
+Three details are deliberate rather than incidental.
+
+**The generation is the one that already exists.** The claim carries the TCB's own
+`RestartState::token` and clears it, which is exactly what the base cleanup did. Nothing new is
+minted, and `None` keeps meaning "this target carried no restart token".
+
+**`Dead` is not claimable.** `status_is_claimable` admits `Faulted | Exited(_)` and nothing else,
+so the state a won claim leaves behind is the state a losing claim sees. That is the whole
+arbitration: two reaps race, one writes `Dead`, the other finds it and returns `AlreadyClaimed`
+having touched nothing. `ReapRefusal::is_already_reaped` then puts that loser on the SAME
+disposition the base handler already gave a target that no longer exists — `Ok(0, 0, 0)` — so the
+syscall's return ABI is unchanged and a duplicate reap costs nothing.
+
+**An ASID-less target is still reapable.** The claim stores `Option<Asid>` rather than refusing,
+and the record sweeps key on `sweep_asid()`, which substitutes `Asid(0)` exactly as the base
+cleanup's `task_asid(tid).unwrap_or(Asid(0))` did. Refusing would have been tidier and would have
+leaked.
+
+### §3 — one transaction, two owners
+
+`run_reap_transaction` is the only code that knows what reaping a faulted task means. Both routes
+reach it: `reap_faulted_task_noalloc_cleanup` is now a thin caller through `BroadReapOwners`, and
+the split route reaches the same function through `SharedReapOwners`. The owners supply
+acquisitions and nothing else — order, conditions and counting all live in the transaction — so a
+divergence between the two routes is not expressible.
+
+```text
+  rank 1   prove the target is on no runqueue and is no CPU's current   (refusal: pre-mutation)
+  rank 2   CLAIM: Faulted|Exited -> Dead, take the restart token        (LINEARIZATION POINT)
+  rank 3   sweep caller-side reply records          -> release -> detach each reverse link once
+  rank 3   sweep replier-side reply records         -> release -> detach each reverse link once
+  rank 3   detach every waiter this identity owns   -> release -> settle each orphan once
+  rank 2   release the kernel context and stack
+  rank 2   last-thread rule: any sibling not Dead? -> the process teardown below is SKIPPED
+    rank 2   collect the process's DISTINCT address spaces
+    vm5/6    per address space: drain -> release -> queue TLB work -> reclaim
+    rank 3   purge the process's transfer envelopes, releasing one pin per shared region
+    rank 3   snapshot active transfer mappings -> unmap (vm5/6) -> clear slot -> account
+    rank 4   snapshot delegation links -> rank 2 resolve -> rank 4 clear the matching ones
+    rank 4   reap the process cspace and its process record
+  retire the reap claim                                                             (LAST)
+```
+
+**Scheduler residency is proved, not performed.** A task reaches `Faulted` only through
+`TaskTransition::FaultRunningCurrent`, which both the broad path and
+`commit_terminal_fault_transition_shared` apply only *after* clearing `current`; nothing re-enqueues
+a terminal task, and a cross-CPU wake refuses one outright. So the transaction asserts absence
+rather than performing a removal — and refuses if it ever finds otherwise. The proof is taken twice:
+before the claim, where a refusal costs nothing, and again under it, where it is the one step that
+can still undo the claim cleanly.
+
+**No allocation, and no rank nested inside another.** Every snapshot is a fixed array sized by an
+existing `MAX_*` bound. Every reverse link, orphaned sender, transfer envelope and delegation link
+is collected under its claim and settled after it releases — which is the discipline the base code
+already kept, preserved rather than invented. The delegation sweep is the sharpest case: the base
+loop resolved `process_id(record.source_tid)` while iterating rank-4 records, so the transaction
+snapshots at rank 4, releases, resolves at rank 2, and clears at rank 4.
+
+**The closure stayed narrow.** No general capability revoke is reachable, and the §5 guard forbids
+one from appearing: not `revoke_capability_in_cnode`, not `revoke_driver_runtime_caps`, not
+`retire_reply_deadline_for_tid` — the last two being things the sibling `mark_task_dead` does and
+the reap does not.
+
+### §4 — the route, and the three gates that admit it
+
+NR 31 reads no user memory and takes no capability argument; its only input is a target TID in
+arg0. So the route exists identically on every profile, and the work was three admission gates: the
+classifier, AArch64's ABI-import allow-list (an unlisted NR keeps `nr = 0` and the dispatcher
+declines) and RISC-V's `split_eligible` predicate. NR 31 also joins RISC-V's *per-invocation*
+marker arm rather than its one-shot latch — with a latch, three working reaps and one would look
+the same.
+
+NR 31 is non-switching for the calling PM: reaping a task the scheduler released at fault time
+cannot block, yield or change the caller's address space, so the route finalizes the frame once and
+advances no queue. Its only decline is the pre-mutation caller lookup. Past the claim there is no
+broad fallback, because re-entering the broad handler would re-sweep every record this transaction
+already retired.
+
+### §5 — proved two ways
+
+Twenty-one tests. The behavioural half drives the real transaction over a harness whose rank-2
+owners call the real locked bodies against a real `[Option<ThreadControlBlock>]` slice, comparing
+full pre/post state by identity and injecting failure at each post-claim boundary:
+
+* a duplicate reap makes **exactly one** owner call — the claim it lost — and the whole state
+  snapshot is byte-identical before and after;
+* a restarted, running, blocked or reserved target keeps its status *and* its restart token;
+* residency found only under the claim rolls it back byte-for-byte and runs nothing below it;
+* a reused numeric TID does not have another incarnation's reply records swept;
+* a live sibling preserves the shared CNode and address space, and the sibling's own later reap
+  destroys **both** of the group's distinct address spaces;
+* every shootdown is queued after its drain and before its reclaim;
+* a failed drain reclaims nothing, queues no shootdown, and still retires the claim;
+* the claim retires last, and the `detach_reverse_link` / `clear_delegation_link` /
+  `reap_process_cspace` owners panic on a repeat, so reaching the end *is* the exactly-once proof.
+
+The structural half pins what a harness cannot see: that both routes reach one transaction, that
+neither file allocates or grows, that no general revocation is reachable, that every architecture's
+gate admits NR 31, that the refusal set is closed, and that the only rollback sits before the first
+irreversible step.
+
+Twenty-one guards that pinned NR 31 as global-lock-only were **re-derived, not deleted** — each now
+asserts the admission it used to forbid, so a regression in either direction still breaks a guard.
+Stage 188H's guard is the clearest: it existed so a later stage could not "silently whitelist"
+NR 31 while wiring the AP dispatcher. It did its job; the admission here is deliberate, and the
+guard now says so.
+
+The status-writer census moves **43 → 44**. The reap's `-> Dead` write moved into the claim and
+gained its exact inverse, and both rows are `Cannot` where the row they replace was `Can`: the old
+write could land on a task that had become `Blocked(EndpointReceive)` between the two acquisitions,
+and the claim, reading and writing behind `status_is_claimable` in one acquisition, cannot.
+
+### §6 — the live acceptance
+
+Fresh artifacts, three consecutive boots per architecture, every counter identical across the three.
+Kernel source is unchanged across the runs: the only commit between the x86_64/AArch64 matrix and
+the RISC-V one touches `scripts/qemu-supervisor-crash-restart-smoke.sh` and nothing under `src/`
+or `crates/`.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| **NR31 broad terminal entries** (`TASK_REAP_BROAD_ENTER`) | **0** | **0** | **0** |
+| NR31 split route entries (`TASK_REAP_SPLIT_ENTER`) | 3 | 3 | 4 |
+| successful reaps (`TASK_REAP_FAULTED_OK`) | 3 | 3 | 4 |
+| reap claims retired (`TASK_REAP_CLAIM_RETIRED`) | 3 | 3 | 4 |
+| PM teardowns (`PM_RESTART_TEARDOWN_OLD_OK`) | 3 | 3 | 4 |
+| distinct reaped targets | 3 | 3 | 4 |
+| refusals (`REJECT`, `ALREADY_GONE`) | 0, 0 | 0, 0 | 0, 0 |
+| panics, lock-order warnings | 0, 0 | 0, 0 | 0, 0 |
+| broad-lock census (`with_cpu / with_broad / TOTAL`) | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+Split route entries equal successful reaps equal claims retired equal PM teardowns, on every one of
+the nine boots, and every success reaped a different task. The broad edge is measured at the broad
+handler's own first line, before any gate can return — not inferred from a route count.
+
+The chain behind those numbers is genuine end to end: a user task faults
+(`CRASH_TEST_SRV_FAULT_NOW`), the report reaches the supervisor
+(`SUPERVISOR_FAULT_LOOKUP_OK`), a restart is scheduled and accepted
+(`PM_RESTART_REPLY_ACCEPTED`), PM spawns the replacement and only then invokes NR 31
+(`PM_RESTART_TEARDOWN_OLD_BEGIN` → `TASK_REAP_SPLIT_ENTER`), the split reap commits, and the next
+instance runs. No target ever resumes or wakes after its reap; no orphaned reply record, waiter or
+kernel context survives; the service chain stays healthy through every cycle.
+
+Regressions, all identical to exact base:
+
+| profile | base | now |
+|---|---|---|
+| x86_64 core + `VM_COW=1` | pass | pass |
+| AArch64 core + `TERMINAL_FAULT_ORACLE=1` (U9-FT4) | pass | pass |
+| AArch64 / RISC-V core + `VM_COW=1` | pass | pass |
+| x86_64 server-death | pass | pass |
+| AArch64 / RISC-V server-death | **fail** (pre-existing) | **fail**, same line |
+
+The AArch64 and RISC-V server-death reds are byte-identical to base —
+`RUN_B expected exactly one captured reverse link, saw 0` — and unrelated to NR 31: those profiles
+produce zero reap activity on any architecture, at base and now.
+
+### The RISC-V stall, measured rather than assumed
+
+One RISC-V boot in the first matrix failed, and it is worth stating exactly what it was. The
+crash_test_srv fault report is enqueued on the supervisor's endpoint with
+`TASK_FAULT_REPORT_ENQUEUE_OK ... waiters=0 queued=1 woke=0` — the supervisor is not parked on the
+endpoint when the report lands, nothing wakes it, and the chain stops at exactly one fault with
+**zero** `SUPERVISOR_FAULT_LOOKUP_OK`. No PM teardown and no NR 31 occur on either route, so no
+reap code runs at all.
+
+Rather than assume, a freshly built base at `70327f7` was booted four times: **two of four**
+reproduce the identical signature (`faults=1 lookup=0 teardown=0 reap_ok=0`). No supervisor fault
+is involved in any of them, so this is a *different* phenomenon from the known intermittent RISC-V
+supervisor fault — which stays exactly as classified, and which is deliberately not the controlled
+NR 31 witness here.
+
+A boot whose chain never started proves nothing either way about the reap, so the riscv64 arm now
+retries it — bounded at four attempts, counted, and named in the output. Exhausting the attempts
+prints `result=inconclusive reason=fault_report_rendezvous_stall` and still exits non-zero, so it
+can never be read as a pass. Nothing is weakened: the detector is narrow (a fault was delivered
+**and** the supervisor looked up nothing), so a chain that starts and then breaks is a real failure
+and is reported as one, and every assertion runs at full strength on the boot that does start. All
+three delivered RISC-V boots ran with `attempts=1 stalled=0`.
+
+### Residual terminal-dispatch matrix (source-recomputed)
+
+| edge | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| NR31 `ReapFaultedTask` production terminal edges | **0** | **0** | **0** |
+| NR12 `Fork` | 0 | 0 | 0 |
+| NR23 / NR29 spawn | 0 | 0 | 0 |
+| broad-lock census | 2 / 0 / 2 | 2 / 0 / 2 | 2 / 0 / 2 |
+
+The census is unchanged at **2 / 0 / 2** — CENSUS-DELTA 0. Both terminal acquisitions still serve
+their other residual classes, so ***U9 remains OPEN***: this increment empties the NR 31 population
+that reached them, it does not delete them.
+
+## U9-EXIT1 — ExitCurrentTask (NR16)
+
+### §1 — what NR16 actually does, and how much of REAP1 it can reuse
+
+`handle_exit_current_task` (`src/kernel/syscall.rs`) resolves the exact current incarnation from
+scheduler state — never from userspace — then applies one pre-mutation gate: if the caller still
+owes a reply and no deferred server-death slot is free on this CPU, it declines `WouldBlock` and
+leaves the task Running with its reverse link attached. Only then does it call `exit_task`, publish
+the typed `CurrentTaskExited` disposition, and return without a frame.
+
+`exit_task` (`src/kernel/boot/restart_state.rs`) is the single teardown authority, and it does
+substantially more than a reap:
+
+1. mint a fresh restart token (restart state);
+2. rank 2 — clear `blocked_recv_state`, write `status = Exited(code)`, install the token, clear
+   `async_preempted`;
+3. sweep caller-side reply records on the exact `{tid, asid}`;
+4. **the server-death deferral** — reserve a slot, `take_server_reply_link`, publish a
+   `DeferredServerDeathCompletion`, or release the reservation if nothing is owed. Reserve
+   precedes detach, so a full queue leaves the link attached rather than stranding a caller;
+5. sweep replier-side records **excluding** the record whose terminal the drain now owns;
+6. `clear_ipc_waiters_for_tid`;
+7. report the exit to the supervisor and to PM (each an endpoint send **plus a wake**);
+8. robust-futex wakes from the task's own robust list;
+9. `wake_joiners_for`;
+10. `if current`: `block_current_cpu()` then `dispatch_next_task()` — the in-lock queue advance;
+11. `if detached`: `reap_if_detached` → `mark_task_dead`, which adds reply-record sweeps, reply
+    deadline retirement, kernel-context release, driver-cap revocation and
+    `maybe_cleanup_process_cnode_for_pid`.
+
+Steps 10 and 11 are **independent `if`s, not an if/else**. A self-exiting *detached* thread
+therefore runs both the queue advance and the full death path; a joinable one stays `Exited(code)`
+until it is joined or reaped.
+
+#### The common/distinct ledger, and one correction to the premise
+
+| | REAP1 (NR31) | Exit (NR16) |
+|---|---|---|
+| claim | `Faulted \| Exited(_)` → **`Dead`** | Running on this exact CPU → **`Exited(code)`** |
+| restart token | takes and **clears** it | **mints and installs** a new one |
+| caller-side reply records | yes | yes — *same owner* |
+| replier-side reply records | unconditional | **except** the detached server link |
+| server-death deferral | none | **reserve → detach → publish** |
+| IPC waiters | yes | yes — *same owner* |
+| supervisor / PM report | none | **send + wake, twice** |
+| robust-futex and joiner wakes | none | **yes** |
+| kernel context | always | only via `mark_task_dead` (detached) |
+| process teardown | `maybe_cleanup_process_cnode_for_pid_noalloc_reap` | `maybe_cleanup_process_cnode_for_pid` |
+| general capability revoke | **not reachable** | **reachable** |
+| scheduler advance | none — target is already off-CPU | **block current + dispatch** |
+
+The last three rows matter more than the rest. The two process-teardown variants are *not* the same
+policy: the exit variant runs a general revocation loop over every live capability in the process
+CNode and purges active transfer mappings **through `revoke_capability_in_cnode`**, while the reap
+variant deliberately does neither — which is exactly the asymmetry U9-REAP1 §1 recorded when it
+found no general-revocation branch reachable from a faulted-task reap.
+
+So "reuse REAP1's lifecycle cleanup" cannot mean "run `run_reap_transaction` after an exit claim".
+Doing that would write `Dead` where NR16 writes `Exited(code)`, skip the server-death deferral,
+skip the supervisor/PM/joiner/futex owed work, and **silently narrow NR16's teardown so that
+capabilities NR16 revokes today would leak**. What is genuinely shared is the *thread-scoped* body
+U9-REAP1 already extracted into `kernel/boot/reap_claim.rs` — the two reply-record sweeps and the
+waiter detach, as `*_locked` helpers over borrowed subsystem state. That is the reuse this mission
+takes, and it is real: one implementation, two claims. The process-scoped halves stay distinct
+because they *are* distinct, and a guard pins that they remain so.
+
+#### Where the queue advance has to go
+
+Exit cannot return through its syscall frame, so the existing U9-QA machinery is the right and only
+vehicle: reserve the deferral, publish the terminal transition, return `QueueAdvanceCommitted`, and
+let the existing post-lock drain select and apply the next context. That is the order U9-FT4's
+terminal-fault route already follows, and it is reused verbatim rather than duplicated.
+
+One hazard is specific to exit. Both existing drain predicates —
+`futex_wait_reverify_blocked` and `terminal_fault_reverify_faulted` — resolve the outgoing TCB and
+`.unwrap_or(false)`, i.e. a **missing** TCB reverifies as *not ok*. An exiting task can legitimately
+have been torn further down by the time the drain runs, so exit needs its own predicate that admits
+`Exited(_) | Dead` **and represents "the claim removed it" explicitly**, rather than silently
+reading absence as success. The existing x86_64 disposition consumer already models exactly this
+(`None => true, // fully reaped` alongside `| None` in its terminal match), so the shape is
+established rather than invented.
+
+#### Base measurement
+
+Fresh artifacts at `f12c7c2`, the three existing exit-oracle profiles, all sealing green:
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_SYSCALL_DISPATCHED` | 1 | 1 | 1 |
+| `EXIT_TASK_PREFLIGHT_OK` | 1 | 1 | 1 |
+| `EXIT_TASK_LIFECYCLE_TRANSITION` | 1 | 1 | 1 |
+| `EXIT_TASK_DISPOSITION_PUBLISHED` | 1 | 1 | 1 |
+| `EXIT_TASK_DISPOSITION_CONSUMED` | 1 | 1 | 1 |
+| `EXIT_TASK_SYSCALL_DECLINED` | 0 | 0 | 0 |
+| oracle seal | ok | ok | ok |
+
+Exactly one NR16 per boot on each architecture, taken through the broad handler, with no decline.
+That single edge per architecture is what §6 must drive to zero.
+
+### §2 — The exit claim
+
+`src/kernel/boot/exit_claim.rs`. `ExitClaim` has no public constructor: the only way to hold one is
+to have performed `claim_self_exit_locked`, the transaction's linearization point. It carries
+`{cpu, tid, asid, pid, code, restart_token, status_before}` — the CPU included, so a claim cannot be
+spent on another CPU's run queue, and the ASID included, so a replacement task reusing the numeric
+TID matches nothing. §2's "numeric TID alone is insufficient" is enforced by construction: every
+lookup in the transaction is `tid.0 == tid && asid == asid`, and `rollback_exit_claim_locked`
+refuses a TCB whose ASID differs.
+
+One rank-2 acquisition performs, with no window between them: resolve the TCB (`TaskGone`), match
+the incarnation (`IdentityChanged`), refuse `Detached` (`DetachedThread`), classify the status
+(`NotRunning`), and only then write. `status_is_self_exitable` admits `Running` and nothing else,
+which is what arbitrates against every competing edge:
+
+| competitor | status it leaves | claim result |
+|---|---|---|
+| reap (NR 31) | `Dead` | `NotRunning` |
+| terminal fault | `Faulted` | `NotRunning` |
+| restart | `Runnable` | `NotRunning` |
+| a previous exit | `Exited(_)` | `NotRunning` |
+| TID reuse | any, different ASID | `IdentityChanged` |
+
+The clear-then-write ordering — rank 1 removes the task from `current`, then rank 2 writes the
+terminal status — is what makes "never simultaneously dispatchable and terminal" true rather than
+asserted. Between the two the task is in no run queue and is no CPU's `current`; it is not yet
+terminal, and it is not dispatchable either. That is the same ordering
+`commit_terminal_fault_transition_shared` established.
+
+Admission is narrower than the broad path's, and both narrowings refuse **before any mutation**:
+
+* `DetachedThread` — a detached self-exit additionally runs `reap_if_detached` → `mark_task_dead`,
+  which reaches a general capability-revocation loop over the process CNode and an allocating live-
+  capability snapshot. §4 forbids allocation in the teardown, so that population keeps its broad
+  path.
+* `RobustFutexList` — the robust-futex registry is a `KernelState` array with no split lock domain
+  of its own. Rather than invent one for a wake this route would owe, a thread that published a
+  robust list is refused.
+
+`ExitRefusal::may_fall_back` is `true` for every pre-mutation variant and `false` for exactly one,
+`VictimChanged`, which is reachable only after `current` has been cleared.
+
+### §3 — One transaction, ending in the existing queue advance
+
+`src/kernel/syscall/exit_txn.rs`. The order, and why it is this order:
+
+```
+  pre-lock  admit: this CPU has a drainer and is the authoritative dispatcher
+  rank 2    preflight: identity, Joinable, Running                       (refusal: free)
+  rank 2    does this thread still owe a reply?  -> capacity probe       (refusal: free)
+  ——        RESERVE the queue-advance deferral                          (refusal: free)
+  ——        RESERVE the server-death slot, if a reply is owed            (refusal: free)
+  rank 1    clear `current`
+  rank 2    CLAIM: Running -> Exited(code), install token                (LINEARIZATION POINT)
+  rank 2    detach the exact reverse link -> publish the deferred completion
+  rank 3    sweep caller-side reply records     -> release -> detach each link once
+  rank 3    sweep replier-side records EXCEPT the detached one -> release -> detach once
+  rank 3    detach every waiter this identity owns -> release -> settle each orphan once
+  rank 3/1  report the exit to the supervisor and to PM (send, then wake)
+  rank 1/2  joiner wakes
+  ——        return QueueAdvanceCommitted; the EXISTING drain selects and applies the next task
+```
+
+Both reservations precede the first irreversible step. That is what makes every refusal above them
+free and every step below them owed rather than optional, and it is why `QueueAdvanceCommitted` is
+returned only with a live reservation in hand.
+
+There is no second selector, no second scheduler policy and no second drain. The route reserves
+U9-QA's own deferral through `futex_wait_dispatch_try_defer` and returns; the post-lock drain that
+FutexWait and the terminal fault already share does the selection and the apply.
+
+**Nothing is saved and nothing is returned.** The shared `trap_entry` bridge and the RISC-V wrapper
+both skip the outgoing-frame capture and the syscall finalize when this CPU carries an exit
+deferral, which shows up live as `captured=0` on the committed advance. After the claim there is no
+broad fallback: re-entering `handle_exit_current_task` would mint a second token, publish a second
+disposition and re-sweep records this transaction already retired. A cleanup step that fails
+therefore fails **closed** — the task stays terminal and off the CPU, the advance still happens, and
+nothing is rolled back.
+
+**The drain's question, when the TCB is gone.** Both existing drain predicates end in
+`.unwrap_or(false)`, so a missing TCB reverifies as *not ok*. For an exit that is the wrong answer:
+an exiting task can legitimately have been reaped or joined between the claim and the drain, and
+absence then means *the exit succeeded*. So absence is represented explicitly rather than inferred.
+`ExitDrainVerdict` is three-valued — `Terminal`, `Removed`, `Contradicted` — and only
+`Contradicted` (present, matching, and **not** terminal) refuses. A per-CPU
+`EXIT_QUEUE_ADVANCE_OUTGOING` cell names the exact incarnation so the drain asks the exit's question
+rather than FutexWait's.
+
+### §4 — Through the existing owners, and what the broad path can delegate
+
+Every acquisition in the transaction is one owner method around a body shared with the broad path.
+The transaction holds no lock between owner calls by construction, so no unrelated lock is held
+across an IPC delivery, a wake, a TLB operation or an arch apply. Nothing in `exit_claim.rs` or
+`exit_txn.rs` allocates: the sweep buffers are fixed-capacity stack arrays sized by `MAX_REPLY_CAPS`,
+`MAX_ENDPOINT_SENDER_WAITERS` and `MAX_TASKS`, and a guard forbids `Vec`, `Box`, `alloc::` and
+`collect` in both files.
+
+The broad NR 16 **cannot** delegate the whole transaction, and the reason is a constraint the
+mission itself imposes: the broad path admits a population this route refuses (a `Detached` thread
+and a robust-futex publisher), and widening the transaction to cover them would reach the allocating
+general revoke §4 forbids. Narrowing NR 16's broad semantics to fit is what §5 forbids.
+
+What it can delegate — and now does — is every body the two routes share:
+
+| body | broad owner | split owner |
+|---|---|---|
+| `apply_self_exit_writes_locked` | `KernelState::exit_task` | `claim_self_exit_locked` |
+| `wake_joiners_for_locked` | `KernelState::wake_joiners_for` | `run_exit_transaction` |
+| `revoke_reply_caps_for_caller_identity_locked` | `exit_task` | `SharedExitOwners` |
+| `revoke_reply_caps_for_replier_identity_locked` | `exit_task` | `SharedExitOwners` |
+| `clear_ipc_waiters_for_identity_locked` | `exit_task` | `SharedExitOwners` |
+| the server-death reserve → detach → publish order | `exit_task` | `run_exit_transaction` |
+
+The status **precondition** stays a difference, deliberately: the split claim admits `Running` and
+nothing else, because a split exit is a task's first terminal edge, while the broad path is also
+reached for a task another owner has already moved. Sharing writes is not sharing a precondition
+neither caller wants the other's — and that is exactly why the shared write is classified `Can` in
+the WA2B census rather than inheriting the `Cannot` of the guard nearest to it.
+
+The one U9-REAP1 signature this stage widened is `revoke_reply_caps_for_replier_identity_locked`,
+which gained an `except: Option<ServerReplyLink>`. Both reap owners pass `None`, so NR 31 excludes
+nothing and its behaviour is byte-for-byte what it was. The exit passes the link whose terminal the
+deferred server-death completion now owns: clearing that slot in the sweep would destroy the
+authority the drain is about to settle `ServerGone` through.
+
+### §5 — Routing, and the guards
+
+NR 16 is wired as the **fourth switching class** in `try_split_dispatch_into_frame`, before both
+terminal acquisitions on all three architectures, and deliberately **not** on the NR-only
+non-switching whitelist — whose whole contract is that every member may be early-returned through
+the caller's own frame, which an exiting task does not have. AArch64's ABI-import allow-list admits
+NR 16; RISC-V's `split_eligible` predicate admits it on a per-invocation marker arm.
+
+`u9exit1_self_exit_transaction` is 27 cases in two halves. The behavioural half drives the real
+`run_exit_transaction` over a harness whose rank-1 and rank-2 owner methods call the real
+`exit_claim` bodies against a real `[Option<ThreadControlBlock>]` slice, recording every owner call
+in order, so ordering and exactly-once claims are checked against full pre/post state compared **by
+identity** rather than by count, and a failure can be injected at any boundary. The structural half
+pins what a harness cannot see.
+
+| §5 property | where it is proved |
+|---|---|
+| one cleanup policy, distinct exact claims | `both_nr16_routes_reach_the_one_transaction_and_the_one_claim`, `the_reap_and_the_exit_keep_their_distinct_terminal_claims` |
+| current/status cannot tear | `an_exited_task_is_never_simultaneously_current_and_terminal` |
+| one queue-advance owner and one drain | `the_committed_exit_holds_exactly_one_queue_advance_naming_itself`, `the_exit_transaction_owns_no_selector_and_no_second_drain` |
+| no return or syscall completion for the dead task | live `captured=0` and `EXIT_TASK_SYSCALL_RETURNED=0` |
+| no fallback after the claim | `a_scheduler_that_hands_back_another_task_fails_closed_with_both_slots_released` |
+| exact server-death settlement and wake | `the_owed_reply_is_detached_once_and_excluded_from_the_replier_sweep`, `a_link_that_vanished_after_the_probe_releases_its_reservation` |
+| duplicate and stale exits inert | `a_duplicate_exit_mutates_nothing_and_publishes_no_second_disposition`, `a_stale_current_pointing_at_an_exited_task_still_refuses` |
+| exhaustive reachable cleanup | `every_reachable_record_and_waiter_is_settled_exactly_once` |
+| no locks across wake/TLB/apply | `joiners_wake_exactly_once_and_the_exiting_task_is_never_among_them` (rank-2 writes before rank-1 enqueues) |
+| reservation before irreversible mutation | `both_reservations_precede_the_first_irreversible_step` |
+| the terminal edges are zero | §6 |
+
+One defect this suite exists for was found by the live run before the suite was written: the route
+had no NR gate at all, so it ran the exit transaction on **every** trap that reached the switching
+seam and retired three tasks on their first `DebugLog`
+(`YARM_LOCK_SPLIT_DISPATCH arch=x86_64 nr=15 result=queue_advance_committed`). The guard that would
+have caught it is `the_split_exit_route_is_gated_on_nr_16_before_anything_else`, and it checks the
+same rule for every switching class on the seam.
+
+### §6 — The live matrix
+
+Three consecutive fresh runs per architecture at the delivered commit, using the existing exit
+oracles, re-derived onto the route that now services NR 16. The re-derivation follows U9-REAP1's
+discipline: the broad pipeline's nine markers move from `need_once` to `need_absent`, which is the
+stronger form of what Stage 200D-0B3/0C2/0D2 policed — those runners checked the lock-state *field*
+on each marker because the field was the only thing that could lie about where the marker was
+emitted, and a marker that cannot be emitted at all cannot carry a false lock state.
+
+Every ordering claim about the exit's own queue advance is made against the **slice** of the boot log
+that begins at the accepted exit. The drain's markers are shared with FutexWait and blocking recv,
+which fire 118 times before the exit in the x86_64 boot; a whole-log claim would have been satisfied
+by somebody else's advance — an oracle that proves nothing while appearing to pass.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_BROAD_ENTER` | **0 / 0 / 0** | **0 / 0 / 0** | **0 / 0 / 0** |
+| `EXIT_TASK_SPLIT_ENTER` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_SPLIT_DECLINED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_CLAIM_RETIRED` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_SYSCALL_DISPATCHED nr=16` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_SYSCALL_RETURNED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| exiting frames captured | 0 | 0 | 0 |
+| drain reselected the exiting task | 0 | 0 | 0 |
+| panics / faults / lock warnings | 0 | 0 | 0 |
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+
+The retired broad pipeline — `PREFLIGHT_OK`, `DISPOSITION_PUBLISHED`, `DISPOSITION_CONSUMED`,
+`EXITING_NOT_CURRENT`, `ABSENCE_VALIDATED`, `RESTORE_OWNER_PREPARED` / `RESTORE_OWNER` /
+`RESTORE_DONE` / `SRET_OWNER`, `INLOCK_BYPASS_ARMED`, `BROAD_LOCK_RELEASED`,
+`POST_LOCK_DRAIN_DONE`, `COMMON_EPILOGUE_OWNER`, `TRAP_DEPTH_OWNER` — counted zero on every run of
+every architecture.
+
+---
+
+## U9-EXIT2 — NR 16 made source-total
+
+### Correction to U9-EXIT1's retirement claim
+
+U9-EXIT1 reported the NR 16 terminal edge as retired on the strength of the live matrix above:
+`EXIT_TASK_BROAD_ENTER` counted zero on nine boots. That measurement is accurate and it is
+reproduced here, but the conclusion drawn from it was too strong, and this correction is recorded
+in its own right.
+
+The exit oracle exercises ONE population: a `Joinable`, non-robust self-exit that owes no reply.
+The route U9-EXIT1 delivered refused two other populations — a `Detached` thread and a robust-futex
+publisher — and refused them by returning `NotHandled`, which hands the trap to the terminal broad
+dispatcher. So `EXIT_TASK_BROAD_ENTER = 0` in those boots proved that *the exercised population*
+avoided the edge. It did not prove the edge unreachable, and U9-EXIT1's summary should have said
+"the admitted population" wherever it said "NR 16".
+
+Worse, one arm was simply wrong. A claim that lost its race between the preflight and the
+linearization point produced `NotRunning`, whose `may_fall_back()` answered `true` — but that
+refusal is produced AFTER `current` has been cleared. The route therefore returned `NotHandled` and
+`handle_exit_current_task` ran on a CPU with no current task, where its first statement resolves
+`current_tid()` to `None` and returns `SyscallError::Internal` to a task that is no longer
+schedulable, with the queue advance never performed. That is a fall-back into a broken state, not a
+graceful decline, and it was reachable from any concurrent reap, fault or restart of the exiting
+task.
+
+### §1 — the complete disposition table
+
+Every arm from NR 16 recognition to the end of the transaction, on all three architectures.
+Classification is A (reachable, must be serviced), B (mechanically impossible at a userspace
+syscall boundary), C (invalid invocation, typed error pre-lock), D (fatal after mutation).
+
+| # | arm | refusal | class | settlement | why |
+|---|---|---|---|---|---|
+| 0 | `frame.syscall_num() != 16` | — | — | `NotHandled` | before recognition; the seam's other classes must still be tried |
+| 1 | no trap drainer / not the dispatch CPU | `RouteNotAdmitted` | **B** | `Complete(Err(Internal))` | the flag is set before any userspace task runs; the dispatching-CPU count is 1 in every production configuration (the only site that clears an AP's wake-only bit is unreachable — Stage 189B, "trap_return_ready is never set"); a wake-only AP dispatches no user task, so no userspace syscall can originate on one |
+| 2 | no current task | `NoCurrent` | **B** | `Complete(Err(Internal))` | this trap IS a userspace syscall taken on `cpu` |
+| 3 | no TCB for the current TID | `TaskGone` | **B** | `Complete(Err(Internal))` | the current task has a TCB by construction |
+| 4 | thread is `Detached` | `DetachedThread` | **B** | `Complete(Err(Internal))` | §2 — no production writer exists |
+| 5 | status is not `Running` | `NotRunning` | **B** | `Complete(Err(Internal))` | the dispatcher writes `Running` when it selects, and nothing moves an executing task out of it |
+| 6 | robust-futex list registered | `RobustFutexList` | **B** | `Complete(Err(Internal))` | §3 — no production writer exists |
+| 7 | owes a reply, no deferred slot | `DeferredCapacity` | **C** | `Complete(Err(WouldBlock))` | the broad handler's own answer, reproduced: still `Running`, link still attached |
+| 8 | queue-advance deferral already held | `QueueAdvanceHeld` | **B** | `Complete(Err(Internal))` | per-CPU, single-shot, and consumed by the drain before this CPU returns to userspace |
+| 9 | server-death reserve fails after the probe | `DeferredCapacity` | **C** | `Complete(Err(WouldBlock))` | same condition, one step later; the queue advance is released first |
+| 10 | scheduler hands back another task | `VictimChanged` | **D** | `Complete(Ok(()))` | `current` already cleared |
+| 11 | claim loses the race | any | **D** | `Complete(Ok(()))` | `current` already cleared — **this is the arm U9-EXIT1 got wrong** |
+| 12 | cleanup step fails after the claim | — | **D** | success, fail-closed | the task is terminal and off the CPU; the advance is still owed |
+| 13 | success | — | — | `QueueAdvanceCommitted` | the existing deferral and the existing drain |
+
+Class A is empty: there is no NR 16 outcome that is reachable, unserviceable, and needs the broad
+path. The disposition is computed from *position*, not from the refusal's name — past the point of
+no return every variant is class D, which is exactly what arm 11 needed and did not have.
+
+There are no class-C *invocation* errors in the ordinary sense, because NR 16 takes no arguments.
+Its single class-C member is a resource condition.
+
+### §2 — Detached is production-impossible
+
+`ThreadDetachState::Detached` has exactly one writer in the whole kernel,
+`KernelState::mark_thread_detached`, and that writer has no production caller: no syscall number
+reaches it (the ABI exposes 20 NRs and none is a detach), no boot or spawn path calls it, and every
+TCB constructor produces `Joinable` — `ThreadControlBlock::reserved` delegates to
+`ThreadControlBlock::new`, which sets it. The fork publication builds the child through the same
+constructor.
+
+The proof is enforced by the build, not by a comment: `mark_thread_detached` is
+`#[cfg(any(test, feature = "hosted-dev"))]`, so the three freestanding kernels do not compile it at
+all. A future production path that detaches a thread breaks those builds and is forced to answer
+§2's real question — what the smallest no-allocation terminal cleanup for a detached self-exit is —
+rather than silently reopening the edge by inheriting a refusal that falls back.
+
+Because no task can be `Detached`, the broad path's `reap_if_detached` → `mark_task_dead` branch,
+whose allocating general-revoke closure was U9-EXIT1's stated reason for refusing this population,
+is itself unreachable on the exit path. Nothing in this stage had to be made allocation-free to
+close it.
+
+### §3 — the robust-futex registry is empty in production
+
+Same shape, and it is the whole §3 lifecycle answer.
+
+* **Registry.** One array, `KernelState::robust_futex: [Option<RobustFutexRecord>; MAX_TASKS]`, in
+  the TASK domain beside `tcbs` and `tls_restore_pending`.
+* **Writers.** Exactly one, `set_robust_futex_head` — and it has no production caller. There is no
+  `SetRobustFutexHead` syscall, no boot path registers a list, and the fork publication explicitly
+  CLEARS the child's slot rather than inheriting the parent's.
+* **Readers.** `robust_futex_state`, called once, by the broad `exit_task`; and
+  `has_robust_futex_list_split_read`, called once, by the split route's preflight. Both take the
+  task lock, so the registry has one real domain rather than an incidental dependence on the broad
+  guard (U9-EXIT1 gave it that domain).
+* **Owner-death publication, waiter selection, wake, teardown.** The broad `exit_task` walks the
+  registered range and calls `futex_wake_on_exit` per address. That loop is dead code: the registry
+  it walks can never be non-empty.
+
+So the ordered no-allocation owner §3 specifies — exact registration claim, owner-death user-memory
+publication outside every lock, waiter mutation through the existing split owner, one wake — has
+nothing to own. Building it would mean writing a lock domain, a fixed-capacity snapshot and a
+user-memory fault path for a registry that no production code can populate, and then having no way
+to witness any of it live. The honest deliverable is the proof plus the same build-enforced gate:
+`set_robust_futex_head` is compiled out of production, and a future registration path breaks the
+build and must then implement §3's order for real.
+
+**This is also why §6's robust-exit live sequence is not merely unwitnessed but unconstructible.**
+The sequence begins "task registers robust futex", and there is no production syscall that does so.
+Extending the oracle would mean adding one — a new ABI surface, which is a larger change than the
+residual it exists to measure and would create the very population it purports to observe.
+
+### §4 — the route is total
+
+```text
+  success                 -> QueueAdvanceCommitted   (existing deferral, existing drain)
+  class C (WouldBlock)    -> Complete(Err(Syscall(WouldBlock)))
+  class B (impossible)    -> Complete(Err(Syscall(Internal)))
+  class D (post-mutation) -> Complete(Err(Syscall(Internal)))   (fail closed, terminal idle)
+```
+
+Class D is a typed error and not `Ok(())`, and the difference is architectural rather than
+cosmetic. Both `Complete` arms finalize through `SplitFinalizeReason::CompletedInThisTrap`, which
+always commits the syscall-return ABI into the ENTERING incarnation — so a success would write a
+successful `exit()` return into a task whose exit did not happen. When the loser is terminal that is
+merely useless; when it is `VictimChanged` the entering task is still alive and would resume
+believing it had exited. `Internal` is truthful in both cases.
+
+`NotHandled` survives at exactly one place, the NR gate, which fires *before* recognition and must
+stay so the seam's other classes are still tried. After recognition there is none. U9-EXIT1's
+`ExitRefusal::may_fall_back` is deleted rather than corrected: it asked a question whose only honest
+answer is now "never", and a predicate that always returns the same value is a place for the next
+mistake to hide.
+
+Nothing else about EXIT1 moves. The claim is still `{cpu, tid, asid}`-exact, the server-death
+reservation still precedes every detach, the drain still reverifies a removed TCB as success, and
+the incoming-context apply is untouched.
+
+### §5 — what is proved mechanically
+
+| property | guard |
+|---|---|
+| zero fallback outcomes after recognition | `the_split_exit_route_never_falls_through_after_recognition` |
+| every refusal carries a settlement, and position overrides name | `every_refusal_carries_a_settlement_and_none_of_them_is_a_fallback` |
+| no production path can make a task `Detached` | `no_production_path_can_make_a_task_detached` + the freestanding builds |
+| no production path can register a robust list | `no_production_path_can_register_a_robust_futex_list` + the freestanding builds |
+| one registry, one lock domain, one exit reader | `the_robust_registry_has_one_owner_and_one_domain` |
+| every architecture admits NR 16 unconditionally | `every_architecture_admits_nr16_into_the_seam_unconditionally` |
+| the broad handler has no production entry | `the_broad_nr16_handler_has_no_production_entry` |
+| a committed advance still requires a live reservation, and every post-reservation failure releases it | `the_committed_advance_still_requires_a_live_reservation` |
+
+The behavioural half of `u9exit1_self_exit_transaction` continues to drive the real transaction and
+now asserts the *settlement* of each injected failure, not merely its refusal — including the
+claim-loses-race case, which is the one that used to fall back.
+
+Failure injection covers every arm that can be injected: deferral held (arm 8), deferred capacity
+at the probe (arm 7) and at the reservation (arm 9, where the two disagree and the queue advance
+already taken must be released), task replacement (arm 10), a claim losing its race (arm 11), and a
+post-claim cleanup failure (arm 12). The four injections §5 lists for the robust-futex lifecycle —
+registration missing or stale, an owner-word fault, a waiter timeout race, a duplicate wake — have
+nothing to inject into: there is no production registration, so there is no owner word to fault, no
+waiter to race and no wake to duplicate.
+
+### §6 — the live matrix
+
+Three consecutive fresh runs per architecture at the delivered tree.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_BROAD_ENTER` | **0 / 0 / 0** | **0 / 0 / 0** | **0 / 0 / 0** |
+| `EXIT_TASK_SPLIT_ENTER` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_SPLIT_DECLINED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SPLIT_IMPOSSIBLE` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SPLIT_FAILED_CLOSED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SYSCALL_RETURNED` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| panics / faults / lock warnings | 0 | 0 | 0 |
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+
+The two new markers counting zero is the expected result and is itself informative: no production
+boot took a class-B or class-D arm, which is what the source classification predicts.
+
+Regressions at the delivered tree: x86_64 server-dies `result=ok`; REAP1 crash-restart `result=ok`
+on all three (RISC-V needed its bounded retry once — `attempts=2 stalled=1`, then
+`faults=5 teardowns=4 reaps=4 distinct_targets=4` — which is the known upstream boot stall and is
+NOT counted as an additional clean run); VM-COW and fault-delivery core smokes green on all three.
+The AArch64 and RISC-V server-dies runners keep their exact-base result: they fail identically at
+base with `BOOT_FATAL_INITRAMFS_MISSING`, having never reached userspace.
+
+**The robust-exit live sequence is not delivered, and could not be.** §6 asks for "task registers
+robust futex → waiter blocks → owner exits via NR 16 → OwnerDied is published → waiter wakes once".
+The first step has no production implementation, so constructing the sequence would mean adding the
+registration ABI — creating the population in order to observe it. The proof that replaces it is
+§3's: the registry has one writer, it has no production caller, and it is compiled out of every
+production build.
+
+### Source-derived edge delta
+
+| | before U9-EXIT1 | after U9-EXIT1 | after U9-EXIT2 |
+|---|---|---|---|
+| x86_64 NR 16 terminal edges | 1 | 0 for the admitted population, reachable otherwise | **0, source-proved** |
+| AArch64 | 1 | same | **0, source-proved** |
+| RISC-V | 1 | same | **0, source-proved** |
+
+"Source-proved" is the conjunction of four guarded facts: every architecture admits NR 16 into the
+seam unconditionally; the route has no `NotHandled` outcome after recognition; every `Complete`
+disposition returns from the trap handler before the broad dispatch on all three; and a committed
+queue advance skips it too. There is no path from a userspace NR 16 to
+`handle_exit_current_task`.
+
+### Census and residual
+
+`with_cpu / with_broad / TOTAL = 2 / 0 / 2`, unchanged — CENSUS-DELTA 0. **U9 remains OPEN**: both
+terminal acquisitions still exist, and now service strictly less than they did.
+
+The next residual family on those two dispatchers is no longer inside NR 16. What remains is the
+set of syscall classes that still have a production terminal edge — every NR not yet on a split
+route — plus the non-syscall traps (page fault, IRQ, notification) the two dispatchers also serve.
+U9's remaining work is to retire those, and only then to delete the acquisitions themselves.
+
+One residual inside this stage is worth naming rather than leaving implicit. Class B and class D
+both settle as `SyscallError::Internal`, which a caller cannot distinguish. That is deliberate —
+both are states no correct program can produce, and the markers `EXIT_TASK_SPLIT_IMPOSSIBLE` and
+`EXIT_TASK_SPLIT_FAILED_CLOSED` distinguish them for an operator — but if a future stage ever needs
+userspace to tell them apart, it will need a second code.
+
+---
+
+## U9-EXIT3 — the post-clear settlements
+
+### §1 — what `Complete(Err)` actually does, and why EXIT2 was unsafe
+
+U9-EXIT2 settled a post-clear failure with `Complete(Err(SyscallError::Internal))` and reasoned
+about it as "a typed fail-closed answer". Reading the trap bridge rather than the disposition's name
+shows what it is:
+
+```rust
+Err(TrapHandleError::Syscall(e)) => {
+    frame.set_err(e.code());
+    finalize_split_handled_syscall(shared, cpu, entering, frame, CompletedInThisTrap);
+    return Ok(());        // -> the arch tail irets/erets/srets THROUGH `frame`
+}
+```
+
+The error reaches userspace by **resuming the entering task** — with `current[cpu] == None`. RISC-V
+is the same shape (`return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)`), and on AArch64
+`CompletedInThisTrap` additionally commits that return into the victim's own TCB, bypassing the
+per-class NR list.
+
+The consequences are not subtle:
+
+* the scheduler believes nothing runs on this CPU while a task runs on it;
+* the task is on no run queue, so once it blocks it is never selected again;
+* every later trap resolves `current_tid()` to `None`;
+* and when the victim lost its claim to a **reap**, the frame resumed belongs to a task that is
+  already `Dead` and whose address space is being torn down.
+
+**Frame finalization is not scheduler ownership.** A settlement may return through the entering
+frame only if that exact incarnation is this CPU's current again. The delivered EXIT2 behaviour is
+recorded here as unsafe, and this stage repairs it.
+
+A second defect fell out of the same trace. `ExitOwners::clear_current` was `block_current_on`, an
+**unconditional** clear. When the scheduler had moved on it removed whatever task was current,
+returned a mismatch, and refused — leaving that task current nowhere and queued nowhere. EXIT2's
+`VictimChanged` arm was not merely mis-settled; it was destructive to a third party.
+
+### §1 — the complete post-clear table
+
+| # | outcome | victim state | who won | frame resumable? | owes advance | settlement |
+|---|---|---|---|---|---|---|
+| 1 | claim succeeds | `Exited(code)` | this transaction | no | yes | advance (`Claimed`) |
+| 2 | claim loses to reap | `Dead` | NR 31 | no | yes | advance |
+| 3 | claim loses to duplicate exit | `Exited(_)` | another NR 16 | no | yes | advance |
+| 4 | TCB disappears | absent | reap + join | no | yes | advance |
+| 5 | TID recycled | replacement, new ASID | spawn | no | yes | advance past the OLD incarnation |
+| 6 | claim finds `Detached` | `Running`, ours, unplaced | nobody | **yes, after restore** | no | **restore** |
+| 7 | claim loses to restart | `Runnable`, requeued | restart | no | drain would refuse | **fatal** |
+| 8 | claim loses to terminal fault | `Faulted` | fault | no | drain would refuse | **fatal** |
+| 9 | cleanup/publication fails after a successful claim | `Exited(code)` | this transaction | no | yes | advance; never rolled back to Running |
+| — | scheduler moved on before the clear | untouched | scheduler | n/a | n/a | **pre-mutation refusal** — nothing was cleared |
+
+Rows 7 and 8 diverge rather than advancing because the existing exit drain's reverify admits
+`Exited | Dead | absent`. Committing an advance past a `Runnable` or `Faulted` victim would hand the
+CPU to a drain that then refuses, leaving an empty current slot and no selection — a different
+unsafe state, reached by a different route. A settlement only commits an advance the drain is
+guaranteed to honour.
+
+### §2 — the token
+
+`ClearedCurrentToken` carries `{cpu, tid, asid}` plus **the priority the removed task held**, which
+is the only record of its placement and therefore the only thing that makes an exact restore
+possible rather than invented.
+
+It is minted by, and only by, `clear_current_exact` — a **compare-and-clear** that mutates nothing
+unless the slot names exactly `tid`. That is the repair for the destructive `VictimChanged` arm, and
+it turns that outcome into a pre-mutation refusal.
+
+The token is `#[must_use]`, has no `Clone`/`Copy`, exposes no fields, and its `Drop` diverges; one
+private `consume` is the only path past `Drop`, so a fourth exit cannot be added without going
+through it. Three consuming settlements, each taking `self`:
+
+1. **`restore_current_exact`** — proves, in order and each under its own acquisition, that the exact
+   `{tid, asid}` incarnation is present, still `Running`, and current-or-queued on **no** CPU; then
+   asks the scheduler for an exact restore, which refuses unless the slot is still empty and the
+   task unqueued. On refusal the token is *returned*, because a failed restore is not a settlement.
+2. **`publish_queue_advance`** — takes an unforgeable `AdvanceAuthority`: either this transaction's
+   own `ExitClaim` (whose `{tid, asid}` is asserted to be the victim's) or an observed
+   non-resumable victim. Uses the already-reserved U9-QA deferral; no second reservation, no second
+   drain.
+3. **`fatal`** — diverges, on the reasoning `dispatch_torn_fatal` already established for the same
+   class of scheduler/task-table disagreement.
+
+Three narrow scheduler primitives support it: `block_current_exact` (compare-and-clear returning the
+removed priority), `restore_exact_current` (refuses into a non-empty slot or a queued task), and
+`tid_present_anywhere`, which asks the placement question of **every** CPU rather than one.
+
+### §3/§4 — what is proved
+
+The queue-advance reservation is released only on the restore arm, where there is genuinely nothing
+to advance past. Everywhere else the advance settlement consumes it.
+
+Ten forced hosted interleavings drive the real transaction over a harness that now holds a **real
+`SmpScheduler`** — the post-clear settlements are scheduler decisions, and a fake current array
+would prove nothing about them. Each asserts full state by identity: the victim current nowhere and
+queued nowhere, the deferral naming the exact incarnation, the replacement untouched, the
+reservation held or released as the arm requires.
+
+| guard | property |
+|---|---|
+| `the_cleared_current_token_cannot_be_forged_cloned_or_dropped` | one mint and it is the compare-and-clear; no clone/copy; `#[must_use]`; diverging `Drop`; three `self`-consuming exits; one `forget` |
+| `a_complete_after_the_clear_requires_a_completed_restoration` | `Complete` post-clear is reachable only from a completed restore; the advance arm can only answer `QueueAdvanceCommitted` |
+| `restoration_checks_the_exact_incarnation_and_every_cpu` | exact `{tid, asid}`, then all-CPU placement, then the write |
+| `the_old_unconditional_clear_and_post_clear_complete_are_rejected` | no `block_current_on_cpu_split` in the exit owners, no `FailClosed`, no post-clear `ExitFailure` built without settling |
+| `the_advance_is_reserved_once_and_published_once` | one publication site; two authorities, neither usable on the other's path |
+| `every_settlement_arm_is_matched_without_a_wildcard` | the Class-D enum is exhaustive at the route |
+| `a_dropped_token_diverges` | an unsettled post-clear state is a runtime failure, not a review claim |
+
+### §5 — live
+
+Three fresh exit-oracle boots per architecture at the delivered tree, with the ordinary successful
+path unchanged.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_BROAD_ENTER` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SPLIT_ENTER` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| exit claims retired | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `CLEARED_CURRENT_RESTORED` / `_ADVANCE` (post-clear) | 0 / 1 | 0 / 1 | 0 / 1 |
+| `CLEARED_CURRENT_FATAL` / `_TOKEN_DROPPED` | 0 | 0 | 0 |
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+
+`CLEARED_CURRENT_ADVANCE` counting one per boot is the ordinary successful exit: the success path
+settles its cleared slot through the same token, with the claim as authority. No boot took a
+restore, a fatal, or a post-clear failure — which is what the source classification predicts, since
+every competing owner needs a concurrency the admitted single-dispatcher topology does not provide.
+(U9-RESIDUAL1 §1 corrects the ground for that topology: it is enforced by the route's admission,
+not guaranteed by the platform.)
+
+**No live race is manufactured.** The competing-owner interleavings are hosted and deterministic;
+inventing timing in QEMU would prove nothing that the forced races do not prove better.
+
+
+
+
+
+## U9-EXIT4 — the post-clear races, removed or proven unreachable
+
+U9-EXIT3 delivered a linear settlement token and, with it, two states it declared unsettleable: a
+victim a **restart** had made `Runnable`, and a victim a **terminal fault** had made `Faulted`. Both
+diverged. This stage asks the question EXIT3 did not: *can a production writer produce either of
+those states while the window is open?*
+
+### §1 — the post-clear writer census
+
+The window opens at step (7) of `run_exit_transaction`, where `clear_current_exact` empties
+`current[cpu]`, and closes at the settlement. Inside it the victim is current nowhere and queued
+nowhere, while its trap frame is still live on the stack.
+
+Every production writer able to move a `Running` task falls into one of four rows. Each row's
+reachability is a **source fact**, and each is guarded in
+`kernel::boot::tests::u9exit4_post_clear_totality` so the derivation cannot silently rot.
+
+| # | writer | rank / lock | how the victim is named | placement required | post-clear reachable |
+|---|---|---|---|---|---|
+| 1 | `TaskTransition::FaultRunningCurrent` — `fault_state::fault_current_task_with_fault`, `runtime::commit_terminal_fault_transition_shared` | 2 (validate) then 1 (clear) then 2 (write) | `current_tid()`; `block_current_cpu()` / `block_current_on_cpu_split(cpu)`, re-checked against the validated TID | must be this CPU's `current` | **no** — the slot is empty, so the broad owner refuses `TaskMissing` and the split owner refuses `RefusedVictimChanged`, both before any write |
+| 2 | `TaskTransition::PreemptOutgoing` / `PreemptOutgoingIdle` — `exec_state::yield_current`, `yield_current_to` | 2 | the outgoing `current_tid()`, inside `if let Some(tid)` | must be this CPU's `current` | **no** — an empty slot skips the transition entirely |
+| 2 | `TaskTransition::DispatchIncoming` / `ContinueCurrent` — `scheduler_state`, `runtime` dispatch owners | 1 (select) then 2 (mark) | a typed `DispatchSelection`, i.e. a TID dequeued from a run queue or already current | must be queued or current | **no** — the victim is in no queue and is nobody's current |
+| 3 | `scheduler_state::apply_cross_cpu_wake_task` | 2 | an explicit TID from another CPU's wake | none | **no** — it transitions `Blocked(_)` only, writes a status exactly once inside that arm, and takes a `Skipped*` arm for every other status including `Running` |
+| 4 | `restart_state::restart_task`, `restart_state::mark_task_dead`, `runtime::wake_tid_to_runnable_split`, `runtime::apply_split_sender_wake_plan_split` | 2 (+1 to enqueue) | an explicit TID a **caller** supplies | none | **no** — see below |
+
+Row 4 is the only one no status or placement gate stops. `restart_task` writes `Runnable` from any
+status without consulting `task_transition`, and the two wakes accept `Blocked | Runnable | Running`
+as the previous status — so a `Running` victim that is not this CPU's current *would* be written and
+enqueued. What excludes them is not a gate but the absence of any agent that could call them:
+
+* **the window calls nothing that wakes.** Between the clear and the claim, `run_exit_transaction`
+  makes exactly one owner call — `mint_restart_token`, the restart domain's counter. It enqueues
+  nothing, wakes nothing and dispatches nothing. (The two `release_*` calls in the same region sit
+  on the `clear_current_exact` **refusal** arm, where the compare-and-clear mutated nothing and no
+  window was ever opened.)
+* **the window is not preemptible, on any architecture.** x86_64 programs `IA32_FMASK` with exactly
+  `RFLAGS.IF`, on the BSP and on every AP that services a ring-3 `syscall`, so a userspace NR 16
+  enters with interrupts off and no `sti` appears on the trap path. AArch64 masks `DAIF` in hardware
+  on synchronous exception entry and neither the AArch64 trap handler nor the shared bridge contains
+  a `daifclr`. RISC-V hardware clears `sstatus.SIE` on trap entry and the single re-enable
+  (`set_sstatus_sie`) is confined to `reestablish_idle_boundary`, the audited terminal-idle tail.
+* **at most one CPU dispatches, and it is this one** — but *not* for the reason U9-EXIT4 gave. It
+  cited U9-EXIT2 §1, which in turn cited a Stage-189B note in `try_enable_ap_user_dispatch`
+  claiming that site is unreachable. **That note was stale, and this record corrects it** — see
+  U9-RESIDUAL1 §1. The fact the row needs is supplied instead by the route's own ADMISSION,
+  `SharedKernel::exit_route_admitted_split`, which re-derives the topology from scheduler state
+  before any mutation and refuses otherwise.
+
+**The consequence is stronger than the question asked.** A claim refusal is itself
+production-impossible. `exit_preflight_locked` at step (3) reads `{present, asid, !detached,
+status}`; `claim_self_exit_locked` re-checks exactly those four; and steps (4)–(7) between them
+write no TCB — a read-only reverse-link probe, two per-CPU deferral cells, the rank-1 current slot,
+and the restart counter. So `settle_failed_claim` is entered only if a writer ran in a window that
+admits none.
+
+**Reported honestly:** this is a proof of *unreachability*, not of *removal*. The `Runnable` and
+`Faulted` settlements EXIT3 called unsettleable are still unsettleable — and this stage does not
+invent one. Making either safe would need two things that do not exist and that §2 forbids adding: a
+way to write the live entering frame back into the victim's TCB before advancing (the outgoing
+capture is deliberately *suppressed* by the exit cell, because an exiting task is never resumed), and
+a broadened drain verdict that admits a non-terminal outgoing task. That is precisely the "genuinely
+new subsystem" §1 says to stop and report rather than build. Because the states cannot occur, the
+retained divergence is a settlement for a **source-proven-impossible** state rather than for a
+legitimate restart or fault race, which is what §2 permits a fatal settlement to be.
+
+### §2 — the drain's admission moved into the settlement
+
+EXIT3 left two safety properties as caller conventions. They are now properties of the token.
+
+**Before.** `publish_queue_advance` was infallible: it published whatever it was handed and ignored
+the cell's return value. `settle_failed_claim` was expected to have asked `victim_is_drain_honourable`
+first, and to diverge itself when the answer was no. So *"cannot publish an advance the drain will
+refuse"* was true of one call site rather than of the type, and the caller's predicate could drift
+from the drain's — a fatal taken on a race the drain would in fact have honoured.
+
+**After.** Both gates run inside the settlement, in order, and both are read-only until the
+publication:
+
+1. the victim must be exactly what `exit_reverify_ok` honours — `Terminal` or `Removed`. A
+   `Runnable`/requeued or `Faulted` victim answers `Contradicted`, and the settlement refuses with
+   `AdvanceRefusal::DrainWouldRefuse`;
+2. the per-CPU cell must actually accept the publication; a duplicate refuses with
+   `AdvanceRefusal::AlreadyPublished` rather than overwriting.
+
+Either refusal hands the **token back**, so a caller that skips the check does not get an advance —
+it gets its obligation returned and must still settle it. `AdvanceAuthority` now states *who*
+licensed the advance and never substitutes for *whether* the drain will take it, including on the
+`Claimed` path, where the claim's own `Exited(code)` write is what makes gate (1) pass.
+
+The success path is tightened by the same change: a refusal there would mean the claim's own write
+did not take, or that a deferral was already published on a CPU whose reservation this transaction
+holds. Neither has a continuation, so it diverges.
+
+| post-clear state | settlement | authority | reachable in production |
+|---|---|---|---|
+| unchanged `Running`, ours, placed nowhere | `restore_current_exact` → `Complete(Err)` | the restore's own three proofs | no (needs a `DetachedThread` refusal, impossible since EXIT2 §2) |
+| `Exited(_)` / `Dead` (reap, duplicate exit) | `publish_queue_advance` → `QueueAdvanceCommitted` | `VictimNonResumable` + `Terminal` | no |
+| TCB removed (joined, reaped through) | `publish_queue_advance` | `VictimNonResumable` + `Removed` | no |
+| replacement at the same numeric TID | `publish_queue_advance` naming the **old** incarnation | `VictimNonResumable` + `Removed` | no |
+| this transaction's own claim | `publish_queue_advance` | `Claimed(&claim)` + `Terminal` | **yes** — the ordinary successful exit |
+| `Runnable` / requeued by restart | refused by both; diverges | — | no (§1 row 4) |
+| `Faulted` | refused by both; diverges | — | no (§1 row 1) |
+
+### §3 — what "linear" was made to mean
+
+| property | EXIT3 | EXIT4 |
+|---|---|---|
+| non-`Clone`, non-`Copy`, private fields, no public constructor, `#[must_use]` | yes | unchanged |
+| cannot be abandoned through `mem::forget` / `ManuallyDrop` | **no** — the private `consume` used `core::mem::forget(self)`, so the property was unprovable by inspection and an external forget was plain safe Rust | the bomb is conditional on a private `settled` flag no other module can set, and no `mem::forget`, `ManuallyDrop`, `ptr::read`, `ptr::write`, `transmute` or `Box::leak` appears in the token's module or in any production file that names it |
+| cannot reach `Drop`/`fatal` while a lock is held | unstated | guarded: neither `run_exit_transaction` nor `settle_failed_claim` nor the token's module contains an acquisition; each owner is one acquisition that returns its answer |
+| cannot produce `Complete` after the clear without exact restoration | guarded | guarded, plus `PostClearAdvance` is proved unable to answer `Complete` at all |
+| cannot publish an advance the drain will refuse | caller convention | a property of the settlement (§2) |
+
+### §4 — the forced interleavings
+
+The window is opened by hand and held open across three observations, so each row states what
+**both** settlements answer rather than only the one the transaction happened to take. Every refusal
+is compared against the full harness snapshot — each TCB's `{tid, asid, pid, status, restart token,
+detach state}`, every CPU's current slot, and `tid_present_anywhere` per task — so a refusal is
+observationally identical to never having been called.
+
+| competing transition | restore | advance |
+|---|---|---|
+| nothing raced | `Restored` | — |
+| restart, requeued | `not_running` | `drain_would_refuse` |
+| restart, enqueue not yet landed | `not_running` | `drain_would_refuse` |
+| placement landed while still `Running` | `placed_elsewhere` | `drain_would_refuse` |
+| terminal fault | `not_running` | `drain_would_refuse` |
+| reap (`Dead`) | `incarnation_gone` | `AdvanceCommitted` |
+| duplicate exit (`Exited(9)`) | `incarnation_gone` | `AdvanceCommitted` |
+| removal (TCB gone) | `incarnation_gone` | `AdvanceCommitted` |
+| TID reuse under a fresh ASID | `incarnation_gone` | `AdvanceCommitted`, naming the **old** incarnation |
+
+Rows whose settlements both refuse are then settled by making the victim terminal — the only thing
+that changes the answer, which is the property stated the other way round: the admission tracks the
+victim's state, not the caller's intent, and no amount of retrying moves it. The TID-reuse row
+additionally proves the replacement is neither restored, re-statused nor placed.
+
+| guard | property |
+|---|---|
+| `every_competing_transition_settles_the_cleared_slot_by_identity` | the nine-row table above, compared by identity |
+| `the_caller_side_drain_predicate_and_the_infallible_advance_are_rejected` | **negative** — EXIT3's fatal-on-legitimate-race shape: the advance is fallible, consults the drain before publishing, settles nothing until it passes; no decider keeps a second copy of the predicate; every call site handles the refusal |
+| `the_old_unconditional_clear_and_post_clear_complete_are_rejected` | **negative** — EXIT2's clear-then-`Complete` shape (unchanged from EXIT3) |
+| `the_token_is_never_abandoned_through_a_forget_primitive` | no abandonment primitive in the token's module or in any production file naming it |
+| `a_settlement_never_runs_under_a_held_lock` | no acquisition in the transaction body or the token module; each owner is one acquisition |
+| `an_advance_disposition_never_resumes_the_entering_frame` | `PostClearRestored` → `Complete(Err)`, `PostClearAdvance` → `QueueAdvanceCommitted`, neither able to answer the other |
+| `faulted_is_written_only_through_the_typed_running_transition` | §1 row 1 |
+| `a_fault_can_only_claim_the_cpus_current_task` | §1 row 1 |
+| `a_preempt_can_only_move_the_cpus_outgoing_current_task` | §1 row 2 |
+| `a_dispatch_can_only_move_a_task_the_scheduler_selected` | §1 row 2 |
+| `a_cross_cpu_wake_skips_a_running_victim` | §1 row 3 |
+| `the_post_clear_window_contains_no_wake_and_no_tcb_write` | §1 row 4 |
+| `the_restart_writer_is_driven_only_by_a_kernel_ipc_handler` | §1 row 4 |
+| `the_x86_syscall_window_runs_with_interrupts_masked` | §1 row 4 |
+| `the_aarch64_trap_window_runs_with_interrupts_masked` | §1 row 4 |
+| `the_riscv_trap_window_runs_with_interrupts_masked` | §1 row 4 |
+| `a_claim_refusal_requires_a_tcb_write_the_window_forbids` | the consequence: `settle_failed_claim` is unreachable |
+| `the_fatal_is_reached_only_through_two_refused_settlements` | the divergence sits in the advance's refusal arm and nowhere else |
+| `the_drain_admits_exactly_terminal_and_removed` | broadening one predicate without the other is impossible |
+
+### §5 — live and gates
+
+Nine fresh exit-oracle boots at the delivered tree (three per architecture), all sealed against the
+exact commit and tree.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| `EXIT_TASK_BROAD_ENTER` | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `EXIT_TASK_SPLIT_ENTER` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `EXIT_TASK_CLAIM_RETIRED` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `CLEARED_CURRENT_ADVANCE` | 1 / 1 / 1 | 1 / 1 / 1 | 1 / 1 / 1 |
+| `CLEARED_CURRENT_RESTORED` | 0 | 0 | 0 |
+| `CLEARED_CURRENT_RESTORE_REFUSED` | 0 | 0 | 0 |
+| `CLEARED_CURRENT_ADVANCE_REFUSED` (**new**) | 0 | 0 | 0 |
+| `CLEARED_CURRENT_FATAL` / `_TOKEN_DROPPED` | 0 | 0 | 0 |
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+
+Ordinary NR 16 keeps `broad=0` on all three. `CLEARED_CURRENT_ADVANCE` counting one per boot is the
+ordinary successful exit settling its cleared slot through the token with the claim as authority.
+
+`CLEARED_CURRENT_ADVANCE_REFUSED` is this stage's new marker and it counts zero, which is the
+expected result and is itself the §1 prediction restated: the admission now runs on **every** advance
+including the success path, so a non-zero count would mean either a claim whose `Exited(code)` write
+did not take or a duplicate deferral on a CPU holding its own reservation. Neither occurred in nine
+boots.
+
+| gate | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| core smoke | ok | ok | ok |
+| Fork/COW (`VM_COW=1`) | ok — 2 fork transactions, 4 COW write faults, 4 private-copy recoveries, parent+child isolation witnesses | ok | ok |
+| fault delivery (`FAULT_DELIVERY=1`) | ok — classify/build/invariant/completion markers all present | ok | ok |
+| REAP1 supervisor crash-restart | ok — `fault_observed=1 supervisor_notified=1 restart_observed=1 stale_reply_objects=0` | ok — same fields | ok — `attempts=4 stalled=3 faults=5 teardowns=4 reaps=4 distinct_targets=4`; the known upstream boot stall consumed three of the four bounded attempts, which is NOT counted as additional clean runs |
+| server-death | `result=ok` — `caller_wakes=1 peer_death_winners=1 exit_returns=0` | **fail, pre-existing** | **fail, pre-existing** |
+
+**The AArch64 and RISC-V server-death runners fail identically at base `c698c95`.** Both were
+re-run from a clean worktree at the base commit and produce the same `RUN_B expected exactly one
+captured reverse link, saw 0` and the same `result=fail` seal. Not a regression, and not repaired
+here — repairing it is the AArch64/RISC-V server-death cell's own work, not this stage's.
+
+**A correction to the U9-EXIT2 §5 record.** That record described these two runners as failing with
+`BOOT_FATAL_INITRAMFS_MISSING`, "having never reached userspace". They no longer do: at both
+`c698c95` and the delivered tree they boot through to `RUN_B` and fail on the reverse-link count
+instead. The earlier description is superseded; the conclusion it supported — pre-existing, not
+caused by the exit work — is re-established here against the current base rather than inherited.
+
+| static gate | result |
+|---|---|
+| hosted suite (`--test-threads=1`) | 5343 passed / 0 failed / 2 ignored (base: 5325) |
+| freestanding x86_64 / AArch64 / RISC-V | built ×3 |
+| `cargo clippy --lib --features hosted-dev` | 372 warnings, identical class-and-count set to base `c698c95` (diffed by class; zero classes added or removed) |
+| `rustfmt --edition 2024 --check` on every changed file | clean |
+| contract/doc enforcement | `[ok] contract-doc enforcement gate passed` |
+| broad-lock census | `with_cpu / with_broad / TOTAL = 2 / 0 / 2`, unchanged |
+| artifact residue | `git status --short` = 0; no build output tracked |
+
+The census stays at 2/0/2. This stage retires no acquisition — it did not set out to; it closes the
+race surface of an acquisition already retired by U9-EXIT1.
+
+## U9-RESIDUAL1 — the terminal admission, corrected; and NR 0 selected
+
+### §1 — EXIT4's proof rested on a stale fact
+
+U9-EXIT2 §1 classified `ExitRefusal::RouteNotAdmitted` as **class B, mechanically impossible**, and
+U9-EXIT4 §1 built its post-clear census on the same ground. Both cited a note in
+`arch::x86_64::smp::try_enable_ap_user_dispatch`:
+
+> (Unreachable in Stage 189B — trap_return_ready is never set.)
+
+**The note had been false since Stage 189C6.** That stage wired the live AP dispatcher and bound the
+only caller's readiness to `trap_return_ready: ap_usermode_entry_ready(cpu)`, whose last conjunct is
+`ap_ring3_entry_path_ready()` — exactly `kernel::boot::ap_user_dispatch_enabled()`, the **default-off
+but real** `yarm.ap_user_dispatch` boot knob. Set the knob and the audited transition clears an AP's
+wake-only bit; the AP dispatches user tasks; the dispatching-CPU count is two. "One dispatcher" is a
+production **default**, not a platform invariant.
+
+#### What actually protects the route
+
+`SharedKernel::exit_route_admitted_split`, evaluated at step (1) of `run_exit_transaction` — before
+any reservation, cell write or TCB touch. It re-derives the topology itself:
+
+| check | source of truth | refuses when |
+|---|---|---|
+| an active post-lock drainer on this CPU | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` | the deferral this route publishes would never be consumed |
+| at most one dispatching CPU | `(online & !wake_only).count_ones()`, rank 1 | a second CPU could be selecting, faulting or exiting concurrently |
+| and that dispatcher is this CPU | `sched.current_cpu`, rank 1 | the drain that consumes the deferral runs elsewhere |
+
+Wake-only APs are excluded from the count **by construction** — `!wake_only` masks them out. They are
+online for wake and accounting but run no dispatcher, so they can neither originate a userspace
+syscall nor race a settlement. Both scheduler facts come from **one** rank-1 acquisition, so the
+count and the bound CPU cannot be torn against each other.
+
+The topology cannot shift under an admitted window: both bitmap writers (`bring_up_cpu`,
+`mark_cpu_wake_only`) take `&mut KernelState`, and every call site is on the boot orchestrator's
+one-shot SMP bring-up, which runs before any userspace task exists. The AP idle-loop hook
+(`yarm_x86_ap_user_dispatch_entry`) writes no topology at all.
+
+#### The classification defect this exposed, and its repair
+
+`RouteNotAdmitted` mapped to `ExitDisposition::ImpossibleState`, which answers userspace
+`SyscallError::Internal`. Under `yarm.ap_user_dispatch=1` that refusal is **reachable**, so a
+legitimate `exit()` would have been answered with a kernel-bug code for a topology the kernel was
+asked to create. It is reclassified to `InvalidPreLock` — joining `DeferredCapacity`, the other
+genuinely reachable pre-mutation refusal — which answers `WouldBlock`. Nothing was reserved, no cell
+was written, no TCB was touched, and the caller is still `Running` and still current, so "not now" is
+the true statement. **The refusal itself is unchanged; only its classification moved.**
+
+Corrections landed in five places: the two notes in `smp.rs` and `ap_dispatch.rs` that asserted the
+stale fact, the two consumers in `exit_txn.rs`, the U9-EXIT4 census in `tests.rs`, and this document.
+`u9residual1_terminal_admission` guards all of it, including a negative guard that the retired claim
+cannot return.
+
+### §2 — the residual matrix, recomputed at both terminal acquisitions
+
+The two production acquisitions are unchanged: `arch/trap_entry.rs:1010` (`shared.with_cpu`, x86_64 +
+AArch64) and `arch/riscv64/trap.rs:1038`. Census **2 / 0 / 2**.
+
+Twenty-two syscall numbers are exposed. Recomputed from source — the switching seam
+(`try_split_dispatch_into_frame`) and the NR-only gate (`classify_split_eligible_nr_only`), not from
+observed markers:
+
+| NR | syscall | admitted by | reachable refusal | authoritative owner | witness |
+|---|---|---|---|---|---|
+| 1 | IpcSend | switching seam | blocked-send envelope | `ipc_send_txn` | U6 live |
+| 2 | IpcRecv (blocking) | switching seam | none past publication | D2 recv drain | U9-RX4 live |
+| 2 | IpcRecv (queued plain) | NR gate | ineligible → broad | `try_split_ipc_recv_queued_plain` | Stage 32B |
+| 8 | ControlPlaneSetCnodeSlots | NR gate | typed cap errors | control-plane split | Stage 27 |
+| 9 | FutexWait | switching seam | none past publication | U9-QA drain | 192A live |
+| 10 | FutexWake | NR gate | invalid addr → broad | `try_split_futex_wake` | 191B live |
+| 11 | SpawnThread | NR gate | typed spawn errors | spawn transaction | U9-SPAWN1 |
+| 12 | Fork | NR gate | typed fork errors | fork transaction | U9-FORK1 |
+| 14 | VmBrk | NR gate | non-shrink → broad | `try_split_vm_brk_shrink` | Stage 114 |
+| 15 | DebugLog | NR gate | none | `try_split_debug_log` | 191A live |
+| 16 | ExitCurrentTask | switching seam | **`RouteNotAdmitted` (§1)**, `DeferredCapacity` | exit transaction | U9-EXIT1‑4 live |
+| 23 | SpawnProcess | NR gate | typed spawn errors | spawn transaction | U9-SPAWN-TXN3 |
+| 28 | CreateInitramfsFileSliceMo | NR gate | typed MO errors | MO transaction | U9-MO2 |
+| 29 | SpawnFromMemoryObject | NR gate | typed spawn errors | spawn transaction | U9-SPAWN-TXN3 |
+| 31 | ReapFaultedTask | NR gate | typed reap errors | reap transaction | U9-REAP1 live |
+| **0** | **Yield** | **— none —** | **—** | `KernelState::yield_current` | **see below** |
+| 3 | VmMap | — none — | — | broad VM handler | — |
+| 4 | TransferRelease | — none — | — | broad transfer handler | — |
+| 5 | IpcRecvTimeout | — none — | — | broad IPC handler | — |
+| 6 | IpcCall | — none — | — | broad IPC handler | — |
+| 7 | IpcReply | — none — | — | broad IPC handler | — |
+| 13 | VmAnonMap | — none — | — | broad VM handler | — |
+| 30 | RecvSharedV3 | — none — | — | broad IPC handler | — |
+
+Three outcome classes are kept distinct, because conflating them is how a family gets called closed
+early: **successful split handling** (the route serves the syscall and finalizes), **legitimate typed
+refusal** (the route answers a defensible error itself — NR 16's two, NR 8's cap errors), and **broad
+fallback** (`NotHandled`, pre-mutation, the unchanged broad handler serves it — NR 2 queued-plain, NR
+10 invalid-addr, NR 14 non-shrink).
+
+### §2 (cont.) — NR 0 selected, and why it qualifies
+
+Yield is the preference the directive names, and it meets both of its conditions.
+
+**Its complete production contract composes from existing owners.** `handle_yield` is
+`kernel.yield_current()?; frame.set_ok(0, 0, 0)`. `yield_current` is five steps, and every one has an
+off-lock owner already:
+
+| step | rank | owner | already off-lock as |
+|---|---|---|---|
+| read the outgoing current | 1 | `current_tid_on` | `current_tid_authoritative` |
+| count the yield | 3 | `ipc.telemetry.scheduler_yield_calls` | `with_ipc_split_mut` |
+| `Running → Runnable` | 2 | `apply_task_transition(PreemptOutgoing\|PreemptOutgoingIdle)` | `with_task_tcbs_split_mut` |
+| re-enqueue at tail + clear `current` | 1 | `preempt_reenqueue_only_on` | `with_scheduler_split_mut` |
+| publish the one-shot deferral | — | `yield_dispatch_try_defer` | a per-CPU cell, no lock |
+
+And the consumer already exists on **all three architectures**, default-on: the post-lock Yield drain
+at `trap_entry.rs:2106` (x86_64), `trap_entry.rs:1984` (AArch64) and `riscv64/trap.rs:1767`
+(RISC-V). The residual edge is not the dispatch — that already left the lock — it is that
+`yield_current` **runs the policy inside `with_cpu`** before deferring.
+
+`preempt_reenqueue_only` is additionally **exactly self-reversing**: on an enqueue failure it
+restores `current` and returns `None`, having changed nothing observable. That is the property the
+split route needs to make its own fallback free.
+
+**Existing profiles witness it on every architecture.** The exit-current-task oracle workload, at
+the delivered tree:
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| complete Yield deferral+drain cycles | 4096 | 4096 | 78 |
+| `*_INLOCK_DISPATCH_FALLBACK` | 0 | 0 | 0 |
+
+No new workload, selector or marker family is needed — the evidence is already produced by a
+qualifying gate that runs three times per architecture.
+
+**Not inferred from absent markers.** The `x86_64`/`AArch64` core smokes issue no NR 0 at all; had
+that been the only profile consulted, Yield would have looked closed on two architectures. The
+selection rests on the exit oracle, where it is richly witnessed.
+
+### §3 — closing NR 0
+
+#### One policy, two acquisition adapters
+
+`KernelState::yield_current` carried three per-architecture deferral blocks — Stage 192B (x86_64),
+195G (AArch64), 196G (RISC-V) — which were three copies of one decision. A split route written
+beside them would have been a fourth. They are now one call into `run_yield_transaction`
+(`kernel/syscall/yield_txn.rs`), driven by `BroadYieldOwners` from `yield_current` and by
+`SharedYieldOwners` from the new pre-lock route.
+
+Nothing about the decision changed. The conditions each architecture applied live in
+`yield_deferral_arch_gate`, one function with `cfg` arms: x86_64 gates on `d6_genuine_enabled` and
+has no bootstrap-CPU requirement; AArch64 and RISC-V require the bootstrap CPU; RISC-V additionally
+refuses while a FutexWait or 196D-foundation deferral is pending, because one drain tail serves all
+three. **Unifying those conditions would have changed production behaviour on at least one
+architecture**, which is not what "one policy" means.
+
+```text
+  pre-lock  the outgoing task is this CPU's current                    (decline: free)
+  pre-lock  the per-architecture deferral gate                         (decline: free)
+  ——        the topology ADMISSION (drainer, one dispatcher, us)       (decline: free)
+  ——        RESERVE the one-shot Yield deferral                        (decline: free)
+  rank 2    Running -> Runnable, the exact typed transition            (decline: free)
+  rank 1    re-enqueue at tail + clear `current`                       (decline: ROLLED BACK)
+  ——        return DeferredToDrain; the EXISTING drain selects and applies the next task
+```
+
+Only the rank-1 step can fail after a write, and its failure is exactly reversible:
+`preempt_reenqueue_only` restores `current` itself before returning `None`, and the transaction
+undoes the rank-2 write through `TaskTransition::RollbackPreemptOutgoing`. So **every** decline
+leaves the world byte for byte, which is what makes `NotHandled` safe rather than convenient. There
+is no broad fallback after the publication.
+
+#### Bounded extractions, and one exact inverse
+
+| owner | why |
+|---|---|
+| `TaskTransition::RollbackPreemptOutgoing` | the exact inverse of `PreemptOutgoing`, mirroring the existing `RollbackDispatchedIncoming`. Without a named inverse the only way back would be `DispatchIncoming`, which has the right mechanics and the wrong meaning |
+| `split_terminal_route_admission` | `exit_route_admitted_split`'s body, extracted so NR 0 shares it verbatim, and now reporting **which** condition refused (`TerminalAdmissionRefusal`) |
+| `log_yield_deferred` / `log_yield_declined` | ONE owner for three vocabularies. The three drains and the live oracles each match their own prefix, so a unified string would have silently zeroed every architecture's Yield evidence |
+| `count_yield_split_mut` | the telemetry increment the broad path's entry increment no longer reaches |
+
+#### Ingress, derived separately per architecture — and the hazard unique to NR 0
+
+x86_64 and RISC-V decode the syscall number into the frame at entry, so `frame.syscall_num()` is
+authoritative. **AArch64 does not.** `pre_split_import_syscall_abi` imports the decoded ABI only for
+an allowlisted number, and an unlisted syscall leaves the frame reading `nr = 0`.
+
+For every other split class that is harmless — their numbers are non-zero, so an unimported frame
+simply declines. **0 is Yield's own number.** So on AArch64 `frame.syscall_num() == 0` is true both
+for a real Yield and for every unlisted syscall, and a route gated on it alone would have fired for
+`VmMap`, `IpcCall`, `IpcReply` and the rest — silently, on one architecture only. Every other class
+is safe from this by the accident of having a non-zero number.
+
+Two changes together close it: NR 0 joins the import allowlist (which is what puts the decoded ABI
+in the frame so the committed result lands in the right lane), and the route gates on
+`trapped_syscall_nr`, which reads the raw `x8` on AArch64 — the same register the import gate itself
+peeks — while keeping `frame.syscall_num()` elsewhere.
+
+Finalize behaviour is the FutexWait shape on all three: the syscall's own `frame.set_ok(0, 0, 0)` is
+written into the OUTGOING frame before the disposition hands the CPU to the drain, and the drain
+performs the authoritative dispatch, address-space activation and incoming-frame restore.
+
+#### One stated behaviour delta, under a default-off knob
+
+On RISC-V the production Yield deferral (196G) is now tried before the 196D foundation oracle, which
+is default-off, one-shot, opt-in via `QUEUE_SWITCH_ORACLE=1`, and documented in its own comment as
+"NOT Yield retirement". With the knob off — every default run — nothing differs.
+
+### §4 — coverage, and the bug it found
+
+The focused tests drive the transaction over a real `SmpScheduler` and real TCBs. Each decline is
+compared against a full snapshot — every TCB's `{tid, status}`, every CPU's current slot, per-task
+placement, the deferral cell and the yield count.
+
+**One of them found a real defect in this stage's own §3 code.** `apply_preempt_outgoing_locked`
+falls back to `PreemptOutgoingIdle` for the idle task, which is `Runnable → Runnable` and writes
+nothing. The rollback applied `RollbackPreemptOutgoing` unconditionally — and `Runnable → Running`
+is a legal transition for a `Runnable` idle task, so the undo *succeeded* and left a never-`Running`
+idle task marked `Running`. A corruption invented by the rollback itself, on the one path that
+exists to make sure nothing is left half-done. The fix: an inverse must know what it is inverting.
+`preempt_outgoing` now reports which twin it applied (`PreemptApplied::{Ordinary, IdleNoop}`), and
+`IdleNoop`'s inverse writes nothing.
+
+| guard | property |
+|---|---|
+| `a_committed_yield_requeues_the_caller_and_clears_current` | caller `Runnable`, queued once, `current` empty, deferral naming it; reserve → write → enqueue ordering |
+| `a_lone_task_yields_to_itself_without_an_idle_outcome` | the caller is its own incoming, so this route never idles |
+| `every_decline_is_pre_mutation` | all six decline shapes, each byte-for-byte free, including the three admission refusals individually |
+| `a_refused_reenqueue_rolls_the_transition_back_exactly` | status restored, `current` intact, deferral released, rollback before release |
+| `the_idle_twin_needs_no_rollback_and_says_so` | the defect above, pinned |
+| `the_arch_gate_precedes_the_admission_and_the_reservation` | ordering |
+| `the_split_route_falls_back_only_before_it_commits` | no broad fallback after consumption; result written before the disposition |
+| `a_yield_is_counted_exactly_once_on_either_route` | telemetry parity |
+| `each_architecture_keeps_its_delivered_yield_vocabulary` | nine markers and five reason strings preserved verbatim |
+| `the_route_reads_the_raw_trapped_number_on_aarch64` | the NR-0 ingress hazard |
+
+Displaced guards were re-derived, not deleted: the 192B/195G/196G inventories follow their facts to
+the policy that owns them; the two AArch64 whitelist-selectivity cases assert Yield **is** imported
+(the condition they were written to hold it to) and prove selectivity against four syscalls that
+genuinely have no pre-lock route; the EXIT2 reservation guard's slice is bounded to its own route;
+and the WA2B status-writer census moves `yield_current`'s row to the two halves of the transition —
+45 → 46 raw sites, CANNOT 18 → 19 — the same shape U9-REAP1 §2 produced when it moved the reap's
+write into its claim and added the claim's inverse.
+
+### §5 — live, gates, and what the numbers do and do not say
+
+Nine exit-oracle boots (three per architecture), the workload §2 selected because it is the one that
+witnesses NR 0 on every architecture.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| oracle seal | ok ×3 | ok ×3 | ok ×3 |
+| `YIELD_SPLIT_COMMITTED` | 4096 / 4096 / 4096 | 4096 / 4096 / 4096 | 64 / 64 / 64 |
+| `YIELD_SPLIT_REFUSED` | 0 | 0 | 0 |
+| in-lock fallback (`*_YIELD_*_FALLBACK`) | 0 | 0 | 0 |
+| `EXIT_TASK_BROAD_ENTER` | 0 | 0 | 0 |
+| `terminal_broad_dispatcher_entries` | 0 | 0 | 0 |
+
+**The family-edge reduction.** Every NR 0 that reached the seam was served off the broad lock, on
+all three architectures, with zero refusals across nine boots. Before this stage every NR 0 entered
+a terminal broad acquisition to decide whether to defer; now none does.
+
+**What that does NOT say.** The route's decline path is a fallback into the broad handler, by
+design and before any consumption. So the honest statement is *no refusal occurred in nine
+qualifying boots*, not *no refusal can occur*. `ArchGateOff` and the three `RouteNotAdmitted`
+reasons remain reachable in configurations these workloads do not produce — a second dispatching
+CPU under `yarm.ap_user_dispatch`, or the RISC-V colliding-deferral case — and each of those falls
+back to the unchanged in-lock path, which is exactly what the pre-mutation property is for.
+
+**The RISC-V gap between 64 and 77.** `RISCV_YIELD_DISPATCH_DONE` counts 77 drain completions
+against 64 split-committed yields. The 13-yield difference is the four kernel-internal
+`yield_current` callers — `scheduler_state::apply_cross_cpu_work`, the `memory_state` TLB-shootdown
+wait, `task_core_state` and `fault_state` — which are already inside the broad lock when they call
+it and were never part of NR 0's family edge. They are not a residue of this work.
+
+| gate | result |
+|---|---|
+| hosted suite (`--test-threads=1`) | 5366 passed / 0 failed / 2 ignored (base `34e4748`: 5343) |
+| freestanding x86_64 / AArch64 / RISC-V | built ×3 |
+| `cargo clippy --lib --features hosted-dev` | 371 warnings, **identical class set** to base `34e4748` (base total 372) |
+| `rustfmt --edition 2024 --check` on all 14 changed files | clean |
+| contract/doc enforcement | `[ok] contract-doc enforcement gate passed` |
+| core smoke | x86_64 ok, AArch64 ok, RISC-V ok |
+| Fork/COW (`VM_COW=1`) | ok |
+| fault delivery (`FAULT_DELIVERY=1`) | ok |
+| x86_64 server-death | `result=ok` |
+| REAP1 supervisor crash-restart | `fault_observed=1 supervisor_notified=1 restart_observed=1 stale_reply_objects=0 result=ok` |
+| broad-lock census | `with_cpu / with_broad / TOTAL = 2 / 0 / 2`, **unchanged** |
+| artifact residue | `git status --short` = 0, untracked = 0 |
+
+**CENSUS-DELTA: 0. Family-edge reduction: NR 0, complete on all three architectures.** Reported
+separately because they are different claims. Both terminal acquisitions still stand and still serve
+the eight NRs §2's matrix lists as having no split route; this stage removed one family's edge, not
+an acquisition. **U9 remains OPEN.**
+
+#### Three defects this stage found, two of them in its own work
+
+Recorded because each was invisible in pass/fail, and the mission's instruction not to infer closure
+from markers cuts both ways — a green run with the wrong marker counts is not a qualified run.
+
+1. **The route was silently unreachable on RISC-V.** Three boots passed with
+   `YIELD_SPLIT_COMMITTED = 0` **and** `YIELD_SPLIT_REFUSED = 0`. RISC-V has a third, independent
+   ingress whitelist (`split_eligible`); the shared seam was simply never called for NR 0, and the
+   unchanged in-lock path served every yield exactly as before. A silently unreachable route looks
+   identical to a working one.
+2. **Admitting NR 0 there then broke the boot** — three yields, then no progress. The RISC-V
+   bridge's outgoing-context capture reads the FutexWait and D2-recv deferrals; this route publishes
+   the Yield deferral. That bridge calls no finalizer and pre-advances `sepc`, so the capture is the
+   **only** thing carrying the advanced pc into the TCB: nothing captured meant the caller re-entered
+   at its own `ecall` and yielded forever. The shared bridge survives the identical omission because
+   `finalize_split_handled_syscall` commits the advanced PC separately — which is why x86_64 and
+   AArch64 were green over 24 576 yields while RISC-V was not. Fixed on RISC-V only; the shared
+   bridge's Yield path is proven live and was left alone.
+3. **The idle twin's rollback invented a corruption.** `PreemptOutgoingIdle` is
+   `Runnable → Runnable` and writes nothing, but the rollback applied `RollbackPreemptOutgoing`
+   unconditionally — a legal transition for a `Runnable` idle task, so the undo *succeeded* and left
+   a never-`Running` idle task marked `Running`, on the one path that exists to make sure nothing is
+   left half-done. Found by §4's own coverage; fixed by making the inverse know what it inverts.
+
+A fourth, smaller one: collapsing three per-architecture blocks into one policy accidentally gave
+`NoCurrent` a fallback marker the delivered code never emitted (each block sat inside `if let
+Some(out_tid)`), adding ~35 lines a boot on RISC-V that read like failures. Restored to silent, so
+the delivered vocabulary's volume is preserved as well as its strings.
+
+---
+
+## U9-YIELD2 — NR 0 is not closed, and the reason is not NR 0's
+
+Base `origin/main = 7d3edd9`. Census **2 / 0 / 2**, unchanged. U9 remains OPEN.
+
+### §1 — the record, corrected
+
+#### NR 0 was not closed
+
+U9-RESIDUAL1 §5 was careful in its prose — *"no refusal occurred in nine qualifying boots, not no
+refusal can occur"* — and then wrote a matrix row that reads as a closed family. The source says
+otherwise, and says it in one line: every `YieldDecline` makes `try_split_yield_into_frame` answer
+`NotHandled`, and `NotHandled` **is** an entry into the terminal broad dispatcher. Nine boots with
+`YIELD_SPLIT_REFUSED = 0` measure the workload, not the route.
+
+They are also not nine boots of the configurations that matter. At the delivered tree, under the
+existing, supported, default-off `yarm.ap_user_dispatch` profile:
+
+```
+scripts/qemu-x86_64-ap-saved-return-smoke.sh        (QEMU_SMP=2, yarm.ap_user_dispatch=1)
+  YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu        × 1
+  YIELD_INLOCK_DISPATCH_FALLBACK reason=multi_cpu tid=20205
+  TASK_TRANSITION_REFUSED site=yield_txn/preempt_outgoing tid=20205
+      transition=preempt_outgoing reason=wrong_status observed=Runnable
+  STAGE_199_X86_AP_SAVED_RETURN_SEAL ... result=ok
+```
+
+One userspace `Yield`, on the AP, refused by the topology admission and served by the terminal
+broad acquisition. The profile passes; the edge is there anyway. That is the difference between
+"no marker" and "no route", and it is why §4 of this mission forbids reading closure out of marker
+counts.
+
+#### NR 5, NR 6 and NR 7 do not have "no split route"
+
+U9-RESIDUAL1 §2's matrix listed all three under `— none —`. All three have production routes:
+
+| NR | route | admitted by | what is actually residual |
+|---|---|---|---|
+| 5 | `try_split_blocking_ipc_recv_into_frame` (Stage 199G-B §2) | the SWITCHING seam, **all three architectures**; RISC-V additionally lists NR 5 in `split_eligible` | the receive that would NOT block (`reason=would_not_block`), plus `not_recv_v2`, `cap_resolve`, `payload_fault`, the admission refusals, and Phase A/B refusals — each `NotHandled` → broad `handle_ipc_recv_timeout`. NR 5 is deliberately absent from `classify_split_eligible_nr_only`, so there is no second, non-blocking route |
+| 6 | `try_split_ipccall_direct_into_frame` | `ipccall_direct_admission_enabled()` = `production \|\| proof`, and `ipccall_direct_production_enabled()` is `cfg!(x86_64) \|\| cfg!(aarch64) \|\| cfg!(riscv64)` — **true on all three** | the helper's `None`: `declined_ineligible_mode`, `declined_preflight`, `declined_pre_txn`, `legacy_fallback`. Live at base in the AP profile: `IPC_DIRECT_PATH_COUNTERS phase=first dir=nr6 attempts=1 eligible=1 declined_pre_txn=1 completed=0 legacy_fallback=0` |
+| 7 | `try_split_ipcreply_direct_into_frame` | same predicate | the same four decline classes, plus `declined_transfer_cap` and `declined_terminal_arbitration` — a cap-bearing reply and a terminally-arbitrated reply are ineligible **by design** and take the legacy path |
+
+The matrix inherited its error from a doc comment. `ipccall_direct_production_enabled`'s heading
+still read *"DISABLED on every architecture — Stage 199D-WA1-GATE"* while the function returned
+`true` on all three; the body underneath already recorded both reversals (WA3C2 for x86_64,
+DIRECT3-CAP-FINAL for AArch64 and RISC-V) but the heading was never updated. The split
+dispatcher's NR6/NR7 admission note repeated the stale claim verbatim, and both direct call sites
+were still labelled *"proof-gated, default-OFF"*. Corrected in place, together with the two NR-gate
+tests whose comments read as *"NR 5 / NR 1 / NR 6 / NR 7 have no pre-lock route"* — what those
+assertions actually pin is absence from `classify_split_eligible_nr_only`, whose contract is
+non-switching, early-returnable classes only.
+
+This is a record correction. Those three families were **not** re-derived, re-qualified or
+rebuilt, and nothing here says they are closed.
+
+#### One more stale WA1-GATE record, reported and NOT changed
+
+`kernel/direct_ipc_counters.rs` emits `IPC_DIRECT_PRODUCTION_DISABLED_SEAL`, whose verdict is
+`ordinary_clean = !production_enabled && ordinary_nr6 == 0 && ordinary_nr7 == 0`. With the
+production term now `true`, that seal reports **`result=fail` on every ordinary boot** — and it is
+already in the tree's own checked-in evidence:
+
+```
+qemu-x86_64-core.log : IPC_DIRECT_PRODUCTION_DISABLED_SEAL production_enabled=1
+                       ordinary_nr6_direct=53 ordinary_nr7_direct=52 ... result=fail
+qemu-riscv64-core.log: IPC_DIRECT_PRODUCTION_DISABLED_SEAL production_enabled=0
+                       ordinary_nr6_direct=0  ordinary_nr7_direct=0  ... result=ok   (pre-DIRECT3)
+```
+
+It is a false signal, not a gate failure: no smoke script matches it, and it is absent from the
+fatal-marker policy in `scripts/qemu-smoke-common.sh`, which is why the x86_64 core smoke passes
+with it present. It is left **unchanged** deliberately. Its verdict is a sealed acceptance
+condition referenced by `doc/KERNEL_UNLOCK_AUDIT.md` and pinned by a hosted test; rewriting what a
+seal means is its own decision, it belongs to the NR6/NR7 family rather than to NR 0, and this
+mission's §1 authorizes correcting the record, not re-sealing another family. Recorded here so the
+next reader of that marker knows it is stale rather than an alarm.
+
+### §2 — every NR 0 outcome, at userspace entry and from a kernel-internal caller
+
+The two callers are kept apart throughout, because they are different questions. A **userspace
+NR 0** enters `try_split_yield_into_frame` before any broad acquisition, on a CPU that just trapped
+from ring 3 / EL0 / U-mode. A **kernel-internal `yield_current`** — `apply_cross_cpu_work`, the
+`memory_state` TLB-shootdown wait, `task_core_state`, `fault_state` — is already inside `with_cpu`
+when it calls, was never part of NR 0's family edge, and reaches these outcomes routinely. A
+deferral observed pending during an internal yield says nothing about a userspace entry, and a
+default-off knob says nothing about unreachability.
+
+| outcome | exact producer | supported configuration that reaches it | userspace NR 0? | mutation at the point of decline | canonical broad behaviour | settlement it requires |
+|---|---|---|---|---|---|---|
+| `NoCurrent` | `SharedKernel::current_tid_authoritative(cpu)` → `None` (CPU not online, or `current_tid_on(cpu)` empty) | every dispatch path that reaches ring 3 sets the per-CPU `current` slot in the same transaction that selects the task (`commit_dispatch_selection_in_lock`, `enqueue_then_dispatch_on_cpu_split`, `d6_genuine_mark_running_via_task_seam`) | **no** — and this is checked, not assumed: in the AP profile the AP's userspace `Yield` passed this test and refused at the admission instead, so `current[1]` was set even for a plan-driven fresh ring-3 entry | none | silent (`Err(NoCurrent) => {}`); the owed transition is skipped; `on_preempt_current_cpu_selection` then dispatches the FIFO head if the queue is non-empty | a real dispatch — this arm is where the internal callers live |
+| `ArchGateOff` (x86_64) | `!d6_genuine_enabled()` = `d6_controlled_switch_proof_enabled() \|\| d6_switch_a_enabled()` | `yarm.d6_switch_proof=1` / `yarm.d6_switch_a=1` (profiles `d6-switch-proof`, `d6-switch-a`) | **yes, by construction** — `d6_genuine_enabled()` is `false` under either knob, so EVERY NR 0 takes this arm; the construction proof is the predicate itself, and no marker count is needed to establish a claim of REACHABILITY (§4's construction requirement is for claims of the opposite). No workload witnesses it because the two profiles that arm these knobs run the x86_64 core smoke, which issues no NR 0 at all — the same blind spot §2 of U9-RESIDUAL1 recorded | none | log `YIELD_INLOCK_DISPATCH_FALLBACK reason=d6_genuine_off`; owed `PreemptOutgoing`; in-lock select + switch | **the drain the deferral would need does not exist in this mode.** `arch/trap_entry.rs` gates the Yield drain on exactly `!d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()` — the same two predicates — so the gate *is* the drain's own availability. Refusing here is correct; removing the edge would mean giving a diagnostic that exists to own the switch path a switch path it must not have |
+| `ArchGateOff` (AArch64, RISC-V) | `!is_bootstrap_cpu(cpu)` | — | **no.** Every AArch64 and RISC-V AP is marked wake-only *before* it is onlined, unconditionally and with no knob (`arch/aarch64/boot.rs`, `arch/riscv64/boot.rs`), and the secondary loops only drain cross-CPU work and `wfe`/`wfi` — they never enter user mode, so no userspace syscall can originate there | none | as above | reachable only from an internal `yield_current` running on an AP. **One caveat, stated rather than glossed:** `riscv64/boot.rs`'s readback-mismatch arm clears wake-only *after* a successful `bring_up_cpu`, so a RISC-V AP whose three topology writes did not all read back is left online and NOT wake-only — `dispatching = 2`. It still hosts no user task, so it produces no userspace NR 0 of its own; what it would do is make the BSP's NR 0 take the `MultiDispatcher` arm below. It is a defensive path reached only when a scheduler write silently failed, and it is logged (`RISCV_SCHEDULER_SMP_ONLINE_FAIL reason=readback_mismatch`) |
+| `DeferralHeld` | `colliding_deferral_pending_for(cpu)` — the Yield cell on every architecture, plus the FutexWait and 196D foundation cells on RISC-V — or a lost reservation race at step (4) | a drain that returns without clearing the cell it was draining | **it was, on RISC-V** — see §3. Otherwise no: each cell is published inside a trap and cleared by that trap's own drain on every arm, so a fresh trap finds all three clear | none | log `reason=already_deferred`; owed `PreemptOutgoing`; in-lock select + switch | clearing the cell on the exits that leaked it (done, §3) |
+| `RouteNotAdmitted::CpuOutOfRange` | `cpu.0 as usize >= MAX_CPUS` | — | **no** — `try_split_yield_into_frame` applies the identical bound itself, before constructing the owners | none | n/a | none |
+| `RouteNotAdmitted::NoTrapDrainer` | `!GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` | — | **no** — `TrapPathWindow::establish(cpu)` is the first statement of both bridges (`arch/trap_entry.rs`, `arch/riscv64/trap.rs`) and runs before the split seam on all three architectures | none | log `reason=no_trap_drainer`; in-lock select + switch | none |
+| `RouteNotAdmitted::MultiDispatcher` | `(online & !wake_only).count_ones() > 1` | **`yarm.ap_user_dispatch=1`** with `QEMU_SMP >= 2`: `try_enable_ap_user_dispatch` clears an AP's wake-only bit and the count becomes two | **yes — witnessed live**, `YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu` | none | log `reason=multi_cpu`; owed `PreemptOutgoing`; in-lock select + switch | **see §3 — this is the boundary** |
+| `RouteNotAdmitted::NotDispatchCpu` | `sched.current_cpu != cpu` | reachable only once `MultiDispatcher` has passed, i.e. `dispatching <= 1`; the single dispatcher then *is* the only CPU that can host a userspace trap, and a wake-only CPU would have failed `NoCurrent` first | **no**, given the count check above | none | log `reason=not_dispatch_cpu`; in-lock select + switch | none |
+| `NotRunning` | `apply_preempt_outgoing_locked` — both `PreemptOutgoing` and its `PreemptOutgoingIdle` twin refuse | **`yarm.ap_user_dispatch=1`** — witnessed: `TASK_TRANSITION_REFUSED ... reason=wrong_status observed=Runnable` for tid 20205, a userspace `Yield` on the AP | none (fail-closed; the reservation is released) | log `reason=not_running`; `Err(KernelError::TaskMissing)` — the in-lock dispatch is deliberately **not** run | a pre-lock `Complete(Err(TaskMissing))` would be exact parity. Long-standing behaviour, not a U9-RESIDUAL1 regression: `34e4748`'s `yield_current` reached the same refusal through the same owner and answered the same error |
+| `ReenqueueRefused` | `preempt_reenqueue_only` → `enqueue_with_priority` → `RingQueue::push` → `QueueFull` | ≥ `MAX_RUN_QUEUE` (64) runnable tasks of the caller's priority queued on one CPU; `MAX_TASKS` is 512, so this is a load condition, not a knob | possible in principle; not witnessed | **rolled back exactly** — the primitive restores `current` itself, the transaction applies `RollbackPreemptOutgoing` and releases the reservation | owed `PreemptOutgoing`; `on_preempt_selection` hits the identical `QueueFull`, logs *"scheduler inconsistency … preserving current task"* and returns `ContinuedCurrent` — the caller keeps the CPU and the yield returns `Ok` with no switch | a pre-lock `Complete(Ok(()))` with `frame.set_ok(0,0,0)` is exact parity, because the canonical outcome performs no switch |
+
+Four arms are unreachable for a userspace NR 0 by construction. Two more (`ReenqueueRefused`,
+`NotRunning`) have an exact, switch-free pre-lock settlement. **Two do not**, and both need a
+context switch the split route cannot perform.
+
+### §3 — what was completed, and the contract that is missing
+
+#### Completed: the RISC-V drains now settle their deferrals
+
+The 196D foundation, FutexWait and Yield drains in `arch/riscv64/trap.rs` each return early on
+three of the five WA3A mark outcomes — `Idle`, `RefusedRolledBack`, `RefusedNoSchedulerChange` —
+and none of the nine exits cleared the deferral it was draining. The cell outlives the trap, so
+the next trap on that CPU re-enters the drain against a stale outgoing identity, and every later
+userspace NR 0 is refused `DeferralHeld`, because `colliding_deferral_pending_for` counts all three
+cells on RISC-V. The refusals are unchanged; each now settles the cell first. The shared
+x86_64/AArch64 drains never had this shape — their refusal arms fall through to a common `clear`.
+
+That closes `DeferralHeld` as a userspace-reachable arm. It does not close the family.
+
+#### Not completed: `MultiDispatcher`, and why it is not Yield's to close
+
+The deferral this route publishes is consumed by a drain whose selection is taken by ONE owner —
+`SharedKernel::queue_advance_select_step_split`, shared by every queue-advancing drain on every
+architecture. Its first act, before any mutation, is Stage 199D-WA3A-R2-SEAL item D:
+
+```rust
+let dispatch_cpu = sched.current_cpu;
+if dispatch_cpu != cpu {
+    // DISPATCH_STEP_REFUSED_CPU_MISMATCH
+    return CpuDispatch::RefusedCpuMismatch { requested: cpu, authoritative: dispatch_cpu };
+}
+```
+
+`CpuDispatch::RefusedCpuMismatch::tid()` is `None`, and for Yield "no incoming" is not idle — it is
+the one outcome all three drains call an invariant failure (`YIELD_DISPATCH_DONE … incoming=idle`,
+`AARCH64_YIELD_DISPATCH_FAIL reason=no_incoming`, `RISCV_YIELD_DISPATCH_FAIL reason=no_incoming`).
+The caller has already been re-enqueued and `current` already cleared, so the CPU returns to
+userspace having advanced its queue with nothing selected. **That is exactly the stranding the
+admission exists to prevent.**
+
+`sched.current_cpu` is a single global field. `SharedKernel::with_cpu` binds it on entry, on
+whichever CPU acquires the broad lock — so with two dispatching CPUs the binding a route reads
+pre-lock can be, and routinely will be, rebound by the other CPU before that route's drain runs.
+Hence both admission conditions are load-bearing and neither is removable on its own:
+
+* `dispatch_cpu == cpu` is *the drain's own precondition*, asked early so the refusal is free;
+* `dispatching <= 1` is what makes that answer **stable** for the window between the admission and
+  the drain. Drop it and the check becomes a race: it passes, CPU B takes `with_cpu(B)`, and the
+  drain refuses on a queue that has already been advanced.
+
+So a queue-advancing split route cannot serve a multi-dispatcher topology, and this is not
+specific to NR 0. The same boot shows `IPC_RECV_BLOCK_SPLIT_REFUSED cpu=0 tid=2 reason=MultiCpu` —
+NR 2 refusing the same topology through the same admission. NR 1, NR 5, NR 9 and NR 16 are in the
+same position. It is a property of the mechanism, not a residue of this family.
+
+The alternative — settling the yield pre-lock **without** the drain — requires selecting and
+applying an incoming context through rank-local acquisitions, which is a second drain, and is
+forbidden. And it would not be correct anyway: the broad path is safe under multi-dispatch
+precisely *because* `with_cpu` binds `current_cpu` and holds it across the whole transaction, which
+is the mutual exclusion rank-local locks do not provide.
+
+> **The exact missing contract.** The authoritative dispatch binding must become per-CPU: either
+> `SchedulerSubsystem::current_cpu` is replaced by a per-CPU authoritative value, or
+> `queue_advance_select_step_split` authenticates against a per-CPU binding rather than a single
+> global one — so that a queue-advancing publication on CPU A cannot be invalidated by CPU B's
+> broad acquisition. Until that exists, every queue-advancing family must refuse
+> `dispatching > 1`, and NR 0 has a reachable production terminal-dispatch fallback under
+> `yarm.ap_user_dispatch=1`.
+>
+> This is squarely inside the D6 fence (`doc/AI_AGENT_RULES.md` §14.4: no per-CPU scheduler lock
+> types until the x86_64 SMP trampoline split lands and D2/D3 are smoke-stable; `entering_tid` /
+> `exiting_tid` remain Class F). It is a scheduler-wide change requiring its own authorization,
+> its own SMP evidence and its own migration of all six queue-advancing families at once — not a
+> Yield change.
+
+The second open arm, x86_64 `ArchGateOff` under `yarm.d6_switch_proof` / `yarm.d6_switch_a`, is a
+different shape and needs no contract: in those modes the Yield drain is gated off by the same two
+predicates that close the gate, so the refusal is the correct answer to an absent consumer.
+Removing that edge would mean giving a controlled switch-proof diagnostic a competing switch path.
+
+### §4 — what this stage did and did not prove
+
+No policy change was made to `run_yield_transaction`, `try_split_yield_into_frame` or
+`KernelState::yield_current`. The only behavioural change is the nine RISC-V deferral settlements
+in §3.
+
+**Delivered to `wip/u9-yield2` only.** The acceptance for this mission is that NR 0 has no
+reachable production terminal-dispatch fallback on any architecture; it does have one, and the
+directive is explicit that a partial family closure must not be delivered as a closure. Census
+delta is **0** and the census is unchanged at **2 / 0 / 2**.
+
+
+### §5 — the qualification matrix, at `wip/u9-yield2` head `1f7f579` / tree `0673ce3`
+
+Every live artifact below was produced at that exact tree; the AArch64 exit seals name it
+(`sha=1f7f579e… tree=0673ce3a…`), which is what makes them exact-tree artifacts rather than
+inherited ones.
+
+| gate | result |
+|---|---|
+| hosted suite (`cargo test --lib --features hosted-dev -- --test-threads=1`) | **5378 passed / 0 failed / 2 ignored** (base `7d3edd9`: 5366; +12 `u9yield2_family_edge` guards) |
+| freestanding x86_64 / AArch64 / RISC-V | built ×3 |
+| `cargo clippy --lib --features hosted-dev` | **371 warnings, identical class set AND counts** to base `7d3edd9`; both measured in fresh, separate `CARGO_TARGET_DIR`s so the comparison is not a cached replay |
+| `rustfmt --edition 2024 --check` on all 5 changed `.rs` files | clean (`cargo fmt --all` still OOMs on the ~164k-line `tests.rs`; formatted individually) |
+| contract/doc enforcement | `[ok] contract-doc enforcement gate passed` |
+| exit-current-task oracle ×3 per architecture | x86_64 ok ok ok · AArch64 ok ok ok · RISC-V ok ok ok |
+| core smoke | x86_64 ok · AArch64 ok · RISC-V ok |
+| **AP saved-return profile** (`QEMU_SMP=2`, `yarm.ap_user_dispatch=1`) | `STAGE_199_X86_AP_SAVED_RETURN_SEAL … result=ok` |
+| broad-lock census | `with_cpu / with_broad / TOTAL = 2 / 0 / 2`, **unchanged** |
+| artifact residue | `git status --short` = 0, untracked = 0 |
+
+**The Yield numbers, and what they measure.**
+
+| | x86_64 ×3 | AArch64 ×3 | RISC-V ×3 |
+|---|---|---|---|
+| `YIELD_SPLIT_COMMITTED` | 4096 / 4096 / 4096 | 4096 / 4096 / 4096 | 64 / 64 / 64 |
+| `YIELD_SPLIT_REFUSED` | 0 | 0 | 0 |
+| `*_YIELD_INLOCK_DISPATCH_FALLBACK` | 0 | 0 | 0 |
+| `EXIT_TASK_BROAD_ENTER` | 0 | 0 | 0 |
+| `RISCV_DISPATCH_DECLINED` | — | — | 0 / 0 / 0 |
+
+Identical to U9-RESIDUAL1's numbers, and they measure the **single-dispatcher default only**. The
+three core smokes issue `YIELD_SPLIT_COMMITTED = 0` and `YIELD_SPLIT_REFUSED = 0` on all three
+architectures — they contain no NR 0 at all — so they are not a Yield witness in either direction.
+
+`RISCV_DISPATCH_DECLINED = 0` across all three RISC-V boots is the honest reading of §3's repair:
+the nine drain arms it settles are **never taken in production**, so the fix changes no observed
+behaviour. That is what makes it a source-totality repair rather than a bug fix, and it is also why
+the leak survived this long — a deferral cell left set by a branch nothing takes looks exactly like
+a deferral cell that is always clear.
+
+**The edge, reproduced at HEAD.** The AP profile still shows, unchanged from base:
+
+```
+YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu            × 1
+YIELD_INLOCK_DISPATCH_FALLBACK reason=multi_cpu       × 1
+STAGE_199_X86_AP_SAVED_RETURN_SEAL … result=ok
+```
+
+The refusal is still there and the profile still seals. Both facts matter: the first is the edge
+this mission was asked to remove, and the second is the evidence that nothing about that supported
+configuration was disturbed while failing to remove it.
+
+**CENSUS-DELTA: 0.** **Family-edge reduction: none claimed.** One userspace-reachable decline arm
+(`DeferralHeld`, on RISC-V) was removed; `MultiDispatcher` and x86_64 `ArchGateOff` remain. NR 0 is
+**not** closed, this work is **not** delivered to `main`, and **U9 remains OPEN**.
+
+
+---
+
+## U9-DISPATCH-CPU1 — remove ambient CPU authority from queue advance, and settle refused drains safely
+
+**Base:** `origin/main = 7d3edd9`. **Preserved WIP:** `origin/wip/u9-yield2 = 5236de5` (U9-YIELD2,
+never delivered to `main`).
+
+U9-YIELD2 §2 derived the exact contract NR 0 was missing and refused to deliver a partial closure
+without it. This stage supplies that contract.
+
+### §1 — The authority boundary
+
+**What the drain actually authenticated.** `queue_advance_select_step_split` took a `CpuId` and,
+inside the rank-1 scheduler acquisition, compared it against the single global
+`SmpScheduler::current_cpu`:
+
+```rust
+let dispatch_cpu = sched.current_cpu;
+if dispatch_cpu != cpu { return CpuDispatch::RefusedCpuMismatch { .. } }
+```
+
+That field is **ambient**: any CPU that takes the broad lock rebinds it. So a drain executing a
+genuine trap on CPU A, holding a correctly derived `cpu = A`, was refused because CPU B had bound
+the field to itself — while CPU A's own run queue had already been advanced and its `current` slot
+cleared. `RefusedCpuMismatch.tid()` is `None`, and for a Yield "no incoming" is not a legitimate
+outcome: the caller was re-enqueued and `current` was cleared, so the route's own invariant says
+one exists. That is why NR 0's route had to refuse `MultiDispatcher` up front, and why the AP
+under `yarm.ap_user_dispatch=1` fell to broad dispatch.
+
+**The boundary that does exist.** A trap entry knows, from hardware, which CPU it is on, and it
+knows it exactly once — at entry. `TrapPathWindow::establish` is the one place in the tree holding
+that fact, so it is where authority is minted:
+
+```rust
+pub struct DispatchAuthority { cpu: CpuId, epoch: u64 }   // private fields, no setter
+```
+
+* `TRAP_DISPATCH_WINDOW[MAX_CPUS]` holds the live epoch per CPU; `0` means no window is open.
+* `TRAP_DISPATCH_EPOCH_NEXT` starts at 1 and only increments, so an epoch is never reused.
+* `establish` opens the window **before** minting, so no authority can name a window that is not
+  yet live. An out-of-range CPU gets `DispatchAuthority::none`, which is never live — which is why
+  `CpuOutOfRange` stopped being a reachable selection refusal.
+* `is_live()` compares the authority's epoch against its CPU's current window cell. It is false the
+  moment the minting trap **retires**, not merely once some later trap opens one.
+
+The selection owner now refuses `StaleWindow` **outside** the scheduler acquisition — a dead token
+must not even take rank 1 — and `CpuOffline` inside it. Nothing reads `sched.current_cpu`.
+
+**What this is not.** It is not a lock and not a per-CPU lock type: §14.4's prohibition is
+untouched. The existing rank-1 `with_scheduler_split_mut` still serialises every scheduler access;
+only the fact that critical section authenticates against changed. Rank 1 held across the rank-2
+acceptance read is the canonical ascending direction. **The census claim originally recorded here
+— "unchanged: 2 / 0 / 2" — was FALSE; see U9-DISPATCH-CPU2 §1 below, which corrects it and
+removes the regression that made it false.**
+
+**Acceptance-filtered selection.** `dispatch_next_accepted_selection_on(cpu, accept)` replaces
+"dequeue the head, then try to mark it". `accept` asks the read-only sibling of the very transition
+the mark will apply, so the scheduler dequeues only a candidate the mark will take, and rejected
+entries are skipped **in place** — nothing is reprioritised, nothing is duplicated, and the
+selected task's membership is **retained**, because membership tracks queued *and* current tasks.
+
+This also removed an unsound bound. An earlier form retried after a failed mark, capped at
+`runnable_count`. That cap was not a proof: `preempt_reenqueue_only` returns a refused task to the
+tail of **its own priority queue**, so a refused `High` task is selected again ahead of every
+`Normal` one and N attempts are spent rotating within `High`. "At most N attempts" never
+established "every candidate was tried", which is exactly the claim a drain needs before acting as
+though nothing is runnable. `AcceptedSelection::NoneAcceptable { examined }` now carries the number
+of entries **actually examined** — exhaustion is measured, not inferred.
+
+A mark can still refuse after an accepted selection, because the acceptance read and the mark are
+two rank-2 acquisitions. That window is reported as `DispatchAcquire::Contended`, not retried: the
+exact dequeue is undone by the existing inverse, so the world is byte-for-byte as it was found.
+
+### §2 — Refusal settlement
+
+Nine exits across the three RISC-V drains cleared no deferral cell and returned `ReturnToCurrent`.
+Both halves were wrong. The cell outlives the trap, so the next trap re-entered that drain against
+a stale outgoing identity and every later userspace NR 0 was refused `DeferralHeld`. And
+`ReturnToCurrent` is the settlement `RefusedRolledBack` contradicts: undoing the incoming dequeue
+puts that task **back on the runqueue** and leaves **nothing** current, so "return to current"
+returns through a frame belonging to a task that is simultaneously queued.
+
+`queue_advance_acquire_incoming_split` is now the one owner every post-lock queue-advancing drain
+settles through. It performs the mark once, matches all five WA3A outcomes there, and narrows them
+to what a drain can act on — without collapsing them: `Torn` survives as its own variant and every
+drain still routes it to the divergent fatal.
+
+Each drain settles a non-resumable acquire by clearing its deferral, reporting the acquire's **own**
+reason, and landing on the architecture's established idle terminal, which diverges rather than
+returning. On RISC-V that is a new typed reason, `RiscvIdleReason::QueueAdvanceNoIncoming`, and the
+bridge no longer prints `no_runnable_task all_services_blocked` for it — it prints
+
+```
+RISCV_KERNEL_IDLE_QUEUE_ADVANCE_REFUSED cpu=N runnable_queued=K recovery=next_dispatch_on_this_cpu
+```
+
+**The recovery contract.** The settlement is recoverable because nothing was lost: every entry the
+selection examined stayed queued, in its own priority queue, in FIFO order, and the acceptance
+filter never dequeued the ones it rejected. The CPU's next dispatch re-examines them. This is not a
+claim about timers — a tick proves nothing about progress. It is a claim about the queue, and the
+marker prints `runnable_queued` so the claim is checkable in a live log.
+
+**Distinguishing the three "nothing selected" cases.** `tid() == None` is no longer one fact. An
+empty queue is `Idle`. A non-empty queue with nothing markable is `NoneAcceptable` — a stall, not
+an idle system. A refused authority is `Refused`. All three land on the same terminal because there
+is nothing to resume in any of them, but each says which it was.
+
+### §3 — The shared owner, and NR 0's migration
+
+The five per-class seams (`d2_recv`, `d2_send`, `futex_wait`, `yield`, and the U9-QA commit) now
+delegate selection to the one owner and keep only their telemetry, so each class stays legible in a
+live log by its own marker family while there is exactly one selection implementation.
+
+`TerminalRouteTopology` names what a route must prove, because that depends on what its **drain**
+authenticates against:
+
+* `AmbientBound` — the delivered conditions, unchanged, for every family whose gate has not been
+  individually justified;
+* `AuthorityBound` — a drainer and nothing more.
+
+NR 0 declares `AuthorityBound` in **both** adapters of its single yield transaction. The two
+route-local conditions live in one function, `terminal_route_admission_authority_bound`, which both
+the shared admission and the broad adapter call — the broad adapter holds a `&mut KernelState` and
+cannot reach the `SharedKernel` method, and a hand-written copy would reintroduce exactly the
+split/broad drift U9-RESIDUAL1 §3 extracted the transaction to prevent.
+
+`d6_genuine_local_dispatch_step_mut` deliberately **keeps** the ambient check, now spelled
+`AmbientMismatch { authoritative }`.
+
+**AP first entry (D4).** The x86_64 AP's first userspace entry called
+`dispatch_next_on_cpu(cpu).unwrap_or(0)`, which returns a bare TID and therefore threw away the one
+fact the mark needs: whether the step dequeued an entry or continued the existing `current`. The AP
+entered userspace with the task never marked `Running`. It now uses the provenance-preserving
+`on_dispatch_selection_on_cpu` + `commit_dispatch_selection_in_lock`, and denies admission on a
+mark refusal rather than entering userspace anyway.
+
+### §4 — Proof
+
+**Authority lifetime (D2).** `TrapPathWindow::retire()` is idempotent and exact-epoch. `Drop` covers
+every returning path; the **ten** non-returning landings — seven in `arch/trap_entry.rs`, three in
+`arch/riscv64/trap.rs`: idle terminals, torn fatals, ownership transfers — call it explicitly first, because a CPU that enters an idle terminal goes on to accept
+interrupts and dispatch other work, and an authority left live across that transfer would name a CPU
+running something else entirely. A displaced epoch is **never saved**: restoring it would revive an
+authority whose trap is long gone. It is reported instead:
+`TRAP_DISPATCH_WINDOW_ABANDONED cpu= displaced= opened=`.
+
+**Guards.** Every displaced guard was re-derived onto the new contract rather than relaxed; the two
+that could not be stated about the old anchors were replaced by stronger statements about the new
+one. `u9dispatchcpu1_authority` seals the authority's *provenance* — one production minting site,
+inside `establish`, after the window opens; no adapter manufactures one from a bare `CpuId`; private
+fields and no setter; and the two test fixtures are excluded **by name** and must drive the real
+window owner rather than build an epoch by arithmetic.
+
+**Gates, on the frozen tree `sha=ecfffb2 tree=4d2aac9`:**
+
+| gate | result |
+|---|---|
+| hosted `cargo test --lib --features hosted-dev` | **5395 passed / 0 failed / 2 ignored** (base 7d3edd9: 5366) |
+| contract-doc enforcement | pass |
+| three freestanding builds (x86_64 / AArch64 / RISC-V) | pass |
+| `rustfmt --edition 2024 --check`, changed files | clean |
+| clippy vs. fresh-target-dir base | **0 errors both sides; no new warning class** |
+| exit-current-task oracle ×3 per architecture | 9/9 `result=ok`, exact-tree seal |
+| `qemu-x86_64-ap-saved-return-smoke` ×3 | 3/3 `STAGE_199_X86_AP_SAVED_RETURN_SEAL … result=ok` |
+| three core smokes | pass |
+| `qemu-supervisor-crash-restart-smoke` (REAP1) | `SUPERVISOR_CRASH_RESTART_BASELINE … result=ok` |
+| `run-ci-profiles.sh full` (26 profiles) | 14 PASS / 12 FAIL — **identical to base, see below** |
+| broad-lock census | ~~**2 / 0 / 2, unchanged**~~ — **FALSE as delivered; corrected by U9-DISPATCH-CPU2 §1** |
+
+**The 12 failing CI profiles are pre-existing and are not this stage's.** `sender-wake`,
+`ipc-final`, `d6-switch-a`, `d6-switch-proof`, `d6-genuine`, `d2-recv`, `d2-send`, `sched-timeout`,
+`cross-arch-d6-{aarch64,riscv64}` and `smp{2,4}-sender-wake` fail at head. All twelve were re-run at
+base `7d3edd9` in a separate worktree with its own `--build`, and all twelve fail there too — with
+**byte-identical `[error]` sets** (md5 of the error lines matches per profile: d2-recv 8/8 errors,
+d6-genuine 6/6, cross-arch-d6-riscv64 5/5, sched-timeout 2/2). The failures are default-off
+diagnostic knobs whose enabled markers never appear (`D2_RECV_GENUINE enabled marker: MISSING`) plus
+a fork/COW condition in the sender-wake oracle; none is in this stage's diff. The 14 that pass at
+head — including `vm-cow` (Fork/COW), `fault-delivery`, `spawn-lifecycle`, `cap-cnode`,
+`global-state`, `d3-full`, `smp-ready`, `smp2-core`, `smp4-core` — pass at head. **CI-profile delta
+introduced by this stage: 0.**
+
+**The default Yield matrix is unchanged from base**, three runs per architecture:
+
+| | x86_64 ×3 | AArch64 ×3 | RISC-V ×3 |
+|---|---|---|---|
+| `YIELD_SPLIT_COMMITTED` | 4096 / 4096 / 4096 | 4096 / 4096 / 4096 | 64 / 64 / 64 |
+| `YIELD_SPLIT_REFUSED` | 0 | 0 | 0 |
+| `*_YIELD_INLOCK_DISPATCH_FALLBACK` | 0 | 0 | 0 |
+| `DISPATCH_STEP_NONE_ACCEPTABLE` | 0 | 0 | 0 |
+| `QUEUE_ADVANCE_ACQUIRE_CONTENDED` | 0 | 0 | 0 |
+| `TRAP_DISPATCH_WINDOW_ABANDONED` | 0 | 0 | 0 |
+
+That the new refusal counters are all zero is the point: the single-dispatcher default takes none
+of the paths this stage added, so nothing about the delivered configuration moved.
+
+### The two results, reported separately
+
+**RESULT 1 — the shared-authority repair, and the witnessed NR 0 multi-dispatcher migration.**
+
+At base, the AP profile showed the edge this mission was asked to remove:
+
+```
+YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu            × 1
+YIELD_INLOCK_DISPATCH_FALLBACK reason=multi_cpu       × 1
+```
+
+At head, on the same profile (`QEMU_SMP=2`, `yarm.ap_user_dispatch=1`), both are **0**, and the
+AP's Yield is witnessed end to end through the corrected pre-lock path:
+
+```
+X86_AP_FIRST_ENTRY_RUNNING_OK cpu=1 tid=20205 provenance=dequeued result=ok
+YIELD_SPLIT_COMMITTED cpu=1 tid=20205
+YIELD_DISPATCH_DEQUEUE_OK cpu=1 tid=20205
+YIELD_DISPATCH_DONE result=ok cpu=1 incoming=20205 count=1
+X86_AP_SAVED_FRAME_COMMITTED cpu=1 syscall=Yield task_exact=1 rip_after_syscall=1 tid=20205 asid=5 result=ok
+X86_AP_SAVED_DISPATCH_OK    cpu=1 mode=saved scheduler_selected=1 continuations=1 tid=20205 result=ok
+X86_AP_SAVED_FRAME_RESUMED  cpu=1 syscall=Yield continuations=1 stack_ok=1 registers_ok=1 result=ok
+```
+
+This is a **successful AP Yield with correct continuation** — not `multi_cpu` replaced by
+`not_running`, and not a broad fallback. CPU 1 selected from CPU 1's own queue, on CPU 1's own
+authority, while the ambient binding named the BSP; the saved-frame continuation survived the
+migration with `stack_ok=1 registers_ok=1`; and the profile still seals `result=ok` with zero
+duplicate entries, zero duplicate continuations and zero wrong-CPU continuations. Reproduced 3/3.
+
+**RESULT 2 — what remains: diagnostic NR 0 edges, and the census.**
+
+* **x86_64 `ArchGateOff` remains**, unchanged and deliberately preserved as a diagnostic. It is not
+  an authority question and this stage did not touch it.
+* **Other families keep `AmbientBound`.** `d2_recv`, `d2_send`, `futex_wait` and the AArch64
+  direct-dispatch drain still publish under the delivered conditions. Each is individually
+  migratable on the same contract; none was migrated here, because none was justified here.
+* **Six direct consumers of the mark seam remain** — four in `arch/trap_entry.rs` (D2 send, D2
+  recv, the AArch64 direct-dispatch drain, the D6-genuine mut dispatch) and two in
+  `arch/riscv64/trap.rs` (D2 send, D2 recv). Each still matches all five outcomes inline, and the
+  guard pins the counts per shape so a delegating drain cannot re-open a match the owner owns. Only
+  the AArch64 direct-dispatch drain's "nothing selected" marker was corrected here, to name which
+  of the three cases occurred rather than calling all of them idle.
+* ~~**CENSUS-DELTA: 0.** `with_cpu / with_broad / TOTAL` is still **2 / 0 / 2**.~~ **This line was
+  false when written.** The stage added a production broad `SharedKernel::with` callsite at
+  `src/arch/riscv64/boot.rs`, taking `with_broad` from 0 to 1, and the claim was never measured —
+  it was asserted from an ad-hoc `grep` of `.with_cpu(` alone. U9-DISPATCH-CPU2 §1 removes the
+  callsite and republishes the census from the guard's own scanner. The rest of the sentence
+  stands: this stage removed an
+  *authority* mismatch, not a broad-lock acquisition, and claims no census reduction.
+
+---
+
+## U9-DISPATCH-CPU2 — remove the broad-lock regression, and establish refusal recovery
+
+**Base:** `origin/main = 26c1c44` (U9-DISPATCH-CPU1). The delivered AP Yield migration is
+preserved unchanged. **U9 remains OPEN.**
+
+### §1 — The census contradiction, reproduced before editing
+
+At `26c1c44`, `src/arch/riscv64/boot.rs:1021` read the queue-advance idle diagnostic's
+`runnable_queued=` field like this:
+
+```rust
+let queued = shared.with(|k| k.runnable_count_on_cpu(cpu));
+```
+
+`SharedKernel::with` takes `self.state.lock()` — the whole-`KernelState` guard. That is a **broad
+acquisition**, and the fact that the closure reads only one scheduler field does not make it
+narrow. It added a production `SharedKernel::with` callsite to a tree whose audited broad-`with`
+total is **zero**, for a log line. The delivery record that shipped it said the census was
+unchanged. That claim was false.
+
+**The existing scanner already detected it.** Run against the exact delivered source, two of the
+seven `tests/broad_lock_census_guard.rs` cases fail and name the site:
+
+```
+NEW  src/arch/riscv64/boot.rs: found 1 (not in the census)
+broad `with` total drifted (after subtracting 1 thread_local false positive)
+  left: 1   right: 0
+```
+
+**Why qualification reported green: the integration suite was never run.** Not a wrong tree, not
+stale output. The U9-DISPATCH-CPU1 qualification ran `cargo test --lib --features hosted-dev`, and
+`--lib` builds **only the library target**; its own log shows exactly one binary — `Running
+unittests src/lib.rs` — and no `tests/*.rs` target is compiled at all. The other gate,
+`scripts/check-contract-doc-enforcement.sh`, runs three narrow `cargo test -q <name>` filters
+(`trap_router_maps_syscall`, `proc_v2_golden_vector_is_stable`, `vfs_v1_golden_vector_is_stable`),
+none of them a census test.
+
+There is a second half to the failure, and it is the more instructive one. The census figure in
+that record was not produced by the guard's scanner at all — it was asserted from an ad-hoc
+`grep -rn "\.with_cpu(" src/arch/` run by hand. That method cannot see a `SharedKernel::with`
+callsite even in principle, and it never counted the `state.lock()` form either. **A measurement
+substituted for the owner of that measurement will agree with itself and with nothing else.**
+
+**The repair.** The number was never the problem, so it is preserved exactly — same explicit `cpu`,
+same `Scheduler::runnable_count_on`, same meaning. What changes is the domain it is read in:
+
+```rust
+let queued = shared.runnable_count_on_cpu_split_read(cpu);
+```
+
+`runnable_count_on_cpu_split_read` is the existing rank-1 scheduler seam, where every other reader
+of that field already lives. The CPU is a **parameter**, not `sched.current_cpu`: an idle landing
+reports its own queue, and reading the ambient binding would print another CPU's backlog under this
+CPU's name — the same ambient-authority confusion U9-DISPATCH-CPU1 §1 removed from the selection
+owner. The diagnostic was not weakened, renamed, excluded from the scanner, or traded away.
+
+**All acquisition forms, recomputed with the guard's own scanner and file set:**
+
+| form | `26c1c44` (delivered) | here | audited |
+|---|---|---|---|
+| `with_cpu` | 2 | **2** | 2 |
+| `with_broad` (`SharedKernel::with`) | 2 — 1 production + 1 `thread_local` false positive | **1** — the false positive only | 0 + 1 FP |
+| raw `.state.lock()` | 3 | **3** | 3 |
+| `AUDITED_ACQUISITION_TOTAL` (`with_cpu + with_broad`) | — | **2** | 2 |
+
+The three `state.lock()` sites are the **bodies** of `SharedKernel::lock`/`with`/`with_cpu` — the
+implementations every callsite goes through, not callsites — which is why the audited acquisition
+total excludes them. All 7 census cases pass. The false claims in the U9-DISPATCH-CPU1 record above
+are struck through in place rather than deleted, so the correction is legible next to what it
+corrects.
+
+**A second guard, broken by the same stage and by the same blind spot.**
+`tests/riscv64_timer_plic_scope::timer_is_armed_at_the_boot_safe_point_not_at_idle` also fails at
+`26c1c44`. U9-DISPATCH-CPU1 added a comment that *quotes* `RISCV_KERNEL_IDLE_WAITING_FOR_IO` while
+explaining why that line is no longer emitted for a refusal. The guard slices
+`.split(MARKER).nth(1)`, so the quotation silently retargeted the slice onto the gap **between** the
+comment and the real marker — which contains neither the re-establish call nor the halt. Prose is
+allowed to quote a marker; a guard is not allowed to be defeated by prose, so the anchor now drops
+comment lines before locating the marker, exactly as the in-tree `code()` helpers do.
+
+### §2 — The recovery contract, from executable paths
+
+U9-DISPATCH-CPU1 D3 proved that rejected entries stay queued, in order. That is a statement about
+**placement**, not about **progress**, and `recovery=next_dispatch_on_this_cpu` named no owner and
+no event. Traced through the real code, the chain is:
+
+```
+settled refusal
+  → wfi/hlt, IRQs as the trap left them, current == None, no frame restored
+     (RISC-V additionally re-enables sstatus.SIE at the idle boundary, so the halt is
+      genuinely wake-capable rather than a masked spin)
+  → timer IRQ → try_split_timer_dispatch
+       • NON-preempting tick → ticks, acks, re-arms, PostWorkCommitted
+                             → dispatches NOTHING, returns to the idle loop
+       • preempting tick     → NotHandled → the broad arm
+  → Trap::TimerInterrupt, whose only dispatch action is `if should_preempt { yield_current() }`
+  → yield_current with current == None: the yield transaction declines NoCurrent, no
+    Running→Runnable transition is owed, and it falls through to
+    on_preempt_current_cpu_selection()
+  → PriorityScheduler::on_preempt_selection skips its re-enqueue block (no current) and calls
+    dispatch_next_selection() — the plain head dequeue
+  → commit_dispatch_selection_in_lock applies the exact Runnable→Running mark,
+    rolling the dequeue back through preempt_reenqueue_only_on if it refuses
+  → the ordinary in-lock architectural restore → userspace
+```
+
+So recovery **exists**, it **does** mark `Running`, and it reaches userspace. Seven cases in
+`u9dispatchcpu2_recovery` establish this by **driving the real owners**, not by reading them:
+an idle CPU with ordinary queued work dispatches it and marks it `Running`; the task leaves the
+queue exactly once; and priority and FIFO order behind it are untouched.
+
+**The recovery event is a *preempting* tick, not any tick.** A non-preempting tick reaches
+`PostWorkCommitted`, which sets the broad-dispatch skip and dispatches nothing. A record that said
+"the timer will re-dispatch" would have been true only for a subset of ticks.
+
+**Two findings the trace produced.**
+
+**(1) Recovery is not the acceptance-filtered owner.** It calls `dispatch_next_selection()`, which
+dequeues the head of the highest non-empty priority queue whether or not that head can be marked.
+`dequeue_highest` scans High → Normal → Low, and a rollback returns a refusal to the tail of **its
+own** priority queue.
+
+**(2) The two admission points diverge.** They gate the same run queues and do not ask the same
+question:
+
+| | status transition | exact incarnation |
+|---|---|---|
+| off-lock acceptance filter (`queue_advance_select_step_split`) | required | **required** |
+| in-lock commit (`commit_dispatch_selection_in_lock`) | required | *not required* |
+
+So a `Runnable` queued task with no ASID is `NoneAcceptable` to a drain — which settles the CPU
+idle — and perfectly dispatchable to the timer one quantum later, which finds
+`task_asid(tid) == None`, **skips** the address-space switch, and marks it `Running` anyway. The
+drain fails closed; recovery fails open; same queue, same CPU, one quantum apart.
+
+**Reachability, settled rather than assumed.** No writer produces that state:
+`spawn_thread_core` binds the ASID and sets `Runnable` **before** the enqueue; `unbind_task_asid` —
+the only writer that clears an ASID — has **no production caller at all**; and `DispatchIncoming`
+requires `Runnable`, while the `Exited`/`Dead`/`Faulted` writers act on the *current* task or on one
+already withdrawn from its queue. The acceptance filter is therefore a **fail-closed guard on a
+state nothing produces**. The divergence is a latent contradiction, not a live stall: **no eligible
+work is stranded**, and the "permanently invalid entries must not strand eligible work" condition
+is satisfied because there are no such entries to strand it.
+
+### §3 — The boundary, measured rather than asserted
+
+The obvious repair is to ask the same `MarkedIncarnation::resolve` question at
+`commit_dispatch_selection_in_lock`, before the status write, letting a refusal take the exact
+inverse a status refusal already takes. **It was implemented and measured, and it is not minimal:**
+168 hosted cases fail, at three sites —
+
+| site | refusals |
+|---|---|
+| `dispatch_next_task` | 272 |
+| `yield_current` | 58 |
+| `yield_current_to` | 8 |
+
+Those are not stale fixtures. `dispatch_next_task` is the kernel's ordinary in-lock dispatcher, and
+what the failures show is that the broad path's dispatch contract **deliberately does not require an
+incarnation**: `yield_current` reads `task_asid(tid)` and treats `None` as "no address space to
+switch to", not as a refusal.
+
+So the boundary is exact: **the two admission points cannot be reconciled at the commit without
+first deciding whether an incarnation is a dispatch precondition on the broad path at all.** That
+decision governs `dispatch_next_task` and is not this stage's to make on the strength of a state no
+writer produces. The change is reverted. The divergence is left as an **executable measurement**
+(`recovery_dispatches_a_candidate_the_drain_refused_as_unmarkable`,
+`the_two_admission_points_differ_only_in_the_incarnation_rule`,
+`the_unmarkable_state_has_no_production_writer`) so the next stage inherits a number rather than a
+suspicion — and so that a stage which does change the contract has to edit those cases deliberately.
+
+### §4 — Qualification, on the frozen tree `sha=f850ae3 tree=67919cb`
+
+| gate | result |
+|---|---|
+| **`broad_lock_census_guard`** (the omitted suite) | **7/7 pass** (2 failed at base) |
+| every integration target (`cargo test --tests`) | all pass except one pre-existing, see residual |
+| hosted `cargo test --lib --features hosted-dev` | **5402 passed / 0 failed / 2 ignored** (base 5395) |
+| contract-doc enforcement | pass |
+| three freestanding builds (x86_64 / AArch64 / RISC-V) | pass |
+| `rustfmt --edition 2024 --check`, changed files | clean |
+| clippy vs. fresh-target-dir base at `26c1c44` | **byte-identical class set; 0 errors both sides** |
+| exit-current-task oracle ×3 per architecture | **9/9 `result=ok`**, every seal carrying `tree=67919cb` |
+| **AP saved-return smoke ×3** | **3/3 sealed**, `duplicate_entries=0 wrong_cpu_continuations=0` |
+| three core smokes | pass |
+| broad-lock census | **`with_cpu`/`with_broad`/`state_lock` = 2 / 0 / 3**, acquisition total **2** |
+
+**The AP acceptance criterion, reproduced three times.** Successful split Yield with correct
+stack/register continuation and **zero** broad Yield fallback:
+
+```
+committed=1  refused=0  broad_fallback=0  ap_entry=1  resumed=1     (×3)
+STAGE_199_X86_AP_SAVED_RETURN_SEAL … duplicate_continuations=0 wrong_cpu_continuations=0 result=ok
+```
+
+**Three-architecture Yield/exit evidence retained**, unchanged from base:
+
+| | x86_64 ×3 | AArch64 ×3 | RISC-V ×3 |
+|---|---|---|---|
+| `YIELD_SPLIT_COMMITTED` | 4096 | 4096 | 64 |
+| `YIELD_SPLIT_REFUSED` | 0 | 0 | 0 |
+| `*_YIELD_INLOCK_DISPATCH_FALLBACK` | 0 | 0 | 0 |
+| `RISCV_KERNEL_IDLE_QUEUE_ADVANCE_REFUSED` | — | — | 0 |
+| `TRAP_DISPATCH_WINDOW_ABANDONED` | 0 | 0 | 0 |
+
+D1 membership, D2 explicit retirement and D4 AP first-entry `Running` behaviour are untouched and
+still covered by their own cases.
+
+### Residual, reported separately
+
+* **`server_dies_runner_scope` fails 2 of 10** — `required_marker_chain_is_ordered_and_complete`
+  and `required_chain_is_scoped_to_the_witnessed_transaction`, both missing
+  `EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG}`. Re-run at a freshly built `26c1c44`: **the same
+  2 fail, identically**. Pre-existing, a different family (the server-dies runner's marker chain),
+  and not touched here. It is red and will stay red until someone owns it.
+* **The admission divergence** stands, with its boundary stated in §3 and its reachability at zero.
+* **Family restrictions unchanged.** x86_64 `ArchGateOff` remains a preserved diagnostic; `d2_recv`,
+  `d2_send`, `futex_wait` and the AArch64 direct-dispatch drain still publish `AmbientBound`; six
+  direct consumers of the mark seam remain, each matching all five outcomes inline. **No family was
+  migrated in this stage**, as instructed — the correction was completed first.
+* **CENSUS-DELTA vs `26c1c44`: −1 production broad `with`.** Against the audited totals the census
+  is now *in agreement* rather than merely *claimed* to be.
+
+---
+
+## U9-DISPATCH-CPU3 — dispatch eligibility, and the missing `Running` mark
+
+**Base:** `origin/main = 8265461`. The corrected 2/0/2 census, explicit CPU authority, membership
+rules, authority retirement and the AP Yield migration are all preserved. No family was migrated.
+**U9 remains OPEN.**
+
+### §1 — The unreachability proof, replaced
+
+`the_unmarkable_state_has_no_production_writer` checked seven hand-picked files for one
+ASID-clearing function and looked for the word `"Reserved"` in the enqueue seam. Neither
+establishes what it was cited for, and the file list was a sample rather than a corpus.
+
+It is replaced by a census built over a **walked** corpus — every `.rs` under `src/` and `crates/`
+with `#[cfg(test)]` modules stripped, the same corpus definition `broad_lock_census_guard` uses —
+which tests **preconditions**, not vocabulary.
+
+**The four ways a queued task can fail to be dispatchable are independent.** Proving one
+unreachable proves nothing about the others:
+
+| mode | refused by (split) | refused by (broad) |
+|---|---|---|
+| **absent TCB** | `MarkedIncarnation::resolve` → `None` | `apply_dispatch_transition` → `TaskMissing` |
+| **non-`Runnable` status** | `dispatch_transition_would_be_accepted` | `apply_dispatch_transition` |
+| **missing ASID** | `MarkedIncarnation::resolve` → `None` | **nothing** — deliberate, see §2 |
+| **changed incarnation** | the mark token carries the exact ASID | **no incarnation concept** |
+
+**The enqueue seam enforces none of them.** `refuse_reservation_locked` refuses exactly one thing —
+a `Reserved` spawn reservation — and returns `Ok(None)` for a TID with no slot at all, because
+TID 0 has no TCB by construction. Its own doc says it: *"The run queue carries bare TIDs with no
+status precondition."*
+
+**So where does missing-ASID safety come from? The spawn transaction's step order.** `spawn_txn`
+binds the ASID and publishes the image before the enqueue, and the enqueue is structurally its last
+step — *"enqueue — rank 1, last, the only step that touches a run queue"*. That ordering is the
+precondition, and it is what the guard now tests.
+
+This distinction was load-bearing. `register_task` leaves `asid: None` and **does** have production
+callers: `register_core_graph` registers init, process-manager, VFS, supervisor and the POSIX server
+that way. Those registrations enqueue **nothing** — the servers reach a run queue only through the
+spawn transaction, after the bind. Had `register_core_graph` enqueued them, the old claim would have
+been false, and the replaced guard would not have noticed.
+
+The one propagation edge is pinned too: `initialize_thread_incarnation_locked` copies `parent.asid`
+as an `Option` with no precondition, and `parent_facts_locked` reads it with none either — so a
+child's incarnation is exactly as good as its parent's, and the induction bottoms out on the
+registration callers above.
+
+### §2 — The broad dispatch contract, classified before changing it
+
+The 168 failures U9-DISPATCH-CPU2 measured established compatibility impact. Classified against
+their production counterparts, the dominant TIDs (1, 2, 41, 42, 77, 81, 82, 900, 901 …) are
+`register_task*` fixtures inside `runtime.rs`'s own test modules: **incomplete test fixtures** that
+model a userspace task and skip the binding every production constructor performs.
+
+**When is an ASID required for the architectural continuation?** When the dispatch resumes
+userspace. The idle task never does — which is why `MarkedIncarnation::resolve` admits TID 0 without
+one, and why requiring an incarnation at the broad *selection* would be wrong rather than merely
+inconvenient.
+
+So the two paths legitimately admit different execution shapes, and both contracts are now stated
+and enforced by test:
+
+* the **split** drains always resume userspace → they require the exact incarnation, in the
+  acceptance filter and again in the resume;
+* the **broad** in-lock path also serves kernel-internal transitions → it cannot require one at the
+  selection;
+* at the **userspace boundary**, the AArch64 owner `post_switch_restore_facts_split` already
+  refuses an incarnation-less task, mapping it to the idle outcome *before* reading any context.
+
+**A repair was implemented at the more permissive x86_64 twin, and reverted.** It cost 3 tests
+including `a_task_with_no_asid_still_restores_and_is_not_refused`, a deliberate equivalence contract
+whose own comment says *"strengthening that into a refusal is explicitly out of contract"* — and §1
+shows the state it would guard cannot be queued at all. Guarding an enforced-impossible state by
+overriding a deliberate contract is not a repair.
+
+### §3 — The missing `Running` mark, repaired at its owner
+
+Carrying the recovery chain past scheduler state — which is what §3 asked for — found a live
+x86_64 defect that stopping at `current_tid` could not see.
+
+`revalidate_idle_owner_after_drains` runs on **every** trap return whose exiting owner is idle
+(`None | Some(0)`). It selects a real task (TID 0 is short-circuited to `Idle` before it gets
+there), loads that task's saved user context into the trap frame, and reports `Replacement(next)` —
+on which the x86_64 trap tail `iretq`s into ring 3. **It never marked the task `Running`.**
+
+The task therefore ran in userspace while its TCB said `Runnable`: the scheduler and the task table
+disagreed about what was running on that CPU for the whole timeslice, and the next
+`PreemptOutgoing` — whose `expected_from` is `Running` — would refuse.
+
+This is the defect U9-DISPATCH-CPU1 **D4** repaired at the AP's first userspace entry. Both paths
+that reach ring 3 without the broad dispatcher were missing the mark `dispatch_next_task` performs
+through `commit_dispatch_selection_in_lock`. D4 fixed one; this fixes the other, the same way and
+through the same owners:
+
+```
+select (provenance-preserving)  →  mark (typed transition)  →  snapshot  →  frame
+```
+
+**Deliberately single-axis.** The mark is `apply_dispatch_transition` — status only — and **not**
+`d6_genuine_mark_running_via_task_seam`, which would also impose the incarnation requirement §2
+settled. Folding both in would re-litigate a settled contract while repairing a different defect.
+The differential against the retired broad body proves the confinement: outcome, trap frame, both
+`current` slots, both queue lengths, the CPU binding and the pending TLS-restore request are
+byte-identical; the status is the only divergence, and it is now asserted in **both** directions —
+legacy leaves `Runnable`, the transaction leaves `Running`, and the frames compare equal.
+
+A refused mark takes the **existing** rollback, before any frame is written. Two settlements, both
+pre-existing: refused mark, and unrestorable snapshot. No new control flow, no retry, no fatal.
+
+**Three deliberate equivalence contracts were changed, not worked around.**
+`no_task_status_is_written_on_success_or_on_rollback` became
+`the_replacement_is_marked_running_and_bystanders_are_untouched`; both differentials drop the status
+from the compared tuple and assert the divergence explicitly, so it is a tested fact rather than an
+omission.
+
+### §3 — the recovery chain, and how it is labelled
+
+| stage | evidence | kind |
+|---|---|---|
+| refusal settlement → idle entry | the settled-idle fixture is built by a real publisher that dispatches and blocks | hosted |
+| interrupt masking at each landing | x86_64 `hlt` / AArch64 `wfi` with flags as the trap left them; **RISC-V positively re-arms** `sstatus.SIE` via `reestablish_idle_boundary()` before the `wfi`, asserted to precede the halt | source |
+| the wake | preempting vs non-preempting tick, driven over `scheduler_tick_if_no_switch_split_mut` | hosted |
+| selection → `Running` mark → address space → saved frame | `revalidate_idle_owner_after_drains` drives all four; the frame is checked to carry the task's own PC, SP and register file, and its exact ASID | hosted |
+| userspace continuation | `X86_AP_SAVED_FRAME_RESUMED cpu=1 syscall=Yield stack_ok=1 registers_ok=1 result=ok` | **live** |
+
+No case claims userspace recovery from a changed `current_tid`; the hosted chain ends at the trap
+frame, and the ring-3 half is the live AP seal, labelled as such.
+
+Deterministic interleavings cover contention (a candidate reaped between enqueue and restore: the
+advance is undone, `current` cleared, no partial frame), an invalid entry ahead of valid work (the
+eligible task behind it is still reached, with its own continuation), and priority/FIFO preservation.
+
+### §4 — Qualification, frozen at `sha=d73e1df tree=55b5c82`
+
+Recorded separately, as required:
+
+| gate | result |
+|---|---|
+| hosted `cargo test --lib --features hosted-dev` | **5415 passed / 0 failed / 2 ignored** (base 5402) |
+| **`cargo test --tests`, every integration target** | all pass **except the established residual** below |
+| — of which `broad_lock_census_guard` | **7/7** |
+| three freestanding builds (x86_64 / AArch64 / RISC-V) | pass |
+| `rustfmt --edition 2024 --check`, changed files | clean |
+| clippy vs. fresh-target-dir base at `8265461` | **identical lint classes; 0 errors both sides** |
+| exit-current-task oracle ×3 per architecture | 9/9 `result=ok`, every seal carrying `tree=55b5c82` |
+| **AP saved-return smoke ×3** | **3/3 sealed**, `mark_refused=0` |
+| three core smokes | pass |
+| broad-lock census | **`with_cpu`/`with_broad`/`state_lock` = 2 / 0 / 3**, acquisition total **2** |
+
+**Three-architecture Yield/exit evidence retained**, unchanged from base:
+
+| | x86_64 ×3 | AArch64 ×3 | RISC-V ×3 |
+|---|---|---|---|
+| `YIELD_SPLIT_COMMITTED` | 4096 | 4096 | 64 |
+| `YIELD_SPLIT_REFUSED` | 0 | 0 | 0 |
+| `*_YIELD_INLOCK_DISPATCH_FALLBACK` | 0 | 0 | 0 |
+| `EXIT_TASK_OWNER_REVALIDATE_MARK_REFUSED` | 0 | 0 | — |
+
+The AP acceptance criterion, three times: `committed=1 refused=0 broad_fallback=0 ap_entry=1
+resumed=1`, sealing with `duplicate_continuations=0 wrong_cpu_continuations=0`.
+
+### Residual, reported separately
+
+* **`server_dies_runner_scope` fails 2 of 10** — `required_marker_chain_is_ordered_and_complete`
+  and `required_chain_is_scoped_to_the_witnessed_transaction`, both missing
+  `EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG}`. Established residual, reproduced identically at
+  `26c1c44` in the previous stage and unchanged here. Different family, not touched. Still red.
+
+* **The quantum and the hardware deadline are one constant.** `Timer::new(BOOTSTRAP_TIMER_DEADLINE_TICKS)`
+  sets the quantum in **timer interrupts** — `tick_and_check` is called once per interrupt and
+  decrements by one — while the same constant is passed to `program_timer_deadline` as a **hardware
+  deadline**. One constant, two incompatible units:
+
+  | | constant | preempting tick after |
+  |---|---|---|
+  | RISC-V | 10 | 10 interrupts |
+  | AArch64 | 3 125 000 | 3.1 M interrupts |
+  | x86_64 | 50 000 000 | 50 M interrupts |
+
+  This stalls nothing in ordinary operation, which advances through syscalls, IPC and wakes rather
+  than through quantum preemption. What it bounds is precisely the **refusal-recovery trigger**:
+  "the next preempting tick will re-dispatch" is a usable claim on RISC-V and, at these values, not
+  a usable one on x86_64 or AArch64. Recorded with an executable measurement rather than repaired —
+  changing the quantum is a scheduler-policy change that would alter the preemption cadence of every
+  live profile, which is outside this stage's scope. The exact contract a future stage needs is:
+  **separate the quantum from the hardware deadline, and give the quantum a value in interrupts.**
+
+* **Family restrictions unchanged.** x86_64 `ArchGateOff` remains a preserved diagnostic; `d2_recv`,
+  `d2_send`, `futex_wait` and the AArch64 direct-dispatch drain still publish `AmbientBound`; six
+  direct consumers of the mark seam remain. No family was migrated, as instructed.
+
+* **CENSUS-DELTA vs `8265461`: 0.**
+
+## U9-TIMER1 — retire preempting-timer broad dispatch
+
+**Base:** `origin/main = a556bbd`. Canonical 203A/203C; named prerequisite for U9/204E. The
+corrected 2/0/2 census, explicit CPU authority, membership rules, authority retirement, the AP Yield
+migration and CPU3's missing-`Running` repair are all preserved. **U9 remains OPEN.**
+
+**Delivered:** the ordinary preempting `TimerInterrupt` — every tick that preempts a running task —
+now executes through subsystem owners on all three ports. Zero of them reach the terminal broad
+dispatcher, measured on x86_64, AArch64 and RISC-V. **CENSUS-DELTA: 0.**
+
+### §1 — What the broad timer path actually did, and why the branch was declared unprovable
+
+U9-TM shipped the non-preempting half of `try_split_timer_into_frame` and declared the other half
+unprovable: across 77 recorded profiles on all three architectures, `YARM_SCHED_TICK … preempt=1`
+occurred zero times, so `scheduler_tick_if_no_switch_split_mut` refused every preempting tick and the
+terminal broad dispatcher served it.
+
+**That zero was an observability limit, not a property of the branch.** U9-DISPATCH-CPU3 measured the
+cause and recorded it as a residual: `Timer::new` and `program_timer_deadline` receive the **same
+constant in incompatible units**. `tick_and_check` is called once per interrupt, so the constant is a
+count of interrupts on one side and a hardware interval on the other:
+
+| | constant | a preempting tick arrives after |
+|---|---|---|
+| RISC-V | 10 | 10 timer interrupts |
+| AArch64 | 3 125 000 | 3.1 million timer interrupts |
+| x86_64 | 50 000 000 | 50 million timer interrupts |
+
+No qualification run is long enough to observe one on two of the three ports. §3 separates the units.
+
+**The outcomes of the broad arm, enumerated.** Ack → bootstrap guard → `tick_scheduler_timer()` →
+`process_ipc_timeout_deadlines` → five timer-only `maybe_run_*` proof hooks → `if should_preempt {
+yield_current()? }` → `program_timer_deadline`. Inside `yield_current`, a preempting tick reaches
+`run_yield_transaction` through `BroadYieldOwners`, and its behaviour splits three ways — which is
+what the conversion has to preserve:
+
+| this CPU | what `yield_current` does |
+|---|---|
+| has a current task | the transaction commits: `Running → Runnable`, re-enqueue at the priority tail, clear `current`, skip the in-lock dispatch |
+| idle, run queue **empty** | `NoCurrent`, silent; the `Running → Runnable` step is skipped (`outgoing_tid` is `None`); `on_preempt_current_cpu_selection()` answers `None`; the `else` arm is guarded by `if let Some(tid) = outgoing_tid` — **nothing happens at all** |
+| idle, run queue **non-empty** | `NoCurrent`, but the selection **dequeues** and the in-lock path dispatches onto the idle CPU |
+
+**A preempting timer IS a yield with a different provenance.** It re-enqueues the running task at its
+priority tail, clears `current`, and defers the selection to the post-lock drain — exactly what NR 0
+publishes. So no new policy is needed: the converted branch drives the SAME
+`run_yield_transaction` through the SAME `SharedYieldOwners`, and the broad adapter keeps driving the
+identical transaction through `BroadYieldOwners`, so the two cannot come to disagree while both are
+needed.
+
+### §2 — The conversion
+
+`try_split_timer_into_frame` now has three settlements, each naming its own post-state:
+
+| tick | this CPU | what runs | disposition |
+|---|---|---|---|
+| preempting | has a current task | `run_yield_transaction`, one tick, ack, re-arm | `QueueAdvanceCommitted` — the post-lock drain performs the switch |
+| preempting | idle, queue empty | one tick, ack, re-arm | `PostWorkCommitted` — there is nothing to preempt |
+| non-preempting | either | the unchanged atomic no-switch seam, one tick, ack, re-arm | `PostWorkCommitted` |
+
+**The ordering is the point.** `timer_would_preempt_split_read` (rank 1, non-mutating) is asked
+**before** anything ticks. Every step of the transaction refuses before it writes, so a decline
+reaches the unchanged broad arm having mutated **nothing** — the same property the non-preempting
+refusal always had. Ticking first and declining afterwards would force a choice between
+double-ticking in the broad arm and silently dropping a quantum's preemption; neither is acceptable,
+so it is not the order.
+
+**No syscall-return encoding.** NR 0 finishes with `frame.set_ok(0, 0, 0)` because a yield is a
+syscall whose caller observes a result. An interrupted task has no syscall in flight: its PC is the
+interrupted instruction. The route **cannot** write a result even by accident — it takes no frame —
+and the outgoing context is supplied by the bridge's existing capture, which runs ahead of the timer
+route, reads the live frame keyed on `current_tid_authoritative`, and copies all 32 GPRs plus PC/SP.
+`finalize_split_handled_syscall` stays gated on `TrapEvent::Syscall`, which a `TimerInterrupt` never
+is.
+
+**The idle settlement is admitted by the RUN QUEUE, not by `current`.** `NoCurrent` alone does not
+license settling the tick: the third row of §1's table is a real queue-advancing consumer, and
+absorbing it would silently drop a dispatch. So the route probes `runnable_count_on_cpu_split_read`
+and declines a non-empty queue under its own reason, `no_current_runnable` — before it ticks.
+
+Both bridges (`arch/trap_entry.rs`, `arch/riscv64/trap.rs`) gained one `QueueAdvanceCommitted` arm
+emitting `QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED … reason=timer_preempt_committed`. No scheduler lock
+sharding, no new scheduling policy, no second drain, and no broad fallback after mutation.
+
+### §3 — Separating the quantum from the hardware interval
+
+`boot::sched_quantum_ticks()` is now the single quantum owner: unset it returns
+`BOOTSTRAP_TIMER_DEADLINE_TICKS` verbatim, so **an unconfigured boot has the delivered cadence** and
+the §1 residual is separated rather than hidden. `yarm.sched_quantum_ticks=N` is the §3-authorised
+default-off override. It changes **only** the interrupt count that makes a quantum — the hardware
+interval is programmed from the constant directly and is not reachable from the override — so every
+interrupt still arrives on its production schedule and is serviced by the production route.
+
+It covers both boot orders, because the three ports capture their command line at different points
+relative to kernel-state construction: x86_64 captures in `prepare_arch_boot`, ahead of
+`init_shared_static*`, so the construction-time read picks it up (`route=construction`); AArch64 and
+RISC-V capture theirs afterwards, so `install_sched_quantum_on_live_timer` installs it on the live
+timer through the rank-1 `set_scheduler_quantum_split_mut`. Both resolve the same owner.
+
+### §4 — Live evidence, three consecutive runs per architecture
+
+Every figure below is from a **matched pair**: base `a556bbd` built with the same quantum forced at
+`Timer::new`, and head `8cef214` with `yarm.sched_quantum_ticks`. `YARM_SCHED_TICK` is **not** used
+as a measure — it self-limits to four emissions per boot (`log_seq < 4`), exactly the
+marker-counting §4 forbids; broad service is read from the split route's own declines instead.
+
+| port | quantum | preempting ticks → **broad** (base) | → **broad** (head) | split commits | split idle settlements | smoke |
+|---|---|---|---|---|---|---|
+| x86_64 | 1 | 73, 74, 74 | **0, 0, 0** | 1, 1, 1 | 73, 73, 73 | pass ×3 both |
+| AArch64 | 8 | 2, 2, 2 | **0, 0, 0** | 2, 2, 2 | 0 | pass ×3 both |
+| RISC-V | 8 | 33, 151, 153 | 146, 81, 148 — **all kernel-origin** | 2, 2, 2 | 0 | pass ×3 both |
+| RISC-V | **production default (10)** | — | 63, 55, 13 — kernel-origin | **1, 1, 2** | 0 | pass ×3 |
+
+The last row matters on its own: RISC-V's shipped quantum is 10 INTERRUPTS, so on that port the
+converted branch is live **with no knob at all**, and the exit-current-task oracle drives 12–13
+genuine preemptions per run through it.
+
+**Every commit is user-origin; every RISC-V decline is kernel-origin.** Classified by trap provenance
+rather than by count: on RISC-V all 154 declines are preceded by
+`RISCV_S_MODE_TIMER_ACCEPTED … spp=1`, i.e. a CPU halted in `wfi` with work queued, and both commits
+are U-mode. That is the **idle-wake** population, which has its own arch continuation contract
+(`RISCV_S_MODE_TIMER_DISPATCH`, SPP clearing, `sanitize_user_sstatus`, startup-ABI lanes) — a
+distinct queue-advancing consumer, not the ordinary preempting-timer population, and §1's
+kernel/idle-versus-userspace contract is what keeps it separate.
+
+**The attributable continuation, end to end.** x86_64, `yarm.sched_quantum_ticks=1`:
+
+```
+YIELD_DISPATCH_DEFER_BEGIN cpu=0 tid=1
+YIELD_DISPATCH_REENQUEUE_OK cpu=0 tid=1
+TIMER_SPLIT_PREEMPT_COMMITTED cpu=0 tick=1 outgoing=1 preempt=1 rearm=1 broad_lock=0
+QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=timer_preempt_committed
+YIELD_DISPATCH_DEFER_BEGIN cpu=0 drain=1
+YIELD_DISPATCH_DEQUEUE_OK cpu=0 tid=1
+YIELD_DISPATCH_CURRENT_SET_OK cpu=0 tid=1
+USER_CR3_PRE_IRET_OK tid=1 hw_cr3=0x000000001000a000
+YIELD_DISPATCH_FRAME_OK cpu=0 tid=1
+USER_LOG tid=1 msg=INIT_VFS_READ_SMOKE_CALL_RETURN ok=1 len=0      <- userspace continued
+```
+
+AArch64 is the stronger witness because it is **cross-task**: `outgoing=3 → incoming=1`, then
+`outgoing=3 → incoming=2`, each with `AARCH64_YIELD_DISPATCH_RUNNING_OK`, a real
+`AARCH64_YIELD_DISPATCH_TTBR0_OK tid=N asid=N` address-space switch, and `FRAME_OK`. RISC-V is
+cross-task too (`outgoing=2 → incoming=3`) and reaches 1508 commits at `quantum=1`.
+
+**Remaining timer declines — the complete inventory, derived from source.** The `TimerInterrupt`
+family is **NOT** closed:
+
+| decline | owner | when |
+|---|---|---|
+| `proof_hooks_armed` | the route's gate | any of the five timer-only `maybe_run_*` proof knobs armed — they are not relocated, so an armed profile takes the whole unchanged broad arm |
+| `no_current_runnable` | the route's run-queue probe | idle CPU with a non-empty queue — the idle-wake population above |
+| `d6_genuine_off` / `not_bsp` | `yield_deferral_arch_gate` | x86_64 under `d6_switch_proof`/`d6_switch_a`; non-bootstrap CPU on AArch64/RISC-V |
+| `already_deferred` | the one-shot deferral | some route already holds this CPU's Yield deferral |
+| `no_trap_drainer` / `cpu_out_of_range` / `multi_cpu` | `TerminalAdmissionRefusal` | trap drain inactive; CPU beyond `MAX_CPUS`; more than one dispatching CPU (`yarm.ap_user_dispatch`) |
+| `not_running` | `apply_preempt_outgoing_locked` | the interrupted task is not `Running` |
+| `reenqueue_failed` | the scheduler | the re-enqueue was refused; `current` restored, transition rolled back |
+
+### §4b — The RISC-V resume defect this conversion introduced, and its repair
+
+RISC-V's shipped quantum is **10 interrupts**, so unlike the other two ports the converted branch
+goes live there at the DEFAULT cadence — and the exit-current-task oracle found it. Three
+consecutive runs failed identically; base `a556bbd` passed three for three. It was a genuine
+regression, and it took two attempts to name correctly.
+
+**What the oracle saw.** The process manager received init's spawn request and was preempted seven
+log lines later. On resume it re-entered its receive loop against the wrong state, decoded a zero
+message (`opcode=4 len=0 sender_tid=0 reply_cap=None`), and init waited for a spawn reply forever.
+
+**The first diagnosis was right about the asymmetry and wrong about the owner.** The shared
+x86_64/AArch64 bridge captures the outgoing user context once, from the live frame, ahead of every
+route — so its timer branch inherits the capture. The RISC-V bridge does not: its only capture sits
+inside the SYSCALL branch, keyed on a published deferral, and its own comment says that capture is
+the only thing carrying the PC into the outgoing TCB, because this bridge never calls
+`finalize_split_handled_syscall`. A `capture_outgoing_user_context_split` in the timer arm made two
+of three runs pass — and was **actively worse than nothing** for the third, because
+`capture_user_context` copies the argument lanes verbatim and a RISC-V timer frame has none (the
+bridge populates them only for `EXC_USER_ECALL`). It wrote zeros over the syscall lane the
+ORDINARY resume arms treat as authoritative.
+
+**The real owner already existed.** RISC-V names three mutually exclusive resume conventions
+(canonical 199E-R1D) and reads the third from an **explicit tag**, never by inference:
+
+| convention | `a0..a5` come from |
+|---|---|
+| FRESH / STARTUP | the argument mirror; `a7` forced to 0 |
+| SYSCALL / BLOCKED CONTINUATION | the result lane |
+| **ASYNCHRONOUSLY PREEMPTED** | the saved register file, verbatim — the mirror is NOT touched |
+
+The tag is published by `snapshot_async_preempted_current`, which the bridge calls **inside the
+broad handler**, at what its own comment calls the earliest correct point: strictly before the
+scheduler tick that can yield. The converted route runs entirely before that lock is taken, so on
+it the snapshot never fired, no tag was published, and the write-back fell through to the STARTUP
+arm — installing a zeroed argument mirror over a live computation and forcing `a7 = 0`. That is
+the same defect 199E-R1D repaired for the broad path, reappearing on a route that bypasses it.
+
+The repair extracts the publisher's body to `task::publish_async_preempt_snapshot` — argument-lane
+preservation, generation bump and tag-last ordering included — and gives the split route the same
+owner through a rank-2 twin, keyed on the identity the deferral names rather than on `current`,
+which the transaction has already cleared. It is gated on `is_restorable` so the S-mode-origin
+timer path's zeroed frame can never authorize a verbatim restore. **Nine of nine exit oracles pass
+after it, with 12–13 tagged preemptions per RISC-V run.**
+
+This is what a bridge asymmetry costs: two ports inherit a property from a shared entry, the third
+states it locally, and a route added to all three gets it on two. It is recorded here rather than
+generalised — unifying the two bridges' capture points is not this stage's, and the shared bridge's
+Yield path is proven live over 4096 yields per boot.
+
+**A pre-existing AArch64 defect, exposed and attributed — not introduced.** At high preemption rates
+the AArch64 profile loses a spawn reply (`INIT_SPAWN_V5_REPLY_DECODE ok=0 reason=zero_pid`) and, at
+`quantum=1`, can livelock past the 180 s smoke deadline. **It reproduces exactly at base
+`a556bbd`** with the same quantum forced, through the unchanged broad dispatch path: at
+`Timer::new(1)`, base runs gave `zero_pid`, a 4 M-line hang, and `zero_pid`; at `Timer::new(8)`,
+base gave `spawn_fail` 1, 1, 0 against head's 1 at the same rate. AArch64 userspace does not survive
+per-tick preemption on **either** route. Deferred; it is not this conversion's, and it is not on the
+production cadence.
+
+### §5 — Qualification
+
+Frozen tree, fresh artifacts, `8cef214`.
+
+* `cargo test --lib --features hosted-dev -- --test-threads=1` — **5425 pass**, 0 fail, 2 ignored
+  (a556bbd: 5415; +10 focused cases).
+* **`tests/broad_lock_census_guard.rs` — 7/7**, run as its own integration target. **CENSUS-DELTA: 0**;
+  the expected census is unchanged at 2 `with_cpu` / 0 `with_broad` / 2 raw. Every seam this stage
+  added (`timer_would_preempt_split_read`, `set_scheduler_quantum_split_mut`) is rank-1
+  `with_scheduler_split_mut`.
+* All integration targets: doc-fragmentation 7, extraction-bridge 2, payload-bench 1, riscv64
+  live-irq 13 / regular-smoke 12 / smp-topology 17 / timer-admission 11 / timer-plic 18,
+  riscv-capacity 11, rpi5-stage1 19, x86_64 ap-env 25 / ap-percpu 16 — all pass.
+  `server_dies_runner_scope` 8 pass / **2 fail** — the established residual
+  (`required_chain_is_scoped_to_the_witnessed_transaction`,
+  `required_marker_chain_is_ordered_and_complete`), unchanged by this conversion and deferred.
+* Three freestanding builds green: x86_64 `x86-none`, AArch64 `aarch64-none`, RISC-V release.
+* Live regressions, all at the **production default** unless stated, three consecutive runs each:
+  * **exit-current-task oracle — 9/9** (x86_64, AArch64, RISC-V ×3 each), exact-tree sealed;
+  * **core smoke — 9/9**. x86_64 73–74 non-preempting ticks, 0 preemptions; AArch64 18–19 ticks, 0
+    preemptions and all 8 spawns succeeding — the delivered behaviour, so the cadence is provably
+    untouched; RISC-V 439–888 ticks and **1–2 genuine preemptions**, because its shipped quantum
+    really is 10 interrupts;
+  * **x86_64 AP saved-return — 3/3**;
+  * **supervisor crash-restart — pass** (`fault_observed=1 supervisor_notified=1
+    restart_observed=1 stale_reply_objects=0`).
+
+**Six displaced structural guards were re-derived**, each keeping its claim and sharpening it:
+`both_refusals_precede_every_mutation` (per-branch ordering now that the route has two branches),
+`a_non_preempting_tick_uses_its_own_disposition` (per-settlement, since the preempting branch
+legitimately answers `QueueAdvanceCommitted`), `the_broad_dispatcher_is_gated_on_the_disposition_alone`
+(four arms), `a_yield_is_counted_exactly_once_on_either_route` (two committing split routes, one
+increment each), `the_quantum_and_the_hardware_deadline_are_the_same_constant` (the separation is
+the only change; unset still resolves to the shipped constant), and
+`the_identity_and_ordering_discipline_is_enforced` — re-derived onto the extracted
+`task::publish_async_preempt_snapshot` and made STRONGER: both snapshot owners must now delegate to
+it rather than restate it, neither may publish a tag of its own, and the syscall-argument-lane
+preservation is pinned explicitly. Three of them now strip comments before locating code, because
+the converted route cites by name the seams and dispositions it deliberately does not use.
+
+**Ten focused cases** were added: nine holding the conversion's own contract (one policy, one tick /
+one claim / one re-arm per settlement, no syscall-return encoding, no decline after a mutation, a
+non-preempting tick advancing no queue, the run-queue admission of the idle settlement, the complete
+decline inventory, both bridges' skip, and the census claim) and one driving the split
+async-preemption publisher against real TCB state — the interrupt frame's PC/SP/register file land,
+the syscall lane survives, the tag names the exact `{tid, asid, generation}`, the consumer accepts it
+exactly once, a replacement incarnation is refused fail-closed, and tid 0 publishes nothing.
+
+### Next roadmap package
+
+**VM entry completion.**

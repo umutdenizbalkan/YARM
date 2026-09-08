@@ -57,6 +57,24 @@ impl Timer {
         self.quantum_ticks
     }
 
+    /// U9-TIMER1 §3 — replace the quantum on a LIVE timer, preserving the monotonic tick count.
+    ///
+    /// The quantum and the hardware deadline are the same constant in incompatible units, which
+    /// puts a preempting tick out of reach of a qualification run on two of the three ports. §3
+    /// authorises separating them, and the boot knob that does so has to reach ports whose
+    /// command line is captured AFTER the kernel state is built — so the quantum must be
+    /// settable, not only constructible.
+    ///
+    /// `current` is deliberately untouched: it is the monotonic tick counter every consumer of
+    /// `current_ticks` reads, and rebuilding the timer to change its quantum would silently
+    /// rewind it. The remaining budget restarts at the new quantum, which is the same thing
+    /// `reset_quantum` does on a voluntary switch.
+    pub fn set_quantum(&mut self, quantum_ticks: u64) {
+        let bounded = quantum_ticks.max(1);
+        self.quantum_ticks = bounded;
+        self.ticks_remaining = bounded;
+    }
+
     /// Reset the remaining quantum to the full quantum length.
     ///
     /// Call this on voluntary task switches (block, yield-to-other) so the

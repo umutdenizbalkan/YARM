@@ -54,11 +54,14 @@ pub(crate) use ipc_state::{
     enqueue_reply_into_endpoint_locked, publish_recv_waiter_locked, reclaim_reply_authority_with,
     release_reply_terminal_locked, reserve_direct_reply_record_locked,
 };
+pub(crate) mod cleared_current;
+pub(crate) mod exit_claim;
 mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;
 pub(crate) mod process_cnode_txn;
 pub(crate) mod provisional_cap;
+pub(crate) mod reap_claim;
 mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
@@ -151,7 +154,7 @@ pub(crate) const MAX_ENDPOINT_SENDER_WAITERS: usize = 4;
 
 // Keep task capacity consistent across hosted-dev and freestanding builds so
 // capacity-sensitive tests match deployed behavior.
-const MAX_TASKS: usize = 512;
+pub(crate) const MAX_TASKS: usize = 512;
 
 const MAX_MEMORY_OBJECTS: usize = 512;
 const MAX_BOOT_MEMORY_REGIONS: usize = 64;
@@ -759,6 +762,68 @@ pub(crate) static GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE: [core::sync::atomic::Atomic
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
 
+/// U9-DISPATCH-CPU1 §1/§2 — the per-CPU **live dispatch window**.
+///
+/// `0` means "no window is open on this CPU"; any other value is the epoch of the window that IS
+/// open. `arch::trap_entry::TrapPathWindow` is the only writer: it opens a window on `establish`
+/// and RETIRES it on drop, which is the real trap boundary.
+///
+/// Retirement is what makes a [`crate::runtime::DispatchAuthority`] a statement about one trap
+/// rather than about a CPU number. Without it a retained copy stayed valid from the moment the
+/// trap returned until the next trap happened to open — a window in which the authority names a
+/// CPU that is running arbitrary code.
+///
+/// It is deliberately NOT a lock and NOT per-CPU scheduler state: it is a tag whose only reader is
+/// [`crate::runtime::DispatchAuthority::is_live`], so `doc/AI_AGENT_RULES.md` §14.4's prohibition
+/// on new per-CPU scheduler lock types is untouched.
+pub(crate) static TRAP_DISPATCH_WINDOW: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// The monotonically increasing source of window epochs. Never reused, so a retired epoch can
+/// never be mistaken for a later window's.
+static TRAP_DISPATCH_EPOCH_NEXT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+/// U9-DISPATCH-CPU1 §2/D2 — open a dispatch window on `cpu` and return `(epoch, displaced)`.
+///
+/// `displaced` is whatever window was open on this CPU, and for a correct run it is always `0`.
+/// **Nested entry into the shared trap wrapper is not supported on any architecture**: x86_64's
+/// `TRAP_DISPATCH_DEPTH` guard halts a re-entrant trap BEFORE it reaches the wrapper
+/// (`previous_depth != 0` → `log_decoded_fatal_trap` + `halt_forever`), and interrupts stay masked
+/// for the whole trap on all three, so no second entry can arrive on this CPU. A non-zero
+/// `displaced` therefore means the previous window was ABANDONED by a landing that diverged
+/// without retiring, and it is reported rather than saved.
+///
+/// It is deliberately not restored on close. Saving and restoring it would let a later trap REVIVE
+/// an abandoned authority: A opens 1 and diverges, B opens 2 saving 1, B returns and restores 1 —
+/// and A's long-dead token is live again. Retirement always goes to `0`.
+///
+/// The ONLY caller is `TrapPathWindow::establish`.
+pub(crate) fn open_trap_dispatch_window(cpu_idx: usize) -> (u64, u64) {
+    let epoch = TRAP_DISPATCH_EPOCH_NEXT.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let displaced = TRAP_DISPATCH_WINDOW[cpu_idx].swap(epoch, core::sync::atomic::Ordering::AcqRel);
+    (epoch, displaced)
+}
+
+/// U9-DISPATCH-CPU1 §2/D2 — retire the window `epoch` on `cpu`.
+///
+/// Exact-epoch and idempotent: the store happens only if this CPU's live window is still `epoch`,
+/// so a repeat call does nothing and a stale retirement can never revoke a NEWER window. Returns
+/// whether this call performed the retirement.
+///
+/// Callers are `TrapPathWindow::retire` and `TrapPathWindow::drop`.
+pub(crate) fn close_trap_dispatch_window(cpu_idx: usize, epoch: u64) -> bool {
+    TRAP_DISPATCH_WINDOW[cpu_idx]
+        .compare_exchange(
+            epoch,
+            0,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 /// Stage 120: x86_64-only controlled one-shot unlocked `switch_frames` proof
 /// harness gate. This is diagnostic/smoke-only, default-off, single-CPU-only,
 /// and does not alter scheduler policy. VALIDATION: D6_CONTROLLED_SWITCH_PROOF_BEGIN
@@ -1141,10 +1206,107 @@ pub(crate) fn futex_wait_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
 }
 
 /// Stage 192A: clear the FutexWait dispatch deferral for `cpu`.
+// ── U9-EXIT1 §3: the EXIT half of the queue-advance deferral ────────────────────────
+//
+// The exit route reserves the EXISTING queue-advance deferral — there is no second selector, no
+// second scheduler policy and no second drain. What it additionally publishes is one per-CPU cell
+// naming the exact `{tid, asid}` incarnation that is exiting, and it exists for two reasons that a
+// bare TID could not serve:
+//
+//   * **the drain must reverify differently.** A FutexWait outgoing must still be
+//     `Blocked(Futex)` and a faulted one must still be `Faulted`, so both of those predicates read
+//     a missing TCB as failure. An exiting task may legitimately have been joined or reaped in the
+//     meantime, and absence then means the exit SUCCEEDED. The cell is what lets the drain pick the
+//     right question instead of loosening the other two.
+//
+//   * **the exiting frame must not be saved.** The post-`QueueAdvanceCommitted` bridges capture the
+//     outgoing task's user context into its TCB so a later resume restarts at the right pc. An
+//     exiting task is never resumed, so capturing is at best pointless and at worst records a
+//     corpse's registers. The cell is what tells the capture site to skip.
+//
+// Per-CPU, single-shot, and generation-bearing by construction (`{tid, asid}`, never a bare TID).
+/// U9-RESIDUAL1 §1/§3 — which condition of the split terminal-route admission refused.
+///
+/// The admission itself is `SharedKernel::split_terminal_route_admission`. The reason is typed at
+/// its source because two callers need to tell the cases apart in a live log — NR 0's delivered
+/// vocabulary already distinguished `no_trap_drainer` from `multi_cpu` — and a refusal that cannot
+/// be told apart in a log cannot be diagnosed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalAdmissionRefusal {
+    /// The CPU id is at or beyond `MAX_CPUS`. Refused before the per-CPU drainer array is indexed.
+    CpuOutOfRange,
+    /// No post-lock drainer is active on this CPU, so a published deferral would never be consumed.
+    NoTrapDrainer,
+    /// More than one CPU dispatches. Wake-only APs do not count; a second REAL dispatcher does.
+    MultiDispatcher,
+    /// This CPU is not the scheduler's bound dispatcher, so the drain would run somewhere else.
+    NotDispatchCpu,
+}
+
+impl TerminalAdmissionRefusal {
+    /// The live vocabulary. `no_trap_drainer` and `multi_cpu` are the exact strings the delivered
+    /// in-lock Yield fallback logged, so a log reader sees no change.
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::CpuOutOfRange => "cpu_out_of_range",
+            Self::NoTrapDrainer => "no_trap_drainer",
+            Self::MultiDispatcher => "multi_cpu",
+            Self::NotDispatchCpu => "not_dispatch_cpu",
+        }
+    }
+}
+
+/// The exact incarnation a CPU's exit deferral names. Never a bare TID: the ASID is what makes a
+/// replacement task at the same numeric TID resolve to nothing.
+pub(crate) type ExitingIncarnation = (u64, Option<Asid>);
+
+static EXIT_QUEUE_ADVANCE_OUTGOING: [crate::kernel::lock::SpinLockIrq<Option<ExitingIncarnation>>;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { crate::kernel::lock::SpinLockIrq::new(None) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Publish the exiting incarnation for this CPU's queue-advance deferral. Returns `false` WITHOUT
+/// overwriting when one is already pending — a duplicate is a bug, not last-writer-wins.
+#[must_use]
+pub(crate) fn exit_queue_advance_publish(cpu_idx: usize, tid: u64, asid: Option<Asid>) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    let mut slot = EXIT_QUEUE_ADVANCE_OUTGOING[cpu_idx].lock();
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some((tid, asid));
+    true
+}
+
+/// Peek the exiting incarnation without consuming it. The drain reads this to choose its reverify
+/// and to decide whether to skip the outgoing-context capture.
+#[must_use]
+pub(crate) fn exit_queue_advance_pending(cpu_idx: usize) -> Option<(u64, Option<Asid>)> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    *EXIT_QUEUE_ADVANCE_OUTGOING[cpu_idx].lock()
+}
+
+/// Clear the cell. Called on the pre-mutation release path and by the drain once it has consumed
+/// the deferral, so a later trap can never act on a stale exit.
+pub(crate) fn exit_queue_advance_clear(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        *EXIT_QUEUE_ADVANCE_OUTGOING[cpu_idx].lock() = None;
+    }
+}
+
 pub(crate) fn futex_wait_dispatch_clear(cpu_idx: usize) {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return;
     }
+    // U9-EXIT1 §3: the exit cell is cleared with the deferral it annotates, in one place rather
+    // than at each of the ten drain tails that release the deferral. The two are paired by
+    // construction — the exit route publishes the cell only while holding this deferral, and the
+    // cell means nothing without it — so clearing them together is what stops a stale exit
+    // identity outliving the advance it described and mis-steering the NEXT trap's reverify.
+    exit_queue_advance_clear(cpu_idx);
     FUTEX_WAIT_DISPATCH_OUTGOING[cpu_idx].store(u64::MAX, core::sync::atomic::Ordering::Release);
     FUTEX_WAIT_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }
@@ -2659,6 +2821,57 @@ pub fn ap_user_dispatch_enabled() -> bool {
     AP_USER_DISPATCH_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// U9-TIMER1 §3 — the DEFAULT-OFF scheduling-quantum override, in TIMER INTERRUPTS.
+///
+/// `0` means unset: the scheduler timer keeps the shipped quantum
+/// (`BOOTSTRAP_TIMER_DEADLINE_TICKS`) and nothing about production cadence changes. A non-zero
+/// value replaces ONLY the interrupt count that makes a quantum — the hardware deadline the timer
+/// is programmed with is untouched, so every interrupt still arrives on its normal schedule and is
+/// serviced by the production route.
+///
+/// This exists because the two are the same constant in incompatible units, which makes a live
+/// preempting tick unobservable inside a qualification run on x86_64 (50M interrupts) and AArch64
+/// (3.1M). Separating them is what §3 authorises; tuning the cadence is not.
+pub(crate) static SCHED_QUANTUM_TICKS_OVERRIDE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_sched_quantum_ticks_override(ticks: u64) {
+    SCHED_QUANTUM_TICKS_OVERRIDE.store(ticks, core::sync::atomic::Ordering::Release);
+}
+
+/// The quantum the scheduler timer should be built with: the override when one was requested,
+/// otherwise the shipped constant. One reader, so the two cannot disagree.
+pub fn sched_quantum_ticks() -> u64 {
+    let override_ticks = SCHED_QUANTUM_TICKS_OVERRIDE.load(core::sync::atomic::Ordering::Acquire);
+    if override_ticks == 0 {
+        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS
+    } else {
+        override_ticks
+    }
+}
+
+/// Install the resolved quantum on an ALREADY-CONSTRUCTED scheduler timer, if there is one.
+///
+/// The three ports capture their command line at different points relative to kernel-state
+/// construction: x86_64 captures it in `prepare_arch_boot`, before `init_shared_static*`, so the
+/// construction-time read in `bootstrap_state` already sees the override; AArch64 and RISC-V
+/// capture theirs after `init_shared_static`, by which time the timer exists. Rather than move an
+/// arch boot sequence to suit a default-off qualification knob, the knob covers both: record the
+/// value for construction, then install it here if construction already happened.
+///
+/// Returns `true` when a live timer was reprogrammed, so the caller can say which route ran.
+pub fn install_sched_quantum_on_live_timer() -> bool {
+    let ticks = sched_quantum_ticks();
+    match Bootstrap::shared_static_ref() {
+        Some(shared) => {
+            shared.set_scheduler_quantum_split_mut(ticks);
+            true
+        }
+        // The timer does not exist yet; `Bootstrap` will build it from the same owner.
+        None => false,
+    }
+}
+
 /// Stage 177: try to claim the one-shot SMP-readiness audit (true exactly once).
 pub(crate) fn smp_ready_audit_try_start() -> bool {
     SMP_READY_AUDIT_STARTED
@@ -3424,12 +3637,21 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # DISABLED on every architecture — Stage 199D-WA1-GATE
+/// # ENABLED on all three architectures — and this heading used to say the opposite
 ///
-/// Ordinary `IpcCall`/`IpcReply` traffic on **every** architecture, x86_64 included, falls back
-/// to the legacy path. Admission and blocked-waiter acknowledgement publication both require an
-/// explicit proof/oracle selector; request/reply endpoint confinement is whatever those
-/// selectors authorize. The rationale is below the blocker history.
+/// U9-YIELD2 §1: the heading here read "**DISABLED on every architecture — Stage 199D-WA1-GATE**",
+/// followed by "ordinary `IpcCall`/`IpcReply` traffic on **every** architecture, x86_64 included,
+/// falls back to the legacy path". The WA1-GATE state it described was later reversed twice — by
+/// WA3C2 for x86_64 (recorded further down this comment) and by DIRECT3-CAP-FINAL for AArch64 and
+/// RISC-V — and the body below already says so, but the heading was never updated. The function
+/// returns `true` on all three architectures, so `ipccall_direct_admission_enabled()` and
+/// `ipccall_direct_publication_enabled()` short-circuit before any proof/oracle selector is read,
+/// and ordinary NR6/NR7 traffic IS admitted to the off-lock request/reply handlers on every
+/// ordinary boot.
+///
+/// Two consumers were reading the retired heading rather than the code: the split dispatcher's
+/// NR6/NR7 admission note and U9-RESIDUAL1 §2's residual matrix, which listed NR 6 and NR 7 as
+/// having "no split route". Both are corrected; see `doc/KERNEL_UNLOCKING.md`, U9-YIELD2 §1.
 ///
 /// ## Historical — the x86_64 production default (`0b5ec254`, since RECLASSIFIED)
 ///
@@ -8554,9 +8776,9 @@ pub(crate) const MAX_REPLY_CAPS: usize = MAX_TASKS;
 /// is a registration/ownership store, NOT a terminal-result authority store.
 pub(crate) const MAX_DEADLINE_TOKENS: usize = 4;
 #[cfg(feature = "hosted-dev")]
-const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
+pub(crate) const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
 #[cfg(not(feature = "hosted-dev"))]
-const MAX_DELEGATED_CAPABILITY_LINKS: usize = 2048;
+pub(crate) const MAX_DELEGATED_CAPABILITY_LINKS: usize = 2048;
 
 /// U9-SPAWN-TXN3 §3: the delegation-link table's bound, for the split reap's per-slot loop.
 ///

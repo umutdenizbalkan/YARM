@@ -999,11 +999,41 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
                 RiscvIdleReason::BlockedIpcNoRunnable => "BlockedIpcNoRunnable",
                 // Stage 200D-0D1: an accepted ExitCurrentTask left no runnable task.
                 RiscvIdleReason::ExitCurrentTaskNoRunnable => "ExitCurrentTaskNoRunnable",
+                // U9-DISPATCH-CPU1 §2: a queue-advancing drain's selection REFUSED, so nothing is
+                // current. Reported under its own name so it can never be read as one of the three
+                // workload outcomes above — and it passes the `current == None|Some(0)` invariant
+                // immediately above by construction, because every refusal that reaches here left
+                // the current slot exactly as the publisher cleared it.
+                RiscvIdleReason::QueueAdvanceNoIncoming => "QueueAdvanceNoIncoming",
             };
             crate::yarm_log!("RISCV_TYPED_IDLE_OUTCOME result=ok reason={}", reason_str);
-            crate::yarm_log!(
-                "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
-            );
+            // U9-DISPATCH-CPU1 D3 — the attribution has to match the reason.
+            //
+            // `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked` was
+            // printed for EVERY typed idle outcome. For the three workload reasons it is true: the
+            // caller blocked, or exited, and nothing was runnable. For a queue-advance refusal it
+            // is false twice over — the runqueue may hold runnable work and nothing is waiting on
+            // I/O — so that line is not emitted for it. What is emitted instead names the actual
+            // state, including how much runnable work is still queued here, so a log never claims
+            // an idle system when the CPU simply could not take any of the work in front of it.
+            match reason {
+                RiscvIdleReason::QueueAdvanceNoIncoming => {
+                    // U9-DISPATCH-CPU2 §1: read through the rank-1 SCHEDULER seam, not the broad
+                    // `SharedKernel::with`. The number and its meaning are unchanged; the
+                    // acquisition is not a whole-KernelState lock taken for a log line.
+                    let queued = shared.runnable_count_on_cpu_split_read(cpu);
+                    crate::yarm_log!(
+                        "RISCV_KERNEL_IDLE_QUEUE_ADVANCE_REFUSED cpu={} runnable_queued={} recovery=next_dispatch_on_this_cpu",
+                        cpu.0,
+                        queued
+                    );
+                }
+                _ => {
+                    crate::yarm_log!(
+                        "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
+                    );
+                }
+            }
             // Safe point per the timer/PLIC bring-up contract: real S-mode trap vector +
             // kernel-state pointer are installed; the service chain has reached stable idle. Both
             // init paths default to deferred and never enable STIE / external-IRQ delivery until

@@ -2297,6 +2297,17 @@ impl KernelState {
         Ok(self.thread_tls_base(tid))
     }
 
+    /// U9-EXIT2 §2 — the ONLY writer of `ThreadDetachState::Detached`, and it has no production
+    /// caller: no syscall reaches it, no boot path calls it, and every TCB constructor produces
+    /// `Joinable`. So a `Detached` task cannot exist in a production kernel, which is what makes
+    /// the self-exit route's `DetachedThread` refusal a class-B impossibility rather than a
+    /// population it declines to serve.
+    ///
+    /// The `cfg` is the proof, not a comment about it: the freestanding builds do not compile this
+    /// function at all, so a future production path that tries to detach a thread breaks the build
+    /// and is forced to answer §2's real question — what the smallest no-allocation terminal
+    /// cleanup for a detached self-exit would be — instead of silently reintroducing a broad edge.
+    #[cfg(any(test, feature = "hosted-dev"))]
     pub fn mark_thread_detached(&mut self, tid: u64) -> Result<(), KernelError> {
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
@@ -2363,6 +2374,17 @@ impl KernelState {
         Ok(Some(exit_code))
     }
 
+    /// U9-EXIT2 §3 — the ONLY writer of the robust-futex registry, and it has no production
+    /// caller: there is no `SetRobustFutexHead` syscall, no boot path registers a list, and the
+    /// fork publication explicitly CLEARS the child's slot. So the registry is empty in a
+    /// production kernel, `has_robust_futex_list` is always false, and the broad `exit_task`'s
+    /// robust-wake loop is unreachable.
+    ///
+    /// As with `mark_thread_detached`, the `cfg` is the proof: a future production registration
+    /// path breaks the freestanding build and must then answer §3's real question — one lock
+    /// domain, one no-allocation owner, owner-death publication outside every lock, one wake —
+    /// rather than inheriting a refusal that quietly routes it back to the broad dispatcher.
+    #[cfg(any(test, feature = "hosted-dev"))]
     pub fn set_robust_futex_head(
         &mut self,
         tid: u64,
@@ -2375,27 +2397,35 @@ impl KernelState {
         self.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid))
             .then_some(())
             .ok_or(KernelError::TaskMissing)?;
-        if let Some(slot) = self
-            .robust_futex
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|entry| entry.tid == ThreadId(tid)) || slot.is_none())
-        {
-            *slot = Some(super::RobustFutexRecord {
-                tid: ThreadId(tid),
-                state: RobustFutexState { head, len },
-            });
-            Ok(())
-        } else {
-            Err(KernelError::TaskTableFull)
-        }
+        // U9-EXIT1 §3: the registry is a TASK-domain array — it sits beside `tcbs`,
+        // `task_classes` and `tls_restore_pending`, and is written only for a task that
+        // `with_tcbs` above just proved live. It had no lock of its own because nothing outside
+        // the broad guard ever reached it; a split reader does now, so both accessors take the
+        // task lock and the pairing is real rather than incidental.
+        self.with_task_robust_futex_mut(|robust| {
+            if let Some(slot) = robust
+                .iter_mut()
+                .find(|slot| slot.is_some_and(|entry| entry.tid == ThreadId(tid)) || slot.is_none())
+            {
+                *slot = Some(super::RobustFutexRecord {
+                    tid: ThreadId(tid),
+                    state: RobustFutexState { head, len },
+                });
+                Ok(())
+            } else {
+                Err(KernelError::TaskTableFull)
+            }
+        })
     }
 
     pub fn robust_futex_state(&self, tid: u64) -> Option<RobustFutexState> {
-        self.robust_futex
-            .iter()
-            .flatten()
-            .find(|entry| entry.tid.0 == tid)
-            .map(|entry| entry.state)
+        self.with_task_robust_futex(|robust| {
+            robust
+                .iter()
+                .flatten()
+                .find(|entry| entry.tid.0 == tid)
+                .map(|entry| entry.state)
+        })
     }
 
     pub(crate) fn sync_current_thread_from_frame(
@@ -2439,64 +2469,14 @@ impl KernelState {
         let Some(tid) = self.current_tid() else {
             return false;
         };
-        // tid 0 is the idle/kernel identity: it never returns to U-mode through a saved user
-        // context, so there is nothing to preserve and a tag would be meaningless.
-        if tid == 0 {
-            return false;
-        }
+        // U9-TIMER1: the body is now `task::publish_async_preempt_snapshot`, shared with the
+        // rank-2 split owner the converted preempting timer uses. Nothing about the decision
+        // changed — the argument-mirror preservation, the generation bump and the tag-last
+        // ordering all live there — and sharing it is what stops the two snapshot boundaries
+        // from ever disagreeing about what `a0..a7` mean.
         let captured = frame.capture_user_context();
         self.with_tcbs_mut(|tcbs| {
-            let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) else {
-                return false;
-            };
-            // A user task always has an ASID; without one the exact-incarnation check the tag
-            // depends on cannot be formed, so refuse rather than publish an unverifiable tag.
-            let Some(asid) = tcb.asid else {
-                return false;
-            };
-            // `checked_add`: an exhausted counter refuses rather than wrapping into a value an
-            // ancient tag could match.
-            let Some(next_generation) = tcb.async_preempt_generation.checked_add(1) else {
-                return false;
-            };
-            // Context FIRST — but the SYSCALL-ARGUMENT MIRROR is preserved, not overwritten.
-            //
-            // `UserRegisterContext` carries two mirrors of userspace state: `user_gprs` (the raw
-            // register file) and `arg0..arg5` (the decoded syscall lane). They mean different
-            // things and have different owners. The asynchronous resume reads `user_gprs`; the
-            // ORDINARY resume arms — fresh startup and syscall/D2 continuation — treat `arg0..5`
-            // as authoritative for `a0..a5`.
-            //
-            // Capturing a timer frame wholesale would write both, and that is a real defect
-            // rather than a tidy-up: an interrupted task's mid-computation `a0` would land in the
-            // syscall lane, and any later ORDINARY resume of that task — a wake from a blocked
-            // receive, say — would install it as the syscall result. Measured live as
-            // `core::fmt` faulting on `ld a1, 0(a0)` with `a0 = 0x10003`, an ordinary
-            // intermediate value promoted to a pointer. Keeping the lane untouched leaves each
-            // mirror owned by exactly the paths that write and read it.
-            let preserved_syscall_lane = (
-                tcb.user_context.arg0,
-                tcb.user_context.arg1,
-                tcb.user_context.arg2,
-                tcb.user_context.arg3,
-                tcb.user_context.arg4,
-                tcb.user_context.arg5,
-            );
-            tcb.user_context = captured;
-            tcb.user_context.arg0 = preserved_syscall_lane.0;
-            tcb.user_context.arg1 = preserved_syscall_lane.1;
-            tcb.user_context.arg2 = preserved_syscall_lane.2;
-            tcb.user_context.arg3 = preserved_syscall_lane.3;
-            tcb.user_context.arg4 = preserved_syscall_lane.4;
-            tcb.user_context.arg5 = preserved_syscall_lane.5;
-            tcb.async_preempt_generation = next_generation;
-            // … tag LAST, so it can never name a half-written register file.
-            tcb.async_preempted = Some(crate::kernel::task::AsyncPreemptedContext {
-                tid,
-                asid,
-                preempt_generation: next_generation,
-            });
-            true
+            crate::kernel::task::publish_async_preempt_snapshot(tcbs, tid, captured)
         })
     }
 
@@ -2565,22 +2545,14 @@ impl KernelState {
     }
 
     pub(crate) fn wake_joiners_for(&mut self, target_tid: u64) -> Result<u32, KernelError> {
-        let wake_tids = self.with_tcbs_mut(|tcbs| {
-            let mut wake_tids = [None; super::MAX_TASKS];
-            let mut wake_count = 0usize;
-            for tcb in tcbs.iter_mut().flatten() {
-                if tcb.status != TaskStatus::Blocked(WaitReason::Join(ThreadId(target_tid))) {
-                    continue;
-                }
-                tcb.status = TaskStatus::Runnable;
-                if wake_count < wake_tids.len() {
-                    wake_tids[wake_count] = Some(tcb.tid.0);
-                    wake_count += 1;
-                }
-            }
-            (wake_tids, wake_count)
+        // U9-EXIT1 §4 — one body, two owners. The rank-2 half lives in `exit_claim`, where the
+        // split route's exit transaction drives it; this is that same body under the broad guard,
+        // so a joiner wake cannot differ by route. The rank-1 enqueues stay here, after the
+        // acquisition releases — which is the property that made the two halves separable at all.
+        let mut wake_tids = [None; super::MAX_TASKS];
+        let wake_count = self.with_tcbs_mut(|tcbs| {
+            super::exit_claim::wake_joiners_for_locked(tcbs, target_tid, &mut wake_tids)
         });
-        let (wake_tids, wake_count) = wake_tids;
         for wake_tid in wake_tids.iter().take(wake_count).flatten() {
             self.enqueue_task(*wake_tid)?;
         }

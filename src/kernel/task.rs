@@ -726,6 +726,78 @@ pub(crate) fn cancel_async_resume(tcbs: &mut [Option<ThreadControlBlock>], tid: 
         .is_some_and(|tcb| tcb.async_preempted.take().is_some())
 }
 
+/// Canonical 199E-R1D — PUBLISH an asynchronous-preemption snapshot for `tid`.
+///
+/// The one implementation both snapshot owners reach: `KernelState::snapshot_async_preempted_current`
+/// (broad, keyed on `current_tid()`) and `SharedKernel::snapshot_async_preempted_split` (rank 2,
+/// keyed on an identity the caller authenticated). U9-TIMER1 needed the second: the RISC-V bridge
+/// takes its snapshot INSIDE the broad handler, strictly before the scheduler tick that can
+/// yield, and the converted preempting timer runs entirely before that lock is taken — so on the
+/// converted route nothing published a tag, and the resume fell back to the STARTUP argument lane
+/// over a live computation. Extracting rather than adding a second copy is what keeps the two
+/// boundaries unable to disagree about what `a0..a7` mean.
+///
+/// Ordering is the whole safety argument and it is enforced here rather than by the caller: the
+/// context is written FIRST and the tag published LAST, so a tag can never be observed pointing at
+/// a half-written register file.
+///
+/// **The syscall-argument mirror is PRESERVED, not overwritten.** `UserRegisterContext` carries
+/// two mirrors: `user_gprs` (the raw register file, which the asynchronous resume reads) and
+/// `arg0..arg5` (the decoded syscall lane, which the ORDINARY resume arms — fresh startup and
+/// syscall/D2 continuation — treat as authoritative for `a0..a5`). Capturing a timer frame
+/// wholesale writes both, and an interrupted task's mid-computation `a0` would then be installed
+/// as a syscall result by any later ordinary resume.
+///
+/// Returns `false` and publishes NOTHING for the idle/kernel identity (tid 0), for a task with no
+/// TCB or no ASID — the exact-incarnation check the tag depends on cannot be formed without one —
+/// or when the preemption counter is exhausted. Every refusal is fail-closed: the previous tag, if
+/// any, is left untouched and no partial state is written.
+pub(crate) fn publish_async_preempt_snapshot(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+    captured: UserRegisterContext,
+) -> bool {
+    // tid 0 is the idle/kernel identity: it never returns to U-mode through a saved user
+    // context, so there is nothing to preserve and a tag would be meaningless.
+    if tid == 0 {
+        return false;
+    }
+    let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) else {
+        return false;
+    };
+    let Some(asid) = tcb.asid else {
+        return false;
+    };
+    // `checked_add`: an exhausted counter refuses rather than wrapping into a value an ancient
+    // tag could match.
+    let Some(next_generation) = tcb.async_preempt_generation.checked_add(1) else {
+        return false;
+    };
+    let preserved_syscall_lane = (
+        tcb.user_context.arg0,
+        tcb.user_context.arg1,
+        tcb.user_context.arg2,
+        tcb.user_context.arg3,
+        tcb.user_context.arg4,
+        tcb.user_context.arg5,
+    );
+    tcb.user_context = captured;
+    tcb.user_context.arg0 = preserved_syscall_lane.0;
+    tcb.user_context.arg1 = preserved_syscall_lane.1;
+    tcb.user_context.arg2 = preserved_syscall_lane.2;
+    tcb.user_context.arg3 = preserved_syscall_lane.3;
+    tcb.user_context.arg4 = preserved_syscall_lane.4;
+    tcb.user_context.arg5 = preserved_syscall_lane.5;
+    tcb.async_preempt_generation = next_generation;
+    // … tag LAST, so it can never name a half-written register file.
+    tcb.async_preempted = Some(AsyncPreemptedContext {
+        tid,
+        asid,
+        preempt_generation: next_generation,
+    });
+    true
+}
+
 /// U3 (canonical 203C) — THE rank-2 read of one incarnation's saved user context together with
 /// its pending TLS-restore request.
 ///

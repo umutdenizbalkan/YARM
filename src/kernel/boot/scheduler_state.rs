@@ -132,6 +132,21 @@ impl KernelState {
     /// scheduler `current`. Used to PLACE the live AP probe task on the AP after its
     /// wake-only bit is cleared (so the AP's syscall dispatches for a real current
     /// task). Returns the tid made current, if any.
+    /// U9-DISPATCH-CPU1 D4 — the provenance-preserving form of [`Self::dispatch_next_on_cpu`].
+    ///
+    /// `dispatch_next_on_cpu` returns a bare TID, which throws away the one fact
+    /// `commit_dispatch_selection_in_lock` needs: whether the step DEQUEUED an entry or continued
+    /// the existing `current`. A caller that wants to mark the incoming task `Running` — which
+    /// every dispatch that enters userspace must — has to keep that provenance, so this is the
+    /// form the AP's first entry uses.
+    pub(crate) fn on_dispatch_selection_on_cpu(
+        &mut self,
+        cpu: CpuId,
+    ) -> crate::kernel::scheduler::DispatchSelection {
+        let mut sched = self.scheduler_state();
+        kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu)
+    }
+
     pub fn dispatch_next_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {
         let mut sched = self.scheduler_state();
         kernel_mut(&mut sched.scheduler)

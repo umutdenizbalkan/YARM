@@ -301,6 +301,14 @@ pub(crate) enum OwnerRevalidation {
 pub(crate) struct OwnerRevalidationSelection {
     pub(crate) cpu: CpuId,
     pub(crate) tid: u64,
+    /// U9-DISPATCH-CPU3 §3 — the PROVENANCE the mark needs.
+    ///
+    /// The selection used to be a bare TID, which throws away the one fact
+    /// `d6_genuine_mark_running_via_task_seam` requires: whether the step DEQUEUED an entry or
+    /// continued the existing `current`. That is the same information D4 had to restore at the AP's
+    /// first entry, for the same reason — a dispatch that enters userspace must mark its task
+    /// `Running`, and the exact transition depends on how the task was selected.
+    pub(crate) selection: crate::kernel::scheduler::DispatchSelection,
 }
 
 /// U3 (canonical 203C) — everything the arch restore needs, read in ONE rank-2 acquisition.
@@ -472,19 +480,221 @@ pub(crate) enum SchedulerTickOutcome {
     Preempt { cpu: CpuId, tick: u64 },
 }
 
+/// U9-DISPATCH-CPU1 §1 — **proof that the caller is executing inside a specific CPU's trap
+/// window**, and the authority every off-lock queue-advancing selection now runs under.
+///
+/// # What it replaces, and why the thing it replaces was wrong
+///
+/// Stage 199D-WA3A-R2-SEAL (item D) authenticated the selection step by comparing the caller's
+/// `cpu` against `sched.current_cpu`. That field is the BROAD path's ambient binding: `with_cpu`
+/// sets it on entry, on whichever CPU happens to acquire the broad lock. With one dispatching CPU
+/// it is a faithful proxy for "this CPU owns the dispatch". With two it is not a proxy for
+/// anything — CPU B's `with_cpu(B)` rebinds it while CPU A is between its publication and its
+/// drain, and A's drain then refuses on a queue it has already advanced. U9-YIELD2 §3 measured
+/// exactly that consequence: every queue-advancing family must refuse `dispatching > 1` because
+/// the drain's own precondition is not stable.
+///
+/// The scheduler never needed the ambient field for this. `SmpScheduler` is CPU-indexed —
+/// `dispatch_next_selection_on(cpu)`, `preempt_reenqueue_only_on(cpu)`, `current_tid_on(cpu)` all
+/// address one CPU's own queue and current slot — so the question the selection has to answer is
+/// not "is the ambient binding mine?" but "am I genuinely CPU `cpu`, inside its live trap?".
+/// This type answers that question directly.
+///
+/// # Why it cannot be forged
+///
+/// It is minted in ONE place: `arch::trap_entry::TrapPathWindow::establish`, from the `CpuId` the
+/// architecture entry derived from hardware (x86_64's per-CPU record, AArch64's `MPIDR_EL1`,
+/// RISC-V's hart id). There is no constructor taking a bare `CpuId`, so no userspace argument and
+/// no arbitrary `CpuId` can produce one — a caller that wants authority for CPU 3 has to actually
+/// be running CPU 3's trap.
+///
+/// The `epoch` makes it one-shot per trap. `establish` bumps this CPU's counter, so an authority
+/// kept past its window fails [`Self::is_live`] and authorizes nothing. A CPU whose index is out
+/// of range mints [`Self::none`], which is never live — which is also why `CpuOutOfRange` stopped
+/// being a reachable selection refusal.
+///
+/// # What it is NOT
+///
+/// It is not a lock and it is not a per-CPU lock type: §14.4's prohibition is untouched. The
+/// existing rank-1 `with_scheduler_split_mut` still serialises every access to the scheduler; this
+/// only changes WHICH FACT that critical section authenticates against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchAuthority {
+    cpu: CpuId,
+    epoch: u64,
+}
+
+impl DispatchAuthority {
+    /// Mint authority for `cpu`'s newly opened trap window.
+    ///
+    /// **The only caller is `TrapPathWindow::establish`**, which is the one place in the tree that
+    /// knows a trap has just begun on a hardware-identified CPU. Pinned by
+    /// `u9dispatchcpu1_authority::authority_is_minted_only_by_the_trap_window`.
+    pub(crate) fn mint(cpu: CpuId, epoch: u64) -> Self {
+        Self { cpu, epoch }
+    }
+
+    /// An authority that is never live — for a CPU index outside `MAX_CPUS`.
+    ///
+    /// Epoch `0` is the "no window open" value, so this can never match a live window.
+    pub(crate) const fn none(cpu: CpuId) -> Self {
+        Self { cpu, epoch: 0 }
+    }
+
+    /// The CPU this authority is for. There is no setter: the value is fixed at the mint.
+    pub(crate) const fn cpu(self) -> CpuId {
+        self.cpu
+    }
+
+    /// Is this still the live window for its CPU?
+    ///
+    /// U9-DISPATCH-CPU1 §2: false the moment the trap that minted it RETIRES its window — not
+    /// merely once some later trap opens one. `TrapPathWindow::drop` restores this CPU's window
+    /// cell at the real trap boundary, so a retained copy is dead immediately after the return,
+    /// which is the interval in which it would otherwise have named a CPU running arbitrary code.
+    ///
+    /// Also false for the out-of-range [`Self::none`], whose epoch is the reserved
+    /// "no window open" value. A false answer authorizes nothing, and every caller refuses before
+    /// touching the scheduler.
+    pub(crate) fn is_live(self) -> bool {
+        let idx = self.cpu.0 as usize;
+        idx < crate::kernel::scheduler::MAX_CPUS
+            && self.epoch != 0
+            && crate::kernel::boot::TRAP_DISPATCH_WINDOW[idx]
+                .load(core::sync::atomic::Ordering::Acquire)
+                == self.epoch
+    }
+}
+
+impl DispatchAuthority {
+    /// Test/hosted-only: authority for `cpu`'s CURRENT window, without opening a trap.
+    ///
+    /// Production code cannot reach this — the only production mint is
+    /// `TrapPathWindow::establish`, which `u9dispatchcpu1_authority` pins. Tests need it because
+    /// the forced interleavings drive the selection owner directly, with no architecture entry
+    /// underneath them.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn live_for_test(cpu: CpuId) -> Self {
+        let idx = cpu.0 as usize;
+        if idx >= crate::kernel::scheduler::MAX_CPUS {
+            return Self::none(cpu);
+        }
+        // Open a real window if none is open, so the fixture is live by the same rule production
+        // is — never by a special case inside `is_live`.
+        let open = crate::kernel::boot::TRAP_DISPATCH_WINDOW[idx]
+            .load(core::sync::atomic::Ordering::Acquire);
+        if open != 0 {
+            return Self::mint(cpu, open);
+        }
+        let (epoch, _displaced) = crate::kernel::boot::open_trap_dispatch_window(idx);
+        Self::mint(cpu, epoch)
+    }
+
+    /// Test/hosted-only: an authority for `cpu` whose window has already closed.
+    ///
+    /// This is what §4's "wrong or stale authority mutates nothing" drives: it names a real,
+    /// online CPU and differs from a live one ONLY in its epoch.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn stale_for_test(cpu: CpuId) -> Self {
+        let idx = cpu.0 as usize;
+        if idx >= crate::kernel::scheduler::MAX_CPUS {
+            return Self::none(cpu);
+        }
+        // A genuinely RETIRED window: open one and close it, exactly as a returning trap does.
+        // Building it by arithmetic would test a number, not the lifetime.
+        let (epoch, _displaced) = crate::kernel::boot::open_trap_dispatch_window(idx);
+        let retired = crate::kernel::boot::close_trap_dispatch_window(idx, epoch);
+        debug_assert!(retired, "the fixture must own the window it retires");
+        Self::mint(cpu, epoch)
+    }
+}
+
+/// U9-DISPATCH-CPU1 §3 — what a queue-advancing route's DRAIN authenticates against, and
+/// therefore what the route itself has to prove before publishing into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalRouteTopology {
+    /// The drain's selection authenticates against the ambient `sched.current_cpu`, so the route
+    /// must prove that binding is this CPU AND that no second dispatcher can rebind it in the
+    /// window. This is the delivered condition and every unmigrated family keeps it.
+    AmbientBound,
+    /// The drain's selection authenticates against the trap's own [`DispatchAuthority`], so the
+    /// route needs a drainer and nothing more.
+    AuthorityBound,
+}
+
+/// U9-DISPATCH-CPU1 §3 — the ROUTE-LOCAL half of the terminal admission: this CPU has cells, and
+/// something will consume what the route publishes.
+///
+/// It is the whole of an [`TerminalRouteTopology::AuthorityBound`] admission, and it is the prefix
+/// of an `AmbientBound` one. Both `SharedKernel::split_terminal_route_admission` and the BROAD
+/// Yield adapter — which holds a `&mut KernelState` and so has no `SharedKernel` to reach that
+/// method through — call this one function, so the two adapters that drive the single yield
+/// transaction cannot come to disagree about when a yield may be deferred. That drift is precisely
+/// what U9-RESIDUAL1 §3 extracted the transaction to prevent, and a second hand-written copy of
+/// these two conditions would reintroduce it.
+///
+/// Purely a read: a refusal mutates nothing, which is what lets every caller treat it as free.
+pub(crate) fn terminal_route_admission_authority_bound(
+    cpu: CpuId,
+) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
+    use crate::kernel::boot::TerminalAdmissionRefusal as R;
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return Err(R::CpuOutOfRange);
+    }
+    if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+        .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return Err(R::NoTrapDrainer);
+    }
+    Ok(())
+}
+
+/// Why a selection step refused. **Every variant is produced strictly before any mutation**:
+/// nothing was dequeued, nothing became current, and no token can exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchAuthorityRefusal {
+    /// The authority is not the live window for its CPU — a token kept past its trap.
+    StaleWindow,
+    /// The CPU is not an online scheduler CPU, so it has no runqueue to advance.
+    CpuOffline,
+    /// U9-DISPATCH-CPU1 §3 — the LEGACY ambient check, retained for the consumers that have not
+    /// been migrated and whose admission gates still rest on it. Not reachable from an
+    /// authority-bearing caller.
+    AmbientMismatch { authoritative: CpuId },
+}
+
+impl DispatchAuthorityRefusal {
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::StaleWindow => "stale_window",
+            Self::CpuOffline => "cpu_offline",
+            Self::AmbientMismatch { .. } => "ambient_mismatch",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CpuDispatch {
-    /// The requested CPU **was** the authoritative dispatch CPU; `selection` is what it did.
+    /// The caller held live authority for `cpu`; `selection` is what that CPU's runqueue did.
     Selected {
         cpu: CpuId,
         selection: crate::kernel::scheduler::DispatchSelection,
     },
-    /// The requested CPU was **not** the authoritative dispatch CPU. Produced strictly BEFORE
-    /// any mutation: nothing was dequeued, nothing became current, and no token can exist.
-    RefusedCpuMismatch {
+    /// The step refused, strictly BEFORE any mutation: nothing was dequeued, nothing became
+    /// current, and no token can exist. The reason is typed so a log can tell a stale window from
+    /// an offline CPU from the retained ambient gate.
+    Refused {
         requested: CpuId,
-        authoritative: CpuId,
+        reason: DispatchAuthorityRefusal,
     },
+    /// U9-DISPATCH-CPU1 §1 — every runqueue entry on this CPU was examined and none could be
+    /// marked `Running`. Distinct from `Selected(Idle)`, which means the queue was EMPTY: these
+    /// are different facts about the CPU and they license different settlements. Nothing was
+    /// dequeued and no entry changed position.
+    NoneAcceptable { examined: usize },
 }
 
 impl CpuDispatch {
@@ -492,7 +702,7 @@ impl CpuDispatch {
     pub(crate) fn tid(self) -> Option<crate::kernel::ipc::ThreadId> {
         match self {
             Self::Selected { selection, .. } => selection.tid(),
-            Self::RefusedCpuMismatch { .. } => None,
+            Self::Refused { .. } | Self::NoneAcceptable { .. } => None,
         }
     }
 
@@ -500,7 +710,8 @@ impl CpuDispatch {
     pub(crate) fn marker(self) -> &'static str {
         match self {
             Self::Selected { selection, .. } => selection.marker(),
-            Self::RefusedCpuMismatch { .. } => "refused_cpu_mismatch",
+            Self::Refused { .. } => "refused_no_authority",
+            Self::NoneAcceptable { .. } => "none_acceptable",
         }
     }
 }
@@ -532,7 +743,7 @@ impl MarkedIncarnation {
     /// incarnation and therefore no token. This is called inside the same rank-2 acquisition
     /// that performs the status transition, and strictly BEFORE it: a missing identity must
     /// refuse before mutation, never be discovered after the status has already moved.
-    fn resolve(tid: u64, asid: Option<crate::kernel::vm::Asid>) -> Option<Self> {
+    pub(crate) fn resolve(tid: u64, asid: Option<crate::kernel::vm::Asid>) -> Option<Self> {
         match (tid, asid) {
             (crate::kernel::task_transition::IDLE_TID, _) => Some(Self::Idle),
             (_, Some(asid)) => Some(Self::User { asid }),
@@ -794,6 +1005,60 @@ pub(crate) enum DispatchDisposition {
     /// race and not recoverable here: no resume, no fallback dispatch, no idle-as-though-clear,
     /// no return to userspace, no further scheduling.
     Fatal,
+}
+
+/// U9-DISPATCH-CPU1 §2 — what [`SharedKernel::queue_advance_acquire_incoming_split`] settled.
+///
+/// Every variant states what is true of the CPU's `current` slot when the drain sees it, because
+/// that — not the reason for the outcome — is what decides the drain's settlement:
+///
+/// * `Resumable` — a task is marked `Running` and current. Resume it.
+/// * everything else — **nothing is current**, and the only correct settlement is this
+///   architecture's established post-lock idle terminal. They are kept distinct anyway, so that a
+///   log never shows a refusal wearing idle's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchAcquire {
+    /// An exact incarnation is `Running` and current on this CPU.
+    Resumable(DispatchMarkToken),
+    /// The runqueue is empty. This is the ONLY genuinely idle outcome.
+    Idle,
+    /// The authority did not authorize the step. Nothing was read past the refusal and nothing
+    /// was mutated on any attempt.
+    NoAuthority { reason: DispatchAuthorityRefusal },
+    /// A mark refused without touching the scheduler. Nothing was mutated.
+    SchedulerUntouched,
+    /// Every runqueue entry was EXAMINED and none could be marked `Running`. The queue is NOT
+    /// empty — this must never be reported as idle — and `examined` is the measured count, so the
+    /// claim is about what was tried rather than about a retry budget that ran out.
+    NoneAcceptable { examined: usize },
+    /// An accepted candidate stopped being markable between the acceptance read and the mark. The
+    /// exact dequeue was undone; nothing is left half-done and nothing is current.
+    Contended,
+    /// The scheduler and the task table disagree about who is running. Fatal at the call site.
+    Torn { tid: u64 },
+}
+
+impl DispatchAcquire {
+    /// The resumable token, if this outcome produced one.
+    pub(crate) fn token(self) -> Option<DispatchMarkToken> {
+        match self {
+            Self::Resumable(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// A stable slug for markers. Distinct per variant, so no two settlements share a name.
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::Resumable(_) => "resumable",
+            Self::Idle => "idle",
+            Self::NoAuthority { reason } => reason.marker(),
+            Self::SchedulerUntouched => "scheduler_untouched",
+            Self::NoneAcceptable { .. } => "none_acceptable",
+            Self::Contended => "contended",
+            Self::Torn { .. } => "torn",
+        }
+    }
 }
 
 impl DispatchMarkOutcome {
@@ -1118,6 +1383,264 @@ impl SharedKernel {
         });
     }
 
+    /// U9-EXIT1 §3 — may the split self-exit route run on this CPU at all?
+    ///
+    /// Two facts, both pre-mutation. A post-lock drainer must be active, or the queue-advance
+    /// deferral this route reserves would never be consumed and the CPU would strand with
+    /// `current` cleared. And this CPU must be the single authoritative dispatcher, because the
+    /// advance the drain performs authenticates against exactly that.
+    ///
+    /// These are the same two admissions `queue_advance_admit_split` makes before it peeks a
+    /// candidate; asking them here, before anything is reserved, is what keeps every exit refusal
+    /// free.
+    pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {
+        self.split_terminal_route_admitted(cpu)
+    }
+    /// U9-RESIDUAL1 §3 — count one yield, rank 3.
+    ///
+    /// The broad `yield_current` increments `scheduler_yield_calls` on entry, before it knows
+    /// whether it will defer, because it counts the in-lock yields too. The split route never
+    /// reaches that increment, so it owes the count for exactly the yields it commits — and a
+    /// declined split is counted by the broad path that then runs. One increment per NR 0 either
+    /// way; the counter's meaning is unchanged.
+    pub(crate) fn count_yield_split_mut(&self) {
+        self.with_ipc_split_mut(|ipc| {
+            ipc.telemetry.scheduler_yield_calls =
+                ipc.telemetry.scheduler_yield_calls.saturating_add(1);
+        });
+    }
+
+    /// U9-RESIDUAL1 §1/§3 — **THE** topology admission for a split route that publishes a
+    /// queue-advance deferral, and the only place its three conditions are decided.
+    ///
+    /// It was `exit_route_admitted_split`'s body until U9-RESIDUAL1 §3 gave NR 0 a split route with
+    /// the same requirement. Extracting it rather than copying it is the point: a second copy is
+    /// how one route would come to admit a topology another refuses, and the whole meaning of "at
+    /// most one dispatcher" would then depend on which route asked.
+    ///
+    /// The three conditions, in the order that makes each refusal cheaper than the next:
+    ///
+    /// 1. **the CPU is in range** — checked before the per-CPU drainer array is indexed;
+    /// 2. **an active post-lock drainer on this CPU** — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]`.
+    ///    Without one the deferral this route is about to publish would never be consumed, and the
+    ///    CPU would return to userspace with its queue advanced and nothing selected;
+    /// 3. **at most one dispatching CPU, and it is this one** — `(online & !wake_only)` counts
+    ///    dispatchers, so wake-only APs are excluded by construction: they are online for wake and
+    ///    accounting but run no dispatcher, and can neither originate a userspace syscall nor race
+    ///    a settlement. `sched.current_cpu` is the scheduler's bound dispatcher, and the drain that
+    ///    consumes the deferral runs there.
+    ///
+    /// Both scheduler facts come from **one** rank-1 acquisition, so the count and the bound CPU
+    /// cannot be torn against each other.
+    ///
+    /// # This is a check, not an assumption
+    ///
+    /// U9-EXIT2 §1 called the refusal mechanically impossible, citing a Stage-189B note claiming an
+    /// AP can never become a dispatching CPU. Stage 189C6 had already bound that site to the
+    /// default-off `yarm.ap_user_dispatch` knob, so a second dispatcher is producible in a
+    /// production build. The topology is a **default**, and this function is what makes relying on
+    /// it safe: it re-derives the fact from scheduler state on every trap, before any mutation.
+    ///
+    /// It is also stable for the window it admits: both bitmap writers (`bring_up_cpu`,
+    /// `mark_cpu_wake_only`) take `&mut KernelState` and every call site is on the boot
+    /// orchestrator's one-shot SMP bring-up, which runs before any userspace task exists.
+    ///
+    /// Purely a read — a refusal mutates nothing, which is what lets every caller treat it as free.
+    pub(crate) fn split_terminal_route_admitted(&self, cpu: CpuId) -> bool {
+        self.split_terminal_route_admission(cpu, TerminalRouteTopology::AmbientBound)
+            .is_ok()
+    }
+
+    /// The same admission, reporting **which** condition refused.
+    ///
+    /// A boolean was enough while the only caller mapped every refusal to one disposition. NR 0
+    /// distinguishes them in its live vocabulary — the delivered in-lock Yield logged
+    /// `no_trap_drainer` and `multi_cpu` as separate `YIELD_INLOCK_DISPATCH_FALLBACK` reasons — and
+    /// a refusal that cannot be told apart in a log cannot be diagnosed. So the reason is typed at
+    /// its source rather than reconstructed by each caller.
+    ///
+    /// # U9-DISPATCH-CPU1 §3 — the topology a route needs depends on what its DRAIN checks
+    ///
+    /// Conditions (1) and (2) are about this route: an out-of-range CPU has no cells, and without
+    /// a drainer the deferral is never consumed. Condition (3) was never about the route at all —
+    /// it was about the DRAIN, whose selection step authenticated against the ambient
+    /// `sched.current_cpu`. A route had to prove that binding was this CPU *and* that no second
+    /// dispatcher could rebind it before the drain ran.
+    ///
+    /// With the selection step now authenticated by the trap's own [`DispatchAuthority`], a drain
+    /// on that path no longer asks the ambient question, so a route that publishes into it no
+    /// longer has to answer it. `topology` names which of the two a caller is:
+    ///
+    /// * [`TerminalRouteTopology::AmbientBound`] — the delivered behaviour, unchanged, for every
+    ///   family whose gate has not been individually justified;
+    /// * [`TerminalRouteTopology::AuthorityBound`] — conditions (1) and (2) only.
+    ///
+    /// This is a parameter rather than a second function on purpose: one body, so the two
+    /// topologies cannot drift into disagreeing about what a drainer or a CPU range means.
+    pub(crate) fn split_terminal_route_admission(
+        &self,
+        cpu: CpuId,
+        topology: TerminalRouteTopology,
+    ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
+        use crate::kernel::boot::TerminalAdmissionRefusal as R;
+        // Conditions (1) and (2) — the route-local half, shared verbatim with every caller that
+        // has no `SharedKernel` to reach this method through.
+        terminal_route_admission_authority_bound(cpu)?;
+        if topology == TerminalRouteTopology::AuthorityBound {
+            // The drain this route publishes into authenticates the trap window, not the ambient
+            // binding, and every scheduler operation between here and it addresses this CPU's own
+            // queue and current slot explicitly. There is nothing left for a second dispatcher to
+            // invalidate, so there is nothing left to refuse.
+            return Ok(());
+        }
+        let (dispatching, dispatch_cpu) = self.with_scheduler_split_mut(|sched| {
+            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+            let online = s.online_cpu_bitmap();
+            (
+                (online & !s.wake_only_bitmap()).count_ones() as usize,
+                sched.current_cpu,
+            )
+        });
+        if dispatching > 1 {
+            return Err(R::MultiDispatcher);
+        }
+        if dispatch_cpu != cpu {
+            return Err(R::NotDispatchCpu);
+        }
+        Ok(())
+    }
+
+    /// The authoritative dispatch CPU, rank 1. Used only to enqueue a woken joiner onto the run
+    /// queue the drain will select from.
+    pub(crate) fn authoritative_dispatch_cpu_split(&self) -> CpuId {
+        self.with_scheduler_split_mut(|sched| sched.current_cpu)
+    }
+
+    /// U9-EXIT1 §3 — did this thread publish a robust-futex list?
+    ///
+    /// Read under the TASK lock, which `set_robust_futex_head` and `robust_futex_state` now also
+    /// take, so the registry has one domain rather than an implicit dependence on the broad guard.
+    /// The route never walks a list: a thread that has one is refused before any mutation.
+    pub(crate) fn has_robust_futex_list_split_read(&self, tid: u64) -> bool {
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by this SharedKernel;
+        // `task_robust_futex_split_ptrs_from_raw` derives raw field pointers without forming a
+        // reference to the whole KernelState, and `task_state_lock` serializes the task domain.
+        let (task_lock, robust) = unsafe {
+            crate::kernel::boot::KernelState::task_robust_futex_split_ptrs_from_raw(
+                self.state.data_ptr(),
+            )
+        };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let robust = unsafe { &*robust };
+        kernel_ref(robust)
+            .iter()
+            .flatten()
+            .any(|entry| entry.tid.0 == tid)
+    }
+
+    /// U9-EXIT1 §3 — report a task exit to the supervisor: endpoint enqueue (rank 3), then wake.
+    ///
+    /// `false` means no supervisor endpoint is bound, which the broad path also treats as success
+    /// rather than an error. The message is built by the SAME encoder the broad reporter uses, so
+    /// the two cannot disagree about the wire format.
+    pub(crate) fn report_task_exit_to_supervisor_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        code: u64,
+        restart_token: u64,
+    ) -> bool {
+        crate::yarm_log!("TASK_EXITED_REPORT_BEGIN tid={}", tid);
+        let Some(endpoint_idx) = self.with_fault_split_mut(|faults| faults.supervisor_endpoint)
+        else {
+            crate::yarm_log!(
+                "TASK_EXITED_REPORT_FAIL tid={} reason=no-supervisor-endpoint",
+                tid
+            );
+            return false;
+        };
+        let Ok(msg) = crate::kernel::ipc::Message::with_header(
+            0,
+            yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TASK_EXITED,
+            0,
+            None,
+            &yarm_ipc_abi::supervisor_abi::encode_task_exited_event(tid, code, restart_token),
+        ) else {
+            crate::yarm_log!("TASK_EXITED_REPORT_FAIL tid={} reason=encode", tid);
+            return false;
+        };
+        if !self.exit_report_send_and_wake_split(cpu, endpoint_idx, msg) {
+            crate::yarm_log!("TASK_EXITED_REPORT_FAIL tid={} reason=queue_full", tid);
+            return false;
+        }
+        crate::yarm_log!("TASK_EXITED_REPORT_SENT tid={} target=supervisor", tid);
+        true
+    }
+
+    /// U9-EXIT1 §3 — report a task exit to PM: endpoint enqueue (rank 3), then wake.
+    pub(crate) fn report_task_exit_to_pm_split(&self, cpu: CpuId, tid: u64, code: u64) -> bool {
+        let Some(endpoint_idx) = self.with_fault_split_mut(|faults| faults.pm_task_exit_endpoint)
+        else {
+            return false;
+        };
+        let payload = yarm_ipc_abi::process_abi::KernelPmTaskExitedPayload::new(tid, code).encode();
+        let Ok(msg) = crate::kernel::ipc::Message::with_header(
+            0,
+            yarm_ipc_abi::process_abi::KERNEL_OP_PM_TASK_EXITED,
+            0,
+            None,
+            &payload,
+        ) else {
+            return false;
+        };
+        self.exit_report_send_and_wake_split(cpu, endpoint_idx, msg)
+    }
+
+    /// The rank-3 enqueue plus the wake, in that order and with the rank-3 claim RELEASED before
+    /// the wake — the same two steps `send_message_to_endpoint_and_wake` performs, split so no
+    /// unrelated lock is held across the wake.
+    fn exit_report_send_and_wake_split(
+        &self,
+        cpu: CpuId,
+        endpoint_idx: usize,
+        msg: crate::kernel::ipc::Message,
+    ) -> bool {
+        let queued = self.with_ipc_split_mut(|ipc| {
+            let Some(ep_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
+            else {
+                return false;
+            };
+            kernel_mut(ep_storage).send(msg).is_ok()
+        });
+        if !queued {
+            return false;
+        }
+        let _ = self.wake_waiter_for_endpoint_split(cpu, endpoint_idx);
+        true
+    }
+
+    /// U9-EXIT1 §3 — the RESTART subsystem, off the broad lock.
+    ///
+    /// The split self-exit mints its restart token from the SAME monotonic counter the broad
+    /// `exit_task` mints from, so the two routes cannot issue the same token or diverge in
+    /// numbering. Nothing else in the exit transaction touches this rank.
+    pub(crate) fn with_restart_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut crate::kernel::boot::RestartSubsystem) -> R,
+    ) -> R {
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by this SharedKernel.
+        // `restart_split_mut_ptrs_from_raw` derives raw field pointers via addr_of!/addr_of_mut!
+        // without forming a reference to the whole KernelState; `restart_state_lock` serializes
+        // access to the `restart` storage.
+        let (restart_lock, restart) =
+            unsafe { KernelState::restart_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let restart_lock = unsafe { &*restart_lock };
+        let _guard = restart_lock.lock();
+        let restart = unsafe { &mut *restart };
+        f(kernel_mut(restart))
+    }
+
     /// # Validation status
     /// - LIVE_OFF_TRAP — mutates only telemetry counters under `telemetry_state_lock`;
     ///   called from off-trap kernel code, not the pre-global-lock trap seam.
@@ -1344,6 +1867,68 @@ impl SharedKernel {
         // failure, never a silent return into ring 3 on the previous task's frame.
         let snapshot = self.owner_revalidation_snapshot_split(next);
         if let Some(snapshot) = snapshot {
+            // U9-DISPATCH-CPU3 §3 — MARK IT RUNNING, before any frame is written.
+            //
+            // This owner selects a task, loads its saved user context into the trap frame and
+            // reports `Replacement(next)`, on which the x86_64 trap tail `iretq`s into ring 3. It
+            // did all of that without ever moving the task's status: the task entered userspace
+            // still `Runnable`, so the scheduler and the task table disagreed about what was
+            // running on this CPU for the whole of its timeslice. The next `PreemptOutgoing`
+            // (`Running -> Runnable`) would then refuse, because its `expected_from` is `Running`.
+            //
+            // This is the SAME defect U9-DISPATCH-CPU1 D4 repaired at the AP's first userspace
+            // entry, on the second path that reaches userspace without the broad dispatcher — and
+            // it is repaired the same way, through the same owners: the provenance-preserving
+            // selection above, and the one rank-2 mark seam here. No new transition, no second
+            // policy; `d6_genuine_mark_running_via_task_seam` owns all five outcomes and its
+            // refusals are the ones this caller already handles.
+            //
+            // A refusal takes the EXISTING restore-failure path below, which clears `current` and
+            // undoes the queue advance exactly — the same settlement an unrestorable snapshot
+            // takes, because "cannot be marked" and "cannot be restored" have the same remedy:
+            // do not return through a frame this CPU has no right to.
+            // The STATUS transition only. Deliberately `apply_dispatch_transition` rather than
+            // `d6_genuine_mark_running_via_task_seam`: the seam also requires an exact
+            // incarnation, and whether an incarnation is a precondition of BROAD dispatch is a
+            // separate question with a separate answer (U9-DISPATCH-CPU3 §1/§2 — it is not, and
+            // the AArch64 userspace boundary is where that is enforced). Folding both changes into
+            // one would re-litigate a settled contract while repairing a different defect. This is
+            // the SAME transition, through the SAME owner, that
+            // `commit_dispatch_selection_in_lock` applies for `dispatch_next_task`; the provenance
+            // chooses between `DispatchIncoming` and `ContinueCurrent` exactly as it does there.
+            let transition = match selection.selection {
+                crate::kernel::scheduler::DispatchSelection::Dequeued { .. } => {
+                    Some(crate::kernel::task_transition::TaskTransition::DispatchIncoming)
+                }
+                crate::kernel::scheduler::DispatchSelection::ContinuedCurrent { .. } => {
+                    Some(crate::kernel::task_transition::TaskTransition::ContinueCurrent)
+                }
+                crate::kernel::scheduler::DispatchSelection::Idle => None,
+            };
+            if let Some(transition) = transition {
+                let marked = self.with_task_tcbs_split_mut(|tcbs| {
+                    crate::kernel::task_transition::apply_dispatch_transition(
+                        tcbs, next, transition,
+                    )
+                    .map_err(|refusal| {
+                        crate::kernel::task_transition::log_transition_refusal(
+                            "owner_revalidation",
+                            next,
+                            transition,
+                            refusal,
+                        )
+                    })
+                    .is_ok()
+                });
+                if !marked {
+                    crate::yarm_log!(
+                        "EXIT_TASK_OWNER_REVALIDATE_MARK_REFUSED arch=x86_64 cpu={} tid={}",
+                        selection.cpu.0,
+                        next
+                    );
+                    return self.owner_revalidation_rollback_split(selection, true);
+                }
+            }
             // (6) No lock held: frame, FS base, per-CPU TLS record, pre-IRET CR3 invariant.
             crate::arch::x86_64::trap::x86_apply_owner_revalidation_restore(
                 self, cpu, next, snapshot, frame,
@@ -1367,8 +1952,17 @@ impl SharedKernel {
         self.with_scheduler_split_mut(|sched| {
             kernel_ref(&sched.scheduler).validate_online_cpu(cpu).ok()?;
             sched.current_cpu = cpu;
-            let tid = kernel_mut(&mut sched.scheduler).dispatch_next_on(cpu)?;
-            Some(OwnerRevalidationSelection { cpu, tid: tid.0 })
+            // U9-DISPATCH-CPU3 §3: the provenance-preserving form. `dispatch_next_on` returns a
+            // bare TID; this returns WHICH kind of selection was made, which is what lets the
+            // caller mark the task `Running` through the one existing seam instead of entering
+            // userspace with the scheduler and the task table disagreeing about its status.
+            let selection = kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu);
+            let tid = selection.tid()?.0;
+            Some(OwnerRevalidationSelection {
+                cpu,
+                tid,
+                selection,
+            })
         })
     }
 
@@ -1425,7 +2019,7 @@ impl SharedKernel {
         use crate::kernel::task::TaskClass;
 
         const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
-        let OwnerRevalidationSelection { cpu, tid } = selection;
+        let OwnerRevalidationSelection { cpu, tid, .. } = selection;
         self.with_scheduler_split_mut(|sched| {
             let cleared = kernel_mut(&mut sched.scheduler)
                 .block_current_on(cpu)
@@ -1499,9 +2093,16 @@ impl SharedKernel {
                     cpu.0,
                     dispatch_cpu.0
                 );
-                return CpuDispatch::RefusedCpuMismatch {
+                // U9-DISPATCH-CPU1 §3: this consumer is NOT migrated. The D6 queue-NEUTRAL
+                // observation slice is x86_64-only, runs under `d6_genuine_enabled()` and its
+                // caller's own single-dispatcher eligibility, and its whole contract is that it
+                // provably does not dequeue. Its admission gate is untouched, so it keeps the
+                // ambient check — now spelled as the typed refusal it always was.
+                return CpuDispatch::Refused {
                     requested: cpu,
-                    authoritative: dispatch_cpu,
+                    reason: DispatchAuthorityRefusal::AmbientMismatch {
+                        authoritative: dispatch_cpu,
+                    },
                 };
             }
             // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
@@ -1588,15 +2189,22 @@ impl SharedKernel {
         };
         let (cpu, selection) = match dispatch {
             CpuDispatch::Selected { cpu, selection } => (cpu, selection),
-            CpuDispatch::RefusedCpuMismatch {
-                requested,
-                authoritative,
-            } => {
+            CpuDispatch::Refused { requested, reason } => {
                 // Nothing was mutated by the seam, so nothing is undone here either.
                 crate::yarm_log!(
-                    "DISPATCH_MARK_REFUSED cpu={} authoritative={} provenance=refused_cpu_mismatch scheduler_mutation=none",
+                    "DISPATCH_MARK_REFUSED cpu={} provenance=refused_no_authority reason={} scheduler_mutation=none",
                     requested.0,
-                    authoritative.0
+                    reason.marker()
+                );
+                return DispatchMarkOutcome::RefusedNoSchedulerChange;
+            }
+            CpuDispatch::NoneAcceptable { examined } => {
+                // The selection examined every entry and dequeued none, so there is nothing to
+                // mark and nothing to undo. Callers that reach the mark with this in hand are
+                // asking about a selection that never happened.
+                crate::yarm_log!(
+                    "DISPATCH_MARK_REFUSED cpu=none provenance=none_acceptable examined={} scheduler_mutation=none",
+                    examined
                 );
                 return DispatchMarkOutcome::RefusedNoSchedulerChange;
             }
@@ -1791,26 +2399,14 @@ impl SharedKernel {
     // U4: architecture-neutral. Nothing in the body is x86-specific — it was gated
     // only because the D2 drains were. All three architectures now drain D2.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn d2_recv_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
-        self.with_scheduler_split_mut(|sched| {
-            let dispatch_cpu = sched.current_cpu;
-            // Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's CPU against the
-            // authoritative dispatch CPU BEFORE any mutation. On mismatch nothing is dequeued.
-            if dispatch_cpu != cpu {
-                crate::yarm_log!(
-                    "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}",
-                    "d2_recv_dispatch_step_mut",
-                    cpu.0,
-                    dispatch_cpu.0
-                );
-                return CpuDispatch::RefusedCpuMismatch {
-                    requested: cpu,
-                    authoritative: dispatch_cpu,
-                };
-            }
-            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
-            let selection =
-                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
+    pub(crate) fn d2_recv_dispatch_step_mut(&self, authority: DispatchAuthority) -> CpuDispatch {
+        // U9-DISPATCH-CPU1 §3: ONE selection implementation. This used to carry its own copy of
+        // the seam acquisition and the CPU authentication — so the "ONE QUEUE-ADVANCE OWNER"
+        // claim U9-QA §1 made was true of three consumers and false of two. What remains here is
+        // this class's telemetry, which is the only thing that was ever class-specific.
+        let cpu = authority.cpu();
+        let dispatch = self.queue_advance_select_step_split(authority, "d2_recv_dispatch_step_mut");
+        if let CpuDispatch::Selected { selection, .. } = dispatch {
             let incoming = selection.tid().map(|t| t.0);
             // Stage 199D-WA3A-R2-SEAL: read off the TYPED selection, not `Option::is_some`.
             let result = match selection {
@@ -1823,11 +2419,8 @@ impl SharedKernel {
                 result,
                 incoming
             );
-            CpuDispatch::Selected {
-                cpu: dispatch_cpu,
-                selection,
-            }
-        })
+        }
+        dispatch
     }
 
     /// Stage 169 (D2-GENUINE-SEND): re-verify — out of the global lock, through
@@ -1863,26 +2456,11 @@ impl SharedKernel {
     // U4: architecture-neutral. Nothing in the body is x86-specific — it was gated
     // only because the D2 drains were. All three architectures now drain D2.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn d2_send_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
-        self.with_scheduler_split_mut(|sched| {
-            let dispatch_cpu = sched.current_cpu;
-            // Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's CPU against the
-            // authoritative dispatch CPU BEFORE any mutation. On mismatch nothing is dequeued.
-            if dispatch_cpu != cpu {
-                crate::yarm_log!(
-                    "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}",
-                    "d2_send_dispatch_step_mut",
-                    cpu.0,
-                    dispatch_cpu.0
-                );
-                return CpuDispatch::RefusedCpuMismatch {
-                    requested: cpu,
-                    authoritative: dispatch_cpu,
-                };
-            }
-            // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
-            let selection =
-                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
+    pub(crate) fn d2_send_dispatch_step_mut(&self, authority: DispatchAuthority) -> CpuDispatch {
+        // U9-DISPATCH-CPU1 §3: the send twin of the recv step above, on the same one owner.
+        let cpu = authority.cpu();
+        let dispatch = self.queue_advance_select_step_split(authority, "d2_send_dispatch_step_mut");
+        if let CpuDispatch::Selected { selection, .. } = dispatch {
             let incoming = selection.tid().map(|t| t.0);
             // Stage 199D-WA3A-R2-SEAL: read off the TYPED selection, not `Option::is_some`.
             let result = match selection {
@@ -1895,11 +2473,8 @@ impl SharedKernel {
                 result,
                 incoming
             );
-            CpuDispatch::Selected {
-                cpu: dispatch_cpu,
-                selection,
-            }
-        })
+        }
+        dispatch
     }
 
     /// Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): re-verify — out of the global
@@ -1937,6 +2512,187 @@ impl SharedKernel {
         })
     }
 
+    /// U9-EXIT1 §3 — reverify one EXIT deferral, by exact incarnation.
+    ///
+    /// Deliberately not shaped like its two neighbours. `futex_wait_reverify_blocked` and
+    /// `terminal_fault_reverify_faulted` both end in `.unwrap_or(false)`, so a MISSING TCB
+    /// reverifies as *not ok* — correct for them, because a blocked or faulted task must still
+    /// exist. An exiting task need not: it can legitimately have been joined or reaped between the
+    /// claim and this drain, and absence then means the exit SUCCEEDED. Reading absence as failure
+    /// would strand the CPU with `current` already cleared and nothing selected.
+    ///
+    /// So absence is represented explicitly rather than inferred — `Removed` is a distinct verdict
+    /// from `Terminal`, and only `Contradicted` (present and NOT terminal, i.e. something
+    /// resurrected a claimed task) refuses. Neither neighbouring predicate is loosened.
+    pub(crate) fn exit_reverify_terminal(
+        &self,
+        tid: u64,
+        asid: Option<crate::kernel::vm::Asid>,
+    ) -> crate::kernel::boot::exit_claim::ExitDrainVerdict {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::exit_claim::exit_drain_verdict_locked(tcbs, tid, asid)
+        })
+    }
+
+    /// The drain's boolean form: is this outgoing task's exit deferral still owed and sound?
+    ///
+    /// U9-EXIT1 §4 — the exact reverse link an incarnation still holds, read off the broad lock.
+    ///
+    /// The split-domain form of `KernelState::server_reply_link_for`, matched on the same
+    /// `{tid, asid}` incarnation, so a replacement task reusing the numeric TID resolves nothing.
+    pub(crate) fn server_reply_link_for_split_read(
+        &self,
+        server_tid: u64,
+        server_asid: crate::kernel::vm::Asid,
+    ) -> Option<crate::kernel::task::ServerReplyLink> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+                .and_then(|t| t.server_reply_link)
+        })
+    }
+
+    /// U9-EXIT1 §4 — the split-domain form of `KernelState::arm_server_dies_link_scope`.
+    ///
+    /// It exists so the ServerDies scenario is armed from the SAME point on both routes: while the
+    /// deferred reservation is held and the reverse link is still attached. Arming it later, or
+    /// from the terminal arm, is what 199D-SD3 established does not work — the one-shot latch then
+    /// claims whichever reply wait happened to be first in the boot rather than the one that dies.
+    ///
+    /// Diagnostic only, and inert unless the reply-timeout oracle core is compiled in.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn arm_server_dies_link_scope_split(
+        &self,
+        record_index: usize,
+        record_generation: u64,
+    ) {
+        use crate::kernel::boot::server_dies_counters as c;
+        if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            != crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+        {
+            return;
+        }
+        if !c::arm_record(record_index, record_generation) {
+            return;
+        }
+        let bound = self.with_ipc_split_mut(|ipc| {
+            if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+                return None;
+            }
+            ipc.reply_caps
+                .get(record_index)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.responder_tid.zip(r.replier_asid))
+        });
+        let Some((server_tid, server_asid)) = bound else {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} link_present=0 reason=unbound_record result=ok",
+                record_index,
+                record_generation
+            );
+            return;
+        };
+        let _ = c::arm_scenario_server(server_tid.0, server_asid.0);
+        let present = self
+            .server_reply_link_for_split_read(server_tid.0, server_asid)
+            .is_some_and(|link| link.matches_record(record_index, record_generation));
+        if present {
+            c::note_armed_link_present(record_index, record_generation);
+        }
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} server_tid={} server_asid={} link_present={} result=ok",
+            record_index,
+            record_generation,
+            server_tid.0,
+            server_asid.0,
+            u32::from(present)
+        );
+    }
+
+    /// U9-EXIT3 §2 — the ONE rank-1 compare-and-clear that mints a post-clear settlement duty.
+    ///
+    /// Nothing is mutated unless `cpu`'s current slot names exactly `tid`.
+    pub(crate) fn clear_current_exact_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: Option<crate::kernel::vm::Asid>,
+    ) -> Option<crate::kernel::boot::cleared_current::ClearedCurrentToken> {
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .ok()?;
+            sched.current_cpu = cpu;
+            crate::kernel::boot::cleared_current::clear_current_exact(
+                crate::kernel::boot::kernel_mut(&mut sched.scheduler),
+                cpu,
+                tid,
+                asid,
+            )
+        })
+    }
+
+    /// U9-EXIT3 §2 — rank 2: is this EXACT incarnation present and `Running`?
+    pub(crate) fn victim_is_running_exact_split(
+        &self,
+        tid: u64,
+        asid: Option<crate::kernel::vm::Asid>,
+    ) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter().flatten().any(|t| {
+                t.tid.0 == tid
+                    && t.asid == asid
+                    && matches!(t.status, crate::kernel::task::TaskStatus::Running)
+            })
+        })
+    }
+
+    /// U9-EXIT3 §2 — rank 1: is `tid` current on, or queued on, ANY CPU?
+    pub(crate) fn tid_placed_anywhere_split(&self, tid: u64) -> bool {
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler)
+                .tid_present_anywhere(crate::kernel::ipc::ThreadId(tid))
+        })
+    }
+
+    /// U9-EXIT3 §2 — rank 1: the exact inverse of `clear_current_exact_split`.
+    pub(crate) fn restore_current_exact_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        priority: crate::kernel::scheduler::TaskPriority,
+    ) -> bool {
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_mut(&mut sched.scheduler).restore_exact_current_on(
+                cpu,
+                crate::kernel::ipc::ThreadId(tid),
+                priority,
+            )
+        })
+    }
+
+    /// `Terminal` and `Removed` both mean "the advance is owed"; `Contradicted` is the only
+    /// refusal, and it is the one that must never happen after a claim.
+    pub(crate) fn exit_reverify_ok(&self, tid: u64) -> bool {
+        use crate::kernel::boot::exit_claim::ExitDrainVerdict as V;
+        let asid = self.task_asid_opt_split_read(tid);
+        match self.exit_reverify_terminal(tid, asid) {
+            V::Terminal => true,
+            V::Removed => {
+                crate::yarm_log!("EXIT_TASK_DRAIN_REVERIFY_REMOVED tid={}", tid);
+                true
+            }
+            V::Contradicted => {
+                crate::yarm_log!(
+                    "EXIT_TASK_DRAIN_REVERIFY_CONTRADICTED tid={} result=fail",
+                    tid
+                );
+                false
+            }
+        }
+    }
+
     pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {
         self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()
@@ -1971,6 +2727,38 @@ impl SharedKernel {
     /// for "the quantum expired": a `NoSwitch` tick must not publish a preemption, and a
     /// `Preempt` tick uses the EXISTING Stage 192B publication and the U9-QA selection owner —
     /// this seam introduces no requeue or dequeue path of its own.
+    /// U9-TIMER1 §1 — **would the next tick preempt?** rank 1, non-mutating.
+    ///
+    /// The lookahead half of [`Self::scheduler_tick_if_no_switch_split_mut`], exposed on its own so
+    /// the timer route can BRANCH before it commits anything. That ordering is what keeps the
+    /// converted route's declines free: the preempting branch runs its whole transaction — every
+    /// step of which refuses before mutating — and only then takes the single tick. A route that
+    /// ticked first and then declined would have to choose between double-ticking in the broad arm
+    /// and silently dropping a quantum's preemption; asking first means a decline falls back to the
+    /// unchanged broad arm having changed exactly nothing, which is the same property the
+    /// non-preempting refusal has always had.
+    ///
+    /// Nothing else ticks this CPU's timer, and interrupts are masked for the whole trap, so the
+    /// answer cannot go stale between this read and the tick that follows it.
+    pub(crate) fn timer_would_preempt_split_read(&self, _cpu: CpuId) -> bool {
+        self.with_scheduler_split_mut(|sched| sched.timer.would_preempt_next())
+    }
+
+    /// U9-TIMER1 §3 — install a quantum on the LIVE scheduler timer. Rank 1, one acquisition.
+    ///
+    /// The construction-time read in `bootstrap_state` covers the port whose command line is
+    /// captured before the kernel state is built (x86_64). AArch64 and RISC-V capture theirs
+    /// afterwards, so on those the timer already exists by the time the knob is parsed and the
+    /// value has to be installed rather than constructed. Both routes resolve the SAME owner,
+    /// `boot::sched_quantum_ticks()`, so they cannot disagree.
+    ///
+    /// This touches only the interrupt-count quantum. The hardware interval is programmed from
+    /// `BOOTSTRAP_TIMER_DEADLINE_TICKS` directly and is not reachable from here, so every timer
+    /// interrupt still arrives on its production schedule.
+    pub(crate) fn set_scheduler_quantum_split_mut(&self, quantum_ticks: u64) {
+        self.with_scheduler_split_mut(|sched| sched.timer.set_quantum(quantum_ticks));
+    }
+
     pub(crate) fn scheduler_tick_split_mut(&self, cpu: CpuId) -> SchedulerTickOutcome {
         let (tick, should_preempt) =
             self.with_scheduler_split_mut(|sched| sched.timer.tick_and_check());
@@ -1983,13 +2771,23 @@ impl SharedKernel {
 
     /// U9-TM §4 — tick ONLY if this tick would not preempt, atomically.
     ///
-    /// No existing profile witnesses a timer-driven preemption: across 77 recorded profiles on
-    /// all three architectures, `YARM_SCHED_TICK ... preempt=1` occurs zero times and no
-    /// `YIELD_DISPATCH_DEQUEUE_OK` is ever produced by a timer. So the preempting branch of a
-    /// split timer route cannot be live-proven, and shipping it unproven is not acceptable.
+    /// **U9-TIMER1 correction.** U9-TM recorded that no existing profile witnessed a timer-driven
+    /// preemption — across 77 recorded profiles on all three architectures, `YARM_SCHED_TICK ...
+    /// preempt=1` occurred zero times — and concluded that the preempting branch of a split timer
+    /// route could not be live-proven, so this seam declined it to the broad arm. That conclusion
+    /// held only because the quantum and the hardware deadline were the same constant in
+    /// incompatible units, which put a preempting tick millions of interrupts away on two of the
+    /// three ports; it was an observability limit, not a property of the branch. U9-TIMER1 §3
+    /// separates the two, and the preempting branch is now live-witnessed on all three ports and
+    /// shipped in `try_split_timer_into_frame`.
     ///
-    /// This is the honest alternative. The lookahead and the tick happen inside ONE rank-1
-    /// acquisition, so the answer cannot go stale between them:
+    /// So this seam's `None` is no longer the route's answer to a preempting tick — the route
+    /// branches on [`Self::timer_would_preempt_split_read`] before reaching here, and a preempting
+    /// tick never gets this far. It is kept as the fail-safe it always was: if the lookahead and
+    /// this seam ever disagreed, this refuses having ticked nothing.
+    ///
+    /// The lookahead and the tick happen inside ONE rank-1 acquisition, so the answer cannot go
+    /// stale between them:
     ///
     /// * would preempt -> `None`, with NOTHING incremented and nothing mutated. The caller falls
     ///   through to the unchanged broad arm, which ticks and preempts exactly as it always has.
@@ -2031,45 +2829,220 @@ impl SharedKernel {
     ///
     /// The step takes rank 1 exactly once and performs, in order:
     ///
-    /// 1. Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's `cpu` against the
-    ///    authoritative `sched.current_cpu` BEFORE any mutation. On mismatch NOTHING is
-    ///    dequeued and the typed `RefusedCpuMismatch` is returned; `site` names the caller so
-    ///    the `DISPATCH_STEP_REFUSED_CPU_MISMATCH` marker stays attributable.
+    /// 1. **U9-DISPATCH-CPU1 §1** — authenticate the caller's AUTHORITY before any mutation. The
+    ///    authority names its own CPU, so there is no caller-supplied `CpuId` left to disagree
+    ///    with; what is checked is that the window is still live and that the CPU is an online
+    ///    scheduler CPU. On refusal NOTHING is dequeued and the typed [`CpuDispatch::Refused`] is
+    ///    returned; `site` names the caller so the marker stays attributable.
     /// 2. Stage 199D-WA3A-R1: produce the selection provenance INSIDE the scheduler mutation,
     ///    so a `CpuDispatch::Selected` can only be minted by a real dequeue on a real CPU.
     ///
-    /// It deliberately emits NO success marker: the two consumers own different telemetry
-    /// families (`QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK` vs `D6_GLOBAL_LOCK_DROP_PLAN_READY`) and
-    /// a shared step must not fabricate either.
+    /// # What changed here, and what did not
+    ///
+    /// Step (1) used to read `sched.current_cpu` and refuse `dispatch_cpu != cpu`. That is the
+    /// ambient binding `with_cpu` writes on whichever CPU takes the broad lock, and U9-YIELD2 §3
+    /// showed it is not a fact about the caller at all once a second CPU dispatches: B's
+    /// `with_cpu(B)` rebinds it inside A's window, and A's drain then refuses on a queue it has
+    /// already advanced. The check is not deleted — it is REPLACED by the fact it was standing in
+    /// for, and that fact is unforgeable (see [`DispatchAuthority`]).
+    ///
+    /// Everything downstream is unchanged and was already CPU-explicit: the selection addresses
+    /// `dispatch_next_selection_on(cpu)`, the mark takes its CPU from the returned dispatch, the
+    /// rollback from the same, and the architectural apply from `token.cpu()`. The ambient field
+    /// is neither read nor written here any more; the broad path keeps it for its own transactions.
+    ///
+    /// It deliberately emits NO success marker: the consumers own different telemetry families
+    /// (`QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK` vs `D6_GLOBAL_LOCK_DROP_PLAN_READY`) and a shared
+    /// step must not fabricate either.
     pub(crate) fn queue_advance_select_step_split(
         &self,
-        cpu: CpuId,
+        authority: DispatchAuthority,
         site: &'static str,
     ) -> CpuDispatch {
+        let cpu = authority.cpu();
+        // The window check is OUTSIDE the scheduler acquisition on purpose: a stale authority must
+        // not even take rank 1.
+        if !authority.is_live() {
+            crate::yarm_log!(
+                "DISPATCH_STEP_REFUSED site={} requested={} reason=stale_window",
+                site,
+                cpu.0
+            );
+            return CpuDispatch::Refused {
+                requested: cpu,
+                reason: DispatchAuthorityRefusal::StaleWindow,
+            };
+        }
         self.with_scheduler_split_mut(|sched| {
-            let dispatch_cpu = sched.current_cpu;
-            // Stage 199D-WA3A-R2-SEAL (item D): authenticate the caller's CPU against the
-            // authoritative dispatch CPU BEFORE any mutation. On mismatch nothing is dequeued.
-            if dispatch_cpu != cpu {
+            // The CPU must be an ONLINE scheduler CPU — the same predicate
+            // `current_tid_authoritative` applies, and the reason `CpuOutOfRange` is no longer a
+            // reachable selection refusal (an out-of-range CPU cannot mint a live authority).
+            if kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .is_err()
+            {
                 crate::yarm_log!(
-                    "DISPATCH_STEP_REFUSED_CPU_MISMATCH site={} requested={} authoritative={}",
+                    "DISPATCH_STEP_REFUSED site={} requested={} reason=cpu_offline",
                     site,
-                    cpu.0,
-                    dispatch_cpu.0
+                    cpu.0
                 );
-                return CpuDispatch::RefusedCpuMismatch {
+                return CpuDispatch::Refused {
                     requested: cpu,
-                    authoritative: dispatch_cpu,
+                    reason: DispatchAuthorityRefusal::CpuOffline,
                 };
             }
             // Stage 199D-WA3A-R1: provenance is produced INSIDE the scheduler mutation.
+            //
+            // U9-DISPATCH-CPU1 §1: and the candidate is ACCEPTANCE-FILTERED. `accept` asks the
+            // read-only sibling of the very transition the mark will apply, so the scheduler
+            // dequeues only a task the mark will take — instead of dequeuing the head, failing to
+            // mark it and rolling the dequeue back. Rank 1 is held across the rank-2 read, which
+            // is the canonical ascending direction.
             let selection =
-                kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(dispatch_cpu);
-            CpuDispatch::Selected {
-                cpu: dispatch_cpu,
-                selection,
+                kernel_mut(&mut sched.scheduler).dispatch_next_accepted_selection_on(cpu, |tid| {
+                    self.with_task_tcbs_split_mut(|tcbs| {
+                        crate::kernel::task_transition::dispatch_transition_would_be_accepted(
+                            tcbs,
+                            tid.0,
+                            crate::kernel::task_transition::TaskTransition::DispatchIncoming,
+                        ) && MarkedIncarnation::resolve(
+                            tid.0,
+                            tcbs.iter()
+                                .flatten()
+                                .find(|t| t.tid.0 == tid.0)
+                                .and_then(|t| t.asid),
+                        )
+                        .is_some()
+                    })
+                });
+            match selection {
+                crate::kernel::scheduler::AcceptedSelection::Selected(selection) => {
+                    CpuDispatch::Selected { cpu, selection }
+                }
+                crate::kernel::scheduler::AcceptedSelection::Empty => CpuDispatch::Selected {
+                    cpu,
+                    selection: crate::kernel::scheduler::DispatchSelection::Idle,
+                },
+                crate::kernel::scheduler::AcceptedSelection::NoneAcceptable { examined } => {
+                    crate::yarm_log!(
+                        "DISPATCH_STEP_NONE_ACCEPTABLE site={} cpu={} examined={}",
+                        site,
+                        cpu.0,
+                        examined
+                    );
+                    CpuDispatch::NoneAcceptable { examined }
+                }
             }
         })
+    }
+
+    /// U9-DISPATCH-CPU1 §2 — **acquire an incoming task for this CPU, or report honestly that it
+    /// has none.** The one owner every post-lock queue-advancing drain settles through.
+    ///
+    /// # The obligation this exists to discharge
+    ///
+    /// Every drain that reaches here was published by a route that ALREADY cleared this CPU's
+    /// `current` slot — a yield re-enqueued its caller, a blocking recv/send parked its caller, an
+    /// exit retired its caller. So on entry the CPU owns nothing, and the drain's obligation is
+    /// exactly: end this trap with a task marked `Running` and current, or with a CPU that is
+    /// genuinely idle. There is no third settlement, and in particular there is no "return to
+    /// current" — `current` is empty, and a frame returned through it would resume a task that is
+    /// simultaneously sitting on a runqueue.
+    ///
+    /// That third settlement is what the three RISC-V drains were taking (`ReturnToCurrent`) and
+    /// what the x86_64 and AArch64 drains were reporting as `incoming=idle` /
+    /// `reason=no_incoming`. `DispatchDisposition` already said otherwise —
+    /// `DeclineDequeueUndone` is documented as "Nothing is current on this CPU; the task is back
+    /// on its runqueue. Ordinary fallback dispatch is permitted." This is that fallback dispatch,
+    /// written once instead of at nine call sites.
+    ///
+    /// # Exhaustion is its own outcome
+    ///
+    /// A CPU whose queue is non-empty but none of whose entries can be marked `Running` is NOT
+    /// idle and must not be logged as idle. It is reported as
+    /// [`DispatchAcquire::NoneAcceptable`], carrying the number of entries actually examined, and
+    /// the caller settles it through the architecture's established idle terminal under a marker
+    /// that names the refusal. That settlement is recoverable — §3's recovery contract — because
+    /// the entries stayed queued, in order, and the next dispatch on this CPU re-examines them.
+    ///
+    /// `step` is the CLASS's own selection wrapper — `yield_dispatch_step_mut`,
+    /// `futex_wait_dispatch_step_mut` — so each drain keeps emitting its own delivered dequeue
+    /// vocabulary. The selection policy underneath is the one owner either way; what the closure
+    /// carries is telemetry, not a second implementation. Threading it is deliberate: calling the
+    /// shared step directly here would have silently zeroed `YIELD_DISPATCH_DEQUEUE_OK`,
+    /// `QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK` and their per-architecture siblings, every one of
+    /// which a live oracle matches.
+    ///
+    /// # There is no retry, and that is the point
+    ///
+    /// An earlier form of this owner retried after a failed mark, bounded by `runnable_count`.
+    /// That bound was unsound: `preempt_reenqueue_only` returns a refused task to the tail of ITS
+    /// OWN priority queue, so a refused `High` task is selected again ahead of every `Normal` one
+    /// and a budget of N attempts is spent rotating within `High`. "At most N attempts" never
+    /// established "every candidate was tried", which is precisely the claim a drain needs before
+    /// it may act as though nothing is runnable.
+    ///
+    /// The selection step now filters by acceptance instead, so only a candidate the mark will
+    /// take is ever dequeued: one pass, every entry examined in priority/FIFO order, rejected
+    /// entries skipped IN PLACE. Nothing is reprioritised, nothing is duplicated, and
+    /// [`DispatchAcquire::NoneAcceptable`] carries the number of entries actually examined —
+    /// exhaustion is measured, not inferred.
+    ///
+    /// A mark can still refuse after an accepted selection, because the acceptance read and the
+    /// mark are two rank-2 acquisitions. That window is reported as
+    /// [`DispatchAcquire::Contended`] rather than retried: the exact dequeue is undone by the
+    /// existing inverse, so the world is byte-for-byte as it was found, and the caller settles it
+    /// like any other non-resumable outcome.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    pub(crate) fn queue_advance_acquire_incoming_split(
+        &self,
+        authority: DispatchAuthority,
+        site: &'static str,
+        step: impl Fn(&Self, DispatchAuthority) -> CpuDispatch,
+    ) -> DispatchAcquire {
+        let cpu = authority.cpu();
+        let dispatch = step(self, authority);
+        match dispatch {
+            CpuDispatch::Refused { reason, .. } => {
+                // Nothing was examined, nothing was dequeued, nothing became current.
+                return DispatchAcquire::NoAuthority { reason };
+            }
+            CpuDispatch::NoneAcceptable { examined } => {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_ACQUIRE_NONE_ACCEPTABLE site={} cpu={} examined={} dequeued=0",
+                    site,
+                    cpu.0,
+                    examined
+                );
+                return DispatchAcquire::NoneAcceptable { examined };
+            }
+            CpuDispatch::Selected { .. } => {}
+        }
+        match self.d6_genuine_mark_running_via_task_seam(dispatch) {
+            DispatchMarkOutcome::Marked(token) => DispatchAcquire::Resumable(token),
+            DispatchMarkOutcome::Idle => DispatchAcquire::Idle,
+            DispatchMarkOutcome::RefusedTorn => DispatchAcquire::Torn {
+                tid: dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX),
+            },
+            // The accepted candidate stopped being markable between the acceptance read and the
+            // mark. The exact dequeue has been undone by `undo_dispatch_selection`, so nothing is
+            // left half-done; this is reported rather than retried.
+            DispatchMarkOutcome::RefusedRolledBack => {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_ACQUIRE_CONTENDED site={} cpu={} tid={} rolled_back=1",
+                    site,
+                    cpu.0,
+                    dispatch.tid().map(|t| t.0).unwrap_or(u64::MAX)
+                );
+                DispatchAcquire::Contended
+            }
+            // Nothing at all was touched.
+            DispatchMarkOutcome::RefusedNoSchedulerChange => DispatchAcquire::SchedulerUntouched,
+        }
     }
 
     /// Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): the authoritative queue-advancing
@@ -2098,8 +3071,10 @@ impl SharedKernel {
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
-    pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
-        let dispatch = self.queue_advance_select_step_split(cpu, "futex_wait_dispatch_step_mut");
+    pub(crate) fn futex_wait_dispatch_step_mut(&self, authority: DispatchAuthority) -> CpuDispatch {
+        let cpu = authority.cpu();
+        let dispatch =
+            self.queue_advance_select_step_split(authority, "futex_wait_dispatch_step_mut");
         // Telemetry only, and only for a genuine selection: a refusal already emitted its own
         // marker inside the seam and dequeued nothing, so it must not be reported as a dequeue.
         if matches!(dispatch, CpuDispatch::Selected { .. }) {
@@ -2166,8 +3141,9 @@ impl SharedKernel {
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
-    pub(crate) fn yield_dispatch_step_mut(&self, cpu: CpuId) -> CpuDispatch {
-        let dispatch = self.queue_advance_select_step_split(cpu, "yield_dispatch_step_mut");
+    pub(crate) fn yield_dispatch_step_mut(&self, authority: DispatchAuthority) -> CpuDispatch {
+        let cpu = authority.cpu();
+        let dispatch = self.queue_advance_select_step_split(authority, "yield_dispatch_step_mut");
         // Telemetry only, and only for a genuine selection: a refusal already emitted its own
         // marker inside the seam and dequeued nothing, so it must not be reported as a dequeue.
         if matches!(dispatch, CpuDispatch::Selected { .. }) {
@@ -3381,6 +4357,34 @@ impl SharedKernel {
     ) -> crate::kernel::task::AsyncResumeClass {
         self.with_task_tcbs_split_mut(|tcbs| {
             crate::kernel::task::classify_and_take_async_resume(tcbs, incoming_tid, incoming_asid)
+        })
+    }
+
+    /// U9-TIMER1 — PUBLISH an async-preemption snapshot off the broad lock, for the EXACT
+    /// outgoing identity the caller authenticated. Rank 2, one acquisition.
+    ///
+    /// The split twin of `KernelState::snapshot_async_preempted_current`, delegating to the same
+    /// `task::publish_async_preempt_snapshot`, so the two boundaries cannot disagree about what
+    /// `a0..a7` mean on a resume.
+    ///
+    /// It exists because the RISC-V bridge takes its snapshot INSIDE the broad handler, at the
+    /// earliest correct point — strictly before the scheduler tick that can yield. The converted
+    /// preempting timer runs entirely before that lock is taken, so on that route the broad
+    /// snapshot never fires, no tag is published, and the resume falls back to the STARTUP
+    /// argument lane over a live computation. Measured on the RISC-V exit oracle: the process
+    /// manager resumed with `a0..a5` reinstalled from a zeroed argument mirror and stalled init.
+    ///
+    /// The identity is an argument rather than `current`, for the same reason the consumer's is:
+    /// this runs at a point where `current` may already have been cleared by the transaction, and
+    /// a tag that named the wrong task would be spent without effect.
+    pub(crate) fn snapshot_async_preempted_split(
+        &self,
+        tid: u64,
+        frame: &crate::kernel::trapframe::TrapFrame,
+    ) -> bool {
+        let captured = frame.capture_user_context();
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::task::publish_async_preempt_snapshot(tcbs, tid, captured)
         })
     }
 
@@ -11253,6 +12257,30 @@ impl SharedKernel {
         self.with_scheduler_split_mut(|sched| sched.current_cpu)
     }
 
+    /// rank 1 (scheduler lock) — how many tasks are waiting in **`cpu`'s** run queue.
+    ///
+    /// U9-DISPATCH-CPU2 §1. The diagnostic this serves — the RISC-V queue-advance refusal marker's
+    /// `runnable_queued=` field — reached the same number through
+    /// `SharedKernel::with(|k| k.runnable_count_on_cpu(cpu))`. That is a BROAD acquisition:
+    /// `with` takes `self.state.lock()`, the whole-`KernelState` guard, and the fact that the
+    /// closure only read one scheduler field does not make the acquisition narrow. It added a
+    /// production `SharedKernel::with` callsite to a tree whose audited broad-`with` total is
+    /// **zero**, for a log line — and the delivery record that accompanied it claimed the census
+    /// was unchanged.
+    ///
+    /// The number itself was never the problem, so it is preserved exactly: same explicit `cpu`,
+    /// same `Scheduler::runnable_count_on`, same meaning ("waiting in this CPU's run queue,
+    /// excluding whatever is current"). What changes is the domain it is read in — the existing
+    /// rank-1 scheduler seam, which is where every other reader of that field already lives.
+    ///
+    /// The CPU is a PARAMETER, not `sched.current_cpu`. The caller is an idle landing on a
+    /// specific CPU reporting its own queue; reading the ambient binding would print another CPU's
+    /// backlog under this CPU's name, which is exactly the ambient-authority confusion
+    /// U9-DISPATCH-CPU1 §1 removed from the selection owner.
+    pub(crate) fn runnable_count_on_cpu_split_read(&self, cpu: CpuId) -> usize {
+        self.with_scheduler_split_mut(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
+    }
+
     /// Reports what the rank-1 enqueue **actually did**.
     ///
     /// Stage 199D: this used to compute the target and throw it away, which left the caller with
@@ -11365,6 +12393,44 @@ impl SharedKernel {
     /// nothing can wake it while that is true, so this check does not race. Declining here keeps
     /// the dangerous `AlreadyQueued`-after-publication branch off the ordinary path entirely —
     /// the branch remains, and fails closed, for a genuine invariant violation.
+    /// U9-REAP1 §3 — rank 1: the CPUs that must acknowledge a shootdown for a destroyed address
+    /// space.
+    ///
+    /// Online, minus wake-only APs. Stage 183.5's exclusion is preserved verbatim: a wake-only AP
+    /// has no dispatcher, no user page table and no user-VA access, so it can hold no translation
+    /// for this ASID — and including one would leave the retired-ASID slot pending forever, which
+    /// after 32 destroys turns every later teardown into `VmError::Full`.
+    pub(crate) fn reap_shootdown_cpu_bitmap_split(&self) -> u64 {
+        self.with_scheduler_split_mut(|sched| {
+            let scheduler = kernel_ref(&sched.scheduler);
+            scheduler.online_cpu_bitmap() & !scheduler.wake_only_bitmap()
+        })
+    }
+
+    /// U9-REAP1 §3 — rank 3: queue one fire-and-forget TLB shootdown for a destroyed address
+    /// space.
+    ///
+    /// A full queue is silenced, exactly as the broad owner silences it: the ASID is already
+    /// retired and its frames must be reclaimed regardless, and frame reuse before invalidation
+    /// still cannot happen because a retired ASID is not reusable until every CPU acknowledges it.
+    pub(crate) fn reap_submit_tlb_shootdown_split(
+        &self,
+        cpu: CpuId,
+        asid: crate::kernel::vm::Asid,
+    ) {
+        let _ = self.with_ipc_split_mut(|ipc| {
+            ipc.cross_cpu_work.send_to(
+                cpu,
+                crate::kernel::smp::WorkItem::TlbShootdown {
+                    asid,
+                    va_range: None,
+                    requester: None,
+                    sequence: 0,
+                },
+            )
+        });
+    }
+
     pub(crate) fn receiver_has_scheduler_membership_split_read(&self, tid: u64) -> bool {
         use crate::kernel::ipc::ThreadId;
         self.with_scheduler_split_mut(|sched| {

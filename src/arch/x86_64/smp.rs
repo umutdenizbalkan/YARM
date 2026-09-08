@@ -1955,8 +1955,31 @@ fn ap_usermode_entry_ready(cpu: CpuId) -> bool {
 /// Stage 189B: the AUDITED, sole authority for clearing an AP's wake-only bit for
 /// dispatch. Refuses unless every readiness condition holds; on success it clears
 /// wake-only and emits `X86_AP_WAKE_ONLY_CLEAR`. No other code path may clear an
-/// AP's wake-only bit for dispatch. In Stage 189B `readiness.trap_return_ready`
-/// is always false, so this function always refuses and never clears wake-only.
+/// AP's wake-only bit for dispatch.
+///
+/// # U9-RESIDUAL1 §1 — this is REACHABLE, and the old note said otherwise
+///
+/// The Stage-189B note here read "`readiness.trap_return_ready` is always false, so this
+/// function always refuses and never clears wake-only". That has not been true since Stage
+/// 189C6 wired the live dispatcher. The only caller,
+/// [`run_ap_dispatch_scaffold_audit`], now passes `trap_return_ready: ap_usermode_entry_ready(cpu)`,
+/// and `ap_usermode_entry_ready` ends in `ap_ring3_entry_path_ready()` — which is exactly
+/// `crate::kernel::boot::ap_user_dispatch_enabled()`, the **default-off but real**
+/// `yarm.ap_user_dispatch` boot knob. With that knob set, every readiness bit can hold, this
+/// function clears wake-only, and the AP becomes a second DISPATCHING CPU.
+///
+/// The stale note was load-bearing outside this file: U9-EXIT2 §1 and U9-EXIT4 §1 both cited it
+/// as proof that the dispatching-CPU count is 1 in every production configuration. It is not a
+/// topological fact and must not be used as one. What actually protects the split terminal
+/// routes is their own admission owner — `SharedKernel::exit_route_admitted_split`, which counts
+/// `online & !wake_only` and refuses, before any mutation, unless that count is at most one and
+/// names this CPU. Under `yarm.ap_user_dispatch=1` the count is two and the route simply never
+/// admits; it does not proceed on a stale assumption.
+///
+/// What IS still true, and is what the admitted window relies on: this site takes
+/// `&mut KernelState` (the broad lock) and is reached only from the boot orchestrator's
+/// one-shot SMP bring-up, before any userspace task runs. So the topology an admission reads
+/// cannot change underneath it. See `u9residual1_terminal_admission`.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub fn try_enable_ap_user_dispatch(
     kernel: &mut KernelState,
@@ -1973,8 +1996,13 @@ pub fn try_enable_ap_user_dispatch(
         );
         return Err(refusal);
     }
-    // All readiness bits hold: this is the ONLY site that clears wake-only for
-    // dispatch. (Unreachable in Stage 189B — trap_return_ready is never set.)
+    // All readiness bits hold: this is the ONLY site that clears wake-only for dispatch.
+    //
+    // U9-RESIDUAL1 §1: the note that used to sit here — "Unreachable in Stage 189B —
+    // trap_return_ready is never set" — is WRONG and has been since 189C6. `trap_return_ready`
+    // is `ap_usermode_entry_ready(cpu)`, whose last conjunct is the default-off `yarm.ap_user_dispatch`
+    // knob. Under that knob this line runs and a second CPU starts dispatching. Nothing downstream
+    // may assume otherwise; the split terminal routes protect themselves at their own admission.
     kernel
         .mark_cpu_wake_only(cpu, false)
         .map_err(|_| ap_dispatch::ClearRefusal::RunQueueNotReady)?;
@@ -3007,7 +3035,41 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
         cpu.0,
         first_tid
     );
-    let placed = kernel.dispatch_next_on_cpu(cpu).unwrap_or(0);
+    // U9-DISPATCH-CPU1 D4 — dispatch through the EXISTING mark-running owner.
+    //
+    // This was `kernel.dispatch_next_on_cpu(cpu)`, a bare rank-1 scheduler step: it installed the
+    // task as `current` and never applied the rank-2 `DispatchIncoming` transition. So the AP's
+    // first workload task entered ring 3 with a TCB that still said `Runnable` — the scheduler and
+    // the task table disagreeing about who is running, which is exactly the state the WA3A
+    // discipline exists to prevent, and which every other dispatch path in the tree avoids.
+    //
+    // It was directly load-bearing for NR 0: the yield transaction's rank-2 step is the exact
+    // `Running → Runnable` preemption, so the AP's yield refused `not_running` and fell into the
+    // broad dispatcher no matter what its admission said. `commit_dispatch_selection_in_lock` is
+    // the same owner the ordinary in-lock dispatch uses; it applies the exact transition, carries
+    // the idle twin, and undoes its own selection exactly on refusal.
+    let selection = kernel.on_dispatch_selection_on_cpu(cpu);
+    let placed = selection.tid().map(|t| t.0).unwrap_or(0);
+    if !kernel.commit_dispatch_selection_in_lock(selection, "ap_user_dispatch_first_entry") {
+        crate::yarm_log!(
+            "{} cpu={} tid={} err=mark_running_refused",
+            ap_dispatch::MARK_ADMIT_DENIED_WAKE_ONLY,
+            cpu.0,
+            first_tid
+        );
+        crate::yarm_log!(
+            "{} cpu={} result=admission_denied",
+            ap_dispatch::MARK_USER_DISPATCH_DONE,
+            cpu.0
+        );
+        return;
+    }
+    crate::yarm_log!(
+        "X86_AP_FIRST_ENTRY_RUNNING_OK cpu={} tid={} provenance={} result=ok",
+        cpu.0,
+        placed,
+        selection.marker()
+    );
     debug_assert_eq!(placed, first_tid);
     let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
     AP_DISPATCH_COUNT[idx].store(0, Ordering::Release);

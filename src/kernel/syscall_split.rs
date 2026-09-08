@@ -718,6 +718,27 @@ pub(crate) fn try_split_dispatch_into_frame(
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
+    // U9-EXIT1 §5 — the FOURTH switching class, and the only one that never returns at all. It is
+    // tried here for the same reason the three above it are: the NR-only whitelist's contract is
+    // that every class on it may be early-returned through the caller's own frame, and an exiting
+    // task has no frame to return through. It answers `QueueAdvanceCommitted` so the EXISTING
+    // post-lock drain — the one FutexWait and the terminal fault already share — selects and
+    // applies the next context.
+    match try_split_exit_current_task(shared, cpu, frame) {
+        SplitDispatchDisposition::NotHandled => {}
+        handled => return handled,
+    }
+    // U9-RESIDUAL1 §3 — the FIFTH switching class, and the last one whose queue advance was
+    // already leaving the broad lock while its DECISION was not. Yield is tried here for the same
+    // reason the four above it are: the NR-only whitelist's contract is that every class on it may
+    // be early-returned through the caller's own frame, and a yielding task is re-enqueued behind
+    // whatever the drain selects. It answers `QueueAdvanceCommitted` so the EXISTING post-lock
+    // Yield drain — present and default-on on all three architectures since 192B/195G/196G —
+    // selects and applies the next context.
+    match try_split_yield_into_frame(shared, cpu, frame) {
+        SplitDispatchDisposition::NotHandled => {}
+        handled => return handled,
+    }
     match try_split_dispatch_nonswitching_into_frame(shared, cpu, frame) {
         None => SplitDispatchDisposition::NotHandled,
         Some(result) => SplitDispatchDisposition::Complete(result),
@@ -1944,30 +1965,44 @@ fn try_split_blocking_ipc_recv_into_frame(
     SplitDispatchDisposition::NotHandled
 }
 
-/// U9-TM §2 — service a NON-PREEMPTING `TimerInterrupt` off the broad lock.
+/// U9-TM §2 / U9-TIMER1 §2 — service an ORDINARY `TimerInterrupt` off the broad lock.
 ///
-/// This is a DEFAULT-CONFIGURATION route, not TimerInterrupt retirement. Two fallbacks remain,
-/// both taken before anything is claimed, ticked or mutated:
+/// U9-TM shipped the non-preempting half and recorded the other half as unprovable: no profile
+/// witnessed a timer-driven preemption (zero `preempt=1` across 77 recorded profiles), so the
+/// preempting branch declined to the terminal broad dispatcher. U9-TIMER1 establishes that the
+/// zero was an observability limit — the quantum and the hardware deadline were one constant in
+/// incompatible units, putting a preempting tick millions of interrupts out of reach on two ports
+/// — separates them behind a default-off boot knob (§3), and converts the branch.
+///
+/// # The three outcomes this route now owns
+///
+/// | tick | this CPU | what runs |
+/// |---|---|---|
+/// | preempting | has a current task | `run_yield_transaction`, then tick/claim/re-arm, then `QueueAdvanceCommitted` — the post-lock drain performs the switch |
+/// | preempting | idle, run queue empty | tick/claim/re-arm, then `PostWorkCommitted` — there is nothing to preempt, and the broad arm's selection provably answers `None` for this state |
+/// | non-preempting | either | the unchanged atomic no-switch seam, tick/claim/re-arm, `PostWorkCommitted` |
+///
+/// In every one of them: exactly ONE tick through the single `SchedulerTimer` policy; claim/ack
+/// and re-arm through the SAME lock-free adapters the `Hal` methods delegate to, with the same
+/// deadline constant the broad arm passes (on RISC-V the single SBI `set_timer` is itself the
+/// completion, and PLIC source 0 is never touched); and no broad acquisition.
+///
+/// # What still declines to the broad arm
+///
+/// Each is taken BEFORE anything is claimed, ticked or mutated, so a decline reaches the
+/// unchanged broad arm having changed exactly nothing:
 ///
 /// 1. **any timer-only proof knob armed** — the five `maybe_run_*` hooks are called only from the
-///    broad arm; U9-TM does not relocate them, so an armed profile takes the unchanged broad
+///    broad arm; neither stage relocates them, so an armed profile takes the unchanged broad
 ///    route and every hook runs exactly as before.
-/// 2. **this tick would preempt** — no existing profile witnesses a timer-driven preemption
-///    (zero `preempt=1` across 77 recorded profiles), so the preempting branch cannot be
-///    live-proven and is not shipped. `scheduler_tick_if_no_switch_split_mut` refuses atomically,
-///    having incremented nothing.
-///
-/// What the route does own, when neither fallback applies:
-///
-/// * claim/ack through the SAME lock-free adapter the `Hal` method delegates to;
-/// * exactly ONE tick, through the single `SchedulerTimer` policy;
-/// * re-arm through the same adapter — on RISC-V SBI `set_timer` is itself the completion, and
-///   PLIC source 0 is never touched;
-/// * and then `PostWorkCommitted`, so the architecture tail still runs the production timeout
-///   pipeline that owns all three timeout classes.
-///
-/// It performs NO queue selection and publishes no transition: a non-preempting tick changes no
-/// scheduler state beyond the tick itself.
+/// 2. **the yield transaction declines** — `ArchGateOff`, `DeferralHeld`, `NotRunning`,
+///    `ReenqueueRefused`, and the topology refusals (`CpuOutOfRange`, `NoTrapDrainer`,
+///    `MultiDispatcher`). The broad arm performs the identical decision through `yield_current`,
+///    which drives the SAME transaction through `BroadYieldOwners`.
+/// 3. **idle CPU with a non-empty run queue** (`no_current_runnable`) — there the broad arm's
+///    `on_preempt_current_cpu_selection()` genuinely dequeues and dispatches onto the idle CPU.
+///    That is a distinct queue-advancing consumer with no demonstrated dependency on this
+///    conversion, so it is declined under its own reason and inventoried rather than absorbed.
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_timer_into_frame(
     shared: &SharedKernel,
@@ -1985,9 +2020,147 @@ fn try_split_timer_into_frame(
         crate::yarm_log!("TIMER_SPLIT_REFUSED cpu={} reason=proof_hooks_armed", cpu.0);
         return D::NotHandled;
     }
-    // (2) The would-preempt refusal, also before any mutation. One rank-1 acquisition decides
-    // and, when it declines, has incremented nothing.
+    // (2) THE PREEMPTING TICK — U9-TIMER1.
+    //
+    // This branch used to be the refusal: `scheduler_tick_if_no_switch_split_mut` returned `None`
+    // having incremented nothing, the route answered `NotHandled`, and the ordinary preempting
+    // timer was serviced by the terminal broad dispatcher. That was the whole remaining
+    // TimerInterrupt population, and it is what this stage removes.
+    //
+    // The order is the point. The lookahead is asked FIRST, so the transaction below runs before
+    // anything has ticked — and every step of `run_yield_transaction` refuses before it mutates.
+    // A decline therefore falls back to the unchanged broad arm having changed exactly nothing,
+    // which is the same property the non-preempting refusal has always had. Ticking first and
+    // declining afterwards would force a choice between double-ticking in the broad arm and
+    // silently dropping a quantum's preemption; neither is acceptable, so it is not the order.
+    //
+    // A preempting timer IS a yield, with a different provenance. It re-enqueues the running task
+    // at its priority tail, clears `current`, and defers the selection to the post-lock drain —
+    // exactly what NR 0 publishes. So it drives the SAME transaction, through the SAME owners
+    // (`SharedYieldOwners`), and no second scheduling policy is introduced: the arch gate, the
+    // topology admission, the deferral reservation, the exact `Running -> Runnable` transition and
+    // its inverse are all the ones NR 0 already uses.
+    //
+    // What it must NOT do, and does not: encode a syscall return. NR 0 finishes with
+    // `frame.set_ok(0, 0, 0)` because a yield is a syscall whose caller observes a result. An
+    // interrupted task has no syscall in flight; its PC is the interrupted instruction, and the
+    // shared bridge has ALREADY captured that frame into the outgoing TCB before this route runs
+    // (`capture_outgoing_user_context_split`, keyed on `current_tid_authoritative`). Writing a
+    // result here would corrupt the resumed register file.
+    if shared.timer_would_preempt_split_read(cpu) {
+        let mut owners = crate::kernel::syscall::yield_txn::SharedYieldOwners { shared };
+        match crate::kernel::syscall::yield_txn::run_yield_transaction(&mut owners, cpu) {
+            Ok(preempted) => {
+                // The publish-side vocabulary NR 0 emits, so the post-lock drain's own markers
+                // read identically whichever route published the deferral.
+                crate::kernel::syscall::yield_txn::log_yield_deferred(cpu, preempted.outgoing);
+                // The broad timer arm reached `yield_current`, whose first act is this increment.
+                // The converted route owes it for the same reason NR 0's split route does: the
+                // broad path no longer runs, so the count would otherwise be lost.
+                shared.count_yield_split_mut();
+                // Exactly ONE tick, taken only now that the transaction has committed. The
+                // lookahead above and this tick cannot disagree: nothing else ticks this CPU's
+                // timer and interrupts are masked for the whole trap.
+                let ticked = shared.scheduler_tick_split_mut(cpu);
+                let tick = match ticked {
+                    crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => tick,
+                    // Unreachable: the lookahead said this tick preempts.
+                    crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => tick,
+                };
+                // Claim/ack and re-arm — the SAME free functions the `Hal` methods delegate to,
+                // and the same deadline constant the broad arm passes. On RISC-V the single SBI
+                // `set_timer` is itself the completion.
+                crate::arch::hal_adapters::acknowledge_interrupt(cpu, 0);
+                crate::arch::hal_adapters::program_timer_deadline(
+                    cpu,
+                    crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+                );
+                crate::yarm_log!(
+                    "TIMER_SPLIT_PREEMPT_COMMITTED cpu={} tick={} outgoing={} preempt=1 rearm=1 broad_lock=0",
+                    cpu.0,
+                    tick,
+                    preempted.outgoing
+                );
+                return D::QueueAdvanceCommitted;
+            }
+            // A PREEMPTING TICK WITH NOTHING TO PREEMPT — the dominant live population.
+            //
+            // `NoCurrent` is unreachable for a userspace NR 0 (a syscall always has a caller), so
+            // it was documented as an unreachable decline. A TIMER has a different provenance: it
+            // fires on a CPU that has already parked in its idle halt, where `current` is empty by
+            // construction. Measured on the x86_64 core profile at `yarm.sched_quantum_ticks=1`:
+            // 73 of 74 preempting ticks land here, because everything blocks shortly after boot.
+            //
+            // Declining them would leave the ordinary preempting-timer population reaching broad
+            // dispatch on every idle tick, so the decline is not the answer. What the answer must
+            // preserve is what the broad arm ACTUALLY does for this state, and that turns on the
+            // run queue rather than on `current`. In `yield_current`, `NoCurrent` is silent, the
+            // `Running -> Runnable` step is skipped because `outgoing_tid` is `None`, and control
+            // reaches `on_preempt_current_cpu_selection()`:
+            //
+            // * runnable == 0 -> the selection answers `None`, the `else` arm is guarded by
+            //   `if let Some(tid) = outgoing_tid` and so does nothing at all. The whole broad
+            //   service of this tick is the tick itself. That is settled here instead, with the
+            //   same one tick, the same claim and the same re-arm the non-preempting route uses.
+            // * runnable > 0 -> the selection DEQUEUES and the broad arm dispatches onto the idle
+            //   CPU. That is a real queue-advancing consumer, and converting it is a separate
+            //   migration this stage has no demonstrated dependency on. It declines, and is
+            //   reported under its own reason so the residual is countable rather than inferred.
+            Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {
+                let runnable = shared.runnable_count_on_cpu_split_read(cpu);
+                if runnable > 0 {
+                    crate::yarm_log!(
+                        "TIMER_SPLIT_PREEMPT_REFUSED cpu={} reason=no_current_runnable runnable={}",
+                        cpu.0,
+                        runnable
+                    );
+                    return D::NotHandled;
+                }
+                // Nothing was mutated: `NoCurrent` is the transaction's first step. So the tick
+                // is taken here, once, exactly as the non-preempting tail takes it.
+                let ticked = shared.scheduler_tick_split_mut(cpu);
+                let tick = match ticked {
+                    crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => tick,
+                    // Unreachable: the lookahead said this tick preempts.
+                    crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => tick,
+                };
+                crate::arch::hal_adapters::acknowledge_interrupt(cpu, 0);
+                crate::arch::hal_adapters::program_timer_deadline(
+                    cpu,
+                    crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+                );
+                crate::yarm_log!(
+                    "TIMER_SPLIT_PREEMPT_IDLE cpu={} tick={} preempt=1 rearm=1 broad_lock=0",
+                    cpu.0,
+                    tick
+                );
+                // No task changed hands, so there is no deferral for a drain to consume and no
+                // outgoing frame to switch away from — the architecture tail owns the rest, the
+                // same as for a non-preempting tick.
+                return D::PostWorkCommitted {
+                    finalize_syscall: false,
+                };
+            }
+            Err(decline) => {
+                // Pre-mutation, and nothing has ticked. The broad arm runs next and performs the
+                // identical decision through `yield_current` — including its own in-lock dispatch
+                // fallback — so a declined preemption is byte-for-byte what it was before this
+                // conversion. Named distinctly from the yield route's refusal so the two events
+                // are separable in a log.
+                crate::yarm_log!(
+                    "TIMER_SPLIT_PREEMPT_REFUSED cpu={} reason={}",
+                    cpu.0,
+                    crate::kernel::syscall::yield_txn::legacy_reason(decline)
+                );
+                return D::NotHandled;
+            }
+        }
+    }
+
+    // (3) The NON-preempting tick, unchanged. One rank-1 acquisition decides and ticks.
     let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu) else {
+        // Unreachable now: the lookahead above already routed every preempting tick. Kept as the
+        // fail-safe it always was — if the two ever disagreed, this refuses having ticked nothing.
         crate::yarm_log!("TIMER_SPLIT_REFUSED cpu={} reason=would_preempt", cpu.0);
         return D::NotHandled;
     };
@@ -1998,9 +2171,9 @@ fn try_split_timer_into_frame(
         // Unreachable: the seam returns `None` rather than a preempting outcome.
         crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => tick,
     };
-    // (3) Claim/ack — the SAME free function `Hal::acknowledge_interrupt` delegates to.
+    // (4) Claim/ack — the SAME free function `Hal::acknowledge_interrupt` delegates to.
     crate::arch::hal_adapters::acknowledge_interrupt(cpu, 0);
-    // (4) Re-arm — the SAME free function `Hal::program_timer_deadline` delegates to, with the
+    // (5) Re-arm — the SAME free function `Hal::program_timer_deadline` delegates to, with the
     // same deadline constant the broad arm passes. On RISC-V this single SBI `set_timer` both
     // clears the pending condition and programs the next deadline: it IS the completion, and
     // there is no separate end-of-interrupt.
@@ -2013,7 +2186,7 @@ fn try_split_timer_into_frame(
         cpu.0,
         tick
     );
-    // (5) The architecture tail still owes the production timeout pipeline.
+    // (6) The architecture tail still owes the production timeout pipeline.
     D::PostWorkCommitted {
         finalize_syscall: false,
     }
@@ -2250,10 +2423,17 @@ fn try_split_dispatch_nonswitching_into_frame(
         return None;
     };
     // Stage 199D: IpcCall (NR 6) + IpcReply (NR 7) are not in the static NR-only whitelist,
-    // but they ARE admitted to the direct request/reply gates below. Since WA1-GATE that
-    // admission requires the explicit proof gate on EVERY architecture, x86_64 included — the
-    // production term is `false` everywhere — so every normal boot stays byte-identical to the
-    // legacy path.
+    // but they ARE admitted to the direct request/reply gates below.
+    //
+    // U9-YIELD2 §1 — the sentence that used to end this note was stale. It read "since WA1-GATE
+    // that admission requires the explicit proof gate on EVERY architecture, x86_64 included —
+    // the production term is `false` everywhere — so every normal boot stays byte-identical to
+    // the legacy path". `ipccall_direct_production_enabled()` is
+    // `cfg!(x86_64) || cfg!(aarch64) || cfg!(riscv64)`, so the production term is `true` on all
+    // three and `ipccall_direct_admission_enabled()` short-circuits before the proof gate is
+    // consulted. NR 6 and NR 7 are admitted here on EVERY ordinary boot; what they still do on a
+    // decline is fall back to the legacy broad handler, which is a residual arm, not an absent
+    // route.
     let direct_ipc_admitted = matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)
         && crate::kernel::boot::ipccall_direct_admission_enabled();
     if classify_split_eligible_nr_only(syscall).is_none() && !direct_ipc_admitted {
@@ -2326,6 +2506,17 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_fork_into_frame(shared, cpu, frame);
     }
 
+    // U9-REAP1 §4: ReapFaultedTask (NR 31), before the terminal acquisition. It reads no user
+    // memory and takes no capability argument — its only input is a numeric TID in arg0 — so the
+    // route exists identically on every profile, and every gate it applies is the broad handler's
+    // own gate. It declines with `None` in exactly one case: no resolvable caller, which is
+    // pre-mutation and which the broad handler re-derives unchanged. Once a caller resolves the
+    // route owns the syscall completely, so `TASK_REAP_FAULTED_BEGIN` is emitted exactly once per
+    // invocation on either path.
+    if matches!(syscall, Syscall::ReapFaultedTask) {
+        return try_split_reap_faulted_task_into_frame(shared, cpu, frame);
+    }
+
     // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) — a pure read
     // serviced off the global lock. The helper returns `None` for any case it cannot
     // service (hosted-dev, unavailable requester), which propagates UNCHANGED back to
@@ -2342,10 +2533,14 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_futex_wake_into_frame(shared, cpu, frame);
     }
 
-    // Stage 199A2B2F (proof-gated, default-OFF): IpcCall (NR 6) direct request. Only
-    // attempted when the internal proof gate is armed; the helper snapshots the request
-    // off-lock and drives the accepted off-lock transaction. Off the gate — or for any
-    // case it cannot service — it returns `None`, so NR 6 stays on its existing path.
+    // Stage 199A2B2F: IpcCall (NR 6) direct request. The helper snapshots the request off-lock
+    // and drives the accepted off-lock transaction. For any case it cannot service it returns
+    // `None`, so NR 6 falls back to its existing broad path.
+    //
+    // U9-YIELD2 §1 — the "(proof-gated, default-OFF)" label that used to head this note is stale.
+    // `ipccall_direct_admission_enabled()` is `production || proof`, and the production term is
+    // `true` on all three architectures, so this gate is OPEN on every ordinary boot. NR 6's
+    // residual arm is the helper's `None`, not an unarmed gate.
     if matches!(syscall, Syscall::IpcCall)
         && crate::kernel::boot::ipccall_direct_admission_enabled()
     {
@@ -2354,12 +2549,14 @@ fn try_split_dispatch_nonswitching_into_frame(
         }
     }
 
-    // Stage 199A2B3 (proof-gated, default-OFF): IpcReply (NR 7) direct reply. Only
-    // attempted when the internal proof gate is armed; the helper snapshots the reply
-    // payload off-lock (owned) and drives the accepted off-lock reply transaction
-    // (reserve → caller-copy → exact-waiter claim → record Consumed → single enqueue).
-    // Off the gate — or for any case it cannot service — it returns `None`, so NR 7
-    // stays on its existing global-lock path.
+    // Stage 199A2B3: IpcReply (NR 7) direct reply. The helper snapshots the reply payload
+    // off-lock (owned) and drives the accepted off-lock reply transaction (reserve →
+    // caller-copy → exact-waiter claim → record Consumed → single enqueue). For any case it
+    // cannot service it returns `None`, so NR 7 falls back to its existing global-lock path.
+    //
+    // U9-YIELD2 §1 — the "(proof-gated, default-OFF)" label that used to head this note is stale
+    // for the same reason NR 6's is: admission short-circuits on the production term, which is
+    // `true` on all three architectures. The gate is open on every ordinary boot.
     if matches!(syscall, Syscall::IpcReply)
         && crate::kernel::boot::ipccall_direct_admission_enabled()
     {
@@ -2699,8 +2896,14 @@ fn try_split_futex_wake_into_frame(
     None
 }
 
-/// Stage 199A2B2F: x86 pre-lock NR6 direct-request snapshot publication + off-lock
-/// transaction drain (proof-gated). Runs ENTIRELY off the broad `KernelState` lock and
+/// Stage 199A2B2F: pre-lock NR6 direct-request snapshot publication + off-lock transaction drain.
+///
+/// U9-YIELD2 §1: this used to be labelled "x86 … (proof-gated)". Neither half holds. Admission is
+/// `ipccall_direct_admission_enabled()` = `production || proof`, and the production term is true on
+/// all three architectures, so the gate is open on every ordinary boot and the route is reached on
+/// x86_64, AArch64 and RISC-V alike.
+///
+/// Runs ENTIRELY off the broad `KernelState` lock and
 /// off any ranked lock during the source copy:
 ///   read args → capture caller `{tid,asid}` → validate `len<=128` → copy the request
 ///   payload through `copy_from_user_asid_split_read` (NO lock held) → build the owned
@@ -2842,8 +3045,12 @@ fn try_split_ipccall_direct_into_frame(
     None
 }
 
-/// Stage 199A2B3 (proof-gated, default-OFF): intercept `IpcReply` (NR 7) BEFORE the
-/// broad `KernelState` lock and drive the accepted off-lock direct-reply transaction.
+/// Stage 199A2B3: intercept `IpcReply` (NR 7) BEFORE the broad `KernelState` lock and drive the
+/// accepted off-lock direct-reply transaction.
+///
+/// U9-YIELD2 §1: the "(proof-gated, default-OFF)" label this carried is stale for the same reason
+/// NR 6's was — admission short-circuits on a production term that is true on all three
+/// architectures, so this route is reached on every ordinary boot.
 ///
 /// Part 1 — owned pre-lock reply snapshot. Order:
 ///   read args → capture replier `{tid,asid}` → validate `len<=128` → copy the reply
@@ -3803,6 +4010,237 @@ fn spawn_owners_for(
 ///
 /// The child's return lane is not set here. It was installed by the publication, from
 /// `fork_child_context`, which is the single owner of that decision on every path.
+/// U9-EXIT1 §5 — NR 16 `ExitCurrentTask`, before the terminal acquisition.
+///
+/// The only admitted class that cannot return through its own frame. It reserves the existing
+/// queue-advance deferral before anything irreversible, claims and removes itself, performs the
+/// cleanup, and answers `QueueAdvanceCommitted` so the EXISTING post-lock drain selects and applies
+/// the next context. No second selector, no second scheduler policy, no second drain.
+///
+/// Every refusal is pre-mutation and returns `NotHandled`, so the broad handler produces the exact
+/// answer it always did — including its `WouldBlock` decline when a reply is owed and no deferred
+/// slot is free, which this route reproduces rather than reinterprets. After the claim there is no
+/// fallback: re-entering the broad handler would mint a second restart token, publish a second
+/// disposition and re-sweep records this transaction already retired.
+fn try_split_exit_current_task(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &TrapFrame,
+) -> SplitDispatchDisposition {
+    use crate::kernel::boot::exit_claim::ExitDisposition;
+    use crate::kernel::syscall::exit_txn::{SharedExitOwners, run_exit_transaction};
+    type D = SplitDispatchDisposition;
+
+    // The FIRST gate, and the one every other switching class states the same way: this route
+    // services NR 16 and nothing else. Without it the transaction runs on every trap that reaches
+    // this seam and exits the caller of whatever syscall it actually made — which is exactly what
+    // the first live x86_64 run showed, three tasks retiring on their first `DebugLog`.
+    if frame.syscall_num() != crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR {
+        return D::NotHandled;
+    }
+    // U9-EXIT1 §6 — the split half of the terminal-edge measurement, emitted at the route's OWN
+    // entry for the same reason `EXIT_TASK_BROAD_ENTER` is: an edge that were counted only on
+    // success would report a route that declines every trap as a route that was never reached.
+    // Paired with `EXIT_TASK_SPLIT_DECLINED`, this is what makes the retirement claim falsifiable.
+    let entering = shared.current_tid_authoritative(cpu).unwrap_or(0);
+    crate::yarm_log!(
+        "EXIT_TASK_SPLIT_ENTER tid={} asid={} result=ok",
+        entering,
+        shared
+            .task_asid_opt_split_read(entering)
+            .unwrap_or(crate::kernel::vm::Asid(0))
+            .0
+    );
+    let mut owners = SharedExitOwners { shared };
+    match run_exit_transaction(
+        &mut owners,
+        cpu,
+        crate::kernel::syscall::EXIT_STATUS_SELF_REQUESTED,
+    ) {
+        Ok(outcome) => {
+            let claim = &outcome.claim;
+            // The same markers the broad handler emits, so an observer sees one vocabulary for one
+            // syscall regardless of route.
+            crate::yarm_log!(
+                "EXIT_TASK_SYSCALL_DISPATCHED nr={} tid={} asid={} target=self result=ok",
+                crate::kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR,
+                claim.tid(),
+                claim.sweep_asid().0
+            );
+            crate::yarm_log!(
+                "EXIT_TASK_LIFECYCLE_TRANSITION tid={} asid={} syscall_returns=0 result=ok",
+                claim.tid(),
+                claim.sweep_asid().0
+            );
+            crate::yarm_log!(
+                "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=exit_current_task_switch_required tid={} cpu={}",
+                claim.tid(),
+                cpu.0
+            );
+            D::QueueAdvanceCommitted
+        }
+        // U9-EXIT2 §4 — THE total settlement. Three arms, none of them `NotHandled`: once NR 16
+        // is recognized this route owns the answer, and the terminal broad dispatcher is not a
+        // destination any production outcome can reach.
+        Err(failure) => match failure.disposition {
+            // Class C. The broad handler's own answer, reproduced exactly: a task that still owes
+            // a reply and finds no free deferred slot gets `WouldBlock` and stays Running, with
+            // its reverse link still attached. Same marker text, same meaning, mutation-free.
+            ExitDisposition::InvalidPreLock => {
+                crate::yarm_log!(
+                    "EXIT_TASK_SYSCALL_DECLINED tid={} reason={} link_retained=1 result=would_block",
+                    entering,
+                    failure.refusal.marker()
+                );
+                D::Complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::WouldBlock,
+                )))
+            }
+            // Class B. A state the U9-EXIT2 §5 guards prove cannot exist at a userspace NR 16
+            // boundary. Handing it to the broad dispatcher would be the one edge this stage
+            // removes, taken for a reason that cannot occur — so it is a typed invariant error
+            // instead, pre-mutation, exactly as the impossible IpcSend classes are refused.
+            ExitDisposition::ImpossibleState => {
+                crate::yarm_log!(
+                    "EXIT_TASK_SPLIT_IMPOSSIBLE cpu={} reason={} task_mutation=none result=fail",
+                    cpu.0,
+                    failure.refusal.marker()
+                );
+                D::Complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                )))
+            }
+            // Class D, RESTORED. The transaction proved the victim was still Running, still ours
+            // and placed on no CPU, and restored it as this CPU's current. The entering frame is
+            // therefore its own again, which is the ONLY state in which a `Complete` may return
+            // through it: the bridge delivers this error by RESUMING that task.
+            //
+            // `Internal` rather than `Ok(())` because the exit did not happen and the task must
+            // not act as if it had.
+            ExitDisposition::PostClearRestored => {
+                crate::yarm_log!(
+                    "EXIT_TASK_SPLIT_POST_CLEAR_RESTORED cpu={} reason={} result=fail",
+                    cpu.0,
+                    failure.refusal.marker()
+                );
+                D::Complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                )))
+            }
+            // Class D, ADVANCED. Another owner made the victim terminal, removed or replaced, so
+            // there is no frame to return through: the entering task must never run again. The
+            // already-reserved deferral names the old incarnation and the EXISTING drain selects
+            // somebody else — the same answer the success path gives, reached for a different
+            // reason.
+            //
+            // This is the arm U9-EXIT2 got wrong. It answered `Complete(Err(Internal))`, and the
+            // bridge delivers that by resuming the entering frame with `current[cpu] == None` —
+            // and, when a reap or a fault won the claim, by resuming a task that is already
+            // terminal.
+            ExitDisposition::PostClearAdvance => {
+                crate::yarm_log!(
+                    "EXIT_TASK_SPLIT_POST_CLEAR_ADVANCE cpu={} reason={} result=fail",
+                    cpu.0,
+                    failure.refusal.marker()
+                );
+                D::QueueAdvanceCommitted
+            }
+        },
+    }
+}
+
+/// U9-REAP1 §4 — NR 31 `ReapFaultedTask`, before the terminal acquisition.
+///
+/// Gate for gate the broad handler: PM-only, never self-targeting, and only a terminal task. The
+/// state gate is deliberately kept here AND enforced again by the claim inside the transaction —
+/// this one produces the exact `TASK_REAP_FAULTED_REJECT` marker the oracle counts, while the
+/// claim is what actually arbitrates, atomically, against a restart or exit that lands between
+/// the two.
+///
+/// NON-SWITCHING. The reaping PM neither blocks nor yields nor changes address space, so the frame
+/// is finalized once here and no queue is advanced. Every refusal is pre-mutation. There is no
+/// broad fallback after the claim: re-entering the broad handler would re-sweep records this
+/// transaction already retired.
+fn try_split_reap_faulted_task_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::boot::reap_claim::ReapRefusal;
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::reap_txn::{SharedReapOwners, run_reap_transaction};
+
+    let fail = |e: SyscallError| -> Option<Result<(), TrapHandleError>> {
+        Some(Err(TrapHandleError::Syscall(e)))
+    };
+
+    // PRE-MUTATION, and the ONLY case this route declines: with no resolvable caller there is no
+    // authorization to check, so the broad handler re-derives the identical answer.
+    let caller = shared.current_tid_authoritative(cpu)?;
+    let target = frame.arg(0) as u64;
+    // U9-REAP1 §6: the split half of the edge measurement. Emitted per invocation, not latched —
+    // §6 asserts that this count equals the successful-reap count, which a one-shot marker could
+    // not express.
+    crate::yarm_log!(
+        "TASK_REAP_SPLIT_ENTER caller_tid={} target_tid={}",
+        caller,
+        target
+    );
+    crate::yarm_log!(
+        "TASK_REAP_FAULTED_BEGIN caller_tid={} target_tid={}",
+        caller,
+        target
+    );
+
+    if caller != crate::kernel::syscall::PM_BOOTSTRAP_TID {
+        crate::yarm_log!(
+            "TASK_REAP_FAULTED_REJECT target_tid={} reason=not_pm",
+            target
+        );
+        return fail(SyscallError::MissingRight);
+    }
+    if target == caller {
+        crate::yarm_log!("TASK_REAP_FAULTED_REJECT target_tid={} reason=self", target);
+        return fail(SyscallError::InvalidArgs);
+    }
+
+    let mut owners = SharedReapOwners { shared };
+    match run_reap_transaction(&mut owners, target) {
+        Ok(_) => {
+            crate::yarm_log!("TASK_REAP_FAULTED_OK target_tid={}", target);
+            frame.set_ok(0, 0, 0);
+            Some(Ok(()))
+        }
+        // Already gone, or already reaped by a winner that got here first. The broad handler
+        // answers `Ok(0, 0, 0)` for a target that no longer exists, and a duplicate reap is the
+        // same fact discovered one step later — so it gets the same answer, having mutated
+        // nothing.
+        Err(refusal) if refusal.is_already_reaped() => {
+            crate::yarm_log!(
+                "TASK_REAP_FAULTED_ALREADY_GONE target_tid={} reason={}",
+                target,
+                refusal.marker()
+            );
+            frame.set_ok(0, 0, 0);
+            Some(Ok(()))
+        }
+        // A live task, a reservation, or a target still resident on a runqueue: the broad
+        // handler's `WrongObject`, with zero mutation behind it.
+        Err(refusal) => {
+            debug_assert!(matches!(
+                refusal,
+                ReapRefusal::NonTerminal | ReapRefusal::StillScheduled | ReapRefusal::NoProcess
+            ));
+            crate::yarm_log!(
+                "TASK_REAP_FAULTED_REJECT target_tid={} reason={}",
+                target,
+                refusal.marker()
+            );
+            fail(SyscallError::WrongObject)
+        }
+    }
+}
+
 fn try_split_fork_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
@@ -4193,6 +4631,12 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // NOTHING from user memory — no startup-args array, no ELF — so the route needs no
         // off-lock user-read seam and exists identically on every profile.
         Syscall::Fork => Some(syscall),
+        // U9-REAP1 §4: ReapFaultedTask (NR 31). It runs the SAME reap transaction the broad
+        // handler runs, over `SharedReapOwners`, and like Fork it reads NOTHING from user memory,
+        // so it needs no off-lock user-read seam. NR 31 is NON-SWITCHING for the calling PM: the
+        // reap never makes the caller block, yield or change address space, so the route finalizes
+        // the caller's frame once and advances no queue.
+        Syscall::ReapFaultedTask => Some(syscall),
         // Stage 197A removed the former NR 27 InitramfsReadChunk split class along with the
         // syscall. Its sibling note — that NR 28 MINTS a capability and therefore "stays
         // global-lock-only" — was retired by U9-MO2 §4: the mint was never the obstacle, the
@@ -4804,8 +5248,9 @@ mod tests {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
         // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A),
         // NR 10 (FutexWake, Stage 191B), NR 28 (CreateInitramfsFileSliceMo, U9-MO2 §4)
-        // NR 11 (SpawnThread, U9-SPAWN1 SP-2), and NR 23 + NR 29 (SpawnProcess and
-        // SpawnFromMemoryObject, U9-SPAWN-TXN3 §4) may pass the NR-only split-eligibility gate.
+        // NR 11 (SpawnThread, U9-SPAWN1 SP-2), NR 23 + NR 29 (SpawnProcess and
+        // SpawnFromMemoryObject, U9-SPAWN-TXN3 §4), NR 12 (Fork, U9-FORK1 §4) and NR 31
+        // (ReapFaultedTask, U9-REAP1 §4) may pass the NR-only split-eligibility gate.
         // (Stage 197A removed NR 27 InitramfsReadChunk from the whitelist and the ABI.)
         // Every other syscall stays global-lock-only. This is an EXHAUSTIVE sweep of the
         // whole NR space, so it is the guard that would catch a sixth admission arriving
@@ -4825,6 +5270,7 @@ mod tests {
                 || nr == SYSCALL_SPAWN_PROCESS_NR
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
                 || nr == crate::kernel::syscall::SYSCALL_FORK_NR
+                || nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {
@@ -4837,32 +5283,39 @@ mod tests {
 
     #[test]
     fn stage188h_reap_faulted_task_excluded_from_split_dispatch() {
-        // SUP-L7K-A ReapFaultedTask (NR 31) is a PM-only, global-lock-only
-        // terminal-task reap. It must NEVER enter the split (no-global-lock)
-        // dispatch path: both the arg-aware and NR-only classifiers default-deny
-        // it, and `try_split_dispatch` must return `None` (defer to global lock).
-        // This pins the invariant explicitly so a future stage cannot silently
-        // whitelist it while wiring the AP/multi-dispatcher path in Stage 189.
-        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        // U9-REAP1 §4 RETIRED this exclusion, and this guard now pins its inverse.
+        //
+        // Stage 188H pinned NR 31 as global-lock-only so a later stage could not "silently
+        // whitelist it while wiring the AP/multi-dispatcher path". That protection did its job:
+        // NR 31 is admitted here deliberately, by a mission whose §1 recomputed the reap closure,
+        // whose §2 gave the reap a linearizable claim and whose §3 put both routes on ONE
+        // transaction. What the guard must now hold is the positive fact — the classifier admits
+        // it, and it admits it through the same NR-only path every other admitted class uses.
         let syscall = decode(crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR);
         assert!(
             matches!(syscall, Syscall::ReapFaultedTask),
             "NR 31 must decode to ReapFaultedTask"
         );
+        assert!(
+            classify_split_eligible_nr_only(syscall).is_some(),
+            "U9-REAP1 §4: ReapFaultedTask must be NR-only split-eligible"
+        );
+        // The route is reached by NUMBER, never by an argument-shaped guess: NR 31's only input
+        // is a target TID, which names nothing the classifier could validate without the rank-2
+        // claim, so admitting it arg-aware would be admitting it on an unchecked number.
         let args = [3u64, 0, 0, 0, 0, 0];
         assert_eq!(
             classify_split_eligible(syscall, 3, args),
             None,
-            "ReapFaultedTask must NOT be arg-aware split-eligible"
+            "ReapFaultedTask is admitted by NR, not by an arg-aware classification"
         );
+        // And the transaction it reaches is the SAME one the broad handler reaches.
+        const SRC: &str = include_str!("syscall_split.rs");
+        const RESTART: &str = include_str!("boot/restart_state.rs");
         assert!(
-            classify_split_eligible_nr_only(syscall).is_none(),
-            "ReapFaultedTask must NOT be NR-only split-eligible"
-        );
-        assert_eq!(
-            try_split_dispatch(&kernel, syscall, 3, args),
-            None,
-            "ReapFaultedTask must fall back to the global-lock dispatch path"
+            SRC.contains("run_reap_transaction(&mut owners, target)")
+                && RESTART.contains("run_reap_transaction(&mut owners, tid)"),
+            "both NR 31 routes must drive the one reap transaction"
         );
     }
 
@@ -4976,8 +5429,17 @@ mod tests {
 
     #[test]
     fn stage32b_ipc_recv_timeout_nr_not_in_whitelist() {
-        // IpcRecvTimeout (NR 5) must NOT be split-eligible: it stays on the
-        // global-lock path (scheduler/deadline interaction).
+        // IpcRecvTimeout (NR 5) must NOT be on the NR-ONLY whitelist: that gate's contract is
+        // that everything on it is non-switching and may be early-returned through the caller's
+        // own frame, and a blocking timed receive may not.
+        //
+        // U9-YIELD2 §1 — this is NOT the statement "NR 5 has no pre-lock route", which is what
+        // the old comment here ("it stays on the global-lock path") said and what U9-RESIDUAL1
+        // §2's matrix copied. Stage 199G-B §2 gave NR 5 the SWITCHING route
+        // `try_split_blocking_ipc_recv_into_frame`, admitted on all three architectures, which
+        // runs BEFORE this gate. What stays broad is the non-blocking half of NR 5 — a receive
+        // that would not block, and every typed refusal — which is a residual arm, not an absent
+        // route.
         assert!(
             classify_split_eligible_nr_only(decode(
                 crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
@@ -4998,7 +5460,15 @@ mod tests {
 
     #[test]
     fn stage32b_ipc_send_call_reply_not_split_eligible() {
-        // The sender-side IPC syscalls stay default-deny.
+        // The sender-side IPC syscalls stay default-deny AT THE NR-ONLY GATE.
+        //
+        // U9-YIELD2 §1 — that is all this asserts, and the old one-line comment ("stay
+        // default-deny") read as though these three had no pre-lock route at all. All three do:
+        // NR 1 through `try_split_ipc_send_into_frame` (199G-C4, a switching class tried before
+        // this gate), NR 6 and NR 7 through the direct request/reply handlers, whose admission
+        // predicate `ipccall_direct_admission_enabled()` is `true` on all three architectures.
+        // They are absent from THIS whitelist because its contract is non-switching
+        // early-returnable classes, not because they are unrouted.
         for nr in [
             SYSCALL_IPC_SEND_NR,
             crate::kernel::syscall::SYSCALL_IPC_CALL_NR,
@@ -5030,4 +5500,111 @@ mod tests {
             "Stage 42+43 adds RecvSharedV3 (NR 30); stage32b invariant updated"
         );
     }
+}
+
+/// U9-RESIDUAL1 §3 — the syscall number this trap ACTUALLY carries, per architecture.
+///
+/// x86_64 and RISC-V decode the number into the frame at entry, so `frame.syscall_num()` is
+/// authoritative there. AArch64 does not: `pre_split_import_syscall_abi` imports the decoded ABI
+/// only for an allowlisted number, and an unlisted syscall leaves the frame reading `nr = 0`.
+///
+/// For every other split class that is harmless — their numbers are non-zero, so an unimported
+/// frame simply declines. **NR 0 is different**: 0 is Yield's own number, so on AArch64
+/// `frame.syscall_num() == 0` is true for a Yield *and* for every unlisted syscall, and a route
+/// gated on it alone would fire for `VmMap`, `IpcCall`, `IpcReply` and the rest.
+///
+/// So this reads the raw `x8` on AArch64 — the same register `pre_split_import_syscall_abi` peeks
+/// to make its own decision, and the authoritative source of the trapped number before any import.
+#[cfg(not(feature = "hosted-dev"))]
+fn trapped_syscall_nr(frame: &TrapFrame) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        frame.syscall_num()
+    }
+}
+
+/// U9-RESIDUAL1 §3 — service `Yield` (NR 0) off the broad lock, on all three architectures.
+///
+/// # What this adds, and what it does not
+///
+/// It adds no policy. The decision is `yield_txn::run_yield_transaction`, the same one
+/// `KernelState::yield_current` drives through `BroadYieldOwners`; this route drives it through
+/// `SharedYieldOwners`, whose methods take one domain lock each with the broad
+/// `SpinLock<KernelState>` released. Every gate, every ordering and every marker is that
+/// transaction's.
+///
+/// # Why declining is always safe here
+///
+/// Every `YieldDecline` is pre-mutation — the one step that can fail after a write rolls that write
+/// back through the named inverse — so `NotHandled` hands a byte-for-byte unchanged world to the
+/// broad path, which then runs the identical decision through the identical owners and produces the
+/// identical outcome. This is a fallback BEFORE consumption, never after: past the commit the
+/// caller is queued exactly once, `current` is empty, and the deferral is published.
+///
+/// # The two things this route owns
+///
+/// The telemetry increment (the broad path counts on entry; this route counts only what it commits,
+/// so a decline is counted exactly once by the broad path that then runs) and the syscall's own
+/// result, written into the outgoing frame before the drain switches away from it.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_yield_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    use crate::kernel::syscall::yield_txn;
+    use SplitDispatchDisposition as D;
+
+    if trapped_syscall_nr(frame) != crate::kernel::syscall::SYSCALL_YIELD_NR {
+        return D::NotHandled;
+    }
+    if (cpu.0 as usize) >= crate::kernel::scheduler::MAX_CPUS {
+        return D::NotHandled;
+    }
+    let mut owners = yield_txn::SharedYieldOwners { shared };
+    match yield_txn::run_yield_transaction(&mut owners, cpu) {
+        Ok(outcome) => {
+            // The publish-side vocabulary, in this architecture's exact delivered strings. The
+            // broad path never runs for a committed yield, so this is emitted once per NR 0 just
+            // as it always was.
+            yield_txn::log_yield_deferred(cpu, outcome.outgoing);
+            // Telemetry: the broad path's entry increment is not reached on this route, so the
+            // count is owed here. Exactly one per yield, either way.
+            shared.count_yield_split_mut();
+            crate::yarm_log!(
+                "YIELD_SPLIT_COMMITTED cpu={} tid={}",
+                cpu.0,
+                outcome.outgoing
+            );
+            // (7) The syscall's own result, into the OUTGOING frame, before the switch — the same
+            // `frame.set_ok(0, 0, 0)` `handle_yield` performs, at the same point relative to the
+            // deferral.
+            frame.set_ok(0, 0, 0);
+            D::QueueAdvanceCommitted
+        }
+        Err(decline) => {
+            // A DISTINCT marker from the in-lock fallback's. The broad path will now run the same
+            // decision and emit its own `*_INLOCK_DISPATCH_FALLBACK`, so reusing that string here
+            // would double-count it; this names the split attempt, which is a different event.
+            crate::yarm_log!(
+                "YIELD_SPLIT_REFUSED cpu={} reason={}",
+                cpu.0,
+                yield_txn::legacy_reason(decline)
+            );
+            D::NotHandled
+        }
+    }
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_yield_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
 }

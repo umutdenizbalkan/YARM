@@ -2379,172 +2379,77 @@ impl KernelState {
             ipc.telemetry.scheduler_yield_calls =
                 ipc.telemetry.scheduler_yield_calls.saturating_add(1);
         });
-        if let Some(tid) = outgoing_tid {
-            // Stage 199D-WA3A: EXACT `Running → Runnable` for the outgoing current task,
-            // evaluated BEFORE any scheduler mutation below, so a refusal touches neither
-            // domain: the task keeps its status, `current` is untouched and nothing is
-            // enqueued. A task that has already blocked itself must not be made runnable here.
-            self.with_tcbs_mut(|tcbs| {
-                crate::kernel::task_transition::apply_task_transition(
-                    tcbs,
-                    tid,
-                    None,
-                    crate::kernel::task_transition::TaskTransition::PreemptOutgoing,
-                )
-                .or_else(|first| {
-                    // Idle-only fallback: the idle task is made `current` by the rank-1
-                    // scheduler without a mark-running step, so preempting it out is
-                    // `Runnable → Runnable`. Restricted to `IDLE_TID` inside the primitive,
-                    // so an ordinary task cannot reach it.
-                    crate::kernel::task_transition::apply_task_transition(
-                        tcbs,
-                        tid,
-                        None,
-                        crate::kernel::task_transition::TaskTransition::PreemptOutgoingIdle,
-                    )
-                    .map_err(|_| first)
-                })
-                .map_err(|refusal| {
-                    crate::kernel::task_transition::log_transition_refusal(
-                        "yield_current",
-                        tid,
-                        crate::kernel::task_transition::TaskTransition::PreemptOutgoing,
-                        refusal,
+        // U9-RESIDUAL1 §3 — the three per-architecture deferral blocks that used to sit here
+        // (Stage 192B x86_64, 195G AArch64, 196G RISC-V) were three copies of ONE decision. They
+        // are now one call into `run_yield_transaction`, driven through `BroadYieldOwners` — the
+        // same transaction the split NR 0 route drives through `SharedYieldOwners`, so the two
+        // routes cannot come to disagree about when a yield may be deferred.
+        //
+        // Nothing about the decision changed. The conditions each architecture applied are
+        // reproduced exactly by `yield_deferral_arch_gate` (x86_64 `d6_genuine_enabled` and no
+        // bootstrap-CPU requirement; AArch64 and RISC-V bootstrap-CPU only; RISC-V additionally
+        // refusing while a FutexWait or 196D foundation deferral is pending) and by the
+        // topology admission (`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` + a single dispatching CPU).
+        //
+        // Every decline is pre-mutation — the one step that can fail after a write rolls that write
+        // back through `TaskTransition::RollbackPreemptOutgoing` — so falling through to the
+        // unchanged in-lock dispatch below is exactly as safe as it was when each block did its own
+        // `yield_dispatch_clear`.
+        {
+            let cpu = self.current_cpu();
+            let mut owners = crate::kernel::syscall::yield_txn::BroadYieldOwners { kernel: self };
+            match crate::kernel::syscall::yield_txn::run_yield_transaction(&mut owners, cpu) {
+                Ok(outcome) => {
+                    crate::kernel::syscall::yield_txn::log_yield_deferred(cpu, outcome.outgoing);
+                    // Skip the in-lock dispatch; the post-lock Yield drain performs the
+                    // authoritative queue-advancing dispatch (there is ALWAYS an incoming — another
+                    // task, or the re-enqueued caller itself — so no idle outcome).
+                    return Ok(());
+                }
+                Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {
+                    // Stage 199D-WA3A's exact `Running → Runnable` refused. The delivered code
+                    // reached the identical refusal, through the identical owner, and answered
+                    // `TaskMissing`; so does this. The in-lock fallback below is NOT run — it
+                    // requires the caller to be `Runnable`, which is precisely what failed.
+                    crate::kernel::syscall::yield_txn::log_yield_declined(
+                        cpu,
+                        outgoing_tid.unwrap_or(0),
+                        crate::kernel::syscall::yield_txn::YieldDecline::NotRunning,
                     );
-                    KernelError::TaskMissing
-                })?;
-                Ok::<_, KernelError>(())
-            })?;
-        }
-
-        // Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): the caller is now Runnable. Mirror
-        // the Stage 192A FutexWait model (itself the D2-GENUINE recv/send model, default-on
-        // on x86_64 single-dispatcher): RE-ENQUEUE the caller + clear `current` in-lock
-        // (the re-enqueue half of on_preempt), record a per-CPU deferral, and SKIP the
-        // in-lock dispatch — the trap-entry drain runs the authoritative queue-advancing
-        // `dispatch_next_on` off the global lock. Every ineligible case keeps the unchanged
-        // in-lock `on_preempt_current_cpu` fallback below.
-        #[cfg(target_arch = "x86_64")]
-        if let Some(out_tid) = outgoing_tid {
-            if crate::kernel::boot::d6_genuine_enabled() {
-                let cpu_idx = self.current_cpu().0 as usize;
-                let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
-                    && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-                        .load(core::sync::atomic::Ordering::Relaxed);
-                let single_cpu = self.dispatching_cpu_count() <= 1;
-                let already = crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
-                if trap_path
-                    && single_cpu
-                    && !already
-                    && crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)
-                {
-                    // Re-enqueue the caller + clear `current` (exactly once); on success the
-                    // out-of-lock drain performs the authoritative dispatch.
-                    match self.preempt_reenqueue_current_cpu() {
-                        Some(reenq_tid) => {
-                            crate::yarm_log!(
-                                "YIELD_DISPATCH_DEFER_BEGIN cpu={} tid={}",
-                                cpu_idx,
-                                out_tid
-                            );
-                            crate::yarm_log!(
-                                "YIELD_DISPATCH_REENQUEUE_OK cpu={} tid={}",
-                                cpu_idx,
-                                reenq_tid
-                            );
-                            return Ok(());
-                        }
-                        None => {
-                            // No current / re-enqueue failed — nothing was deferred; clear
-                            // the intent and fall back to the legacy in-lock path.
-                            crate::kernel::boot::yield_dispatch_clear(cpu_idx);
-                        }
-                    }
-                } else {
-                    crate::yarm_log!(
-                        "YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
-                        if !trap_path {
-                            "no_trap_drainer"
-                        } else if !single_cpu {
-                            "multi_cpu"
-                        } else {
-                            "already_deferred"
-                        },
-                        out_tid
+                    return Err(KernelError::TaskMissing);
+                }
+                // `NoCurrent` is deliberately silent. The delivered per-architecture blocks were
+                // each wrapped in `if let Some(out_tid) = outgoing_tid`, so a yield with no current
+                // task never reached their fallback markers at all — it is not a declined deferral,
+                // it is a yield with nothing to yield. The kernel-internal callers
+                // (`apply_cross_cpu_work`, the TLB-shootdown wait, `task_core_state`,
+                // `fault_state`) reach it routinely, and logging them would add ~35 lines a boot of
+                // new output that reads like a failure and that the delivered vocabulary never had.
+                Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {}
+                Err(decline) => {
+                    crate::kernel::syscall::yield_txn::log_yield_declined(
+                        cpu,
+                        outgoing_tid.unwrap_or(0),
+                        decline,
                     );
                 }
             }
         }
 
-        // Stage 195G (AARCH64 YIELD QUEUE-ADVANCING DISPATCH): the AArch64 port of the x86_64
-        // 192B model — DEFAULT-ON (no knob). The caller is now Runnable (set above). Re-enqueue
-        // it exactly once at its priority queue tail + clear `current` in-lock
-        // (`preempt_reenqueue_current_cpu`, the re-enqueue half of on_preempt), record the
-        // one-shot Yield deferral, and SKIP the in-lock dispatch — the caller returns through the
-        // AArch64 Yield handler bypass and the trap-entry drain performs the authoritative
-        // queue-advancing dispatch (there is ALWAYS an incoming: another task or the caller
-        // itself, so NO idle outcome). Eligible only on the BSP with the shared trap drain active
-        // and a single dispatching CPU. Every ineligible/failed case keeps the unchanged in-lock
-        // `on_preempt_current_cpu` fallback below (on re-enqueue failure the caller's current
-        // state is left untouched by `preempt_reenqueue_current_cpu`).
-        #[cfg(target_arch = "aarch64")]
-        if let Some(out_tid) = outgoing_tid {
-            let cpu_idx = self.current_cpu().0 as usize;
-            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
-                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-                    .load(core::sync::atomic::Ordering::Relaxed);
-            let single_cpu = self.dispatching_cpu_count() <= 1;
-            let is_bsp = self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
-            let already = crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
-            if trap_path
-                && single_cpu
-                && is_bsp
-                && !already
-                && crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)
-            {
-                match self.preempt_reenqueue_current_cpu() {
-                    Some(reenq_tid) => {
-                        crate::kernel::boot::maybe_log_yield_default_on();
-                        crate::yarm_log!(
-                            "AARCH64_YIELD_DISPATCH_DEFER_BEGIN cpu={} tid={}",
-                            cpu_idx,
-                            out_tid
-                        );
-                        crate::yarm_log!(
-                            "AARCH64_YIELD_DISPATCH_REENQUEUE_OK cpu={} tid={}",
-                            cpu_idx,
-                            reenq_tid
-                        );
-                        // The AArch64 Yield handler bypass returns cleanly through `with_cpu`;
-                        // the trap-entry drain performs the authoritative dispatch. Do NOT
-                        // dispatch in-lock here.
-                        return Ok(());
-                    }
-                    None => {
-                        // Re-enqueue failed: `preempt_reenqueue_current_cpu` left `current`
-                        // untouched, so the original current-task state is intact. Clear the
-                        // deferral intent and fall through to the legacy in-lock dispatch.
-                        crate::kernel::boot::yield_dispatch_clear(cpu_idx);
-                        crate::yarm_log!(
-                            "AARCH64_YIELD_INLOCK_DISPATCH_FALLBACK reason=reenqueue_failed tid={}",
-                            out_tid
-                        );
-                    }
-                }
-            } else {
-                crate::yarm_log!(
-                    "AARCH64_YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
-                    if !trap_path {
-                        "no_trap_drainer"
-                    } else if !single_cpu {
-                        "multi_cpu"
-                    } else if !is_bsp {
-                        "not_bsp"
-                    } else {
-                        "already_deferred"
-                    },
-                    out_tid
-                );
+        // U9-RESIDUAL1 §3 — the transition the DECLINED path still owes.
+        //
+        // The transaction owns `Running → Runnable` because it is policy, not acquisition. Every
+        // decline above happens before that write (the one step that can fail after it rolls it
+        // back), so the caller is still `Running` here — and both the 196D foundation block and the
+        // in-lock dispatch below require it `Runnable`, exactly as they always have. This applies
+        // the same transition through the same owner, with the same idle-only twin and the same
+        // `TaskMissing` on refusal.
+        if let Some(tid) = outgoing_tid {
+            let applied = self.with_tcbs_mut(|tcbs| {
+                crate::kernel::syscall::yield_txn::apply_preempt_outgoing_locked(tcbs, tid)
+            });
+            if applied.is_none() {
+                return Err(KernelError::TaskMissing);
             }
         }
 
@@ -2591,70 +2496,6 @@ impl KernelState {
                         crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
                         crate::yarm_log!(
                             "RISCV_QUEUE_SWITCH_FOUNDATION_FALLBACK reason=reenqueue_failed tid={}",
-                            out_tid
-                        );
-                    }
-                }
-            }
-        }
-
-        // Stage 196G (RISC-V YIELD QUEUE-ADVANCING RETIREMENT — DEFAULT-ON): the RISC-V port of the
-        // x86_64 (192B) / AArch64 (195G) Yield model, PRODUCTION default-on (no oracle knob, no
-        // consume latch). The caller is now Runnable (set above). Re-enqueue it exactly once at its
-        // priority queue tail + clear `current` in-lock (`preempt_reenqueue_current_cpu`, the
-        // re-enqueue half of on_preempt), record the generic YIELD_DISPATCH deferral, and SKIP the
-        // in-lock dispatch — the caller returns through the RISC-V Yield handler bypass and the
-        // shared post-lock Yield drain performs the authoritative queue-advancing dispatch + real
-        // SATP/sfence.vma + frame restore + sret (there is ALWAYS an incoming: another task or the
-        // caller itself, so NO idle outcome). Eligible only on the BSP with the shared trap drain
-        // active + single dispatcher + NO pending Yield/FutexWait/196D-foundation deferral. This is
-        // a SEPARATE deferral from the 196D foundation oracle (which stays default-off + one-shot).
-        // Every ineligible/failed case keeps the unchanged in-lock `on_preempt_current_cpu` fallback.
-        #[cfg(target_arch = "riscv64")]
-        if let Some(out_tid) = outgoing_tid {
-            let cpu_idx = self.current_cpu().0 as usize;
-            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
-                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-                    .load(core::sync::atomic::Ordering::Relaxed);
-            let single_cpu = self.dispatching_cpu_count() <= 1;
-            let is_bsp = self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
-            let yield_pending = crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
-            let futex_pending = crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
-            let foundation_pending =
-                crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx);
-            if trap_path
-                && single_cpu
-                && is_bsp
-                && !yield_pending
-                && !futex_pending
-                && !foundation_pending
-                && crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)
-            {
-                match self.preempt_reenqueue_current_cpu() {
-                    Some(reenq_tid) => {
-                        crate::kernel::boot::maybe_log_riscv_yield_retire_default_on();
-                        crate::yarm_log!(
-                            "RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu={} outgoing={}",
-                            cpu_idx,
-                            out_tid
-                        );
-                        crate::yarm_log!(
-                            "RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu={} outgoing={}",
-                            cpu_idx,
-                            reenq_tid
-                        );
-                        // Skip the in-lock dispatch; the post-lock Yield drain switches to the
-                        // incoming (another task, or the re-enqueued caller itself when alone).
-                        return Ok(());
-                    }
-                    None => {
-                        // Re-enqueue failed: `preempt_reenqueue_current_cpu` left `current`
-                        // untouched, so the original current-task state is intact (never
-                        // both/neither current+queued). Clear the deferral intent and fall
-                        // through to the unchanged legacy in-lock dispatch.
-                        crate::kernel::boot::yield_dispatch_clear(cpu_idx);
-                        crate::yarm_log!(
-                            "RISCV_YIELD_DISPATCH_FALLBACK reason=reenqueue_failed tid={}",
                             out_tid
                         );
                     }
@@ -4203,10 +4044,11 @@ impl crate::runtime::SharedKernel {
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub(crate) fn queue_advance_commit_split(
         &self,
-        cpu: CpuId,
+        authority: crate::runtime::DispatchAuthority,
         outgoing_tid: u64,
         admitted: Option<u64>,
     ) -> QueueAdvanceOutcome {
+        let cpu = authority.cpu();
         use crate::kernel::scheduler::DispatchSelection;
         use crate::runtime::CpuDispatch;
         let cpu_idx = cpu.0 as usize;
@@ -4219,12 +4061,35 @@ impl crate::runtime::SharedKernel {
         // acquisitions, so a wake may enqueue between them; short-circuiting on `admitted == None`
         // would idle a CPU that had just become runnable — a lost wake. Deciding from the
         // authoritative dequeue instead means a task enqueued in that window is simply selected.
-        let dispatch = self.queue_advance_select_step_split(cpu, "queue_advance_commit_split");
+        let dispatch =
+            self.queue_advance_select_step_split(authority, "queue_advance_commit_split");
         let incoming = match dispatch {
-            // Admission already authenticated this CPU under the single-dispatcher gate, so a
-            // mismatch here is unreachable. It is still matched explicitly, and it dequeued
+            // U9-DISPATCH-CPU1 §1: the step now authenticates the caller's trap AUTHORITY rather
+            // than the ambient `sched.current_cpu`, and this caller holds the authority its own
+            // trap minted — so a refusal here means a stale window or an offline CPU, neither of
+            // which an in-trap caller can present. It is still matched explicitly, and it dequeued
             // NOTHING — so the truthful outcome is an idle CPU, never a fabricated switch.
-            CpuDispatch::RefusedCpuMismatch { .. } => return QueueAdvanceOutcome::TerminalIdle,
+            // U9-DISPATCH-CPU1 §1: every entry was examined and none could be marked `Running`.
+            // Nothing was dequeued, so — exactly as for a refusal — the truthful outcome is an
+            // idle CPU rather than a fabricated switch. It is matched separately from `Refused`
+            // because it says something different: there IS runnable work, this CPU just cannot
+            // take any of it right now.
+            CpuDispatch::NoneAcceptable { examined } => {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_COMMIT_NONE_ACCEPTABLE cpu={} examined={} dequeued=0",
+                    cpu.0,
+                    examined
+                );
+                return QueueAdvanceOutcome::TerminalIdle;
+            }
+            CpuDispatch::Refused { requested, reason } => {
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_COMMIT_REFUSED cpu={} reason={} dequeued=0",
+                    requested.0,
+                    reason.marker()
+                );
+                return QueueAdvanceOutcome::TerminalIdle;
+            }
             CpuDispatch::Selected { selection, .. } => match selection {
                 DispatchSelection::Dequeued { tid } => tid.0,
                 // The caller did not clear the current slot, so nothing was dequeued.

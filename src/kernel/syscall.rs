@@ -322,8 +322,10 @@ pub(crate) mod ipc_abi;
 pub(crate) mod ipc_recv_core;
 // U9-FORK1 §3/§4: THE fork transaction, over the delivered `SpawnTxnOwners` plus the seven
 // operations a fork needs that a spawn does not.
+pub(crate) mod exit_txn;
 pub(crate) mod fork_txn;
 pub(crate) mod process;
+pub(crate) mod reap_txn;
 mod recv_shared_v3;
 mod sched;
 // U9-SPAWN1 SP-3: the ONE compensated image-loading spawn transaction, shared by NR 23, 24, 26
@@ -331,7 +333,9 @@ mod sched;
 // owner the broad handlers use.
 pub(crate) mod spawn_image_txn;
 pub(crate) mod spawn_txn;
+// U9-RESIDUAL1 §3: THE cooperative-yield policy, over owners, with a broad and a split adapter.
 mod vm;
+pub(crate) mod yield_txn;
 
 // Stage 149: [S] shared helper re-exports so sibling modules and external
 // callers (runtime.rs) keep their existing use-paths unchanged.
@@ -2232,6 +2236,18 @@ fn handle_exit_current_task(
         return Err(SyscallError::Internal);
     };
     let asid = kernel.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0));
+    // U9-EXIT1 §6 — THE terminal-edge measurement.
+    //
+    // Both NR 16 routes emit `EXIT_TASK_SYSCALL_DISPATCHED`, deliberately: the oracle counts exit
+    // invocations, and a marker only one route emits would make a working split route look
+    // identical to no route at all. So the EDGE gets its own marker, emitted at the broad
+    // handler's own entry rather than inferred from a route count — the same way U9-FORK1 measured
+    // NR 12 and U9-REAP1 measured NR 31. `EXIT_TASK_BROAD_ENTER` counting zero is the retirement.
+    crate::yarm_log!(
+        "EXIT_TASK_BROAD_ENTER tid={} asid={} result=ok",
+        tid,
+        asid.0
+    );
     crate::yarm_log!(
         "EXIT_TASK_SYSCALL_DISPATCHED nr={} tid={} asid={} target=self result=ok",
         SYSCALL_EXIT_CURRENT_TASK_NR,

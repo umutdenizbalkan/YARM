@@ -467,6 +467,19 @@ pub(super) fn handle_reap_faulted_task(
 ) -> Result<(), SyscallError> {
     let caller = current_tid(kernel)?;
     let target = frame.arg(0) as u64;
+    // U9-REAP1 §6 — THE terminal-edge measurement.
+    //
+    // Both NR 31 routes emit `TASK_REAP_FAULTED_BEGIN`, deliberately: the oracle counts reap
+    // invocations, and a marker only one route emits would make a working split route look
+    // identical to no route at all. So the EDGE gets its own marker, emitted at the broad
+    // handler's own entry rather than inferred from a route count — the same way U9-FORK1
+    // measured NR 12 at `FORK_PROOF_ENTER`. `TASK_REAP_BROAD_ENTER` counting zero is the
+    // retirement; anything else is a live terminal acquisition.
+    crate::yarm_log!(
+        "TASK_REAP_BROAD_ENTER caller_tid={} target_tid={}",
+        caller,
+        target
+    );
     crate::yarm_log!(
         "TASK_REAP_FAULTED_BEGIN caller_tid={} target_tid={}",
         caller,
