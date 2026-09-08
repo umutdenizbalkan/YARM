@@ -106615,14 +106615,23 @@ mod stage200d2b1d5a_owner_revalidation {
         let body = seam();
         // U3 (203C): `dispatch_next_on_cpu` was `scheduler_state()` + `dispatch_next_on(cpu)`.
         // The rank-1 phase calls that same primitive directly, under the seam it holds.
+        // U9-DISPATCH-CPU3 §3: the PROVENANCE-PRESERVING form of the same primitive. The seam
+        // still advances exactly once, through the scheduler's own selection, but it now keeps
+        // WHICH kind of selection was made — which is what lets the caller mark the task
+        // `Running` before returning to userspace. `dispatch_next_on` threw that away, which is
+        // exactly the shape U9-DISPATCH-CPU1 D4 had to undo at the AP's first entry.
         assert!(
-            body.contains("kernel_mut(&mut sched.scheduler).dispatch_next_on(cpu)"),
+            body.contains("kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu)"),
             "the seam must advance through the existing scheduler dispatch primitive"
         );
         assert_eq!(
-            body.matches("dispatch_next_on(").count(),
+            body.matches("dispatch_next_selection_on(").count(),
             1,
             "exactly one queue advance per revalidation"
+        );
+        assert!(
+            !body.contains("dispatch_next_on("),
+            "and not through the bare-TID form, which cannot carry provenance to the mark"
         );
         // No second queue, no hand-rolled selection. (`block_current_on_cpu`/`enqueue_on_cpu`
         // ARE used, but only to UNDO this advance — see the Stage 200D-2B1D5B guards.)
@@ -106639,7 +106648,7 @@ mod stage200d2b1d5a_owner_revalidation {
     fn g02_seam_is_cpu_local() {
         let body = seam();
         assert!(
-            body.contains("dispatch_next_on(cpu)"),
+            body.contains("dispatch_next_selection_on(cpu)"),
             "the seam must pop from this CPU's own run queue"
         );
         // The Stage 200D-2B1D5B rollback is CPU-local too: it must undo the advance on the very
@@ -126787,9 +126796,31 @@ mod u3_owner_revalidation_transaction {
     // ── fact 12: no TaskStatus is written, on either outcome ──────────────────────────────
 
     #[test]
-    fn no_task_status_is_written_on_success_or_on_rollback() {
+    fn the_replacement_is_marked_running_and_bystanders_are_untouched() {
+        // U9-DISPATCH-CPU3 §3 — THIS CONTRACT IS DELIBERATELY CHANGED, and the change is the
+        // point of the case rather than a casualty of it.
+        //
+        // It previously read "success writes no TaskStatus — no Runnable -> Running transition is
+        // introduced", preserving what the retired broad body did. That preservation was faithful
+        // and the behaviour it preserved was incoherent: this owner selects a real task (TID 0 is
+        // short-circuited to `Idle` before it gets here), loads that task's saved user context into
+        // the trap frame, and reports `Replacement`, on which the x86_64 trap tail `iretq`s into
+        // ring 3. The task therefore ran in userspace while its TCB still said `Runnable`, so the
+        // scheduler and the task table disagreed about what was running on this CPU for the whole
+        // timeslice — and the next `PreemptOutgoing`, whose `expected_from` is `Running`, would
+        // refuse.
+        //
+        // It is the same defect U9-DISPATCH-CPU1 D4 repaired at the AP's first userspace entry:
+        // the two paths that reach ring 3 without the broad dispatcher were both missing the mark
+        // that `dispatch_next_task` performs through `commit_dispatch_selection_in_lock`. D4 fixed
+        // one of them. This is the other.
+        //
+        // The change is deliberately single-axis: the STATUS transition only, through the same
+        // owner, with the provenance choosing between `DispatchIncoming` and `ContinueCurrent`.
+        // It does NOT add an incarnation requirement — whether an ASID is a precondition of broad
+        // dispatch is a separate, settled question (§1/§2), and
+        // `a_task_with_no_asid_still_restores_and_is_not_refused` still holds unchanged.
         let k = fixture();
-        let before = status_of(&k, A);
         let mut f = frame();
         assert_eq!(
             k.revalidate_idle_owner_after_drains(CpuId(0), &mut f),
@@ -126797,8 +126828,8 @@ mod u3_owner_revalidation_transaction {
         );
         assert_eq!(
             status_of(&k, A),
-            before,
-            "success writes no TaskStatus — no Runnable -> Running transition is introduced"
+            Some(TaskStatus::Running),
+            "the task this owner is about to iretq into must be marked Running first"
         );
 
         let k2 = fixture();
@@ -126821,16 +126852,25 @@ mod u3_owner_revalidation_transaction {
     // ── differential against the retired broad body ───────────────────────────────────────
 
     /// Everything the revalidation may legitimately change, as one comparable value.
+    ///
+    /// U9-DISPATCH-CPU3 §3: `A`'s STATUS was a member of this tuple and is deliberately no longer.
+    /// It is the one axis on which the split transaction now diverges from the retired body — by
+    /// design, because the retired body returned to userspace without marking the task `Running`
+    /// and the split transaction does not. Leaving it in the tuple would assert the defect;
+    /// removing it silently would hide the divergence. So it is removed here and asserted
+    /// explicitly, in both directions, by
+    /// [`the_split_transaction_diverges_from_the_legacy_on_exactly_one_axis`] — every other
+    /// observable (outcome, frame, both `current` slots, both queue lengths, the CPU binding and
+    /// the pending TLS-restore request) is still compared byte for byte.
     type Observed = (
         OwnerRevalidation,
         TrapFrame,
-        Option<u64>,        // current on cpu 0
-        Option<u64>,        // current on cpu 1
-        usize,              // cpu 0 queue length
-        usize,              // cpu 1 queue length
-        Option<TaskStatus>, // A's status
-        CpuId,              // bound current_cpu
-        Option<bool>,       // A's pending TLS-restore request
+        Option<u64>,  // current on cpu 0
+        Option<u64>,  // current on cpu 1
+        usize,        // cpu 0 queue length
+        usize,        // cpu 1 queue length
+        CpuId,        // bound current_cpu
+        Option<bool>, // A's pending TLS-restore request
     );
 
     fn observe(k: &SharedKernel, outcome: OwnerRevalidation, f: TrapFrame) -> Observed {
@@ -126841,7 +126881,6 @@ mod u3_owner_revalidation_transaction {
             current_on(k, CpuId(1)),
             queue_len(k, CpuId(0)),
             queue_len(k, CpuId(1)),
-            status_of(k, A),
             k.with(|s| s.current_cpu()),
             k.with(|s| s.tls_restore_pending(A)),
         )
@@ -126938,6 +126977,43 @@ mod u3_owner_revalidation_transaction {
         assert_eq!(observe(&old, ro, fo), observe(&new, rn, fn_));
     }
 
+    /// **The one axis on which the split transaction diverges from the retired body — asserted in
+    /// both directions.**
+    ///
+    /// The retired body left the replacement `Runnable` and `iretq`'d into it. The split
+    /// transaction marks it `Running` first. Both halves are checked here so the divergence is a
+    /// tested fact rather than an omission from the differential tuple.
+    #[test]
+    fn the_split_transaction_diverges_from_the_legacy_on_exactly_one_axis() {
+        let legacy_k = fixture();
+        let mut lf = frame();
+        assert_eq!(
+            legacy(&legacy_k, CpuId(0), &mut lf),
+            OwnerRevalidation::Replacement(A)
+        );
+        assert_eq!(
+            status_of(&legacy_k, A),
+            Some(TaskStatus::Runnable),
+            "the RETIRED body entered userspace with the task still Runnable — the defect"
+        );
+
+        let split_k = fixture();
+        let mut sf = frame();
+        assert_eq!(
+            split_k.revalidate_idle_owner_after_drains(CpuId(0), &mut sf),
+            OwnerRevalidation::Replacement(A)
+        );
+        assert_eq!(
+            status_of(&split_k, A),
+            Some(TaskStatus::Running),
+            "the split transaction marks it first — the repair"
+        );
+        assert_eq!(
+            lf, sf,
+            "and the frames are identical: the divergence is the status and nothing else"
+        );
+    }
+
     // ── source guards ────────────────────────────────────────────────────────────────────
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
@@ -127000,7 +127076,7 @@ mod u3_owner_revalidation_transaction {
         // Validation precedes the bind, which precedes the advance.
         let v = select.find("validate_online_cpu").expect("validate");
         let bind = select.find("current_cpu = cpu").expect("bind");
-        let adv = select.find("dispatch_next_on(").expect("advance");
+        let adv = select.find("dispatch_next_selection_on(").expect("advance");
         assert!(v < bind && bind < adv, "validate -> bind -> advance");
 
         let snap = body_of(RUNTIME, "fn owner_revalidation_snapshot_split");
@@ -127033,10 +127109,37 @@ mod u3_owner_revalidation_transaction {
         let rb = outer
             .find("owner_revalidation_rollback_split")
             .expect("rollback");
-        assert!(sel < sn && sn < apply && apply < rb);
+        // U9-DISPATCH-CPU3 §3: a fourth phase sits between the snapshot and the frame write —
+        // the exact `Runnable -> Running` mark, applied through the task-transition owner BEFORE
+        // any frame is committed, so a refused mark leaves nothing to undo but the queue advance.
+        let mark = outer
+            .find("apply_dispatch_transition(")
+            .expect("the mark phase");
+        assert!(
+            sel < sn && sn < mark && mark < apply,
+            "select -> snapshot -> mark -> apply"
+        );
+        // The rollback now appears TWICE, and both are the same existing settlement: once for a
+        // refused mark (before any frame write) and once for an unrestorable snapshot. `rb` is the
+        // first of them, which is the mark's — so the tail rollback is asserted by count.
+        assert!(
+            mark < rb,
+            "a refused mark rolls back before anything is committed"
+        );
+        assert_eq!(
+            outer.matches("owner_revalidation_rollback_split(").count(),
+            2,
+            "exactly two settlements, both the existing rollback: refused mark, unrestorable \
+             snapshot. A third would mean a new settlement was introduced"
+        );
+        assert!(
+            outer.contains("owner_revalidation_rollback_split(selection, true)"),
+            "and a refused mark takes the EXISTING rollback, not a new settlement"
+        );
         assert!(
             !outer.contains(".status ="),
-            "the transaction writes no TaskStatus"
+            "the transaction writes no RAW TaskStatus — the mark goes through the typed \
+             transition owner, exactly as `commit_dispatch_selection_in_lock` does"
         );
     }
 
@@ -165773,6 +165876,67 @@ mod u9dispatchcpu1_authority {
     }
 }
 
+/// U9-DISPATCH-CPU3 §1 — the production source corpus, walked rather than listed.
+///
+/// The census this serves failed once already by checking seven hand-picked files. A caller added
+/// in an eighth would have gone unseen, so the corpus is enumerated from the filesystem: every
+/// `.rs` under `src/` and `crates/`, minus whole-file test modules, with each file's inline
+/// `#[cfg(test)] mod tests` stripped. Same corpus definition `tests/broad_lock_census_guard.rs`
+/// uses, for the same reason.
+#[cfg(test)]
+pub(crate) mod u9dispatchcpu3_corpus {
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().is_some_and(|n| n != "tests.rs")
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    /// `(repo-relative path, production source)` for every production file.
+    pub(crate) fn production_corpus() -> Vec<(String, String)> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut paths = Vec::new();
+        walk(&root.join("src"), &mut paths);
+        walk(&root.join("crates"), &mut paths);
+        paths.sort();
+        let mut out = Vec::new();
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let production = text
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(&text)
+                .to_string();
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, production));
+        }
+        assert!(
+            out.len() > 100,
+            "the corpus walk found only {} files — a census over an empty corpus proves nothing",
+            out.len()
+        );
+        out
+    }
+}
+
 /// U9-DISPATCH-CPU2 §2 — **the recovery contract, driven over the real owners.**
 ///
 /// U9-DISPATCH-CPU1 D3 proved that a refused drain leaves rejected entries queued, in order. That
@@ -166079,50 +166243,309 @@ mod u9dispatchcpu2_recovery {
         );
     }
 
-    /// **The divergence has no production writer today, and that is why it is a hazard rather
-    /// than an outage.**
+    /// **DISPATCH ELIGIBILITY, enumerated — replacing an incomplete unreachability proof.**
     ///
-    /// `NoneAcceptable` needs a queued task that is either not `Runnable` or has no incarnation.
-    /// Neither is producible by any path in this tree:
+    /// The case this replaces checked that one ASID-clearing function has no production caller and
+    /// that the string "Reserved" occurs in the enqueue seam. Neither establishes what it was cited
+    /// for. A queued task can fail to be dispatchable in **four independent ways**, and proving one
+    /// unreachable says nothing about the other three:
     ///
-    /// * `spawn_thread_core` sets `tcb.asid = parent.asid` and `status = Runnable` BEFORE the
-    ///   enqueue, so nothing is ever queued without an incarnation;
-    /// * `unbind_task_asid` — the only writer that clears one — has no production caller at all;
-    /// * `DispatchIncoming` requires `Runnable`, and the status writers that produce
-    ///   `Exited`/`Dead`/`Faulted` act on the CURRENT task or on one already withdrawn from its
-    ///   queue.
+    /// | mode | what it means | who refuses it (split) | who refuses it (broad) |
+    /// |---|---|---|---|
+    /// | **absent TCB** | the TID names no slot | `MarkedIncarnation::resolve` → `None` | `apply_dispatch_transition` → `TaskMissing` |
+    /// | **non-`Runnable` status** | queued but blocked/exited/dead | `dispatch_transition_would_be_accepted` | `apply_dispatch_transition` |
+    /// | **missing ASID** | `Runnable`, queued, no address space | `MarkedIncarnation::resolve` → `None` | *nothing at selection* — see below |
+    /// | **changed incarnation** | the ASID was replaced after the acceptance read | the mark token carries the exact ASID | *no incarnation concept at the commit* |
     ///
-    /// So the acceptance filter is a fail-CLOSED guard on a state no writer produces. This case
-    /// pins that, because it is the difference between "the recovery path strands eligible work"
-    /// (it does not) and "the recovery path would admit what the drain refuses" (it would).
+    /// The enqueue seam itself enforces **none** of them. `refuse_reservation_locked` refuses
+    /// exactly one thing — a `Reserved` spawn reservation — and its own doc comment says so:
+    /// *"The run queue carries bare TIDs with no status precondition."* It returns `Ok(None)` for a
+    /// TID with no slot at all, because TID 0 legitimately has none. So the run queue admits
+    /// absent, non-`Runnable` and ASID-less TIDs by construction, and the safety of dispatch has to
+    /// come from somewhere else.
+    ///
+    /// # Where it actually comes from
+    ///
+    /// For the first two modes, from both dispatch paths: each refuses independently, before any
+    /// mutation, and those refusals are covered by their own cases.
+    ///
+    /// For **missing ASID**, from neither dispatch path — the broad path admits it — and instead
+    /// from the **spawn transaction's step order**. `spawn_txn` binds the ASID
+    /// (`bind_spawned_task_asid`) and publishes the image before the enqueue, and the enqueue is
+    /// structurally the LAST step of the transaction, documented as *"enqueue — rank 1, last, the
+    /// only step that touches a run queue"*. That ordering is the precondition, and it is what this
+    /// case tests — not the presence of a word.
+    ///
+    /// This matters because `register_task` leaves `asid: None` and **does** have production
+    /// callers: `register_core_graph` registers init, process-manager, VFS, supervisor and the
+    /// POSIX server that way. Those registrations perform no enqueue at all; the servers reach a
+    /// run queue only through the spawn transaction, after the bind. Had `register_core_graph`
+    /// enqueued them, the "no production writer" claim would have been false — which is precisely
+    /// why the claim needed to be about the ordering rather than about one clearing function.
     #[test]
-    fn the_unmarkable_state_has_no_production_writer() {
-        const FAULT_EP: &str = include_str!("fault_endpoint_state.rs");
-        assert!(
-            FAULT_EP.contains("pub fn unbind_task_asid(&mut self, tid: u64)"),
-            "the only ASID-clearing writer must still be this one, or this proof is stale"
-        );
-        // Nothing outside its own definition and the tests calls it.
-        for rel in [
-            include_str!("../../runtime.rs"),
-            include_str!("exec_state.rs"),
-            include_str!("scheduler_state.rs"),
-            include_str!("../task_enqueue.rs"),
-            include_str!("reap_claim.rs"),
-            include_str!("exit_claim.rs"),
-            include_str!("restart_state.rs"),
-        ] {
-            assert!(
-                !rel.contains("unbind_task_asid("),
-                "a production caller of `unbind_task_asid` would make the unmarkable state \
-                 reachable, and this module's reachability claim would have to be redone"
-            );
-        }
-        // And the enqueue seam refuses a task that is not yet live.
+    fn the_enqueue_seam_enforces_only_the_spawn_reservation() {
         const ENQ: &str = include_str!("../task_enqueue.rs");
+        let refuse = ENQ
+            .split_once("pub(crate) fn refuse_reservation_locked(")
+            .map(|(_, r)| r.split_once("\n}").map(|(b, _)| b).unwrap_or(r))
+            .expect("the enqueue refusal owner");
         assert!(
-            ENQ.contains("Reserved"),
-            "the enqueue seam must still keep a Reserved (spawning) task out of the run queue"
+            refuse.contains("is_spawn_reservation"),
+            "the one precondition the seam enforces is the spawn reservation"
+        );
+        assert!(
+            !refuse.contains(".asid") && !refuse.contains("TaskStatus::Runnable"),
+            "and it enforces NEITHER an incarnation NOR a Runnable status — a guard that assumed \
+             otherwise would be asserting a precondition that does not exist"
+        );
+        assert!(
+            refuse.contains("return Ok(None)"),
+            "a TID with no slot is admitted, not refused: TID 0 has no TCB by construction"
+        );
+    }
+
+    /// **The missing-ASID precondition, tested as a precondition.** The spawn transaction binds the
+    /// incarnation strictly before it enqueues, and the enqueue is its last step.
+    #[test]
+    fn the_spawn_transaction_binds_the_incarnation_before_it_enqueues() {
+        const SPAWN: &str = include_str!("../syscall/spawn_txn.rs");
+        let bind = SPAWN
+            .find("owners.bind_spawned_task_asid(spec.tid, asid)")
+            .expect("the ASID bind");
+        let publish = SPAWN
+            .find(".publish_spawned_image(")
+            .expect("the image publication");
+        let enqueue_pinned = SPAWN
+            .find("owners.enqueue_on_cpu(chosen_cpu, spec.tid)?")
+            .expect("the pinned enqueue");
+        let enqueue_balanced = SPAWN
+            .find("owners.enqueue_balanced(spec.tid)?")
+            .expect("the balanced enqueue");
+        assert!(
+            bind < publish && publish < enqueue_pinned && publish < enqueue_balanced,
+            "bind, then publish, then enqueue — the ordering IS the precondition that keeps an \
+             ASID-less task out of every run queue"
+        );
+        assert!(
+            SPAWN.contains(
+                "enqueue               rank 1, last, the only step that touches a run queue"
+            ),
+            "and the transaction must still declare the enqueue its last step, so a future \
+             reordering has to edit the declaration as well as the code"
+        );
+    }
+
+    /// **`register_task` leaves no incarnation, and its production callers enqueue nothing.**
+    ///
+    /// The complete production caller set is covered, not sampled: every `register_task` /
+    /// `register_task_with_class` call outside a `#[cfg(test)]` module is accounted for.
+    #[test]
+    fn every_production_registration_either_binds_an_incarnation_or_enqueues_nothing() {
+        // The constructor leaves `asid` unset — this is what makes the ordering load-bearing.
+        const POLICY: &str = include_str!("task_policy_state.rs");
+        let reg = POLICY
+            .split_once("pub fn register_task_with_class(")
+            .map(|(_, r)| r.split_once("\n    }").map(|(b, _)| b).unwrap_or(r))
+            .expect("the registration owner");
+        assert!(
+            !reg.contains("asid"),
+            "registration must not bind an incarnation — if it started to, this whole ordering \
+             argument would be replaced by a stronger one and this case must be redone"
+        );
+
+        // Caller 1: the idle/bootstrap task. TID 0 is legitimately incarnation-less; it is
+        // `MarkedIncarnation::Idle` and never reaches a userspace return.
+        const BOOTSTRAP: &str = include_str!("bootstrap_state.rs");
+        assert!(
+            BOOTSTRAP.contains("state.register_task(0)"),
+            "the idle task is registered without an incarnation, by design"
+        );
+
+        // Caller 2: the AP workload builder — registers and binds in the same function.
+        const EXEC: &str = include_str!("exec_state.rs");
+        let ap = EXEC
+            .split_once("fn build_ap_workload(")
+            .map(|(_, r)| r.split_once("\n    pub").map(|(b, _)| b).unwrap_or(r))
+            .expect("the AP workload builder");
+        assert!(
+            ap.contains("register_task_with_class") && ap.contains("tcb.asid = Some(asid);"),
+            "the AP workload binds the incarnation itself, in the same owner that registers"
+        );
+
+        // Caller 3: the core service graph — registers five real servers and enqueues NONE.
+        const CORE: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/core/mod.rs"
+        );
+        let graph = CORE
+            .split_once("pub fn register_core_graph(")
+            .map(|(_, r)| r.split_once("\n    }").map(|(b, _)| b).unwrap_or(r))
+            .expect("the core service graph registration");
+        assert_eq!(
+            graph.matches("kernel.register_task(").count(),
+            5,
+            "the five core servers are registered without incarnations"
+        );
+        assert!(
+            !graph.contains("enqueue"),
+            "and NONE of them is enqueued here — they reach a run queue only through the spawn \
+             transaction, after its bind. An enqueue added here would make an ASID-less task \
+             dispatchable and this module's conclusion would be false"
+        );
+    }
+
+    /// **A spawned child inherits its parent's incarnation, including the absence of one.**
+    ///
+    /// `initialize_thread_incarnation_locked` copies `parent.asid` — an `Option` — with no
+    /// precondition, and `parent_facts_locked` reads it with none either. So the child's
+    /// incarnation is exactly as good as the parent's, and the induction bottoms out on the
+    /// registration callers above. Pinned because it is the one propagation edge: a parent that
+    /// somehow had no incarnation would produce children that had none, indefinitely.
+    #[test]
+    fn a_spawned_child_inherits_the_parents_incarnation_unchecked() {
+        const CORE: &str = include_str!("spawn_thread_core.rs");
+        let init = CORE
+            .split_once("pub(crate) fn initialize_thread_incarnation_locked(")
+            .map(|(_, r)| r.split_once("\n}").map(|(b, _)| b).unwrap_or(r))
+            .expect("the incarnation initializer");
+        assert!(
+            init.contains("tcb.asid = parent.asid;"),
+            "the child's incarnation is the parent's, copied as an Option"
+        );
+        assert!(
+            init.contains("tcb.status = TaskStatus::Runnable;"),
+            "and the child is left Runnable — so only the ordering keeps it out of a run queue \
+             before the bind"
+        );
+        let facts = CORE
+            .split_once("pub(crate) fn parent_facts_locked(")
+            .map(|(_, r)| r.split_once("\n}").map(|(b, _)| b).unwrap_or(r))
+            .expect("the parent facts reader");
+        assert!(
+            facts.contains("asid: parent.asid,") && !facts.contains("ok_or(KernelError::Vm"),
+            "and the parent's incarnation is read with no precondition of its own"
+        );
+    }
+
+    /// **The only ASID-clearing writer, and its complete caller set over the whole corpus.**
+    ///
+    /// The replaced case checked seven hand-picked files. This walks every production `.rs` file
+    /// under `src/` and `crates/`, with `#[cfg(test)]` modules stripped, so a caller added in a
+    /// file nobody thought to list is caught.
+    #[test]
+    fn the_only_incarnation_clearing_writer_has_no_production_caller() {
+        let mut definitions = 0usize;
+        let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for (rel, src) in super::u9dispatchcpu3_corpus::production_corpus() {
+            for line in src.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
+                    continue;
+                }
+                if t.contains("fn unbind_task_asid(") {
+                    definitions += 1;
+                } else if t.contains("unbind_task_asid(") {
+                    callers.push(alloc::format!("{rel}: {}", t.trim()));
+                }
+            }
+            // The assignment itself, wherever it lives.
+            if src.contains("tcb.asid = None;") {
+                assert_eq!(
+                    rel, "src/kernel/boot/fault_endpoint_state.rs",
+                    "an incarnation is cleared somewhere new; the census must be redone"
+                );
+            }
+        }
+        assert_eq!(definitions, 1, "exactly one clearing writer must exist");
+        assert!(
+            callers.is_empty(),
+            "it must have NO production caller; found: {callers:?}"
+        );
+    }
+
+    /// **The four modes are distinct, and each dispatch path's answer to each is pinned.**
+    ///
+    /// Driven over the real owners rather than read out of source, because the point of the table
+    /// is that the two paths answer differently and both answers are deliberate.
+    #[test]
+    fn each_ineligibility_mode_is_refused_by_the_owner_that_owns_it() {
+        use crate::kernel::task_transition::{
+            TaskTransition, dispatch_transition_would_be_accepted,
+        };
+        let mut state = Bootstrap::init().expect("init");
+        state.set_current_cpu(CPU).expect("cpu");
+
+        // mode 1 — absent TCB. Neither owner can resolve it.
+        let absent = 31000u64;
+        assert!(
+            state.with_tcbs_mut(|tcbs| !dispatch_transition_would_be_accepted(
+                tcbs,
+                absent,
+                TaskTransition::DispatchIncoming
+            )),
+            "an absent TCB is refused by the STATUS owner, on both paths"
+        );
+        assert!(
+            crate::runtime::MarkedIncarnation::resolve(absent, None).is_none(),
+            "and by the incarnation owner"
+        );
+
+        // mode 2 — non-Runnable status. Both paths refuse; the incarnation is irrelevant.
+        eligible(&mut state, 31001, TaskClass::App);
+        state.set_task_status_for_test(
+            31001,
+            crate::kernel::task::TaskStatus::Blocked(crate::kernel::task::WaitReason::Futex(
+                crate::kernel::vm::VirtAddr(0x1000),
+            )),
+        );
+        assert!(
+            state.with_tcbs_mut(|tcbs| !dispatch_transition_would_be_accepted(
+                tcbs,
+                31001,
+                TaskTransition::DispatchIncoming
+            )),
+            "a non-Runnable task is refused by the STATUS owner, on both paths"
+        );
+        assert!(
+            state.task_asid(31001).is_some(),
+            "and it has a perfectly good incarnation — proving mode 2 is independent of mode 3"
+        );
+
+        // mode 3 — missing ASID. The two paths DIFFER, deliberately.
+        unmarkable(&mut state, 31002, TaskClass::App);
+        assert!(
+            state.with_tcbs_mut(|tcbs| dispatch_transition_would_be_accepted(
+                tcbs,
+                31002,
+                TaskTransition::DispatchIncoming
+            )),
+            "the STATUS owner ACCEPTS it — so the broad path admits it"
+        );
+        assert!(
+            crate::runtime::MarkedIncarnation::resolve(31002, None).is_none(),
+            "the INCARNATION owner refuses it — so the split path does not"
+        );
+
+        // and the idle task is the shape that makes that difference correct.
+        assert!(
+            crate::runtime::MarkedIncarnation::resolve(
+                crate::kernel::task_transition::IDLE_TID,
+                None
+            )
+            .is_some(),
+            "TID 0 resolves WITHOUT an ASID: kernel execution needs no address space, which is \
+             why requiring one at the broad selection would be wrong"
+        );
+
+        // mode 4 — changed incarnation. Only the token-carrying path can see it.
+        eligible(&mut state, 31003, TaskClass::App);
+        let first = state.task_asid(31003).expect("bound");
+        let replaced = crate::kernel::vm::Asid(first.0 ^ 0x55);
+        assert_ne!(first, replaced);
+        assert_ne!(
+            crate::runtime::MarkedIncarnation::resolve(31003, Some(first)),
+            crate::runtime::MarkedIncarnation::resolve(31003, Some(replaced)),
+            "the incarnation owner distinguishes two ASIDs under one TID; the status owner, which \
+             takes no ASID at all, cannot — which is exactly mode 4"
         );
     }
 
@@ -166181,6 +166604,484 @@ mod u9dispatchcpu2_recovery {
             queued_on(&state, CPU),
             alloc::vec![30401, 30402],
             "and the Normal queue kept its FIFO order untouched"
+        );
+    }
+}
+
+/// U9-DISPATCH-CPU3 §3 — **the recovery chain, carried past scheduler state.**
+///
+/// U9-DISPATCH-CPU2 §2 established that recovery exists and identified its owners, but its
+/// positive cases began after idle/interrupt handling and stopped at `current_tid`. A changed
+/// `current_tid` is not a userspace continuation: it says a slot was written, not that an address
+/// space was activated or that the task's saved frame was restored. These cases carry the same
+/// chain through to the frame, and label what is hosted and what is live.
+///
+/// # The trigger, per architecture
+///
+/// | | idle landing | interrupt state there | what lifts it |
+/// |---|---|---|---|
+/// | x86_64 | `idle_halt_loop()` in the raw trap tail | IF as the trap left it | LAPIC timer IRQ |
+/// | AArch64 | `idle_no_eret_loop()` — `wfi` | DAIF as the trap left it; `wfi` wakes on an unmasked pending IRQ | GIC PPI 30 |
+/// | RISC-V | `riscv_trap_halt` — `wfi` | **explicitly re-armed**: `reestablish_idle_boundary()` sets `sstatus.SIE`, because hardware clears it on every trap entry and the `wfi` would otherwise loop masked | S-mode timer |
+///
+/// RISC-V is the one that needs a positive act, and it has one. That is why "the timer will fire"
+/// is a claim about three different mechanisms, not one.
+///
+/// # Preempting versus non-preempting
+///
+/// A tick alone dispatches nothing. `try_split_timer_dispatch` asks
+/// `scheduler_tick_if_no_switch_split_mut`: a NON-preempting tick is handled entirely in the split
+/// route (`PostWorkCommitted`), which sets the broad-dispatch skip — no selection runs and the CPU
+/// returns to the idle loop. Only a PREEMPTING tick returns `None`, falls through to the broad arm,
+/// and reaches `yield_current`. The two are exercised separately below.
+#[cfg(test)]
+mod u9dispatchcpu3_recovery_chain {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskClass, TaskStatus};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, VirtAddr};
+    use crate::runtime::{OwnerRevalidation, SharedKernel};
+
+    const CPU: CpuId = CpuId(0);
+    /// The task that publishes the refusal by blocking — the shape every drain is published by.
+    const PUBLISHER: u64 = 32000;
+    /// The eligible task recovery must actually reach userspace.
+    const ELIGIBLE: u64 = 32001;
+
+    fn frame() -> TrapFrame {
+        TrapFrame::new(0, [0; 6])
+    }
+
+    /// Give `tid` a real incarnation and a recognisable saved user context, so "the frame carries
+    /// THIS task's continuation" is checkable rather than asserted.
+    fn with_continuation(k: &SharedKernel, tid: u64, asid: u16, pc: u64, sp: u64) {
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                t.status = TaskStatus::Runnable;
+                t.asid = Some(Asid(asid));
+                t.user_context.instruction_ptr = VirtAddr(pc);
+                t.user_context.stack_ptr = VirtAddr(sp);
+                t.user_context.user_gprs[5] = (pc ^ 0x5555) as usize;
+                t.user_context.arg0 = asid as usize;
+            });
+        });
+    }
+
+    /// A CPU in the post-settlement state: `current` cleared by a real publisher that blocked,
+    /// nothing running, no frame restored.
+    fn settled_idle_cpu() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.set_current_cpu(CPU).expect("cpu");
+            s.register_task_with_class(PUBLISHER, TaskClass::App)
+                .expect("publisher");
+        });
+        with_continuation(&k, PUBLISHER, 3, 0x3333_0000, 0x3334_0000);
+        k.with(|s| {
+            s.enqueue_on_cpu(CPU, PUBLISHER).expect("queued");
+            s.dispatch_next_task().expect("current");
+            let _ = s.block_current_cpu();
+        });
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            None,
+            "fixture: the publisher cleared `current` — the post-settlement state"
+        );
+        k
+    }
+
+    // ── the trigger ──────────────────────────────────────────────────────────────────────────
+
+    /// **A non-preempting tick dispatches nothing; only a preempting one reaches the selector.**
+    ///
+    /// Driven over the real seam, not read out of source: the same owner
+    /// `try_split_timer_dispatch` calls, on the same scheduler state.
+    #[test]
+    fn only_a_preempting_tick_reaches_the_recovery_selector() {
+        let k = settled_idle_cpu();
+        k.with(|s| {
+            s.register_task_with_class(ELIGIBLE, TaskClass::App)
+                .expect("eligible");
+        });
+        with_continuation(&k, ELIGIBLE, 9, 0x9999_0000, 0x999A_0000);
+        k.with(|s| s.enqueue_on_cpu(CPU, ELIGIBLE).expect("queued"));
+
+        // A SHORT quantum, installed through the existing test seam. The production quantum is
+        // `BOOTSTRAP_TIMER_DEADLINE_TICKS` — 50_000_000 on x86_64, 3_125_000 on AArch64, 10 on
+        // RISC-V — counted in TIMER INTERRUPTS, because `Timer::new` receives the same constant
+        // that `program_timer_deadline` receives as a HARDWARE deadline. Ticking 50 million times
+        // in a unit test would measure the constant, not the contract; the discriminator under
+        // test is `would_preempt_next`, which is quantum-length-independent. The consequence of
+        // that constant is recorded as a residual finding rather than exercised here.
+        k.with(|s| s.set_timer_for_test(crate::kernel::scheduler_timer::Timer::new(4)));
+
+        // Tick until the seam declines — that decline IS the preempting tick, and it is the only
+        // path that reaches the broad arm.
+        let mut non_preempting = 0usize;
+        let mut saw_preempting = false;
+        for _ in 0..64 {
+            match k.scheduler_tick_if_no_switch_split_mut(CPU) {
+                Some(crate::runtime::SchedulerTickOutcome::NoSwitch { .. }) => {
+                    non_preempting += 1;
+                    // The split route settles this itself and never selects.
+                    assert_eq!(
+                        k.with(|s| s.current_tid_on_cpu(CPU)),
+                        None,
+                        "a non-preempting tick must dispatch nothing"
+                    );
+                }
+                Some(other) => panic!("the seam must not return a preempting outcome: {other:?}"),
+                None => {
+                    saw_preempting = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_preempting,
+            "a preempting tick must arrive — recovery depends on one, and if the quantum never \
+             expires the chain has no trigger at all"
+        );
+        assert!(
+            non_preempting > 0,
+            "and non-preempting ticks must precede it, so the two cases are genuinely distinct"
+        );
+        // Still nothing dispatched: the decline is a hand-off to the broad arm, not a dispatch.
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            None,
+            "the seam itself never selects; it declines so the broad arm can"
+        );
+    }
+
+    /// **RESIDUAL, measured: the quantum and the hardware deadline are one constant.**
+    ///
+    /// `Timer::new(BOOTSTRAP_TIMER_DEADLINE_TICKS)` sets the quantum in units of TIMER INTERRUPTS
+    /// — `tick_and_check` is called once per interrupt and decrements `ticks_remaining` by one.
+    /// The same constant is passed to `program_timer_deadline` as a HARDWARE deadline. One
+    /// constant, two incompatible units, and the values are not interchangeable:
+    ///
+    /// | | constant | preempting tick arrives after |
+    /// |---|---|---|
+    /// | RISC-V | 10 | 10 timer interrupts |
+    /// | AArch64 | 3_125_000 | 3.1 million timer interrupts |
+    /// | x86_64 | 50_000_000 | 50 million timer interrupts |
+    ///
+    /// This does not stall ordinary operation, which advances through syscalls, IPC and wakes
+    /// rather than through quantum preemption. What it bounds is precisely the refusal-recovery
+    /// trigger: "the next preempting tick will re-dispatch" is a usable claim on RISC-V and, at
+    /// these values, not a usable one on x86_64 or AArch64.
+    ///
+    /// It is recorded rather than repaired: changing the quantum is a scheduler-policy change that
+    /// would alter the preemption cadence of every live profile, which is outside this stage. The
+    /// case exists so the number is measured, attached to its consequence, and breaks if either
+    /// side of the conflation moves.
+    #[test]
+    fn the_quantum_and_the_hardware_deadline_are_the_same_constant() {
+        const BOOTSTRAP: &str = include_str!("bootstrap_state.rs");
+        assert!(
+            BOOTSTRAP
+                .contains("timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS)"),
+            "the quantum is initialised from the hardware-deadline constant"
+        );
+        const SPLIT: &str = include_str!("../syscall_split.rs");
+        assert!(
+            SPLIT.contains("crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,"),
+            "and the SAME constant is programmed as the hardware deadline"
+        );
+        // The quantum is counted in calls, i.e. in interrupts — measured, not asserted.
+        let mut t = crate::kernel::scheduler_timer::Timer::new(5);
+        let mut ticks_to_preempt = 0usize;
+        for _ in 0..16 {
+            ticks_to_preempt += 1;
+            if t.tick_and_check().1 {
+                break;
+            }
+        }
+        assert_eq!(
+            ticks_to_preempt, 5,
+            "one interrupt consumes one unit of quantum, so the constant's value IS the number \
+             of interrupts between preemptions"
+        );
+        assert_eq!(
+            crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+            50_000_000,
+            "on this build that is fifty million interrupts between preempting ticks — if this \
+             value changes, the recovery-trigger consequence recorded above changes with it"
+        );
+    }
+
+    /// **Each architecture's idle landing is wake-capable, and RISC-V says so explicitly.**
+    ///
+    /// Source-level, and labelled as such: the interrupt state at a `wfi`/`hlt` is not observable
+    /// from a hosted test. What the live evidence adds is recorded in the stage record.
+    #[test]
+    fn every_idle_landing_is_wake_capable() {
+        const A64: &str = include_str!("../../arch/aarch64/trap.rs");
+        let idle = A64
+            .split_once("fn idle_no_eret_loop() -> ! {")
+            .map(|(_, r)| r.split_once("\n}").map(|(b, _)| b).unwrap_or(r))
+            .expect("the AArch64 idle primitive");
+        assert!(
+            idle.contains("wfi"),
+            "AArch64 idles on `wfi`, which wakes on an unmasked pending interrupt"
+        );
+        assert!(
+            !idle.contains("msr daifset") && !idle.contains("DAIFSet"),
+            "and it must NOT mask interrupts on the way in — that would make the halt terminal"
+        );
+
+        const RV: &str = include_str!("../../arch/riscv64/boot.rs");
+        let rv_idle = RV
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let boundary = rv_idle
+            .find("timer::reestablish_idle_boundary()")
+            .expect("RISC-V must re-establish the S-origin boundary before halting");
+        let halt = rv_idle
+            .find("riscv_trap_halt(\"kernel_idle_awaiting_io\")")
+            .expect("the RISC-V idle halt");
+        assert!(
+            boundary < halt,
+            "SIE must be re-enabled BEFORE the wfi: hardware clears it on every trap entry, so \
+             without this the idle loop would spin masked and no timer could ever lift it"
+        );
+    }
+
+    // ── the chain, through to the frame ──────────────────────────────────────────────────────
+
+    /// **THE FULL CHAIN.** Settled refusal → idle CPU → eligible work → selection → `Running`
+    /// mark → the task's own address space and its own saved frame.
+    ///
+    /// This is the case CPU2 could not write: it ends at the trap frame, driven through
+    /// `revalidate_idle_owner_after_drains` — the production owner that selects, marks, and
+    /// populates the frame the epilogue returns through. `Replacement(tid)` is the owner's own
+    /// statement that this task is what the CPU will resume.
+    #[test]
+    fn recovery_reaches_userspace_with_the_right_address_space_and_frame() {
+        let k = settled_idle_cpu();
+        k.with(|s| {
+            s.register_task_with_class(ELIGIBLE, TaskClass::App)
+                .expect("eligible");
+        });
+        with_continuation(&k, ELIGIBLE, 9, 0x9999_0000, 0x999A_0000);
+        k.with(|s| s.enqueue_on_cpu(CPU, ELIGIBLE).expect("queued"));
+
+        let mut f = frame();
+        let outcome = k.revalidate_idle_owner_after_drains(CPU, &mut f);
+
+        assert_eq!(
+            outcome,
+            OwnerRevalidation::Replacement(ELIGIBLE),
+            "the owner must name the task the CPU will resume — not merely report progress"
+        );
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            Some(ELIGIBLE),
+            "it is current on THIS cpu"
+        );
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|tcbs| tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == ELIGIBLE)
+                .map(|t| t.status))),
+            Some(TaskStatus::Running),
+            "and genuinely marked Running"
+        );
+        // The half `current_tid` cannot show: the frame the epilogue returns through carries THIS
+        // task's saved continuation, and its address space is the one that will be activated.
+        assert_eq!(
+            f.saved_pc, 0x9999_0000,
+            "the frame carries the eligible task's own resume PC"
+        );
+        assert_eq!(f.saved_sp, 0x999A_0000, "and its own stack pointer");
+        assert_eq!(
+            f.user_gprs[5],
+            (0x9999_0000u64 ^ 0x5555) as usize,
+            "and its own register file — not the publisher's"
+        );
+        assert_eq!(
+            k.with(|s| s.task_asid(ELIGIBLE)),
+            Some(Asid(9)),
+            "and it has an exact incarnation, which is what the CR3/TTBR0/SATP activation uses"
+        );
+        // The publisher stayed blocked and out of the queue throughout.
+        // The publisher is not what was resumed, and was not returned to a run queue by the
+        // recovery: `block_current_cpu` cleared `current` without re-queueing it, and recovery
+        // took the eligible task instead.
+        assert_ne!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            Some(PUBLISHER),
+            "recovery resumed the eligible task, not the one that settled the refusal"
+        );
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(CPU)),
+            0,
+            "and the queue is empty: the eligible task left it, the publisher was never in it"
+        );
+    }
+
+    /// **An invalid entry ahead of valid work does not strand it.**
+    ///
+    /// A queued TID whose TCB is absent sits at the head. Recovery must not stop there, and must
+    /// not lose the eligible task behind it.
+    #[test]
+    fn an_invalid_head_does_not_strand_the_eligible_task_behind_it() {
+        let k = settled_idle_cpu();
+        k.with(|s| {
+            // A queued TID with no TCB at all — the enqueue seam admits it (`Ok(None)`).
+            s.register_task_with_class(32900, TaskClass::App)
+                .expect("t");
+            s.enqueue_on_cpu(CPU, 32900).expect("queued invalid");
+            s.register_task_with_class(ELIGIBLE, TaskClass::App)
+                .expect("eligible");
+        });
+        with_continuation(&k, ELIGIBLE, 9, 0x9999_0000, 0x999A_0000);
+        k.with(|s| s.enqueue_on_cpu(CPU, ELIGIBLE).expect("queued eligible"));
+        // Remove the head's TCB, leaving its TID queued: the "absent TCB" mode, at the head.
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                for slot in tcbs.iter_mut() {
+                    if slot.as_ref().is_some_and(|t| t.tid.0 == 32900) {
+                        *slot = None;
+                    }
+                }
+            })
+        });
+
+        let mut f = frame();
+        // First attempt: the invalid head is selected and cannot be restored, so the owner rolls
+        // its advance back rather than returning through a frame it could not populate.
+        let first = k.revalidate_idle_owner_after_drains(CPU, &mut f);
+        assert_ne!(
+            first,
+            OwnerRevalidation::Replacement(32900),
+            "an entry with no TCB must never be reported as a resumable replacement"
+        );
+        assert_eq!(f.saved_pc, frame().saved_pc, "and no frame was populated");
+
+        // Second attempt: the eligible task is reached. Nothing was lost.
+        let mut f2 = frame();
+        let second = k.revalidate_idle_owner_after_drains(CPU, &mut f2);
+        assert_eq!(
+            second,
+            OwnerRevalidation::Replacement(ELIGIBLE),
+            "the eligible task behind the invalid head is still reached"
+        );
+        assert_eq!(
+            f2.saved_pc, 0x9999_0000,
+            "with its own continuation in the frame"
+        );
+    }
+
+    /// **Contention: an entry that stops being eligible between selection and restore.**
+    ///
+    /// The deterministic interleaving of the race the split path reports as `Contended`. Driven
+    /// over the real owner by invalidating the candidate after it is queued and before the
+    /// revalidation runs — the same window, with the ordering pinned by construction rather than
+    /// by timing.
+    #[test]
+    fn a_candidate_invalidated_before_the_restore_is_rolled_back_exactly() {
+        let k = settled_idle_cpu();
+        k.with(|s| {
+            s.register_task_with_class(ELIGIBLE, TaskClass::App)
+                .expect("eligible");
+        });
+        with_continuation(&k, ELIGIBLE, 9, 0x9999_0000, 0x999A_0000);
+        k.with(|s| s.enqueue_on_cpu(CPU, ELIGIBLE).expect("queued"));
+        let queued_before = k.with(|s| s.runnable_count_on_cpu(CPU));
+
+        // The interleaving: the TCB is reaped after the enqueue, before the revalidation.
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                for slot in tcbs.iter_mut() {
+                    if slot.as_ref().is_some_and(|t| t.tid.0 == ELIGIBLE) {
+                        *slot = None;
+                    }
+                }
+            })
+        });
+
+        let mut f = frame();
+        let outcome = k.revalidate_idle_owner_after_drains(CPU, &mut f);
+        assert_ne!(
+            outcome,
+            OwnerRevalidation::Replacement(ELIGIBLE),
+            "a reaped candidate must not be resumed"
+        );
+        assert_eq!(
+            f.saved_pc,
+            frame().saved_pc,
+            "and no partial frame is left behind — the epilogue has nothing to return through"
+        );
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            None,
+            "`current` is cleared, so nothing is stranded behind an occupied slot"
+        );
+        assert!(
+            k.with(|s| s.runnable_count_on_cpu(CPU)) <= queued_before,
+            "and the queue advance was undone, never doubled"
+        );
+    }
+
+    /// **The two dispatch contracts, stated and enforced.**
+    ///
+    /// They differ, deliberately, and each is correct for the shape it serves:
+    ///
+    /// * the **split** drains always resume userspace, so they require an exact incarnation —
+    ///   `MarkedIncarnation::resolve` in the acceptance filter, and again in the resume;
+    /// * the **broad** in-lock path also serves kernel-internal transitions (the idle task is
+    ///   made current and preempted out without ever entering userspace), so it cannot require one
+    ///   at the selection;
+    /// * and at the **userspace boundary** the AArch64 owner already refuses an incarnation-less
+    ///   task, mapping it to the idle outcome before reading any context.
+    ///
+    /// U9-DISPATCH-CPU3 §1 shows why the x86_64 twin's more permissive behaviour is not a live
+    /// hazard: the spawn transaction binds the incarnation before its structurally-last enqueue,
+    /// so no incarnation-less task can be queued to reach that boundary at all.
+    #[test]
+    fn the_split_and_broad_contracts_are_each_enforced_where_they_belong() {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        // Split: the acceptance filter requires the exact incarnation.
+        let filter = RUNTIME
+            .split_once("pub(crate) fn queue_advance_select_step_split(")
+            .map(|(_, r)| r.split_once("\n    /// ").map(|(b, _)| b).unwrap_or(r))
+            .expect("the split filter");
+        assert!(
+            filter.contains("MarkedIncarnation::resolve("),
+            "the split path requires an exact incarnation, because it always resumes userspace"
+        );
+        // Broad, at the userspace boundary on AArch64: an incarnation-less task is the idle
+        // outcome, decided before any context is read.
+        let facts = RUNTIME
+            .split_once("pub(crate) fn post_switch_restore_facts_split(")
+            .map(|(_, r)| r.split_once("\n    /// ").map(|(b, _)| b).unwrap_or(r))
+            .expect("the AArch64 restore owner");
+        let asid_gate = facts
+            .find(".and_then(|t| t.asid)")
+            .expect("it must read the incarnation");
+        // The FIRST `Idle` return is the `tid == 0` short-circuit; the one that matters is the
+        // incarnation gate's, which follows the read above.
+        let idle = asid_gate
+            + facts[asid_gate..]
+                .find("return PostSwitchRestoreOutcome::Idle;")
+                .expect("and map its absence to the idle outcome");
+        let take = facts
+            .find("take_thread_restore_facts(")
+            .expect("before taking any restore facts");
+        assert!(
+            asid_gate < idle && idle < take,
+            "the AArch64 userspace boundary refuses an incarnation-less task BEFORE it reads a \
+             context — no partial restore, no return through another task's address space"
         );
     }
 }
