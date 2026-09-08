@@ -15443,3 +15443,198 @@ still covered by their own cases.
   migrated in this stage**, as instructed — the correction was completed first.
 * **CENSUS-DELTA vs `26c1c44`: −1 production broad `with`.** Against the audited totals the census
   is now *in agreement* rather than merely *claimed* to be.
+
+---
+
+## U9-DISPATCH-CPU3 — dispatch eligibility, and the missing `Running` mark
+
+**Base:** `origin/main = 8265461`. The corrected 2/0/2 census, explicit CPU authority, membership
+rules, authority retirement and the AP Yield migration are all preserved. No family was migrated.
+**U9 remains OPEN.**
+
+### §1 — The unreachability proof, replaced
+
+`the_unmarkable_state_has_no_production_writer` checked seven hand-picked files for one
+ASID-clearing function and looked for the word `"Reserved"` in the enqueue seam. Neither
+establishes what it was cited for, and the file list was a sample rather than a corpus.
+
+It is replaced by a census built over a **walked** corpus — every `.rs` under `src/` and `crates/`
+with `#[cfg(test)]` modules stripped, the same corpus definition `broad_lock_census_guard` uses —
+which tests **preconditions**, not vocabulary.
+
+**The four ways a queued task can fail to be dispatchable are independent.** Proving one
+unreachable proves nothing about the others:
+
+| mode | refused by (split) | refused by (broad) |
+|---|---|---|
+| **absent TCB** | `MarkedIncarnation::resolve` → `None` | `apply_dispatch_transition` → `TaskMissing` |
+| **non-`Runnable` status** | `dispatch_transition_would_be_accepted` | `apply_dispatch_transition` |
+| **missing ASID** | `MarkedIncarnation::resolve` → `None` | **nothing** — deliberate, see §2 |
+| **changed incarnation** | the mark token carries the exact ASID | **no incarnation concept** |
+
+**The enqueue seam enforces none of them.** `refuse_reservation_locked` refuses exactly one thing —
+a `Reserved` spawn reservation — and returns `Ok(None)` for a TID with no slot at all, because
+TID 0 has no TCB by construction. Its own doc says it: *"The run queue carries bare TIDs with no
+status precondition."*
+
+**So where does missing-ASID safety come from? The spawn transaction's step order.** `spawn_txn`
+binds the ASID and publishes the image before the enqueue, and the enqueue is structurally its last
+step — *"enqueue — rank 1, last, the only step that touches a run queue"*. That ordering is the
+precondition, and it is what the guard now tests.
+
+This distinction was load-bearing. `register_task` leaves `asid: None` and **does** have production
+callers: `register_core_graph` registers init, process-manager, VFS, supervisor and the POSIX server
+that way. Those registrations enqueue **nothing** — the servers reach a run queue only through the
+spawn transaction, after the bind. Had `register_core_graph` enqueued them, the old claim would have
+been false, and the replaced guard would not have noticed.
+
+The one propagation edge is pinned too: `initialize_thread_incarnation_locked` copies `parent.asid`
+as an `Option` with no precondition, and `parent_facts_locked` reads it with none either — so a
+child's incarnation is exactly as good as its parent's, and the induction bottoms out on the
+registration callers above.
+
+### §2 — The broad dispatch contract, classified before changing it
+
+The 168 failures U9-DISPATCH-CPU2 measured established compatibility impact. Classified against
+their production counterparts, the dominant TIDs (1, 2, 41, 42, 77, 81, 82, 900, 901 …) are
+`register_task*` fixtures inside `runtime.rs`'s own test modules: **incomplete test fixtures** that
+model a userspace task and skip the binding every production constructor performs.
+
+**When is an ASID required for the architectural continuation?** When the dispatch resumes
+userspace. The idle task never does — which is why `MarkedIncarnation::resolve` admits TID 0 without
+one, and why requiring an incarnation at the broad *selection* would be wrong rather than merely
+inconvenient.
+
+So the two paths legitimately admit different execution shapes, and both contracts are now stated
+and enforced by test:
+
+* the **split** drains always resume userspace → they require the exact incarnation, in the
+  acceptance filter and again in the resume;
+* the **broad** in-lock path also serves kernel-internal transitions → it cannot require one at the
+  selection;
+* at the **userspace boundary**, the AArch64 owner `post_switch_restore_facts_split` already
+  refuses an incarnation-less task, mapping it to the idle outcome *before* reading any context.
+
+**A repair was implemented at the more permissive x86_64 twin, and reverted.** It cost 3 tests
+including `a_task_with_no_asid_still_restores_and_is_not_refused`, a deliberate equivalence contract
+whose own comment says *"strengthening that into a refusal is explicitly out of contract"* — and §1
+shows the state it would guard cannot be queued at all. Guarding an enforced-impossible state by
+overriding a deliberate contract is not a repair.
+
+### §3 — The missing `Running` mark, repaired at its owner
+
+Carrying the recovery chain past scheduler state — which is what §3 asked for — found a live
+x86_64 defect that stopping at `current_tid` could not see.
+
+`revalidate_idle_owner_after_drains` runs on **every** trap return whose exiting owner is idle
+(`None | Some(0)`). It selects a real task (TID 0 is short-circuited to `Idle` before it gets
+there), loads that task's saved user context into the trap frame, and reports `Replacement(next)` —
+on which the x86_64 trap tail `iretq`s into ring 3. **It never marked the task `Running`.**
+
+The task therefore ran in userspace while its TCB said `Runnable`: the scheduler and the task table
+disagreed about what was running on that CPU for the whole timeslice, and the next
+`PreemptOutgoing` — whose `expected_from` is `Running` — would refuse.
+
+This is the defect U9-DISPATCH-CPU1 **D4** repaired at the AP's first userspace entry. Both paths
+that reach ring 3 without the broad dispatcher were missing the mark `dispatch_next_task` performs
+through `commit_dispatch_selection_in_lock`. D4 fixed one; this fixes the other, the same way and
+through the same owners:
+
+```
+select (provenance-preserving)  →  mark (typed transition)  →  snapshot  →  frame
+```
+
+**Deliberately single-axis.** The mark is `apply_dispatch_transition` — status only — and **not**
+`d6_genuine_mark_running_via_task_seam`, which would also impose the incarnation requirement §2
+settled. Folding both in would re-litigate a settled contract while repairing a different defect.
+The differential against the retired broad body proves the confinement: outcome, trap frame, both
+`current` slots, both queue lengths, the CPU binding and the pending TLS-restore request are
+byte-identical; the status is the only divergence, and it is now asserted in **both** directions —
+legacy leaves `Runnable`, the transaction leaves `Running`, and the frames compare equal.
+
+A refused mark takes the **existing** rollback, before any frame is written. Two settlements, both
+pre-existing: refused mark, and unrestorable snapshot. No new control flow, no retry, no fatal.
+
+**Three deliberate equivalence contracts were changed, not worked around.**
+`no_task_status_is_written_on_success_or_on_rollback` became
+`the_replacement_is_marked_running_and_bystanders_are_untouched`; both differentials drop the status
+from the compared tuple and assert the divergence explicitly, so it is a tested fact rather than an
+omission.
+
+### §3 — the recovery chain, and how it is labelled
+
+| stage | evidence | kind |
+|---|---|---|
+| refusal settlement → idle entry | the settled-idle fixture is built by a real publisher that dispatches and blocks | hosted |
+| interrupt masking at each landing | x86_64 `hlt` / AArch64 `wfi` with flags as the trap left them; **RISC-V positively re-arms** `sstatus.SIE` via `reestablish_idle_boundary()` before the `wfi`, asserted to precede the halt | source |
+| the wake | preempting vs non-preempting tick, driven over `scheduler_tick_if_no_switch_split_mut` | hosted |
+| selection → `Running` mark → address space → saved frame | `revalidate_idle_owner_after_drains` drives all four; the frame is checked to carry the task's own PC, SP and register file, and its exact ASID | hosted |
+| userspace continuation | `X86_AP_SAVED_FRAME_RESUMED cpu=1 syscall=Yield stack_ok=1 registers_ok=1 result=ok` | **live** |
+
+No case claims userspace recovery from a changed `current_tid`; the hosted chain ends at the trap
+frame, and the ring-3 half is the live AP seal, labelled as such.
+
+Deterministic interleavings cover contention (a candidate reaped between enqueue and restore: the
+advance is undone, `current` cleared, no partial frame), an invalid entry ahead of valid work (the
+eligible task behind it is still reached, with its own continuation), and priority/FIFO preservation.
+
+### §4 — Qualification, frozen at `sha=d73e1df tree=55b5c82`
+
+Recorded separately, as required:
+
+| gate | result |
+|---|---|
+| hosted `cargo test --lib --features hosted-dev` | **5415 passed / 0 failed / 2 ignored** (base 5402) |
+| **`cargo test --tests`, every integration target** | all pass **except the established residual** below |
+| — of which `broad_lock_census_guard` | **7/7** |
+| three freestanding builds (x86_64 / AArch64 / RISC-V) | pass |
+| `rustfmt --edition 2024 --check`, changed files | clean |
+| clippy vs. fresh-target-dir base at `8265461` | **identical lint classes; 0 errors both sides** |
+| exit-current-task oracle ×3 per architecture | 9/9 `result=ok`, every seal carrying `tree=55b5c82` |
+| **AP saved-return smoke ×3** | **3/3 sealed**, `mark_refused=0` |
+| three core smokes | pass |
+| broad-lock census | **`with_cpu`/`with_broad`/`state_lock` = 2 / 0 / 3**, acquisition total **2** |
+
+**Three-architecture Yield/exit evidence retained**, unchanged from base:
+
+| | x86_64 ×3 | AArch64 ×3 | RISC-V ×3 |
+|---|---|---|---|
+| `YIELD_SPLIT_COMMITTED` | 4096 | 4096 | 64 |
+| `YIELD_SPLIT_REFUSED` | 0 | 0 | 0 |
+| `*_YIELD_INLOCK_DISPATCH_FALLBACK` | 0 | 0 | 0 |
+| `EXIT_TASK_OWNER_REVALIDATE_MARK_REFUSED` | 0 | 0 | — |
+
+The AP acceptance criterion, three times: `committed=1 refused=0 broad_fallback=0 ap_entry=1
+resumed=1`, sealing with `duplicate_continuations=0 wrong_cpu_continuations=0`.
+
+### Residual, reported separately
+
+* **`server_dies_runner_scope` fails 2 of 10** — `required_marker_chain_is_ordered_and_complete`
+  and `required_chain_is_scoped_to_the_witnessed_transaction`, both missing
+  `EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG}`. Established residual, reproduced identically at
+  `26c1c44` in the previous stage and unchanged here. Different family, not touched. Still red.
+
+* **The quantum and the hardware deadline are one constant.** `Timer::new(BOOTSTRAP_TIMER_DEADLINE_TICKS)`
+  sets the quantum in **timer interrupts** — `tick_and_check` is called once per interrupt and
+  decrements by one — while the same constant is passed to `program_timer_deadline` as a **hardware
+  deadline**. One constant, two incompatible units:
+
+  | | constant | preempting tick after |
+  |---|---|---|
+  | RISC-V | 10 | 10 interrupts |
+  | AArch64 | 3 125 000 | 3.1 M interrupts |
+  | x86_64 | 50 000 000 | 50 M interrupts |
+
+  This stalls nothing in ordinary operation, which advances through syscalls, IPC and wakes rather
+  than through quantum preemption. What it bounds is precisely the **refusal-recovery trigger**:
+  "the next preempting tick will re-dispatch" is a usable claim on RISC-V and, at these values, not
+  a usable one on x86_64 or AArch64. Recorded with an executable measurement rather than repaired —
+  changing the quantum is a scheduler-policy change that would alter the preemption cadence of every
+  live profile, which is outside this stage's scope. The exact contract a future stage needs is:
+  **separate the quantum from the hardware deadline, and give the quantum a value in interrupts.**
+
+* **Family restrictions unchanged.** x86_64 `ArchGateOff` remains a preserved diagnostic; `d2_recv`,
+  `d2_send`, `futex_wait` and the AArch64 direct-dispatch drain still publish `AmbientBound`; six
+  direct consumers of the mark seam remain. No family was migrated, as instructed.
+
+* **CENSUS-DELTA vs `8265461`: 0.**
