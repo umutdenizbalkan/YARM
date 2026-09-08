@@ -15024,7 +15024,9 @@ must not even take rank 1 — and `CpuOffline` inside it. Nothing reads `sched.c
 **What this is not.** It is not a lock and not a per-CPU lock type: §14.4's prohibition is
 untouched. The existing rank-1 `with_scheduler_split_mut` still serialises every scheduler access;
 only the fact that critical section authenticates against changed. Rank 1 held across the rank-2
-acceptance read is the canonical ascending direction. Broad-lock census is **unchanged: 2 / 0 / 2**.
+acceptance read is the canonical ascending direction. **The census claim originally recorded here
+— "unchanged: 2 / 0 / 2" — was FALSE; see U9-DISPATCH-CPU2 §1 below, which corrects it and
+removes the regression that made it false.**
 
 **Acceptance-filtered selection.** `dispatch_next_accepted_selection_on(cpu, accept)` replaces
 "dequeue the head, then try to mark it". `accept` asks the read-only sibling of the very transition
@@ -15138,7 +15140,7 @@ window owner rather than build an epoch by arithmetic.
 | three core smokes | pass |
 | `qemu-supervisor-crash-restart-smoke` (REAP1) | `SUPERVISOR_CRASH_RESTART_BASELINE … result=ok` |
 | `run-ci-profiles.sh full` (26 profiles) | 14 PASS / 12 FAIL — **identical to base, see below** |
-| broad-lock census | **2 / 0 / 2, unchanged** |
+| broad-lock census | ~~**2 / 0 / 2, unchanged**~~ — **FALSE as delivered; corrected by U9-DISPATCH-CPU2 §1** |
 
 **The 12 failing CI profiles are pre-existing and are not this stage's.** `sender-wake`,
 `ipc-final`, `d6-switch-a`, `d6-switch-proof`, `d6-genuine`, `d2-recv`, `d2-send`, `sched-timeout`,
@@ -15209,5 +15211,10 @@ duplicate entries, zero duplicate continuations and zero wrong-CPU continuations
   guard pins the counts per shape so a delegating drain cannot re-open a match the owner owns. Only
   the AArch64 direct-dispatch drain's "nothing selected" marker was corrected here, to name which
   of the three cases occurred rather than calling all of them idle.
-* **CENSUS-DELTA: 0.** `with_cpu / with_broad / TOTAL` is still **2 / 0 / 2**. This stage removed an
+* ~~**CENSUS-DELTA: 0.** `with_cpu / with_broad / TOTAL` is still **2 / 0 / 2**.~~ **This line was
+  false when written.** The stage added a production broad `SharedKernel::with` callsite at
+  `src/arch/riscv64/boot.rs`, taking `with_broad` from 0 to 1, and the claim was never measured —
+  it was asserted from an ad-hoc `grep` of `.with_cpu(` alone. U9-DISPATCH-CPU2 §1 removes the
+  callsite and republishes the census from the guard's own scanner. The rest of the sentence
+  stands: this stage removed an
   *authority* mismatch, not a broad-lock acquisition, and claims no census reduction.

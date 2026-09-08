@@ -298,7 +298,26 @@ fn timer_is_armed_at_the_boot_safe_point_not_at_idle() {
         "the timer must be armed before control passes to the workload"
     );
     // The idle block still re-establishes the S-origin contract, and arms nothing.
-    let idle_block = boot
+    //
+    // U9-DISPATCH-CPU2: anchored on the marker as it appears in CODE, not on its first textual
+    // occurrence anywhere in the file. U9-DISPATCH-CPU1 added a comment that quotes
+    // `RISCV_KERNEL_IDLE_WAITING_FOR_IO` while explaining why that line is no longer emitted for a
+    // queue-advance refusal — legitimate prose, and it silently retargeted this slice onto the gap
+    // BETWEEN the comment and the real marker, which contains neither the re-establish call nor
+    // the halt. The guard then failed for a reason that had nothing to do with the timer.
+    //
+    // Prose is allowed to quote a marker; a guard is not allowed to be satisfied or defeated by
+    // prose. Comment lines are dropped before the anchor is located, exactly as the in-tree
+    // `code()` helpers do it.
+    let boot_code: String = boot
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//") && !t.starts_with("///") && !t.starts_with('*')
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let idle_block = boot_code
         .split("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
         .nth(1)
         .expect("the idle block")

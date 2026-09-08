@@ -165772,3 +165772,415 @@ mod u9dispatchcpu1_authority {
         }
     }
 }
+
+/// U9-DISPATCH-CPU2 §2 — **the recovery contract, driven over the real owners.**
+///
+/// U9-DISPATCH-CPU1 D3 proved that a refused drain leaves rejected entries queued, in order. That
+/// is necessary and it is not sufficient: "still queued" is a statement about placement, not about
+/// progress. What the record then claimed — `recovery=next_dispatch_on_this_cpu` — names no owner
+/// and no event, and this module exists because tracing it turned out to matter.
+///
+/// # The chain, as it actually executes
+///
+/// A settled refusal leaves the CPU in `idle_no_eret_loop()` (AArch64/x86_64) or the RISC-V typed
+/// idle landing: a `wfi`/`hlt` with interrupts as the trap left them, `current == None`, no frame
+/// restored. The only thing that can lift it is an interrupt. Following the timer:
+///
+/// 1. the timer IRQ enters the shared trap path;
+/// 2. `try_split_timer_dispatch` asks `scheduler_tick_if_no_switch_split_mut`. On a
+///    **non**-preempting tick it ticks, acks, re-arms and returns `PostWorkCommitted` — which
+///    sets `queue_advance_broad_dispatch_skipped`, so **no dispatch runs at all** and the CPU
+///    returns to the idle loop. This is correct (nothing said the quantum expired) but it means
+///    the recovery event is specifically a *preempting* tick, not any tick;
+/// 3. on a preempting tick the split route returns `NotHandled` and the broad arm runs
+///    `Trap::TimerInterrupt`, whose only dispatch action is `if should_preempt { yield_current() }`;
+/// 4. `yield_current` with `current == None` declines the yield transaction as `NoCurrent`
+///    (silently, by design), owes no `Running → Runnable` transition, and falls through to
+///    `on_preempt_current_cpu_selection()`;
+/// 5. `PriorityScheduler::on_preempt_selection` skips its re-enqueue block because there is no
+///    `current`, and calls **`dispatch_next_selection()`** — the plain head dequeue;
+/// 6. `commit_dispatch_selection_in_lock` applies the exact `Runnable → Running` mark, rolling the
+///    dequeue back through `preempt_reenqueue_only_on` if it refuses.
+///
+/// So recovery exists, it does mark `Running`, and it reaches userspace through the ordinary
+/// in-lock restore. **But step 5 is not the acceptance-filtered owner.** It dequeues the head of
+/// the highest non-empty priority queue whether or not that head can be marked, and the rollback
+/// returns the refusal to the tail of **its own** priority queue. That is the same unsound shape
+/// U9-DISPATCH-CPU1 §1 removed from the drains, still live on the path recovery actually uses.
+///
+/// These cases drive that path and record what it really does.
+#[cfg(test)]
+mod u9dispatchcpu2_recovery {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskClass;
+
+    const CPU: CpuId = CpuId(0);
+
+    /// A task that CAN be marked `Running`: registered, `Runnable`, and carrying an incarnation.
+    fn eligible(state: &mut crate::kernel::boot::KernelState, tid: u64, class: TaskClass) {
+        state
+            .register_task_with_class(tid, class)
+            .expect("register");
+        super::give_task_an_incarnation(state, tid);
+    }
+
+    /// A task that CANNOT be marked `Running`: registered and `Runnable`, but with **no**
+    /// incarnation, so `MarkedIncarnation::resolve` refuses it. This is the queued-but-unmarkable
+    /// shape a `NoneAcceptable` settlement reports — reached in production when a task's address
+    /// space is torn down while it sits on a runqueue.
+    fn unmarkable(state: &mut crate::kernel::boot::KernelState, tid: u64, class: TaskClass) {
+        state
+            .register_task_with_class(tid, class)
+            .expect("register");
+        // deliberately no incarnation
+    }
+
+    fn queued_on(state: &crate::kernel::boot::KernelState, cpu: CpuId) -> alloc::vec::Vec<u64> {
+        let mut out = alloc::vec::Vec::new();
+        state.for_each_queued_on_for_test(cpu, |_, tid| out.push(tid.0));
+        out
+    }
+
+    /// Put the CPU in the state a settled refusal leaves it in: `current == None`, nothing
+    /// running, the run queue holding whatever was there.
+    ///
+    /// Built through the REAL publisher shape rather than by poking the slot — a task is
+    /// dispatched and then blocked, exactly as a blocking syscall does, which is how production
+    /// reaches an empty `current`. `Bootstrap::init` leaves the idle/bootstrap task current, and
+    /// dispatching over it is what removes it from the picture; a fixture that left tid 0 current
+    /// would be testing the idle twin rather than the refusal state.
+    fn settled_refusal_idle_cpu(state: &mut crate::kernel::boot::KernelState, cpu: CpuId) {
+        eligible(state, 30000, TaskClass::App);
+        state.enqueue_on_cpu(cpu, 30000).expect("publisher queued");
+        state.dispatch_next_task().expect("publisher current");
+        assert_eq!(
+            state.current_tid_on_cpu(cpu),
+            Some(30000),
+            "fixture: the publisher is current before it blocks"
+        );
+        let _ = state.block_current_cpu();
+        assert_eq!(
+            state.current_tid_on_cpu(cpu),
+            None,
+            "fixture: the publisher cleared `current`, which is the post-settlement state"
+        );
+        assert!(
+            queued_on(state, cpu).is_empty(),
+            "fixture: and left an empty queue for the case under test to populate"
+        );
+    }
+
+    /// **The recovery owner is not the acceptance-filtered one.** Pinned as a fact, because every
+    /// claim below depends on which owner runs.
+    #[test]
+    fn recovery_runs_the_plain_head_dequeue_not_the_acceptance_filter() {
+        const EXEC: &str = include_str!("exec_state.rs");
+        let body = EXEC
+            .split_once("pub fn yield_current(&mut self) -> Result<(), KernelError> {")
+            .map(|(_, r)| r.split_once("\n    /// ").map(|(b, _)| b).unwrap_or(r))
+            .expect("yield_current");
+        assert!(
+            body.contains("self.on_preempt_current_cpu_selection()"),
+            "the timer's only dispatch action must still be this selection owner"
+        );
+        assert!(
+            !body.contains("dispatch_next_accepted_selection"),
+            "and it is NOT the acceptance-filtered owner — the drains use that one; recovery \
+             does not, which is the whole reason this module exists"
+        );
+        assert!(
+            body.contains("commit_dispatch_selection_in_lock(selection, \"yield_current\")"),
+            "recovery must still MARK the task it dequeues; a selection alone is not a dispatch"
+        );
+    }
+
+    /// **THE DIVERGENCE, AND THE BOUNDARY.** The drain refuses a candidate as unmarkable and
+    /// settles the CPU idle; the recovery path then dispatches that same candidate — without an
+    /// address space.
+    ///
+    /// The two owners do not apply the same admission rule. The acceptance filter admits a
+    /// candidate only when BOTH hold:
+    ///
+    /// * `dispatch_transition_would_be_accepted(.., DispatchIncoming)` — the status is `Runnable`;
+    /// * `MarkedIncarnation::resolve(tid, asid).is_some()` — a non-idle task has an exact ASID.
+    ///
+    /// `commit_dispatch_selection_in_lock`, which recovery uses, applies only the first. So a
+    /// `Runnable` queued task with no incarnation is `NoneAcceptable` to the drain and perfectly
+    /// dispatchable to the timer. `yield_current` then reaches
+    /// `if let Some(asid) = incoming_asid { switch_address_space(..) }`, finds `None`, skips the
+    /// switch, and marks the task `Running` anyway — so it becomes current with whatever address
+    /// space the previous task left active.
+    ///
+    /// This is not a liveness bug; it is the opposite. The drain fails closed and the recovery
+    /// path fails open, on the same queue, on the same CPU, one quantum apart.
+    ///
+    /// # Why U9-DISPATCH-CPU2 §3 does NOT close it here — the exact boundary
+    ///
+    /// The obvious repair is to ask the same `MarkedIncarnation::resolve` question at
+    /// `commit_dispatch_selection_in_lock`, before the status write, and let a refusal take the
+    /// exact inverse the status refusal already takes. That was implemented and measured, and it
+    /// is **not** a minimal repair: it fails 168 hosted cases, at three sites —
+    /// `dispatch_next_task` (272 refusals), `yield_current` (58) and `yield_current_to` (8).
+    ///
+    /// Those are not stale fixtures. They are the ordinary in-lock dispatcher, and what they show
+    /// is that the broad path's dispatch contract deliberately does **not** require an
+    /// incarnation: `yield_current` reads `task_asid(tid)` and treats `None` as "no address space
+    /// to switch to", not as a refusal. Making the in-lock commit require one is a change to that
+    /// contract for every caller, not a repair of this divergence.
+    ///
+    /// So the boundary is precise: **the two admission points cannot be reconciled at the commit
+    /// without first deciding whether an incarnation is a dispatch precondition on the broad path
+    /// at all.** That decision governs `dispatch_next_task` — the kernel's main dispatcher — and
+    /// is not this stage's to make on the strength of a state no writer produces. The divergence
+    /// is recorded here, in an executable case, so the next stage inherits a measurement rather
+    /// than a suspicion.
+    #[test]
+    fn recovery_dispatches_a_candidate_the_drain_refused_as_unmarkable() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_current_cpu(CPU).expect("cpu");
+        settled_refusal_idle_cpu(&mut state, CPU);
+        unmarkable(&mut state, 30100, TaskClass::App);
+        state.enqueue_on_cpu(CPU, 30100).expect("queued");
+        assert_eq!(state.task_asid(30100), None, "fixture: no incarnation");
+        assert_eq!(
+            state.task_status(30100),
+            Some(crate::kernel::task::TaskStatus::Runnable),
+            "fixture: Runnable, so ONLY the incarnation rule separates the two owners"
+        );
+
+        // What the DRAIN's owner says about this candidate.
+        let accepted = state.with_tcbs_mut(|tcbs| {
+            crate::kernel::task_transition::dispatch_transition_would_be_accepted(
+                tcbs,
+                30100,
+                crate::kernel::task_transition::TaskTransition::DispatchIncoming,
+            )
+        });
+        assert!(
+            accepted,
+            "the STATUS half accepts it — the drain's refusal is entirely the incarnation half"
+        );
+
+        // What the DRAIN's owner says overall: refused, on the incarnation half alone.
+        let drain_accepts = state.with_tcbs_mut(|tcbs| {
+            crate::runtime::MarkedIncarnation::resolve(
+                30100,
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == 30100)
+                    .and_then(|t| t.asid),
+            )
+            .is_some()
+        });
+        assert!(
+            !drain_accepts,
+            "the drain refuses this candidate — that is the fact recovery does not agree with"
+        );
+
+        // What RECOVERY does with the same candidate.
+        state.yield_current().expect("recovery tick");
+        assert_eq!(
+            state.current_tid_on_cpu(CPU),
+            Some(30100),
+            "THE DIVERGENCE: recovery dispatched the task the drain reported as NoneAcceptable"
+        );
+        assert_eq!(
+            state.task_status(30100),
+            Some(crate::kernel::task::TaskStatus::Running),
+            "and marked it Running"
+        );
+        assert_eq!(
+            state.task_asid(30100),
+            None,
+            "with no address space of its own — the switch was skipped, not performed"
+        );
+    }
+
+    /// **The RISC-V idle diagnostic reads through the scheduler seam, not the broad lock.**
+    ///
+    /// U9-DISPATCH-CPU2 §1. The `runnable_queued=` field was reached through
+    /// `SharedKernel::with(|k| k.runnable_count_on_cpu(cpu))` — a whole-`KernelState` acquisition
+    /// taken for a log line, on a tree whose audited production broad-`with` total is zero. The
+    /// number is fine and is preserved exactly; the domain it is read in is what changed.
+    ///
+    /// `tests/broad_lock_census_guard.rs` already catches this generically, and it is what
+    /// detected it — after delivery, because the qualification that shipped it ran
+    /// `cargo test --lib`, which builds only the library target and never compiles a single
+    /// `tests/*.rs` integration target. This case is the SPECIFIC pin: it names the site, so a
+    /// reader of this drain sees the constraint without having to know the census exists.
+    #[test]
+    fn the_riscv_idle_diagnostic_does_not_take_the_broad_lock() {
+        const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+        let block = RV_BOOT
+            .split_once("RiscvIdleReason::QueueAdvanceNoIncoming => {")
+            .map(|(_, r)| {
+                r.split_once("\n                }")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .expect("the queue-advance idle attribution");
+        assert!(
+            block.contains("shared.runnable_count_on_cpu_split_read(cpu)"),
+            "the diagnostic must read through the rank-1 scheduler seam"
+        );
+        assert!(
+            !block.contains("shared.with(|"),
+            "and must NOT take the broad KernelState lock — reading one scheduler field inside \
+             the closure does not make the acquisition narrow"
+        );
+        assert!(
+            block.contains("runnable_queued=") && block.contains("recovery="),
+            "and the diagnostic's meaning is preserved, not traded away for the census"
+        );
+        // The split reader is explicit-CPU, not ambient: an idle landing reports ITS OWN queue.
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        let reader = RUNTIME
+            .split_once(
+                "pub(crate) fn runnable_count_on_cpu_split_read(&self, cpu: CpuId) -> usize {",
+            )
+            .map(|(_, r)| r.split_once("\n    }").map(|(b, _)| b).unwrap_or(r))
+            .expect("the split reader");
+        assert!(
+            reader.contains("runnable_count_on(cpu)") && !reader.contains("sched.current_cpu"),
+            "it must address the CPU it was given, never the ambient binding"
+        );
+    }
+
+    /// **The two admission points ask DIFFERENT questions, and this pins exactly which.**
+    ///
+    /// Not a claim that the difference is correct — a measurement of it, at both sites, so the
+    /// stage that decides whether an incarnation is a broad-path dispatch precondition has to
+    /// edit this case deliberately rather than discover the asymmetry again.
+    #[test]
+    fn the_two_admission_points_differ_only_in_the_incarnation_rule() {
+        const SCHED_STATE: &str = include_str!("scheduler_state.rs");
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        let commit = SCHED_STATE
+            .split_once("pub(crate) fn commit_dispatch_selection_in_lock(")
+            .map(|(_, r)| r.split_once("\n    /// ").map(|(b, _)| b).unwrap_or(r))
+            .expect("the in-lock commit");
+        assert!(
+            !commit.contains("MarkedIncarnation::resolve"),
+            "the in-lock commit does NOT require an exact incarnation — this asserts the CURRENT \
+             contract, so that a future stage which changes it has to change this line and say so"
+        );
+        assert!(
+            commit.contains("apply_dispatch_transition(tcbs, tid, transition)"),
+            "it admits on the STATUS transition alone"
+        );
+        let filter = RUNTIME
+            .split_once("pub(crate) fn queue_advance_select_step_split(")
+            .map(|(_, r)| r.split_once("\n    /// ").map(|(b, _)| b).unwrap_or(r))
+            .expect("the off-lock filter");
+        assert!(
+            filter.contains("MarkedIncarnation::resolve("),
+            "the off-lock filter must still ask the same question through the same owner"
+        );
+    }
+
+    /// **The divergence has no production writer today, and that is why it is a hazard rather
+    /// than an outage.**
+    ///
+    /// `NoneAcceptable` needs a queued task that is either not `Runnable` or has no incarnation.
+    /// Neither is producible by any path in this tree:
+    ///
+    /// * `spawn_thread_core` sets `tcb.asid = parent.asid` and `status = Runnable` BEFORE the
+    ///   enqueue, so nothing is ever queued without an incarnation;
+    /// * `unbind_task_asid` — the only writer that clears one — has no production caller at all;
+    /// * `DispatchIncoming` requires `Runnable`, and the status writers that produce
+    ///   `Exited`/`Dead`/`Faulted` act on the CURRENT task or on one already withdrawn from its
+    ///   queue.
+    ///
+    /// So the acceptance filter is a fail-CLOSED guard on a state no writer produces. This case
+    /// pins that, because it is the difference between "the recovery path strands eligible work"
+    /// (it does not) and "the recovery path would admit what the drain refuses" (it would).
+    #[test]
+    fn the_unmarkable_state_has_no_production_writer() {
+        const FAULT_EP: &str = include_str!("fault_endpoint_state.rs");
+        assert!(
+            FAULT_EP.contains("pub fn unbind_task_asid(&mut self, tid: u64)"),
+            "the only ASID-clearing writer must still be this one, or this proof is stale"
+        );
+        // Nothing outside its own definition and the tests calls it.
+        for rel in [
+            include_str!("../../runtime.rs"),
+            include_str!("exec_state.rs"),
+            include_str!("scheduler_state.rs"),
+            include_str!("../task_enqueue.rs"),
+            include_str!("reap_claim.rs"),
+            include_str!("exit_claim.rs"),
+            include_str!("restart_state.rs"),
+        ] {
+            assert!(
+                !rel.contains("unbind_task_asid("),
+                "a production caller of `unbind_task_asid` would make the unmarkable state \
+                 reachable, and this module's reachability claim would have to be redone"
+            );
+        }
+        // And the enqueue seam refuses a task that is not yet live.
+        const ENQ: &str = include_str!("../task_enqueue.rs");
+        assert!(
+            ENQ.contains("Reserved"),
+            "the enqueue seam must still keep a Reserved (spawning) task out of the run queue"
+        );
+    }
+
+    /// **Recovery does reach an eligible task, and marks it Running.** The positive half: an idle
+    /// CPU with ordinary queued work is not stuck, and the chain that lifts it is the preempting
+    /// timer tick reaching `yield_current`.
+    #[test]
+    fn recovery_dispatches_ordinary_queued_work_and_marks_it_running() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_current_cpu(CPU).expect("cpu");
+        settled_refusal_idle_cpu(&mut state, CPU);
+        eligible(&mut state, 30301, TaskClass::App);
+        state.enqueue_on_cpu(CPU, 30301).expect("queued");
+        assert_eq!(state.current_tid_on_cpu(CPU), None, "fixture: idle CPU");
+
+        state.yield_current().expect("recovery tick");
+
+        assert_eq!(
+            state.current_tid_on_cpu(CPU),
+            Some(30301),
+            "the queued task became current on THIS CPU"
+        );
+        assert_eq!(
+            state.task_status(30301),
+            Some(crate::kernel::task::TaskStatus::Running),
+            "and was genuinely marked Running — not merely placed in the slot"
+        );
+        assert!(
+            queued_on(&state, CPU).is_empty(),
+            "and it left the run queue exactly once"
+        );
+    }
+
+    /// **Priority and FIFO order survive recovery.** Whatever recovery does, it must not reorder
+    /// the queue behind the task it takes.
+    #[test]
+    fn recovery_preserves_priority_and_fifo_order() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_current_cpu(CPU).expect("cpu");
+        settled_refusal_idle_cpu(&mut state, CPU);
+        // SystemServer => High, App => Normal.
+        eligible(&mut state, 30400, TaskClass::SystemServer);
+        eligible(&mut state, 30401, TaskClass::App);
+        eligible(&mut state, 30402, TaskClass::App);
+        for tid in [30400, 30401, 30402] {
+            state.enqueue_on_cpu(CPU, tid).expect("queued");
+        }
+
+        state.yield_current().expect("recovery tick");
+        assert_eq!(
+            state.current_tid_on_cpu(CPU),
+            Some(30400),
+            "High before Normal"
+        );
+        assert_eq!(
+            queued_on(&state, CPU),
+            alloc::vec![30401, 30402],
+            "and the Normal queue kept its FIFO order untouched"
+        );
+    }
+}
