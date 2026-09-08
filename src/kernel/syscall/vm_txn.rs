@@ -145,15 +145,31 @@ pub(crate) trait VmMapOwners {
     /// space rather than the ambient one.
     fn is_page_mapped(&self, asid: Asid, virt: VirtAddr) -> Result<bool, KernelError>;
 
-    /// rank 6 then rank 4 — take one frame, create its memory object, mint the caller's capability
-    /// for it, and resolve the physical extent THROUGH that capability against `flags`.
+    /// rank 6 — take one frame and create its memory object. NO capability is minted here.
     ///
-    /// Sequential acquisitions, never nested. On a mint failure the object and its frame are
-    /// released before returning, so no orphan is left. Resolving the phys through the capability
-    /// rather than remembering the allocation is what preserves the delivered RIGHTS check: the
-    /// same `resolve_memory_object_phys(cap, flags)` the in-lock map performs, at the same point
-    /// relative to the mint, with the same error.
-    fn acquire_frame(&mut self, flags: PageFlags) -> Result<ProvisionalFrame, KernelError>;
+    /// The delivered RIGHTS check is evaluated at this point and with this error, against the
+    /// rights the mint will carry (`memory_object_rights_for_kind(Anonymous)`) rather than
+    /// against a published capability. Same predicate, same position in the error precedence,
+    /// no cap required — which is what lets the mint move to the end of the transaction.
+    fn acquire_object(&mut self, flags: PageFlags) -> Result<(u64, PhysAddr), KernelError>;
+
+    /// rank 4 — mint the caller's capability for an object this transaction created.
+    ///
+    /// Deliberately the LAST mutation of the transaction. See the module header: a provisional
+    /// capability is not private, and the shortest window in which one exists is the safest.
+    fn mint_frame_cap(&mut self, object_id: u64, phys: PhysAddr) -> Result<CapId, KernelError>;
+
+    /// rank 6 — release an object that no capability ever referenced.
+    ///
+    /// Reachable only before the mint phase, so the object is unreachable by construction: no
+    /// slot names it, no enumerator can see it, and its backing returns by its own ownership
+    /// rule.
+    fn release_unminted_object(&mut self, object_id: u64);
+
+    /// ONE rank-5 acquisition — remove exactly the pages `installed` records, restoring whatever
+    /// each displaced. Used only by the mint-phase rollback, which runs after `install_range`
+    /// has already returned.
+    fn undo_installed_range(&mut self, asid: Asid, installed: &[InstalledPage]);
 
     /// ONE rank-5 acquisition covering the whole range: install `frames[i]` at
     /// `base + i * PAGE_SIZE`, recording what each displaced. On the first failure, restore every
@@ -167,7 +183,7 @@ pub(crate) trait VmMapOwners {
         asid: Asid,
         base: usize,
         flags: PageFlags,
-        frames: &[ProvisionalFrame],
+        objects: &[(u64, PhysAddr)],
         out: &mut [InstalledPage],
     ) -> Result<usize, (usize, KernelError)>;
 
@@ -225,6 +241,8 @@ pub(crate) enum VmTxnEvent {
 pub(crate) enum VmRollbackReason {
     FrameAlloc,
     PageTableUpdate,
+    /// The mint phase — the ONLY phase in which a provisional capability exists.
+    CapabilityMint,
 }
 
 /// Validates the `(addr, len, prot)` triple shared by NR 3 and NR 13, in the delivered order and
@@ -397,24 +415,22 @@ fn run_one_map_run<O: VmMapOwners>(
     flags: PageFlags,
 ) -> Result<(), SyscallError> {
     debug_assert!(pages <= VM_MAP_MAX_PAGES_PER_RUN);
-    let empty = ProvisionalFrame {
-        object_id: 0,
-        cap: CapId(0),
-        phys: PhysAddr(0),
-    };
-    let mut frames = [empty; VM_MAP_MAX_PAGES_PER_RUN];
+    let mut objects = [(0u64, PhysAddr(0)); VM_MAP_MAX_PAGES_PER_RUN];
 
-    // ── Phase R: every frame first. Nothing is installed yet, so a failure here has no VM effect
-    // to undo — only the frames already taken.
+    // ── Phase R: every frame and its object first. NO capability exists yet, so nothing this
+    // phase creates is visible to any enumerator, and its failure path touches no capability
+    // domain at all.
     for i in 0..pages {
-        match owners.acquire_frame(flags) {
-            Ok(frame) => frames[i] = frame,
+        match owners.acquire_object(flags) {
+            Ok(pair) => objects[i] = pair,
             Err(e) => {
-                let (released, retained) = release_frames(owners, cnode, &frames[..i]);
+                for (object_id, _) in objects.iter().take(i) {
+                    owners.release_unminted_object(*object_id);
+                }
                 owners.note(VmTxnEvent::RolledBack {
                     reason: VmRollbackReason::FrameAlloc,
-                    released,
-                    retained,
+                    released: i,
+                    retained: 0,
                 });
                 return Err(SyscallError::from(e));
             }
@@ -423,29 +439,84 @@ fn run_one_map_run<O: VmMapOwners>(
     owners.note(VmTxnEvent::FramesAcquired { count: pages });
 
     // ── Phase I: ONE VM acquisition installs the whole run and, on failure, restores every page
-    // it displaced before releasing that acquisition. Ownership of what the failure path removes
-    // is established by that serialization, not by comparing a recorded frame number.
+    // it displaced before releasing. Ownership of what the failure path removes is established by
+    // that serialization, not by comparing a recorded frame number.
+    //
+    // The mapping is built from the object's own `phys`. It does NOT go through a capability, so
+    // a sibling revoking or replacing a provisional slot cannot make this map freed or recycled
+    // backing — there is no capability in the dependency chain to revoke.
     let mut installed = [InstalledPage {
         virt: VirtAddr(0),
         inserted: PhysAddr(0),
         replaced: None,
     }; VM_MAP_MAX_PAGES_PER_RUN];
-    let count =
-        match owners.install_range(asid, base, flags, &frames[..pages], &mut installed[..pages]) {
-            Ok(count) => count,
-            Err((_failed_index, e)) => {
-                // The acquisition already restored the address space. The frames are still ours.
-                let (released, retained) = release_frames(owners, cnode, &frames[..pages]);
+    let count = match owners.install_range(
+        asid,
+        base,
+        flags,
+        &objects[..pages],
+        &mut installed[..pages],
+    ) {
+        Ok(count) => count,
+        Err((_failed_index, e)) => {
+            // The acquisition already restored the address space, and no capability was ever
+            // minted, so the objects are unreachable and go back whole.
+            for (object_id, _) in objects.iter().take(pages) {
+                owners.release_unminted_object(*object_id);
+            }
+            owners.note(VmTxnEvent::RolledBack {
+                reason: VmRollbackReason::PageTableUpdate,
+                released: pages,
+                retained: 0,
+            });
+            return Err(SyscallError::from(e));
+        }
+    };
+    debug_assert_eq!(count, pages);
+    owners.note(VmTxnEvent::Installed { count });
+
+    // ── Phase M: the mint, LAST. This is the only phase in which a provisional capability
+    // exists, and it is placed here deliberately.
+    //
+    // A provisional cap is not private: every thread of a process shares one CNode, and Fork
+    // inherits by ENUMERATING the parent's cspace — so a sibling forking concurrently can
+    // capture a slot this transaction has minted but not yet returned, with no CapId guessing
+    // required. Minting after the two phases that actually fail in practice (frame exhaustion and
+    // page-table update) removes that window from both of them; what remains is the mint's own,
+    // which is the shortest it can be.
+    let mut frames = [ProvisionalFrame {
+        object_id: 0,
+        cap: CapId(0),
+        phys: PhysAddr(0),
+    }; VM_MAP_MAX_PAGES_PER_RUN];
+    for i in 0..pages {
+        let (object_id, phys) = objects[i];
+        match owners.mint_frame_cap(object_id, phys) {
+            Ok(cap) => {
+                frames[i] = ProvisionalFrame {
+                    object_id,
+                    cap,
+                    phys,
+                }
+            }
+            Err(e) => {
+                // Undo in reverse dependency order: the mappings first (one acquisition,
+                // restoring what each displaced), then the capabilities this phase minted, then
+                // the objects that never got one.
+                owners.undo_installed_range(asid, &installed[..count]);
+                let (released, retained) = release_frames(owners, cnode, &frames[..i]);
+                for (object_id, _) in objects.iter().take(pages).skip(i) {
+                    owners.release_unminted_object(*object_id);
+                }
                 owners.note(VmTxnEvent::RolledBack {
-                    reason: VmRollbackReason::PageTableUpdate,
+                    reason: VmRollbackReason::CapabilityMint,
                     released,
                     retained,
                 });
                 return Err(SyscallError::from(e));
             }
-        };
-    debug_assert_eq!(count, pages);
-    owners.note(VmTxnEvent::Installed { count });
+        }
+    }
 
     // ── Phase S: the run has committed. Account it, then retire whatever it displaced —
     // shootdown BEFORE reclaim, with no domain lock held across the wait.

@@ -60,35 +60,27 @@ impl VmMapOwners for BroadVmOwners<'_> {
         self.kernel.is_user_page_mapped_in_asid(asid, virt)
     }
 
-    fn acquire_frame(&mut self, flags: PageFlags) -> Result<ProvisionalFrame, KernelError> {
-        let (object_id, cap) = self.kernel.alloc_anonymous_memory_object()?;
-        // The delivered RIGHTS check, at the delivered point: the in-lock map resolves the phys
-        // through the capability against these exact flags before touching a page table.
-        match self.kernel.resolve_memory_object_phys(cap, flags) {
-            Ok(phys) => Ok(ProvisionalFrame {
-                object_id,
-                cap,
-                phys,
-            }),
-            Err(e) => {
-                // The object exists and its cap is minted, so the failure owes the same narrow
-                // release every other failure owes.
-                let frame = ProvisionalFrame {
-                    object_id,
-                    cap,
-                    phys: PhysAddr(0),
-                };
-                if let Some(cnode) = self.kernel.current_task_cnode()
-                    && matches!(
-                        self.release_provisional_cap(cnode, frame),
-                        ProvisionalReleaseOutcome::Released
-                    )
-                {
-                    self.account_released_cap(frame);
-                }
-                Err(e)
-            }
-        }
+    fn acquire_object(&mut self, flags: PageFlags) -> Result<(u64, PhysAddr), KernelError> {
+        // The delivered RIGHTS check, at the delivered point in the error precedence, evaluated
+        // against the rights the mint WILL carry rather than through a published capability. Same
+        // predicate as `resolve_memory_object_phys(cap, flags)`, no cap required — which is what
+        // lets the mint move to the end of the transaction.
+        anonymous_rights_admit(flags)?;
+        let (object_id, phys) = self.kernel.alloc_anonymous_object_without_cap()?;
+        Ok((object_id, phys))
+    }
+
+    fn mint_frame_cap(&mut self, object_id: u64, _phys: PhysAddr) -> Result<CapId, KernelError> {
+        self.kernel.mint_anonymous_frame_cap(object_id)
+    }
+
+    fn release_unminted_object(&mut self, object_id: u64) {
+        self.kernel.release_unminted_anonymous_object(object_id);
+    }
+
+    fn undo_installed_range(&mut self, asid: Asid, installed: &[InstalledPage]) {
+        self.kernel
+            .with_user_spaces_mut(|spaces| undo_installed_locked(spaces, asid, installed));
     }
 
     fn install_range(
@@ -96,11 +88,11 @@ impl VmMapOwners for BroadVmOwners<'_> {
         asid: Asid,
         base: usize,
         flags: PageFlags,
-        frames: &[ProvisionalFrame],
+        objects: &[(u64, PhysAddr)],
         out: &mut [InstalledPage],
     ) -> Result<usize, (usize, KernelError)> {
         self.kernel.with_user_spaces_mut(|spaces| {
-            install_range_locked(spaces, asid, base, flags, frames, out)
+            install_range_locked(spaces, asid, base, flags, objects, out)
         })
     }
 
@@ -175,6 +167,7 @@ impl VmMapOwners for BroadVmOwners<'_> {
                 let reason = match reason {
                     VmRollbackReason::FrameAlloc => "frame_alloc",
                     VmRollbackReason::PageTableUpdate => "pt_update",
+                    VmRollbackReason::CapabilityMint => "cap_mint",
                 };
                 crate::yarm_log!(
                     "VM_MAP_ROLLBACK_OK reason={} released={} retained={}",
@@ -185,6 +178,26 @@ impl VmMapOwners for BroadVmOwners<'_> {
             }
         }
     }
+}
+
+/// The delivered rights predicate for an anonymous frame, without a capability.
+///
+/// `resolve_memory_object_phys(cap, flags)` refuses `MissingRight` when the requested flags demand
+/// a right the capability lacks. Every capability this transaction mints carries
+/// `memory_object_rights_for_kind(Anonymous)`, so the same question can be asked of those rights
+/// directly — same predicate, same error, same position in the precedence, and no published slot
+/// needed to ask it.
+pub(crate) fn anonymous_rights_admit(flags: PageFlags) -> Result<(), KernelError> {
+    use crate::kernel::boot::MemoryObjectKind;
+    use crate::kernel::capabilities::CapRights;
+    let rights = KernelState::memory_object_rights_for_kind(MemoryObjectKind::Anonymous);
+    if flags.read && !rights.contains(CapRights::READ) {
+        return Err(KernelError::MissingRight);
+    }
+    if flags.write && !rights.contains(CapRights::WRITE) {
+        return Err(KernelError::MissingRight);
+    }
+    Ok(())
 }
 
 /// rank 5, ONE acquisition: install the whole run, and on the first failure restore every page
@@ -200,16 +213,13 @@ pub(crate) fn install_range_locked(
     asid: Asid,
     base: usize,
     flags: PageFlags,
-    frames: &[ProvisionalFrame],
+    objects: &[(u64, PhysAddr)],
     out: &mut [InstalledPage],
 ) -> Result<usize, (usize, KernelError)> {
     use crate::kernel::vm::VmError;
-    for (i, frame) in frames.iter().enumerate() {
+    for (i, (_object_id, phys)) in objects.iter().enumerate() {
         let virt = VirtAddr((base + i * PAGE_SIZE) as u64);
-        let mapping = Mapping {
-            phys: frame.phys,
-            flags,
-        };
+        let mapping = Mapping { phys: *phys, flags };
         let aspace = match spaces.get_mut(asid) {
             Some(a) => a,
             None => {
@@ -221,7 +231,7 @@ pub(crate) fn install_range_locked(
             Ok(replaced) => {
                 out[i] = InstalledPage {
                     virt,
-                    inserted: frame.phys,
+                    inserted: *phys,
                     replaced,
                 };
             }
@@ -231,16 +241,18 @@ pub(crate) fn install_range_locked(
             }
         }
     }
-    Ok(frames.len())
+    Ok(objects.len())
 }
 
-/// The undo half, inside the SAME acquisition as the install.
+/// The undo half, inside the SAME acquisition as the install — and the same body the mint-phase
+/// rollback reaches through `undo_installed_range`, so a mapping is removed by exactly one
+/// implementation whichever phase failed.
 ///
 /// Each page is returned to exactly the state the install found it in: the displaced mapping is
 /// re-installed verbatim, and a page that displaced nothing is removed. A failure here cannot be
 /// propagated — the acquisition is the transaction — so a re-install that refuses leaves the page
 /// unmapped, which is strictly safer than leaving this transaction's frame reachable.
-fn undo_installed_locked(
+pub(crate) fn undo_installed_locked(
     spaces: &mut crate::kernel::vm::AddressSpaceManager,
     asid: Asid,
     installed: &[InstalledPage],

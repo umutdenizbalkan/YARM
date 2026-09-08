@@ -1088,6 +1088,78 @@ impl KernelState {
         self.create_memory_object_with_len(phys, total_len)
     }
 
+    /// U9-VM-ENTRY1 — take one anonymous frame and create its object, WITHOUT minting a
+    /// capability for it.
+    ///
+    /// `alloc_anonymous_memory_object` does both in one step, which forces every caller into a
+    /// shape where a provisional capability exists for the whole rest of the transaction. The
+    /// mapping transaction needs the object early (to install the page) and the capability late
+    /// (so the window in which a sibling can capture it is the shortest possible), so the two
+    /// halves are separable here.
+    ///
+    /// Returns `(object_id, phys)`. The object is unreachable until
+    /// [`Self::mint_anonymous_frame_cap`] publishes a slot for it: no capability names it, so no
+    /// enumerator — including Fork's cspace walk — can see it.
+    pub(crate) fn alloc_anonymous_object_without_cap(
+        &mut self,
+    ) -> Result<(u64, PhysAddr), KernelError> {
+        let max_objects = self.runtime_capacity_config().max_memory_objects;
+        self.with_memory_state_mut(|memory| {
+            let phys = PhysAddr(
+                kernel_mut(&mut memory.frame_allocator)
+                    .alloc_contiguous(1)
+                    .map_err(|err| match err {
+                        FrameAllocError::OutOfMemory => KernelError::MemoryObjectFull,
+                        _ => KernelError::Vm(VmError::Full),
+                    })?,
+            );
+            match Self::create_memory_object_slot_locked(
+                memory,
+                phys,
+                crate::kernel::vm::PAGE_SIZE,
+                MemoryObjectKind::Anonymous,
+                max_objects,
+            ) {
+                Ok(id) => Ok((id, phys)),
+                Err(e) => {
+                    // The slot install refused, so the frame it would have described is ours to
+                    // return — the same extent, to the same allocator.
+                    let _ = kernel_mut(&mut memory.frame_allocator).free_contiguous(phys.0, 1);
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// U9-VM-ENTRY1 — mint the caller's capability for an anonymous object this transaction
+    /// created. The delivered rights, the delivered mint owner.
+    pub(crate) fn mint_anonymous_frame_cap(
+        &mut self,
+        object_id: u64,
+    ) -> Result<CapId, KernelError> {
+        self.mint_capability_for_current_context(crate::kernel::capabilities::Capability::new(
+            CapObject::MemoryObject { id: object_id },
+            Self::memory_object_rights_for_kind(MemoryObjectKind::Anonymous),
+        ))
+    }
+
+    /// U9-VM-ENTRY1 — release an object no capability ever referenced.
+    ///
+    /// Reachable only before the mint phase, so the object is unreachable by construction.
+    /// `release_memory_object_slot_locked` returns its backing by that backing's own ownership
+    /// rule, so an anonymous object returns its exact extent to the allocator.
+    pub(crate) fn release_unminted_anonymous_object(&mut self, object_id: u64) {
+        self.with_memory_state_mut(|memory| {
+            if let Some(slot) = memory
+                .memory_objects
+                .iter()
+                .position(|entry| entry.is_some_and(|mem| mem.id == object_id))
+            {
+                Self::release_memory_object_slot_locked(memory, slot);
+            }
+        });
+    }
+
     pub fn task_brk_bounds(&self, tid: u64) -> Option<(usize, usize)> {
         self.with_memory_state(|memory| {
             memory

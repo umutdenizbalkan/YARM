@@ -58,11 +58,54 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         self.shared.is_user_page_mapped_in_asid_split(asid, virt)
     }
 
-    fn acquire_frame(
+    fn acquire_object(
         &mut self,
         flags: crate::kernel::vm::PageFlags,
-    ) -> Result<crate::kernel::syscall::vm_txn::ProvisionalFrame, KernelError> {
-        self.shared.acquire_anonymous_frame_split(self.tid, flags)
+    ) -> Result<(u64, crate::kernel::vm::PhysAddr), KernelError> {
+        // The delivered rights predicate, asked of the rights the mint will carry. Same question,
+        // same error, same position — and no capability needed to ask it, which is what lets the
+        // mint be the transaction's last mutation.
+        crate::kernel::syscall::vm::anonymous_rights_admit(flags)?;
+        self.shared.alloc_anonymous_object_without_cap_split()
+    }
+
+    fn mint_frame_cap(
+        &mut self,
+        object_id: u64,
+        _phys: crate::kernel::vm::PhysAddr,
+    ) -> Result<CapId, KernelError> {
+        use crate::kernel::boot::MemoryObjectKind;
+        use crate::kernel::capabilities::Capability;
+        let cnode = self
+            .shared
+            .task_cnode_split(self.tid)
+            .ok_or(KernelError::TaskMissing)?;
+        // `mint_capability_with_memory_ref_split` is Stage 186D-proper's Model-A discipline: the
+        // object's `cap_refcount` is bumped BEFORE any cnode slot can reference it, so no
+        // concurrent reclaim can free an object a freshly published slot already names. This is
+        // its first live caller.
+        self.shared.mint_capability_with_memory_ref_split(
+            cnode,
+            Capability::new(
+                CapObject::MemoryObject { id: object_id },
+                KernelState::memory_object_rights_for_kind(MemoryObjectKind::Anonymous),
+            ),
+        )
+    }
+
+    fn release_unminted_object(&mut self, object_id: u64) {
+        self.shared.release_unminted_object_split(object_id);
+    }
+
+    fn undo_installed_range(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        installed: &[crate::kernel::syscall::vm_txn::InstalledPage],
+    ) {
+        // ONE rank-5 acquisition, the same body the install phase's own undo uses.
+        self.shared.with_vm_user_spaces_split_mut(|spaces| {
+            crate::kernel::syscall::vm::undo_installed_locked(spaces, asid, installed)
+        });
     }
 
     fn install_range(
@@ -70,13 +113,15 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         asid: crate::kernel::vm::Asid,
         base: usize,
         flags: crate::kernel::vm::PageFlags,
-        frames: &[crate::kernel::syscall::vm_txn::ProvisionalFrame],
+        objects: &[(u64, crate::kernel::vm::PhysAddr)],
         out: &mut [crate::kernel::syscall::vm_txn::InstalledPage],
     ) -> Result<usize, (usize, KernelError)> {
         // ONE rank-5 acquisition covering install AND undo — the same body the broad adapter
         // runs, so the ownership proof is identical on both routes.
         self.shared.with_vm_user_spaces_split_mut(|spaces| {
-            crate::kernel::syscall::vm::install_range_locked(spaces, asid, base, flags, frames, out)
+            crate::kernel::syscall::vm::install_range_locked(
+                spaces, asid, base, flags, objects, out,
+            )
         })
     }
 
@@ -154,6 +199,7 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
                 let reason = match reason {
                     VmRollbackReason::FrameAlloc => "frame_alloc",
                     VmRollbackReason::PageTableUpdate => "pt_update",
+                    VmRollbackReason::CapabilityMint => "cap_mint",
                 };
                 crate::yarm_log!(
                     "VM_MAP_SPLIT_ROLLBACK_OK reason={} released={} retained={}",
@@ -269,36 +315,26 @@ impl crate::runtime::SharedKernel {
         })
     }
 
-    /// U9-VM-ENTRY1 — take one anonymous frame for `tid`, off the broad lock.
+    /// U9-VM-ENTRY1 — rank 6, ONE acquisition: one anonymous frame and the object slot that owns
+    /// it, with NO capability minted.
     ///
-    /// The split twin of `alloc_anonymous_memory_object` followed by the delivered rights-checked
-    /// phys resolve. Rank 6 (frame + object slot), then rank 4 (mint), then rank 4+6 (resolve) —
-    /// sequential acquisitions, never nested.
+    /// The split twin of `KernelState::alloc_anonymous_object_without_cap`. Nothing published a
+    /// cnode slot naming this object, so it is unreachable by construction — no enumerator,
+    /// including Fork's cspace walk, can observe it, and no sibling can revoke or replace it. That
+    /// is what lets the transaction defer its mint to the last mutation.
     ///
-    /// The mint goes through `mint_capability_with_memory_ref_split`, whose Model-A discipline
-    /// exists for exactly this: the object's `cap_refcount` is bumped BEFORE any cnode slot can
-    /// reference it, so no concurrent reclaim can free an object a freshly published slot already
-    /// names. That helper has been `M2_SEAM_HELPER_ONLY` since Stage 186D-proper; this is its
-    /// first live caller.
-    ///
-    /// Every failure after the first mutation compensates through the same narrow owners the
-    /// transaction uses, so nothing is ever handed back partially executed.
-    pub(crate) fn acquire_anonymous_frame_split(
+    /// The frame and the slot are taken together so a slot can never exist without its backing
+    /// (or the reverse): if the slot install refuses, the frame it would have described is
+    /// returned here, the same extent to the same allocator.
+    pub(crate) fn alloc_anonymous_object_without_cap_split(
         &self,
-        tid: u64,
-        flags: crate::kernel::vm::PageFlags,
-    ) -> Result<crate::kernel::syscall::vm_txn::ProvisionalFrame, KernelError> {
+    ) -> Result<(u64, crate::kernel::vm::PhysAddr), KernelError> {
         use crate::kernel::boot::MemoryObjectKind;
-        use crate::kernel::capabilities::Capability;
-        use crate::kernel::syscall::vm_txn::ProvisionalFrame;
         use crate::kernel::vm::{PAGE_SIZE, PhysAddr};
 
-        let cnode = self.task_cnode_split(tid).ok_or(KernelError::TaskMissing)?;
         let max_objects = self.runtime_capacity_config_split_read().max_memory_objects;
 
-        // Phase 1 (rank 6): the frame and its object slot, in ONE acquisition so a slot can never
-        // exist without its backing or vice versa.
-        let (object_id, phys) = self.with_memory_split_mut(|memory| {
+        self.with_memory_split_mut(|memory| {
             let phys = PhysAddr(
                 crate::kernel::boot::kernel_mut(&mut memory.frame_allocator)
                     .alloc_contiguous(1)
@@ -320,68 +356,21 @@ impl crate::runtime::SharedKernel {
                 Err(e) => {
                     // The slot install refused, so the frame it would have described is ours to
                     // return — the same extent, to the same allocator.
-                    crate::kernel::boot::kernel_mut(&mut memory.frame_allocator)
+                    let _ = crate::kernel::boot::kernel_mut(&mut memory.frame_allocator)
                         .free_contiguous(phys.0, 1);
                     Err(e)
                 }
             }
-        })?;
-
-        let object = CapObject::MemoryObject { id: object_id };
-        // Phase 2 (rank 6 then rank 4): the pre-bumped, atomically published mint.
-        let cap = match self.mint_capability_with_memory_ref_split(
-            cnode,
-            Capability::new(
-                object,
-                KernelState::memory_object_rights_for_kind(MemoryObjectKind::Anonymous),
-            ),
-        ) {
-            Ok(cap) => cap,
-            Err(e) => {
-                self.release_orphan_object_split(object_id);
-                return Err(e);
-            }
-        };
-
-        // Phase 3: the delivered RIGHTS check, resolved THROUGH the capability against these
-        // exact flags — the same question the in-lock map asks before touching a page table.
-        match self.resolve_memory_object_phys_for_task_split(tid, cap, flags) {
-            Ok(resolved) => Ok(ProvisionalFrame {
-                object_id,
-                cap,
-                phys: resolved,
-            }),
-            Err(e) => {
-                let frame = ProvisionalFrame {
-                    object_id,
-                    cap,
-                    phys,
-                };
-                if matches!(
-                    self.with_capability_state_split_mut(|capability| {
-                        crate::kernel::syscall::vm::release_provisional_frame_cap_locked(
-                            capability, cnode, frame,
-                        )
-                    }),
-                    crate::kernel::syscall::vm_txn::ProvisionalReleaseOutcome::Released
-                ) {
-                    self.with_memory_split_mut(|memory| {
-                        KernelState::adjust_memory_object_cap_refcount_locked(memory, object, -1);
-                        KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object);
-                    });
-                }
-                Err(e)
-            }
-        }
+        })
     }
 
     /// rank 6 — release an object that no capability ever came to reference.
     ///
-    /// Reached only when the mint itself failed, so the object is unreachable by construction:
-    /// nothing published a slot naming it. `release_memory_object_slot_locked` returns its backing
-    /// according to that backing's own ownership rule, so an anonymous object returns its exact
-    /// extent to the allocator.
-    fn release_orphan_object_split(&self, object_id: u64) {
+    /// Reached when a later phase of the transaction refuses, so the object is unreachable by
+    /// construction: nothing ever published a slot naming it.
+    /// `release_memory_object_slot_locked` returns its backing according to that backing's own
+    /// ownership rule, so an anonymous object returns its exact extent to the allocator.
+    pub(crate) fn release_unminted_object_split(&self, object_id: u64) {
         self.with_memory_split_mut(|memory| {
             if let Some(slot) = memory
                 .memory_objects
