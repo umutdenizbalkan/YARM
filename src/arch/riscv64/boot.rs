@@ -1018,7 +1018,10 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // an idle system when the CPU simply could not take any of the work in front of it.
             match reason {
                 RiscvIdleReason::QueueAdvanceNoIncoming => {
-                    let queued = shared.with(|k| k.runnable_count_on_cpu(cpu));
+                    // U9-DISPATCH-CPU2 §1: read through the rank-1 SCHEDULER seam, not the broad
+                    // `SharedKernel::with`. The number and its meaning are unchanged; the
+                    // acquisition is not a whole-KernelState lock taken for a log line.
+                    let queued = shared.runnable_count_on_cpu_split_read(cpu);
                     crate::yarm_log!(
                         "RISCV_KERNEL_IDLE_QUEUE_ADVANCE_REFUSED cpu={} runnable_queued={} recovery=next_dispatch_on_this_cpu",
                         cpu.0,

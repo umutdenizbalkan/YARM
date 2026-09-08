@@ -1749,6 +1749,20 @@ impl KernelState {
         self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
     }
 
+    /// U9-DISPATCH-CPU2 §2: the exact queued order on `cpu`, priority-major then FIFO — the shape
+    /// a recovery proof has to assert about, because "still queued" and "reachable" are different
+    /// claims and only the order distinguishes them.
+    #[cfg(test)]
+    pub(crate) fn for_each_queued_on_for_test(
+        &self,
+        cpu: CpuId,
+        mut f: impl FnMut(crate::kernel::scheduler::TaskPriority, crate::kernel::ipc::ThreadId),
+    ) {
+        self.with_scheduler_state(|sched| {
+            kernel_ref(&sched.scheduler).for_each_queued_on(cpu, &mut f)
+        });
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn timer_ticks_for_test(&self) -> u64 {

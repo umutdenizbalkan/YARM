@@ -735,7 +735,7 @@ impl MarkedIncarnation {
     /// incarnation and therefore no token. This is called inside the same rank-2 acquisition
     /// that performs the status transition, and strictly BEFORE it: a missing identity must
     /// refuse before mutation, never be discovered after the status has already moved.
-    fn resolve(tid: u64, asid: Option<crate::kernel::vm::Asid>) -> Option<Self> {
+    pub(crate) fn resolve(tid: u64, asid: Option<crate::kernel::vm::Asid>) -> Option<Self> {
         match (tid, asid) {
             (crate::kernel::task_transition::IDLE_TID, _) => Some(Self::Idle),
             (_, Some(asid)) => Some(Self::User { asid }),
@@ -12106,6 +12106,30 @@ impl SharedKernel {
     /// be mistaken for a remote wake.
     pub(crate) fn current_cpu_split_read(&self) -> CpuId {
         self.with_scheduler_split_mut(|sched| sched.current_cpu)
+    }
+
+    /// rank 1 (scheduler lock) — how many tasks are waiting in **`cpu`'s** run queue.
+    ///
+    /// U9-DISPATCH-CPU2 §1. The diagnostic this serves — the RISC-V queue-advance refusal marker's
+    /// `runnable_queued=` field — reached the same number through
+    /// `SharedKernel::with(|k| k.runnable_count_on_cpu(cpu))`. That is a BROAD acquisition:
+    /// `with` takes `self.state.lock()`, the whole-`KernelState` guard, and the fact that the
+    /// closure only read one scheduler field does not make the acquisition narrow. It added a
+    /// production `SharedKernel::with` callsite to a tree whose audited broad-`with` total is
+    /// **zero**, for a log line — and the delivery record that accompanied it claimed the census
+    /// was unchanged.
+    ///
+    /// The number itself was never the problem, so it is preserved exactly: same explicit `cpu`,
+    /// same `Scheduler::runnable_count_on`, same meaning ("waiting in this CPU's run queue,
+    /// excluding whatever is current"). What changes is the domain it is read in — the existing
+    /// rank-1 scheduler seam, which is where every other reader of that field already lives.
+    ///
+    /// The CPU is a PARAMETER, not `sched.current_cpu`. The caller is an idle landing on a
+    /// specific CPU reporting its own queue; reading the ambient binding would print another CPU's
+    /// backlog under this CPU's name, which is exactly the ambient-authority confusion
+    /// U9-DISPATCH-CPU1 §1 removed from the selection owner.
+    pub(crate) fn runnable_count_on_cpu_split_read(&self, cpu: CpuId) -> usize {
+        self.with_scheduler_split_mut(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
     }
 
     /// Reports what the rank-1 enqueue **actually did**.
