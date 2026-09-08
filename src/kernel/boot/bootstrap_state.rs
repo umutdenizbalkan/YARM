@@ -611,7 +611,7 @@ impl Bootstrap {
             core::ptr::addr_of_mut!((*state_ptr).scheduler_state).write(SpinLockIrq::new(
                 SchedulerState {
                     scheduler: store_kernel_value(scheduler),
-                    timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS),
+                    timer: Timer::new(crate::kernel::boot::sched_quantum_ticks()),
                     current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
                 },
             ));

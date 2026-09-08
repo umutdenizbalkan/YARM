@@ -2821,6 +2821,57 @@ pub fn ap_user_dispatch_enabled() -> bool {
     AP_USER_DISPATCH_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// U9-TIMER1 §3 — the DEFAULT-OFF scheduling-quantum override, in TIMER INTERRUPTS.
+///
+/// `0` means unset: the scheduler timer keeps the shipped quantum
+/// (`BOOTSTRAP_TIMER_DEADLINE_TICKS`) and nothing about production cadence changes. A non-zero
+/// value replaces ONLY the interrupt count that makes a quantum — the hardware deadline the timer
+/// is programmed with is untouched, so every interrupt still arrives on its normal schedule and is
+/// serviced by the production route.
+///
+/// This exists because the two are the same constant in incompatible units, which makes a live
+/// preempting tick unobservable inside a qualification run on x86_64 (50M interrupts) and AArch64
+/// (3.1M). Separating them is what §3 authorises; tuning the cadence is not.
+pub(crate) static SCHED_QUANTUM_TICKS_OVERRIDE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_sched_quantum_ticks_override(ticks: u64) {
+    SCHED_QUANTUM_TICKS_OVERRIDE.store(ticks, core::sync::atomic::Ordering::Release);
+}
+
+/// The quantum the scheduler timer should be built with: the override when one was requested,
+/// otherwise the shipped constant. One reader, so the two cannot disagree.
+pub fn sched_quantum_ticks() -> u64 {
+    let override_ticks = SCHED_QUANTUM_TICKS_OVERRIDE.load(core::sync::atomic::Ordering::Acquire);
+    if override_ticks == 0 {
+        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS
+    } else {
+        override_ticks
+    }
+}
+
+/// Install the resolved quantum on an ALREADY-CONSTRUCTED scheduler timer, if there is one.
+///
+/// The three ports capture their command line at different points relative to kernel-state
+/// construction: x86_64 captures it in `prepare_arch_boot`, before `init_shared_static*`, so the
+/// construction-time read in `bootstrap_state` already sees the override; AArch64 and RISC-V
+/// capture theirs after `init_shared_static`, by which time the timer exists. Rather than move an
+/// arch boot sequence to suit a default-off qualification knob, the knob covers both: record the
+/// value for construction, then install it here if construction already happened.
+///
+/// Returns `true` when a live timer was reprogrammed, so the caller can say which route ran.
+pub fn install_sched_quantum_on_live_timer() -> bool {
+    let ticks = sched_quantum_ticks();
+    match Bootstrap::shared_static_ref() {
+        Some(shared) => {
+            shared.set_scheduler_quantum_split_mut(ticks);
+            true
+        }
+        // The timer does not exist yet; `Bootstrap` will build it from the same owner.
+        None => false,
+    }
+}
+
 /// Stage 177: try to claim the one-shot SMP-readiness audit (true exactly once).
 pub(crate) fn smp_ready_audit_try_start() -> bool {
     SMP_READY_AUDIT_STARTED

@@ -566,6 +566,23 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             enabled
         );
     }
+    if let Some(ticks) = parsed.sched_quantum_ticks {
+        // U9-TIMER1 §3: record the override, then install it if the timer already exists.
+        //
+        // The two halves cover the two boot orders. x86_64 captures its command line in
+        // `prepare_arch_boot`, ahead of `init_shared_static*`, so the construction-time read
+        // picks the value up and `install_*` finds nothing to do. AArch64 and RISC-V capture
+        // theirs after the kernel state is built, so there the install is what takes effect.
+        // Both resolve `boot::sched_quantum_ticks()`, so neither route can disagree with the
+        // other; unset (`0`) leaves the shipped quantum untouched on every port.
+        crate::kernel::boot::set_sched_quantum_ticks_override(ticks as u64);
+        let live = crate::kernel::boot::install_sched_quantum_on_live_timer();
+        crate::yarm_log!(
+            "YARM_SCHED_QUANTUM_OVERRIDE ticks={} route={}",
+            ticks,
+            if live { "live_timer" } else { "construction" }
+        );
+    }
     if let Some(enabled) = parsed.ap_user_dispatch {
         // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
         // first live AP user dispatch. No-op on other arches; when OFF the AP
@@ -919,6 +936,21 @@ pub struct YarmBootOptions<'a> {
     /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
     /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
     pub ap_user_dispatch: Option<bool>,
+    /// U9-TIMER1 §3: `yarm.sched_quantum_ticks=N` DEFAULT-OFF override for the number of TIMER
+    /// INTERRUPTS in a scheduling quantum.
+    ///
+    /// It exists because the quantum and the hardware interval are the same constant
+    /// (`BOOTSTRAP_TIMER_DEADLINE_TICKS`), measured in incompatible units: the hardware deadline is
+    /// in timer units, while `SchedulerTimer` decrements once per INTERRUPT. At the shipped values
+    /// a preempting tick arrives after 50M interrupts on x86_64 and 3.1M on AArch64, so a live
+    /// preemption cannot be witnessed inside any qualification run.
+    ///
+    /// This separates the two WITHOUT changing the hardware interval, the production cadence or any
+    /// IPC timeout unit: unset (the default) leaves the quantum exactly as it shipped. It is not a
+    /// tuning knob and it is not a test harness — the hardware timer still fires on its normal
+    /// deadline and the interrupt is serviced by the production route; only the number of those
+    /// interrupts that make a quantum changes.
+    pub sched_quantum_ticks: Option<usize>,
 }
 
 /// Parse a `yarm.loglevel=` value: digit 0–7 or a level name.
@@ -977,6 +1009,11 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
             b"yarm.max_cpus" => {
                 if let Some(max_cpus) = parse_positive_usize(value) {
                     options.max_cpus = Some(max_cpus);
+                }
+            }
+            b"yarm.sched_quantum_ticks" => {
+                if let Some(ticks) = parse_positive_usize(value) {
+                    options.sched_quantum_ticks = Some(ticks);
                 }
             }
             _ => {}

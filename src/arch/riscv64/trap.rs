@@ -714,6 +714,70 @@ pub fn handle_riscv_trap_entry_shared(
                 post_work_committed = true;
             }
             crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
+            crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted => {
+                // U9-TIMER1: the PREEMPTING tick, converted. Same contract as the shared bridge —
+                // one tick, ack, re-arm and the NR 0 deferral — so the broad dispatcher is skipped
+                // and the existing post-lock Yield drain performs the switch.
+                //
+                // THE ASYNC-PREEMPTION SNAPSHOT, and why the converted route has to take it.
+                //
+                // RISC-V names three mutually exclusive resume conventions (199E-R1D), and the
+                // third one is this stage's: FRESH/STARTUP takes `a0..a5` from the argument
+                // mirror; SYSCALL CONTINUATION takes the result lane; ASYNCHRONOUSLY PREEMPTED
+                // restores the integer register file verbatim and must NOT touch the mirror. The
+                // boundary reads that state from an EXPLICIT tag — `riscv_async_resume_take` — and
+                // never infers it.
+                //
+                // The tag is published by `snapshot_async_preempted_current`, which this bridge
+                // calls INSIDE the broad handler, at what its own comment calls the earliest
+                // correct point: strictly before the scheduler tick that can yield. The converted
+                // preempting timer runs entirely BEFORE that lock is taken, so on this route the
+                // broad snapshot never fires. Without a tag the write-back takes the STARTUP arm
+                // and installs the argument mirror — for a timer frame, all zeros — over a live
+                // computation, and forces `a7 = 0`.
+                //
+                // Measured on the RISC-V exit oracle, where the production quantum is 10
+                // interrupts and the preempting branch is therefore live at the DEFAULT cadence:
+                // the process manager was preempted mid-startup, resumed through the startup arm,
+                // and never re-entered its receive loop; init stalled forever waiting for a spawn
+                // reply. A plain `capture_outgoing_user_context_split` here is not the repair and
+                // is actively worse — it overwrites the syscall-argument lane the ordinary resume
+                // arms treat as authoritative, which is the defect 199E-R1D's mirror preservation
+                // exists to prevent.
+                //
+                // So this calls the SAME owner the broad path calls, through its rank-2 split
+                // twin, keyed on the exact identity the deferral names rather than on `current`,
+                // which the transaction has already cleared.
+                //
+                // The frame is the right one for an INTERRUPT: `advance` is `4` only for
+                // `EXC_USER_ECALL`, so `saved_pc` is the interrupted instruction, and all 31 GPRs
+                // were mirrored on entry.
+                //
+                // Gated on the frame actually carrying a user context. The S-mode-origin timer
+                // path (`riscv_s_mode_timer_trap`) builds a `TrapFrame::zeroed()` with only
+                // `saved_pc` set — it has no register file to save — and is reached only with
+                // `current` already cleared, so the transaction declines `NoCurrent` there and no
+                // snapshot is owed. `is_restorable` is the existing predicate for exactly this
+                // property, so a zeroed frame can never authorize a verbatim restore.
+                let outgoing = crate::kernel::boot::yield_dispatch_outgoing(cpu_idx);
+                let restorable = frame.capture_user_context().is_restorable();
+                let tagged = match (outgoing, restorable) {
+                    (Some(tid), true) => shared.snapshot_async_preempted_split(tid, frame),
+                    _ => false,
+                };
+                crate::yarm_log!(
+                    "TIMER_SPLIT_PREEMPT_ASYNC_TAGGED cpu={} outgoing={} tagged={} restorable={}",
+                    cpu.0,
+                    outgoing.unwrap_or(u64::MAX),
+                    u8::from(tagged),
+                    u8::from(restorable)
+                );
+                queue_advance_committed = true;
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=timer_preempt_committed",
+                    cpu.0
+                );
+            }
             other => {
                 crate::yarm_log!(
                     "TIMER_SPLIT_UNEXPECTED_DISPOSITION cpu={} value={:?}",
@@ -722,7 +786,7 @@ pub fn handle_riscv_trap_entry_shared(
                 );
                 debug_assert!(
                     false,
-                    "the timer route yields NotHandled or PostWorkCommitted"
+                    "the timer route yields NotHandled, PostWorkCommitted or QueueAdvanceCommitted"
                 );
             }
         }

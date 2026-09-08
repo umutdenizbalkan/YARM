@@ -135739,16 +135739,72 @@ mod riscv64_async_preemption {
         assert!(m.contains("self.tid == tcb.tid.0"));
         assert!(m.contains("tcb.asid == Some(self.asid)"));
         assert!(m.contains("self.preempt_generation == tcb.async_preempt_generation"));
-        let snap = THREAD_STATE_SRC
-            .split("pub(crate) fn snapshot_async_preempted_current(")
+        // U9-TIMER1 re-derivation. The discipline is unchanged and is now held in ONE place:
+        // `task::publish_async_preempt_snapshot`. It had to move, because the converted
+        // preempting timer publishes its tag off the broad lock — the RISC-V bridge takes the
+        // broad snapshot INSIDE the broad handler, which that route never enters — and a second
+        // copy of this discipline is exactly how two boundaries come to disagree about what
+        // `a0..a7` mean. So the body is asserted where it now lives, and BOTH owners are
+        // required to reach it rather than restate it.
+        let snap = TASK_SRC
+            .split("pub(crate) fn publish_async_preempt_snapshot(")
             .nth(1)
-            .expect("the snapshot")
-            .split("\n    /// Canonical 199E-R1D — consume")
+            .expect("the shared snapshot publisher")
+            .split("\n/// ")
             .next()
             .expect("its body");
+        for (owner, src, call) in [
+            (
+                "the broad owner",
+                THREAD_STATE_SRC,
+                "crate::kernel::task::publish_async_preempt_snapshot(tcbs, tid, captured)",
+            ),
+            (
+                "the rank-2 split owner",
+                RUNTIME_SRC,
+                "crate::kernel::task::publish_async_preempt_snapshot(tcbs, tid, captured)",
+            ),
+        ] {
+            assert!(
+                src.contains(call),
+                "{owner} must delegate to the shared publisher, not restate it"
+            );
+        }
+        // Neither owner may keep its own copy of the discipline.
+        for (owner, src) in [
+            ("the broad owner", THREAD_STATE_SRC),
+            ("the rank-2 split owner", RUNTIME_SRC),
+        ] {
+            assert!(
+                !src.contains("tcb.async_preempted = Some("),
+                "{owner} must not publish a tag of its own"
+            );
+        }
         assert!(
             snap.contains("checked_add(1)"),
             "an exhausted counter must refuse rather than wrap into a matchable value"
+        );
+        // The syscall-argument mirror is PRESERVED across the capture. This is the property the
+        // converted timer route depends on and the one a plain `capture_user_context` write would
+        // destroy: the ordinary resume arms treat `arg0..arg5` as authoritative for `a0..a5`, so
+        // an interrupted task's mid-computation `a0` must never land in that lane.
+        for lane in 0..6 {
+            assert!(
+                snap.contains(&alloc::format!(
+                    "tcb.user_context.arg{lane} = preserved_syscall_lane.{lane};"
+                )),
+                "argument lane {lane} must be restored after the capture"
+            );
+        }
+        let capture_at = snap
+            .find("tcb.user_context = captured;")
+            .expect("the capture");
+        let restore_at = snap
+            .find("tcb.user_context.arg0 = preserved_syscall_lane.0;")
+            .expect("the lane restore");
+        assert!(
+            capture_at < restore_at,
+            "the lane is restored AFTER the wholesale capture, or the capture would win"
         );
         let ctx_at = snap
             .find("tcb.user_context = captured;")
@@ -143997,16 +144053,44 @@ mod u9qa_split_dispatch_disposition {
             !between.contains("DISPATCH_SWITCH_PLAN_STASH") && !between.contains("has_plan()"),
             "a stale or unrelated stash must not alter dispatch control flow"
         );
-        // U9-FT4 re-derivation: the flag is now set by THREE explicit disposition arms rather
-        // than one, because a second class (the AArch64 terminal fault) commits. The semantic
-        // claim is unchanged and is what is asserted here: every setter sits inside an explicit
-        // `SplitDispatchDisposition` match arm, and none is inferred from a stash. The count is
-        // pinned so a fourth setter cannot appear unreviewed.
+        // U9-FT4 re-derivation: the flag is now set by explicit disposition arms rather than one,
+        // because further classes commit. The semantic claim is unchanged and is what is asserted
+        // here: every setter sits inside an explicit `SplitDispatchDisposition` match arm, and
+        // none is inferred from a stash. The count is pinned so a further setter cannot appear
+        // unreviewed.
+        //
+        // U9-TIMER1 re-derivation: FOUR. The converted preempting timer is the fourth, and it is
+        // the same reason as the first — it published a queue-advance deferral, so the caller is
+        // no longer current on this CPU and the post-lock drain, not the broad dispatcher, owes
+        // the switch. Retiring the ordinary preempting-timer population from broad dispatch is
+        // precisely what this arm does, so it belongs here rather than to a new mechanism.
         assert_eq!(
             code.matches("queue_advance_committed = true;").count(),
-            3,
-            "exactly three disposition arms may declare the broad dispatcher skipped: \
-             FutexWait publication, terminal-fault commit, terminal-fault fail-closed"
+            4,
+            "exactly four disposition arms may declare the broad dispatcher skipped: \
+             FutexWait publication, terminal-fault commit, terminal-fault fail-closed, \
+             and the preempting-timer commit"
+        );
+        // And the fourth is reached from the TIMER route's own arm, not smuggled into another
+        // one: the setter and its distinct skip reason both sit between that arm's head and the
+        // next arm.
+        let timer_at = code
+            .find("SplitDispatchDisposition::QueueAdvanceCommitted => {")
+            .expect("the timer route's committed arm");
+        let arm_end = code[timer_at..]
+            .find("\n            other => {")
+            .map(|r| timer_at + r)
+            .expect("the end of the timer disposition match");
+        let timer_arm = &code[timer_at..arm_end];
+        let set = timer_arm
+            .find("queue_advance_committed = true;")
+            .expect("the preempting-timer arm must declare the skip itself");
+        let why = timer_arm
+            .find("reason=timer_preempt_committed")
+            .expect("and must say why, in its own words");
+        assert!(
+            set < why,
+            "the flag is set, then reported — the report never decides the control flow"
         );
         for (i, _) in code.match_indices("queue_advance_committed = true;") {
             let before = &code[..i];
@@ -145097,32 +145181,111 @@ mod u9tm_proof_gate {
         }
     }
 
-    /// FAIL BEFORE MUTATION: both refusals precede the claim, the tick and the re-arm.
+    /// FAIL BEFORE MUTATION: every refusal precedes the claim, the tick and the re-arm.
+    ///
+    /// U9-TIMER1 re-derivation. The route now has TWO branches, and the property this guard
+    /// exists to hold is unchanged for both: nothing is claimed, ticked or re-armed until the
+    /// last thing that can refuse has already answered, so a fallback reaches the unchanged
+    /// broad arm having mutated nothing.
+    ///
+    /// What moved is the arity. There used to be one refusal ordered against one mutation
+    /// sequence; the would-preempt case was itself a refusal, because the preempting timer was
+    /// serviced by broad dispatch. It is now a serviced branch with its own transaction, so the
+    /// ordering is asserted per branch:
+    ///
+    /// * shared prologue — the proof-mode gate, ahead of everything;
+    /// * the preempting branch — the lookahead, then `run_yield_transaction` (whose every step
+    ///   refuses before it mutates), and only on `Ok` the tick, claim and re-arm;
+    /// * the non-preempting tail — the atomic no-switch seam, then claim and re-arm.
+    ///
+    /// The lookahead must also be asked BEFORE anything ticks, which is what makes a declined
+    /// preemption byte-for-byte the pre-conversion behaviour: ticking first would leave the
+    /// broad arm to either double-tick or drop the quantum.
     #[test]
     fn both_refusals_precede_every_mutation() {
-        let route = SPLIT
+        // Positions are read from CODE only. The branch comments name the seams they replaced,
+        // and an anchor that matched prose rather than a call would order the wrong things.
+        let route: alloc::string::String = SPLIT
             .split("fn try_split_timer_into_frame(")
             .nth(1)
             .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
-            .expect("the timer route");
+            .expect("the timer route")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let route = route.as_str();
         let gate = route
             .find("timer_proof_hooks_armed()")
             .expect("the proof-mode refusal");
-        let preempt = route
-            .find("scheduler_tick_if_no_switch_split_mut(cpu)")
-            .expect("the would-preempt refusal");
-        let claim = route
-            .find("acknowledge_interrupt(cpu, 0)")
-            .expect("the claim");
-        let rearm = route.find("program_timer_deadline(").expect("the re-arm");
-        assert!(
-            gate < preempt && preempt < claim && claim < rearm,
-            "order must be: proof gate -> would-preempt -> claim -> re-arm"
-        );
-        // The proof-mode refusal happens before the tick seam is even consulted.
+        let lookahead = route
+            .find("timer_would_preempt_split_read(cpu)")
+            .expect("the preempting-branch lookahead");
+        // The proof-mode refusal happens before anything ticks, and before the branch is chosen.
         assert!(
             route[..gate].find("scheduler_tick").is_none(),
             "nothing may tick before the proof-mode gate is evaluated"
+        );
+        assert!(gate < lookahead, "the proof-mode gate is the prologue");
+        assert!(
+            route[..lookahead].find("scheduler_tick").is_none()
+                && route[..lookahead]
+                    .find("acknowledge_interrupt(cpu, 0)")
+                    .is_none(),
+            "the lookahead must be asked before ANY tick or claim — a decline has to be able to \
+             fall through to the broad arm having changed nothing"
+        );
+
+        // ── the preempting branch ────────────────────────────────────────────────────────────
+        // The tail begins at the no-switch seam, which is the only statement outside the
+        // preempting branch that can still refuse.
+        let split_at = route
+            .find("let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu)")
+            .expect("the boundary between the two branches");
+        let preempting = &route[lookahead..split_at];
+        let txn = preempting
+            .find("run_yield_transaction(&mut owners, cpu)")
+            .expect("the transaction");
+        let tick = preempting
+            .find("scheduler_tick_split_mut(cpu)")
+            .expect("the preempting branch's tick");
+        let claim = preempting
+            .find("acknowledge_interrupt(cpu, 0)")
+            .expect("the preempting branch's claim");
+        let rearm = preempting
+            .find("program_timer_deadline(")
+            .expect("the preempting branch's re-arm");
+        assert!(
+            txn < tick && tick < claim && claim < rearm,
+            "preempting order must be: transaction -> tick -> claim -> re-arm"
+        );
+        // The declining arm sits past every one of those mutations, so it cannot be reached
+        // from a half-applied state.
+        let decline = preempting
+            .find("TIMER_SPLIT_PREEMPT_REFUSED")
+            .expect("the transaction's decline");
+        assert!(
+            decline > rearm,
+            "the decline is the transaction's own `Err`, not a bail-out after mutation"
+        );
+
+        // ── the non-preempting tail, unchanged ───────────────────────────────────────────────
+        let tail = &route[split_at..];
+        let seam = tail
+            .find("scheduler_tick_if_no_switch_split_mut(cpu)")
+            .expect("the no-switch seam");
+        let tail_claim = tail
+            .find("acknowledge_interrupt(cpu, 0)")
+            .expect("the tail's claim");
+        let tail_rearm = tail
+            .find("program_timer_deadline(")
+            .expect("the tail's re-arm");
+        assert!(
+            seam < tail_claim && tail_claim < tail_rearm,
+            "non-preempting order must be: atomic seam -> claim -> re-arm"
         );
     }
 
@@ -145184,28 +145347,96 @@ mod u9tm_proof_gate {
             .nth(1)
             .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
             .expect("the timer route");
+        // U9-TIMER1 re-derivation. The claim this guard protects is unchanged: a settlement must
+        // name what actually happened, and a tick that changed no scheduler state must not borrow
+        // a disposition that says it did. What changed is that the route now has THREE settlement
+        // points instead of one, so "the route does not contain `QueueAdvanceCommitted`" is no
+        // longer an adequate stand-in for it. Each is asserted against its own post-state:
+        //
+        // | settlement | scheduler state changed | disposition |
+        // |---|---|---|
+        // | a preempting tick that re-enqueued the current task | yes — a deferral is published | `QueueAdvanceCommitted`, so the drain performs the switch |
+        // | a preempting tick on an idle CPU with an empty run queue | no — there was nothing to preempt | `PostWorkCommitted`, the architecture tail |
+        // | a non-preempting tick | no — only the tick itself | `PostWorkCommitted`, the architecture tail |
+        //
+        // Positions are read from CODE: the branch comments quote the dispositions they
+        // deliberately do NOT use, and an anchor that matched prose would slice the wrong region.
+        let code: alloc::string::String = route
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let code = code.as_str();
+        let commit_at = code
+            .find("if shared.timer_would_preempt_split_read(cpu) {")
+            .expect("the preempting branch");
+        let idle_at = code
+            .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {")
+            .expect("the idle-CPU arm");
+        let tail_at = code
+            .find("let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu)")
+            .expect("the non-preempting tail");
         assert!(
-            route.contains("D::PostWorkCommitted"),
-            "the timer route must settle as PostWorkCommitted"
+            commit_at < idle_at && idle_at < tail_at,
+            "the three settlements appear in the order the route decides them"
         );
-        for wrong in ["D::Complete", "D::QueueAdvanceCommitted"] {
-            assert!(
-                !route.contains(wrong),
-                "a non-preempting tick must not borrow `{wrong}`"
-            );
-        }
-        // It performs no queue selection and publishes no transition.
-        for banned in [
-            "queue_advance_select_step_split",
-            "queue_advance_commit_split",
-            "yield_dispatch_try_defer",
-            "dispatch_next_selection_on",
+
+        // (a) The committing branch hands the CPU to the drain — never to the architecture tail,
+        // which would return through the outgoing frame it just switched away from.
+        let committing = &code[commit_at..idle_at];
+        assert!(
+            committing.contains("return D::QueueAdvanceCommitted;")
+                && !committing.contains("D::PostWorkCommitted"),
+            "a preempting tick that re-enqueued the current task hands off to the drain"
+        );
+
+        // (b) and (c) Neither the idle arm nor the non-preempting tail changed any scheduler
+        // state beyond its own tick, so neither may claim a queue advance, and neither may
+        // select, defer or publish a transition.
+        for (name, region) in [
+            ("the idle-CPU arm", &code[idle_at..tail_at]),
+            ("a non-preempting tick", &code[tail_at..]),
         ] {
             assert!(
-                !route.contains(banned),
-                "a non-preempting tick must not `{banned}`"
+                region.contains("D::PostWorkCommitted"),
+                "{name} must settle as PostWorkCommitted"
             );
+            for wrong in ["D::Complete", "D::QueueAdvanceCommitted"] {
+                assert!(!region.contains(wrong), "{name} must not borrow `{wrong}`");
+            }
+            for banned in [
+                "queue_advance_select_step_split",
+                "queue_advance_commit_split",
+                "yield_dispatch_try_defer",
+                "dispatch_next_selection_on",
+                "run_yield_transaction",
+            ] {
+                assert!(!region.contains(banned), "{name} must not `{banned}`");
+            }
         }
+
+        // The idle arm's admission is the RUN QUEUE, not `current`. `NoCurrent` alone does not
+        // license settling the tick here: with runnable work the broad arm's
+        // `on_preempt_current_cpu_selection()` genuinely dequeues and dispatches onto the idle
+        // CPU, and absorbing that would silently drop a dispatch.
+        let idle_arm = &code[idle_at..tail_at];
+        let probe = idle_arm
+            .find("runnable_count_on_cpu_split_read(cpu)")
+            .expect("the idle arm must consult the run queue");
+        let decline = idle_arm
+            .find("reason=no_current_runnable")
+            .expect("and must decline, under its own reason, when it is not empty");
+        let tick = idle_arm
+            .find("scheduler_tick_split_mut(cpu)")
+            .expect("the idle arm's tick");
+        assert!(
+            probe < decline && decline < tick,
+            "the run-queue probe and its decline both precede the tick, so a declined idle tick \
+             reaches the broad arm having incremented nothing"
+        );
     }
 
     /// Both trap bridges skip the broad arm for the committed post-work outcome, and the gate is
@@ -164583,12 +164814,62 @@ mod u9residual1_yield_family {
                 "the policy must not count; the two routes reach the counter at different points"
             );
         }
-        // And the split route counts once, on the commit arm only.
+        // And each split route counts once, on its commit arm only.
+        //
+        // U9-TIMER1 re-derivation: there are now TWO split routes that commit a yield — NR 0,
+        // whose caller asked for one, and the converted preempting timer, which performs the
+        // identical transaction with a different provenance. The claim is unchanged and is what
+        // is asserted below: exactly one increment per committing route, each inside its own
+        // commit arm, and none on any declining path. Counting the timer's yield is not
+        // double-counting — the broad `yield_current` that used to run for it, and did this same
+        // increment on entry, no longer runs.
+        let sites: alloc::vec::Vec<usize> = SPLIT
+            .match_indices("shared.count_yield_split_mut();")
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(
-            SPLIT.matches("shared.count_yield_split_mut();").count(),
-            1,
-            "the split route counts exactly once"
+            sites.len(),
+            2,
+            "exactly the two committing split routes count: NR 0 and the preempting timer"
         );
+        for (route, marker) in [
+            ("fn try_split_yield_into_frame", "D::QueueAdvanceCommitted"),
+            (
+                "fn try_split_timer_into_frame(",
+                "TIMER_SPLIT_PREEMPT_COMMITTED",
+            ),
+        ] {
+            let at = SPLIT.find(route).expect("the route");
+            let end = SPLIT[at..]
+                .find("\n#[cfg(feature = \"hosted-dev\")]")
+                .map(|r| at + r)
+                .unwrap_or(SPLIT.len());
+            let body = &SPLIT[at..end];
+            assert_eq!(
+                body.matches("shared.count_yield_split_mut();").count(),
+                1,
+                "`{route}` counts exactly once"
+            );
+            let count = body
+                .find("shared.count_yield_split_mut();")
+                .expect("the increment");
+            let commit = body.find(marker).expect("the commit");
+            assert!(
+                count < commit,
+                "`{route}`: the increment belongs to the committing arm, ahead of `{marker}`"
+            );
+            // No decline may reach it: every `NotHandled` in the route is either before the
+            // increment or in a different arm, so the counter never moves on a fallback.
+            let declines_after: alloc::vec::Vec<usize> = body
+                .match_indices("return D::NotHandled;")
+                .map(|(i, _)| i)
+                .filter(|i| *i > count && *i < commit)
+                .collect();
+            assert!(
+                declines_after.is_empty(),
+                "`{route}`: no decline may sit between the increment and the commit"
+            );
+        }
     }
 
     /// **The per-architecture vocabulary is preserved byte for byte**, in one owner. The three
@@ -166756,12 +167037,13 @@ mod u9dispatchcpu3_recovery_chain {
         );
     }
 
-    /// **RESIDUAL, measured: the quantum and the hardware deadline are one constant.**
+    /// **RESIDUAL, measured: the quantum and the hardware deadline are one constant — and
+    /// U9-TIMER1 §3 separates them WITHOUT changing production cadence.**
     ///
-    /// `Timer::new(BOOTSTRAP_TIMER_DEADLINE_TICKS)` sets the quantum in units of TIMER INTERRUPTS
-    /// — `tick_and_check` is called once per interrupt and decrements `ticks_remaining` by one.
-    /// The same constant is passed to `program_timer_deadline` as a HARDWARE deadline. One
-    /// constant, two incompatible units, and the values are not interchangeable:
+    /// `Timer::new(N)` sets the quantum in units of TIMER INTERRUPTS — `tick_and_check` is called
+    /// once per interrupt and decrements `ticks_remaining` by one. The same constant is passed to
+    /// `program_timer_deadline` as a HARDWARE deadline. One constant, two incompatible units, and
+    /// the values are not interchangeable:
     ///
     /// | | constant | preempting tick arrives after |
     /// |---|---|---|
@@ -166770,26 +167052,72 @@ mod u9dispatchcpu3_recovery_chain {
     /// | x86_64 | 50_000_000 | 50 million timer interrupts |
     ///
     /// This does not stall ordinary operation, which advances through syscalls, IPC and wakes
-    /// rather than through quantum preemption. What it bounds is precisely the refusal-recovery
-    /// trigger: "the next preempting tick will re-dispatch" is a usable claim on RISC-V and, at
-    /// these values, not a usable one on x86_64 or AArch64.
+    /// rather than through quantum preemption. What it bounds is precisely a live preemption
+    /// witness: "the next preempting tick will re-dispatch" is a usable claim on RISC-V and, at
+    /// these values, not one that can be OBSERVED inside a qualification run on x86_64 or AArch64.
     ///
-    /// It is recorded rather than repaired: changing the quantum is a scheduler-policy change that
-    /// would alter the preemption cadence of every live profile, which is outside this stage. The
-    /// case exists so the number is measured, attached to its consequence, and breaks if either
-    /// side of the conflation moves.
+    /// U9-TIMER1 needs that witness on all three ports, and §3 authorises exactly one repair for
+    /// it: separate the interrupt-count quantum from the hardware interval, default-off. What this
+    /// guard now pins is that the separation is the ONLY change:
+    ///
+    /// * the quantum reads through ONE owner, `boot::sched_quantum_ticks()`;
+    /// * with no override that owner returns the shipped constant verbatim, so an unconfigured
+    ///   boot has the delivered cadence — the residual above is unrepaired, not hidden;
+    /// * the hardware deadline still uses the constant directly and is NOT routed through the
+    ///   override, so every interrupt keeps arriving on its normal schedule;
+    /// * and the override defaults to `0`/unset, so it can only be turned on by a boot argument.
     #[test]
     fn the_quantum_and_the_hardware_deadline_are_the_same_constant() {
         const BOOTSTRAP: &str = include_str!("bootstrap_state.rs");
         assert!(
-            BOOTSTRAP
-                .contains("timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS)"),
-            "the quantum is initialised from the hardware-deadline constant"
+            BOOTSTRAP.contains("timer: Timer::new(crate::kernel::boot::sched_quantum_ticks())"),
+            "the quantum is initialised through the single quantum owner"
+        );
+        assert!(
+            !BOOTSTRAP.contains("Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS)"),
+            "and no longer reads the hardware-deadline constant directly"
         );
         const SPLIT: &str = include_str!("../syscall_split.rs");
         assert!(
             SPLIT.contains("crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,"),
-            "and the SAME constant is programmed as the hardware deadline"
+            "and the hardware deadline is still programmed from the constant itself"
+        );
+        // Code only: the timer route CITES the knob when recording what it measured, and prose
+        // naming the knob is not the knob reaching a deadline.
+        let split_code: alloc::string::String = SPLIT
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !split_code.contains("sched_quantum_ticks"),
+            "the override must never reach a hardware deadline — separating the units is the \
+             whole point, and routing the interval through it would tune the live cadence"
+        );
+        // The owner: unset means the shipped constant, so production cadence is untouched.
+        const BOOT_MOD: &str = include_str!("mod.rs");
+        let owner = BOOT_MOD
+            .split("pub fn sched_quantum_ticks() -> u64 {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the quantum owner");
+        assert!(
+            owner.contains("if override_ticks == 0 {")
+                && owner
+                    .contains("crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS"),
+            "unset must resolve to the shipped constant"
+        );
+        assert!(
+            BOOT_MOD.contains("SCHED_QUANTUM_TICKS_OVERRIDE: core::sync::atomic::AtomicU64 =\n    core::sync::atomic::AtomicU64::new(0);"),
+            "and the override must be default-off"
+        );
+        assert_eq!(
+            crate::kernel::boot::sched_quantum_ticks(),
+            crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+            "executed, not just read: an unconfigured kernel gets the delivered quantum"
         );
         // The quantum is counted in calls, i.e. in interrupts — measured, not asserted.
         let mut t = crate::kernel::scheduler_timer::Timer::new(5);
@@ -166809,7 +167137,7 @@ mod u9dispatchcpu3_recovery_chain {
             crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
             50_000_000,
             "on this build that is fifty million interrupts between preempting ticks — if this \
-             value changes, the recovery-trigger consequence recorded above changes with it"
+             value changes, the observability consequence recorded above changes with it"
         );
     }
 
@@ -167082,6 +167410,734 @@ mod u9dispatchcpu3_recovery_chain {
             asid_gate < idle && idle < take,
             "the AArch64 userspace boundary refuses an incarnation-less task BEFORE it reads a \
              context — no partial restore, no return through another task's address space"
+        );
+    }
+}
+
+/// U9-TIMER1 §4 — the converted preempting timer.
+///
+/// U9-TM shipped only the NON-preempting half of the split timer route and recorded the other
+/// half as unprovable: across 77 recorded profiles, zero `preempt=1`. U9-DISPATCH-CPU3 measured
+/// WHY — `Timer::new` and `program_timer_deadline` receive the SAME constant in incompatible
+/// units, so a preempting tick sits 50 million interrupts away on x86_64 and 3.1 million on
+/// AArch64. That was an observability limit, not a property of the branch, and §3 separates the
+/// two behind a default-off boot knob so the branch can be witnessed on a real hardware timer.
+///
+/// These cases hold the SOURCE contract. The live evidence is separate and is recorded in the
+/// stage record: on all three ports, at `yarm.sched_quantum_ticks=1`, with zero broad timer
+/// service in the same runs (x86_64 1 commit + 73 idle settlements; AArch64 2 cross-task commits
+/// with a real TTBR0/ASID switch; RISC-V 1508 cross-task commits).
+mod u9timer1_preempting_timer {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::yield_txn::{
+        SharedYieldOwners, YieldDecline, run_yield_transaction,
+    };
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+    const CPU: CpuId = CpuId(0);
+
+    /// The timer route, CODE only. Every one of these cases reasons about statement order or
+    /// about which calls a branch makes, and the route's comments quote the very calls and
+    /// dispositions the branches deliberately avoid — an anchor that matched prose would slice
+    /// the wrong region and assert the opposite of what is meant.
+    fn route() -> alloc::string::String {
+        SPLIT
+            .split("fn try_split_timer_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the timer route")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The route's three settlements, in the order it decides them, each as its own region.
+    fn settlements(code: &str) -> (usize, usize, usize) {
+        let commit = code
+            .find("if shared.timer_would_preempt_split_read(cpu) {")
+            .expect("the preempting branch");
+        let idle = code
+            .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {")
+            .expect("the idle-CPU arm");
+        let tail = code
+            .find("let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu)")
+            .expect("the non-preempting tail");
+        (commit, idle, tail)
+    }
+
+    // ── one policy ───────────────────────────────────────────────────────────────────────────
+
+    /// **The converted branch introduces NO scheduling policy of its own.**
+    ///
+    /// A preempting timer IS a yield with a different provenance: it re-enqueues the running task
+    /// at its priority tail, clears `current`, and defers the selection to the post-lock drain.
+    /// That is exactly what NR 0 publishes, so the branch drives the SAME transaction through the
+    /// SAME owners. §2 requires the broad and split adapters to share the policy while both are
+    /// needed, and this is what makes that true for the timer as well as for the syscall.
+    #[test]
+    fn the_preempting_branch_drives_the_existing_yield_transaction() {
+        let code = route();
+        let (commit, idle, _) = settlements(&code);
+        let branch = &code[commit..idle];
+        assert!(
+            branch.contains("yield_txn::SharedYieldOwners { shared }"),
+            "the timer must drive the transaction through the EXISTING split owners"
+        );
+        assert!(
+            branch.contains("run_yield_transaction(&mut owners, cpu)"),
+            "and through the existing transaction"
+        );
+        // No selection, requeue or transition of its own — every one of those belongs to the
+        // transaction or to the drain that consumes its deferral.
+        for banned in [
+            "dispatch_next_selection_on",
+            "queue_advance_select_step_split",
+            "queue_advance_commit_split",
+            "preempt_reenqueue",
+            "apply_dispatch_transition",
+            "enqueue_on_cpu",
+            "set_current",
+        ] {
+            assert!(
+                !branch.contains(banned),
+                "the timer branch must not `{banned}` — that is the transaction's or the \
+                 drain's, and a second copy is how two routes come to disagree"
+            );
+        }
+        // And the broad arm still reaches the identical transaction through its own adapter, so
+        // the two cannot diverge while both are needed.
+        const EXEC: &str = include_str!("exec_state.rs");
+        assert!(
+            EXEC.contains("yield_txn::BroadYieldOwners { kernel: self }")
+                && EXEC.contains("yield_txn::run_yield_transaction(&mut owners, cpu)"),
+            "the broad adapter must still share the policy"
+        );
+    }
+
+    /// **Exactly one tick, one claim and one re-arm on every settlement.**
+    ///
+    /// §2's first invariant. A route with three exits is exactly where a tick gets taken twice or
+    /// not at all, so it is counted per region rather than over the whole route.
+    #[test]
+    fn every_settlement_ticks_claims_and_rearms_exactly_once() {
+        let code = route();
+        let (commit, idle, tail) = settlements(&code);
+        for (name, region, tick_call) in [
+            (
+                "the preempting commit",
+                &code[commit..idle],
+                "scheduler_tick_split_mut(cpu)",
+            ),
+            (
+                "the idle-CPU settlement",
+                &code[idle..tail],
+                "scheduler_tick_split_mut(cpu)",
+            ),
+            (
+                "the non-preempting tail",
+                &code[tail..],
+                "scheduler_tick_if_no_switch_split_mut(cpu)",
+            ),
+        ] {
+            assert_eq!(
+                region.matches(tick_call).count(),
+                1,
+                "{name} must tick exactly once"
+            );
+            assert_eq!(
+                region.matches("acknowledge_interrupt(cpu, 0)").count(),
+                1,
+                "{name} must claim exactly once"
+            );
+            assert_eq!(
+                region.matches("program_timer_deadline(").count(),
+                1,
+                "{name} must re-arm exactly once"
+            );
+            // The same deadline constant the broad arm passes — the quantum override separates
+            // the interrupt count from the interval and must never reach the interval.
+            assert!(
+                region.contains("crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,"),
+                "{name} must re-arm from the shipped hardware constant"
+            );
+        }
+        // The declining paths tick nothing at all: they hand an unchanged CPU to the broad arm,
+        // which ticks and preempts exactly as it always has.
+        assert_eq!(
+            code.matches("return D::NotHandled;").count(),
+            5,
+            "five declines: not-a-timer, the proof-mode gate, an idle CPU whose run queue is NOT \
+             empty, a transaction decline, and the tail's fail-safe if the lookahead and the \
+             no-switch seam ever disagreed"
+        );
+    }
+
+    /// **No syscall-return encoding.** NR 0 finishes with `frame.set_ok(0, 0, 0)` because a yield
+    /// is a syscall whose caller observes a result. An interrupted task has no syscall in flight;
+    /// its PC is the interrupted instruction, and writing a result would corrupt the register
+    /// file it resumes with. The route cannot do this even by accident — it takes no frame.
+    #[test]
+    fn the_timer_route_cannot_encode_a_syscall_return() {
+        let signature = SPLIT
+            .split("fn try_split_timer_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .expect("the route's parameters");
+        assert!(
+            !signature.contains("TrapFrame"),
+            "the timer route must not take a frame at all"
+        );
+        let code = route();
+        assert!(
+            !code.contains("set_ok") && !code.contains("set_err"),
+            "and must write no syscall result"
+        );
+        // The outgoing context comes from the bridge's interrupt-semantics capture, which runs
+        // BEFORE this route and is keyed on the authoritative current tid — so the frame that is
+        // saved holds the interrupted PC and register file, not a syscall return.
+        // The bridge has more than one `QueueAdvanceCommitted` arm — the terminal fault commits
+        // too — so the timer's is located from the dispatch call that produces it, not from the
+        // first arm of that shape.
+        const ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        let timer_dispatch = ENTRY
+            .find("try_split_timer_dispatch(shared, cpu, is_timer)")
+            .expect("the timer dispatch");
+        let capture = ENTRY[..timer_dispatch]
+            .rfind("capture_outgoing_user_context_split(")
+            .expect("an outgoing capture ahead of the timer route");
+        assert!(
+            capture < timer_dispatch,
+            "the outgoing frame must be captured before the timer route can switch away from it"
+        );
+        // And that capture is the interrupt-semantics one: it reads the LIVE frame, keyed on the
+        // authoritative current tid, with no syscall decoding between it and the timer route.
+        let between = &ENTRY[capture..timer_dispatch];
+        assert!(
+            !between.contains("finalize_split_handled_syscall"),
+            "no syscall finalization may run between the capture and the timer route"
+        );
+        assert!(
+            ENTRY[..capture].contains("current_tid_authoritative(cpu)"),
+            "the capture must be keyed on the authoritative current tid"
+        );
+        // And the syscall-return finalizer is gated on the trap actually being a syscall, so a
+        // TimerInterrupt never reaches it.
+        assert!(
+            ENTRY.contains("matches!(decode_trap_context(context), TrapEvent::Syscall)"),
+            "syscall finalization must stay gated on a syscall"
+        );
+    }
+
+    // ── settlement and error cases ───────────────────────────────────────────────────────────
+
+    /// **Every decline is pre-mutation, so the broad fallback is always safe.**
+    ///
+    /// §2 forbids a broad fallback after mutation. The route's ordering is what makes that true:
+    /// the lookahead is asked before anything ticks, the transaction's every step refuses before
+    /// it writes, and the idle arm probes the run queue before it takes its tick. So a decline
+    /// hands the broad arm a CPU in exactly the state it would have found before this conversion
+    /// — no double tick, and no silently dropped quantum.
+    #[test]
+    fn no_decline_can_follow_a_mutation() {
+        let code = route();
+        let (commit, idle, tail) = settlements(&code);
+        // Nothing may tick or claim before the branch is chosen.
+        assert!(
+            code[..commit].find("scheduler_tick").is_none()
+                && code[..commit].find("acknowledge_interrupt").is_none(),
+            "the lookahead must precede every mutation"
+        );
+        // In the committing branch the decline is the transaction's own `Err`, which is
+        // unreachable once the transaction returned `Ok`.
+        let branch = &code[commit..idle];
+        let txn = branch
+            .find("run_yield_transaction(&mut owners, cpu)")
+            .expect("the transaction");
+        let tick = branch
+            .find("scheduler_tick_split_mut(cpu)")
+            .expect("the tick");
+        assert!(
+            txn < tick,
+            "nothing ticks until the transaction has committed"
+        );
+        // In the idle arm the run-queue probe and its decline both precede the tick.
+        let arm = &code[idle..tail];
+        let probe = arm
+            .find("runnable_count_on_cpu_split_read(cpu)")
+            .expect("the run-queue probe");
+        let decline = arm
+            .find("return D::NotHandled;")
+            .expect("the idle arm's decline");
+        let idle_tick = arm
+            .find("scheduler_tick_split_mut(cpu)")
+            .expect("the idle arm's tick");
+        assert!(
+            probe < decline && decline < idle_tick,
+            "the idle arm decides on the run queue before it takes its tick"
+        );
+        // And the tail's seam is atomic: it refuses without incrementing.
+        let seam = RUNTIME
+            .split("pub(crate) fn scheduler_tick_if_no_switch_split_mut(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the no-switch seam");
+        assert_eq!(
+            seam.matches("with_scheduler_split_mut").count(),
+            1,
+            "the tail's lookahead and tick must share ONE acquisition"
+        );
+        let _ = tail;
+    }
+
+    /// **A tick that changed nothing may not claim a queue advance — driven, not read.**
+    ///
+    /// The seam the non-preempting tail uses is executed against real scheduler state: it must
+    /// tick, and it must leave `current` and the run queue exactly as it found them. This is the
+    /// contract the `PostWorkCommitted` settlement rests on, so it is exercised rather than
+    /// inferred from the disposition name.
+    #[test]
+    fn a_non_preempting_tick_advances_no_queue() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.set_current_cpu(CPU).expect("cpu");
+            s.register_task_with_class(41000, TaskClass::App)
+                .expect("a");
+            s.register_task_with_class(41001, TaskClass::App)
+                .expect("b");
+            s.with_tcbs_mut(|tcbs| {
+                for t in tcbs.iter_mut().flatten() {
+                    if t.tid.0 == 41000 || t.tid.0 == 41001 {
+                        t.asid = Some(Asid(t.tid.0 as u16 - 40000));
+                    }
+                }
+            });
+            s.enqueue_on_cpu(CPU, 41000).expect("queued a");
+            s.enqueue_on_cpu(CPU, 41001).expect("queued b");
+            s.dispatch_next_task().expect("current");
+        });
+        // A quantum of 4, so the first three ticks are non-preempting. The production constant is
+        // counted in interrupts and is 50 million on this build; ticking it would measure the
+        // constant, not the contract.
+        k.with(|s| s.set_timer_for_test(crate::kernel::scheduler_timer::Timer::new(4)));
+        let before = k.with(|s| (s.current_tid_on_cpu(CPU), s.runnable_count_on_cpu(CPU)));
+        for i in 1..=3 {
+            let outcome = k
+                .scheduler_tick_if_no_switch_split_mut(CPU)
+                .expect("a non-preempting tick must be served, not declined");
+            assert!(
+                matches!(
+                    outcome,
+                    crate::runtime::SchedulerTickOutcome::NoSwitch { .. }
+                ),
+                "tick {i} must not preempt"
+            );
+            assert_eq!(
+                k.with(|s| (s.current_tid_on_cpu(CPU), s.runnable_count_on_cpu(CPU))),
+                before,
+                "tick {i} changed scheduler state — it may not settle as PostWorkCommitted"
+            );
+        }
+        // The fourth would preempt, and the seam declines it having incremented nothing.
+        assert!(
+            k.timer_would_preempt_split_read(CPU),
+            "the lookahead the route branches on must agree with the seam"
+        );
+        assert!(
+            k.scheduler_tick_if_no_switch_split_mut(CPU).is_none(),
+            "and the no-switch seam refuses it"
+        );
+        assert!(
+            k.timer_would_preempt_split_read(CPU),
+            "having incremented nothing: the refused tick is still pending"
+        );
+    }
+
+    /// **The idle settlement's admission is the RUN QUEUE, not `current`.**
+    ///
+    /// `NoCurrent` alone does not license settling a preempting tick in the split route. Two
+    /// states produce it, and the broad arm treats them differently — `yield_current` skips the
+    /// `Running -> Runnable` step (there is no outgoing task) and falls through to
+    /// `on_preempt_current_cpu_selection()`, which answers `None` for an empty queue and DEQUEUES
+    /// for a non-empty one. Absorbing the second would silently drop a dispatch, so the route
+    /// declines it. Both states are built and the discriminator is executed.
+    #[test]
+    fn the_idle_settlement_is_admitted_by_an_empty_run_queue() {
+        // (a) idle, empty queue — the state the broad arm does nothing for.
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.set_current_cpu(CPU).expect("cpu");
+            s.register_task_with_class(41100, TaskClass::App)
+                .expect("t");
+            s.enqueue_on_cpu(CPU, 41100).expect("queued");
+            s.dispatch_next_task().expect("current");
+            let _ = s.block_current_cpu();
+        });
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            None,
+            "fixture: the task blocked and cleared `current`"
+        );
+        assert_eq!(
+            k.runnable_count_on_cpu_split_read(CPU),
+            0,
+            "and left nothing runnable — this is the settleable state"
+        );
+        let mut owners = SharedYieldOwners { shared: &k };
+        assert_eq!(
+            run_yield_transaction(&mut owners, CPU),
+            Err(YieldDecline::NoCurrent),
+            "the transaction declines exactly here, and does so pre-mutation"
+        );
+
+        // (b) idle, NON-empty queue — the state that still belongs to the broad arm.
+        k.with(|s| {
+            s.register_task_with_class(41101, TaskClass::App)
+                .expect("u");
+            s.enqueue_on_cpu(CPU, 41101).expect("queued");
+        });
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            None,
+            "still no current task"
+        );
+        assert!(
+            k.runnable_count_on_cpu_split_read(CPU) > 0,
+            "but now there IS work — the same decline, a different settlement"
+        );
+        let mut owners = SharedYieldOwners { shared: &k };
+        assert_eq!(
+            run_yield_transaction(&mut owners, CPU),
+            Err(YieldDecline::NoCurrent),
+            "the transaction cannot tell the two apart: the run queue is what discriminates"
+        );
+    }
+
+    // ── the remaining timer declines, derived from source ────────────────────────────────────
+
+    /// **Every remaining route into the broad timer arm, enumerated from source.**
+    ///
+    /// §4 requires the inventory to be derived independently of marker counts, and forbids
+    /// claiming the TimerInterrupt family closed while any supported branch still reaches broad
+    /// dispatch. It is not closed, and this is the complete list of what is left:
+    ///
+    /// | decline | owner | when |
+    /// |---|---|---|
+    /// | `proof_hooks_armed` | the route's own gate | any of the five timer-only `maybe_run_*` proof knobs armed |
+    /// | `d6_genuine_off` / `not_bsp` | `yield_deferral_arch_gate` | x86_64 under `d6_switch_proof`/`d6_switch_a`; non-bootstrap CPU on AArch64/RISC-V — ONE variant, two per-architecture spellings |
+    /// | `already_deferred` | the one-shot deferral | some route already holds this CPU's Yield deferral |
+    /// | `no_trap_drainer` | `TerminalAdmissionRefusal` | the shared trap drain is not active on this CPU |
+    /// | `cpu_out_of_range` | `TerminalAdmissionRefusal` | CPU index beyond `MAX_CPUS` |
+    /// | `multi_cpu` | `TerminalAdmissionRefusal` | more than one dispatching CPU (`yarm.ap_user_dispatch`) |
+    /// | `not_running` | `apply_preempt_outgoing_locked` | the interrupted task is not `Running` |
+    /// | `reenqueue_failed` | the scheduler | the re-enqueue was refused; `current` was restored |
+    /// | `no_current_runnable` | the route's run-queue probe | idle CPU whose run queue is NOT empty |
+    ///
+    /// The first and last are the route's own; the middle seven are `YieldDecline`'s, and the
+    /// case enumerates the enum so a new variant cannot be added without landing here.
+    #[test]
+    fn every_remaining_timer_decline_is_inventoried() {
+        // The route's own two, by their exact emitted reasons.
+        let code = route();
+        assert!(
+            code.contains("reason=proof_hooks_armed"),
+            "the proof-mode gate must name itself"
+        );
+        assert!(
+            code.contains("reason=no_current_runnable"),
+            "and so must the idle-CPU-with-work decline"
+        );
+
+        // The transaction's, from the enum rather than from a log. Every variant either has a
+        // reason string in the shared vocabulary or is settled by the route itself.
+        let decls = YIELD_TXN
+            .split("pub(crate) enum YieldDecline {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the decline enum");
+        let mut variants = alloc::vec::Vec::new();
+        for line in decls.lines() {
+            let t = line.trim();
+            if t.starts_with("//") || t.starts_with('/') || t.is_empty() {
+                continue;
+            }
+            if let Some(name) = t.split(['(', ',']).next()
+                && !name.is_empty()
+                && name.chars().next().is_some_and(|c| c.is_uppercase())
+            {
+                variants.push(alloc::string::String::from(name));
+            }
+        }
+        assert_eq!(
+            variants.len(),
+            6,
+            "the inventory covers exactly the declared variants, found {variants:?}"
+        );
+        for v in &variants {
+            assert!(
+                [
+                    "NoCurrent",
+                    "ArchGateOff",
+                    "DeferralHeld",
+                    "RouteNotAdmitted",
+                    "NotRunning",
+                    "ReenqueueRefused",
+                ]
+                .contains(&v.as_str()),
+                "unknown decline `{v}` — the timer inventory must be extended with it"
+            );
+        }
+        // `NoCurrent` is the only one the route settles rather than declines, and only for an
+        // empty run queue. The other five reach the broad arm through `legacy_reason`.
+        // `ArchGateOff` is the one variant with TWO spellings, chosen per architecture, and both
+        // are in the inventory because both are reachable on a supported build.
+        for reason in [
+            "\"d6_genuine_off\"",
+            "\"not_bsp\"",
+            "\"already_deferred\"",
+            "\"not_running\"",
+            "\"reenqueue_failed\"",
+        ] {
+            assert!(
+                YIELD_TXN.contains(reason),
+                "the declared reason {reason} must exist in the shared vocabulary"
+            );
+        }
+        const BOOT_MOD: &str = include_str!("mod.rs");
+        for reason in ["\"no_trap_drainer\"", "\"multi_cpu\""] {
+            assert!(
+                BOOT_MOD.contains(reason),
+                "the topology reason {reason} is owned by TerminalAdmissionRefusal"
+            );
+        }
+        // The five timer-only proof hooks are NOT relocated by this stage, so an armed profile
+        // still takes the whole unchanged broad arm. That is the first row of the table, and it
+        // is what stops any claim that the family is closed.
+        const FAULT: &str = include_str!("fault_state.rs");
+        let arm = FAULT
+            .split("Trap::TimerInterrupt => {")
+            .nth(1)
+            .and_then(|s| s.split("\n            Trap::").next())
+            .expect("the broad timer arm");
+        assert!(
+            arm.contains("self.maybe_run_"),
+            "the broad arm still owns the diagnostic hooks — the family is NOT closed"
+        );
+    }
+
+    /// **Both bridges skip the broad dispatcher for a committed preemption, and neither can
+    /// reach it afterwards.**
+    ///
+    /// §2 forbids a broad fallback after mutation, and a committed preemption is the sharpest
+    /// case: the outgoing task has already been re-enqueued and `current` cleared, so a broad
+    /// dispatch would select against state the drain is about to act on.
+    #[test]
+    fn both_bridges_skip_broad_dispatch_for_a_committed_preemption() {
+        for (name, src) in [
+            ("shared", include_str!("../../arch/trap_entry.rs")),
+            ("riscv", include_str!("../../arch/riscv64/trap.rs")),
+        ] {
+            let arm = src
+                .find("SplitDispatchDisposition::QueueAdvanceCommitted => {")
+                .unwrap_or_else(|| {
+                    src.find(
+                        "crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted => {",
+                    )
+                    .unwrap_or_else(|| panic!("{name} bridge: the timer's committed arm"))
+                });
+            let after = &src[arm..];
+            let set = after
+                .find("queue_advance_committed = true;")
+                .unwrap_or_else(|| panic!("{name} bridge: the arm must declare the skip"));
+            let why = after
+                .find("reason=timer_preempt_committed")
+                .unwrap_or_else(|| panic!("{name} bridge: and must say why"));
+            assert!(
+                set < why,
+                "{name} bridge: the flag is set, then reported — the report decides nothing"
+            );
+            // The gate on the broad acquisition consults the flag, and the acquisition follows it.
+            let gate = src
+                .find("if queue_advance_committed")
+                .unwrap_or_else(|| panic!("{name} bridge: the broad-dispatch gate"));
+            let call = src
+                .find(".with_cpu(cpu, |kernel| {")
+                .unwrap_or_else(|| panic!("{name} bridge: the broad acquisition"));
+            assert!(
+                gate < call,
+                "{name} bridge: the gate must precede the acquisition"
+            );
+        }
+    }
+
+    /// **The converted route publishes the async-preemption tag, and preserves the syscall
+    /// lane — driven against real TCB state, not read out of source.**
+    ///
+    /// RISC-V names three mutually exclusive resume conventions and reads the third from an
+    /// EXPLICIT tag. The tag is published by the broad `snapshot_async_preempted_current`, which
+    /// that bridge calls INSIDE the broad handler — a lock the converted preempting timer never
+    /// takes. So the converted route owes the tag itself, through the rank-2 split twin, and this
+    /// exercises the property the live resume depends on:
+    ///
+    /// * the register file, PC and SP are captured from the interrupt frame;
+    /// * the SYSCALL-ARGUMENT LANE is left exactly as it was — the ordinary resume arms treat it
+    ///   as authoritative for `a0..a5`, so an interrupted task's mid-computation `a0` must never
+    ///   land there;
+    /// * the tag names the exact `{tid, asid, generation}` and the generation advances.
+    ///
+    /// Measured live before the repair: the process manager was preempted mid-startup on the
+    /// RISC-V exit oracle, resumed through the STARTUP arm with a zeroed argument mirror
+    /// reinstalled over `a0..a5`, and never re-entered its receive loop.
+    #[test]
+    fn the_converted_route_publishes_an_async_tag_and_preserves_the_syscall_lane() {
+        use crate::kernel::task::AsyncResumeClass;
+
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.set_current_cpu(CPU).expect("cpu");
+            s.register_task_with_class(41200, TaskClass::App)
+                .expect("t");
+        });
+        // A task with a live incarnation, a saved syscall lane, and a register file.
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == 41200)
+                    .unwrap();
+                t.asid = Some(Asid(7));
+                t.user_context.arg0 = 0xA11;
+                t.user_context.arg1 = 0xA22;
+                t.user_context.arg2 = 0xA33;
+                t.user_context.arg3 = 0xA44;
+                t.user_context.arg4 = 0xA55;
+                t.user_context.arg5 = 0xA66;
+            });
+        });
+        let generation_before = k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == 41200)
+                    .unwrap()
+                    .async_preempt_generation
+            })
+        });
+
+        // The INTERRUPT frame: a PC and SP that are not a syscall return, a recognisable register
+        // file, and argument lanes that are ZERO — which is exactly what the RISC-V bridge builds
+        // for a timer, since it populates them only for EXC_USER_ECALL.
+        let mut frame = crate::kernel::trapframe::TrapFrame::zeroed();
+        frame.set_saved_pc(0x4321_0000);
+        frame.set_saved_sp(0x7fff_0000);
+        for n in 1..32usize {
+            frame.set_user_gpr(n, 0xC000 + n);
+        }
+        assert_eq!(
+            frame.arg(0),
+            0,
+            "fixture: a timer frame has no argument lane"
+        );
+
+        assert!(
+            k.snapshot_async_preempted_split(41200, &frame),
+            "the converted route must be able to publish the tag off the broad lock"
+        );
+
+        k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                let t = tcbs.iter().flatten().find(|t| t.tid.0 == 41200).unwrap();
+                // The interrupted context landed.
+                assert_eq!(t.user_context.instruction_ptr.0, 0x4321_0000);
+                assert_eq!(t.user_context.stack_ptr.0, 0x7fff_0000);
+                assert_eq!(t.user_context.user_gprs[10], 0xC000 + 10);
+                assert_eq!(t.user_context.user_gprs[31], 0xC000 + 31);
+                // …and the syscall lane did NOT.
+                assert_eq!(t.user_context.arg0, 0xA11, "the syscall lane must survive");
+                assert_eq!(t.user_context.arg1, 0xA22);
+                assert_eq!(t.user_context.arg2, 0xA33);
+                assert_eq!(t.user_context.arg3, 0xA44);
+                assert_eq!(t.user_context.arg4, 0xA55);
+                assert_eq!(t.user_context.arg5, 0xA66);
+                // The tag names this exact incarnation, at an advanced generation.
+                let tag = t.async_preempted.expect("a tag must be published");
+                assert_eq!(tag.tid, 41200);
+                assert_eq!(tag.asid, Asid(7));
+                assert_eq!(tag.preempt_generation, generation_before + 1);
+                assert!(tag.matches_tcb(t), "and it must verify against its own TCB");
+            });
+        });
+
+        // The consumer accepts it for the resolved incarnation, exactly once.
+        assert_eq!(
+            k.take_async_preempt_for_incoming_split(41200, Some(Asid(7))),
+            AsyncResumeClass::AsyncPreempted,
+            "the resume boundary must be authorized to restore verbatim"
+        );
+        assert_eq!(
+            k.take_async_preempt_for_incoming_split(41200, Some(Asid(7))),
+            AsyncResumeClass::Ordinary,
+            "and the authorization is spent — one tag, one restore"
+        );
+
+        // A replacement incarnation that reused the TID is refused, not silently downgraded.
+        assert!(k.snapshot_async_preempted_split(41200, &frame));
+        assert_eq!(
+            k.take_async_preempt_for_incoming_split(41200, Some(Asid(9))),
+            AsyncResumeClass::Refused("identity_mismatch"),
+            "a different incarnation must be refused fail-closed"
+        );
+
+        // The idle identity publishes nothing at all.
+        assert!(
+            !k.snapshot_async_preempted_split(0, &frame),
+            "tid 0 never returns to U-mode through a saved user context"
+        );
+    }
+
+    /// **CENSUS: the conversion adds no broad acquisition.**
+    ///
+    /// Every owner the converted branch touches is a rank-1 split seam. The expected census is
+    /// unchanged at 2 `with_cpu` and 0 `with_broad` — `tests/broad_lock_census_guard.rs` is the
+    /// authority on the count; this holds the narrower claim that the NEW seams are split ones,
+    /// which is the property that keeps the count where it is.
+    #[test]
+    fn the_conversion_introduces_no_broad_acquisition() {
+        let code = route();
+        assert!(
+            !code.contains(".with(|") && !code.contains("with_cpu("),
+            "the timer route must open no broad acquisition"
+        );
+        for seam in [
+            "pub(crate) fn timer_would_preempt_split_read",
+            "pub(crate) fn set_scheduler_quantum_split_mut",
+        ] {
+            let body = RUNTIME
+                .split(seam)
+                .nth(1)
+                .and_then(|s| s.split("\n    }").next())
+                .unwrap_or_else(|| panic!("the seam `{seam}`"));
+            assert!(
+                body.contains("with_scheduler_split_mut")
+                    && !body.contains(".with(|")
+                    && !body.contains("with_cpu("),
+                "`{seam}` must be a rank-1 scheduler-domain seam"
+            );
+        }
+        // And the committed marker says so in the log, so a live run reports it too.
+        assert!(
+            code.contains("broad_lock=0"),
+            "the committed marker must state that no broad lock was taken"
         );
     }
 }

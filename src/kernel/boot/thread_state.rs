@@ -2469,64 +2469,14 @@ impl KernelState {
         let Some(tid) = self.current_tid() else {
             return false;
         };
-        // tid 0 is the idle/kernel identity: it never returns to U-mode through a saved user
-        // context, so there is nothing to preserve and a tag would be meaningless.
-        if tid == 0 {
-            return false;
-        }
+        // U9-TIMER1: the body is now `task::publish_async_preempt_snapshot`, shared with the
+        // rank-2 split owner the converted preempting timer uses. Nothing about the decision
+        // changed — the argument-mirror preservation, the generation bump and the tag-last
+        // ordering all live there — and sharing it is what stops the two snapshot boundaries
+        // from ever disagreeing about what `a0..a7` mean.
         let captured = frame.capture_user_context();
         self.with_tcbs_mut(|tcbs| {
-            let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) else {
-                return false;
-            };
-            // A user task always has an ASID; without one the exact-incarnation check the tag
-            // depends on cannot be formed, so refuse rather than publish an unverifiable tag.
-            let Some(asid) = tcb.asid else {
-                return false;
-            };
-            // `checked_add`: an exhausted counter refuses rather than wrapping into a value an
-            // ancient tag could match.
-            let Some(next_generation) = tcb.async_preempt_generation.checked_add(1) else {
-                return false;
-            };
-            // Context FIRST — but the SYSCALL-ARGUMENT MIRROR is preserved, not overwritten.
-            //
-            // `UserRegisterContext` carries two mirrors of userspace state: `user_gprs` (the raw
-            // register file) and `arg0..arg5` (the decoded syscall lane). They mean different
-            // things and have different owners. The asynchronous resume reads `user_gprs`; the
-            // ORDINARY resume arms — fresh startup and syscall/D2 continuation — treat `arg0..5`
-            // as authoritative for `a0..a5`.
-            //
-            // Capturing a timer frame wholesale would write both, and that is a real defect
-            // rather than a tidy-up: an interrupted task's mid-computation `a0` would land in the
-            // syscall lane, and any later ORDINARY resume of that task — a wake from a blocked
-            // receive, say — would install it as the syscall result. Measured live as
-            // `core::fmt` faulting on `ld a1, 0(a0)` with `a0 = 0x10003`, an ordinary
-            // intermediate value promoted to a pointer. Keeping the lane untouched leaves each
-            // mirror owned by exactly the paths that write and read it.
-            let preserved_syscall_lane = (
-                tcb.user_context.arg0,
-                tcb.user_context.arg1,
-                tcb.user_context.arg2,
-                tcb.user_context.arg3,
-                tcb.user_context.arg4,
-                tcb.user_context.arg5,
-            );
-            tcb.user_context = captured;
-            tcb.user_context.arg0 = preserved_syscall_lane.0;
-            tcb.user_context.arg1 = preserved_syscall_lane.1;
-            tcb.user_context.arg2 = preserved_syscall_lane.2;
-            tcb.user_context.arg3 = preserved_syscall_lane.3;
-            tcb.user_context.arg4 = preserved_syscall_lane.4;
-            tcb.user_context.arg5 = preserved_syscall_lane.5;
-            tcb.async_preempt_generation = next_generation;
-            // … tag LAST, so it can never name a half-written register file.
-            tcb.async_preempted = Some(crate::kernel::task::AsyncPreemptedContext {
-                tid,
-                asid,
-                preempt_generation: next_generation,
-            });
-            true
+            crate::kernel::task::publish_async_preempt_snapshot(tcbs, tid, captured)
         })
     }
 

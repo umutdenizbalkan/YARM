@@ -810,8 +810,26 @@ pub fn handle_trap_entry_shared(
                 // architecture tail still runs the production timeout pipeline.
                 post_work_committed = true;
             }
+            SplitDispatchDisposition::QueueAdvanceCommitted => {
+                // U9-TIMER1: the PREEMPTING tick. The route ticked once, acked, re-armed and
+                // published the same queue-advance deferral NR 0 publishes, so the broad
+                // dispatcher is skipped for the same reason it is skipped for a committed yield —
+                // the caller is no longer current on this CPU and the post-lock drain owes the
+                // switch.
+                //
+                // The outgoing user context was captured ABOVE, from the live frame, before this
+                // route ran: for an interrupt that frame holds the interrupted PC and register
+                // file, which is exactly what must be restored when the task is resumed. No
+                // syscall-return encoding runs — `finalize_split_handled_syscall` is reached only
+                // from the syscall branch, which a TimerInterrupt never enters.
+                queue_advance_committed = true;
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=timer_preempt_committed",
+                    cpu.0
+                );
+            }
             other => {
-                // The timer route produces only those two. Anything else would mean a
+                // The timer route produces only those three. Anything else would mean a
                 // non-preempting tick had claimed a terminal transition.
                 crate::yarm_log!(
                     "TIMER_SPLIT_UNEXPECTED_DISPOSITION cpu={} value={:?}",
@@ -820,7 +838,7 @@ pub fn handle_trap_entry_shared(
                 );
                 debug_assert!(
                     false,
-                    "the timer route yields NotHandled or PostWorkCommitted"
+                    "the timer route yields NotHandled, PostWorkCommitted or QueueAdvanceCommitted"
                 );
             }
         }

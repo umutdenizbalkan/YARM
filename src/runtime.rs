@@ -2727,6 +2727,38 @@ impl SharedKernel {
     /// for "the quantum expired": a `NoSwitch` tick must not publish a preemption, and a
     /// `Preempt` tick uses the EXISTING Stage 192B publication and the U9-QA selection owner —
     /// this seam introduces no requeue or dequeue path of its own.
+    /// U9-TIMER1 §1 — **would the next tick preempt?** rank 1, non-mutating.
+    ///
+    /// The lookahead half of [`Self::scheduler_tick_if_no_switch_split_mut`], exposed on its own so
+    /// the timer route can BRANCH before it commits anything. That ordering is what keeps the
+    /// converted route's declines free: the preempting branch runs its whole transaction — every
+    /// step of which refuses before mutating — and only then takes the single tick. A route that
+    /// ticked first and then declined would have to choose between double-ticking in the broad arm
+    /// and silently dropping a quantum's preemption; asking first means a decline falls back to the
+    /// unchanged broad arm having changed exactly nothing, which is the same property the
+    /// non-preempting refusal has always had.
+    ///
+    /// Nothing else ticks this CPU's timer, and interrupts are masked for the whole trap, so the
+    /// answer cannot go stale between this read and the tick that follows it.
+    pub(crate) fn timer_would_preempt_split_read(&self, _cpu: CpuId) -> bool {
+        self.with_scheduler_split_mut(|sched| sched.timer.would_preempt_next())
+    }
+
+    /// U9-TIMER1 §3 — install a quantum on the LIVE scheduler timer. Rank 1, one acquisition.
+    ///
+    /// The construction-time read in `bootstrap_state` covers the port whose command line is
+    /// captured before the kernel state is built (x86_64). AArch64 and RISC-V capture theirs
+    /// afterwards, so on those the timer already exists by the time the knob is parsed and the
+    /// value has to be installed rather than constructed. Both routes resolve the SAME owner,
+    /// `boot::sched_quantum_ticks()`, so they cannot disagree.
+    ///
+    /// This touches only the interrupt-count quantum. The hardware interval is programmed from
+    /// `BOOTSTRAP_TIMER_DEADLINE_TICKS` directly and is not reachable from here, so every timer
+    /// interrupt still arrives on its production schedule.
+    pub(crate) fn set_scheduler_quantum_split_mut(&self, quantum_ticks: u64) {
+        self.with_scheduler_split_mut(|sched| sched.timer.set_quantum(quantum_ticks));
+    }
+
     pub(crate) fn scheduler_tick_split_mut(&self, cpu: CpuId) -> SchedulerTickOutcome {
         let (tick, should_preempt) =
             self.with_scheduler_split_mut(|sched| sched.timer.tick_and_check());
@@ -2739,13 +2771,23 @@ impl SharedKernel {
 
     /// U9-TM §4 — tick ONLY if this tick would not preempt, atomically.
     ///
-    /// No existing profile witnesses a timer-driven preemption: across 77 recorded profiles on
-    /// all three architectures, `YARM_SCHED_TICK ... preempt=1` occurs zero times and no
-    /// `YIELD_DISPATCH_DEQUEUE_OK` is ever produced by a timer. So the preempting branch of a
-    /// split timer route cannot be live-proven, and shipping it unproven is not acceptable.
+    /// **U9-TIMER1 correction.** U9-TM recorded that no existing profile witnessed a timer-driven
+    /// preemption — across 77 recorded profiles on all three architectures, `YARM_SCHED_TICK ...
+    /// preempt=1` occurred zero times — and concluded that the preempting branch of a split timer
+    /// route could not be live-proven, so this seam declined it to the broad arm. That conclusion
+    /// held only because the quantum and the hardware deadline were the same constant in
+    /// incompatible units, which put a preempting tick millions of interrupts away on two of the
+    /// three ports; it was an observability limit, not a property of the branch. U9-TIMER1 §3
+    /// separates the two, and the preempting branch is now live-witnessed on all three ports and
+    /// shipped in `try_split_timer_into_frame`.
     ///
-    /// This is the honest alternative. The lookahead and the tick happen inside ONE rank-1
-    /// acquisition, so the answer cannot go stale between them:
+    /// So this seam's `None` is no longer the route's answer to a preempting tick — the route
+    /// branches on [`Self::timer_would_preempt_split_read`] before reaching here, and a preempting
+    /// tick never gets this far. It is kept as the fail-safe it always was: if the lookahead and
+    /// this seam ever disagreed, this refuses having ticked nothing.
+    ///
+    /// The lookahead and the tick happen inside ONE rank-1 acquisition, so the answer cannot go
+    /// stale between them:
     ///
     /// * would preempt -> `None`, with NOTHING incremented and nothing mutated. The caller falls
     ///   through to the unchanged broad arm, which ticks and preempts exactly as it always has.
@@ -4315,6 +4357,34 @@ impl SharedKernel {
     ) -> crate::kernel::task::AsyncResumeClass {
         self.with_task_tcbs_split_mut(|tcbs| {
             crate::kernel::task::classify_and_take_async_resume(tcbs, incoming_tid, incoming_asid)
+        })
+    }
+
+    /// U9-TIMER1 — PUBLISH an async-preemption snapshot off the broad lock, for the EXACT
+    /// outgoing identity the caller authenticated. Rank 2, one acquisition.
+    ///
+    /// The split twin of `KernelState::snapshot_async_preempted_current`, delegating to the same
+    /// `task::publish_async_preempt_snapshot`, so the two boundaries cannot disagree about what
+    /// `a0..a7` mean on a resume.
+    ///
+    /// It exists because the RISC-V bridge takes its snapshot INSIDE the broad handler, at the
+    /// earliest correct point — strictly before the scheduler tick that can yield. The converted
+    /// preempting timer runs entirely before that lock is taken, so on that route the broad
+    /// snapshot never fires, no tag is published, and the resume falls back to the STARTUP
+    /// argument lane over a live computation. Measured on the RISC-V exit oracle: the process
+    /// manager resumed with `a0..a5` reinstalled from a zeroed argument mirror and stalled init.
+    ///
+    /// The identity is an argument rather than `current`, for the same reason the consumer's is:
+    /// this runs at a point where `current` may already have been cleared by the transaction, and
+    /// a tag that named the wrong task would be spent without effect.
+    pub(crate) fn snapshot_async_preempted_split(
+        &self,
+        tid: u64,
+        frame: &crate::kernel::trapframe::TrapFrame,
+    ) -> bool {
+        let captured = frame.capture_user_context();
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::task::publish_async_preempt_snapshot(tcbs, tid, captured)
         })
     }
 

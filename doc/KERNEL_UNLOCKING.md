@@ -15638,3 +15638,271 @@ resumed=1`, sealing with `duplicate_continuations=0 wrong_cpu_continuations=0`.
   direct consumers of the mark seam remain. No family was migrated, as instructed.
 
 * **CENSUS-DELTA vs `8265461`: 0.**
+
+## U9-TIMER1 — retire preempting-timer broad dispatch
+
+**Base:** `origin/main = a556bbd`. Canonical 203A/203C; named prerequisite for U9/204E. The
+corrected 2/0/2 census, explicit CPU authority, membership rules, authority retirement, the AP Yield
+migration and CPU3's missing-`Running` repair are all preserved. **U9 remains OPEN.**
+
+**Delivered:** the ordinary preempting `TimerInterrupt` — every tick that preempts a running task —
+now executes through subsystem owners on all three ports. Zero of them reach the terminal broad
+dispatcher, measured on x86_64, AArch64 and RISC-V. **CENSUS-DELTA: 0.**
+
+### §1 — What the broad timer path actually did, and why the branch was declared unprovable
+
+U9-TM shipped the non-preempting half of `try_split_timer_into_frame` and declared the other half
+unprovable: across 77 recorded profiles on all three architectures, `YARM_SCHED_TICK … preempt=1`
+occurred zero times, so `scheduler_tick_if_no_switch_split_mut` refused every preempting tick and the
+terminal broad dispatcher served it.
+
+**That zero was an observability limit, not a property of the branch.** U9-DISPATCH-CPU3 measured the
+cause and recorded it as a residual: `Timer::new` and `program_timer_deadline` receive the **same
+constant in incompatible units**. `tick_and_check` is called once per interrupt, so the constant is a
+count of interrupts on one side and a hardware interval on the other:
+
+| | constant | a preempting tick arrives after |
+|---|---|---|
+| RISC-V | 10 | 10 timer interrupts |
+| AArch64 | 3 125 000 | 3.1 million timer interrupts |
+| x86_64 | 50 000 000 | 50 million timer interrupts |
+
+No qualification run is long enough to observe one on two of the three ports. §3 separates the units.
+
+**The outcomes of the broad arm, enumerated.** Ack → bootstrap guard → `tick_scheduler_timer()` →
+`process_ipc_timeout_deadlines` → five timer-only `maybe_run_*` proof hooks → `if should_preempt {
+yield_current()? }` → `program_timer_deadline`. Inside `yield_current`, a preempting tick reaches
+`run_yield_transaction` through `BroadYieldOwners`, and its behaviour splits three ways — which is
+what the conversion has to preserve:
+
+| this CPU | what `yield_current` does |
+|---|---|
+| has a current task | the transaction commits: `Running → Runnable`, re-enqueue at the priority tail, clear `current`, skip the in-lock dispatch |
+| idle, run queue **empty** | `NoCurrent`, silent; the `Running → Runnable` step is skipped (`outgoing_tid` is `None`); `on_preempt_current_cpu_selection()` answers `None`; the `else` arm is guarded by `if let Some(tid) = outgoing_tid` — **nothing happens at all** |
+| idle, run queue **non-empty** | `NoCurrent`, but the selection **dequeues** and the in-lock path dispatches onto the idle CPU |
+
+**A preempting timer IS a yield with a different provenance.** It re-enqueues the running task at its
+priority tail, clears `current`, and defers the selection to the post-lock drain — exactly what NR 0
+publishes. So no new policy is needed: the converted branch drives the SAME
+`run_yield_transaction` through the SAME `SharedYieldOwners`, and the broad adapter keeps driving the
+identical transaction through `BroadYieldOwners`, so the two cannot come to disagree while both are
+needed.
+
+### §2 — The conversion
+
+`try_split_timer_into_frame` now has three settlements, each naming its own post-state:
+
+| tick | this CPU | what runs | disposition |
+|---|---|---|---|
+| preempting | has a current task | `run_yield_transaction`, one tick, ack, re-arm | `QueueAdvanceCommitted` — the post-lock drain performs the switch |
+| preempting | idle, queue empty | one tick, ack, re-arm | `PostWorkCommitted` — there is nothing to preempt |
+| non-preempting | either | the unchanged atomic no-switch seam, one tick, ack, re-arm | `PostWorkCommitted` |
+
+**The ordering is the point.** `timer_would_preempt_split_read` (rank 1, non-mutating) is asked
+**before** anything ticks. Every step of the transaction refuses before it writes, so a decline
+reaches the unchanged broad arm having mutated **nothing** — the same property the non-preempting
+refusal always had. Ticking first and declining afterwards would force a choice between
+double-ticking in the broad arm and silently dropping a quantum's preemption; neither is acceptable,
+so it is not the order.
+
+**No syscall-return encoding.** NR 0 finishes with `frame.set_ok(0, 0, 0)` because a yield is a
+syscall whose caller observes a result. An interrupted task has no syscall in flight: its PC is the
+interrupted instruction. The route **cannot** write a result even by accident — it takes no frame —
+and the outgoing context is supplied by the bridge's existing capture, which runs ahead of the timer
+route, reads the live frame keyed on `current_tid_authoritative`, and copies all 32 GPRs plus PC/SP.
+`finalize_split_handled_syscall` stays gated on `TrapEvent::Syscall`, which a `TimerInterrupt` never
+is.
+
+**The idle settlement is admitted by the RUN QUEUE, not by `current`.** `NoCurrent` alone does not
+license settling the tick: the third row of §1's table is a real queue-advancing consumer, and
+absorbing it would silently drop a dispatch. So the route probes `runnable_count_on_cpu_split_read`
+and declines a non-empty queue under its own reason, `no_current_runnable` — before it ticks.
+
+Both bridges (`arch/trap_entry.rs`, `arch/riscv64/trap.rs`) gained one `QueueAdvanceCommitted` arm
+emitting `QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED … reason=timer_preempt_committed`. No scheduler lock
+sharding, no new scheduling policy, no second drain, and no broad fallback after mutation.
+
+### §3 — Separating the quantum from the hardware interval
+
+`boot::sched_quantum_ticks()` is now the single quantum owner: unset it returns
+`BOOTSTRAP_TIMER_DEADLINE_TICKS` verbatim, so **an unconfigured boot has the delivered cadence** and
+the §1 residual is separated rather than hidden. `yarm.sched_quantum_ticks=N` is the §3-authorised
+default-off override. It changes **only** the interrupt count that makes a quantum — the hardware
+interval is programmed from the constant directly and is not reachable from the override — so every
+interrupt still arrives on its production schedule and is serviced by the production route.
+
+It covers both boot orders, because the three ports capture their command line at different points
+relative to kernel-state construction: x86_64 captures in `prepare_arch_boot`, ahead of
+`init_shared_static*`, so the construction-time read picks it up (`route=construction`); AArch64 and
+RISC-V capture theirs afterwards, so `install_sched_quantum_on_live_timer` installs it on the live
+timer through the rank-1 `set_scheduler_quantum_split_mut`. Both resolve the same owner.
+
+### §4 — Live evidence, three consecutive runs per architecture
+
+Every figure below is from a **matched pair**: base `a556bbd` built with the same quantum forced at
+`Timer::new`, and head `8cef214` with `yarm.sched_quantum_ticks`. `YARM_SCHED_TICK` is **not** used
+as a measure — it self-limits to four emissions per boot (`log_seq < 4`), exactly the
+marker-counting §4 forbids; broad service is read from the split route's own declines instead.
+
+| port | quantum | preempting ticks → **broad** (base) | → **broad** (head) | split commits | split idle settlements | smoke |
+|---|---|---|---|---|---|---|
+| x86_64 | 1 | 73, 74, 74 | **0, 0, 0** | 1, 1, 1 | 73, 73, 73 | pass ×3 both |
+| AArch64 | 8 | 2, 2, 2 | **0, 0, 0** | 2, 2, 2 | 0 | pass ×3 both |
+| RISC-V | 8 | 33, 151, 153 | 146, 81, 148 — **all kernel-origin** | 2, 2, 2 | 0 | pass ×3 both |
+| RISC-V | **production default (10)** | — | 63, 55, 13 — kernel-origin | **1, 1, 2** | 0 | pass ×3 |
+
+The last row matters on its own: RISC-V's shipped quantum is 10 INTERRUPTS, so on that port the
+converted branch is live **with no knob at all**, and the exit-current-task oracle drives 12–13
+genuine preemptions per run through it.
+
+**Every commit is user-origin; every RISC-V decline is kernel-origin.** Classified by trap provenance
+rather than by count: on RISC-V all 154 declines are preceded by
+`RISCV_S_MODE_TIMER_ACCEPTED … spp=1`, i.e. a CPU halted in `wfi` with work queued, and both commits
+are U-mode. That is the **idle-wake** population, which has its own arch continuation contract
+(`RISCV_S_MODE_TIMER_DISPATCH`, SPP clearing, `sanitize_user_sstatus`, startup-ABI lanes) — a
+distinct queue-advancing consumer, not the ordinary preempting-timer population, and §1's
+kernel/idle-versus-userspace contract is what keeps it separate.
+
+**The attributable continuation, end to end.** x86_64, `yarm.sched_quantum_ticks=1`:
+
+```
+YIELD_DISPATCH_DEFER_BEGIN cpu=0 tid=1
+YIELD_DISPATCH_REENQUEUE_OK cpu=0 tid=1
+TIMER_SPLIT_PREEMPT_COMMITTED cpu=0 tick=1 outgoing=1 preempt=1 rearm=1 broad_lock=0
+QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=timer_preempt_committed
+YIELD_DISPATCH_DEFER_BEGIN cpu=0 drain=1
+YIELD_DISPATCH_DEQUEUE_OK cpu=0 tid=1
+YIELD_DISPATCH_CURRENT_SET_OK cpu=0 tid=1
+USER_CR3_PRE_IRET_OK tid=1 hw_cr3=0x000000001000a000
+YIELD_DISPATCH_FRAME_OK cpu=0 tid=1
+USER_LOG tid=1 msg=INIT_VFS_READ_SMOKE_CALL_RETURN ok=1 len=0      <- userspace continued
+```
+
+AArch64 is the stronger witness because it is **cross-task**: `outgoing=3 → incoming=1`, then
+`outgoing=3 → incoming=2`, each with `AARCH64_YIELD_DISPATCH_RUNNING_OK`, a real
+`AARCH64_YIELD_DISPATCH_TTBR0_OK tid=N asid=N` address-space switch, and `FRAME_OK`. RISC-V is
+cross-task too (`outgoing=2 → incoming=3`) and reaches 1508 commits at `quantum=1`.
+
+**Remaining timer declines — the complete inventory, derived from source.** The `TimerInterrupt`
+family is **NOT** closed:
+
+| decline | owner | when |
+|---|---|---|
+| `proof_hooks_armed` | the route's gate | any of the five timer-only `maybe_run_*` proof knobs armed — they are not relocated, so an armed profile takes the whole unchanged broad arm |
+| `no_current_runnable` | the route's run-queue probe | idle CPU with a non-empty queue — the idle-wake population above |
+| `d6_genuine_off` / `not_bsp` | `yield_deferral_arch_gate` | x86_64 under `d6_switch_proof`/`d6_switch_a`; non-bootstrap CPU on AArch64/RISC-V |
+| `already_deferred` | the one-shot deferral | some route already holds this CPU's Yield deferral |
+| `no_trap_drainer` / `cpu_out_of_range` / `multi_cpu` | `TerminalAdmissionRefusal` | trap drain inactive; CPU beyond `MAX_CPUS`; more than one dispatching CPU (`yarm.ap_user_dispatch`) |
+| `not_running` | `apply_preempt_outgoing_locked` | the interrupted task is not `Running` |
+| `reenqueue_failed` | the scheduler | the re-enqueue was refused; `current` restored, transition rolled back |
+
+### §4b — The RISC-V resume defect this conversion introduced, and its repair
+
+RISC-V's shipped quantum is **10 interrupts**, so unlike the other two ports the converted branch
+goes live there at the DEFAULT cadence — and the exit-current-task oracle found it. Three
+consecutive runs failed identically; base `a556bbd` passed three for three. It was a genuine
+regression, and it took two attempts to name correctly.
+
+**What the oracle saw.** The process manager received init's spawn request and was preempted seven
+log lines later. On resume it re-entered its receive loop against the wrong state, decoded a zero
+message (`opcode=4 len=0 sender_tid=0 reply_cap=None`), and init waited for a spawn reply forever.
+
+**The first diagnosis was right about the asymmetry and wrong about the owner.** The shared
+x86_64/AArch64 bridge captures the outgoing user context once, from the live frame, ahead of every
+route — so its timer branch inherits the capture. The RISC-V bridge does not: its only capture sits
+inside the SYSCALL branch, keyed on a published deferral, and its own comment says that capture is
+the only thing carrying the PC into the outgoing TCB, because this bridge never calls
+`finalize_split_handled_syscall`. A `capture_outgoing_user_context_split` in the timer arm made two
+of three runs pass — and was **actively worse than nothing** for the third, because
+`capture_user_context` copies the argument lanes verbatim and a RISC-V timer frame has none (the
+bridge populates them only for `EXC_USER_ECALL`). It wrote zeros over the syscall lane the
+ORDINARY resume arms treat as authoritative.
+
+**The real owner already existed.** RISC-V names three mutually exclusive resume conventions
+(canonical 199E-R1D) and reads the third from an **explicit tag**, never by inference:
+
+| convention | `a0..a5` come from |
+|---|---|
+| FRESH / STARTUP | the argument mirror; `a7` forced to 0 |
+| SYSCALL / BLOCKED CONTINUATION | the result lane |
+| **ASYNCHRONOUSLY PREEMPTED** | the saved register file, verbatim — the mirror is NOT touched |
+
+The tag is published by `snapshot_async_preempted_current`, which the bridge calls **inside the
+broad handler**, at what its own comment calls the earliest correct point: strictly before the
+scheduler tick that can yield. The converted route runs entirely before that lock is taken, so on
+it the snapshot never fired, no tag was published, and the write-back fell through to the STARTUP
+arm — installing a zeroed argument mirror over a live computation and forcing `a7 = 0`. That is
+the same defect 199E-R1D repaired for the broad path, reappearing on a route that bypasses it.
+
+The repair extracts the publisher's body to `task::publish_async_preempt_snapshot` — argument-lane
+preservation, generation bump and tag-last ordering included — and gives the split route the same
+owner through a rank-2 twin, keyed on the identity the deferral names rather than on `current`,
+which the transaction has already cleared. It is gated on `is_restorable` so the S-mode-origin
+timer path's zeroed frame can never authorize a verbatim restore. **Nine of nine exit oracles pass
+after it, with 12–13 tagged preemptions per RISC-V run.**
+
+This is what a bridge asymmetry costs: two ports inherit a property from a shared entry, the third
+states it locally, and a route added to all three gets it on two. It is recorded here rather than
+generalised — unifying the two bridges' capture points is not this stage's, and the shared bridge's
+Yield path is proven live over 4096 yields per boot.
+
+**A pre-existing AArch64 defect, exposed and attributed — not introduced.** At high preemption rates
+the AArch64 profile loses a spawn reply (`INIT_SPAWN_V5_REPLY_DECODE ok=0 reason=zero_pid`) and, at
+`quantum=1`, can livelock past the 180 s smoke deadline. **It reproduces exactly at base
+`a556bbd`** with the same quantum forced, through the unchanged broad dispatch path: at
+`Timer::new(1)`, base runs gave `zero_pid`, a 4 M-line hang, and `zero_pid`; at `Timer::new(8)`,
+base gave `spawn_fail` 1, 1, 0 against head's 1 at the same rate. AArch64 userspace does not survive
+per-tick preemption on **either** route. Deferred; it is not this conversion's, and it is not on the
+production cadence.
+
+### §5 — Qualification
+
+Frozen tree, fresh artifacts, `8cef214`.
+
+* `cargo test --lib --features hosted-dev -- --test-threads=1` — **5425 pass**, 0 fail, 2 ignored
+  (a556bbd: 5415; +10 focused cases).
+* **`tests/broad_lock_census_guard.rs` — 7/7**, run as its own integration target. **CENSUS-DELTA: 0**;
+  the expected census is unchanged at 2 `with_cpu` / 0 `with_broad` / 2 raw. Every seam this stage
+  added (`timer_would_preempt_split_read`, `set_scheduler_quantum_split_mut`) is rank-1
+  `with_scheduler_split_mut`.
+* All integration targets: doc-fragmentation 7, extraction-bridge 2, payload-bench 1, riscv64
+  live-irq 13 / regular-smoke 12 / smp-topology 17 / timer-admission 11 / timer-plic 18,
+  riscv-capacity 11, rpi5-stage1 19, x86_64 ap-env 25 / ap-percpu 16 — all pass.
+  `server_dies_runner_scope` 8 pass / **2 fail** — the established residual
+  (`required_chain_is_scoped_to_the_witnessed_transaction`,
+  `required_marker_chain_is_ordered_and_complete`), unchanged by this conversion and deferred.
+* Three freestanding builds green: x86_64 `x86-none`, AArch64 `aarch64-none`, RISC-V release.
+* Live regressions, all at the **production default** unless stated, three consecutive runs each:
+  * **exit-current-task oracle — 9/9** (x86_64, AArch64, RISC-V ×3 each), exact-tree sealed;
+  * **core smoke — 9/9**. x86_64 73–74 non-preempting ticks, 0 preemptions; AArch64 18–19 ticks, 0
+    preemptions and all 8 spawns succeeding — the delivered behaviour, so the cadence is provably
+    untouched; RISC-V 439–888 ticks and **1–2 genuine preemptions**, because its shipped quantum
+    really is 10 interrupts;
+  * **x86_64 AP saved-return — 3/3**;
+  * **supervisor crash-restart — pass** (`fault_observed=1 supervisor_notified=1
+    restart_observed=1 stale_reply_objects=0`).
+
+**Six displaced structural guards were re-derived**, each keeping its claim and sharpening it:
+`both_refusals_precede_every_mutation` (per-branch ordering now that the route has two branches),
+`a_non_preempting_tick_uses_its_own_disposition` (per-settlement, since the preempting branch
+legitimately answers `QueueAdvanceCommitted`), `the_broad_dispatcher_is_gated_on_the_disposition_alone`
+(four arms), `a_yield_is_counted_exactly_once_on_either_route` (two committing split routes, one
+increment each), `the_quantum_and_the_hardware_deadline_are_the_same_constant` (the separation is
+the only change; unset still resolves to the shipped constant), and
+`the_identity_and_ordering_discipline_is_enforced` — re-derived onto the extracted
+`task::publish_async_preempt_snapshot` and made STRONGER: both snapshot owners must now delegate to
+it rather than restate it, neither may publish a tag of its own, and the syscall-argument-lane
+preservation is pinned explicitly. Three of them now strip comments before locating code, because
+the converted route cites by name the seams and dispositions it deliberately does not use.
+
+**Ten focused cases** were added: nine holding the conversion's own contract (one policy, one tick /
+one claim / one re-arm per settlement, no syscall-return encoding, no decline after a mutation, a
+non-preempting tick advancing no queue, the run-queue admission of the idle settlement, the complete
+decline inventory, both bridges' skip, and the census claim) and one driving the split
+async-preemption publisher against real TCB state — the interrupt frame's PC/SP/register file land,
+the syscall lane survives, the tag names the exact `{tid, asid, generation}`, the consumer accepts it
+exactly once, a replacement incarnation is refused fail-closed, and tid 0 publishes nothing.
+
+### Next roadmap package
+
+**VM entry completion.**
