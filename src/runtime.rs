@@ -6848,7 +6848,11 @@ impl SharedKernel {
     /// Same three checks in the same order: the cap must resolve in that task's cspace to a
     /// memory-backed object, it must carry the rights the requested flags demand, and the object
     /// must still exist.
-    #[cfg(not(feature = "hosted-dev"))]
+    ///
+    /// U9-VM-ENTRY1: the `#[cfg(not(hosted-dev))]` gate is removed. It was there because the only
+    /// caller was a freestanding COW path, and the hosted build would have reported it dead. The
+    /// mapping transaction's split adapter calls it for the delivered rights check on every frame
+    /// it acquires, and §4's focused failure cases exercise that check from the hosted suite.
     pub(crate) fn resolve_memory_object_phys_for_task_split(
         &self,
         tid: u64,

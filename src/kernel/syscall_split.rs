@@ -2466,8 +2466,18 @@ fn try_split_dispatch_nonswitching_into_frame(
     // page-crossing shrink, single CPU online) can only be decided inside the
     // helper. Every case it cannot service returns `None`, which propagates
     // UNCHANGED back to the global-lock fallback below.
+    // U9-VM-ENTRY1: NR 3, NR 13 and NR 14 are routed to their TOTAL owners. Unlike every other
+    // route above, none of these may answer `None` after the NR gate: a family with a reachable
+    // broad fallback is not closed, and after a frame is taken or a page installed a `None` would
+    // hand a partially executed transaction to a dispatcher that knows nothing about it.
+    if matches!(syscall, Syscall::VmMap) {
+        return try_split_vm_map_into_frame(shared, cpu, frame);
+    }
+    if matches!(syscall, Syscall::VmAnonMap) {
+        return try_split_vm_anon_map_into_frame(shared, cpu, frame);
+    }
     if matches!(syscall, Syscall::VmBrk) {
-        return try_split_vm_brk_shrink_into_frame(shared, cpu, frame);
+        return try_split_vm_brk_into_frame(shared, cpu, frame);
     }
 
     // U9-MO2 §4: `CreateInitramfsFileSliceMo` (NR 28) is routed to its own pre-lock owner for
@@ -3749,28 +3759,132 @@ pub(crate) fn try_split_ipc_recv_queued_plain_into_frame(
     shared.try_split_ipc_recv_queued_plain_into_frame(cpu, frame)
 }
 
-/// # Validation status
-/// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — wired into the live trap seam:
-///   `try_split_dispatch_into_frame` routes `VmBrk` (NR 14) here BEFORE the
-///   global lock. Only the page-crossing shrink case (at most one CPU online,
-///   group-leader caller) is serviced; every other case returns `None` and
-///   propagates to the unchanged global-lock fallback (`handle_vm_brk`).
+/// U9-VM-ENTRY1 — the pre-lock NR 3 / NR 13 / NR 14 routes.
 ///
-/// Thin number-only gate mirroring [`try_split_ipc_recv_queued_plain_into_frame`]:
-/// re-decode the syscall number defensively, reject anything but `VmBrk`, then
-/// delegate to `SharedKernel::try_split_vm_brk_shrink_into_frame`, which holds
-/// the full eligibility logic and the single-CPU-online safety proof.
-pub(crate) fn try_split_vm_brk_shrink_into_frame(
+/// # These three are TOTAL
+///
+/// Every other route in this file may answer `None` before its first mutation and let the broad
+/// handler service the case. These three may not, and the reason is what "closed" means: a family
+/// that still has a reachable broad fallback is not closed, however rare the fallback is. So each
+/// route below produces EVERY outcome its NR admits — success, every validation refusal, every
+/// resource failure — from the split transaction itself, and returns `Some(..)` unconditionally
+/// once the NR gate has matched.
+///
+/// That is also what makes compensation honest. After a frame is taken, a capability minted or a
+/// page installed, answering `None` would hand a partially executed transaction to a dispatcher
+/// that knows nothing about it. The transaction settles its own phases through the narrow owners
+/// in `vm_txn`, and there is no path on which it does not.
+///
+/// The NR gate itself is the one place a `None` remains, and it is not a fallback: it is the
+/// defensive re-decode every route in this file performs, and it can only fail for a frame whose
+/// syscall number is not the one the dispatcher already matched.
+fn split_vm_caller_tid(shared: &SharedKernel, cpu: CpuId) -> Result<u64, TrapHandleError> {
+    shared.current_tid_authoritative(cpu).ok_or({
+        TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::from(
+            crate::kernel::boot::KernelError::TaskMissing,
+        ))
+    })
+}
+
+/// NR 3 — `VmMap`. The target address space is the one the caller's CAPABILITY names; the
+/// provisional frame capabilities are still minted in the caller's own cnode.
+pub(crate) fn try_split_vm_map_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) -> Option<Result<(), TrapHandleError>> {
-    // Number-only default-deny gate: only VmBrk is considered here.
+    use crate::kernel::syscall::vm_txn::{MapTarget, run_vm_map_transaction};
+    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
+    if !matches!(syscall, Syscall::VmMap) {
+        return None;
+    }
+    let tid = match split_vm_caller_tid(shared, cpu) {
+        Ok(tid) => tid,
+        Err(e) => return Some(Err(e)),
+    };
+    let cap = crate::kernel::capabilities::CapId(
+        frame.arg(crate::kernel::syscall::SYSCALL_ARG_CAP) as u64,
+    );
+    let addr = frame.arg(crate::kernel::syscall::SYSCALL_ARG_PTR);
+    let len = frame.arg(crate::kernel::syscall::SYSCALL_ARG_LEN);
+    let prot = frame.arg(crate::kernel::syscall::SYSCALL_ARG_INLINE_PAYLOAD0);
+    let mut owners = crate::kernel::syscall::vm_split::SplitVmOwners { shared, tid };
+    Some(
+        match run_vm_map_transaction(&mut owners, MapTarget::Capability(cap), addr, len, prot) {
+            Ok((base, map_len)) => {
+                frame.set_ok(base, map_len, 0);
+                Ok(())
+            }
+            Err(e) => Err(TrapHandleError::Syscall(e)),
+        },
+    )
+}
+
+/// NR 13 — `VmAnonMap`. Same transaction, caller's own address space.
+pub(crate) fn try_split_vm_anon_map_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::vm_txn::{MapTarget, run_vm_map_transaction};
+    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
+    if !matches!(syscall, Syscall::VmAnonMap) {
+        return None;
+    }
+    let tid = match split_vm_caller_tid(shared, cpu) {
+        Ok(tid) => tid,
+        Err(e) => return Some(Err(e)),
+    };
+    let addr = frame.arg(crate::kernel::syscall::SYSCALL_ARG_PTR);
+    let len = frame.arg(crate::kernel::syscall::SYSCALL_ARG_LEN);
+    let prot = frame.arg(crate::kernel::syscall::SYSCALL_ARG_INLINE_PAYLOAD0);
+    let mut owners = crate::kernel::syscall::vm_split::SplitVmOwners { shared, tid };
+    Some(
+        match run_vm_map_transaction(&mut owners, MapTarget::CallerAddressSpace, addr, len, prot) {
+            Ok((base, map_len)) => {
+                frame.set_ok(base, map_len, 0);
+                Ok(())
+            }
+            Err(e) => Err(TrapHandleError::Syscall(e)),
+        },
+    )
+}
+
+/// NR 14 — `VmBrk`, COMPLETE.
+///
+/// Stage 114's `M2_SEAM_LIVE_D3_BRK_SHRINK` serviced one shape — a page-crossing shrink at at
+/// most one CPU online — and declined the query, growth, the no-op, a within-page shrink, a
+/// non-leader caller, every validation failure and every multi-CPU boot. All of those reached the
+/// broad handler, and on RISC-V so did the one shape it did service, because NR 14 was never on
+/// that architecture's whitelist.
+///
+/// This route services all five shapes at any CPU count. The topology restriction is not ignored:
+/// it was a consequence of the only unmap cascade the old route could reach needing the ipc(3)
+/// domain for its shootdown, and `unmap_range_two_phase_split` — rank 5, then the coordinator
+/// with NO lock held, then rank 6 — is the owner that answered it.
+pub(crate) fn try_split_vm_brk_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::vm_txn::run_vm_brk_transaction;
     let syscall = Syscall::decode(frame.syscall_num()).ok()?;
     if !matches!(syscall, Syscall::VmBrk) {
         return None;
     }
-    shared.try_split_vm_brk_shrink_into_frame(cpu, frame)
+    let tid = match split_vm_caller_tid(shared, cpu) {
+        Ok(tid) => tid,
+        Err(e) => return Some(Err(e)),
+    };
+    let requested = frame.arg(crate::kernel::syscall::SYSCALL_ARG_CAP);
+    let mut owners = crate::kernel::syscall::vm_split::SplitVmOwners { shared, tid };
+    Some(match run_vm_brk_transaction(&mut owners, requested) {
+        Ok(result) => {
+            frame.set_ok(result, 0, 0);
+            Ok(())
+        }
+        Err(e) => Err(TrapHandleError::Syscall(e)),
+    })
 }
 
 /// U9-SPAWN1 SP-2 — the pre-lock NR 11 (`SpawnThread`) route.
@@ -4589,10 +4703,15 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // Final eligibility (kernel-task receiver, queued plain, no sender-wake/recv-v2)
         // is decided inside that helper; ineligible cases return `None` → fallback.
         Syscall::IpcRecv => Some(syscall),
-        // Stage 114: VmBrk (NR 14) passes the NR gate so the live seam attempts the
-        // page-crossing-shrink split via `try_split_vm_brk_shrink_into_frame`. Final
-        // eligibility (group leader, page-crossing shrink, single CPU online) is
-        // decided inside that helper; ineligible cases return `None` → fallback.
+        // U9-VM-ENTRY1: the three VM entries. Stage 114 admitted NR 14 here so the seam could
+        // ATTEMPT a page-crossing shrink, with every other shape declining to the broad handler.
+        // That conditional admission is gone: all three routes are TOTAL, so passing this gate is
+        // the whole decision and no VM entry has a reachable broad fallback left.
+        //
+        // NR 3 and NR 13 were never admitted at all, so every call reached the terminal broad
+        // dispatcher on every port.
+        Syscall::VmMap => Some(syscall),
+        Syscall::VmAnonMap => Some(syscall),
         Syscall::VmBrk => Some(syscall),
         // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) is a pure READ
         // syscall — it resolves the current task, copies user bytes, logs, and never
@@ -5164,15 +5283,60 @@ mod tests {
         );
     }
 
+    /// U9-VM-ENTRY1 re-derivation of `stage29_vm_map_not_eligible`.
+    ///
+    /// Stage 29 pinned NR 3 as global-lock-only so a later stage could not silently whitelist a
+    /// MINTING, MAPPING class while its off-lock compensation was undefined. That protection did
+    /// its job, and it is retired the way it was meant to be retired: by a mission that derived
+    /// the closure first. What the case now holds is the positive fact and the property that
+    /// made the admission legitimate.
+    ///
+    /// The route is TOTAL — that is the whole difference. Stage 29's assertion was
+    /// `legacy() == None`, i.e. "the dispatcher hands this to the broad handler". A family with a
+    /// reachable broad fallback is not closed, so NR 3 must now answer for EVERY input,
+    /// including the invalid one this fixture supplies.
     #[test]
-    fn stage29_vm_map_not_eligible() {
+    fn stage29_vm_map_is_eligible_and_total() {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
-        let mut frame = TrapFrame::new(SYSCALL_VM_MAP_NR, [1, 2, 3, 4, 5, 6]);
-        assert_eq!(
-            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy(),
-            None
+        assert!(
+            classify_split_eligible_nr_only(decode(SYSCALL_VM_MAP_NR)).is_some(),
+            "NR 3 passes the NR-only gate since U9-VM-ENTRY1"
         );
-        assert!(classify_split_eligible_nr_only(decode(SYSCALL_VM_MAP_NR)).is_none());
+        // The SAME frame Stage 29 used: args (1, 2, 3, …) are not a valid (addr, len, prot)
+        // triple, so this is the invalid-input case. It must be ANSWERED, not deferred.
+        let mut frame = TrapFrame::new(SYSCALL_VM_MAP_NR, [1, 2, 3, 4, 5, 6]);
+        let outcome = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame).legacy();
+        assert!(
+            outcome.is_some(),
+            "NR 3 must never fall through to the broad dispatcher — a reachable fallback is \
+             exactly what stops the family being closed"
+        );
+        assert!(
+            matches!(
+                outcome,
+                Some(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::InvalidArgs
+                )))
+            ),
+            "and the error is the delivered one: addr=2 is not page-aligned"
+        );
+        // NR 13 is the same transaction with the other authority, and NR 14 is total too.
+        for nr in [
+            crate::kernel::syscall::SYSCALL_VM_ANON_MAP_NR,
+            crate::kernel::syscall::SYSCALL_VM_BRK_NR,
+        ] {
+            assert!(
+                classify_split_eligible_nr_only(decode(nr)).is_some(),
+                "NR {nr} passes the NR-only gate"
+            );
+            let mut frame = TrapFrame::new(nr, [1, 2, 3, 4, 5, 6]);
+            assert!(
+                try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
+                    .legacy()
+                    .is_some(),
+                "NR {nr} must answer rather than defer"
+            );
+        }
     }
 
     #[test]
@@ -5262,6 +5426,10 @@ mod tests {
             let eligible = classify_split_eligible_nr_only(syscall).is_some();
             if nr == SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR
                 || nr == SYSCALL_IPC_RECV_NR
+                // U9-VM-ENTRY1: the three VM entries. NR 14 was already here for its one
+                // conditional shape; NR 3 and NR 13 join it, and all three are now TOTAL.
+                || nr == crate::kernel::syscall::SYSCALL_VM_MAP_NR
+                || nr == crate::kernel::syscall::SYSCALL_VM_ANON_MAP_NR
                 || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
                 || nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
                 || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR

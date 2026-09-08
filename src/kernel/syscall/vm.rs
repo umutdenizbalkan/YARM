@@ -134,7 +134,7 @@ impl VmMapOwners for BroadVmOwners<'_> {
         frame: ProvisionalFrame,
     ) -> ProvisionalReleaseOutcome {
         self.kernel.with_capability_state_mut(|capability| {
-            release_provisional_cap_locked(capability, cnode, frame)
+            release_provisional_frame_cap_locked(capability, cnode, frame)
         })
     }
 
@@ -293,7 +293,7 @@ pub(crate) fn settle_installed_locked(
 /// and removing it would destroy another transaction's resource. That is a retained frame, not a
 /// leaked one — it is still referenced, so its object stays alive and is reclaimed with its last
 /// reference.
-pub(crate) fn release_provisional_cap_locked(
+pub(crate) fn release_provisional_frame_cap_locked(
     capability: &mut crate::kernel::boot::CapabilitySubsystem,
     cnode: crate::kernel::capabilities::CNodeId,
     frame: ProvisionalFrame,

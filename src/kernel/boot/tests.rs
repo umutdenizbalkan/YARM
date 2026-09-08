@@ -33561,8 +33561,12 @@ mod stage114_d3_vm_brk_shrink_live {
             );
         }
         let syscall_split_src = include_str!("../syscall_split.rs");
+        // U9-VM-ENTRY1: the route is still reached from the dispatcher's own NR arm, which is
+        // Stage 114's claim. What changed is its name and its totality — the shrink-only
+        // specialization became the complete NR 14 transaction, so the seam it must be routed to
+        // is `try_split_vm_brk_into_frame`.
         assert!(
-            syscall_split_src.contains("try_split_vm_brk_shrink_into_frame(shared, cpu, frame)"),
+            syscall_split_src.contains("try_split_vm_brk_into_frame(shared, cpu, frame)"),
             "syscall_split.rs must route VmBrk to the live seam"
         );
         assert!(
@@ -33690,20 +33694,41 @@ mod stage114_d3_vm_brk_shrink_live {
         );
     }
 
+    /// U9-VM-ENTRY1 re-derivation of `stage114_d3_full_vm_anon_map_two_phase_remains_deferred`.
+    ///
+    /// Stage 114 deferred "D3-FULL" — the full two-phase mapping conversion — and pinned two
+    /// things: NR 3 must not be split-eligible, and the aggregate-batch rollback SCAFFOLD
+    /// (`VmAnonMapRollbackTlbPlan`) must not be wired into a live seam.
+    ///
+    /// The first is what this mission delivers, so it is replaced by its positive form. The
+    /// SECOND still holds and is the more interesting half: the conversion did NOT wire the old
+    /// scaffold, because that scaffold batched rollback TLB work as a plan computed ahead of
+    /// time, and the delivered transaction does not need it — installation and rollback share one
+    /// VM acquisition, so there is no cross-acquisition plan to carry. Keeping the assertion
+    /// proves the scaffold stayed dead rather than being revived to do a job it was the wrong
+    /// shape for.
     #[test]
-    fn stage114_d3_full_vm_anon_map_two_phase_remains_deferred() {
+    fn stage114_d3_full_vm_anon_map_two_phase_is_delivered_without_the_batch_scaffold() {
         let (kernel, _asid) = shared_task0_with_known_asid();
         let mut frame = TrapFrame::new(Syscall::VmMap as usize, [0, 0, 0, 0, 0, 0]);
-        assert_eq!(
+        assert!(
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
-                .legacy(),
-            None,
-            "VmMap must remain non-split-eligible (D3-FULL out of scope)"
+                .legacy()
+                .is_some(),
+            "NR 3 is split-eligible and TOTAL since U9-VM-ENTRY1: it answers every input rather \
+             than deferring any of them"
         );
         let runtime_src = include_str!("../../runtime.rs");
         assert!(
             !runtime_src.contains("VmAnonMapRollbackTlbPlan"),
             "the aggregate-batch rollback scaffold must remain unwired into any live seam"
+        );
+        // And the delivered transaction is the reason it is not needed: the undo happens inside
+        // the acquisition that installed, so no rollback plan crosses an acquisition boundary.
+        let vm_src = include_str!("../syscall/vm.rs");
+        assert!(
+            vm_src.contains("fn undo_installed_locked("),
+            "the rollback is a rank-local body inside the install acquisition"
         );
     }
 
@@ -34144,14 +34169,40 @@ mod stage115_d2_d6_seam_analysis {
         }
     }
 
+    /// U9-VM-ENTRY1 re-derivation of `stage115_d3_full_vm_anon_map_two_phase_not_implemented`.
+    ///
+    /// Stage 115's hard rule 6 was a SCOPE fence for that stage: D3-FULL was not its job, so a
+    /// `try_split_vm_anon_map` appearing in `syscall_split.rs` would have meant scope creep. The
+    /// fence has been lifted by the mission that owns the work, and the case is re-derived onto
+    /// what Stage 115 was really protecting — that the conversion, when it came, would consume
+    /// the existing owners rather than reimplement them, which is the same property its sibling
+    /// case asserts for D1/D5 immediately above.
     #[test]
-    fn stage115_d3_full_vm_anon_map_two_phase_not_implemented() {
-        // Hard rule 6: D3-FULL (full VmAnonMap two-phase) must not be implemented.
+    fn stage115_d3_full_vm_anon_map_two_phase_reuses_owners() {
         let split_src = include_str!("../syscall_split.rs");
         assert!(
-            !split_src.contains("try_split_vm_anon_map"),
-            "D3-FULL VmAnonMap two-phase must not be implemented in Stage 115"
+            split_src.contains("try_split_vm_anon_map_into_frame"),
+            "D3-FULL is delivered by U9-VM-ENTRY1"
         );
+        // It consumes the transaction rather than restating any of its policy.
+        assert!(
+            split_src.contains("run_vm_map_transaction(")
+                && !split_src.contains("fn validate_map_args(")
+                && !split_src.contains("fn release_frames<"),
+            "the NR 13 route must consume the mapping transaction, never reimplement it"
+        );
+        // And the split adapter reaches the SAME rank-local bodies the broad adapter uses.
+        let vm_split_src = include_str!("../syscall/vm_split.rs");
+        for shared_body in [
+            "install_range_locked(",
+            "settle_installed_locked(",
+            "release_provisional_frame_cap_locked(",
+        ] {
+            assert!(
+                vm_split_src.contains(shared_body),
+                "the split adapter must reach the shared rank-local body `{shared_body}`"
+            );
+        }
     }
 
     #[test]
@@ -62003,14 +62054,16 @@ mod stage191a_lock_retire_inventory {
                 && SPLIT_SRC.contains("Syscall::SpawnFromMemoryObject => Some(syscall),")
                 // U9-FORK1 §4 added Fork, which shares the spawn transaction and reads nothing
                 // from user memory.
-                && SPLIT_SRC.contains("Syscall::Fork => Some(syscall),"),
+                && SPLIT_SRC.contains("Syscall::Fork => Some(syscall),")
+                // U9-VM-ENTRY1 added the two anonymous-mapping entries. They were the last two
+                // live production classes reaching the terminal broad dispatcher on EVERY call.
+                && SPLIT_SRC.contains("Syscall::VmMap => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::VmAnonMap => Some(syscall),"),
             "the NR-only split gate must whitelist exactly the accepted classes"
         );
         // Dangerous classes must NOT appear as split-eligible (default-deny `_ => None`).
         // FutexWake is INTENTIONALLY absent here (retired in 191B); FutexWait stays.
         for dangerous in [
-            "Syscall::VmMap => Some",
-            "Syscall::VmAnonMap => Some",
             // U9-SPAWN1 SP-2 removed NR 11 from this list. It was here because the whole spawn
             // family was, not because NR 11 shares the family's obstacles: it creates no address
             // space, loads no ELF, mints nothing, maps nothing and never switches tasks. Its
@@ -62438,8 +62491,13 @@ mod stage191c_split_user_copy_seam {
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
             "Syscall::IpcReply => Some",
-            "Syscall::VmMap => Some",
-            "Syscall::VmAnonMap => Some",
+            // U9-VM-ENTRY1: NR 3 and NR 13 left this list. They were here for the reason the
+            // spawn family was — the obstacle was never the seam, it was the compensation. Both
+            // MINT and both MAP, and §2 gave each half an exact off-lock owner: the mapping half
+            // installs and undoes inside ONE VM acquisition, so its rollback provably removes
+            // only pages the transaction installed; the capability half re-establishes exact
+            // identity inside the one acquisition that removes the slot, so it never revokes a
+            // cap a sibling took ownership of.
             // U9-SPAWN-TXN3 §4: NR 23 left this list, for the same kind of reason NR 11 did —
             // the obstacle was never the seam, it was the rollback, and §2 replaced it with the
             // exact provisional-capability closure.
@@ -62475,10 +62533,17 @@ mod stage191c_split_user_copy_seam {
         // admitted on exactly the same terms: `release_delegation` is the exact off-lock inverse
         // of each mint, and it refuses to remove a slot that no longer holds the object its token
         // names.
+        // U9-VM-ENTRY1: NR 3 and NR 13 mint too — one MemoryObject capability per page — so they
+        // join this cohort on exactly the same terms. Their exact off-lock inverse is asserted
+        // below rather than assumed, and it is a STRICTER inverse than the spawn family's,
+        // because a provisional frame capability is minted into a cnode that every sibling thread
+        // of the caller shares.
         for minting_class in [
             "Syscall::SpawnProcess => Some(syscall),",
             "Syscall::SpawnFromMemoryObject => Some(syscall),",
             "Syscall::Fork => Some(syscall),",
+            "Syscall::VmMap => Some(syscall),",
+            "Syscall::VmAnonMap => Some(syscall),",
         ] {
             assert!(
                 SPLIT_SRC.contains(minting_class),
@@ -62504,8 +62569,26 @@ mod stage191c_split_user_copy_seam {
                 && PROVCAP.contains("ProvisionalCapRelease::Residue"),
             "the admitted spawn classes must have an exact, refusing, bounded rollback owner"
         );
+        // U9-VM-ENTRY1: the mapping classes' inverse, asserted the same way. Three properties,
+        // all of them refusals rather than removals:
+        //   * the release re-establishes identity INSIDE the acquisition that removes the slot —
+        //     a snapshot from an earlier acquisition proves nothing about this one;
+        //   * a cap a sibling derived from is RETAINED, never revoked, because it is no longer
+        //     this transaction's resource;
+        //   * the accounting runs only for a slot actually released.
+        const VM_SRC: &str = include_str!("../syscall/vm.rs");
+        assert!(
+            VM_SRC.contains("pub(crate) fn release_provisional_frame_cap_locked(")
+                && VM_SRC.contains("ProvisionalReleaseOutcome::Derived")
+                && VM_SRC.contains("ProvisionalReleaseOutcome::NotOurs"),
+            "the admitted mapping classes must have an exact, refusing, bounded rollback owner"
+        );
+        const VM_TXN: &str = include_str!("../syscall/vm_txn.rs");
+        assert!(
+            VM_TXN.contains("owners.account_released_cap(*frame);"),
+            "the accounting must follow a release, never a retention"
+        );
         for still_locked in [
-            "Syscall::VmAnonMap => Some",
             "Syscall::TransferRelease => Some",
             "Syscall::CreateEndpoint => Some",
             "Syscall::CreateNotification => Some",
@@ -62793,6 +62876,9 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::SpawnFromMemoryObject => Some(syscall),",
             // U9-FORK1 §4.
             "Syscall::Fork => Some(syscall),",
+            // U9-VM-ENTRY1: the two anonymous-mapping entries.
+            "Syscall::VmMap => Some(syscall),",
+            "Syscall::VmAnonMap => Some(syscall),",
         ] {
             assert!(
                 SPLIT_SRC.contains(accepted),
@@ -62806,8 +62892,9 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::IpcCall => Some",
             "Syscall::IpcReply => Some",
             "Syscall::IpcRecvTimeout => Some",
-            "Syscall::VmMap => Some",
-            "Syscall::VmAnonMap => Some",
+            // U9-VM-ENTRY1 removed NR 3 and NR 13. Stage 191E's claim is unaffected and
+            // unchanged: the CANDIDATE SEAM adds no live class and never owned the whitelist's
+            // contents; each admission comes from the stage that derived its compensation.
             "Syscall::TransferRelease => Some",
             // U9-SPAWN1 SP-2 removed NR 11, and U9-SPAWN-TXN3 §4 removed NR 23 and NR 29: the
             // candidate seam never owned the whitelist's contents, and each admission came from
@@ -114869,6 +114956,12 @@ mod stage199d_riscv_canonical_admission {
             // its queue advance is the existing deferral plus the existing drain.
             "SYSCALL_EXIT_CURRENT_TASK_NR",
             "SYSCALL_YIELD_NR",
+            // U9-VM-ENTRY1: the three VM entries. Their absence was not a decline — this list is
+            // what decides whether the shared dispatcher is consulted at all, so NR 14's Stage 114
+            // shrink route could never once have run on this architecture in the stages between.
+            "SYSCALL_VM_MAP_NR",
+            "SYSCALL_VM_ANON_MAP_NR",
+            "SYSCALL_VM_BRK_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -114880,12 +114973,13 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            13,
-            "exactly thirteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            16,
+            "exactly sixteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
              SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask, \
-             (U9-EXIT1 §5) ExitCurrentTask and (U9-RESIDUAL1 §3) Yield"
+             (U9-EXIT1 §5) ExitCurrentTask, (U9-RESIDUAL1 §3) Yield and (U9-VM-ENTRY1) \
+             VmMap + VmAnonMap + VmBrk"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
