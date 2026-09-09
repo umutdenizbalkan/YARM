@@ -168674,6 +168674,8 @@ mod u9vment1_ownership_cases {
                         phys: our_phys,
                         cap: None,
                         installed: false,
+                        pinned: false,
+                        displaced_pinned: false,
                         replaced: None,
                     },
                     PageRecord {
@@ -168684,6 +168686,8 @@ mod u9vment1_ownership_cases {
                         phys: competitor_mapping.phys,
                         cap: None,
                         installed: false,
+                        pinned: false,
+                        displaced_pinned: false,
                         replaced: None,
                     },
                 ];
@@ -168759,6 +168763,8 @@ mod u9vment1_ownership_cases {
                         phys,
                         cap: None,
                         installed: false,
+                        pinned: false,
+                        displaced_pinned: false,
                         replaced: None,
                     });
                 }
@@ -168846,6 +168852,12 @@ mod u9vment1_ownership_cases {
         cap_refs: BTreeMap<u64, i64>,
         reclaimed: Vec<u64>,
         freed: Vec<u64>,
+        /// The transaction's own hold, per object, and per displaced physical address. A pin is
+        /// what the transaction owns; a capability is not, because a sibling can revoke it.
+        pins: BTreeMap<u64, i64>,
+        displaced_pins: BTreeMap<u64, i64>,
+        /// Every object this mock handed out, so a pin can be resolved to its backing.
+        phys_by_object: BTreeMap<u64, u64>,
     }
 
     impl OrderingOwners {
@@ -168866,7 +168878,23 @@ mod u9vment1_ownership_cases {
                 cap_refs: BTreeMap::new(),
                 reclaimed: Vec::new(),
                 freed: Vec::new(),
+                pins: BTreeMap::new(),
+                displaced_pins: BTreeMap::new(),
+                phys_by_object: BTreeMap::new(),
             }
+        }
+
+        fn phys_of(&self, object_id: u64) -> Option<u64> {
+            self.phys_by_object.get(&object_id).copied()
+        }
+
+        fn live_pins(&self) -> BTreeMap<u64, i64> {
+            self.pins
+                .iter()
+                .chain(self.displaced_pins.iter())
+                .filter(|(_, count)| **count != 0)
+                .map(|(k, v)| (*k, *v))
+                .collect()
         }
 
         fn premap(&mut self, virt: u64, phys: u64, flags: PageFlags) {
@@ -168921,13 +168949,40 @@ mod u9vment1_ownership_cases {
             let object_id = self.next_object;
             self.next_object += 1;
             self.live_objects.push(object_id);
+            self.phys_by_object.insert(object_id, phys);
             Ok((object_id, PhysAddr(phys)))
+        }
+
+        fn pin_object(&mut self, object_id: u64) -> bool {
+            self.say("pin_object");
+            *self.pins.entry(object_id).or_insert(0) += 1;
+            true
+        }
+
+        fn unpin_object(&mut self, object_id: u64) {
+            self.say("unpin_object");
+            *self.pins.entry(object_id).or_insert(0) -= 1;
+            let unreferenced = self.pins.get(&object_id).copied().unwrap_or(0) == 0
+                && self.cap_refs.get(&object_id).copied().unwrap_or(0) == 0;
+            if unreferenced && let Some(phys) = self.phys_of(object_id) {
+                if self.map_refs.get(&phys).copied().unwrap_or(0) == 0 {
+                    self.live_objects.retain(|live| *live != object_id);
+                    self.freed.push(phys);
+                }
+            }
+        }
+
+        fn unpin_displaced(&mut self, phys: PhysAddr) {
+            self.say("unpin_displaced");
+            *self.displaced_pins.entry(phys.0).or_insert(0) -= 1;
         }
 
         fn release_unminted_object(&mut self, object_id: u64) {
             self.say("release_unminted_object");
-            // The production owner refuses to free backing anything still references.
-            let referenced = self.cap_refs.get(&object_id).copied().unwrap_or(0) > 0;
+            // The production owner refuses to free backing anything still references — a
+            // capability, a mapping, or this transaction's own pin.
+            let referenced = self.cap_refs.get(&object_id).copied().unwrap_or(0) > 0
+                || self.pins.get(&object_id).copied().unwrap_or(0) > 0;
             if referenced {
                 self.say("release_unminted_object_skipped");
                 return;
@@ -168987,10 +169042,13 @@ mod u9vment1_ownership_cases {
                 records[i].replaced = replaced;
                 records[i].installed = true;
             }
-            // Pass B — cannot fail.
-            for record in records.iter() {
+            // Pass B — cannot fail. The displaced backing is PINNED before its last mapping
+            // reference is dropped, in this same acquisition, exactly as the production body does.
+            for record in records.iter_mut() {
                 *self.map_refs.entry(record.phys.0).or_insert(0) += 1;
                 if let Some(old) = record.replaced {
+                    record.displaced_pinned = true;
+                    *self.displaced_pins.entry(old.phys.0).or_insert(0) += 1;
                     *self.map_refs.entry(old.phys.0).or_insert(0) -= 1;
                 }
             }
@@ -169189,12 +169247,21 @@ mod u9vment1_ownership_cases {
             "the acquisition is finished before any wait begins: {:?}",
             owners.log
         );
+        // The settlement triple, in this exact order, once per displaced page: acknowledge the
+        // translation, release THIS transaction's hold, and only then reclaim. The unpin sits
+        // between them because the reclaim is guarded on the pin — so it is the single point at
+        // which the displaced backing becomes reusable, and it is reached only once the
+        // translation is provably gone.
         for (i, entry) in owners.log.iter().enumerate() {
             if entry == "reclaim_replaced" {
                 assert_eq!(
-                    owners.log.get(i - 1).map(String::as_str),
-                    Some("complete_shootdown"),
-                    "a displaced frame is reclaimed only after its own acknowledgement: {:?}",
+                    (
+                        owners.log.get(i - 2).map(String::as_str),
+                        owners.log.get(i - 1).map(String::as_str),
+                    ),
+                    (Some("complete_shootdown"), Some("unpin_displaced")),
+                    "a displaced frame is reclaimed only after its own acknowledgement and only \
+                     once this transaction has released its hold: {:?}",
                     owners.log
                 );
             }
@@ -169202,6 +169269,11 @@ mod u9vment1_ownership_cases {
         assert_eq!(
             owners.reclaimed, displaced,
             "each displaced frame is reclaimed exactly once, in page order"
+        );
+        assert!(
+            owners.live_pins().is_empty(),
+            "every hold this transaction took is released exactly once: {:?}",
+            owners.live_pins()
         );
     }
 
@@ -169293,6 +169365,8 @@ mod u9vment1_ownership_cases {
                     phys: mapped_phys,
                     cap: None,
                     installed: false,
+                    pinned: false,
+                    displaced_pinned: false,
                     replaced: None,
                 }];
                 state
@@ -169509,6 +169583,576 @@ mod u9vment1_ownership_cases {
                 && revoke.contains("reclaim_memory_object_if_unreferenced(capability.object)"),
             "the cleanup owner must drop the cap reference and reclaim the object"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // Transaction-owned backing lifetime.
+    //
+    // A user-revocable capability is not a hold. These exercise the three boundaries against the
+    // real memory-lifetime, revoke and mapping owners, and check allocator availability and
+    // object identity — not merely that this transaction calls shootdown before its own reclaim.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    /// The production pin, through the same rank-6 body both adapters drive.
+    fn pin(state: &mut KernelState, object_id: u64) -> bool {
+        state.with_memory_state_mut(|memory| {
+            crate::kernel::syscall::vm::pin_object_locked(memory, object_id)
+        })
+    }
+
+    fn unpin(state: &mut KernelState, object_id: u64) {
+        state.with_memory_state_mut(|memory| {
+            crate::kernel::syscall::vm::unpin_object_locked(memory, object_id)
+        });
+    }
+
+    fn pin_count(state: &KernelState, object_id: u64) -> Option<u32> {
+        let slot = state.memory_object_slot_by_id(object_id)?;
+        state.with_memory_state(|memory| memory.memory_objects[slot].map(|o| o.pin_refcount))
+    }
+
+    /// Is `phys` currently held by the frame allocator — i.e. free to be handed to someone else?
+    /// Checked by allocating until it comes back, which is the only question that actually
+    /// matters: "the object slot is gone" and "the frame is reusable" are different claims.
+    fn frame_is_available(state: &mut KernelState, phys: PhysAddr, budget: usize) -> bool {
+        let mut taken = Vec::new();
+        let mut found = false;
+        for _ in 0..budget {
+            match state.with_memory_state_mut(|memory| {
+                crate::kernel::boot::kernel_mut(&mut memory.frame_allocator).alloc_contiguous(1)
+            }) {
+                Ok(candidate) => {
+                    if candidate == phys.0 {
+                        found = true;
+                    }
+                    taken.push(candidate);
+                }
+                Err(_) => break,
+            }
+        }
+        for candidate in taken {
+            state.with_memory_state_mut(|memory| {
+                let _ = crate::kernel::boot::kernel_mut(&mut memory.frame_allocator)
+                    .free_contiguous(candidate, 1);
+            });
+        }
+        found
+    }
+
+    #[test]
+    fn lifetime_a_sibling_revoking_the_last_capability_cannot_free_pinned_backing() {
+        // Boundary 1: after mint, before install. The transaction is about to write
+        // `PageRecord.phys` into a page table; a sibling revokes the last capability naming that
+        // object. Without a transaction-owned hold the object is reclaimed and its frame becomes
+        // reusable — so the install would map freed or recycled backing.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+
+                // Phase R: acquire, and pin — before any revocable authority exists.
+                let (object_id, phys) = state.alloc_anonymous_object_without_cap().expect("object");
+                assert!(pin(&mut state, object_id), "the hold is taken");
+                assert_eq!(pin_count(&state, object_id), Some(1));
+
+                // Phase M: publish the revocable authority.
+                let cap = state.mint_anonymous_frame_cap(object_id).expect("mint");
+                assert_eq!(refcounts(&state, object_id), Some((1, 0)));
+
+                // A sibling revokes the LAST capability, through the production revoke owner.
+                state
+                    .revoke_capability_in_cnode(cnode, cap)
+                    .expect("sibling revoke");
+
+                // Object identity survives, and the frame is NOT available to anyone else.
+                assert_eq!(
+                    refcounts(&state, object_id),
+                    Some((0, 0)),
+                    "no capability and no mapping references it any more"
+                );
+                assert_eq!(
+                    pin_count(&state, object_id),
+                    Some(1),
+                    "but this transaction's hold is untouched by a capability revoke"
+                );
+                assert!(
+                    state.memory_object_slot_by_id(object_id).is_some(),
+                    "the object still exists, so `PageRecord.phys` still names it"
+                );
+                assert!(
+                    !frame_is_available(&mut state, phys, 64),
+                    "and its frame is not reusable, so the install cannot map recycled backing"
+                );
+
+                // Releasing the hold is the single point at which it becomes reclaimable.
+                unpin(&mut state, object_id);
+                assert!(
+                    state.memory_object_slot_by_id(object_id).is_none(),
+                    "the guarded reclaim fires exactly when the last hold goes"
+                );
+                assert!(
+                    frame_is_available(&mut state, phys, 64),
+                    "and only then does the frame return to the allocator"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn lifetime_concurrent_revocation_after_removal_before_ack_cannot_make_backing_reclaimable() {
+        // Boundary 2: the rollback has removed the translation but its acknowledgement has not
+        // arrived. A sibling revokes the capability. The pin — not the capability — is the durable
+        // owner of the outstanding obligation.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+
+                let (object_id, phys) = state.alloc_anonymous_object_without_cap().expect("object");
+                assert!(pin(&mut state, object_id));
+                let cap = state.mint_anonymous_frame_cap(object_id).expect("mint");
+
+                // Install then remove, as the address-space phase's failure path does.
+                let mut records = [PageRecord {
+                    virt: VirtAddr(0x11_0000),
+                    object_id,
+                    phys,
+                    cap: Some(cap),
+                    installed: false,
+                    pinned: true,
+                    displaced_pinned: false,
+                    replaced: None,
+                }];
+                state
+                    .with_vm_then_memory_mut(|spaces, memory| {
+                        crate::kernel::syscall::vm::install_and_account_locked(
+                            spaces,
+                            memory,
+                            asid,
+                            PageFlags::USER_RX,
+                            &mut records,
+                        )
+                    })
+                    .expect("install");
+                state.with_user_spaces_mut(|spaces| {
+                    let _ = spaces
+                        .get_mut(asid)
+                        .expect("aspace")
+                        .unmap_page(VirtAddr(0x11_0000));
+                });
+                state.with_memory_state_mut(|memory| {
+                    KernelState::note_mapping_removed_locked(memory, phys);
+                });
+
+                // The acknowledgement has NOT arrived. A sibling now revokes the capability.
+                state
+                    .revoke_capability_in_cnode(cnode, cap)
+                    .expect("sibling revoke");
+
+                assert!(
+                    state.memory_object_slot_by_id(object_id).is_some(),
+                    "the object survives a revoke while the obligation is outstanding"
+                );
+                assert_eq!(
+                    pin_count(&state, object_id),
+                    Some(1),
+                    "the pin is the durable owner — leaving a revocable capability would not be"
+                );
+                assert!(
+                    !frame_is_available(&mut state, phys, 64),
+                    "no other allocation can receive a frame a remote translation may still reach"
+                );
+
+                // Settling the obligation — which the transaction does only after the ACK — is
+                // what finally releases it.
+                unpin(&mut state, object_id);
+                assert!(state.memory_object_slot_by_id(object_id).is_none());
+                assert!(frame_is_available(&mut state, phys, 64));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn lifetime_displaced_backing_is_held_from_its_displacement_until_its_own_ack() {
+        // Boundary 3: after a successful displacement, before the displaced page's ACK. Another
+        // reclaimer must not free the displaced backing either — and the displaced object is one
+        // this transaction did not create, so its hold is keyed by physical address.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let base = 0x12_0000usize;
+
+                let displaced = premap(&mut state, asid, base, &[(0, PageFlags::USER_RW)]);
+                let (old_object, virt, old_mapping) = displaced[0];
+
+                // Strip the displaced page's capability, so its map reference is its LAST
+                // reference: exactly the state in which the displacement's own accounting would
+                // otherwise make it reclaimable.
+                let (dcnode, dcap) = state
+                    .find_current_task_cap_for_memory_object_phys(old_mapping.phys)
+                    .expect("the premap minted a capability");
+                assert_eq!(dcnode, cnode);
+                state
+                    .revoke_capability_in_cnode(dcnode, dcap)
+                    .expect("revoke the displaced page's capability");
+                assert_eq!(
+                    refcounts(&state, old_object),
+                    Some((0, 1)),
+                    "its mapping is now its only reference"
+                );
+
+                // Displace it through the production body.
+                let (object_id, phys) = state.alloc_anonymous_object_without_cap().expect("object");
+                assert!(pin(&mut state, object_id));
+                let mut records = [PageRecord {
+                    virt,
+                    object_id,
+                    phys,
+                    cap: None,
+                    installed: false,
+                    pinned: true,
+                    displaced_pinned: false,
+                    replaced: None,
+                }];
+                state
+                    .with_vm_then_memory_mut(|spaces, memory| {
+                        crate::kernel::syscall::vm::install_and_account_locked(
+                            spaces,
+                            memory,
+                            asid,
+                            PageFlags::USER_RX,
+                            &mut records,
+                        )
+                    })
+                    .expect("install");
+                assert_eq!(
+                    records[0].replaced.map(|m| m.phys),
+                    Some(old_mapping.phys),
+                    "the displacement is recorded"
+                );
+                assert!(
+                    records[0].displaced_pinned,
+                    "and the displaced backing is held by this transaction"
+                );
+
+                // Before the ACK: another reclaimer runs. It must not free the displaced backing.
+                state.with_memory_state_mut(|memory| {
+                    KernelState::reclaim_memory_object_for_phys_locked(memory, old_mapping.phys);
+                });
+                state.with_memory_state_mut(|memory| {
+                    KernelState::reclaim_memory_object_if_unreferenced_locked(
+                        memory,
+                        CapObject::MemoryObject { id: old_object },
+                    );
+                });
+                assert!(
+                    state.memory_object_slot_by_id(old_object).is_some(),
+                    "a competing reclaimer cannot free displaced backing before its ACK"
+                );
+                assert!(
+                    !frame_is_available(&mut state, old_mapping.phys, 64),
+                    "and its frame stays out of the allocator"
+                );
+
+                // The transaction settles it: ACK, then release the hold, then reclaim.
+                state.with_memory_state_mut(|memory| {
+                    crate::kernel::syscall::vm::unpin_object_for_phys_locked(
+                        memory,
+                        old_mapping.phys,
+                    );
+                });
+                state.with_memory_state_mut(|memory| {
+                    KernelState::reclaim_memory_object_for_phys_locked(memory, old_mapping.phys);
+                });
+                assert!(
+                    state.memory_object_slot_by_id(old_object).is_none(),
+                    "released exactly once, when its own obligation is settled"
+                );
+                assert!(frame_is_available(&mut state, old_mapping.phys, 64));
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn lifetime_the_hold_is_taken_before_any_revocable_authority_is_published() {
+        // The ordering claim, read from the transaction: the pin is taken in phase R, and phase M
+        // — the only phase that publishes revocable authority — comes after it.
+        const TXN: &str = include_str!("../syscall/vm_txn.rs");
+        let body: String = TXN
+            .split("pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(")
+            .nth(1)
+            .expect("the transaction")
+            .split("\n}\n")
+            .next()
+            .expect("body")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pin = body.find("owners.pin_object(").expect("the hold");
+        let mint = body.find("owners.mint_frame_cap(").expect("the mint");
+        let install = body
+            .find("owners.install_and_account(")
+            .expect("the address-space phase");
+        assert!(
+            pin < mint && mint < install,
+            "hold -> revocable authority -> address space, in that order"
+        );
+        // And the displaced hold is taken inside the acquisition that displaces, before the
+        // reference it replaces is dropped.
+        const VM: &str = include_str!("../syscall/vm.rs");
+        let pass_b = VM
+            .split("// ── Pass B: account it. Cannot fail.")
+            .nth(1)
+            .expect("pass B")
+            .split("\n    Ok(())")
+            .next()
+            .expect("body");
+        let take = pass_b
+            .find("pin_object_for_phys_locked(")
+            .expect("the displaced hold");
+        let drop_ref = pass_b
+            .find("note_mapping_removed_locked(memory, old.phys)")
+            .expect("the reference it replaces");
+        assert!(
+            take < drop_ref,
+            "the displaced backing is held BEFORE its last mapping reference is dropped"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // The failing operation is inside the mutation boundary.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn a_refused_replacement_changes_nothing_it_touched() {
+        // The mutation boundary, exercised where it is reachable. Every refusal `map_page` can
+        // produce in a hosted build is a PRE-mutation gate — alignment, canonicality, privilege,
+        // and the two `len >= MAX_MAPPINGS` capacity checks — so a refused replacement must leave
+        // the predecessor mapped with its exact frame, attributes and backing references.
+        //
+        // The one refusal that happens AFTER the break-before-make is the arch backend's, which
+        // the hosted `arch_map_page` cannot produce (it is a no-op stub). That path's restoration
+        // is proven from source in the next case, together with the property that makes it
+        // guaranteed rather than attempted.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, asid) = kernel_with_asid();
+                let base = 0x13_0000usize;
+                let before = premap(&mut state, asid, base, &[(0, PageFlags::USER_RW)]);
+                let (old_object, virt, old_mapping) = before[0];
+                let (_, phys) = state.alloc_anonymous_object_without_cap().expect("object");
+
+                // A kernel-only flag set: refused by `mapping_is_allowed`, before anything moves.
+                let refused = state.with_user_spaces_mut(|spaces| {
+                    spaces.get_mut(asid).expect("aspace").map_page(
+                        virt,
+                        Mapping {
+                            phys,
+                            flags: PageFlags {
+                                user: false,
+                                ..PageFlags::USER_RW
+                            },
+                        },
+                    )
+                });
+                assert!(refused.is_err(), "the replacement must be refused");
+                assert_eq!(
+                    resolve_page(&state, asid, virt),
+                    Some(old_mapping),
+                    "the predecessor is still mapped, with its exact frame and attributes"
+                );
+                assert_eq!(
+                    refcounts(&state, old_object),
+                    Some((1, 1)),
+                    "and its capability and map references are untouched"
+                );
+                // Its backing never returned to the allocator, which is the operational meaning of
+                // "its contents are preserved": the frame was never handed to anyone else.
+                assert!(
+                    !frame_is_available(&mut state, old_mapping.phys, 64),
+                    "the predecessor's frame is still its own"
+                );
+
+                // And a misaligned physical address, the other pre-mutation gate.
+                let refused = state.with_user_spaces_mut(|spaces| {
+                    spaces.get_mut(asid).expect("aspace").map_page(
+                        virt,
+                        Mapping {
+                            phys: PhysAddr(phys.0 + 1),
+                            flags: PageFlags::USER_RX,
+                        },
+                    )
+                });
+                assert!(refused.is_err());
+                assert_eq!(
+                    resolve_page(&state, asid, virt),
+                    Some(old_mapping),
+                    "still untouched"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn replacement_failure_leaves_the_mapping_shadow_byte_identical() {
+        // The bookkeeping half: a replacement inside a multi-page run right-splits the run before
+        // it breaks. A refusal must undo that split too, or `len` and the entry shape drift on a
+        // path that changed nothing the caller can see.
+        const VM_SRC: &str = include_str!("../vm.rs");
+        let body = VM_SRC
+            .split("if let Err(e) = arch_map_page(self.asid, virt, mapping) {")
+            .nth(1)
+            .expect("the replacement failure path")
+            .split(
+                "\n                self.entries[i].as_mut().expect(\"entry\").mapping = mapping;",
+            )
+            .next()
+            .expect("body");
+        assert!(
+            body.contains("if arch_map_page(self.asid, virt, old).is_ok() {"),
+            "the predecessor must be put back, not merely deleted from the shadow"
+        );
+        assert!(
+            body.contains("if split_tail {") && body.contains(".pages = original_pages;"),
+            "and the bookkeeping split must be undone so the shadow is byte-identical"
+        );
+        assert!(
+            !body.contains("panic!") && !body.contains("unwrap()"),
+            "ordinary resource exhaustion must not become a kernel panic"
+        );
+        assert!(
+            body.contains("VM_MAP_REPLACE_RESTORE_FAILED"),
+            "and a restoration that somehow failed must be reported, never silent"
+        );
+        // The guarantee rests on unmap never freeing an intermediate table, so the re-map of the
+        // SAME virtual address allocates nothing. Checked on all three ports.
+        for (arch, src) in [
+            ("x86_64", include_str!("../../arch/x86_64/page_table.rs")),
+            ("aarch64", include_str!("../../arch/aarch64/page_table.rs")),
+            ("riscv64", include_str!("../../arch/riscv64/page_table.rs")),
+        ] {
+            let unmap = src
+                .split("pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {")
+                .nth(1)
+                .expect("unmap_page")
+                .split("\npub fn ")
+                .next()
+                .expect("body");
+            assert!(
+                !unmap.contains("free_table") && !unmap.contains("free_frame"),
+                "{arch}: `unmap_page` must not free an intermediate table, or the guaranteed \
+                 restoration would not be allocation-free"
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // The journal guarantee.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn compensation_allocates_nothing_and_a_refused_journal_changes_nothing() {
+        const TXN: &str = include_str!("../syscall/vm_txn.rs");
+        // The only allocation in the whole module is the journal reservation itself.
+        assert_eq!(
+            TXN.matches("alloc::vec::Vec").count(),
+            2,
+            "the journal is the module's ONLY allocation — one type, one constructor"
+        );
+        assert!(
+            !TXN.contains(".collect()"),
+            "compensation must iterate the reserved journal in place, never build a second \
+             collection on a failure path"
+        );
+        assert!(
+            TXN.contains("records.try_reserve_exact(pages).is_err()"),
+            "the reservation is fallible and checked"
+        );
+        // The reservation precedes every owner call that could mutate anything.
+        let body: String = TXN
+            .split("pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(")
+            .nth(1)
+            .expect("the transaction")
+            .split("\n}\n")
+            .next()
+            .expect("body")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reserve = body.find("try_reserve_exact").expect("the reservation");
+        for mutating in [
+            "owners.acquire_object(",
+            "owners.pin_object(",
+            "owners.mint_frame_cap(",
+            "owners.install_and_account(",
+        ] {
+            let at = body.find(mutating).unwrap_or_else(|| panic!("{mutating}"));
+            assert!(
+                reserve < at,
+                "the journal is reserved before `{mutating}`, so a refusal costs nothing"
+            );
+        }
+        // And the honest statement of when it can fail is in the source, not omitted.
+        assert!(
+            TXN.contains("different pools, so heap exhaustion below the object-table limit"),
+            "the reservation's failure mode must be described honestly — the fixed object-table \
+             capacity alone does not prove the allocation cannot fail"
+        );
+    }
+
+    #[test]
+    fn a_refused_journal_leaves_the_system_exactly_as_it_found_it() {
+        // Behavioural counterpart: a request the journal cannot serve refuses with nothing
+        // acquired, minted, installed, pinned or freed. Driven at the size the object table
+        // cannot serve either, which is the reachable shape of the same refusal.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let before = quiescent(&state, cnode);
+                let base = 0x14_0000usize;
+
+                // More pages than the object table can ever hold.
+                let pages = 4096usize;
+                let mut frame = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::VmAnonMap as usize,
+                    [0, base, pages * PAGE, 0x1 | 0x4, 0, 0],
+                );
+                let result = state.handle_trap(Trap::Syscall, Some(&mut frame));
+                assert!(
+                    result.is_err() || frame.error_code().is_some(),
+                    "a request beyond the object table must refuse"
+                );
+                assert_eq!(
+                    quiescent(&state, cnode),
+                    before,
+                    "and leave frames, objects and capability slots exactly as they were"
+                );
+                assert_eq!(
+                    resolve_page(&state, asid, VirtAddr(base as u64)),
+                    None,
+                    "with nothing installed"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════════════
