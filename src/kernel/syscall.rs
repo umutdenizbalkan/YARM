@@ -342,6 +342,9 @@ pub(crate) mod vm;
 pub(crate) mod vm_split;
 /// U9-VM-ENTRY1 — the one mapping/brk policy both the broad and the split adapters drive.
 pub(crate) mod vm_txn;
+/// U9-XFER1 §3 — THE transfer-release transaction (NR 4), shared by both adapters.
+pub(crate) mod xfer_split;
+pub(crate) mod xfer_txn;
 pub(crate) mod yield_txn;
 
 // Stage 149: [S] shared helper re-exports so sibling modules and external
@@ -5850,13 +5853,39 @@ mod tests {
                 && cap_src.contains("control_plane_set_process_cnode_slots_planned"),
             "capability release/CNode marker strings must remain in cap.rs"
         );
+        // U9-XFER1 §3 moved NR 4's validation — and therefore its error vocabulary — out of the
+        // handler and into the shared transaction, so both adapters raise the same errors for the
+        // same inputs. The claim this guard makes is unchanged (the vocabulary must not have
+        // silently shifted); what changed is that it is now asserted against the module that owns
+        // it, plus the CNode handler's own errors, which stayed in cap.rs.
+        let xfer_src = include_str!("syscall/xfer_txn.rs");
         assert!(
             cap_src.contains("SyscallError::InvalidArgs")
-                && cap_src.contains("SyscallError::Internal")
-                && cap_src.contains("KernelError::UserMemoryFault")
                 && cap_src.contains("KernelError::TaskMissing"),
+            "the CNode handler's error markers must remain in cap.rs"
+        );
+        assert!(
+            xfer_src.contains("SyscallError::InvalidArgs")
+                && xfer_src.contains("SyscallError::Internal")
+                && xfer_src.contains("KernelError::UserMemoryFault")
+                && xfer_src.contains("KernelError::InvalidCapability"),
             "capability syscall error handling markers must remain unchanged"
         );
+        // …and the mapping from refusal to error must exist EXACTLY once, so a second adapter
+        // cannot introduce a second answer for the same input.
+        assert_eq!(
+            xfer_src
+                .matches("impl From<XferRefusal> for SyscallError")
+                .count(),
+            1,
+            "one refusal-to-error mapping, shared by both adapters"
+        );
+        for adapter in [cap_src, include_str!("syscall/xfer_split.rs")] {
+            assert!(
+                !adapter.contains("XferRefusal::"),
+                "an adapter must not restate the refusal-to-error mapping"
+            );
+        }
         assert!(
             !syscall_src.contains(&["fn parse_v3_request", "_bytes"].concat())
                 && recv_v3_src.contains(&["fn parse_v3_request", "_bytes"].concat()),
@@ -5891,10 +5920,16 @@ mod tests {
         );
         assert!(
             cap_src.contains("current_task_cnode")
-                && cap_src.contains("round_up_page")
                 && cap_src.contains("revoke_capability_in_cnode")
                 && cap_src.contains("control_plane_set_process_cnode_slots_planned"),
             "cap generation/refcount/slot semantic call sites must remain in cap.rs"
+        );
+        // U9-XFER1 §3 moved NR 4's page-rounding into the shared transaction, where both adapters
+        // reach the same one. The claim — that the rounding is still performed, and performed
+        // once — is asserted where it now lives.
+        assert!(
+            xfer_src.contains("round_up_page(len_arg)") && !cap_src.contains("round_up_page("),
+            "NR 4's page rounding must live once, in the shared transaction"
         );
     }
 

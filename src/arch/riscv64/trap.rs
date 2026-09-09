@@ -923,6 +923,10 @@ pub fn handle_riscv_trap_entry_shared(
             || nr == crate::kernel::syscall::SYSCALL_VM_MAP_NR
             || nr == crate::kernel::syscall::SYSCALL_VM_ANON_MAP_NR
             || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
+            // U9-XFER1 §3: NR 4 `TransferRelease`, on the same terms. It is NON-SWITCHING —
+            // it unmaps a range, revokes a capability and returns to the same caller — so it
+            // finalizes through the same same-task ecall writeback the three above it use.
+            || nr == crate::kernel::syscall::SYSCALL_TRANSFER_RELEASE_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without

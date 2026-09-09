@@ -34,6 +34,7 @@ use crate::arch::raw_syscall;
 const SYSCALL_VM_MAP_NR: usize = 3;
 const SYSCALL_VM_ANON_MAP_NR: usize = 13;
 const SYSCALL_VM_BRK_NR: usize = 14;
+const SYSCALL_TRANSFER_RELEASE_NR: usize = 4;
 
 const PROT_READ: usize = 0x1;
 const PROT_WRITE: usize = 0x2;
@@ -307,6 +308,98 @@ pub fn run_once(non_aspace_cap: Option<u32>) {
         SYSCALL_VM_BRK_NR,
         "query_after",
         &trap(SYSCALL_VM_BRK_NR, [0, 0, 0, 0, 0, 0]),
+    );
+
+    // ── NR 4 TransferRelease — U9-XFER1 §4 ──────────────────────────────────────────────────
+    //
+    // NR 4 had no live issuer either: no server in any profile called it, so its converted route
+    // could not have executed on any architecture. §4 authorizes a minimal witness on the
+    // EXISTING ABI, and NR 4's is three registers, so it fits here rather than needing anything
+    // new.
+    //
+    // What this witnesses is exactly what U9-XFER1 §3 CHANGED: the refusal set, each member now
+    // raised from READS ONLY, before the range or the capability is touched. Before §3, two of
+    // these unmapped and reclaimed every page they had walked before discovering the problem and
+    // then told the caller the call had failed. The positive evidence is the re-map below: it can
+    // only succeed if a refused release really did leave the prefix alone.
+    //
+    // NR 4's SUCCESS path is deliberately NOT witnessed here, and the reason is structural rather
+    // than an omission: succeeding means REVOKING a capability, and every capability this server
+    // holds is one it needs to keep running. A witness that destroyed the init server's own
+    // authority would take the whole profile down with it. That path is the part of NR 4 §3 did
+    // not change; the parts it did change are all here.
+
+    // `(0,0)` against a slot the active-transfer registry does not hold. Refused with nothing
+    // touched.
+    note(
+        SYSCALL_TRANSFER_RELEASE_NR,
+        "not_registered_refused",
+        &trap(SYSCALL_TRANSFER_RELEASE_NR, [0xFFFF_FFFF, 0, 0, 0, 0, 0]),
+    );
+
+    // An explicit range of zero length.
+    note(
+        SYSCALL_TRANSFER_RELEASE_NR,
+        "zero_len_refused",
+        &trap(
+            SYSCALL_TRANSFER_RELEASE_NR,
+            [0xFFFF_FFFF, WITNESS_BASE + 64 * PAGE, 0, 0, 0, 0],
+        ),
+    );
+
+    // An explicit range whose base is not page aligned.
+    note(
+        SYSCALL_TRANSFER_RELEASE_NR,
+        "unaligned_base_refused",
+        &trap(
+            SYSCALL_TRANSFER_RELEASE_NR,
+            [0xFFFF_FFFF, WITNESS_BASE + 64 * PAGE + 1, PAGE, 0, 0, 0],
+        ),
+    );
+
+    // A page-aligned range this witness has NEVER mapped. The whole-range proof refuses it before
+    // the first unmap; the old handler would have walked into it.
+    note(
+        SYSCALL_TRANSFER_RELEASE_NR,
+        "range_not_mapped_refused",
+        &trap(
+            SYSCALL_TRANSFER_RELEASE_NR,
+            [0xFFFF_FFFF, WITNESS_BASE + 512 * PAGE, PAGE, 0, 0, 0],
+        ),
+    );
+
+    // A range whose FIRST page is mapped and whose second is not — the exact shape that used to
+    // destroy the mapped prefix and then report failure. The prefix must survive, which the
+    // re-read below checks.
+    note(
+        SYSCALL_TRANSFER_RELEASE_NR,
+        "partial_range_refused",
+        &trap(
+            SYSCALL_TRANSFER_RELEASE_NR,
+            [0xFFFF_FFFF, WITNESS_BASE + 64 * PAGE, 2 * PAGE, 0, 0, 0],
+        ),
+    );
+
+    // The prefix is still mapped: re-mapping it read-only DISPLACES a live page, which only
+    // succeeds if the page the refused release walked over is still there. A `remap_displacing`
+    // style success here is the positive evidence that the refusal destroyed nothing.
+    note(
+        SYSCALL_VM_ANON_MAP_NR,
+        "xfer_refusal_left_the_prefix_mapped",
+        &trap(
+            SYSCALL_VM_ANON_MAP_NR,
+            [0, WITNESS_BASE + 64 * PAGE, PAGE, PROT_READ, 0, 0],
+        ),
+    );
+
+    // …and an overflowing range, the last read-only refusal.
+    note(
+        SYSCALL_TRANSFER_RELEASE_NR,
+        "range_overflow_refused",
+        &trap(
+            SYSCALL_TRANSFER_RELEASE_NR,
+            [0xFFFF_FFFF, usize::MAX & !(PAGE - 1), PAGE, 0, 0, 0],
+        ),
     );
 
     crate::user_log!("VM_ENTRY_WITNESS_END");

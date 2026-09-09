@@ -3,10 +3,10 @@
 
 use super::EndpointWaiterRecord;
 use super::{
-    IpcEndpointRecvResult, IpcEndpointSendResult, IpcEndpointSplitRejectReason, IpcFastpathResult,
-    IpcSubsystem, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
-    NotificationObject, ReceiverWaiterIdentity, ReplyCapRecord, ReplyRecordSetOutcome,
-    SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
+    IpcEndpointPeekResult, IpcEndpointRecvResult, IpcEndpointSendResult,
+    IpcEndpointSplitRejectReason, IpcFastpathResult, IpcSubsystem, KernelError, KernelState,
+    MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, NotificationObject, ReceiverWaiterIdentity,
+    ReplyCapRecord, ReplyRecordSetOutcome, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{EndpointMode, Message, ThreadId};
@@ -5532,6 +5532,26 @@ impl KernelState {
         })
     }
 
+    /// U9-XFER1 §3 — the broad wrapper for the NON-CONSUMING head read (NR 30).
+    pub(crate) fn peek_queued_with_cap_transfer(
+        &mut self,
+        endpoint_idx: usize,
+    ) -> IpcEndpointPeekResult {
+        self.with_ipc_state_mut(|ipc| ipc_peek_queued_with_cap_transfer_locked(ipc, endpoint_idx))
+    }
+
+    /// U9-XFER1 §3 — the broad wrapper for the identity-checked commit (NR 30): consume the
+    /// message that was peeked, and only that one.
+    pub(crate) fn commit_peeked_recv_with_cap_transfer(
+        &mut self,
+        endpoint_idx: usize,
+        expected: &Message,
+    ) -> IpcEndpointRecvResult {
+        self.with_ipc_state_mut(|ipc| {
+            commit_peeked_recv_with_cap_transfer_locked(ipc, endpoint_idx, expected)
+        })
+    }
+
     /// Apply a deferred scheduler wake plan returned by the Stage 4D split recv helper.
     ///
     /// Must be called outside `ipc_state_lock`. Wakes the sender whose message was
@@ -8375,6 +8395,106 @@ pub(crate) fn ipc_try_recv_queued_admitted_locked(
 
 /// U9-C — the rank-3 body of [`KernelState::ipc_try_recv_queued_with_cap_transfer`], for the
 /// same reason as its plain sibling above: one implementation, two owners.
+/// U9-XFER1 §3 — the NON-CONSUMING half of
+/// [`ipc_try_recv_queued_with_cap_transfer_locked`], for NR 30 `RecvSharedV3`.
+///
+/// Runs exactly the same eligibility gates in exactly the same order — index range, receiver
+/// waiter, head sender waiter, the sender-refill cap-flag guard, endpoint presence and buffered
+/// mode — and then *peeks* the head instead of dequeuing it. Nothing is mutated on any path.
+///
+/// This is what lets NR 30 do every fallible thing it must do — mint the transferred capability,
+/// resolve the object, map its pages, register the active-transfer entry — BEFORE the message is
+/// consumed and the sender is settled. Before this existed, the dequeue came first and every one
+/// of those failures destroyed the message and woke the sender while returning an error to the
+/// receiver.
+///
+/// The peeked `Message` is `Copy` and `PartialEq`, so the commit
+/// ([`commit_peeked_recv_with_cap_transfer_locked`]) can prove the head is still the one this
+/// transaction planned around before it consumes anything.
+pub(crate) fn ipc_peek_queued_with_cap_transfer_locked(
+    ipc: &mut IpcSubsystem,
+    endpoint_idx: usize,
+) -> IpcEndpointPeekResult {
+    if endpoint_idx >= ipc.endpoints.len() {
+        return IpcEndpointPeekResult::Ineligible(
+            IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
+        );
+    }
+    if ipc.endpoint_waiter_present(endpoint_idx) {
+        return IpcEndpointPeekResult::Ineligible(
+            IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
+        );
+    }
+    let head_waiter: Option<(crate::kernel::ipc::SenderWakeTarget, Message)> =
+        ipc.endpoint_sender_waiters[endpoint_idx][0].map(|w| (w.wake_target(), w.msg));
+    if head_waiter.is_none()
+        && ipc.endpoint_sender_waiters[endpoint_idx]
+            .iter()
+            .any(Option::is_some)
+    {
+        return IpcEndpointPeekResult::Ineligible(
+            IpcEndpointSplitRejectReason::SenderWaiterPresent,
+        );
+    }
+    if let Some((_, waiter_msg)) = head_waiter {
+        let split_unsafe_flags =
+            Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN | Message::FLAG_REPLY_CAP;
+        if (waiter_msg.flags & split_unsafe_flags) != 0 || waiter_msg.transferred_cap().is_some() {
+            return IpcEndpointPeekResult::Ineligible(
+                IpcEndpointSplitRejectReason::SenderWaiterPresent,
+            );
+        }
+    }
+    let Some(endpoint_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
+        return IpcEndpointPeekResult::Ineligible(IpcEndpointSplitRejectReason::EndpointMissing);
+    };
+    let endpoint = kernel_mut(endpoint_storage);
+    if endpoint.mode() != EndpointMode::Buffered {
+        return IpcEndpointPeekResult::Ineligible(
+            IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+        );
+    }
+    let Some(message) = endpoint.peek() else {
+        return IpcEndpointPeekResult::Ineligible(IpcEndpointSplitRejectReason::EmptyQueue);
+    };
+    IpcEndpointPeekResult::Peeked(*message)
+}
+
+/// U9-XFER1 §3 — the COMMIT half: consume the message this transaction peeked, and only that one.
+///
+/// Re-runs the same gates (they can have changed since the peek — this is one rank-3 acquisition,
+/// not a continuation of the earlier one) and then compares the head against `expected` before
+/// dequeuing. If the head is a different message, another receiver took the one this transaction
+/// planned around, and NOTHING is consumed: the caller compensates what it built and reports the
+/// ABI's existing "nothing for you right now" outcome.
+///
+/// The identity check is the same discipline U9-VM-ENTRY1-S §0 established for
+/// `settle_displaced_hold`: name what you took, and act only if it is still that. `Message` is
+/// structurally compared, so two byte-identical messages from the same sender are
+/// interchangeable — dequeuing either is equally correct, which is exactly what the check needs
+/// to be sound.
+///
+/// Everything after the identity check is the unchanged tail of
+/// [`ipc_try_recv_queued_with_cap_transfer_locked`]: dequeue, then refill from the head sender
+/// waiter and hand its wake target back for the caller to apply outside rank 3.
+pub(crate) fn commit_peeked_recv_with_cap_transfer_locked(
+    ipc: &mut IpcSubsystem,
+    endpoint_idx: usize,
+    expected: &Message,
+) -> IpcEndpointRecvResult {
+    match ipc_peek_queued_with_cap_transfer_locked(ipc, endpoint_idx) {
+        IpcEndpointPeekResult::Peeked(head) if head == *expected => {}
+        IpcEndpointPeekResult::Peeked(_) => {
+            // Someone else took it. Not an error in the endpoint — an ordinary lost race.
+            return IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::EmptyQueue);
+        }
+        IpcEndpointPeekResult::Ineligible(reason) => {
+            return IpcEndpointRecvResult::Ineligible(reason);
+        }
+    }
+    ipc_try_recv_queued_with_cap_transfer_locked(ipc, endpoint_idx)
+}
+
 pub(crate) fn ipc_try_recv_queued_with_cap_transfer_locked(
     ipc: &mut IpcSubsystem,
     endpoint_idx: usize,

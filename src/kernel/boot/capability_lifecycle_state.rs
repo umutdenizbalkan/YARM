@@ -1013,6 +1013,28 @@ impl SplitRevokePlan {
     }
 }
 
+/// U9-XFER1 §3 — the HEAP-reserved reservation for a root capability **userspace holds**
+/// (NR 4 `TransferRelease`), the sibling of the stack-allocated [`SplitRevokePlan`].
+///
+/// Same three fixed fields, but the closure and the link-removal set are `Vec`s rather than fixed
+/// arrays, because NR 4's root can have been delegated to arbitrary depth across processes — a
+/// closure bounded only by `MAX_DELEGATED_CAPABILITY_LINKS`, which is exactly the bound the broad
+/// `collect_delegated_descendants` works to (and it, too, uses a heap `Vec`).
+///
+/// The element type stays `Option<SplitRevokeNode>` / `Option<usize>` so both reservations hand
+/// [`crate::runtime::SharedKernel::commit_revoke_split`] the same slice shapes and the teardown
+/// exists exactly once.
+///
+/// Reserving is the LAST thing that happens before the first mutation, so a failed allocation is
+/// a pre-mutation refusal that costs nothing.
+pub(crate) struct SplitRevokeReservation {
+    pub(crate) cnode: CNodeId,
+    pub(crate) root: SplitRevokeNode,
+    pub(crate) root_object: CapObject,
+    pub(crate) descendants: alloc::vec::Vec<Option<SplitRevokeNode>>,
+    pub(crate) link_removals: alloc::vec::Vec<Option<usize>>,
+}
+
 impl crate::runtime::SharedKernel {
     /// Stage 198B — split-read resolve of the `CapObject` a receiver-local `cap` references, read
     /// OUT of the receiver's cspace under the rank-4 capability seam only (no broad
@@ -1607,16 +1629,50 @@ impl crate::runtime::SharedKernel {
         cap: CapId,
     ) -> Result<CapObject, SplitRevokeRefusal> {
         let plan = self.plan_revoke_capability_no_vm_split(receiver_tid, cap)?;
+        self.commit_revoke_split(
+            plan.cnode,
+            plan.root,
+            plan.root_object,
+            plan.descendant_slice(),
+            &plan.link_removals[..plan.link_removal_len],
+        )
+    }
+
+    /// U9-XFER1 §3 — the commit half of [`Self::revoke_capability_no_vm_split`], taking its
+    /// working set as SLICES rather than reading it out of one fixed-size plan struct.
+    ///
+    /// The teardown itself is unchanged and remains the only implementation. What the extraction
+    /// buys is that the closure can be RESERVED two different ways for two different callers
+    /// without the teardown being written twice:
+    ///
+    /// * the provisional-cap rollback sites keep the bounded, stack-allocated
+    ///   [`SplitRevokePlan`] — their closure is provably empty, so a fixed array costs nothing
+    ///   and allocates nothing;
+    /// * NR 4 `TransferRelease` reserves on the HEAP (see
+    ///   [`Self::plan_revoke_user_held_capability_split`]), because its root is a capability
+    ///   USERSPACE HOLDS: the delegated closure is bounded only by the link table, not by 16.
+    ///
+    /// Both reservations are complete before this function is entered, so this function cannot
+    /// refuse for capacity — the single `Err` it can produce is the root slot having vanished
+    /// between the preflight and the first mutation, at which point nothing has changed yet.
+    fn commit_revoke_split(
+        &self,
+        cnode: CNodeId,
+        root: SplitRevokeNode,
+        root_object: CapObject,
+        descendants: &[Option<SplitRevokeNode>],
+        link_removals: &[Option<usize>],
+    ) -> Result<CapObject, SplitRevokeRefusal> {
         // (1) rank 4: the root revoke. This is the first mutation; if the slot vanished between
         // the preflight and here, nothing has changed yet and the refusal is still clean.
-        if self.cspace_revoke_split(plan.cnode, plan.root.cap).is_err() {
+        if self.cspace_revoke_split(cnode, root.cap).is_err() {
             return Err(SplitRevokeRefusal::Unresolvable);
         }
         // (2) descendants, each complete before the next — the broad interleave, including the
         // per-descendant mapping revocation and memory obligations that
         // `revoke_capability_direct_in_process_cnode` performs between the revoke and the
         // notification destroy.
-        for descendant in plan.descendant_slice().iter().flatten().copied() {
+        for descendant in descendants.iter().flatten().copied() {
             let object = self
                 .process_cnode_for_pid_split(descendant.pid)
                 .and_then(|cnode| self.cspace_read_then_revoke_split(cnode, descendant.cap));
@@ -1630,12 +1686,178 @@ impl crate::runtime::SharedKernel {
             }
         }
         // (3) rank 4: delegation-link removal.
-        self.clear_delegation_links_split(&plan.link_removals[..plan.link_removal_len]);
+        self.clear_delegation_links_split(link_removals);
         // (4) the root's obligations (4) and (5), in the broad order: mappings, refcount, reclaim.
-        self.memory_obligations_split(plan.root.pid, plan.root.cap, plan.root_object);
+        self.memory_obligations_split(root.pid, root.cap, root_object);
         // (5) rank 3 then rank 2 → rank 1: the root's notification obligation.
-        self.destroy_notification_for_revoked_object_split(plan.root_object);
-        Ok(plan.root_object)
+        self.destroy_notification_for_revoked_object_split(root_object);
+        Ok(root_object)
+    }
+
+    /// U9-XFER1 §3 — the HEAP-reserved sibling of
+    /// [`Self::plan_revoke_capability_no_vm_split`], for a root capability **userspace holds**.
+    ///
+    /// Two deliberate differences from the bounded plan, each forced by what NR 4's ABI admits:
+    ///
+    /// * **No fixed capacity, and therefore no capacity refusal.** `SPLIT_REVOKE_MAX_DESCENDANTS`
+    ///   (16) and `SPLIT_REVOKE_MAX_LINK_HITS` (32) size stack arrays, and they are sound at the
+    ///   rollback sites only because the closure there is provably EMPTY — the cap was minted
+    ///   moments earlier in the same syscall and never handed out. NR 4's cap has been handed out
+    ///   and can have been delegated to arbitrary depth across processes, bounded only by
+    ///   `MAX_DELEGATED_CAPABILITY_LINKS` (the same bound the broad
+    ///   `collect_delegated_descendants` works to, and it uses a heap `Vec` for exactly this
+    ///   reason). Refusing at 16 would introduce a refusal for authority the broad path serves.
+    ///
+    /// * **No class gate.** `SplitRevokeRefusal::ReplyObject` is CALLSITE policy, not object
+    ///   policy: the rollback sites need U9-C's reply-registry transaction
+    ///   (`rollback_reply_cap_split`) because they are undoing a mint. Broad
+    ///   `revoke_capability_in_cnode` — which is what NR 4 actually runs — treats a `Reply` root
+    ///   GENERICALLY, and produces none of that registry work. Routing NR 4's `Reply` to the
+    ///   rollback owner would therefore CHANGE its semantics by additionally clearing the
+    ///   reply-waiter cap alias. So `Reply` goes through the same generic commit here, exactly as
+    ///   it does on the broad path, where `adjust_memory_object_cap_refcount`,
+    ///   `reclaim_memory_object_if_unreferenced` and `destroy_notification_for_revoked_cap` are
+    ///   all early-return no-ops for it.
+    ///
+    /// The reservation is complete BEFORE the first mutation, so an allocation failure is a
+    /// pre-mutation refusal that costs nothing — the U9-VM-ENTRY1 journal discipline.
+    /// Makes NO mutation on any path.
+    pub(crate) fn plan_revoke_user_held_capability_split(
+        &self,
+        owner_tid: u64,
+        cap: CapId,
+    ) -> Result<SplitRevokeReservation, SplitRevokeRefusal> {
+        let cnode = self
+            .task_cnode_split(owner_tid)
+            .ok_or(SplitRevokeRefusal::Unresolvable)?;
+        let pid = self
+            .pid_for_cnode_split(cnode)
+            .ok_or(SplitRevokeRefusal::Unresolvable)?;
+        let root_object = self
+            .resolved_capability_split(cnode, cap)
+            .ok_or(SplitRevokeRefusal::Unresolvable)?
+            .object;
+        let root = SplitRevokeNode { pid, cap };
+        // ONE rank-4 snapshot of the link table, shared by both collectors. The broad path clones
+        // it once per collector; taking it once here is the same data with half the allocation.
+        let links = self.with_capability_state_split_mut(|capability| {
+            capability.delegated_capability_links.clone()
+        });
+        let descendants = self.collect_user_held_descendants_split(root, links.as_ref());
+        let link_removals =
+            self.collect_user_held_link_removals_split(root, &descendants, links.as_ref());
+        Ok(SplitRevokeReservation {
+            cnode,
+            root,
+            root_object,
+            descendants,
+            link_removals,
+        })
+    }
+
+    /// U9-XFER1 §3 — the heap closure. Same BFS the broad `collect_delegated_descendants`
+    /// performs, over the same `delegated_capability_links` table, with the same
+    /// `MAX_DELEGATED_CAPABILITY_LINKS` bound and the same tid→pid resolution — read through the
+    /// rank-4 split seam instead of the broad one. No class gate (see the caller's note).
+    fn collect_user_held_descendants_split(
+        &self,
+        root: SplitRevokeNode,
+        links: &[Option<super::defs::DelegatedCapabilityLink>],
+    ) -> alloc::vec::Vec<Option<SplitRevokeNode>> {
+        let mut found: alloc::vec::Vec<Option<SplitRevokeNode>> = alloc::vec::Vec::new();
+        let mut queue: alloc::vec::Vec<SplitRevokeNode> = alloc::vec::Vec::new();
+        let mut head = 0usize;
+        queue.push(root);
+        while head < queue.len() {
+            let current = queue[head];
+            head += 1;
+            for link in links.iter().flatten() {
+                let source_pid = self
+                    .process_id_split_read(link.source_tid)
+                    .unwrap_or(link.source_tid);
+                if source_pid != current.pid || link.source_cap != current.cap {
+                    continue;
+                }
+                let child = SplitRevokeNode {
+                    pid: self
+                        .process_id_split_read(link.dest_tid)
+                        .unwrap_or(link.dest_tid),
+                    cap: link.dest_cap,
+                };
+                if found.iter().flatten().any(|seen| *seen == child) {
+                    continue;
+                }
+                if found.len() >= MAX_DELEGATED_CAPABILITY_LINKS
+                    || queue.len() >= MAX_DELEGATED_CAPABILITY_LINKS
+                {
+                    break;
+                }
+                found.push(Some(child));
+                queue.push(child);
+            }
+        }
+        found
+    }
+
+    /// U9-XFER1 §3 — the exact link-removal set, the heap twin of
+    /// `collect_delegation_link_removals_split`: every link whose resolved source OR dest equals
+    /// the root or a descendant, which is what the broad `remove_delegation_links_for` clears.
+    fn collect_user_held_link_removals_split(
+        &self,
+        root: SplitRevokeNode,
+        descendants: &[Option<SplitRevokeNode>],
+        links: &[Option<super::defs::DelegatedCapabilityLink>],
+    ) -> alloc::vec::Vec<Option<usize>> {
+        let mut removals: alloc::vec::Vec<Option<usize>> = alloc::vec::Vec::new();
+        for (idx, maybe_link) in links.iter().enumerate() {
+            let Some(link) = maybe_link else {
+                continue;
+            };
+            let source = SplitRevokeNode {
+                pid: self
+                    .process_id_split_read(link.source_tid)
+                    .unwrap_or(link.source_tid),
+                cap: link.source_cap,
+            };
+            let dest = SplitRevokeNode {
+                pid: self
+                    .process_id_split_read(link.dest_tid)
+                    .unwrap_or(link.dest_tid),
+                cap: link.dest_cap,
+            };
+            let involved = source == root
+                || dest == root
+                || descendants
+                    .iter()
+                    .flatten()
+                    .any(|d| *d == source || *d == dest);
+            if involved {
+                removals.push(Some(idx));
+            }
+        }
+        removals
+    }
+
+    /// U9-XFER1 §3 — the complete off-broad-lock teardown of a capability USERSPACE HOLDS,
+    /// reaching the same [`Self::commit_revoke_split`] body the rollback cohort reaches, over a
+    /// heap-reserved closure.
+    ///
+    /// This is the split twin of what NR 4 `TransferRelease` runs through
+    /// `revoke_capability_in_cnode` on the broad path. Every refusal is raised before the first
+    /// mutation.
+    pub(crate) fn revoke_user_held_capability_split(
+        &self,
+        owner_tid: u64,
+        cap: CapId,
+    ) -> Result<CapObject, SplitRevokeRefusal> {
+        let plan = self.plan_revoke_user_held_capability_split(owner_tid, cap)?;
+        self.commit_revoke_split(
+            plan.cnode,
+            plan.root,
+            plan.root_object,
+            &plan.descendants,
+            &plan.link_removals,
+        )
     }
 
     /// U9-F production entry point for the ordinary (non-`Reply`) recv-boundary rollback cohort:
@@ -1682,5 +1904,56 @@ impl crate::runtime::SharedKernel {
             true
         );
         true
+    }
+
+    // ── U9-XFER1 §3 — the rank-3 active-transfer-registry seams NR 4 needs off the broad lock ──
+    //
+    // Each is the `&mut IpcSubsystem` body the broad `KernelState` method already owns, reached
+    // through `with_ipc_split_mut` instead of the broad acquisition. Byte-identical slot logic;
+    // the broad and split routes read and write the same records the same way.
+
+    /// rank 3 — the registered `(base, len)` for this `(owner, cap)` pair, if the registry holds
+    /// one. The split twin of `KernelState::active_transfer_mapping_for`.
+    pub(crate) fn active_transfer_mapping_for_split(
+        &self,
+        owner_tid: crate::kernel::ipc::ThreadId,
+        transfer_cap: CapId,
+    ) -> Option<(crate::kernel::vm::VirtAddr, usize)> {
+        self.with_ipc_split_mut(|ipc| {
+            ipc.active_transfer_mappings
+                .iter()
+                .flatten()
+                .find(|mapping| {
+                    mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap
+                })
+                .map(|mapping| (mapping.base, mapping.len))
+        })
+    }
+
+    /// rank 3 — clear the registry entry for this pair. Reaches the SAME
+    /// `remove_active_transfer_mapping_locked` body the broad method reaches, so the two cannot
+    /// come to disagree about which record matches.
+    pub(crate) fn remove_active_transfer_mapping_split(
+        &self,
+        owner_tid: crate::kernel::ipc::ThreadId,
+        transfer_cap: CapId,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::remove_active_transfer_mapping_locked(ipc, owner_tid, transfer_cap)
+        })
+    }
+
+    /// rank 3 — the release accounting, the split twin of
+    /// `KernelState::note_shared_mem_released`: both counters, in the same order, with the same
+    /// saturating arithmetic.
+    pub(crate) fn note_shared_mem_released_split(&self, len: usize) {
+        self.with_ipc_split_mut(|ipc| {
+            ipc.telemetry.transfer_release_calls =
+                ipc.telemetry.transfer_release_calls.saturating_add(1);
+            ipc.telemetry.shared_mem_bytes_released = ipc
+                .telemetry
+                .shared_mem_bytes_released
+                .saturating_add(len as u64);
+        });
     }
 }

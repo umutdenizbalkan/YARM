@@ -2479,6 +2479,10 @@ fn try_split_dispatch_nonswitching_into_frame(
     if matches!(syscall, Syscall::VmBrk) {
         return try_split_vm_brk_into_frame(shared, cpu, frame);
     }
+    // U9-XFER1 §3: NR 4 joins them, and for the same reason — its route is TOTAL after this gate.
+    if matches!(syscall, Syscall::TransferRelease) {
+        return try_split_transfer_release_into_frame(shared, cpu, frame);
+    }
 
     // U9-MO2 §4: `CreateInitramfsFileSliceMo` (NR 28) is routed to its own pre-lock owner for
     // the same reason as the two above — eligibility (SystemServer caller, resolvable name,
@@ -3887,6 +3891,47 @@ pub(crate) fn try_split_vm_brk_into_frame(
     })
 }
 
+/// U9-XFER1 §3 — the pre-lock NR 4 (`TransferRelease`) route.
+///
+/// TOTAL after the NR gate, for the same reason NR 3 / NR 13 / NR 14 are: after the range is
+/// unmapped and the capability revoked, answering `None` would hand a partially executed
+/// transaction to a dispatcher that knows nothing about it — and here that dispatcher would then
+/// run the whole release a SECOND time against an already-released range.
+///
+/// It never needs to. `xfer_txn` raises every refusal in phase V, from reads only, so a refused
+/// request has changed nothing and is returned as the exact error the broad handler produced for
+/// the same input. There is no branch between the first mutation and the return.
+fn try_split_transfer_release_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::xfer_txn::run_transfer_release_transaction;
+    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
+    if !matches!(syscall, Syscall::TransferRelease) {
+        return None;
+    }
+    let tid = match split_vm_caller_tid(shared, cpu) {
+        Ok(tid) => tid,
+        Err(e) => return Some(Err(e)),
+    };
+    let transfer_cap = crate::kernel::capabilities::CapId(
+        frame.arg(crate::kernel::syscall::SYSCALL_ARG_CAP) as u64,
+    );
+    let base_arg = frame.arg(crate::kernel::syscall::SYSCALL_ARG_PTR);
+    let len_arg = frame.arg(crate::kernel::syscall::SYSCALL_ARG_LEN);
+    let mut owners = crate::kernel::syscall::xfer_split::SplitXferOwners { shared, tid, cpu };
+    Some(
+        match run_transfer_release_transaction(&mut owners, transfer_cap, base_arg, len_arg) {
+            Ok(map_len) => {
+                frame.set_ok(map_len, 0, 0);
+                Ok(())
+            }
+            Err(e) => Err(TrapHandleError::Syscall(e)),
+        },
+    )
+}
+
 /// U9-SPAWN1 SP-2 — the pre-lock NR 11 (`SpawnThread`) route.
 ///
 /// NR 11 is the smallest member of the spawn family: it creates no address space, loads no ELF,
@@ -4713,6 +4758,11 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         Syscall::VmMap => Some(syscall),
         Syscall::VmAnonMap => Some(syscall),
         Syscall::VmBrk => Some(syscall),
+        // U9-XFER1 §3: TransferRelease (NR 4). Like the three above it, it had NO split route at
+        // all — every call on every architecture reached the terminal broad dispatcher. Its route
+        // is TOTAL after this gate: `xfer_txn` raises every refusal in a read-only preflight, so
+        // nothing can be refused once the range has been unmapped or the capability revoked.
+        Syscall::TransferRelease => Some(syscall),
         // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) is a pure READ
         // syscall — it resolves the current task, copies user bytes, logs, and never
         // blocks/yields/switches tasks or mutates KernelState. It is serviced off the
@@ -5439,6 +5489,8 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR
                 || nr == crate::kernel::syscall::SYSCALL_FORK_NR
                 || nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
+                // U9-XFER1 §3: NR 4 `TransferRelease` — the first of the IPC/transfer residual.
+                || nr == crate::kernel::syscall::SYSCALL_TRANSFER_RELEASE_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {

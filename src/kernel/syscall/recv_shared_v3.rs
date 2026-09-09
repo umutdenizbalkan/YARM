@@ -238,8 +238,8 @@ pub(super) fn handle_recv_shared_v3(
     use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_REQUEST_LEN, validate_v3_request};
     use crate::kernel::recv_core::{
         RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvOutcome, RecvPayloadTarget,
-        RecvRequest, RecvRequestKind, RecvSchedulerWakePlan, RecvTransferPolicy,
-        RecvUserWritebackOutcome, execute_user_asid_plain_writeback, try_recv_core_user_plain,
+        RecvRequest, RecvRequestKind, RecvTransferPolicy, RecvUserWritebackOutcome,
+        execute_user_asid_plain_writeback, peek_recv_core_user_plain,
     };
 
     const V3_STATUS_OK: u32 = 0;
@@ -315,7 +315,23 @@ pub(super) fn handle_recv_shared_v3(
     };
 
     crate::yarm_log!("RECV_V3_ENTER tid={} cap={}", caller_tid, recv_cap.0);
-    let outcome = try_recv_core_user_plain(kernel, &request, endpoint);
+    // U9-XFER1 §3 — PEEK, do not dequeue.
+    //
+    // Before this, NR 30 dequeued here and woke the sender immediately afterwards, which put both
+    // of those irreversible steps AHEAD of everything that can fail: the capability mint, the
+    // mapping plan, the object/ASID resolution, the page mapping and the registry entry. Every one
+    // of those failures therefore destroyed the sender's message and settled the sender while
+    // returning `InvalidArgs` to the receiver — `rollback_materialized_recv_cap` restored the
+    // CAPABILITY, and nothing restored the MESSAGE.
+    //
+    // The message is now consumed by `commit_peeked_recv_with_cap_transfer` at the END of the
+    // transaction, under an identity check that proves the head is still the one this call planned
+    // around. Everything fallible happens first, while the message is still the sender's.
+    let endpoint_idx_for_commit = match kernel.resolve_endpoint_index(endpoint) {
+        Ok(idx) => idx,
+        Err(e) => return Err(SyscallError::from(e)),
+    };
+    let outcome = peek_recv_core_user_plain(kernel, &request, endpoint);
 
     match outcome {
         RecvOutcome::WouldBlock | RecvOutcome::FallbackRequired(_) => {
@@ -361,17 +377,10 @@ pub(super) fn handle_recv_shared_v3(
                 None
             };
 
-            // Deferred sender wake BEFORE writeback — matches §58 ordering.
-            if let RecvSchedulerWakePlan::WakeSender(wake_tid) = delivery.scheduler {
-                let _ = kernel.apply_split_sender_wake_plan(wake_tid);
-                // U6-FRAME §5C: wake-application observability parity with the other routes
-                // (`handle_ipc_recv`, `handle_ipc_recv_timeout`, queued split). Emitted once,
-                // after the wake is applied and before this route's writeback.
-                crate::yarm_log!(
-                    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
-                    wake_tid.tid.0
-                );
-            }
+            // U9-XFER1 §3: the sender's wake is NOT applied here. It belongs to the commit,
+            // because settling a sender for a message that was never consumed is exactly the
+            // defect this reordering removes. The peek's `scheduler` plan is always `None`; the
+            // real one comes back from `commit_peeked_recv_with_cap_transfer` below.
 
             let payload_len = delivery.msg.as_slice().len();
             let sender_tid_raw = delivery.msg.sender_tid.0;
@@ -581,6 +590,65 @@ pub(super) fn handle_recv_shared_v3(
             } else {
                 (0u64, 0u64, 0u32, 0u64, false, None)
             };
+
+            // ── U9-XFER1 §3 COMMIT ──────────────────────────────────────────────────────────
+            //
+            // Everything fallible is done: the capability is minted, the object resolved, the
+            // pages mapped and the registry entry taken, and each of those has its own exact undo
+            // below. NOW consume the message and settle the sender, in ONE rank-3 acquisition,
+            // under an identity check that the head is still the message this call planned around.
+            //
+            // If it is not, another receiver took it while this transaction was mapping. Nothing
+            // is consumed, nothing user-visible has happened yet, and this call compensates
+            // everything it built and reports the ABI's EXISTING "nothing for you right now"
+            // outcome — `WouldBlock`, which an empty queue already produces. No new refusal.
+            let committed =
+                kernel.commit_peeked_recv_with_cap_transfer(endpoint_idx_for_commit, &delivery.msg);
+            let commit_wake = match committed {
+                crate::kernel::boot::IpcEndpointRecvResult::Received(_) => None,
+                crate::kernel::boot::IpcEndpointRecvResult::ReceivedWithSenderWake(_, wake) => {
+                    Some(wake)
+                }
+                crate::kernel::boot::IpcEndpointRecvResult::Ineligible(_) => {
+                    // Lost the race. Undo, in the reverse order of construction, using the same
+                    // owners the post-writeback rollback uses.
+                    if let Some((rb_asid, rb_cap)) = map_rollback {
+                        kernel.unmap_range_two_phase(
+                            rb_asid,
+                            mapped_base as usize,
+                            mapped_len_out as usize,
+                        );
+                        kernel.remove_active_transfer_mapping(
+                            crate::kernel::ipc::ThreadId(caller_tid),
+                            rb_cap,
+                        );
+                    }
+                    if let Some(cap_id) = materialized_cap {
+                        kernel.rollback_materialized_recv_cap(
+                            caller_tid,
+                            CapId(cap_id),
+                            is_reply_cap,
+                        );
+                    }
+                    crate::yarm_log!(
+                        "RECV_V3_COMMIT_LOST_RACE tid={} cap={}",
+                        caller_tid,
+                        xfer_cap_out
+                    );
+                    return Err(SyscallError::WouldBlock);
+                }
+            };
+            // The message is consumed, so the sender's send succeeded and it may be settled.
+            if let Some(wake_tid) = commit_wake {
+                let _ = kernel.apply_split_sender_wake_plan(wake_tid);
+                // U6-FRAME §5C: unchanged wake-application observability, still emitted once and
+                // still before this route's writeback — the wake simply now follows the consume
+                // it reports rather than preceding it.
+                crate::yarm_log!(
+                    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+                    wake_tid.tid.0
+                );
+            }
 
             if skip_payload {
                 // Mapping done: payload_ptr is the mapping target VA, not an inline

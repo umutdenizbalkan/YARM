@@ -2868,6 +2868,11 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         || raw_nr == crate::kernel::syscall::SYSCALL_VM_MAP_NR
         || raw_nr == crate::kernel::syscall::SYSCALL_VM_ANON_MAP_NR
         || raw_nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
+        // U9-XFER1 §3: NR 4 `TransferRelease` joins them. It takes three arguments (the transfer
+        // capability, and the base/length pair whose `(0,0)` form means "the registered range"),
+        // all within the set the ABI import already carries. Like the three above it, it was never
+        // on this list, so its split route could not have run on this architecture at all.
+        || raw_nr == crate::kernel::syscall::SYSCALL_TRANSFER_RELEASE_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

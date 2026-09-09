@@ -10,68 +10,137 @@
 
 use super::{
     SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError, current_task_has_user_asid,
-    current_tid, round_up_page,
+    current_tid,
 };
 use crate::kernel::boot::{ControlPlaneCnodePlan, KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::ThreadId;
 use crate::kernel::trapframe::TrapFrame;
-use crate::kernel::vm::{PAGE_SIZE, VirtAddr};
+use crate::kernel::vm::VirtAddr;
+
+/// U9-XFER1 §3 — the BROAD adapter for NR 4 `TransferRelease`.
+///
+/// Holds no policy of its own: it resolves the owners out of `&mut KernelState` and runs the same
+/// [`crate::kernel::syscall::xfer_txn::run_transfer_release_transaction`] the split adapter runs.
+/// Every validation, ordering and refusal decision lives once, in that module.
+pub(crate) struct BroadXferOwners<'a> {
+    pub(crate) kernel: &'a mut KernelState,
+}
+
+impl crate::kernel::syscall::xfer_txn::XferReleaseOwners for BroadXferOwners<'_> {
+    fn caller_with_user_asid(&mut self) -> Option<(ThreadId, crate::kernel::vm::Asid)> {
+        if !current_task_has_user_asid(self.kernel).ok()? {
+            return None;
+        }
+        let owner = ThreadId(current_tid(self.kernel).ok()?);
+        // Stage 7's note holds: `current_task_has_user_asid` succeeding is exactly what makes
+        // `task_asid` return `Some`, so the two are resolved as one owner rather than as a check
+        // followed by an unreachable error arm.
+        let asid = self.kernel.task_asid(owner.0)?;
+        Some((owner, asid))
+    }
+
+    fn registered_range(&mut self, owner: ThreadId, cap: CapId) -> Option<(VirtAddr, usize)> {
+        self.kernel.active_transfer_mapping_for(owner, cap)
+    }
+
+    fn caller_cnode(&mut self) -> Option<crate::kernel::capabilities::CNodeId> {
+        self.kernel.current_task_cnode()
+    }
+
+    fn page_is_mapped(&mut self, asid: crate::kernel::vm::Asid, virt: VirtAddr) -> bool {
+        self.kernel
+            .is_user_page_mapped_in_asid(asid, virt)
+            .unwrap_or(false)
+    }
+
+    fn capability_release_is_reservable(
+        &mut self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: CapId,
+    ) -> bool {
+        // The broad revoke reserves its own closure with a heap `Vec` inside
+        // `collect_delegated_descendants`, so the only thing to prove ahead of the mutation is
+        // that the slot resolves — which is the one refusal `revoke_capability_in_cnode` raises.
+        self.kernel.capability_for_cnode_local(cnode, cap).is_some()
+    }
+
+    fn unmap_whole_range(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        base: usize,
+        map_len: usize,
+    ) -> bool {
+        // The existing broad two-phase unmap: per page, remove the PTE, complete the shootdown,
+        // then reclaim. Its per-page errors are swallowed by design — the transaction's phase V
+        // already proved every page is mapped, so the `Ok(None)` case this used to refuse on
+        // cannot arise here.
+        self.kernel.unmap_range_two_phase(asid, base, map_len);
+        true
+    }
+
+    fn revoke_user_held_capability(
+        &mut self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: CapId,
+    ) -> bool {
+        self.kernel.revoke_capability_in_cnode(cnode, cap).is_ok()
+    }
+
+    fn remove_registration(&mut self, owner: ThreadId, cap: CapId) -> bool {
+        self.kernel.remove_active_transfer_mapping(owner, cap)
+    }
+
+    fn account_release(&mut self, map_len: usize) {
+        self.kernel.note_shared_mem_released(map_len);
+    }
+
+    fn note(&mut self, event: crate::kernel::syscall::xfer_txn::XferTxnEvent) {
+        note_xfer_event("broad", event);
+    }
+}
+
+/// The shared marker text for both adapters, so a live capture cannot tell them apart by accident
+/// and a reader can tell them apart on purpose.
+pub(crate) fn note_xfer_event(route: &str, event: crate::kernel::syscall::xfer_txn::XferTxnEvent) {
+    use crate::kernel::syscall::xfer_txn::XferTxnEvent;
+    match event {
+        XferTxnEvent::Refused { reason } => {
+            crate::yarm_log!("XFER_RELEASE_REFUSED route={} reason={:?}", route, reason);
+        }
+        XferTxnEvent::Released { pages, map_len } => {
+            crate::yarm_log!(
+                "XFER_RELEASE_OK route={} pages={} len={}",
+                route,
+                pages,
+                map_len
+            );
+        }
+        XferTxnEvent::ReleasedWithIncompleteShootdown { pages, map_len } => {
+            crate::yarm_log!(
+                "XFER_RELEASE_SHOOTDOWN_INCOMPLETE route={} pages={} len={}",
+                route,
+                pages,
+                map_len
+            );
+        }
+    }
+}
 
 pub(super) fn handle_transfer_release(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    if !current_task_has_user_asid(kernel)? {
-        return Err(SyscallError::InvalidArgs);
-    }
     let transfer_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-    let owner = ThreadId(current_tid(kernel)?);
-    let (base, map_len) = {
-        let base_arg = frame.arg(SYSCALL_ARG_PTR);
-        let len_arg = frame.arg(SYSCALL_ARG_LEN);
-        if base_arg == 0 && len_arg == 0 {
-            kernel
-                .active_transfer_mapping_for(owner, transfer_cap)
-                .map(|(base, len)| (base.0 as usize, len))
-                .ok_or(SyscallError::InvalidArgs)?
-        } else {
-            if len_arg == 0 || !base_arg.is_multiple_of(PAGE_SIZE) {
-                return Err(SyscallError::InvalidArgs);
-            }
-            (base_arg, round_up_page(len_arg)?)
-        }
-    };
-    let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
-    // Stage 7: plan-first ASID resolution before the two-phase unmap loop
-    // (rank-2 task read before vm/memory mutation in loop body).
-    // current_task_has_user_asid (checked above) guarantees task_asid returns Some.
-    let asid = kernel
-        .task_asid(owner.0)
-        .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
-    let mut va = base;
-    while va < end {
-        // Stage 7: two-phase unmap — reclaim only after shootdown wait/fast path.
-        // Ok(None) means the page was never mapped; preserve old InvalidArgs behavior.
-        let plan = kernel
-            .unmap_page_phase1(asid, VirtAddr(va as u64))
-            .map_err(SyscallError::from)?;
-        let Some(plan) = plan else {
-            return Err(SyscallError::InvalidArgs);
-        };
-        kernel
-            .execute_tlb_shootdown_wait_plan(plan)
-            .map_err(SyscallError::from)?;
-        va += PAGE_SIZE;
-    }
-
-    let cnode = kernel.current_task_cnode().ok_or(SyscallError::Internal)?;
-    kernel
-        .revoke_capability_in_cnode(cnode, transfer_cap)
-        .map_err(SyscallError::from)?;
-    if kernel.remove_active_transfer_mapping(owner, transfer_cap) {
-        kernel.note_shared_mem_released(map_len);
-    }
+    let base_arg = frame.arg(SYSCALL_ARG_PTR);
+    let len_arg = frame.arg(SYSCALL_ARG_LEN);
+    let mut owners = BroadXferOwners { kernel };
+    let map_len = crate::kernel::syscall::xfer_txn::run_transfer_release_transaction(
+        &mut owners,
+        transfer_cap,
+        base_arg,
+        len_arg,
+    )?;
     frame.set_ok(map_len, 0, 0);
     Ok(())
 }

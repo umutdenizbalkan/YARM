@@ -178,6 +178,20 @@ pub(crate) enum IpcEndpointSplitRejectReason {
     EndpointQueueFull,
 }
 
+/// U9-XFER1 §3 — the outcome of a NON-CONSUMING head read, for NR 30 `RecvSharedV3`.
+///
+/// Deliberately a separate type from [`IpcEndpointRecvResult`]: that one's `Received` variants
+/// mean "the message is now yours and the endpoint no longer has it", and a peek must not be
+/// confusable with them at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpcEndpointPeekResult {
+    /// The head message, still queued. The endpoint is unchanged.
+    Peeked(Message),
+    /// The same eligibility refusals `ipc_try_recv_queued_with_cap_transfer_locked` raises, in
+    /// the same order, from the same gates.
+    Ineligible(IpcEndpointSplitRejectReason),
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IpcEndpointRecvResult {

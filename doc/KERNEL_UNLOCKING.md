@@ -16456,3 +16456,153 @@ commit path rather than adding one.
 ### Next roadmap package
 
 **NR 4 `TransferRelease` and NR 30 `RecvSharedV3`** — IPC/transfer residual completion.
+
+## U9-XFER1 — NR 4 closed; NR 30's transaction corrected, its dispatch not closed
+
+Reviewed candidate `bdc4278`; base `bdc4278`. Two families were selected. **One closed, one did
+not — and the reason the second did not is a missing owner, not a missing decision.** Both halves
+are reported separately below because they reached different places.
+
+### Reachability, before and after
+
+| | before | after |
+|---|---|---|
+| NR 4 `TransferRelease` | no split route on any architecture — **every** call reached the terminal broad dispatcher | total pre-lock route on x86_64, AArch64 and RISC-V; **no reachable broad fallback** |
+| NR 30 `RecvSharedV3` | no split route on any architecture | **unchanged** — still terminal broad on all three |
+
+### §2 — what NR 4's ABI actually admits
+
+`arg(CAP)` is any `CapId` in the caller's own cnode: **a capability userspace holds**, of any of
+the nine `CapObject` kinds. Releasing it is a full recursive revoke — the in-cspace derivation
+tree, a delegated closure crossing process boundaries to arbitrary depth, each member's
+transfer-mapping teardown in *its own* address space, memory refcount and reclaim, and
+notification destruction with a waiter wake, plus a supervisor IPC report.
+
+The existing split revoke is **not** a substitute for that, and the difference is load-bearing:
+
+| dimension | broad `revoke_capability_in_cnode` | split `revoke_capability_no_vm_split` |
+|---|---|---|
+| in-cspace derivation tree | full recursive `CapabilitySpace::revoke` | same |
+| cross-process delegated closure | ≤ `MAX_DELEGATED_CAPABILITY_LINKS` (2048/4096), heap `Vec` | **≤ 16, on a stack array**, else `DescendantOverflow` |
+| link removals | full table scan | **≤ 32**, else `LinkOverflow` |
+| `Reply` root | served generically | **refused** (`ReplyObject`) |
+
+Those bounds are sound where that composition is used — the provisional-capability rollback
+sites revoke a cap minted moments earlier in the same syscall and never handed out, so the closure
+is provably empty. NR 4's root has been handed out. Reusing the subset would have refused
+authority the broad path serves, which §3 forbids.
+
+So NR 4 reserves its closure on the **heap**, bounded by the same link table the broad path is
+bounded by, and both reservations drive **one** teardown (`commit_revoke_split`, extracted to take
+slices). A correction to a first reading: `ReplyObject` is *callsite* policy, not object policy —
+broad `revoke_capability_in_cnode` treats a `Reply` root generically, and
+`rollback_reply_cap_split` additionally clears the reply-waiter alias, an effect NR 4 does not
+produce. Routing NR 4's `Reply` there would have changed its semantics, so the reservation omits
+the class gate instead.
+
+### §3 — NR 4: three partial-mutation refusals removed
+
+| defect at `bdc4278` | what the caller saw |
+|---|---|
+| an unmapped page mid-range | `InvalidArgs` **after** every preceding page was unmapped and its frame reclaimed |
+| a phase-1/phase-2 error | the same |
+| an unresolvable capability | `InvalidArgs` **after the entire range** was unmapped and reclaimed |
+
+Each told the caller the call failed while part or all of its shared region was permanently gone.
+`xfer_txn` now raises every refusal in phase V, from reads only: the whole range's mappedness and
+the capability's resolvability are proven **before** the first unmap. After phase V there is no
+branch to an error at all.
+
+This narrows nothing. The preflight refuses exactly the inputs the broad handler already refused —
+an unregistered `(0,0)`, a zero-length or misaligned explicit range, an overflow, an unmapped
+page, an unresolvable capability — and refuses them *earlier*.
+
+The split route reaches `unmap_range_two_phase_from_split`, the requester-stating owner
+U9-VM-ENTRY1-S §1 produced, never the impersonating `request_live_asid_shootdown`.
+
+### §3 — NR 30: the message is no longer consumed before it can be delivered
+
+The dequeue was the first thing after validation and the sender wake the second — both **ahead of**
+the capability mint, the mapping plan, the phys/ASID resolution, the page mapping and the registry
+entry. Every one of those failures destroyed the sender's message and settled the sender while
+returning `InvalidArgs` to the receiver. `rollback_materialized_recv_cap` restored the
+*capability*; nothing restored the *message*.
+
+`Endpoint::peek()` is a non-consuming rank-3 head read and `Message` is `Copy + PartialEq`, so the
+order is now:
+
+```
+peek  →  mint  →  metadata  →  map  →  register  →  COMMIT  →  writeback
+```
+
+where COMMIT is `commit_peeked_recv_with_cap_transfer`: one rank-3 acquisition that verifies the
+head is still the message this call planned around, dequeues it, and only then yields the sender's
+wake target. A lost race consumes nothing, compensates in reverse order of construction, and
+reports the ABI's **existing** `WouldBlock` — the outcome an empty queue already produces. No new
+refusal.
+
+**Exactly one branch still consumes and can then fail**: the user metadata writeback. User memory
+cannot be un-written, so this is inherent. It is now the *last* step, and it keeps its existing
+`RECV_V3_WRITEBACK_FAIL_ROLLBACK` compensation. Stated, not claimed away.
+
+### §3 — why NR 30's DISPATCH is not closed, proven rather than asserted
+
+NR 30 writes user memory on **every** exit — the metadata record on the would-block, mapped and
+plain exits alike, plus the payload copy on the plain path. There is an off-lock user **read**
+seam (`copy_from_user_asid_split_read`) and **no off-lock user write seam**.
+
+This is not a new obstacle. It is the one that has kept NR 2 `IpcRecv`'s user-ASID cohort on the
+broad path since Stage 32B, in that route's own words: a user-ASID receiver "would require a
+forbidden user copy". Building that owner is a foundation stage with its own fault semantics,
+which §4 excludes. A route admitted without it would decline every real caller — a dormant seam,
+which §4 also excludes.
+
+So NR 30 keeps its terminal broad edge, and the limit is pinned by four source-derived guards in
+`u9xfer1_nr30_terminal_dispatch_limit` rather than left to be rediscovered.
+
+### Coverage
+
+12 cases in `u9xfer1_ownership_cases` (7 NR 4 including the live-witness guard, 5 NR 30) and 4 in
+`u9xfer1_nr30_terminal_dispatch_limit`. Displaced guards re-derived onto their new owners:
+`the_commit_preserves_the_broad_interleave` (sharpened — both reservations must REACH the single
+commit, and the heap one must inherit neither the capacity refusals nor the class gate),
+`d4_step4_cap_module_extraction_guardrails`, `every_minting_class_admitted_has_an_exact_off_lock_rollback`,
+`split_whitelist_unchanged_no_new_class`, `aarch64_abi_import_is_debuglog_selective`,
+`feature_off_remains_marker_clean` and `stage29_whitelist_exhaustive`.
+
+**Genuinely exercised vs. evidence limits.** No server issued NR 4 in any profile — the same
+situation NR 3/13/14 were in before U9-VM-ENTRY1 — so §4's minimal-witness authorization applies,
+and NR 4 is added to the existing `vm_entry_witness` rather than to a new binary. What it
+witnesses is exactly what §3 changed: all six refusals, each now raised from reads only, plus one
+positive case — a re-map of the prefix after a partial-range refusal, which can only succeed if
+the refusal really did leave the range alone. That is the defect repair itself, executed rather
+than only source-proven.
+
+**NR 4's SUCCESS path is not witnessed, for a structural reason rather than an omission**:
+succeeding means REVOKING a capability, and every capability the init server holds is one it needs
+to keep running. It is also the part of NR 4 that §3 did not change. Reported the same way NR 3's
+success path is.
+
+**NR 30's live coverage is unchanged.** Its reordering is proven from source and by the peek/commit
+owners' own guards; no profile issues `RecvSharedV3`, and it gains no witness here because its
+route is unchanged.
+
+### Census
+
+**CENSUS-DELTA: 0.** `with_cpu` 2, `with_broad` 0 production (plus 1 `thread_local` false
+positive), acquisition total 2. Raw `state_lock` 3, separately labelled.
+
+### Deferred
+
+* **An off-lock user-memory WRITE owner** — the single thing blocking NR 30's dispatch closure,
+  and NR 2's user-ASID recv cohort with it. A foundation stage in its own right.
+* **NR 30 blocking** (`timeout_ticks != 0` → `WouldBlock`). Unimplemented since Stage 42+43; needs
+  `RecvAbiVariant::RecvSharedV3` plus wake-path changes. A new capability, not a closure.
+* **NR 4's explicit `(base, len)` shape** releases an arbitrary caller-named range in the caller's
+  own address space without checking it belongs to the named transfer. Preserved verbatim;
+  narrowing it would be a new refusal.
+
+### Next roadmap package
+
+**The off-lock user-memory write owner**, which unblocks NR 30 and NR 2's user-ASID cohort
+together.

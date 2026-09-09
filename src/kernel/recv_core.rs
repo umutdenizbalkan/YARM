@@ -726,6 +726,39 @@ pub(crate) fn try_recv_core_user_plain(
     })
 }
 
+/// U9-XFER1 §3 — the NON-CONSUMING twin of [`try_recv_core_user_plain`], for NR 30.
+///
+/// Produces the SAME `RecvDelivery` shape from the SAME gates, built from a PEEK instead of a
+/// dequeue. Nothing is consumed and no sender is settled, so every fallible step NR 30 performs
+/// next — minting the transferred capability, resolving the object, mapping its pages, registering
+/// the active-transfer entry — happens while the message is still the sender's.
+///
+/// The returned delivery's `scheduler` is deliberately `None`: the sender's wake belongs to the
+/// COMMIT, not to the plan, and is produced by
+/// [`KernelState::commit_peeked_recv_with_cap_transfer`] when it actually consumes the message.
+pub(crate) fn peek_recv_core_user_plain(
+    kernel: &mut KernelState,
+    request: &RecvRequest,
+    endpoint: CapObject,
+) -> RecvOutcome {
+    let endpoint_idx = match kernel.resolve_endpoint_index(endpoint) {
+        Ok(idx) => idx,
+        Err(e) => return RecvOutcome::Error(e),
+    };
+    let peeked = kernel.peek_queued_with_cap_transfer(endpoint_idx);
+    map_queued_recv_outcome(
+        match peeked {
+            crate::kernel::boot::IpcEndpointPeekResult::Peeked(msg) => {
+                IpcEndpointRecvResult::Received(msg)
+            }
+            crate::kernel::boot::IpcEndpointPeekResult::Ineligible(reason) => {
+                IpcEndpointRecvResult::Ineligible(reason)
+            }
+        },
+        |_msg, sender_tid| user_memory_plan(request, sender_tid),
+    )
+}
+
 /// Perform the user-space copy for a dequeued plain message.
 ///
 /// Called after the ipc_state_lock (rank 3) is released.  The global lock
