@@ -94,6 +94,24 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         )
     }
 
+    fn pin_object(&mut self, object_id: u64) -> bool {
+        self.shared.with_memory_split_mut(|memory| {
+            crate::kernel::syscall::vm::pin_object_locked(memory, object_id)
+        })
+    }
+
+    fn unpin_object(&mut self, object_id: u64) {
+        self.shared.with_memory_split_mut(|memory| {
+            crate::kernel::syscall::vm::unpin_object_locked(memory, object_id)
+        });
+    }
+
+    fn unpin_displaced(&mut self, phys: crate::kernel::vm::PhysAddr) {
+        self.shared.with_memory_split_mut(|memory| {
+            crate::kernel::syscall::vm::unpin_object_for_phys_locked(memory, phys)
+        });
+    }
+
     fn release_unminted_object(&mut self, object_id: u64) {
         self.shared.release_unminted_object_split(object_id);
     }

@@ -95,6 +95,12 @@ pub(crate) struct PageRecord {
     pub(crate) cap: Option<CapId>,
     /// Set once the page's PTE has been written by phase I.
     pub(crate) installed: bool,
+    /// Set while this transaction holds a PIN on `object_id` — a hold nothing outside the
+    /// transaction can drop. Cleared exactly once, when the obligation it covers is settled.
+    pub(crate) pinned: bool,
+    /// Set while this transaction holds a PIN on the object backing `replaced` — taken inside the
+    /// acquisition that displaced it, released only after its shootdown is acknowledged.
+    pub(crate) displaced_pinned: bool,
     /// What the install displaced, recorded inside the acquisition that displaced it. On the
     /// failure path this is restored verbatim, in the SAME acquisition; on the success path its
     /// frame is accounted and then reclaimed after its shootdown.
@@ -109,6 +115,8 @@ impl PageRecord {
             phys,
             cap: None,
             installed: false,
+            pinned: false,
+            displaced_pinned: false,
             replaced: None,
         }
     }
@@ -201,6 +209,28 @@ pub(crate) trait VmMapOwners {
     /// rights the mint will carry rather than against a published capability. Same predicate,
     /// same position in the error precedence, no cap required.
     fn acquire_object(&mut self, flags: PageFlags) -> Result<(u64, PhysAddr), KernelError>;
+
+    /// rank 6 — take this TRANSACTION's own hold on `object_id`, and report whether it was
+    /// taken.
+    ///
+    /// A capability is not a hold: it is user-revocable, and a sibling revoking the last one
+    /// makes the object reclaimable and its frame reusable while this transaction is still
+    /// relying on the physical address it recorded. A pin is not revocable from userspace at all
+    /// — `reclaim_memory_object_if_unreferenced` and `reclaim_memory_object_for_phys` both refuse
+    /// while `pin_refcount != 0` — so it is the hold this transaction actually owns.
+    ///
+    /// Taken BEFORE any revocable authority is published, and released or transferred exactly
+    /// once, when the obligation it covers is settled.
+    fn pin_object(&mut self, object_id: u64) -> bool;
+
+    /// rank 6 — release this transaction's hold, then let the object be reclaimed if that was its
+    /// last reference of any kind. Called exactly once per successful [`Self::pin_object`].
+    fn unpin_object(&mut self, object_id: u64);
+
+    /// rank 6 — release the hold taken on a DISPLACED page's backing inside the install
+    /// acquisition. Separate from [`Self::unpin_object`] because it is keyed by physical address:
+    /// the displaced object is not one this transaction created and it has no record of its id.
+    fn unpin_displaced(&mut self, phys: PhysAddr);
 
     /// rank 6 — release an object that no capability and no mapping ever referenced.
     ///
@@ -383,15 +413,21 @@ fn release_capabilities<O: VmMapOwners>(
     owners: &mut O,
     cnode: Option<CNodeId>,
     records: &[PageRecord],
+    settled_only: bool,
 ) -> (usize, usize) {
-    let minted = records.iter().filter(|r| r.cap.is_some()).count();
+    let eligible =
+        |record: &&PageRecord| record.cap.is_some() && !(settled_only && record.installed);
+    let minted = records.iter().filter(eligible).count();
     let Some(cnode) = cnode else {
         // No cspace to release into. Nothing was minted there either.
         return (0, minted);
     };
     let mut released = 0usize;
     let mut retained = 0usize;
-    for record in records {
+    // Iterated IN PLACE over the journal reserved before any mutation: compensation allocates
+    // nothing. An intermediate collection here would be an infallible allocation on the failure
+    // path, which is exactly what the journal exists to avoid.
+    for record in records.iter().filter(eligible) {
         let Some(frame) = record.provisional() else {
             continue;
         };
@@ -410,12 +446,15 @@ fn release_capabilities<O: VmMapOwners>(
     (released, retained)
 }
 
-/// Every page phase I installed and then removed owes a shootdown before its backing may return to
-/// the allocator. Complete them with NO lock held, and report which pages were acknowledged.
+/// Every page phase I installed and then removed owes a shootdown before its backing may return
+/// to the allocator. Complete them with NO lock held, and settle this transaction's hold on each
+/// page whose acknowledgement arrives.
 ///
-/// A page whose acknowledgement does not arrive is deliberately left unreclaimed rather than
-/// recycled under a possibly-stale remote translation. That is the same fail-closed rule the
-/// committed path and `unmap_range_two_phase` already obey.
+/// A page whose acknowledgement does NOT arrive keeps its pin. The pin, not the capability, is the
+/// durable owner of that unsettled obligation: a capability can be revoked by any sibling, and the
+/// instant the last one goes the object becomes reclaimable and its frame reusable under a
+/// translation a remote CPU may still hold. A pin cannot be dropped from outside this transaction
+/// at all.
 fn settle_rollback_shootdowns<O: VmMapOwners>(
     owners: &mut O,
     asid: Asid,
@@ -439,17 +478,28 @@ fn settle_rollback_shootdowns<O: VmMapOwners>(
     unacknowledged
 }
 
+/// Drop this transaction's hold on every page whose obligation is settled — that is, every page
+/// that no longer owes a shootdown acknowledgement. Called exactly once per page that took one.
+fn release_settled_pins<O: VmMapOwners>(owners: &mut O, records: &mut [PageRecord]) {
+    for record in records.iter_mut() {
+        if record.pinned && !record.installed {
+            owners.unpin_object(record.object_id);
+            record.pinned = false;
+        }
+    }
+}
+
 /// THE anonymous-mapping transaction: NR 3 and NR 13, one policy, one request.
 ///
 /// | phase | acquisition | on failure |
 /// |---|---|---|
-/// | J: reserve the whole-request journal | none | nothing acquired |
+/// | J: reserve the whole-request journal | none | nothing acquired, nothing mutated |
 /// | V: validate, resolve target, guard page | rank 4 / rank 5 reads | nothing acquired |
-/// | R: acquire every object and frame | rank 6 | release exactly the objects acquired so far |
-/// | M: mint every capability | rank 4 | release the capabilities minted so far, then every object |
-/// | I: install the whole request, take map references, account displaced | ONE rank 5 → rank 6 | the acquisition restores every page it touched BEFORE releasing; then shootdown, then capabilities, then objects |
+/// | R: acquire every object and frame, and PIN each one | rank 6 | unpin and release exactly the objects acquired so far |
+/// | M: mint every capability | rank 4 | release the capabilities minted so far, then unpin and release every object |
+/// | I: install the whole request, take map references, account and PIN every displaced page | ONE rank 5 → rank 6 | the acquisition restores every page it touched BEFORE releasing; then shootdown, then unpin, then capabilities, then objects |
 /// | W: required shootdown acknowledgements | none | — |
-/// | S: reclaim displaced backing | rank 6 | — |
+/// | S: unpin and reclaim displaced backing; release this request's own pins | rank 6 | — |
 ///
 /// Returns the `(addr, map_len)` the caller's result lanes carry.
 pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
@@ -479,15 +529,24 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
     // ── Phase J: the journal for the WHOLE request, reserved before any mutation.
     //
     // The delivered rollback covers `[addr, mapped_end)` — measured from the REQUEST base, not
-    // from any chunk — so a failure at any page must be able to undo every page. That is only
-    // expressible with a record per page of the request, and a `no_std` transaction must not
-    // depend on an allocation succeeding *after* it has begun mutating. So the reservation is
-    // fallible and happens here, where nothing has been acquired and a refusal costs nothing.
+    // from any chunk — so a failure at any page must be able to undo every page. That needs a
+    // record per page, and a `no_std` transaction must not depend on an allocation succeeding
+    // *after* it has begun mutating. Reserving here is what lets every later compensation step
+    // run in place, allocating nothing.
     //
-    // It introduces no reachable new refusal: every page also needs its own memory-object slot,
-    // and the object table is a fixed array, so a request whose journal will not fit could not
-    // have got past phase R either — and the error it reports is the one phase R would have
-    // reported.
+    // This reservation CAN fail, and the honest statement of when is not "only above the
+    // object-table limit". The journal comes from the kernel heap and the frames come from the
+    // frame allocator; they are different pools, so heap exhaustion below the object-table limit
+    // is possible in principle — a request of a few dozen pages needs about a kilobyte of heap,
+    // and a kernel heap that cannot supply that is already in trouble for other reasons. What the
+    // object-table limit does bound is the journal's WORST CASE: a request can never install more
+    // pages than there are object slots, so the reservation is bounded by a fixed boot constant
+    // rather than by the request.
+    //
+    // What matters for correctness is not that the reservation cannot fail, but that a failure
+    // costs nothing: it happens before any object, capability, mapping, pin or frame has been
+    // touched, so the refusal leaves the system byte-for-byte as it found it, and reports the same
+    // error phase R reports when the object table is what runs out.
     let mut records: alloc::vec::Vec<PageRecord> = alloc::vec::Vec::new();
     if records.try_reserve_exact(pages).is_err() {
         owners.note(VmTxnEvent::RolledBack {
@@ -498,19 +557,35 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
         return Err(SyscallError::from(KernelError::MemoryObjectFull));
     }
 
-    // ── Phase R: every frame and its object, for the whole request. NO capability exists yet, so
-    // nothing this phase creates is visible to any enumerator, and its failure path touches
-    // neither the capability domain nor the address space.
+    // ── Phase R: every frame and its object, for the whole request, each PINNED as it is
+    // acquired.
+    //
+    // The pin is the hold this TRANSACTION owns. A capability is not one: it is user-revocable,
+    // and a sibling revoking the last capability for an object makes it reclaimable and its frame
+    // reusable — while this transaction is still about to write `record.phys` into a page table.
+    // `reclaim_memory_object_if_unreferenced` and `reclaim_memory_object_for_phys` both refuse
+    // while `pin_refcount != 0`, and nothing reachable from userspace can decrement it, so the
+    // pin holds the backing across every later phase no matter what happens to the capability.
+    //
+    // It is taken here, BEFORE phase M publishes any revocable authority at all.
     for i in 0..pages {
         match owners.acquire_object(args.flags) {
-            Ok((object_id, phys)) => records.push(PageRecord::new(
-                VirtAddr((args.addr + i * PAGE_SIZE) as u64),
-                object_id,
-                phys,
-            )),
+            Ok((object_id, phys)) => {
+                let mut record = PageRecord::new(
+                    VirtAddr((args.addr + i * PAGE_SIZE) as u64),
+                    object_id,
+                    phys,
+                );
+                record.pinned = owners.pin_object(object_id);
+                records.push(record);
+            }
             Err(e) => {
-                for record in records.iter() {
-                    owners.release_unminted_object(record.object_id);
+                for index in 0..records.len() {
+                    if records[index].pinned {
+                        owners.unpin_object(records[index].object_id);
+                        records[index].pinned = false;
+                    }
+                    owners.release_unminted_object(records[index].object_id);
                 }
                 owners.note(VmTxnEvent::RolledBack {
                     reason: VmRollbackReason::FrameAlloc,
@@ -536,19 +611,25 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
     //
     // A provisional capability is not private — every thread of a process shares one CNode, and
     // Fork inherits by enumerating the parent's cspace — so this order does widen the window in
-    // which a sibling can capture a slot this transaction has not yet returned. That is the
-    // deliberate trade: an escaped provisional capability is COMPENSABLE (identity-checked
-    // release, and a named cleanup owner for one that has genuinely escaped), whereas a mapping
-    // destroyed by a rollback that could not prove ownership is not compensable at all.
+    // which a sibling can capture, or revoke, a slot this transaction has not yet returned. The
+    // pin taken in phase R is what makes that safe rather than merely unlikely: whatever a sibling
+    // does to the capability, the object and its frame are held.
     for i in 0..pages {
         let (object_id, phys) = (records[i].object_id, records[i].phys);
         match owners.mint_frame_cap(object_id, phys) {
             Ok(cap) => records[i].cap = Some(cap),
             Err(e) => {
-                // Nothing is installed, so there is no page table work and no shootdown to owe.
-                let (released, retained) = release_capabilities(owners, cnode, &records[..i]);
-                for record in records.iter().skip(i) {
-                    owners.release_unminted_object(record.object_id);
+                // Nothing is installed, so there is no page-table work and no shootdown to owe.
+                let (released, retained) =
+                    release_capabilities(owners, cnode, &records[..i], false);
+                for index in 0..records.len() {
+                    if records[index].pinned {
+                        owners.unpin_object(records[index].object_id);
+                        records[index].pinned = false;
+                    }
+                }
+                for index in i..records.len() {
+                    owners.release_unminted_object(records[index].object_id);
                 }
                 owners.note(VmTxnEvent::RolledBack {
                     reason: VmRollbackReason::CapabilityMint,
@@ -561,9 +642,9 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
     }
 
     // ── Phase I: ONE acquisition — VM rank 5, then memory rank 6 nested underneath it, which is
-    // the legal direction — installs the whole request, takes the map reference on every frame
-    // and accounts every mapping it displaced. On any failure it restores every page it touched
-    // BEFORE releasing.
+    // the legal direction — installs the whole request, takes the map reference on every frame,
+    // and accounts and PINS every mapping it displaced. On any failure it restores every page it
+    // touched BEFORE releasing.
     //
     // Because install, accounting and rollback all happen inside this one acquisition, and
     // because it spans the WHOLE request rather than a chunk of it, two claims hold that could
@@ -572,18 +653,24 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
     // table with no map reference for another transaction to observe.
     if let Err((failed_index, e)) = owners.install_and_account(asid, args.flags, &mut records) {
         let _ = failed_index;
-        // The address space is already back to its pre-transaction state. What remains is what
-        // the acquisition could not do: wait for the acknowledgements its removals owe, and then
-        // release the capabilities and objects this request no longer needs.
+        // The address space is already back to its pre-transaction state, including at the page
+        // that refused: `AddressSpace::map_page` restores a predecessor it broke before returning
+        // an error, so the pages this call actually changed are exactly the ones it marked
+        // `installed`. What remains is what the acquisition could not do — wait for the
+        // acknowledgements its removals owe, and then let go of what this request no longer needs.
         let unacknowledged = settle_rollback_shootdowns(owners, asid, &mut records);
-        // A page whose shootdown was NOT acknowledged keeps its capability and therefore its
-        // object and its frame: fail-closed, exactly as the committed path and the brk shrink do.
-        let releasable: alloc::vec::Vec<PageRecord> = records
-            .iter()
-            .filter(|record| !record.installed)
-            .copied()
-            .collect();
-        let (released, retained) = release_capabilities(owners, cnode, &releasable);
+        // Order matters, and it is the inverse of the order the holds were taken in. The pin goes
+        // first for every SETTLED page, because a capability release that finds the object
+        // unreferenced must be able to reclaim it; a page still owing an acknowledgement keeps its
+        // pin, and that pin — not the capability it also still holds — is the durable owner of
+        // the obligation.
+        release_settled_pins(owners, &mut records);
+        let (released, retained) = release_capabilities(owners, cnode, &records, true);
+        for index in 0..records.len() {
+            if !records[index].installed && records[index].cap.is_none() {
+                owners.release_unminted_object(records[index].object_id);
+            }
+        }
         owners.note(VmTxnEvent::RolledBack {
             reason: VmRollbackReason::PageTableUpdate,
             released,
@@ -594,12 +681,31 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
     owners.note(VmTxnEvent::Installed { count: pages });
 
     // ── Phase W and S: the request has committed. Retire whatever it displaced — shootdown
-    // BEFORE reclaim, with NO domain lock held across the wait.
-    for record in records.iter() {
-        if let Some(old) = record.replaced
-            && owners.complete_shootdown(asid, record.virt)
-        {
+    // BEFORE reclaim, with NO domain lock held across the wait — and then let go of this
+    // request's own holds, which the map references taken in phase I have now replaced.
+    for index in 0..records.len() {
+        let Some(old) = records[index].replaced else {
+            continue;
+        };
+        if owners.complete_shootdown(asid, records[index].virt) {
+            // Unpin BEFORE the reclaim, and only after the acknowledgement: the reclaim is
+            // guarded on the pin, so this is the single point at which the displaced backing
+            // becomes reusable, and it is reached only once its translation is provably gone.
+            if records[index].displaced_pinned {
+                owners.unpin_displaced(old.phys);
+                records[index].displaced_pinned = false;
+            }
             owners.reclaim_replaced(old.phys);
+        }
+        // No acknowledgement: the pin stays, and with it the guarantee that no other reclaimer
+        // can hand this frame out while a remote translation may still reach it.
+    }
+    for index in 0..records.len() {
+        if records[index].pinned {
+            // The page is installed and its map reference is taken, so the map reference is now
+            // the hold. Released exactly once, here.
+            owners.unpin_object(records[index].object_id);
+            records[index].pinned = false;
         }
     }
     Ok((args.addr, args.map_len))

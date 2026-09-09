@@ -563,13 +563,15 @@ impl AddressSpace {
         match effective_exact_idx {
             Some(i) => {
                 let old = self.entries[i].as_ref().expect("entry").mapping;
+                let original_pages = self.entries[i].as_ref().expect("entry").pages;
                 // Bug 1 fix: right-split so the tail of a multi-page run keeps its
                 // own tracking entry — overwriting entry.mapping here would corrupt it.
-                if self.entries[i].as_ref().expect("entry").pages > 1 {
+                let mut split_tail = false;
+                if original_pages > 1 {
                     if self.len >= MAX_MAPPINGS {
                         return Err(VmError::Full);
                     }
-                    let tail_pages = self.entries[i].as_ref().expect("entry").pages - 1;
+                    let tail_pages = original_pages - 1;
                     let tail_virt = VirtAddr(virt.0 + PAGE_SIZE as u64);
                     let tail_phys = PhysAddr(old.phys.0 + PAGE_SIZE as u64);
                     for shift_idx in (i + 1..self.len).rev() {
@@ -585,13 +587,50 @@ impl AddressSpace {
                     });
                     self.entries[i].as_mut().expect("entry").pages = 1;
                     self.len += 1;
+                    split_tail = true;
                 }
                 // Bug 5 fix: BBM — unmap before remap for AArch64 compliance;
                 // also forces a TLB shootdown on x86_64 and RISC-V.
                 arch_unmap_page(self.asid, virt);
                 if let Err(e) = arch_map_page(self.asid, virt, mapping) {
-                    // Hardware is already unmapped; remove the stale software entry
-                    // so the shadow stays consistent.
+                    // U9-VM-ENTRY1-L §2: a REPLACEMENT that fails must leave the address space
+                    // exactly as it found it.
+                    //
+                    // Break-before-make has already removed the predecessor from hardware. This
+                    // used to return `Err` with the software entry deleted to match — which is
+                    // internally consistent but silently destroys a mapping the caller neither
+                    // asked to remove nor was told had been removed, and which no caller-side
+                    // journal can compensate because the caller never saw it.
+                    //
+                    // Putting the predecessor back is GUARANTEED, not attempted: on all three
+                    // ports `page_table::unmap_page` clears only the leaf entry and never frees
+                    // an intermediate table, so the walk to this VA's leaf still exists and
+                    // re-mapping the SAME virtual address allocates nothing. It therefore cannot
+                    // fail for the reason the install just did.
+                    if arch_map_page(self.asid, virt, old).is_ok() {
+                        if split_tail {
+                            // Undo the bookkeeping split too, so `len` and the entry shape are
+                            // byte-for-byte what they were on entry.
+                            for shift_idx in i + 1..self.len.saturating_sub(1) {
+                                self.entries[shift_idx] = self.entries[shift_idx + 1];
+                            }
+                            self.entries[self.len - 1] = None;
+                            self.len -= 1;
+                            self.entries[i].as_mut().expect("entry").pages = original_pages;
+                        }
+                        return Err(e);
+                    }
+                    // Unreachable by the argument above: the leaf table is still installed and
+                    // this re-map touches nothing else. If it ever were reached, the only safe
+                    // choice is to keep hardware and the software shadow consistent — never to
+                    // claim a mapping that is not there — and to say so loudly rather than
+                    // panicking in a syscall path.
+                    crate::yarm_log!(
+                        "VM_MAP_REPLACE_RESTORE_FAILED asid={} va=0x{:x} lost_pa=0x{:x}",
+                        self.asid.map(|a| a.0).unwrap_or(0),
+                        virt.0,
+                        old.phys.0
+                    );
                     for shift_idx in i..self.len.saturating_sub(1) {
                         self.entries[shift_idx] = self.entries[shift_idx + 1];
                     }

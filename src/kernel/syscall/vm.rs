@@ -69,6 +69,21 @@ impl VmMapOwners for BroadVmOwners<'_> {
         Ok((object_id, phys))
     }
 
+    fn pin_object(&mut self, object_id: u64) -> bool {
+        self.kernel
+            .with_memory_state_mut(|memory| pin_object_locked(memory, object_id))
+    }
+
+    fn unpin_object(&mut self, object_id: u64) {
+        self.kernel
+            .with_memory_state_mut(|memory| unpin_object_locked(memory, object_id));
+    }
+
+    fn unpin_displaced(&mut self, phys: PhysAddr) {
+        self.kernel
+            .with_memory_state_mut(|memory| unpin_object_for_phys_locked(memory, phys));
+    }
+
     fn release_unminted_object(&mut self, object_id: u64) {
         self.kernel.release_unminted_anonymous_object(object_id);
     }
@@ -252,14 +267,92 @@ pub(crate) fn install_and_account_locked(
     }
 
     // ── Pass B: account it. Cannot fail.
-    for record in records.iter() {
+    for record in records.iter_mut() {
         KernelState::note_mapping_inserted_locked(memory, record.phys);
         if let Some(old) = record.replaced {
+            // PIN the displaced backing BEFORE dropping its last mapping reference, inside this
+            // same acquisition. Between the decrement and the pin there is no window at all: a
+            // reclaimer would need this very rank-6 acquisition to act. Without the pin, a page
+            // whose displaced object holds no capability becomes reclaimable the instant its map
+            // reference goes — and its frame reusable — while this transaction still owes it a
+            // shootdown acknowledgement.
+            record.displaced_pinned = pin_object_for_phys_locked(memory, old.phys);
             KernelState::clear_cow_page_locked(memory, asid, record.virt);
             KernelState::note_mapping_removed_locked(memory, old.phys);
         }
     }
     Ok(())
+}
+
+/// rank 6 — this transaction's own hold on the object with `object_id`. Returns whether it was
+/// taken; an object that has already been reclaimed cannot be pinned and needs no hold.
+pub(crate) fn pin_object_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    object_id: u64,
+) -> bool {
+    let object = CapObject::MemoryObject { id: object_id };
+    if !memory
+        .memory_objects
+        .iter()
+        .flatten()
+        .any(|entry| entry.id == object_id)
+    {
+        return false;
+    }
+    KernelState::adjust_memory_object_pin_refcount_locked(memory, object, 1);
+    true
+}
+
+/// rank 6 — release this transaction's hold, then let the object be reclaimed if that was its last
+/// reference of any kind. The guarded reclaim is what makes the release the single point at which
+/// the backing becomes reusable.
+pub(crate) fn unpin_object_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    object_id: u64,
+) {
+    let object = CapObject::MemoryObject { id: object_id };
+    KernelState::adjust_memory_object_pin_refcount_locked(memory, object, -1);
+    KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object);
+}
+
+/// rank 6 — the same hold, keyed by physical address, for a DISPLACED page whose object this
+/// transaction did not create and has no id for.
+pub(crate) fn pin_object_for_phys_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    phys: PhysAddr,
+) -> bool {
+    let Some(object_id) = memory
+        .memory_objects
+        .iter()
+        .flatten()
+        .find(|object| object.phys == phys)
+        .map(|object| object.id)
+    else {
+        return false;
+    };
+    pin_object_locked(memory, object_id)
+}
+
+/// rank 6 — release a hold taken by [`pin_object_for_phys_locked`]. Deliberately does NOT reclaim:
+/// the displaced page's own reclaim is the caller's next step and is already shootdown-gated, so
+/// reclaiming here would duplicate it.
+pub(crate) fn unpin_object_for_phys_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    phys: PhysAddr,
+) {
+    if let Some(object_id) = memory
+        .memory_objects
+        .iter()
+        .flatten()
+        .find(|object| object.phys == phys)
+        .map(|object| object.id)
+    {
+        KernelState::adjust_memory_object_pin_refcount_locked(
+            memory,
+            CapObject::MemoryObject { id: object_id },
+            -1,
+        );
+    }
 }
 
 /// The undo half of pass A, inside the SAME acquisition as the install. A page is returned to
