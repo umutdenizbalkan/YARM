@@ -12,31 +12,57 @@
 //! # Why the phases are shaped the way they are
 //!
 //! The broad handlers could interleave "allocate one frame, map one frame" because the global
-//! lock made the whole loop atomic. Off that lock it is not, and two obligations follow that the
-//! in-lock shape cannot meet:
+//! lock made the whole loop atomic. Off that lock it is not, and three obligations follow that
+//! the in-lock shape cannot meet.
 //!
-//! * **Mapping compensation must prove OWNERSHIP, not matching bytes.** `AddressSpace::map_page`
-//!   REPLACES, and comparing a recorded `(va, phys)` on the way out does not exclude a concurrent
-//!   replacement that happens to reuse the same physical backing, nor an ABA reuse of the frame.
-//!   So installation and rollback are performed inside ONE `user_spaces` acquisition: within it no
-//!   other transaction can observe or alter this address space, so every page this transaction
-//!   removes on the failure path is provably the page it installed, by serialization rather than
-//!   by comparison. That is also what lets the failure path RESTORE the exact mapping each page
-//!   displaced, so a partial failure removes no pre-existing mapping at all.
+//! ## 1. Failure semantics are REQUEST-wide, not chunk-wide
 //!
-//! * **A provisional capability is not private.** Every thread of a process shares one CNode
-//!   (`task_cnode` resolves through `thread_group_id`), so a sibling running on another CPU can in
-//!   principle reach a slot this transaction has minted but not yet returned. "Freshly minted" is
-//!   therefore not a proof of exclusivity, and a childlessness snapshot taken in one acquisition
-//!   says nothing about the next. The release below re-establishes identity INSIDE the one
-//!   capability acquisition that removes the slot: the exact `CapId` (which carries the slot
-//!   generation), the exact `MemoryObject` id, no delegation link naming it, and
-//!   `delete_if_leaf`'s own in-cspace child scan. A cap that fails any of those is NOT this
-//!   transaction's to remove and is left exactly as it is.
+//! The delivered rollback is `rollback_anon_map(kernel, asid, addr, mapped_end, ..)`, and `addr`
+//! there is the ORIGINAL request address: a failure at any page unmaps, revokes and reclaims
+//! everything the request had installed, from its base. Servicing a request as a sequence of
+//! independently committing runs does NOT reproduce that — a failure in a later run leaves the
+//! earlier runs installed, minted and accounted, which is silently accepted partial success.
 //!
-//! Hence: acquire every resource first, install the whole range under one VM acquisition, and do
-//! all rank-6 accounting afterwards. The failure path at each phase undoes exactly that phase's
-//! own work through the same owners.
+//! So the transaction has one failure domain: the whole request. Its journal is reserved for the
+//! whole request BEFORE any mutation, because a `no_std` transaction must not depend on an
+//! allocation succeeding in order to be able to roll back. The reservation adds no reachable
+//! refusal — every page also needs its own memory-object slot from a fixed table, so a request
+//! whose journal will not fit cannot get past phase R either, and reports the same error.
+//!
+//! ## 2. Mapping compensation must prove OWNERSHIP, not matching bytes
+//!
+//! `AddressSpace::map_page` REPLACES, and comparing a recorded `(va, phys)` on the way out
+//! excludes neither a concurrent replacement that happens to reuse the same physical backing nor
+//! an ABA reuse of the frame. There is no per-mapping identity token to appeal to instead.
+//!
+//! What is available is serialization, and it is only worth anything if it covers the install AND
+//! the undo. So EVERY page-table write of the request — install, restore and removal — happens
+//! inside ONE acquisition, and the capability mint happens BEFORE it. That ordering is forced,
+//! not preferred: a mint placed after the install would have to undo the install on failure, by
+//! which time the installing acquisition is gone, so the undo would run in a second acquisition
+//! and could not prove that the page it removes is still the page it put there.
+//!
+//! The cost is that a provisional capability now exists across the address-space phase. That is
+//! the deliberate trade. An escaped provisional capability is COMPENSABLE — the release below
+//! re-establishes identity inside the one capability acquisition that removes the slot, and a cap
+//! that has genuinely escaped is retained with a named cleanup owner. A mapping destroyed by a
+//! rollback that could not prove ownership is not compensable at all.
+//!
+//! ## 3. A removed translation owes an acknowledgement before its backing is recycled
+//!
+//! Removing a PTE invalidates it locally; a remote CPU running the same address space may still
+//! hold the translation. The delivered rollback knew this — it paired `unmap_page_phase1` with
+//! `execute_tlb_shootdown_wait_plan` before the frame could return to the allocator. Every page
+//! this transaction installs and then removes therefore completes its shootdown, with NO domain
+//! lock held across the wait, before its capability, its object or its frame is released. A page
+//! whose acknowledgement does not arrive is left unreclaimed rather than recycled under a
+//! possibly-stale translation.
+//!
+//! The map reference is taken in the SAME acquisition as the install, and dropped only after the
+//! removal is acknowledged, so there is no interval in which a page of this request is live in
+//! the page table with no map reference — an interval a competing mapping operation could
+//! otherwise observe, and whose displaced-frame reclaim would free backing this transaction still
+//! owns.
 //!
 //! # What this module deliberately does NOT do
 //!
@@ -46,22 +72,56 @@
 //! left alone rather than torn down. And it introduces no new user-visible refusal: every input
 //! the broad handlers accept is accepted here, with the same error for every input they reject.
 
+extern crate alloc;
+
 use crate::kernel::boot::KernelError;
 use crate::kernel::capabilities::{CNodeId, CapId};
 use crate::kernel::syscall::SyscallError;
 use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 
-/// The maximum number of pages one `VmMap`/`VmAnonMap` call may install.
+/// One page of the request, and everything its rollback needs.
 ///
-/// The broad handlers are bounded only by the frame allocator, but this transaction records one
-/// entry per page so that installation and rollback can share a single VM acquisition — and that
-/// record has to live somewhere bounded, because a `no_std` kernel transaction must not depend on
-/// a heap allocation succeeding in order to be able to roll back.
-///
-/// A request above the bound is NOT a new refusal: it is serviced page-run by page-run, each run
-/// a complete transaction of its own, so userspace observes exactly the mapping it asked for. The
-/// value is the same order as the largest run any live profile issues.
-pub(crate) const VM_MAP_MAX_PAGES_PER_RUN: usize = 64;
+/// The journal is allocated for the WHOLE request before any mutation, so a failure at any page
+/// can undo every page — there is no chunk boundary to leak a partial commit across. It is
+/// bounded in practice by the memory-object table (`MAX_MEMORY_OBJECTS`): every page needs its own
+/// object slot, so a request that would outgrow the journal cannot get past phase R either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PageRecord {
+    pub(crate) virt: VirtAddr,
+    /// The object this transaction created for the page, and the frame it owns.
+    pub(crate) object_id: u64,
+    pub(crate) phys: PhysAddr,
+    /// The capability minted for `object_id`, once phase M has run.
+    pub(crate) cap: Option<CapId>,
+    /// Set once the page's PTE has been written by phase I.
+    pub(crate) installed: bool,
+    /// What the install displaced, recorded inside the acquisition that displaced it. On the
+    /// failure path this is restored verbatim, in the SAME acquisition; on the success path its
+    /// frame is accounted and then reclaimed after its shootdown.
+    pub(crate) replaced: Option<Mapping>,
+}
+
+impl PageRecord {
+    fn new(virt: VirtAddr, object_id: u64, phys: PhysAddr) -> Self {
+        Self {
+            virt,
+            object_id,
+            phys,
+            cap: None,
+            installed: false,
+            replaced: None,
+        }
+    }
+
+    /// The provisional frame view the capability-release owner takes.
+    fn provisional(&self) -> Option<ProvisionalFrame> {
+        self.cap.map(|cap| ProvisionalFrame {
+            object_id: self.object_id,
+            cap,
+            phys: self.phys,
+        })
+    }
+}
 
 /// One frame this transaction acquired and still owns: the object it created, the capability slot
 /// it minted for the caller, and the physical extent both name.
@@ -74,16 +134,6 @@ pub(crate) struct ProvisionalFrame {
     pub(crate) object_id: u64,
     pub(crate) cap: CapId,
     pub(crate) phys: PhysAddr,
-}
-
-/// What one page's installation displaced, recorded inside the VM acquisition that displaced it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct InstalledPage {
-    pub(crate) virt: VirtAddr,
-    pub(crate) inserted: PhysAddr,
-    /// The mapping that was already there, if any. On the failure path this is restored verbatim;
-    /// on the success path its frame is accounted and reclaimed after its shootdown.
-    pub(crate) replaced: Option<Mapping>,
 }
 
 /// Why a provisional capability was not released.
@@ -123,8 +173,8 @@ pub(crate) enum MapTarget {
     CallerAddressSpace,
 }
 
-/// Every domain operation the mapping transaction performs. One method, one acquisition of one
-/// domain. No method contains phase order, validation sequencing or rollback policy.
+/// Every domain operation the mapping transaction performs. One method, one acquisition; no method
+/// contains phase order, validation sequencing or rollback policy.
 pub(crate) trait VmMapOwners {
     /// The calling thread. `None` means no current task.
     fn caller_tid(&self) -> Option<u64>;
@@ -148,66 +198,42 @@ pub(crate) trait VmMapOwners {
     /// rank 6 — take one frame and create its memory object. NO capability is minted here.
     ///
     /// The delivered RIGHTS check is evaluated at this point and with this error, against the
-    /// rights the mint will carry (`memory_object_rights_for_kind(Anonymous)`) rather than
-    /// against a published capability. Same predicate, same position in the error precedence,
-    /// no cap required — which is what lets the mint move to the end of the transaction.
+    /// rights the mint will carry rather than against a published capability. Same predicate,
+    /// same position in the error precedence, no cap required.
     fn acquire_object(&mut self, flags: PageFlags) -> Result<(u64, PhysAddr), KernelError>;
+
+    /// rank 6 — release an object that no capability and no mapping ever referenced.
+    ///
+    /// Reachable ONLY from phase R's own failure path, and only for objects phase M has not yet
+    /// minted a capability for. At that point nothing in the system can name the object: no slot
+    /// was published and no PTE was written, so freeing its backing cannot take a frame another
+    /// mapping now references. The owner asserts that precondition rather than assuming it.
+    fn release_unminted_object(&mut self, object_id: u64);
 
     /// rank 4 — mint the caller's capability for an object this transaction created.
     ///
-    /// Deliberately the LAST mutation of the transaction. See the module header: a provisional
-    /// capability is not private, and the shortest window in which one exists is the safest.
+    /// Phase M, and it runs BEFORE the address space is touched. See the module header: a mint
+    /// after the install would force the install's rollback into a second VM acquisition, and a
+    /// rollback that cannot see the acquisition that installed cannot prove what it is undoing.
     fn mint_frame_cap(&mut self, object_id: u64, phys: PhysAddr) -> Result<CapId, KernelError>;
 
-    /// rank 6 — release an object that no capability ever referenced.
+    /// ONE acquisition, VM rank 5 then memory rank 6 — install the WHOLE request, take the map
+    /// reference on every frame, account every mapping it displaced, and on any failure restore
+    /// every page it touched, all before releasing.
     ///
-    /// Reachable only before the mint phase, so the object is unreachable by construction: no
-    /// slot names it, no enumerator can see it, and its backing returns by its own ownership
-    /// rule.
-    fn release_unminted_object(&mut self, object_id: u64);
-
-    /// ONE rank-5 acquisition — remove exactly the pages `installed` records, restoring whatever
-    /// each displaced. Used only by the mint-phase rollback, which runs after `install_range`
-    /// has already returned.
-    fn undo_installed_range(&mut self, asid: Asid, installed: &[InstalledPage]);
-
-    /// ONE rank-5 acquisition covering the whole range: install `frames[i]` at
-    /// `base + i * PAGE_SIZE`, recording what each displaced. On the first failure, restore every
-    /// page already installed IN THIS SAME ACQUISITION and return the error together with the
-    /// index that failed.
+    /// This is the whole of the address-space phase. Nothing else in the transaction writes a PTE
+    /// or a map refcount, so ownership of everything the failure path removes is established by
+    /// serialization over the entire request rather than by comparing a virtual and physical
+    /// address, which excludes neither a same-backing replacement nor an ABA frame reuse.
     ///
-    /// Installation and rollback share one acquisition precisely so the rollback provably removes
-    /// only pages this transaction installed.
-    fn install_range(
+    /// On failure returns the index that failed; `records[..]` still describes what happened, so
+    /// the caller knows which pages were installed and removed and therefore owe a shootdown.
+    fn install_and_account(
         &mut self,
         asid: Asid,
-        base: usize,
         flags: PageFlags,
-        objects: &[(u64, PhysAddr)],
-        out: &mut [InstalledPage],
-    ) -> Result<usize, (usize, KernelError)>;
-
-    /// rank 6 — take the MAP reference on every frame this run installed (`map_refcount++`).
-    ///
-    /// Deliberately BEFORE the mint. `reclaim_memory_object_if_unreferenced` frees an object only
-    /// when `cap_refcount`, `map_refcount` and `pin_refcount` are all zero, so taking the map
-    /// reference before any capability naming the object is published makes it structurally
-    /// impossible for a capability-side revoke to reclaim backing this transaction has already
-    /// mapped. The protection is an invariant of the phase order, not an argument about which
-    /// actors happen to exist.
-    fn note_inserted(&mut self, installed: &[InstalledPage]);
-
-    /// rank 6 — the exact inverse of [`Self::note_inserted`], for the mint-phase rollback. Run
-    /// AFTER the mappings are removed, so a frame is never reclaimable while its PTE is live.
-    fn unnote_inserted(&mut self, installed: &[InstalledPage]);
-
-    /// rank 6 — the accounting the DISPLACED pages owe, run only once the run has committed:
-    /// COW clear plus `map_refcount--` for each mapping this run replaced.
-    ///
-    /// Separated from [`Self::note_inserted`] because it is not reversible — `clear_cow_page`
-    /// destroys a mark this transaction cannot restore — so it must not run on any path that can
-    /// still put the displaced mappings back.
-    fn settle_displaced(&mut self, asid: Asid, installed: &[InstalledPage]);
+        records: &mut [PageRecord],
+    ) -> Result<(), (usize, KernelError)>;
 
     /// NO LOCK — complete the required TLB shootdown for `virt` in `asid`. Returns `false` when a
     /// remote acknowledgement was not obtained, in which case the caller must skip the reclaim.
@@ -257,10 +283,15 @@ pub(crate) enum VmTxnEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VmRollbackReason {
+    /// Phase R — no capability and no mapping exists for anything this phase acquired.
     FrameAlloc,
-    PageTableUpdate,
-    /// The mint phase — the ONLY phase in which a provisional capability exists.
+    /// Phase M — capabilities exist, the address space has not been touched.
     CapabilityMint,
+    /// Phase I — the address space phase restored itself before releasing; what remains is the
+    /// shootdown its removals owe, and the capabilities and objects it no longer needs.
+    PageTableUpdate,
+    /// The journal itself could not be reserved. Nothing was acquired, minted or installed.
+    JournalReserve,
 }
 
 /// Validates the `(addr, len, prot)` triple shared by NR 3 and NR 13, in the delivered order and
@@ -340,52 +371,85 @@ pub(crate) fn guard_page_refuses<O: VmMapOwners>(
         .map_err(SyscallError::from)
 }
 
-/// Release every provisional frame in `frames`, and report how many were actually this
-/// transaction's to release.
+/// Release every capability in `records` that is still this transaction's to release, and report
+/// `(released, retained)`.
 ///
-/// Returns `(released, retained)`. A retained frame is one a sibling took ownership of while this
-/// transaction was in flight; its capability and its object stay exactly as they are, which is the
-/// only correct outcome — the frame is still referenced, so it is not leaked, and removing it
-/// would destroy another transaction's resource.
-fn release_frames<O: VmMapOwners>(
+/// A retained frame is one a sibling took ownership of while this transaction was in flight; its
+/// capability and its object stay exactly as they are, which is the only correct outcome — the
+/// frame is still referenced, so it is not leaked, and removing it would destroy another
+/// transaction's resource. Its cleanup owner is `revoke_capability_in_cnode`, which process
+/// teardown drives once per live capability.
+fn release_capabilities<O: VmMapOwners>(
     owners: &mut O,
     cnode: Option<CNodeId>,
-    frames: &[ProvisionalFrame],
+    records: &[PageRecord],
 ) -> (usize, usize) {
+    let minted = records.iter().filter(|r| r.cap.is_some()).count();
     let Some(cnode) = cnode else {
-        // No cspace to release into. Nothing was minted there either, so there is nothing to undo.
-        return (0, frames.len());
+        // No cspace to release into. Nothing was minted there either.
+        return (0, minted);
     };
     let mut released = 0usize;
     let mut retained = 0usize;
-    for frame in frames {
-        match owners.release_provisional_cap(cnode, *frame) {
+    for record in records {
+        let Some(frame) = record.provisional() else {
+            continue;
+        };
+        match owners.release_provisional_cap(cnode, frame) {
             ProvisionalReleaseOutcome::Released => {
-                owners.account_released_cap(*frame);
+                owners.account_released_cap(frame);
                 released += 1;
             }
-            ProvisionalReleaseOutcome::NotOurs => {
-                // Someone else's retirement already did this frame's accounting.
+            // Someone else's retirement already did this frame's accounting, or someone derived
+            // from the slot while this transaction was in flight. Either way it is not ours.
+            ProvisionalReleaseOutcome::NotOurs | ProvisionalReleaseOutcome::Derived => {
                 retained += 1;
             }
-            ProvisionalReleaseOutcome::Derived => retained += 1,
         }
     }
     (released, retained)
 }
 
-/// THE anonymous-mapping transaction: NR 3 and NR 13, one policy.
+/// Every page phase I installed and then removed owes a shootdown before its backing may return to
+/// the allocator. Complete them with NO lock held, and report which pages were acknowledged.
 ///
-/// Phase order, and what each failure settles:
+/// A page whose acknowledgement does not arrive is deliberately left unreclaimed rather than
+/// recycled under a possibly-stale remote translation. That is the same fail-closed rule the
+/// committed path and `unmap_range_two_phase` already obey.
+fn settle_rollback_shootdowns<O: VmMapOwners>(
+    owners: &mut O,
+    asid: Asid,
+    records: &mut [PageRecord],
+) -> usize {
+    let mut unacknowledged = 0usize;
+    for record in records.iter_mut() {
+        if !record.installed {
+            continue;
+        }
+        if owners.complete_shootdown(asid, record.virt) {
+            // The translation is retired everywhere it could have been cached, so this page's
+            // backing may now be released. There is no map reference to drop: pass B of the
+            // address-space phase is the only thing that takes one, and it runs only once the
+            // whole request has installed — so a page reached by this path never had one.
+            record.installed = false;
+        } else {
+            unacknowledged += 1;
+        }
+    }
+    unacknowledged
+}
+
+/// THE anonymous-mapping transaction: NR 3 and NR 13, one policy, one request.
 ///
-/// | phase | on failure |
-/// |---|---|
-/// | validate, resolve target, guard page | nothing acquired, nothing installed |
-/// | R: acquire every frame and its object, NO capability | release exactly the objects acquired so far |
-/// | I: install the whole range under ONE VM acquisition | that acquisition restores every page it displaced, then release every object |
-/// | S1: take the map reference on every inserted frame | (cannot fail) |
-/// | M: mint the caller's capabilities, LAST | remove the mappings, drop the map references, release the caps minted so far, release the rest of the objects |
-/// | S2: account, shoot down and reclaim displaced frames | — the transaction has committed |
+/// | phase | acquisition | on failure |
+/// |---|---|---|
+/// | J: reserve the whole-request journal | none | nothing acquired |
+/// | V: validate, resolve target, guard page | rank 4 / rank 5 reads | nothing acquired |
+/// | R: acquire every object and frame | rank 6 | release exactly the objects acquired so far |
+/// | M: mint every capability | rank 4 | release the capabilities minted so far, then every object |
+/// | I: install the whole request, take map references, account displaced | ONE rank 5 → rank 6 | the acquisition restores every page it touched BEFORE releasing; then shootdown, then capabilities, then objects |
+/// | W: required shootdown acknowledgements | none | — |
+/// | S: reclaim displaced backing | rank 6 | — |
 ///
 /// Returns the `(addr, map_len)` the caller's result lanes carry.
 pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
@@ -410,46 +474,47 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
     });
 
     let cnode = owners.caller_cnode(tid);
-    let total_pages = args.map_len / PAGE_SIZE;
-    let mut base = args.addr;
-    let mut remaining = total_pages;
+    let pages = args.map_len / PAGE_SIZE;
 
-    // A request longer than one run is serviced as consecutive complete transactions. Each run
-    // commits on its own, so a failure in a later run leaves the earlier runs installed — which is
-    // exactly the delivered behaviour, whose rollback also only covers `[addr, mapped_end)`.
-    while remaining > 0 {
-        let run_pages = remaining.min(VM_MAP_MAX_PAGES_PER_RUN);
-        run_one_map_run(owners, asid, cnode, base, run_pages, args.flags)?;
-        base += run_pages * PAGE_SIZE;
-        remaining -= run_pages;
+    // ── Phase J: the journal for the WHOLE request, reserved before any mutation.
+    //
+    // The delivered rollback covers `[addr, mapped_end)` — measured from the REQUEST base, not
+    // from any chunk — so a failure at any page must be able to undo every page. That is only
+    // expressible with a record per page of the request, and a `no_std` transaction must not
+    // depend on an allocation succeeding *after* it has begun mutating. So the reservation is
+    // fallible and happens here, where nothing has been acquired and a refusal costs nothing.
+    //
+    // It introduces no reachable new refusal: every page also needs its own memory-object slot,
+    // and the object table is a fixed array, so a request whose journal will not fit could not
+    // have got past phase R either — and the error it reports is the one phase R would have
+    // reported.
+    let mut records: alloc::vec::Vec<PageRecord> = alloc::vec::Vec::new();
+    if records.try_reserve_exact(pages).is_err() {
+        owners.note(VmTxnEvent::RolledBack {
+            reason: VmRollbackReason::JournalReserve,
+            released: 0,
+            retained: 0,
+        });
+        return Err(SyscallError::from(KernelError::MemoryObjectFull));
     }
-    Ok((args.addr, args.map_len))
-}
 
-fn run_one_map_run<O: VmMapOwners>(
-    owners: &mut O,
-    asid: Asid,
-    cnode: Option<CNodeId>,
-    base: usize,
-    pages: usize,
-    flags: PageFlags,
-) -> Result<(), SyscallError> {
-    debug_assert!(pages <= VM_MAP_MAX_PAGES_PER_RUN);
-    let mut objects = [(0u64, PhysAddr(0)); VM_MAP_MAX_PAGES_PER_RUN];
-
-    // ── Phase R: every frame and its object first. NO capability exists yet, so nothing this
-    // phase creates is visible to any enumerator, and its failure path touches no capability
-    // domain at all.
+    // ── Phase R: every frame and its object, for the whole request. NO capability exists yet, so
+    // nothing this phase creates is visible to any enumerator, and its failure path touches
+    // neither the capability domain nor the address space.
     for i in 0..pages {
-        match owners.acquire_object(flags) {
-            Ok(pair) => objects[i] = pair,
+        match owners.acquire_object(args.flags) {
+            Ok((object_id, phys)) => records.push(PageRecord::new(
+                VirtAddr((args.addr + i * PAGE_SIZE) as u64),
+                object_id,
+                phys,
+            )),
             Err(e) => {
-                for (object_id, _) in objects.iter().take(i) {
-                    owners.release_unminted_object(*object_id);
+                for record in records.iter() {
+                    owners.release_unminted_object(record.object_id);
                 }
                 owners.note(VmTxnEvent::RolledBack {
                     reason: VmRollbackReason::FrameAlloc,
-                    released: i,
+                    released: records.len(),
                     retained: 0,
                 });
                 return Err(SyscallError::from(e));
@@ -458,90 +523,32 @@ fn run_one_map_run<O: VmMapOwners>(
     }
     owners.note(VmTxnEvent::FramesAcquired { count: pages });
 
-    // ── Phase I: ONE VM acquisition installs the whole run and, on failure, restores every page
-    // it displaced before releasing. Ownership of what the failure path removes is established by
-    // that serialization, not by comparing a recorded frame number.
+    // ── Phase M: every capability, for the whole request, and BEFORE the address space is
+    // touched.
     //
-    // The mapping is built from the object's own `phys`. It does NOT go through a capability, so
-    // a sibling revoking or replacing a provisional slot cannot make this map freed or recycled
-    // backing — there is no capability in the dependency chain to revoke.
-    let mut installed = [InstalledPage {
-        virt: VirtAddr(0),
-        inserted: PhysAddr(0),
-        replaced: None,
-    }; VM_MAP_MAX_PAGES_PER_RUN];
-    let count = match owners.install_range(
-        asid,
-        base,
-        flags,
-        &objects[..pages],
-        &mut installed[..pages],
-    ) {
-        Ok(count) => count,
-        Err((_failed_index, e)) => {
-            // The acquisition already restored the address space, and no capability was ever
-            // minted, so the objects are unreachable and go back whole.
-            for (object_id, _) in objects.iter().take(pages) {
-                owners.release_unminted_object(*object_id);
-            }
-            owners.note(VmTxnEvent::RolledBack {
-                reason: VmRollbackReason::PageTableUpdate,
-                released: pages,
-                retained: 0,
-            });
-            return Err(SyscallError::from(e));
-        }
-    };
-    debug_assert_eq!(count, pages);
-    owners.note(VmTxnEvent::Installed { count });
-
-    // ── Phase S1: take the MAP reference on every frame just installed, BEFORE any capability
-    // naming it exists. An object is reclaimed only when cap, map and pin references are all
-    // zero, so from this point a capability-side revoke cannot free backing this transaction has
-    // mapped — no matter what a sibling does with the slot the next phase publishes. Only the
-    // inserted side is accounted here: the displaced side is not reversible and belongs after the
-    // run commits.
-    owners.note_inserted(&installed[..count]);
-
-    // ── Phase M: the mint, LAST. This is the only phase in which a provisional capability
-    // exists, and it is placed here deliberately.
+    // The order is forced, not preferred. A mint after the install would have to undo the install
+    // on failure, and the install's acquisition has by then been released — so the undo would run
+    // in a SECOND acquisition, unable to prove that what it is removing is still what it put
+    // there. A competing mapping operation on another CPU may have replaced any of those pages in
+    // the interval, possibly with the very same physical backing, so no comparison of virtual and
+    // physical address could distinguish the two. Minting first keeps every page-table write and
+    // every page-table undo inside one acquisition.
     //
-    // A provisional cap is not private: every thread of a process shares one CNode, and Fork
-    // inherits by ENUMERATING the parent's cspace — so a sibling forking concurrently can
-    // capture a slot this transaction has minted but not yet returned, with no CapId guessing
-    // required. Minting after the two phases that actually fail in practice (frame exhaustion and
-    // page-table update) removes that window from both of them; what remains is the mint's own,
-    // which is the shortest it can be.
-    let mut frames = [ProvisionalFrame {
-        object_id: 0,
-        cap: CapId(0),
-        phys: PhysAddr(0),
-    }; VM_MAP_MAX_PAGES_PER_RUN];
+    // A provisional capability is not private — every thread of a process shares one CNode, and
+    // Fork inherits by enumerating the parent's cspace — so this order does widen the window in
+    // which a sibling can capture a slot this transaction has not yet returned. That is the
+    // deliberate trade: an escaped provisional capability is COMPENSABLE (identity-checked
+    // release, and a named cleanup owner for one that has genuinely escaped), whereas a mapping
+    // destroyed by a rollback that could not prove ownership is not compensable at all.
     for i in 0..pages {
-        let (object_id, phys) = objects[i];
+        let (object_id, phys) = (records[i].object_id, records[i].phys);
         match owners.mint_frame_cap(object_id, phys) {
-            Ok(cap) => {
-                frames[i] = ProvisionalFrame {
-                    object_id,
-                    cap,
-                    phys,
-                }
-            }
+            Ok(cap) => records[i].cap = Some(cap),
             Err(e) => {
-                // Undo in reverse dependency order, and in the order that never leaves a frame
-                // reclaimable while its PTE is live:
-                //   1. remove the mappings (ONE acquisition, restoring what each displaced),
-                //   2. only then drop the map references phase S1 took,
-                //   3. then the capabilities this phase minted — each one's release is what makes
-                //      its object unreferenced, and by now it is genuinely unmapped,
-                //   4. then the objects that never got a capability at all.
-                // Between (1) and (2) a frame is over-counted rather than under-counted, which is
-                // the safe direction: nothing can be reclaimed early.
-                owners.undo_installed_range(asid, &installed[..count]);
-                owners.unnote_inserted(&installed[..count]);
-                let (released, retained) = release_frames(owners, cnode, &frames[..i]);
-                for (object_id, _) in objects.iter().take(pages).skip(i) {
-                    owners.release_unminted_object(*object_id);
+                // Nothing is installed, so there is no page table work and no shootdown to owe.
+                let (released, retained) = release_capabilities(owners, cnode, &records[..i]);
+                for record in records.iter().skip(i) {
+                    owners.release_unminted_object(record.object_id);
                 }
                 owners.note(VmTxnEvent::RolledBack {
                     reason: VmRollbackReason::CapabilityMint,
@@ -553,17 +560,49 @@ fn run_one_map_run<O: VmMapOwners>(
         }
     }
 
-    // ── Phase S2: the run has committed. Account what it displaced, then retire it — shootdown
-    // BEFORE reclaim, with no domain lock held across the wait.
-    owners.settle_displaced(asid, &installed[..count]);
-    for page in &installed[..count] {
-        if let Some(old) = page.replaced {
-            if owners.complete_shootdown(asid, page.virt) {
-                owners.reclaim_replaced(old.phys);
-            }
+    // ── Phase I: ONE acquisition — VM rank 5, then memory rank 6 nested underneath it, which is
+    // the legal direction — installs the whole request, takes the map reference on every frame
+    // and accounts every mapping it displaced. On any failure it restores every page it touched
+    // BEFORE releasing.
+    //
+    // Because install, accounting and rollback all happen inside this one acquisition, and
+    // because it spans the WHOLE request rather than a chunk of it, two claims hold that could
+    // not hold otherwise: every page the failure path removes is provably the page this call
+    // installed, and there is no interval in which a page of this request is live in the page
+    // table with no map reference for another transaction to observe.
+    if let Err((failed_index, e)) = owners.install_and_account(asid, args.flags, &mut records) {
+        let _ = failed_index;
+        // The address space is already back to its pre-transaction state. What remains is what
+        // the acquisition could not do: wait for the acknowledgements its removals owe, and then
+        // release the capabilities and objects this request no longer needs.
+        let unacknowledged = settle_rollback_shootdowns(owners, asid, &mut records);
+        // A page whose shootdown was NOT acknowledged keeps its capability and therefore its
+        // object and its frame: fail-closed, exactly as the committed path and the brk shrink do.
+        let releasable: alloc::vec::Vec<PageRecord> = records
+            .iter()
+            .filter(|record| !record.installed)
+            .copied()
+            .collect();
+        let (released, retained) = release_capabilities(owners, cnode, &releasable);
+        owners.note(VmTxnEvent::RolledBack {
+            reason: VmRollbackReason::PageTableUpdate,
+            released,
+            retained: retained + unacknowledged,
+        });
+        return Err(SyscallError::from(e));
+    }
+    owners.note(VmTxnEvent::Installed { count: pages });
+
+    // ── Phase W and S: the request has committed. Retire whatever it displaced — shootdown
+    // BEFORE reclaim, with NO domain lock held across the wait.
+    for record in records.iter() {
+        if let Some(old) = record.replaced
+            && owners.complete_shootdown(asid, record.virt)
+        {
+            owners.reclaim_replaced(old.phys);
         }
     }
-    Ok(())
+    Ok((args.addr, args.map_len))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
