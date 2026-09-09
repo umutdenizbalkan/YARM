@@ -16793,3 +16793,43 @@ feature-and-selector guards (the arming sites key on the arch-neutral provisioni
   narrowing it would be a new refusal. Now **witnessed** — this line is a semantics note, not an
   evidence gap.
 * **NR 2 `IpcRecv`'s user-ASID cohort** — not blocked on a mechanism (see §1); simply not wired.
+
+### Recomputed terminal-dispatch rows at `64b2a91`
+
+Derived from `classify_split_eligible_nr_only`'s exhaustive NR sweep plus the conditional gates in
+`try_split_dispatch_into_frame`, and cross-checked against a fresh AArch64 core boot (the `nr=`
+counts below are that boot's observed pre-lock dispatches).
+
+| NR | syscall | pre-lock route | terminal-broad residual |
+|---|---|---|---|
+| 0 | `Yield` | U9-YIELD2, its own drain | none |
+| 1 | `IpcSend` | U6 send lifecycle + enqueue boundary (obs. 1) | class-conditional |
+| 2 | `IpcRecv` | whitelisted; eligibility decided internally (obs. 116 recv-route) | **user-ASID cohort not wired** |
+| 3 | `VmMap` | whitelisted (obs. 2) | none — TOTAL |
+| 4 | `TransferRelease` | whitelisted (obs. 6) | none — TOTAL |
+| 5 | `IpcRecvTimeout` | U7 (obs. 18) | class-conditional |
+| 6 | `IpcCall` | 199A2B2F direct request, gate OPEN on all three arches (obs. 53) | **helper's `None`** |
+| 7 | `IpcReply` | 199A2B3 direct reply, gate OPEN on all three arches (obs. 54) | **helper's `None`** |
+| 8 | `ControlPlaneSetCnodeSlots` | whitelisted | narrow |
+| 9 | `FutexWait` | own route (obs. 1) | class-conditional |
+| 10 | `FutexWake` | whitelisted | narrow |
+| 11 / 12 / 23 / 29 | spawn + fork family | whitelisted (obs. 3 + 5) | eligibility-conditional |
+| 13 | `VmAnonMap` | whitelisted (obs. 10) | none — TOTAL |
+| 14 | `VmBrk` | whitelisted (obs. 7) | none — TOTAL |
+| 15 | `DebugLog` | whitelisted (obs. 670) | none |
+| 28 | `CreateInitramfsFileSliceMo` | whitelisted (obs. 5) | eligibility-conditional |
+| 30 | `RecvSharedV3` | whitelisted | **none — TOTAL (this package)** |
+| 31 | `ReapFaultedTask` | whitelisted | eligibility-conditional |
+| — | `ExitCurrentTask` | EXIT4 | none |
+
+### Next roadmap package
+
+**NR 6 `IpcCall` and NR 7 `IpcReply` — close the direct request/reply residual arm.** Both gates
+are open on every ordinary boot on all three architectures, and both helpers still answer `None`
+for cases they cannot service, which falls through to the legacy broad handler. Source says so in
+its own words ("NR 6's residual arm is the helper's `None`, not an unarmed gate"). They are also
+the highest-traffic pair in the whole space — 53 and 54 dispatches in a single short boot, against
+1 for NR 1 and 2 for NR 3 — so this is the last high-volume terminal-broad edge in the IPC core.
+
+Second candidate, smaller and mostly wiring: **NR 2 `IpcRecv`'s user-ASID cohort**, which §1
+established is not short a mechanism.
