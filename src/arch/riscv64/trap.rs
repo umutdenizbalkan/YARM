@@ -910,6 +910,19 @@ pub fn handle_riscv_trap_entry_shared(
             // Unlike NR 16, the caller IS resumed later, so its frame must be finalized — which is
             // the same requirement FutexWait has, and it is met the same way.
             || nr == crate::kernel::syscall::SYSCALL_YIELD_NR
+            // U9-VM-ENTRY1: VmMap (NR 3), VmAnonMap (NR 13) and VmBrk (NR 14). Same reason as
+            // every class above — the routes are architecture-neutral but reachable here only for
+            // a listed NR, and their absence was not a decline: NR 14's Stage 114 shrink route has
+            // existed since then and could never once have run on this architecture, because this
+            // list is what decides whether `try_split_dispatch_into_frame` is called at all.
+            //
+            // All three are NON-SWITCHING: they map, unmap or move a break and return to the same
+            // caller, so each finalizes through the same same-task ecall writeback DebugLog uses
+            // (sepc+4 once, sstatus preserved, a0/a1 from `set_ok`). None blocks, none yields,
+            // none changes address space, and no queue is advanced.
+            || nr == crate::kernel::syscall::SYSCALL_VM_MAP_NR
+            || nr == crate::kernel::syscall::SYSCALL_VM_ANON_MAP_NR
+            || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without

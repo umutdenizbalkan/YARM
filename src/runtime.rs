@@ -6848,6 +6848,12 @@ impl SharedKernel {
     /// Same three checks in the same order: the cap must resolve in that task's cspace to a
     /// memory-backed object, it must carry the rights the requested flags demand, and the object
     /// must still exist.
+    ///
+    /// U9-VM-ENTRY1 keeps the `#[cfg(not(hosted-dev))]` gate: the mapping transaction mints LAST,
+    /// so it holds no capability at the point it needs a frame's rights verdict and asks
+    /// `syscall::vm::anonymous_rights_admit` — the same predicate, the same error, the same
+    /// position — instead. This resolver therefore still has exactly one caller, the freestanding
+    /// COW path.
     #[cfg(not(feature = "hosted-dev"))]
     pub(crate) fn resolve_memory_object_phys_for_task_split(
         &self,

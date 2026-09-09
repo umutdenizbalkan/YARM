@@ -15906,3 +15906,222 @@ exactly once, a replacement incarnation is refused fail-closed, and tid 0 publis
 ### Next roadmap package
 
 **VM entry completion.**
+
+## U9-VM-ENTRY1 — close the terminal-dispatch populations of NR 3, NR 13 and NR 14
+
+Canonical 201A/201B; roadmap R2; prerequisite for U9/204E. Base `ca65dca`.
+
+### The population, and what was actually reachable
+
+Three syscalls owned the VM entry residual, and every one of them reached a terminal broad
+dispatcher for every input on at least one architecture:
+
+| NR | before | reachable on |
+|---|---|---|
+| 3 `VmMap` | no split route at all | x86_64, AArch64, RISC-V |
+| 13 `VmAnonMap` | no split route at all | x86_64, AArch64, RISC-V |
+| 14 `VmBrk` | Stage 114's shrink-only adapter, gated on a page-crossing shrink **and at most one CPU online** | every other shape everywhere; **every** shape on RISC-V and AArch64 |
+
+NR 14's route had a second, quieter problem: on RISC-V its NR was never on the trap wrapper's
+eligibility list, and on AArch64 it was never on the ABI import list, so `try_split_dispatch_into_frame`
+was not called for it at all. The Stage 114 adapter could not have run once on either architecture
+since the day it landed. That is not a decline — the route was never reached.
+
+### What replaces them
+
+`syscall/vm_txn.rs` states the two policies once — the anonymous-mapping transaction shared by NR 3
+and NR 13, and the complete NR 14 transaction — over two owner traits. `syscall/vm.rs` is the broad
+adapter, `syscall/vm_split.rs` the split one, and three of the split adapter's methods delegate to
+the *same* rank-local bodies the broad adapter runs (`install_range_locked`, `undo_installed_locked`,
+`note_inserted_locked`, `unnote_inserted_locked`, `settle_displaced_locked`,
+`release_provisional_frame_cap_locked`). They are not two implementations of one contract; they are
+one implementation reached through two acquisitions.
+
+The two NRs differ in exactly one decision, and it is stated as a type: `MapTarget::Capability(cap)`
+resolves the address space the CALLER's capability names, `MapTarget::CallerAddressSpace` the
+caller's own. The provisional frame capabilities are minted in the caller's own cnode either way,
+which is the delivered rule. NR 14 keeps its group-leader rule, its bounds, its error precedence and
+its lazy/eager behaviour verbatim.
+
+### Phase order, and why each phase sits where it does
+
+```
+V  validate → resolve target → guard page      (nothing acquired)
+R  acquire every frame and its object          rank 6, NO capability
+I  install the whole range                     ONE rank-5 acquisition, undo INSIDE it
+S1 take the map reference on every frame       rank 6, reversible
+M  mint the caller's capabilities              rank 4, LAST
+S2 account displaced, shoot down, reclaim      rank 6 → no lock → rank 6
+```
+
+Two obligations the in-lock shape could not meet drove this.
+
+**Mapping compensation must prove OWNERSHIP, not matching bytes.** `AddressSpace::map_page`
+REPLACES, and comparing a recorded `(va, phys)` on the way out excludes neither a concurrent
+replacement that reuses the same physical backing nor an ABA reuse of the frame. Installation and
+rollback therefore happen inside ONE `user_spaces` acquisition: within it no other transaction can
+observe or alter this address space, so every page the failure path removes is provably the page
+this call installed — by serialization, not comparison. That is also what lets the failure path
+restore the exact mapping each page displaced, so a partial failure removes no pre-existing mapping
+at all.
+
+**A provisional capability is not private.** Every thread of a process shares one CNode, and Fork
+inherits by ENUMERATING the parent's cspace (`snapshot_inheritable_caps_split`) — so a sibling
+forking concurrently can capture a slot this transaction has minted but not yet returned, with no
+CapId guessing required. The escape is real. Minting LAST removes the window from the two phases
+that actually fail (frame exhaustion, page-table update) and leaves only the mint's own, which is
+the shortest it can be.
+
+**Taking the map reference before the mint** makes the third obligation structural rather than
+argued. `reclaim_memory_object_if_unreferenced` frees an object only when its cap, map and pin
+refcounts are ALL zero, so once S1 has run no capability-side revoke can free backing this
+transaction has mapped — whatever a sibling does with the slot M is about to publish. S1 is
+deliberately split from the displaced-side accounting: `clear_cow_page` destroys a mark this
+transaction cannot restore, so that half must not run on any path that can still put the displaced
+mappings back.
+
+The mint-failure path settles in the order that never leaves a frame reclaimable while its PTE is
+live: remove the mappings (one acquisition, restoring what each displaced) → drop the map references
+S1 took → release the capabilities minted so far → release the objects that never got one. Between
+the first two steps a frame is over-counted rather than under-counted, which is the safe direction.
+
+`release_provisional_frame_cap_locked` re-establishes exclusivity INSIDE the one rank-4 acquisition
+that removes the slot — the exact `CapId` (which carries the slot generation), the exact
+`MemoryObject { id }`, no delegation link naming it, and `delete_if_leaf`'s own in-cspace child scan.
+A cap failing any of those is `Derived` or `NotOurs` and is left exactly as it is. It never reaches
+general capability revocation.
+
+**A pre-existing gap was closed on the way.** `map_user_page_in_asid_raw_locked` reclaimed a
+displaced frame with no shootdown between the PTE overwrite and the reclaim. Under the global lock
+no other CPU could enter the kernel to observe it, but the frame could still be handed out while a
+remote TLB held the old translation. The displaced-frame reclaim now runs through the same
+required-ACK rule the rest of the transaction obeys; the only behaviour change is that a reclaim
+waits for the acknowledgement it always owed.
+
+### Entry and return, per architecture
+
+* **x86_64** — `pre_split_import_syscall_abi` is an empty function off AArch64, so every NR reaches
+  the shared dispatcher unconditionally; the `Complete` disposition returns through the ret lanes.
+* **AArch64** — all three NRs added to the ABI import list. An unlisted NR keeps `nr = 0` in the
+  frame and the dispatcher declines it, which is why §3 was not finished until this landed. Import
+  and return agree: each route answers `Complete(_)`, which reaches
+  `finalize_split_handled_syscall` with `CompletedInThisTrap` — the arm that exports the result and
+  advances the `SVC` unconditionally — so no per-class entry in the published-transition list is
+  owed.
+* **RISC-V** — all three NRs added to the trap wrapper's `split_eligible` list, which is what
+  decides whether the dispatcher is called at all. All three are non-switching and finalize through
+  the same same-task ecall writeback DebugLog uses.
+
+**The routes are TOTAL.** Unlike every other pre-lock route, none of the three may answer `None`
+after its NR gate: a family with a reachable broad fallback is not closed, and after a frame is
+taken or a page installed a `None` would hand a partially executed transaction to a dispatcher that
+knows nothing about it. The guard checks this literally — after the gate the token `None` does not
+appear in any of the three bodies.
+
+The superseded `try_split_vm_brk_shrink_into_frame` is deleted, not left caller-free. NR 14's shrink
+now reaches `unmap_range_two_phase_split` — rank 5 removes the PTE, the shootdown completes with NO
+lock held through the generation-matched coordinator, and rank 6 reclaims only after the
+acknowledgement — so the one-CPU ceiling is gone by reaching a better owner, not by ignoring the
+constraint that produced it.
+
+### The three focused ownership cases
+
+Fourteen cases in `u9vment1_ownership_cases`, all over the production owners.
+
+**1. Provisional-cap escape.** An identity-mismatched replacement — same slot INDEX, moved
+generation — is declined `NotOurs` and left completely alone, as is a same-generation slot holding a
+different object; a cap with a delegation link or an in-cspace child is `Derived` and retained
+untouched; an exclusive one is `Released` and returns cap, object and frame counts to their
+pre-transaction values. The retained cap's cleanup owner is named and exercised:
+`revoke_capability_in_cnode`, which `maybe_cleanup_process_cnode_for_pid` drives once per live cap
+at process teardown, and which drops the memory-object cap reference and reclaims. Releasing the
+external alias plus that owner really does retire the otherwise-unreturned source cap AND its
+backing — checked by the object slot being *gone*, not by "still referenced". A retained provisional
+cap is in exactly the state a successfully returned mapping cap is in, and is retired by the same
+owner.
+
+**2. Revocation during preparation.** The window the case names is closed by construction, and the
+proof is in two halves. From source: the phase order is install → map reference → mint, and the
+installed mapping is built from `objects`, never from a resolved capability, so no capability is in
+the dependency chain that produces the PTE. Live: with the map reference taken first, a sibling
+revoking the provisional cap the instant it is minted leaves the object alive, the mapping intact
+and the backing unfreed. Compensation aimed at a slot a sibling has since taken declines and leaves
+the sibling's capability unchanged.
+
+**3. Mapping rollback and displaced backing.** A forced failure after four installations restores
+every displaced mapping with its exact frame and attributes, unmaps the page that displaced nothing,
+preserves an unrelated mapping, leaves no map or cap reference behind, and reclaims nothing. On the
+committed path every reclaim is immediately preceded by its own acknowledged shootdown, every wait
+follows the VM acquisition, and an unacknowledged shootdown blocks the reclaim outright. The live
+pair runs the same four-page request twice — with and without cspace headroom — so the failing run's
+failure is attributable to the MINT phase and not to frame exhaustion or a page-table refusal, which
+no error code would distinguish.
+
+### The live witness
+
+Not one server issued NR 3, NR 13 or NR 14 before this mission. The complete set of
+`raw_syscall(SYSCALL_*_NR)` call sites in `crates/` never named one, so no profile on any
+architecture had executed the routes this mission converted and a green boot proved nothing about
+them. §4 authorizes a minimal userspace witness added to an existing profile:
+`yarm-user-rt::vm_entry_witness`, one call from `init_server` — a binary that already runs in every
+core profile on all three architectures. No new binary, image entry, packing rule or oracle
+inventory. It reports raw return lanes rather than a decoded verdict and never asserts.
+
+### Reachability matrix — source-proven closure vs. actual execution, reported separately
+
+`src` = no path from this ingress reaches a terminal broad dispatcher after the family is recognized
+(`u9vment1_reachability_matrix`, 11 cells). `live` = the case executed in a real boot.
+
+| | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| NR 3 authority refusals (`InvalidCapability`, `WrongObject`) | src + **live** | src + **live** | src + **live** |
+| NR 3 mapping half | src only — **no live issuer** | src only | src only |
+| NR 13 map (1 page / 4 pages / displacing re-map / writable) | src + **live** | src + **live** | src + **live** |
+| NR 13 refusals (len 0, unaligned, unknown prot, overflow, guard page) | src + **live** | src + **live** | src + **live** |
+| NR 14 query / growth / no-op / within-page shrink / page-crossing shrink | src + **live** | src + **live** | src + **live** |
+| NR 14 below-base refusal | src + **live** | src + **live** | src + **live** |
+
+Per architecture, per boot: `VM_MAP_SPLIT_BEGIN` = 4, `VM_BRK_SPLIT_OK` = 6,
+`VM_MAP_PHASE_METADATA` = 0, `VM_MAP_ROLLBACK_OK` = 0, `YARM_SPLIT_DISPATCH_FALLBACK` = 0. Every
+one serviced by the split route with `broad_lock=0`; not one reached a broad handler.
+
+**The SMP cases the old ceiling excluded now run.** The page-crossing brk shrink
+(`VM_BRK_SPLIT_OK shape=shrink_unmapping`) executed through the split route at every CPU count the
+Stage 114 adapter refused outright, with zero broad VM markers and zero incomplete shootdowns:
+
+| | smp 1 | smp 2 | smp 3 | smp 4 |
+|---|---|---|---|---|
+| x86_64 | 1 | 1 | — | 1 |
+| AArch64 | — | 1 | — | 1 |
+| RISC-V | 1 | 1 | 1 | 1 |
+
+**One exception, reported rather than papered over.** NR 3's SUCCESS path has no live issuer at all:
+it needs an `AddressSpace` capability and no syscall returns one to userspace — a spawn mints it into
+the spawner's cspace but reports only the child TID and the packed send caps. Manufacturing a return
+lane would be an ABI change §3 forbids. Its mapping half is byte-identical to NR 13's — everything
+after `resolve_map_target` is one shared body, and that resolver's two refusals *are* witnessed live
+— but the claim is source-proven, not executed, and the witness says so in the log.
+
+### Census
+
+**CENSUS-DELTA: 0**, expected while the two aggregate dispatchers remain.
+
+* `with_cpu` — 2
+* `with_broad` (`.with(|`) — 0 production, plus 1 `thread_local` false positive
+* **acquisition total — 2**
+* raw `state_lock` — 3, **separately labelled**: the bodies of `SharedKernel::lock` / `with` /
+  `with_cpu`, which every callsite goes through. Counting them would double-count the lock.
+
+Every seam this stage added is rank-local: rank 4 (`with_capability_state_split_mut`), rank 5
+(`with_vm_user_spaces_split_mut`), rank 6 (`with_memory_split_mut`), rank 2 (`with_task_tcbs_split_mut`).
+
+### Deferred, unchanged
+
+`server_dies_runner_scope`'s two established failures; the U9-TIMER1 residual branches; the AArch64
+high-preemption spawn defect. Demand-fault routing remains a separate residual.
+
+### Next roadmap package
+
+**IPC/transfer residual completion**, including NR 4 `TransferRelease` and NR 30 `RecvSharedV3` —
+the two syscalls the AArch64 import list's selectivity guard now names as its stand-ins for "no
+pre-lock route".

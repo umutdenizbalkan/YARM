@@ -33561,8 +33561,12 @@ mod stage114_d3_vm_brk_shrink_live {
             );
         }
         let syscall_split_src = include_str!("../syscall_split.rs");
+        // U9-VM-ENTRY1: the route is still reached from the dispatcher's own NR arm, which is
+        // Stage 114's claim. What changed is its name and its totality — the shrink-only
+        // specialization became the complete NR 14 transaction, so the seam it must be routed to
+        // is `try_split_vm_brk_into_frame`.
         assert!(
-            syscall_split_src.contains("try_split_vm_brk_shrink_into_frame(shared, cpu, frame)"),
+            syscall_split_src.contains("try_split_vm_brk_into_frame(shared, cpu, frame)"),
             "syscall_split.rs must route VmBrk to the live seam"
         );
         assert!(
@@ -33690,20 +33694,41 @@ mod stage114_d3_vm_brk_shrink_live {
         );
     }
 
+    /// U9-VM-ENTRY1 re-derivation of `stage114_d3_full_vm_anon_map_two_phase_remains_deferred`.
+    ///
+    /// Stage 114 deferred "D3-FULL" — the full two-phase mapping conversion — and pinned two
+    /// things: NR 3 must not be split-eligible, and the aggregate-batch rollback SCAFFOLD
+    /// (`VmAnonMapRollbackTlbPlan`) must not be wired into a live seam.
+    ///
+    /// The first is what this mission delivers, so it is replaced by its positive form. The
+    /// SECOND still holds and is the more interesting half: the conversion did NOT wire the old
+    /// scaffold, because that scaffold batched rollback TLB work as a plan computed ahead of
+    /// time, and the delivered transaction does not need it — installation and rollback share one
+    /// VM acquisition, so there is no cross-acquisition plan to carry. Keeping the assertion
+    /// proves the scaffold stayed dead rather than being revived to do a job it was the wrong
+    /// shape for.
     #[test]
-    fn stage114_d3_full_vm_anon_map_two_phase_remains_deferred() {
+    fn stage114_d3_full_vm_anon_map_two_phase_is_delivered_without_the_batch_scaffold() {
         let (kernel, _asid) = shared_task0_with_known_asid();
         let mut frame = TrapFrame::new(Syscall::VmMap as usize, [0, 0, 0, 0, 0, 0]);
-        assert_eq!(
+        assert!(
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
-                .legacy(),
-            None,
-            "VmMap must remain non-split-eligible (D3-FULL out of scope)"
+                .legacy()
+                .is_some(),
+            "NR 3 is split-eligible and TOTAL since U9-VM-ENTRY1: it answers every input rather \
+             than deferring any of them"
         );
         let runtime_src = include_str!("../../runtime.rs");
         assert!(
             !runtime_src.contains("VmAnonMapRollbackTlbPlan"),
             "the aggregate-batch rollback scaffold must remain unwired into any live seam"
+        );
+        // And the delivered transaction is the reason it is not needed: the undo happens inside
+        // the acquisition that installed, so no rollback plan crosses an acquisition boundary.
+        let vm_src = include_str!("../syscall/vm.rs");
+        assert!(
+            vm_src.contains("fn undo_installed_locked("),
+            "the rollback is a rank-local body inside the install acquisition"
         );
     }
 
@@ -34144,14 +34169,42 @@ mod stage115_d2_d6_seam_analysis {
         }
     }
 
+    /// U9-VM-ENTRY1 re-derivation of `stage115_d3_full_vm_anon_map_two_phase_not_implemented`.
+    ///
+    /// Stage 115's hard rule 6 was a SCOPE fence for that stage: D3-FULL was not its job, so a
+    /// `try_split_vm_anon_map` appearing in `syscall_split.rs` would have meant scope creep. The
+    /// fence has been lifted by the mission that owns the work, and the case is re-derived onto
+    /// what Stage 115 was really protecting — that the conversion, when it came, would consume
+    /// the existing owners rather than reimplement them, which is the same property its sibling
+    /// case asserts for D1/D5 immediately above.
     #[test]
-    fn stage115_d3_full_vm_anon_map_two_phase_not_implemented() {
-        // Hard rule 6: D3-FULL (full VmAnonMap two-phase) must not be implemented.
+    fn stage115_d3_full_vm_anon_map_two_phase_reuses_owners() {
         let split_src = include_str!("../syscall_split.rs");
         assert!(
-            !split_src.contains("try_split_vm_anon_map"),
-            "D3-FULL VmAnonMap two-phase must not be implemented in Stage 115"
+            split_src.contains("try_split_vm_anon_map_into_frame"),
+            "D3-FULL is delivered by U9-VM-ENTRY1"
         );
+        // It consumes the transaction rather than restating any of its policy.
+        assert!(
+            split_src.contains("run_vm_map_transaction(")
+                && !split_src.contains("fn validate_map_args(")
+                && !split_src.contains("fn release_frames<"),
+            "the NR 13 route must consume the mapping transaction, never reimplement it"
+        );
+        // And the split adapter reaches the SAME rank-local bodies the broad adapter uses.
+        let vm_split_src = include_str!("../syscall/vm_split.rs");
+        for shared_body in [
+            "install_range_locked(",
+            "note_inserted_locked(",
+            "unnote_inserted_locked(",
+            "settle_displaced_locked(",
+            "release_provisional_frame_cap_locked(",
+        ] {
+            assert!(
+                vm_split_src.contains(shared_body),
+                "the split adapter must reach the shared rank-local body `{shared_body}`"
+            );
+        }
     }
 
     #[test]
@@ -40103,6 +40156,8 @@ mod stage145_vm_module_extraction {
 
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const VM_SRC: &str = include_str!("../syscall/vm.rs");
+    /// U9-VM-ENTRY1: the policy half of the VM module family.
+    const VM_TXN_SRC: &str = include_str!("../syscall/vm_txn.rs");
 
     // 1. vm.rs must exist and declare the three pub(super) handlers.
     #[test]
@@ -40121,33 +40176,58 @@ mod stage145_vm_module_extraction {
         );
     }
 
-    // 2. vm_map_page_flags, validate_anon_map_args, rollback_anon_map must live in vm.rs only.
+    // 2. The VM helpers live in the VM module family, never in the parent `syscall.rs`.
     #[test]
     fn stage145_vm_helpers_live_in_vm_module() {
+        // U9-VM-ENTRY1 re-derivation. Stage 145's claim is the DECOMPOSITION: the parent
+        // `syscall.rs` owns no VM mapping policy, and each helper has exactly one home. That claim
+        // is unchanged and is now one level stronger — the policy moved out of `vm.rs` too, into
+        // `vm_txn.rs`, where the broad and split adapters both drive it. So the three helpers are
+        // asserted against the VM module FAMILY rather than against `vm.rs` alone, and each is
+        // pinned to the successor that actually owns its job:
+        //
+        //   vm_map_page_flags + validate_anon_map_args -> `validate_map_args`, one function,
+        //     because prot decoding and (addr, len) validation are one validation step with one
+        //     error precedence;
+        //   rollback_anon_map -> `release_frames` (the capability half) and `undo_installed_locked`
+        //     (the VM half), which is the split Stage 145 could not make: compensation for
+        //     resources and compensation for mappings have different owners and different
+        //     exclusivity proofs.
         assert!(
-            VM_SRC.contains("fn vm_map_page_flags("),
-            "vm.rs must contain vm_map_page_flags"
+            VM_TXN_SRC.contains("fn validate_map_args("),
+            "the validation helper must live in the VM module family"
         );
         assert!(
-            VM_SRC.contains("fn validate_anon_map_args("),
-            "vm.rs must contain validate_anon_map_args"
+            VM_TXN_SRC.contains("fn release_frames<"),
+            "the resource half of the rollback must live in the VM module family"
         );
         assert!(
-            VM_SRC.contains("fn rollback_anon_map("),
-            "vm.rs must contain rollback_anon_map"
+            VM_SRC.contains("fn undo_installed_locked("),
+            "the mapping half of the rollback must live in the VM module family"
         );
-        // These private helpers must not remain in the parent syscall.rs.
+        // The whole point of Stage 145, unchanged: none of it may sit in the parent.
+        for absent in [
+            "fn vm_map_page_flags(",
+            "fn validate_anon_map_args(",
+            "fn rollback_anon_map(",
+            "fn validate_map_args(",
+            "fn release_frames<",
+            "fn undo_installed_locked(",
+        ] {
+            assert!(
+                !SYSCALL_SRC.contains(absent),
+                "syscall.rs must NOT contain `{absent}` — it belongs to the VM module family"
+            );
+        }
+        // And exactly one home each: a helper that exists in both files is the duplication this
+        // case was written to prevent.
         assert!(
-            !SYSCALL_SRC.contains("fn vm_map_page_flags("),
-            "syscall.rs must NOT contain vm_map_page_flags (moved to vm.rs)"
+            !VM_SRC.contains("fn validate_map_args("),
+            "the validation helper must have ONE home"
         );
         assert!(
-            !SYSCALL_SRC.contains("fn validate_anon_map_args("),
-            "syscall.rs must NOT contain validate_anon_map_args (moved to vm.rs)"
-        );
-        assert!(
-            !SYSCALL_SRC.contains("fn rollback_anon_map("),
-            "syscall.rs must NOT contain rollback_anon_map (moved to vm.rs)"
+            !VM_TXN_SRC.contains("fn undo_installed_locked("),
+            "the mapping-rollback helper must have ONE home"
         );
     }
 
@@ -40192,17 +40272,32 @@ mod stage145_vm_module_extraction {
         );
     }
 
-    // 6. vm.rs must import round_up_page and validate_user_region from super (syscall.rs).
+    // 6. The VM module family REUSES the shared helpers rather than restating them.
     #[test]
     fn stage145_vm_imports_helpers_from_super() {
+        // U9-VM-ENTRY1 re-derivation. The claim is reuse, not the import syntax: `round_up_page`
+        // and `validate_user_region` have one implementation, in the syscall namespace, and the VM
+        // code calls it. What moved is WHICH file calls them — validation is now the transaction's,
+        // so both live in `vm_txn.rs`, which reaches them through the same namespace `vm.rs` used.
         assert!(
-            VM_SRC.contains("round_up_page") && VM_SRC.contains("super::"),
-            "vm.rs must import round_up_page from super"
+            VM_TXN_SRC.contains("round_up_page"),
+            "the VM transaction must reuse round_up_page"
         );
         assert!(
-            VM_SRC.contains("validate_user_region") && VM_SRC.contains("super::"),
-            "vm.rs must import validate_user_region from super"
+            VM_TXN_SRC.contains("validate_user_region"),
+            "the VM transaction must reuse validate_user_region"
         );
+        assert!(
+            VM_TXN_SRC.contains("crate::kernel::syscall::"),
+            "and must reach them through the syscall namespace, not a private copy"
+        );
+        // Neither may be reimplemented anywhere in the family.
+        for src in [VM_SRC, VM_TXN_SRC] {
+            assert!(
+                !src.contains("fn round_up_page(") && !src.contains("fn validate_user_region("),
+                "the shared helpers must not be reimplemented in the VM module family"
+            );
+        }
     }
 
     // 7. VM syscall numbers unchanged.
@@ -61961,14 +62056,16 @@ mod stage191a_lock_retire_inventory {
                 && SPLIT_SRC.contains("Syscall::SpawnFromMemoryObject => Some(syscall),")
                 // U9-FORK1 §4 added Fork, which shares the spawn transaction and reads nothing
                 // from user memory.
-                && SPLIT_SRC.contains("Syscall::Fork => Some(syscall),"),
+                && SPLIT_SRC.contains("Syscall::Fork => Some(syscall),")
+                // U9-VM-ENTRY1 added the two anonymous-mapping entries. They were the last two
+                // live production classes reaching the terminal broad dispatcher on EVERY call.
+                && SPLIT_SRC.contains("Syscall::VmMap => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::VmAnonMap => Some(syscall),"),
             "the NR-only split gate must whitelist exactly the accepted classes"
         );
         // Dangerous classes must NOT appear as split-eligible (default-deny `_ => None`).
         // FutexWake is INTENTIONALLY absent here (retired in 191B); FutexWait stays.
         for dangerous in [
-            "Syscall::VmMap => Some",
-            "Syscall::VmAnonMap => Some",
             // U9-SPAWN1 SP-2 removed NR 11 from this list. It was here because the whole spawn
             // family was, not because NR 11 shares the family's obstacles: it creates no address
             // space, loads no ELF, mints nothing, maps nothing and never switches tasks. Its
@@ -62396,8 +62493,13 @@ mod stage191c_split_user_copy_seam {
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
             "Syscall::IpcReply => Some",
-            "Syscall::VmMap => Some",
-            "Syscall::VmAnonMap => Some",
+            // U9-VM-ENTRY1: NR 3 and NR 13 left this list. They were here for the reason the
+            // spawn family was — the obstacle was never the seam, it was the compensation. Both
+            // MINT and both MAP, and §2 gave each half an exact off-lock owner: the mapping half
+            // installs and undoes inside ONE VM acquisition, so its rollback provably removes
+            // only pages the transaction installed; the capability half re-establishes exact
+            // identity inside the one acquisition that removes the slot, so it never revokes a
+            // cap a sibling took ownership of.
             // U9-SPAWN-TXN3 §4: NR 23 left this list, for the same kind of reason NR 11 did —
             // the obstacle was never the seam, it was the rollback, and §2 replaced it with the
             // exact provisional-capability closure.
@@ -62433,10 +62535,17 @@ mod stage191c_split_user_copy_seam {
         // admitted on exactly the same terms: `release_delegation` is the exact off-lock inverse
         // of each mint, and it refuses to remove a slot that no longer holds the object its token
         // names.
+        // U9-VM-ENTRY1: NR 3 and NR 13 mint too — one MemoryObject capability per page — so they
+        // join this cohort on exactly the same terms. Their exact off-lock inverse is asserted
+        // below rather than assumed, and it is a STRICTER inverse than the spawn family's,
+        // because a provisional frame capability is minted into a cnode that every sibling thread
+        // of the caller shares.
         for minting_class in [
             "Syscall::SpawnProcess => Some(syscall),",
             "Syscall::SpawnFromMemoryObject => Some(syscall),",
             "Syscall::Fork => Some(syscall),",
+            "Syscall::VmMap => Some(syscall),",
+            "Syscall::VmAnonMap => Some(syscall),",
         ] {
             assert!(
                 SPLIT_SRC.contains(minting_class),
@@ -62462,8 +62571,26 @@ mod stage191c_split_user_copy_seam {
                 && PROVCAP.contains("ProvisionalCapRelease::Residue"),
             "the admitted spawn classes must have an exact, refusing, bounded rollback owner"
         );
+        // U9-VM-ENTRY1: the mapping classes' inverse, asserted the same way. Three properties,
+        // all of them refusals rather than removals:
+        //   * the release re-establishes identity INSIDE the acquisition that removes the slot —
+        //     a snapshot from an earlier acquisition proves nothing about this one;
+        //   * a cap a sibling derived from is RETAINED, never revoked, because it is no longer
+        //     this transaction's resource;
+        //   * the accounting runs only for a slot actually released.
+        const VM_SRC: &str = include_str!("../syscall/vm.rs");
+        assert!(
+            VM_SRC.contains("pub(crate) fn release_provisional_frame_cap_locked(")
+                && VM_SRC.contains("ProvisionalReleaseOutcome::Derived")
+                && VM_SRC.contains("ProvisionalReleaseOutcome::NotOurs"),
+            "the admitted mapping classes must have an exact, refusing, bounded rollback owner"
+        );
+        const VM_TXN: &str = include_str!("../syscall/vm_txn.rs");
+        assert!(
+            VM_TXN.contains("owners.account_released_cap(*frame);"),
+            "the accounting must follow a release, never a retention"
+        );
         for still_locked in [
-            "Syscall::VmAnonMap => Some",
             "Syscall::TransferRelease => Some",
             "Syscall::CreateEndpoint => Some",
             "Syscall::CreateNotification => Some",
@@ -62751,6 +62878,9 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::SpawnFromMemoryObject => Some(syscall),",
             // U9-FORK1 §4.
             "Syscall::Fork => Some(syscall),",
+            // U9-VM-ENTRY1: the two anonymous-mapping entries.
+            "Syscall::VmMap => Some(syscall),",
+            "Syscall::VmAnonMap => Some(syscall),",
         ] {
             assert!(
                 SPLIT_SRC.contains(accepted),
@@ -62764,8 +62894,9 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::IpcCall => Some",
             "Syscall::IpcReply => Some",
             "Syscall::IpcRecvTimeout => Some",
-            "Syscall::VmMap => Some",
-            "Syscall::VmAnonMap => Some",
+            // U9-VM-ENTRY1 removed NR 3 and NR 13. Stage 191E's claim is unaffected and
+            // unchanged: the CANDIDATE SEAM adds no live class and never owned the whitelist's
+            // contents; each admission comes from the stage that derived its compensation.
             "Syscall::TransferRelease => Some",
             // U9-SPAWN1 SP-2 removed NR 11, and U9-SPAWN-TXN3 §4 removed NR 23 and NR 29: the
             // candidate seam never owned the whitelist's contents, and each admission came from
@@ -73738,12 +73869,25 @@ mod stage195a_aarch64_debuglog_live {
             body.contains("SYSCALL_YIELD_NR"),
             "AArch64 imports Yield (NR 0) — the fifth switching pre-lock class"
         );
-        for absent in [
+        // U9-VM-ENTRY1 §3: NR 3, NR 13 and NR 14 ARE now imported, for the reason this guard was
+        // written to withhold them — all three have a pre-lock route, and an unlisted NR keeps
+        // `nr = 0` so the dispatcher declines it and the family keeps its terminal broad edge
+        // here no matter what the route admits. They were this case's stand-in for "a syscall
+        // with no pre-lock route", so the stand-in moves rather than the claim.
+        for present in [
             "SYSCALL_VM_MAP_NR",
             "SYSCALL_VM_ANON_MAP_NR",
-            "SYSCALL_TRANSFER_RELEASE_NR",
-            "SYSCALL_RECV_SHARED_V3_NR",
+            "SYSCALL_VM_BRK_NR",
         ] {
+            assert!(
+                body.contains(present),
+                "AArch64 imports `{present}` — it has a TOTAL pre-lock route"
+            );
+        }
+        // The selectivity claim this case owns is unchanged, and is checked against syscalls that
+        // genuinely still have no pre-lock route: NR 4 and NR 30 are the IPC/transfer residual the
+        // next roadmap package covers.
+        for absent in ["SYSCALL_TRANSFER_RELEASE_NR", "SYSCALL_RECV_SHARED_V3_NR"] {
             assert!(
                 !body.contains(absent),
                 "the import must stay a whitelist: `{absent}` has no pre-lock route"
@@ -114827,6 +114971,12 @@ mod stage199d_riscv_canonical_admission {
             // its queue advance is the existing deferral plus the existing drain.
             "SYSCALL_EXIT_CURRENT_TASK_NR",
             "SYSCALL_YIELD_NR",
+            // U9-VM-ENTRY1: the three VM entries. Their absence was not a decline — this list is
+            // what decides whether the shared dispatcher is consulted at all, so NR 14's Stage 114
+            // shrink route could never once have run on this architecture in the stages between.
+            "SYSCALL_VM_MAP_NR",
+            "SYSCALL_VM_ANON_MAP_NR",
+            "SYSCALL_VM_BRK_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -114838,12 +114988,13 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            13,
-            "exactly thirteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            16,
+            "exactly sixteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
              SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask, \
-             (U9-EXIT1 §5) ExitCurrentTask and (U9-RESIDUAL1 §3) Yield"
+             (U9-EXIT1 §5) ExitCurrentTask, (U9-RESIDUAL1 §3) Yield and (U9-VM-ENTRY1) \
+             VmMap + VmAnonMap + VmBrk"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -168138,6 +168289,1658 @@ mod u9timer1_preempting_timer {
         assert!(
             code.contains("broad_lock=0"),
             "the committed marker must state that no broad lock was taken"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// U9-VM-ENTRY1 §4 — the three focused OWNERSHIP cases.
+//
+// These are proofs of obligations the mapping transaction already has, not of new machinery:
+//
+//   1. Provisional-cap escape — an identity-mismatched replacement slot is distinguished from
+//      the exact provisional cap that acquired descendants; the replacement is preserved
+//      untouched; and the retained provisional cap has a named cleanup owner that actually
+//      retires it, and its backing, once the external alias is released.
+//   2. Revocation during preparation — a sibling revoking or replacing the provisional cap
+//      cannot make this transaction map freed or recycled backing, and compensation cannot
+//      touch the replacement.
+//   3. Mapping rollback and displaced backing — a failure after several installations restores
+//      every displaced mapping with its exact attributes, leaves unrelated mappings alone, and
+//      reclaims no frame before its shootdown is acknowledged, with the wait outside the VM
+//      acquisition.
+//
+// Everything below drives the PRODUCTION owners: `run_vm_map_transaction`, the shared rank-local
+// bodies in `syscall::vm`, and the real `KernelState` capability/memory owners.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod u9vment1_ownership_cases {
+    use super::*;
+    use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
+    use crate::kernel::syscall::vm_txn::{
+        InstalledPage, MapTarget, ProvisionalFrame, ProvisionalReleaseOutcome, VmMapOwners,
+        run_vm_map_transaction,
+    };
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use std::collections::BTreeMap;
+    use std::string::{String, ToString};
+    use std::vec::Vec;
+
+    // ── shared helpers ──────────────────────────────────────────────────────────────────────
+
+    fn kernel_with_asid() -> (KernelState, Asid) {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        (state, asid)
+    }
+
+    fn cnode_occupied(state: &KernelState, cnode: CNodeId) -> usize {
+        state.with_capability_state(|capability| {
+            capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| kernel_ref(&space.cspace).occupied_slots())
+                .unwrap_or(0)
+        })
+    }
+
+    fn free_frames(state: &KernelState) -> usize {
+        state.with_memory_state(|memory| memory.frame_allocator.free_frames())
+    }
+
+    fn refcounts(state: &KernelState, object_id: u64) -> Option<(u32, u32)> {
+        let slot = state.memory_object_slot_by_id(object_id)?;
+        state.with_memory_state(|memory| {
+            memory.memory_objects[slot].map(|object| (object.cap_refcount, object.map_refcount))
+        })
+    }
+
+    fn resolve_page(state: &KernelState, asid: Asid, virt: VirtAddr) -> Option<Mapping> {
+        state.with_user_spaces(|spaces| spaces.get(asid).and_then(|space| space.resolve(virt)))
+    }
+
+    /// One provisional frame, acquired exactly the way the transaction's phase R and phase M
+    /// acquire it — the same two production owners, in the same order.
+    fn acquire_provisional(state: &mut KernelState) -> ProvisionalFrame {
+        let (object_id, phys) = state
+            .alloc_anonymous_object_without_cap()
+            .expect("object without cap");
+        let cap = state.mint_anonymous_frame_cap(object_id).expect("mint");
+        ProvisionalFrame {
+            object_id,
+            cap,
+            phys,
+        }
+    }
+
+    /// The production release owner, reached through the same single rank-4 acquisition the
+    /// broad adapter uses.
+    fn release_provisional(
+        state: &mut KernelState,
+        cnode: CNodeId,
+        frame: ProvisionalFrame,
+    ) -> ProvisionalReleaseOutcome {
+        state.with_capability_state_mut(|capability| {
+            crate::kernel::syscall::vm::release_provisional_frame_cap_locked(
+                capability, cnode, frame,
+            )
+        })
+    }
+
+    /// The production delegation-link writer's body, under rank 4 and nothing else. This is the
+    /// state an IPC capability transfer leaves behind, which is the ONLY way a provisional cap
+    /// acquires an external alias — there is no cap-derive, copy or mint syscall.
+    fn record_link(state: &mut KernelState, source_cap: CapId, dest_cap: CapId) {
+        state
+            .with_capability_state_mut(|capability| {
+                crate::kernel::boot::spawn_ipc_cap_txn::record_delegation_link_locked(
+                    capability, 0, source_cap, 0, dest_cap,
+                )
+            })
+            .expect("link table has room");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // Case 1 — provisional-cap escape.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn case1_identity_mismatched_replacement_slot_is_not_ours_and_is_preserved() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+
+                // This transaction's provisional frame.
+                let ours = acquire_provisional(&mut state);
+
+                // A sibling retires it and takes the slot for something of its own. `revoke`
+                // bumps the slot generation, so the replacement's CapId differs from ours even
+                // though it may land on the same slot INDEX.
+                state
+                    .revoke_capability_in_cnode(cnode, ours.cap)
+                    .expect("sibling revoke");
+                let theirs = acquire_provisional(&mut state);
+                assert_eq!(
+                    theirs.cap.index(),
+                    ours.cap.index(),
+                    "the replacement must reuse the same slot index, so only the generation \
+                     and object identity can tell the two apart"
+                );
+                assert_ne!(
+                    theirs.cap, ours.cap,
+                    "the slot generation must have moved on"
+                );
+
+                let before = (
+                    free_frames(&state),
+                    state.live_memory_object_count_for_test(),
+                    cnode_occupied(&state, cnode),
+                );
+
+                // Compensation runs with OUR recorded frame. It must decline.
+                assert_eq!(
+                    release_provisional(&mut state, cnode, ours),
+                    ProvisionalReleaseOutcome::NotOurs,
+                    "a replacement slot is not this transaction's to remove"
+                );
+
+                // And it must have left the replacement completely alone.
+                assert_eq!(
+                    (
+                        free_frames(&state),
+                        state.live_memory_object_count_for_test(),
+                        cnode_occupied(&state, cnode),
+                    ),
+                    before,
+                    "declining must not remove a cap, an object or a frame"
+                );
+                let replacement = state
+                    .resolve_capability_for_task(0, theirs.cap)
+                    .expect("the replacement still resolves");
+                assert_eq!(
+                    replacement.object,
+                    CapObject::MemoryObject {
+                        id: theirs.object_id
+                    },
+                    "the replacement still names its own object"
+                );
+                assert_eq!(
+                    refcounts(&state, theirs.object_id),
+                    Some((1, 0)),
+                    "the replacement's object keeps its own capability reference"
+                );
+
+                // The same-generation shape of the mismatch is the second gate: a live cap of
+                // ours, but recorded against a different object id.
+                let wrong_object = ProvisionalFrame {
+                    object_id: theirs.object_id.wrapping_add(1_000_000),
+                    ..theirs
+                };
+                assert_eq!(
+                    release_provisional(&mut state, cnode, wrong_object),
+                    ProvisionalReleaseOutcome::NotOurs,
+                    "an exact-generation slot holding a DIFFERENT object is not ours either"
+                );
+                assert!(
+                    state.resolve_capability_for_task(0, theirs.cap).is_ok(),
+                    "and that decline must also leave the slot untouched"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn case1_delegated_provisional_cap_is_retained_and_left_exactly_as_it_is() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let ours = acquire_provisional(&mut state);
+
+                // An IPC transfer of the provisional cap materializes an alias and records the
+                // link that names our cap as its source.
+                let alias = state
+                    .mint_capability_in_cnode(
+                        cnode,
+                        Capability::new(
+                            CapObject::MemoryObject { id: ours.object_id },
+                            KernelState::memory_object_rights_for_kind(MemoryObjectKind::Anonymous),
+                        ),
+                    )
+                    .expect("alias mint");
+                record_link(&mut state, ours.cap, alias);
+                assert_eq!(
+                    refcounts(&state, ours.object_id),
+                    Some((2, 0)),
+                    "source cap plus alias"
+                );
+
+                let before = (
+                    free_frames(&state),
+                    state.live_memory_object_count_for_test(),
+                    cnode_occupied(&state, cnode),
+                );
+                assert_eq!(
+                    release_provisional(&mut state, cnode, ours),
+                    ProvisionalReleaseOutcome::Derived,
+                    "a cap another transaction derived from is retained, never removed"
+                );
+                assert_eq!(
+                    (
+                        free_frames(&state),
+                        state.live_memory_object_count_for_test(),
+                        cnode_occupied(&state, cnode),
+                    ),
+                    before,
+                    "retention must change nothing at all"
+                );
+                assert!(
+                    state.resolve_capability_for_task(0, ours.cap).is_ok()
+                        && state.resolve_capability_for_task(0, alias).is_ok(),
+                    "both the source cap and the alias survive"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn case1_in_cspace_child_also_retains_the_provisional_cap() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let ours = acquire_provisional(&mut state);
+
+                // The second derivation shape `delete_if_leaf` itself screens for: an in-cspace
+                // child whose parent link names this exact cap.
+                let child = state
+                    .with_capability_state_mut(|capability| {
+                        capability
+                            .cnode_spaces
+                            .iter_mut()
+                            .flatten()
+                            .find(|space| space.id == cnode)
+                            .map(|space| kernel_mut(&mut space.cspace))
+                            .expect("cspace")
+                            .mint_derived(ours.cap, CapRights::READ)
+                    })
+                    .expect("derived child");
+
+                assert_eq!(
+                    release_provisional(&mut state, cnode, ours),
+                    ProvisionalReleaseOutcome::Derived,
+                    "a cap with a live in-cspace child is not a leaf and is retained"
+                );
+                assert!(
+                    state.resolve_capability_for_task(0, ours.cap).is_ok(),
+                    "the source cap survives"
+                );
+                assert!(
+                    state.resolve_capability_for_task(0, child).is_ok(),
+                    "and so does the child that made it non-exclusive"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn case1_exclusive_provisional_cap_releases_back_to_quiescent_counts() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+
+                let quiescent = (
+                    free_frames(&state),
+                    state.live_memory_object_count_for_test(),
+                    cnode_occupied(&state, cnode),
+                );
+
+                let ours = acquire_provisional(&mut state);
+                assert_eq!(refcounts(&state, ours.object_id), Some((1, 0)));
+
+                assert_eq!(
+                    release_provisional(&mut state, cnode, ours),
+                    ProvisionalReleaseOutcome::Released,
+                    "an untouched, childless, undelegated provisional cap IS ours"
+                );
+                // The accounting half the transaction runs only after `Released`.
+                let object = CapObject::MemoryObject { id: ours.object_id };
+                state.with_memory_state_mut(|memory| {
+                    KernelState::adjust_memory_object_cap_refcount_locked(memory, object, -1);
+                    KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object);
+                });
+
+                assert_eq!(
+                    (
+                        free_frames(&state),
+                        state.live_memory_object_count_for_test(),
+                        cnode_occupied(&state, cnode),
+                    ),
+                    quiescent,
+                    "cap, object AND frame counts must return to their pre-transaction values"
+                );
+                assert!(
+                    state.memory_object_slot_by_id(ours.object_id).is_none(),
+                    "the object slot itself is gone"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn case1_retained_cap_is_retired_by_its_cleanup_owner_once_the_alias_is_released() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let quiescent = (
+                    free_frames(&state),
+                    state.live_memory_object_count_for_test(),
+                    cnode_occupied(&state, cnode),
+                );
+
+                let ours = acquire_provisional(&mut state);
+                let alias = state
+                    .mint_capability_in_cnode(
+                        cnode,
+                        Capability::new(
+                            CapObject::MemoryObject { id: ours.object_id },
+                            KernelState::memory_object_rights_for_kind(MemoryObjectKind::Anonymous),
+                        ),
+                    )
+                    .expect("alias mint");
+                record_link(&mut state, ours.cap, alias);
+                assert_eq!(
+                    release_provisional(&mut state, cnode, ours),
+                    ProvisionalReleaseOutcome::Derived,
+                    "retained, as case 1 requires"
+                );
+
+                // "Still referenced" is NOT the compensation claim. The claim is that a retained
+                // provisional cap is in exactly the state a SUCCESSFULLY RETURNED mapping cap is
+                // in — a live memory-object cap in the caller's cspace — and is retired by the
+                // same owner. That owner is `revoke_capability_in_cnode`, which process teardown
+                // (`maybe_cleanup_process_cnode_for_pid`) drives once per live cap.
+
+                // Step 1: the external alias is released. Its own revoke removes the delegation
+                // link that named our cap, which is what makes the source cap a leaf again.
+                state
+                    .revoke_capability_in_cnode(cnode, alias)
+                    .expect("alias revoke");
+                assert_eq!(
+                    refcounts(&state, ours.object_id),
+                    Some((1, 0)),
+                    "the source cap is the object's last reference, and the backing is still held"
+                );
+                assert!(
+                    state.resolve_capability_for_task(0, ours.cap).is_ok(),
+                    "the source cap itself is untouched by the alias's retirement"
+                );
+
+                // Step 2: the cleanup owner runs over that last cap.
+                state
+                    .revoke_capability_in_cnode(cnode, ours.cap)
+                    .expect("cleanup owner");
+
+                assert_eq!(
+                    (
+                        free_frames(&state),
+                        state.live_memory_object_count_for_test(),
+                        cnode_occupied(&state, cnode),
+                    ),
+                    quiescent,
+                    "the otherwise-unreturned source cap, its object and its frame are all retired"
+                );
+                assert!(
+                    state.memory_object_slot_by_id(ours.object_id).is_none(),
+                    "the backing is genuinely reclaimed, not merely still referenced"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn case1_process_teardown_drives_that_cleanup_owner_over_every_live_cap() {
+        // The owner named above is not a test-only call: process cnode cleanup revokes every
+        // live cap in the cspace, one at a time, through exactly that function.
+        const CNODE_SRC: &str = include_str!("cnode_state.rs");
+        let body = CNODE_SRC
+            .split("fn maybe_cleanup_process_cnode_for_pid(")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub(crate) fn ").next())
+            .expect("the alloc-capable process cnode cleanup");
+        assert!(
+            body.contains("live_cap_ids()")
+                && body.contains("revoke_capability_in_cnode(cnode, cap)"),
+            "process teardown must retire each live cap through `revoke_capability_in_cnode`, \
+             which is the owner that decrements the memory-object cap refcount and reclaims"
+        );
+        // And that owner really does the accounting a retained cap is owed.
+        const LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+        let revoke = LIFECYCLE_SRC
+            .split("fn revoke_capability_in_cnode(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("revoke_capability_in_cnode");
+        assert!(
+            revoke.contains("adjust_memory_object_cap_refcount(capability.object, -1)")
+                && revoke.contains("reclaim_memory_object_if_unreferenced(capability.object)"),
+            "the cleanup owner must drop the cap reference and reclaim the object"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // Case 2 — revocation during preparation.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn case2_no_capability_exists_while_the_mapping_is_being_built() {
+        // The window the case describes — a sibling revoking or replacing the provisional cap
+        // "between mint and mapping" — is closed by construction: the transaction installs the
+        // whole range and takes its map references BEFORE it mints anything, and it builds each
+        // mapping from the object's own physical extent, so no capability is in the dependency
+        // chain that produces the PTE.
+        const TXN_SRC: &str = include_str!("../syscall/vm_txn.rs");
+        let body = TXN_SRC
+            .split("fn run_one_map_run<O: VmMapOwners>(")
+            .nth(1)
+            .expect("run_one_map_run");
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let install = code.find("owners.install_range(").expect("install phase");
+        let note = code
+            .find("owners.note_inserted(")
+            .expect("map-reference phase");
+        let mint = code.find("owners.mint_frame_cap(").expect("mint phase");
+        assert!(
+            install < note && note < mint,
+            "phase order must be install → map reference → mint, so no capability can be \
+             revoked or replaced before the mapping exists"
+        );
+        // The install takes the physical address from the OBJECT, never from a resolved cap.
+        let install_args = &code[install
+            ..code[install..]
+                .find(')')
+                .map(|end| install + end)
+                .unwrap_or(code.len())];
+        assert!(
+            install_args.contains("&objects[..pages]") && !install_args.contains("frames"),
+            "the installed mapping is built from the objects this transaction owns outright"
+        );
+    }
+
+    #[test]
+    fn case2_map_reference_precedes_the_mint_so_a_revoke_cannot_free_mapped_backing() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let base = 0x40_0000usize;
+                let virt = VirtAddr(base as u64);
+
+                // Phase R + phase I + phase S1, through the production owners.
+                let (object_id, phys) = state
+                    .alloc_anonymous_object_without_cap()
+                    .expect("object without cap");
+                let mut installed = [InstalledPage {
+                    virt,
+                    inserted: phys,
+                    replaced: None,
+                }; 1];
+                state
+                    .with_user_spaces_mut(|spaces| {
+                        crate::kernel::syscall::vm::install_range_locked(
+                            spaces,
+                            asid,
+                            base,
+                            PageFlags::USER_RW,
+                            &[(object_id, phys)],
+                            &mut installed,
+                        )
+                    })
+                    .expect("install");
+                state.with_memory_state_mut(|memory| {
+                    crate::kernel::syscall::vm::note_inserted_locked(memory, &installed);
+                });
+                assert_eq!(
+                    refcounts(&state, object_id),
+                    Some((0, 1)),
+                    "the map reference exists BEFORE any capability does"
+                );
+
+                // Phase M publishes the cap. A sibling immediately revokes it — the most hostile
+                // thing it could do to this transaction's provisional slot.
+                let cap = state.mint_anonymous_frame_cap(object_id).expect("mint");
+                state
+                    .revoke_capability_in_cnode(cnode, cap)
+                    .expect("sibling revoke");
+
+                // The revoke drops the capability reference and asks for a reclaim. It cannot
+                // get one: the map reference this transaction took first is still held.
+                assert_eq!(
+                    refcounts(&state, object_id),
+                    Some((0, 1)),
+                    "the object survives its capability's revocation because it is mapped"
+                );
+                assert_eq!(
+                    resolve_page(&state, asid, virt).map(|mapping| mapping.phys),
+                    Some(phys),
+                    "and the mapping still points at backing that was never freed or recycled"
+                );
+                assert!(
+                    state.memory_object_slot_by_id(object_id).is_some(),
+                    "the backing object is still live"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn case2_compensation_cannot_reach_a_sibling_replacement_of_the_slot() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+
+                let ours = acquire_provisional(&mut state);
+                // A sibling revokes our provisional cap and mints its own thing into the freed
+                // slot — the "replaced during preparation" shape.
+                state
+                    .revoke_capability_in_cnode(cnode, ours.cap)
+                    .expect("sibling revoke");
+                let sibling_cap = state
+                    .mint_capability_in_cnode(
+                        cnode,
+                        Capability::new(CapObject::Kernel, CapRights::READ),
+                    )
+                    .expect("sibling mint");
+                assert_eq!(
+                    sibling_cap.index(),
+                    ours.cap.index(),
+                    "the sibling took the very slot our recorded CapId names"
+                );
+
+                // Our compensation runs. It must not remove the sibling's capability.
+                assert_eq!(
+                    release_provisional(&mut state, cnode, ours),
+                    ProvisionalReleaseOutcome::NotOurs,
+                    "the object check refuses a slot that no longer holds our memory object"
+                );
+                let survivor = state
+                    .resolve_capability_for_task(0, sibling_cap)
+                    .expect("the sibling's capability survives compensation");
+                assert_eq!(survivor.object, CapObject::Kernel, "and it is unchanged");
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // Case 3 — mapping rollback and displaced backing.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    /// A `VmMapOwners` that records the ORDER in which the transaction drives its owners, over a
+    /// simulated address space and refcount table. Its only purpose is to make ordering
+    /// obligations — "no shootdown under the VM acquisition", "no reclaim before an
+    /// acknowledgement" — directly observable; every policy decision still comes from
+    /// `run_vm_map_transaction`.
+    struct OrderingOwners {
+        log: Vec<String>,
+        space: BTreeMap<u64, Mapping>,
+        in_vm_acquisition: bool,
+        next_phys: u64,
+        next_object: u64,
+        next_cap: u64,
+        fail_mint_at: Option<usize>,
+        minted: usize,
+        shootdown_ok: bool,
+        live_objects: Vec<u64>,
+        map_refs: BTreeMap<u64, i64>,
+        cap_refs: BTreeMap<u64, i64>,
+        reclaimed: Vec<u64>,
+    }
+
+    impl OrderingOwners {
+        fn new() -> Self {
+            Self {
+                log: Vec::new(),
+                space: BTreeMap::new(),
+                in_vm_acquisition: false,
+                next_phys: 0x10_0000,
+                next_object: 1,
+                next_cap: 1,
+                fail_mint_at: None,
+                minted: 0,
+                shootdown_ok: true,
+                live_objects: Vec::new(),
+                map_refs: BTreeMap::new(),
+                cap_refs: BTreeMap::new(),
+                reclaimed: Vec::new(),
+            }
+        }
+
+        fn premap(&mut self, virt: u64, phys: u64, flags: PageFlags) {
+            self.space.insert(
+                virt,
+                Mapping {
+                    phys: PhysAddr(phys),
+                    flags,
+                },
+            );
+            *self.map_refs.entry(phys).or_insert(0) += 1;
+        }
+
+        fn say(&mut self, what: &str) {
+            self.log.push(what.to_string());
+        }
+
+        fn index_of(&self, what: &str) -> Option<usize> {
+            self.log.iter().position(|entry| entry == what)
+        }
+    }
+
+    impl VmMapOwners for OrderingOwners {
+        fn caller_tid(&self) -> Option<u64> {
+            Some(0)
+        }
+        fn caller_asid(&self, _tid: u64) -> Option<Asid> {
+            Some(Asid(1))
+        }
+        fn resolve_address_space_cap(&self, _tid: u64, _cap: CapId) -> Result<Asid, KernelError> {
+            Ok(Asid(1))
+        }
+        fn caller_cnode(&self, _tid: u64) -> Option<CNodeId> {
+            Some(CNodeId(1))
+        }
+        fn is_page_mapped(&self, _asid: Asid, virt: VirtAddr) -> Result<bool, KernelError> {
+            Ok(self.space.contains_key(&virt.0))
+        }
+
+        fn acquire_object(&mut self, _flags: PageFlags) -> Result<(u64, PhysAddr), KernelError> {
+            self.say("acquire_object");
+            let phys = self.next_phys;
+            self.next_phys += crate::kernel::vm::PAGE_SIZE as u64;
+            let object_id = self.next_object;
+            self.next_object += 1;
+            self.live_objects.push(object_id);
+            Ok((object_id, PhysAddr(phys)))
+        }
+
+        fn mint_frame_cap(
+            &mut self,
+            object_id: u64,
+            _phys: PhysAddr,
+        ) -> Result<CapId, KernelError> {
+            self.say("mint_frame_cap");
+            if self.fail_mint_at == Some(self.minted) {
+                return Err(KernelError::CapabilityFull);
+            }
+            self.minted += 1;
+            *self.cap_refs.entry(object_id).or_insert(0) += 1;
+            let cap = CapId(self.next_cap);
+            self.next_cap += 1;
+            Ok(cap)
+        }
+
+        fn release_unminted_object(&mut self, object_id: u64) {
+            self.say("release_unminted_object");
+            self.live_objects.retain(|live| *live != object_id);
+        }
+
+        fn undo_installed_range(&mut self, _asid: Asid, installed: &[InstalledPage]) {
+            self.say("undo_installed_range");
+            self.in_vm_acquisition = true;
+            for page in installed.iter().rev() {
+                match page.replaced {
+                    Some(old) => {
+                        self.space.insert(page.virt.0, old);
+                    }
+                    None => {
+                        self.space.remove(&page.virt.0);
+                    }
+                }
+            }
+            self.in_vm_acquisition = false;
+        }
+
+        fn install_range(
+            &mut self,
+            _asid: Asid,
+            base: usize,
+            flags: PageFlags,
+            objects: &[(u64, PhysAddr)],
+            out: &mut [InstalledPage],
+        ) -> Result<usize, (usize, KernelError)> {
+            self.say("install_range_begin");
+            self.in_vm_acquisition = true;
+            for (i, (_object_id, phys)) in objects.iter().enumerate() {
+                let virt = VirtAddr((base + i * crate::kernel::vm::PAGE_SIZE) as u64);
+                let replaced = self.space.insert(virt.0, Mapping { phys: *phys, flags });
+                out[i] = InstalledPage {
+                    virt,
+                    inserted: *phys,
+                    replaced,
+                };
+            }
+            self.in_vm_acquisition = false;
+            self.say("install_range_end");
+            Ok(objects.len())
+        }
+
+        fn note_inserted(&mut self, installed: &[InstalledPage]) {
+            self.say("note_inserted");
+            for page in installed {
+                *self.map_refs.entry(page.inserted.0).or_insert(0) += 1;
+            }
+        }
+
+        fn unnote_inserted(&mut self, installed: &[InstalledPage]) {
+            self.say("unnote_inserted");
+            for page in installed {
+                *self.map_refs.entry(page.inserted.0).or_insert(0) -= 1;
+            }
+        }
+
+        fn settle_displaced(&mut self, _asid: Asid, installed: &[InstalledPage]) {
+            self.say("settle_displaced");
+            for page in installed {
+                if let Some(old) = page.replaced {
+                    *self.map_refs.entry(old.phys.0).or_insert(0) -= 1;
+                }
+            }
+        }
+
+        fn complete_shootdown(&mut self, _asid: Asid, _virt: VirtAddr) -> bool {
+            assert!(
+                !self.in_vm_acquisition,
+                "a shootdown wait must never run while the VM acquisition is held"
+            );
+            self.say("complete_shootdown");
+            self.shootdown_ok
+        }
+
+        fn reclaim_replaced(&mut self, phys: PhysAddr) {
+            self.say("reclaim_replaced");
+            self.reclaimed.push(phys.0);
+        }
+
+        fn release_provisional_cap(
+            &mut self,
+            _cnode: CNodeId,
+            frame: ProvisionalFrame,
+        ) -> ProvisionalReleaseOutcome {
+            self.say("release_provisional_cap");
+            if self.cap_refs.get(&frame.object_id).copied().unwrap_or(0) > 0 {
+                ProvisionalReleaseOutcome::Released
+            } else {
+                ProvisionalReleaseOutcome::NotOurs
+            }
+        }
+
+        fn account_released_cap(&mut self, frame: ProvisionalFrame) {
+            self.say("account_released_cap");
+            *self.cap_refs.entry(frame.object_id).or_insert(0) -= 1;
+            self.live_objects.retain(|live| *live != frame.object_id);
+        }
+    }
+
+    const MOCK_BASE: usize = 0x20_0000;
+
+    fn mock_virt(page: usize) -> u64 {
+        (MOCK_BASE + page * crate::kernel::vm::PAGE_SIZE) as u64
+    }
+
+    #[test]
+    fn case3_committed_run_shoots_down_before_every_reclaim_and_never_under_the_acquisition() {
+        let mut owners = OrderingOwners::new();
+        for page in 0..3 {
+            owners.premap(
+                mock_virt(page),
+                0x90_0000 + page as u64 * 0x1000,
+                PageFlags::USER_RW,
+            );
+        }
+        let displaced: Vec<u64> = (0..3).map(|p| 0x90_0000 + p as u64 * 0x1000).collect();
+
+        run_vm_map_transaction(
+            &mut owners,
+            MapTarget::CallerAddressSpace,
+            MOCK_BASE,
+            3 * crate::kernel::vm::PAGE_SIZE,
+            0x1 | 0x4, // READ|EXEC — no guard-page interaction, the page below IS unmapped anyway
+        )
+        .expect("the run commits");
+
+        // Ordering: the VM acquisition is finished before any wait begins, and the displaced
+        // accounting happens before the waits, not interleaved with them.
+        let install_end = owners.index_of("install_range_end").expect("install end");
+        let settle = owners.index_of("settle_displaced").expect("settle");
+        let first_wait = owners.index_of("complete_shootdown").expect("a wait ran");
+        assert!(
+            install_end < settle && settle < first_wait,
+            "install (rank 5) → displaced accounting (rank 6) → shootdown wait (no lock): {:?}",
+            owners.log
+        );
+        // And every reclaim is immediately preceded by its own acknowledged shootdown.
+        for (i, entry) in owners.log.iter().enumerate() {
+            if entry == "reclaim_replaced" {
+                assert_eq!(
+                    owners.log.get(i - 1).map(String::as_str),
+                    Some("complete_shootdown"),
+                    "a displaced frame is reclaimed only after its own acknowledgement: {:?}",
+                    owners.log
+                );
+            }
+        }
+        assert_eq!(
+            owners.reclaimed, displaced,
+            "each displaced frame is reclaimed exactly once, in page order"
+        );
+        // The map reference moved from the displaced frames to the inserted ones.
+        for phys in &displaced {
+            assert_eq!(owners.map_refs.get(phys).copied(), Some(0));
+        }
+    }
+
+    #[test]
+    fn case3_unacknowledged_shootdown_blocks_the_reclaim() {
+        let mut owners = OrderingOwners::new();
+        owners.shootdown_ok = false;
+        for page in 0..3 {
+            owners.premap(
+                mock_virt(page),
+                0x90_0000 + page as u64 * 0x1000,
+                PageFlags::USER_RW,
+            );
+        }
+
+        run_vm_map_transaction(
+            &mut owners,
+            MapTarget::CallerAddressSpace,
+            MOCK_BASE,
+            3 * crate::kernel::vm::PAGE_SIZE,
+            0x1 | 0x4,
+        )
+        .expect("the run still commits — the mapping is installed either way");
+
+        assert_eq!(
+            owners
+                .log
+                .iter()
+                .filter(|e| *e == "complete_shootdown")
+                .count(),
+            3,
+            "every displaced page still asks for its acknowledgement"
+        );
+        assert!(
+            owners.reclaimed.is_empty(),
+            "but no frame may be reused until the acknowledgement arrives: {:?}",
+            owners.log
+        );
+    }
+
+    #[test]
+    fn case3_mint_failure_after_several_installations_restores_the_whole_range() {
+        let mut owners = OrderingOwners::new();
+        // Three pages displaced with DISTINCT attributes, one page mapping nothing, plus an
+        // unrelated mapping that has nothing to do with this range.
+        owners.premap(mock_virt(0), 0x90_0000, PageFlags::USER_RW);
+        owners.premap(mock_virt(1), 0x91_0000, PageFlags::USER_RX);
+        owners.premap(mock_virt(2), 0x92_0000, PageFlags::USER_RW);
+        owners.premap(mock_virt(9), 0x99_0000, PageFlags::USER_RX);
+        let before = owners.space.clone();
+        let map_refs_before = owners.map_refs.clone();
+
+        // Fail the THIRD mint, so two provisional caps and four installed pages exist when the
+        // transaction has to settle.
+        owners.fail_mint_at = Some(2);
+        let err = run_vm_map_transaction(
+            &mut owners,
+            MapTarget::CallerAddressSpace,
+            MOCK_BASE,
+            4 * crate::kernel::vm::PAGE_SIZE,
+            0x1 | 0x4,
+        )
+        .expect_err("the mint phase must fail");
+        assert!(
+            !matches!(err, crate::kernel::syscall::SyscallError::WouldBlock),
+            "the failure is the real one, not a manufactured refusal"
+        );
+
+        assert_eq!(
+            owners.space, before,
+            "every displaced mapping is back with its exact physical frame and attributes, the \
+             page that displaced nothing is unmapped again, and the unrelated mapping is untouched"
+        );
+        let live_map_refs: BTreeMap<u64, i64> = owners
+            .map_refs
+            .iter()
+            .filter(|(_, count)| **count != 0)
+            .map(|(phys, count)| (*phys, *count))
+            .collect();
+        assert_eq!(
+            live_map_refs, map_refs_before,
+            "and no map reference is left behind on either the inserted or the displaced frames"
+        );
+        assert!(
+            owners.live_objects.is_empty(),
+            "every object this run acquired is released — the two that were minted through the \
+             capability release, the two that never were through the object release"
+        );
+        assert!(
+            owners.cap_refs.values().all(|count| *count == 0),
+            "and no capability reference survives"
+        );
+        assert!(
+            owners.reclaimed.is_empty(),
+            "a failed run reclaims nothing: it displaced nothing permanently"
+        );
+
+        // The settlement order the case demands.
+        let undo = owners.index_of("undo_installed_range").expect("undo");
+        let unnote = owners.index_of("unnote_inserted").expect("unnote");
+        let release_cap = owners
+            .index_of("release_provisional_cap")
+            .expect("cap release");
+        let release_object = owners
+            .index_of("release_unminted_object")
+            .expect("object release");
+        assert!(
+            undo < unnote && unnote < release_cap && release_cap < release_object,
+            "mappings → map references → capabilities → objects, so a frame is never \
+             reclaimable while its PTE is live: {:?}",
+            owners.log
+        );
+        assert!(
+            owners.index_of("settle_displaced").is_none(),
+            "the irreversible displaced-side accounting must never run on a failing path"
+        );
+    }
+
+    #[test]
+    fn case3_live_mint_failure_restores_displaced_mappings_in_a_real_address_space() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let base = 0x50_0000usize;
+
+                // Three real displaced mappings with distinct attributes, and one unrelated
+                // mapping well outside the range.
+                let mut displaced = Vec::new();
+                for (page, flags) in [
+                    (0usize, PageFlags::USER_RW),
+                    (1, PageFlags::USER_RX),
+                    (2, PageFlags::USER_RW),
+                ] {
+                    let (object_id, mem_cap) =
+                        state.alloc_anonymous_memory_object().expect("alloc");
+                    let virt = VirtAddr((base + page * crate::kernel::vm::PAGE_SIZE) as u64);
+                    state
+                        .map_user_page_in_asid_with_caps(asid, mem_cap, virt, flags)
+                        .expect("premap");
+                    displaced.push((
+                        object_id,
+                        virt,
+                        resolve_page(&state, asid, virt).expect("mapped"),
+                    ));
+                }
+                let unrelated_virt = VirtAddr((base + 16 * crate::kernel::vm::PAGE_SIZE) as u64);
+                let (_unrelated_id, unrelated_cap) =
+                    state.alloc_anonymous_memory_object().expect("alloc");
+                state
+                    .map_user_page_in_asid_with_caps(
+                        asid,
+                        unrelated_cap,
+                        unrelated_virt,
+                        PageFlags::USER_RW,
+                    )
+                    .expect("premap unrelated");
+                let unrelated_before = resolve_page(&state, asid, unrelated_virt).expect("mapped");
+
+                // Fill the cspace so that exactly TWO mints can still succeed. The transaction
+                // asks for four pages, so its third mint fails for real.
+                let mut filler = 0usize;
+                loop {
+                    let free_slots = state.with_capability_state(|capability| {
+                        capability
+                            .cnode_spaces
+                            .iter()
+                            .flatten()
+                            .find(|space| space.id == cnode)
+                            .map(|space| {
+                                space.slot_capacity - kernel_ref(&space.cspace).occupied_slots()
+                            })
+                            .unwrap_or(0)
+                    });
+                    if free_slots <= 2 {
+                        break;
+                    }
+                    state
+                        .mint_capability_in_cnode(
+                            cnode,
+                            Capability::new(CapObject::Kernel, CapRights::READ),
+                        )
+                        .expect("filler mint");
+                    filler += 1;
+                    assert!(filler < 4096, "the cspace must fill");
+                }
+
+                let quiescent = (
+                    free_frames(&state),
+                    state.live_memory_object_count_for_test(),
+                    cnode_occupied(&state, cnode),
+                );
+
+                let mut frame = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::VmAnonMap as usize,
+                    [0, base, 4 * crate::kernel::vm::PAGE_SIZE, 0x1 | 0x4, 0, 0],
+                );
+                let result = state.handle_trap(Trap::Syscall, Some(&mut frame));
+                assert!(
+                    result.is_err() || frame.error_code().is_some(),
+                    "the mint phase must fail once the cspace is full"
+                );
+
+                // Every displaced mapping is back, verbatim, with its refcounts intact.
+                for (object_id, virt, original) in &displaced {
+                    assert_eq!(
+                        resolve_page(&state, asid, *virt),
+                        Some(*original),
+                        "the displaced mapping at {:#x} must be restored with its exact frame \
+                         and attributes",
+                        virt.0
+                    );
+                    assert_eq!(
+                        refcounts(&state, *object_id),
+                        Some((1, 1)),
+                        "and with its capability and map references untouched"
+                    );
+                }
+                // The page that displaced nothing is unmapped again.
+                assert_eq!(
+                    resolve_page(
+                        &state,
+                        asid,
+                        VirtAddr((base + 3 * crate::kernel::vm::PAGE_SIZE) as u64)
+                    ),
+                    None,
+                    "a page this run created and then rolled back must not survive"
+                );
+                // The unrelated mapping never moved.
+                assert_eq!(
+                    resolve_page(&state, asid, unrelated_virt),
+                    Some(unrelated_before),
+                    "a mapping outside the range must be preserved exactly"
+                );
+                // And the run left nothing of its own behind.
+                assert_eq!(
+                    (
+                        free_frames(&state),
+                        state.live_memory_object_count_for_test(),
+                        cnode_occupied(&state, cnode),
+                    ),
+                    quiescent,
+                    "frames, objects and capability slots all return to their pre-call values"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn case3_live_control_the_same_request_commits_when_the_cspace_has_headroom() {
+        // The control for the test above. Same address space, same premapped range, same four
+        // page request — the ONLY difference is that the cspace is not full. It commits. That is
+        // what attributes the other run's failure to the MINT phase specifically, rather than to
+        // frame exhaustion or a page-table refusal, which no error code would distinguish.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, asid) = kernel_with_asid();
+                let base = 0x50_0000usize;
+
+                let mut displaced = Vec::new();
+                for (page, flags) in [
+                    (0usize, PageFlags::USER_RW),
+                    (1, PageFlags::USER_RX),
+                    (2, PageFlags::USER_RW),
+                ] {
+                    let (object_id, mem_cap) =
+                        state.alloc_anonymous_memory_object().expect("alloc");
+                    let virt = VirtAddr((base + page * crate::kernel::vm::PAGE_SIZE) as u64);
+                    state
+                        .map_user_page_in_asid_with_caps(asid, mem_cap, virt, flags)
+                        .expect("premap");
+                    displaced.push((object_id, virt, mem_cap));
+                }
+
+                let mut frame = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::VmAnonMap as usize,
+                    [0, base, 4 * crate::kernel::vm::PAGE_SIZE, 0x1 | 0x4, 0, 0],
+                );
+                let result = state.handle_trap(Trap::Syscall, Some(&mut frame));
+                assert!(
+                    result.is_ok() && frame.error_code().is_none(),
+                    "with cspace headroom the identical request commits"
+                );
+
+                // All four pages are now this run's, and each displaced page really was replaced.
+                for page in 0..4 {
+                    let virt = VirtAddr((base + page * crate::kernel::vm::PAGE_SIZE) as u64);
+                    assert!(
+                        resolve_page(&state, asid, virt).is_some(),
+                        "page {page} must be mapped after a committed run"
+                    );
+                }
+                for (object_id, virt, _) in &displaced {
+                    let now = resolve_page(&state, asid, *virt).expect("mapped");
+                    let old_phys = state.with_memory_state(|memory| {
+                        memory
+                            .memory_objects
+                            .iter()
+                            .flatten()
+                            .find(|object| object.id == *object_id)
+                            .map(|object| object.phys)
+                    });
+                    assert_ne!(
+                        Some(now.phys),
+                        old_phys,
+                        "the displaced page is backed by this run's frame now"
+                    );
+                    // The displaced object lost its map reference but keeps its capability one,
+                    // so its backing is deliberately NOT reclaimed: the shootdown-gated reclaim
+                    // is refused by the very refcount rule that protects a still-referenced frame.
+                    assert_eq!(
+                        refcounts(&state, *object_id),
+                        Some((1, 0)),
+                        "map reference dropped, capability reference kept"
+                    );
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// U9-VM-ENTRY1 §4 — the three-NR × three-architecture SOURCE reachability matrix.
+//
+// One row per NR, one cell per architecture, plus the shared cells every architecture goes
+// through. Each cell asserts the SOURCE fact that makes the route reachable there, and the
+// absence of a path back to either terminal broad dispatcher after the family is recognized.
+//
+// Route markers alone would not prove any of this, which is why nothing below reads one: the
+// cells read the ingress gates, the shared dispatcher and the routes themselves. Live execution
+// is reported separately — a source cell says a fall-through cannot happen, never that a syscall
+// ran.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod u9vment1_reachability_matrix {
+    use std::string::String;
+    use std::vec::Vec;
+
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TXN: &str = include_str!("../syscall/vm_txn.rs");
+    const VM: &str = include_str!("../syscall/vm.rs");
+    const VM_SPLIT: &str = include_str!("../syscall/vm_split.rs");
+
+    /// Every NR in this mission, with the constant each ingress gate names it by and the route
+    /// that owns it.
+    const FAMILIES: [(&str, &str, &str); 3] = [
+        (
+            "NR 3 VmMap",
+            "SYSCALL_VM_MAP_NR",
+            "try_split_vm_map_into_frame",
+        ),
+        (
+            "NR 13 VmAnonMap",
+            "SYSCALL_VM_ANON_MAP_NR",
+            "try_split_vm_anon_map_into_frame",
+        ),
+        (
+            "NR 14 VmBrk",
+            "SYSCALL_VM_BRK_NR",
+            "try_split_vm_brk_into_frame",
+        ),
+    ];
+
+    /// The body of `name`, from its signature up to the next item at the same nesting depth.
+    fn body_of<'a>(src: &'a str, name: &str, terminator: &str) -> &'a str {
+        src.split(name)
+            .nth(1)
+            .and_then(|rest| rest.split(terminator).next())
+            .unwrap_or_else(|| panic!("could not isolate `{name}`"))
+    }
+
+    /// `src` with every comment line removed, so a cell cannot be satisfied by prose that merely
+    /// MENTIONS the seam it is asserting about.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // ── Column: x86_64 ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_x86_64_column_every_nr_reaches_the_shared_dispatcher_unconditionally() {
+        // x86_64 enters through the shared `trap_entry` syscall branch. Its only pre-dispatch
+        // gate is `pre_split_import_syscall_abi`, which on every non-AArch64 target is an empty
+        // function — so no NR can be filtered out before the dispatcher sees it.
+        assert!(
+            TRAP_ENTRY.contains("#[cfg(not(target_arch = \"aarch64\"))]\nfn pre_split_import_syscall_abi(_frame: &mut TrapFrame) {}"),
+            "on x86_64 the ABI import is a no-op, so the dispatcher sees every syscall number"
+        );
+        let branch = code_only(body_of(
+            TRAP_ENTRY,
+            "if !post_work_committed && matches!(decode_trap_context(context), TrapEvent::Syscall)",
+            "\n    if !queue_advance_committed",
+        ));
+        assert!(
+            branch.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "the shared syscall branch calls the split dispatcher"
+        );
+        assert!(
+            branch.contains("SplitDispatchDisposition::Complete(result)"),
+            "and it consumes the `Complete` disposition all three of these NRs answer with"
+        );
+    }
+
+    // ── Column: AArch64 ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_aarch64_column_import_admits_all_three_and_agrees_with_the_return_path() {
+        // AArch64 shares the same branch, but reaches the dispatcher only for an NR whose ABI
+        // this function imports; an unlisted NR keeps `nr = 0` in the frame and is declined.
+        let import = code_only(body_of(
+            TRAP_ENTRY,
+            "fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {",
+            "\n#[cfg(not(target_arch = \"aarch64\"))]",
+        ));
+        for (label, nr_const, _) in FAMILIES {
+            assert!(
+                import.contains(&std::format!(
+                    "raw_nr == crate::kernel::syscall::{nr_const}"
+                )),
+                "{label} must be on the AArch64 ABI import list, or it keeps its terminal broad \
+                 edge on this architecture no matter what its route admits"
+            );
+        }
+        // Import and return handling agree: all three answer `Complete`, and the `Complete` arm
+        // reaches the finalizer with `CompletedInThisTrap`, which commits unconditionally rather
+        // than consulting the per-class published-transition list.
+        let finalize = code_only(body_of(
+            TRAP_ENTRY,
+            "fn finalize_split_handled_syscall(\n    shared: &crate::runtime::SharedKernel,",
+            "\n#[cfg(not(target_arch = \"aarch64\"))]",
+        ));
+        assert!(
+            finalize.contains("if matches!(reason, SplitFinalizeReason::CompletedInThisTrap) {")
+                && finalize.contains(
+                    "split_finalize_handled_syscall(shared, cpu, entering, frame);\n        return;"
+                ),
+            "a syscall completed in this trap must have its result exported and its SVC advanced \
+             unconditionally — the defect this arm exists to prevent is exactly a class that is \
+             imported and routed but never finalized"
+        );
+        let complete_arm = code_only(body_of(
+            TRAP_ENTRY,
+            "if let SplitDispatchDisposition::Complete(result) = disposition {",
+            "\n            }\n        }",
+        ));
+        assert!(
+            complete_arm.contains("SplitFinalizeReason::CompletedInThisTrap"),
+            "the `Complete` arm must finalize with the reason that always commits"
+        );
+    }
+
+    // ── Column: RISC-V ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_riscv_column_eligibility_admits_all_three_and_actually_invokes_the_route() {
+        let gate = code_only(body_of(
+            RISCV_TRAP,
+            "let split_eligible =",
+            "\n    if split_eligible {",
+        ));
+        for (label, nr_const, _) in FAMILIES {
+            assert!(
+                gate.contains(&std::format!("nr == crate::kernel::syscall::{nr_const}")),
+                "{label} must be on the RISC-V eligibility list"
+            );
+        }
+        // Eligibility is not enough on its own: the gate must actually call the dispatcher.
+        let admitted = code_only(body_of(
+            RISCV_TRAP,
+            "\n    if split_eligible {",
+            "\n    // Not split-eligible",
+        ));
+        assert!(
+            admitted.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "the RISC-V eligibility gate must invoke the shared dispatcher, not merely admit"
+        );
+    }
+
+    // ── Shared cells: the dispatcher and the three routes ───────────────────────────────────
+
+    #[test]
+    fn matrix_shared_dispatcher_admits_all_three_and_routes_each_to_a_total_owner() {
+        let classifier = code_only(body_of(SPLIT, "fn classify_split_eligible_nr_only(", "\n}"));
+        for (label, _, _) in FAMILIES {
+            let variant = match label {
+                "NR 3 VmMap" => "Syscall::VmMap => Some(syscall)",
+                "NR 13 VmAnonMap" => "Syscall::VmAnonMap => Some(syscall)",
+                _ => "Syscall::VmBrk => Some(syscall)",
+            };
+            assert!(
+                classifier.contains(variant),
+                "{label} must pass the shared NR-only eligibility gate"
+            );
+        }
+        let dispatcher = code_only(body_of(
+            SPLIT,
+            "fn try_split_dispatch_nonswitching_into_frame(",
+            "\n/// U9-SPAWN1 SP-2",
+        ));
+        for (label, _, route) in FAMILIES {
+            assert!(
+                dispatcher.contains(&std::format!("return {route}(shared, cpu, frame);")),
+                "{label} must be routed to `{route}` and RETURNED, so no later arm and no \
+                 fall-through can reach the terminal broad acquisition for it"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_each_route_is_total_after_its_nr_gate() {
+        for (label, _, route) in FAMILIES {
+            let body = code_only(body_of(
+                SPLIT,
+                &std::format!("pub(crate) fn {route}("),
+                "\n}\n",
+            ));
+            // The NR gate itself is the ONLY place a `None` may be produced: an undecodable
+            // number and a different syscall. Everything after it is `Some(..)`.
+            let gate_end = body
+                .find("return None;")
+                .expect("the NR gate declines a different syscall")
+                + "return None;".len();
+            let after_gate = &body[gate_end..];
+            assert_eq!(
+                after_gate.matches("None").count(),
+                0,
+                "{label}: `{route}` must never answer `None` after recognizing its NR — a family \
+                 with a reachable broad fallback is not closed, and after a frame is taken or a \
+                 page installed a `None` would hand a partially executed transaction to a \
+                 dispatcher that knows nothing about it"
+            );
+            assert_eq!(
+                body.matches(".ok()?").count(),
+                1,
+                "{label}: the only `?` is the decode in the NR gate"
+            );
+            // Errors go back as errors, not as declines.
+            assert!(
+                after_gate.contains("Err(e) => Err(TrapHandleError::Syscall(e))")
+                    || after_gate.contains("Err(e) => return Some(Err(e))")
+                    || after_gate.contains("Err(e) => Err(e)"),
+                "{label}: an ordinary refusal must be returned as this syscall's error"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_error_and_refusal_branches_stay_inside_the_route() {
+        // Every refusal the transaction can produce is a `SyscallError`, and the routes convert
+        // each into `TrapHandleError::Syscall`. None of them is `WouldBlock` or `Unsupported`,
+        // and none is a fatal: the ABI the broad handlers implement is preserved exactly.
+        let txn = code_only(&TXN);
+        assert!(
+            !txn.contains("SyscallError::WouldBlock")
+                && !txn.contains("SyscallError::Unsupported")
+                && !txn.contains("panic!")
+                && !txn.contains("unreachable!"),
+            "no supported behaviour may be replaced with WouldBlock, Unsupported or a fatal to \
+             manufacture closure"
+        );
+        // The refusal vocabulary is the delivered one.
+        for expected in [
+            "SyscallError::InvalidArgs",
+            "KernelError::TaskMissing",
+            "KernelError::UserMemoryFault",
+        ] {
+            assert!(
+                txn.contains(expected),
+                "the transaction must still be able to produce `{expected}`"
+            );
+        }
+        // `WrongObject` is the NR 3 authority refusal, and it is produced identically by BOTH
+        // adapters' capability resolvers — the one place the two NRs differ.
+        for (label, src) in [("broad", VM), ("split", VM_SPLIT)] {
+            assert!(
+                code_only(src).contains("_ => Err(KernelError::WrongObject)"),
+                "the {label} adapter must still refuse a non-address-space capability with \
+                 `WrongObject`"
+            );
+        }
+    }
+
+    // ── Row: NR 14, every shape ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_nr14_row_services_every_brk_shape_on_every_architecture() {
+        let classify = code_only(body_of(TXN, "pub(crate) fn classify_brk(", "\n}\n"));
+        for shape in [
+            "BrkShape::Query",
+            "BrkShape::Growth",
+            "BrkShape::NoOp",
+            "BrkShape::ShrinkUnmapping",
+            "BrkShape::ShrinkWithinPage",
+        ] {
+            assert!(
+                classify.contains(shape),
+                "`classify_brk` must produce `{shape}`"
+            );
+        }
+        let run = code_only(body_of(
+            TXN,
+            "pub(crate) fn run_vm_brk_transaction<O: VmBrkOwners>(",
+            "\n}\n",
+        ));
+        // Exactly ONE shape does any unmapping; every other shape is serviced by the same body
+        // rather than declined, which is what makes "all five shapes, at any CPU count" true.
+        assert!(
+            run.contains("if let BrkShape::ShrinkUnmapping {"),
+            "only the page-crossing shrink unmaps"
+        );
+        assert!(
+            !run.contains("return None") && !run.contains("NotHandled"),
+            "no shape may decline — the transaction is total for NR 14"
+        );
+        // The topology restriction is gone, and gone by reaching a better owner rather than by
+        // ignoring the constraint that produced it.
+        let split_unmap = code_only(body_of(
+            VM_SPLIT,
+            "fn unmap_brk_range(",
+            "\n    fn note_brk",
+        ));
+        assert!(
+            split_unmap.contains("unmap_range_two_phase_split(asid, start, len)"),
+            "the split shrink must reach the two-phase unmap owner — rank 5, then the shootdown \
+             with NO lock held, then rank 6 — which is what removed the one-CPU ceiling"
+        );
+        assert!(
+            !split_unmap.contains("cpus_online") && !split_unmap.contains("online_cpu"),
+            "and it must not reintroduce a CPU-count condition"
+        );
+    }
+
+    // ── The two policies exist once ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_one_implementation_of_each_policy_reached_through_two_acquisitions() {
+        // Neither adapter restates the policy…
+        for (label, src) in [("broad", VM), ("split", VM_SPLIT)] {
+            let code = code_only(src);
+            for owned_by_the_transaction in [
+                "fn validate_map_args(",
+                "fn classify_brk(",
+                "fn guard_page_refuses(",
+                "fn release_frames<",
+                "fn run_one_map_run",
+            ] {
+                assert!(
+                    !code.contains(owned_by_the_transaction),
+                    "the {label} adapter must not restate `{owned_by_the_transaction}`"
+                );
+            }
+        }
+        // …and both reach the SAME rank-local bodies for installation, accounting and exclusivity.
+        let split = code_only(&VM_SPLIT);
+        let broad = code_only(&VM);
+        for shared_body in [
+            "install_range_locked(",
+            "undo_installed_locked(",
+            "note_inserted_locked(",
+            "unnote_inserted_locked(",
+            "settle_displaced_locked(",
+            "release_provisional_frame_cap_locked(",
+        ] {
+            assert!(
+                broad.contains(shared_body) && split.contains(shared_body),
+                "`{shared_body}` must be reached by BOTH adapters — one implementation, two \
+                 acquisitions"
+            );
+            assert_eq!(
+                split
+                    .matches(&std::format!("fn {}", shared_body.trim_end_matches('(')))
+                    .count(),
+                0,
+                "and the split adapter must not define its own `{shared_body}`"
+            );
+        }
+    }
+
+    // ── The live witness ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_live_witness_exists_issues_all_three_and_never_asserts() {
+        // Before this mission no server issued NR 3, NR 13 or NR 14, so no profile executed the
+        // converted routes at all. The witness is what makes the live column of this matrix
+        // possible; a guard keeps it from quietly disappearing again.
+        const WITNESS: &str = include_str!("../../../crates/yarm-user-rt/src/vm_entry_witness.rs");
+        const INIT_BIN: &str =
+            include_str!("../../../crates/yarm-control-plane-servers/src/bin/init_server.rs");
+
+        for nr in [
+            "const SYSCALL_VM_MAP_NR: usize = 3;",
+            "const SYSCALL_VM_ANON_MAP_NR: usize = 13;",
+            "const SYSCALL_VM_BRK_NR: usize = 14;",
+        ] {
+            assert!(WITNESS.contains(nr), "the witness must issue `{nr}`");
+        }
+        // Every NR 14 shape, and the NR 13 shapes that matter for the transaction's own phases.
+        for case in [
+            "\"single_page\"",
+            "\"multi_page\"",
+            "\"remap_displacing\"",
+            "\"guard_page_refused\"",
+            "\"writable_page\"",
+            "\"invalid_capability_refused\"",
+            "\"wrong_object_refused\"",
+            "\"query\"",
+            "\"growth\"",
+            "\"no_op\"",
+            "\"shrink_within_page\"",
+            "\"shrink_unmapping\"",
+            "\"below_base_refused\"",
+        ] {
+            assert!(
+                WITNESS.contains(case),
+                "the witness must cover the case {case}"
+            );
+        }
+        // It reports, it does not decide: a witness that panicked would make every profile
+        // sharing this image depend on it.
+        let code = code_only(WITNESS);
+        for forbidden in ["panic!", "unwrap()", "expect(", "assert!", "assert_eq!"] {
+            assert!(
+                !code.contains(forbidden),
+                "the witness must never `{forbidden}` — it reports raw lanes and nothing else"
+            );
+        }
+        // And it is actually invoked, from a binary that runs in every core profile.
+        assert!(
+            INIT_BIN.contains("vm_entry_witness::run_once("),
+            "the witness must be called from the init server"
+        );
+    }
+
+    #[test]
+    fn matrix_nr14_shapes_have_a_live_issuer_because_boot_seeds_the_break() {
+        // NR 14's four non-query shapes need a break window that already exists — the delivered
+        // rule, preserved. Each architecture's boot seeds one for the init server, which is where
+        // the witness runs; without that the shapes would be refused by the bounds lookup and the
+        // live column would be empty through no fault of the route.
+        for (arch, src) in [
+            ("x86_64", include_str!("../../arch/x86_64/boot.rs")),
+            ("aarch64", include_str!("../../arch/aarch64/boot.rs")),
+            ("riscv64", include_str!("../../arch/riscv64/boot.rs")),
+        ] {
+            assert!(
+                src.contains("set_task_brk_bounds(RING3_INIT_SERVER_TID"),
+                "{arch} boot must seed the init server's break window"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_superseded_runtime_acquisition_adapter_is_gone() {
+        // The delivered split route for NR 14 was a shrink-only specialization gated on CPU
+        // count. It is removed rather than left caller-free beside its replacement.
+        assert!(
+            !SPLIT.contains("try_split_vm_brk_shrink_into_frame"),
+            "the superseded shrink-only NR 14 adapter must be gone, not merely bypassed"
+        );
+        assert!(
+            !VM_SPLIT.contains("fn acquire_anonymous_frame_split(")
+                && !SPLIT.contains("acquire_anonymous_frame_split"),
+            "the mint-early frame acquirer the mint-last order superseded must be gone too"
         );
     }
 }

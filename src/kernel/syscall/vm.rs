@@ -7,88 +7,431 @@
 //! behavior change. `syscall.rs` keeps minimal delegation shims so dispatch
 //! routing remains explicit while VM mapping semantics stay owned by the
 //! existing `KernelState` VM methods.
+//!
+//! U9-VM-ENTRY1: the three handlers no longer own their policy. Validation order, the
+//! guard-page rule, error precedence, phase order, compensation and result encoding all live in
+//! [`crate::kernel::syscall::vm_txn`]; what remains here is the BROAD ADAPTER — one method per
+//! domain acquisition — plus the frame decoding each NR does. The split adapter in
+//! `runtime.rs` implements the same trait, so the two routes cannot disagree about any of it.
 
 use super::{
-    SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR,
-    SYSCALL_VM_MAP_PROT_EXEC, SYSCALL_VM_MAP_PROT_READ, SYSCALL_VM_MAP_PROT_WRITE, SyscallError,
-    current_tid, round_up_page, validate_user_region,
+    SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError,
 };
-use crate::kernel::boot::{
-    KernelError, KernelState, VmAnonMapProgressPlan, VmAnonMapValidatedArgs, VmBrkPlan,
-    VmPageMapProgress,
-};
+use crate::kernel::boot::{KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::capabilities::CapObject;
+use crate::kernel::syscall::vm_txn::{
+    BrkShape, InstalledPage, MapTarget, ProvisionalFrame, ProvisionalReleaseOutcome, VmBrkOwners,
+    VmMapOwners, VmRollbackReason, VmTxnEvent, run_vm_brk_transaction, run_vm_map_transaction,
+};
 use crate::kernel::trapframe::TrapFrame;
-use crate::kernel::vm::{Asid, PAGE_SIZE, PageFlags, VirtAddr};
+use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 
-fn vm_map_page_flags(prot: usize) -> Result<PageFlags, SyscallError> {
-    let unknown =
-        prot & !(SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE | SYSCALL_VM_MAP_PROT_EXEC);
-    if unknown != 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    Ok(PageFlags {
-        read: (prot & SYSCALL_VM_MAP_PROT_READ) != 0,
-        write: (prot & SYSCALL_VM_MAP_PROT_WRITE) != 0,
-        execute: (prot & SYSCALL_VM_MAP_PROT_EXEC) != 0,
-        user: true,
-        cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
-    })
+/// The BROAD adapter. Every method is the delivered `KernelState` owner, called with the global
+/// lock already held; the transaction module supplies the order.
+pub(crate) struct BroadVmOwners<'a> {
+    pub(crate) kernel: &'a mut KernelState,
 }
 
-/// Validates the (addr, len, prot) triple shared by VmMap and VmAnonMap.
-/// Returns `(map_len, end, flags)` where `map_len` is rounded up to `PAGE_SIZE`
-/// and `end = addr + map_len` is guaranteed not to overflow.
-fn validate_anon_map_args(
-    addr: usize,
-    len: usize,
-    prot: usize,
-) -> Result<(usize, usize, PageFlags), SyscallError> {
-    if len == 0 || !addr.is_multiple_of(PAGE_SIZE) {
-        return Err(SyscallError::InvalidArgs);
+impl VmMapOwners for BroadVmOwners<'_> {
+    fn caller_tid(&self) -> Option<u64> {
+        self.kernel.current_tid()
     }
-    let map_len = round_up_page(len)?;
-    let end = addr.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
-    let flags = vm_map_page_flags(prot)?;
-    Ok((map_len, end, flags))
-}
 
-/// Undo physical mappings for [addr, mapped_end) on partial VmAnonMap failure.
-/// Stage 9: also revokes capability slots for rolled-back pages so physical
-/// frames are fully reclaimed. `unmapped_cap` carries the cap that was allocated
-/// for the failing page but never mapped (only set on map failure, not alloc failure).
-fn rollback_anon_map(
-    kernel: &mut KernelState,
-    asid: Asid,
-    addr: usize,
-    mapped_end: usize,
-    unmapped_cap: Option<CapId>,
-) {
-    // Revoke the un-mapped cap first (case: map_user_page_in_asid_with_caps failed).
-    // The cap was allocated but the page was never inserted into the address space,
-    // so there is no phase-1 unmap — we revoke it directly.
-    if let Some(cap) = unmapped_cap {
-        if let Some(cnode) = kernel.current_task_cnode() {
-            let _ = kernel.revoke_capability_in_cnode(cnode, cap);
+    fn caller_asid(&self, tid: u64) -> Option<Asid> {
+        self.kernel.task_asid(tid)
+    }
+
+    fn resolve_address_space_cap(&self, tid: u64, cap: CapId) -> Result<Asid, KernelError> {
+        let capability = self.kernel.resolve_capability_for_task(tid, cap)?;
+        match capability.object {
+            CapObject::AddressSpace { asid } => Ok(Asid(asid)),
+            _ => Err(KernelError::WrongObject),
         }
     }
-    // Stage 6: two-phase unmap for mapped pages; Stage 9: also revoke their caps.
-    // After unmap_page_phase1, map_refcount=0 and we have the physical address.
-    // Revoking the cap decrements cap_refcount to 0; execute_tlb_shootdown_wait_plan
-    // then frees the physical frame (reclaim_memory_object_if_unreferenced sees both=0).
-    // Absent pages (Ok(None)) are silently skipped — unmap_page_phase1 tolerates them.
-    let mut va = addr;
-    while va < mapped_end {
-        if let Ok(Some(wait_plan)) = kernel.unmap_page_phase1(asid, VirtAddr(va as u64)) {
-            if let Some((cnode, cap_id)) =
-                kernel.find_current_task_cap_for_memory_object_phys(wait_plan.phys)
-            {
-                let _ = kernel.revoke_capability_in_cnode(cnode, cap_id);
+
+    fn caller_cnode(&self, _tid: u64) -> Option<crate::kernel::capabilities::CNodeId> {
+        // The delivered rollback allocates and revokes in the CURRENT task's cnode regardless of
+        // which address space the mapping targets. Preserved verbatim.
+        self.kernel.current_task_cnode()
+    }
+
+    fn is_page_mapped(&self, asid: Asid, virt: VirtAddr) -> Result<bool, KernelError> {
+        self.kernel.is_user_page_mapped_in_asid(asid, virt)
+    }
+
+    fn acquire_object(&mut self, flags: PageFlags) -> Result<(u64, PhysAddr), KernelError> {
+        // The delivered RIGHTS check, at the delivered point in the error precedence, evaluated
+        // against the rights the mint WILL carry rather than through a published capability. Same
+        // predicate as `resolve_memory_object_phys(cap, flags)`, no cap required — which is what
+        // lets the mint move to the end of the transaction.
+        anonymous_rights_admit(flags)?;
+        let (object_id, phys) = self.kernel.alloc_anonymous_object_without_cap()?;
+        Ok((object_id, phys))
+    }
+
+    fn mint_frame_cap(&mut self, object_id: u64, _phys: PhysAddr) -> Result<CapId, KernelError> {
+        self.kernel.mint_anonymous_frame_cap(object_id)
+    }
+
+    fn release_unminted_object(&mut self, object_id: u64) {
+        self.kernel.release_unminted_anonymous_object(object_id);
+    }
+
+    fn undo_installed_range(&mut self, asid: Asid, installed: &[InstalledPage]) {
+        self.kernel
+            .with_user_spaces_mut(|spaces| undo_installed_locked(spaces, asid, installed));
+    }
+
+    fn install_range(
+        &mut self,
+        asid: Asid,
+        base: usize,
+        flags: PageFlags,
+        objects: &[(u64, PhysAddr)],
+        out: &mut [InstalledPage],
+    ) -> Result<usize, (usize, KernelError)> {
+        self.kernel.with_user_spaces_mut(|spaces| {
+            install_range_locked(spaces, asid, base, flags, objects, out)
+        })
+    }
+
+    fn note_inserted(&mut self, installed: &[InstalledPage]) {
+        self.kernel.with_memory_state_mut(|memory| {
+            note_inserted_locked(memory, installed);
+        });
+    }
+
+    fn unnote_inserted(&mut self, installed: &[InstalledPage]) {
+        self.kernel.with_memory_state_mut(|memory| {
+            unnote_inserted_locked(memory, installed);
+        });
+    }
+
+    fn settle_displaced(&mut self, asid: Asid, installed: &[InstalledPage]) {
+        self.kernel.with_memory_state_mut(|memory| {
+            settle_displaced_locked(memory, asid, installed);
+        });
+    }
+
+    fn complete_shootdown(&mut self, asid: Asid, virt: VirtAddr) -> bool {
+        // The delivered coordinator, called at the point the delivered replace path never called
+        // it at all: `map_user_page_in_asid_raw_locked` reclaimed a displaced frame with no
+        // shootdown between the PTE overwrite and the reclaim. Under the global lock no other CPU
+        // could enter the kernel to observe it, but the frame could still be handed out while a
+        // remote TLB held the old translation. Routing the displaced-frame reclaim through the
+        // same required-ACK rule the rest of this transaction obeys closes that without widening
+        // scope: the ONLY behaviour change is that a reclaim now waits for the acknowledgement it
+        // always owed.
+        self.kernel.shootdown_replaced_mapping(asid, virt).is_ok()
+    }
+
+    fn reclaim_replaced(&mut self, phys: PhysAddr) {
+        self.kernel.with_memory_state_mut(|memory| {
+            KernelState::reclaim_memory_object_for_phys_locked(memory, phys);
+        });
+    }
+
+    fn release_provisional_cap(
+        &mut self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        frame: ProvisionalFrame,
+    ) -> ProvisionalReleaseOutcome {
+        self.kernel.with_capability_state_mut(|capability| {
+            release_provisional_frame_cap_locked(capability, cnode, frame)
+        })
+    }
+
+    fn account_released_cap(&mut self, frame: ProvisionalFrame) {
+        let object = CapObject::MemoryObject {
+            id: frame.object_id,
+        };
+        self.kernel.with_memory_state_mut(|memory| {
+            KernelState::adjust_memory_object_cap_refcount_locked(memory, object, -1);
+            KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object);
+        });
+    }
+
+    fn note(&mut self, event: VmTxnEvent) {
+        // The delivered VM-COW diagnostic vocabulary, unchanged and still knob-gated.
+        if !crate::kernel::boot::vm_cow_enabled() {
+            return;
+        }
+        match event {
+            VmTxnEvent::Validated { asid, addr, len } => {
+                crate::yarm_log!(
+                    "VM_MAP_PHASE_METADATA asid={} addr=0x{:x} len={}",
+                    asid.0,
+                    addr,
+                    len
+                );
             }
-            let _ = kernel.execute_tlb_shootdown_wait_plan(wait_plan);
+            VmTxnEvent::FramesAcquired { .. } => {}
+            VmTxnEvent::Installed { count } => {
+                crate::yarm_log!("VM_MAP_PHASE_FRAME_ALLOC pages={}", count);
+                crate::yarm_log!("VM_MAP_PHASE_PT_UPDATE pages={}", count);
+            }
+            VmTxnEvent::RolledBack {
+                reason,
+                released,
+                retained,
+            } => {
+                let reason = match reason {
+                    VmRollbackReason::FrameAlloc => "frame_alloc",
+                    VmRollbackReason::PageTableUpdate => "pt_update",
+                    VmRollbackReason::CapabilityMint => "cap_mint",
+                };
+                crate::yarm_log!(
+                    "VM_MAP_ROLLBACK_OK reason={} released={} retained={}",
+                    reason,
+                    released,
+                    retained
+                );
+            }
         }
-        va += PAGE_SIZE;
+    }
+}
+
+/// The delivered rights predicate for an anonymous frame, without a capability.
+///
+/// `resolve_memory_object_phys(cap, flags)` refuses `MissingRight` when the requested flags demand
+/// a right the capability lacks. Every capability this transaction mints carries
+/// `memory_object_rights_for_kind(Anonymous)`, so the same question can be asked of those rights
+/// directly — same predicate, same error, same position in the precedence, and no published slot
+/// needed to ask it.
+pub(crate) fn anonymous_rights_admit(flags: PageFlags) -> Result<(), KernelError> {
+    use crate::kernel::boot::MemoryObjectKind;
+    use crate::kernel::capabilities::CapRights;
+    let rights = KernelState::memory_object_rights_for_kind(MemoryObjectKind::Anonymous);
+    if flags.read && !rights.contains(CapRights::READ) {
+        return Err(KernelError::MissingRight);
+    }
+    if flags.write && !rights.contains(CapRights::WRITE) {
+        return Err(KernelError::MissingRight);
+    }
+    Ok(())
+}
+
+/// rank 5, ONE acquisition: install the whole run, and on the first failure restore every page
+/// already installed BEFORE releasing.
+///
+/// This is the function that makes compensation ownership-proving rather than byte-comparing.
+/// Because the install and the undo happen inside one `user_spaces` acquisition, no other
+/// transaction can observe or alter this address space between them — so each page the undo
+/// removes is provably the page this call installed, and each page it restores is provably the
+/// mapping this call displaced. No `(va, phys)` comparison is needed or would be sufficient.
+pub(crate) fn install_range_locked(
+    spaces: &mut crate::kernel::vm::AddressSpaceManager,
+    asid: Asid,
+    base: usize,
+    flags: PageFlags,
+    objects: &[(u64, PhysAddr)],
+    out: &mut [InstalledPage],
+) -> Result<usize, (usize, KernelError)> {
+    use crate::kernel::vm::VmError;
+    for (i, (_object_id, phys)) in objects.iter().enumerate() {
+        let virt = VirtAddr((base + i * PAGE_SIZE) as u64);
+        let mapping = Mapping { phys: *phys, flags };
+        let aspace = match spaces.get_mut(asid) {
+            Some(a) => a,
+            None => {
+                undo_installed_locked(spaces, asid, &out[..i]);
+                return Err((i, KernelError::Vm(VmError::InvalidAsid)));
+            }
+        };
+        match aspace.map_page(virt, mapping) {
+            Ok(replaced) => {
+                out[i] = InstalledPage {
+                    virt,
+                    inserted: *phys,
+                    replaced,
+                };
+            }
+            Err(e) => {
+                undo_installed_locked(spaces, asid, &out[..i]);
+                return Err((i, KernelError::Vm(e)));
+            }
+        }
+    }
+    Ok(objects.len())
+}
+
+/// The undo half, inside the SAME acquisition as the install — and the same body the mint-phase
+/// rollback reaches through `undo_installed_range`, so a mapping is removed by exactly one
+/// implementation whichever phase failed.
+///
+/// Each page is returned to exactly the state the install found it in: the displaced mapping is
+/// re-installed verbatim, and a page that displaced nothing is removed. A failure here cannot be
+/// propagated — the acquisition is the transaction — so a re-install that refuses leaves the page
+/// unmapped, which is strictly safer than leaving this transaction's frame reachable.
+pub(crate) fn undo_installed_locked(
+    spaces: &mut crate::kernel::vm::AddressSpaceManager,
+    asid: Asid,
+    installed: &[InstalledPage],
+) {
+    let Some(aspace) = spaces.get_mut(asid) else {
+        return;
+    };
+    for page in installed.iter().rev() {
+        match page.replaced {
+            Some(old) => {
+                let _ = aspace.map_page(page.virt, old);
+            }
+            None => {
+                let _ = aspace.unmap_page(page.virt);
+            }
+        }
+    }
+}
+
+/// rank 6: take the MAP reference on every frame this run installed.
+///
+/// Called BEFORE the mint. `reclaim_memory_object_if_unreferenced_locked` frees an object only
+/// when its cap, map and pin refcounts are ALL zero, so once this has run the object cannot be
+/// reclaimed through the capability domain at all — which is precisely what makes "a sibling
+/// revoking the provisional cap cannot free mapped backing" an invariant of the phase order
+/// rather than a claim about which actors exist.
+pub(crate) fn note_inserted_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    installed: &[InstalledPage],
+) {
+    for page in installed {
+        KernelState::note_mapping_inserted_locked(memory, page.inserted);
+    }
+}
+
+/// rank 6: the exact inverse of [`note_inserted_locked`], for the mint-phase rollback. Run only
+/// after the PTEs are gone, so a frame is never reclaimable while it is still mapped.
+pub(crate) fn unnote_inserted_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    installed: &[InstalledPage],
+) {
+    for page in installed {
+        KernelState::note_mapping_removed_locked(memory, page.inserted);
+    }
+}
+
+/// rank 6: the accounting a COMMITTED run owes for what it displaced — the COW clear and
+/// `map_refcount--` for every mapping it replaced. Reclaim of a displaced frame is deliberately
+/// NOT here: it happens only after that page's shootdown completes.
+///
+/// Kept apart from [`note_inserted_locked`] because it is not reversible: `clear_cow_page_locked`
+/// destroys a mark this transaction cannot restore, so it must not run on any path that can still
+/// put the displaced mappings back.
+pub(crate) fn settle_displaced_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    asid: Asid,
+    installed: &[InstalledPage],
+) {
+    for page in installed {
+        if let Some(old) = page.replaced {
+            KernelState::clear_cow_page_locked(memory, asid, page.virt);
+            KernelState::note_mapping_removed_locked(memory, old.phys);
+        }
+    }
+}
+
+/// rank 4, ONE acquisition: release a provisional capability if and only if it is STILL this
+/// transaction's exclusive childless leaf.
+///
+/// Three checks, all inside this one acquisition, because exclusivity established in an earlier
+/// acquisition says nothing about this one:
+///
+/// 1. the slot resolves for this exact `CapId` — which carries the slot GENERATION, so a slot
+///    that was retired and re-minted fails here rather than being mistaken for ours;
+/// 2. it holds this exact `MemoryObject { id }` — so a same-generation reuse for a different
+///    object fails too;
+/// 3. no delegation link names this cap, and `delete_if_leaf` finds no in-cspace child.
+///
+/// Anything else returns without touching a thing: the slot now belongs to whoever derived it,
+/// and removing it would destroy another transaction's resource. That is a retained frame, not a
+/// leaked one — it is still referenced, so its object stays alive and is reclaimed with its last
+/// reference.
+pub(crate) fn release_provisional_frame_cap_locked(
+    capability: &mut crate::kernel::boot::CapabilitySubsystem,
+    cnode: crate::kernel::capabilities::CNodeId,
+    frame: ProvisionalFrame,
+) -> ProvisionalReleaseOutcome {
+    use crate::kernel::boot::kernel_mut;
+    // (3a) A delegation link naming this cap makes it non-exclusive. Conservative on purpose: the
+    // numeric match alone is enough to decline, and declining never removes anything.
+    if kernel_ref_links(capability)
+        .iter()
+        .flatten()
+        .any(|link| link.source_cap == frame.cap)
+    {
+        return ProvisionalReleaseOutcome::Derived;
+    }
+    let Some(space) = capability
+        .cnode_spaces
+        .iter_mut()
+        .flatten()
+        .find(|space| space.id == cnode)
+    else {
+        return ProvisionalReleaseOutcome::NotOurs;
+    };
+    let cspace = kernel_mut(&mut space.cspace);
+    // (1)+(2) exact slot generation, exact object.
+    match cspace.get(frame.cap) {
+        Some(capability) => {
+            let expected = CapObject::MemoryObject {
+                id: frame.object_id,
+            };
+            if capability.object != expected {
+                return ProvisionalReleaseOutcome::NotOurs;
+            }
+        }
+        None => return ProvisionalReleaseOutcome::NotOurs,
+    }
+    // (3b) the in-cspace derivation check, and the removal, in one step.
+    match cspace.delete_if_leaf(frame.cap) {
+        Ok(true) => ProvisionalReleaseOutcome::Released,
+        Ok(false) => ProvisionalReleaseOutcome::Derived,
+        Err(_) => ProvisionalReleaseOutcome::NotOurs,
+    }
+}
+
+fn kernel_ref_links(
+    capability: &crate::kernel::boot::CapabilitySubsystem,
+) -> &[Option<crate::kernel::boot::DelegatedCapabilityLink>] {
+    crate::kernel::boot::kernel_ref(&capability.delegated_capability_links).as_slice()
+}
+
+impl VmBrkOwners for BroadVmOwners<'_> {
+    fn caller_tid(&self) -> Option<u64> {
+        self.kernel.current_tid()
+    }
+    fn is_group_leader(&self, tid: u64) -> bool {
+        self.kernel.is_thread_group_leader(tid)
+    }
+    fn caller_asid(&self, tid: u64) -> Option<Asid> {
+        self.kernel.task_asid(tid)
+    }
+    fn brk_bounds(&self, tid: u64) -> Option<(usize, usize)> {
+        self.kernel.task_brk_bounds(tid)
+    }
+    fn task_exists(&self, tid: u64) -> bool {
+        self.kernel
+            .with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid))
+    }
+    fn set_brk_bounds(&mut self, tid: u64, base: usize, end: usize) -> Result<(), KernelError> {
+        self.kernel.set_task_brk_bounds(tid, base, end)
+    }
+    fn unmap_brk_range(
+        &mut self,
+        asid: Asid,
+        start: usize,
+        end: usize,
+    ) -> Result<usize, KernelError> {
+        // The delivered two-phase shrink owner, unchanged: PTE remove → shootdown wait → reclaim.
+        // The delivered two-phase shrink owner, unchanged: PTE remove -> shootdown wait ->
+        // reclaim. Its second lane is the shootdown count, which the transaction does not need.
+        self.kernel
+            .vm_brk_shrink_two_phase(asid, start, end)
+            .map(|(pages_unmapped, _shootdowns)| pages_unmapped)
+    }
+    fn note_brk(&mut self, shape: BrkShape, pages_unmapped: usize) {
+        let _ = (shape, pages_unmapped);
     }
 }
 
@@ -100,98 +443,15 @@ pub(super) fn handle_vm_map(
     let addr = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
     let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
-    let (map_len, end, flags) = validate_anon_map_args(addr, len, prot)?;
-    // Stage 7: extract ASID from aspace_map_cap (the capability target) so that the
-    // stack guard check looks at the same address space as the map loop. The old
-    // check_stack_guard used is_user_page_mapped_in_current_asid, which would differ
-    // from the map target if aspace_map_cap refers to a different address space.
-    let map_asid = {
-        let cap = kernel
-            .capability_service()
-            .resolve_current_task_capability(aspace_map_cap)
-            .ok_or(SyscallError::from(KernelError::InvalidCapability))?;
-        match cap.object {
-            CapObject::AddressSpace { asid } => Asid(asid),
-            _ => return Err(SyscallError::from(KernelError::WrongObject)),
-        }
-    };
-    // Explicit-ASID guard check (same condition as check_stack_guard / handle_vm_anon_map):
-    // reject write-only mappings when the page immediately below addr is already mapped.
-    if flags.write
-        && !flags.execute
-        && let Some(guard_page) = addr.checked_sub(PAGE_SIZE)
-        && kernel
-            .is_user_page_mapped_in_asid(map_asid, VirtAddr(guard_page as u64))
-            .map_err(SyscallError::from)?
-    {
-        return Err(SyscallError::InvalidArgs);
-    }
-    // Stage 10: use map_asid (resolved plan-first above) directly instead of
-    // re-resolving from aspace_map_cap on every page. Track mapped_end for
-    // rollback symmetry: on alloc or map failure, rollback_anon_map revokes
-    // caps and reclaims frames for [addr, mapped_end) — same two-phase pattern
-    // as handle_vm_anon_map. Anonymous memory is always allocated in the
-    // current task's cnode regardless of which address space it is mapped into.
-    // Stage 172 (VM-COW): default-off map phase markers. Diagnostic only — the
-    // two-phase `rollback_anon_map` transaction below is UNCHANGED.
-    let vm_cow = crate::kernel::boot::vm_cow_enabled();
-    if vm_cow {
-        crate::yarm_log!(
-            "VM_MAP_PHASE_METADATA asid={} addr=0x{:x} len={}",
-            map_asid.0,
-            addr,
-            map_len
-        );
-    }
-    let mut mapped_end = addr;
-    while mapped_end < end {
-        let (_, mem_cap) = match kernel.alloc_anonymous_memory_object() {
-            Ok(pair) => pair,
-            Err(e) => {
-                rollback_anon_map(kernel, map_asid, addr, mapped_end, None);
-                if vm_cow {
-                    crate::yarm_log!(
-                        "VM_MAP_ROLLBACK_OK asid={} addr=0x{:x} reason=frame_alloc",
-                        map_asid.0,
-                        addr
-                    );
-                }
-                return Err(SyscallError::from(e));
-            }
-        };
-        if let Err(e) = kernel.map_user_page_in_asid_with_caps(
-            map_asid,
-            mem_cap,
-            VirtAddr(mapped_end as u64),
-            flags,
-        ) {
-            rollback_anon_map(kernel, map_asid, addr, mapped_end, Some(mem_cap));
-            if vm_cow {
-                crate::yarm_log!(
-                    "VM_MAP_ROLLBACK_OK asid={} addr=0x{:x} reason=pt_update",
-                    map_asid.0,
-                    addr
-                );
-            }
-            return Err(SyscallError::from(e));
-        }
-        mapped_end += PAGE_SIZE;
-    }
-    if vm_cow {
-        crate::yarm_log!(
-            "VM_MAP_PHASE_FRAME_ALLOC asid={} addr=0x{:x} len={}",
-            map_asid.0,
-            addr,
-            map_len
-        );
-        crate::yarm_log!(
-            "VM_MAP_PHASE_PT_UPDATE asid={} addr=0x{:x} len={}",
-            map_asid.0,
-            addr,
-            map_len
-        );
-    }
-    frame.set_ok(addr, map_len, 0);
+    let mut owners = BroadVmOwners { kernel };
+    let (base, map_len) = run_vm_map_transaction(
+        &mut owners,
+        MapTarget::Capability(aspace_map_cap),
+        addr,
+        len,
+        prot,
+    )?;
+    frame.set_ok(base, map_len, 0);
     Ok(())
 }
 
@@ -202,77 +462,10 @@ pub(super) fn handle_vm_anon_map(
     let addr = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
     let prot = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
-    let (map_len, end, flags) = validate_anon_map_args(addr, len, prot)?;
-
-    // Stage 6 plan-first; Stage 9: captured in VmAnonMapProgressPlan so all fields
-    // (tid, asid, validated args, mapped_end progress) are explicit in one struct.
-    let tid = current_tid(kernel)?;
-    let asid = kernel
-        .task_asid(tid)
-        .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
-    let mut plan = VmAnonMapProgressPlan {
-        validated: VmAnonMapValidatedArgs {
-            addr,
-            map_len,
-            end,
-            flags,
-        },
-        tid,
-        asid,
-        progress: VmPageMapProgress {
-            base_addr: addr,
-            mapped_end: addr,
-            end_addr: end,
-        },
-    };
-
-    // Stage 6: explicit-ASID stack guard check using the plan-first ASID.
-    // Guard fires iff flags.write && !flags.execute && the page below addr is mapped.
-    if plan.validated.flags.write
-        && !plan.validated.flags.execute
-        && let Some(guard_page) = plan.validated.addr.checked_sub(PAGE_SIZE)
-        && kernel
-            .is_user_page_mapped_in_asid(plan.asid, VirtAddr(guard_page as u64))
-            .map_err(SyscallError::from)?
-    {
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    while plan.progress.mapped_end < plan.progress.end_addr {
-        let va = plan.progress.mapped_end;
-        let (_, mem_cap) = match kernel.alloc_anonymous_memory_object() {
-            Ok(pair) => pair,
-            Err(e) => {
-                // Stage 9: alloc failure — no unmapped cap (alloc itself failed).
-                rollback_anon_map(
-                    kernel,
-                    plan.asid,
-                    plan.progress.base_addr,
-                    plan.progress.mapped_end,
-                    None,
-                );
-                return Err(SyscallError::from(e));
-            }
-        };
-        if let Err(e) = kernel.map_user_page_in_asid_with_caps(
-            plan.asid,
-            mem_cap,
-            VirtAddr(va as u64),
-            plan.validated.flags,
-        ) {
-            // Stage 9: map failure — mem_cap was allocated but not mapped; pass it for revoke.
-            rollback_anon_map(
-                kernel,
-                plan.asid,
-                plan.progress.base_addr,
-                plan.progress.mapped_end,
-                Some(mem_cap),
-            );
-            return Err(SyscallError::from(e));
-        }
-        plan.progress.mapped_end += PAGE_SIZE;
-    }
-    frame.set_ok(plan.validated.addr, plan.validated.map_len, 0);
+    let mut owners = BroadVmOwners { kernel };
+    let (base, map_len) =
+        run_vm_map_transaction(&mut owners, MapTarget::CallerAddressSpace, addr, len, prot)?;
+    frame.set_ok(base, map_len, 0);
     Ok(())
 }
 
@@ -280,67 +473,9 @@ pub(super) fn handle_vm_brk(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    let tid = current_tid(kernel)?;
-    // Stage 5B plan-first: snapshot task domain (rank 2) before memory
-    // mutation (rank 6). When the global lock is removed, this read moves to
-    // before the with_cpu() call via split-read on SharedKernel.
-    let plan = VmBrkPlan {
-        tid,
-        is_group_leader: kernel.is_thread_group_leader(tid),
-    };
-    if !plan.is_group_leader {
-        return Err(SyscallError::InvalidArgs);
-    }
-
     let requested = frame.arg(SYSCALL_ARG_CAP);
-    if requested == 0 {
-        let current_end = kernel
-            .task_brk_bounds(plan.tid)
-            .map(|(_, end)| end)
-            .unwrap_or(0);
-        frame.set_ok(current_end, 0, 0);
-        return Ok(());
-    }
-
-    validate_user_region(requested as u64, 1)?;
-    let (base, current_end) = kernel
-        .task_brk_bounds(plan.tid)
-        .ok_or(SyscallError::InvalidArgs)?;
-    if requested < base {
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    if requested < current_end {
-        let unmap_start = round_up_page(requested)?;
-        let unmap_end = round_up_page(current_end)?;
-        if unmap_start < unmap_end {
-            // VALIDATION: D3_LIVE_SPLIT (Stage 107)
-            // Stage 5F two-phase shrink: resolve ASID once before the helper
-            // call (plan-first: snapshot task rank 2 before vm+memory
-            // mutation). Stage 107 routes the per-page two-phase loop into
-            // the typed `vm_brk_shrink_two_phase` helper in memory_state.rs
-            // — observability + future SharedKernel seam anchor. The per-page
-            // ordering (Phase 1 PTE remove → Phase 2 TLB shootdown wait →
-            // Phase 3 frame reclaim, via execute_tlb_shootdown_wait_plan)
-            // is byte-identical to the pre-Stage-107 inline loop. See
-            // doc/KERNEL_UNLOCKING.md
-            let asid = kernel
-                .task_asid(plan.tid)
-                .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
-            kernel
-                .vm_brk_shrink_two_phase(asid, unmap_start, unmap_end)
-                .map_err(SyscallError::from)?;
-        }
-    }
-
-    // Staged VM_BRK behavior: tracked per-task. Growth requires
-    // pre-initialized brk bounds to avoid creating an empty [base,end) window
-    // from unset state. Heap pages are still allocated lazily by demand-fault
-    // mapping in [base, end). Shrink updates the byte-granular brk after all
-    // page-granular unmap bookkeeping succeeds.
-    kernel
-        .set_task_brk_bounds(tid, base, requested)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(requested, 0, 0);
+    let mut owners = BroadVmOwners { kernel };
+    let result = run_vm_brk_transaction(&mut owners, requested)?;
+    frame.set_ok(result, 0, 0);
     Ok(())
 }
