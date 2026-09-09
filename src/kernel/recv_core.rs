@@ -570,7 +570,7 @@ pub enum RecvOutcome {
 /// rank-4 split-wired yet. D1 (Stage 102+) splits Phase A (rank 3 dequeue
 /// here) from Phase B (rank 4 materialize) from Phase C (writeback).
 /// See doc/KERNEL_UNLOCKING.md
-fn extract_cap_transfer_plan(msg: &Message) -> Option<RecvCapTransferPlan> {
+pub(crate) fn extract_cap_transfer_plan(msg: &Message) -> Option<RecvCapTransferPlan> {
     let raw_handle = msg.transferred_cap()?.0;
     let is_reply_cap = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
     Some(RecvCapTransferPlan {

@@ -4845,7 +4845,7 @@ impl SharedKernel {
     /// Nothing is strengthened: no endpoint identity, ASID, wait generation, `WaiterKey` or
     /// ownership state is consulted. This stays the existing generic sender wake.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn apply_split_sender_wake_plan_split(
+    pub(crate) fn apply_split_sender_wake_plan_split(
         &self,
         cpu: CpuId,
         target: crate::kernel::ipc::SenderWakeTarget,
@@ -7574,6 +7574,161 @@ impl SharedKernel {
     /// A shared-region envelope (`pinned_object.is_some()`) is NOT serviced here: it owes a rank-6
     /// pin release this transaction deliberately does not perform. Its arrival is a routing bug, so
     /// it fails closed rather than being half-settled.
+    // ── U9-XFER2 §3 — the rank-local seams NR 30's split route needs ────────────────────────
+    //
+    // Each wraps an EXISTING rank-local body in the matching `_split` acquisition. None copies
+    // bytes, resolves a capability or dequeues a message in a way the broad path does not.
+
+    /// rank 3 — liveness of a capability's object, the split twin of
+    /// `KernelState::capability_object_live` for the classes NR 30 can name.
+    pub(crate) fn capability_object_live_split(
+        &self,
+        object: crate::kernel::capabilities::CapObject,
+    ) -> Option<()> {
+        use crate::kernel::capabilities::CapObject;
+        match object {
+            CapObject::Endpoint { index, generation } => self.with_ipc_split_mut(|ipc| {
+                (index < ipc.endpoint_generations.len()
+                    && ipc.endpoint_generations[index] == generation)
+                    .then_some(())
+            }),
+            CapObject::Notification { index, generation } => self.with_ipc_split_mut(|ipc| {
+                (index < ipc.notification_generations.len()
+                    && ipc.notification_generations[index] == generation)
+                    .then_some(())
+            }),
+            CapObject::Reply { index, generation } => self.with_ipc_split_mut(|ipc| {
+                (index < ipc.reply_cap_generations.len()
+                    && ipc.reply_cap_generations[index] == generation)
+                    .then_some(())
+            }),
+            // Every other class has no generation to compare; the broad form treats them as live.
+            _ => Some(()),
+        }
+    }
+
+    /// rank 3 — the NON-CONSUMING head read.
+    pub(crate) fn peek_queued_with_cap_transfer_split(
+        &self,
+        endpoint_idx: usize,
+    ) -> crate::kernel::boot::IpcEndpointPeekResult {
+        self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::ipc_peek_queued_with_cap_transfer_locked(ipc, endpoint_idx)
+        })
+    }
+
+    /// ONE rank-3 acquisition — the identity-checked consume.
+    pub(crate) fn commit_peeked_recv_with_cap_transfer_split(
+        &self,
+        endpoint_idx: usize,
+        expected: &crate::kernel::ipc::Message,
+    ) -> crate::kernel::boot::IpcEndpointRecvResult {
+        self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::commit_peeked_recv_with_cap_transfer_locked(
+                ipc,
+                endpoint_idx,
+                expected,
+            )
+        })
+    }
+
+    /// rank 4 (+3, +6) — NR 30's cap materialization, routed exactly as
+    /// `materialize_received_message_cap_routed` routes it: a genuine `FLAG_REPLY_CAP` message
+    /// goes to the D5 reply arm, everything else to the D1 ordinary arm, and a message with no
+    /// transfer mints nothing.
+    pub(crate) fn materialize_received_message_cap_split(
+        &self,
+        endpoint: crate::kernel::capabilities::CapObject,
+        receiver_tid: u64,
+        _sender_tid: u64,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<Option<u64>, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::ipc::Message;
+        let Some(handle) = msg.transferred_cap().map(|c| c.0) else {
+            return Ok(None);
+        };
+        let CapObject::Endpoint { index, .. } = endpoint else {
+            return Err(crate::kernel::syscall::SyscallError::WrongObject);
+        };
+        if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+            let materialized = self.materialize_reply_cap_split(index, receiver_tid, handle)?;
+            return Ok(Some(materialized.cap.0));
+        }
+        let cap = self.materialize_ordinary_cap_split(index, receiver_tid, handle)?;
+        Ok(Some(cap.0))
+    }
+
+    /// rank 6 — a memory object's length, for the output record's `exact_object_size`.
+    pub(crate) fn memory_object_len_split(
+        &self,
+        object: crate::kernel::capabilities::CapObject,
+    ) -> u64 {
+        use crate::kernel::capabilities::CapObject;
+        let CapObject::MemoryObject { id } = object else {
+            return 0;
+        };
+        self.with_memory_split_mut(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.len as u64)
+                .unwrap_or(0)
+        })
+    }
+
+    /// rank 6 — a memory object's physical base.
+    pub(crate) fn memory_object_phys_by_id_split(
+        &self,
+        id: u64,
+    ) -> Option<crate::kernel::vm::PhysAddr> {
+        self.with_memory_split_mut(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.phys)
+        })
+    }
+
+    /// rank 5 → rank 6 — install one page, through the SAME rank-local body the broad
+    /// `map_user_page_in_asid_raw` uses.
+    pub(crate) fn map_user_page_raw_split(
+        &self,
+        asid: crate::kernel::vm::Asid,
+        virt: crate::kernel::vm::VirtAddr,
+        mapping: crate::kernel::vm::Mapping,
+    ) -> bool {
+        self.with_vm_then_memory_split_mut(|vm, memory| {
+            crate::kernel::boot::vm_image_locked::map_user_page_in_asid_raw_locked(
+                vm, memory, asid, virt, mapping,
+            )
+            .is_ok()
+        })
+    }
+
+    /// rank 3 — register the active-transfer entry, through the existing locked body.
+    pub(crate) fn register_active_transfer_mapping_split(
+        &self,
+        owner_tid: crate::kernel::ipc::ThreadId,
+        transfer_cap: crate::kernel::capabilities::CapId,
+        base: crate::kernel::vm::VirtAddr,
+        len: usize,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            crate::kernel::boot::KernelState::register_active_transfer_mapping_locked(
+                ipc,
+                owner_tid,
+                transfer_cap,
+                base,
+                len,
+            )
+        })
+    }
+
     pub(crate) fn materialize_reply_cap_split(
         &self,
         endpoint_idx: usize,

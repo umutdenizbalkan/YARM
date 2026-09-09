@@ -927,6 +927,10 @@ pub fn handle_riscv_trap_entry_shared(
             // it unmaps a range, revokes a capability and returns to the same caller — so it
             // finalizes through the same same-task ecall writeback the three above it use.
             || nr == crate::kernel::syscall::SYSCALL_TRANSFER_RELEASE_NR
+            // U9-XFER2 §3: NR 30 `RecvSharedV3`, on the same terms. It is NON-SWITCHING for
+            // the receiver — it may wake a blocked SENDER, but the caller itself returns
+            // normally — so it finalizes through the same same-task ecall writeback.
+            || nr == crate::kernel::syscall::SYSCALL_RECV_SHARED_V3_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without

@@ -9,6 +9,10 @@ mod capability_lifecycle_state;
 /// U9-XFER2 §2 — NR 4's revoke reservation and its commit outcome cross the module boundary,
 /// because the transaction carries the reservation from phase V into phase R.
 pub(crate) use capability_lifecycle_state::{SplitRevokeCommitOutcome, SplitRevokeReservation};
+/// U9-XFER2 §3 — NR 30's peek and identity-checked commit, reached by both routes.
+pub(crate) use ipc_state::{
+    commit_peeked_recv_with_cap_transfer_locked, ipc_peek_queued_with_cap_transfer_locked,
+};
 mod capability_service_state;
 mod capability_state;
 mod capacity_state;

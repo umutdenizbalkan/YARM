@@ -326,7 +326,10 @@ pub(crate) mod exit_txn;
 pub(crate) mod fork_txn;
 pub(crate) mod process;
 pub(crate) mod reap_txn;
-mod recv_shared_v3;
+pub(crate) mod recv_shared_v3;
+/// U9-XFER2 §3 — THE RecvSharedV3 transaction (NR 30), shared by both adapters.
+pub(crate) mod recv_v3_split;
+pub(crate) mod recv_v3_txn;
 mod sched;
 // U9-SPAWN1 SP-3: the ONE compensated image-loading spawn transaction, shared by NR 23, 24, 26
 // and 29. `pub(crate)` so the split route and the hosted failure-injection proofs reach the same

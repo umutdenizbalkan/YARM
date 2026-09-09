@@ -47546,8 +47546,38 @@ mod stage186e_vm_user_copy_seam {
     // borrow is dropped. The under-global-lock syscall/IPC files below must
     // STILL never call the copy seam: inside them a broad `&mut KernelState`
     // is live and the data_ptr()-derived seam would alias it (Stage 186D4).
+    //
+    // U9-XFER2 §1/§3 — the CLAIM is unchanged; the file list is corrected.
+    //
+    // The property this guard protects is aliasing: a `data_ptr()`-derived seam must not run
+    // while a broad `&mut KernelState` is live. `syscall_split.rs` was on the list because
+    // nothing in it called the seam, not because it holds such a borrow — it is the PRE-LOCK
+    // route and holds `&SharedKernel`, which is the whole reason it exists. NR 30's split route
+    // calls the seam there deliberately, and the aliasing property is asserted positively below
+    // rather than approximated by a filename.
     #[test]
     fn stage186e_seam_not_wired_live() {
+        // The pre-lock route may call the seam — and must never hold the borrow that would make
+        // that unsound. Asserted directly.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(
+            SPLIT_SRC
+                .contains("fn try_split_recv_shared_v3_into_frame(\n    shared: &SharedKernel,"),
+            "the NR 30 pre-lock route must take `&SharedKernel`"
+        );
+        let split_code: alloc::string::String = SPLIT_SRC
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !split_code.contains("&mut KernelState"),
+            "no pre-lock route may hold a broad `&mut KernelState`: that is exactly the borrow \
+             the data_ptr()-derived copy seam would alias"
+        );
         for (name, src) in [
             ("ipc_state.rs", include_str!("ipc_state.rs")),
             ("../syscall.rs", include_str!("../syscall.rs")),
@@ -47556,7 +47586,6 @@ mod stage186e_vm_user_copy_seam {
                 "../syscall/ipc_recv_core.rs",
                 include_str!("../syscall/ipc_recv_core.rs"),
             ),
-            ("../syscall_split.rs", include_str!("../syscall_split.rs")),
         ] {
             for helper in [
                 "copy_to_user_split(",
@@ -62934,7 +62963,8 @@ mod stage191e_dispatch_next_candidate_seam {
             // U9-MO2 §4 removed NR 28 from this list. Stage 191E's claim is that the CANDIDATE
             // SEAM adds no live class — it does not, and did not, own the whitelist's contents;
             // NR 28's admission came from §4 and is pinned by its own guards.
-            "Syscall::RecvSharedV3 => Some",
+            // U9-XFER2 §3 removed NR 30 from this list. Stage 191E's claim is untouched: the
+            // CANDIDATE SEAM adds no live class, and NR 30's admission came from U9-XFER2 §3.
             // U9-REAP1 §4 removed NR 31. Stage 191E's claim is unaffected and unchanged: the
             // CANDIDATE SEAM adds no live class, and NR 31's admission came from §4, not from it.
         ] {
@@ -73920,14 +73950,27 @@ mod stage195a_aarch64_debuglog_live {
                 "AArch64 imports `{present}` — it has a TOTAL pre-lock route"
             );
         }
-        // The selectivity claim this case owns is unchanged; the stand-in moves again rather than
-        // the claim. NR 30 `RecvSharedV3` is the one still without a pre-lock route.
-        for absent in ["SYSCALL_RECV_SHARED_V3_NR"] {
-            assert!(
-                !body.contains(absent),
-                "the import must stay a whitelist: `{absent}` has no pre-lock route"
-            );
-        }
+        // U9-XFER2 §3: NR 30 now has a pre-lock route too, so it joins the import list.
+        assert!(
+            body.contains("SYSCALL_RECV_SHARED_V3_NR"),
+            "AArch64 imports NR 30 — it has a TOTAL pre-lock route"
+        );
+        // The SELECTIVITY claim this case owns is what matters, and it is asserted directly
+        // rather than through a stand-in that keeps being converted: the import is a whitelist,
+        // not "every syscall". `IpcRecv` (NR 2) is the standing example — its user-ASID cohort
+        // still has no pre-lock route.
+        assert!(
+            !body.contains("SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR"),
+            "the import must stay a whitelist: NR 8 is not on it — its split route decides \
+             eligibility from ARGUMENTS, so importing the ABI would not help it"
+        );
+        let imported = body
+            .matches("raw_nr == crate::kernel::syscall::SYSCALL_")
+            .count();
+        assert!(
+            imported < crate::kernel::syscall::SYSCALL_COUNT,
+            "the import list must remain strictly smaller than the syscall table"
+        );
         // NR 0 is the one entry for which the whitelist alone is not sufficient, because an
         // UNLISTED syscall leaves the frame reading `nr = 0` — which is Yield's own number. The
         // split route must therefore read the raw x8 rather than the frame's decoded number, or it
@@ -115015,6 +115058,8 @@ mod stage199d_riscv_canonical_admission {
             // U9-XFER1 §3: NR 4 `TransferRelease`, on the same terms — non-switching, and this
             // list is what decides whether the shared dispatcher is consulted at all.
             "SYSCALL_TRANSFER_RELEASE_NR",
+            // U9-XFER2 §3: NR 30 `RecvSharedV3`, the second half of the residual.
+            "SYSCALL_RECV_SHARED_V3_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -115026,13 +115071,14 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            17,
-            "exactly seventeen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            18,
+            "exactly eighteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
              SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask, \
              (U9-EXIT1 §5) ExitCurrentTask, (U9-RESIDUAL1 §3) Yield and (U9-VM-ENTRY1) \
-             VmMap + VmAnonMap + VmBrk and (U9-XFER1 §3) TransferRelease"
+             VmMap + VmAnonMap + VmBrk and (U9-XFER1 §3) TransferRelease \
+             plus (U9-XFER2 §3) RecvSharedV3"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -141386,7 +141432,10 @@ mod u9f_split_capability_revocation {
                 "register_active_transfer_mapping(",
                 1,
             ),
-            (RUNTIME, "register_active_transfer_mapping_locked(", 1),
+            // U9-XFER2 §3 added the second: `SharedKernel::register_active_transfer_mapping_split`,
+            // NR 30's off-lock registration seam. The admission proof is re-derived below rather
+            // than the count merely bumped.
+            (RUNTIME, "register_active_transfer_mapping_locked(", 2),
         ];
         for (src, needle, expected) in sites {
             assert_eq!(
@@ -141396,6 +141445,33 @@ mod u9f_split_capability_revocation {
                  must be re-derived before this test is updated"
             );
         }
+        // THE re-derivation. A Notification still cannot reach a registration, because NR 30's
+        // split route registers only after `region_phys_start` resolved a physical base — and
+        // that owner matches `DmaRegion` and `MemoryObject` and nothing else.
+        const V3_SPLIT: &str = include_str!("../syscall/recv_v3_split.rs");
+        let phys = V3_SPLIT
+            .split_once("fn region_phys_start(")
+            .map(|(_, r)| r.split_once("\n    fn ").map_or(r, |(b, _)| b))
+            .expect("the split route must resolve a region base");
+        assert!(
+            phys.contains("CapObject::DmaRegion { id, offset, .. } => (id, offset)")
+                && phys.contains("CapObject::MemoryObject { id } => (id, 0u64)")
+                && phys.contains("_ => return None"),
+            "the split route's region resolver must admit only DmaRegion and MemoryObject"
+        );
+        // …and the transaction registers only on the path that resolved one.
+        const V3_TXN: &str = include_str!("../syscall/recv_v3_txn.rs");
+        let txn = code_of(V3_TXN);
+        let resolve = txn
+            .find("owners.region_phys_start(cap_id)")
+            .expect("the resolve must precede the register");
+        let register = txn
+            .find("owners.register_transfer(")
+            .expect("the register must exist");
+        assert!(
+            resolve < register,
+            "the object gate must precede the registration, so a Notification can never reach it"
+        );
     }
 
     // ── (4) THE ADMISSION CONDITION: Notification is production-UNREACHABLE here ────────────
@@ -171392,6 +171468,8 @@ mod u9xfer1_ownership_cases {
     const XFER_SPLIT: &str = include_str!("../syscall/xfer_split.rs");
     const CAP: &str = include_str!("../syscall/cap.rs");
     const RECV_V3: &str = include_str!("../syscall/recv_shared_v3.rs");
+    const V3_TXN: &str = include_str!("../syscall/recv_v3_txn.rs");
+    const V3_SPLIT: &str = include_str!("../syscall/recv_v3_split.rs");
     const IPC_STATE: &str = include_str!("ipc_state.rs");
     const LIFECYCLE: &str = include_str!("capability_lifecycle_state.rs");
     const SPLIT: &str = include_str!("../syscall_split.rs");
@@ -171708,30 +171786,31 @@ mod u9xfer1_ownership_cases {
 
     // ── NR 30: the message is not consumed until everything fallible has succeeded ──────────
 
-    /// THE defect. The dequeue used to be the FIRST thing that happened after validation, and the
-    /// sender wake the second — both ahead of the cap mint, the mapping plan, the page mapping and
-    /// the registry entry. Every one of those failures destroyed the message and settled the
-    /// sender while returning an error.
+    /// THE defect, and where it now lives. The dequeue used to be the FIRST thing after
+    /// validation and the sender wake the second, both ahead of the cap mint, the mapping plan,
+    /// the phys/ASID resolution, the page mapping and the registry entry. U9-XFER2 §3 moved the
+    /// body into the shared transaction, so the ordering is asserted there — and it is now ONE
+    /// body serving both routes rather than a broad handler a split route would have to mirror.
     #[test]
     fn nr30_everything_fallible_precedes_the_consume() {
-        let handler = code_only(body_of(
-            RECV_V3,
-            "pub(super) fn handle_recv_shared_v3(",
-            "\npub(super) fn ",
+        let txn = code_only(body_of(
+            V3_TXN,
+            "pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(",
+            "/// Undo exactly what this transaction owns",
         ));
-        let peek = handler
-            .find("peek_recv_core_user_plain(kernel, &request, endpoint)")
+        let peek = txn
+            .find("owners.peek_head(endpoint_idx)")
             .expect("the head must be PEEKED, not dequeued");
-        let commit = handler
-            .find("kernel.commit_peeked_recv_with_cap_transfer(")
+        let commit = txn
+            .find("owners.commit_peeked(&head)")
             .expect("the consume must be an explicit commit");
         for fallible in [
-            "materialize_received_message_cap(",
+            "owners.materialize_cap(",
             "compute_recv_v3_mapping_plan(",
-            "map_user_page_in_asid_raw(",
-            "register_active_transfer_mapping(",
+            "owners.map_page(",
+            "owners.register_transfer(",
         ] {
-            let at = handler
+            let at = txn
                 .find(fallible)
                 .unwrap_or_else(|| panic!("`{fallible}` must be present"));
             assert!(at > peek, "`{fallible}` must follow the peek");
@@ -171741,59 +171820,69 @@ mod u9xfer1_ownership_cases {
                  destroys the sender's message"
             );
         }
-        // The consuming core is gone from this route entirely.
-        assert!(
-            !handler.contains("try_recv_core_user_plain("),
-            "NR 30 must not reach the CONSUMING core any more"
-        );
+        for (label, src) in [
+            ("the transaction", V3_TXN),
+            ("the broad adapter", RECV_V3),
+            ("the split adapter", V3_SPLIT),
+        ] {
+            assert!(
+                !code_only(src).contains("try_recv_core_user_plain("),
+                "{label} must not reach the CONSUMING core"
+            );
+        }
     }
 
-    /// The sender is settled by the COMMIT, never by the plan. Waking a sender for a message that
-    /// was never consumed is the second half of the same defect.
+    /// The sender is settled by the COMMIT, EXACTLY ONCE, and never by a compensation path.
     #[test]
     fn nr30_the_sender_is_settled_only_by_the_consume() {
-        let handler = code_only(body_of(
-            RECV_V3,
-            "pub(super) fn handle_recv_shared_v3(",
-            "\npub(super) fn ",
+        let txn = code_only(body_of(
+            V3_TXN,
+            "pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(",
+            "/// Undo exactly what this transaction owns",
         ));
-        let commit = handler
-            .find("kernel.commit_peeked_recv_with_cap_transfer(")
+        let commit = txn
+            .find("owners.commit_peeked(&head)")
             .expect("the commit must exist");
-        let wake = handler
-            .find("kernel.apply_split_sender_wake_plan(")
+        let wake = txn
+            .find("owners.settle_sender(wake)")
             .expect("the wake must exist");
         assert!(
             commit < wake,
             "the sender's wake must follow the consume it reports"
         );
-        // The wake target comes from the commit's own result, not from the peek's plan.
         assert!(
-            handler.contains("let commit_wake = match committed {")
-                && handler.contains("if let Some(wake_tid) = commit_wake {"),
+            txn.contains("V3CommitOutcome::Consumed { wake } => wake"),
             "the wake target must be the one the CONSUME produced"
         );
-        // The peek's plan can never carry one.
-        let peek_core = code_only(body_of(
-            include_str!("../recv_core.rs"),
-            "pub(crate) fn peek_recv_core_user_plain(",
-            "\n/// Perform the user-space copy",
+        assert_eq!(
+            txn.matches("owners.settle_sender(").count(),
+            1,
+            "a sender may be settled from exactly one site"
+        );
+        let rollback = code_only(body_of(
+            V3_TXN,
+            "fn rollback_owned<O: RecvV3Owners>(",
+            "/// Encode the output record",
         ));
         assert!(
-            peek_core.contains("IpcEndpointRecvResult::Received(msg)")
-                && !peek_core.contains("ReceivedWithSenderWake"),
-            "a peek must never produce a sender-wake plan"
+            !rollback.contains("settle_sender"),
+            "compensation must never settle a sender — it never consumed a message"
+        );
+        // The peek CANNOT produce a wake: only the commit outcome carries one.
+        assert!(
+            code_only(V3_TXN)
+                .contains("fn peek_head(&mut self, endpoint_idx: usize) -> Result<Option<Message>"),
+            "the peek owner returns a bare Message, never a plan carrying a wake"
         );
     }
 
-    /// The commit names the message it planned around. A lost race must not consume somebody
-    /// else's message, and must not be reported as a new kind of failure.
+    /// The commit names the message it planned around. A lost race consumes nothing.
     #[test]
     fn nr30_the_commit_consumes_the_peeked_message_or_nothing() {
         let commit = code_only(body_of(
             IPC_STATE,
             "pub(crate) fn commit_peeked_recv_with_cap_transfer_locked(",
-            "\n\npub(crate) fn ipc_try_recv_queued_with_cap_transfer_locked(",
+            "pub(crate) fn ipc_try_recv_queued_with_cap_transfer_locked(",
         ));
         assert!(
             commit.contains("IpcEndpointPeekResult::Peeked(head) if head == *expected"),
@@ -171809,19 +171898,13 @@ mod u9xfer1_ownership_cases {
             mismatch < dequeue,
             "the identity check must precede the dequeue"
         );
-        let arm_end = commit[mismatch..].find('}').expect("arm end");
-        assert!(
-            commit[mismatch..mismatch + arm_end]
-                .contains("return IpcEndpointRecvResult::Ineligible"),
-            "a mismatched head must consume nothing"
-        );
-        // The peek itself mutates nothing at all.
+        // The peek itself mutates nothing.
         let peek = code_only(body_of(
             IPC_STATE,
             "pub(crate) fn ipc_peek_queued_with_cap_transfer_locked(",
-            "\n\n/// U9-XFER1 \u{a7}3 \u{2014} the COMMIT half",
+            "U9-XFER1 \u{a7}3 \u{2014} the COMMIT half",
         ));
-        for mutating in ["endpoint.recv()", "= None", "queue[0] = None", "ep.send("] {
+        for mutating in ["endpoint.recv()", "queue[0] = None", "ep.send("] {
             assert!(
                 !peek.contains(mutating),
                 "the peek must not mutate (`{mutating}` found)"
@@ -171833,78 +171916,85 @@ mod u9xfer1_ownership_cases {
         );
     }
 
-    /// A lost race compensates everything it built, in reverse order, and reports the ABI's
-    /// EXISTING "nothing for you right now" outcome — not a new refusal.
+    /// A lost race compensates ONLY what this transaction owns, in reverse order, and reports the
+    /// ABI's existing `WouldBlock`.
     #[test]
     fn nr30_a_lost_race_compensates_and_reuses_the_existing_outcome() {
-        let handler = code_only(body_of(
-            RECV_V3,
-            "pub(super) fn handle_recv_shared_v3(",
-            "\npub(super) fn ",
+        let txn = code_only(body_of(
+            V3_TXN,
+            "pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(",
+            "/// Undo exactly what this transaction owns",
         ));
-        let arm_start = handler
-            .find("IpcEndpointRecvResult::Ineligible(_) => {")
+        let arm = txn
+            .split_once("V3CommitOutcome::LostRace =>")
+            .map(|(_, r)| r)
             .expect("the lost-race arm must exist");
-        let arm = &handler[arm_start..];
-        let arm_end = arm
+        let end = arm
             .find("return Err(SyscallError::WouldBlock);")
-            .expect("the outcome");
-        let arm = &arm[..arm_end];
+            .expect("outcome");
+        let arm = &arm[..end];
+        assert!(
+            arm.contains("rollback_owned("),
+            "a lost race must compensate what it built"
+        );
+        assert!(
+            !arm.contains("settle_sender"),
+            "a lost race consumed nothing, so it settles nobody"
+        );
+        // `WouldBlock` is what an empty queue already produces — no new refusal.
+        assert!(
+            txn.contains("return Err(SyscallError::WouldBlock);"),
+            "a lost race reuses the ABI's existing empty-queue outcome"
+        );
+        // Compensation touches only owned resources: the transaction's own mapping range, its own
+        // registry entry, its own minted cap.
+        let rollback = code_only(body_of(
+            V3_TXN,
+            "fn rollback_owned<O: RecvV3Owners>(",
+            "/// Encode the output record",
+        ));
         let order = [
-            "kernel.unmap_range_two_phase(",
-            "kernel.remove_active_transfer_mapping(",
-            "kernel.rollback_materialized_recv_cap(",
+            "owners.unmap_range(asid, base.0 as usize, len)",
+            "owners.remove_transfer(reg_cap)",
+            "owners.rollback_cap(cap_id, is_reply)",
         ];
         let mut last = 0usize;
         for needle in order {
-            let at = arm
+            let at = rollback
                 .find(needle)
-                .unwrap_or_else(|| panic!("the lost-race arm must `{needle}`"));
+                .unwrap_or_else(|| panic!("compensation must `{needle}`"));
             assert!(
                 at > last,
                 "`{needle}` must undo in reverse order of construction"
             );
             last = at;
         }
-        // `WouldBlock` is what an empty queue already produces, so this introduces no new refusal.
-        assert!(
-            handler.contains("crate::yarm_log!(\n                        \"RECV_V3_COMMIT_LOST_RACE tid={} cap={}\"")
-                || handler.contains("RECV_V3_COMMIT_LOST_RACE"),
-            "the lost race must be observable, not silent"
-        );
-        assert!(
-            handler.contains("return Err(SyscallError::WouldBlock);"),
-            "a lost race reuses the ABI's existing empty-queue outcome"
-        );
     }
 
     /// Exactly ONE branch still consumes the message and can then fail: the user metadata
-    /// writeback. User memory cannot be un-written, so this is inherent — it is the LAST step, and
-    /// it keeps its existing compensation. Stated rather than claimed away.
+    /// writeback. User memory cannot be un-written, so it is LAST and compensates what remains.
     #[test]
     fn nr30_the_one_remaining_consuming_failure_is_named_and_last() {
-        let handler = code_only(body_of(
-            RECV_V3,
-            "pub(super) fn handle_recv_shared_v3(",
-            "\npub(super) fn ",
+        let txn = code_only(body_of(
+            V3_TXN,
+            "pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(",
+            "/// Undo exactly what this transaction owns",
         ));
-        let commit = handler
-            .find("kernel.commit_peeked_recv_with_cap_transfer(")
+        let commit = txn
+            .find("owners.commit_peeked(&head)")
             .expect("the commit must exist");
-        let writeback = handler
-            .find("let wrote_ok = write_v3_output_to_user(")
+        let writeback = txn
+            .find("let wrote = write_output(")
             .expect("the metadata writeback must exist");
         assert!(
             commit < writeback,
             "the writeback is the only fallible step left after the consume"
         );
-        // …and it still compensates exactly what it did.
-        let after = &handler[writeback..];
+        let after = &txn[writeback..];
         assert!(
-            after.contains("RECV_V3_WRITEBACK_FAIL_ROLLBACK")
-                && after.contains("kernel.unmap_range_two_phase(")
-                && after.contains("kernel.rollback_materialized_recv_cap("),
-            "the writeback failure keeps its existing rollback"
+            after.contains("V3TxnEvent::WritebackFailedAfterCommit")
+                && after.contains("rollback_owned("),
+            "the writeback failure must be reported and must compensate what remains"
         );
     }
 }

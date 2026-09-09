@@ -2483,6 +2483,11 @@ fn try_split_dispatch_nonswitching_into_frame(
     if matches!(syscall, Syscall::TransferRelease) {
         return try_split_transfer_release_into_frame(shared, cpu, frame);
     }
+    // U9-XFER2 §3: NR 30 joins them. Its user copies have off-lock owners, so the whole ABI —
+    // including every error path — is serviced here.
+    if matches!(syscall, Syscall::RecvSharedV3) {
+        return try_split_recv_shared_v3_into_frame(shared, cpu, frame);
+    }
 
     // U9-MO2 §4: `CreateInitramfsFileSliceMo` (NR 28) is routed to its own pre-lock owner for
     // the same reason as the two above — eligibility (SystemServer caller, resolvable name,
@@ -3891,6 +3896,103 @@ pub(crate) fn try_split_vm_brk_into_frame(
     })
 }
 
+/// U9-XFER2 §3 — the pre-lock NR 30 (`RecvSharedV3`) route.
+///
+/// TOTAL after the NR gate. Every refusal the ABI can produce — a short record, a bad version, a
+/// nonzero timeout, an undersized metadata buffer, a missing right, a dead endpoint, an empty
+/// queue, a refused mapping plan, a lost commit race, a copy fault — is produced by the shared
+/// transaction, so there is nothing left for a broad fallback to service.
+///
+/// This route exists because NR 30's user copies have owners off the broad lock:
+/// `copy_from_user_split` and `copy_to_user_split`, the rank-5/6 mirrors of
+/// `KernelState::copy_from_user` / `copy_to_user`.
+fn try_split_recv_shared_v3_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_REQUEST_LEN, validate_v3_request};
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::recv_v3_txn::{V3Delivery, run_recv_v3_transaction};
+
+    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
+    if !matches!(syscall, Syscall::RecvSharedV3) {
+        return None;
+    }
+    let tid = match split_vm_caller_tid(shared, cpu) {
+        Ok(tid) => tid,
+        Err(e) => return Some(Err(e)),
+    };
+    let req_ptr = frame.arg(0);
+    let req_len = frame.arg(1);
+    if req_len < V3_MIN_REQUEST_LEN as usize {
+        return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    }
+    let Some(asid) = shared.task_asid_option_split_read(tid) else {
+        return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    };
+    let read_len = req_len.min(80);
+    let Ok(wide) =
+        shared.copy_from_user_split(asid, crate::kernel::vm::VirtAddr(req_ptr as u64), read_len)
+    else {
+        return Some(Err(TrapHandleError::Syscall(SyscallError::PageFault)));
+    };
+    let mut req_bytes = [0u8; 80];
+    req_bytes[..read_len].copy_from_slice(&wide[..read_len]);
+    let req = crate::kernel::syscall::recv_shared_v3::parse_v3_request_bytes(&req_bytes);
+    if validate_v3_request(&req).is_err() {
+        return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    }
+    // Blocking is unimplemented on BOTH routes and stays that way — adding a blocking mode is
+    // out of scope, and answering `WouldBlock` here is what the broad handler already answers.
+    if req.timeout_ticks != 0 {
+        return Some(Err(TrapHandleError::Syscall(SyscallError::WouldBlock)));
+    }
+    if req.map_intent != 0
+        && req.metadata_len < crate::kernel::recv_core::recv_shared_v3::V3_LIVE_OUTPUT_LEN as u64
+    {
+        return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    }
+
+    let mut owners = crate::kernel::syscall::recv_v3_split::SplitRecvV3Owners { shared, tid, cpu };
+    Some(match run_recv_v3_transaction(&mut owners, &req) {
+        Ok(V3Delivery::Mapped {
+            sender_tid,
+            xfer_cap,
+        }) => {
+            frame.set_ok(
+                usize::try_from(sender_tid).unwrap_or(0),
+                0,
+                usize::try_from(xfer_cap).unwrap_or(usize::MAX),
+            );
+            Ok(())
+        }
+        Ok(V3Delivery::Plain {
+            sender_tid,
+            payload_len,
+            xfer_cap,
+        }) => {
+            frame.set_ok(
+                usize::try_from(sender_tid).unwrap_or(0),
+                payload_len,
+                usize::try_from(xfer_cap).unwrap_or(usize::MAX),
+            );
+            Ok(())
+        }
+        Ok(V3Delivery::PayloadFault { user_ptr }) => {
+            // §58 semantics, unchanged: the message IS consumed, a user fault is recorded, and
+            // the syscall returns Ok without a result lane.
+            shared.record_fault_split_mut(crate::kernel::trap::FaultInfo {
+                addr: crate::kernel::vm::VirtAddr(user_ptr as u64),
+                access: crate::kernel::trap::FaultAccess::Write,
+            });
+            frame.set_err(SyscallError::PageFault.code());
+            Ok(())
+        }
+        Err(e) => Err(TrapHandleError::Syscall(e)),
+    })
+}
+
 /// U9-XFER1 §3 — the pre-lock NR 4 (`TransferRelease`) route.
 ///
 /// TOTAL after the NR gate, for the same reason NR 3 / NR 13 / NR 14 are: after the range is
@@ -4763,6 +4865,9 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // is TOTAL after this gate: `xfer_txn` raises every refusal in a read-only preflight, so
         // nothing can be refused once the range has been unmapped or the capability revoked.
         Syscall::TransferRelease => Some(syscall),
+        // U9-XFER2 §3: RecvSharedV3 (NR 30) — the second half of the IPC/transfer residual. Its
+        // route is TOTAL after this gate for the same reason NR 4's is.
+        Syscall::RecvSharedV3 => Some(syscall),
         // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) is a pure READ
         // syscall — it resolves the current task, copies user bytes, logs, and never
         // blocks/yields/switches tasks or mutates KernelState. It is serviced off the
@@ -5491,6 +5596,8 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR
                 // U9-XFER1 §3: NR 4 `TransferRelease` — the first of the IPC/transfer residual.
                 || nr == crate::kernel::syscall::SYSCALL_TRANSFER_RELEASE_NR
+                // U9-XFER2 §3: NR 30 `RecvSharedV3` — the second, and the last of it.
+                || nr == crate::kernel::syscall::SYSCALL_RECV_SHARED_V3_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {
