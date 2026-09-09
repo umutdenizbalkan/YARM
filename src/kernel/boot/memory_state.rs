@@ -1143,21 +1143,51 @@ impl KernelState {
         ))
     }
 
-    /// U9-VM-ENTRY1 — release an object no capability ever referenced.
+    /// U9-VM-ENTRY1 — release an object no capability and no mapping ever referenced.
     ///
-    /// Reachable only before the mint phase, so the object is unreachable by construction.
-    /// `release_memory_object_slot_locked` returns its backing by that backing's own ownership
-    /// rule, so an anonymous object returns its exact extent to the allocator.
+    /// Reachable only from the mapping transaction's phase-R failure path, where the object has
+    /// neither a published capability slot nor a PTE, so nothing in the system can name it. The
+    /// precondition is CHECKED rather than assumed: an object that has since acquired a
+    /// capability, map or pin reference is left alone, because freeing its backing would hand a
+    /// frame another mapping still references back to the allocator. A skip is recorded rather
+    /// than silent.
+    ///
+    /// `release_memory_object_slot_locked` returns backing by that backing's own ownership rule,
+    /// so an anonymous object returns its exact extent to the allocator.
     pub(crate) fn release_unminted_anonymous_object(&mut self, object_id: u64) {
         self.with_memory_state_mut(|memory| {
-            if let Some(slot) = memory
-                .memory_objects
-                .iter()
-                .position(|entry| entry.is_some_and(|mem| mem.id == object_id))
-            {
-                Self::release_memory_object_slot_locked(memory, slot);
-            }
+            Self::release_unminted_object_slot_locked(memory, object_id);
         });
+    }
+
+    /// The rank-6 body of [`Self::release_unminted_anonymous_object`], shared with the split
+    /// adapter so one rule decides in both routes. Returns `true` when the object was released.
+    pub(crate) fn release_unminted_object_slot_locked(
+        memory: &mut MemorySubsystem,
+        object_id: u64,
+    ) -> bool {
+        let Some(slot) = memory
+            .memory_objects
+            .iter()
+            .position(|entry| entry.is_some_and(|mem| mem.id == object_id))
+        else {
+            return false;
+        };
+        let Some(object) = memory.memory_objects[slot] else {
+            return false;
+        };
+        if object.cap_refcount != 0 || object.map_refcount != 0 || object.pin_refcount != 0 {
+            crate::yarm_log!(
+                "VM_UNMINTED_RELEASE_SKIPPED object={} cap_refs={} map_refs={} pin_refs={}",
+                object_id,
+                object.cap_refcount,
+                object.map_refcount,
+                object.pin_refcount
+            );
+            return false;
+        }
+        Self::release_memory_object_slot_locked(memory, slot);
+        true
     }
 
     pub fn task_brk_bounds(&self, tid: u64) -> Option<(usize, usize)> {

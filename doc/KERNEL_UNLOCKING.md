@@ -15945,6 +15945,12 @@ its lazy/eager behaviour verbatim.
 
 ### Phase order, and why each phase sits where it does
 
+> **Superseded.** The phase order first delivered here (install, then map references, then mint
+> LAST, in three separate acquisitions) did not meet three of the transaction's obligations. It is
+> corrected below under **U9-VM-ENTRY1-R — the rollback contract**, which states the current order
+> and the reasoning that forces it. The paragraphs in this subsection are kept only so the record
+> shows what was believed at delivery and what the review found.
+
 ```
 V  validate → resolve target → guard page      (nothing acquired)
 R  acquire every frame and its object          rank 6, NO capability
@@ -15959,31 +15965,21 @@ Two obligations the in-lock shape could not meet drove this.
 **Mapping compensation must prove OWNERSHIP, not matching bytes.** `AddressSpace::map_page`
 REPLACES, and comparing a recorded `(va, phys)` on the way out excludes neither a concurrent
 replacement that reuses the same physical backing nor an ABA reuse of the frame. Installation and
-rollback therefore happen inside ONE `user_spaces` acquisition: within it no other transaction can
-observe or alter this address space, so every page the failure path removes is provably the page
-this call installed — by serialization, not comparison. That is also what lets the failure path
-restore the exact mapping each page displaced, so a partial failure removes no pre-existing mapping
-at all.
+rollback therefore happen inside ONE `user_spaces` acquisition. *(This held for the install-failure
+path only; the mint-failure path undid the install from a SECOND acquisition, which is the hole the
+review found.)*
 
 **A provisional capability is not private.** Every thread of a process shares one CNode, and Fork
 inherits by ENUMERATING the parent's cspace (`snapshot_inheritable_caps_split`) — so a sibling
 forking concurrently can capture a slot this transaction has minted but not yet returned, with no
 CapId guessing required. The escape is real. Minting LAST removes the window from the two phases
-that actually fail (frame exhaustion, page-table update) and leaves only the mint's own, which is
-the shortest it can be.
+that actually fail. *(True, and the reason the mint was placed last — but placing it last is
+exactly what forced the mint-failure rollback into a second acquisition.)*
 
 **Taking the map reference before the mint** makes the third obligation structural rather than
 argued. `reclaim_memory_object_if_unreferenced` frees an object only when its cap, map and pin
-refcounts are ALL zero, so once S1 has run no capability-side revoke can free backing this
-transaction has mapped — whatever a sibling does with the slot M is about to publish. S1 is
-deliberately split from the displaced-side accounting: `clear_cow_page` destroys a mark this
-transaction cannot restore, so that half must not run on any path that can still put the displaced
-mappings back.
-
-The mint-failure path settles in the order that never leaves a frame reclaimable while its PTE is
-live: remove the mappings (one acquisition, restoring what each displaced) → drop the map references
-S1 took → release the capabilities minted so far → release the objects that never got one. Between
-the first two steps a frame is over-counted rather than under-counted, which is the safe direction.
+refcounts are ALL zero. *(The reference was taken in a LATER acquisition than the install, so an
+interval remained in which a page was live in the page table with `map_refcount == 0`.)*
 
 `release_provisional_frame_cap_locked` re-establishes exclusivity INSIDE the one rank-4 acquisition
 that removes the slot — the exact `CapId` (which carries the slot generation), the exact
@@ -16125,3 +16121,143 @@ high-preemption spawn defect. Demand-fault routing remains a separate residual.
 **IPC/transfer residual completion**, including NR 4 `TransferRelease` and NR 30 `RecvSharedV3` —
 the two syscalls the AArch64 import list's selectivity guard now names as its stand-ins for "no
 pre-lock route".
+
+## U9-VM-ENTRY1-R — the mapping transaction's rollback contract
+
+Reviewed candidate `cdfe859`; base `ca65dca`. This corrects three obligations the candidate did not
+meet. It changes no route, no ingress, no ABI and no census; NR 3, NR 13 and NR 14 keep their
+pre-lock routes and their one shared policy.
+
+### The three findings, reproduced before anything was changed
+
+**1. Failure semantics were chunk-wide, not request-wide.** `ca65dca:src/kernel/syscall/vm.rs`
+rolls back with `rollback_anon_map(kernel, map_asid, addr, mapped_end, ..)`, and `addr` there is
+the ORIGINAL request address; the delivered map loop covers `[addr, end)`, so a failure at any page
+unmaps, revokes and reclaims everything the request had installed, from its base.
+`run_vm_map_transaction` instead serviced a request as consecutive 64-page runs, each committing on
+its own — so a failure in a later run left the earlier runs installed, minted and accounted. The
+comment claiming this was "exactly the delivered behaviour, whose rollback also only covers
+`[addr, mapped_end)`" was wrong: `mapped_end` is measured from the request base, not a run base.
+That is silently accepted partial success for any request above 64 pages.
+
+**2. The mint-failure rollback could not prove ownership.** `SplitVmOwners::install_range` and
+`SplitVmOwners::undo_installed_range` were separate rank-5 acquisitions with the rank-4 mint
+between them, holding no VM lock. A competing mapping operation on another CPU could replace any of
+this transaction's pages in that interval; `undo_installed_locked` then blindly re-installed the
+saved predecessor or unmapped the VA, destroying the competitor's work. `(va, phys)` comparison
+would not have detected it — a competitor may legitimately map the same backing, and a freed frame
+may be handed back out at the same physical address — and there is no per-mapping identity token in
+`Mapping` or `AddressSpace` to appeal to instead. The module's claim that install and rollback
+"share one acquisition" was true only of the install-failure path.
+
+**3. Rollback recycled backing with no remote acknowledgement.** `undo_installed_locked` reaches
+`AddressSpace::map_page` / `unmap_page` → `arch_unmap_page`, which is local invalidation only. The
+objects were then released straight to the allocator by `release_unminted_object` and
+`account_released_cap`. The delivered rollback did not do this: it paired `unmap_page_phase1` with
+`execute_tlb_shootdown_wait_plan` precisely so a frame could not return to the allocator while a
+remote TLB might still hold its translation. This was a regression against the delivered contract,
+not merely an omission.
+
+**And the interval finding.** Installation released VM before `note_inserted` took map references,
+so the request's pages were live in the page table with `map_refcount == 0` and — because the mint
+was last — `cap_refcount == 0` as well. A competing mapping operation displacing one of them runs
+`settle_displaced` → `complete_shootdown` → `reclaim_replaced`, and
+`reclaim_memory_object_for_phys_locked` would have seen all three refcounts at zero and freed
+backing this transaction still owned. "No capability minted yet" is not proof that backing is
+unreachable through page tables.
+
+### The corrected composition
+
+```
+J   reserve the whole-request journal            no acquisition, before any mutation
+V   validate → resolve target → guard page       rank 4 / rank 5 reads
+R   acquire every object and frame               rank 6
+M   mint every capability                        rank 4
+I   install the WHOLE request, take every map
+    reference, account every displaced mapping,
+    and on ANY failure restore every page it
+    touched before releasing                     ONE acquisition, rank 5 → rank 6
+W   required shootdown acknowledgements          no lock held
+S   release / reclaim what the ACKs cleared      rank 6
+```
+
+**One failure domain.** There is no chunk boundary left. The journal is a per-page record for the
+whole request, reserved fallibly before anything is acquired, because a `no_std` transaction must
+not depend on an allocation succeeding in order to be able to roll back. It introduces no reachable
+new refusal: every page also needs its own memory-object slot from a fixed 512-entry table, so a
+request whose journal will not fit cannot get past phase R either, and the error it reports is the
+one phase R would have reported. No request-size restriction replaces the chunk bound.
+
+**The mint moves before the address-space phase, and the ordering is forced rather than preferred.**
+A mint placed after the install has to undo the install on failure, and by then the installing
+acquisition is gone — so the undo runs in a second acquisition and cannot prove that the page it
+removes is still the page it put there. Moving the mint first makes the whole address-space phase a
+single call under a single acquisition, which is the only thing that can carry the ownership claim
+over the whole request. Rank order across the transaction is 6 → 4 → (5 → 6) → 6: every acquisition
+sequential, the one nesting in the legal direction, and capability rank 4 never taken underneath VM
+rank 5.
+
+**The cost is stated, not hidden.** A provisional capability now exists across the address-space
+phase, widening the escape window the first delivery had narrowed by minting last. That is the
+deliberate trade: an escaped provisional capability is COMPENSABLE — the release re-establishes
+identity inside the one rank-4 acquisition that removes the slot (exact `CapId` and therefore exact
+slot generation, exact `MemoryObject { id }`, no delegation link, `delete_if_leaf`'s own child
+scan), and a cap that has genuinely escaped is retained with a named cleanup owner. A mapping
+destroyed by a rollback that could not prove ownership is not compensable at all.
+
+**Every removed translation is acknowledged before its backing is recycled.** The address-space
+phase restores itself inside its acquisition; then, with every lock released, each page that had a
+live translation completes its shootdown; only then are capabilities, objects and frames released. A
+page whose acknowledgement does not arrive keeps its capability — and therefore its object and its
+frame — rather than being recycled under a possibly-stale translation, which is the same fail-closed
+rule the committed path and `unmap_range_two_phase` already obey. A page that never had a
+translation owes nothing and is released normally.
+
+**The interval is gone, and the lifetime rule is checked rather than assumed.** Map references are
+taken in the same acquisition as the install, so no page of the request is ever live in the page
+table with no map reference. `release_unminted_object` now refuses an object that has acquired a
+capability, map or pin reference, recording the skip, so it can never hand a frame another mapping
+references back to the allocator.
+
+The address-space phase runs two sub-passes inside its one acquisition. Pass A writes every PTE and
+records what each displaced; on the first failure it walks back over exactly the pages it wrote.
+Pass B, which cannot fail, takes the map references and does the displaced-side accounting — and it
+holds the irreversible half deliberately, because `clear_cow_page` destroys a mark this transaction
+could not restore and must never run on a path that can still put the displaced mappings back.
+
+### Proof — 17 cases against production owners, checking post-state
+
+| case | what it establishes |
+|---|---|
+| `finding1_the_transaction_has_exactly_one_failure_domain` | no chunk bound, no run loop, one `install_and_account` call |
+| `finding1_a_failure_after_many_pages_undoes_the_entire_request` | a 100-page request failing at its capability phase leaves **no** page mapped and returns frames, objects and cspace slots to their pre-request values |
+| `finding1_a_large_request_that_fits_still_commits_whole` | removing the chunk bound introduced no size restriction |
+| `finding2_every_page_table_write_and_undo_shares_one_acquisition` | mint precedes install; one address-space call; the second-acquisition undo is gone; both adapters drive the shared body under `with_vm_then_memory{,_split}_mut` |
+| `finding2_a_same_backing_competitor_replacement_is_not_removed_by_our_rollback` | a page a record names by VA **and** by physical address, but which this transaction never installed, is left untouched with its accounting intact |
+| `finding2_install_failure_restores_the_whole_range_inside_one_acquisition` | forced page-table refusal: every displaced mapping back with exact frame and attributes, unrelated mappings preserved, no map reference taken, and exactly the pages that had translations marked as owing an ACK |
+| `finding3_install_failure_acknowledges_every_removed_translation_before_freeing_backing` | one ACK per removed translation, all of them before any release, and the restore before all of it |
+| `finding3_an_unacknowledged_rollback_keeps_its_backing_rather_than_recycling_it` | an outstanding ACK keeps exactly its own page's backing and capability; pages that never had a translation are released normally |
+| `finding3_committed_run_shoots_down_before_every_reclaim_and_never_under_an_acquisition` | waits follow the acquisition; every reclaim is immediately preceded by its own ACK |
+| `finding3_unacknowledged_displaced_shootdown_blocks_the_reclaim` | the committed path's fail-closed rule |
+| `mint_failure_settles_without_touching_the_address_space` | no page-table write, no shootdown owed |
+| `release_unminted_object_never_frees_backing_something_still_references` | refuses on a capability, map or pin reference; and the map reference is present the instant the install returns |
+| four provisional-capability cases | identity-mismatched replacement declined and preserved; same-generation different-object declined; delegation link and in-cspace child retained; cleanup owner retires an escaped cap and its backing |
+| `a_committed_request_displaces_settles_and_leaves_unrelated_mappings_alone` | the committed path, live, against real state |
+
+### Retained from the first delivery
+
+The NR 3 / NR 13 / NR 14 source-closure matrix across all three ingress mechanisms, NR 14's SMP
+shrink coverage, and the three-architecture live witness. NR 3's success path remains labelled
+**unexecuted**: no syscall returns an `AddressSpace` capability to userspace, and no userspace ABI
+was added to manufacture one.
+
+### Census
+
+**CENSUS-DELTA: 0.** `with_cpu` 2, `with_broad` 0 production (plus 1 `thread_local` false
+positive), acquisition total 2. Raw `state_lock` 3, separately labelled: the bodies of
+`SharedKernel::lock` / `with` / `with_cpu`. The corrected composition adds no acquisition — it
+merges two rank-5 acquisitions and one rank-6 acquisition into one rank-5 → rank-6 acquisition.
+
+### Next roadmap package
+
+**IPC/transfer residual completion**, including NR 4 `TransferRelease` and NR 30 `RecvSharedV3`.

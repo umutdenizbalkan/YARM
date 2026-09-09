@@ -21,7 +21,7 @@ use crate::kernel::boot::{KernelError, KernelState};
 use crate::kernel::capabilities::CapId;
 use crate::kernel::capabilities::CapObject;
 use crate::kernel::syscall::vm_txn::{
-    BrkShape, InstalledPage, MapTarget, ProvisionalFrame, ProvisionalReleaseOutcome, VmBrkOwners,
+    BrkShape, MapTarget, PageRecord, ProvisionalFrame, ProvisionalReleaseOutcome, VmBrkOwners,
     VmMapOwners, VmRollbackReason, VmTxnEvent, run_vm_brk_transaction, run_vm_map_transaction,
 };
 use crate::kernel::trapframe::TrapFrame;
@@ -63,55 +63,30 @@ impl VmMapOwners for BroadVmOwners<'_> {
     fn acquire_object(&mut self, flags: PageFlags) -> Result<(u64, PhysAddr), KernelError> {
         // The delivered RIGHTS check, at the delivered point in the error precedence, evaluated
         // against the rights the mint WILL carry rather than through a published capability. Same
-        // predicate as `resolve_memory_object_phys(cap, flags)`, no cap required — which is what
-        // lets the mint move to the end of the transaction.
+        // predicate as `resolve_memory_object_phys(cap, flags)`, no cap required.
         anonymous_rights_admit(flags)?;
         let (object_id, phys) = self.kernel.alloc_anonymous_object_without_cap()?;
         Ok((object_id, phys))
-    }
-
-    fn mint_frame_cap(&mut self, object_id: u64, _phys: PhysAddr) -> Result<CapId, KernelError> {
-        self.kernel.mint_anonymous_frame_cap(object_id)
     }
 
     fn release_unminted_object(&mut self, object_id: u64) {
         self.kernel.release_unminted_anonymous_object(object_id);
     }
 
-    fn undo_installed_range(&mut self, asid: Asid, installed: &[InstalledPage]) {
-        self.kernel
-            .with_user_spaces_mut(|spaces| undo_installed_locked(spaces, asid, installed));
+    fn mint_frame_cap(&mut self, object_id: u64, _phys: PhysAddr) -> Result<CapId, KernelError> {
+        self.kernel.mint_anonymous_frame_cap(object_id)
     }
 
-    fn install_range(
+    fn install_and_account(
         &mut self,
         asid: Asid,
-        base: usize,
         flags: PageFlags,
-        objects: &[(u64, PhysAddr)],
-        out: &mut [InstalledPage],
-    ) -> Result<usize, (usize, KernelError)> {
-        self.kernel.with_user_spaces_mut(|spaces| {
-            install_range_locked(spaces, asid, base, flags, objects, out)
+        records: &mut [PageRecord],
+    ) -> Result<(), (usize, KernelError)> {
+        // ONE acquisition: VM rank 5, then memory rank 6 nested underneath — the legal direction.
+        self.kernel.with_vm_then_memory_mut(|spaces, memory| {
+            install_and_account_locked(spaces, memory, asid, flags, records)
         })
-    }
-
-    fn note_inserted(&mut self, installed: &[InstalledPage]) {
-        self.kernel.with_memory_state_mut(|memory| {
-            note_inserted_locked(memory, installed);
-        });
-    }
-
-    fn unnote_inserted(&mut self, installed: &[InstalledPage]) {
-        self.kernel.with_memory_state_mut(|memory| {
-            unnote_inserted_locked(memory, installed);
-        });
-    }
-
-    fn settle_displaced(&mut self, asid: Asid, installed: &[InstalledPage]) {
-        self.kernel.with_memory_state_mut(|memory| {
-            settle_displaced_locked(memory, asid, installed);
-        });
     }
 
     fn complete_shootdown(&mut self, asid: Asid, virt: VirtAddr) -> bool {
@@ -180,6 +155,7 @@ impl VmMapOwners for BroadVmOwners<'_> {
                     VmRollbackReason::FrameAlloc => "frame_alloc",
                     VmRollbackReason::PageTableUpdate => "pt_update",
                     VmRollbackReason::CapabilityMint => "cap_mint",
+                    VmRollbackReason::JournalReserve => "journal_reserve",
                 };
                 crate::yarm_log!(
                     "VM_MAP_ROLLBACK_OK reason={} released={} retained={}",
@@ -212,121 +188,107 @@ pub(crate) fn anonymous_rights_admit(flags: PageFlags) -> Result<(), KernelError
     Ok(())
 }
 
-/// rank 5, ONE acquisition: install the whole run, and on the first failure restore every page
-/// already installed BEFORE releasing.
+/// ONE acquisition — VM rank 5, memory rank 6 nested underneath it — that owns the WHOLE
+/// address-space phase of the request: every install, every map reference, every displaced-mapping
+/// accounting, and, on any failure, the restoration of every page it touched, all before it
+/// releases.
 ///
 /// This is the function that makes compensation ownership-proving rather than byte-comparing.
-/// Because the install and the undo happen inside one `user_spaces` acquisition, no other
-/// transaction can observe or alter this address space between them — so each page the undo
-/// removes is provably the page this call installed, and each page it restores is provably the
-/// mapping this call displaced. No `(va, phys)` comparison is needed or would be sufficient.
-pub(crate) fn install_range_locked(
+/// `map_page` REPLACES, so a rollback that ran in a LATER acquisition could not distinguish the
+/// page it installed from a competitor's replacement — not even by comparing the virtual and
+/// physical address, since a competitor may legitimately map the same backing, and a freed frame
+/// may be handed back out under the same physical address. There is no per-mapping identity token
+/// to appeal to. What there is, is serialization: within this one acquisition no other transaction
+/// can observe or alter this address space, so each page the undo removes is provably the page
+/// this call installed, and each page it restores is provably the mapping this call displaced.
+///
+/// Two sub-passes, in this order and for a reason:
+///
+/// * **A — install.** Write every PTE, recording what each displaced and marking the record
+///   `installed`. On the first failure, walk back over exactly the pages this pass wrote,
+///   restoring each displaced mapping verbatim or removing a page that displaced nothing. No
+///   accounting has run yet, so there is none to undo. The `installed` flags survive the return,
+///   because those pages had live translations and therefore owe a shootdown.
+/// * **B — account.** Only once the whole request is installed: take the map reference on every
+///   inserted frame, and for every displaced page clear its COW mark and drop its map reference.
+///   This pass cannot fail, which is what lets it hold the irreversible half — `clear_cow_page`
+///   destroys a mark this transaction could not restore, so it must never run on a path that can
+///   still put the displaced mappings back.
+///
+/// Taking the map reference here rather than in a later acquisition is what removes the interval
+/// in which a page of this request would be live in the page table with `map_refcount == 0` — an
+/// interval a competing mapping operation could observe, and whose displaced-frame reclaim would
+/// then free backing this transaction still owns.
+pub(crate) fn install_and_account_locked(
     spaces: &mut crate::kernel::vm::AddressSpaceManager,
+    memory: &mut crate::kernel::boot::MemorySubsystem,
     asid: Asid,
-    base: usize,
     flags: PageFlags,
-    objects: &[(u64, PhysAddr)],
-    out: &mut [InstalledPage],
-) -> Result<usize, (usize, KernelError)> {
+    records: &mut [PageRecord],
+) -> Result<(), (usize, KernelError)> {
     use crate::kernel::vm::VmError;
-    for (i, (_object_id, phys)) in objects.iter().enumerate() {
-        let virt = VirtAddr((base + i * PAGE_SIZE) as u64);
-        let mapping = Mapping { phys: *phys, flags };
-        let aspace = match spaces.get_mut(asid) {
-            Some(a) => a,
-            None => {
-                undo_installed_locked(spaces, asid, &out[..i]);
-                return Err((i, KernelError::Vm(VmError::InvalidAsid)));
-            }
+
+    // ── Pass A: install the whole request.
+    for i in 0..records.len() {
+        let virt = records[i].virt;
+        let mapping = Mapping {
+            phys: records[i].phys,
+            flags,
+        };
+        let Some(aspace) = spaces.get_mut(asid) else {
+            undo_installed_locked(spaces, asid, &records[..i]);
+            return Err((i, KernelError::Vm(VmError::InvalidAsid)));
         };
         match aspace.map_page(virt, mapping) {
             Ok(replaced) => {
-                out[i] = InstalledPage {
-                    virt,
-                    inserted: *phys,
-                    replaced,
-                };
+                records[i].replaced = replaced;
+                records[i].installed = true;
             }
             Err(e) => {
-                undo_installed_locked(spaces, asid, &out[..i]);
+                undo_installed_locked(spaces, asid, &records[..i]);
                 return Err((i, KernelError::Vm(e)));
             }
         }
     }
-    Ok(objects.len())
+
+    // ── Pass B: account it. Cannot fail.
+    for record in records.iter() {
+        KernelState::note_mapping_inserted_locked(memory, record.phys);
+        if let Some(old) = record.replaced {
+            KernelState::clear_cow_page_locked(memory, asid, record.virt);
+            KernelState::note_mapping_removed_locked(memory, old.phys);
+        }
+    }
+    Ok(())
 }
 
-/// The undo half, inside the SAME acquisition as the install — and the same body the mint-phase
-/// rollback reaches through `undo_installed_range`, so a mapping is removed by exactly one
-/// implementation whichever phase failed.
+/// The undo half of pass A, inside the SAME acquisition as the install. A page is returned to
+/// exactly the state the install found it in: the displaced mapping is re-installed verbatim, and
+/// a page that displaced nothing is removed.
 ///
-/// Each page is returned to exactly the state the install found it in: the displaced mapping is
-/// re-installed verbatim, and a page that displaced nothing is removed. A failure here cannot be
-/// propagated — the acquisition is the transaction — so a re-install that refuses leaves the page
-/// unmapped, which is strictly safer than leaving this transaction's frame reachable.
-pub(crate) fn undo_installed_locked(
+/// A failure here cannot be propagated — the acquisition is the transaction — so a re-install that
+/// refuses leaves the page unmapped, which is strictly safer than leaving this transaction's frame
+/// reachable. The pages stay marked `installed`, because a removed translation owes a shootdown
+/// whether or not it was replaced by something else.
+fn undo_installed_locked(
     spaces: &mut crate::kernel::vm::AddressSpaceManager,
     asid: Asid,
-    installed: &[InstalledPage],
+    installed: &[PageRecord],
 ) {
     let Some(aspace) = spaces.get_mut(asid) else {
         return;
     };
-    for page in installed.iter().rev() {
-        match page.replaced {
+    for record in installed.iter().rev() {
+        if !record.installed {
+            continue;
+        }
+        match record.replaced {
             Some(old) => {
-                let _ = aspace.map_page(page.virt, old);
+                let _ = aspace.map_page(record.virt, old);
             }
             None => {
-                let _ = aspace.unmap_page(page.virt);
+                let _ = aspace.unmap_page(record.virt);
             }
-        }
-    }
-}
-
-/// rank 6: take the MAP reference on every frame this run installed.
-///
-/// Called BEFORE the mint. `reclaim_memory_object_if_unreferenced_locked` frees an object only
-/// when its cap, map and pin refcounts are ALL zero, so once this has run the object cannot be
-/// reclaimed through the capability domain at all — which is precisely what makes "a sibling
-/// revoking the provisional cap cannot free mapped backing" an invariant of the phase order
-/// rather than a claim about which actors exist.
-pub(crate) fn note_inserted_locked(
-    memory: &mut crate::kernel::boot::MemorySubsystem,
-    installed: &[InstalledPage],
-) {
-    for page in installed {
-        KernelState::note_mapping_inserted_locked(memory, page.inserted);
-    }
-}
-
-/// rank 6: the exact inverse of [`note_inserted_locked`], for the mint-phase rollback. Run only
-/// after the PTEs are gone, so a frame is never reclaimable while it is still mapped.
-pub(crate) fn unnote_inserted_locked(
-    memory: &mut crate::kernel::boot::MemorySubsystem,
-    installed: &[InstalledPage],
-) {
-    for page in installed {
-        KernelState::note_mapping_removed_locked(memory, page.inserted);
-    }
-}
-
-/// rank 6: the accounting a COMMITTED run owes for what it displaced — the COW clear and
-/// `map_refcount--` for every mapping it replaced. Reclaim of a displaced frame is deliberately
-/// NOT here: it happens only after that page's shootdown completes.
-///
-/// Kept apart from [`note_inserted_locked`] because it is not reversible: `clear_cow_page_locked`
-/// destroys a mark this transaction cannot restore, so it must not run on any path that can still
-/// put the displaced mappings back.
-pub(crate) fn settle_displaced_locked(
-    memory: &mut crate::kernel::boot::MemorySubsystem,
-    asid: Asid,
-    installed: &[InstalledPage],
-) {
-    for page in installed {
-        if let Some(old) = page.replaced {
-            KernelState::clear_cow_page_locked(memory, asid, page.virt);
-            KernelState::note_mapping_removed_locked(memory, old.phys);
         }
     }
 }

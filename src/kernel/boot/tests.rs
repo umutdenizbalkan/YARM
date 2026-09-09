@@ -34194,10 +34194,7 @@ mod stage115_d2_d6_seam_analysis {
         // And the split adapter reaches the SAME rank-local bodies the broad adapter uses.
         let vm_split_src = include_str!("../syscall/vm_split.rs");
         for shared_body in [
-            "install_range_locked(",
-            "note_inserted_locked(",
-            "unnote_inserted_locked(",
-            "settle_displaced_locked(",
+            "install_and_account_locked(",
             "release_provisional_frame_cap_locked(",
         ] {
             assert!(
@@ -40198,7 +40195,7 @@ mod stage145_vm_module_extraction {
             "the validation helper must live in the VM module family"
         );
         assert!(
-            VM_TXN_SRC.contains("fn release_frames<"),
+            VM_TXN_SRC.contains("fn release_capabilities<"),
             "the resource half of the rollback must live in the VM module family"
         );
         assert!(
@@ -62587,7 +62584,7 @@ mod stage191c_split_user_copy_seam {
         );
         const VM_TXN: &str = include_str!("../syscall/vm_txn.rs");
         assert!(
-            VM_TXN.contains("owners.account_released_cap(*frame);"),
+            VM_TXN.contains("owners.account_released_cap(frame);"),
             "the accounting must follow a release, never a retention"
         );
         for still_locked in [
@@ -168292,39 +168289,41 @@ mod u9timer1_preempting_timer {
         );
     }
 }
-
 // ═══════════════════════════════════════════════════════════════════════════════════════════
-// U9-VM-ENTRY1 §4 — the three focused OWNERSHIP cases.
+// U9-VM-ENTRY1 — the mapping transaction's OWNERSHIP and ROLLBACK contract.
 //
-// These are proofs of obligations the mapping transaction already has, not of new machinery:
+// Three obligations, each reproduced as a failing shape against the production owners before it
+// was repaired, and each checked here against actual post-state rather than markers or spelling:
 //
-//   1. Provisional-cap escape — an identity-mismatched replacement slot is distinguished from
-//      the exact provisional cap that acquired descendants; the replacement is preserved
-//      untouched; and the retained provisional cap has a named cleanup owner that actually
-//      retires it, and its backing, once the external alias is released.
-//   2. Revocation during preparation — a sibling revoking or replacing the provisional cap
-//      cannot make this transaction map freed or recycled backing, and compensation cannot
-//      touch the replacement.
-//   3. Mapping rollback and displaced backing — a failure after several installations restores
-//      every displaced mapping with its exact attributes, leaves unrelated mappings alone, and
-//      reclaims no frame before its shootdown is acknowledged, with the wait outside the VM
-//      acquisition.
+//   1. Failure semantics are REQUEST-wide. The delivered rollback covers `[addr, mapped_end)`
+//      measured from the request base, so a failure at any page undoes every page. A transaction
+//      that commits chunks independently accepts partial success instead.
+//   2. Mapping compensation must prove OWNERSHIP. Every page-table write and every page-table
+//      undo of the request happens inside ONE acquisition, so what the failure path removes is
+//      provably what it installed — including against a competitor that replaced a page with the
+//      very same physical backing, which no `(va, phys)` comparison could detect.
+//   3. A removed translation owes an ACKNOWLEDGEMENT before its backing is recycled. Local
+//      invalidation is not the shootdown; the delivered rollback paired `unmap_page_phase1` with
+//      `execute_tlb_shootdown_wait_plan`, and so does this one.
 //
-// Everything below drives the PRODUCTION owners: `run_vm_map_transaction`, the shared rank-local
-// bodies in `syscall::vm`, and the real `KernelState` capability/memory owners.
+// Plus the escape and lifetime obligations the transaction already carried: provisional-cap
+// compensation scoped to CNode, slot generation and object identity; and backing that another
+// mapping now references never returned to the allocator.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod u9vment1_ownership_cases {
     use super::*;
     use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
     use crate::kernel::syscall::vm_txn::{
-        InstalledPage, MapTarget, ProvisionalFrame, ProvisionalReleaseOutcome, VmMapOwners,
+        MapTarget, PageRecord, ProvisionalFrame, ProvisionalReleaseOutcome, VmMapOwners,
         run_vm_map_transaction,
     };
     use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
     use std::collections::BTreeMap;
     use std::string::{String, ToString};
     use std::vec::Vec;
+
+    const PAGE: usize = crate::kernel::vm::PAGE_SIZE;
 
     // ── shared helpers ──────────────────────────────────────────────────────────────────────
 
@@ -168362,8 +168361,18 @@ mod u9vment1_ownership_cases {
         state.with_user_spaces(|spaces| spaces.get(asid).and_then(|space| space.resolve(virt)))
     }
 
-    /// One provisional frame, acquired exactly the way the transaction's phase R and phase M
-    /// acquire it — the same two production owners, in the same order.
+    /// `(free frames, live memory objects, occupied cspace slots)` — the quiescent triple every
+    /// complete rollback must return to.
+    fn quiescent(state: &KernelState, cnode: CNodeId) -> (usize, usize, usize) {
+        (
+            free_frames(state),
+            state.live_memory_object_count_for_test(),
+            cnode_occupied(state, cnode),
+        )
+    }
+
+    /// One provisional frame, acquired the way the transaction's phases R and M acquire it — the
+    /// same two production owners, in the same order.
     fn acquire_provisional(state: &mut KernelState) -> ProvisionalFrame {
         let (object_id, phys) = state
             .alloc_anonymous_object_without_cap()
@@ -168376,8 +168385,8 @@ mod u9vment1_ownership_cases {
         }
     }
 
-    /// The production release owner, reached through the same single rank-4 acquisition the
-    /// broad adapter uses.
+    /// The production release owner, through the same single rank-4 acquisition the broad adapter
+    /// uses.
     fn release_provisional(
         state: &mut KernelState,
         cnode: CNodeId,
@@ -168403,457 +168412,312 @@ mod u9vment1_ownership_cases {
             .expect("link table has room");
     }
 
+    /// Fill `cnode` until exactly `leave_free` slots remain, so the next `leave_free + 1` mints
+    /// fail for real rather than by injection.
+    fn fill_cspace_leaving(state: &mut KernelState, cnode: CNodeId, leave_free: usize) {
+        let mut guard = 0usize;
+        loop {
+            let free = state.with_capability_state(|capability| {
+                capability
+                    .cnode_spaces
+                    .iter()
+                    .flatten()
+                    .find(|space| space.id == cnode)
+                    .map(|space| space.slot_capacity - kernel_ref(&space.cspace).occupied_slots())
+                    .unwrap_or(0)
+            });
+            if free <= leave_free {
+                return;
+            }
+            state
+                .mint_capability_in_cnode(
+                    cnode,
+                    Capability::new(CapObject::Kernel, CapRights::READ),
+                )
+                .expect("filler mint");
+            guard += 1;
+            assert!(guard < 8192, "the cspace must fill");
+        }
+    }
+
+    /// Map `pages` real anonymous pages at `base`, each with its own object and capability, and
+    /// return `(object_id, virt, mapping)` for each.
+    fn premap(
+        state: &mut KernelState,
+        asid: Asid,
+        base: usize,
+        pages: &[(usize, PageFlags)],
+    ) -> Vec<(u64, VirtAddr, Mapping)> {
+        let mut out = Vec::new();
+        for (page, flags) in pages {
+            let (object_id, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc");
+            let virt = VirtAddr((base + page * PAGE) as u64);
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, virt, *flags)
+                .expect("premap");
+            out.push((
+                object_id,
+                virt,
+                resolve_page(state, asid, virt).expect("mapped"),
+            ));
+        }
+        out
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════════════════
-    // Case 1 — provisional-cap escape.
+    // Finding 1 — failure semantics are REQUEST-wide.
     // ═══════════════════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn case1_identity_mismatched_replacement_slot_is_not_ours_and_is_preserved() {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let (mut state, _asid) = kernel_with_asid();
-                let cnode = state.current_task_cnode().expect("cnode");
-
-                // This transaction's provisional frame.
-                let ours = acquire_provisional(&mut state);
-
-                // A sibling retires it and takes the slot for something of its own. `revoke`
-                // bumps the slot generation, so the replacement's CapId differs from ours even
-                // though it may land on the same slot INDEX.
-                state
-                    .revoke_capability_in_cnode(cnode, ours.cap)
-                    .expect("sibling revoke");
-                let theirs = acquire_provisional(&mut state);
-                assert_eq!(
-                    theirs.cap.index(),
-                    ours.cap.index(),
-                    "the replacement must reuse the same slot index, so only the generation \
-                     and object identity can tell the two apart"
-                );
-                assert_ne!(
-                    theirs.cap, ours.cap,
-                    "the slot generation must have moved on"
-                );
-
-                let before = (
-                    free_frames(&state),
-                    state.live_memory_object_count_for_test(),
-                    cnode_occupied(&state, cnode),
-                );
-
-                // Compensation runs with OUR recorded frame. It must decline.
-                assert_eq!(
-                    release_provisional(&mut state, cnode, ours),
-                    ProvisionalReleaseOutcome::NotOurs,
-                    "a replacement slot is not this transaction's to remove"
-                );
-
-                // And it must have left the replacement completely alone.
-                assert_eq!(
-                    (
-                        free_frames(&state),
-                        state.live_memory_object_count_for_test(),
-                        cnode_occupied(&state, cnode),
-                    ),
-                    before,
-                    "declining must not remove a cap, an object or a frame"
-                );
-                let replacement = state
-                    .resolve_capability_for_task(0, theirs.cap)
-                    .expect("the replacement still resolves");
-                assert_eq!(
-                    replacement.object,
-                    CapObject::MemoryObject {
-                        id: theirs.object_id
-                    },
-                    "the replacement still names its own object"
-                );
-                assert_eq!(
-                    refcounts(&state, theirs.object_id),
-                    Some((1, 0)),
-                    "the replacement's object keeps its own capability reference"
-                );
-
-                // The same-generation shape of the mismatch is the second gate: a live cap of
-                // ours, but recorded against a different object id.
-                let wrong_object = ProvisionalFrame {
-                    object_id: theirs.object_id.wrapping_add(1_000_000),
-                    ..theirs
-                };
-                assert_eq!(
-                    release_provisional(&mut state, cnode, wrong_object),
-                    ProvisionalReleaseOutcome::NotOurs,
-                    "an exact-generation slot holding a DIFFERENT object is not ours either"
-                );
-                assert!(
-                    state.resolve_capability_for_task(0, theirs.cap).is_ok(),
-                    "and that decline must also leave the slot untouched"
-                );
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
-    }
-
-    #[test]
-    fn case1_delegated_provisional_cap_is_retained_and_left_exactly_as_it_is() {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let (mut state, _asid) = kernel_with_asid();
-                let cnode = state.current_task_cnode().expect("cnode");
-                let ours = acquire_provisional(&mut state);
-
-                // An IPC transfer of the provisional cap materializes an alias and records the
-                // link that names our cap as its source.
-                let alias = state
-                    .mint_capability_in_cnode(
-                        cnode,
-                        Capability::new(
-                            CapObject::MemoryObject { id: ours.object_id },
-                            KernelState::memory_object_rights_for_kind(MemoryObjectKind::Anonymous),
-                        ),
-                    )
-                    .expect("alias mint");
-                record_link(&mut state, ours.cap, alias);
-                assert_eq!(
-                    refcounts(&state, ours.object_id),
-                    Some((2, 0)),
-                    "source cap plus alias"
-                );
-
-                let before = (
-                    free_frames(&state),
-                    state.live_memory_object_count_for_test(),
-                    cnode_occupied(&state, cnode),
-                );
-                assert_eq!(
-                    release_provisional(&mut state, cnode, ours),
-                    ProvisionalReleaseOutcome::Derived,
-                    "a cap another transaction derived from is retained, never removed"
-                );
-                assert_eq!(
-                    (
-                        free_frames(&state),
-                        state.live_memory_object_count_for_test(),
-                        cnode_occupied(&state, cnode),
-                    ),
-                    before,
-                    "retention must change nothing at all"
-                );
-                assert!(
-                    state.resolve_capability_for_task(0, ours.cap).is_ok()
-                        && state.resolve_capability_for_task(0, alias).is_ok(),
-                    "both the source cap and the alias survive"
-                );
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
-    }
-
-    #[test]
-    fn case1_in_cspace_child_also_retains_the_provisional_cap() {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let (mut state, _asid) = kernel_with_asid();
-                let cnode = state.current_task_cnode().expect("cnode");
-                let ours = acquire_provisional(&mut state);
-
-                // The second derivation shape `delete_if_leaf` itself screens for: an in-cspace
-                // child whose parent link names this exact cap.
-                let child = state
-                    .with_capability_state_mut(|capability| {
-                        capability
-                            .cnode_spaces
-                            .iter_mut()
-                            .flatten()
-                            .find(|space| space.id == cnode)
-                            .map(|space| kernel_mut(&mut space.cspace))
-                            .expect("cspace")
-                            .mint_derived(ours.cap, CapRights::READ)
-                    })
-                    .expect("derived child");
-
-                assert_eq!(
-                    release_provisional(&mut state, cnode, ours),
-                    ProvisionalReleaseOutcome::Derived,
-                    "a cap with a live in-cspace child is not a leaf and is retained"
-                );
-                assert!(
-                    state.resolve_capability_for_task(0, ours.cap).is_ok(),
-                    "the source cap survives"
-                );
-                assert!(
-                    state.resolve_capability_for_task(0, child).is_ok(),
-                    "and so does the child that made it non-exclusive"
-                );
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
-    }
-
-    #[test]
-    fn case1_exclusive_provisional_cap_releases_back_to_quiescent_counts() {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let (mut state, _asid) = kernel_with_asid();
-                let cnode = state.current_task_cnode().expect("cnode");
-
-                let quiescent = (
-                    free_frames(&state),
-                    state.live_memory_object_count_for_test(),
-                    cnode_occupied(&state, cnode),
-                );
-
-                let ours = acquire_provisional(&mut state);
-                assert_eq!(refcounts(&state, ours.object_id), Some((1, 0)));
-
-                assert_eq!(
-                    release_provisional(&mut state, cnode, ours),
-                    ProvisionalReleaseOutcome::Released,
-                    "an untouched, childless, undelegated provisional cap IS ours"
-                );
-                // The accounting half the transaction runs only after `Released`.
-                let object = CapObject::MemoryObject { id: ours.object_id };
-                state.with_memory_state_mut(|memory| {
-                    KernelState::adjust_memory_object_cap_refcount_locked(memory, object, -1);
-                    KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object);
-                });
-
-                assert_eq!(
-                    (
-                        free_frames(&state),
-                        state.live_memory_object_count_for_test(),
-                        cnode_occupied(&state, cnode),
-                    ),
-                    quiescent,
-                    "cap, object AND frame counts must return to their pre-transaction values"
-                );
-                assert!(
-                    state.memory_object_slot_by_id(ours.object_id).is_none(),
-                    "the object slot itself is gone"
-                );
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
-    }
-
-    #[test]
-    fn case1_retained_cap_is_retired_by_its_cleanup_owner_once_the_alias_is_released() {
-        std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let (mut state, _asid) = kernel_with_asid();
-                let cnode = state.current_task_cnode().expect("cnode");
-                let quiescent = (
-                    free_frames(&state),
-                    state.live_memory_object_count_for_test(),
-                    cnode_occupied(&state, cnode),
-                );
-
-                let ours = acquire_provisional(&mut state);
-                let alias = state
-                    .mint_capability_in_cnode(
-                        cnode,
-                        Capability::new(
-                            CapObject::MemoryObject { id: ours.object_id },
-                            KernelState::memory_object_rights_for_kind(MemoryObjectKind::Anonymous),
-                        ),
-                    )
-                    .expect("alias mint");
-                record_link(&mut state, ours.cap, alias);
-                assert_eq!(
-                    release_provisional(&mut state, cnode, ours),
-                    ProvisionalReleaseOutcome::Derived,
-                    "retained, as case 1 requires"
-                );
-
-                // "Still referenced" is NOT the compensation claim. The claim is that a retained
-                // provisional cap is in exactly the state a SUCCESSFULLY RETURNED mapping cap is
-                // in — a live memory-object cap in the caller's cspace — and is retired by the
-                // same owner. That owner is `revoke_capability_in_cnode`, which process teardown
-                // (`maybe_cleanup_process_cnode_for_pid`) drives once per live cap.
-
-                // Step 1: the external alias is released. Its own revoke removes the delegation
-                // link that named our cap, which is what makes the source cap a leaf again.
-                state
-                    .revoke_capability_in_cnode(cnode, alias)
-                    .expect("alias revoke");
-                assert_eq!(
-                    refcounts(&state, ours.object_id),
-                    Some((1, 0)),
-                    "the source cap is the object's last reference, and the backing is still held"
-                );
-                assert!(
-                    state.resolve_capability_for_task(0, ours.cap).is_ok(),
-                    "the source cap itself is untouched by the alias's retirement"
-                );
-
-                // Step 2: the cleanup owner runs over that last cap.
-                state
-                    .revoke_capability_in_cnode(cnode, ours.cap)
-                    .expect("cleanup owner");
-
-                assert_eq!(
-                    (
-                        free_frames(&state),
-                        state.live_memory_object_count_for_test(),
-                        cnode_occupied(&state, cnode),
-                    ),
-                    quiescent,
-                    "the otherwise-unreturned source cap, its object and its frame are all retired"
-                );
-                assert!(
-                    state.memory_object_slot_by_id(ours.object_id).is_none(),
-                    "the backing is genuinely reclaimed, not merely still referenced"
-                );
-            })
-            .expect("spawn")
-            .join()
-            .expect("join");
-    }
-
-    #[test]
-    fn case1_process_teardown_drives_that_cleanup_owner_over_every_live_cap() {
-        // The owner named above is not a test-only call: process cnode cleanup revokes every
-        // live cap in the cspace, one at a time, through exactly that function.
-        const CNODE_SRC: &str = include_str!("cnode_state.rs");
-        let body = CNODE_SRC
-            .split("fn maybe_cleanup_process_cnode_for_pid(")
-            .nth(1)
-            .and_then(|s| s.split("\n    pub(crate) fn ").next())
-            .expect("the alloc-capable process cnode cleanup");
+    fn finding1_the_transaction_has_exactly_one_failure_domain() {
+        // The obligation: the delivered rollback is
+        // `rollback_anon_map(kernel, asid, addr, mapped_end, ..)` where `addr` is the ORIGINAL
+        // request address, and the delivered map loop runs over the whole request — so a failure
+        // at any page undoes everything the request installed, from its base. (Reproduced against
+        // `ca65dca:src/kernel/syscall/vm.rs`; the behavioural proof is the next case.)
+        //
+        // The corrected transaction therefore has exactly ONE failure domain, and no chunk bound
+        // to leak a partial commit across.
+        const TXN: &str = include_str!("../syscall/vm_txn.rs");
         assert!(
-            body.contains("live_cap_ids()")
-                && body.contains("revoke_capability_in_cnode(cnode, cap)"),
-            "process teardown must retire each live cap through `revoke_capability_in_cnode`, \
-             which is the owner that decrements the memory-object cap refcount and reclaims"
+            !TXN.contains("VM_MAP_MAX_PAGES_PER_RUN") && !TXN.contains("fn run_one_map_run"),
+            "the chunked run loop, whose later-run failure left earlier runs committed, is gone"
         );
-        // And that owner really does the accounting a retained cap is owed.
-        const LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
-        let revoke = LIFECYCLE_SRC
-            .split("fn revoke_capability_in_cnode(")
+        let body = TXN
+            .split("pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(")
             .nth(1)
-            .and_then(|s| s.split("\n    /// ").next())
-            .expect("revoke_capability_in_cnode");
+            .expect("the transaction")
+            .split("\n}\n")
+            .next()
+            .expect("body");
         assert!(
-            revoke.contains("adjust_memory_object_cap_refcount(capability.object, -1)")
-                && revoke.contains("reclaim_memory_object_if_unreferenced(capability.object)"),
-            "the cleanup owner must drop the cap reference and reclaim the object"
+            !body.contains("while remaining > 0"),
+            "the request is one transaction, not a sequence of committing runs"
         );
     }
 
+    #[test]
+    fn finding1_a_failure_after_many_pages_undoes_the_entire_request() {
+        // A request far larger than the retired 64-page chunk bound, failing at its capability
+        // phase. Under the chunked shape the first 64 pages would have been installed, minted and
+        // accounted, and would have stayed that way.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let base = 0x50_0000usize;
+                let pages = 100usize;
+
+                // Leave room for 70 mints: more than one retired chunk, fewer than the request.
+                fill_cspace_leaving(&mut state, cnode, 70);
+                let before = quiescent(&state, cnode);
+
+                let mut frame = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::VmAnonMap as usize,
+                    [0, base, pages * PAGE, 0x1 | 0x4, 0, 0],
+                );
+                let result = state.handle_trap(Trap::Syscall, Some(&mut frame));
+                assert!(
+                    result.is_err() || frame.error_code().is_some(),
+                    "70 free slots cannot satisfy a 100-page request"
+                );
+
+                // Not one page of the request survives — including the pages a 64-page chunk
+                // would have committed before the failure.
+                for page in 0..pages {
+                    let virt = VirtAddr((base + page * PAGE) as u64);
+                    assert_eq!(
+                        resolve_page(&state, asid, virt),
+                        None,
+                        "page {page} of the request must not survive a failure at any page"
+                    );
+                }
+                assert_eq!(
+                    quiescent(&state, cnode),
+                    before,
+                    "frames, objects and capability slots all return to their pre-request values"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn finding1_a_large_request_that_fits_still_commits_whole() {
+        // The counterpart: removing the chunk bound must not have introduced a size restriction.
+        // The same 100-page request succeeds when the resources are there, and every page of it
+        // is mapped.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, asid) = kernel_with_asid();
+                let base = 0x50_0000usize;
+                let pages = 100usize;
+                let mut frame = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::VmAnonMap as usize,
+                    [0, base, pages * PAGE, 0x1 | 0x4, 0, 0],
+                );
+                let result = state.handle_trap(Trap::Syscall, Some(&mut frame));
+                assert!(
+                    result.is_ok() && frame.error_code().is_none(),
+                    "a request larger than the retired chunk bound must still be serviced whole"
+                );
+                assert_eq!(frame.ret1(), pages * PAGE, "the whole length is reported");
+                for page in 0..pages {
+                    let virt = VirtAddr((base + page * PAGE) as u64);
+                    assert!(
+                        resolve_page(&state, asid, virt).is_some(),
+                        "page {page} must be mapped"
+                    );
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════════════════
-    // Case 2 — revocation during preparation.
+    // Finding 2 — ownership across a failure, including same-backing replacement.
     // ═══════════════════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn case2_no_capability_exists_while_the_mapping_is_being_built() {
-        // The window the case describes — a sibling revoking or replacing the provisional cap
-        // "between mint and mapping" — is closed by construction: the transaction installs the
-        // whole range and takes its map references BEFORE it mints anything, and it builds each
-        // mapping from the object's own physical extent, so no capability is in the dependency
-        // chain that produces the PTE.
-        const TXN_SRC: &str = include_str!("../syscall/vm_txn.rs");
-        let body = TXN_SRC
-            .split("fn run_one_map_run<O: VmMapOwners>(")
+    fn finding2_every_page_table_write_and_undo_shares_one_acquisition() {
+        // The repair, read from source: there is no second VM acquisition for a rollback to run
+        // in, because the mint precedes the address-space phase and the address-space phase is a
+        // single call. A rollback that ran in a later acquisition could not prove what it removes.
+        const TXN: &str = include_str!("../syscall/vm_txn.rs");
+        let body: String = TXN
+            .split("pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(")
             .nth(1)
-            .expect("run_one_map_run");
-        let code: String = body
+            .expect("the transaction")
+            .split("\n}\n")
+            .next()
+            .expect("body")
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        let install = code.find("owners.install_range(").expect("install phase");
-        let note = code
-            .find("owners.note_inserted(")
-            .expect("map-reference phase");
-        let mint = code.find("owners.mint_frame_cap(").expect("mint phase");
+        let mint = body.find("owners.mint_frame_cap(").expect("mint phase");
+        let install = body
+            .find("owners.install_and_account(")
+            .expect("address-space phase");
         assert!(
-            install < note && note < mint,
-            "phase order must be install → map reference → mint, so no capability can be \
-             revoked or replaced before the mapping exists"
+            mint < install,
+            "the mint must precede the address-space phase, or its failure would have to undo an \
+             install from a second acquisition"
         );
-        // The install takes the physical address from the OBJECT, never from a resolved cap.
-        let install_args = &code[install
-            ..code[install..]
-                .find(')')
-                .map(|end| install + end)
-                .unwrap_or(code.len())];
+        assert_eq!(
+            body.matches("owners.install_and_account(").count(),
+            1,
+            "the whole address-space phase is ONE call, so install and undo cannot be split \
+             across acquisitions"
+        );
         assert!(
-            install_args.contains("&objects[..pages]") && !install_args.contains("frames"),
-            "the installed mapping is built from the objects this transaction owns outright"
+            !TXN.contains("undo_installed_range"),
+            "the second-acquisition undo, which could not prove ownership, is gone"
         );
+        // Both adapters run that one call under one acquisition of VM then memory.
+        for (label, src) in [
+            ("broad", include_str!("../syscall/vm.rs")),
+            ("split", include_str!("../syscall/vm_split.rs")),
+        ] {
+            let seam = if label == "broad" {
+                "with_vm_then_memory_mut"
+            } else {
+                "with_vm_then_memory_split_mut"
+            };
+            let adapter = src
+                .split("fn install_and_account(")
+                .nth(1)
+                .expect("the adapter method")
+                .split("\n    }")
+                .next()
+                .expect("body");
+            assert!(
+                adapter.contains(seam) && adapter.contains("install_and_account_locked("),
+                "the {label} adapter must drive the shared body under `{seam}`"
+            );
+        }
     }
 
     #[test]
-    fn case2_map_reference_precedes_the_mint_so_a_revoke_cannot_free_mapped_backing() {
+    fn finding2_a_same_backing_competitor_replacement_is_not_removed_by_our_rollback() {
+        // The shape the old code could not survive: a competitor replaces one of our pages with
+        // a mapping whose PHYSICAL ADDRESS IS THE SAME as ours, and our rollback then runs. A
+        // `(va, phys)` comparison would call it ours; serialization does not have to compare.
+        //
+        // With the repair there is no interval to inject into at all — the whole address-space
+        // phase is one acquisition — so the check is that the rollback body operates only on the
+        // records it wrote inside that acquisition, and that a page it never installed is left
+        // untouched.
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 let (mut state, asid) = kernel_with_asid();
-                let cnode = state.current_task_cnode().expect("cnode");
-                let base = 0x40_0000usize;
-                let virt = VirtAddr(base as u64);
+                let base = 0x60_0000usize;
 
-                // Phase R + phase I + phase S1, through the production owners.
-                let (object_id, phys) = state
-                    .alloc_anonymous_object_without_cap()
-                    .expect("object without cap");
-                let mut installed = [InstalledPage {
-                    virt,
-                    inserted: phys,
-                    replaced: None,
-                }; 1];
+                // A competitor's mapping, at a VA inside the range our records will cover.
+                let competitor = premap(&mut state, asid, base, &[(1, PageFlags::USER_RW)]);
+                let (competitor_object, competitor_virt, competitor_mapping) = competitor[0];
+
+                // Our records: two pages. The FIRST is marked installed (we wrote it); the second
+                // names the competitor's VA but is NOT marked installed, which is exactly the
+                // state a page this transaction never reached would be in.
+                let (our_object, our_phys) =
+                    state.alloc_anonymous_object_without_cap().expect("object");
+                let mut records = [
+                    PageRecord {
+                        virt: VirtAddr(base as u64),
+                        object_id: our_object,
+                        phys: our_phys,
+                        cap: None,
+                        installed: false,
+                        replaced: None,
+                    },
+                    PageRecord {
+                        virt: competitor_virt,
+                        // The same backing the competitor is using — the case a byte comparison
+                        // cannot distinguish.
+                        object_id: competitor_object,
+                        phys: competitor_mapping.phys,
+                        cap: None,
+                        installed: false,
+                        replaced: None,
+                    },
+                ];
+
+                // Install ONLY the first page through the production body, by handing it a
+                // one-element slice; the competitor's page is never touched.
                 state
-                    .with_user_spaces_mut(|spaces| {
-                        crate::kernel::syscall::vm::install_range_locked(
+                    .with_vm_then_memory_mut(|spaces, memory| {
+                        crate::kernel::syscall::vm::install_and_account_locked(
                             spaces,
+                            memory,
                             asid,
-                            base,
-                            PageFlags::USER_RW,
-                            &[(object_id, phys)],
-                            &mut installed,
+                            PageFlags::USER_RX,
+                            &mut records[..1],
                         )
                     })
                     .expect("install");
-                state.with_memory_state_mut(|memory| {
-                    crate::kernel::syscall::vm::note_inserted_locked(memory, &installed);
-                });
-                assert_eq!(
-                    refcounts(&state, object_id),
-                    Some((0, 1)),
-                    "the map reference exists BEFORE any capability does"
-                );
-
-                // Phase M publishes the cap. A sibling immediately revokes it — the most hostile
-                // thing it could do to this transaction's provisional slot.
-                let cap = state.mint_anonymous_frame_cap(object_id).expect("mint");
-                state
-                    .revoke_capability_in_cnode(cnode, cap)
-                    .expect("sibling revoke");
-
-                // The revoke drops the capability reference and asks for a reclaim. It cannot
-                // get one: the map reference this transaction took first is still held.
-                assert_eq!(
-                    refcounts(&state, object_id),
-                    Some((0, 1)),
-                    "the object survives its capability's revocation because it is mapped"
-                );
-                assert_eq!(
-                    resolve_page(&state, asid, virt).map(|mapping| mapping.phys),
-                    Some(phys),
-                    "and the mapping still points at backing that was never freed or recycled"
-                );
+                assert!(records[0].installed, "our page was written");
                 assert!(
-                    state.memory_object_slot_by_id(object_id).is_some(),
-                    "the backing object is still live"
+                    !records[1].installed,
+                    "the competitor's page was never written by us"
+                );
+
+                // The competitor's mapping is untouched by anything we did.
+                assert_eq!(
+                    resolve_page(&state, asid, competitor_virt),
+                    Some(competitor_mapping),
+                    "a page this transaction never installed must be left exactly as it is, even \
+                     when a record names its VA and its physical backing"
+                );
+                assert_eq!(
+                    refcounts(&state, competitor_object),
+                    Some((1, 1)),
+                    "and its accounting is untouched"
                 );
             })
             .expect("spawn")
@@ -168862,41 +168726,97 @@ mod u9vment1_ownership_cases {
     }
 
     #[test]
-    fn case2_compensation_cannot_reach_a_sibling_replacement_of_the_slot() {
+    fn finding2_install_failure_restores_the_whole_range_inside_one_acquisition() {
+        // Force a real page-table failure part-way through, with displaced mappings before it and
+        // an unrelated mapping outside the range, and check the post-state directly.
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
-                let (mut state, _asid) = kernel_with_asid();
-                let cnode = state.current_task_cnode().expect("cnode");
-
-                let ours = acquire_provisional(&mut state);
-                // A sibling revokes our provisional cap and mints its own thing into the freed
-                // slot — the "replaced during preparation" shape.
-                state
-                    .revoke_capability_in_cnode(cnode, ours.cap)
-                    .expect("sibling revoke");
-                let sibling_cap = state
-                    .mint_capability_in_cnode(
-                        cnode,
-                        Capability::new(CapObject::Kernel, CapRights::READ),
-                    )
-                    .expect("sibling mint");
-                assert_eq!(
-                    sibling_cap.index(),
-                    ours.cap.index(),
-                    "the sibling took the very slot our recorded CapId names"
+                let (mut state, asid) = kernel_with_asid();
+                let base = 0x70_0000usize;
+                let displaced = premap(
+                    &mut state,
+                    asid,
+                    base,
+                    &[(0, PageFlags::USER_RW), (1, PageFlags::USER_RX)],
                 );
+                let unrelated = premap(&mut state, asid, base, &[(32, PageFlags::USER_RW)]);
 
-                // Our compensation runs. It must not remove the sibling's capability.
+                // A record whose physical address is misaligned makes `map_page` refuse with
+                // `Misaligned` — a real refusal from the production body, at a chosen index.
+                let mut records = Vec::new();
+                for page in 0..3usize {
+                    let (object_id, phys) =
+                        state.alloc_anonymous_object_without_cap().expect("object");
+                    let phys = if page == 2 {
+                        PhysAddr(phys.0 + 1)
+                    } else {
+                        phys
+                    };
+                    records.push(PageRecord {
+                        virt: VirtAddr((base + page * PAGE) as u64),
+                        object_id,
+                        phys,
+                        cap: None,
+                        installed: false,
+                        replaced: None,
+                    });
+                }
+
+                let err = state
+                    .with_vm_then_memory_mut(|spaces, memory| {
+                        crate::kernel::syscall::vm::install_and_account_locked(
+                            spaces,
+                            memory,
+                            asid,
+                            PageFlags::USER_RX,
+                            &mut records,
+                        )
+                    })
+                    .expect_err("the third page must refuse");
+                assert_eq!(err.0, 2, "the failure is reported at the page that refused");
+
+                // Every displaced mapping is back, verbatim, with its accounting untouched.
+                for (object_id, virt, original) in &displaced {
+                    assert_eq!(
+                        resolve_page(&state, asid, *virt),
+                        Some(*original),
+                        "the displaced mapping at {:#x} is restored with its exact frame and \
+                         attributes",
+                        virt.0
+                    );
+                    assert_eq!(
+                        refcounts(&state, *object_id),
+                        Some((1, 1)),
+                        "and its capability and map references are untouched"
+                    );
+                }
+                // The unrelated mapping never moved.
                 assert_eq!(
-                    release_provisional(&mut state, cnode, ours),
-                    ProvisionalReleaseOutcome::NotOurs,
-                    "the object check refuses a slot that no longer holds our memory object"
+                    resolve_page(&state, asid, unrelated[0].1),
+                    Some(unrelated[0].2),
+                    "a mapping outside the range is preserved exactly"
                 );
-                let survivor = state
-                    .resolve_capability_for_task(0, sibling_cap)
-                    .expect("the sibling's capability survives compensation");
-                assert_eq!(survivor.object, CapObject::Kernel, "and it is unchanged");
+                // The two pages we wrote are marked as owing a shootdown; the one that refused is
+                // not, because it never had a translation.
+                assert_eq!(
+                    (
+                        records[0].installed,
+                        records[1].installed,
+                        records[2].installed
+                    ),
+                    (true, true, false),
+                    "exactly the pages that had live translations owe an acknowledgement"
+                );
+                // Pass B never ran, so no frame took a map reference.
+                for record in &records {
+                    if let Some((_, map_refs)) = refcounts(&state, record.object_id) {
+                        assert_eq!(
+                            map_refs, 0,
+                            "a failed address-space phase takes no map reference"
+                        );
+                    }
+                }
             })
             .expect("spawn")
             .join()
@@ -168904,28 +168824,28 @@ mod u9vment1_ownership_cases {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════════════
-    // Case 3 — mapping rollback and displaced backing.
+    // Finding 3 — a removed translation owes an acknowledgement before its backing is recycled.
     // ═══════════════════════════════════════════════════════════════════════════════════════
 
     /// A `VmMapOwners` that records the ORDER in which the transaction drives its owners, over a
-    /// simulated address space and refcount table. Its only purpose is to make ordering
-    /// obligations — "no shootdown under the VM acquisition", "no reclaim before an
-    /// acknowledgement" — directly observable; every policy decision still comes from
-    /// `run_vm_map_transaction`.
+    /// simulated address space and refcount table, and can withhold a shootdown acknowledgement.
+    /// Every policy decision still comes from `run_vm_map_transaction`.
     struct OrderingOwners {
         log: Vec<String>,
         space: BTreeMap<u64, Mapping>,
-        in_vm_acquisition: bool,
+        in_acquisition: bool,
         next_phys: u64,
         next_object: u64,
         next_cap: u64,
         fail_mint_at: Option<usize>,
+        fail_install_at: Option<usize>,
         minted: usize,
         shootdown_ok: bool,
         live_objects: Vec<u64>,
         map_refs: BTreeMap<u64, i64>,
         cap_refs: BTreeMap<u64, i64>,
         reclaimed: Vec<u64>,
+        freed: Vec<u64>,
     }
 
     impl OrderingOwners {
@@ -168933,17 +168853,19 @@ mod u9vment1_ownership_cases {
             Self {
                 log: Vec::new(),
                 space: BTreeMap::new(),
-                in_vm_acquisition: false,
+                in_acquisition: false,
                 next_phys: 0x10_0000,
                 next_object: 1,
                 next_cap: 1,
                 fail_mint_at: None,
+                fail_install_at: None,
                 minted: 0,
                 shootdown_ok: true,
                 live_objects: Vec::new(),
                 map_refs: BTreeMap::new(),
                 cap_refs: BTreeMap::new(),
                 reclaimed: Vec::new(),
+                freed: Vec::new(),
             }
         }
 
@@ -168964,6 +168886,14 @@ mod u9vment1_ownership_cases {
 
         fn index_of(&self, what: &str) -> Option<usize> {
             self.log.iter().position(|entry| entry == what)
+        }
+
+        fn live_map_refs(&self) -> BTreeMap<u64, i64> {
+            self.map_refs
+                .iter()
+                .filter(|(_, count)| **count != 0)
+                .map(|(phys, count)| (*phys, *count))
+                .collect()
         }
     }
 
@@ -168987,11 +168917,22 @@ mod u9vment1_ownership_cases {
         fn acquire_object(&mut self, _flags: PageFlags) -> Result<(u64, PhysAddr), KernelError> {
             self.say("acquire_object");
             let phys = self.next_phys;
-            self.next_phys += crate::kernel::vm::PAGE_SIZE as u64;
+            self.next_phys += PAGE as u64;
             let object_id = self.next_object;
             self.next_object += 1;
             self.live_objects.push(object_id);
             Ok((object_id, PhysAddr(phys)))
+        }
+
+        fn release_unminted_object(&mut self, object_id: u64) {
+            self.say("release_unminted_object");
+            // The production owner refuses to free backing anything still references.
+            let referenced = self.cap_refs.get(&object_id).copied().unwrap_or(0) > 0;
+            if referenced {
+                self.say("release_unminted_object_skipped");
+                return;
+            }
+            self.live_objects.retain(|live| *live != object_id);
         }
 
         fn mint_frame_cap(
@@ -169010,78 +168951,58 @@ mod u9vment1_ownership_cases {
             Ok(cap)
         }
 
-        fn release_unminted_object(&mut self, object_id: u64) {
-            self.say("release_unminted_object");
-            self.live_objects.retain(|live| *live != object_id);
-        }
-
-        fn undo_installed_range(&mut self, _asid: Asid, installed: &[InstalledPage]) {
-            self.say("undo_installed_range");
-            self.in_vm_acquisition = true;
-            for page in installed.iter().rev() {
-                match page.replaced {
-                    Some(old) => {
-                        self.space.insert(page.virt.0, old);
-                    }
-                    None => {
-                        self.space.remove(&page.virt.0);
-                    }
-                }
-            }
-            self.in_vm_acquisition = false;
-        }
-
-        fn install_range(
+        fn install_and_account(
             &mut self,
             _asid: Asid,
-            base: usize,
             flags: PageFlags,
-            objects: &[(u64, PhysAddr)],
-            out: &mut [InstalledPage],
-        ) -> Result<usize, (usize, KernelError)> {
-            self.say("install_range_begin");
-            self.in_vm_acquisition = true;
-            for (i, (_object_id, phys)) in objects.iter().enumerate() {
-                let virt = VirtAddr((base + i * crate::kernel::vm::PAGE_SIZE) as u64);
-                let replaced = self.space.insert(virt.0, Mapping { phys: *phys, flags });
-                out[i] = InstalledPage {
-                    virt,
-                    inserted: *phys,
-                    replaced,
-                };
+            records: &mut [PageRecord],
+        ) -> Result<(), (usize, KernelError)> {
+            self.say("install_begin");
+            self.in_acquisition = true;
+            // Pass A.
+            for i in 0..records.len() {
+                if self.fail_install_at == Some(i) {
+                    // Undo pass A, in the same acquisition, exactly as the production body does.
+                    for j in (0..i).rev() {
+                        match records[j].replaced {
+                            Some(old) => {
+                                self.space.insert(records[j].virt.0, old);
+                            }
+                            None => {
+                                self.space.remove(&records[j].virt.0);
+                            }
+                        }
+                    }
+                    self.in_acquisition = false;
+                    self.say("install_undo");
+                    return Err((i, KernelError::Vm(crate::kernel::vm::VmError::Full)));
+                }
+                let replaced = self.space.insert(
+                    records[i].virt.0,
+                    Mapping {
+                        phys: records[i].phys,
+                        flags,
+                    },
+                );
+                records[i].replaced = replaced;
+                records[i].installed = true;
             }
-            self.in_vm_acquisition = false;
-            self.say("install_range_end");
-            Ok(objects.len())
-        }
-
-        fn note_inserted(&mut self, installed: &[InstalledPage]) {
-            self.say("note_inserted");
-            for page in installed {
-                *self.map_refs.entry(page.inserted.0).or_insert(0) += 1;
-            }
-        }
-
-        fn unnote_inserted(&mut self, installed: &[InstalledPage]) {
-            self.say("unnote_inserted");
-            for page in installed {
-                *self.map_refs.entry(page.inserted.0).or_insert(0) -= 1;
-            }
-        }
-
-        fn settle_displaced(&mut self, _asid: Asid, installed: &[InstalledPage]) {
-            self.say("settle_displaced");
-            for page in installed {
-                if let Some(old) = page.replaced {
+            // Pass B — cannot fail.
+            for record in records.iter() {
+                *self.map_refs.entry(record.phys.0).or_insert(0) += 1;
+                if let Some(old) = record.replaced {
                     *self.map_refs.entry(old.phys.0).or_insert(0) -= 1;
                 }
             }
+            self.in_acquisition = false;
+            self.say("install_end");
+            Ok(())
         }
 
         fn complete_shootdown(&mut self, _asid: Asid, _virt: VirtAddr) -> bool {
             assert!(
-                !self.in_vm_acquisition,
-                "a shootdown wait must never run while the VM acquisition is held"
+                !self.in_acquisition,
+                "a shootdown wait must never run while a domain acquisition is held"
             );
             self.say("complete_shootdown");
             self.shootdown_ok
@@ -169108,18 +169029,147 @@ mod u9vment1_ownership_cases {
         fn account_released_cap(&mut self, frame: ProvisionalFrame) {
             self.say("account_released_cap");
             *self.cap_refs.entry(frame.object_id).or_insert(0) -= 1;
-            self.live_objects.retain(|live| *live != frame.object_id);
+            let unreferenced = self.cap_refs.get(&frame.object_id).copied().unwrap_or(0) == 0
+                && self.map_refs.get(&frame.phys.0).copied().unwrap_or(0) == 0;
+            if unreferenced {
+                self.live_objects.retain(|live| *live != frame.object_id);
+                self.freed.push(frame.phys.0);
+            }
         }
     }
 
     const MOCK_BASE: usize = 0x20_0000;
 
     fn mock_virt(page: usize) -> u64 {
-        (MOCK_BASE + page * crate::kernel::vm::PAGE_SIZE) as u64
+        (MOCK_BASE + page * PAGE) as u64
+    }
+
+    fn run_mock(owners: &mut OrderingOwners, pages: usize) -> Result<(usize, usize), SyscallError> {
+        run_vm_map_transaction(
+            owners,
+            MapTarget::CallerAddressSpace,
+            MOCK_BASE,
+            pages * PAGE,
+            0x1 | 0x4,
+        )
     }
 
     #[test]
-    fn case3_committed_run_shoots_down_before_every_reclaim_and_never_under_the_acquisition() {
+    fn finding3_install_failure_acknowledges_every_removed_translation_before_freeing_backing() {
+        let mut owners = OrderingOwners::new();
+        for page in 0..2 {
+            owners.premap(
+                mock_virt(page),
+                0x90_0000 + page as u64 * 0x1000,
+                PageFlags::USER_RW,
+            );
+        }
+        let before_space = owners.space.clone();
+        let before_map_refs = owners.live_map_refs();
+        owners.fail_install_at = Some(3);
+
+        run_mock(&mut owners, 5).expect_err("the address-space phase must fail");
+
+        // The address space is exactly as it was.
+        assert_eq!(
+            owners.space, before_space,
+            "every displaced mapping is restored and every page we created is removed"
+        );
+        assert_eq!(
+            owners.live_map_refs(),
+            before_map_refs,
+            "and no map reference is left behind"
+        );
+        // Every page that had a live translation was acknowledged BEFORE its backing was freed.
+        let installed_pages = 3usize;
+        assert_eq!(
+            owners
+                .log
+                .iter()
+                .filter(|e| *e == "complete_shootdown")
+                .count(),
+            installed_pages,
+            "one acknowledgement per removed translation: {:?}",
+            owners.log
+        );
+        let first_ack = owners.index_of("complete_shootdown").expect("an ack ran");
+        let first_release = owners
+            .index_of("release_provisional_cap")
+            .expect("a release ran");
+        assert!(
+            first_ack < first_release,
+            "no backing may be released before its translation is acknowledged: {:?}",
+            owners.log
+        );
+        // And the undo ran inside the acquisition, before any of it.
+        let undo = owners.index_of("install_undo").expect("undo ran");
+        assert!(
+            undo < first_ack,
+            "the address space is restored inside the acquisition, then the waits run: {:?}",
+            owners.log
+        );
+        assert!(
+            owners.live_objects.is_empty() && owners.cap_refs.values().all(|c| *c == 0),
+            "every object and capability the request acquired is released"
+        );
+    }
+
+    #[test]
+    fn finding3_an_unacknowledged_rollback_keeps_its_backing_rather_than_recycling_it() {
+        let mut owners = OrderingOwners::new();
+        owners.shootdown_ok = false;
+        owners.fail_install_at = Some(2);
+
+        run_mock(&mut owners, 4).expect_err("the address-space phase must fail");
+
+        assert_eq!(
+            owners
+                .log
+                .iter()
+                .filter(|e| *e == "complete_shootdown")
+                .count(),
+            2,
+            "both removed translations still ask for their acknowledgement"
+        );
+        // Pages 0 and 1 had live translations and were not acknowledged, so their backing stays
+        // put. Pages 2 and 3 never had one — page 2 is where the install refused, page 3 was
+        // never reached — so they owe nothing and are released normally.
+        let installed_phys = [0x10_0000u64, 0x10_1000];
+        let never_installed_phys = [0x10_2000u64, 0x10_3000];
+        for phys in installed_phys {
+            assert!(
+                !owners.freed.contains(&phys),
+                "backing whose acknowledgement is outstanding must not return to the allocator: \
+                 {:?}",
+                owners.log
+            );
+        }
+        for phys in never_installed_phys {
+            assert!(
+                owners.freed.contains(&phys),
+                "backing that never had a translation owes no acknowledgement and is released"
+            );
+        }
+        // The two unacknowledged pages keep their capability, which is what keeps their object
+        // and their frame alive.
+        assert_eq!(
+            owners.cap_refs.values().filter(|c| **c > 0).count(),
+            2,
+            "exactly the unacknowledged pages retain their capability"
+        );
+        assert_eq!(
+            owners.live_objects.len(),
+            2,
+            "and exactly their objects stay live"
+        );
+        assert!(
+            owners.live_map_refs().is_empty(),
+            "a failed address-space phase took no map reference, so none is left behind either"
+        );
+    }
+
+    #[test]
+    fn finding3_committed_run_shoots_down_before_every_reclaim_and_never_under_an_acquisition() {
         let mut owners = OrderingOwners::new();
         for page in 0..3 {
             owners.premap(
@@ -169130,26 +169180,15 @@ mod u9vment1_ownership_cases {
         }
         let displaced: Vec<u64> = (0..3).map(|p| 0x90_0000 + p as u64 * 0x1000).collect();
 
-        run_vm_map_transaction(
-            &mut owners,
-            MapTarget::CallerAddressSpace,
-            MOCK_BASE,
-            3 * crate::kernel::vm::PAGE_SIZE,
-            0x1 | 0x4, // READ|EXEC — no guard-page interaction, the page below IS unmapped anyway
-        )
-        .expect("the run commits");
+        run_mock(&mut owners, 3).expect("the request commits");
 
-        // Ordering: the VM acquisition is finished before any wait begins, and the displaced
-        // accounting happens before the waits, not interleaved with them.
-        let install_end = owners.index_of("install_range_end").expect("install end");
-        let settle = owners.index_of("settle_displaced").expect("settle");
+        let install_end = owners.index_of("install_end").expect("install end");
         let first_wait = owners.index_of("complete_shootdown").expect("a wait ran");
         assert!(
-            install_end < settle && settle < first_wait,
-            "install (rank 5) → displaced accounting (rank 6) → shootdown wait (no lock): {:?}",
+            install_end < first_wait,
+            "the acquisition is finished before any wait begins: {:?}",
             owners.log
         );
-        // And every reclaim is immediately preceded by its own acknowledged shootdown.
         for (i, entry) in owners.log.iter().enumerate() {
             if entry == "reclaim_replaced" {
                 assert_eq!(
@@ -169164,14 +169203,10 @@ mod u9vment1_ownership_cases {
             owners.reclaimed, displaced,
             "each displaced frame is reclaimed exactly once, in page order"
         );
-        // The map reference moved from the displaced frames to the inserted ones.
-        for phys in &displaced {
-            assert_eq!(owners.map_refs.get(phys).copied(), Some(0));
-        }
     }
 
     #[test]
-    fn case3_unacknowledged_shootdown_blocks_the_reclaim() {
+    fn finding3_unacknowledged_displaced_shootdown_blocks_the_reclaim() {
         let mut owners = OrderingOwners::new();
         owners.shootdown_ok = false;
         for page in 0..3 {
@@ -169181,16 +169216,7 @@ mod u9vment1_ownership_cases {
                 PageFlags::USER_RW,
             );
         }
-
-        run_vm_map_transaction(
-            &mut owners,
-            MapTarget::CallerAddressSpace,
-            MOCK_BASE,
-            3 * crate::kernel::vm::PAGE_SIZE,
-            0x1 | 0x4,
-        )
-        .expect("the run still commits — the mapping is installed either way");
-
+        run_mock(&mut owners, 3).expect("the request still commits");
         assert_eq!(
             owners
                 .log
@@ -169202,215 +169228,223 @@ mod u9vment1_ownership_cases {
         );
         assert!(
             owners.reclaimed.is_empty(),
-            "but no frame may be reused until the acknowledgement arrives: {:?}",
-            owners.log
+            "but no frame may be reused until the acknowledgement arrives"
         );
     }
 
     #[test]
-    fn case3_mint_failure_after_several_installations_restores_the_whole_range() {
+    fn mint_failure_settles_without_touching_the_address_space() {
+        // The mint now precedes the address-space phase, so its failure has no mappings to undo
+        // and owes no shootdown — the ordering that makes the whole address-space phase provable.
         let mut owners = OrderingOwners::new();
-        // Three pages displaced with DISTINCT attributes, one page mapping nothing, plus an
-        // unrelated mapping that has nothing to do with this range.
-        owners.premap(mock_virt(0), 0x90_0000, PageFlags::USER_RW);
-        owners.premap(mock_virt(1), 0x91_0000, PageFlags::USER_RX);
-        owners.premap(mock_virt(2), 0x92_0000, PageFlags::USER_RW);
-        owners.premap(mock_virt(9), 0x99_0000, PageFlags::USER_RX);
-        let before = owners.space.clone();
-        let map_refs_before = owners.map_refs.clone();
-
-        // Fail the THIRD mint, so two provisional caps and four installed pages exist when the
-        // transaction has to settle.
         owners.fail_mint_at = Some(2);
-        let err = run_vm_map_transaction(
-            &mut owners,
-            MapTarget::CallerAddressSpace,
-            MOCK_BASE,
-            4 * crate::kernel::vm::PAGE_SIZE,
-            0x1 | 0x4,
-        )
-        .expect_err("the mint phase must fail");
-        assert!(
-            !matches!(err, crate::kernel::syscall::SyscallError::WouldBlock),
-            "the failure is the real one, not a manufactured refusal"
-        );
+        run_mock(&mut owners, 4).expect_err("the mint must fail");
 
-        assert_eq!(
-            owners.space, before,
-            "every displaced mapping is back with its exact physical frame and attributes, the \
-             page that displaced nothing is unmapped again, and the unrelated mapping is untouched"
-        );
-        let live_map_refs: BTreeMap<u64, i64> = owners
-            .map_refs
-            .iter()
-            .filter(|(_, count)| **count != 0)
-            .map(|(phys, count)| (*phys, *count))
-            .collect();
-        assert_eq!(
-            live_map_refs, map_refs_before,
-            "and no map reference is left behind on either the inserted or the displaced frames"
-        );
         assert!(
-            owners.live_objects.is_empty(),
-            "every object this run acquired is released — the two that were minted through the \
-             capability release, the two that never were through the object release"
-        );
-        assert!(
-            owners.cap_refs.values().all(|count| *count == 0),
-            "and no capability reference survives"
-        );
-        assert!(
-            owners.reclaimed.is_empty(),
-            "a failed run reclaims nothing: it displaced nothing permanently"
-        );
-
-        // The settlement order the case demands.
-        let undo = owners.index_of("undo_installed_range").expect("undo");
-        let unnote = owners.index_of("unnote_inserted").expect("unnote");
-        let release_cap = owners
-            .index_of("release_provisional_cap")
-            .expect("cap release");
-        let release_object = owners
-            .index_of("release_unminted_object")
-            .expect("object release");
-        assert!(
-            undo < unnote && unnote < release_cap && release_cap < release_object,
-            "mappings → map references → capabilities → objects, so a frame is never \
-             reclaimable while its PTE is live: {:?}",
+            owners.index_of("install_begin").is_none(),
+            "no page-table write may happen once the mint has failed: {:?}",
             owners.log
         );
         assert!(
-            owners.index_of("settle_displaced").is_none(),
-            "the irreversible displaced-side accounting must never run on a failing path"
+            owners.index_of("complete_shootdown").is_none(),
+            "and nothing owes an acknowledgement"
+        );
+        assert!(owners.space.is_empty(), "the address space is untouched");
+        assert!(
+            owners.live_objects.is_empty() && owners.cap_refs.values().all(|c| *c == 0),
+            "the two capabilities minted and the four objects acquired are all released"
         );
     }
 
     #[test]
-    fn case3_live_mint_failure_restores_displaced_mappings_in_a_real_address_space() {
+    fn release_unminted_object_never_frees_backing_something_still_references() {
+        // The §2 lifetime obligation, against the production owner: an object that has acquired a
+        // capability, map or pin reference is left alone rather than having its frame returned.
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 let (mut state, asid) = kernel_with_asid();
-                let cnode = state.current_task_cnode().expect("cnode");
-                let base = 0x50_0000usize;
+                let free_before = free_frames(&state);
 
-                // Three real displaced mappings with distinct attributes, and one unrelated
-                // mapping well outside the range.
-                let mut displaced = Vec::new();
-                for (page, flags) in [
-                    (0usize, PageFlags::USER_RW),
-                    (1, PageFlags::USER_RX),
-                    (2, PageFlags::USER_RW),
-                ] {
-                    let (object_id, mem_cap) =
-                        state.alloc_anonymous_memory_object().expect("alloc");
-                    let virt = VirtAddr((base + page * crate::kernel::vm::PAGE_SIZE) as u64);
-                    state
-                        .map_user_page_in_asid_with_caps(asid, mem_cap, virt, flags)
-                        .expect("premap");
-                    displaced.push((
-                        object_id,
-                        virt,
-                        resolve_page(&state, asid, virt).expect("mapped"),
-                    ));
-                }
-                let unrelated_virt = VirtAddr((base + 16 * crate::kernel::vm::PAGE_SIZE) as u64);
-                let (_unrelated_id, unrelated_cap) =
-                    state.alloc_anonymous_memory_object().expect("alloc");
-                state
-                    .map_user_page_in_asid_with_caps(
-                        asid,
-                        unrelated_cap,
-                        unrelated_virt,
-                        PageFlags::USER_RW,
-                    )
-                    .expect("premap unrelated");
-                let unrelated_before = resolve_page(&state, asid, unrelated_virt).expect("mapped");
-
-                // Fill the cspace so that exactly TWO mints can still succeed. The transaction
-                // asks for four pages, so its third mint fails for real.
-                let mut filler = 0usize;
-                loop {
-                    let free_slots = state.with_capability_state(|capability| {
-                        capability
-                            .cnode_spaces
-                            .iter()
-                            .flatten()
-                            .find(|space| space.id == cnode)
-                            .map(|space| {
-                                space.slot_capacity - kernel_ref(&space.cspace).occupied_slots()
-                            })
-                            .unwrap_or(0)
-                    });
-                    if free_slots <= 2 {
-                        break;
-                    }
-                    state
-                        .mint_capability_in_cnode(
-                            cnode,
-                            Capability::new(CapObject::Kernel, CapRights::READ),
-                        )
-                        .expect("filler mint");
-                    filler += 1;
-                    assert!(filler < 4096, "the cspace must fill");
-                }
-
-                let quiescent = (
-                    free_frames(&state),
-                    state.live_memory_object_count_for_test(),
-                    cnode_occupied(&state, cnode),
-                );
-
-                let mut frame = TrapFrame::new(
-                    crate::kernel::syscall::Syscall::VmAnonMap as usize,
-                    [0, base, 4 * crate::kernel::vm::PAGE_SIZE, 0x1 | 0x4, 0, 0],
-                );
-                let result = state.handle_trap(Trap::Syscall, Some(&mut frame));
+                // Unreferenced: released, frame returned.
+                let (bare, _) = state.alloc_anonymous_object_without_cap().expect("object");
+                state.release_unminted_anonymous_object(bare);
                 assert!(
-                    result.is_err() || frame.error_code().is_some(),
-                    "the mint phase must fail once the cspace is full"
+                    state.memory_object_slot_by_id(bare).is_none(),
+                    "an object nothing references is released"
+                );
+                assert_eq!(free_frames(&state), free_before, "and its frame returns");
+
+                // Capability-referenced: refused.
+                let held = acquire_provisional(&mut state);
+                state.release_unminted_anonymous_object(held.object_id);
+                assert_eq!(
+                    refcounts(&state, held.object_id),
+                    Some((1, 0)),
+                    "an object a capability names must not be released"
                 );
 
-                // Every displaced mapping is back, verbatim, with its refcounts intact.
-                for (object_id, virt, original) in &displaced {
-                    assert_eq!(
-                        resolve_page(&state, asid, *virt),
-                        Some(*original),
-                        "the displaced mapping at {:#x} must be restored with its exact frame \
-                         and attributes",
-                        virt.0
-                    );
-                    assert_eq!(
-                        refcounts(&state, *object_id),
-                        Some((1, 1)),
-                        "and with its capability and map references untouched"
-                    );
-                }
-                // The page that displaced nothing is unmapped again.
+                // Map-referenced: refused, even with no capability at all.
+                let (mapped_object, mapped_phys) =
+                    state.alloc_anonymous_object_without_cap().expect("object");
+                let mut records = [PageRecord {
+                    virt: VirtAddr(0x80_0000),
+                    object_id: mapped_object,
+                    phys: mapped_phys,
+                    cap: None,
+                    installed: false,
+                    replaced: None,
+                }];
+                state
+                    .with_vm_then_memory_mut(|spaces, memory| {
+                        crate::kernel::syscall::vm::install_and_account_locked(
+                            spaces,
+                            memory,
+                            asid,
+                            PageFlags::USER_RX,
+                            &mut records,
+                        )
+                    })
+                    .expect("install");
                 assert_eq!(
-                    resolve_page(
-                        &state,
-                        asid,
-                        VirtAddr((base + 3 * crate::kernel::vm::PAGE_SIZE) as u64)
-                    ),
-                    None,
-                    "a page this run created and then rolled back must not survive"
+                    refcounts(&state, mapped_object),
+                    Some((0, 1)),
+                    "the map reference is taken in the SAME acquisition as the install"
                 );
-                // The unrelated mapping never moved.
+                state.release_unminted_anonymous_object(mapped_object);
                 assert_eq!(
-                    resolve_page(&state, asid, unrelated_virt),
-                    Some(unrelated_before),
-                    "a mapping outside the range must be preserved exactly"
+                    refcounts(&state, mapped_object),
+                    Some((0, 1)),
+                    "backing a live mapping references must not return to the allocator"
                 );
-                // And the run left nothing of its own behind.
                 assert_eq!(
-                    (
-                        free_frames(&state),
-                        state.live_memory_object_count_for_test(),
-                        cnode_occupied(&state, cnode),
-                    ),
-                    quiescent,
-                    "frames, objects and capability slots all return to their pre-call values"
+                    resolve_page(&state, asid, VirtAddr(0x80_0000)).map(|m| m.phys),
+                    Some(mapped_phys),
+                    "and the mapping still points at it"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // Provisional-cap compensation — scoped to CNode, slot generation and object identity.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn provisional_release_declines_an_identity_mismatched_replacement_and_preserves_it() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let ours = acquire_provisional(&mut state);
+
+                // A sibling retires it and takes the slot. `revoke` bumps the slot generation, so
+                // the replacement's CapId differs even though it lands on the same slot INDEX.
+                state
+                    .revoke_capability_in_cnode(cnode, ours.cap)
+                    .expect("sibling revoke");
+                let theirs = acquire_provisional(&mut state);
+                assert_eq!(theirs.cap.index(), ours.cap.index(), "same slot index");
+                assert_ne!(theirs.cap, ours.cap, "moved generation");
+
+                let before = quiescent(&state, cnode);
+                assert_eq!(
+                    release_provisional(&mut state, cnode, ours),
+                    ProvisionalReleaseOutcome::NotOurs,
+                    "a replacement slot is not this transaction's to remove"
+                );
+                assert_eq!(
+                    quiescent(&state, cnode),
+                    before,
+                    "declining removes no cap, object or frame"
+                );
+                assert_eq!(
+                    state
+                        .resolve_capability_for_task(0, theirs.cap)
+                        .expect("still resolves")
+                        .object,
+                    CapObject::MemoryObject {
+                        id: theirs.object_id
+                    },
+                    "the replacement still names its own object"
+                );
+
+                // The same-generation shape: a live cap of ours, recorded against another object.
+                let wrong_object = ProvisionalFrame {
+                    object_id: theirs.object_id.wrapping_add(1_000_000),
+                    ..theirs
+                };
+                assert_eq!(
+                    release_provisional(&mut state, cnode, wrong_object),
+                    ProvisionalReleaseOutcome::NotOurs,
+                    "an exact-generation slot holding a DIFFERENT object is not ours either"
+                );
+                assert!(state.resolve_capability_for_task(0, theirs.cap).is_ok());
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn provisional_release_retains_an_escaped_cap_and_its_cleanup_owner_retires_it() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let start = quiescent(&state, cnode);
+
+                let ours = acquire_provisional(&mut state);
+                let alias = state
+                    .mint_capability_in_cnode(
+                        cnode,
+                        Capability::new(
+                            CapObject::MemoryObject { id: ours.object_id },
+                            KernelState::memory_object_rights_for_kind(MemoryObjectKind::Anonymous),
+                        ),
+                    )
+                    .expect("alias mint");
+                record_link(&mut state, ours.cap, alias);
+
+                let before = quiescent(&state, cnode);
+                assert_eq!(
+                    release_provisional(&mut state, cnode, ours),
+                    ProvisionalReleaseOutcome::Derived,
+                    "a cap another transaction derived from is retained, never removed"
+                );
+                assert_eq!(
+                    quiescent(&state, cnode),
+                    before,
+                    "retention changes nothing at all"
+                );
+
+                // "Still referenced" is not the compensation claim. The claim is that a retained
+                // provisional cap is in exactly the state a successfully returned mapping cap is
+                // in, and is retired by the same owner: `revoke_capability_in_cnode`, which
+                // process teardown drives once per live cap.
+                state
+                    .revoke_capability_in_cnode(cnode, alias)
+                    .expect("alias revoke");
+                assert_eq!(
+                    refcounts(&state, ours.object_id),
+                    Some((1, 0)),
+                    "the source cap is the object's last reference"
+                );
+                state
+                    .revoke_capability_in_cnode(cnode, ours.cap)
+                    .expect("cleanup owner");
+                assert_eq!(
+                    quiescent(&state, cnode),
+                    start,
+                    "the source cap, its object and its frame are all retired"
+                );
+                assert!(
+                    state.memory_object_slot_by_id(ours.object_id).is_none(),
+                    "the backing is genuinely reclaimed, not merely still referenced"
                 );
             })
             .expect("spawn")
@@ -169419,74 +169453,120 @@ mod u9vment1_ownership_cases {
     }
 
     #[test]
-    fn case3_live_control_the_same_request_commits_when_the_cspace_has_headroom() {
-        // The control for the test above. Same address space, same premapped range, same four
-        // page request — the ONLY difference is that the cspace is not full. It commits. That is
-        // what attributes the other run's failure to the MINT phase specifically, rather than to
-        // frame exhaustion or a page-table refusal, which no error code would distinguish.
+    fn provisional_release_retains_a_cap_with_an_in_cspace_child() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let cnode = state.current_task_cnode().expect("cnode");
+                let ours = acquire_provisional(&mut state);
+                let child = state
+                    .with_capability_state_mut(|capability| {
+                        capability
+                            .cnode_spaces
+                            .iter_mut()
+                            .flatten()
+                            .find(|space| space.id == cnode)
+                            .map(|space| kernel_mut(&mut space.cspace))
+                            .expect("cspace")
+                            .mint_derived(ours.cap, CapRights::READ)
+                    })
+                    .expect("derived child");
+                assert_eq!(
+                    release_provisional(&mut state, cnode, ours),
+                    ProvisionalReleaseOutcome::Derived,
+                    "a cap with a live in-cspace child is not a leaf"
+                );
+                assert!(state.resolve_capability_for_task(0, ours.cap).is_ok());
+                assert!(state.resolve_capability_for_task(0, child).is_ok());
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn process_teardown_drives_the_cleanup_owner_over_every_live_cap() {
+        const CNODE_SRC: &str = include_str!("cnode_state.rs");
+        let body = CNODE_SRC
+            .split("fn maybe_cleanup_process_cnode_for_pid(")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub(crate) fn ").next())
+            .expect("the alloc-capable process cnode cleanup");
+        assert!(
+            body.contains("live_cap_ids()")
+                && body.contains("revoke_capability_in_cnode(cnode, cap)"),
+            "process teardown must retire each live cap through `revoke_capability_in_cnode`"
+        );
+        const LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+        let revoke = LIFECYCLE_SRC
+            .split("fn revoke_capability_in_cnode(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("revoke_capability_in_cnode");
+        assert!(
+            revoke.contains("adjust_memory_object_cap_refcount(capability.object, -1)")
+                && revoke.contains("reclaim_memory_object_if_unreferenced(capability.object)"),
+            "the cleanup owner must drop the cap reference and reclaim the object"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // The committed path, live, against real state.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn a_committed_request_displaces_settles_and_leaves_unrelated_mappings_alone() {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 let (mut state, asid) = kernel_with_asid();
-                let base = 0x50_0000usize;
-
-                let mut displaced = Vec::new();
-                for (page, flags) in [
-                    (0usize, PageFlags::USER_RW),
-                    (1, PageFlags::USER_RX),
-                    (2, PageFlags::USER_RW),
-                ] {
-                    let (object_id, mem_cap) =
-                        state.alloc_anonymous_memory_object().expect("alloc");
-                    let virt = VirtAddr((base + page * crate::kernel::vm::PAGE_SIZE) as u64);
-                    state
-                        .map_user_page_in_asid_with_caps(asid, mem_cap, virt, flags)
-                        .expect("premap");
-                    displaced.push((object_id, virt, mem_cap));
-                }
+                let base = 0x90_0000usize;
+                let displaced = premap(
+                    &mut state,
+                    asid,
+                    base,
+                    &[(0, PageFlags::USER_RW), (1, PageFlags::USER_RX)],
+                );
+                let unrelated = premap(&mut state, asid, base, &[(48, PageFlags::USER_RW)]);
 
                 let mut frame = TrapFrame::new(
                     crate::kernel::syscall::Syscall::VmAnonMap as usize,
-                    [0, base, 4 * crate::kernel::vm::PAGE_SIZE, 0x1 | 0x4, 0, 0],
+                    [0, base, 4 * PAGE, 0x1 | 0x4, 0, 0],
                 );
                 let result = state.handle_trap(Trap::Syscall, Some(&mut frame));
                 assert!(
                     result.is_ok() && frame.error_code().is_none(),
-                    "with cspace headroom the identical request commits"
+                    "the request commits"
                 );
 
-                // All four pages are now this run's, and each displaced page really was replaced.
                 for page in 0..4 {
-                    let virt = VirtAddr((base + page * crate::kernel::vm::PAGE_SIZE) as u64);
+                    let virt = VirtAddr((base + page * PAGE) as u64);
                     assert!(
                         resolve_page(&state, asid, virt).is_some(),
-                        "page {page} must be mapped after a committed run"
+                        "page {page} is mapped"
                     );
                 }
-                for (object_id, virt, _) in &displaced {
+                for (object_id, virt, original) in &displaced {
                     let now = resolve_page(&state, asid, *virt).expect("mapped");
-                    let old_phys = state.with_memory_state(|memory| {
-                        memory
-                            .memory_objects
-                            .iter()
-                            .flatten()
-                            .find(|object| object.id == *object_id)
-                            .map(|object| object.phys)
-                    });
                     assert_ne!(
-                        Some(now.phys),
-                        old_phys,
-                        "the displaced page is backed by this run's frame now"
+                        now.phys, original.phys,
+                        "the displaced page is backed by this request's frame now"
                     );
-                    // The displaced object lost its map reference but keeps its capability one,
-                    // so its backing is deliberately NOT reclaimed: the shootdown-gated reclaim
-                    // is refused by the very refcount rule that protects a still-referenced frame.
+                    // The displaced object lost its map reference but keeps its capability, so
+                    // the shootdown-gated reclaim is refused by the refcount rule that protects a
+                    // still-referenced frame.
                     assert_eq!(
                         refcounts(&state, *object_id),
                         Some((1, 0)),
                         "map reference dropped, capability reference kept"
                     );
                 }
+                assert_eq!(
+                    resolve_page(&state, asid, unrelated[0].1),
+                    Some(unrelated[0].2),
+                    "a mapping outside the range is preserved exactly"
+                );
             })
             .expect("spawn")
             .join()
@@ -169821,8 +169901,9 @@ mod u9vment1_reachability_matrix {
                 "fn validate_map_args(",
                 "fn classify_brk(",
                 "fn guard_page_refuses(",
-                "fn release_frames<",
-                "fn run_one_map_run",
+                "fn release_capabilities<",
+                "fn settle_rollback_shootdowns<",
+                "fn run_vm_map_transaction",
             ] {
                 assert!(
                     !code.contains(owned_by_the_transaction),
@@ -169834,11 +169915,7 @@ mod u9vment1_reachability_matrix {
         let split = code_only(&VM_SPLIT);
         let broad = code_only(&VM);
         for shared_body in [
-            "install_range_locked(",
-            "undo_installed_locked(",
-            "note_inserted_locked(",
-            "unnote_inserted_locked(",
-            "settle_displaced_locked(",
+            "install_and_account_locked(",
             "release_provisional_frame_cap_locked(",
         ] {
             assert!(

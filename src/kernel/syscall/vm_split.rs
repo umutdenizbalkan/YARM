@@ -11,10 +11,10 @@ use crate::kernel::capabilities::{CapId, CapObject};
 // U9-VM-ENTRY1 — the SPLIT adapter for NR 3 / NR 13 / NR 14.
 //
 // One method per domain acquisition, driving the SAME `vm_txn` policy the broad handlers drive.
-// Three of its methods delegate to the very same rank-local bodies the broad adapter uses
-// (`install_range_locked`, `note_inserted_locked`, `release_provisional_frame_cap_locked`), so
-// two routes cannot disagree about installation, accounting or exclusivity — they are not two
-// implementations of one contract, they are one implementation reached through two acquisitions.
+// Two of its methods delegate to the very same rank-local bodies the broad adapter uses
+// (`install_and_account_locked`, `release_provisional_frame_cap_locked`), so the two routes cannot
+// disagree about installation, accounting or exclusivity — they are not two implementations of one
+// contract, they are one implementation reached through two acquisitions.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 
 /// The split adapter. `tid` is the authoritative requester identity the trap seam resolved, never
@@ -63,8 +63,7 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         flags: crate::kernel::vm::PageFlags,
     ) -> Result<(u64, crate::kernel::vm::PhysAddr), KernelError> {
         // The delivered rights predicate, asked of the rights the mint will carry. Same question,
-        // same error, same position — and no capability needed to ask it, which is what lets the
-        // mint be the transaction's last mutation.
+        // same error, same position, and no capability needed to ask it.
         crate::kernel::syscall::vm::anonymous_rights_admit(flags)?;
         self.shared.alloc_anonymous_object_without_cap_split()
     }
@@ -83,7 +82,9 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         // `mint_capability_with_memory_ref_split` is Stage 186D-proper's Model-A discipline: the
         // object's `cap_refcount` is bumped BEFORE any cnode slot can reference it, so no
         // concurrent reclaim can free an object a freshly published slot already names. This is
-        // its first live caller.
+        // its first live caller, and the discipline matters more here than it did: the mint runs
+        // BEFORE the address-space phase, so from this point the object carries a capability
+        // reference for the whole of it.
         self.shared.mint_capability_with_memory_ref_split(
             cnode,
             Capability::new(
@@ -97,54 +98,21 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         self.shared.release_unminted_object_split(object_id);
     }
 
-    fn undo_installed_range(
+    fn install_and_account(
         &mut self,
         asid: crate::kernel::vm::Asid,
-        installed: &[crate::kernel::syscall::vm_txn::InstalledPage],
-    ) {
-        // ONE rank-5 acquisition, the same body the install phase's own undo uses.
-        self.shared.with_vm_user_spaces_split_mut(|spaces| {
-            crate::kernel::syscall::vm::undo_installed_locked(spaces, asid, installed)
-        });
-    }
-
-    fn install_range(
-        &mut self,
-        asid: crate::kernel::vm::Asid,
-        base: usize,
         flags: crate::kernel::vm::PageFlags,
-        objects: &[(u64, crate::kernel::vm::PhysAddr)],
-        out: &mut [crate::kernel::syscall::vm_txn::InstalledPage],
-    ) -> Result<usize, (usize, KernelError)> {
-        // ONE rank-5 acquisition covering install AND undo — the same body the broad adapter
+        records: &mut [crate::kernel::syscall::vm_txn::PageRecord],
+    ) -> Result<(), (usize, KernelError)> {
+        // ONE acquisition covering the WHOLE address-space phase of the request — VM rank 5, then
+        // memory rank 6 nested underneath it, which is the legal direction and the seam
+        // `with_vm_then_memory_split_mut` exists for. It runs the very same body the broad adapter
         // runs, so the ownership proof is identical on both routes.
-        self.shared.with_vm_user_spaces_split_mut(|spaces| {
-            crate::kernel::syscall::vm::install_range_locked(
-                spaces, asid, base, flags, objects, out,
+        self.shared.with_vm_then_memory_split_mut(|spaces, memory| {
+            crate::kernel::syscall::vm::install_and_account_locked(
+                spaces, memory, asid, flags, records,
             )
         })
-    }
-
-    fn note_inserted(&mut self, installed: &[crate::kernel::syscall::vm_txn::InstalledPage]) {
-        self.shared.with_memory_split_mut(|memory| {
-            crate::kernel::syscall::vm::note_inserted_locked(memory, installed);
-        });
-    }
-
-    fn unnote_inserted(&mut self, installed: &[crate::kernel::syscall::vm_txn::InstalledPage]) {
-        self.shared.with_memory_split_mut(|memory| {
-            crate::kernel::syscall::vm::unnote_inserted_locked(memory, installed);
-        });
-    }
-
-    fn settle_displaced(
-        &mut self,
-        asid: crate::kernel::vm::Asid,
-        installed: &[crate::kernel::syscall::vm_txn::InstalledPage],
-    ) {
-        self.shared.with_memory_split_mut(|memory| {
-            crate::kernel::syscall::vm::settle_displaced_locked(memory, asid, installed);
-        });
     }
 
     fn complete_shootdown(
@@ -212,6 +180,7 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
                     VmRollbackReason::FrameAlloc => "frame_alloc",
                     VmRollbackReason::PageTableUpdate => "pt_update",
                     VmRollbackReason::CapabilityMint => "cap_mint",
+                    VmRollbackReason::JournalReserve => "journal_reserve",
                 };
                 crate::yarm_log!(
                     "VM_MAP_SPLIT_ROLLBACK_OK reason={} released={} retained={}",
@@ -376,21 +345,15 @@ impl crate::runtime::SharedKernel {
         })
     }
 
-    /// rank 6 — release an object that no capability ever came to reference.
+    /// rank 6 — release an object that no capability and no mapping ever came to reference.
     ///
-    /// Reached when a later phase of the transaction refuses, so the object is unreachable by
-    /// construction: nothing ever published a slot naming it.
-    /// `release_memory_object_slot_locked` returns its backing according to that backing's own
-    /// ownership rule, so an anonymous object returns its exact extent to the allocator.
+    /// The split twin of `KernelState::release_unminted_anonymous_object`, driving the SAME rank-6
+    /// body, so one rule decides on both routes: an object that has since acquired a capability,
+    /// map or pin reference is left alone rather than having its backing returned to the allocator
+    /// underneath a mapping that still references it.
     pub(crate) fn release_unminted_object_split(&self, object_id: u64) {
         self.with_memory_split_mut(|memory| {
-            if let Some(slot) = memory
-                .memory_objects
-                .iter()
-                .position(|entry| entry.is_some_and(|mem| mem.id == object_id))
-            {
-                KernelState::release_memory_object_slot_locked(memory, slot);
-            }
+            KernelState::release_unminted_object_slot_locked(memory, object_id);
         });
     }
 }
