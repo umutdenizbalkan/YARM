@@ -16261,3 +16261,91 @@ merges two rank-5 acquisitions and one rank-6 acquisition into one rank-5 → ra
 ### Next roadmap package
 
 **IPC/transfer residual completion**, including NR 4 `TransferRelease` and NR 30 `RecvSharedV3`.
+
+## U9-VM-ENTRY1-L — transaction-owned backing lifetime and guaranteed restoration
+
+Reviewed candidate `7e732c0`; base `ca65dca`. Completes the mapping transaction's lifetime and
+restoration guarantees. No route, ingress or ABI changes; NR 3, NR 13 and NR 14 keep their
+pre-lock routes, their whole-request journal and their one shared policy.
+
+### §1 — a user-revocable capability is not a transaction-owned hold
+
+`7e732c0` relied on `cap_refcount >= 1` — established by minting before the address-space phase —
+to keep backing alive. That is authority the *caller* holds, not a hold the *transaction* owns:
+any sibling sharing the CNode can revoke the last capability, and
+`reclaim_memory_object_if_unreferenced` then frees the object and returns its frame to the
+allocator. Three boundaries follow directly, and all three were reachable:
+
+| boundary | what a revoke could do before |
+|---|---|
+| after mint, before install | object reclaimed, frame reissued — the install writes recycled backing into a page table from `PageRecord.phys` |
+| after rollback removes a translation, before its ACK | object reclaimed, frame reissued while a remote TLB may still reach it |
+| after a successful displacement, before its ACK | the displaced object's last mapping reference is what the displacement itself drops; a competing reclaimer then frees it |
+
+The repair uses the existing memory-lifetime mechanism: a **pin**. Both
+`reclaim_memory_object_if_unreferenced` and `reclaim_memory_object_for_phys` refuse while
+`pin_refcount != 0`, and nothing reachable from userspace can decrement it.
+
+* **Own objects** are pinned in phase R, as each is acquired — *before* phase M publishes any
+  revocable authority. Released once the request commits (the map reference taken in phase I is
+  then the hold), or, on the failure path, only after that page's shootdown is acknowledged.
+* **Displaced backing** is pinned inside the acquisition that displaces it, *before* its last
+  mapping reference is dropped, so a competing reclaimer never sees an unreferenced object.
+  Released after its own acknowledgement, immediately before the reclaim it gates — which makes
+  the unpin the single point at which that frame becomes reusable.
+* **An unacknowledged page keeps its pin.** The pin is the durable owner of the outstanding
+  obligation; the capability it also still holds is not, because a sibling can revoke it.
+
+Proven against the real revoke, lifetime and allocator owners. Allocator availability is checked
+by allocating until the frame reappears — "the object slot is gone" and "the frame is reusable"
+are different claims, and only the second one matters here.
+
+### §2 — the failing operation is inside the mutation boundary
+
+`AddressSpace::map_page`'s replacement path is break-before-make: it unmaps the predecessor, then
+installs. On an arch-backend failure it returned `Err` having removed the predecessor from
+hardware *and* deleted its shadow entry. `install_and_account_locked` undoes `records[..i]` — the
+pages *before* the failure — so the predecessor at the failing page was silently lost, and no
+caller-side journal could compensate for it because the caller was never told.
+
+The primitive now restores what it breaks: it re-maps the predecessor and undoes its own
+bookkeeping right-split, leaving the address space byte-identical. The restoration is
+**guaranteed, not attempted**: on all three ports `page_table::unmap_page` clears only the leaf
+entry and never frees an intermediate table, so re-mapping the *same* virtual address walks an
+existing path, allocates nothing, and cannot fail for the reason the install just did. A
+restoration that somehow failed is reported with `VM_MAP_REPLACE_RESTORE_FAILED` rather than being
+silent, and ordinary resource exhaustion never becomes a panic.
+
+With that, `records[..i]` is the complete mutation set. Every other refusal `map_page` can produce
+— alignment, canonicality, privilege, and both `len >= MAX_MAPPINGS` capacity checks — is a
+pre-mutation gate, so a refused replacement changes nothing at all.
+
+### §3 — the journal guarantee completed
+
+The failure path no longer builds a second `Vec` with `collect()`: `release_capabilities` filters
+the already-reserved journal in place, so compensation allocates nothing.
+
+The reservation's failure mode is now stated honestly. The journal comes from the kernel heap and
+the frames from the frame allocator; they are **different pools**, so heap exhaustion below the
+object-table limit is possible in principle. What the fixed object table bounds is the journal's
+*worst case* — a request can never install more pages than there are object slots — not its
+failure probability. What makes a refusal safe is not that it cannot happen but that it costs
+nothing: it precedes every owner call that mutates anything, asserted from source and checked
+behaviourally against frames, objects, capability slots and the address space.
+
+### Coverage
+
+25 cases in `u9vment1_ownership_cases`, including the whole-request failure beyond 64 pages and
+every earlier obligation, unchanged. NR 14's SMP shrink coverage and the three-architecture live
+witness are retained. NR 3's success path remains labelled **unexecuted**.
+
+### Census
+
+**CENSUS-DELTA: 0.** `with_cpu` 2, `with_broad` 0 production (plus 1 `thread_local` false
+positive), acquisition total 2. Raw `state_lock` 3, separately labelled. The pin owners are rank-6
+seams (`with_memory_state_mut` / `with_memory_split_mut`); the displaced pin is taken inside the
+existing rank-5 → rank-6 acquisition and adds none.
+
+### Next roadmap package
+
+**NR 4 `TransferRelease` and NR 30 `RecvSharedV3`** — IPC/transfer residual completion.
