@@ -11834,16 +11834,65 @@ impl SharedKernel {
         asid: crate::kernel::vm::Asid,
         virt: crate::kernel::vm::VirtAddr,
     ) -> bool {
+        // The ambient requester, for callers that have no entering-CPU identity to hand over.
+        // U9-VM-ENTRY1-S: prefer `complete_unmap_shootdown_from_split` wherever the trap seam
+        // knows which CPU actually entered — see the note there on why the ambient field is not
+        // an authority.
+        let ambient = self.with_scheduler_split_mut(|sched| sched.current_cpu);
+        self.complete_unmap_shootdown_from_split(ambient, asid, virt)
+    }
+
+    /// U9-VM-ENTRY1-S §1 — the same shootdown, with the requester stated by the caller rather
+    /// than read from an ambient field.
+    ///
+    /// `sched.current_cpu` is a single shared field that any CPU's BROAD acquisition may write —
+    /// `request_live_asid_shootdown` sets it deliberately to impersonate a requester onto each
+    /// target. Excluding "whichever CPU last wrote that field" from the target set is therefore
+    /// not the same as excluding the requester: it can exclude an innocent third CPU that really
+    /// does hold the ASID (leaving a live remote translation unretired) while including the real
+    /// requester (which then waits for an acknowledgement from itself). The entering CPU is the
+    /// only correct authority, and every trap seam already knows it.
+    ///
+    /// ## What completes the required invalidation, per architecture
+    ///
+    /// * **x86_64** — `invlpg` retires only the executing CPU's translation, and secondaries CAN
+    ///   dispatch user tasks (`smp.rs` clears `wake_only` under `yarm.ap_user_dispatch`, and the
+    ///   AP saved-return oracle drives it), so a genuinely remote holder of the target ASID is
+    ///   reachable. The required mechanism is the existing generation-matched IPI:
+    ///   `smp_tlb_shootdown_cpus` publishes the request and waits for each target's own handler to
+    ///   publish `ack_gen == req_gen`.
+    /// * **AArch64** — `page_table::invalidate_page` issues `dsb ishst; tlbi vaae1is; dsb ish;
+    ///   isb`. `tlbi ...is` is an INNER-SHAREABLE BROADCAST: it invalidates the address on every PE
+    ///   in the domain, and the trailing `dsb ish` waits for that broadcast to complete. The
+    ///   invalidation every remote observer needs has therefore already happened, architecturally,
+    ///   inside the `unmap_page`/`map_page` that removed the translation. No IPI exists on this
+    ///   port because none is required.
+    /// * **RISC-V** — `sfence.vma` is hart-local and the ISA offers no broadcast, so a remote
+    ///   holder would need an IPI this port does not have. It does not need one: secondary harts
+    ///   are brought online WAKE-ONLY (`riscv_bring_trap_ready_secondaries_online_wake_only`,
+    ///   "no AP dispatcher yet; a placed task would strand"), nothing anywhere clears that bit,
+    ///   and `live_cpu_bitmap_for_asid_split` computes its candidates as `online & !wake_only`.
+    ///   A remote holder of a user ASID is therefore unreachable by the port's own dispatch rules
+    ///   — not merely absent at some CPU count — so the local fence is the whole shootdown.
+    ///
+    /// Returns `true` only when the invalidation every observer needs is complete. A `false`
+    /// return means the caller must NOT reclaim.
+    pub(crate) fn complete_unmap_shootdown_from_split(
+        &self,
+        requester: CpuId,
+        asid: crate::kernel::vm::Asid,
+        virt: crate::kernel::vm::VirtAddr,
+    ) -> bool {
         // The requester's OWN translation is retired locally; a CPU never IPIs itself.
         #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
         unsafe {
             core::arch::asm!("invlpg [{}]", in(reg) virt.0, options(nostack, preserves_flags));
         }
-        let requester = self.with_scheduler_split_mut(|sched| sched.current_cpu);
         let targets = self.live_cpu_bitmap_for_asid_split(asid) & !(1u64 << requester.0);
         if targets == 0 {
-            // Zero remote targets: the local invalidation above is the whole shootdown, and it
-            // has already happened. Correct, and not a silent skip.
+            // Zero remote observers: the local invalidation above — and, on AArch64, the
+            // broadcast the unmap already completed — is the whole shootdown. Correct, and not a
+            // silent skip.
             return true;
         }
         let want = targets.count_ones() as usize;
@@ -11851,10 +11900,24 @@ impl SharedKernel {
         {
             crate::arch::x86_64::smp::smp_tlb_shootdown_cpus(targets, virt.0) == want
         }
-        #[cfg(not(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev"))))]
+        #[cfg(all(target_arch = "aarch64", not(test), not(feature = "hosted-dev")))]
         {
-            // No cross-CPU coordinator on this build; a non-empty remote target set therefore
-            // cannot be acknowledged, and must NOT be reported as completed.
+            // The inner-shareable broadcast issued by `invalidate_page` inside the unmap already
+            // invalidated this address on every PE in the domain, and its `dsb ish` waited for
+            // completion. There is nothing left for a remote request to do, and no acknowledgement
+            // to collect: the architecture is the coordinator.
+            let _ = want;
+            true
+        }
+        #[cfg(not(any(
+            all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")),
+            all(target_arch = "aarch64", not(test), not(feature = "hosted-dev"))
+        )))]
+        {
+            // RISC-V and the hosted build: no cross-CPU coordinator, so a non-empty remote target
+            // set cannot be acknowledged and must NOT be reported as completed. On RISC-V that set
+            // is unreachable by the port's dispatch rules (see above), so this arm is a
+            // fail-closed backstop rather than an expected outcome.
             let _ = want;
             false
         }
@@ -11873,6 +11936,20 @@ impl SharedKernel {
     /// [`Self::complete_unmap_shootdown_split`].
     pub(crate) fn unmap_range_two_phase_split(
         &self,
+        asid: crate::kernel::vm::Asid,
+        base: usize,
+        len: usize,
+    ) -> bool {
+        let ambient = self.with_scheduler_split_mut(|sched| sched.current_cpu);
+        self.unmap_range_two_phase_from_split(ambient, asid, base, len)
+    }
+
+    /// U9-VM-ENTRY1-S §1 — the same two-phase unmap, with the requester stated by the caller.
+    /// See [`Self::complete_unmap_shootdown_from_split`] for why the ambient field is not an
+    /// authority and what completes the invalidation on each architecture.
+    pub(crate) fn unmap_range_two_phase_from_split(
+        &self,
+        requester: CpuId,
         asid: crate::kernel::vm::Asid,
         base: usize,
         len: usize,
@@ -11901,7 +11978,8 @@ impl SharedKernel {
                 // invalidation, then a published remote request that each target's own 0xF1
                 // handler invalidates and acknowledges by generation. The VM lock is already
                 // released and the memory lock is not yet taken, so nothing is held while waiting.
-                let shootdown_ok = self.complete_unmap_shootdown_split(asid, VirtAddr(va as u64));
+                let shootdown_ok =
+                    self.complete_unmap_shootdown_from_split(requester, asid, VirtAddr(va as u64));
                 // Phase C (rank 6): reclaim the frame — only AFTER a COMPLETED shootdown. Guarded
                 // (a still-pinned or still-cap-referenced object is not freed), so a rollback
                 // prefix-unmap is a no-op. A timeout skips the reclaim entirely: the frame stays

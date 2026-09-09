@@ -98,9 +98,15 @@ pub(crate) struct PageRecord {
     /// Set while this transaction holds a PIN on `object_id` — a hold nothing outside the
     /// transaction can drop. Cleared exactly once, when the obligation it covers is settled.
     pub(crate) pinned: bool,
-    /// Set while this transaction holds a PIN on the object backing `replaced` — taken inside the
-    /// acquisition that displaced it, released only after its shootdown is acknowledged.
-    pub(crate) displaced_pinned: bool,
+    /// The IDENTITY of the object backing `replaced`, recorded when this transaction pinned it
+    /// inside the acquisition that displaced it. `Some` means the hold is held and not yet
+    /// settled.
+    ///
+    /// It is an id, not a flag, because releasing the hold and reclaiming its backing must name
+    /// the SAME object it pinned. A physical address alone would not: once the hold is dropped the
+    /// object can be reclaimed and its frame reissued, so a later lookup by address could act on a
+    /// completely different object that now sits there.
+    pub(crate) displaced_pinned: Option<u64>,
     /// What the install displaced, recorded inside the acquisition that displaced it. On the
     /// failure path this is restored verbatim, in the SAME acquisition; on the success path its
     /// frame is accounted and then reclaimed after its shootdown.
@@ -116,7 +122,7 @@ impl PageRecord {
             cap: None,
             installed: false,
             pinned: false,
-            displaced_pinned: false,
+            displaced_pinned: None,
             replaced: None,
         }
     }
@@ -227,10 +233,17 @@ pub(crate) trait VmMapOwners {
     /// last reference of any kind. Called exactly once per successful [`Self::pin_object`].
     fn unpin_object(&mut self, object_id: u64);
 
-    /// rank 6 — release the hold taken on a DISPLACED page's backing inside the install
-    /// acquisition. Separate from [`Self::unpin_object`] because it is keyed by physical address:
-    /// the displaced object is not one this transaction created and it has no record of its id.
-    fn unpin_displaced(&mut self, phys: PhysAddr);
+    /// ONE rank-6 acquisition — release the hold this transaction took on a DISPLACED page's
+    /// backing AND reclaim that exact object, together.
+    ///
+    /// Deliberately one operation, not an unpin followed by a reclaim: between two acquisitions a
+    /// competing final-reference release could reclaim the now-unpinned object and the allocator
+    /// could reissue its frame, after which a reclaim keyed on the physical address would act on
+    /// whatever object had taken its place. Naming `object_id` and settling inside one acquisition
+    /// removes both the window and the ambiguity.
+    ///
+    /// Returns whether the object was actually reclaimed.
+    fn settle_displaced_hold(&mut self, object_id: u64, phys: PhysAddr) -> bool;
 
     /// rank 6 — release an object that no capability and no mapping ever referenced.
     ///
@@ -268,9 +281,6 @@ pub(crate) trait VmMapOwners {
     /// NO LOCK — complete the required TLB shootdown for `virt` in `asid`. Returns `false` when a
     /// remote acknowledgement was not obtained, in which case the caller must skip the reclaim.
     fn complete_shootdown(&mut self, asid: Asid, virt: VirtAddr) -> bool;
-
-    /// rank 6 — reclaim a displaced frame, only ever after its shootdown completed.
-    fn reclaim_replaced(&mut self, phys: PhysAddr);
 
     /// ONE rank-4 acquisition — release a provisional capability if and only if it is still, at
     /// this instant, this transaction's exclusive childless leaf naming `frame.object_id`.
@@ -455,6 +465,19 @@ fn release_capabilities<O: VmMapOwners>(
 /// instant the last one goes the object becomes reclaimable and its frame reusable under a
 /// translation a remote CPU may still hold. A pin cannot be dropped from outside this transaction
 /// at all.
+///
+/// Stated precisely, because the difference matters: a retained pin is INDEFINITE QUARANTINE, not
+/// deferred retirement. It guarantees the frame is never reissued, and nothing more. There is no
+/// completion record for a shootdown that never arrived and no consumer that would release the pin
+/// if one arrived later, so no owner ever retires the page — the object and its frame are held for
+/// the lifetime of the kernel. That is the deliberate fail-closed choice (a quarantined frame is
+/// strictly safer than one reissued under a live remote translation), and it must not be described
+/// as anything else.
+///
+/// On the ports where it could arise: it cannot on AArch64, whose invalidation is a completed
+/// architectural broadcast, nor on RISC-V, where no secondary hart ever dispatches a user task and
+/// so the remote target set is empty by the port's own dispatch rules. On x86_64 it requires a
+/// target that took the shootdown IPI but never published its acknowledgement.
 fn settle_rollback_shootdowns<O: VmMapOwners>(
     owners: &mut O,
     asid: Asid,
@@ -577,6 +600,27 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
                     phys,
                 );
                 record.pinned = owners.pin_object(object_id);
+                if !record.pinned {
+                    // The hold is REQUIRED, not best-effort. Without it nothing keeps this object
+                    // alive across the phases that follow, so `record.phys` could name recycled
+                    // backing by the time the install writes it into a page table. A hold that
+                    // cannot be taken must therefore fail the request — never silently authorize
+                    // continued use of the journal's physical address.
+                    owners.release_unminted_object(object_id);
+                    for index in 0..records.len() {
+                        if records[index].pinned {
+                            owners.unpin_object(records[index].object_id);
+                            records[index].pinned = false;
+                        }
+                        owners.release_unminted_object(records[index].object_id);
+                    }
+                    owners.note(VmTxnEvent::RolledBack {
+                        reason: VmRollbackReason::FrameAlloc,
+                        released: records.len(),
+                        retained: 0,
+                    });
+                    return Err(SyscallError::from(KernelError::MemoryObjectMissing));
+                }
                 records.push(record);
             }
             Err(e) => {
@@ -688,14 +732,15 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             continue;
         };
         if owners.complete_shootdown(asid, records[index].virt) {
-            // Unpin BEFORE the reclaim, and only after the acknowledgement: the reclaim is
-            // guarded on the pin, so this is the single point at which the displaced backing
-            // becomes reusable, and it is reached only once its translation is provably gone.
-            if records[index].displaced_pinned {
-                owners.unpin_displaced(old.phys);
-                records[index].displaced_pinned = false;
+            // ONE rank-6 operation: release this transaction's hold and reclaim that exact
+            // object, named by identity. Reached only once the translation is provably gone, so
+            // it is the single point at which the displaced backing becomes reusable — and
+            // because the release and the reclaim cannot be separated, no competing
+            // final-reference release can slip in between them and have this transaction mutate
+            // whatever replaced the object it pinned.
+            if let Some(object_id) = records[index].displaced_pinned.take() {
+                owners.settle_displaced_hold(object_id, old.phys);
             }
-            owners.reclaim_replaced(old.phys);
         }
         // No acknowledgement: the pin stays, and with it the guarantee that no other reclaimer
         // can hand this frame out while a remote translation may still reach it.

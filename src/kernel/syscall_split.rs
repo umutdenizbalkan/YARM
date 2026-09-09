@@ -3808,7 +3808,7 @@ pub(crate) fn try_split_vm_map_into_frame(
     let addr = frame.arg(crate::kernel::syscall::SYSCALL_ARG_PTR);
     let len = frame.arg(crate::kernel::syscall::SYSCALL_ARG_LEN);
     let prot = frame.arg(crate::kernel::syscall::SYSCALL_ARG_INLINE_PAYLOAD0);
-    let mut owners = crate::kernel::syscall::vm_split::SplitVmOwners { shared, tid };
+    let mut owners = crate::kernel::syscall::vm_split::SplitVmOwners { shared, tid, cpu };
     Some(
         match run_vm_map_transaction(&mut owners, MapTarget::Capability(cap), addr, len, prot) {
             Ok((base, map_len)) => {
@@ -3838,7 +3838,7 @@ pub(crate) fn try_split_vm_anon_map_into_frame(
     let addr = frame.arg(crate::kernel::syscall::SYSCALL_ARG_PTR);
     let len = frame.arg(crate::kernel::syscall::SYSCALL_ARG_LEN);
     let prot = frame.arg(crate::kernel::syscall::SYSCALL_ARG_INLINE_PAYLOAD0);
-    let mut owners = crate::kernel::syscall::vm_split::SplitVmOwners { shared, tid };
+    let mut owners = crate::kernel::syscall::vm_split::SplitVmOwners { shared, tid, cpu };
     Some(
         match run_vm_map_transaction(&mut owners, MapTarget::CallerAddressSpace, addr, len, prot) {
             Ok((base, map_len)) => {
@@ -3877,7 +3877,7 @@ pub(crate) fn try_split_vm_brk_into_frame(
         Err(e) => return Some(Err(e)),
     };
     let requested = frame.arg(crate::kernel::syscall::SYSCALL_ARG_CAP);
-    let mut owners = crate::kernel::syscall::vm_split::SplitVmOwners { shared, tid };
+    let mut owners = crate::kernel::syscall::vm_split::SplitVmOwners { shared, tid, cpu };
     Some(match run_vm_brk_transaction(&mut owners, requested) {
         Ok(result) => {
             frame.set_ok(result, 0, 0);

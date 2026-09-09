@@ -16349,3 +16349,110 @@ existing rank-5 → rank-6 acquisition and adds none.
 ### Next roadmap package
 
 **NR 4 `TransferRelease` and NR 30 `RecvSharedV3`** — IPC/transfer residual completion.
+
+## U9-VM-ENTRY1-S — the two VM release boundaries
+
+Reviewed candidate `19e6987`; base `ca65dca`. Closes the mapping transaction's two remaining
+release-boundary defects. No route, ingress or ABI changes; NR 3, NR 13 and NR 14 keep their
+pre-lock routes, their whole-request journal, their existing pin protection and their
+allocation-free compensation.
+
+### §0 — releasing a hold and reclaiming its backing is one rank-local operation
+
+At `19e6987` a successful displacement ran `unpin_displaced(old.phys)` and then
+`reclaim_replaced(old.phys)` through two separate rank-6 acquisitions. Between them the object was
+unpinned and, for that window, reclaimable by anyone: a competing final-reference release could
+retire it and the allocator could reissue its frame, after which the second acquisition's
+`reclaim_memory_object_for_phys_locked(old.phys)` would have acted on **whatever object now sat at
+that address** — a mutation of somebody else's resource, keyed on a stale physical address.
+
+The two owners are now one, `settle_displaced_hold_locked`, shared verbatim by both adapters:
+
+```
+adjust_memory_object_pin_refcount_locked(object_id, -1)
+if the object at `phys` is still `object_id`  ->  reclaim_memory_object_if_unreferenced_locked
+otherwise                                     ->  VM_DISPLACED_SETTLE_IDENTITY_MISMATCH, do nothing
+```
+
+Two things make the recycled-object case impossible rather than unlikely. The release and the
+reclaim are inside **one** acquisition, so nothing runs between them; and the reclaim names the
+object by **identity**, not by address, so even a mismatch reached some other way leaves the
+replacement completely alone. `PageRecord.displaced_pinned` changed from a `bool` to an
+`Option<u64>` to carry that identity — a flag could only have said *that* a hold was held, never
+*what* it was held on.
+
+`pin_object_for_phys_locked` correspondingly returns the id it pinned (`Option<u64>`) instead of a
+bare `bool`, so the identity is recorded at the moment the hold is taken rather than looked up
+again afterwards.
+
+### §0b — a refused pin refuses the request
+
+`pin_object` was treated as best-effort: on a `false` return the transaction recorded
+`pinned = false` and carried on using `record.phys`. But the pin is the *only* thing keeping that
+object alive across phases M and I, so continuing meant the install could write recycled backing
+into a page table from the journal's physical address — exactly the failure the pin exists to
+prevent.
+
+Phase R now fails the request on a refused pin: it releases the object it could not hold, unpins
+and releases every object acquired before it, notes the rollback, and returns
+`MemoryObjectMissing`. This happens before phase M, so nothing revocable has been published and
+nothing has been installed.
+
+### §1 — the shootdown excludes the real requester
+
+`complete_unmap_shootdown_split` derived its requester from `sched.current_cpu`. That is one
+shared field **any** CPU's broad acquisition may write — `request_live_asid_shootdown` writes it
+deliberately, to impersonate a requester onto each target — so excluding "whichever CPU last wrote
+it" is not the same as excluding the requester. Under that interference it could drop an innocent
+third CPU that genuinely holds the ASID out of the target set (leaving a live remote translation
+unretired) *and* put the real requester into it (which then waits for an acknowledgement from
+itself).
+
+The requester is now a parameter. `complete_unmap_shootdown_from_split(requester, asid, virt)` and
+`unmap_range_two_phase_from_split(requester, asid, base, len)` carry the bodies; the old names
+survive as thin delegators for callers with no entering-CPU identity to hand over, and read the
+ambient field in that one place and nowhere else. The VM adapter carries `SplitVmOwners.cpu`,
+which is the CPU the trap actually entered on:
+
+| port | where the entering-CPU identity comes from | what completes the invalidation |
+|---|---|---|
+| x86_64 | `current_cpu_id()` at the IDT entry, from the local APIC id | `invlpg` locally, then the existing generation-matched `smp_tlb_shootdown_cpus` IPI, completing only when every target's own 0xF1 handler publishes `ack_gen == req_gen` |
+| AArch64 | `read_mpidr_el1() & 0xff` at the vector entry | already complete: `invalidate_page` issues `dsb ishst; tlbi vaae1is; dsb ish; isb` — an inner-shareable **broadcast** whose trailing `dsb ish` waits for it. No IPI exists because none is required |
+| RISC-V | `token.cpu()`, the per-hart dispatch authority minted at trap entry | the hart-local `sfence.vma`. A remote holder of a user ASID is unreachable by the port's own **dispatch rules**, not by CPU count: secondaries are onlined wake-only, nothing clears that bit, and `live_cpu_bitmap_for_asid_split` computes candidates as `online & !wake_only` |
+
+From the arch entry the identity is a plain parameter the whole way down — shared trap handler ->
+`try_split_dispatch_into_frame` -> each NR's split seam -> `SplitVmOwners.cpu` -> both shootdown
+owners. Nothing on that path consults `sched.current_cpu`. No new SMP dispatch capability was
+added; the x86_64 witness is the mechanism that was already there.
+
+### §1b — unacknowledged pins, described precisely
+
+A pin retained because an acknowledgement never arrived is **indefinite quarantine, not deferred
+retirement**. It guarantees the frame is never reissued and nothing more: there is no completion
+record for a shootdown that did not arrive and no consumer that would release the pin if one
+arrived later, so no owner ever retires the page — the object and its frame are held for the
+lifetime of the kernel. That is the deliberate fail-closed choice, and the earlier wording
+suggesting eventual retirement was wrong. It cannot arise on AArch64 (completed architectural
+broadcast) or on RISC-V (empty remote target set by dispatch rule); on x86_64 it requires a target
+that took the IPI and never published its acknowledgement.
+
+### Coverage
+
+32 cases in `u9vment1_ownership_cases` — 7 new, covering the recycled-object settle, the identity
+mismatch, the single-acquisition requirement, the refused pin, and the quarantine wording. 12 in
+`u9vment1_reachability_matrix`, including the new
+`matrix_the_shootdown_requester_is_the_entering_cpu_on_every_architecture`, which walks the
+identity from each port's hardware register to both shootdown seams. The five displaced U9-D3
+structural guards were re-derived onto the requester-stating owners and sharpened: the target mask
+must exclude the *stated* requester, and neither owner may contain `current_cpu` at all.
+
+### Census
+
+**CENSUS-DELTA: 0.** `with_cpu` 2, `with_broad` 0 production (plus 1 `thread_local` false
+positive), acquisition total 2. Raw `state_lock` 3, separately labelled. `settle_displaced_hold` is
+one rank-6 acquisition where there were two, so the change *removes* an acquisition from the
+commit path rather than adding one.
+
+### Next roadmap package
+
+**NR 4 `TransferRelease` and NR 30 `RecvSharedV3`** — IPC/transfer residual completion.

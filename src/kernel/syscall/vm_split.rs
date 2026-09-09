@@ -23,6 +23,13 @@ use crate::kernel::capabilities::{CapId, CapObject};
 pub(crate) struct SplitVmOwners<'a> {
     pub(crate) shared: &'a crate::runtime::SharedKernel,
     pub(crate) tid: u64,
+    /// The CPU this trap actually entered on, handed over by the arch seam.
+    ///
+    /// NOT read from `sched.current_cpu`: that is one shared field any CPU's broad acquisition may
+    /// write (`request_live_asid_shootdown` writes it deliberately, to impersonate a requester
+    /// onto each target), so a shootdown that excluded "whichever CPU last wrote it" could exclude
+    /// an innocent third CPU that really does hold the ASID while waiting on the real requester.
+    pub(crate) cpu: crate::kernel::scheduler::CpuId,
 }
 
 impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
@@ -106,10 +113,12 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         });
     }
 
-    fn unpin_displaced(&mut self, phys: crate::kernel::vm::PhysAddr) {
+    fn settle_displaced_hold(&mut self, object_id: u64, phys: crate::kernel::vm::PhysAddr) -> bool {
+        // ONE rank-6 acquisition running the very same body the broad adapter runs: release and
+        // reclaim cannot be separated, and the object is named by identity.
         self.shared.with_memory_split_mut(|memory| {
-            crate::kernel::syscall::vm::unpin_object_for_phys_locked(memory, phys)
-        });
+            crate::kernel::syscall::vm::settle_displaced_hold_locked(memory, object_id, phys)
+        })
     }
 
     fn release_unminted_object(&mut self, object_id: u64) {
@@ -138,15 +147,10 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         asid: crate::kernel::vm::Asid,
         virt: crate::kernel::vm::VirtAddr,
     ) -> bool {
-        // The existing U9-D3 coordinator: local invalidation, then a generation-matched remote
-        // request each target acknowledges. NO domain lock is held across it.
-        self.shared.complete_unmap_shootdown_split(asid, virt)
-    }
-
-    fn reclaim_replaced(&mut self, phys: crate::kernel::vm::PhysAddr) {
-        self.shared.with_memory_split_mut(|memory| {
-            KernelState::reclaim_memory_object_for_phys_locked(memory, phys)
-        });
+        // The existing U9-D3 coordinator, with the requester stated as the CPU this trap entered
+        // on rather than read from an ambient field. NO domain lock is held across it.
+        self.shared
+            .complete_unmap_shootdown_from_split(self.cpu, asid, virt)
     }
 
     fn release_provisional_cap(
@@ -267,7 +271,9 @@ impl crate::kernel::syscall::vm_txn::VmBrkOwners for SplitVmOwners<'_> {
         // fail-closed rule and this route does not weaken it.
         let len = end.saturating_sub(start);
         let pages = len / crate::kernel::vm::PAGE_SIZE;
-        let all_acked = self.shared.unmap_range_two_phase_split(asid, start, len);
+        let all_acked = self
+            .shared
+            .unmap_range_two_phase_from_split(self.cpu, asid, start, len);
         if !all_acked {
             crate::yarm_log!(
                 "VM_BRK_SPLIT_SHOOTDOWN_INCOMPLETE asid={} start=0x{:x} end=0x{:x}",

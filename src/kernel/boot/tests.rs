@@ -69624,8 +69624,11 @@ mod stage198e3b2a_offlock_ctx {
         );
         // The unmap seam releases the VM lock (rank 5) BEFORE the memory reclaim (rank 6) — separate
         // `with_*_split_mut` calls, never nested; the map seam applies memory accounting after VM.
+        // U9-VM-ENTRY1-S §1 moved the seam BODY to `..._from_split` (the requester is now a
+        // parameter, not an ambient field); `unmap_range_two_phase_split` is a two-line
+        // ambient-requester delegator. The rank contract lives with the body.
         let unmap = RT
-            .split_once("pub(crate) fn unmap_range_two_phase_split(")
+            .split_once("pub(crate) fn unmap_range_two_phase_from_split(")
             .map(|(_, r)| r.split_once("\n    }\n").map(|(b, _)| b).unwrap_or(r))
             .expect("unmap seam present");
         let vm_pos = unmap
@@ -140857,11 +140860,12 @@ mod u9f_split_capability_revocation {
         // shootdown, and that reports the verdict this gate consumes.
         let seam = body_of(
             RUNTIME,
-            "pub(crate) fn unmap_range_two_phase_split(",
+            "pub(crate) fn unmap_range_two_phase_from_split(",
             "\n    /// rank 2 \u{2192} rank 1 (non-nested)",
         );
         assert!(
-            seam.contains("let shootdown_ok = self.complete_unmap_shootdown_split(")
+            seam.contains("self.complete_unmap_shootdown_from_split(requester, asid,")
+                && seam.contains("let shootdown_ok =")
                 && seam.contains("if shootdown_ok {")
                 && seam.contains("all_acked = false;")
                 && seam.contains("all_acked\n"),
@@ -143155,12 +143159,18 @@ mod u9d3_split_unmap_drives_real_d3 {
     fn u9d3_unmap_before_ack_before_reclaim() {
         let b = fn_body(
             RUNTIME,
-            "pub(crate) fn unmap_range_two_phase_split(\n        &self,\n        asid: crate::kernel::vm::Asid,\n        base: usize,\n        len: usize,\n    )",
+            "pub(crate) fn unmap_range_two_phase_from_split(\n        &self,\n        requester: CpuId,\n        asid: crate::kernel::vm::Asid,\n        base: usize,\n        len: usize,\n    )",
         );
         let unmap = b.find("unmap_page(VirtAddr(va as u64))").expect("Phase A");
         let shoot = b
-            .find("complete_unmap_shootdown_split(asid, VirtAddr(va as u64))")
+            .find("complete_unmap_shootdown_from_split(requester, asid, VirtAddr(va as u64))")
             .expect("Phase B");
+        // U9-VM-ENTRY1-S §1: the requester is the CPU the caller states it entered on. The seam
+        // must not re-derive one from the ambient scheduler field between the two phases.
+        assert!(
+            !b.contains("current_cpu"),
+            "the seam takes its requester as a parameter, never from the ambient field"
+        );
         let reclaim = b
             .find("reclaim_memory_object_for_phys_locked")
             .expect("Phase C");
@@ -143180,7 +143190,7 @@ mod u9d3_split_unmap_drives_real_d3 {
     fn u9d3_timeout_retains_the_frame() {
         let b = fn_body(
             RUNTIME,
-            "pub(crate) fn unmap_range_two_phase_split(\n        &self,\n        asid: crate::kernel::vm::Asid,\n        base: usize,\n        len: usize,\n    )",
+            "pub(crate) fn unmap_range_two_phase_from_split(\n        &self,\n        requester: CpuId,\n        asid: crate::kernel::vm::Asid,\n        base: usize,\n        len: usize,\n    )",
         );
         let gate = b.find("if shootdown_ok {").expect("the gate");
         let els = b[gate..].find("} else {").expect("the failure arm");
@@ -143199,7 +143209,10 @@ mod u9d3_split_unmap_drives_real_d3 {
     /// and it is reported as completed rather than silently skipped.
     #[test]
     fn u9d3_zero_target_path_is_correct_not_skipped() {
-        let b = fn_body(RUNTIME, "pub(crate) fn complete_unmap_shootdown_split(");
+        let b = fn_body(
+            RUNTIME,
+            "pub(crate) fn complete_unmap_shootdown_from_split(",
+        );
         let local = b.find("invlpg").expect("local invalidation");
         let targets = b
             .find("live_cpu_bitmap_for_asid_split(asid)")
@@ -143217,10 +143230,15 @@ mod u9d3_split_unmap_drives_real_d3 {
         );
     }
 
-    /// The target mask comes from the live-ASID predicate, never the wake-only complement.
+    /// The target mask comes from the live-ASID predicate, never the wake-only complement — and
+    /// the CPU it excludes is the requester the CALLER stated, not whichever CPU last wrote the
+    /// ambient `sched.current_cpu` field.
     #[test]
     fn u9d3_target_mask_is_the_live_asid_set() {
-        let b = fn_body(RUNTIME, "pub(crate) fn complete_unmap_shootdown_split(");
+        let b = fn_body(
+            RUNTIME,
+            "pub(crate) fn complete_unmap_shootdown_from_split(",
+        );
         assert!(
             b.contains("live_cpu_bitmap_for_asid_split(asid)"),
             "targets come from the live-ASID predicate"
@@ -143232,6 +143250,42 @@ mod u9d3_split_unmap_drives_real_d3 {
         assert!(
             b.contains("& !(1u64 << requester.0)"),
             "a CPU never IPIs itself; its own translation is retired locally"
+        );
+        // U9-VM-ENTRY1-S §1. `sched.current_cpu` is one shared field that ANY CPU's broad
+        // acquisition may write (`request_live_asid_shootdown` writes it deliberately, to
+        // impersonate a requester onto each target). Excluding it instead of the real requester
+        // both drops an innocent third CPU that genuinely holds the ASID out of the target set
+        // and puts the real requester into it. The owner must therefore never read it.
+        assert!(
+            !b.contains("current_cpu"),
+            "the exclusion must be the stated requester, never the ambient field"
+        );
+        assert!(
+            RUNTIME.contains(
+                "pub(crate) fn complete_unmap_shootdown_from_split(\n        &self,\n        requester: CpuId,"
+            ),
+            "the requester is an explicit parameter of the owner"
+        );
+        // The ambient read survives in exactly one place: the compatibility delegator, for callers
+        // that have no entering-CPU identity to hand over. It computes nothing else.
+        let amb = fn_body(RUNTIME, "pub(crate) fn complete_unmap_shootdown_split(");
+        assert!(
+            amb.contains("let ambient = self.with_scheduler_split_mut(|sched| sched.current_cpu);")
+                && amb.contains("self.complete_unmap_shootdown_from_split(ambient, asid, virt)"),
+            "the ambient reader is a pure delegator onto the requester-stating owner"
+        );
+        assert!(
+            !amb.contains("live_cpu_bitmap_for_asid_split")
+                && !amb.contains("smp_tlb_shootdown_cpus"),
+            "and it holds no shootdown logic of its own"
+        );
+        // Every VM-entry seam states its own requester rather than taking the ambient default.
+        let vm_split = include_str!("../syscall/vm_split.rs");
+        assert!(
+            vm_split.contains("complete_unmap_shootdown_from_split(self.cpu, asid, virt)")
+                && vm_split
+                    .contains("unmap_range_two_phase_from_split(self.cpu, asid, start, len)"),
+            "the NR3/NR13/NR14 split adapter passes the entering CPU it was constructed with"
         );
         // The split predicate applies the same online & !wake_only & asid-matches rule.
         let p = fn_body(RUNTIME, "pub(crate) fn live_cpu_bitmap_for_asid_split(");
@@ -143246,7 +143300,10 @@ mod u9d3_split_unmap_drives_real_d3 {
     /// impersonation, no `current_cpu` rebinding, no requester-side mailbox drain, no yield.
     #[test]
     fn u9d3_shootdown_wait_holds_nothing_and_impersonates_nobody() {
-        let b = fn_body(RUNTIME, "pub(crate) fn complete_unmap_shootdown_split(");
+        let b = fn_body(
+            RUNTIME,
+            "pub(crate) fn complete_unmap_shootdown_from_split(",
+        );
         for banned in [
             "set_current_cpu",
             "process_cross_cpu_work_for_cpu",
@@ -168675,7 +168732,7 @@ mod u9vment1_ownership_cases {
                         cap: None,
                         installed: false,
                         pinned: false,
-                        displaced_pinned: false,
+                        displaced_pinned: None,
                         replaced: None,
                     },
                     PageRecord {
@@ -168687,7 +168744,7 @@ mod u9vment1_ownership_cases {
                         cap: None,
                         installed: false,
                         pinned: false,
-                        displaced_pinned: false,
+                        displaced_pinned: None,
                         replaced: None,
                     },
                 ];
@@ -168764,7 +168821,7 @@ mod u9vment1_ownership_cases {
                         cap: None,
                         installed: false,
                         pinned: false,
-                        displaced_pinned: false,
+                        displaced_pinned: None,
                         replaced: None,
                     });
                 }
@@ -168856,6 +168913,10 @@ mod u9vment1_ownership_cases {
         /// what the transaction owns; a capability is not, because a sibling can revoke it.
         pins: BTreeMap<u64, i64>,
         displaced_pins: BTreeMap<u64, i64>,
+        /// The object identity currently backing each displaced physical address. A competitor
+        /// that reclaims and reissues a frame changes this, which is exactly what the settle
+        /// owner's identity check must notice.
+        displaced_object_at: BTreeMap<u64, u64>,
         /// Every object this mock handed out, so a pin can be resolved to its backing.
         phys_by_object: BTreeMap<u64, u64>,
     }
@@ -168880,6 +168941,7 @@ mod u9vment1_ownership_cases {
                 freed: Vec::new(),
                 pins: BTreeMap::new(),
                 displaced_pins: BTreeMap::new(),
+                displaced_object_at: BTreeMap::new(),
                 phys_by_object: BTreeMap::new(),
             }
         }
@@ -168906,6 +168968,8 @@ mod u9vment1_ownership_cases {
                 },
             );
             *self.map_refs.entry(phys).or_insert(0) += 1;
+            let id = 0x1000_0000 + phys;
+            self.displaced_object_at.insert(phys, id);
         }
 
         fn say(&mut self, what: &str) {
@@ -168972,9 +169036,18 @@ mod u9vment1_ownership_cases {
             }
         }
 
-        fn unpin_displaced(&mut self, phys: PhysAddr) {
-            self.say("unpin_displaced");
+        fn settle_displaced_hold(&mut self, object_id: u64, phys: PhysAddr) -> bool {
+            // ONE operation: release and reclaim cannot be separated, and the object is named by
+            // identity — so a competitor that reclaimed it and had its frame reissued cannot make
+            // this transaction act on whatever now sits at `phys`.
+            self.say("settle_displaced_hold");
             *self.displaced_pins.entry(phys.0).or_insert(0) -= 1;
+            if self.displaced_object_at.get(&phys.0).copied() != Some(object_id) {
+                self.say("settle_displaced_identity_mismatch");
+                return false;
+            }
+            self.reclaimed.push(phys.0);
+            true
         }
 
         fn release_unminted_object(&mut self, object_id: u64) {
@@ -169047,8 +169120,10 @@ mod u9vment1_ownership_cases {
             for record in records.iter_mut() {
                 *self.map_refs.entry(record.phys.0).or_insert(0) += 1;
                 if let Some(old) = record.replaced {
-                    record.displaced_pinned = true;
-                    *self.displaced_pins.entry(old.phys.0).or_insert(0) += 1;
+                    record.displaced_pinned = self.displaced_object_at.get(&old.phys.0).copied();
+                    if record.displaced_pinned.is_some() {
+                        *self.displaced_pins.entry(old.phys.0).or_insert(0) += 1;
+                    }
                     *self.map_refs.entry(old.phys.0).or_insert(0) -= 1;
                 }
             }
@@ -169064,11 +169139,6 @@ mod u9vment1_ownership_cases {
             );
             self.say("complete_shootdown");
             self.shootdown_ok
-        }
-
-        fn reclaim_replaced(&mut self, phys: PhysAddr) {
-            self.say("reclaim_replaced");
-            self.reclaimed.push(phys.0);
         }
 
         fn release_provisional_cap(
@@ -169253,19 +169323,20 @@ mod u9vment1_ownership_cases {
         // which the displaced backing becomes reusable, and it is reached only once the
         // translation is provably gone.
         for (i, entry) in owners.log.iter().enumerate() {
-            if entry == "reclaim_replaced" {
+            if entry == "settle_displaced_hold" {
                 assert_eq!(
-                    (
-                        owners.log.get(i - 2).map(String::as_str),
-                        owners.log.get(i - 1).map(String::as_str),
-                    ),
-                    (Some("complete_shootdown"), Some("unpin_displaced")),
-                    "a displaced frame is reclaimed only after its own acknowledgement and only \
-                     once this transaction has released its hold: {:?}",
+                    owners.log.get(i - 1).map(String::as_str),
+                    Some("complete_shootdown"),
+                    "the hold is released and its backing reclaimed as ONE operation, and only \
+                     after that page's own acknowledgement: {:?}",
                     owners.log
                 );
             }
         }
+        assert!(
+            !owners.log.iter().any(|e| e == "reclaim_replaced"),
+            "there is no separate reclaim step left to race against the release"
+        );
         assert_eq!(
             owners.reclaimed, displaced,
             "each displaced frame is reclaimed exactly once, in page order"
@@ -169366,7 +169437,7 @@ mod u9vment1_ownership_cases {
                     cap: None,
                     installed: false,
                     pinned: false,
-                    displaced_pinned: false,
+                    displaced_pinned: None,
                     replaced: None,
                 }];
                 state
@@ -169724,7 +169795,7 @@ mod u9vment1_ownership_cases {
                     cap: Some(cap),
                     installed: false,
                     pinned: true,
-                    displaced_pinned: false,
+                    displaced_pinned: None,
                     replaced: None,
                 }];
                 state
@@ -169819,7 +169890,7 @@ mod u9vment1_ownership_cases {
                     cap: None,
                     installed: false,
                     pinned: true,
-                    displaced_pinned: false,
+                    displaced_pinned: None,
                     replaced: None,
                 }];
                 state
@@ -169838,9 +169909,10 @@ mod u9vment1_ownership_cases {
                     Some(old_mapping.phys),
                     "the displacement is recorded"
                 );
-                assert!(
+                assert_eq!(
                     records[0].displaced_pinned,
-                    "and the displaced backing is held by this transaction"
+                    Some(old_object),
+                    "and the displaced backing is held by this transaction, by IDENTITY"
                 );
 
                 // Before the ACK: another reclaimer runs. It must not free the displaced backing.
@@ -169863,15 +169935,14 @@ mod u9vment1_ownership_cases {
                 );
 
                 // The transaction settles it: ACK, then release the hold, then reclaim.
-                state.with_memory_state_mut(|memory| {
-                    crate::kernel::syscall::vm::unpin_object_for_phys_locked(
+                let reclaimed = state.with_memory_state_mut(|memory| {
+                    crate::kernel::syscall::vm::settle_displaced_hold_locked(
                         memory,
+                        old_object,
                         old_mapping.phys,
-                    );
+                    )
                 });
-                state.with_memory_state_mut(|memory| {
-                    KernelState::reclaim_memory_object_for_phys_locked(memory, old_mapping.phys);
-                });
+                assert!(reclaimed, "the settle owner reclaims the object it pinned");
                 assert!(
                     state.memory_object_slot_by_id(old_object).is_none(),
                     "released exactly once, when its own obligation is settled"
@@ -170156,6 +170227,432 @@ mod u9vment1_ownership_cases {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════════════
+    // The release boundary: one rank-local operation, named by identity.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn release_and_reclaim_are_one_operation_shared_by_both_adapters() {
+        const TXN: &str = include_str!("../syscall/vm_txn.rs");
+        assert!(
+            !TXN.contains("fn reclaim_replaced") && !TXN.contains("fn unpin_displaced"),
+            "the separate unpin and reclaim owners are gone: split across two acquisitions, a \
+             competing final-reference release can reclaim the unpinned object and the allocator \
+             can reissue its frame between them"
+        );
+        assert!(
+            TXN.contains("fn settle_displaced_hold(&mut self, object_id: u64, phys: PhysAddr)"),
+            "one owner releases the hold and reclaims that exact object, named by identity"
+        );
+        // And exactly one call site, on the committed path, after the acknowledgement.
+        let body: String = TXN
+            .split("pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(")
+            .nth(1)
+            .expect("the transaction")
+            .split("\n}\n")
+            .next()
+            .expect("body")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(body.matches("settle_displaced_hold(").count(), 1);
+        let ack = body
+            .rfind("owners.complete_shootdown(asid, records[index].virt)")
+            .expect("the acknowledgement");
+        let settle = body.find("settle_displaced_hold(").expect("the settle");
+        assert!(ack < settle, "acknowledged first, then settled");
+        // Both adapters drive the same rank-6 body.
+        for (label, src) in [
+            ("broad", include_str!("../syscall/vm.rs")),
+            ("split", include_str!("../syscall/vm_split.rs")),
+        ] {
+            let adapter = src
+                .split("fn settle_displaced_hold(")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{label} adapter"))
+                .split("\n    }")
+                .next()
+                .expect("body");
+            assert!(
+                adapter.contains("settle_displaced_hold_locked("),
+                "the {label} adapter must drive the shared rank-6 body"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recycled_object_at_the_same_address_is_never_mutated_by_this_transaction() {
+        // The interleaving the single operation exists to make impossible, forced against the
+        // production lifetime and allocator owners: a competing FINAL-REFERENCE release reclaims
+        // the object this transaction pinned, and the allocator reissues its frame to a brand new
+        // object at the very same physical address. Settling by address alone would then reclaim
+        // the replacement.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+
+                // The object this transaction displaced and pinned.
+                let (displaced_object, phys) =
+                    state.alloc_anonymous_object_without_cap().expect("object");
+                assert!(pin(&mut state, displaced_object));
+
+                // Its last reference goes away underneath us. The pin is what keeps it, so a
+                // competing reclaimer cannot free it — this is the boundary the pin already
+                // covers, re-established here so the identity check is exercised on the path
+                // AFTER the hold is released rather than instead of it.
+                state.with_memory_state_mut(|memory| {
+                    KernelState::reclaim_memory_object_if_unreferenced_locked(
+                        memory,
+                        CapObject::MemoryObject {
+                            id: displaced_object,
+                        },
+                    );
+                });
+                assert!(state.memory_object_slot_by_id(displaced_object).is_some());
+
+                // Now simulate the ONLY way the identity could drift: the object is retired and a
+                // DIFFERENT object takes the same physical address. (Reached here by retiring it
+                // directly, because with the hold in place nothing else can.)
+                state.with_memory_state_mut(|memory| {
+                    let slot = memory
+                        .memory_objects
+                        .iter()
+                        .position(|e| e.is_some_and(|o| o.id == displaced_object))
+                        .expect("slot");
+                    memory.memory_objects[slot] = None;
+                });
+                let max_objects = state.runtime_capacity_config().max_memory_objects;
+                let replacement = state
+                    .with_memory_state_mut(|memory| {
+                        KernelState::create_memory_object_slot_locked(
+                            memory,
+                            phys,
+                            PAGE,
+                            MemoryObjectKind::Anonymous,
+                            max_objects,
+                        )
+                    })
+                    .expect("a different object now sits at that address");
+                assert_ne!(replacement, displaced_object);
+                let before = refcounts(&state, replacement);
+
+                // The transaction settles the hold it recorded. It must decline: the object at
+                // that address is not the one it pinned.
+                let reclaimed = state.with_memory_state_mut(|memory| {
+                    crate::kernel::syscall::vm::settle_displaced_hold_locked(
+                        memory,
+                        displaced_object,
+                        phys,
+                    )
+                });
+                assert!(!reclaimed, "nothing of this transaction's was reclaimed");
+                assert!(
+                    state.memory_object_slot_by_id(replacement).is_some(),
+                    "the replacement object is left completely alone"
+                );
+                assert_eq!(
+                    refcounts(&state, replacement),
+                    before,
+                    "and its accounting is untouched"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn the_settle_owner_reclaims_only_the_object_it_pinned() {
+        // The positive half: when identity still matches, the hold is released and that exact
+        // object is reclaimed, in one operation.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let (mut state, _asid) = kernel_with_asid();
+                let free_before = free_frames(&state);
+                let (object_id, phys) = state.alloc_anonymous_object_without_cap().expect("object");
+                assert!(pin(&mut state, object_id));
+                assert!(
+                    !frame_is_available(&mut state, phys, 64),
+                    "held while pinned"
+                );
+
+                let reclaimed = state.with_memory_state_mut(|memory| {
+                    crate::kernel::syscall::vm::settle_displaced_hold_locked(
+                        memory, object_id, phys,
+                    )
+                });
+                assert!(reclaimed);
+                assert!(state.memory_object_slot_by_id(object_id).is_none());
+                assert_eq!(free_frames(&state), free_before, "its frame returns");
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    #[test]
+    fn a_failed_required_pin_refuses_rather_than_using_the_journal_address() {
+        // A hold that could not be taken must not silently authorize continued use of
+        // `PageRecord.phys`. Driven through the transaction with an owner whose pin refuses.
+        struct PinRefusingOwners {
+            inner: OrderingOwners,
+            refuse_at: usize,
+            pinned: usize,
+        }
+        impl VmMapOwners for PinRefusingOwners {
+            fn caller_tid(&self) -> Option<u64> {
+                self.inner.caller_tid()
+            }
+            fn caller_asid(&self, tid: u64) -> Option<Asid> {
+                self.inner.caller_asid(tid)
+            }
+            fn resolve_address_space_cap(&self, tid: u64, cap: CapId) -> Result<Asid, KernelError> {
+                self.inner.resolve_address_space_cap(tid, cap)
+            }
+            fn caller_cnode(&self, tid: u64) -> Option<CNodeId> {
+                self.inner.caller_cnode(tid)
+            }
+            fn is_page_mapped(&self, asid: Asid, virt: VirtAddr) -> Result<bool, KernelError> {
+                self.inner.is_page_mapped(asid, virt)
+            }
+            fn acquire_object(&mut self, flags: PageFlags) -> Result<(u64, PhysAddr), KernelError> {
+                self.inner.acquire_object(flags)
+            }
+            fn pin_object(&mut self, object_id: u64) -> bool {
+                if self.pinned == self.refuse_at {
+                    self.inner.say("pin_object_refused");
+                    return false;
+                }
+                self.pinned += 1;
+                self.inner.pin_object(object_id)
+            }
+            fn unpin_object(&mut self, object_id: u64) {
+                self.inner.unpin_object(object_id)
+            }
+            fn settle_displaced_hold(&mut self, object_id: u64, phys: PhysAddr) -> bool {
+                self.inner.settle_displaced_hold(object_id, phys)
+            }
+            fn release_unminted_object(&mut self, object_id: u64) {
+                self.inner.release_unminted_object(object_id)
+            }
+            fn mint_frame_cap(
+                &mut self,
+                object_id: u64,
+                phys: PhysAddr,
+            ) -> Result<CapId, KernelError> {
+                self.inner.mint_frame_cap(object_id, phys)
+            }
+            fn install_and_account(
+                &mut self,
+                asid: Asid,
+                flags: PageFlags,
+                records: &mut [PageRecord],
+            ) -> Result<(), (usize, KernelError)> {
+                self.inner.install_and_account(asid, flags, records)
+            }
+            fn complete_shootdown(&mut self, asid: Asid, virt: VirtAddr) -> bool {
+                self.inner.complete_shootdown(asid, virt)
+            }
+            fn release_provisional_cap(
+                &mut self,
+                cnode: CNodeId,
+                frame: ProvisionalFrame,
+            ) -> ProvisionalReleaseOutcome {
+                self.inner.release_provisional_cap(cnode, frame)
+            }
+            fn account_released_cap(&mut self, frame: ProvisionalFrame) {
+                self.inner.account_released_cap(frame)
+            }
+        }
+
+        let mut owners = PinRefusingOwners {
+            inner: OrderingOwners::new(),
+            refuse_at: 2,
+            pinned: 0,
+        };
+        run_vm_map_transaction(
+            &mut owners,
+            MapTarget::CallerAddressSpace,
+            MOCK_BASE,
+            4 * PAGE,
+            0x1 | 0x4,
+        )
+        .expect_err("a hold that cannot be taken must fail the request");
+
+        assert!(
+            owners.inner.index_of("mint_frame_cap").is_none(),
+            "no revocable authority is published once a required hold has failed: {:?}",
+            owners.inner.log
+        );
+        assert!(
+            owners.inner.index_of("install_begin").is_none(),
+            "and no page table is written from an address nothing is holding"
+        );
+        assert!(
+            owners.inner.live_pins().is_empty(),
+            "every hold that WAS taken is released"
+        );
+        assert!(
+            owners.inner.live_objects.is_empty(),
+            "and every object acquired is released, including the one whose pin refused"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // The shootdown contract actually used.
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn the_requester_is_the_entering_cpu_not_an_ambient_field() {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        // The authority is a parameter, and the exclusion uses it.
+        let body = RUNTIME
+            .split("pub(crate) fn complete_unmap_shootdown_from_split(")
+            .nth(1)
+            .expect("the shootdown")
+            .split("\n    }")
+            .next()
+            .expect("body");
+        assert!(
+            body.contains("requester: CpuId")
+                && body.contains("live_cpu_bitmap_for_asid_split(asid) & !(1u64 << requester.0)"),
+            "the requester must be stated by the caller and be what the target set excludes"
+        );
+        assert!(
+            !body.contains("sched.current_cpu"),
+            "the shootdown must not read the ambient field any CPU's broad acquisition can write"
+        );
+        // And the ambient field really is written by another CPU's broad acquisition — which is
+        // why reading it would exclude the wrong CPU.
+        const MEMSTATE: &str = include_str!("memory_state.rs");
+        assert!(
+            MEMSTATE.contains("set_current_cpu"),
+            "`request_live_asid_shootdown` impersonates a requester by writing that field"
+        );
+        // Every VM-transaction caller hands over the CPU the trap entered on.
+        const VM_SPLIT: &str = include_str!("../syscall/vm_split.rs");
+        assert!(
+            VM_SPLIT.contains("complete_unmap_shootdown_from_split(self.cpu, asid, virt)")
+                && VM_SPLIT
+                    .contains("unmap_range_two_phase_from_split(self.cpu, asid, start, len)"),
+            "both the mapping and the brk route must state the entering CPU"
+        );
+        const SPLIT: &str = include_str!("../syscall_split.rs");
+        assert_eq!(
+            SPLIT.matches("SplitVmOwners { shared, tid, cpu }").count(),
+            3,
+            "and all three NR routes hand the trap seam's own CPU to the adapter"
+        );
+    }
+
+    #[test]
+    fn each_architecture_names_the_mechanism_that_completes_its_invalidation() {
+        // x86_64: `invlpg` is local, secondaries CAN dispatch user tasks, so the remote request
+        // and acknowledgement is required — and exists.
+        const X86_SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            X86_SMP.contains("mark_cpu_wake_only(cpu, false)"),
+            "x86_64 has a site that makes a secondary dispatchable, so a remote holder of a user \
+             ASID is reachable"
+        );
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        assert!(
+            RUNTIME.contains("smp_tlb_shootdown_cpus(targets, virt.0) == want"),
+            "and the required mechanism is the generation-matched IPI with acknowledgement"
+        );
+
+        // AArch64: the unmap already issued an inner-shareable BROADCAST and waited for it.
+        const A64_PT: &str = include_str!("../../arch/aarch64/page_table.rs");
+        let inv = A64_PT
+            .split("pub fn invalidate_page(virt: VirtAddr) {")
+            .nth(1)
+            .expect("invalidate_page")
+            .split("\npub fn ")
+            .next()
+            .expect("body");
+        assert!(
+            inv.contains("tlbi vaae1is") && inv.contains("dsb ish"),
+            "AArch64 invalidation is an inner-shareable broadcast completed by a DSB, so every PE \
+             in the domain is covered without any IPI"
+        );
+        // AArch64 secondaries do not dispatch user tasks either, so the target set is empty in
+        // practice; the broadcast is what makes the contract hold regardless.
+        const A64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+        assert!(
+            A64_BOOT.contains("AArch64 has no AP *user* dispatcher")
+                && A64_BOOT.contains("mark_cpu_wake_only(cpu, true)"),
+            "AArch64 secondaries are marked wake-only before onlining"
+        );
+
+        // RISC-V: `sfence.vma` is hart-local and there is no broadcast — but a remote holder is
+        // unreachable by the port's DISPATCH RULES, not merely absent at some CPU count.
+        const RV_PT: &str = include_str!("../../arch/riscv64/page_table.rs");
+        let inv = RV_PT
+            .split("pub fn invalidate_page(virt: VirtAddr) {")
+            .nth(1)
+            .expect("invalidate_page")
+            .split("\npub fn ")
+            .next()
+            .expect("body");
+        assert!(
+            inv.contains("sfence.vma") && !inv.contains("remote"),
+            "RISC-V invalidation is hart-local"
+        );
+        const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+        assert!(
+            RV_BOOT.contains("riscv_bring_trap_ready_secondaries_online_wake_only")
+                && RV_BOOT.contains("mark_cpu_wake_only(cpu, true)"),
+            "RISC-V secondaries are brought online wake-only"
+        );
+        assert!(
+            !RV_BOOT.contains("mark_cpu_wake_only(cpu, false)")
+                || RV_BOOT.matches("mark_cpu_wake_only(cpu, false)").count()
+                    == RV_BOOT
+                        .matches("let _ = kernel.mark_cpu_wake_only(cpu, false);")
+                        .count(),
+            "and nothing clears that bit except the bring-up's own rollback, so no secondary hart \
+             ever dispatches a user task"
+        );
+        // The candidate set the shootdown asks about is exactly `online & !wake_only`, so a
+        // wake-only hart can never appear in it.
+        assert!(
+            RUNTIME.contains("let candidates = online & !wake_only;"),
+            "the target set excludes wake-only CPUs by construction"
+        );
+    }
+
+    #[test]
+    fn an_unacknowledged_page_is_quarantined_not_scheduled_for_retirement() {
+        // Precision about what an outstanding acknowledgement actually means. The pin prevents
+        // reuse — that is proven elsewhere — but nothing retires it later: there is no completion
+        // record and no release consumer for a shootdown that never arrived. Saying so plainly is
+        // part of the contract; claiming eventual retirement would be claiming an owner that does
+        // not exist.
+        const TXN: &str = include_str!("../syscall/vm_txn.rs");
+        assert!(
+            TXN.contains(
+                "INDEFINITE QUARANTINE, not
+/// deferred retirement"
+            ),
+            "the unacknowledged case must be described as quarantine, not as deferred retirement"
+        );
+        // And there is genuinely no such consumer: nothing re-reads the pin to retire it.
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        for phantom in [
+            "retry_unacknowledged_shootdown",
+            "drain_quarantined_frames",
+            "reclaim_after_late_ack",
+        ] {
+            assert!(
+                !RUNTIME.contains(phantom) && !TXN.contains(phantom),
+                "no owner named `{phantom}` exists, so none may be implied"
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
     // The committed path, live, against real state.
     // ═══════════════════════════════════════════════════════════════════════════════════════
 
@@ -170241,6 +170738,8 @@ mod u9vment1_reachability_matrix {
     const TXN: &str = include_str!("../syscall/vm_txn.rs");
     const VM: &str = include_str!("../syscall/vm.rs");
     const VM_SPLIT: &str = include_str!("../syscall/vm_split.rs");
+    const X86_IDT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const AARCH64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
 
     /// Every NR in this mission, with the constant each ingress gate names it by and the route
     /// that owns it.
@@ -170524,13 +171023,93 @@ mod u9vment1_reachability_matrix {
             "\n    fn note_brk",
         ));
         assert!(
-            split_unmap.contains("unmap_range_two_phase_split(asid, start, len)"),
+            split_unmap.contains("unmap_range_two_phase_from_split(self.cpu, asid, start, len)"),
             "the split shrink must reach the two-phase unmap owner — rank 5, then the shootdown \
-             with NO lock held, then rank 6 — which is what removed the one-CPU ceiling"
+             with NO lock held, then rank 6 — which is what removed the one-CPU ceiling; and it \
+             must state the entering CPU as the requester (U9-VM-ENTRY1-S §1)"
         );
         assert!(
             !split_unmap.contains("cpus_online") && !split_unmap.contains("online_cpu"),
             "and it must not reintroduce a CPU-count condition"
+        );
+    }
+
+    /// U9-VM-ENTRY1-S §1 — the requester every VM shootdown excludes is the CPU that ACTUALLY
+    /// entered the trap, and that identity is derived from hardware on each port rather than read
+    /// from any ambient kernel field another CPU can write.
+    ///
+    /// | port | where the entering-CPU identity comes from |
+    /// |---|---|
+    /// | x86_64 | `current_cpu_id()` at the IDT entry, from the local APIC id |
+    /// | AArch64 | `read_mpidr_el1() & 0xff` at the vector entry |
+    /// | RISC-V | `token.cpu()` — the per-hart dispatch authority minted at trap entry |
+    ///
+    /// From there it is a plain parameter the whole way down: arch entry -> the shared trap
+    /// handler -> `try_split_dispatch_into_frame` -> each NR's split seam -> `SplitVmOwners.cpu`
+    /// -> `complete_unmap_shootdown_from_split` / `unmap_range_two_phase_from_split`. Nothing on
+    /// that path consults `sched.current_cpu`, so no other CPU's broad acquisition can change
+    /// which CPU this transaction excludes from its target set.
+    #[test]
+    fn matrix_the_shootdown_requester_is_the_entering_cpu_on_every_architecture() {
+        // Each arch ingress derives the CPU from its own hardware identity and hands it over.
+        assert!(
+            X86_IDT.contains("let cpu = current_cpu_id();")
+                && X86_IDT.contains(
+                    "dispatch_trap_entry_with_shared_kernel(\n            shared,\n            cpu,"
+                ),
+            "x86_64 passes the APIC-derived entering CPU into the shared trap handler"
+        );
+        assert!(
+            AARCH64_BOOT.contains("read_mpidr_el1() & 0xff) as u8)")
+                && AARCH64_BOOT.contains(
+                    "dispatch_trap_entry_with_shared_kernel(\n            shared,\n            trap_cpu,"
+                ),
+            "AArch64 passes the MPIDR-derived entering CPU into the shared trap handler"
+        );
+        assert!(
+            RISCV_TRAP.contains("let cpu = token.cpu();")
+                && RISCV_TRAP.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "RISC-V passes the minted per-hart dispatch authority's CPU into the split dispatch"
+        );
+        // The shared handler and the split dispatcher only forward it.
+        assert!(
+            TRAP_ENTRY.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "the shared trap handler forwards its `cpu` parameter unchanged"
+        );
+        for (family, _, route) in FAMILIES {
+            assert!(
+                SPLIT.contains(&std::format!("return {route}(shared, cpu, frame);")),
+                "{family}: the NR gate forwards the entering CPU to its own route"
+            );
+        }
+        // Each route hands that same CPU to the owners struct — one construction site per family.
+        let constructions = SPLIT.matches("SplitVmOwners { shared, tid, cpu }").count();
+        assert_eq!(
+            constructions,
+            FAMILIES.len(),
+            "each of NR 3 / NR 13 / NR 14 constructs its owners with the entering CPU"
+        );
+        assert!(
+            !SPLIT.contains("SplitVmOwners { shared, tid }"),
+            "no VM route may construct owners without a stated requester"
+        );
+        // And the adapter uses it, rather than the ambient field, at both shootdown seams.
+        let split = code_only(VM_SPLIT);
+        assert!(
+            split.contains("complete_unmap_shootdown_from_split(self.cpu, asid, virt)")
+                && split.contains("unmap_range_two_phase_from_split(self.cpu, asid, start, len)"),
+            "both VM shootdown seams state the entering CPU as the requester"
+        );
+        assert!(
+            !split.contains("current_cpu"),
+            "and the adapter never reads the ambient `current_cpu` field"
+        );
+        // The broad adapter needs no such parameter: it runs under an acquisition that already
+        // pins the caller to this CPU, and its shootdown owner is the arch-neutral
+        // `shootdown_replaced_mapping`, not the split coordinator.
+        assert!(
+            code_only(VM).contains("shootdown_replaced_mapping(asid, virt)"),
+            "the broad adapter keeps its own existing shootdown owner"
         );
     }
 

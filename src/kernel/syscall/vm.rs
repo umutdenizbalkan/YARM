@@ -79,9 +79,9 @@ impl VmMapOwners for BroadVmOwners<'_> {
             .with_memory_state_mut(|memory| unpin_object_locked(memory, object_id));
     }
 
-    fn unpin_displaced(&mut self, phys: PhysAddr) {
+    fn settle_displaced_hold(&mut self, object_id: u64, phys: PhysAddr) -> bool {
         self.kernel
-            .with_memory_state_mut(|memory| unpin_object_for_phys_locked(memory, phys));
+            .with_memory_state_mut(|memory| settle_displaced_hold_locked(memory, object_id, phys))
     }
 
     fn release_unminted_object(&mut self, object_id: u64) {
@@ -114,12 +114,6 @@ impl VmMapOwners for BroadVmOwners<'_> {
         // scope: the ONLY behaviour change is that a reclaim now waits for the acknowledgement it
         // always owed.
         self.kernel.shootdown_replaced_mapping(asid, virt).is_ok()
-    }
-
-    fn reclaim_replaced(&mut self, phys: PhysAddr) {
-        self.kernel.with_memory_state_mut(|memory| {
-            KernelState::reclaim_memory_object_for_phys_locked(memory, phys);
-        });
     }
 
     fn release_provisional_cap(
@@ -316,43 +310,62 @@ pub(crate) fn unpin_object_locked(
 }
 
 /// rank 6 — the same hold, keyed by physical address, for a DISPLACED page whose object this
-/// transaction did not create and has no id for.
+/// transaction did not create and has no id for. Returns the IDENTITY it pinned, so the release
+/// can name the same object rather than looking it up by address again.
 pub(crate) fn pin_object_for_phys_locked(
     memory: &mut crate::kernel::boot::MemorySubsystem,
     phys: PhysAddr,
-) -> bool {
-    let Some(object_id) = memory
+) -> Option<u64> {
+    let object_id = memory
         .memory_objects
         .iter()
         .flatten()
         .find(|object| object.phys == phys)
-        .map(|object| object.id)
-    else {
-        return false;
-    };
-    pin_object_locked(memory, object_id)
+        .map(|object| object.id)?;
+    pin_object_locked(memory, object_id).then_some(object_id)
 }
 
-/// rank 6 — release a hold taken by [`pin_object_for_phys_locked`]. Deliberately does NOT reclaim:
-/// the displaced page's own reclaim is the caller's next step and is already shootdown-gated, so
-/// reclaiming here would duplicate it.
-pub(crate) fn unpin_object_for_phys_locked(
+/// ONE rank-6 acquisition: release the hold taken by [`pin_object_for_phys_locked`] AND reclaim
+/// that exact object. Returns whether it was reclaimed.
+///
+/// The two halves are inseparable on purpose. Split across two acquisitions, a competing
+/// final-reference release could reclaim the now-unpinned object between them and the allocator
+/// could reissue its frame — after which a reclaim keyed on the physical address would act on
+/// whatever object had taken its place, which is a mutation of somebody else's resource.
+///
+/// The identity check is what makes that impossible even in principle: the object at `phys` is
+/// reclaimed only if it is still the one this transaction pinned. If some other object now sits at
+/// that address the hold is released against the recorded id — never against the address — and the
+/// replacement is left completely alone.
+pub(crate) fn settle_displaced_hold_locked(
     memory: &mut crate::kernel::boot::MemorySubsystem,
+    object_id: u64,
     phys: PhysAddr,
-) {
-    if let Some(object_id) = memory
+) -> bool {
+    let object = CapObject::MemoryObject { id: object_id };
+    KernelState::adjust_memory_object_pin_refcount_locked(memory, object, -1);
+    // Reclaim the object this transaction pinned, and only if the frame at `phys` is still its
+    // own. A mismatch means it was already retired and something else took the address, so there
+    // is nothing here for this transaction to do.
+    let still_ours = memory
         .memory_objects
         .iter()
         .flatten()
-        .find(|object| object.phys == phys)
-        .map(|object| object.id)
-    {
-        KernelState::adjust_memory_object_pin_refcount_locked(
-            memory,
-            CapObject::MemoryObject { id: object_id },
-            -1,
+        .any(|entry| entry.id == object_id && entry.phys == phys);
+    if !still_ours {
+        crate::yarm_log!(
+            "VM_DISPLACED_SETTLE_IDENTITY_MISMATCH object={} phys=0x{:x}",
+            object_id,
+            phys.0
         );
+        return false;
     }
+    KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object);
+    memory
+        .memory_objects
+        .iter()
+        .flatten()
+        .all(|entry| entry.id != object_id)
 }
 
 /// The undo half of pass A, inside the SAME acquisition as the install. A page is returned to
