@@ -25,7 +25,7 @@ use crate::kernel::vm::{CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, Vi
 ///
 /// Bytes below 64 are required; bytes [64..80] (the `reserved` fields) default
 /// to zero when absent so validation still passes for a minimal 64-byte record.
-fn parse_v3_request_bytes(
+pub(crate) fn parse_v3_request_bytes(
     buf: &[u8],
 ) -> crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request {
     use crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request;
@@ -90,6 +90,56 @@ fn parse_v3_request_bytes(
 ///   [104..108] actual_mapping_perm (u32) — 1=RO, 3=RW, 0=none (Stage 58+59)
 ///   [108..112] C-layout padding
 ///   [112..120] cleanup_token (u64) — nonzero when mapping live (Stage 58+59)
+/// U9-XFER2 §3 — the OUTPUT ENCODER, factored out of the acquisition.
+///
+/// Building the record and writing it to user memory used to be one function that took
+/// `&mut KernelState`, which is what tied the whole of NR 30's output to the broad route. The
+/// bytes are the same bytes; what changed is that producing them no longer requires an
+/// acquisition, so both routes encode identically and differ only in which owner performs the
+/// copy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_v3_output(
+    out_len: u64,
+    result_status: u32,
+    sender_tid: u64,
+    message_len: u32,
+    message_flags: u32,
+    transferred_cap: u64,
+    object_kind: u32,
+    object_generation: u64,
+    effective_rights: u32,
+    exact_object_size: u64,
+    exact_region_len: u64,
+    mapped_base: u64,
+    page_rounded_mapped_len: u64,
+    actual_mapping_perm: u32,
+    cleanup_token: u64,
+) -> Option<([u8; 120], usize)> {
+    use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_OUTPUT_LEN, V3_VERSION};
+    if out_len < V3_MIN_OUTPUT_LEN as u64 {
+        return None;
+    }
+    let mut out = [0u8; 120];
+    out[0..4].copy_from_slice(&V3_VERSION.to_le_bytes());
+    out[4..8].copy_from_slice(&(V3_MIN_OUTPUT_LEN as u32).to_le_bytes());
+    out[8..12].copy_from_slice(&(SYSCALL_ABI_VERSION as u32).to_le_bytes());
+    out[12..16].copy_from_slice(&result_status.to_le_bytes());
+    out[16..24].copy_from_slice(&sender_tid.to_le_bytes());
+    out[24..28].copy_from_slice(&message_len.to_le_bytes());
+    out[28..32].copy_from_slice(&message_flags.to_le_bytes());
+    out[32..40].copy_from_slice(&transferred_cap.to_le_bytes());
+    out[40..44].copy_from_slice(&object_kind.to_le_bytes());
+    out[48..56].copy_from_slice(&object_generation.to_le_bytes());
+    out[56..60].copy_from_slice(&effective_rights.to_le_bytes());
+    out[64..72].copy_from_slice(&exact_object_size.to_le_bytes());
+    out[80..88].copy_from_slice(&exact_region_len.to_le_bytes());
+    out[88..96].copy_from_slice(&mapped_base.to_le_bytes());
+    out[96..104].copy_from_slice(&page_rounded_mapped_len.to_le_bytes());
+    out[104..108].copy_from_slice(&actual_mapping_perm.to_le_bytes());
+    out[112..120].copy_from_slice(&cleanup_token.to_le_bytes());
+    Some((out, (out_len as usize).min(120)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_v3_output_to_user(
     kernel: &mut KernelState,
@@ -110,44 +160,36 @@ fn write_v3_output_to_user(
     actual_mapping_perm: u32,
     cleanup_token: u64,
 ) -> bool {
-    use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_OUTPUT_LEN, V3_VERSION};
-    if out_ptr == 0 || out_len < V3_MIN_OUTPUT_LEN as u64 {
+    if out_ptr == 0 {
         return false;
     }
-    let mut out = [0u8; 120];
-    out[0..4].copy_from_slice(&V3_VERSION.to_le_bytes());
-    out[4..8].copy_from_slice(&(V3_MIN_OUTPUT_LEN as u32).to_le_bytes());
-    out[8..12].copy_from_slice(&(SYSCALL_ABI_VERSION as u32).to_le_bytes());
-    out[12..16].copy_from_slice(&result_status.to_le_bytes());
-    out[16..24].copy_from_slice(&sender_tid.to_le_bytes());
-    out[24..28].copy_from_slice(&message_len.to_le_bytes());
-    out[28..32].copy_from_slice(&message_flags.to_le_bytes());
-    out[32..40].copy_from_slice(&transferred_cap.to_le_bytes());
-    // Stage 47+48 object introspection fields.
-    out[40..44].copy_from_slice(&object_kind.to_le_bytes());
-    // out[44..48]: C-layout padding (already 0).
-    out[48..56].copy_from_slice(&object_generation.to_le_bytes());
-    out[56..60].copy_from_slice(&effective_rights.to_le_bytes());
-    // out[60..64]: C-layout padding (already 0).
-    // Stage 49: exact_object_size for MemoryObject; 0 for all other kinds.
-    out[64..72].copy_from_slice(&exact_object_size.to_le_bytes());
-    // out[72..80]: region_offset — FUTURE, always 0.
-    // Stage 50: exact_region_len for DmaRegion; 0 for all other kinds.
-    out[80..88].copy_from_slice(&exact_region_len.to_le_bytes());
-    // Stage 58+59: live mapping output fields (0 when no mapping).
-    out[88..96].copy_from_slice(&mapped_base.to_le_bytes());
-    out[96..104].copy_from_slice(&page_rounded_mapped_len.to_le_bytes());
-    out[104..108].copy_from_slice(&actual_mapping_perm.to_le_bytes());
-    // out[108..112]: C-layout padding (already 0).
-    out[112..120].copy_from_slice(&cleanup_token.to_le_bytes());
-    let write_len = (out_len as usize).min(120);
+    // U9-XFER2 §3: ONE encoder. This is the broad route's acquisition around it.
+    let Some((out, write_len)) = encode_v3_output(
+        out_len,
+        result_status,
+        sender_tid,
+        message_len,
+        message_flags,
+        transferred_cap,
+        object_kind,
+        object_generation,
+        effective_rights,
+        exact_object_size,
+        exact_region_len,
+        mapped_base,
+        page_rounded_mapped_len,
+        actual_mapping_perm,
+        cleanup_token,
+    ) else {
+        return false;
+    };
     kernel
         .copy_to_current_user(out_ptr as usize, &out[..write_len])
         .is_ok()
 }
 
 /// Map a [`CapObject`] variant to its `RecvSharedV3ObjectKind` discriminant.
-fn recv_v3_object_kind(obj: crate::kernel::capabilities::CapObject) -> u32 {
+pub(crate) fn recv_v3_object_kind(obj: crate::kernel::capabilities::CapObject) -> u32 {
     use crate::kernel::capabilities::CapObject;
     match obj {
         CapObject::MemoryObject { .. } => 1,
@@ -161,7 +203,7 @@ fn recv_v3_object_kind(obj: crate::kernel::capabilities::CapObject) -> u32 {
 }
 
 /// Return the object generation stored in a [`CapObject`], or 0 if unavailable.
-fn recv_v3_object_generation(obj: crate::kernel::capabilities::CapObject) -> u64 {
+pub(crate) fn recv_v3_object_generation(obj: crate::kernel::capabilities::CapObject) -> u64 {
     use crate::kernel::capabilities::CapObject;
     match obj {
         CapObject::Endpoint { generation, .. } => generation,
@@ -198,7 +240,7 @@ fn recv_v3_exact_object_size(
 ///
 /// The length is embedded directly in the cap — no registry lookup needed.
 /// Returns 0 for all other cap kinds (not fabricated — genuinely unavailable).
-fn recv_v3_exact_region_len(obj: crate::kernel::capabilities::CapObject) -> u64 {
+pub(crate) fn recv_v3_exact_region_len(obj: crate::kernel::capabilities::CapObject) -> u64 {
     use crate::kernel::capabilities::CapObject;
     match obj {
         CapObject::DmaRegion { len, .. } => len,
@@ -236,18 +278,10 @@ pub(super) fn handle_recv_shared_v3(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_REQUEST_LEN, validate_v3_request};
-    use crate::kernel::recv_core::{
-        RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvOutcome, RecvPayloadTarget,
-        RecvRequest, RecvRequestKind, RecvTransferPolicy, RecvUserWritebackOutcome,
-        execute_user_asid_plain_writeback, peek_recv_core_user_plain,
-    };
-
-    const V3_STATUS_OK: u32 = 0;
-    const V3_STATUS_WOULD_BLOCK: u32 = 1;
+    use crate::kernel::syscall::recv_v3_txn::{V3Delivery, run_recv_v3_transaction};
 
     let req_ptr = frame.arg(0);
     let req_len = frame.arg(1);
-
     if req_len < V3_MIN_REQUEST_LEN as usize {
         return Err(SyscallError::InvalidArgs);
     }
@@ -256,505 +290,301 @@ pub(super) fn handle_recv_shared_v3(
     kernel
         .copy_from_current_user_into_slice(req_ptr, read_len, &mut req_bytes[..read_len])
         .map_err(|_| SyscallError::PageFault)?;
-
     let req = parse_v3_request_bytes(&req_bytes);
-
     if validate_v3_request(&req).is_err() {
         return Err(SyscallError::InvalidArgs);
     }
-
-    // Stage 42+43: blocking not implemented — full blocking requires
-    // RecvAbiVariant::RecvSharedV3 in task.rs and wake-path changes.
+    // Blocking is unimplemented (Stage 42+43) and stays that way: adding a blocking mode is out
+    // of scope, and this is the answer the ABI already gives.
     if req.timeout_ticks != 0 {
         return Err(SyscallError::WouldBlock);
     }
-
-    // Stage 58+59: map_intent is now live for DmaRegion read-only.
-    // When map_intent != 0 the caller must supply at least V3_LIVE_OUTPUT_LEN bytes
-    // so mapped_base, page_rounded_mapped_len, actual_mapping_perm, and cleanup_token
-    // can all be written.  Smaller buffers are rejected to prevent silent token loss.
     if req.map_intent != 0
         && req.metadata_len < crate::kernel::recv_core::recv_shared_v3::V3_LIVE_OUTPUT_LEN as u64
     {
         return Err(SyscallError::InvalidArgs);
     }
 
-    // Stage 72: MAP_READ|MAP_WRITE (0x3) is permitted for the READ_SHARED_REPLY profile.
-    // Rights enforcement: compute_recv_v3_mapping_plan checks CAP_RIGHT_MAP + CAP_RIGHT_WRITE;
-    // InsufficientRights → rollback + InvalidArgs below.
-    // NX: hardcoded (execute: false) in all recv_shared_v3 page mappings.
-    // Cleanup: ActiveTransferMapping carries owner_tid+cap+base+len regardless of perm;
-    // purge_active_transfer_mappings_for_pid cleans both read-only and read-write mappings.
-    // WRITE-only (0x2) is already rejected: validate_v3_request above requires READ bit.
-
-    let caller_tid = current_tid(kernel)?;
-    let recv_cap = CapId(req.endpoint_cap);
-
-    validate_endpoint_right(kernel, recv_cap, CapRights::RECEIVE)?;
-    let endpoint_cap = kernel
-        .current_task_cnode()
-        .and_then(|cnode| kernel.capability_for_cnode_local(cnode, recv_cap))
-        .and_then(|cap| kernel.capability_object_live(cap.object).map(|_| cap));
-    let Some(ep_cap) = endpoint_cap else {
-        return Err(SyscallError::InvalidCapability);
-    };
-    let endpoint = ep_cap.object;
-
-    let request = RecvRequest {
-        kind: RecvRequestKind::NonblockingProbe,
-        requester_tid: caller_tid,
-        recv_cap,
-        payload_target: RecvPayloadTarget::UserMemory {
-            ptr: req.payload_ptr as usize,
-            len: req.payload_len as usize,
-        },
-        meta_target: RecvMetaTarget::None,
-        blocking: RecvBlockingPolicy::NoWait,
-        transfer: RecvTransferPolicy::LegacyFull,
-        map_intent: RecvMapIntent::None,
-    };
-
-    crate::yarm_log!("RECV_V3_ENTER tid={} cap={}", caller_tid, recv_cap.0);
-    // U9-XFER1 §3 — PEEK, do not dequeue.
-    //
-    // Before this, NR 30 dequeued here and woke the sender immediately afterwards, which put both
-    // of those irreversible steps AHEAD of everything that can fail: the capability mint, the
-    // mapping plan, the object/ASID resolution, the page mapping and the registry entry. Every one
-    // of those failures therefore destroyed the sender's message and settled the sender while
-    // returning `InvalidArgs` to the receiver — `rollback_materialized_recv_cap` restored the
-    // CAPABILITY, and nothing restored the MESSAGE.
-    //
-    // The message is now consumed by `commit_peeked_recv_with_cap_transfer` at the END of the
-    // transaction, under an identity check that proves the head is still the one this call planned
-    // around. Everything fallible happens first, while the message is still the sender's.
-    let endpoint_idx_for_commit = match kernel.resolve_endpoint_index(endpoint) {
-        Ok(idx) => idx,
-        Err(e) => return Err(SyscallError::from(e)),
-    };
-    let outcome = peek_recv_core_user_plain(kernel, &request, endpoint);
-
-    match outcome {
-        RecvOutcome::WouldBlock | RecvOutcome::FallbackRequired(_) => {
-            let _ = write_v3_output_to_user(
-                kernel,
-                req.metadata_ptr,
-                req.metadata_len,
-                V3_STATUS_WOULD_BLOCK,
+    let tid = current_tid(kernel)?;
+    crate::yarm_log!("RECV_V3_ENTER tid={} cap={}", tid, req.endpoint_cap);
+    let mut owners = BroadRecvV3Owners { kernel, tid };
+    match run_recv_v3_transaction(&mut owners, &req) {
+        Ok(V3Delivery::Mapped {
+            sender_tid,
+            xfer_cap,
+        }) => {
+            frame.set_ok(
+                usize::try_from(sender_tid).unwrap_or(0),
                 0,
-                0,
-                0,
-                SYSCALL_NO_TRANSFER_CAP,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
+                usize::try_from(xfer_cap).unwrap_or(usize::MAX),
             );
-            crate::yarm_log!("RECV_V3_WOULD_BLOCK tid={}", caller_tid);
-            return Err(SyscallError::WouldBlock);
-        }
-        RecvOutcome::TimedOut => return Err(SyscallError::TimedOut),
-        RecvOutcome::Error(e) => return Err(SyscallError::from(e)),
-        RecvOutcome::Delivered(delivery) => {
-            // Cap materialization BEFORE writeback — matches full-path §58 ordering.
-            let is_reply_cap = (delivery.msg.flags & Message::FLAG_REPLY_CAP) != 0;
-            let materialized_cap: Option<u64> = if let Some(_plan) = delivery.cap_transfer {
-                match materialize_received_message_cap(
-                    kernel,
-                    endpoint,
-                    caller_tid,
-                    delivery.msg.sender_tid.0,
-                    &delivery.msg,
-                ) {
-                    Ok(cap) => cap,
-                    Err(e) => return Err(e),
-                }
-            } else {
-                None
-            };
-
-            // U9-XFER1 §3: the sender's wake is NOT applied here. It belongs to the commit,
-            // because settling a sender for a message that was never consumed is exactly the
-            // defect this reordering removes. The peek's `scheduler` plan is always `None`; the
-            // real one comes back from `commit_peeked_recv_with_cap_transfer` below.
-
-            let payload_len = delivery.msg.as_slice().len();
-            let sender_tid_raw = delivery.msg.sender_tid.0;
-            let message_flags_raw = delivery.msg.flags as u32;
-            let xfer_cap_out = materialized_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
-
-            // Stage 47+48 + Stage 49 + Stage 50: resolve object metadata from the materialized cap.
-            // Resolve capability first (borrows kernel briefly), then query size separately.
-            let (obj_kind, obj_gen, eff_rights, exact_obj_size, exact_reg_len) =
-                match materialized_cap {
-                    Some(cap_id_raw) => {
-                        let resolved = kernel
-                            .capability_service()
-                            .resolve_current_task_capability(CapId(cap_id_raw));
-                        if let Some(cap) = resolved {
-                            (
-                                recv_v3_object_kind(cap.object),
-                                recv_v3_object_generation(cap.object),
-                                u32::from(cap.rights_bits()),
-                                recv_v3_exact_object_size(kernel, cap.object),
-                                recv_v3_exact_region_len(cap.object),
-                            )
-                        } else {
-                            (0, 0, 0, 0, 0)
-                        }
-                    }
-                    None => (0, 0, 0, 0, 0),
-                };
-
-            // Stage 58+59: live DmaRegion/MemoryObject read-only (or RW) mapping.
-            // Order: materialize cap → metadata → map pages → register token → output.
-            // On any failure: rollback mapped pages + cleanup slot + rollback cap.
-            // Stage 60: 6th element (map_rollback) carries (Asid, CapId) for
-            // post-writeback rollback if copy_to_current_user fails.
-            let (
-                mapped_base,
-                mapped_len_out,
-                actual_perm,
-                cleanup_token,
-                skip_payload,
-                map_rollback,
-            ) = if req.map_intent != 0 {
-                use crate::kernel::capabilities::CapObject;
-                use crate::kernel::recv_core::recv_shared_v3::{
-                    MAP_PERM_READ_ONLY, MAP_PERM_READ_WRITE, RecvV3MappingPlan,
-                    compute_recv_v3_mapping_plan,
-                };
-
-                let Some(cap_id_raw) = materialized_cap else {
-                    // map_intent requires a cap-transfer message
-                    return Err(SyscallError::InvalidArgs);
-                };
-                let cap_id = CapId(cap_id_raw);
-
-                // Use eff_rights (already resolved above) for plan computation.
-                let plan = compute_recv_v3_mapping_plan(
-                    delivery.msg.opcode,
-                    req.map_intent,
-                    req.payload_ptr,
-                    req.payload_len,
-                    eff_rights as u8,
-                    exact_reg_len,
-                    PAGE_SIZE as u64,
-                );
-
-                match plan {
-                    RecvV3MappingPlan::Map {
-                        map_va,
-                        mapped_len,
-                        read_only,
-                    } => {
-                        // Resolve physical start: mo.phys + dma.offset.
-                        // Separate cap lookup (Copy) and memory lookup (immutable borrow).
-                        let dma_fields = kernel
-                            .capability_service()
-                            .resolve_current_task_capability(cap_id)
-                            .and_then(|cap| match cap.object {
-                                CapObject::DmaRegion { id, offset, .. } => Some((id, offset)),
-                                CapObject::MemoryObject { id } => Some((id, 0u64)),
-                                _ => None,
-                            });
-                        let phys_start = dma_fields.and_then(|(mo_id, dma_offset)| {
-                            kernel.with_memory_state(|m| {
-                                m.memory_objects
-                                    .iter()
-                                    .flatten()
-                                    .find(|e| e.id == mo_id)
-                                    .map(|e| PhysAddr(e.phys.0 + dma_offset))
-                            })
-                        });
-                        let phys_start = match phys_start {
-                            Some(p) => p,
-                            None => {
-                                kernel.rollback_materialized_recv_cap(
-                                    caller_tid,
-                                    cap_id,
-                                    is_reply_cap,
-                                );
-                                return Err(SyscallError::InvalidArgs);
-                            }
-                        };
-
-                        let receiver_asid = match kernel.task_asid(caller_tid) {
-                            Some(a) => a,
-                            None => {
-                                kernel.rollback_materialized_recv_cap(
-                                    caller_tid,
-                                    cap_id,
-                                    is_reply_cap,
-                                );
-                                return Err(SyscallError::InvalidArgs);
-                            }
-                        };
-
-                        let map_flags = PageFlags {
-                            read: true,
-                            write: !read_only,
-                            execute: false,
-                            user: true,
-                            cache_policy: CachePolicy::WriteBack,
-                        };
-                        let num_pages = (mapped_len / PAGE_SIZE as u64) as usize;
-                        for page_idx in 0..num_pages {
-                            let virt = VirtAddr(map_va + page_idx as u64 * PAGE_SIZE as u64);
-                            let phys = PhysAddr(phys_start.0 + page_idx as u64 * PAGE_SIZE as u64);
-                            if kernel
-                                .map_user_page_in_asid_raw(
-                                    receiver_asid,
-                                    virt,
-                                    Mapping {
-                                        phys,
-                                        flags: map_flags,
-                                    },
-                                )
-                                .is_err()
-                            {
-                                let rollback_len = page_idx * PAGE_SIZE;
-                                if rollback_len > 0 {
-                                    kernel.unmap_range_two_phase(
-                                        receiver_asid,
-                                        map_va as usize,
-                                        rollback_len,
-                                    );
-                                }
-                                kernel.rollback_materialized_recv_cap(
-                                    caller_tid,
-                                    cap_id,
-                                    is_reply_cap,
-                                );
-                                return Err(SyscallError::InvalidArgs);
-                            }
-                        }
-
-                        if kernel
-                            .register_active_transfer_mapping(
-                                crate::kernel::ipc::ThreadId(caller_tid),
-                                cap_id,
-                                VirtAddr(map_va),
-                                mapped_len as usize,
-                            )
-                            .is_err()
-                        {
-                            kernel.unmap_range_two_phase(
-                                receiver_asid,
-                                map_va as usize,
-                                mapped_len as usize,
-                            );
-                            kernel.rollback_materialized_recv_cap(caller_tid, cap_id, is_reply_cap);
-                            return Err(SyscallError::InvalidArgs);
-                        }
-
-                        crate::yarm_log!(
-                            "RECV_V3_MAPPED tid={} va=0x{:x} len={} ro={}",
-                            caller_tid,
-                            map_va,
-                            mapped_len,
-                            read_only
-                        );
-                        let perm = if read_only {
-                            MAP_PERM_READ_ONLY
-                        } else {
-                            MAP_PERM_READ_WRITE
-                        };
-                        // cleanup_token = xfer_cap_out (full CapId.0, encodes slot+generation).
-                        // Stage 60: stale tokens are generation-safe because CapId encodes
-                        // generation in bits[63:16]; a revoked-then-reused slot has a
-                        // different CapId and will not match the stored active mapping entry.
-                        (
-                            map_va,
-                            mapped_len,
-                            perm,
-                            xfer_cap_out,
-                            true,
-                            Some((receiver_asid, cap_id)),
-                        )
-                    }
-                    RecvV3MappingPlan::Skip => {
-                        // map_intent != 0 but received message is not OPCODE_SHARED_MEM.
-                        kernel.rollback_materialized_recv_cap(caller_tid, cap_id, is_reply_cap);
-                        return Err(SyscallError::InvalidArgs);
-                    }
-                    RecvV3MappingPlan::InvalidRegion | RecvV3MappingPlan::InsufficientRights => {
-                        kernel.rollback_materialized_recv_cap(caller_tid, cap_id, is_reply_cap);
-                        return Err(SyscallError::InvalidArgs);
-                    }
-                }
-            } else {
-                (0u64, 0u64, 0u32, 0u64, false, None)
-            };
-
-            // ── U9-XFER1 §3 COMMIT ──────────────────────────────────────────────────────────
-            //
-            // Everything fallible is done: the capability is minted, the object resolved, the
-            // pages mapped and the registry entry taken, and each of those has its own exact undo
-            // below. NOW consume the message and settle the sender, in ONE rank-3 acquisition,
-            // under an identity check that the head is still the message this call planned around.
-            //
-            // If it is not, another receiver took it while this transaction was mapping. Nothing
-            // is consumed, nothing user-visible has happened yet, and this call compensates
-            // everything it built and reports the ABI's EXISTING "nothing for you right now"
-            // outcome — `WouldBlock`, which an empty queue already produces. No new refusal.
-            let committed =
-                kernel.commit_peeked_recv_with_cap_transfer(endpoint_idx_for_commit, &delivery.msg);
-            let commit_wake = match committed {
-                crate::kernel::boot::IpcEndpointRecvResult::Received(_) => None,
-                crate::kernel::boot::IpcEndpointRecvResult::ReceivedWithSenderWake(_, wake) => {
-                    Some(wake)
-                }
-                crate::kernel::boot::IpcEndpointRecvResult::Ineligible(_) => {
-                    // Lost the race. Undo, in the reverse order of construction, using the same
-                    // owners the post-writeback rollback uses.
-                    if let Some((rb_asid, rb_cap)) = map_rollback {
-                        kernel.unmap_range_two_phase(
-                            rb_asid,
-                            mapped_base as usize,
-                            mapped_len_out as usize,
-                        );
-                        kernel.remove_active_transfer_mapping(
-                            crate::kernel::ipc::ThreadId(caller_tid),
-                            rb_cap,
-                        );
-                    }
-                    if let Some(cap_id) = materialized_cap {
-                        kernel.rollback_materialized_recv_cap(
-                            caller_tid,
-                            CapId(cap_id),
-                            is_reply_cap,
-                        );
-                    }
-                    crate::yarm_log!(
-                        "RECV_V3_COMMIT_LOST_RACE tid={} cap={}",
-                        caller_tid,
-                        xfer_cap_out
-                    );
-                    return Err(SyscallError::WouldBlock);
-                }
-            };
-            // The message is consumed, so the sender's send succeeded and it may be settled.
-            if let Some(wake_tid) = commit_wake {
-                let _ = kernel.apply_split_sender_wake_plan(wake_tid);
-                // U6-FRAME §5C: unchanged wake-application observability, still emitted once and
-                // still before this route's writeback — the wake simply now follows the consume
-                // it reports rather than preceding it.
-                crate::yarm_log!(
-                    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
-                    wake_tid.tid.0
-                );
-            }
-
-            if skip_payload {
-                // Mapping done: payload_ptr is the mapping target VA, not an inline
-                // payload buffer. Skip copy. All info is in v3 metadata output.
-                // Stage 60: if metadata writeback fails the caller never receives the
-                // cleanup_token, so it cannot call TransferRelease. Roll back the mapping,
-                // remove the registry entry, and revoke the materialized cap so no resources
-                // leak.
-                let wrote_ok = write_v3_output_to_user(
-                    kernel,
-                    req.metadata_ptr,
-                    req.metadata_len,
-                    V3_STATUS_OK,
-                    sender_tid_raw,
-                    0,
-                    message_flags_raw,
-                    xfer_cap_out,
-                    obj_kind,
-                    obj_gen,
-                    eff_rights,
-                    exact_obj_size,
-                    exact_reg_len,
-                    mapped_base,
-                    mapped_len_out,
-                    actual_perm,
-                    cleanup_token,
-                );
-                if !wrote_ok {
-                    if let Some((rb_asid, rb_cap)) = map_rollback {
-                        kernel.unmap_range_two_phase(
-                            rb_asid,
-                            mapped_base as usize,
-                            mapped_len_out as usize,
-                        );
-                        kernel.remove_active_transfer_mapping(
-                            crate::kernel::ipc::ThreadId(caller_tid),
-                            rb_cap,
-                        );
-                        kernel.rollback_materialized_recv_cap(caller_tid, rb_cap, is_reply_cap);
-                    }
-                    crate::yarm_log!(
-                        "RECV_V3_WRITEBACK_FAIL_ROLLBACK tid={} cap={}",
-                        caller_tid,
-                        xfer_cap_out
-                    );
-                    return Err(SyscallError::InvalidArgs);
-                }
-                frame.set_ok(
-                    usize::try_from(sender_tid_raw).unwrap_or(0),
-                    0,
-                    usize::try_from(xfer_cap_out).unwrap_or(usize::MAX),
-                );
-                crate::yarm_log!(
-                    "RECV_V3_LIVE_MAPPED tid={} sender={}",
-                    caller_tid,
-                    sender_tid_raw
-                );
-                return Ok(());
-            }
-
-            match execute_user_asid_plain_writeback(kernel, &delivery) {
-                RecvUserWritebackOutcome::Ok => {
-                    let _ = write_v3_output_to_user(
-                        kernel,
-                        req.metadata_ptr,
-                        req.metadata_len,
-                        V3_STATUS_OK,
-                        sender_tid_raw,
-                        payload_len as u32,
-                        message_flags_raw,
-                        xfer_cap_out,
-                        obj_kind,
-                        obj_gen,
-                        eff_rights,
-                        exact_obj_size,
-                        exact_reg_len,
-                        0,
-                        0,
-                        0,
-                        0,
-                    );
-                    frame.set_ok(
-                        usize::try_from(sender_tid_raw).unwrap_or(0),
-                        payload_len,
-                        usize::try_from(xfer_cap_out).unwrap_or(usize::MAX),
-                    );
-                    crate::yarm_log!("RECV_V3_LIVE tid={} sender={}", caller_tid, sender_tid_raw);
-                }
-                RecvUserWritebackOutcome::UndersizedBuffer => {
-                    // Rollback cap — buffer too small, message consumed, §58.
-                    if let Some(cap_id) = materialized_cap {
-                        kernel.rollback_materialized_recv_cap(
-                            caller_tid,
-                            CapId(cap_id),
-                            is_reply_cap,
-                        );
-                    }
-                    return Err(SyscallError::InvalidArgs);
-                }
-                RecvUserWritebackOutcome::CopyFault { user_ptr } => {
-                    // No rollback on payload copy fault — message consumed, §58.
-                    record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
-                    return Ok(());
-                }
-            }
             Ok(())
+        }
+        Ok(V3Delivery::Plain {
+            sender_tid,
+            payload_len,
+            xfer_cap,
+        }) => {
+            frame.set_ok(
+                usize::try_from(sender_tid).unwrap_or(0),
+                payload_len,
+                usize::try_from(xfer_cap).unwrap_or(usize::MAX),
+            );
+            Ok(())
+        }
+        Ok(V3Delivery::PayloadFault { user_ptr }) => {
+            // §58 semantics, unchanged: the message IS consumed, the fault is recorded against
+            // the faulting pointer, and the syscall returns Ok without a result lane.
+            record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// U9-XFER2 §3 — the BROAD adapter for NR 30.
+///
+/// Holds no policy: it resolves the owners out of `&mut KernelState` and runs the SAME
+/// [`crate::kernel::syscall::recv_v3_txn::run_recv_v3_transaction`] the split adapter runs. The
+/// caller's ASID is resolved once, up front, and passed explicitly — the same discipline the
+/// split route needs, applied here so the two cannot disagree about which address space they are
+/// touching after the sender wake.
+pub(crate) struct BroadRecvV3Owners<'a> {
+    pub(crate) kernel: &'a mut KernelState,
+    pub(crate) tid: u64,
+}
+
+impl crate::kernel::syscall::recv_v3_txn::RecvV3Owners for BroadRecvV3Owners<'_> {
+    fn caller_tid(&mut self) -> u64 {
+        self.tid
+    }
+
+    fn caller_asid(&mut self) -> Option<crate::kernel::vm::Asid> {
+        self.kernel.task_asid(self.tid)
+    }
+
+    fn read_user(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        ptr: usize,
+        len: usize,
+    ) -> Option<[u8; 80]> {
+        let wide = self
+            .kernel
+            .copy_from_user(asid, crate::kernel::vm::VirtAddr(ptr as u64), len)
+            .ok()?;
+        let mut out = [0u8; 80];
+        let take = len.min(80);
+        out[..take].copy_from_slice(&wide[..take]);
+        Some(out)
+    }
+
+    fn write_user(&mut self, asid: crate::kernel::vm::Asid, ptr: usize, bytes: &[u8]) -> bool {
+        self.kernel
+            .copy_to_user(asid, crate::kernel::vm::VirtAddr(ptr as u64), bytes)
+            .is_ok()
+    }
+
+    fn resolve_recv_endpoint(
+        &mut self,
+        cap: CapId,
+    ) -> Result<crate::kernel::capabilities::CapObject, SyscallError> {
+        use crate::kernel::capabilities::CapRights;
+        validate_endpoint_right(self.kernel, cap, CapRights::RECEIVE)?;
+        let resolved = self
+            .kernel
+            .current_task_cnode()
+            .and_then(|cnode| self.kernel.capability_for_cnode_local(cnode, cap))
+            .and_then(|c| self.kernel.capability_object_live(c.object).map(|_| c));
+        resolved
+            .map(|c| c.object)
+            .ok_or(SyscallError::InvalidCapability)
+    }
+
+    fn endpoint_index(
+        &mut self,
+        endpoint: crate::kernel::capabilities::CapObject,
+    ) -> Result<usize, SyscallError> {
+        self.kernel
+            .resolve_endpoint_index(endpoint)
+            .map_err(SyscallError::from)
+    }
+
+    fn peek_head(
+        &mut self,
+        endpoint_idx: usize,
+    ) -> Result<Option<crate::kernel::ipc::Message>, SyscallError> {
+        use crate::kernel::boot::IpcEndpointPeekResult;
+        Ok(
+            match self.kernel.peek_queued_with_cap_transfer(endpoint_idx) {
+                IpcEndpointPeekResult::Peeked(msg) => Some(msg),
+                IpcEndpointPeekResult::Ineligible(_) => None,
+            },
+        )
+    }
+
+    fn materialize_cap(
+        &mut self,
+        endpoint: crate::kernel::capabilities::CapObject,
+        sender_tid: u64,
+        msg: &crate::kernel::ipc::Message,
+    ) -> Result<Option<u64>, SyscallError> {
+        materialize_received_message_cap(self.kernel, endpoint, self.tid, sender_tid, msg)
+    }
+
+    fn object_meta(&mut self, cap: CapId) -> crate::kernel::syscall::recv_v3_txn::V3ObjectMeta {
+        use crate::kernel::syscall::recv_v3_txn::V3ObjectMeta;
+        let Some(capability) = self
+            .kernel
+            .capability_service()
+            .resolve_current_task_capability(cap)
+        else {
+            return V3ObjectMeta::default();
+        };
+        V3ObjectMeta {
+            kind: recv_v3_object_kind(capability.object),
+            generation: recv_v3_object_generation(capability.object),
+            effective_rights: u32::from(capability.rights_bits()),
+            exact_object_size: recv_v3_exact_object_size(self.kernel, capability.object),
+            exact_region_len: recv_v3_exact_region_len(capability.object),
+        }
+    }
+
+    fn region_phys_start(&mut self, cap: CapId) -> Option<crate::kernel::vm::PhysAddr> {
+        use crate::kernel::capabilities::CapObject;
+        let (mo_id, offset) = self
+            .kernel
+            .capability_service()
+            .resolve_current_task_capability(cap)
+            .and_then(|c| match c.object {
+                CapObject::DmaRegion { id, offset, .. } => Some((id, offset)),
+                CapObject::MemoryObject { id } => Some((id, 0u64)),
+                _ => None,
+            })?;
+        self.kernel.with_memory_state(|m| {
+            m.memory_objects
+                .iter()
+                .flatten()
+                .find(|e| e.id == mo_id)
+                .map(|e| crate::kernel::vm::PhysAddr(e.phys.0 + offset))
+        })
+    }
+
+    fn map_page(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        virt: crate::kernel::vm::VirtAddr,
+        phys: crate::kernel::vm::PhysAddr,
+        writable: bool,
+    ) -> bool {
+        use crate::kernel::vm::{CachePolicy, Mapping, PageFlags};
+        self.kernel
+            .map_user_page_in_asid_raw(
+                asid,
+                virt,
+                Mapping {
+                    phys,
+                    flags: PageFlags {
+                        read: true,
+                        write: writable,
+                        execute: false,
+                        user: true,
+                        cache_policy: CachePolicy::WriteBack,
+                    },
+                },
+            )
+            .is_ok()
+    }
+
+    fn unmap_range(&mut self, asid: crate::kernel::vm::Asid, base: usize, len: usize) {
+        self.kernel.unmap_range_two_phase(asid, base, len);
+    }
+
+    fn register_transfer(
+        &mut self,
+        cap: CapId,
+        base: crate::kernel::vm::VirtAddr,
+        len: usize,
+    ) -> bool {
+        self.kernel
+            .register_active_transfer_mapping(
+                crate::kernel::ipc::ThreadId(self.tid),
+                cap,
+                base,
+                len,
+            )
+            .is_ok()
+    }
+
+    fn remove_transfer(&mut self, cap: CapId) -> bool {
+        self.kernel
+            .remove_active_transfer_mapping(crate::kernel::ipc::ThreadId(self.tid), cap)
+    }
+
+    fn commit_peeked(
+        &mut self,
+        head: &crate::kernel::syscall::recv_v3_txn::PeekedHead,
+    ) -> crate::kernel::syscall::recv_v3_txn::V3CommitOutcome {
+        use crate::kernel::boot::IpcEndpointRecvResult;
+        use crate::kernel::syscall::recv_v3_txn::V3CommitOutcome;
+        match self
+            .kernel
+            .commit_peeked_recv_with_cap_transfer(head.endpoint_idx, &head.msg)
+        {
+            IpcEndpointRecvResult::Received(_) => V3CommitOutcome::Consumed { wake: None },
+            IpcEndpointRecvResult::ReceivedWithSenderWake(_, wake) => {
+                V3CommitOutcome::Consumed { wake: Some(wake) }
+            }
+            IpcEndpointRecvResult::Ineligible(_) => V3CommitOutcome::LostRace,
+        }
+    }
+
+    fn settle_sender(&mut self, wake: crate::kernel::ipc::SenderWakeTarget) {
+        let _ = self.kernel.apply_split_sender_wake_plan(wake);
+        crate::yarm_log!(
+            "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+            wake.tid.0
+        );
+    }
+
+    fn rollback_cap(&mut self, cap: CapId, is_reply: bool) {
+        self.kernel
+            .rollback_materialized_recv_cap(self.tid, cap, is_reply);
+    }
+
+    fn note(&mut self, event: crate::kernel::syscall::recv_v3_txn::V3TxnEvent) {
+        note_v3_event("broad", event);
+    }
+}
+
+/// U9-XFER2 §3 — the shared NR 30 marker text, so both routes emit the same lines and a reader
+/// can still tell them apart on purpose.
+pub(crate) fn note_v3_event(route: &str, event: crate::kernel::syscall::recv_v3_txn::V3TxnEvent) {
+    use crate::kernel::syscall::recv_v3_txn::V3TxnEvent;
+    match event {
+        V3TxnEvent::Refused => crate::yarm_log!("RECV_V3_REFUSED route={}", route),
+        V3TxnEvent::WouldBlock => crate::yarm_log!("RECV_V3_WOULD_BLOCK route={}", route),
+        V3TxnEvent::DeliveredMapped {
+            sender_tid,
+            cleanup_token,
+        } => crate::yarm_log!(
+            "RECV_V3_LIVE_MAPPED route={} sender={} token={}",
+            route,
+            sender_tid,
+            cleanup_token
+        ),
+        V3TxnEvent::DeliveredPlain {
+            sender_tid,
+            payload_len,
+        } => crate::yarm_log!(
+            "RECV_V3_LIVE route={} sender={} len={}",
+            route,
+            sender_tid,
+            payload_len
+        ),
+        V3TxnEvent::LostRace => crate::yarm_log!("RECV_V3_COMMIT_LOST_RACE route={}", route),
+        V3TxnEvent::WritebackFailedAfterCommit => {
+            crate::yarm_log!("RECV_V3_WRITEBACK_FAIL_ROLLBACK route={}", route)
         }
     }
 }

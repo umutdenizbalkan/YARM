@@ -47546,8 +47546,38 @@ mod stage186e_vm_user_copy_seam {
     // borrow is dropped. The under-global-lock syscall/IPC files below must
     // STILL never call the copy seam: inside them a broad `&mut KernelState`
     // is live and the data_ptr()-derived seam would alias it (Stage 186D4).
+    //
+    // U9-XFER2 §1/§3 — the CLAIM is unchanged; the file list is corrected.
+    //
+    // The property this guard protects is aliasing: a `data_ptr()`-derived seam must not run
+    // while a broad `&mut KernelState` is live. `syscall_split.rs` was on the list because
+    // nothing in it called the seam, not because it holds such a borrow — it is the PRE-LOCK
+    // route and holds `&SharedKernel`, which is the whole reason it exists. NR 30's split route
+    // calls the seam there deliberately, and the aliasing property is asserted positively below
+    // rather than approximated by a filename.
     #[test]
     fn stage186e_seam_not_wired_live() {
+        // The pre-lock route may call the seam — and must never hold the borrow that would make
+        // that unsound. Asserted directly.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(
+            SPLIT_SRC
+                .contains("fn try_split_recv_shared_v3_into_frame(\n    shared: &SharedKernel,"),
+            "the NR 30 pre-lock route must take `&SharedKernel`"
+        );
+        let split_code: alloc::string::String = SPLIT_SRC
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !split_code.contains("&mut KernelState"),
+            "no pre-lock route may hold a broad `&mut KernelState`: that is exactly the borrow \
+             the data_ptr()-derived copy seam would alias"
+        );
         for (name, src) in [
             ("ipc_state.rs", include_str!("ipc_state.rs")),
             ("../syscall.rs", include_str!("../syscall.rs")),
@@ -47556,7 +47586,6 @@ mod stage186e_vm_user_copy_seam {
                 "../syscall/ipc_recv_core.rs",
                 include_str!("../syscall/ipc_recv_core.rs"),
             ),
-            ("../syscall_split.rs", include_str!("../syscall_split.rs")),
         ] {
             for helper in [
                 "copy_to_user_split(",
@@ -62934,7 +62963,8 @@ mod stage191e_dispatch_next_candidate_seam {
             // U9-MO2 §4 removed NR 28 from this list. Stage 191E's claim is that the CANDIDATE
             // SEAM adds no live class — it does not, and did not, own the whitelist's contents;
             // NR 28's admission came from §4 and is pinned by its own guards.
-            "Syscall::RecvSharedV3 => Some",
+            // U9-XFER2 §3 removed NR 30 from this list. Stage 191E's claim is untouched: the
+            // CANDIDATE SEAM adds no live class, and NR 30's admission came from U9-XFER2 §3.
             // U9-REAP1 §4 removed NR 31. Stage 191E's claim is unaffected and unchanged: the
             // CANDIDATE SEAM adds no live class, and NR 31's admission came from §4, not from it.
         ] {
@@ -72463,7 +72493,20 @@ mod stage198e3c2b_aarch64_direct {
         assert!(pred.contains("x86_shared_region_direct_oracle_enabled()"));
         assert!(pred.contains("aarch64_shared_region_direct_oracle_enabled()"));
         assert!(BOOT_SRC.contains("#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]"));
-        assert!(BOOT_SRC.contains("aarch64_shared_region_direct_oracle_enabled()"));
+        // U9-XFER2 §4: the AArch64 arming site now keys on the arch-neutral PROVISIONING predicate,
+        // because two cells consume the same provisioning. The AArch64 knob still reaches it — the
+        // provisioning predicate ORs the direct predicate asserted above with the witness knob — so
+        // the property re-anchors onto that route rather than onto the per-arch name.
+        assert!(
+            BOOT_SRC.contains("crate::kernel::boot::shared_region_oracle_provisioning_armed()")
+        );
+        let prov = MOD_SRC
+            .split_once("pub fn shared_region_oracle_provisioning_armed() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("provisioning-armed predicate present");
+        assert!(prov.contains("shared_region_direct_oracle_enabled()"));
+        assert!(prov.contains("xfer2_grant_witness_enabled()"));
     }
 
     // (3) The AArch64 boot provisioning slot contract: selector 6, source cap + endpoint cap in slots
@@ -72656,7 +72699,18 @@ mod stage198e3c2c_riscv_direct {
             .expect("shared enabled predicate present");
         assert!(pred.contains("riscv_shared_region_direct_oracle_enabled()"));
         assert!(BOOT_SRC.contains("#[cfg(feature = \"riscv-shared-region-direct-oracle\")]"));
-        assert!(BOOT_SRC.contains("riscv_shared_region_direct_oracle_enabled()"));
+        // U9-XFER2 §4 — same re-anchoring as AArch64: the arming site keys on the arch-neutral
+        // provisioning predicate, which ORs the per-arch direct predicate with the witness knob.
+        assert!(
+            BOOT_SRC.contains("crate::kernel::boot::shared_region_oracle_provisioning_armed()")
+        );
+        let prov = MOD_SRC
+            .split_once("pub fn shared_region_oracle_provisioning_armed() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("provisioning-armed predicate present");
+        assert!(prov.contains("shared_region_direct_oracle_enabled()"));
+        assert!(prov.contains("xfer2_grant_witness_enabled()"));
     }
 
     // (3) The RISC-V boot provisioning slot contract: selector 7, source cap + endpoint cap in slots
@@ -73920,14 +73974,27 @@ mod stage195a_aarch64_debuglog_live {
                 "AArch64 imports `{present}` — it has a TOTAL pre-lock route"
             );
         }
-        // The selectivity claim this case owns is unchanged; the stand-in moves again rather than
-        // the claim. NR 30 `RecvSharedV3` is the one still without a pre-lock route.
-        for absent in ["SYSCALL_RECV_SHARED_V3_NR"] {
-            assert!(
-                !body.contains(absent),
-                "the import must stay a whitelist: `{absent}` has no pre-lock route"
-            );
-        }
+        // U9-XFER2 §3: NR 30 now has a pre-lock route too, so it joins the import list.
+        assert!(
+            body.contains("SYSCALL_RECV_SHARED_V3_NR"),
+            "AArch64 imports NR 30 — it has a TOTAL pre-lock route"
+        );
+        // The SELECTIVITY claim this case owns is what matters, and it is asserted directly
+        // rather than through a stand-in that keeps being converted: the import is a whitelist,
+        // not "every syscall". `IpcRecv` (NR 2) is the standing example — its user-ASID cohort
+        // still has no pre-lock route.
+        assert!(
+            !body.contains("SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR"),
+            "the import must stay a whitelist: NR 8 is not on it — its split route decides \
+             eligibility from ARGUMENTS, so importing the ABI would not help it"
+        );
+        let imported = body
+            .matches("raw_nr == crate::kernel::syscall::SYSCALL_")
+            .count();
+        assert!(
+            imported < crate::kernel::syscall::SYSCALL_COUNT,
+            "the import list must remain strictly smaller than the syscall table"
+        );
         // NR 0 is the one entry for which the whitelist alone is not sufficient, because an
         // UNLISTED syscall leaves the frame reading `nr = 0` — which is Yield's own number. The
         // split route must therefore read the raw x8 rather than the frame's decoded number, or it
@@ -103032,11 +103099,18 @@ mod stage200d0d1_riscv_exit_prep {
     #[test]
     fn r25_selector_is_free_and_actually_written() {
         // Free: the RISC-V slot-5 namespace occupies 1..=10 and nothing writes 22.
-        assert!(
-            RV_BOOT_SRC.contains(
-                "init_args[5] = crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR;"
-            )
-        );
+        //
+        // U9-XFER2 §4 displaced the statement form: the shared-region arming site now assigns the
+        // result of a two-way choice (selector 7 for the DIRECT oracle, 12 for the grant witness),
+        // so the constant appears as an else-branch EXPRESSION rather than as a terminated
+        // statement. The property is unchanged — the shared-region selector reaches slot 5 by its
+        // NAME, never as a literal — so the guard is re-anchored on the assignment as a whole.
+        let sr_arm = RV_BOOT_SRC
+            .split("init_args[5] = ")
+            .find(|tail| tail.starts_with("if crate::kernel::boot::xfer2_grant_witness_enabled()"))
+            .expect("the RISC-V shared-region slot-5 arming site");
+        assert!(sr_arm.contains("crate::kernel::boot::XFER2_GRANT_WITNESS_SELECTOR"));
+        assert!(sr_arm.contains("crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR"));
         assert!(MOD_SRC.contains("pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"));
         assert!(MOD_SRC.contains("pub const RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 8;"));
         assert!(
@@ -103679,7 +103753,16 @@ mod stage200d2b1_liveness_abi {
         }
         assert_eq!(dispatch_sites, 3);
         // The shared `armed` helper decodes; it does not enumerate.
-        let armed = INIT_SRC
+        //
+        // Anchored on the OWNING MODULE, not on the first `armed` in the file: several unrelated
+        // cells (the two exit-current-task oracles, and U9-XFER2 §4's grant witness) define their
+        // own single-selector `armed`, and this guard is about the reply-liveness decoder alone —
+        // taking "the first one" made it silently move to whichever cell was declared earliest.
+        let reply_oracle = INIT_SRC
+            .split("mod ipc_reply_timeout_oracle {")
+            .nth(1)
+            .expect("ipc_reply_timeout_oracle module");
+        let armed = reply_oracle
             .split("pub(super) fn armed(slot5: Option<u32>) -> bool {")
             .nth(1)
             .expect("armed helper");
@@ -115015,6 +115098,8 @@ mod stage199d_riscv_canonical_admission {
             // U9-XFER1 §3: NR 4 `TransferRelease`, on the same terms — non-switching, and this
             // list is what decides whether the shared dispatcher is consulted at all.
             "SYSCALL_TRANSFER_RELEASE_NR",
+            // U9-XFER2 §3: NR 30 `RecvSharedV3`, the second half of the residual.
+            "SYSCALL_RECV_SHARED_V3_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -115026,13 +115111,14 @@ mod stage199d_riscv_canonical_admission {
         // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            17,
-            "exactly seventeen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            18,
+            "exactly eighteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
              SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask, \
              (U9-EXIT1 §5) ExitCurrentTask, (U9-RESIDUAL1 §3) Yield and (U9-VM-ENTRY1) \
-             VmMap + VmAnonMap + VmBrk and (U9-XFER1 §3) TransferRelease"
+             VmMap + VmAnonMap + VmBrk and (U9-XFER1 §3) TransferRelease \
+             plus (U9-XFER2 §3) RecvSharedV3"
         );
         assert!(
             !whitelist.contains("SYSCALL_IPC_RECV_NR"),
@@ -141011,26 +141097,59 @@ mod u9f_split_capability_revocation {
             ),
             (
                 "heap-reserved (NR 4, a capability userspace holds)",
-                "pub(crate) fn revoke_user_held_capability_split(",
-                "\n}",
+                "pub(crate) fn commit_user_held_capability_split(",
+                "\n    /// U9-F production entry point",
             ),
         ] {
             let body = body_of(region, entry, terminator);
-            assert!(
-                body.contains("self.commit_revoke_split("),
-                "the {label} entry point must reach the single commit"
-            );
-            for restated in [
-                "cspace_revoke_split(",
-                "cspace_read_then_revoke_split(",
-                "clear_delegation_links_split(",
-                "destroy_notification_for_revoked_object_split(",
-            ] {
+            // U9-XFER2 §2 split the two reservations apart on purpose. The bounded cohort keeps
+            // reaching `commit_revoke_split`; NR 4's own commit CONSUMES an owned reservation and
+            // carries the caller's shootdown verdict, which the shared body has no parameter for.
+            // What both must still do is perform the SAME teardown in the SAME order — asserted
+            // per-body below rather than by insisting on one shared callee.
+            if label.starts_with("bounded") {
                 assert!(
-                    !body.contains(restated),
-                    "the {label} entry point must not restate `{restated}`"
+                    body.contains("self.commit_revoke_split("),
+                    "the {label} entry point must reach the shared commit"
                 );
+                for restated in [
+                    "cspace_revoke_split(",
+                    "cspace_read_then_revoke_split(",
+                    "clear_delegation_links_split(",
+                    "destroy_notification_for_revoked_object_split(",
+                ] {
+                    assert!(
+                        !body.contains(restated),
+                        "the {label} entry point must not restate `{restated}`"
+                    );
+                }
+                continue;
             }
+            // NR 4's commit: same five steps, same order, plus the two things only it needs —
+            // link removal BY CONTENT, and a reclaim gated on the caller's shootdown verdict.
+            let order = [
+                "cspace_revoke_split(reservation.cnode, reservation.root.cap)",
+                "cspace_read_then_revoke_split(cnode, descendant.cap)",
+                "memory_obligations_split_gated(",
+                "destroy_notification_for_revoked_object_split(object)",
+                "clear_reserved_delegation_links_split(&reservation.link_removals)",
+                "destroy_notification_for_revoked_object_split(reservation.root_object)",
+            ];
+            let mut last = 0usize;
+            for needle in order {
+                let at = body
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("the {label} commit must `{needle}`"));
+                assert!(
+                    at > last,
+                    "`{needle}` is out of order in the {label} commit"
+                );
+                last = at;
+            }
+            assert!(
+                !body.contains("clear_delegation_links_split("),
+                "NR 4 must clear links by CONTENT, never by index alone"
+            );
         }
         // And the heap reservation must NOT carry the bounded plan's capacity refusals: NR 4's
         // root is a cap userspace holds, so a closure larger than 16 is ordinary, not an error.
@@ -141353,7 +141472,10 @@ mod u9f_split_capability_revocation {
                 "register_active_transfer_mapping(",
                 1,
             ),
-            (RUNTIME, "register_active_transfer_mapping_locked(", 1),
+            // U9-XFER2 §3 added the second: `SharedKernel::register_active_transfer_mapping_split`,
+            // NR 30's off-lock registration seam. The admission proof is re-derived below rather
+            // than the count merely bumped.
+            (RUNTIME, "register_active_transfer_mapping_locked(", 2),
         ];
         for (src, needle, expected) in sites {
             assert_eq!(
@@ -141363,6 +141485,33 @@ mod u9f_split_capability_revocation {
                  must be re-derived before this test is updated"
             );
         }
+        // THE re-derivation. A Notification still cannot reach a registration, because NR 30's
+        // split route registers only after `region_phys_start` resolved a physical base — and
+        // that owner matches `DmaRegion` and `MemoryObject` and nothing else.
+        const V3_SPLIT: &str = include_str!("../syscall/recv_v3_split.rs");
+        let phys = V3_SPLIT
+            .split_once("fn region_phys_start(")
+            .map(|(_, r)| r.split_once("\n    fn ").map_or(r, |(b, _)| b))
+            .expect("the split route must resolve a region base");
+        assert!(
+            phys.contains("CapObject::DmaRegion { id, offset, .. } => (id, offset)")
+                && phys.contains("CapObject::MemoryObject { id } => (id, 0u64)")
+                && phys.contains("_ => return None"),
+            "the split route's region resolver must admit only DmaRegion and MemoryObject"
+        );
+        // …and the transaction registers only on the path that resolved one.
+        const V3_TXN: &str = include_str!("../syscall/recv_v3_txn.rs");
+        let txn = code_of(V3_TXN);
+        let resolve = txn
+            .find("owners.region_phys_start(cap_id)")
+            .expect("the resolve must precede the register");
+        let register = txn
+            .find("owners.register_transfer(")
+            .expect("the register must exist");
+        assert!(
+            resolve < register,
+            "the object gate must precede the registration, so a Notification can never reach it"
+        );
     }
 
     // ── (4) THE ADMISSION CONDITION: Notification is production-UNREACHABLE here ────────────
@@ -171359,6 +171508,8 @@ mod u9xfer1_ownership_cases {
     const XFER_SPLIT: &str = include_str!("../syscall/xfer_split.rs");
     const CAP: &str = include_str!("../syscall/cap.rs");
     const RECV_V3: &str = include_str!("../syscall/recv_shared_v3.rs");
+    const V3_TXN: &str = include_str!("../syscall/recv_v3_txn.rs");
+    const V3_SPLIT: &str = include_str!("../syscall/recv_v3_split.rs");
     const IPC_STATE: &str = include_str!("ipc_state.rs");
     const LIFECYCLE: &str = include_str!("capability_lifecycle_state.rs");
     const SPLIT: &str = include_str!("../syscall_split.rs");
@@ -171430,14 +171581,44 @@ mod u9xfer1_ownership_cases {
             "\n/// THE transfer-release transaction",
         ));
         let cap_check = plan
-            .find("owners.capability_release_is_reservable(cnode, cap)")
-            .expect("the capability must be proven in the preflight");
+            .find(".reserve_capability_release(cnode, cap)")
+            .expect("the capability closure must be RESERVED in the preflight");
         let range_check = plan
             .find("owners.page_is_mapped(")
             .expect("the range must be proven in the preflight");
         assert!(
             range_check < cap_check,
-            "the range proof precedes the capability proof, so both precede every mutation"
+            "the range proof precedes the capability reservation, so both precede every mutation"
+        );
+        // U9-XFER2 §2 — the preflight must hand the reservation OUT. Building one here and
+        // dropping it would make this a rehearsal, and would put the allocation that can fail on
+        // the far side of the unmap.
+        assert!(
+            plan.contains("Ok((") && plan.contains("reservation,"),
+            "the preflight must return the owned reservation, not merely test that one could be \
+             built"
+        );
+        let txn = code_only(body_of(
+            XFER_TXN,
+            "pub(crate) fn run_transfer_release_transaction<O: XferReleaseOwners>(",
+            "\n}\n",
+        ));
+        assert!(
+            txn.contains("let (plan, reservation) = match plan_transfer_release("),
+            "the transaction must receive the reservation from its preflight"
+        );
+        assert!(
+            txn.contains("owners.revoke_reserved_capability(reservation, !all_acked)"),
+            "…and consume THAT reservation in the commit, with the shootdown verdict"
+        );
+        // Nothing may rebuild a reservation after the mutation boundary.
+        let after_unmap = txn
+            .split_once("owners.unmap_whole_range(")
+            .map(|(_, rest)| rest)
+            .expect("the unmap is the mutation boundary");
+        assert!(
+            !after_unmap.contains("reserve_capability_release"),
+            "the closure must not be re-reserved after the range has been destroyed"
         );
     }
 
@@ -171460,10 +171641,24 @@ mod u9xfer1_ownership_cases {
                 "nothing after the first mutation may refuse (`{refusal}` found)"
             );
         }
+        // U9-XFER2 §2 — and the revoke's result must be CONSUMED, not discarded. Dropping it made
+        // a revoke that never landed indistinguishable from a clean release of a range that had
+        // already been destroyed.
+        assert!(
+            !commit.contains("let _ = owners.revoke_reserved_capability")
+                && commit.contains("let revoke = owners.revoke_reserved_capability("),
+            "the revoke outcome must be bound and accounted for, never dropped"
+        );
+        assert!(
+            commit.contains(
+                "XferRevokeOutcome::AlreadyRetired) => XferTxnEvent::ReleasedAfterConcurrentRevoke"
+            ),
+            "a capability retired by someone else must be reported, not folded into a clean release"
+        );
         // The order the phases actually run in.
         let order = [
             "owners.unmap_whole_range(",
-            "owners.revoke_user_held_capability(",
+            "owners.revoke_reserved_capability(",
             "owners.remove_registration(",
             "owners.account_release(",
         ];
@@ -171529,8 +171724,8 @@ mod u9xfer1_ownership_cases {
     fn nr4_the_split_revoke_is_not_the_provisional_cap_subset() {
         let code = code_only(XFER_SPLIT);
         assert!(
-            code.contains("revoke_user_held_capability_split(self.tid, cap)"),
-            "NR 4 must reach the user-held revoke"
+            code.contains("commit_user_held_capability_split(reservation, backing_is_quarantined)"),
+            "NR 4 must commit the reservation it prepared, carrying the shootdown verdict"
         );
         assert!(
             !code.contains("revoke_capability_no_vm_split")
@@ -171553,10 +171748,37 @@ mod u9xfer1_ownership_cases {
             "fn collect_user_held_descendants_split(",
             "\n    /// U9-XFER1 \u{a7}3 \u{2014} the exact link-removal set",
         );
+        // U9-XFER2 §2 — capacity is reserved FALLIBLY and up front, never grown with `push`
+        // against the global allocation-error handler.
         assert!(
-            closure.contains("MAX_DELEGATED_CAPABILITY_LINKS")
-                && closure.contains("alloc::vec::Vec"),
-            "the closure must be heap-reserved and bounded by the link table, as the broad one is"
+            closure.contains("try_reserve(capacity)")
+                && closure.contains("SplitRevokeReserveError::OutOfMemory"),
+            "the closure must be reserved fallibly, so exhaustion is a value and not an abort"
+        );
+        // …and the truncating bound is gone. `queue` starts holding the ROOT, so a
+        // `queue.len() >= MAX` test could trip while the closure was still one short — and its
+        // `break` left the outer walk running, so the shortfall was silent.
+        assert!(
+            !closure.contains("found.len() >= MAX_DELEGATED_CAPABILITY_LINKS")
+                && !closure.contains("queue.len() >= MAX_DELEGATED_CAPABILITY_LINKS"),
+            "the off-by-one truncation bound must be gone, not merely widened"
+        );
+        assert!(
+            closure.contains("capacity.saturating_add(1)"),
+            "the queue reservation must account for the root it starts with"
+        );
+        // The link-removal set is identity-bearing: an index alone cannot name a link across a
+        // lock release, because the table has no per-slot generation.
+        let clear = body_of(
+            LIFECYCLE,
+            "fn clear_reserved_delegation_links_split(",
+            "\n    /// rank 3: the notification-destroy half",
+        );
+        assert!(
+            clear.contains(
+                "capability.delegated_capability_links[removal.index] == Some(removal.link)"
+            ),
+            "a reserved link must be cleared only while the slot still holds exactly that link"
         );
     }
 
@@ -171604,30 +171826,31 @@ mod u9xfer1_ownership_cases {
 
     // ── NR 30: the message is not consumed until everything fallible has succeeded ──────────
 
-    /// THE defect. The dequeue used to be the FIRST thing that happened after validation, and the
-    /// sender wake the second — both ahead of the cap mint, the mapping plan, the page mapping and
-    /// the registry entry. Every one of those failures destroyed the message and settled the
-    /// sender while returning an error.
+    /// THE defect, and where it now lives. The dequeue used to be the FIRST thing after
+    /// validation and the sender wake the second, both ahead of the cap mint, the mapping plan,
+    /// the phys/ASID resolution, the page mapping and the registry entry. U9-XFER2 §3 moved the
+    /// body into the shared transaction, so the ordering is asserted there — and it is now ONE
+    /// body serving both routes rather than a broad handler a split route would have to mirror.
     #[test]
     fn nr30_everything_fallible_precedes_the_consume() {
-        let handler = code_only(body_of(
-            RECV_V3,
-            "pub(super) fn handle_recv_shared_v3(",
-            "\npub(super) fn ",
+        let txn = code_only(body_of(
+            V3_TXN,
+            "pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(",
+            "/// Undo exactly what this transaction owns",
         ));
-        let peek = handler
-            .find("peek_recv_core_user_plain(kernel, &request, endpoint)")
+        let peek = txn
+            .find("owners.peek_head(endpoint_idx)")
             .expect("the head must be PEEKED, not dequeued");
-        let commit = handler
-            .find("kernel.commit_peeked_recv_with_cap_transfer(")
+        let commit = txn
+            .find("owners.commit_peeked(&head)")
             .expect("the consume must be an explicit commit");
         for fallible in [
-            "materialize_received_message_cap(",
+            "owners.materialize_cap(",
             "compute_recv_v3_mapping_plan(",
-            "map_user_page_in_asid_raw(",
-            "register_active_transfer_mapping(",
+            "owners.map_page(",
+            "owners.register_transfer(",
         ] {
-            let at = handler
+            let at = txn
                 .find(fallible)
                 .unwrap_or_else(|| panic!("`{fallible}` must be present"));
             assert!(at > peek, "`{fallible}` must follow the peek");
@@ -171637,59 +171860,69 @@ mod u9xfer1_ownership_cases {
                  destroys the sender's message"
             );
         }
-        // The consuming core is gone from this route entirely.
-        assert!(
-            !handler.contains("try_recv_core_user_plain("),
-            "NR 30 must not reach the CONSUMING core any more"
-        );
+        for (label, src) in [
+            ("the transaction", V3_TXN),
+            ("the broad adapter", RECV_V3),
+            ("the split adapter", V3_SPLIT),
+        ] {
+            assert!(
+                !code_only(src).contains("try_recv_core_user_plain("),
+                "{label} must not reach the CONSUMING core"
+            );
+        }
     }
 
-    /// The sender is settled by the COMMIT, never by the plan. Waking a sender for a message that
-    /// was never consumed is the second half of the same defect.
+    /// The sender is settled by the COMMIT, EXACTLY ONCE, and never by a compensation path.
     #[test]
     fn nr30_the_sender_is_settled_only_by_the_consume() {
-        let handler = code_only(body_of(
-            RECV_V3,
-            "pub(super) fn handle_recv_shared_v3(",
-            "\npub(super) fn ",
+        let txn = code_only(body_of(
+            V3_TXN,
+            "pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(",
+            "/// Undo exactly what this transaction owns",
         ));
-        let commit = handler
-            .find("kernel.commit_peeked_recv_with_cap_transfer(")
+        let commit = txn
+            .find("owners.commit_peeked(&head)")
             .expect("the commit must exist");
-        let wake = handler
-            .find("kernel.apply_split_sender_wake_plan(")
+        let wake = txn
+            .find("owners.settle_sender(wake)")
             .expect("the wake must exist");
         assert!(
             commit < wake,
             "the sender's wake must follow the consume it reports"
         );
-        // The wake target comes from the commit's own result, not from the peek's plan.
         assert!(
-            handler.contains("let commit_wake = match committed {")
-                && handler.contains("if let Some(wake_tid) = commit_wake {"),
+            txn.contains("V3CommitOutcome::Consumed { wake } => wake"),
             "the wake target must be the one the CONSUME produced"
         );
-        // The peek's plan can never carry one.
-        let peek_core = code_only(body_of(
-            include_str!("../recv_core.rs"),
-            "pub(crate) fn peek_recv_core_user_plain(",
-            "\n/// Perform the user-space copy",
+        assert_eq!(
+            txn.matches("owners.settle_sender(").count(),
+            1,
+            "a sender may be settled from exactly one site"
+        );
+        let rollback = code_only(body_of(
+            V3_TXN,
+            "fn rollback_owned<O: RecvV3Owners>(",
+            "/// Encode the output record",
         ));
         assert!(
-            peek_core.contains("IpcEndpointRecvResult::Received(msg)")
-                && !peek_core.contains("ReceivedWithSenderWake"),
-            "a peek must never produce a sender-wake plan"
+            !rollback.contains("settle_sender"),
+            "compensation must never settle a sender — it never consumed a message"
+        );
+        // The peek CANNOT produce a wake: only the commit outcome carries one.
+        assert!(
+            code_only(V3_TXN)
+                .contains("fn peek_head(&mut self, endpoint_idx: usize) -> Result<Option<Message>"),
+            "the peek owner returns a bare Message, never a plan carrying a wake"
         );
     }
 
-    /// The commit names the message it planned around. A lost race must not consume somebody
-    /// else's message, and must not be reported as a new kind of failure.
+    /// The commit names the message it planned around. A lost race consumes nothing.
     #[test]
     fn nr30_the_commit_consumes_the_peeked_message_or_nothing() {
         let commit = code_only(body_of(
             IPC_STATE,
             "pub(crate) fn commit_peeked_recv_with_cap_transfer_locked(",
-            "\n\npub(crate) fn ipc_try_recv_queued_with_cap_transfer_locked(",
+            "pub(crate) fn ipc_try_recv_queued_with_cap_transfer_locked(",
         ));
         assert!(
             commit.contains("IpcEndpointPeekResult::Peeked(head) if head == *expected"),
@@ -171705,19 +171938,13 @@ mod u9xfer1_ownership_cases {
             mismatch < dequeue,
             "the identity check must precede the dequeue"
         );
-        let arm_end = commit[mismatch..].find('}').expect("arm end");
-        assert!(
-            commit[mismatch..mismatch + arm_end]
-                .contains("return IpcEndpointRecvResult::Ineligible"),
-            "a mismatched head must consume nothing"
-        );
-        // The peek itself mutates nothing at all.
+        // The peek itself mutates nothing.
         let peek = code_only(body_of(
             IPC_STATE,
             "pub(crate) fn ipc_peek_queued_with_cap_transfer_locked(",
-            "\n\n/// U9-XFER1 \u{a7}3 \u{2014} the COMMIT half",
+            "U9-XFER1 \u{a7}3 \u{2014} the COMMIT half",
         ));
-        for mutating in ["endpoint.recv()", "= None", "queue[0] = None", "ep.send("] {
+        for mutating in ["endpoint.recv()", "queue[0] = None", "ep.send("] {
             assert!(
                 !peek.contains(mutating),
                 "the peek must not mutate (`{mutating}` found)"
@@ -171729,193 +171956,954 @@ mod u9xfer1_ownership_cases {
         );
     }
 
-    /// A lost race compensates everything it built, in reverse order, and reports the ABI's
-    /// EXISTING "nothing for you right now" outcome — not a new refusal.
+    /// A lost race compensates ONLY what this transaction owns, in reverse order, and reports the
+    /// ABI's existing `WouldBlock`.
     #[test]
     fn nr30_a_lost_race_compensates_and_reuses_the_existing_outcome() {
-        let handler = code_only(body_of(
-            RECV_V3,
-            "pub(super) fn handle_recv_shared_v3(",
-            "\npub(super) fn ",
+        let txn = code_only(body_of(
+            V3_TXN,
+            "pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(",
+            "/// Undo exactly what this transaction owns",
         ));
-        let arm_start = handler
-            .find("IpcEndpointRecvResult::Ineligible(_) => {")
+        let arm = txn
+            .split_once("V3CommitOutcome::LostRace =>")
+            .map(|(_, r)| r)
             .expect("the lost-race arm must exist");
-        let arm = &handler[arm_start..];
-        let arm_end = arm
+        let end = arm
             .find("return Err(SyscallError::WouldBlock);")
-            .expect("the outcome");
-        let arm = &arm[..arm_end];
+            .expect("outcome");
+        let arm = &arm[..end];
+        assert!(
+            arm.contains("rollback_owned("),
+            "a lost race must compensate what it built"
+        );
+        assert!(
+            !arm.contains("settle_sender"),
+            "a lost race consumed nothing, so it settles nobody"
+        );
+        // `WouldBlock` is what an empty queue already produces — no new refusal.
+        assert!(
+            txn.contains("return Err(SyscallError::WouldBlock);"),
+            "a lost race reuses the ABI's existing empty-queue outcome"
+        );
+        // Compensation touches only owned resources: the transaction's own mapping range, its own
+        // registry entry, its own minted cap.
+        let rollback = code_only(body_of(
+            V3_TXN,
+            "fn rollback_owned<O: RecvV3Owners>(",
+            "/// Encode the output record",
+        ));
         let order = [
-            "kernel.unmap_range_two_phase(",
-            "kernel.remove_active_transfer_mapping(",
-            "kernel.rollback_materialized_recv_cap(",
+            "owners.unmap_range(asid, base.0 as usize, len)",
+            "owners.remove_transfer(reg_cap)",
+            "owners.rollback_cap(cap_id, is_reply)",
         ];
         let mut last = 0usize;
         for needle in order {
-            let at = arm
+            let at = rollback
                 .find(needle)
-                .unwrap_or_else(|| panic!("the lost-race arm must `{needle}`"));
+                .unwrap_or_else(|| panic!("compensation must `{needle}`"));
             assert!(
                 at > last,
                 "`{needle}` must undo in reverse order of construction"
             );
             last = at;
         }
-        // `WouldBlock` is what an empty queue already produces, so this introduces no new refusal.
-        assert!(
-            handler.contains("crate::yarm_log!(\n                        \"RECV_V3_COMMIT_LOST_RACE tid={} cap={}\"")
-                || handler.contains("RECV_V3_COMMIT_LOST_RACE"),
-            "the lost race must be observable, not silent"
-        );
-        assert!(
-            handler.contains("return Err(SyscallError::WouldBlock);"),
-            "a lost race reuses the ABI's existing empty-queue outcome"
-        );
     }
 
     /// Exactly ONE branch still consumes the message and can then fail: the user metadata
-    /// writeback. User memory cannot be un-written, so this is inherent — it is the LAST step, and
-    /// it keeps its existing compensation. Stated rather than claimed away.
+    /// writeback. User memory cannot be un-written, so it is LAST and compensates what remains.
     #[test]
     fn nr30_the_one_remaining_consuming_failure_is_named_and_last() {
-        let handler = code_only(body_of(
-            RECV_V3,
-            "pub(super) fn handle_recv_shared_v3(",
-            "\npub(super) fn ",
+        let txn = code_only(body_of(
+            V3_TXN,
+            "pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(",
+            "/// Undo exactly what this transaction owns",
         ));
-        let commit = handler
-            .find("kernel.commit_peeked_recv_with_cap_transfer(")
+        let commit = txn
+            .find("owners.commit_peeked(&head)")
             .expect("the commit must exist");
-        let writeback = handler
-            .find("let wrote_ok = write_v3_output_to_user(")
+        let writeback = txn
+            .find("let wrote = write_output(")
             .expect("the metadata writeback must exist");
         assert!(
             commit < writeback,
             "the writeback is the only fallible step left after the consume"
         );
-        // …and it still compensates exactly what it did.
-        let after = &handler[writeback..];
+        let after = &txn[writeback..];
         assert!(
-            after.contains("RECV_V3_WRITEBACK_FAIL_ROLLBACK")
-                && after.contains("kernel.unmap_range_two_phase(")
-                && after.contains("kernel.rollback_materialized_recv_cap("),
-            "the writeback failure keeps its existing rollback"
+            after.contains("V3TxnEvent::WritebackFailedAfterCommit")
+                && after.contains("rollback_owned("),
+            "the writeback failure must be reported and must compensate what remains"
         );
     }
 }
 
-/// U9-XFER1 §4 — why NR 30's TERMINAL DISPATCH is not closed in this package, proven from source
-/// rather than asserted.
+/// U9-XFER2 §2 — NR 4's prepare/commit boundary, exercised against the REAL production owners
+/// rather than asserted from source.
 ///
-/// NR 4 is closed: it has a total pre-lock route on all three architectures. NR 30 does not, and
-/// the obstacle is not its transaction — that is now correct, and its owners are rank-local. The
-/// obstacle is that **NR 30 writes user memory on every single exit**, and no off-lock user-memory
-/// WRITE owner exists.
-///
-/// This is the same constraint that has kept NR 2 `IpcRecv`'s user-ASID cohort on the broad path
-/// since Stage 32B, in that route's own words: a user-ASID receiver "would require a forbidden
-/// user copy". Building that owner is a foundation stage with its own fault semantics, not part of
-/// completing these two families — so the limit is recorded here instead of being papered over
-/// with a route that would decline every real caller.
+/// Each case drives `plan_revoke_user_held_capability_split` and
+/// `commit_user_held_capability_split` — the pair NR 4's split adapter actually calls — and
+/// checks a property that was wrong before this package.
 #[cfg(test)]
-mod u9xfer1_nr30_terminal_dispatch_limit {
-    const RECV_V3: &str = include_str!("../syscall/recv_shared_v3.rs");
-    const SPLIT: &str = include_str!("../syscall_split.rs");
-    const RUNTIME: &str = include_str!("../../runtime.rs");
+mod u9xfer2_reservation_cases {
+    use super::*;
+    use crate::kernel::boot::MAX_DELEGATED_CAPABILITY_LINKS;
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    use crate::runtime::SharedKernel;
 
-    /// Every exit of NR 30 writes to user memory — success, would-block and mapped alike. There is
-    /// no cohort of NR 30 calls that could be serviced without a user write.
+    /// Build a kernel with task 1 dispatched, holding one ordinary capability in its cnode.
+    /// Returns `(shared, tid, cap)`.
+    fn shared_with_one_held_cap() -> (SharedKernel, u64, CapId) {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cap = shared.with(|state| {
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            state
+                .mint_capability_for_current_context(Capability::new(
+                    CapObject::Kernel,
+                    CapRights::READ,
+                ))
+                .expect("mint root cap")
+        });
+        (shared, 1, cap)
+    }
+
+    /// A COMPLETELY populated delegation table must yield the whole closure.
+    ///
+    /// The old collector seeded `queue` with the ROOT and then tested `queue.len() >= MAX`, so it
+    /// could stop while the closure was still one short — and its `break` left the outer walk
+    /// running, so the shortfall was silent. The reservation is now sized from the table itself
+    /// and carries no truncating test at all.
     #[test]
-    fn nr30_writes_user_memory_on_every_exit() {
-        // The metadata record is written on the would-block exit, the mapped-success exit and the
-        // plain-success exit; the plain path additionally copies the payload.
+    fn a_full_delegation_table_yields_every_descendant() {
+        std::thread::Builder::new()
+            .name("u9xfer2_full_table".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (shared, tid, root) = shared_with_one_held_cap();
+                // One chain: root -> d1 -> d2 -> ... , filling the table completely.
+                let mut chain: std::vec::Vec<CapId> = std::vec::Vec::new();
+                let mut source = root;
+                let mut filled = 0usize;
+                loop {
+                    let dest = CapId(0x9000_0000u64 + filled as u64);
+                    let ok = shared.with(|state| {
+                        state
+                            .record_delegated_capability_link(tid, source, tid, dest)
+                            .is_ok()
+                    });
+                    if !ok {
+                        break;
+                    }
+                    chain.push(dest);
+                    source = dest;
+                    filled += 1;
+                }
+                assert_eq!(
+                    filled, MAX_DELEGATED_CAPABILITY_LINKS,
+                    "the table must be COMPLETELY full for this case to mean anything"
+                );
+
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(tid, root)
+                    .expect("a full table must still reserve");
+                let collected = reservation.descendants.iter().flatten().count();
+                assert_eq!(
+                    collected, filled,
+                    "every link in a full table is one descendant; the closure must contain all \
+                     {filled} of them, with no truncation"
+                );
+                // …and the link-removal set covers the whole chain too.
+                assert_eq!(
+                    reservation.link_removals.len(),
+                    filled,
+                    "every link on the chain names the root or a descendant, so all are removable"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// A link slot that was RECYCLED between the reservation and the commit must be left alone.
+    ///
+    /// `delegated_capability_links` has no per-slot generation, so an index does not identify a
+    /// link. Clearing by index would destroy an unrelated delegation created after the plan.
+    #[test]
+    fn a_recycled_link_slot_is_not_cleared_by_index() {
+        std::thread::Builder::new()
+            .name("u9xfer2_link_reuse".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (shared, tid, root) = shared_with_one_held_cap();
+                let doomed = CapId(0x9100_0000);
+                shared.with(|state| {
+                    state
+                        .record_delegated_capability_link(tid, root, tid, doomed)
+                        .expect("link");
+                });
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(tid, root)
+                    .expect("reserve");
+                assert_eq!(reservation.link_removals.len(), 1, "one link reserved");
+                let idx = reservation.link_removals[0].index;
+
+                // Concurrent world: that link is retired and its slot reused by an unrelated
+                // delegation between UNRELATED caps.
+                let other_src = CapId(0x9200_0000);
+                let other_dst = CapId(0x9200_0001);
+                shared.with_capability_state_split_mut(|capability| {
+                    capability.delegated_capability_links[idx] =
+                        Some(crate::kernel::boot::defs::DelegatedCapabilityLink {
+                            source_tid: 77,
+                            source_cap: other_src,
+                            dest_tid: 78,
+                            dest_cap: other_dst,
+                        });
+                });
+
+                let _ = shared.commit_user_held_capability_split(reservation, false);
+
+                let survivor = shared.with_capability_state_split_mut(|capability| {
+                    capability.delegated_capability_links[idx]
+                });
+                assert_eq!(
+                    survivor.map(|l| (l.source_cap, l.dest_cap)),
+                    Some((other_src, other_dst)),
+                    "the unrelated delegation that took the slot must survive: an index alone \
+                     does not identify a link"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// An incomplete shootdown must survive the REVOKE, not just the unmap.
+    ///
+    /// The unmap owner already skips its own per-page reclaim. But the revoke then runs its own
+    /// reclaimers, finds the pages already gone, concludes everything was acknowledged, and would
+    /// free the very backing the unmap quarantined. The verdict is carried in so it does not.
+    #[test]
+    fn an_incomplete_shootdown_suppresses_the_revokes_reclaim() {
+        std::thread::Builder::new()
+            .name("u9xfer2_quarantine".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+                let (mo_id, mem_cap) = shared.with(|state| {
+                    state.register_task(1).expect("task1");
+                    state.enqueue_current_cpu(1).expect("enqueue");
+                    state.dispatch_next_task().expect("dispatch");
+                    state.alloc_anonymous_memory_object().expect("mem")
+                });
+                let live_before = shared.with(|state| state.memory_object_slot_by_id(mo_id));
+                assert!(live_before.is_some(), "the object starts live");
+
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(1, mem_cap)
+                    .expect("reserve");
+                // Quarantined: phase U reported an incomplete ACK for this backing.
+                let outcome = shared.commit_user_held_capability_split(reservation, true);
+                assert!(
+                    matches!(
+                        outcome,
+                        crate::kernel::boot::SplitRevokeCommitOutcome::Revoked(_)
+                    ),
+                    "the capability half still completes"
+                );
+                assert!(
+                    shared
+                        .with(|state| state.memory_object_slot_by_id(mo_id))
+                        .is_some(),
+                    "the backing must NOT be reclaimed while its shootdown is unacknowledged — \
+                     the revoke's own reclaimer would otherwise free the quarantined frame"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// The same request WITHOUT the quarantine reclaims normally, so the guard above is proving a
+    /// suppression rather than an object that was never reclaimable.
+    #[test]
+    fn an_acknowledged_shootdown_still_reclaims() {
+        std::thread::Builder::new()
+            .name("u9xfer2_reclaims".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+                let (mo_id, mem_cap) = shared.with(|state| {
+                    state.register_task(1).expect("task1");
+                    state.enqueue_current_cpu(1).expect("enqueue");
+                    state.dispatch_next_task().expect("dispatch");
+                    state.alloc_anonymous_memory_object().expect("mem")
+                });
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(1, mem_cap)
+                    .expect("reserve");
+                let _ = shared.commit_user_held_capability_split(reservation, false);
+                assert!(
+                    shared
+                        .with(|state| state.memory_object_slot_by_id(mo_id))
+                        .is_none(),
+                    "with the shootdown acknowledged, the last capability reference retires the \
+                     object exactly as the broad path does"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// A root somebody else retired between the reservation and the commit is REPORTED, not
+    /// folded into a clean release.
+    #[test]
+    fn a_concurrently_retired_root_is_reported() {
+        std::thread::Builder::new()
+            .name("u9xfer2_raced_revoke".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (shared, tid, root) = shared_with_one_held_cap();
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(tid, root)
+                    .expect("reserve");
+                // Concurrent world: someone else revokes it first.
+                shared.with(|state| {
+                    let cnode = state.current_task_cnode().expect("cnode");
+                    state
+                        .revoke_capability_in_cnode(cnode, root)
+                        .expect("concurrent revoke");
+                });
+                let outcome = shared.commit_user_held_capability_split(reservation, false);
+                assert_eq!(
+                    outcome,
+                    crate::kernel::boot::SplitRevokeCommitOutcome::RootAlreadyRetired,
+                    "the commit must say the capability was already gone rather than claim it \
+                     performed the revocation"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+}
+
+/// U9-XFER2 §4 — structural guards for the END-TO-END GRANT WITNESS.
+///
+/// The witness itself is a LIVE cell: it runs in QEMU on all three ports under
+/// `scripts/qemu-xfer2-grant-witness-smoke.sh`, and what it proves — NR 30 receives and maps a
+/// disposable grant with correct metadata, rights and backing, NR 4 releases it through both
+/// request shapes, the mapping is really gone and the capability really revoked, and init's
+/// essential capabilities survive — is proven by that boot, not here.
+///
+/// These guards protect the WIRING that boot depends on, so a silent disarm (the failure mode
+/// that made the first three attempts at this witness produce an all-green log with no cell in
+/// it) is caught hosted rather than by reading a QEMU transcript.
+#[cfg(test)]
+mod u9xfer2_grant_witness_wiring {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const X86_BOOT: &str = include_str!("../../arch/x86_64/boot.rs");
+    const A64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    /// The knob reaches the flag, and the flag reaches PROVISIONING.
+    ///
+    /// This is the exact defect the first live run hit: the boot parsed `yarm.xfer2_grant_witness=1`
+    /// and set the flag, but `provision_init_shared_region_oracle` returned early on the DIRECT
+    /// predicate, so slots 5/13/14 were never written and the cell never ran — a clean boot with
+    /// no witness in it.
+    #[test]
+    fn the_witness_knob_arms_the_shared_provisioning() {
+        assert!(CMDLINE_SRC.contains("yarm.xfer2_grant_witness"));
+        assert!(CMDLINE_SRC.contains("set_xfer2_grant_witness_enabled"));
+        assert!(MOD_SRC.contains("pub fn shared_region_oracle_provisioning_armed() -> bool {"));
+        let prov = MOD_SRC
+            .split_once("pub fn shared_region_oracle_provisioning_armed() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("provisioning-armed predicate");
+        assert!(prov.contains("shared_region_direct_oracle_enabled()"));
+        assert!(prov.contains("xfer2_grant_witness_enabled()"));
+        // And the provisioning's own early return is the one that consults it.
+        let body = MOD_SRC
+            .split_once("pub fn provision_init_shared_region_oracle(")
+            .map(|(_, r)| r)
+            .expect("provisioning owner");
+        let head = &body[..body.len().min(1200)];
         assert!(
-            RECV_V3.matches("write_v3_output_to_user(").count() >= 4,
-            "the metadata record is written on every exit (one definition plus each call site)"
-        );
-        assert!(
-            RECV_V3.contains("execute_user_asid_plain_writeback(kernel, &delivery)"),
-            "the plain path additionally copies the payload into user memory"
-        );
-        // And that writeback owner is a `&mut KernelState` user copy.
-        let writer = RECV_V3
-            .split_once("fn write_v3_output_to_user(")
-            .map(|(_, r)| r.split_once("\n}").map_or(r, |(b, _)| b))
-            .expect("the metadata writer must exist");
-        assert!(
-            writer.contains("kernel: &mut KernelState"),
-            "the metadata writer takes the broad state"
+            head.contains("if !shared_region_oracle_provisioning_armed() {"),
+            "the provisioning must admit the witness knob, not only the direct predicate"
         );
     }
 
-    /// The owner a split route would need does not exist: there is an off-lock user READ seam and
-    /// no off-lock user WRITE seam.
+    /// The witness does NOT widen the DIRECT producer.
+    ///
+    /// NR 30 is non-blocking, so the witness's grant travels the ENQUEUE path and never reaches a
+    /// blocked waiter. Folding the witness knob into `shared_region_direct_oracle_enabled` would
+    /// have armed the authoritative ack gate, its consume, and the blocked-recv ack publication on
+    /// a boot with no direct producer at all.
     #[test]
-    fn no_off_lock_user_write_owner_exists() {
+    fn the_witness_knob_does_not_arm_the_direct_producer() {
+        let pred = MOD_SRC
+            .split_once("pub fn shared_region_direct_oracle_enabled() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("direct predicate");
         assert!(
-            RUNTIME.contains("pub fn copy_from_user_asid_split_read("),
-            "fixture check: the off-lock user READ seam does exist"
+            !pred.contains("xfer2_grant_witness"),
+            "the direct-producer predicate must stay keyed on the three per-arch oracle knobs"
         );
-        for absent in [
-            "fn copy_to_user_asid_split",
-            "fn copy_to_current_user_split",
-            "fn write_user_asid_split",
+    }
+
+    /// Slot 5 is mutually exclusive, and the witness takes a value nothing else claims.
+    #[test]
+    fn the_witness_selector_is_free_and_named_on_every_port() {
+        assert!(MOD_SRC.contains("pub const XFER2_GRANT_WITNESS_SELECTOR: u64 = 12;"));
+        // 12 is claimed by no other slot-5 selector constant.
+        for taken in [
+            "SHARED_REGION_ORACLE_SELECTOR: u64 = 12",
+            "AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 12",
+            "RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 12",
+            "RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 12",
         ] {
+            assert!(!MOD_SRC.contains(taken), "selector 12 collides: {taken}");
+        }
+        // Every port arms it by NAME, never as a literal, and only when the knob is set.
+        for (arch, src) in [("x86", X86_BOOT), ("aarch64", A64_BOOT), ("riscv", RV_BOOT)] {
+            let arm = src
+                .split("init_args[5] = ")
+                .find(|t| t.starts_with("if crate::kernel::boot::xfer2_grant_witness_enabled()"))
+                .unwrap_or_else(|| panic!("{arch} witness arming site"));
             assert!(
-                !RUNTIME.contains(absent),
-                "an off-lock user WRITE seam (`{absent}`) must not have appeared without this \
-                 limit being re-derived"
+                arm.contains("crate::kernel::boot::XFER2_GRANT_WITNESS_SELECTOR"),
+                "{arch} must name the selector constant"
+            );
+            assert!(
+                !src.contains("init_args[5] = 12"),
+                "{arch} must not hand-write the selector"
             );
         }
-        // No split route writes user memory today.
-        assert!(
-            !crate::kernel::boot::tests::u9xfer1_nr30_terminal_dispatch_limit::split_code()
-                .contains("copy_to_current_user("),
-            "no split route writes user memory"
-        );
     }
 
-    pub(super) fn split_code() -> alloc::string::String {
-        SPLIT
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//") && !t.starts_with("///")
-            })
-            .collect::<alloc::vec::Vec<_>>()
-            .join("\n")
-    }
-
-    /// The precedent, in the codebase's own words: NR 2 declines a user-ASID receiver for exactly
-    /// this reason, and has since Stage 32B. NR 30 is not a new exception — it is the same one.
+    /// The witness's source cap is a `DmaRegion`, and only under the witness knob.
+    ///
+    /// NR 30's mapped delivery takes the region span from `recv_v3_exact_region_len`, which is
+    /// non-zero only for `CapObject::DmaRegion` — the existing NR 30 ABI, applied identically by
+    /// both adapters. A bare `MemoryObject` grant is therefore not a shape NR 30 maps, which is
+    /// what the second live run showed (`region_len=0` → the mapping plan refused). The DIRECT
+    /// oracle keeps its `MemoryObject` cap because it maps from the envelope's own descriptor.
     #[test]
-    fn the_same_constraint_already_holds_nr2s_user_asid_cohort_broad() {
+    fn the_witness_source_cap_is_a_dma_region_and_is_rolled_back() {
+        assert!(MOD_SRC.contains("let init_source_cap = if xfer2_grant_witness_enabled() {"));
+        assert!(MOD_SRC.contains("mem_cap: init_source_cap.0 as u32,"));
+        let step = MOD_SRC
+            .split_once("let init_source_cap = if xfer2_grant_witness_enabled() {")
+            .map(|(_, r)| r)
+            .expect("witness source-cap step");
+        let step = &step[..step.len().min(1600)];
+        assert!(step.contains("CapObject::DmaRegion {"));
         assert!(
-            SPLIT.contains("user-ASID receiver (would require a forbidden user copy)"),
-            "NR 2's route must still name the constraint this limit shares"
+            step.contains("CapRights::READ | CapRights::MAP"),
+            "the witness cap must carry the same rights as the MemoryObject grant — no WRITE"
+        );
+        assert!(step.contains("scratch.init_dma_cap = Some(c);"));
+        // Minted directly, so the step-4 delegation cascade does not reach it: the rollback must
+        // revoke it explicitly or the provisioning leaks a cap on a later-step failure.
+        assert!(MOD_SRC.contains("scratch.init_dma_cap"));
+        let rb = MOD_SRC
+            .split_once("fn rollback_shared_region_provision(")
+            .map(|(_, r)| r)
+            .expect("rollback owner");
+        let rb = &rb[..rb.len().min(1200)];
+        assert!(
+            rb.contains("scratch.init_dma_cap"),
+            "the rollback must reclaim the witness's directly-minted cap"
         );
     }
 
-    /// So NR 30 keeps its terminal broad edge, on every architecture — stated positively, so a
-    /// future package that closes it has to come here and say so.
+    /// The cell covers BOTH of NR 4's request shapes, over SEPARATE grants, and checks the
+    /// properties §4 names: metadata, rights, backing, release, unmap, revocation, and that the
+    /// essential capabilities survive.
     #[test]
-    fn nr30_is_not_split_eligible_on_any_architecture() {
-        let code = split_code();
+    fn the_cell_covers_both_release_shapes_and_the_named_properties() {
+        let cell = INIT_SRC
+            .split_once("pub(super) mod xfer2_grant_witness {")
+            .map(|(_, r)| r)
+            .expect("witness cell");
+        assert!(cell.contains("matches!(slot5, Some(12))"));
+        // Two release SHAPES, selected by the caller, not by leftover state.
+        assert!(cell.contains("release_shared_region_range("));
+        assert!(cell.contains("release_shared_region_mapping("));
+        // Two SEPARATE grants, one per shape.
+        assert!(cell.contains("one_grant(mem_cap, ep_cap, false, \"A\")"));
+        assert!(cell.contains("one_grant(mem_cap, ep_cap, true, \"B\")"));
+        // Every named property is computed, and the verdict is their conjunction.
+        for prop in [
+            "let meta_ok",
+            "let perm_ok",
+            "let release_ok",
+            "let unmapped_ok",
+            "let revoked_ok",
+        ] {
+            assert!(cell.contains(prop), "the cell must check {prop}");
+        }
         assert!(
-            !code.contains("Syscall::RecvSharedV3 => Some(syscall)"),
-            "NR 30 is not on the NR-only whitelist"
+            cell.contains(
+                "meta_ok && perm_ok && p0 && p1 && release_ok && unmapped_ok && revoked_ok"
+            )
+        );
+        assert!(cell.contains("caps_intact"));
+        // The verdict line must be SHORT: `debug_log` truncates at 192 bytes, and the first live
+        // run lost `unmapped`/`revoked`/`result` off the end of a single combined line.
+        let verdict = cell
+            .split_once("\"XFER2_GRANT_WITNESS shape=")
+            .map(|(_, r)| r)
+            .expect("verdict line");
+        let verdict = verdict.split_once('"').map(|(l, _)| l).expect("line end");
+        // Worst case: `shape=registered_range` and every flag `1`, plus the `USER_LOG tid=N msg=`
+        // prefix the kernel adds. Budget against the emitter's own cap.
+        let widest =
+            verdict.replace("{}", "1").len() + "XFER2_GRANT_WITNESS shape=registered_range".len();
+        assert!(
+            widest < 192,
+            "the verdict line must fit debug_log's 192-byte cap (widest {widest})"
+        );
+    }
+}
+
+/// U9-XFER2 §5 — the two transactions driven directly, through STUB OWNERS, over the cases the
+/// live witness cannot force: a reservation that fails, a mapping that changed under the caller,
+/// a shootdown that did not complete, and a metadata writeback that fails after the commit.
+///
+/// Both policies are generic over their owner traits, so this drives EXACTLY the shipped
+/// transaction — the stubs replace only the acquisitions, never a decision.
+#[cfg(test)]
+mod u9xfer2_transaction_cases {
+    use crate::kernel::capabilities::{CNodeId, CapId, CapObject};
+    use crate::kernel::ipc::{Message, ThreadId};
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::recv_v3_txn::{
+        PeekedHead, RecvV3Owners, V3CommitOutcome, V3Delivery, V3ObjectMeta, V3TxnEvent,
+        run_recv_v3_transaction,
+    };
+    use crate::kernel::syscall::xfer_txn::{
+        XferRefusal, XferReleaseOwners, XferRevokeOutcome, XferTxnEvent,
+        run_transfer_release_transaction,
+    };
+    use crate::kernel::vm::{Asid, PAGE_SIZE, PhysAddr, VirtAddr};
+
+    // ── NR 4 ──────────────────────────────────────────────────────────────────────────────────
+    #[derive(Default)]
+    struct XferStub {
+        registered: Option<(VirtAddr, usize)>,
+        mapped_pages: alloc::vec::Vec<u64>,
+        reserve_ok: bool,
+        shootdown_complete: bool,
+        revoke: Option<XferRevokeOutcome>,
+        /// Every mutation, in order, so a refusal that claims to be pre-mutation can be checked
+        /// rather than trusted.
+        log: alloc::vec::Vec<&'static str>,
+        events: alloc::vec::Vec<XferTxnEvent>,
+        quarantine_seen: Option<bool>,
+    }
+
+    impl XferReleaseOwners for XferStub {
+        type RevokeReservation = CapId;
+
+        fn caller_with_user_asid(&mut self) -> Option<(ThreadId, Asid)> {
+            Some((ThreadId(7), Asid(3)))
+        }
+        fn registered_range(&mut self, _owner: ThreadId, _cap: CapId) -> Option<(VirtAddr, usize)> {
+            self.registered
+        }
+        fn caller_cnode(&mut self) -> Option<CNodeId> {
+            Some(CNodeId(1))
+        }
+        fn page_is_mapped(&mut self, _asid: Asid, virt: VirtAddr) -> bool {
+            self.mapped_pages.contains(&virt.0)
+        }
+        fn reserve_capability_release(
+            &mut self,
+            _cnode: CNodeId,
+            cap: CapId,
+        ) -> Option<Self::RevokeReservation> {
+            self.reserve_ok.then_some(cap)
+        }
+        fn unmap_whole_range(&mut self, _asid: Asid, _base: usize, _map_len: usize) -> bool {
+            self.log.push("unmap");
+            self.shootdown_complete
+        }
+        fn revoke_reserved_capability(
+            &mut self,
+            _reservation: Self::RevokeReservation,
+            backing_is_quarantined: bool,
+        ) -> XferRevokeOutcome {
+            self.log.push("revoke");
+            self.quarantine_seen = Some(backing_is_quarantined);
+            self.revoke.unwrap_or(XferRevokeOutcome::Revoked)
+        }
+        fn remove_registration(&mut self, _owner: ThreadId, _cap: CapId) -> bool {
+            self.log.push("unregister");
+            true
+        }
+        fn account_release(&mut self, _map_len: usize) {
+            self.log.push("account");
+        }
+        fn note(&mut self, event: XferTxnEvent) {
+            self.events.push(event);
+        }
+    }
+
+    fn two_page_stub() -> XferStub {
+        XferStub {
+            registered: Some((VirtAddr(0x4000_0000), 2 * PAGE_SIZE)),
+            mapped_pages: alloc::vec![0x4000_0000, 0x4000_0000 + PAGE_SIZE as u64],
+            reserve_ok: true,
+            shootdown_complete: true,
+            ..Default::default()
+        }
+    }
+
+    /// §2: a reservation that cannot be established is a PRE-MUTATION refusal. It must not be
+    /// discovered after the range is gone, and it must not be reported as a successful release.
+    #[test]
+    fn a_failed_reservation_refuses_before_anything_is_destroyed() {
+        let mut owners = XferStub {
+            reserve_ok: false,
+            ..two_page_stub()
+        };
+        let got = run_transfer_release_transaction(&mut owners, CapId(0x1_0002), 0, 0);
+        assert!(got.is_err(), "an unreservable closure must refuse");
+        assert!(
+            owners.log.is_empty(),
+            "nothing may be mutated before the reservation succeeds, got {:?}",
+            owners.log
+        );
+        assert_eq!(
+            owners.events,
+            alloc::vec![XferTxnEvent::Refused {
+                reason: XferRefusal::CapabilityUnresolvable
+            }]
+        );
+    }
+
+    /// §2: the mapping changed between the caller's last look and this call — one page of the
+    /// registered range is no longer mapped. The broad handler discovered this mid-unmap, with the
+    /// prefix already destroyed; the transaction refuses from reads only.
+    #[test]
+    fn a_range_that_changed_under_the_caller_refuses_from_reads_only() {
+        let mut owners = XferStub {
+            // The second page went away since it was registered.
+            mapped_pages: alloc::vec![0x4000_0000],
+            ..two_page_stub()
+        };
+        let got = run_transfer_release_transaction(&mut owners, CapId(0x1_0002), 0, 0);
+        assert!(got.is_err());
+        assert!(owners.log.is_empty(), "got {:?}", owners.log);
+        assert_eq!(
+            owners.events,
+            alloc::vec![XferTxnEvent::Refused {
+                reason: XferRefusal::RangeNotFullyMapped
+            }]
+        );
+    }
+
+    /// §2: a shootdown that did not complete must (a) reach the revoke as a QUARANTINE verdict, so
+    /// the revoke's own reclaimer does not free a frame whose translation was never retired, and
+    /// (b) be REPORTED, not folded into a clean release.
+    #[test]
+    fn an_incomplete_shootdown_quarantines_the_backing_and_is_reported() {
+        let mut owners = XferStub {
+            shootdown_complete: false,
+            ..two_page_stub()
+        };
+        let got = run_transfer_release_transaction(&mut owners, CapId(0x1_0002), 0, 0);
+        assert_eq!(got.ok(), Some(2 * PAGE_SIZE), "the release still commits");
+        assert_eq!(owners.quarantine_seen, Some(true));
+        assert_eq!(
+            owners.log,
+            alloc::vec!["unmap", "revoke", "unregister", "account"],
+            "the commit order is unmap → revoke → unregister → account"
+        );
+        assert_eq!(
+            owners.events,
+            alloc::vec![XferTxnEvent::ReleasedWithIncompleteShootdown {
+                pages: 2,
+                map_len: 2 * PAGE_SIZE
+            }]
+        );
+    }
+
+    /// §2: a capability someone else retired between the reservation and the commit is reported as
+    /// such, rather than claimed as this call's revocation.
+    #[test]
+    fn a_concurrently_retired_capability_is_reported_not_claimed() {
+        let mut owners = XferStub {
+            revoke: Some(XferRevokeOutcome::AlreadyRetired),
+            ..two_page_stub()
+        };
+        let got = run_transfer_release_transaction(&mut owners, CapId(0x1_0002), 0, 0);
+        assert_eq!(got.ok(), Some(2 * PAGE_SIZE));
+        assert_eq!(owners.quarantine_seen, Some(false));
+        assert_eq!(
+            owners.events,
+            alloc::vec![XferTxnEvent::ReleasedAfterConcurrentRevoke {
+                pages: 2,
+                map_len: 2 * PAGE_SIZE
+            }]
+        );
+    }
+
+    // ── NR 30 ─────────────────────────────────────────────────────────────────────────────────
+    struct V3Stub {
+        head: Option<Message>,
+        commit: V3CommitOutcome,
+        writes_ok: bool,
+        map_ok: bool,
+        register_ok: bool,
+        log: alloc::vec::Vec<&'static str>,
+        events: alloc::vec::Vec<V3TxnEvent>,
+    }
+
+    impl Default for V3Stub {
+        fn default() -> Self {
+            Self {
+                head: None,
+                commit: V3CommitOutcome::Consumed { wake: None },
+                writes_ok: true,
+                map_ok: true,
+                register_ok: true,
+                log: alloc::vec::Vec::new(),
+                events: alloc::vec::Vec::new(),
+            }
+        }
+    }
+
+    const STUB_ENDPOINT: CapObject = CapObject::Endpoint {
+        index: 4,
+        generation: 1,
+    };
+
+    impl RecvV3Owners for V3Stub {
+        fn caller_tid(&mut self) -> u64 {
+            9
+        }
+        fn caller_asid(&mut self) -> Option<Asid> {
+            Some(Asid(3))
+        }
+        fn read_user(&mut self, _asid: Asid, _ptr: usize, _len: usize) -> Option<[u8; 80]> {
+            Some([0u8; 80])
+        }
+        fn write_user(&mut self, _asid: Asid, _ptr: usize, _bytes: &[u8]) -> bool {
+            self.log.push("write");
+            self.writes_ok
+        }
+        fn resolve_recv_endpoint(&mut self, _cap: CapId) -> Result<CapObject, SyscallError> {
+            Ok(STUB_ENDPOINT)
+        }
+        fn endpoint_index(&mut self, _endpoint: CapObject) -> Result<usize, SyscallError> {
+            Ok(4)
+        }
+        fn peek_head(&mut self, _idx: usize) -> Result<Option<Message>, SyscallError> {
+            Ok(self.head)
+        }
+        fn materialize_cap(
+            &mut self,
+            _endpoint: CapObject,
+            _sender_tid: u64,
+            _msg: &Message,
+        ) -> Result<Option<u64>, SyscallError> {
+            self.log.push("mint");
+            Ok(Some(0x1_0005))
+        }
+        fn object_meta(&mut self, _cap: CapId) -> V3ObjectMeta {
+            V3ObjectMeta {
+                kind: 5,
+                generation: 1,
+                // READ | MAP, matching what the live witness's grant carries.
+                effective_rights: 0b101,
+                exact_object_size: 0,
+                exact_region_len: 2 * PAGE_SIZE as u64,
+            }
+        }
+        fn region_phys_start(&mut self, _cap: CapId) -> Option<PhysAddr> {
+            Some(PhysAddr(0x10_0000))
+        }
+        fn map_page(
+            &mut self,
+            _asid: Asid,
+            _virt: VirtAddr,
+            _phys: PhysAddr,
+            _writable: bool,
+        ) -> bool {
+            self.log.push("map");
+            self.map_ok
+        }
+        fn unmap_range(&mut self, _asid: Asid, _base: usize, _len: usize) {
+            self.log.push("unmap");
+        }
+        fn register_transfer(&mut self, _cap: CapId, _base: VirtAddr, _len: usize) -> bool {
+            self.log.push("register");
+            self.register_ok
+        }
+        fn remove_transfer(&mut self, _cap: CapId) -> bool {
+            self.log.push("unregister");
+            true
+        }
+        fn commit_peeked(&mut self, _head: &PeekedHead) -> V3CommitOutcome {
+            self.log.push("commit");
+            self.commit
+        }
+        fn settle_sender(&mut self, _wake: crate::kernel::ipc::SenderWakeTarget) {
+            self.log.push("settle");
+        }
+        fn rollback_cap(&mut self, _cap: CapId, _is_reply: bool) {
+            self.log.push("rollback_cap");
+        }
+        fn note(&mut self, event: V3TxnEvent) {
+            self.events.push(event);
+        }
+    }
+
+    fn mapped_grant_message() -> Message {
+        Message::with_header(
+            1,
+            crate::kernel::recv_core::recv_shared_v3::OPCODE_SHARED_MEM_VALUE,
+            Message::FLAG_CAP_TRANSFER,
+            Some(0x2_0001),
+            &[0u8; 16],
+        )
+        .expect("message")
+    }
+
+    fn mapped_request() -> crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request {
+        crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request {
+            version: crate::kernel::recv_core::recv_shared_v3::V3_VERSION,
+            record_len: crate::kernel::recv_core::recv_shared_v3::V3_MIN_REQUEST_LEN,
+            endpoint_cap: 0x1_0001,
+            payload_ptr: 0x4000_0000,
+            payload_len: 2 * PAGE_SIZE as u64,
+            metadata_ptr: 0x5000_0000,
+            metadata_len: 128,
+            map_intent: crate::kernel::recv_core::recv_shared_v3::MAP_READ,
+            flags: 0,
+            timeout_ticks: 0,
+            reserved: [0; 2],
+        }
+    }
+
+    /// §3: the happy mapped path, so the failure cases below are contrasted against a real
+    /// success rather than against nothing.
+    #[test]
+    fn a_mapped_grant_is_delivered_and_registered_before_the_commit() {
+        let mut owners = V3Stub {
+            head: Some(mapped_grant_message()),
+            ..Default::default()
+        };
+        let got = run_recv_v3_transaction(&mut owners, &mapped_request());
+        assert!(matches!(got, Ok(V3Delivery::Mapped { .. })), "{got:?}");
+        assert_eq!(
+            owners.log,
+            alloc::vec!["mint", "map", "map", "register", "commit", "write"],
+            "everything that can fail happens while the message is still the sender's"
+        );
+        assert!(matches!(
+            owners.events.as_slice(),
+            [V3TxnEvent::DeliveredMapped { .. }]
+        ));
+    }
+
+    /// §3: the head changed between the peek and the commit. NOTHING is consumed, and exactly the
+    /// resources this transaction owns — its mapping, its registration, its minted cap — are
+    /// compensated. The sender is never settled.
+    #[test]
+    fn a_lost_commit_race_compensates_only_what_this_transaction_owns() {
+        let mut owners = V3Stub {
+            head: Some(mapped_grant_message()),
+            commit: V3CommitOutcome::LostRace,
+            ..Default::default()
+        };
+        let got = run_recv_v3_transaction(&mut owners, &mapped_request());
+        assert_eq!(got.err(), Some(SyscallError::WouldBlock));
+        assert_eq!(
+            owners.log,
+            alloc::vec![
+                "mint",
+                "map",
+                "map",
+                "register",
+                "commit",
+                "unmap",
+                "unregister",
+                "rollback_cap"
+            ]
         );
         assert!(
-            !code.contains("try_split_recv_shared_v3_into_frame"),
-            "NR 30 has no pre-lock route"
+            !owners.log.contains(&"settle"),
+            "a lost race must not settle the sender"
         );
-        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
-        const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+        assert_eq!(owners.events, alloc::vec![V3TxnEvent::LostRace]);
+    }
+
+    /// §3: the writeback fails AFTER the commit. The caller never receives the cleanup token, so
+    /// it can never call NR 4 for this region — everything still owned is compensated, and the
+    /// outcome is reported rather than returned as a success.
+    #[test]
+    fn a_writeback_failure_after_the_commit_compensates_and_is_reported() {
+        let mut owners = V3Stub {
+            head: Some(mapped_grant_message()),
+            writes_ok: false,
+            ..Default::default()
+        };
+        let got = run_recv_v3_transaction(&mut owners, &mapped_request());
+        assert!(got.is_err(), "a lost cleanup token is not a success");
+        assert_eq!(
+            owners.log,
+            alloc::vec![
+                "mint",
+                "map",
+                "map",
+                "register",
+                "commit",
+                "write",
+                "unmap",
+                "unregister",
+                "rollback_cap"
+            ]
+        );
+        assert_eq!(
+            owners.events,
+            alloc::vec![V3TxnEvent::WritebackFailedAfterCommit]
+        );
+    }
+
+    /// §3: a registration that cannot be recorded undoes the EXACT mapping this transaction
+    /// installed, and undoes the mint — before the commit, so the message is still the sender's.
+    #[test]
+    fn a_failed_registration_undoes_the_mapping_and_the_mint_before_the_commit() {
+        let mut owners = V3Stub {
+            head: Some(mapped_grant_message()),
+            register_ok: false,
+            ..Default::default()
+        };
+        let got = run_recv_v3_transaction(&mut owners, &mapped_request());
+        assert!(got.is_err());
+        assert_eq!(
+            owners.log,
+            alloc::vec!["mint", "map", "map", "register", "unmap", "rollback_cap"]
+        );
         assert!(
-            !TRAP_ENTRY.contains("SYSCALL_RECV_SHARED_V3_NR")
-                && !RISCV_TRAP.contains("SYSCALL_RECV_SHARED_V3_NR"),
-            "and it is on neither architecture's ingress list"
+            !owners.log.contains(&"commit"),
+            "nothing may be consumed after a pre-commit refusal"
         );
+        assert_eq!(owners.events, alloc::vec![V3TxnEvent::Refused]);
     }
 }

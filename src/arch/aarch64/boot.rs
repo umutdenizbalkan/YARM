@@ -7892,14 +7892,23 @@ pub fn bootstrap_first_user_task(
             || crate::kernel::boot::aarch64_futex_wait_idle_oracle_enabled()
             || crate::kernel::boot::aarch64_futex_wait_retire_enabled()
             || crate::kernel::boot::aarch64_futex_wake_oracle_enabled();
-        if crate::kernel::boot::aarch64_shared_region_direct_oracle_enabled() && slot5_conflict {
+        // U9-XFER2 §4: the witness knob arms the SAME provisioning and the SAME slot 5, so it
+        // fails closed against the other slot-5 knobs on exactly the same terms.
+        if crate::kernel::boot::shared_region_oracle_provisioning_armed() && slot5_conflict {
             crate::yarm_log!(
                 "AARCH64_ORACLE_SLOT5_CONFLICT shared_region=1 other_slot5=1 result=arm_neither"
             );
         } else if let Some(caps) =
             crate::kernel::boot::provision_init_shared_region_oracle(kernel, RING3_INIT_SERVER_TID)
         {
-            init_args[5] = crate::kernel::boot::AARCH64_SHARED_REGION_ORACLE_SELECTOR;
+            // U9-XFER2 §4: the SAME provisioning serves two cells. Selector 12 runs the NR 30 +
+            // NR 4 grant witness (the ENQUEUE path a non-blocking probe needs); selector 2 runs the
+            // DIRECT blocked-waiter oracle. Slot 5 is mutually exclusive, so exactly one is armed.
+            init_args[5] = if crate::kernel::boot::xfer2_grant_witness_enabled() {
+                crate::kernel::boot::XFER2_GRANT_WITNESS_SELECTOR
+            } else {
+                crate::kernel::boot::AARCH64_SHARED_REGION_ORACLE_SELECTOR
+            };
             init_args[13] = caps.mem_cap as u64;
             init_args[14] = caps.endpoint_cap as u64;
             crate::yarm_log!(

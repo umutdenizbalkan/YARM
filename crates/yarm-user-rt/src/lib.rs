@@ -698,6 +698,75 @@ pub mod syscall {
     ///
     /// # Safety
     /// `cleanup_cap` must be the receiver-local cap returned by `recv_shared_region_v2`.
+    /// U9-XFER2 §4 — NR 4's EXPLICIT-RANGE shape: release `base..base+len` in the caller's own
+    /// address space, naming `cleanup_cap` as the capability to revoke.
+    ///
+    /// The source has always implemented this shape; what it lacked was a caller, and therefore
+    /// evidence. This is that caller. It is not a new ABI — the same three registers the
+    /// registered-range form uses, with the base/len pair non-zero instead of `(0, 0)`.
+    ///
+    /// # Safety
+    /// Architecture syscall ABI entry.
+    pub unsafe fn release_shared_region_range(
+        cleanup_cap: u32,
+        base: usize,
+        len: usize,
+    ) -> core::result::Result<usize, SyscallError> {
+        if cleanup_cap == 0 || base == 0 || len == 0 {
+            return Err(SyscallError::InvalidArgs);
+        }
+        let args = [cleanup_cap as usize, base, len, 0, 0, 0];
+        // SAFETY: architecture syscall ABI entry.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_TRANSFER_RELEASE_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if ret.error != 0 {
+                return Err(decode_syscall_error(ret.error));
+            }
+            Ok(ret.ret0)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            const PAGE: usize = 4096;
+            if ret.ret0 < PAGE || !ret.ret0.is_multiple_of(PAGE) {
+                return Err(decode_syscall_error(ret.ret0));
+            }
+            Ok(ret.ret0)
+        }
+    }
+
+    /// U9-XFER2 §4 — NR 13 `VmAnonMap`, used by the grant witness to prove a released window is
+    /// genuinely unmapped: a fresh anonymous mapping over it can only succeed if the release
+    /// really removed the pages, not merely the registry entry.
+    ///
+    /// # Safety
+    /// Architecture syscall ABI entry.
+    pub unsafe fn vm_anon_map(
+        addr: usize,
+        len: usize,
+        prot: usize,
+    ) -> core::result::Result<usize, SyscallError> {
+        const SYSCALL_VM_ANON_MAP_NR: usize = 13;
+        let args = [0, addr, len, prot, 0, 0];
+        // SAFETY: architecture syscall ABI entry.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_VM_ANON_MAP_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if ret.error != 0 {
+                return Err(decode_syscall_error(ret.error));
+            }
+            Ok(ret.ret0)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            const PAGE: usize = 4096;
+            if ret.ret0 < PAGE || !ret.ret0.is_multiple_of(PAGE) {
+                return Err(decode_syscall_error(ret.ret0));
+            }
+            Ok(ret.ret0)
+        }
+    }
+
     pub unsafe fn release_shared_region_mapping(
         cleanup_cap: u32,
     ) -> core::result::Result<usize, SyscallError> {

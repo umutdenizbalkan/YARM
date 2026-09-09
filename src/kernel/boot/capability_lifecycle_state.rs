@@ -1032,7 +1032,47 @@ pub(crate) struct SplitRevokeReservation {
     pub(crate) root: SplitRevokeNode,
     pub(crate) root_object: CapObject,
     pub(crate) descendants: alloc::vec::Vec<Option<SplitRevokeNode>>,
-    pub(crate) link_removals: alloc::vec::Vec<Option<usize>>,
+    /// U9-XFER2 §2 — link removals carry the link's IDENTITY, not only its index.
+    ///
+    /// `delegated_capability_links` is a plain array with no per-slot generation, so an index
+    /// alone does not name a link: between the reservation and the commit the slot can be cleared
+    /// and REUSED for a completely unrelated delegation, and clearing it by index would then
+    /// destroy somebody else's authority. Each entry therefore records what the reservation saw,
+    /// and the commit clears the slot only while it still holds exactly that.
+    pub(crate) link_removals: alloc::vec::Vec<ReservedLinkRemoval>,
+}
+
+/// U9-XFER2 §2 — one link this reservation intends to clear, named by content rather than by
+/// position.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ReservedLinkRemoval {
+    pub(crate) index: usize,
+    pub(crate) link: super::defs::DelegatedCapabilityLink,
+}
+
+/// U9-XFER2 §2 — why a reservation could not be built. Every variant is raised BEFORE the first
+/// mutation, so a refused reservation leaves everything exactly as it was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SplitRevokeReserveError {
+    /// The task, its process cnode, or the root cap slot could not be resolved.
+    Unresolvable,
+    /// The kernel heap could not supply the closure. This is the reason the reservation is
+    /// FALLIBLE and is built before anything is destroyed: growing it with `push` would abort on
+    /// the allocation error handler instead, in the middle of a transaction.
+    OutOfMemory,
+}
+
+/// U9-XFER2 §2 — what the commit actually did, so the transaction cannot report a destructive
+/// release as clean when its revoke did not land.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SplitRevokeCommitOutcome {
+    /// The complete teardown ran.
+    Revoked(CapObject),
+    /// The root slot was already gone when the commit reached it — someone else revoked it
+    /// between the reservation and here. Nothing was left half-done: the root revoke is the FIRST
+    /// mutation of the teardown, so this is a clean no-op for the capability half. The caller must
+    /// still surface it, because it means this call is not what retired the capability.
+    RootAlreadyRetired,
 }
 
 impl crate::runtime::SharedKernel {
@@ -1143,6 +1183,34 @@ impl crate::runtime::SharedKernel {
                 }
             }
         });
+    }
+
+    /// U9-XFER2 §2 — rank 4: clear reserved links, each only while the slot still holds the
+    /// EXACT link the reservation recorded.
+    ///
+    /// `delegated_capability_links` carries no per-slot generation, so an index does not name a
+    /// link across a lock release. Between the reservation and here the slot can have been
+    /// cleared and reused for a completely unrelated delegation — clearing it by index would then
+    /// destroy authority this transaction has nothing to do with. Comparing the content is what
+    /// makes the removal set exact rather than positional.
+    ///
+    /// A slot whose content changed is left alone, because it means the link this transaction
+    /// meant to remove is already gone: nothing is owed for it. The count of slots actually
+    /// cleared is returned so the caller can report a closure that moved under it.
+    fn clear_reserved_delegation_links_split(&self, removals: &[ReservedLinkRemoval]) -> usize {
+        self.with_capability_state_split_mut(|capability| {
+            let mut cleared = 0usize;
+            for removal in removals {
+                if removal.index >= MAX_DELEGATED_CAPABILITY_LINKS {
+                    continue;
+                }
+                if capability.delegated_capability_links[removal.index] == Some(removal.link) {
+                    capability.delegated_capability_links[removal.index] = None;
+                    cleared += 1;
+                }
+            }
+            cleared
+        })
     }
 
     /// rank 3: the notification-destroy half of `destroy_notification_for_revoked_cap`, byte for
@@ -1556,6 +1624,44 @@ impl crate::runtime::SharedKernel {
     ///
     /// A non-memory-backed object takes the `_ => return` arm inside both rank-6 helpers, so this
     /// is exactly the no-op the broad path is for `Endpoint`, `Notification` and `Kernel`.
+    /// U9-XFER2 §2 — [`Self::memory_obligations_split`] with the CALLER's shootdown verdict
+    /// folded in.
+    ///
+    /// The plain form gates its reclaim on the ACKs of the unmap IT performs. That is not enough
+    /// for NR 4. NR 4 unmaps the range itself, in an earlier phase, and an incomplete ACK there
+    /// deliberately leaves that frame unreclaimed. By the time the revoke runs, the pages are
+    /// already gone, so this function's own unmap finds nothing to do and reports `acked = true`
+    /// — and would then reclaim the very object whose translation may still be live on another
+    /// CPU, handing the quarantined frame straight back to the allocator.
+    ///
+    /// `caller_quarantined` carries that earlier verdict in, so the object-level reclaim is
+    /// suppressed for exactly the same reason the page-level one was. The quarantine is the
+    /// established fail-closed choice (U9-VM-ENTRY1-S §1b): a frame nobody can reuse is strictly
+    /// safer than one reissued under a translation a remote CPU may still hold.
+    fn memory_obligations_split_gated(
+        &self,
+        pid: u64,
+        cap: CapId,
+        object: CapObject,
+        caller_quarantined: bool,
+    ) {
+        let acked = self.revoke_active_transfer_mappings_for_cap_split(pid, cap);
+        self.with_memory_split_mut(|memory| {
+            KernelState::adjust_memory_object_cap_refcount_locked(memory, object, -1)
+        });
+        if acked && !caller_quarantined {
+            self.with_memory_split_mut(|memory| {
+                KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object)
+            });
+        } else if caller_quarantined {
+            crate::yarm_log!(
+                "XFER_REVOKE_RECLAIM_QUARANTINED pid={} cap={} reason=caller_shootdown_incomplete",
+                pid,
+                cap.0
+            );
+        }
+    }
+
     fn memory_obligations_split(&self, pid: u64, cap: CapId, object: CapObject) {
         let acked = self.revoke_active_transfer_mappings_for_cap_split(pid, cap);
         self.with_memory_split_mut(|memory| {
@@ -1726,16 +1832,16 @@ impl crate::runtime::SharedKernel {
         &self,
         owner_tid: u64,
         cap: CapId,
-    ) -> Result<SplitRevokeReservation, SplitRevokeRefusal> {
+    ) -> Result<SplitRevokeReservation, SplitRevokeReserveError> {
         let cnode = self
             .task_cnode_split(owner_tid)
-            .ok_or(SplitRevokeRefusal::Unresolvable)?;
+            .ok_or(SplitRevokeReserveError::Unresolvable)?;
         let pid = self
             .pid_for_cnode_split(cnode)
-            .ok_or(SplitRevokeRefusal::Unresolvable)?;
+            .ok_or(SplitRevokeReserveError::Unresolvable)?;
         let root_object = self
             .resolved_capability_split(cnode, cap)
-            .ok_or(SplitRevokeRefusal::Unresolvable)?
+            .ok_or(SplitRevokeReserveError::Unresolvable)?
             .object;
         let root = SplitRevokeNode { pid, cap };
         // ONE rank-4 snapshot of the link table, shared by both collectors. The broad path clones
@@ -1743,9 +1849,9 @@ impl crate::runtime::SharedKernel {
         let links = self.with_capability_state_split_mut(|capability| {
             capability.delegated_capability_links.clone()
         });
-        let descendants = self.collect_user_held_descendants_split(root, links.as_ref());
+        let descendants = self.collect_user_held_descendants_split(root, links.as_ref())?;
         let link_removals =
-            self.collect_user_held_link_removals_split(root, &descendants, links.as_ref());
+            self.collect_user_held_link_removals_split(root, &descendants, links.as_ref())?;
         Ok(SplitRevokeReservation {
             cnode,
             root,
@@ -1763,9 +1869,31 @@ impl crate::runtime::SharedKernel {
         &self,
         root: SplitRevokeNode,
         links: &[Option<super::defs::DelegatedCapabilityLink>],
-    ) -> alloc::vec::Vec<Option<SplitRevokeNode>> {
+    ) -> Result<alloc::vec::Vec<Option<SplitRevokeNode>>, SplitRevokeReserveError> {
+        // U9-XFER2 §2 — capacity is RESERVED UP FRONT and fallibly.
+        //
+        // Growing these with `push` was wrong twice over: an allocation failure would hit the
+        // global allocation-error handler in the middle of a transaction rather than becoming a
+        // pre-mutation refusal, and the "journal discipline" this was claimed to follow requires
+        // exactly the opposite. `try_reserve` makes the failure a value.
+        //
+        // The bound is the link table itself. Each admitted descendant is discovered through a
+        // distinct link, and a link can admit at most one new node, so the closure can never
+        // exceed the number of links — the same bound the broad `collect_delegated_descendants`
+        // works to.
+        let capacity = links.iter().flatten().count();
         let mut found: alloc::vec::Vec<Option<SplitRevokeNode>> = alloc::vec::Vec::new();
         let mut queue: alloc::vec::Vec<SplitRevokeNode> = alloc::vec::Vec::new();
+        found
+            .try_reserve(capacity)
+            .map_err(|_| SplitRevokeReserveError::OutOfMemory)?;
+        // The queue holds the ROOT plus every discovered node, which is why its reservation is
+        // one larger — and why the old `queue.len() >= MAX` guard was an off-by-one that could
+        // stop one short of the final descendant, silently truncating the closure.
+        queue
+            .try_reserve(capacity.saturating_add(1))
+            .map_err(|_| SplitRevokeReserveError::OutOfMemory)?;
+
         let mut head = 0usize;
         queue.push(root);
         while head < queue.len() {
@@ -1787,16 +1915,15 @@ impl crate::runtime::SharedKernel {
                 if found.iter().flatten().any(|seen| *seen == child) {
                     continue;
                 }
-                if found.len() >= MAX_DELEGATED_CAPABILITY_LINKS
-                    || queue.len() >= MAX_DELEGATED_CAPABILITY_LINKS
-                {
-                    break;
-                }
+                // No capacity test and no `break`: the reservation above already covers every
+                // node this walk can possibly admit, so there is nothing to truncate against.
+                // The old `break` was worse than a bound anyway — it left the OUTER loop running,
+                // so the closure came out short with nothing reported.
                 found.push(Some(child));
                 queue.push(child);
             }
         }
-        found
+        Ok(found)
     }
 
     /// U9-XFER1 §3 — the exact link-removal set, the heap twin of
@@ -1807,8 +1934,12 @@ impl crate::runtime::SharedKernel {
         root: SplitRevokeNode,
         descendants: &[Option<SplitRevokeNode>],
         links: &[Option<super::defs::DelegatedCapabilityLink>],
-    ) -> alloc::vec::Vec<Option<usize>> {
-        let mut removals: alloc::vec::Vec<Option<usize>> = alloc::vec::Vec::new();
+    ) -> Result<alloc::vec::Vec<ReservedLinkRemoval>, SplitRevokeReserveError> {
+        let capacity = links.iter().flatten().count();
+        let mut removals: alloc::vec::Vec<ReservedLinkRemoval> = alloc::vec::Vec::new();
+        removals
+            .try_reserve(capacity)
+            .map_err(|_| SplitRevokeReserveError::OutOfMemory)?;
         for (idx, maybe_link) in links.iter().enumerate() {
             let Some(link) = maybe_link else {
                 continue;
@@ -1832,10 +1963,14 @@ impl crate::runtime::SharedKernel {
                     .flatten()
                     .any(|d| *d == source || *d == dest);
             if involved {
-                removals.push(Some(idx));
+                // Record WHAT was seen, not only WHERE. The commit re-checks it.
+                removals.push(ReservedLinkRemoval {
+                    index: idx,
+                    link: *link,
+                });
             }
         }
-        removals
+        Ok(removals)
     }
 
     /// U9-XFER1 §3 — the complete off-broad-lock teardown of a capability USERSPACE HOLDS,
@@ -1845,19 +1980,62 @@ impl crate::runtime::SharedKernel {
     /// This is the split twin of what NR 4 `TransferRelease` runs through
     /// `revoke_capability_in_cnode` on the broad path. Every refusal is raised before the first
     /// mutation.
-    pub(crate) fn revoke_user_held_capability_split(
+    pub(crate) fn commit_user_held_capability_split(
         &self,
-        owner_tid: u64,
-        cap: CapId,
-    ) -> Result<CapObject, SplitRevokeRefusal> {
-        let plan = self.plan_revoke_user_held_capability_split(owner_tid, cap)?;
-        self.commit_revoke_split(
-            plan.cnode,
-            plan.root,
-            plan.root_object,
-            &plan.descendants,
-            &plan.link_removals,
-        )
+        reservation: SplitRevokeReservation,
+        backing_is_quarantined: bool,
+    ) -> SplitRevokeCommitOutcome {
+        // (1) rank 4: the root revoke — the FIRST mutation of the teardown.
+        //
+        // `CapId` is `(generation << 16) | index` and every revoke bumps the slot generation, so
+        // a slot that was recycled since the reservation cannot present the same `CapId`. Slot
+        // identity therefore needs no separate re-check here: `cspace_revoke_split` failing IS
+        // "the capability this reservation named is already gone".
+        if self
+            .cspace_revoke_split(reservation.cnode, reservation.root.cap)
+            .is_err()
+        {
+            return SplitRevokeCommitOutcome::RootAlreadyRetired;
+        }
+        // (2) descendants, each complete before the next — the broad interleave.
+        for descendant in reservation.descendants.iter().flatten().copied() {
+            let object = self
+                .process_cnode_for_pid_split(descendant.pid)
+                .and_then(|cnode| self.cspace_read_then_revoke_split(cnode, descendant.cap));
+            if let Some(object) = object {
+                self.memory_obligations_split_gated(
+                    descendant.pid,
+                    descendant.cap,
+                    object,
+                    backing_is_quarantined,
+                );
+                self.destroy_notification_for_revoked_object_split(object);
+            } else {
+                self.revoke_active_transfer_mappings_for_cap_split(descendant.pid, descendant.cap);
+            }
+        }
+        // (3) rank 4: link removal, by CONTENT rather than by index.
+        let cleared = self.clear_reserved_delegation_links_split(&reservation.link_removals);
+        if cleared != reservation.link_removals.len() {
+            // Not an error: a link this reservation meant to remove was already gone, and the
+            // replacement occupying its slot was deliberately left alone. Reported so a closure
+            // that moved under the transaction is visible rather than silent.
+            crate::yarm_log!(
+                "XFER_REVOKE_LINKS_MOVED reserved={} cleared={}",
+                reservation.link_removals.len(),
+                cleared
+            );
+        }
+        // (4) the root's obligations, in the broad order: mappings, refcount, reclaim.
+        self.memory_obligations_split_gated(
+            reservation.root.pid,
+            reservation.root.cap,
+            reservation.root_object,
+            backing_is_quarantined,
+        );
+        // (5) rank 3 then rank 2 → rank 1: the root's notification obligation.
+        self.destroy_notification_for_revoked_object_split(reservation.root_object);
+        SplitRevokeCommitOutcome::Revoked(reservation.root_object)
     }
 
     /// U9-F production entry point for the ordinary (non-`Reply`) recv-boundary rollback cohort:

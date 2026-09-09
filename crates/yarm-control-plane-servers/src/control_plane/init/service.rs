@@ -1034,6 +1034,206 @@ fn run_x86_futex_wake_oracle(init_tid: u64) {
     }
 }
 
+// ─── U9-XFER2 §4: the NR 30 + NR 4 end-to-end grant witness (selector 12) ────────────────────
+//
+// The DIRECT oracle above already witnesses NR 4's SUCCESS path live, on all three architectures,
+// against DISPOSABLE authority: `first_release=ok second_release=rejected`, backed by
+// `XFER_RELEASE_OK route=split pages=2 len=8192`. What it does NOT witness is NR 30 — its child
+// receives through the ordinary recv-v2 blocked-waiter path, and NR 30 is a NON-BLOCKING probe, so
+// a grant it receives must have been ENQUEUED. That is a class the direct oracle's seal explicitly
+// forbids, so this witness is its own cell rather than an extension of that one.
+//
+// It reuses the existing boot/grant owner verbatim: `provision_init_shared_region_oracle` hands
+// init a fresh two-page `MemoryObject` cap (`READ | MAP`, no WRITE, deterministic contents) and a
+// `SEND | RECEIVE` endpoint cap. Init sends the grant to that endpoint and receives it back with
+// `RecvSharedV3` — a self-send through a buffered endpoint, which is exactly the enqueue shape NR
+// 30 serves. No new syscall, no new ABI, no new provisioning path.
+//
+// Two grants are exercised so BOTH of NR 4's request shapes are covered:
+//   * grant A — released with `(cap, 0, 0)`, the REGISTERED-range shape;
+//   * grant B — released with `(cap, base, len)`, the EXPLICIT-range shape.
+//
+// After both, the endpoint capability is used again, so "the essential service capabilities are
+// still usable" is checked rather than assumed.
+#[cfg(not(feature = "hosted-dev"))]
+pub(super) mod xfer2_grant_witness {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn armed(slot5: Option<u32>) -> bool {
+        matches!(slot5, Some(12))
+    }
+
+    /// One grant cycle: send the shared region to our own endpoint, receive it with NR 30 mapped
+    /// read-only, check the metadata and the backing, then release it through NR 4.
+    ///
+    /// `explicit_range` selects which of NR 4's two shapes the release uses.
+    fn one_grant(mem_cap: u32, ep_cap: u32, explicit_range: bool, label: &str) -> bool {
+        use yarm_ipc_abi::recv_shared_v3_abi::RecvSharedV3Output;
+
+        // SAFETY: `ep_cap` carries SEND; `mem_cap` is init's disposable source cap.
+        let sent = unsafe { yarm_user_rt::syscall::send_shared_region(ep_cap, mem_cap) };
+        if sent.is_err() {
+            yarm_user_rt::user_log!("XFER2_GRANT_WITNESS phase={} step=send result=fail", label);
+            return false;
+        }
+
+        let mut out = RecvSharedV3Output::new_zeroed();
+        // SAFETY: `out` is a live stack record; the mapping window is init's own unmapped range.
+        let got = unsafe {
+            yarm_user_rt::syscall::recv_v3::ipc_recv_shared_v3_mapped_readonly_nonblocking(
+                ep_cap as u64,
+                yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA as u64,
+                yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN as u64,
+                &mut out,
+            )
+        };
+        let Ok(Some(d)) = got else {
+            yarm_user_rt::user_log!("XFER2_GRANT_WITNESS phase={} step=recv result=fail", label);
+            return false;
+        };
+
+        // METADATA: the record must describe the object the sender actually granted.
+        let base = out.mapped_base as usize;
+        let len = out.page_rounded_mapped_len as usize;
+        let meta_ok = len == yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN
+            && base != 0
+            && out.transferred_cap != 0
+            && out.cleanup_token == out.transferred_cap;
+        // RIGHTS: granted READ | MAP, never WRITE — so the mapping is read-only.
+        let perm_ok = out.actual_mapping_perm == 1;
+        // BACKING: every byte of BOTH pages, checked independently, so a page swap or a
+        // single-page mapping is detected rather than averaged away.
+        // SAFETY: the recv mapped this whole window readable.
+        let (p0, p1) = unsafe { super::shared_region_oracle_core::validate_pages_split(base, len) };
+
+        // RELEASE — the shape under test.
+        let released = if explicit_range {
+            // SAFETY: the cleanup cap and the exact range the recv reported.
+            unsafe {
+                yarm_user_rt::syscall::release_shared_region_range(
+                    out.transferred_cap as u32,
+                    base,
+                    len,
+                )
+            }
+        } else {
+            // SAFETY: the registered-range shape.
+            unsafe {
+                yarm_user_rt::syscall::release_shared_region_mapping(out.transferred_cap as u32)
+            }
+        };
+        let release_ok = matches!(released, Ok(l) if l == len);
+
+        // MAPPING REMOVED: the window must be free again, which a fresh anonymous mapping over it
+        // can only demonstrate if the release really did unmap. This also proves the release did
+        // not merely drop the registry entry.
+        // SAFETY: the window is this task's own, and is expected to be unmapped now.
+        let remap = unsafe {
+            yarm_user_rt::syscall::vm_anon_map(
+                base,
+                yarm_user_rt::syscall::SHARED_REGION_ORACLE_PAGE_SIZE,
+                0x1,
+            )
+        };
+        let unmapped_ok = remap.is_ok();
+
+        // REVOCATION: the cleanup cap is gone, so a duplicate release is refused.
+        // SAFETY: intentional duplicate to observe the canonical refusal.
+        let dup = unsafe {
+            yarm_user_rt::syscall::release_shared_region_mapping(out.transferred_cap as u32)
+        };
+        let revoked_ok = dup.is_err();
+
+        let all = meta_ok && perm_ok && p0 && p1 && release_ok && unmapped_ok && revoked_ok;
+        let shape = if explicit_range {
+            "explicit_range"
+        } else {
+            "registered_range"
+        };
+        // TWO lines, deliberately: `debug_log` truncates at 192 bytes, and a single line carrying
+        // both the observed values and the eight verdicts overruns that — silently dropping the
+        // trailing verdicts, which is exactly the shape of evidence that must not be lost.
+        yarm_user_rt::user_log!(
+            "XFER2_GRANT_DETAIL phase={} shape={} base=0x{:x} len={} cap={} kind={} rights={} obj_size={} region_len={}",
+            label,
+            shape,
+            base,
+            len,
+            out.transferred_cap,
+            out.object_kind,
+            out.effective_rights,
+            out.exact_object_size,
+            out.exact_region_len
+        );
+        yarm_user_rt::user_log!(
+            "XFER2_GRANT_WITNESS shape={} meta={} perm={} page0={} page1={} release={} unmapped={} revoked={} result={}",
+            shape,
+            meta_ok as u32,
+            perm_ok as u32,
+            p0 as u32,
+            p1 as u32,
+            release_ok as u32,
+            unmapped_ok as u32,
+            revoked_ok as u32,
+            all as u32
+        );
+        all
+    }
+
+    /// Run the whole witness once. Never asserts: a failure is reported through the markers.
+    pub(super) fn run_once() {
+        let (mem_cap, ep_cap) = super::shared_region_oracle_core::oracle_caps();
+        if mem_cap == 0 || ep_cap == 0 {
+            yarm_user_rt::user_log!("XFER2_GRANT_WITNESS step=caps result=missing");
+            RESULT.store(0xF0, Relaxed);
+            return;
+        }
+        yarm_user_rt::user_log!(
+            "XFER2_GRANT_WITNESS_BEGIN mem_cap={} ep_cap={}",
+            mem_cap,
+            ep_cap
+        );
+
+        // Grant A — the registered-range release shape.
+        let a = one_grant(mem_cap, ep_cap, false, "A");
+        // Grant B — the explicit-range release shape, over a SEPARATE grant so neither shape can
+        // be satisfied by state the other left behind.
+        let b = one_grant(mem_cap, ep_cap, true, "B");
+
+        // ESSENTIAL AUTHORITY INTACT: the endpoint cap init depends on must still work after two
+        // full grant/release cycles. A plain NR 30 probe on an empty queue is the cheapest use of
+        // it that proves the capability itself is still live — `WouldBlock` is a SUCCESSFUL
+        // resolution of the endpoint, an `InvalidCapability` would not be.
+        let mut probe = yarm_ipc_abi::recv_shared_v3_abi::RecvSharedV3Output::new_zeroed();
+        // SAFETY: `probe` is a live stack record.
+        let after = unsafe {
+            yarm_user_rt::syscall::recv_v3::ipc_recv_shared_v3_nonblocking(
+                ep_cap as u64,
+                0,
+                0,
+                &mut probe,
+            )
+        };
+        let caps_intact = !matches!(
+            after,
+            Err(yarm_user_rt::syscall::SyscallError::InvalidCapability)
+                | Err(yarm_user_rt::syscall::SyscallError::MissingRight)
+        );
+
+        let all = a && b && caps_intact;
+        RESULT.store(if all { 1 } else { 0xF1 }, Relaxed);
+        yarm_user_rt::user_log!(
+            "XFER2_GRANT_WITNESS_DONE grant_a={} grant_b={} caps_intact={} result={}",
+            a as u32,
+            b as u32,
+            caps_intact as u32,
+            if all { "ok" } else { "fail" }
+        );
+    }
+}
+
 // ─── Stage 198E3C1B: x86_64 DIRECT shared-region live oracle (COMPILE-ONLY scaffold) ─────
 // Parent/child DIRECT blocked-receiver shared-region proof topology. Child B recv-v2-blocks on the
 // oracle endpoint (the ORDINARY recv path, NOT RecvSharedV3); parent A then issues exactly ONE
@@ -4947,6 +5147,14 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if ipc_reply_timeout_oracle::armed(ctx.supervisor_control_recv_ep) {
         run_aarch64_ipc_reply_timeout_oracle(ctx.task_id);
+    }
+    // U9-XFER2 §4: the NR 30 + NR 4 end-to-end grant witness. Slot-5 selector 12, mutually
+    // exclusive with every other cell, and ARCHITECTURE-NEUTRAL — the whole body is the same
+    // syscalls on all three ports, so one arm serves them all. It runs in init and uses only the
+    // disposable authority `provision_init_shared_region_oracle` already hands it.
+    #[cfg(not(feature = "hosted-dev"))]
+    if xfer2_grant_witness::armed(ctx.supervisor_control_recv_ep) {
+        xfer2_grant_witness::run_once();
     }
     // Stage 200D-0C1: default-off + feature-gated AArch64 LIVE ExitCurrentTask oracle. The slot-5
     // value is DECODED through the shared `yarm_ipc_abi::exit_current_task_abi` helper rather than

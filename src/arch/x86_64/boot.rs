@@ -980,7 +980,9 @@ pub fn bootstrap_first_user_task(
     // provisioning failure rolls back and leaves the oracle un-armed.
     #[cfg(feature = "x86-shared-region-direct-oracle")]
     if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
-        if crate::kernel::boot::x86_shared_region_direct_oracle_enabled()
+        // U9-XFER2 §4: the witness knob arms the SAME provisioning and the SAME slot 5, so it
+        // fails closed against the other slot-5 knob on exactly the same terms.
+        if crate::kernel::boot::shared_region_oracle_provisioning_armed()
             && crate::kernel::boot::x86_futex_wake_oracle_enabled()
         {
             crate::yarm_log!(
@@ -989,7 +991,14 @@ pub fn bootstrap_first_user_task(
         } else if let Some(caps) =
             crate::kernel::boot::provision_init_shared_region_oracle(kernel, RING3_INIT_SERVER_TID)
         {
-            init_args[5] = crate::kernel::boot::SHARED_REGION_ORACLE_SELECTOR;
+            // U9-XFER2 §4: the SAME provisioning serves two cells. Selector 12 runs the NR 30 +
+            // NR 4 grant witness (the ENQUEUE path a non-blocking probe needs); selector 2 runs the
+            // DIRECT blocked-waiter oracle. Slot 5 is mutually exclusive, so exactly one is armed.
+            init_args[5] = if crate::kernel::boot::xfer2_grant_witness_enabled() {
+                crate::kernel::boot::XFER2_GRANT_WITNESS_SELECTOR
+            } else {
+                crate::kernel::boot::SHARED_REGION_ORACLE_SELECTOR
+            };
             init_args[13] = caps.mem_cap as u64;
             init_args[14] = caps.endpoint_cap as u64;
             crate::yarm_log!(

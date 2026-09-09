@@ -83,6 +83,22 @@ pub(crate) struct XferReleasePlan {
     pub(crate) map_len: usize,
 }
 
+/// U9-XFER2 §2 — what phase R's revoke actually did.
+///
+/// The previous shape discarded this (`let _ = owners.revoke_user_held_capability(..)`), which
+/// meant a revoke that did not land was reported as a clean release of a range that had already
+/// been destroyed. It is a value now so the transaction has to account for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum XferRevokeOutcome {
+    /// The complete teardown ran over the reserved closure.
+    Revoked,
+    /// The root slot was already gone when the commit reached it: someone else retired the
+    /// capability between the reservation and here. The root revoke is the FIRST mutation of the
+    /// teardown, so nothing was left half-done — but this call is not what retired the capability,
+    /// and saying so is the difference between reporting and hiding.
+    AlreadyRetired,
+}
+
 /// What the transaction did, for the adapter's telemetry and markers. Not an error channel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum XferTxnEvent {
@@ -91,8 +107,13 @@ pub(crate) enum XferTxnEvent {
     /// The whole request committed: `pages` unmapped, capability revoked, registration removed.
     Released { pages: usize, map_len: usize },
     /// The range was unmapped but at least one page's shootdown did not complete, so that frame
-    /// was deliberately left unreclaimed. The release still committed.
+    /// was deliberately left unreclaimed — and phase R's object-level reclaim was suppressed for
+    /// the same reason. The release still committed.
     ReleasedWithIncompleteShootdown { pages: usize, map_len: usize },
+    /// The range was released, but the capability had already been retired by someone else before
+    /// phase R reached it. Reported rather than folded into `Released`, because this call did not
+    /// perform the revocation its caller asked for even though the postcondition holds.
+    ReleasedAfterConcurrentRevoke { pages: usize, map_len: usize },
 }
 
 /// Why phase V refused. Every variant maps to the error the broad handler already produced for
@@ -153,6 +174,16 @@ impl From<XferRefusal> for SyscallError {
 /// over `&mut KernelState`; the split adapter over `&SharedKernel` with the entering CPU stated,
 /// so its unmap reaches the requester-stating shootdown owner rather than the ambient one.
 pub(crate) trait XferReleaseOwners {
+    /// U9-XFER2 §2 — the OWNED, identity-bearing revoke reservation this adapter produces in
+    /// phase V and consumes in phase R.
+    ///
+    /// Opaque to the policy on purpose: what it holds is the adapter's business, but that it is
+    /// *carried* is the policy's. The previous shape built a reservation during the preflight,
+    /// dropped it, and rebuilt one after the range was already destroyed — which made the
+    /// preflight a rehearsal rather than a reservation, and put an allocation that could fail on
+    /// the far side of the mutation boundary.
+    type RevokeReservation;
+
     /// rank 2 — the calling thread, or `None` if it is a kernel task / has no user ASID.
     fn caller_with_user_asid(&mut self) -> Option<(ThreadId, Asid)>;
 
@@ -166,13 +197,17 @@ pub(crate) trait XferReleaseOwners {
     /// mappedness is known before anything is removed.
     fn page_is_mapped(&mut self, asid: Asid, virt: VirtAddr) -> bool;
 
-    /// rank 4 — does the capability resolve in `cnode`, and can its revoke closure be reserved?
-    /// Called in phase V, from reads only: a `false` here is a pre-mutation refusal.
-    fn capability_release_is_reservable(
+    /// rank 4 — RESERVE the capability's revoke closure, from reads only.
+    ///
+    /// Called in phase V. The returned value is owned by the transaction and handed back to
+    /// [`Self::revoke_reserved_capability`] in phase R, so the capacity the commit needs is
+    /// acquired while a failure still costs nothing. `None` is a pre-mutation refusal — the root
+    /// did not resolve, or the closure could not be allocated.
+    fn reserve_capability_release(
         &mut self,
         cnode: crate::kernel::capabilities::CNodeId,
         cap: CapId,
-    ) -> bool;
+    ) -> Option<Self::RevokeReservation>;
 
     /// rank 5 → TLB with NO lock held → rank 6 — unmap the whole range. Returns `false` if at
     /// least one page's shootdown did not complete, in which case that frame was deliberately
@@ -180,12 +215,17 @@ pub(crate) trait XferReleaseOwners {
     fn unmap_whole_range(&mut self, asid: Asid, base: usize, map_len: usize) -> bool;
 
     /// rank 4 (+3, +6, +2, +1) — the full recursive revoke of a capability USERSPACE HOLDS, over
-    /// the closure reserved in phase V. Not the provisional-cap subset.
-    fn revoke_user_held_capability(
+    /// the closure RESERVED IN PHASE V and handed back here. Not the provisional-cap subset.
+    ///
+    /// `backing_is_quarantined` carries phase U's shootdown verdict in. When the range's
+    /// shootdown did not complete, its frame was deliberately left unreclaimed; without this the
+    /// revoke's own reclaimer would find the pages already gone, conclude everything is
+    /// acknowledged, and free the quarantined backing anyway.
+    fn revoke_reserved_capability(
         &mut self,
-        cnode: crate::kernel::capabilities::CNodeId,
-        cap: CapId,
-    ) -> bool;
+        reservation: Self::RevokeReservation,
+        backing_is_quarantined: bool,
+    ) -> XferRevokeOutcome;
 
     /// rank 3 — remove the registry entry, if one exists. `false` simply means there was none,
     /// which the `Explicit` shape permits.
@@ -207,7 +247,7 @@ pub(crate) fn plan_transfer_release<O: XferReleaseOwners>(
     cap: CapId,
     base_arg: usize,
     len_arg: usize,
-) -> Result<XferReleasePlan, XferRefusal> {
+) -> Result<(XferReleasePlan, O::RevokeReservation), XferRefusal> {
     let (owner, asid) = owners
         .caller_with_user_asid()
         .ok_or(XferRefusal::NoUserAddressSpace)?;
@@ -243,20 +283,24 @@ pub(crate) fn plan_transfer_release<O: XferReleaseOwners>(
         va = va.saturating_add(PAGE_SIZE);
     }
 
-    // …and the capability half of the same proof: it must resolve, and its closure must be
-    // reservable, before the range is touched.
-    if !owners.capability_release_is_reservable(cnode, cap) {
-        return Err(XferRefusal::CapabilityUnresolvable);
-    }
+    // …and the capability half of the same proof. This does not merely CHECK: it RESERVES, and
+    // the reservation is handed back to the caller to carry into phase R. Checking and then
+    // rebuilding would put the allocation that can fail on the far side of the unmap.
+    let reservation = owners
+        .reserve_capability_release(cnode, cap)
+        .ok_or(XferRefusal::CapabilityUnresolvable)?;
 
-    Ok(XferReleasePlan {
-        shape,
-        owner,
-        cap,
-        asid,
-        base,
-        map_len,
-    })
+    Ok((
+        XferReleasePlan {
+            shape,
+            owner,
+            cap,
+            asid,
+            base,
+            map_len,
+        },
+        reservation,
+    ))
 }
 
 /// THE transfer-release transaction. Phase V refuses or the whole request commits.
@@ -268,8 +312,8 @@ pub(crate) fn run_transfer_release_transaction<O: XferReleaseOwners>(
     base_arg: usize,
     len_arg: usize,
 ) -> Result<usize, SyscallError> {
-    let plan = match plan_transfer_release(owners, cap, base_arg, len_arg) {
-        Ok(plan) => plan,
+    let (plan, reservation) = match plan_transfer_release(owners, cap, base_arg, len_arg) {
+        Ok(prepared) => prepared,
         Err(reason) => {
             owners.note(XferTxnEvent::Refused { reason });
             return Err(SyscallError::from(reason));
@@ -277,20 +321,23 @@ pub(crate) fn run_transfer_release_transaction<O: XferReleaseOwners>(
     };
 
     // ── Committed from here. Nothing below refuses. ─────────────────────────────────────────
+    //
+    // What makes that true is not optimism: phase V proved the whole range mapped and RESERVED
+    // the revoke closure, so the two things that could still fail — a missing page and an
+    // allocation — are already behind us. `reservation` is that owned capacity, carried in.
     let pages = plan.map_len / PAGE_SIZE;
 
     // U — the whole range at once, through the owner that releases rank 5 before the shootdown
-    // and takes rank 6 only after it completes.
+    // and takes rank 6 only after it completes. `false` means at least one page's shootdown did
+    // not complete and its frame was deliberately left unreclaimed.
     let all_acked = owners.unmap_whole_range(plan.asid, plan.base, plan.map_len);
 
-    // R — the capability. Phase V proved it resolves and its closure reserves, so this is the
-    // commit of a decision already made. A `false` here can only mean the slot went away between
-    // the preflight and now, which is the same race the broad path had and the same outcome: the
-    // range is released either way.
-    let cnode = owners.caller_cnode();
-    if let Some(cnode) = cnode {
-        let _ = owners.revoke_user_held_capability(cnode, plan.cap);
-    }
+    // R — the capability, over the closure reserved in phase V.
+    //
+    // The shootdown verdict goes WITH it. Without that, the revoke's own reclaimer would find the
+    // pages already unmapped, conclude there was nothing left to acknowledge, and free the
+    // quarantined backing that phase U had just refused to free.
+    let revoke = owners.revoke_reserved_capability(reservation, !all_acked);
 
     // S — registry and accounting, in the broad handler's order: account only when a registration
     // was actually removed.
@@ -298,16 +345,22 @@ pub(crate) fn run_transfer_release_transaction<O: XferReleaseOwners>(
         owners.account_release(plan.map_len);
     }
 
-    owners.note(if all_acked {
-        XferTxnEvent::Released {
+    // The event names what actually happened, in precedence order: a quarantined frame is the
+    // most consequential outcome, then a capability somebody else retired, then the ordinary
+    // clean release.
+    owners.note(match (all_acked, revoke) {
+        (false, _) => XferTxnEvent::ReleasedWithIncompleteShootdown {
             pages,
             map_len: plan.map_len,
-        }
-    } else {
-        XferTxnEvent::ReleasedWithIncompleteShootdown {
+        },
+        (true, XferRevokeOutcome::AlreadyRetired) => XferTxnEvent::ReleasedAfterConcurrentRevoke {
             pages,
             map_len: plan.map_len,
-        }
+        },
+        (true, XferRevokeOutcome::Revoked) => XferTxnEvent::Released {
+            pages,
+            map_len: plan.map_len,
+        },
     });
     Ok(plan.map_len)
 }
