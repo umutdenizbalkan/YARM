@@ -26,9 +26,10 @@
 //!   ABI admits every `CapObject` kind including `Reply`. Reusing the bounded composition would
 //!   refuse authority the broad path serves.
 
+use crate::kernel::boot::SplitRevokeCommitOutcome;
 use crate::kernel::capabilities::{CNodeId, CapId};
 use crate::kernel::ipc::ThreadId;
-use crate::kernel::syscall::xfer_txn::{XferReleaseOwners, XferTxnEvent};
+use crate::kernel::syscall::xfer_txn::{XferReleaseOwners, XferRevokeOutcome, XferTxnEvent};
 use crate::kernel::vm::{Asid, VirtAddr};
 
 /// The split adapter.
@@ -44,6 +45,8 @@ pub(crate) struct SplitXferOwners<'a> {
 }
 
 impl XferReleaseOwners for SplitXferOwners<'_> {
+    type RevokeReservation = crate::kernel::boot::SplitRevokeReservation;
+
     fn caller_with_user_asid(&mut self) -> Option<(ThreadId, Asid)> {
         // rank 2. A kernel task has no user ASID, which is exactly the condition the broad
         // `current_task_has_user_asid` gate tested, so one read answers both halves.
@@ -65,16 +68,18 @@ impl XferReleaseOwners for SplitXferOwners<'_> {
             .unwrap_or(false)
     }
 
-    fn capability_release_is_reservable(&mut self, _cnode: CNodeId, cap: CapId) -> bool {
-        // Phase V, from reads only: the root must resolve AND its whole closure must be
-        // reservable on the heap. Building the reservation here is what makes an allocation
-        // failure a PRE-MUTATION refusal — the U9-VM-ENTRY1 journal discipline. The reservation
-        // is then rebuilt by the commit rather than carried across, because between the two the
-        // only thing that can have changed is the closure itself, and the commit must act on
-        // what is true when it runs.
+    fn reserve_capability_release(
+        &mut self,
+        _cnode: CNodeId,
+        cap: CapId,
+    ) -> Option<Self::RevokeReservation> {
+        // Phase V, from reads only: resolve the root and RESERVE its whole closure on the heap,
+        // fallibly. The reservation is returned to the transaction and carried into phase R —
+        // it is not rebuilt there. That is what puts the allocation that can fail on the safe
+        // side of the mutation boundary, which is the whole point of reserving at all.
         self.shared
             .plan_revoke_user_held_capability_split(self.tid, cap)
-            .is_ok()
+            .ok()
     }
 
     fn unmap_whole_range(&mut self, asid: Asid, base: usize, map_len: usize) -> bool {
@@ -83,10 +88,18 @@ impl XferReleaseOwners for SplitXferOwners<'_> {
             .unmap_range_two_phase_from_split(self.cpu, asid, base, map_len)
     }
 
-    fn revoke_user_held_capability(&mut self, _cnode: CNodeId, cap: CapId) -> bool {
-        self.shared
-            .revoke_user_held_capability_split(self.tid, cap)
-            .is_ok()
+    fn revoke_reserved_capability(
+        &mut self,
+        reservation: Self::RevokeReservation,
+        backing_is_quarantined: bool,
+    ) -> XferRevokeOutcome {
+        match self
+            .shared
+            .commit_user_held_capability_split(reservation, backing_is_quarantined)
+        {
+            SplitRevokeCommitOutcome::Revoked(_) => XferRevokeOutcome::Revoked,
+            SplitRevokeCommitOutcome::RootAlreadyRetired => XferRevokeOutcome::AlreadyRetired,
+        }
     }
 
     fn remove_registration(&mut self, owner: ThreadId, cap: CapId) -> bool {

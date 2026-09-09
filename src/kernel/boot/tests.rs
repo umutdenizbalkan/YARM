@@ -141011,26 +141011,59 @@ mod u9f_split_capability_revocation {
             ),
             (
                 "heap-reserved (NR 4, a capability userspace holds)",
-                "pub(crate) fn revoke_user_held_capability_split(",
-                "\n}",
+                "pub(crate) fn commit_user_held_capability_split(",
+                "\n    /// U9-F production entry point",
             ),
         ] {
             let body = body_of(region, entry, terminator);
-            assert!(
-                body.contains("self.commit_revoke_split("),
-                "the {label} entry point must reach the single commit"
-            );
-            for restated in [
-                "cspace_revoke_split(",
-                "cspace_read_then_revoke_split(",
-                "clear_delegation_links_split(",
-                "destroy_notification_for_revoked_object_split(",
-            ] {
+            // U9-XFER2 §2 split the two reservations apart on purpose. The bounded cohort keeps
+            // reaching `commit_revoke_split`; NR 4's own commit CONSUMES an owned reservation and
+            // carries the caller's shootdown verdict, which the shared body has no parameter for.
+            // What both must still do is perform the SAME teardown in the SAME order — asserted
+            // per-body below rather than by insisting on one shared callee.
+            if label.starts_with("bounded") {
                 assert!(
-                    !body.contains(restated),
-                    "the {label} entry point must not restate `{restated}`"
+                    body.contains("self.commit_revoke_split("),
+                    "the {label} entry point must reach the shared commit"
                 );
+                for restated in [
+                    "cspace_revoke_split(",
+                    "cspace_read_then_revoke_split(",
+                    "clear_delegation_links_split(",
+                    "destroy_notification_for_revoked_object_split(",
+                ] {
+                    assert!(
+                        !body.contains(restated),
+                        "the {label} entry point must not restate `{restated}`"
+                    );
+                }
+                continue;
             }
+            // NR 4's commit: same five steps, same order, plus the two things only it needs —
+            // link removal BY CONTENT, and a reclaim gated on the caller's shootdown verdict.
+            let order = [
+                "cspace_revoke_split(reservation.cnode, reservation.root.cap)",
+                "cspace_read_then_revoke_split(cnode, descendant.cap)",
+                "memory_obligations_split_gated(",
+                "destroy_notification_for_revoked_object_split(object)",
+                "clear_reserved_delegation_links_split(&reservation.link_removals)",
+                "destroy_notification_for_revoked_object_split(reservation.root_object)",
+            ];
+            let mut last = 0usize;
+            for needle in order {
+                let at = body
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("the {label} commit must `{needle}`"));
+                assert!(
+                    at > last,
+                    "`{needle}` is out of order in the {label} commit"
+                );
+                last = at;
+            }
+            assert!(
+                !body.contains("clear_delegation_links_split("),
+                "NR 4 must clear links by CONTENT, never by index alone"
+            );
         }
         // And the heap reservation must NOT carry the bounded plan's capacity refusals: NR 4's
         // root is a cap userspace holds, so a closure larger than 16 is ordinary, not an error.
@@ -171430,14 +171463,44 @@ mod u9xfer1_ownership_cases {
             "\n/// THE transfer-release transaction",
         ));
         let cap_check = plan
-            .find("owners.capability_release_is_reservable(cnode, cap)")
-            .expect("the capability must be proven in the preflight");
+            .find(".reserve_capability_release(cnode, cap)")
+            .expect("the capability closure must be RESERVED in the preflight");
         let range_check = plan
             .find("owners.page_is_mapped(")
             .expect("the range must be proven in the preflight");
         assert!(
             range_check < cap_check,
-            "the range proof precedes the capability proof, so both precede every mutation"
+            "the range proof precedes the capability reservation, so both precede every mutation"
+        );
+        // U9-XFER2 §2 — the preflight must hand the reservation OUT. Building one here and
+        // dropping it would make this a rehearsal, and would put the allocation that can fail on
+        // the far side of the unmap.
+        assert!(
+            plan.contains("Ok((") && plan.contains("reservation,"),
+            "the preflight must return the owned reservation, not merely test that one could be \
+             built"
+        );
+        let txn = code_only(body_of(
+            XFER_TXN,
+            "pub(crate) fn run_transfer_release_transaction<O: XferReleaseOwners>(",
+            "\n}\n",
+        ));
+        assert!(
+            txn.contains("let (plan, reservation) = match plan_transfer_release("),
+            "the transaction must receive the reservation from its preflight"
+        );
+        assert!(
+            txn.contains("owners.revoke_reserved_capability(reservation, !all_acked)"),
+            "…and consume THAT reservation in the commit, with the shootdown verdict"
+        );
+        // Nothing may rebuild a reservation after the mutation boundary.
+        let after_unmap = txn
+            .split_once("owners.unmap_whole_range(")
+            .map(|(_, rest)| rest)
+            .expect("the unmap is the mutation boundary");
+        assert!(
+            !after_unmap.contains("reserve_capability_release"),
+            "the closure must not be re-reserved after the range has been destroyed"
         );
     }
 
@@ -171460,10 +171523,24 @@ mod u9xfer1_ownership_cases {
                 "nothing after the first mutation may refuse (`{refusal}` found)"
             );
         }
+        // U9-XFER2 §2 — and the revoke's result must be CONSUMED, not discarded. Dropping it made
+        // a revoke that never landed indistinguishable from a clean release of a range that had
+        // already been destroyed.
+        assert!(
+            !commit.contains("let _ = owners.revoke_reserved_capability")
+                && commit.contains("let revoke = owners.revoke_reserved_capability("),
+            "the revoke outcome must be bound and accounted for, never dropped"
+        );
+        assert!(
+            commit.contains(
+                "XferRevokeOutcome::AlreadyRetired) => XferTxnEvent::ReleasedAfterConcurrentRevoke"
+            ),
+            "a capability retired by someone else must be reported, not folded into a clean release"
+        );
         // The order the phases actually run in.
         let order = [
             "owners.unmap_whole_range(",
-            "owners.revoke_user_held_capability(",
+            "owners.revoke_reserved_capability(",
             "owners.remove_registration(",
             "owners.account_release(",
         ];
@@ -171529,8 +171606,8 @@ mod u9xfer1_ownership_cases {
     fn nr4_the_split_revoke_is_not_the_provisional_cap_subset() {
         let code = code_only(XFER_SPLIT);
         assert!(
-            code.contains("revoke_user_held_capability_split(self.tid, cap)"),
-            "NR 4 must reach the user-held revoke"
+            code.contains("commit_user_held_capability_split(reservation, backing_is_quarantined)"),
+            "NR 4 must commit the reservation it prepared, carrying the shootdown verdict"
         );
         assert!(
             !code.contains("revoke_capability_no_vm_split")
@@ -171553,10 +171630,37 @@ mod u9xfer1_ownership_cases {
             "fn collect_user_held_descendants_split(",
             "\n    /// U9-XFER1 \u{a7}3 \u{2014} the exact link-removal set",
         );
+        // U9-XFER2 §2 — capacity is reserved FALLIBLY and up front, never grown with `push`
+        // against the global allocation-error handler.
         assert!(
-            closure.contains("MAX_DELEGATED_CAPABILITY_LINKS")
-                && closure.contains("alloc::vec::Vec"),
-            "the closure must be heap-reserved and bounded by the link table, as the broad one is"
+            closure.contains("try_reserve(capacity)")
+                && closure.contains("SplitRevokeReserveError::OutOfMemory"),
+            "the closure must be reserved fallibly, so exhaustion is a value and not an abort"
+        );
+        // …and the truncating bound is gone. `queue` starts holding the ROOT, so a
+        // `queue.len() >= MAX` test could trip while the closure was still one short — and its
+        // `break` left the outer walk running, so the shortfall was silent.
+        assert!(
+            !closure.contains("found.len() >= MAX_DELEGATED_CAPABILITY_LINKS")
+                && !closure.contains("queue.len() >= MAX_DELEGATED_CAPABILITY_LINKS"),
+            "the off-by-one truncation bound must be gone, not merely widened"
+        );
+        assert!(
+            closure.contains("capacity.saturating_add(1)"),
+            "the queue reservation must account for the root it starts with"
+        );
+        // The link-removal set is identity-bearing: an index alone cannot name a link across a
+        // lock release, because the table has no per-slot generation.
+        let clear = body_of(
+            LIFECYCLE,
+            "fn clear_reserved_delegation_links_split(",
+            "\n    /// rank 3: the notification-destroy half",
+        );
+        assert!(
+            clear.contains(
+                "capability.delegated_capability_links[removal.index] == Some(removal.link)"
+            ),
+            "a reserved link must be cleared only while the slot still holds exactly that link"
         );
     }
 
@@ -171805,117 +171909,255 @@ mod u9xfer1_ownership_cases {
     }
 }
 
-/// U9-XFER1 §4 — why NR 30's TERMINAL DISPATCH is not closed in this package, proven from source
-/// rather than asserted.
+/// U9-XFER2 §2 — NR 4's prepare/commit boundary, exercised against the REAL production owners
+/// rather than asserted from source.
 ///
-/// NR 4 is closed: it has a total pre-lock route on all three architectures. NR 30 does not, and
-/// the obstacle is not its transaction — that is now correct, and its owners are rank-local. The
-/// obstacle is that **NR 30 writes user memory on every single exit**, and no off-lock user-memory
-/// WRITE owner exists.
-///
-/// This is the same constraint that has kept NR 2 `IpcRecv`'s user-ASID cohort on the broad path
-/// since Stage 32B, in that route's own words: a user-ASID receiver "would require a forbidden
-/// user copy". Building that owner is a foundation stage with its own fault semantics, not part of
-/// completing these two families — so the limit is recorded here instead of being papered over
-/// with a route that would decline every real caller.
+/// Each case drives `plan_revoke_user_held_capability_split` and
+/// `commit_user_held_capability_split` — the pair NR 4's split adapter actually calls — and
+/// checks a property that was wrong before this package.
 #[cfg(test)]
-mod u9xfer1_nr30_terminal_dispatch_limit {
-    const RECV_V3: &str = include_str!("../syscall/recv_shared_v3.rs");
-    const SPLIT: &str = include_str!("../syscall_split.rs");
-    const RUNTIME: &str = include_str!("../../runtime.rs");
+mod u9xfer2_reservation_cases {
+    use super::*;
+    use crate::kernel::boot::MAX_DELEGATED_CAPABILITY_LINKS;
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    use crate::runtime::SharedKernel;
 
-    /// Every exit of NR 30 writes to user memory — success, would-block and mapped alike. There is
-    /// no cohort of NR 30 calls that could be serviced without a user write.
-    #[test]
-    fn nr30_writes_user_memory_on_every_exit() {
-        // The metadata record is written on the would-block exit, the mapped-success exit and the
-        // plain-success exit; the plain path additionally copies the payload.
-        assert!(
-            RECV_V3.matches("write_v3_output_to_user(").count() >= 4,
-            "the metadata record is written on every exit (one definition plus each call site)"
-        );
-        assert!(
-            RECV_V3.contains("execute_user_asid_plain_writeback(kernel, &delivery)"),
-            "the plain path additionally copies the payload into user memory"
-        );
-        // And that writeback owner is a `&mut KernelState` user copy.
-        let writer = RECV_V3
-            .split_once("fn write_v3_output_to_user(")
-            .map(|(_, r)| r.split_once("\n}").map_or(r, |(b, _)| b))
-            .expect("the metadata writer must exist");
-        assert!(
-            writer.contains("kernel: &mut KernelState"),
-            "the metadata writer takes the broad state"
-        );
+    /// Build a kernel with task 1 dispatched, holding one ordinary capability in its cnode.
+    /// Returns `(shared, tid, cap)`.
+    fn shared_with_one_held_cap() -> (SharedKernel, u64, CapId) {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cap = shared.with(|state| {
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            state
+                .mint_capability_for_current_context(Capability::new(
+                    CapObject::Kernel,
+                    CapRights::READ,
+                ))
+                .expect("mint root cap")
+        });
+        (shared, 1, cap)
     }
 
-    /// The owner a split route would need does not exist: there is an off-lock user READ seam and
-    /// no off-lock user WRITE seam.
+    /// A COMPLETELY populated delegation table must yield the whole closure.
+    ///
+    /// The old collector seeded `queue` with the ROOT and then tested `queue.len() >= MAX`, so it
+    /// could stop while the closure was still one short — and its `break` left the outer walk
+    /// running, so the shortfall was silent. The reservation is now sized from the table itself
+    /// and carries no truncating test at all.
     #[test]
-    fn no_off_lock_user_write_owner_exists() {
-        assert!(
-            RUNTIME.contains("pub fn copy_from_user_asid_split_read("),
-            "fixture check: the off-lock user READ seam does exist"
-        );
-        for absent in [
-            "fn copy_to_user_asid_split",
-            "fn copy_to_current_user_split",
-            "fn write_user_asid_split",
-        ] {
-            assert!(
-                !RUNTIME.contains(absent),
-                "an off-lock user WRITE seam (`{absent}`) must not have appeared without this \
-                 limit being re-derived"
-            );
-        }
-        // No split route writes user memory today.
-        assert!(
-            !crate::kernel::boot::tests::u9xfer1_nr30_terminal_dispatch_limit::split_code()
-                .contains("copy_to_current_user("),
-            "no split route writes user memory"
-        );
-    }
+    fn a_full_delegation_table_yields_every_descendant() {
+        std::thread::Builder::new()
+            .name("u9xfer2_full_table".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (shared, tid, root) = shared_with_one_held_cap();
+                // One chain: root -> d1 -> d2 -> ... , filling the table completely.
+                let mut chain: std::vec::Vec<CapId> = std::vec::Vec::new();
+                let mut source = root;
+                let mut filled = 0usize;
+                loop {
+                    let dest = CapId(0x9000_0000u64 + filled as u64);
+                    let ok = shared.with(|state| {
+                        state
+                            .record_delegated_capability_link(tid, source, tid, dest)
+                            .is_ok()
+                    });
+                    if !ok {
+                        break;
+                    }
+                    chain.push(dest);
+                    source = dest;
+                    filled += 1;
+                }
+                assert_eq!(
+                    filled, MAX_DELEGATED_CAPABILITY_LINKS,
+                    "the table must be COMPLETELY full for this case to mean anything"
+                );
 
-    pub(super) fn split_code() -> alloc::string::String {
-        SPLIT
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//") && !t.starts_with("///")
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(tid, root)
+                    .expect("a full table must still reserve");
+                let collected = reservation.descendants.iter().flatten().count();
+                assert_eq!(
+                    collected, filled,
+                    "every link in a full table is one descendant; the closure must contain all \
+                     {filled} of them, with no truncation"
+                );
+                // …and the link-removal set covers the whole chain too.
+                assert_eq!(
+                    reservation.link_removals.len(),
+                    filled,
+                    "every link on the chain names the root or a descendant, so all are removable"
+                );
             })
-            .collect::<alloc::vec::Vec<_>>()
-            .join("\n")
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
-    /// The precedent, in the codebase's own words: NR 2 declines a user-ASID receiver for exactly
-    /// this reason, and has since Stage 32B. NR 30 is not a new exception — it is the same one.
+    /// A link slot that was RECYCLED between the reservation and the commit must be left alone.
+    ///
+    /// `delegated_capability_links` has no per-slot generation, so an index does not identify a
+    /// link. Clearing by index would destroy an unrelated delegation created after the plan.
     #[test]
-    fn the_same_constraint_already_holds_nr2s_user_asid_cohort_broad() {
-        assert!(
-            SPLIT.contains("user-ASID receiver (would require a forbidden user copy)"),
-            "NR 2's route must still name the constraint this limit shares"
-        );
+    fn a_recycled_link_slot_is_not_cleared_by_index() {
+        std::thread::Builder::new()
+            .name("u9xfer2_link_reuse".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (shared, tid, root) = shared_with_one_held_cap();
+                let doomed = CapId(0x9100_0000);
+                shared.with(|state| {
+                    state
+                        .record_delegated_capability_link(tid, root, tid, doomed)
+                        .expect("link");
+                });
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(tid, root)
+                    .expect("reserve");
+                assert_eq!(reservation.link_removals.len(), 1, "one link reserved");
+                let idx = reservation.link_removals[0].index;
+
+                // Concurrent world: that link is retired and its slot reused by an unrelated
+                // delegation between UNRELATED caps.
+                let other_src = CapId(0x9200_0000);
+                let other_dst = CapId(0x9200_0001);
+                shared.with_capability_state_split_mut(|capability| {
+                    capability.delegated_capability_links[idx] =
+                        Some(crate::kernel::boot::defs::DelegatedCapabilityLink {
+                            source_tid: 77,
+                            source_cap: other_src,
+                            dest_tid: 78,
+                            dest_cap: other_dst,
+                        });
+                });
+
+                let _ = shared.commit_user_held_capability_split(reservation, false);
+
+                let survivor = shared.with_capability_state_split_mut(|capability| {
+                    capability.delegated_capability_links[idx]
+                });
+                assert_eq!(
+                    survivor.map(|l| (l.source_cap, l.dest_cap)),
+                    Some((other_src, other_dst)),
+                    "the unrelated delegation that took the slot must survive: an index alone \
+                     does not identify a link"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
-    /// So NR 30 keeps its terminal broad edge, on every architecture — stated positively, so a
-    /// future package that closes it has to come here and say so.
+    /// An incomplete shootdown must survive the REVOKE, not just the unmap.
+    ///
+    /// The unmap owner already skips its own per-page reclaim. But the revoke then runs its own
+    /// reclaimers, finds the pages already gone, concludes everything was acknowledged, and would
+    /// free the very backing the unmap quarantined. The verdict is carried in so it does not.
     #[test]
-    fn nr30_is_not_split_eligible_on_any_architecture() {
-        let code = split_code();
-        assert!(
-            !code.contains("Syscall::RecvSharedV3 => Some(syscall)"),
-            "NR 30 is not on the NR-only whitelist"
-        );
-        assert!(
-            !code.contains("try_split_recv_shared_v3_into_frame"),
-            "NR 30 has no pre-lock route"
-        );
-        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
-        const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
-        assert!(
-            !TRAP_ENTRY.contains("SYSCALL_RECV_SHARED_V3_NR")
-                && !RISCV_TRAP.contains("SYSCALL_RECV_SHARED_V3_NR"),
-            "and it is on neither architecture's ingress list"
-        );
+    fn an_incomplete_shootdown_suppresses_the_revokes_reclaim() {
+        std::thread::Builder::new()
+            .name("u9xfer2_quarantine".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+                let (mo_id, mem_cap) = shared.with(|state| {
+                    state.register_task(1).expect("task1");
+                    state.enqueue_current_cpu(1).expect("enqueue");
+                    state.dispatch_next_task().expect("dispatch");
+                    state.alloc_anonymous_memory_object().expect("mem")
+                });
+                let live_before = shared.with(|state| state.memory_object_slot_by_id(mo_id));
+                assert!(live_before.is_some(), "the object starts live");
+
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(1, mem_cap)
+                    .expect("reserve");
+                // Quarantined: phase U reported an incomplete ACK for this backing.
+                let outcome = shared.commit_user_held_capability_split(reservation, true);
+                assert!(
+                    matches!(
+                        outcome,
+                        crate::kernel::boot::SplitRevokeCommitOutcome::Revoked(_)
+                    ),
+                    "the capability half still completes"
+                );
+                assert!(
+                    shared
+                        .with(|state| state.memory_object_slot_by_id(mo_id))
+                        .is_some(),
+                    "the backing must NOT be reclaimed while its shootdown is unacknowledged — \
+                     the revoke's own reclaimer would otherwise free the quarantined frame"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// The same request WITHOUT the quarantine reclaims normally, so the guard above is proving a
+    /// suppression rather than an object that was never reclaimable.
+    #[test]
+    fn an_acknowledged_shootdown_still_reclaims() {
+        std::thread::Builder::new()
+            .name("u9xfer2_reclaims".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+                let (mo_id, mem_cap) = shared.with(|state| {
+                    state.register_task(1).expect("task1");
+                    state.enqueue_current_cpu(1).expect("enqueue");
+                    state.dispatch_next_task().expect("dispatch");
+                    state.alloc_anonymous_memory_object().expect("mem")
+                });
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(1, mem_cap)
+                    .expect("reserve");
+                let _ = shared.commit_user_held_capability_split(reservation, false);
+                assert!(
+                    shared
+                        .with(|state| state.memory_object_slot_by_id(mo_id))
+                        .is_none(),
+                    "with the shootdown acknowledged, the last capability reference retires the \
+                     object exactly as the broad path does"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// A root somebody else retired between the reservation and the commit is REPORTED, not
+    /// folded into a clean release.
+    #[test]
+    fn a_concurrently_retired_root_is_reported() {
+        std::thread::Builder::new()
+            .name("u9xfer2_raced_revoke".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let (shared, tid, root) = shared_with_one_held_cap();
+                let reservation = shared
+                    .plan_revoke_user_held_capability_split(tid, root)
+                    .expect("reserve");
+                // Concurrent world: someone else revokes it first.
+                shared.with(|state| {
+                    let cnode = state.current_task_cnode().expect("cnode");
+                    state
+                        .revoke_capability_in_cnode(cnode, root)
+                        .expect("concurrent revoke");
+                });
+                let outcome = shared.commit_user_held_capability_split(reservation, false);
+                assert_eq!(
+                    outcome,
+                    crate::kernel::boot::SplitRevokeCommitOutcome::RootAlreadyRetired,
+                    "the commit must say the capability was already gone rather than claim it \
+                     performed the revocation"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 }

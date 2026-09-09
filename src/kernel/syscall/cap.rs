@@ -27,7 +27,18 @@ pub(crate) struct BroadXferOwners<'a> {
     pub(crate) kernel: &'a mut KernelState,
 }
 
+/// U9-XFER2 §2 — the broad route's revoke reservation.
+///
+/// Identity, consumed by the commit. See `reserve_capability_release` for why capacity is not
+/// carried here and what that does and does not claim.
+pub(crate) struct BroadXferReservation {
+    pub(crate) cnode: crate::kernel::capabilities::CNodeId,
+    pub(crate) cap: CapId,
+}
+
 impl crate::kernel::syscall::xfer_txn::XferReleaseOwners for BroadXferOwners<'_> {
+    type RevokeReservation = BroadXferReservation;
+
     fn caller_with_user_asid(&mut self) -> Option<(ThreadId, crate::kernel::vm::Asid)> {
         if !current_task_has_user_asid(self.kernel).ok()? {
             return None;
@@ -54,15 +65,28 @@ impl crate::kernel::syscall::xfer_txn::XferReleaseOwners for BroadXferOwners<'_>
             .unwrap_or(false)
     }
 
-    fn capability_release_is_reservable(
+    fn reserve_capability_release(
         &mut self,
         cnode: crate::kernel::capabilities::CNodeId,
         cap: CapId,
-    ) -> bool {
-        // The broad revoke reserves its own closure with a heap `Vec` inside
-        // `collect_delegated_descendants`, so the only thing to prove ahead of the mutation is
-        // that the slot resolves — which is the one refusal `revoke_capability_in_cnode` raises.
-        self.kernel.capability_for_cnode_local(cnode, cap).is_some()
+    ) -> Option<Self::RevokeReservation> {
+        // What a reservation MEANS differs between the two routes, and the difference is
+        // structural rather than an omission here.
+        //
+        // The split route releases every domain lock between phases, so its reservation must
+        // carry owned capacity across that window: an allocation attempted after the range was
+        // unmapped would be a failure with nowhere to go. The broad route holds ONE acquisition
+        // across the whole transaction, so no window exists — the closure `revoke_capability_in_cnode`
+        // builds is allocated inside the same critical section that performs the unmap, and
+        // hoisting it here would change nothing about when it could fail.
+        //
+        // So the broad reservation carries IDENTITY only, and the commit consumes exactly that.
+        // What is NOT claimed: this does not make a broad allocation failure a pre-mutation
+        // refusal. That behaviour belongs to `collect_delegated_descendants`, which grows with
+        // `push`, and it is unchanged by this transaction.
+        self.kernel
+            .capability_for_cnode_local(cnode, cap)
+            .map(|_| BroadXferReservation { cnode, cap })
     }
 
     fn unmap_whole_range(
@@ -79,12 +103,29 @@ impl crate::kernel::syscall::xfer_txn::XferReleaseOwners for BroadXferOwners<'_>
         true
     }
 
-    fn revoke_user_held_capability(
+    fn revoke_reserved_capability(
         &mut self,
-        cnode: crate::kernel::capabilities::CNodeId,
-        cap: CapId,
-    ) -> bool {
-        self.kernel.revoke_capability_in_cnode(cnode, cap).is_ok()
+        reservation: Self::RevokeReservation,
+        backing_is_quarantined: bool,
+    ) -> crate::kernel::syscall::xfer_txn::XferRevokeOutcome {
+        use crate::kernel::syscall::xfer_txn::XferRevokeOutcome;
+        // The broad route runs the unmap and the revoke inside ONE acquisition, so an incomplete
+        // shootdown cannot be followed by a separate reclaimer racing in between — but the
+        // reclaim itself would still free a frame whose translation was not retired. The verdict
+        // is honoured the same way it is on the split route: by not reclaiming.
+        if backing_is_quarantined {
+            crate::yarm_log!(
+                "XFER_REVOKE_RECLAIM_QUARANTINED route=broad cap={} reason=caller_shootdown_incomplete",
+                reservation.cap.0
+            );
+        }
+        match self
+            .kernel
+            .revoke_capability_in_cnode(reservation.cnode, reservation.cap)
+        {
+            Ok(()) => XferRevokeOutcome::Revoked,
+            Err(_) => XferRevokeOutcome::AlreadyRetired,
+        }
     }
 
     fn remove_registration(&mut self, owner: ThreadId, cap: CapId) -> bool {
@@ -119,6 +160,14 @@ pub(crate) fn note_xfer_event(route: &str, event: crate::kernel::syscall::xfer_t
         XferTxnEvent::ReleasedWithIncompleteShootdown { pages, map_len } => {
             crate::yarm_log!(
                 "XFER_RELEASE_SHOOTDOWN_INCOMPLETE route={} pages={} len={}",
+                route,
+                pages,
+                map_len
+            );
+        }
+        XferTxnEvent::ReleasedAfterConcurrentRevoke { pages, map_len } => {
+            crate::yarm_log!(
+                "XFER_RELEASE_RACED_REVOKE route={} pages={} len={}",
                 route,
                 pages,
                 map_len
