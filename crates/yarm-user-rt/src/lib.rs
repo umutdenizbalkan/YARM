@@ -5,6 +5,9 @@
 
 mod arch;
 pub mod recv_v3_draft;
+// U9-VM-ENTRY1 §4 — the minimal userspace witness for NR 3 / NR 13 / NR 14, which had no live
+// issuer anywhere in the system before this mission.
+pub mod vm_entry_witness;
 
 #[macro_export]
 macro_rules! user_log {
