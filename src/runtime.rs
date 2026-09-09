@@ -7655,8 +7655,97 @@ impl SharedKernel {
             let materialized = self.materialize_reply_cap_split(index, receiver_tid, handle)?;
             return Ok(Some(materialized.cap.0));
         }
-        let cap = self.materialize_ordinary_cap_split(index, receiver_tid, handle)?;
+        let cap = self.materialize_queued_transfer_cap_split(index, receiver_tid, handle)?;
         Ok(Some(cap.0))
+    }
+
+    /// U9-XFER2 §3 — NR 30's ordinary-arm materialization, INCLUDING the shared-region shape.
+    ///
+    /// This is the split twin of what broad NR 30 does, and it exists because
+    /// [`Self::materialize_ordinary_cap_split`] deliberately does NOT service a shared-region
+    /// envelope: that seam was written for U9-C's blocked-send classes, where a `pinned_object`
+    /// means "a class you were handed by mistake" and the pin belongs to another transaction.
+    ///
+    /// NR 30's queue is not that world. A `send_shared_region` enqueues an `OPCODE_SHARED_MEM`
+    /// message whose envelope carries the `+1` MemoryObject pin, and the BROAD route consumes it
+    /// through `KernelState::take_transfer_envelope`, which drops that pin as part of the same
+    /// decision (`transfer_envelope_owes_pin` → `adjust_memory_object_pin_refcount(-1)`) and then
+    /// mints. Routing NR 30's split adapter at `materialize_ordinary_cap_split` therefore turned
+    /// the single grant shape init actually sends into a `WrongObject` refusal that broad accepts
+    /// — a NEW refusal, and worse, one raised AFTER the rank-3 consume had already retired the
+    /// envelope, leaking its pin.
+    ///
+    /// So the same decision is made here, split into strictly sequential, never-nested
+    /// acquisitions in ascending rank:
+    ///
+    ///   * rank 3 — `take_transfer_envelope_facts_split` consumes the envelope exactly once and
+    ///     REPORTS the pin obligation instead of performing it;
+    ///   * rank 4 — the mint, through the same routed owner the non-shared shape uses;
+    ///   * rank 6 — `sr_release_pin_split`, the EXISTING pin-release owner
+    ///     (`settle_blocked_send_envelope_split` uses the same one), called on every exit after
+    ///     the consume, success or failure, so no path can retire an envelope and keep its pin.
+    ///
+    /// Releasing the pin after the mint rather than before it is the safer of the two orders and
+    /// changes nothing about lifetime: the pin release is a no-reclaim counter update (see
+    /// `sr_release_pin_split`), and the sender's own source capability holds the object live
+    /// across the whole window regardless.
+    pub(crate) fn materialize_queued_transfer_cap_split(
+        &self,
+        endpoint_idx: usize,
+        receiver_tid: u64,
+        raw_handle: u64,
+    ) -> Result<CapId, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::boot::{
+            CapTransferMaterializeOutcome, TransferCapDelegation, TransferCapSnapshot,
+        };
+        use crate::kernel::syscall::SyscallError;
+
+        let facts = self
+            .take_transfer_envelope_facts_split(
+                raw_handle,
+                endpoint_idx,
+                crate::kernel::ipc::ThreadId(receiver_tid),
+            )
+            .ok_or(SyscallError::InvalidCapability)?;
+        // From here the envelope is CONSUMED, so every exit owes the pin release it reported.
+        let pinned = facts.pinned_object;
+        let settle = |shared: &Self| {
+            if let Some(object) = pinned {
+                shared.sr_release_pin_split(object);
+            }
+        };
+
+        let source_capability =
+            match self.resolve_capability_for_task_split(facts.source_tid, facts.source_cap) {
+                Ok(c) => c,
+                Err(e) => {
+                    settle(self);
+                    return Err(SyscallError::from(e));
+                }
+            };
+        let Some(receiver_cnode) = self.task_cnode_split(receiver_tid) else {
+            settle(self);
+            return Err(SyscallError::InvalidCapability);
+        };
+        let snap = TransferCapSnapshot {
+            receiver_cnode,
+            object: source_capability.object,
+            rights: source_capability.rights(),
+        };
+        let delegation = TransferCapDelegation {
+            source_tid: facts.source_tid,
+            source_cap: facts.source_cap,
+            dest_tid: receiver_tid,
+        };
+        let outcome = self
+            .materialize_received_message_cap_routed_with_delegation_split(snap, Some(delegation));
+        settle(self);
+        match outcome {
+            Ok(CapTransferMaterializeOutcome::Materialized(cap)) => Ok(cap),
+            // Unreachable: a Reply source object is declined at admission, before the dequeue.
+            Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => Err(SyscallError::WrongObject),
+            Err(e) => Err(SyscallError::from(e)),
+        }
     }
 
     /// rank 6 — a memory object's length, for the output record's `exact_object_size`.

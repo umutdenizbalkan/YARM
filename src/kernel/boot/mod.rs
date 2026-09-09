@@ -7768,6 +7768,44 @@ pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x4000_0000;
 #[cfg(feature = "x86-shared-region-direct-oracle")]
 pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
 
+/// U9-XFER2 §4 — the NR 30 + NR 4 grant-witness selector. Slot 5 is mutually exclusive, so this
+/// value is distinct from every other cell's; it reuses the SAME provisioning
+/// (`provision_init_shared_region_oracle`) and the same startup slots 13/14, and differs only in
+/// which init cell consumes them. Selector 2 runs the DIRECT blocked-waiter oracle; 12 runs the
+/// enqueue-path grant witness, which NR 30 needs because it is a non-blocking probe.
+pub const XFER2_GRANT_WITNESS_SELECTOR: u64 = 12;
+
+static XFER2_GRANT_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the U9-XFER2 §4 grant witness (`yarm.xfer2_grant_witness=1`). Default OFF, so an ordinary
+/// boot is byte-identical.
+pub(crate) fn set_xfer2_grant_witness_enabled(enabled: bool) {
+    XFER2_GRANT_WITNESS_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the U9-XFER2 §4 grant witness is armed.
+pub fn xfer2_grant_witness_enabled() -> bool {
+    XFER2_GRANT_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// U9-XFER2 §4 — the arch-neutral predicate that arms the SHARED init shared-region PROVISIONING.
+///
+/// The provisioning (`provision_init_shared_region_oracle`) mints exactly one disposable two-page
+/// `MemoryObject` + one rendezvous endpoint into init's startup slots 13/14, and TWO cells consume
+/// them: selector 2/6/7 (the DIRECT blocked-waiter oracle) and selector 12 (this witness). So the
+/// knob that arms EITHER cell has to arm the provisioning.
+///
+/// This is deliberately NOT folded into `shared_region_direct_oracle_enabled()`. That predicate
+/// additionally gates the DIRECT producer's authoritative ack gate, its ack consume, and the
+/// blocked-recv ack publication — machinery keyed on a BLOCKED waiter. NR 30 is non-blocking, so
+/// the witness's grant travels the ENQUEUE path and never reaches a blocked waiter; widening the
+/// direct predicate would arm paths the witness never exercises, and would change what
+/// `SHARED_REGION_DIRECT_DECLINE_NO_ACK` means on a boot that has no direct producer at all.
+pub fn shared_region_oracle_provisioning_armed() -> bool {
+    shared_region_direct_oracle_enabled() || xfer2_grant_witness_enabled()
+}
+
 /// Stage 198E3C2B: the AArch64 init startup-slot-5 selector for the DIRECT shared-region oracle. On
 /// AArch64 slot-5 values 1–5 are already claimed (FutexWake/FutexWait-switch/idle/yield oracles), so
 /// the shared-region oracle uses the next FREE value, 6. (x86_64 uses 2, where it is free there.)
@@ -8126,6 +8164,10 @@ struct SharedRegionProvisionScratch {
     endpoint_idx: Option<usize>,
     /// The `SEND | RECEIVE` cap minted into init's CNode.
     init_ep_cap: Option<crate::kernel::capabilities::CapId>,
+    /// U9-XFER2 §4 — the `READ | MAP` `DmaRegion` cap minted into init's CNode for the grant
+    /// witness. Minted DIRECTLY rather than delegated from `obj_src_cap`, so the step-4 cascade
+    /// does not reach it and it needs its own rollback entry.
+    init_dma_cap: Option<crate::kernel::capabilities::CapId>,
 }
 
 /// Undo a partial provisioning transaction. Idempotent and total: every present resource is
@@ -8137,9 +8179,14 @@ fn rollback_shared_region_provision(
     init_tid: u64,
     scratch: &SharedRegionProvisionScratch,
 ) {
-    // 1. init-local endpoint cap.
-    if let (Some(cap), Some(cnode)) = (scratch.init_ep_cap, kernel.task_cnode(init_tid)) {
-        let _ = kernel.revoke_capability_in_cnode(cnode, cap);
+    // 1. init-local endpoint cap, and the witness's init-local DmaRegion cap.
+    if let Some(cnode) = kernel.task_cnode(init_tid) {
+        for cap in [scratch.init_ep_cap, scratch.init_dma_cap]
+            .into_iter()
+            .flatten()
+        {
+            let _ = kernel.revoke_capability_in_cnode(cnode, cap);
+        }
     }
     // 2. endpoint root caps in task 0's CNode.
     if let Some(cnode) = kernel.task_cnode(0) {
@@ -8174,7 +8221,9 @@ pub fn provision_init_shared_region_oracle(
     kernel: &mut KernelState,
     init_tid: u64,
 ) -> Option<SharedRegionOracleCaps> {
-    if !shared_region_direct_oracle_enabled() {
+    // U9-XFER2 §4: armed by EITHER consuming cell's knob. See
+    // `shared_region_oracle_provisioning_armed` for why this is not the direct-producer predicate.
+    if !shared_region_oracle_provisioning_armed() {
         return None;
     }
     use crate::kernel::capabilities::{CapObject, CapRights, Capability};
@@ -8265,6 +8314,63 @@ pub fn provision_init_shared_region_oracle(
         }
     };
 
+    // Step 3b (U9-XFER2 §4, witness only): the SOURCE CAP THE WITNESS SENDS.
+    //
+    // NR 30's mapped delivery takes the region span off the RECEIVER-side capability, through
+    // `recv_v3_exact_region_len`, which is non-zero only for `CapObject::DmaRegion`. That is the
+    // EXISTING NR 30 ABI and both adapters apply it identically — the broad route reads the same
+    // helper — so a bare `MemoryObject` grant is not a shape NR 30 maps, on either route. (The
+    // DIRECT oracle never asks NR 30: it maps from the ENVELOPE's own descriptor, which is why a
+    // `MemoryObject` cap is the right source there and not here.)
+    //
+    // So when — and only when — the witness is armed, the SAME disposable object is additionally
+    // named by a `READ | MAP` `DmaRegion` cap over its whole two-page span, and that is what goes
+    // into startup slot 13. Rights are identical to the MemoryObject grant (no WRITE, no execute),
+    // the backing is the same two pages already filled with the pattern, and nothing about the
+    // direct oracle's provisioning changes when the knob is off.
+    let init_source_cap = if xfer2_grant_witness_enabled() {
+        let init_cnode_early = match kernel.task_cnode(init_tid) {
+            Some(c) => c,
+            None => {
+                crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=init_cnode_dma");
+                rollback_shared_region_provision(kernel, init_tid, &scratch);
+                return None;
+            }
+        };
+        match kernel.mint_capability_in_cnode(
+            init_cnode_early,
+            Capability::new(
+                CapObject::DmaRegion {
+                    id: obj_id,
+                    offset: 0,
+                    len: len as u64,
+                },
+                CapRights::READ | CapRights::MAP,
+            ),
+        ) {
+            Ok(c) => {
+                scratch.init_dma_cap = Some(c);
+                crate::yarm_log!(
+                    "SHARED_REGION_ORACLE_PROVISION_DMA obj_id={} len={} cap={}",
+                    obj_id,
+                    len,
+                    c.0
+                );
+                c
+            }
+            Err(e) => {
+                crate::yarm_log!(
+                    "SHARED_REGION_ORACLE_PROVISION_FAIL step=mint_dma err={:?}",
+                    e
+                );
+                rollback_shared_region_provision(kernel, init_tid, &scratch);
+                return None;
+            }
+        }
+    } else {
+        init_mem_cap
+    };
+
     // Step 4: create the rendezvous endpoint.
     if inject == shared_region_fault::CREATE_EP {
         crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=create_ep err=Injected");
@@ -8340,12 +8446,12 @@ pub fn provision_init_shared_region_oracle(
         init_tid,
         obj_id,
         SHARED_REGION_ORACLE_PAGES,
-        init_mem_cap.0,
+        init_source_cap.0,
         init_ep_cap.0,
         endpoint_idx
     );
     Some(SharedRegionOracleCaps {
-        mem_cap: init_mem_cap.0 as u32,
+        mem_cap: init_source_cap.0 as u32,
         endpoint_cap: init_ep_cap.0 as u32,
         endpoint_idx,
     })

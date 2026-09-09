@@ -16606,3 +16606,190 @@ positive), acquisition total 2. Raw `state_lock` 3, separately labelled.
 
 **The off-lock user-memory write owner**, which unblocks NR 30 and NR 2's user-ASID cohort
 together.
+
+## U9-XFER2 — NR 4's transaction completed; NR 30's terminal dispatch closed
+
+Reviewed candidate `b997de4`; base `b997de4`. Both families are now closed. Two statements in the
+U9-XFER1 record above are **corrected here**, one of them a claim I made about the code that was
+simply wrong.
+
+### Reachability, before and after
+
+| | at `b997de4` | after |
+|---|---|---|
+| NR 4 `TransferRelease` | total pre-lock route; reservation rebuilt after the unmap, revoke result discarded | unchanged reachability; the prepare/commit boundary is now real |
+| NR 30 `RecvSharedV3` | no split route on any architecture — **every** call reached the terminal broad dispatcher | total pre-lock route on x86_64, AArch64 and RISC-V; **no reachable broad fallback**, error paths included |
+
+### §1 — the correction: NR 30 was never blocked on a missing owner
+
+The U9-XFER1 record says an off-lock user-memory **write** owner does not exist, and that this is
+"the single thing blocking NR 30's dispatch closure". **That is false.**
+`SharedKernel::copy_to_user_split` exists in `boot/user_memory_state.rs`, is documented there as a
+rank-5/6-seam mirror of `KernelState::copy_to_user` with identical error semantics, and has live
+receive/reply callers in `runtime.rs`. `copy_from_user_split` is its read twin. Neither performs
+COW fault-in — matching `vm_image_locked::copy_to_user_locked`, the rank-local body
+`KernelState::copy_to_user` itself delegates to.
+
+Worse than the wrong conclusion was the shape of the "proof": the guards asserting the blocker
+asserted the **absence of three names I invented** (`copy_to_user_asid_split`,
+`copy_to_current_user_split`, `write_user_asid_split`). Nothing in the tree ever had those names,
+so the guards passed vacuously — a search failure dressed up as a proof. That module is deleted.
+The one property in it that was real — a `data_ptr()`-derived split seam must not run while a
+broad `&mut KernelState` is live, and NR 30's pre-lock route holds only `&SharedKernel`, so it is
+exempt — is re-derived onto the actual owner.
+
+The Stage 32B explanation attached to it is also withdrawn. NR 2 `IpcRecv`'s user-ASID cohort is
+**not** short a mechanism; its remaining cohort has not been wired, which is a different statement
+and not this package's work.
+
+### §2 — NR 4: preparation now produces what the commit consumes
+
+Four defects, each of which let a failure land on the far side of the mutation boundary:
+
+| defect at `b997de4` | consequence |
+|---|---|
+| the split adapter built a revoke reservation during preflight, **dropped it**, and rebuilt one after the range was unmapped | an allocation that could fail sat *after* the destructive work; the preflight was a rehearsal |
+| the transaction discarded the revoke's result (`let _ = ...`) | a revoke that did not land was reported as a clean release of an already-destroyed range |
+| collectors grew `Vec`s with `push` | allocation failure inside the commit, with nowhere to go |
+| `collect_user_held_descendants_split` counted the root in `queue.len()` | with a full table the walk stopped one descendant short, and the `break` only left the inner loop |
+
+`plan_transfer_release` now returns `(plan, reservation)`; `XferReleaseOwners` carries an
+associated `RevokeReservation` type that phase V produces and phase R consumes. The split
+reservation owns `Vec`s sized by `links.iter().flatten().count()` and grown with `try_reserve`, so
+`OutOfMemory` is a **pre-mutation refusal**. There is no truncation and no new 16-descendant
+restriction — the whole table is walked.
+
+**Identity across the lock release.** `CapId` is `(generation << 16) | index` and both
+`CapabilitySpace::revoke` and `delete_if_leaf` bump the slot generation, so a recycled capability
+slot cannot present the same `CapId` and root/descendant identity is self-checking.
+`delegated_capability_links` has **no per-slot generation**, so an index alone does not identify a
+link across a lock release — that is the real gap. The reservation therefore carries
+`ReservedLinkRemoval { index, link }` and the commit clears a slot only while it still holds
+*that* link, preserving a concurrent replacement and every unrelated delegation.
+
+**A real bug found by tracing the incomplete shootdown through to its reclaimers.** With an
+incomplete ACK, phase U quarantines the frame; phase R's revoke then found the pages already gone,
+computed `acked = true`, and reclaimed the object — returning the quarantined frame to the
+allocator under a possibly-live remote translation. Skipping the unmap owner's reclaim was not
+enough, because revocation frees the same backing. Phase U's verdict now travels into phase R as
+`backing_is_quarantined`, and `memory_obligations_split_gated` declines the reclaim, logging
+`XFER_REVOKE_RECLAIM_QUARANTINED`. Proven by a paired suppression/non-vacuity test.
+
+The broad adapter carries identity only, and says so explicitly: the broad route holds one
+acquisition across the whole transaction, so there is no window an owned capacity would span.
+What that does **not** claim is that a broad allocation failure became a pre-mutation refusal —
+that behaviour belongs to `collect_delegated_descendants`, which is unchanged.
+
+### §3 — NR 30: one policy, two adapters, one explicit caller ASID
+
+`recv_v3_txn` holds the policy; `recv_v3_split` and `BroadRecvV3Owners` supply the acquisitions.
+The output encoder is factored into `encode_v3_output`, so both routes emit byte-identical
+records. The caller's ASID is resolved once and passed **explicitly** to every user-memory owner:
+NR 30 wakes a sender partway through, so "current task" is not a safe question after the commit,
+and the split route has no ambient borrow to ask it of.
+
+Ownership is derived per phase rather than assumed: a successful **peek reserves nothing**. The
+message stays the sender's until `commit_peeked` — one rank-3 acquisition that re-checks the head
+is still the exact `Message` this call planned around. A lost race or a copy fault compensates
+only what this transaction owns (its mapping, its registration, its minted cap) and never settles
+a sender it did not consume; sender settlement remains exactly-once, performed only by the
+acquisition that consumed the message.
+
+**A behavioural divergence the live witness exposed.** The split adapter first routed cap
+materialization at `materialize_ordinary_cap_split`, which *refuses* a shared-region envelope
+(`pinned_object.is_some()` → `WrongObject`) because it was written for U9-C's blocked-send classes
+where the pin belongs elsewhere. NR 30's queue is not that world: `send_shared_region` enqueues an
+`OPCODE_SHARED_MEM` message whose envelope carries the `+1` MemoryObject pin, and the **broad**
+route consumes it through `take_transfer_envelope`, which drops that pin as part of the same
+decision. So the split route was raising a new refusal on the one grant shape init actually sends
+— and raising it *after* the rank-3 consume had retired the envelope, leaking its pin.
+`materialize_queued_transfer_cap_split` makes the same decision as broad, split into ascending
+non-nested acquisitions (rank 3 consume → rank 4 mint → rank 6 `sr_release_pin_split`), releasing
+the pin on **every** exit after the consume. A mint refusal is now also `note`d, like every other
+terminal exit.
+
+Blocking is unimplemented on both routes and stays that way; `timeout_ticks != 0` answers the
+`WouldBlock` the broad handler already answered. All three ingress lists admit NR 30, and after
+the NR gate `try_split_recv_shared_v3_into_frame` is **total**: it answers `None` only when the
+syscall is not NR 30 at all.
+
+### §4 — the end-to-end grant witness, and two corrections to the U9-XFER1 record
+
+`scripts/qemu-xfer2-grant-witness-smoke.sh <arch>` boots one `-smp 1` QEMU per port with
+`yarm.xfer2_grant_witness=1` and runs init cell selector 12 over **disposable authority** — the
+two-page object and endpoint `provision_init_shared_region_oracle` mints, nothing the system
+depends on. Per grant it checks metadata, read-only rights, every byte of **both** pages
+independently, the NR 4 release, that the window is really unmapped (a fresh anonymous mapping
+over it succeeds), and that the capability is really revoked (a duplicate release is refused).
+Grant A uses the registered-range shape, grant B the explicit-range shape, over **separate**
+grants so neither can be satisfied by state the other left behind. An endpoint probe afterwards
+proves init's essential capabilities survive.
+
+**Correction 1 — "NR 4's SUCCESS path is not witnessed, for a structural reason": withdrawn.**
+The U9-XFER1 record said succeeding means revoking a capability and "every capability the init
+server holds is one it needs to keep running". That was not a structural reason, it was a missing
+fixture. The shared-region direct oracle was *already* witnessing NR 4 success live on all three
+ports (`first_release=ok second_release=rejected`), and this package's witness now does it twice
+per boot over authority provisioned for the purpose.
+
+**Correction 2 — "NR 4's explicit `(base, len)` shape" was MISSING EVIDENCE, not missing
+routing.** The source implements that shape and always did; the U9-XFER1 record listed it under
+"Deferred" without distinguishing the two. Grant B exercises it live on all three ports.
+
+Two implementation notes the live runs forced, both recorded because each produced a *silently*
+wrong result first:
+
+* The witness knob has to arm the shared **provisioning**, not the direct-producer predicate. The
+  first run parsed the knob and set the flag, but `provision_init_shared_region_oracle` returned
+  early on `shared_region_direct_oracle_enabled()`, so slots 5/13/14 were never written and the
+  boot came up clean with no cell in it. `shared_region_oracle_provisioning_armed()` is the
+  predicate the provisioning and the three arming sites now use;
+  `shared_region_direct_oracle_enabled()` is deliberately *not* widened, because NR 30 is
+  non-blocking and its grant never reaches a blocked waiter.
+* NR 30's mapped delivery takes the region span from `recv_v3_exact_region_len`, non-zero only for
+  `CapObject::DmaRegion`. That is the existing NR 30 ABI and **both** adapters apply it, so a bare
+  `MemoryObject` grant is not a shape NR 30 maps on either route. Under the witness knob only, the
+  provisioning additionally mints a `READ | MAP` `DmaRegion` cap over the same two pages — same
+  rights, same backing — and tracks it in the rollback scratch, since a directly-minted cap is not
+  reached by the source cap's delegation cascade.
+
+Live result, identical on all three ports:
+
+```
+XFER2_GRANT_WITNESS shape=registered_range meta=1 perm=1 page0=1 page1=1 release=1 unmapped=1 revoked=1 result=1
+XFER2_GRANT_WITNESS shape=explicit_range    meta=1 perm=1 page0=1 page1=1 release=1 unmapped=1 revoked=1 result=1
+XFER2_GRANT_WITNESS_DONE grant_a=1 grant_b=1 caps_intact=1 result=ok
+RECV_V3_LIVE_MAPPED route=split   (×2)
+XFER_RELEASE_OK route=split pages=2 len=8192   (×2)
+```
+
+### Coverage
+
+`u9xfer2_reservation_cases` (5) drives the production revoke pair over a concurrently retired
+root, a **completely populated** delegation table, a recycled link slot, and both shootdown
+verdicts. `u9xfer2_transaction_cases` (8) drives both shipped transactions through stub owners
+over a failed reservation, a range that changed under the caller, an incomplete shootdown, a
+concurrently retired capability, a lost commit race, a failed registration and a writeback failure
+after the commit — checking the mutation *order*, not only the outcome.
+`u9xfer2_grant_witness_wiring` (5) protects the wiring the live cell depends on, including the two
+silent-disarm modes above.
+
+Displaced guards re-derived onto their new owners: `r25_selector_is_free_and_actually_written` (the
+RISC-V shared-region selector is now an else-branch expression, not a terminated statement),
+`b04_no_private_tables_or_hand_computed_offsets` (anchored on the `ipc_reply_timeout_oracle`
+module rather than on the first `armed` helper in the file), and the AArch64/RISC-V
+feature-and-selector guards (the arming sites key on the arch-neutral provisioning predicate).
+
+### Census
+
+**CENSUS-DELTA: 0.**
+
+### Deferred
+
+* **NR 30 blocking** (`timeout_ticks != 0` → `WouldBlock`). Unimplemented since Stage 42+43; a new
+  capability, not a closure.
+* **NR 4's explicit `(base, len)` shape** releases an arbitrary caller-named range in the caller's
+  own address space without checking it belongs to the named transfer. Preserved verbatim;
+  narrowing it would be a new refusal. Now **witnessed** — this line is a semantics note, not an
+  evidence gap.
+* **NR 2 `IpcRecv`'s user-ASID cohort** — not blocked on a mechanism (see §1); simply not wired.

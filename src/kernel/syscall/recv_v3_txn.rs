@@ -217,7 +217,16 @@ pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(
     // M — mint the transferred capability from the PEEKED descriptor. Owned from here.
     let has_transfer = crate::kernel::recv_core::extract_cap_transfer_plan(&msg).is_some();
     let materialized_cap: Option<u64> = if has_transfer {
-        owners.materialize_cap(endpoint, sender_tid_raw, &msg)?
+        // A mint refusal is a terminal exit like any other, so it is NOTED like any other.
+        // Nothing is compensated here: the peek consumed nothing, so the message is still the
+        // sender's, and the mint owner has already settled whatever it consumed of the envelope.
+        match owners.materialize_cap(endpoint, sender_tid_raw, &msg) {
+            Ok(v) => v,
+            Err(e) => {
+                owners.note(V3TxnEvent::Refused);
+                return Err(e);
+            }
+        }
     } else {
         None
     };

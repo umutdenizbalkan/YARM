@@ -72493,7 +72493,20 @@ mod stage198e3c2b_aarch64_direct {
         assert!(pred.contains("x86_shared_region_direct_oracle_enabled()"));
         assert!(pred.contains("aarch64_shared_region_direct_oracle_enabled()"));
         assert!(BOOT_SRC.contains("#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]"));
-        assert!(BOOT_SRC.contains("aarch64_shared_region_direct_oracle_enabled()"));
+        // U9-XFER2 §4: the AArch64 arming site now keys on the arch-neutral PROVISIONING predicate,
+        // because two cells consume the same provisioning. The AArch64 knob still reaches it — the
+        // provisioning predicate ORs the direct predicate asserted above with the witness knob — so
+        // the property re-anchors onto that route rather than onto the per-arch name.
+        assert!(
+            BOOT_SRC.contains("crate::kernel::boot::shared_region_oracle_provisioning_armed()")
+        );
+        let prov = MOD_SRC
+            .split_once("pub fn shared_region_oracle_provisioning_armed() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("provisioning-armed predicate present");
+        assert!(prov.contains("shared_region_direct_oracle_enabled()"));
+        assert!(prov.contains("xfer2_grant_witness_enabled()"));
     }
 
     // (3) The AArch64 boot provisioning slot contract: selector 6, source cap + endpoint cap in slots
@@ -72686,7 +72699,18 @@ mod stage198e3c2c_riscv_direct {
             .expect("shared enabled predicate present");
         assert!(pred.contains("riscv_shared_region_direct_oracle_enabled()"));
         assert!(BOOT_SRC.contains("#[cfg(feature = \"riscv-shared-region-direct-oracle\")]"));
-        assert!(BOOT_SRC.contains("riscv_shared_region_direct_oracle_enabled()"));
+        // U9-XFER2 §4 — same re-anchoring as AArch64: the arming site keys on the arch-neutral
+        // provisioning predicate, which ORs the per-arch direct predicate with the witness knob.
+        assert!(
+            BOOT_SRC.contains("crate::kernel::boot::shared_region_oracle_provisioning_armed()")
+        );
+        let prov = MOD_SRC
+            .split_once("pub fn shared_region_oracle_provisioning_armed() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("provisioning-armed predicate present");
+        assert!(prov.contains("shared_region_direct_oracle_enabled()"));
+        assert!(prov.contains("xfer2_grant_witness_enabled()"));
     }
 
     // (3) The RISC-V boot provisioning slot contract: selector 7, source cap + endpoint cap in slots
@@ -103075,11 +103099,18 @@ mod stage200d0d1_riscv_exit_prep {
     #[test]
     fn r25_selector_is_free_and_actually_written() {
         // Free: the RISC-V slot-5 namespace occupies 1..=10 and nothing writes 22.
-        assert!(
-            RV_BOOT_SRC.contains(
-                "init_args[5] = crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR;"
-            )
-        );
+        //
+        // U9-XFER2 §4 displaced the statement form: the shared-region arming site now assigns the
+        // result of a two-way choice (selector 7 for the DIRECT oracle, 12 for the grant witness),
+        // so the constant appears as an else-branch EXPRESSION rather than as a terminated
+        // statement. The property is unchanged — the shared-region selector reaches slot 5 by its
+        // NAME, never as a literal — so the guard is re-anchored on the assignment as a whole.
+        let sr_arm = RV_BOOT_SRC
+            .split("init_args[5] = ")
+            .find(|tail| tail.starts_with("if crate::kernel::boot::xfer2_grant_witness_enabled()"))
+            .expect("the RISC-V shared-region slot-5 arming site");
+        assert!(sr_arm.contains("crate::kernel::boot::XFER2_GRANT_WITNESS_SELECTOR"));
+        assert!(sr_arm.contains("crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR"));
         assert!(MOD_SRC.contains("pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"));
         assert!(MOD_SRC.contains("pub const RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 8;"));
         assert!(
@@ -103722,7 +103753,16 @@ mod stage200d2b1_liveness_abi {
         }
         assert_eq!(dispatch_sites, 3);
         // The shared `armed` helper decodes; it does not enumerate.
-        let armed = INIT_SRC
+        //
+        // Anchored on the OWNING MODULE, not on the first `armed` in the file: several unrelated
+        // cells (the two exit-current-task oracles, and U9-XFER2 §4's grant witness) define their
+        // own single-selector `armed`, and this guard is about the reply-liveness decoder alone —
+        // taking "the first one" made it silently move to whichever cell was declared earliest.
+        let reply_oracle = INIT_SRC
+            .split("mod ipc_reply_timeout_oracle {")
+            .nth(1)
+            .expect("ipc_reply_timeout_oracle module");
+        let armed = reply_oracle
             .split("pub(super) fn armed(slot5: Option<u32>) -> bool {")
             .nth(1)
             .expect("armed helper");
@@ -172249,5 +172289,621 @@ mod u9xfer2_reservation_cases {
             .expect("spawn")
             .join()
             .expect("join");
+    }
+}
+
+/// U9-XFER2 §4 — structural guards for the END-TO-END GRANT WITNESS.
+///
+/// The witness itself is a LIVE cell: it runs in QEMU on all three ports under
+/// `scripts/qemu-xfer2-grant-witness-smoke.sh`, and what it proves — NR 30 receives and maps a
+/// disposable grant with correct metadata, rights and backing, NR 4 releases it through both
+/// request shapes, the mapping is really gone and the capability really revoked, and init's
+/// essential capabilities survive — is proven by that boot, not here.
+///
+/// These guards protect the WIRING that boot depends on, so a silent disarm (the failure mode
+/// that made the first three attempts at this witness produce an all-green log with no cell in
+/// it) is caught hosted rather than by reading a QEMU transcript.
+#[cfg(test)]
+mod u9xfer2_grant_witness_wiring {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const X86_BOOT: &str = include_str!("../../arch/x86_64/boot.rs");
+    const A64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    /// The knob reaches the flag, and the flag reaches PROVISIONING.
+    ///
+    /// This is the exact defect the first live run hit: the boot parsed `yarm.xfer2_grant_witness=1`
+    /// and set the flag, but `provision_init_shared_region_oracle` returned early on the DIRECT
+    /// predicate, so slots 5/13/14 were never written and the cell never ran — a clean boot with
+    /// no witness in it.
+    #[test]
+    fn the_witness_knob_arms_the_shared_provisioning() {
+        assert!(CMDLINE_SRC.contains("yarm.xfer2_grant_witness"));
+        assert!(CMDLINE_SRC.contains("set_xfer2_grant_witness_enabled"));
+        assert!(MOD_SRC.contains("pub fn shared_region_oracle_provisioning_armed() -> bool {"));
+        let prov = MOD_SRC
+            .split_once("pub fn shared_region_oracle_provisioning_armed() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("provisioning-armed predicate");
+        assert!(prov.contains("shared_region_direct_oracle_enabled()"));
+        assert!(prov.contains("xfer2_grant_witness_enabled()"));
+        // And the provisioning's own early return is the one that consults it.
+        let body = MOD_SRC
+            .split_once("pub fn provision_init_shared_region_oracle(")
+            .map(|(_, r)| r)
+            .expect("provisioning owner");
+        let head = &body[..body.len().min(1200)];
+        assert!(
+            head.contains("if !shared_region_oracle_provisioning_armed() {"),
+            "the provisioning must admit the witness knob, not only the direct predicate"
+        );
+    }
+
+    /// The witness does NOT widen the DIRECT producer.
+    ///
+    /// NR 30 is non-blocking, so the witness's grant travels the ENQUEUE path and never reaches a
+    /// blocked waiter. Folding the witness knob into `shared_region_direct_oracle_enabled` would
+    /// have armed the authoritative ack gate, its consume, and the blocked-recv ack publication on
+    /// a boot with no direct producer at all.
+    #[test]
+    fn the_witness_knob_does_not_arm_the_direct_producer() {
+        let pred = MOD_SRC
+            .split_once("pub fn shared_region_direct_oracle_enabled() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("direct predicate");
+        assert!(
+            !pred.contains("xfer2_grant_witness"),
+            "the direct-producer predicate must stay keyed on the three per-arch oracle knobs"
+        );
+    }
+
+    /// Slot 5 is mutually exclusive, and the witness takes a value nothing else claims.
+    #[test]
+    fn the_witness_selector_is_free_and_named_on_every_port() {
+        assert!(MOD_SRC.contains("pub const XFER2_GRANT_WITNESS_SELECTOR: u64 = 12;"));
+        // 12 is claimed by no other slot-5 selector constant.
+        for taken in [
+            "SHARED_REGION_ORACLE_SELECTOR: u64 = 12",
+            "AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 12",
+            "RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 12",
+            "RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 12",
+        ] {
+            assert!(!MOD_SRC.contains(taken), "selector 12 collides: {taken}");
+        }
+        // Every port arms it by NAME, never as a literal, and only when the knob is set.
+        for (arch, src) in [("x86", X86_BOOT), ("aarch64", A64_BOOT), ("riscv", RV_BOOT)] {
+            let arm = src
+                .split("init_args[5] = ")
+                .find(|t| t.starts_with("if crate::kernel::boot::xfer2_grant_witness_enabled()"))
+                .unwrap_or_else(|| panic!("{arch} witness arming site"));
+            assert!(
+                arm.contains("crate::kernel::boot::XFER2_GRANT_WITNESS_SELECTOR"),
+                "{arch} must name the selector constant"
+            );
+            assert!(
+                !src.contains("init_args[5] = 12"),
+                "{arch} must not hand-write the selector"
+            );
+        }
+    }
+
+    /// The witness's source cap is a `DmaRegion`, and only under the witness knob.
+    ///
+    /// NR 30's mapped delivery takes the region span from `recv_v3_exact_region_len`, which is
+    /// non-zero only for `CapObject::DmaRegion` — the existing NR 30 ABI, applied identically by
+    /// both adapters. A bare `MemoryObject` grant is therefore not a shape NR 30 maps, which is
+    /// what the second live run showed (`region_len=0` → the mapping plan refused). The DIRECT
+    /// oracle keeps its `MemoryObject` cap because it maps from the envelope's own descriptor.
+    #[test]
+    fn the_witness_source_cap_is_a_dma_region_and_is_rolled_back() {
+        assert!(MOD_SRC.contains("let init_source_cap = if xfer2_grant_witness_enabled() {"));
+        assert!(MOD_SRC.contains("mem_cap: init_source_cap.0 as u32,"));
+        let step = MOD_SRC
+            .split_once("let init_source_cap = if xfer2_grant_witness_enabled() {")
+            .map(|(_, r)| r)
+            .expect("witness source-cap step");
+        let step = &step[..step.len().min(1600)];
+        assert!(step.contains("CapObject::DmaRegion {"));
+        assert!(
+            step.contains("CapRights::READ | CapRights::MAP"),
+            "the witness cap must carry the same rights as the MemoryObject grant — no WRITE"
+        );
+        assert!(step.contains("scratch.init_dma_cap = Some(c);"));
+        // Minted directly, so the step-4 delegation cascade does not reach it: the rollback must
+        // revoke it explicitly or the provisioning leaks a cap on a later-step failure.
+        assert!(MOD_SRC.contains("scratch.init_dma_cap"));
+        let rb = MOD_SRC
+            .split_once("fn rollback_shared_region_provision(")
+            .map(|(_, r)| r)
+            .expect("rollback owner");
+        let rb = &rb[..rb.len().min(1200)];
+        assert!(
+            rb.contains("scratch.init_dma_cap"),
+            "the rollback must reclaim the witness's directly-minted cap"
+        );
+    }
+
+    /// The cell covers BOTH of NR 4's request shapes, over SEPARATE grants, and checks the
+    /// properties §4 names: metadata, rights, backing, release, unmap, revocation, and that the
+    /// essential capabilities survive.
+    #[test]
+    fn the_cell_covers_both_release_shapes_and_the_named_properties() {
+        let cell = INIT_SRC
+            .split_once("pub(super) mod xfer2_grant_witness {")
+            .map(|(_, r)| r)
+            .expect("witness cell");
+        assert!(cell.contains("matches!(slot5, Some(12))"));
+        // Two release SHAPES, selected by the caller, not by leftover state.
+        assert!(cell.contains("release_shared_region_range("));
+        assert!(cell.contains("release_shared_region_mapping("));
+        // Two SEPARATE grants, one per shape.
+        assert!(cell.contains("one_grant(mem_cap, ep_cap, false, \"A\")"));
+        assert!(cell.contains("one_grant(mem_cap, ep_cap, true, \"B\")"));
+        // Every named property is computed, and the verdict is their conjunction.
+        for prop in [
+            "let meta_ok",
+            "let perm_ok",
+            "let release_ok",
+            "let unmapped_ok",
+            "let revoked_ok",
+        ] {
+            assert!(cell.contains(prop), "the cell must check {prop}");
+        }
+        assert!(
+            cell.contains(
+                "meta_ok && perm_ok && p0 && p1 && release_ok && unmapped_ok && revoked_ok"
+            )
+        );
+        assert!(cell.contains("caps_intact"));
+        // The verdict line must be SHORT: `debug_log` truncates at 192 bytes, and the first live
+        // run lost `unmapped`/`revoked`/`result` off the end of a single combined line.
+        let verdict = cell
+            .split_once("\"XFER2_GRANT_WITNESS shape=")
+            .map(|(_, r)| r)
+            .expect("verdict line");
+        let verdict = verdict.split_once('"').map(|(l, _)| l).expect("line end");
+        // Worst case: `shape=registered_range` and every flag `1`, plus the `USER_LOG tid=N msg=`
+        // prefix the kernel adds. Budget against the emitter's own cap.
+        let widest =
+            verdict.replace("{}", "1").len() + "XFER2_GRANT_WITNESS shape=registered_range".len();
+        assert!(
+            widest < 192,
+            "the verdict line must fit debug_log's 192-byte cap (widest {widest})"
+        );
+    }
+}
+
+/// U9-XFER2 §5 — the two transactions driven directly, through STUB OWNERS, over the cases the
+/// live witness cannot force: a reservation that fails, a mapping that changed under the caller,
+/// a shootdown that did not complete, and a metadata writeback that fails after the commit.
+///
+/// Both policies are generic over their owner traits, so this drives EXACTLY the shipped
+/// transaction — the stubs replace only the acquisitions, never a decision.
+#[cfg(test)]
+mod u9xfer2_transaction_cases {
+    use crate::kernel::capabilities::{CNodeId, CapId, CapObject};
+    use crate::kernel::ipc::{Message, ThreadId};
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::recv_v3_txn::{
+        PeekedHead, RecvV3Owners, V3CommitOutcome, V3Delivery, V3ObjectMeta, V3TxnEvent,
+        run_recv_v3_transaction,
+    };
+    use crate::kernel::syscall::xfer_txn::{
+        XferRefusal, XferReleaseOwners, XferRevokeOutcome, XferTxnEvent,
+        run_transfer_release_transaction,
+    };
+    use crate::kernel::vm::{Asid, PAGE_SIZE, PhysAddr, VirtAddr};
+
+    // ── NR 4 ──────────────────────────────────────────────────────────────────────────────────
+    #[derive(Default)]
+    struct XferStub {
+        registered: Option<(VirtAddr, usize)>,
+        mapped_pages: alloc::vec::Vec<u64>,
+        reserve_ok: bool,
+        shootdown_complete: bool,
+        revoke: Option<XferRevokeOutcome>,
+        /// Every mutation, in order, so a refusal that claims to be pre-mutation can be checked
+        /// rather than trusted.
+        log: alloc::vec::Vec<&'static str>,
+        events: alloc::vec::Vec<XferTxnEvent>,
+        quarantine_seen: Option<bool>,
+    }
+
+    impl XferReleaseOwners for XferStub {
+        type RevokeReservation = CapId;
+
+        fn caller_with_user_asid(&mut self) -> Option<(ThreadId, Asid)> {
+            Some((ThreadId(7), Asid(3)))
+        }
+        fn registered_range(&mut self, _owner: ThreadId, _cap: CapId) -> Option<(VirtAddr, usize)> {
+            self.registered
+        }
+        fn caller_cnode(&mut self) -> Option<CNodeId> {
+            Some(CNodeId(1))
+        }
+        fn page_is_mapped(&mut self, _asid: Asid, virt: VirtAddr) -> bool {
+            self.mapped_pages.contains(&virt.0)
+        }
+        fn reserve_capability_release(
+            &mut self,
+            _cnode: CNodeId,
+            cap: CapId,
+        ) -> Option<Self::RevokeReservation> {
+            self.reserve_ok.then_some(cap)
+        }
+        fn unmap_whole_range(&mut self, _asid: Asid, _base: usize, _map_len: usize) -> bool {
+            self.log.push("unmap");
+            self.shootdown_complete
+        }
+        fn revoke_reserved_capability(
+            &mut self,
+            _reservation: Self::RevokeReservation,
+            backing_is_quarantined: bool,
+        ) -> XferRevokeOutcome {
+            self.log.push("revoke");
+            self.quarantine_seen = Some(backing_is_quarantined);
+            self.revoke.unwrap_or(XferRevokeOutcome::Revoked)
+        }
+        fn remove_registration(&mut self, _owner: ThreadId, _cap: CapId) -> bool {
+            self.log.push("unregister");
+            true
+        }
+        fn account_release(&mut self, _map_len: usize) {
+            self.log.push("account");
+        }
+        fn note(&mut self, event: XferTxnEvent) {
+            self.events.push(event);
+        }
+    }
+
+    fn two_page_stub() -> XferStub {
+        XferStub {
+            registered: Some((VirtAddr(0x4000_0000), 2 * PAGE_SIZE)),
+            mapped_pages: alloc::vec![0x4000_0000, 0x4000_0000 + PAGE_SIZE as u64],
+            reserve_ok: true,
+            shootdown_complete: true,
+            ..Default::default()
+        }
+    }
+
+    /// §2: a reservation that cannot be established is a PRE-MUTATION refusal. It must not be
+    /// discovered after the range is gone, and it must not be reported as a successful release.
+    #[test]
+    fn a_failed_reservation_refuses_before_anything_is_destroyed() {
+        let mut owners = XferStub {
+            reserve_ok: false,
+            ..two_page_stub()
+        };
+        let got = run_transfer_release_transaction(&mut owners, CapId(0x1_0002), 0, 0);
+        assert!(got.is_err(), "an unreservable closure must refuse");
+        assert!(
+            owners.log.is_empty(),
+            "nothing may be mutated before the reservation succeeds, got {:?}",
+            owners.log
+        );
+        assert_eq!(
+            owners.events,
+            alloc::vec![XferTxnEvent::Refused {
+                reason: XferRefusal::CapabilityUnresolvable
+            }]
+        );
+    }
+
+    /// §2: the mapping changed between the caller's last look and this call — one page of the
+    /// registered range is no longer mapped. The broad handler discovered this mid-unmap, with the
+    /// prefix already destroyed; the transaction refuses from reads only.
+    #[test]
+    fn a_range_that_changed_under_the_caller_refuses_from_reads_only() {
+        let mut owners = XferStub {
+            // The second page went away since it was registered.
+            mapped_pages: alloc::vec![0x4000_0000],
+            ..two_page_stub()
+        };
+        let got = run_transfer_release_transaction(&mut owners, CapId(0x1_0002), 0, 0);
+        assert!(got.is_err());
+        assert!(owners.log.is_empty(), "got {:?}", owners.log);
+        assert_eq!(
+            owners.events,
+            alloc::vec![XferTxnEvent::Refused {
+                reason: XferRefusal::RangeNotFullyMapped
+            }]
+        );
+    }
+
+    /// §2: a shootdown that did not complete must (a) reach the revoke as a QUARANTINE verdict, so
+    /// the revoke's own reclaimer does not free a frame whose translation was never retired, and
+    /// (b) be REPORTED, not folded into a clean release.
+    #[test]
+    fn an_incomplete_shootdown_quarantines_the_backing_and_is_reported() {
+        let mut owners = XferStub {
+            shootdown_complete: false,
+            ..two_page_stub()
+        };
+        let got = run_transfer_release_transaction(&mut owners, CapId(0x1_0002), 0, 0);
+        assert_eq!(got.ok(), Some(2 * PAGE_SIZE), "the release still commits");
+        assert_eq!(owners.quarantine_seen, Some(true));
+        assert_eq!(
+            owners.log,
+            alloc::vec!["unmap", "revoke", "unregister", "account"],
+            "the commit order is unmap → revoke → unregister → account"
+        );
+        assert_eq!(
+            owners.events,
+            alloc::vec![XferTxnEvent::ReleasedWithIncompleteShootdown {
+                pages: 2,
+                map_len: 2 * PAGE_SIZE
+            }]
+        );
+    }
+
+    /// §2: a capability someone else retired between the reservation and the commit is reported as
+    /// such, rather than claimed as this call's revocation.
+    #[test]
+    fn a_concurrently_retired_capability_is_reported_not_claimed() {
+        let mut owners = XferStub {
+            revoke: Some(XferRevokeOutcome::AlreadyRetired),
+            ..two_page_stub()
+        };
+        let got = run_transfer_release_transaction(&mut owners, CapId(0x1_0002), 0, 0);
+        assert_eq!(got.ok(), Some(2 * PAGE_SIZE));
+        assert_eq!(owners.quarantine_seen, Some(false));
+        assert_eq!(
+            owners.events,
+            alloc::vec![XferTxnEvent::ReleasedAfterConcurrentRevoke {
+                pages: 2,
+                map_len: 2 * PAGE_SIZE
+            }]
+        );
+    }
+
+    // ── NR 30 ─────────────────────────────────────────────────────────────────────────────────
+    struct V3Stub {
+        head: Option<Message>,
+        commit: V3CommitOutcome,
+        writes_ok: bool,
+        map_ok: bool,
+        register_ok: bool,
+        log: alloc::vec::Vec<&'static str>,
+        events: alloc::vec::Vec<V3TxnEvent>,
+    }
+
+    impl Default for V3Stub {
+        fn default() -> Self {
+            Self {
+                head: None,
+                commit: V3CommitOutcome::Consumed { wake: None },
+                writes_ok: true,
+                map_ok: true,
+                register_ok: true,
+                log: alloc::vec::Vec::new(),
+                events: alloc::vec::Vec::new(),
+            }
+        }
+    }
+
+    const STUB_ENDPOINT: CapObject = CapObject::Endpoint {
+        index: 4,
+        generation: 1,
+    };
+
+    impl RecvV3Owners for V3Stub {
+        fn caller_tid(&mut self) -> u64 {
+            9
+        }
+        fn caller_asid(&mut self) -> Option<Asid> {
+            Some(Asid(3))
+        }
+        fn read_user(&mut self, _asid: Asid, _ptr: usize, _len: usize) -> Option<[u8; 80]> {
+            Some([0u8; 80])
+        }
+        fn write_user(&mut self, _asid: Asid, _ptr: usize, _bytes: &[u8]) -> bool {
+            self.log.push("write");
+            self.writes_ok
+        }
+        fn resolve_recv_endpoint(&mut self, _cap: CapId) -> Result<CapObject, SyscallError> {
+            Ok(STUB_ENDPOINT)
+        }
+        fn endpoint_index(&mut self, _endpoint: CapObject) -> Result<usize, SyscallError> {
+            Ok(4)
+        }
+        fn peek_head(&mut self, _idx: usize) -> Result<Option<Message>, SyscallError> {
+            Ok(self.head)
+        }
+        fn materialize_cap(
+            &mut self,
+            _endpoint: CapObject,
+            _sender_tid: u64,
+            _msg: &Message,
+        ) -> Result<Option<u64>, SyscallError> {
+            self.log.push("mint");
+            Ok(Some(0x1_0005))
+        }
+        fn object_meta(&mut self, _cap: CapId) -> V3ObjectMeta {
+            V3ObjectMeta {
+                kind: 5,
+                generation: 1,
+                // READ | MAP, matching what the live witness's grant carries.
+                effective_rights: 0b101,
+                exact_object_size: 0,
+                exact_region_len: 2 * PAGE_SIZE as u64,
+            }
+        }
+        fn region_phys_start(&mut self, _cap: CapId) -> Option<PhysAddr> {
+            Some(PhysAddr(0x10_0000))
+        }
+        fn map_page(
+            &mut self,
+            _asid: Asid,
+            _virt: VirtAddr,
+            _phys: PhysAddr,
+            _writable: bool,
+        ) -> bool {
+            self.log.push("map");
+            self.map_ok
+        }
+        fn unmap_range(&mut self, _asid: Asid, _base: usize, _len: usize) {
+            self.log.push("unmap");
+        }
+        fn register_transfer(&mut self, _cap: CapId, _base: VirtAddr, _len: usize) -> bool {
+            self.log.push("register");
+            self.register_ok
+        }
+        fn remove_transfer(&mut self, _cap: CapId) -> bool {
+            self.log.push("unregister");
+            true
+        }
+        fn commit_peeked(&mut self, _head: &PeekedHead) -> V3CommitOutcome {
+            self.log.push("commit");
+            self.commit
+        }
+        fn settle_sender(&mut self, _wake: crate::kernel::ipc::SenderWakeTarget) {
+            self.log.push("settle");
+        }
+        fn rollback_cap(&mut self, _cap: CapId, _is_reply: bool) {
+            self.log.push("rollback_cap");
+        }
+        fn note(&mut self, event: V3TxnEvent) {
+            self.events.push(event);
+        }
+    }
+
+    fn mapped_grant_message() -> Message {
+        Message::with_header(
+            1,
+            crate::kernel::recv_core::recv_shared_v3::OPCODE_SHARED_MEM_VALUE,
+            Message::FLAG_CAP_TRANSFER,
+            Some(0x2_0001),
+            &[0u8; 16],
+        )
+        .expect("message")
+    }
+
+    fn mapped_request() -> crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request {
+        crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request {
+            version: crate::kernel::recv_core::recv_shared_v3::V3_VERSION,
+            record_len: crate::kernel::recv_core::recv_shared_v3::V3_MIN_REQUEST_LEN,
+            endpoint_cap: 0x1_0001,
+            payload_ptr: 0x4000_0000,
+            payload_len: 2 * PAGE_SIZE as u64,
+            metadata_ptr: 0x5000_0000,
+            metadata_len: 128,
+            map_intent: crate::kernel::recv_core::recv_shared_v3::MAP_READ,
+            flags: 0,
+            timeout_ticks: 0,
+            reserved: [0; 2],
+        }
+    }
+
+    /// §3: the happy mapped path, so the failure cases below are contrasted against a real
+    /// success rather than against nothing.
+    #[test]
+    fn a_mapped_grant_is_delivered_and_registered_before_the_commit() {
+        let mut owners = V3Stub {
+            head: Some(mapped_grant_message()),
+            ..Default::default()
+        };
+        let got = run_recv_v3_transaction(&mut owners, &mapped_request());
+        assert!(matches!(got, Ok(V3Delivery::Mapped { .. })), "{got:?}");
+        assert_eq!(
+            owners.log,
+            alloc::vec!["mint", "map", "map", "register", "commit", "write"],
+            "everything that can fail happens while the message is still the sender's"
+        );
+        assert!(matches!(
+            owners.events.as_slice(),
+            [V3TxnEvent::DeliveredMapped { .. }]
+        ));
+    }
+
+    /// §3: the head changed between the peek and the commit. NOTHING is consumed, and exactly the
+    /// resources this transaction owns — its mapping, its registration, its minted cap — are
+    /// compensated. The sender is never settled.
+    #[test]
+    fn a_lost_commit_race_compensates_only_what_this_transaction_owns() {
+        let mut owners = V3Stub {
+            head: Some(mapped_grant_message()),
+            commit: V3CommitOutcome::LostRace,
+            ..Default::default()
+        };
+        let got = run_recv_v3_transaction(&mut owners, &mapped_request());
+        assert_eq!(got.err(), Some(SyscallError::WouldBlock));
+        assert_eq!(
+            owners.log,
+            alloc::vec![
+                "mint",
+                "map",
+                "map",
+                "register",
+                "commit",
+                "unmap",
+                "unregister",
+                "rollback_cap"
+            ]
+        );
+        assert!(
+            !owners.log.contains(&"settle"),
+            "a lost race must not settle the sender"
+        );
+        assert_eq!(owners.events, alloc::vec![V3TxnEvent::LostRace]);
+    }
+
+    /// §3: the writeback fails AFTER the commit. The caller never receives the cleanup token, so
+    /// it can never call NR 4 for this region — everything still owned is compensated, and the
+    /// outcome is reported rather than returned as a success.
+    #[test]
+    fn a_writeback_failure_after_the_commit_compensates_and_is_reported() {
+        let mut owners = V3Stub {
+            head: Some(mapped_grant_message()),
+            writes_ok: false,
+            ..Default::default()
+        };
+        let got = run_recv_v3_transaction(&mut owners, &mapped_request());
+        assert!(got.is_err(), "a lost cleanup token is not a success");
+        assert_eq!(
+            owners.log,
+            alloc::vec![
+                "mint",
+                "map",
+                "map",
+                "register",
+                "commit",
+                "write",
+                "unmap",
+                "unregister",
+                "rollback_cap"
+            ]
+        );
+        assert_eq!(
+            owners.events,
+            alloc::vec![V3TxnEvent::WritebackFailedAfterCommit]
+        );
+    }
+
+    /// §3: a registration that cannot be recorded undoes the EXACT mapping this transaction
+    /// installed, and undoes the mint — before the commit, so the message is still the sender's.
+    #[test]
+    fn a_failed_registration_undoes_the_mapping_and_the_mint_before_the_commit() {
+        let mut owners = V3Stub {
+            head: Some(mapped_grant_message()),
+            register_ok: false,
+            ..Default::default()
+        };
+        let got = run_recv_v3_transaction(&mut owners, &mapped_request());
+        assert!(got.is_err());
+        assert_eq!(
+            owners.log,
+            alloc::vec!["mint", "map", "map", "register", "unmap", "rollback_cap"]
+        );
+        assert!(
+            !owners.log.contains(&"commit"),
+            "nothing may be consumed after a pre-commit refusal"
+        );
+        assert_eq!(owners.events, alloc::vec![V3TxnEvent::Refused]);
     }
 }

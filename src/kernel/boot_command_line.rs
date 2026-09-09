@@ -366,6 +366,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_x86_futex_wake_oracle_enabled(enabled);
         crate::yarm_log!("YARM_X86_64_FUTEX_WAKE_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.xfer2_grant_witness {
+        // U9-XFER2 §4: arm the NR 30 + NR 4 grant witness. Default off, so an ordinary boot is
+        // unchanged.
+        crate::kernel::boot::set_xfer2_grant_witness_enabled(enabled);
+        crate::yarm_log!("YARM_XFER2_GRANT_WITNESS_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.x86_64_shared_region_direct_oracle {
         // Stage 198E3C1: default-off x86_64 DIRECT shared-region (`IpcSendSharedRegionDirect`)
         // live-oracle knob. Provisions init startup slot 5 (=2) so init runs the parent/child
@@ -821,6 +827,11 @@ pub struct YarmBootOptions<'a> {
     /// direct producer is live for the run. Selects the workload + enables exactly one x86_64
     /// shared-region class; the queued class and all non-x86 architectures stay disabled.
     pub x86_64_shared_region_direct_oracle: Option<bool>,
+    /// U9-XFER2 §4: `yarm.xfer2_grant_witness=1` DEFAULT-OFF knob. Arms init startup slot 5 (=12)
+    /// so init runs the NR 30 + NR 4 end-to-end grant witness over the SAME disposable authority
+    /// the shared-region oracle provisions. Architecture-neutral: the whole cell is the same
+    /// syscalls on all three ports.
+    pub xfer2_grant_witness: Option<bool>,
     /// Stage 198E3C2B: `yarm.aarch64_shared_region_direct_oracle=1` DEFAULT-OFF knob. Provisions init
     /// startup slot 5 (=6) so init runs the SAME arch-neutral DIRECT shared-region delivery proof on
     /// AArch64, and arms the shared IPC/oracle-proof knob. Selects the workload + enables exactly one
@@ -1114,6 +1125,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.x86_64_shared_region_direct_oracle" {
             options.x86_64_shared_region_direct_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.xfer2_grant_witness" {
+            options.xfer2_grant_witness = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_shared_region_direct_oracle" {
             options.aarch64_shared_region_direct_oracle = parse_bool_knob(value);
