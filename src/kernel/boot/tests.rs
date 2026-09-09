@@ -169856,6 +169856,79 @@ mod u9vment1_reachability_matrix {
         }
     }
 
+    // ── The live witness ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_live_witness_exists_issues_all_three_and_never_asserts() {
+        // Before this mission no server issued NR 3, NR 13 or NR 14, so no profile executed the
+        // converted routes at all. The witness is what makes the live column of this matrix
+        // possible; a guard keeps it from quietly disappearing again.
+        const WITNESS: &str = include_str!("../../../crates/yarm-user-rt/src/vm_entry_witness.rs");
+        const INIT_BIN: &str =
+            include_str!("../../../crates/yarm-control-plane-servers/src/bin/init_server.rs");
+
+        for nr in [
+            "const SYSCALL_VM_MAP_NR: usize = 3;",
+            "const SYSCALL_VM_ANON_MAP_NR: usize = 13;",
+            "const SYSCALL_VM_BRK_NR: usize = 14;",
+        ] {
+            assert!(WITNESS.contains(nr), "the witness must issue `{nr}`");
+        }
+        // Every NR 14 shape, and the NR 13 shapes that matter for the transaction's own phases.
+        for case in [
+            "\"single_page\"",
+            "\"multi_page\"",
+            "\"remap_displacing\"",
+            "\"guard_page_refused\"",
+            "\"writable_page\"",
+            "\"invalid_capability_refused\"",
+            "\"wrong_object_refused\"",
+            "\"query\"",
+            "\"growth\"",
+            "\"no_op\"",
+            "\"shrink_within_page\"",
+            "\"shrink_unmapping\"",
+            "\"below_base_refused\"",
+        ] {
+            assert!(
+                WITNESS.contains(case),
+                "the witness must cover the case {case}"
+            );
+        }
+        // It reports, it does not decide: a witness that panicked would make every profile
+        // sharing this image depend on it.
+        let code = code_only(WITNESS);
+        for forbidden in ["panic!", "unwrap()", "expect(", "assert!", "assert_eq!"] {
+            assert!(
+                !code.contains(forbidden),
+                "the witness must never `{forbidden}` — it reports raw lanes and nothing else"
+            );
+        }
+        // And it is actually invoked, from a binary that runs in every core profile.
+        assert!(
+            INIT_BIN.contains("vm_entry_witness::run_once("),
+            "the witness must be called from the init server"
+        );
+    }
+
+    #[test]
+    fn matrix_nr14_shapes_have_a_live_issuer_because_boot_seeds_the_break() {
+        // NR 14's four non-query shapes need a break window that already exists — the delivered
+        // rule, preserved. Each architecture's boot seeds one for the init server, which is where
+        // the witness runs; without that the shapes would be refused by the bounds lookup and the
+        // live column would be empty through no fault of the route.
+        for (arch, src) in [
+            ("x86_64", include_str!("../../arch/x86_64/boot.rs")),
+            ("aarch64", include_str!("../../arch/aarch64/boot.rs")),
+            ("riscv64", include_str!("../../arch/riscv64/boot.rs")),
+        ] {
+            assert!(
+                src.contains("set_task_brk_bounds(RING3_INIT_SERVER_TID"),
+                "{arch} boot must seed the init server's break window"
+            );
+        }
+    }
+
     #[test]
     fn matrix_superseded_runtime_acquisition_adapter_is_gone() {
         // The delivered split route for NR 14 was a shrink-only specialization gated on CPU
