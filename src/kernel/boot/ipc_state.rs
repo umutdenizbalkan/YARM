@@ -5160,6 +5160,36 @@ impl KernelState {
     /// The conservative screen and this are deliberately different questions with different
     /// answers; extracting this one is what lets an off-lock route reach the same conclusion the
     /// broad fallback reaches instead of stopping at the screen.
+    /// U9-IPC-RESIDUAL1 §3 — **THE linearization point of NR 6's pre-lock queued lane**, rank 3.
+    ///
+    /// Re-asks the admission question and enqueues in the SAME acquisition. That pairing is the
+    /// whole point: the pre-lock lane read the endpoint's waiter state earlier, without a lock
+    /// held, so a receiver may have parked in between. Enqueueing unconditionally there would
+    /// leave the message in the queue with the receiver asleep — a lost wakeup the broad path
+    /// cannot suffer, because it holds one acquisition across both steps.
+    ///
+    /// Composed from the two owners that already decide these questions
+    /// (`endpoint_send_admission_locked` and `ipc_endpoint_enqueue_authoritative_locked`), so it
+    /// adds an ordering guarantee and no new policy.
+    pub(crate) fn enqueue_request_if_no_waiter_locked(
+        ipc: &mut IpcSubsystem,
+        endpoint_idx: usize,
+        msg: Message,
+    ) -> super::QueuedRequestOutcome {
+        match Self::endpoint_send_admission_locked(ipc, endpoint_idx) {
+            super::EndpointSendAdmission::NoWaiters => {}
+            // Someone parked (or queued to send) since the pre-lock read: this send belongs to
+            // another arm now, and NOTHING has been enqueued. The caller compensates and hands
+            // the request to the owner of that arm.
+            _ => return super::QueuedRequestOutcome::WaiterAppeared,
+        }
+        match Self::ipc_endpoint_enqueue_authoritative_locked(ipc, endpoint_idx, msg) {
+            Ok(true) => super::QueuedRequestOutcome::Enqueued,
+            Ok(false) => super::QueuedRequestOutcome::QueueFull,
+            Err(_) => super::QueuedRequestOutcome::EndpointMissing,
+        }
+    }
+
     pub(crate) fn ipc_endpoint_enqueue_authoritative_locked(
         ipc: &mut IpcSubsystem,
         endpoint_idx: usize,
@@ -5596,6 +5626,42 @@ impl KernelState {
     /// the endpoint-missing and non-`Buffered` refusals, and the bounded `endpoint.send(msg)`
     /// with its queue-full refusal. FIFO order, sparse-slot behaviour, message framing and every
     /// refusal code are the endpoint primitive's, unchanged.
+    /// U9-IPC-RESIDUAL1 §2 — **THE endpoint send-admission classification**, rank 3 only.
+    ///
+    /// Extracted, not re-derived: `ipc_try_send_queued_plain_endpoint_only_locked` used to
+    /// compute this pair inline and match on it, and it still reaches exactly the same three
+    /// verdicts through this function. NR6's pre-lock queued lane has to ask the same question
+    /// before it mints or stashes anything, and asking it a second way is precisely how two
+    /// routes come to disagree about which broad arm a send belongs to.
+    ///
+    /// The verdicts map one-to-one onto the broad `handle_ipc_call` arms:
+    ///
+    /// | verdict | what the broad path does |
+    /// |---|---|
+    /// | `ReceiverWaiter` | direct delivery into the parked receiver (`ReceiverWaiterFound`) |
+    /// | `SenderWaiters` | the full `ipc_send`, which preserves sender-queue ordering |
+    /// | `BothWaiters` | the full `ipc_send`, which owns the combined ordering state |
+    /// | `NoWaiters` | enqueue onto the endpoint — the buffered shape |
+    #[must_use]
+    pub(crate) fn endpoint_send_admission_locked(
+        ipc: &IpcSubsystem,
+        endpoint_idx: usize,
+    ) -> super::EndpointSendAdmission {
+        if endpoint_idx >= ipc.endpoints.len() {
+            return super::EndpointSendAdmission::NoWaiters;
+        }
+        let receiver_waiter = ipc.endpoint_waiter_identity(endpoint_idx);
+        let has_sender_waiters = ipc.endpoint_sender_waiters[endpoint_idx]
+            .iter()
+            .any(Option::is_some);
+        match (receiver_waiter, has_sender_waiters) {
+            (Some(_), true) => super::EndpointSendAdmission::BothWaiters,
+            (Some(receiver), false) => super::EndpointSendAdmission::ReceiverWaiter(receiver),
+            (None, true) => super::EndpointSendAdmission::SenderWaiters,
+            (None, false) => super::EndpointSendAdmission::NoWaiters,
+        }
+    }
+
     pub(crate) fn ipc_try_send_queued_plain_endpoint_only_locked(
         ipc: &mut IpcSubsystem,
         endpoint_idx: usize,
@@ -5606,32 +5672,27 @@ impl KernelState {
                 IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
             );
         }
-        let receiver_waiter = ipc.endpoint_waiter_identity(endpoint_idx);
-        let has_sender_waiters = ipc.endpoint_sender_waiters[endpoint_idx]
-            .iter()
-            .any(Option::is_some);
-
-        match (receiver_waiter, has_sender_waiters) {
-            (Some(_), true) => {
+        match Self::endpoint_send_admission_locked(ipc, endpoint_idx) {
+            super::EndpointSendAdmission::BothWaiters => {
                 // Both receiver and sender waiters present: complex ordering state.
                 // Fall back to the full IPC send path which handles this correctly.
                 return IpcEndpointSendResult::Ineligible(
                     IpcEndpointSplitRejectReason::SenderWaiterPresent,
                 );
             }
-            (Some(receiver), false) => {
+            super::EndpointSendAdmission::ReceiverWaiter(receiver) => {
                 // Receiver waiter present, no sender waiters.
                 // TID comes from a locked ipc_state_lock read — no unlocked access needed.
                 // Caller must check is_task_recv_v2_blocked (task_state_lock rank 3) before
                 // calling ipc_try_send_to_plain_receiver_endpoint_only (ipc_state_lock rank 4).
                 return IpcEndpointSendResult::ReceiverWaiterFound(receiver);
             }
-            (None, true) => {
+            super::EndpointSendAdmission::SenderWaiters => {
                 return IpcEndpointSendResult::Ineligible(
                     IpcEndpointSplitRejectReason::SenderWaiterPresent,
                 );
             }
-            (None, false) => {
+            super::EndpointSendAdmission::NoWaiters => {
                 // No waiters: fall through to Stage 4E queue-enqueue logic below.
             }
         }
@@ -6061,6 +6122,109 @@ impl KernelState {
         }
     }
 
+    /// U9-IPC-RESIDUAL1 §2 — **THE reply-record reservation**, rank 3 only.
+    ///
+    /// Phase 1 of `create_reply_cap_for_caller_in_cnode`, extracted so NR 6's pre-lock queued
+    /// lane reserves through the same body rather than a second implementation of the same
+    /// free-slot scan, generation bump and `Available` stamp.
+    pub(crate) fn reserve_reply_record_locked(
+        ipc: &mut IpcSubsystem,
+        caller_tid: ThreadId,
+        caller_asid: Asid,
+        reply_endpoint: CapObject,
+        responder_tid: Option<ThreadId>,
+        replier_asid: Option<Asid>,
+    ) -> Result<(usize, u64), KernelError> {
+        for idx in 0..super::MAX_REPLY_CAPS {
+            if ipc.reply_caps[idx].is_none() {
+                // U9-IPC-RESIDUAL1 §3 — PREPARE THE TERMINAL CELL, atomically with the
+                // allocation, exactly as `reserve_direct_reply_record_locked` does.
+                //
+                // This was missing here, and its absence is a defect that owner's own
+                // documentation predicts word for word: "without it every recycled slot's next
+                // occupant is an identity mismatch forever, and the queued (unblocked-caller)
+                // reply mode, which requires an unarmed terminal, can never be selected again."
+                // A live boot showed exactly that — a reply on a recycled slot classified
+                // `TerminalUnavailable(IdentityMismatch)` and fell to the terminal broad
+                // dispatcher, with the cell still naming the slot's previous occupant.
+                //
+                // A cell that refuses to vacate still holds a live claimant or an unsettled
+                // arming, so that slot is SKIPPED rather than taken — recycling it would
+                // discard a claim or deadline that may still legitimately win.
+                if !ipc
+                    .reply_terminal_ownership
+                    .get_mut(idx)
+                    .is_some_and(|cell| cell.vacate_for_reuse())
+                {
+                    continue;
+                }
+                let mut next_generation = ipc.reply_cap_generations[idx].wrapping_add(1);
+                if next_generation == 0 {
+                    next_generation = 1;
+                }
+                ipc.reply_cap_generations[idx] = next_generation;
+                ipc.reply_caps[idx] = Some(ReplyCapRecord {
+                    // Legacy create path: the record is immediately invokable.
+                    reservation: super::ReplyRecordReservation::Available,
+                    caller_tid,
+                    caller_asid,
+                    reply_endpoint,
+                    responder_tid,
+                    replier_asid,
+                    caller_cap_id: CapId(0), // placeholder; updated by the persist below
+                    waiter_cap_id: None,     // filled in when cap is materialized
+                });
+                return Ok((idx, next_generation));
+            }
+        }
+        Err(KernelError::CapabilityFull)
+    }
+
+    /// U9-IPC-RESIDUAL1 §2 — **THE minted-CapId persist**, rank 3 only (Phase 3, extracted).
+    ///
+    /// Generation-exact, which the inline form was not: a record recycled between the mint and
+    /// this write would otherwise have another transaction's caller cap stamped onto it. On the
+    /// broad path the window does not exist (one acquisition throughout), so this is a
+    /// strengthening the split lane needs and the broad lane is unaffected by.
+    pub(crate) fn persist_reply_caller_cap_locked(
+        ipc: &mut IpcSubsystem,
+        slot: usize,
+        generation: u64,
+        cap_id: CapId,
+    ) -> bool {
+        if ipc.reply_cap_generations.get(slot).copied() != Some(generation) {
+            return false;
+        }
+        match ipc.reply_caps.get_mut(slot).and_then(Option::as_mut) {
+            Some(record) => {
+                record.caller_cap_id = cap_id;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// U9-IPC-RESIDUAL1 §2 — **free an unpublished reply record**, rank 3 only.
+    ///
+    /// The compensation twin of the reservation, for a queued request that fails between the
+    /// reservation and the enqueue. Generation-exact so a recycled slot is never freed.
+    pub(crate) fn free_reserved_reply_record_locked(
+        ipc: &mut IpcSubsystem,
+        slot: usize,
+        generation: u64,
+    ) -> bool {
+        if ipc.reply_cap_generations.get(slot).copied() != Some(generation) {
+            return false;
+        }
+        match ipc.reply_caps.get_mut(slot) {
+            Some(entry @ Some(_)) => {
+                *entry = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn create_reply_cap_for_caller(
         &mut self,
         caller_tid: ThreadId,
@@ -6119,28 +6283,14 @@ impl KernelState {
         // The real CapId is filled in after the mint succeeds (Phase 3).
         let (slot, generation) = self
             .with_ipc_state_mut(|ipc| {
-                for idx in 0..super::MAX_REPLY_CAPS {
-                    if ipc.reply_caps[idx].is_none() {
-                        let mut next_generation = ipc.reply_cap_generations[idx].wrapping_add(1);
-                        if next_generation == 0 {
-                            next_generation = 1;
-                        }
-                        ipc.reply_cap_generations[idx] = next_generation;
-                        ipc.reply_caps[idx] = Some(ReplyCapRecord {
-                            // Legacy create path: the record is immediately invokable.
-                            reservation: super::ReplyRecordReservation::Available,
-                            caller_tid,
-                            caller_asid,
-                            reply_endpoint,
-                            responder_tid,
-                            replier_asid,
-                            caller_cap_id: CapId(0), // placeholder; updated in Phase 3
-                            waiter_cap_id: None,     // filled in when cap is materialized
-                        });
-                        return Ok::<_, KernelError>((idx, next_generation));
-                    }
-                }
-                Err(KernelError::CapabilityFull)
+                Self::reserve_reply_record_locked(
+                    ipc,
+                    caller_tid,
+                    caller_asid,
+                    reply_endpoint,
+                    responder_tid,
+                    replier_asid,
+                )
             })
             .map_err(|err| {
                 crate::yarm_log!(
@@ -6187,9 +6337,7 @@ impl KernelState {
         // Phase 3: Persist the minted CapId in the record so that ipc_reply can revoke
         // it from the caller's cnode when the reply is eventually delivered.
         self.with_ipc_state_mut(|ipc| {
-            if let Some(record) = &mut ipc.reply_caps[slot] {
-                record.caller_cap_id = cap_id;
-            }
+            Self::persist_reply_caller_cap_locked(ipc, slot, generation, cap_id);
         });
 
         // Stage 200D-2B1D1 — register the BOUNDED reverse link on the ORDINARY queued path.

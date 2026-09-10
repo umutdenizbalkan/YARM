@@ -1055,6 +1055,144 @@ fn run_x86_futex_wake_oracle(init_tid: u64) {
 //
 // After both, the endpoint capability is used again, so "the essential service capabilities are
 // still usable" is checked rather than assumed.
+/// U9-IPC-RESIDUAL1 §4 — the QUEUED cap-bearing reply witness (init startup-slot-5 selector 13).
+///
+/// The one production shape this package newly serves that no service issues: an `IpcReply`
+/// carrying a transferred capability to a caller that is **not blocked** on its reply endpoint.
+/// `transfer_cap=0` in every direction on every ordinary boot of every port, so the lane cannot
+/// be shown to work by watching normal traffic — §4's minimal-witness authorization applies.
+///
+/// It runs in ONE task over ONE disposable endpoint, using only the authority
+/// `provision_init_shared_region_oracle` already hands init, and only syscalls that already
+/// exist. The single endpoint is used as both the request and the reply channel, which is what
+/// makes the caller provably unblocked: init is running the whole time and never parks.
+///
+/// ```text
+/// NR 6  ipc_call(ep, ep, "U9REQ")      -> no receiver parked  => the BUFFERED lane enqueues
+/// NR 2  ipc_recv_v2(ep)                -> the request, with a materialized reply cap
+/// NR 7  ipc_reply(reply_cap, "U9RSP" + mem_cap)
+///                                      -> caller (init) is NOT blocked => the QUEUED lane,
+///                                         framed FLAG_CAP_TRANSFER_PLAIN with an envelope
+/// NR 2  ipc_recv_v2(ep)                -> the reply, and the capability materialized from it
+/// ```
+///
+/// The last step is the assertion that matters: a queued cap-bearing reply is only correct if
+/// the capability actually arrives, and it arrives through the ordinary receive-side
+/// materialization owner rather than anything this witness supplies.
+#[cfg(not(feature = "hosted-dev"))]
+pub(super) mod ipc_residual1_queued_cap_witness {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn armed(slot5: Option<u32>) -> bool {
+        matches!(slot5, Some(13))
+    }
+
+    pub(super) fn run_once() {
+        use yarm_user_rt::ipc::Message;
+
+        let (mem_cap, ep_cap) = super::shared_region_oracle_core::oracle_caps();
+        if mem_cap == 0 || ep_cap == 0 {
+            yarm_user_rt::user_log!("IPC_RESIDUAL1_QUEUED_CAP_WITNESS step=caps result=missing");
+            RESULT.store(0xF0, Relaxed);
+            return;
+        }
+        yarm_user_rt::user_log!(
+            "IPC_RESIDUAL1_QUEUED_CAP_WITNESS_BEGIN mem_cap={} ep_cap={}",
+            mem_cap,
+            ep_cap
+        );
+
+        // (1) NR 6 with no receiver parked. This is the BUFFERED lane: the request is enqueued
+        // and the call returns immediately. Init deliberately does NOT receive its reply yet.
+        let Ok(req) = Message::new(0, b"U9REQ") else {
+            yarm_user_rt::user_log!("IPC_RESIDUAL1_QUEUED_CAP_WITNESS step=req_build result=fail");
+            RESULT.store(0xF1, Relaxed);
+            return;
+        };
+        // SAFETY: `ep_cap` carries SEND and RECEIVE; it is the reply channel too.
+        let called = unsafe { yarm_user_rt::syscall::ipc_call(ep_cap, ep_cap, &req) };
+        let call_ok = called.is_ok();
+
+        // (2) Receive the request. The reply capability is materialized into init by the
+        // ordinary receive-side owner and reported in the recv metadata.
+        // SAFETY: `ep_cap` carries RECEIVE.
+        let got_req = unsafe { yarm_user_rt::syscall::ipc_recv_v2(ep_cap) };
+        let reply_cap = match &got_req {
+            Ok(Some(m)) => m.reply_cap.unwrap_or(0),
+            _ => 0,
+        };
+        let req_ok = call_ok && reply_cap != 0;
+
+        // (3) NR 7 carrying a capability, to a caller that is not blocked. THE shape under test.
+        let rsp = match Message::with_header(
+            0,
+            0,
+            Message::FLAG_CAP_TRANSFER_PLAIN,
+            Some(u64::from(mem_cap)),
+            b"U9RSP",
+        ) {
+            Ok(m) => m,
+            Err(_) => {
+                yarm_user_rt::user_log!(
+                    "IPC_RESIDUAL1_QUEUED_CAP_WITNESS step=rsp_build result=fail"
+                );
+                RESULT.store(0xF2, Relaxed);
+                return;
+            }
+        };
+        let replied = if req_ok {
+            // SAFETY: `reply_cap` is the one-shot this task just received.
+            unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &rsp) }
+        } else {
+            Err(yarm_user_rt::syscall::SyscallError::InvalidArgs)
+        };
+        let reply_ok = replied.is_ok();
+
+        // (4) Receive the queued reply. The capability must be there, materialized locally —
+        // a different CapId from the sender's, because it is the receiver's own cnode slot.
+        // SAFETY: `ep_cap` carries RECEIVE.
+        let got_rsp = unsafe { yarm_user_rt::syscall::ipc_recv_v2(ep_cap) };
+        let (rsp_ok, delivered_cap) = match &got_rsp {
+            Ok(Some(m)) => (
+                m.message.as_slice() == b"U9RSP",
+                m.transferred_cap.unwrap_or(0),
+            ),
+            _ => (false, 0),
+        };
+        let cap_ok = rsp_ok && delivered_cap != 0;
+
+        // (5) ESSENTIAL AUTHORITY INTACT: the endpoint init depends on still resolves. Deadline
+        // 0 is the NON-BLOCKING probe (AI_AGENT_RULES §8.2) — a plain `ipc_recv` would park init
+        // forever on an endpoint nobody else sends to.
+        // SAFETY: `ep_cap` carries RECEIVE.
+        let after = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(ep_cap, 0) };
+        let caps_intact = !matches!(
+            after,
+            Err(yarm_user_rt::syscall::SyscallError::InvalidCapability)
+                | Err(yarm_user_rt::syscall::SyscallError::MissingRight)
+        );
+
+        let all = call_ok && req_ok && reply_ok && cap_ok && caps_intact;
+        yarm_user_rt::user_log!(
+            "IPC_RESIDUAL1_QUEUED_CAP_WITNESS call={} reply_cap={} reply={} cap={} intact={} result={}",
+            call_ok as u32,
+            reply_cap,
+            reply_ok as u32,
+            cap_ok as u32,
+            caps_intact as u32,
+            all as u32
+        );
+        yarm_user_rt::user_log!(
+            "IPC_RESIDUAL1_QUEUED_CAP_WITNESS_DONE delivered_cap={} result={}",
+            delivered_cap,
+            if all { "ok" } else { "fail" }
+        );
+        RESULT.store(if all { 1 } else { 0xFF }, Relaxed);
+    }
+}
+
 #[cfg(not(feature = "hosted-dev"))]
 pub(super) mod xfer2_grant_witness {
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -5155,6 +5293,12 @@ pub fn run() {
     #[cfg(not(feature = "hosted-dev"))]
     if xfer2_grant_witness::armed(ctx.supervisor_control_recv_ep) {
         xfer2_grant_witness::run_once();
+    }
+    // U9-IPC-RESIDUAL1 §4: the queued cap-bearing reply witness, selector 13. Mutually
+    // exclusive with every other slot-5 cell, architecture-neutral, and default-off.
+    #[cfg(not(feature = "hosted-dev"))]
+    if ipc_residual1_queued_cap_witness::armed(ctx.supervisor_control_recv_ep) {
+        ipc_residual1_queued_cap_witness::run_once();
     }
     // Stage 200D-0C1: default-off + feature-gated AArch64 LIVE ExitCurrentTask oracle. The slot-5
     // value is DECODED through the shared `yarm_ipc_abi::exit_current_task_abi` helper rather than

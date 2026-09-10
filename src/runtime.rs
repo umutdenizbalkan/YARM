@@ -14208,6 +14208,78 @@ impl SharedKernel {
     /// Returns the receiver that must be woken, if one blocked on the endpoint between the mode
     /// classification and this commit — the race is closed by taking the waiter inside the same
     /// acquisition that enqueues, exactly as the broad path does.
+    /// U9-IPC-RESIDUAL1 §2 — rank-3 read: which broad send arm this endpoint's waiter state
+    /// selects. The split entry to THE classification the Stage-4E screen also uses.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    #[must_use]
+    pub(crate) fn endpoint_send_admission_split_read(
+        &self,
+        endpoint_idx: usize,
+    ) -> crate::kernel::boot::EndpointSendAdmission {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::endpoint_send_admission_locked(ipc, endpoint_idx)
+        })
+    }
+
+    /// U9-IPC-RESIDUAL1 §3 — rank 3: NR 6's queued publication point. Re-checks admission and
+    /// enqueues in ONE acquisition; see `enqueue_request_if_no_waiter_locked`.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn enqueue_request_if_no_waiter_split(
+        &self,
+        endpoint_idx: usize,
+        msg: crate::kernel::ipc::Message,
+    ) -> crate::kernel::boot::QueuedRequestOutcome {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::enqueue_request_if_no_waiter_locked(ipc, endpoint_idx, msg)
+        })
+    }
+
+    /// U9-IPC-RESIDUAL1 §2 — rank 3: reserve a reply record, through THE body the broad
+    /// `create_reply_cap_for_caller_in_cnode` reserves through.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn reserve_reply_record_split(
+        &self,
+        caller_tid: crate::kernel::ipc::ThreadId,
+        caller_asid: crate::kernel::vm::Asid,
+        reply_endpoint: CapObject,
+        responder_tid: Option<crate::kernel::ipc::ThreadId>,
+        replier_asid: Option<crate::kernel::vm::Asid>,
+    ) -> Result<(usize, u64), KernelError> {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::reserve_reply_record_locked(
+                ipc,
+                caller_tid,
+                caller_asid,
+                reply_endpoint,
+                responder_tid,
+                replier_asid,
+            )
+        })
+    }
+
+    /// U9-IPC-RESIDUAL1 §2 — rank 3: persist the minted caller CapId into an EXACT record
+    /// incarnation. `false` means the record was recycled under us and nothing was written.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn persist_reply_caller_cap_split(
+        &self,
+        slot: usize,
+        generation: u64,
+        cap_id: CapId,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::persist_reply_caller_cap_locked(ipc, slot, generation, cap_id)
+        })
+    }
+
+    /// U9-IPC-RESIDUAL1 §2 — rank 3: free a reply record this transaction reserved and never
+    /// published. Generation-exact, so a recycled slot is left alone.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn free_reserved_reply_record_split(&self, slot: usize, generation: u64) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::free_reserved_reply_record_locked(ipc, slot, generation)
+        })
+    }
+
     pub(crate) fn commit_queued_reply_split(
         &self,
         record_index: usize,

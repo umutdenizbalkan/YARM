@@ -96,9 +96,10 @@ pub(crate) struct DirectReplyFacts {
     /// DIRECT3-CAP-FINAL: this no longer decides eligibility, it selects a LANE. A cap-bearing
     /// reply to a committed-blocked caller is serviced by the capability lane, which stashes the
     /// transfer envelope through the same owner the split IpcSend boundary uses and hands the
-    /// delivery to the blocked-waiter ordinary-cap producer/executor pair. The one shape that
-    /// lane does not claim is a cap-bearing reply to an UNBLOCKED caller, which would need the
-    /// queued receive-side materialization; the route declines that pre-mutation.
+    /// delivery to the blocked-waiter ordinary-cap producer/executor pair. U9-IPC-RESIDUAL1 §2
+    /// completed the other side: a cap-bearing reply to an UNBLOCKED caller is queued with
+    /// `FLAG_CAP_TRANSFER_PLAIN` framing and materialized on the caller's next receive, so
+    /// neither shape declines for carrying a capability.
     ///
     /// It stays a fact rather than becoming a mode here because the mode also depends on the
     /// caller's blocked state, which this pure classifier does not — and must not — read.
@@ -251,9 +252,12 @@ pub(crate) enum DirectReplyEligibility {
     /// The record does not bind a reply-endpoint incarnation (absent / stale / not an
     /// endpoint).
     ReplyEndpointGone,
-    /// The reply carries a transferred capability, which the direct transaction cannot
-    /// deliver. The legacy path owns it; declining here is what stops the capability from
-    /// being silently dropped.
+    /// The reply carries a transferred capability that no lane can deliver.
+    ///
+    /// U9-IPC-RESIDUAL1 §2: no production path produces this any more — both the blocked and
+    /// the queued lane carry a capability. Retained so the ABI-shape tests can keep pinning
+    /// that such a decline would yield no endpoint and no error, which is what makes it
+    /// mutation-free by construction.
     TransferCapUnsupported,
     /// The reply-record's terminal cell cannot be claimed by this reply: a competitor owns it,
     /// it is already settled, or its published identity does not name this exact reply. The
@@ -396,9 +400,15 @@ pub(crate) fn classify_direct_reply_eligibility(
     // delivery, and carries its reply lifecycle to the executor as a typed continuation. So
     // "this reply carries a capability" is a MODE question — which lane services it — not an
     // eligibility question, and it is asked at the mode selection where the caller's blocked
-    // state is known. `TransferCapUnsupported` is still produced there, for the one shape this
-    // lane deliberately does not claim: a cap-bearing reply to an UNBLOCKED caller, which
-    // would need the queued receive-side materialization and is not witnessed in production.
+    // state is known.
+    //
+    // U9-IPC-RESIDUAL1 §2: both modes now carry a capability. The blocked lane delivers it
+    // through the blocked-waiter ordinary-cap producer; the queued lane frames it
+    // `FLAG_CAP_TRANSFER_PLAIN` and lets the receive-side materialization arm every route
+    // reaches materialize it on the caller's next receive. `TransferCapUnsupported` is
+    // therefore no longer produced by any production path; the variant and its predicate are
+    // retained because the ABI-shape tests below pin what it would mean, and removing it would
+    // delete that pin rather than prove it unnecessary.
     if let Err(err) = facts.reply_object {
         return DirectReplyEligibility::ReplyCapUnresolved(err);
     }
@@ -821,13 +831,21 @@ mod tests {
         );
     }
 
-    /// THE shape the capability lane deliberately does not claim: a cap-bearing reply to a
-    /// caller that is NOT blocked. It would have to ride its transfer envelope in the queued
-    /// message and be materialized by the receive-side owner on a later receive — a class
-    /// production does not witness. The route must select neither blocked lane nor the queued
-    /// lane for it, so it declines pre-mutation and the legacy path owns it.
+    /// **U9-IPC-RESIDUAL1 §2 — both queued shapes are served.**
+    ///
+    /// This guard used to pin the opposite: that a cap-bearing reply to an UNBLOCKED caller was
+    /// claimed by neither lane and fell to the terminal broad dispatcher, on the stated grounds
+    /// that the capability would be "enqueued with a capability nothing would materialize".
+    /// That reason was wrong about the source. The queued message is framed
+    /// `FLAG_CAP_TRANSFER_PLAIN`, and the receive-side materialization arm every route reaches
+    /// treats that flag exactly as it treats `FLAG_CAP_TRANSFER` — so the capability is
+    /// delivered by the same owner that delivers every other queued transfer.
+    ///
+    /// What the mode selection must now guarantee is that the capability chooses the FRAMING,
+    /// never the lane: the terminal alone decides blocked-vs-queued, and each lane carries the
+    /// capability through an owner that already exists.
     #[test]
-    fn a_cap_bearing_reply_to_an_unblocked_caller_is_not_claimed_by_either_lane() {
+    fn both_reply_lanes_carry_a_capability_and_the_terminal_alone_selects_the_lane() {
         let route = include_str!("syscall_split.rs");
         let body = route
             .split("fn try_split_ipcreply_direct_into_frame(")
@@ -840,9 +858,39 @@ mod tests {
             "a blocked caller + a capability selects the capability lane"
         );
         assert!(
-            mode.contains("&& !facts.transfer_cap_present"),
-            "the queued lane must refuse a cap-bearing reply rather than enqueue a message \
-             carrying a capability nothing would materialize"
+            mode.contains("DirectReplyMode::QueueUnblocked"),
+            "an unarmed terminal selects the queued lane"
+        );
+        // The queued arm must no longer condition on the capability at all.
+        let queued_arm = mode
+            .split("DirectReplyTerminal::Unarmed")
+            .nth(1)
+            .expect("the queued arm");
+        let queued_arm = &queued_arm[..queued_arm
+            .find("QueueUnblocked")
+            .expect("the queued arm resolves")];
+        assert!(
+            !queued_arm.contains("transfer_cap_present"),
+            "the queued lane must select on the terminal alone; the capability decides only \
+             which framing the queued message carries"
+        );
+        // And the queued lane must reach the capability through the SHARED owners, not a
+        // second stash or a second framing of its own.
+        let queued_lane = body
+            .split("DirectReplyMode::QueueUnblocked")
+            .nth(2)
+            .expect("the queued lane body");
+        assert!(
+            queued_lane.contains("stash_transfer_envelope_split("),
+            "the queued lane stashes through the shared envelope owner"
+        );
+        assert!(
+            queued_lane.contains("ipc_abi::frame_reply_message_with_cap("),
+            "and frames through the shared cap-bearing reply framing"
+        );
+        assert!(
+            queued_lane.contains("take_transfer_envelope_facts_split("),
+            "and returns the envelope on every refusal after the stash"
         );
     }
 

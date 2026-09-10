@@ -34155,6 +34155,18 @@ mod stage115_d2_d6_seam_analysis {
             split_src.contains("fn try_split_ipc_send_into_frame("),
             "NR 1 has a pre-lock route since 199G-C4 §1"
         );
+        // U9-IPC-RESIDUAL1 §2: matched against CODE, not prose. The rule is that the pre-lock
+        // routes must not REIMPLEMENT these owners; naming one in a doc comment to say which
+        // owner does the work is the opposite of the defect, and the sibling guard above
+        // already strips comments for exactly this reason.
+        let split_code: alloc::string::String = split_src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
         for reimplemented in [
             "mint_capability_in_cnode",
             "materialize_received_message_cap",
@@ -34162,7 +34174,7 @@ mod stage115_d2_d6_seam_analysis {
             "phase_a_take_reply_envelope",
         ] {
             assert!(
-                !split_src.contains(reimplemented),
+                !split_code.contains(reimplemented),
                 "D1/D5: the NR 1 route must consume the cap-transfer owners, never reimplement \
                  `{reimplemented}`"
             );
@@ -86503,31 +86515,38 @@ mod stage199d_delivery_projection_differential {
                 split
                     .matches("COUNTERS.note_declined_pre_transaction();")
                     .count(),
-                20,
-                "NR6 has three (copy, snapshot, ack claim); 199D-TRC gave NR7 three more — the \
-                 unresolved-record fail-close, the mode-indeterminate refusal and the lost \
-                 terminal claim; DIRECT3-QUEUECAP gave it two more on the queued mode — the \
-                 message-framing refusal and the pre-mutation queue refusal; DIRECT3-CAP-FINAL \
-                 gave the capability lane nine, one per way it can refuse having mutated \
-                 nothing it cannot undo — absent transfer cap, unreadable caller, unreadable \
-                 authority slots, refused record reservation, an unarmed terminal, a LOST \
-                 terminal claim, a refused envelope stash, a refused message framing, and a \
-                 producer that declined or failed. §7's pre-lock refusal of a spent reply \
-                 authority is NOT among them: it is a PREFLIGHT decline, counted through \
+                23,
+                "NR6 has two (copy, snapshot) since U9-IPC-RESIDUAL1 §2 turned the third — the \
+                 no-claimable-acknowledgement case — into the BUFFERED lane, which contributes \
+                 one of its own through its shared `decline` helper; 199D-TRC gave NR7 three — \
+                 the unresolved-record fail-close, the mode-indeterminate refusal and the lost \
+                 terminal claim; the queued mode has five — message framing, the pre-mutation \
+                 queue refusal, and §2's three cap-bearing acquisitions (absent transfer cap, \
+                 unreadable caller, refused envelope stash); DIRECT3-CAP-FINAL gave the \
+                 blocked capability lane nine, one per way it can refuse having mutated nothing \
+                 it cannot undo — absent transfer cap, unreadable caller, unreadable authority \
+                 slots, refused record reservation, an unarmed terminal, a LOST terminal claim, \
+                 a refused envelope stash, a refused message framing, and a producer that \
+                 declined or failed. §7\'s pre-lock refusal of a spent reply authority is NOT \
+                 among them: it is a PREFLIGHT decline, counted through \
                  `note_declined_preflight_reply` with every other ineligibility"
             );
             for (direction, sites, what) in [
                 (
                     "REQUEST_COUNTERS",
                     3,
-                    "copy, snapshot and ack-claim declines are all counted",
+                    "copy and snapshot declines are counted, plus the BUFFERED lane's single \
+                     shared `decline` helper — U9-IPC-RESIDUAL1 §2 turned the third site, the \
+                     no-claimable-acknowledgement case, into that lane instead of a fall-back",
                 ),
                 (
                     "REPLY_COUNTERS",
-                    17,
+                    20,
                     "copy, snapshot, ack-claim, unresolved-record, mode-indeterminate, \
                      lost-claim, queued-framing and queued-refusal declines are all counted, \
-                     plus the capability lane's nine — absent transfer cap, unreadable caller, \
+                     plus U9-IPC-RESIDUAL1 §2's three cap-bearing queued acquisitions (absent \
+                     transfer cap, unreadable caller, refused envelope stash), and the blocked \
+                     capability lane's nine — absent transfer cap, unreadable caller, \
                      unreadable authority slots, refused record reservation, unarmed terminal, \
                      lost terminal claim, refused envelope stash, refused message framing, and \
                      a producer that declined or failed. The lane uses THIS counter rather than \
@@ -86549,9 +86568,13 @@ mod stage199d_delivery_projection_differential {
                 split
                     .matches("direct_ipc_counters::note_disposition(")
                     .count(),
-                3,
-                "NR6, the plain NR7 lanes, and the capability lane each count their terminal \
-                 disposition — the capability lane needs its own because it returns from the \
+                6,
+                "Every lane that RETURNS from the route counts its own terminal disposition. \
+                 U9-IPC-RESIDUAL1 §1/§2 added three: the queued reply success (which applied a \
+                 disposition without recording it, so `terminals_balance` read false on every \
+                 ordinary boot), the fail-closed unresolved-claim exit, and NR6's BUFFERED \
+                 lane. The rest are NR6 direct, the plain NR7 tail, and the capability lane — \
+                 the capability lane needs its own because it returns from the \
                  route before the shared tail, having handed its delivery to the drain"
             );
             // Only the NR6 direction can report a MODE decline; NR7 has no mode requirement.
@@ -106439,8 +106462,12 @@ mod stage200d2b1d1_ordinary_link {
             "the ordinary registration must not be gated on an oracle feature"
         );
         // After the record is authoritative (Phase 3 persisted the CapId)...
+        // U9-IPC-RESIDUAL1 §2 re-anchor: Phase 3 is now the shared
+        // `persist_reply_caller_cap_locked` body, so that both this creator and NR 6's pre-lock
+        // queued lane persist the minted CapId through one owner. The ORDERING property this
+        // guard exists for is unchanged and still checked here.
         let phase3 = body
-            .find("record.caller_cap_id = cap_id;")
+            .find("Self::persist_reply_caller_cap_locked(")
             .expect("phase 3");
         assert!(
             phase3 < reg,
@@ -172905,5 +172932,432 @@ mod u9xfer2_transaction_cases {
             "nothing may be consumed after a pre-commit refusal"
         );
         assert_eq!(owners.events, alloc::vec![V3TxnEvent::Refused]);
+    }
+}
+
+/// U9-IPC-RESIDUAL1 §4 — the changed residuals, driven through PRODUCTION owners.
+///
+/// Each case drives the same rank-local bodies the shipped lanes drive — the reply-record
+/// reservation/persist/free trio, the endpoint send-admission classification, and the queued
+/// publication point — and checks a property that was wrong, or unreachable, before this package.
+#[cfg(test)]
+mod u9_ipc_residual1_cases {
+    use super::*;
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    use crate::kernel::ipc::{Message, ThreadId};
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    fn shared_with_task() -> SharedKernel {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        shared.with(|state| {
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+        shared
+    }
+
+    fn make_endpoint(shared: &SharedKernel) -> (usize, CapObject) {
+        let (idx, send_root, _recv_root) = shared.with(|s| s.create_endpoint(8).expect("endpoint"));
+        let object = shared
+            .with(|s| s.current_task_capability(send_root).map(|c| c.object))
+            .expect("endpoint object");
+        (idx, object)
+    }
+
+    /// **The defect the live boot found.** The ordinary allocation path never prepared the
+    /// terminal-ownership cell, so a recycled slot stayed identity-mismatched forever and the
+    /// queued (unblocked-caller) reply mode could never be selected on it again.
+    ///
+    /// Reserve, free and reserve again on the same slot: the second occupant must classify as
+    /// `Unarmed`, which is exactly what selects the queued lane.
+    #[test]
+    fn a_recycled_reply_record_leaves_its_terminal_cell_unarmed() {
+        use crate::kernel::direct_eligibility::DirectReplyTerminal;
+        let shared = shared_with_task();
+        let (eidx, endpoint) = make_endpoint(&shared);
+        let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), Asid(0));
+
+        let (slot, gen1) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), endpoint, None, None)
+            .expect("first reservation");
+        assert!(shared.free_reserved_reply_record_split(slot, gen1));
+
+        let (slot2, gen2) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), endpoint, None, None)
+            .expect("second reservation");
+        assert_eq!(slot2, slot, "the freed slot is the one reused");
+        assert_ne!(gen2, gen1, "and it advances its generation");
+
+        let terminal = shared.classify_direct_reply_terminal_split_read(
+            slot2,
+            gen2,
+            replier,
+            eidx,
+            match endpoint {
+                CapObject::Endpoint { generation, .. } => generation,
+                _ => unreachable!("endpoint"),
+            },
+        );
+        assert_eq!(
+            terminal,
+            DirectReplyTerminal::Unarmed,
+            "a recycled slot's new occupant must not inherit its predecessor's cell — that is \
+             what made every such reply an IdentityMismatch and sent it to the broad dispatcher"
+        );
+    }
+
+    /// The persist and the free are GENERATION-EXACT: a record recycled under the transaction is
+    /// neither stamped with another transaction's caller cap nor freed by it.
+    #[test]
+    fn the_reply_record_persist_and_free_refuse_a_recycled_slot() {
+        let shared = shared_with_task();
+        let (_eidx, endpoint) = make_endpoint(&shared);
+        let (slot, gen1) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), endpoint, None, None)
+            .expect("reservation");
+        assert!(shared.persist_reply_caller_cap_split(slot, gen1, CapId(0x1234)));
+        // A stale generation writes nothing and frees nothing.
+        assert!(
+            !shared.persist_reply_caller_cap_split(slot, gen1.wrapping_add(7), CapId(0x9999)),
+            "a stale generation must not stamp a live record"
+        );
+        assert!(
+            !shared.free_reserved_reply_record_split(slot, gen1.wrapping_add(7)),
+            "a stale generation must not free a live record"
+        );
+        // The exact incarnation still frees.
+        assert!(shared.free_reserved_reply_record_split(slot, gen1));
+        assert!(
+            !shared.free_reserved_reply_record_split(slot, gen1),
+            "and a second free finds nothing"
+        );
+    }
+
+    /// The admission classification is the one the Stage-4E screen uses, and it separates the
+    /// four broad arms exactly. The buffered arm — the only one NR 6's queued lane claims — is
+    /// `NoWaiters`.
+    #[test]
+    fn the_endpoint_send_admission_separates_the_broad_arms() {
+        use crate::kernel::boot::EndpointSendAdmission;
+        let shared = shared_with_task();
+        let (eidx, _endpoint) = make_endpoint(&shared);
+        assert_eq!(
+            shared.endpoint_send_admission_split_read(eidx),
+            EndpointSendAdmission::NoWaiters,
+            "a fresh endpoint with nobody parked is the buffered arm"
+        );
+        // Park a receiver: the arm becomes the direct-delivery one, which this lane declines.
+        let waiter = crate::kernel::boot::EndpointWaiterRecord::new(
+            crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), Asid(0)),
+            0,
+        );
+        shared.with(|s| {
+            s.publish_recv_waiter_live(eidx, waiter, CapId(0));
+        });
+        assert!(
+            matches!(
+                shared.endpoint_send_admission_split_read(eidx),
+                EndpointSendAdmission::ReceiverWaiter(_)
+            ),
+            "a parked receiver selects the direct-delivery arm"
+        );
+    }
+
+    /// **The publication point.** `enqueue_request_if_no_waiter` re-asks admission and enqueues
+    /// in ONE acquisition, so a receiver that parks between the pre-lock read and the publication
+    /// is reported rather than left asleep behind a queued message.
+    #[test]
+    fn the_queued_publication_reports_a_waiter_that_appeared_and_enqueues_nothing() {
+        use crate::kernel::boot::QueuedRequestOutcome;
+        let shared = shared_with_task();
+        let (eidx, _endpoint) = make_endpoint(&shared);
+        let msg = Message::new(1, b"req").expect("message");
+
+        // Park a receiver on the EMPTY endpoint. This is the state the pre-lock admission read
+        // cannot see if the receiver arrives after it: the publication point must catch it.
+        let waiter = crate::kernel::boot::EndpointWaiterRecord::new(
+            crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), Asid(0)),
+            0,
+        );
+        shared.with(|s| {
+            s.publish_recv_waiter_live(eidx, waiter, CapId(0));
+        });
+        assert_eq!(
+            shared.enqueue_request_if_no_waiter_split(eidx, msg),
+            QueuedRequestOutcome::WaiterAppeared,
+            "a receiver that parked since the pre-lock read is REPORTED, not enqueued behind"
+        );
+        // And nothing was added: the endpoint is still empty, read back through the production
+        // non-consuming head read.
+        assert!(
+            matches!(
+                shared.peek_queued_with_cap_transfer_split(eidx),
+                crate::kernel::boot::IpcEndpointPeekResult::Ineligible(_)
+            ),
+            "a lost admission race must enqueue nothing"
+        );
+
+        // With the waiter taken, the same request publishes.
+        let _ = shared.with(|s| s.with_ipc_state_mut(|ipc| ipc.take_endpoint_waiter(eidx)));
+        assert_eq!(
+            shared.enqueue_request_if_no_waiter_split(eidx, msg),
+            QueuedRequestOutcome::Enqueued
+        );
+        assert!(
+            matches!(
+                shared.peek_queued_with_cap_transfer_split(eidx),
+                crate::kernel::boot::IpcEndpointPeekResult::Peeked(m) if m == msg
+            ),
+            "and the published message is the head"
+        );
+    }
+
+    /// A missing endpoint is reported as such — never as a silent success, and never as a
+    /// queue-full (which is the BLOCKING origin and a different answer entirely).
+    #[test]
+    fn the_queued_publication_distinguishes_a_missing_endpoint() {
+        use crate::kernel::boot::QueuedRequestOutcome;
+        let shared = shared_with_task();
+        let msg = Message::new(1, b"req").expect("message");
+        assert_eq!(
+            shared.enqueue_request_if_no_waiter_split(usize::MAX, msg),
+            QueuedRequestOutcome::EndpointMissing,
+            "a missing endpoint is named as itself — never a silent success, and never a \
+             queue-full, which is the BLOCKING origin and a different answer entirely"
+        );
+    }
+
+    /// The caller's one-shot Reply cap is minted and rolled back through the SAME owners the
+    /// receive-side reply-cap materialization uses, so a compensated queued request leaves the
+    /// caller's cnode exactly as it found it.
+    #[test]
+    fn the_queued_reply_cap_mint_is_exactly_undone_by_its_rollback() {
+        let shared = shared_with_task();
+        let (_eidx, endpoint) = make_endpoint(&shared);
+        let cnode = shared.task_cnode_split(1).expect("cnode");
+        let (slot, generation) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), endpoint, None, None)
+            .expect("reservation");
+        let reply_object = CapObject::Reply {
+            index: slot,
+            generation,
+        };
+        let cap = shared
+            .mint_capability_with_memory_ref_split(
+                cnode,
+                Capability::new(reply_object, CapRights::SEND),
+            )
+            .expect("mint");
+        assert!(
+            shared.with(|s| s.capability_for_cnode_local(cnode, cap).is_some()),
+            "the cap is present after the mint"
+        );
+        shared.rollback_minted_cap_split(cnode, cap, reply_object);
+        assert!(
+            shared.with(|s| s.capability_for_cnode_local(cnode, cap).is_none()),
+            "and gone after the rollback — a compensated request hands nothing back to userspace"
+        );
+        assert!(shared.free_reserved_reply_record_split(slot, generation));
+    }
+}
+
+/// U9-IPC-RESIDUAL1 §4 — **source closure for the NR 6 / NR 7 family.**
+///
+/// The live census answers "did any trap enter the broad acquisition on THIS boot"; these guards
+/// answer the question a boot cannot: whether the route's disposition chain is complete, so that
+/// no supported production outcome has a `None` left to fall through.
+#[cfg(test)]
+mod u9_ipc_residual1_closure {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const COUNTERS_SRC: &str = include_str!("../direct_ipc_counters.rs");
+
+    /// Strip comments: these guards are about the ROUTE, and a doc comment naming a shape is
+    /// not the shape being present.
+    fn code(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// **All three ingress paths admit both NRs.** A family cannot be closed on a port whose
+    /// trap entry never offers the syscall to the split dispatcher in the first place.
+    #[test]
+    fn every_architecture_ingress_admits_nr6_and_nr7() {
+        // x86_64 and AArch64 share `arch/trap_entry.rs`; RISC-V has its own wrapper.
+        for (name, src) in [
+            ("shared trap entry", TRAP_ENTRY_SRC),
+            ("riscv trap wrapper", RISCV_TRAP_SRC),
+        ] {
+            let c = code(src);
+            for nr in ["SYSCALL_IPC_CALL_NR", "SYSCALL_IPC_REPLY_NR"] {
+                assert!(
+                    c.contains(nr),
+                    "{name} must offer {nr} to the split dispatcher"
+                );
+            }
+        }
+        // And the dispatcher admits them past the NR-only whitelist through the production
+        // admission predicate, not through a proof selector.
+        let c = code(SPLIT_SRC);
+        assert!(c.contains(
+            "let direct_ipc_admitted = matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)"
+        ));
+        assert!(c.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"));
+    }
+
+    /// **The terminal-entry measurement exists, is per-trap, and is in exactly one place per
+    /// direction.** This is what makes the live `broad_entries=0` claim mean what it says.
+    #[test]
+    fn the_terminal_entry_is_counted_once_per_trap_at_the_fall_through() {
+        let c = code(SPLIT_SRC);
+        assert_eq!(
+            c.matches("REQUEST.note_broad_entry();").count(),
+            1,
+            "NR6's terminal entry is counted in exactly one place"
+        );
+        assert_eq!(
+            c.matches("REPLY.note_broad_entry();").count(),
+            1,
+            "and NR7's likewise"
+        );
+        // Each sits immediately after its helper's fall-through, inside the admission arm.
+        for (helper, counter) in [
+            (
+                "try_split_ipccall_direct_into_frame(shared, cpu, frame)",
+                "REQUEST.note_broad_entry();",
+            ),
+            (
+                "try_split_ipcreply_direct_into_frame(shared, cpu, frame)",
+                "REPLY.note_broad_entry();",
+            ),
+        ] {
+            let at = c.find(helper).expect("helper call site");
+            let after = &c[at..];
+            let end = after.find("\n    }").unwrap_or(after.len());
+            assert!(
+                after[..end].contains(counter),
+                "{helper} must count its fall-through before the arm closes"
+            );
+        }
+        // And it is a hard closure invariant, not merely reported.
+        assert!(COUNTERS_SRC.contains("no_broad_entry: counters.broad_entries() == 0,"));
+        assert!(COUNTERS_SRC.contains("&& self.no_broad_entry"));
+    }
+
+    /// **The disposition chain is complete.** Every mode NR 6 and NR 7 recognize has an owner
+    /// that RETURNS, and the two shapes this package added are among them.
+    #[test]
+    fn every_recognized_mode_has_a_returning_owner() {
+        let c = code(SPLIT_SRC);
+        // NR6: the direct transaction, and the buffered lane for the no-acknowledgement state.
+        assert!(c.contains("fn try_split_ipccall_queued_into_frame("));
+        assert!(
+            c.contains("return try_split_ipccall_queued_into_frame("),
+            "the no-claimable-acknowledgement state must reach the buffered lane, not a `None`"
+        );
+        // NR7: three modes, each with its own committing owner.
+        for mode in [
+            "DirectReplyMode::DeliverBlockedWithCap",
+            "DirectReplyMode::DeliverBlocked",
+            "DirectReplyMode::QueueUnblocked",
+        ] {
+            assert!(c.contains(mode), "the mode selection must produce {mode}");
+        }
+        assert!(c.contains(".commit_queued_reply_split("));
+        assert!(c.contains("produce_blocked_waiter_ordinary_cap_delivery_split("));
+        // The deterministic refusals are ANSWERED here rather than handed over to be refused.
+        assert!(
+            c.contains("IPCCALL_DIRECT_REFUSED_PRE_LOCK"),
+            "NR6's unresolvable send capability is refused pre-lock"
+        );
+        assert!(
+            c.contains("IPCREPLY_DIRECT_REFUSED_PRE_LOCK"),
+            "NR7's spent reply authority is refused pre-lock"
+        );
+    }
+
+    /// **The buffered lane composes existing owners and compensates exactly.**
+    ///
+    /// Its publication point is the enqueue; before it, each of the three resources it acquires
+    /// has its own undo, and every refusal after an acquisition runs them.
+    #[test]
+    fn the_buffered_lane_owns_three_resources_and_returns_all_of_them() {
+        let c = code(SPLIT_SRC);
+        let lane = c
+            .split("fn try_split_ipccall_queued_into_frame(")
+            .nth(1)
+            .expect("the buffered lane");
+        let lane = &lane[..lane.find("\n}\n").unwrap_or(lane.len())];
+        for (acquire, compensate) in [
+            (
+                "reserve_reply_record_split(",
+                "free_reserved_reply_record_split(",
+            ),
+            (
+                "mint_capability_with_memory_ref_split(",
+                "rollback_minted_cap_split(",
+            ),
+            (
+                "stash_transfer_envelope_split(",
+                "take_transfer_envelope_facts_split(",
+            ),
+        ] {
+            assert!(
+                lane.contains(acquire),
+                "the lane acquires through {acquire}"
+            );
+            assert!(
+                lane.contains(compensate),
+                "and returns it through {compensate}"
+            );
+        }
+        // The publication point re-checks admission in the acquisition that enqueues.
+        assert!(
+            lane.contains("enqueue_request_if_no_waiter_split("),
+            "the enqueue must be the admission-rechecking one, or a receiver that parks in the \
+             window is left asleep behind a queued message"
+        );
+        // It frames through the SHARED helper, never a private `Message::with_header`.
+        assert!(lane.contains("ipc_abi::frame_call_request_message("));
+        assert!(
+            !lane.contains("Message::with_header("),
+            "the lane must not frame a request of its own"
+        );
+        // Every terminal it returns is counted.
+        assert!(lane.contains("note_disposition("));
+    }
+
+    /// The two shared policies this package extracted are driven by BOTH routes, so the broad
+    /// and pre-lock paths cannot come to disagree about them.
+    #[test]
+    fn the_extracted_policies_have_two_drivers_each() {
+        let ipc_state = include_str!("ipc_state.rs");
+        let runtime = include_str!("../../runtime.rs");
+        for owner in [
+            "endpoint_send_admission_locked",
+            "reserve_reply_record_locked",
+            "persist_reply_caller_cap_locked",
+        ] {
+            assert!(
+                ipc_state.contains(&alloc::format!("fn {owner}(")),
+                "{owner} is defined once"
+            );
+            assert!(
+                ipc_state.matches(&alloc::format!("Self::{owner}(")).count() >= 1,
+                "{owner} is driven from the broad owner"
+            );
+            assert!(
+                runtime.contains(&alloc::format!("KernelState::{owner}(")),
+                "{owner} is driven from a split seam too"
+            );
+        }
     }
 }

@@ -185,6 +185,37 @@ pub(crate) enum IpcEndpointSplitRejectReason {
     EndpointQueueFull,
 }
 
+/// U9-IPC-RESIDUAL1 §2 — which broad send arm an endpoint's waiter state selects.
+///
+/// One classification, produced by `KernelState::endpoint_send_admission_locked` and consumed
+/// both by the conservative Stage-4E screen and by NR 6's pre-lock queued lane, so the two
+/// cannot come to disagree about which arm a send belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointSendAdmission {
+    /// A parked receiver and no sender waiters: the direct-delivery arm.
+    ReceiverWaiter(ReceiverWaiterIdentity),
+    /// Sender waiters and no receiver: the full send owns the queue ordering.
+    SenderWaiters,
+    /// Both: the full send owns the combined ordering state.
+    BothWaiters,
+    /// Neither: the buffered enqueue arm.
+    NoWaiters,
+}
+
+/// U9-IPC-RESIDUAL1 §3 — what NR 6's pre-lock queued enqueue did, decided in one acquisition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueuedRequestOutcome {
+    /// Published: the message is the endpoint's, and the caller owns its reply capability.
+    Enqueued,
+    /// The endpoint queue is full. That is the BLOCKING origin, not a failure — the broad path
+    /// parks the sender, and adding a blocking mode here is out of scope.
+    QueueFull,
+    /// A receiver parked, or a sender queued, between the pre-lock read and this acquisition.
+    WaiterAppeared,
+    /// The endpoint incarnation is gone.
+    EndpointMissing,
+}
+
 /// U9-XFER1 §3 — the outcome of a NON-CONSUMING head read, for NR 30 `RecvSharedV3`.
 ///
 /// Deliberately a separate type from [`IpcEndpointRecvResult`]: that one's `Received` variants
@@ -7775,6 +7806,24 @@ pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
 /// enqueue-path grant witness, which NR 30 needs because it is a non-blocking probe.
 pub const XFER2_GRANT_WITNESS_SELECTOR: u64 = 12;
 
+/// U9-IPC-RESIDUAL1 §4 — the queued cap-bearing reply witness selector. Slot 5 is mutually
+/// exclusive; 13 is the next free value after U9-XFER2's 12. It reuses the SAME provisioning and
+/// the same startup slots 13/14, and differs only in which init cell consumes them.
+pub const IPC_RESIDUAL1_QUEUED_CAP_WITNESS_SELECTOR: u64 = 13;
+
+static IPC_RESIDUAL1_QUEUED_CAP_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the U9-IPC-RESIDUAL1 §4 witness (`yarm.ipc_residual1_queued_cap_witness=1`). Default OFF.
+pub(crate) fn set_ipc_residual1_queued_cap_witness_enabled(enabled: bool) {
+    IPC_RESIDUAL1_QUEUED_CAP_WITNESS_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the U9-IPC-RESIDUAL1 §4 witness is armed.
+pub fn ipc_residual1_queued_cap_witness_enabled() -> bool {
+    IPC_RESIDUAL1_QUEUED_CAP_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 static XFER2_GRANT_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -7803,7 +7852,9 @@ pub fn xfer2_grant_witness_enabled() -> bool {
 /// direct predicate would arm paths the witness never exercises, and would change what
 /// `SHARED_REGION_DIRECT_DECLINE_NO_ACK` means on a boot that has no direct producer at all.
 pub fn shared_region_oracle_provisioning_armed() -> bool {
-    shared_region_direct_oracle_enabled() || xfer2_grant_witness_enabled()
+    shared_region_direct_oracle_enabled()
+        || xfer2_grant_witness_enabled()
+        || ipc_residual1_queued_cap_witness_enabled()
 }
 
 /// Stage 198E3C2B: the AArch64 init startup-slot-5 selector for the DIRECT shared-region oracle. On
