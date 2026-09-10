@@ -996,6 +996,8 @@ pub fn bootstrap_first_user_task(
             // DIRECT blocked-waiter oracle. Slot 5 is mutually exclusive, so exactly one is armed.
             init_args[5] = if crate::kernel::boot::xfer2_grant_witness_enabled() {
                 crate::kernel::boot::XFER2_GRANT_WITNESS_SELECTOR
+            } else if crate::kernel::boot::ipc_residual1_queued_cap_witness_enabled() {
+                crate::kernel::boot::IPC_RESIDUAL1_QUEUED_CAP_WITNESS_SELECTOR
             } else {
                 crate::kernel::boot::SHARED_REGION_ORACLE_SELECTOR
             };

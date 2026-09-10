@@ -80,6 +80,29 @@ pub(crate) fn frame_reply_message_with_cap(
     .map_err(|_| SyscallError::InvalidArgs)
 }
 
+/// U9-IPC-RESIDUAL1 §2 — THE `IpcCall` request framing, shared by the broad handler and NR 6's
+/// pre-lock queued lane so the two cannot frame the same request differently.
+///
+/// `OPCODE_INLINE` + `FLAG_REPLY_CAP` + the stashed envelope handle: exactly what
+/// `handle_ipc_call` builds, and the shape the receive side's reply-cap materialization arm
+/// expects to find. This module frames messages and decodes ABI lanes; it never resolves,
+/// mints or materializes a capability, and naming those owners here is left to the modules
+/// that call them.
+pub(crate) fn frame_call_request_message(
+    sender_tid: u64,
+    payload: &[u8],
+    transfer_handle: u64,
+) -> Result<Message, SyscallError> {
+    Message::with_header(
+        sender_tid,
+        super::OPCODE_INLINE,
+        Message::FLAG_REPLY_CAP,
+        Some(transfer_handle),
+        payload,
+    )
+    .map_err(|_| SyscallError::InvalidArgs)
+}
+
 pub(super) fn transfer_cap_arg(
     _kernel: &KernelState,
     frame: &TrapFrame,

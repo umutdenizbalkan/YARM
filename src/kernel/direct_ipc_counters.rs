@@ -73,6 +73,18 @@ pub(crate) struct DirectPathCounters {
     declined_terminal_arbitration: AtomicU64,
     completed: AtomicU64,
     legacy_fallback_after_decline: AtomicU64,
+    /// U9-IPC-RESIDUAL1 §1 — **actual terminal-broad entries, counted once per trap.**
+    ///
+    /// Every other counter here describes what the split helper DECIDED. This one describes
+    /// what the trap then DID, and it is incremented in exactly one place: the split
+    /// dispatcher, immediately after the helper answered `None` for a recognized NR6/NR7. So it
+    /// cannot double-count a helper with several decline sites, cannot miss a decline site
+    /// added later, and — unlike `attempts − completed` — is not perturbed by a terminal that
+    /// forgets to count itself or by a helper that answers `Some` without falling back.
+    ///
+    /// It is deliberately NOT part of `terminals_balance`: it is a different question about the
+    /// same trap (where did it go), not another bucket (how did the helper decide).
+    broad_entries: AtomicU64,
     failed_by_code: [AtomicU64; FAILED_CODE_SLOTS],
     /// Per-direction attestation latches (see `maybe_emit_attestation`).
     attested_first: AtomicUsize,
@@ -92,6 +104,7 @@ impl DirectPathCounters {
             declined_terminal_arbitration: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             legacy_fallback_after_decline: AtomicU64::new(0),
+            broad_entries: AtomicU64::new(0),
             failed_by_code: [const { AtomicU64::new(0) }; FAILED_CODE_SLOTS],
             attested_first: AtomicUsize::new(0),
             attested_settled: AtomicUsize::new(0),
@@ -111,6 +124,7 @@ impl DirectPathCounters {
         self.completed.store(0, Ordering::Relaxed);
         self.legacy_fallback_after_decline
             .store(0, Ordering::Relaxed);
+        self.broad_entries.store(0, Ordering::Relaxed);
         for slot in &self.failed_by_code {
             slot.store(0, Ordering::Relaxed);
         }
@@ -198,6 +212,14 @@ impl DirectPathCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// U9-IPC-RESIDUAL1 §1 — this trap is entering the terminal broad acquisition.
+    ///
+    /// Called from the split dispatcher, once, after the direct helper answered `None`. See the
+    /// `broad_entries` field for why this is the only honest way to count it.
+    pub(crate) fn note_broad_entry(&self) {
+        self.broad_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn attempts(&self) -> u64 {
         self.attempts.load(Ordering::Acquire)
     }
@@ -227,6 +249,10 @@ impl DirectPathCounters {
     }
     pub(crate) fn legacy_fallback_after_decline(&self) -> u64 {
         self.legacy_fallback_after_decline.load(Ordering::Acquire)
+    }
+    /// Traps that actually reached the terminal broad acquisition for this direction.
+    pub(crate) fn broad_entries(&self) -> u64 {
+        self.broad_entries.load(Ordering::Acquire)
     }
 
     /// Failures recorded for one canonical error code.
@@ -342,6 +368,13 @@ pub(crate) struct QuiescentVerdict {
     pub(crate) watermark_bounded: bool,
     /// Every fail-closed fuse is clear.
     pub(crate) fuses_clear: bool,
+    /// **U9-IPC-RESIDUAL1 §6 — the family-closure invariant.**
+    ///
+    /// No recognized trap of this direction reached the terminal broad acquisition. Measured
+    /// once per trap at the dispatcher fall-through, never inferred from the decline buckets:
+    /// a decline that answers the caller here (a typed refusal, a `WouldBlock` retry) is not a
+    /// broad entry, and a terminal that forgets to count itself does not create one.
+    pub(crate) no_broad_entry: bool,
 }
 
 impl QuiescentVerdict {
@@ -359,6 +392,7 @@ impl QuiescentVerdict {
             && self.terminals_mutually_exclusive
             && self.watermark_bounded
             && self.fuses_clear
+            && self.no_broad_entry
     }
 }
 
@@ -395,6 +429,7 @@ pub(crate) fn quiescent_verdict(
             && store.duplicate_consume_rejection_count() == 0
             && store.duplicate_release_rejection_count() == 0
             && store.not_committed_rejection_count() == 0,
+        no_broad_entry: counters.broad_entries() == 0,
     }
 }
 
@@ -517,7 +552,7 @@ fn emit_quiescent(
     // Split across four lines per direction: `PRB_MSG_MAX` is 192 bytes and a kernel log line
     // is truncated silently, so one wide line would clip its own verdict flags.
     crate::yarm_log!(
-        "IPC_DIRECT_PRODUCTION_QUIESCENT dir={} attempts={} completed={} failed={} preflight={} pre_txn={} fallback={} not_admitted={} transfer_cap={} arbitrated={}",
+        "IPC_DIRECT_PRODUCTION_QUIESCENT dir={} attempts={} completed={} failed={} preflight={} pre_txn={} fallback={} not_admitted={} transfer_cap={} arbitrated={} broad_entries={}",
         which,
         counters.attempts(),
         counters.completed(),
@@ -528,15 +563,17 @@ fn emit_quiescent(
         counters.declined_not_admitted(),
         counters.declined_transfer_cap(),
         counters.declined_terminal_arbitration(),
+        counters.broad_entries(),
     );
     crate::yarm_log!(
-        "IPC_DIRECT_PRODUCTION_QUIESCENT_FLAGS dir={} terminals={} eligibility={} completed_gt0={} no_confinement={} no_late_fallback={} result={}",
+        "IPC_DIRECT_PRODUCTION_QUIESCENT_FLAGS dir={} terminals={} eligibility={} completed_gt0={} no_confinement={} no_late_fallback={} no_broad_entry={} result={}",
         which,
         v.terminals_balance as u8,
         v.eligibility_balances as u8,
         v.completed_positive as u8,
         v.no_confinement_decline as u8,
         v.no_fallback_after_terminal as u8,
+        v.no_broad_entry as u8,
         if v.ok() { "ok" } else { "fail" },
     );
     crate::yarm_log!(

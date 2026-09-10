@@ -34155,6 +34155,18 @@ mod stage115_d2_d6_seam_analysis {
             split_src.contains("fn try_split_ipc_send_into_frame("),
             "NR 1 has a pre-lock route since 199G-C4 §1"
         );
+        // U9-IPC-RESIDUAL1 §2: matched against CODE, not prose. The rule is that the pre-lock
+        // routes must not REIMPLEMENT these owners; naming one in a doc comment to say which
+        // owner does the work is the opposite of the defect, and the sibling guard above
+        // already strips comments for exactly this reason.
+        let split_code: alloc::string::String = split_src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
         for reimplemented in [
             "mint_capability_in_cnode",
             "materialize_received_message_cap",
@@ -34162,7 +34174,7 @@ mod stage115_d2_d6_seam_analysis {
             "phase_a_take_reply_envelope",
         ] {
             assert!(
-                !split_src.contains(reimplemented),
+                !split_code.contains(reimplemented),
                 "D1/D5: the NR 1 route must consume the cap-transfer owners, never reimplement \
                  `{reimplemented}`"
             );
@@ -86503,31 +86515,38 @@ mod stage199d_delivery_projection_differential {
                 split
                     .matches("COUNTERS.note_declined_pre_transaction();")
                     .count(),
-                20,
-                "NR6 has three (copy, snapshot, ack claim); 199D-TRC gave NR7 three more — the \
-                 unresolved-record fail-close, the mode-indeterminate refusal and the lost \
-                 terminal claim; DIRECT3-QUEUECAP gave it two more on the queued mode — the \
-                 message-framing refusal and the pre-mutation queue refusal; DIRECT3-CAP-FINAL \
-                 gave the capability lane nine, one per way it can refuse having mutated \
-                 nothing it cannot undo — absent transfer cap, unreadable caller, unreadable \
-                 authority slots, refused record reservation, an unarmed terminal, a LOST \
-                 terminal claim, a refused envelope stash, a refused message framing, and a \
-                 producer that declined or failed. §7's pre-lock refusal of a spent reply \
-                 authority is NOT among them: it is a PREFLIGHT decline, counted through \
+                23,
+                "NR6 has two (copy, snapshot) since U9-IPC-RESIDUAL1 §2 turned the third — the \
+                 no-claimable-acknowledgement case — into the BUFFERED lane, which contributes \
+                 one of its own through its shared `decline` helper; 199D-TRC gave NR7 three — \
+                 the unresolved-record fail-close, the mode-indeterminate refusal and the lost \
+                 terminal claim; the queued mode has five — message framing, the pre-mutation \
+                 queue refusal, and §2's three cap-bearing acquisitions (absent transfer cap, \
+                 unreadable caller, refused envelope stash); DIRECT3-CAP-FINAL gave the \
+                 blocked capability lane nine, one per way it can refuse having mutated nothing \
+                 it cannot undo — absent transfer cap, unreadable caller, unreadable authority \
+                 slots, refused record reservation, an unarmed terminal, a LOST terminal claim, \
+                 a refused envelope stash, a refused message framing, and a producer that \
+                 declined or failed. §7\'s pre-lock refusal of a spent reply authority is NOT \
+                 among them: it is a PREFLIGHT decline, counted through \
                  `note_declined_preflight_reply` with every other ineligibility"
             );
             for (direction, sites, what) in [
                 (
                     "REQUEST_COUNTERS",
                     3,
-                    "copy, snapshot and ack-claim declines are all counted",
+                    "copy and snapshot declines are counted, plus the BUFFERED lane's single \
+                     shared `decline` helper — U9-IPC-RESIDUAL1 §2 turned the third site, the \
+                     no-claimable-acknowledgement case, into that lane instead of a fall-back",
                 ),
                 (
                     "REPLY_COUNTERS",
-                    17,
+                    20,
                     "copy, snapshot, ack-claim, unresolved-record, mode-indeterminate, \
                      lost-claim, queued-framing and queued-refusal declines are all counted, \
-                     plus the capability lane's nine — absent transfer cap, unreadable caller, \
+                     plus U9-IPC-RESIDUAL1 §2's three cap-bearing queued acquisitions (absent \
+                     transfer cap, unreadable caller, refused envelope stash), and the blocked \
+                     capability lane's nine — absent transfer cap, unreadable caller, \
                      unreadable authority slots, refused record reservation, unarmed terminal, \
                      lost terminal claim, refused envelope stash, refused message framing, and \
                      a producer that declined or failed. The lane uses THIS counter rather than \
@@ -86549,9 +86568,13 @@ mod stage199d_delivery_projection_differential {
                 split
                     .matches("direct_ipc_counters::note_disposition(")
                     .count(),
-                3,
-                "NR6, the plain NR7 lanes, and the capability lane each count their terminal \
-                 disposition — the capability lane needs its own because it returns from the \
+                6,
+                "Every lane that RETURNS from the route counts its own terminal disposition. \
+                 U9-IPC-RESIDUAL1 §1/§2 added three: the queued reply success (which applied a \
+                 disposition without recording it, so `terminals_balance` read false on every \
+                 ordinary boot), the fail-closed unresolved-claim exit, and NR6's BUFFERED \
+                 lane. The rest are NR6 direct, the plain NR7 tail, and the capability lane — \
+                 the capability lane needs its own because it returns from the \
                  route before the shared tail, having handed its delivery to the drain"
             );
             // Only the NR6 direction can report a MODE decline; NR7 has no mode requirement.
@@ -106439,8 +106462,12 @@ mod stage200d2b1d1_ordinary_link {
             "the ordinary registration must not be gated on an oracle feature"
         );
         // After the record is authoritative (Phase 3 persisted the CapId)...
+        // U9-IPC-RESIDUAL1 §2 re-anchor: Phase 3 is now the shared
+        // `persist_reply_caller_cap_locked` body, so that both this creator and NR 6's pre-lock
+        // queued lane persist the minted CapId through one owner. The ORDERING property this
+        // guard exists for is unchanged and still checked here.
         let phase3 = body
-            .find("record.caller_cap_id = cap_id;")
+            .find("Self::persist_reply_caller_cap_locked(")
             .expect("phase 3");
         assert!(
             phase3 < reg,

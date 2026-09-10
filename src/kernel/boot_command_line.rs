@@ -372,6 +372,14 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_xfer2_grant_witness_enabled(enabled);
         crate::yarm_log!("YARM_XFER2_GRANT_WITNESS_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.ipc_residual1_queued_cap_witness {
+        // U9-IPC-RESIDUAL1 §4: arm the queued cap-bearing reply witness. Default off.
+        crate::kernel::boot::set_ipc_residual1_queued_cap_witness_enabled(enabled);
+        crate::yarm_log!(
+            "YARM_IPC_RESIDUAL1_QUEUED_CAP_WITNESS_SET enabled={}",
+            enabled
+        );
+    }
     if let Some(enabled) = parsed.x86_64_shared_region_direct_oracle {
         // Stage 198E3C1: default-off x86_64 DIRECT shared-region (`IpcSendSharedRegionDirect`)
         // live-oracle knob. Provisions init startup slot 5 (=2) so init runs the parent/child
@@ -832,6 +840,12 @@ pub struct YarmBootOptions<'a> {
     /// the shared-region oracle provisions. Architecture-neutral: the whole cell is the same
     /// syscalls on all three ports.
     pub xfer2_grant_witness: Option<bool>,
+    /// U9-IPC-RESIDUAL1 §4: `yarm.ipc_residual1_queued_cap_witness=1` DEFAULT-OFF knob. Arms init
+    /// startup slot 5 (=13) so init exercises the one newly-served shape no service issues: an
+    /// `IpcReply` carrying a transferred capability to a caller that is not blocked.
+    /// Architecture-neutral, over the same disposable authority the shared-region oracle
+    /// provisions.
+    pub ipc_residual1_queued_cap_witness: Option<bool>,
     /// Stage 198E3C2B: `yarm.aarch64_shared_region_direct_oracle=1` DEFAULT-OFF knob. Provisions init
     /// startup slot 5 (=6) so init runs the SAME arch-neutral DIRECT shared-region delivery proof on
     /// AArch64, and arms the shared IPC/oracle-proof knob. Selects the workload + enables exactly one
@@ -1128,6 +1142,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.xfer2_grant_witness" {
             options.xfer2_grant_witness = parse_bool_knob(value);
+        }
+        if key == b"yarm.ipc_residual1_queued_cap_witness" {
+            options.ipc_residual1_queued_cap_witness = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_shared_region_direct_oracle" {
             options.aarch64_shared_region_direct_oracle = parse_bool_knob(value);
