@@ -2996,6 +2996,33 @@ fn try_split_ipccall_direct_into_frame(
             verdict
                 == crate::kernel::direct_eligibility::DirectRequestEligibility::EndpointNotAdmitted,
         );
+        // U9-IPC-RESIDUAL1 §2 — CLOSE THE DETERMINISTIC-REFUSAL EDGE, exactly as the NR 7 twin
+        // closes its own (`IPCREPLY_DIRECT_REFUSED_PRE_LOCK`).
+        //
+        // When the send capability does not resolve AS AN ENDPOINT WITH `SEND`, the broad
+        // handler's only remaining act is to fail: `validate_endpoint_right(kernel, cap, SEND)?`
+        // is the FIRST statement of `handle_ipc_call`, so nothing else has run and nothing else
+        // will. Entering the terminal broad acquisition purely to be told that buys nothing.
+        //
+        // The two resolvers apply the same three checks in the same order — slot present
+        // (`InvalidCapability`), object is an `Endpoint` (`WrongObject`), `SEND` right held
+        // (`MissingRight`) — so the error given here is the one the broad path would have
+        // produced, written the same way, having mutated NOTHING. Every other verdict still
+        // declines to legacy, because for those the broad path genuinely does more than fail:
+        // a `Synchronous` endpoint is served by the rendezvous arm, an unadmitted one by the
+        // legacy send, and an over-long payload is judged after the capability checks.
+        if let crate::kernel::direct_eligibility::DirectRequestEligibility::SendCapUnresolved(err) =
+            verdict
+        {
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_REFUSED_PRE_LOCK tid={} send_cap={} err={:?} copies=0 enqueues=0 mutations=0 result=ok",
+                tid.unwrap_or(0),
+                send_cap.0,
+                err
+            );
+            frame.set_err(crate::kernel::syscall::SyscallError::from(err).code());
+            return Some(Ok(()));
+        }
         crate::yarm_log!(
             "IPCCALL_DIRECT_DECLINE reason=preflight verdict={:?} tid={}",
             verdict,
