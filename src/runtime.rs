@@ -8071,6 +8071,45 @@ impl SharedKernel {
             .ok_or(KernelError::InvalidCapability)
     }
 
+    /// U9-IPC-RESIDUAL2 §2 — THE endpoint-right validation, off-lock, in the broad order.
+    ///
+    /// `syscall::helpers::validate_endpoint_right` is the one owner of "may this task use this
+    /// capability as an endpoint with this right", and its ORDER is part of the answer:
+    ///
+    /// 1. the slot must resolve **and** its object must be live → `InvalidCapability`;
+    /// 2. the object must be an `Endpoint` → `WrongObject`;
+    /// 3. the right must be held → `MissingRight`.
+    ///
+    /// A route that asks the same three questions in a different order gives a different answer
+    /// for a capability that fails more than one of them, which is a user-visible difference for
+    /// exactly the malformed calls that are hardest to debug. So this mirrors the sequence rather
+    /// than re-deriving it, and both NR 6 pre-lock users (the preflight refusal resolver and the
+    /// buffered lane's reply-endpoint check) go through here.
+    ///
+    /// Returns the resolved object so a caller that needs the incarnation does not resolve twice.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn validate_endpoint_right_split_read(
+        &self,
+        tid: u64,
+        cap: crate::kernel::capabilities::CapId,
+        right: crate::kernel::capabilities::CapRights,
+    ) -> Result<crate::kernel::capabilities::CapObject, crate::kernel::syscall::SyscallError> {
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::syscall::SyscallError;
+        let live = self
+            .task_cnode_split(tid)
+            .and_then(|cnode| self.resolved_capability_split(cnode, cap))
+            .filter(|c| self.capability_object_live_split(c.object).is_some());
+        let endpoint_cap = live.ok_or(SyscallError::InvalidCapability)?;
+        if !matches!(endpoint_cap.object, CapObject::Endpoint { .. }) {
+            return Err(SyscallError::WrongObject);
+        }
+        if !endpoint_cap.has_right(right) {
+            return Err(SyscallError::MissingRight);
+        }
+        Ok(endpoint_cap.object)
+    }
+
     /// U9-C — rank-3 liveness of an exact Reply object. This is the `Reply` arm of
     /// `KernelState::capability_object_live`, narrowed to the one class the reply-cap
     /// transaction needs, so no wider object-store read is introduced.
@@ -8628,7 +8667,29 @@ impl SharedKernel {
         frame: &mut TrapFrame,
         addr: usize,
     ) -> Result<(), KernelError> {
-        use crate::arch::trap::{FaultAccess, FaultInfo};
+        use crate::arch::trap::FaultAccess;
+        self.record_split_user_fault(cpu, frame, addr, FaultAccess::Write)
+    }
+
+    /// U9-IPC-RESIDUAL2 §2 — the SAME transaction, with the access direction as a parameter.
+    ///
+    /// `record_user_fault` has always taken the direction: the recv boundary reports `Write`
+    /// because it faults writing INTO the receiver, and NR 6 / NR 7 report `Read` because they
+    /// fault reading the caller's payload OUT. The direction reaches the fault record and is what
+    /// a fault handler uses to decide whether the page is a demand-read or a copy-on-write case,
+    /// so hard-coding it here would have made every split source-copy fault report the wrong
+    /// cause.
+    ///
+    /// The body is unchanged and is documented on the `_recv_boundary_` wrapper above: rank 1
+    /// bind, rank 8 record, then the frame error, with a refused CPU mutating nothing.
+    fn record_split_user_fault(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        addr: usize,
+        access: crate::arch::trap::FaultAccess,
+    ) -> Result<(), KernelError> {
+        use crate::arch::trap::FaultInfo;
         use crate::kernel::syscall::SyscallError;
         use crate::kernel::vm::VirtAddr;
 
@@ -8637,11 +8698,29 @@ impl SharedKernel {
         // (2) rank 8 — the fault record, identical to `record_user_fault`'s.
         self.record_fault_split_mut(FaultInfo {
             addr: VirtAddr(addr as u64),
-            access: FaultAccess::Write,
+            access,
         });
         // (3) no lock held — the frame error, after the record, as `record_user_fault` ordered.
         frame.set_err(SyscallError::PageFault.code());
         Ok(())
+    }
+
+    /// U9-IPC-RESIDUAL2 §2 — the source-payload READ fault, for NR 6 and NR 7.
+    ///
+    /// Both broad handlers answer a faulting source copy the same way and it is NOT an error
+    /// return: `record_user_fault(kernel, frame, user_ptr, FaultAccess::Read)` then `Ok(())`.
+    /// Substituting `InvalidArgs` would skip the fault record entirely, so the task would be
+    /// told its arguments were malformed instead of being told — and having the kernel record —
+    /// that its buffer was not readable.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn record_split_source_read_fault(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        addr: usize,
+    ) -> Result<(), KernelError> {
+        use crate::arch::trap::FaultAccess;
+        self.record_split_user_fault(cpu, frame, addr, FaultAccess::Read)
     }
 
     /// Stage 198B — emit the AUTHORITATIVE ordinary-cap object-identity proof for a freshly
@@ -8989,6 +9068,33 @@ impl SharedKernel {
                         snap.sender_tid,
                         cleanup.handle,
                         u8::from(taken)
+                    );
+                }
+                // U9-IPC-RESIDUAL2 §3 — and the reply authority, when the producer minted one.
+                //
+                // Order mirrors the lane's own `unwind_mint`: revoke the minted capability
+                // FIRST, then free the record it names. Freeing the record first would leave a
+                // live `Reply` cap pointing at a slot that may already have been reissued.
+                //
+                // Both are the lane's exact owners, and both are generation-exact, so a refusal
+                // that raced a recycle settles nothing rather than settling somebody else's.
+                if let Some(authority) = snap.reply_authority {
+                    self.rollback_minted_cap_split(
+                        authority.caller_cnode,
+                        authority.reply_cap_id,
+                        authority.reply_object,
+                    );
+                    let freed = self.free_reserved_reply_record_split(
+                        authority.record_index,
+                        authority.record_generation,
+                    );
+                    crate::yarm_log!(
+                        "U6_BLOCKING_SEND_REPLY_AUTHORITY_RECLAIMED tid={} reply_cap={} record_index={} record_generation={} freed={}",
+                        snap.sender_tid,
+                        authority.reply_cap_id.0,
+                        authority.record_index,
+                        authority.record_generation,
+                        u8::from(freed)
                     );
                 }
                 let error = refusal
@@ -14221,16 +14327,23 @@ impl SharedKernel {
         })
     }
 
-    /// U9-IPC-RESIDUAL1 §3 — rank 3: NR 6's queued publication point. Re-checks admission and
-    /// enqueues in ONE acquisition; see `enqueue_request_if_no_waiter_locked`.
+    /// U9-IPC-RESIDUAL1 §3 / U9-IPC-RESIDUAL2 §3 — rank 3: NR 6's queued publication point.
+    /// Validates the exact endpoint incarnation, re-checks admission and enqueues in ONE
+    /// acquisition; see `enqueue_request_if_no_waiter_locked`.
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub(crate) fn enqueue_request_if_no_waiter_split(
         &self,
         endpoint_idx: usize,
+        expected_generation: u64,
         msg: crate::kernel::ipc::Message,
     ) -> crate::kernel::boot::QueuedRequestOutcome {
         self.with_ipc_split_mut(|ipc| {
-            KernelState::enqueue_request_if_no_waiter_locked(ipc, endpoint_idx, msg)
+            KernelState::enqueue_request_if_no_waiter_locked(
+                ipc,
+                endpoint_idx,
+                expected_generation,
+                msg,
+            )
         })
     }
 

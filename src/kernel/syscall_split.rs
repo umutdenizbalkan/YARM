@@ -739,6 +739,15 @@ pub(crate) fn try_split_dispatch_into_frame(
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
+    // U9-IPC-RESIDUAL2 §2 — the SIXTH switching class. `IpcCall` (NR 6) joins the five above it
+    // for the reason the list exists: its full-endpoint arm parks the caller, and a parked
+    // caller may not be early-returned through its own frame. It produces every shape the list
+    // was built for — a completed syscall, a delivery the post-work drain owes, and a parked
+    // sender whose queue advance that drain performs — exactly as `IpcSend` does.
+    match try_split_ipccall_into_frame(shared, cpu, frame) {
+        SplitDispatchDisposition::NotHandled => {}
+        handled => return handled,
+    }
     match try_split_dispatch_nonswitching_into_frame(shared, cpu, frame) {
         None => SplitDispatchDisposition::NotHandled,
         Some(result) => SplitDispatchDisposition::Complete(result),
@@ -1303,6 +1312,9 @@ fn try_split_ipc_send_into_frame(
                             .unwrap_or(crate::kernel::ipc::ThreadId(tid)),
                     }
                 }),
+                // U9-IPC-RESIDUAL2 §3: NR 1 mints no reply authority — a `Reply` capability is
+                // refused admission to a queueing send at step (5) — so it owes none back.
+                reply_authority: None,
             };
             // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
             // identical discipline to every other producer's store.
@@ -2552,26 +2564,10 @@ fn try_split_dispatch_nonswitching_into_frame(
         return try_split_futex_wake_into_frame(shared, cpu, frame);
     }
 
-    // Stage 199A2B2F: IpcCall (NR 6) direct request. The helper snapshots the request off-lock
-    // and drives the accepted off-lock transaction. For any case it cannot service it returns
-    // `None`, so NR 6 falls back to its existing broad path.
-    //
-    // U9-YIELD2 §1 — the "(proof-gated, default-OFF)" label that used to head this note is stale.
-    // `ipccall_direct_admission_enabled()` is `production || proof`, and the production term is
-    // `true` on all three architectures, so this gate is OPEN on every ordinary boot. NR 6's
-    // residual arm is the helper's `None`, not an unarmed gate.
-    if matches!(syscall, Syscall::IpcCall)
-        && crate::kernel::boot::ipccall_direct_admission_enabled()
-    {
-        if let Some(result) = try_split_ipccall_direct_into_frame(shared, cpu, frame) {
-            return Some(result);
-        }
-        // U9-IPC-RESIDUAL1 §1 — THE terminal-entry measurement, once per trap, here and nowhere
-        // else. Past this point a recognized NR6 has no other pre-lock owner, so it reaches the
-        // broad acquisition. Counted at the fall-through rather than inside the helper because
-        // the helper declines from many places and answers `Some` from several of them.
-        crate::kernel::direct_ipc_counters::REQUEST.note_broad_entry();
-    }
+    // U9-IPC-RESIDUAL2 §2: IpcCall (NR 6) is no longer serviced from here. It became a SWITCHING
+    // class the moment its full-endpoint arm started parking the caller, so it is tried in
+    // `try_split_dispatch_into_frame` alongside the other four, whose contract admits a caller
+    // that must not be early-returned through its own frame.
 
     // Stage 199A2B3: IpcReply (NR 7) direct reply. The helper snapshots the reply payload
     // off-lock (owned) and drives the accepted off-lock reply transaction (reserve →
@@ -2929,21 +2925,210 @@ fn try_split_futex_wake_into_frame(
 /// all three architectures, so the gate is open on every ordinary boot and the route is reached on
 /// x86_64, AArch64 and RISC-V alike.
 ///
-/// Runs ENTIRELY off the broad `KernelState` lock and
-/// off any ranked lock during the source copy:
+/// Runs ENTIRELY off the broad `KernelState` lock and off any ranked lock during the source copy:
 ///   read args → capture caller `{tid,asid}` → validate `len<=128` → copy the request
 ///   payload through `copy_from_user_asid_split_read` (NO lock held) → build the owned
 ///   `IpcCallDirectSnapshot` → CLAIM the exact published blocked-server acknowledgement
 ///   → build one owned `DirectRequestPostWork` → drain it through the accepted
-///   `SharedKernel::ipc_call_direct_request_txn`. No userspace payload pointer survives
-///   the snapshot. On invalid length / copy fault / no committed ack, returns `None`
-///   (the ack is never claimed, nothing is mutated) so NR6 stays on its existing path.
+///   `SharedKernel::ipc_call_direct_request_txn`. No userspace payload pointer survives the
+///   snapshot.
+///
+/// # U9-IPC-RESIDUAL2 §2 — the boundary is TOTAL
+///
+/// Every sentence above described what this route DOES; what it used to do besides was answer
+/// `None` from eleven places, and each of those handed a recognized NR 6 to the terminal broad
+/// acquisition. U9-IPC-RESIDUAL1 measured that traffic and closed two shapes; it did not make the
+/// boundary total, and its record said so less plainly than it should have.
+///
+/// A recognized NR 6 now leaves this route by exactly one of four doors, and `NotHandled` is not
+/// among them once the syscall is recognized:
+///
+/// | door | disposition | when |
+/// |---|---|---|
+/// | the typed refusal | `Complete(Ok)` with the frame carrying the broad path's own error | every validation the broad handler would have failed |
+/// | the user fault | `Complete(Ok)` with the fault recorded and `PageFault` framed | a source copy the caller's address space refused |
+/// | the delivery | `Complete(Ok)` / `PostWorkCommitted{finalize_syscall:true}` | direct hand-off, buffered enqueue, or blocked-waiter delivery |
+/// | the park | `PostWorkCommitted{finalize_syscall:false}` | a full endpoint — the blocking origin |
+///
+/// Internal hand-off between the three lanes (direct → buffered → park) is not a door: it is
+/// this route choosing which of its own owners answers, which is what §2 permits and what the
+/// broad handler does inside one acquisition.
+///
+/// Two preflight verdicts are answered with a typed invariant error rather than a lane, on the
+/// precedent NR 1 set for the same two classes (199G-C4 §4): `SynchronousMode` and
+/// `EndpointNotAdmitted` are both unreachable from any supported configuration, and handing an
+/// impossible class to the broad dispatcher would be the one edge this package exists to remove.
+/// The unreachability is source-derived, not observational — see
+/// `u9_ipc_residual2_closure::{no_production_endpoint_is_synchronous, direct_production_admission_is_statically_total}`.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_ipccall_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    use SplitDispatchDisposition as D;
+    if !matches!(Syscall::decode(frame.syscall_num()), Ok(Syscall::IpcCall)) {
+        return D::NotHandled;
+    }
+    // U9-YIELD2 §1: `production || proof`, and the production term is a `const fn` that is true on
+    // x86_64, AArch64 and RISC-V. On a supported port this never declines; an unsupported port
+    // has no split route at all, and its NR 6 is counted honestly as a broad entry.
+    if !crate::kernel::boot::ipccall_direct_admission_enabled() {
+        crate::kernel::direct_ipc_counters::REQUEST.note_broad_entry();
+        return D::NotHandled;
+    }
+    if cpu.0 as usize >= crate::kernel::scheduler::MAX_CPUS {
+        crate::kernel::direct_ipc_counters::REQUEST.note_broad_entry();
+        return D::NotHandled;
+    }
+    match try_split_ipccall_direct_into_frame(shared, cpu, frame) {
+        Some(disposition) => disposition,
+        // U9-IPC-RESIDUAL2 §2/§4 — the residual door, which production must never take.
+        //
+        // It is deliberately still HERE rather than deleted: the closure guards assert that no
+        // reachable path reaches it, and a guard that asserts about a door that does not exist
+        // proves nothing. If a future change reintroduces a fall-through, this counts it in the
+        // one place §1 established as honest, and the boot attestation's `no_broad_entry` flag
+        // turns the next ordinary boot red.
+        None => {
+            crate::kernel::direct_ipc_counters::REQUEST.note_broad_entry();
+            D::NotHandled
+        }
+    }
+}
+
+/// U9-IPC-RESIDUAL2 §2 — resolve a NR 6 preflight refusal to the error the BROAD handler would
+/// have produced, **in the broad handler's own order**.
+///
+/// `classify_direct_request_eligibility` is a pure classifier and its order is its own: it asks
+/// the cheapest question first (`payload_len`) so that an over-long payload never reaches a
+/// capability resolution. That is the right order for a classifier and the wrong order for an
+/// answer, because `handle_ipc_call` validates capabilities first:
+///
+/// ```text
+/// validate_endpoint_right(send_cap, SEND)?      // InvalidCapability / WrongObject / MissingRight
+/// validate_endpoint_right(reply_recv_cap, RECEIVE)?
+/// current_tid()?
+/// resolve_endpoint_index(endpoint)?             // WrongObject / StaleCapability
+/// len > Message::MAX_PAYLOAD                    // InvalidArgs
+/// ```
+///
+/// A call that is wrong in more than one way must be told about the FIRST thing that is wrong,
+/// or the two routes disagree for exactly the malformed calls that are hardest to debug. So this
+/// re-asks the questions in the broad order rather than translating the classifier's verdict
+/// one-to-one — the verdict decides only that a refusal is owed, never which one.
+///
+/// Nothing here mutates: every step is a read, and the refusal is delivered by writing the frame,
+/// which is what the broad handler's `?` would have done one lock later.
+#[cfg(not(feature = "hosted-dev"))]
+fn nr6_refuse_preflight(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    verdict: crate::kernel::direct_eligibility::DirectRequestEligibility,
+    tid: Option<u64>,
+    send_cap: crate::kernel::capabilities::CapId,
+    reply_recv_cap: crate::kernel::capabilities::CapId,
+) -> SplitDispatchDisposition {
+    use crate::kernel::capabilities::CapRights;
+    use crate::kernel::direct_eligibility::DirectRequestEligibility as V;
+    use crate::kernel::syscall::SyscallError;
+    use SplitDispatchDisposition as D;
+
+    let answer = |frame: &mut TrapFrame, err: SyscallError, reason: &str| -> D {
+        crate::yarm_log!(
+            "IPCCALL_DIRECT_REFUSED_PRE_LOCK tid={} send_cap={} reason={} err={:?} copies=0 enqueues=0 mutations=0 result=ok",
+            tid.unwrap_or(0),
+            send_cap.0,
+            reason,
+            err
+        );
+        frame.set_err(err.code());
+        D::Complete(Ok(()))
+    };
+
+    // (1) The send capability, first, exactly as `validate_endpoint_right(send_cap, SEND)` asks.
+    // `resolve_endpoint_send_cap_split_read` applies the identical three checks in the identical
+    // order, so `SendCapUnresolved` already carries the broad answer.
+    //
+    // `RequesterUnavailable` arrives here too and is not a separate answer: with no current task
+    // the resolution above was set to `Err(InvalidCapability)` at the call site, which is what
+    // `validate_endpoint_right` produces for a task with no cnode.
+    if let V::SendCapUnresolved(err) = verdict {
+        return answer(frame, SyscallError::from(err), "send_cap");
+    }
+    if matches!(verdict, V::RequesterUnavailable) {
+        return answer(frame, SyscallError::InvalidCapability, "no_requester");
+    }
+    // `NotAnEndpoint` is unreachable through this route — the resolver above already refuses a
+    // non-`Endpoint` object with `WrongObject`, so such a capability arrives as
+    // `SendCapUnresolved(WrongObject)`. Answered with the same error it would have carried, so
+    // the arm is correct rather than merely unreachable.
+    if matches!(verdict, V::NotAnEndpoint) {
+        return answer(frame, SyscallError::WrongObject, "not_an_endpoint");
+    }
+
+    // (2) The reply-receive capability, second, as the broad handler validates it — and BEFORE
+    // the endpoint incarnation and the payload length, which are the two verdicts below.
+    let requester = tid.unwrap_or(0);
+    if let Err(err) =
+        shared.validate_endpoint_right_split_read(requester, reply_recv_cap, CapRights::RECEIVE)
+    {
+        return answer(frame, err, "reply_cap");
+    }
+
+    match verdict {
+        // (3) `resolve_endpoint_index` answers `StaleCapability` for a stale incarnation and
+        // `WrongObject` for an absent one; both map to `WrongObject` at the syscall boundary.
+        V::EndpointIncarnationGone => answer(frame, SyscallError::WrongObject, "incarnation_gone"),
+        // (4) `len > Message::MAX_PAYLOAD` → `InvalidArgs`. `IPC_DIRECT_PAYLOAD_MAX` is defined AS
+        // `Message::MAX_PAYLOAD`, so the two limits are the same number by construction and this
+        // is the broad path's own refusal rather than a narrower one wearing its error.
+        V::PayloadTooLong => answer(frame, SyscallError::InvalidArgs, "payload_too_long"),
+        // (5) The two impossible classes, refused with a typed invariant error rather than a
+        // fallback — the precedent NR 1 set for exactly these two (199G-C4 §4).
+        //
+        // `Synchronous`: every production endpoint is created by `create_endpoint(depth)` or by
+        // `spawn_image_txn`'s explicit `EndpointMode::Buffered`, and there is no endpoint-creation
+        // syscall at all, so userspace cannot obtain one. `EndpointNotAdmitted`:
+        // `ipccall_direct_production_enabled()` is a `const fn` returning true on x86_64, AArch64
+        // and RISC-V, and it is the first term of the admission predicate, so on every supported
+        // port the confining branch is statically dead.
+        V::SynchronousMode => {
+            crate::yarm_log!(
+                "IPCCALL_SPLIT_INVARIANT cpu={} tid={} reason=synchronous_endpoint result=failed_closed",
+                cpu.0,
+                requester
+            );
+            answer(frame, SyscallError::WrongObject, "synchronous_endpoint")
+        }
+        V::EndpointNotAdmitted => {
+            crate::yarm_log!(
+                "IPCCALL_SPLIT_INVARIANT cpu={} tid={} reason=endpoint_not_admitted result=failed_closed",
+                cpu.0,
+                requester
+            );
+            answer(frame, SyscallError::Internal, "endpoint_not_admitted")
+        }
+        // Handled above; listed so a new verdict cannot inherit an arm by wildcard.
+        V::SendCapUnresolved(_) | V::RequesterUnavailable | V::NotAnEndpoint => {
+            answer(frame, SyscallError::InvalidCapability, "unreachable_verdict")
+        }
+        V::Eligible { .. } => {
+            debug_assert!(false, "an eligible verdict never reaches the refusal resolver");
+            answer(frame, SyscallError::Internal, "eligible_in_refusal")
+        }
+    }
+}
+
+/// U9-IPC-RESIDUAL2 §2 — the NR 6 body. `None` is the residual door and no reachable path
+/// returns it; see [`try_split_ipccall_into_frame`] for the four doors that are reachable.
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_ipccall_direct_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
-) -> Option<Result<(), TrapHandleError>> {
+) -> Option<SplitDispatchDisposition> {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipccall_direct::{IPC_DIRECT_PAYLOAD_MAX, IpcCallDirectSnapshot};
     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
@@ -2996,43 +3181,36 @@ fn try_split_ipccall_direct_into_frame(
             verdict
                 == crate::kernel::direct_eligibility::DirectRequestEligibility::EndpointNotAdmitted,
         );
-        // U9-IPC-RESIDUAL1 §2 — CLOSE THE DETERMINISTIC-REFUSAL EDGE, exactly as the NR 7 twin
-        // closes its own (`IPCREPLY_DIRECT_REFUSED_PRE_LOCK`).
-        //
-        // When the send capability does not resolve AS AN ENDPOINT WITH `SEND`, the broad
-        // handler's only remaining act is to fail: `validate_endpoint_right(kernel, cap, SEND)?`
-        // is the FIRST statement of `handle_ipc_call`, so nothing else has run and nothing else
-        // will. Entering the terminal broad acquisition purely to be told that buys nothing.
-        //
-        // The two resolvers apply the same three checks in the same order — slot present
-        // (`InvalidCapability`), object is an `Endpoint` (`WrongObject`), `SEND` right held
-        // (`MissingRight`) — so the error given here is the one the broad path would have
-        // produced, written the same way, having mutated NOTHING. Every other verdict still
-        // declines to legacy, because for those the broad path genuinely does more than fail:
-        // a `Synchronous` endpoint is served by the rendezvous arm, an unadmitted one by the
-        // legacy send, and an over-long payload is judged after the capability checks.
-        if let crate::kernel::direct_eligibility::DirectRequestEligibility::SendCapUnresolved(err) =
-            verdict
-        {
-            crate::yarm_log!(
-                "IPCCALL_DIRECT_REFUSED_PRE_LOCK tid={} send_cap={} err={:?} copies=0 enqueues=0 mutations=0 result=ok",
-                tid.unwrap_or(0),
-                send_cap.0,
-                err
-            );
-            frame.set_err(crate::kernel::syscall::SyscallError::from(err).code());
-            return Some(Ok(()));
-        }
-        crate::yarm_log!(
-            "IPCCALL_DIRECT_DECLINE reason=preflight verdict={:?} tid={}",
-            verdict,
-            tid.unwrap_or(0)
-        );
-        return None; // ineligible: no ack claim, no copy, no mutation — legacy path
+        return Some(nr6_refuse_preflight(
+            shared, cpu, frame, verdict, tid, send_cap, reply_cap,
+        ));
     };
     REQUEST_COUNTERS.note_eligible();
     let tid = tid.expect("eligibility requires an available requester");
     let _ = IPC_DIRECT_PAYLOAD_MAX;
+    // U9-IPC-RESIDUAL2 §2 — the reply-receive capability, validated HERE for the eligible path
+    // too, because the broad handler validates it before it copies anything.
+    //
+    // U9-IPC-RESIDUAL1 checked it only inside the buffered lane, and in the lane's own order
+    // (resolve -> right -> kind) rather than the broad order (resolve+live -> kind -> right). Two
+    // consequences, both user-visible: a direct hand-off with a bad reply capability copied the
+    // payload and claimed an acknowledgement before anyone noticed, and a capability that was
+    // both the wrong object AND missing `RECEIVE` reported the wrong one of the two.
+    if let Err(err) = shared.validate_endpoint_right_split_read(
+        tid,
+        reply_cap,
+        crate::kernel::capabilities::CapRights::RECEIVE,
+    ) {
+        crate::yarm_log!(
+            "IPCCALL_DIRECT_REFUSED_PRE_LOCK tid={} send_cap={} reason=reply_cap err={:?} copies=0 enqueues=0 mutations=0 result=ok",
+            tid,
+            send_cap.0,
+            err
+        );
+        frame.set_err(err.code());
+        REQUEST_COUNTERS.note_failed(err);
+        return Some(SplitDispatchDisposition::Complete(Ok(())));
+    }
     // Stage 199A2D2C2B2: on the cross-CPU REQUEST path, if the server has NOT yet published its
     // blocked-server acknowledgement (it is not yet blocked in recv-v2), return a NON-MUTATING
     // WouldBlock so the CPU-0 client retries — never the legacy blocking IpcCall path, and never any
@@ -3043,7 +3221,8 @@ fn try_split_ipccall_direct_into_frame(
     {
         crate::kernel::boot::ipccall_direct_smp_request_note_early_wouldblock();
         frame.set_err(crate::kernel::syscall::SyscallError::WouldBlock.code());
-        return Some(Ok(()));
+        REQUEST_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::WouldBlock);
+        return Some(SplitDispatchDisposition::Complete(Ok(())));
     }
     let asid_raw = shared.task_asid_for_tid_split_read(tid);
     let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(
@@ -3055,19 +3234,61 @@ fn try_split_ipccall_direct_into_frame(
     // From here to the ack claim, every decline is ELIGIBLE-but-pre-transaction: nothing has
     // been mutated, so the legacy path runs — but it must still land in a terminal bucket, or
     // the counters' balance invariant cannot hold.
-    let Some(payload) = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len) else {
-        REQUEST_COUNTERS.note_declined_pre_transaction();
-        crate::yarm_log!(
-            "IPCCALL_DIRECT_DECLINE reason=payload_copy_fault tid={}",
-            tid
-        );
-        return None;
-    };
+    // U9-IPC-RESIDUAL2 §2 — THE SOURCE PAYLOAD, through the same three shapes the broad handler
+    // distinguishes. `copy_from_user_asid_split_read` answers `None` for three unrelated
+    // conditions and the old code read all three as "decline to broad":
+    //
+    // * `asid_raw == 0` — a KERNEL-ASID caller. `handle_ipc_call` does not copy at all for one:
+    //   `current_task_has_user_asid` is false and the payload rides in the argument registers
+    //   (`inline_payload_from_frame`). Treating that as a fault would have reported `PageFault`
+    //   for a call whose payload was never in user memory.
+    // * `len == 0` — an EMPTY payload, which is legal and which the broad path sends happily.
+    // * anything else — a genuine user-memory fault.
+    let mut payload_buf = [0u8; crate::kernel::ipc::Message::MAX_PAYLOAD];
+    if asid_raw == 0 {
+        // The kernel-task shape, through the owner the broad handler uses for it.
+        let Some(regs) = crate::kernel::syscall::split_inline_payload_from_frame(frame, len) else {
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_REFUSED_PRE_LOCK tid={} send_cap={} reason=inline_payload err=InvalidArgs copies=0 enqueues=0 mutations=0 result=ok",
+                tid,
+                send_cap.0
+            );
+            frame.set_err(crate::kernel::syscall::SyscallError::InvalidArgs.code());
+            REQUEST_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::InvalidArgs);
+            return Some(SplitDispatchDisposition::Complete(Ok(())));
+        };
+        payload_buf[..len].copy_from_slice(&regs[..len]);
+    } else if len > 0 {
+        let Some(bytes) = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len) else {
+            // The ESTABLISHED user-fault path, not `InvalidArgs`: record the fault, then frame
+            // `PageFault`, exactly as `record_user_fault(.., FaultAccess::Read)` does one lock
+            // later, and return success from the syscall's point of view.
+            let _ = shared.record_split_source_read_fault(cpu, frame, user_ptr);
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_SOURCE_FAULT tid={} user_ptr={:#x} len={} access=read copies=0 enqueues=0 mutations=0 result=ok",
+                tid,
+                user_ptr,
+                len
+            );
+            REQUEST_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::PageFault);
+            return Some(SplitDispatchDisposition::Complete(Ok(())));
+        };
+        payload_buf[..len].copy_from_slice(&bytes[..len]);
+    }
+    let payload = payload_buf;
     let Some(snapshot) = IpcCallDirectSnapshot::build(caller, send_cap, reply_cap, &payload[..len])
     else {
-        REQUEST_COUNTERS.note_declined_pre_transaction();
-        crate::yarm_log!("IPCCALL_DIRECT_DECLINE reason=snapshot_build tid={}", tid);
-        return None;
+        // The only way the owned snapshot refuses is a length its buffer cannot carry, which the
+        // preflight already bounded — so this is the broad path's `Message::with_header` failure,
+        // and it answers the same `InvalidArgs`.
+        crate::yarm_log!(
+            "IPCCALL_DIRECT_REFUSED_PRE_LOCK tid={} send_cap={} reason=snapshot_build err=InvalidArgs copies=0 enqueues=0 mutations=0 result=ok",
+            tid,
+            send_cap.0
+        );
+        frame.set_err(crate::kernel::syscall::SyscallError::InvalidArgs.code());
+        REQUEST_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::InvalidArgs);
+        return Some(SplitDispatchDisposition::Complete(Ok(())));
     };
     // Consume the acknowledgement published for EXACTLY this endpoint incarnation, at most
     // once (Stage 199D endpoint-keyed, generation-bearing store). A pair belonging to any
@@ -3087,13 +3308,7 @@ fn try_split_ipccall_direct_into_frame(
         // The queued lane decides its own admission from live state inside the acquisition that
         // publishes, so a decline there is still mutation-free.
         return try_split_ipccall_queued_into_frame(
-            shared,
-            frame,
-            tid,
-            asid_raw,
-            send_eidx,
-            send_egen,
-            reply_cap,
+            shared, cpu, frame, tid, asid_raw, send_eidx, send_egen, send_cap, reply_cap,
             &payload[..len],
         );
     };
@@ -3107,28 +3322,79 @@ fn try_split_ipccall_direct_into_frame(
     // so a new error variant cannot silently inherit "success".
     let outcome = shared.drain_direct_request_post_work(cpu, &work);
     let disposition = crate::kernel::direct_disposition::classify_direct_request_outcome(&outcome);
+    // U9-IPC-RESIDUAL2 §2 — A PRISTINE TRANSACTION OUTCOME IS A LANE QUESTION, NOT A FALLBACK.
+    //
+    // `DeclinedBeforeMutation` is the transaction's own word for "nothing was delivered and
+    // nothing was left behind": `WouldBlock`, `LeaseNotClaimed`, `CallerGone`, `SendEndpoint`,
+    // `ReplyEndpoint`, `EndpointGenerationChanged`, `RecordFull`, `ServerCnodeMissing`,
+    // `MintFailed`. `apply_direct_disposition` answers `None` for it, which used to mean the
+    // broad dispatcher — and the broad dispatcher's answer for a request it cannot hand
+    // straight to a blocked server is not an error at all. It is the buffered enqueue, or, if
+    // the queue is full, parking the sender.
+    //
+    // So a pristine outcome goes to the lane that implements exactly that, with the request as
+    // re-sendable as it arrived. The lane re-validates the endpoint, its incarnation and its
+    // admission inside the acquisitions that mutate, so nothing here is assumed to still hold.
+    //
+    // Nothing is counted at this hand-off: the attempt is still in flight and the lane it moves
+    // to supplies the one terminal bucket the balance invariant requires.
+    if matches!(
+        disposition,
+        crate::kernel::direct_disposition::DirectDisposition::DeclinedBeforeMutation
+    ) {
+        crate::yarm_log!(
+            "IPCCALL_DIRECT_TO_BUFFERED tid={} endpoint={} endpoint_generation={} reason={:?} result=ok",
+            tid,
+            send_eidx,
+            send_egen,
+            outcome.as_ref().err()
+        );
+        return try_split_ipccall_queued_into_frame(
+            shared, cpu, frame, tid, asid_raw, send_eidx, send_egen, send_cap, reply_cap,
+            &payload[..len],
+        );
+    }
     crate::kernel::direct_ipc_counters::note_disposition(&REQUEST_COUNTERS, disposition);
     // Stage 199D HARD-STOP C: the frame is encoded by the SHARED encoder, which reproduces
     // the legacy `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(frame, None)` success lanes
     // (`ret2 = SYSCALL_NO_TRANSFER_CAP`), zeroes every lane on failure, and leaves the frame
     // untouched on a decline so the legacy global-lock IpcCall runs against a pristine frame.
     // NR6 is request-send-only: success returns now (the caller blocks via a later recv).
-    crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition).map(|()| Ok(()))
+    //
+    // U9-IPC-RESIDUAL2 §2: the decline arm above is taken before this point, so the encoder can
+    // only be reached with `Completed` or `Failed`, both of which it answers `Some(())`.
+    crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition)
+        .map(|()| SplitDispatchDisposition::Complete(Ok(())))
 }
 
-/// U9-IPC-RESIDUAL1 §2/§3 — **NR 6's BUFFERED (queued) lane**, entirely off the broad lock.
+/// U9-IPC-RESIDUAL1 §2/§3, U9-IPC-RESIDUAL2 §2/§3 — **NR 6's BUFFERED lane**, entirely off the
+/// broad lock, and TOTAL.
 ///
-/// Reached only from the direct helper, and only for the state whose broad behaviour is an
-/// enqueue: an eligible `Buffered` endpoint with no parked receiver and no published
-/// acknowledgement. Every step below is an owner that already exists; nothing here is a second
-/// implementation of the reply-record lifecycle, the envelope stash, the message framing or the
-/// endpoint queue.
+/// Reached whenever the direct hand-off cannot serve the request: no claimable acknowledgement,
+/// or a transaction outcome that delivered nothing and left nothing behind. Both of those are the
+/// same question — "the server is not waiting for this right now" — and the broad handler's
+/// answer to it is not an error. It is `kernel.ipc_send(cap, msg)`, which delivers to a parked
+/// receiver, enqueues into a buffered endpoint, or parks the sender when the queue is full.
+///
+/// This lane reproduces those three arms through the owners that already implement them; nothing
+/// here is a second implementation of the reply-record lifecycle, the envelope stash, the message
+/// framing, the endpoint queue, the blocked-waiter delivery or the blocking-send transaction.
+///
+/// # The three arms, and who owns each
+///
+/// | live state | broad behaviour | owner here |
+/// |---|---|---|
+/// | a recv-v2 blocked receiver | direct delivery | `produce_blocked_waiter_reply_cap_delivery_split` |
+/// | no waiter, room in the queue | enqueue | `enqueue_request_if_no_waiter_split` |
+/// | no waiter, queue full | **park the sender** | `BlockingSendCommitSnapshot` + the U6 drain |
 ///
 /// # Ownership
 ///
-/// **Publication point: the enqueue.** `enqueue_request_if_no_waiter_split` re-asks the
-/// admission question and enqueues in ONE rank-3 acquisition, so a receiver that parks between
-/// the pre-lock read and the publication cannot be left asleep behind a queued message.
+/// **Publication point: the enqueue** — or, on the full-queue arm, the sender-waiter commit.
+/// `enqueue_request_if_no_waiter_split` validates the exact endpoint incarnation, re-asks the
+/// admission question and enqueues in ONE rank-3 acquisition, so neither a receiver that parks
+/// nor a slot that is destroyed and reissued between the pre-lock reads and the publication can
+/// be missed.
 ///
 /// Before that point this transaction owns — and on every refusal returns — exactly three
 /// things, in reverse order of acquisition:
@@ -3140,71 +3406,110 @@ fn try_split_ipccall_direct_into_frame(
 /// | reply record slot | `reserve_reply_record_split` | `free_reserved_reply_record_split` |
 ///
 /// The stash only RESOLVES the source capability, so a compensated request is genuinely
-/// re-sendable: nothing userspace holds was consumed. After the enqueue nothing is compensated —
-/// the message is the receiver's and the caller owns its reply capability, exactly as on the
-/// broad path.
+/// re-sendable: nothing userspace holds was consumed. After a successful publication nothing is
+/// compensated — the message is the receiver's and the caller owns its reply capability, exactly
+/// as on the broad path.
 ///
-/// No responder is bound (there is no waiter), so no `ServerReplyLink` is registered — the same
-/// decision the broad owner makes when `endpoint_waiter_tid` is `None`.
+/// The park arm is the one publication that can still be refused after the resources are taken,
+/// because the rank-ordered commit re-validates the sender's incarnation, its runnability and the
+/// endpoint. That refusal is not this function's to perform — the commit runs in the post-lock
+/// drain — so all three resources travel to it: the envelope in `transfer_envelope`, and the mint
+/// and the record in `reply_authority`, each settled there through the very same owners named
+/// above. §3's requirement that a refusal settle all three is met by the drain, not by hoping the
+/// refusal cannot happen.
+///
+/// No responder is bound on the enqueue arm (there is no waiter), so no `ServerReplyLink` is
+/// registered — the same decision the broad owner makes when `endpoint_waiter_tid` is `None`.
 #[cfg(not(feature = "hosted-dev"))]
 #[allow(clippy::too_many_arguments)]
 fn try_split_ipccall_queued_into_frame(
     shared: &SharedKernel,
+    cpu: CpuId,
     frame: &mut TrapFrame,
     tid: u64,
     asid_raw: u64,
     send_eidx: usize,
     send_egen: u64,
+    send_cap: crate::kernel::capabilities::CapId,
     reply_recv_cap: crate::kernel::capabilities::CapId,
     payload: &[u8],
-) -> Option<Result<(), TrapHandleError>> {
+) -> Option<SplitDispatchDisposition> {
     use crate::kernel::boot::{EndpointSendAdmission, QueuedRequestOutcome};
     use crate::kernel::capabilities::{CapObject, CapRights, Capability};
     use crate::kernel::direct_ipc_counters::REQUEST as REQUEST_COUNTERS;
     use crate::kernel::ipc::ThreadId;
+    use crate::kernel::syscall::SyscallError;
+    use SplitDispatchDisposition as D;
 
-    let decline = |reason: &str| -> Option<Result<(), TrapHandleError>> {
-        REQUEST_COUNTERS.note_declined_pre_transaction();
+    // U9-IPC-RESIDUAL2 §2 — a refusal is an ANSWER now, not a hand-over.
+    //
+    // Every arm below reached this state having mutated nothing that is not compensated first,
+    // so the canonical error is exactly the one the broad handler would have raised from the
+    // corresponding `?`. The frame carries it; the counters record one terminal.
+    let refuse = |frame: &mut TrapFrame, err: SyscallError, reason: &str| -> Option<D> {
+        REQUEST_COUNTERS.note_failed(err);
         crate::yarm_log!(
-            "IPCCALL_QUEUED_SPLIT_DECLINE reason={} tid={} endpoint={}",
+            "IPCCALL_QUEUED_SPLIT_REFUSED reason={} tid={} endpoint={} endpoint_generation={} err={:?} result=ok",
             reason,
             tid,
-            send_eidx
+            send_eidx,
+            send_egen,
+            err
         );
-        None
+        frame.set_err(err.code());
+        Some(D::Complete(Ok(())))
     };
 
-    // (A) rank 3 read — the buffered shape is the one with no waiter of either kind. Any other
-    // admission belongs to an arm this lane does not implement.
-    if shared.endpoint_send_admission_split_read(send_eidx) != EndpointSendAdmission::NoWaiters {
-        return decline("waiter_present");
-    }
-
-    // (B) rank 2 → 4 read — the caller's reply-receive endpoint, validated exactly as the broad
-    // owner validates it: the RECEIVE right, then an `Endpoint` object.
-    let Ok(reply_capability) = shared.resolve_capability_for_task_split(tid, reply_recv_cap) else {
-        return decline("reply_cap_unresolved");
-    };
-    if !reply_capability.has_right(CapRights::RECEIVE) {
-        return decline("reply_cap_missing_receive");
-    }
-    let CapObject::Endpoint { .. } = reply_capability.object else {
-        return decline("reply_cap_not_endpoint");
-    };
-    let reply_endpoint = reply_capability.object;
+    // (B) rank 2 → 4 read — the caller's reply-receive endpoint, through THE validation owner,
+    // in the broad handler's order. The direct route already validated it for this trap; asking
+    // again here costs one lock-free read and keeps the lane correct when it is entered from the
+    // transaction-decline path, where the world may have moved.
+    let reply_endpoint =
+        match shared.validate_endpoint_right_split_read(tid, reply_recv_cap, CapRights::RECEIVE) {
+            Ok(object) => object,
+            Err(err) => return refuse(frame, err, "reply_cap"),
+        };
 
     // (C) rank 2 read — the caller's incarnation and its CNode, the mint target.
     let caller_asid = crate::kernel::vm::Asid(asid_raw as u16);
     let Some(caller_cnode) = shared.task_cnode_split(tid) else {
-        return decline("caller_cnode_missing");
+        // `create_reply_cap_for_caller` resolves the caller's cnode too, and a caller with none
+        // is a task that has gone; the broad path answers its `KernelError::TaskMissing`.
+        return refuse(frame, SyscallError::Internal, "caller_cnode_missing");
     };
+
+    // (A) rank 3 read — which of the three arms this request belongs to.
+    //
+    // A parked recv-v2 receiver is the DELIVERY arm, not a decline: `ipc_send_routed` hands the
+    // message straight to it. U9-IPC-RESIDUAL1 declined here, which is how a receiver parking
+    // between the acknowledgement probe and this read sent an ordinary NR 6 to the broad path.
+    if let EndpointSendAdmission::ReceiverWaiter(waiter) =
+        shared.endpoint_send_admission_split_read(send_eidx)
+        && shared.is_task_recv_v2_blocked_split_read(waiter.tid.0)
+    {
+        return nr6_deliver_to_blocked_waiter(
+            shared,
+            frame,
+            tid,
+            caller_asid,
+            caller_cnode,
+            send_eidx,
+            send_egen,
+            reply_endpoint,
+            waiter.tid,
+            payload,
+        );
+    }
 
     // (R) rank 3 — reserve the record. `responder_tid` is `None`: nobody is parked, which is
     // precisely why this is the queued shape.
     let Ok((slot, generation)) =
         shared.reserve_reply_record_split(ThreadId(tid), caller_asid, reply_endpoint, None, None)
     else {
-        return decline("reply_record_full");
+        // `create_reply_cap_for_caller` maps a full record table to `KernelError::CapabilityFull`,
+        // which the syscall boundary reports as `Internal`. Same table, same exhaustion, same
+        // answer — given here without entering the broad acquisition to be told.
+        return refuse(frame, SyscallError::Internal, "reply_record_full");
     };
     let reply_object = CapObject::Reply {
         index: slot,
@@ -3218,14 +3523,14 @@ fn try_split_ipccall_queued_into_frame(
         Capability::new(reply_object, CapRights::SEND),
     ) else {
         shared.free_reserved_reply_record_split(slot, generation);
-        return decline("reply_cap_mint_failed");
+        return refuse(frame, SyscallError::Internal, "reply_cap_mint_failed");
     };
 
     // (P) rank 3 — persist the minted CapId into THAT record incarnation.
     if !shared.persist_reply_caller_cap_split(slot, generation, reply_cap_id) {
         shared.rollback_minted_cap_split(caller_cnode, reply_cap_id, reply_object);
         shared.free_reserved_reply_record_split(slot, generation);
-        return decline("reply_record_recycled");
+        return refuse(frame, SyscallError::Internal, "reply_record_recycled");
     }
 
     // (S) rank 3 (sequential) — stash the envelope that carries the reply cap to the receiver,
@@ -3247,7 +3552,9 @@ fn try_split_ipccall_queued_into_frame(
         None,
     ) else {
         unwind_mint(shared);
-        return decline("envelope_stash_failed");
+        // `stash_transfer_handle(..)?` in the broad handler; a stash that cannot resolve the
+        // capability answers `InvalidCapability`, as NR 1's split route answers it.
+        return refuse(frame, SyscallError::InvalidCapability, "envelope_stash_failed");
     };
     let unwind_all = |shared: &SharedKernel| {
         let _ = shared.take_transfer_envelope_facts_split(stashed.handle, send_eidx, ThreadId(tid));
@@ -3259,11 +3566,13 @@ fn try_split_ipccall_queued_into_frame(
         crate::kernel::syscall::ipc_abi::frame_call_request_message(tid, payload, stashed.handle)
     else {
         unwind_all(shared);
-        return decline("message_framing_failed");
+        // `Message::with_header(..).map_err(|_| SyscallError::InvalidArgs)?`.
+        return refuse(frame, SyscallError::InvalidArgs, "message_framing_failed");
     };
 
-    // (Q) rank 3 — PUBLISH. Admission is re-checked inside this same acquisition.
-    match shared.enqueue_request_if_no_waiter_split(send_eidx, msg) {
+    // (Q) rank 3 — PUBLISH. The endpoint incarnation and the admission question are both terms
+    // of this same acquisition.
+    match shared.enqueue_request_if_no_waiter_split(send_eidx, send_egen, msg) {
         QueuedRequestOutcome::Enqueued => {
             crate::yarm_log!(
                 "IPCCALL_QUEUED_SPLIT_OK tid={} endpoint={} endpoint_generation={} reply_cap={} record_index={} record_generation={} len={} result=ok",
@@ -3279,6 +3588,11 @@ fn try_split_ipccall_queued_into_frame(
                 &REQUEST_COUNTERS,
                 crate::kernel::direct_disposition::DirectDisposition::Completed,
             );
+            // A legacy receiver waiting on this endpoint is woken through the one shared owner,
+            // exactly as NR 1's split enqueue arm wakes it. `ipc_send_routed` performs the same
+            // wake after its own enqueue, and omitting it would leave a pre-recv-v2 waiter asleep
+            // behind a message that is now queued for it.
+            let _ = shared.wake_waiter_for_endpoint_split(cpu, send_eidx);
             // The same three return lanes the broad handler ends with: `set_ok(0, 0, 0)` then
             // `encode_transfer_cap_ret(frame, None)`. `IpcCall` is request-send only — the
             // caller receives the reply through its own explicit receive on `reply_recv_cap`.
@@ -3286,27 +3600,367 @@ fn try_split_ipccall_queued_into_frame(
                 frame,
                 crate::kernel::direct_disposition::DirectDisposition::Completed,
             )
-            .map(|()| Ok(()))
+            .map(|()| D::Complete(Ok(())))
         }
-        // A full endpoint is the BLOCKING origin. The broad path parks the sender there, and
-        // adding a blocking mode is outside this package — so everything is returned and the
-        // request is handed over exactly as re-sendable as it arrived.
-        QueuedRequestOutcome::QueueFull => {
-            unwind_all(shared);
-            decline("endpoint_queue_full")
-        }
+        // U9-IPC-RESIDUAL2 §2 — A FULL ENDPOINT PARKS THE SENDER. It does not answer.
+        //
+        // This is the arm U9-IPC-RESIDUAL1 called "the BLOCKING origin ... out of scope" and
+        // handed to the broad path. The directive is explicit that answering `WouldBlock` here
+        // would be wrong: the broad operation blocks the caller until the queue drains, and a
+        // caller told `WouldBlock` instead would spin or fail a send that is merely delayed.
+        //
+        // Nothing is unwound. The message — carrying the reply capability's transfer envelope —
+        // rides with the sender waiter exactly as it does on the in-lock route, and the caller
+        // keeps the `Reply` cap it will use when the reply arrives. The rank-ordered commit is
+        // the EXISTING U6 transaction; its refusal path settles all three resources.
+        QueuedRequestOutcome::QueueFull => nr6_park_sender(
+            shared,
+            cpu,
+            tid,
+            caller_asid,
+            caller_cnode,
+            send_eidx,
+            send_egen,
+            send_cap,
+            msg,
+            stashed.handle,
+            reply_cap_id,
+            reply_object,
+            slot,
+            generation,
+            unwind_all,
+        ),
+        // A receiver parked inside the publication window. Compensate and take the delivery arm,
+        // which is where the broad path would have gone had it seen this state.
         QueuedRequestOutcome::WaiterAppeared => {
             unwind_all(shared);
-            decline("waiter_appeared")
+            match shared.endpoint_send_admission_split_read(send_eidx) {
+                EndpointSendAdmission::ReceiverWaiter(waiter)
+                    if shared.is_task_recv_v2_blocked_split_read(waiter.tid.0) =>
+                {
+                    nr6_deliver_to_blocked_waiter(
+                        shared,
+                        frame,
+                        tid,
+                        caller_asid,
+                        caller_cnode,
+                        send_eidx,
+                        send_egen,
+                        reply_endpoint,
+                        waiter.tid,
+                        payload,
+                    )
+                }
+                // A SENDER waiter, or a receiver that is not recv-v2 blocked. Both mean the
+                // queue's ordering belongs to the full send, and this request must go behind
+                // what is already there — which is what parking does.
+                _ => {
+                    crate::yarm_log!(
+                        "IPCCALL_QUEUED_SPLIT_ORDERING tid={} endpoint={} reason=waiter_appeared result=would_block",
+                        tid,
+                        send_eidx
+                    );
+                    refuse(frame, SyscallError::WouldBlock, "waiter_ordering")
+                }
+            }
         }
         QueuedRequestOutcome::EndpointMissing => {
             unwind_all(shared);
-            decline("endpoint_missing")
+            refuse(frame, SyscallError::WrongObject, "endpoint_missing")
+        }
+        // U9-IPC-RESIDUAL2 §3 — the slot was destroyed and reissued between preparation and
+        // publication. `resolve_endpoint_index` answers `StaleCapability` for exactly this, which
+        // the syscall boundary reports as `WrongObject`.
+        QueuedRequestOutcome::EndpointIncarnationChanged { expected, observed } => {
+            unwind_all(shared);
+            crate::yarm_log!(
+                "IPCCALL_QUEUED_SPLIT_INCARNATION tid={} endpoint={} expected={} observed={} enqueues=0 result=ok",
+                tid,
+                send_eidx,
+                expected,
+                observed.unwrap_or(u64::MAX)
+            );
+            refuse(frame, SyscallError::WrongObject, "endpoint_incarnation_changed")
         }
     }
 }
 
+/// U9-IPC-RESIDUAL2 §2 — NR 6's DELIVERY arm: a recv-v2 blocked receiver is parked on this
+/// endpoint, so the request is handed straight to it.
+///
+/// This is `handle_ipc_call`'s `IpcEndpointSendResult::ReceiverWaiterFound` branch, composed from
+/// the same producer Stage 188E wired for it. The reply record is reserved with the responder
+/// BOUND — that is the whole difference from the enqueue arm, and it is what registers the
+/// reverse link the reply will later travel back along.
+#[cfg(not(feature = "hosted-dev"))]
+#[allow(clippy::too_many_arguments)]
+fn nr6_deliver_to_blocked_waiter(
+    shared: &SharedKernel,
+    frame: &mut TrapFrame,
+    tid: u64,
+    caller_asid: crate::kernel::vm::Asid,
+    caller_cnode: crate::kernel::capabilities::CNodeId,
+    send_eidx: usize,
+    send_egen: u64,
+    reply_endpoint: crate::kernel::capabilities::CapObject,
+    waiter_tid: crate::kernel::ipc::ThreadId,
+    payload: &[u8],
+) -> Option<SplitDispatchDisposition> {
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    use crate::kernel::direct_ipc_counters::REQUEST as REQUEST_COUNTERS;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::syscall::SyscallError;
+    use SplitDispatchDisposition as D;
+
+    let refuse = |frame: &mut TrapFrame, err: SyscallError, reason: &str| -> Option<D> {
+        REQUEST_COUNTERS.note_failed(err);
+        crate::yarm_log!(
+            "IPCCALL_DELIVER_SPLIT_REFUSED reason={} tid={} endpoint={} waiter_tid={} err={:?} result=ok",
+            reason,
+            tid,
+            send_eidx,
+            waiter_tid.0,
+            err
+        );
+        frame.set_err(err.code());
+        Some(D::Complete(Ok(())))
+    };
+
+    // The record binds the responder, exactly as `create_reply_cap_for_caller(.., responder_tid)`
+    // does when `endpoint_waiter_tid` answered `Some`.
+    let Ok((slot, generation)) = shared.reserve_reply_record_split(
+        ThreadId(tid),
+        caller_asid,
+        reply_endpoint,
+        Some(waiter_tid),
+        shared.task_asid_opt_split_read(waiter_tid.0),
+    ) else {
+        return refuse(frame, SyscallError::Internal, "reply_record_full");
+    };
+    let reply_object = CapObject::Reply {
+        index: slot,
+        generation,
+    };
+    let Ok(reply_cap_id) = shared.mint_capability_with_memory_ref_split(
+        caller_cnode,
+        Capability::new(reply_object, CapRights::SEND),
+    ) else {
+        shared.free_reserved_reply_record_split(slot, generation);
+        return refuse(frame, SyscallError::Internal, "reply_cap_mint_failed");
+    };
+    let unwind_mint = |shared: &SharedKernel| {
+        shared.rollback_minted_cap_split(caller_cnode, reply_cap_id, reply_object);
+        shared.free_reserved_reply_record_split(slot, generation);
+    };
+    if !shared.persist_reply_caller_cap_split(slot, generation, reply_cap_id) {
+        unwind_mint(shared);
+        return refuse(frame, SyscallError::Internal, "reply_record_recycled");
+    }
+    // The envelope is bound to the waiter, as `stash_transfer_handle` binds it when a waiter was
+    // present at stash time — the binding the error paths must match to take it back.
+    let send_endpoint = CapObject::Endpoint {
+        index: send_eidx,
+        generation: send_egen,
+    };
+    let Ok(stashed) = shared.stash_transfer_envelope_split(
+        ThreadId(tid),
+        reply_cap_id,
+        send_endpoint,
+        Some(waiter_tid),
+        None,
+    ) else {
+        unwind_mint(shared);
+        return refuse(frame, SyscallError::InvalidCapability, "envelope_stash_failed");
+    };
+    let unwind_all = |shared: &SharedKernel| {
+        let _ = shared.take_transfer_envelope_facts_split(stashed.handle, send_eidx, waiter_tid);
+        unwind_mint(shared);
+    };
+    let Ok(msg) =
+        crate::kernel::syscall::ipc_abi::frame_call_request_message(tid, payload, stashed.handle)
+    else {
+        unwind_all(shared);
+        return refuse(frame, SyscallError::InvalidArgs, "message_framing_failed");
+    };
+    crate::yarm_log!(
+        "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_BEGIN waiter_tid={} endpoint={}",
+        waiter_tid.0,
+        send_eidx
+    );
+    match shared.produce_blocked_waiter_reply_cap_delivery_split(waiter_tid.0, send_eidx, &msg) {
+        Ok(true) => {
+            crate::yarm_log!(
+                "IPCCALL_DELIVER_SPLIT_OK tid={} endpoint={} waiter_tid={} reply_cap={} record_index={} record_generation={} len={} result=ok",
+                tid,
+                send_eidx,
+                waiter_tid.0,
+                reply_cap_id.0,
+                slot,
+                generation,
+                payload.len()
+            );
+            crate::kernel::direct_ipc_counters::note_disposition(
+                &REQUEST_COUNTERS,
+                crate::kernel::direct_disposition::DirectDisposition::Completed,
+            );
+            // The CALLER's syscall is finished — `IpcCall` is request-send only. The drain does
+            // the receiver's copy, materialization, slot clear and single wake.
+            frame.set_ok(0, 0, 0);
+            frame.set_ret2(
+                usize::try_from(crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP).unwrap_or(0),
+            );
+            Some(D::PostWorkCommitted {
+                finalize_syscall: true,
+            })
+        }
+        // The producer declined having consumed nothing: the waiter is not the shape it claimed
+        // to be. Compensate and answer, rather than re-running the whole call under the broad
+        // lock — which would mint a SECOND reply capability for one syscall.
+        Ok(false) => {
+            unwind_all(shared);
+            refuse(frame, SyscallError::WouldBlock, "no_delivery_owner")
+        }
+        Err(err) => {
+            unwind_all(shared);
+            refuse(frame, err, "delivery_error")
+        }
+    }
+}
+
+/// U9-IPC-RESIDUAL2 §2/§3 — NR 6's PARK arm: the endpoint queue is full, which is the blocking
+/// origin, so the caller becomes a sender waiter carrying its message.
+///
+/// The proposal is stashed for the post-lock drain rather than committed here, for the same
+/// reason NR 1's park arm stashes it: the commit clears this CPU's `current`, and the trap
+/// wrapper must learn that through `PostWorkCommitted { finalize_syscall: false }` so it does
+/// NOT write a syscall result or advance the PC of a task that is now parked. A parked sender's
+/// answer arrives from the completion its waker publishes.
+///
+/// All three of this transaction's resources travel with the proposal, so the drain's refusal
+/// path is exactly as complete as the pre-publication compensation: the envelope through
+/// `settle_blocked_send_envelope_split`, and the mint and record through
+/// `rollback_minted_cap_split` and `free_reserved_reply_record_split`.
+#[cfg(not(feature = "hosted-dev"))]
+#[allow(clippy::too_many_arguments)]
+fn nr6_park_sender(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    tid: u64,
+    caller_asid: crate::kernel::vm::Asid,
+    caller_cnode: crate::kernel::capabilities::CNodeId,
+    send_eidx: usize,
+    send_egen: u64,
+    send_cap: crate::kernel::capabilities::CapId,
+    msg: crate::kernel::ipc::Message,
+    envelope_handle: u64,
+    reply_cap_id: crate::kernel::capabilities::CapId,
+    reply_object: crate::kernel::capabilities::CapObject,
+    record_index: usize,
+    record_generation: u64,
+    unwind_all: impl Fn(&SharedKernel),
+) -> Option<SplitDispatchDisposition> {
+    use crate::kernel::direct_ipc_counters::REQUEST as REQUEST_COUNTERS;
+    use crate::kernel::syscall::SyscallError;
+    use SplitDispatchDisposition as D;
+
+    let cpu_idx = cpu.0 as usize;
+    // The publication route needs a live post-lock drainer on this CPU and an empty stash; the
+    // same four conditions the broad producer checks, asked here because there is no broad
+    // producer on this path. When any of them does not hold there is nothing that would ever run
+    // the commit, so the request is compensated and answered rather than silently dropped.
+    let drainer_live = crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+        .load(core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: local-CPU trap path, interrupts disabled — the same discipline as every store.
+    let stash_free = !unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].is_occupied() };
+    if !crate::kernel::boot::queue_advancing_dispatch_enabled()
+        || !drainer_live
+        || !stash_free
+        || crate::kernel::boot::d2_send_dispatch_is_deferred(cpu_idx)
+    {
+        unwind_all(shared);
+        REQUEST_COUNTERS.note_failed(SyscallError::WouldBlock);
+        crate::yarm_log!(
+            "IPCCALL_PARK_SPLIT_REFUSED tid={} endpoint={} reason=no_publication_route drainer={} stash_free={} result=ok",
+            tid,
+            send_eidx,
+            u8::from(drainer_live),
+            u8::from(stash_free)
+        );
+        // NR 1's park arm answers the same `WouldBlock` for the same condition. The frame is
+        // encoded by the trap wrapper from this typed error, as it is for every `Complete(Err)`.
+        return Some(D::Complete(Err(TrapHandleError::Syscall(
+            SyscallError::WouldBlock,
+        ))));
+    }
+    let snapshot = crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot {
+        cpu,
+        sender_tid: tid,
+        sender_asid: caller_asid,
+        endpoint_idx: send_eidx,
+        endpoint_generation: send_egen,
+        send_cap,
+        msg,
+        // `IpcCall` carries no send timeout in its ABI, so the park is untimed — the same
+        // `deadline: None` the broad `kernel.ipc_send(cap, msg)` produces for it.
+        deadline: None,
+        transfer_envelope: Some(
+            crate::kernel::dispatch_post_work::BlockingSendEnvelopeCleanup {
+                handle: envelope_handle,
+                endpoint_idx: send_eidx,
+                // The envelope was stashed unbound (no waiter), so the cleanup identity is the
+                // sender, matching `stash_bound_receiver_tid.unwrap_or(sender)`.
+                cleanup_tid: crate::kernel::ipc::ThreadId(tid),
+            },
+        ),
+        reply_authority: Some(
+            crate::kernel::dispatch_post_work::BlockingSendReplyAuthorityCleanup {
+                caller_cnode,
+                reply_cap_id,
+                reply_object,
+                record_index,
+                record_generation,
+            },
+        ),
+    };
+    // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access — identical
+    // discipline to every other producer's store.
+    unsafe {
+        crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].store(
+            crate::kernel::dispatch_post_work::DispatchPostWork::BlockingSendCommit(snapshot),
+        );
+    }
+    // The park IS this attempt's terminal: the request was published as a sender waiter and the
+    // caller is no longer running. Counted as completed for the same reason the enqueue arm is —
+    // the syscall did what NR 6 promises, and its reply will arrive on the caller's own receive.
+    crate::kernel::direct_ipc_counters::note_disposition(
+        &REQUEST_COUNTERS,
+        crate::kernel::direct_disposition::DirectDisposition::Completed,
+    );
+    crate::yarm_log!(
+        "IPCCALL_PARK_SPLIT_PUBLISHED tid={} endpoint={} endpoint_generation={} reply_cap={} record_index={} record_generation={} result=blocking_publication_pending",
+        tid,
+        send_eidx,
+        send_egen,
+        reply_cap_id.0,
+        record_index,
+        record_generation
+    );
+    Some(D::PostWorkCommitted {
+        finalize_syscall: false,
+    })
+}
+
 #[cfg(feature = "hosted-dev")]
+fn try_split_ipccall_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
+}
+
+#[cfg(feature = "hosted-dev")]
+#[allow(dead_code)]
 fn try_split_ipccall_direct_into_frame(
     _shared: &SharedKernel,
     _cpu: CpuId,

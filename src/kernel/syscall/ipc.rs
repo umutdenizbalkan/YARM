@@ -191,7 +191,10 @@ pub(crate) fn frame_ipc_send_message(
         .map_err(|_| SyscallError::InvalidArgs)
 }
 
-fn inline_payload_from_frame(
+/// U9-IPC-RESIDUAL2 §2: visible to the `syscall` module so the NR 6 split route can reach the
+/// SAME kernel-task payload source through `split_inline_payload_from_frame`, instead of
+/// re-deriving the register unpack. Still owned here, and still the only implementation.
+pub(super) fn inline_payload_from_frame(
     frame: &TrapFrame,
     len: usize,
 ) -> Result<[u8; Message::MAX_PAYLOAD], SyscallError> {
