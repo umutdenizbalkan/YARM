@@ -16833,3 +16833,154 @@ the highest-traffic pair in the whole space — 53 and 54 dispatches in a single
 
 Second candidate, smaller and mostly wiring: **NR 2 `IpcRecv`'s user-ASID cohort**, which §1
 established is not short a mechanism.
+
+## U9-IPC-RESIDUAL1 — NR 6 and NR 7 terminal dispatch closed
+
+Reviewed candidate `7b58ba7`; base `7b58ba7`. Both directions of the direct request/reply pair now
+have a source-derived terminal closure, and the U9-XFER2 record's own traffic claim is corrected
+below.
+
+### §1 — the correction, and the measurement that replaced it
+
+The U9-XFER2 record selected this package on the grounds that NR 6 and NR 7 are "the
+highest-traffic pair — 53 and 54 dispatches in a single short boot". **Those numbers are not
+terminal-broad traffic.** `YARM_LOCK_SPLIT_DISPATCH nr=6 result=ok` is emitted when the SPLIT
+route handled the trap; 53 and 54 were direct *successes*. The residual was invisible in them.
+
+Subtracting is no better. At base, NR 7 reported `attempts=54 completed=52` with every decline
+bucket at zero — which reads as two traps lost to the broad path. It was not: the **queued reply
+lane applied its disposition without recording it**, so two successful queued replies were
+attempts with no bucket. That single missing call also made `terminals_balance()` false and
+`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` report `nr7_ok=0 result=fail` on every ordinary boot of
+every port.
+
+So the terminal entry is now counted **directly, once per trap**, at the one place that knows:
+the split dispatcher, immediately after a recognized NR 6/NR 7 helper answered `None`. It is a
+separate counter (`broad_entries`) from the decline buckets, because they answer different
+questions — how the helper decided, versus where the trap then went. A decline that answers the
+caller here (a typed refusal, a `WouldBlock` retry) is *not* a broad entry, and RISC-V proves the
+distinction is load-bearing: it declines one NR 7 per boot on terminal arbitration and still
+reports `broad_entries=0`, because that decline is answered pre-lock.
+
+Measured at base, per boot, identically on all three ports:
+
+| direction | shape reaching the broad acquisition | per boot |
+|---|---|---|
+| NR 6 | **no claimable receiver acknowledgement** (`IPCCALL_DIRECT_DECLINE reason=no_claimable_ack tid=2 endpoint=0`) | 1 |
+| NR 6 | send capability that does not resolve as an `Endpoint` with `SEND` | 0 on an ordinary boot; reachable, and observed under the §4 witness |
+| NR 7 | none | 0 |
+
+Every other decline site was enumerated from source and left alone, because for each of them the
+broad path genuinely does more than fail: a `Synchronous` endpoint is served by the rendezvous
+arm, an unadmitted endpoint by the legacy send, a payload over the snapshot bound is judged after
+the capability checks, and a lost terminal claim already answers here.
+
+### §2 — the two shapes, closed through existing owners
+
+**NR 6's buffered lane.** "No claimable acknowledgement", together with an endpoint that has no
+parked receiver, is the positive signature of the BUFFERED shape — the server has not blocked in
+recv-v2, so the authoritative send path enqueues the request and the call returns. That is now a
+lane, not a fall-through. It composes owners that already existed:
+
+```
+A  rank 3 read   endpoint_send_admission_split_read  -> must be NoWaiters
+B  rank 2→4      the caller's reply-receive endpoint: RECEIVE right, Endpoint object
+R  rank 3        reserve_reply_record_split          (THE body the broad creator reserves through)
+M  rank 4        mint_capability_with_memory_ref_split
+P  rank 3        persist_reply_caller_cap_split      (generation-exact)
+S  rank 3        stash_transfer_envelope_split
+F  pure          ipc_abi::frame_call_request_message (THE framing the broad handler builds)
+Q  rank 3        enqueue_request_if_no_waiter_split  ← PUBLICATION POINT
+```
+
+**NR 7's cap-bearing queued lane.** The selector declined a reply carrying a capability to an
+unblocked caller, on the stated grounds that it would be "enqueued with a capability nothing would
+materialize". That was wrong about the source: the queued message is framed
+`FLAG_CAP_TRANSFER_PLAIN`, and the receive-side materialization arm every route reaches treats
+that flag exactly as `FLAG_CAP_TRANSFER`. The mode is now chosen on the terminal alone; the
+capability decides only the framing, and travels through the same envelope owner the blocked
+capability lane uses.
+
+**Two deterministic refusals answered here rather than handed over.** NR 7 already refused a spent
+reply authority pre-lock; NR 6's unresolvable send capability now does the same, from the same
+typed error, written the same way. `validate_endpoint_right(kernel, cap, SEND)?` is the *first*
+statement of the broad handler, so nothing else has run and nothing else will — entering the
+terminal acquisition purely to be told that buys nothing. Both resolvers apply the same three
+checks in the same order (slot present → `InvalidCapability`, object is an `Endpoint` →
+`WrongObject`, `SEND` held → `MissingRight`), so the answer is byte-identical.
+
+Nothing was replaced by an arbitrary error to make an edge disappear: a call the broad path
+queues still queues, a cap-bearing reply keeps its capability, `IpcCall` remains request-send
+followed by the caller's own receive, and a full endpoint still declines to legacy because a full
+queue is the BLOCKING origin and adding a blocking mode is out of scope.
+
+### §3 — ownership, and a defect the witness found
+
+The buffered lane's publication point is the **enqueue**, and `enqueue_request_if_no_waiter_locked`
+re-asks the admission question in the same rank-3 acquisition that enqueues. That pairing is the
+whole point: the pre-lock lane read the endpoint's waiter state with no lock held, so a receiver
+may have parked since — and enqueueing regardless would leave it asleep behind a queued message,
+a lost wakeup the broad path cannot suffer because it holds one acquisition across both steps.
+
+Before that point the lane owns exactly three things, each returned on every refusal after it is
+taken: the transfer envelope, the caller's minted `Reply` cap, and the reply-record slot. The
+stash only RESOLVES the replier's source capability, so a compensated request is genuinely
+re-sendable. After the enqueue nothing is compensated. No responder is bound, so no
+`ServerReplyLink` is registered — the same decision the broad owner makes when the endpoint has
+no waiter.
+
+**The defect.** The ordinary reply-record allocation never prepared the slot's terminal-ownership
+cell. `reserve_direct_reply_record_locked` documents exactly what that costs: *"without it every
+recycled slot's next occupant is an identity mismatch forever, and the queued (unblocked-caller)
+reply mode, which requires an unarmed terminal, can never be selected again."* The §4 witness hit
+it on its first run — `TerminalUnavailable(IdentityMismatch)` on a recycled slot, falling to the
+broad dispatcher. The extracted reservation body now performs the same vacate-or-skip preparation
+the direct allocator performs, atomically with the allocation; a cell that refuses to vacate still
+holds a live claimant, so that slot is skipped rather than taken.
+
+### §4 — the witness, and what it exercises
+
+NR 6's buffered lane needs no witness: it is the boot's own critical path and fires on every
+ordinary boot of every port (`IPCCALL_QUEUED_SPLIT_OK tid=2 endpoint=0`). The cap-bearing queued
+reply has no issuer — `transfer_cap=0` in both directions on every port — so §4's
+minimal-witness authorization applies. `scripts/qemu-ipc-residual1-queued-cap-witness-smoke.sh`
+boots one `-smp 1` QEMU per port with `yarm.ipc_residual1_queued_cap_witness=1` and runs init cell
+selector 13 over disposable authority, in one task over one endpoint:
+
+```
+NR 6  ipc_call(ep, ep, "U9REQ")   -> no receiver parked  => the BUFFERED lane enqueues
+NR 2  ipc_recv_v2(ep)             -> the request, reply capability materialized
+NR 7  ipc_reply(reply_cap, "U9RSP" + mem_cap)
+                                  -> caller not blocked  => the QUEUED lane, cap-bearing
+NR 2  ipc_recv_v2(ep)             -> the reply, and the capability materialized from it
+```
+
+The last step is the assertion that matters: a queued cap-bearing reply is only correct if the
+capability actually arrives, and it arrives through the ordinary receive-side materialization
+owner rather than anything the witness supplies.
+
+Coverage: `u9_ipc_residual1_cases` (6) drives the production owners over a recycled record's
+terminal cell, generation-exact persist and free, the admission classification's four arms, the
+publication point's lost-admission race (which must enqueue nothing), a missing endpoint, and the
+mint/rollback pair. `u9_ipc_residual1_closure` (5) establishes all three architecture ingress
+paths, the once-per-trap measurement, the complete disposition chain, the buffered lane's
+three-resource compensation, and that each extracted policy has two drivers.
+
+Displaced guards re-derived: `stage115_d1_d5_cap_transfer_untouched` (matched against code, not
+prose — naming an owner in a doc comment to say it does the work is the opposite of
+reimplementing it), `d06_registration_is_production_and_precedes_any_wake` (Phase 3 is now the
+shared persist body; the ordering property is unchanged and still checked),
+`counters_are_wired_and_the_attestation_is_bounded` (three new counted terminals), and the NR 7
+cap-lane guard, which pinned the behaviour §2 was asked to change and now pins the new contract:
+the terminal alone selects the lane, and each lane carries the capability through an existing
+owner.
+
+### Census
+
+**CENSUS-DELTA: 0.**
+
+### Deferred
+
+* **NR 6 / NR 7 blocking-mode changes.** Out of scope by directive; a full endpoint still parks
+  the sender on the legacy path, which is the blocking origin.
+* **NR 2 `IpcRecv`'s user-ASID cohort** — still not wired, and still not short a mechanism.

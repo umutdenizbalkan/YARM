@@ -643,7 +643,31 @@ impl AddressSpace {
             }
             None => {
                 let i = self.find_entry_index(virt).err().expect("insert idx");
-                if self.len >= MAX_MAPPINGS {
+                // U9-IPC-RESIDUAL1 §5 — the capacity refusal applies to the INSERT, not to every
+                // new page.
+                //
+                // Both merge paths below `return` without growing `self.len` (the prev+next case
+                // even shrinks it), so a page that extends an adjacent run consumes no
+                // bookkeeping entry and a full table is no reason to refuse it. Checking `len`
+                // first refused exactly those pages: a live x86_64 boot mapped
+                // `va=0x40000000` into the last free entry and then refused the physically and
+                // virtually adjacent `va=0x40001000` — which would have merged into the run just
+                // created — with `VM_FULL`, failing the shared-region transaction with
+                // `MapFault`.
+                //
+                // The predicates are pure reads of `entries[i-1]` / `entries[i]`, so hoisting
+                // them changes nothing about what they decide. The refusal stays BEFORE
+                // `arch_map_page`, preserving the Bug-3 property that hardware and the software
+                // shadow never diverge on a rejected mapping.
+                let prev_merge = i > 0
+                    && self.entries[i - 1].is_some_and(|prev| {
+                        Self::run_precedes_page(&prev, virt, mapping.phys, mapping.flags)
+                    });
+                let next_merge = i < self.len
+                    && self.entries[i].is_some_and(|next| {
+                        Self::page_precedes_run(virt, mapping.phys, mapping.flags, &next)
+                    });
+                if !prev_merge && !next_merge && self.len >= MAX_MAPPINGS {
                     crate::yarm_log!(
                         "VM_FULL reason=mapping_bookkeeping_full asid={:?} len={} max_mappings={} va=0x{:x}",
                         self.asid.map(|v| v.0),
@@ -654,17 +678,10 @@ impl AddressSpace {
                     return Err(VmError::Full);
                 }
                 arch_map_page(self.asid, virt, mapping)?;
-                let prev_merge = i > 0
-                    && self.entries[i - 1].is_some_and(|prev| {
-                        Self::run_precedes_page(&prev, virt, mapping.phys, mapping.flags)
-                    });
                 if prev_merge {
                     // Bug 6 fix: also check if the new page bridges into the next
                     // run so all three entries can be collapsed into one.
-                    let next_also_merges = i < self.len
-                        && self.entries[i].is_some_and(|next| {
-                            Self::page_precedes_run(virt, mapping.phys, mapping.flags, &next)
-                        });
+                    let next_also_merges = next_merge;
                     if next_also_merges {
                         let next_pages = self.entries[i].expect("next").pages;
                         self.entries[i - 1].as_mut().expect("prev").pages += 1 + next_pages;
@@ -679,10 +696,6 @@ impl AddressSpace {
                     return Ok(None);
                 }
 
-                let next_merge = i < self.len
-                    && self.entries[i].is_some_and(|next| {
-                        Self::page_precedes_run(virt, mapping.phys, mapping.flags, &next)
-                    });
                 if next_merge {
                     let next = self.entries[i].as_mut().expect("next");
                     next.virt = virt;
@@ -2345,6 +2358,70 @@ mod tests {
     // Item 8: canonical-address policy (x86_64 only) — non-canonical user addresses
     // are rejected by map_page; canonical low/high addresses are accepted by the
     // is_canonical predicate.
+    /// U9-IPC-RESIDUAL1 §5 — **a FULL table still admits a page that consumes no entry.**
+    ///
+    /// Both merge paths return without growing `len`, so refusing a mergeable page because the
+    /// table is full refuses a mapping the table has room for. A live x86_64 boot hit exactly
+    /// this: init mapped `0x40000000` into its last free entry and the physically and virtually
+    /// adjacent `0x40001000` — which merges into the run just created — was refused `VM_FULL`,
+    /// failing the shared-region transaction with `MapFault`.
+    #[test]
+    fn a_full_mapping_table_still_admits_a_page_that_merges_into_a_run() {
+        let mut aspace = AddressSpace::new_user();
+        let flags = PageFlags {
+            read: true,
+            write: false,
+            execute: false,
+            user: true,
+            cache_policy: CachePolicy::WriteBack,
+        };
+        // Fill the table with MAX_MAPPINGS non-adjacent runs, so nothing can merge.
+        for k in 0..MAX_MAPPINGS {
+            let va = VirtAddr((k as u64 + 1) * 2 * PAGE_SIZE as u64);
+            let pa = PhysAddr((k as u64 + 1) * 2 * PAGE_SIZE as u64);
+            aspace
+                .map_page(va, Mapping { phys: pa, flags })
+                .unwrap_or_else(|e| panic!("fill {k}: {e:?}"));
+        }
+        assert_eq!(aspace.len, MAX_MAPPINGS, "the table is exactly full");
+
+        // A page that extends the LAST run forward: same flags, adjacent VA and PA. It consumes
+        // no entry, so a full table is no reason to refuse it.
+        let last_va = VirtAddr(MAX_MAPPINGS as u64 * 2 * PAGE_SIZE as u64);
+        let ext_va = VirtAddr(last_va.0 + PAGE_SIZE as u64);
+        let ext_pa = PhysAddr(last_va.0 + PAGE_SIZE as u64);
+        assert!(
+            aspace
+                .map_page(
+                    ext_va,
+                    Mapping {
+                        phys: ext_pa,
+                        flags
+                    }
+                )
+                .is_ok(),
+            "a page that merges into an existing run must be admitted by a full table"
+        );
+        assert_eq!(
+            aspace.len, MAX_MAPPINGS,
+            "and it must not have grown the table"
+        );
+
+        // A page that genuinely needs a NEW entry is still refused.
+        let fresh_va = VirtAddr(0x7000_0000_0000);
+        assert_eq!(
+            aspace.map_page(
+                fresh_va,
+                Mapping {
+                    phys: PhysAddr(0x9000_0000),
+                    flags,
+                },
+            ),
+            Err(VmError::Full),
+            "a genuinely new run is still refused when the table is full"
+        );
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn map_page_rejects_non_canonical_x86_64() {
