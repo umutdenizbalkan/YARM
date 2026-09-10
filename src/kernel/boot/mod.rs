@@ -7835,6 +7835,30 @@ pub fn ipc_residual1_queued_cap_witness_enabled() -> bool {
     IPC_RESIDUAL1_QUEUED_CAP_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// U9-IPC-RESIDUAL2 §4 — the FULL-ENDPOINT PARK witness selector. Slot 5 is mutually exclusive;
+/// 14 is the next free value after U9-IPC-RESIDUAL1's 13. It reuses the SAME provisioning and the
+/// same startup slots 13/14, and differs only in which init cell consumes them.
+///
+/// It exists because the shape it exercises has no production issuer: an ordinary boot never
+/// fills an eight-deep endpoint, so the arm that parks the sender — the blocking origin — is
+/// never taken. A hosted case can drive the publication's DECISION, but only a live boot can show
+/// the sender actually park, the drain commit the transaction, the receiver make progress and the
+/// sender resume with its call completed.
+pub const IPC_RESIDUAL2_PARK_WITNESS_SELECTOR: u64 = 14;
+
+static IPC_RESIDUAL2_PARK_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the U9-IPC-RESIDUAL2 §4 park witness (`yarm.ipc_residual2_park_witness=1`). Default OFF.
+pub(crate) fn set_ipc_residual2_park_witness_enabled(enabled: bool) {
+    IPC_RESIDUAL2_PARK_WITNESS_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the U9-IPC-RESIDUAL2 §4 park witness is armed.
+pub fn ipc_residual2_park_witness_enabled() -> bool {
+    IPC_RESIDUAL2_PARK_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 static XFER2_GRANT_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -7866,6 +7890,7 @@ pub fn shared_region_oracle_provisioning_armed() -> bool {
     shared_region_direct_oracle_enabled()
         || xfer2_grant_witness_enabled()
         || ipc_residual1_queued_cap_witness_enabled()
+        || ipc_residual2_park_witness_enabled()
 }
 
 /// Stage 198E3C2B: the AArch64 init startup-slot-5 selector for the DIRECT shared-region oracle. On

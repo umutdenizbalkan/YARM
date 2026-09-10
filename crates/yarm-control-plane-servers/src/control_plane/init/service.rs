@@ -1193,6 +1193,237 @@ pub(super) mod ipc_residual1_queued_cap_witness {
     }
 }
 
+/// U9-IPC-RESIDUAL2 §4 — **the FULL-ENDPOINT PARK witness**, selector 14, default off.
+///
+/// The one newly-served NR 6 shape with no production issuer. An ordinary boot never fills an
+/// eight-deep endpoint, so the arm that parks the sender — the blocking origin — is never taken,
+/// and a hosted case can drive the publication's *decision* but not its consequences. This cell
+/// shows the whole sequence the directive asks for: **the sender parks, the receiver makes
+/// progress, and the sender resumes correctly.**
+///
+/// # Topology
+///
+/// Two tasks sharing init's cspace and address space, on one CPU:
+///
+/// ```text
+///   parent (init)                         child (drainer)
+///   spawn child ────────────────────────▶ Runnable, has not run yet
+///   ipc_call x8   → the BUFFERED lane, each enqueues
+///   ipc_call #9   → the queue is FULL → the sender PARKS
+///                                     ┌▶ runs for the first time here
+///                                     │  ipc_recv_with_deadline(ep, 0) drains one
+///                                     │  → a slot frees → the parked sender completes
+///   resumes, the call returns Ok ◀────┘  yield_now()
+///   ... and so on until the loop ends
+///   DONE = 1
+/// ```
+///
+/// The child polls with deadline 0 — the non-blocking probe of `AI_AGENT_RULES` §8.2 — rather
+/// than blocking in `ipc_recv_v2`. A blocked receiver would publish a receiver waiter, and the
+/// buffered lane would then take its DELIVERY arm instead of ever filling the queue, so the shape
+/// under test would never occur.
+///
+/// # What it proves that the source guards cannot
+///
+/// That the park's publication reaches the post-lock drain, that `commit_blocking_send_split`
+/// commits it, that the D2-send deferral performs the queue-advancing dispatch, that the
+/// receiver's progress completes the sender waiter, and that the resumed caller's `IpcCall`
+/// returns success with its reply capability still its own. The kernel-side evidence is
+/// `IPCCALL_PARK_SPLIT_PUBLISHED` + `U6_BLOCKING_SEND_COMMITTED`; this cell's own evidence is
+/// that every call returned Ok and the child drained at least one message.
+#[cfg(not(feature = "hosted-dev"))]
+pub(super) mod ipc_residual2_park_witness {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
+    /// How many messages the child has taken off the endpoint.
+    pub(super) static DRAINED: AtomicU32 = AtomicU32::new(0);
+    /// Set by the parent when its call loop is finished, so the child stops.
+    pub(super) static DONE: AtomicU32 = AtomicU32::new(0);
+    /// The endpoint both roles use, published before the spawn.
+    pub(super) static EP_CAP: AtomicU32 = AtomicU32::new(0);
+
+    /// The drainer's stack, deliberately SMALL — 4 KiB, against the 16 KiB every other oracle
+    /// child takes.
+    ///
+    /// Init's address space runs at `MAX_MAPPINGS` (128/128 runs) on the provisioned oracle
+    /// profile, which `U9-IPC-RESIDUAL1 §5` recorded as deferred headroom. A 16 KiB stack plus a
+    /// 512-byte TLS block adds about four pages to init's image, and on that profile four pages
+    /// is enough to make the fork proof's copy-on-write remap fail closed
+    /// (`VM_COW_SPLIT_FAILED_CLOSED ... reason=remap`) — a real defect, but not this package's,
+    /// and §5 of this directive says to defer it rather than widen scope into it.
+    ///
+    /// So the witness is sized to fit inside the headroom that exists. The child is a
+    /// non-recursive poll loop whose deepest frame holds one `ReceivedMessage`; 4 KiB is ample
+    /// for it, and the smaller TLS block matches what a thread that touches no thread-locals
+    /// needs.
+    #[allow(unused)]
+    pub(super) static mut CHILD_STACK: [u8; 4096] = [0u8; 4096];
+    #[allow(unused)]
+    pub(super) static mut CHILD_TLS: [u8; 256] = [0u8; 256];
+
+    /// How many calls the parent issues. Comfortably more than the provisioned endpoint's depth
+    /// (8), so the queue fills and the park arm is reached even if that depth is raised later.
+    const CALLS: u32 = 20;
+    /// A bound on the child's polling so a parent failure cannot spin the boot forever.
+    const CHILD_ITERATIONS: u32 = 4096;
+
+    pub(super) fn armed(slot5: Option<u32>) -> bool {
+        matches!(slot5, Some(14))
+    }
+
+    /// The child: drain, yield, repeat, until the parent says it is done. Never returns.
+    pub(super) extern "C" fn child_body() -> ! {
+        let ep = EP_CAP.load(Relaxed);
+        let mut drained = 0u32;
+        let mut iterations = 0u32;
+        while iterations < CHILD_ITERATIONS && DONE.load(Relaxed) == 0 {
+            iterations += 1;
+            // SAFETY: `ep` carries RECEIVE. Deadline 0 is the NON-BLOCKING probe — a blocking
+            // receive here would publish a receiver waiter and the queue would never fill.
+            if let Ok(Some(_)) = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(ep, 0) } {
+                drained += 1;
+                DRAINED.store(drained, Relaxed);
+            }
+            // Hand the CPU back. When the parent is parked this is what lets the scheduler
+            // re-select it once a drained slot has completed its sender waiter.
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+        yarm_user_rt::user_log!(
+            "IPC_RESIDUAL2_PARK_WITNESS_CHILD drained={} iterations={} result=ok",
+            drained,
+            iterations
+        );
+        // Leave the runnable set without exiting: the parent may still be reporting.
+        loop {
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+    }
+
+    pub(super) fn run_once(child_entry: usize, stack_top: usize, tls_base: usize) {
+        use yarm_user_rt::ipc::Message;
+
+        let (_mem_cap, ep_cap) = super::shared_region_oracle_core::oracle_caps();
+        if ep_cap == 0 {
+            yarm_user_rt::user_log!("IPC_RESIDUAL2_PARK_WITNESS step=caps result=missing");
+            RESULT.store(0xF0, Relaxed);
+            return;
+        }
+        EP_CAP.store(ep_cap, Relaxed);
+
+        // SAFETY: `child_entry` is a valid `extern "C" fn() -> !` for this architecture; the
+        // static stack and TLS above outlive the thread, which never returns.
+        let child_tid =
+            match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, child_entry) } {
+                Ok(t) => t,
+                Err(e) => {
+                    yarm_user_rt::user_log!(
+                        "IPC_RESIDUAL2_PARK_WITNESS step=spawn err={:?} result=fail",
+                        e
+                    );
+                    RESULT.store(0xF1, Relaxed);
+                    return;
+                }
+            };
+        yarm_user_rt::user_log!(
+            "IPC_RESIDUAL2_PARK_WITNESS_BEGIN ep_cap={} child_tid={} calls={}",
+            ep_cap,
+            child_tid,
+            CALLS
+        );
+
+        // The child is Runnable but has not run: `spawn_thread` does not switch. So the calls
+        // below fill an endpoint nobody is draining, which is exactly the state under test.
+        let Ok(req) = Message::new(0, b"U9PARK") else {
+            yarm_user_rt::user_log!("IPC_RESIDUAL2_PARK_WITNESS step=req_build result=fail");
+            RESULT.store(0xF2, Relaxed);
+            return;
+        };
+        let mut ok = 0u32;
+        let mut failed = 0u32;
+        let mut first_err = 0u32;
+        for _ in 0..CALLS {
+            // SAFETY: `ep_cap` carries SEND and RECEIVE; it is the reply channel too.
+            match unsafe { yarm_user_rt::syscall::ipc_call(ep_cap, ep_cap, &req) } {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    failed += 1;
+                    if first_err == 0 {
+                        first_err = e as u32;
+                    }
+                }
+            }
+        }
+        DONE.store(1, Relaxed);
+        // Let the child observe DONE and emit its own line before this cell reports.
+        let _ = yarm_user_rt::syscall::yield_now();
+        let drained = DRAINED.load(Relaxed);
+
+        // ESSENTIAL AUTHORITY INTACT: the endpoint init depends on still resolves after a park
+        // and a resume. Deadline 0 is the non-blocking probe (AI_AGENT_RULES §8.2).
+        // SAFETY: `ep_cap` carries RECEIVE.
+        let after = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(ep_cap, 0) };
+        let caps_intact = !matches!(
+            after,
+            Err(yarm_user_rt::syscall::SyscallError::InvalidCapability)
+                | Err(yarm_user_rt::syscall::SyscallError::MissingRight)
+        );
+
+        // The park happened iff the child ran, and the child only runs when the parent blocks.
+        // So `drained > 0` is not incidental progress — it is the proof that the sender parked
+        // and that the scheduler advanced past it.
+        let all = failed == 0 && ok == CALLS && drained > 0 && caps_intact;
+        yarm_user_rt::user_log!(
+            "IPC_RESIDUAL2_PARK_WITNESS calls_ok={} calls_failed={} first_err={} drained={} intact={} result={}",
+            ok,
+            failed,
+            first_err,
+            drained,
+            caps_intact as u32,
+            all as u32
+        );
+        yarm_user_rt::user_log!(
+            "IPC_RESIDUAL2_PARK_WITNESS_DONE child_tid={} result={}",
+            child_tid,
+            if all { "ok" } else { "fail" }
+        );
+        RESULT.store(if all { 1 } else { 0xFF }, Relaxed);
+    }
+}
+
+/// U9-IPC-RESIDUAL2 §4 — the x86_64 child entry trampoline.
+///
+/// x86_64 is the one port that needs one: its SysV ABI expects the initial stack to look as if a
+/// `call` had just pushed a return address (`AI_AGENT_RULES` §2.5), and `spawn_thread` hands the
+/// entry a 16-byte-aligned SP. The `call` supplies the missing push. AArch64 and RISC-V take the
+/// body directly, which is the convention their existing live-sealed oracle children already use.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+mod x86_ipc_residual2_park {
+    #[unsafe(naked)]
+    pub(super) extern "C" fn child_entry() -> ! {
+        core::arch::naked_asm!(
+            "call {body}",
+            "ud2",
+            body = sym super::ipc_residual2_park_witness::child_body,
+        )
+    }
+}
+
+/// U9-IPC-RESIDUAL2 §4 — resolve this architecture's child entry and run the witness.
+#[cfg(not(feature = "hosted-dev"))]
+fn run_ipc_residual2_park_witness() {
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(ipc_residual2_park_witness::CHILD_STACK) as usize;
+        (base + 4096) & !0xF
+    };
+    let tls_base = core::ptr::addr_of_mut!(ipc_residual2_park_witness::CHILD_TLS) as usize;
+    #[cfg(target_arch = "x86_64")]
+    let entry = x86_ipc_residual2_park::child_entry as *const () as usize;
+    #[cfg(not(target_arch = "x86_64"))]
+    let entry = ipc_residual2_park_witness::child_body as *const () as usize;
+    ipc_residual2_park_witness::run_once(entry, stack_top, tls_base);
+}
+
 #[cfg(not(feature = "hosted-dev"))]
 pub(super) mod xfer2_grant_witness {
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -5299,6 +5530,13 @@ pub fn run() {
     #[cfg(not(feature = "hosted-dev"))]
     if ipc_residual1_queued_cap_witness::armed(ctx.supervisor_control_recv_ep) {
         ipc_residual1_queued_cap_witness::run_once();
+    }
+    // U9-IPC-RESIDUAL2 §4: the full-endpoint PARK witness, selector 14. Mutually exclusive with
+    // every other slot-5 cell and default-off. Two tasks, because the shape needs a receiver that
+    // makes progress while the sender is parked — see the module for the topology.
+    #[cfg(not(feature = "hosted-dev"))]
+    if ipc_residual2_park_witness::armed(ctx.supervisor_control_recv_ep) {
+        run_ipc_residual2_park_witness();
     }
     // Stage 200D-0C1: default-off + feature-gated AArch64 LIVE ExitCurrentTask oracle. The slot-5
     // value is DECODED through the shared `yarm_ipc_abi::exit_current_task_abi` helper rather than
