@@ -2970,30 +2970,33 @@ fn try_split_ipccall_into_frame(
     if !matches!(Syscall::decode(frame.syscall_num()), Ok(Syscall::IpcCall)) {
         return D::NotHandled;
     }
-    // U9-YIELD2 §1: `production || proof`, and the production term is a `const fn` that is true on
-    // x86_64, AArch64 and RISC-V. On a supported port this never declines; an unsupported port
-    // has no split route at all, and its NR 6 is counted honestly as a broad entry.
-    if !crate::kernel::boot::ipccall_direct_admission_enabled() {
+    // U9-IPC-RESIDUAL1 §1 / U9-IPC-RESIDUAL2 §2 — THE terminal-entry measurement for NR 6, once
+    // per trap and in exactly one place, so `broad_entries=0` means what it says.
+    //
+    // Every way a RECOGNIZED NR 6 can leave this route without being serviced goes through this
+    // one closure. There are three, and none is reachable on a supported port: admission is a
+    // `const fn` that is true on all three, the CPU index is bounded by the trap entry, and the
+    // body is total. They are kept — rather than deleted or debug-asserted away — because the
+    // closure guards assert that no reachable path takes them, and a guard about a door that
+    // does not exist proves nothing.
+    let unrouted = |reason: &str| -> D {
         crate::kernel::direct_ipc_counters::REQUEST.note_broad_entry();
-        return D::NotHandled;
+        crate::yarm_log!(
+            "IPCCALL_SPLIT_UNROUTED cpu={} nr=6 reason={} result=broad_entry",
+            cpu.0,
+            reason
+        );
+        D::NotHandled
+    };
+    if !crate::kernel::boot::ipccall_direct_admission_enabled() {
+        return unrouted("admission_disabled");
     }
     if cpu.0 as usize >= crate::kernel::scheduler::MAX_CPUS {
-        crate::kernel::direct_ipc_counters::REQUEST.note_broad_entry();
-        return D::NotHandled;
+        return unrouted("cpu_out_of_range");
     }
     match try_split_ipccall_direct_into_frame(shared, cpu, frame) {
         Some(disposition) => disposition,
-        // U9-IPC-RESIDUAL2 §2/§4 — the residual door, which production must never take.
-        //
-        // It is deliberately still HERE rather than deleted: the closure guards assert that no
-        // reachable path reaches it, and a guard that asserts about a door that does not exist
-        // proves nothing. If a future change reintroduces a fall-through, this counts it in the
-        // one place §1 established as honest, and the boot attestation's `no_broad_entry` flag
-        // turns the next ordinary boot red.
-        None => {
-            crate::kernel::direct_ipc_counters::REQUEST.note_broad_entry();
-            D::NotHandled
-        }
+        None => unrouted("residual"),
     }
 }
 
@@ -4451,7 +4454,7 @@ fn try_split_ipcreply_direct_into_frame(
             }
             crate::kernel::boot::DirectReplyTerminalClaim::Lost(class) => {
                 let _ = shared.release_reply_record_split(rec_idx, rec_gen);
-                REPLY_COUNTERS.note_declined_pre_transaction();
+                REPLY_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::WrongObject);
                 crate::yarm_log!(
                     "IPCREPLY_DIRECT_TERMINAL_LOST record_index={} record_generation={} replier_tid={} reason={:?} reply_copies=0 caller_wakes=0 result=ok",
                     rec_idx,
@@ -4753,11 +4756,14 @@ fn try_split_ipcreply_direct_into_frame(
         crate::kernel::boot::DirectReplyTerminalClaim::NotArmed => None,
         crate::kernel::boot::DirectReplyTerminalClaim::Won(owner) => Some(owner),
         crate::kernel::boot::DirectReplyTerminalClaim::Lost(class) => {
-            // Eligible, but the exclusive claim was lost — counted where every other
-            // eligible-but-pre-transaction refusal is counted. It is deliberately NOT a
-            // preflight decline: preflight passed, and the arbitration outcome is reported
-            // by the marker below rather than folded into the preflight subset.
-            REPLY_COUNTERS.note_declined_pre_transaction();
+            // Eligible, but the exclusive claim was lost. It is deliberately NOT a preflight
+            // decline: preflight passed, and the arbitration outcome is reported by the marker
+            // below rather than folded into the preflight subset.
+            //
+            // U9-IPC-RESIDUAL2 §2: counted as a FAILED terminal, not a pre-transaction decline.
+            // This arm already answered userspace with a typed error — it was never a decline in
+            // the sense that word had, which was "the broad path will now service this trap".
+            REPLY_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::WrongObject);
             crate::yarm_log!(
                 "IPCREPLY_DIRECT_TERMINAL_LOST record_index={} record_generation={} replier_tid={} reason={:?} reply_copies=0 caller_wakes=0 result=ok",
                 rec_idx,

@@ -314,21 +314,7 @@ pub(crate) use self::ipc_abi::transfer_cap_arg_present;
 // the policy guard test can assert it as a compile-time constant.
 pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;
 
-/// U9-IPC-RESIDUAL2 §2 — the KERNEL-TASK payload source, for the NR 6 split route.
-///
-/// `handle_ipc_call` takes one of two payload sources depending on
-/// `current_task_has_user_asid`: a user copy, or the argument registers via
-/// `inline_payload_from_frame`. The split route has to make the same distinction, and the
-/// register unpack is the half that has no split seam because it needs no lock — it reads the
-/// caller's own trap frame. This exposes THE existing implementation rather than adding a
-/// second one; `None` carries the same `InvalidArgs` the broad path returns.
-#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-pub(crate) fn split_inline_payload_from_frame(
-    frame: &crate::kernel::trapframe::TrapFrame,
-    len: usize,
-) -> Option<[u8; crate::kernel::ipc::Message::MAX_PAYLOAD]> {
-    ipc::inline_payload_from_frame(frame, len).ok()
-}
+pub(crate) use ipc::split_inline_payload_from_frame;
 pub(crate) mod ipc_abi;
 // Stage 154: D1/D5 cap-boundary landing zone. Holds the pure recv-v2 meta
 // codec today; the stateful cap/materialization seams stay in syscall.rs until

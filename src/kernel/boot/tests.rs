@@ -86508,74 +86508,72 @@ mod stage199d_delivery_projection_differential {
                 1,
                 "NR7 counts its preflight declines once, through the reply reporter"
             );
-            // Every post-eligibility, pre-transaction decline is counted too — otherwise
-            // `eligible` exceeds the terminals and the balance invariant cannot hold. A live
-            // boot found exactly this hole (the oracle's bounded pre-ack NR7 retries).
+            // U9-IPC-RESIDUAL2 §2 — THE ACCOUNTING CHANGED SHAPE, and this is the assertion
+            // that says how.
+            //
+            // `declined_pre_transaction` used to mean "eligible, nothing mutated, and the BROAD
+            // dispatcher will now service this trap". There were twenty-three such sites. Every
+            // one of them was a fall-through, and §2 removed the fall-through: each now either
+            // hands off to another lane of the same route, or answers userspace with the
+            // canonical error the broad handler would have raised.
+            //
+            // So the count is ZERO, in both directions, and that is the load-bearing fact. A
+            // non-zero count is not a style regression — it is a NR 6 or NR 7 that reached a
+            // terminal broad acquisition, which is precisely what this package exists to
+            // prevent, and it would show up in a live boot as `broad_entries` > 0.
             assert_eq!(
                 split
                     .matches("COUNTERS.note_declined_pre_transaction();")
                     .count(),
-                23,
-                "NR6 has two (copy, snapshot) since U9-IPC-RESIDUAL1 §2 turned the third — the \
-                 no-claimable-acknowledgement case — into the BUFFERED lane, which contributes \
-                 one of its own through its shared `decline` helper; 199D-TRC gave NR7 three — \
-                 the unresolved-record fail-close, the mode-indeterminate refusal and the lost \
-                 terminal claim; the queued mode has five — message framing, the pre-mutation \
-                 queue refusal, and §2's three cap-bearing acquisitions (absent transfer cap, \
-                 unreadable caller, refused envelope stash); DIRECT3-CAP-FINAL gave the \
-                 blocked capability lane nine, one per way it can refuse having mutated nothing \
-                 it cannot undo — absent transfer cap, unreadable caller, unreadable authority \
-                 slots, refused record reservation, an unarmed terminal, a LOST terminal claim, \
-                 a refused envelope stash, a refused message framing, and a producer that \
-                 declined or failed. §7\'s pre-lock refusal of a spent reply authority is NOT \
-                 among them: it is a PREFLIGHT decline, counted through \
-                 `note_declined_preflight_reply` with every other ineligibility"
+                0,
+                "no NR6/NR7 path declines to the broad dispatcher any more: every refusal is \
+                 answered here with the canonical error, and every non-refusal is handed to \
+                 another lane of the same route. `note_declined_pre_transaction` is the counter \
+                 for a decline that the broad path then services, so a live call site means a \
+                 fall-through has come back"
             );
-            for (direction, sites, what) in [
+            // Each answered refusal lands in a terminal bucket instead, which is what keeps
+            // `terminals_balance()` true: attempts == preflight + pre_transaction + completed +
+            // failed + legacy_fallback.
+            assert_eq!(
+                split.matches("COUNTERS.note_failed(").count(),
+                11,
+                "eleven answered refusals: NR6's eight (the eligible-path reply-capability \
+                 check, the SMP pre-acknowledgement WouldBlock, the inline-payload and \
+                 source-fault arms, the snapshot build, and the buffered, delivery and park \
+                 lanes' shared refusal helpers) and NR7's three (the terminal-lost arms in the \
+                 capability lane and the plain tail, plus its own shared helper). Every other \
+                 NR7 refusal routes through `nr7_refuse`, which is one of those three"
+            );
+            for (helper, what) in [
                 (
-                    "REQUEST_COUNTERS",
-                    3,
-                    "copy and snapshot declines are counted, plus the BUFFERED lane's single \
-                     shared `decline` helper — U9-IPC-RESIDUAL1 §2 turned the third site, the \
-                     no-claimable-acknowledgement case, into that lane instead of a fall-back",
+                    "fn nr7_refuse(",
+                    "NR7's shared refusal helper: one place that records the terminal, emits \
+                     the attributable marker and frames the error",
                 ),
                 (
-                    "REPLY_COUNTERS",
-                    20,
-                    "copy, snapshot, ack-claim, unresolved-record, mode-indeterminate, \
-                     lost-claim, queued-framing and queued-refusal declines are all counted, \
-                     plus U9-IPC-RESIDUAL1 §2's three cap-bearing queued acquisitions (absent \
-                     transfer cap, unreadable caller, refused envelope stash), and the blocked \
-                     capability lane's nine — absent transfer cap, unreadable caller, \
-                     unreadable authority slots, refused record reservation, unarmed terminal, \
-                     lost terminal claim, refused envelope stash, refused message framing, and \
-                     a producer that declined or failed. The lane uses THIS counter rather than \
-                     a second alias for it, so a cap-bearing refusal is never accounted apart \
-                     from every other NR7 refusal",
+                    "fn nr7_refuse_preflight(",
+                    "and NR7's preflight resolver, which applies the BROAD validation order",
                 ),
+                ("fn nr6_refuse_preflight(", "NR6's preflight resolver, likewise"),
             ] {
-                assert_eq!(
-                    split
-                        .matches(&alloc::format!(
-                            "{direction}.note_declined_pre_transaction();"
-                        ))
-                        .count(),
-                    sites,
-                    "{direction}: {what}"
-                );
+                assert!(split.contains(helper), "{what}");
             }
             assert_eq!(
                 split
                     .matches("direct_ipc_counters::note_disposition(")
                     .count(),
-                6,
+                8,
                 "Every lane that RETURNS from the route counts its own terminal disposition. \
                  U9-IPC-RESIDUAL1 §1/§2 added three: the queued reply success (which applied a \
                  disposition without recording it, so `terminals_balance` read false on every \
                  ordinary boot), the fail-closed unresolved-claim exit, and NR6's BUFFERED \
                  lane. The rest are NR6 direct, the plain NR7 tail, and the capability lane — \
                  the capability lane needs its own because it returns from the \
-                 route before the shared tail, having handed its delivery to the drain"
+                 route before the shared tail, having handed its delivery to the drain. \
+                 U9-IPC-RESIDUAL2 §2 added NR6's two new arms — the delivery to a recv-v2 \
+                 blocked waiter, and the park on a full endpoint — each of which returns from \
+                 the route and so owes its own terminal"
             );
             // Only the NR6 direction can report a MODE decline; NR7 has no mode requirement.
             // Whitespace-collapsed so rustfmt's line breaking cannot break the guard.
@@ -108994,15 +108992,23 @@ mod stage199d_transfer_cap_safety {
         // the assertion is no longer "the arm is exactly this text" but the property that text
         // was standing in for — both exits are returns, and neither touches any mutating or
         // user-memory step.
+        // U9-IPC-RESIDUAL2 §2 re-derivation. The arm used to end at `return None;` — the
+        // fall-through this package removed — so it now ends at the refusal resolver, and BOTH
+        // its exits are typed answers: the DIRECT3 spent-authority refusal, and the resolver
+        // that answers every other ineligibility in the broad handler's own validation order.
         let arm = &flat[decline_at..];
         let arm_end = arm
-            .find("return None;")
-            .expect("the decline arm still ends in a return to the legacy path");
-        let arm = &arm[..arm_end + "return None;".len()];
+            .find("return Some(nr7_refuse_preflight(")
+            .expect("the decline arm ends in the refusal resolver, not a fall-through");
+        let arm = &arm[..arm_end + "return Some(nr7_refuse_preflight(".len()];
         assert!(
             arm.contains("frame.set_err( crate::kernel::syscall::SyscallError::WrongObject.code(), ); return Some(Ok(()));")
                 || arm.contains("frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code()); return Some(Ok(()));"),
             "the spent-authority refusal returns the typed error rather than falling through"
+        );
+        assert!(
+            !arm.contains("return None"),
+            "and no exit from the preflight decline arm hands the trap to the broad dispatcher"
         );
         for mutating in [
             "ipcreply_direct_ack::claim(",
@@ -127964,7 +127970,30 @@ mod u3_recv_copy_fault_completion {
 
     #[test]
     fn the_transaction_is_rank_ordered_and_takes_each_domain_once() {
-        let t = body_of("fn record_recv_boundary_user_fault_split");
+        // U9-IPC-RESIDUAL2 §2 re-derivation. `record_recv_boundary_user_fault_split` is now a
+        // two-line wrapper that names its access direction and delegates; the transaction it
+        // used to hold inline moved WHOLE into `record_split_user_fault`, so the ordering
+        // assertions follow the body. The wrapper's own property — that the recv boundary still
+        // reports `Write` — is asserted separately below, and the NR 6 / NR 7 source-copy
+        // sibling's `Read` with it, because the direction is exactly what a shared body could
+        // silently get wrong for one of its callers.
+        let recv_wrapper = body_of("fn record_recv_boundary_user_fault_split");
+        assert!(
+            recv_wrapper.contains("FaultAccess::Write"),
+            "the recv boundary still records a WRITE fault: it faults writing into the receiver"
+        );
+        let read_wrapper = body_of("fn record_split_source_read_fault");
+        assert!(
+            read_wrapper.contains("FaultAccess::Read"),
+            "the NR6/NR7 source copy records a READ fault: it faults reading the caller's payload"
+        );
+        for w in [&recv_wrapper, &read_wrapper] {
+            assert!(
+                w.contains("self.record_split_user_fault("),
+                "both wrappers delegate to the ONE transaction; neither re-implements it"
+            );
+        }
+        let t = body_of("fn record_split_user_fault");
         assert!(
             !t.contains(".with_cpu(") && !t.contains("self.with(|"),
             "no broad acquisition and no fallback"
@@ -127985,8 +128014,10 @@ mod u3_recv_copy_fault_completion {
             !t.contains("with_scheduler_split_mut"),
             "the binding is delegated, never re-implemented or held open"
         );
-        // Exactly the legacy record, and no frame snapshot.
-        assert!(t.contains("access: FaultAccess::Write"));
+        // Exactly the legacy record, and no frame snapshot. The direction is now the shared
+        // body's PARAMETER — `record_user_fault` always took it as one — and each wrapper's
+        // choice is pinned above.
+        assert!(t.contains("access,"));
         assert!(t.contains("addr: VirtAddr(addr as u64)"));
         assert!(!t.contains("record_fault_frame_snapshot"));
         // The refusal propagates before anything else runs.
@@ -139093,6 +139124,7 @@ mod u6_frame_exact_envelope_preservation {
             msg: child_msg(),
             deadline: None,
             transfer_envelope: None,
+            reply_authority: None,
         };
         assert_eq!(snap.msg.sender_tid, ThreadId(CHILD));
         assert_eq!(snap.msg.opcode, OPCODE);
@@ -153105,10 +153137,18 @@ mod direct3_cap_final_prelock_refusal {
             .split("REPLY_COUNTERS.note_declined_preflight_reply(")
             .nth(1)
             .expect("the preflight decline arm");
-        let arm = &arm[..arm.find("return None;").expect("the arm still falls back")];
+        // U9-IPC-RESIDUAL2 §2 re-derivation. This used to slice the arm at `return None;` and
+        // assert "an unresolved capability still declines to legacy". That fall-through is
+        // exactly what §2 removed, so the slice terminator is now the refusal resolver the arm
+        // ends in, and the property asserted is the one that was always the point: the DIRECT3
+        // record-exact refusal is decided on the record, comes first, and every other shape is
+        // resolved by a named owner rather than handed to the broad dispatcher.
+        let arm = &arm[..arm
+            .find("return Some(nr7_refuse_preflight(")
+            .expect("the arm ends in the refusal resolver, not a fall-through")];
         assert!(
             arm.contains("if let Ok((rec_idx, rec_gen)) = reply_object"),
-            "an unresolved capability still declines to legacy — no record to be exact about"
+            "the record-exact refusal is still guarded on a RESOLVED record"
         );
         assert!(
             arm.contains("!shared.reply_record_externally_invokable_split_read(rec_idx, rec_gen)"),
@@ -165708,10 +165748,22 @@ mod u9yield2_family_edge {
             ),
             "the NR-gate bypass must be the canonical admission predicate"
         );
+        // U9-IPC-RESIDUAL2 §2 re-derivation. NR 6 left the NON-SWITCHING dispatcher when its
+        // full-endpoint arm started parking the caller, so it is now reached from the switching
+        // dispatcher like `IpcSend`; NR 7 still never switches and stays where it was. The
+        // property is unchanged — both are reached from the dispatcher and both gate on the
+        // production admission predicate — so the assertion follows the call sites.
         assert!(
-            c.contains("if matches!(syscall, Syscall::IpcCall)")
-                && c.contains("if matches!(syscall, Syscall::IpcReply)"),
-            "and both direct handlers must still be reached from the dispatcher"
+            c.contains("match try_split_ipccall_into_frame(shared, cpu, frame)"),
+            "NR 6 must be reached from the SWITCHING dispatcher (it can park its caller)"
+        );
+        assert!(
+            c.contains("if matches!(syscall, Syscall::IpcReply)"),
+            "and NR 7 from the non-switching one"
+        );
+        assert!(
+            code(SPLIT).contains("crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "both still gate on the canonical production admission predicate"
         );
     }
 
@@ -172966,6 +173018,14 @@ mod u9_ipc_residual1_cases {
         (idx, object)
     }
 
+    /// U9-IPC-RESIDUAL2 §3 — the live endpoint incarnation, read the way the publication reads
+    /// it, so a test asserts against the real generation rather than a guessed one.
+    fn endpoint_generation(shared: &SharedKernel, idx: usize) -> u64 {
+        shared
+            .with(|s| s.with_ipc_state(|ipc| ipc.endpoint_generations.get(idx).copied()))
+            .expect("a live endpoint has a generation")
+    }
+
     /// **The defect the live boot found.** The ordinary allocation path never prepared the
     /// terminal-ownership cell, so a recycled slot stayed identity-mismatched forever and the
     /// queued (unblocked-caller) reply mode could never be selected on it again.
@@ -173084,8 +173144,9 @@ mod u9_ipc_residual1_cases {
         shared.with(|s| {
             s.publish_recv_waiter_live(eidx, waiter, CapId(0));
         });
+        let egen = endpoint_generation(&shared, eidx);
         assert_eq!(
-            shared.enqueue_request_if_no_waiter_split(eidx, msg),
+            shared.enqueue_request_if_no_waiter_split(eidx, egen, msg),
             QueuedRequestOutcome::WaiterAppeared,
             "a receiver that parked since the pre-lock read is REPORTED, not enqueued behind"
         );
@@ -173102,7 +173163,7 @@ mod u9_ipc_residual1_cases {
         // With the waiter taken, the same request publishes.
         let _ = shared.with(|s| s.with_ipc_state_mut(|ipc| ipc.take_endpoint_waiter(eidx)));
         assert_eq!(
-            shared.enqueue_request_if_no_waiter_split(eidx, msg),
+            shared.enqueue_request_if_no_waiter_split(eidx, egen, msg),
             QueuedRequestOutcome::Enqueued
         );
         assert!(
@@ -173122,7 +173183,7 @@ mod u9_ipc_residual1_cases {
         let shared = shared_with_task();
         let msg = Message::new(1, b"req").expect("message");
         assert_eq!(
-            shared.enqueue_request_if_no_waiter_split(usize::MAX, msg),
+            shared.enqueue_request_if_no_waiter_split(usize::MAX, 0, msg),
             QueuedRequestOutcome::EndpointMissing,
             "a missing endpoint is named as itself — never a silent success, and never a \
              queue-full, which is the BLOCKING origin and a different answer entirely"
@@ -173228,23 +173289,35 @@ mod u9_ipc_residual1_closure {
             1,
             "and NR7's likewise"
         );
-        // Each sits immediately after its helper's fall-through, inside the admission arm.
-        for (helper, counter) in [
-            (
-                "try_split_ipccall_direct_into_frame(shared, cpu, frame)",
-                "REQUEST.note_broad_entry();",
-            ),
-            (
-                "try_split_ipcreply_direct_into_frame(shared, cpu, frame)",
-                "REPLY.note_broad_entry();",
-            ),
+        // U9-IPC-RESIDUAL2 §2 re-derivation. NR 6's three unrouted exits (admission off, CPU out
+        // of range, and the residual door) funnel through ONE closure, so the count stays one and
+        // the measurement stays per-trap. NR 7's single site is unchanged.
+        let closure_at = c
+            .find("let unrouted = |reason: &str| -> D {")
+            .expect("NR6's unrouted exits share one counting closure");
+        assert!(
+            c[closure_at..closure_at + 200].contains("REQUEST.note_broad_entry();"),
+            "and that closure is where the terminal entry is counted"
+        );
+        for reason in [
+            "unrouted(\"admission_disabled\")",
+            "unrouted(\"cpu_out_of_range\")",
+            "unrouted(\"residual\")",
         ] {
-            let at = c.find(helper).expect("helper call site");
+            assert!(
+                c.contains(reason),
+                "the `{reason}` exit must go through the counting closure"
+            );
+        }
+        {
+            let at = c
+                .find("try_split_ipcreply_direct_into_frame(shared, cpu, frame)")
+                .expect("the NR7 helper call site");
             let after = &c[at..];
             let end = after.find("\n    }").unwrap_or(after.len());
             assert!(
-                after[..end].contains(counter),
-                "{helper} must count its fall-through before the arm closes"
+                after[..end].contains("REPLY.note_broad_entry();"),
+                "NR7 must count its fall-through before the arm closes"
             );
         }
         // And it is a hard closure invariant, not merely reported.

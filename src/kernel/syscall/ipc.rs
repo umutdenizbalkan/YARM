@@ -191,10 +191,26 @@ pub(crate) fn frame_ipc_send_message(
         .map_err(|_| SyscallError::InvalidArgs)
 }
 
-/// U9-IPC-RESIDUAL2 §2: visible to the `syscall` module so the NR 6 split route can reach the
-/// SAME kernel-task payload source through `split_inline_payload_from_frame`, instead of
-/// re-deriving the register unpack. Still owned here, and still the only implementation.
-pub(super) fn inline_payload_from_frame(
+/// U9-IPC-RESIDUAL2 §2 — the SPLIT route's entry to the kernel-task payload source.
+///
+/// `handle_ipc_call` and `handle_ipc_reply` take one of two payload sources depending on
+/// `current_task_has_user_asid`: a user copy, or the argument registers. The split NR 6 / NR 7
+/// routes must make the same distinction, and the register unpack is the half with no split seam
+/// because it needs no lock — it reads the caller's own trap frame.
+///
+/// This is a wrapper, not a second implementation, and it lives HERE rather than exposing
+/// `inline_payload_from_frame` itself: the Stage 147 IPC boundary audit requires that helper to
+/// stay module-private, and widening it would have traded a real ownership rule for convenience.
+/// `None` carries the same `InvalidArgs` the broad path returns.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn split_inline_payload_from_frame(
+    frame: &TrapFrame,
+    len: usize,
+) -> Option<[u8; Message::MAX_PAYLOAD]> {
+    inline_payload_from_frame(frame, len).ok()
+}
+
+fn inline_payload_from_frame(
     frame: &TrapFrame,
     len: usize,
 ) -> Result<[u8; Message::MAX_PAYLOAD], SyscallError> {
