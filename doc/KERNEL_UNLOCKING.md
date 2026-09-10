@@ -16831,6 +16831,11 @@ its own words ("NR 6's residual arm is the helper's `None`, not an unarmed gate"
 the highest-traffic pair in the whole space — 53 and 54 dispatches in a single short boot, against
 1 for NR 1 and 2 for NR 3 — so this is the last high-volume terminal-broad edge in the IPC core.
 
+> **Corrected by U9-IPC-RESIDUAL1 §1.** The "53 and 54 dispatches" are direct SUCCESSES, not
+> terminal-broad traffic: `YARM_LOCK_SPLIT_DISPATCH nr=6 result=ok` is emitted when the SPLIT
+> route handled the trap. The residual was one NR 6 trap per boot and zero NR 7 traps, which that
+> row could not have shown. The selection was right; the reason given for it was not.
+
 Second candidate, smaller and mostly wiring: **NR 2 `IpcRecv`'s user-ASID cohort**, which §1
 established is not short a mechanism.
 
@@ -16975,6 +16980,36 @@ cap-lane guard, which pinned the behaviour §2 was asked to change and now pins 
 the terminal alone selects the lane, and each lane carries the capability through an existing
 owner.
 
+### §5 — a regression found against fresh base artifacts, and repaired
+
+The x86_64 shared-region direct oracle failed on the changed tree and passed at `7b58ba7`, so it
+was investigated rather than excluded. The mechanism:
+
+```
+USER_MAP_PA_CHECK asid=1 va=0x40000000 pa=0x1021b000
+USER_MAP_PA_CHECK asid=1 va=0x40001000 pa=0x1021c000
+VM_FULL reason=mapping_bookkeeping_full asid=Some(1) len=128 max_mappings=128 va=0x40001000
+DISPATCH_POST_WORK_FAIL kind=blocked_waiter_shared_region reason=txn err=MapFault
+```
+
+Init runs at **128/128 mapping runs** on that profile. `AddressSpace::map_page` performed its
+capacity check *before* the merge predicates — so the second page, which is virtually and
+physically adjacent to the run the first page just created and would have merged into it
+consuming **no** bookkeeping entry, was refused as "full". Growing the init binary by the §4
+witness cell shifted its heap layout by one page, which was enough to expose it.
+
+The repair is to check what the operation actually costs: both merge paths return without growing
+`len` (the prev+next case shrinks it), so the refusal now applies only when the insert genuinely
+needs an entry. The predicates are pure reads, so hoisting them decides nothing differently, and
+the refusal stays ahead of `arch_map_page` — preserving the property that hardware and the
+software shadow never diverge on a rejected mapping.
+`a_full_mapping_table_still_admits_a_page_that_merges_into_a_run` fills the table with
+non-adjacent runs, admits a merging page without growth, and confirms a genuinely new run is
+still refused.
+
+This is a repair of a defect this package exposed, not scope creep: without it the package
+regresses a live cell that passes at base.
+
 ### Census
 
 **CENSUS-DELTA: 0.**
@@ -16984,3 +17019,5 @@ owner.
 * **NR 6 / NR 7 blocking-mode changes.** Out of scope by directive; a full endpoint still parks
   the sender on the legacy path, which is the blocking origin.
 * **NR 2 `IpcRecv`'s user-ASID cohort** — still not wired, and still not short a mechanism.
+* **Init's mapping-run pressure.** 128/128 is the reason a one-page layout shift was visible at
+  all. The refusal is now correct, but the headroom is not investigated here.
