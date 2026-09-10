@@ -2571,20 +2571,28 @@ fn try_split_dispatch_nonswitching_into_frame(
 
     // Stage 199A2B3: IpcReply (NR 7) direct reply. The helper snapshots the reply payload
     // off-lock (owned) and drives the accepted off-lock reply transaction (reserve →
-    // caller-copy → exact-waiter claim → record Consumed → single enqueue). For any case it
-    // cannot service it returns `None`, so NR 7 falls back to its existing global-lock path.
+    // caller-copy → exact-waiter claim → record Consumed → single enqueue).
     //
     // U9-YIELD2 §1 — the "(proof-gated, default-OFF)" label that used to head this note is stale
     // for the same reason NR 6's is: admission short-circuits on the production term, which is
     // `true` on all three architectures. The gate is open on every ordinary boot.
-    if matches!(syscall, Syscall::IpcReply)
-        && crate::kernel::boot::ipccall_direct_admission_enabled()
-    {
-        if let Some(result) = try_split_ipcreply_direct_into_frame(shared, cpu, frame) {
-            return Some(result);
+    //
+    // U9-IPC-RESIDUAL2 §2 — and the route now answers `Result`, not `Option`. "For any case it
+    // cannot service it returns `None`" was the fall-through this package removed; there is no
+    // longer a value the route can produce that means "let the broad dispatcher have this trap",
+    // so the measurement below counts only the arm that never runs on a supported port.
+    #[cfg(not(feature = "hosted-dev"))]
+    if matches!(syscall, Syscall::IpcReply) {
+        if crate::kernel::boot::ipccall_direct_admission_enabled() {
+            return Some(try_split_ipcreply_direct_into_frame(shared, cpu, frame));
         }
-        // U9-IPC-RESIDUAL1 §1 — the NR7 twin of the measurement above.
+        // U9-IPC-RESIDUAL1 §1 — the NR7 twin of the measurement above. Reachable only where the
+        // production admission term is false, which is no supported architecture.
         crate::kernel::direct_ipc_counters::REPLY.note_broad_entry();
+        crate::yarm_log!(
+            "IPCREPLY_SPLIT_UNROUTED cpu={} nr=7 reason=admission_disabled result=broad_entry",
+            cpu.0
+        );
     }
 
     // The requester TID is what the global-lock handler reads via
@@ -2974,11 +2982,15 @@ fn try_split_ipccall_into_frame(
     // per trap and in exactly one place, so `broad_entries=0` means what it says.
     //
     // Every way a RECOGNIZED NR 6 can leave this route without being serviced goes through this
-    // one closure. There are three, and none is reachable on a supported port: admission is a
-    // `const fn` that is true on all three, the CPU index is bounded by the trap entry, and the
-    // body is total. They are kept — rather than deleted or debug-asserted away — because the
-    // closure guards assert that no reachable path takes them, and a guard about a door that
-    // does not exist proves nothing.
+    // one closure. There are exactly TWO, and neither is reachable on a supported port:
+    // admission's first term is a `const fn` that is true on x86_64, AArch64 and RISC-V, and the
+    // CPU index is bounded by the trap entry that produced it.
+    //
+    // There used to be a third — the body answering `None` — and it is gone at the type level:
+    // `try_split_ipccall_direct_into_frame` returns `SplitDispatchDisposition`, so there is no
+    // value it can produce that means "the broad dispatcher should service this trap". The two
+    // that remain are kept rather than deleted, because the closure guards assert that no
+    // reachable path takes them, and a guard about a door that does not exist proves nothing.
     let unrouted = |reason: &str| -> D {
         crate::kernel::direct_ipc_counters::REQUEST.note_broad_entry();
         crate::yarm_log!(
@@ -2994,10 +3006,7 @@ fn try_split_ipccall_into_frame(
     if cpu.0 as usize >= crate::kernel::scheduler::MAX_CPUS {
         return unrouted("cpu_out_of_range");
     }
-    match try_split_ipccall_direct_into_frame(shared, cpu, frame) {
-        Some(disposition) => disposition,
-        None => unrouted("residual"),
-    }
+    try_split_ipccall_direct_into_frame(shared, cpu, frame)
 }
 
 /// U9-IPC-RESIDUAL2 §2 — resolve a NR 6 preflight refusal to the error the BROAD handler would
@@ -3129,14 +3138,19 @@ fn nr6_refuse_preflight(
     }
 }
 
-/// U9-IPC-RESIDUAL2 §2 — the NR 6 body. `None` is the residual door and no reachable path
-/// returns it; see [`try_split_ipccall_into_frame`] for the four doors that are reachable.
+/// U9-IPC-RESIDUAL2 §2 — the NR 6 body, whose return type is the proof.
+///
+/// It answers `SplitDispatchDisposition` and not `Option<..>`: there is no value it can produce
+/// that means "the broad dispatcher should service this trap". The one disposition that would
+/// mean that, `NotHandled`, appears nowhere in this function or in anything it calls — which is
+/// checked by `u9_ipc_residual2_closure::no_family_function_can_fall_through`, and is a
+/// statement about types rather than about text.
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_ipccall_direct_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
-) -> Option<SplitDispatchDisposition> {
+) -> SplitDispatchDisposition {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipccall_direct::{IPC_DIRECT_PAYLOAD_MAX, IpcCallDirectSnapshot};
     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
@@ -3189,9 +3203,7 @@ fn try_split_ipccall_direct_into_frame(
             verdict
                 == crate::kernel::direct_eligibility::DirectRequestEligibility::EndpointNotAdmitted,
         );
-        return Some(nr6_refuse_preflight(
-            shared, cpu, frame, verdict, tid, send_cap, reply_cap,
-        ));
+        return nr6_refuse_preflight(shared, cpu, frame, verdict, tid, send_cap, reply_cap);
     };
     REQUEST_COUNTERS.note_eligible();
     let tid = tid.expect("eligibility requires an available requester");
@@ -3217,7 +3229,7 @@ fn try_split_ipccall_direct_into_frame(
         );
         frame.set_err(err.code());
         REQUEST_COUNTERS.note_failed(err);
-        return Some(SplitDispatchDisposition::Complete(Ok(())));
+        return SplitDispatchDisposition::Complete(Ok(()));
     }
     // Stage 199A2D2C2B2: on the cross-CPU REQUEST path, if the server has NOT yet published its
     // blocked-server acknowledgement (it is not yet blocked in recv-v2), return a NON-MUTATING
@@ -3230,7 +3242,7 @@ fn try_split_ipccall_direct_into_frame(
         crate::kernel::boot::ipccall_direct_smp_request_note_early_wouldblock();
         frame.set_err(crate::kernel::syscall::SyscallError::WouldBlock.code());
         REQUEST_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::WouldBlock);
-        return Some(SplitDispatchDisposition::Complete(Ok(())));
+        return SplitDispatchDisposition::Complete(Ok(()));
     }
     let asid_raw = shared.task_asid_for_tid_split_read(tid);
     let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(
@@ -3263,7 +3275,7 @@ fn try_split_ipccall_direct_into_frame(
             );
             frame.set_err(crate::kernel::syscall::SyscallError::InvalidArgs.code());
             REQUEST_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::InvalidArgs);
-            return Some(SplitDispatchDisposition::Complete(Ok(())));
+            return SplitDispatchDisposition::Complete(Ok(()));
         };
         payload_buf[..len].copy_from_slice(&regs[..len]);
     } else if len > 0 {
@@ -3279,7 +3291,7 @@ fn try_split_ipccall_direct_into_frame(
                 len
             );
             REQUEST_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::PageFault);
-            return Some(SplitDispatchDisposition::Complete(Ok(())));
+            return SplitDispatchDisposition::Complete(Ok(()));
         };
         payload_buf[..len].copy_from_slice(&bytes[..len]);
     }
@@ -3296,7 +3308,7 @@ fn try_split_ipccall_direct_into_frame(
         );
         frame.set_err(crate::kernel::syscall::SyscallError::InvalidArgs.code());
         REQUEST_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::InvalidArgs);
-        return Some(SplitDispatchDisposition::Complete(Ok(())));
+        return SplitDispatchDisposition::Complete(Ok(()));
     };
     // Consume the acknowledgement published for EXACTLY this endpoint incarnation, at most
     // once (Stage 199D endpoint-keyed, generation-bearing store). A pair belonging to any
@@ -3387,8 +3399,18 @@ fn try_split_ipccall_direct_into_frame(
     //
     // U9-IPC-RESIDUAL2 §2: the decline arm above is taken before this point, so the encoder can
     // only be reached with `Completed` or `Failed`, both of which it answers `Some(())`.
-    crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition)
-        .map(|()| SplitDispatchDisposition::Complete(Ok(())))
+    match crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition) {
+        Some(()) => SplitDispatchDisposition::Complete(Ok(())),
+        None => {
+            // Unreachable: the decline arm above returned already, and the encoder answers
+            // `Some` for `Completed` and `Failed` alike. Named rather than unwrapped, so the
+            // impossible case can never become a silent fall-through.
+            debug_assert!(false, "the encoder was reached with a decline");
+            SplitDispatchDisposition::Complete(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            )))
+        }
+    }
 }
 
 /// U9-IPC-RESIDUAL1 §2/§3, U9-IPC-RESIDUAL2 §2/§3 — **NR 6's BUFFERED lane**, entirely off the
@@ -3457,7 +3479,7 @@ fn try_split_ipccall_queued_into_frame(
     send_cap: crate::kernel::capabilities::CapId,
     reply_recv_cap: crate::kernel::capabilities::CapId,
     payload: &[u8],
-) -> Option<SplitDispatchDisposition> {
+) -> SplitDispatchDisposition {
     use crate::kernel::boot::{EndpointSendAdmission, QueuedRequestOutcome};
     use crate::kernel::capabilities::{CapObject, CapRights, Capability};
     use crate::kernel::direct_ipc_counters::REQUEST as REQUEST_COUNTERS;
@@ -3470,7 +3492,7 @@ fn try_split_ipccall_queued_into_frame(
     // Every arm below reached this state having mutated nothing that is not compensated first,
     // so the canonical error is exactly the one the broad handler would have raised from the
     // corresponding `?`. The frame carries it; the counters record one terminal.
-    let refuse = |frame: &mut TrapFrame, err: SyscallError, reason: &str| -> Option<D> {
+    let refuse = |frame: &mut TrapFrame, err: SyscallError, reason: &str| -> D {
         REQUEST_COUNTERS.note_failed(err);
         crate::yarm_log!(
             "IPCCALL_QUEUED_SPLIT_REFUSED reason={} tid={} endpoint={} endpoint_generation={} err={:?} result=ok",
@@ -3481,7 +3503,7 @@ fn try_split_ipccall_queued_into_frame(
             err
         );
         frame.set_err(err.code());
-        Some(D::Complete(Ok(())))
+        D::Complete(Ok(()))
     };
 
     // (B) rank 2 → 4 read — the caller's reply-receive endpoint, through THE validation owner,
@@ -3624,11 +3646,19 @@ fn try_split_ipccall_queued_into_frame(
             // The same three return lanes the broad handler ends with: `set_ok(0, 0, 0)` then
             // `encode_transfer_cap_ret(frame, None)`. `IpcCall` is request-send only — the
             // caller receives the reply through its own explicit receive on `reply_recv_cap`.
-            crate::kernel::direct_disposition::apply_direct_disposition(
+            // `Completed` always encodes, so the encoder's `Option` is `Some` here. Named
+            // rather than unwrapped: an impossible case that is spelled out cannot become a
+            // silent fall-through if the encoder's contract ever changes.
+            match crate::kernel::direct_disposition::apply_direct_disposition(
                 frame,
                 crate::kernel::direct_disposition::DirectDisposition::Completed,
-            )
-            .map(|()| D::Complete(Ok(())))
+            ) {
+                Some(()) => D::Complete(Ok(())),
+                None => {
+                    debug_assert!(false, "a completed disposition always encodes");
+                    D::Complete(Err(TrapHandleError::Syscall(SyscallError::Internal)))
+                }
+            }
         }
         // U9-IPC-RESIDUAL2 §2 — A FULL ENDPOINT PARKS THE SENDER. It does not answer.
         //
@@ -3737,14 +3767,14 @@ fn nr6_deliver_to_blocked_waiter(
     reply_endpoint: crate::kernel::capabilities::CapObject,
     waiter_tid: crate::kernel::ipc::ThreadId,
     payload: &[u8],
-) -> Option<SplitDispatchDisposition> {
+) -> SplitDispatchDisposition {
     use crate::kernel::capabilities::{CapObject, CapRights, Capability};
     use crate::kernel::direct_ipc_counters::REQUEST as REQUEST_COUNTERS;
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::syscall::SyscallError;
     use SplitDispatchDisposition as D;
 
-    let refuse = |frame: &mut TrapFrame, err: SyscallError, reason: &str| -> Option<D> {
+    let refuse = |frame: &mut TrapFrame, err: SyscallError, reason: &str| -> D {
         REQUEST_COUNTERS.note_failed(err);
         crate::yarm_log!(
             "IPCCALL_DELIVER_SPLIT_REFUSED reason={} tid={} endpoint={} waiter_tid={} err={:?} result=ok",
@@ -3755,7 +3785,7 @@ fn nr6_deliver_to_blocked_waiter(
             err
         );
         frame.set_err(err.code());
-        Some(D::Complete(Ok(())))
+        D::Complete(Ok(()))
     };
 
     // The record binds the responder, exactly as `create_reply_cap_for_caller(.., responder_tid)`
@@ -3845,9 +3875,9 @@ fn nr6_deliver_to_blocked_waiter(
             frame.set_ret2(
                 usize::try_from(crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP).unwrap_or(0),
             );
-            Some(D::PostWorkCommitted {
+            D::PostWorkCommitted {
                 finalize_syscall: true,
-            })
+            }
         }
         // The producer declined having consumed nothing: the waiter is not the shape it claimed
         // to be. Compensate and answer, rather than re-running the whole call under the broad
@@ -3894,7 +3924,7 @@ fn nr6_park_sender(
     record_index: usize,
     record_generation: u64,
     unwind_all: impl Fn(&SharedKernel),
-) -> Option<SplitDispatchDisposition> {
+) -> SplitDispatchDisposition {
     use crate::kernel::direct_ipc_counters::REQUEST as REQUEST_COUNTERS;
     use crate::kernel::syscall::SyscallError;
     use SplitDispatchDisposition as D;
@@ -3925,9 +3955,7 @@ fn nr6_park_sender(
         );
         // NR 1's park arm answers the same `WouldBlock` for the same condition. The frame is
         // encoded by the trap wrapper from this typed error, as it is for every `Complete(Err)`.
-        return Some(D::Complete(Err(TrapHandleError::Syscall(
-            SyscallError::WouldBlock,
-        ))));
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WouldBlock)));
     }
     let snapshot = crate::kernel::dispatch_post_work::BlockingSendCommitSnapshot {
         cpu,
@@ -3982,9 +4010,9 @@ fn nr6_park_sender(
         record_index,
         record_generation
     );
-    Some(D::PostWorkCommitted {
+    D::PostWorkCommitted {
         finalize_syscall: false,
-    })
+    }
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -4089,7 +4117,7 @@ fn try_split_ipcreply_direct_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
-) -> Option<Result<(), TrapHandleError>> {
+) -> Result<(), TrapHandleError> {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipccall_direct::{IPC_DIRECT_PAYLOAD_MAX, IpcReplyDirectSnapshot};
     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
@@ -4197,11 +4225,9 @@ fn try_split_ipcreply_direct_into_frame(
                 facts.terminal
             );
             frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
-            return Some(Ok(()));
+            return Ok(());
         }
-        return Some(nr7_refuse_preflight(
-            shared, cpu, frame, verdict, tid, reply_cap,
-        ));
+        return nr7_refuse_preflight(shared, cpu, frame, verdict, tid, reply_cap);
     };
     REPLY_COUNTERS.note_eligible();
     let tid = tid.expect("eligibility requires an available requester");
@@ -4223,7 +4249,7 @@ fn try_split_ipcreply_direct_into_frame(
         if crate::kernel::boot::ipcreply_direct_ack::snapshot(reply_eidx, reply_egen).is_none() {
             crate::kernel::boot::ipcreply_direct_smp_reply_note_early_wouldblock();
             frame.set_err(SyscallError::WouldBlock.code());
-            return Some(Ok(()));
+            return Ok(());
         }
         if !crate::kernel::boot::ipcreply_direct_ack::is_claimable(reply_eidx, reply_egen) {
             crate::kernel::boot::ipcreply_direct_smp_note_duplicate_refused();
@@ -4231,7 +4257,7 @@ fn try_split_ipcreply_direct_into_frame(
                 "IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED arch=x86_64 reason=consumed_barrier reply_copies=1 caller_wakes=1 ipis=1 result=ok"
             );
             frame.set_err(SyscallError::WrongObject.code());
-            return Some(Ok(()));
+            return Ok(());
         }
     }
     let asid_raw = shared.task_asid_for_tid_split_read(tid);
@@ -4246,14 +4272,14 @@ fn try_split_ipcreply_direct_into_frame(
         // U9-IPC-RESIDUAL2 §2: with a typed answer, not by handing the trap to the broad path,
         // which would resolve the same capability and reach the same conclusion one lock later.
         Err(err) => {
-            return Some(nr7_refuse(
+            return nr7_refuse(
                 frame,
                 tid,
                 0,
                 0,
                 crate::kernel::syscall::SyscallError::from(err),
                 "reply_object_unresolved",
-            ));
+            );
         }
     };
     // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing. As on the
@@ -4266,14 +4292,14 @@ fn try_split_ipcreply_direct_into_frame(
     let mut payload_buf = [0u8; crate::kernel::ipc::Message::MAX_PAYLOAD];
     if asid_raw == 0 {
         let Some(regs) = crate::kernel::syscall::split_inline_payload_from_frame(frame, len) else {
-            return Some(nr7_refuse(
+            return nr7_refuse(
                 frame,
                 tid,
                 rec_idx,
                 rec_gen,
                 crate::kernel::syscall::SyscallError::InvalidArgs,
                 "inline_payload",
-            ));
+            );
         };
         payload_buf[..len].copy_from_slice(&regs[..len]);
     } else if len > 0 {
@@ -4288,20 +4314,20 @@ fn try_split_ipcreply_direct_into_frame(
                 len
             );
             REPLY_COUNTERS.note_failed(crate::kernel::syscall::SyscallError::PageFault);
-            return Some(Ok(()));
+            return Ok(());
         };
         payload_buf[..len].copy_from_slice(&bytes[..len]);
     }
     let payload = payload_buf;
     let Some(snapshot) = IpcReplyDirectSnapshot::build(replier, reply_cap, &payload[..len]) else {
-        return Some(nr7_refuse(
+        return nr7_refuse(
             frame,
             tid,
             rec_idx,
             rec_gen,
             crate::kernel::syscall::SyscallError::InvalidArgs,
             "snapshot_build",
-        ));
+        );
     };
     // 199D-TRC: probe the acknowledgement WITHOUT consuming it, so the ordinary
     // "caller has not blocked yet" decline still happens BEFORE any terminal claim and can
@@ -4360,14 +4386,14 @@ fn try_split_ipcreply_direct_into_frame(
             rec_idx,
             rec_gen
         );
-        return Some(nr7_refuse(
+        return nr7_refuse(
             frame,
             tid,
             rec_idx,
             rec_gen,
             crate::kernel::syscall::SyscallError::WrongObject,
             "mode_indeterminate",
-        ));
+        );
     };
     // ── DIRECT3-CAP-FINAL — the CAP-BEARING blocked lane ────────────────────────────────
     //
@@ -4386,50 +4412,50 @@ fn try_split_ipcreply_direct_into_frame(
         else {
             // `transfer_cap_arg(kernel, frame)?` in the broad handler: the argument says a
             // capability is present and it does not decode.
-            return Some(nr7_refuse(
+            return nr7_refuse(
                 frame,
                 tid,
                 rec_idx,
                 rec_gen,
                 crate::kernel::syscall::SyscallError::InvalidCapability,
                 "transfer_cap_arg",
-            ));
+            );
         };
         // The caller this reply settles, read from the record itself — never re-derived.
         let Some(caller) = shared.reply_record_caller_split_read(rec_idx, rec_gen) else {
-            return Some(nr7_refuse(
+            return nr7_refuse(
                 frame,
                 tid,
                 rec_idx,
                 rec_gen,
                 crate::kernel::syscall::SyscallError::WrongObject,
                 "record_caller_missing",
-            ));
+            );
         };
         // (1) The one-shot authority identities, snapshotted BEFORE any mutation so a recycled
         // record can never hand out another transaction's slots.
         let Some(authority) = shared.reply_authority_slots_split_read(rec_idx, rec_gen) else {
-            return Some(nr7_refuse(
+            return nr7_refuse(
                 frame,
                 tid,
                 rec_idx,
                 rec_gen,
                 crate::kernel::syscall::SyscallError::WrongObject,
                 "authority_slots_missing",
-            ));
+            );
         };
         // (2) Reserve the record for this exact replier: `Available → Reserved`. Refused
         // pre-mutation if the record is not this replier's to answer — the transaction's own
         // `ReservePreconditionFailed`, whose canonical answer is the stale-authority error.
         if !shared.reserve_existing_reply_record_split(rec_idx, rec_gen, replier) {
-            return Some(nr7_refuse(
+            return nr7_refuse(
                 frame,
                 tid,
                 rec_idx,
                 rec_gen,
                 crate::kernel::syscall::SyscallError::WrongObject,
                 "reserve_precondition_failed",
-            ));
+            );
         }
         // (3) THE EXCLUSIVE CLAIM, through the same single authority every other terminal
         // claimant uses. A loser mutates nothing and does NOT fall back to the broad
@@ -4443,14 +4469,14 @@ fn try_split_ipcreply_direct_into_frame(
                 // the same answer a lost claim gets, since either way this replier's authority
                 // is not the one that will settle the record.
                 let _ = shared.release_reply_record_split(rec_idx, rec_gen);
-                return Some(nr7_refuse(
+                return nr7_refuse(
                     frame,
                     tid,
                     rec_idx,
                     rec_gen,
                     crate::kernel::syscall::SyscallError::WrongObject,
                     "terminal_not_armed",
-                ));
+                );
             }
             crate::kernel::boot::DirectReplyTerminalClaim::Lost(class) => {
                 let _ = shared.release_reply_record_split(rec_idx, rec_gen);
@@ -4463,7 +4489,7 @@ fn try_split_ipcreply_direct_into_frame(
                     class
                 );
                 frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
-                return Some(Ok(()));
+                return Ok(());
             }
         };
         // (4) Stash the transfer envelope through the SAME owner the split IpcSend route uses.
@@ -4483,14 +4509,14 @@ fn try_split_ipcreply_direct_into_frame(
         let Ok(stashed) = stashed else {
             let _ = shared.release_direct_reply_terminal_split(rec_idx, &terminal_owner);
             let _ = shared.release_reply_record_split(rec_idx, rec_gen);
-            return Some(nr7_refuse(
+            return nr7_refuse(
                 frame,
                 tid,
                 rec_idx,
                 rec_gen,
                 crate::kernel::syscall::SyscallError::InvalidCapability,
                 "envelope_stash_failed",
-            ));
+            );
         };
         crate::yarm_log!(
             "IPC_REPLY_DIRECT_CAP_STASH tid={} transfer_cap={} handle={} endpoint={} endpoint_generation={} caller_tid={}",
@@ -4511,14 +4537,14 @@ fn try_split_ipcreply_direct_into_frame(
         ) else {
             let _ = shared.release_direct_reply_terminal_split(rec_idx, &terminal_owner);
             let _ = shared.release_reply_record_split(rec_idx, rec_gen);
-            return Some(nr7_refuse(
+            return nr7_refuse(
                 frame,
                 tid,
                 rec_idx,
                 rec_gen,
                 crate::kernel::syscall::SyscallError::InvalidArgs,
                 "message_framing_failed",
-            ));
+            );
         };
         // (6) The delivery, produced by the existing owner, carrying the reply lifecycle.
         let continuation = crate::kernel::dispatch_post_work::ReplyTerminalContinuation {
@@ -4552,11 +4578,18 @@ fn try_split_ipcreply_direct_into_frame(
                     &REPLY_COUNTERS,
                     crate::kernel::direct_disposition::DirectDisposition::Completed,
                 );
-                return crate::kernel::direct_disposition::apply_direct_disposition(
+                return match crate::kernel::direct_disposition::apply_direct_disposition(
                     frame,
                     crate::kernel::direct_disposition::DirectDisposition::Completed,
-                )
-                .map(|()| Ok(()));
+                ) {
+                    Some(()) => Ok(()),
+                    None => {
+                        debug_assert!(false, "a completed disposition always encodes");
+                        Err(TrapHandleError::Syscall(
+                            crate::kernel::syscall::SyscallError::Internal,
+                        ))
+                    }
+                };
             }
             // Declined or failed having consumed nothing irreversible: hand the reply back
             // re-sendable. The envelope is dropped with it, and the replier still holds the
@@ -4576,14 +4609,7 @@ fn try_split_ipcreply_direct_into_frame(
                     Err(e) => *e,
                     Ok(_) => crate::kernel::syscall::SyscallError::WouldBlock,
                 };
-                return Some(nr7_refuse(
-                    frame,
-                    tid,
-                    rec_idx,
-                    rec_gen,
-                    err,
-                    "cap_delivery_declined",
-                ));
+                return nr7_refuse(frame, tid, rec_idx, rec_gen, err, "cap_delivery_declined");
             }
         }
     } else if mode == crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked {
@@ -4599,25 +4625,25 @@ fn try_split_ipcreply_direct_into_frame(
         let stashed_cap = if facts.transfer_cap_present {
             let Some(transfer_cap) = crate::kernel::syscall::ipc_abi::transfer_cap_arg_value(frame)
             else {
-                return Some(nr7_refuse(
+                return nr7_refuse(
                     frame,
                     tid,
                     rec_idx,
                     rec_gen,
                     crate::kernel::syscall::SyscallError::InvalidCapability,
                     "transfer_cap_arg",
-                ));
+                );
             };
             // The caller this reply settles, read from the record itself — never re-derived.
             let Some(caller) = shared.reply_record_caller_split_read(rec_idx, rec_gen) else {
-                return Some(nr7_refuse(
+                return nr7_refuse(
                     frame,
                     tid,
                     rec_idx,
                     rec_gen,
                     crate::kernel::syscall::SyscallError::WrongObject,
                     "record_caller_missing",
-                ));
+                );
             };
             let reply_endpoint_object = crate::kernel::capabilities::CapObject::Endpoint {
                 index: reply_eidx,
@@ -4630,14 +4656,14 @@ fn try_split_ipcreply_direct_into_frame(
                 Some(caller.tid),
                 None,
             ) else {
-                return Some(nr7_refuse(
+                return nr7_refuse(
                     frame,
                     tid,
                     rec_idx,
                     rec_gen,
                     crate::kernel::syscall::SyscallError::InvalidCapability,
                     "envelope_stash_failed",
-                ));
+                );
             };
             Some((stashed.handle, caller.tid))
         } else {
@@ -4661,14 +4687,14 @@ fn try_split_ipcreply_direct_into_frame(
         };
         let Some(msg) = framed else {
             unwind_envelope(shared);
-            return Some(nr7_refuse(
+            return nr7_refuse(
                 frame,
                 tid,
                 rec_idx,
                 rec_gen,
                 crate::kernel::syscall::SyscallError::InvalidArgs,
                 "message_framing_failed",
-            ));
+            );
         };
         let authority = shared.reply_authority_slots_split_read(rec_idx, rec_gen);
         return match shared
@@ -4717,11 +4743,18 @@ fn try_split_ipcreply_direct_into_frame(
                     &REPLY_COUNTERS,
                     crate::kernel::direct_disposition::DirectDisposition::Completed,
                 );
-                crate::kernel::direct_disposition::apply_direct_disposition(
+                match crate::kernel::direct_disposition::apply_direct_disposition(
                     frame,
                     crate::kernel::direct_disposition::DirectDisposition::Completed,
-                )
-                .map(|()| Ok(()))
+                ) {
+                    Some(()) => Ok(()),
+                    None => {
+                        debug_assert!(false, "a completed disposition always encodes");
+                        Err(TrapHandleError::Syscall(
+                            crate::kernel::syscall::SyscallError::Internal,
+                        ))
+                    }
+                }
             }
             Err(err) => {
                 // Nothing was mutated: the record is still `Available` and the reply is exactly
@@ -4734,14 +4767,14 @@ fn try_split_ipcreply_direct_into_frame(
                 // it could not reproduce this state; it would simply take the same reply through
                 // a different implementation, which is the fall-through this package removes.
                 unwind_envelope(shared);
-                Some(nr7_refuse(
+                nr7_refuse(
                     frame,
                     tid,
                     rec_idx,
                     rec_gen,
                     crate::kernel::syscall::SyscallError::from(err),
                     "queued_commit_refused",
-                ))
+                )
             }
         };
     }
@@ -4775,7 +4808,7 @@ fn try_split_ipcreply_direct_into_frame(
             // has been settled by another claimant, so the canonical answer is the same one a
             // duplicate reply gets. Zero copies, zero wakes, zero mutation.
             frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
-            return Some(Ok(()));
+            return Ok(());
         }
     };
     // Consume the acknowledgement published for EXACTLY this reply-endpoint incarnation,
@@ -4800,20 +4833,20 @@ fn try_split_ipcreply_direct_into_frame(
                 ),
             );
             frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code());
-            return Some(Ok(()));
+            return Ok(());
         }
         // U9-IPC-RESIDUAL2 §2 — the claim was restored, so the record is exactly as it was
         // found and this replier's authority is unspent. It is still answered here: the
         // acknowledgement it needs is gone, and the broad path would resolve the same record
         // and reach the same refusal.
-        return Some(nr7_refuse(
+        return nr7_refuse(
             frame,
             tid,
             rec_idx,
             rec_gen,
             crate::kernel::syscall::SyscallError::WrongObject,
             "ack_vanished_after_claim",
-        ));
+        );
     };
     let work = crate::kernel::ipccall_direct_txn::DirectReplyPostWork {
         snapshot,
@@ -4921,14 +4954,7 @@ fn try_split_ipcreply_direct_into_frame(
                 crate::kernel::syscall::SyscallError::Internal
             }
         };
-        return Some(nr7_refuse(
-            frame,
-            tid,
-            rec_idx,
-            rec_gen,
-            err,
-            "transaction_declined",
-        ));
+        return nr7_refuse(frame, tid, rec_idx, rec_gen, err, "transaction_declined");
     }
     crate::kernel::direct_ipc_counters::note_disposition(&REPLY_COUNTERS, disposition);
     // Same shared encoder as the NR6 twin: legacy `handle_ipc_reply` ends with the identical
@@ -4938,7 +4964,18 @@ fn try_split_ipcreply_direct_into_frame(
     //
     // U9-IPC-RESIDUAL2 §2: the decline arm above is taken first, so the encoder is reached only
     // with `Completed` or `Failed`, both of which it answers `Some(())`.
-    crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition).map(|()| Ok(()))
+    match crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition) {
+        Some(()) => Ok(()),
+        None => {
+            // Unreachable: the decline arm above returned already, and the encoder answers
+            // `Some` for `Completed` and `Failed` alike. Named rather than unwrapped, so the
+            // impossible case can never become a silent fall-through.
+            debug_assert!(false, "the encoder was reached with a decline");
+            Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            ))
+        }
+    }
 }
 
 /// U9-IPC-RESIDUAL2 §2 — resolve a NR 7 PREFLIGHT refusal in the broad handler's own order.
@@ -5095,16 +5132,11 @@ fn nr7_refuse(
     Ok(())
 }
 
-#[cfg(feature = "hosted-dev")]
-fn try_split_ipcreply_direct_into_frame(
-    _shared: &SharedKernel,
-    _cpu: CpuId,
-    _frame: &mut TrapFrame,
-) -> Option<Result<(), TrapHandleError>> {
-    // Hosted: the off-lock user-read seam uses the direct map (real targets only). The
-    // drain + transaction are exercised directly by the stage199a2b3 hosted tests.
-    None
-}
+// Hosted: NR 7 has no split route at all. The off-lock user-read seam uses the direct map,
+// which exists only on real targets, so the dispatcher arm above is `cfg`-ed out rather than
+// stubbed — a stub would have to answer SOMETHING, and every answer is wrong for a profile that
+// never routes. The drain and the transaction are exercised directly by the stage199a2b3 hosted
+// tests, which call them without going through the dispatcher.
 
 // ── Stage 191D FUTEXWAIT BLOCK-PUBLISH SEAM markers + deferral ─────────────────────────
 //

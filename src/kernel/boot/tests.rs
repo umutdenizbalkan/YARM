@@ -86555,7 +86555,10 @@ mod stage199d_delivery_projection_differential {
                     "fn nr7_refuse_preflight(",
                     "and NR7's preflight resolver, which applies the BROAD validation order",
                 ),
-                ("fn nr6_refuse_preflight(", "NR6's preflight resolver, likewise"),
+                (
+                    "fn nr6_refuse_preflight(",
+                    "NR6's preflight resolver, likewise",
+                ),
             ] {
                 assert!(split.contains(helper), "{what}");
             }
@@ -108998,12 +109001,15 @@ mod stage199d_transfer_cap_safety {
         // that answers every other ineligibility in the broad handler's own validation order.
         let arm = &flat[decline_at..];
         let arm_end = arm
-            .find("return Some(nr7_refuse_preflight(")
+            .find("return nr7_refuse_preflight(")
             .expect("the decline arm ends in the refusal resolver, not a fall-through");
-        let arm = &arm[..arm_end + "return Some(nr7_refuse_preflight(".len()];
+        let arm = &arm[..arm_end + "return nr7_refuse_preflight(".len()];
+        // U9-IPC-RESIDUAL2 §2: the route answers `Result`, not `Option`, so the refusal's
+        // return is `Ok(())` where it used to be `Some(Ok(()))`. The property is unchanged —
+        // the typed error is framed and the trap is finished here.
         assert!(
-            arm.contains("frame.set_err( crate::kernel::syscall::SyscallError::WrongObject.code(), ); return Some(Ok(()));")
-                || arm.contains("frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code()); return Some(Ok(()));"),
+            arm.contains("frame.set_err( crate::kernel::syscall::SyscallError::WrongObject.code(), ); return Ok(());")
+                || arm.contains("frame.set_err(crate::kernel::syscall::SyscallError::WrongObject.code()); return Ok(());"),
             "the spent-authority refusal returns the typed error rather than falling through"
         );
         assert!(
@@ -153144,7 +153150,7 @@ mod direct3_cap_final_prelock_refusal {
         // record-exact refusal is decided on the record, comes first, and every other shape is
         // resolved by a named owner rather than handed to the broad dispatcher.
         let arm = &arm[..arm
-            .find("return Some(nr7_refuse_preflight(")
+            .find("return nr7_refuse_preflight(")
             .expect("the arm ends in the refusal resolver, not a fall-through")];
         assert!(
             arm.contains("if let Ok((rec_idx, rec_gen)) = reply_object"),
@@ -173302,13 +173308,20 @@ mod u9_ipc_residual1_closure {
         for reason in [
             "unrouted(\"admission_disabled\")",
             "unrouted(\"cpu_out_of_range\")",
-            "unrouted(\"residual\")",
         ] {
             assert!(
                 c.contains(reason),
                 "the `{reason}` exit must go through the counting closure"
             );
         }
+        // U9-IPC-RESIDUAL2 §2: the third exit — the body answering `None` — is gone at the TYPE
+        // level, so there is no `unrouted("residual")` to count. Asserting its absence is what
+        // stops it being reintroduced as a quiet fourth door.
+        assert!(
+            !c.contains("unrouted(\"residual\")"),
+            "the residual door was removed by making the body's return type non-optional; a \
+             call site here would mean it has come back"
+        );
         {
             let at = c
                 .find("try_split_ipcreply_direct_into_frame(shared, cpu, frame)")
@@ -173432,5 +173445,882 @@ mod u9_ipc_residual1_closure {
                 "{owner} is driven from a split seam too"
             );
         }
+    }
+}
+
+/// U9-IPC-RESIDUAL2 §4 — **the closure proof, over COMPLETE function boundaries.**
+///
+/// U9-IPC-RESIDUAL1's closure module asserted that the terminal entry was *measured* and that
+/// the ingress paths existed. Neither statement is a closure proof, and the module was named as
+/// if it were one: at `872c4b9` the NR 6 route still answered `None` from eleven places and the
+/// NR 7 route from nineteen, and every one of those handed a recognized syscall to a terminal
+/// broad acquisition. A live boot with `broad_entries=0` did not contradict that — it only said
+/// no trap took those doors on that boot.
+///
+/// These guards answer the question a boot cannot. They read the WHOLE of every function the
+/// family routes through, follow the disposition chain transitively, and fail if any of them can
+/// return a fall-through. **They fail against the delivered `872c4b9` code**, which is the
+/// property §4 asks for and the reason the previous module's checks were not enough.
+#[cfg(test)]
+mod u9_ipc_residual2_closure {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const DISPOSITION_SRC: &str = include_str!("../direct_disposition.rs");
+    const ELIGIBILITY_SRC: &str = include_str!("../direct_eligibility.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const BOOT_SRC: &str = include_str!("mod.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPAWN_IMAGE_SRC: &str = include_str!("../syscall/spawn_image_txn.rs");
+
+    /// Strip comments: these guards are about the ROUTE, and a doc comment naming a shape is
+    /// not the shape being present.
+    fn code(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The COMPLETE body of a function: from its signature to the closing brace at its own
+    /// indentation, not to the next `fn` or the next `#[cfg]`.
+    ///
+    /// Slicing to the next attribute — which is what the earlier modules did — silently stops
+    /// early whenever a nested item carries one, so a `return None` past that point was invisible
+    /// to the guard. Brace matching cannot be fooled that way.
+    fn complete_body(src: &str, signature: &str) -> alloc::string::String {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` must exist"));
+        let rest = &src[start..];
+        let open = rest.find('{').expect("a body");
+        let bytes = rest.as_bytes();
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(depth == 0, "`{signature}` body must be brace-balanced");
+        rest[..end].into()
+    }
+
+    /// Every function a recognized NR 6 or NR 7 can be servicing when it decides what to answer.
+    ///
+    /// The list is the transitive closure of the two routes' own call graph within the split
+    /// file, and it is asserted to be complete below rather than trusted.
+    const FAMILY_FUNCTIONS: &[&str] = &[
+        "fn try_split_ipccall_into_frame(",
+        "fn nr6_refuse_preflight(",
+        "fn try_split_ipccall_direct_into_frame(",
+        "fn try_split_ipccall_queued_into_frame(",
+        "fn nr6_deliver_to_blocked_waiter(",
+        "fn nr6_park_sender(",
+        "fn try_split_ipcreply_direct_into_frame(",
+        "fn nr7_refuse_preflight(",
+        "fn nr7_refuse(",
+    ];
+
+    /// **THE closure guard.** No function in the family can express a fall-through.
+    ///
+    /// This is the check that fails on the delivered code, and it is a statement about TYPES
+    /// rather than about text. At `872c4b9` both routes returned `Option<..>`, so "the broad
+    /// dispatcher should service this trap" was a value they could produce — and each produced
+    /// it from eleven and nineteen places respectively. They now return
+    /// `SplitDispatchDisposition` and `Result<(), TrapHandleError>`: the fall-through is not
+    /// something the compiler will let them say.
+    ///
+    /// The one disposition that still means it, `NotHandled`, exists only on the NR 6 entry
+    /// point, where "this trap is not a NR 6 at all" has to be expressible. It is asserted below
+    /// to appear nowhere else in the family.
+    #[test]
+    fn no_family_function_can_fall_through() {
+        let src = code(SPLIT_SRC);
+        for signature in FAMILY_FUNCTIONS {
+            let body = complete_body(&src, signature);
+            assert!(
+                !body.contains("return None"),
+                "`{signature}` still returns a fall-through"
+            );
+            if *signature == "fn try_split_ipccall_into_frame(" {
+                continue;
+            }
+            assert!(
+                !body.contains("NotHandled"),
+                "`{signature}` can still answer `NotHandled`, which hands a recognized NR6/NR7 \
+                 to a terminal broad acquisition. Only the entry point may say it, and only for \
+                 a trap that is not a NR 6."
+            );
+        }
+        // The return types are the proof. A family body that answered `Option` could always
+        // reintroduce the door without any of the assertions above noticing.
+        for (signature, ret) in [
+            (
+                "fn try_split_ipccall_direct_into_frame(",
+                ") -> SplitDispatchDisposition {",
+            ),
+            (
+                "fn try_split_ipccall_queued_into_frame(",
+                ") -> SplitDispatchDisposition {",
+            ),
+            (
+                "fn nr6_deliver_to_blocked_waiter(",
+                ") -> SplitDispatchDisposition {",
+            ),
+            ("fn nr6_park_sender(", ") -> SplitDispatchDisposition {"),
+            (
+                "fn try_split_ipcreply_direct_into_frame(",
+                ") -> Result<(), TrapHandleError> {",
+            ),
+            ("fn nr7_refuse(", ") -> Result<(), TrapHandleError> {"),
+            (
+                "fn nr7_refuse_preflight(",
+                ") -> Result<(), TrapHandleError> {",
+            ),
+            (
+                "fn nr6_refuse_preflight(",
+                ") -> SplitDispatchDisposition {",
+            ),
+        ] {
+            let body = complete_body(&src, signature);
+            assert!(
+                body.contains(ret),
+                "`{signature}` must return `{ret}` — a non-optional type is what makes the \
+                 fall-through inexpressible rather than merely absent"
+            );
+        }
+        // And the NR 7 dispatcher arm consumes that `Result` directly, so the route's answer is
+        // always the trap's answer.
+        assert!(
+            src.contains("return Some(try_split_ipcreply_direct_into_frame(shared, cpu, frame));"),
+            "NR7's answer is wrapped once at the dispatcher, never tested for a fall-through"
+        );
+    }
+
+    /// The list above is the WHOLE family: every function the two entry points call within the
+    /// split file that takes a `TrapFrame` is on it.
+    ///
+    /// Without this, the guard above could be satisfied by moving a `return None` into a helper
+    /// nobody listed.
+    #[test]
+    fn the_family_function_list_is_transitively_complete() {
+        let src = code(SPLIT_SRC);
+        let mut reachable: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut frontier: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+            "fn try_split_ipccall_into_frame(".into(),
+            "fn try_split_ipcreply_direct_into_frame(".into(),
+        ];
+        // Every `fn <name>(` defined in the file, so a call can be recognized as an internal one.
+        let defined: alloc::vec::Vec<alloc::string::String> = src
+            .match_indices("fn ")
+            .filter_map(|(i, _)| {
+                let rest = &src[i + 3..];
+                let end = rest.find('(')?;
+                let name = &rest[..end];
+                (!name.contains(char::is_whitespace) && !name.is_empty())
+                    .then(|| alloc::format!("fn {name}("))
+            })
+            .collect();
+        while let Some(sig) = frontier.pop() {
+            if reachable.contains(&sig) {
+                continue;
+            }
+            reachable.push(sig.clone());
+            let body = complete_body(&src, &sig);
+            for candidate in &defined {
+                let call = &candidate[3..]; // "name("
+                if body.contains(call) && !reachable.contains(candidate) {
+                    frontier.push(candidate.clone());
+                }
+            }
+        }
+        for sig in &reachable {
+            // Only the frame-carrying route functions are the family; the file's other helpers
+            // (page fault, timer, yield, send, recv) are reached because they share names with
+            // nothing, and are excluded by requiring the NR6/NR7 naming.
+            let is_family = sig.contains("ipccall")
+                || sig.contains("ipcreply")
+                || sig.starts_with("fn nr6_")
+                || sig.starts_with("fn nr7_");
+            if is_family {
+                assert!(
+                    FAMILY_FUNCTIONS.contains(&sig.as_str()),
+                    "`{sig}` is reachable from the NR6/NR7 entry points but is not in \
+                     FAMILY_FUNCTIONS, so the closure guard never reads it"
+                );
+            }
+        }
+        for sig in FAMILY_FUNCTIONS {
+            assert!(
+                reachable.iter().any(|r| r == sig),
+                "`{sig}` is listed but is not reachable — the list has gone stale"
+            );
+        }
+    }
+
+    /// **The transitive disposition chain.** `apply_direct_disposition` answers `None` for
+    /// `DeclinedBeforeMutation`, so every call site must be unreachable with that disposition.
+    ///
+    /// This is the indirect fall-through the earlier module missed entirely: the route contained
+    /// no `return None` at those points, it contained `.map(|()| Ok(()))` over an `Option` that
+    /// could be `None`.
+    #[test]
+    fn the_disposition_encoder_is_never_reached_with_a_decline() {
+        let disposition = code(DISPOSITION_SRC);
+        assert!(
+            disposition.contains("DirectDisposition::DeclinedBeforeMutation => None,"),
+            "the encoder still answers `None` for a decline — so the guard below is what stops \
+             that `None` becoming a fall-through"
+        );
+        let src = code(SPLIT_SRC);
+        // Both routes must short-circuit the decline BEFORE they reach the encoder.
+        for (signature, what) in [
+            (
+                "fn try_split_ipccall_direct_into_frame(",
+                "NR6 routes a pristine transaction outcome to the buffered lane",
+            ),
+            (
+                "fn try_split_ipcreply_direct_into_frame(",
+                "NR7 maps a pristine transaction outcome to its canonical error",
+            ),
+        ] {
+            let body = complete_body(&src, signature);
+            let guard = body
+                .find("DirectDisposition::DeclinedBeforeMutation")
+                .unwrap_or_else(|| panic!("{what}: the decline must be handled explicitly"));
+            let encoder = body
+                .find("apply_direct_disposition(frame, disposition)")
+                .unwrap_or_else(|| panic!("{signature}: the shared encoder call"));
+            assert!(
+                guard < encoder,
+                "{what}, and that handling must PRECEDE the encoder — otherwise the encoder's \
+                 `None` is reached and the trap falls through"
+            );
+        }
+    }
+
+    /// The two impossible preflight classes are refused with a typed error, never handed over —
+    /// the precedent NR 1 set for exactly these two classes.
+    #[test]
+    fn the_impossible_classes_fail_closed_rather_than_falling_back() {
+        let src = code(SPLIT_SRC);
+        let nr6 = complete_body(&src, "fn nr6_refuse_preflight(");
+        assert!(
+            nr6.contains("V::SynchronousMode =>") && nr6.contains("reason=synchronous_endpoint"),
+            "NR6 must name the Synchronous class and fail closed on it"
+        );
+        assert!(
+            nr6.contains("V::EndpointNotAdmitted =>")
+                && nr6.contains("reason=endpoint_not_admitted"),
+            "and the unadmitted class likewise"
+        );
+        let nr7 = complete_body(&src, "fn nr7_refuse_preflight(");
+        assert!(
+            nr7.contains("V::EndpointNotAdmitted =>"),
+            "NR7's unadmitted class too"
+        );
+        // Neither resolver may contain a wildcard arm: a new verdict must break the build rather
+        // than silently inherit an answer.
+        for (name, body) in [("nr6", &nr6), ("nr7", &nr7)] {
+            for line in body.lines() {
+                let t = line.trim();
+                assert!(
+                    !(t.starts_with("_ =>") || t.starts_with("_ if")),
+                    "{name}'s refusal resolver has a wildcard arm: {line}"
+                );
+            }
+        }
+    }
+
+    /// **`Synchronous` is unreachable in production, from source.** "Not observed in the boot"
+    /// is not an unreachability proof; this is one.
+    ///
+    /// Every production endpoint constructor names `Buffered`, and there is no syscall by which
+    /// userspace could create an endpoint at all — so no capability userspace can hold names a
+    /// `Synchronous` endpoint, on any supported configuration.
+    #[test]
+    fn no_production_endpoint_is_synchronous() {
+        for (name, src) in [
+            ("x86_64 boot", X86_BOOT_SRC),
+            ("aarch64 boot", AARCH64_BOOT_SRC),
+            ("riscv64 boot", RISCV_BOOT_SRC),
+            ("spawn_image_txn", SPAWN_IMAGE_SRC),
+            ("ipc.rs", IPC_SRC),
+        ] {
+            let c = code(src);
+            assert!(
+                !c.contains("EndpointMode::Synchronous"),
+                "{name} must not construct a Synchronous endpoint: it is the one mode the split \
+                 route does not implement, and its production absence is what makes the \
+                 fail-closed arm unreachable rather than merely unused"
+            );
+        }
+        // And no syscall creates an endpoint, so userspace cannot obtain one of either mode.
+        let syscall = code(include_str!("../syscall.rs"));
+        assert!(
+            !syscall.contains("CreateEndpoint"),
+            "there must be no endpoint-creation syscall — endpoints are minted by boot and by \
+             spawn, both of which are pinned above"
+        );
+    }
+
+    /// **The direct route's production admission is statically total on every supported port.**
+    ///
+    /// `EndpointNotAdmitted` is the other fail-closed arm, and this is why it is unreachable: the
+    /// predicate's first term is a `const fn` naming all three architectures, and `||`
+    /// short-circuits, so the confining branch is dead code wherever the kernel actually runs.
+    #[test]
+    fn direct_production_admission_is_statically_total() {
+        let boot = code(BOOT_SRC);
+        let body = complete_body(&boot, "pub const fn ipccall_direct_production_enabled()");
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                body.contains(arch),
+                "the production term must name {arch}, or NR6/NR7 admission is confined there"
+            );
+        }
+        assert!(
+            body.contains("cfg!(target_arch"),
+            "and it must be decided by `cfg!`, at compile time, not by a runtime knob"
+        );
+        for predicate in [
+            "pub fn ipccall_direct_admission_enabled()",
+            "pub fn ipccall_direct_request_endpoint_admitted(",
+            "pub fn ipccall_direct_reply_endpoint_admitted(",
+        ] {
+            let b = complete_body(&boot, predicate);
+            let first = b
+                .find("ipccall_direct_production_enabled()")
+                .unwrap_or_else(|| panic!("`{predicate}` must consult the production term"));
+            let or = b.find("||").unwrap_or(usize::MAX);
+            assert!(
+                first < or,
+                "`{predicate}` must SHORT-CIRCUIT on the production term, or an oracle knob \
+                 could still confine an ordinary production endpoint"
+            );
+        }
+    }
+
+    /// The publication point validates the endpoint incarnation in the SAME acquisition that
+    /// checks waiter state and enqueues. Earlier validation is not validation.
+    #[test]
+    fn the_publication_validates_the_incarnation_inside_its_own_acquisition() {
+        let ipc_state = code(include_str!("ipc_state.rs"));
+        let body = complete_body(
+            &ipc_state,
+            "pub(crate) fn enqueue_request_if_no_waiter_locked(",
+        );
+        assert!(
+            body.contains("expected_generation: u64"),
+            "the locked body must TAKE the expected incarnation — carrying it only as far as a \
+             log line is not a validation"
+        );
+        let gen_check = body
+            .find("ipc.endpoint_generations.get(endpoint_idx).copied()")
+            .expect("the incarnation comparison");
+        let admission = body
+            .find("Self::endpoint_send_admission_locked(ipc, endpoint_idx)")
+            .expect("the admission question");
+        let enqueue = body
+            .find("Self::ipc_endpoint_enqueue_authoritative_locked(")
+            .expect("the enqueue");
+        assert!(
+            gen_check < admission && admission < enqueue,
+            "incarnation -> admission -> enqueue, all three in this one body, so no window \
+             exists between the check and the mutation"
+        );
+        assert!(
+            body.contains("QueuedRequestOutcome::EndpointIncarnationChanged"),
+            "and a changed incarnation is named as itself, never conflated with a missing slot"
+        );
+        // The split seam passes it through rather than inventing one.
+        let runtime = code(include_str!("../../runtime.rs"));
+        let seam = complete_body(
+            &runtime,
+            "pub(crate) fn enqueue_request_if_no_waiter_split(",
+        );
+        assert!(
+            seam.contains("expected_generation,"),
+            "the split seam forwards the caller's expected incarnation"
+        );
+        // And the one production caller passes the incarnation it prepared against.
+        let split = code(SPLIT_SRC);
+        assert!(
+            split.contains("enqueue_request_if_no_waiter_split(send_eidx, send_egen, msg)"),
+            "NR6's buffered lane publishes against the incarnation it resolved the capability on"
+        );
+    }
+
+    /// A refused blocking-send commit settles all three of the buffered lane's resources.
+    #[test]
+    fn a_refused_park_settles_the_envelope_the_mint_and_the_record() {
+        let runtime = code(include_str!("../../runtime.rs"));
+        let body = complete_body(&runtime, "fn execute_blocking_send_commit(");
+        let refusal = body.find("refusal =>").expect("the refusal arm");
+        let arm = &body[refusal..];
+        for (owner, what) in [
+            (
+                "settle_blocked_send_envelope_split(",
+                "the transfer envelope",
+            ),
+            ("rollback_minted_cap_split(", "the minted reply capability"),
+            (
+                "free_reserved_reply_record_split(",
+                "the reserved reply record",
+            ),
+        ] {
+            assert!(
+                arm.contains(owner),
+                "a refused commit must give back {what} through `{owner}` — settling only the \
+                 envelope leaves the caller holding a Reply cap for a request never sent, and \
+                 one of MAX_REPLY_CAPS permanently consumed"
+            );
+        }
+        let revoke = arm.find("rollback_minted_cap_split(").expect("the revoke");
+        let free = arm
+            .find("free_reserved_reply_record_split(")
+            .expect("the free");
+        assert!(
+            revoke < free,
+            "revoke the capability BEFORE freeing the record it names, or a live cap is left \
+             pointing at a slot that may already have been reissued"
+        );
+        // And the producer that owes it supplies it.
+        let split = code(SPLIT_SRC);
+        let park = complete_body(&split, "fn nr6_park_sender(");
+        assert!(
+            park.contains("reply_authority: Some("),
+            "NR6's park arm must hand its reply authority to the drain"
+        );
+    }
+
+    /// The refusal resolvers apply the BROAD handler's validation order, not the classifier's.
+    #[test]
+    fn the_refusal_resolvers_preserve_validation_precedence() {
+        let split = code(SPLIT_SRC);
+        let nr6 = complete_body(&split, "fn nr6_refuse_preflight(");
+        let send_cap = nr6
+            .find("V::SendCapUnresolved(err)")
+            .expect("send cap first");
+        let reply_cap = nr6
+            .find("validate_endpoint_right_split_read(requester, reply_recv_cap")
+            .expect("then the reply capability");
+        let incarnation = nr6
+            .find("V::EndpointIncarnationGone =>")
+            .expect("then the endpoint incarnation");
+        let length = nr6.find("V::PayloadTooLong =>").expect("then the length");
+        assert!(
+            send_cap < reply_cap && reply_cap < incarnation && incarnation < length,
+            "handle_ipc_call validates send cap, then reply cap, then resolves the endpoint \
+             index, then checks the length — a call wrong in several ways must be told about \
+             the FIRST thing that is wrong"
+        );
+        let nr7 = complete_body(&split, "fn nr7_refuse_preflight(");
+        let requester = nr7
+            .find("V::RequesterUnavailable)")
+            .expect("the requester first");
+        let transfer = nr7
+            .find("transfer_cap_arg_present(frame)")
+            .expect("then the transferred capability");
+        let len = nr7.find("V::PayloadTooLong)").expect("then the length");
+        let record = nr7
+            .find("V::ReplyCapUnresolved(err) =>")
+            .expect("the record last");
+        assert!(
+            requester < transfer && transfer < len && len < record,
+            "handle_ipc_reply validates the requester, the transferred capability and the \
+             length before it ever resolves the one-shot"
+        );
+    }
+
+    /// The source copy distinguishes its three causes, and a fault takes the ESTABLISHED
+    /// user-fault path rather than being reported as a malformed argument.
+    #[test]
+    fn a_source_copy_fault_is_recorded_not_reported_as_invalid_args() {
+        let split = code(SPLIT_SRC);
+        for signature in [
+            "fn try_split_ipccall_direct_into_frame(",
+            "fn try_split_ipcreply_direct_into_frame(",
+        ] {
+            let body = complete_body(&split, signature);
+            assert!(
+                body.contains("if asid_raw == 0 {"),
+                "{signature} must take the kernel-task payload source for a kernel-ASID caller, \
+                 as `current_task_has_user_asid` makes the broad handler do"
+            );
+            assert!(
+                body.contains("split_inline_payload_from_frame(frame, len)"),
+                "{signature} must reach it through the owner, not a second register unpack"
+            );
+            assert!(
+                body.contains("} else if len > 0 {"),
+                "{signature} must not treat an EMPTY payload as a fault: it is legal, and the \
+                 broad path sends it"
+            );
+            assert!(
+                body.contains("record_split_source_read_fault(cpu, frame, user_ptr)"),
+                "{signature} must record the fault through the established owner"
+            );
+        }
+        // The owner reports a READ, which is what BOTH broad handlers pass — asserted on each
+        // handler's own body rather than by counting occurrences across the file, so a third
+        // caller elsewhere cannot make or break this.
+        let ipc = code(IPC_SRC);
+        for handler in [
+            "pub(super) fn handle_ipc_call(",
+            "pub(super) fn handle_ipc_reply(",
+        ] {
+            let body = complete_body(&ipc, handler);
+            assert!(
+                body.contains("FaultAccess::Read"),
+                "`{handler}` records a READ fault for a faulting source copy — the split route \
+                 must not invent a different direction"
+            );
+            assert!(
+                !body.contains(
+                    "KernelError::UserMemoryFault) => { return Err(SyscallError::InvalidArgs)"
+                ),
+                "`{handler}` must not report a source fault as a malformed argument"
+            );
+        }
+    }
+
+    /// `TransferCapUnsupported` still has no production producer, and the eligibility classifier
+    /// still has no wildcard.
+    #[test]
+    fn the_eligibility_classifiers_stay_exhaustive() {
+        let src = code(ELIGIBILITY_SRC);
+        for classifier in [
+            "pub(crate) fn classify_direct_request_eligibility(",
+            "pub(crate) fn classify_direct_reply_eligibility(",
+        ] {
+            let body = complete_body(&src, classifier);
+            for line in body.lines() {
+                let t = line.trim();
+                assert!(
+                    !t.starts_with("_ =>"),
+                    "`{classifier}` must stay exhaustive: {line}"
+                );
+            }
+        }
+        assert!(
+            !code(SPLIT_SRC).contains("DirectReplyEligibility::TransferCapUnsupported =>")
+                || code(SPLIT_SRC).contains("V::TransferCapUnsupported =>"),
+            "the retained variant may only appear in the refusal resolver's exhaustive match"
+        );
+    }
+}
+
+/// U9-IPC-RESIDUAL2 §4 — behavioural cases for the residuals, driven through production owners.
+#[cfg(test)]
+mod u9_ipc_residual2_cases {
+    use super::*;
+    use crate::kernel::boot::QueuedRequestOutcome;
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    use crate::kernel::ipc::{Message, ThreadId};
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    fn shared_with_task() -> SharedKernel {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        shared.with(|state| {
+            state.register_task(1).expect("task1");
+            state.enqueue_current_cpu(1).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+        shared
+    }
+
+    fn make_endpoint(shared: &SharedKernel) -> (usize, CapObject, CapId) {
+        let (idx, send_root, _recv_root) = shared.with(|s| s.create_endpoint(8).expect("endpoint"));
+        let object = shared
+            .with(|s| s.current_task_capability(send_root).map(|c| c.object))
+            .expect("endpoint object");
+        (idx, object, send_root)
+    }
+
+    fn generation(shared: &SharedKernel, idx: usize) -> u64 {
+        shared
+            .with(|s| s.with_ipc_state(|ipc| ipc.endpoint_generations.get(idx).copied()))
+            .expect("a live endpoint has a generation")
+    }
+
+    /// **Endpoint recycling before the enqueue.** The §3 defect, driven end to end.
+    ///
+    /// A request prepared against incarnation N must not be published into incarnation N+1, and
+    /// the refusal must name the incarnation change rather than reporting a missing slot.
+    #[test]
+    fn a_recycled_endpoint_cannot_receive_a_request_prepared_for_its_predecessor() {
+        let shared = shared_with_task();
+        let (eidx, _object, _cap) = make_endpoint(&shared);
+        let prepared_generation = generation(&shared, eidx);
+        let msg = Message::new(1, b"req").expect("message");
+
+        // Destroy and re-create so the SAME slot carries a new incarnation. This is the state
+        // that made the old signature unsafe: the slot is occupied, so a presence check passes
+        // and the admission question answers about the new endpoint.
+        shared.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                ipc.endpoints[eidx] = None;
+                ipc.endpoint_generations[eidx] = ipc.endpoint_generations[eidx].wrapping_add(1);
+            });
+        });
+        let (reused, _o, _c) = make_endpoint(&shared);
+        assert_eq!(reused, eidx, "the allocator must reuse the freed slot");
+        let live_generation = generation(&shared, eidx);
+        assert_ne!(
+            live_generation, prepared_generation,
+            "and the reissued endpoint must carry a different incarnation"
+        );
+
+        assert_eq!(
+            shared.enqueue_request_if_no_waiter_split(eidx, prepared_generation, msg),
+            QueuedRequestOutcome::EndpointIncarnationChanged {
+                expected: prepared_generation,
+                observed: Some(live_generation),
+            },
+            "the publication must refuse a request prepared against a dead incarnation, and \
+             name the change rather than reporting the slot as missing"
+        );
+        assert!(
+            matches!(
+                shared.peek_queued_with_cap_transfer_split(eidx),
+                crate::kernel::boot::IpcEndpointPeekResult::Ineligible(_)
+            ),
+            "and nothing may be enqueued into the stranger's queue"
+        );
+        // The same request against the LIVE incarnation publishes, so the guard is exact rather
+        // than a blanket refusal.
+        assert_eq!(
+            shared.enqueue_request_if_no_waiter_split(eidx, live_generation, msg),
+            QueuedRequestOutcome::Enqueued
+        );
+    }
+
+    /// **A full queue is the blocking origin.** The publication must report it as such — never
+    /// as a success, never as a missing endpoint, and never as an incarnation change.
+    #[test]
+    fn a_full_endpoint_reports_the_blocking_origin_and_enqueues_nothing() {
+        let shared = shared_with_task();
+        let (eidx, _object, _cap) = make_endpoint(&shared);
+        let egen = generation(&shared, eidx);
+        let msg = Message::new(1, b"req").expect("message");
+        // Fill it through the authoritative enqueue, the same owner the publication uses.
+        let mut enqueued = 0usize;
+        loop {
+            match shared.enqueue_request_if_no_waiter_split(eidx, egen, msg) {
+                QueuedRequestOutcome::Enqueued => enqueued += 1,
+                QueuedRequestOutcome::QueueFull => break,
+                other => panic!("unexpected outcome while filling: {other:?}"),
+            }
+            assert!(enqueued < 4096, "the queue must be bounded");
+        }
+        assert!(
+            enqueued > 0,
+            "the endpoint accepted messages before filling"
+        );
+        assert_eq!(
+            shared.enqueue_request_if_no_waiter_split(eidx, egen, msg),
+            QueuedRequestOutcome::QueueFull,
+            "a full endpoint stays the blocking origin; it never degrades to another answer"
+        );
+    }
+
+    /// **A waiter that appears before the publication** is reported, and the message is not
+    /// enqueued behind a receiver that would then sleep through it.
+    #[test]
+    fn a_waiter_that_appears_before_publication_is_reported_not_enqueued_behind() {
+        let shared = shared_with_task();
+        let (eidx, _object, _cap) = make_endpoint(&shared);
+        let egen = generation(&shared, eidx);
+        let msg = Message::new(1, b"req").expect("message");
+        let waiter = crate::kernel::boot::EndpointWaiterRecord::new(
+            crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), Asid(0)),
+            0,
+        );
+        shared.with(|s| {
+            s.publish_recv_waiter_live(eidx, waiter, CapId(0));
+        });
+        assert_eq!(
+            shared.enqueue_request_if_no_waiter_split(eidx, egen, msg),
+            QueuedRequestOutcome::WaiterAppeared
+        );
+        assert!(
+            matches!(
+                shared.peek_queued_with_cap_transfer_split(eidx),
+                crate::kernel::boot::IpcEndpointPeekResult::Ineligible(_)
+            ),
+            "a lost admission race must enqueue nothing"
+        );
+    }
+
+    /// **Invalid authority, and the ORDER the answers come in.**
+    ///
+    /// The validation owner is the one the broad handler uses, so a capability that fails more
+    /// than one check reports the first failure — not whichever the split route happened to ask
+    /// about first.
+    #[test]
+    fn endpoint_right_validation_reports_the_first_failure_in_the_broad_order() {
+        let shared = shared_with_task();
+        let (_eidx, _object, send_cap) = make_endpoint(&shared);
+
+        // A capability that does not exist at all.
+        assert_eq!(
+            shared.validate_endpoint_right_split_read(1, CapId(9999), CapRights::SEND),
+            Err(SyscallError::InvalidCapability),
+            "an unresolvable slot is InvalidCapability, before any question about kind or right"
+        );
+        // A capability that resolves to the WRONG KIND and also lacks the right: the kind is
+        // reported, because `validate_endpoint_right` asks about it first.
+        let cnode = shared.task_cnode_split(1).expect("cnode");
+        let (slot, gen_) = shared
+            .reserve_reply_record_split(
+                ThreadId(1),
+                Asid(0),
+                CapObject::Endpoint {
+                    index: 0,
+                    generation: generation(&shared, 0),
+                },
+                None,
+                None,
+            )
+            .expect("reservation");
+        let reply_object = CapObject::Reply {
+            index: slot,
+            generation: gen_,
+        };
+        let reply_cap = shared
+            .mint_capability_with_memory_ref_split(
+                cnode,
+                Capability::new(reply_object, CapRights::SEND),
+            )
+            .expect("mint");
+        assert_eq!(
+            shared.validate_endpoint_right_split_read(1, reply_cap, CapRights::RECEIVE),
+            Err(SyscallError::WrongObject),
+            "a non-Endpoint object is WrongObject — reported BEFORE the missing RECEIVE right, \
+             which it also lacks"
+        );
+        shared.rollback_minted_cap_split(cnode, reply_cap, reply_object);
+        assert!(shared.free_reserved_reply_record_split(slot, gen_));
+
+        // A real endpoint capability, held with SEND but asked for RECEIVE.
+        assert_eq!(
+            shared.validate_endpoint_right_split_read(1, send_cap, CapRights::RECEIVE),
+            Err(SyscallError::MissingRight),
+            "an Endpoint that lacks the requested right is MissingRight, last of the three"
+        );
+        // And the affirmative case resolves to the object, so a caller need not resolve twice.
+        assert!(matches!(
+            shared.validate_endpoint_right_split_read(1, send_cap, CapRights::SEND),
+            Ok(CapObject::Endpoint { .. })
+        ));
+    }
+
+    /// **Compensated retry.** After the buffered lane's three resources are given back, the
+    /// caller's cspace and the reply-record table are exactly as they were, so the same request
+    /// can be made again — which is what "genuinely re-sendable" has to mean.
+    #[test]
+    fn a_compensated_request_leaves_nothing_behind_and_can_be_remade() {
+        let shared = shared_with_task();
+        let (eidx, object, _cap) = make_endpoint(&shared);
+        let cnode = shared.task_cnode_split(1).expect("cnode");
+
+        let take = |shared: &SharedKernel| {
+            let (slot, gen_) = shared
+                .reserve_reply_record_split(ThreadId(1), Asid(0), object, None, None)
+                .expect("reservation");
+            let reply_object = CapObject::Reply {
+                index: slot,
+                generation: gen_,
+            };
+            let cap = shared
+                .mint_capability_with_memory_ref_split(
+                    cnode,
+                    Capability::new(reply_object, CapRights::SEND),
+                )
+                .expect("mint");
+            assert!(shared.persist_reply_caller_cap_split(slot, gen_, cap));
+            let stashed = shared
+                .stash_transfer_envelope_split(ThreadId(1), cap, object, None, None)
+                .expect("stash");
+            (slot, gen_, reply_object, cap, stashed.handle)
+        };
+
+        let (slot, gen_, reply_object, cap, handle) = take(&shared);
+        // Give all three back, in the lane's order.
+        let _ = shared.take_transfer_envelope_facts_split(handle, eidx, ThreadId(1));
+        shared.rollback_minted_cap_split(cnode, cap, reply_object);
+        assert!(shared.free_reserved_reply_record_split(slot, gen_));
+        assert!(
+            shared.with(|s| s.capability_for_cnode_local(cnode, cap).is_none()),
+            "the caller holds no Reply capability for a request that was never sent"
+        );
+
+        // The same request can be taken again, and it gets the same slot back — proof that the
+        // record was returned to the table rather than merely abandoned.
+        let (slot2, gen2, reply_object2, cap2, handle2) = take(&shared);
+        assert_eq!(
+            slot2, slot,
+            "the compensated record returned to the table and was reissued"
+        );
+        assert_ne!(
+            gen2, gen_,
+            "as a NEW incarnation, so a stale capability for the old one can never be honoured"
+        );
+        // Clean up.
+        let _ = shared.take_transfer_envelope_facts_split(handle2, eidx, ThreadId(1));
+        shared.rollback_minted_cap_split(cnode, cap2, reply_object2);
+        assert!(shared.free_reserved_reply_record_split(slot2, gen2));
+    }
+
+    /// **The record reservation binds the responder on the delivery arm and nobody on the
+    /// buffered arm**, which is the difference the reverse link depends on.
+    #[test]
+    fn the_delivery_arm_binds_the_responder_and_the_buffered_arm_does_not() {
+        let shared = shared_with_task();
+        let (_eidx, object, _cap) = make_endpoint(&shared);
+        shared.with(|s| {
+            s.register_task(2).expect("task2");
+        });
+
+        let (buffered_slot, buffered_gen) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), object, None, None)
+            .expect("buffered reservation");
+        let (bound_slot, bound_gen) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), object, Some(ThreadId(2)), None)
+            .expect("bound reservation");
+        assert_ne!(buffered_slot, bound_slot, "two distinct records");
+
+        let responder_of = |slot: usize| -> Option<ThreadId> {
+            shared.with(|s| {
+                s.with_ipc_state(|ipc| ipc.reply_caps[slot].as_ref().and_then(|r| r.responder_tid))
+            })
+        };
+        assert_eq!(
+            responder_of(buffered_slot),
+            None,
+            "the buffered arm binds no responder — nobody is parked, which is why it buffers"
+        );
+        assert_eq!(
+            responder_of(bound_slot),
+            Some(ThreadId(2)),
+            "the delivery arm binds the waiter it is delivering to"
+        );
+        assert!(shared.free_reserved_reply_record_split(buffered_slot, buffered_gen));
+        assert!(shared.free_reserved_reply_record_split(bound_slot, bound_gen));
     }
 }
