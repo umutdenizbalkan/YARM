@@ -2443,9 +2443,15 @@ fn try_split_dispatch_nonswitching_into_frame(
     // the legacy path". `ipccall_direct_production_enabled()` is
     // `cfg!(x86_64) || cfg!(aarch64) || cfg!(riscv64)`, so the production term is `true` on all
     // three and `ipccall_direct_admission_enabled()` short-circuits before the proof gate is
-    // consulted. NR 6 and NR 7 are admitted here on EVERY ordinary boot; what they still do on a
-    // decline is fall back to the legacy broad handler, which is a residual arm, not an absent
-    // route.
+    // consulted. NR 6 and NR 7 are admitted here on EVERY ordinary boot.
+    //
+    // U9-IPC-RESIDUAL2 §2 — and the sentence that ended this note in turn ("what they still do on
+    // a decline is fall back to the legacy broad handler, which is a residual arm") no longer
+    // holds either: neither route can express a decline. NR 6 does not reach this predicate at
+    // all any more — it is serviced by the switching dispatcher above, because its full-endpoint
+    // arm parks the caller — so in practice this term now admits NR 7 alone. It is kept naming
+    // both because it is the canonical admission predicate for the family, and narrowing it to
+    // one NR would make the two routes answer different questions about the same gate.
     let direct_ipc_admitted = matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)
         && crate::kernel::boot::ipccall_direct_admission_enabled();
     if classify_split_eligible_nr_only(syscall).is_none() && !direct_ipc_admitted {
