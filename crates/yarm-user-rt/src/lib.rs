@@ -58,8 +58,10 @@ pub mod syscall {
     }
 
     const SYSCALL_IPC_SEND_NR: usize = 1;
-    const SYSCALL_IPC_RECV_NR: usize = 2;
-    const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
+    // U9-RECV-QUEUE1 §3: re-exposed so `ipc_recv_raw_mapping`'s caller can name which of the two
+    // receive syscalls it is issuing. These are the existing frozen numbers; nothing is added.
+    pub const SYSCALL_IPC_RECV_NR: usize = 2;
+    pub const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
     const SYSCALL_IPC_CALL_NR: usize = 6;
     const SYSCALL_IPC_REPLY_NR: usize = 7;
     /// Control-plane: resize a process cnode (NR 8). Already part of the frozen
@@ -94,6 +96,9 @@ pub mod syscall {
     /// live; it is the same value the kernel's `SYSCALL_NO_TRANSFER_CAP` writes.
     pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
+    /// U9-RECV-QUEUE1 §3 — the kernel's read-only map intent, for `ipc_recv_raw_mapping`. The
+    /// existing frozen bit, re-exposed; nothing is added.
+    pub const SYSCALL_RECV_MAP_INTENT_READ: usize = 0x1;
     const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
     const SYSCALL_RECV_META_TRANSFERRED_CAP: usize = 1 << 1;
 
@@ -350,6 +355,110 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
+    }
+
+    /// What a raw receive reported: the frame's three return lanes and its error lane.
+    ///
+    /// Deliberately not a `Message`: a shared-region receive does not return a payload at all —
+    /// it returns a MAPPING. `ret1` is the page-rounded mapped length and `ret2` the
+    /// receiver-local transfer capability; decoding the frame through `ipc_recv_v2`'s metadata
+    /// struct would discard both.
+    ///
+    /// The mapped BASE is deliberately absent. The kernel maps at exactly the address the
+    /// receiver asked for (`Ok((requested_va, mapped_len))`), so the caller already knows it —
+    /// and the base is reported in an inline ARGUMENT register that the x86_64 syscall stub does
+    /// not carry back. Surfacing it would mean changing every port's syscall return convention
+    /// to serve a witness, which is the wrong trade: reading the mapped bytes proves the mapping
+    /// exists more convincingly than echoing the address back would.
+    #[derive(Debug, Clone, Copy)]
+    pub struct RawRecvRet {
+        pub ret0: u64,
+        pub ret1: u64,
+        pub ret2: u64,
+        pub err: u64,
+    }
+
+    impl RawRecvRet {
+        /// The syscall's error code, from whichever lane this port puts it in.
+        ///
+        /// x86_64 carries it in its own error register; aarch64 and riscv64 put it in `ret0`,
+        /// which a successful shared-region receive sets to `0` (`frame.set_ok(0, ..)`).
+        #[must_use]
+        pub fn error_code(&self) -> u64 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                self.err
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                self.ret0
+            }
+        }
+    }
+
+    /// U9-RECV-QUEUE1 §3 — issue `IpcRecv` (NR 2) or `IpcRecvTimeout` (NR 5) with NO recv-v2
+    /// metadata buffer, and report the raw frame.
+    ///
+    /// Every other receive wrapper here supplies a 40-byte metadata buffer, which is right for a
+    /// payload receive and makes a SHARED-REGION receive impossible to issue: the kernel's
+    /// `recv_shared_mem_map_intent_flags` reads its map-intent word from argument 4, and argument
+    /// 4 is where those wrappers put the metadata LENGTH (NR 2) or POINTER (NR 5). A metadata
+    /// buffer therefore presents itself as an unknown map-intent bit pattern and the canonical
+    /// handler answers `InvalidArgs` before it maps anything.
+    ///
+    /// With `meta = 0` the map-intent word is `0`, which the canonical reader defines as
+    /// read-write — the shape a shared-region receive needs. This adds no syscall number and no
+    /// ABI; it is the same two syscalls with the arguments a mapping receive requires.
+    ///
+    /// `map_intent` goes in argument 4, which is where the kernel's
+    /// `recv_shared_mem_map_intent_flags` reads it on BOTH syscalls. `0` means the kernel's
+    /// default read-write; `SYSCALL_RECV_MAP_INTENT_READ` asks for a read-only mapping, which is
+    /// what a capability granted `READ | MAP` can actually back.
+    ///
+    /// Putting it there is also what keeps argument 4 from being read as a metadata field: for
+    /// NR 2 arg 4 is the metadata LENGTH and `MAP_INTENT_READ` is far below the 40 bytes that
+    /// would select a recv-v2 writeback, and for NR 5 it is the metadata POINTER whose length in
+    /// arg 5 is zero. Neither syscall writes a metadata struct here.
+    ///
+    /// `timeout_ticks` is ignored for NR 2, which has no timeout slot.
+    ///
+    /// # Safety
+    ///
+    /// The caller names a raw user address range the kernel may MAP INTO. It must be a range this
+    /// task owns and does not already have mapped, or the kernel refuses through its own
+    /// validation rather than corrupting anything.
+    #[inline]
+    pub unsafe fn ipc_recv_raw_mapping(
+        nr: usize,
+        ep_cap: u32,
+        ptr: usize,
+        len: usize,
+        timeout_ticks: u64,
+        map_intent: usize,
+    ) -> RawRecvRet {
+        // NR 2: arg 3 is the recv-v2 metadata POINTER (zero here), arg 4 its LENGTH.
+        // NR 5: arg 3 is the timeout, arg 4 the metadata POINTER, arg 5 its LENGTH (zero here).
+        // On both, arg 4 is also the map-intent word.
+        let args = if nr == SYSCALL_IPC_RECV_TIMEOUT_NR {
+            [
+                ep_cap as usize,
+                ptr,
+                len,
+                timeout_ticks as usize,
+                map_intent,
+                0,
+            ]
+        } else {
+            [ep_cap as usize, ptr, len, 0, map_intent, 0]
+        };
+        // SAFETY: Uses architecture syscall ABI to enter kernel, exactly as `ipc_recv` does.
+        let ret = unsafe { crate::arch::raw_syscall(nr, args) };
+        RawRecvRet {
+            ret0: ret.ret0 as u64,
+            ret1: ret.ret1 as u64,
+            ret2: ret.ret2 as u64,
+            err: ret.error as u64,
+        }
     }
 
     /// Stage 163 proof-only: timed/blocking `IpcSend`. Identical to `ipc_send`

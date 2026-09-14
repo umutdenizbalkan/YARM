@@ -304,7 +304,16 @@ fn attenuate_transfer_cap_for_recv_intent(
     Ok(derived)
 }
 
-fn recv_shared_mem_map_intent_flags(frame: &TrapFrame) -> Result<PageFlags, SyscallError> {
+/// U9-RECV-QUEUE1 §2 — widened so the off-lock shared-region completion reads the map-intent
+/// word through THIS function rather than re-deriving it.
+///
+/// That matters more than it looks: the word is read from `SYSCALL_ARG_INLINE_PAYLOAD1` (arg 4)
+/// straight off the caller's frame, and arg 4 is NR 2's recv-v2 metadata LENGTH and NR 5's
+/// metadata POINTER. The overload is canonical behaviour on both syscalls; sharing the one
+/// reader is what keeps the split route from accidentally "fixing" it into a divergence.
+pub(crate) fn recv_shared_mem_map_intent_flags(
+    frame: &TrapFrame,
+) -> Result<PageFlags, SyscallError> {
     let raw = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1);
     if raw == 0 {
         return Ok(PageFlags {

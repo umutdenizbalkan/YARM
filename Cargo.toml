@@ -104,6 +104,13 @@ aarch64-exit-current-task-oracle = []
 # U9-SEND-FINAL §3: accepted and inert here, so one `--features` argument can reach every
 # package the artifact build touches. Only yarm-control-plane-servers acts on it.
 ipc-send-final-fault-witness = []
+# U9-RECV-QUEUE1 §3: the queued shared-region grant taken by the ORDINARY receive syscalls
+# (NR 2 and NR 5) rather than by NR 30. A cargo feature and not only a runtime selector, for the
+# same reason the send-fault cell is one: init's address space runs at `MAX_MAPPINGS` and its
+# image sits 19 bytes under a page boundary, so ~500 bytes of extra cell text costs a whole page
+# and the oracle window can no longer be mapped. Gated off, the image is byte-identical to one
+# without the cell. Accepted and inert outside yarm-control-plane-servers.
+recv-queue1-ordinary-grant = []
 # Stage 200D-0D1: the RISC-V disposable-task ExitCurrentTask live oracle — the third and final
 # arch cell. Selector, marker and gate literals compile ONLY with this feature; the production
 # NR16 syscall, the disposition publication and the RISC-V post-lock consumer are

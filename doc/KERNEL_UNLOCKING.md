@@ -16839,6 +16839,161 @@ the highest-traffic pair in the whole space — 53 and 54 dispatches in a single
 Second candidate, smaller and mostly wiring: **NR 2 `IpcRecv`'s user-ASID cohort**, which §1
 established is not short a mechanism.
 
+## U9-RECV-QUEUE1 — the four queued receive populations, closed
+
+Reviewed candidate `f24ebab2`; base `f24ebab2`. **NR 2 and NR 5 are still NOT closed.** This is the
+second staged slice: it closes the four populations the directive scoped — the queued
+shared-region transfer, sparse sender-waiter queues, cap-bearing refills, and the forbidden
+ordinary-transfer Reply object — and leaves the blocking/admission residuals explicitly open.
+
+### One dequeue policy, not two approximations of one
+
+`KernelState::ipc_recv_endpoint_take` and the split `ipc_try_recv_queued_admitted_locked` were
+separate implementations of the same four-way decision, and they disagreed in three places. The
+authoritative body is now `endpoint_take_with_refill_locked`, which both drive:
+
+| decision | broad | split, before | now |
+|---|---|---|---|
+| which waiter is next | first LIVE, by scan | slot 0 only | first LIVE, by scan |
+| compaction | full left-compact | shift-by-one | full left-compact |
+| a cap-bearing waiter message | refilled unchanged | declined the whole receive | refilled unchanged |
+| empty endpoint + live waiter | delivered directly | `EmptyQueue` | delivered directly |
+
+The scan is not a refinement: `process_ipc_timeout_deadlines` nulls an expired sender's slot in
+place *without* compacting, so `[None, Some(B), Some(C)]` is a state the queue really reaches, and
+a slot-0 read reports "no waiter" for it. The shift-by-one compaction is only correct when the
+entry taken was at the head, which the scan makes untrue.
+
+### The distinction the package turns on
+
+**A refilled message is queued for a later receiver; it is not delivered now.** In the
+`(Some(msg), Some(waiter))` arm the waiter's message is `send`-ed into the slot the dequeue just
+freed — byte-identical, transfer handle intact, envelope still stashed. It owes no
+materialization, no mapping and no registration at that point; the receiver that eventually takes
+it discharges those. The split guard that refused a cap-bearing waiter message was declining a
+receive because of what a *different* message happened to contain. There is no such thing as
+refill-time materialization, and none was invented.
+
+The one place a waiter's message IS delivered now is the empty-endpoint direct delivery, and
+there it carries the obligations of any delivered message.
+
+### The queued shared-region transfer
+
+The receiver-side transaction is real and it lives in
+`handle_ipc_recv_result_with_empty_error` **after** materialization, not in the materializer.
+`SharedKernel::complete_recv_boundary_shared_region` runs it in NR 2 / NR 5's own order —
+materialize, publish the capability in the return lane, write the recv-v2 metadata if one was
+asked for, wake the sender, then decode, validate, attenuate, map, register and write the frame —
+composed entirely from owners that already existed: `materialize_queued_transfer_cap_split` (which
+consumes the envelope once, reports the pin obligation and releases it on every exit),
+`map_user_page_raw_split`, `register_active_transfer_mapping_split`,
+`unmap_range_two_phase_from_split` (unmap → ACK → reclaim, in that order),
+`revoke_capability_no_vm_split` and `apply_split_sender_wake_plan_split`.
+
+NR 30's transaction order was deliberately **not** transplanted. `RecvSharedV3` peeks, builds
+everything fallible, and only then commits the dequeue — a better transaction, and not the one
+NR 2 and NR 5 have. Preserving behaviour meant reproducing consume-then-compensate, including
+which failures revoke the minted capability and which propagate bare.
+
+Two canonical quirks are reproduced rather than repaired, and both are load-bearing:
+
+* **The map-intent word shares a register with the metadata slots.**
+  `recv_shared_mem_map_intent_flags` reads argument 4 straight off the frame; argument 4 is
+  NR 2's recv-v2 metadata LENGTH and NR 5's metadata POINTER. That function is *called*, not
+  re-derived, so the split route cannot drift from it. A consequence worth stating: a production
+  `ipc_recv_v2` supplying a 40-byte metadata buffer presents `40` as an unknown map-intent bit
+  pattern, and the canonical handler answers `InvalidArgs` — on the broad path too.
+* **The metadata struct names the pre-attenuation capability.** The broad arm encodes
+  `frame.ret2()` into the metadata before the read-only attenuation may mint a different
+  capability and rewrite the return lane. Same order here, same bytes.
+
+### The forbidden ordinary-transfer Reply object
+
+`materialize_received_message_cap` fails closed on a `Reply` source object arriving without
+`FLAG_REPLY_CAP`: reclaim the envelope exactly once, mint nothing, emit
+`IPC_RECV_REPLY_CAP_QUEUE_REFUSED … reason=direct_only`, return `InvalidCapability`. The split
+composition answered `WrongObject` with no marker, from two arms each carrying a comment asserting
+the arm was unreachable *because admission declined the shape first*. Admission no longer does, so
+both arms are live and both now give the canonical answer.
+
+**The position matters as much as the answer.** The broad route decides from the envelope's own
+resolved source object as its FIRST act, before anything else is resolved — so a forbidden shape
+whose source task has since died still gets `InvalidCapability`. Deciding it later, where the
+routed materializer's `DeferredReplyCap` arm sits, gives `Internal` for exactly that case. The
+differential caught this; the check now sits immediately after the consume on both arms.
+
+### Finite-timeout NR 5
+
+`handle_ipc_recv_timeout` calls `try_endpoint_split_recv` BEFORE it looks at `request.blocking`,
+because a message that is already queued makes the deadline irrelevant. The split lane refused
+every non-zero timeout by name, so a timed receive with a message waiting reached the terminal
+acquisition. It now serves every NR 5, and the two timeouts differ only in what an EMPTY endpoint
+means: a probe's empty endpoint is its result (`WouldBlock`), a timed receive's belongs to the
+blocking owner and is declined INTERNALLY — never converted into the non-blocking error. The
+per-CPU pre-read deadline is consumed only on a path that answers the trap, so a decline leaves
+it for the owner that will park the caller against it.
+
+### Live evidence
+
+The XFER2 grant witness now runs in two complementary profiles over the same grant: default,
+which receives with NR 30 in both release shapes, and `ORDINARY_ROUTES=1`, which receives a queued
+`OPCODE_SHARED_MEM` transfer with NR 2 and with NR 5 under a finite timeout. Both prove the same
+seven properties — the frame reports a real capability and the page-rounded length, every byte of
+the mapped page matches the deterministic oracle pattern, the NR 4 release returns the exact
+length, the window is free again afterwards (proven by remapping over it), and a duplicate release
+is refused.
+
+The ordinary profile grants **one page**, not the oracle's two, and the reason is the defect
+recorded above: the broad mapping loop resolves one physical base per page, so a two-page grant
+through NR 2 or NR 5 maps both pages to the object's first frame. A two-page grant here would be
+testing that bug rather than the route, and single-page is the only shape production sends through
+these two syscalls. The send therefore uses `send_shared_region_large` with an explicit length
+instead of the whole-object `send_shared_region`.
+
+Observed on x86_64: `IPC_RECV_SHARED_REGION_SPLIT_MAPPED receiver_tid=1 va=0x40000000
+mapped_len=4096 region_len=4096` for both grants, each followed by
+`IPC_RECV_SHARED_REGION_SPLIT_DONE result=ok`, with `nr=2 timeout=0` and `nr=5 timeout=64`
+respectively — the finite-timeout grant taking the immediate engine with nothing ever waiting.
+Cap-bearing refills are exercised by the park witness, which serves 12 per boot, one per parked
+sender.
+
+It REPLACES rather than adds, and that is measured. Init's address space runs at `MAX_MAPPINGS`
+(128/128) and its `init_server` text sits **19 bytes** below a page boundary (143 341 of 143 360),
+so ~2 KiB of extra cell text costs a page, a page costs a mapping, and the oracle window can no
+longer be mapped — observed as `VM_FULL reason=mapping_bookkeeping_full … va=0x40000000`, which
+failed every grant including the two that had nothing to do with this package.
+`U9-IPC-RESIDUAL1 §5` records that pressure as deferred and this package does not widen into it.
+Gated off, the cell's contribution is byte-identical; gated on it is 1 200 bytes SMALLER than the
+NR 30 pair it replaces.
+
+### Source-reachable receive residuals that REMAIN — NR 2 / NR 5 stay OPEN
+
+| class | next existing owner, or the missing operation |
+|---|---|
+| a parked RECEIVER on the endpoint (`ReceiverWaiterPresent`) | an admission residual, not dequeue policy; the blocking lane owns the shape |
+| a non-buffered (`Synchronous`) endpoint | the rendezvous arm has no pre-lock owner |
+| **kernel-task receiver + V2 metadata** (`RecvV2MetaUserCopy`) | canonical answer still to be derived; a kernel task has no address space for the 40-byte struct |
+| NR 2 **legacy (non-recv-v2) blocking** shape (`not_recv_v2`) | the blocking lane saves `BlockedRecvState` only for the recv-v2 variant |
+| blocking-lane **races / admission**: `already_deferred`, `defer_unavailable`, `phase_a`, `phase_b`, `queue_non_empty` / `waiter_ownership_busy`, `deadline_reservation` | each needs a settlement rather than a hand-over; `recv_block_unwind_race_split` already exists as the unwind owner |
+| **publication gates armed**: `shared_region_ack_publication_armed`, `direct_oracle_selector_armed` | broad-only acknowledgement machinery; the dominant residual on oracle-armed profiles |
+| NR 5 **timed** receive whose endpoint is empty | declined to the blocking owner by design; closing it is the blocking-settlement package |
+
+Closed by this slice: the queued shared-region transfer, sparse sender-waiter queues,
+cap-bearing and reply-cap-flagged refills, empty-endpoint direct delivery, the forbidden
+ordinary-transfer Reply object, and finite-timeout immediate delivery.
+
+### Census
+
+**CENSUS-DELTA: 0.** `AUDITED_WITH_CPU_TOTAL = 2`, `AUDITED_WITH_BROAD_TOTAL = 0`.
+
+### Deferred, unchanged by this slice
+
+Init's `MAX_MAPPINGS` pressure (measured above, not widened into); the per-page physical
+resolution in the shared-region mapping loop, which reads the memory object's base for every page
+and is therefore correct only for the single-page regions production sends — reproduced exactly
+rather than silently diverged from; the RISC-V startup-arm resume of the process manager; the
+`vm-cow` CI profile's pre-existing heap OOM; NR 9 and the non-syscall trap families.
+
 ## U9-RECV-FINAL (slice 1) — one receive entry, RISC-V NR 2, and the non-blocking probe
 
 Reviewed candidate `8dd067f4`; base `8dd067f4`. **NR 2 and NR 5 are NOT closed.** This is a

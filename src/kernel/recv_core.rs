@@ -989,6 +989,40 @@ pub(crate) struct RecvBoundaryOrdinaryCapSnapshot {
     pub(crate) writeback: RecvWritebackPlan,
 }
 
+/// U9-RECV-QUEUE1 §2 — by-value snapshot of a queued **shared-region** transfer
+/// (`OPCODE_SHARED_MEM`) to a user-ASID receiver, taken after the rank-3 dequeue and before any
+/// of the receiver-side transaction has run.
+///
+/// This class is not a variant of the ordinary cap transfer: its receiver-side obligations are
+/// a mapping, an active-transfer registration and a completely different frame writeback, and
+/// they live in `handle_ipc_recv_result_with_empty_error` **after** materialization rather than
+/// in the materializer. So it carries what that transaction reads and nothing else.
+///
+/// Deliberately absent: a metadata pointer/length pair. The map-intent word and the recv-v2
+/// metadata slots are read from the caller's own frame at completion time, because NR 2 and
+/// NR 5 put them in DIFFERENT argument registers and the canonical result owner reads the frame
+/// directly for both. Carrying a decoded pair here would mean choosing one syscall's decode for
+/// the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecvBoundarySharedRegionSnapshot {
+    /// The endpoint the message came from — the envelope's binding, re-stated for the
+    /// materializer.
+    pub(crate) endpoint: CapObject,
+    /// Receiver TID (mint target, mapping owner, rollback target).
+    pub(crate) receiver_tid: u64,
+    /// Receiver ASID, resolved in Phase A. A shared-region delivery only reaches this snapshot
+    /// for a user-ASID receiver, so this is `Some` by construction.
+    pub(crate) asid: Option<crate::kernel::vm::Asid>,
+    /// The dequeued message, by value. Its payload is the `SharedMemoryRegion` descriptor.
+    pub(crate) msg: Message,
+    /// The receiver's requested mapping base and byte budget — NR 2 and NR 5 both put these in
+    /// args 1/2, so there is one decode and it is not syscall-specific.
+    pub(crate) user_ptr: usize,
+    pub(crate) user_len: usize,
+    /// Deferred sender-waiter wake, applied after the mint and before any writeback (§56 order).
+    pub(crate) wake_tid: Option<super::ipc::SenderWakeTarget>,
+}
+
 /// Stage 187A — Phase B sibling of [`execute_user_asid_plain_writeback`]
 /// running on the 186E user-copy seam AFTER the global-lock borrow is dead.
 ///

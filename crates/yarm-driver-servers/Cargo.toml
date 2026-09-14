@@ -19,6 +19,7 @@ aarch64-exit-current-task-oracle = []
 # U9-SEND-FINAL §3: accepted and inert here, so one `--features` argument can reach every
 # package the artifact build touches. Only yarm-control-plane-servers acts on it.
 ipc-send-final-fault-witness = []
+recv-queue1-ordinary-grant = []
 # Stage 200D-0D1: the RISC-V sibling, an UNUSED pass-through for the same reason — one
 # BOOTSTRAP_FEATURE_ARGS is applied to every server package. No oracle code compiles here.
 riscv-exit-current-task-oracle = []

@@ -83,8 +83,23 @@ fail=0
 note() { echo "[xfer2-witness] $*"; }
 die()  { echo "[xfer2-witness][fail] $*"; fail=1; }
 
-note "building base $ARCH artifacts"
-BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
+# U9-RECV-QUEUE1 §3 — which RECEIVE syscall the witness's two grant cycles use.
+#
+#   ORDINARY_ROUTES=0 (default): NR 30 `RecvSharedV3`, in its two release shapes.
+#   ORDINARY_ROUTES=1          : the identical queued transfer taken by NR 2 and by NR 5 with a
+#                                finite timeout — the population U9-RECV-QUEUE1 moved off the
+#                                terminal acquisition.
+#
+# The cell REPLACES rather than adds because init runs at MAX_MAPPINGS and has no page of
+# headroom; the two settings are complementary runs of one witness over one transfer.
+ORDINARY_ROUTES=${ORDINARY_ROUTES:-0}
+USERSPACE_FEATURES="--no-default-features"
+if (( ORDINARY_ROUTES )); then
+  USERSPACE_FEATURES="--no-default-features --features recv-queue1-ordinary-grant"
+fi
+
+note "building base $ARCH artifacts (ordinary_routes=$ORDINARY_ROUTES)"
+BOOTSTRAP_FEATURE_ARGS="$USERSPACE_FEATURES" \
   "$BUILD_SCRIPT" >"$LOGDIR/build.log" 2>&1 || die "base artifact build failed"
 
 note "rebuilding kernel_boot with $FEATURE"
@@ -141,33 +156,93 @@ have()  { grep -a -q -F -- "$1" "$NORM"; }
 
 # Both grants must report every property true. The full line is matched, so a partial success
 # cannot pass by carrying the right prefix.
-for shape in registered_range explicit_range; do
-  # The VERDICT line only — `XFER2_GRANT_DETAIL` carries the observed values on its own line and
-  # also names the shape, so an unqualified `shape=` match would count two lines per grant.
-  m="XFER2_GRANT_WITNESS shape=$shape"
-  n=$(count "$m")
-  [[ "$n" == "1" ]] || die "expected exactly one $shape grant (got $n)"
-  line=$(grep -a -m1 -- "$m" "$NORM" || true)
-  for prop in meta=1 perm=1 page0=1 page1=1 release=1 unmapped=1 revoked=1 result=1; do
+if (( ORDINARY_ROUTES )); then
+  # The ordinary-receive profile. `perm=` has no counterpart here: NR 2 / NR 5 report their
+  # mapping through the frame's return lanes, which carry no permission field, so the read-only
+  # intent is proven by the mapping succeeding against a `READ | MAP` capability at all.
+  for phase in A_nr2 B_nr5_timed; do
+    m="XFER2_ORDINARY_GRANT_WITNESS phase=$phase"
+    n=$(count "$m")
+    [[ "$n" == "1" ]] || die "expected exactly one $phase grant (got $n)"
+    line=$(grep -a -m1 -- "$m" "$NORM" || true)
+    for prop in page0=1 page1=1 release=1 unmapped=1 revoked=1 result=1; do
+      case "$line" in
+        *" $prop"*) ;;
+        *) die "$phase grant missing $prop  [$line]" ;;
+      esac
+    done
+  done
+  # The detail line proves the frame reported a real capability and the page-rounded length.
+  for phase in A_nr2 B_nr5_timed; do
+    line=$(grep -a -m1 -- "XFER2_ORDINARY_GRANT phase=$phase " "$NORM" || true)
     case "$line" in
-      *" $prop"*) ;;
-      *) die "$shape grant missing $prop  [$line]" ;;
+      *" meta=1"*) ;;
+      *) die "$phase detail missing meta=1  [$line]" ;;
     esac
   done
-done
+  # NR 5's grant carried a FINITE timeout with the message already queued: the immediate engine
+  # must take it. A zero there would mean the probe lane served it and the finite-timeout
+  # population was never exercised.
+  have 'XFER2_ORDINARY_GRANT phase=B_nr5_timed nr=5 timeout=64' \
+    || die "the NR 5 grant did not carry a finite timeout"
+  # The shared-region receives themselves must have been SERVED pre-lock, which the
+  # `IPC_RECV_SHARED_REGION_SPLIT_DONE` pair below asserts exactly. A global
+  # `IPC_RECV_SPLIT_UNROUTED == 0` is deliberately NOT asserted here: this profile arms the
+  # shared-region direct oracle, whose `shared_region_ack_publication_armed` gate sends every
+  # ordinary NR 2 to the terminal acquisition. That is a real, separately-tracked residual of
+  # the blocking lane (doc/KERNEL_UNLOCKING.md, U9-RECV-QUEUE1) and is not this witness's to
+  # prove; the unarmed core profile is where the zero is measured.
+  have 'IPC_RECV_SHARED_REGION_SPLIT_BEGIN' \
+    || die "no shared-region receive ran through the split boundary"
+else
+  for shape in registered_range explicit_range; do
+    # The VERDICT line only — `XFER2_GRANT_DETAIL` carries the observed values on its own line
+    # and also names the shape, so an unqualified `shape=` match would count two lines per grant.
+    m="XFER2_GRANT_WITNESS shape=$shape"
+    n=$(count "$m")
+    [[ "$n" == "1" ]] || die "expected exactly one $shape grant (got $n)"
+    line=$(grep -a -m1 -- "$m" "$NORM" || true)
+    for prop in meta=1 perm=1 page0=1 page1=1 release=1 unmapped=1 revoked=1 result=1; do
+      case "$line" in
+        *" $prop"*) ;;
+        *) die "$shape grant missing $prop  [$line]" ;;
+      esac
+    done
+  done
+fi
 
 [[ "$(count 'XFER2_GRANT_WITNESS_DONE grant_a=1 grant_b=1 caps_intact=1 result=ok')" == "1" ]] \
   || die "witness completion missing (grants, or essential caps, did not all pass)"
 
 # ── Kernel side: two successful releases, both through the SPLIT route ──
-rel=$(count 'XFER_RELEASE_OK route=split pages=2 len=8192')
-[[ "$rel" == "2" ]] || die "expected two split-route releases of the two-page grant (got $rel)"
+#
+# The ordinary-receive profile grants ONE page, not the oracle's two: the broad NR 2 / NR 5
+# mapping loop resolves the memory object's physical base once per PAGE (it has no virtual
+# address to vary on), so every page of a multi-page region maps to the object's first frame.
+# That is a pre-existing defect of the broad path which this package reproduces rather than
+# silently diverging from, and a 2-page grant here would be testing the bug instead of the
+# route. Production only ever sends single-page regions through these two syscalls.
+if (( ORDINARY_ROUTES )); then
+  rel=$(count 'XFER_RELEASE_OK route=split pages=1 len=4096')
+  [[ "$rel" == "2" ]] || die "expected two split-route releases of the one-page grant (got $rel)"
+else
+  rel=$(count 'XFER_RELEASE_OK route=split pages=2 len=8192')
+  [[ "$rel" == "2" ]] || die "expected two split-route releases of the two-page grant (got $rel)"
+fi
 have 'XFER_RELEASE_OK route=broad' && die "a release fell to the broad route: the family is not closed"
 
-# ── NR 30 must have delivered through the split route too, twice, mapped ──
-v3=$(count 'RECV_V3_LIVE_MAPPED route=split')
-[[ "$v3" == "2" ]] || die "expected two split-route mapped NR 30 deliveries (got $v3)"
-have 'RECV_V3_LIVE_MAPPED route=broad' && die "an NR 30 delivery fell to the broad route"
+# ── The receive side must have delivered through the split route too, twice, mapped ──
+if (( ORDINARY_ROUTES )); then
+  sr=$(count 'IPC_RECV_SHARED_REGION_SPLIT_DONE')
+  [[ "$sr" == "2" ]] \
+    || die "expected two split-boundary shared-region deliveries (got $sr)"
+  ok=$(count 'IPC_RECV_SHARED_REGION_SPLIT_DONE cpu=0 receiver_tid=1 result=ok')
+  [[ "$ok" == "2" ]] || die "expected both shared-region deliveries to report ok (got $ok)"
+else
+  v3=$(count 'RECV_V3_LIVE_MAPPED route=split')
+  [[ "$v3" == "2" ]] || die "expected two split-route mapped NR 30 deliveries (got $v3)"
+  have 'RECV_V3_LIVE_MAPPED route=broad' && die "an NR 30 delivery fell to the broad route"
+fi
 
 # ── Nothing may have gone wrong on the way ──
 for bad in \
