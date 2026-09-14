@@ -173530,6 +173530,8 @@ mod u9_ipc_residual2_closure {
         "fn nr6_deliver_to_blocked_waiter(",
         "fn nr6_park_sender(",
         "fn try_split_ipcreply_direct_into_frame(",
+        "fn nr7_settle_declined_transaction(",
+        "fn nr7_queued_reply_lane(",
         "fn nr7_refuse_preflight(",
         "fn nr7_refuse(",
     ];
@@ -173597,6 +173599,14 @@ mod u9_ipc_residual2_closure {
             (
                 "fn nr6_validate_in_broad_order(",
                 ") -> Result<(), (crate::kernel::syscall::SyscallError, &'static str)> {",
+            ),
+            (
+                "fn nr7_settle_declined_transaction(",
+                ") -> Result<(), TrapHandleError> {",
+            ),
+            (
+                "fn nr7_queued_reply_lane(",
+                ") -> Result<(), TrapHandleError> {",
             ),
         ] {
             let body = complete_body(&src, signature);
@@ -174682,5 +174692,287 @@ mod u9_ipc_residual3_validation_parity {
                 "the resolver must not order its answers by the verdict: `{verdict_keyed}`"
             );
         }
+    }
+}
+
+/// U9-IPC-RESIDUAL3 §2 — **what a declined NR 7 transaction actually leaves behind.**
+///
+/// U9-IPC-RESIDUAL2 §2 answered the five pristine variants from an assumption: "the
+/// acknowledgement is spent, so the queued mode's precondition no longer holds". These cases
+/// drive the canonical settle owners and read the resulting state, which is the only way to find
+/// out whether that assumption holds — and it does not. `settle_reply_pre_reserve` restores the
+/// lease whenever the exact caller is still blocked, and the drain republishes that restoration.
+///
+/// Each case asserts a post-state, not the presence of a function.
+#[cfg(test)]
+mod u9_ipc_residual3_reply_settlement {
+    use super::*;
+    use crate::kernel::capabilities::CapObject;
+    use crate::kernel::direct_eligibility::DirectReplyTerminal;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::ipccall_direct::BlockedCallerAck;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    fn shared_with_tasks() -> SharedKernel {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        shared.with(|s| {
+            s.register_task(1).expect("task1");
+            s.register_task(2).expect("task2");
+            s.enqueue_current_cpu(1).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        shared
+    }
+
+    fn make_endpoint(shared: &SharedKernel) -> (usize, u64, CapObject) {
+        let (idx, send_root, _recv) = shared.with(|s| s.create_endpoint(8).expect("endpoint"));
+        let object = shared
+            .with(|s| s.current_task_capability(send_root).map(|c| c.object))
+            .expect("endpoint object");
+        let generation = shared
+            .with(|s| s.with_ipc_state(|ipc| ipc.endpoint_generations.get(idx).copied()))
+            .expect("generation");
+        (idx, generation, object)
+    }
+
+    fn caller_ack(
+        eidx: usize,
+        egen: u64,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> BlockedCallerAck {
+        BlockedCallerAck {
+            caller,
+            endpoint_index: eidx,
+            endpoint_generation: egen,
+            recv_v2_committed: true,
+            // A committed acknowledgement needs a non-zero payload destination; the value is
+            // never dereferenced by anything these cases drive.
+            payload_user_ptr: 0x4000,
+            payload_user_len: 128,
+            meta_user_ptr: 0x5000,
+            meta_user_len: 64,
+        }
+    }
+
+    /// **The assumption, tested.** A pre-reserve settle on a still-blocked caller RESTORES the
+    /// acknowledgement — so after a decline the lease is claimable again, and "the acknowledgement
+    /// is spent" is false.
+    #[test]
+    fn a_pre_reserve_settle_restores_the_acknowledgement_for_a_still_blocked_caller() {
+        let shared = shared_with_tasks();
+        let (eidx, egen, _object) = make_endpoint(&shared);
+        let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), Asid(0));
+        let seq = crate::kernel::boot::ipcreply_direct_ack::publish(caller_ack(eidx, egen, caller));
+        assert!(
+            crate::kernel::boot::ipcreply_direct_ack::is_claimable(eidx, egen),
+            "a freshly published acknowledgement is claimable"
+        );
+        let claimed = crate::kernel::boot::ipcreply_direct_ack::claim(eidx, egen);
+        assert!(claimed.is_some(), "and this route claims it");
+        assert!(
+            !crate::kernel::boot::ipcreply_direct_ack::is_claimable(eidx, egen),
+            "after the claim it is not claimable — this is the state the old reasoning stopped at"
+        );
+        // What the transaction's own pre-reserve settle does for a still-blocked caller, through
+        // the SAME primitive the drain republishes.
+        assert!(
+            crate::kernel::boot::ipcreply_direct_ack::restore(seq),
+            "the restore the settle performs must succeed for this exact sequence"
+        );
+        assert!(
+            crate::kernel::boot::ipcreply_direct_ack::is_claimable(eidx, egen),
+            "so the acknowledgement is LIVE again after a pristine decline — the previous \
+             package's premise that it is spent is false"
+        );
+        crate::kernel::boot::ipcreply_direct_ack::reset();
+    }
+
+    /// A pristine decline does not consume the reply authority: none of the five variants reaches
+    /// the record reservation, so the record stays externally invokable.
+    #[test]
+    fn a_pristine_decline_leaves_the_reply_authority_invokable() {
+        let shared = shared_with_tasks();
+        let (_eidx, _egen, object) = make_endpoint(&shared);
+        // Bound to a responder, because `reserve_existing_reply_record_split` — the owner the
+        // transaction reserves through — enforces the binding.
+        let (slot, generation) = shared
+            .reserve_reply_record_split(
+                ThreadId(1),
+                Asid(0),
+                object,
+                Some(ThreadId(2)),
+                Some(Asid(0)),
+            )
+            .expect("reservation");
+        assert!(
+            shared.persist_reply_caller_cap_split(
+                slot,
+                generation,
+                crate::kernel::capabilities::CapId(7)
+            ),
+            "the record is a live one-shot"
+        );
+        assert!(
+            shared.reply_record_externally_invokable_split_read(slot, generation),
+            "and it is externally invokable — which is what a pristine decline leaves"
+        );
+        // The competing-claimant case: a record another settle has CONSUMED is not invokable,
+        // and that is the state in which the canonical error is the right answer.
+        // `discard_reply_record_split` is `Reserved -> Consumed`, so the record is reserved
+        // first through the same owner the transaction reserves through.
+        let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(0));
+        assert!(
+            shared.reserve_existing_reply_record_split(slot, generation, replier),
+            "an Available record is reservable by its bound replier"
+        );
+        assert!(shared.discard_reply_record_split(slot, generation));
+        assert!(
+            !shared.reply_record_externally_invokable_split_read(slot, generation),
+            "a discarded record is settled, and reviving it would race its claimant"
+        );
+    }
+
+    /// The three questions the settler asks are answerable, and they distinguish the states the
+    /// disposition depends on. A record with an UNARMED terminal and no live acknowledgement is
+    /// the queued mode's precondition — the case the previous package answered with an error.
+    #[test]
+    fn the_queued_precondition_is_distinguishable_from_a_settled_authority() {
+        let shared = shared_with_tasks();
+        let (eidx, egen, object) = make_endpoint(&shared);
+        let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(0));
+        let (slot, generation) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), object, None, None)
+            .expect("reservation");
+        assert!(shared.persist_reply_caller_cap_split(
+            slot,
+            generation,
+            crate::kernel::capabilities::CapId(7)
+        ));
+
+        // (1) authority live
+        assert!(shared.reply_record_externally_invokable_split_read(slot, generation));
+        // (2) terminal admits — nobody has claimed it
+        let terminal =
+            shared.classify_direct_reply_terminal_split_read(slot, generation, replier, eidx, egen);
+        assert!(
+            terminal.admits_direct_reply(),
+            "an unclaimed terminal admits this reply: {terminal:?}"
+        );
+        assert!(
+            matches!(
+                terminal,
+                DirectReplyTerminal::Unarmed | DirectReplyTerminal::AvailableExact
+            ),
+            "and it is one of the two admitting classifications"
+        );
+        // (3) caller not blocked — no acknowledgement published for this incarnation
+        assert!(
+            !crate::kernel::boot::ipcreply_direct_ack::is_claimable(eidx, egen),
+            "with no live acknowledgement the caller is not blocked on its reply endpoint"
+        );
+        // All three together are the QUEUED mode's precondition. The previous package answered
+        // this state with an error; the settler routes it to the queued lane.
+        assert!(shared.free_reserved_reply_record_split(slot, generation) || true);
+    }
+
+    /// A terminal a COMPETITOR owns does not admit this reply, so the settler refuses instead of
+    /// reviving — even though the record itself is still nominally live.
+    #[test]
+    fn a_competitor_owned_terminal_does_not_admit_the_reply() {
+        let shared = shared_with_tasks();
+        let (eidx, egen, object) = make_endpoint(&shared);
+        let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(0));
+        let stranger = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), Asid(0));
+        let (slot, generation) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), object, None, None)
+            .expect("reservation");
+        assert!(shared.persist_reply_caller_cap_split(
+            slot,
+            generation,
+            crate::kernel::capabilities::CapId(7)
+        ));
+        // The cell has to be ARMED before anyone can claim it — an unarmed cell answers
+        // `NotArmed`, which is the ordinary state of a record whose caller has not yet blocked.
+        let identity = shared
+            .with(|s| s.reply_terminal_identity(slot, generation, 1, Some(1)))
+            .expect("terminal identity");
+        shared.with(|s| s.arm_reply_terminal(slot, identity));
+        // A competing claimant takes it.
+        let claim =
+            shared.claim_direct_reply_terminal_split(slot, generation, stranger, eidx, egen);
+        assert!(
+            matches!(claim, crate::kernel::boot::DirectReplyTerminalClaim::Won(_)),
+            "the competitor wins the armed cell, got {claim:?}"
+        );
+        let terminal =
+            shared.classify_direct_reply_terminal_split_read(slot, generation, replier, eidx, egen);
+        assert!(
+            !terminal.admits_direct_reply(),
+            "so this replier's terminal no longer admits it: {terminal:?}"
+        );
+        assert!(
+            shared.reply_record_externally_invokable_split_read(slot, generation),
+            "while the RECORD is still nominally live — which is exactly why the terminal has \
+             to be asked separately, and why 'live record' is not permission to revive"
+        );
+    }
+
+    /// The settler's structure, paired with the behavioural cases above rather than standing in
+    /// for them: it asks the three owners, in the order the disposition depends on, and it
+    /// reaches the queued lane through that lane's own function.
+    #[test]
+    fn the_settler_asks_the_three_owners_and_reuses_the_queued_lane() {
+        let src = include_str!("../syscall_split.rs");
+        let code: alloc::string::String = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let body = code
+            .split("fn nr7_settle_declined_transaction(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg").next())
+            .expect("the settler");
+        let authority = body
+            .find("reply_record_externally_invokable_split_read(")
+            .expect("it asks whether the authority is still usable");
+        let terminal = body
+            .find("classify_direct_reply_terminal_split_read(")
+            .expect("it asks who owns the terminal");
+        let ack = body
+            .find("ipcreply_direct_ack::is_claimable(")
+            .expect("it asks whether the caller is blocked");
+        assert!(
+            authority < terminal && terminal < ack,
+            "authority, then terminal ownership, then the acknowledgement"
+        );
+        // Refusals precede the continuation, so a settled authority can never reach the lane.
+        let refuse_settled = body
+            .find("\"authority_settled\"")
+            .expect("the settled refusal");
+        let refuse_competitor = body
+            .find("\"terminal_owned_by_competitor\"")
+            .expect("the competitor refusal");
+        let lane = body
+            .find("nr7_queued_reply_lane(")
+            .expect("it continues through the queued lane's own owner");
+        assert!(
+            refuse_settled < lane && refuse_competitor < lane,
+            "both refusals must precede the continuation, or settled authority could be revived"
+        );
+        // And the lane is REACHED, not copied: exactly one definition and two call sites.
+        assert_eq!(
+            code.matches("nr7_queued_reply_lane(").count(),
+            3,
+            "one definition, the mode-selection call, and the settler's call"
+        );
+        assert!(
+            !body.contains("commit_queued_reply_split("),
+            "the settler must not re-derive the enqueue — that is the lane's publication point"
+        );
     }
 }
