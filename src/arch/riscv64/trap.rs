@@ -280,6 +280,50 @@ fn direct_dispatch_resume_incoming(
         crate::kernel::boot::riscv_syscall_continuation_publish(cpu.0 as usize);
         crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
     }
+    // U9-IPC-RESIDUAL3 §3 — the BLOCKED-SEND completion boundary on THIS drain, which is the one
+    // a parked sender actually resumes through.
+    //
+    // U6 §8 wired this consumer into the x86_64 and AArch64 resume boundaries and into RISC-V's
+    // IN-LOCK `restore_arch_thread_state`. The RISC-V exact-token drain — the post-lock route the
+    // D2-send deferral runs, and therefore the route every committed park takes — was never given
+    // it. So the completion was published (`U6_SEND_COMPLETION_PUBLISHED ... result=0`) and then
+    // never consumed: `apply_user_context` above reinstalls the sender's PRE-BLOCK register file,
+    // whose `a0` still carries the `WouldBlock` the frame held when it parked, and the write-back
+    // — with no continuation tag published — takes the STARTUP arm and installs the argument
+    // mirror over it. Live on the full-queue witness: all twelve parks committed and completed,
+    // and all twelve callers read a failure for a message the receiver had already taken
+    // (`calls_ok=8 calls_failed=12`, the eight being the enqueues that never parked).
+    //
+    // Same owner as the other two ports (`direct_dispatch_take_send_completion_split`: class
+    // `IpcSend`, identity exact on `{tid, asid, blocked_send_generation}` from the mark token, so
+    // a replacement incarnation's completion is neither taken nor applied), and the same RISC-V
+    // lane convention the in-lock consumer uses — BOTH the result lane and the a0/a1 mirror, then
+    // the 199E-R2 continuation tag, because the write-back chooses the ABI block from that tag and
+    // from nothing else.
+    //
+    // Placed after `apply_user_context` for the reason that placement has everywhere else on this
+    // port: the restored pre-block snapshot must not be able to overwrite the canonical result.
+    // `sepc` is untouched — the bridge advanced it past the `ecall` once, at block time.
+    if let Some(done) = shared.direct_dispatch_take_send_completion_split(token) {
+        if done.result == 0 {
+            frame.set_ok(0, 0, 0);
+        } else {
+            frame.set_err(done.result as usize);
+        }
+        frame.set_user_gpr(10, done.result as usize);
+        frame.set_user_gpr(11, 0);
+        crate::yarm_log!(
+            "RISCV_BLOCKED_SEND_COMPLETION_DELIVERED tid={} class={} result={} blocked_generation={} sepc=0x{:016x} final_a0={} final_a1={} origin=post_lock_drain result=ok",
+            incoming,
+            done.syscall_class.slug(),
+            done.result,
+            done.blocked_generation,
+            frame.saved_pc() as u64,
+            frame.user_gpr(10),
+            frame.user_gpr(11)
+        );
+        crate::kernel::boot::riscv_syscall_continuation_publish(cpu.0 as usize);
+    }
     let _ = incoming;
     let idx = cpu.0 as usize;
     if idx < MAX_CPUS {
@@ -1249,10 +1293,44 @@ pub fn handle_riscv_trap_entry_shared(
         } => {
             // Parked. Write no syscall result; the D2-send drain below performs the
             // queue-advancing dispatch the transaction armed.
+            //
+            // U9-IPC-RESIDUAL3 §3 — SAVE THE PARKED SENDER'S CONTEXT, and why this bridge is the
+            // only one that has to do it here.
+            //
+            // The broad `handle_trap(Trap::Syscall, ..)` arm opens with
+            // `sync_current_thread_from_frame`, and the shared x86_64/AArch64 entry captures the
+            // entering task unconditionally before it dispatches (199D-DW2). A park that commits on
+            // the SPLIT route skips the first, and this bridge never had the second — so on RISC-V
+            // the parked caller's TCB kept whatever context an earlier trap had left in it, and the
+            // exact-token resume re-entered at that stale pc. Live on the full-queue witness: the
+            // whole park chain committed and completed correctly and the caller faulted the moment
+            // it was resumed (`unknown trap event arch_code=0xc`, an instruction page fault).
+            //
+            // That is the FOURTH time this chain has been the defect on this port — FutexWait
+            // (199G-B §2), the blocking receive, the blocking send, and NR 0's yield
+            // (U9-RESIDUAL1 §3) — and for the same structural reason each time: RISC-V pre-advances
+            // `sepc` before the dispatch, so a capture is the only thing that carries the advanced
+            // pc into the outgoing TCB, whereas the shared bridge commits it separately in
+            // `finalize_split_handled_syscall` and needs the capture for the register file alone.
+            //
+            // Placed HERE rather than beside the `PostWorkCommitted` disposition above because the
+            // park is not committed until this drain runs it: `execute_blocking_send_commit` is
+            // what publishes the block and arms the D2-send deferral, and it is what reports
+            // `SenderCommittedBlocked`. Before the drain there is only a stashed proposal, which
+            // `ImmediateReturn` may still refuse with the caller still current. The frame is still
+            // the caller's — a parked sender is given no result by the drain — and `tid` is the
+            // identity the transaction itself committed, not an ambient `current` lookup, which the
+            // block has already cleared.
+            //
+            // This is a syscall continuation, so the ordinary result-lane resume applies and
+            // `capture_user_context` is the right owner; the asynchronous-preemption tag belongs to
+            // the timer route and is deliberately not published here.
+            let captured = tid != 0 && shared.capture_outgoing_user_context_split(tid, frame);
             crate::yarm_log!(
-                "U6_BLOCKING_SEND_WRAPPER_BLOCKED arch=riscv64 cpu={} tid={} result=ok",
+                "U6_BLOCKING_SEND_WRAPPER_BLOCKED arch=riscv64 cpu={} tid={} captured={} result=ok",
                 cpu.0,
-                tid
+                tid,
+                u8::from(captured)
             );
         }
     }

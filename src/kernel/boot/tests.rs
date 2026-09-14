@@ -174976,3 +174976,144 @@ mod u9_ipc_residual3_reply_settlement {
         );
     }
 }
+
+/// U9-IPC-RESIDUAL3 §3 — **the RISC-V park resume**, and the two properties whose absence the
+/// live witness measured.
+///
+/// The park itself is architecture-neutral and was proven on x86_64 and AArch64 first. RISC-V
+/// failed it twice, in two different places, and both failures were a missing wiring rather than
+/// a wrong decision — so what is pinned here is the CONTROL FLOW each repair depends on, with the
+/// behavioural proof being the live witness itself (`proposed == committed == resumed`, three
+/// clean runs per port). A structural claim is the right instrument for exactly this: these are
+/// bridge routes no hosted build executes, and each defect was an omission that a test naming the
+/// function would have missed as thoroughly as the code did.
+///
+/// 1. **The parked sender's context was never saved.** The broad `handle_trap(Trap::Syscall, ..)`
+///    arm opens with `sync_current_thread_from_frame`, and the shared x86_64/AArch64 entry
+///    captures the entering task unconditionally (199D-DW2). A park committed on the split route
+///    reaches neither, and RISC-V pre-advances `sepc`, so the capture is the only carrier of the
+///    advanced pc. Measured: the full chain committed and completed, and the caller took an
+///    instruction page fault (`arch_code=0xc`) the instant it was resumed.
+///
+/// 2. **The completion was published and never consumed.** U6 §8 wired the class-scoped consumer
+///    into both other ports' resume boundaries and into RISC-V's IN-LOCK restore — but not into
+///    the exact-token post-lock drain, which is the route every committed park actually takes.
+///    Measured: twelve completions published with `result=0`, one consumed, and twelve callers
+///    reading a failure for a message the receiver had already taken.
+#[cfg(test)]
+mod u9_ipc_residual3_park_resume {
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    /// (1) The capture sits where the park is COMMITTED — the post-work drain's
+    /// `SenderCommittedBlocked` arm — and is keyed on the identity that disposition carries.
+    ///
+    /// Placement is the claim. Beside the `PostWorkCommitted` disposition there is only a stashed
+    /// proposal, which the drain may still refuse as `ImmediateReturn` with the caller current;
+    /// and `current` is no longer readable once the block publishes, which is why an ambient
+    /// lookup cannot stand in for the disposition's own tid.
+    #[test]
+    fn the_committed_park_saves_the_sender_context_keyed_on_the_committed_identity() {
+        let arm = RISCV_TRAP
+            .split("DispatchPostWorkDisposition::SenderCommittedBlocked {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the committed-blocked arm");
+        assert!(
+            arm.contains("shared.capture_outgoing_user_context_split(tid, frame)"),
+            "the parked sender's context must be captured, keyed on the committed tid"
+        );
+        assert!(
+            !arm.contains("current_tid"),
+            "never an ambient current lookup — the block has already cleared current"
+        );
+        assert!(
+            arm.contains("tid != 0 &&"),
+            "tid 0 is skipped for the same reason every other capture skips it"
+        );
+        // And it must not leak into the disposition arm above, where the park is not yet real.
+        let disposition_arm = RISCV_TRAP
+            .split("SplitDispatchDisposition::PostWorkCommitted {\n            finalize_syscall,\n        } = disposition\n        {")
+            .nth(1)
+            .and_then(|s| s.split("\n        }").next())
+            .expect("the post-work disposition arm");
+        assert!(
+            !disposition_arm.contains("capture_outgoing_user_context_split"),
+            "a proposal is not a park: the capture belongs to the drain that commits it"
+        );
+    }
+
+    /// (2) The exact-token drain consumes the blocked-SEND completion, and does it in the order
+    /// that makes the result survive.
+    ///
+    /// Three ordering facts, each load-bearing: the take runs AFTER `apply_user_context`, which
+    /// reinstalls the pre-block register file and would otherwise overwrite the result; it writes
+    /// BOTH the typed result lane and the a0/a1 mirror, because the two resume routes read
+    /// different ones; and it publishes the 199E-R2 continuation tag, without which the write-back
+    /// takes the STARTUP arm and installs the argument mirror over the result.
+    #[test]
+    fn the_exact_token_drain_delivers_the_blocked_send_completion() {
+        let body = RISCV_TRAP
+            .split("fn direct_dispatch_resume_incoming(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the exact-token drain");
+        let apply = body
+            .find("frame.apply_user_context(context);")
+            .expect("the restore");
+        let take = body
+            .find("shared.direct_dispatch_take_send_completion_split(token)")
+            .expect("the class-scoped, identity-exact consumer");
+        assert!(
+            apply < take,
+            "the completion must be consumed AFTER the pre-block snapshot is restored, or the \
+             restore overwrites the canonical result"
+        );
+        let tail = &body[take..];
+        assert!(
+            tail.contains("frame.set_user_gpr(10, done.result as usize);")
+                && tail.contains("frame.set_user_gpr(11, 0);"),
+            "the a0/a1 mirror is what a post-switch resume reads"
+        );
+        assert!(
+            tail.contains("frame.set_ok(0, 0, 0);") && tail.contains("frame.set_err("),
+            "and the typed result lane is what a same-task return re-derives a0 from; a success \
+             must CLEAR the error lane rather than set it"
+        );
+        let publish = tail
+            .find("riscv_syscall_continuation_publish(")
+            .expect("the 199E-R2 continuation tag");
+        let log = tail
+            .find("RISCV_BLOCKED_SEND_COMPLETION_DELIVERED")
+            .expect("the delivery marker");
+        assert!(
+            log < publish,
+            "the tag is published only after the canonical result is actually encoded"
+        );
+    }
+
+    /// The consumer is the SAME owner the other two ports use, and there is exactly one of it —
+    /// so the three bridges cannot drift on which completions a resume is allowed to take.
+    #[test]
+    fn all_three_ports_take_the_send_completion_through_one_owner() {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        const TRAP_ENTRY: &str = include_str!("../../arch/x86_64/trap.rs");
+        const AARCH64: &str = include_str!("../../arch/aarch64/trap.rs");
+        assert_eq!(
+            RUNTIME
+                .matches("pub(crate) fn direct_dispatch_take_send_completion_split(")
+                .count(),
+            1,
+            "one definition"
+        );
+        for (port, src) in [
+            ("riscv64", RISCV_TRAP),
+            ("x86_64", TRAP_ENTRY),
+            ("aarch64", AARCH64),
+        ] {
+            assert!(
+                src.contains("direct_dispatch_take_send_completion_split(token)"),
+                "{port}'s resume boundary must consume the parked send completion"
+            );
+        }
+    }
+}

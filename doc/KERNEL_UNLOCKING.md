@@ -16966,6 +16966,39 @@ reply-capability validity is checked kernel-side, where every park logs its own 
 share a one-shot. The broad producer's `U6_BLOCKING_SEND_PUBLISHED` must be **absent**, so the
 park is attributable to the split route and not to the in-lock one.
 
+**What running it on RISC-V found.** x86_64 and AArch64 were green on the first frozen tree.
+RISC-V failed twice, in two different places, and neither was a wrong decision — the park chain
+committed and completed correctly on that port from the first run. Both were missing wirings on
+the resume side, and the witness is what separated them from one another, because each produced a
+completely different symptom.
+
+| | what was missing | what the boot showed |
+|---|---|---|
+| 1 | the parked sender's context was never SAVED | the whole chain green, then `unknown trap event arch_code=0xc` the instant the caller was resumed |
+| 2 | the published completion was never CONSUMED | twelve parks, twelve `result=0` completions, and twelve callers reading a failure — `calls_ok=8 calls_failed=12` |
+
+Both have the same shape: a route the other two ports cover elsewhere. The broad
+`handle_trap(Trap::Syscall, ..)` arm opens with `sync_current_thread_from_frame`, and the shared
+x86_64/AArch64 entry captures the entering task unconditionally (199D-DW2); a park committed on
+the split route reaches neither, and RISC-V pre-advances `sepc`, so on this port a capture is the
+only thing that carries the advanced pc into the outgoing TCB. It is placed in the post-work
+drain's `SenderCommittedBlocked` arm rather than beside the `PostWorkCommitted` disposition,
+because before the drain there is only a stashed proposal that `ImmediateReturn` may still refuse
+with the caller current — a proposal is not a park. The second is narrower still: U6 §8 wired
+`direct_dispatch_take_send_completion_split` into both other ports' resume boundaries and into
+RISC-V's IN-LOCK restore, but not into its exact-token post-lock drain, which is the route every
+committed park actually takes. Same owner, same class scoping, same exact-identity check; the
+RISC-V lane convention (both the typed result lane and the a0/a1 mirror, then the 199E-R2
+continuation tag, without which the write-back installs the startup argument mirror over the
+result) is the in-lock consumer's, unchanged.
+
+This is the fourth time the save half of that chain has been the defect on this port — FutexWait
+(199G-B §2), the blocking receive, the blocking send, and NR 0's yield (U9-RESIDUAL1 §3). The
+guards in `u9_ipc_residual3_park_resume` pin the control flow each repair depends on — where the
+capture sits and on which identity, and that the consumer runs after `apply_user_context`, writes
+both lanes and publishes the tag — rather than the names of the functions involved, since the
+omission is what both defects were.
+
 ### Census
 
 **CENSUS-DELTA: 0.**
