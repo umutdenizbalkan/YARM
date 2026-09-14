@@ -120,7 +120,10 @@ pub const SYSCALL_RET_TRANSFER_CAP: usize = 2;
 pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
 pub const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
 pub const SYSCALL_RECV_META_TRANSFERRED_CAP: usize = 1 << 1;
-pub(super) const IPC_RECV_META_V2_ENCODED_LEN: usize = 40;
+// U9-RECV-FINAL: `pub(crate)` so the NR 5 probe lane can ask the SAME predicate
+// `handle_ipc_recv_result_with_empty_error` asks about the owed metadata shape. Inlining the
+// literal 40 there would be a second definition of the contract.
+pub(crate) const IPC_RECV_META_V2_ENCODED_LEN: usize = 40;
 pub const SYSCALL_VM_MAP_PROT_READ: usize = 0x1;
 pub const SYSCALL_VM_MAP_PROT_WRITE: usize = 0x2;
 pub const SYSCALL_VM_MAP_PROT_EXEC: usize = 0x4;

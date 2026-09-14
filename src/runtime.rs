@@ -7171,11 +7171,22 @@ impl SharedKernel {
     /// object, which the broad router deliberately fails closed. Each returns `Fallback` with the
     /// message still queued, so the unchanged legacy path services it — the same contract Phase A
     /// has always had for a case it cannot serve.
+    /// U9-RECV-FINAL: the request is now a PARAMETER rather than something this engine decodes.
+    ///
+    /// It used to build `RecvRequest::from_legacy_ipc_recv` itself, reading the payload pointer
+    /// and length from args 1/2 and the metadata pointer and length from args 3/4. Those are
+    /// NR 2's argument slots. NR 5 puts its timeout in arg 3 and its metadata in args 4/5, so an
+    /// NR 5 driven through that decode would have read its own timeout as a metadata pointer.
+    ///
+    /// Taking the request instead is what lets both receive syscalls share ONE delivery engine
+    /// without either of them being rewritten into the other. Each caller decodes its own ABI;
+    /// everything from planning to writeback is this function's, unchanged.
     pub(crate) fn recv_queued_split_phase_a_split(
         &self,
         cpu: CpuId,
         frame: &mut TrapFrame,
         snapshot: &EndpointRecvCapSnapshot,
+        request: &crate::kernel::recv_core::RecvRequest,
     ) -> crate::kernel::syscall::RecvQueuedSplitPhaseA {
         use crate::kernel::ipc::{Message, pack_register_payload};
         use crate::kernel::recv_core::{
@@ -7190,20 +7201,8 @@ impl SharedKernel {
         };
 
         let receiver_tid = snapshot.requester_tid;
-        // Rank 2 on the EXACT requester — never the ambient current task.
-        let is_kernel_task = self.task_asid_option_split_read(receiver_tid).is_none();
-        let recv_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-        let request = crate::kernel::recv_core::RecvRequest::from_legacy_ipc_recv(
-            receiver_tid,
-            recv_cap,
-            frame.arg(SYSCALL_ARG_PTR),
-            frame.arg(SYSCALL_ARG_LEN),
-            frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
-            frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
-            is_kernel_task,
-        );
 
-        let plan = plan_recv_core(&request);
+        let plan = plan_recv_core(request);
         crate::yarm_log!("YARM_RECV_CORE_PLAN plan={:?}", plan);
         let (kind, is_user_writeback) = match plan {
             RecvPlan::KernelPlainEligible => ("kernel_plain", false),
@@ -7276,10 +7275,10 @@ impl SharedKernel {
         let outcome = match plan {
             RecvPlan::KernelPlainEligible => map_queued_recv_outcome(result, kernel_register_plan),
             RecvPlan::UserPlainEligible => {
-                map_queued_recv_outcome(result, |_m, tid| user_memory_plan(&request, tid))
+                map_queued_recv_outcome(result, |_m, tid| user_memory_plan(request, tid))
             }
             RecvPlan::UserPlainV2Eligible => {
-                map_queued_recv_outcome(result, |_m, tid| user_memory_v2_plan(&request, tid))
+                map_queued_recv_outcome(result, |_m, tid| user_memory_v2_plan(request, tid))
             }
             RecvPlan::FallbackRequired(_) => unreachable!("fallback returned above"),
         };
@@ -8342,6 +8341,180 @@ impl SharedKernel {
     /// Returns `Some(Ok(()))` when a plain message was dequeued and the frame
     /// written; `Some(Err(e))` when the recv cap was invalid (same error as the old
     /// path); `None` for every non-split-eligible case (fall back to global lock).
+    /// U9-RECV-FINAL — NR 5's NON-BLOCKING probe (`timeout_ticks == 0`), through the same
+    /// delivery engine NR 2's immediate lane uses.
+    ///
+    /// # Why this lane existed as a residual at all
+    ///
+    /// The blocking route refuses it by name — `reason=not_timed_recv` — because a probe never
+    /// parks, so it is not that route's business. Nothing else claimed it, so every NR 5 with a
+    /// zero timeout reached the terminal broad acquisition. On an ordinary boot this was the only
+    /// receive still doing so on any port.
+    ///
+    /// # The ABI is NR 5's, not NR 2's
+    ///
+    /// `timeout_ticks` is arg 3 — exactly the slot NR 2 uses for its recv-v2 metadata POINTER.
+    /// Driving this through NR 2's decode would read a timeout as a pointer. So the request is
+    /// built by `RecvRequest::from_ipc_recv_timeout`, NR 5's own builder, and the syscall number
+    /// in the frame is never rewritten.
+    ///
+    /// The metadata shape is taken from args 4/5, which is where NR 5's own immediate-success
+    /// owner `handle_ipc_recv_result_with_empty_error` reads it
+    /// (`meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN`). `from_ipc_recv_timeout`
+    /// hard-codes `RecvMetaTarget::None`, which is a PLANNING artifact that never reaches a
+    /// writeback; the blocking route already derives the owed shape from the same predicate for
+    /// exactly this reason. Which shape a receive owes is the caller's arguments to decide, not
+    /// the syscall number's.
+    ///
+    /// # What it must not do
+    ///
+    /// Never park, never arm a deadline, never commit a queue advance. An empty endpoint is
+    /// answered `WouldBlock` — the error NR 5's own result owner passes as `empty_error` for a
+    /// `NoWait` request — and the caller returns through its own frame with nothing published.
+    ///
+    /// # What it preserves
+    ///
+    /// The engine's own order: dequeue and two-phase refill in one rank-3 acquisition, capability
+    /// materialization, THEN the sender wake, THEN the user writeback. A probe that frees a slot
+    /// for a parked sender therefore refills, publishes and wakes in the same order the broad
+    /// path does — which matters because the park witness's drainer polls with exactly this
+    /// syscall.
+    pub fn try_split_ipc_recv_timeout_probe_into_frame(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+    ) -> Option<Result<(), TrapHandleError>> {
+        use crate::kernel::recv_core::{RecvMetaTarget, RecvRequest};
+        use crate::kernel::syscall::{
+            IPC_RECV_META_V2_ENCODED_LEN, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0,
+            SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR,
+            SYSCALL_ARG_TRANSFER_CAP,
+        };
+
+        // NR 5's timeout lane, and only it. A non-zero timeout is the blocking route's.
+        if frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64 != 0 {
+            return None;
+        }
+        let Some(requester_tid) = self.current_tid_authoritative(cpu) else {
+            return None;
+        };
+
+        // The canonical handler consumes the per-CPU pre-read deadline UNCONDITIONALLY, before
+        // it classifies the request. Staging only happens for a non-zero timeout, so there is
+        // normally nothing here — but leaving a value behind would hand it to the next NR 5 on
+        // this CPU, and parity is cheaper than reasoning about when that can happen.
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+            let _ = crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+                .swap(0, core::sync::atomic::Ordering::AcqRel);
+        }
+
+        // Validation order, as `handle_ipc_recv_timeout` asks it: the receive capability first,
+        // resolved and live, before anything about the payload is looked at. A resolution failure
+        // is the error the broad path raises identically, so it is ANSWERED, not declined.
+        let recv_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+        let snapshot = match self.resolve_endpoint_recv_cap_split_read(requester_tid, recv_cap) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                return Some(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::from(e),
+                )));
+            }
+        };
+
+        let is_kernel_task = self.task_asid_option_split_read(requester_tid).is_none();
+        let mut request = RecvRequest::from_ipc_recv_timeout(
+            requester_tid,
+            recv_cap,
+            frame.arg(SYSCALL_ARG_PTR),
+            frame.arg(SYSCALL_ARG_LEN),
+            0,
+            None,
+            is_kernel_task,
+        );
+        // The owed METADATA shape, from NR 5's own slots. A kernel-register receiver is left
+        // alone: it has no address space to copy a struct into, and the planner refuses that
+        // combination rather than inventing one.
+        let meta_ptr = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1);
+        let meta_len = frame.arg(SYSCALL_ARG_TRANSFER_CAP);
+        if !is_kernel_task && meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN {
+            request.meta_target = RecvMetaTarget::V2 {
+                ptr: meta_ptr,
+                len: meta_len,
+            };
+        }
+
+        let phase_a = self.recv_queued_split_phase_a_split(cpu, frame, &snapshot, &request);
+        match phase_a {
+            // Nothing to take, or a shape this engine does not serve. The EMPTY case is this
+            // lane's to answer; the rest stay residual and are counted by the family entry.
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback => {
+                // The engine declines for several reasons; only an EMPTY buffered endpoint is
+                // this lane's to answer. The would-block read is the same rank-3 structural
+                // question the blocking route asks, so the two agree on what "nothing to take"
+                // means.
+                let empty = match snapshot.endpoint {
+                    CapObject::Endpoint { index, generation } => {
+                        self.recv_would_block_split_read(index, generation)
+                    }
+                    _ => false,
+                };
+                if empty {
+                    // THE EMPTY-RESULT ENCODING, and it is not an error return.
+                    //
+                    // `handle_ipc_recv_result_with_empty_error`'s `None` arm sets the frame's
+                    // error lane to the empty error and the transfer-cap return lane to the
+                    // no-transfer sentinel, then answers the SYSCALL with `Ok(())`. Returning
+                    // `Err(WouldBlock)` instead would let the dispatcher encode the error its own
+                    // way and would leave the transfer-cap lane unwritten — a receiver that reads
+                    // it would see whatever the previous syscall left there.
+                    //
+                    // `WouldBlock` and not `TimedOut`: the canonical handler passes `TimedOut`
+                    // only when a deadline actually elapsed, which a probe has none to elapse.
+                    frame.set_err(crate::kernel::syscall::SyscallError::WouldBlock.code());
+                    if crate::kernel::syscall::recv_boundary_encode_transfer_cap_ret(frame, None)
+                        .is_err()
+                    {
+                        return Some(Err(TrapHandleError::Syscall(
+                            crate::kernel::syscall::SyscallError::Internal,
+                        )));
+                    }
+                    crate::yarm_log!(
+                        "IPC_RECV_PROBE_SPLIT_EMPTY cpu={} tid={} err=WouldBlock parked=0 deadline_armed=0 advances=0 result=ok",
+                        cpu.0,
+                        requester_tid
+                    );
+                    return Some(Ok(()));
+                }
+                None
+            }
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::Completed(r) => {
+                crate::yarm_log!(
+                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} result=completed",
+                    cpu.0,
+                    requester_tid
+                );
+                Some(r)
+            }
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingUserCopy(pending) => {
+                crate::yarm_log!(
+                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} result=user_copy",
+                    cpu.0,
+                    requester_tid
+                );
+                Some(self.complete_recv_boundary_user_copy(cpu, frame, &pending))
+            }
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingOrdinaryCapUserCopy(pending) => {
+                crate::yarm_log!(
+                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} result=ordinary_cap",
+                    cpu.0,
+                    requester_tid
+                );
+                Some(self.complete_recv_boundary_ordinary_cap(cpu, frame, pending))
+            }
+        }
+    }
+
     pub fn try_split_ipc_recv_queued_plain_into_frame(
         &self,
         cpu: CpuId,
@@ -8420,7 +8593,21 @@ impl SharedKernel {
         // `current_task_has_user_asid` classified the receiver correctly (the Stage 160 parity
         // fix). The receiver class is now read from `snapshot.requester_tid` — the authoritative
         // TID resolved above — so there is no ambient reader left to bind a CPU for.
-        let phase_a = self.recv_queued_split_phase_a_split(cpu, frame, &snapshot);
+        // U9-RECV-FINAL: NR 2's OWN ABI decode, moved out of the shared engine and left
+        // byte-for-byte what it was — payload at args 1/2, recv-v2 metadata at args 3/4.
+        let is_kernel_task = self
+            .task_asid_option_split_read(snapshot.requester_tid)
+            .is_none();
+        let request = crate::kernel::recv_core::RecvRequest::from_legacy_ipc_recv(
+            snapshot.requester_tid,
+            recv_cap,
+            frame.arg(crate::kernel::syscall::SYSCALL_ARG_PTR),
+            frame.arg(crate::kernel::syscall::SYSCALL_ARG_LEN),
+            frame.arg(crate::kernel::syscall::SYSCALL_ARG_INLINE_PAYLOAD0),
+            frame.arg(crate::kernel::syscall::SYSCALL_ARG_INLINE_PAYLOAD1),
+            is_kernel_task,
+        );
+        let phase_a = self.recv_queued_split_phase_a_split(cpu, frame, &snapshot, &request);
         let result = match phase_a {
             crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback => None,
             crate::kernel::syscall::RecvQueuedSplitPhaseA::Completed(r) => Some(r),

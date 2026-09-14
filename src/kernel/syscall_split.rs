@@ -1760,14 +1760,26 @@ fn try_split_recv_recognized(
         }
     }
 
-    // (4) The IMMEDIATE lane, for NR 2. NR 5 decodes its arguments differently — its metadata
-    // pointer and length live in the slots NR 2 uses for the inline payload — so feeding it to
-    // NR 2's request builder would plan the wrong shape. Its own immediate delivery is settled
-    // below.
-    if matches!(Syscall::decode(frame.syscall_num()), Ok(Syscall::IpcRecv))
-        && let Some(result) = try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame)
-    {
-        return Some(D::Complete(result));
+    // (4) The IMMEDIATE lanes, one per syscall, because the two decode DIFFERENT argument
+    // slots. NR 5 carries its timeout in arg 3 — the slot NR 2 uses for its recv-v2 metadata
+    // pointer — so each builds its own `RecvRequest` and both drive the same delivery engine.
+    // Neither rewrites the frame's syscall number into the other's.
+    match Syscall::decode(frame.syscall_num()) {
+        Ok(Syscall::IpcRecv) => {
+            if let Some(result) = try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame) {
+                return Some(D::Complete(result));
+            }
+        }
+        Ok(Syscall::IpcRecvTimeout) => {
+            // The NON-BLOCKING probe. The blocking lane above refuses it by name
+            // (`reason=not_timed_recv`) because a probe never parks, and until this lane existed
+            // nothing else claimed it — so every `timeout_ticks == 0` receive reached the
+            // terminal broad acquisition, on every port.
+            if let Some(result) = shared.try_split_ipc_recv_timeout_probe_into_frame(cpu, frame) {
+                return Some(D::Complete(result));
+            }
+        }
+        _ => {}
     }
 
     // (5) Not yet owned pre-lock. Named and counted by the entry above.
