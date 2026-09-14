@@ -176279,3 +176279,196 @@ mod u9_recv_final_probe_parity {
         );
     }
 }
+
+/// U9-RECV-FINAL — **the boot chain that must not depend on broad-dispatch traffic.**
+///
+/// Two of the things hooked to `handle_trap_event`'s syscall and timer arms are not diagnostics,
+/// and the distinction was traced rather than taken from their names:
+///
+/// * `maybe_run_unlock_graduated_proof` runs a real D3 scratch transaction — create an address
+///   space, allocate a memory object, map, verify, unmap, release both leaf capabilities, destroy
+///   — bracketed by a PT-pool leak check, and ends by calling
+///   `set_unlock_graduated_proof_completed()`, which is the ORDERING GATE
+///   `maybe_run_x86_smp_unlock_audit` requires before `ap_scheduler_online_admission`. A boot
+///   where it never runs is a boot where APs can never be admitted.
+/// * `maybe_run_cross_arch_live_audit` reads topology counts and emits markers. No mutation, and
+///   a core-smoke requirement.
+///
+/// Unlocking removes the terminal acquisition family by family, so anything hooked to it starves.
+/// Both now run from boot ownership points that ALREADY hold their reference, so the census is
+/// unchanged; each keeps its one-shot latch, so the trap-path drivers can still serve a boot that
+/// does reach them, and neither can run twice.
+#[cfg(test)]
+mod u9_recv_final_boot_chain {
+    const ORCH: &str = include_str!("orchestrator_state.rs");
+    const X86: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    /// Comments stripped: these guards are about what the code DOES, and the prose in this very
+    /// module names the calls it describes — a checker that cannot tell the two apart counts a
+    /// doc comment as a second setter, which is exactly what it did the first time.
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} is missing"));
+        let open = src[start..].find('{').expect("a body") + start;
+        let bytes = src.as_bytes();
+        let (mut depth, mut i) = (0usize, open);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("{signature} has an unbalanced body");
+    }
+
+    /// The required work runs from a boot ownership point on EVERY port, and the completion flag
+    /// that gates AP admission is set there — not wherever a trap happens to land.
+    #[test]
+    fn the_graduated_proof_runs_from_bootstrap_on_every_port() {
+        for (port, src) in [("x86_64", X86), ("aarch64", AARCH64), ("riscv64", RISCV)] {
+            assert!(
+                src.contains(
+                    "kernel.run_unlock_graduated_proof_at_bootstrap(RING3_INIT_SERVER_TID)"
+                ),
+                "{port} must drive the graduated proof from bootstrap"
+            );
+        }
+        // The completion flag still means the work COMPLETED: it is set inside the proof body,
+        // after the scratch check and the verdict, and nowhere else.
+        assert_eq!(
+            code_of(ORCH)
+                .matches("set_unlock_graduated_proof_completed()")
+                .count(),
+            1,
+            "the completion flag must have exactly one setter"
+        );
+        let body = body_of(ORCH, "fn run_unlock_graduated_proof_with(");
+        let d3 = body
+            .find("unlock_graduated_d3_scratch_check(cnode)")
+            .expect("the scratch transaction");
+        let flag = body
+            .find("set_unlock_graduated_proof_completed()")
+            .expect("the completion flag");
+        assert!(
+            d3 < flag,
+            "the flag must be set AFTER the scratch transaction, never before"
+        );
+    }
+
+    /// **The mint target and the release target are the same cnode.** The scratch check mints
+    /// through `create_user_address_space` / `alloc_anonymous_memory_object`, which use the
+    /// CURRENT task's cspace, and releases from the cnode it is handed. Handing it a different
+    /// task's cnode made it mint into one cspace and delete from another — measured live as
+    /// `mem_leaf=false aspace_leaf=false mo_leak=true`, a memory object never released.
+    #[test]
+    fn the_bootstrap_driver_uses_the_cnode_the_mint_actually_targets() {
+        let body = body_of(ORCH, "fn run_unlock_graduated_proof_at_bootstrap(");
+        assert!(
+            body.contains("self.current_task_cnode()"),
+            "the bootstrap driver must resolve the CURRENT cnode"
+        );
+        assert!(
+            !body.contains("self.task_cnode("),
+            "a named task's cnode is not where the scratch capabilities are minted"
+        );
+    }
+
+    /// One policy: both drivers share the latch and the body, so the scratch transaction cannot
+    /// run twice and cannot drift into two implementations.
+    #[test]
+    fn the_two_drivers_share_one_latch_and_one_body() {
+        for driver in [
+            "fn run_unlock_graduated_proof_at_bootstrap(",
+            "fn maybe_run_unlock_graduated_proof(",
+        ] {
+            let body = body_of(ORCH, driver);
+            assert!(
+                body.contains("unlock_graduated_proof_try_start()"),
+                "{driver} must claim the shared one-shot latch"
+            );
+            assert!(
+                body.contains("self.run_unlock_graduated_proof_with("),
+                "{driver} must delegate to the one body"
+            );
+        }
+        assert_eq!(
+            code_of(ORCH)
+                .matches("fn run_unlock_graduated_proof_with(")
+                .count(),
+            1,
+            "exactly one proof body"
+        );
+        for driver in [
+            "fn run_cross_arch_live_audit_at_first_dispatch(",
+            "fn maybe_run_cross_arch_live_audit(",
+        ] {
+            let body = body_of(ORCH, driver);
+            assert!(
+                body.contains("cross_arch_live_audit_try_start()"),
+                "{driver} must claim the shared one-shot latch"
+            );
+            assert!(
+                body.contains("self.cross_arch_live_audit_body("),
+                "{driver} must delegate to the one body"
+            );
+        }
+        assert_eq!(
+            code_of(ORCH)
+                .matches("fn cross_arch_live_audit_body(")
+                .count(),
+            1,
+            "exactly one audit body"
+        );
+    }
+
+    /// **No acquisition was added.** The relocation reuses references the boot already holds: the
+    /// graduated proof takes `&mut KernelState` from `bootstrap_first_user_task`, and the
+    /// read-only audit takes `&KernelState` from the first-dispatch entry. Neither driver opens a
+    /// broad acquisition, and the read-only one cannot — its receiver is shared.
+    #[test]
+    fn neither_driver_opens_a_broad_acquisition() {
+        for driver in [
+            "fn run_unlock_graduated_proof_at_bootstrap(",
+            "fn run_cross_arch_live_audit_at_first_dispatch(",
+        ] {
+            let body = body_of(ORCH, driver);
+            for broad in ["with_cpu(", "self.with(|", ".with(|state"] {
+                assert!(
+                    !body.contains(broad),
+                    "{driver} must not open a broad acquisition ({broad})"
+                );
+            }
+        }
+        assert!(
+            ORCH.contains("fn run_cross_arch_live_audit_at_first_dispatch(&self, tid: u64)"),
+            "the read-only audit must take a SHARED reference, so it cannot mutate or acquire"
+        );
+        assert!(
+            ORCH.contains("fn cross_arch_live_audit_body(&self, tid: u64)"),
+            "and its body likewise"
+        );
+        for (port, src) in [("x86_64", X86), ("aarch64", AARCH64), ("riscv64", RISCV)] {
+            assert!(
+                src.contains("kernel.run_cross_arch_live_audit_at_first_dispatch(tid)"),
+                "{port} must drive the live audit at first dispatch"
+            );
+        }
+    }
+}
