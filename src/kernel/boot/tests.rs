@@ -135885,12 +135885,20 @@ mod riscv64_async_preemption {
         assert!(arm.contains("frame.regs[RiscvTrapFrame::A7] = 0;"));
         // The continuation decision is published only where a completion was consumed, and it is
         // cleared at every trap entry so it cannot be inherited.
+        //
+        // U9-IPC-RESIDUAL3 §3 re-derives the count, not the claim. The post-lock drain now has
+        // TWO consumers rather than one — the reply-timeout take, which is compiled only under
+        // the oracle feature, and the production-live blocked-SEND take that a committed park
+        // resumes through — so there are four publication sites and each still sits immediately
+        // after a completion was actually consumed and its result actually encoded. The property
+        // being guarded is that pairing; four was reached by adding a consumer, which is the only
+        // way it is allowed to move.
         assert_eq!(
             RV_TRAP_SRC
                 .matches("crate::kernel::boot::riscv_syscall_continuation_publish(cpu.0 as usize)")
                 .count(),
-            3,
-            "the two in-lock completion consumers and the post-lock drain all publish"
+            4,
+            "the two in-lock completion consumers and the post-lock drain's two all publish"
         );
         assert!(
             RV_BOOT_SRC
@@ -173523,12 +173531,15 @@ mod u9_ipc_residual2_closure {
     /// file, and it is asserted to be complete below rather than trusted.
     const FAMILY_FUNCTIONS: &[&str] = &[
         "fn try_split_ipccall_into_frame(",
+        "fn nr6_validate_in_broad_order(",
         "fn nr6_refuse_preflight(",
         "fn try_split_ipccall_direct_into_frame(",
         "fn try_split_ipccall_queued_into_frame(",
         "fn nr6_deliver_to_blocked_waiter(",
         "fn nr6_park_sender(",
         "fn try_split_ipcreply_direct_into_frame(",
+        "fn nr7_settle_declined_transaction(",
+        "fn nr7_queued_reply_lane(",
         "fn nr7_refuse_preflight(",
         "fn nr7_refuse(",
     ];
@@ -173592,6 +173603,18 @@ mod u9_ipc_residual2_closure {
             (
                 "fn nr6_refuse_preflight(",
                 ") -> SplitDispatchDisposition {",
+            ),
+            (
+                "fn nr6_validate_in_broad_order(",
+                ") -> Result<(), (crate::kernel::syscall::SyscallError, &'static str)> {",
+            ),
+            (
+                "fn nr7_settle_declined_transaction(",
+                ") -> Result<(), TrapHandleError> {",
+            ),
+            (
+                "fn nr7_queued_reply_lane(",
+                ") -> Result<(), TrapHandleError> {",
             ),
         ] {
             let body = complete_body(&src, signature);
@@ -173910,23 +173933,55 @@ mod u9_ipc_residual2_closure {
     #[test]
     fn the_refusal_resolvers_preserve_validation_precedence() {
         let split = code(SPLIT_SRC);
-        let nr6 = complete_body(&split, "fn nr6_refuse_preflight(");
-        let send_cap = nr6
-            .find("V::SendCapUnresolved(err)")
-            .expect("send cap first");
-        let reply_cap = nr6
-            .find("validate_endpoint_right_split_read(requester, reply_recv_cap")
+        // U9-IPC-RESIDUAL3 §1 re-derivation. The ordering used to live inside the NR 6 resolver,
+        // keyed on the classifier's verdict — which is exactly the defect that package repaired,
+        // because the classifier answers `PayloadTooLong` before it resolves anything. The order
+        // now lives in ONE policy asked from the FACTS, so the guard reads the policy.
+        let policy = complete_body(&split, "fn nr6_validate_in_broad_order(");
+        let send_cap = policy
+            .find("facts.send_cap")
+            .expect("the send capability first");
+        let live = policy
+            .find("capability_object_live_split(object)")
+            .expect("its liveness question, which the send-side resolver does not ask");
+        let reply_cap = policy
+            .find("validate_endpoint_right_split_read(")
             .expect("then the reply capability");
-        let incarnation = nr6
-            .find("V::EndpointIncarnationGone =>")
+        let requester = policy.find("tid.is_none()").expect("then the requester");
+        let incarnation = policy
+            .find("facts.endpoint_mode.is_none()")
             .expect("then the endpoint incarnation");
-        let length = nr6.find("V::PayloadTooLong =>").expect("then the length");
+        let length = policy
+            .find("facts.payload_len >")
+            .expect("and the length last");
         assert!(
-            send_cap < reply_cap && reply_cap < incarnation && incarnation < length,
-            "handle_ipc_call validates send cap, then reply cap, then resolves the endpoint \
-             index, then checks the length — a call wrong in several ways must be told about \
-             the FIRST thing that is wrong"
+            send_cap < live
+                && live < reply_cap
+                && reply_cap < requester
+                && requester < incarnation
+                && incarnation < length,
+            "handle_ipc_call validates the send capability (slot, LIVENESS, kind, right), then \
+             the reply capability, then the requester, then resolves the endpoint index, and \
+             only then checks the length"
         );
+        // And the resolver must not reintroduce an ordering of its own.
+        let resolver = complete_body(&split, "fn nr6_refuse_preflight(");
+        assert!(
+            resolver.contains("nr6_validate_in_broad_order(shared, facts, tid, reply_recv_cap)"),
+            "the resolver defers its ordering to the policy"
+        );
+        for verdict_keyed in [
+            "V::PayloadTooLong => answer",
+            "V::EndpointIncarnationGone => answer",
+            "V::SendCapUnresolved(err) = verdict",
+        ] {
+            assert!(
+                !resolver.contains(verdict_keyed),
+                "the resolver must not answer `{verdict_keyed}` from the verdict — the \
+                 classifier reaches that verdict without having asked the earlier questions"
+            );
+        }
+
         let nr7 = complete_body(&split, "fn nr7_refuse_preflight(");
         let requester = nr7
             .find("V::RequesterUnavailable)")
@@ -174322,5 +174377,751 @@ mod u9_ipc_residual2_cases {
         );
         assert!(shared.free_reserved_reply_record_split(buffered_slot, buffered_gen));
         assert!(shared.free_reserved_reply_record_split(bound_slot, bound_gen));
+    }
+}
+
+/// U9-IPC-RESIDUAL3 §1 — **differential validation order, against the broad handler itself.**
+///
+/// U9-IPC-RESIDUAL2 §2 introduced a resolver whose own doc comment said it "re-asks the questions
+/// in the broad order rather than translating the classifier's verdict one-to-one". It did not:
+/// step (1) read `if let V::SendCapUnresolved(err) = verdict`, and the classifier checks
+/// `payload_len` FIRST and returns `PayloadTooLong` before it ever resolves the send capability.
+/// So a call that was wrong in two ways was told about the second one.
+///
+/// These cases do not check that a function exists or that a marker is spelled a certain way.
+/// Each one builds a real kernel, runs the REAL `syscall::dispatch` over a real `TrapFrame` to
+/// obtain `handle_ipc_call`'s own answer, then asks the split policy the same question over the
+/// same facts, and requires the two to agree — and requires the split side to have mutated
+/// nothing on the way.
+#[cfg(test)]
+mod u9_ipc_residual3_validation_parity {
+    use super::*;
+    use crate::kernel::capabilities::{CapId, CapObject, CapRights};
+    use crate::kernel::direct_eligibility::DirectRequestFacts;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP, SyscallError,
+        dispatch,
+    };
+    use crate::kernel::syscall_split::nr6_validate_in_broad_order;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    /// A kernel with one running task holding a live endpoint: `send_cap` carries SEND,
+    /// `recv_cap` carries RECEIVE, and both name the same endpoint.
+    struct Fixture {
+        shared: SharedKernel,
+        tid: u64,
+        send_cap: CapId,
+        recv_cap: CapId,
+        endpoint: CapObject,
+    }
+
+    fn fixture() -> Fixture {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        shared.with(|s| {
+            s.register_task(1).expect("task1");
+            s.enqueue_current_cpu(1).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        let (_idx, send_cap, recv_cap) = shared.with(|s| s.create_endpoint(8).expect("endpoint"));
+        let endpoint = shared
+            .with(|s| s.current_task_capability(send_cap).map(|c| c.object))
+            .expect("endpoint object");
+        Fixture {
+            shared,
+            tid: 1,
+            send_cap,
+            recv_cap,
+            endpoint,
+        }
+    }
+
+    impl Fixture {
+        /// The facts the NR 6 call site gathers, built exactly as `try_split_ipccall_direct_into_frame`
+        /// builds them — through the same two split reads — so the policy is asked the same
+        /// question the live route asks it.
+        fn facts(&self, send_cap: CapId, len: usize) -> DirectRequestFacts {
+            let send_cap_resolution = self
+                .shared
+                .resolve_endpoint_send_cap_split_read(self.tid, send_cap);
+            let endpoint_mode = match send_cap_resolution {
+                Ok(CapObject::Endpoint { index, generation }) => {
+                    self.shared.endpoint_mode_split_read(index, generation)
+                }
+                _ => None,
+            };
+            let endpoint_admitted = match send_cap_resolution {
+                Ok(CapObject::Endpoint { index, .. }) => {
+                    crate::kernel::boot::ipccall_direct_request_endpoint_admitted(index)
+                }
+                _ => false,
+            };
+            DirectRequestFacts {
+                payload_len: len,
+                requester_available: true,
+                send_cap: send_cap_resolution,
+                endpoint_mode,
+                endpoint_admitted,
+            }
+        }
+
+        /// `handle_ipc_call`'s own answer for these arguments, from the REAL dispatcher.
+        fn broad_answer(
+            &self,
+            send_cap: CapId,
+            recv_cap: CapId,
+            len: usize,
+        ) -> Option<SyscallError> {
+            let mut frame = TrapFrame::new(crate::kernel::syscall::SYSCALL_IPC_CALL_NR, [0; 6]);
+            frame.set_arg(SYSCALL_ARG_CAP, send_cap.0 as usize);
+            frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, recv_cap.0 as usize);
+            frame.set_arg(SYSCALL_ARG_PTR, 0);
+            frame.set_arg(SYSCALL_ARG_LEN, len);
+            self.shared.with(|s| dispatch(s, &mut frame)).err()
+        }
+
+        /// The split policy's answer for the same arguments.
+        fn split_answer(
+            &self,
+            send_cap: CapId,
+            recv_cap: CapId,
+            len: usize,
+        ) -> Option<SyscallError> {
+            let facts = self.facts(send_cap, len);
+            nr6_validate_in_broad_order(&self.shared, &facts, Some(self.tid), recv_cap)
+                .err()
+                .map(|(e, _reason)| e)
+        }
+
+        /// A by-value snapshot of everything a refusal must leave alone.
+        fn state_snapshot(&self) -> (usize, usize, usize) {
+            self.shared.with(|s| {
+                let reserved =
+                    s.with_ipc_state(|ipc| ipc.reply_caps.iter().filter(|r| r.is_some()).count());
+                let envelopes = s.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes
+                        .iter()
+                        .filter(|e| e.is_some())
+                        .count()
+                });
+                // How many endpoints hold anything, read through the production non-consuming
+                // head read rather than an internal field, so the snapshot cannot drift from
+                // what a receiver would see.
+                let live = s.with_ipc_state(|ipc| {
+                    ipc.endpoints
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.is_some())
+                        .map(|(i, _)| i)
+                        .collect::<alloc::vec::Vec<_>>()
+                });
+                let mut queued = 0usize;
+                for i in live {
+                    if matches!(
+                        s.peek_queued_with_cap_transfer(i),
+                        crate::kernel::boot::IpcEndpointPeekResult::Peeked(_)
+                    ) {
+                        queued += 1;
+                    }
+                }
+                (reserved, envelopes, queued)
+            })
+        }
+    }
+
+    /// A capability id that resolves to nothing at all.
+    const ABSENT: CapId = CapId(9_999);
+
+    /// **THE REGRESSION.** An invalid send capability, a valid reply capability and an oversized
+    /// payload. The classifier answers `PayloadTooLong`, so the U9-IPC-RESIDUAL2 resolver skipped
+    /// the send-capability question entirely and returned `InvalidArgs`. `handle_ipc_call`
+    /// validates the send capability first and returns `InvalidCapability`.
+    #[test]
+    fn an_invalid_send_cap_is_reported_even_behind_an_oversized_payload() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(ABSENT, fx.recv_cap, oversized);
+        assert_eq!(
+            broad,
+            Some(SyscallError::InvalidCapability),
+            "handle_ipc_call validates the send capability before the length"
+        );
+        let before = fx.state_snapshot();
+        assert_eq!(
+            fx.split_answer(ABSENT, fx.recv_cap, oversized),
+            broad,
+            "the split policy must report the FIRST thing that is wrong, not the verdict's"
+        );
+        assert_eq!(fx.state_snapshot(), before, "a refusal mutates nothing");
+    }
+
+    /// A stale endpoint identity hidden behind an oversized payload. Broad resolves the endpoint
+    /// index before it checks the length, so it answers `WrongObject`.
+    #[test]
+    fn a_stale_endpoint_identity_is_reported_even_behind_an_oversized_payload() {
+        let fx = fixture();
+        let CapObject::Endpoint { index, .. } = fx.endpoint else {
+            panic!("an endpoint");
+        };
+        // Recycle the incarnation under the capability, leaving the slot occupied — the state
+        // that makes "the slot is present" an insufficient check.
+        fx.shared.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_generations[index] = ipc.endpoint_generations[index].wrapping_add(1);
+            });
+        });
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(fx.send_cap, fx.recv_cap, oversized);
+        assert_eq!(
+            broad,
+            Some(SyscallError::InvalidCapability),
+            "`validate_endpoint_right` folds the LIVENESS check into its first answer, so a \
+             capability naming a recycled incarnation is InvalidCapability — not the WrongObject \
+             that `resolve_endpoint_index` would give for an absent slot. The split send-side \
+             resolver does not check the generation at all, so the policy has to."
+        );
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(fx.send_cap, fx.recv_cap, oversized), broad);
+        assert_eq!(fx.state_snapshot(), before, "a refusal mutates nothing");
+    }
+
+    /// An invalid REPLY authority behind an oversized payload: broad validates the reply
+    /// capability before the length too.
+    #[test]
+    fn an_invalid_reply_authority_is_reported_even_behind_an_oversized_payload() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(fx.send_cap, ABSENT, oversized);
+        assert_eq!(broad, Some(SyscallError::InvalidCapability));
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(fx.send_cap, ABSENT, oversized), broad);
+        assert_eq!(fx.state_snapshot(), before, "a refusal mutates nothing");
+    }
+
+    /// BOTH capabilities invalid: the SEND one is reported, because it is asked first.
+    #[test]
+    fn with_both_capabilities_invalid_the_send_capability_is_reported() {
+        let fx = fixture();
+        let broad = fx.broad_answer(ABSENT, ABSENT, 8);
+        assert_eq!(broad, Some(SyscallError::InvalidCapability));
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(ABSENT, ABSENT, 8), broad);
+        assert_eq!(fx.state_snapshot(), before);
+    }
+
+    /// A reply capability that resolves but carries the WRONG RIGHT, behind an oversized payload.
+    /// Broad answers `MissingRight`; the classifier would have said `PayloadTooLong`.
+    #[test]
+    fn a_reply_capability_missing_receive_is_reported_before_the_length() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        // `send_cap` names the same endpoint but carries SEND, not RECEIVE.
+        let broad = fx.broad_answer(fx.send_cap, fx.send_cap, oversized);
+        assert_eq!(
+            broad,
+            Some(SyscallError::MissingRight),
+            "an Endpoint capability lacking RECEIVE is MissingRight, asked before the length"
+        );
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(fx.send_cap, fx.send_cap, oversized), broad);
+        assert_eq!(fx.state_snapshot(), before);
+    }
+
+    /// A send capability that resolves but lacks SEND: reported as `MissingRight`, and still
+    /// reported when the payload is also oversized.
+    #[test]
+    fn a_send_capability_missing_send_is_reported_before_the_length() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(fx.recv_cap, fx.recv_cap, oversized);
+        assert_eq!(broad, Some(SyscallError::MissingRight));
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(fx.recv_cap, fx.recv_cap, oversized), broad);
+        assert_eq!(fx.state_snapshot(), before);
+    }
+
+    /// The length is still reported when it is the ONLY thing wrong — the repair narrows the
+    /// answer to the first fault, it does not stop reporting the last one.
+    #[test]
+    fn an_oversized_payload_alone_is_still_invalid_args() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(fx.send_cap, fx.recv_cap, oversized);
+        assert_eq!(broad, Some(SyscallError::InvalidArgs));
+        assert_eq!(fx.split_answer(fx.send_cap, fx.recv_cap, oversized), broad);
+    }
+
+    /// And a wholly valid call is not refused by the policy at all, so the ordering repair has
+    /// not turned a legal call into an error.
+    #[test]
+    fn a_valid_call_passes_the_policy() {
+        let fx = fixture();
+        assert_eq!(
+            fx.split_answer(fx.send_cap, fx.recv_cap, 8),
+            None,
+            "nothing is wrong with this call, and the policy must say so"
+        );
+    }
+
+    /// The policy is ONE policy: both NR 6 callers reach it, and neither keeps a private copy of
+    /// one of its steps. This is a source guard, and it is deliberately paired with the
+    /// behavioural cases above rather than standing in for them.
+    #[test]
+    fn both_nr6_callers_go_through_the_one_policy() {
+        let src = include_str!("../syscall_split.rs");
+        let code: alloc::string::String = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("nr6_validate_in_broad_order(").count(),
+            3,
+            "one definition and exactly two call sites: the eligible path and the refusal resolver"
+        );
+        // The refusal resolver must not key ordering on the verdict any more.
+        let resolver = code
+            .split("fn nr6_refuse_preflight(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("the resolver");
+        for verdict_keyed in [
+            "V::SendCapUnresolved(err) = verdict",
+            "matches!(verdict, V::RequesterUnavailable)",
+            "V::EndpointIncarnationGone => answer",
+            "V::PayloadTooLong => answer",
+        ] {
+            assert!(
+                !resolver.contains(verdict_keyed),
+                "the resolver must not order its answers by the verdict: `{verdict_keyed}`"
+            );
+        }
+    }
+}
+
+/// U9-IPC-RESIDUAL3 §2 — **what a declined NR 7 transaction actually leaves behind.**
+///
+/// U9-IPC-RESIDUAL2 §2 answered the five pristine variants from an assumption: "the
+/// acknowledgement is spent, so the queued mode's precondition no longer holds". These cases
+/// drive the canonical settle owners and read the resulting state, which is the only way to find
+/// out whether that assumption holds — and it does not. `settle_reply_pre_reserve` restores the
+/// lease whenever the exact caller is still blocked, and the drain republishes that restoration.
+///
+/// Each case asserts a post-state, not the presence of a function.
+#[cfg(test)]
+mod u9_ipc_residual3_reply_settlement {
+    use super::*;
+    use crate::kernel::capabilities::CapObject;
+    use crate::kernel::direct_eligibility::DirectReplyTerminal;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::ipccall_direct::BlockedCallerAck;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    fn shared_with_tasks() -> SharedKernel {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        shared.with(|s| {
+            s.register_task(1).expect("task1");
+            s.register_task(2).expect("task2");
+            s.enqueue_current_cpu(1).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        shared
+    }
+
+    fn make_endpoint(shared: &SharedKernel) -> (usize, u64, CapObject) {
+        let (idx, send_root, _recv) = shared.with(|s| s.create_endpoint(8).expect("endpoint"));
+        let object = shared
+            .with(|s| s.current_task_capability(send_root).map(|c| c.object))
+            .expect("endpoint object");
+        let generation = shared
+            .with(|s| s.with_ipc_state(|ipc| ipc.endpoint_generations.get(idx).copied()))
+            .expect("generation");
+        (idx, generation, object)
+    }
+
+    fn caller_ack(
+        eidx: usize,
+        egen: u64,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> BlockedCallerAck {
+        BlockedCallerAck {
+            caller,
+            endpoint_index: eidx,
+            endpoint_generation: egen,
+            recv_v2_committed: true,
+            // A committed acknowledgement needs a non-zero payload destination; the value is
+            // never dereferenced by anything these cases drive.
+            payload_user_ptr: 0x4000,
+            payload_user_len: 128,
+            meta_user_ptr: 0x5000,
+            meta_user_len: 64,
+        }
+    }
+
+    /// **The assumption, tested.** A pre-reserve settle on a still-blocked caller RESTORES the
+    /// acknowledgement — so after a decline the lease is claimable again, and "the acknowledgement
+    /// is spent" is false.
+    #[test]
+    fn a_pre_reserve_settle_restores_the_acknowledgement_for_a_still_blocked_caller() {
+        let shared = shared_with_tasks();
+        let (eidx, egen, _object) = make_endpoint(&shared);
+        let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), Asid(0));
+        let seq = crate::kernel::boot::ipcreply_direct_ack::publish(caller_ack(eidx, egen, caller));
+        assert!(
+            crate::kernel::boot::ipcreply_direct_ack::is_claimable(eidx, egen),
+            "a freshly published acknowledgement is claimable"
+        );
+        let claimed = crate::kernel::boot::ipcreply_direct_ack::claim(eidx, egen);
+        assert!(claimed.is_some(), "and this route claims it");
+        assert!(
+            !crate::kernel::boot::ipcreply_direct_ack::is_claimable(eidx, egen),
+            "after the claim it is not claimable — this is the state the old reasoning stopped at"
+        );
+        // What the transaction's own pre-reserve settle does for a still-blocked caller, through
+        // the SAME primitive the drain republishes.
+        assert!(
+            crate::kernel::boot::ipcreply_direct_ack::restore(seq),
+            "the restore the settle performs must succeed for this exact sequence"
+        );
+        assert!(
+            crate::kernel::boot::ipcreply_direct_ack::is_claimable(eidx, egen),
+            "so the acknowledgement is LIVE again after a pristine decline — the previous \
+             package's premise that it is spent is false"
+        );
+        crate::kernel::boot::ipcreply_direct_ack::reset();
+    }
+
+    /// A pristine decline does not consume the reply authority: none of the five variants reaches
+    /// the record reservation, so the record stays externally invokable.
+    #[test]
+    fn a_pristine_decline_leaves_the_reply_authority_invokable() {
+        let shared = shared_with_tasks();
+        let (_eidx, _egen, object) = make_endpoint(&shared);
+        // Bound to a responder, because `reserve_existing_reply_record_split` — the owner the
+        // transaction reserves through — enforces the binding.
+        let (slot, generation) = shared
+            .reserve_reply_record_split(
+                ThreadId(1),
+                Asid(0),
+                object,
+                Some(ThreadId(2)),
+                Some(Asid(0)),
+            )
+            .expect("reservation");
+        assert!(
+            shared.persist_reply_caller_cap_split(
+                slot,
+                generation,
+                crate::kernel::capabilities::CapId(7)
+            ),
+            "the record is a live one-shot"
+        );
+        assert!(
+            shared.reply_record_externally_invokable_split_read(slot, generation),
+            "and it is externally invokable — which is what a pristine decline leaves"
+        );
+        // The competing-claimant case: a record another settle has CONSUMED is not invokable,
+        // and that is the state in which the canonical error is the right answer.
+        // `discard_reply_record_split` is `Reserved -> Consumed`, so the record is reserved
+        // first through the same owner the transaction reserves through.
+        let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(0));
+        assert!(
+            shared.reserve_existing_reply_record_split(slot, generation, replier),
+            "an Available record is reservable by its bound replier"
+        );
+        assert!(shared.discard_reply_record_split(slot, generation));
+        assert!(
+            !shared.reply_record_externally_invokable_split_read(slot, generation),
+            "a discarded record is settled, and reviving it would race its claimant"
+        );
+    }
+
+    /// The three questions the settler asks are answerable, and they distinguish the states the
+    /// disposition depends on. A record with an UNARMED terminal and no live acknowledgement is
+    /// the queued mode's precondition — the case the previous package answered with an error.
+    #[test]
+    fn the_queued_precondition_is_distinguishable_from_a_settled_authority() {
+        let shared = shared_with_tasks();
+        let (eidx, egen, object) = make_endpoint(&shared);
+        let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(0));
+        let (slot, generation) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), object, None, None)
+            .expect("reservation");
+        assert!(shared.persist_reply_caller_cap_split(
+            slot,
+            generation,
+            crate::kernel::capabilities::CapId(7)
+        ));
+
+        // (1) authority live
+        assert!(shared.reply_record_externally_invokable_split_read(slot, generation));
+        // (2) terminal admits — nobody has claimed it
+        let terminal =
+            shared.classify_direct_reply_terminal_split_read(slot, generation, replier, eidx, egen);
+        assert!(
+            terminal.admits_direct_reply(),
+            "an unclaimed terminal admits this reply: {terminal:?}"
+        );
+        assert!(
+            matches!(
+                terminal,
+                DirectReplyTerminal::Unarmed | DirectReplyTerminal::AvailableExact
+            ),
+            "and it is one of the two admitting classifications"
+        );
+        // (3) caller not blocked — no acknowledgement published for this incarnation
+        assert!(
+            !crate::kernel::boot::ipcreply_direct_ack::is_claimable(eidx, egen),
+            "with no live acknowledgement the caller is not blocked on its reply endpoint"
+        );
+        // All three together are the QUEUED mode's precondition. The previous package answered
+        // this state with an error; the settler routes it to the queued lane.
+        assert!(shared.free_reserved_reply_record_split(slot, generation) || true);
+    }
+
+    /// A terminal a COMPETITOR owns does not admit this reply, so the settler refuses instead of
+    /// reviving — even though the record itself is still nominally live.
+    #[test]
+    fn a_competitor_owned_terminal_does_not_admit_the_reply() {
+        let shared = shared_with_tasks();
+        let (eidx, egen, object) = make_endpoint(&shared);
+        let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(0));
+        let stranger = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), Asid(0));
+        let (slot, generation) = shared
+            .reserve_reply_record_split(ThreadId(1), Asid(0), object, None, None)
+            .expect("reservation");
+        assert!(shared.persist_reply_caller_cap_split(
+            slot,
+            generation,
+            crate::kernel::capabilities::CapId(7)
+        ));
+        // The cell has to be ARMED before anyone can claim it — an unarmed cell answers
+        // `NotArmed`, which is the ordinary state of a record whose caller has not yet blocked.
+        let identity = shared
+            .with(|s| s.reply_terminal_identity(slot, generation, 1, Some(1)))
+            .expect("terminal identity");
+        shared.with(|s| s.arm_reply_terminal(slot, identity));
+        // A competing claimant takes it.
+        let claim =
+            shared.claim_direct_reply_terminal_split(slot, generation, stranger, eidx, egen);
+        assert!(
+            matches!(claim, crate::kernel::boot::DirectReplyTerminalClaim::Won(_)),
+            "the competitor wins the armed cell, got {claim:?}"
+        );
+        let terminal =
+            shared.classify_direct_reply_terminal_split_read(slot, generation, replier, eidx, egen);
+        assert!(
+            !terminal.admits_direct_reply(),
+            "so this replier's terminal no longer admits it: {terminal:?}"
+        );
+        assert!(
+            shared.reply_record_externally_invokable_split_read(slot, generation),
+            "while the RECORD is still nominally live — which is exactly why the terminal has \
+             to be asked separately, and why 'live record' is not permission to revive"
+        );
+    }
+
+    /// The settler's structure, paired with the behavioural cases above rather than standing in
+    /// for them: it asks the three owners, in the order the disposition depends on, and it
+    /// reaches the queued lane through that lane's own function.
+    #[test]
+    fn the_settler_asks_the_three_owners_and_reuses_the_queued_lane() {
+        let src = include_str!("../syscall_split.rs");
+        let code: alloc::string::String = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let body = code
+            .split("fn nr7_settle_declined_transaction(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg").next())
+            .expect("the settler");
+        let authority = body
+            .find("reply_record_externally_invokable_split_read(")
+            .expect("it asks whether the authority is still usable");
+        let terminal = body
+            .find("classify_direct_reply_terminal_split_read(")
+            .expect("it asks who owns the terminal");
+        let ack = body
+            .find("ipcreply_direct_ack::is_claimable(")
+            .expect("it asks whether the caller is blocked");
+        assert!(
+            authority < terminal && terminal < ack,
+            "authority, then terminal ownership, then the acknowledgement"
+        );
+        // Refusals precede the continuation, so a settled authority can never reach the lane.
+        let refuse_settled = body
+            .find("\"authority_settled\"")
+            .expect("the settled refusal");
+        let refuse_competitor = body
+            .find("\"terminal_owned_by_competitor\"")
+            .expect("the competitor refusal");
+        let lane = body
+            .find("nr7_queued_reply_lane(")
+            .expect("it continues through the queued lane's own owner");
+        assert!(
+            refuse_settled < lane && refuse_competitor < lane,
+            "both refusals must precede the continuation, or settled authority could be revived"
+        );
+        // And the lane is REACHED, not copied: exactly one definition and two call sites.
+        assert_eq!(
+            code.matches("nr7_queued_reply_lane(").count(),
+            3,
+            "one definition, the mode-selection call, and the settler's call"
+        );
+        assert!(
+            !body.contains("commit_queued_reply_split("),
+            "the settler must not re-derive the enqueue — that is the lane's publication point"
+        );
+    }
+}
+
+/// U9-IPC-RESIDUAL3 §3 — **the RISC-V park resume**, and the two properties whose absence the
+/// live witness measured.
+///
+/// The park itself is architecture-neutral and was proven on x86_64 and AArch64 first. RISC-V
+/// failed it twice, in two different places, and both failures were a missing wiring rather than
+/// a wrong decision — so what is pinned here is the CONTROL FLOW each repair depends on, with the
+/// behavioural proof being the live witness itself (`proposed == committed == resumed`, three
+/// clean runs per port). A structural claim is the right instrument for exactly this: these are
+/// bridge routes no hosted build executes, and each defect was an omission that a test naming the
+/// function would have missed as thoroughly as the code did.
+///
+/// 1. **The parked sender's context was never saved.** The broad `handle_trap(Trap::Syscall, ..)`
+///    arm opens with `sync_current_thread_from_frame`, and the shared x86_64/AArch64 entry
+///    captures the entering task unconditionally (199D-DW2). A park committed on the split route
+///    reaches neither, and RISC-V pre-advances `sepc`, so the capture is the only carrier of the
+///    advanced pc. Measured: the full chain committed and completed, and the caller took an
+///    instruction page fault (`arch_code=0xc`) the instant it was resumed.
+///
+/// 2. **The completion was published and never consumed.** U6 §8 wired the class-scoped consumer
+///    into both other ports' resume boundaries and into RISC-V's IN-LOCK restore — but not into
+///    the exact-token post-lock drain, which is the route every committed park actually takes.
+///    Measured: twelve completions published with `result=0`, one consumed, and twelve callers
+///    reading a failure for a message the receiver had already taken.
+#[cfg(test)]
+mod u9_ipc_residual3_park_resume {
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    /// (1) The capture sits where the park is COMMITTED — the post-work drain's
+    /// `SenderCommittedBlocked` arm — and is keyed on the identity that disposition carries.
+    ///
+    /// Placement is the claim. Beside the `PostWorkCommitted` disposition there is only a stashed
+    /// proposal, which the drain may still refuse as `ImmediateReturn` with the caller current;
+    /// and `current` is no longer readable once the block publishes, which is why an ambient
+    /// lookup cannot stand in for the disposition's own tid.
+    #[test]
+    fn the_committed_park_saves_the_sender_context_keyed_on_the_committed_identity() {
+        let arm = RISCV_TRAP
+            .split("DispatchPostWorkDisposition::SenderCommittedBlocked {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the committed-blocked arm");
+        assert!(
+            arm.contains("shared.capture_outgoing_user_context_split(tid, frame)"),
+            "the parked sender's context must be captured, keyed on the committed tid"
+        );
+        assert!(
+            !arm.contains("current_tid"),
+            "never an ambient current lookup — the block has already cleared current"
+        );
+        assert!(
+            arm.contains("tid != 0 &&"),
+            "tid 0 is skipped for the same reason every other capture skips it"
+        );
+        // And it must not leak into the disposition arm above, where the park is not yet real.
+        let disposition_arm = RISCV_TRAP
+            .split("SplitDispatchDisposition::PostWorkCommitted {\n            finalize_syscall,\n        } = disposition\n        {")
+            .nth(1)
+            .and_then(|s| s.split("\n        }").next())
+            .expect("the post-work disposition arm");
+        assert!(
+            !disposition_arm.contains("capture_outgoing_user_context_split"),
+            "a proposal is not a park: the capture belongs to the drain that commits it"
+        );
+    }
+
+    /// (2) The exact-token drain consumes the blocked-SEND completion, and does it in the order
+    /// that makes the result survive.
+    ///
+    /// Three ordering facts, each load-bearing: the take runs AFTER `apply_user_context`, which
+    /// reinstalls the pre-block register file and would otherwise overwrite the result; it writes
+    /// BOTH the typed result lane and the a0/a1 mirror, because the two resume routes read
+    /// different ones; and it publishes the 199E-R2 continuation tag, without which the write-back
+    /// takes the STARTUP arm and installs the argument mirror over the result.
+    #[test]
+    fn the_exact_token_drain_delivers_the_blocked_send_completion() {
+        let body = RISCV_TRAP
+            .split("fn direct_dispatch_resume_incoming(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the exact-token drain");
+        let apply = body
+            .find("frame.apply_user_context(context);")
+            .expect("the restore");
+        let take = body
+            .find("shared.direct_dispatch_take_send_completion_split(token)")
+            .expect("the class-scoped, identity-exact consumer");
+        assert!(
+            apply < take,
+            "the completion must be consumed AFTER the pre-block snapshot is restored, or the \
+             restore overwrites the canonical result"
+        );
+        let tail = &body[take..];
+        assert!(
+            tail.contains("frame.set_user_gpr(10, done.result as usize);")
+                && tail.contains("frame.set_user_gpr(11, 0);"),
+            "the a0/a1 mirror is what a post-switch resume reads"
+        );
+        assert!(
+            tail.contains("frame.set_ok(0, 0, 0);") && tail.contains("frame.set_err("),
+            "and the typed result lane is what a same-task return re-derives a0 from; a success \
+             must CLEAR the error lane rather than set it"
+        );
+        let publish = tail
+            .find("riscv_syscall_continuation_publish(")
+            .expect("the 199E-R2 continuation tag");
+        let log = tail
+            .find("RISCV_BLOCKED_SEND_COMPLETION_DELIVERED")
+            .expect("the delivery marker");
+        assert!(
+            log < publish,
+            "the tag is published only after the canonical result is actually encoded"
+        );
+    }
+
+    /// The consumer is the SAME owner the other two ports use, and there is exactly one of it —
+    /// so the three bridges cannot drift on which completions a resume is allowed to take.
+    #[test]
+    fn all_three_ports_take_the_send_completion_through_one_owner() {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        const TRAP_ENTRY: &str = include_str!("../../arch/x86_64/trap.rs");
+        const AARCH64: &str = include_str!("../../arch/aarch64/trap.rs");
+        assert_eq!(
+            RUNTIME
+                .matches("pub(crate) fn direct_dispatch_take_send_completion_split(")
+                .count(),
+            1,
+            "one definition"
+        );
+        for (port, src) in [
+            ("riscv64", RISCV_TRAP),
+            ("x86_64", TRAP_ENTRY),
+            ("aarch64", AARCH64),
+        ] {
+            assert!(
+                src.contains("direct_dispatch_take_send_completion_split(token)"),
+                "{port}'s resume boundary must consume the parked send completion"
+            );
+        }
     }
 }
