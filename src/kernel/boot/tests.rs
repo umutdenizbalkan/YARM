@@ -173523,6 +173523,7 @@ mod u9_ipc_residual2_closure {
     /// file, and it is asserted to be complete below rather than trusted.
     const FAMILY_FUNCTIONS: &[&str] = &[
         "fn try_split_ipccall_into_frame(",
+        "fn nr6_validate_in_broad_order(",
         "fn nr6_refuse_preflight(",
         "fn try_split_ipccall_direct_into_frame(",
         "fn try_split_ipccall_queued_into_frame(",
@@ -173592,6 +173593,10 @@ mod u9_ipc_residual2_closure {
             (
                 "fn nr6_refuse_preflight(",
                 ") -> SplitDispatchDisposition {",
+            ),
+            (
+                "fn nr6_validate_in_broad_order(",
+                ") -> Result<(), (crate::kernel::syscall::SyscallError, &'static str)> {",
             ),
         ] {
             let body = complete_body(&src, signature);
@@ -173910,23 +173915,55 @@ mod u9_ipc_residual2_closure {
     #[test]
     fn the_refusal_resolvers_preserve_validation_precedence() {
         let split = code(SPLIT_SRC);
-        let nr6 = complete_body(&split, "fn nr6_refuse_preflight(");
-        let send_cap = nr6
-            .find("V::SendCapUnresolved(err)")
-            .expect("send cap first");
-        let reply_cap = nr6
-            .find("validate_endpoint_right_split_read(requester, reply_recv_cap")
+        // U9-IPC-RESIDUAL3 §1 re-derivation. The ordering used to live inside the NR 6 resolver,
+        // keyed on the classifier's verdict — which is exactly the defect that package repaired,
+        // because the classifier answers `PayloadTooLong` before it resolves anything. The order
+        // now lives in ONE policy asked from the FACTS, so the guard reads the policy.
+        let policy = complete_body(&split, "fn nr6_validate_in_broad_order(");
+        let send_cap = policy
+            .find("facts.send_cap")
+            .expect("the send capability first");
+        let live = policy
+            .find("capability_object_live_split(object)")
+            .expect("its liveness question, which the send-side resolver does not ask");
+        let reply_cap = policy
+            .find("validate_endpoint_right_split_read(")
             .expect("then the reply capability");
-        let incarnation = nr6
-            .find("V::EndpointIncarnationGone =>")
+        let requester = policy.find("tid.is_none()").expect("then the requester");
+        let incarnation = policy
+            .find("facts.endpoint_mode.is_none()")
             .expect("then the endpoint incarnation");
-        let length = nr6.find("V::PayloadTooLong =>").expect("then the length");
+        let length = policy
+            .find("facts.payload_len >")
+            .expect("and the length last");
         assert!(
-            send_cap < reply_cap && reply_cap < incarnation && incarnation < length,
-            "handle_ipc_call validates send cap, then reply cap, then resolves the endpoint \
-             index, then checks the length — a call wrong in several ways must be told about \
-             the FIRST thing that is wrong"
+            send_cap < live
+                && live < reply_cap
+                && reply_cap < requester
+                && requester < incarnation
+                && incarnation < length,
+            "handle_ipc_call validates the send capability (slot, LIVENESS, kind, right), then \
+             the reply capability, then the requester, then resolves the endpoint index, and \
+             only then checks the length"
         );
+        // And the resolver must not reintroduce an ordering of its own.
+        let resolver = complete_body(&split, "fn nr6_refuse_preflight(");
+        assert!(
+            resolver.contains("nr6_validate_in_broad_order(shared, facts, tid, reply_recv_cap)"),
+            "the resolver defers its ordering to the policy"
+        );
+        for verdict_keyed in [
+            "V::PayloadTooLong => answer",
+            "V::EndpointIncarnationGone => answer",
+            "V::SendCapUnresolved(err) = verdict",
+        ] {
+            assert!(
+                !resolver.contains(verdict_keyed),
+                "the resolver must not answer `{verdict_keyed}` from the verdict — the \
+                 classifier reaches that verdict without having asked the earlier questions"
+            );
+        }
+
         let nr7 = complete_body(&split, "fn nr7_refuse_preflight(");
         let requester = nr7
             .find("V::RequesterUnavailable)")
@@ -174322,5 +174359,328 @@ mod u9_ipc_residual2_cases {
         );
         assert!(shared.free_reserved_reply_record_split(buffered_slot, buffered_gen));
         assert!(shared.free_reserved_reply_record_split(bound_slot, bound_gen));
+    }
+}
+
+/// U9-IPC-RESIDUAL3 §1 — **differential validation order, against the broad handler itself.**
+///
+/// U9-IPC-RESIDUAL2 §2 introduced a resolver whose own doc comment said it "re-asks the questions
+/// in the broad order rather than translating the classifier's verdict one-to-one". It did not:
+/// step (1) read `if let V::SendCapUnresolved(err) = verdict`, and the classifier checks
+/// `payload_len` FIRST and returns `PayloadTooLong` before it ever resolves the send capability.
+/// So a call that was wrong in two ways was told about the second one.
+///
+/// These cases do not check that a function exists or that a marker is spelled a certain way.
+/// Each one builds a real kernel, runs the REAL `syscall::dispatch` over a real `TrapFrame` to
+/// obtain `handle_ipc_call`'s own answer, then asks the split policy the same question over the
+/// same facts, and requires the two to agree — and requires the split side to have mutated
+/// nothing on the way.
+#[cfg(test)]
+mod u9_ipc_residual3_validation_parity {
+    use super::*;
+    use crate::kernel::capabilities::{CapId, CapObject, CapRights};
+    use crate::kernel::direct_eligibility::DirectRequestFacts;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP, SyscallError,
+        dispatch,
+    };
+    use crate::kernel::syscall_split::nr6_validate_in_broad_order;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    /// A kernel with one running task holding a live endpoint: `send_cap` carries SEND,
+    /// `recv_cap` carries RECEIVE, and both name the same endpoint.
+    struct Fixture {
+        shared: SharedKernel,
+        tid: u64,
+        send_cap: CapId,
+        recv_cap: CapId,
+        endpoint: CapObject,
+    }
+
+    fn fixture() -> Fixture {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        shared.with(|s| {
+            s.register_task(1).expect("task1");
+            s.enqueue_current_cpu(1).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+        });
+        let (_idx, send_cap, recv_cap) = shared.with(|s| s.create_endpoint(8).expect("endpoint"));
+        let endpoint = shared
+            .with(|s| s.current_task_capability(send_cap).map(|c| c.object))
+            .expect("endpoint object");
+        Fixture {
+            shared,
+            tid: 1,
+            send_cap,
+            recv_cap,
+            endpoint,
+        }
+    }
+
+    impl Fixture {
+        /// The facts the NR 6 call site gathers, built exactly as `try_split_ipccall_direct_into_frame`
+        /// builds them — through the same two split reads — so the policy is asked the same
+        /// question the live route asks it.
+        fn facts(&self, send_cap: CapId, len: usize) -> DirectRequestFacts {
+            let send_cap_resolution = self
+                .shared
+                .resolve_endpoint_send_cap_split_read(self.tid, send_cap);
+            let endpoint_mode = match send_cap_resolution {
+                Ok(CapObject::Endpoint { index, generation }) => {
+                    self.shared.endpoint_mode_split_read(index, generation)
+                }
+                _ => None,
+            };
+            let endpoint_admitted = match send_cap_resolution {
+                Ok(CapObject::Endpoint { index, .. }) => {
+                    crate::kernel::boot::ipccall_direct_request_endpoint_admitted(index)
+                }
+                _ => false,
+            };
+            DirectRequestFacts {
+                payload_len: len,
+                requester_available: true,
+                send_cap: send_cap_resolution,
+                endpoint_mode,
+                endpoint_admitted,
+            }
+        }
+
+        /// `handle_ipc_call`'s own answer for these arguments, from the REAL dispatcher.
+        fn broad_answer(
+            &self,
+            send_cap: CapId,
+            recv_cap: CapId,
+            len: usize,
+        ) -> Option<SyscallError> {
+            let mut frame = TrapFrame::new(crate::kernel::syscall::SYSCALL_IPC_CALL_NR, [0; 6]);
+            frame.set_arg(SYSCALL_ARG_CAP, send_cap.0 as usize);
+            frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, recv_cap.0 as usize);
+            frame.set_arg(SYSCALL_ARG_PTR, 0);
+            frame.set_arg(SYSCALL_ARG_LEN, len);
+            self.shared.with(|s| dispatch(s, &mut frame)).err()
+        }
+
+        /// The split policy's answer for the same arguments.
+        fn split_answer(
+            &self,
+            send_cap: CapId,
+            recv_cap: CapId,
+            len: usize,
+        ) -> Option<SyscallError> {
+            let facts = self.facts(send_cap, len);
+            nr6_validate_in_broad_order(&self.shared, &facts, Some(self.tid), recv_cap)
+                .err()
+                .map(|(e, _reason)| e)
+        }
+
+        /// A by-value snapshot of everything a refusal must leave alone.
+        fn state_snapshot(&self) -> (usize, usize, usize) {
+            self.shared.with(|s| {
+                let reserved =
+                    s.with_ipc_state(|ipc| ipc.reply_caps.iter().filter(|r| r.is_some()).count());
+                let envelopes = s.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes
+                        .iter()
+                        .filter(|e| e.is_some())
+                        .count()
+                });
+                // How many endpoints hold anything, read through the production non-consuming
+                // head read rather than an internal field, so the snapshot cannot drift from
+                // what a receiver would see.
+                let live = s.with_ipc_state(|ipc| {
+                    ipc.endpoints
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.is_some())
+                        .map(|(i, _)| i)
+                        .collect::<alloc::vec::Vec<_>>()
+                });
+                let mut queued = 0usize;
+                for i in live {
+                    if matches!(
+                        s.peek_queued_with_cap_transfer(i),
+                        crate::kernel::boot::IpcEndpointPeekResult::Peeked(_)
+                    ) {
+                        queued += 1;
+                    }
+                }
+                (reserved, envelopes, queued)
+            })
+        }
+    }
+
+    /// A capability id that resolves to nothing at all.
+    const ABSENT: CapId = CapId(9_999);
+
+    /// **THE REGRESSION.** An invalid send capability, a valid reply capability and an oversized
+    /// payload. The classifier answers `PayloadTooLong`, so the U9-IPC-RESIDUAL2 resolver skipped
+    /// the send-capability question entirely and returned `InvalidArgs`. `handle_ipc_call`
+    /// validates the send capability first and returns `InvalidCapability`.
+    #[test]
+    fn an_invalid_send_cap_is_reported_even_behind_an_oversized_payload() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(ABSENT, fx.recv_cap, oversized);
+        assert_eq!(
+            broad,
+            Some(SyscallError::InvalidCapability),
+            "handle_ipc_call validates the send capability before the length"
+        );
+        let before = fx.state_snapshot();
+        assert_eq!(
+            fx.split_answer(ABSENT, fx.recv_cap, oversized),
+            broad,
+            "the split policy must report the FIRST thing that is wrong, not the verdict's"
+        );
+        assert_eq!(fx.state_snapshot(), before, "a refusal mutates nothing");
+    }
+
+    /// A stale endpoint identity hidden behind an oversized payload. Broad resolves the endpoint
+    /// index before it checks the length, so it answers `WrongObject`.
+    #[test]
+    fn a_stale_endpoint_identity_is_reported_even_behind_an_oversized_payload() {
+        let fx = fixture();
+        let CapObject::Endpoint { index, .. } = fx.endpoint else {
+            panic!("an endpoint");
+        };
+        // Recycle the incarnation under the capability, leaving the slot occupied — the state
+        // that makes "the slot is present" an insufficient check.
+        fx.shared.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_generations[index] = ipc.endpoint_generations[index].wrapping_add(1);
+            });
+        });
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(fx.send_cap, fx.recv_cap, oversized);
+        assert_eq!(
+            broad,
+            Some(SyscallError::InvalidCapability),
+            "`validate_endpoint_right` folds the LIVENESS check into its first answer, so a \
+             capability naming a recycled incarnation is InvalidCapability — not the WrongObject \
+             that `resolve_endpoint_index` would give for an absent slot. The split send-side \
+             resolver does not check the generation at all, so the policy has to."
+        );
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(fx.send_cap, fx.recv_cap, oversized), broad);
+        assert_eq!(fx.state_snapshot(), before, "a refusal mutates nothing");
+    }
+
+    /// An invalid REPLY authority behind an oversized payload: broad validates the reply
+    /// capability before the length too.
+    #[test]
+    fn an_invalid_reply_authority_is_reported_even_behind_an_oversized_payload() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(fx.send_cap, ABSENT, oversized);
+        assert_eq!(broad, Some(SyscallError::InvalidCapability));
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(fx.send_cap, ABSENT, oversized), broad);
+        assert_eq!(fx.state_snapshot(), before, "a refusal mutates nothing");
+    }
+
+    /// BOTH capabilities invalid: the SEND one is reported, because it is asked first.
+    #[test]
+    fn with_both_capabilities_invalid_the_send_capability_is_reported() {
+        let fx = fixture();
+        let broad = fx.broad_answer(ABSENT, ABSENT, 8);
+        assert_eq!(broad, Some(SyscallError::InvalidCapability));
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(ABSENT, ABSENT, 8), broad);
+        assert_eq!(fx.state_snapshot(), before);
+    }
+
+    /// A reply capability that resolves but carries the WRONG RIGHT, behind an oversized payload.
+    /// Broad answers `MissingRight`; the classifier would have said `PayloadTooLong`.
+    #[test]
+    fn a_reply_capability_missing_receive_is_reported_before_the_length() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        // `send_cap` names the same endpoint but carries SEND, not RECEIVE.
+        let broad = fx.broad_answer(fx.send_cap, fx.send_cap, oversized);
+        assert_eq!(
+            broad,
+            Some(SyscallError::MissingRight),
+            "an Endpoint capability lacking RECEIVE is MissingRight, asked before the length"
+        );
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(fx.send_cap, fx.send_cap, oversized), broad);
+        assert_eq!(fx.state_snapshot(), before);
+    }
+
+    /// A send capability that resolves but lacks SEND: reported as `MissingRight`, and still
+    /// reported when the payload is also oversized.
+    #[test]
+    fn a_send_capability_missing_send_is_reported_before_the_length() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(fx.recv_cap, fx.recv_cap, oversized);
+        assert_eq!(broad, Some(SyscallError::MissingRight));
+        let before = fx.state_snapshot();
+        assert_eq!(fx.split_answer(fx.recv_cap, fx.recv_cap, oversized), broad);
+        assert_eq!(fx.state_snapshot(), before);
+    }
+
+    /// The length is still reported when it is the ONLY thing wrong — the repair narrows the
+    /// answer to the first fault, it does not stop reporting the last one.
+    #[test]
+    fn an_oversized_payload_alone_is_still_invalid_args() {
+        let fx = fixture();
+        let oversized = Message::MAX_PAYLOAD + 1;
+        let broad = fx.broad_answer(fx.send_cap, fx.recv_cap, oversized);
+        assert_eq!(broad, Some(SyscallError::InvalidArgs));
+        assert_eq!(fx.split_answer(fx.send_cap, fx.recv_cap, oversized), broad);
+    }
+
+    /// And a wholly valid call is not refused by the policy at all, so the ordering repair has
+    /// not turned a legal call into an error.
+    #[test]
+    fn a_valid_call_passes_the_policy() {
+        let fx = fixture();
+        assert_eq!(
+            fx.split_answer(fx.send_cap, fx.recv_cap, 8),
+            None,
+            "nothing is wrong with this call, and the policy must say so"
+        );
+    }
+
+    /// The policy is ONE policy: both NR 6 callers reach it, and neither keeps a private copy of
+    /// one of its steps. This is a source guard, and it is deliberately paired with the
+    /// behavioural cases above rather than standing in for them.
+    #[test]
+    fn both_nr6_callers_go_through_the_one_policy() {
+        let src = include_str!("../syscall_split.rs");
+        let code: alloc::string::String = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("nr6_validate_in_broad_order(").count(),
+            3,
+            "one definition and exactly two call sites: the eligible path and the refusal resolver"
+        );
+        // The refusal resolver must not key ordering on the verdict any more.
+        let resolver = code
+            .split("fn nr6_refuse_preflight(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("the resolver");
+        for verdict_keyed in [
+            "V::SendCapUnresolved(err) = verdict",
+            "matches!(verdict, V::RequesterUnavailable)",
+            "V::EndpointIncarnationGone => answer",
+            "V::PayloadTooLong => answer",
+        ] {
+            assert!(
+                !resolver.contains(verdict_keyed),
+                "the resolver must not order its answers by the verdict: `{verdict_keyed}`"
+            );
+        }
     }
 }

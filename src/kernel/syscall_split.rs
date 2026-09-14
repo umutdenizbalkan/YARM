@@ -3015,6 +3015,109 @@ fn try_split_ipccall_into_frame(
     try_split_ipccall_direct_into_frame(shared, cpu, frame)
 }
 
+/// U9-IPC-RESIDUAL3 §1 — **THE NR 6 validation policy**, in `handle_ipc_call`'s own order, asked
+/// from the FACTS.
+///
+/// U9-IPC-RESIDUAL2 §2 claimed to do this and did not. Its resolver keyed step (1) on the
+/// classifier's *verdict* — `if let V::SendCapUnresolved(err) = verdict` — but the classifier
+/// checks `payload_len` first and returns `PayloadTooLong` **before it ever resolves the send
+/// capability**. So a call with an invalid send capability, a valid reply capability and an
+/// oversized payload skipped the send-capability question entirely and answered `InvalidArgs`,
+/// where `handle_ipc_call` answers `InvalidCapability`. The same hole swallowed a stale endpoint
+/// incarnation behind an oversized payload, which broad reports as `WrongObject`.
+///
+/// A verdict is not an ordering. It says only that *a* refusal is owed; which one is a question
+/// about the facts, and the facts are what this asks:
+///
+/// ```text
+/// validate_endpoint_right(send_cap, SEND)?      // InvalidCapability / WrongObject / MissingRight
+/// validate_endpoint_right(reply_recv_cap, RECEIVE)?
+/// current_tid()?                                // Internal
+/// resolve_endpoint_index(endpoint)?             // WrongObject / StaleCapability -> WrongObject
+/// len > Message::MAX_PAYLOAD                    // InvalidArgs
+/// ```
+///
+/// Both NR 6 callers go through here — the eligible path and the refusal resolver — so there is
+/// one policy rather than two that have to be kept in step. On the eligible path every question
+/// but the reply capability has already been answered by the classifier, so the call is a
+/// consistency check that costs one lock-free read; on the refusal path it is the whole answer.
+///
+/// `RequesterUnavailable` needs no arm of its own: with no current task the call site sets
+/// `facts.send_cap` to `Err(InvalidCapability)`, which is exactly what `validate_endpoint_right`
+/// produces for a task with no cnode, so step (1) answers it first — as broad does. Step (3) is
+/// therefore unreachable and is kept only because `current_tid()?` is a real statement of the
+/// broad sequence.
+///
+/// Nothing here mutates. Every step is a read.
+///
+/// It is `pub(crate)` and compiled on BOTH profiles so the differential cases can drive it
+/// directly against `syscall::dispatch`'s own answer for the same arguments. A policy whose only
+/// coverage is a source scan for its name is not covered.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn nr6_validate_in_broad_order(
+    shared: &SharedKernel,
+    facts: &crate::kernel::direct_eligibility::DirectRequestFacts,
+    tid: Option<u64>,
+    reply_recv_cap: crate::kernel::capabilities::CapId,
+) -> Result<(), (crate::kernel::syscall::SyscallError, &'static str)> {
+    use crate::kernel::capabilities::{CapObject, CapRights};
+    use crate::kernel::syscall::SyscallError;
+
+    // (1) `validate_endpoint_right(send_cap, SEND)?`, all four of its questions.
+    let object = match facts.send_cap {
+        Ok(object) => object,
+        Err(err) => return Err((SyscallError::from(err), "send_cap")),
+    };
+    // U9-IPC-RESIDUAL3 §1 — the LIVENESS question, which the send-side resolver does not ask.
+    //
+    // `validate_endpoint_right` folds it into its first answer:
+    // `slot_result.and_then(|c| capability_object_live(c.object).map(|_| c)).ok_or(InvalidCapability)`.
+    // `resolve_endpoint_send_cap_split_read` checks the slot, the object kind and the `SEND`
+    // right, and NOT the generation — so a capability naming a recycled endpoint incarnation
+    // resolves `Ok` there while broad has already refused it with `InvalidCapability`.
+    //
+    // Without this, a stale send capability was answered `WrongObject` by step (4) below, which
+    // is the error broad gives for a DIFFERENT condition. The differential case
+    // `a_stale_endpoint_identity_is_reported_even_behind_an_oversized_payload` found it by
+    // running `dispatch` and comparing, which is the only way a mismatch like this surfaces:
+    // both answers are plausible in isolation.
+    if shared.capability_object_live_split(object).is_none() {
+        return Err((SyscallError::InvalidCapability, "send_cap_stale"));
+    }
+    // Unreachable through this route — the resolver refuses a non-`Endpoint` object with
+    // `WrongObject` before it returns — but it is the broad handler's own next question, and
+    // stating it keeps the sequence complete rather than relying on a resolver's internals
+    // staying as they are.
+    if !matches!(object, CapObject::Endpoint { .. }) {
+        return Err((SyscallError::WrongObject, "not_an_endpoint"));
+    }
+    // (2) `validate_endpoint_right(reply_recv_cap, RECEIVE)?`
+    if let Err(err) = shared.validate_endpoint_right_split_read(
+        tid.unwrap_or(0),
+        reply_recv_cap,
+        CapRights::RECEIVE,
+    ) {
+        return Err((err, "reply_cap"));
+    }
+    // (3) `current_tid(kernel)?` — `Internal`, which is what `current_tid` maps `None` to.
+    if tid.is_none() {
+        return Err((SyscallError::Internal, "no_requester"));
+    }
+    // (4) `resolve_endpoint_index(endpoint)?` — an absent slot is `WrongObject` and a stale
+    // incarnation `StaleCapability`; both reach userspace as `WrongObject`. The split facts
+    // collapse the two into "no live mode for this incarnation", which is the same question.
+    if facts.endpoint_mode.is_none() {
+        return Err((SyscallError::WrongObject, "incarnation_gone"));
+    }
+    // (5) `len > Message::MAX_PAYLOAD` → `InvalidArgs`. `IPC_DIRECT_PAYLOAD_MAX` is defined AS
+    // `Message::MAX_PAYLOAD`, so this is the broad refusal and not a narrower limit wearing its
+    // error.
+    if facts.payload_len > crate::kernel::ipccall_direct::IPC_DIRECT_PAYLOAD_MAX {
+        return Err((SyscallError::InvalidArgs, "payload_too_long"));
+    }
+    Ok(())
+}
+
 /// U9-IPC-RESIDUAL2 §2 — resolve a NR 6 preflight refusal to the error the BROAD handler would
 /// have produced, **in the broad handler's own order**.
 ///
@@ -3039,16 +3142,17 @@ fn try_split_ipccall_into_frame(
 /// Nothing here mutates: every step is a read, and the refusal is delivered by writing the frame,
 /// which is what the broad handler's `?` would have done one lock later.
 #[cfg(not(feature = "hosted-dev"))]
+#[allow(clippy::too_many_arguments)]
 fn nr6_refuse_preflight(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
     verdict: crate::kernel::direct_eligibility::DirectRequestEligibility,
+    facts: &crate::kernel::direct_eligibility::DirectRequestFacts,
     tid: Option<u64>,
     send_cap: crate::kernel::capabilities::CapId,
     reply_recv_cap: crate::kernel::capabilities::CapId,
 ) -> SplitDispatchDisposition {
-    use crate::kernel::capabilities::CapRights;
     use crate::kernel::direct_eligibility::DirectRequestEligibility as V;
     use crate::kernel::syscall::SyscallError;
     use SplitDispatchDisposition as D;
@@ -3065,45 +3169,20 @@ fn nr6_refuse_preflight(
         D::Complete(Ok(()))
     };
 
-    // (1) The send capability, first, exactly as `validate_endpoint_right(send_cap, SEND)` asks.
-    // `resolve_endpoint_send_cap_split_read` applies the identical three checks in the identical
-    // order, so `SendCapUnresolved` already carries the broad answer.
+    // U9-IPC-RESIDUAL3 §1 — ONE policy, asked from the FACTS, in the broad handler's order.
     //
-    // `RequesterUnavailable` arrives here too and is not a separate answer: with no current task
-    // the resolution above was set to `Err(InvalidCapability)` at the call site, which is what
-    // `validate_endpoint_right` produces for a task with no cnode.
-    if let V::SendCapUnresolved(err) = verdict {
-        return answer(frame, SyscallError::from(err), "send_cap");
-    }
-    if matches!(verdict, V::RequesterUnavailable) {
-        return answer(frame, SyscallError::InvalidCapability, "no_requester");
-    }
-    // `NotAnEndpoint` is unreachable through this route — the resolver above already refuses a
-    // non-`Endpoint` object with `WrongObject`, so such a capability arrives as
-    // `SendCapUnresolved(WrongObject)`. Answered with the same error it would have carried, so
-    // the arm is correct rather than merely unreachable.
-    if matches!(verdict, V::NotAnEndpoint) {
-        return answer(frame, SyscallError::WrongObject, "not_an_endpoint");
-    }
-
-    // (2) The reply-receive capability, second, as the broad handler validates it — and BEFORE
-    // the endpoint incarnation and the payload length, which are the two verdicts below.
+    // The verdict is not consulted for ordering at all. It told the caller that a refusal is
+    // owed; which refusal is a question about the facts, and asking the verdict instead is what
+    // let an invalid send capability hide behind an oversized payload.
     let requester = tid.unwrap_or(0);
-    if let Err(err) =
-        shared.validate_endpoint_right_split_read(requester, reply_recv_cap, CapRights::RECEIVE)
-    {
-        return answer(frame, err, "reply_cap");
+    if let Err((err, reason)) = nr6_validate_in_broad_order(shared, facts, tid, reply_recv_cap) {
+        return answer(frame, err, reason);
     }
 
+    // Everything the broad sequence asks has now passed, so the only refusals left are the two
+    // classes the broad path answers by doing something the split route does not implement.
     match verdict {
-        // (3) `resolve_endpoint_index` answers `StaleCapability` for a stale incarnation and
-        // `WrongObject` for an absent one; both map to `WrongObject` at the syscall boundary.
-        V::EndpointIncarnationGone => answer(frame, SyscallError::WrongObject, "incarnation_gone"),
-        // (4) `len > Message::MAX_PAYLOAD` → `InvalidArgs`. `IPC_DIRECT_PAYLOAD_MAX` is defined AS
-        // `Message::MAX_PAYLOAD`, so the two limits are the same number by construction and this
-        // is the broad path's own refusal rather than a narrower one wearing its error.
-        V::PayloadTooLong => answer(frame, SyscallError::InvalidArgs, "payload_too_long"),
-        // (5) The two impossible classes, refused with a typed invariant error rather than a
+        // The two impossible classes, refused with a typed invariant error rather than a
         // fallback — the precedent NR 1 set for exactly these two (199G-C4 §4).
         //
         // `Synchronous`: every production endpoint is created by `create_endpoint(depth)` or by
@@ -3128,12 +3207,21 @@ fn nr6_refuse_preflight(
             );
             answer(frame, SyscallError::Internal, "endpoint_not_admitted")
         }
-        // Handled above; listed so a new verdict cannot inherit an arm by wildcard.
-        V::SendCapUnresolved(_) | V::RequesterUnavailable | V::NotAnEndpoint => answer(
-            frame,
-            SyscallError::InvalidCapability,
-            "unreachable_verdict",
-        ),
+        // Answered by the shared policy above, which reaches each of them from the facts rather
+        // than from the verdict. Listed so a new verdict cannot inherit an arm by wildcard, and
+        // reachable only if the policy and the classifier ever disagree — which is itself the
+        // bug this arm should report rather than paper over.
+        V::SendCapUnresolved(_)
+        | V::RequesterUnavailable
+        | V::NotAnEndpoint
+        | V::EndpointIncarnationGone
+        | V::PayloadTooLong => {
+            debug_assert!(
+                false,
+                "the shared validation policy must answer every fact-derived verdict"
+            );
+            answer(frame, SyscallError::Internal, "policy_classifier_disagree")
+        }
         V::Eligible { .. } => {
             debug_assert!(
                 false,
@@ -3209,12 +3297,14 @@ fn try_split_ipccall_direct_into_frame(
             verdict
                 == crate::kernel::direct_eligibility::DirectRequestEligibility::EndpointNotAdmitted,
         );
-        return nr6_refuse_preflight(shared, cpu, frame, verdict, tid, send_cap, reply_cap);
+        return nr6_refuse_preflight(
+            shared, cpu, frame, verdict, &facts, tid, send_cap, reply_cap,
+        );
     };
     REQUEST_COUNTERS.note_eligible();
     let tid = tid.expect("eligibility requires an available requester");
     let _ = IPC_DIRECT_PAYLOAD_MAX;
-    // U9-IPC-RESIDUAL2 §2 — the reply-receive capability, validated HERE for the eligible path
+    // U9-IPC-RESIDUAL2 §2 — the reply-receive capability is validated HERE for the eligible path
     // too, because the broad handler validates it before it copies anything.
     //
     // U9-IPC-RESIDUAL1 checked it only inside the buffered lane, and in the lane's own order
@@ -3222,15 +3312,18 @@ fn try_split_ipccall_direct_into_frame(
     // consequences, both user-visible: a direct hand-off with a bad reply capability copied the
     // payload and claimed an acknowledgement before anyone noticed, and a capability that was
     // both the wrong object AND missing `RECEIVE` reported the wrong one of the two.
-    if let Err(err) = shared.validate_endpoint_right_split_read(
-        tid,
-        reply_cap,
-        crate::kernel::capabilities::CapRights::RECEIVE,
-    ) {
+    //
+    // U9-IPC-RESIDUAL3 §1 — and it is asked through THE shared policy, not through a private
+    // copy of one of its steps. Every other question in that policy has already been answered by
+    // the classifier on this path, so what this adds is the reply capability plus a consistency
+    // check; having both callers go through one function is what stops the eligible path and the
+    // refusal path drifting into different orders again.
+    if let Err((err, reason)) = nr6_validate_in_broad_order(shared, &facts, Some(tid), reply_cap) {
         crate::yarm_log!(
-            "IPCCALL_DIRECT_REFUSED_PRE_LOCK tid={} send_cap={} reason=reply_cap err={:?} copies=0 enqueues=0 mutations=0 result=ok",
+            "IPCCALL_DIRECT_REFUSED_PRE_LOCK tid={} send_cap={} reason={} err={:?} copies=0 enqueues=0 mutations=0 result=ok",
             tid,
             send_cap.0,
+            reason,
             err
         );
         frame.set_err(err.code());
