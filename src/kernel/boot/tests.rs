@@ -24223,8 +24223,11 @@ mod stage32_cap_resolution_tests {
 
     #[test]
     fn stage32b_ipc_recv_timeout_nr_not_split_eligible() {
-        // IpcRecvTimeout (NR 5) is NOT in the split-eligible NR set: the live seam
-        // returns None and defers to the global-lock path.
+        // U9-RECV-FINAL INVERTS this. NR 5's NON-BLOCKING probe (`timeout_ticks == 0`, arg 3)
+        // was the one receive still reaching the terminal broad acquisition on an ordinary boot:
+        // the blocking route refuses it by name because a probe never parks, and nothing else
+        // claimed it. It is now served by the same delivery engine NR 2's immediate lane uses,
+        // driven through NR 5's OWN request builder.
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = TrapFrame::new(
             crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR,
@@ -24233,8 +24236,8 @@ mod stage32_cap_resolution_tests {
         assert_eq!(
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
                 .legacy(),
-            None,
-            "IpcRecvTimeout must fall back (not split-eligible)"
+            Some(Ok(())),
+            "a queued message must be delivered to the NR 5 probe pre-lock"
         );
     }
 
@@ -24488,8 +24491,10 @@ mod stage33_34 {
 
     #[test]
     fn stage33_timeout_adapter_full_path_behavior_unchanged() {
-        // IpcRecvTimeout (NR 5) is NOT on the split-eligible list and must still
-        // fall back to the global-lock path through the live seam.
+        // U9-RECV-FINAL INVERTS this for the same reason its Stage 32B sibling above is
+        // inverted: NR 5's non-blocking probe is serviced pre-lock now. What the adapter's
+        // behaviour must still be is the canonical one, which the differential cases check
+        // against the real handler rather than by asserting a fallback.
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = TrapFrame::new(
             crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR,
@@ -24498,8 +24503,8 @@ mod stage33_34 {
         assert_eq!(
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
                 .legacy(),
-            None,
-            "IpcRecvTimeout must fall back through live seam (NR 5 not split-eligible)"
+            Some(Ok(())),
+            "the NR 5 probe must be serviced through the live seam"
         );
     }
 
@@ -40826,12 +40831,17 @@ mod stage147_ipc_boundary_audit {
         );
     }
 
-    // 10. The IPC_RECV_META_V2_ENCODED_LEN constant is pub(super) in syscall.rs (ABI-stable).
+    // 10. The IPC_RECV_META_V2_ENCODED_LEN constant is owned by syscall.rs (ABI-stable).
+    //
+    // U9-RECV-FINAL widened it from `pub(super)` to `pub(crate)` so the NR 5 probe lane can ask
+    // the SAME predicate `handle_ipc_recv_result_with_empty_error` asks about the owed metadata
+    // shape. The claim this guard carries is SINGLE DEFINITION, owned here — not the width of
+    // the visibility; inlining the literal 40 in the lane would have been the violation.
     #[test]
     fn stage147_recv_meta_len_constant_in_syscall_rs() {
         assert!(
-            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
-            "IPC_RECV_META_V2_ENCODED_LEN must remain pub(super) const in syscall.rs"
+            SYSCALL_SRC.contains("pub(crate) const IPC_RECV_META_V2_ENCODED_LEN"),
+            "IPC_RECV_META_V2_ENCODED_LEN must remain a single const owned by syscall.rs"
         );
         assert!(
             !IPC_SRC.contains("const IPC_RECV_META_V2_ENCODED_LEN"),
@@ -41851,8 +41861,8 @@ mod stage152_syscall_decomposition_completeness_audit {
     #[test]
     fn stage152_recv_meta_len_not_duplicated() {
         assert!(
-            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
-            "IPC_RECV_META_V2_ENCODED_LEN must remain pub(super) const in syscall.rs"
+            SYSCALL_SRC.contains("pub(crate) const IPC_RECV_META_V2_ENCODED_LEN"),
+            "IPC_RECV_META_V2_ENCODED_LEN must remain a single const owned by syscall.rs"
         );
         for (name, src) in ALL_SUBMODULE_SRCS {
             assert!(
@@ -42170,8 +42180,8 @@ mod stage153_ipc_cap_boundary_audit {
     #[test]
     fn stage153_recv_meta_len_owned_by_syscall_rs() {
         assert!(
-            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
-            "IPC_RECV_META_V2_ENCODED_LEN must remain pub(super) const in syscall.rs"
+            SYSCALL_SRC.contains("pub(crate) const IPC_RECV_META_V2_ENCODED_LEN"),
+            "IPC_RECV_META_V2_ENCODED_LEN must remain a single const owned by syscall.rs"
         );
         for (name, src) in ALL_SUBMODULE_SRCS {
             assert!(
@@ -42431,7 +42441,7 @@ mod stage154_ipc_recv_core_boundary {
     #[test]
     fn stage154_recv_meta_len_single_definition() {
         assert!(
-            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
+            SYSCALL_SRC.contains("pub(crate) const IPC_RECV_META_V2_ENCODED_LEN"),
             "the single IPC_RECV_META_V2_ENCODED_LEN definition must stay in syscall.rs"
         );
         for (name, src) in NON_SYSCALL_SRCS {
@@ -42690,7 +42700,7 @@ mod stage155_recv_v2_codec_convergence {
     #[test]
     fn stage155_recv_meta_len_single_definition() {
         assert!(
-            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
+            SYSCALL_SRC.contains("pub(crate) const IPC_RECV_META_V2_ENCODED_LEN"),
             "the single IPC_RECV_META_V2_ENCODED_LEN definition must stay in syscall.rs"
         );
         for (name, src) in &[
@@ -43011,7 +43021,7 @@ mod stage156_ipc_smoke_oracle {
     #[test]
     fn stage156_recv_meta_len_single_definition() {
         assert!(
-            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
+            SYSCALL_SRC.contains("pub(crate) const IPC_RECV_META_V2_ENCODED_LEN"),
             "IPC_RECV_META_V2_ENCODED_LEN single definition must stay in syscall.rs"
         );
         for (name, src) in &[
@@ -43608,10 +43618,36 @@ mod stage160_aarch64_split_recv_routing {
                     .next()
             })
             .expect("the off-lock Phase A must exist");
-        assert!(
-            m.contains("self.task_asid_option_split_read(receiver_tid).is_none()"),
-            "the receiver class must be read from the EXACT requester, not the ambient task"
-        );
+        // U9-RECV-FINAL moves the classification to the CALLERS, because the two receive
+        // syscalls decode different argument slots and each must build its own request. The
+        // claim is unchanged and is checked where it now lives: every caller classifies from the
+        // exact requester TID, and no ambient current-task read returns anywhere in the family.
+        for caller in [
+            "fn try_split_ipc_recv_queued_plain_into_frame",
+            "fn try_split_ipc_recv_timeout_probe_into_frame",
+        ] {
+            let body = RUNTIME_SRC
+                .split(caller)
+                .nth(1)
+                .and_then(|s| s.split("\n    pub").next())
+                .unwrap_or_else(|| panic!("{caller} must exist"));
+            // Comments stripped: the Stage 160 parity note in this very function NAMES the
+            // ambient reader it replaced, and a guard that cannot tell prose from code would
+            // read that as the defect it is describing.
+            let code = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                code.contains("task_asid_option_split_read("),
+                "{caller} must classify the receiver from the exact requester"
+            );
+            assert!(
+                !code.contains("current_task_has_user_asid"),
+                "{caller} must not classify from the ambient current task"
+            );
+        }
         assert!(
             !m.contains("current_task_has_user_asid"),
             "no ambient current-task classification may return to Phase A"
@@ -43628,7 +43664,7 @@ mod stage160_aarch64_split_recv_routing {
             .and_then(|s| s.split("\n    /// Stage 187A — Phase B").next())
             .expect("split recv method must exist");
         assert!(
-            entry.contains("self.recv_queued_split_phase_a_split(cpu, frame, &snapshot)"),
+            entry.contains("self.recv_queued_split_phase_a_split(cpu, frame, &snapshot, &request)"),
             "the entry must dispatch Phase A through the off-lock transaction"
         );
         for broad in ["self.with_cpu(", "self.with(|"] {
@@ -43718,8 +43754,12 @@ mod stage160b_aarch64_recv_split_dispatch_audit {
         for marker in &[
             "YARM_SPLIT_DISPATCH_ENTER nr=",
             "YARM_SPLIT_DISPATCH_FALLBACK reason=",
-            "YARM_SPLIT_DISPATCH_RECV_CONSIDER nr=",
-            "YARM_SPLIT_DISPATCH_RECV_CALL",
+            // U9-RECV-FINAL §1: the two RECV_CONSIDER / RECV_CALL markers went with the
+            // non-switching dispatcher's NR 2 arm. They localized a divergence between the
+            // dispatcher and the queued-plain helper, and there is no longer a boundary there to
+            // localize: the family entry owns both lanes and reports its own outcome through
+            // `IPC_RECV_SPLIT_UNROUTED` / the lane markers. The diagnostic this stage asked for
+            // is the one below, which still names the step that fell back.
         ] {
             assert!(
                 SYSCALL_SPLIT_SRC.contains(marker),
@@ -49077,7 +49117,8 @@ mod stage187a_ipc_recv_delivery_boundary_split {
             );
         }
         assert!(
-            closure.contains("self.recv_queued_split_phase_a_split(cpu, frame, &snapshot)"),
+            closure
+                .contains("self.recv_queued_split_phase_a_split(cpu, frame, &snapshot, &request)"),
             "the entry must dispatch Phase A through the off-lock transaction"
         );
     }
@@ -62079,11 +62120,20 @@ mod stage191a_lock_retire_inventory {
 
     // INVENTORY: the split whitelist is EXACTLY {ControlPlaneSetCnodeSlots, IpcRecv,
     // VmBrk, DebugLog}. DebugLog is the newly retired class; the rest predate 191A.
+    //
+    // U9-RECV-FINAL §1 re-derives the IpcRecv term. NR 2 is a SWITCHING class now — it parks on
+    // an empty endpoint — so it is consulted before this gate rather than on it, exactly as NR 5
+    // always was. The inventory's claim is that this gate holds exactly the accepted
+    // NON-SWITCHING classes, and NR 2's absence is now part of that claim rather than a gap in
+    // it; the guard below pins the absence so the admission cannot quietly come back.
     #[test]
     fn split_whitelist_is_exactly_the_four_classes() {
         assert!(
+            !SPLIT_SRC.contains("Syscall::IpcRecv => Some(syscall),"),
+            "IpcRecv parks, so it must not be on the non-switching gate"
+        );
+        assert!(
             SPLIT_SRC.contains("Syscall::ControlPlaneSetCnodeSlots => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::IpcRecv => Some(syscall),")
                 && SPLIT_SRC.contains("Syscall::VmBrk => Some(syscall),")
                 && SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
                 // Stage 191B added FutexWake as the fifth split class.
@@ -62936,9 +62986,14 @@ mod stage191e_dispatch_next_candidate_seam {
     // the accepted classes, and every out-of-scope class stays global-lock-only.
     #[test]
     fn split_whitelist_unchanged_no_new_class() {
+        // U9-RECV-FINAL §1: IpcRecv moved to the SWITCHING classes, so it is asserted ABSENT
+        // here rather than present — the same re-derivation the 191A inventory carries.
+        assert!(
+            !SPLIT_SRC.contains("Syscall::IpcRecv => Some(syscall),"),
+            "IpcRecv parks, so it must not be on the non-switching gate"
+        );
         for accepted in [
             "Syscall::ControlPlaneSetCnodeSlots => Some(syscall),",
-            "Syscall::IpcRecv => Some(syscall),",
             "Syscall::VmBrk => Some(syscall),",
             "Syscall::DebugLog => Some(syscall),",
             "Syscall::FutexWake => Some(syscall),",
@@ -115146,22 +115201,27 @@ mod stage199d_riscv_canonical_admission {
                 "the whitelist must still admit `{nr}`"
             );
         }
-        // Nothing else was added to the whitelist. NR 2 in particular is NOT here: 199G-B §2
-        // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
+        // Nothing else was added to the whitelist. U9-RECV-FINAL §1 widens the count by exactly
+        // one — NR 2, the last recognized IPC syscall this port still excluded — and the count is
+        // what stops a nineteenth arriving without its own justification.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            18,
-            "exactly eighteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
-             FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
+            19,
+            "exactly nineteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+             FutexWait, IpcRecvTimeout, (U9-RECV-FINAL §1) IpcRecv, IpcSend, \
+             (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
              SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask, \
              (U9-EXIT1 §5) ExitCurrentTask, (U9-RESIDUAL1 §3) Yield and (U9-VM-ENTRY1) \
              VmMap + VmAnonMap + VmBrk and (U9-XFER1 §3) TransferRelease \
              plus (U9-XFER2 §3) RecvSharedV3"
         );
+        // U9-RECV-FINAL §1: NR 2 admission on RISC-V WAS a separate class with its own witness,
+        // and this package is the one that supplies it. The term is inverted rather than
+        // dropped, so the admission is pinned exactly as every other class on this list is.
         assert!(
-            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2 admission on RISC-V is a separate class with its own witness"
+            whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "RISC-V must admit NR 2 into the split dispatcher"
         );
         // The arch-tagged NR6/NR7 markers are emitted by the kernel drain, not by this gate.
         assert!(
@@ -139664,7 +139724,7 @@ mod u9c_reply_cap_ordered_transaction {
             "the split recv entry must hold no broad acquisition"
         );
         assert!(
-            entry.contains("self.recv_queued_split_phase_a_split(cpu, frame, &snapshot)"),
+            entry.contains("self.recv_queued_split_phase_a_split(cpu, frame, &snapshot, &request)"),
             "and must dispatch Phase A through the off-lock transaction"
         );
     }
@@ -144011,17 +144071,18 @@ mod u9qa_apply_convention {
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
 
-        // The shared route admits NR 5 and does NOT exclude any architecture for it. NR 2 keeps
-        // its own two-architecture gate, which is what "do not disturb NR2 admission" means.
+        // The shared route admits NR 5 and does NOT exclude any architecture for it.
+        //
+        // U9-RECV-FINAL removes the architecture exclusion entirely rather than narrowing it:
+        // it applied to NR 2 alone and existed "for want of a live witness, not for a structural
+        // reason". The guard now pins its ABSENCE, so a re-introduction has to argue for itself.
         assert!(
             SPLIT_SRC.contains("Ok(Syscall::IpcRecvTimeout) => true,"),
             "the pre-lock receive route must admit NR 5"
         );
         assert!(
-            SPLIT_SRC.contains(
-                "if !recv_timeout && !cfg!(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))"
-            ),
-            "the architecture exclusion must apply to NR 2 only"
+            !SPLIT_SRC.contains("if !recv_timeout && !cfg!(any(target_arch ="),
+            "no architecture exclusion may remain on the receive route"
         );
         // x86_64 needs no import gate: its ABI is already in the frame.
         // AArch64: the pre-split ABI import must admit NR 5, or the dispatcher sees nr=0.
@@ -144039,9 +144100,13 @@ mod u9qa_apply_convention {
             whitelist.contains("SYSCALL_IPC_RECV_TIMEOUT_NR"),
             "RISC-V must admit NR 5 into the split dispatcher"
         );
+        // U9-RECV-FINAL §1 INVERTS this term. NR 2's RISC-V admission WAS a separate class and
+        // it is the one this package converted: the exclusion was "for want of a live witness,
+        // not for a structural reason", and §4 supplies the witness. What each of these guards
+        // still says is that the class it is about did not change when NR 2 did.
         assert!(
-            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2's RISC-V admission is a separate class and stays untouched"
+            whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "RISC-V must admit NR 2 into the split dispatcher"
         );
         // And nothing in the route yields NR 5 back to the broad arm: all three publication
         // yields are scoped to NR 2, whose handler owns the hooks they protect.
@@ -144774,9 +144839,14 @@ mod u9qa_split_dispatch_disposition {
         );
     }
 
-    /// The five existing non-switching classes still go through the unchanged dispatcher, and
-    /// FutexWait is deliberately NOT on that whitelist — the whitelist's contract is that
-    /// everything on it may be early-returned.
+    /// The remaining non-switching classes still go through the unchanged dispatcher, and every
+    /// class that can PARK is deliberately NOT on that whitelist — the whitelist's contract is
+    /// that everything on it may be early-returned through the caller's own frame.
+    ///
+    /// U9-RECV-FINAL §1 moves `IpcRecv` from the first list to the second, which is this guard's
+    /// own claim applied to a class that had been miscategorised since Stage 32B: a receive on an
+    /// empty endpoint parks the caller, so it was never early-returnable. The guard gets
+    /// stronger, not weaker — it now pins the absence of two switching classes rather than one.
     #[test]
     fn futex_wait_is_not_on_the_non_switching_whitelist() {
         let whitelist = SPLIT
@@ -144784,13 +144854,14 @@ mod u9qa_split_dispatch_disposition {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the NR whitelist");
-        assert!(
-            !whitelist.contains("Syscall::FutexWait"),
-            "the switching class must never join the early-returnable whitelist"
-        );
+        for switching in ["Syscall::FutexWait => Some", "Syscall::IpcRecv => Some"] {
+            assert!(
+                !whitelist.contains(switching),
+                "a switching class must never join the early-returnable whitelist: {switching}"
+            );
+        }
         for class in [
             "Syscall::ControlPlaneSetCnodeSlots",
-            "Syscall::IpcRecv",
             "Syscall::VmBrk",
             "Syscall::DebugLog",
             "Syscall::FutexWake",
@@ -147975,9 +148046,12 @@ mod u9rx3_route {
         let futex = body
             .find("try_split_futex_wait_into_frame(")
             .expect("FutexWait is dispatched");
+        // U9-RECV-FINAL §1: the receive family is dispatched through its ONE entry, which owns
+        // both the blocking lane named here before and the immediate lane that used to sit on
+        // the non-switching whitelist. The claim is unchanged and now covers both halves.
         let recv = body
-            .find("try_split_blocking_ipc_recv_into_frame(")
-            .expect("the blocking recv is dispatched");
+            .find("try_split_ipc_recv_family_into_frame(")
+            .expect("the receive family is dispatched");
         let nonswitching = body
             .find("try_split_dispatch_nonswitching_into_frame(")
             .expect("the non-switching dispatcher");
@@ -153530,9 +153604,13 @@ mod u9mo2_nr28_terminal_edges {
             whitelist.contains("SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR"),
             "RISC-V must admit NR 28 into the split dispatcher"
         );
+        // U9-RECV-FINAL §1 INVERTS this term. NR 2's RISC-V admission WAS a separate class and
+        // it is the one this package converted: the exclusion was "for want of a live witness,
+        // not for a structural reason", and §4 supplies the witness. What each of these guards
+        // still says is that the class it is about did not change when NR 2 did.
         assert!(
-            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2's RISC-V admission is a separate class and stays untouched"
+            whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "RISC-V must admit NR 2 into the split dispatcher"
         );
     }
 
@@ -154237,9 +154315,13 @@ mod u9spawn1_nr11_terminal_edges {
             whitelist.contains("SYSCALL_SPAWN_THREAD_NR"),
             "RISC-V must admit NR 11 into the split dispatcher"
         );
+        // U9-RECV-FINAL §1 INVERTS this term. NR 2's RISC-V admission WAS a separate class and
+        // it is the one this package converted: the exclusion was "for want of a live witness,
+        // not for a structural reason", and §4 supplies the witness. What each of these guards
+        // still says is that the class it is about did not change when NR 2 did.
         assert!(
-            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2's RISC-V admission is a separate class and stays untouched"
+            whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "RISC-V must admit NR 2 into the split dispatcher"
         );
     }
 
@@ -165734,9 +165816,12 @@ mod u9yield2_family_edge {
             route.contains("Ok(Syscall::IpcRecvTimeout) => true"),
             "the blocking-recv route must admit NR 5 by decoding it"
         );
+        // U9-RECV-FINAL: the exclusion is GONE, not narrowed. It applied to NR 2 alone and
+        // existed for want of a live witness; both syscalls are now admitted on all three ports,
+        // so this pins the absence rather than the term.
         assert!(
-            route.contains("if !recv_timeout && !cfg!(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))"),
-            "and the architecture exclusion must apply to NR 2 ONLY — NR 5 is admitted on all three"
+            !route.contains("!cfg!(any(target_arch ="),
+            "no architecture exclusion may remain — both receives are admitted on all three"
         );
         assert!(
             code(RV_TRAP).contains("SYSCALL_IPC_RECV_TIMEOUT_NR"),
@@ -175905,5 +175990,485 @@ mod u9_send_final_closure {
             !SPLIT.contains("IPC_SEND_BROAD_ENTRY"),
             "the census belongs to the terminal acquisition, not to the route that avoids it"
         );
+    }
+}
+
+/// U9-RECV-FINAL — **NR 5's non-blocking probe, differentially against its canonical handler.**
+///
+/// The probe (`timeout_ticks == 0`) was the one receive still reaching the terminal broad
+/// acquisition on an ordinary boot, on every port: the blocking route refuses it by name because
+/// a probe never parks, and nothing else claimed it.
+///
+/// Every case here drives the REAL `syscall::dispatch` over a real `TrapFrame` to obtain
+/// `handle_ipc_recv_timeout`'s own answer, then drives the split lane over an identically
+/// prepared kernel, and requires the same result AND the same endpoint state. "The same error"
+/// is only half of parity: a probe that consumed a message it then refused, or left a sender
+/// parked that the canonical path would have woken, would agree on the error and disagree on
+/// everything that matters.
+#[cfg(test)]
+mod u9_recv_final_probe_parity {
+    use super::*;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
+        SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP, SYSCALL_IPC_RECV_TIMEOUT_NR, SyscallError,
+        dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    const CPU: crate::kernel::scheduler::CpuId = crate::kernel::scheduler::CpuId(0);
+
+    /// A kernel whose endpoint holds `queued` plain messages, receivable through `recv_cap`.
+    fn fixture(queued: usize) -> (SharedKernel, CapId) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            for i in 0..queued {
+                state
+                    .ipc_send(send_cap, Message::new(7, &[i as u8; 4]).expect("m"))
+                    .expect("send");
+            }
+            recv_cap
+        });
+        (kernel, recv_cap)
+    }
+
+    /// A NR 5 frame. `timeout` goes in arg 3 — the slot NR 2 uses for its metadata POINTER,
+    /// which is the whole reason this lane needs its own decode.
+    fn probe_frame(recv_cap: CapId, timeout: usize, ptr: usize, len: usize) -> TrapFrame {
+        let mut frame = TrapFrame::new(SYSCALL_IPC_RECV_TIMEOUT_NR, [0; 6]);
+        frame.set_arg(SYSCALL_ARG_CAP, recv_cap.0 as usize);
+        frame.set_arg(SYSCALL_ARG_PTR, ptr);
+        frame.set_arg(SYSCALL_ARG_LEN, len);
+        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, timeout);
+        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, 0);
+        frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, 0);
+        frame
+    }
+
+    /// Total queued depth across every live endpoint — what a refusal must leave alone.
+    fn queued_total(kernel: &SharedKernel) -> usize {
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.endpoints
+                    .iter()
+                    .flatten()
+                    .map(|e| e.queued())
+                    .sum::<usize>()
+            })
+        })
+    }
+
+    /// **An EMPTY probe answers `WouldBlock`, and is the split lane's own answer.**
+    ///
+    /// `handle_ipc_recv_timeout` passes `WouldBlock` as the `empty_error` for a `NoWait` request
+    /// — not `TimedOut`, which is what a deadline that elapsed gives. The two are different
+    /// conditions and userspace distinguishes them.
+    #[test]
+    fn an_empty_probe_answers_would_block_on_both_paths() {
+        let (broad, cap) = fixture(0);
+        let mut bf = probe_frame(cap, 0, 0, 0);
+        // The canonical handler ENCODES the empty error into the frame and answers the SYSCALL
+        // `Ok(())`; it does not return the error on the syscall channel. So the parity to check
+        // is the frame, not the return value — and getting that backwards is exactly how a split
+        // lane ends up leaving the transfer-cap return lane unwritten.
+        assert!(
+            broad.with(|s| dispatch(s, &mut bf)).is_ok(),
+            "an empty probe is a successful syscall"
+        );
+        assert_eq!(bf.error_code(), Some(SyscallError::WouldBlock.code()));
+
+        let (split, cap2) = fixture(0);
+        let mut sf = probe_frame(cap2, 0, 0, 0);
+        let split_answer = split
+            .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+            .expect("the lane answers an empty probe rather than declining");
+        assert!(
+            split_answer.is_ok(),
+            "an empty probe is a SUCCESSFUL syscall carrying an error lane"
+        );
+        assert_eq!(
+            sf.error_code(),
+            bf.error_code(),
+            "the split lane must encode the canonical empty error"
+        );
+        assert_eq!(
+            sf.ret2(),
+            bf.ret2(),
+            "and the no-transfer sentinel, which an error return would have left unwritten"
+        );
+        assert_eq!(queued_total(&split), 0, "and consume nothing");
+    }
+
+    /// **A QUEUED message is delivered**, and the endpoint depth drops by exactly one on both
+    /// paths — so the lane consumed the same single message the canonical handler does.
+    #[test]
+    fn a_queued_message_is_delivered_and_consumed_exactly_once() {
+        let (broad, cap) = fixture(2);
+        let mut bf = probe_frame(cap, 0, 0, 0);
+        let broad_answer = broad.with(|s| dispatch(s, &mut bf)).err();
+        assert_eq!(broad_answer, None, "the canonical handler delivers");
+        assert_eq!(queued_total(&broad), 1, "and consumes exactly one");
+
+        let (split, cap2) = fixture(2);
+        let mut sf = probe_frame(cap2, 0, 0, 0);
+        let split_answer = split
+            .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+            .expect("the lane serves a queued message");
+        assert!(split_answer.is_ok(), "the split lane delivers too");
+        assert_eq!(
+            queued_total(&split),
+            1,
+            "and consumes exactly one — never zero, never two"
+        );
+    }
+
+    /// The delivered frame agrees lane-to-handler on the lanes userspace reads.
+    #[test]
+    fn the_delivered_frame_matches_the_canonical_handlers() {
+        let (broad, cap) = fixture(1);
+        let mut bf = probe_frame(cap, 0, 0, 0);
+        assert!(broad.with(|s| dispatch(s, &mut bf)).is_ok());
+
+        let (split, cap2) = fixture(1);
+        let mut sf = probe_frame(cap2, 0, 0, 0);
+        assert!(
+            split
+                .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+                .expect("serviced")
+                .is_ok()
+        );
+        assert_eq!(sf.ret0(), bf.ret0(), "ret0 (sender tid) must agree");
+        assert_eq!(sf.ret1(), bf.ret1(), "ret1 (length) must agree");
+        assert_eq!(sf.ret2(), bf.ret2(), "ret2 (transfer cap lane) must agree");
+        assert_eq!(
+            sf.error_code(),
+            bf.error_code(),
+            "the error lane must agree"
+        );
+    }
+
+    /// **An invalid receive capability is ANSWERED, not declined** — the broad path raises the
+    /// identical error, so handing it over would only be a slower route to the same result. And
+    /// the capability is validated BEFORE anything about the payload is looked at.
+    #[test]
+    fn an_invalid_capability_is_answered_with_the_canonical_error() {
+        let (broad, _cap) = fixture(1);
+        let mut bf = probe_frame(CapId(4242), 0, 0, 0);
+        let broad_answer = broad.with(|s| dispatch(s, &mut bf)).err();
+        assert_eq!(broad_answer, Some(SyscallError::InvalidCapability));
+
+        let (split, _cap2) = fixture(1);
+        let mut sf = probe_frame(CapId(4242), 0, 0, 0);
+        let split_answer = split
+            .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+            .expect("a resolution failure is answered, not declined");
+        assert_eq!(
+            split_answer.err().map(|e| match e {
+                crate::kernel::boot::TrapHandleError::Syscall(s) => s,
+                other => panic!("unexpected error channel: {other:?}"),
+            }),
+            broad_answer
+        );
+        assert_eq!(
+            queued_total(&split),
+            1,
+            "a refused probe consumes no queued message"
+        );
+    }
+
+    /// **A NON-ZERO timeout is not this lane's**, at any queue depth. The blocking route owns it,
+    /// and a probe lane that took it would answer a timed receive without arming its deadline.
+    #[test]
+    fn a_timed_receive_is_never_taken_by_the_probe_lane() {
+        for queued in [0usize, 1] {
+            let (split, cap) = fixture(queued);
+            let mut sf = probe_frame(cap, 5, 0, 0);
+            assert!(
+                split
+                    .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+                    .is_none(),
+                "queued={queued}: a non-zero timeout belongs to the blocking route"
+            );
+            assert_eq!(queued_total(&split), queued, "and nothing was consumed");
+        }
+    }
+
+    /// The lane reads NR 5's OWN argument slots. Arg 3 is the timeout; putting a non-zero value
+    /// there must move the request out of this lane even though the same slot holds NR 2's
+    /// metadata pointer — which is the confusion the separate decode exists to prevent.
+    #[test]
+    fn arg_three_is_a_timeout_here_and_not_a_metadata_pointer() {
+        let (split, cap) = fixture(1);
+        // A plausible user metadata POINTER in arg 3. For NR 2 this would select a recv-v2
+        // writeback; for NR 5 it is a timeout, and a large one.
+        let mut sf = probe_frame(cap, 0x4000, 0, 0);
+        assert!(
+            split
+                .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+                .is_none(),
+            "arg 3 must be read as a timeout, so this is a TIMED receive and not a probe"
+        );
+        assert_eq!(queued_total(&split), 1);
+    }
+
+    /// The lane never parks, never arms a deadline and never commits a queue advance — on an
+    /// empty endpoint, which is the only state in which any of those would be tempting.
+    #[test]
+    fn an_empty_probe_publishes_nothing() {
+        let (split, cap) = fixture(0);
+        let before = split.with(|s| {
+            (
+                s.with_ipc_state(|ipc| ipc.endpoint_waiters.iter().filter(|w| w.is_some()).count()),
+                s.current_tid(),
+            )
+        });
+        let mut sf = probe_frame(cap, 0, 0, 0);
+        let answer = split
+            .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+            .expect("answered");
+        assert!(answer.is_ok(), "an empty probe is a successful syscall");
+        assert_eq!(sf.error_code(), Some(SyscallError::WouldBlock.code()));
+        let after = split.with(|s| {
+            (
+                s.with_ipc_state(|ipc| ipc.endpoint_waiters.iter().filter(|w| w.is_some()).count()),
+                s.current_tid(),
+            )
+        });
+        assert_eq!(
+            before, after,
+            "no receiver waiter published and no current task changed"
+        );
+    }
+
+    /// The lane's structure: it decodes NR 5's own ABI and drives the SHARED engine, rather than
+    /// rewriting the syscall number or duplicating a receive.
+    #[test]
+    fn the_lane_reuses_the_shared_engine_through_nr5s_own_builder() {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        let body = RUNTIME
+            .split("pub fn try_split_ipc_recv_timeout_probe_into_frame")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub fn ").next())
+            .expect("the probe lane");
+        assert!(
+            body.contains("RecvRequest::from_ipc_recv_timeout("),
+            "the request must be built by NR 5's own builder"
+        );
+        assert!(
+            !body.contains("from_legacy_ipc_recv"),
+            "NR 5 must never be decoded through NR 2's builder"
+        );
+        assert!(
+            !body.contains("set_syscall_num") && !body.contains("SYSCALL_IPC_RECV_NR"),
+            "the frame's syscall number must never be rewritten"
+        );
+        assert!(
+            body.contains("self.recv_queued_split_phase_a_split("),
+            "delivery must go through the one shared engine"
+        );
+        // One engine, two callers — not two engines.
+        assert_eq!(
+            RUNTIME
+                .matches("fn recv_queued_split_phase_a_split(")
+                .count(),
+            1,
+            "there must be exactly one delivery engine"
+        );
+    }
+}
+
+/// U9-RECV-FINAL — **the boot chain that must not depend on broad-dispatch traffic.**
+///
+/// Two of the things hooked to `handle_trap_event`'s syscall and timer arms are not diagnostics,
+/// and the distinction was traced rather than taken from their names:
+///
+/// * `maybe_run_unlock_graduated_proof` runs a real D3 scratch transaction — create an address
+///   space, allocate a memory object, map, verify, unmap, release both leaf capabilities, destroy
+///   — bracketed by a PT-pool leak check, and ends by calling
+///   `set_unlock_graduated_proof_completed()`, which is the ORDERING GATE
+///   `maybe_run_x86_smp_unlock_audit` requires before `ap_scheduler_online_admission`. A boot
+///   where it never runs is a boot where APs can never be admitted.
+/// * `maybe_run_cross_arch_live_audit` reads topology counts and emits markers. No mutation, and
+///   a core-smoke requirement.
+///
+/// Unlocking removes the terminal acquisition family by family, so anything hooked to it starves.
+/// Both now run from boot ownership points that ALREADY hold their reference, so the census is
+/// unchanged; each keeps its one-shot latch, so the trap-path drivers can still serve a boot that
+/// does reach them, and neither can run twice.
+#[cfg(test)]
+mod u9_recv_final_boot_chain {
+    const ORCH: &str = include_str!("orchestrator_state.rs");
+    const X86: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    /// Comments stripped: these guards are about what the code DOES, and the prose in this very
+    /// module names the calls it describes — a checker that cannot tell the two apart counts a
+    /// doc comment as a second setter, which is exactly what it did the first time.
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} is missing"));
+        let open = src[start..].find('{').expect("a body") + start;
+        let bytes = src.as_bytes();
+        let (mut depth, mut i) = (0usize, open);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("{signature} has an unbalanced body");
+    }
+
+    /// The required work runs from a boot ownership point on EVERY port, and the completion flag
+    /// that gates AP admission is set there — not wherever a trap happens to land.
+    #[test]
+    fn the_graduated_proof_runs_from_bootstrap_on_every_port() {
+        for (port, src) in [("x86_64", X86), ("aarch64", AARCH64), ("riscv64", RISCV)] {
+            assert!(
+                src.contains(
+                    "kernel.run_unlock_graduated_proof_at_bootstrap(RING3_INIT_SERVER_TID)"
+                ),
+                "{port} must drive the graduated proof from bootstrap"
+            );
+        }
+        // The completion flag still means the work COMPLETED: it is set inside the proof body,
+        // after the scratch check and the verdict, and nowhere else.
+        assert_eq!(
+            code_of(ORCH)
+                .matches("set_unlock_graduated_proof_completed()")
+                .count(),
+            1,
+            "the completion flag must have exactly one setter"
+        );
+        let body = body_of(ORCH, "fn run_unlock_graduated_proof_with(");
+        let d3 = body
+            .find("unlock_graduated_d3_scratch_check(cnode)")
+            .expect("the scratch transaction");
+        let flag = body
+            .find("set_unlock_graduated_proof_completed()")
+            .expect("the completion flag");
+        assert!(
+            d3 < flag,
+            "the flag must be set AFTER the scratch transaction, never before"
+        );
+    }
+
+    /// **The mint target and the release target are the same cnode.** The scratch check mints
+    /// through `create_user_address_space` / `alloc_anonymous_memory_object`, which use the
+    /// CURRENT task's cspace, and releases from the cnode it is handed. Handing it a different
+    /// task's cnode made it mint into one cspace and delete from another — measured live as
+    /// `mem_leaf=false aspace_leaf=false mo_leak=true`, a memory object never released.
+    #[test]
+    fn the_bootstrap_driver_uses_the_cnode_the_mint_actually_targets() {
+        let body = body_of(ORCH, "fn run_unlock_graduated_proof_at_bootstrap(");
+        assert!(
+            body.contains("self.current_task_cnode()"),
+            "the bootstrap driver must resolve the CURRENT cnode"
+        );
+        assert!(
+            !body.contains("self.task_cnode("),
+            "a named task's cnode is not where the scratch capabilities are minted"
+        );
+    }
+
+    /// One policy: both drivers share the latch and the body, so the scratch transaction cannot
+    /// run twice and cannot drift into two implementations.
+    #[test]
+    fn the_two_drivers_share_one_latch_and_one_body() {
+        for driver in [
+            "fn run_unlock_graduated_proof_at_bootstrap(",
+            "fn maybe_run_unlock_graduated_proof(",
+        ] {
+            let body = body_of(ORCH, driver);
+            assert!(
+                body.contains("unlock_graduated_proof_try_start()"),
+                "{driver} must claim the shared one-shot latch"
+            );
+            assert!(
+                body.contains("self.run_unlock_graduated_proof_with("),
+                "{driver} must delegate to the one body"
+            );
+        }
+        assert_eq!(
+            code_of(ORCH)
+                .matches("fn run_unlock_graduated_proof_with(")
+                .count(),
+            1,
+            "exactly one proof body"
+        );
+        for driver in [
+            "fn run_cross_arch_live_audit_at_first_dispatch(",
+            "fn maybe_run_cross_arch_live_audit(",
+        ] {
+            let body = body_of(ORCH, driver);
+            assert!(
+                body.contains("cross_arch_live_audit_try_start()"),
+                "{driver} must claim the shared one-shot latch"
+            );
+            assert!(
+                body.contains("self.cross_arch_live_audit_body("),
+                "{driver} must delegate to the one body"
+            );
+        }
+        assert_eq!(
+            code_of(ORCH)
+                .matches("fn cross_arch_live_audit_body(")
+                .count(),
+            1,
+            "exactly one audit body"
+        );
+    }
+
+    /// **No acquisition was added.** The relocation reuses references the boot already holds: the
+    /// graduated proof takes `&mut KernelState` from `bootstrap_first_user_task`, and the
+    /// read-only audit takes `&KernelState` from the first-dispatch entry. Neither driver opens a
+    /// broad acquisition, and the read-only one cannot — its receiver is shared.
+    #[test]
+    fn neither_driver_opens_a_broad_acquisition() {
+        for driver in [
+            "fn run_unlock_graduated_proof_at_bootstrap(",
+            "fn run_cross_arch_live_audit_at_first_dispatch(",
+        ] {
+            let body = body_of(ORCH, driver);
+            for broad in ["with_cpu(", "self.with(|", ".with(|state"] {
+                assert!(
+                    !body.contains(broad),
+                    "{driver} must not open a broad acquisition ({broad})"
+                );
+            }
+        }
+        assert!(
+            ORCH.contains("fn run_cross_arch_live_audit_at_first_dispatch(&self, tid: u64)"),
+            "the read-only audit must take a SHARED reference, so it cannot mutate or acquire"
+        );
+        assert!(
+            ORCH.contains("fn cross_arch_live_audit_body(&self, tid: u64)"),
+            "and its body likewise"
+        );
+        for (port, src) in [("x86_64", X86), ("aarch64", AARCH64), ("riscv64", RISCV)] {
+            assert!(
+                src.contains("kernel.run_cross_arch_live_audit_at_first_dispatch(tid)"),
+                "{port} must drive the live audit at first dispatch"
+            );
+        }
     }
 }

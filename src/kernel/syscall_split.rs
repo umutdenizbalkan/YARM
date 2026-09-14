@@ -683,6 +683,45 @@ impl SplitDispatchDisposition {
 /// advance of its own — its park hands one to the post-work drain instead — so
 /// `QueueAdvanceCommitted` is absent too, and the type states that rather than leaving it to a
 /// comment.
+/// U9-RECV-FINAL §1 — the outcome of a **recognized** NR 2 / NR 5, which is a strictly smaller
+/// set than `SplitDispatchDisposition`.
+///
+/// The receive family had two entry points and both could answer `NotHandled` long after they had
+/// recognized the syscall — the queued lane through an `Option`, the blocking lane through
+/// eighteen separate declines. Those were not "this trap is not a receive"; they were a
+/// recognized receive being handed to the terminal broad dispatcher.
+///
+/// Giving the recognized body its own return type is what makes that unrepeatable, as it did for
+/// NR 1 and NR 7. A receive can finish immediately, it can PARK — which is why
+/// `QueueAdvanceCommitted` is present here and absent from the send type — and it can owe the
+/// post-work drain a delivery. It can never ask the broad dispatcher to service it.
+#[derive(Debug)]
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) enum SplitRecvDisposition {
+    /// The syscall is finished and its result is in the frame.
+    Complete(Result<(), TrapHandleError>),
+    /// The receiver is PARKED: a terminal transition is published, the caller is no longer
+    /// current, and the existing D2-recv drain owes the queue advance.
+    QueueAdvanceCommitted,
+    /// A delivery the post-work drain owes.
+    PostWorkCommitted { finalize_syscall: bool },
+}
+
+impl SplitRecvDisposition {
+    /// Widen to the dispatcher's type. Total by construction: every arm names a committed
+    /// outcome, so widening can never introduce the `NotHandled` the narrow type excludes.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn into_dispatch(self) -> SplitDispatchDisposition {
+        match self {
+            Self::Complete(result) => SplitDispatchDisposition::Complete(result),
+            Self::QueueAdvanceCommitted => SplitDispatchDisposition::QueueAdvanceCommitted,
+            Self::PostWorkCommitted { finalize_syscall } => {
+                SplitDispatchDisposition::PostWorkCommitted { finalize_syscall }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 pub(crate) enum SplitSendDisposition {
@@ -743,7 +782,7 @@ pub(crate) fn try_split_dispatch_into_frame(
     // It runs AFTER the non-blocking queued-plain recv would have, in the sense that matters:
     // this route admits ONLY the state in which that one declines (an empty buffered endpoint with
     // no waiters), so the two never contend for the same trap.
-    match try_split_blocking_ipc_recv_into_frame(shared, cpu, frame) {
+    match try_split_ipc_recv_family_into_frame(shared, cpu, frame) {
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
@@ -1603,6 +1642,150 @@ fn try_split_ipc_send_into_frame(
     SplitDispatchDisposition::NotHandled
 }
 
+/// U9-RECV-FINAL §1 — **THE receive family entry**, and the only thing it decides.
+///
+/// It answers one question: is this trap an `IpcRecv` or an `IpcRecvTimeout`? A `NotHandled` from
+/// here is not a fall-through — it is a different syscall, for which this route has no opinion.
+/// Everything a RECOGNIZED receive can produce is settled by the body below, whose return type
+/// cannot express "hand this to the broad dispatcher".
+///
+/// The family used to have TWO entry points. The blocking lane sat at the switching position and
+/// could decline for eighteen distinct reasons; the immediate lane sat in the NON-SWITCHING
+/// whitelist — whose contract is that every class on it may be early-returned through the
+/// caller's own frame, which is false of a receive that parks — and declined through an `Option`.
+/// Each decline, in both, was a recognized receive reaching the terminal broad acquisition.
+fn try_split_ipc_recv_family_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    let Ok(syscall @ (Syscall::IpcRecv | Syscall::IpcRecvTimeout)) =
+        Syscall::decode(frame.syscall_num())
+    else {
+        return SplitDispatchDisposition::NotHandled;
+    };
+    match try_split_recv_recognized(shared, cpu, frame) {
+        Some(settled) => settled.into_dispatch(),
+        // U9-RECV-FINAL §1 — THE terminal-entry measurement for the receive family, once per
+        // trap and in exactly one place, so a claim about `broad_entries` means what it says.
+        //
+        // This package does NOT close the family, and the type reflects that honestly rather
+        // than hiding it: the classes still listed in `RecvResidualClass` have no pre-lock owner
+        // yet, and each one that takes this door is counted and named. What changed is that a
+        // decline from a lane that DOES have an owner no longer arrives here — it reaches the
+        // next lane — and that the two admission escapes are settled rather than handed over.
+        None => {
+            crate::kernel::boot::note_recv_broad_entry();
+            crate::yarm_log!(
+                "IPC_RECV_SPLIT_UNROUTED cpu={} nr={} result=broad_entry",
+                cpu.0,
+                if matches!(syscall, Syscall::IpcRecv) {
+                    2
+                } else {
+                    5
+                }
+            );
+            SplitDispatchDisposition::NotHandled
+        }
+    }
+}
+
+/// U9-RECV-FINAL §1/§2 — a RECOGNIZED receive, and the order its lanes are consulted in.
+///
+/// The two admission escapes are settled with the error the broad path produces for the same
+/// condition, derived from source exactly as NR 1's were:
+///
+/// * **`cpu_idx >= MAX_CPUS`.** The broad phase is `with_cpu(cpu, ..)`, which runs
+///   `set_current_cpu(cpu)?` BEFORE its closure — `validate_online_cpu` → `check_cpu` →
+///   `SchedulerError::InvalidCpu` → `map_scheduler_error` → `KernelError::WrongObject` →
+///   `SyscallError::WrongObject`, closure never entered. The broad dispatcher does not service
+///   that trap either; it produces the same error one lock later.
+/// * **No current task.** `handle_ipc_recv` reads `current_tid().unwrap_or(0)` and then calls
+///   `validate_endpoint_right(cap, RECEIVE)?`, whose first step is `current_task_cnode()`; with
+///   no current task that is `None`, so the answer is `InvalidCapability` — not the `Internal`
+///   that a `current_tid()?` would give, because this handler never asks that question.
+///
+/// ## Lane order, and why it is this one
+///
+/// The BLOCKING lane is consulted first, as it was before this package, because it admits only
+/// the state in which the immediate lane declines — an endpoint with nothing to take — and
+/// refuses with `would_not_block` the moment a message is waiting. The two are disjoint, so the
+/// order is a preservation of live behaviour rather than a policy choice.
+///
+/// A decline from either lane is INTERNAL: it reaches the next pre-lock owner, never the broad
+/// dispatcher. That is the whole point of the narrow return type.
+fn try_split_recv_recognized(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<SplitRecvDisposition> {
+    use crate::kernel::syscall::SyscallError;
+    use SplitRecvDisposition as D;
+
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        crate::yarm_log!(
+            "IPC_RECV_SPLIT_INVARIANT cpu={} reason=cpu_out_of_range result=failed_closed",
+            cpu.0
+        );
+        return Some(D::Complete(Err(TrapHandleError::Syscall(
+            SyscallError::WrongObject,
+        ))));
+    }
+    let Some(_tid) = shared.current_tid_authoritative(cpu) else {
+        crate::yarm_log!(
+            "IPC_RECV_SPLIT_REFUSED cpu={} reason=no_current_task err=InvalidCapability",
+            cpu.0
+        );
+        return Some(D::Complete(Err(TrapHandleError::Syscall(
+            SyscallError::InvalidCapability,
+        ))));
+    };
+
+    // (3) The BLOCKING lane. It declines whenever a message is already waiting.
+    //
+    // This is the one half of the family that cannot exist on the hosted profile: it parks a
+    // task and publishes into a queue-advance drain no hosted build runs. The IMMEDIATE lane
+    // below is production code the hosted cases drive directly, so it stays compiled — removing
+    // it from this entry is what would break them, not the profile gate.
+    #[cfg(not(feature = "hosted-dev"))]
+    match try_split_blocking_ipc_recv_into_frame(shared, cpu, frame) {
+        SplitDispatchDisposition::NotHandled => {}
+        SplitDispatchDisposition::Complete(result) => return Some(D::Complete(result)),
+        SplitDispatchDisposition::QueueAdvanceCommitted => {
+            return Some(D::QueueAdvanceCommitted);
+        }
+        SplitDispatchDisposition::PostWorkCommitted { finalize_syscall } => {
+            return Some(D::PostWorkCommitted { finalize_syscall });
+        }
+    }
+
+    // (4) The IMMEDIATE lanes, one per syscall, because the two decode DIFFERENT argument
+    // slots. NR 5 carries its timeout in arg 3 — the slot NR 2 uses for its recv-v2 metadata
+    // pointer — so each builds its own `RecvRequest` and both drive the same delivery engine.
+    // Neither rewrites the frame's syscall number into the other's.
+    match Syscall::decode(frame.syscall_num()) {
+        Ok(Syscall::IpcRecv) => {
+            if let Some(result) = try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame) {
+                return Some(D::Complete(result));
+            }
+        }
+        Ok(Syscall::IpcRecvTimeout) => {
+            // The NON-BLOCKING probe. The blocking lane above refuses it by name
+            // (`reason=not_timed_recv`) because a probe never parks, and until this lane existed
+            // nothing else claimed it — so every `timeout_ticks == 0` receive reached the
+            // terminal broad acquisition, on every port.
+            if let Some(result) = shared.try_split_ipc_recv_timeout_probe_into_frame(cpu, frame) {
+                return Some(D::Complete(result));
+            }
+        }
+        _ => {}
+    }
+
+    // (5) Not yet owned pre-lock. Named and counted by the entry above.
+    None
+}
+
 /// U9-RX3 §3 — service a BLOCKING `IpcRecv` (NR 2) off the broad lock.
 ///
 /// This is the migration of the existing block-and-publish sequence onto the four SharedKernel
@@ -1678,9 +1861,13 @@ fn try_split_blocking_ipc_recv_into_frame(
         Ok(Syscall::IpcRecv) => false,
         _ => return D::NotHandled,
     };
-    if !recv_timeout && !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
-        return D::NotHandled;
-    }
+    // U9-RECV-FINAL §1 retires the architecture exclusion this gate carried.
+    //
+    // The comment above it said exactly why it existed — "RISC-V is excluded for want of a live
+    // witness, not for a structural reason: its D2-recv drain is the same shape" — and NR 5,
+    // which shares this route step for step, has been admitted on all three ports throughout.
+    // §4 supplies the witness, so the term is gone rather than narrowed.
+    let _ = recv_timeout;
     let cpu_idx = cpu.0 as usize;
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return D::NotHandled;
@@ -2707,13 +2894,18 @@ fn try_split_dispatch_nonswitching_into_frame(
     // back to the global-lock fallback below — the split path never converts a
     // would-be-fallback into a `Some(Err(..))` (it only returns `Some(Err)` for a
     // cap-resolution error the old path would have raised identically).
-    if matches!(syscall, Syscall::IpcRecv) {
-        if probe {
-            crate::yarm_log!("YARM_SPLIT_DISPATCH_RECV_CONSIDER nr={}", raw_nr);
-            crate::yarm_log!("YARM_SPLIT_DISPATCH_RECV_CALL");
-        }
-        return try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame);
-    }
+    // U9-RECV-FINAL §1 — NR 2 no longer appears here, and is no longer on the NR whitelist
+    // above either.
+    //
+    // It used to be routed to the queued-plain helper from the NON-SWITCHING dispatcher, whose
+    // contract is that every class on it may be early-returned through the caller's own frame.
+    // That was never true of a receive: an empty endpoint parks the caller. The two halves of the
+    // family were also separate entry points, each free to answer `NotHandled` after recognizing
+    // the syscall.
+    //
+    // `try_split_ipc_recv_family_into_frame` is now the ONE entry, consulted with the other
+    // switching classes, and the queued-plain helper is one of its internal lanes. A decline from
+    // that lane reaches the next pre-lock owner instead of a second dispatcher entry.
 
     // Stage 114: `VmBrk` (NR 14) is routed to the dedicated brk-shrink helper
     // for the same reason `IpcRecv` is above — eligibility (group leader,
@@ -6799,11 +6991,16 @@ fn try_split_spawn_from_mo_into_frame(
 fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
     match syscall {
         Syscall::ControlPlaneSetCnodeSlots => Some(syscall),
-        // Stage 32B: IpcRecv (NR 2) passes the NR gate so the live seam attempts the
-        // kernel-task queued-plain split via `try_split_ipc_recv_queued_plain_into_frame`.
-        // Final eligibility (kernel-task receiver, queued plain, no sender-wake/recv-v2)
-        // is decided inside that helper; ineligible cases return `None` → fallback.
-        Syscall::IpcRecv => Some(syscall),
+        // U9-RECV-FINAL §1: IpcRecv (NR 2) is NO LONGER on this whitelist.
+        //
+        // Stage 32B admitted it here so the seam could attempt the queued-plain split. The
+        // whitelist's contract, though, is that every class on it may be early-returned through
+        // the caller's own frame — and that is false of a receive, which parks when the endpoint
+        // is empty. NR 2 is now consulted with the other SWITCHING classes, through
+        // `try_split_ipc_recv_family_into_frame`, which owns both of the family's lanes.
+        //
+        // Leaving it here as well would give one syscall two entry points into the dispatcher,
+        // and the second would be consulted precisely when the first had already declined.
         // U9-VM-ENTRY1: the three VM entries. Stage 114 admitted NR 14 here so the seam could
         // ATTEMPT a page-crossing shrink, with every other shape declining to the broad handler.
         // That conditional admission is gone: all three routes are TOTAL, so passing this gate is
@@ -7533,8 +7730,10 @@ mod tests {
                 continue;
             };
             let eligible = classify_split_eligible_nr_only(syscall).is_some();
+            // U9-RECV-FINAL §1: NR 2 left this set. It is a SWITCHING class now — it parks
+            // when the endpoint is empty — so it is consulted before this gate, exactly as
+            // NR 5 always was. Its absence here is the claim, not an omission.
             if nr == SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR
-                || nr == SYSCALL_IPC_RECV_NR
                 // U9-VM-ENTRY1: the three VM entries. NR 14 was already here for its one
                 // conditional shape; NR 3 and NR 13 join it, and all three are now TOTAL.
                 || nr == crate::kernel::syscall::SYSCALL_VM_MAP_NR
@@ -7696,10 +7895,19 @@ mod tests {
 
     #[test]
     fn stage32b_ipc_recv_classify_nr2_eligible() {
-        // NR 2 (IpcRecv) now passes the NR-only split-eligibility gate.
+        // U9-RECV-FINAL §1 INVERTS this guard, on the reasoning its NR 5 sibling below has
+        // carried all along.
+        //
+        // Stage 32B admitted NR 2 to the NR-only gate so the seam could attempt the queued-plain
+        // split. That gate's contract is that everything on it is non-switching and may be
+        // early-returned through the caller's own frame — and a receive on an empty endpoint
+        // parks the caller. NR 2 is now consulted with the switching classes, through the family
+        // entry that owns BOTH of its lanes, so it must no longer pass this gate: leaving it
+        // here would give one syscall two entry points, the second consulted exactly when the
+        // first had declined.
         assert!(
-            classify_split_eligible_nr_only(decode(SYSCALL_IPC_RECV_NR)).is_some(),
-            "IpcRecv (NR 2) must be split-eligible at the NR gate"
+            classify_split_eligible_nr_only(decode(SYSCALL_IPC_RECV_NR)).is_none(),
+            "IpcRecv (NR 2) is a switching class and must not be on the NR-only gate"
         );
         // And the arg-level classifier maps it to the IpcRecvKernelTask variant.
         assert_eq!(

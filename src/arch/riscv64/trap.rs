@@ -900,6 +900,22 @@ pub fn handle_riscv_trap_entry_shared(
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR
             || nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
+            // U9-RECV-FINAL §1: IpcRecv (NR 2). It was the ONE recognized IPC syscall this
+            // whitelist still excluded, and the exclusion was the single largest residual in the
+            // receive family: with NR 2 absent, every `IpcRecv` on this port — the queued
+            // deliveries as much as the blocking ones — went to the terminal broad dispatcher,
+            // while the same traps were served pre-lock on the other two.
+            //
+            // It was never structural. The blocking route's own gate said so — "RISC-V is
+            // excluded for want of a live witness, not for a structural reason: its D2-recv drain
+            // is the same shape" — and NR 5, which shares that route step for step, has been
+            // admitted here all along. §4 supplies the witness the exclusion was waiting on.
+            //
+            // The shape is the one this port already runs for the other switching classes: a
+            // parked receive answers `QueueAdvanceCommitted`, the existing D2-recv drain performs
+            // the advance, and the bridge's own capture carries the advanced `sepc` into the
+            // outgoing TCB.
+            || nr == crate::kernel::syscall::SYSCALL_IPC_RECV_NR
             || nr == crate::kernel::syscall::SYSCALL_IPC_SEND_NR
             // U9-MO2 §4: CreateInitramfsFileSliceMo (NR 28). Same reason as the classes above
             // — the route is architecture-neutral but reachable here only for a listed NR. It

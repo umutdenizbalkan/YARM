@@ -799,8 +799,19 @@ if (( riscv_split_nr29 != 5 )); then
   echo "[fail] RISC-V SpawnFromMemoryObject split count is ${riscv_split_nr29}, expected 5"
   failures=$((failures + 1))
 fi
-if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 )); then
-  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29})"
+# U9-RECV-FINAL §1: NR 2 (`IpcRecv`) joins the retired set. It was the last recognized IPC
+# syscall this port excluded, so until now every `IpcRecv` on RISC-V — queued deliveries as much
+# as blocking ones — reached the terminal broad dispatcher while the same traps were served
+# pre-lock on the other two ports. The accounting is WIDENED by exactly one term, never relaxed:
+# the sum below is still what catches a syscall being serviced that nobody authorized.
+riscv_split_nr2=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=2 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr2=${riscv_split_nr2:-0}
+if (( riscv_split_nr2 == 0 )); then
+  echo "[fail] RISC-V serviced no IpcRecv through the split dispatcher (nr2=0)"
+  failures=$((failures + 1))
+fi
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 + riscv_split_nr2 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 )); then
+  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5} nr2=${riscv_split_nr2} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29})"
   failures=$((failures + 1))
 fi
 

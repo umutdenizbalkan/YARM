@@ -1142,6 +1142,14 @@ pub fn bootstrap_first_user_task(
         },
         INITRAMFS_HELLO_WORLD_IMAGE_ID
     );
+    // U9-RECV-FINAL — run the graduated proof HERE, while `&mut KernelState` is already held.
+    //
+    // It is not diagnostics: it runs the D3 scratch transaction and sets the completion flag that
+    // gates `ap_scheduler_online_admission`. Its only trigger was the terminal broad acquisition,
+    // which unlocking is removing — see `run_unlock_graduated_proof_at_bootstrap`. Placed at the
+    // END of bootstrap so init's cnode exists, and before any AP is online, which is the
+    // single-CPU topology the proof requires rather than merely happens to find.
+    kernel.run_unlock_graduated_proof_at_bootstrap(RING3_INIT_SERVER_TID);
     Ok(())
 }
 
@@ -1159,6 +1167,14 @@ pub fn enter_dispatched_user_task_if_available(
     kernel: &crate::kernel::boot::KernelState,
     dispatched_tid: Option<u64>,
 ) {
+    if let Some(tid) = dispatched_tid {
+        // U9-RECV-FINAL — the cross-arch live audit runs HERE, at first dispatch, while
+        // `&KernelState` is already held. Read-only, one-shot, shared latch with the trap-path
+        // driver. Its topology claim only becomes true once a user task is actually running, which
+        // is why it is not at `bootstrap_first_user_task` with the graduated proof.
+        kernel.run_cross_arch_live_audit_at_first_dispatch(tid);
+    }
+
     const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
     let Some(tid) = dispatched_tid else {
         if DEBUG_DISPATCH_CONTEXT_LOG {

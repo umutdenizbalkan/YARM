@@ -779,6 +779,32 @@ impl KernelState {
     ///
     /// It live-wires nothing, performs no user-memory copy / dispatch / restore, and is
     /// pure observability. Any anomaly is a `CROSS_ARCH_*_BLOCKED`/`_FAIL` marker.
+    /// U9-RECV-FINAL — the FIRST-DISPATCH driver for the cross-arch live audit.
+    ///
+    /// Traced rather than assumed: the body below reads `online_cpu_count`,
+    /// `dispatching_cpu_count` and the accepted-seam predicates and emits markers. It performs
+    /// no mutation — no scheduler write, no placement change, no capability or VM work — so
+    /// unlike the graduated proof it is genuinely reporting, and `&self` is enough.
+    ///
+    /// Its prerequisite is NOT the graduated proof's. The topology claim it makes ("dispatching
+    /// >= 1 whenever a user task is current") is only meaningful once a user task is actually
+    /// running, so `bootstrap_first_user_task` is too early — init exists there but nothing
+    /// dispatches it, and the audit would refuse with `accounting_bad`. The first-dispatch entry
+    /// holds `&KernelState` at exactly the moment the claim becomes true, and holds it already,
+    /// so this adds no acquisition either.
+    ///
+    /// One-shot latch shared with the trap-path driver.
+    pub(crate) fn run_cross_arch_live_audit_at_first_dispatch(&self, tid: u64) {
+        if tid == 0 {
+            return;
+        }
+        if !crate::kernel::boot::cross_arch_live_audit_try_start() {
+            return;
+        }
+        crate::yarm_log!("CROSS_ARCH_LIVE_ORIGIN origin=first_dispatch tid={}", tid);
+        self.cross_arch_live_audit_body(tid);
+    }
+
     pub(crate) fn maybe_run_cross_arch_live_audit(&mut self) {
         let Some(tid) = self.current_tid() else {
             return;
@@ -789,7 +815,12 @@ impl KernelState {
         if !crate::kernel::boot::cross_arch_live_audit_try_start() {
             return; // one-shot
         }
+        crate::yarm_log!("CROSS_ARCH_LIVE_ORIGIN origin=trap tid={}", tid);
+        self.cross_arch_live_audit_body(tid);
+    }
 
+    /// U9-RECV-FINAL — the audit body, shared by both drivers. Reads only.
+    fn cross_arch_live_audit_body(&self, tid: u64) {
         let arch = if cfg!(target_arch = "x86_64") {
             "x86_64"
         } else if cfg!(target_arch = "aarch64") {
@@ -1253,6 +1284,70 @@ impl KernelState {
     /// the compact D3 scratch check, and emits the graduated OK/INVARIANT/DONE markers.
     /// It changes no behavior (the gates were already set at apply); it only verifies +
     /// reports.
+    /// U9-RECV-FINAL — the BOOTSTRAP driver for the graduated proof.
+    ///
+    /// # Why this exists
+    ///
+    /// The proof is not diagnostics. It runs a real D3 scratch transaction — create a user
+    /// address space, allocate an anonymous memory object, map a page, verify it, unmap, release
+    /// both leaf capabilities, destroy the address space — bracketed by a PT-pool leak check, and
+    /// it ends by calling `set_unlock_graduated_proof_completed()`, which is the ORDERING GATE
+    /// that `maybe_run_x86_smp_unlock_audit` requires before it calls
+    /// `ap_scheduler_online_admission`. So a boot where it never runs is a boot where AP
+    /// scheduler-online admission can never happen.
+    ///
+    /// Its only trigger was `handle_trap_event`'s syscall and timer arms — the terminal broad
+    /// acquisition. Unlocking removes that acquisition family by family, and converting NR 5's
+    /// non-blocking probe removed the last trap reaching it on the core profile, where the
+    /// split-dispatch fallback count, `IPC_RECV_SPLIT_UNROUTED`, `IPC_SEND_BROAD_ENTRY` and the
+    /// page-fault count are all zero. The required work stopped running.
+    ///
+    /// # Why the bootstrap point satisfies the real prerequisites
+    ///
+    /// `bootstrap_first_user_task` already holds `&mut KernelState`, so this adds NO acquisition.
+    /// Against what the chain actually needs:
+    ///
+    /// * **CNode identity** — the scratch check mints two leaf capabilities and deletes them
+    ///   again; it needs a live cnode to mint into, not the cnode of whatever task happens to be
+    ///   current. Init's is passed explicitly.
+    /// * **Address space** — the check CREATES and destroys its own; it never touches the
+    ///   caller's, so no active user address space is required.
+    /// * **`online == 1`** — the proof defers under SMP because its seam slices require the
+    ///   single-CPU topology. At bootstrap no AP is online yet, which is that condition by
+    ///   construction rather than by luck.
+    /// * **Ordering before AP admission** — the completion flag is now set strictly before any
+    ///   AP can be admitted, which is the sequencing Stage 183.5 asks for, tightened.
+    /// * **Task placement** — the invariant is that verification displaces nothing. It is checked
+    ///   the same way in both contexts, by comparing the current task before and after.
+    ///
+    /// The one-shot latch is shared with the trap-path driver, so whichever runs first wins and
+    /// the other declines; neither can run the scratch transaction twice.
+    pub(crate) fn run_unlock_graduated_proof_at_bootstrap(&mut self, tid: u64) {
+        if !crate::kernel::boot::unlock_graduated_enabled() {
+            return;
+        }
+        // THE CNODE IS THE CURRENT ONE, not the named task's, and the distinction is not
+        // cosmetic. `create_user_address_space` and `alloc_anonymous_memory_object` mint their
+        // capabilities into the CURRENT task's cspace, and the scratch check releases them from
+        // the cnode it is handed. Passing init's cnode while the bootstrap task is current made
+        // the check mint into one cspace and delete from another: measured live as
+        // `mem_leaf=false aspace_leaf=false` with `mo_leak=true` — the memory object was never
+        // released, because the capability it was released through was looked for in the wrong
+        // place. The mint target and the release target must be the same cnode by construction.
+        let Some(cnode) = self.current_task_cnode() else {
+            crate::yarm_log!(
+                "UNLOCK_GRADUATED_BOOTSTRAP_SKIPPED tid={} reason=no_current_cnode",
+                tid
+            );
+            return;
+        };
+        if !crate::kernel::boot::unlock_graduated_proof_try_start() {
+            return; // one-shot, shared with the trap-path driver
+        }
+        crate::yarm_log!("UNLOCK_GRADUATED_ORIGIN origin=bootstrap tid={}", tid);
+        self.run_unlock_graduated_proof_with(tid, cnode);
+    }
+
     pub(crate) fn maybe_run_unlock_graduated_proof(&mut self) {
         if !crate::kernel::boot::unlock_graduated_enabled() {
             return; // emergency opt-out / deferred at cmdline apply
@@ -1269,6 +1364,20 @@ impl KernelState {
         if !crate::kernel::boot::unlock_graduated_proof_try_start() {
             return; // one-shot
         }
+        crate::yarm_log!("UNLOCK_GRADUATED_ORIGIN origin=trap tid={}", tid);
+        self.run_unlock_graduated_proof_with(tid, cnode);
+    }
+
+    /// U9-RECV-FINAL — the proof body, with its identity supplied rather than sampled.
+    ///
+    /// One policy, one scratch transaction, one completion flag. The two drivers above differ
+    /// only in where the identity comes from and which latch check admitted them.
+    fn run_unlock_graduated_proof_with(&mut self, tid: u64, cnode: CNodeId) {
+        // The placement invariant, sampled where it is meaningful in BOTH contexts: whatever the
+        // current task is when verification starts, it must still be current when it ends. On the
+        // trap path that is the calling task; at bootstrap it is typically `None`, and `None`
+        // must still equal `None` afterwards — the scratch transaction may not dispatch anything.
+        let placement_before = self.current_tid();
 
         // The accepted seams are x86_64 -smp 1 only: defer the verdict under SMP.
         let online = self.online_cpu_count();
@@ -1318,7 +1427,8 @@ impl KernelState {
         }
 
         // No queue double-advance from this read-mostly verification.
-        if self.current_tid() != Some(tid) {
+        let placement_held = self.current_tid() == placement_before;
+        if !placement_held {
             crate::yarm_log!("UNLOCK_GRADUATED_DOUBLE_DISPATCH path=proof");
             crate::yarm_log!("UNLOCK_GRADUATED_RESTORE_FAIL path=proof");
         }
@@ -1341,7 +1451,7 @@ impl KernelState {
             );
         }
 
-        if d3_ok && self.current_tid() == Some(tid) {
+        if d3_ok && placement_held {
             crate::yarm_log!("UNLOCK_GRADUATED_INVARIANT_OK");
             crate::yarm_log!("UNLOCK_GRADUATED_DONE result=ok");
         } else {
