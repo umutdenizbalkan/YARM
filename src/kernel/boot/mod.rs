@@ -7888,6 +7888,24 @@ pub fn ipc_send_final_fault_witness_enabled() -> bool {
     IPC_SEND_FINAL_FAULT_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// U9-RECV-FINAL §1 — how many RECOGNIZED receives reached the terminal broad acquisition.
+///
+/// The receive family is not closed by this package, and this is what keeps that statement
+/// honest rather than rhetorical: every recognized NR 2 / NR 5 that leaves the split entry
+/// unrouted is counted here and named in the log. A boot's total is therefore the number of
+/// receives still served by the terminal dispatcher, not a claim about what could happen.
+static RECV_BROAD_ENTRIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Count one recognized receive that reached the terminal broad acquisition.
+pub(crate) fn note_recv_broad_entry() {
+    RECV_BROAD_ENTRIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The running total, for the live census.
+pub fn recv_broad_entries() -> u64 {
+    RECV_BROAD_ENTRIES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 static XFER2_GRANT_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

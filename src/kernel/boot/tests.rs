@@ -43718,8 +43718,12 @@ mod stage160b_aarch64_recv_split_dispatch_audit {
         for marker in &[
             "YARM_SPLIT_DISPATCH_ENTER nr=",
             "YARM_SPLIT_DISPATCH_FALLBACK reason=",
-            "YARM_SPLIT_DISPATCH_RECV_CONSIDER nr=",
-            "YARM_SPLIT_DISPATCH_RECV_CALL",
+            // U9-RECV-FINAL §1: the two RECV_CONSIDER / RECV_CALL markers went with the
+            // non-switching dispatcher's NR 2 arm. They localized a divergence between the
+            // dispatcher and the queued-plain helper, and there is no longer a boundary there to
+            // localize: the family entry owns both lanes and reports its own outcome through
+            // `IPC_RECV_SPLIT_UNROUTED` / the lane markers. The diagnostic this stage asked for
+            // is the one below, which still names the step that fell back.
         ] {
             assert!(
                 SYSCALL_SPLIT_SRC.contains(marker),
@@ -62079,11 +62083,20 @@ mod stage191a_lock_retire_inventory {
 
     // INVENTORY: the split whitelist is EXACTLY {ControlPlaneSetCnodeSlots, IpcRecv,
     // VmBrk, DebugLog}. DebugLog is the newly retired class; the rest predate 191A.
+    //
+    // U9-RECV-FINAL §1 re-derives the IpcRecv term. NR 2 is a SWITCHING class now — it parks on
+    // an empty endpoint — so it is consulted before this gate rather than on it, exactly as NR 5
+    // always was. The inventory's claim is that this gate holds exactly the accepted
+    // NON-SWITCHING classes, and NR 2's absence is now part of that claim rather than a gap in
+    // it; the guard below pins the absence so the admission cannot quietly come back.
     #[test]
     fn split_whitelist_is_exactly_the_four_classes() {
         assert!(
+            !SPLIT_SRC.contains("Syscall::IpcRecv => Some(syscall),"),
+            "IpcRecv parks, so it must not be on the non-switching gate"
+        );
+        assert!(
             SPLIT_SRC.contains("Syscall::ControlPlaneSetCnodeSlots => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::IpcRecv => Some(syscall),")
                 && SPLIT_SRC.contains("Syscall::VmBrk => Some(syscall),")
                 && SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
                 // Stage 191B added FutexWake as the fifth split class.
@@ -62936,9 +62949,14 @@ mod stage191e_dispatch_next_candidate_seam {
     // the accepted classes, and every out-of-scope class stays global-lock-only.
     #[test]
     fn split_whitelist_unchanged_no_new_class() {
+        // U9-RECV-FINAL §1: IpcRecv moved to the SWITCHING classes, so it is asserted ABSENT
+        // here rather than present — the same re-derivation the 191A inventory carries.
+        assert!(
+            !SPLIT_SRC.contains("Syscall::IpcRecv => Some(syscall),"),
+            "IpcRecv parks, so it must not be on the non-switching gate"
+        );
         for accepted in [
             "Syscall::ControlPlaneSetCnodeSlots => Some(syscall),",
-            "Syscall::IpcRecv => Some(syscall),",
             "Syscall::VmBrk => Some(syscall),",
             "Syscall::DebugLog => Some(syscall),",
             "Syscall::FutexWake => Some(syscall),",
@@ -115146,22 +115164,27 @@ mod stage199d_riscv_canonical_admission {
                 "the whitelist must still admit `{nr}`"
             );
         }
-        // Nothing else was added to the whitelist. NR 2 in particular is NOT here: 199G-B §2
-        // admitted NR 5 and 199G-C4 §1 admitted NR 1, neither disturbing NR 2's admission.
+        // Nothing else was added to the whitelist. U9-RECV-FINAL §1 widens the count by exactly
+        // one — NR 2, the last recognized IPC syscall this port still excluded — and the count is
+        // what stops a nineteenth arriving without its own justification.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            18,
-            "exactly eighteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
-             FutexWait, IpcRecvTimeout, IpcSend, (U9-MO2 §4) CreateInitramfsFileSliceMo, \
+            19,
+            "exactly nineteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+             FutexWait, IpcRecvTimeout, (U9-RECV-FINAL §1) IpcRecv, IpcSend, \
+             (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
              SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask, \
              (U9-EXIT1 §5) ExitCurrentTask, (U9-RESIDUAL1 §3) Yield and (U9-VM-ENTRY1) \
              VmMap + VmAnonMap + VmBrk and (U9-XFER1 §3) TransferRelease \
              plus (U9-XFER2 §3) RecvSharedV3"
         );
+        // U9-RECV-FINAL §1: NR 2 admission on RISC-V WAS a separate class with its own witness,
+        // and this package is the one that supplies it. The term is inverted rather than
+        // dropped, so the admission is pinned exactly as every other class on this list is.
         assert!(
-            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2 admission on RISC-V is a separate class with its own witness"
+            whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "RISC-V must admit NR 2 into the split dispatcher"
         );
         // The arch-tagged NR6/NR7 markers are emitted by the kernel drain, not by this gate.
         assert!(
@@ -144039,9 +144062,13 @@ mod u9qa_apply_convention {
             whitelist.contains("SYSCALL_IPC_RECV_TIMEOUT_NR"),
             "RISC-V must admit NR 5 into the split dispatcher"
         );
+        // U9-RECV-FINAL §1 INVERTS this term. NR 2's RISC-V admission WAS a separate class and
+        // it is the one this package converted: the exclusion was "for want of a live witness,
+        // not for a structural reason", and §4 supplies the witness. What each of these guards
+        // still says is that the class it is about did not change when NR 2 did.
         assert!(
-            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2's RISC-V admission is a separate class and stays untouched"
+            whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "RISC-V must admit NR 2 into the split dispatcher"
         );
         // And nothing in the route yields NR 5 back to the broad arm: all three publication
         // yields are scoped to NR 2, whose handler owns the hooks they protect.
@@ -144774,9 +144801,14 @@ mod u9qa_split_dispatch_disposition {
         );
     }
 
-    /// The five existing non-switching classes still go through the unchanged dispatcher, and
-    /// FutexWait is deliberately NOT on that whitelist — the whitelist's contract is that
-    /// everything on it may be early-returned.
+    /// The remaining non-switching classes still go through the unchanged dispatcher, and every
+    /// class that can PARK is deliberately NOT on that whitelist — the whitelist's contract is
+    /// that everything on it may be early-returned through the caller's own frame.
+    ///
+    /// U9-RECV-FINAL §1 moves `IpcRecv` from the first list to the second, which is this guard's
+    /// own claim applied to a class that had been miscategorised since Stage 32B: a receive on an
+    /// empty endpoint parks the caller, so it was never early-returnable. The guard gets
+    /// stronger, not weaker — it now pins the absence of two switching classes rather than one.
     #[test]
     fn futex_wait_is_not_on_the_non_switching_whitelist() {
         let whitelist = SPLIT
@@ -144784,13 +144816,14 @@ mod u9qa_split_dispatch_disposition {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the NR whitelist");
-        assert!(
-            !whitelist.contains("Syscall::FutexWait"),
-            "the switching class must never join the early-returnable whitelist"
-        );
+        for switching in ["Syscall::FutexWait => Some", "Syscall::IpcRecv => Some"] {
+            assert!(
+                !whitelist.contains(switching),
+                "a switching class must never join the early-returnable whitelist: {switching}"
+            );
+        }
         for class in [
             "Syscall::ControlPlaneSetCnodeSlots",
-            "Syscall::IpcRecv",
             "Syscall::VmBrk",
             "Syscall::DebugLog",
             "Syscall::FutexWake",
@@ -147975,9 +148008,12 @@ mod u9rx3_route {
         let futex = body
             .find("try_split_futex_wait_into_frame(")
             .expect("FutexWait is dispatched");
+        // U9-RECV-FINAL §1: the receive family is dispatched through its ONE entry, which owns
+        // both the blocking lane named here before and the immediate lane that used to sit on
+        // the non-switching whitelist. The claim is unchanged and now covers both halves.
         let recv = body
-            .find("try_split_blocking_ipc_recv_into_frame(")
-            .expect("the blocking recv is dispatched");
+            .find("try_split_ipc_recv_family_into_frame(")
+            .expect("the receive family is dispatched");
         let nonswitching = body
             .find("try_split_dispatch_nonswitching_into_frame(")
             .expect("the non-switching dispatcher");
@@ -153530,9 +153566,13 @@ mod u9mo2_nr28_terminal_edges {
             whitelist.contains("SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR"),
             "RISC-V must admit NR 28 into the split dispatcher"
         );
+        // U9-RECV-FINAL §1 INVERTS this term. NR 2's RISC-V admission WAS a separate class and
+        // it is the one this package converted: the exclusion was "for want of a live witness,
+        // not for a structural reason", and §4 supplies the witness. What each of these guards
+        // still says is that the class it is about did not change when NR 2 did.
         assert!(
-            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2's RISC-V admission is a separate class and stays untouched"
+            whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "RISC-V must admit NR 2 into the split dispatcher"
         );
     }
 
@@ -154237,9 +154277,13 @@ mod u9spawn1_nr11_terminal_edges {
             whitelist.contains("SYSCALL_SPAWN_THREAD_NR"),
             "RISC-V must admit NR 11 into the split dispatcher"
         );
+        // U9-RECV-FINAL §1 INVERTS this term. NR 2's RISC-V admission WAS a separate class and
+        // it is the one this package converted: the exclusion was "for want of a live witness,
+        // not for a structural reason", and §4 supplies the witness. What each of these guards
+        // still says is that the class it is about did not change when NR 2 did.
         assert!(
-            !whitelist.contains("SYSCALL_IPC_RECV_NR"),
-            "NR 2's RISC-V admission is a separate class and stays untouched"
+            whitelist.contains("SYSCALL_IPC_RECV_NR"),
+            "RISC-V must admit NR 2 into the split dispatcher"
         );
     }
 
