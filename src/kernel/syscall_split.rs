@@ -668,6 +668,44 @@ impl SplitDispatchDisposition {
     }
 }
 
+/// U9-SEND-FINAL §1 — the outcome of a **recognized** NR 1, which is a strictly smaller set than
+/// `SplitDispatchDisposition`.
+///
+/// The distinction the directive draws is between "this trap is not an `IpcSend`", which only the
+/// entry point can answer and which is not a fall-through at all, and "this IS an `IpcSend` and it
+/// needs settling", which used to be able to answer `NotHandled` from three further places. Those
+/// three were not declines of an unrecognized trap; they were a recognized NR 1 being handed to
+/// the terminal broad dispatcher.
+///
+/// Giving the recognized body its own return type is what makes that unrepeatable: there is no
+/// value here meaning "the broad dispatcher should service this trap", exactly as there is none in
+/// the `Result<(), TrapHandleError>` U9-IPC-RESIDUAL2 gave NR 7. NR 1 never publishes a queue
+/// advance of its own — its park hands one to the post-work drain instead — so
+/// `QueueAdvanceCommitted` is absent too, and the type states that rather than leaving it to a
+/// comment.
+#[derive(Debug)]
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) enum SplitSendDisposition {
+    /// The syscall is finished and its result is in the frame.
+    Complete(Result<(), TrapHandleError>),
+    /// A delivery the post-work drain owes, or a parked sender whose queue advance it performs.
+    PostWorkCommitted { finalize_syscall: bool },
+}
+
+impl SplitSendDisposition {
+    /// Widen to the dispatcher's type. Total by construction: every arm names a committed outcome,
+    /// so widening can never introduce the `NotHandled` the narrow type exists to exclude.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn into_dispatch(self) -> SplitDispatchDisposition {
+        match self {
+            Self::Complete(result) => SplitDispatchDisposition::Complete(result),
+            Self::PostWorkCommitted { finalize_syscall } => {
+                SplitDispatchDisposition::PostWorkCommitted { finalize_syscall }
+            }
+        }
+    }
+}
+
 /// U9-QA §2 — the pre-lock split dispatcher.
 ///
 /// FutexWait is tried first and separately because it is the only SWITCHING class: it must never
@@ -777,12 +815,53 @@ pub(crate) fn try_split_dispatch_into_frame(
 /// error rather than a fallback: handing an impossible class to the broad dispatcher would be
 /// the one edge this stage exists to remove, and it would be an edge no production trap can
 /// ever take.
+///
+/// ## U9-SEND-FINAL §1 — the entry point, and the ONLY thing it decides
+///
+/// It answers exactly one question: is this trap an `IpcSend`? A `NotHandled` from here is not a
+/// fall-through — it is a different syscall, for which this route has no opinion and the
+/// dispatcher goes on to consult the next class. Everything a RECOGNIZED NR 1 can produce is
+/// settled by the body below, whose return type cannot express "hand this to the broad
+/// dispatcher".
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_ipc_send_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) -> SplitDispatchDisposition {
+    if !matches!(Syscall::decode(frame.syscall_num()), Ok(Syscall::IpcSend)) {
+        return SplitDispatchDisposition::NotHandled;
+    }
+    try_split_ipc_send_recognized(shared, cpu, frame).into_dispatch()
+}
+
+/// U9-SEND-FINAL §1 — a RECOGNIZED NR 1, settled pre-lock in every reachable outcome.
+///
+/// The two admission escapes this used to answer `NotHandled` from are now settled with the
+/// error the broad path produces for the same condition, derived from source rather than
+/// assumed:
+///
+/// * **`cpu_idx >= MAX_CPUS`.** The broad phase is `with_cpu(cpu, ..)`, which runs
+///   `set_current_cpu(cpu)?` BEFORE its closure — `validate_online_cpu` → `check_cpu` →
+///   `SchedulerError::InvalidCpu` → `map_scheduler_error` → `KernelError::WrongObject` →
+///   `SyscallError::WrongObject`, with the closure never entered. So the broad dispatcher does
+///   not service this trap either; it produces that error one lock later. Handing it over was
+///   never a fallback, it was a slower way to the same answer, and settling it here is exact.
+///   The same derivation covers an in-range but OFFLINE CPU, which `validate_online_cpu` refuses
+///   with the same `SchedulerError` class.
+/// * **No current task.** `handle_ipc_send` opens with `validate_endpoint_right(cap, SEND)?`,
+///   whose first step is `current_task_cnode()`; with no current task that is `None`, the slot
+///   lookup is `None`, and it answers `InvalidCapability` — before `current_tid(kernel)?` is ever
+///   reached, so `Internal` is NOT the broad answer for this condition.
+///
+/// Neither is a fallback with a proof attached; both are settlements, so nothing about them
+/// needs one.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_ipc_send_recognized(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitSendDisposition {
     use crate::kernel::capabilities::{CapId, CapObject, CapRights};
     use crate::kernel::ipc::{EndpointMode, SharedMemoryRegion};
     use crate::kernel::syscall::{
@@ -791,22 +870,25 @@ fn try_split_ipc_send_into_frame(
         SyscallError, classify_ipc_send_payload_shape, frame_ipc_send_message,
         transfer_cap_arg_present,
     };
-    use SplitDispatchDisposition as D;
+    use SplitSendDisposition as D;
 
-    // ── (1) NR and CPU ──────────────────────────────────────────────────────────────────────
-    if !matches!(Syscall::decode(frame.syscall_num()), Ok(Syscall::IpcSend)) {
-        return D::NotHandled;
-    }
+    // ── (1) CPU and requester ───────────────────────────────────────────────────────────────
     let cpu_idx = cpu.0 as usize;
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-        return D::NotHandled;
+        crate::yarm_log!(
+            "IPC_SEND_SPLIT_INVARIANT cpu={} reason=cpu_out_of_range result=failed_closed",
+            cpu.0
+        );
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)));
     }
     let Some(tid) = shared.current_tid_authoritative(cpu) else {
         crate::yarm_log!(
-            "IPC_SEND_SPLIT_REFUSED cpu={} reason=no_current_task",
+            "IPC_SEND_SPLIT_REFUSED cpu={} reason=no_current_task err=InvalidCapability",
             cpu.0
         );
-        return D::NotHandled;
+        return D::Complete(Err(TrapHandleError::Syscall(
+            SyscallError::InvalidCapability,
+        )));
     };
 
     // Helper: a completed syscall's frame result, exactly as the broad handler writes it.
@@ -970,30 +1052,66 @@ fn try_split_ipc_send_into_frame(
             ))
         }
         IpcSendPayloadShape::Inline => {
-            if let Some(asid) = sender_asid {
-                // A user sender's payload lives in ITS address space; a fault here is the
-                // ordinary user-memory fault the broad handler reports, and nothing is consumed.
-                let Some(bytes) =
-                    shared.copy_from_user_asid_split_read(asid.0 as u64, user_ptr_or_offset, len)
-                else {
-                    crate::yarm_log!(
-                        "IPC_SEND_SPLIT_REFUSED cpu={} tid={} reason=payload_fault",
-                        cpu.0,
-                        tid
-                    );
-                    return D::NotHandled;
-                };
-                payload_buf[..len].copy_from_slice(&bytes[..len]);
-            } else {
-                // A kernel task's payload rides in the argument registers.
-                let words = [
-                    frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
-                    frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
-                ];
-                let Some(regs) = crate::kernel::ipc::unpack_register_payload(words, len) else {
-                    return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
-                };
-                payload_buf[..len].copy_from_slice(&regs[..len]);
+            // U9-SEND-FINAL §2 — the source is SELECTED, not inferred from a reader's refusal.
+            //
+            // The delivered route asked `copy_from_user_asid_split_read` and treated every `None`
+            // alike, answering `NotHandled`. That reader refuses three unrelated things, and only
+            // one of them is a fault:
+            //
+            //   * `len == 0`   → a LEGAL EMPTY PAYLOAD, which `copy_from_user` answers `Ok` for
+            //                    (its per-byte loop does not run) and which the broad path sends
+            //                    happily. Folding it into the refusal is how every zero-length
+            //                    user send reached the terminal broad dispatcher.
+            //   * `len > 192`  → IMPOSSIBLE here, derived rather than assumed:
+            //                    `classify_ipc_send_payload_shape` yields `Inline` for a user
+            //                    sender only when `len <= Message::MAX_PAYLOAD` (128), and the
+            //                    reader's cap is `DEBUG_LOG_MAX_BYTES` (192). The assertion below
+            //                    states that bound where it is relied on; it is not a runtime
+            //                    branch, because no reachable value could take one.
+            //   * anything else → a genuine user-memory fault, including a caller whose
+            //                    incarnation ASID is the kernel's (`asid_raw == 0`), which
+            //                    `copy_from_user`'s `validate_user_access_for_asid` answers
+            //                    `UserMemoryFault` for too.
+            //
+            // A fault is settled through the owner U9-IPC-RESIDUAL2 §2 established, which runs
+            // the same two steps in the same order `record_user_fault` does, and the syscall then
+            // returns SUCCESS, exactly as `handle_ipc_send`'s `record_user_fault(..); return
+            // Ok(())` does.
+            debug_assert!(
+                len <= crate::kernel::ipc::Message::MAX_PAYLOAD,
+                "the Inline shape bounds an inline length below the reader's cap"
+            );
+            match nr1_classify_inline_source(sender_asid, len) {
+                // Nothing to copy. The buffer is already zeroed and `payload_len` is 0.
+                Nr1InlineSource::Empty => {}
+                Nr1InlineSource::UserMemory { asid_raw, len } => {
+                    let Some(bytes) =
+                        shared.copy_from_user_asid_split_read(asid_raw, user_ptr_or_offset, len)
+                    else {
+                        return nr1_source_read_fault(
+                            shared,
+                            cpu,
+                            frame,
+                            tid,
+                            user_ptr_or_offset,
+                            len,
+                        );
+                    };
+                    payload_buf[..len].copy_from_slice(&bytes[..len]);
+                }
+                Nr1InlineSource::Registers { len } => {
+                    // A kernel task's payload rides in the argument registers.
+                    let words = [
+                        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+                        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+                    ];
+                    let Some(regs) = crate::kernel::ipc::unpack_register_payload(words, len) else {
+                        return D::Complete(Err(TrapHandleError::Syscall(
+                            SyscallError::InvalidArgs,
+                        )));
+                    };
+                    payload_buf[..len].copy_from_slice(&regs[..len]);
+                }
             }
             None
         }
@@ -1334,6 +1452,124 @@ fn try_split_ipc_send_into_frame(
             D::PostWorkCommitted {
                 finalize_syscall: false,
             }
+        }
+    }
+}
+
+/// U9-SEND-FINAL §2 — **where an inline NR 1 payload comes from**, as one policy.
+///
+/// `handle_ipc_send`'s inline arm makes this choice in two places that look like one:
+///
+/// ```text
+/// if sender_has_user_asid { copy_from_current_user(ptr, len)? } else { inline_payload_from_frame(frame, len)? }
+/// ```
+///
+/// and `copy_from_user` then answers `len == 0` with `Ok` and an untouched buffer, because its
+/// per-byte loop does not run. So there are THREE sources, not two, and the empty one is a
+/// success rather than a copy. The delivered split route folded the empty case into its reader's
+/// refusal and answered `NotHandled` for it, which sent every zero-length user send to the
+/// terminal broad dispatcher.
+///
+/// Stating the choice once, as a value, is what stops the two sides drifting again: the
+/// production route selects its source from here, and the differential cases ask this the same
+/// question they ask the real dispatcher.
+///
+/// Nothing here reads memory, resolves a capability or mutates anything — it is a decision about
+/// two inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Nr1InlineSource {
+    /// A legal EMPTY payload. No copy is owed and none is attempted; the message carries zero
+    /// bytes. Reached by a user sender with `len == 0` — a kernel sender's empty payload goes
+    /// through the register source, which handles zero the same way.
+    Empty,
+    /// A USER sender's payload, in its own address space. An unreadable buffer here is the
+    /// canonical `record_user_fault(.., Read)` case, never `InvalidArgs`.
+    UserMemory { asid_raw: u64, len: usize },
+    /// A KERNEL-ASID sender's payload, riding in the argument registers.
+    Registers { len: usize },
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn nr1_classify_inline_source(
+    sender_asid: Option<crate::kernel::vm::Asid>,
+    len: usize,
+) -> Nr1InlineSource {
+    match sender_asid {
+        // The register source owns every kernel-ASID sender, including `len == 0`:
+        // `inline_payload_from_frame` is what `handle_ipc_send` calls for one, at every length.
+        None => Nr1InlineSource::Registers { len },
+        Some(_) if len == 0 => Nr1InlineSource::Empty,
+        Some(asid) => Nr1InlineSource::UserMemory {
+            asid_raw: asid.0 as u64,
+            len,
+        },
+    }
+}
+
+/// U9-SEND-FINAL §2 — settle an unreadable NR 1 source buffer through the canonical fault owner.
+///
+/// `handle_ipc_send` answers this with `record_user_fault(kernel, frame, user_ptr,
+/// FaultAccess::Read); return Ok(())` — a fault RECORD and a `PageFault` frame, and a SUCCESSFUL
+/// syscall return, not an error return. `record_split_source_read_fault` is the split twin
+/// U9-IPC-RESIDUAL2 §2 extracted for NR 6 and NR 7, and it performs those two steps in that same
+/// order.
+///
+/// ## Why returning through the entering frame is safe here, which recording a fault does not by
+/// itself establish
+///
+/// The record is a rank-8 write and a frame error. It publishes NO terminal transition: the
+/// caller is not blocked, not preempted, not exiting; it is still `current` on this CPU and still
+/// owns this frame, exactly as it is after the broad handler's own `record_user_fault`. Nothing
+/// is stashed on the per-CPU post-work channel and no deferral is armed, so the architecture tail
+/// has nothing to drain and returns through this frame — which is the same frame the broad path
+/// would have returned through. The `Complete(Ok(()))` disposition is what says so: it is the one
+/// outcome that means "serviced, return now, no drain owed".
+///
+/// This is also strictly BEFORE anything is consumed. The fault is raised inside step (7), and
+/// step (8) — `stash_transfer_envelope_split` — is the first consuming step, so on this path
+/// there is no envelope, no transient pin, no `Message`, no queue entry, no receiver copy and no
+/// wake to undo. That ordering is `handle_ipc_send`'s too: its `record_user_fault` arm returns
+/// before `stash_transfer_handle` is called.
+///
+/// ## The fallible settlement
+///
+/// The split twin can fail where the broad one cannot, and for exactly one reason: it must BIND
+/// the CPU that `with_cpu` had already bound on entry, through the same `validate_online_cpu`
+/// predicate. If that refuses, the record did not happen and the frame carries no `PageFault` —
+/// so answering `Ok(())` would return a task an unset result for a fault the kernel never
+/// recorded. It is refused instead, with the error that predicate's own failure maps to
+/// (`InvalidCpu`/`CpuOffline` → `KernelError::WrongObject` → `SyscallError::WrongObject`), which
+/// is what the broad phase's `with_cpu` would have produced for the same CPU.
+#[cfg(not(feature = "hosted-dev"))]
+fn nr1_source_read_fault(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    tid: u64,
+    user_ptr: usize,
+    len: usize,
+) -> SplitSendDisposition {
+    match shared.record_split_source_read_fault(cpu, frame, user_ptr) {
+        Ok(()) => {
+            crate::yarm_log!(
+                "IPC_SEND_SPLIT_SOURCE_FAULT cpu={} tid={} user_ptr={:#x} len={} access=read envelopes=0 enqueues=0 deliveries=0 wakes=0 result=ok",
+                cpu.0,
+                tid,
+                user_ptr,
+                len
+            );
+            SplitSendDisposition::Complete(Ok(()))
+        }
+        Err(err) => {
+            crate::yarm_log!(
+                "IPC_SEND_SPLIT_INVARIANT cpu={} tid={} reason=fault_record_refused err={:?} result=failed_closed",
+                cpu.0,
+                tid,
+                err
+            );
+            SplitSendDisposition::Complete(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::from(err),
+            )))
         }
     }
 }

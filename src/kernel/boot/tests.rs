@@ -175125,3 +175125,310 @@ mod u9_ipc_residual3_park_resume {
         }
     }
 }
+
+/// U9-SEND-FINAL §3 — **NR 1's source-fault and empty-payload behaviour, differentially.**
+///
+/// Every case drives the REAL `syscall::dispatch` over a real `TrapFrame` to obtain
+/// `handle_ipc_send`'s own answer, and asks `nr1_classify_inline_source` the same question about
+/// the same two inputs. The split route selects its payload source from that policy, so agreement
+/// here is agreement with the code that runs.
+///
+/// Each case also snapshots what a refusal must leave alone — the transfer-envelope table, the
+/// reply-record table and the total queued depth — because "the same error" is only half of
+/// parity. A send that faults must produce no envelope, no queue entry and no wake, and the
+/// snapshot is what says so rather than a marker count.
+#[cfg(test)]
+mod u9_send_final_source_parity {
+    use super::*;
+    use crate::arch::trap::FaultAccess;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP,
+        SYSCALL_IPC_SEND_NR, SYSCALL_NO_TRANSFER_CAP, SyscallError, dispatch,
+    };
+    use crate::kernel::syscall_split::{Nr1InlineSource, nr1_classify_inline_source};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const NR1_READABLE: usize = 0x2000;
+    const NR1_UNREADABLE: usize = 0x5000_0000;
+
+    /// A user task running on cpu 0, holding a SEND capability on a live endpoint, with ONE
+    /// readable user page mapped at `NR1_READABLE` and nothing at `NR1_UNREADABLE`.
+    struct Nr1Fixture {
+        shared: SharedKernel,
+        send_cap: CapId,
+        /// The SAME endpoint without SEND — for the precedence case that needs a capability
+        /// which resolves and is live but carries the wrong right.
+        recv_only: CapId,
+        asid: Asid,
+    }
+
+    fn nr1_fixture() -> Nr1Fixture {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (send_cap, recv_only, asid) = shared.with(|s| {
+            s.register_task(1).expect("task1");
+            let (asid, aspace_map_cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(1, asid).expect("bind");
+            // Mapped while the BOOTSTRAP task is current, because that is the cspace
+            // `create_user_address_space` minted the mapping capability into.
+            s.map_user_page(
+                aspace_map_cap,
+                VirtAddr(NR1_READABLE as u64),
+                Mapping {
+                    phys: PhysAddr(0x8000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map a readable page");
+            // PRIME it. A freshly mapped page is not yet readable through
+            // `validate_user_access_for_asid` — a real sender's buffer holds data it wrote, so
+            // this is the state the readable cases are actually about, and the contrast with
+            // `NR1_UNREADABLE` is then about the mapping rather than about first touch.
+            s.write_user_memory_for_asid(asid, NR1_READABLE, &[0xABu8; PAGE_SIZE])
+                .expect("prime the readable page");
+            s.enqueue_current_cpu(1).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+            assert_eq!(s.current_tid(), Some(1), "task 1 is the running task");
+            // Created while task 1 is current, so both capabilities land in ITS cspace — which
+            // is the cspace `validate_endpoint_right` resolves against.
+            let (_idx, send_cap, recv_only) = s.create_endpoint(8).expect("endpoint");
+            (send_cap, recv_only, asid)
+        });
+        Nr1Fixture {
+            shared,
+            send_cap,
+            recv_only,
+            asid,
+        }
+    }
+
+    impl Nr1Fixture {
+        /// `handle_ipc_send`'s own outcome for these arguments, plus everything the caller can
+        /// observe about it: the error (if any), the frame's encoded error lane, and the fault
+        /// the kernel recorded.
+        fn broad_send(
+            &self,
+            cap: CapId,
+            ptr: usize,
+            len: usize,
+        ) -> (
+            Option<SyscallError>,
+            Option<usize>,
+            Option<crate::arch::trap::FaultInfo>,
+        ) {
+            let mut frame = TrapFrame::new(SYSCALL_IPC_SEND_NR, [0; 6]);
+            frame.set_arg(SYSCALL_ARG_CAP, cap.0 as usize);
+            frame.set_arg(SYSCALL_ARG_PTR, ptr);
+            frame.set_arg(SYSCALL_ARG_LEN, len);
+            // The ABI sentinel, not a zeroed slot: `transfer_cap_arg_present` treats anything but
+            // `SYSCALL_NO_TRANSFER_CAP` as a real capability, so leaving this zero would make
+            // every case a transfer of an unresolvable cap 0.
+            frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, SYSCALL_NO_TRANSFER_CAP as usize);
+            self.shared.with(|s| s.clear_last_fault());
+            let err = self.shared.with(|s| dispatch(s, &mut frame)).err();
+            let fault = self.shared.with(|s| s.last_fault());
+            (err, frame.error_code(), fault)
+        }
+
+        /// The transfer-envelope table, the reply-record table and the total queued depth across
+        /// every live endpoint — a by-value snapshot of everything a refused send must not touch.
+        fn resources(&self) -> (usize, usize, usize) {
+            self.shared.with(|s| {
+                let envelopes = s.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes
+                        .iter()
+                        .filter(|e| e.is_some())
+                        .count()
+                });
+                let replies =
+                    s.with_ipc_state(|ipc| ipc.reply_caps.iter().filter(|r| r.is_some()).count());
+                let queued = s.with_ipc_state(|ipc| {
+                    ipc.endpoints
+                        .iter()
+                        .flatten()
+                        .map(|e| e.queued())
+                        .sum::<usize>()
+                });
+                (envelopes, replies, queued)
+            })
+        }
+    }
+
+    /// **The empty payload, which is the case the delivered route got wrong.**
+    ///
+    /// A user sender with `len == 0` is legal: `copy_from_user`'s per-byte loop does not run and
+    /// it answers `Ok` with an untouched buffer. The broad handler therefore ENQUEUES the message
+    /// — and the split reader refuses `len == 0` up front, so folding that refusal into the fault
+    /// path sent every zero-length user send to the terminal broad dispatcher.
+    #[test]
+    fn an_empty_user_payload_is_sent_not_faulted() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, _code, fault) = f.broad_send(f.send_cap, 0, 0);
+        assert_eq!(err, None, "an empty send succeeds");
+        assert!(fault.is_none(), "and records no fault");
+        assert_eq!(
+            f.resources().2,
+            before.2 + 1,
+            "the message is enqueued: an empty payload is a real send, not a refusal"
+        );
+        // The policy the split route selects its source from agrees this is not a copy at all.
+        assert_eq!(
+            nr1_classify_inline_source(Some(f.asid), 0),
+            Nr1InlineSource::Empty
+        );
+    }
+
+    /// **An unreadable source buffer is a recorded FAULT and a successful syscall return**, which
+    /// is what makes `InvalidArgs` the wrong substitution: it would skip the record entirely and
+    /// tell the task its arguments were malformed rather than that its buffer was unreadable.
+    #[test]
+    fn an_unreadable_source_is_recorded_as_a_read_fault_and_returns_ok() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, code, fault) = f.broad_send(f.send_cap, NR1_UNREADABLE, 8);
+        assert_eq!(
+            err, None,
+            "the SYSCALL succeeds — `record_user_fault(..); return Ok(())`"
+        );
+        let fault = fault.expect("a fault is recorded");
+        assert_eq!(
+            fault.addr,
+            VirtAddr(NR1_UNREADABLE as u64),
+            "at the address the caller named"
+        );
+        assert_eq!(fault.access, FaultAccess::Read, "as a READ");
+        assert_eq!(
+            code,
+            Some(SyscallError::PageFault.code()),
+            "and the frame carries PageFault, not InvalidArgs"
+        );
+        assert_ne!(
+            code,
+            Some(SyscallError::InvalidArgs.code()),
+            "InvalidArgs would have skipped the fault record"
+        );
+        assert_eq!(
+            f.resources(),
+            before,
+            "and nothing is produced: no envelope, no reply record, no queued message"
+        );
+        assert_eq!(
+            nr1_classify_inline_source(Some(f.asid), 8),
+            Nr1InlineSource::UserMemory {
+                asid_raw: f.asid.0 as u64,
+                len: 8
+            },
+            "the policy routes this to the user-memory source, whose failure is the fault"
+        );
+    }
+
+    /// **Precedence: the capability is validated before the source is read.** An unreadable
+    /// buffer behind an unresolvable send capability must report the CAPABILITY, and must record
+    /// no fault — the handler never reaches the copy.
+    #[test]
+    fn an_invalid_send_capability_is_reported_before_the_unreadable_source() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, _code, fault) = f.broad_send(CapId(4242), NR1_UNREADABLE, 8);
+        assert_eq!(err, Some(SyscallError::InvalidCapability));
+        assert!(
+            fault.is_none(),
+            "no fault is recorded: validation precedes the copy"
+        );
+        assert_eq!(f.resources(), before);
+    }
+
+    /// The same precedence one question deeper: a capability that resolves but carries no SEND
+    /// right is `MissingRight`, again with the unreadable buffer never read.
+    #[test]
+    fn a_capability_missing_send_is_reported_before_the_unreadable_source() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, _code, fault) = f.broad_send(f.recv_only, NR1_UNREADABLE, 8);
+        assert_eq!(err, Some(SyscallError::MissingRight));
+        assert!(
+            fault.is_none(),
+            "still no fault: the right is checked first"
+        );
+        assert_eq!(f.resources(), before);
+    }
+
+    /// A READABLE buffer of the same length sends normally — so the fault case above is about the
+    /// buffer and not about the length, the capability or the endpoint.
+    #[test]
+    fn the_same_length_from_a_readable_buffer_sends() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, _code, fault) = f.broad_send(f.send_cap, NR1_READABLE, 8);
+        assert_eq!(err, None);
+        assert!(
+            fault.is_none(),
+            "a mapped user-readable page does not fault"
+        );
+        assert_eq!(
+            f.resources().2,
+            before.2 + 1,
+            "a readable source of the same length enqueues"
+        );
+    }
+
+    /// A page boundary the copy crosses: readable at the start, unmapped immediately after. The
+    /// fault is reported at the address the caller NAMED, which is what the broad handler passes
+    /// to `record_user_fault` — not at the byte that actually failed.
+    #[test]
+    fn a_partially_readable_source_faults_at_the_named_address() {
+        let f = nr1_fixture();
+        let start = NR1_READABLE + PAGE_SIZE - 4;
+        let before = f.resources();
+        let (err, code, fault) = f.broad_send(f.send_cap, start, 64);
+        assert_eq!(err, None, "still the fault path, not an error return");
+        let fault = fault.expect("a fault is recorded");
+        assert_eq!(
+            fault.addr,
+            VirtAddr(start as u64),
+            "reported at the caller's pointer, as `record_user_fault(.., user_ptr_or_offset, ..)` does"
+        );
+        assert_eq!(fault.access, FaultAccess::Read);
+        assert_eq!(code, Some(SyscallError::PageFault.code()));
+        assert_eq!(f.resources(), before, "and nothing partial is produced");
+    }
+
+    /// The KERNEL-ASID sender takes the register source at every length, including zero — which
+    /// is why the empty case above is scoped to a user sender and why the policy keys on the
+    /// ASID before it keys on the length.
+    #[test]
+    fn a_kernel_sender_takes_the_register_source_at_every_length() {
+        for len in [0usize, 1, 8] {
+            assert_eq!(
+                nr1_classify_inline_source(None, len),
+                Nr1InlineSource::Registers { len },
+                "a kernel-ASID sender never copies from user memory"
+            );
+        }
+    }
+
+    /// The policy is TOTAL over its two inputs and has exactly one user-memory arm, so there is
+    /// no length at which a user sender silently stops being classified.
+    #[test]
+    fn the_policy_answers_every_length_a_user_sender_can_reach() {
+        let f = nr1_fixture();
+        for len in 0..=crate::kernel::ipc::Message::MAX_PAYLOAD {
+            let answer = nr1_classify_inline_source(Some(f.asid), len);
+            if len == 0 {
+                assert_eq!(answer, Nr1InlineSource::Empty);
+            } else {
+                assert_eq!(
+                    answer,
+                    Nr1InlineSource::UserMemory {
+                        asid_raw: f.asid.0 as u64,
+                        len
+                    },
+                    "len={len}"
+                );
+            }
+        }
+    }
+}
