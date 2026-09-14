@@ -313,6 +313,8 @@ pub(crate) use self::ipc_abi::transfer_cap_arg_present;
 // Stage 198D-S: re-export the authoritative direct-only reply-cap policy switch so
 // the policy guard test can assert it as a compile-time constant.
 pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;
+
+pub(crate) use ipc::split_inline_payload_from_frame;
 pub(crate) mod ipc_abi;
 // Stage 154: D1/D5 cap-boundary landing zone. Holds the pure recv-v2 meta
 // codec today; the stateful cap/materialization seams stay in syscall.rs until

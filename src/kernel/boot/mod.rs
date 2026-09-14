@@ -214,6 +214,17 @@ pub(crate) enum QueuedRequestOutcome {
     WaiterAppeared,
     /// The endpoint incarnation is gone.
     EndpointMissing,
+    /// U9-IPC-RESIDUAL2 §3 — the endpoint slot is occupied, but by a DIFFERENT incarnation than
+    /// the one this request was prepared against.
+    ///
+    /// Distinct from [`Self::EndpointMissing`] on purpose: "the slot is empty" and "the slot has
+    /// been destroyed and reallocated to somebody else" are different facts about the world, and
+    /// only the second one describes a request that would have been delivered to a stranger. The
+    /// caller compensates identically, but the two are never conflated in a marker or a test.
+    EndpointIncarnationChanged {
+        expected: u64,
+        observed: Option<u64>,
+    },
 }
 
 /// U9-XFER1 §3 — the outcome of a NON-CONSUMING head read, for NR 30 `RecvSharedV3`.

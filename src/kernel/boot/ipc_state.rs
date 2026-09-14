@@ -5026,6 +5026,9 @@ impl KernelState {
                 msg,
                 deadline,
                 transfer_envelope,
+                // U9-IPC-RESIDUAL2 §3: the broad producer mints no reply authority of its own —
+                // it excludes FLAG_REPLY_CAP messages a few lines above — so it owes none back.
+                reply_authority: None,
             },
         )
     }
@@ -5171,11 +5174,46 @@ impl KernelState {
     /// Composed from the two owners that already decide these questions
     /// (`endpoint_send_admission_locked` and `ipc_endpoint_enqueue_authoritative_locked`), so it
     /// adds an ordering guarantee and no new policy.
+    ///
+    /// U9-IPC-RESIDUAL2 §3 — **and the exact endpoint INCARNATION is validated here too**, in
+    /// this same acquisition, ahead of the admission question.
+    ///
+    /// Carrying the generation only as far as a log line was not a validation. Between the
+    /// pre-lock preparation (which resolved the send capability, reserved a reply record, minted
+    /// the caller's `Reply` cap and stashed an envelope against endpoint incarnation
+    /// `expected_generation`) and this publication, the endpoint can be destroyed and its slot
+    /// reallocated to an unrelated endpoint. `ipc.endpoints[idx]` would then be `Some` and the
+    /// admission question would answer `NoWaiters` about the NEW endpoint — so the enqueue would
+    /// publish this caller's request, carrying a live reply capability, into a queue belonging to
+    /// somebody else entirely.
+    ///
+    /// Checking the generation earlier cannot fix that: any check outside this acquisition is a
+    /// check of a value that may change before the enqueue. The comparison has to be a term of
+    /// the same critical section that mutates, which is why it lives here and not at the call
+    /// site — the same discipline `commit_blocking_send_split` applies to its own rank-3 section.
     pub(crate) fn enqueue_request_if_no_waiter_locked(
         ipc: &mut IpcSubsystem,
         endpoint_idx: usize,
+        expected_generation: u64,
         msg: Message,
     ) -> super::QueuedRequestOutcome {
+        // The incarnation term, FIRST: an admission answer about a different endpoint is not an
+        // answer about this request at all.
+        if ipc
+            .endpoints
+            .get(endpoint_idx)
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return super::QueuedRequestOutcome::EndpointMissing;
+        }
+        let observed = ipc.endpoint_generations.get(endpoint_idx).copied();
+        if observed != Some(expected_generation) {
+            return super::QueuedRequestOutcome::EndpointIncarnationChanged {
+                expected: expected_generation,
+                observed,
+            };
+        }
         match Self::endpoint_send_admission_locked(ipc, endpoint_idx) {
             super::EndpointSendAdmission::NoWaiters => {}
             // Someone parked (or queued to send) since the pre-lock read: this send belongs to

@@ -202,6 +202,39 @@ pub(crate) struct BlockingSendCommitSnapshot {
     /// refusal be exactly as complete as the in-lock one, instead of leaking a stashed
     /// envelope on a path the producer can no longer reach.
     pub(crate) transfer_envelope: Option<BlockingSendEnvelopeCleanup>,
+    /// U9-IPC-RESIDUAL2 §3 — REPLY-AUTHORITY CLEANUP for the refusal path.
+    ///
+    /// `None` for every pre-existing producer, whose messages carry no reply authority of their
+    /// own: `handle_ipc_send` and NR 1's split route stash at most a transfer envelope, so
+    /// taking that envelope back is the whole of their refusal debt.
+    ///
+    /// NR 6's buffered lane is different. Before it can park a sender it has already reserved a
+    /// reply record and minted the caller's one-shot `Reply` capability — two resources the
+    /// envelope cleanup knows nothing about. A refused commit that settled only the envelope
+    /// would leave the caller holding a `Reply` cap for a request that was never sent and one of
+    /// `MAX_REPLY_CAPS` permanently consumed, once per refusal. Carrying the two identities here
+    /// lets the refusal be exactly as complete as the lane's own pre-publication compensation,
+    /// through the same two owners.
+    pub(crate) reply_authority: Option<BlockingSendReplyAuthorityCleanup>,
+}
+
+/// U9-IPC-RESIDUAL2 §3 — the reply authority a refused blocking-send commit must give back.
+///
+/// Deliberately carries the record's GENERATION as well as its index: a refusal that raced a
+/// recycle must free the incarnation it reserved and no other, which is the same exactness
+/// `free_reserved_reply_record_split` already enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockingSendReplyAuthorityCleanup {
+    /// The caller's cnode, the mint target.
+    pub(crate) caller_cnode: crate::kernel::capabilities::CNodeId,
+    /// The minted caller-local `Reply` capability id.
+    pub(crate) reply_cap_id: CapId,
+    /// The `Reply` object that capability names.
+    pub(crate) reply_object: crate::kernel::capabilities::CapObject,
+    /// The reserved reply-record slot.
+    pub(crate) record_index: usize,
+    /// The exact record incarnation reserved.
+    pub(crate) record_generation: u64,
 }
 
 /// U6 §4 — the envelope a refused blocking-send commit must take back.
