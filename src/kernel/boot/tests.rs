@@ -175808,6 +175808,74 @@ mod u9_send_final_closure {
         );
     }
 
+    /// **The witness cell is a CARGO feature, and that is load-bearing rather than tidy.**
+    ///
+    /// Init's address space already runs at `AddressSpace::MAX_MAPPINGS` on the provisioned
+    /// oracle profile. The cell costs about 6 KiB of text — two more mapping runs — and the XFER2
+    /// grant witness, a different slot-5 cell on the same profile, needs exactly those two free
+    /// to map its pair of pages. Measured: compiled in unconditionally, XFER2 failed with
+    /// `VM_FULL reason=mapping_bookkeeping_full max_mappings=128 va=0x40000000`. With the call
+    /// gated off the image is byte-identical to one without the cell.
+    ///
+    /// So the gate is what keeps this package out of the deferred mapping headroom, and it has to
+    /// cover every item the cell owns: a module still compiled in would cost the text whether or
+    /// not anything called it.
+    #[test]
+    fn the_witness_cell_is_gated_so_other_profiles_keep_their_headroom() {
+        const SERVICE: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        const FEATURE: &str = "feature = \"ipc-send-final-fault-witness\"";
+        // Every item the cell owns is behind the feature: the module, the x86_64 trampoline, the
+        // per-architecture runner, and the dispatch arm that reaches it.
+        for owned in [
+            "pub(super) mod ipc_send_final_fault_witness {",
+            "mod x86_ipc_send_final_fault {",
+            "fn run_ipc_send_final_fault_witness() {",
+            "if ipc_send_final_fault_witness::armed(ctx.supervisor_control_recv_ep) {",
+        ] {
+            let at = SERVICE
+                .find(owned)
+                .unwrap_or_else(|| panic!("{owned} is missing"));
+            // The nearest preceding `#[cfg(` must name the feature.
+            let before = &SERVICE[..at];
+            let cfg_at = before.rfind("#[cfg(").expect("an attribute precedes it");
+            assert!(
+                SERVICE[cfg_at..at].contains(FEATURE),
+                "{owned} is not behind the witness feature"
+            );
+        }
+        // And it SHARES the park witness's child stack rather than adding its own, because two
+        // slot-5 cells cannot coexist and a second stack is a second pair of BSS pages.
+        let runner = SERVICE
+            .split("fn run_ipc_send_final_fault_witness() {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the runner");
+        assert!(
+            runner.contains("ipc_residual2_park_witness::CHILD_STACK")
+                && runner.contains("ipc_residual2_park_witness::CHILD_TLS"),
+            "the witness must share the park witness's disposable child stack"
+        );
+        assert!(
+            !SERVICE.contains("ipc_send_final_fault_witness::CHILD_STACK"),
+            "a second child stack would cost the headroom the sharing exists to preserve"
+        );
+        // The feature must be accepted by every package the artifact build passes it to, or the
+        // build fails rather than the cell silently not forwarding.
+        for manifest in [
+            include_str!("../../../Cargo.toml"),
+            include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml"),
+            include_str!("../../../crates/yarm-driver-servers/Cargo.toml"),
+            include_str!("../../../crates/yarm-fs-servers/Cargo.toml"),
+        ] {
+            assert!(
+                manifest.contains("ipc-send-final-fault-witness = []"),
+                "a package the artifact build touches does not accept the feature"
+            );
+        }
+    }
+
     /// The terminal-broad measurement sits at the ARRIVAL, and there is exactly one of it.
     #[test]
     fn the_broad_entry_census_counts_arrivals_at_the_terminal_acquisition() {

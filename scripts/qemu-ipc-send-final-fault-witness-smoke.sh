@@ -73,8 +73,20 @@ fail=0
 note() { echo "[ipc-send-fault-witness] $*"; }
 die()  { echo "[ipc-send-fault-witness][fail] $*"; fail=1; }
 
-note "building base $ARCH artifacts"
-BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
+# U9-SEND-FINAL §3 — the userspace cell is a CARGO feature, not only a runtime knob.
+#
+# Init's address space already runs at `AddressSpace::MAX_MAPPINGS` on the provisioned oracle
+# profile. The witness cell costs about 6 KiB of text, which is two more mapping runs, and the
+# XFER2 grant witness — a different slot-5 cell on the same profile — needs exactly those two
+# free to map its pair of pages. Measured: with the cell compiled in unconditionally, XFER2
+# failed with `VM_FULL reason=mapping_bookkeeping_full max_mappings=128 va=0x40000000`. With the
+# call gated off the image is byte-identical to one without the cell, so the feature keeps that
+# headroom for every other profile and this one alone pays for the witness. That headroom is
+# deferred work this package does not touch.
+WITNESS_FEATURE=ipc-send-final-fault-witness
+
+note "building base $ARCH artifacts with $WITNESS_FEATURE"
+BOOTSTRAP_FEATURE_ARGS="--no-default-features --features $WITNESS_FEATURE" \
   "$BUILD_SCRIPT" >"$LOGDIR/build.log" 2>&1 || die "base artifact build failed"
 
 note "rebuilding kernel_boot with $FEATURE"
@@ -122,6 +134,13 @@ tr '\r' '\n' <"$BOOT_LOG" >"$NORM"
 
 count() { grep -a -F -- "$1" "$NORM" 2>/dev/null | wc -l | tr -d ' '; }
 have()  { grep -a -q -F -- "$1" "$NORM"; }
+
+# ── The feature actually reached the userspace image ──
+# A cargo feature that silently failed to forward would leave the cell out and the witness
+# silent, which must not read as a pass.
+if ! grep -a -q -F "IPC_SEND_FAULT_WITNESS_BEGIN" "$INITRAMFS_IMAGE" 2>/dev/null; then
+  die "the $WITNESS_FEATURE cell is not in the userspace image"
+fi
 
 # ── The witness itself ──
 [[ "$(count 'IPC_SEND_FAULT_WITNESS_BEGIN')" == "1" ]] || die "witness did not start exactly once"

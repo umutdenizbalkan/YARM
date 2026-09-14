@@ -16935,6 +16935,18 @@ Slot-5 ownership is verified rather than assumed: selector 15 is distinct from 1
 is default-off, arming it arms the ONE shared provisioning, and the copy-on-write cell still
 requires slot 5 EMPTY — so this witness cannot drag in the unrelated fork workload.
 
+**The cell is a CARGO feature as well as a runtime knob, and that is what keeps this package out
+of the deferred mapping headroom.** Init's address space already runs at
+`AddressSpace::MAX_MAPPINGS` on the provisioned oracle profile. The cell costs about 6 KiB of
+text — two more mapping runs — and the XFER2 grant witness, a different slot-5 cell on the same
+profile, needs exactly those two free to map its pair of pages. Compiled in unconditionally it
+took them, and XFER2 failed with `VM_FULL reason=mapping_bookkeeping_full max_mappings=128
+va=0x40000000`. Measured the other way: with the call gated off, `init_server` is byte-identical
+to the base image (`0x22ff8` text, RW at `0x423000`, `0x54808` mem), so a feature-off build costs
+nothing at all and every other profile keeps the headroom it had. The cell additionally SHARES
+the park witness's disposable child stack rather than adding a second one — two slot-5 cells
+cannot coexist, so they do not need two stacks. No capacity constant was changed.
+
 **The terminal-broad measurement sits at the arrival.** `IPC_SEND_BROAD_ENTRY` is emitted by
 `handle_ipc_send`, whose only caller is the broad dispatcher's `Syscall::IpcSend` arm, so it
 counts NR 1 traps that reached the terminal acquisition. A marker on the split side could only
@@ -16971,8 +16983,10 @@ unchanged.
   witness child exits when its work is done instead of yielding forever, because an unbounded
   yield loop turned 70 of those resumes into 1133 and one eventually landed on an instruction
   that dereferenced the stale `a0`.
-* **Init's mapping-run pressure** at `MAX_MAPPINGS` is untouched; the witness fits in existing
-  headroom.
+* **Init's mapping-run pressure** at `MAX_MAPPINGS` is untouched — no constant, layout or
+  allocation policy was changed. What the witness needed was to stop competing for it, which the
+  cargo gate and the shared child stack achieve; the pressure itself is still there and still
+  somebody else's package.
 * **NR 2 `IpcRecv`'s user-ASID cohort, NR 5 and NR 9** still reach terminal acquisition.
 
 ## U9-IPC-RESIDUAL3 — settlement parity, and the park qualified live

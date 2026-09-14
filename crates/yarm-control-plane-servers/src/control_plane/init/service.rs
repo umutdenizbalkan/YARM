@@ -1496,7 +1496,7 @@ pub(super) mod ipc_residual2_park_witness {
 /// The child is DISPOSABLE: it shares init's cspace and address space, does a bounded loop and
 /// then parks itself in a yield loop. Nothing the running system depends on is at risk if it
 /// misbehaves, and init keeps its own authority throughout.
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), feature = "ipc-send-final-fault-witness"))]
 pub(super) mod ipc_send_final_fault_witness {
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -1517,14 +1517,6 @@ pub(super) mod ipc_send_final_fault_witness {
     pub(super) static CHILD_DONE: AtomicU32 = AtomicU32::new(0);
     /// The child's TID, so the smoke can correlate the kernel's fault line with the caller.
     pub(super) static CHILD_TID: AtomicU32 = AtomicU32::new(0);
-
-    /// The same 4 KiB / 256-byte sizing the park witness uses, for the same reason: this child is
-    /// a non-recursive bounded loop whose deepest frame holds one `Message`, and init's address
-    /// space on the provisioned profile has no room to spare.
-    #[allow(unused)]
-    pub(super) static mut CHILD_STACK: [u8; 4096] = [0u8; 4096];
-    #[allow(unused)]
-    pub(super) static mut CHILD_TLS: [u8; 256] = [0u8; 256];
 
     /// How many fault/recover rounds the child runs. Small: each round is one faulting send and
     /// one good one, and the endpoint provisioned for this cell is eight deep, so the good sends
@@ -1756,7 +1748,11 @@ pub(super) mod ipc_send_final_fault_witness {
 /// U9-SEND-FINAL §3 — the x86_64 child entry trampoline, for the same ABI reason as the park
 /// witness's: x86_64 expects the initial stack to look as if a `call` had just pushed a return
 /// address (`AI_AGENT_RULES` §2.5).
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "ipc-send-final-fault-witness",
+    target_arch = "x86_64"
+))]
 mod x86_ipc_send_final_fault {
     #[unsafe(naked)]
     pub(super) extern "C" fn child_entry() -> ! {
@@ -1769,13 +1765,25 @@ mod x86_ipc_send_final_fault {
 }
 
 /// U9-SEND-FINAL §3 — resolve this architecture's child entry and run the witness.
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), feature = "ipc-send-final-fault-witness"))]
 fn run_ipc_send_final_fault_witness() {
+    // U9-SEND-FINAL §3 — this cell SHARES the park witness's child stack and TLS block rather
+    // than adding its own, and the sharing is load-bearing rather than tidy.
+    //
+    // Slot 5 is mutually exclusive, so selectors 14 and 15 can never both run in one boot and
+    // can never both own the stack. Giving this cell its own 4 KiB stack plus a 256-byte TLS
+    // block grew init's image by enough to push its address space over `AddressSpace::
+    // MAX_MAPPINGS`, which it already sits at (128/128 runs on the provisioned oracle profile).
+    // Measured: the XFER2 grant witness — a different slot-5 cell on the same profile — then
+    // failed its two-page mapping with `VM_FULL reason=mapping_bookkeeping_full max_mappings=128`.
+    //
+    // That headroom is DEFERRED work this directive says not to broaden into, and it does not
+    // need to be touched: two cells that cannot coexist do not need two stacks.
     let stack_top = {
-        let base = core::ptr::addr_of_mut!(ipc_send_final_fault_witness::CHILD_STACK) as usize;
+        let base = core::ptr::addr_of_mut!(ipc_residual2_park_witness::CHILD_STACK) as usize;
         (base + 4096) & !0xF
     };
-    let tls_base = core::ptr::addr_of_mut!(ipc_send_final_fault_witness::CHILD_TLS) as usize;
+    let tls_base = core::ptr::addr_of_mut!(ipc_residual2_park_witness::CHILD_TLS) as usize;
     #[cfg(target_arch = "x86_64")]
     let entry = x86_ipc_send_final_fault::child_entry as *const () as usize;
     #[cfg(not(target_arch = "x86_64"))]
@@ -5959,7 +5967,7 @@ pub fn run() {
     // U9-SEND-FINAL §3: the NR 1 SOURCE-FAULT witness, selector 15. Mutually exclusive with
     // every other slot-5 cell and default-off. Two tasks, because the faulting sender must be
     // DISPOSABLE — init keeps its own authority while a child issues the unreadable sends.
-    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg(all(not(feature = "hosted-dev"), feature = "ipc-send-final-fault-witness"))]
     if ipc_send_final_fault_witness::armed(ctx.supervisor_control_recv_ep) {
         run_ipc_send_final_fault_witness();
     }
