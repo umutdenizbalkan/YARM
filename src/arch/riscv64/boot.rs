@@ -2268,6 +2268,8 @@ pub fn bootstrap_first_user_task(
                 crate::kernel::boot::IPC_RESIDUAL1_QUEUED_CAP_WITNESS_SELECTOR
             } else if crate::kernel::boot::ipc_residual2_park_witness_enabled() {
                 crate::kernel::boot::IPC_RESIDUAL2_PARK_WITNESS_SELECTOR
+            } else if crate::kernel::boot::ipc_send_final_fault_witness_enabled() {
+                crate::kernel::boot::IPC_SEND_FINAL_FAULT_WITNESS_SELECTOR
             } else {
                 crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR
             };

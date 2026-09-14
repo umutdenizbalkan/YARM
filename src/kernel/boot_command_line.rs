@@ -377,6 +377,11 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_ipc_residual2_park_witness_enabled(enabled);
         crate::yarm_log!("YARM_IPC_RESIDUAL2_PARK_WITNESS_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.ipc_send_final_fault_witness {
+        // U9-SEND-FINAL §3: arm the NR 1 source-fault witness. Default off.
+        crate::kernel::boot::set_ipc_send_final_fault_witness_enabled(enabled);
+        crate::yarm_log!("YARM_IPC_SEND_FINAL_FAULT_WITNESS_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ipc_residual1_queued_cap_witness {
         // U9-IPC-RESIDUAL1 §4: arm the queued cap-bearing reply witness. Default off.
         crate::kernel::boot::set_ipc_residual1_queued_cap_witness_enabled(enabled);
@@ -857,6 +862,12 @@ pub struct YarmBootOptions<'a> {
     /// Architecture-neutral, over the same disposable authority the shared-region oracle
     /// provisions.
     pub ipc_residual2_park_witness: Option<bool>,
+    /// U9-SEND-FINAL §3: `yarm.ipc_send_final_fault_witness=1` DEFAULT-OFF knob. Arms init
+    /// startup slot 5 (=15) so a DISPOSABLE child issues a real `IpcSend` whose source buffer is
+    /// unreadable — the one NR 1 shape no production workload reaches, because ordinary senders
+    /// pass buffers they own. Architecture-neutral, over the same disposable authority the
+    /// shared-region oracle provisions.
+    pub ipc_send_final_fault_witness: Option<bool>,
     /// Stage 198E3C2B: `yarm.aarch64_shared_region_direct_oracle=1` DEFAULT-OFF knob. Provisions init
     /// startup slot 5 (=6) so init runs the SAME arch-neutral DIRECT shared-region delivery proof on
     /// AArch64, and arms the shared IPC/oracle-proof knob. Selects the workload + enables exactly one
@@ -1156,6 +1167,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.ipc_residual2_park_witness" {
             options.ipc_residual2_park_witness = parse_bool_knob(value);
+        }
+        if key == b"yarm.ipc_send_final_fault_witness" {
+            options.ipc_send_final_fault_witness = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_residual1_queued_cap_witness" {
             options.ipc_residual1_queued_cap_witness = parse_bool_knob(value);

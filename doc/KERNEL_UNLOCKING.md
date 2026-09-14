@@ -16839,6 +16839,142 @@ the highest-traffic pair in the whole space — 53 and 54 dispatches in a single
 Second candidate, smaller and mostly wiring: **NR 2 `IpcRecv`'s user-ASID cohort**, which §1
 established is not short a mechanism.
 
+## U9-SEND-FINAL — NR 1's last terminal edges, closed and witnessed
+
+Reviewed candidate `31527329`; base `31527329`. 199G-C4 moved `IpcSend` off the broad lock and
+left four ways for it to come back. One of them is the entry point saying "this is not a NR 1",
+which is not a fall-through at all. The other three were a RECOGNIZED NR 1 being handed to the
+terminal broad dispatcher, and they are settled here.
+
+### §1 — the four escapes, and what each one actually meant
+
+Each is answered with what `handle_ipc_send` produces for the same condition, derived from source
+rather than chosen:
+
+| escape | what the broad path does with it | settled as |
+|---|---|---|
+| not a NR 1 | the dispatcher consults the next class | **retained** — the entry's one decision |
+| `cpu_idx >= MAX_CPUS` | `with_cpu` runs `set_current_cpu(cpu)?` BEFORE its closure and refuses | `WrongObject` |
+| no current task | `validate_endpoint_right`'s first step reads `current_task_cnode()`, gets `None` | `InvalidCapability` |
+| source-copy failure | `record_user_fault(.., Read)` then `Ok(())` | the fault owner, below |
+
+The CPU row is the one worth stating plainly: handing an out-of-range CPU to the broad path was
+never a fallback. `with_cpu` validates through `validate_online_cpu` → `check_cpu` →
+`SchedulerError::InvalidCpu` → `KernelError::WrongObject` and never enters its closure, so the
+broad dispatcher does not service that trap either — it produces the same error one lock later.
+The same derivation covers an in-range but OFFLINE CPU. Neither of the first two is a defensive
+fallback with a proof attached; both are settlements, so neither needs one.
+
+The requester row corrects an easy mis-derivation. `current_tid(kernel)?` answers `Internal`, and
+it is tempting to use that — but `handle_ipc_send` never reaches it with no current task, because
+`validate_endpoint_right(cap, SEND)?` runs first and answers `InvalidCapability`.
+
+**The escape is closed by the TYPE, not by a guard.** The entry point decides one thing and hands
+a recognized NR 1 to a body returning `SplitSendDisposition`, which has `Complete` and
+`PostWorkCommitted` and nothing else. There is no value meaning "the broad dispatcher should
+service this trap", exactly as there is none in the `Result<(), TrapHandleError>`
+U9-IPC-RESIDUAL2 gave NR 7. `QueueAdvanceCommitted` is absent too: NR 1 never publishes a queue
+advance of its own, its park hands one to the post-work drain, and the type says so.
+
+### §2 — the source fault, and the empty payload hiding inside it
+
+The delivered route asked `copy_from_user_asid_split_read` and treated every `None` alike. That
+reader refuses three unrelated things and only one of them is a fault:
+
+* **`len == 0`** — a legal empty payload. `copy_from_user`'s per-byte loop does not run, so the
+  broad handler answers `Ok` with an untouched buffer and sends the message. Folding this into
+  the refusal is how **every zero-length user send reached the terminal broad dispatcher**, on
+  every boot. This was the reachable one.
+* **`len > 192`** — impossible, and derived rather than assumed: `classify_ipc_send_payload_shape`
+  yields `Inline` for a user sender only when `len <= Message::MAX_PAYLOAD` (128), and the
+  reader's cap is `DEBUG_LOG_MAX_BYTES` (192). The guard drives the real classifier across the
+  whole range instead of asserting it.
+* **anything else** — the genuine user-memory fault, `asid_raw == 0` included, which
+  `copy_from_user`'s own `validate_user_access_for_asid` also answers `UserMemoryFault` for.
+
+So the source is now SELECTED, by `nr1_classify_inline_source`, rather than inferred from a
+reader's refusal; the production route and the differential cases ask that one policy the same
+question.
+
+**Why returning through the entering frame is safe**, which recording a fault does not establish
+by itself: the record is a rank-8 write and a frame error and publishes no terminal transition.
+The caller is not blocked, not preempted, not exiting — it is still `current` on this CPU and
+still owns this frame, exactly as after the broad handler's own `record_user_fault`. Nothing is
+stashed on the per-CPU post-work channel and no deferral is armed, so the architecture tail has
+nothing to drain. `Complete(Ok(()))` is what says so.
+
+It is also strictly before anything is consumed. The fault is raised in step (7); step (8),
+`stash_transfer_envelope_split`, is the first consuming step — so there is no envelope, no
+transient pin, no `Message`, no queue entry, no receiver copy and no wake to undo. That ordering
+is `handle_ipc_send`'s too: its `record_user_fault` arm returns before `stash_transfer_handle`.
+
+**The fallible settlement is not discarded.** The split twin can fail where the broad one cannot,
+for exactly one reason: it must BIND the CPU `with_cpu` had already bound on entry. If that
+refuses, the record did not happen and the frame carries no `PageFault`, so answering `Ok(())`
+would hand a task an unset result for a fault the kernel never recorded. It is refused with the
+error that predicate's own failure maps to.
+
+### §3 — the witness, and what it refuses to infer
+
+Nothing in production can issue the shape: every `ipc_send` caller passes a pointer to a frame it
+just built, so the fault arm has existed and never run, and a successful send says nothing about
+it. `ipc_send_raw_source` is the minimum that makes it issuable — the same syscall, the same
+argument slots, the same error decoding, with `ptr`/`len` chosen by the caller instead of derived
+from a `Message`. No syscall number, no ABI.
+
+A DISPOSABLE child, sharing init's cspace and address space and owning nothing the system depends
+on, runs six rounds of `fault → recover`. The three halves of the evidence are kept apart:
+
+| | attests |
+|---|---|
+| the child | the faulting send answered `PageFault` and not `InvalidArgs`, and the very next send from the same task succeeded — the continuation |
+| the parent | exactly the good messages arrived, in order: `drained == good_ok`, so the failed sends delivered nothing and woke nobody |
+| the kernel | `IPC_SEND_SPLIT_SOURCE_FAULT` names the address the child passed, `access=read`, and the child's own tid — a handler that merely encoded the error would look identical from userspace |
+
+Slot-5 ownership is verified rather than assumed: selector 15 is distinct from 12/13/14, the knob
+is default-off, arming it arms the ONE shared provisioning, and the copy-on-write cell still
+requires slot 5 EMPTY — so this witness cannot drag in the unrelated fork workload.
+
+**The terminal-broad measurement sits at the arrival.** `IPC_SEND_BROAD_ENTRY` is emitted by
+`handle_ipc_send`, whose only caller is the broad dispatcher's `Syscall::IpcSend` arm, so it
+counts NR 1 traps that reached the terminal acquisition. A marker on the split side could only
+report doors that route chose to walk past, and with the fall-through now unwritable it would be
+a statement about code that cannot run.
+
+### §4 — the guard, tested against the code it was written to catch
+
+`u9_send_final_closure` checks complete function bodies by brace matching, the family's return
+types, the entry's single guarded `NotHandled`, the settlements and the source policy. Two cases
+then splice the delivered shapes back into a copy of the source and require the checker to
+REJECT them — the payload-fault fallback and each admission escape in turn. A closure guard that
+passes on the code it replaced proves nothing about either.
+
+One displaced guard re-derived. 199G-C4's `no_broad_fallback_exists_after_the_route_consumes_
+anything` required at least three pre-mutation declines; all three were escapes, so the half that
+asserted their presence is replaced by its own negation — no recognized NR 1 may answer
+`NotHandled` at all, which makes "where does it do so" moot. The post-stash settle requirement is
+unchanged.
+
+### Census
+
+**CENSUS-DELTA: 0.**
+
+### Deferred, and recorded against a fresh base
+
+* **RISC-V resumes the process manager through the STARTUP arm with a stale argument mirror.**
+  `RISCV_STARTUP_ARGS tid=2 ... a0=9` appears **70 times in the base-qualified park-witness boot
+  at `31527329`**, so it is pre-existing and is not this package's. It is the same
+  resume-convention family U9-IPC-RESIDUAL3 §3 repaired for a committed park, and the remaining
+  case is an unconsumed `IpcRecv`-class completion whose split consumer is still behind
+  `ipc-reply-timeout-oracle-core` on this port — the defect AArch64 fixed at its own resume
+  boundary. It is named here and left alone. What this package did do is stop AMPLIFYING it: the
+  witness child exits when its work is done instead of yielding forever, because an unbounded
+  yield loop turned 70 of those resumes into 1133 and one eventually landed on an instruction
+  that dereferenced the stale `a0`.
+* **Init's mapping-run pressure** at `MAX_MAPPINGS` is untouched; the witness fits in existing
+  headroom.
+* **NR 2 `IpcRecv`'s user-ASID cohort, NR 5 and NR 9** still reach terminal acquisition.
+
 ## U9-IPC-RESIDUAL3 — settlement parity, and the park qualified live
 
 Reviewed candidate `cdd53d4e`; base `cdd53d4e`. U9-IPC-RESIDUAL2 made the NR 6 / NR 7 boundary
