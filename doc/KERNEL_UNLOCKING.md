@@ -16839,6 +16839,120 @@ the highest-traffic pair in the whole space — 53 and 54 dispatches in a single
 Second candidate, smaller and mostly wiring: **NR 2 `IpcRecv`'s user-ASID cohort**, which §1
 established is not short a mechanism.
 
+## U9-RECV-FINAL (slice 1) — one receive entry, RISC-V NR 2, and the non-blocking probe
+
+Reviewed candidate `8dd067f4`; base `8dd067f4`. **NR 2 and NR 5 are NOT closed.** This is a
+staged slice: it converts three source-defined receive populations, removes a dependency the
+conversion exposed, and lists every fallback that remains with its next owner.
+
+### The family had TWO entry points, and one of them was on the wrong list
+
+The blocking lane sat with the switching classes; the immediate lane sat on the NON-SWITCHING
+whitelist, whose contract is that everything on it may be early-returned through the caller's own
+frame. That was never true of a receive — an empty endpoint parks the caller. Each lane could also
+answer `NotHandled` long after recognizing the syscall: eighteen distinct declines in one, an
+`Option` in the other, every one a recognized receive reaching the terminal acquisition.
+
+`try_split_ipc_recv_family_into_frame` is now the one entry, consulted with the other switching
+classes, and NR 2 is off the non-switching whitelist. A decline from either lane reaches the next
+pre-lock owner instead of the broad dispatcher. The two admission escapes are settled with the
+error the broad path produces — `WrongObject` for an out-of-range CPU (`with_cpu` runs
+`set_current_cpu(cpu)?` before its closure and never enters it), `InvalidCapability` for no current
+task (`validate_endpoint_right`'s first step reads `current_task_cnode()`, so `Internal` is not the
+answer this handler gives).
+
+### What this slice closes
+
+| population | before | after |
+|---|---|---|
+| **every NR 2 on RISC-V** | the whitelist excluded NR 2, so all of them — queued deliveries as much as blocking ones — reached the terminal acquisition | served pre-lock, ~114 per boot |
+| **NR 5's non-blocking probe** (`timeout_ticks == 0`) | the blocking route refuses it by name (`not_timed_recv`) because a probe never parks, and nothing else claimed it | served by the same delivery engine NR 2's immediate lane uses |
+| **the two receive admission escapes** | handed to the broad dispatcher | settled with its own errors |
+
+The RISC-V exclusion was never structural. The gate's own comment said so — "excluded for want of
+a live witness, not for a structural reason: its D2-recv drain is the same shape" — and NR 5, which
+shares that route step for step, was admitted throughout.
+
+**The probe reads NR 5's ABI, not NR 2's.** `timeout_ticks` is arg 3, which is exactly where NR 2
+puts its recv-v2 metadata POINTER; decoding one as the other would read a timeout as a pointer. The
+request is built by `RecvRequest::from_ipc_recv_timeout` and the frame's syscall number is never
+rewritten. `recv_queued_split_phase_a_split` now takes the request as a PARAMETER rather than
+decoding it, so both syscalls drive one delivery engine — one definition, two callers, guarded.
+
+**The empty-result encoding is not an error return.** `handle_ipc_recv_result_with_empty_error`'s
+`None` arm sets the frame's error lane to `WouldBlock` *and* the transfer-cap return lane to the
+no-transfer sentinel, then answers the SYSCALL `Ok(())`. The first cut returned
+`Err(WouldBlock)`, which would have left `ret2` carrying the previous syscall's value; the
+differential caught it because it compares `ret2` and not just the error.
+
+### The dependency the conversion exposed, and its removal
+
+With the probe converted, the x86_64 core profile takes **no terminal acquisition at all** —
+`IPC_RECV_SPLIT_UNROUTED`, `IPC_SEND_BROAD_ENTRY`, the split-dispatch fallback count and the
+page-fault count are all zero. That starved a chain hooked to `handle_trap_event`'s syscall and
+timer arms, and the ledger matters:
+
+* `maybe_run_unlock_graduated_proof` is **not diagnostics**. It runs a real D3 scratch transaction
+  — create address space, allocate memory object, map, verify, unmap, release both leaf
+  capabilities, destroy — bracketed by a PT-pool leak check, and ends by calling
+  `set_unlock_graduated_proof_completed()`, the ORDERING GATE `maybe_run_x86_smp_unlock_audit`
+  requires before `ap_scheduler_online_admission`. A boot where it never runs is a boot where APs
+  can never be admitted.
+* `maybe_run_cross_arch_live_audit` reads topology counts and emits markers. No mutation — verified
+  by inspection, not by its comment — and a core-smoke requirement.
+
+Both now run from boot ownership points that ALREADY hold their reference, so **no acquisition was
+added and the census stays 2**:
+
+| chain | owner | why that one |
+|---|---|---|
+| graduated proof | `bootstrap_first_user_task` (`&mut KernelState`) | init's cnode exists; the check creates and destroys its OWN address space; no AP is online yet, so `online == 1` holds by construction rather than by racing a trap |
+| live audit | `enter_dispatched_user_task_if_available` (`&KernelState`) | its topology claim only becomes true once a task is running, so bootstrap is too early — it would refuse with `accounting_bad`. Its body is `&self`, so it cannot mutate or acquire |
+
+**A real defect the placement exposed.** The first cut passed init's cnode. But
+`create_user_address_space` and `alloc_anonymous_memory_object` mint into the CURRENT task's
+cspace, and the check releases from the cnode it is handed — so it minted into one cspace and
+deleted from another. Measured live: `mem_leaf=false aspace_leaf=false mo_leak=true`, a memory
+object never released. The mint target and the release target must be the same cnode by
+construction.
+
+The SMP profile is better than before, not merely preserved: the proof used to have to catch a trap
+while `online == 1` or answer `DEFERRED reason=smp_not_live` and never set the flag. It now runs at
+bootstrap, and `X86_SMP_AP_SCHED_ONLINE present=2 online=2 … remote_wake_ok=1` plus
+`X86_SMP_UNLOCK_DONE result=smp_seams_ok tlb_ack=1` follow deterministically.
+
+No marker substitution, no relaxed runner assertion, no fallback syscall, no wrapper hiding an
+acquisition.
+
+### Census
+
+**CENSUS-DELTA: 0.** `AUDITED_WITH_CPU_TOTAL = 2`, `AUDITED_WITH_BROAD_TOTAL = 0`.
+
+### Source-reachable receive fallbacks that REMAIN — NR 2 / NR 5 stay OPEN
+
+Zero terminal entries in ordinary boots is a workload result, not closure. Each of these still has
+a reachable path to the broad dispatcher:
+
+| class | next existing owner, or the missing operation |
+|---|---|
+| queued **shared-region** transfer (`OPCODE_SHARED_MEM`) — declined at admission before consuming | the NR 30 transfer/mapping owners; needs a receiver-side mapping step the engine has no off-lock materializer for |
+| **sender-waiter refill** with a cap-bearing or reply-cap message, or a sparse waiter queue | `materialize_reply_cap_split` / the 186D2-186D3 ordinary-cap seam; needs refill-time materialization ordered against the wake |
+| queued **Reply object tagged as an ordinary transfer** | declined deliberately; the canonical materialize fails closed on it |
+| **kernel-task receiver + V2 metadata** (`RecvV2MetaUserCopy`) | needs the canonical answer derived; a kernel task has no address space for the 40-byte struct |
+| NR 2 **legacy (non-recv-v2) blocking** shape (`not_recv_v2`) | the blocking lane saves `BlockedRecvState` for the recv-v2 variant only; needs a legacy completion variant |
+| blocking-lane **races and admission**: `already_deferred`, `defer_unavailable`, `phase_a`, `phase_b`, `queue_non_empty` / `waiter_ownership_busy`, `deadline_reservation` | each needs a settlement rather than a hand-over; the unwind owner `recv_block_unwind_race_split` already exists |
+| **publication gates armed**: `shared_region_ack_publication_armed`, `direct_oracle_selector_armed` | broad-only acknowledgement machinery; needs the shared-region ack published pre-lock |
+| NR 5 **timed** receive where the blocking lane declines | the same lanes above |
+
+Proven UNREACHABLE from NR 2 / NR 5 rather than left open: `UserAsidCopySemantics` (no production
+request builder sets `map_intent`; only a test constructor does) and `SharedV3HelperOnly` (neither
+builder produces that kind).
+
+### Deferred, unchanged by this slice
+
+Init's `MAX_MAPPINGS` pressure; the RISC-V startup-arm resume of the process manager; the `vm-cow`
+CI profile's pre-existing heap OOM; NR 9 and the non-syscall trap families.
+
 ## U9-SEND-FINAL — NR 1's last terminal edges, closed and witnessed
 
 Reviewed candidate `31527329`; base `31527329`. 199G-C4 moved `IpcSend` off the broad lock and
