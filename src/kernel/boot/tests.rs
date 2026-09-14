@@ -135885,12 +135885,20 @@ mod riscv64_async_preemption {
         assert!(arm.contains("frame.regs[RiscvTrapFrame::A7] = 0;"));
         // The continuation decision is published only where a completion was consumed, and it is
         // cleared at every trap entry so it cannot be inherited.
+        //
+        // U9-IPC-RESIDUAL3 §3 re-derives the count, not the claim. The post-lock drain now has
+        // TWO consumers rather than one — the reply-timeout take, which is compiled only under
+        // the oracle feature, and the production-live blocked-SEND take that a committed park
+        // resumes through — so there are four publication sites and each still sits immediately
+        // after a completion was actually consumed and its result actually encoded. The property
+        // being guarded is that pairing; four was reached by adding a consumer, which is the only
+        // way it is allowed to move.
         assert_eq!(
             RV_TRAP_SRC
                 .matches("crate::kernel::boot::riscv_syscall_continuation_publish(cpu.0 as usize)")
                 .count(),
-            3,
-            "the two in-lock completion consumers and the post-lock drain all publish"
+            4,
+            "the two in-lock completion consumers and the post-lock drain's two all publish"
         );
         assert!(
             RV_BOOT_SRC
