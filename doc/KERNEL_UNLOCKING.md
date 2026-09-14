@@ -16839,7 +16839,231 @@ the highest-traffic pair in the whole space — 53 and 54 dispatches in a single
 Second candidate, smaller and mostly wiring: **NR 2 `IpcRecv`'s user-ASID cohort**, which §1
 established is not short a mechanism.
 
+## U9-IPC-RESIDUAL2 — NR 6 and NR 7 closed at the type level
+
+Reviewed candidate `872c4b9`; base `872c4b9`. The previous package measured the terminal-broad
+traffic honestly and served two residual shapes; it did not make the family boundary total, and
+its record said otherwise. This one does, and the way it does it is a return type rather than a
+count.
+
+### §0 — the acceptance record, corrected
+
+The correction is inserted in place above U9-IPC-RESIDUAL1's own heading rather than restated
+here. In summary: at `872c4b9` the NR 6 route answered `None` from three places and the NR 7
+route from eighteen, plus — indirectly, and invisibly to every guard that existed — from every
+transaction outcome `apply_direct_disposition` maps to `DeclinedBeforeMutation`, whose `None` was
+`.map`ped rather than matched. A boot reporting `broad_entries=0` did not contradict any of that;
+it reported that no trap took those doors on that boot.
+
+### §1 — the exhaustive residual-to-owner table
+
+Every fall-through, enumerated from source, with the canonical broad behaviour and the pre-lock
+owner that reproduces it. "Not observed in the boot" is not used as an argument anywhere in it.
+
+**NR 6 — `try_split_ipccall_direct_into_frame` and its buffered lane**
+
+| # | residual | canonical broad behaviour | owner |
+|---|---|---|---|
+| 1 | `SendCapUnresolved` | `validate_endpoint_right(SEND)?` | closed by U9-IPC-RESIDUAL1 |
+| 2 | `RequesterUnavailable` | the same validation, with no cnode | typed error |
+| 3 | `NotAnEndpoint` | `WrongObject` (unreachable: the resolver refuses first) | typed error |
+| 4 | `EndpointIncarnationGone` | `resolve_endpoint_index` → `StaleCapability` | typed error |
+| 5 | `PayloadTooLong` | `len > Message::MAX_PAYLOAD` → `InvalidArgs` | typed error, after both capability checks |
+| 6 | `SynchronousMode` | the rendezvous arm | **statically unreachable**; typed invariant error |
+| 7 | `EndpointNotAdmitted` | the legacy send | **statically unreachable**; typed invariant error |
+| 8 | source copy — user fault | `record_user_fault(.., Read)` then `Ok(())` | `record_split_source_read_fault` |
+| 9 | source copy — `len == 0` | a legal empty message | the copy is skipped |
+| 10 | source copy — kernel ASID | `inline_payload_from_frame` | `split_inline_payload_from_frame` |
+| 11 | snapshot build | `Message::with_header` → `InvalidArgs` | typed error |
+| 12 | buffered lane: waiter present | `ReceiverWaiterFound` → direct delivery | `produce_blocked_waiter_reply_cap_delivery_split` |
+| 13 | buffered lane: reply capability | `validate_endpoint_right(RECEIVE)?` | `validate_endpoint_right_split_read` |
+| 14–18 | cnode, record, mint, persist, stash | `create_reply_cap_for_caller` / `stash_transfer_handle` errors | typed errors, each after compensation |
+| 19 | framing | `.map_err(InvalidArgs)?` | typed error |
+| 20 | **queue full** | `ipc_send` **parks the sender** | `BlockingSendCommitSnapshot` + the U6 drain |
+| 21 | waiter appeared at publication | delivery, or the queue's own ordering | the delivery arm, else `WouldBlock` |
+| 22 | endpoint missing | `WrongObject` | typed error |
+| 23 | **endpoint incarnation changed** | `StaleCapability` | new; see §3 |
+| 24 | every pristine transaction outcome | enqueue, deliver or park | routed to the buffered lane |
+
+**NR 7 — `try_split_ipcreply_direct_into_frame`**
+
+Nineteen sites, in three groups. The preflight verdicts (`ReplyCapUnresolved`,
+`ReplyEndpointGone`, `TerminalUnavailable`, `PayloadTooLong`, `RequesterUnavailable`,
+`EndpointNotAdmitted`) are resolved in `handle_ipc_reply`'s own order — requester, transferred
+capability, length, and only then the one-shot. The two lanes' acquisitions (transfer-capability
+decode, record caller, authority slots, record reservation, terminal claim, envelope stash,
+framing, producer decline, queued commit) each answer with the canonical error after compensating
+through their exact owners. The five pristine transaction variants (`WouldBlock`,
+`LeaseNotClaimed`, `ReplyCapResolve`, `ReservePreconditionFailed`, `WaiterLost`) are mapped
+exhaustively, with no wildcard.
+
+**The two unreachability proofs.** Neither is observational.
+
+* `EndpointMode::Synchronous` — every production endpoint is created by `create_endpoint(depth)`
+  (`Buffered`) or by `spawn_image_txn`'s explicit `EndpointMode::Buffered`, and there is **no
+  endpoint-creation syscall at all**, so no capability userspace can hold names one. Every
+  remaining `EndpointMode::Synchronous` in the tree is test-only.
+* `EndpointNotAdmitted` — `ipccall_direct_production_enabled()` is a `const fn` returning
+  `cfg!(x86_64) || cfg!(aarch64) || cfg!(riscv64)`, and it is the first, short-circuiting term of
+  every admission predicate, so the confining branch is statically dead on every supported port.
+
+Both are refused with a typed invariant error rather than a fallback, on the precedent NR 1 set
+for exactly these two classes (199G-C4 §4).
+
+### §2 — the boundary is total, and the type system is what says so
+
+The routes returned `Option<..>`. "The broad dispatcher should service this trap" was therefore a
+value they could produce, and a guard could only ever count the places that produced it. They now
+return `SplitDispatchDisposition` and `Result<(), TrapHandleError>`; the fall-through is not
+something the compiler will let them say. `NotHandled` survives only on the NR 6 entry point,
+where "this trap is not a NR 6" has to be expressible, and is asserted to appear nowhere else in
+the family.
+
+NR 6 became a **switching** class in the process, because its full-endpoint arm parks the caller.
+It is tried in `try_split_dispatch_into_frame` beside the five that were already there, and its
+park answers `PostWorkCommitted { finalize_syscall: false }` — the disposition whose whole purpose
+is a caller that must not have a result written into its frame, because that frame now belongs to
+a parked task.
+
+**The three arms of the buffered lane**, each composed from the owner that already implements it:
+
+```
+a recv-v2 blocked receiver  ->  produce_blocked_waiter_reply_cap_delivery_split
+no waiter, room in queue    ->  enqueue_request_if_no_waiter_split
+no waiter, queue FULL       ->  BlockingSendCommitSnapshot + commit_blocking_send_split
+```
+
+The third is the one U9-IPC-RESIDUAL1 called "the BLOCKING origin ... out of scope". Answering
+`WouldBlock` there would have been wrong in the specific way the directive names: the broad
+operation blocks the caller until the queue drains, and a caller told `WouldBlock` instead would
+spin or fail a send that is merely delayed. Nothing is unwound on that arm — the message, carrying
+the reply capability's envelope, rides with the sender waiter exactly as it does in-lock.
+
+**Validation precedence is preserved rather than approximated.** The eligibility classifier asks
+the cheapest question first (`payload_len`), which is right for a classifier and wrong for an
+answer: `handle_ipc_call` validates the send capability, then the reply capability, then resolves
+the endpoint index, and only then checks the length. A call that is wrong in several ways must be
+told about the first thing that is wrong, so the refusal resolvers re-ask in the broad order and
+the verdict decides only *that* a refusal is owed. The same correction applies inside the buffered
+lane, which had been asking resolve → right → kind where the owner asks resolve+live → kind →
+right.
+
+**And a source-copy fault is a fault.** `copy_from_user_asid_split_read` answers `None` for three
+unrelated conditions — a kernel-ASID caller, an empty payload, and a real fault — and all three
+read as "decline" before. Each now takes the owner the broad handler takes for it, and the fault
+takes `record_user_fault(.., FaultAccess::Read)`, not `InvalidArgs`: substituting the argument
+error would skip the fault record entirely and tell a task its arguments were malformed instead of
+telling it — and recording — that its buffer was not readable.
+
+### §3 — identity across the publication boundary
+
+`enqueue_request_if_no_waiter_split` and its locked body took only `endpoint_idx`. The queued lane
+captured `send_egen` and put it in a log line. That is not a validation, and the gap it left is
+not theoretical: between the preparation (which resolves the send capability, reserves a reply
+record, mints the caller's one-shot `Reply` capability and stashes an envelope against incarnation
+N) and the publication, the endpoint can be destroyed and its slot reallocated. `ipc.endpoints[idx]`
+is then `Some`, the admission question answers about the **new** endpoint, and the enqueue publishes
+this caller's request — carrying a live reply capability — into a stranger's queue.
+
+The comparison now happens inside the same rank-3 acquisition that checks waiter state and
+enqueues, ahead of both, and answers a new `QueuedRequestOutcome::EndpointIncarnationChanged`
+rather than being conflated with a missing slot. Checking earlier could not have fixed it: any
+check outside that acquisition is a check of a value that may change before the mutation. It is
+the discipline `commit_blocking_send_split` already applies to its own rank-3 section.
+
+`a_recycled_endpoint_cannot_receive_a_request_prepared_for_its_predecessor` drives it end to end
+through production owners: destroy, reissue into the same slot, and confirm the prepared request
+is refused, that nothing reaches the new endpoint's queue, and that the same request against the
+live incarnation still publishes — so the guard is exact rather than a blanket refusal.
+
+**The refusal settles all three resources.** The park arm is the one publication that can still be
+refused after the resources are taken, and the commit runs in the post-lock drain, so all three
+travel to it: the envelope in `transfer_envelope`, and the mint and the record in a new
+`reply_authority`. `execute_blocking_send_commit`'s refusal arm revokes the capability **before**
+freeing the record it names — the other order leaves a live capability pointing at a slot that may
+already have been reissued — through `rollback_minted_cap_split` and
+`free_reserved_reply_record_split`, the lane's own compensators. Settling only the envelope, which
+is all the pre-existing cleanup could do, would have left the caller holding a `Reply` capability
+for a request that was never sent and one of `MAX_REPLY_CAPS` permanently consumed, once per
+refusal.
+
+### §4 — acceptance that catches the current code
+
+`u9_ipc_residual2_closure` replaces the claimed proof. It reads **complete** function bodies by
+brace matching rather than slicing to the next attribute — the earlier modules' slices stopped
+early whenever a nested item carried one, which is how a `return None` past that point stayed
+invisible — walks the two entry points' transitive call graph and asserts the function list is
+complete, and pins the disposition chain including the indirect fall-through nobody had looked at.
+
+Run against the delivered `872c4b9` tree, the guard fails **8 of 8** of its structural checks.
+
+`u9_ipc_residual2_cases` drives the behavioural residuals through production owners: endpoint
+recycling before the enqueue, the full-queue blocking origin, a waiter appearing before the
+publication, validation precedence over three shapes of invalid authority, compensated retry (the
+same slot is reissued, as a new incarnation, which is what "genuinely re-sendable" has to mean),
+and the responder binding that distinguishes the delivery arm from the buffered one.
+
+Displaced guards re-derived, and why each moved: two sliced their arm at `return None`; the
+rank-order guard read a body that moved whole into a shared transaction when the fault direction
+became a parameter (its wrappers' directions — `Write` for the recv boundary, `Read` for the
+source copy — are now pinned separately, because a shared body could silently get that wrong for
+one caller); the dispatcher guards followed NR 6 to the switching dispatcher; and the accounting
+census asserted twenty-three pre-transaction declines, which is now **zero** in both directions,
+with the guard stating that a non-zero count would mean a NR 6 or NR 7 had reached a terminal
+broad acquisition.
+
+The Stage 147 IPC boundary audit was **not** re-derived: it was right. `inline_payload_from_frame`
+must stay module-private, so `ipc.rs` owns a named split entry point instead of the helper being
+widened.
+
+### §5 — the live matrix, and the witness that is not here
+
+Reported separately below. The one thing §4 authorized that is absent is the full-endpoint park
+witness, and it is absent for a reason that is itself a finding: see the deferred list.
+
+### Census
+
+**CENSUS-DELTA: 0.**
+
+### Deferred
+
+* **Init's mapping-run pressure — now blocking, and named exactly.** Init's address space runs at
+  `AddressSpace::MAX_MAPPINGS` (128/128) on the oracle-provisioned profile. A copy-on-write write
+  fault to a page in the **middle** of a run must split it into up to three entries, so
+  `AddressSpace::map_page` — reached from the COW transaction's rank-5 remap in `runtime.rs` —
+  returns `VmError::Full` and the fault fails closed with
+  `VM_COW_SPLIT_FAILED_CLOSED ... reason=remap`. U9-IPC-RESIDUAL1 §5 recorded the headroom as
+  deferred; this is the second package it has stopped, and the first it has stopped from producing
+  evidence. The park witness is complete and retained on `wip/u9-ipc-residual2-park-witness`.
+* **NR 6 / NR 7 rendezvous.** Preserved by proof rather than by implementation: no production
+  endpoint can be `Synchronous`, so the arm is refused with a typed invariant error. If an
+  endpoint-creation syscall is ever added, that arm becomes reachable and needs the rendezvous
+  scheduling semantics the legacy path has.
+* **NR 2 `IpcRecv`'s user-ASID cohort** — still not wired, and still not short a mechanism.
+* **NR 1's source-copy fault** still declines to the broad path. It is the same shape §2 closed for
+  NR 6 and NR 7 and the owner now exists, but NR 1 is outside this package by directive.
+
 ## U9-IPC-RESIDUAL1 — NR 6 and NR 7 terminal dispatch closed
+
+> **Corrected by U9-IPC-RESIDUAL2 §0. This record's closure claim was too strong.**
+>
+> What §1–§5 below established is real and is not withdrawn: the traffic figures U9-XFER2 cited
+> were direct successes, the terminal entry is now measured once per trap, two residual shapes
+> were served through existing owners, and every exercised workload reported `broad_entries=0`.
+>
+> What it did **not** establish is source closure, and the heading and the section titles read as
+> if it had. At the delivered `872c4b9` the NR 6 route still answered `None` from **three** places
+> and the NR 7 route from **eighteen** — the preflight verdicts other than an unresolvable send
+> capability, both source copies, both snapshot builds, every acquisition in the buffered and
+> cap-bearing lanes, the full-endpoint arm, and, indirectly, every transaction outcome the
+> disposition encoder maps to `DeclinedBeforeMutation`. The split dispatcher counted each of those
+> fall-throughs and then let the trap enter the terminal broad acquisition.
+>
+> Zero broad entries in a boot is a statement about that boot's workload, not about the route. The
+> §4 module below was named `u9_ipc_residual1_closure` while asserting only that the measurement
+> existed and that the three architecture ingress paths did — neither of which is a closure proof.
+> U9-IPC-RESIDUAL2 replaces it with guards that read complete function boundaries and follow the
+> disposition chain, and those guards fail against this tree.
 
 Reviewed candidate `7b58ba7`; base `7b58ba7`. Both directions of the direct request/reply pair now
 have a source-derived terminal closure, and the U9-XFER2 record's own traffic claim is corrected
