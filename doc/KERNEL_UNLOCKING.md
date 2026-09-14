@@ -16935,9 +16935,27 @@ it for the owner that will park the caller against it.
 
 ### Live evidence
 
-The XFER2 grant witness now runs in two complementary profiles over the same transfer: default,
-which receives with NR 30 in both release shapes, and `ORDINARY_ROUTES=1`, which receives the
-identical queued `OPCODE_SHARED_MEM` message with NR 2 and with NR 5 under a finite timeout.
+The XFER2 grant witness now runs in two complementary profiles over the same grant: default,
+which receives with NR 30 in both release shapes, and `ORDINARY_ROUTES=1`, which receives a queued
+`OPCODE_SHARED_MEM` transfer with NR 2 and with NR 5 under a finite timeout. Both prove the same
+seven properties — the frame reports a real capability and the page-rounded length, every byte of
+the mapped page matches the deterministic oracle pattern, the NR 4 release returns the exact
+length, the window is free again afterwards (proven by remapping over it), and a duplicate release
+is refused.
+
+The ordinary profile grants **one page**, not the oracle's two, and the reason is the defect
+recorded above: the broad mapping loop resolves one physical base per page, so a two-page grant
+through NR 2 or NR 5 maps both pages to the object's first frame. A two-page grant here would be
+testing that bug rather than the route, and single-page is the only shape production sends through
+these two syscalls. The send therefore uses `send_shared_region_large` with an explicit length
+instead of the whole-object `send_shared_region`.
+
+Observed on x86_64: `IPC_RECV_SHARED_REGION_SPLIT_MAPPED receiver_tid=1 va=0x40000000
+mapped_len=4096 region_len=4096` for both grants, each followed by
+`IPC_RECV_SHARED_REGION_SPLIT_DONE result=ok`, with `nr=2 timeout=0` and `nr=5 timeout=64`
+respectively — the finite-timeout grant taking the immediate engine with nothing ever waiting.
+Cap-bearing refills are exercised by the park witness, which serves 12 per boot, one per parked
+sender.
 
 It REPLACES rather than adds, and that is measured. Init's address space runs at `MAX_MAPPINGS`
 (128/128) and its `init_server` text sits **19 bytes** below a page boundary (143 341 of 143 360),
