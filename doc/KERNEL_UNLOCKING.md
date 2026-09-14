@@ -16839,7 +16839,177 @@ the highest-traffic pair in the whole space — 53 and 54 dispatches in a single
 Second candidate, smaller and mostly wiring: **NR 2 `IpcRecv`'s user-ASID cohort**, which §1
 established is not short a mechanism.
 
+## U9-IPC-RESIDUAL3 — settlement parity, and the park qualified live
+
+Reviewed candidate `cdd53d4e`; base `cdd53d4e`. U9-IPC-RESIDUAL2 made the NR 6 / NR 7 boundary
+total and guarded it. Three things it got wrong or left unfinished are settled here, and the
+full-endpoint park it could not witness is now qualified on all three ports.
+
+### §0 — what the previous record over-claimed
+
+Two corrections, both narrow.
+
+**"The fall-through is inexpressible" is true of NR 7 and not of NR 6.** NR 7 returns
+`Result<(), TrapHandleError>`, which has no variant meaning "the broad dispatcher should service
+this". NR 6 returns `SplitDispatchDisposition`, which still contains `NotHandled` — necessarily,
+because its entry point has to be able to say "this trap is not a NR 6". So NR 6's closure rests
+on guarded control flow: `NotHandled` appears in the entry point and nowhere else in the family,
+and `no_family_function_can_fall_through` is what holds that. The type does half the work; the
+guard does the other half. The record above now says so.
+
+**Source closure and live qualification are separate claims and are reported separately.** The
+live census answers "did any trap enter the terminal acquisition on this boot"; the guards answer
+"can any path". Neither substitutes for the other, and §5's report keeps them apart.
+
+### §1 — the validation order, repaired through one policy
+
+`nr6_refuse_preflight` claimed in its own doc comment to "re-ask the questions in the broad order
+rather than translating the classifier's verdict one-to-one". It did not. Step (1) read
+`if let V::SendCapUnresolved(err) = verdict`, and the classifier checks `payload_len` FIRST — it
+returns `PayloadTooLong` before it has resolved anything. So:
+
+| call | `handle_ipc_call` | U9-IPC-RESIDUAL2 |
+|---|---|---|
+| bad send cap + good reply cap + oversized payload | `InvalidCapability` | **`InvalidArgs`** |
+| stale endpoint identity + oversized payload | `InvalidCapability` | **`InvalidArgs`** |
+| bad reply cap + oversized payload | `InvalidCapability` | **`InvalidArgs`** |
+| send cap missing SEND + oversized payload | `MissingRight` | **`InvalidArgs`** |
+
+A verdict is not an ordering. `nr6_validate_in_broad_order` is now the one policy, asked from the
+FACTS, and **both** NR 6 callers go through it — the eligible path and the refusal resolver — so
+there is one sequence rather than two that must be kept in step.
+
+Repairing that exposed a second mismatch that only a differential could find.
+`validate_endpoint_right` folds a LIVENESS check into its first answer
+(`slot.and_then(|c| capability_object_live(c.object)).ok_or(InvalidCapability)`), while
+`resolve_endpoint_send_cap_split_read` checks the slot, the object kind and the `SEND` right and
+**not** the generation. A capability naming a recycled endpoint incarnation therefore resolved
+`Ok` on the split side and was answered `WrongObject` by the incarnation step — the error broad
+gives for a different condition. Both answers are plausible in isolation; the policy now asks the
+liveness question where the broad handler asks it.
+
+The cases are behavioural. Each builds a real kernel, runs the real `syscall::dispatch` over a
+real `TrapFrame` to obtain `handle_ipc_call`'s own answer, asks the policy the same question over
+the same facts, and requires agreement **plus** an unchanged reply-record table, envelope table
+and endpoint depth. Seven of them, every one with more than one thing wrong at a time.
+
+### §2 — reply declines settled from ownership, not from an assumption
+
+U9-IPC-RESIDUAL2 mapped the five pristine variants to canonical errors on the reasoning that
+"the acknowledgement is spent, so the queued mode's precondition no longer holds, and re-running
+the reply under the broad lock would refuse identically". Both halves are false for some of them:
+
+* `settle_reply_pre_reserve` **restores** the lease whenever the exact caller is still blocked,
+  and `drain_direct_reply_post_work` republishes that restoration
+  (`if lease.is_available() { ipcreply_direct_ack::restore(work.ack_seq) }`). `WouldBlock` does
+  not touch the lease at all — it returns before the claim is even checked.
+* none of the five reaches the record reservation, so the record stays `Available` and externally
+  invokable, and the terminal claim this route took was **released**, not committed.
+
+So a reply the previous package refused could be a perfectly deliverable one: authority live,
+nobody else owning the terminal, caller not blocked — which is exactly the queued mode's
+precondition. Owning an acknowledgement is not proof that reply authority was consumed.
+
+`nr7_settle_declined_transaction` asks the three owners instead:
+
+| question | owner | disposition |
+|---|---|---|
+| is the authority still usable? | `reply_record_externally_invokable_split_read` | no → `WrongObject` |
+| who owns the terminal now? | `classify_direct_reply_terminal_split_read` | a competitor → `WrongObject`, **not revived** |
+| is the caller blocked? | `ipcreply_direct_ack::is_claimable` | no → the QUEUED lane; yes → `WouldBlock` |
+
+The competitor arm is deliberate and is the one §2 warns about: a live record is exactly the state
+in which reviving authority another claimant has settled would be easy. A resolution failure keeps
+its own typed error whatever the record looks like, because it is a statement about the capability
+the replier named.
+
+The queued lane is extracted into `nr7_queued_reply_lane` so the settler **reaches** it. The
+settler contains no `commit_queued_reply_split` of its own; a guard pins that, the order of the
+three questions, and the requirement that both refusals precede the continuation.
+
+### §3 — the park witness: the prerequisite was a slot collision, not a mapping limit
+
+U9-IPC-RESIDUAL2 deferred this witness and named `AddressSpace::MAX_MAPPINGS` as the blocker.
+That was the symptom. The cause is a startup-slot collision, and removing it needed no capacity
+change of any kind.
+
+`run_vm_cow_fork_witness_early` gates on startup slot 13, and its note said slot 13 is provisioned
+"ONLY under the sender-wake sub-knob". That stopped being true when
+`provision_init_shared_region_oracle` began writing `init_args[13] = mem_cap` and
+`init_args[14] = endpoint_cap` — the same `(13 + 14, no 17)` presence pattern sender-wake uses. So
+every slot-5 witness ran a fork and two copy-on-write faults it never asked for, and on a profile
+already at `MAX_MAPPINGS` the second remap failed closed and hung the boot. **The IPC evidence was
+being blocked by a workload unrelated to it.**
+
+Slot 5 is the discriminator and it already existed: on all three ports every `init_args[5]` writer
+sits inside a block guarded by slots 5, 13 and 14 all being zero, so a non-zero slot 5 means a
+slot-5 cell owns 13/14. The COW cell now additionally requires slot 5 empty. Sender-wake leaves
+slot 5 at zero, so **every existing COW regression profile still runs it unchanged**; the gate
+excludes exactly the profiles that were never meant to reach it.
+
+**What the witness proves, and what it refuses to infer.** `drained > 0` is not park evidence —
+timer preemption and Yield can both run the child. The evidence is the kernel's own
+identity-correlated chain, with the proposal and the commit counted separately because they are
+different events:
+
+```
+IPCCALL_PARK_SPLIT_PUBLISHED tid=C ... reply_cap=R record_index=I    proposal stashed
+U6_BLOCKING_SEND_COMMITTED   tid=C send_generation=N                 park COMMITTED
+U6_BLOCKING_SEND_WRAPPER_BLOCKED tid=C                               caller descheduled
+U6_SEND_COMPLETION_PUBLISHED tid=C send_generation=N result=0        the EXACT completion
+```
+
+paired generation by generation, with `proposed == committed == completed`. Each request carries
+its own sequence number so the receiver can check order and duplication, which no count can;
+reply-capability validity is checked kernel-side, where every park logs its own `reply_cap` and
+`record_index` and the smoke requires those distinct across parks — no two parked requests may
+share a one-shot. The broad producer's `U6_BLOCKING_SEND_PUBLISHED` must be **absent**, so the
+park is attributable to the split route and not to the in-lock one.
+
+### Census
+
+**CENSUS-DELTA: 0.**
+
+### Deferred, and recorded against a fresh base
+
+* **The `vm-cow` CI profile fails** with a kernel heap OOM at `VM_COW_FORK_BEGIN`
+  (`memory allocation of 4096 bytes failed`). It fails **identically at a freshly built base
+  `cdd53d4e`**, so it is pre-existing and unrelated to this package; that run is also what
+  confirms the COW cell still executes on its own regression profile after the slot-5 gate.
+* **Init's mapping-run pressure** at `MAX_MAPPINGS` is untouched. This package did not need it and
+  did not change it — the witness fits inside the headroom that exists once the unrelated fork is
+  out of the profile.
+* **NR 1's source-copy fault** still declines to the broad path; the owner exists, but NR 1 is
+  outside this package.
+* **NR 2 `IpcRecv`'s user-ASID cohort** — still not wired, still not short a mechanism.
+
 ## U9-IPC-RESIDUAL2 — NR 6 and NR 7 closed at the type level
+
+> **Corrected by U9-IPC-RESIDUAL3 §0, on two points. The closure holds; two of the claims made
+> for it were stronger than the code.**
+>
+> **1. "Closed at the type level" is true of NR 7 and only half true of NR 6.** NR 7 returns
+> `Result<(), TrapHandleError>`, which has no variant meaning "the broad dispatcher should
+> service this trap", so for NR 7 the fall-through really is inexpressible. NR 6 returns
+> `SplitDispatchDisposition`, which still contains `NotHandled` — necessarily, because its entry
+> point has to be able to say "this trap is not a NR 6 at all". NR 6's closure therefore rests on
+> GUARDED CONTROL FLOW as well as on the type: `NotHandled` appears in the entry point and
+> nowhere else in the family, and `no_family_function_can_fall_through` is what holds that. The
+> heading is kept because it is the name the package shipped under, not because it is exact.
+>
+> **2. Two of its refusal paths did not match the broad handler.** The §2 resolver's own doc
+> comment said it "re-asks the questions in the broad order rather than translating the
+> classifier's verdict one-to-one"; it keyed its first step on the verdict, and the classifier
+> reaches `PayloadTooLong` before it resolves anything. An invalid send capability, a stale
+> endpoint incarnation or an invalid reply authority behind an oversized payload all reported
+> `InvalidArgs` where `handle_ipc_call` reports a capability error. Separately, its §2 reply
+> decline assumed the acknowledgement was spent and the reply authority with it, which
+> `settle_reply_pre_reserve` contradicts — it restores the lease whenever the exact caller is
+> still blocked. Both are repaired in U9-IPC-RESIDUAL3 §1 and §2, with differential cases against
+> the real dispatcher and against the real settle owners.
+>
+> Its live figures and its census delta stand unchanged.
+
 
 Reviewed candidate `872c4b9`; base `872c4b9`. The previous package measured the terminal-broad
 traffic honestly and served two residual shapes; it did not make the family boundary total, and
