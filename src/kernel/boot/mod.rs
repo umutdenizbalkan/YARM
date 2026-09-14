@@ -7859,6 +7859,35 @@ pub fn ipc_residual2_park_witness_enabled() -> bool {
     IPC_RESIDUAL2_PARK_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// U9-SEND-FINAL §3 — the NR 1 SOURCE-FAULT witness selector. Slot 5 is mutually exclusive; 15 is
+/// the next free value after U9-IPC-RESIDUAL2's 14.
+///
+/// It exists for the reason every slot-5 cell exists: production never issues the shape. An
+/// ordinary boot's `IpcSend` callers pass buffers they own, so the arm that answers an unreadable
+/// source — `record_user_fault(.., Read)` and a `PageFault` return — is never taken, and a
+/// successful send proves nothing about it. A hosted case can drive the broad handler's decision;
+/// only a live boot can show a real NR 1 trap fault, the caller resume, and the endpoint stay
+/// untouched by the send that failed.
+///
+/// It reuses the SAME provisioning and the same startup slots 13/14 as selectors 12/13/14, and
+/// differs only in which init cell consumes them, so it adds no capacity requirement and no
+/// second provisioning path.
+pub const IPC_SEND_FINAL_FAULT_WITNESS_SELECTOR: u64 = 15;
+
+static IPC_SEND_FINAL_FAULT_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the U9-SEND-FINAL §3 source-fault witness (`yarm.ipc_send_final_fault_witness=1`).
+/// Default OFF, so an ordinary boot is byte-identical.
+pub(crate) fn set_ipc_send_final_fault_witness_enabled(enabled: bool) {
+    IPC_SEND_FINAL_FAULT_WITNESS_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the U9-SEND-FINAL §3 source-fault witness is armed.
+pub fn ipc_send_final_fault_witness_enabled() -> bool {
+    IPC_SEND_FINAL_FAULT_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 static XFER2_GRANT_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -7891,6 +7920,7 @@ pub fn shared_region_oracle_provisioning_armed() -> bool {
         || xfer2_grant_witness_enabled()
         || ipc_residual1_queued_cap_witness_enabled()
         || ipc_residual2_park_witness_enabled()
+        || ipc_send_final_fault_witness_enabled()
 }
 
 /// Stage 198E3C2B: the AArch64 init startup-slot-5 selector for the DIRECT shared-region oracle. On

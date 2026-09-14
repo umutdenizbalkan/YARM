@@ -101,6 +101,9 @@ x86-exit-current-task-oracle = []
 # disposition consumer are unconditional. Feature-OFF AArch64 artifacts contain none of the
 # Stage 200D-0C oracle literals.
 aarch64-exit-current-task-oracle = []
+# U9-SEND-FINAL §3: accepted and inert here, so one `--features` argument can reach every
+# package the artifact build touches. Only yarm-control-plane-servers acts on it.
+ipc-send-final-fault-witness = []
 # Stage 200D-0D1: the RISC-V disposable-task ExitCurrentTask live oracle — the third and final
 # arch cell. Selector, marker and gate literals compile ONLY with this feature; the production
 # NR16 syscall, the disposition publication and the RISC-V post-lock consumer are

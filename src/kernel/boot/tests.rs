@@ -151311,26 +151311,26 @@ mod stage199gc4_nr1_terminal_edges {
     #[test]
     fn no_broad_fallback_exists_after_the_route_consumes_anything() {
         let body = route_body();
-        // Every `NotHandled` — the ONLY route back to the broad dispatcher — must appear before
-        // the envelope stash, which is the first consuming step.
+        // U9-SEND-FINAL §1 RE-DERIVES this guard, and the claim it carries got STRONGER rather
+        // than weaker.
+        //
+        // 199G-C4 asserted that every `NotHandled` sits before the envelope stash — the first
+        // consuming step — and required at least three of them, because three pre-mutation
+        // declines were the shape of the route as delivered. All three were escapes: an
+        // out-of-range CPU, a missing requester and a faulting source copy, each handing a
+        // RECOGNIZED NR 1 to the terminal broad dispatcher. They are settled now, so the
+        // "at least three" half asserts the presence of exactly what this package removed and is
+        // replaced by its own negation.
+        //
+        // What remains of the original claim is unchanged and still checked: whatever the route
+        // does after the stash, it settles the envelope through the one settle owner.
         let stash = body
             .find("stash_transfer_envelope_split(")
             .expect("the consuming step");
-        let mut searched = 0usize;
-        let mut fallbacks = 0usize;
-        while let Some(rel) = body[searched..].find("D::NotHandled") {
-            let at = searched + rel;
-            assert!(
-                at < stash,
-                "a fallback at byte {at} follows the envelope stash at {stash}: re-running the \
-                 send would stash a SECOND envelope for one syscall"
-            );
-            fallbacks += 1;
-            searched = at + 1;
-        }
         assert!(
-            fallbacks >= 3,
-            "the pre-mutation declines are still present"
+            !body.contains("D::NotHandled"),
+            "a recognized NR 1 can still answer NotHandled — the question of WHERE it does so \
+             only arises while any such answer exists"
         );
         // And after the stash every exit settles the envelope through the ONE settle owner.
         let after = &body[stash..];
@@ -175123,5 +175123,787 @@ mod u9_ipc_residual3_park_resume {
                 "{port}'s resume boundary must consume the parked send completion"
             );
         }
+    }
+}
+
+/// U9-SEND-FINAL §3 — **NR 1's source-fault and empty-payload behaviour, differentially.**
+///
+/// Every case drives the REAL `syscall::dispatch` over a real `TrapFrame` to obtain
+/// `handle_ipc_send`'s own answer, and asks `nr1_classify_inline_source` the same question about
+/// the same two inputs. The split route selects its payload source from that policy, so agreement
+/// here is agreement with the code that runs.
+///
+/// Each case also snapshots what a refusal must leave alone — the transfer-envelope table, the
+/// reply-record table and the total queued depth — because "the same error" is only half of
+/// parity. A send that faults must produce no envelope, no queue entry and no wake, and the
+/// snapshot is what says so rather than a marker count.
+#[cfg(test)]
+mod u9_send_final_source_parity {
+    use super::*;
+    use crate::arch::trap::FaultAccess;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP,
+        SYSCALL_IPC_SEND_NR, SYSCALL_NO_TRANSFER_CAP, SyscallError, dispatch,
+    };
+    use crate::kernel::syscall_split::{Nr1InlineSource, nr1_classify_inline_source};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const NR1_READABLE: usize = 0x2000;
+    const NR1_UNREADABLE: usize = 0x5000_0000;
+
+    /// A user task running on cpu 0, holding a SEND capability on a live endpoint, with ONE
+    /// readable user page mapped at `NR1_READABLE` and nothing at `NR1_UNREADABLE`.
+    struct Nr1Fixture {
+        shared: SharedKernel,
+        send_cap: CapId,
+        /// The SAME endpoint without SEND — for the precedence case that needs a capability
+        /// which resolves and is live but carries the wrong right.
+        recv_only: CapId,
+        asid: Asid,
+    }
+
+    fn nr1_fixture() -> Nr1Fixture {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (send_cap, recv_only, asid) = shared.with(|s| {
+            s.register_task(1).expect("task1");
+            let (asid, aspace_map_cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(1, asid).expect("bind");
+            // Mapped while the BOOTSTRAP task is current, because that is the cspace
+            // `create_user_address_space` minted the mapping capability into.
+            s.map_user_page(
+                aspace_map_cap,
+                VirtAddr(NR1_READABLE as u64),
+                Mapping {
+                    phys: PhysAddr(0x8000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map a readable page");
+            // PRIME it. A freshly mapped page is not yet readable through
+            // `validate_user_access_for_asid` — a real sender's buffer holds data it wrote, so
+            // this is the state the readable cases are actually about, and the contrast with
+            // `NR1_UNREADABLE` is then about the mapping rather than about first touch.
+            s.write_user_memory_for_asid(asid, NR1_READABLE, &[0xABu8; PAGE_SIZE])
+                .expect("prime the readable page");
+            s.enqueue_current_cpu(1).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+            assert_eq!(s.current_tid(), Some(1), "task 1 is the running task");
+            // Created while task 1 is current, so both capabilities land in ITS cspace — which
+            // is the cspace `validate_endpoint_right` resolves against.
+            let (_idx, send_cap, recv_only) = s.create_endpoint(8).expect("endpoint");
+            (send_cap, recv_only, asid)
+        });
+        Nr1Fixture {
+            shared,
+            send_cap,
+            recv_only,
+            asid,
+        }
+    }
+
+    impl Nr1Fixture {
+        /// `handle_ipc_send`'s own outcome for these arguments, plus everything the caller can
+        /// observe about it: the error (if any), the frame's encoded error lane, and the fault
+        /// the kernel recorded.
+        fn broad_send(
+            &self,
+            cap: CapId,
+            ptr: usize,
+            len: usize,
+        ) -> (
+            Option<SyscallError>,
+            Option<usize>,
+            Option<crate::arch::trap::FaultInfo>,
+        ) {
+            let mut frame = TrapFrame::new(SYSCALL_IPC_SEND_NR, [0; 6]);
+            frame.set_arg(SYSCALL_ARG_CAP, cap.0 as usize);
+            frame.set_arg(SYSCALL_ARG_PTR, ptr);
+            frame.set_arg(SYSCALL_ARG_LEN, len);
+            // The ABI sentinel, not a zeroed slot: `transfer_cap_arg_present` treats anything but
+            // `SYSCALL_NO_TRANSFER_CAP` as a real capability, so leaving this zero would make
+            // every case a transfer of an unresolvable cap 0.
+            frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, SYSCALL_NO_TRANSFER_CAP as usize);
+            self.shared.with(|s| s.clear_last_fault());
+            let err = self.shared.with(|s| dispatch(s, &mut frame)).err();
+            let fault = self.shared.with(|s| s.last_fault());
+            (err, frame.error_code(), fault)
+        }
+
+        /// The transfer-envelope table, the reply-record table and the total queued depth across
+        /// every live endpoint — a by-value snapshot of everything a refused send must not touch.
+        fn resources(&self) -> (usize, usize, usize) {
+            self.shared.with(|s| {
+                let envelopes = s.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes
+                        .iter()
+                        .filter(|e| e.is_some())
+                        .count()
+                });
+                let replies =
+                    s.with_ipc_state(|ipc| ipc.reply_caps.iter().filter(|r| r.is_some()).count());
+                let queued = s.with_ipc_state(|ipc| {
+                    ipc.endpoints
+                        .iter()
+                        .flatten()
+                        .map(|e| e.queued())
+                        .sum::<usize>()
+                });
+                (envelopes, replies, queued)
+            })
+        }
+    }
+
+    /// **The empty payload, which is the case the delivered route got wrong.**
+    ///
+    /// A user sender with `len == 0` is legal: `copy_from_user`'s per-byte loop does not run and
+    /// it answers `Ok` with an untouched buffer. The broad handler therefore ENQUEUES the message
+    /// — and the split reader refuses `len == 0` up front, so folding that refusal into the fault
+    /// path sent every zero-length user send to the terminal broad dispatcher.
+    #[test]
+    fn an_empty_user_payload_is_sent_not_faulted() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, _code, fault) = f.broad_send(f.send_cap, 0, 0);
+        assert_eq!(err, None, "an empty send succeeds");
+        assert!(fault.is_none(), "and records no fault");
+        assert_eq!(
+            f.resources().2,
+            before.2 + 1,
+            "the message is enqueued: an empty payload is a real send, not a refusal"
+        );
+        // The policy the split route selects its source from agrees this is not a copy at all.
+        assert_eq!(
+            nr1_classify_inline_source(Some(f.asid), 0),
+            Nr1InlineSource::Empty
+        );
+    }
+
+    /// **An unreadable source buffer is a recorded FAULT and a successful syscall return**, which
+    /// is what makes `InvalidArgs` the wrong substitution: it would skip the record entirely and
+    /// tell the task its arguments were malformed rather than that its buffer was unreadable.
+    #[test]
+    fn an_unreadable_source_is_recorded_as_a_read_fault_and_returns_ok() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, code, fault) = f.broad_send(f.send_cap, NR1_UNREADABLE, 8);
+        assert_eq!(
+            err, None,
+            "the SYSCALL succeeds — `record_user_fault(..); return Ok(())`"
+        );
+        let fault = fault.expect("a fault is recorded");
+        assert_eq!(
+            fault.addr,
+            VirtAddr(NR1_UNREADABLE as u64),
+            "at the address the caller named"
+        );
+        assert_eq!(fault.access, FaultAccess::Read, "as a READ");
+        assert_eq!(
+            code,
+            Some(SyscallError::PageFault.code()),
+            "and the frame carries PageFault, not InvalidArgs"
+        );
+        assert_ne!(
+            code,
+            Some(SyscallError::InvalidArgs.code()),
+            "InvalidArgs would have skipped the fault record"
+        );
+        assert_eq!(
+            f.resources(),
+            before,
+            "and nothing is produced: no envelope, no reply record, no queued message"
+        );
+        assert_eq!(
+            nr1_classify_inline_source(Some(f.asid), 8),
+            Nr1InlineSource::UserMemory {
+                asid_raw: f.asid.0 as u64,
+                len: 8
+            },
+            "the policy routes this to the user-memory source, whose failure is the fault"
+        );
+    }
+
+    /// **Precedence: the capability is validated before the source is read.** An unreadable
+    /// buffer behind an unresolvable send capability must report the CAPABILITY, and must record
+    /// no fault — the handler never reaches the copy.
+    #[test]
+    fn an_invalid_send_capability_is_reported_before_the_unreadable_source() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, _code, fault) = f.broad_send(CapId(4242), NR1_UNREADABLE, 8);
+        assert_eq!(err, Some(SyscallError::InvalidCapability));
+        assert!(
+            fault.is_none(),
+            "no fault is recorded: validation precedes the copy"
+        );
+        assert_eq!(f.resources(), before);
+    }
+
+    /// The same precedence one question deeper: a capability that resolves but carries no SEND
+    /// right is `MissingRight`, again with the unreadable buffer never read.
+    #[test]
+    fn a_capability_missing_send_is_reported_before_the_unreadable_source() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, _code, fault) = f.broad_send(f.recv_only, NR1_UNREADABLE, 8);
+        assert_eq!(err, Some(SyscallError::MissingRight));
+        assert!(
+            fault.is_none(),
+            "still no fault: the right is checked first"
+        );
+        assert_eq!(f.resources(), before);
+    }
+
+    /// A READABLE buffer of the same length sends normally — so the fault case above is about the
+    /// buffer and not about the length, the capability or the endpoint.
+    #[test]
+    fn the_same_length_from_a_readable_buffer_sends() {
+        let f = nr1_fixture();
+        let before = f.resources();
+        let (err, _code, fault) = f.broad_send(f.send_cap, NR1_READABLE, 8);
+        assert_eq!(err, None);
+        assert!(
+            fault.is_none(),
+            "a mapped user-readable page does not fault"
+        );
+        assert_eq!(
+            f.resources().2,
+            before.2 + 1,
+            "a readable source of the same length enqueues"
+        );
+    }
+
+    /// A page boundary the copy crosses: readable at the start, unmapped immediately after. The
+    /// fault is reported at the address the caller NAMED, which is what the broad handler passes
+    /// to `record_user_fault` — not at the byte that actually failed.
+    #[test]
+    fn a_partially_readable_source_faults_at_the_named_address() {
+        let f = nr1_fixture();
+        let start = NR1_READABLE + PAGE_SIZE - 4;
+        let before = f.resources();
+        let (err, code, fault) = f.broad_send(f.send_cap, start, 64);
+        assert_eq!(err, None, "still the fault path, not an error return");
+        let fault = fault.expect("a fault is recorded");
+        assert_eq!(
+            fault.addr,
+            VirtAddr(start as u64),
+            "reported at the caller's pointer, as `record_user_fault(.., user_ptr_or_offset, ..)` does"
+        );
+        assert_eq!(fault.access, FaultAccess::Read);
+        assert_eq!(code, Some(SyscallError::PageFault.code()));
+        assert_eq!(f.resources(), before, "and nothing partial is produced");
+    }
+
+    /// The KERNEL-ASID sender takes the register source at every length, including zero — which
+    /// is why the empty case above is scoped to a user sender and why the policy keys on the
+    /// ASID before it keys on the length.
+    #[test]
+    fn a_kernel_sender_takes_the_register_source_at_every_length() {
+        for len in [0usize, 1, 8] {
+            assert_eq!(
+                nr1_classify_inline_source(None, len),
+                Nr1InlineSource::Registers { len },
+                "a kernel-ASID sender never copies from user memory"
+            );
+        }
+    }
+
+    /// The policy is TOTAL over its two inputs and has exactly one user-memory arm, so there is
+    /// no length at which a user sender silently stops being classified.
+    #[test]
+    fn the_policy_answers_every_length_a_user_sender_can_reach() {
+        let f = nr1_fixture();
+        for len in 0..=crate::kernel::ipc::Message::MAX_PAYLOAD {
+            let answer = nr1_classify_inline_source(Some(f.asid), len);
+            if len == 0 {
+                assert_eq!(answer, Nr1InlineSource::Empty);
+            } else {
+                assert_eq!(
+                    answer,
+                    Nr1InlineSource::UserMemory {
+                        asid_raw: f.asid.0 as u64,
+                        len
+                    },
+                    "len={len}"
+                );
+            }
+        }
+    }
+}
+
+/// U9-SEND-FINAL §4 — **the NR 1 closure**, guarded over complete function boundaries.
+///
+/// The recognized body's return type carries most of this: `SplitSendDisposition` has no variant
+/// meaning "the broad dispatcher should service this trap", so the three admission and copy
+/// escapes the delivered route answered `NotHandled` from are not merely unused, they are
+/// unwritable. What the type cannot say is that the ENTRY point kept exactly one `NotHandled` and
+/// that it is the "this is not an `IpcSend`" answer, nor that the family is complete, nor that the
+/// three ingress paths actually reach it. Those are here.
+///
+/// `the_guard_rejects_the_delivered_payload_fault_fallback` is the case that makes the rest
+/// worth anything: it splices the delivered shape back into a copy of the source and requires
+/// this checker to reject it. A guard that passes on both the old code and the new proves
+/// nothing about either.
+#[cfg(test)]
+mod u9_send_final_closure {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    /// Every function of the NR 1 family: the entry, the recognized body, and the two settlement
+    /// owners it reaches. `settle_ipc_send_envelope` returns `()` and cannot carry a disposition,
+    /// so it is listed for completeness rather than for the fall-through check.
+    const FAMILY: [&str; 5] = [
+        "fn try_split_ipc_send_into_frame(",
+        "fn try_split_ipc_send_recognized(",
+        "fn nr1_source_read_fault(",
+        "fn nr1_classify_inline_source(",
+        "fn settle_ipc_send_envelope(",
+    ];
+
+    /// Strip comments so a `NotHandled` discussed in prose is not read as one produced in code.
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// One complete function body, by brace matching from its signature — not by scanning to the
+    /// next blank line or the next `fn`, either of which would stop early inside a nested item
+    /// and silently pass a body it never looked at.
+    fn body_of<'a>(code: &'a str, signature: &str) -> &'a str {
+        let start = code
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} is missing"));
+        let open = code[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{signature} has no body"))
+            + start;
+        let bytes = code.as_bytes();
+        let mut depth = 0usize;
+        let mut i = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &code[open..=i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("{signature} has an unbalanced body");
+    }
+
+    /// THE checker, over an arbitrary copy of the source, so it can be run against both the code
+    /// that ships and a copy carrying the delivered fallback. Returns the reason it rejected.
+    fn closure_violation(src: &str) -> Option<alloc::string::String> {
+        use alloc::format;
+        let code = code_of(src);
+
+        // (1) The recognized body — and every settlement owner it reaches — returns the NARROW
+        // type. A widening anywhere in the family would reopen the door.
+        for signature in [
+            "fn try_split_ipc_send_recognized(",
+            "fn nr1_source_read_fault(",
+        ] {
+            let at = code.find(signature)?;
+            let header_end = code[at..].find('{')? + at;
+            if !code[at..header_end].contains("-> SplitSendDisposition") {
+                return Some(format!("{signature} does not return SplitSendDisposition"));
+            }
+        }
+
+        // (2) No family function may PRODUCE a fall-through. The entry is the one exception and
+        // is checked separately below.
+        for signature in FAMILY {
+            if signature == "fn try_split_ipc_send_into_frame(" {
+                continue;
+            }
+            let body = body_of(&code, signature);
+            if body.contains("NotHandled") {
+                return Some(format!("{signature} can answer NotHandled"));
+            }
+        }
+
+        // (3) The ENTRY decides one thing. Exactly one `NotHandled`, and it is guarded by the NR
+        // decode — so a recognized NR 1 cannot reach it.
+        let entry = body_of(&code, "fn try_split_ipc_send_into_frame(");
+        if entry.matches("NotHandled").count() != 1 {
+            return Some(alloc::string::String::from(
+                "the entry point must answer NotHandled exactly once",
+            ));
+        }
+        let decode = entry.find("Ok(Syscall::IpcSend)")?;
+        let not_handled = entry.find("NotHandled")?;
+        if decode > not_handled {
+            return Some(alloc::string::String::from(
+                "the entry's NotHandled is not guarded by the NR decode",
+            ));
+        }
+        if !entry.contains("try_split_ipc_send_recognized(") {
+            return Some(alloc::string::String::from(
+                "the entry does not hand a recognized NR 1 to the settling body",
+            ));
+        }
+
+        // (4) The two admission escapes are SETTLED with the broad path's own errors, not
+        // declined. Both are inside the recognized body, which (2) already proved cannot decline
+        // — this pins that they answer the right thing rather than merely answering something.
+        let recognized = body_of(&code, "fn try_split_ipc_send_recognized(");
+        if !recognized.contains("reason=cpu_out_of_range result=failed_closed") {
+            return Some(alloc::string::String::from(
+                "an out-of-range CPU is not settled as an invariant failure",
+            ));
+        }
+        if !recognized.contains("reason=no_current_task err=InvalidCapability") {
+            return Some(alloc::string::String::from(
+                "a missing requester is not settled with the broad path's InvalidCapability",
+            ));
+        }
+
+        // (5) The source fault goes through the CANONICAL owner and returns SUCCESS, and the
+        // fallible settlement is not ignored.
+        let fault = body_of(&code, "fn nr1_source_read_fault(");
+        if !fault.contains("record_split_source_read_fault(cpu, frame, user_ptr)") {
+            return Some(alloc::string::String::from(
+                "the source fault does not use the canonical fault owner",
+            ));
+        }
+        if fault.contains("let _ = shared.record_split_source_read_fault") {
+            return Some(alloc::string::String::from(
+                "the fallible fault settlement is discarded",
+            ));
+        }
+        if !fault.contains("SplitSendDisposition::Complete(Ok(()))") {
+            return Some(alloc::string::String::from(
+                "a recorded source fault does not return a SUCCESSFUL syscall",
+            ));
+        }
+        if fault.contains("InvalidArgs") {
+            return Some(alloc::string::String::from(
+                "the source fault substitutes InvalidArgs",
+            ));
+        }
+
+        // (6) The payload SOURCE is selected from the one policy, not inferred from a reader's
+        // refusal — which is what the delivered route did.
+        if !recognized.contains("nr1_classify_inline_source(sender_asid, len)") {
+            return Some(alloc::string::String::from(
+                "the inline source is not selected through the shared policy",
+            ));
+        }
+        None
+    }
+
+    /// The code that ships is closed.
+    #[test]
+    fn the_recognized_nr1_family_cannot_fall_through() {
+        assert_eq!(closure_violation(SPLIT), None);
+    }
+
+    /// **And the checker would have caught the delivered code.**
+    ///
+    /// The delivered route answered a faulting source copy with `return D::NotHandled;` after a
+    /// `reason=payload_fault` marker. Splicing that shape back in must make this reject — a
+    /// closure guard that passes on the code it was written to catch proves nothing.
+    #[test]
+    fn the_guard_rejects_the_delivered_payload_fault_fallback() {
+        // The delivered shape, restored into the recognized body at the point the source copy is
+        // selected. `D` is `SplitSendDisposition` there, so this is exactly the edit that would
+        // reintroduce the escape.
+        let reintroduced = SPLIT.replace(
+            "            match nr1_classify_inline_source(sender_asid, len) {",
+            "            if true {\n                return D::NotHandled;\n            }\n            match nr1_classify_inline_source(sender_asid, len) {",
+        );
+        assert_ne!(
+            reintroduced, SPLIT,
+            "the splice must actually change the source, or this case tests nothing"
+        );
+        let violation = closure_violation(&reintroduced);
+        assert!(
+            violation.is_some(),
+            "the guard passed source carrying the delivered payload-fault fallback"
+        );
+        assert!(
+            violation
+                .as_deref()
+                .is_some_and(|v| v.contains("can answer NotHandled")),
+            "rejected for the wrong reason: {violation:?}"
+        );
+    }
+
+    /// The two admission escapes, spliced back one at a time.
+    #[test]
+    fn the_guard_rejects_each_restored_admission_escape() {
+        for (from, what) in [
+            (
+                "        crate::yarm_log!(\n            \"IPC_SEND_SPLIT_INVARIANT cpu={} reason=cpu_out_of_range result=failed_closed\",",
+                "cpu_out_of_range",
+            ),
+            (
+                "            \"IPC_SEND_SPLIT_REFUSED cpu={} reason=no_current_task err=InvalidCapability\",",
+                "no_current_task",
+            ),
+        ] {
+            let broken = SPLIT.replace(
+                from,
+                "        // removed\n        crate::yarm_log!(\n            \"removed\",",
+            );
+            assert_ne!(broken, SPLIT, "the splice for {what} changed nothing");
+            assert!(
+                closure_violation(&broken).is_some(),
+                "the guard accepted source with the {what} settlement removed"
+            );
+        }
+    }
+
+    /// **The reader's length cap cannot be reached from the inline arm**, and this is derived by
+    /// driving the real classifier rather than asserted.
+    ///
+    /// `copy_from_user_asid_split_read` refuses `len > DEBUG_LOG_MAX_BYTES` (192). The recognized
+    /// body relies on that never happening for a user sender, because it treats a refusal as a
+    /// fault. `classify_ipc_send_payload_shape` is what bounds it: above `Message::MAX_PAYLOAD`
+    /// (128) a user sender's send is a SharedRegion and never reaches the inline copy at all.
+    #[test]
+    fn the_inline_arm_can_never_reach_the_readers_length_cap() {
+        use crate::kernel::ipc::Message;
+        use crate::kernel::syscall::{IpcSendPayloadShape, classify_ipc_send_payload_shape};
+        assert!(
+            Message::MAX_PAYLOAD <= crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES,
+            "the inline bound must sit at or below the reader's cap"
+        );
+        // Every length a USER sender can present, across the boundary and well past it.
+        for len in 0..=(crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES + 64) {
+            let shape = classify_ipc_send_payload_shape(true, len).expect("a user shape");
+            if len > Message::MAX_PAYLOAD {
+                assert_eq!(
+                    shape,
+                    IpcSendPayloadShape::SharedRegion,
+                    "len={len} must leave the inline arm"
+                );
+            } else {
+                assert_eq!(shape, IpcSendPayloadShape::Inline, "len={len}");
+                assert!(
+                    len <= crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES,
+                    "an inline length must be readable"
+                );
+            }
+        }
+    }
+
+    /// All three ingress paths reach the split dispatcher for NR 1, and both bridges handle the
+    /// two dispositions it can produce.
+    #[test]
+    fn every_ingress_path_routes_nr1_through_the_split_dispatcher() {
+        // x86_64 and AArch64 share one entry and gate only on the trap being a syscall — no NR
+        // whitelist — so NR 1 reaches the dispatcher there by construction.
+        assert!(
+            TRAP_ENTRY.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "the shared bridge must consult the split dispatcher"
+        );
+        assert!(
+            TRAP_ENTRY.contains("matches!(decode_trap_context(context), TrapEvent::Syscall)"),
+            "and it gates on the trap being a syscall, not on an NR list"
+        );
+        // RISC-V gates on an explicit NR whitelist, so NR 1 must be named on it.
+        let gate = RISCV_TRAP
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .expect("the RISC-V eligibility gate");
+        assert!(
+            gate.contains("SYSCALL_IPC_SEND_NR"),
+            "RISC-V must admit NR 1 to the split dispatcher"
+        );
+        // Both bridges must handle the committed post-work disposition NR 1's delivery and park
+        // arms produce; without it a committed delivery would also enter the broad dispatcher.
+        for (port, src) in [("shared", TRAP_ENTRY), ("riscv64", RISCV_TRAP)] {
+            assert!(
+                src.contains("PostWorkCommitted"),
+                "{port} must handle the post-work committed disposition"
+            );
+        }
+        // And NR 1 is consulted as a SWITCHING class, before the non-switching whitelist whose
+        // contract is that everything on it may be early-returned through the caller's frame.
+        let dispatcher = SPLIT
+            .split("pub(crate) fn try_split_dispatch_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the dispatcher");
+        let send = dispatcher
+            .find("try_split_ipc_send_into_frame(")
+            .expect("NR 1 is consulted");
+        let nonswitching = dispatcher
+            .find("try_split_dispatch_nonswitching_into_frame(")
+            .expect("the non-switching whitelist");
+        assert!(
+            send < nonswitching,
+            "NR 1 must be tried before the non-switching whitelist"
+        );
+    }
+
+    /// **The witness's startup slot cannot silently enable another workload.**
+    ///
+    /// Slot 5 is mutually exclusive by construction, so a new selector is only safe if it is
+    /// distinct from every existing one AND if the cells gated on the shared slots 13/14 still
+    /// exclude it. U9-IPC-RESIDUAL3 §3 made the copy-on-write cell require slot 5 EMPTY, which is
+    /// what stops selector 15 dragging in a fork and two COW faults it never asked for.
+    #[test]
+    fn the_witness_selector_is_exclusive_and_enables_nothing_else() {
+        use crate::kernel::boot::{
+            IPC_RESIDUAL1_QUEUED_CAP_WITNESS_SELECTOR, IPC_RESIDUAL2_PARK_WITNESS_SELECTOR,
+            IPC_SEND_FINAL_FAULT_WITNESS_SELECTOR, XFER2_GRANT_WITNESS_SELECTOR,
+        };
+        let all = [
+            XFER2_GRANT_WITNESS_SELECTOR,
+            IPC_RESIDUAL1_QUEUED_CAP_WITNESS_SELECTOR,
+            IPC_RESIDUAL2_PARK_WITNESS_SELECTOR,
+            IPC_SEND_FINAL_FAULT_WITNESS_SELECTOR,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two slot-5 cells share a selector");
+            }
+        }
+        // The knob is DEFAULT-OFF, so an ordinary boot never reaches the cell.
+        assert!(
+            !crate::kernel::boot::ipc_send_final_fault_witness_enabled(),
+            "the witness must be default-off"
+        );
+        // And arming it must arm the SHARED provisioning rather than a second one.
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let armed = MOD_SRC
+            .split("pub fn shared_region_oracle_provisioning_armed() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("the provisioning predicate");
+        assert!(
+            armed.contains("ipc_send_final_fault_witness_enabled()"),
+            "arming the witness must arm the one shared provisioning"
+        );
+        // The copy-on-write cell must still require slot 5 EMPTY, or selector 15 would drag in a
+        // workload this witness has nothing to do with.
+        const SERVICE: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let cow = SERVICE
+            .split("fn run_vm_cow_fork_witness_early(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the COW cell");
+        assert!(
+            cow.contains("ctx.supervisor_control_recv_ep.is_some()")
+                && cow.contains("slot5_selector_owns_extra_caps"),
+            "the COW cell must still exclude every slot-5 selector"
+        );
+    }
+
+    /// **The witness cell is a CARGO feature, and that is load-bearing rather than tidy.**
+    ///
+    /// Init's address space already runs at `AddressSpace::MAX_MAPPINGS` on the provisioned
+    /// oracle profile. The cell costs about 6 KiB of text — two more mapping runs — and the XFER2
+    /// grant witness, a different slot-5 cell on the same profile, needs exactly those two free
+    /// to map its pair of pages. Measured: compiled in unconditionally, XFER2 failed with
+    /// `VM_FULL reason=mapping_bookkeeping_full max_mappings=128 va=0x40000000`. With the call
+    /// gated off the image is byte-identical to one without the cell.
+    ///
+    /// So the gate is what keeps this package out of the deferred mapping headroom, and it has to
+    /// cover every item the cell owns: a module still compiled in would cost the text whether or
+    /// not anything called it.
+    #[test]
+    fn the_witness_cell_is_gated_so_other_profiles_keep_their_headroom() {
+        const SERVICE: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        const FEATURE: &str = "feature = \"ipc-send-final-fault-witness\"";
+        // Every item the cell owns is behind the feature: the module, the x86_64 trampoline, the
+        // per-architecture runner, and the dispatch arm that reaches it.
+        for owned in [
+            "pub(super) mod ipc_send_final_fault_witness {",
+            "mod x86_ipc_send_final_fault {",
+            "fn run_ipc_send_final_fault_witness() {",
+            "if ipc_send_final_fault_witness::armed(ctx.supervisor_control_recv_ep) {",
+        ] {
+            let at = SERVICE
+                .find(owned)
+                .unwrap_or_else(|| panic!("{owned} is missing"));
+            // The nearest preceding `#[cfg(` must name the feature.
+            let before = &SERVICE[..at];
+            let cfg_at = before.rfind("#[cfg(").expect("an attribute precedes it");
+            assert!(
+                SERVICE[cfg_at..at].contains(FEATURE),
+                "{owned} is not behind the witness feature"
+            );
+        }
+        // And it SHARES the park witness's child stack rather than adding its own, because two
+        // slot-5 cells cannot coexist and a second stack is a second pair of BSS pages.
+        let runner = SERVICE
+            .split("fn run_ipc_send_final_fault_witness() {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the runner");
+        assert!(
+            runner.contains("ipc_residual2_park_witness::CHILD_STACK")
+                && runner.contains("ipc_residual2_park_witness::CHILD_TLS"),
+            "the witness must share the park witness's disposable child stack"
+        );
+        assert!(
+            !SERVICE.contains("ipc_send_final_fault_witness::CHILD_STACK"),
+            "a second child stack would cost the headroom the sharing exists to preserve"
+        );
+        // The feature must be accepted by every package the artifact build passes it to, or the
+        // build fails rather than the cell silently not forwarding.
+        for manifest in [
+            include_str!("../../../Cargo.toml"),
+            include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml"),
+            include_str!("../../../crates/yarm-driver-servers/Cargo.toml"),
+            include_str!("../../../crates/yarm-fs-servers/Cargo.toml"),
+        ] {
+            assert!(
+                manifest.contains("ipc-send-final-fault-witness = []"),
+                "a package the artifact build touches does not accept the feature"
+            );
+        }
+    }
+
+    /// The terminal-broad measurement sits at the ARRIVAL, and there is exactly one of it.
+    #[test]
+    fn the_broad_entry_census_counts_arrivals_at_the_terminal_acquisition() {
+        const BROAD: &str = include_str!("../syscall/ipc.rs");
+        assert_eq!(
+            BROAD.matches("IPC_SEND_BROAD_ENTRY nr=1").count(),
+            1,
+            "one census marker"
+        );
+        let handler = BROAD
+            .split("pub(super) fn handle_ipc_send(")
+            .nth(1)
+            .expect("the broad handler");
+        let census = handler
+            .find("IPC_SEND_BROAD_ENTRY")
+            .expect("the census is inside the handler");
+        let first_read = handler
+            .find("frame.arg(SYSCALL_ARG_CAP)")
+            .expect("the handler's first argument read");
+        assert!(
+            census < first_read,
+            "the census must count the ARRIVAL, before any validation can divert it"
+        );
+        // And the split side does not claim the measurement: a marker there could only report
+        // doors it chose to walk past.
+        assert!(
+            !SPLIT.contains("IPC_SEND_BROAD_ENTRY"),
+            "the census belongs to the terminal acquisition, not to the route that avoids it"
+        );
     }
 }

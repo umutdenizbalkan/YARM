@@ -18,6 +18,15 @@ x86-exit-current-task-oracle = []
 aarch64-exit-current-task-oracle = []
 # Stage 200D-0D1: gates the disposable RISC-V ExitCurrentTask oracle task.
 riscv-exit-current-task-oracle = []
+# U9-SEND-FINAL §3: gates the disposable NR 1 SOURCE-FAULT witness task.
+#
+# It is a cargo feature and not only a runtime knob because init's address space already runs at
+# `AddressSpace::MAX_MAPPINGS` on the provisioned oracle profile. The cell costs about 6 KiB of
+# text, which is two more mapping runs, and the XFER2 grant witness needs exactly those two free
+# to map its pair of pages. A feature-off build is BYTE-IDENTICAL to one without the cell, so
+# every other slot-5 profile keeps the headroom it had. Feature-off builds carry none of its
+# literals.
+ipc-send-final-fault-witness = []
 
 [dependencies]
 yarm = { package = "yarm-server-runtime", path = "../yarm-server-runtime", default-features = false }

@@ -1455,6 +1455,342 @@ pub(super) mod ipc_residual2_park_witness {
     }
 }
 
+/// U9-SEND-FINAL §3 — the NR 1 SOURCE-FAULT witness, selector 15.
+///
+/// # The shape, and why only a live boot can show it
+///
+/// `handle_ipc_send`'s inline arm answers an unreadable user buffer with
+/// `record_user_fault(kernel, frame, user_ptr, FaultAccess::Read); return Ok(())` — a recorded
+/// fault and a `PageFault` frame, and a SUCCESSFUL syscall return. Nothing in production can
+/// issue it: every `ipc_send` caller passes a pointer to a frame it just built, so the arm exists
+/// and has never run. A successful send proves nothing about it, and §3 says not to infer
+/// coverage from one.
+///
+/// ```text
+///   child (disposable)                                  kernel
+///   ipc_send_raw_source(ep, UNMAPPED, 8) ─────────────▶  copy refuses
+///                                                        record_user_fault(.., Read)
+///   Err(PageFault) ◀───────────────────────────────────  frame err, syscall Ok
+///   ipc_send(ep, b"U9SENDOK" + seq)  ─────────────────▶  ordinary enqueue
+///   Ok(())        ◀───────────────────────────────────
+///   ... ROUNDS times, then exit
+///
+///   parent (init) drains: exactly ROUNDS messages, every one the GOOD payload
+/// ```
+///
+/// # What each half attests
+///
+/// The child attests the CALLER's side: the faulting send returned `PageFault` and not
+/// `InvalidArgs`, and the very next send from the same task succeeded — which is the scheduler
+/// continuation, because a task that was not resumed correctly could not issue it.
+///
+/// The parent attests the ENDPOINT's side: exactly `ROUNDS` messages arrive, all carrying the
+/// good payload and in order. A faulting send that leaked an envelope, enqueued a partial
+/// message or woke a receiver would show up as a count or a payload mismatch here, and nowhere
+/// else.
+///
+/// The kernel's own `IPC_SEND_SPLIT_SOURCE_FAULT` line carries the third part — the fault
+/// address, the access direction and the caller identity — and the smoke script correlates it
+/// with the child's TID and the address the child actually named.
+///
+/// The child is DISPOSABLE: it shares init's cspace and address space, does a bounded loop and
+/// then parks itself in a yield loop. Nothing the running system depends on is at risk if it
+/// misbehaves, and init keeps its own authority throughout.
+#[cfg(all(not(feature = "hosted-dev"), feature = "ipc-send-final-fault-witness"))]
+pub(super) mod ipc_send_final_fault_witness {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
+    /// The endpoint both roles use, published before the spawn.
+    pub(super) static EP_CAP: AtomicU32 = AtomicU32::new(0);
+    /// How many faulting sends the child issued, and how many answered `PageFault`.
+    pub(super) static FAULTS: AtomicU32 = AtomicU32::new(0);
+    pub(super) static FAULTS_PAGEFAULT: AtomicU32 = AtomicU32::new(0);
+    /// How many answered something else — any non-`PageFault` error, `InvalidArgs` above all.
+    pub(super) static FAULTS_WRONG_ERR: AtomicU32 = AtomicU32::new(0);
+    /// A faulting send that returned SUCCESS would mean the kernel read a buffer it must not.
+    pub(super) static FAULTS_SUCCEEDED: AtomicU32 = AtomicU32::new(0);
+    /// Good sends issued after each fault, and how many succeeded — the continuation evidence.
+    pub(super) static GOOD_OK: AtomicU32 = AtomicU32::new(0);
+    pub(super) static GOOD_FAILED: AtomicU32 = AtomicU32::new(0);
+    /// Set by the child when its loop is finished, so the parent stops waiting.
+    pub(super) static CHILD_DONE: AtomicU32 = AtomicU32::new(0);
+    /// The child's TID, so the smoke can correlate the kernel's fault line with the caller.
+    pub(super) static CHILD_TID: AtomicU32 = AtomicU32::new(0);
+
+    /// How many fault/recover rounds the child runs. Small: each round is one faulting send and
+    /// one good one, and the endpoint provisioned for this cell is eight deep, so the good sends
+    /// must not fill it or the last ones would park instead of enqueueing.
+    const ROUNDS: u32 = 6;
+
+    /// THE unreadable address. Deliberately far above anything init maps and inside the user
+    /// half of the address space, so `validate_user_region` admits it (this is a fault, not an
+    /// out-of-range argument — an address the range check rejected would answer `InvalidArgs`
+    /// from a DIFFERENT question and would not exercise the copy at all).
+    pub(super) const UNREADABLE: usize = 0x0000_4000_0000_0000;
+
+    pub(super) fn armed(slot5: Option<u32>) -> bool {
+        matches!(slot5, Some(15))
+    }
+
+    /// The child: fault, check the answer, recover, repeat. Never returns.
+    pub(super) extern "C" fn child_body() -> ! {
+        use yarm_user_rt::ipc::Message;
+        use yarm_user_rt::syscall::SyscallError;
+
+        let ep = EP_CAP.load(Relaxed);
+        let mut faults = 0u32;
+        let mut pagefault = 0u32;
+        let mut wrong_err = 0u32;
+        let mut succeeded = 0u32;
+        let mut good_ok = 0u32;
+        let mut good_failed = 0u32;
+
+        for i in 0..ROUNDS {
+            // (1) THE SHAPE UNDER TEST: a real NR 1 whose source buffer this task cannot read.
+            // SAFETY: `ep` carries SEND. The address is unmapped ON PURPOSE — the kernel
+            // validates every byte through its own page tables and answers with a recorded fault.
+            let faulted = unsafe { yarm_user_rt::syscall::ipc_send_raw_source(ep, UNREADABLE, 8) };
+            faults += 1;
+            match faulted {
+                Err(SyscallError::PageFault) => pagefault += 1,
+                // Anything else is the substitution §2 forbids — `InvalidArgs` above all, which
+                // would mean the fault was never recorded.
+                Err(_) => wrong_err += 1,
+                // A SUCCESS here would mean the kernel read a buffer it must not have.
+                Ok(()) => succeeded += 1,
+            }
+
+            // (2) CONTINUATION: the same task, immediately, with a buffer it owns. A caller that
+            // was not resumed correctly after the fault could not issue this at all.
+            let mut body = [0u8; 12];
+            body[..8].copy_from_slice(b"U9SENDOK");
+            body[8..].copy_from_slice(&i.to_be_bytes());
+            match Message::new(0, &body) {
+                Ok(m) => {
+                    // SAFETY: `ep` carries SEND; `m` is a live stack message.
+                    match unsafe { yarm_user_rt::syscall::ipc_send(ep, &m) } {
+                        Ok(()) => good_ok += 1,
+                        Err(_) => good_failed += 1,
+                    }
+                }
+                Err(_) => good_failed += 1,
+            }
+        }
+
+        FAULTS.store(faults, Relaxed);
+        FAULTS_PAGEFAULT.store(pagefault, Relaxed);
+        FAULTS_WRONG_ERR.store(wrong_err, Relaxed);
+        FAULTS_SUCCEEDED.store(succeeded, Relaxed);
+        GOOD_OK.store(good_ok, Relaxed);
+        GOOD_FAILED.store(good_failed, Relaxed);
+        CHILD_DONE.store(1, Relaxed);
+        yarm_user_rt::user_log!(
+            "IPC_SEND_FAULT_WITNESS_CHILD faults={} pagefault={} wrong_err={} succeeded={} good_ok={} good_failed={} result=ok",
+            faults,
+            pagefault,
+            wrong_err,
+            succeeded,
+            good_ok,
+            good_failed
+        );
+        // EXIT rather than park in a yield loop. The park witness's drainer loops because its
+        // parent may still need it scheduled; this child's work is finished the moment it has
+        // published its counters, and it is disposable by construction — it shares init's cspace
+        // and address space and owns nothing the system depends on.
+        //
+        // The distinction is not cosmetic. A thread that yields forever keeps the run queue
+        // switching for the rest of the boot, and on RISC-V every one of those switches resumes
+        // the process manager through the startup arm with its stale argument mirror — a
+        // PRE-EXISTING resume-convention defect, present at the delivered base (70 such resumes
+        // in the base-qualified park boot) and not this package's to fix. An unbounded yield loop
+        // turns 70 into 1133 and eventually one of them lands on an instruction that dereferences
+        // the stale `a0`. The witness has no reason to run that long, so it does not.
+        //
+        // SAFETY: ends this thread; nothing after it runs. Falling through to the yield loop is
+        // the fail-closed path if the kernel declines the exit.
+        let _ = unsafe { yarm_user_rt::syscall::exit_current_task() };
+        loop {
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+    }
+
+    pub(super) fn run_once(child_entry: usize, stack_top: usize, tls_base: usize) {
+        let (_mem_cap, ep_cap) = super::shared_region_oracle_core::oracle_caps();
+        if ep_cap == 0 {
+            yarm_user_rt::user_log!("IPC_SEND_FAULT_WITNESS step=caps result=missing");
+            RESULT.store(0xF0, Relaxed);
+            return;
+        }
+        EP_CAP.store(ep_cap, Relaxed);
+
+        // SAFETY: `child_entry` is a valid `extern "C" fn() -> !` for this architecture; the
+        // static stack and TLS above outlive the thread, which never returns.
+        let child_tid = match unsafe {
+            yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, child_entry)
+        } {
+            Ok(t) => t,
+            Err(e) => {
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_FAULT_WITNESS step=spawn err={:?} result=fail",
+                    e
+                );
+                RESULT.store(0xF1, Relaxed);
+                return;
+            }
+        };
+        CHILD_TID.store(child_tid as u32, Relaxed);
+        yarm_user_rt::user_log!(
+            "IPC_SEND_FAULT_WITNESS_BEGIN ep_cap={} child_tid={} rounds={} unreadable={:#x}",
+            ep_cap,
+            child_tid,
+            ROUNDS,
+            UNREADABLE
+        );
+
+        // Let the child run its whole loop. It never blocks, so a bounded number of yields is
+        // enough; the bound exists so a child failure cannot spin the boot forever.
+        let mut waited = 0u32;
+        while CHILD_DONE.load(Relaxed) == 0 && waited < 4096 {
+            waited += 1;
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+
+        // THE ENDPOINT'S SIDE. Exactly the good sends arrived, in order, and nothing the faulting
+        // sends could have left behind. Deadline 0 is the non-blocking probe (AI_AGENT_RULES §8.2).
+        let mut drained = 0u32;
+        let mut bad_payload = 0u32;
+        let mut out_of_order = 0u32;
+        let mut last_seq: i64 = -1;
+        loop {
+            // SAFETY: `ep_cap` carries RECEIVE.
+            match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(ep_cap, 0) } {
+                Ok(Some(m)) => {
+                    drained += 1;
+                    let body = &m.payload[..usize::from(m.len).min(m.payload.len())];
+                    // NR 1 carries the wire frame the user runtime built — `[opcode:2][body]`,
+                    // see `ipc_call_prepare` — into the message payload verbatim, so the tag
+                    // sits at offset 2 and not at 0. The scan covers both rather than asserting
+                    // a framing offset, because what this witness is about is WHICH messages
+                    // arrived, not how they are laid out.
+                    let at =
+                        (0..=2).find(|&o| body.len() >= o + 12 && &body[o..o + 8] == b"U9SENDOK");
+                    if let Some(o) = at {
+                        let seq = i64::from(u32::from_be_bytes([
+                            body[o + 8],
+                            body[o + 9],
+                            body[o + 10],
+                            body[o + 11],
+                        ]));
+                        if seq <= last_seq {
+                            out_of_order += 1;
+                        }
+                        last_seq = seq;
+                    } else {
+                        bad_payload += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        let faults = FAULTS.load(Relaxed);
+        let pagefault = FAULTS_PAGEFAULT.load(Relaxed);
+        let wrong_err = FAULTS_WRONG_ERR.load(Relaxed);
+        let succeeded = FAULTS_SUCCEEDED.load(Relaxed);
+        let good_ok = GOOD_OK.load(Relaxed);
+        let good_failed = GOOD_FAILED.load(Relaxed);
+
+        // ESSENTIAL AUTHORITY INTACT: the endpoint still resolves after six faults.
+        // SAFETY: `ep_cap` carries RECEIVE.
+        let after = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(ep_cap, 0) };
+        let caps_intact = !matches!(
+            after,
+            Err(yarm_user_rt::syscall::SyscallError::InvalidCapability)
+                | Err(yarm_user_rt::syscall::SyscallError::MissingRight)
+        );
+
+        // `drained == good_ok` is the no-delivery claim: the faulting sends produced NOTHING, so
+        // the endpoint holds exactly what the good sends put there and not one message more.
+        let all = faults == ROUNDS
+            && pagefault == ROUNDS
+            && wrong_err == 0
+            && succeeded == 0
+            && good_ok == ROUNDS
+            && good_failed == 0
+            && drained == good_ok
+            && bad_payload == 0
+            && out_of_order == 0
+            && caps_intact;
+        yarm_user_rt::user_log!(
+            "IPC_SEND_FAULT_WITNESS faults={} pagefault={} wrong_err={} succeeded={} good_ok={} good_failed={} drained={} bad_payload={} out_of_order={} intact={} result={}",
+            faults,
+            pagefault,
+            wrong_err,
+            succeeded,
+            good_ok,
+            good_failed,
+            drained,
+            bad_payload,
+            out_of_order,
+            caps_intact as u32,
+            all as u32
+        );
+        yarm_user_rt::user_log!(
+            "IPC_SEND_FAULT_WITNESS_DONE child_tid={} result={}",
+            child_tid,
+            if all { "ok" } else { "fail" }
+        );
+        RESULT.store(if all { 1 } else { 0xFF }, Relaxed);
+    }
+}
+
+/// U9-SEND-FINAL §3 — the x86_64 child entry trampoline, for the same ABI reason as the park
+/// witness's: x86_64 expects the initial stack to look as if a `call` had just pushed a return
+/// address (`AI_AGENT_RULES` §2.5).
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "ipc-send-final-fault-witness",
+    target_arch = "x86_64"
+))]
+mod x86_ipc_send_final_fault {
+    #[unsafe(naked)]
+    pub(super) extern "C" fn child_entry() -> ! {
+        core::arch::naked_asm!(
+            "call {body}",
+            "ud2",
+            body = sym super::ipc_send_final_fault_witness::child_body,
+        )
+    }
+}
+
+/// U9-SEND-FINAL §3 — resolve this architecture's child entry and run the witness.
+#[cfg(all(not(feature = "hosted-dev"), feature = "ipc-send-final-fault-witness"))]
+fn run_ipc_send_final_fault_witness() {
+    // U9-SEND-FINAL §3 — this cell SHARES the park witness's child stack and TLS block rather
+    // than adding its own, and the sharing is load-bearing rather than tidy.
+    //
+    // Slot 5 is mutually exclusive, so selectors 14 and 15 can never both run in one boot and
+    // can never both own the stack. Giving this cell its own 4 KiB stack plus a 256-byte TLS
+    // block grew init's image by enough to push its address space over `AddressSpace::
+    // MAX_MAPPINGS`, which it already sits at (128/128 runs on the provisioned oracle profile).
+    // Measured: the XFER2 grant witness — a different slot-5 cell on the same profile — then
+    // failed its two-page mapping with `VM_FULL reason=mapping_bookkeeping_full max_mappings=128`.
+    //
+    // That headroom is DEFERRED work this directive says not to broaden into, and it does not
+    // need to be touched: two cells that cannot coexist do not need two stacks.
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(ipc_residual2_park_witness::CHILD_STACK) as usize;
+        (base + 4096) & !0xF
+    };
+    let tls_base = core::ptr::addr_of_mut!(ipc_residual2_park_witness::CHILD_TLS) as usize;
+    #[cfg(target_arch = "x86_64")]
+    let entry = x86_ipc_send_final_fault::child_entry as *const () as usize;
+    #[cfg(not(target_arch = "x86_64"))]
+    let entry = ipc_send_final_fault_witness::child_body as *const () as usize;
+    ipc_send_final_fault_witness::run_once(entry, stack_top, tls_base);
+}
+
 /// U9-IPC-RESIDUAL2 §4 — the x86_64 child entry trampoline.
 ///
 /// x86_64 is the one port that needs one: its SysV ABI expects the initial stack to look as if a
@@ -5627,6 +5963,13 @@ pub fn run() {
     #[cfg(not(feature = "hosted-dev"))]
     if ipc_residual1_queued_cap_witness::armed(ctx.supervisor_control_recv_ep) {
         ipc_residual1_queued_cap_witness::run_once();
+    }
+    // U9-SEND-FINAL §3: the NR 1 SOURCE-FAULT witness, selector 15. Mutually exclusive with
+    // every other slot-5 cell and default-off. Two tasks, because the faulting sender must be
+    // DISPOSABLE — init keeps its own authority while a child issues the unreadable sends.
+    #[cfg(all(not(feature = "hosted-dev"), feature = "ipc-send-final-fault-witness"))]
+    if ipc_send_final_fault_witness::armed(ctx.supervisor_control_recv_ep) {
+        run_ipc_send_final_fault_witness();
     }
     // U9-IPC-RESIDUAL2 §4 / U9-IPC-RESIDUAL3 §3: the full-endpoint PARK witness, selector 14.
     // Mutually exclusive with every other slot-5 cell and default-off. Two tasks, because the

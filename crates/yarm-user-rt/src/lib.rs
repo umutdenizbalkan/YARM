@@ -307,6 +307,51 @@ pub mod syscall {
         Ok(())
     }
 
+    /// U9-SEND-FINAL §3 — issue `IpcSend` with an ARBITRARY source pointer.
+    ///
+    /// `ipc_send` above always passes a pointer to a local frame it just built, so no caller of
+    /// it can ever hand the kernel a buffer it cannot read. That is correct for production and it
+    /// is exactly why the source-fault arm of NR 1 — `record_user_fault(.., Read)` and a
+    /// `PageFault` return — has never been exercised by a live boot: nothing can issue the shape.
+    ///
+    /// This is the same syscall, the same argument slots and the same error decoding; the ONLY
+    /// difference is that the caller chooses `ptr` and `len` instead of having them derived from
+    /// a `Message`. It adds no syscall number and no ABI.
+    ///
+    /// # Safety
+    ///
+    /// The caller names a raw user address the kernel will attempt to read. Passing an address
+    /// the task cannot read is the intended use and is SAFE for the caller — the kernel validates
+    /// every byte through its own page tables and answers with a recorded fault rather than
+    /// touching the address in this task's context. Passing a readable address performs an
+    /// ordinary send of those `len` bytes.
+    #[inline]
+    pub unsafe fn ipc_send_raw_source(
+        ep_cap: u32,
+        ptr: usize,
+        len: usize,
+    ) -> core::result::Result<(), SyscallError> {
+        let args = [
+            ep_cap as usize,
+            ptr,
+            len,
+            0,
+            0,
+            SYSCALL_NO_TRANSFER_CAP as usize,
+        ];
+        // SAFETY: Uses architecture syscall ABI to enter kernel, exactly as `ipc_send` does.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_SEND_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
+    }
+
     /// Stage 163 proof-only: timed/blocking `IpcSend`. Identical to `ipc_send`
     /// except it sets the send-timeout field (`SYSCALL_ARG_INLINE_PAYLOAD1`, arg
     /// slot 4) to `timeout_ticks`, which the kernel routes through

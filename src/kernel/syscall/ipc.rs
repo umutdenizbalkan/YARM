@@ -332,6 +332,22 @@ pub(super) fn handle_ipc_send(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
+    // U9-SEND-FINAL §3 — THE terminal-broad-entry measurement for NR 1, and the reason it lives
+    // HERE rather than in the split route.
+    //
+    // `dispatch`'s `Syscall::IpcSend` arm is this function's only caller, and it is reached only
+    // when the split route declined — so one line here counts exactly the thing the claim is
+    // about: an `IpcSend` trap that reached the terminal broad acquisition. A marker on the split
+    // side could only report doors it chose to walk past; this reports arrivals.
+    //
+    // It is deliberately NOT a guard about an unreachable branch. The recognized NR 1 body can no
+    // longer answer `NotHandled` at the type level, so a count from the split side would be a
+    // statement about code that cannot run. This is the live half of the claim; the source half
+    // is `u9_send_final_closure`.
+    crate::yarm_log!(
+        "IPC_SEND_BROAD_ENTRY nr=1 tid={} result=broad_entry",
+        kernel.current_tid().unwrap_or(u64::MAX)
+    );
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     validate_endpoint_right(kernel, cap, CapRights::SEND)?;
     let endpoint = kernel
