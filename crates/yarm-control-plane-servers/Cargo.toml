@@ -27,6 +27,7 @@ riscv-exit-current-task-oracle = []
 # every other slot-5 profile keeps the headroom it had. Feature-off builds carry none of its
 # literals.
 ipc-send-final-fault-witness = []
+recv-queue1-ordinary-grant = []
 
 [dependencies]
 yarm = { package = "yarm-server-runtime", path = "../yarm-server-runtime", default-features = false }

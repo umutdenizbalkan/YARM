@@ -3,7 +3,7 @@
 
 use super::EndpointWaiterRecord;
 use super::{
-    IpcEndpointPeekResult, IpcEndpointRecvResult, IpcEndpointSendResult,
+    EndpointTakeOutcome, IpcEndpointPeekResult, IpcEndpointRecvResult, IpcEndpointSendResult,
     IpcEndpointSplitRejectReason, IpcFastpathResult, IpcSubsystem, KernelError, KernelState,
     MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, NotificationObject, ReceiverWaiterIdentity,
     ReplyCapRecord, ReplyRecordSetOutcome, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
@@ -8226,58 +8226,23 @@ impl KernelState {
         ),
         KernelError,
     > {
-        self.with_ipc_state_mut(|ipc| {
-            // 1a: Dequeue from endpoint queue; scoped block releases the borrow.
-            let opt_msg = {
-                let Some(ep_storage) = ipc.endpoints[endpoint_idx].as_mut() else {
-                    return Err(KernelError::WrongObject);
-                };
-                kernel_mut(ep_storage).recv()
-            };
-            // 1b: Compact sender-waiter queue.
-            //
-            // Scan for the first live sender rather than always taking slot[0]:
-            // process_ipc_timeout_deadlines nulls expired slots in-place without
-            // compacting, creating sparse queues ([None, Some(B), ...]). Taking
-            // only slot[0] would miss live senders at positions > 0, permanently
-            // stranding them.  Full left-compaction after the take keeps the queue
-            // dense for subsequent operations.
-            let opt_waiter = {
-                let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
-                if let Some(idx) = queue.iter().position(Option::is_some) {
-                    let head = queue[idx].take().expect("position guarantees Some");
-                    // Full left-compact: move remaining Some entries to the front.
-                    let mut write = 0;
-                    for read in 0..queue.len() {
-                        if queue[read].is_some() {
-                            queue[write] = queue[read].take();
-                            write += 1;
-                        }
-                    }
-                    Some(head)
-                } else {
-                    None
+        // U9-RECV-QUEUE1 §2: the steps this method used to spell out inline are now
+        // `endpoint_take_with_refill_locked`, which the split dequeue drives too. Nothing about
+        // the policy moved — the scan for the first live sender, the full left-compaction, the
+        // unchanged refill and the four-way match are the same ones, in the same order, and the
+        // broad owner admits every message because it has always had to.
+        self.with_ipc_state_mut(
+            |ipc| match endpoint_take_with_refill_locked(ipc, endpoint_idx) {
+                EndpointTakeOutcome::Took { msg, wake } => Ok((Some(msg), wake)),
+                EndpointTakeOutcome::Empty => Ok((None, None)),
+                EndpointTakeOutcome::QueueFull => Err(KernelError::EndpointQueueFull),
+                // `EndpointMissing` and `IndexOutOfRange` are the same `WrongObject` this
+                // method has always raised for an absent endpoint slot.
+                EndpointTakeOutcome::EndpointMissing | EndpointTakeOutcome::IndexOutOfRange => {
+                    Err(KernelError::WrongObject)
                 }
-            };
-            match (opt_msg, opt_waiter) {
-                (Some(msg), Some(waiter)) => {
-                    // Endpoint slot just freed: refill with waiter's message.
-                    let ep_storage = ipc.endpoints[endpoint_idx]
-                        .as_mut()
-                        .expect("endpoint must exist after recv");
-                    kernel_mut(ep_storage)
-                        .send(waiter.msg)
-                        .map_err(|_| KernelError::EndpointQueueFull)?;
-                    Ok((Some(msg), Some(waiter.wake_target())))
-                }
-                (Some(msg), None) => Ok((Some(msg), None)),
-                (None, Some(waiter)) => {
-                    // Direct delivery: bypass endpoint queue.
-                    Ok((Some(waiter.msg), Some(waiter.wake_target())))
-                }
-                (None, None) => Ok((None, None)),
-            }
-        })
+            },
+        )
     }
 
     pub fn try_ipc_recv(&mut self, recv_cap: CapId) -> Result<Option<Message>, KernelError> {
@@ -8426,6 +8391,118 @@ impl KernelState {
     }
 }
 
+/// U9-RECV-QUEUE1 §2 — THE authoritative endpoint take: dequeue one message and settle the
+/// sender-waiter queue, in one rank-3 acquisition, for every owner that receives.
+///
+/// This is the body [`KernelState::ipc_recv_endpoint_take`] used to hold inline and the body the
+/// split dequeue used to approximate. Both now drive it, which is what removes the class of bug
+/// where one route's idea of "who is next" differs from the other's.
+///
+/// # The two halves, and the order they must run in
+///
+/// **The waiter step scans, it does not index.** `process_ipc_timeout_deadlines` nulls an expired
+/// sender's slot in place without compacting, so `[None, Some(B), None, Some(C)]` is a state the
+/// queue really reaches. Taking slot 0 unconditionally would report "no waiter" for that queue
+/// and strand B and C permanently. The scan takes the first live entry and then FULLY
+/// left-compacts, which is both the FIFO answer and the only compaction that stays correct when
+/// the entry taken was not at the head.
+///
+/// **Nothing is consumed until the outcome is decided.** The head and the first live waiter are
+/// both read by value first; only then does the body commit. That ordering is what lets the
+/// endpoint slot's absence, an empty queue and a real take all be answered without a partial
+/// mutation to undo.
+///
+/// # What a refill is, and what it is not
+///
+/// When a message is dequeued AND a waiter exists, the waiter's message is enqueued into the
+/// slot the dequeue just freed — byte-identical, transfer handle intact, envelope still stashed.
+/// It is *queued for a later receiver*, not delivered now, and it therefore carries no
+/// materialization, mapping or registration obligation at this point; the receiver that
+/// eventually takes it discharges those. This is why `admit` is not consulted for it, and why a
+/// cap-bearing waiter message is an ordinary refill rather than a reason to decline.
+///
+/// The one case where a waiter's message IS delivered now is the empty-endpoint direct delivery,
+/// and there the receiver-side obligations are the delivered message's, as for any other.
+///
+/// The returned wake is ALWAYS a blocked SENDER's — it can only come from
+/// `endpoint_sender_waiters` — and carries that sender's exact blocking cycle, so the caller's
+/// settle site cannot publish one cycle's completion against another's.
+pub(crate) fn endpoint_take_with_refill_locked(
+    ipc: &mut IpcSubsystem,
+    endpoint_idx: usize,
+) -> EndpointTakeOutcome {
+    if endpoint_idx >= ipc.endpoints.len() {
+        return EndpointTakeOutcome::IndexOutOfRange;
+    }
+    // Plan-first reads: the head message and the first LIVE waiter, both by value, neither
+    // consumed. Nothing below mutates until admission has answered.
+    let head_msg = match ipc.endpoints[endpoint_idx].as_ref() {
+        Some(storage) => kernel_ref(storage).peek().copied(),
+        None => return EndpointTakeOutcome::EndpointMissing,
+    };
+    let waiter_slot = ipc.endpoint_sender_waiters[endpoint_idx]
+        .iter()
+        .position(Option::is_some);
+    let waiter = waiter_slot.map(|idx| {
+        ipc.endpoint_sender_waiters[endpoint_idx][idx].expect("position guarantees Some")
+    });
+
+    if head_msg.is_none() && waiter.is_none() {
+        return EndpointTakeOutcome::Empty;
+    }
+
+    // ── committed from here ────────────────────────────────────────────────────────────────
+    if let Some(idx) = waiter_slot {
+        let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
+        queue[idx] = None;
+        // Full left-compaction: the taken entry was not necessarily the head, so a shift-by-one
+        // is not enough to leave the queue dense.
+        let mut write = 0;
+        for read in 0..queue.len() {
+            if queue[read].is_some() {
+                queue[write] = queue[read].take();
+                write += 1;
+            }
+        }
+    }
+    match (head_msg, waiter) {
+        (Some(_), Some(w)) => {
+            // Dequeue, then refill the freed slot with the waiter's message, unchanged.
+            let storage = match ipc.endpoints[endpoint_idx].as_mut() {
+                Some(storage) => storage,
+                None => return EndpointTakeOutcome::EndpointMissing,
+            };
+            let endpoint = kernel_mut(storage);
+            let msg = endpoint
+                .recv()
+                .expect("peeked endpoint message must remain queued under one acquisition");
+            if endpoint.send(w.msg).is_err() {
+                return EndpointTakeOutcome::QueueFull;
+            }
+            EndpointTakeOutcome::Took {
+                msg,
+                wake: Some(w.wake_target()),
+            }
+        }
+        (Some(_), None) => {
+            let storage = match ipc.endpoints[endpoint_idx].as_mut() {
+                Some(storage) => storage,
+                None => return EndpointTakeOutcome::EndpointMissing,
+            };
+            let msg = kernel_mut(storage)
+                .recv()
+                .expect("peeked endpoint message must remain queued under one acquisition");
+            EndpointTakeOutcome::Took { msg, wake: None }
+        }
+        // Direct delivery: the endpoint queue is empty, so the waiter's message bypasses it.
+        (None, Some(w)) => EndpointTakeOutcome::Took {
+            msg: w.msg,
+            wake: Some(w.wake_target()),
+        },
+        (None, None) => unreachable!("the empty case returned above"),
+    }
+}
+
 /// U9-C — the rank-3 body of [`KernelState::ipc_try_recv_queued_plain_endpoint_only`],
 /// expressed over the IPC subsystem alone so BOTH owners can drive it: the broad
 /// `KernelState` method (which reaches it through `with_ipc_state_mut`) and
@@ -8541,42 +8618,88 @@ pub(crate) fn ipc_try_recv_queued_plain_endpoint_only_locked(
     IpcEndpointRecvResult::Received(received)
 }
 
-/// U9-C — peek the queued head under the SAME rank-3 acquisition that will dequeue it, and
-/// dequeue only if `admit` accepts the class.
+/// U9-RECV-QUEUE1 §2 — the rank-3 take for NR 2 / NR 5's off-lock delivery engine.
 ///
-/// This is what lets the off-lock Phase A refuse a class it cannot service **before** anything
-/// is consumed. A post-dequeue refusal is not available — the message is gone by then — and a
-/// separate peek-then-dequeue pair would be a race. One acquisition closes both gaps.
+/// The dequeue and the sender-waiter settlement are [`endpoint_take_with_refill_locked`], the
+/// same body the broad [`KernelState::ipc_recv_endpoint_take`] drives. One policy, two
+/// acquisitions; a divergence between the two receive routes about FIFO order, about which
+/// waiter is next, or about what a refill leaves behind is no longer expressible.
 ///
-/// A refusal returns `Ineligible(TransferOrReplyCapMessage)`, which the shared mapping turns
-/// into `WouldBlock` and Phase A turns into `Fallback`: the unchanged legacy global-lock path
-/// then services the message, exactly as it services every other case Phase A declines.
+/// # What the substitution closed
+///
+/// Three escapes disappeared, and each was a divergence from the authoritative policy rather
+/// than an obligation this route could not discharge:
+///
+/// * **A sparse waiter queue.** This route read slot 0 and declined whenever slot 0 was empty
+///   but a later slot was not. The shared body scans for the first LIVE waiter and fully
+///   left-compacts, which is what the broad owner has always done.
+/// * **A cap-bearing refill message.** This route declined whenever the head waiter's message
+///   carried a transfer or reply flag. That message is *queued for a later receiver* —
+///   `send`-ed into the slot the dequeue frees, unchanged, envelope still stashed — so it owes
+///   nothing here. The broad owner refills it without a second thought.
+/// * **An empty endpoint with a live waiter.** This route reported `EmptyQueue`; the shared body
+///   delivers the waiter's message directly, as the broad owner's fourth arm does.
+///
+/// The per-class `admit` predicate went with them. It existed to refuse the queued shared-region
+/// transfer and the forbidden ordinary-transfer Reply object *before* the dequeue, because
+/// neither had an owner past it; both now have one, and both are settled after the take by the
+/// same owners the broad route uses. Nothing is declined by message shape any more, so there is
+/// no shape to judge.
+///
+/// What did NOT move: the two gates the shared body has no business knowing about — a parked
+/// receiver on this endpoint, and a non-buffered endpoint — are still decided here, before the
+/// take, and still decline. Those are admission residuals, not dequeue policy, and they stay
+/// open.
 pub(crate) fn ipc_try_recv_queued_admitted_locked(
     ipc: &mut IpcSubsystem,
     endpoint_idx: usize,
-    admit: impl Fn(&Message, &IpcSubsystem) -> bool,
 ) -> IpcEndpointRecvResult {
     if endpoint_idx >= ipc.endpoints.len() {
         return IpcEndpointRecvResult::Ineligible(
             IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
         );
     }
-    let head = match ipc.endpoints[endpoint_idx].as_ref() {
-        Some(storage) => kernel_ref(storage).peek().copied(),
+    if ipc.endpoint_waiter_present(endpoint_idx) {
+        return IpcEndpointRecvResult::Ineligible(
+            IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
+        );
+    }
+    match ipc.endpoints[endpoint_idx].as_ref() {
+        Some(storage) => {
+            if kernel_ref(storage).mode() != EndpointMode::Buffered {
+                return IpcEndpointRecvResult::Ineligible(
+                    IpcEndpointSplitRejectReason::NonBufferedEndpoint,
+                );
+            }
+        }
         None => {
             return IpcEndpointRecvResult::Ineligible(
                 IpcEndpointSplitRejectReason::EndpointMissing,
             );
         }
-    };
-    if let Some(msg) = head
-        && !admit(&msg, ipc)
-    {
-        return IpcEndpointRecvResult::Ineligible(
-            IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
-        );
     }
-    ipc_try_recv_queued_with_cap_transfer_locked(ipc, endpoint_idx)
+    match endpoint_take_with_refill_locked(ipc, endpoint_idx) {
+        EndpointTakeOutcome::Took { msg, wake: None } => IpcEndpointRecvResult::Received(msg),
+        EndpointTakeOutcome::Took {
+            msg,
+            wake: Some(wake),
+        } => {
+            crate::yarm_log!("IPC_RECV_SPLIT_CAP_REFILL_QUEUED waiter_tid={}", wake.tid.0);
+            IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake)
+        }
+        EndpointTakeOutcome::Empty => {
+            IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::EmptyQueue)
+        }
+        EndpointTakeOutcome::EndpointMissing => {
+            IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::EndpointMissing)
+        }
+        EndpointTakeOutcome::IndexOutOfRange => {
+            IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::EndpointIndexOutOfRange)
+        }
+        EndpointTakeOutcome::QueueFull => {
+            IpcEndpointRecvResult::Ineligible(IpcEndpointSplitRejectReason::EndpointQueueFull)
+        }
+    }
 }
 
 /// U9-C — the rank-3 body of [`KernelState::ipc_try_recv_queued_with_cap_transfer`], for the

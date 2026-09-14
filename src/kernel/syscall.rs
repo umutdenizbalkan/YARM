@@ -306,12 +306,18 @@ pub(crate) mod debug;
 mod helpers;
 mod initramfs;
 mod ipc;
+// U9-RECV-QUEUE1 §2 — the receiver side of a queued shared-region transfer, off the broad lock.
+pub(crate) mod recv_shared_region_split;
 
 // 199G-C4 §1: the pre-lock NR 1 route consults the same payload-shape and message-framing
 // owners the broad handler does, so they are reachable from `syscall_split` by name.
 pub(crate) use self::ipc::{
     IpcSendPayloadShape, classify_ipc_send_payload_shape, frame_ipc_send_message,
 };
+// U9-RECV-QUEUE1 §2: the off-lock shared-region receive completion reads the receiver's
+// map-intent word through the SAME frame reader the broad result owner uses, so the two cannot
+// disagree about which argument register carries it on which syscall.
+pub(crate) use self::ipc::recv_shared_mem_map_intent_flags;
 pub(crate) use self::ipc_abi::transfer_cap_arg_present;
 // Stage 198D-S: re-export the authoritative direct-only reply-cap policy switch so
 // the policy guard test can assert it as a compile-time constant.
@@ -1841,6 +1847,13 @@ pub(crate) enum RecvQueuedSplitPhaseA {
     /// must, after dropping the borrow: materialize the cap via the 186D2/186D3
     /// seam, wake the sender, then run the 186E user copy — in that order.
     PendingOrdinaryCapUserCopy(crate::kernel::recv_core::RecvBoundaryOrdinaryCapSnapshot),
+    /// U9-RECV-QUEUE1 §2 — a queued `OPCODE_SHARED_MEM` transfer to a user-ASID receiver. The
+    /// message is consumed and the sender wake decided, but NOTHING else has run: the cap is not
+    /// minted, no page is mapped, no active-transfer entry is registered and the frame is
+    /// untouched. The caller runs the receiver-side transaction
+    /// (`SharedKernel::complete_recv_boundary_shared_region`) after the borrow drops, in the
+    /// order `handle_ipc_recv_result_with_empty_error` runs it.
+    PendingSharedRegion(crate::kernel::recv_core::RecvBoundarySharedRegionSnapshot),
 }
 
 /// Stage 187B — Phase A helper: for a NON-shared-region ordinary transfer,

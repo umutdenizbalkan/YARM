@@ -1771,11 +1771,16 @@ fn try_split_recv_recognized(
             }
         }
         Ok(Syscall::IpcRecvTimeout) => {
-            // The NON-BLOCKING probe. The blocking lane above refuses it by name
-            // (`reason=not_timed_recv`) because a probe never parks, and until this lane existed
-            // nothing else claimed it — so every `timeout_ticks == 0` receive reached the
-            // terminal broad acquisition, on every port.
-            if let Some(result) = shared.try_split_ipc_recv_timeout_probe_into_frame(cpu, frame) {
+            // EVERY NR 5, not only the non-blocking probe. The blocking lane above refuses a
+            // probe by name (`reason=not_timed_recv`) because a probe never parks, and it
+            // refuses a TIMED receive with `reason=would_not_block` the moment a message is
+            // already waiting — which is exactly the case this lane serves. U9-RECV-QUEUE1 §2
+            // widened it to finite timeouts for that reason: the canonical handler also tries
+            // the immediate engine before it looks at `request.blocking`, because a message that
+            // is already queued makes the deadline irrelevant. An empty endpoint under a finite
+            // timeout is declined back here, never converted into `WouldBlock`.
+            if let Some(result) = shared.try_split_ipc_recv_timeout_immediate_into_frame(cpu, frame)
+            {
                 return Some(D::Complete(result));
             }
         }

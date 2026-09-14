@@ -7225,49 +7225,17 @@ impl SharedKernel {
             }
         };
 
-        // ── rank 3: admit + dequeue + two-phase refill, in ONE acquisition ──────────────────
+        // ── rank 3: dequeue + sender-waiter settlement, in ONE acquisition ──────────────────
+        //
+        // U9-RECV-QUEUE1 §2 — nothing is declined here by message shape any more. The per-class
+        // `admit` predicate refused the queued shared-region transfer and the forbidden
+        // ordinary-transfer Reply object before the dequeue, because neither had an owner past
+        // it. Both now do: the shared-region arm below runs the receiver-side transaction the
+        // broad result owner runs, and the Reply-as-ordinary shape is refused by the same
+        // materializer the broad router sends it to, with the same error and the same envelope
+        // reclaim. The take itself is the authoritative policy, shared with the broad owner.
         let result = self.with_ipc_split_mut(|ipc| {
-            crate::kernel::boot::ipc_try_recv_queued_admitted_locked(
-                ipc,
-                endpoint_idx,
-                |msg, ipc| {
-                    // Admission classifies by MESSAGE SHAPE only. Envelope validity is
-                    // deliberately NOT an admission criterion: a stale or missing handle must
-                    // still be dequeued so it surfaces the same `InvalidCapability` the broad
-                    // path raised, rather than degrading into a silent fallback.
-                    let Some(handle) = msg.transferred_cap().map(|c| c.0) else {
-                        return true; // plain: always serviceable
-                    };
-                    if msg.opcode == OPCODE_SHARED_MEM {
-                        // Shared-region transfers carry receiver-side MAPPING obligations outside
-                        // the materialize step; no off-lock materializer exists for them. Decline
-                        // BEFORE consuming, so the unchanged legacy owner services the message.
-                        return false;
-                    }
-                    if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
-                        return true; // the exact reply-cap transaction serves this
-                    }
-                    // A Reply object tagged as an ORDINARY transfer is the forbidden queued
-                    // reply-cap shape; the broad router sends it to the canonical materialize,
-                    // which fails closed. Declining here is that same refusal one step earlier —
-                    // and only when the envelope actually RESOLVES to a Reply. An unresolvable
-                    // handle stays admitted so its error is raised, not swallowed.
-                    let Ok(idx) = usize::try_from(handle & 0xFFFF) else {
-                        return true;
-                    };
-                    if idx >= crate::kernel::boot::MAX_TRANSFER_ENVELOPES {
-                        return true;
-                    }
-                    let generation = handle >> 16;
-                    if generation == 0 || ipc.transfer_envelope_generations[idx] != generation {
-                        return true;
-                    }
-                    !matches!(
-                        ipc.transfer_envelopes[idx].map(|e| e.source_object),
-                        Some(CapObject::Reply { .. })
-                    )
-                },
-            )
+            crate::kernel::boot::ipc_try_recv_queued_admitted_locked(ipc, endpoint_idx)
         });
         if queued_recv_result_delivered(&result) {
             self.note_endpoint_only_queued_recv_split_seam();
@@ -7297,6 +7265,55 @@ impl SharedKernel {
 
         let is_reply_cap = (delivery.msg.flags & Message::FLAG_REPLY_CAP) != 0;
 
+        // ── queued SHARED-REGION transfer to a user receiver ────────────────────────────────
+        //
+        // U9-RECV-QUEUE1 §2. The gate is the canonical one, taken apart:
+        // `handle_ipc_recv_result_with_empty_error` enters its shared-region arm when
+        // `current_task_has_user_asid` AND `msg.opcode == OPCODE_SHARED_MEM`, which is
+        // `is_user_writeback` and the opcode here; a kernel-register receiver falls through to
+        // the raw-payload arm below regardless of opcode, exactly as it does on the broad route.
+        //
+        // The writeback plan `map_queued_recv_outcome` built is deliberately DROPPED for this
+        // class: it plans a payload copy, and a shared-region receive does not copy a payload —
+        // it maps the region and reports the mapping in the frame's argument registers. The
+        // planner works from the REQUEST, which cannot know the opcode of a message that had
+        // not been dequeued yet, so the correction belongs here, after the take.
+        //
+        // Nothing has been consumed beyond the message itself: the cap is not minted, no page is
+        // mapped, and the sender wake is carried rather than applied, so the whole receiver-side
+        // transaction runs in the canonical order at the boundary.
+        if is_user_writeback
+            && !is_reply_cap
+            && delivery.msg.opcode == OPCODE_SHARED_MEM
+            && let Some(plan) = delivery.cap_transfer
+            && !plan.is_reply_cap
+        {
+            let wake_tid = match delivery.scheduler {
+                RecvSchedulerWakePlan::WakeSender(t) => Some(t),
+                RecvSchedulerWakePlan::None => None,
+            };
+            // `is_user_writeback` is exactly `RecvPayloadTarget::UserMemory`, so the destination
+            // is present by construction — but it is matched, not unwrapped.
+            let crate::kernel::recv_core::RecvPayloadTarget::UserMemory { ptr, len } =
+                request.payload_target
+            else {
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                    SyscallError::Internal,
+                )));
+            };
+            return RecvQueuedSplitPhaseA::PendingSharedRegion(
+                crate::kernel::recv_core::RecvBoundarySharedRegionSnapshot {
+                    endpoint,
+                    receiver_tid,
+                    asid: self.task_asid_option_split_read(receiver_tid),
+                    msg: delivery.msg,
+                    user_ptr: ptr,
+                    user_len: len,
+                    wake_tid,
+                },
+            );
+        }
+
         // ── ordinary cap to a USER receiver: unchanged route, its mint already off-lock ─────
         if is_user_writeback
             && !is_reply_cap
@@ -7312,6 +7329,19 @@ impl SharedKernel {
                     SyscallError::InvalidCapability,
                 )));
             };
+            // U9-RECV-QUEUE1 §2 — the forbidden ordinary-transfer Reply object, decided from the
+            // envelope's own resolved source object at the position the broad route decides it:
+            // immediately after the consume, before the source capability is resolved. This arm's
+            // gate is the message's FLAGS, and a Reply object tagged as an ordinary transfer is
+            // precisely a message whose flags lie about its object, so it lands here. Answering
+            // later — from the routed materializer's `DeferredReplyCap` — would give `Internal`
+            // for a forbidden shape whose source task has since died, where broad gives
+            // `InvalidCapability`.
+            if matches!(facts.source_object, CapObject::Reply { .. }) {
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                    Self::queued_reply_cap_refusal(plan.raw_handle, receiver_tid),
+                )));
+            }
             let source_capability =
                 match self.resolve_capability_for_task_split(facts.source_tid, facts.source_cap) {
                     Ok(c) => c,
@@ -7354,12 +7384,20 @@ impl SharedKernel {
         // Keeping it ADMITTED is what preserves the split path's long-standing contract that a
         // cap-transfer message is dequeued and materialized rather than handed back — including
         // surfacing a bad handle as `Some(Err(InvalidCapability))` instead of `None`.
+        //
+        // U9-RECV-QUEUE1 §2 — through `materialize_queued_transfer_cap_split`, the materializer
+        // that also services a SHARED-REGION envelope. Its predecessor here refused one
+        // (`pinned_object.is_some()` → `WrongObject`) on the stated grounds that the class was
+        // declined pre-dequeue anyway; now that it is admitted, that refusal would be a NEW
+        // error the broad path does not raise — broad mints the cap and returns the raw payload
+        // in registers regardless of opcode, because its shared-region arm is gated on the
+        // receiver having a user ASID and a kernel task has none.
         if !is_user_writeback
             && !is_reply_cap
             && let Some(plan) = delivery.cap_transfer
             && !plan.is_reply_cap
         {
-            let local_cap = match self.materialize_ordinary_cap_split(
+            let local_cap = match self.materialize_queued_transfer_cap_split(
                 endpoint_idx,
                 receiver_tid,
                 plan.raw_handle,
@@ -7714,6 +7752,21 @@ impl SharedKernel {
             }
         };
 
+        // U9-RECV-QUEUE1 §2 — the forbidden shape is decided from the ENVELOPE's own resolved
+        // source object, immediately after the consume and before anything else is resolved.
+        //
+        // That position is not a preference; it is where the broad route decides it.
+        // `materialize_received_message_cap` asks
+        // `peek_transfer_envelope_source_object(handle)` as its FIRST act and answers
+        // `InvalidCapability` from it, so a forbidden shape whose source TASK has since died
+        // still gets `InvalidCapability`. Deciding it after the source-capability resolve — where
+        // the routed materializer's `DeferredReplyCap` arm sits — would answer `Internal` for
+        // exactly that case, which is a different error for the same message.
+        if matches!(facts.source_object, CapObject::Reply { .. }) {
+            settle(self);
+            return Err(Self::queued_reply_cap_refusal(raw_handle, receiver_tid));
+        }
+
         let source_capability =
             match self.resolve_capability_for_task_split(facts.source_tid, facts.source_cap) {
                 Ok(c) => c,
@@ -7741,10 +7794,44 @@ impl SharedKernel {
         settle(self);
         match outcome {
             Ok(CapTransferMaterializeOutcome::Materialized(cap)) => Ok(cap),
-            // Unreachable: a Reply source object is declined at admission, before the dequeue.
-            Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => Err(SyscallError::WrongObject),
+            Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => {
+                Err(Self::queued_reply_cap_refusal(raw_handle, receiver_tid))
+            }
             Err(e) => Err(SyscallError::from(e)),
         }
+    }
+
+    /// U9-RECV-QUEUE1 §2 — THE canonical refusal for a Reply object tagged as an ORDINARY
+    /// transfer, derived from `materialize_received_message_cap`'s own arm rather than invented.
+    ///
+    /// Reply capabilities are direct-delivery only and one-shot; `IpcSend` refuses to enqueue a
+    /// Reply-object transfer, so an envelope whose kernel-resolved `source_object` is a `Reply`
+    /// arriving WITHOUT `FLAG_REPLY_CAP` is the forbidden queued shape, reachable only through
+    /// an internal invariant violation. The broad router hands it to the canonical materialize,
+    /// which fails CLOSED, and all four parts of that refusal are reproduced here:
+    ///
+    /// * the message is **consumed** — the dequeue already happened, and any sender refill wake
+    ///   with it, exactly as on the broad route where `ipc_recv` applies the wake before
+    ///   `handle_ipc_recv_result*` runs;
+    /// * the **envelope is reclaimed exactly once** — `take_transfer_envelope_facts_split` is
+    ///   the split twin of the broad arm's `take_transfer_envelope`, and it has already run by
+    ///   the time this is reached, with the pin obligation settled on the same exit;
+    /// * **no capability is minted** and no receiver-visible return lane is written;
+    /// * the error is **`InvalidCapability`**, and the marker is the one the broad arm emits.
+    ///
+    /// The previous answer here was `WrongObject` under a comment asserting the arm was
+    /// unreachable because admission declined the shape first. Admission no longer declines it,
+    /// so the arm is live and owes the real answer.
+    fn queued_reply_cap_refusal(
+        raw_handle: u64,
+        receiver_tid: u64,
+    ) -> crate::kernel::syscall::SyscallError {
+        crate::yarm_log!(
+            "IPC_RECV_REPLY_CAP_QUEUE_REFUSED raw={} receiver_tid={} reason=direct_only",
+            raw_handle,
+            receiver_tid
+        );
+        crate::kernel::syscall::SyscallError::InvalidCapability
     }
 
     /// rank 6 — a memory object's length, for the output record's `exact_object_size`.
@@ -7912,61 +7999,6 @@ impl SharedKernel {
                 );
                 Err(SyscallError::WrongObject)
             }
-        }
-    }
-
-    /// U9-C — off-lock materialization of an ORDINARY (non-Reply) transferred cap, for the
-    /// kernel-register receiver class. Same three ordered steps the user-receiver form already
-    /// runs after the boundary: rank 3 consume the envelope exactly once, rank 4 (+2) resolve
-    /// the source object/rights and the receiver CNode, then the existing 186D2/186D3 seam
-    /// mints atomically and records the delegation edge.
-    ///
-    /// A shared-region envelope is refused (`pinned_object.is_some()`): it owes a rank-6 pin
-    /// release this transaction does not perform, and its class is declined pre-dequeue anyway.
-    pub(crate) fn materialize_ordinary_cap_split(
-        &self,
-        endpoint_idx: usize,
-        receiver_tid: u64,
-        raw_handle: u64,
-    ) -> Result<CapId, crate::kernel::syscall::SyscallError> {
-        use crate::kernel::boot::{
-            CapTransferMaterializeOutcome, TransferCapDelegation, TransferCapSnapshot,
-        };
-        use crate::kernel::syscall::SyscallError;
-
-        let facts = self
-            .take_transfer_envelope_facts_split(
-                raw_handle,
-                endpoint_idx,
-                crate::kernel::ipc::ThreadId(receiver_tid),
-            )
-            .ok_or(SyscallError::InvalidCapability)?;
-        if facts.pinned_object.is_some() {
-            return Err(SyscallError::WrongObject);
-        }
-        let source_capability = self
-            .resolve_capability_for_task_split(facts.source_tid, facts.source_cap)
-            .map_err(SyscallError::from)?;
-        let receiver_cnode = self
-            .task_cnode_split(receiver_tid)
-            .ok_or(SyscallError::InvalidCapability)?;
-        let snap = TransferCapSnapshot {
-            receiver_cnode,
-            object: source_capability.object,
-            rights: source_capability.rights(),
-        };
-        let delegation = TransferCapDelegation {
-            source_tid: facts.source_tid,
-            source_cap: facts.source_cap,
-            dest_tid: receiver_tid,
-        };
-        match self
-            .materialize_received_message_cap_routed_with_delegation_split(snap, Some(delegation))
-        {
-            Ok(CapTransferMaterializeOutcome::Materialized(cap)) => Ok(cap),
-            // Unreachable: a Reply source object is declined at admission, before the dequeue.
-            Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => Err(SyscallError::WrongObject),
-            Err(e) => Err(SyscallError::from(e)),
         }
     }
 
@@ -8366,11 +8398,31 @@ impl SharedKernel {
     /// exactly this reason. Which shape a receive owes is the caller's arguments to decide, not
     /// the syscall number's.
     ///
+    /// # Finite timeouts, and what an empty endpoint means for each
+    ///
+    /// U9-RECV-QUEUE1 §2 — this lane serves EVERY NR 5, not only `timeout_ticks == 0`. The
+    /// canonical handler does the same and in the same order: `handle_ipc_recv_timeout` calls
+    /// `try_endpoint_split_recv` *before* it looks at `request.blocking`, precisely because a
+    /// message that is already queued is delivered immediately and the deadline is irrelevant to
+    /// it. Refusing a finite timeout here sent every such receive to the terminal acquisition
+    /// even when a message was waiting.
+    ///
+    /// What `empty` means is where the two timeouts part, and neither answer is invented:
+    ///
+    /// * `timeout_ticks == 0` — a probe, which never parks. The endpoint being empty IS its
+    ///   result, and the result is `WouldBlock`, the `empty_error` NR 5's own result owner is
+    ///   passed for a `NoWait` request.
+    /// * `timeout_ticks != 0` — a timed receive, whose empty endpoint is the BLOCKING owner's
+    ///   business. This lane DECLINES it, internally, so the family's blocking route (or, if
+    ///   that route also declines, the broad handler) parks the caller against its deadline.
+    ///   Converting it into `WouldBlock` would answer a receive that asked to wait with the error
+    ///   for a receive that asked not to.
+    ///
     /// # What it must not do
     ///
-    /// Never park, never arm a deadline, never commit a queue advance. An empty endpoint is
-    /// answered `WouldBlock` — the error NR 5's own result owner passes as `empty_error` for a
-    /// `NoWait` request — and the caller returns through its own frame with nothing published.
+    /// Never park, never arm a deadline, never commit a queue advance — for either timeout. The
+    /// per-CPU pre-read deadline is consumed only on a path that ANSWERS the trap; a decline
+    /// leaves it for the owner that will actually park the caller against it.
     ///
     /// # What it preserves
     ///
@@ -8379,7 +8431,7 @@ impl SharedKernel {
     /// for a parked sender therefore refills, publishes and wakes in the same order the broad
     /// path does — which matters because the park witness's drainer polls with exactly this
     /// syscall.
-    pub fn try_split_ipc_recv_timeout_probe_into_frame(
+    pub fn try_split_ipc_recv_timeout_immediate_into_frame(
         &self,
         cpu: CpuId,
         frame: &mut TrapFrame,
@@ -8391,23 +8443,22 @@ impl SharedKernel {
             SYSCALL_ARG_TRANSFER_CAP,
         };
 
-        // NR 5's timeout lane, and only it. A non-zero timeout is the blocking route's.
-        if frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64 != 0 {
-            return None;
-        }
+        let timeout_ticks = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64;
         let Some(requester_tid) = self.current_tid_authoritative(cpu) else {
             return None;
         };
 
-        // The canonical handler consumes the per-CPU pre-read deadline UNCONDITIONALLY, before
-        // it classifies the request. Staging only happens for a non-zero timeout, so there is
-        // normally nothing here — but leaving a value behind would hand it to the next NR 5 on
-        // this CPU, and parity is cheaper than reasoning about when that can happen.
-        let cpu_idx = cpu.0 as usize;
-        if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
-            let _ = crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
-                .swap(0, core::sync::atomic::Ordering::AcqRel);
-        }
+        // The canonical handler consumes the per-CPU pre-read deadline before it classifies the
+        // request, so a value can never be handed to the next NR 5 on this CPU. Done here on
+        // every path that ANSWERS the trap, and deliberately NOT on a decline: a declined timed
+        // receive is about to be parked by an owner that wants that exact pre-read deadline.
+        let consume_preread_deadline = |cpu: CpuId| {
+            let cpu_idx = cpu.0 as usize;
+            if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+                let _ = crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+                    .swap(0, core::sync::atomic::Ordering::AcqRel);
+            }
+        };
 
         // Validation order, as `handle_ipc_recv_timeout` asks it: the receive capability first,
         // resolved and live, before anything about the payload is looked at. A resolution failure
@@ -8416,6 +8467,7 @@ impl SharedKernel {
         let snapshot = match self.resolve_endpoint_recv_cap_split_read(requester_tid, recv_cap) {
             Ok(snapshot) => snapshot,
             Err(e) => {
+                consume_preread_deadline(cpu);
                 return Some(Err(TrapHandleError::Syscall(
                     crate::kernel::syscall::SyscallError::from(e),
                 )));
@@ -8423,12 +8475,16 @@ impl SharedKernel {
         };
 
         let is_kernel_task = self.task_asid_option_split_read(requester_tid).is_none();
+        // The caller's REAL timeout, carried into the request rather than flattened to zero: it
+        // decides `request.blocking`, and this lane's own empty-endpoint answer below reads that
+        // classification instead of re-deriving one. The deadline is never ARMED here — a
+        // non-zero timeout only ever reaches a delivery or a decline.
         let mut request = RecvRequest::from_ipc_recv_timeout(
             requester_tid,
             recv_cap,
             frame.arg(SYSCALL_ARG_PTR),
             frame.arg(SYSCALL_ARG_LEN),
-            0,
+            timeout_ticks,
             None,
             is_kernel_task,
         );
@@ -8450,16 +8506,33 @@ impl SharedKernel {
             // lane's to answer; the rest stay residual and are counted by the family entry.
             crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback => {
                 // The engine declines for several reasons; only an EMPTY buffered endpoint is
-                // this lane's to answer. The would-block read is the same rank-3 structural
-                // question the blocking route asks, so the two agree on what "nothing to take"
-                // means.
+                // this lane's to answer, and only for a request that asked not to wait. The
+                // would-block read is the same rank-3 structural question the blocking route
+                // asks, so the two agree on what "nothing to take" means.
                 let empty = match snapshot.endpoint {
                     CapObject::Endpoint { index, generation } => {
                         self.recv_would_block_split_read(index, generation)
                     }
                     _ => false,
                 };
+                // A TIMED receive's empty endpoint belongs to the blocking owner. Declining is an
+                // internal outcome — the family entry hands it to the next lane — and is what
+                // keeps a receive that asked to wait from being answered with the non-blocking
+                // error. The classification is the canonical builder's, not a re-read of arg 3.
+                let nonblocking = matches!(
+                    request.blocking,
+                    crate::kernel::recv_core::RecvBlockingPolicy::NoWait
+                );
+                if empty && !nonblocking {
+                    crate::yarm_log!(
+                        "IPC_RECV_TIMED_SPLIT_DECLINE cpu={} tid={} reason=empty_endpoint_timed parked=0 deadline_armed=0",
+                        cpu.0,
+                        requester_tid
+                    );
+                    return None;
+                }
                 if empty {
+                    consume_preread_deadline(cpu);
                     // THE EMPTY-RESULT ENCODING, and it is not an error return.
                     //
                     // `handle_ipc_recv_result_with_empty_error`'s `None` arm sets the frame's
@@ -8489,28 +8562,44 @@ impl SharedKernel {
                 None
             }
             crate::kernel::syscall::RecvQueuedSplitPhaseA::Completed(r) => {
+                consume_preread_deadline(cpu);
                 crate::yarm_log!(
-                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} result=completed",
+                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} timeout={} result=completed",
                     cpu.0,
-                    requester_tid
+                    requester_tid,
+                    timeout_ticks
                 );
                 Some(r)
             }
             crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingUserCopy(pending) => {
+                consume_preread_deadline(cpu);
                 crate::yarm_log!(
-                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} result=user_copy",
+                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} timeout={} result=user_copy",
                     cpu.0,
-                    requester_tid
+                    requester_tid,
+                    timeout_ticks
                 );
                 Some(self.complete_recv_boundary_user_copy(cpu, frame, &pending))
             }
             crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingOrdinaryCapUserCopy(pending) => {
+                consume_preread_deadline(cpu);
                 crate::yarm_log!(
-                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} result=ordinary_cap",
+                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} timeout={} result=ordinary_cap",
                     cpu.0,
-                    requester_tid
+                    requester_tid,
+                    timeout_ticks
                 );
                 Some(self.complete_recv_boundary_ordinary_cap(cpu, frame, pending))
+            }
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingSharedRegion(pending) => {
+                consume_preread_deadline(cpu);
+                crate::yarm_log!(
+                    "IPC_RECV_PROBE_SPLIT_DONE cpu={} tid={} timeout={} result=shared_region",
+                    cpu.0,
+                    requester_tid,
+                    timeout_ticks
+                );
+                Some(self.complete_recv_boundary_shared_region(cpu, frame, &pending))
             }
         }
     }
@@ -8631,6 +8720,12 @@ impl SharedKernel {
                 // sender, then run the 186E user copy.
                 crate::yarm_log!("IPC_RECV_BOUNDARY_GLOBAL_DROPPED_OK");
                 Some(self.complete_recv_boundary_ordinary_cap(cpu, frame, pending))
+            }
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingSharedRegion(pending) => {
+                // U9-RECV-QUEUE1 §2 — the receiver-side shared-region transaction, in NR 2's own
+                // order: materialize, publish, metadata, wake, map, register, writeback.
+                crate::yarm_log!("IPC_RECV_BOUNDARY_GLOBAL_DROPPED_OK");
+                Some(self.complete_recv_boundary_shared_region(cpu, frame, &pending))
             }
         };
         match result {
@@ -9042,12 +9137,25 @@ impl SharedKernel {
                 cap.0
             }
             Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => {
-                // Cannot occur: ordinary (non-reply) objects only reach here. If
-                // it somehow did, surface a real error rather than silently drop.
+                // U9-RECV-QUEUE1 §2 — REACHABLE, and it owes the canonical answer.
+                //
+                // The comment that stood here said this could not occur because only ordinary
+                // objects reach the arm. That was true only while the admission closure declined
+                // a Reply source object before the dequeue. It no longer does, and Phase A's gate
+                // for this snapshot is the message's FLAGS (`!is_reply_cap` and a non-reply
+                // transfer plan) — which is exactly what the forbidden shape lies about: a Reply
+                // OBJECT tagged as an ORDINARY transfer. So a user-ASID receiver taking one lands
+                // here, and `WrongObject` would be an answer the broad route never gives.
+                //
+                // The envelope was consumed in Phase A, which is the canonical reclaim; what was
+                // missing is the canonical error and marker.
                 crate::yarm_log!(
                     "CAP_TRANSFER_BOUNDARY_SEAM_DEFERRED reason=unexpected_reply_object"
                 );
-                return Err(TrapHandleError::Syscall(SyscallError::WrongObject));
+                return Err(TrapHandleError::Syscall(Self::queued_reply_cap_refusal(
+                    pending.source_cap.0,
+                    pending.receiver_tid,
+                )));
             }
             Err(e) => {
                 // Same real error the legacy router would raise (CapabilityFull,

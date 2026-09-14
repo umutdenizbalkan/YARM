@@ -1838,6 +1838,10 @@ pub(super) mod xfer2_grant_witness {
     /// read-only, check the metadata and the backing, then release it through NR 4.
     ///
     /// `explicit_range` selects which of NR 4's two shapes the release uses.
+    ///
+    /// Not compiled under `recv-queue1-ordinary-grant`: that profile runs the same two cycles
+    /// through NR 2 and NR 5 instead, and init has no room for both cells (see `run_once`).
+    #[cfg(not(feature = "recv-queue1-ordinary-grant"))]
     fn one_grant(mem_cap: u32, ep_cap: u32, explicit_range: bool, label: &str) -> bool {
         use yarm_ipc_abi::recv_shared_v3_abi::RecvSharedV3Output;
 
@@ -1965,11 +1969,34 @@ pub(super) mod xfer2_grant_witness {
             ep_cap
         );
 
-        // Grant A — the registered-range release shape.
-        let a = one_grant(mem_cap, ep_cap, false, "A");
-        // Grant B — the explicit-range release shape, over a SEPARATE grant so neither shape can
-        // be satisfied by state the other left behind.
-        let b = one_grant(mem_cap, ep_cap, true, "B");
+        // TWO grant cycles, and which RECEIVE syscall takes them is the profile's choice.
+        //
+        // Feature-off (the default, and what every ordinary matrix run builds): NR 30
+        // `RecvSharedV3`, in its two release shapes — the registered range and the explicit
+        // range, over SEPARATE grants so neither shape can be satisfied by state the other left
+        // behind.
+        //
+        // U9-RECV-QUEUE1 §3, feature-on: the identical queued `OPCODE_SHARED_MEM` message taken
+        // by NR 2 and by NR 5 with a finite timeout — the population this package moved off the
+        // terminal acquisition. Same send, same teardown, same backing check; only the receive
+        // differs, so the evidence is the same transfer taken by the route under test rather
+        // than a new kind of transfer.
+        //
+        // The feature REPLACES rather than adds, and that is measured rather than preferred:
+        // init's address space runs at `MAX_MAPPINGS` (128/128) and its image sits 19 bytes below
+        // a page boundary, so ~2 KiB of extra cell text costs a page, a page costs a mapping, and
+        // the shared-region oracle window can then no longer be mapped
+        // (`VM_FULL reason=mapping_bookkeeping_full`). `U9-IPC-RESIDUAL1 §5` records that
+        // pressure as deferred and this package does not widen into it. Gated off, this file's
+        // contribution to the image is unchanged — measured byte-identical `init_server` text.
+        // The two profiles are complementary runs of one witness, and the matrix runs both.
+        #[cfg(not(feature = "recv-queue1-ordinary-grant"))]
+        let (a, b) = (
+            one_grant(mem_cap, ep_cap, false, "A"),
+            one_grant(mem_cap, ep_cap, true, "B"),
+        );
+        #[cfg(feature = "recv-queue1-ordinary-grant")]
+        let (a, b) = ordinary_route_grants(mem_cap, ep_cap);
 
         // ESSENTIAL AUTHORITY INTACT: the endpoint cap init depends on must still work after two
         // full grant/release cycles. A plain NR 30 probe on an empty queue is the cheapest use of
@@ -2000,6 +2027,145 @@ pub(super) mod xfer2_grant_witness {
             caps_intact as u32,
             if all { "ok" } else { "fail" }
         );
+    }
+
+    /// U9-RECV-QUEUE1 §3 — the two grant cycles, received through NR 2 and NR 5 instead of NR 30.
+    ///
+    /// The send is the same `send_shared_region` grants A and B use, and the teardown is the same
+    /// NR 4 release. The difference is entirely the receive: no recv-v2 metadata buffer, because
+    /// argument 4 carries the kernel's map-intent word on BOTH receive syscalls — a metadata
+    /// length (NR 2) or pointer (NR 5) there reads as an unknown intent bit pattern and the
+    /// canonical handler answers `InvalidArgs` before it maps anything. `MAP_INTENT_READ` asks
+    /// for the read-only mapping the oracle's `READ | MAP` capability can actually back.
+    ///
+    /// The smoke script that drives this asserts the feature actually reached the userspace
+    /// image, so a silently-dropped feature cannot pass as a witness.
+    #[cfg(feature = "recv-queue1-ordinary-grant")]
+    fn ordinary_route_grants(mem_cap: u32, ep_cap: u32) -> (bool, bool) {
+        const VA: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
+        // ONE page, not the oracle's full two.
+        //
+        // The broad NR 2 / NR 5 mapping loop resolves the memory object's physical base ONCE PER
+        // PAGE from the capability — `map_user_page_in_asid_with_caps` → `resolve_memory_object_phys`,
+        // which takes no virtual address and no page index — so every page of a multi-page region
+        // is mapped to the object's FIRST frame. Observed live at
+        // `USER_MAP_PA_CHECK va=0x40000000 pa=0x1021c000` followed by
+        // `va=0x40001000 pa=0x1021c000`. That is a pre-existing defect of the BROAD path, latent
+        // because production only ever sends single-page regions through these two syscalls, and
+        // this package reproduces it rather than silently diverging (see
+        // `the_shared_region_mapping_loop_resolves_one_phys_per_page`). So the live cell exercises
+        // the production shape, where the defect cannot be reached; a 2-page grant here would be
+        // testing the bug, not the route.
+        const LEN: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_PAGE_SIZE;
+
+        // `timeout` is NR 5's only. A non-zero value with the message ALREADY queued is the
+        // finite-timeout immediate delivery this package added: the immediate engine must take it
+        // without arming a deadline. A lane serving only `timeout_ticks == 0` would send this one
+        // to the terminal acquisition even though nothing ever waits.
+        let one = |nr: usize, timeout: u64, label: &str| -> bool {
+            // The explicit-length send, so the descriptor the receiver acts on names ONE page.
+            // SAFETY: `ep_cap` carries SEND; `mem_cap` is init's disposable source cap.
+            if unsafe { yarm_user_rt::syscall::send_shared_region_large(ep_cap, mem_cap, 0, LEN) }
+                .is_err()
+            {
+                yarm_user_rt::user_log!(
+                    "XFER2_ORDINARY_GRANT phase={} step=send result=fail",
+                    label
+                );
+                return false;
+            }
+            // SAFETY: `VA..VA+LEN` is init's dedicated unmapped oracle window; the kernel
+            // validates and installs the mapping itself.
+            let got = unsafe {
+                yarm_user_rt::syscall::ipc_recv_raw_mapping(
+                    nr,
+                    ep_cap,
+                    VA,
+                    LEN,
+                    timeout,
+                    yarm_user_rt::syscall::SYSCALL_RECV_MAP_INTENT_READ,
+                )
+            };
+            let err = got.error_code();
+            if err != 0 {
+                yarm_user_rt::user_log!(
+                    "XFER2_ORDINARY_GRANT phase={} step=recv err={} result=fail",
+                    label,
+                    err
+                );
+                return false;
+            }
+            // The mapping the frame reports: the page-rounded length in ret1 and the
+            // receiver-local transfer capability in ret2. The base is the one this task asked
+            // for, because the kernel maps at exactly the requested address.
+            let cap = got.ret2 as u32;
+            let meta_ok = got.ret1 as usize == LEN && cap != 0 && got.ret2 != u64::MAX;
+
+            // BACKING: every byte of the mapped page against the deterministic oracle pattern —
+            // the only check that can tell a real mapping from a frame that merely claims one.
+            let mut p0 = true;
+            let mut off = 0usize;
+            while off < LEN {
+                // SAFETY: the recv mapped this whole window readable.
+                let got = unsafe { core::ptr::read_volatile((VA + off) as *const u8) };
+                if got != yarm_user_rt::syscall::shared_region_oracle_pattern_byte(off) {
+                    p0 = false;
+                }
+                off += 1;
+            }
+            // One page is mapped, so there is no second page to prove; reported as `1` so the
+            // marker's shape matches the NR 30 profile's rather than inventing a new one.
+            let p1 = true;
+
+            // The same three-part teardown A and B check: release, prove the window is free
+            // again, and prove the cleanup capability is revoked.
+            // SAFETY: the cleanup cap and the exact range the recv reported.
+            let released =
+                unsafe { yarm_user_rt::syscall::release_shared_region_range(cap, VA, LEN) };
+            let release_ok = matches!(released, Ok(l) if l == LEN);
+            // SAFETY: the window is this task's own, and is expected to be unmapped now.
+            let remap = unsafe {
+                yarm_user_rt::syscall::vm_anon_map(
+                    VA,
+                    yarm_user_rt::syscall::SHARED_REGION_ORACLE_PAGE_SIZE,
+                    0x1,
+                )
+            };
+            let unmapped_ok = remap.is_ok();
+            // SAFETY: intentional duplicate to observe the canonical refusal.
+            let dup = unsafe { yarm_user_rt::syscall::release_shared_region_mapping(cap) };
+            let revoked_ok = dup.is_err();
+
+            let all = meta_ok && p0 && p1 && release_ok && unmapped_ok && revoked_ok;
+            yarm_user_rt::user_log!(
+                "XFER2_ORDINARY_GRANT phase={} nr={} timeout={} cap={} ret1={} meta={}",
+                label,
+                nr,
+                timeout,
+                cap,
+                got.ret1,
+                meta_ok as u32
+            );
+            yarm_user_rt::user_log!(
+                "XFER2_ORDINARY_GRANT_WITNESS phase={} page0={} page1={} release={} unmapped={} revoked={} result={}",
+                label,
+                p0 as u32,
+                p1 as u32,
+                release_ok as u32,
+                unmapped_ok as u32,
+                revoked_ok as u32,
+                all as u32
+            );
+            all
+        };
+
+        let a = one(yarm_user_rt::syscall::SYSCALL_IPC_RECV_NR, 0, "A_nr2");
+        let b = one(
+            yarm_user_rt::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR,
+            64,
+            "B_nr5_timed",
+        );
+        (a, b)
     }
 }
 

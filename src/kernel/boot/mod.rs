@@ -241,6 +241,40 @@ pub(crate) enum IpcEndpointPeekResult {
     Ineligible(IpcEndpointSplitRejectReason),
 }
 
+/// U9-RECV-QUEUE1 §2 — what THE authoritative endpoint take did.
+///
+/// One policy, two acquisitions. `endpoint_take_with_refill_locked` is the only implementation
+/// of "dequeue one message and settle the sender-waiter queue" in the tree; the broad
+/// `KernelState::ipc_recv_endpoint_take` and the split
+/// `ipc_try_recv_queued_admitted_locked` both reach it, so the two cannot come to disagree
+/// about FIFO order, about which waiter is next, or about what a refill leaves behind.
+///
+/// There is deliberately no "refused" outcome. U9-RECV-QUEUE1 closed the last message shape the
+/// split route declined by class — the queued shared-region transfer and the forbidden
+/// ordinary-transfer Reply object are now served and refused respectively by the same owners the
+/// broad route uses, after the take, exactly as the broad route does it. A take that reaches this
+/// body takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointTakeOutcome {
+    /// The message is the caller's. The endpoint queue and the waiter queue are already
+    /// updated, and `wake` (when present) is the exact blocking cycle of the sender whose
+    /// message was either refilled into the freed slot or delivered directly.
+    Took {
+        msg: Message,
+        wake: Option<crate::kernel::ipc::SenderWakeTarget>,
+    },
+    /// No queued message and no live sender waiter. Nothing was touched.
+    Empty,
+    /// The endpoint index is past the table.
+    IndexOutOfRange,
+    /// The endpoint slot is empty — the incarnation is gone.
+    EndpointMissing,
+    /// The refill could not be enqueued into the slot the dequeue just freed. Defensive: the
+    /// broad owner has always mapped this to `EndpointQueueFull`, and it is not reachable
+    /// while a take precedes the refill.
+    QueueFull,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IpcEndpointRecvResult {

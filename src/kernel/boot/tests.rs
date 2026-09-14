@@ -43610,7 +43610,7 @@ mod stage160_aarch64_split_recv_routing {
         // nothing to bind a CPU for, and the broad acquisition is deleted. The guard therefore
         // pins the STRONGER property: the classification is exact, and no ambient
         // current-task read may return.
-        let m = RUNTIME_SRC
+        let m_src = RUNTIME_SRC
             .split("fn recv_queued_split_phase_a_split(")
             .nth(1)
             .and_then(|s| {
@@ -43618,13 +43618,23 @@ mod stage160_aarch64_split_recv_routing {
                     .next()
             })
             .expect("the off-lock Phase A must exist");
+        // Comments stripped for the same reason the per-caller check below strips them, and now
+        // because Phase A's own shared-region gate cites the broad arm's
+        // `current_task_has_user_asid` predicate when explaining which canonical branch it
+        // mirrors. A guard that cannot tell prose from code reads that citation as the defect it
+        // is describing.
+        let m = &m_src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
         // U9-RECV-FINAL moves the classification to the CALLERS, because the two receive
         // syscalls decode different argument slots and each must build its own request. The
         // claim is unchanged and is checked where it now lives: every caller classifies from the
         // exact requester TID, and no ambient current-task read returns anywhere in the family.
         for caller in [
             "fn try_split_ipc_recv_queued_plain_into_frame",
-            "fn try_split_ipc_recv_timeout_probe_into_frame",
+            "fn try_split_ipc_recv_timeout_immediate_into_frame",
         ] {
             let body = RUNTIME_SRC
                 .split(caller)
@@ -130594,19 +130604,39 @@ mod u4_cross_arch_queue_advancing_dispatch {
         #[test]
         fn no_consumed_sender_wake_can_bypass_completion_publication() {
             // The full path can no longer express a bare-TID sender wake.
+            //
+            // U9-RECV-QUEUE1 §2 moved the four-way match out of `ipc_recv_endpoint_take` and into
+            // `endpoint_take_with_refill_locked`, the ONE body the broad owner and the split
+            // dequeue now both drive. The property is unchanged and is checked where it lives —
+            // and checking it there is strictly stronger, because it now covers both routes
+            // rather than only the broad one.
             let take = body_of(
                 IPC_STATE,
-                "pub(crate) fn ipc_recv_endpoint_take(",
-                "\n    pub fn try_ipc_recv(",
+                "pub(crate) fn endpoint_take_with_refill_locked(",
+                "\n/// U9-C — the rank-3 body of",
             );
             assert!(
                 !take.contains("SchedulerWakePlan::Wake("),
-                "the full receive path must not return a bare-TID wake for a consumed sender"
+                "the shared take must not return a bare-TID wake for a consumed sender"
             );
             assert_eq!(
                 take.matches("wake_target()").count(),
                 2,
                 "both consuming arms return the exact blocking cycle"
+            );
+            // And the broad owner reaches exactly that body, so it cannot regrow its own.
+            let broad = body_of(
+                IPC_STATE,
+                "pub(crate) fn ipc_recv_endpoint_take(",
+                "\n    pub fn try_ipc_recv(",
+            );
+            assert!(
+                broad.contains("endpoint_take_with_refill_locked(ipc, endpoint_idx)"),
+                "the broad receive owner must drive the shared take"
+            );
+            assert!(
+                !broad.contains("wake_target()"),
+                "and must not build a wake target of its own"
             );
             // Both appliers publish before they wake.
             for (applier, close) in [
@@ -139671,10 +139701,14 @@ mod u9c_reply_cap_ordered_transaction {
     }
 
     fn materialize_body() -> &'static str {
+        // U9-RECV-QUEUE1 §2 retired `materialize_ordinary_cap_split`, which used to follow this
+        // method; the kernel-register arm it served now goes through
+        // `materialize_queued_transfer_cap_split`, the materializer that also handles a
+        // shared-region envelope's pin. The next item is the Reply-only rollback.
         body_of(
             RUNTIME,
             "pub(crate) fn materialize_reply_cap_split(",
-            "\n    /// U9-C — off-lock materialization of an ORDINARY",
+            "\n    /// U9-C — the authoritative Reply-ONLY rollback",
         )
     }
 
@@ -139838,25 +139872,56 @@ mod u9c_reply_cap_ordered_transaction {
         );
     }
 
-    /// A shared-region envelope owes a rank-6 pin release this transaction does not perform, so
-    /// it is refused rather than half-settled.
+    /// A shared-region envelope's pin obligation is DISCHARGED on every exit after the consume,
+    /// never dropped.
+    ///
+    /// U9-RECV-QUEUE1 §2 changed which owner answers this, and strengthened the answer. The
+    /// kernel-register arm used to route at `materialize_ordinary_cap_split`, which refused a
+    /// pinned envelope outright (`pinned_object.is_some()` → `WrongObject`) on the stated
+    /// grounds that the shared-region class was declined before the dequeue anyway. The class is
+    /// now admitted and served, so that refusal would be a NEW error the broad path does not
+    /// raise; both arms go through `materialize_queued_transfer_cap_split`, which reports the pin
+    /// obligation from the consume and releases it on every exit.
+    ///
+    /// The property to pin is therefore no longer "is it refused" but "can any exit after the
+    /// consume keep the pin". Every `return` below the consume must be preceded by the settle.
     #[test]
-    fn a_shared_region_envelope_is_refused_not_half_settled() {
-        let body = materialize_body();
-        assert!(
-            body.contains("if facts.pinned_object.is_some()"),
-            "the pin obligation must be checked"
+    fn a_shared_region_envelope_pin_is_settled_on_every_exit_after_the_consume() {
+        let body = body_of(
+            RUNTIME,
+            "pub(crate) fn materialize_queued_transfer_cap_split(",
+            "\n    /// U9-RECV-QUEUE1 §2 — THE canonical refusal",
         );
-        let at = body.find("facts.pinned_object.is_some()").expect("checked");
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let consume = code
+            .find("take_transfer_envelope_facts_split(")
+            .expect("the envelope is consumed exactly once");
         assert!(
-            body[at..].contains("return Err(SyscallError::WrongObject)"),
-            "and refused"
+            code[consume..].contains("let pinned = facts.pinned_object;"),
+            "the consume must REPORT the pin obligation rather than perform it"
         );
         assert!(
-            at < body
-                .find("mint_capability_with_memory_ref_split")
-                .expect("mint"),
-            "the refusal precedes the mint"
+            code.contains("shared.sr_release_pin_split(object)"),
+            "and the release must go through the existing rank-6 pin owner"
+        );
+        // Every exit after the consume settles first. `settle(self)` may appear on the line
+        // before the `return`, or once before a `match` that returns in every arm.
+        let tail = &code[consume..];
+        let returns = tail.matches("return Err(").count();
+        let settles = tail.matches("settle(self);").count();
+        assert!(
+            settles >= returns,
+            "every post-consume exit must settle the pin: {returns} returns, {settles} settles"
+        );
+        let last_settle = tail.rfind("settle(self);").expect("the terminal settle");
+        let match_outcome = tail.find("match outcome {").expect("the outcome match");
+        assert!(
+            last_settle < match_outcome,
+            "the success and failure arms alike must be settled before they are inspected"
         );
     }
 
@@ -140008,48 +140073,137 @@ mod u9c_reply_cap_ordered_transaction {
         );
     }
 
-    // ── (5) admission: classes are refused BEFORE anything is consumed ──────────────────────
+    // ── (5) admission: nothing is declined by message SHAPE any more ────────────────────────
 
-    /// Phase A declines only what it cannot serve, and does so pre-dequeue — never by consuming
-    /// a message and then failing. Envelope validity is deliberately NOT an admission
-    /// criterion, so a bad handle still surfaces its real error instead of degrading to a
-    /// silent fallback.
+    /// **No message shape is declined at admission, because every one of them now has an owner
+    /// past the dequeue.**
+    ///
+    /// U9-RECV-QUEUE1 §2 replaced what this guard used to pin. The `admit` predicate existed to
+    /// refuse two shapes *before* the take — a queued `OPCODE_SHARED_MEM` transfer and a Reply
+    /// object tagged as an ordinary transfer — because neither had a post-dequeue owner and a
+    /// post-dequeue refusal is not available once the message is gone. Both have one now:
+    /// the shared-region arm runs the receiver-side transaction, and the forbidden Reply shape is
+    /// refused by the same materializer the broad router sends it to. The predicate went with
+    /// them, and so did the possibility of a receive being handed to the broad dispatcher because
+    /// of what its message contained.
+    ///
+    /// The residual admission gates that remain are NOT about the message: a parked receiver on
+    /// the endpoint, and a non-buffered endpoint. Those are pinned here so they cannot silently
+    /// grow a message-shape sibling.
     #[test]
-    fn unserviceable_classes_are_refused_before_the_dequeue() {
+    fn no_message_shape_is_declined_at_admission() {
         let admitted = body_of(
             IPC_STATE,
             "pub(crate) fn ipc_try_recv_queued_admitted_locked(",
             "\n}",
         );
-        let peek = admitted.find("peek()").expect("the head is peeked");
-        let admit = admitted
-            .find("!admit(&msg, ipc)")
-            .expect("admission is consulted");
-        let dequeue = admitted
-            .find("ipc_try_recv_queued_with_cap_transfer_locked(ipc, endpoint_idx)")
-            .expect("the dequeue");
-        assert!(peek < admit && admit < dequeue, "peek -> admit -> dequeue");
+        let code = admitted
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("admit("),
+            "no per-class admission predicate may return: every shape has a post-dequeue owner"
+        );
+        assert!(
+            !code.contains("OPCODE_SHARED_MEM") && !code.contains("FLAG_REPLY_CAP"),
+            "the take must not inspect the message's opcode or transfer flags at all"
+        );
+        // The two gates that DO remain, and the fact that they precede the take.
+        let receiver = code
+            .find("endpoint_waiter_present(endpoint_idx)")
+            .expect("a parked receiver still declines");
+        let buffered = code
+            .find("!= EndpointMode::Buffered")
+            .expect("a non-buffered endpoint still declines");
+        let take = code
+            .find("endpoint_take_with_refill_locked(ipc, endpoint_idx)")
+            .expect("the shared take");
+        assert!(
+            receiver < take && buffered < take,
+            "the residual admission gates decide before anything is consumed"
+        );
 
-        let body = phase_a_body();
+        // And Phase A no longer carries the class declines it used to.
+        let phase_a = phase_a_body()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
         assert!(
-            body.contains("if msg.opcode == OPCODE_SHARED_MEM {"),
-            "shared-region must be declined"
+            !phase_a.contains("return false"),
+            "Phase A must no longer refuse a class from inside an admission closure"
         );
-        // An unresolvable handle stays ADMITTED so its error is raised rather than swallowed:
-        // every early-out in the envelope-resolution ladder returns `true`, not `false`.
-        let ladder = body
-            .split("let Ok(idx) = usize::try_from(handle & 0xFFFF)")
+        assert!(
+            phase_a.contains("RecvQueuedSplitPhaseA::PendingSharedRegion("),
+            "the shared-region shape must be SERVED, not declined"
+        );
+    }
+
+    /// **The forbidden queued reply-cap shape is refused with the CANONICAL answer**, now that
+    /// admission no longer refuses it earlier.
+    ///
+    /// `materialize_received_message_cap` fails closed on a `Reply` source object arriving
+    /// without `FLAG_REPLY_CAP`: it reclaims the envelope exactly once, mints nothing, emits
+    /// `IPC_RECV_REPLY_CAP_QUEUE_REFUSED … reason=direct_only`, and returns `InvalidCapability`.
+    /// The split arm used to answer `WrongObject` with no marker, under a comment asserting it
+    /// was unreachable. It is reachable now, so it owes the real answer.
+    #[test]
+    fn the_forbidden_queued_reply_shape_gets_the_canonical_refusal() {
+        let refusal = body_of(
+            RUNTIME,
+            "fn queued_reply_cap_refusal(",
+            "\n    /// rank 6 — a memory object's length",
+        );
+        assert!(
+            refusal.contains("IPC_RECV_REPLY_CAP_QUEUE_REFUSED")
+                && refusal.contains("reason=direct_only"),
+            "the canonical marker, verbatim"
+        );
+        assert!(
+            refusal.contains("SyscallError::InvalidCapability"),
+            "and the canonical error — not the WrongObject the unreachable arm used to give"
+        );
+        // The broad arm this is derived from still says the same thing, so the two cannot drift.
+        const RECV_CORE: &str = include_str!("../syscall/ipc_recv_core.rs");
+        let broad = RECV_CORE
+            .split("pub(crate) fn materialize_received_message_cap(")
             .nth(1)
-            .expect("the envelope-resolution ladder must exist");
-        let ladder = &ladder[..ladder.find("!matches!(").expect("ends at the Reply check")];
+            .expect("the canonical materializer");
+        let marker = broad
+            .find("IPC_RECV_REPLY_CAP_QUEUE_REFUSED")
+            .expect("the canonical marker");
         assert!(
-            !ladder.contains("return false"),
-            "an unresolvable or stale handle must stay admitted (return true), so its real \
-             error is surfaced instead of degrading into a silent fallback"
+            broad[marker..].contains("return Err(SyscallError::InvalidCapability)"),
+            "the canonical refusal is InvalidCapability"
         );
-        assert!(
-            ladder.matches("return true").count() >= 2,
-            "the early-outs admit"
+        // Every `DeferredReplyCap` arm in the split composition routes to the one refusal, so a
+        // second answer for the same condition cannot be introduced by adding an arm.
+        let code = RUNTIME
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        // Both RECEIVE-side arms — the kernel-register materializer and the user-receiver
+        // boundary — route to the one refusal. The send-side arm
+        // (`ipc_send_cap_boundary_origin_take`) is a different transaction and is not in scope.
+        let mut receive_arms = 0;
+        for (at, _) in code.match_indices("CapTransferMaterializeOutcome::DeferredReplyCap) =>") {
+            let arm = &code[at..(at + 400).min(code.len())];
+            if arm.contains("ipc_send_cap_boundary_origin_take") {
+                continue;
+            }
+            receive_arms += 1;
+            assert!(
+                arm.contains("queued_reply_cap_refusal("),
+                "a receive-side DeferredReplyCap arm must route to the canonical refusal: {arm}"
+            );
+        }
+        assert_eq!(
+            receive_arms, 2,
+            "both receive-side arms — the kernel-register materializer and the user-receiver \
+             boundary — are reachable now that admission no longer declines the shape"
         );
     }
 
@@ -140089,6 +140243,107 @@ mod u9c_reply_cap_ordered_transaction {
                 && code_of(IPC_STATE)
                     .contains("ipc_try_recv_queued_with_cap_transfer_locked(ipc, endpoint_idx)"),
             "both owners must drive the same body"
+        );
+
+        // U9-RECV-QUEUE1 §2 — and the TAKE itself, which is the part the two receive routes used
+        // to approximate separately, has exactly one body that both of them drive.
+        let ipc = code_of(IPC_STATE);
+        assert_eq!(
+            ipc.matches("fn endpoint_take_with_refill_locked(").count(),
+            1,
+            "one take body"
+        );
+        assert_eq!(
+            ipc.matches("endpoint_take_with_refill_locked(ipc, endpoint_idx)")
+                .count(),
+            2,
+            "driven by exactly two owners: the broad receive and the split dequeue"
+        );
+        // NR 30's peek/commit pair is the deliberate exception and stays its own: its
+        // transaction plans everything fallible BEFORE consuming, which is a different shape
+        // from the consume-then-compensate order NR 2 and NR 5 have. It is named here so the
+        // exception is explicit rather than an oversight.
+        assert_eq!(
+            ipc.matches("fn ipc_peek_queued_with_cap_transfer_locked(")
+                .count(),
+            1,
+            "NR 30's non-consuming peek remains exactly one body"
+        );
+    }
+
+    /// U9-RECV-QUEUE1 §3 — **the three removed escapes cannot come back**, each pinned at the
+    /// place it used to live.
+    ///
+    /// A guard that only asserted the new code is present would pass again the moment someone
+    /// re-added a decline beside it. These assert the ABSENCE of the specific gates, in the
+    /// specific body, and would fail against the code as it stood before this package.
+    #[test]
+    fn the_removed_dequeue_escapes_cannot_return() {
+        let take = body_of(
+            IPC_STATE,
+            "pub(crate) fn endpoint_take_with_refill_locked(",
+            "\n/// U9-C — the rank-3 body of",
+        );
+        let code = take
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+
+        // (1) SPARSE QUEUES. The waiter step must SCAN, and must not index slot 0.
+        assert!(
+            code.contains(".position(Option::is_some)"),
+            "the first LIVE waiter is found by scanning, never by reading slot 0"
+        );
+        assert!(
+            !code.contains("[endpoint_idx][0]"),
+            "a slot-0 read is exactly the sparse-queue defect this replaced"
+        );
+        // And the compaction is FULL, not a shift-by-one — which is only correct when the entry
+        // taken was at the head, and the scan above means it need not be.
+        assert!(
+            code.contains("for read in 0..queue.len()") && code.contains("write += 1;"),
+            "the queue is fully left-compacted after the take"
+        );
+        assert!(
+            !code.contains("queue[idx - 1] = queue[idx].take()"),
+            "a shift-by-one compaction strands waiters behind an interior gap"
+        );
+
+        // (2) CAP-BEARING REFILLS. The waiter's message is enqueued unchanged; its flags are
+        // never inspected, because it is queued for a later receiver rather than delivered.
+        assert!(
+            code.contains("endpoint.send(w.msg)"),
+            "the waiter's message is refilled BYTE-IDENTICAL"
+        );
+        for gate in [
+            "FLAG_CAP_TRANSFER",
+            "FLAG_REPLY_CAP",
+            "split_unsafe_flags",
+            "transferred_cap()",
+        ] {
+            assert!(
+                !code.contains(gate),
+                "the take must not inspect a message's transfer flags (saw `{gate}`)"
+            );
+        }
+
+        // (3) DIRECT-FROM-WAITER. An empty endpoint with a live waiter delivers that waiter's
+        // message rather than reporting nothing.
+        assert!(
+            code.contains("(None, Some(w)) => EndpointTakeOutcome::Took {"),
+            "an empty endpoint with a live waiter must deliver directly"
+        );
+
+        // (4) And the split wrapper no longer carries a per-class admission predicate at all.
+        let split = body_of(
+            IPC_STATE,
+            "pub(crate) fn ipc_try_recv_queued_admitted_locked(",
+            "\n}",
+        );
+        assert!(
+            !split.contains("impl Fn(&Message"),
+            "the admission closure parameter is gone, not merely unused"
         );
     }
 
@@ -150489,7 +150744,11 @@ mod stage199gc4_ordinary_cap_delivery_policy {
         let body = &RUNTIME_SRC[start..end];
 
         // The receiver-local capability is the executor's to mint, never a producer's.
-        for minting in ["sr_mint_split(", "materialize_ordinary_cap_split(", "mint("] {
+        for minting in [
+            "sr_mint_split(",
+            "materialize_queued_transfer_cap_split(",
+            "mint(",
+        ] {
             assert!(
                 !body.contains(minting),
                 "a producer must not mint the receiver's capability (saw `{minting}`)"
@@ -176083,7 +176342,7 @@ mod u9_recv_final_probe_parity {
         let (split, cap2) = fixture(0);
         let mut sf = probe_frame(cap2, 0, 0, 0);
         let split_answer = split
-            .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+            .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
             .expect("the lane answers an empty probe rather than declining");
         assert!(
             split_answer.is_ok(),
@@ -176115,7 +176374,7 @@ mod u9_recv_final_probe_parity {
         let (split, cap2) = fixture(2);
         let mut sf = probe_frame(cap2, 0, 0, 0);
         let split_answer = split
-            .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+            .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
             .expect("the lane serves a queued message");
         assert!(split_answer.is_ok(), "the split lane delivers too");
         assert_eq!(
@@ -176136,7 +176395,7 @@ mod u9_recv_final_probe_parity {
         let mut sf = probe_frame(cap2, 0, 0, 0);
         assert!(
             split
-                .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+                .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
                 .expect("serviced")
                 .is_ok()
         );
@@ -176163,7 +176422,7 @@ mod u9_recv_final_probe_parity {
         let (split, _cap2) = fixture(1);
         let mut sf = probe_frame(CapId(4242), 0, 0, 0);
         let split_answer = split
-            .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+            .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
             .expect("a resolution failure is answered, not declined");
         assert_eq!(
             split_answer.err().map(|e| match e {
@@ -176179,39 +176438,110 @@ mod u9_recv_final_probe_parity {
         );
     }
 
-    /// **A NON-ZERO timeout is not this lane's**, at any queue depth. The blocking route owns it,
-    /// and a probe lane that took it would answer a timed receive without arming its deadline.
+    /// **An EMPTY endpoint under a FINITE timeout is declined, not answered.**
+    ///
+    /// U9-RECV-QUEUE1 §2. This is the half of the timed receive that stays the blocking owner's:
+    /// the caller asked to wait, so the lane returns an internal decline and the family's
+    /// blocking route (or, failing that, the broad handler) parks it against its deadline.
+    /// Answering `WouldBlock` here would hand a receive that asked to wait the error for a
+    /// receive that asked not to.
     #[test]
-    fn a_timed_receive_is_never_taken_by_the_probe_lane() {
-        for queued in [0usize, 1] {
-            let (split, cap) = fixture(queued);
-            let mut sf = probe_frame(cap, 5, 0, 0);
-            assert!(
-                split
-                    .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
-                    .is_none(),
-                "queued={queued}: a non-zero timeout belongs to the blocking route"
-            );
-            assert_eq!(queued_total(&split), queued, "and nothing was consumed");
-        }
-    }
-
-    /// The lane reads NR 5's OWN argument slots. Arg 3 is the timeout; putting a non-zero value
-    /// there must move the request out of this lane even though the same slot holds NR 2's
-    /// metadata pointer — which is the confusion the separate decode exists to prevent.
-    #[test]
-    fn arg_three_is_a_timeout_here_and_not_a_metadata_pointer() {
-        let (split, cap) = fixture(1);
-        // A plausible user metadata POINTER in arg 3. For NR 2 this would select a recv-v2
-        // writeback; for NR 5 it is a timeout, and a large one.
-        let mut sf = probe_frame(cap, 0x4000, 0, 0);
+    fn an_empty_timed_receive_is_declined_rather_than_answered_would_block() {
+        let (split, cap) = fixture(0);
+        let mut sf = probe_frame(cap, 5, 0, 0);
         assert!(
             split
-                .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+                .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
+                .is_none(),
+            "an empty TIMED receive belongs to the blocking owner"
+        );
+        assert_eq!(
+            sf.error_code(),
+            None,
+            "and nothing was encoded into the frame — least of all the non-blocking error"
+        );
+        assert_eq!(queued_total(&split), 0, "and nothing was consumed");
+    }
+
+    /// **A READY message takes the immediate engine for a FINITE timeout too**, and the frame
+    /// matches the canonical handler's.
+    ///
+    /// `handle_ipc_recv_timeout` calls `try_endpoint_split_recv` BEFORE it looks at
+    /// `request.blocking`, precisely because a queued message makes the deadline irrelevant.
+    /// Refusing a finite timeout here sent every such receive to the terminal acquisition even
+    /// with a message waiting.
+    #[test]
+    fn a_ready_message_takes_the_immediate_engine_under_a_finite_timeout() {
+        let (broad, cap) = fixture(2);
+        let mut bf = probe_frame(cap, 5, 0, 0);
+        assert!(
+            broad.with(|s| dispatch(s, &mut bf)).is_ok(),
+            "the canonical handler delivers without waiting"
+        );
+        assert_eq!(queued_total(&broad), 1, "and consumes exactly one");
+
+        let (split, cap2) = fixture(2);
+        let mut sf = probe_frame(cap2, 5, 0, 0);
+        let answer = split
+            .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
+            .expect("a ready message is served, not declined, under a finite timeout");
+        assert!(answer.is_ok(), "the split lane delivers too");
+        assert_eq!(
+            queued_total(&split),
+            1,
+            "and consumes exactly one — never zero, never two"
+        );
+        assert_eq!(sf.ret0(), bf.ret0(), "ret0 must agree");
+        assert_eq!(sf.ret1(), bf.ret1(), "ret1 must agree");
+        assert_eq!(sf.ret2(), bf.ret2(), "ret2 must agree");
+        assert_eq!(
+            sf.error_code(),
+            bf.error_code(),
+            "the error lane must agree"
+        );
+        // No deadline was armed: the lane must not have parked the caller or published a waiter.
+        assert_eq!(
+            split.with(|s| s.with_ipc_state(|ipc| ipc
+                .endpoint_waiters
+                .iter()
+                .filter(|w| w.is_some())
+                .count())),
+            0,
+            "a delivered timed receive parks nobody"
+        );
+    }
+
+    /// The lane reads NR 5's OWN argument slots. Arg 3 is the timeout, and the proof is that a
+    /// non-zero value there changes the EMPTY-endpoint answer from `WouldBlock` (a probe) to a
+    /// decline (a timed receive). For NR 2 the same slot is a metadata pointer and would change
+    /// the writeback shape instead — which is the confusion the separate decode exists to
+    /// prevent.
+    #[test]
+    fn arg_three_is_a_timeout_here_and_not_a_metadata_pointer() {
+        // A plausible user metadata POINTER in arg 3.
+        let (probe, probe_cap) = fixture(0);
+        let mut zero = probe_frame(probe_cap, 0, 0, 0);
+        assert!(
+            probe
+                .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut zero)
+                .expect("a probe is answered")
+                .is_ok()
+        );
+        assert_eq!(zero.error_code(), Some(SyscallError::WouldBlock.code()));
+
+        let (timed, timed_cap) = fixture(0);
+        let mut big = probe_frame(timed_cap, 0x4000, 0, 0);
+        assert!(
+            timed
+                .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut big)
                 .is_none(),
             "arg 3 must be read as a timeout, so this is a TIMED receive and not a probe"
         );
-        assert_eq!(queued_total(&split), 1);
+        assert_eq!(
+            big.error_code(),
+            None,
+            "a timed receive's empty endpoint is not an answer at all"
+        );
     }
 
     /// The lane never parks, never arms a deadline and never commits a queue advance — on an
@@ -176227,7 +176557,7 @@ mod u9_recv_final_probe_parity {
         });
         let mut sf = probe_frame(cap, 0, 0, 0);
         let answer = split
-            .try_split_ipc_recv_timeout_probe_into_frame(CPU, &mut sf)
+            .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
             .expect("answered");
         assert!(answer.is_ok(), "an empty probe is a successful syscall");
         assert_eq!(sf.error_code(), Some(SyscallError::WouldBlock.code()));
@@ -176249,7 +176579,7 @@ mod u9_recv_final_probe_parity {
     fn the_lane_reuses_the_shared_engine_through_nr5s_own_builder() {
         const RUNTIME: &str = include_str!("../../runtime.rs");
         let body = RUNTIME
-            .split("pub fn try_split_ipc_recv_timeout_probe_into_frame")
+            .split("pub fn try_split_ipc_recv_timeout_immediate_into_frame")
             .nth(1)
             .and_then(|s| s.split("\n    pub fn ").next())
             .expect("the probe lane");
@@ -176277,6 +176607,850 @@ mod u9_recv_final_probe_parity {
             1,
             "there must be exactly one delivery engine"
         );
+    }
+}
+
+/// U9-RECV-QUEUE1 — **the four queued populations, differentially against their canonical
+/// handlers.**
+///
+/// Each case drives the REAL `syscall::dispatch` over a real `TrapFrame` to obtain
+/// `handle_ipc_recv` / `handle_ipc_recv_timeout`'s own answer, then drives the split lane over an
+/// identically prepared kernel, and requires the same result AND the same state. What "the same
+/// state" means is deliberately broad here — the endpoint's depth and head, the sender-waiter
+/// queue's contents and order, the transfer-envelope table, the receiver's cnode and its
+/// mappings — because every one of these populations is one where agreeing on the error code
+/// while disagreeing about what was consumed would be the actual defect.
+#[cfg(test)]
+mod u9_recv_queue1_parity {
+    use super::*;
+    use crate::kernel::capabilities::{CapId, CapObject};
+    use crate::kernel::ipc::{Message, SharedMemoryRegion, ThreadId};
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
+        SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP, SYSCALL_IPC_RECV_NR,
+        SYSCALL_IPC_RECV_TIMEOUT_NR, Syscall, SyscallError, dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{CachePolicy, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const CPU: crate::kernel::scheduler::CpuId = crate::kernel::scheduler::CpuId(0);
+    /// The receiver's mapping target. Deliberately not the page `setup_receiver` installs, so a
+    /// successful map has to install something.
+    const MAP_TARGET: usize = 0x2_0000;
+
+    fn recv_frame(nr: usize, recv_cap: CapId, ptr: usize, len: usize) -> TrapFrame {
+        let mut frame = TrapFrame::new(nr, [0; 6]);
+        frame.set_arg(SYSCALL_ARG_CAP, recv_cap.0 as usize);
+        frame.set_arg(SYSCALL_ARG_PTR, ptr);
+        frame.set_arg(SYSCALL_ARG_LEN, len);
+        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, 0);
+        frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, 0);
+        frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, 0);
+        frame
+    }
+
+    /// Drive whichever split lane owns this frame's syscall, exactly as the family entry would.
+    fn split_lane(
+        kernel: &SharedKernel,
+        frame: &mut TrapFrame,
+    ) -> Option<Result<(), crate::kernel::boot::TrapHandleError>> {
+        match Syscall::decode(frame.syscall_num()) {
+            Ok(Syscall::IpcRecv) => kernel.try_split_ipc_recv_queued_plain_into_frame(CPU, frame),
+            Ok(Syscall::IpcRecvTimeout) => {
+                kernel.try_split_ipc_recv_timeout_immediate_into_frame(CPU, frame)
+            }
+            other => panic!("not a receive frame: {other:?}"),
+        }
+    }
+
+    fn err_of(r: Result<(), crate::kernel::boot::TrapHandleError>) -> Option<SyscallError> {
+        match r {
+            Ok(()) => None,
+            Err(crate::kernel::boot::TrapHandleError::Syscall(s)) => Some(s),
+            Err(other) => panic!("unexpected error channel: {other:?}"),
+        }
+    }
+
+    // ── endpoint / waiter observation ───────────────────────────────────────────────────────
+
+    fn queued_total(kernel: &SharedKernel) -> usize {
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.endpoints
+                    .iter()
+                    .flatten()
+                    .map(|e| e.queued())
+                    .sum::<usize>()
+            })
+        })
+    }
+
+    /// The endpoint's head message, by value — so a case can assert WHICH message is next, not
+    /// merely how many remain.
+    fn head_of(kernel: &SharedKernel, idx: usize) -> Option<Message> {
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.endpoints[idx]
+                    .as_ref()
+                    .and_then(|e| crate::kernel::boot::kernel_ref(e).peek().copied())
+            })
+        })
+    }
+
+    /// The sender-waiter queue's live TIDs in slot order — the FIFO answer, observable.
+    fn waiter_tids(kernel: &SharedKernel, idx: usize) -> alloc::vec::Vec<u64> {
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.endpoint_sender_waiters[idx]
+                    .iter()
+                    .flatten()
+                    .map(|w| w.tid.0)
+                    .collect()
+            })
+        })
+    }
+
+    /// How many transfer envelopes are still stashed — a refusal that reclaims twice, or not at
+    /// all, shows up here and nowhere else.
+    fn live_envelopes(kernel: &SharedKernel) -> usize {
+        kernel.with(|s| s.with_ipc_state(|ipc| ipc.transfer_envelopes.iter().flatten().count()))
+    }
+
+    // ── fixtures ────────────────────────────────────────────────────────────────────────────
+
+    /// An endpoint with `queued` plain messages.
+    fn plain_fixture(queued: usize) -> (SharedKernel, CapId, CapId, usize) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (send_cap, recv_cap, idx) = kernel.with(|state| {
+            let (eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            for i in 0..queued {
+                state
+                    .ipc_send(send_cap, Message::new(7, &[i as u8; 4]).expect("m"))
+                    .expect("send");
+            }
+            (send_cap, recv_cap, eid)
+        });
+        (kernel, send_cap, recv_cap, idx)
+    }
+
+    /// Park `count` senders on a FULL endpoint, so the waiter queue is populated in FIFO order,
+    /// then null the slots named by `expire` in place — exactly what
+    /// `process_ipc_timeout_deadlines` does to a sender whose deadline fired, and exactly the
+    /// state that makes the queue SPARSE.
+    fn sparse_fixture(expire: &[usize]) -> (SharedKernel, CapId, usize) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, idx) = kernel.with(|state| {
+            // Depth 1 so the second send onwards must park.
+            let (eid, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, b"head").expect("m"))
+                .expect("fills the queue");
+            for tid in 1u64..=3 {
+                // Real tasks: a waiter naming a task that does not exist makes the BROAD route's
+                // `apply_blocked_sender_wake` fail with `TaskMissing`, which would compare a
+                // fixture artifact rather than the dequeue policy.
+                state.register_task(tid).expect("waiter task");
+                let msg = Message::with_header(tid, 7, 0, None, &[tid as u8; 4]).expect("m");
+                state.with_ipc_state_mut(|ipc| {
+                    let slot = ipc.endpoint_sender_waiters[eid]
+                        .iter_mut()
+                        .find(|s| s.is_none())
+                        .expect("a free waiter slot");
+                    *slot = Some(crate::kernel::boot::SenderWaiter {
+                        tid: ThreadId(tid),
+                        msg,
+                        asid: None,
+                        send_generation: tid,
+                    });
+                });
+            }
+            state.with_ipc_state_mut(|ipc| {
+                for &slot in expire {
+                    ipc.endpoint_sender_waiters[eid][slot] = None;
+                }
+            });
+            (recv_cap, eid)
+        });
+        (kernel, recv_cap, idx)
+    }
+
+    /// A receiver address space with one page mapped at `0x1_0000` for metadata, and `MAP_TARGET`
+    /// left unmapped so a successful shared-region map has to install it.
+    fn bind_receiver(state: &mut crate::kernel::boot::KernelState) -> crate::kernel::vm::Asid {
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_, page_cap) = state.alloc_anonymous_memory_object().expect("page cap");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                page_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map metadata page");
+        asid
+    }
+
+    /// An endpoint holding ONE queued `OPCODE_SHARED_MEM` transfer, with the receiver bound to a
+    /// user ASID. The send runs BEFORE the bind so it takes the kernel-task `IpcSend` path, whose
+    /// `payload_len = 20 > IPC_REGISTER_BYTES` selects `IpcSendPayloadShape::SharedRegion`.
+    fn shared_region_fixture() -> (SharedKernel, CapId, usize) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, idx) = kernel.with(|state| {
+            let (eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+            let dma_cap = state
+                .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+                .expect("dma cap");
+            let mut send = TrapFrame::new(
+                Syscall::IpcSend as usize,
+                [send_cap.0 as usize, 0, 20, 0, 0, dma_cap.0 as usize],
+            );
+            dispatch(state, &mut send).expect("shared-region send");
+            let _asid = bind_receiver(state);
+            (recv_cap, eid)
+        });
+        (kernel, recv_cap, idx)
+    }
+
+    // ── population 1: the queued shared-region transfer ──────────────────────────────────────
+
+    /// **A queued shared-region transfer is SERVED, not handed to the broad dispatcher** — and
+    /// the frame it produces is the canonical handler's, lane for lane.
+    ///
+    /// `ret0 = 0`, `ret1 = mapped_len`, `ret2` = the receiver-local transfer capability, arg 3 =
+    /// the mapped base and arg 4 = the region's byte length. All five are checked, because the
+    /// mapping is reported entirely through the argument registers and an arm that got only the
+    /// return lanes right would hand userspace a capability to a region it cannot find.
+    #[test]
+    fn a_queued_shared_region_transfer_matches_the_canonical_handler() {
+        for nr in [SYSCALL_IPC_RECV_NR, SYSCALL_IPC_RECV_TIMEOUT_NR] {
+            let (broad, bcap, _bidx) = shared_region_fixture();
+            let mut bf = recv_frame(nr, bcap, MAP_TARGET, crate::kernel::vm::PAGE_SIZE);
+            let broad_err = broad.with(|s| dispatch(s, &mut bf)).err();
+
+            let (split, scap, _sidx) = shared_region_fixture();
+            let mut sf = recv_frame(nr, scap, MAP_TARGET, crate::kernel::vm::PAGE_SIZE);
+            let answer = split_lane(&split, &mut sf)
+                .unwrap_or_else(|| panic!("nr={nr}: the lane must SERVE a shared-region transfer"));
+
+            assert_eq!(
+                err_of(answer),
+                broad_err,
+                "nr={nr}: the error lane must agree"
+            );
+            assert_eq!(sf.ret0(), bf.ret0(), "nr={nr}: ret0");
+            assert_eq!(sf.ret1(), bf.ret1(), "nr={nr}: ret1 (mapped_len)");
+            assert_eq!(sf.ret2(), bf.ret2(), "nr={nr}: ret2 (transfer cap)");
+            assert_eq!(
+                sf.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+                bf.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+                "nr={nr}: the mapped base"
+            );
+            assert_eq!(
+                sf.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+                bf.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+                "nr={nr}: the region length"
+            );
+            assert_eq!(queued_total(&split), queued_total(&broad), "nr={nr}: depth");
+            assert_eq!(
+                live_envelopes(&split),
+                live_envelopes(&broad),
+                "nr={nr}: the envelope must be consumed exactly as often"
+            );
+        }
+    }
+
+    /// **The region is really mapped, and registered**, on both routes — a frame that reports a
+    /// mapping nobody installed would satisfy every lane comparison above.
+    #[test]
+    fn the_region_is_mapped_and_registered_on_both_routes() {
+        let (broad, bcap, _bidx) = shared_region_fixture();
+        let mut bf = recv_frame(
+            SYSCALL_IPC_RECV_NR,
+            bcap,
+            MAP_TARGET,
+            crate::kernel::vm::PAGE_SIZE,
+        );
+        assert!(
+            broad.with(|s| dispatch(s, &mut bf)).is_ok(),
+            "broad delivers"
+        );
+
+        let (split, scap, _sidx) = shared_region_fixture();
+        let mut sf = recv_frame(
+            SYSCALL_IPC_RECV_NR,
+            scap,
+            MAP_TARGET,
+            crate::kernel::vm::PAGE_SIZE,
+        );
+        assert!(
+            err_of(split_lane(&split, &mut sf).expect("served")).is_none(),
+            "split delivers"
+        );
+
+        for (name, kernel, frame) in [("broad", &broad, &bf), ("split", &split, &sf)] {
+            let asid = kernel.with(|s| s.task_asid(0)).expect("receiver asid");
+            assert!(
+                kernel
+                    .with(|s| s.is_user_page_mapped_in_asid(asid, VirtAddr(MAP_TARGET as u64)))
+                    .expect("mapped query"),
+                "{name}: the region must actually be installed at the requested base"
+            );
+            let cap = CapId(frame.ret2() as u64);
+            assert_eq!(
+                kernel.active_transfer_mapping_for_split(ThreadId(0), cap),
+                Some((VirtAddr(MAP_TARGET as u64), crate::kernel::vm::PAGE_SIZE)),
+                "{name}: the active-transfer entry must name the exact mapping"
+            );
+        }
+    }
+
+    /// **An undersized receiver buffer is refused identically, and compensated identically**:
+    /// `InvalidArgs`, the return lane cleared, and no mapping left behind.
+    #[test]
+    fn an_undersized_shared_region_buffer_is_refused_and_compensated() {
+        let (broad, bcap, _bidx) = shared_region_fixture();
+        let mut bf = recv_frame(SYSCALL_IPC_RECV_NR, bcap, MAP_TARGET, 8);
+        let broad_err = broad.with(|s| dispatch(s, &mut bf)).err();
+        assert_eq!(broad_err, Some(SyscallError::InvalidArgs));
+
+        let (split, scap, _sidx) = shared_region_fixture();
+        let mut sf = recv_frame(SYSCALL_IPC_RECV_NR, scap, MAP_TARGET, 8);
+        let answer = split_lane(&split, &mut sf).expect("the lane answers rather than declining");
+        assert_eq!(err_of(answer), broad_err, "the same refusal");
+        assert_eq!(
+            sf.ret2(),
+            bf.ret2(),
+            "the return lane is cleared identically"
+        );
+        let asid = split.with(|s| s.task_asid(0)).expect("asid");
+        assert!(
+            !split
+                .with(|s| s.is_user_page_mapped_in_asid(asid, VirtAddr(MAP_TARGET as u64)))
+                .expect("mapped query"),
+            "a refused transfer must leave no mapping installed"
+        );
+        assert_eq!(
+            live_envelopes(&split),
+            live_envelopes(&broad),
+            "and must reclaim the envelope exactly as the canonical route does"
+        );
+    }
+
+    /// **A null mapping base is refused identically.** Separate from the undersized case because
+    /// the canonical arm reaches it through the same `user_ptr == 0 || user_len < region_len`
+    /// gate but by the other disjunct, and a split arm that checked only the length would pass
+    /// the test above and fail here.
+    #[test]
+    fn a_null_shared_region_base_is_refused_identically() {
+        let (broad, bcap, _bidx) = shared_region_fixture();
+        let mut bf = recv_frame(SYSCALL_IPC_RECV_NR, bcap, 0, crate::kernel::vm::PAGE_SIZE);
+        let broad_err = broad.with(|s| dispatch(s, &mut bf)).err();
+
+        let (split, scap, _sidx) = shared_region_fixture();
+        let mut sf = recv_frame(SYSCALL_IPC_RECV_NR, scap, 0, crate::kernel::vm::PAGE_SIZE);
+        let answer = split_lane(&split, &mut sf).expect("answered");
+        assert_eq!(err_of(answer), broad_err);
+        assert_eq!(sf.ret2(), bf.ret2());
+    }
+
+    /// **An unaligned mapping base is refused identically** — the gate lives inside the mapping
+    /// helper rather than in the arm, so this exercises a different owner than the two above.
+    #[test]
+    fn an_unaligned_shared_region_base_is_refused_identically() {
+        let base = MAP_TARGET + 8;
+        let (broad, bcap, _bidx) = shared_region_fixture();
+        let mut bf = recv_frame(
+            SYSCALL_IPC_RECV_NR,
+            bcap,
+            base,
+            crate::kernel::vm::PAGE_SIZE,
+        );
+        let broad_err = broad.with(|s| dispatch(s, &mut bf)).err();
+        assert_eq!(broad_err, Some(SyscallError::InvalidArgs));
+
+        let (split, scap, _sidx) = shared_region_fixture();
+        let mut sf = recv_frame(
+            SYSCALL_IPC_RECV_NR,
+            scap,
+            base,
+            crate::kernel::vm::PAGE_SIZE,
+        );
+        let answer = split_lane(&split, &mut sf).expect("answered");
+        assert_eq!(err_of(answer), broad_err);
+        assert_eq!(sf.ret2(), bf.ret2(), "and the return lane is cleared");
+    }
+
+    /// The descriptor the receiver acts on is the SENDER's, decoded from the message payload —
+    /// so the reported region length is the sender's length, not the receiver's buffer size.
+    #[test]
+    fn the_reported_region_length_comes_from_the_senders_descriptor() {
+        let (split, cap, idx) = shared_region_fixture();
+        let desc = SharedMemoryRegion::decode(
+            head_of(&split, idx)
+                .expect("the queued transfer")
+                .as_slice(),
+        )
+        .expect("the descriptor");
+        // A receiver buffer far larger than the region: the reported length must still be the
+        // descriptor's.
+        let mut sf = recv_frame(
+            SYSCALL_IPC_RECV_NR,
+            cap,
+            MAP_TARGET,
+            crate::kernel::vm::PAGE_SIZE * 4,
+        );
+        assert!(err_of(split_lane(&split, &mut sf).expect("served")).is_none());
+        assert_eq!(
+            sf.arg(SYSCALL_ARG_INLINE_PAYLOAD1) as u64,
+            desc.len,
+            "the region length is the sender's, not the receiver's budget"
+        );
+    }
+
+    /// **A pre-existing BROAD defect, reproduced rather than silently diverged from: the
+    /// shared-region mapping loop resolves ONE physical base for every page.**
+    ///
+    /// `map_shared_region_into_receiver` calls `map_user_page_in_asid_with_caps` once per page,
+    /// and that resolves the frame through `resolve_memory_object_phys(mem_cap, flags)` — which
+    /// takes no virtual address and no page index and returns the memory object's BASE. So every
+    /// page of a multi-page region is mapped to the object's first frame. Observed live at
+    /// `USER_MAP_PA_CHECK va=0x40000000 pa=0x1021c000` followed by `va=0x40001000 pa=0x1021c000`.
+    ///
+    /// It is latent in production because only single-page regions are ever sent through NR 2 and
+    /// NR 5; NR 30 has its own mapping planner and advances the physical base per page correctly.
+    /// This package PRESERVES the behaviour — a split route that silently mapped correctly would
+    /// be a divergence, and repairing the broad path is a different change with its own blast
+    /// radius. The test exists so the defect is recorded, attributed, and cannot be "fixed" on one
+    /// route only without a deliberate decision.
+    #[test]
+    fn the_shared_region_mapping_loop_resolves_one_phys_per_page() {
+        const IPC: &str = include_str!("../syscall/ipc.rs");
+        let body = IPC
+            .split("fn map_shared_region_into_receiver(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("the broad mapping loop");
+        assert!(
+            body.contains("kernel.map_user_page_in_asid_with_caps(")
+                && body.contains("receiver_mem_cap"),
+            "the loop maps through the capability, once per page"
+        );
+        // The capability is passed unchanged on every iteration — no offset, no page index.
+        assert!(
+            !body.contains("receiver_mem_cap + ") && !body.contains("phys.0 +"),
+            "no per-page physical advance exists in the broad loop"
+        );
+        // And the resolver it reaches really is address-blind.
+        const MEM: &str = include_str!("memory_state.rs");
+        let resolve = MEM
+            .split("pub(crate) fn resolve_memory_object_phys(")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub").next())
+            .expect("the resolver");
+        assert!(
+            resolve.contains("mem_cap: CapId") && !resolve.contains("virt"),
+            "the resolver takes no virtual address, so it cannot vary per page"
+        );
+        assert!(
+            resolve.contains(".map(|entry| entry.phys)"),
+            "it returns the object's BASE frame"
+        );
+
+        // The SPLIT route reproduces exactly that, and says so where it does it.
+        const SR: &str = include_str!("../syscall/recv_shared_region_split.rs");
+        let split = SR
+            .split("fn map_shared_region_into_receiver_split(")
+            .nth(1)
+            .expect("the split mapping loop");
+        assert!(
+            split.contains("self.resolve_shared_region_phys_split("),
+            "the split loop resolves per page through its own twin of the same resolver"
+        );
+        let resolver = SR
+            .split("fn resolve_shared_region_phys_split(")
+            .nth(1)
+            .expect("the split resolver");
+        assert!(
+            !resolver.contains("virt") && !resolver.contains("+ offset"),
+            "and that twin is address-blind too, exactly as the broad one is"
+        );
+    }
+
+    // ── population 2: sparse sender-waiter queues ────────────────────────────────────────────
+
+    /// **A sparse waiter queue is served, and the FIRST LIVE waiter is the one taken** — in FIFO
+    /// order, with the remainder left dense.
+    ///
+    /// `process_ipc_timeout_deadlines` nulls an expired sender's slot in place without
+    /// compacting, so `[None, Some(B), Some(C)]` is a state the queue really reaches. The split
+    /// dequeue used to read slot 0, find it empty, and decline the whole receive.
+    #[test]
+    fn a_sparse_waiter_queue_is_served_and_the_first_live_waiter_is_taken() {
+        // Expire slot 0, leaving [None, Some(2), Some(3)].
+        let (broad, bcap, bidx) = sparse_fixture(&[0]);
+        let mut bf = recv_frame(SYSCALL_IPC_RECV_NR, bcap, 0, 0);
+        let broad_err = broad.with(|s| dispatch(s, &mut bf)).err();
+
+        let (split, scap, sidx) = sparse_fixture(&[0]);
+        assert_eq!(
+            waiter_tids(&split, sidx),
+            alloc::vec![2, 3],
+            "the fixture really is sparse at slot 0"
+        );
+        let mut sf = recv_frame(SYSCALL_IPC_RECV_NR, scap, 0, 0);
+        let answer = split_lane(&split, &mut sf)
+            .expect("a sparse waiter queue must be SERVED, not handed to the broad dispatcher");
+        assert_eq!(err_of(answer), broad_err, "the same result");
+        assert_eq!(
+            waiter_tids(&split, sidx),
+            waiter_tids(&broad, bidx),
+            "the same waiter survives, in the same order"
+        );
+        assert_eq!(
+            waiter_tids(&split, sidx),
+            alloc::vec![3],
+            "the FIRST LIVE waiter (tid 2) was taken, not slot 0 and not tid 3"
+        );
+        assert_eq!(
+            head_of(&split, sidx),
+            head_of(&broad, bidx),
+            "and its message was refilled into the freed slot, identically"
+        );
+    }
+
+    /// **A gap in the MIDDLE is compacted away**, which a shift-by-one cannot do. The old split
+    /// compaction moved every entry left by exactly one, which is correct only when the entry
+    /// taken was at slot 0.
+    #[test]
+    fn an_interior_gap_is_fully_compacted() {
+        // [Some(1), None, Some(3)] — the take is at slot 0, the gap is behind it.
+        let (split, cap, idx) = sparse_fixture(&[1]);
+        assert_eq!(waiter_tids(&split, idx), alloc::vec![1, 3]);
+        let mut sf = recv_frame(SYSCALL_IPC_RECV_NR, cap, 0, 0);
+        assert!(split_lane(&split, &mut sf).is_some(), "served");
+        assert_eq!(
+            waiter_tids(&split, idx),
+            alloc::vec![3],
+            "tid 1 was taken and the queue left dense"
+        );
+        // And the survivor really is at slot 0, not stranded behind a hole.
+        let slot0 = split
+            .with(|s| s.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[idx][0].map(|w| w.tid.0)));
+        assert_eq!(slot0, Some(3), "the survivor must be dense at slot 0");
+    }
+
+    /// **Every-slot-expired is the empty queue**, not a decline: a waiter table with no live
+    /// entry must read exactly like one that was never populated.
+    #[test]
+    fn an_all_expired_waiter_queue_reads_as_empty() {
+        let (broad, bcap, _bidx) = sparse_fixture(&[0, 1, 2]);
+        let mut bf = recv_frame(SYSCALL_IPC_RECV_NR, bcap, 0, 0);
+        let broad_err = broad.with(|s| dispatch(s, &mut bf)).err();
+
+        let (split, scap, sidx) = sparse_fixture(&[0, 1, 2]);
+        assert!(waiter_tids(&split, sidx).is_empty());
+        let mut sf = recv_frame(SYSCALL_IPC_RECV_NR, scap, 0, 0);
+        let answer = split_lane(&split, &mut sf).expect("served");
+        assert_eq!(err_of(answer), broad_err);
+        assert_eq!(queued_total(&split), queued_total(&broad));
+    }
+
+    // ── population 3: cap-bearing refill messages ────────────────────────────────────────────
+
+    /// **A waiter whose message carries a capability is refilled, not declined** — and the
+    /// refilled message is byte-identical, with its transfer handle intact and its envelope still
+    /// stashed.
+    ///
+    /// This is the distinction the whole package turns on: the refilled message is *queued for a
+    /// later receiver*, not delivered now, so it owes no materialization at refill time. The old
+    /// split guard declined the entire receive because of what a message it was not delivering
+    /// happened to contain.
+    #[test]
+    fn a_cap_bearing_refill_is_queued_unchanged_rather_than_declining_the_receive() {
+        // Build the same shape on both routes: a full endpoint, and one parked sender whose
+        // message carries a transfer flag and a handle.
+        let build = || {
+            let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+            let (recv_cap, idx) = kernel.with(|state| {
+                let (eid, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+                state
+                    .ipc_send(send_cap, Message::new(7, b"head").expect("m"))
+                    .expect("fills the queue");
+                state.register_task(9).expect("waiter task");
+                let carried = Message::with_header(
+                    9,
+                    7,
+                    Message::FLAG_CAP_TRANSFER_PLAIN,
+                    Some(0x1_0001),
+                    b"cap!",
+                )
+                .expect("a cap-bearing waiter message");
+                state.with_ipc_state_mut(|ipc| {
+                    ipc.endpoint_sender_waiters[eid][0] = Some(crate::kernel::boot::SenderWaiter {
+                        tid: ThreadId(9),
+                        msg: carried,
+                        asid: None,
+                        send_generation: 1,
+                    });
+                });
+                (recv_cap, eid)
+            });
+            (kernel, recv_cap, idx)
+        };
+        let (broad, bcap, bidx) = build();
+        let mut bf = recv_frame(SYSCALL_IPC_RECV_NR, bcap, 0, 0);
+        let broad_err = broad.with(|s| dispatch(s, &mut bf)).err();
+
+        let (split, scap, sidx) = build();
+        let carried = split
+            .with(|s| s.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[sidx][0].map(|w| w.msg)));
+        let mut sf = recv_frame(SYSCALL_IPC_RECV_NR, scap, 0, 0);
+        let answer = split_lane(&split, &mut sf).expect(
+            "a cap-bearing REFILL must not decline the receive that is delivering a \
+                     different message",
+        );
+        assert_eq!(err_of(answer), broad_err, "the same result");
+        assert_eq!(
+            head_of(&split, sidx),
+            carried,
+            "the waiter's message is refilled BYTE-IDENTICAL, handle intact"
+        );
+        assert_eq!(
+            head_of(&split, sidx),
+            head_of(&broad, bidx),
+            "and identically to the canonical route"
+        );
+        assert!(
+            waiter_tids(&split, sidx).is_empty(),
+            "and the waiter is no longer queued"
+        );
+        assert_eq!(
+            live_envelopes(&split),
+            live_envelopes(&broad),
+            "nothing about the refilled message's envelope was touched"
+        );
+    }
+
+    /// **A reply-cap-flagged refill is also just a refill.** Same property, different flag — the
+    /// old guard rejected `FLAG_REPLY_CAP` on a waiter message too, and a fix that only handled
+    /// the ordinary transfer flag would pass the case above and fail here.
+    #[test]
+    fn a_reply_cap_flagged_refill_is_also_queued_unchanged() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, idx) = kernel.with(|state| {
+            let (eid, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, b"head").expect("m"))
+                .expect("fills the queue");
+            state.register_task(9).expect("waiter task");
+            let carried =
+                Message::with_header(9, 7, Message::FLAG_REPLY_CAP, Some(0x1_0001), b"rply")
+                    .expect("a reply-cap waiter message");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_sender_waiters[eid][0] = Some(crate::kernel::boot::SenderWaiter {
+                    tid: ThreadId(9),
+                    msg: carried,
+                    asid: None,
+                    send_generation: 1,
+                });
+            });
+            (recv_cap, eid)
+        });
+        let carried = kernel
+            .with(|s| s.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[idx][0].map(|w| w.msg)));
+        let mut sf = recv_frame(SYSCALL_IPC_RECV_NR, recv_cap, 0, 0);
+        assert!(
+            split_lane(&kernel, &mut sf).is_some(),
+            "a reply-cap-flagged REFILL must not decline the receive"
+        );
+        assert_eq!(head_of(&kernel, idx), carried, "refilled unchanged");
+    }
+
+    // ── population 4: the forbidden ordinary-transfer Reply object ───────────────────────────
+
+    /// **The forbidden queued reply-cap shape gets the canonical refusal, and the canonical
+    /// cleanup** — `InvalidCapability`, the message consumed, and the envelope reclaimed exactly
+    /// once.
+    ///
+    /// Reply capabilities are direct-delivery only; `IpcSend` refuses to enqueue one, so this
+    /// shape is reachable only by constructing it. The canonical materializer fails CLOSED on it.
+    /// The split route used to decline the class before the dequeue, which meant the broad
+    /// dispatcher re-did the whole receive to produce the same refusal one lock later.
+    #[test]
+    fn the_forbidden_queued_reply_shape_is_refused_with_the_canonical_cleanup() {
+        // A queued message whose transfer envelope resolves to a Reply object, but WITHOUT
+        // `FLAG_REPLY_CAP` — the forbidden combination.
+        let build = || {
+            let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+            let (recv_cap, idx) = kernel.with(|state| {
+                let (eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+                let endpoint = CapObject::Endpoint {
+                    index: eid,
+                    generation: state.with_ipc_state(|ipc| ipc.endpoint_generations[eid]),
+                };
+                // Written directly: `stash_transfer_envelope` derives `source_object` from a
+                // live capability, and `IpcSend` refuses to enqueue a Reply transfer at all —
+                // which is precisely why this shape is "reachable only through an internal
+                // invariant violation" and has to be constructed to be tested.
+                let handle = state.with_ipc_state_mut(|ipc| {
+                    ipc.transfer_envelope_generations[0] = 1;
+                    ipc.transfer_envelopes[0] = Some(crate::kernel::boot::TransferEnvelope {
+                        source_tid: ThreadId(1),
+                        source_cap: CapId(1),
+                        source_object: CapObject::Reply {
+                            index: 0,
+                            generation: 1,
+                        },
+                        endpoint,
+                        receiver_tid: None,
+                        state: crate::kernel::boot::TransferState::Created,
+                        shared_region: None,
+                        generation: 1,
+                    });
+                    (1u64 << 16) | 0u64
+                });
+                let msg = Message::with_header(
+                    1,
+                    7,
+                    Message::FLAG_CAP_TRANSFER_PLAIN,
+                    Some(handle),
+                    b"nope",
+                )
+                .expect("m");
+                state.with_ipc_state_mut(|ipc| {
+                    crate::kernel::boot::kernel_mut(ipc.endpoints[eid].as_mut().expect("endpoint"))
+                        .send(msg)
+                        .expect("enqueue");
+                });
+                (recv_cap, eid)
+            });
+            (kernel, recv_cap, idx)
+        };
+        let (broad, bcap, _bidx) = build();
+        let mut bf = recv_frame(SYSCALL_IPC_RECV_NR, bcap, 0, 0);
+        let broad_err = broad.with(|s| dispatch(s, &mut bf)).err();
+        assert_eq!(
+            broad_err,
+            Some(SyscallError::InvalidCapability),
+            "the canonical refusal for a queued Reply transfer"
+        );
+
+        let (split, scap, sidx) = build();
+        let mut sf = recv_frame(SYSCALL_IPC_RECV_NR, scap, 0, 0);
+        let answer = split_lane(&split, &mut sf)
+            .expect("the forbidden shape must be REFUSED here, not handed to the dispatcher");
+        assert_eq!(
+            err_of(answer),
+            broad_err,
+            "the same error — not the WrongObject the unreachable arm used to give"
+        );
+        assert_eq!(
+            queued_total(&split),
+            queued_total(&broad),
+            "the message is consumed on both routes"
+        );
+        assert_eq!(queued_total(&split), 0, "and it really is consumed");
+        assert_eq!(
+            live_envelopes(&split),
+            live_envelopes(&broad),
+            "and the envelope is reclaimed exactly as often"
+        );
+        assert_eq!(live_envelopes(&split), 0, "which is exactly once");
+        assert_eq!(
+            sf.ret2(),
+            bf.ret2(),
+            "and no capability is published in the return lane"
+        );
+    }
+
+    // ── duplicate protection ────────────────────────────────────────────────────────────────
+
+    /// **A second receive on a drained endpoint gets nothing**, and does not re-deliver the
+    /// message the first one took — on either route, and for either syscall.
+    #[test]
+    fn a_drained_endpoint_does_not_redeliver() {
+        for nr in [SYSCALL_IPC_RECV_NR, SYSCALL_IPC_RECV_TIMEOUT_NR] {
+            let (split, _s, cap, _idx) = plain_fixture(1);
+            let mut first = recv_frame(nr, cap, 0, 0);
+            assert!(
+                err_of(split_lane(&split, &mut first).expect("served")).is_none(),
+                "nr={nr}: the first receive delivers"
+            );
+            assert_eq!(queued_total(&split), 0, "nr={nr}: and drains the endpoint");
+
+            let mut second = recv_frame(nr, cap, 0, 0);
+            // NR 5's probe ANSWERS an empty endpoint; NR 2 declines it to the blocking owner.
+            // Neither may deliver a second copy. The probe's answer is a SUCCESSFUL syscall
+            // carrying `WouldBlock` in the frame's error lane — reading the syscall result
+            // instead would see `Ok` and conclude a delivery happened.
+            if let Some(answer) = split_lane(&split, &mut second) {
+                assert!(
+                    err_of(answer).is_none(),
+                    "nr={nr}: the empty answer is a successful syscall"
+                );
+                assert_eq!(
+                    second.error_code(),
+                    Some(SyscallError::WouldBlock.code()),
+                    "nr={nr}: a drained endpoint is WouldBlock, never a re-delivery"
+                );
+            }
+            assert_eq!(queued_total(&split), 0, "nr={nr}: still drained");
+        }
+    }
+
+    /// **A shared-region transfer is delivered exactly once**: the second receive finds nothing,
+    /// and no second capability or mapping is produced.
+    #[test]
+    fn a_shared_region_transfer_is_delivered_exactly_once() {
+        let (split, cap, _idx) = shared_region_fixture();
+        let mut first = recv_frame(
+            SYSCALL_IPC_RECV_NR,
+            cap,
+            MAP_TARGET,
+            crate::kernel::vm::PAGE_SIZE,
+        );
+        assert!(err_of(split_lane(&split, &mut first).expect("served")).is_none());
+        let minted = first.ret2();
+        assert_eq!(live_envelopes(&split), 0, "the envelope is consumed");
+
+        let mut second = recv_frame(
+            SYSCALL_IPC_RECV_NR,
+            cap,
+            MAP_TARGET + crate::kernel::vm::PAGE_SIZE,
+            crate::kernel::vm::PAGE_SIZE,
+        );
+        if let Some(answer) = split_lane(&split, &mut second) {
+            assert!(
+                err_of(answer).is_some(),
+                "a drained endpoint must not deliver a second transfer"
+            );
+        }
+        assert_eq!(
+            queued_total(&split),
+            0,
+            "and must not resurrect the consumed message"
+        );
+        assert_eq!(live_envelopes(&split), 0, "nor its envelope");
+        let asid = split.with(|s| s.task_asid(0)).expect("asid");
+        assert!(
+            !split
+                .with(|s| s.is_user_page_mapped_in_asid(
+                    asid,
+                    VirtAddr((MAP_TARGET + crate::kernel::vm::PAGE_SIZE) as u64)
+                ))
+                .expect("mapped query"),
+            "and must install no second mapping"
+        );
+        assert_ne!(minted, 0, "the first delivery really did mint a capability");
     }
 }
 
