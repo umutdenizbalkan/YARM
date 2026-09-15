@@ -1955,6 +1955,19 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
             crate::yarm_log!("YARM_RECV_CORE_FALLBACK reason={:?}", reason);
             return RecvQueuedSplitPhaseA::Fallback;
         }
+        // U9-RECV-BLOCK1 §1(c): this retained body is the SPLIT-ELIGIBILITY comparison baseline,
+        // and it has no production caller. The kernel-register + recv-v2 shape is served by the
+        // live off-lock Phase A, which reproduces the canonical dequeue → materialize → meta
+        // fault → rollback order; the true canonical baseline the differentials compare against
+        // is `syscall::dispatch` itself, not this helper. Declining here leaves this body's own
+        // behaviour exactly as it was.
+        RecvPlan::KernelRegisterV2MetaFaults => {
+            crate::yarm_log!(
+                "YARM_RECV_CORE_FALLBACK reason={:?}",
+                crate::kernel::recv_core::FallbackReason::RecvV2MetaUserCopy
+            );
+            return RecvQueuedSplitPhaseA::Fallback;
+        }
     };
 
     match outcome {

@@ -5971,25 +5971,46 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
         expected_tid: u64,
-    ) -> Option<crate::kernel::vm::Asid> {
-        let removed = self.block_current_on_cpu_split(cpu).ok().flatten()?;
-        if removed != expected_tid {
-            // A different task was current than the one this route classified. Nothing else has
-            // been touched, so the caller unwinds this single step and declines.
+    ) -> Option<(crate::kernel::vm::Asid, crate::kernel::scheduler::TaskPriority)> {
+        // U9-RECV-BLOCK1 §3 — COMPARE, then clear. Never the other way round.
+        //
+        // This step used to call `block_current_on_cpu_split`, which clears whatever is current,
+        // and only then compare the removed TID against the one the route classified. A mismatch
+        // therefore BLOCKED a task that had nothing to do with this receive, and the repair —
+        // `let _ = self.on_preempt_prefer_on_cpu_split(cpu, removed);` — discarded its result, so
+        // a failed repair left that task current nowhere and queued nowhere. The route then
+        // returned `NotHandled`, and the broad dispatcher ran the syscall against a `current` that
+        // was no longer what it had been.
+        //
+        // `block_current_exact_on` (U9-EXIT3 §2) is the compare-and-clear that makes the mismatch
+        // free: it mutates nothing unless the slot names exactly this task. There is no repair to
+        // discard because there is nothing to repair.
+        //
+        // The returned PRIORITY is the restoration authority. It is the only record of the
+        // placement the task was removed from, and without carrying it an unwind would have to
+        // invent one — which is how a restore ends up overwriting somebody else's placement.
+        let priority = self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler)
+                .validate_online_cpu(cpu)
+                .ok()?;
+            sched.current_cpu = cpu;
+            crate::kernel::boot::kernel_mut(&mut sched.scheduler)
+                .block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(expected_tid))
+        });
+        let Some(priority) = priority else {
             crate::yarm_log!(
-                "D2_RECV_SPLIT_REFUSED cpu={} phase=a reason=victim_changed expected={} removed={}",
+                "D2_RECV_SPLIT_REFUSED cpu={} phase=a reason=victim_changed expected={} removed=none",
                 cpu.0,
-                expected_tid,
-                removed
+                expected_tid
             );
-            let _ = self.on_preempt_prefer_on_cpu_split(cpu, removed);
             return None;
-        }
-        crate::yarm_log!("SCHED_BLOCK tid={}", removed);
-        Some(
-            self.task_asid_opt_split_read(removed)
+        };
+        crate::yarm_log!("SCHED_BLOCK tid={}", expected_tid);
+        Some((
+            self.task_asid_opt_split_read(expected_tid)
                 .unwrap_or(crate::kernel::vm::Asid(0)),
-        )
+            priority,
+        ))
     }
 
     /// U9-RX3 — Phase B twin (task, rank 2): mint the FRESH wait generation, mark the receiver
@@ -6165,60 +6186,114 @@ impl SharedKernel {
         })
     }
 
-    /// U9-RX3 — the EXACT inverse of Phase B then Phase A, for the `QueueNonEmpty` race.
+    /// U9-RECV-BLOCK1 §3 — the EXACT inverse of Phase B then Phase A, for **this transaction's**
+    /// incarnation and no other.
     ///
-    /// Reverses in strict reverse order: clear the blocked-recv writeback state and restore the
-    /// task to `Runnable` (rank 2), then re-establish it as `current` on the SAME cpu (rank 1).
-    /// The wait generation is deliberately NOT rolled back — generations only ever advance, and a
-    /// rollback would let a stale record compare equal to a newer one.
+    /// # What identity buys, and what its absence cost
     ///
-    /// Returns `true` only when the receiver is provably `current` again. A `false` return means
-    /// the caller must fail closed rather than resume a task that is still Blocked.
+    /// The predecessor took a bare `tid`, found `t.tid.0 == tid`, and assigned
+    /// `tcb.status = TaskStatus::Runnable` whatever it found there. A numeric TID is not an
+    /// incarnation: between Phase A and this call the task can have been replaced, reaped and
+    /// respawned, or claimed by a terminal owner that installed its own status — and the write
+    /// would have overwritten all three. It then called `wake_tid_to_runnable_split` and
+    /// `on_preempt_prefer_on_cpu_split`, neither of which is exact either: the first enqueues by
+    /// TID, and the second PREFERS the task, displacing whatever the scheduler had already
+    /// chosen.
+    ///
+    /// Every fact needed to be exact was already available and simply unused: Phase A returns the
+    /// priority it removed, Phase B mints the wait generation, and Phase C carries
+    /// `{tid, asid, wait_generation}`. This form requires all of them to still hold before it
+    /// writes anything:
+    ///
+    /// * **rank 2** — the TCB must still be the same `{tid, asid}`, still carry exactly this
+    ///   transaction's `blocked_recv_generation`, and still be `Blocked(EndpointReceive)`. Any
+    ///   other state means another owner has taken the task over, and this unwind is not entitled
+    ///   to touch it. The wait generation is NOT rolled back: generations only advance, and
+    ///   rolling one back would let a stale record compare equal to a newer one.
+    /// * **rank 1** — `restore_exact_current_on` refuses unless this CPU's slot is still empty
+    ///   and the task is queued nowhere on it, so a restore can never displace a task the
+    ///   scheduler chose in the meantime nor create a second placement.
+    ///
+    /// # Never a lost task
+    ///
+    /// If rank 2 succeeded but the exact restore is refused, the task is `Runnable` and belongs on
+    /// a run queue — so it is enqueued rather than left placed nowhere. The caller then learns it
+    /// may NOT return through the entering frame, which is the whole point of distinguishing the
+    /// two failures.
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-    pub(crate) fn recv_block_unwind_race_split(&self, cpu: CpuId, tid: u64) -> bool {
-        use crate::kernel::task::TaskStatus;
+    pub(crate) fn recv_block_unwind_exact_split(
+        &self,
+        cpu: CpuId,
+        identity: crate::kernel::recv_waiter_split::RecvBlockIdentity,
+    ) -> crate::kernel::recv_waiter_split::RecvUnwindOutcome {
+        use crate::kernel::recv_waiter_split::RecvUnwindOutcome as U;
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let tid = identity.tid;
         crate::yarm_log!("D2_PUBLISH_RACE_UNWIND endpoint=split tid={}", tid);
         crate::yarm_log!("D2_RECV_WAITER_RACE_UNWIND tid={}", tid);
-        // Rank 2 — the exact inverse of Phase B's task half.
+        // Rank 2 — the exact inverse of Phase B's task half, on the exact incarnation.
         let cleared = self.with_task_tcbs_split_mut(|tcbs| {
-            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
-                Some(tcb) => {
-                    tcb.blocked_recv_state = None;
-                    tcb.ipc_timeout_deadline = None;
-                    tcb.ipc_timeout_fired = false;
-                    tcb.status = TaskStatus::Runnable;
-                    true
-                }
-                None => false,
+            let Some(tcb) = tcbs.iter_mut().flatten().find(|t| {
+                t.tid.0 == tid
+                    && t.asid == Some(identity.asid)
+                    && t.blocked_recv_generation == identity.wait_generation
+            }) else {
+                return false;
+            };
+            // Still parked on OUR receive? A different `WaitReason`, or any non-blocked status,
+            // means some other owner re-purposed this incarnation after Phase B.
+            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointReceive(_))) {
+                return false;
             }
+            tcb.blocked_recv_state = None;
+            tcb.ipc_timeout_deadline = None;
+            tcb.ipc_timeout_fired = false;
+            tcb.status = TaskStatus::Runnable;
+            true
         });
         if !cleared {
             crate::yarm_log!(
-                "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=b reason=task_missing",
-                tid
+                "D2_RECV_SPLIT_UNWIND_FAIL tid={} asid={} wait_gen={} phase=b reason=incarnation_moved",
+                tid,
+                identity.asid.0,
+                identity.wait_generation
             );
-            return false;
+            return U::IncarnationMoved;
         }
-        // Rank 1 — the exact inverse of Phase A: re-enqueue and make current again.
-        if self
-            .wake_tid_to_runnable_split(cpu, crate::kernel::ipc::ThreadId(tid))
-            .is_err()
-        {
-            crate::yarm_log!("D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=wake", tid);
-            return false;
+        // Rank 1 — the exact inverse of Phase A, at the priority Phase A removed.
+        //
+        // `restore_exact_current_on` refuses on two conditions, and they are not equally
+        // reachable. `current.is_some()` cannot hold: installing a current on this CPU requires
+        // running on this CPU, and this trap is what is running on it. `contains_tid` CAN hold —
+        // Phase B staged `ipc_timeout_deadline`, so on a multi-CPU boot the deadline scan may
+        // have woken and enqueued this exact task between Phase A and here.
+        if self.restore_current_exact_split(cpu, tid, identity.priority) {
+            crate::yarm_log!("D2_RECV_SPLIT_UNWIND_OK cpu={} tid={}", cpu.0, tid);
+            return U::Restored;
         }
+        // The reachable refusal: ours, Runnable, and sitting in this CPU's run queue rather than
+        // in its empty current slot. Taking it back out is the existing preempt-and-prefer
+        // primitive's exact job, and its RESULT is checked — the predecessor discarded it.
         match self.on_preempt_prefer_on_cpu_split(cpu, tid) {
             Some(now) if now == tid => {
-                crate::yarm_log!("D2_RECV_SPLIT_UNWIND_OK cpu={} tid={}", cpu.0, tid);
-                true
+                crate::yarm_log!(
+                    "D2_RECV_SPLIT_UNWIND_OK cpu={} tid={} via=prefer_after_requeue",
+                    cpu.0,
+                    tid
+                );
+                U::Restored
             }
             other => {
+                // Neither refusal condition should hold here. The task is Runnable, so it is not
+                // lost; it is enqueued rather than left placed nowhere, and the caller is told it
+                // may NOT return through the entering frame.
+                let _ = self.enqueue_task_split(cpu, tid);
                 crate::yarm_log!(
-                    "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=not_current observed={:?}",
+                    "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=placement_taken observed={:?} enqueued=1",
                     tid,
                     other
                 );
-                false
+                U::RunnableElsewhere
             }
         }
     }
@@ -7181,6 +7256,96 @@ impl SharedKernel {
     /// Taking the request instead is what lets both receive syscalls share ONE delivery engine
     /// without either of them being rewritten into the other. Each caller decodes its own ABI;
     /// everything from planning to writeback is this function's, unchanged.
+    /// U9-RECV-BLOCK1 §1(c) — the metadata write a KERNEL-REGISTER receive with a recv-v2 buffer
+    /// is owed, performed where the canonical owner performs it, and failing where it fails.
+    ///
+    /// `handle_ipc_recv_result_with_empty_error` does not ask whether the receiver has an address
+    /// space before deciding to write metadata: it computes
+    /// `recv_v2_meta_written = meta_ptr != 0 && meta_len >= 40` from the caller's arguments,
+    /// encodes the struct, and hands it to `copy_to_current_user`. That is
+    /// `task_asid(tid).ok_or(KernelError::UserMemoryFault)` — so the failure is discovered at the
+    /// COPY, after the message has been consumed and the capability minted, and it arrives as
+    /// `SyscallError::PageFault` together with the rollback that undoes the mint.
+    ///
+    /// This reproduces that, including the fact that the ASID is looked UP rather than assumed
+    /// absent: the missing address space is derived from the same read the canonical helper
+    /// makes, so a receiver that somehow has one gets a real copy attempt and not a fabricated
+    /// fault.
+    ///
+    /// Returns `Some(err)` when the receive must fail; the caller returns it immediately. `None`
+    /// means the metadata is written and the ordinary register writeback continues.
+    fn kernel_register_v2_meta_write_split(
+        &self,
+        frame: &mut TrapFrame,
+        receiver_tid: u64,
+        msg: &crate::kernel::ipc::Message,
+        meta_ptr: usize,
+        materialized_cap: Option<u64>,
+        is_reply_cap: bool,
+    ) -> Option<crate::kernel::syscall::SyscallError> {
+        use crate::kernel::ipc::Message;
+        use crate::kernel::syscall::{
+            SYSCALL_RECV_META_REPLY_CAP, SYSCALL_RECV_META_TRANSFERRED_CAP, SyscallError,
+            recv_boundary_encode_transfer_cap_ret,
+        };
+
+        // The same three-way flag derivation the canonical owner performs on the message.
+        let recv_meta_flags = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+            SYSCALL_RECV_META_REPLY_CAP
+        } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0
+        {
+            SYSCALL_RECV_META_TRANSFERRED_CAP
+        } else {
+            0
+        };
+        let sender = match usize::try_from(msg.sender_tid.0) {
+            Ok(s) => s,
+            Err(_) => return Some(SyscallError::Internal),
+        };
+        let delivery = crate::kernel::syscall::ipc_recv_core::project_recv_delivery(msg);
+        let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
+            sender as u64,
+            delivery.app_opcode,
+            msg.flags,
+            delivery.app_payload.len() as u32,
+            frame.ret2() as u64,
+            recv_meta_flags as u64,
+            msg.sender_tid.0,
+        );
+
+        // `copy_to_current_user`'s own first step, through the split seam: resolve the receiver's
+        // address space, and treat its absence as `UserMemoryFault`.
+        let copy_err = match self.task_asid_option_split_read(receiver_tid) {
+            Some(asid) => match self.copy_to_user_split(
+                asid,
+                crate::kernel::vm::VirtAddr(meta_ptr as u64),
+                &meta,
+            ) {
+                Ok(()) => {
+                    crate::yarm_log!("IPC_RECV_V2_META_IMMEDIATE_OK len=40");
+                    return None;
+                }
+                Err(e) => e,
+            },
+            None => crate::kernel::boot::KernelError::UserMemoryFault,
+        };
+
+        // The canonical rollback: undo the mint made moments ago, clear the return lane, and
+        // emit the marker the broad arm emits at this exact site.
+        if let Some(materialized) = materialized_cap {
+            let _ = self.rollback_materialized_recv_cap_no_vm_split(
+                receiver_tid,
+                crate::kernel::capabilities::CapId(materialized),
+            );
+            let _ = recv_boundary_encode_transfer_cap_ret(frame, None);
+            crate::yarm_log!(
+                "IPC_RECV_V2_ROLLBACK_OK site=immediate_meta reply={}",
+                is_reply_cap
+            );
+        }
+        Some(SyscallError::from(copy_err))
+    }
+
     pub(crate) fn recv_queued_split_phase_a_split(
         &self,
         cpu: CpuId,
@@ -7208,11 +7373,18 @@ impl SharedKernel {
             RecvPlan::KernelPlainEligible => ("kernel_plain", false),
             RecvPlan::UserPlainEligible => ("user_plain", true),
             RecvPlan::UserPlainV2Eligible => ("user_plain_v2", true),
+            // U9-RECV-BLOCK1 §1(c) — kernel-register payload, recv-v2 metadata owed. The payload
+            // writeback is the kernel-register one; the metadata write is attempted after the
+            // materialization and faults there, which is where the canonical owner faults.
+            RecvPlan::KernelRegisterV2MetaFaults => ("kernel_register_v2_meta", false),
             RecvPlan::FallbackRequired(reason) => {
                 crate::yarm_log!("YARM_RECV_CORE_FALLBACK reason={:?}", reason);
                 return RecvQueuedSplitPhaseA::Fallback;
             }
         };
+        // Does this receive owe a recv-v2 metadata struct it cannot write? Carried as a fact
+        // rather than re-derived below, so the one place that decides it is the planner.
+        let kernel_register_meta_owed = matches!(plan, RecvPlan::KernelRegisterV2MetaFaults);
         crate::yarm_log!("YARM_RECV_CORE_ADAPTER kind={}", kind);
 
         let endpoint = snapshot.endpoint;
@@ -7241,7 +7413,11 @@ impl SharedKernel {
             self.note_endpoint_only_queued_recv_split_seam();
         }
         let outcome = match plan {
-            RecvPlan::KernelPlainEligible => map_queued_recv_outcome(result, kernel_register_plan),
+            // Both kernel-register plans build the SAME writeback plan: the payload contract is
+            // identical, and the metadata is a separate obligation the arm below discharges.
+            RecvPlan::KernelPlainEligible | RecvPlan::KernelRegisterV2MetaFaults => {
+                map_queued_recv_outcome(result, kernel_register_plan)
+            }
             RecvPlan::UserPlainEligible => {
                 map_queued_recv_outcome(result, |_m, tid| user_memory_plan(request, tid))
             }
@@ -7439,6 +7615,23 @@ impl SharedKernel {
                     wake_tid.tid.0
                 );
             }
+            // U9-RECV-BLOCK1 §1(c) — the metadata write comes BEFORE the register writeback,
+            // exactly as it does in the canonical owner, so a receive that owes one and cannot
+            // perform it fails with the mint rolled back rather than reporting success.
+            if kernel_register_meta_owed
+                && let crate::kernel::recv_core::RecvMetaTarget::V2 { ptr, .. } =
+                    request.meta_target
+                && let Some(err) = self.kernel_register_v2_meta_write_split(
+                    frame,
+                    receiver_tid,
+                    &delivery.msg,
+                    ptr,
+                    Some(local_cap.0),
+                    false,
+                )
+            {
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(err)));
+            }
             let RecvWritebackPlan::KernelRegister {
                 sender_tid,
                 raw_len,
@@ -7523,6 +7716,23 @@ impl SharedKernel {
                 sender_tid,
                 raw_len,
             } => {
+                // U9-RECV-BLOCK1 §1(c) — same obligation on the no-transfer and reply-cap paths
+                // that reach a kernel-register writeback: the metadata write is attempted first,
+                // and its failure carries whatever was minted back out with it.
+                if kernel_register_meta_owed
+                    && let crate::kernel::recv_core::RecvMetaTarget::V2 { ptr, .. } =
+                        request.meta_target
+                    && let Some(err) = self.kernel_register_v2_meta_write_split(
+                        frame,
+                        receiver_tid,
+                        &delivery.msg,
+                        ptr,
+                        materialized_cap,
+                        is_reply_cap,
+                    )
+                {
+                    return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(err)));
+                }
                 frame.set_ok(sender_tid, raw_len, frame.ret2());
                 let words = match pack_register_payload(delivery.msg.as_slice()) {
                     Ok(w) => w,

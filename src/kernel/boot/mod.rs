@@ -8202,6 +8202,47 @@ pub(crate) fn maybe_publish_shared_region_blocked_recv_ack(
     endpoint: crate::kernel::capabilities::CapObject,
     state: &crate::kernel::task::BlockedRecvState,
 ) {
+    // U9-RECV-BLOCK1 §2 — the broad arm now supplies the same two facts the split route supplies
+    // and runs the SAME body. Both reads stay exactly where they were: the waiter identity under
+    // `ipc_state`, the receiver ASID under the task domain.
+    let receiver_asid = kernel.task_asid(receiver_tid);
+    publish_shared_region_blocked_recv_ack_with(
+        receiver_tid,
+        receiver_asid,
+        endpoint,
+        state,
+        |index| kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index)),
+    );
+}
+
+/// U9-RECV-BLOCK1 §2 — **the ONE shared-region acknowledgement publication body**, shared by the
+/// broad blocked-recv arm above and the off-lock split blocking-`IpcRecv` route.
+///
+/// This is the same parameterisation Stage 199D-WA3C2 applied to the NR6/NR7 pair, for the same
+/// reason and with the same shape: the body needed a broad `&KernelState` for exactly two reads —
+/// the live endpoint-waiter identity and the receiver's ASID — so the split route could not run it
+/// and yielded the whole receive instead. That yield was written as
+/// `cfg!(feature = "shared-region-direct-oracle")`, a COMPILE-TIME term: it fired on every NR 2
+/// blocking receive in any build where the feature was compiled in, whether or not the oracle was
+/// ever enabled at runtime, sending 114 ordinary receives per boot to the terminal acquisition for
+/// work none of them had anything to do with.
+///
+/// Nothing about the policy moves. The runtime knob, the oracle contract (recv-v2, the dedicated
+/// two-page window, a real metadata buffer), the authoritative committed-waiter check, the ack
+/// record, the sequence number and the marker are all unchanged and in the same order; only the
+/// two reads are supplied by the caller that can perform them.
+///
+/// `live_waiter` answers "which identity, if any, currently holds this endpoint's waiter slot" —
+/// the caller's own domain read. Returning `None` means not committed, and the ack is refused,
+/// exactly as a non-matching identity is.
+#[cfg(feature = "shared-region-direct-oracle")]
+pub(crate) fn publish_shared_region_blocked_recv_ack_with(
+    receiver_tid: u64,
+    receiver_asid: Option<crate::kernel::vm::Asid>,
+    endpoint: crate::kernel::capabilities::CapObject,
+    state: &crate::kernel::task::BlockedRecvState,
+    live_waiter: impl FnOnce(usize) -> Option<ReceiverWaiterIdentity>,
+) {
     use crate::kernel::capabilities::CapObject;
     if !shared_region_direct_oracle_enabled() {
         return;
@@ -8222,11 +8263,8 @@ pub(crate) fn maybe_publish_shared_region_blocked_recv_ack(
     // Authoritative commit check: the endpoint waiter slot must already hold THIS receiver (the
     // Phase-C publish committed it before BlockedRecvState was stored). If it does not, the record is
     // not fully committed for this endpoint — do not acknowledge.
-    let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
-    let receiver_generation = kernel
-        .task_asid(receiver_tid)
-        .map(|a| a.0 as u32)
-        .unwrap_or(0);
+    let waiter = live_waiter(index);
+    let receiver_generation = receiver_asid.map(|a| a.0 as u32).unwrap_or(0);
     match waiter {
         Some(w) if w.tid.0 == receiver_tid && w.asid.0 as u32 == receiver_generation => {}
         _ => return,

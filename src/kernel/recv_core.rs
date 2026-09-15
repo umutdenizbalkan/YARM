@@ -602,6 +602,27 @@ pub enum RecvPlan {
     /// [`execute_user_asid_plain_v2_writeback`].  Meta-first copy ordering and
     /// all three failure modes proven equivalent to the full path (see §55).
     UserPlainV2Eligible,
+    /// U9-RECV-BLOCK1 §1(c) — **kernel-register payload WITH a recv-v2 metadata buffer**: the
+    /// message is taken and materialized, and the metadata write then faults.
+    ///
+    /// This used to be `FallbackRequired(RecvV2MetaUserCopy)`, refused BEFORE the dequeue on the
+    /// reasoning that "no user ASID exists to copy to". The reasoning is right and the
+    /// disposition was wrong: the canonical owner does not refuse either, it proceeds and faults,
+    /// and where it faults decides what the caller observes.
+    ///
+    /// `handle_ipc_recv_result_with_empty_error` computes
+    /// `recv_v2_meta_written = meta_ptr != 0 && meta_len >= 40` from the caller's arguments — it
+    /// never asks whether the receiver has an address space — encodes the struct, and calls
+    /// `copy_to_current_user`, which is `task_asid(tid).ok_or(KernelError::UserMemoryFault)`
+    /// (`user_memory_state.rs:325`) and maps to `SyscallError::PageFault`. By then the message is
+    /// CONSUMED and the transferred capability is MINTED, so the canonical outcome is a fault
+    /// *plus* the rollback that undoes the mint and clears the return lane — not a receive that
+    /// never happened.
+    ///
+    /// Refusing earlier would have moved the error ahead of the dequeue and turned a consumed
+    /// message into an unconsumed one. The plan therefore says "kernel register, and a metadata
+    /// write is owed", and the owner performs it and fails where the canonical owner fails.
+    KernelRegisterV2MetaFaults,
     /// The request requires the global-lock full path.
     FallbackRequired(FallbackReason),
 }
@@ -632,13 +653,19 @@ pub(crate) fn plan_recv_core(request: &RecvRequest) -> RecvPlan {
 
     match request.payload_target {
         RecvPayloadTarget::KernelRegister => {
-            // Kernel task: V2/V3 meta would require a user-copy for meta struct;
-            // no user ASID exists to copy to.
-            if matches!(
-                request.meta_target,
-                RecvMetaTarget::V2 { .. } | RecvMetaTarget::V3Future { .. }
-            ) {
+            // U9-RECV-BLOCK1 §1(c): a V2 metadata buffer on a kernel-register receive is owed a
+            // write that cannot succeed — but the canonical owner discovers that at the COPY,
+            // after the dequeue and the mint, and answers `PageFault` with a rollback. Saying so
+            // here keeps the failure where the canonical route puts it.
+            //
+            // `V3Future` keeps the fallback: it is a helper-only shape neither
+            // `from_legacy_ipc_recv` nor `from_ipc_recv_timeout` can produce, so it has no
+            // production outcome to match and inventing one would be inventing a population.
+            if matches!(request.meta_target, RecvMetaTarget::V3Future { .. }) {
                 return RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy);
+            }
+            if matches!(request.meta_target, RecvMetaTarget::V2 { .. }) {
+                return RecvPlan::KernelRegisterV2MetaFaults;
             }
             RecvPlan::KernelPlainEligible
         }

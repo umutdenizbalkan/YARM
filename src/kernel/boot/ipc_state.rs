@@ -8659,25 +8659,29 @@ pub(crate) fn ipc_try_recv_queued_admitted_locked(
             IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
         );
     }
-    if ipc.endpoint_waiter_present(endpoint_idx) {
-        return IpcEndpointRecvResult::Ineligible(
-            IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
-        );
-    }
-    match ipc.endpoints[endpoint_idx].as_ref() {
-        Some(storage) => {
-            if kernel_ref(storage).mode() != EndpointMode::Buffered {
-                return IpcEndpointRecvResult::Ineligible(
-                    IpcEndpointSplitRejectReason::NonBufferedEndpoint,
-                );
-            }
-        }
-        None => {
-            return IpcEndpointRecvResult::Ineligible(
-                IpcEndpointSplitRejectReason::EndpointMissing,
-            );
-        }
-    }
+    // U9-RECV-BLOCK1 §2 — the last two gates go, and neither had a canonical counterpart.
+    //
+    // **A parked RECEIVER is not a reason to refuse a dequeue.** The canonical take
+    // (`endpoint_take_with_refill_locked`, which the broad `ipc_recv` drives) never asks whether
+    // an endpoint has a receiver waiter — the waiter table governs PUBLICATION, not consumption,
+    // and its policy is canonical last-receiver-wins: `publish_recv_waiter_locked` DISPLACES an
+    // existing waiter through the explicit CLAIM(Teardown) → CANCEL → RETIRE transition rather
+    // than refusing. Refusing the take here was a split-only exclusivity rule that the broad
+    // route does not have, and inventing one is exactly what this settlement must not do.
+    //
+    // The state is reachable but narrow: a published waiter implies an EMPTY queue (publication
+    // itself refuses `QueueNonEmpty`), so the only case where this gate changed an answer is a
+    // parked receiver WITH a parked sender — where canonical delivers the sender's message
+    // directly to whoever asks, and the parked receiver stays parked. That is now what happens.
+    //
+    // **A non-buffered endpoint is not a receive-side distinction.** `Endpoint::recv` is
+    // mode-agnostic, and every mode-specific branch lives on the SEND side
+    // (`ipc_state.rs:7585/8123`); the canonical receive path reads no mode at all. So this gate
+    // also had no counterpart. It is not replaced by rendezvous support, because the population
+    // cannot be constructed: `create_endpoint` is `create_endpoint_with_mode(_, Buffered)` and
+    // every production caller uses it — the only `Synchronous` constructions in the tree are four
+    // call sites inside `#[cfg(test)] mod tests`, and no syscall creates an endpoint at all.
+    // `production_endpoints_are_buffered_only` re-derives that from source.
     match endpoint_take_with_refill_locked(ipc, endpoint_idx) {
         EndpointTakeOutcome::Took { msg, wake: None } => IpcEndpointRecvResult::Received(msg),
         EndpointTakeOutcome::Took {

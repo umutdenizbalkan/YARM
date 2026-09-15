@@ -107,6 +107,64 @@ pub struct PublishWaiterPlan {
     pub recv_cap: CapId,
 }
 
+/// U9-RECV-BLOCK1 §3 — the EXACT incarnation a blocking receive transaction owns.
+///
+/// Every field is minted by this transaction and by nothing else: `tid` is the authoritative
+/// requester the trap seam resolved, `asid` the address space it held when Phase A removed it,
+/// `priority` the placement Phase A's compare-and-clear returned, and `wait_generation` the
+/// freshly minted counter Phase B advanced. Carrying them together is what lets a compensation
+/// prove it is undoing ITS OWN block rather than writing over whatever currently answers to the
+/// same numeric TID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvBlockIdentity {
+    pub tid: u64,
+    pub asid: crate::kernel::vm::Asid,
+    pub priority: crate::kernel::scheduler::TaskPriority,
+    pub wait_generation: u64,
+}
+
+/// U9-RECV-BLOCK1 §3 — what an exact unwind actually achieved, which decides what the caller may
+/// do next.
+///
+/// The predecessor returned `bool`, and `false` was read as "fail closed" — an `Internal` error
+/// returned through a frame whose task might no longer be this CPU's current. The two failures
+/// are not the same and neither is fatal, so they are named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvUnwindOutcome {
+    /// Both halves reversed: the exact incarnation is this CPU's `current` again at the priority
+    /// it was removed with. The entering frame is its own, so the trap MAY return through it.
+    Restored,
+    /// The task is `Runnable` and on a run queue, but this CPU's current slot went to somebody
+    /// else. Nothing is lost — but the entering frame is no longer this task's to return through,
+    /// so the caller must answer with a queue advance instead.
+    RunnableElsewhere,
+    /// The TCB no longer matches `{tid, asid, wait_generation}`, or is no longer parked on this
+    /// receive. Another owner took the incarnation over and **nothing was written**. The caller
+    /// must not resume through the entering frame.
+    IncarnationMoved,
+}
+
+impl RecvUnwindOutcome {
+    /// May the trap return through the entering frame?
+    ///
+    /// The one question every post-clear settlement asks, so no call site re-derives it by
+    /// matching variants itself.
+    #[must_use]
+    pub const fn may_resume_entering_frame(self) -> bool {
+        matches!(self, Self::Restored)
+    }
+
+    /// Stable slug for markers.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Restored => "restored",
+            Self::RunnableElsewhere => "runnable_elsewhere",
+            Self::IncarnationMoved => "incarnation_moved",
+        }
+    }
+}
+
 /// D2 Phase 1 outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishWaiterOutcome {
