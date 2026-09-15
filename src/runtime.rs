@@ -16983,13 +16983,21 @@ mod tests {
             1,
             "the authoritative transaction has ONE definition; U3 reuses it"
         );
-        // U9-D3 §7 later retired the D6 proof cleanup tail too, so the ONE acquisition that
-        // remains in the file is the canonical broad Phase-2 trap dispatch — untouched here.
+        // U9-D3 §7 later retired the D6 proof cleanup tail too, taking the file to ONE
+        // acquisition: the canonical broad Phase-2 trap dispatch, untouched here.
+        //
+        // U9-RECV-BLOCK1 §6: 1 -> 2. The second is `drive_pending_x86_smp_unlock_audit`, a
+        // BOOT-ONLY acquisition that runs at most once per boot and restores a dependency
+        // closing the receive family exposed — `maybe_run_x86_smp_unlock_audit` had both of its
+        // call sites inside `handle_trap`'s BROAD arms, so it ran only on traps the split routes
+        // declined. It is also untouched by this retirement, and the branch this test is about
+        // is separately asserted above to contain no acquisition of any form.
         let code = u3_code_lines(TRAP_ENTRY);
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            1,
-            "trap_entry.rs drops from 3 to 2 with this retirement, then to 1 with U9-D3 §7"
+            2,
+            "trap_entry.rs drops from 3 to 2 with this retirement, to 1 with U9-D3 §7, then \
+             back to 2 with U9-RECV-BLOCK1 §6's boot-only SMP-unlock audit driver"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
         // U9-QA §2 made the one acquisition CONDITIONAL — a pre-lock route that published a
