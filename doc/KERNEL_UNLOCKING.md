@@ -18106,3 +18106,174 @@ both cases the first reading from source alone was wrong:
   `the_shared_region_mapping_loop_resolves_one_phys_per_page`.
 * **Init's mapping-run pressure**, unchanged from QUEUE1.
 * Next: NR 9, then non-syscall traps, then deletion of the terminal acquisitions.
+
+---
+
+## U9-RECV-BLOCK2 — closing the receive conversion
+
+BLOCK1 delivered a receive family whose recognized body could no longer answer `NotHandled`. What
+it had not finished was the *settlements* behind that type: several of them were shaped so that the
+narrow return type was the only thing making the claim true. This slice finishes them.
+
+### §1 — the take is the only observation
+
+The immediate-first ordering BLOCK1 introduced moved the queue-consumption window; it did not close
+it. The blocking lane still re-read the endpoint through `recv_would_block_split_read`, and that
+second observation is what the race is made of:
+
+> A issues a finite NR 5. Its immediate take finds nothing and A requests parking. B enqueues. The
+> blocking lane's read sees B's message and answers `ImmediateLaneOwns`. C consumes it. The re-run
+> immediate take finds nothing. The settlement encoded `WouldBlock` — the NON-BLOCKING error — into
+> a receive that had asked for a finite wait whose deadline had not elapsed.
+
+The canonical owner has no such read. `ipc_recv_with_optional_deadline` calls
+`ipc_recv_endpoint_take` and parks if and only if that take answered `Ok(None)`. **The take is the
+observation.**
+
+So the take's answer is carried outward. `RecvQueuedSplitPhaseA::Fallback` had two producers meaning
+opposite things — the planner refusing a SHAPE before any endpoint was resolved, and the
+authoritative rank-3 dequeue coming back empty — and it now carries
+`RecvSplitDecline::{ShapeNotServed, EmptyTake}`. Classifying from the take's own reject reason also
+exposed a second conflation: `map_queued_recv_outcome` answers `WouldBlock` for an empty queue AND
+for a missing endpoint, an out-of-range index and a full queue. The canonical take owner keeps those
+apart — `Ok(None)`, `Err(WrongObject)`, `Err(EndpointQueueFull)` — so Phase A now answers the last
+three as errors instead of declining. Parking on a destroyed endpoint is the bug that conflation
+permitted.
+
+The immediate lanes answer `RecvImmediateOutcome::{Answered, EmptyAwaitingPark, NoTakeAttempted}`.
+`EmptyAwaitingPark` — and only it — continues into the blocking lane. `recv_would_block_split_read`
+is gone from that lane with nothing in its place: a sender arriving after the empty take is caught
+where the canonical owner catches it, at the rank-3 waiter publication, whose `QueueNonEmpty`
+refusal unwinds the park and continues into the immediate owner. That is a PUBLICATION outcome
+rather than a pre-park guess, which is why removing the predicate reopens nothing.
+
+The post-wake empty take keeps its own answer, and it is a different fact: canonical phase 2 takes
+once after the wake and returns `Ok(None)` without re-parking and without waiting for the deadline,
+so `recv_encode_empty_answer` there is completion, not substitution.
+
+### §2 — selection and apply must ask the same question
+
+The receive route parks on a queue advance and ignores admission's `IncomingUnavailable`. The
+argument for that was that a candidate the convention cannot resume has the same consequence as no
+candidate at all. It does not follow, and the gap was fatal:
+
+* admission classifies the RAW PEEKED HEAD (`peek_next_runnable_on`);
+* the drain selects through `queue_advance_select_step_split`, a FILTERED dequeue, so it can land on
+  a task admission never looked at;
+* that filter asked whether the dispatch transition would be accepted and whether the ASID resolves
+  — neither of which is the question the APPLY asks.
+
+`x86_post_lock_resume_marked_incoming` calls
+`direct_dispatch_classify_and_consume_convention_split`, which IS
+`classify_incoming_resume_convention(.., ExactTokenResume)`. A `None` there is
+`X86ResumeRefusal::Context`, raised after the dequeue and after the mark with the scheduler already
+believing the task is running — leaving the shared D2 drain no move but `d2_resume_refused_fatal`.
+
+The repair is in the selection owner: the filter now asks the same classifier, read-only. A task it
+refuses stays in the queue rather than being dequeued and fataled, and a drain that finds no
+acceptable candidate settles through its existing typed idle. All five consumers of that owner apply
+through the exact-token resume, so that is the convention screened for.
+
+This narrowed 18 fixtures that modelled a queued, ASID-bound task with a zero continuation — a shape
+`spawn_user_task_from_image` never produces, since its publication installs a real entry pointer, a
+real stack pointer and `arg0 = tid`. `give_task_an_incarnation`, the helper created when this same
+filter last narrowed, now seeds the continuation too.
+
+### §3 — `Restored` is a claim about a running incarnation
+
+Three things have to hold before a trap may return to userspace through the entering frame, and each
+had its own failure.
+
+**Identity.** The recovery took a bare `u64`. A TID is a slot number the allocator reuses, so it
+could install a DIFFERENT address space as `current` and let the trap return through this trap's
+saved frame into it. Worse, `recv_block_phase_a_split` read the ASID AFTER its compare-and-clear —
+the one moment the TCB can be reclaimed — so every compensation keyed on `{tid, asid}` was
+authenticating against a possible replacement while believing it was exact. The read moves BEFORE
+the clear, while the task is still current and its TCB therefore unreclaimable.
+
+**Status.** `Restored` was reported for `status == Runnable`, which is a status saying no dispatcher
+has selected this task — while its caller returned to ring 3 through the task's frame, and
+`dispatch_transition_would_be_accepted` would still accept it for a second CPU to mark. The restore
+now COMMITS through the existing transition owner: `DispatchIncoming` (Runnable → Running) after the
+rank-2 reversal, `ContinueCurrent` (Running → Running) for the Phase-B-failure site whose TCB never
+got a rank-2 write.
+
+**The commit contract.** A rank-2 precheck followed by a bare-TID rank-1 write is not a contract,
+and reading it back afterwards only reports the damage. The placement is now provisional: rank 1
+puts the task back, ONE rank-2 acquisition authenticates the incarnation and applies the transition,
+and a refusal undoes the placement through `block_current_exact_on` — the same compare-and-clear
+Phase A used, so a scheduler that has moved on is untouched.
+
+**Distinct post-states.** `task_present_anywhere` consults a membership mirror that covers the run
+queues AND the current slots, so "queued, waiting for a dispatch" and "executing on another CPU
+right now" were the same `true` — and a settlement that idles this CPU on the second is wrong twice
+over: the task is not waiting for anything, and its saved context is live.
+`SmpScheduler::placement_of` answers them separately and `RecvUnwindOutcome` reports which:
+`Restored`, `QueuedRunnable`, `RunningElsewhere`, `Unpublished`, `IncarnationMoved`. The three
+questions a settlement asks became three predicates — `may_resume_entering_frame`,
+`may_capture_continuation`, `dispatcher_already_owns_task` — because membership alone answers none
+of them.
+
+The recovery no longer enqueues at all. Publication is what makes a task dispatchable, and the
+settlement owes its continuation capture first.
+
+### §4 — the settlement belongs to the bridge
+
+`recv_unsettleable_idle_terminal` was a `-> !` called from the syscall body, several frames below
+the `TrapPathWindow` value and below the frame the trap returns through. Everything the trap boundary
+owns was bypassed by that jump — window retirement (which `Drop` cannot perform on a path that never
+unwinds), the outgoing-context capture, and each port's own landing, two of which settle by
+RETURNING. x86_64's own contract says diverging from a drain "would be strictly worse: it would skip
+the depth clear and the attestation epilogue the tail performs, and it would add a second place that
+decides how this architecture idles"; RISC-V's landing is the typed `EnterKernelIdle` its bridge
+returns.
+
+So the route reports the two facts the bridge cannot re-derive — the exact entering incarnation and
+the recovery's verified outcome — as `SplitDispatchDisposition::RecvUnsettled`. The helper and
+`TrapPathWindow::retire_diverging_landing`, which existed only to serve it, are both removed.
+
+The four post-clear sites go through one settlement helper, which ENCODES this receive's canonical
+answer into the entering frame first — `WrongObject` for a refused publish, `WouldBlock` for a
+deadline reservation or an unwound race, `Internal` for a Phase B failure — and only then lets the
+outcome decide where that frame goes. `Complete(Err(e))` leaves encoding to the epilogue, which runs
+only on the returning path; a captured frame needs the answer already in it.
+
+Each bridge then, in this order and no other:
+
+1. **captures** the continuation, gated on `may_capture_continuation` — true only for `Unpublished`,
+   the one outcome in which nothing can dispatch the task, so a `QueuedRunnable` task's live context
+   and a `RunningElsewhere` winner's state are never overwritten;
+2. **publishes** strictly afterwards, because publishing first is what would let another CPU
+   dispatch the task and resume it from a context this trap had not finished writing;
+3. **lands** — x86_64 returns and the raw trap tail idles with its depth clear and attestation
+   epilogue intact; RISC-V returns the typed `EnterKernelIdle`; AArch64 keeps its established
+   non-returning idle terminal, after the window is retired.
+
+The PC/result convention is each port's own. `finalize_split_handled_syscall` advances AArch64's SVC
+and exports its lanes; it is a no-op on x86_64 (saved RIP already past the trap instruction) and on
+RISC-V (`sepc` pre-advanced by the bridge before `handle_trap_entry`). No arithmetic is introduced
+anywhere. What is preserved is a COMPLETED syscall, so the resumed task observes the answer rather
+than re-executing its receive.
+
+**`Unpublished` is not a successful idle.** Idling is licensed only when a dispatcher already owns
+the task or this bridge published it. Otherwise the task table says `Runnable` while the scheduler
+holds it nowhere, which is exactly `DISPATCH_TORN_FATAL … reason=scheduler_task_table_disagree`, and
+that established terminal is what it takes.
+
+### Qualification
+
+Hosted **5621 passed / 0 failed / 2 ignored** — the whole suite green, with the six previously
+deferred guards rederived rather than re-passed. Three ports build. Census target 7/7 at
+`with_cpu = 2` with no added broad acquisition; doc-fragmentation 7/7; extraction bridge 2/2. The
+established carve-out is unchanged at 8 pass / 2 fail
+(`required_chain_is_scoped_to_the_witnessed_transaction`,
+`required_marker_chain_is_ordered_and_complete`).
+
+The six guards, and what replaced what:
+
+| guard | pinned | now pins |
+|---|---|---|
+| four `empty_queue_falls_back` | an empty endpoint returns `None` to the broad dispatcher | the production parking precondition from the production engine, and only then the hosted landing's encoding |
+| `the_family_entry_declines_only_a_non_receive` | TWO hand-offs, the second counted and named | ONE, the NR filter's; the counter absent rather than unused; and the recognized body's type unable to name `NotHandled` |
+| `every_decline_after_the_reservation_clears_it` | three post-reservation hand-offs | zero, enforced by type; two pre-mutation `CannotPark` settlements; four post-clear exits through one helper |
+

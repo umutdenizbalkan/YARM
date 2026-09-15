@@ -179156,6 +179156,24 @@ mod u9_recv_block1_closure {
                 arm.contains("ipc_recv_unsettled"),
                 "{name}: and a task reachable by nothing takes the established fatal, not an idle"
             );
+            // U9-RECV-BLOCK2 §4 — and no landing at all is licensed while this CPU's slot holds a
+            // DIFFERENT task: returning would resume it with the entering task's register file,
+            // and idling would abandon it. Established-impossible, and checked rather than assumed
+            // because the landing cannot be undone.
+            assert!(
+                arm.contains("slot_clear"),
+                "{name}: the landing must verify this CPU's current slot is clear"
+            );
+            let fatal = arm
+                .find("IPC_RECV_SPLIT_UNSETTLED_FATAL")
+                .unwrap_or_else(|| panic!("{name}: the fatal"));
+            let slot_read = arm
+                .find("let slot = shared.current_tid_split_read(cpu);")
+                .unwrap_or_else(|| panic!("{name}: the slot read"));
+            assert!(
+                slot_read < fatal,
+                "{name}: and it must read the slot BEFORE deciding the landing"
+            );
         }
     }
 

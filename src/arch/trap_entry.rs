@@ -944,13 +944,30 @@ pub fn handle_trap_entry_shared(
                 // `Unpublished` task whose capture or publication FAILED is reachable by nothing,
                 // and idling on it strands it forever — so that is the established fatal
                 // terminal, not an idle.
-                let settled = outcome.dispatcher_already_owns_task() || published;
+                // THIS CPU'S SLOT MUST BE CLEAR before any landing is licensed.
+                //
+                // Phase A cleared it and the recovery could not put the entering incarnation back,
+                // so `None` is the state every reachable outcome leaves. A DIFFERENT task in the
+                // slot would mean this CPU is running something whose frame is not the live one —
+                // returning would resume it with the entering task's register file, and idling
+                // would abandon it. Established-impossible (installing a current on a CPU requires
+                // running on that CPU, and this trap is what is running on it), and checked rather
+                // than assumed because the landing below cannot be undone.
+                let slot = shared.current_tid_split_read(cpu);
+                let slot_clear = slot.is_none_or(|t| t == entering_incarnation.tid);
+                let settled = (outcome.dispatcher_already_owns_task() || published) && slot_clear;
                 if !settled {
                     crate::yarm_log!(
-                        "IPC_RECV_SPLIT_UNSETTLED_FATAL cpu={} tid={} outcome={} reason=task_reachable_by_nothing",
+                        "IPC_RECV_SPLIT_UNSETTLED_FATAL cpu={} tid={} outcome={} slot={:?} reason={}",
                         cpu.0,
                         entering_incarnation.tid,
-                        outcome.slug()
+                        outcome.slug(),
+                        slot,
+                        if slot_clear {
+                            "task_reachable_by_nothing"
+                        } else {
+                            "current_slot_holds_another_task"
+                        }
                     );
                     // U9-DISPATCH-CPU1 D2: retire before the non-returning transfer.
                     trap_path.retire();

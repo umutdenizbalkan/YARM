@@ -1159,12 +1159,25 @@ pub fn handle_riscv_trap_entry_shared(
             // `Unpublished` task whose capture or publication failed is reachable by nothing, and
             // this port's own contract for that state is the canonical error path, never a silent
             // idle — the same rule `RISCV_BLOCKED_IDLE_NO_PROVENANCE` enforces one level down.
-            if !(outcome.dispatcher_already_owns_task() || published) {
+            // THIS CPU'S SLOT MUST BE CLEAR before the typed idle is licensed — the same check
+            // the shared bridge makes, and the same one this port's own idle arm enforces one
+            // level down as `RISCV_TYPED_IDLE_INVARIANT_VIOLATION`. Making it here names the
+            // settlement that produced the state rather than reporting it as an anonymous
+            // invariant break.
+            let slot = shared.current_tid_split_read(cpu);
+            let slot_clear = matches!(slot, None | Some(0)) || slot == Some(entering.tid);
+            if !(outcome.dispatcher_already_owns_task() || published) || !slot_clear {
                 crate::yarm_log!(
-                    "IPC_RECV_SPLIT_UNSETTLED_FATAL cpu={} tid={} outcome={} reason=task_reachable_by_nothing",
+                    "IPC_RECV_SPLIT_UNSETTLED_FATAL cpu={} tid={} outcome={} slot={:?} reason={}",
                     cpu.0,
                     entering.tid,
-                    outcome.slug()
+                    outcome.slug(),
+                    slot,
+                    if slot_clear {
+                        "task_reachable_by_nothing"
+                    } else {
+                        "current_slot_holds_another_task"
+                    }
                 );
                 // The ESTABLISHED architecture-neutral terminal for exactly this class of
                 // state — `DISPATCH_TORN_FATAL … reason=scheduler_task_table_disagree` — and that
