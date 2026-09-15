@@ -369,7 +369,7 @@ impl KernelState {
     /// scheduler admission lands, the graduated seams run single-CPU-eligible on the BSP and
     /// the SMP in-lock path never engages (there is no live 2nd scheduler CPU to race). This
     /// audit names that blocker honestly rather than faking SMP success.
-    pub(crate) fn maybe_run_x86_smp_unlock_audit(&mut self) {
+    pub fn maybe_run_x86_smp_unlock_audit(&mut self) {
         if !cfg!(target_arch = "x86_64") {
             return; // AArch64/RISC-V SMP-live is Stage 184, not this stage.
         }

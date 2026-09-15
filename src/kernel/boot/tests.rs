@@ -55877,12 +55877,12 @@ mod stage169_d2_send_genuine {
         // closing the receive family exposed: `maybe_run_x86_smp_unlock_audit` — which clears an
         // AP's wake-only bit and drives `live_ap_user_dispatch` -> `build_ap_workload` — had both
         // of its call sites inside `handle_trap`'s BROAD arms, so it ran only on traps the split
-        // routes declined. It is not the terminal dispatcher and it is not a receive-family
-        // acquisition; the assertion below pins that the file holds those two and nothing else.
+        // routes declined. §3 then drove the same one-shot body from `run_scheduler_loop`, so the
+        // acquisition is gone and the file is back to its single terminal dispatcher.
         assert_eq!(
             src.matches(".with_cpu(").count(),
-            2,
-            "trap_entry.rs retains the terminal dispatcher and the boot-only SMP-unlock audit"
+            1,
+            "trap_entry.rs retains exactly one broad acquisition — the terminal dispatcher"
         );
         assert!(
             src.contains("FUTEX_WAIT_DISPATCH_COUNT"),
@@ -102482,11 +102482,11 @@ mod stage200d0c1_aarch64_exit_prep {
         // acquisition; the assertion below pins that the file holds those two and nothing else.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            2,
-            "trap_entry.rs is at 2 with_cpu callsites: this retirement took it 4 -> 3, the U3 \
+            1,
+            "trap_entry.rs is at 1 with_cpu callsite: this retirement took it 4 -> 3, the U3 \
              AArch64 FutexWait no-incoming idle retirement took it 3 -> 2, U9-D3 §7 retired the \
-             D6 functional broad tail to take it 2 -> 1, and U9-RECV-BLOCK1 §6 added the \
-             boot-only SMP-unlock audit driver, 1 -> 2"
+             D6 functional broad tail to take it 2 -> 1, and U9-RECV-BLOCK2 §3 returned it to 1 \
+             after §6 had briefly taken it to 2"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
     }
@@ -126480,8 +126480,8 @@ mod u3_d6_first_resume_bind_transaction {
         // acquisition; the assertion below pins that the file holds those two and nothing else.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            2,
-            "trap_entry.rs holds the terminal dispatcher and the boot-only SMP-unlock audit"
+            1,
+            "trap_entry.rs holds one acquisition — the terminal dispatcher"
         );
         assert!(
             !code.contains("fn post_switch_restore_broad_tail("),
@@ -143041,12 +143041,13 @@ mod u9_production_post_switch_restore {
         // of its call sites inside `handle_trap`'s BROAD arms, so it ran only on traps the split
         // routes declined. It is not the terminal dispatcher and it is not a receive-family
         // acquisition; the assertion below pins that the file holds those two and nothing else.
-        assert_eq!(code.matches(".with_cpu(").count(), 2);
+        assert_eq!(code.matches(".with_cpu(").count(), 1);
         assert_eq!(
             code.matches("fn drive_pending_x86_smp_unlock_audit(")
                 .count(),
-            1,
-            "and the second acquisition is that one boot-only driver, defined exactly once"
+            0,
+            "U9-RECV-BLOCK2 §3 retired that driver; the SMP-unlock audit runs from the boot \
+             ownership point, which already owns `&mut KernelState`"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
         assert_eq!(code.matches("state.lock()").count(), 0);
@@ -143363,10 +143364,7 @@ mod u9d3_d6_cleanup_split {
     /// only the terminal broad dispatcher, and nothing gained a broad acquisition to compensate.
     #[test]
     fn u9d3_the_cleanup_retirement_relocates_no_acquisition() {
-        // U9-RECV-BLOCK1 §6: 1 -> 2 (the boot-only SMP-unlock audit driver). The claim this
-        // test is about is unchanged and is asserted below: the D6 cleanup retirement RELOCATED
-        // no acquisition into the three files that must stay at zero.
-        assert_eq!(code_of(TRAP_ENTRY).matches(".with_cpu(").count(), 2);
+        assert_eq!(code_of(TRAP_ENTRY).matches(".with_cpu(").count(), 1);
         for (name, src) in [
             ("thread_state.rs", THREAD_STATE),
             ("exec_state.rs", EXEC_STATE),

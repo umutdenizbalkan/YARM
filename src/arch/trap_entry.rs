@@ -856,23 +856,6 @@ pub fn handle_trap_entry_shared(
             // "current" lookup would find afterwards — a direct NR6/NR7 transaction wakes and
             // enqueues another task, so that lookup is not a safe question to ask after it.
             let entering = split_return_identity(shared, cpu);
-            // U9-RECV-BLOCK1 §6 — the one-shot SMP-unlock audit, driven BEFORE the split dispatch
-            // decides whether the broad arm will run at all.
-            //
-            // The audit clears an AP's wake-only bit and drives `live_ap_user_dispatch` →
-            // `build_ap_workload`, and both of its call sites are inside `handle_trap`'s broad
-            // syscall and timer arms. That made it depend on some syscall class always falling
-            // through — an incidental dependency, not a designed one. Closing the receive family
-            // removed the traffic it rested on: on the x86_64 SMP oracle profile the 114 blocking
-            // NR 2 receives per boot that used to yield now commit a queue advance pre-lock, the
-            // audit stopped being reached, and CPU 1 never received a workload.
-            //
-            // Placed here, ahead of the dispatch, so it is reached whichever route services this
-            // trap. Every gate the audit applies is re-checked off-lock inside, including its own
-            // one-shot latch, so this is one broad acquisition on the first trap that can claim
-            // the run and a single atomic load for the rest of the boot.
-            #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-            drive_pending_x86_smp_unlock_audit(shared, cpu);
             let disposition =
                 crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame);
             // U9-QA §2: the COMMITTED disposition. The split route published a terminal
@@ -2913,57 +2896,39 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
 #[cfg(not(target_arch = "aarch64"))]
 fn pre_split_import_syscall_abi(_frame: &mut TrapFrame) {}
 
-/// U9-RECV-BLOCK1 §6 — drive the one-shot x86_64 SMP-unlock audit when the trap that would have
-/// carried it is serviced pre-lock instead.
+/// U9-RECV-BLOCK2 §2 — the receive family's UNSETTLEABLE terminal.
 ///
-/// # The dependency this repairs
+/// Reached only when this CPU's `current` was cleared by Phase A and BOTH exact rank-1 recoveries
+/// refused: `restore_exact_current_on` (which needs the slot empty and the task unqueued) and
+/// `on_preempt_prefer_on_cpu_split` (which pulls the task back out of the run queue). The
+/// composite requires `current.is_some()` on this CPU, and installing a current on a CPU requires
+/// running on that CPU — which this trap is what is doing. So the state is established-impossible.
 ///
-/// `maybe_run_x86_smp_unlock_audit` is what clears an AP's wake-only bit and then drives
-/// `live_ap_user_dispatch` → `build_ap_workload`. Both of its call sites are inside
-/// `KernelState::handle_trap` — the BROAD syscall and timer arms — so it ran only on traps the
-/// split routes declined. That was never a designed dependency; it held because some syscall
-/// class always fell through. U9-RECV-BLOCK1 closed the receive family, and on the x86_64 SMP
-/// oracle profile that is 114 blocking NR 2 receives per boot which used to yield to the broad arm
-/// and now commit a queue advance pre-lock. The audit stopped being reached, CPU 1 never received
-/// a workload, and the AP recv-v2 witness went from `blocked_commits=1 ack_publications=1
-/// result=ok` to CPU 1 idling forever.
-///
-/// # Why this is ONE broad acquisition per boot, not one per trap
-///
-/// Every gate the audit itself applies is re-checked HERE, off-lock, first:
-///
-/// * its one-shot latch, read lock-free — once the audit claims its run this returns immediately
-///   and for the rest of the boot the whole function is a single atomic load;
-/// * `present > 1`, through the topology split read — an `-smp 1` boot never acquires at all;
-/// * a real user task current, through the authoritative split read — the audit's own `tid != 0`
-///   gate, which is why it must run from a trap rather than from bootstrap;
-/// * the graduated proof's completion flag, a lock-free global.
-///
-/// So the acquisition happens on the first trap where the audit would actually claim its run, and
-/// never again. It lives HERE rather than on `SharedKernel` deliberately: `src/runtime.rs` has no
-/// production broad acquisition and the census publishes that, while this file already owns a
-/// terminal dispatcher acquisition. This is a boot-provisioning step the broad path used to carry,
-/// not a receive-family acquisition, and it is conditional on no oracle.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn drive_pending_x86_smp_unlock_audit(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
-    if crate::kernel::boot::x86_smp_unlock_audit_claimed() {
-        return;
-    }
-    if shared.present_cpu_count_split_read() <= 1 {
-        return;
-    }
-    if !crate::kernel::boot::unlock_graduated_proof_completed() {
-        return;
-    }
-    match shared.current_tid_authoritative(cpu) {
-        Some(tid) if tid != 0 => {}
-        _ => return,
-    }
+/// It diverges rather than returning, for the reason the D2 drain states for its homologous case:
+/// the caller is no longer this CPU's current, so returning through the entering frame would
+/// resume a task the scheduler has parked, through a frame that is no longer its own. The caller
+/// enqueues the task before calling this, so nothing is lost — the idle is WAKE-CAPABLE on all
+/// three architectures (`sti; hlt`, `wfi`, `wfi`), so the next timer tick or IPI dispatches it.
+#[cfg(not(feature = "hosted-dev"))]
+pub(crate) fn recv_unsettleable_idle_terminal(cpu: CpuId, tid: u64, enqueued: bool) -> ! {
     crate::yarm_log!(
-        "X86_SMP_UNLOCK_AUDIT_DRIVEN_PRELOCK cpu={} reason=split_handled_trap",
-        cpu.0
+        "IPC_RECV_SPLIT_UNSETTLEABLE cpu={} tid={} enqueued={} reason=current_cleared_and_unrestorable result=idle",
+        cpu.0,
+        tid,
+        u8::from(enqueued)
     );
-    let _ = shared.with_cpu(cpu, |kernel| kernel.maybe_run_x86_smp_unlock_audit());
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::arch::x86_64::descriptor_tables::idle_halt_loop()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::aarch64::trap::idle_no_eret_loop()
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::arch::riscv64::boot::riscv_trap_halt("ipc_recv_split_unsettleable")
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

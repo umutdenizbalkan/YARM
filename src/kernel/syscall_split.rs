@@ -1648,53 +1648,83 @@ fn try_split_ipc_send_into_frame(
     SplitDispatchDisposition::NotHandled
 }
 
+/// U9-RECV-BLOCK2 §1 — what the BLOCKING lane answers, as a type rather than as a disposition
+/// that has to be re-interpreted by its caller.
+///
+/// The lane used to answer `SplitDispatchDisposition`, whose `NotHandled` meant three unrelated
+/// things at once — "the immediate lane owns this state", "this CPU cannot park anything right
+/// now", and "not a receive at all" — and the family entry could not tell them apart, so it
+/// translated all three into the same terminal broad hand-off. Naming them is what makes each one
+/// settleable.
+#[cfg(not(feature = "hosted-dev"))]
+enum BlockingLaneOutcome {
+    /// The lane answered the trap.
+    Settled(SplitRecvDisposition),
+    /// The IMMEDIATE lane owns this state. Either a message is available (so there is nothing to
+    /// park for), or the request is NR 5's non-blocking probe, or the capability/endpoint answer
+    /// is the immediate lane's to raise. This is internal lane continuation, never a hand-off.
+    ImmediateLaneOwns,
+    /// A precondition for parking on THIS CPU did not hold, for a reason that is not about the
+    /// message. Each variant carries its own established-impossibility argument; see
+    /// [`settle_cannot_park`].
+    CannotPark(CannotParkReason),
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+impl BlockingLaneOutcome {
+    /// The lane answered the trap with a completed syscall. A constructor rather than a wrapped
+    /// literal so the lane's own `return` sites read as they did before the type was introduced.
+    fn complete(result: Result<(), TrapHandleError>) -> Self {
+        Self::Settled(SplitRecvDisposition::Complete(result))
+    }
+}
+
+/// U9-RECV-BLOCK2 §1 — the reasons a parking receive cannot be committed on this CPU.
+///
+/// Every one of these is proven unreachable from an authority-bearing receive inside a live trap
+/// window; the proofs live on [`settle_cannot_park`]. They are kept as distinct variants rather
+/// than collapsed so that a marker names WHICH invariant broke if one ever does.
+#[cfg(not(feature = "hosted-dev"))]
+#[derive(Clone, Copy, Debug)]
+enum CannotParkReason {
+    /// This CPU's receive deferral was already taken when the lane checked it.
+    AlreadyDeferred,
+    /// …or was taken between that check and the reservation.
+    DeferUnavailable,
+    /// The queue-advance admission refused, for a refusal that is not `IncomingUnavailable`
+    /// (which this family treats as "nothing resumable here", the same as no candidate at all).
+    AdmissionRefused(crate::kernel::boot::QueueAdvanceRefusal),
+    /// Phase A's compare-and-clear found a different task current than the one this trap decoded.
+    PhaseAVictimChanged,
+}
+
 /// U9-RECV-FINAL §1 — **THE receive family entry**, and the only thing it decides.
 ///
 /// It answers one question: is this trap an `IpcRecv` or an `IpcRecvTimeout`? A `NotHandled` from
 /// here is not a fall-through — it is a different syscall, for which this route has no opinion.
 /// Everything a RECOGNIZED receive can produce is settled by the body below, whose return type
 /// cannot express "hand this to the broad dispatcher".
-///
-/// The family used to have TWO entry points. The blocking lane sat at the switching position and
-/// could decline for eighteen distinct reasons; the immediate lane sat in the NON-SWITCHING
-/// whitelist — whose contract is that every class on it may be early-returned through the
-/// caller's own frame, which is false of a receive that parks — and declined through an `Option`.
-/// Each decline, in both, was a recognized receive reaching the terminal broad acquisition.
 fn try_split_ipc_recv_family_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
     authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
-    let Ok(syscall @ (Syscall::IpcRecv | Syscall::IpcRecvTimeout)) =
-        Syscall::decode(frame.syscall_num())
+    let Ok(Syscall::IpcRecv | Syscall::IpcRecvTimeout) = Syscall::decode(frame.syscall_num())
     else {
+        // U9-RECV-BLOCK2 §1 — THE ONLY `NotHandled` the receive family can produce, and it is not
+        // a fall-through: this trap is a different syscall, about which this route has no opinion.
+        //
+        // The family used to have a second one. `try_split_recv_recognized` returned an `Option`
+        // whose `None` arm landed here and was counted as a terminal broad entry — so a
+        // RECOGNIZED receive that no lane had settled left the family through the same door as a
+        // syscall that was never ours. That door is gone: the recognized body now returns a
+        // `SplitRecvDisposition`, a type with no representation for "hand this to the broad
+        // dispatcher", and every outcome it can reach is settled. The narrow type is the final
+        // enforcement; the settlements are the work.
         return SplitDispatchDisposition::NotHandled;
     };
-    match try_split_recv_recognized(shared, cpu, frame, authority) {
-        Some(settled) => settled.into_dispatch(),
-        // U9-RECV-FINAL §1 — THE terminal-entry measurement for the receive family, once per
-        // trap and in exactly one place, so a claim about `broad_entries` means what it says.
-        //
-        // This package does NOT close the family, and the type reflects that honestly rather
-        // than hiding it: the classes still listed in `RecvResidualClass` have no pre-lock owner
-        // yet, and each one that takes this door is counted and named. What changed is that a
-        // decline from a lane that DOES have an owner no longer arrives here — it reaches the
-        // next lane — and that the two admission escapes are settled rather than handed over.
-        None => {
-            crate::kernel::boot::note_recv_broad_entry();
-            crate::yarm_log!(
-                "IPC_RECV_SPLIT_UNROUTED cpu={} nr={} result=broad_entry",
-                cpu.0,
-                if matches!(syscall, Syscall::IpcRecv) {
-                    2
-                } else {
-                    5
-                }
-            );
-            SplitDispatchDisposition::NotHandled
-        }
-    }
+    try_split_recv_recognized(shared, cpu, frame, authority).into_dispatch()
 }
 
 /// U9-RECV-FINAL §1/§2 — a RECOGNIZED receive, and the order its lanes are consulted in.
@@ -1726,7 +1756,7 @@ fn try_split_recv_recognized(
     cpu: CpuId,
     frame: &mut TrapFrame,
     authority: crate::runtime::DispatchAuthority,
-) -> Option<SplitRecvDisposition> {
+) -> SplitRecvDisposition {
     use crate::kernel::syscall::SyscallError;
     use SplitRecvDisposition as D;
 
@@ -1736,73 +1766,187 @@ fn try_split_recv_recognized(
             "IPC_RECV_SPLIT_INVARIANT cpu={} reason=cpu_out_of_range result=failed_closed",
             cpu.0
         );
-        return Some(D::Complete(Err(TrapHandleError::Syscall(
-            SyscallError::WrongObject,
-        ))));
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)));
     }
     let Some(tid) = shared.current_tid_authoritative(cpu) else {
         crate::yarm_log!(
             "IPC_RECV_SPLIT_REFUSED cpu={} reason=no_current_task err=InvalidCapability",
             cpu.0
         );
-        return Some(D::Complete(Err(TrapHandleError::Syscall(
+        return D::Complete(Err(TrapHandleError::Syscall(
             SyscallError::InvalidCapability,
-        ))));
+        )));
     };
 
-    // (3) The BLOCKING lane. It declines whenever a message is already waiting.
+    // (3) The IMMEDIATE lane, FIRST — the canonical order, and the reason the queue-consumption
+    // race no longer exists.
     //
-    // This is the one half of the family that cannot exist on the hosted profile: it parks a
-    // task and publishes into a queue-advance drain no hosted build runs. The IMMEDIATE lane
-    // below is production code the hosted cases drive directly, so it stays compiled — removing
-    // it from this entry is what would break them, not the profile gate.
-    // U9-RECV-BLOCK1 §5 — the two facts the entry ALREADY settled are passed down rather than
-    // re-read. They were re-read in the lane, and each re-read carried its own `NotHandled` arm:
-    // two hand-off shapes for conditions this entry has just answered with a canonical error, so
-    // neither could fire and both widened the escape surface for a reader to trip over. `current`
-    // on a CPU can only be changed by code running on that CPU, and this trap is what is running
-    // on it, so the value is stable across the call.
+    // This entry used to consult the BLOCKING lane first, on the reasoning that the two are
+    // disjoint: the blocking lane refuses `would_not_block` the moment a message is waiting, and
+    // the immediate lane serves exactly that state. They are disjoint at any INSTANT, and that is
+    // not the same as being disjoint across two separate observations. The interleaving:
+    //
+    //   A issues a finite NR 5. The blocking lane's rank-3 would-block read sees a queued
+    //   message and refuses `would_not_block`. B consumes that message. A's immediate lane now
+    //   finds the endpoint empty and declines, because an empty endpoint under a finite timeout
+    //   belongs to the blocking owner. Neither lane served it, and the receive fell out of the
+    //   family — which is precisely what the terminal broad hand-off was catching.
+    //
+    // The canonical handler has no such window: `ipc_recv_with_optional_deadline` TRIES THE TAKE,
+    // and parks only if the take came back empty. The take is the observation. Running the
+    // immediate lane first reproduces that order exactly, so "saw a message" and "took the
+    // message" are one step rather than two, and a sender that arrives after an empty take is
+    // caught where the canonical owner catches it — at the rank-3 publish, whose `QueueNonEmpty`
+    // race already continues into this same immediate owner.
+    if let Some(result) = try_split_recv_immediate_lane(shared, cpu, frame) {
+        return D::Complete(result);
+    }
+
+    // (4) The BLOCKING lane. The endpoint was empty at the take above, which is the canonical
+    // precondition for parking.
+    //
+    // This is the one half of the family that cannot exist on the hosted profile: it parks a task
+    // and publishes into a queue-advance drain no hosted build runs. The IMMEDIATE lane above is
+    // production code the hosted cases drive directly, so it stays compiled.
     #[cfg(not(feature = "hosted-dev"))]
     match try_split_blocking_ipc_recv_into_frame(shared, cpu, cpu_idx, tid, frame, authority) {
-        SplitDispatchDisposition::NotHandled => {}
-        SplitDispatchDisposition::Complete(result) => return Some(D::Complete(result)),
-        SplitDispatchDisposition::QueueAdvanceCommitted => {
-            return Some(D::QueueAdvanceCommitted);
+        BlockingLaneOutcome::Settled(settled) => settled,
+        // The immediate lane already ran and declined. Reaching here means the blocking lane
+        // disagrees with it about who owns this state — the take found nothing while the lane
+        // found a message, or the lane refused a shape the take had already answered. Both are
+        // the same fact from two angles, and the immediate owner is the one that settles it.
+        BlockingLaneOutcome::ImmediateLaneOwns => {
+            settle_recv_immediate_owns_after_empty_take(shared, cpu, frame)
         }
-        SplitDispatchDisposition::PostWorkCommitted { finalize_syscall } => {
-            return Some(D::PostWorkCommitted { finalize_syscall });
+        BlockingLaneOutcome::CannotPark(reason) => {
+            settle_cannot_park(shared, cpu, tid, frame, reason)
         }
     }
+    #[cfg(feature = "hosted-dev")]
+    {
+        let _ = (tid, authority);
+        settle_recv_immediate_owns_after_empty_take(shared, cpu, frame)
+    }
+}
 
-    // (4) The IMMEDIATE lanes, one per syscall, because the two decode DIFFERENT argument
-    // slots. NR 5 carries its timeout in arg 3 — the slot NR 2 uses for its recv-v2 metadata
-    // pointer — so each builds its own `RecvRequest` and both drive the same delivery engine.
-    // Neither rewrites the frame's syscall number into the other's.
+/// U9-RECV-BLOCK2 §1 — the immediate lanes, one per syscall, behind one call.
+///
+/// The two decode DIFFERENT argument slots — NR 5 carries its timeout in arg 3, the slot NR 2 uses
+/// for its recv-v2 metadata pointer — so each builds its own `RecvRequest` from its own ABI and
+/// both drive the same delivery engine. Neither rewrites the frame's syscall number into the
+/// other's. `None` means the endpoint had nothing to take AND the request asked to wait.
+fn try_split_recv_immediate_lane(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
     match Syscall::decode(frame.syscall_num()) {
-        Ok(Syscall::IpcRecv) => {
-            if let Some(result) = try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame) {
-                return Some(D::Complete(result));
-            }
-        }
+        Ok(Syscall::IpcRecv) => try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame),
+        // EVERY NR 5, not only the non-blocking probe: a probe is answered here outright, and a
+        // TIMED receive whose message is already queued is served by the same engine, because the
+        // canonical handler also tries the immediate engine before it looks at `request.blocking`.
+        // An empty endpoint under a finite timeout is declined, never converted into `WouldBlock`.
         Ok(Syscall::IpcRecvTimeout) => {
-            // EVERY NR 5, not only the non-blocking probe. The blocking lane above refuses a
-            // probe by name (`reason=not_timed_recv`) because a probe never parks, and it
-            // refuses a TIMED receive with `reason=would_not_block` the moment a message is
-            // already waiting — which is exactly the case this lane serves. U9-RECV-QUEUE1 §2
-            // widened it to finite timeouts for that reason: the canonical handler also tries
-            // the immediate engine before it looks at `request.blocking`, because a message that
-            // is already queued makes the deadline irrelevant. An empty endpoint under a finite
-            // timeout is declined back here, never converted into `WouldBlock`.
-            if let Some(result) = shared.try_split_ipc_recv_timeout_immediate_into_frame(cpu, frame)
-            {
-                return Some(D::Complete(result));
-            }
+            shared.try_split_ipc_recv_timeout_immediate_into_frame(cpu, frame)
         }
-        _ => {}
+        _ => None,
     }
+}
 
-    // (5) Not yet owned pre-lock. Named and counted by the entry above.
-    None
+/// U9-RECV-BLOCK2 §1 — the blocking lane says the immediate lane owns this state, but the
+/// immediate lane has already run and declined.
+///
+/// The two disagree about one fact: whether the endpoint has something to take. The immediate
+/// lane's answer is the authoritative one, because it answered by ATTEMPTING the take rather than
+/// by reading a structural predicate — so re-running it is what resolves the disagreement, and a
+/// second empty answer means the state really is empty.
+///
+/// A second decline can only come from a shape whose owner is not this route at all: NR 5's probe
+/// (already answered by the immediate lane, so it cannot reach here), a capability the resolver
+/// rejects (answered as an error, likewise), or the `hosted-dev` profile where no blocking lane is
+/// compiled. On the hosted profile an empty endpoint with a request that asked to wait has no
+/// parking owner at all, and the canonical empty answer is what that build's own callers expect.
+fn settle_recv_immediate_owns_after_empty_take(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitRecvDisposition {
+    if let Some(result) = try_split_recv_immediate_lane(shared, cpu, frame) {
+        return SplitRecvDisposition::Complete(result);
+    }
+    crate::yarm_log!(
+        "IPC_RECV_SPLIT_SETTLED cpu={} reason=empty_no_parking_owner",
+        cpu.0
+    );
+    SplitRecvDisposition::Complete(recv_encode_empty_answer(
+        frame,
+        crate::kernel::syscall::SyscallError::WouldBlock,
+    ))
+}
+
+/// U9-RECV-BLOCK2 §1 — settle a receive that must park but whose CPU could not commit the park.
+///
+/// # Every reason here is PRE-MUTATION, and every one is established-impossible
+///
+/// All four are decided before Phase A clears `current`, or by a Phase A compare-and-clear that
+/// refused without touching the slot. The caller is therefore still this CPU's current task and
+/// the entering frame is still its own, so answering through that frame loses nothing and parks
+/// nothing — this is a fail-closed answer, not a settlement that has to account for a cleared
+/// current. §2 governs the post-clear paths; none of them arrive here.
+///
+/// The impossibility argument, per reason, from the executed bodies:
+///
+/// * **`AlreadyDeferred` / `DeferUnavailable`.** The D2-recv deferral is per CPU. This route is
+///   the only producer, it reserves at step (7), and every decline after that point clears it
+///   before returning — `every_decline_after_the_reservation_clears_it` pins that. Traps do not
+///   nest on any of the three architectures, so no second reservation can exist on this CPU while
+///   this trap is running.
+/// * **`AdmissionRefused`.** `IncomingUnavailable` never reaches here — the lane treats it as
+///   "nothing resumable on this CPU", which is what it means for a parking receiver.
+///   `ArchUnsupported` and `StashOccupied` are scoped to `StashedKernelSwitch` and this caller
+///   passes `ExactTokenResume`. `MultiCpu` and `CpuNotAuthoritative` are the AMBIENT contract,
+///   scoped by U9-RECV-BLOCK1 §4 to callers holding no authority. `NoTrapDrainer` and
+///   `OutgoingIdentityStale` are both refuted by `TrapPathWindow::establish`: it sets
+///   `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` and opens the dispatch window that minted this
+///   authority, in that order, and only its `Drop` clears either. While a live authority exists,
+///   the drainer flag is set and the epoch matches.
+/// * **`PhaseAVictimChanged`.** `tid` was read by `current_tid_authoritative(cpu)` in this same
+///   trap. Installing a current on a CPU requires running on that CPU, and this trap is what is
+///   running on it, so the slot cannot have changed underneath.
+///
+/// # Why fail-closed rather than divergent
+///
+/// Divergence is licensed for an established impossibility, but it is not required, and it is the
+/// worse choice when the alternative loses nothing. The task is current, runnable and resumable;
+/// answering `Internal` through its own frame reports the broken invariant to the caller and to
+/// the log without taking the machine down over a condition no production path can construct.
+/// What is NOT available is handing the trap to the broad dispatcher: that would be the escape
+/// this slice exists to remove, wearing a different name.
+#[cfg(not(feature = "hosted-dev"))]
+fn settle_cannot_park(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    tid: u64,
+    frame: &mut TrapFrame,
+    reason: CannotParkReason,
+) -> SplitRecvDisposition {
+    let _ = (shared, frame);
+    let slug = match reason {
+        CannotParkReason::AlreadyDeferred => "already_deferred",
+        CannotParkReason::DeferUnavailable => "defer_unavailable",
+        CannotParkReason::AdmissionRefused(_) => "admission_refused",
+        CannotParkReason::PhaseAVictimChanged => "phase_a_victim_changed",
+    };
+    crate::yarm_log!(
+        "IPC_RECV_SPLIT_INVARIANT cpu={} tid={} reason={} detail={:?} result=failed_closed",
+        cpu.0,
+        tid,
+        slug,
+        reason
+    );
+    SplitRecvDisposition::Complete(Err(TrapHandleError::Syscall(
+        crate::kernel::syscall::SyscallError::Internal,
+    )))
 }
 
 /// U9-RECV-BLOCK1 §3 — THE empty-result encoding for a receive that settles without a message.
@@ -1872,7 +2016,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     tid: u64,
     frame: &mut TrapFrame,
     authority: crate::runtime::DispatchAuthority,
-) -> SplitDispatchDisposition {
+) -> BlockingLaneOutcome {
     use crate::kernel::capabilities::{CapId, CapObject};
     use crate::kernel::recv_core::{RecvBlockingPolicy, RecvMetaTarget, RecvRequest};
     use crate::kernel::syscall::{
@@ -1880,7 +2024,9 @@ fn try_split_blocking_ipc_recv_into_frame(
         SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP,
     };
     use crate::kernel::task::BlockedRecvState;
-    use SplitDispatchDisposition as D;
+    // U9-RECV-BLOCK2 §1 — the lane composes RECEIVE dispositions now; the family entry is the
+    // only place a `SplitDispatchDisposition` is produced, and only for "not a receive".
+    use SplitRecvDisposition as D;
 
     // (1) NR, then architecture. The body is architecture-neutral; the gate names the two that
     // have the drain this route publishes into, and since U9-RX4 repaired the queued-plain
@@ -1902,7 +2048,11 @@ fn try_split_blocking_ipc_recv_into_frame(
     let recv_timeout = match Syscall::decode(frame.syscall_num()) {
         Ok(Syscall::IpcRecvTimeout) => true,
         Ok(Syscall::IpcRecv) => false,
-        _ => return D::NotHandled,
+        // Unreachable: `try_split_ipc_recv_family_into_frame` decodes the same field and returns
+        // `NotHandled` for anything else before this lane is entered. Kept as the immediate
+        // lane's problem rather than a fourth outcome, because the immediate lanes match on the
+        // same decode and answer nothing for a non-receive either.
+        _ => return BlockingLaneOutcome::ImmediateLaneOwns,
     };
     // U9-RECV-FINAL §1 retires the architecture exclusion this gate carried.
     //
@@ -1960,9 +2110,30 @@ fn try_split_blocking_ipc_recv_into_frame(
     // it parked under the broad lock.
     let (state, deadline, timed_blocking) = if recv_timeout {
         let timeout_ticks = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64;
+        // U9-RECV-BLOCK2 §1 — the ORIGINAL absolute deadline, consumed from the trap entry's
+        // staging slot exactly as `handle_ipc_recv_timeout` consumes it.
+        //
+        // This route used to recompute `scheduler_tick_now_split_read() + timeout_ticks` here.
+        // That is a SECOND tick read, taken later in the trap than the canonical one, so a
+        // receive parking on this route expired on a later tick than the same receive parking
+        // under the broad lock — and, worse, it made the deadline a function of WHEN in the trap
+        // the blocking lane happened to run. `recv_block_phase_c_split` can send this receive
+        // back through the immediate owner on the `QueueNonEmpty` race, so "when the blocking
+        // lane ran" is not a fixed point, and a re-evaluated receive would have silently
+        // extended its own timeout.
+        //
+        // `arch/trap_entry.rs` stages `now + timeout_ticks` for every NR 5 with a non-zero
+        // timeout BEFORE any dispatch runs, and the broad handler `swap(0)`s it out. Taking the
+        // same value here makes the deadline the trap's, not the lane's, and therefore stable
+        // across every re-evaluation inside this trap. The fallback keeps the old formula for
+        // the paths that stage nothing (a raw trap entry, or a CPU index out of range).
         let absolute = shared
-            .scheduler_tick_now_split_read()
-            .wrapping_add(timeout_ticks);
+            .take_preread_recv_timeout_deadline_split(cpu)
+            .unwrap_or_else(|| {
+                shared
+                    .scheduler_tick_now_split_read()
+                    .wrapping_add(timeout_ticks)
+            });
         let request = RecvRequest::from_ipc_recv_timeout(
             tid,
             cap,
@@ -1980,7 +2151,7 @@ fn try_split_blocking_ipc_recv_into_frame(
                 cpu.0,
                 tid
             );
-            return D::NotHandled;
+            return BlockingLaneOutcome::ImmediateLaneOwns;
         };
         // Which SHAPE the receive owes is the caller's to decide, not the syscall number's.
         // `RecvRequest::from_ipc_recv_timeout` hard-codes `RecvMetaTarget::None`, but that is a
@@ -2071,14 +2242,17 @@ fn try_split_blocking_ipc_recv_into_frame(
             cpu.0,
             tid
         );
-        return D::NotHandled;
+        return BlockingLaneOutcome::ImmediateLaneOwns;
     };
     let CapObject::Endpoint {
         index: endpoint_idx,
         generation,
     } = snapshot.endpoint
     else {
-        return D::NotHandled;
+        // The resolver only ever answers `Ok` for an endpoint carrying RECEIVE, so this is
+        // defensive. The immediate lane resolves the same capability through the same reader and
+        // raises whatever the canonical handler raises for it.
+        return BlockingLaneOutcome::ImmediateLaneOwns;
     };
     // (5) Would-block, under one rank-3 acquisition.
     if !shared.recv_would_block_split_read(endpoint_idx, generation) {
@@ -2088,7 +2262,7 @@ fn try_split_blocking_ipc_recv_into_frame(
             tid,
             endpoint_idx
         );
-        return D::NotHandled;
+        return BlockingLaneOutcome::ImmediateLaneOwns;
     }
     // (6) ADMISSION — the last point at which falling back is safe.
     if crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx) {
@@ -2097,16 +2271,33 @@ fn try_split_blocking_ipc_recv_into_frame(
             cpu.0,
             tid
         );
-        return D::NotHandled;
+        return BlockingLaneOutcome::CannotPark(CannotParkReason::AlreadyDeferred);
     }
     // U9-RECV-BLOCK1 §4 — authenticated on the trap's own authority. The ambient
     // `CpuNotAuthoritative` comparison and the blanket `MultiCpu` refusal do not apply to a
     // caller that provably IS this CPU's trap; every other precondition is the shared body's and
     // is unchanged. This is what lets a blocking receive park on a boot with more than one
     // dispatching CPU, which the ambient contract refused outright.
+    //
+    // U9-RECV-BLOCK2 §1 — `IncomingUnavailable` is NOT a refusal for this family.
+    //
+    // Admission answers two different questions at once: "may this caller publish a queue
+    // advance?" and "is there an incoming task this convention can resume?". `Ok(None)` — no
+    // candidate at all — already proceeds to park, and the existing D2-recv drain settles that
+    // CPU idle (`D2_RECV_GENUINE_IDLE_PROVENANCE_PUBLISHED`). `IncomingUnavailable` says a
+    // candidate exists but `ExactTokenResume` cannot resume it, which for a PARKING receiver has
+    // the identical consequence: this CPU has nothing it can resume, and the drain owes it the
+    // same idle settlement. The distinction is real for the STASH convention, which must build a
+    // plan for a specific incoming task and has nothing to do if it cannot; it is not real here.
+    //
+    // Treating it as a refusal is what made a receive that must block have nowhere to go, and
+    // the only remaining destination was the terminal broad acquisition.
     if let Err(refusal) = shared.queue_advance_admit_with_authority_split(
         authority,
         crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+    ) && !matches!(
+        refusal,
+        crate::kernel::boot::QueueAdvanceRefusal::IncomingUnavailable
     ) {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason={:?}",
@@ -2114,7 +2305,7 @@ fn try_split_blocking_ipc_recv_into_frame(
             tid,
             refusal
         );
-        return D::NotHandled;
+        return BlockingLaneOutcome::CannotPark(CannotParkReason::AdmissionRefused(refusal));
     }
     // The markers the broad entry emits before it blocks, in the broad entry's order — this route
     // intercepts before the arm that would have printed them, and the stream an observer sees must
@@ -2173,7 +2364,7 @@ fn try_split_blocking_ipc_recv_into_frame(
             cpu.0,
             tid
         );
-        return D::NotHandled;
+        return BlockingLaneOutcome::CannotPark(CannotParkReason::DeferUnavailable);
     }
     // (8) Phase A — scheduler rank 1. A victim mismatch unwinds its own single step inside the
     // twin, so this is still pre-mutation from the route's point of view.
@@ -2188,13 +2379,15 @@ fn try_split_blocking_ipc_recv_into_frame(
             cpu.0,
             tid
         );
-        return D::NotHandled;
+        return BlockingLaneOutcome::CannotPark(CannotParkReason::PhaseAVictimChanged);
     };
     // Phase B — task rank 2, with the state and deadline the ABI step decoded. For NR 2 the
     // deadline is `None` (it carries no timeout, which is what keeps the reply-deadline and oracle
     // arming the broad arm performs strict no-ops); for NR 5 it is the absolute tick, which is
     // what puts the parked receiver in front of the existing receive-timeout scan.
-    let Some(wait_generation) = shared.recv_block_phase_b_split(tid, cap, deadline, state) else {
+    let Some(wait_generation) =
+        shared.recv_block_phase_b_split(tid, receiver_asid, cap, deadline, state)
+    else {
         // U9-RECV-BLOCK1 §3 — the task half wrote NOTHING, so only Phase A's clear has to be
         // reversed. There is no wait generation to name yet, which is exactly why this one
         // failure reverses the scheduler half directly instead of going through the exact unwind:
@@ -2202,38 +2395,45 @@ fn try_split_blocking_ipc_recv_into_frame(
         //
         // The restore is still exact — same CPU, same priority, and it refuses rather than
         // displace anything the scheduler chose in between.
-        let restored = shared.restore_current_exact_split(cpu, tid, victim_priority);
+        // U9-RECV-BLOCK2 §2 — through the ONE rank-1 recovery, which tries the exact restore,
+        // falls back to the preempt-and-prefer primitive for the reachable `contains_tid`
+        // refusal, and PROVES status and placement agree before it reports `Restored`. The
+        // predecessor called `restore_current_exact_split` alone, so the reachable refusal —
+        // a remote deadline scan having enqueued this task since Phase A — went straight to the
+        // non-resumable arm below even though the task was trivially recoverable.
+        let outcome = shared.restore_entering_incarnation_exact_split(cpu, tid, victim_priority);
         crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
         crate::yarm_log!(
-            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=phase_b restored={}",
+            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=phase_b restored={} outcome={}",
             cpu.0,
             tid,
-            u8::from(restored)
+            u8::from(outcome.may_resume_entering_frame()),
+            outcome.slug()
         );
-        if restored {
-            // The caller is provably current again; the entering frame is its own.
-            return D::NotHandled;
+        if outcome.may_resume_entering_frame() {
+            // The caller is provably current again and Runnable; the entering frame is its own.
+            //
+            // Phase B failing at all means the TCB vanished between Phase A's compare-and-clear
+            // and this call, or a u64 wait generation overflowed. Neither is constructible, so
+            // this is a fail-closed answer through a frame that is provably resumable — not a
+            // hand-off, and not a settlement that has to account for a cleared current.
+            return BlockingLaneOutcome::complete(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            )));
         }
-        // It is not. The task is still Runnable-by-construction (Phase B never blocked it) but
-        // this CPU's slot went elsewhere, so it belongs on a run queue and the trap must not
-        // return through its frame. The deferral reserved at step (7) is released above, so a
-        // fresh advance is published for the drain to act on.
-        // The task is Runnable and queued, so nothing is lost — but the entering frame is not
-        // this CPU's current task's, and a queue advance is not available either: the D2-recv
-        // drain re-verifies `Blocked(EndpointReceive)` before it dispatches
-        // (`d2_recv_reverify_blocked`) and would decline for a Runnable task, leaving the CPU with
-        // an empty slot and no selection. Neither settlement is licensed, and this state is not
-        // ordinary contention: installing a current on this CPU requires running on it, and this
-        // trap is what is running on it.
-        let _ = shared.enqueue_task_split(cpu, tid);
-        crate::yarm_log!(
-            "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=phase_b_restore",
-            cpu.0,
-            tid
-        );
-        return D::Complete(Err(TrapHandleError::Syscall(
-            crate::kernel::syscall::SyscallError::Internal,
-        )));
+        // U9-RECV-BLOCK2 §2 — it is NOT resumable, and this arm no longer contradicts itself.
+        //
+        // The predecessor enqueued the task and then returned `Complete(Err(Internal))`, which
+        // returns THROUGH the entering frame — the exact frame it had just finished proving does
+        // not belong to this CPU's current task. An error return cannot conceal an unscheduled
+        // task, and this one did.
+        //
+        // A queue advance is not available either, and the reason is the drain's: the D2-recv
+        // drain re-verifies `Blocked(EndpointReceive)` (`d2_recv_reverify_blocked`) and takes its
+        // `state_changed` fallback for a Runnable task, settling nothing. So the settlement is
+        // the established divergent one — the task is enqueued by the recovery owner above, and
+        // this CPU enters the same wake-capable idle the D2 drain enters when it cannot resume.
+        crate::arch::trap_entry::recv_unsettleable_idle_terminal(cpu, tid, true)
     };
     // U9-RECV-BLOCK1 §3 — THE identity every compensation below authenticates against. Built
     // once, from the four facts this transaction minted and nothing else: the authoritative
@@ -2288,18 +2488,18 @@ fn try_split_blocking_ipc_recv_into_frame(
                 shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
             if !unwound.may_resume_entering_frame() {
-                // The exact inverse could not complete, so the entering frame is not this task's
-                // to return through. Nothing is lost — the unwind leaves a Runnable task on a run
-                // queue — but no settlement is licensed here.
+                // U9-RECV-BLOCK2 §2 — the exact inverse could not complete, so the entering frame
+                // is not this task's to return through, and this arm no longer returns through it
+                // anyway. Nothing is lost: the recovery owner leaves the task Runnable and on a
+                // run queue. The settlement is the established divergent one, the same
+                // wake-capable idle the D2 drain enters when it cannot resume.
                 crate::yarm_log!(
                     "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=unwind outcome={}",
                     cpu.0,
                     tid,
                     unwound.slug()
                 );
-                return D::Complete(Err(TrapHandleError::Syscall(
-                    crate::kernel::syscall::SyscallError::Internal,
-                )));
+                crate::arch::trap_entry::recv_unsettleable_idle_terminal(cpu, tid, true)
             }
             // U9-RECV-BLOCK1 §3 — the exact incarnation is current again, so this transaction
             // may answer. The two races answer DIFFERENTLY, and both answers are the broad
@@ -2329,33 +2529,25 @@ fn try_split_blocking_ipc_recv_into_frame(
                 unwound.slug()
             );
             if busy {
-                return D::Complete(recv_encode_empty_answer(
+                return BlockingLaneOutcome::complete(recv_encode_empty_answer(
                     frame,
                     crate::kernel::syscall::SyscallError::WouldBlock,
                 ));
             }
-            // Continue into the immediate receive owner for the message that raced in.
-            return match Syscall::decode(frame.syscall_num()) {
-                Ok(Syscall::IpcRecv) => {
-                    match try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame) {
-                        Some(result) => D::Complete(result),
-                        // The racing message went to somebody else between the unwind and here.
-                        // The canonical phase-2 dequeue finds nothing either, and its receive
-                        // then returns the empty answer for its own ABI.
-                        None => D::Complete(recv_encode_empty_answer(
-                            frame,
-                            crate::kernel::syscall::SyscallError::WouldBlock,
-                        )),
-                    }
-                }
-                _ => match shared.try_split_ipc_recv_timeout_immediate_into_frame(cpu, frame) {
-                    Some(result) => D::Complete(result),
-                    None => D::Complete(recv_encode_empty_answer(
+            // Continue into the immediate receive owner for the message that raced in, through
+            // the same one-call lane the family entry drives — not a second copy of its decode.
+            return BlockingLaneOutcome::complete(
+                match try_split_recv_immediate_lane(shared, cpu, frame) {
+                    Some(result) => result,
+                    // The racing message went to somebody else between the unwind and here. The
+                    // canonical phase-2 dequeue finds nothing either, and its receive then
+                    // returns the empty answer for its own ABI.
+                    None => recv_encode_empty_answer(
                         frame,
                         crate::kernel::syscall::SyscallError::WouldBlock,
-                    )),
+                    ),
                 },
-            };
+            );
         }
         // `ReceiverAlreadyWaiting` and `InvalidEndpoint`. The live publish policy is canonical
         // last-receiver-wins and never returns the first; step (5) validated index and generation
@@ -2373,13 +2565,16 @@ fn try_split_blocking_ipc_recv_into_frame(
                 tid,
                 unwound.slug()
             );
-            return D::Complete(Err(TrapHandleError::Syscall(
-                if unwound.may_resume_entering_frame() {
-                    crate::kernel::syscall::SyscallError::WrongObject
-                } else {
-                    crate::kernel::syscall::SyscallError::Internal
-                },
-            )));
+            // U9-RECV-BLOCK2 §2 — the two answers are not two errors, they are an answer and a
+            // non-answer. `WrongObject` through a resumable frame is the canonical outcome;
+            // `Internal` through a frame that is NOT this task's would return into a task the
+            // scheduler has parked, which is the contradiction this slice removes.
+            if unwound.may_resume_entering_frame() {
+                return BlockingLaneOutcome::complete(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::WrongObject,
+                )));
+            }
+            crate::arch::trap_entry::recv_unsettleable_idle_terminal(cpu, tid, true)
         }
     }
     // (9b) 199E-DL — the COMPENSATED rank-2 half of the finite-deadline registration.
@@ -2400,6 +2595,14 @@ fn try_split_blocking_ipc_recv_into_frame(
         // would leave a blocked caller with a deadline it cannot identify, so unwind the whole
         // block exactly as the publish races do and let the broad arm own the outcome.
         crate::kernel::boot::ReplyWaitArm::DeadlineRefused { .. } => {
+            // U9-RECV-BLOCK2 §2 — this is the ONE post-PUBLICATION failure in the route, so it
+            // owes more than the task unwind. Phase C published this receiver as the endpoint's
+            // waiter; unwinding the task without retracting that record would leave a published
+            // waiter naming a receiver that is no longer blocked, and a sender finding it would
+            // consume a message into a delivery `complete_blocked_recv_for_waiter` then refuses.
+            // The retraction is identity-keyed through the existing rank-3 owner, so a competitor
+            // that displaced this waiter under last-receiver-WINS is never detached.
+            shared.retract_recv_waiter_exact_split(endpoint_idx, tid, receiver_asid);
             let unwound =
                 shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
@@ -2411,9 +2614,11 @@ fn try_split_blocking_ipc_recv_into_frame(
                 unwound.slug()
             );
             if !unwound.may_resume_entering_frame() {
-                return D::Complete(Err(TrapHandleError::Syscall(
-                    crate::kernel::syscall::SyscallError::Internal,
-                )));
+                // U9-RECV-BLOCK2 §2 — the unwind could not put this exact incarnation back, so
+                // there is no frame to answer through. The recovery owner has left the task
+                // Runnable and enqueued; the settlement is the established divergent idle rather
+                // than an error returned into a task the scheduler has parked.
+                crate::arch::trap_entry::recv_unsettleable_idle_terminal(cpu, tid, true)
             }
             // U9-RECV-BLOCK1 §3 — the terminal armed but its deadline token could not be
             // reserved, so parking would leave a caller holding a deadline it cannot identify.
@@ -2421,7 +2626,7 @@ fn try_split_blocking_ipc_recv_into_frame(
             // proceed: `WouldBlock`, the same lane the ownership-busy race answers on, and the
             // one the caller's own retry loop already handles. This is capacity contention on a
             // bounded store, not a fault, so it is not an error return.
-            return D::Complete(recv_encode_empty_answer(
+            return BlockingLaneOutcome::complete(recv_encode_empty_answer(
                 frame,
                 crate::kernel::syscall::SyscallError::WouldBlock,
             ));
@@ -2573,7 +2778,7 @@ fn try_split_blocking_ipc_recv_into_frame(
         endpoint_idx,
         wait_generation
     );
-    D::QueueAdvanceCommitted
+    BlockingLaneOutcome::Settled(D::QueueAdvanceCommitted)
 }
 
 #[cfg(feature = "hosted-dev")]

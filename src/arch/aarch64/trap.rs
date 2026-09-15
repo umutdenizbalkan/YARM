@@ -29,7 +29,7 @@ fn aarch64_trap_trace(args: core::fmt::Arguments) {
 macro_rules! trap_trace { ($($arg:tt)*) => { aarch64_trap_trace(format_args!($($arg)*)) }; }
 
 #[inline(always)]
-fn idle_no_eret_loop() -> ! {
+pub(crate) fn idle_no_eret_loop() -> ! {
     crate::yarm_log!("SCHED_ENTER_IDLE_HLT");
     loop {
         unsafe { core::arch::asm!("wfi") };

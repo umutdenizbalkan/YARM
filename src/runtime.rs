@@ -6065,16 +6065,29 @@ impl SharedKernel {
     /// — a repair wearing the costume of a reproduction, and a silent divergence between the two
     /// routes for a shape neither of them announces. The defect is the broad arm's to carry until
     /// something decides to fix it deliberately; this route reproduces it.
+    /// U9-RECV-BLOCK2 §2 carries the INCARNATION into this phase, not only into the
+    /// compensations. Phase A returns the ASID it captured under its own compare-and-clear; this
+    /// phase matches `{tid, asid}` rather than a bare numeric TID, so a task that was reaped and
+    /// respawned onto the same TID between the two phases is refused here instead of being
+    /// blocked, given a fresh wait generation and published as this receive's waiter. The
+    /// compensations already authenticated on `{tid, asid, blocked_recv_generation}`; the
+    /// authority they authenticate against has to be established by the phases that mint it.
     pub(crate) fn recv_block_phase_b_split(
         &self,
         tid: u64,
+        asid: crate::kernel::vm::Asid,
         recv_cap: crate::kernel::capabilities::CapId,
         deadline: Option<u64>,
         state: Option<crate::kernel::task::BlockedRecvState>,
     ) -> Option<u64> {
         use crate::kernel::task::{TaskStatus, WaitReason};
         let wait_gen = self.with_task_tcbs_split_mut(|tcbs| {
-            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
+            // The same `Asid(0)`-for-absent normalisation Phase A applied when it captured this,
+            // and that `ReceiverWaiterIdentity` applies when it publishes it.
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid && t.asid.unwrap_or(crate::kernel::vm::Asid(0)) == asid)?;
             let next = tcb.blocked_recv_generation.checked_add(1)?;
             tcb.blocked_recv_generation = next;
             tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
@@ -6317,42 +6330,91 @@ impl SharedKernel {
             );
             return U::IncarnationMoved;
         }
-        // Rank 1 — the exact inverse of Phase A, at the priority Phase A removed.
-        //
-        // `restore_exact_current_on` refuses on two conditions, and they are not equally
-        // reachable. `current.is_some()` cannot hold: installing a current on this CPU requires
-        // running on this CPU, and this trap is what is running on it. `contains_tid` CAN hold —
-        // Phase B staged `ipc_timeout_deadline`, so on a multi-CPU boot the deadline scan may
-        // have woken and enqueued this exact task between Phase A and here.
-        if self.restore_current_exact_split(cpu, tid, identity.priority) {
-            crate::yarm_log!("D2_RECV_SPLIT_UNWIND_OK cpu={} tid={}", cpu.0, tid);
+        // Rank 1 — the exact inverse of Phase A, through the ONE recovery owner both post-clear
+        // compensations share. It also PROVES the final state before it answers `Restored`.
+        self.restore_entering_incarnation_exact_split(cpu, tid, identity.priority)
+    }
+
+    /// U9-RECV-BLOCK2 §2 — **the ONE rank-1 recovery for a cleared `current`**, and the only place
+    /// that may answer `Restored`.
+    ///
+    /// # Two recoveries, and why both are needed
+    ///
+    /// `restore_exact_current_on` refuses on two conditions that are not equally reachable.
+    /// `current.is_some()` cannot hold — installing a current on a CPU requires running on that
+    /// CPU, and this trap is what is running on it. `contains_tid` CAN hold: Phase B stages
+    /// `ipc_timeout_deadline`, so on a multi-CPU boot the deadline scan may have woken and
+    /// enqueued this exact task since Phase A cleared it. That reachable refusal is the
+    /// preempt-and-prefer primitive's exact job, and its RESULT is checked — the predecessor
+    /// discarded it, which is how a task ended up current nowhere and queued nowhere.
+    ///
+    /// # Status and placement must AGREE before this reports `Restored`
+    ///
+    /// The two halves of an unwind write different things. Rank 2 sets `TaskStatus::Runnable` on
+    /// the TCB; rank 1 changes only where the scheduler believes the task is. Either can succeed
+    /// while the other does not, and `Restored` is a claim about BOTH — the caller reads it as
+    /// "this exact incarnation is resumable through the entering frame", which is false if the
+    /// TCB is not Runnable or if this CPU's current slot names somebody else. So the final state
+    /// is read back and checked rather than inferred from the primitives having returned `true`.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn restore_entering_incarnation_exact_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        priority: crate::kernel::scheduler::TaskPriority,
+    ) -> crate::kernel::recv_waiter_split::RecvUnwindOutcome {
+        use crate::kernel::recv_waiter_split::RecvUnwindOutcome as U;
+        let via = if self.restore_current_exact_split(cpu, tid, priority) {
+            "exact"
+        } else {
+            match self.on_preempt_prefer_on_cpu_split(cpu, tid) {
+                Some(now) if now == tid => "prefer_after_requeue",
+                other => {
+                    // Neither recovery applied. The task is Runnable, so it is not lost; it is
+                    // enqueued rather than left placed nowhere, and the caller is told it may NOT
+                    // return through the entering frame.
+                    let enqueued = self.enqueue_task_split(cpu, tid).is_ok();
+                    crate::yarm_log!(
+                        "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=placement_taken observed={:?} enqueued={}",
+                        tid,
+                        other,
+                        u8::from(enqueued)
+                    );
+                    return U::RunnableElsewhere;
+                }
+            }
+        };
+        // The proof. `Restored` means the entering frame is this task's again, which is a claim
+        // about the TCB's status AND about this CPU's current slot; a primitive returning `true`
+        // is evidence for one of them, never for both.
+        let status_ok = self.task_is_runnable_split_read(tid);
+        let placed_ok = self.current_tid_split_read(cpu) == Some(tid);
+        if status_ok && placed_ok {
+            crate::yarm_log!(
+                "D2_RECV_SPLIT_UNWIND_OK cpu={} tid={} via={} status=runnable placement=current",
+                cpu.0,
+                tid,
+                via
+            );
             return U::Restored;
         }
-        // The reachable refusal: ours, Runnable, and sitting in this CPU's run queue rather than
-        // in its empty current slot. Taking it back out is the existing preempt-and-prefer
-        // primitive's exact job, and its RESULT is checked — the predecessor discarded it.
-        match self.on_preempt_prefer_on_cpu_split(cpu, tid) {
-            Some(now) if now == tid => {
-                crate::yarm_log!(
-                    "D2_RECV_SPLIT_UNWIND_OK cpu={} tid={} via=prefer_after_requeue",
-                    cpu.0,
-                    tid
-                );
-                U::Restored
-            }
-            other => {
-                // Neither refusal condition should hold here. The task is Runnable, so it is not
-                // lost; it is enqueued rather than left placed nowhere, and the caller is told it
-                // may NOT return through the entering frame.
-                let _ = self.enqueue_task_split(cpu, tid);
-                crate::yarm_log!(
-                    "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=placement_taken observed={:?} enqueued=1",
-                    tid,
-                    other
-                );
-                U::RunnableElsewhere
-            }
-        }
+        // Placement and status disagree. The task is not lost — it is this CPU's current, or on a
+        // run queue, or both were left consistent by whichever half did succeed — but the frame
+        // is not provably its own, so the caller must not return through it.
+        let enqueued = if placed_ok {
+            false
+        } else {
+            self.enqueue_task_split(cpu, tid).is_ok()
+        };
+        crate::yarm_log!(
+            "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=status_placement_disagree via={} status_runnable={} placed_current={} enqueued={}",
+            tid,
+            via,
+            u8::from(status_ok),
+            u8::from(placed_ok),
+            u8::from(enqueued)
+        );
+        U::RunnableElsewhere
     }
 
     /// U9-FT3 §1 — the read-only buffered fault-report admission preflight.
@@ -13427,6 +13489,81 @@ impl SharedKernel {
         });
     }
 
+    /// U9-RECV-BLOCK2 §1 — take the ORIGINAL absolute receive-timeout deadline this trap staged.
+    ///
+    /// `arch/trap_entry.rs` computes `scheduler_tick_now + timeout_ticks` for every NR 5 carrying
+    /// a non-zero timeout, BEFORE any dispatch runs, and stores it per CPU. The broad handler
+    /// `handle_ipc_recv_timeout` consumes it with the same `swap(0)` this does, for the same
+    /// reason: the deadline belongs to the TRAP, not to whichever owner ends up parking the
+    /// receive, so it must be read once and cleared so it cannot be inherited by the next NR 5 on
+    /// this CPU.
+    ///
+    /// Returning `None` means nothing was staged — a raw trap entry that does not run the staging
+    /// block, an out-of-range CPU index, or a zero timeout (a probe, which never parks). The
+    /// caller then falls back to the same formula the staging block would have used.
+    pub(crate) fn take_preread_recv_timeout_deadline_split(&self, cpu: CpuId) -> Option<u64> {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+            return None;
+        }
+        let staged = crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+            .swap(0, core::sync::atomic::Ordering::AcqRel);
+        (staged != 0).then_some(staged)
+    }
+
+    /// U9-RECV-BLOCK2 §2 — retract THIS transaction's endpoint waiter after a post-publication
+    /// failure.
+    ///
+    /// Phase C publishes the waiter and arms the reply terminal in one rank-3 scope. A failure
+    /// AFTER that — today only the deadline-reservation refusal — unwinds the task, and unwinding
+    /// the task alone leaves a published waiter naming a receiver that is no longer blocked. A
+    /// sender that finds it attempts a direct delivery into a `Runnable` task, which
+    /// `complete_blocked_recv_for_waiter` refuses with `InvalidArgs` after consuming the message.
+    ///
+    /// The clear is IDENTITY-KEYED through the existing rank-3 owner, so a competitor's waiter is
+    /// never detached: `clear_endpoint_waiter_if_identity` compares the full `{tid, asid}` record
+    /// and returns `false` for anyone else's. Returns whether this transaction's own waiter was
+    /// the one removed.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn retract_recv_waiter_exact_split(
+        &self,
+        endpoint_idx: usize,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> bool {
+        let identity = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(tid),
+            asid,
+        );
+        let cleared = self.with_ipc_split_mut(|ipc| {
+            ipc.clear_endpoint_waiter_if_identity(endpoint_idx, identity)
+        });
+        crate::yarm_log!(
+            "IPC_RECV_SPLIT_WAITER_RETRACTED endpoint={} tid={} asid={} cleared={}",
+            endpoint_idx,
+            tid,
+            asid.0,
+            u8::from(cleared)
+        );
+        cleared
+    }
+
+    /// U9-RECV-BLOCK2 §2 — rank 2: is this task's TCB status exactly `Runnable`?
+    ///
+    /// The status half of the `Restored` proof. `Runnable` and nothing else: a task that another
+    /// owner has since re-blocked, faulted, exited or reaped is not this transaction's to resume,
+    /// and reporting `Restored` for it would hand the entering frame to an incarnation that has
+    /// moved on.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn task_is_runnable_split_read(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .is_some_and(|t| matches!(t.status, crate::kernel::task::TaskStatus::Runnable))
+        })
+    }
+
     pub(crate) fn receiver_has_scheduler_membership_split_read(&self, tid: u64) -> bool {
         use crate::kernel::ipc::ThreadId;
         self.with_scheduler_split_mut(|sched| {
@@ -15882,6 +16019,7 @@ mod tests {
         let wait_generation = kernel
             .recv_block_phase_b_split(
                 0,
+                receiver_asid,
                 recv_cap,
                 None,
                 Some(BlockedRecvState {
@@ -16033,13 +16171,13 @@ mod tests {
             .recv_block_phase_a_split(cpu, 0)
             .expect("phase A must block the exact victim");
         let first_generation = kernel
-            .recv_block_phase_b_split(0, recv_cap, None, Some(state_of(0x1000)))
+            .recv_block_phase_b_split(0, asid, recv_cap, None, Some(state_of(0x1000)))
             .expect("the first transaction's generation");
         // The REPLACEMENT: a later transaction re-blocks the same numeric TID, advancing the
         // generation and installing its own record. Generations only advance, so this is exactly
         // what distinguishes the two.
         let second_generation = kernel
-            .recv_block_phase_b_split(0, recv_cap, None, Some(state_of(0x9000)))
+            .recv_block_phase_b_split(0, asid, recv_cap, None, Some(state_of(0x9000)))
             .expect("the second transaction's generation");
         assert_eq!(second_generation, first_generation + 1);
 
@@ -16111,6 +16249,7 @@ mod tests {
         let wait_generation = kernel
             .recv_block_phase_b_split(
                 0,
+                asid,
                 recv_cap,
                 Some(7),
                 Some(BlockedRecvState {
@@ -16199,6 +16338,7 @@ mod tests {
         let wait_generation = kernel
             .recv_block_phase_b_split(
                 0,
+                asid,
                 recv_cap,
                 None,
                 Some(BlockedRecvState {
@@ -16986,18 +17126,14 @@ mod tests {
         // U9-D3 §7 later retired the D6 proof cleanup tail too, taking the file to ONE
         // acquisition: the canonical broad Phase-2 trap dispatch, untouched here.
         //
-        // U9-RECV-BLOCK1 §6: 1 -> 2. The second is `drive_pending_x86_smp_unlock_audit`, a
-        // BOOT-ONLY acquisition that runs at most once per boot and restores a dependency
-        // closing the receive family exposed — `maybe_run_x86_smp_unlock_audit` had both of its
-        // call sites inside `handle_trap`'s BROAD arms, so it ran only on traps the split routes
-        // declined. It is also untouched by this retirement, and the branch this test is about
-        // is separately asserted above to contain no acquisition of any form.
+        // U9-RECV-BLOCK1 §6 briefly took this to 2 for the SMP-unlock audit driver; U9-RECV-BLOCK2
+        // §3 returned it to 1 by driving that same one-shot body from `run_scheduler_loop`, which
+        // already owns `&mut KernelState`.
         let code = u3_code_lines(TRAP_ENTRY);
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            2,
-            "trap_entry.rs drops from 3 to 2 with this retirement, to 1 with U9-D3 §7, then \
-             back to 2 with U9-RECV-BLOCK1 §6's boot-only SMP-unlock audit driver"
+            1,
+            "trap_entry.rs drops from 3 to 2 with this retirement, then to 1 with U9-D3 §7"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
         // U9-QA §2 made the one acquisition CONDITIONAL — a pre-lock route that published a

@@ -28,7 +28,7 @@ pub(crate) mod fork_owners;
 // U9-QA §1: the queue-advance apply convention is named by callers outside this module (the
 // pre-lock split route), so it is re-exported alongside the transaction it parameterises.
 pub(crate) use exec_state::{
-    IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome,
+    IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome, QueueAdvanceRefusal,
     classify_incoming_resume_convention,
 };
 #[cfg_attr(feature = "hosted-dev", allow(unused_imports))]

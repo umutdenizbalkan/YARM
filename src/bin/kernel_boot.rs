@@ -43,6 +43,35 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     );
 
     let initial = kernel.dispatch_ready_task().ok().flatten();
+    // U9-RECV-BLOCK2 §3 — the one-shot x86_64 SMP-unlock audit, driven from the BOOT OWNERSHIP
+    // POINT that already holds `&mut KernelState`, so it costs no broad acquisition.
+    //
+    // The audit is what clears an AP's wake-only bit and drives `live_ap_user_dispatch` ->
+    // `build_ap_workload`. Its two historical call sites are inside `KernelState::handle_trap`'s
+    // broad syscall and timer arms, which made it depend on some syscall class always falling
+    // through to the broad dispatcher — an incidental dependency, and one U9-RECV-BLOCK1 broke by
+    // closing the receive family. U9-RECV-BLOCK1 §6 repaired it from the trap path at the cost of
+    // a `with_cpu`; this drives the same one-shot body from here instead, and the acquisition is
+    // gone.
+    //
+    // Every gate the audit applies holds AT THIS POINT, which is why this is the right owner and
+    // `bootstrap_first_user_task` is not:
+    //
+    //   * `present > 1` — `release_secondary_cpus_after_bootstrap()` ran above, so the APs this
+    //     audit admits are online.
+    //   * `unlock_graduated_proof_completed()` — set by the graduated proof, which
+    //     `bootstrap_first_user_task` ran above. The ordering the audit's own comment requires
+    //     (graduated evidence first, with `online == 1`) is therefore satisfied, not bypassed.
+    //   * a real user task current (`tid != 0`) — `dispatch_ready_task()` has just made one
+    //     current. This is the gate that keeps the audit off `bootstrap_first_user_task`, and it
+    //     is the same reason `run_cross_arch_live_audit_at_first_dispatch` sits at first dispatch
+    //     rather than at bootstrap.
+    //
+    // The audit body, its one-shot latch and its provisioning policy are untouched; only the
+    // driver moved, and the historical trap-path hooks beside it are left exactly as they are.
+    if initial.is_some() {
+        kernel.maybe_run_x86_smp_unlock_audit();
+    }
     if DEBUG_DISPATCH_CONTEXT_LOG {
         yarm::yarm_log!("BSP_REDISPATCH_SELECTED tid={:?}", initial);
         yarm::yarm_log!("YARM_SCHED_LOOP_START dispatched_tid={:?}", initial);

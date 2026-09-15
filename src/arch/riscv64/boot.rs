@@ -1710,7 +1710,7 @@ fn riscv_s_mode_timer_trap(
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn riscv_trap_halt(reason: &'static str) -> ! {
+pub(crate) fn riscv_trap_halt(reason: &'static str) -> ! {
     early_marker!("RISCV_TRAP_HALTED reason={}", reason);
     loop {
         unsafe {

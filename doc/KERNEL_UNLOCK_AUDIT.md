@@ -127,10 +127,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **3** |
+| `SharedKernel::with_cpu` | **2** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **0** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **3** |
+| **Total broad-lock acquisition sites** | **2** |
 
 > **U9-D3 — DELIVERED; U9 REMAINS OPEN.** The D3 fence of `AI_AGENT_RULES` §14.4 is discharged:
 > vector `0xF1` is the SOLE target-side invalidation and generation-matched ACK producer and earns
@@ -314,7 +314,7 @@ Enclosing functions were resolved mechanically from source.
 
 | Class | Count |
 |-------|-------|
-| boot-only | **1** |
+| boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
 | runtime-required | **2** |
@@ -359,15 +359,24 @@ Per-file subtotals, matching source and guard exactly:
 
 | File | `with_cpu` | Broad `with` |
 |------|-----------|--------------|
-| `src/arch/trap_entry.rs` | 2 | 0 |
+| `src/arch/trap_entry.rs` | 1 | 0 |
 | `src/arch/riscv64/trap.rs` | 1 | 0 |
-| **Total** | **3** | **0** |
+| **Total** | **2** | **0** |
 
 `src/runtime.rs` is absent from this table because U9-D3 §6 retired its last three — the
 ordinary `rollback_materialized_recv_cap` fallbacks — so it now holds **zero** broad
 acquisitions of any form.
 
-**U9-RECV-BLOCK1 §6 — `trap_entry.rs` 1 -> 2, and the one boot-only site.**
+**U9-RECV-BLOCK2 §3 — `trap_entry.rs` back to 1, and boot-only back to 0.** The driver below no
+longer takes a lock: it runs from `run_scheduler_loop`, immediately after `dispatch_ready_task()`,
+where `&mut KernelState` is already owned by the boot loop. Every gate the audit applies holds at
+that point — the APs were released above, the graduated proof completed in
+`bootstrap_first_user_task`, and `dispatch_ready_task()` has just made a real user task current,
+which is the gate that kept it off bootstrap in the first place. The provisioning, the one-shot
+latch and the audit body are unchanged; only the driver moved. The §6 record is kept below because
+the dependency it documents is the durable finding.
+
+**U9-RECV-BLOCK1 §6 — `trap_entry.rs` 1 -> 2, and the one boot-only site (SUPERSEDED by §3).**
 `drive_pending_x86_smp_unlock_audit` repairs a dependency that closing the receive family
 exposed. `maybe_run_x86_smp_unlock_audit` clears an AP's wake-only bit and drives
 `live_ap_user_dispatch` -> `build_ap_workload`, and both of its call sites sit inside
