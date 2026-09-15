@@ -18064,6 +18064,35 @@ more sit beside this one (`maybe_run_cross_arch_d6_audit`, `maybe_run_cross_arch
 `maybe_run_d3_full_proof`, `maybe_run_unlock_graduated_proof`); only this one had a live cell
 depending on it, and the rest are left alone rather than speculatively relocated.
 
+### Qualification
+
+Hosted 5600 passed / 0 failed / 2 ignored. Three ports build. Census target 7/7 with the updated
+pin; doc-fragmentation 7/7; extraction bridge 2/2. The established carve-out is unchanged at
+8 pass / 2 fail (`required_chain_is_scoped_to_the_witnessed_transaction`,
+`required_marker_chain_is_ordered_and_complete`).
+
+Live matrix, all re-run on the delivered tree:
+
+| witness | result |
+|---|---|
+| direct-oracle round trip, x86_64 / aarch64 / riscv64 | `classes=2 live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok` |
+| shared-region direct matrix seal | `arches=3 live_cells=3 fuse_trips=0 duplicate_wakes=0 result=ok` |
+| xfer2 grant witness, ordinary routes (NR 2 + NR 5) | `unrouted=0 result=ok` |
+| xfer2 grant witness, NR 30 profile | `result=ok` |
+| park witness | `proposed=12 committed=12 resumed=12 broad_entries=0 result=ok` |
+| x86_64 AP recv-v2 block, `-smp 2` | `blocked_commits=1 ack_publications=1 premature_wakes=0 wrong_cpu_blocks=0 result=ok` |
+| x86_64 SMP reply-direct, `-smp 2` | boot clean; `result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired` (its own pre-existing state) |
+
+**Two regressions were found and fixed during qualification, both by running the failing witness
+at BASE first.** That is the only way to separate a regression from a pre-existing failure, and in
+both cases the first reading from source alone was wrong:
+
+1. The RISC-V duplicate-reply wait, added unconditionally, grew init `.text` from 143367 to
+   143431 — past the 143360 page boundary that init's 128/128 mapping runs cannot absorb — and
+   the NR 30 grant witness died on `VM_FULL reason=mapping_bookkeeping_full`. Scoping the wait to
+   the one port whose ordering actually changed put the image back to base's 143367 exactly.
+2. The SMP-unlock audit, described in §6 above.
+
 ### Deferred, and one gap recorded rather than papered over
 
 * **The legacy NR 2 blocking population has no live producer.** `yarm-user-rt::ipc_recv` is
