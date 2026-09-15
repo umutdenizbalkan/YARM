@@ -51,10 +51,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **2** |
+| `SharedKernel::with_cpu` | **3** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **0** |
 | Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
-| **Total broad-lock acquisition sites** | **2** |
+| **Total broad-lock acquisition sites** | **3** |
 
 > **U9-D3 — DELIVERED; U9 REMAINS OPEN.** The D3 fence of `AI_AGENT_RULES` §14.4 is discharged:
 > vector `0xF1` is the SOLE target-side invalidation and generation-matched ACK producer and earns

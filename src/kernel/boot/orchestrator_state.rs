@@ -11,6 +11,18 @@ use std::thread_local;
 static WITH_TCBS_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Stage 183 (SMP-LIVE): one-shot latch for the x86_64 SMP-unlock readiness audit.
 static X86_SMP_UNLOCK_AUDIT_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// U9-RECV-BLOCK1 §6 — has the one-shot SMP-unlock audit already claimed its run?
+///
+/// Lock-free, and deliberately readable from the trap path: the audit is what clears an AP's
+/// wake-only bit and drives `live_ap_user_dispatch`, so a boot in which it never runs is a boot
+/// whose APs never receive a workload. Its two call sites are both on the BROAD trap path
+/// (`handle_trap`'s syscall and timer arms), which was fine while some syscall class always went
+/// broad — an incidental dependency, not a designed one, and closing the receive family removed
+/// the traffic it was resting on.
+pub(crate) fn x86_smp_unlock_audit_claimed() -> bool {
+    X86_SMP_UNLOCK_AUDIT_STARTED.load(Ordering::Acquire)
+}
 #[cfg(all(debug_assertions, feature = "hosted-dev"))]
 thread_local! {
     static LOCK_ORDER_LAST_RANK: Cell<u8> = const { Cell::new(0) };

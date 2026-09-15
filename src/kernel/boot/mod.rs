@@ -66,6 +66,9 @@ pub(crate) mod exit_claim;
 mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;
+// U9-RECV-BLOCK1 §6 — the one-shot SMP-unlock audit's latch, readable lock-free from the trap
+// path so a split-handled trap can drive the audit the broad path used to carry.
+pub(crate) use orchestrator_state::x86_smp_unlock_audit_claimed;
 pub(crate) mod process_cnode_txn;
 pub(crate) mod provisional_cap;
 pub(crate) mod reap_claim;

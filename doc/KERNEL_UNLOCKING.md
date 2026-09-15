@@ -18027,9 +18027,42 @@ pre-lock the reply wake resumes the client first. The client now waits for the a
 yielding; the check is unchanged and a server that never attempts the duplicate still fails the
 oracle rather than hanging it.
 
-### Census
+### §6 — one acquisition added, and why
 
-**CENSUS-DELTA: 0.**
+**CENSUS-DELTA: +1** (`with_cpu` 2 -> 3; boot-only 0 -> 1). This is not a receive-family
+acquisition and it is not an oracle term. It repairs a dependency that closing the family exposed.
+
+`maybe_run_x86_smp_unlock_audit` clears an AP's wake-only bit and drives `live_ap_user_dispatch`
+-> `build_ap_workload`. Both of its call sites sit inside `KernelState::handle_trap`'s BROAD
+syscall and timer arms, so it ran only on traps the split routes declined — a dependency that was
+never designed, and held only because some syscall class always fell through. On the x86_64 SMP
+oracle profile the 114 blocking NR 2 receives per boot that used to yield now commit a queue
+advance pre-lock; the audit stopped being reached, and CPU 1 never received a workload at all. The
+AP recv-v2 witness went from base's
+
+```
+STAGE_199_X86_AP_RECV_V2_BLOCK_SEAL arch=x86_64 smp=2 server_cpu=1 real_syscall=1
+  blocked_commits=1 ack_publications=1 premature_wakes=0 wrong_cpu_blocks=0 result=ok
+```
+
+to CPU 1 idling forever. It was found by running the witness at base after it failed on the
+changed tree, which is the only way to tell a regression from a pre-existing failure.
+
+`drive_pending_x86_smp_unlock_audit` runs the audit from the trap path ahead of the split
+dispatch, so it is reached whichever route services the trap. Every gate the audit itself applies
+is re-checked off-lock first — its one-shot latch read lock-free, `present > 1` through the
+topology split read, a real user task current through the authoritative split read, and the
+graduated proof's completion flag — so the acquisition happens on the first trap that can claim
+the run and never again, and an `-smp 1` boot never acquires at all. It is classified **boot-only**
+rather than runtime-required because no steady-state syscall, trap or drain depends on it, and it
+lives in `trap_entry.rs` rather than on `SharedKernel` so that `src/runtime.rs` keeps the zero the
+census publishes.
+
+The general lesson is worth recording: **the broad syscall path carries one-shot boot-provisioning
+hooks that the split routes do not, so closing a syscall family can silently disable them.** Four
+more sit beside this one (`maybe_run_cross_arch_d6_audit`, `maybe_run_cross_arch_live_audit`,
+`maybe_run_d3_full_proof`, `maybe_run_unlock_graduated_proof`); only this one had a live cell
+depending on it, and the rest are left alone rather than speculatively relocated.
 
 ### Deferred, and one gap recorded rather than papered over
 

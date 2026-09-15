@@ -96,7 +96,29 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // `!cfg!(target_arch = "riscv64")`), so no reachable behaviour was removed and the
     // cross-arch FOUNDATION `post_switch_restore_arch_thread_state` stays defined.
     // The ONE that remains is the canonical broad Phase-2 trap dispatch — a terminal dispatcher.
-    ("src/arch/trap_entry.rs", 1),
+    // U9-RECV-BLOCK1 §6: 1 -> 2. `drive_pending_x86_smp_unlock_audit` is a boot-provisioning
+    // step the BROAD path used to carry incidentally, not a receive-family acquisition.
+    //
+    // `maybe_run_x86_smp_unlock_audit` clears an AP's wake-only bit and drives
+    // `live_ap_user_dispatch` -> `build_ap_workload`. Both of its call sites sit inside
+    // `KernelState::handle_trap`'s broad syscall and timer arms, so it ran only on traps the
+    // split routes declined. That dependency was never designed; it held because some syscall
+    // class always fell through. Closing the receive family removed the traffic it rested on —
+    // on the x86_64 SMP oracle profile, 114 blocking NR 2 receives per boot that used to yield
+    // now commit a queue advance pre-lock — and CPU 1 stopped ever receiving a workload
+    // (`STAGE_199_X86_AP_RECV_V2_BLOCK_SEAL result=fail`, CPU 1 idling, where base measured
+    // `blocked_commits=1 ack_publications=1 result=ok`).
+    //
+    // The acquisition is bounded to ONE per boot by off-lock pre-screening of every gate the
+    // audit itself applies: its own one-shot latch read lock-free, `present > 1` through the
+    // topology split read, a real user task current through the authoritative split read, and
+    // the graduated proof's completion flag. An `-smp 1` boot never acquires at all, and after
+    // the audit claims its run the whole function is a single atomic load.
+    //
+    // It lives in this file rather than on `SharedKernel` deliberately: `src/runtime.rs` has no
+    // production broad acquisition and this census publishes that, while this file already owns
+    // a terminal dispatcher acquisition.
+    ("src/arch/trap_entry.rs", 2),
     // U3 (203C): 4 -> 3. The AP saved-resume placement's `with_cpu(cpu, |k| { enqueue; dispatch })`
     // became one authoritative rank-1 -> rank-2 transaction,
     // `SharedKernel::enqueue_then_dispatch_on_cpu_split`: rank 1 acquired once, CPU validated with
@@ -248,13 +270,18 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 2; // U9-D3 §7: 3 -> 2 (the D6 functional broad tail retired; only the two terminal dispatchers remain). U9-D3 §6: 6 -> 3 (all three ordinary rollback fallbacks retired). U9-C: 7 -> 6 (recv Phase-A retired). U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 -> 8 -> 7 (… the x86_64 BSP saved-resume preempt-and-prefer reacquisition, then the x86_64 ED-2 next-task placement)
+const AUDITED_WITH_CPU_TOTAL: usize = 3; // U9-RECV-BLOCK1 §6: 2 -> 3 (the one-shot SMP-unlock audit, which the broad syscall path used to carry incidentally; bounded to one acquisition per boot by off-lock pre-screening — see the trap_entry.rs entry above). U9-D3 §7: 3 -> 2 (the D6 functional broad tail retired; only the two terminal dispatchers remain). U9-D3 §6: 6 -> 3 (all three ordinary rollback fallbacks retired). U9-C: 7 -> 6 (recv Phase-A retired). U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 -> 8 -> 7 (… the x86_64 BSP saved-resume preempt-and-prefer reacquisition, then the x86_64 ED-2 next-task placement)
 const AUDITED_WITH_BROAD_TOTAL: usize = 0; // U3: 6 -> 2 -> 1 -> 0 (runtime.rs fully drained, then both x86 SMP saved-resume reads retired). ZERO production broad `SharedKernel::with` callsites remain.
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
 
 /// Stage 204A classification totals, as published in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
-const CLASS_BOOT_ONLY: usize = 0;
+// U9-RECV-BLOCK1 §6: 0 -> 1. `drive_pending_x86_smp_unlock_audit` is boot-only in the exact sense
+// this class means: it runs at most once per boot, it provisions AP user dispatch, and after its
+// one-shot latch is claimed it never acquires again. It is not runtime-required — no steady-state
+// syscall, trap or drain depends on it — which is why it is classified here rather than beside the
+// two terminal dispatchers.
+const CLASS_BOOT_ONLY: usize = 1;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
 const CLASS_RUNTIME_REQUIRED: usize = 2; // U9-D3 §7: 3 -> 2 (the D6 functional broad tail retired). U9-D3 §6: 6 -> 3 (all three ordinary rollback fallbacks retired). U9-C: 7 -> 6 (recv Phase-A retired). U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 -> 10 -> 8 -> 7 (thirty-seven retired onto their seams)

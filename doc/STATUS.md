@@ -1998,9 +1998,9 @@ function holds no broad acquisition today. Earlier "U8 is next" pointers are rem
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **2** |
+| Production `SharedKernel::with_cpu` callsites | **3** |
 | Production broad `SharedKernel::with` callsites | **0** |
-| **Total production broad-lock acquisition sites** | **2** |
+| **Total production broad-lock acquisition sites** | **3** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **Direct NR6/NR7:** x86_64 (live) + AArch64 (structural, proof-gated) via `offlock_authoritative_dispatch_enabled()`; RISC-V not admitted. **Blocking IpcRecv / IpcSend (U4):** queue-advancing dispatch is authoritative outside the broad lock on **all three** architectures via the canonical `queue_advancing_dispatch_enabled()`. `d6_genuine_enabled()` itself remains compile-time x86_64-only — U4 widened the queue-ADVANCING question only, never the queue-neutral D6 slice. |
