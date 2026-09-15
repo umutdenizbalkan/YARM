@@ -2493,7 +2493,14 @@ fn try_split_blocking_ipc_recv_into_frame(
         // predecessor called `restore_current_exact_split` alone, so the reachable refusal —
         // a remote deadline scan having enqueued this task since Phase A — went straight to the
         // non-resumable arm below even though the task was trivially recoverable.
-        let outcome = shared.restore_entering_incarnation_exact_split(cpu, tid, victim_priority);
+        let outcome = shared.restore_entering_incarnation_exact_split(
+            cpu,
+            crate::kernel::recv_waiter_split::RecvEnteringIncarnation {
+                tid,
+                asid: receiver_asid,
+                priority: victim_priority,
+            },
+        );
         crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} tid={} reason=phase_b restored={} outcome={}",
@@ -2523,9 +2530,15 @@ fn try_split_blocking_ipc_recv_into_frame(
         // A queue advance is not available either, and the reason is the drain's: the D2-recv
         // drain re-verifies `Blocked(EndpointReceive)` (`d2_recv_reverify_blocked`) and takes its
         // `state_changed` fallback for a Runnable task, settling nothing. So the settlement is
-        // the established divergent one — the task is enqueued by the recovery owner above, and
-        // this CPU enters the same wake-capable idle the D2 drain enters when it cannot resume.
-        crate::arch::trap_entry::recv_unsettleable_idle_terminal(cpu, tid, true)
+        // the established divergent one — and U9-RECV-BLOCK2b §2: whether the task is actually
+        // somewhere the scheduler will run it again is the RECOVERY OWNER's verified answer, not
+        // an assumption this call site makes. `RunnableElsewhere` is read back from the TCB and
+        // the membership mirror; `Unrecovered` and `IncarnationMoved` claim nothing.
+        crate::arch::trap_entry::recv_unsettleable_idle_terminal(
+            cpu,
+            tid,
+            outcome.task_is_verified_schedulable(),
+        )
     };
     // U9-RECV-BLOCK1 §3 — THE identity every compensation below authenticates against. Built
     // once, from the four facts this transaction minted and nothing else: the authoritative
@@ -2591,7 +2604,11 @@ fn try_split_blocking_ipc_recv_into_frame(
                     tid,
                     unwound.slug()
                 );
-                crate::arch::trap_entry::recv_unsettleable_idle_terminal(cpu, tid, true)
+                crate::arch::trap_entry::recv_unsettleable_idle_terminal(
+                    cpu,
+                    tid,
+                    unwound.task_is_verified_schedulable(),
+                )
             }
             // U9-RECV-BLOCK1 §3 — the exact incarnation is current again, so this transaction
             // may answer. The two races answer DIFFERENTLY, and both answers are the broad
@@ -2688,7 +2705,11 @@ fn try_split_blocking_ipc_recv_into_frame(
                     crate::kernel::syscall::SyscallError::WrongObject,
                 )));
             }
-            crate::arch::trap_entry::recv_unsettleable_idle_terminal(cpu, tid, true)
+            crate::arch::trap_entry::recv_unsettleable_idle_terminal(
+                cpu,
+                tid,
+                unwound.task_is_verified_schedulable(),
+            )
         }
     }
     // (9b) 199E-DL — the COMPENSATED rank-2 half of the finite-deadline registration.
@@ -2732,7 +2753,11 @@ fn try_split_blocking_ipc_recv_into_frame(
                 // there is no frame to answer through. The recovery owner has left the task
                 // Runnable and enqueued; the settlement is the established divergent idle rather
                 // than an error returned into a task the scheduler has parked.
-                crate::arch::trap_entry::recv_unsettleable_idle_terminal(cpu, tid, true)
+                crate::arch::trap_entry::recv_unsettleable_idle_terminal(
+                    cpu,
+                    tid,
+                    unwound.task_is_verified_schedulable(),
+                )
             }
             // U9-RECV-BLOCK1 §3 — the terminal armed but its deadline token could not be
             // reserved, so parking would leave a caller holding a deadline it cannot identify.
