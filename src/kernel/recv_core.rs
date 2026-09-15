@@ -2015,11 +2015,33 @@ mod tests {
     fn recv_core_plan_recv_v2_returns_fallback_meta_copy() {
         // Use is_kernel_task=true so payload_target=KernelRegister bypasses the
         // user-ASID check and the V2 meta check is reached instead.
+        //
+        // U9-RECV-BLOCK1 §1(c) re-derived the answer. This shape used to be refused BEFORE the
+        // dequeue as `FallbackRequired(RecvV2MetaUserCopy)`; the canonical owner does not refuse
+        // it — it dequeues, mints, encodes, and faults at `copy_to_current_user` because the
+        // kernel task has no ASID, then rolls the mint back and answers `PageFault`. The plan
+        // now names that outcome so the failure stays where the canonical owner puts it.
         let req = RecvRequest::from_recv_v2(1, CAP0, 0, 0, 0x2000, 40, true);
         assert_eq!(
             plan_recv_core(&req),
+            RecvPlan::KernelRegisterV2MetaFaults,
+            "recv-v2 with V2 meta on a kernel-register receive is owed a write that faults"
+        );
+    }
+
+    #[test]
+    fn recv_core_plan_v3_future_meta_still_falls_back() {
+        // The V3 metadata shape keeps the fallback: neither `from_legacy_ipc_recv` nor
+        // `from_ipc_recv_timeout` can construct it, so it has no production outcome to match and
+        // inventing one would be inventing a population.
+        let mut req = RecvRequest::from_recv_v2(1, CAP0, 0, 0, 0x2000, 40, true);
+        req.meta_target = RecvMetaTarget::V3Future {
+            ptr: 0x2000,
+            len: 40,
+        };
+        assert_eq!(
+            plan_recv_core(&req),
             RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy),
-            "recv-v2 with V2 meta target must fall back (meta user-copy)"
         );
     }
 
@@ -2035,14 +2057,11 @@ mod tests {
 
     #[test]
     fn recv_core_plan_kernel_task_with_v2_meta_falls_back() {
-        // Even a kernel-task receiver with a v2 meta pointer falls back
-        // (the meta would need a user-copy for the receiver's meta buffer).
+        // U9-RECV-BLOCK1 §1(c). A kernel-task receiver with a v2 meta pointer is NOT refused: the
+        // meta write is owed, it is performed after the dequeue and the mint, and it faults there
+        // — the same position and the same `PageFault` the canonical owner produces.
         let req = RecvRequest::from_recv_v2(0, CAP0, 0, 0, 0x5000, 40, true);
-        // meta_target = V2 → fallback
-        assert_eq!(
-            plan_recv_core(&req),
-            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy),
-        );
+        assert_eq!(plan_recv_core(&req), RecvPlan::KernelRegisterV2MetaFaults);
     }
 
     // ── E. recv_shared_v3 design tests ───────────────────────────────────────

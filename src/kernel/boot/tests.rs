@@ -11879,13 +11879,31 @@ fn stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker() {
         !broad_dispatch.contains("with_scheduler_split_mut("),
         "the BROAD dispatch entry point must not be relocated onto with_scheduler_split_mut"
     );
+    // U9-RECV-BLOCK1 §4. The admission is now a FAMILY: the ambient-contract entry point
+    // `queue_advance_admit_split`, the trap-authority entry point
+    // `queue_advance_admit_with_authority_split`, and the one shared body
+    // `queue_advance_admit_inner_split` that both delegate into. The rank-1 acquisitions moved
+    // into the shared body, so the region is bounded by the commit rather than by the first
+    // entry point's own body. Both entry points are checked to delegate, so "inside the U9-QA
+    // admission" still means exactly one body performs the acquisition.
     let admit = exec_src
         .split("pub(crate) fn queue_advance_admit_split")
         .nth(1)
         .expect("the U9-QA admission must exist")
-        .split("\n    }\n")
+        .split("pub(crate) fn queue_advance_commit_split")
         .next()
-        .expect("its body");
+        .expect("bounded by the U9-QA commit");
+    assert!(
+        exec_src.contains("fn queue_advance_admit_inner_split("),
+        "the shared admission body must exist"
+    );
+    assert_eq!(
+        admit
+            .matches("self.queue_advance_admit_inner_split(")
+            .count(),
+        2,
+        "both admission entry points must delegate into the ONE shared body"
+    );
     let commit = exec_src
         .split("pub(crate) fn queue_advance_commit_split")
         .nth(1)
@@ -23922,13 +23940,78 @@ mod stage32_cap_resolution_tests {
 
     #[test]
     fn stage32_integrated_recv_v2_fallback() {
-        // A recv-v2 metadata request must fall back (None) even with a valid cap.
+        // U9-RECV-BLOCK1 §1(c). This shape — a KERNEL task (tid 0, no user ASID) asking for
+        // recv-v2 metadata — used to be refused as a fallback BEFORE the dequeue. The canonical
+        // owner does not refuse it: it dequeues, encodes the metadata, and faults at
+        // `copy_to_current_user` because there is no ASID to copy into, answering `PageFault`.
+        // The split route is now checked AGAINST that owner rather than against the old refusal.
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_v2_frame(recv_cap);
+        let split = kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+
+        let mut canonical_state = Bootstrap::init().expect("init");
+        let canonical_cap = {
+            let (_eid, send_cap, recv_cap) = canonical_state.create_endpoint(4).expect("endpoint");
+            canonical_state
+                .ipc_send(send_cap, Message::new(7, b"ping").expect("m"))
+                .expect("send");
+            recv_cap
+        };
+        let mut canonical_frame = recv_v2_frame(canonical_cap);
+        let canonical =
+            crate::kernel::syscall::dispatch(&mut canonical_state, &mut canonical_frame);
+
         assert_eq!(
-            kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
-            None,
-            "recv-v2 metadata request must fall back (None)"
+            split,
+            Some(canonical.map_err(TrapHandleError::Syscall)),
+            "the split route must answer exactly what the canonical owner answers"
+        );
+        assert_eq!(
+            split,
+            Some(Err(TrapHandleError::Syscall(SyscallError::PageFault))),
+            "and that answer is the metadata copy fault, not a pre-dequeue refusal"
+        );
+        assert_eq!(
+            frame.ret2(),
+            canonical_frame.ret2(),
+            "the transfer-cap lane must match, cleared on both"
+        );
+        // The message is CONSUMED on both routes: the fault happens after the dequeue, so the
+        // queue is empty on each. Read the depth directly rather than by attempting a second
+        // receive, which would block the caller instead of reporting emptiness.
+        let queued =
+            |ep: crate::kernel::capabilities::CapObject,
+             read: &dyn Fn(&mut dyn FnMut(&crate::kernel::boot::IpcSubsystem))| {
+                let crate::kernel::capabilities::CapObject::Endpoint { index, .. } = ep else {
+                    panic!("recv cap must name an endpoint")
+                };
+                let mut depth = usize::MAX;
+                read(&mut |ipc: &crate::kernel::boot::IpcSubsystem| {
+                    depth = crate::kernel::boot::kernel_ref(
+                        ipc.endpoints[index].as_ref().expect("endpoint present"),
+                    )
+                    .queued();
+                });
+                depth
+            };
+        let split_ep = kernel.with(|s| s.current_task_capability(recv_cap).expect("cap").object);
+        let split_depth = queued(split_ep, &|f| {
+            kernel.with(|s| s.with_ipc_state(|ipc| f(ipc)))
+        });
+        let canonical_ep = canonical_state
+            .current_task_capability(canonical_cap)
+            .expect("cap")
+            .object;
+        let canonical_depth = queued(canonical_ep, &|f| {
+            canonical_state.with_ipc_state(|ipc| f(ipc))
+        });
+        assert_eq!(
+            split_depth, canonical_depth,
+            "both routes must leave the endpoint in the same state"
+        );
+        assert_eq!(
+            split_depth, 0,
+            "and that state is empty: the message was consumed before the fault"
         );
     }
 
@@ -24190,15 +24273,38 @@ mod stage32_cap_resolution_tests {
 
     #[test]
     fn stage32b_ipc_recv_v2_fallback() {
-        // A recv-v2 metadata request must fall back (None) through the LIVE seam.
+        // U9-RECV-BLOCK1 §1(c) — the same re-derivation, through the LIVE seam: a kernel task
+        // asking for recv-v2 metadata is served, not handed off, and it faults at the metadata
+        // copy exactly where the canonical owner faults.
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_v2_frame(recv_cap);
-        assert_eq!(
+        let split =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
-                .legacy(),
-            None,
-            "recv-v2 must fall back through the live seam"
+                .legacy();
+
+        let mut canonical_state = Bootstrap::init().expect("init");
+        let canonical_cap = {
+            let (_eid, send_cap, recv_cap) = canonical_state.create_endpoint(4).expect("endpoint");
+            canonical_state
+                .ipc_send(send_cap, Message::new(7, b"ping").expect("m"))
+                .expect("send");
+            recv_cap
+        };
+        let mut canonical_frame = recv_v2_frame(canonical_cap);
+        let canonical =
+            crate::kernel::syscall::dispatch(&mut canonical_state, &mut canonical_frame);
+
+        assert_eq!(
+            split,
+            Some(canonical.map_err(TrapHandleError::Syscall)),
+            "the live seam must answer exactly what the canonical owner answers"
         );
+        assert_eq!(
+            split,
+            Some(Err(TrapHandleError::Syscall(SyscallError::PageFault))),
+            "and that answer is the metadata copy fault"
+        );
+        assert_eq!(frame.ret2(), canonical_frame.ret2(), "ret2 parity");
     }
 
     #[test]
@@ -24378,12 +24484,10 @@ mod stage33_34 {
 
     #[test]
     fn stage33_legacy_adapter_v2_meta_kernel_task_fallback_on_meta() {
-        // Kernel-task with v2 meta pointer → meta-copy fallback.
+        // U9-RECV-BLOCK1 §1(c): kernel-task with a v2 meta pointer is owed a metadata write that
+        // faults after the dequeue — not a pre-dequeue refusal.
         let req = RecvRequest::from_legacy_ipc_recv(0, CAP0, 0, 0, 0x2000, 40, true);
-        assert_eq!(
-            plan_recv_core(&req),
-            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy),
-        );
+        assert_eq!(plan_recv_core(&req), RecvPlan::KernelRegisterV2MetaFaults);
     }
 
     #[test]
@@ -24458,13 +24562,29 @@ mod stage33_34 {
 
     #[test]
     fn stage33_canonical_core_fallback_for_recv_v2() {
+        // U9-RECV-BLOCK1 §1(c): the canonical core now SERVES this shape and faults at the
+        // metadata copy, which is where the global-lock owner faults too.
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_v2_frame(recv_cap);
-        assert_eq!(
+        let split =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
-                .legacy(),
-            None,
-            "canonical core must fall back for recv-v2 (meta user-copy required)"
+                .legacy();
+
+        let mut canonical_state = Bootstrap::init().expect("init");
+        let canonical_cap = {
+            let (_eid, send_cap, recv_cap) = canonical_state.create_endpoint(4).expect("endpoint");
+            canonical_state
+                .ipc_send(send_cap, Message::new(7, b"ping").expect("m"))
+                .expect("send");
+            recv_cap
+        };
+        let mut canonical_frame = recv_v2_frame(canonical_cap);
+        let canonical =
+            crate::kernel::syscall::dispatch(&mut canonical_state, &mut canonical_frame);
+        assert_eq!(split, Some(canonical.map_err(TrapHandleError::Syscall)));
+        assert_eq!(
+            split,
+            Some(Err(TrapHandleError::Syscall(SyscallError::PageFault)))
         );
     }
 
@@ -24539,15 +24659,34 @@ mod stage33_34 {
 
     #[test]
     fn stage33_recv_v2_full_path_still_fallback_via_seam() {
-        // A recv-v2 IpcRecv request (NR 2 with meta pointer) must still fall
-        // back through the LIVE seam.
+        // U9-RECV-BLOCK1 §1(c). A recv-v2 `IpcRecv` from a KERNEL task is no longer handed off:
+        // the split route serves it and faults at the metadata copy, matching the canonical
+        // owner. The old `None` pinned the pre-dequeue refusal this slice removed.
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_v2_frame(recv_cap);
-        assert_eq!(
+        let split =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
-                .legacy(),
-            None,
-            "recv-v2 must fall back via live seam (meta user-copy required)"
+                .legacy();
+
+        let mut canonical_state = Bootstrap::init().expect("init");
+        let canonical_cap = {
+            let (_eid, send_cap, recv_cap) = canonical_state.create_endpoint(4).expect("endpoint");
+            canonical_state
+                .ipc_send(send_cap, Message::new(7, b"ping").expect("m"))
+                .expect("send");
+            recv_cap
+        };
+        let mut canonical_frame = recv_v2_frame(canonical_cap);
+        let canonical =
+            crate::kernel::syscall::dispatch(&mut canonical_state, &mut canonical_frame);
+        assert_eq!(
+            split,
+            Some(canonical.map_err(TrapHandleError::Syscall)),
+            "the live seam must answer exactly what the canonical owner answers"
+        );
+        assert_eq!(
+            split,
+            Some(Err(TrapHandleError::Syscall(SyscallError::PageFault)))
         );
     }
 
@@ -25025,11 +25164,9 @@ mod stage35 {
                 len: 40
             }
         );
-        // Even a kernel task falls back when V2 meta is present (user meta-copy).
-        assert_eq!(
-            plan_recv_core(&req),
-            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy)
-        );
+        // U9-RECV-BLOCK1 §1(c): a kernel task with V2 meta present is owed the metadata write,
+        // and it faults where the canonical owner faults — after the dequeue, not before it.
+        assert_eq!(plan_recv_core(&req), RecvPlan::KernelRegisterV2MetaFaults);
     }
 
     #[test]
@@ -25542,18 +25679,30 @@ mod stage36 {
 
     #[test]
     fn stage36_recv_v2_still_falls_back() {
-        // recv-v2 (meta pointer) must still fall back to global-lock path.
+        // U9-RECV-BLOCK1 §1(c): recv-v2 on a kernel task is served and faults at the metadata
+        // copy, matching the global-lock owner exactly.
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
-        let mut frame = TrapFrame::new(
-            Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, 0x1000, 64, 0x5000, 40, 0],
-        );
-        let result =
+        let args = |cap: CapId| [cap.0 as usize, 0x1000, 64, 0x5000, 40, 0];
+        let mut frame = TrapFrame::new(Syscall::IpcRecv as usize, args(recv_cap));
+        let split =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
                 .legacy();
+
+        let mut canonical_state = Bootstrap::init().expect("init");
+        let canonical_cap = {
+            let (_eid, send_cap, recv_cap) = canonical_state.create_endpoint(4).expect("endpoint");
+            canonical_state
+                .ipc_send(send_cap, Message::new(7, b"ping").expect("m"))
+                .expect("send");
+            recv_cap
+        };
+        let mut canonical_frame = TrapFrame::new(Syscall::IpcRecv as usize, args(canonical_cap));
+        let canonical =
+            crate::kernel::syscall::dispatch(&mut canonical_state, &mut canonical_frame);
+        assert_eq!(split, Some(canonical.map_err(TrapHandleError::Syscall)));
         assert_eq!(
-            result, None,
-            "recv-v2 must still fall back (meta user-copy)"
+            split,
+            Some(Err(TrapHandleError::Syscall(SyscallError::PageFault)))
         );
     }
 
@@ -25718,12 +25867,14 @@ mod stage37 {
 
     #[test]
     fn stage37_plan_kernel_task_v2_meta_still_fallback() {
-        // Kernel task + V2 meta → RecvV2MetaUserCopy (no user ASID to copy to).
+        // U9-RECV-BLOCK1 §1(c). "No user ASID to copy to" is the right reason and was attached to
+        // the wrong disposition: the canonical owner discovers it AT the copy, after the dequeue
+        // and the mint, and answers `PageFault` with a rollback. The plan names that outcome.
         let req = RecvRequest::from_recv_v2(1, CAP0, 0, 0, 0x5000, 40, true);
         assert_eq!(
             plan_recv_core(&req),
-            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy),
-            "kernel-task + V2 meta must still fall back"
+            RecvPlan::KernelRegisterV2MetaFaults,
+            "kernel-task + V2 meta is owed a metadata write that faults at the copy"
         );
     }
 
@@ -33961,8 +34112,19 @@ mod stage115_d2_d6_seam_analysis {
             code.contains("recv_block_phase_a_split(")
                 && code.contains("recv_block_phase_b_split(")
                 && code.contains("recv_block_phase_c_split(")
-                && code.contains("recv_block_unwind_race_split("),
+                // U9-RECV-BLOCK1 §3 renamed the inverse: `recv_block_unwind_race_split` took a
+                // bare TID and returned `bool`. The replacement authenticates against the exact
+                // `{tid, asid, priority, wait_generation}` this transaction minted and reports
+                // which of the two failures happened, so the caller can tell "may resume the
+                // entering frame" from "must not".
+                && code.contains("recv_block_unwind_exact_split("),
             "the pre-lock blocking recv must drive the SharedKernel twins"
+        );
+        // And the TID-only inverse is gone, not merely unused — a compensation keyed on a numeric
+        // TID can overwrite a replacement incarnation or another winner's status.
+        assert!(
+            !code.contains("recv_block_unwind_race_split("),
+            "the TID-only unwind must not return"
         );
     }
 
@@ -71786,12 +71948,31 @@ mod stage198e3c1_direct_live_policy {
         assert!(MOD_SRC.contains("if !shared_region_direct_oracle_enabled() {\n        return;"));
         // The hook checks the recv-v2 state, the oracle VA, and a real metadata pointer before it
         // acknowledges, and confirms the endpoint waiter identity is committed for THIS receiver.
+        //
+        // U9-RECV-BLOCK1 §2 moved those four checks into the ONE shared publication body
+        // `publish_shared_region_blocked_recv_ack_with`, which the broad arm above delegates
+        // into and which the off-lock split blocking route also drives. So the checks are
+        // asserted on the shared body, and the broad arm is asserted to delegate — strictly
+        // stronger than before, since the contract now demonstrably governs BOTH arms rather
+        // than the broad one alone.
+        assert!(
+            MOD_SRC.contains("fn publish_shared_region_blocked_recv_ack_with"),
+            "the ONE shared acknowledgement publication body must exist"
+        );
+        let broad_arm = MOD_SRC
+            .split_once("pub(crate) fn maybe_publish_shared_region_blocked_recv_ack")
+            .and_then(|(_, r)| r.split_once("\npub(crate) fn ").map(|(b, _)| b))
+            .expect("broad arm body");
+        assert!(
+            broad_arm.contains("publish_shared_region_blocked_recv_ack_with("),
+            "the broad blocked-recv arm must delegate into the shared publication body"
+        );
         let hook = MOD_SRC
-            .split_once("fn maybe_publish_shared_region_blocked_recv_ack")
+            .split_once("fn publish_shared_region_blocked_recv_ack_with")
             .and_then(|(_, r)| r.split_once("\npub(crate) fn ").map(|(b, _)| b))
             .or_else(|| {
                 MOD_SRC
-                    .split_once("fn maybe_publish_shared_region_blocked_recv_ack")
+                    .split_once("fn publish_shared_region_blocked_recv_ack_with")
                     .map(|(_, r)| r)
             })
             .expect("hook body");
@@ -71807,9 +71988,13 @@ mod stage198e3c1_direct_live_policy {
             hook.contains("state.meta_user_ptr == 0"),
             "metadata ptr checked"
         );
+        // The shared body asks its CALLER for the live waiter — that parameterisation is the
+        // whole point of §2 — so the check appears here as the call, and the broad arm is
+        // separately asserted to answer it with the authoritative read it always used.
+        assert!(hook.contains("live_waiter(index)"), "waiter commit checked");
         assert!(
-            hook.contains("endpoint_waiter_identity(index)"),
-            "waiter commit checked"
+            broad_arm.contains("ipc.endpoint_waiter_identity(index)"),
+            "the broad arm must answer it with the authoritative rank-3 read"
         );
     }
 
@@ -119916,12 +120101,21 @@ mod stage199d_wa2a_ownership_boundary {
             //   acquisition that mints the fresh wait generation and stores the blocked-recv
             //   writeback state, so a task cannot be Blocked for a receive whose generation was
             //   never advanced or whose payload/meta pointers do not yet exist.
-            // - `recv_block_unwind_race_split` writes `Blocked -> Runnable`, the split form of
+            // - `recv_block_unwind_exact_split` writes `Blocked -> Runnable`, the split form of
             //   the reversal `KernelState::recv_block_unwind_race` performs. It is the EXACT
-            //   inverse of the writer above and runs only on the `QueueNonEmpty` race, before
-            //   any waiter was published. The wait generation is deliberately NOT rolled back —
+            //   inverse of the writer above and runs only on the post-clear races, before any
+            //   waiter was published. The wait generation is deliberately NOT rolled back —
             //   generations only advance, and a rollback would let a stale record compare equal
             //   to a newer one.
+            //
+            //   U9-RECV-BLOCK1 §3 made the write exact rather than by-TID. The predecessor
+            //   `recv_block_unwind_race_split` located its victim by `t.tid.0 == tid` alone and
+            //   then assigned `Runnable` whatever it found, so a replacement incarnation that had
+            //   reused the numeric TID, another winner's status, or another transaction's pending
+            //   work could be overwritten. The write now happens only when `{tid, asid,
+            //   blocked_recv_generation}` all match AND the task is still
+            //   `Blocked(EndpointReceive(_))` — this transaction's own waiter and no other. The
+            //   site count is unchanged: the writer was made exact, it did not multiply.
             ("src/runtime.rs", 11),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
@@ -119929,7 +120123,17 @@ mod stage199d_wa2a_ownership_boundary {
             if !src.contains("TaskStatus") {
                 continue;
             }
-            let n = src.matches(".status = ").count() + src.matches("status: TaskStatus::").count();
+            // Count CODE, not prose. A doc comment that quotes a status write — for instance the
+            // one on `recv_block_unwind_exact_split` explaining why the unwind it replaced wrote
+            // `Runnable` unconditionally — is not a writer, and counting it would make the census
+            // answer to how the owners are described rather than to what they do.
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            let n =
+                code.matches(".status = ").count() + code.matches("status: TaskStatus::").count();
             if n > 0 {
                 found.push((rel, n));
             }
@@ -119948,7 +120152,7 @@ mod stage199d_wa2a_ownership_boundary {
             "38 raw writes (U6 added `commit_blocking_send_split`; U7 added \
              `drain_send_timeout_post_work`; U9-F added \
              `wake_destroyed_notification_waiter_split`; U9-RX3 added the exact BLOCK/UNWIND \
-             pair `recv_block_phase_b_split` and `recv_block_unwind_race_split`; U9-FORK1 \
+             pair `recv_block_phase_b_split` and `recv_block_unwind_exact_split`; U9-FORK1 \
              RETIRED `fork_complete_post_clone`'s direct Runnable write, 36 -> 35, because the \
              fork child now becomes live through the reservation commit; U9-REAP1 MOVED the \
              faulted reap's `-> Dead` write into the claim and added its exact inverse, \
@@ -120577,12 +120781,17 @@ mod stage199d_wa2b_wake_owner_census {
             Verdict::IntoBlocked,
         ),
         // U9-RX3: the UNWIND half — the exact inverse of the writer above, taken only on the
-        // `QueueNonEmpty` race before any waiter was published. It acts on a
+        // post-clear races before any waiter was published. It acts on a
         // `Blocked(EndpointReceive)` task, so it carries the same verdict as the in-lock
         // reversal it mirrors (`recv_block_unwind_race`).
+        //
+        // U9-RECV-BLOCK1 §3 renamed it `recv_block_unwind_exact_split` and made the match exact:
+        // `{tid, asid, blocked_recv_generation}` plus a live `Blocked(EndpointReceive(_))` check.
+        // The verdict is unchanged — it still CAN act on a `Blocked(EndpointReceive)` task,
+        // because that is precisely and only the task it is allowed to act on.
         (
             "src/runtime.rs",
-            "recv_block_unwind_race_split",
+            "recv_block_unwind_exact_split",
             1,
             Verdict::Can,
         ),
@@ -121072,7 +121281,7 @@ mod stage199d_wa2b_wake_owner_census {
         ),
         (
             "src/runtime.rs",
-            "recv_block_unwind_race_split",
+            "recv_block_unwind_exact_split",
             "tcb.status",
             "TaskStatus::Runnable",
             "tcb.ipc_timeout_fired = false;",
@@ -121183,6 +121392,15 @@ mod stage199d_wa2b_wake_owner_census {
             let lines: alloc::vec::Vec<&str> = src.lines().collect();
             for at in offsets {
                 let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                // A status write QUOTED IN PROSE is not a writer. `recv_block_unwind_exact_split`'s
+                // doc comment quotes the unconditional `tcb.status = TaskStatus::Runnable` its
+                // by-TID predecessor performed, precisely to say why that form was wrong; counting
+                // it would attribute a write to whichever function happened to precede the comment
+                // and make the census answer to how the owners are described rather than to what
+                // they do.
+                if src[line_start..].trim_start().starts_with("//") {
+                    continue;
+                }
                 let line_index = src[..at].matches('\n').count();
                 let end = src[at..]
                     .find(';')
@@ -121680,7 +121898,8 @@ mod stage199d_wa2b_wake_owner_census {
         // anything, so it can never act on a `Blocked(EndpointReceive)` task — CANNOT moves
         // 16 → 17 and nothing else moves.
         // U9-RX3 adds exactly TWO rows, one to each of two classes, and nothing else moves.
-        // `recv_block_unwind_race_split` joins CAN (14 → 15): it writes
+        // `recv_block_unwind_exact_split` (then named `recv_block_unwind_race_split`) joins
+        // CAN (14 → 15): it writes
         // `Blocked(EndpointReceive) -> Runnable`, the split form of the reversal
         // `recv_block_unwind_race` performs, so it is the same class as the in-lock writer it
         // mirrors. `recv_block_phase_b_split` joins INTO-BLOCKED (8 → 9): it only ever moves a
@@ -127613,6 +127832,13 @@ mod u3_owner_revalidation_transaction {
         // This increment converted none of the rollback family. U9-D3 §6 later retired their
         // broad acquisitions onto the phased split composition, so what this guard pins is the
         // callsite COUNT — still three, still the same three operations — not their lock shape.
+        //
+        // U9-RECV-BLOCK1 §1(c) raised the count 3 -> 4. The new caller is
+        // `kernel_register_v2_meta_write_split`: a kernel-register receive carrying a recv-v2
+        // metadata buffer used to be refused BEFORE the dequeue, so no mint existed to undo. The
+        // canonical owner does not refuse it — it dequeues, mints, and faults at the metadata
+        // copy — so the split route now reaches that fault and owes the SAME undo the other three
+        // owe. A newly reachable caller of the existing operation, not a new rollback policy.
         let code = code_of(RUNTIME);
         assert!(
             code.contains("rollback_materialized_recv_cap_no_vm_split("),
@@ -127621,8 +127847,8 @@ mod u3_owner_revalidation_transaction {
         assert_eq!(
             code.matches("rollback_materialized_recv_cap_no_vm_split(")
                 .count(),
-            3,
-            "all three legacy rollback call sites remain"
+            4,
+            "all four legacy rollback call sites remain"
         );
     }
 }
@@ -128104,12 +128330,19 @@ mod u3_recv_copy_fault_completion {
     fn the_dependency_blocked_and_deferred_acquisitions_all_remain() {
         // U9-D3 §6 lifted the D3 dependency and retired these three broad acquisitions; the three
         // rollback OPERATIONS remain, unnarrowed, on the phased split composition.
+        //
+        // U9-RECV-BLOCK1 §1(c) raised the count 3 -> 4. The new caller is
+        // `kernel_register_v2_meta_write_split`: a kernel-register receive carrying a recv-v2
+        // metadata buffer used to be refused BEFORE the dequeue, so no mint existed to undo. The
+        // canonical owner does not refuse it — it dequeues, mints, and faults at the metadata
+        // copy — so the split route now reaches that fault and owes the SAME undo the other three
+        // owe. A newly reachable caller of the existing operation, not a new rollback policy.
         let code = code_of(RUNTIME);
         assert_eq!(
             code.matches("rollback_materialized_recv_cap_no_vm_split(")
                 .count(),
-            3,
-            "all three capability-rollback callsites remain"
+            4,
+            "all four capability-rollback callsites remain"
         );
         // The deferred ordinary-cap sender wake is still performed, now through its split form.
         let ordinary = body_of("fn complete_recv_boundary_ordinary_cap");
@@ -128550,11 +128783,18 @@ mod u3_riscv_terminal_idle_snapshot {
     fn the_out_of_scope_runtime_acquisitions_are_unchanged() {
         // Re-derived for U9-D3 §6, which retired the three broad rollback acquisitions: what is
         // pinned is that this drain touched none of those callsites, not their lock shape.
+        //
+        // U9-RECV-BLOCK1 §1(c) raised the count 3 -> 4. The new caller is
+        // `kernel_register_v2_meta_write_split`: a kernel-register receive carrying a recv-v2
+        // metadata buffer used to be refused BEFORE the dequeue, so no mint existed to undo. The
+        // canonical owner does not refuse it — it dequeues, mints, and faults at the metadata
+        // copy — so the split route now reaches that fault and owes the SAME undo the other three
+        // owe. A newly reachable caller of the existing operation, not a new rollback policy.
         let code = code_of(RUNTIME);
         assert_eq!(
             code.matches("rollback_materialized_recv_cap_no_vm_split(")
                 .count(),
-            3,
+            4,
             "the capability-rollback callsites are untouched by this drain"
         );
         let ordinary = body_of(RUNTIME, "fn complete_recv_boundary_ordinary_cap");
@@ -129143,11 +129383,18 @@ mod u3_ordinary_cap_sender_wake {
         let code = code_of(RUNTIME);
         // U9-D3 §6 retired their broad acquisitions; the three rollback callsites themselves
         // remain, unnarrowed, on the phased split composition.
+        //
+        // U9-RECV-BLOCK1 §1(c) raised the count 3 -> 4. The new caller is
+        // `kernel_register_v2_meta_write_split`: a kernel-register receive carrying a recv-v2
+        // metadata buffer used to be refused BEFORE the dequeue, so no mint existed to undo. The
+        // canonical owner does not refuse it — it dequeues, mints, and faults at the metadata
+        // copy — so the split route now reaches that fault and owes the SAME undo the other three
+        // owe. A newly reachable caller of the existing operation, not a new rollback policy.
         assert_eq!(
             code.matches("rollback_materialized_recv_cap_no_vm_split(")
                 .count(),
-            3,
-            "the three capability-rollback callsites remain"
+            4,
+            "the four capability-rollback callsites remain"
         );
         // The queued-receive Phase-A broad acquisition.
         assert!(
@@ -140059,17 +140306,17 @@ mod u9c_reply_cap_ordered_transaction {
         }
     }
 
-    /// The three ordinary rollback callsites all remain. U9-C retired none of them; U9-D3 §6
+    /// The ordinary rollback callsites all remain. U9-C retired none of them; U9-D3 §6
     /// later moved all three off the broad lock without removing a single callsite, taking the
-    /// census 6 -> 3.
+    /// census 6 -> 3. U9-RECV-BLOCK1 §1(c) raised this 3 -> 4: `kernel_register_v2_meta_write_split` reaches the SAME rollback operation from a shape that used to be refused before the dequeue, so no rollback could be owed there. Not a new policy — a newly reachable caller of the existing one.
     #[test]
     fn all_three_ordinary_rollback_callsites_remain() {
         let code = code_of(RUNTIME);
         assert_eq!(
             code.matches("rollback_materialized_recv_cap_no_vm_split(")
                 .count(),
-            3,
-            "all three ordinary rollback callers must remain; U9-C retires none of them"
+            4,
+            "all four ordinary rollback callers must remain; U9-C retires none of them"
         );
     }
 
@@ -140087,9 +140334,23 @@ mod u9c_reply_cap_ordered_transaction {
     /// them, and so did the possibility of a receive being handed to the broad dispatcher because
     /// of what its message contained.
     ///
-    /// The residual admission gates that remain are NOT about the message: a parked receiver on
-    /// the endpoint, and a non-buffered endpoint. Those are pinned here so they cannot silently
-    /// grow a message-shape sibling.
+    /// U9-RECV-BLOCK1 §2 then retired the last two gates as well, and neither was about the
+    /// message either:
+    ///
+    /// * `endpoint_waiter_present` — refusing because another receiver is parked was an INVENTED
+    ///   exclusivity rule. `publish_recv_waiter_locked` is last-receiver-WINS: it displaces the
+    ///   incumbent through CLAIM(Teardown) → CANCEL → RETIRE and publishes the new one. There is
+    ///   no canonical outcome in which a parked receiver makes a queued message undeliverable, so
+    ///   the gate had no counterpart to reproduce.
+    /// * `!= EndpointMode::Buffered` — refusing a synchronous endpoint guarded a population
+    ///   production cannot construct. `create_endpoint` is
+    ///   `create_endpoint_with_mode(depth, EndpointMode::Buffered)` and every production caller
+    ///   uses it; the only four `Synchronous` constructions in the tree are inside
+    ///   `#[cfg(test)] mod tests` in `syscall.rs`, and no syscall creates an endpoint at all.
+    ///
+    /// So the take now declines for exactly the reasons the SHARED dequeue policy declines —
+    /// out-of-range, missing, empty, full — and this guard pins that none of the retired gates
+    /// can come back.
     #[test]
     fn no_message_shape_is_declined_at_admission() {
         let admitted = body_of(
@@ -140110,20 +140371,33 @@ mod u9c_reply_cap_ordered_transaction {
             !code.contains("OPCODE_SHARED_MEM") && !code.contains("FLAG_REPLY_CAP"),
             "the take must not inspect the message's opcode or transfer flags at all"
         );
-        // The two gates that DO remain, and the fact that they precede the take.
-        let receiver = code
-            .find("endpoint_waiter_present(endpoint_idx)")
-            .expect("a parked receiver still declines");
-        let buffered = code
-            .find("!= EndpointMode::Buffered")
-            .expect("a non-buffered endpoint still declines");
-        let take = code
-            .find("endpoint_take_with_refill_locked(ipc, endpoint_idx)")
-            .expect("the shared take");
+        // U9-RECV-BLOCK1 §2: the last two gates are gone, and may not come back.
         assert!(
-            receiver < take && buffered < take,
-            "the residual admission gates decide before anything is consumed"
+            !code.contains("endpoint_waiter_present(endpoint_idx)"),
+            "a parked receiver is not a decline: the waiter publication is last-receiver-WINS"
         );
+        assert!(
+            !code.contains("EndpointMode::Buffered"),
+            "endpoint mode is not a decline: production constructs only Buffered endpoints"
+        );
+        // What remains decides nothing before the take except the range check the shared policy
+        // repeats: every other answer comes OUT of the one dequeue/refill owner.
+        assert!(
+            code.contains("endpoint_take_with_refill_locked(ipc, endpoint_idx)"),
+            "the shared take"
+        );
+        for outcome in [
+            "EndpointTakeOutcome::Took",
+            "EndpointTakeOutcome::Empty",
+            "EndpointTakeOutcome::EndpointMissing",
+            "EndpointTakeOutcome::IndexOutOfRange",
+            "EndpointTakeOutcome::QueueFull",
+        ] {
+            assert!(
+                code.contains(outcome),
+                "every shape the shared policy can answer must be matched here: {outcome}"
+            );
+        }
 
         // And Phase A no longer carries the class declines it used to.
         let phase_a = phase_a_body()
@@ -141232,8 +141506,8 @@ mod u9f_split_capability_revocation {
                 + code
                     .matches("shared.rollback_materialized_recv_cap_no_vm_split(")
                     .count(),
-            3,
-            "and all three sites go to the split composition"
+            4,
+            "and all four sites go to the split composition"
         );
     }
 
@@ -141266,10 +141540,9 @@ mod u9f_split_capability_revocation {
                 "no site may negate the offer: there is no broad path left to select"
             );
         }
-        assert_eq!(
-            sites, 3,
-            "all three ordinary rollback sites must be covered"
-        );
+        // U9-RECV-BLOCK1 §1(c): 3 -> 4. `kernel_register_v2_meta_write_split` reaches the same
+        // rollback from a shape that used to be refused before the dequeue.
+        assert_eq!(sites, 4, "all four ordinary rollback sites must be covered");
     }
 
     /// The broad teardown body is untouched: every obligation it owes is still there.
@@ -144174,10 +144447,19 @@ mod u9qa_apply_convention {
     const SPLIT: &str = include_str!("../syscall_split.rs");
     const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
 
+    /// The admission FAMILY: the ambient-contract entry point `queue_advance_admit_split`, the
+    /// trap-authority entry point `queue_advance_admit_with_authority_split` that U9-RECV-BLOCK1
+    /// §4 added, and the one shared body `queue_advance_admit_inner_split` both delegate into.
+    ///
+    /// The region is bounded by the commit rather than by the first entry point's own body,
+    /// because the screens and refusals these guards are about live in the shared body now. That
+    /// is not a loosening: `stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker`
+    /// separately proves both entry points delegate, so "somewhere in this region" still means
+    /// "in the one body that performs the acquisition".
     fn admit_body() -> &'static str {
         EXEC.split("pub(crate) fn queue_advance_admit_split")
             .nth(1)
-            .and_then(|s| s.split("\n    /// ").next())
+            .and_then(|s| s.split("pub(crate) fn queue_advance_commit_split").next())
             .expect("the admission body")
     }
 
@@ -144363,17 +144645,31 @@ mod u9qa_apply_convention {
             whitelist.contains("SYSCALL_IPC_RECV_NR"),
             "RISC-V must admit NR 2 into the split dispatcher"
         );
-        // And nothing in the route yields NR 5 back to the broad arm: all three publication
-        // yields are scoped to NR 2, whose handler owns the hooks they protect.
-        for yielded in [
-            "if !recv_timeout && cfg!(feature = \"shared-region-direct-oracle\")",
-            "if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm()",
-        ] {
-            assert!(
-                SPLIT_SRC.contains(yielded),
-                "every broad-arm yield must be scoped to NR 2: {yielded}"
-            );
-        }
+        // And nothing in the route yields NR 5 back to the broad arm. The remaining publication
+        // yield is scoped to NR 2, whose handler owns the hook it protects.
+        assert!(
+            SPLIT_SRC.contains(
+                "if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm()"
+            ),
+            "the selector-keyed yield must stay scoped to NR 2"
+        );
+        // U9-RECV-BLOCK1 §2 RETIRED the shared-region-oracle yield entirely, and it must not come
+        // back. It was `cfg!(feature = "shared-region-direct-oracle")` — a COMPILE-TIME term that
+        // fired on every NR 2 blocking receive in any build where the feature was compiled in,
+        // whether or not the oracle was ever enabled at runtime. It existed only because the
+        // acknowledgement body needed a broad `&KernelState` for two reads; the body is now
+        // parameterised on those two reads (`publish_shared_region_blocked_recv_ack_with`) and
+        // step (10) publishes the acknowledgement itself, so the yield protects nothing.
+        assert!(
+            !SPLIT_SRC
+                .contains("if !recv_timeout && cfg!(feature = \"shared-region-direct-oracle\")"),
+            "the compile-time oracle yield is retired: a compiled feature must not force \
+             unrelated receives broad"
+        );
+        assert!(
+            SPLIT_SRC.contains("publish_shared_region_blocked_recv_ack_with("),
+            "and the route must publish the acknowledgement itself instead of yielding"
+        );
         // DIRECT3-CAP-FINAL §5: there used to be a THIRD yield, scoped to non-x86_64 and keyed
         // on `ipccall_direct_publication_enabled()`. It was written when only the broad arm
         // could publish the NR6/NR7 acknowledgements; step (10) has published them
@@ -145477,13 +145773,51 @@ mod u9qa_one_queue_advance_owner {
 
     /// The commit cannot refuse, so the CPU authentication the shared step performs must already
     /// have been checked by admission — before the caller published its terminal transition.
+    ///
+    /// U9-RECV-BLOCK1 §4 made WHICH authentication depend on what the caller holds, and the guard
+    /// checks both halves. A caller with no trap authority keeps the ambient contract exactly as
+    /// it was: the single-dispatching-CPU restriction and the `sched.current_cpu` comparison. A
+    /// caller holding a `DispatchAuthority` has already answered both questions unforgeably — the
+    /// authority names its CPU from hardware, is one-shot per trap via its epoch, and the
+    /// selection owner authenticates against that same value — so neither ambient term applies to
+    /// it. The body checks the authority is still live BEFORE it takes rank 1, which is the
+    /// pre-check this test is about.
     #[test]
     fn admission_pre_checks_the_authentication_the_commit_cannot_refuse_on() {
-        let admit = body_of(EXEC, "pub(crate) fn queue_advance_admit_split(");
+        // The acquisition and both contracts live in the ONE shared body the two entry points
+        // delegate into; `stage113_d6_...` separately proves that delegation.
+        let admit = body_of(EXEC, "fn queue_advance_admit_inner_split(");
         assert!(
             admit.contains("if dispatch_cpu != cpu {")
                 && admit.contains("QueueAdvanceRefusal::CpuNotAuthoritative"),
             "admission must pre-check the dispatch-CPU authentication"
+        );
+        // The ambient terms are REACHED ONLY when no authority was supplied…
+        let ambient = admit
+            .find("if authority.is_none() {")
+            .expect("the ambient contract must be scoped to callers without an authority");
+        for term in ["QueueAdvanceRefusal::MultiCpu", "if dispatch_cpu != cpu {"] {
+            let at = admit.find(term).unwrap_or_else(|| panic!("{term}"));
+            assert!(
+                ambient < at,
+                "`{term}` is the AMBIENT contract and must sit inside the no-authority arm"
+            );
+        }
+        // …and an authority-bearing caller is screened on liveness before it takes rank 1.
+        let with_authority = EXEC
+            .split("pub(crate) fn queue_advance_admit_with_authority_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("the authority entry point");
+        let live = with_authority
+            .find("if !authority.is_live() {")
+            .expect("a stale authority must be refused");
+        let delegate = with_authority
+            .find("self.queue_advance_admit_inner_split(")
+            .expect("it delegates into the shared body");
+        assert!(
+            live < delegate,
+            "a stale authority must not even reach the shared body's rank-1 acquisition"
         );
         // And the commit still handles every non-selection explicitly rather than by a wildcard,
         // mapping each to the only truthful outcome for a step that dequeued nothing.
@@ -148196,11 +148530,41 @@ mod u9rx3_route {
             after.contains("reason=deadline_reservation"),
             "the deadline-reservation refusal is one of them, and names itself"
         );
+        // U9-RECV-BLOCK1 §3 settled three of the five. What the reservation invariant actually
+        // claims is that every post-reservation EXIT releases it, and that is now stronger than
+        // counting hand-offs, because three of those exits no longer hand off at all:
+        //
+        // * the race branch (`QueueNonEmpty` / `WaiterOwnershipBusy`) settles through the
+        //   immediate receive owner or `WouldBlock` after an exact unwind;
+        // * `ReceiverAlreadyWaiting` / `InvalidEndpoint` settle as `WrongObject`;
+        // * the deadline-reservation refusal settles from its own post-state.
+        //
+        // The three hand-offs that remain are the three PRE-MUTATION ones: the reservation
+        // itself failing (nothing reserved, nothing to clear), a Phase A compare-and-clear that
+        // refused without touching the slot, and a Phase B failure whose exact restore succeeded
+        // — in all three the caller is provably still current, so returning through the entering
+        // frame is licensed and the broad arm runs the syscall from an unchanged state.
         assert_eq!(
             after.matches("D::NotHandled").count(),
-            5,
-            "the only fallbacks at or after the reservation are: reservation failed, phase A, \
-             phase B, the race branch, and the deadline-reservation refusal"
+            3,
+            "the only hand-offs at or after the reservation are the three pre-mutation ones: \
+             reservation failed, phase A refused without mutating, and phase B restored exactly"
+        );
+        for reason in [
+            "reason=defer_unavailable",
+            "reason=phase_a",
+            "reason=phase_b restored={}",
+        ] {
+            assert!(
+                after.contains(reason),
+                "each remaining hand-off must name itself: {reason}"
+            );
+        }
+        // And every exit that is NOT one of those three settles: no post-mutation path may hand
+        // the frame back to a dispatcher that would re-run the syscall against a changed state.
+        assert!(
+            after.contains("IPC_RECV_BLOCK_SPLIT_SETTLED"),
+            "the post-mutation races settle rather than hand off, and say so"
         );
     }
 
@@ -148220,19 +148584,43 @@ mod u9rx3_route {
         );
     }
 
-    /// THE RACE BRANCH RUNS THE INVERSE. `QueueNonEmpty` must reach `recv_block_unwind_race_split`
-    /// — the branch exists precisely because the block cannot be left standing.
+    /// THE RACE BRANCH RUNS THE INVERSE. `QueueNonEmpty` must reach the unwind — the branch
+    /// exists precisely because the block cannot be left standing.
+    ///
+    /// U9-RECV-BLOCK1 §3 strengthens the claim in two ways, and both are asserted here. The
+    /// inverse is now the EXACT one (`recv_block_unwind_exact_split`, which matches
+    /// `{tid, asid, blocked_recv_generation}` and refuses anything that is not still parked on
+    /// this receive), and the arm no longer answers at all until the unwind reports that this
+    /// exact incarnation is current again — `may_resume_entering_frame()`. Returning through the
+    /// entering frame after `current` was cleared is only licensed by that proof.
     #[test]
-    fn the_queue_non_empty_branch_runs_the_unwind() {
+    fn the_queue_non_empty_branch_runs_the_exact_unwind_before_it_answers() {
         let code = route_code();
+        // The by-TID predecessor must be gone from the route entirely.
+        assert!(
+            !code.contains("recv_block_unwind_race_split("),
+            "the by-TID unwind must not survive anywhere in the route"
+        );
         let arm = code
             .find("PublishWaiterOutcome::QueueNonEmpty =>")
             .expect("the race arm must be matched explicitly");
         let tail = &code[arm..];
         let stop = tail.find("\n        _ =>").unwrap_or(tail.len());
+        let arm_code = &tail[..stop];
+        let unwind = arm_code
+            .find("recv_block_unwind_exact_split(")
+            .expect("the race arm must run the EXACT inverse before it falls back");
+        let resumable = arm_code
+            .find("may_resume_entering_frame()")
+            .expect("the arm must prove the entering frame is resumable before answering");
         assert!(
-            tail[..stop].contains("recv_block_unwind_race_split("),
-            "the race arm must run the inverse before it falls back"
+            unwind < resumable,
+            "the resumability proof must come FROM the unwind, not before it"
+        );
+        // And the unwind is handed this transaction's own identity, not a bare TID.
+        assert!(
+            arm_code.contains("block_identity(wait_generation)"),
+            "the unwind must be given this transaction's exact identity"
         );
     }
 
@@ -166966,13 +167354,41 @@ mod u9dispatchcpu1_authority {
                 );
             }
         }
-        // The struct literal form is confined to the two constructors, both in runtime.rs.
+        // The struct literal form is confined to the type's own constructors, all in runtime.rs.
+        //
+        // U9-RECV-BLOCK1 §4 adds a THIRD: `for_open_window`, which the receive family's admission
+        // needs because that family enters from a trap that has already established its window and
+        // does not carry the authority down. It does NOT manufacture anything — it READS this
+        // CPU's live `TRAP_DISPATCH_WINDOW` cell, so when no window is open it produces the
+        // reserved epoch 0 and `is_live()` is false, exactly as `none` is. That is the property
+        // this guard exists to protect, so it is asserted directly below rather than approximated
+        // by the literal count.
         let runtime = production_source("src/runtime.rs");
         assert_eq!(
             runtime.matches("Self { cpu, epoch }").count()
                 + runtime.matches("Self { cpu, epoch: 0 }").count(),
-            2,
-            "the only two struct literals are `mint` and `none`, both on the type itself"
+            3,
+            "the only struct literals are `mint`, `none` and `for_open_window`, all on the type"
+        );
+        let for_open = runtime
+            .split("pub(crate) fn for_open_window(cpu: CpuId) -> Self {")
+            .nth(1)
+            .expect("the window-reading constructor")
+            .split("\n    }")
+            .next()
+            .expect("its body");
+        assert!(
+            for_open.contains("TRAP_DISPATCH_WINDOW[idx]")
+                && for_open.contains("core::sync::atomic::Ordering::Acquire"),
+            "the epoch must be READ from the live window cell, never chosen"
+        );
+        assert!(
+            !for_open.contains("epoch: 1") && !for_open.contains("epoch + 1"),
+            "no constructor may invent or advance an epoch: only `TrapPathWindow` opens a window"
+        );
+        assert!(
+            for_open.contains("return Self::none(cpu);"),
+            "an out-of-range CPU must produce the authorizes-nothing form"
         );
     }
 

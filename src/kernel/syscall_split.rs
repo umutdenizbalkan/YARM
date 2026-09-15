@@ -1834,7 +1834,7 @@ fn recv_encode_empty_answer(
 /// published waiter must also observe a `Blocked` TCB, or it will attempt direct delivery to a
 /// task that is still `Running`. So the recheck-loses race (`QueueNonEmpty`) cannot be made
 /// mutation-free, and this route must be able to UNDO the rank-1 block. That inverse is
-/// `SharedKernel::recv_block_unwind_race_split`, and its existence is what makes this route
+/// `SharedKernel::recv_block_unwind_exact_split`, and its existence is what makes this route
 /// possible at all.
 ///
 /// ## Steps, ordered so the last decline precedes the first mutation
@@ -2080,11 +2080,7 @@ fn try_split_blocking_ipc_recv_into_frame(
             // No metadata buffer: payload-only, and the contract forbids naming one.
             _ => BlockedRecvState::legacy_timeout(cap, payload_user_ptr, payload_user_len),
         };
-        (
-            state,
-            None,
-            None,
-        )
+        (state, None, None)
     };
     // (4) Capability: task(2) pid read → capability(4) resolve, both off the broad lock. Every
     // refusal here has a canonical error the broad handler produces, so fall back and let it.
@@ -2264,12 +2260,13 @@ fn try_split_blocking_ipc_recv_into_frame(
     // compare-and-clear returned, and the wait generation Phase B advanced. A compensation that
     // matched on the numeric TID alone could overwrite a replacement incarnation, another
     // winner's status, or another transaction's pending work; with this it can only undo its own.
-    let block_identity = |wait_generation: u64| crate::kernel::recv_waiter_split::RecvBlockIdentity {
-        tid,
-        asid: receiver_asid,
-        priority: victim_priority,
-        wait_generation,
-    };
+    let block_identity =
+        |wait_generation: u64| crate::kernel::recv_waiter_split::RecvBlockIdentity {
+            tid,
+            asid: receiver_asid,
+            priority: victim_priority,
+            wait_generation,
+        };
     // `IPC_RECV_BLOCKED_STATE_SAVE` is NOT emitted here: `recv_block_phase_b_split` is the owner
     // of that write and already prints it, so printing it again would double the marker.
     // Phase C — ipc rank 3. The atomic recheck-and-publish, through the ONE policy owner both
@@ -2306,7 +2303,8 @@ fn try_split_blocking_ipc_recv_into_frame(
                 outcome,
                 crate::kernel::recv_waiter_split::PublishWaiterOutcome::WaiterOwnershipBusy
             );
-            let unwound = shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
+            let unwound =
+                shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
             if !unwound.may_resume_entering_frame() {
                 // The exact inverse could not complete, so the entering frame is not this task's
@@ -2388,7 +2386,8 @@ fn try_split_blocking_ipc_recv_into_frame(
         // route unwinds first, because returning `WrongObject` through the entering frame is only
         // licensed once the exact incarnation is current again.
         _ => {
-            let unwound = shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
+            let unwound =
+                shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
             crate::yarm_log!(
                 "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=publish outcome={}",
@@ -2423,7 +2422,8 @@ fn try_split_blocking_ipc_recv_into_frame(
         // would leave a blocked caller with a deadline it cannot identify, so unwind the whole
         // block exactly as the publish races do and let the broad arm own the outcome.
         crate::kernel::boot::ReplyWaitArm::DeadlineRefused { .. } => {
-            let unwound = shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
+            let unwound =
+                shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
             crate::yarm_log!(
                 "IPC_RECV_BLOCK_SPLIT_SETTLED cpu={} tid={} endpoint={} reason=deadline_reservation outcome={}",

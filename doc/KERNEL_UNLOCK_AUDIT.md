@@ -4031,19 +4031,33 @@ classification table's):
 | file | function | sites |
 |---|---|---|
 | `ipc_state.rs` | `rt_commit_receiver_runnable`, `wake_tid_to_runnable`, `process_ipc_timeout_deadlines`, `signal_notification`, `wake_destroyed_notification_waiter` | 5 |
-| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`, `wake_tid_to_runnable_split`, `drain_recv_timeout_post_work`, `recv_block_unwind_race_split` | 7 |
+| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`, `wake_tid_to_runnable_split`, `drain_recv_timeout_post_work`, `recv_block_unwind_exact_split` | 7 |
 | `restart_state.rs` | `exit_task`, `restart_task`, `mark_task_dead`, `reap_faulted_task_noalloc_cleanup` | 4 |
 | `exec_state.rs` | `spawn_user_task_from_image`, `dispatch_next_task`, `yield_current` ×2, `yield_current_to` ×2 | 6 |
 | `scheduler_state.rs` | `apply_cross_cpu_wake_task` | 1 |
 | `fault_state.rs` | `fault_current_task_with_fault` | 1 |
 
-**U9-RX3 — `recv_block_unwind_race_split`.** The split form of the reversal
+**U9-RX3 — `recv_block_unwind_exact_split`** (U9-RECV-BLOCK1 §3 renamed it from
+`recv_block_unwind_race_split` when it was made exact; see the note below this paragraph).
+The split form of the reversal
 `KernelState::recv_block_unwind_race` performs, and a CAN path because it writes
 `Blocked(EndpointReceive) -> Runnable`. Its origin is exactly one: the `QueueNonEmpty` branch of
 the split receive-block route, taken only when the rank-3 recheck found a message **before any
 waiter was published**. It is the exact inverse of `recv_block_phase_b_split` and runs in reverse
 rank order (task 2, then scheduler 1). It cannot act on a receiver that any sender can observe,
 because no waiter exists for it to be found through.
+
+**U9-RECV-BLOCK1 §3 — the same row, now exact.** The predecessor located its victim by
+`t.tid.0 == tid` alone and then assigned `Runnable` whatever it found there, so a replacement
+incarnation that had reused the numeric TID, another winner's status, or another transaction's
+pending work could all be overwritten. Every fact needed to be exact was already minted and
+simply unused: Phase A returns the priority it removed, Phase B mints the wait generation, and
+Phase C carries `{tid, asid, wait_generation}`. The rank-2 half now requires all of
+`{tid, asid, blocked_recv_generation}` to match AND the task to still be
+`Blocked(EndpointReceive(_))`; the rank-1 half uses `restore_exact_current_on`, which refuses
+unless this CPU's slot is still empty and the task is queued nowhere on it. The verdict and the
+site count are unchanged — the writer was made exact, it did not multiply — and the caller now
+learns from `RecvUnwindOutcome` whether it may return through the entering frame at all.
 | `capability_lifecycle_state.rs` | `wake_destroyed_notification_waiter_split` | 1 |
 | `exit_claim.rs` | `wake_joiners_for_locked` | 1 |
 | `exit_claim.rs` | `apply_self_exit_writes_locked` | 1 |

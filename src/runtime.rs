@@ -5993,7 +5993,10 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
         expected_tid: u64,
-    ) -> Option<(crate::kernel::vm::Asid, crate::kernel::scheduler::TaskPriority)> {
+    ) -> Option<(
+        crate::kernel::vm::Asid,
+        crate::kernel::scheduler::TaskPriority,
+    )> {
         // U9-RECV-BLOCK1 §3 — COMPARE, then clear. Never the other way round.
         //
         // This step used to call `block_current_on_cpu_split`, which clears whatever is current,
@@ -6256,15 +6259,24 @@ impl SharedKernel {
         // Rank 2 — the exact inverse of Phase B's task half, on the exact incarnation.
         let cleared = self.with_task_tcbs_split_mut(|tcbs| {
             let Some(tcb) = tcbs.iter_mut().flatten().find(|t| {
+                // The ASID comparison uses the SAME normalisation Phase A used to capture it and
+                // `ReceiverWaiterIdentity` uses to publish it: an absent address space is
+                // `Asid(0)`. A kernel-task receiver — which is exactly what the boot chain's
+                // NR 2 receivers are — has `tcb.asid == None`, so comparing against
+                // `Some(identity.asid)` would have made every one of them unmatchable and every
+                // unwind report `IncarnationMoved` for a task that had never moved.
                 t.tid.0 == tid
-                    && t.asid == Some(identity.asid)
+                    && t.asid.unwrap_or(crate::kernel::vm::Asid(0)) == identity.asid
                     && t.blocked_recv_generation == identity.wait_generation
             }) else {
                 return false;
             };
             // Still parked on OUR receive? A different `WaitReason`, or any non-blocked status,
             // means some other owner re-purposed this incarnation after Phase B.
-            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointReceive(_))) {
+            if !matches!(
+                tcb.status,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+            ) {
                 return false;
             }
             tcb.blocked_recv_state = None;
@@ -15847,6 +15859,20 @@ mod tests {
         assert!(
             !kernel.recv_would_block_split_read(endpoint_idx, generation),
             "the raced enqueue must make the endpoint no longer would-block"
+        );
+        // The racing sender runs on ANOTHER CPU in the real system. This hosted fixture has one,
+        // so after the send it is descheduled to restore the exact state the route is actually in
+        // at this point: CPU 0's `current` slot EMPTY, because Phase A cleared it and nothing
+        // installs a current on a CPU except code running on that CPU. Leaving the sender
+        // installed would make the fixture ask the unwind to displace a task the scheduler chose
+        // — which it correctly refuses, and which the route can never present it with.
+        assert_eq!(
+            kernel.with_scheduler_split_mut(|sched| {
+                crate::kernel::boot::kernel_mut(&mut sched.scheduler)
+                    .block_current_exact_on(cpu, ThreadId(1))
+            }),
+            Some(crate::kernel::scheduler::TaskPriority::Normal),
+            "the fixture's stand-in sender is descheduled, exactly"
         );
 
         // Phase C (rank 3) — the atomic recheck loses, exactly as the route expects.
