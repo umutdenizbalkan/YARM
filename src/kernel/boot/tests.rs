@@ -144698,6 +144698,12 @@ mod u9qa_apply_convention {
             !SPLIT_SRC.contains("blocked_recv_split_route_yields_to_broad_arm()"),
             "the selector-keyed yield is retired: an armed oracle is not `not NR 2 / NR 5`"
         );
+        // And the predicate itself is DELETED, not merely uncalled: a public function whose doc
+        // asserts a policy nothing enforces is the stale second owner this tree keeps retiring.
+        assert!(
+            !include_str!("mod.rs").contains("fn blocked_recv_split_route_yields_to_broad_arm"),
+            "the retired yield's predicate must be gone from the source, not left dangling"
+        );
         assert!(
             SPLIT_SRC.contains("emit_ipccall_direct_smp_server_blocked_with("),
             "and the route must publish the SMP blocked-server marker itself"

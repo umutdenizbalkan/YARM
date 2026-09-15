@@ -3878,29 +3878,13 @@ pub fn ipccall_direct_publication_enabled() -> bool {
     ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()
 }
 
-/// Stage 199D-WA3C2 — **does the off-lock blocking-IpcRecv route yield the whole receive to the
-/// broad blocked-recv arm?**
-///
-/// This is deliberately NOT an admission question, and it deliberately does not live in the
-/// split dispatcher: direct NR6/NR7 *admission* is a production decision with no proof-gate
-/// term, and `the_split_dispatcher_has_no_proof_gate_dependency` pins that. What this answers is
-/// a different question — whether a blocked receive still needs work only the broad arm does.
-///
-/// It does, while any direct proof/oracle selector is armed. Every such profile depends on
-/// blocked-recv work the split route does not reproduce: the SMP oracle's
-/// `..._SMP_SERVER_BLOCKED` / `..._SMP_CALLER_BLOCKED` markers re-verify runqueue absence and
-/// home-CPU placement against authoritative broad state, and the single-CPU round-trip oracles
-/// assert on the broad arm's exact marker order. So under a selector the route yields exactly as
-/// it did before WA3C2.
-///
-/// With NO selector armed — the ordinary production configuration, which is what the x86_64
-/// direct default is about — it does not yield. The route publishes its waiter, defers the
-/// dispatch, and publishes its own NR6/NR7 acknowledgements through the shared publication
-/// bodies. That is what keeps the delivered split blocking-recv route and direct production
-/// alive at the same time, instead of one silently retiring the other.
-pub fn blocked_recv_split_route_yields_to_broad_arm() -> bool {
-    ipccall_direct_proof_enabled()
-}
+// U9-RECV-BLOCK1 §2/§5 — `blocked_recv_split_route_yields_to_broad_arm` is DELETED, not left
+// uncalled. It answered "does a blocked receive still need work only the broad arm does?", and
+// the honest answer became no: the whole of that work was five authoritative reads inside
+// `maybe_emit_ipccall_direct_smp_server_blocked`, now carried as `SmpServerBlockedFacts` so both
+// arms run the one emitter body. Keeping a public predicate whose doc asserts a policy nothing
+// enforces is the stale second owner this file keeps retiring; `ipccall_direct_proof_enabled()`
+// remains, for the callers whose policy it actually is.
 
 /// True iff this REQUEST endpoint index is admitted to the off-lock path.
 ///
