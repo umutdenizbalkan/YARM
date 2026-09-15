@@ -1992,20 +1992,24 @@ fn try_split_blocking_ipc_recv_into_frame(
         // owed exactly what the same arguments would have been owed had a message been waiting.
         let meta_user_ptr = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1);
         let meta_user_len = frame.arg(SYSCALL_ARG_TRANSFER_CAP);
-        let state = if meta_user_ptr != 0
-            && meta_user_len >= crate::kernel::syscall::IPC_RECV_META_V2_ENCODED_LEN
-        {
-            BlockedRecvState {
-                recv_cap: cap,
-                payload_user_ptr,
-                payload_user_len,
-                meta_user_ptr,
-                meta_user_len,
-                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
-            }
-        } else {
-            BlockedRecvState::legacy_timeout(cap, payload_user_ptr, payload_user_len)
-        };
+        let state = Some(
+            if meta_user_ptr != 0
+                && meta_user_len >= crate::kernel::syscall::IPC_RECV_META_V2_ENCODED_LEN
+            {
+                BlockedRecvState {
+                    recv_cap: cap,
+                    payload_user_ptr,
+                    payload_user_len,
+                    meta_user_ptr,
+                    meta_user_len,
+                    recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+                }
+            } else {
+                // NR 5's canonical arm DOES store this one — see `handle_ipc_recv_timeout`'s
+                // blocking branch, which derives the shape from args 4/5 exactly as this does.
+                BlockedRecvState::legacy_timeout(cap, payload_user_ptr, payload_user_len)
+            },
+        );
         (
             state,
             Some(absolute),
@@ -2023,35 +2027,39 @@ fn try_split_blocking_ipc_recv_into_frame(
             frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
             is_kernel_task,
         );
-        // U9-RECV-BLOCK1 §1(a) — NR 2's LEGACY shape needs no new completion variant.
+        // U9-RECV-BLOCK1 §1(a) — NR 2's LEGACY shape is ADMITTED, and it leaves NO record.
         //
-        // This arm used to refuse it (`reason=not_recv_v2`) on the premise that a blocked NR 2
-        // without a metadata buffer had no completion record to leave behind. That premise was
-        // already false when it was written: Stage 199G-B §A added `RecvAbiVariant::LegacyTimeout`
-        // and `BlockedRecvState::legacy_timeout` for exactly this payload-only shape, NR 5's arm
-        // twelve lines above constructs it, and every consumer is variant-aware —
-        // `check_blocked_recv_meta_contract` (which REQUIRES a legacy waiter to name no buffer),
-        // `plan_blocked_waiter_plain_delivery`, and
-        // `publish_blocked_recv_delivery_result_locked`, whose legacy arm installs exactly the
-        // `ret0 = sender_tid, ret1 = payload_len, ret2 = NO_TRANSFER_CAP` lanes the broad
-        // `handle_ipc_recv_result_with_empty_error` success arm installs.
+        // This arm used to refuse it (`reason=not_recv_v2`), which was a recognized receive
+        // reaching the terminal acquisition for a shape the route can serve. It is served now.
         //
-        // So the two NR 2 shapes are the two variants, chosen by the caller's own arguments, and
-        // the state is built the same way NR 5 builds its own.
+        // What it must NOT do is invent the record. `handle_ipc_recv`'s blocking arm stores
+        // `BlockedRecvState` only inside `if recv_v2_request { … }`: a legacy NR 2 parks with
+        // `blocked_recv_state` left `None`, publishes none of the three acknowledgements, and
+        // answers `WouldBlock`. A sender that later finds this waiter therefore FAILS the
+        // delivery — `complete_blocked_recv_for_waiter` opens with
+        // `blocked_recv_state.take().ok_or(SyscallError::InvalidArgs)?`.
+        //
+        // An earlier form of this slice built `BlockedRecvState::legacy_timeout` here, reasoning
+        // that NR 5's arm constructs it twelve lines above. NR 5's arm does, and correctly: NR 5's
+        // own result owner derives the shape from the caller's arguments, so a parked NR 5 is owed
+        // what those same arguments would have been owed had a message been waiting. NR 2's owner
+        // does not, and storing one here would have made this route SUCCEED where the canonical
+        // route fails — a repair dressed as a reproduction, and a silent divergence between the
+        // two routes for a shape neither of them announces. `None` is what the canonical arm
+        // leaves, so `None` is what this arm leaves.
         let state = match request.meta_target {
             RecvMetaTarget::V2 {
                 ptr: meta_user_ptr,
                 len: meta_user_len,
-            } => BlockedRecvState {
+            } => Some(BlockedRecvState {
                 recv_cap: cap,
                 payload_user_ptr,
                 payload_user_len,
                 meta_user_ptr,
                 meta_user_len,
                 recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
-            },
-            // No metadata buffer: payload-only, and the contract forbids naming one.
-            _ => BlockedRecvState::legacy_timeout(cap, payload_user_ptr, payload_user_len),
+            }),
+            _ => None,
         };
         (state, None, None)
     };
@@ -2472,7 +2480,13 @@ fn try_split_blocking_ipc_recv_into_frame(
     // The two reads the shared bodies need are supplied off-lock: the receiver ASID from the
     // rank-2 seam, and the live waiter identity from the rank-3 seam. Both publishers are
     // strict no-ops when publication is not enabled or the endpoint is not admitted.
-    {
+    //
+    // U9-RECV-BLOCK1 §1(a) — `if let Some(state)`, because the broad arm's three publish calls
+    // are nested INSIDE `if recv_v2_request { … }`. A legacy NR 2 parks with no writeback record
+    // and publishes nothing; every one of these bodies would refuse it on the recv-v2 term
+    // anyway, but refusing inside a body is not the same claim as never calling it, and the
+    // acknowledgement stores are not things to call speculatively.
+    if let Some(state) = state {
         let endpoint = crate::kernel::capabilities::CapObject::Endpoint {
             index: endpoint_idx,
             generation,

@@ -6045,13 +6045,32 @@ impl SharedKernel {
     /// The `BlockedRecvState` is stored HERE, before the waiter is published, so a sender that
     /// finds the waiter can never complete a receiver whose payload/meta pointers do not yet
     /// exist. Checked generation advancement fails closed exactly as the broad phase does.
-    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    ///
+    /// # U9-RECV-BLOCK1 §1(a) CORRECTED — the writeback record is OPTIONAL, because the canonical
+    /// owner does not always leave one.
+    ///
+    /// `handle_ipc_recv`'s blocking arm stores `BlockedRecvState` **only** when the request is
+    /// recv-v2 (`if recv_v2_request { … }`); a legacy NR 2 that names no metadata buffer parks
+    /// with `blocked_recv_state` left `None`, publishes no acknowledgement, and still answers
+    /// `WouldBlock`. That has a real consequence downstream —
+    /// `complete_blocked_recv_for_waiter` opens with
+    /// `blocked_recv_state.take().ok_or(SyscallError::InvalidArgs)?`, so a sender that later
+    /// finds this waiter fails the delivery rather than completing it.
+    ///
+    /// An earlier form of this slice built `BlockedRecvState::legacy_timeout` here on the
+    /// reasoning that NR 5's arm constructs it twelve lines away. NR 5's arm does, and it is
+    /// right to: NR 5's own result owner derives the shape from the caller's arguments, so a
+    /// parked NR 5 is owed what the same arguments would have been owed. NR 2's does not, and
+    /// storing one here would have made the split route SUCCEED where the canonical route fails
+    /// — a repair wearing the costume of a reproduction, and a silent divergence between the two
+    /// routes for a shape neither of them announces. The defect is the broad arm's to carry until
+    /// something decides to fix it deliberately; this route reproduces it.
     pub(crate) fn recv_block_phase_b_split(
         &self,
         tid: u64,
         recv_cap: crate::kernel::capabilities::CapId,
         deadline: Option<u64>,
-        state: crate::kernel::task::BlockedRecvState,
+        state: Option<crate::kernel::task::BlockedRecvState>,
     ) -> Option<u64> {
         use crate::kernel::task::{TaskStatus, WaitReason};
         let wait_gen = self.with_task_tcbs_split_mut(|tcbs| {
@@ -6061,7 +6080,7 @@ impl SharedKernel {
             tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
             tcb.ipc_timeout_deadline = deadline;
             tcb.ipc_timeout_fired = false;
-            tcb.blocked_recv_state = Some(state);
+            tcb.blocked_recv_state = state;
             Some(next)
         })?;
         crate::yarm_log!(
@@ -6069,16 +6088,20 @@ impl SharedKernel {
             tid,
             wait_gen
         );
-        crate::yarm_log!(
-            "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={} abi={}",
-            tid,
-            recv_cap.0,
-            state.payload_user_ptr,
-            state.payload_user_len,
-            state.meta_user_ptr,
-            state.meta_user_len,
-            state.recv_abi.slug()
-        );
+        // The marker is the STORE's, so it prints only when a store happened — exactly as the
+        // broad arm prints it only inside its `if recv_v2_request` block.
+        if let Some(state) = state {
+            crate::yarm_log!(
+                "IPC_RECV_BLOCKED_STATE_SAVE tid={} cap={} payload_ptr=0x{:x} payload_len={} meta_ptr=0x{:x} meta_len={} abi={}",
+                tid,
+                recv_cap.0,
+                state.payload_user_ptr,
+                state.payload_user_len,
+                state.meta_user_ptr,
+                state.meta_user_len,
+                state.recv_abi.slug()
+            );
+        }
         Some(wait_gen)
     }
 
@@ -15861,14 +15884,14 @@ mod tests {
                 0,
                 recv_cap,
                 None,
-                BlockedRecvState {
+                Some(BlockedRecvState {
                     recv_cap,
                     payload_user_ptr: 0x1000,
                     payload_user_len: 128,
                     meta_user_ptr: 0x2000,
                     meta_user_len: 40,
                     recv_abi: RecvAbiVariant::RecvV2,
-                },
+                }),
             )
             .expect("phase B must mint a generation");
         assert_eq!(wait_generation, 1);

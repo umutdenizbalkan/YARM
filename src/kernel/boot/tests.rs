@@ -178232,6 +178232,93 @@ mod u9_recv_block1_closure {
         );
     }
 
+    /// **NR 2's legacy shape is SERVED, and it leaves exactly what the canonical arm leaves.**
+    ///
+    /// `handle_ipc_recv`'s blocking arm stores `BlockedRecvState` only inside
+    /// `if recv_v2_request { … }`, and nests its three `maybe_publish_*_ack` calls in the same
+    /// block. A legacy NR 2 therefore parks with `blocked_recv_state` left `None` and publishes
+    /// nothing — which a sender feels: `complete_blocked_recv_for_waiter` opens with
+    /// `blocked_recv_state.take().ok_or(SyscallError::InvalidArgs)?`, so the delivery FAILS.
+    ///
+    /// The split route must reproduce that, not improve on it. An earlier form of this slice
+    /// stored `BlockedRecvState::legacy_timeout` here, reasoning from NR 5's arm — which does
+    /// construct it, correctly, because NR 5's own result owner derives the shape from the
+    /// caller's arguments. NR 2's owner does not. Storing one would have made this route succeed
+    /// where the canonical route fails: a repair dressed as a reproduction, and a silent
+    /// divergence for a shape neither route announces.
+    #[test]
+    fn the_legacy_nr2_shape_parks_with_no_record_exactly_as_the_broad_arm_does() {
+        const IPC: &str = include_str!("../syscall/ipc.rs");
+        // The canonical arm: the store and all three publishes are inside the recv-v2 block.
+        let broad = code_of(IPC);
+        let gate = broad
+            .find("let recv_v2_request = matches!(request.meta_target, RecvMetaTarget::V2 { .. });")
+            .expect("the canonical recv-v2 gate");
+        let store = broad[gate..]
+            .find("tcb.blocked_recv_state = Some(state);")
+            .expect("the canonical store");
+        let would_block = broad[gate..]
+            .find("return Err(SyscallError::WouldBlock);")
+            .expect("the canonical blocking answer");
+        assert!(
+            store < would_block,
+            "the canonical store is inside the recv-v2 block, ahead of the WouldBlock answer"
+        );
+        for publish in [
+            "maybe_publish_shared_region_blocked_recv_ack(",
+            "maybe_publish_ipccall_direct_blocked_server_ack(",
+            "maybe_publish_ipcreply_direct_blocked_caller_ack(",
+        ] {
+            let at = broad[gate..]
+                .find(publish)
+                .unwrap_or_else(|| panic!("{publish} must be in the canonical blocking arm"));
+            assert!(
+                at < would_block,
+                "`{publish}` is nested in the recv-v2 block, so a legacy receive never reaches it"
+            );
+        }
+        // The split route: the record is OPTIONAL, the legacy arm is `None`, and the shape is
+        // never manufactured on the NR 2 side.
+        let lane = code_of(body_of(
+            SPLIT,
+            "fn try_split_blocking_ipc_recv_into_frame(\n    shared: &SharedKernel,",
+        ));
+        assert!(
+            !lane.contains("reason=not_recv_v2"),
+            "the legacy shape must be SERVED, not handed to the terminal acquisition"
+        );
+        assert_eq!(
+            lane.matches("BlockedRecvState::legacy_timeout(").count(),
+            1,
+            "exactly one construction, and it belongs to NR 5, whose owner does derive the shape              from the caller's arguments"
+        );
+        let nr5 = lane.find("let timeout_ticks =").expect("the NR 5 arm");
+        let legacy = lane
+            .find("BlockedRecvState::legacy_timeout(")
+            .expect("the construction");
+        let nr2 = lane.find("from_legacy_ipc_recv(").expect("the NR 2 arm");
+        assert!(
+            nr5 < legacy && legacy < nr2,
+            "the construction must sit in the NR 5 arm, before the NR 2 arm begins"
+        );
+        assert!(
+            SPLIT.contains("state: Option<crate::kernel::task::BlockedRecvState>,")
+                || crate::kernel::boot::tests::u9_recv_block1_closure::phase_b_takes_an_option(),
+            "the phase-B twin must take an OPTIONAL record"
+        );
+        // And the publications are gated on the record existing, mirroring the canonical nesting.
+        assert!(
+            lane.contains("if let Some(state) = state {"),
+            "step (10) must be nested on the record, as the canonical arm nests its three hooks"
+        );
+    }
+
+    /// The phase-B twin's parameter is the `Option`, read from `runtime.rs` itself.
+    pub(super) fn phase_b_takes_an_option() -> bool {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        RUNTIME.contains("state: Option<crate::kernel::task::BlockedRecvState>,")
+    }
+
     /// **No publication yield survives anywhere in the route.**
     ///
     /// All three were retired the same way — by making the hook's body take the facts it needs
