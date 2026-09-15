@@ -17867,3 +17867,180 @@ regresses a live cell that passes at base.
 * **NR 2 `IpcRecv`'s user-ASID cohort** — still not wired, and still not short a mechanism.
 * **Init's mapping-run pressure.** 128/128 is the reason a one-page layout shift was visible at
   all. The refusal is now correct, but the headroom is not investigated here.
+
+## U9-RECV-BLOCK1 — the receive family is source-closed
+
+Reviewed candidate `8f30f3b9`; base `8f30f3b9`. **NR 2 and NR 5 are closed.** The family entry
+hands off for exactly one reason — the trap is not an `IpcRecv` or `IpcRecvTimeout` — and every
+recognized receive settles inside the family on all three ports, in the default build and with
+an oracle armed.
+
+### §1 — the three named starting points all changed the answer
+
+The directive named three places to look before building machinery. Each overturned something
+the QUEUE1 residual list asserted.
+
+**(a) `LegacyTimeout` was never missing, and NR 2 must not use it.** `RecvAbiVariant::LegacyTimeout`
+and `BlockedRecvState::legacy_timeout` already existed, NR 5's blocking arm already constructed
+them on both owners, and every consumer was already variant-aware. So the split lane's
+`reason=not_recv_v2` refusal was a gate that had simply never been widened — no completion
+variant had to be built.
+
+Tracing the consumers, as instructed, then overturned the obvious fix. `handle_ipc_recv`'s
+blocking arm stores `BlockedRecvState` **only** inside `if recv_v2_request { … }`, and nests its
+three `maybe_publish_*_ack` calls in the same block. A legacy NR 2 parks with
+`blocked_recv_state` left `None`, publishes nothing, and answers `WouldBlock` — and a sender that
+later finds that waiter FAILS the delivery, because `complete_blocked_recv_for_waiter` opens with
+`blocked_recv_state.take().ok_or(SyscallError::InvalidArgs)?`.
+
+NR 5's arm is right to construct the record: its own result owner derives the shape from the
+caller's arguments, so a parked NR 5 is owed what those arguments would have been owed had a
+message been waiting. NR 2's owner derives nothing of the kind. Constructing one there would have
+made the split route succeed where the canonical route fails — a repair dressed as a
+reproduction. `recv_block_phase_b_split` takes `Option<BlockedRecvState>`; NR 2's legacy arm
+passes `None`; the shape is served and leaves exactly what the canonical arm leaves.
+
+**(b) Production constructs only `Buffered` endpoints.** `create_endpoint(depth)` is
+`create_endpoint_with_mode(depth, EndpointMode::Buffered)`, every production caller uses it, and
+the only four `Synchronous` constructions in the tree are inside `#[cfg(test)] mod tests` in
+`syscall.rs`. No syscall creates an endpoint at all. So `NonBufferedEndpoint` was an
+unreachability proof to write, not a rendezvous path to build, and the gate is gone.
+
+**(c) The kernel-task metadata fault belongs at the copy, not before the dequeue.**
+`plan_recv_core` returned `FallbackRequired(RecvV2MetaUserCopy)` on the reasoning "no user ASID
+exists to copy to". The reasoning is right and the disposition was wrong:
+`handle_ipc_recv_result_with_empty_error` computes `recv_v2_meta_written` from the caller's
+arguments — it never asks whether the receiver has an address space — dequeues, mints, encodes,
+and faults at `copy_to_current_user`, then rolls the mint back, clears the return lane, emits
+`IPC_RECV_V2_ROLLBACK_OK site=immediate_meta` and answers `PageFault`. The message is consumed
+and lost; that IS the canonical answer. `RecvPlan::KernelRegisterV2MetaFaults` names it, and
+`kernel_register_v2_meta_write_split` performs it. The rollback census rises 3 → 4: the same
+operation, from a newly reachable caller.
+
+`RecvMetaTarget::V3Future` keeps the fallback. Neither `from_legacy_ipc_recv` nor
+`from_ipc_recv_timeout` can produce it, so it has no production outcome to match and inventing
+one would be inventing a population.
+
+### §2 — every publication yield retired, by the same move each time
+
+Each yield existed for one reason: a `maybe_publish_*` hook took `&mut KernelState`, the split
+route holds no broad reference, and so the entire receive was handed away to preserve work it
+could not perform. Each was retired by making the hook's body take the facts it needs instead of
+the kernel it read them from.
+
+| yield | term | retired by |
+|---|---|---|
+| NR6/NR7 acknowledgements | `ipccall_direct_publication_enabled()` | `publish_ipccall_direct_blocked_server_ack_with` / `..._caller_ack_with` (WA3C2) |
+| shared-region acknowledgement | `cfg!(feature = "shared-region-direct-oracle")` | `publish_shared_region_blocked_recv_ack_with` |
+| SMP blocked-server marker | any armed direct-oracle selector | `emit_ipccall_direct_smp_server_blocked_with` + `SmpServerBlockedFacts` |
+
+The shared-region term was the expensive one, because it was **compile-time**: it fired in any
+build carrying the feature whether or not the oracle was ever enabled at runtime. Measured on the
+armed x86_64 profile, 114 ordinary NR 2 receives per boot reached the terminal acquisition to
+preserve an acknowledgement none of them could produce. It is 0 now, and the witness asserts the
+zero instead of carrying a carve-out comment explaining why it could not.
+
+The last one protected five authoritative reads inside one marker emitter. They are carried as
+plain values — no borrow, which a guard checks — and the split side answers them off-lock:
+`smp_blocked_server_task_facts_split_read` takes the two TCB fields in ONE rank-2 acquisition,
+because the marker asserts a single committed blocking state and two acquisitions could observe
+it torn. It reproduces `task_cpu_affinity`'s `tid == 0` short-circuit rather than reading the
+field raw.
+
+Two admission gates went with them, neither about the message:
+
+* `endpoint_waiter_present` — refusing because another receiver is parked was an **invented
+  exclusivity rule**. `publish_recv_waiter_locked` is last-receiver-WINS: it displaces the
+  incumbent through CLAIM(Teardown) → CANCEL → RETIRE. There is no canonical outcome in which a
+  parked receiver makes a queued message undeliverable.
+* `!= EndpointMode::Buffered` — per (b), a population production cannot construct.
+
+### §3 — three defects in the blocking settlement, and the exactness that fixes them
+
+1. **Phase A cleared `current` before checking the victim.** It called `block_current_on_cpu_split`,
+   which clears whatever is current, and compared afterwards. A mismatched victim had already been
+   blocked, and the repair discarded its own result. `block_current_exact_on` (U9-EXIT3 §2) is the
+   compare-and-clear that makes the mismatch free: it mutates nothing unless the slot names exactly
+   this task, so there is no repair to discard. It also returns the PRIORITY it removed — the only
+   record of the placement, and without carrying it an unwind must invent one.
+2. **Identity was TID-only and the unwind wrote `Runnable` unconditionally.** Every fact needed to
+   be exact was already minted and unused. `recv_block_unwind_exact_split` requires
+   `{tid, asid, blocked_recv_generation}` to match AND the task to still be
+   `Blocked(EndpointReceive(_))`; the rank-1 half uses `restore_exact_current_on`, which refuses
+   unless this CPU's slot is empty and the task is queued nowhere on it. The wait generation is
+   deliberately NOT rolled back — generations only advance.
+3. **Callers ignored restoration failure, or answered `Internal` afterwards.** `RecvUnwindOutcome`
+   makes the answer explicit, and `may_resume_entering_frame()` is the proof a settlement needs
+   before returning through the entering frame. `QueueNonEmpty` continues into the immediate
+   receive owner — the canonical continuation is a RECEIVE, because `recv_block_unwind_race` wakes
+   and redispatches and `ipc_recv_with_optional_deadline`'s phase 2 then delivers.
+   `WaiterOwnershipBusy` answers `WouldBlock`, which is `block_current_on_receive_with_deadline`'s
+   own policy, not a second copy of it.
+
+The ASID comparison normalises an absent address space to `Asid(0)` — the same normalisation Phase
+A uses to capture it and `ReceiverWaiterIdentity` uses to publish it. Comparing against
+`Some(identity.asid)` made every kernel-task receiver unmatchable, which is what the boot chain's
+NR 2 receivers are; caught by the forced-race test, whose fixture also had to stop leaving its
+stand-in sender installed as `current` on the one hosted CPU — a state the route can never present,
+because Phase A cleared the slot and nothing installs a current on a CPU except code running on it.
+
+### §4 — the receive family migrates to the trap-authority contract
+
+`queue_advance_admit_split` consulted ambient `sched.current_cpu` and refused `MultiCpu` outright,
+while the receive drain already accepted `DispatchAuthority`. Both ambient terms are now scoped to
+callers WITHOUT an authority; a caller holding one has already answered both questions unforgeably
+— the authority names its CPU from hardware, is one-shot per trap via its epoch, and the selection
+owner authenticates against the same value. The two other callers (terminal-fault, futex-wait)
+keep the ambient contract, so the body is shared rather than replaced.
+
+`DispatchAuthority::for_open_window` is a third constructor and manufactures nothing: it READS
+this CPU's live `TRAP_DISPATCH_WINDOW` cell, so with no window open it produces the reserved epoch
+0 and `is_live()` is false, exactly as `none` is.
+
+### §5 — source closure, and the live census that qualifies it
+
+The family entry's two hand-offs are the NR filter and the counted residual door. Two dead
+hand-off shapes went with the yields: the blocking lane re-read the CPU index and the current task
+the entry had already settled with canonical errors, and each re-read carried a `NotHandled` arm
+that could never fire. Both are parameters now.
+
+`IPC_RECV_SPLIT_UNROUTED`, measured per profile because zero on an ordinary boot does not qualify
+an armed one:
+
+| profile | x86_64 | aarch64 | riscv64 |
+|---|---|---|---|
+| direct-oracle ARMED | 0 | 0 | 0 |
+| feature-OFF core smoke | 0 | 0 | 0 |
+| shared-region oracle ARMED (xfer2, ordinary routes) | 0 | — | — |
+
+Every blocking-lane refusal remaining on any of those boots is internal lane continuation, never a
+broad entry: `not_timed_recv` (an NR 5 probe, to the immediate lane), `would_not_block` (a message
+is already waiting, to the immediate lane) and `cap_resolve` (the immediate lane raises the
+canonical error).
+
+One live defect, in a witness rather than the kernel. The RISC-V direct-oracle round trip failed
+with the yield removed — not on correctness, which was clean end to end, but because the oracle's
+client read `SERVER_DUP_REJECTED` straight out on the comment "the server has replied, run its
+duplicate reply, and parked before we resumed here". That is an assumption about scheduling order,
+not a synchronisation, and not what the oracle proves. Once the blocking receives are serviced
+pre-lock the reply wake resumes the client first. The client now waits for the attempt, bounded and
+yielding; the check is unchanged and a server that never attempts the duplicate still fails the
+oracle rather than hanging it.
+
+### Census
+
+**CENSUS-DELTA: 0.**
+
+### Deferred, and one gap recorded rather than papered over
+
+* **The legacy NR 2 blocking population has no live producer.** `yarm-user-rt::ipc_recv` is
+  `ipc_recv_v2`, so every one of the 116–184 blocked receives per boot is `abi=recv`. The parity
+  above is pinned by source comparison against the canonical arm and by a guard, not by a boot.
+  A witness would need a raw NR 2 with no metadata buffer, a second thread to satisfy it, and
+  init text the current mapping-run pressure does not have.
+* **The multi-page shared-region mapping defect** — `resolve_memory_object_phys` takes no VA, so
+  every page of a multi-page region maps to the object's first frame. Pre-existing, broad, and
+  reproduced rather than repaired; pinned by
+  `the_shared_region_mapping_loop_resolves_one_phys_per_page`.
+* **Init's mapping-run pressure**, unchanged from QUEUE1.
+* Next: NR 9, then non-syscall traps, then deletion of the terminal acquisitions.
