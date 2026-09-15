@@ -18277,3 +18277,42 @@ The six guards, and what replaced what:
 | `the_family_entry_declines_only_a_non_receive` | TWO hand-offs, the second counted and named | ONE, the NR filter's; the counter absent rather than unused; and the recognized body's type unable to name `NotHandled` |
 | `every_decline_after_the_reservation_clears_it` | three post-reservation hand-offs | zero, enforced by type; two pre-mutation `CannotPark` settlements; four post-clear exits through one helper |
 
+Live matrix, all re-run on the delivered tree:
+
+| witness | result |
+|---|---|
+| x86_64 / AArch64 / RISC-V core smoke | boot clean, terminal idle after all required markers |
+| park witness | `proposed=12 committed=12 resumed=12 stream_ok=1 broad_entries=0 result=ok` |
+| x86_64 AP recv-v2 block, `-smp 2` | `blocked_commits=1 ack_publications=1 premature_wakes=0 premature_continuations=0 wrong_cpu_blocks=0 result=ok` |
+| x86_64 AP saved return, `-smp 2` | `fresh_entries=1 saved_dispatches=1 continuations=1 duplicate_entries=0 duplicate_continuations=0 wrong_cpu_continuations=0 result=ok` |
+| recv/reply/transfer/split delivery oracle | `late_timeout_claims=0 result=ok` |
+| xfer2 grant witness, NR 30 profile | `grants=2 shapes=registered_range,explicit_range releases=2 route=split result=ok` |
+
+SMP provisioning is intact in both AP witnesses — each boots `-smp 2` and brings up the AP before
+its cell runs, which is the condition BLOCK1 §6's relocation of the SMP-unlock audit had to
+preserve and which the census restoration to `with_cpu = 2` must not have cost.
+
+### What the boot exercises, and what it does not
+
+On an ordinary x86_64 boot the delivered route publishes and defers **116** blocking receives, and
+the D2-recv drain resumes a replacement for each. Across that run:
+
+* `IPC_RECV_SPLIT_UNROUTED` — **0**. No receive reaches the terminal broad dispatcher.
+* `IPC_RECV_SPLIT_INVARIANT` — **0**. No settlement fails closed.
+* `IPC_RECV_SPLIT_UNSETTLED` — **0**. The bridge settlement never fires.
+* `D2_RECV_SPLIT_UNWIND_FAIL` — **0**. RISC-V likewise: 892 receive markers, none of the three.
+
+That is the honest live picture, and it is stated rather than dressed up: the boot exercises the
+PUBLISH-and-drain path exhaustively and the compensations not at all. Every unwind, recovery and
+settlement path in this slice is proven by the deterministic forced interleavings, which drive the
+production owners over real scheduler and task state — the replacement incarnation, the competing
+timeout wake, the doubly-refused restore, and the capture-then-publish-then-resume sequence. The
+zero counts are what the design predicts, not what it is proven by.
+
+### Deferred, unchanged from BLOCK1
+
+* The legacy NR 2 blocking population still has no live producer; parity stays pinned by source
+  comparison and guards.
+* The multi-page shared-region mapping defect, reproduced rather than repaired.
+* Init's mapping-run pressure.
+* Next: NR 9, then non-syscall traps, then deletion of the terminal acquisitions.
