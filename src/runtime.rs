@@ -2920,19 +2920,54 @@ impl SharedKernel {
             // dequeues only a task the mark will take — instead of dequeuing the head, failing to
             // mark it and rolling the dequeue back. Rank 1 is held across the rank-2 read, which
             // is the canonical ascending direction.
+            //
+            // U9-RECV-BLOCK2b §3: and the filter asks the RESUME CONVENTION too, which it did
+            // not. The two questions it already asked — "will the dispatch transition be
+            // accepted" and "does the ASID resolve" — are not the question the APPLY asks.
+            // `x86_post_lock_resume_marked_incoming` calls
+            // `direct_dispatch_classify_and_consume_convention_split`, which is
+            // `classify_incoming_resume_convention(tcb, ExactTokenResume)`, and a `None` there is
+            // `X86ResumeRefusal::Context` — after the dequeue, after the mark, with the scheduler
+            // already believing the task is running. The caller's only remaining move is
+            // `d2_resume_refused_fatal`.
+            //
+            // So a task with a non-restorable `user_context`, or one whose first-resume snapshot
+            // has already been consumed, passed selection and took the machine down. That is a
+            // LIVE reachable path, not a theoretical one: the apply's own comment records that
+            // "admission classified the peeked candidate; a higher-priority wake can displace it
+            // before the authoritative dequeue", and the filtered dequeue can also skip past the
+            // peeked head to a task admission never looked at.
+            //
+            // Asking the classifier here is the fix in its own terms — the same owner, read-only
+            // (the consuming variant belongs to the apply, which is the one place a one-shot
+            // startup snapshot may be spent), evaluated inside the same rank-1/rank-2 nesting as
+            // the other two predicates. A task it refuses is left in the queue rather than
+            // dequeued-and-fataled, and a drain that finds no acceptable candidate settles
+            // through its existing typed idle.
+            //
+            // Every consumer of this owner applies through the exact-token resume — the D2 recv
+            // and send drains, the FutexWait and yield retirement drains, and the U9-QA commit —
+            // so `ExactTokenResume` is the convention to screen for, and it is the same value
+            // those applies pass.
             let selection =
                 kernel_mut(&mut sched.scheduler).dispatch_next_accepted_selection_on(cpu, |tid| {
                     self.with_task_tcbs_split_mut(|tcbs| {
-                        crate::kernel::task_transition::dispatch_transition_would_be_accepted(
+                        if !crate::kernel::task_transition::dispatch_transition_would_be_accepted(
                             tcbs,
                             tid.0,
                             crate::kernel::task_transition::TaskTransition::DispatchIncoming,
-                        ) && MarkedIncarnation::resolve(
-                            tid.0,
-                            tcbs.iter()
-                                .flatten()
-                                .find(|t| t.tid.0 == tid.0)
-                                .and_then(|t| t.asid),
+                        ) {
+                            return false;
+                        }
+                        let Some(tcb) = tcbs.iter().flatten().find(|t| t.tid.0 == tid.0) else {
+                            return false;
+                        };
+                        if MarkedIncarnation::resolve(tid.0, tcb.asid).is_none() {
+                            return false;
+                        }
+                        crate::kernel::boot::classify_incoming_resume_convention(
+                            tcb,
+                            crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
                         )
                         .is_some()
                     })

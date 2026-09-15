@@ -2376,14 +2376,33 @@ fn try_split_blocking_ipc_recv_into_frame(
     // Admission answers two different questions at once: "may this caller publish a queue
     // advance?" and "is there an incoming task this convention can resume?". `Ok(None)` — no
     // candidate at all — already proceeds to park, and the existing D2-recv drain settles that
-    // CPU idle (`D2_RECV_GENUINE_IDLE_PROVENANCE_PUBLISHED`). `IncomingUnavailable` says a
-    // candidate exists but `ExactTokenResume` cannot resume it, which for a PARKING receiver has
-    // the identical consequence: this CPU has nothing it can resume, and the drain owes it the
-    // same idle settlement. The distinction is real for the STASH convention, which must build a
-    // plan for a specific incoming task and has nothing to do if it cannot; it is not real here.
+    // CPU idle (`D2_RECV_GENUINE_IDLE_PROVENANCE_PUBLISHED`). Treating `IncomingUnavailable` as a
+    // refusal is what made a receive that must block have nowhere to go, and the only remaining
+    // destination was the terminal broad acquisition.
     //
-    // Treating it as a refusal is what made a receive that must block have nowhere to go, and
-    // the only remaining destination was the terminal broad acquisition.
+    // U9-RECV-BLOCK2b §3 — WHY ignoring it is sound, corrected. The earlier argument here was
+    // that a candidate the convention cannot resume "has the identical consequence" as no
+    // candidate at all, so the drain owes the same idle. That did not follow, and the gap was
+    // fatal rather than merely untidy:
+    //
+    //   * Admission classifies the RAW PEEKED HEAD (`peek_next_runnable_on`).
+    //   * The drain selects through `queue_advance_select_step_split`, a FILTERED dequeue that
+    //     skips unacceptable tasks — so it can land on a task admission never looked at.
+    //   * That filter used to ask only whether the dispatch transition would be accepted and
+    //     whether the ASID resolves. The APPLY asks
+    //     `classify_incoming_resume_convention(.., ExactTokenResume)`, and a `None` there is
+    //     `X86ResumeRefusal::Context` — raised after the dequeue and after the mark, with the
+    //     scheduler already believing the task is running, leaving the shared D2 drain no move
+    //     but `d2_resume_refused_fatal`.
+    //
+    // So "the drain will find no candidate" was never established by this refusal; what the
+    // refusal permitted was the drain selecting a DIFFERENT candidate and taking the machine down
+    // on it. The repair is in the selection owner, not here: that filter now asks the same
+    // classifier the apply asks, so a task the apply would refuse is left in the queue instead of
+    // being dequeued and fataled, and a drain that finds no acceptable candidate settles through
+    // its existing typed idle. With selection and apply agreeing, admission's peek-based
+    // `IncomingUnavailable` is a statement about a candidate the drain will not select, and
+    // ignoring it costs this family nothing.
     if let Err(refusal) = shared.queue_advance_admit_with_authority_split(
         authority,
         crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,

@@ -3410,6 +3410,28 @@ impl KernelState {
     }
 
     #[cfg(any(test, feature = "hosted-dev"))]
+    /// U9-RECV-BLOCK2b §3 — give `tid` the RESUMABLE user context a production task has.
+    ///
+    /// A task reaches a run queue in production only through `spawn_user_task_from_image`, whose
+    /// publication installs a full startup context: a real entry instruction pointer, a real
+    /// stack pointer, and `arg0 = tid != 0`. That is what makes
+    /// `classify_incoming_resume_convention` — the predicate the exact-token APPLY asks, and now
+    /// the one the SELECTION filter asks with it — accept the task.
+    ///
+    /// Fixtures that build a dispatchable task out of `register_task` + `bind_task_asid` +
+    /// `set_task_status_for_test` skip that publication, so they model a shape production never
+    /// constructs: queued, ASID-bound and with a zero continuation. This restores the missing
+    /// half rather than weakening the predicate that caught it.
+    pub(crate) fn seed_resumable_user_context_for_test(&mut self, tid: u64) {
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                tcb.user_context.instruction_ptr = crate::kernel::vm::VirtAddr(0x40_0000);
+                tcb.user_context.stack_ptr = crate::kernel::vm::VirtAddr(0x7fff_0000);
+                tcb.user_context.arg0 = tid as usize;
+            }
+        });
+    }
+
     pub(crate) fn set_task_status_for_test(&mut self, tid: u64, status: TaskStatus) {
         self.with_tcbs_mut(|tcbs| {
             if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {

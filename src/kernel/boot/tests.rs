@@ -54908,7 +54908,9 @@ mod stage168b_d2_recv_genuine_completion {
         let owner = RUNTIME_SRC
             .find("pub(crate) fn queue_advance_select_step_split(")
             .expect("the one selection owner");
-        let owner_body = &RUNTIME_SRC[owner..owner + 2400];
+        // U9-RECV-BLOCK2b §3 widened: the owner grew the resume-convention predicate and the
+        // derivation that explains why it is there.
+        let owner_body = &RUNTIME_SRC[owner..owner + 5200];
         assert!(
             owner_body.contains("dispatch_next_accepted_selection_on(cpu, |tid| {"),
             "the owner must call the authoritative queue-advancing scheduler primitive"
@@ -55310,7 +55312,9 @@ mod stage169_d2_send_genuine {
         let owner = RUNTIME_SRC
             .find("pub(crate) fn queue_advance_select_step_split(")
             .expect("the one selection owner");
-        let owner_body = &RUNTIME_SRC[owner..owner + 2400];
+        // U9-RECV-BLOCK2b §3 widened: the owner grew the resume-convention predicate and the
+        // derivation that explains why it is there.
+        let owner_body = &RUNTIME_SRC[owner..owner + 5200];
         assert!(
             owner_body.contains("dispatch_next_accepted_selection_on(cpu, |tid| {"),
             "the owner must call the authoritative queue-advancing scheduler primitive"
@@ -55557,6 +55561,10 @@ mod stage169_d2_send_genuine {
             let (b, _) = s.create_user_address_space().expect("incoming asid");
             s.bind_task_asid(U3_INCOMING, b).expect("bind incoming");
             s.set_task_status_for_test(U3_INCOMING, TaskStatus::Runnable);
+            // U9-RECV-BLOCK2b §3 — the selection filter now asks the same resume predicate the
+            // apply asks, so an ordinarily dispatchable fixture needs the continuation a spawned
+            // task has. See `give_task_an_incarnation`.
+            s.seed_resumable_user_context_for_test(U3_INCOMING);
             b
         });
         (k, in_asid)
@@ -111343,6 +111351,11 @@ mod stage199d_aarch64_offlock_dispatch {
                 TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(9))),
             );
             s.set_task_status_for_test(INCOMING, TaskStatus::Runnable);
+            // U9-RECV-BLOCK2b §3 — the selection filter asks the apply's own resume predicate.
+            // Both tasks get the continuation a spawned task has: OUTGOING because cases here
+            // wake and re-enqueue it, INCOMING because it is the dispatch target.
+            s.seed_resumable_user_context_for_test(OUTGOING);
+            s.seed_resumable_user_context_for_test(INCOMING);
         });
         (k, out_asid, in_asid)
     }
@@ -122872,6 +122885,9 @@ mod stage199d_wa3a_transition_barriers {
             .expect("asid");
         kernel.with(|s| {
             s.bind_task_asid(OTHER, asid).expect("bind");
+            // U9-RECV-BLOCK2b §3 — the selection filter asks the apply's own resume predicate, so
+            // a dispatchable fixture needs the continuation a spawned task has.
+            s.seed_resumable_user_context_for_test(OTHER);
             s.enqueue_task(OTHER).expect("enqueue");
         });
         let dispatch = kernel.futex_wait_dispatch_step_mut(
@@ -122913,6 +122929,158 @@ mod stage199d_wa3a_transition_barriers {
         assert_ne!(
             outcome.disposition(),
             crate::runtime::DispatchDisposition::ResumeIncoming
+        );
+    }
+
+    // ─── U9-RECV-BLOCK2b §3 — selection and apply must ask the SAME resume question ────────────
+
+    /// A queued, ASID-bound, `Runnable` task whose CONTINUATION is not resumable.
+    ///
+    /// `UserRegisterContext::is_restorable()` is `instruction_ptr != 0 && stack_ptr != 0`, so a
+    /// task that has never had a context published fails it while satisfying everything the
+    /// selection filter used to ask: the dispatch transition is accepted and the ASID resolves.
+    fn queue_an_unresumable_task(kernel: &crate::runtime::SharedKernel, tid: u64) {
+        // Take the bootstrap task off the run queue first, so the queue these cases reason about
+        // holds only the tasks they put there.
+        kernel.with(|s| {
+            let _ = s.dispatch_next_on_cpu(CpuId(0));
+        });
+        let (asid, _) = kernel
+            .with(|s| {
+                s.register_task(tid).expect("register");
+                s.create_user_address_space()
+            })
+            .expect("asid");
+        kernel.with(|s| {
+            s.bind_task_asid(tid, asid).expect("bind");
+            s.enqueue_task(tid).expect("enqueue");
+        });
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            1,
+            "exactly the one task this case queued"
+        );
+    }
+
+    /// **THE CASE §3 names, traced through selection, mark and apply.**
+    ///
+    /// The receive family parks on a queue advance and ignores admission's `IncomingUnavailable`,
+    /// on the reasoning that a candidate the convention cannot resume is the same as no candidate
+    /// at all. That reasoning needed the DRAIN to find nothing, and it did not follow:
+    ///
+    ///   * admission classifies the RAW PEEKED HEAD (`peek_next_runnable_on`);
+    ///   * the drain selects through `queue_advance_select_step_split`, a FILTERED dequeue;
+    ///   * that filter asked whether the dispatch transition would be accepted and whether the
+    ///     ASID resolves — neither of which is the question the APPLY asks.
+    ///
+    /// `x86_post_lock_resume_marked_incoming` calls
+    /// `direct_dispatch_classify_and_consume_convention_split`, which is
+    /// `classify_incoming_resume_convention(.., ExactTokenResume)`; a `None` there is
+    /// `X86ResumeRefusal::Context`, raised AFTER the dequeue and AFTER the mark, with the
+    /// scheduler already believing the task is running — and the shared D2 drain's only remaining
+    /// move is `d2_resume_refused_fatal`.
+    ///
+    /// So the selection must never hand such a task out. This drives the real selection owner
+    /// over exactly that state and requires it to refuse, and then requires the apply to agree —
+    /// the two predicates are the same predicate, which is the property that makes the drain's
+    /// idle settlement true rather than hoped for.
+    #[test]
+    fn u9recvblock2b_selection_refuses_a_task_the_apply_would_fatally_refuse() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        queue_an_unresumable_task(&kernel, OTHER);
+
+        // The filter's OTHER two questions both say yes — this is not a task being excluded for
+        // some unrelated reason.
+        kernel.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                assert!(
+                    crate::kernel::task_transition::dispatch_transition_would_be_accepted(
+                        tcbs,
+                        OTHER,
+                        crate::kernel::task_transition::TaskTransition::DispatchIncoming,
+                    ),
+                    "the dispatch transition accepts it"
+                );
+                let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == OTHER).unwrap();
+                assert!(tcb.asid.is_some(), "and its ASID resolves");
+                // And the APPLY's own predicate says no. This is the disagreement.
+                assert!(
+                    crate::kernel::boot::classify_incoming_resume_convention(
+                        tcb,
+                        crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+                    )
+                    .is_none(),
+                    "the exact-token apply cannot resume a zero continuation"
+                );
+            });
+        });
+
+        let queued_before = kernel.with(|s| s.runnable_count_on_cpu(CpuId(0)));
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
+        assert_eq!(
+            dispatch.tid(),
+            None,
+            "THE REGRESSION: selection must not hand out a task the apply would fatally refuse"
+        );
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(CpuId(0))),
+            queued_before,
+            "and a refused candidate stays QUEUED — it is not dequeued and dropped"
+        );
+        assert_eq!(
+            kernel.current_tid_authoritative(CpuId(0)),
+            Some(0),
+            "and the CPU's current slot is untouched — nothing was installed over it"
+        );
+        // No token, so nothing can reach the apply — which is what keeps
+        // `d2_resume_refused_fatal` unreachable from this state.
+        assert_eq!(
+            kernel
+                .d6_genuine_mark_running_via_task_seam(dispatch)
+                .token(),
+            None,
+            "a selection that chose nothing mints no token"
+        );
+    }
+
+    /// **The drain settles idle rather than fataling, and a resumable peer is still served.**
+    ///
+    /// Two queued tasks: the head cannot be resumed, the one behind it can. The filtered dequeue
+    /// must skip the first and hand out the second — the whole point of filtering rather than
+    /// refusing the advance — and with only the unresumable one queued it must answer nothing,
+    /// which is the drain's typed idle settlement.
+    #[test]
+    fn u9recvblock2b_selection_skips_the_unresumable_head_and_serves_the_peer() {
+        let kernel = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+        queue_an_unresumable_task(&kernel, OTHER);
+
+        let resumable = OTHER + 1;
+        let (asid, _) = kernel
+            .with(|s| {
+                s.register_task(resumable).expect("register");
+                s.create_user_address_space()
+            })
+            .expect("asid");
+        kernel.with(|s| {
+            s.bind_task_asid(resumable, asid).expect("bind");
+            s.seed_resumable_user_context_for_test(resumable);
+            s.enqueue_task(resumable).expect("enqueue");
+        });
+
+        let dispatch = kernel.futex_wait_dispatch_step_mut(
+            crate::runtime::DispatchAuthority::live_for_test(CpuId(0)),
+        );
+        assert_eq!(
+            dispatch.tid().map(|t| t.0),
+            Some(resumable),
+            "the filtered dequeue skips the unresumable head and serves the peer behind it"
+        );
+        // The skipped task is still queued — refusing to resume it is not losing it.
+        assert!(
+            kernel.receiver_has_scheduler_membership_split_read(OTHER),
+            "the unresumable task keeps its scheduler membership"
         );
     }
 
@@ -130100,6 +130268,11 @@ mod u4_cross_arch_queue_advancing_dispatch {
                 // bound ASID could never be dispatched in production either.
                 let (asid, _map) = s.create_user_address_space().expect("asid");
                 s.bind_task_asid(tid, asid).expect("bind asid");
+                // U9-RECV-BLOCK2b §3 — and a RESUMABLE CONTINUATION, for the same reason one step
+                // on: the selection filter now asks `classify_incoming_resume_convention`, the
+                // predicate the exact-token apply asks, so a task with a zero continuation could
+                // never be dispatched in production either.
+                s.seed_resumable_user_context_for_test(tid);
                 s.with_tcbs_mut(|tcbs| {
                     tcbs.iter_mut()
                         .flatten()
@@ -167019,6 +167192,17 @@ mod u9yield2_family_edge {
 /// and which means a fixture that wants an ordinarily dispatchable task has to say so. Production
 /// already does: `spawn_thread_core` sets `tcb.asid = parent.asid` and `status = Runnable` BEFORE
 /// the enqueue, so no real task is ever queued without one.
+///
+/// U9-RECV-BLOCK2b §3 — and a RESUMABLE CONTINUATION, for the same reason one step further on.
+///
+/// The selection filter now also asks `classify_incoming_resume_convention`, the predicate the
+/// exact-token APPLY asks, because the two disagreeing is what let a drain dequeue and mark a task
+/// the apply then refused with `X86ResumeRefusal::Context` — reaching `d2_resume_refused_fatal`
+/// with the scheduler already believing that task was running. Production tasks satisfy it:
+/// `spawn_user_task_from_image` publishes a startup context with a real entry instruction pointer,
+/// a real stack pointer and `arg0 = tid`. A fixture that wants an ordinarily dispatchable task has
+/// to say that too, so this helper seeds the same shape rather than the predicate being weakened
+/// to accept a zero continuation no production task has.
 #[cfg(any(test, feature = "hosted-dev"))]
 pub(crate) fn give_task_an_incarnation(state: &mut crate::kernel::boot::KernelState, tid: u64) {
     state.with_tcbs_mut(|tcbs| {
@@ -167026,6 +167210,7 @@ pub(crate) fn give_task_an_incarnation(state: &mut crate::kernel::boot::KernelSt
             tcb.asid = Some(crate::kernel::vm::Asid((tid & 0xffff) as u16));
         }
     });
+    state.seed_resumable_user_context_for_test(tid);
 }
 
 mod u9dispatchcpu1_contracts {
