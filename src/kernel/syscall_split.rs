@@ -2357,9 +2357,6 @@ fn try_split_blocking_ipc_recv_into_frame(
                 },
             };
         }
-        // The live publish policy preserves last-receiver-wins and never returns
-        // `ReceiverAlreadyWaiting`, and step (5) validated the index and generation under the
-        // same rank-3 lock, so `InvalidEndpoint` is defensively unreachable.
         // `ReceiverAlreadyWaiting` and `InvalidEndpoint`. The live publish policy is canonical
         // last-receiver-wins and never returns the first; step (5) validated index and generation
         // under the same rank-3 lock, so neither is reachable. The canonical owner answers
