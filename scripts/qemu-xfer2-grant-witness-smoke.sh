@@ -185,15 +185,22 @@ if (( ORDINARY_ROUTES )); then
   # population was never exercised.
   have 'XFER2_ORDINARY_GRANT phase=B_nr5_timed nr=5 timeout=64' \
     || die "the NR 5 grant did not carry a finite timeout"
-  # The shared-region receives themselves must have been SERVED pre-lock, which the
-  # `IPC_RECV_SHARED_REGION_SPLIT_DONE` pair below asserts exactly. A global
-  # `IPC_RECV_SPLIT_UNROUTED == 0` is deliberately NOT asserted here: this profile arms the
-  # shared-region direct oracle, whose `shared_region_ack_publication_armed` gate sends every
-  # ordinary NR 2 to the terminal acquisition. That is a real, separately-tracked residual of
-  # the blocking lane (doc/KERNEL_UNLOCKING.md, U9-RECV-QUEUE1) and is not this witness's to
-  # prove; the unarmed core profile is where the zero is measured.
+  # U9-RECV-BLOCK1 §2/§5 — the zero IS asserted here now, on the ARMED profile.
+  #
+  # It was excluded because this profile arms the shared-region direct oracle, whose
+  # `shared_region_ack_publication_armed` gate was a COMPILE-TIME term that sent every ordinary
+  # NR 2 blocking receive to the terminal acquisition — 114 per boot — to preserve an
+  # acknowledgement the split route could not publish. §2 retired that yield by making the
+  # publication body take the two facts it needed instead of the kernel it read them from, so the
+  # route publishes the acknowledgement itself at its own committed point. An armed oracle is no
+  # longer a reason for an unrelated receive to go broad, and asserting it here is what keeps
+  # that true: "zero on the ordinary profile" would not have caught the regression this line
+  # catches.
   have 'IPC_RECV_SHARED_REGION_SPLIT_BEGIN' \
     || die "no shared-region receive ran through the split boundary"
+  unrouted=$(count 'IPC_RECV_SPLIT_UNROUTED')
+  [[ "$unrouted" == "0" ]] \
+    || die "with the shared-region oracle ARMED, $unrouted recognized receive(s) still reached the terminal acquisition"
 else
   for shape in registered_range explicit_range; do
     # The VERDICT line only — `XFER2_GRANT_DETAIL` carries the observed values on its own line

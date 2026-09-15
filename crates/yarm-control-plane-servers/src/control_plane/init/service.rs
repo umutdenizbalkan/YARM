@@ -2909,7 +2909,26 @@ mod ipccall_direct_oracle_core {
                 false
             }
         };
-        // The server has replied, run its duplicate reply, and parked before we resumed here.
+        // WAIT for the server's duplicate-reply attempt rather than ASSUMING it already ran.
+        //
+        // This used to read `SERVER_DUP_REJECTED` straight out, on the comment "the server has
+        // replied, run its duplicate reply, and parked before we resumed here". That was an
+        // assumption about scheduling order, not a synchronisation, and it is not something this
+        // oracle proves — what it proves is that a SECOND reply on a consumed authority is
+        // refused. U9-RECV-BLOCK1 §5 falsified the assumption on RISC-V: once the blocking
+        // receives are serviced pre-lock, the reply wake resumes this client before the server
+        // reaches its duplicate attempt, and the completion line was emitted with
+        // `duplicate_reply=0` moments before the server logged `dup_rejected=1`.
+        //
+        // The check itself is unchanged and is NOT weakened — `dup_rejected` must still become 1,
+        // and the server still emits its own `IPCCALL_DIRECT_ORACLE_SERVER_DUP` line. The wait is
+        // bounded and yields, so a server that never performs the attempt still fails the oracle
+        // rather than hanging it.
+        let mut dup_waits = 0;
+        while SERVER_DUP_REJECTED.load(Relaxed) == 0 && dup_waits < MAX_ATTEMPTS {
+            dup_waits += 1;
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
         out.request_ok = SERVER_REQUEST_OK.load(Relaxed);
         out.server_reply_ok = SERVER_REPLY_OK.load(Relaxed);
         out.dup_rejected = SERVER_DUP_REJECTED.load(Relaxed);

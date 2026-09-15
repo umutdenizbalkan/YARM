@@ -13424,15 +13424,15 @@ impl SharedKernel {
         &self,
         tid: u64,
     ) -> (bool, Option<CpuId>) {
-        self.with_task_tcbs_split_mut(|tcbs| {
-            match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
+        self.with_task_tcbs_split_mut(
+            |tcbs| match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
                 Some(tcb) => (
                     tcb.user_context.instruction_ptr.0 != 0 && tcb.user_context.stack_ptr.0 != 0,
                     if tid == 0 { None } else { tcb.cpu_affinity },
                 ),
                 None => (false, None),
-            }
-        })
+            },
+        )
     }
 
     /// rank 2 (task lock) — Stage 199D: the exact INVERSE of

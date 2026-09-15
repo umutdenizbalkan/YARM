@@ -178111,3 +178111,155 @@ mod u9_recv_final_boot_chain {
         }
     }
 }
+
+/// U9-RECV-BLOCK1 §5 — **the receive family's source closure**, asserted against the bodies.
+///
+/// The live census is the other half of this claim and lives in the witnesses: with a
+/// direct-oracle selector armed and on a feature-off boot, all three ports measure
+/// `IPC_RECV_SPLIT_UNROUTED == 0`, and the only blocking-lane refusal on any of them is
+/// `not_timed_recv` — an NR 5 probe being handed to the IMMEDIATE lane, which is internal lane
+/// continuation, not a broad hand-off. These guards pin the source shape that makes that
+/// measurement reproducible rather than incidental.
+mod u9_recv_block1_closure {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} is missing"));
+        let open = src[start..].find('{').expect("a body") + start;
+        let bytes = src.as_bytes();
+        let (mut depth, mut i) = (0usize, open);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..=i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("{signature} has an unbalanced body");
+    }
+
+    /// **The family entry hands off for exactly one reason: it is not a receive.**
+    ///
+    /// Everything else it can answer, it answers. The two admission escapes are settled with the
+    /// error the broad path produces for the same condition, and the `None` arm — which counts a
+    /// terminal entry — is reachable only from the recognized body below.
+    #[test]
+    fn the_family_entry_declines_only_a_non_receive() {
+        let entry = code_of(body_of(SPLIT, "fn try_split_ipc_recv_family_into_frame("));
+        // Exactly two hand-offs: the NR filter, and the counted terminal entry.
+        assert_eq!(
+            entry
+                .matches("SplitDispatchDisposition::NotHandled")
+                .count(),
+            2,
+            "the entry may hand off only for `not a receive` and for the counted residual"
+        );
+        let nr_filter = entry
+            .find("Syscall::IpcRecv | Syscall::IpcRecvTimeout")
+            .expect("the NR filter");
+        let first = entry
+            .find("SplitDispatchDisposition::NotHandled")
+            .expect("the first hand-off");
+        assert!(
+            nr_filter < first,
+            "the first hand-off must be the NR filter's own else-arm"
+        );
+        // And the second is counted and named, so a claim about broad entries means what it says.
+        assert!(
+            entry.contains("note_recv_broad_entry()") && entry.contains("IPC_RECV_SPLIT_UNROUTED"),
+            "the residual door must be counted and named"
+        );
+    }
+
+    /// **A recognized receive settles the two admission escapes rather than handing them over.**
+    #[test]
+    fn the_recognized_body_settles_both_admission_escapes() {
+        let body = code_of(body_of(SPLIT, "fn try_split_recv_recognized("));
+        // Neither escape may hand off — each has a derived canonical error.
+        assert!(
+            body.contains("SyscallError::WrongObject") && body.contains("reason=cpu_out_of_range"),
+            "an out-of-range CPU settles as WrongObject, the error `with_cpu` raises"
+        );
+        assert!(
+            body.contains("SyscallError::InvalidCapability")
+                && body.contains("reason=no_current_task"),
+            "no current task settles as InvalidCapability, the error `handle_ipc_recv` raises \
+             through `current_task_cnode`"
+        );
+    }
+
+    /// **The blocking lane does not re-read what the entry already settled.**
+    ///
+    /// Each re-read carried its own `NotHandled` arm — a hand-off shape for a condition the entry
+    /// has just answered with a canonical error, so neither could fire and both widened the
+    /// escape surface. The facts are parameters now.
+    #[test]
+    fn the_blocking_lane_takes_the_settled_facts_as_parameters() {
+        assert!(
+            SPLIT.contains("cpu_idx: usize,") && SPLIT.contains("tid: u64,"),
+            "the lane must take the entry's `cpu_idx` and `tid`"
+        );
+        let lane = code_of(body_of(
+            SPLIT,
+            "fn try_split_blocking_ipc_recv_into_frame(\n    shared: &SharedKernel,",
+        ));
+        assert!(
+            !lane.contains("let cpu_idx = cpu.0 as usize;"),
+            "the lane must not recompute the CPU index the entry validated"
+        );
+        assert!(
+            !lane.contains("shared.current_tid_authoritative(cpu)"),
+            "the lane must not re-read the current task the entry settled on"
+        );
+        assert!(
+            !lane.contains("reason=no_current_task"),
+            "and the dead refusal that went with that re-read must be gone"
+        );
+    }
+
+    /// **No publication yield survives anywhere in the route.**
+    ///
+    /// All three were retired the same way — by making the hook's body take the facts it needs
+    /// instead of the kernel it read them from — and each is pinned absent by the term it used.
+    #[test]
+    fn no_publication_yield_survives() {
+        for retired in [
+            "cfg!(feature = \"shared-region-direct-oracle\")",
+            "blocked_recv_split_route_yields_to_broad_arm()",
+            "ipccall_direct_publication_enabled()",
+        ] {
+            assert!(
+                !code_of(SPLIT).contains(retired),
+                "the route must not yield on `{retired}`: a compiled feature or an armed oracle \
+                 is not a reason to send an unrelated receive broad"
+            );
+        }
+        // And the route drives all four shared publication bodies itself.
+        for body in [
+            "publish_ipccall_direct_blocked_server_ack_with(",
+            "publish_ipcreply_direct_blocked_caller_ack_with(",
+            "publish_shared_region_blocked_recv_ack_with(",
+            "emit_ipccall_direct_smp_server_blocked_with(",
+        ] {
+            assert!(
+                SPLIT.contains(body),
+                "the route must publish through the shared body `{body}`"
+            );
+        }
+    }
+}

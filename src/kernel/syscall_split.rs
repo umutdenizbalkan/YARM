@@ -1740,7 +1740,7 @@ fn try_split_recv_recognized(
             SyscallError::WrongObject,
         ))));
     }
-    let Some(_tid) = shared.current_tid_authoritative(cpu) else {
+    let Some(tid) = shared.current_tid_authoritative(cpu) else {
         crate::yarm_log!(
             "IPC_RECV_SPLIT_REFUSED cpu={} reason=no_current_task err=InvalidCapability",
             cpu.0
@@ -1756,8 +1756,14 @@ fn try_split_recv_recognized(
     // task and publishes into a queue-advance drain no hosted build runs. The IMMEDIATE lane
     // below is production code the hosted cases drive directly, so it stays compiled — removing
     // it from this entry is what would break them, not the profile gate.
+    // U9-RECV-BLOCK1 §5 — the two facts the entry ALREADY settled are passed down rather than
+    // re-read. They were re-read in the lane, and each re-read carried its own `NotHandled` arm:
+    // two hand-off shapes for conditions this entry has just answered with a canonical error, so
+    // neither could fire and both widened the escape surface for a reader to trip over. `current`
+    // on a CPU can only be changed by code running on that CPU, and this trap is what is running
+    // on it, so the value is stable across the call.
     #[cfg(not(feature = "hosted-dev"))]
-    match try_split_blocking_ipc_recv_into_frame(shared, cpu, frame, authority) {
+    match try_split_blocking_ipc_recv_into_frame(shared, cpu, cpu_idx, tid, frame, authority) {
         SplitDispatchDisposition::NotHandled => {}
         SplitDispatchDisposition::Complete(result) => return Some(D::Complete(result)),
         SplitDispatchDisposition::QueueAdvanceCommitted => {
@@ -1862,6 +1868,8 @@ fn recv_encode_empty_answer(
 fn try_split_blocking_ipc_recv_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
+    cpu_idx: usize,
+    tid: u64,
     frame: &mut TrapFrame,
     authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
@@ -1903,75 +1911,37 @@ fn try_split_blocking_ipc_recv_into_frame(
     // which shares this route step for step, has been admitted on all three ports throughout.
     // §4 supplies the witness, so the term is gone rather than narrowed.
     let _ = recv_timeout;
-    let cpu_idx = cpu.0 as usize;
-    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-        return D::NotHandled;
-    }
-    // (2) The publication work that still requires a broad `&KernelState`.
+    // (2) THE PUBLICATION YIELDS ARE GONE. All of them. This step is now empty, and the history
+    // is kept because it is the whole argument for why nothing belongs here.
     //
-    // Stage 199D-WA3C2 NARROWS this. It used to yield on `ipccall_direct_publication_enabled()`
-    // outright, because the NR6/NR7 acknowledgements could only be published from the broad
-    // blocked-recv arm — and with the x86_64 production default now ON, that yield would fire on
-    // EVERY boot and silently retire the delivered split blocking-IpcRecv route. The publication
-    // bodies are now shared (`publish_ipccall_direct_blocked_server_ack_with` /
-    // `publish_ipcreply_direct_blocked_caller_ack_with`), so this route publishes its own
-    // acknowledgements at step (10) below and no longer has to yield the whole receive.
+    // Every yield that ever stood at this position existed for the same reason: a `maybe_publish_*`
+    // hook in the broad blocked-recv arm took `&mut KernelState`, this route holds no broad
+    // reference, and so the entire receive was handed away to preserve work it could not perform.
+    // Each one was retired the same way — by making the hook's body take the facts it needs
+    // instead of the kernel it read them from:
     //
-    // The shared-region oracle's acknowledgement family is unrelated to those two and still
-    // broad-only, so it keeps its yield unconditionally.
+    // * **NR6/NR7 acknowledgements** (Stage 199D-WA3C2). Yielded on
+    //   `ipccall_direct_publication_enabled()`. Retired by
+    //   `publish_ipccall_direct_blocked_server_ack_with` /
+    //   `publish_ipcreply_direct_blocked_caller_ack_with`, which step (10) drives. Live on
+    //   AArch64 this yield was a real defect, not merely a cost: with direct production on it
+    //   fired on EVERY blocking recv-v2, the caller's block was published late, and a reply could
+    //   arrive with no claimable acknowledgement, be declined as mode-indeterminate, fall to
+    //   legacy, and be LOST (`IPC_REPLY_FAIL err=WrongObject`, caller never resumed).
+    // * **Shared-region acknowledgement** (U9-RECV-BLOCK1 §2). Yielded on
+    //   `cfg!(feature = "shared-region-direct-oracle")` — a COMPILE-TIME term, so it fired in any
+    //   build carrying the feature whether or not the oracle was ever enabled at runtime.
+    //   Measured on the armed x86_64 profile: 114 ordinary receives per boot reaching the terminal
+    //   acquisition to preserve an acknowledgement none of them could produce. Retired by
+    //   `publish_shared_region_blocked_recv_ack_with`.
+    // * **The SMP blocked-server marker** (U9-RECV-BLOCK1 §2/§5). The last one, keyed on any armed
+    //   direct-oracle selector. What it protected was five authoritative reads inside one marker
+    //   emitter; they are now carried as `SmpServerBlockedFacts` and step (10) drives the SAME
+    //   body the broad arm drives. Keeping it would have been the §5 escape in its last form:
+    //   `NotHandled` may remain only for "not NR 2 / NR 5", and "an oracle is armed" is not that.
     //
-    // Stage 199G-B §2: all three yields below are scoped to NR 2. Every hook they protect lives in
-    // `handle_ipc_recv` — `maybe_publish_shared_region_blocked_recv_ack`,
-    // `maybe_publish_ipccall_direct_blocked_server_ack`,
-    // `maybe_publish_ipcreply_direct_blocked_caller_ack` — and each one additionally refuses any
-    // `RecvAbiVariant` but `RecvV2`. `handle_ipc_recv_timeout` calls none of them, so there is no
-    // broad-arm publication for an NR 5 receive to yield BACK to, and yielding anyway would be
-    // the one thing §4 forbids: an NR 5 edge into the terminal broad dispatcher.
-    // U9-RECV-BLOCK1 §2 — the shared-region yield is GONE, not narrowed.
-    //
-    // It read `cfg!(feature = "shared-region-direct-oracle")`: a COMPILE-TIME term that fired on
-    // every NR 2 blocking receive in any build carrying the feature, whether or not the oracle was
-    // ever enabled at runtime. Measured on the armed x86_64 profile, that was 114 receives per
-    // boot arriving at the terminal acquisition to preserve an acknowledgement none of them could
-    // produce. `publish_shared_region_blocked_recv_ack_with` is now the one body both arms drive,
-    // and step (10) publishes from the same committed point the broad arm publishes from — so
-    // there is no longer any publication to yield BACK to.
-    // DIRECT3-CAP-FINAL §5 — ONE owner for this yield, on every architecture.
-    //
-    // The yield is scoped to an ARMED SELECTOR, never to the production default: a selector's
-    // profile depends on blocked-recv work this route does not reproduce, while the ordinary
-    // production configuration needs the route to keep the receive and publish its own
-    // acknowledgements at step (10). It is not an admission question, so the split dispatcher's
-    // admission logic stays free of proof-gate terms.
-    //
-    // This used to be TWO owners. Non-x86_64 yielded on `ipccall_direct_publication_enabled()`,
-    // written when only the broad arm could publish the NR6/NR7 acknowledgements. Step (10) has
-    // published them unconditionally since WA3C2 made the publication bodies shared — both
-    // publishers are strict no-ops when publication is off — so that branch had become a stale
-    // duplicate of this policy. Live on AArch64 it was the §5 gap: with direct production on,
-    // `publication_enabled()` turned true, the branch fired on EVERY blocking recv-v2, and the
-    // whole receive was handed to the broad arm. That reopened the window this route exists to
-    // close — the caller's block was published late, so a reply could arrive with no claimable
-    // acknowledgement and an armed terminal, be declined as mode-indeterminate, fall to legacy,
-    // and be LOST (`IPC_REPLY_FAIL err=WrongObject`, caller never resumed, `resume=0`).
-    //
-    // U9-RECV-BLOCK1 §2/§5 — RETIRED. The yield existed because a selector's profile depended on
-    // blocked-recv work this route could not reproduce, and the whole of that work was five
-    // authoritative reads inside one marker emitter. Those five are now carried as facts
-    // (`SmpServerBlockedFacts`) and step (10) drives the SAME emitter body the broad arm drives,
-    // so there is nothing left for the yield to protect: with a selector armed, the route now
-    // publishes exactly the evidence the selector's profile asserts on, from the same committed
-    // point and in the same order, instead of handing the receive away to produce it.
-    //
-    // Keeping it would have been the §5 escape in its last form: `NotHandled` may remain only for
-    // "not NR 2 / NR 5", and "an oracle is armed" is not that.
-    let Some(tid) = shared.current_tid_authoritative(cpu) else {
-        crate::yarm_log!(
-            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=no_current_task",
-            cpu.0
-        );
-        return D::NotHandled;
-    };
+    // NR 5 never had a publication to yield back to at all — `handle_ipc_recv_timeout` calls none
+    // of these hooks — which is why every one of them was scoped to NR 2 while it existed.
     // (3) ABI, through the canonical builder. `is_kernel_task` is the same question
     // `current_task_has_user_asid` asks, read through the rank-2 seam.
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
@@ -2599,6 +2569,8 @@ fn try_split_blocking_ipc_recv_into_frame(
 fn try_split_blocking_ipc_recv_into_frame(
     _shared: &SharedKernel,
     _cpu: CpuId,
+    _cpu_idx: usize,
+    _tid: u64,
     _frame: &mut TrapFrame,
     _authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
