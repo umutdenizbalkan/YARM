@@ -568,6 +568,16 @@ impl DispatchAuthority {
         self.cpu
     }
 
+    /// U9-RECV-BLOCK2b §4 — the window epoch this authority was minted against.
+    ///
+    /// Read by `TrapPathWindow::retire_diverging_landing`, which closes exactly this window from a
+    /// non-returning landing below the frame that owns the guard. Exposing the value authorizes
+    /// nothing on its own: `close_trap_dispatch_window` is epoch-checked, so a stale copy closes
+    /// no window at all.
+    pub(crate) const fn epoch(self) -> u64 {
+        self.epoch
+    }
+
     /// Is this still the live window for its CPU?
     ///
     /// U9-DISPATCH-CPU1 §2: false the moment the trap that minted it RETIRES its window — not

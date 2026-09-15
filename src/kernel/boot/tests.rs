@@ -135476,10 +135476,26 @@ mod riscv64_s_mode_timer_bridge {
     #[test]
     fn other_architectures_d2_behaviour_is_unchanged() {
         const SHARED_TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        // U9-RECV-BLOCK2b §4 — the receive family's unsettleable landing lives in this shared
+        // file and publishes the token too, so the assertion is what it always MEANT: the
+        // x86_64/AArch64 arms gain no publication. The one occurrence here is `cfg`-gated to
+        // RISC-V, the token's sole reader, so those two ports still publish none and nothing
+        // leaks to their next trap.
+        let publications: alloc::vec::Vec<_> = SHARED_TRAP_ENTRY
+            .match_indices("blocked_syscall_idle_provenance_set(")
+            .map(|(at, _)| at)
+            .collect();
         assert!(
-            !SHARED_TRAP_ENTRY.contains("blocked_syscall_idle_provenance_set("),
-            "the shared drain that serves x86_64/AArch64 gains no publication"
+            publications.len() <= 1,
+            "at most one publication site may exist in the shared file"
         );
+        for at in publications {
+            let before = &SHARED_TRAP_ENTRY[at.saturating_sub(500)..at];
+            assert!(
+                before.contains("#[cfg(target_arch = \"riscv64\")]"),
+                "a publication in the shared file must be gated to RISC-V, its sole reader"
+            );
+        }
         assert!(
             !SHARED_TRAP_ENTRY.contains("blocked_syscall_idle_provenance_take("),
             "and still reads none — RISC-V is the sole reader, which is why the repair is local"
@@ -178798,6 +178814,116 @@ mod u9_recv_block1_closure {
                 "{builder} must not construct the helper-only metadata target"
             );
         }
+    }
+
+    // ─── U9-RECV-BLOCK2b §4 — a non-returning landing owes the retirement contract ────────────
+
+    /// **The unsettleable terminal retires this trap's authority before it diverges.**
+    ///
+    /// `TrapPathWindow::retire`'s contract is unconditional — *every landing that does not return
+    /// must call this first* — and `Drop` cannot cover a diverging path. The terminal used to jump
+    /// straight from the syscall body into an architecture halt loop, leaving the window reading
+    /// as live and the publication flag set: exactly the state `TrapPathWindow::establish` reports
+    /// as `TRAP_DISPATCH_WINDOW_ABANDONED` on the next trap that CPU takes, while the CPU goes on
+    /// to accept interrupts and dispatch other work under an authority naming a trap that is gone.
+    #[test]
+    fn the_unsettleable_landing_retires_the_trap_authority() {
+        const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+        let body = TRAP_ENTRY_SRC
+            .split("pub(crate) fn recv_unsettleable_idle_terminal(")
+            .nth(1)
+            .and_then(|b| b.split("\n}").next())
+            .expect("the unsettleable terminal");
+        assert!(
+            body.contains("TrapPathWindow::retire_diverging_landing(authority)"),
+            "the landing must retire this trap's window before handing the CPU on"
+        );
+        // Before the halt, not after it — after is unreachable.
+        let retire = body
+            .find("TrapPathWindow::retire_diverging_landing(")
+            .expect("the retirement");
+        for landing in [
+            "idle_halt_loop()",
+            "enter_post_lock_idle_after_direct_dispatch(",
+            "riscv_trap_halt(",
+        ] {
+            if let Some(at) = body.find(landing) {
+                assert!(
+                    retire < at,
+                    "the retirement must precede the {landing} landing, which never returns"
+                );
+            }
+        }
+        // And it takes the authority rather than re-deriving one: only `establish` mints, so a
+        // landing that read the window cell instead could close a window it never owned.
+        assert!(
+            body.contains("authority: crate::runtime::DispatchAuthority"),
+            "the landing is given this trap's own authority"
+        );
+    }
+
+    /// **The landing settles through the ESTABLISHED per-architecture idle primitives.**
+    ///
+    /// Not a second idle policy: each is the one that architecture's own post-lock dispatch
+    /// terminal enters. On x86_64 the attestation that names which class idled runs first, so a
+    /// live log can tell this settlement apart from the ordinary idle outcome.
+    #[test]
+    fn the_unsettleable_landing_introduces_no_new_idle_implementation() {
+        const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+        let body = TRAP_ENTRY_SRC
+            .split("pub(crate) fn recv_unsettleable_idle_terminal(")
+            .nth(1)
+            .and_then(|b| b.split("\n}").next())
+            .expect("the unsettleable terminal");
+        for established in [
+            "crate::arch::x86_64::trap::settle_post_lock_terminal_idle(",
+            "crate::arch::x86_64::descriptor_tables::idle_halt_loop()",
+            "crate::arch::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(",
+            "crate::arch::riscv64::boot::riscv_trap_halt(",
+        ] {
+            assert!(
+                body.contains(established),
+                "the landing must reach the established primitive: {established}"
+            );
+        }
+        for invented in ["loop {", "wfi", "hlt", "unsafe {"] {
+            assert!(
+                !body.contains(invented),
+                "the landing must not spell out an idle of its own: {invented}"
+            );
+        }
+    }
+
+    /// **The landing reports VERIFIED state, never an assumed one.**
+    ///
+    /// Its callers used to pass `enabled=true` unconditionally, so the marker claimed the task was
+    /// enqueued whatever the recovery had actually achieved. The value is now the recovery owner's
+    /// verified answer, and the deferral and placement are read back rather than assumed.
+    #[test]
+    fn the_unsettleable_landing_reports_only_what_it_read_back() {
+        const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        let body = TRAP_ENTRY_SRC
+            .split("pub(crate) fn recv_unsettleable_idle_terminal(")
+            .nth(1)
+            .and_then(|b| b.split("\n}").next())
+            .expect("the unsettleable terminal");
+        assert!(
+            body.contains("d2_recv_dispatch_is_deferred(cpu_idx)")
+                && body.contains("current_tid_split_read(cpu)")
+                && body.contains("receiver_has_scheduler_membership_split_read(tid)"),
+            "the deferral, the placement and the membership are READ, not assumed"
+        );
+        // No caller may hand it a literal again.
+        assert!(
+            !SPLIT_SRC.contains("recv_unsettleable_idle_terminal(cpu, tid, true)"),
+            "no call site may assert a post-state it did not verify"
+        );
+        assert_eq!(
+            SPLIT_SRC.matches("task_is_verified_schedulable()").count(),
+            4,
+            "every one of the four landings passes the recovery owner's verified answer"
+        );
     }
 
     /// **The legacy `Option` adapter is a TEST adapter.**

@@ -2554,7 +2554,8 @@ fn try_split_blocking_ipc_recv_into_frame(
         // an assumption this call site makes. `RunnableElsewhere` is read back from the TCB and
         // the membership mirror; `Unrecovered` and `IncarnationMoved` claim nothing.
         crate::arch::trap_entry::recv_unsettleable_idle_terminal(
-            cpu,
+            shared,
+            authority,
             tid,
             outcome.task_is_verified_schedulable(),
         )
@@ -2624,7 +2625,8 @@ fn try_split_blocking_ipc_recv_into_frame(
                     unwound.slug()
                 );
                 crate::arch::trap_entry::recv_unsettleable_idle_terminal(
-                    cpu,
+                    shared,
+                    authority,
                     tid,
                     unwound.task_is_verified_schedulable(),
                 )
@@ -2725,7 +2727,8 @@ fn try_split_blocking_ipc_recv_into_frame(
                 )));
             }
             crate::arch::trap_entry::recv_unsettleable_idle_terminal(
-                cpu,
+                shared,
+                authority,
                 tid,
                 unwound.task_is_verified_schedulable(),
             )
@@ -2773,7 +2776,8 @@ fn try_split_blocking_ipc_recv_into_frame(
                 // Runnable and enqueued; the settlement is the established divergent idle rather
                 // than an error returned into a task the scheduler has parked.
                 crate::arch::trap_entry::recv_unsettleable_idle_terminal(
-                    cpu,
+                    shared,
+                    authority,
                     tid,
                     unwound.task_is_verified_schedulable(),
                 )
