@@ -771,6 +771,12 @@ pub(crate) fn try_split_dispatch_into_frame(
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) -> SplitDispatchDisposition {
+    // U9-RECV-BLOCK1 §4 — the receive family authenticates its admission on the trap's own
+    // authority rather than on the ambient dispatch CPU. Minting it here from `cpu` would defeat
+    // the point (an authority must be unforgeable), so the live window is READ: `for_cpu` returns
+    // the authority this CPU's open trap window already holds, and `none` when no window is open —
+    // which is never live and therefore authorizes nothing.
+    let authority = crate::runtime::DispatchAuthority::for_open_window(cpu);
     match try_split_futex_wait_into_frame(shared, cpu, frame) {
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
@@ -782,7 +788,7 @@ pub(crate) fn try_split_dispatch_into_frame(
     // It runs AFTER the non-blocking queued-plain recv would have, in the sense that matters:
     // this route admits ONLY the state in which that one declines (an empty buffered endpoint with
     // no waiters), so the two never contend for the same trap.
-    match try_split_ipc_recv_family_into_frame(shared, cpu, frame) {
+    match try_split_ipc_recv_family_into_frame(shared, cpu, frame, authority) {
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
@@ -1658,13 +1664,14 @@ fn try_split_ipc_recv_family_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
+    authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
     let Ok(syscall @ (Syscall::IpcRecv | Syscall::IpcRecvTimeout)) =
         Syscall::decode(frame.syscall_num())
     else {
         return SplitDispatchDisposition::NotHandled;
     };
-    match try_split_recv_recognized(shared, cpu, frame) {
+    match try_split_recv_recognized(shared, cpu, frame, authority) {
         Some(settled) => settled.into_dispatch(),
         // U9-RECV-FINAL §1 — THE terminal-entry measurement for the receive family, once per
         // trap and in exactly one place, so a claim about `broad_entries` means what it says.
@@ -1718,6 +1725,7 @@ fn try_split_recv_recognized(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
+    authority: crate::runtime::DispatchAuthority,
 ) -> Option<SplitRecvDisposition> {
     use crate::kernel::syscall::SyscallError;
     use SplitRecvDisposition as D;
@@ -1749,7 +1757,7 @@ fn try_split_recv_recognized(
     // below is production code the hosted cases drive directly, so it stays compiled — removing
     // it from this entry is what would break them, not the profile gate.
     #[cfg(not(feature = "hosted-dev"))]
-    match try_split_blocking_ipc_recv_into_frame(shared, cpu, frame) {
+    match try_split_blocking_ipc_recv_into_frame(shared, cpu, frame, authority) {
         SplitDispatchDisposition::NotHandled => {}
         SplitDispatchDisposition::Complete(result) => return Some(D::Complete(result)),
         SplitDispatchDisposition::QueueAdvanceCommitted => {
@@ -1855,6 +1863,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
+    authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
     use crate::kernel::capabilities::{CapId, CapObject};
     use crate::kernel::recv_core::{RecvBlockingPolicy, RecvMetaTarget, RecvRequest};
@@ -2113,8 +2122,13 @@ fn try_split_blocking_ipc_recv_into_frame(
         );
         return D::NotHandled;
     }
-    if let Err(refusal) = shared.queue_advance_admit_split(
-        cpu,
+    // U9-RECV-BLOCK1 §4 — authenticated on the trap's own authority. The ambient
+    // `CpuNotAuthoritative` comparison and the blanket `MultiCpu` refusal do not apply to a
+    // caller that provably IS this CPU's trap; every other precondition is the shared body's and
+    // is unchanged. This is what lets a blocking receive park on a boot with more than one
+    // dispatching CPU, which the ambient contract refused outright.
+    if let Err(refusal) = shared.queue_advance_admit_with_authority_split(
+        authority,
         crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
     ) {
         crate::yarm_log!(
@@ -2558,6 +2572,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     _shared: &SharedKernel,
     _cpu: CpuId,
     _frame: &mut TrapFrame,
+    _authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
     SplitDispatchDisposition::NotHandled
 }

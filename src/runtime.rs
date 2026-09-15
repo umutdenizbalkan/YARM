@@ -541,6 +541,28 @@ impl DispatchAuthority {
         Self { cpu, epoch: 0 }
     }
 
+    /// U9-RECV-BLOCK1 §4 — READ the authority this CPU's already-open trap window holds.
+    ///
+    /// This is emphatically not a second mint. It forges nothing: it copies the epoch the window
+    /// cell currently carries, which `TrapPathWindow::establish` wrote when this trap began and
+    /// `TrapPathWindow::drop` retires at the real trap boundary. If no window is open the cell
+    /// holds the reserved `0`, and the result is [`Self::none`] — never live, authorizing nothing.
+    /// So the value is exactly as strong as the window it came from and no stronger.
+    ///
+    /// It exists because the split dispatch entry is reached from two architecture call sites
+    /// that both hold a `TrapPathWindow`, but through a shared signature that carries only a
+    /// `CpuId`. Reading the live window is what lets the receive family authenticate its
+    /// admission without every caller threading a parameter it already has.
+    pub(crate) fn for_open_window(cpu: CpuId) -> Self {
+        let idx = cpu.0 as usize;
+        if idx >= crate::kernel::scheduler::MAX_CPUS {
+            return Self::none(cpu);
+        }
+        let epoch = crate::kernel::boot::TRAP_DISPATCH_WINDOW[idx]
+            .load(core::sync::atomic::Ordering::Acquire);
+        Self { cpu, epoch }
+    }
+
     /// The CPU this authority is for. There is no setter: the value is fixed at the mint.
     pub(crate) const fn cpu(self) -> CpuId {
         self.cpu
@@ -15794,9 +15816,9 @@ mod tests {
         );
 
         // Phase A (rank 1) — the receiver (tid 0) is removed from `current`.
-        let receiver_asid = kernel
+        let (receiver_asid, victim_priority) = kernel
             .recv_block_phase_a_split(cpu, 0)
-            .expect("phase A must block the receiver it was given");
+            .expect("phase A must block the exact victim");
         // Phase B (rank 2) — marked `Blocked(EndpointReceive)` with a fresh generation.
         let wait_generation = kernel
             .recv_block_phase_b_split(
@@ -15843,9 +15865,19 @@ mod tests {
             "the publish must detect the raced enqueue"
         );
 
-        // THE INVERSE.
-        assert!(
-            kernel.recv_block_unwind_race_split(cpu, 0),
+        // THE INVERSE — U9-RECV-BLOCK1 §3: authenticated against the EXACT incarnation this
+        // transaction blocked, using the four facts it minted, not the bare numeric TID.
+        assert_eq!(
+            kernel.recv_block_unwind_exact_split(
+                cpu,
+                crate::kernel::recv_waiter_split::RecvBlockIdentity {
+                    tid: 0,
+                    asid: receiver_asid,
+                    priority: victim_priority,
+                    wait_generation,
+                },
+            ),
+            crate::kernel::recv_waiter_split::RecvUnwindOutcome::Restored,
             "the unwind must complete"
         );
         kernel.with(|state| {

@@ -3871,6 +3871,52 @@ impl crate::runtime::SharedKernel {
         cpu: CpuId,
         apply: QueueAdvanceApply,
     ) -> Result<Option<u64>, QueueAdvanceRefusal> {
+        self.queue_advance_admit_inner_split(cpu, apply, None)
+    }
+
+    /// U9-RECV-BLOCK1 §4 — the same admission, authenticated by the TRAP'S OWN authority.
+    ///
+    /// The ambient contract below predates [`crate::runtime::DispatchAuthority`] and asks two
+    /// questions this one does not have to:
+    ///
+    /// * **`CpuNotAuthoritative`** — it compares the caller's `cpu` against the ambient
+    ///   `sched.current_cpu`, a field any earlier acquisition may have written. A live authority
+    ///   is strictly stronger: it is minted only by `TrapPathWindow::establish`, from the CpuId
+    ///   the architecture entry derived from hardware, and its epoch makes it one-shot for THIS
+    ///   trap. A caller holding one is not claiming to be this CPU's trap, it is provably running
+    ///   it, so there is no ambient field to agree with.
+    /// * **`MultiCpu`** — it refused whenever more than one dispatching CPU was online, because
+    ///   without an authority the admission could not tell which CPU's run queue the later
+    ///   selection would touch. The selection step
+    ///   (`queue_advance_select_step_split`) has authenticated on the authority since
+    ///   U9-DISPATCH-CPU1: it checks `is_live()`, validates the CPU is an online scheduler CPU,
+    ///   and then operates on THAT CPU's queue and no other. The receive DRAIN has passed its
+    ///   authority to that owner all along; only the receive ADMISSION was still asking the older
+    ///   question, and refusing the whole receive on a two-CPU boot for it.
+    ///
+    /// Every other precondition is unchanged and shared, which is the point of the common body:
+    /// the trap-drainer flag, the stash conventions, the candidate peek, and the per-convention
+    /// resumability screen are one implementation, and the other two families that drive it
+    /// (terminal-fault and FutexWait) keep the ambient contract until they migrate themselves.
+    pub(crate) fn queue_advance_admit_with_authority_split(
+        &self,
+        authority: crate::runtime::DispatchAuthority,
+        apply: QueueAdvanceApply,
+    ) -> Result<Option<u64>, QueueAdvanceRefusal> {
+        // Outside the scheduler acquisition, exactly as the selection owner checks it: a stale
+        // authority must not even take rank 1.
+        if !authority.is_live() {
+            return Err(QueueAdvanceRefusal::OutgoingIdentityStale);
+        }
+        self.queue_advance_admit_inner_split(authority.cpu(), apply, Some(authority))
+    }
+
+    fn queue_advance_admit_inner_split(
+        &self,
+        cpu: CpuId,
+        apply: QueueAdvanceApply,
+        authority: Option<crate::runtime::DispatchAuthority>,
+    ) -> Result<Option<u64>, QueueAdvanceRefusal> {
         let cpu_idx = cpu.0 as usize;
         if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
             return Err(QueueAdvanceRefusal::OutgoingIdentityStale);
@@ -3908,13 +3954,22 @@ impl crate::runtime::SharedKernel {
                 sched.current_cpu,
             )
         });
-        if dispatching > 1 {
-            return Err(QueueAdvanceRefusal::MultiCpu);
-        }
         // U9-QA §1: pre-check the authentication the commit's selection step will perform. The
         // commit cannot refuse, so this must fail HERE — before the caller blocks anything.
-        if dispatch_cpu != cpu {
-            return Err(QueueAdvanceRefusal::CpuNotAuthoritative);
+        //
+        // U9-RECV-BLOCK1 §4: WHICH authentication that is depends on what the caller holds. A
+        // trap authority already answers both questions — it names this CPU unforgeably and the
+        // selection owner authenticates against the same value — so neither the ambient
+        // comparison nor the single-dispatching-CPU restriction applies to it.
+        if authority.is_none() {
+            if dispatching > 1 {
+                return Err(QueueAdvanceRefusal::MultiCpu);
+            }
+            if dispatch_cpu != cpu {
+                return Err(QueueAdvanceRefusal::CpuNotAuthoritative);
+            }
+        } else {
+            let _ = (dispatching, dispatch_cpu);
         }
         // Stash-specific: an `ExactTokenResume` publishes no plan, so an occupied stash is not its
         // precondition. It is still checked for the stash convention, where a second plan is lost.
