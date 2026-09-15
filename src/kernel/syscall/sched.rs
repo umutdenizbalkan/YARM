@@ -101,6 +101,20 @@ pub(super) fn handle_futex_wait(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
+    // U9-FUTEX-WAIT-FINAL §4 — the LIVE half of the closure claim, measured where arrivals are.
+    //
+    // Same placement and same reasoning as `IPC_SEND_BROAD_ENTRY`: `dispatch`'s
+    // `Syscall::FutexWait` arm is this function's only caller, and it is reached only when the
+    // split route declined. One line here therefore counts exactly what the claim is about — an
+    // NR 9 trap that reached the terminal broad acquisition — where a marker on the split side
+    // could only report doors it chose to walk past.
+    //
+    // The source half is the recognized body's return type: it can no longer answer `NotHandled`,
+    // so a count from that side would be a statement about code that cannot run.
+    crate::yarm_log!(
+        "FUTEX_WAIT_BROAD_ENTRY nr=9 tid={} result=broad_entry",
+        kernel.current_tid().unwrap_or(u64::MAX)
+    );
     let addr = frame.arg(SYSCALL_ARG_CAP);
     let expected =
         u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;

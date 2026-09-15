@@ -18316,3 +18316,209 @@ zero counts are what the design predicts, not what it is proven by.
 * The multi-page shared-region mapping defect, reproduced rather than repaired.
 * Init's mapping-run pressure.
 * Next: NR 9, then non-syscall traps, then deletion of the terminal acquisitions.
+
+## U9-FUTEX-WAIT-FINAL — closing NR 9's terminal broad reachability
+
+Base `bced70eb`. NR 9 (`FutexWait`) was recognized by the split route and then, on eight distinct
+exits, handed back to the terminal broad dispatcher. Those were not "this trap is not a FutexWait";
+they were a recognized NR 9 being given away, and the broad arm it landed in has its own in-lock
+deferral machinery — so one syscall had two blocking implementations reachable from one trap.
+
+### §1 — the eight, derived and classified
+
+| # | recognized exit | classification | now |
+|---|---|---|---|
+| 1 | CPU index out of range | mechanically unreachable — the authority is minted by `TrapPathWindow::establish` from a hardware-identified CPU, and an index at or past `MAX_CPUS` yields `DispatchAuthority::none`, which is never live | settled `WrongObject`, the error `with_cpu` raises for a CPU it cannot bind |
+| 2 | argument decode | genuinely reachable from userspace | canonical `InvalidArgs` — the error `handle_futex_wait`'s two `u32::try_from` produce |
+| 3 | no current task | reachable | canonical `TaskMissing`, raised in the canonical ORDER (see below) |
+| 4 | value/address validation | reachable; four canonical errors the `Option` erased into one `None` | typed, by `futex_wait_decide_split_read` |
+| 5 | existing deferral | mechanically unreachable — the deferral is per CPU, this route is its only split producer, traps nest on no architecture, and every decline past the reservation clears it | blocking settlement, fail-closed |
+| 6 | queue-advance admission | `MultiCpu`/`CpuNotAuthoritative` are the ambient contract the trap authority replaces; `NoTrapDrainer`/`OutgoingIdentityStale` are refuted by `establish`; `ArchUnsupported`/`StashOccupied` are scoped to `StashedKernelSwitch` and this caller passes `ExactTokenResume` | admitted on the trap's own authority, with `IncomingUnavailable` the one tolerated refusal |
+| 7 | reservation failure | mechanically unreachable, same argument as 5 | blocking settlement, fail-closed |
+| 8 | publication failure | reachable — a competing NR 10 winner | a typed competing-winner settlement, not a `bool` |
+
+Zero markers on ordinary boots is not unreachability, so 1, 5, 6 and 7 are argued from the owners
+that make them impossible, and each is still settled rather than assumed away.
+
+**The canonical validation ORDER, which this route did not have.** `futex_wait_current` calls
+`validate_current_user_futex_word` first, and that owner checks the ADDRESS before it resolves the
+caller: `addr == 0` is `WrongObject` and a kernel-range address is `UserMemoryFault` **even when
+there is no current task**. The route read `current_tid_authoritative` before the value check and
+fell back on its `None`, which was correct only because the broad handler then re-derived the whole
+thing in the right order. With the fall-back gone the order has to be right here, and it is:
+decode, address range, caller, readability, then the caller's own comparison.
+
+### §2 — one policy, two acquisition adapters
+
+`futex_word_range_check` is THE futex-word range policy. The broad validator and the split reader
+were byte-identical copies of it, and the copy is what let the split route erase the answers: it
+returned `Option<bool>`, so a null word and a kernel-range word came back as the same `None`. Both
+now call the one function, because only the reachability of the address space differs between them,
+never the rule.
+
+`futex_wait_decide_split_read` answers `Result<FutexWaitDecision, KernelError>`. Its readability
+probe is `copy_from_user_split` — the documented rank-5/6 mirror of the canonical validator's own
+leaf, same page walk, same user+read question, same errors. The caller with no address space keeps
+its explicit `UserMemoryFault`.
+
+**The ABI is unchanged.** YARM's NR 9 takes `expected` and `observed` as CALLER arguments and the
+kernel compares them; it reads the word only to prove the address is readable. No timeout, no
+bitset, no requeue, no PI, no new flag, no new lane. Success is `set_ok(usize::from(blocked), 0, 0)`,
+byte-for-byte the broad handler's. The blocking policy is the receive family's, shared through
+`SplitBlockingDisposition` — the receive-specific waiter state and result policy are not NR 9's.
+
+### §3 — the exact park transaction
+
+`futex_wait_publish_block_split_mut` wrote `Blocked` under rank 2, released, then called
+`block_current_on(cpu)` under rank 1 — an unconditional clear of whatever was current, keyed on
+nothing. Derived against NR 10's owners, that window is not benign. `futex_wake_inner` takes rank 2
+first (scan, set `Runnable`, collect) and rank 1 second (`enqueue_task` each). A waker entering the
+window sees this waiter registered, makes it `Runnable`, and its enqueue is REFUSED: the caller is
+still this CPU's `current`, and `enqueue_with_priority` refuses `AlreadyQueued` for anything the
+membership mirror holds — which includes the current slot. NR 10 then answers an error for a wake it
+performed, the unconditional clear runs, and the waiter is left `Runnable`, current on no CPU and
+queued on none: reachable by nothing.
+
+Ranks are ascending and never nested, so the registration and the clear cannot be one transaction.
+Of the two available orders, clear-then-register makes the waiter invisible for the whole window and
+LOSES a wake; register-then-clear keeps it visible and costs only that a wake may land while the
+task is still current. `futex_wait_park_exact_split` takes the second and then DETECTS it: after the
+compare-and-clear it reads the status back. Still `Blocked(Futex(addr))` means no waker ran, so the
+caller is `Parked` and carries the priority the clear actually removed. Anything else means a waker
+won, and the settlement is the receive family's placement recovery — built for exactly this shape,
+including the case where the waker's enqueue DID land and the task must be taken back out.
+
+Every step is keyed on the entering incarnation, read while the caller is still this CPU's current —
+the one interval in which its TCB cannot be reclaimed. The rank-2 registration refuses a TCB that is
+not `{tid, asid}` or not `Running` and writes nothing when it refuses; the rank-1 clear is
+`block_current_exact_on`, which mutates nothing unless the slot names exactly this task, so the
+transaction can never clear another task's placement, and a refusal undoes the registration exactly.
+The quantum reset a successful block performs is preserved.
+
+### §4 — proof, and what it caught
+
+Eleven tests. The differentials cover validation precedence and every return lane, comparing the
+split adapter against `futex_wait_current` address by address. The forced interleavings drive the
+production owners over real scheduler and task state: publication versus wake, incarnation
+replacement, a changed victim, deferral refusal, no acceptable incoming task, and exact subsequent
+resumption with the whole register file checked.
+
+Two source repairs fell out of writing them. `futex_wait_decide_split_read` had inherited its
+predecessor's `#[cfg(not(feature = "hosted-dev"))]` gate and its predecessor's now-false `Option`
+doc block, so the route's own validation policy was unreachable from a hosted differential; and its
+readability probe was the DebugLog-shaped `copy_from_user_asid_split_read`, which answers `Option`
+— the erasure §2 exists to remove — and carries a 192-byte clamp that has nothing to do with a
+futex word.
+
+**`IncomingUnavailable` has two shapes and only one is a refusal.** An empty queue admits with
+`Ok(None)`; a queued candidate the resume classifier refuses is `Err(IncomingUnavailable)`. The
+route tolerates exactly the second and nothing else, because a FutexWait caller parks on its own
+futex word, not on somebody else being ready to run. Either way the caller parks and the CPU lands
+idle rather than resuming what just parked.
+
+### Source closure
+
+The recognized body's return type cannot name `NotHandled`, so no production NR 9 outcome can hand
+the trap to the broad dispatcher. That is the source half, and it is enforced by the compiler rather
+than by a count.
+
+### Live traffic
+
+The live half is measured at ARRIVALS: `FUTEX_WAIT_BROAD_ENTRY nr=9` sits at the top of
+`handle_futex_wait`, before its first argument read. `dispatch`'s `Syscall::FutexWait` arm is that
+function's only caller and is reached only when the split route declined, so one line there counts
+exactly the thing the claim is about. A marker on the split side could only report doors it chose to
+walk past. Same placement and same reasoning as `IPC_SEND_BROAD_ENTRY`.
+
+| boot | NR 9 split parks | nonblocking completions | `FUTEX_WAIT_BROAD_ENTRY` |
+|---|---|---|---|
+| x86_64 core, ordinary | 1 | 0 | **0** |
+| AArch64 core, ordinary | 1 | 0 | **0** |
+| RISC-V core, ordinary | 1 | 0 | **0** |
+| x86_64 `X86_FUTEX_WAKE_ORACLE=1` | 4 | 1 | **0** |
+| AArch64 `FUTEX_WAIT_ORACLE=1` | 4 | 1 | **0** |
+| RISC-V `FUTEX_WAIT_ORACLE=1` | 3 | 1 | **0** |
+
+Genuine block → wake → resume on each port, with results checked in userspace:
+
+| port | witness |
+|---|---|
+| x86_64 | `X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid=10008 waiter_resumes=1` |
+| AArch64 | `AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid=1 dispatched_tid=10000 wake_count=1` |
+| RISC-V | `RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid=1 dispatched_tid=10008 wake_count=1` |
+
+Each park shows the §3 transaction and the per-port landing: `FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK …
+priority=exact`, `result=queue_advance_committed outgoing=<tid> captured=1`,
+`QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED reason=publication_committed`, and then x86_64's
+`X86_POST_LOCK_TERMINAL_IDLE … class=futex_wait landing=raw_trap_tail primitive=idle_halt_loop`,
+AArch64's `AARCH64_SPLIT_FINALIZE_OK nr=9` before its dispatch chain, or RISC-V's
+`SATP_OK → SFENCE_OK → FRAME_OK → SRET_ARMED`. RISC-V's `sepc` is pre-advanced by its bridge and no
+arithmetic was added anywhere; `RISCV_FUTEX_WAIT_USER_RETURN_OK tid=1 wake_count=1` is the resumed
+caller observing its own answer.
+
+**The nonblocking lane needed a witness, and the witness needed a feature gate.** Every futex oracle
+on every port blocks, so `FutexWaitDecision::Proceed` had zero live traffic. `nr9_nonblocking_probe`
+is one syscall with `expected != observed`, run first in each oracle while the task is plainly
+current. It is gated behind `futex-wait-nonblock-probe` for a measured reason, not a stylistic one:
+init's address space runs at `AddressSpace::MAX_MAPPINGS` on the provisioned oracle profiles, and
+compiling the probe unconditionally cost one more mapping run — enough that the XFER2 grant witness,
+a different slot-5 cell on the same image, failed with
+`VM_FULL reason=mapping_bookkeeping_full max_mappings=128 va=0x40000000` while mapping its pair of
+pages. Feature-off the image carries none of its literals. This is the same trade
+`ipc-send-final-fault-witness` already records, and init's mapping-run pressure remains deferred.
+
+To reproduce the nonblocking evidence:
+
+```
+BOOTSTRAP_FEATURE_ARGS="--no-default-features --features futex-wait-nonblock-probe" \
+  scripts/build-qemu-<arch>-artifacts.sh
+X86_FUTEX_WAKE_ORACLE=1 scripts/qemu-x86_64-core-smoke.sh     # or FUTEX_WAIT_ORACLE=1 for the others
+```
+
+### Acquisition census
+
+Unchanged, and that is the point — this package retired a reachability, not an acquisition:
+
+| measure | value |
+|---|---|
+| `AUDITED_WITH_CPU_TOTAL` | **2** |
+| `AUDITED_WITH_BROAD_TOTAL` | **0** |
+| raw `self.state.lock()` wrapper bodies | **3** |
+
+Census target 7/7.
+
+### Qualification
+
+Hosted **5632 passed / 0 failed / 2 ignored**. Three ports build. Doc-fragmentation 7/7; extraction
+bridge 2/2; census 7/7. Three ordinary core smokes clean with terminal idle after all required
+markers. Park witness `proposed=12 committed=12 resumed=12 stream_ok=1 broad_entries=0 result=ok`;
+x86_64 AP recv-v2 block `-smp 2` `blocked_commits=1 ack_publications=1 premature_wakes=0
+premature_continuations=0 wrong_cpu_blocks=0 result=ok`; x86_64 AP saved return `-smp 2`
+`fresh_entries=1 saved_dispatches=1 continuations=1 duplicate_entries=0 duplicate_continuations=0
+wrong_cpu_continuations=0 result=ok`; recv/reply delivery oracle `late_timeout_claims=0 result=ok`;
+XFER2 grant witness `grants=2 shapes=registered_range,explicit_range releases=2 route=split
+result=ok`. The established carve-out is unchanged at 8 pass / 2 fail
+(`required_chain_is_scoped_to_the_witnessed_transaction`,
+`required_marker_chain_is_ordered_and_complete`).
+
+### What the boot exercises, and what it does not
+
+An ordinary boot parks exactly one NR 9 per port — init's terminal idle park — and the oracle
+profiles add three or four more plus one nonblocking completion. Across every run:
+
+* `FUTEX_WAIT_BROAD_ENTRY` — **0**. No NR 9 arrives at the terminal broad acquisition.
+* `FUTEX_WAIT_SPLIT_INVARIANT` — **0**. No settlement fails closed.
+* `FUTEX_WAIT_SPLIT_DONE … result=task_missing` — **0**. No incarnation moved under a park.
+
+Stated plainly: live traffic exercises the PARK and the nonblocking completion, and the
+compensations not at all. The wake-during-publication recovery, the refused replacement incarnation,
+the changed victim and the refused deferral are proven by the deterministic forced interleavings
+over real scheduler and task state. The zero counts are what the design predicts, not what it is
+proven by.
+
+### Deferred, unchanged
+
+* The legacy NR 2 blocking population still has no live producer.
+* The multi-page shared-region mapping defect, reproduced rather than repaired.
+* Init's mapping-run pressure — now with a second witness paying the feature-gate tax for it.
+* Next: non-syscall traps, then deletion of the terminal acquisitions.

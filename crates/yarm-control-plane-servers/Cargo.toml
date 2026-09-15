@@ -27,6 +27,15 @@ riscv-exit-current-task-oracle = []
 # every other slot-5 profile keeps the headroom it had. Feature-off builds carry none of its
 # literals.
 ipc-send-final-fault-witness = []
+# U9-FUTEX-WAIT-FINAL §4: gates the NR 9 NONBLOCKING-completion probe in the futex oracles.
+#
+# Same reason as `ipc-send-final-fault-witness`, measured the same way: init's address space runs
+# at `AddressSpace::MAX_MAPPINGS` on the provisioned oracle profiles, and compiling the probe
+# unconditionally cost one more mapping run — enough to make the XFER2 grant witness fail with
+# `VM_FULL reason=mapping_bookkeeping_full max_mappings=128 va=0x40000000`. Feature-off builds
+# carry none of its literals and are byte-identical to a build without it, so every other slot-5
+# profile keeps the headroom it had.
+futex-wait-nonblock-probe = []
 recv-queue1-ordinary-grant = []
 
 [dependencies]

@@ -659,6 +659,53 @@ fn register_crash_test_with_supervisor(supervisor_send: u32, crash_tid: u64) {
     }
 }
 
+// ─── U9-FUTEX-WAIT-FINAL §4: the NONBLOCKING NR 9 completion lane, live ───────────────
+//
+// Every futex oracle on every port exercises NR 9's BLOCKING lane and nothing else, so an
+// ordinary boot measured zero traffic through the other half of the recognized body: the
+// `FutexWaitDecision::Proceed` completion, which validates the address, declines to park, and
+// answers `0` with no transition, no switch and no drain.
+//
+// The probe is one syscall with `expected != observed` — the caller's own view of the word
+// already moved, which is exactly what YARM's NR 9 ABI takes as arguments and compares. It runs
+// FIRST in each oracle, while the task is plainly current and runnable, so a `true` answer or an
+// error is unambiguous. It is gated behind the same default-off oracle selectors as everything
+// around it and changes no ordinary boot.
+//
+// It takes the caller's OWN oracle word rather than declaring one. Init's address space is at its
+// `max_mappings` ceiling — the deferred mapping-run pressure — and a fresh static was enough to
+// push its image over the boundary and make the NR 30 grant witness fail with
+// `VM_FULL reason=mapping_bookkeeping_full`. The probe only reads the word (`futex_wait` never
+// writes one), and `expected != observed` makes the answer independent of its value, so borrowing
+// a word costs the oracle nothing.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "futex-wait-nonblock-probe",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+))]
+fn nr9_nonblocking_probe(word: *const u32) {
+    // SAFETY: the caller passes its own oracle word, a live static `AtomicU32` in this image.
+    let observed = unsafe { core::ptr::read_volatile(word) };
+    // `expected` deliberately differs from `observed`: the canonical `Ok(false)` lane.
+    // ONE format string and no `Debug` formatting, because every byte of init's image is
+    // mapping-ceiling pressure on the feature-built profiles. `blocked` is the syscall's own
+    // answer: 0 is the required one, 1 means it parked, 2 means it errored.
+    let blocked: u32 = match yarm_user_rt::syscall::futex_wait(word, observed ^ 1, observed) {
+        Ok(false) => 0,
+        Ok(true) => 1,
+        Err(_) => 2,
+    };
+    yarm_user_rt::user_log!(
+        "NR9_NONBLOCK_PROBE observed={} blocked={}",
+        observed,
+        blocked
+    );
+}
+
 // ─── Stage 195C: AArch64 FutexWake live oracle ────────────────────────────────────────
 // A controlled parent/child proof of the AArch64 split FutexWake (NR 10). The child thread
 // blocks through the LEGACY global-lock FutexWait; the parent (init) wakes it through the
@@ -841,6 +888,9 @@ fn run_aarch64_futex_wake_oracle(init_tid: u64, futex_wait_mode: bool) {
         init_tid,
         futex_wait_mode as u32
     );
+    // U9-FUTEX-WAIT-FINAL §4: NR 9's nonblocking completion lane, before anything blocks.
+    #[cfg(feature = "futex-wait-nonblock-probe")]
+    nr9_nonblocking_probe(FUTEX_ORACLE_WORD.as_ptr());
     let addr = FUTEX_ORACLE_WORD.as_ptr();
     // 16-byte-aligned stack top of the child's dedicated static stack.
     let stack_top = {
@@ -977,6 +1027,9 @@ extern "C" fn x86_futex_wake_oracle_child_body() -> ! {
 fn run_x86_futex_wake_oracle(init_tid: u64) {
     use core::sync::atomic::Ordering::Relaxed;
     yarm_user_rt::user_log!("X86_FUTEX_WAKE_ORACLE_BEGIN init_tid={}", init_tid);
+    // U9-FUTEX-WAIT-FINAL §4: NR 9's nonblocking completion lane, before anything blocks.
+    #[cfg(feature = "futex-wait-nonblock-probe")]
+    nr9_nonblocking_probe(X86_FW_WORD.as_ptr());
     let addr = X86_FW_WORD.as_ptr();
     // 16-byte-aligned stack top (spawn_user_thread requires it and installs it as the initial
     // RSP verbatim). The naked `x86_futex_wake_oracle_child` trampoline re-establishes the
@@ -5111,6 +5164,9 @@ extern "C" fn riscv_futex_wait_oracle_child() -> ! {
 fn run_riscv_futex_wait_oracle(init_tid: u64) {
     use core::sync::atomic::Ordering::Relaxed;
     yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_ORACLE_BEGIN init_tid={}", init_tid);
+    // U9-FUTEX-WAIT-FINAL §4: NR 9's nonblocking completion lane, before anything blocks.
+    #[cfg(feature = "futex-wait-nonblock-probe")]
+    nr9_nonblocking_probe(FUTEX_ORACLE_WORD.as_ptr());
     let stack_top = {
         let base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_STACK) as usize;
         (base + 16384) & !0xF

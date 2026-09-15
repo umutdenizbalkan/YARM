@@ -19,6 +19,15 @@ aarch64-exit-current-task-oracle = []
 # U9-SEND-FINAL §3: accepted and inert here, so one `--features` argument can reach every
 # package the artifact build touches. Only yarm-control-plane-servers acts on it.
 ipc-send-final-fault-witness = []
+# U9-FUTEX-WAIT-FINAL §4: gates the NR 9 NONBLOCKING-completion probe in the futex oracles.
+#
+# Same reason as `ipc-send-final-fault-witness`, measured the same way: init's address space runs
+# at `AddressSpace::MAX_MAPPINGS` on the provisioned oracle profiles, and compiling the probe
+# unconditionally cost one more mapping run — enough to make the XFER2 grant witness fail with
+# `VM_FULL reason=mapping_bookkeeping_full max_mappings=128 va=0x40000000`. Feature-off builds
+# carry none of its literals and are byte-identical to a build without it, so every other slot-5
+# profile keeps the headroom it had.
+futex-wait-nonblock-probe = []
 recv-queue1-ordinary-grant = []
 # Stage 200D-0D1: the RISC-V sibling, an UNUSED pass-through for the same reason — one
 # BOOTSTRAP_FEATURE_ARGS is applied to every server package. No oracle code compiles here.

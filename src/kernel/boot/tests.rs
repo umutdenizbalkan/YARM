@@ -63920,6 +63920,107 @@ mod stage191d_futex_wait_block_publish {
         crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu.0 as usize]
             .store(false, core::sync::atomic::Ordering::Relaxed);
     }
+
+    /// **THE LIVE HALF OF THE CLOSURE CLAIM SITS AT THE ARRIVAL.**
+    ///
+    /// The source half is the recognized body's return type: it cannot answer `NotHandled`, so a
+    /// count taken on the split side would be a statement about code that cannot run. The live
+    /// half has to be measured where NR 9 traps ARRIVE at the terminal broad acquisition, which
+    /// is `handle_futex_wait` — reached only when the split route declined. Same placement and
+    /// same reasoning as `IPC_SEND_BROAD_ENTRY`, and pinned the same way.
+    #[test]
+    fn u9fw_the_broad_entry_census_counts_arrivals_at_the_terminal_acquisition() {
+        const BROAD: &str = include_str!("../syscall/sched.rs");
+        assert_eq!(
+            BROAD.matches("FUTEX_WAIT_BROAD_ENTRY nr=9").count(),
+            1,
+            "one census marker"
+        );
+        let handler = BROAD
+            .split("pub(super) fn handle_futex_wait(")
+            .nth(1)
+            .expect("the broad handler");
+        let census = handler
+            .find("FUTEX_WAIT_BROAD_ENTRY")
+            .expect("the census is inside the handler");
+        let first_read = handler
+            .find("frame.arg(SYSCALL_ARG_CAP)")
+            .expect("the handler's first argument read");
+        assert!(
+            census < first_read,
+            "the census must count the ARRIVAL, before any validation can divert it"
+        );
+        // The split side does not claim the measurement: a marker there could only report doors
+        // it chose to walk past.
+        assert!(
+            !SPLIT_SRC.contains("FUTEX_WAIT_BROAD_ENTRY"),
+            "the census belongs to the terminal acquisition, not to the route that avoids it"
+        );
+        // And it is the ONLY broad-entry census for NR 9 anywhere in the kernel, so the number
+        // reported from a boot log is a total and not one of several partial counts.
+        assert_eq!(
+            RUNTIME_SRC.matches("FUTEX_WAIT_BROAD_ENTRY").count(),
+            0,
+            "runtime.rs owns no NR 9 arrival census"
+        );
+    }
+
+    /// **THE NONBLOCKING-LANE PROBE IS FEATURE-GATED, AND THAT GATE IS LOAD-BEARING.**
+    ///
+    /// The probe is the live half of NR 9's OTHER lane: every futex oracle on every port blocks,
+    /// so a boot measured zero traffic through `FutexWaitDecision::Proceed` until this existed.
+    ///
+    /// It has to be a cargo feature, not just a runtime knob, and that was MEASURED rather than
+    /// assumed: init's address space runs at `AddressSpace::MAX_MAPPINGS` on the provisioned
+    /// oracle profiles, and compiling the probe unconditionally cost one more mapping run — enough
+    /// that the XFER2 grant witness, a different slot-5 cell on the same image, failed with
+    /// `VM_FULL reason=mapping_bookkeeping_full max_mappings=128 va=0x40000000` while it tried to
+    /// map its pair of pages. Feature-off, the image carries none of the probe's literals. That
+    /// headroom is deferred work this package does not touch, which is exactly why the gate has to
+    /// hold. `ipc-send-final-fault-witness` exists for the same reason and is pinned the same way.
+    #[test]
+    fn u9fw_the_nonblocking_probe_is_gated_so_it_costs_no_other_profile() {
+        const SERVICE: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        // The definition is gated.
+        let def = SERVICE
+            .split("fn nr9_nonblocking_probe(")
+            .next()
+            .expect("the source before the probe");
+        let cfg = def
+            .rfind("#[cfg(all(")
+            .expect("the probe carries a cfg attribute");
+        assert!(
+            def[cfg..].contains("feature = \"futex-wait-nonblock-probe\""),
+            "the probe definition must be behind the feature"
+        );
+        // And EVERY call site is gated too — an ungated call would drag the body in.
+        let calls = SERVICE.matches("nr9_nonblocking_probe(").count();
+        assert_eq!(calls, 4, "one definition and the three oracle call sites");
+        assert_eq!(
+            SERVICE
+                .matches(
+                    "#[cfg(feature = \"futex-wait-nonblock-probe\")]\n    nr9_nonblocking_probe("
+                )
+                .count(),
+            3,
+            "each of the three oracle call sites must carry the gate"
+        );
+        // The feature must be accepted by every package the artifact build passes it to, or the
+        // build fails rather than the probe silently not compiling in.
+        for manifest in [
+            include_str!("../../../Cargo.toml"),
+            include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml"),
+            include_str!("../../../crates/yarm-driver-servers/Cargo.toml"),
+            include_str!("../../../crates/yarm-fs-servers/Cargo.toml"),
+        ] {
+            assert!(
+                manifest.contains("futex-wait-nonblock-probe = []"),
+                "a package the artifact build touches does not accept the feature"
+            );
+        }
+    }
 }
 
 // Stage 191E — NEXT SAFE GLOBAL-LOCK RETIREMENT SLICE. Inventory finding: NO safe live
