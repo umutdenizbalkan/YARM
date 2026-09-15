@@ -1010,7 +1010,7 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
                 // settlement's obligations — the completed continuation captured and published,
                 // or the task already owned by a dispatcher — so it likewise passes the
                 // `current == None|Some(0)` invariant above by construction.
-                RiscvIdleReason::RecvUnsettled => "RecvUnsettled",
+                RiscvIdleReason::BlockUnsettled => "BlockUnsettled",
             };
             crate::yarm_log!("RISCV_TYPED_IDLE_OUTCOME result=ok reason={}", reason_str);
             // U9-DISPATCH-CPU1 D3 — the attribution has to match the reason.

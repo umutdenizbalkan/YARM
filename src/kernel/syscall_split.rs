@@ -616,7 +616,7 @@ pub(crate) fn try_split_terminal_page_fault_dispatch(
 /// what the rank-1 recovery actually achieved, as a verified post-state.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-pub(crate) struct RecvUnsettled {
+pub(crate) struct SplitBlockUnsettled {
     /// The exact incarnation the trap entered from.
     pub(crate) entering: crate::kernel::recv_waiter_split::RecvEnteringIncarnation,
     /// Where the recovery left it. Read, never assumed.
@@ -649,8 +649,8 @@ pub(crate) enum SplitDispatchDisposition {
     /// caller is no longer this CPU's current and re-running the receive against it is the exact
     /// corruption this disposition exists to prevent. It is not `QueueAdvanceCommitted` either —
     /// nothing was published and no drain owes anything. The BRIDGE settles it; see
-    /// [`RecvUnsettled`].
-    RecvUnsettled(RecvUnsettled),
+    /// [`SplitBlockUnsettled`].
+    BlockUnsettled(SplitBlockUnsettled),
     /// U9-TM §3 — the route finished its own work, mutated no scheduler state, and still owes the
     /// architecture tail's POST-WORK.
     ///
@@ -698,7 +698,7 @@ impl SplitDispatchDisposition {
             Self::QueueAdvanceCommitted => {
                 panic!("a committed queue advance has no pre-U9-QA equivalent")
             }
-            Self::RecvUnsettled(_) => {
+            Self::BlockUnsettled(_) => {
                 panic!("an unsettled receive has no pre-U9-QA equivalent")
             }
             Self::PostWorkCommitted { .. } => {
@@ -723,8 +723,15 @@ impl SplitDispatchDisposition {
 /// advance of its own — its park hands one to the post-work drain instead — so
 /// `QueueAdvanceCommitted` is absent too, and the type states that rather than leaving it to a
 /// comment.
-/// U9-RECV-FINAL §1 — the outcome of a **recognized** NR 2 / NR 5, which is a strictly smaller
-/// set than `SplitDispatchDisposition`.
+/// U9-RECV-FINAL §1 / U9-FUTEX-WAIT-FINAL §2 — the outcome of a **recognized BLOCKING syscall**,
+/// which is a strictly smaller set than `SplitDispatchDisposition`.
+///
+/// Shared by NR 2 / NR 5 and by NR 9, because the shape is the family-neutral one: a blocking
+/// syscall can finish immediately, it can PARK — which is why `QueueAdvanceCommitted` is present
+/// here and absent from the send type — it can owe the post-work drain, and it can clear `current`
+/// and fail to put the caller back. What is NOT shared is any of the receive family's own policy:
+/// its `BlockedRecvState`, its waiter publication and its empty-answer encoding are the receive
+/// transaction's, and NR 9 uses none of them.
 ///
 /// The receive family had two entry points and both could answer `NotHandled` long after they had
 /// recognized the syscall — the queued lane through an `Option`, the blocking lane through
@@ -737,7 +744,7 @@ impl SplitDispatchDisposition {
 /// post-work drain a delivery. It can never ask the broad dispatcher to service it.
 #[derive(Debug)]
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-pub(crate) enum SplitRecvDisposition {
+pub(crate) enum SplitBlockingDisposition {
     /// The syscall is finished and its result is in the frame.
     Complete(Result<(), TrapHandleError>),
     /// The receiver is PARKED: a terminal transition is published, the caller is no longer
@@ -748,10 +755,10 @@ pub(crate) enum SplitRecvDisposition {
     /// U9-RECV-BLOCK2 §2 — `current` was cleared and the entering incarnation could not be put
     /// back. The BRIDGE settles it; the frame already carries this receive's canonical answer, so
     /// a settlement that captures it completes the syscall rather than re-entering it.
-    Unsettled(RecvUnsettled),
+    Unsettled(SplitBlockUnsettled),
 }
 
-impl SplitRecvDisposition {
+impl SplitBlockingDisposition {
     /// Widen to the dispatcher's type. Total by construction: every arm names a committed
     /// outcome, so widening can never introduce the `NotHandled` the narrow type excludes.
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
@@ -762,7 +769,7 @@ impl SplitRecvDisposition {
             Self::PostWorkCommitted { finalize_syscall } => {
                 SplitDispatchDisposition::PostWorkCommitted { finalize_syscall }
             }
-            Self::Unsettled(unsettled) => SplitDispatchDisposition::RecvUnsettled(unsettled),
+            Self::Unsettled(unsettled) => SplitDispatchDisposition::BlockUnsettled(unsettled),
         }
     }
 }
@@ -822,7 +829,7 @@ pub(crate) fn try_split_dispatch_into_frame(
     // the authority this CPU's open trap window already holds, and `none` when no window is open —
     // which is never live and therefore authorizes nothing.
     let authority = crate::runtime::DispatchAuthority::for_open_window(cpu);
-    match try_split_futex_wait_into_frame(shared, cpu, frame) {
+    match try_split_futex_wait_into_frame(shared, cpu, frame, authority) {
         SplitDispatchDisposition::NotHandled => {}
         handled => return handled,
     }
@@ -1704,7 +1711,7 @@ fn try_split_ipc_send_into_frame(
 #[cfg(not(feature = "hosted-dev"))]
 enum BlockingLaneOutcome {
     /// The lane answered the trap.
-    Settled(SplitRecvDisposition),
+    Settled(SplitBlockingDisposition),
     /// A precondition for parking on THIS CPU did not hold, for a reason that is not about the
     /// message. Each variant carries its own established-impossibility argument; see
     /// [`settle_cannot_park`].
@@ -1716,7 +1723,7 @@ impl BlockingLaneOutcome {
     /// The lane answered the trap with a completed syscall. A constructor rather than a wrapped
     /// literal so the lane's own `return` sites read as they did before the type was introduced.
     fn complete(result: Result<(), TrapHandleError>) -> Self {
-        Self::Settled(SplitRecvDisposition::Complete(result))
+        Self::Settled(SplitBlockingDisposition::Complete(result))
     }
 }
 
@@ -1767,7 +1774,7 @@ fn try_split_ipc_recv_family_into_frame(
         // whose `None` arm landed here and was counted as a terminal broad entry — so a
         // RECOGNIZED receive that no lane had settled left the family through the same door as a
         // syscall that was never ours. That door is gone: the recognized body now returns a
-        // `SplitRecvDisposition`, a type with no representation for "hand this to the broad
+        // `SplitBlockingDisposition`, a type with no representation for "hand this to the broad
         // dispatcher", and every outcome it can reach is settled. The narrow type is the final
         // enforcement; the settlements are the work.
         return SplitDispatchDisposition::NotHandled;
@@ -1804,9 +1811,9 @@ fn try_split_recv_recognized(
     cpu: CpuId,
     frame: &mut TrapFrame,
     authority: crate::runtime::DispatchAuthority,
-) -> SplitRecvDisposition {
+) -> SplitBlockingDisposition {
     use crate::kernel::syscall::SyscallError;
-    use SplitRecvDisposition as D;
+    use SplitBlockingDisposition as D;
 
     let cpu_idx = cpu.0 as usize;
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
@@ -1973,14 +1980,14 @@ fn settle_no_immediate_take(
     tid: u64,
     _frame: &mut TrapFrame,
     reason: &'static str,
-) -> SplitRecvDisposition {
+) -> SplitBlockingDisposition {
     crate::yarm_log!(
         "IPC_RECV_SPLIT_INVARIANT cpu={} tid={} reason={} result=failed_closed",
         cpu.0,
         tid,
         reason
     );
-    SplitRecvDisposition::Complete(Err(TrapHandleError::Syscall(
+    SplitBlockingDisposition::Complete(Err(TrapHandleError::Syscall(
         crate::kernel::syscall::SyscallError::Internal,
     )))
 }
@@ -2037,7 +2044,7 @@ fn settle_cannot_park(
     tid: u64,
     frame: &mut TrapFrame,
     reason: CannotParkReason,
-) -> SplitRecvDisposition {
+) -> SplitBlockingDisposition {
     let _ = (shared, frame);
     let slug = match reason {
         CannotParkReason::AlreadyDeferred => "already_deferred",
@@ -2053,7 +2060,7 @@ fn settle_cannot_park(
         slug,
         reason
     );
-    SplitRecvDisposition::Complete(Err(TrapHandleError::Syscall(
+    SplitBlockingDisposition::Complete(Err(TrapHandleError::Syscall(
         crate::kernel::syscall::SyscallError::Internal,
     )))
 }
@@ -2114,7 +2121,7 @@ fn recv_settle_after_unwind(
     outcome: crate::kernel::recv_waiter_split::RecvUnwindOutcome,
     answer: crate::kernel::syscall::SyscallError,
     reason: &'static str,
-) -> SplitRecvDisposition {
+) -> SplitBlockingDisposition {
     let encoded = recv_encode_empty_answer(frame, answer);
     crate::yarm_log!(
         "IPC_RECV_BLOCK_SPLIT_SETTLED cpu={} tid={} asid={} reason={} answer={} outcome={} resumable={}",
@@ -2127,13 +2134,13 @@ fn recv_settle_after_unwind(
         u8::from(outcome.may_resume_entering_frame())
     );
     if outcome.may_resume_entering_frame() {
-        return SplitRecvDisposition::Complete(encoded);
+        return SplitBlockingDisposition::Complete(encoded);
     }
     // The encode failed only if the transfer-cap lane could not be written, which is a frame
     // defect rather than a settlement one; carry it as the answer so the bridge captures a frame
     // that says so rather than one that says nothing.
     let _ = encoded;
-    SplitRecvDisposition::Unsettled(RecvUnsettled { entering, outcome })
+    SplitBlockingDisposition::Unsettled(SplitBlockUnsettled { entering, outcome })
 }
 
 /// U9-RX3 §3 — service a BLOCKING `IpcRecv` (NR 2) off the broad lock.
@@ -2192,7 +2199,7 @@ fn try_split_blocking_ipc_recv_into_frame(
     use crate::kernel::task::BlockedRecvState;
     // U9-RECV-BLOCK2 §1 — the lane composes RECEIVE dispositions now; the family entry is the
     // only place a `SplitDispatchDisposition` is produced, and only for "not a receive".
-    use SplitRecvDisposition as D;
+    use SplitBlockingDisposition as D;
 
     // (1) NR, then architecture. The body is architecture-neutral; the gate names the two that
     // have the drain this route publishes into, and since U9-RX4 repaired the queued-plain
@@ -3275,92 +3282,156 @@ fn try_split_timer_into_frame(
     SplitDispatchDisposition::NotHandled
 }
 
-/// U9-QA §2 — service `FutexWait` (NR 9) off the broad lock.
+/// U9-FUTEX-WAIT-FINAL — the CLOSED `FutexWait` (NR 9) route.
 ///
-/// This is the migration of the EXISTING semantics onto the already-present split primitives —
-/// the same Phase A value check, the same Phase B block publication, and the same one-shot
-/// per-CPU deferral the in-lock `futex_wait_current` records. No timeout, no `WAIT_BITSET`, no
-/// requeue, no PI, no new flag and no ABI change.
+/// # What the type change means
 ///
-/// The steps are ordered so that the LAST thing which can decline comes before the FIRST thing
-/// which mutates:
+/// U9-QA §2 migrated NR 9's semantics onto the split primitives and left EIGHT recognized-NR9
+/// exits answering `NotHandled` — the terminal broad dispatcher. Those were not "this trap is not
+/// a FutexWait"; they were a recognized NR 9 being handed away, and the broad arm it landed in has
+/// its own in-lock deferral machinery, so the family had two blocking implementations reachable
+/// from one syscall. Giving the recognized body its own return type is what makes that
+/// unrepeatable, exactly as it did for NR 1, NR 2/NR 5 and NR 7.
 ///
-/// 1. **NR + ABI** — decoded exactly as `handle_futex_wait` decodes it. A non-`u32` argument is
-///    an `InvalidArgs` the broad handler owns, so it falls back.
-/// 2. **Phase A value check** — `futex_wait_would_block_split_read`. `None` is a validation miss
-///    whose canonical error is the broad handler's to produce; fall back and let it.
-/// 3. **Not blocking** — the futex word already moved. Nothing is published and no switch is
-///    needed, so this is an ordinary `Complete`, encoded exactly as the broad handler encodes it.
-/// 4. **Admission** — `queue_advance_admit_split`, plus this class's own precondition that no
-///    same-class deferral is outstanding. Every refusal lands here, while falling back is still
-///    safe. `Ok(None)` is ADMITTED: it means the advance will idle this CPU, which the drains
-///    already settle.
-/// 5. **Deferral reservation** — taken BEFORE the publication, because it is the only step that
-///    can fail for a reason unrelated to this caller. Reserving first keeps such a failure a
-///    pre-mutation refusal.
-/// 6. **Publication** — `futex_wait_publish_block_split_mut`. It returns `false` only when the
-///    caller has no TCB, and it does so BEFORE touching the scheduler, so that case is still
-///    unmutated: release the reservation and fall back.
-/// 7. **The result** — `set_ok(1, 0, 0)` into the OUTGOING frame, identical to the broad
-///    handler's `set_ok(usize::from(blocked), 0, 0)`. It is written before the switch so the
-///    caller observes it when it is later resumed.
+/// # The eight, and what each became
+///
+/// 1. **CPU out of range.** Mechanically unreachable for an authority-bearing caller: the
+///    authority is minted by `TrapPathWindow::establish` from a hardware-identified CPU, and an
+///    index at or past `MAX_CPUS` yields `DispatchAuthority::none`, which is never live. Settled
+///    as `WrongObject` — the error `with_cpu` raises for a CPU it cannot bind.
+/// 2. **Argument decode.** Genuinely reachable from userspace, and canonical: `InvalidArgs`,
+///    the error `handle_futex_wait`'s two `u32::try_from` produce.
+/// 3. **No current task.** Canonical `TaskMissing` — but raised in the canonical ORDER, which is
+///    not where this route used to ask it; see below.
+/// 4. **Value/address validation.** Four canonical errors the `Option` erased into one `None`.
+///    `futex_wait_decide_split_read` answers them typed.
+/// 5. **Existing deferral** and 7. **reservation failure.** Both mechanically unreachable: the
+///    deferral is per CPU, this route is its only split producer, traps nest on no architecture,
+///    and every decline past the reservation clears it.
+/// 6. **Queue-advance admission.** `MultiCpu` and `CpuNotAuthoritative` are the AMBIENT contract,
+///    and they are what kept this route to a single dispatching CPU; the trap's own authority
+///    replaces them. `NoTrapDrainer` and `OutgoingIdentityStale` are refuted by
+///    `TrapPathWindow::establish`, which sets the drainer flag and opens the window that minted
+///    this authority, in that order. `ArchUnsupported` and `StashOccupied` are scoped to
+///    `StashedKernelSwitch`, and this caller passes `ExactTokenResume`.
+/// 8. **Publication failure.** A competing-winner settlement, not a `bool`; see
+///    `futex_wait_park_exact_split`.
+///
+/// # The canonical validation ORDER, which this route did not have
+///
+/// `futex_wait_current` calls `validate_current_user_futex_word` FIRST, and that owner checks the
+/// address before it resolves the caller: `addr == 0` is `WrongObject` and a kernel-range address
+/// is `UserMemoryFault` **even when there is no current task**. This route read
+/// `current_tid_authoritative` before the value check and fell back on its `None`, which was
+/// correct only because the broad handler then re-derived the whole thing in the right order.
+/// With the fall-back gone the order has to be right here, so it is: decode, address range,
+/// caller, readability, then the caller's own comparison.
+///
+/// # The ABI is unchanged
+///
+/// `expected` and `observed` are both the CALLER'S arguments and the kernel compares them; it
+/// reads no futex word to decide whether to block, only to prove the address is readable. No
+/// timeout, no bitset, no requeue, no PI, no new flag, no new lane. The success encoding is
+/// `set_ok(usize::from(blocked), 0, 0)`, byte-for-byte the broad handler's.
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_futex_wait_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     frame: &mut TrapFrame,
+    authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
-    use SplitDispatchDisposition as D;
 
     if frame.syscall_num() != crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR {
-        return D::NotHandled;
+        // THE ONLY `NotHandled` this family can produce, and it is not a fall-through: the trap is
+        // a different syscall, about which this route has no opinion.
+        return SplitDispatchDisposition::NotHandled;
     }
+    try_split_futex_wait_recognized(shared, cpu, frame, authority).into_dispatch()
+}
+
+/// U9-FUTEX-WAIT-FINAL §2 — the recognized NR 9 body. Every outcome is settled here.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_futex_wait_recognized(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    authority: crate::runtime::DispatchAuthority,
+) -> SplitBlockingDisposition {
+    use crate::kernel::syscall::sched::{FutexParkOutcome, FutexWaitDecision};
+    use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError};
+    use SplitBlockingDisposition as D;
+
     let cpu_idx = cpu.0 as usize;
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-        return D::NotHandled;
+        // (1) Established impossible: `DispatchAuthority::none` is what an out-of-range index
+        // mints, and it is never live. `WrongObject` is the error `with_cpu` raises for a CPU it
+        // cannot bind, so the answer is the broad arm's even though the owner is not.
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_INVARIANT cpu={} reason=cpu_out_of_range result=failed_closed",
+            cpu.0
+        );
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::WrongObject)));
     }
-    // (1) ABI, identical to `handle_futex_wait`.
-    //
-    // Every decline from here on is ATTRIBUTED. These were silent, and that cost a diagnosis:
-    // AArch64 imported `nr=9` into the frame and still never took this route, with no marker to
-    // say which check declined it. A refusal that cannot be seen in a live log cannot be
-    // distinguished from a route that was never reached.
+
+    // (2) ABI, identical to `handle_futex_wait` — and ANSWERED, because `InvalidArgs` is what that
+    // handler's `u32::try_from` produces and no later owner will produce it for us.
     let addr = frame.arg(SYSCALL_ARG_CAP);
     let (Ok(expected), Ok(observed)) = (
         u32::try_from(frame.arg(SYSCALL_ARG_PTR)),
         u32::try_from(frame.arg(SYSCALL_ARG_LEN)),
     ) else {
-        // legacy: InvalidArgs, produced by the broad handler
         crate::yarm_log!(
-            "FUTEX_WAIT_SPLIT_REFUSED tid=0 reason=arg_decode cpu={}",
+            "FUTEX_WAIT_SPLIT_DONE tid=0 addr={} result=invalid_args cpu={}",
+            addr,
             cpu.0
         );
-        return D::NotHandled;
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
     };
+
+    // (3) THE ADDRESS RANGE COMES FIRST. `validate_current_user_futex_word` refuses a null or
+    // kernel-range word before it ever asks who the caller is, so a trap with no current task
+    // still gets the address error. This is the same function that owner calls.
+    if let Err(err) = crate::kernel::syscall::sched::futex_word_range_check(addr) {
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_DONE tid=0 addr={} result=range_refused err={:?} cpu={}",
+            addr,
+            err,
+            cpu.0
+        );
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(err))));
+    }
+
+    // (4) Only now the caller, and its absence is the canonical `TaskMissing`.
     let Some(tid) = shared.current_tid_authoritative(cpu) else {
         crate::yarm_log!(
-            "FUTEX_WAIT_SPLIT_REFUSED tid=0 reason=no_current_task cpu={}",
-            cpu.0
-        );
-        return D::NotHandled;
-    };
-    // (2) Phase A: the off-lock value check.
-    let Some(would_block) = shared.futex_wait_would_block_split_read(tid, addr, expected, observed)
-    else {
-        // legacy: WrongObject / UserMemoryFault
-        crate::yarm_log!(
-            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason=value_check addr={} expected={} observed={} cpu={}",
-            tid,
+            "FUTEX_WAIT_SPLIT_DONE tid=0 addr={} result=no_current_task cpu={}",
             addr,
-            expected,
-            observed,
             cpu.0
         );
-        return D::NotHandled;
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(
+            crate::kernel::boot::KernelError::TaskMissing,
+        ))));
     };
-    // (3) The non-blocking outcome: no transition, no switch, no drain.
-    if !would_block {
+
+    // (5) Readability, then the CALLER'S comparison — typed, so each canonical error is answered
+    // by the owner that decided it rather than re-derived by the broad dispatcher.
+    let decision = match shared.futex_wait_decide_split_read(tid, addr, expected, observed) {
+        Ok(decision) => decision,
+        Err(err) => {
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=value_check err={:?} cpu={}",
+                tid,
+                addr,
+                err,
+                cpu.0
+            );
+            return D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(err))));
+        }
+    };
+    if matches!(decision, FutexWaitDecision::Proceed) {
+        // The futex word already moved. No transition, no switch, no drain — the canonical
+        // `set_ok(usize::from(false), 0, 0)`.
         frame.set_ok(0, 0, 0);
         crate::yarm_log!(
             "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=not_blocked",
@@ -3369,61 +3440,143 @@ fn try_split_futex_wait_into_frame(
         );
         return D::Complete(Ok(()));
     }
-    // (4) ADMISSION — the last point at which falling back is safe.
+
+    // (6) ADMISSION, on the trap's own authority.
+    //
+    // The ambient form refused `MultiCpu` whenever more than one CPU was dispatching, which is why
+    // this route never ran on an SMP boot and why every NR 9 there reached the terminal
+    // acquisition. A trap authority answers both ambient questions unforgeably — it names this CPU
+    // and the selection owner authenticates against the same value — so neither the comparison nor
+    // the single-dispatcher restriction applies to it. Every other precondition is the shared
+    // body's and is unchanged.
     if crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx) {
-        crate::yarm_log!(
-            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason=already_deferred cpu={}",
-            tid,
-            cpu.0
-        );
-        return D::NotHandled;
+        return settle_futex_cannot_park(cpu, tid, "already_deferred");
     }
-    // The FutexWait drains apply through the EXACT-TOKEN resume on all three architectures — they
-    // stash nothing and switch no kernel context — so admission is asked that convention's
-    // preconditions, not the stash's.
-    if let Err(refusal) = shared.queue_advance_admit_split(
-        cpu,
+    if let Err(refusal) = shared.queue_advance_admit_with_authority_split(
+        authority,
         crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+    ) && !matches!(
+        refusal,
+        crate::kernel::boot::QueueAdvanceRefusal::IncomingUnavailable
     ) {
         crate::yarm_log!(
-            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason={:?} cpu={}",
+            "FUTEX_WAIT_SPLIT_INVARIANT cpu={} tid={} reason=admission detail={:?} result=failed_closed",
+            cpu.0,
             tid,
-            refusal,
-            cpu.0
+            refusal
         );
-        return D::NotHandled;
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::Internal)));
     }
-    // (5) Reserve the deferral before publishing, so a reservation failure is pre-mutation.
+    // (7) Reserve before the irreversible publication, so a reservation failure stays
+    // pre-mutation.
     if !crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid) {
-        crate::yarm_log!(
-            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason=defer_unavailable cpu={}",
-            tid,
-            cpu.0
-        );
-        return D::NotHandled;
+        return settle_futex_cannot_park(cpu, tid, "defer_unavailable");
     }
     crate::yarm_log!("FUTEX_WAIT_SPLIT_BEGIN");
-    // (6) PUBLICATION. Past this line the trap MUST settle through the drains.
-    if !shared.futex_wait_publish_block_split_mut(cpu, tid, addr) {
-        // No TCB for the caller: the publish refused before it touched the scheduler, so
-        // nothing is mutated. Release the reservation and let the broad handler produce the
-        // canonical `TaskMissing`.
-        crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
-        crate::yarm_log!(
-            "FUTEX_WAIT_SPLIT_REFUSED tid={} reason=publish_no_tcb cpu={}",
-            tid,
-            cpu.0
-        );
-        return D::NotHandled;
+
+    // (8) THE PARK. Exact incarnation, compare-and-clear, wake detected.
+    //
+    // The ASID is read while the caller is still this CPU's current — the one interval in which
+    // its TCB cannot be reclaimed — so what the transaction authenticates against is the
+    // incarnation this trap entered from and not whatever later answers to the number.
+    let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
+    match shared.futex_wait_park_exact_split(cpu, tid, asid, addr) {
+        FutexParkOutcome::Parked { .. } => {
+            crate::yarm_log!(
+                "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid={} cpu={}",
+                tid,
+                cpu_idx
+            );
+            // The syscall's own result, into the outgoing frame, before the switch: the caller
+            // observes it when it is later resumed.
+            frame.set_ok(1, 0, 0);
+            D::QueueAdvanceCommitted
+        }
+        // A waker won during publication. The caller is NOT parked, so nothing is owed to a drain
+        // — release the reservation — and the answer is still `1`: it blocked and was woken, which
+        // is what `set_ok(usize::from(blocked), 0, 0)` reports for a caller that parked at all.
+        FutexParkOutcome::WokenDuringPublication {
+            entering,
+            recovered,
+        } => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            frame.set_ok(1, 0, 0);
+            if recovered.may_resume_entering_frame() {
+                crate::yarm_log!(
+                    "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=woken_during_publish recovery={}",
+                    tid,
+                    addr,
+                    recovered.slug()
+                );
+                return D::Complete(Ok(()));
+            }
+            // The placement could not be restored, so the entering frame is not this task's to
+            // return through. The BRIDGE settles it — the same owner the receive family's
+            // post-clear settlements use, which captures the completed continuation, publishes it
+            // and lands this CPU.
+            D::Unsettled(SplitBlockUnsettled {
+                entering,
+                outcome: recovered,
+            })
+        }
+        // Both established-impossible, and both PRE-MUTATION by construction: the registration is
+        // undone exactly on a victim mismatch, and an incarnation mismatch writes nothing at all.
+        // The caller is therefore still this CPU's current and its frame is still its own.
+        FutexParkOutcome::VictimChanged => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            settle_futex_cannot_park(cpu, tid, "phase_a_victim_changed")
+        }
+        FutexParkOutcome::IncarnationMoved => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=task_missing cpu={}",
+                tid,
+                addr,
+                cpu.0
+            );
+            D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(
+                crate::kernel::boot::KernelError::TaskMissing,
+            ))))
+        }
     }
+}
+
+/// U9-FUTEX-WAIT-FINAL §2 — settle an NR 9 that must park but whose CPU could not commit the park.
+///
+/// # Every reason is PRE-MUTATION, and every one is established-impossible
+///
+/// All three are decided before the park transaction registers anything, or by a transaction that
+/// undid its registration exactly. The caller is therefore still this CPU's current task and the
+/// entering frame is still its own, so answering through that frame loses nothing and parks
+/// nothing.
+///
+/// * **`already_deferred` / `defer_unavailable`.** The FutexWait deferral is per CPU. This route
+///   is its only split producer, it reserves at step (7), and every decline after that point
+///   clears it. Traps do not nest on any of the three architectures, so no second reservation can
+///   exist on this CPU while this trap is running.
+/// * **`phase_a_victim_changed`.** The current slot was read by `current_tid_authoritative(cpu)`
+///   in this same trap. Installing a current on a CPU requires running on that CPU, and this trap
+///   is what is running on it.
+///
+/// Fail-closed rather than divergent, for the reason the receive family's twin records: divergence
+/// is licensed for an established impossibility but is not required, and it is the worse choice
+/// when the task is current, runnable and resumable. What is NOT available is handing the trap to
+/// the broad dispatcher, which would be this slice's own escape wearing a different name.
+#[cfg(not(feature = "hosted-dev"))]
+fn settle_futex_cannot_park(
+    cpu: CpuId,
+    tid: u64,
+    reason: &'static str,
+) -> SplitBlockingDisposition {
     crate::yarm_log!(
-        "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid={} cpu={}",
+        "FUTEX_WAIT_SPLIT_INVARIANT cpu={} tid={} reason={} result=failed_closed",
+        cpu.0,
         tid,
-        cpu_idx
+        reason
     );
-    // (7) The syscall's own result, into the outgoing frame, before the switch.
-    frame.set_ok(1, 0, 0);
-    D::QueueAdvanceCommitted
+    SplitBlockingDisposition::Complete(Err(TrapHandleError::Syscall(
+        crate::kernel::syscall::SyscallError::Internal,
+    )))
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -3431,6 +3584,7 @@ fn try_split_futex_wait_into_frame(
     _shared: &SharedKernel,
     _cpu: CpuId,
     _frame: &mut TrapFrame,
+    _authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
     SplitDispatchDisposition::NotHandled
 }

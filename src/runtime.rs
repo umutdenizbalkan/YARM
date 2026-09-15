@@ -15159,73 +15159,215 @@ impl SharedKernel {
     /// Read-only: no TCB / scheduler / IPC / cap / VM structural mutation. `None` lets a
     /// caller fall back to the global-lock handler for the canonical error (never masked).
     #[cfg(not(feature = "hosted-dev"))]
-    pub fn futex_wait_would_block_split_read(
+    /// U9-FUTEX-WAIT-FINAL §2 — the SPLIT acquisition adapter over the one futex-word policy,
+    /// answering the canonical error rather than erasing it.
+    ///
+    /// # What the `Option` cost
+    ///
+    /// This returned `Option<bool>`, and `None` stood for four different canonical answers:
+    /// `WrongObject` for a null word, `UserMemoryFault` for an address whose last byte overflows
+    /// or reaches `KERNEL_SPACE_BASE`, `UserMemoryFault` again for a task with no address space,
+    /// and whatever the user copy itself raises. The route could not tell them apart, so it handed
+    /// every one of them to the broad dispatcher to re-derive — which is a correct answer produced
+    /// by the wrong owner, and the last reason a recognized NR 9 could reach the terminal
+    /// acquisition on a validation miss.
+    ///
+    /// # The order is the canonical one, and it is load-bearing
+    ///
+    /// `validate_current_user_futex_word` checks the ADDRESS before it resolves the caller, so a
+    /// null or kernel-range word raises its own error even when there is no current task. The
+    /// range prefix is now literally the same function (`futex_word_range_check`); the ASID
+    /// resolution and the readability probe are this adapter's, because only their acquisition
+    /// differs from the broad validator's.
+    ///
+    /// The `expected`/`observed` comparison happens last and is the CALLER'S: YARM's NR 9 takes
+    /// both values as arguments and the kernel compares them. No word is read to decide it.
+    pub fn futex_wait_decide_split_read(
         &self,
         tid: u64,
         addr: usize,
         expected: u32,
         observed: u32,
-    ) -> Option<bool> {
-        if addr == 0 {
-            return None; // legacy: WrongObject
-        }
-        let end = addr.checked_add(core::mem::size_of::<u32>() - 1)?;
-        if end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE {
-            return None; // legacy: UserMemoryFault
-        }
+    ) -> Result<crate::kernel::syscall::sched::FutexWaitDecision, crate::kernel::boot::KernelError>
+    {
+        use crate::kernel::syscall::sched::FutexWaitDecision;
+        crate::kernel::syscall::sched::futex_word_range_check(addr)?;
+        // The canonical validator resolves the ASID through `task_asid(tid).ok_or(
+        // UserMemoryFault)`, so a caller with no address space is a fault rather than a missing
+        // task. `task_asid_for_tid_split_read` answers `0` for that case, which is the reserved
+        // no-address-space value, and the probe below refuses it exactly as the broad copy does.
         let asid = self.task_asid_for_tid_split_read(tid);
-        self.copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())?;
-        Some(expected == observed)
+        if self
+            .copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())
+            .is_none()
+        {
+            return Err(crate::kernel::boot::KernelError::UserMemoryFault);
+        }
+        Ok(if expected == observed {
+            FutexWaitDecision::Park
+        } else {
+            FutexWaitDecision::Proceed
+        })
     }
 
-    /// Stage 191D (FUTEXWAIT BLOCK-PUBLISH SEAM), Phase B: publish the caller `tid` as
-    /// `Blocked(Futex(addr))` and clear the current-CPU slot, OFF the broad global lock —
-    /// mirroring the block portion of `KernelState::futex_wait_current` (the TCB status
-    /// set) + `block_current_cpu` (`block_current_on` + `timer.reset_quantum`), WITHOUT the
-    /// subsequent `dispatch_next_task`. Task lock (rank 2) then scheduler lock (rank 1),
-    /// each held transiently and released before the next — non-nested; no broad
-    /// `&mut KernelState`. The published waiter is left `Blocked` and NOT enqueued (so no
-    /// duplicate enqueue and no orphaned runnable), removed from the current slot (so it is
-    /// current on NO CPU), and observable to `futex_wake_split_mut` on the same `addr` (so
-    /// no lost wake). Requires `tid` to be the current task on `cpu` (the live caller is).
-    /// Returns `true` iff the caller was published `Blocked` and removed from current.
+    /// U9-FUTEX-WAIT-FINAL §3 — THE exact `FutexWait` park transaction.
     ///
-    /// DEFERRED / HELPER-ONLY: this is the block-publish half of a split FutexWait. It does
-    /// NOT dispatch — the queue-ADVANCING switch to the next runnable task
-    /// (`dispatch_next_task`'s "switch_required" case) requires the global-lock dispatch /
-    /// context-switch machinery and is the documented multi-stage rewrite, so FutexWait's
-    /// LIVE retirement is deferred and this seam is not wired into `try_split_dispatch`.
-    pub fn futex_wait_publish_block_split_mut(&self, cpu: CpuId, tid: u64, addr: usize) -> bool {
+    /// # What the predecessor did, and the interleaving it admitted
+    ///
+    /// It wrote `Blocked(Futex(addr))` under rank 2, released, then called `block_current_on(cpu)`
+    /// under rank 1 — an UNCONDITIONAL clear of whatever was current, keyed on nothing. Derived
+    /// against NR 10's owners, that window is not benign:
+    ///
+    /// `futex_wake_inner` takes rank 2 first (scan for `Blocked(Futex(addr))`, set `Runnable`,
+    /// collect the tids) and rank 1 second (`enqueue_task` each). A waker entering that window
+    /// sees this waiter registered — correctly, which is why the registration must come first —
+    /// makes it `Runnable`, and then tries to enqueue it. The enqueue is REFUSED: the caller is
+    /// still this CPU's `current`, and `PriorityScheduler::enqueue_with_priority` refuses
+    /// `AlreadyQueued` for anything the membership mirror holds, which includes the current slot.
+    /// `futex_wake_inner` propagates that with `?`, so NR 10 answers an error for a wake it
+    /// performed. Then the unconditional clear runs, and the waiter is left `Runnable`, current on
+    /// no CPU and queued on none — reachable by nothing.
+    ///
+    /// That is invisible today only because `queue_advance_admit_split`'s AMBIENT `MultiCpu`
+    /// refusal keeps this route to a single dispatching CPU, and §2 replaces that with the trap's
+    /// own authority. So closing the window is a PRECONDITION for the migration, not a separate
+    /// repair.
+    ///
+    /// # The order is forced, and the detection is what makes it safe
+    ///
+    /// Ranks ascend and never nest, so the status write and the current-clear cannot be one
+    /// acquisition. Of the two possible orders only one is correct:
+    ///
+    /// * clear first, then register — the waiter is invisible to a waker for the whole window, so
+    ///   a wake in it is LOST;
+    /// * register first, then clear — the waiter is visible for the whole window, so no wake is
+    ///   lost, and the only cost is that a wake may land while the task is still current.
+    ///
+    /// This takes the second and then DETECTS it: after the compare-and-clear, the status is read
+    /// back. Still `Blocked(Futex(addr))` means no waker ran and the caller is parked. Anything
+    /// else means a waker won, and the settlement is the placement recovery the receive family
+    /// already owns — which is built for exactly this shape, including the case where the waker's
+    /// enqueue DID land and the task must be taken back out of the run queue.
+    ///
+    /// # Exactness
+    ///
+    /// Every step is keyed on the entering incarnation. The rank-2 registration refuses a TCB that
+    /// is not `{tid, asid}` or not `Running`, and writes nothing when it refuses. The rank-1 clear
+    /// is `block_current_exact_on`, which mutates nothing unless the slot names exactly this task
+    /// — so this transaction can never clear another task's placement — and a refusal undoes the
+    /// registration exactly. The quantum reset that `block_current_cpu` performs on a successful
+    /// block is preserved.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn futex_wait_park_exact_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+        addr: usize,
+    ) -> crate::kernel::syscall::sched::FutexParkOutcome {
+        use crate::kernel::syscall::sched::FutexParkOutcome as O;
         use crate::kernel::task::{TaskStatus, WaitReason};
         use crate::kernel::vm::VirtAddr;
-        // Phase B1: publish Blocked(Futex(addr)) on the caller's TCB (task lock, rank 2) —
-        // identical transition to `futex_wait_current`'s `with_tcbs_mut` block.
-        let published = self.with_task_tcbs_split_mut(|tcbs| {
+        let blocked = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+
+        // (1) rank 2 — REGISTER, exactly. From `Running` only: a caller that is not this CPU's
+        // running task has no business publishing a block, and `TaskStatus::Running` is what the
+        // dispatcher installed on entry. The ASID comparison uses the same normalization the
+        // placement owners use, so a kernel task's `None` compares equal to the reserved `Asid(0)`.
+        let registered = self.with_task_tcbs_split_mut(|tcbs| {
             match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
-                Some(tcb) => {
-                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                Some(tcb)
+                    if tcb.asid.unwrap_or(crate::kernel::vm::Asid(0)) == asid
+                        && matches!(tcb.status, TaskStatus::Running) =>
+                {
+                    tcb.status = blocked;
                     true
                 }
-                None => false,
+                _ => false,
             }
         });
-        if !published {
-            return false;
+        if !registered {
+            crate::yarm_log!(
+                "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason=incarnation_moved",
+                tid,
+                asid.0,
+                addr
+            );
+            return O::IncarnationMoved;
         }
-        // Phase B2: clear the current-CPU slot (scheduler lock, rank 1) — identical to
-        // `block_current_cpu` (block_current_on + reset_quantum). NO dispatch here.
-        self.with_scheduler_split_mut(|sched| {
-            let blocked = kernel_mut(&mut sched.scheduler).block_current_on(cpu);
-            if blocked.is_some() {
+
+        // (2) rank 1 — COMPARE-AND-CLEAR. `block_current_exact_on` mutates nothing unless the slot
+        // names exactly this task, so a mismatch costs no other task its placement. The quantum
+        // reset is `block_current_cpu`'s and is preserved on the successful clear.
+        let removed = self.with_scheduler_split_mut(|sched| {
+            let priority = kernel_mut(&mut sched.scheduler)
+                .block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid));
+            if priority.is_some() {
                 sched.timer.reset_quantum();
             }
+            priority
         });
-        crate::yarm_log!(
-            "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={}",
+        let Some(priority) = removed else {
+            // Undo the registration exactly: this transaction published a block it could not
+            // complete, and leaving the TCB `Blocked` would strand a task the scheduler still
+            // believes is elsewhere.
+            let restored = self.with_task_tcbs_split_mut(|tcbs| {
+                match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                    Some(tcb) if tcb.status == blocked => {
+                        tcb.status = TaskStatus::Running;
+                        true
+                    }
+                    _ => false,
+                }
+            });
+            crate::yarm_log!(
+                "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason=victim_changed undone={}",
+                tid,
+                asid.0,
+                addr,
+                u8::from(restored)
+            );
+            return O::VictimChanged;
+        };
+
+        // (3) rank 2 — READ BACK. A waker that entered the window between (1) and (2) has already
+        // moved this TCB off `Blocked(Futex(addr))`, and that is the ONLY thing that can have.
+        let still_parked = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .is_some_and(|t| t.status == blocked)
+        });
+        if still_parked {
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={} priority=exact",
+                tid,
+                addr
+            );
+            return O::Parked { priority };
+        }
+
+        // A waker won. The clear has already run, so the caller is current on no CPU while being
+        // `Runnable` — put it back through the ONE placement recovery, which commits
+        // `Runnable -> Running` on the exact incarnation and pulls it out of the run queue if the
+        // waker's enqueue landed there.
+        let entering = crate::kernel::recv_waiter_split::RecvEnteringIncarnation {
             tid,
-            addr
+            asid,
+            priority,
+        };
+        let recovered = self.restore_entering_incarnation_exact_split(cpu, entering);
+        crate::yarm_log!(
+            "FUTEX_WAIT_PARK_WOKEN_DURING_PUBLISH tid={} asid={} addr={} recovery={}",
+            tid,
+            asid.0,
+            addr,
+            recovered.slug()
         );
-        true
+        O::WokenDuringPublication {
+            entering,
+            recovered,
+        }
     }
 
     /// Stage 191E (FUTEXWAIT PHASE-C SELECTION SEAM): peek the next-runnable dispatch

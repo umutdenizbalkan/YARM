@@ -68,7 +68,7 @@ pub enum RiscvIdleReason {
     /// it: the entering incarnation's completed continuation is captured and published, or the
     /// task was already owned by a dispatcher. Idling is therefore the correct landing and is
     /// recoverable — the periodic timer re-dispatches this CPU.
-    RecvUnsettled,
+    BlockUnsettled,
 }
 
 /// Stage 197B: the explicit, typed result of the RISC-V shared trap-entry wrapper. It replaces the
@@ -1127,7 +1127,7 @@ pub fn handle_riscv_trap_entry_shared(
         // typed idle this port's landing is built on and left the dispatch window open. Here the
         // obligations are discharged in order and the landing is the typed `EnterKernelIdle` the
         // bridge already owns — the same one `riscv_trap_halt` is reached THROUGH.
-        if let crate::kernel::syscall_split::SplitDispatchDisposition::RecvUnsettled(unsettled) =
+        if let crate::kernel::syscall_split::SplitDispatchDisposition::BlockUnsettled(unsettled) =
             disposition
         {
             let entering = unsettled.entering;
@@ -1190,7 +1190,7 @@ pub fn handle_riscv_trap_entry_shared(
                 cpu.0
             );
             return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
-                reason: RiscvIdleReason::RecvUnsettled,
+                reason: RiscvIdleReason::BlockUnsettled,
             });
         }
         if let crate::kernel::syscall_split::SplitDispatchDisposition::PostWorkCommitted {

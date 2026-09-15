@@ -873,7 +873,7 @@ pub fn handle_trap_entry_shared(
             // Its predecessor was a `-> !` jump from the syscall body into a halt loop, which
             // bypassed every one of those three. Here the three obligations are discharged in the
             // order the world requires, and each through the owner that already exists.
-            if let SplitDispatchDisposition::RecvUnsettled(unsettled) = disposition {
+            if let SplitDispatchDisposition::BlockUnsettled(unsettled) = disposition {
                 let entering_incarnation = unsettled.entering;
                 let outcome = unsettled.outcome;
                 // (1) THE CONTINUATION, and it goes first.

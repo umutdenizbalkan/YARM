@@ -63126,9 +63126,14 @@ mod stage191d_futex_wait_block_publish {
                 ),
             "the FutexWait split marker vocabulary must exist"
         );
+        // U9-FUTEX-WAIT-FINAL §3 re-derivation: the marker gains a field rather than moving.
+        // `futex_wait_park_exact_split` reports the priority it actually removed, because that is
+        // the only record of the placement the caller was at and a compensation cannot
+        // reconstruct it.
         assert!(
-            RUNTIME_SRC.contains("\"FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={}\""),
-            "the block-publish seam must emit FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK"
+            RUNTIME_SRC
+                .contains("\"FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={} priority=exact\""),
+            "the park transaction must emit FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK"
         );
     }
 
@@ -63136,22 +63141,43 @@ mod stage191d_futex_wait_block_publish {
     // expected/observed comparison exactly.
     #[test]
     fn futex_wait_value_check_seam_mirrors_legacy() {
+        // U9-FUTEX-WAIT-FINAL §2 re-derivation. This asserted that the split reader MIRRORED the
+        // canonical validator — two copies of the same rule, checked for resemblance — and the
+        // resemblance is what let the copy erase the answers: the reader returned `Option<bool>`,
+        // so `WrongObject` and `UserMemoryFault` were both `None` and the route handed every
+        // validation miss to the broad dispatcher to re-raise.
+        //
+        // There is ONE policy now, so what is pinned is that both owners CALL it and that the
+        // split adapter answers the canonical error rather than erasing it.
+        const SCHED_SRC: &str = include_str!("../syscall/sched.rs");
         assert!(
-            RUNTIME_SRC.contains("pub fn futex_wait_would_block_split_read(")
-                && RUNTIME_SRC.contains("return None; // legacy: WrongObject")
-                && RUNTIME_SRC.contains("return None; // legacy: UserMemoryFault")
-                && RUNTIME_SRC.contains(
-                    "self.copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())?"
-                )
-                && RUNTIME_SRC.contains("Some(expected == observed)"),
-            "the value-check seam must mirror validate_current_user_futex_word + arg compare"
+            SCHED_SRC.contains("pub(crate) fn futex_word_range_check(")
+                && SCHED_SRC.contains("return Err(KernelError::WrongObject);")
+                && SCHED_SRC.contains(">= crate::kernel::vm::KERNEL_SPACE_BASE"),
+            "the one futex-word range policy must exist and keep the canonical answers"
         );
-        // Same address-validation shape as legacy futex validation.
+        for (name, src) in [("runtime.rs", RUNTIME_SRC), ("exec_state.rs", EXEC_SRC)] {
+            assert!(
+                src.contains("futex_word_range_check(addr)"),
+                "{name}: the acquisition adapter must reach the one range policy, not copy it"
+            );
+        }
         assert!(
-            EXEC_SRC.contains("if addr == 0 {")
-                && EXEC_SRC.contains("return Err(KernelError::WrongObject);")
-                && EXEC_SRC.contains(">= crate::kernel::vm::KERNEL_SPACE_BASE"),
-            "legacy validate_current_user_futex_word must have the mirrored checks"
+            !RUNTIME_SRC.contains("fn futex_wait_would_block_split_read("),
+            "the Option-erased reader is gone, not renamed"
+        );
+        assert!(
+            RUNTIME_SRC.contains("pub fn futex_wait_decide_split_read(")
+                && RUNTIME_SRC.contains("Err(crate::kernel::boot::KernelError::UserMemoryFault)")
+                && RUNTIME_SRC.contains("FutexWaitDecision::Park")
+                && RUNTIME_SRC.contains("FutexWaitDecision::Proceed"),
+            "the split adapter must answer typed canonical errors and a typed decision"
+        );
+        // And the ABI is unchanged: the comparison is the CALLER'S two arguments, not a word the
+        // kernel reads to decide with.
+        assert!(
+            RUNTIME_SRC.contains("Ok(if expected == observed {"),
+            "the decision must be the caller-provided expected/observed comparison"
         );
     }
 
@@ -63160,27 +63186,60 @@ mod stage191d_futex_wait_block_publish {
     // dispatch.
     #[test]
     fn futex_wait_block_publish_seam_uses_split_mut() {
+        // U9-FUTEX-WAIT-FINAL §3 re-derivation. `block_current_on` is the UNCONDITIONAL clear,
+        // and pinning it was pinning the defect: it clears whatever is current, keyed on nothing,
+        // so a transaction that had already lost its victim cleared another task's placement. The
+        // exact transaction uses `block_current_exact_on`, which mutates nothing unless the slot
+        // names exactly this caller. The two split-mut seams and the quantum reset are unchanged.
         assert!(
-            RUNTIME_SRC.contains("pub fn futex_wait_publish_block_split_mut(")
+            RUNTIME_SRC.contains("pub(crate) fn futex_wait_park_exact_split(")
                 && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
                 && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
-                && RUNTIME_SRC.contains("kernel_mut(&mut sched.scheduler).block_current_on(cpu)")
                 && RUNTIME_SRC.contains("sched.timer.reset_quantum();"),
-            "the block-publish seam must use the task + scheduler split-mut seams + block_current_on"
+            "the park transaction must use the task + scheduler split-mut seams"
         );
-        // Same Blocked(Futex(addr)) transition as legacy futex_wait_current.
+        let park = RUNTIME_SRC
+            .split("pub(crate) fn futex_wait_park_exact_split(")
+            .nth(1)
+            .and_then(|b| b.split("\n    ///").next())
+            .expect("the park transaction");
+        assert!(
+            park.contains(".block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid))"),
+            "the clear must be a COMPARE-and-clear, so it can never clear another task"
+        );
+        assert!(
+            !park.contains("block_current_on(cpu)"),
+            "the unconditional clear may not come back"
+        );
+        assert!(
+            !RUNTIME_SRC.contains("fn futex_wait_publish_block_split_mut("),
+            "the bool-answering publish seam is gone, not renamed"
+        );
+        // Same Blocked(Futex(addr)) transition as legacy futex_wait_current. The exact
+        // transaction BINDS it once and uses the same value three times — to register, to
+        // recognize its own registration when undoing it, and to read back whether a waker moved
+        // the TCB off it — so the three can never come to disagree about what "parked" means.
         assert!(
             EXEC_SRC.contains(
                 "tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));"
-            ) && RUNTIME_SRC.contains(
-                "tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));"
             ),
-            "the block-publish transition must match legacy futex_wait_current"
+            "legacy futex_wait_current must keep its transition"
         );
-        // The seam must NOT dispatch (that is the deferred switch_required case).
+        assert!(
+            RUNTIME_SRC.contains(
+                "let blocked = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));"
+            ) && park.contains("tcb.status = blocked;"),
+            "the park transaction's transition must match legacy futex_wait_current"
+        );
+        assert_eq!(
+            park.matches("status == blocked").count(),
+            2,
+            "and the SAME value must be what the undo and the read-back compare against"
+        );
+        // The transaction must NOT dispatch (the switch is the drain's).
         let start = RUNTIME_SRC
-            .find("pub fn futex_wait_publish_block_split_mut(")
-            .expect("seam must exist");
+            .find("pub(crate) fn futex_wait_park_exact_split(")
+            .expect("the park transaction must exist");
         let rest = &RUNTIME_SRC[start..];
         let end = rest[1..]
             .find("\n    pub fn ")
@@ -63219,8 +63278,17 @@ mod stage191d_futex_wait_block_publish {
         make_current(&mut state, tid, CpuId(0));
         let shared = SharedKernel::new(state);
 
-        let published = shared.futex_wait_publish_block_split_mut(CpuId(0), tid, addr);
-        assert!(published, "publish must succeed");
+        // U9-FUTEX-WAIT-FINAL §3 — through the EXACT park transaction. It answers a typed
+        // outcome rather than a `bool`, keyed on the entering incarnation, and its rank-1 half is
+        // a compare-and-clear rather than an unconditional one.
+        let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
+        assert_eq!(
+            shared.futex_wait_park_exact_split(CpuId(0), tid, asid, addr),
+            crate::kernel::syscall::sched::FutexParkOutcome::Parked {
+                priority: crate::kernel::scheduler::TaskPriority::Normal
+            },
+            "publish must park the exact incarnation"
+        );
         shared.with(|k| {
             assert_eq!(
                 k.task_status(tid),
@@ -63268,7 +63336,11 @@ mod stage191d_futex_wait_block_publish {
         make_current(&mut state, tid, CpuId(0));
         let shared = SharedKernel::new(state);
 
-        assert!(shared.futex_wait_publish_block_split_mut(CpuId(0), tid, addr));
+        let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
+        assert!(matches!(
+            shared.futex_wait_park_exact_split(CpuId(0), tid, asid, addr),
+            crate::kernel::syscall::sched::FutexParkOutcome::Parked { .. }
+        ));
         shared.with(|k| {
             assert_ne!(k.current_tid_on_cpu(CpuId(0)), Some(tid));
             assert_ne!(k.current_tid_on_cpu(CpuId(1)), Some(tid));
@@ -78483,7 +78555,7 @@ mod stage197b_riscv_typed_idle_outcome {
         // the region with that one arm removed, and the arm is required to be present and to
         // carry its own reason — a silent idle in this region remains a failure.
         assert!(
-            prelock.contains("RiscvIdleReason::RecvUnsettled"),
+            prelock.contains("RiscvIdleReason::BlockUnsettled"),
             "the unsettled-receive settlement must land through the bridge's own typed idle"
         );
         // Comment-stripped: the derivations in this region name the landing they route to, and a
@@ -78494,11 +78566,11 @@ mod stage197b_riscv_typed_idle_outcome {
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
         let same_task_region = prelock_code
-            .split("SplitDispatchDisposition::RecvUnsettled(unsettled)")
+            .split("SplitDispatchDisposition::BlockUnsettled(unsettled)")
             .next()
             .unwrap_or(&prelock_code);
         let after_unsettled = prelock_code
-            .split("reason: RiscvIdleReason::RecvUnsettled,")
+            .split("reason: RiscvIdleReason::BlockUnsettled,")
             .nth(1)
             .unwrap_or("");
         assert!(
@@ -120378,7 +120450,12 @@ mod stage199d_wa2a_ownership_boundary {
             //   blocked_recv_generation}` all match AND the task is still
             //   `Blocked(EndpointReceive(_))` — this transaction's own waiter and no other. The
             //   site count is unchanged: the writer was made exact, it did not multiply.
-            ("src/runtime.rs", 11),
+            // U9-FUTEX-WAIT-FINAL §3: 11 -> 12. `futex_wait_park_exact_split` writes the status
+            // TWICE by construction — it REGISTERS the caller as a futex waiter and, when the
+            // rank-1 compare-and-clear then refuses, UNDOES that registration exactly. Its
+            // predecessor wrote once and left the TCB `Blocked` on a transaction it could not
+            // complete, which is a parked task the scheduler believes is elsewhere.
+            ("src/runtime.rs", 12),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -120410,8 +120487,12 @@ mod stage199d_wa2a_ownership_boundary {
         );
         assert_eq!(
             found.iter().map(|(_, n)| n).sum::<usize>(),
-            40,
-            "38 raw writes (U6 added `commit_blocking_send_split`; U7 added \
+            41,
+            "39 raw writes — U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex \
+             registration, 38 -> 39, so a park transaction whose rank-1 compare-and-clear \
+             refuses takes its own registration back instead of leaving a task parked that the \
+             scheduler believes is elsewhere — \
+             (U6 added `commit_blocking_send_split`; U7 added \
              `drain_send_timeout_post_work`; U9-F added \
              `wake_destroyed_notification_waiter_split`; U9-RX3 added the exact BLOCK/UNWIND \
              pair `recv_block_phase_b_split` and `recv_block_unwind_exact_split`; U9-FORK1 \
@@ -121091,9 +121172,13 @@ mod stage199d_wa2b_wake_owner_census {
             Verdict::Can,
         ),
         (
+            // U9-FUTEX-WAIT-FINAL §3 — two sites, and the second is the exact undo of the first:
+            // a registration this transaction cannot complete is taken back rather than left
+            // standing. Both are `IntoBlocked`'s cohort — they enter and leave the futex-waiter
+            // state and wake nobody.
             "src/runtime.rs",
-            "futex_wait_publish_block_split_mut",
-            1,
+            "futex_wait_park_exact_split",
+            2,
             Verdict::IntoBlocked,
         ),
     ];
@@ -121609,11 +121694,22 @@ mod stage199d_wa2b_wake_owner_census {
             "tcb.ipc_timeout_deadline = None;",
         ),
         (
+            // The REGISTRATION: exact incarnation, from `Running` only.
             "src/runtime.rs",
-            "futex_wait_publish_block_split_mut",
+            "futex_wait_park_exact_split",
             "tcb.status",
-            "TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))",
-            "Some(tcb) => {",
+            "blocked",
+            "{",
+            "true",
+        ),
+        (
+            // Its exact UNDO, taken only when the rank-1 compare-and-clear refuses and only for a
+            // TCB still holding this transaction's own registration.
+            "src/runtime.rs",
+            "futex_wait_park_exact_split",
+            "tcb.status",
+            "TaskStatus::Running",
+            "Some(tcb) if tcb.status == blocked => {",
             "true",
         ),
     ];
@@ -121700,8 +121796,9 @@ mod stage199d_wa2b_wake_owner_census {
         );
         assert_eq!(
             sites.len(),
-            36,
-            "35 raw writes (U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
+            37,
+            "36 raw writes (U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, \
+             36 -> 37; U9-FORK1 §4 retired `fork_complete_post_clone`'s direct Runnable \
              write, 33 -> 32, when the fork moved onto the spawn reservation lifecycle): U6 (199C) added `commit_blocking_send_split`, the split form of the \
              blocking-send block transition; U3 (203C) added `wake_tid_to_runnable_split`, the \
              split form of \
@@ -121779,8 +121876,11 @@ mod stage199d_wa2b_wake_owner_census {
         // reach under the broad lock. The transition did not multiply — it moved.
         assert_eq!(
             CENSUS.iter().map(|(_, _, c, _)| c).sum::<usize>(),
-            46,
-            "U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43; U9-REAP1 §2 moved \
+            47,
+            "U9-FUTEX-WAIT-FINAL §3 added the exact UNDO of the futex registration, 46 -> 47, \
+             so a park transaction whose rank-1 compare-and-clear refuses takes its own \
+             registration back rather than leaving a task parked that the scheduler believes is \
+             elsewhere; U9-FORK1 §4 retired `fork_complete_post_clone`'s write, 44 -> 43; U9-REAP1 §2 moved \
              the faulted reap's `-> Dead` write into its claim and added the claim's exact \
              inverse, 43 -> 44; U9-EXIT1 §2 added the self-exit claim, its exact inverse and the \
              rank-2 half of the joiner wake, 44 -> 47; U9-EXIT1 §4 then retired the broad \
@@ -121803,10 +121903,12 @@ mod stage199d_wa2b_wake_owner_census {
                     .iter()
                     .map(|(_, _, n, _)| n)
                     .sum::<usize>(),
-            46,
-            "U9-RESIDUAL1 §3 moved `yield_current`'s transition-barriered write into the ONE yield \
-             policy and added its exact inverse, 45 -> 46 — the same shape U9-REAP1 §2 produced. \
-             35 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
+            47,
+            "U9-FUTEX-WAIT-FINAL §3 added the futex registration's exact undo, 46 -> 47 — the \
+             same shape U9-REAP1 §2 and U9-RESIDUAL1 §3 produced, a transition that gained a \
+             named way back rather than multiplying. U9-RESIDUAL1 §3 moved `yield_current`'s \
+             transition-barriered write into the ONE yield policy and added its exact inverse, \
+             45 -> 46. 36 raw writes (U9-RX3 added the exact BLOCK/UNWIND pair; U9-FORK1 §4 retired \
              `fork_complete_post_clone`'s, 35 -> 34; U9-REAP1 §2 moved the faulted reap's \
              `-> Dead` write into its claim and added the claim's exact inverse, 34 -> 35) + 8 \
              transition-barriered sites + 1 reservation-barriered site"
@@ -122140,9 +122242,12 @@ mod stage199d_wa2b_wake_owner_census {
         let non_production = count(Verdict::NonProduction);
         let unproven = count(Verdict::Unproven);
 
+        // U9-FUTEX-WAIT-FINAL §3: 46 -> 47. The added site is the futex registration's exact
+        // undo, and it lands in the same `IntoBlocked` class as the registration it reverses —
+        // it enters and leaves the futex-waiter state and wakes nobody.
         assert_eq!(
             can + cannot + into_blocked + fresh + non_production + unproven,
-            46,
+            47,
             "the classes must partition the enumerated sites"
         );
         // Stage 199D-WA3A moved eight Group-3 sites CAN → CANNOT by production enforcement.
@@ -122201,7 +122306,11 @@ mod stage199d_wa2b_wake_owner_census {
             // strength of the guard its OTHER caller applies would record the nearest guard
             // rather than the one every caller applies, which is precisely the error this census
             // exists to catch.
-            (15, 19, 9, 2, 1)
+            //
+            // U9-FUTEX-WAIT-FINAL §3: INTO_BLOCKED 9 -> 10. The futex registration's exact UNDO
+            // joins the registration it reverses, in the same class and for the same reason —
+            // it enters and leaves the futex-waiter state and wakes nobody.
+            (15, 19, 10, 2, 1)
         );
 
         // The verdict is derived, not written down.
@@ -145613,34 +145722,54 @@ mod u9qa_split_dispatch_disposition {
     /// `NotHandled` sits before the publication, and the one after the reservation releases it.
     #[test]
     fn not_handled_is_only_reachable_before_any_mutation() {
-        let route = SPLIT
-            .split("fn try_split_futex_wait_into_frame")
+        // U9-FUTEX-WAIT-FINAL §2 re-derivation. This pinned that exactly ONE `NotHandled` could
+        // follow the publication call and that it released the reservation first — which was the
+        // right claim for a route that could still hand a recognized NR 9 to the broad dispatcher.
+        // It cannot any more: the recognized body answers `SplitBlockingDisposition`, a type with
+        // no representation for the broad hand-off, so the stronger claim is that ZERO reach it
+        // and that the one `NotHandled` the family can produce is the NR filter's own.
+        let entry = SPLIT
+            .split("fn try_split_futex_wait_into_frame(")
             .nth(1)
-            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
-            .expect("the FutexWait route");
-        let publish = route
-            .find("futex_wait_publish_block_split_mut(cpu, tid, addr)")
-            .expect("the publication");
-        // Everything after the publication line must be the committed path only.
-        let after = &route[publish..];
-        let tail = after
-            .split_once("D::QueueAdvanceCommitted")
-            .map(|(t, _)| t)
-            .unwrap_or(after);
-        // The single `NotHandled` after the publication CALL is the publish-refused arm, and it
-        // releases the reservation first, so nothing is left mutated.
+            .and_then(|s| s.split("\n}").next())
+            .expect("the FutexWait entry");
         assert_eq!(
-            tail.matches("return D::NotHandled;").count(),
+            entry
+                .matches("SplitDispatchDisposition::NotHandled")
+                .count(),
             1,
-            "exactly one post-publish-call refusal: the publish-refused arm"
+            "the entry may hand off ONLY for `not a FutexWait`"
         );
-        let clear = tail
-            .find("futex_wait_dispatch_clear(cpu_idx)")
-            .expect("it must release the reservation");
-        let refuse = tail.find("return D::NotHandled;").expect("the refusal");
+        let nr_filter = entry.find("SYSCALL_FUTEX_WAIT_NR").expect("the NR filter");
+        let hand_off = entry
+            .find("SplitDispatchDisposition::NotHandled")
+            .expect("the hand-off");
         assert!(
-            clear < refuse,
-            "the reservation must be released BEFORE the refusal returns"
+            nr_filter < hand_off,
+            "and that one hand-off must be the NR filter's own arm"
+        );
+        let recognized = SPLIT
+            .split("fn try_split_futex_wait_recognized(")
+            .nth(1)
+            .and_then(|s| {
+                s.split("\n/// U9-FUTEX-WAIT-FINAL §2 — settle an NR 9")
+                    .next()
+            })
+            .expect("the recognized body");
+        assert!(
+            !recognized.contains("NotHandled"),
+            "a recognized NR 9 may not even name the broad hand-off"
+        );
+        // Every exit past the reservation still releases it — now by settling rather than by
+        // handing off, which is what the release has to accompany.
+        let reserve = recognized
+            .find("futex_wait_dispatch_try_defer(cpu_idx, tid)")
+            .expect("the reservation");
+        let after = &recognized[reserve..];
+        assert_eq!(
+            after.matches("futex_wait_dispatch_clear(cpu_idx)").count(),
+            3,
+            "the three non-parking park outcomes each release the reservation"
         );
     }
 
@@ -145652,15 +145781,24 @@ mod u9qa_split_dispatch_disposition {
             .split("fn try_split_futex_wait_into_frame")
             .nth(1)
             .expect("the FutexWait route");
+        // U9-FUTEX-WAIT-FINAL §2 — admission is now asked on the TRAP'S OWN AUTHORITY. The
+        // ambient form refused `MultiCpu` whenever more than one CPU was dispatching, which is
+        // why this route never ran on an SMP boot at all; the authority names this CPU
+        // unforgeably and the selection owner authenticates against the same value, so neither
+        // ambient question applies to it.
         let admit = route
-            .find("shared.queue_advance_admit_split(")
+            .find("shared.queue_advance_admit_with_authority_split(")
             .expect("admission");
+        assert!(
+            !route.contains("shared.queue_advance_admit_split("),
+            "the ambient-CPU admission may not remain beside the authority-bound one"
+        );
         let reserve = route
             .find("futex_wait_dispatch_try_defer(cpu_idx, tid)")
             .expect("the deferral reservation");
         let publish = route
-            .find("futex_wait_publish_block_split_mut(cpu, tid, addr)")
-            .expect("the publication");
+            .find("futex_wait_park_exact_split(cpu, tid, asid, addr)")
+            .expect("the park transaction");
         assert!(
             admit < reserve && reserve < publish,
             "admit -> reserve -> publish, so every failure lands before the mutation"
@@ -145696,7 +145834,7 @@ mod u9qa_split_dispatch_disposition {
         // the switch. Retiring the ordinary preempting-timer population from broad dispatch is
         // precisely what this arm does, so it belongs here rather than to a new mechanism.
         //
-        // U9-RECV-BLOCK2 §2 re-derivation: FIVE. `RecvUnsettled` is the fifth, and its reason is
+        // U9-RECV-BLOCK2 §2 re-derivation: FIVE. `BlockUnsettled` is the fifth, and its reason is
         // the strongest of the five: the receive route cleared `current` and could NOT put the
         // entering incarnation back, so the caller is not this CPU's current and re-running the
         // receive against it in the broad dispatcher is exactly the corruption the disposition
@@ -178755,7 +178893,7 @@ mod u9_recv_block1_closure {
         // the second to be named and counted. That second door is what the receive conversion
         // removed: a RECOGNIZED receive left the family through the same exit as a syscall that
         // was never ours, and counting it made the escape visible without making it impossible.
-        // `try_split_recv_recognized` now returns `SplitRecvDisposition`, a type with no
+        // `try_split_recv_recognized` now returns `SplitBlockingDisposition`, a type with no
         // representation for "hand this to the broad dispatcher", so the residual door cannot be
         // written; the narrow type is the final enforcement and the settlements are the work.
         //
@@ -179078,7 +179216,7 @@ mod u9_recv_block1_closure {
     /// **The route reports FACTS; the bridge performs the settlement.**
     ///
     /// The syscall body may name neither a landing nor a halt: what it owes is the exact entering
-    /// incarnation and the recovery's verified outcome, and that is all `RecvUnsettled` carries.
+    /// incarnation and the recovery's verified outcome, and that is all `SplitBlockUnsettled` carries.
     #[test]
     fn the_unsettled_receive_is_reported_not_landed() {
         let code = code_of(SPLIT);
@@ -179094,7 +179232,7 @@ mod u9_recv_block1_closure {
             );
         }
         assert!(
-            code.contains("SplitRecvDisposition::Unsettled(RecvUnsettled {"),
+            code.contains("SplitBlockingDisposition::Unsettled(SplitBlockUnsettled {"),
             "it reports the settlement as a value"
         );
         // And every post-clear settlement goes through the ONE helper, so the answer cannot be
@@ -179120,12 +179258,12 @@ mod u9_recv_block1_closure {
             (
                 "trap_entry.rs",
                 TRAP_ENTRY_SRC,
-                "if let SplitDispatchDisposition::RecvUnsettled(unsettled) = disposition {",
+                "if let SplitDispatchDisposition::BlockUnsettled(unsettled) = disposition {",
             ),
             (
                 "riscv64/trap.rs",
                 RISCV_SRC,
-                "SplitDispatchDisposition::RecvUnsettled(unsettled) =",
+                "SplitDispatchDisposition::BlockUnsettled(unsettled) =",
             ),
         ] {
             let arm = src.split(marker).nth(1).expect("the unsettled arm");
