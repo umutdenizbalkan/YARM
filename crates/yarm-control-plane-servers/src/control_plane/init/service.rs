@@ -2924,10 +2924,23 @@ mod ipccall_direct_oracle_core {
         // and the server still emits its own `IPCCALL_DIRECT_ORACLE_SERVER_DUP` line. The wait is
         // bounded and yields, so a server that never performs the attempt still fails the oracle
         // rather than hanging it.
-        let mut dup_waits = 0;
-        while SERVER_DUP_REJECTED.load(Relaxed) == 0 && dup_waits < MAX_ATTEMPTS {
-            dup_waits += 1;
-            let _ = yarm_user_rt::syscall::yield_now();
+        //
+        // SCOPED TO RISC-V, and that scoping is a CAPACITY workaround, not a claim about the
+        // other two ports. The assumption is equally unsound everywhere; it simply still holds on
+        // x86_64 and AArch64, whose round trips pass without the wait. Init's `.text` sits 19
+        // bytes below a page boundary on the profile the NR 30 grant witness builds, and it runs
+        // at `MAX_MAPPINGS` 128/128 — so an unconditional wait costs a page, the page costs a
+        // mapping, and the oracle window then fails with
+        // `VM_FULL reason=mapping_bookkeeping_full`, which is exactly what it did. That pressure
+        // is deferred by directive; confining the fix to the port that needs it keeps the other
+        // two images byte-identical rather than spending the headroom on them.
+        #[cfg(target_arch = "riscv64")]
+        {
+            let mut dup_waits = 0;
+            while SERVER_DUP_REJECTED.load(Relaxed) == 0 && dup_waits < MAX_ATTEMPTS {
+                dup_waits += 1;
+                let _ = yarm_user_rt::syscall::yield_now();
+            }
         }
         out.request_ok = SERVER_REQUEST_OK.load(Relaxed);
         out.server_reply_ok = SERVER_REPLY_OK.load(Relaxed);

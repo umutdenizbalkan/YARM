@@ -15996,6 +15996,269 @@ mod tests {
         });
     }
 
+    /// U9-RECV-BLOCK1 §3 — **the unwind refuses a replacement incarnation.**
+    ///
+    /// A deterministic interleaving over the real scheduler, task and IPC owners for the
+    /// post-clear case the predecessor got wrong. `recv_block_unwind_race_split` located its
+    /// victim by `t.tid.0 == tid` alone and then assigned `Runnable` whatever it found there, so
+    /// a task that had been re-blocked by a LATER transaction — same numeric TID, newer wait
+    /// generation — was silently woken by this one's compensation.
+    ///
+    /// The interleaving: block the receiver once, then block it AGAIN (a second Phase B, which is
+    /// what a second receive on the same task is), and offer the FIRST transaction's identity to
+    /// the unwind. It must refuse, report `IncarnationMoved`, leave the task `Blocked`, leave the
+    /// newer transaction's record intact, and tell its caller it may not return through the
+    /// entering frame.
+    #[test]
+    fn u9recvblock1_the_unwind_refuses_a_replacement_incarnation() {
+        use crate::kernel::recv_waiter_split::{RecvBlockIdentity, RecvUnwindOutcome};
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskStatus, WaitReason};
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let recv_cap = kernel.with(|state| {
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            recv_cap
+        });
+        let state_of = |ptr: usize| BlockedRecvState {
+            recv_cap,
+            payload_user_ptr: ptr,
+            payload_user_len: 128,
+            meta_user_ptr: 0x2000,
+            meta_user_len: 40,
+            recv_abi: RecvAbiVariant::RecvV2,
+        };
+
+        let (asid, _priority) = kernel
+            .recv_block_phase_a_split(cpu, 0)
+            .expect("phase A must block the exact victim");
+        let first_generation = kernel
+            .recv_block_phase_b_split(0, recv_cap, None, Some(state_of(0x1000)))
+            .expect("the first transaction's generation");
+        // The REPLACEMENT: a later transaction re-blocks the same numeric TID, advancing the
+        // generation and installing its own record. Generations only advance, so this is exactly
+        // what distinguishes the two.
+        let second_generation = kernel
+            .recv_block_phase_b_split(0, recv_cap, None, Some(state_of(0x9000)))
+            .expect("the second transaction's generation");
+        assert_eq!(second_generation, first_generation + 1);
+
+        let outcome = kernel.recv_block_unwind_exact_split(
+            cpu,
+            RecvBlockIdentity {
+                tid: 0,
+                asid,
+                priority: crate::kernel::scheduler::TaskPriority::Normal,
+                wait_generation: first_generation,
+            },
+        );
+        assert_eq!(
+            outcome,
+            RecvUnwindOutcome::IncarnationMoved,
+            "a stale identity must not be able to unwind a newer incarnation"
+        );
+        assert!(
+            !outcome.may_resume_entering_frame(),
+            "and its caller may not return through the entering frame"
+        );
+        kernel.with(|state| {
+            assert_eq!(
+                state.task_status(0),
+                Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))),
+                "the replacement must still be Blocked — not woken by somebody else's inverse"
+            );
+            state.with_tcb_mut(0, |tcb| {
+                assert_eq!(
+                    tcb.blocked_recv_state.map(|s| s.payload_user_ptr),
+                    Some(0x9000),
+                    "the NEWER transaction's writeback record must be untouched"
+                );
+                assert_eq!(
+                    tcb.blocked_recv_generation, second_generation,
+                    "and its generation must not be rolled back"
+                );
+            });
+        });
+    }
+
+    /// U9-RECV-BLOCK1 §3 — **the reachable restore refusal is recovered exactly, and its result
+    /// is checked.**
+    ///
+    /// `restore_exact_current_on` refuses on two conditions, and they are not equally reachable.
+    /// `current.is_some()` cannot hold inside a trap window: installing a current on a CPU
+    /// requires running on it, and the trap is what is running. `contains_tid` CAN hold — Phase B
+    /// staged `ipc_timeout_deadline`, so on a multi-CPU boot the deadline scan may have woken and
+    /// enqueued this exact task between Phase A and here.
+    ///
+    /// The recovery is the existing preempt-and-prefer primitive, and the point of this
+    /// interleaving is that its RESULT is checked: the predecessor wrote
+    /// `let _ = self.on_preempt_prefer_on_cpu_split(cpu, removed);` and discarded it, so a failed
+    /// recovery left a task current nowhere and queued nowhere.
+    #[test]
+    fn u9recvblock1_an_enqueued_victim_is_recovered_exactly_by_the_prefer_primitive() {
+        use crate::kernel::recv_waiter_split::{RecvBlockIdentity, RecvUnwindOutcome};
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskStatus};
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let recv_cap = kernel.with(|state| {
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            recv_cap
+        });
+        let (asid, priority) = kernel
+            .recv_block_phase_a_split(cpu, 0)
+            .expect("phase A must block the exact victim");
+        let wait_generation = kernel
+            .recv_block_phase_b_split(
+                0,
+                recv_cap,
+                Some(7),
+                Some(BlockedRecvState {
+                    recv_cap,
+                    payload_user_ptr: 0x1000,
+                    payload_user_len: 128,
+                    meta_user_ptr: 0x2000,
+                    meta_user_len: 40,
+                    recv_abi: RecvAbiVariant::RecvV2,
+                }),
+            )
+            .expect("phase B must mint a generation");
+        // THE RACE: a remote deadline scan woke the task and put it on a run queue while this
+        // transaction still believed it owned the block.
+        kernel
+            .enqueue_task_split(cpu, 0)
+            .expect("the stand-in deadline scan enqueues the task");
+
+        let outcome = kernel.recv_block_unwind_exact_split(
+            cpu,
+            RecvBlockIdentity {
+                tid: 0,
+                asid,
+                priority,
+                wait_generation,
+            },
+        );
+        assert_eq!(
+            outcome,
+            RecvUnwindOutcome::Restored,
+            "the queued victim must be taken back out and restored, not abandoned"
+        );
+        assert!(
+            outcome.may_resume_entering_frame(),
+            "and the entering frame is this task's again"
+        );
+        kernel.with(|state| {
+            assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
+            assert_eq!(
+                state.current_tid_on_cpu(cpu),
+                Some(0),
+                "the exact incarnation is this CPU's current again"
+            );
+            state.with_tcb_mut(0, |tcb| {
+                assert!(tcb.blocked_recv_state.is_none());
+                assert!(tcb.ipc_timeout_deadline.is_none());
+            });
+        });
+        // EXACTLY ONE placement: current, and no longer a queue entry as well. Read the queue
+        // directly — `task_present_anywhere` is `contains_or_current`, which is true either way
+        // and so cannot tell a recovered task from a duplicated one.
+        assert!(
+            kernel.with_scheduler_split_mut(|sched| {
+                kernel_ref(&sched.scheduler)
+                    .peek_next_runnable_on(cpu)
+                    .is_none()
+            }),
+            "the prefer primitive must have taken it OUT of the run queue, not duplicated it"
+        );
+    }
+
+    /// U9-RECV-BLOCK1 §3 — **a doubly-refused restore never loses the task, and says so.**
+    ///
+    /// Both rank-1 recoveries decline: this CPU's current slot is occupied by somebody else, so
+    /// the exact restore refuses, and the victim is in no run queue for the prefer primitive to
+    /// pull it from, so that answers with a different task. Neither refusal should be reachable
+    /// from the route — the interleaving constructs it deliberately — and what matters is the
+    /// settlement: the task is Runnable and ENQUEUED rather than placed nowhere, and the caller
+    /// is told it may NOT return through the entering frame.
+    #[test]
+    fn u9recvblock1_a_doubly_refused_restore_enqueues_rather_than_losing_the_task() {
+        use crate::kernel::recv_waiter_split::{RecvBlockIdentity, RecvUnwindOutcome};
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskStatus};
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let recv_cap = kernel.with(|state| {
+            state.register_task(1).expect("the other task");
+            state.enqueue_current_cpu(1).expect("queue the other task");
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            recv_cap
+        });
+        let (asid, priority) = kernel
+            .recv_block_phase_a_split(cpu, 0)
+            .expect("phase A must block the exact victim");
+        let wait_generation = kernel
+            .recv_block_phase_b_split(
+                0,
+                recv_cap,
+                None,
+                Some(BlockedRecvState {
+                    recv_cap,
+                    payload_user_ptr: 0x1000,
+                    payload_user_len: 128,
+                    meta_user_ptr: 0x2000,
+                    meta_user_len: 40,
+                    recv_abi: RecvAbiVariant::RecvV2,
+                }),
+            )
+            .expect("phase B must mint a generation");
+        // Somebody else took this CPU's current slot, and the victim is in no run queue.
+        kernel.with(|state| {
+            state.dispatch_next_task().expect("dispatch the other task");
+            assert_eq!(state.current_tid(), Some(1));
+        });
+
+        let outcome = kernel.recv_block_unwind_exact_split(
+            cpu,
+            RecvBlockIdentity {
+                tid: 0,
+                asid,
+                priority,
+                wait_generation,
+            },
+        );
+        assert_eq!(
+            outcome,
+            RecvUnwindOutcome::RunnableElsewhere,
+            "neither recovery applied, and the outcome must say so rather than claim a restore"
+        );
+        assert!(
+            !outcome.may_resume_entering_frame(),
+            "so the entering frame is not this task's to return through"
+        );
+        kernel.with(|state| {
+            assert_eq!(
+                state.task_status(0),
+                Some(TaskStatus::Runnable),
+                "rank 2 still ran: the task is Runnable, not left Blocked"
+            );
+            assert_eq!(
+                state.current_tid_on_cpu(cpu),
+                Some(1),
+                "and the other task's placement was NOT overwritten"
+            );
+            state.with_tcb_mut(0, |tcb| {
+                assert!(
+                    tcb.blocked_recv_state.is_none(),
+                    "this transaction's own record is compensated"
+                );
+            });
+        });
+        assert!(
+            kernel.receiver_has_scheduler_membership_split_read(0),
+            "NEVER a lost task: it is Runnable and on a run queue"
+        );
+    }
+
     #[test]
     fn topology_count_split_reads_match_scheduler_state() {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
