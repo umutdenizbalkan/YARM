@@ -596,6 +596,33 @@ pub(crate) fn try_split_terminal_page_fault_dispatch(
     try_split_terminal_page_fault_into_frame(shared, cpu, fault, frame)
 }
 
+/// U9-RECV-BLOCK2 §2 — a receive whose `current` was cleared and could not be put back, handed to
+/// the BRIDGE that owns the frame, the dispatch window and the architectural landing.
+///
+/// # Why this is a value and not a jump
+///
+/// Its predecessor was `recv_unsettleable_idle_terminal`, a `-> !` helper called from the syscall
+/// body that jumped straight into an architecture halt loop. Everything the trap boundary owns was
+/// bypassed by that jump: the `TrapPathWindow` (which `Drop` cannot retire on a path that never
+/// unwinds), the outgoing-context capture, and each port's own idle landing — two of which settle
+/// by RETURNING, not by diverging. x86_64's own comment on `settle_post_lock_terminal_idle` says
+/// diverging from a drain "would be strictly worse: it would skip the depth clear and the
+/// attestation epilogue the tail performs, and it would add a second place that decides how this
+/// architecture idles", and RISC-V's landing is the typed `EnterKernelIdle` its bridge returns.
+///
+/// So the route reports the FACTS and the bridge performs the settlement. The facts are exactly
+/// two, and neither can be re-derived at the bridge: which incarnation this trap entered from —
+/// captured before Phase A's clear, so it names the entering task and not a replacement — and
+/// what the rank-1 recovery actually achieved, as a verified post-state.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) struct RecvUnsettled {
+    /// The exact incarnation the trap entered from.
+    pub(crate) entering: crate::kernel::recv_waiter_split::RecvEnteringIncarnation,
+    /// Where the recovery left it. Read, never assumed.
+    pub(crate) outcome: crate::kernel::recv_waiter_split::RecvUnwindOutcome,
+}
+
 #[derive(Debug)]
 pub(crate) enum SplitDispatchDisposition {
     /// The split route declined BEFORE it mutated anything. This is the ONLY route to a
@@ -614,6 +641,16 @@ pub(crate) enum SplitDispatchDisposition {
     /// through to the existing post-lock drains, which consume that one deferral and settle the
     /// trap as Switch, ResumeSame or TerminalIdle.
     QueueAdvanceCommitted,
+    /// U9-RECV-BLOCK2 §2 — a RECOGNIZED receive cleared `current` and could not put the entering
+    /// incarnation back, so the trap must not return through the entering frame and there is no
+    /// deferral for a drain to consume.
+    ///
+    /// It is emphatically not `NotHandled`: the broad dispatcher must not service it, because the
+    /// caller is no longer this CPU's current and re-running the receive against it is the exact
+    /// corruption this disposition exists to prevent. It is not `QueueAdvanceCommitted` either —
+    /// nothing was published and no drain owes anything. The BRIDGE settles it; see
+    /// [`RecvUnsettled`].
+    RecvUnsettled(RecvUnsettled),
     /// U9-TM §3 — the route finished its own work, mutated no scheduler state, and still owes the
     /// architecture tail's POST-WORK.
     ///
@@ -661,6 +698,9 @@ impl SplitDispatchDisposition {
             Self::QueueAdvanceCommitted => {
                 panic!("a committed queue advance has no pre-U9-QA equivalent")
             }
+            Self::RecvUnsettled(_) => {
+                panic!("an unsettled receive has no pre-U9-QA equivalent")
+            }
             Self::PostWorkCommitted { .. } => {
                 panic!("a committed post-work outcome has no pre-U9-QA equivalent")
             }
@@ -705,6 +745,10 @@ pub(crate) enum SplitRecvDisposition {
     QueueAdvanceCommitted,
     /// A delivery the post-work drain owes.
     PostWorkCommitted { finalize_syscall: bool },
+    /// U9-RECV-BLOCK2 §2 — `current` was cleared and the entering incarnation could not be put
+    /// back. The BRIDGE settles it; the frame already carries this receive's canonical answer, so
+    /// a settlement that captures it completes the syscall rather than re-entering it.
+    Unsettled(RecvUnsettled),
 }
 
 impl SplitRecvDisposition {
@@ -718,6 +762,7 @@ impl SplitRecvDisposition {
             Self::PostWorkCommitted { finalize_syscall } => {
                 SplitDispatchDisposition::PostWorkCommitted { finalize_syscall }
             }
+            Self::Unsettled(unsettled) => SplitDispatchDisposition::RecvUnsettled(unsettled),
         }
     }
 }
@@ -2034,6 +2079,63 @@ fn recv_encode_empty_answer(
     Ok(())
 }
 
+/// U9-RECV-BLOCK2 §2 — settle a receive whose block has been UNWOUND, from the recovery's verified
+/// outcome.
+///
+/// # One answer, two destinations
+///
+/// Every caller of this reaches it the same way: a post-clear failure whose canonical answer it
+/// has already computed, and a rank-1 recovery that either put the entering incarnation back or
+/// did not. The answer does not depend on which — `WrongObject` for a publish that named an
+/// endpoint the recheck refused, `WouldBlock` for a deadline reservation that could not be taken —
+/// so it is ENCODED INTO THE ENTERING FRAME first, unconditionally, and only then does the
+/// outcome decide where that frame goes.
+///
+/// * `Restored` — the exact incarnation is this CPU's `current` and `Running`. The frame is its
+///   own, so the trap RETURNS through it and the syscall is complete.
+/// * anything else — the frame is not this CPU's to return through, but it is still this
+///   receive's completed answer. The bridge either captures it into the exact incarnation (which
+///   completes the syscall for a task that will be dispatched later) or settles divergently; that
+///   decision needs the trap boundary, so it is the bridge's.
+///
+/// # Why the answer is encoded rather than returned as `Err`
+///
+/// `SplitDispatchDisposition::Complete(Err(e))` leaves the encoding to the architecture epilogue,
+/// which only runs on the returning path. A settlement that CAPTURES the frame instead needs the
+/// answer already in it — otherwise the captured context carries this receive's arguments and no
+/// result, and the task resumes past its syscall reading whatever the previous one left behind.
+/// `recv_encode_empty_answer` is the receive family's own encoder: the error lane plus the
+/// no-transfer sentinel, exactly the two writes `handle_ipc_recv_result_with_empty_error` performs.
+#[cfg(not(feature = "hosted-dev"))]
+fn recv_settle_after_unwind(
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    entering: crate::kernel::recv_waiter_split::RecvEnteringIncarnation,
+    outcome: crate::kernel::recv_waiter_split::RecvUnwindOutcome,
+    answer: crate::kernel::syscall::SyscallError,
+    reason: &'static str,
+) -> SplitRecvDisposition {
+    let encoded = recv_encode_empty_answer(frame, answer);
+    crate::yarm_log!(
+        "IPC_RECV_BLOCK_SPLIT_SETTLED cpu={} tid={} asid={} reason={} answer={} outcome={} resumable={}",
+        cpu.0,
+        entering.tid,
+        entering.asid.0,
+        reason,
+        answer.code(),
+        outcome.slug(),
+        u8::from(outcome.may_resume_entering_frame())
+    );
+    if outcome.may_resume_entering_frame() {
+        return SplitRecvDisposition::Complete(encoded);
+    }
+    // The encode failed only if the transfer-cap lane could not be written, which is a frame
+    // defect rather than a settlement one; carry it as the answer so the bridge captures a frame
+    // that says so rather than one that says nothing.
+    let _ = encoded;
+    SplitRecvDisposition::Unsettled(RecvUnsettled { entering, outcome })
+}
+
 /// U9-RX3 §3 — service a BLOCKING `IpcRecv` (NR 2) off the broad lock.
 ///
 /// This is the migration of the existing block-and-publish sequence onto the four SharedKernel
@@ -2528,37 +2630,22 @@ fn try_split_blocking_ipc_recv_into_frame(
             u8::from(outcome.may_resume_entering_frame()),
             outcome.slug()
         );
-        if outcome.may_resume_entering_frame() {
-            // The caller is provably current again and Runnable; the entering frame is its own.
-            //
-            // Phase B failing at all means the TCB vanished between Phase A's compare-and-clear
-            // and this call, or a u64 wait generation overflowed. Neither is constructible, so
-            // this is a fail-closed answer through a frame that is provably resumable — not a
-            // hand-off, and not a settlement that has to account for a cleared current.
-            return BlockingLaneOutcome::complete(Err(TrapHandleError::Syscall(
-                crate::kernel::syscall::SyscallError::Internal,
-            )));
-        }
-        // U9-RECV-BLOCK2 §2 — it is NOT resumable, and this arm no longer contradicts itself.
-        //
-        // The predecessor enqueued the task and then returned `Complete(Err(Internal))`, which
-        // returns THROUGH the entering frame — the exact frame it had just finished proving does
-        // not belong to this CPU's current task. An error return cannot conceal an unscheduled
-        // task, and this one did.
-        //
-        // A queue advance is not available either, and the reason is the drain's: the D2-recv
-        // drain re-verifies `Blocked(EndpointReceive)` (`d2_recv_reverify_blocked`) and takes its
-        // `state_changed` fallback for a Runnable task, settling nothing. So the settlement is
-        // the established divergent one — and U9-RECV-BLOCK2b §2: whether the task is actually
-        // somewhere the scheduler will run it again is the RECOVERY OWNER's verified answer, not
-        // an assumption this call site makes. `RunnableElsewhere` is read back from the TCB and
-        // the membership mirror; `Unrecovered` and `IncarnationMoved` claim nothing.
-        crate::arch::trap_entry::recv_unsettleable_idle_terminal(
-            shared,
-            authority,
-            tid,
-            outcome.task_is_verified_schedulable(),
-        )
+        // U9-RECV-BLOCK2 §2 — ONE answer, encoded into the entering frame, and the outcome
+        // decides whether that frame is returned or handed to the bridge. Phase B failing at all
+        // means the TCB vanished between Phase A's compare-and-clear and this call, or a u64 wait
+        // generation overflowed; neither is constructible, so the answer is `Internal`.
+        return BlockingLaneOutcome::Settled(recv_settle_after_unwind(
+            cpu,
+            frame,
+            crate::kernel::recv_waiter_split::RecvEnteringIncarnation {
+                tid,
+                asid: receiver_asid,
+                priority: victim_priority,
+            },
+            outcome,
+            crate::kernel::syscall::SyscallError::Internal,
+            "phase_b",
+        ));
     };
     // U9-RECV-BLOCK1 §3 — THE identity every compensation below authenticates against. Built
     // once, from the four facts this transaction minted and nothing else: the authoritative
@@ -2613,23 +2700,24 @@ fn try_split_blocking_ipc_recv_into_frame(
                 shared.recv_block_unwind_exact_split(cpu, block_identity(wait_generation));
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
             if !unwound.may_resume_entering_frame() {
-                // U9-RECV-BLOCK2 §2 — the exact inverse could not complete, so the entering frame
-                // is not this task's to return through, and this arm no longer returns through it
-                // anyway. Nothing is lost: the recovery owner leaves the task Runnable and on a
-                // run queue. The settlement is the established divergent one, the same
-                // wake-capable idle the D2 drain enters when it cannot resume.
-                crate::yarm_log!(
-                    "IPC_RECV_BLOCK_SPLIT_FAILED_CLOSED cpu={} tid={} phase=unwind outcome={}",
-                    cpu.0,
-                    tid,
-                    unwound.slug()
-                );
-                crate::arch::trap_entry::recv_unsettleable_idle_terminal(
-                    shared,
-                    authority,
-                    tid,
-                    unwound.task_is_verified_schedulable(),
-                )
+                // U9-RECV-BLOCK2 §2 — the exact inverse could not put the entering incarnation
+                // back, so the entering frame is not this task's to return through. The ANSWER is
+                // still the one this arm would have given — `WouldBlock`, the retry lane both
+                // races settle on when they cannot dequeue — and it is encoded into the frame so
+                // that a bridge which captures that frame completes the syscall rather than
+                // leaving a task to resume past its receive with no result.
+                return BlockingLaneOutcome::Settled(recv_settle_after_unwind(
+                    cpu,
+                    frame,
+                    block_identity(wait_generation).entering(),
+                    unwound,
+                    crate::kernel::syscall::SyscallError::WouldBlock,
+                    if busy {
+                        "waiter_ownership_busy_unwound"
+                    } else {
+                        "queue_non_empty_unwound"
+                    },
+                ));
             }
             // U9-RECV-BLOCK1 §3 — the exact incarnation is current again, so this transaction
             // may answer. The two races answer DIFFERENTLY, and both answers are the broad
@@ -2721,17 +2809,18 @@ fn try_split_blocking_ipc_recv_into_frame(
             // non-answer. `WrongObject` through a resumable frame is the canonical outcome;
             // `Internal` through a frame that is NOT this task's would return into a task the
             // scheduler has parked, which is the contradiction this slice removes.
-            if unwound.may_resume_entering_frame() {
-                return BlockingLaneOutcome::complete(Err(TrapHandleError::Syscall(
-                    crate::kernel::syscall::SyscallError::WrongObject,
-                )));
-            }
-            crate::arch::trap_entry::recv_unsettleable_idle_terminal(
-                shared,
-                authority,
-                tid,
-                unwound.task_is_verified_schedulable(),
-            )
+            // U9-RECV-BLOCK2 §2 — ONE answer, encoded first. `WrongObject` is what the canonical
+            // owner raises for both `ReceiverAlreadyWaiting` and `InvalidEndpoint`, and it is the
+            // answer whether or not the unwind could put this incarnation back; what the outcome
+            // decides is where the answered frame goes.
+            return BlockingLaneOutcome::Settled(recv_settle_after_unwind(
+                cpu,
+                frame,
+                block_identity(wait_generation).entering(),
+                unwound,
+                crate::kernel::syscall::SyscallError::WrongObject,
+                "publish_refused",
+            ));
         }
     }
     // (9b) 199E-DL — the COMPENSATED rank-2 half of the finite-deadline registration.
@@ -2770,27 +2859,22 @@ fn try_split_blocking_ipc_recv_into_frame(
                 endpoint_idx,
                 unwound.slug()
             );
-            if !unwound.may_resume_entering_frame() {
-                // U9-RECV-BLOCK2 §2 — the unwind could not put this exact incarnation back, so
-                // there is no frame to answer through. The recovery owner has left the task
-                // Runnable and enqueued; the settlement is the established divergent idle rather
-                // than an error returned into a task the scheduler has parked.
-                crate::arch::trap_entry::recv_unsettleable_idle_terminal(
-                    shared,
-                    authority,
-                    tid,
-                    unwound.task_is_verified_schedulable(),
-                )
-            }
             // U9-RECV-BLOCK1 §3 — the terminal armed but its deadline token could not be
             // reserved, so parking would leave a caller holding a deadline it cannot identify.
             // The whole block is reversed and the receive answers as a receive that could not
             // proceed: `WouldBlock`, the same lane the ownership-busy race answers on, and the
             // one the caller's own retry loop already handles. This is capacity contention on a
             // bounded store, not a fault, so it is not an error return.
-            return BlockingLaneOutcome::complete(recv_encode_empty_answer(
+            //
+            // U9-RECV-BLOCK2 §2 — that answer is encoded whether or not the unwind could put the
+            // incarnation back, and the outcome decides where the answered frame goes.
+            return BlockingLaneOutcome::Settled(recv_settle_after_unwind(
+                cpu,
                 frame,
+                block_identity(wait_generation).entering(),
+                unwound,
                 crate::kernel::syscall::SyscallError::WouldBlock,
+                "deadline_reservation",
             ));
         }
         crate::kernel::boot::ReplyWaitArm::Armed {

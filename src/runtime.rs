@@ -568,16 +568,6 @@ impl DispatchAuthority {
         self.cpu
     }
 
-    /// U9-RECV-BLOCK2b §4 — the window epoch this authority was minted against.
-    ///
-    /// Read by `TrapPathWindow::retire_diverging_landing`, which closes exactly this window from a
-    /// non-returning landing below the frame that owns the guard. Exposing the value authorizes
-    /// nothing on its own: `close_trap_dispatch_window` is epoch-checked, so a stale copy closes
-    /// no window at all.
-    pub(crate) const fn epoch(self) -> u64 {
-        self.epoch
-    }
-
     /// Is this still the live window for its CPU?
     ///
     /// U9-DISPATCH-CPU1 §2: false the moment the trap that minted it RETIRES its window — not
@@ -6059,6 +6049,24 @@ impl SharedKernel {
         // The returned PRIORITY is the restoration authority. It is the only record of the
         // placement the task was removed from, and without carrying it an unwind would have to
         // invent one — which is how a restore ends up overwriting somebody else's placement.
+        // U9-RECV-BLOCK2 §1 — THE IDENTITY IS CAPTURED BEFORE THE PLACEMENT MUTATION.
+        //
+        // This read used to sit AFTER the compare-and-clear, and that ordering cannot produce the
+        // entering incarnation. `block_current_exact_on` compares a numeric TID; once it has
+        // cleared the slot the task is current nowhere, which is precisely the state in which its
+        // TCB may be reclaimed and the TID handed to a different address space. The ASID read
+        // afterwards would then describe the REPLACEMENT, and every compensation downstream —
+        // each of which authenticates on `{tid, asid}` — would be authenticating against the
+        // wrong incarnation while believing it was exact.
+        //
+        // Read first, while the task is still this CPU's current. That is the exclusion: a TCB
+        // cannot be reclaimed while it is a CPU's current task, and installing a current on this
+        // CPU requires running on it — which this trap is what is doing. So the value read here
+        // is the incarnation the trap entered from, and the clear below either removes exactly
+        // that task or removes nothing.
+        let entering_asid = self
+            .task_asid_opt_split_read(expected_tid)
+            .unwrap_or(crate::kernel::vm::Asid(0));
         let priority = self.with_scheduler_split_mut(|sched| {
             crate::kernel::boot::kernel_ref(&sched.scheduler)
                 .validate_online_cpu(cpu)
@@ -6076,11 +6084,7 @@ impl SharedKernel {
             return None;
         };
         crate::yarm_log!("SCHED_BLOCK tid={}", expected_tid);
-        Some((
-            self.task_asid_opt_split_read(expected_tid)
-                .unwrap_or(crate::kernel::vm::Asid(0)),
-            priority,
-        ))
+        Some((entering_asid, priority))
     }
 
     /// U9-RX3 — Phase B twin (task, rank 2): mint the FRESH wait generation, mark the receiver
@@ -6382,48 +6386,66 @@ impl SharedKernel {
         self.restore_entering_incarnation_exact_split(cpu, identity.entering())
     }
 
-    /// U9-RECV-BLOCK2 §2 — **the ONE rank-1 recovery for a cleared `current`**, and the only place
-    /// that may answer `Restored`.
+    /// U9-RECV-BLOCK2 §1/§2 — **the ONE rank-1 recovery for a cleared `current`**, and the only
+    /// place that may answer `Restored`.
     ///
-    /// # Two recoveries, and why both are needed
+    /// # `Restored` is a claim about a RUNNING INCARNATION
     ///
-    /// `restore_exact_current_on` refuses on two conditions that are not equally reachable.
-    /// `current.is_some()` cannot hold — installing a current on a CPU requires running on that
-    /// CPU, and this trap is what is running on it. `contains_tid` CAN hold: Phase B stages
-    /// `ipc_timeout_deadline`, so on a multi-CPU boot the deadline scan may have woken and
-    /// enqueued this exact task since Phase A cleared it. That reachable refusal is the
-    /// preempt-and-prefer primitive's exact job, and its RESULT is checked — the predecessor
-    /// discarded it, which is how a task ended up current nowhere and queued nowhere.
+    /// Its callers read the answer as "the trap may return to userspace through the entering
+    /// frame". Three separate things have to hold for that, and each has its own failure:
     ///
-    /// # `Restored` is a claim about a RUNNING INCARNATION, not about two numbers
+    /// * **Identity.** A TID is a slot number the allocator reuses. A recovery keyed on the
+    ///   number alone can install a DIFFERENT address space as `current` and let the trap return
+    ///   through this trap's saved frame into it. The exact incarnation — `{tid, asid, priority}`
+    ///   — is carried in, and the ASID it carries was captured by `recv_block_phase_a_split`
+    ///   BEFORE its compare-and-clear, while the task was still current and its TCB therefore
+    ///   unreclaimable.
+    /// * **Placement.** `restore_exact_current_on` is GIVEN a priority, so proving the slot names
+    ///   the task says nothing about whether it went back at that priority. Both halves are read
+    ///   as ONE rank-1 observation.
+    /// * **Status.** A task whose TCB says `Runnable` is, to every dispatch transition in the
+    ///   tree, a task that has not been selected to run. Reporting `Restored` for it permitted
+    ///   userspace execution from a status that says otherwise — `dispatch_transition_would_be_
+    ///   accepted` would still accept it, so a second CPU could select and mark it while this one
+    ///   was returning to ring 3 through the same incarnation.
     ///
-    /// U9-RECV-BLOCK2b §2. The predecessor took a bare `u64` TID and reported `Restored` when two
-    /// independent reads — `task_is_runnable_split_read(tid)` and
-    /// `current_tid_split_read(cpu) == Some(tid)` — both happened to hold. Neither establishes
-    /// what the caller reads the answer as, which is "the trap may return to userspace through
-    /// the entering frame":
+    /// # The exclusion/commit contract
     ///
-    /// * **Identity.** A TID is a slot number the allocator reuses. `Runnable` and `current` are
-    ///   true of whatever occupies the slot now, so a restore keyed on the number alone can
-    ///   install a DIFFERENT address space as `current` and let the trap return through this
-    ///   trap's saved frame into it. The exact incarnation — `{tid, asid, priority}` — is carried
-    ///   in and authenticated instead.
-    /// * **Consistency.** Status and ASID are facts about one TCB and are read in one rank-2
-    ///   acquisition; which task is current and at what priority are facts about one scheduler
-    ///   slot and are read in one rank-1 acquisition. Four separate reads can describe a state
-    ///   the machine was never in.
-    /// * **Placement.** `restore_exact_current_on` was given a priority, so proving the slot
-    ///   names the task says nothing about whether it was installed at that priority. Both halves
-    ///   of the placement are read back.
+    /// U9-RECV-BLOCK2 §1. A rank-2 identity PRECHECK followed by a bare-TID rank-1 write is not a
+    /// contract: the two acquisitions are separate, and nothing stops the TCB changing between
+    /// them. Reading it back afterwards does not fix that either — it only reports the damage.
     ///
-    /// # Every outcome names a VERIFIED post-state
+    /// So the placement is provisional until an exact-incarnation COMMIT accepts it:
     ///
-    /// U9-RECV-BLOCK2b §2. `RunnableElsewhere` used to be returned after LOGGING whether an
-    /// enqueue returned `Ok`, which establishes nothing: `enqueue_task_split` can refuse for
-    /// capacity, affinity or an offline CPU, and the caller — which settles by idling this CPU on
-    /// the strength of that outcome — would have stranded the task forever. It is now returned
-    /// only when the incarnation is read back `Runnable` AND holding scheduler membership.
-    /// Anything else is `Unrecovered`, which claims nothing.
+    /// 1. **rank 1** — put the task back (the exact restore, or the preempt-and-prefer primitive
+    ///    for the reachable `contains_tid` refusal). The scheduler is keyed on TID; this write is
+    ///    what makes the slot say `tid`.
+    /// 2. **rank 2** — `apply_task_transition(tid, Some(asid), …)`, the existing transition owner.
+    ///    It is exact-incarnation and fail-closed: a TCB that is not this address space, or not in
+    ///    the status the transition runs from, is refused with **no field written**. This is the
+    ///    commit, and it is also what establishes `Running`.
+    /// 3. **rollback** — a refused commit undoes step 1 through `block_current_exact_on`, the same
+    ///    compare-and-clear Phase A used, so a placement this transaction cannot justify is not
+    ///    left standing and no other task's slot is touched.
+    ///
+    /// Which transition depends on what the caller's own half already did, and both are exact
+    /// `from → to` pairs rather than a status assignment: `recv_block_unwind_exact_split` runs the
+    /// rank-2 reversal first and leaves the TCB `Runnable`, so the commit is `DispatchIncoming`
+    /// (`Runnable → Running`); the Phase-B-failure site never got a rank-2 write at all and its
+    /// TCB still carries the `Running` the dispatcher installed on entry, so the commit is
+    /// `ContinueCurrent` (`Running → Running`). Neither can launder a `Blocked`, `Reserved`,
+    /// `Faulted`, `Exited` or `Dead` task into `Running`.
+    ///
+    /// # Every outcome names a DISTINCT verified post-state
+    ///
+    /// U9-RECV-BLOCK2 §1. The predecessor answered `RunnableElsewhere` from
+    /// `task_present_anywhere`, whose membership mirror covers the run queues **and** the current
+    /// slots — so "queued, waiting for a dispatch" and "executing on another CPU right now" were
+    /// the same `true`, and a settlement that idles this CPU on the strength of it is wrong in the
+    /// second case. `SmpScheduler::placement_of` answers the four states separately and this
+    /// reports whichever it observed. Nothing here enqueues: publication is what makes a task
+    /// dispatchable, and the settlement owes its continuation capture BEFORE that, so the decision
+    /// belongs to the caller that holds the frame.
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub(crate) fn restore_entering_incarnation_exact_split(
         &self,
@@ -6431,113 +6453,196 @@ impl SharedKernel {
         incarnation: crate::kernel::recv_waiter_split::RecvEnteringIncarnation,
     ) -> crate::kernel::recv_waiter_split::RecvUnwindOutcome {
         use crate::kernel::recv_waiter_split::RecvUnwindOutcome as U;
+        use crate::kernel::task_transition::TaskTransition;
         let crate::kernel::recv_waiter_split::RecvEnteringIncarnation {
             tid,
             asid,
             priority,
         } = incarnation;
 
-        // The identity gate, BEFORE any placement is written. Installing a task as `current` is
-        // the step that lets the trap return to userspace, so it may not be performed for a TCB
-        // that is no longer the incarnation this trap entered from. Both halves of the rank-2
-        // precondition — the address space and a resumable status — come from one acquisition.
-        if !self.task_incarnation_is_resumable_split_read(tid, asid) {
-            crate::yarm_log!(
-                "D2_RECV_SPLIT_UNWIND_FAIL tid={} asid={} phase=a reason=incarnation_not_entering",
-                tid,
-                asid.0
-            );
-            return U::IncarnationMoved;
-        }
-
+        // (1) rank 1 — the PROVISIONAL placement.
+        //
+        // `restore_exact_current_on` refuses on two conditions that are not equally reachable.
+        // `current.is_some()` cannot hold — installing a current on a CPU requires running on that
+        // CPU, and this trap is what is running on it. `contains_tid` CAN hold: Phase B stages
+        // `ipc_timeout_deadline`, so on a multi-CPU boot the deadline scan may have woken and
+        // enqueued this exact task since Phase A cleared it. That reachable refusal is the
+        // preempt-and-prefer primitive's exact job, and its RESULT is checked.
         let via = if self.restore_current_exact_split(cpu, tid, priority) {
             "exact"
         } else {
             match self.on_preempt_prefer_on_cpu_split(cpu, tid) {
                 Some(now) if now == tid => "prefer_after_requeue",
                 other => {
-                    // Neither placement recovery applied. The task is Runnable, so it is not
-                    // lost; it is enqueued rather than left placed nowhere — and the RESULT of
-                    // that enqueue is verified below rather than reported.
-                    let enqueued = self.enqueue_task_split(cpu, tid).is_ok();
+                    // Neither placement recovery applied, and NOTHING was written. Report where
+                    // the task actually is; the caller decides what that state owes.
+                    let observed = self.recv_unwind_placement_outcome_split(tid, asid, "placement");
                     crate::yarm_log!(
-                        "D2_RECV_SPLIT_UNWIND_FAIL tid={} phase=a reason=placement_taken observed={:?} enqueued={}",
+                        "D2_RECV_SPLIT_UNWIND_FAIL tid={} asid={} phase=a reason=placement_taken observed={:?} outcome={}",
                         tid,
+                        asid.0,
                         other,
-                        u8::from(enqueued)
+                        observed.slug()
                     );
-                    return self.verified_runnable_elsewhere_split(tid, asid, "placement_taken");
+                    return observed;
                 }
             }
         };
 
-        // THE PROOF. Two acquisitions, each internally consistent, and both required: the rank-2
-        // one says this is still the entering incarnation and it is Runnable, the rank-1 one says
-        // this CPU's current slot names it at the priority Phase A removed it with.
-        let incarnation_ok = self.task_incarnation_is_resumable_split_read(tid, asid);
-        let placement_ok = self.current_placement_split_read(cpu) == Some((tid, priority));
-        if incarnation_ok && placement_ok {
+        // (2) rank 2 — THE COMMIT. Exact incarnation, exact `from → to`, fail-closed.
+        let commit = self.with_task_tcbs_split_mut(|tcbs| {
+            use crate::kernel::task_transition::TransitionRefusal;
+            // The identity check and the transition share ONE acquisition, which is what makes
+            // this a commit rather than a precheck: nothing can move the TCB between them.
+            //
+            // The comparison uses the receive family's own normalization, because that is what
+            // the entering identity was captured under: `recv_block_phase_a_split` records an
+            // absent ASID as `Asid(0)`, so a kernel-task receiver — whose `tcb.asid` is `None` —
+            // compares equal to what the trap entered with. `apply_task_transition` is then given
+            // the TCB's own `Option<Asid>`, so its exact check runs against the value this
+            // closure has just authenticated rather than against a re-read.
+            let Some((observed_asid, status)) = tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| (t.asid, t.status))
+            else {
+                return Err(TransitionRefusal::TaskMissing);
+            };
+            if observed_asid.unwrap_or(crate::kernel::vm::Asid(0)) != asid {
+                return Err(TransitionRefusal::IncarnationMismatch {
+                    observed: observed_asid,
+                });
+            }
+            let transition = if matches!(status, crate::kernel::task::TaskStatus::Running) {
+                TaskTransition::ContinueCurrent
+            } else {
+                TaskTransition::DispatchIncoming
+            };
+            crate::kernel::task_transition::apply_task_transition(
+                tcbs,
+                tid,
+                observed_asid,
+                transition,
+            )
+            .map(|previous| (transition, previous))
+        });
+        let Ok((transition, previous)) = commit else {
+            // (3) ROLLBACK. The placement this transaction wrote is not one it can justify, so it
+            // is taken back through the same compare-and-clear Phase A used — which mutates
+            // nothing unless the slot still names exactly this task, so a scheduler that has
+            // already moved on is untouched.
+            let retracted = self
+                .with_scheduler_split_mut(|sched| {
+                    kernel_mut(&mut sched.scheduler)
+                        .block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid))
+                })
+                .is_some();
+            let refusal = commit.unwrap_err();
             crate::yarm_log!(
-                "D2_RECV_SPLIT_UNWIND_OK cpu={} tid={} asid={} via={} status=resumable placement=current priority=exact",
-                cpu.0,
+                "D2_RECV_SPLIT_UNWIND_FAIL tid={} asid={} phase=a reason=commit_refused via={} refusal={:?} placement_retracted={}",
                 tid,
                 asid.0,
-                via
+                via,
+                refusal,
+                u8::from(retracted)
             );
-            return U::Restored;
-        }
-        // The entering frame is not provably this task's, so the caller must not return through
-        // it. Whether the task is nonetheless somewhere the scheduler will run it again is a
-        // separate question, and it is ANSWERED rather than assumed.
-        if !placement_ok {
-            let _ = self.enqueue_task_split(cpu, tid);
+            return U::IncarnationMoved;
+        };
+
+        // (4) THE PROOF of the placement half, as ONE rank-1 observation: this CPU's current slot
+        // names the task AND holds the priority Phase A removed it with.
+        if self.current_placement_split_read(cpu) != Some((tid, priority)) {
+            // The commit made the TCB `Running`; the placement does not agree, so undo the
+            // transition exactly (its named inverse) and report where the task is.
+            let _ = self.with_task_tcbs_split_mut(|tcbs| {
+                let observed = tcbs
+                    .iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .and_then(|t| t.asid);
+                crate::kernel::task_transition::apply_task_transition(
+                    tcbs,
+                    tid,
+                    observed,
+                    match transition {
+                        TaskTransition::DispatchIncoming => {
+                            TaskTransition::RollbackDispatchedIncoming
+                        }
+                        // `ContinueCurrent` is `Running → Running`: it wrote no change, so there
+                        // is nothing to undo and the task keeps the status it entered with.
+                        other => other,
+                    },
+                )
+            });
+            let observed =
+                self.recv_unwind_placement_outcome_split(tid, asid, "placement_disagree");
+            crate::yarm_log!(
+                "D2_RECV_SPLIT_UNWIND_FAIL tid={} asid={} phase=a reason=placement_disagree via={} outcome={}",
+                tid,
+                asid.0,
+                via,
+                observed.slug()
+            );
+            return observed;
         }
         crate::yarm_log!(
-            "D2_RECV_SPLIT_UNWIND_FAIL tid={} asid={} phase=a reason=incarnation_placement_disagree via={} incarnation_ok={} placement_ok={}",
+            "D2_RECV_SPLIT_UNWIND_OK cpu={} tid={} asid={} via={} transition={} from={:?} status=running placement=current priority=exact",
+            cpu.0,
             tid,
             asid.0,
             via,
-            u8::from(incarnation_ok),
-            u8::from(placement_ok)
+            transition.marker(),
+            previous
         );
-        self.verified_runnable_elsewhere_split(tid, asid, "incarnation_placement_disagree")
+        U::Restored
     }
 
-    /// U9-RECV-BLOCK2b §2 — read the post-state back and answer what it actually is.
+    /// U9-RECV-BLOCK2 §1 — read the post-state back and answer WHICH of the distinct placements
+    /// it is.
     ///
-    /// The one place `RunnableElsewhere` may be produced. It is a claim that the exact
-    /// incarnation will run again without this CPU's help, and the two facts that make it true
-    /// are read here rather than inferred: the TCB is still this address space and `Runnable`,
-    /// and the scheduler holds membership for it (`task_present_anywhere`, which covers every
-    /// CPU's run queues and current slots — a per-CPU answer could not state it).
+    /// The only producer of the three non-`Restored`, non-`IncarnationMoved` outcomes. It asks two
+    /// things and combines them, because either alone is ambiguous: the TCB must still be this
+    /// exact incarnation and `Runnable` (otherwise another owner holds it and nothing may be
+    /// claimed), and the scheduler's `placement_of` says whether it is queued, executing
+    /// somewhere, or reachable by nothing at all.
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-    fn verified_runnable_elsewhere_split(
+    fn recv_unwind_placement_outcome_split(
         &self,
         tid: u64,
         asid: crate::kernel::vm::Asid,
         phase: &'static str,
     ) -> crate::kernel::recv_waiter_split::RecvUnwindOutcome {
         use crate::kernel::recv_waiter_split::RecvUnwindOutcome as U;
-        let resumable = self.task_incarnation_is_resumable_split_read(tid, asid);
-        let member = self.receiver_has_scheduler_membership_split_read(tid);
-        if resumable && member {
+        use crate::kernel::scheduler::TaskPlacement;
+        if !self.task_incarnation_is_resumable_split_read(tid, asid) {
             crate::yarm_log!(
-                "D2_RECV_SPLIT_UNWIND_ELSEWHERE tid={} asid={} phase={} status=resumable membership=present",
+                "D2_RECV_SPLIT_UNWIND_MOVED tid={} asid={} phase={}",
                 tid,
                 asid.0,
                 phase
             );
-            return U::RunnableElsewhere;
+            return U::IncarnationMoved;
         }
+        let placement = self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler).placement_of(crate::kernel::ipc::ThreadId(tid))
+        });
+        let outcome = match placement {
+            TaskPlacement::Queued(cpu) => U::QueuedRunnable(cpu),
+            TaskPlacement::Current(cpu) | TaskPlacement::CurrentAndQueued(cpu) => {
+                U::RunningElsewhere(cpu)
+            }
+            TaskPlacement::Nowhere => U::Unpublished,
+        };
         crate::yarm_log!(
-            "D2_RECV_SPLIT_UNWIND_UNRECOVERED tid={} asid={} phase={} resumable={} membership={}",
+            "D2_RECV_SPLIT_UNWIND_PLACEMENT tid={} asid={} phase={} placement={:?} outcome={}",
             tid,
             asid.0,
             phase,
-            u8::from(resumable),
-            u8::from(member)
+            placement,
+            outcome.slug()
         );
-        U::Unrecovered
+        outcome
     }
 
     /// U9-FT3 §1 — the read-only buffered fault-report admission preflight.
@@ -16356,10 +16461,16 @@ mod tests {
             "the unwind must complete"
         );
         kernel.with(|state| {
+            // U9-RECV-BLOCK2 §1 — `Running`, not `Runnable`. The rank-2 reversal clears the
+            // block, and the restore's COMMIT then moves the exact incarnation
+            // `Runnable → Running` through `TaskTransition::DispatchIncoming`, because `Restored`
+            // licenses a return to userspace and a TCB that says `Runnable` says the opposite —
+            // it is a task no dispatcher has selected, and `dispatch_transition_would_be_accepted`
+            // would still accept it for a second CPU to mark.
             assert_eq!(
                 state.task_status(0),
-                Some(TaskStatus::Runnable),
-                "the receiver must be Runnable again, not left Blocked"
+                Some(TaskStatus::Running),
+                "the restored receiver must be Running, not merely un-Blocked"
             );
             assert_eq!(
                 state.current_tid_on_cpu(cpu),
@@ -16551,7 +16662,9 @@ mod tests {
             "and the entering frame is this task's again"
         );
         kernel.with(|state| {
-            assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
+            // U9-RECV-BLOCK2 §1 — the restore COMMITS `Runnable → Running`; see
+            // `restore_entering_incarnation_exact_split`.
+            assert_eq!(state.task_status(0), Some(TaskStatus::Running));
             assert_eq!(
                 state.current_tid_on_cpu(cpu),
                 Some(0),
@@ -16575,16 +16688,22 @@ mod tests {
         );
     }
 
-    /// U9-RECV-BLOCK1 §3 — **a doubly-refused restore never loses the task, and says so.**
+    /// U9-RECV-BLOCK1 §3 / U9-RECV-BLOCK2 §1 — **a doubly-refused restore names the state it left,
+    /// and leaves the publication to the settlement that owes the capture first.**
     ///
     /// Both rank-1 recoveries decline: this CPU's current slot is occupied by somebody else, so
     /// the exact restore refuses, and the victim is in no run queue for the prefer primitive to
     /// pull it from, so that answers with a different task. Neither refusal should be reachable
-    /// from the route — the interleaving constructs it deliberately — and what matters is the
-    /// settlement: the task is Runnable and ENQUEUED rather than placed nowhere, and the caller
-    /// is told it may NOT return through the entering frame.
+    /// from the route — the interleaving constructs it deliberately.
+    ///
+    /// U9-RECV-BLOCK2 §1 re-derivation: the recovery used to ENQUEUE here, and that ordering is
+    /// the defect. Publication is what makes a task dispatchable, and the settlement owes its
+    /// continuation capture BEFORE that — otherwise another CPU can dispatch the task and resume
+    /// it from a context this trap has not finished writing. So the recovery now reports
+    /// `Unpublished` — Runnable, in no run queue and in no current slot — and the bridge captures,
+    /// then publishes, in that order. The task is not lost; it is deliberately not yet reachable.
     #[test]
-    fn u9recvblock1_a_doubly_refused_restore_enqueues_rather_than_losing_the_task() {
+    fn u9recvblock1_a_doubly_refused_restore_reports_unpublished_and_does_not_publish() {
         use crate::kernel::recv_waiter_split::{RecvBlockIdentity, RecvUnwindOutcome};
         use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskStatus};
 
@@ -16630,9 +16749,11 @@ mod tests {
                 wait_generation,
             },
         );
+        // U9-RECV-BLOCK2 §1 — the recovery no longer enqueues, so the task is Runnable and
+        // reachable by NOTHING: the one outcome whose settlement still owes work.
         assert_eq!(
             outcome,
-            RecvUnwindOutcome::RunnableElsewhere,
+            RecvUnwindOutcome::Unpublished,
             "neither recovery applied, and the outcome must say so rather than claim a restore"
         );
         assert!(
@@ -16657,9 +16778,18 @@ mod tests {
                 );
             });
         });
+        // NOT published, and that is the contract: the bridge's capture runs first.
         assert!(
-            kernel.receiver_has_scheduler_membership_split_read(0),
-            "NEVER a lost task: it is Runnable and on a run queue"
+            !kernel.receiver_has_scheduler_membership_split_read(0),
+            "the recovery must not publish — the settlement owes the capture before the enqueue"
+        );
+        assert!(
+            outcome.may_capture_continuation(),
+            "and precisely because nothing can dispatch it, its continuation may be written"
+        );
+        assert!(
+            !outcome.dispatcher_already_owns_task(),
+            "so idling on this outcome alone would strand the task"
         );
     }
 
@@ -16789,18 +16919,25 @@ mod tests {
                 priority,
             },
         );
+        // U9-RECV-BLOCK2 §1 — the recovery mutates no placement it cannot justify and does NOT
+        // enqueue: publication is the bridge's, strictly after the continuation capture. So the
+        // task is Runnable and reachable by nothing, which is `Unpublished` and NOT a state that
+        // licenses idling this CPU.
         assert_eq!(
             outcome,
-            RecvUnwindOutcome::RunnableElsewhere,
-            "the enqueue actually landed, so the verified answer is RunnableElsewhere"
+            RecvUnwindOutcome::Unpublished,
+            "both placement recoveries refused and nothing published the task"
         );
         assert!(
-            outcome.task_is_verified_schedulable(),
-            "and THAT is what licenses a caller to settle by idling this CPU"
+            !outcome.dispatcher_already_owns_task(),
+            "no dispatcher owns it, so idling on this outcome alone would strand it"
+        );
+        assert!(
+            outcome.may_capture_continuation(),
+            "and precisely because nothing can dispatch it, its continuation may be written"
         );
         // The claim is true of the world, not of a return value.
         assert!(kernel.task_incarnation_is_resumable_split_read(0, asid));
-        assert!(kernel.receiver_has_scheduler_membership_split_read(0));
         assert_eq!(
             kernel.current_tid_split_read(cpu),
             Some(1),
@@ -16840,8 +16977,8 @@ mod tests {
             "a TID with no TCB cannot be the entering incarnation"
         );
         assert!(
-            !outcome.task_is_verified_schedulable(),
-            "and nothing about where it is may be claimed"
+            !outcome.dispatcher_already_owns_task() && !outcome.may_capture_continuation(),
+            "and nothing about where it is may be claimed, nor may anything be written to it"
         );
         assert_eq!(
             kernel.current_tid_split_read(cpu),

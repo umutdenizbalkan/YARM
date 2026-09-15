@@ -205,6 +205,27 @@ impl RingQueue {
     }
 }
 
+/// U9-RECV-BLOCK2 §1 — the DISTINCT placements a task can hold, as answered by
+/// [`SmpScheduler::placement_of`].
+///
+/// Four states, because the settlement that consumes them owes a different thing in each and the
+/// single boolean it used to read could not tell them apart. `Queued` is waiting for a dispatch
+/// and its saved context is the one it will resume from; `Current` is EXECUTING and its saved
+/// context belongs to whoever is running it; `Nowhere` is neither, which for a `Runnable` task is
+/// a scheduler invariant break; `CurrentAndQueued` is a double placement and is named rather than
+/// folded into either, so a marker can say which invariant broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskPlacement {
+    /// On no run queue and in no CPU's current slot.
+    Nowhere,
+    /// Queued on this CPU, and current nowhere.
+    Queued(CpuId),
+    /// This CPU's current task, and on no run queue.
+    Current(CpuId),
+    /// Both at once — a scheduler invariant break. The CPU named is the one running it.
+    CurrentAndQueued(CpuId),
+}
+
 /// Stage 199D: outcome of a non-dispatching runqueue withdrawal.
 ///
 /// `bool` would be genuinely ambiguous here — a bare `false` would conflate "the TID was not
@@ -1123,6 +1144,39 @@ impl SmpScheduler {
         self.schedulers
             .iter()
             .any(|sched| sched.contains_or_current(tid))
+    }
+
+    /// U9-RECV-BLOCK2 §1 — WHERE `tid` actually is, as ONE read-only rank-1 observation.
+    ///
+    /// [`Self::task_present_anywhere`] answers `contains_or_current`, and the membership mirror it
+    /// consults deliberately tracks the run queues **plus** the dispatched `current` task
+    /// (`rebuild_membership_table` inserts `current`; `block_current` removes it). So a `true`
+    /// from that predicate means one of three unrelated things — the task is queued and waiting,
+    /// it is EXECUTING on some CPU right now, or both — and a caller that reads it as "queued, so
+    /// this CPU may idle" is wrong in the second case: a task another CPU is running has a live
+    /// saved context that must not be written, and is not waiting for a dispatch at all.
+    ///
+    /// This distinguishes them, in one acquisition so the answers cannot tear against each other.
+    /// `current` is checked before the queues on each CPU because the two are not symmetric: the
+    /// current slot is the authority on what is executing.
+    pub(crate) fn placement_of(&self, tid: ThreadId) -> TaskPlacement {
+        let mut queued_on = None;
+        let mut current_on = None;
+        for (idx, sched) in self.schedulers.iter().enumerate() {
+            let cpu = CpuId(idx as u8);
+            if sched.current.is_some_and(|task| task.tid == tid) {
+                current_on = Some(cpu);
+            }
+            if sched.queues.iter().any(|q| q.count_tid(tid) > 0) {
+                queued_on = Some(cpu);
+            }
+        }
+        match (current_on, queued_on) {
+            (None, None) => TaskPlacement::Nowhere,
+            (None, Some(cpu)) => TaskPlacement::Queued(cpu),
+            (Some(cpu), None) => TaskPlacement::Current(cpu),
+            (Some(cpu), Some(_)) => TaskPlacement::CurrentAndQueued(cpu),
+        }
     }
 
     /// Non-mutating peek of the next-runnable dispatch candidate on `cpu`: the TID

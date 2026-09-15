@@ -1005,6 +1005,12 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
                 // immediately above by construction, because every refusal that reaches here left
                 // the current slot exactly as the publisher cleared it.
                 RiscvIdleReason::QueueAdvanceNoIncoming => "QueueAdvanceNoIncoming",
+                // U9-RECV-BLOCK2 §2: a recognized receive cleared `current` and could not put the
+                // entering incarnation back. It reaches here only after the bridge discharged the
+                // settlement's obligations — the completed continuation captured and published,
+                // or the task already owned by a dispatcher — so it likewise passes the
+                // `current == None|Some(0)` invariant above by construction.
+                RiscvIdleReason::RecvUnsettled => "RecvUnsettled",
             };
             crate::yarm_log!("RISCV_TYPED_IDLE_OUTCOME result=ok reason={}", reason_str);
             // U9-DISPATCH-CPU1 D3 — the attribution has to match the reason.

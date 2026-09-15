@@ -129,32 +129,6 @@ pub struct RecvBlockIdentity {
 /// The predecessor returned `bool`, and `false` was read as "fail closed" — an `Internal` error
 /// returned through a frame whose task might no longer be this CPU's current. The two failures
 /// are not the same and neither is fatal, so they are named.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvUnwindOutcome {
-    /// Both halves reversed: the exact incarnation is this CPU's `current` again at the priority
-    /// it was removed with. The entering frame is its own, so the trap MAY return through it.
-    Restored,
-    /// The exact incarnation is `Runnable` AND holds scheduler membership — **both verified by
-    /// reading the post-state back**, not inferred from an enqueue call having returned `Ok`.
-    /// This CPU's current slot went to somebody else, so the entering frame is no longer this
-    /// task's to return through and the caller must answer with a queue advance instead.
-    RunnableElsewhere,
-    /// U9-RECV-BLOCK2b §2 — recovery FAILED, and the post-state is one this transaction could
-    /// not verify: the incarnation is neither this CPU's current nor provably on any run queue.
-    ///
-    /// Distinct from [`Self::RunnableElsewhere`] on purpose. That outcome is a CLAIM — "the task
-    /// is queued somewhere and will run again" — and its predecessor made that claim after
-    /// merely logging whether an enqueue returned `Ok`, which establishes nothing about where
-    /// the task ended up. A caller that settles by idling on the strength of a false
-    /// `RunnableElsewhere` strands the task forever. This variant says the recovery did not
-    /// succeed and nothing about the post-state may be assumed.
-    Unrecovered,
-    /// The TCB no longer matches `{tid, asid, wait_generation}`, or is no longer parked on this
-    /// receive. Another owner took the incarnation over and **nothing was written**. The caller
-    /// must not resume through the entering frame.
-    IncarnationMoved,
-}
-
 /// U9-RECV-BLOCK2b §2 — the exact incarnation a RANK-1 PLACEMENT recovery authenticates against.
 ///
 /// [`RecvBlockIdentity`] names four facts, and the wait generation is Phase B's: it authenticates
@@ -167,6 +141,12 @@ pub enum RecvUnwindOutcome {
 /// `u64` TID, so it could restore whatever currently answered to that number: a TID the task
 /// allocator had reused names a different address space, and installing it as `current` would
 /// return to userspace through another task's page tables using this trap's saved frame.
+///
+/// U9-RECV-BLOCK2 §1 — the ASID is captured by `recv_block_phase_a_split` BEFORE its
+/// compare-and-clear, while the task is still this CPU's current and its TCB therefore cannot be
+/// reclaimed. A read taken after the clear would describe the replacement, not the entering
+/// incarnation, and every compensation keyed on `{tid, asid}` would then authenticate against the
+/// wrong task while believing it was exact.
 ///
 /// A caller whose Phase B never ran has no wait generation and can still be exact, which is why
 /// this is its own type rather than a `RecvBlockIdentity` with a fabricated fourth field.
@@ -189,6 +169,39 @@ impl RecvBlockIdentity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvUnwindOutcome {
+    /// Both halves reversed AND COMMITTED: the exact incarnation is this CPU's `current` at the
+    /// priority it was removed with, and its TCB says `Running`. The entering frame is its own,
+    /// so the trap MAY return through it.
+    Restored,
+    /// U9-RECV-BLOCK2 §1 — the exact incarnation is `Runnable` and QUEUED on `cpu`, current
+    /// nowhere. It is already DISPATCHABLE, so nothing may be written into its saved context: a
+    /// dispatch can take it at any moment and resume from exactly that context.
+    QueuedRunnable(crate::kernel::scheduler::CpuId),
+    /// U9-RECV-BLOCK2 §1 — the exact incarnation is ANOTHER CPU's `current`: it is executing.
+    /// Neither its saved context nor its status belongs to this transaction, and this CPU has no
+    /// frame to return through.
+    ///
+    /// Distinct from [`Self::QueuedRunnable`] because the two used to be one `true` from
+    /// `task_present_anywhere`, whose membership mirror covers the run queues *and* the current
+    /// slots. Reading that as "queued, so this CPU may idle" is wrong here in both directions:
+    /// the task is not waiting for a dispatch, and writing the completion this trap computed into
+    /// it would overwrite a winner's live state.
+    RunningElsewhere(crate::kernel::scheduler::CpuId),
+    /// U9-RECV-BLOCK2 §1 — the exact incarnation is `Runnable` and in NO run queue and NO current
+    /// slot: not dispatchable by anything. Nothing will resume it until something publishes it.
+    ///
+    /// The one outcome whose settlement still OWES work, and the reason it is named rather than
+    /// folded into a claim: a settlement that idles this CPU on the strength of it strands the
+    /// task forever.
+    Unpublished,
+    /// The TCB no longer matches `{tid, asid, wait_generation}`, or is no longer parked on this
+    /// receive. Another owner took the incarnation over and **nothing was written**. The caller
+    /// must not resume through the entering frame.
+    IncarnationMoved,
+}
+
 impl RecvUnwindOutcome {
     /// May the trap return through the entering frame?
     ///
@@ -199,16 +212,29 @@ impl RecvUnwindOutcome {
         matches!(self, Self::Restored)
     }
 
-    /// U9-RECV-BLOCK2b §2 — is the task VERIFIED to be somewhere the scheduler will run it again?
+    /// U9-RECV-BLOCK2 §1 — may this transaction write into the incarnation's SAVED CONTEXT?
     ///
-    /// The second question every post-clear settlement asks, and the one that decides whether
-    /// idling is a settlement or an abandonment. True only for outcomes whose post-state was read
-    /// back: `Restored` (this CPU's current) and `RunnableElsewhere` (Runnable with scheduler
-    /// membership). `IncarnationMoved` means another owner holds the incarnation and this
-    /// transaction wrote nothing, so it makes no claim; `Unrecovered` states the opposite.
+    /// True only where the task is provably not executing and not dispatchable — `Unpublished` —
+    /// because that is the only state in which the write cannot race a resume. `QueuedRunnable`
+    /// is already dispatchable and `RunningElsewhere` is already running, so both would be a
+    /// write over a context somebody else owns; `Restored` answers through the live frame instead
+    /// and needs no capture at all.
     #[must_use]
-    pub const fn task_is_verified_schedulable(self) -> bool {
-        matches!(self, Self::Restored | Self::RunnableElsewhere)
+    pub const fn may_capture_continuation(self) -> bool {
+        matches!(self, Self::Unpublished)
+    }
+
+    /// U9-RECV-BLOCK2 §1 — is the task VERIFIED to be somewhere the scheduler will run it again,
+    /// with no further work owed by this transaction?
+    ///
+    /// **Membership alone does not answer this**, which is why `task_present_anywhere` is not the
+    /// predicate. `QueuedRunnable` and `RunningElsewhere` qualify because a dispatcher already
+    /// owns them. `Unpublished` does not: the task is Runnable and reachable by nothing, so
+    /// idling this CPU on the strength of it strands it. `IncarnationMoved` makes no claim —
+    /// another owner holds the incarnation and this transaction wrote nothing.
+    #[must_use]
+    pub const fn dispatcher_already_owns_task(self) -> bool {
+        matches!(self, Self::QueuedRunnable(_) | Self::RunningElsewhere(_))
     }
 
     /// Stable slug for markers.
@@ -216,8 +242,9 @@ impl RecvUnwindOutcome {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Restored => "restored",
-            Self::RunnableElsewhere => "runnable_elsewhere",
-            Self::Unrecovered => "unrecovered",
+            Self::QueuedRunnable(_) => "queued_runnable",
+            Self::RunningElsewhere(_) => "running_elsewhere",
+            Self::Unpublished => "unpublished",
             Self::IncarnationMoved => "incarnation_moved",
         }
     }

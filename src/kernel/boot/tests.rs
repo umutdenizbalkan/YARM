@@ -44072,11 +44072,13 @@ mod stage160c_aarch64_trap_abi_bracketing {
                 - TRAP_ENTRY_SRC
                     .matches("fn finalize_split_handled_syscall(")
                     .count(),
-            4,
-            "finalize must run on the Ok, handled-error, queue-advance-committed and \
-             post-work-committed arms — 199G-C4 §2 added the fourth, and it is CONDITIONAL: a \
-             send that delivered or enqueued finished its caller's syscall, while one that is \
-             about to park it must not advance its SVC or export a result on its behalf"
+            5,
+            "finalize must run on the Ok, handled-error, queue-advance-committed, \
+             post-work-committed and recv-unsettled arms — 199G-C4 §2 added the fourth, and it \
+             is CONDITIONAL: a send that delivered or enqueued finished its caller's syscall, \
+             while one that is about to park it must not advance its SVC or export a result on \
+             its behalf. U9-RECV-BLOCK2 §2 added the fifth, and it is conditional on a different \
+             question — whether the incarnation's saved context may be written at all"
         );
         // A64-DEPTH: each arm now states WHY it finalizes, and that is the property that broke.
         // The AArch64 gate used to be a hand-maintained list of syscall numbers while claiming to
@@ -44088,9 +44090,13 @@ mod stage160c_aarch64_trap_abi_bracketing {
             TRAP_ENTRY_SRC
                 .matches("SplitFinalizeReason::CompletedInThisTrap,")
                 .count(),
-            2,
+            3,
             "the Complete(Ok) and Complete(Err) arms finalize unconditionally — a completed \
-             syscall's result exists now and no later drain will deliver it"
+             syscall's result exists now and no later drain will deliver it. U9-RECV-BLOCK2 §2 \
+             adds the recv-unsettled arm, for exactly that reason: its receive's canonical answer \
+             is already encoded in the frame and NO drain will deliver it, so the continuation \
+             preserved into the entering incarnation is a COMPLETED syscall — which is why it \
+             finalizes as completed rather than as a published transition"
         );
         assert_eq!(
             TRAP_ENTRY_SRC
@@ -78352,9 +78358,41 @@ mod stage197b_riscv_typed_idle_outcome {
             .split("Phase 2: run the canonical handler in-lock")
             .next()
             .unwrap();
+        // U9-RECV-BLOCK2 §2 re-derivation. The claim being made is about the CLASSES this guard
+        // names — DebugLog and FutexWake, which neither block nor switch and whose split returns
+        // are therefore same-task — and that is unchanged.
+        //
+        // What is new in this region is the receive family's unsettled settlement, and it is the
+        // opposite kind of outcome by construction: it is reached only when a recognized receive
+        // has CLEARED `current` and could not put the entering incarnation back, so there is no
+        // same-task frame to `sret` through and idle is the only correct landing. It is the typed
+        // `EnterKernelIdle` this bridge already owns rather than a jump into `riscv_trap_halt`,
+        // which is the whole point of routing it here. So the same-task claim is asserted over
+        // the region with that one arm removed, and the arm is required to be present and to
+        // carry its own reason — a silent idle in this region remains a failure.
         assert!(
-            prelock.contains("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);")
-                && !prelock.contains("EnterKernelIdle"),
+            prelock.contains("RiscvIdleReason::RecvUnsettled"),
+            "the unsettled-receive settlement must land through the bridge's own typed idle"
+        );
+        // Comment-stripped: the derivations in this region name the landing they route to, and a
+        // prose mention is not a code path.
+        let prelock_code = prelock
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let same_task_region = prelock_code
+            .split("SplitDispatchDisposition::RecvUnsettled(unsettled)")
+            .next()
+            .unwrap_or(&prelock_code);
+        let after_unsettled = prelock_code
+            .split("reason: RiscvIdleReason::RecvUnsettled,")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            prelock_code.contains("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);")
+                && !same_task_region.contains("EnterKernelIdle")
+                && !after_unsettled.contains("EnterKernelIdle"),
             "DebugLog/FutexWake split returns are same-task, never idle"
         );
     }
@@ -123652,8 +123690,21 @@ mod stage199d_wa3a_transition_barriers {
                 "{rel}: every one of the {delegating} DELEGATING consumers must match the torn \
                  outcome the owner handed it"
             );
+            // U9-RECV-BLOCK2 §2 — the terminal has a second, NON-torn population, and the
+            // guard's claim is unchanged by it: what is asserted is that every Mark/Acquire
+            // consumer routes a torn dispatch here, not that nothing else may use the terminal.
+            // The receive family's unsettled settlement reaches it for the state the marker
+            // itself names — `scheduler_task_table_disagree`: the task table says `Runnable`
+            // while the scheduler holds the task nowhere at all — and it is subtracted by its own
+            // site string so it can neither hide a missing torn route nor be added to silently.
+            let recv_unsettled = src
+                .matches("dispatch_torn_fatal(cpu, entering.tid, \"ipc_recv_unsettled\")")
+                .count()
+                + src
+                    .matches("\"ipc_recv_unsettled\",\n                    );")
+                    .count();
             assert_eq!(
-                src.matches("dispatch_torn_fatal(").count(),
+                src.matches("dispatch_torn_fatal(").count() - recv_unsettled,
                 direct + delegating,
                 "{rel}: EVERY consumer of either shape must route a torn dispatch to the \
                  divergent fatal"
@@ -145523,10 +145574,17 @@ mod u9qa_split_dispatch_disposition {
         // no longer current on this CPU and the post-lock drain, not the broad dispatcher, owes
         // the switch. Retiring the ordinary preempting-timer population from broad dispatch is
         // precisely what this arm does, so it belongs here rather than to a new mechanism.
+        //
+        // U9-RECV-BLOCK2 §2 re-derivation: FIVE. `RecvUnsettled` is the fifth, and its reason is
+        // the strongest of the five: the receive route cleared `current` and could NOT put the
+        // entering incarnation back, so the caller is not this CPU's current and re-running the
+        // receive against it in the broad dispatcher is exactly the corruption the disposition
+        // exists to prevent. Like the other four it is an explicit disposition arm and infers
+        // nothing from a stash.
         assert_eq!(
             code.matches("queue_advance_committed = true;").count(),
-            4,
-            "exactly four disposition arms may declare the broad dispatcher skipped: \
+            5,
+            "exactly five disposition arms may declare the broad dispatcher skipped: \
              FutexWait publication, terminal-fault commit, terminal-fault fail-closed, \
              and the preempting-timer commit"
         );
@@ -148209,12 +148267,22 @@ mod u9ft3_transition {
     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const FAULT_SRC: &str = include_str!("fault_state.rs");
 
+    /// U9-RECV-BLOCK2 §1 re-derivation: bounded by the FUNCTION'S OWN closing brace.
+    ///
+    /// This used to run to the next `/// U9-FT3 §1` doc line, which is not the end of this
+    /// function — it is the start of a different one several hundred lines later — so every item
+    /// written between the two fell inside the slice and was asserted against this transition's
+    /// contract. A receive-family recovery landing there made `apply_task_transition(` appear
+    /// four times in a body that performs exactly one status write. The closing brace at this
+    /// item's own indentation is the real boundary; nested blocks are indented deeper and cannot
+    /// match it.
     fn body() -> &'static str {
-        RUNTIME_SRC
+        let tail = RUNTIME_SRC
             .split("pub(crate) fn commit_terminal_fault_transition_shared(")
             .nth(1)
-            .and_then(|s| s.split("\n    /// U9-FT3 §1").next())
-            .expect("the terminal transition")
+            .expect("the terminal transition");
+        let end = tail.find("\n    }\n").expect("its closing brace") + "\n    }\n".len();
+        &tail[..end]
     }
 
     /// The victim is validated at rank 2 BEFORE the irreversible scheduler mutation, exactly as
@@ -178816,117 +178884,174 @@ mod u9_recv_block1_closure {
         }
     }
 
-    // ─── U9-RECV-BLOCK2b §4 — a non-returning landing owes the retirement contract ────────────
+    // ─── U9-RECV-BLOCK2 §2 — the settlement belongs to the bridge that owns the frame ─────────
 
-    /// **The unsettleable terminal retires this trap's authority before it diverges.**
+    /// **The deep-divergence helper is gone, and so is the adapter it needed.**
     ///
-    /// `TrapPathWindow::retire`'s contract is unconditional — *every landing that does not return
-    /// must call this first* — and `Drop` cannot cover a diverging path. The terminal used to jump
-    /// straight from the syscall body into an architecture halt loop, leaving the window reading
-    /// as live and the publication flag set: exactly the state `TrapPathWindow::establish` reports
-    /// as `TRAP_DISPATCH_WINDOW_ABANDONED` on the next trap that CPU takes, while the CPU goes on
-    /// to accept interrupts and dispatch other work under an authority naming a trap that is gone.
+    /// `recv_unsettleable_idle_terminal` was a `-> !` called from the syscall body, several frames
+    /// below the `TrapPathWindow` value and below the frame the trap returns through. Everything
+    /// the trap boundary owns was bypassed by that jump — window retirement, the outgoing-context
+    /// capture, and each port's own landing, two of which settle by RETURNING rather than
+    /// diverging. It is not renamed or narrowed; it and `TrapPathWindow::retire_diverging_landing`
+    /// — which existed only to serve it — are both removed.
     #[test]
-    fn the_unsettleable_landing_retires_the_trap_authority() {
+    fn the_deep_divergence_helper_and_its_adapter_are_gone() {
         const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
-        let body = TRAP_ENTRY_SRC
-            .split("pub(crate) fn recv_unsettleable_idle_terminal(")
-            .nth(1)
-            .and_then(|b| b.split("\n}").next())
-            .expect("the unsettleable terminal");
+        const RISCV_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for (name, src) in [
+            ("trap_entry.rs", TRAP_ENTRY_SRC),
+            ("syscall_split.rs", SPLIT),
+            ("riscv64/trap.rs", RISCV_SRC),
+        ] {
+            assert!(
+                !src.contains("fn recv_unsettleable_idle_terminal"),
+                "{name}: the deep-divergence helper must be gone, not renamed"
+            );
+            assert!(
+                !src.contains("recv_unsettleable_idle_terminal("),
+                "{name}: and it must have no callers"
+            );
+        }
         assert!(
-            body.contains("TrapPathWindow::retire_diverging_landing(authority)"),
-            "the landing must retire this trap's window before handing the CPU on"
+            !TRAP_ENTRY_SRC.contains("fn retire_diverging_landing"),
+            "the retirement adapter is callerless once the helper is gone, so it goes too"
         );
-        // Before the halt, not after it — after is unreachable.
-        let retire = body
-            .find("TrapPathWindow::retire_diverging_landing(")
-            .expect("the retirement");
+        assert!(
+            !RUNTIME_SRC.contains("pub(crate) const fn epoch(self) -> u64"),
+            "and so does the authority-epoch accessor that existed only to feed it"
+        );
+    }
+
+    /// **The route reports FACTS; the bridge performs the settlement.**
+    ///
+    /// The syscall body may name neither a landing nor a halt: what it owes is the exact entering
+    /// incarnation and the recovery's verified outcome, and that is all `RecvUnsettled` carries.
+    #[test]
+    fn the_unsettled_receive_is_reported_not_landed() {
+        let code = code_of(SPLIT);
         for landing in [
-            "idle_halt_loop()",
-            "enter_post_lock_idle_after_direct_dispatch(",
-            "riscv_trap_halt(",
-        ] {
-            if let Some(at) = body.find(landing) {
-                assert!(
-                    retire < at,
-                    "the retirement must precede the {landing} landing, which never returns"
-                );
-            }
-        }
-        // And it takes the authority rather than re-deriving one: only `establish` mints, so a
-        // landing that read the window cell instead could close a window it never owned.
-        assert!(
-            body.contains("authority: crate::runtime::DispatchAuthority"),
-            "the landing is given this trap's own authority"
-        );
-    }
-
-    /// **The landing settles through the ESTABLISHED per-architecture idle primitives.**
-    ///
-    /// Not a second idle policy: each is the one that architecture's own post-lock dispatch
-    /// terminal enters. On x86_64 the attestation that names which class idled runs first, so a
-    /// live log can tell this settlement apart from the ordinary idle outcome.
-    #[test]
-    fn the_unsettleable_landing_introduces_no_new_idle_implementation() {
-        const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
-        let body = TRAP_ENTRY_SRC
-            .split("pub(crate) fn recv_unsettleable_idle_terminal(")
-            .nth(1)
-            .and_then(|b| b.split("\n}").next())
-            .expect("the unsettleable terminal");
-        for established in [
-            "crate::arch::x86_64::trap::settle_post_lock_terminal_idle(",
-            "crate::arch::x86_64::descriptor_tables::idle_halt_loop()",
-            "crate::arch::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(",
-            "crate::arch::riscv64::boot::riscv_trap_halt(",
+            "idle_halt_loop",
+            "riscv_trap_halt",
+            "enter_post_lock_idle_after_direct_dispatch",
+            "enter_post_lock_dispatch_fatal",
         ] {
             assert!(
-                body.contains(established),
-                "the landing must reach the established primitive: {established}"
+                !code.contains(landing),
+                "the split route must not name an architectural landing: {landing}"
             );
         }
-        for invented in ["loop {", "wfi", "hlt", "unsafe {"] {
-            assert!(
-                !body.contains(invented),
-                "the landing must not spell out an idle of its own: {invented}"
-            );
-        }
-    }
-
-    /// **The landing reports VERIFIED state, never an assumed one.**
-    ///
-    /// Its callers used to pass `enabled=true` unconditionally, so the marker claimed the task was
-    /// enqueued whatever the recovery had actually achieved. The value is now the recovery owner's
-    /// verified answer, and the deferral and placement are read back rather than assumed.
-    #[test]
-    fn the_unsettleable_landing_reports_only_what_it_read_back() {
-        const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
-        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
-        let body = TRAP_ENTRY_SRC
-            .split("pub(crate) fn recv_unsettleable_idle_terminal(")
-            .nth(1)
-            .and_then(|b| b.split("\n}").next())
-            .expect("the unsettleable terminal");
         assert!(
-            body.contains("d2_recv_dispatch_is_deferred(cpu_idx)")
-                && body.contains("current_tid_split_read(cpu)")
-                && body.contains("receiver_has_scheduler_membership_split_read(tid)"),
-            "the deferral, the placement and the membership are READ, not assumed"
+            code.contains("SplitRecvDisposition::Unsettled(RecvUnsettled {"),
+            "it reports the settlement as a value"
         );
-        // No caller may hand it a literal again.
-        assert!(
-            !SPLIT_SRC.contains("recv_unsettleable_idle_terminal(cpu, tid, true)"),
-            "no call site may assert a post-state it did not verify"
-        );
+        // And every post-clear settlement goes through the ONE helper, so the answer cannot be
+        // encoded on one path and forgotten on another.
         assert_eq!(
-            SPLIT_SRC.matches("task_is_verified_schedulable()").count(),
-            4,
-            "every one of the four landings passes the recovery owner's verified answer"
+            code.matches("recv_settle_after_unwind(").count(),
+            5,
+            "one definition and the four post-clear settlements that use it"
         );
     }
 
-    /// **The legacy `Option` adapter is a TEST adapter.**
+    /// **The bridge's order is capture, then publish, then land — and never the reverse.**
+    ///
+    /// Publishing first is what would let another CPU dispatch the task and resume it from a
+    /// context this trap had not finished writing. The capture is also GATED: it runs only for the
+    /// one outcome in which nothing can dispatch the task, so a `QueuedRunnable` task's live
+    /// context and a `RunningElsewhere` winner's state are never overwritten.
+    #[test]
+    fn the_bridge_captures_before_it_publishes() {
+        const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+        const RISCV_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        for (name, src, marker) in [
+            (
+                "trap_entry.rs",
+                TRAP_ENTRY_SRC,
+                "if let SplitDispatchDisposition::RecvUnsettled(unsettled) = disposition {",
+            ),
+            (
+                "riscv64/trap.rs",
+                RISCV_SRC,
+                "SplitDispatchDisposition::RecvUnsettled(unsettled) =",
+            ),
+        ] {
+            let arm = src.split(marker).nth(1).expect("the unsettled arm");
+            let arm = &arm[..arm.len().min(9000)];
+            let gate = arm
+                .find("may_capture_continuation()")
+                .unwrap_or_else(|| panic!("{name}: the capture must be gated"));
+            let capture = arm
+                .find("split_return_commit_context_split(")
+                .unwrap_or_else(|| panic!("{name}: the capture"));
+            let publish = arm
+                .find("enqueue_task_split(")
+                .unwrap_or_else(|| panic!("{name}: the publication"));
+            assert!(
+                gate < capture,
+                "{name}: the capture is gated on the one outcome that cannot race a resume"
+            );
+            assert!(
+                capture < publish,
+                "{name}: the continuation must be preserved BEFORE publication makes the task \
+                 dispatchable elsewhere"
+            );
+            assert!(
+                arm.contains("dispatcher_already_owns_task()"),
+                "{name}: idling is licensed only when something will run the task again"
+            );
+            assert!(
+                arm.contains("ipc_recv_unsettled"),
+                "{name}: and a task reachable by nothing takes the established fatal, not an idle"
+            );
+        }
+    }
+
+    /// **`Unpublished` is not a successful idle, and the type says so.**
+    ///
+    /// The three predicates the settlement reads are separate on purpose: whether the frame may be
+    /// returned through, whether the saved context may be written, and whether a dispatcher
+    /// already owns the task. Membership alone answers none of them — `task_present_anywhere`
+    /// covers the run queues AND the current slots — so it may not appear in the recovery at all.
+    #[test]
+    fn the_outcomes_separate_the_three_questions_a_settlement_asks() {
+        const WAITER_SRC: &str = include_str!("../recv_waiter_split.rs");
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for predicate in [
+            "fn may_resume_entering_frame",
+            "fn may_capture_continuation",
+            "fn dispatcher_already_owns_task",
+        ] {
+            assert!(
+                WAITER_SRC.contains(predicate),
+                "the settlement's three questions are answered separately: {predicate}"
+            );
+        }
+        for variant in [
+            "QueuedRunnable(",
+            "RunningElsewhere(",
+            "Unpublished,",
+            "IncarnationMoved,",
+        ] {
+            assert!(
+                WAITER_SRC.contains(variant),
+                "the distinct post-states must be named: {variant}"
+            );
+        }
+        // The recovery derives them from the scheduler's own placement answer, not from a
+        // membership boolean that cannot tell queued from running.
+        let recovery = RUNTIME_SRC
+            .split("fn recv_unwind_placement_outcome_split(")
+            .nth(1)
+            .expect("the placement owner");
+        let recovery = &recovery[..recovery.len().min(3000)];
+        assert!(
+            recovery.contains("placement_of(") && !recovery.contains("task_present_anywhere"),
+            "the outcome comes from `placement_of`, which distinguishes queued from current"
+        );
+    }
+
+    /// **The legacy `Option` adapter is a TEST adapter.**    /// **The legacy `Option` adapter is a TEST adapter.**
     ///
     /// `RecvImmediateOutcome::into_legacy_option` collapses both declines to `None` — exactly the
     /// information loss the type exists to remove. Hosted cases written against the old shape may

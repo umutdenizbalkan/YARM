@@ -624,40 +624,6 @@ impl TrapPathWindow {
         self.authority
     }
 
-    /// U9-RECV-BLOCK2b §4 — retire a window from a landing BELOW the frame that owns the guard.
-    ///
-    /// The contract on [`Self::retire`] is unconditional: *every landing that does not return must
-    /// call this first*. The drains satisfy it by holding the `TrapPathWindow` value, but a
-    /// non-returning landing reached from inside the split dispatch is several frames below that
-    /// value and cannot name it — so the receive family's unsettleable terminal jumped straight
-    /// into an architecture halt loop, retiring nothing and settling nothing. `Drop` does not
-    /// cover it either: divergence never unwinds.
-    ///
-    /// What that left behind is exactly what `establish` reports as `TRAP_DISPATCH_WINDOW_ABANDONED`
-    /// on the NEXT trap taken on that CPU: a window still reading as live, minting nothing but
-    /// authorizing a `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag that says a drainer will consume
-    /// publications this CPU can no longer drain.
-    ///
-    /// This performs the same two operations `Drop` performs, in the same order, through the same
-    /// owners. It is exact rather than ambient: the epoch closed is the one carried by the
-    /// authority this trap was given, which `establish` minted, so it can only ever close its own
-    /// window — `close_trap_dispatch_window` is epoch-checked and a mismatched epoch is a no-op.
-    pub(crate) fn retire_diverging_landing(authority: crate::runtime::DispatchAuthority) {
-        let cpu_idx = authority.cpu().0 as usize;
-        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-            return;
-        }
-        // `settle` first, then `retire` — the order `Drop` uses. The publication flag must be
-        // clear before the window is closed, so no interval exists in which a publication is
-        // welcomed by a window that is already gone. Through the same one clearing write
-        // `settle` uses, so the flag still has exactly one place that clears it.
-        Self::clear_publication_flag(cpu_idx);
-        let epoch = authority.epoch();
-        if epoch != 0 {
-            crate::kernel::boot::close_trap_dispatch_window(cpu_idx, epoch);
-        }
-    }
-
     /// Close the window. Idempotent by construction, so an explicit call before a divergence
     /// and the `Drop` that follows a return together still clear it exactly once.
     pub(crate) fn settle(&self) {
@@ -667,12 +633,11 @@ impl TrapPathWindow {
         Self::clear_publication_flag(self.cpu_idx);
     }
 
-    /// U9-RECV-BLOCK2b §4 — THE clearing write, in one place.
+    /// U9-RECV-BLOCK2 §2 — THE clearing write, in one place.
     ///
     /// `the_window_is_cleared_exactly_once_on_every_path` requires that this flag be written only
-    /// by `establish` and by the settlement, and that stays true with the landing settlement added:
-    /// both [`Self::settle`] and [`Self::retire_diverging_landing`] reach the store through here
-    /// rather than each carrying a copy.
+    /// by `establish` and by the settlement, and keeping the store here rather than inline in
+    /// [`Self::settle`] is what keeps that literally true as settlements are added.
     fn clear_publication_flag(cpu_idx: usize) {
         if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
             crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
@@ -902,6 +867,133 @@ pub fn handle_trap_entry_shared(
             let entering = split_return_identity(shared, cpu);
             let disposition =
                 crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame);
+            // U9-RECV-BLOCK2 §2 — THE UNSETTLED RECEIVE, settled by the bridge that owns the
+            // frame, the dispatch window and this architecture's landing.
+            //
+            // Its predecessor was a `-> !` jump from the syscall body into a halt loop, which
+            // bypassed every one of those three. Here the three obligations are discharged in the
+            // order the world requires, and each through the owner that already exists.
+            if let SplitDispatchDisposition::RecvUnsettled(unsettled) = disposition {
+                let entering_incarnation = unsettled.entering;
+                let outcome = unsettled.outcome;
+                // (1) THE CONTINUATION, and it goes first.
+                //
+                // `may_capture_continuation` is true for exactly one outcome — the task is
+                // `Runnable`, on no run queue and in no current slot, so nothing can dispatch it
+                // and this write cannot race a resume. For the other outcomes it is false and
+                // this step is SKIPPED, which is the point: `QueuedRunnable` is already
+                // dispatchable and `RunningElsewhere` is executing, so writing their saved
+                // context would overwrite a winner's state, and `IncarnationMoved` names a TCB
+                // this transaction no longer owns.
+                //
+                // The frame already carries this receive's canonical answer —
+                // `recv_settle_after_unwind` encoded it before reporting — so what is preserved
+                // is a COMPLETED syscall, not a receive to be re-entered. The PC convention is
+                // each port's own: `finalize_split_handled_syscall` advances AArch64's `SVC` and
+                // exports its result lanes, and is a no-op on x86_64 (whose saved RIP is already
+                // past the trap instruction) and on RISC-V (whose bridge pre-advanced `sepc`),
+                // so no arithmetic is introduced anywhere.
+                let identity = crate::runtime::SplitReturnIdentity {
+                    tid: entering_incarnation.tid,
+                    asid: entering_incarnation.asid,
+                };
+                let captured = if outcome.may_capture_continuation() {
+                    finalize_split_handled_syscall(
+                        shared,
+                        cpu,
+                        identity,
+                        frame,
+                        SplitFinalizeReason::CompletedInThisTrap,
+                    );
+                    // AArch64's finalize owner commits the context itself, with the corrected
+                    // resume PC (`last_vector_raw_elr()`), so this rewrites the identical value
+                    // there. The other two ports have no finalize step at all — x86_64's saved
+                    // RIP and RISC-V's pre-advanced `sepc` are already past the trap instruction —
+                    // so this is where their capture happens. Exact-incarnation by construction:
+                    // `split_return_commit_context_split` matches `{tid, asid}` and writes
+                    // nothing for a replacement.
+                    shared.split_return_commit_context_split(identity, frame.capture_user_context())
+                } else {
+                    false
+                };
+                // (2) PUBLICATION, strictly after the capture. Publishing first is what would let
+                // another CPU dispatch the task and resume it from a context this trap had not
+                // finished writing.
+                let published = if captured {
+                    shared
+                        .enqueue_task_split(cpu, entering_incarnation.tid)
+                        .is_ok()
+                } else {
+                    false
+                };
+                crate::yarm_log!(
+                    "IPC_RECV_SPLIT_UNSETTLED_BRIDGE cpu={} tid={} asid={} outcome={} captured={} published={} dispatcher_owns={}",
+                    cpu.0,
+                    entering_incarnation.tid,
+                    entering_incarnation.asid.0,
+                    outcome.slug(),
+                    u8::from(captured),
+                    u8::from(published),
+                    u8::from(outcome.dispatcher_already_owns_task())
+                );
+                // (3) THE LANDING, and whether one is licensed at all.
+                //
+                // Idling this CPU is a SETTLEMENT only when the task is somewhere a dispatcher
+                // will take it: `QueuedRunnable`/`RunningElsewhere` (a dispatcher already owns
+                // it) or an `Unpublished` task this bridge has just captured and published. An
+                // `Unpublished` task whose capture or publication FAILED is reachable by nothing,
+                // and idling on it strands it forever — so that is the established fatal
+                // terminal, not an idle.
+                let settled = outcome.dispatcher_already_owns_task() || published;
+                if !settled {
+                    crate::yarm_log!(
+                        "IPC_RECV_SPLIT_UNSETTLED_FATAL cpu={} tid={} outcome={} reason=task_reachable_by_nothing",
+                        cpu.0,
+                        entering_incarnation.tid,
+                        outcome.slug()
+                    );
+                    // U9-DISPATCH-CPU1 D2: retire before the non-returning transfer.
+                    trap_path.retire();
+                    // The ESTABLISHED architecture-neutral terminal for exactly this class of
+                    // state — `DISPATCH_TORN_FATAL … reason=scheduler_task_table_disagree` — and
+                    // that is what this is: the task table says `Runnable` while the scheduler
+                    // holds it nowhere at all.
+                    crate::runtime::dispatch_torn_fatal(
+                        cpu,
+                        entering_incarnation.tid,
+                        "ipc_recv_unsettled",
+                    );
+                }
+                // The broad dispatcher is skipped for the same reason a committed queue advance
+                // skips it: the caller is no longer this CPU's current, and re-running the
+                // receive against it is the corruption this disposition exists to prevent.
+                queue_advance_committed = true;
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=recv_unsettled",
+                    cpu.0
+                );
+                // AArch64 keeps its ESTABLISHED non-returning landing, and must: its vector
+                // epilogue would otherwise `eret` through the entering frame, which belongs to a
+                // task that is no longer current. x86_64 RETURNS — the raw trap tail's
+                // `exiting_tid is None` landing enters `idle_halt_loop()` with the depth clear and
+                // the attestation epilogue intact, which is what its own
+                // `settle_post_lock_terminal_idle` contract requires and what diverging from here
+                // would skip.
+                #[cfg(target_arch = "x86_64")]
+                crate::arch::x86_64::trap::settle_post_lock_terminal_idle(
+                    cpu,
+                    entering_incarnation.tid,
+                    "ipc_recv_unsettled",
+                );
+                #[cfg(target_arch = "aarch64")]
+                {
+                    trap_path.retire();
+                    crate::arch::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(
+                        cpu,
+                        entering_incarnation.tid,
+                    );
+                }
+            }
             // U9-QA §2: the COMMITTED disposition. The split route published a terminal
             // transition, so the caller is no longer current on this CPU and the live frame no
             // longer belongs to anything this trap may return through.
@@ -2939,126 +3031,6 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
 }
 #[cfg(not(target_arch = "aarch64"))]
 fn pre_split_import_syscall_abi(_frame: &mut TrapFrame) {}
-
-/// U9-RECV-BLOCK2 §2 / U9-RECV-BLOCK2b §4 — the receive family's UNSETTLEABLE terminal.
-///
-/// Reached only when this CPU's `current` was cleared by Phase A and BOTH exact rank-1 recoveries
-/// refused: `restore_exact_current_on` (which needs the slot empty and the task unqueued) and
-/// `on_preempt_prefer_on_cpu_split` (which pulls the task back out of the run queue). The
-/// composite requires `current.is_some()` on this CPU, and installing a current on a CPU requires
-/// running on that CPU — which this trap is what is doing. So the state is established-impossible.
-///
-/// It diverges rather than returning, for the reason the D2 drain states for its homologous case:
-/// the caller is no longer this CPU's current, so returning through the entering frame would
-/// resume a task the scheduler has parked, through a frame that is no longer its own.
-///
-/// # What a non-returning landing owes, and what this used to skip
-///
-/// U9-RECV-BLOCK2b §4. This function jumped straight from the syscall body into an architecture
-/// halt loop. Three obligations went unmet, and the first is a contract this file states in so
-/// many words on [`TrapPathWindow::retire`] — *every landing that does not return must call this
-/// first*:
-///
-/// * **The trap authority was never retired, and the publication window never settled.** `Drop`
-///   does not cover a diverging path, and this landing holds no `TrapPathWindow` value to call.
-///   What that leaves is precisely what `TrapPathWindow::establish` reports as
-///   `TRAP_DISPATCH_WINDOW_ABANDONED` on the next trap this CPU takes: a window still reading as
-///   live, and a `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag telling every admission that a drainer
-///   will consume publications this CPU has stopped draining. The CPU then goes on to accept
-///   interrupts and dispatch other work under an authority naming a trap that is long gone.
-///   `TrapPathWindow::retire_diverging_landing` performs the two operations `Drop` performs, in
-///   `Drop`'s order, against the epoch this trap's own authority carries.
-/// * **The idle was unexplained.** A cleared `current` with no recorded provenance is, to the
-///   RISC-V bridge's own terminal-idle tail, a BUG — it takes the defensive
-///   `RISCV_BLOCKED_IDLE_NO_PROVENANCE … result=defensive_err` path rather than reading it as
-///   intentional. The established owner is `blocked_syscall_idle_provenance_set`, which the
-///   D2-recv drain publishes on exactly this class of settlement
-///   (`D2_RECV_GENUINE_IDLE_PROVENANCE_PUBLISHED … class=IpcRecv`), and this landing publishes it
-///   the same way rather than leaving the state unexplained.
-/// * **The deferral was assumed clear rather than checked.** Every caller clears it before
-///   arriving; a drain that ran anyway would re-verify `Blocked(EndpointReceive)` against a task
-///   this transaction has just made `Runnable` and settle nothing. It is now read back, and
-///   cleared if a caller ever failed to.
-///
-/// `schedulable` is the recovery owner's VERIFIED answer (`RecvUnwindOutcome::
-/// task_is_verified_schedulable`), not the unconditional `true` its callers used to pass. When it
-/// holds, the task is `Runnable` with scheduler membership and the wake-capable idle below —
-/// `sti; hlt`, `wfi`, `wfi` on the three ports — hands it to the next timer tick or IPI. When it
-/// does not, nothing here can recover it and the marker says so instead of claiming otherwise.
-#[cfg(not(feature = "hosted-dev"))]
-pub(crate) fn recv_unsettleable_idle_terminal(
-    shared: &crate::runtime::SharedKernel,
-    authority: crate::runtime::DispatchAuthority,
-    tid: u64,
-    schedulable: bool,
-) -> ! {
-    let cpu = authority.cpu();
-    let cpu_idx = cpu.0 as usize;
-    // (1) DEFERRAL. Read back rather than assumed; a stale one would send the D2-recv drain at a
-    // transaction that owns nothing.
-    let deferred = crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx);
-    if deferred {
-        crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
-    }
-    // (2) CURRENT/QUEUE STATE, read back through the same owners the recovery used, so the marker
-    // reports what is true rather than what was intended.
-    let still_current = shared.current_tid_split_read(cpu) == Some(tid);
-    let member = shared.receiver_has_scheduler_membership_split_read(tid);
-    crate::yarm_log!(
-        "IPC_RECV_SPLIT_UNSETTLEABLE cpu={} tid={} schedulable={} still_current={} membership={} stale_deferral={} reason=current_cleared_and_unrestorable result=idle",
-        cpu.0,
-        tid,
-        u8::from(schedulable),
-        u8::from(still_current),
-        u8::from(member),
-        u8::from(deferred)
-    );
-    // (3) IDLE PROVENANCE, through the owner the D2-recv drain uses for its own idle settlement.
-    // Published only when the task is verifiably schedulable: the provenance means "a canonical
-    // blocking receive dispatched away from this task", and claiming it for a task nothing can
-    // resume would be the same false claim §2 removed from `RunnableElsewhere`.
-    //
-    // RISC-V ONLY, because RISC-V is the sole reader. `blocked_syscall_idle_provenance_take` has
-    // exactly one consumer in the tree — this port's bridge tail — and
-    // `other_architectures_d2_behaviour_is_unchanged` holds the x86_64/AArch64 arms to publishing
-    // none, which is the scoping the token was introduced with. Publishing it unconditionally
-    // would put a token on two ports that never read it and would leak to their next trap.
-    #[cfg(target_arch = "riscv64")]
-    if schedulable {
-        crate::kernel::boot::blocked_syscall_idle_provenance_set(
-            cpu_idx,
-            tid,
-            crate::kernel::boot::BlockingSyscallClass::IpcRecv,
-        );
-        crate::yarm_log!(
-            "D2_RECV_GENUINE_IDLE_PROVENANCE_PUBLISHED cpu={} tid={} class=IpcRecv",
-            cpu.0,
-            tid
-        );
-    }
-    // (4) AUTHORITY RETIREMENT — the contract on `TrapPathWindow::retire`, discharged before the
-    // CPU is handed on to interrupts and further dispatch.
-    TrapPathWindow::retire_diverging_landing(authority);
-    // (5) The landing. Each is the architecture's ESTABLISHED wake-capable idle primitive — the
-    // same one its post-lock dispatch terminals enter — not a second idle policy.
-    #[cfg(target_arch = "x86_64")]
-    {
-        crate::arch::x86_64::trap::settle_post_lock_terminal_idle(
-            cpu,
-            tid,
-            "ipc_recv_split_unsettleable",
-        );
-        crate::arch::x86_64::descriptor_tables::idle_halt_loop()
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::arch::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(cpu, tid)
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        crate::arch::riscv64::boot::riscv_trap_halt("ipc_recv_split_unsettleable")
-    }
-}
 
 #[cfg(target_arch = "aarch64")]
 fn split_return_identity(

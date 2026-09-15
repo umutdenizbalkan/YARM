@@ -59,6 +59,16 @@ pub enum RiscvIdleReason {
     /// CPU. Keeping it separate is what stops a refusal being read later as a real blocking or
     /// exiting outcome; the genuine `Idle` selections keep their own reasons above.
     QueueAdvanceNoIncoming,
+    /// U9-RECV-BLOCK2 §2 — a RECOGNIZED receive cleared `current` and could not put the entering
+    /// incarnation back, so this trap has no frame to `sret` through.
+    ///
+    /// Distinct from all four above because none of them describes it: the caller is not blocked
+    /// (its block was fully unwound), it is not gone, and no selection refused — nothing was ever
+    /// selected. The bridge has already discharged the settlement's obligations before producing
+    /// it: the entering incarnation's completed continuation is captured and published, or the
+    /// task was already owned by a dispatcher. Idling is therefore the correct landing and is
+    /// recoverable — the periodic timer re-dispatches this CPU.
+    RecvUnsettled,
 }
 
 /// Stage 197B: the explicit, typed result of the RISC-V shared trap-entry wrapper. It replaces the
@@ -1111,6 +1121,65 @@ pub fn handle_riscv_trap_entry_shared(
         // canonical return path rather than by an explicit finalize call, so a completed send
         // needs nothing extra here; a PARKED sender needs the opposite — no result written on
         // its behalf — and gets it, because this arm writes none either way.
+        // U9-RECV-BLOCK2 §2 — THE UNSETTLED RECEIVE, settled by this bridge.
+        //
+        // Its predecessor jumped from the syscall body into `riscv_trap_halt`, which skipped the
+        // typed idle this port's landing is built on and left the dispatch window open. Here the
+        // obligations are discharged in order and the landing is the typed `EnterKernelIdle` the
+        // bridge already owns — the same one `riscv_trap_halt` is reached THROUGH.
+        if let crate::kernel::syscall_split::SplitDispatchDisposition::RecvUnsettled(unsettled) =
+            disposition
+        {
+            let entering = unsettled.entering;
+            let outcome = unsettled.outcome;
+            let identity = crate::runtime::SplitReturnIdentity {
+                tid: entering.tid,
+                asid: entering.asid,
+            };
+            // (1) THE CONTINUATION, first, and only where nothing can dispatch the task while it
+            // is being written. The frame already carries this receive's canonical answer, and
+            // `sepc` is the one THIS BRIDGE pre-advanced past the `ecall` before
+            // `handle_trap_entry` — so capturing it verbatim preserves a COMPLETED syscall, and
+            // no `+4` or `-4` is introduced here or anywhere else.
+            let captured = outcome.may_capture_continuation()
+                && shared.split_return_commit_context_split(identity, frame.capture_user_context());
+            // (2) PUBLICATION, strictly after the capture.
+            let published = captured && shared.enqueue_task_split(cpu, entering.tid).is_ok();
+            crate::yarm_log!(
+                "IPC_RECV_SPLIT_UNSETTLED_BRIDGE cpu={} tid={} asid={} outcome={} captured={} published={} dispatcher_owns={}",
+                cpu.0,
+                entering.tid,
+                entering.asid.0,
+                outcome.slug(),
+                u8::from(captured),
+                u8::from(published),
+                u8::from(outcome.dispatcher_already_owns_task())
+            );
+            // (3) Idling is a settlement only when SOMETHING will run this task again. An
+            // `Unpublished` task whose capture or publication failed is reachable by nothing, and
+            // this port's own contract for that state is the canonical error path, never a silent
+            // idle — the same rule `RISCV_BLOCKED_IDLE_NO_PROVENANCE` enforces one level down.
+            if !(outcome.dispatcher_already_owns_task() || published) {
+                crate::yarm_log!(
+                    "IPC_RECV_SPLIT_UNSETTLED_FATAL cpu={} tid={} outcome={} reason=task_reachable_by_nothing",
+                    cpu.0,
+                    entering.tid,
+                    outcome.slug()
+                );
+                // The ESTABLISHED architecture-neutral terminal for exactly this class of
+                // state — `DISPATCH_TORN_FATAL … reason=scheduler_task_table_disagree` — and that
+                // is what this is: the task table says `Runnable` while the scheduler holds it
+                // nowhere at all.
+                crate::runtime::dispatch_torn_fatal(cpu, entering.tid, "ipc_recv_unsettled");
+            }
+            crate::yarm_log!(
+                "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=recv_unsettled",
+                cpu.0
+            );
+            return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                reason: RiscvIdleReason::RecvUnsettled,
+            });
+        }
         if let crate::kernel::syscall_split::SplitDispatchDisposition::PostWorkCommitted {
             finalize_syscall,
         } = disposition
