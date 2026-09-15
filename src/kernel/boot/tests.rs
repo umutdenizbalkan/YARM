@@ -24284,11 +24284,40 @@ mod stage32_cap_resolution_tests {
             recv_cap
         });
         let mut frame = recv_frame(recv_cap);
+        // U9-RECV-BLOCK2 §3 re-derivation. This pinned `None` — "an empty endpoint falls back to
+        // the broad dispatcher" — and that is precisely the escape the receive conversion closed.
+        // A RECOGNIZED receive never falls back; the property this case now pins is the one that
+        // replaced it, in two parts:
+        //
+        // 1. THE PRODUCTION PARKING PRECONDITION, from the production owner. The immediate lane's
+        //    authoritative rank-3 take runs and the endpoint is empty, and because NR 2 is built
+        //    by `RecvRequest::from_legacy_ipc_recv` — which hard-codes
+        //    `RecvBlockingPolicy::WaitForever` — that is `EmptyAwaitingPark`, never an answer.
+        //    This is what the production route parks on; the hosted landing below is NOT evidence
+        //    for it, which is why it is asserted separately and first.
+        // 2. The hosted profile compiles no parking owner at all, so the family entry settles with
+        //    the canonical empty encoding rather than handing the trap away. The frame's error
+        //    lane and no-transfer sentinel are checked, because a settlement that answered on the
+        //    syscall channel would leave the transfer-cap lane carrying whatever the previous
+        //    syscall left there.
+        assert!(
+            matches!(
+                kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
+                crate::kernel::syscall::RecvImmediateOutcome::EmptyAwaitingPark
+            ),
+            "the empty take is the PARKING precondition, not a fall-through"
+        );
+        let mut frame = recv_frame(recv_cap);
         assert_eq!(
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
                 .legacy(),
-            None,
-            "empty endpoint must fall back through the live seam"
+            Some(Ok(())),
+            "and the recognized receive is SETTLED, never handed to the broad dispatcher"
+        );
+        assert_eq!(
+            frame.error_code(),
+            Some(SyscallError::WouldBlock.code()),
+            "the hosted landing encodes the canonical empty error"
         );
     }
 
@@ -25064,12 +25093,37 @@ mod stage33_34 {
             recv_cap
         });
         let mut frame = recv_frame(recv_cap);
+        // U9-RECV-BLOCK2 §3 re-derivation. This pinned `None` — "an empty endpoint falls back to
+        // the broad dispatcher" — and that is precisely the escape the receive conversion closed.
+        // A RECOGNIZED receive never falls back; the property this case now pins is the one that
+        // replaced it, in two parts:
+        //
+        // 1. THE PRODUCTION PARKING PRECONDITION, from the production owner. The immediate lane's
+        //    authoritative rank-3 take runs and the endpoint is empty, and because NR 2 is built
+        //    by `RecvRequest::from_legacy_ipc_recv` — which hard-codes
+        //    `RecvBlockingPolicy::WaitForever` — that is `EmptyAwaitingPark`, never an answer.
+        //    This is what the production route parks on; the hosted landing below is NOT evidence
+        //    for it, which is why it is asserted separately and first.
+        // 2. The hosted profile compiles no parking owner at all, so the family entry settles with
+        //    the canonical empty encoding rather than handing the trap away. The frame's error
+        //    lane and no-transfer sentinel are checked, because a settlement that answered on the
+        //    syscall channel would leave the transfer-cap lane carrying whatever the previous
+        //    syscall left there.
+        assert!(
+            matches!(
+                kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
+                crate::kernel::syscall::RecvImmediateOutcome::EmptyAwaitingPark
+            ),
+            "the empty take is the PARKING precondition, not a fall-through"
+        );
+        let mut frame = recv_frame(recv_cap);
         assert_eq!(
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
                 .legacy(),
-            None,
-            "empty endpoint must fall back through canonical core"
+            Some(Ok(())),
+            "and the recognized receive is SETTLED, never handed to the broad dispatcher"
         );
+        assert_eq!(frame.error_code(), Some(SyscallError::WouldBlock.code()));
     }
 
     #[test]
@@ -25536,10 +25590,39 @@ mod stage36 {
             recv_cap
         });
         let mut frame = recv_frame(recv_cap);
+        // U9-RECV-BLOCK2 §3 re-derivation. This pinned `None` — "an empty endpoint falls back to
+        // the broad dispatcher" — and that is precisely the escape the receive conversion closed.
+        // A RECOGNIZED receive never falls back; the property this case now pins is the one that
+        // replaced it, in two parts:
+        //
+        // 1. THE PRODUCTION PARKING PRECONDITION, from the production owner. The immediate lane's
+        //    authoritative rank-3 take runs and the endpoint is empty, and because NR 2 is built
+        //    by `RecvRequest::from_legacy_ipc_recv` — which hard-codes
+        //    `RecvBlockingPolicy::WaitForever` — that is `EmptyAwaitingPark`, never an answer.
+        //    This is what the production route parks on; the hosted landing below is NOT evidence
+        //    for it, which is why it is asserted separately and first.
+        // 2. The hosted profile compiles no parking owner at all, so the family entry settles with
+        //    the canonical empty encoding rather than handing the trap away. The frame's error
+        //    lane and no-transfer sentinel are checked, because a settlement that answered on the
+        //    syscall channel would leave the transfer-cap lane carrying whatever the previous
+        //    syscall left there.
+        assert!(
+            matches!(
+                kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
+                crate::kernel::syscall::RecvImmediateOutcome::EmptyAwaitingPark
+            ),
+            "a user-ASID receiver's empty take is the PARKING precondition too"
+        );
+        let mut frame = recv_frame(recv_cap);
         let result =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
                 .legacy();
-        assert_eq!(result, None, "empty queue → fallback (None)");
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "and the recognized receive is SETTLED, never handed to the broad dispatcher"
+        );
+        assert_eq!(frame.error_code(), Some(SyscallError::WouldBlock.code()));
     }
 
     // ── C. Live split path: successful user-ASID deliver ─────────────────────
@@ -26332,10 +26415,39 @@ mod stage37 {
             recv_cap
         });
         let mut frame = recv_v2_frame(recv_cap, 0x1000, 64, 0x2000);
+        // U9-RECV-BLOCK2 §3 re-derivation. This pinned `None` — "an empty endpoint falls back to
+        // the broad dispatcher" — and that is precisely the escape the receive conversion closed.
+        // A RECOGNIZED receive never falls back; the property this case now pins is the one that
+        // replaced it, in two parts:
+        //
+        // 1. THE PRODUCTION PARKING PRECONDITION, from the production owner. The immediate lane's
+        //    authoritative rank-3 take runs and the endpoint is empty, and because NR 2 is built
+        //    by `RecvRequest::from_legacy_ipc_recv` — which hard-codes
+        //    `RecvBlockingPolicy::WaitForever` — that is `EmptyAwaitingPark`, never an answer.
+        //    This is what the production route parks on; the hosted landing below is NOT evidence
+        //    for it, which is why it is asserted separately and first.
+        // 2. The hosted profile compiles no parking owner at all, so the family entry settles with
+        //    the canonical empty encoding rather than handing the trap away. The frame's error
+        //    lane and no-transfer sentinel are checked, because a settlement that answered on the
+        //    syscall channel would leave the transfer-cap lane carrying whatever the previous
+        //    syscall left there.
+        assert!(
+            matches!(
+                kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
+                crate::kernel::syscall::RecvImmediateOutcome::EmptyAwaitingPark
+            ),
+            "a recv-v2 receiver's empty take is the PARKING precondition too"
+        );
+        let mut frame = recv_v2_frame(recv_cap, 0x1000, 64, 0x2000);
         let result =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame)
                 .legacy();
-        assert_eq!(result, None, "empty queue → fallback (None)");
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "and the recognized receive is SETTLED, never handed to the broad dispatcher"
+        );
+        assert_eq!(frame.error_code(), Some(SyscallError::WouldBlock.code()));
     }
 
     // ── F. Regression: earlier paths unchanged ────────────────────────────────
@@ -102733,8 +102845,17 @@ mod stage200d0c1_aarch64_exit_prep {
             3,
             "one definition and exactly two callers: the in-lock restore and the off-lock apply"
         );
+        // Scoped to runtime.rs's PRODUCTION half. The claim is that no restore/completion frame
+        // policy was cloned out of the one arch writer into the shared runtime; a case that builds
+        // a fixture frame to drive a production owner is not a second policy, and U9-RECV-BLOCK2
+        // §3's forced interleavings do exactly that.
+        let runtime_production = RUNTIME_SRC
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(RUNTIME_SRC);
         assert!(
-            !RUNTIME_SRC.contains("REG_X18_TLS") && !RUNTIME_SRC.contains("set_user_gpr"),
+            !runtime_production.contains("REG_X18_TLS")
+                && !runtime_production.contains("set_user_gpr"),
             "no restore/completion frame policy was cloned into runtime.rs"
         );
         // Completion encoding still precedes the argument mirror, in the one writer.
@@ -148913,25 +149034,39 @@ mod u9rx3_route {
             after.contains("reason=deadline_reservation"),
             "the deadline-reservation refusal is one of them, and names itself"
         );
-        // U9-RECV-BLOCK1 §3 settled three of the five. What the reservation invariant actually
-        // claims is that every post-reservation EXIT releases it, and that is now stronger than
-        // counting hand-offs, because three of those exits no longer hand off at all:
+        // U9-RECV-BLOCK1 §3 settled three of the five, and U9-RECV-BLOCK2 §1/§2 settled the last
+        // two. What the reservation invariant actually claims is that every post-reservation EXIT
+        // releases it, and that is now enforced by TYPE rather than by counting hand-offs: the
+        // lane answers `BlockingLaneOutcome`, which has no representation for "hand this to the
+        // broad dispatcher" at all.
         //
-        // * the race branch (`QueueNonEmpty` / `WaiterOwnershipBusy`) settles through the
-        //   immediate receive owner or `WouldBlock` after an exact unwind;
-        // * `ReceiverAlreadyWaiting` / `InvalidEndpoint` settle as `WrongObject`;
-        // * the deadline-reservation refusal settles from its own post-state.
+        // So the three pre-mutation hand-offs this used to count are gone as hand-offs, and each
+        // is settled in place:
         //
-        // The three hand-offs that remain are the three PRE-MUTATION ones: the reservation
-        // itself failing (nothing reserved, nothing to clear), a Phase A compare-and-clear that
-        // refused without touching the slot, and a Phase B failure whose exact restore succeeded
-        // — in all three the caller is provably still current, so returning through the entering
-        // frame is licensed and the broad arm runs the syscall from an unchanged state.
+        // * the reservation itself failing and a Phase A compare-and-clear that refused without
+        //   touching the slot are `CannotPark`, whose settlement fails closed through the entering
+        //   frame — licensed because both are decided before anything is mutated, so the caller is
+        //   provably still this CPU's current;
+        // * a Phase B failure goes through the ONE post-clear settlement, which encodes this
+        //   receive's canonical answer into the entering frame and then lets the recovery's
+        //   verified outcome decide whether that frame is RETURNED or handed to the bridge.
         assert_eq!(
             after.matches("D::NotHandled").count(),
-            3,
-            "the only hand-offs at or after the reservation are the three pre-mutation ones: \
-             reservation failed, phase A refused without mutating, and phase B restored exactly"
+            0,
+            "no exit at or after the reservation may hand off: the lane's own type has no such \
+             value, and every post-reservation outcome is settled in place"
+        );
+        assert_eq!(
+            after.matches("BlockingLaneOutcome::CannotPark(").count(),
+            2,
+            "the two PRE-MUTATION refusals — the reservation failing and Phase A refusing without \
+             touching the slot — settle fail-closed through the still-current entering frame"
+        );
+        assert_eq!(
+            after.matches("Settled(recv_settle_after_unwind(").count(),
+            4,
+            "and every POST-CLEAR exit goes through the one settlement, so the receive's answer \
+             cannot be encoded on one path and forgotten on another"
         );
         for reason in [
             "reason=defer_unavailable",
@@ -148940,11 +149075,9 @@ mod u9rx3_route {
         ] {
             assert!(
                 after.contains(reason),
-                "each remaining hand-off must name itself: {reason}"
+                "each remaining exit must name itself: {reason}"
             );
         }
-        // And every exit that is NOT one of those three settles: no post-mutation path may hand
-        // the frame back to a dispatcher that would re-run the syscall against a changed state.
         assert!(
             after.contains("IPC_RECV_BLOCK_SPLIT_SETTLED"),
             "the post-mutation races settle rather than hand off, and say so"
@@ -178616,28 +178749,47 @@ mod u9_recv_block1_closure {
     #[test]
     fn the_family_entry_declines_only_a_non_receive() {
         let entry = code_of(body_of(SPLIT, "fn try_split_ipc_recv_family_into_frame("));
-        // Exactly two hand-offs: the NR filter, and the counted terminal entry.
+        // U9-RECV-BLOCK2 §3 re-derivation: ONE hand-off, not two.
+        //
+        // This pinned TWO — the NR filter's, plus a COUNTED terminal broad entry — and required
+        // the second to be named and counted. That second door is what the receive conversion
+        // removed: a RECOGNIZED receive left the family through the same exit as a syscall that
+        // was never ours, and counting it made the escape visible without making it impossible.
+        // `try_split_recv_recognized` now returns `SplitRecvDisposition`, a type with no
+        // representation for "hand this to the broad dispatcher", so the residual door cannot be
+        // written; the narrow type is the final enforcement and the settlements are the work.
+        //
+        // What is pinned now is the stronger claim: exactly one `NotHandled`, it is the NR
+        // filter's own else-arm, and the counter that used to make the second door respectable is
+        // GONE from the family rather than merely unused.
         assert_eq!(
             entry
                 .matches("SplitDispatchDisposition::NotHandled")
                 .count(),
-            2,
-            "the entry may hand off only for `not a receive` and for the counted residual"
+            1,
+            "the entry may hand off ONLY for `not a receive` — a recognized receive has no exit"
         );
         let nr_filter = entry
             .find("Syscall::IpcRecv | Syscall::IpcRecvTimeout")
             .expect("the NR filter");
         let first = entry
             .find("SplitDispatchDisposition::NotHandled")
-            .expect("the first hand-off");
+            .expect("the hand-off");
         assert!(
             nr_filter < first,
-            "the first hand-off must be the NR filter's own else-arm"
+            "and that one hand-off must be the NR filter's own else-arm"
         );
-        // And the second is counted and named, so a claim about broad entries means what it says.
         assert!(
-            entry.contains("note_recv_broad_entry()") && entry.contains("IPC_RECV_SPLIT_UNROUTED"),
-            "the residual door must be counted and named"
+            !entry.contains("note_recv_broad_entry()")
+                && !entry.contains("IPC_RECV_SPLIT_UNROUTED"),
+            "the residual door is gone, so nothing counts or names one"
+        );
+        // And the recognized body's own type carries no such value either — this is the
+        // enforcement the count above can only observe.
+        let recognized = code_of(body_of(SPLIT, "fn try_split_recv_recognized("));
+        assert!(
+            !recognized.contains("NotHandled"),
+            "a recognized receive may not even name the broad hand-off"
         );
     }
 

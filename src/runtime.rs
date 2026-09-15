@@ -16987,6 +16987,437 @@ mod tests {
         );
     }
 
+    // ─── U9-RECV-BLOCK2 §3 — forced interleavings through the production owners ────────────────
+
+    /// A user-ASID task, registered, bound and given the resumable continuation a spawned task
+    /// has. Every case below needs a real incarnation, because the restore's commit authenticates
+    /// against one.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    fn u9rb2_user_task(kernel: &SharedKernel, tid: u64) -> crate::kernel::vm::Asid {
+        let (asid, _) = kernel
+            .with(|s| {
+                s.register_task(tid).expect("register");
+                s.create_user_address_space()
+            })
+            .expect("asid");
+        kernel.with(|s| {
+            s.bind_task_asid(tid, asid).expect("bind");
+            s.seed_resumable_user_context_for_test(tid);
+        });
+        asid
+    }
+
+    /// **RUNNABLE-TO-RUNNING.** The restore's commit moves the exact incarnation through the
+    /// existing transition owner, and `Restored` is not reported until it has.
+    ///
+    /// The predecessor reported `Restored` for `status == Runnable`, which is a status saying no
+    /// dispatcher has selected this task — while its caller returned to userspace through the
+    /// task's frame. This drives the real recovery over a TCB the rank-2 reversal has just left
+    /// `Runnable` and requires both halves: `Running`, and this CPU's current at the exact
+    /// priority Phase A removed it with.
+    #[test]
+    fn u9rb2_the_restore_commits_runnable_to_running_through_the_transition_owner() {
+        use crate::kernel::recv_waiter_split::{RecvEnteringIncarnation, RecvUnwindOutcome};
+        use crate::kernel::task::TaskStatus;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 7001u64;
+        let asid = u9rb2_user_task(&kernel, tid);
+        kernel.with(|s| {
+            s.set_task_status_for_test(tid, TaskStatus::Runnable);
+            s.enqueue_task(tid).expect("queue it");
+            // Make it this CPU's current, exactly as a dispatch would, so Phase A has a victim.
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
+        });
+        let (entered_asid, priority) = kernel
+            .recv_block_phase_a_split(cpu, tid)
+            .expect("phase A blocks the exact victim");
+        assert_eq!(
+            entered_asid, asid,
+            "the identity is captured before the clear"
+        );
+        // The rank-2 reversal's end state: un-Blocked, i.e. `Runnable`.
+        kernel.with(|s| s.set_task_status_for_test(tid, TaskStatus::Runnable));
+
+        let outcome = kernel.restore_entering_incarnation_exact_split(
+            cpu,
+            RecvEnteringIncarnation {
+                tid,
+                asid,
+                priority,
+            },
+        );
+        assert_eq!(outcome, RecvUnwindOutcome::Restored);
+        assert!(outcome.may_resume_entering_frame());
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Running),
+            "THE REGRESSION: `Restored` must not be reported for a Runnable TCB"
+        );
+        assert_eq!(
+            kernel.current_placement_split_read(cpu),
+            Some((tid, priority)),
+            "and the placement must name the task at the priority it was removed with"
+        );
+    }
+
+    /// **INCARNATION REPLACEMENT ACROSS RECOVERY.** The TID is reused between Phase A and the
+    /// restore; the commit refuses and the provisional placement is RETRACTED.
+    ///
+    /// A precheck followed by a read-back would report the damage. The commit prevents it: the
+    /// rank-1 placement is undone through the same compare-and-clear Phase A used, so the trap
+    /// cannot return into an address space it never entered from.
+    #[test]
+    fn u9rb2_a_replacement_incarnation_refuses_the_commit_and_retracts_the_placement() {
+        use crate::kernel::recv_waiter_split::{RecvEnteringIncarnation, RecvUnwindOutcome};
+        use crate::kernel::task::TaskStatus;
+        use crate::kernel::vm::Asid;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 7002u64;
+        let asid = u9rb2_user_task(&kernel, tid);
+        kernel.with(|s| {
+            s.set_task_status_for_test(tid, TaskStatus::Runnable);
+            s.enqueue_task(tid).expect("queue it");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
+        });
+        let (_, priority) = kernel
+            .recv_block_phase_a_split(cpu, tid)
+            .expect("phase A blocks the exact victim");
+        kernel.with(|s| s.set_task_status_for_test(tid, TaskStatus::Runnable));
+        // THE INTERLEAVING: the TID is recycled to a different address space.
+        kernel.with(|s| {
+            s.with_tcb_mut(tid, |tcb| tcb.asid = Some(Asid(asid.0 + 11)));
+        });
+
+        let outcome = kernel.restore_entering_incarnation_exact_split(
+            cpu,
+            RecvEnteringIncarnation {
+                tid,
+                asid,
+                priority,
+            },
+        );
+        assert_eq!(
+            outcome,
+            RecvUnwindOutcome::IncarnationMoved,
+            "the commit must refuse a replacement, not report it afterwards"
+        );
+        assert_eq!(
+            kernel.current_tid_split_read(cpu),
+            None,
+            "and the provisional placement must be RETRACTED, so the trap cannot return into it"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Runnable),
+            "the replacement's status is untouched — the transition wrote nothing"
+        );
+    }
+
+    /// **QUEUED VERSUS CURRENT MEMBERSHIP.** The two states `task_present_anywhere` collapses are
+    /// answered separately, and only one of them permits writing the saved context.
+    ///
+    /// The membership mirror `contains_or_current` consults tracks the run queues AND the
+    /// dispatched current task, so "waiting for a dispatch" and "executing right now" are the same
+    /// `true`. A settlement that reads that as "queued, so this CPU may idle" is wrong twice over
+    /// for the second: the task is not waiting for anything, and its saved context is live.
+    #[test]
+    fn u9rb2_queued_and_running_elsewhere_are_distinct_outcomes() {
+        use crate::kernel::recv_waiter_split::RecvUnwindOutcome;
+        use crate::kernel::scheduler::TaskPlacement;
+        use crate::kernel::task::TaskStatus;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let running = 7003u64;
+        let waiting = 7004u64;
+        u9rb2_user_task(&kernel, running);
+        u9rb2_user_task(&kernel, waiting);
+        kernel.with(|s| {
+            for t in [running, waiting] {
+                s.set_task_status_for_test(t, TaskStatus::Runnable);
+            }
+            // Clear whatever boot left current, then make `running` this CPU's current and leave
+            // `waiting` in the queue behind it.
+            let _ = s.block_current_on_cpu(cpu);
+            s.enqueue_task(running).expect("queue running");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(running));
+            s.enqueue_task(waiting).expect("queue waiting");
+        });
+
+        let place = |tid: u64| {
+            kernel.with_scheduler_split_mut(|sched| {
+                kernel_ref(&sched.scheduler).placement_of(crate::kernel::ipc::ThreadId(tid))
+            })
+        };
+        assert!(
+            matches!(place(running), TaskPlacement::Current(_)),
+            "a task this CPU is RUNNING reads as Current: {:?}",
+            place(running)
+        );
+        assert!(
+            matches!(place(waiting), TaskPlacement::Queued(_)),
+            "a task waiting for a dispatch reads as Queued: {:?}",
+            place(waiting)
+        );
+        // THE AMBIGUITY the predecessor read: one boolean, both states.
+        assert!(
+            kernel.receiver_has_scheduler_membership_split_read(running)
+                && kernel.receiver_has_scheduler_membership_split_read(waiting),
+            "`task_present_anywhere` says `true` for BOTH, which is why it is not the predicate"
+        );
+
+        // And the outcomes built from those placements carry different permissions.
+        assert!(
+            !RecvUnwindOutcome::RunningElsewhere(cpu).may_capture_continuation(),
+            "a running winner's saved context may never be written"
+        );
+        assert!(
+            !RecvUnwindOutcome::QueuedRunnable(cpu).may_capture_continuation(),
+            "nor may an already-dispatchable task's, which a dispatch can take at any moment"
+        );
+        assert!(
+            RecvUnwindOutcome::Unpublished.may_capture_continuation(),
+            "only a task nothing can dispatch may have its continuation written"
+        );
+        assert!(
+            RecvUnwindOutcome::RunningElsewhere(cpu).dispatcher_already_owns_task()
+                && RecvUnwindOutcome::QueuedRunnable(cpu).dispatcher_already_owns_task()
+                && !RecvUnwindOutcome::Unpublished.dispatcher_already_owns_task(),
+            "and only the first two license this CPU to idle"
+        );
+        assert!(
+            !RecvUnwindOutcome::IncarnationMoved.dispatcher_already_owns_task()
+                && !RecvUnwindOutcome::IncarnationMoved.may_capture_continuation(),
+            "a moved incarnation claims nothing and may not be written to"
+        );
+    }
+
+    /// **FAILED RECOVERY.** Both placement recoveries refuse and nothing publishes the task, so
+    /// the outcome is `Unpublished` — which claims nothing and licenses no idle.
+    #[test]
+    fn u9rb2_a_failed_recovery_claims_nothing_and_licenses_no_idle() {
+        use crate::kernel::recv_waiter_split::{RecvEnteringIncarnation, RecvUnwindOutcome};
+        use crate::kernel::task::TaskStatus;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let victim = 7005u64;
+        let other = 7006u64;
+        let victim_asid = u9rb2_user_task(&kernel, victim);
+        u9rb2_user_task(&kernel, other);
+        kernel.with(|s| {
+            for t in [victim, other] {
+                s.set_task_status_for_test(t, TaskStatus::Runnable);
+            }
+            s.enqueue_task(victim).expect("queue victim");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(victim));
+        });
+        let (_, priority) = kernel
+            .recv_block_phase_a_split(cpu, victim)
+            .expect("phase A blocks the exact victim");
+        kernel.with(|s| s.set_task_status_for_test(victim, TaskStatus::Runnable));
+        // Somebody else is current and the victim is in no run queue: the exact restore refuses on
+        // an occupied slot and the prefer primitive has nothing to pull back.
+        kernel.with(|s| {
+            s.enqueue_task(other).expect("queue other");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(other));
+        });
+
+        let outcome = kernel.restore_entering_incarnation_exact_split(
+            cpu,
+            RecvEnteringIncarnation {
+                tid: victim,
+                asid: victim_asid,
+                priority,
+            },
+        );
+        assert_eq!(outcome, RecvUnwindOutcome::Unpublished);
+        assert!(
+            !outcome.dispatcher_already_owns_task(),
+            "nothing owns it, so idling on this outcome alone would strand it"
+        );
+        assert!(
+            !kernel.receiver_has_scheduler_membership_split_read(victim),
+            "and the recovery must not have published it — the capture is owed first"
+        );
+        assert_eq!(
+            kernel.current_tid_split_read(cpu),
+            Some(other),
+            "the other task's placement was NOT overwritten"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(other)),
+            Some(TaskStatus::Runnable),
+            "nor its status — the refused recovery wrote nothing to the winner"
+        );
+    }
+
+    /// **SUBSEQUENT RESUMPTION AFTER THE BRIDGE SETTLEMENT.** The bridge's two steps, in order,
+    /// over the real owners: the completed continuation is committed into the exact incarnation
+    /// and only then is the task published — and a later dispatch resumes it from exactly that.
+    ///
+    /// This is what makes the settlement a COMPLETION rather than a re-entry: the frame carries
+    /// the receive's canonical answer when it is captured, so the resumed task observes the
+    /// answer rather than re-executing its syscall.
+    #[test]
+    fn u9rb2_the_settled_task_resumes_from_the_completed_continuation() {
+        use crate::kernel::task::TaskStatus;
+        use crate::kernel::trapframe::TrapFrame;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 7007u64;
+        let asid = u9rb2_user_task(&kernel, tid);
+        kernel.with(|s| {
+            s.set_task_status_for_test(tid, TaskStatus::Runnable);
+            s.enqueue_task(tid).expect("queue it");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
+        });
+        let (_, _priority) = kernel
+            .recv_block_phase_a_split(cpu, tid)
+            .expect("phase A blocks the exact victim");
+        kernel.with(|s| s.set_task_status_for_test(tid, TaskStatus::Runnable));
+
+        // The entering frame, carrying this receive's ANSWER — what
+        // `recv_settle_after_unwind` encodes before it reports.
+        let mut frame = TrapFrame::new(crate::kernel::syscall::SYSCALL_IPC_RECV_NR, [0; 6]);
+        frame.set_saved_pc(0x41_0000);
+        frame.set_saved_sp(0x7fee_0000);
+        for i in 0..8 {
+            frame.set_user_gpr(i, 0xD000 + i);
+        }
+        frame.set_err(crate::kernel::syscall::SyscallError::WouldBlock.code());
+        let expected = frame.capture_user_context();
+
+        let identity = SplitReturnIdentity { tid, asid };
+        // Step 1 — the capture, into the EXACT incarnation.
+        assert!(
+            kernel.split_return_commit_context_split(identity, expected),
+            "the completed continuation commits into the entering incarnation"
+        );
+        assert!(
+            !kernel.receiver_has_scheduler_membership_split_read(tid),
+            "and nothing can dispatch it while that write is in flight"
+        );
+        // Step 2 — publication, strictly afterwards.
+        assert!(kernel.enqueue_task_split(cpu, tid).is_ok());
+        assert!(kernel.receiver_has_scheduler_membership_split_read(tid));
+
+        // A later dispatch resumes it from exactly that continuation.
+        let resumed = kernel.with(|s| s.dispatch_next_on_cpu(cpu));
+        assert_eq!(resumed, Some(tid), "the published task is dispatched again");
+        let saved = kernel
+            .with(|s| s.thread_user_context(tid))
+            .expect("its saved continuation");
+        assert_eq!(
+            saved.instruction_ptr, expected.instruction_ptr,
+            "the PC is the one the settlement preserved — not re-entered, not advanced again"
+        );
+        assert_eq!(saved.stack_ptr, expected.stack_ptr, "and the stack pointer");
+        assert_eq!(
+            saved.user_gprs, expected.user_gprs,
+            "and the whole register file, so the answer the settlement encoded survives"
+        );
+        // A REPLACEMENT incarnation is never written into.
+        let stale = SplitReturnIdentity {
+            tid,
+            asid: crate::kernel::vm::Asid(asid.0 + 5),
+        };
+        assert!(
+            !kernel.split_return_commit_context_split(
+                stale,
+                TrapFrame::new(0, [0; 6]).capture_user_context()
+            ),
+            "a stale identity writes nothing — a replacement's context is never overwritten"
+        );
+        assert_eq!(
+            kernel
+                .with(|s| s.thread_user_context(tid))
+                .expect("still there")
+                .instruction_ptr,
+            expected.instruction_ptr,
+            "and the preserved continuation is intact"
+        );
+    }
+
+    /// **COMPETING TIMEOUT/DELIVERY.** A remote deadline scan wakes and enqueues the exact victim
+    /// between Phase A and the restore. The recovery takes it back through the existing
+    /// preempt-and-prefer primitive and commits it Running — and the competitor's own record is
+    /// not disturbed.
+    ///
+    /// This is the one genuinely reachable placement refusal: Phase B stages
+    /// `ipc_timeout_deadline`, so on a multi-CPU boot the scan can reach this task while this trap
+    /// still believes it owns the block. `restore_exact_current_on` refuses it (`contains_tid`),
+    /// which is exactly what the second recovery is for.
+    #[test]
+    fn u9rb2_a_competing_timeout_wake_is_recovered_exactly_and_committed_running() {
+        use crate::kernel::recv_waiter_split::{RecvEnteringIncarnation, RecvUnwindOutcome};
+        use crate::kernel::task::TaskStatus;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 7008u64;
+        let asid = u9rb2_user_task(&kernel, tid);
+        kernel.with(|s| {
+            s.set_task_status_for_test(tid, TaskStatus::Runnable);
+            let _ = s.block_current_on_cpu(cpu);
+            s.enqueue_task(tid).expect("queue it");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
+        });
+        let (_, priority) = kernel
+            .recv_block_phase_a_split(cpu, tid)
+            .expect("phase A blocks the exact victim");
+        // THE COMPETITOR: a deadline scan wakes the task and puts it on a run queue, and records
+        // that the timeout fired — state this transaction must not destroy.
+        kernel.with(|s| {
+            s.set_task_status_for_test(tid, TaskStatus::Runnable);
+            s.with_tcb_mut(tid, |tcb| tcb.ipc_timeout_fired = true);
+            s.enqueue_task(tid).expect("the scan enqueues it");
+        });
+
+        let outcome = kernel.restore_entering_incarnation_exact_split(
+            cpu,
+            RecvEnteringIncarnation {
+                tid,
+                asid,
+                priority,
+            },
+        );
+        assert_eq!(
+            outcome,
+            RecvUnwindOutcome::Restored,
+            "the queued victim is taken back out by the prefer primitive, not abandoned"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Running),
+            "and committed Running, so the frame it returns through is licensed"
+        );
+        assert_eq!(
+            kernel.current_placement_split_read(cpu),
+            Some((tid, priority)),
+            "at the exact priority Phase A removed it with"
+        );
+        assert_eq!(
+            kernel.with(|s| s.with_tcb_mut(tid, |tcb| tcb.ipc_timeout_fired)),
+            Some(true),
+            "the competitor's own record is untouched — this recovery undoes only its own block"
+        );
+        // EXACTLY ONE placement: current, and no longer a queue entry as well.
+        assert!(
+            kernel.with_scheduler_split_mut(|sched| {
+                kernel_ref(&sched.scheduler)
+                    .peek_next_runnable_on(cpu)
+                    .is_none()
+            }),
+            "the prefer primitive must have taken it OUT of the run queue, not duplicated it"
+        );
+    }
+
     #[test]
     fn topology_count_split_reads_match_scheduler_state() {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
