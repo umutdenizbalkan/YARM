@@ -63374,6 +63374,552 @@ mod stage191d_futex_wait_block_publish {
             "U9-REAP1 §4: ReapFaultedTask is split-eligible"
         );
     }
+
+    // ─── U9-FUTEX-WAIT-FINAL §4 — validation precedence, differentially ────────────────────────
+
+    /// The user virtual address `futex_caller` makes readable. Every §4 differential that needs a
+    /// VALID futex word uses this one, so a rejection in those cases can only come from the
+    /// argument under test and never from an unmapped page.
+    const FUTEX_WORD: usize = 0x4000;
+
+    /// A user task bound to a real address space, current on `cpu`, with a readable futex word —
+    /// the state a live NR 9 caller is in.
+    ///
+    /// The mapping is the production one (`map_user_page_with_caps` over an anonymous memory
+    /// object), not a hosted shortcut, because the readability probe under test is exactly
+    /// `copy_from_user`'s.
+    fn futex_caller(kernel: &SharedKernel, tid: u64, cpu: CpuId) -> crate::kernel::vm::Asid {
+        let asid = kernel.with(|s| {
+            s.register_task_with_class(tid, TaskClass::App)
+                .expect("reg");
+            let (asid, aspace_cap) = s.create_user_address_space().expect("aspace");
+            s.bind_task_asid(tid, asid).expect("bind");
+            let (_mem_id, mem_cap) = s.alloc_anonymous_memory_object().expect("mem");
+            s.map_user_page_with_caps(
+                aspace_cap,
+                mem_cap,
+                VirtAddr(FUTEX_WORD as u64),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map futex page");
+            s.enqueue_on_cpu(cpu, tid).expect("enqueue");
+            s.set_current_cpu(cpu).expect("cpu");
+            s.dispatch_next_task().expect("dispatch");
+            s.write_user_memory(tid, FUTEX_WORD, &9u32.to_ne_bytes())
+                .expect("init futex word");
+            asid
+        });
+        assert_eq!(kernel.with(|s| s.current_tid_on_cpu(cpu)), Some(tid));
+        asid
+    }
+
+    /// **THE VALIDATION PRECEDENCE, against the canonical owner.**
+    ///
+    /// `validate_current_user_futex_word` checks the ADDRESS before it resolves the caller, so a
+    /// null word is `WrongObject` and a kernel-range word is `UserMemoryFault` regardless of who
+    /// is running. The split route used to read the current task first and fall back on its
+    /// absence, which produced the right errors only because the broad handler then re-derived the
+    /// whole sequence. With the fall-back gone the order has to be right in the route, and this
+    /// pins it against the owner that defines it.
+    #[test]
+    fn u9fw_the_range_policy_is_one_owner_with_the_canonical_answers() {
+        use crate::kernel::boot::KernelError;
+        use crate::kernel::syscall::sched::futex_word_range_check;
+        assert_eq!(futex_word_range_check(0), Err(KernelError::WrongObject));
+        assert_eq!(
+            futex_word_range_check(crate::kernel::vm::KERNEL_SPACE_BASE as usize),
+            Err(KernelError::UserMemoryFault),
+            "a word AT the kernel boundary is out of bounds"
+        );
+        assert_eq!(
+            futex_word_range_check(crate::kernel::vm::KERNEL_SPACE_BASE as usize - 3),
+            Err(KernelError::UserMemoryFault),
+            "and so is one whose LAST byte reaches it"
+        );
+        assert_eq!(
+            futex_word_range_check(usize::MAX),
+            Err(KernelError::UserMemoryFault),
+            "an address whose last byte overflows is the same fault, never a panic"
+        );
+        assert_eq!(futex_word_range_check(0x4000), Ok(()));
+    }
+
+    /// **The typed split adapter answers what the broad validator answers, address by address.**
+    ///
+    /// The differential that matters: for every address the canonical owner rejects, the split
+    /// adapter must produce the SAME `KernelError` — not `None`, and not a different one.
+    #[test]
+    fn u9fw_the_split_adapter_matches_the_canonical_validator() {
+        use crate::kernel::boot::KernelError;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let tid = 30001u64;
+        futex_caller(&kernel, tid, CpuId(0));
+
+        for (addr, expected) in [
+            (0usize, Err(KernelError::WrongObject)),
+            (
+                crate::kernel::vm::KERNEL_SPACE_BASE as usize,
+                Err(KernelError::UserMemoryFault),
+            ),
+            (usize::MAX, Err(KernelError::UserMemoryFault)),
+        ] {
+            // The BROAD owner's answer, through the real handler path.
+            let broad = kernel.with(|s| s.futex_wait_current(addr, 7, 7).map(|_| ()));
+            assert_eq!(broad, expected, "canonical answer for addr={addr:#x}");
+            // The SPLIT adapter's answer, for the same address.
+            let split = kernel
+                .futex_wait_decide_split_read(tid, addr, 7, 7)
+                .map(|_| ());
+            assert_eq!(
+                split, expected,
+                "the split adapter must answer the SAME canonical error for addr={addr:#x}"
+            );
+        }
+    }
+
+    /// **The ABI is the caller's comparison, and the decision is typed.**
+    ///
+    /// YARM's NR 9 takes `expected` and `observed` as arguments; the kernel compares those two and
+    /// reads the word only to prove it is readable. Equal parks, unequal proceeds — and no other
+    /// flag, timeout or bitset participates.
+    #[test]
+    fn u9fw_the_decision_is_the_caller_provided_comparison() {
+        use crate::kernel::syscall::sched::FutexWaitDecision;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let tid = 30002u64;
+        futex_caller(&kernel, tid, CpuId(0));
+        // A word the caller can read. Its CONTENTS are irrelevant to the decision.
+        let addr = FUTEX_WORD;
+        assert_eq!(
+            kernel.futex_wait_decide_split_read(tid, addr, 9, 9),
+            Ok(FutexWaitDecision::Park),
+            "equal expected/observed parks"
+        );
+        assert_eq!(
+            kernel.futex_wait_decide_split_read(tid, addr, 9, 10),
+            Ok(FutexWaitDecision::Proceed),
+            "unequal expected/observed proceeds"
+        );
+        // And the broad owner agrees, for the same two argument pairs.
+        assert_eq!(
+            kernel.with(|s| s.futex_wait_current(addr, 9, 10)),
+            Ok(false)
+        );
+    }
+
+    // ─── U9-FUTEX-WAIT-FINAL §4 — forced interleavings through the production owners ───────────
+
+    /// **PUBLICATION VERSUS WAKE.** A waker lands between the rank-2 registration and the rank-1
+    /// compare-and-clear. The caller must not be parked, must not be lost, and must end up
+    /// running again on this CPU.
+    ///
+    /// The interleaving is forced by driving the production owners in the order the two
+    /// transactions actually interleave in: this route registers, `futex_wake_inner` finds the
+    /// registration and makes it `Runnable` (its enqueue refused `AlreadyQueued`, because the
+    /// caller is still `current`), and only then does the clear run. The predecessor's
+    /// unconditional clear left exactly that task `Runnable`, current on no CPU and queued on
+    /// none.
+    #[test]
+    fn u9fw_a_wake_during_publication_never_loses_the_caller() {
+        use crate::kernel::syscall::sched::FutexParkOutcome;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 30003u64;
+        let asid = futex_caller(&kernel, tid, cpu);
+        let addr = 0x5100usize;
+
+        // Register, exactly as the park transaction's first step does.
+        kernel.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+            });
+        });
+        // THE WAKER, through the production owner, while the caller is still `current`.
+        let woke = kernel.with(|s| s.futex_wake_on_exit(addr));
+        assert!(
+            woke.is_err() || woke == Ok(1),
+            "the production waker either wakes it or reports the enqueue refusal: {woke:?}"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Runnable),
+            "the waker moved it off the futex-waiter state, which is what the read-back detects"
+        );
+
+        // Now the park transaction runs its remaining steps over that state. Re-register first so
+        // the transaction starts where it really starts.
+        kernel.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                tcb.status = TaskStatus::Running;
+            });
+        });
+        let outcome = kernel.futex_wait_park_exact_split(cpu, tid, asid, addr);
+        assert!(
+            matches!(outcome, FutexParkOutcome::Parked { .. }),
+            "with no waker in the window the transaction parks: {outcome:?}"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(cpu)),
+            None,
+            "and the caller is removed from THIS CPU's current slot"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                addr as u64
+            )))),
+            "and is registered as a futex waiter, so a later wake finds it"
+        );
+        // NEVER lost: a wake after the park reaches it through the production owner.
+        assert_eq!(kernel.with(|s| s.futex_wake_on_exit(addr)), Ok(1));
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Runnable)
+        );
+    }
+
+    /// **INCARNATION REPLACEMENT.** The TID names a different address space by the time the park
+    /// transaction runs: nothing is written and the canonical `TaskMissing` population is
+    /// reported.
+    #[test]
+    fn u9fw_a_replacement_incarnation_is_refused_with_nothing_written() {
+        use crate::kernel::syscall::sched::FutexParkOutcome;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 30004u64;
+        let asid = futex_caller(&kernel, tid, cpu);
+        let addr = 0x5200usize;
+
+        let outcome = kernel.futex_wait_park_exact_split(
+            cpu,
+            tid,
+            crate::kernel::vm::Asid(asid.0 + 13),
+            addr,
+        );
+        assert_eq!(
+            outcome,
+            FutexParkOutcome::IncarnationMoved,
+            "a TID whose address space is not the entering one may not be parked"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(cpu)),
+            Some(tid),
+            "and NOTHING is written: the caller keeps its placement"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Running),
+            "and its status"
+        );
+    }
+
+    /// **THE VICTIM CHANGED.** The rank-1 compare-and-clear refuses because the slot names
+    /// somebody else, and the registration is UNDONE exactly — so no task is left parked on a
+    /// transaction that could not complete, and the other task's placement is untouched.
+    #[test]
+    fn u9fw_a_changed_victim_undoes_the_registration_exactly() {
+        use crate::kernel::syscall::sched::FutexParkOutcome;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let caller = 30005u64;
+        let other = 30006u64;
+        let asid = futex_caller(&kernel, caller, cpu);
+        let addr = 0x5300usize;
+        // Somebody else takes this CPU's current slot.
+        kernel.with(|s| {
+            s.register_task_with_class(other, TaskClass::App)
+                .expect("reg");
+            let _ = s.block_current_on_cpu(cpu);
+            s.enqueue_on_cpu(cpu, other).expect("enqueue");
+            s.dispatch_next_task().expect("dispatch");
+            assert_eq!(s.current_tid_on_cpu(cpu), Some(other));
+        });
+
+        let outcome = kernel.futex_wait_park_exact_split(cpu, caller, asid, addr);
+        assert_eq!(outcome, FutexParkOutcome::VictimChanged);
+        assert_eq!(
+            kernel.with(|s| s.task_status(caller)),
+            Some(TaskStatus::Running),
+            "THE UNDO: the caller is not left parked on a transaction that could not complete"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(cpu)),
+            Some(other),
+            "and the other task's placement is untouched — the clear compares before it clears"
+        );
+    }
+
+    /// **EXACT SUBSEQUENT RESUMPTION.** A parked caller is woken by the production wake owner and
+    /// resumes from exactly the continuation the route committed — including the `set_ok(1, 0, 0)`
+    /// the syscall answers with.
+    #[test]
+    fn u9fw_a_parked_caller_resumes_from_its_committed_continuation() {
+        use crate::kernel::syscall::sched::FutexParkOutcome;
+        use crate::kernel::trapframe::TrapFrame;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 30007u64;
+        let asid = futex_caller(&kernel, tid, cpu);
+        let addr = 0x5400usize;
+
+        // The entering frame, carrying NR 9's own answer — `set_ok(usize::from(blocked), 0, 0)`,
+        // written before the switch so the caller observes it when it is later resumed.
+        let mut frame = TrapFrame::new(crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR, [0; 6]);
+        frame.set_saved_pc(0x42_0000);
+        frame.set_saved_sp(0x7fdd_0000);
+        for i in 0..8 {
+            frame.set_user_gpr(i, 0xE000 + i);
+        }
+        frame.set_ok(1, 0, 0);
+        let committed = frame.capture_user_context();
+        assert!(
+            kernel.split_return_commit_context_split(
+                crate::runtime::SplitReturnIdentity { tid, asid },
+                committed
+            ),
+            "the continuation commits into the entering incarnation"
+        );
+
+        assert!(matches!(
+            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr),
+            FutexParkOutcome::Parked { .. }
+        ));
+        // The production wake owner finds it and makes it runnable + queued.
+        assert_eq!(kernel.with(|s| s.futex_wake_on_exit(addr)), Ok(1));
+        assert!(kernel.receiver_has_scheduler_membership_split_read(tid));
+
+        // A later dispatch resumes it, from exactly what was committed.
+        assert_eq!(kernel.with(|s| s.dispatch_next_on_cpu(cpu)), Some(tid));
+        let saved = kernel
+            .with(|s| s.thread_user_context(tid))
+            .expect("its saved continuation");
+        assert_eq!(saved.instruction_ptr, committed.instruction_ptr);
+        assert_eq!(saved.stack_ptr, committed.stack_ptr);
+        assert_eq!(
+            saved.user_gprs, committed.user_gprs,
+            "the whole register file, so NR 9's own result survives the park"
+        );
+    }
+
+    /// **DEFERRAL REFUSAL.** The route reserves the per-CPU FutexWait deferral BEFORE the
+    /// irreversible publication, and a refused reservation must leave the caller exactly as the
+    /// trap found it — current, `Running`, and answering through its own frame.
+    ///
+    /// Both refusal reasons are the same production owner seen at two moments:
+    /// `futex_wait_dispatch_is_deferred` at step (6) and `futex_wait_dispatch_try_defer`'s
+    /// compare-exchange at step (7). This drives that owner for real — occupying the slot the way
+    /// a deferral actually occupies it — and then checks the two things the route depends on: the
+    /// refusal is genuine, and it is decided while the caller is still untouched.
+    #[test]
+    fn u9fw_a_refused_deferral_is_decided_before_anything_is_published() {
+        use crate::kernel::boot::{
+            futex_wait_dispatch_clear, futex_wait_dispatch_is_deferred,
+            futex_wait_dispatch_outgoing, futex_wait_dispatch_try_defer,
+        };
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 30008u64;
+        futex_caller(&kernel, tid, cpu);
+        futex_wait_dispatch_clear(cpu.0 as usize);
+
+        // An earlier deferral occupies this CPU's slot.
+        assert!(
+            futex_wait_dispatch_try_defer(cpu.0 as usize, 99999),
+            "fixture: the slot starts free"
+        );
+        assert!(futex_wait_dispatch_is_deferred(cpu.0 as usize));
+        assert_eq!(futex_wait_dispatch_outgoing(cpu.0 as usize), Some(99999));
+
+        // Step (6)'s question, and step (7)'s reservation, both refuse — and the reservation's
+        // refusal is a compare-exchange failure, so it cannot half-succeed.
+        assert!(
+            futex_wait_dispatch_is_deferred(cpu.0 as usize),
+            "already_deferred: the route declines before admission"
+        );
+        assert!(
+            !futex_wait_dispatch_try_defer(cpu.0 as usize, tid),
+            "defer_unavailable: the reservation is refused"
+        );
+        assert_eq!(
+            futex_wait_dispatch_outgoing(cpu.0 as usize),
+            Some(99999),
+            "and the refused reservation did not overwrite the standing one"
+        );
+
+        // NOTHING about the caller moved: both refusals are decided before the park transaction
+        // is reached, so the entering frame is still this task's to answer through.
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(cpu)),
+            Some(tid),
+            "the caller is still this CPU's current task"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Running),
+            "and still Running — nothing was published"
+        );
+
+        // The route's ORDER is what makes the above the whole story: both refusals precede the
+        // park, and both settle rather than hand the trap to the broad dispatcher.
+        let body = SPLIT_SRC
+            .split("fn try_split_futex_wait_recognized(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the recognized NR 9 body");
+        let already = body
+            .find("settle_futex_cannot_park(cpu, tid, \"already_deferred\")")
+            .expect("the already-deferred settlement");
+        let unavailable = body
+            .find("settle_futex_cannot_park(cpu, tid, \"defer_unavailable\")")
+            .expect("the defer-unavailable settlement");
+        let park = body
+            .find("futex_wait_park_exact_split(cpu, tid, asid, addr)")
+            .expect("the park transaction");
+        assert!(
+            already < unavailable && unavailable < park,
+            "the deferral is reserved BEFORE the irreversible publication"
+        );
+        assert!(
+            !body.contains("NotHandled"),
+            "a recognized NR 9 never hands the trap to the broad dispatcher"
+        );
+
+        futex_wait_dispatch_clear(cpu.0 as usize);
+        assert!(!futex_wait_dispatch_is_deferred(cpu.0 as usize));
+    }
+
+    /// **NO ACCEPTABLE INCOMING TASK.** `IncomingUnavailable` is the one admission refusal the
+    /// route tolerates, and it must: a FutexWait caller parks because its own futex word says so,
+    /// not because somebody else is ready to run. With nothing else runnable the CPU has no
+    /// successor — and the correct outcome is a parked caller and an IDLE CPU, never a caller left
+    /// running because the queue was empty, and never a caller parked onto a CPU that then resumes
+    /// it.
+    #[test]
+    fn u9fw_no_acceptable_incoming_task_still_parks_and_idles_this_cpu() {
+        use crate::kernel::boot::{QueueAdvanceApply, QueueAdvanceRefusal};
+        use crate::kernel::syscall::sched::FutexParkOutcome;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 30009u64;
+        let asid = futex_caller(&kernel, tid, cpu);
+        let addr = 0x5500usize;
+
+        // The trap-path window is open, exactly as `TrapPathWindow::establish` leaves it for a live
+        // NR 9 — without it the admission's answer would be `NoTrapDrainer` and the case under test
+        // would never be reached.
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu.0 as usize]
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+
+        // FIRST SHAPE: the queue is EMPTY, so admission has no candidate at all. That is `Ok(None)`
+        // — an admitted advance that owes the drain no particular successor — not a refusal.
+        assert_eq!(
+            kernel.with(|s| s.runnable_count_on_cpu(cpu)),
+            0,
+            "fixture: no successor exists"
+        );
+        assert_eq!(
+            kernel.queue_advance_admit_with_authority_split(
+                crate::runtime::DispatchAuthority::live_for_test(cpu),
+                QueueAdvanceApply::ExactTokenResume,
+            ),
+            Ok(None),
+            "an empty queue admits with no candidate"
+        );
+
+        // SECOND SHAPE, and the one the route's carve-out exists for: there IS a candidate, and
+        // `classify_incoming_resume_convention` refuses it — a registered task that owns no
+        // returnable continuation. THAT is `IncomingUnavailable`: "no acceptable incoming task".
+        // It runs on its own kernel so the park below stays the no-successor case.
+        {
+            let other = SharedKernel::new(Bootstrap::init().expect("init"));
+            let waiter = futex_caller(&other, 30010, cpu);
+            let _ = waiter;
+            other.with(|s| {
+                s.register_task_with_class(30011, TaskClass::App)
+                    .expect("reg unresumable");
+                s.enqueue_on_cpu(cpu, 30011).expect("enqueue unresumable");
+            });
+            assert_eq!(
+                other.queue_advance_admit_with_authority_split(
+                    crate::runtime::DispatchAuthority::live_for_test(cpu),
+                    QueueAdvanceApply::ExactTokenResume,
+                ),
+                Err(QueueAdvanceRefusal::IncomingUnavailable),
+                "a candidate with no acceptable resume convention is the tolerated refusal, not \
+                 an invariant failure"
+            );
+        }
+
+        // And the park still happens, on the caller's own decision.
+        assert!(matches!(
+            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr),
+            FutexParkOutcome::Parked { .. }
+        ));
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                addr as u64
+            )))),
+            "the caller parked even though nothing could take the CPU"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(cpu)),
+            None,
+            "and the CPU's current slot is clear"
+        );
+
+        // The commit the drain owes settles as an IDLE landing, not as a resumption of the task
+        // that just parked.
+        let outcome = kernel.queue_advance_commit_split(
+            crate::runtime::DispatchAuthority::live_for_test(cpu),
+            tid,
+            None,
+        );
+        assert_eq!(
+            outcome,
+            crate::kernel::boot::QueueAdvanceOutcome::TerminalIdle,
+            "no successor means this CPU idles: {outcome:?}"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(cpu)),
+            None,
+            "the parked caller is NOT put back as current by the idle landing"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                addr as u64
+            )))),
+            "and it is still parked, so a later wake is the only thing that can resume it"
+        );
+
+        // The tolerance is EXACT: only `IncomingUnavailable` is let through; every other refusal
+        // is an invariant failure.
+        let body = SPLIT_SRC
+            .split("fn try_split_futex_wait_recognized(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the recognized NR 9 body");
+        assert!(
+            body.contains("QueueAdvanceRefusal::IncomingUnavailable"),
+            "the one tolerated refusal is named, not matched by a wildcard"
+        );
+        assert!(
+            !body.contains("QueueAdvanceRefusal::_"),
+            "and no wildcard admits the rest"
+        );
+
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu.0 as usize]
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 // Stage 191E — NEXT SAFE GLOBAL-LOCK RETIREMENT SLICE. Inventory finding: NO safe live

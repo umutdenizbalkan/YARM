@@ -15144,21 +15144,6 @@ impl SharedKernel {
         Ok(())
     }
 
-    /// Stage 191D (FUTEXWAIT BLOCK-PUBLISH SEAM), Phase A: validate the futex word and
-    /// decide whether the caller `tid` WOULD block, OFF the broad global lock. Mirrors the
-    /// read/validate portion of `KernelState::futex_wait_current` /
-    /// `validate_current_user_futex_word` EXACTLY:
-    /// * `addr == 0` → `None` (legacy `WrongObject`).
-    /// * `addr + 3 >= KERNEL_SPACE_BASE` → `None` (legacy `UserMemoryFault`).
-    /// * 4-byte user read fails → `None` (legacy `UserMemoryFault`).
-    ///
-    /// On a validated address returns `Some(would_block)` where `would_block ==
-    /// (expected == observed)` — identical to `futex_wait_current`'s `expected != observed
-    /// → Ok(false)` decision (the futex value comparison uses the caller-provided `expected`
-    /// / `observed` syscall args; the memory read only proves the address is user-readable).
-    /// Read-only: no TCB / scheduler / IPC / cap / VM structural mutation. `None` lets a
-    /// caller fall back to the global-lock handler for the canonical error (never masked).
-    #[cfg(not(feature = "hosted-dev"))]
     /// U9-FUTEX-WAIT-FINAL §2 — the SPLIT acquisition adapter over the one futex-word policy,
     /// answering the canonical error rather than erasing it.
     ///
@@ -15182,6 +15167,7 @@ impl SharedKernel {
     ///
     /// The `expected`/`observed` comparison happens last and is the CALLER'S: YARM's NR 9 takes
     /// both values as arguments and the kernel compares them. No word is read to decide it.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub fn futex_wait_decide_split_read(
         &self,
         tid: u64,
@@ -15197,12 +15183,20 @@ impl SharedKernel {
         // task. `task_asid_for_tid_split_read` answers `0` for that case, which is the reserved
         // no-address-space value, and the probe below refuses it exactly as the broad copy does.
         let asid = self.task_asid_for_tid_split_read(tid);
-        if self
-            .copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())
-            .is_none()
-        {
+        if asid == 0 {
             return Err(crate::kernel::boot::KernelError::UserMemoryFault);
         }
+        // The readability probe is the canonical validator's own leaf: `copy_from_user` reads the
+        // 4 bytes and its error IS the answer. `copy_from_user_split` is that function's documented
+        // rank-5/6 mirror — same page walk, same user+read question, same errors — so the two
+        // adapters differ only in acquisition. (The DebugLog-shaped `copy_from_user_asid_split_read`
+        // is the wrong owner here: it answers `Option`, which is the erasure §2 is removing, and it
+        // carries a 192-byte clamp that has nothing to do with a futex word.)
+        self.copy_from_user_split(
+            crate::kernel::vm::Asid(asid as u16),
+            crate::kernel::vm::VirtAddr(addr as u64),
+            core::mem::size_of::<u32>(),
+        )?;
         Ok(if expected == observed {
             FutexWaitDecision::Park
         } else {
