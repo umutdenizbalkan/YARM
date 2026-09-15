@@ -269,4 +269,11 @@ if (( fail )); then
   exit 1
 fi
 note "NR 30 received+mapped and NR 4 released two disposable grants, both shapes, split route only"
-echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH grants=2 shapes=registered_range,explicit_range releases=2 route=split result=ok"
+# The seal names WHICH profile passed. It used to hardcode the NR 30 shape names on both runs,
+# so an ordinary-routes pass was indistinguishable from an NR 30 pass in the transcript — and the
+# two are complementary cells of one witness, not interchangeable.
+if (( ORDINARY_ROUTES )); then
+  echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=ordinary_routes grants=2 shapes=nr2,nr5_timed releases=2 route=split unrouted=0 result=ok"
+else
+  echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=nr30 grants=2 shapes=registered_range,explicit_range releases=2 route=split result=ok"
+fi
