@@ -18521,4 +18521,42 @@ proven by.
 * The legacy NR 2 blocking population still has no live producer.
 * The multi-page shared-region mapping defect, reproduced rather than repaired.
 * Init's mapping-run pressure — now with a second witness paying the feature-gate tax for it.
-* Next: non-syscall traps, then deletion of the terminal acquisitions.
+
+### Next: the source-derived non-syscall target
+
+Both remaining `with_cpu` acquisitions ARE the canonical broad Phase-2 trap dispatch, so the
+question is which trap classes still arrive there. `TrapEvent` has four non-syscall variants, and
+only one of them has a split route at all:
+
+* **`TimerInterrupt`** — has a route (`try_split_timer_into_frame`) with four residual
+  `NotHandled` exits: the `proof_hooks_armed` gate, `would_preempt` (documented unreachable
+  fail-safe), a general `YieldDecline` refusal, and
+  `TIMER_SPLIT_PREEMPT_REFUSED reason=no_current_runnable`.
+* **`PageFault`** — the pre-lock phase records diagnostic bookkeeping only. COW faults are
+  recovered off-lock (`cow_recovered`); every other fault takes the broad phase. Zero faults on an
+  ordinary boot of any port, so this is a population with no live traffic to convert.
+* **`ExternalInterrupt`** and **`Unknown`** — no split route whatsoever.
+
+`reason=no_current_runnable` is the target, and it is the one the timer route's own comment already
+names: "the selection DEQUEUES and the broad arm dispatches onto the idle CPU. That is a real
+queue-advancing consumer, and converting it is a separate migration this stage has no demonstrated
+dependency on. It declines, and is reported under its own reason so the residual is countable
+rather than inferred."
+
+Counted on the boots qualified above:
+
+| port | `TIMER_SPLIT_PREEMPT_REFUSED reason=no_current_runnable` |
+|---|---|
+| x86_64 core | 0 |
+| AArch64 core | 0 |
+| RISC-V core | **33** |
+
+So it is live, not theoretical, and RISC-V is where it can be witnessed. The shape is the one NR 9
+just closed: a preempting tick on a CPU whose current slot is empty and whose run queue is not, which
+must dispatch an incoming task through the queue-advance owner rather than hand the trap away. The
+admission, selection, commit and per-port landing contracts it needs all exist —
+`queue_advance_admit_with_authority_split` with `ExactTokenResume`, `queue_advance_commit_split`, and
+the three landings — and a timer carries no syscall frame to answer, so there is no PC or result
+convention to derive.
+
+After that: `PageFault`'s non-COW population, and then deletion of the terminal acquisitions.
