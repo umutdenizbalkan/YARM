@@ -89887,21 +89887,61 @@ mod stage199a2d2c2b1_guards {
     // never trusting the caller.
     #[test]
     fn marker_reverifies_every_committed_condition() {
+        // U9-RECV-BLOCK1 §2 parameterised the body on the five authoritative reads, so that the
+        // off-lock split blocking-receive route — which holds no broad `&KernelState` — can drive
+        // the SAME emitter instead of yielding the whole receive to produce this marker. The
+        // conditions, their conjunction and their order are unchanged; only who performs the
+        // reads moved. So the conditions are checked on the shared body, and the broad arm is
+        // separately checked to answer them with the authoritative reads it always used.
         assert!(MODRS.contains("fn maybe_emit_ipccall_direct_smp_server_blocked("));
-        assert!(MODRS.contains("let saved_frame = kernel.task_has_saved_frame(receiver_tid);"));
-        assert!(MODRS.contains(
-            "let absent_from_runqueue = !kernel.task_present_in_any_runqueue(receiver_tid);"
-        ));
-        assert!(MODRS.contains("== Some(crate::kernel::scheduler::CpuId(1));"));
-        assert!(MODRS.contains("let waiter_exact ="));
-        assert!(MODRS.contains("endpoint_waiter_identity(endpoint_index)) == Some(server)"));
-        assert!(MODRS.contains(
+        assert!(MODRS.contains("pub(crate) fn emit_ipccall_direct_smp_server_blocked_with("));
+        let broad = MODRS
+            .split("fn maybe_emit_ipccall_direct_smp_server_blocked(")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("the broad arm body");
+        for read in [
+            "saved_frame: kernel.task_has_saved_frame(receiver_tid)",
+            "present_in_any_runqueue: kernel.task_present_in_any_runqueue(receiver_tid)",
+            "home_cpu: kernel.task_home_cpu(receiver_tid)",
+            "asid: kernel.task_asid(receiver_tid)",
+            "ipc.endpoint_waiter_identity(endpoint_index)",
+        ] {
+            assert!(
+                broad.contains(read),
+                "the broad arm must answer the shared body with `{read}`"
+            );
+        }
+        assert!(
+            broad.contains("emit_ipccall_direct_smp_server_blocked_with("),
+            "and it must run the ONE shared body rather than its own copy"
+        );
+        let shared = MODRS
+            .split("pub(crate) fn emit_ipccall_direct_smp_server_blocked_with(")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("the shared body");
+        assert!(shared.contains("let saved_frame = facts.saved_frame;"));
+        assert!(shared.contains("let absent_from_runqueue = !facts.present_in_any_runqueue;"));
+        assert!(shared.contains("facts.home_cpu == Some(crate::kernel::scheduler::CpuId(1))"));
+        assert!(shared.contains("let waiter_exact = facts.waiter == Some(server);"));
+        assert!(shared.contains(
             "let ack_published = ipccall_direct_ack::commit_seq(endpoint_index, endpoint_generation)"
         ));
-        assert!(MODRS.contains("        == ack_seq\n        && ack_seq != 0;"));
-        assert!(MODRS.contains(
+        assert!(shared.contains("        == ack_seq\n        && ack_seq != 0;"));
+        assert!(shared.contains(
             "if !(saved_frame && absent_from_runqueue && home_cpu_1 && waiter_exact && ack_published)"
         ));
+        // The facts are DATA, not a broad reference smuggled through a new name.
+        let facts = MODRS
+            .split("pub(crate) struct SmpServerBlockedFacts {")
+            .nth(1)
+            .and_then(|r| r.split("\n}").next())
+            .expect("the facts struct");
+        assert!(
+            !facts.contains("KernelState") && !facts.contains("&"),
+            "the facts must be plain values; a borrow here would reinstate the broad dependency"
+        );
     }
 
     // (Part 5) The marker is emitted EXACTLY once (one-shot latch).
@@ -144645,13 +144685,22 @@ mod u9qa_apply_convention {
             whitelist.contains("SYSCALL_IPC_RECV_NR"),
             "RISC-V must admit NR 2 into the split dispatcher"
         );
-        // And nothing in the route yields NR 5 back to the broad arm. The remaining publication
-        // yield is scoped to NR 2, whose handler owns the hook it protects.
+        // And nothing in the route yields to the broad arm at all any more.
+        //
+        // U9-RECV-BLOCK1 §2/§5 retired the LAST publication yield, the selector-keyed one. It
+        // existed because a selector's profile depended on blocked-recv work the route could not
+        // reproduce — and the whole of that work was five authoritative reads inside one marker
+        // emitter. Those five are now carried as `SmpServerBlockedFacts` and step (10) drives the
+        // same emitter body the broad arm drives, so with a selector armed the route publishes
+        // exactly the evidence the profile asserts on instead of handing the receive away to
+        // produce it.
         assert!(
-            SPLIT_SRC.contains(
-                "if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm()"
-            ),
-            "the selector-keyed yield must stay scoped to NR 2"
+            !SPLIT_SRC.contains("blocked_recv_split_route_yields_to_broad_arm()"),
+            "the selector-keyed yield is retired: an armed oracle is not `not NR 2 / NR 5`"
+        );
+        assert!(
+            SPLIT_SRC.contains("emit_ipccall_direct_smp_server_blocked_with("),
+            "and the route must publish the SMP blocked-server marker itself"
         );
         // U9-RECV-BLOCK1 §2 RETIRED the shared-region-oracle yield entirely, and it must not come
         // back. It was `cfg!(feature = "shared-region-direct-oracle")` — a COMPILE-TIME term that

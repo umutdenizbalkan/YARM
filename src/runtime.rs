@@ -13411,6 +13411,30 @@ impl SharedKernel {
         })
     }
 
+    /// U9-RECV-BLOCK1 §2 — rank 2: the two TASK-domain facts the SMP blocked-server marker
+    /// re-verifies, as `(saved_frame, home_cpu)`.
+    ///
+    /// Both are TCB fields, so they are read in ONE acquisition rather than two: the marker
+    /// asserts a single committed blocking state, and two acquisitions could observe it torn.
+    /// Each predicate is copied exactly from the broad reader it replaces —
+    /// `KernelState::task_has_saved_frame` (a non-zero instruction AND stack pointer) and
+    /// `KernelState::task_cpu_affinity` (whose `tid == 0` short-circuit is reproduced, because a
+    /// kernel task has no home CPU regardless of what its TCB happens to carry).
+    pub(crate) fn smp_blocked_server_task_facts_split_read(
+        &self,
+        tid: u64,
+    ) -> (bool, Option<CpuId>) {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
+                Some(tcb) => (
+                    tcb.user_context.instruction_ptr.0 != 0 && tcb.user_context.stack_ptr.0 != 0,
+                    if tid == 0 { None } else { tcb.cpu_affinity },
+                ),
+                None => (false, None),
+            }
+        })
+    }
+
     /// rank 2 (task lock) — Stage 199D: the exact INVERSE of
     /// [`Self::sr_commit_blocked_receiver_split`], for the one case that has no other cure: the
     /// commit succeeded but the rank-1 enqueue that follows it was refused. Without this the

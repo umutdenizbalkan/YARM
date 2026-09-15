@@ -1954,14 +1954,17 @@ fn try_split_blocking_ipc_recv_into_frame(
     // close — the caller's block was published late, so a reply could arrive with no claimable
     // acknowledgement and an armed terminal, be declined as mode-indeterminate, fall to legacy,
     // and be LOST (`IPC_REPLY_FAIL err=WrongObject`, caller never resumed, `resume=0`).
-    #[cfg(not(feature = "hosted-dev"))]
-    if !recv_timeout && crate::kernel::boot::blocked_recv_split_route_yields_to_broad_arm() {
-        crate::yarm_log!(
-            "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=direct_oracle_selector_armed",
-            cpu.0
-        );
-        return D::NotHandled;
-    }
+    //
+    // U9-RECV-BLOCK1 §2/§5 — RETIRED. The yield existed because a selector's profile depended on
+    // blocked-recv work this route could not reproduce, and the whole of that work was five
+    // authoritative reads inside one marker emitter. Those five are now carried as facts
+    // (`SmpServerBlockedFacts`) and step (10) drives the SAME emitter body the broad arm drives,
+    // so there is nothing left for the yield to protect: with a selector armed, the route now
+    // publishes exactly the evidence the selector's profile asserts on, from the same committed
+    // point and in the same order, instead of handing the receive away to produce it.
+    //
+    // Keeping it would have been the §5 escape in its last form: `NotHandled` may remain only for
+    // "not NR 2 / NR 5", and "an oracle is armed" is not that.
     let Some(tid) = shared.current_tid_authoritative(cpu) else {
         crate::yarm_log!(
             "IPC_RECV_BLOCK_SPLIT_REFUSED cpu={} reason=no_current_task",
@@ -2514,13 +2517,38 @@ fn try_split_blocking_ipc_recv_into_frame(
                 .endpoint_waiter_is_split_read(index, generation, waiter_identity)
                 .then_some(waiter_identity)
         };
-        let _ = crate::kernel::boot::publish_ipccall_direct_blocked_server_ack_with(
+        let server_ack = crate::kernel::boot::publish_ipccall_direct_blocked_server_ack_with(
             tid,
             asid,
             endpoint,
             &state,
             live_waiter,
         );
+        // U9-RECV-BLOCK1 §2 — the AUTHORITATIVE cross-CPU blocked-server marker, from the same
+        // committed point and through the same body the broad arm now drives. This was the last
+        // step that demanded a broad `&KernelState`, for five reads and nothing else; carrying
+        // those five as facts is what lets the route publish the evidence instead of yielding the
+        // whole receive to produce it. Every condition, its conjunction, the one-shot fuse and
+        // the marker text are the body's, unchanged — this side only answers the reads.
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+        if let Some((ack_index, ack_generation, ack_seq)) = server_ack {
+            let (saved_frame, home_cpu) = shared.smp_blocked_server_task_facts_split_read(tid);
+            crate::kernel::boot::emit_ipccall_direct_smp_server_blocked_with(
+                tid,
+                ack_index,
+                ack_generation,
+                ack_seq,
+                crate::kernel::boot::SmpServerBlockedFacts {
+                    saved_frame,
+                    present_in_any_runqueue: shared
+                        .receiver_has_scheduler_membership_split_read(tid),
+                    home_cpu,
+                    asid,
+                    waiter: live_waiter(ack_index),
+                },
+            );
+        }
+        let _ = server_ack;
         let _ = crate::kernel::boot::publish_ipcreply_direct_blocked_caller_ack_with(
             tid,
             asid,

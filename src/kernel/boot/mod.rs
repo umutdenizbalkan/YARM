@@ -7169,21 +7169,77 @@ fn maybe_emit_ipccall_direct_smp_server_blocked(
     endpoint_generation: u64,
     ack_seq: u64,
 ) {
+    // U9-RECV-BLOCK1 §2 — the broad arm now SUPPLIES the five authoritative facts and runs the
+    // same body the split route runs. Each read stays exactly where it was and in its own domain:
+    // the saved frame and the ASID under the task domain, runqueue presence and home CPU under
+    // the scheduler domain, the waiter identity under `ipc_state`.
+    emit_ipccall_direct_smp_server_blocked_with(
+        receiver_tid,
+        endpoint_index,
+        endpoint_generation,
+        ack_seq,
+        SmpServerBlockedFacts {
+            saved_frame: kernel.task_has_saved_frame(receiver_tid),
+            present_in_any_runqueue: kernel.task_present_in_any_runqueue(receiver_tid),
+            home_cpu: kernel.task_home_cpu(receiver_tid),
+            asid: kernel.task_asid(receiver_tid),
+            waiter: kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(endpoint_index)),
+        },
+    );
+}
+
+/// U9-RECV-BLOCK1 §2 — the five authoritative facts the SMP blocked-server marker re-verifies,
+/// each read by whichever caller can perform it.
+///
+/// They are carried as DATA rather than as a `&KernelState` for the same reason the NR6/NR7
+/// acknowledgement bodies are: the split blocking-receive route holds no broad reference, so a
+/// body that demanded one could only be reached by yielding the whole receive to the broad arm.
+/// Nothing about the marker's policy moves — the conditions, their conjunction, the one-shot fuse
+/// and the marker text are unchanged and in the same order.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) struct SmpServerBlockedFacts {
+    /// A committed saved continuation exists for the server.
+    pub saved_frame: bool,
+    /// The server is present in SOME runqueue. The marker requires the negation.
+    pub present_in_any_runqueue: bool,
+    /// The server's home CPU. The marker requires CPU 1.
+    pub home_cpu: Option<crate::kernel::scheduler::CpuId>,
+    /// The server's address space. Absent means no committed identity, and the marker refuses.
+    pub asid: Option<crate::kernel::vm::Asid>,
+    /// Whoever currently holds the endpoint's waiter slot, as that caller's own domain read.
+    pub waiter: Option<ReceiverWaiterIdentity>,
+}
+
+/// U9-RECV-BLOCK1 §2 — **the ONE SMP blocked-server marker body**, shared by the broad
+/// blocked-recv arm and the off-lock split blocking-`IpcRecv` route.
+///
+/// Fires at most once per boot, only when the SMP oracle is armed and every blocking-order
+/// invariant re-verifies against authoritative committed state (never trusting the caller): the
+/// server has a committed saved frame, it is absent from all runqueues (BlockedUnfinalized / not
+/// re-selectable), its home CPU is 1, the exact endpoint waiter identity still equals the server,
+/// and the ack sequence is live. A strict no-op otherwise.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn emit_ipccall_direct_smp_server_blocked_with(
+    receiver_tid: u64,
+    endpoint_index: usize,
+    endpoint_generation: u64,
+    ack_seq: u64,
+    facts: SmpServerBlockedFacts,
+) {
     use core::sync::atomic::{AtomicBool, Ordering};
     static EMITTED: AtomicBool = AtomicBool::new(false);
     if !x86_ipccall_direct_smp_oracle_enabled() {
         return;
     }
     // Independent re-verification of every authoritative condition.
-    let saved_frame = kernel.task_has_saved_frame(receiver_tid);
-    let absent_from_runqueue = !kernel.task_present_in_any_runqueue(receiver_tid);
-    let home_cpu_1 = kernel.task_home_cpu(receiver_tid) == Some(crate::kernel::scheduler::CpuId(1));
-    let Some(asid) = kernel.task_asid(receiver_tid) else {
+    let saved_frame = facts.saved_frame;
+    let absent_from_runqueue = !facts.present_in_any_runqueue;
+    let home_cpu_1 = facts.home_cpu == Some(crate::kernel::scheduler::CpuId(1));
+    let Some(asid) = facts.asid else {
         return;
     };
     let server = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
-    let waiter_exact =
-        kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(endpoint_index)) == Some(server);
+    let waiter_exact = facts.waiter == Some(server);
     let ack_published = ipccall_direct_ack::commit_seq(endpoint_index, endpoint_generation)
         == ack_seq
         && ack_seq != 0;
