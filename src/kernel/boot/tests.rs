@@ -23436,7 +23436,8 @@ mod stage31_split_recv_tests {
             assert_eq!(
                 crate::kernel::syscall_split::try_split_ipc_recv_queued_plain_into_frame(
                     &kernel, CPU0, &mut frame,
-                ),
+                )
+                .into_legacy_option(),
                 None,
                 "non-IpcRecv syscall nr {nr} must be rejected (None)"
             );
@@ -23536,7 +23537,9 @@ mod stage31_split_recv_tests {
             recv_cap
         });
         let mut frame = recv_frame(recv_cap);
-        let result = kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let result = kernel
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -23818,7 +23821,9 @@ mod stage32_cap_resolution_tests {
     fn stage32_integrated_queued_recv_valid_cap_succeeds() {
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_frame(recv_cap);
-        let result = kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let result = kernel
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
         assert_eq!(result, Some(Ok(())), "cap resolve + dequeue must succeed");
         assert_eq!(frame.ret0(), 7, "ret0 == sender tid");
         assert_eq!(frame.ret1(), b"ping".len(), "ret1 == raw payload len");
@@ -23835,7 +23840,9 @@ mod stage32_cap_resolution_tests {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let bogus = CapId(999_999);
         let mut frame = recv_frame(bogus);
-        let split = kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let split = kernel
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
 
         // Reference: the old global-lock recv error for the same bogus cap.
         let mut ref_state = Bootstrap::init().expect("init");
@@ -23861,7 +23868,9 @@ mod stage32_cap_resolution_tests {
             aspace_map_cap
         });
         let mut frame = recv_frame(aspace_cap);
-        let split = kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let split = kernel
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
 
         let mut ref_state = Bootstrap::init().expect("init");
         let ref_aspace = ref_state.create_user_address_space().expect("aspace ref").1;
@@ -23885,7 +23894,9 @@ mod stage32_cap_resolution_tests {
         });
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
-            kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
+            kernel
+                .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+                .into_legacy_option(),
             None,
             "empty endpoint must fall back (None)"
         );
@@ -23909,7 +23920,9 @@ mod stage32_cap_resolution_tests {
         });
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
-            kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
+            kernel
+                .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+                .into_legacy_option(),
             Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
             "user-ASID split path: undersized buffer (ptr=0, len=0) → InvalidArgs"
         );
@@ -23930,7 +23943,9 @@ mod stage32_cap_resolution_tests {
         });
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
-            kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
+            kernel
+                .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+                .into_legacy_option(),
             Some(Err(TrapHandleError::Syscall(
                 SyscallError::InvalidCapability
             ))),
@@ -23947,7 +23962,9 @@ mod stage32_cap_resolution_tests {
         // The split route is now checked AGAINST that owner rather than against the old refusal.
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_v2_frame(recv_cap);
-        let split = kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let split = kernel
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
 
         let mut canonical_state = Bootstrap::init().expect("init");
         let canonical_cap = {
@@ -24023,7 +24040,9 @@ mod stage32_cap_resolution_tests {
         let (kernel, recv_cap) = kernel_with_queued_plain(payload);
         let mut split_frame = recv_frame(recv_cap);
         assert_eq!(
-            kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut split_frame),
+            kernel
+                .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut split_frame)
+                .into_legacy_option(),
             Some(Ok(()))
         );
 
@@ -24115,7 +24134,9 @@ mod stage32_cap_resolution_tests {
             IpcRecvQueuedPlainWritebackPlan::for_kernel_task(&snap, 7, b"abcd").expect("plan");
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
-            kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
+            kernel
+                .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+                .into_legacy_option(),
             Some(Ok(()))
         );
         assert_eq!(
@@ -49443,7 +49464,9 @@ mod stage187a_ipc_recv_delivery_boundary_split {
                 0,
             ],
         );
-        let result = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let result = shared
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -49456,7 +49479,9 @@ mod stage187a_ipc_recv_delivery_boundary_split {
             .expect("read back");
         assert_eq!(&copied[..b"boundary".len()], b"boundary");
         // One-shot: the message is consumed — a second recv finds nothing.
-        let second = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let second = shared
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
         assert_eq!(
             second, None,
             "the queue must be empty after delivery (no envelope/message reuse)"
@@ -49490,7 +49515,9 @@ mod stage187a_ipc_recv_delivery_boundary_split {
             crate::kernel::syscall::Syscall::IpcRecv as usize,
             [recv_cap_t1.0 as usize, 0x4000, 4, 0, 0, 0],
         );
-        let result = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let result = shared
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
         assert_eq!(
             result,
             Some(Err(TrapHandleError::Syscall(
@@ -49499,7 +49526,9 @@ mod stage187a_ipc_recv_delivery_boundary_split {
             "undersized buffer must surface the real InvalidArgs error, never success"
         );
         // Message consumed (§54: consumed on undersize) — queue now empty.
-        let second = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let second = shared
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
         assert_eq!(
             second, None,
             "message must be consumed by the failed delivery"
@@ -49688,7 +49717,9 @@ mod stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary {
         let base_refcount = cap_refcount(&shared, mem_id);
 
         let mut frame = recv_frame(recv_cap_t1);
-        let result = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let result = shared
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -49730,7 +49761,9 @@ mod stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary {
 
         // One-shot: the envelope/message is consumed — a second recv finds nothing.
         let mut frame2 = recv_frame(recv_cap_t1);
-        let second = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame2);
+        let second = shared
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame2)
+            .into_legacy_option();
         assert_eq!(second, None, "envelope/message must not be reusable");
     }
 
@@ -49784,7 +49817,9 @@ mod stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary {
         let shared = SharedKernel::new(state);
 
         let mut frame = recv_frame(recv_cap_t1);
-        let result = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        let result = shared
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame)
+            .into_legacy_option();
         assert_eq!(
             result,
             Some(Ok(())),
@@ -176801,6 +176836,22 @@ mod u9_recv_final_probe_parity {
         (kernel, recv_cap)
     }
 
+    /// U9-RECV-BLOCK2b §1 — the same fixture, keeping the SEND capability too, so a case can
+    /// enqueue onto the very endpoint the receiver under test is waiting on.
+    fn fixture_with_send(queued: usize) -> (SharedKernel, CapId, CapId) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (send_cap, recv_cap) = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            for i in 0..queued {
+                state
+                    .ipc_send(send_cap, Message::new(7, &[i as u8; 4]).expect("m"))
+                    .expect("send");
+            }
+            (send_cap, recv_cap)
+        });
+        (kernel, send_cap, recv_cap)
+    }
+
     /// A NR 5 frame. `timeout` goes in arg 3 — the slot NR 2 uses for its metadata POINTER,
     /// which is the whole reason this lane needs its own decode.
     fn probe_frame(recv_cap: CapId, timeout: usize, ptr: usize, len: usize) -> TrapFrame {
@@ -176850,6 +176901,7 @@ mod u9_recv_final_probe_parity {
         let mut sf = probe_frame(cap2, 0, 0, 0);
         let split_answer = split
             .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
+            .into_legacy_option()
             .expect("the lane answers an empty probe rather than declining");
         assert!(
             split_answer.is_ok(),
@@ -176882,6 +176934,7 @@ mod u9_recv_final_probe_parity {
         let mut sf = probe_frame(cap2, 0, 0, 0);
         let split_answer = split
             .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
+            .into_legacy_option()
             .expect("the lane serves a queued message");
         assert!(split_answer.is_ok(), "the split lane delivers too");
         assert_eq!(
@@ -176903,6 +176956,7 @@ mod u9_recv_final_probe_parity {
         assert!(
             split
                 .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
+                .into_legacy_option()
                 .expect("serviced")
                 .is_ok()
         );
@@ -176930,6 +176984,7 @@ mod u9_recv_final_probe_parity {
         let mut sf = probe_frame(CapId(4242), 0, 0, 0);
         let split_answer = split
             .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
+            .into_legacy_option()
             .expect("a resolution failure is answered, not declined");
         assert_eq!(
             split_answer.err().map(|e| match e {
@@ -176959,6 +177014,7 @@ mod u9_recv_final_probe_parity {
         assert!(
             split
                 .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
+                .into_legacy_option()
                 .is_none(),
             "an empty TIMED receive belongs to the blocking owner"
         );
@@ -176991,6 +177047,7 @@ mod u9_recv_final_probe_parity {
         let mut sf = probe_frame(cap2, 5, 0, 0);
         let answer = split
             .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
+            .into_legacy_option()
             .expect("a ready message is served, not declined, under a finite timeout");
         assert!(answer.is_ok(), "the split lane delivers too");
         assert_eq!(
@@ -177031,6 +177088,7 @@ mod u9_recv_final_probe_parity {
         assert!(
             probe
                 .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut zero)
+                .into_legacy_option()
                 .expect("a probe is answered")
                 .is_ok()
         );
@@ -177041,6 +177099,7 @@ mod u9_recv_final_probe_parity {
         assert!(
             timed
                 .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut big)
+                .into_legacy_option()
                 .is_none(),
             "arg 3 must be read as a timeout, so this is a TIMED receive and not a probe"
         );
@@ -177065,6 +177124,7 @@ mod u9_recv_final_probe_parity {
         let mut sf = probe_frame(cap, 0, 0, 0);
         let answer = split
             .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut sf)
+            .into_legacy_option()
             .expect("answered");
         assert!(answer.is_ok(), "an empty probe is a successful syscall");
         assert_eq!(sf.error_code(), Some(SyscallError::WouldBlock.code()));
@@ -177115,6 +177175,88 @@ mod u9_recv_final_probe_parity {
             "there must be exactly one delivery engine"
         );
     }
+
+    // ─── U9-RECV-BLOCK2b §1 — the queue-consumption interleaving ──────────────────────────────
+
+    /// **THE RACE, in full, through the production owners — and it no longer produces an
+    /// answer.**
+    ///
+    /// The interleaving, step for step as the directive states it:
+    ///
+    /// 1. A issues a FINITE NR 5 (`timeout_ticks != 0`, so a deadline that has not elapsed).
+    ///    Its immediate take finds nothing, and A requests parking.
+    /// 2. B enqueues a message onto the same endpoint.
+    /// 3. A competing receiver C consumes that message.
+    /// 4. A's lane is driven again, and finds nothing.
+    ///
+    /// On `140df976` the blocking lane's `recv_would_block_split_read` saw B's message at step 2,
+    /// answered `ImmediateLaneOwns`, and `settle_recv_immediate_owns_after_empty_take` re-ran the
+    /// take at step 4, found it empty, and encoded `WouldBlock` — a NON-BLOCKING error handed to
+    /// a receive that had asked to wait, with its deadline still in the future.
+    ///
+    /// What this case pins is that the lane's answer is derived from its OWN take and nothing
+    /// else, at every step: it is `EmptyAwaitingPark` before B's send and again after C's
+    /// consume, and it is `Answered` only in the one window where the message is actually
+    /// present. There is no state in this sequence where the lane answers a finite receive with
+    /// the empty encoding.
+    #[test]
+    fn a_racing_consumer_never_turns_a_finite_receive_into_would_block() {
+        use crate::kernel::syscall::RecvImmediateOutcome as I;
+
+        // A finite timeout: 50 ticks, so `RecvRequest::from_ipc_recv_timeout` classifies the
+        // request `RecvBlockingPolicy::Deadline(..)` and NOT `NoWait`. That classification is the
+        // whole difference between "park me" and "tell me it would block".
+        const FINITE: usize = 50;
+
+        let (kernel, send_cap, recv_cap) = fixture_with_send(0);
+
+        // ── step 1: A's immediate take, on an empty endpoint ──────────────────────────────────
+        let mut a_frame = probe_frame(recv_cap, FINITE, 0, 0);
+        let first = kernel.try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut a_frame);
+        assert!(
+            matches!(first, I::EmptyAwaitingPark),
+            "an empty take under a finite timeout is the PARKING PRECONDITION, not an answer: {first:?}"
+        );
+        assert_eq!(
+            a_frame.error_code(),
+            None,
+            "and nothing may be encoded into A's frame — it is about to be parked"
+        );
+
+        // ── step 2: B enqueues ────────────────────────────────────────────────────────────────
+        //
+        // Through the canonical send, so the queue reaches the state a real sender leaves.
+        kernel.with(|state| {
+            state
+                .ipc_send(send_cap, Message::new(7, &[9u8; 4]).expect("m"))
+                .expect("B's send")
+        });
+        assert_eq!(queued_total(&kernel), 1, "B's message is queued");
+
+        // ── step 3: C consumes it, through the same production take ───────────────────────────
+        let mut c_frame = probe_frame(recv_cap, 0, 0, 0);
+        let c = kernel.try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut c_frame);
+        assert!(
+            matches!(c, I::Answered(Ok(()))),
+            "C's probe takes the message: {c:?}"
+        );
+        assert_eq!(queued_total(&kernel), 0, "and the queue is empty again");
+
+        // ── step 4: A's lane runs again, on the now-empty endpoint ────────────────────────────
+        let mut a_again = probe_frame(recv_cap, FINITE, 0, 0);
+        let second = kernel.try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut a_again);
+        assert!(
+            matches!(second, I::EmptyAwaitingPark),
+            "THE REGRESSION: A asked for a finite wait whose deadline has not elapsed, so an \
+             empty endpoint is still the parking precondition — never the WouldBlock answer: \
+             {second:?}"
+        );
+        assert_eq!(
+            a_again.error_code(),
+            None,
+            "and no error lane may be written for a receive that is going to park"
+        );
+    }
 }
 
 /// U9-RECV-QUEUE1 — **the four queued populations, differentially against their canonical
@@ -177163,10 +177305,12 @@ mod u9_recv_queue1_parity {
         frame: &mut TrapFrame,
     ) -> Option<Result<(), crate::kernel::boot::TrapHandleError>> {
         match Syscall::decode(frame.syscall_num()) {
-            Ok(Syscall::IpcRecv) => kernel.try_split_ipc_recv_queued_plain_into_frame(CPU, frame),
-            Ok(Syscall::IpcRecvTimeout) => {
-                kernel.try_split_ipc_recv_timeout_immediate_into_frame(CPU, frame)
-            }
+            Ok(Syscall::IpcRecv) => kernel
+                .try_split_ipc_recv_queued_plain_into_frame(CPU, frame)
+                .into_legacy_option(),
+            Ok(Syscall::IpcRecvTimeout) => kernel
+                .try_split_ipc_recv_timeout_immediate_into_frame(CPU, frame)
+                .into_legacy_option(),
             other => panic!("not a receive frame: {other:?}"),
         }
     }
@@ -178388,6 +178532,101 @@ mod u9_recv_block1_closure {
             assert!(
                 SPLIT.contains(body),
                 "the route must publish through the shared body `{body}`"
+            );
+        }
+    }
+
+    // ─── U9-RECV-BLOCK2b §1 — the take is the only observation ────────────────────────────────
+
+    /// **The structural predicate is gone from the blocking lane, and may not come back.**
+    ///
+    /// A second observation of the queue is what the race is made of: the immediate take answers
+    /// "nothing to take", the lane re-reads the endpoint, and between the two a sender arrives
+    /// and a competitor consumes. The take is the only observation this route is allowed, so the
+    /// lane that parks must contain no re-read at all.
+    #[test]
+    fn the_blocking_lane_reads_the_queue_no_second_time() {
+        let lane = code_of(body_of(SPLIT, "fn try_split_blocking_ipc_recv_into_frame("));
+        assert!(
+            !lane.contains("recv_would_block_split_read"),
+            "the blocking lane must not re-read the queue: the immediate take already answered \
+             that question, and asking it twice is the race"
+        );
+        assert!(
+            !lane.contains("ImmediateLaneOwns"),
+            "and it must not hand back to a lane that has already run and declined"
+        );
+    }
+
+    /// **The recognized family has no empty-answer substitute on the production profile.**
+    ///
+    /// The hosted profile compiles no parking owner at all, so its own landing encodes the
+    /// canonical empty answer. That landing is `#[cfg(feature = "hosted-dev")]`, and the
+    /// production arm ahead of it must contain nothing of the kind — otherwise the substitute
+    /// that concealed the race is simply back under another name.
+    #[test]
+    fn the_production_family_has_no_empty_answer_substitute() {
+        assert!(
+            !SPLIT.contains("fn settle_recv_immediate_owns_after_empty_take"),
+            "the settlement that concealed the race is gone, not renamed"
+        );
+        let entry = body_of(SPLIT, "fn try_split_recv_recognized(");
+        let production = entry
+            .split("#[cfg(feature = \"hosted-dev\")]")
+            .next()
+            .expect("the production arm precedes the hosted landing");
+        assert!(
+            !code_of(production).contains("recv_encode_empty_answer"),
+            "no empty answer may be encoded on the production continuation path"
+        );
+        assert!(
+            code_of(production).contains("RecvImmediateOutcome::EmptyAwaitingPark => {}"),
+            "the take's OWN empty answer is what continues into the blocking lane"
+        );
+        assert!(
+            code_of(production).contains("RecvImmediateOutcome::NoTakeAttempted(reason)"),
+            "and a lane that attempted no take is settled separately, never parked"
+        );
+    }
+
+    /// **The receive family cannot construct a shape the planner refuses.**
+    ///
+    /// This is the impossibility argument `settle_no_immediate_take` rests on, re-derived from
+    /// source rather than asserted in a comment. `plan_recv_core` answers `FallbackRequired` for
+    /// exactly three inputs — the `SharedV3Future` kind, a `V3Future` metadata target and a
+    /// non-`None` map intent — and neither builder this family uses can produce any of them.
+    #[test]
+    fn the_recv_family_cannot_construct_an_unserved_shape() {
+        const RECV_CORE: &str = include_str!("../recv_core.rs");
+        for builder in ["fn from_legacy_ipc_recv(", "fn from_ipc_recv_timeout("] {
+            let body = code_of(body_of(RECV_CORE, builder));
+            assert!(
+                body.contains("map_intent: RecvMapIntent::None"),
+                "{builder} must hard-code the map intent the planner serves"
+            );
+            assert!(
+                !body.contains("SharedV3Future"),
+                "{builder} must not construct the helper-only request kind"
+            );
+            assert!(
+                !body.contains("V3Future"),
+                "{builder} must not construct the helper-only metadata target"
+            );
+        }
+    }
+
+    /// **The legacy `Option` adapter is a TEST adapter.**
+    ///
+    /// `RecvImmediateOutcome::into_legacy_option` collapses both declines to `None` — exactly the
+    /// information loss the type exists to remove. Hosted cases written against the old shape may
+    /// use it; no production body may.
+    #[test]
+    fn the_immediate_outcome_adapter_is_test_only() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for (name, src) in [("syscall_split.rs", SPLIT), ("runtime.rs", RUNTIME_SRC)] {
+            assert!(
+                !src.contains("into_legacy_option()"),
+                "{name} must derive its continuation from the outcome, not flatten it"
             );
         }
     }

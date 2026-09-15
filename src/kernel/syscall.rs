@@ -1826,14 +1826,15 @@ pub(crate) fn try_split_recv_queued_plain_into_frame_locked(
 /// `data_ptr()`-derived seam from the live recv path.
 ///
 /// Return contract:
-/// - [`RecvQueuedSplitPhaseA::Fallback`] — non-split-eligible (was `None`).
+/// - [`RecvQueuedSplitPhaseA::Fallback`] — non-split-eligible (was `None`), carrying
+///   [`RecvSplitDecline`] so the caller can tell WHY.
 /// - [`RecvQueuedSplitPhaseA::Completed`] — kernel-register delivery or an
 ///   error fully handled in Phase A (was `Some(..)`).
 /// - [`RecvQueuedSplitPhaseA::PendingUserCopy`] — dequeue + materialize + wake
 ///   done; user copy deferred to the seam phase.
 pub(crate) enum RecvQueuedSplitPhaseA {
-    /// Non-split-eligible; caller falls back to the unchanged global path.
-    Fallback,
+    /// Non-split-eligible; the caller decides what to do from the carried reason.
+    Fallback(RecvSplitDecline),
     /// Delivery (or error) fully completed under the global lock.
     Completed(Result<(), TrapHandleError>),
     /// Everything except the user copy is done; the caller must run Phase B
@@ -1854,6 +1855,92 @@ pub(crate) enum RecvQueuedSplitPhaseA {
     /// (`SharedKernel::complete_recv_boundary_shared_region`) after the borrow drops, in the
     /// order `handle_ipc_recv_result_with_empty_error` runs it.
     PendingSharedRegion(crate::kernel::recv_core::RecvBoundarySharedRegionSnapshot),
+}
+
+/// U9-RECV-BLOCK2b §1 — WHY the split Phase A declined, as a fact the caller can act on.
+///
+/// # The two producers of the former bare `Fallback` meant opposite things
+///
+/// `RecvQueuedSplitPhaseA::Fallback` had exactly two producers and they answered different
+/// questions. One fires from the PLANNER, before the endpoint is even resolved: the request's
+/// shape is not one this engine serves, and **no take was attempted**. The other fires AFTER the
+/// authoritative rank-3 dequeue has run and come back with nothing.
+///
+/// Collapsing the two is what let a structural `recv_would_block_split_read` predicate stand in
+/// for the take: the caller could not tell "I looked and the queue was empty" from "I never
+/// looked", so it had to re-derive the queue state with a second, separate observation — and two
+/// observations of a shared queue are exactly the window a competing receiver consumes a message
+/// in. The canonical owner (`ipc_recv_with_optional_deadline`) has no such window because THE
+/// TAKE IS THE OBSERVATION: it calls `ipc_recv_endpoint_take` and parks if and only if that take
+/// answered `Ok(None)`.
+///
+/// So this type carries the take's own answer outward, and [`Self::EmptyTake`] — nothing else —
+/// is the precondition that licenses parking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecvSplitDecline {
+    /// The planner refused the request's SHAPE. No endpoint was resolved and no take ran, so this
+    /// says nothing whatsoever about the queue.
+    ///
+    /// Unreachable for the NR 2 / NR 5 family: `plan_recv_core` produces `FallbackRequired` only
+    /// for `RecvRequestKind::SharedV3Future`, for a `RecvMetaTarget::V3Future` metadata target, or
+    /// for `map_intent != RecvMapIntent::None`, and neither `RecvRequest::from_legacy_ipc_recv`
+    /// nor `RecvRequest::from_ipc_recv_timeout` can construct any of the three. Carried as a
+    /// distinct variant anyway so the settlement names which assumption broke if one ever does.
+    ShapeNotServed(crate::kernel::recv_core::FallbackReason),
+    /// The authoritative rank-3 take RAN under `ipc_try_recv_queued_admitted_locked` and the
+    /// endpoint queue was empty.
+    ///
+    /// This is `ipc_recv_endpoint_take`'s `Ok(None)` — the canonical parking precondition, and
+    /// the only decline in this enum that licenses a park. Every other refusal that take can
+    /// answer (`EndpointMissing`, `IndexOutOfRange`, `QueueFull`) is an ERROR in the canonical
+    /// owner, so Phase A answers those as `Completed(Err(..))` rather than declining at all.
+    EmptyTake,
+}
+
+/// U9-RECV-BLOCK2b §1 — what an IMMEDIATE receive lane answered, as a type rather than as an
+/// `Option` whose `None` the caller had to re-derive a meaning for.
+///
+/// The two immediate engines (`SharedKernel::try_split_ipc_recv_queued_plain_into_frame` for
+/// NR 2, `SharedKernel::try_split_ipc_recv_timeout_immediate_into_frame` for NR 5) used to answer
+/// `Option<Result<(), TrapHandleError>>`, and `None` meant "not mine" without saying why. The
+/// family entry then asked a SECOND question — a structural `recv_would_block_split_read` — to
+/// decide whether to park, and a competing receiver consuming the message between the take and
+/// that read is exactly the window this type closes: the take's answer IS the continuation.
+#[derive(Debug)]
+pub(crate) enum RecvImmediateOutcome {
+    /// The lane ANSWERED the trap; the frame carries the result.
+    Answered(Result<(), TrapHandleError>),
+    /// The authoritative rank-3 take ran, the endpoint queue was empty, and the request asked to
+    /// WAIT (`RecvBlockingPolicy` is not `NoWait`).
+    ///
+    /// This is the canonical parking precondition and nothing else: it is
+    /// `ipc_recv_with_optional_deadline`'s state after `ipc_recv_endpoint_take` answered
+    /// `Ok(None)` and before `block_current_on_receive_with_deadline`. A request that asked NOT
+    /// to wait never reaches here — the lane encodes the canonical empty answer itself and
+    /// reports [`Self::Answered`].
+    EmptyAwaitingPark,
+    /// The lane attempted NO take. Carries a fixed reason word for the settlement marker.
+    ///
+    /// Established-unreachable for the NR 2 / NR 5 family; the argument per producer lives on the
+    /// settlement (`settle_no_immediate_take` in `syscall_split.rs`).
+    NoTakeAttempted(&'static str),
+}
+
+impl RecvImmediateOutcome {
+    /// The pre-U9-RECV-BLOCK2b shape, for the hosted cases that were written against it.
+    ///
+    /// `Some(result)` only for [`Self::Answered`]. Both declines collapse to `None`, which is
+    /// exactly the information loss this type exists to remove — so this is a TEST adapter and
+    /// has no production caller. A case that means to assert on the parking policy matches on
+    /// [`Self::EmptyAwaitingPark`] directly; `the_immediate_outcome_adapter_is_test_only` pins
+    /// that no production body calls this.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn into_legacy_option(self) -> Option<Result<(), TrapHandleError>> {
+        match self {
+            Self::Answered(result) => Some(result),
+            Self::EmptyAwaitingPark | Self::NoTakeAttempted(_) => None,
+        }
+    }
 }
 
 /// Stage 187B — Phase A helper: for a NON-shared-region ordinary transfer,
@@ -1953,7 +2040,7 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
         }
         RecvPlan::FallbackRequired(reason) => {
             crate::yarm_log!("YARM_RECV_CORE_FALLBACK reason={:?}", reason);
-            return RecvQueuedSplitPhaseA::Fallback;
+            return RecvQueuedSplitPhaseA::Fallback(RecvSplitDecline::ShapeNotServed(reason));
         }
         // U9-RECV-BLOCK1 §1(c): this retained body is the SPLIT-ELIGIBILITY comparison baseline,
         // and it has no production caller. The kernel-register + recv-v2 shape is served by the
@@ -1966,7 +2053,9 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                 "YARM_RECV_CORE_FALLBACK reason={:?}",
                 crate::kernel::recv_core::FallbackReason::RecvV2MetaUserCopy
             );
-            return RecvQueuedSplitPhaseA::Fallback;
+            return RecvQueuedSplitPhaseA::Fallback(RecvSplitDecline::ShapeNotServed(
+                crate::kernel::recv_core::FallbackReason::RecvV2MetaUserCopy,
+            ));
         }
     };
 
@@ -2154,8 +2243,13 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                 }
             }
         }
+        // This retained body has no production caller — it is the split-eligibility comparison
+        // baseline — so the classification it reports is the coarse one it has always reported:
+        // the take ran and delivered nothing. The LIVE Phase A
+        // (`SharedKernel::recv_queued_split_phase_a_split`) classifies from the take's own reject
+        // reason, because it is the one whose caller may park on the answer.
         RecvOutcome::WouldBlock | RecvOutcome::FallbackRequired(_) | RecvOutcome::TimedOut => {
-            RecvQueuedSplitPhaseA::Fallback
+            RecvQueuedSplitPhaseA::Fallback(RecvSplitDecline::EmptyTake)
         }
         RecvOutcome::Error(e) => {
             RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(SyscallError::from(e))))

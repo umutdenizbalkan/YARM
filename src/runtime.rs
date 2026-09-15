@@ -7498,7 +7498,12 @@ impl SharedKernel {
             RecvPlan::KernelRegisterV2MetaFaults => ("kernel_register_v2_meta", false),
             RecvPlan::FallbackRequired(reason) => {
                 crate::yarm_log!("YARM_RECV_CORE_FALLBACK reason={:?}", reason);
-                return RecvQueuedSplitPhaseA::Fallback;
+                // U9-RECV-BLOCK2b §1 — NO TAKE WAS ATTEMPTED. The endpoint is not even resolved
+                // at this point, so this decline says nothing about the queue and must never be
+                // read as the parking precondition.
+                return RecvQueuedSplitPhaseA::Fallback(
+                    crate::kernel::syscall::RecvSplitDecline::ShapeNotServed(reason),
+                );
             }
         };
         // Does this receive owe a recv-v2 metadata struct it cannot write? Carried as a fact
@@ -7531,6 +7536,15 @@ impl SharedKernel {
         if queued_recv_result_delivered(&result) {
             self.note_endpoint_only_queued_recv_split_seam();
         }
+        // U9-RECV-BLOCK2b §1 — the take's OWN reject reason, captured before the mapping folds it
+        // into `RecvOutcome`. `map_queued_recv_outcome` answers `WouldBlock` for an empty queue
+        // AND for a missing endpoint, an out-of-range index and a full queue — one word for four
+        // facts, and only the first of them licenses a park. The canonical take owner
+        // (`KernelState::ipc_recv_endpoint_take`) keeps them apart and so does the arm below.
+        let take_refusal = match &result {
+            crate::kernel::boot::IpcEndpointRecvResult::Ineligible(reason) => Some(*reason),
+            _ => None,
+        };
         let outcome = match plan {
             // Both kernel-register plans build the SAME writeback plan: the payload contract is
             // identical, and the metadata is a separate obligation the arm below discharges.
@@ -7548,8 +7562,51 @@ impl SharedKernel {
 
         let delivery = match outcome {
             RecvOutcome::Delivered(d) => d,
+            // U9-RECV-BLOCK2b §1 — THE TAKE RAN AND DELIVERED NOTHING. Which of the take's
+            // refusals it was decides the caller's continuation, and the classification is the
+            // canonical take owner's, taken apart rather than re-invented:
+            // `KernelState::ipc_recv_endpoint_take` answers `Ok(None)` for `Empty` — the state
+            // `ipc_recv_with_optional_deadline` parks on — `Err(WrongObject)` for
+            // `EndpointMissing`/`IndexOutOfRange` and `Err(EndpointQueueFull)` for `QueueFull`.
+            // The last three are ERRORS there, so they are answered here rather than declined:
+            // returning them as a decline is what would let a receive park on an endpoint that no
+            // longer exists and never be woken.
             RecvOutcome::WouldBlock | RecvOutcome::FallbackRequired(_) | RecvOutcome::TimedOut => {
-                return RecvQueuedSplitPhaseA::Fallback;
+                use crate::kernel::boot::IpcEndpointSplitRejectReason as R;
+                let kernel_err = match take_refusal {
+                    // The parking precondition, and the only one.
+                    None | Some(R::EmptyQueue) => {
+                        return RecvQueuedSplitPhaseA::Fallback(
+                            crate::kernel::syscall::RecvSplitDecline::EmptyTake,
+                        );
+                    }
+                    Some(R::EndpointMissing | R::EndpointIndexOutOfRange) => {
+                        crate::kernel::boot::KernelError::WrongObject
+                    }
+                    Some(R::EndpointQueueFull) => {
+                        crate::kernel::boot::KernelError::EndpointQueueFull
+                    }
+                    // `NonBufferedEndpoint`, `ReceiverWaiterPresent`, `SenderWaiterPresent` and
+                    // `TransferOrReplyCapMessage` are the four class gates U9-RECV-QUEUE1 §2 and
+                    // U9-RECV-BLOCK1 §2 removed from `ipc_try_recv_queued_admitted_locked`; that
+                    // body now answers only the five `EndpointTakeOutcome` shapes above. Kept
+                    // named so the match stays total over the reject enum, and answered as the
+                    // canonical take owner answers an unusable endpoint slot.
+                    Some(
+                        R::NonBufferedEndpoint
+                        | R::ReceiverWaiterPresent
+                        | R::SenderWaiterPresent
+                        | R::TransferOrReplyCapMessage,
+                    ) => crate::kernel::boot::KernelError::WrongObject,
+                };
+                crate::yarm_log!(
+                    "IPC_RECV_SPLIT_TAKE_REFUSED endpoint={} reason={:?} result=answered",
+                    endpoint_idx,
+                    take_refusal
+                );
+                return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
+                    SyscallError::from(kernel_err),
+                )));
             }
             RecvOutcome::Error(e) => {
                 return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(
@@ -8764,8 +8821,9 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
         frame: &mut TrapFrame,
-    ) -> Option<Result<(), TrapHandleError>> {
+    ) -> crate::kernel::syscall::RecvImmediateOutcome {
         use crate::kernel::recv_core::{RecvMetaTarget, RecvRequest};
+        use crate::kernel::syscall::RecvImmediateOutcome as I;
         use crate::kernel::syscall::{
             IPC_RECV_META_V2_ENCODED_LEN, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0,
             SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR,
@@ -8774,7 +8832,8 @@ impl SharedKernel {
 
         let timeout_ticks = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64;
         let Some(requester_tid) = self.current_tid_authoritative(cpu) else {
-            return None;
+            // U9-RECV-BLOCK2b §1 — no take was attempted, and nothing about the queue is known.
+            return I::NoTakeAttempted("no_current_task");
         };
 
         // The canonical handler consumes the per-CPU pre-read deadline before it classifies the
@@ -8797,7 +8856,7 @@ impl SharedKernel {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 consume_preread_deadline(cpu);
-                return Some(Err(TrapHandleError::Syscall(
+                return I::Answered(Err(TrapHandleError::Syscall(
                     crate::kernel::syscall::SyscallError::from(e),
                 )));
             }
@@ -8831,36 +8890,47 @@ impl SharedKernel {
 
         let phase_a = self.recv_queued_split_phase_a_split(cpu, frame, &snapshot, &request);
         match phase_a {
-            // Nothing to take, or a shape this engine does not serve. The EMPTY case is this
-            // lane's to answer; the rest stay residual and are counted by the family entry.
-            crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback => {
-                // The engine declines for several reasons; only an EMPTY buffered endpoint is
-                // this lane's to answer, and only for a request that asked not to wait. The
-                // would-block read is the same rank-3 structural question the blocking route
-                // asks, so the two agree on what "nothing to take" means.
-                let empty = match snapshot.endpoint {
-                    CapObject::Endpoint { index, generation } => {
-                        self.recv_would_block_split_read(index, generation)
-                    }
-                    _ => false,
+            // U9-RECV-BLOCK2b §1 — the take's own answer, not a second observation of the queue.
+            //
+            // This arm used to re-read the endpoint through `recv_would_block_split_read` to
+            // decide whether "fallback" meant an empty queue. That read is a SEPARATE observation
+            // from the take that produced this decline, and between the two a competing receiver
+            // can consume the message — which is precisely how a finite receive whose deadline
+            // had not elapsed ended up answered `WouldBlock`. Phase A now says which it was, from
+            // the take itself, so there is no second observation to disagree with the first.
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback(decline) => {
+                // A shape the planner does not serve is NOT an empty queue and never was. It
+                // leaves this lane as `NoTakeAttempted`, whose settlement is the family entry's.
+                let crate::kernel::syscall::RecvSplitDecline::EmptyTake = decline else {
+                    crate::yarm_log!(
+                        "IPC_RECV_TIMED_SPLIT_DECLINE cpu={} tid={} reason=shape_not_served parked=0 deadline_armed=0",
+                        cpu.0,
+                        requester_tid
+                    );
+                    return I::NoTakeAttempted("shape_not_served");
                 };
-                // A TIMED receive's empty endpoint belongs to the blocking owner. Declining is an
-                // internal outcome — the family entry hands it to the next lane — and is what
-                // keeps a receive that asked to wait from being answered with the non-blocking
-                // error. The classification is the canonical builder's, not a re-read of arg 3.
+                // The take ran and the queue was empty. Which continuation that licenses is
+                // decided by what the CALLER asked for, and the classification is the canonical
+                // builder's (`RecvRequest::from_ipc_recv_timeout`), not a re-read of arg 3.
                 let nonblocking = matches!(
                     request.blocking,
                     crate::kernel::recv_core::RecvBlockingPolicy::NoWait
                 );
-                if empty && !nonblocking {
+                if !nonblocking {
+                    // A TIMED receive whose endpoint was empty at the take. This is the canonical
+                    // parking precondition — `ipc_recv_with_optional_deadline` reaches
+                    // `block_current_on_receive_with_deadline` in exactly this state — and it is
+                    // reported as that, not as a bare decline. The pre-read deadline is
+                    // deliberately NOT consumed: the parking owner wants that exact absolute
+                    // deadline, and it is the one this receive was entered with.
                     crate::yarm_log!(
                         "IPC_RECV_TIMED_SPLIT_DECLINE cpu={} tid={} reason=empty_endpoint_timed parked=0 deadline_armed=0",
                         cpu.0,
                         requester_tid
                     );
-                    return None;
+                    return I::EmptyAwaitingPark;
                 }
-                if empty {
+                {
                     consume_preread_deadline(cpu);
                     // THE EMPTY-RESULT ENCODING, and it is not an error return.
                     //
@@ -8877,7 +8947,7 @@ impl SharedKernel {
                     if crate::kernel::syscall::recv_boundary_encode_transfer_cap_ret(frame, None)
                         .is_err()
                     {
-                        return Some(Err(TrapHandleError::Syscall(
+                        return I::Answered(Err(TrapHandleError::Syscall(
                             crate::kernel::syscall::SyscallError::Internal,
                         )));
                     }
@@ -8886,9 +8956,8 @@ impl SharedKernel {
                         cpu.0,
                         requester_tid
                     );
-                    return Some(Ok(()));
+                    I::Answered(Ok(()))
                 }
-                None
             }
             crate::kernel::syscall::RecvQueuedSplitPhaseA::Completed(r) => {
                 consume_preread_deadline(cpu);
@@ -8898,7 +8967,7 @@ impl SharedKernel {
                     requester_tid,
                     timeout_ticks
                 );
-                Some(r)
+                I::Answered(r)
             }
             crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingUserCopy(pending) => {
                 consume_preread_deadline(cpu);
@@ -8908,7 +8977,7 @@ impl SharedKernel {
                     requester_tid,
                     timeout_ticks
                 );
-                Some(self.complete_recv_boundary_user_copy(cpu, frame, &pending))
+                I::Answered(self.complete_recv_boundary_user_copy(cpu, frame, &pending))
             }
             crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingOrdinaryCapUserCopy(pending) => {
                 consume_preread_deadline(cpu);
@@ -8918,7 +8987,7 @@ impl SharedKernel {
                     requester_tid,
                     timeout_ticks
                 );
-                Some(self.complete_recv_boundary_ordinary_cap(cpu, frame, pending))
+                I::Answered(self.complete_recv_boundary_ordinary_cap(cpu, frame, pending))
             }
             crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingSharedRegion(pending) => {
                 consume_preread_deadline(cpu);
@@ -8928,7 +8997,7 @@ impl SharedKernel {
                     requester_tid,
                     timeout_ticks
                 );
-                Some(self.complete_recv_boundary_shared_region(cpu, frame, &pending))
+                I::Answered(self.complete_recv_boundary_shared_region(cpu, frame, &pending))
             }
         }
     }
@@ -8937,7 +9006,8 @@ impl SharedKernel {
         &self,
         cpu: CpuId,
         frame: &mut TrapFrame,
-    ) -> Option<Result<(), TrapHandleError>> {
+    ) -> crate::kernel::syscall::RecvImmediateOutcome {
+        use crate::kernel::syscall::RecvImmediateOutcome as I;
         // Stage 160 diagnostics: pin exactly where (if anywhere) the AArch64 split
         // recv falls back to the global legacy path. Each step logs result=ok or a
         // reason, so the boot log localizes the divergence to a single step.
@@ -8947,7 +9017,8 @@ impl SharedKernel {
         // Mirrors the Stage 29A trap-seam discipline: never current_tid_split_read.
         let Some(requester_tid) = self.current_tid_authoritative(cpu) else {
             crate::yarm_log!("YARM_SPLIT_RECV_PROBE step=tid result=none cpu={}", cpu.0);
-            return None;
+            // U9-RECV-BLOCK2b §1 — no take was attempted, so nothing about the queue is known.
+            return I::NoTakeAttempted("no_current_task");
         };
         crate::yarm_log!(
             "YARM_SPLIT_RECV_PROBE step=tid result=ok requester_tid={}",
@@ -8967,7 +9038,7 @@ impl SharedKernel {
                     "YARM_SPLIT_RECV_PROBE step=snapshot result=err recv_cap={}",
                     recv_cap.0
                 );
-                return Some(Err(TrapHandleError::Syscall(
+                return I::Answered(Err(TrapHandleError::Syscall(
                     crate::kernel::syscall::SyscallError::from(e),
                 )));
             }
@@ -9027,7 +9098,19 @@ impl SharedKernel {
         );
         let phase_a = self.recv_queued_split_phase_a_split(cpu, frame, &snapshot, &request);
         let result = match phase_a {
-            crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback => None,
+            // U9-RECV-BLOCK2b §1 — the take's own answer. NR 2 has no non-blocking form: its
+            // request is built by `RecvRequest::from_legacy_ipc_recv`, which hard-codes
+            // `RecvBlockingPolicy::WaitForever`, so an empty take on this NR is always the
+            // canonical parking precondition and never an answer.
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback(decline) => {
+                crate::yarm_log!("YARM_SPLIT_RECV_PROBE step=outcome result=fallback");
+                return match decline {
+                    crate::kernel::syscall::RecvSplitDecline::EmptyTake => I::EmptyAwaitingPark,
+                    crate::kernel::syscall::RecvSplitDecline::ShapeNotServed(_) => {
+                        I::NoTakeAttempted("shape_not_served")
+                    }
+                };
+            }
             crate::kernel::syscall::RecvQueuedSplitPhaseA::Completed(r) => Some(r),
             crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingUserCopy(pending) => {
                 // The with_cpu closure has returned: the global SpinLock is
@@ -9067,11 +9150,16 @@ impl SharedKernel {
             Some(Err(_)) => {
                 crate::yarm_log!("YARM_SPLIT_RECV_PROBE step=outcome result=serviced_err");
             }
+            // Unreachable: the `Fallback` arm above returns before `result` is built, and every
+            // other arm produces `Some(..)`. Retained so the match stays total over the Option.
             None => {
                 crate::yarm_log!("YARM_SPLIT_RECV_PROBE step=outcome result=fallback");
             }
         }
-        result
+        match result {
+            Some(r) => I::Answered(r),
+            None => I::NoTakeAttempted("no_phase_a_result"),
+        }
     }
 
     /// Stage 187A — Phase B (186E user-copy seam) + Phase C (frame/rollback/
