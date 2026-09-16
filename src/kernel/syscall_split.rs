@@ -3162,10 +3162,27 @@ fn try_split_timer_into_frame(
     if !is_timer {
         return D::NotHandled;
     }
-    // (1) FAIL BEFORE MUTATION — the proof-mode gate. Evaluated before claim, tick, timeout work,
-    // preemption or re-arm, so a refused trap reaches the broad arm having changed nothing.
-    if crate::kernel::boot::timer_proof_hooks_armed() {
-        crate::yarm_log!("TIMER_SPLIT_REFUSED cpu={} reason=proof_hooks_armed", cpu.0);
+    // U9-TIMER3 §2 — the PROOF-MODE GATE, reduced from five terms to one by REMOVING the
+    // dependency behind four of them, not by narrowing a predicate.
+    //
+    // It used to refuse the whole route whenever any of five default-off knobs was set, because
+    // all five one-shot proof bodies had their only callsite in the broad timer arm. Narrowing it
+    // to "enabled and not yet run" would have been the wrong repair — that still needs a broad
+    // timer to EXECUTE each proof — so four of the bodies are driven from the boot ownership point
+    // instead, where their one real prerequisite (a real user task current) is first satisfied.
+    // `yarm.cap_cnode`, `yarm.fault_delivery`, `yarm.global_state` and `yarm.smp_ready` no longer
+    // send a single tick to the broad dispatcher.
+    //
+    // `spawn_lifecycle` alone remains, because its rollback queues a cross-CPU `TlbShootdown` and
+    // the boot ownership point sits inside the dispatch window; see
+    // `spawn_lifecycle_proof_needs_broad_timer` for the measurement. It still fails BEFORE the
+    // claim, the tick, the timeout work, the preemption and the re-arm, so a refused trap reaches
+    // the broad arm having changed nothing.
+    if crate::kernel::boot::spawn_lifecycle_proof_needs_broad_timer() {
+        crate::yarm_log!(
+            "TIMER_SPLIT_REFUSED cpu={} reason=spawn_lifecycle_proof_armed",
+            cpu.0
+        );
         return D::NotHandled;
     }
     // (2) THE PREEMPTING TICK — U9-TIMER1.

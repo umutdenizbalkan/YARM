@@ -137,6 +137,74 @@ impl KernelState {
         }
     }
 
+    /// U9-TIMER3 §2 — drive the one-shot diagnostic proofs that CAN leave the timer, from the
+    /// BOOT OWNERSHIP POINT.
+    ///
+    /// # What this replaces, and why it is not a framework
+    ///
+    /// Each of these bodies had exactly ONE caller: the broad `Trap::TimerInterrupt` arm. That
+    /// made `yarm.cap_cnode`, `yarm.fault_delivery`, `yarm.spawn_lifecycle`, `yarm.global_state`
+    /// and `yarm.smp_ready` into reasons for the split timer route to refuse —
+    /// `timer_proof_hooks_armed` — so an armed profile sent EVERY tick to the terminal broad
+    /// dispatcher, tick included, for the whole boot. The knobs stay set after their one-shot
+    /// bodies finish, so the cost did not even end when the proof did: measured on
+    /// `yarm.smp_ready=1`, the split route serviced 0 of 73 ticks.
+    ///
+    /// Nothing here is redesigned. This is a DRIVER: it calls the existing bodies, in the order
+    /// the timer arm called them, and each keeps its own knob check, its own prerequisites, its
+    /// own one-shot latch, its own scratch transactions and its own cleanup. No policy is copied,
+    /// no marker is manufactured, and no executed proof is replaced by a static assertion.
+    ///
+    /// # Why the timer was never a requirement
+    ///
+    /// Not one of them reads a tick, a deadline, an interrupt or any timer state. What they
+    /// actually require is identical — a real user task current with `tid != 0` — plus, for the
+    /// ones that run scratch transactions, that task's CNode. The timer arm was simply a recurring
+    /// callsite that already held `&mut KernelState` and ran after a task was current; it was
+    /// never the prerequisite, only the place that happened to satisfy it.
+    ///
+    /// # Why the caller's point satisfies every prerequisite
+    ///
+    /// The one caller is `run_scheduler_loop`, immediately after `dispatch_ready_task()` and
+    /// guarded on it having produced a task — which is exactly what makes a real user task
+    /// current, and exactly the gate the relocated `maybe_run_x86_smp_unlock_audit` already
+    /// depends on at that same point. Before that line no real user task is current, and this is
+    /// measurable rather than assumed: driven there, every body returns silently and no profile
+    /// emits any evidence. `release_secondary_cpus_after_bootstrap()` has run, so AP admission is
+    /// settled before `smp_ready` reports `online_cpu_count`; the graduated proof ran inside
+    /// `bootstrap_first_user_task`, so the graduated-proof ordering gate is satisfied rather than
+    /// bypassed. The CNode-dependent proofs ask `current_task_cnode()` themselves and return
+    /// silently if it is absent, exactly as before.
+    ///
+    /// The order is the timer arm's order, and it is preserved for one reason that matters:
+    /// `smp_ready` observes `online_cpu_count()`, and the SMP-unlock audit that runs after it is
+    /// what admits an AP. Running them the other way round would change what `smp_ready` reports.
+    ///
+    /// # Why `spawn_lifecycle` is NOT here
+    ///
+    /// It is the one body whose mutation is unsafe in this window, and that was measured rather
+    /// than reasoned about. Its rollback calls `destroy_user_address_space_by_asid`, which queues
+    /// a `TlbShootdown` cross-CPU work item to every online non-wake-only CPU — this one included
+    /// — and the caller runs inside its DISPATCH WINDOW: the selected task's translation regime is
+    /// installed and the task has not been entered yet. Driven here on AArch64 the proof reports
+    /// `SPAWN_LIFECYCLE_PROOF_DONE result=ok` and the selected task then never reaches user mode;
+    /// the boot only ticks. Re-installing the selected task's address space afterwards through
+    /// `d2_recv_switch_incoming_asid` restores TTBR0 and does NOT fix it, which is what identifies
+    /// the pending shootdown rather than the register as the cause.
+    ///
+    /// Draining or reshaping that shootdown is a repair to the cross-CPU work path, not a
+    /// dependency removal, so it is out of this package's scope. `spawn_lifecycle` keeps its timer
+    /// callsite and its gate term, and that residual is reported rather than absorbed.
+    ///
+    /// No acquisition is added. The caller already owns `&mut KernelState`; this takes no
+    /// `with_cpu`, no `SharedKernel::with`, no raw broad lock and no whole-state projection.
+    pub fn run_one_shot_diagnostic_proofs_at_first_dispatch(&mut self) {
+        self.maybe_run_cap_cnode_proof();
+        self.maybe_run_fault_delivery_proof();
+        self.maybe_run_global_state_audit();
+        self.maybe_run_smp_ready_audit();
+    }
+
     /// Stage 176 (GLOBAL-STATE): one-shot, read-only global-state audit.
     ///
     /// Runs at most once (a `compare_exchange` latch) when `yarm.global_state=1` and

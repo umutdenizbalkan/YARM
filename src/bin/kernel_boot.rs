@@ -70,6 +70,16 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     // The audit body, its one-shot latch and its provisioning policy are untouched; only the
     // driver moved, and the historical trap-path hooks beside it are left exactly as they are.
     if initial.is_some() {
+        // U9-TIMER3 §2 — the five one-shot diagnostic proofs, driven from the same ownership point
+        // and for the same reason the SMP-unlock audit is: `dispatch_ready_task()` has just made a
+        // real user task current, which is the ONE prerequisite all five share and the only thing
+        // their historical timer callsite was providing. Before this line no real user task is
+        // current, which is measurable — every proof returns silently there.
+        //
+        // They run BEFORE the SMP-unlock audit, which is the order the broad timer arm called them
+        // in and which is load-bearing: `smp_ready` reports `online_cpu_count()`, and the audit
+        // below is what admits an AP to the scheduler.
+        kernel.run_one_shot_diagnostic_proofs_at_first_dispatch();
         kernel.maybe_run_x86_smp_unlock_audit();
     }
     if DEBUG_DISPATCH_CONTEXT_LOG {

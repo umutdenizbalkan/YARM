@@ -18786,3 +18786,150 @@ there too — today an armed profile pays a full broad trap to get them.
 `ExternalInterrupt` is structurally smaller still and is worth naming for that reason, but it has no
 live traffic on any port and would be a conversion with nothing to witness; it belongs after the
 PLIC-enable pass, not before it.
+
+## U9-TIMER3 — removing `proof_hooks_armed` as a reason to enter the terminal broad dispatcher
+
+Base `52e1288c`. Five default-off diagnostic knobs — `yarm.cap_cnode`, `yarm.fault_delivery`,
+`yarm.spawn_lifecycle`, `yarm.global_state`, `yarm.smp_ready` — each made the split timer route
+refuse for the whole boot, because each of their one-shot bodies had exactly ONE caller: the broad
+`Trap::TimerInterrupt` arm. The knobs stay set after the one-shot finishes, so the cost outlived the
+proof. Measured at base on `yarm.smp_ready=1`: **0 of 73 ticks** serviced by the split route.
+
+### §1 — where each proof actually has to run
+
+Traced body by body. Not one of the five reads a tick, a deadline, an interrupt or any timer state.
+Their real prerequisites are identical — a real user task current with `tid != 0` — plus, for the
+three that run scratch transactions, that task's CNode. The timer arm was never the prerequisite,
+only a recurring callsite that already held `&mut KernelState` and happened to satisfy it.
+
+| proof | mutations | cleanup | needs a timer? |
+|---|---|---|---|
+| `cap_cnode` | mints one memory-object cap into the task's CNode | revokes it; double-revoke must fail | no |
+| `fault_delivery` | scratch endpoint, one message sent and dequeued | revokes both caps, frees the endpoint slot | no |
+| `spawn_lifecycle` | creates a user address space + cap | destroys the aspace, revokes the cap | no |
+| `global_state` | **none** (read-only) | — | no |
+| `smp_ready` | **none** (read-only) | — | no |
+
+The owner is the one the SMP-unlock audit already uses: `run_scheduler_loop`, guarded on
+`dispatch_ready_task()` having produced a task. `release_secondary_cpus_after_bootstrap()` has run,
+so AP admission is settled before `smp_ready` reports `online_cpu_count`; the graduated proof ran
+inside `bootstrap_first_user_task`, so the ordering gate is satisfied rather than bypassed. That the
+prerequisite does **not** hold earlier is measured, not assumed: driven before
+`dispatch_ready_task()`, every body returns silently and no profile emits any evidence.
+
+### §2 — four relocated, one blocked, and the blocker is measured
+
+`run_one_shot_diagnostic_proofs_at_first_dispatch` is a DRIVER, not a framework: it calls the
+existing bodies in the timer arm's order, and each keeps its own knob check, prerequisites, one-shot
+latch, scratch transactions and cleanup. No policy is copied, no marker manufactured, no executed
+proof replaced by a static assertion. The caller already owns `&mut KernelState`, so no `with_cpu`,
+`SharedKernel::with`, raw broad lock or whole-state projection is added.
+
+**`spawn_lifecycle` does not move, and the reason is a measurement rather than an argument.** Its
+rollback calls `destroy_user_address_space_by_asid`, which queues a `TlbShootdown` cross-CPU work
+item to every online non-wake-only CPU — this one included — and the boot ownership point sits
+inside the DISPATCH WINDOW: the selected task's translation regime is installed and the task has not
+been entered yet. Driven there on AArch64, the proof reports `SPAWN_LIFECYCLE_PROOF_DONE result=ok`
+and the selected task then never reaches user mode; the boot only ticks. The base passes the same
+profile, so the regression was mine. Re-installing the selected task's address space afterwards
+through `d2_recv_switch_incoming_asid` restores TTBR0 and does **not** fix it — which is what
+identifies the pending shootdown, not the register, as the cause.
+
+Draining or reshaping that shootdown is a repair to the cross-CPU work path, not a dependency
+removal, so it is out of scope. The five-term `timer_proof_hooks_armed` therefore becomes the
+one-term `spawn_lifecycle_proof_needs_broad_timer`, and the residual is reported rather than
+absorbed. It is **not** a narrowed predicate over the same five — that would still need a broad
+timer to EXECUTE each proof; four of the five no longer need one at all.
+
+### §3 — the dependency is gone, proved against the real bodies
+
+Six runtime cases drive the production driver over a real `KernelState`: each relocated proof runs
+exactly once and a second drive changes nothing; a disabled proof leaves its latch untouched;
+**prerequisites are checked before the latch is consumed**, so a call that could not produce
+evidence does not burn the one-shot and a later call still runs it; all four together run once and
+strand no memory object, endpoint or address space against a full before/after snapshot; and
+`spawn_lifecycle` is asserted **not** to be driven from first dispatch, so re-adding it silently
+reintroduces the AArch64 hang.
+
+Eleven delivered guards were rederived rather than re-passed. The two that constrained the gate
+itself were replaced by a stronger claim than either could make: the timer-only set is now exactly
+`{spawn_lifecycle_proof}`, pinned by size, so a sixth timer-only hook fails there instead of quietly
+recreating the dependency.
+
+### Live traffic
+
+| port | profile | relocated fall-throughs | `spawn_lifecycle` gate | split ticks | evidence |
+|---|---|---|---|---|---|
+| x86_64 | `cap_cnode` / `fault_delivery` / `global_state` / `smp_ready` | **0** | 0 | 73 | all `result=ok` |
+| x86_64 | `spawn_lifecycle` | 0 | 73 | 0 | `result=ok` |
+| AArch64 | the four | **0** | 0 | 100–116 | all `result=ok` |
+| AArch64 | `spawn_lifecycle` | 0 | 115 | 0 | `result=ok` |
+| RISC-V | the four | **0** | 0 | 2022–2047 | all `result=ok` |
+| RISC-V | `spawn_lifecycle` | 0 | 800 | 0 | `result=ok` |
+
+The base measurement inverts exactly on the profile the directive names: `yarm.smp_ready=1` went
+from **73 fall-throughs / 0 split ticks** to **0 fall-throughs / 73 split ticks**, with
+`SMP_READY_PROOF_DONE result=ok` intact. Real proof evidence and zero relocated fall-throughs
+together, on every supported port.
+
+TIMER2's RISC-V idle-to-user witness is preserved on the ordinary boot: 207 idle advances, 207
+resumed, 0 `TIMER_IDLE_ADVANCE_BROAD_ENTRY`, 21 preempting commits. Tick, acknowledgement and
+re-arm accounting are untouched — the relocation moves no timer step.
+
+### Acquisition census
+
+| measure | value |
+|---|---|
+| `AUDITED_WITH_CPU_TOTAL` | **2** |
+| `AUDITED_WITH_BROAD_TOTAL` | **0** |
+| raw `self.state.lock()` wrapper bodies | **3** |
+
+Census target 7/7. The relocation adds no acquisition: the boot ownership point already holds
+`&mut KernelState`.
+
+### Qualification
+
+Hosted **5646 passed / 0 failed / 2 ignored**. Three ports build from fresh frozen artifacts.
+Doc-fragmentation 7/7, extraction bridge 2/2, census 7/7. Ordinary core smokes clean on all three
+ports. Futex regressions green on all three (`first_wake=1 second_wake=0 waiter_resumes=1`;
+`wake_count=1`). AP/SMP provisioning intact: recv-v2 block `-smp 2` `blocked_commits=1
+premature_wakes=0 wrong_cpu_blocks=0 result=ok`; saved return `-smp 2` `fresh_entries=1
+saved_dispatches=1 continuations=1 result=ok`. Park witness `proposed=12 committed=12 resumed=12
+broad_entries=0 result=ok`; delivery oracle `late_timeout_claims=0 result=ok`; XFER2 grant witness
+`grants=2 releases=2 route=split result=ok`. The established carve-out is unchanged at 8 pass /
+2 fail (`required_chain_is_scoped_to_the_witnessed_transaction`,
+`required_marker_chain_is_ordered_and_complete`).
+
+### Remaining timer edges
+
+Five declines remain in the route, and none of them is closed by this package:
+
+| # | exit | population |
+|---|---|---|
+| 1 | `!is_timer` | the family filter, not a hand-off |
+| 2 | `reason=spawn_lifecycle_proof_armed` | **the last diagnostic dependency.** Its prerequisite for removal is the cross-CPU shootdown path, not another relocation |
+| 3 | `reason=no_user_return_path` | x86_64 and AArch64 idle-boundary timers, which cannot return to user mode |
+| 4 | `reason=<legacy_reason(decline)>` | the other five `YieldDecline` variants |
+| 5 | `reason=would_preempt` | documented-unreachable fail-safe |
+
+**Row 3 is a prerequisite for deleting the terminal acquisitions, not an unrelated deferred bug.**
+Those two ports idle in non-returning kernel loops (`sti; hlt`, `wfi`) whose traps cannot `iretq`
+or `eret` into a user task, so a task marked `Running` and current from such a trap is stranded.
+Until each port has an idle-boundary timer entry that can leave the idle lifecycle for user mode —
+the thing RISC-V's `riscv_s_mode_timer_trap` already is — the broad timer arm remains reachable
+there and the terminal acquisition cannot be deleted.
+
+**IRQ routing stays on the roadmap and its prerequisite is not yet derived.** `TrapEvent::
+ExternalInterrupt` still has no split route; its broad service is an IPC-rank route lookup, one
+`signal_notification`, an EOI and a handler arm that is `Ok(())`. Live traffic is currently zero on
+every port — RISC-V enables no PLIC source (`plic_does_not_enable_any_source_in_this_pass`) and
+neither other port delivered one on the core or FAT profiles — but that absence is an observation
+about today's boots, **not** a finding that a separate PLIC-enable project is required first. What
+the IRQ boundary actually needs must be derived when that boundary is addressed, from its own
+owners, rather than assumed from the current marker counts.
+
+### Deferred, unchanged
+
+* The legacy NR 2 blocking population still has no live producer.
+* The multi-page shared-region mapping defect, reproduced rather than repaired.
+* Init's mapping-run pressure.

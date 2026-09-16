@@ -2748,28 +2748,26 @@ pub(crate) fn set_cap_cnode_enabled(enabled: bool) {
     CAP_CNODE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
 }
 
-/// U9-TM §1 — is ANY timer-only proof hook armed?
+/// U9-TIMER3 §2 — the ONE remaining timer-only proof hook, and why it is still one.
 ///
-/// Five `maybe_run_*` hooks are called ONLY from the broad `Trap::TimerInterrupt` arm. A split
-/// timer route that returned early would stop them running, which is a silent regression rather
-/// than a refactor — each is armed by an existing profile and carries a dozen test references.
+/// This was `timer_proof_hooks_armed`, a five-term disjunction, and every term was a reason for
+/// the split timer route to hand a whole armed boot to the terminal broad dispatcher. Four of the
+/// five bodies are driven from the boot ownership point now, so their knobs are no longer reasons
+/// for anything.
 ///
-/// U9-TM does not relocate them. Instead the split route REFUSES whenever any of their knobs is
-/// armed, before it claims the interrupt, ticks, or mutates anything at all, and the unchanged
-/// broad arm then executes the tick and every hook exactly as before. This is a TEMPORARY
-/// proof-mode fallback, not TimerInterrupt retirement: while it stands, an armed proof profile
-/// still reaches the terminal broad dispatcher through the timer.
+/// `spawn_lifecycle` is the exception, and it is measured rather than assumed. Its rollback calls
+/// `destroy_user_address_space_by_asid`, which queues a `TlbShootdown` cross-CPU work item to every
+/// online non-wake-only CPU. The boot ownership point sits inside the dispatch window — the
+/// selected task's translation regime is installed and the task has not been entered — and on
+/// AArch64 that pending shootdown stops the task ever reaching user mode, with the proof itself
+/// still reporting `result=ok`. Restoring TTBR0 afterwards does not fix it, which is what
+/// identifies the shootdown rather than the register as the cause.
 ///
-/// Every term is one of the five existing knob sources — no new flag, no new selector. The
-/// disjunction is exhaustive over the timer-only set, and
-/// `u9tm_proof_gate::the_gate_covers_every_timer_only_hook` pins that a sixth timer-only hook
-/// cannot be added without extending it.
-pub(crate) fn timer_proof_hooks_armed() -> bool {
-    cap_cnode_enabled()
-        || fault_delivery_enabled()
-        || spawn_lifecycle_enabled()
-        || global_state_enabled()
-        || smp_ready_enabled()
+/// So this hook keeps its broad timer callsite and this gate keeps one term. Draining or reshaping
+/// the cross-CPU shootdown is a repair to that path, not a dependency removal, and it is the
+/// prerequisite for retiring the last term.
+pub(crate) fn spawn_lifecycle_proof_needs_broad_timer() -> bool {
+    spawn_lifecycle_enabled()
 }
 
 pub(crate) fn cap_cnode_enabled() -> bool {

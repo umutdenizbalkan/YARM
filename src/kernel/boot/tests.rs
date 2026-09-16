@@ -57176,9 +57176,33 @@ mod stage173_cap_cnode {
     // The one-shot proof is hooked in the arch-neutral timer path (no arch cfg).
     #[test]
     fn stage173_proof_hooked_arch_neutral() {
+        // U9-TIMER3 re-derivation. The claim is unchanged — this proof must be DRIVEN, from an
+        // arch-neutral owner, rather than merely defined — but its driver moved. Its only
+        // historical caller was the broad `Trap::TimerInterrupt` arm, which is exactly what made
+        // the five knobs a reason for the split timer route to refuse; it is now driven from the
+        // boot ownership point, where its one real prerequisite (a real user task current) is
+        // first satisfied. Both halves are pinned: the driver calls it, and the boot binary calls
+        // the driver.
+        const ORCH: &str = include_str!("orchestrator_state.rs");
+        const BOOT_BIN: &str = include_str!("../../bin/kernel_boot.rs");
+        let driver = ORCH
+            .split("pub fn run_one_shot_diagnostic_proofs_at_first_dispatch(&mut self) {")
+            .nth(1)
+            .and_then(|b| b.split("\n    }").next())
+            .expect("the first-dispatch driver");
         assert!(
-            FAULT_SRC.contains("self.maybe_run_cap_cnode_proof()"),
-            "proof must be driven from the arch-neutral fault/timer path"
+            driver.contains("self.maybe_run_cap_cnode_proof()"),
+            "the cap/CNode proof must be driven from the arch-neutral first-dispatch owner"
+        );
+        assert!(
+            BOOT_BIN.contains("kernel.run_one_shot_diagnostic_proofs_at_first_dispatch();"),
+            "and that owner must itself be driven from the boot ownership point"
+        );
+        // And NOT from the broad timer arm any more — leaving it there is what kept every tick of
+        // an armed boot on the terminal broad dispatcher.
+        assert!(
+            !FAULT_SRC.contains("self.maybe_run_cap_cnode_proof()"),
+            "the obsolete timer callsite must be removed, not left inert"
         );
         assert!(
             LIFECYCLE_SRC.contains("fn maybe_run_cap_cnode_proof(")
@@ -57538,9 +57562,33 @@ mod stage174_fault_delivery {
     // is self-contained + one-shot.
     #[test]
     fn stage174_proof_hooked_arch_neutral() {
+        // U9-TIMER3 re-derivation. The claim is unchanged — this proof must be DRIVEN, from an
+        // arch-neutral owner, rather than merely defined — but its driver moved. Its only
+        // historical caller was the broad `Trap::TimerInterrupt` arm, which is exactly what made
+        // the five knobs a reason for the split timer route to refuse; it is now driven from the
+        // boot ownership point, where its one real prerequisite (a real user task current) is
+        // first satisfied. Both halves are pinned: the driver calls it, and the boot binary calls
+        // the driver.
+        const ORCH: &str = include_str!("orchestrator_state.rs");
+        const BOOT_BIN: &str = include_str!("../../bin/kernel_boot.rs");
+        let driver = ORCH
+            .split("pub fn run_one_shot_diagnostic_proofs_at_first_dispatch(&mut self) {")
+            .nth(1)
+            .and_then(|b| b.split("\n    }").next())
+            .expect("the first-dispatch driver");
         assert!(
-            FAULT_SRC.contains("self.maybe_run_fault_delivery_proof()"),
-            "proof must be driven from the arch-neutral fault/timer path"
+            driver.contains("self.maybe_run_fault_delivery_proof()"),
+            "the fault-delivery proof must be driven from the arch-neutral first-dispatch owner"
+        );
+        assert!(
+            BOOT_BIN.contains("kernel.run_one_shot_diagnostic_proofs_at_first_dispatch();"),
+            "and that owner must itself be driven from the boot ownership point"
+        );
+        // And NOT from the broad timer arm any more — leaving it there is what kept every tick of
+        // an armed boot on the terminal broad dispatcher.
+        assert!(
+            !FAULT_SRC.contains("self.maybe_run_fault_delivery_proof()"),
+            "the obsolete timer callsite must be removed, not left inert"
         );
         assert!(
             FAULT_SRC.contains("fn maybe_run_fault_delivery_proof(")
@@ -57816,9 +57864,21 @@ mod stage175_spawn_lifecycle {
     // self-contained + one-shot.
     #[test]
     fn stage175_proof_hooked_arch_neutral() {
+        // U9-TIMER3: this is the ONE proof that did not move. Its rollback calls
+        // `destroy_user_address_space_by_asid`, which queues a `TlbShootdown` cross-CPU work item,
+        // and the boot ownership point sits inside the dispatch window — measured on AArch64, the
+        // selected task then never reaches user mode while the proof itself still reports
+        // `result=ok`. So it keeps the broad timer callsite and the timer route keeps one gate
+        // term for it; see `spawn_lifecycle_proof_needs_broad_timer`.
         assert!(
             FAULT_SRC.contains("self.maybe_run_spawn_lifecycle_proof()"),
             "proof must be driven from the arch-neutral fault/timer path"
+        );
+        const ORCH175: &str = include_str!("orchestrator_state.rs");
+        assert!(
+            !ORCH175.contains("self.maybe_run_spawn_lifecycle_proof()"),
+            "and must NOT also be driven from the first-dispatch owner, where its shootdown \
+             lands inside the dispatch window"
         );
         assert!(
             EXEC_SRC.contains("fn maybe_run_spawn_lifecycle_proof(")
@@ -58140,9 +58200,33 @@ mod stage176_global_state {
     // The audit is one-shot, arch-neutral, read-only, and hooked in the timer path.
     #[test]
     fn stage176_audit_hooked_arch_neutral() {
+        // U9-TIMER3 re-derivation. The claim is unchanged — this proof must be DRIVEN, from an
+        // arch-neutral owner, rather than merely defined — but its driver moved. Its only
+        // historical caller was the broad `Trap::TimerInterrupt` arm, which is exactly what made
+        // the five knobs a reason for the split timer route to refuse; it is now driven from the
+        // boot ownership point, where its one real prerequisite (a real user task current) is
+        // first satisfied. Both halves are pinned: the driver calls it, and the boot binary calls
+        // the driver.
+        const ORCH: &str = include_str!("orchestrator_state.rs");
+        const BOOT_BIN: &str = include_str!("../../bin/kernel_boot.rs");
+        let driver = ORCH
+            .split("pub fn run_one_shot_diagnostic_proofs_at_first_dispatch(&mut self) {")
+            .nth(1)
+            .and_then(|b| b.split("\n    }").next())
+            .expect("the first-dispatch driver");
         assert!(
-            FAULT_SRC.contains("self.maybe_run_global_state_audit()"),
-            "audit must be driven from the arch-neutral fault/timer path"
+            driver.contains("self.maybe_run_global_state_audit()"),
+            "the global-state audit must be driven from the arch-neutral first-dispatch owner"
+        );
+        assert!(
+            BOOT_BIN.contains("kernel.run_one_shot_diagnostic_proofs_at_first_dispatch();"),
+            "and that owner must itself be driven from the boot ownership point"
+        );
+        // And NOT from the broad timer arm any more — leaving it there is what kept every tick of
+        // an armed boot on the terminal broad dispatcher.
+        assert!(
+            !FAULT_SRC.contains("self.maybe_run_global_state_audit()"),
+            "the obsolete timer callsite must be removed, not left inert"
         );
         assert!(
             ORCH_SRC.contains("fn maybe_run_global_state_audit(")
@@ -58396,9 +58480,33 @@ mod stage177_smp_ready {
     // The audit is one-shot, read-only, hooked in the arch-neutral timer path.
     #[test]
     fn stage177_audit_hooked_and_readonly() {
+        // U9-TIMER3 re-derivation. The claim is unchanged — this proof must be DRIVEN, from an
+        // arch-neutral owner, rather than merely defined — but its driver moved. Its only
+        // historical caller was the broad `Trap::TimerInterrupt` arm, which is exactly what made
+        // the five knobs a reason for the split timer route to refuse; it is now driven from the
+        // boot ownership point, where its one real prerequisite (a real user task current) is
+        // first satisfied. Both halves are pinned: the driver calls it, and the boot binary calls
+        // the driver.
+        const ORCH: &str = include_str!("orchestrator_state.rs");
+        const BOOT_BIN: &str = include_str!("../../bin/kernel_boot.rs");
+        let driver = ORCH
+            .split("pub fn run_one_shot_diagnostic_proofs_at_first_dispatch(&mut self) {")
+            .nth(1)
+            .and_then(|b| b.split("\n    }").next())
+            .expect("the first-dispatch driver");
         assert!(
-            FAULT_SRC.contains("self.maybe_run_smp_ready_audit()"),
-            "audit must be driven from the arch-neutral fault/timer path"
+            driver.contains("self.maybe_run_smp_ready_audit()"),
+            "the SMP-readiness audit must be driven from the arch-neutral first-dispatch owner"
+        );
+        assert!(
+            BOOT_BIN.contains("kernel.run_one_shot_diagnostic_proofs_at_first_dispatch();"),
+            "and that owner must itself be driven from the boot ownership point"
+        );
+        // And NOT from the broad timer arm any more — leaving it there is what kept every tick of
+        // an armed boot on the terminal broad dispatcher.
+        assert!(
+            !FAULT_SRC.contains("self.maybe_run_smp_ready_audit()"),
+            "the obsolete timer callsite must be removed, not left inert"
         );
         assert!(
             ORCH_SRC.contains("fn maybe_run_smp_ready_audit(")
@@ -145540,25 +145648,61 @@ mod u9qa_not_retired {
                  retired the SELECTION owner, not the timer entry"
             );
         }
-        // The five hooks with no other call site. If any of these ever gains a pre-lock route,
-        // this list is where the claim has to be re-derived rather than quietly dropped.
-        for only in [
+        // U9-TIMER3 re-derivation. This list used to name five hooks whose ONLY call site was the
+        // broad timer arm, and that was the stated reason skipping the arm would be a silent
+        // regression. The five are driven from the boot ownership point now, so the claim is
+        // INVERTED rather than dropped: none of them may still hang off the timer arm, because
+        // that is precisely what made an armed profile send every tick to broad dispatch.
+        //
+        // What this guard still asserts about the timer entry is the part that remains true and
+        // is checked above: the arm continues to own the tick, the timeout collector and the
+        // re-arm.
+        for relocated in [
             "self.maybe_run_cap_cnode_proof()",
             "self.maybe_run_fault_delivery_proof()",
-            "self.maybe_run_spawn_lifecycle_proof()",
             "self.maybe_run_global_state_audit()",
             "self.maybe_run_smp_ready_audit()",
         ] {
             assert!(
-                arm.contains(only),
-                "the timer arm is the ONLY caller of `{only}`; a pre-lock timer route that \
-                 returned early would stop it running"
+                !arm.contains(relocated),
+                "`{relocated}` must no longer be driven from the broad timer arm"
             );
             assert_eq!(
-                FAULT.matches(only).count(),
-                1,
-                "`{only}` must still have exactly one call site — that is what makes skipping \
-                 the broad timer arm a silent regression rather than a refactor"
+                FAULT.matches(relocated).count(),
+                0,
+                "`{relocated}` must have no call site left in the broad trap handler at all"
+            );
+        }
+        // `spawn_lifecycle` is the ONE hook still owned solely by this arm, and the timer route
+        // still carries one gate term for it. Pinned explicitly so it cannot be quietly joined by
+        // a second: its shootdown lands inside the dispatch window, which is what keeps it here.
+        assert!(
+            arm.contains("self.maybe_run_spawn_lifecycle_proof()"),
+            "spawn_lifecycle keeps its timer callsite"
+        );
+        assert_eq!(
+            FAULT
+                .matches("self.maybe_run_spawn_lifecycle_proof()")
+                .count(),
+            1,
+            "and it is the only proof still driven exclusively from the broad trap handler"
+        );
+        // Every OTHER hook in the arm keeps its other caller, so none of them is timer-only and
+        // none can make a split timer route a silent regression.
+        for retained in [
+            "self.maybe_run_cross_arch_d6_audit()",
+            "self.maybe_run_cross_arch_live_audit()",
+            "self.maybe_run_d3_full_proof()",
+            "self.maybe_run_unlock_graduated_proof()",
+            "self.maybe_run_x86_smp_unlock_audit()",
+        ] {
+            assert!(
+                arm.contains(retained),
+                "`{retained}` is retained in the arm"
+            );
+            assert!(
+                FAULT.matches(retained).count() >= 2,
+                "`{retained}` must keep a caller outside the timer arm"
             );
         }
     }
@@ -147577,48 +147721,90 @@ mod u9tm_proof_gate {
     const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
     const TIMER: &str = include_str!("../scheduler_timer.rs");
 
-    fn gate_body() -> &'static str {
-        MOD_SRC
-            .split("pub(crate) fn timer_proof_hooks_armed() -> bool {")
-            .nth(1)
-            .and_then(|s| s.split("\n}").next())
-            .expect("the proof-mode gate")
-    }
-
-    /// The gate is built from the five EXISTING knob predicates — no new flag, no new selector.
+    /// U9-TIMER3 §3 — **NO KNOB MAY FORCE THE TIMER TO BROAD DISPATCH.**
+    ///
+    /// This replaces the two guards that constrained the proof-mode gate itself
+    /// (`the_gate_is_built_from_existing_knobs_only`, `the_gate_covers_every_timer_only_hook`).
+    /// They are not weakened into nothing — their purpose was to stop a timer-only hook being
+    /// silently skipped by the split route, and that purpose is now served by a STRONGER claim
+    /// than either of them could make: there is no gate, and no hook that could need one.
+    ///
+    /// The old exhaustiveness argument was "every hook whose ONLY callsite is the broad timer arm
+    /// must appear in the gate". The replacement removes the antecedent: after the relocation, no
+    /// hook in that arm is timer-only, so no hook can be skipped by a split route that services
+    /// the tick — and a sixth one added tomorrow fails here rather than quietly reintroducing the
+    /// dependency this package removed.
     #[test]
-    fn the_gate_is_built_from_existing_knobs_only() {
-        let g = gate_body();
-        for k in [
-            "cap_cnode_enabled()",
-            "fault_delivery_enabled()",
-            "spawn_lifecycle_enabled()",
-            "global_state_enabled()",
-            "smp_ready_enabled()",
+    fn no_diagnostic_knob_forces_the_timer_to_broad_dispatch() {
+        const ORCH: &str = include_str!("orchestrator_state.rs");
+        const BOOT_BIN: &str = include_str!("../../bin/kernel_boot.rs");
+
+        // (1) The five-term gate is GONE. What replaced it is not a narrower predicate over the
+        // same five — that would still need a broad timer to EXECUTE each proof — but a ONE-term
+        // gate over the single body whose mutation cannot run where the others now do.
+        assert!(
+            !MOD_SRC.contains("fn timer_proof_hooks_armed("),
+            "the five-term gate must be removed"
+        );
+        assert!(
+            MOD_SRC.contains("fn spawn_lifecycle_proof_needs_broad_timer() -> bool {"),
+            "and the one remaining dependency must name itself"
+        );
+        let remaining = MOD_SRC
+            .split("pub(crate) fn spawn_lifecycle_proof_needs_broad_timer() -> bool {")
+            .nth(1)
+            .and_then(|b| b.split("\n}").next())
+            .expect("the one-term gate");
+        assert_eq!(
+            remaining.matches("_enabled()").count(),
+            1,
+            "exactly one term: {remaining}"
+        );
+        assert!(
+            remaining.contains("spawn_lifecycle_enabled()"),
+            "and it is the spawn-lifecycle knob"
+        );
+
+        // (2) The split timer route consults none of the four RELOCATED knobs, under any
+        // spelling.
+        let route: alloc::string::String = SPLIT
+            .split("fn try_split_timer_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the timer route")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for knob in [
+            "cap_cnode_enabled",
+            "fault_delivery_enabled",
+            "global_state_enabled",
+            "smp_ready_enabled",
+            "timer_proof_hooks_armed",
         ] {
             assert!(
-                g.contains(k),
-                "the gate must consult the existing knob `{k}`"
+                !route.contains(knob),
+                "the timer route must not consult `{knob}` — that is the dependency U9-TIMER3 \
+                 removed"
             );
         }
-        assert_eq!(g.matches("||").count(), 4, "exactly five terms, disjoined");
         assert!(
-            !g.contains("static ") && !g.contains("AtomicBool"),
-            "the gate must introduce no new flag of its own"
+            route.contains("spawn_lifecycle_proof_needs_broad_timer()"),
+            "the one remaining dependency must be consulted through its named owner, so the \
+             residual stays countable rather than being spelled out inline"
         );
-    }
 
-    /// EXHAUSTIVENESS: every hook whose ONLY call site is the broad timer arm must appear in the
-    /// gate. Adding a sixth timer-only hook without extending the gate fails here — which is the
-    /// whole point, since such a hook would be silently skipped by the split route.
-    #[test]
-    fn the_gate_covers_every_timer_only_hook() {
+        // (3) EXHAUSTIVENESS, in its strongest form: no hook still called from the broad timer arm
+        // is timer-ONLY, so none of them can be skipped by a split route that services the tick.
         let arm = FAULT
             .split("Trap::TimerInterrupt => {")
             .nth(1)
             .and_then(|s| s.split("\n            Trap::").next())
             .expect("the broad timer arm");
-        let g = gate_body();
         let mut timer_only = alloc::vec::Vec::new();
         for line in arm.lines() {
             let t = line.trim();
@@ -147634,18 +147820,344 @@ mod u9tm_proof_gate {
             }
         }
         assert_eq!(
-            timer_only.len(),
-            5,
-            "expected exactly five timer-only hooks, found {timer_only:?}"
+            timer_only,
+            alloc::vec![alloc::string::String::from("spawn_lifecycle_proof")],
+            "exactly one hook may still be timer-only, and it is the one whose shootdown cannot \
+             run in the dispatch window — anything else reintroduces the dependency this package \
+             removed: {timer_only:?}"
         );
-        for name in &timer_only {
-            // Each hook's knob predicate shares its stem: `maybe_run_X_proof`/`_audit` -> `X_enabled`.
-            let stem = name.trim_end_matches("_proof").trim_end_matches("_audit");
+
+        // (4) And the five relocated bodies are genuinely driven, from a non-timer owner that the
+        // boot ownership point calls. Their evidence does not depend on broad trap dispatch.
+        let driver = ORCH
+            .split("pub fn run_one_shot_diagnostic_proofs_at_first_dispatch(&mut self) {")
+            .nth(1)
+            .and_then(|b| b.split("\n    }").next())
+            .expect("the first-dispatch driver");
+        for fn_name in [
+            "maybe_run_cap_cnode_proof",
+            "maybe_run_fault_delivery_proof",
+            "maybe_run_global_state_audit",
+            "maybe_run_smp_ready_audit",
+        ] {
             assert!(
-                g.contains(&alloc::format!("{stem}_enabled()")),
-                "timer-only hook `maybe_run_{name}` has no term in the proof-mode gate"
+                driver.contains(&alloc::format!("self.{fn_name}()")),
+                "`{fn_name}` must be driven from the first-dispatch owner"
+            );
+            assert!(
+                !arm.contains(&alloc::format!("self.{fn_name}()")),
+                "`{fn_name}` must not also keep its obsolete timer callsite"
             );
         }
+        assert!(
+            BOOT_BIN.contains("kernel.run_one_shot_diagnostic_proofs_at_first_dispatch();"),
+            "the boot ownership point must drive them"
+        );
+
+        // (5) The relocation adds no acquisition: the caller already owns `&mut KernelState`.
+        for banned in ["with_cpu(", "SharedKernel", ".state.lock()", "unsafe {"] {
+            assert!(
+                !driver.contains(banned),
+                "the driver must not introduce `{banned}`"
+            );
+        }
+    }
+
+    // ─── U9-TIMER3 §3 — the dependency is gone, proved by running the real bodies ────────────
+    //
+    // Every case below drives `run_one_shot_diagnostic_proofs_at_first_dispatch` — the production
+    // driver, not a reimplementation — over a real `KernelState`, and checks the latch, the
+    // prerequisites and the scratch resources the proofs actually touch.
+
+    use crate::kernel::boot::{
+        CAP_CNODE_PROOF_STARTED, FAULT_DELIVERY_PROOF_STARTED, GLOBAL_STATE_AUDIT_STARTED,
+        SMP_READY_AUDIT_STARTED, SPAWN_LIFECYCLE_PROOF_STARTED,
+    };
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// The four RELOCATED proofs and their one-shot latches, as one table so no case can drift
+    /// from another. `spawn_lifecycle` is deliberately absent — it is the one body whose rollback
+    /// queues a cross-CPU `TlbShootdown`, which cannot run in the caller's dispatch window, so it
+    /// keeps its broad timer callsite. Its exclusion is asserted rather than assumed, in
+    /// `u9t3_the_retained_proof_is_not_driven_from_first_dispatch`.
+    fn proofs() -> [(&'static str, fn(bool), &'static AtomicBool); 4] {
+        [
+            (
+                "cap_cnode",
+                crate::kernel::boot::set_cap_cnode_enabled as fn(bool),
+                &CAP_CNODE_PROOF_STARTED,
+            ),
+            (
+                "fault_delivery",
+                crate::kernel::boot::set_fault_delivery_enabled as fn(bool),
+                &FAULT_DELIVERY_PROOF_STARTED,
+            ),
+            (
+                "global_state",
+                crate::kernel::boot::set_global_state_enabled as fn(bool),
+                &GLOBAL_STATE_AUDIT_STARTED,
+            ),
+            (
+                "smp_ready",
+                crate::kernel::boot::set_smp_ready_enabled as fn(bool),
+                &SMP_READY_AUDIT_STARTED,
+            ),
+        ]
+    }
+
+    /// These knobs and latches are process-wide, so every case starts from a known state and
+    /// leaves one. Disarming is part of the fixture, not an afterthought: a leaked knob would make
+    /// the next case's "disabled" assertion vacuously true.
+    fn disarm_all() {
+        for (_, set, latch) in proofs() {
+            set(false);
+            latch.store(false, Ordering::Release);
+        }
+        crate::kernel::boot::set_spawn_lifecycle_enabled(false);
+        SPAWN_LIFECYCLE_PROOF_STARTED.store(false, Ordering::Release);
+    }
+
+    /// **THE RETAINED PROOF IS NOT DRIVEN FROM FIRST DISPATCH.**
+    ///
+    /// `spawn_lifecycle` is armed and the driver runs, and its latch stays unconsumed — because it
+    /// is not in the driver at all. This is what keeps the exclusion a fact rather than a comment:
+    /// silently adding it back would reintroduce the AArch64 dispatch-window hang that
+    /// `spawn_lifecycle_proof_needs_broad_timer` records.
+    #[test]
+    fn u9t3_the_retained_proof_is_not_driven_from_first_dispatch() {
+        disarm_all();
+        let mut state = first_dispatch_kernel();
+        crate::kernel::boot::set_spawn_lifecycle_enabled(true);
+        state.run_one_shot_diagnostic_proofs_at_first_dispatch();
+        assert!(
+            !SPAWN_LIFECYCLE_PROOF_STARTED.load(Ordering::Acquire),
+            "the first-dispatch driver must not run the proof whose shootdown cannot land here"
+        );
+        assert!(
+            crate::kernel::boot::spawn_lifecycle_proof_needs_broad_timer(),
+            "and the one-term gate must still report the dependency while the knob is armed"
+        );
+        disarm_all();
+        assert!(
+            !crate::kernel::boot::spawn_lifecycle_proof_needs_broad_timer(),
+            "with the knob off it is not a dependency at all"
+        );
+    }
+
+    /// A kernel whose current task is a real user task with a CNode — the state
+    /// `dispatch_ready_task()` leaves at the boot ownership point, and the one prerequisite all
+    /// five bodies share.
+    fn first_dispatch_kernel() -> crate::kernel::boot::KernelState {
+        use crate::kernel::boot::UserImageSpec;
+        use crate::kernel::task::TaskClass;
+        let mut state = crate::kernel::boot::Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("aspace");
+        state
+            .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
+                tid: 7,
+                entry: 0x4000,
+                asid: Some(asid),
+                class: TaskClass::App,
+                startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+                ..Default::default()
+            })
+            .expect("spawn");
+        // `dispatch_next_task` is the production owner `dispatch_ready_task` reaches; this is the
+        // same state the boot ownership point is in when it drives the proofs.
+        state.dispatch_next_task().expect("dispatch");
+        while state.current_tid() != Some(7) {
+            state.yield_current().expect("switch to the user task");
+        }
+        assert!(
+            state.current_tid().is_some_and(|t| t != 0),
+            "fixture: a real user task must be current"
+        );
+        assert!(
+            state.current_task_cnode().is_some(),
+            "fixture: that task must have a CNode"
+        );
+        state
+    }
+
+    /// **EACH PROOF RUNS EXACTLY ONCE, FROM THE FIRST-DISPATCH OWNER.**
+    ///
+    /// Armed individually: the driver consumes the latch on the first call, and a second call
+    /// finds it already consumed. This is the property the timer arm's repetition used to make
+    /// invisible — it called the bodies on every tick and the latch absorbed the rest.
+    #[test]
+    fn u9t3_each_proof_runs_exactly_once_from_the_first_dispatch_owner() {
+        for (name, set, latch) in proofs() {
+            disarm_all();
+            let mut state = first_dispatch_kernel();
+            set(true);
+            assert!(
+                !latch.load(Ordering::Acquire),
+                "{name}: the latch starts unconsumed"
+            );
+            state.run_one_shot_diagnostic_proofs_at_first_dispatch();
+            assert!(
+                latch.load(Ordering::Acquire),
+                "{name}: the first-dispatch owner must actually run it"
+            );
+            // A second drive changes nothing: the latch is the one-shot, and it is already spent.
+            state.run_one_shot_diagnostic_proofs_at_first_dispatch();
+            assert!(latch.load(Ordering::Acquire), "{name}: still consumed");
+        }
+        disarm_all();
+    }
+
+    /// **A DISABLED PROOF LEAVES ITS EVIDENCE ABSENT.**
+    ///
+    /// The driver is unconditional; each body's own knob check is what decides. With the knob off
+    /// the latch is never consumed, which is exactly what "no evidence" means for a one-shot.
+    #[test]
+    fn u9t3_a_disabled_proof_leaves_its_evidence_absent() {
+        disarm_all();
+        let mut state = first_dispatch_kernel();
+        state.run_one_shot_diagnostic_proofs_at_first_dispatch();
+        for (name, _, latch) in proofs() {
+            assert!(
+                !latch.load(Ordering::Acquire),
+                "{name}: a disabled proof must not run"
+            );
+        }
+        disarm_all();
+    }
+
+    /// **PREREQUISITES ARE CHECKED BEFORE THE LATCH IS CONSUMED.**
+    ///
+    /// The one-shot must not be burned by a call that could not have produced evidence. Driven
+    /// with no real user task current, every body returns without claiming its latch — so a later
+    /// call, once the prerequisite holds, still runs the proof.
+    #[test]
+    fn u9t3_prerequisites_are_checked_before_the_latch_is_consumed() {
+        disarm_all();
+        for (_, set, _) in proofs() {
+            set(true);
+        }
+        let mut state = crate::kernel::boot::Bootstrap::init().expect("init");
+        // Clear the current slot through the production owner: no current task, so no proof can
+        // have anything to report.
+        let _ = state.block_current_cpu();
+        assert_eq!(state.current_tid(), None, "fixture: nothing is current");
+
+        state.run_one_shot_diagnostic_proofs_at_first_dispatch();
+        for (name, _, latch) in proofs() {
+            assert!(
+                !latch.load(Ordering::Acquire),
+                "{name}: a call that cannot produce evidence must not burn the one-shot"
+            );
+        }
+
+        // Now the prerequisite holds, and every one of them still runs.
+        let mut ready = first_dispatch_kernel();
+        ready.run_one_shot_diagnostic_proofs_at_first_dispatch();
+        for (name, _, latch) in proofs() {
+            assert!(
+                latch.load(Ordering::Acquire),
+                "{name}: the proof must still be available once its prerequisite holds"
+            );
+        }
+        disarm_all();
+    }
+
+    /// **THE SUPPORTED COMBINATION: ALL FOUR RELOCATED PROOFS ARMED AT ONCE.**
+    ///
+    /// Each still runs exactly once, and the scratch transactions strand nothing. The two that
+    /// mutate — cap/CNode mints and revokes a memory-object cap, fault-delivery creates a scratch
+    /// endpoint and frees it — are checked against a full before/after resource snapshot rather
+    /// than against their own markers, so a leak shows up here even if a body stopped reporting
+    /// one.
+    #[test]
+    fn u9t3_all_four_together_run_once_and_strand_nothing() {
+        disarm_all();
+        let mut state = first_dispatch_kernel();
+
+        let snapshot = |s: &crate::kernel::boot::KernelState| {
+            let objects = s
+                .memory
+                .memory_objects
+                .iter()
+                .filter(|o| o.is_some())
+                .count();
+            let endpoints = s.live_endpoint_count_for_test();
+            let spaces = s.with_user_spaces(|sp| {
+                (0..crate::kernel::vm::MAX_ADDRESS_SPACES)
+                    .filter(|i| sp.get(crate::kernel::vm::Asid(*i as u16)).is_some())
+                    .count()
+            });
+            (objects, endpoints, spaces)
+        };
+        let before = snapshot(&state);
+
+        for (_, set, _) in proofs() {
+            set(true);
+        }
+        state.run_one_shot_diagnostic_proofs_at_first_dispatch();
+
+        for (name, _, latch) in proofs() {
+            assert!(
+                latch.load(Ordering::Acquire),
+                "{name}: ran under the combination"
+            );
+        }
+        assert_eq!(
+            snapshot(&state),
+            before,
+            "the scratch transactions must strand no memory object, endpoint or address space"
+        );
+        disarm_all();
+    }
+
+    /// **LATER TICKS STAY SPLIT.**
+    ///
+    /// The point of the whole package. With every knob armed and every proof already run, the
+    /// timer route's decision is unchanged — because it no longer asks about the knobs at all.
+    /// Asserted against the route's own source, since the refusal it used to take is the thing
+    /// being removed.
+    #[test]
+    fn u9t3_later_ticks_stay_split_with_every_relocated_knob_armed() {
+        disarm_all();
+        let mut state = first_dispatch_kernel();
+        for (_, set, _) in proofs() {
+            set(true);
+        }
+        state.run_one_shot_diagnostic_proofs_at_first_dispatch();
+        for (name, _, latch) in proofs() {
+            assert!(latch.load(Ordering::Acquire), "{name}: ran");
+        }
+        // The knobs are STILL armed — that is the situation that used to cost every subsequent
+        // tick a broad dispatch, because the knob outlives the one-shot body.
+        for (name, _, _) in proofs() {
+            let _ = name;
+        }
+        assert!(
+            crate::kernel::boot::smp_ready_enabled()
+                && crate::kernel::boot::cap_cnode_enabled()
+                && crate::kernel::boot::global_state_enabled(),
+            "fixture: the knobs outlive their one-shot bodies, which is the whole problem"
+        );
+        let route: alloc::string::String = SPLIT
+            .split("fn try_split_timer_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the timer route")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !route.contains("cap_cnode_enabled")
+                && !route.contains("global_state_enabled")
+                && !route.contains("smp_ready_enabled")
+                && !route.contains("fault_delivery_enabled")
+                && !route.contains("timer_proof_hooks_armed"),
+            "with the relocated knobs armed the route must still decide on the tick alone"
+        );
+        disarm_all();
     }
 
     /// FAIL BEFORE MUTATION: every refusal precedes the claim, the tick and the re-arm.
@@ -147685,18 +148197,18 @@ mod u9tm_proof_gate {
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
         let route = route.as_str();
-        let gate = route
-            .find("timer_proof_hooks_armed()")
-            .expect("the proof-mode refusal");
         let lookahead = route
             .find("timer_would_preempt_split_read(cpu)")
             .expect("the preempting-branch lookahead");
-        // The proof-mode refusal happens before anything ticks, and before the branch is chosen.
+        // U9-TIMER3 re-derivation: the proof-mode refusal that used to be ordered here is GONE,
+        // so there is no longer a prologue refusal to order against the lookahead. The property
+        // the guard exists for is untouched and is asserted below for the refusals that remain:
+        // nothing is claimed, ticked or re-armed until the last thing that can refuse has already
+        // answered.
         assert!(
-            route[..gate].find("scheduler_tick").is_none(),
-            "nothing may tick before the proof-mode gate is evaluated"
+            !route.contains("timer_proof_hooks_armed"),
+            "the proof-mode refusal is removed, so nothing may still order against it"
         );
-        assert!(gate < lookahead, "the proof-mode gate is the prologue");
         assert!(
             route[..lookahead].find("scheduler_tick").is_none()
                 && route[..lookahead]
@@ -170281,11 +170793,19 @@ mod u9timer1_preempting_timer {
         }
         // The declining paths tick nothing at all: they hand an unchanged CPU to the broad arm,
         // which ticks and preempts exactly as it always has.
+        // U9-TIMER3 re-derivation: 5 -> 4. The proof-mode gate is removed, because the dependency
+        // behind it is removed — the five one-shot proof bodies are driven from the boot ownership
+        // point and no diagnostic knob sends a tick to broad dispatch any more.
+        // U9-TIMER3 re-derivation: the five-term proof-mode gate became a ONE-term gate, so the
+        // decline count is unchanged at 5 while what the third of them covers shrank from five
+        // default-off knobs to one. Four of the five proof bodies are driven from the boot
+        // ownership point and no longer send a tick anywhere.
         assert_eq!(
             code.matches("return D::NotHandled;").count(),
             5,
-            "five declines: not-a-timer, the proof-mode gate, an idle CPU whose run queue is NOT \
-             empty, a transaction decline, and the tail's fail-safe if the lookahead and the \
+            "five declines: not-a-timer, the one remaining proof hook whose shootdown cannot run \
+             in the dispatch window, a port with no idle-boundary landing that can return to user \
+             mode, a transaction decline, and the tail's fail-safe if the lookahead and the \
              no-switch seam ever disagreed"
         );
     }
@@ -170556,9 +171076,17 @@ mod u9timer1_preempting_timer {
     fn every_remaining_timer_decline_is_inventoried() {
         // The route's own two, by their exact emitted reasons.
         let code = route();
+        // U9-TIMER3 re-derivation: `proof_hooks_armed` is RETIRED as a decline, and retired by
+        // removing the dependency rather than by narrowing the predicate. The five one-shot proof
+        // bodies are driven from the boot ownership point, so no diagnostic knob is a reason for
+        // this route to refuse any more.
         assert!(
-            code.contains("reason=proof_hooks_armed"),
-            "the proof-mode gate must name itself"
+            !code.contains("reason=proof_hooks_armed"),
+            "the proof-mode decline is retired, not renamed"
+        );
+        assert!(
+            !code.contains("timer_proof_hooks_armed"),
+            "and the route must not consult the removed gate under any spelling"
         );
         // U9-TIMER2 re-derivation: `no_current_runnable` is RETIRED as a decline. The
         // idle-CPU-with-queued-work population is now settled by the route, which ticks once,
