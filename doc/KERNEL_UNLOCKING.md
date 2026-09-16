@@ -18933,3 +18933,149 @@ owners, rather than assumed from the current marker counts.
 * The legacy NR 2 blocking population still has no live producer.
 * The multi-page shared-region mapping defect, reproduced rather than repaired.
 * Init's mapping-run pressure.
+
+## U9-TIMER4 — removing the last timer-proof dependency
+
+Base `df93c336`. U9-TIMER3 relocated four of five one-shot diagnostic proofs off the broad timer arm
+and left one term: `spawn_lifecycle_proof_armed`. It attributed that residual to the proof's
+cross-CPU TLB shootdown. **That attribution was wrong**, and this package establishes what was
+actually happening.
+
+### §1 — which teardown the scratch transaction owes
+
+`maybe_run_spawn_lifecycle_proof` created a scratch address space and rolled it back with
+`destroy_user_address_space_by_asid` — the **resident** teardown. The tree already provides the
+never-resident inverse, `destroy_unresident_address_space_locked`, used by
+`create_user_address_space`'s own mint-failure rollback, both spawn adapters and the COW clone.
+
+Never-residency is provable, not assumed:
+
+* residency has a definition — `live_cpu_bitmap_for_asid`: an ASID is CPU-resident exactly when
+  some online, non-wake-only CPU's **current** task carries it via `task_asid(tid)`;
+* a task carries one only through `tcb.asid = Some(..)`, and this proof never binds, never
+  activates and never maps the scratch space;
+* the whole transaction runs under one `&mut KernelState` with no yield, trap or lock release
+  between create and destroy, so nothing can interleave and bind it;
+* **ASID reuse cannot reintroduce it**: `allocate_asid` refuses any candidate present in `entries`
+  **or** in `retired`, so the number handed out aliases neither a live nor a recently-retired space.
+
+The resident teardown was not merely redundant here. It passes `online & !wake_only` rather than the
+resident set, so it registers a retired ASID and posts mailbox work for **every** destroy. The
+retired array is `MAX_ADDRESS_SPACES` deep and drains only on acknowledgement — a bounded resource
+spent on behalf of a space no CPU could ever have held a translation for. The rollback now composes
+the existing inverse through the established VM→memory acquisition; capability cleanup is unchanged
+and stays in the CNode the cap was minted into. Resident teardown is untouched.
+
+### The real cause, captured rather than guessed
+
+Switching to the never-resident inverse did **not** fix the AArch64 hang — which is precisely what
+falsifies the shootdown attribution, since that path posts no shootdown and takes no retired slot.
+Nor did restoring TTBR0 through `d2_recv_switch_incoming_asid`. Nor did masking interrupts around
+the driver alone; the hang was deterministic 3/3, so it was not a timing race against the proof.
+
+Diffing a failing boot against a passing one gave one divergence: `CROSS_ARCH_LIVE_ORIGIN
+origin=trap` where the passing boot has `origin=first_dispatch`, with the entire
+`BSP_BEFORE_ENTER_RING3` / `YARM_AARCH64_BEFORE_ERET` block absent. Probing the boundary gave the
+state directly:
+
+```
+U9T4_ENTRY_PROBE tid=2 ctx_present=1 pc=0x40084fdc sp=0x0 asid=Some(Asid(2)) status=Some(Running)
+```
+
+**`sp=0`.** `enter_dispatched_user_task_if_available` requires `stack_ptr != 0` and silently declines
+otherwise, so the boot never returns to user mode. Probes inside the proof showed it had left the
+context untouched (`pc=0x401f54 sp=0x3f9fff70` at every step) — the corruption happens *between* the
+proof and the entry.
+
+The mechanism is the boot path's own: `start_bsp_periodic_timer` runs before `dispatch_ready_task()`,
+so the BSP timer is armed while `run_scheduler_loop` holds a selected task whose saved context the
+entry is about to return through. A trap taken in that window writes the **EL1 boot frame** into
+that task's TCB. The hazard is the window, not anything a proof touches; the other four bodies escape
+it only by finishing inside a timer interval, and the spawn-lifecycle rollback is simply the first
+one slow enough not to.
+
+`run_scheduler_loop` now holds the region from the diagnostics through the architectural entry under
+`irq_save`/`irq_restore` — the tree's existing arch-neutral interrupt-exclusion owner. The window is
+closed rather than narrowed, and it does not leak into userspace: the architectural return restores
+the user interrupt state from the saved program status.
+
+### §2 — the dependency is gone
+
+The proof moves into the existing first-dispatch driver with the other four. The timer callsite and
+`spawn_lifecycle_proof_needs_broad_timer` are both removed — **no diagnostic knob redirects a
+`TimerInterrupt` to the broad dispatcher any more**, and the route's decline count drops 5 → 4.
+
+The proof's verdict now depends on its checks. It previously emitted `SPAWN_LIFECYCLE_PROOF_DONE
+result=ok` unconditionally, so a boot that emitted `SPAWN_LIFECYCLE_ROLLBACK_LEAK` still signed off as
+success and every profile grepping the done marker accepted a leak. It now reports
+`created=… destroyed=… aspace_gone=… cap_gone=… result=ok|leak`, computed from the four checks.
+Scratch creation, capability mint, destruction and leak checks are all retained.
+
+### §3 — the bounded change, through production owners
+
+Six cases drive the real driver over a real `KernelState`: the scratch capability and address space
+are released; the transaction consumes **no retired-ASID slot and posts no shootdown**; the selected
+task's identity, address space and continuation (including a non-zero saved stack pointer) survive;
+resident teardown keeps its pending-set computation and its shootdown submission; the last proof is
+driven from first dispatch; and the verdict is not a literal.
+
+### Live traffic
+
+Three runs per architecture on the spawn-lifecycle profile, fresh frozen artifacts, requiring real
+proof success and zero proof-gated fall-throughs **together**, plus actual userspace progress:
+
+| port | runs | proof-gated fall-throughs | split ticks | `USER_LOG` lines | evidence |
+|---|---|---|---|---|---|
+| x86_64 | 3 | **0 / 0 / 0** | 73 each | 598 each | `created=1 destroyed=1 aspace_gone=1 cap_gone=1 result=ok` |
+| AArch64 | 3 | **0 / 0 / 0** | 111–119 | 841–854 | same |
+| RISC-V | 3 | **0 / 0 / 0** | 1944–1956 | 1746 each | same |
+
+At base this profile gave 73 / 115 / 800 fall-throughs and **0** split ticks on the three ports; it
+is now 0 fall-throughs and full split service everywhere. The four relocated profiles are unchanged
+(0 fall-throughs, `result=ok`). TIMER2's RISC-V idle-to-user witness is preserved on the ordinary
+boot: 199 idle advances, 199 resumed, 0 `TIMER_IDLE_ADVANCE_BROAD_ENTRY`.
+
+### Source reachability
+
+No `self.maybe_run_*` hook in the broad timer arm is timer-only; every one retains a caller outside
+it. No diagnostic knob appears in the split timer route under any spelling, and neither gate helper
+exists. Both facts are pinned by guard rather than by inspection.
+
+### Acquisition census
+
+| measure | value |
+|---|---|
+| `AUDITED_WITH_CPU_TOTAL` | **2** |
+| `AUDITED_WITH_BROAD_TOTAL` | **0** |
+| raw `self.state.lock()` wrapper bodies | **3** |
+
+Census target 7/7. No acquisition is added: the boot ownership point already holds
+`&mut KernelState`, and `irq_save`/`irq_restore` is not a lock.
+
+### Qualification
+
+Hosted **5649 passed / 0 failed / 2 ignored**, single-threaded. Three ports build. Doc-fragmentation
+7/7, extraction bridge 2/2, census 7/7. Ordinary core smokes clean on all three ports. Futex
+regressions green (`first_wake=1 second_wake=0 waiter_resumes=1`; `wake_count=1`). AP/SMP acceptance
+chain intact: recv-v2 block `-smp 2` `blocked_commits=1 premature_wakes=0 wrong_cpu_blocks=0
+result=ok`; saved return `-smp 2` `fresh_entries=1 saved_dispatches=1 continuations=1 result=ok`.
+XFER2 grant witness `grants=2 releases=2 route=split result=ok`. The established carve-out is
+unchanged at 8 pass / 2 fail (`required_chain_is_scoped_to_the_witnessed_transaction`,
+`required_marker_chain_is_ordered_and_complete`).
+
+### Remaining timer edges
+
+`TimerInterrupt` is **not** closed and neither is U9. Four declines remain:
+
+| # | exit | population |
+|---|---|---|
+| 1 | `!is_timer` | the family filter, not a hand-off |
+| 2 | `reason=no_user_return_path` | x86_64 and AArch64 idle-boundary timers, which cannot return to user mode. Still a prerequisite for deleting the terminal acquisitions |
+| 3 | `reason=<legacy_reason(decline)>` | the other five `YieldDecline` variants |
+| 4 | `reason=would_preempt` | documented-unreachable fail-safe |
+
+### Deferred, unchanged
+
+* The legacy NR 2 blocking population still has no live producer.
+* The multi-page shared-region mapping defect, reproduced rather than repaired.
+* Init's mapping-run pressure.

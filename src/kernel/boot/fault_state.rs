@@ -1612,22 +1612,15 @@ impl KernelState {
                     .process_ipc_timeout_deadlines(_tick.0)
                     .map_err(SyscallError::from)
                     .map_err(TrapHandleError::Syscall)?;
-                // U9-TIMER3 §2: four of the five one-shot proofs that used to run HERE —
-                // cap/CNode, fault-delivery, global-state and SMP-ready — are driven from the boot
-                // ownership point instead (`run_one_shot_diagnostic_proofs_at_first_dispatch`),
-                // which is where their one real prerequisite is first satisfied. Their callsites
-                // are removed rather than left inert, because leaving them is what made those four
-                // knobs reasons for the split timer route to refuse: an armed profile sent every
-                // tick of the boot to this arm, long after the one-shot bodies had finished.
+                // U9-TIMER3 §2 / U9-TIMER4 §2: ALL FIVE one-shot proofs that used to run HERE —
+                // cap/CNode, fault-delivery, spawn-lifecycle, global-state and SMP-ready — are
+                // driven from the boot ownership point instead
+                // (`run_one_shot_diagnostic_proofs_at_first_dispatch`), which is where their one
+                // real prerequisite is first satisfied. Their callsites are removed rather than
+                // left inert, because leaving them is what made those knobs reasons for the split
+                // timer route to refuse: an armed profile sent every tick of the boot to this arm,
+                // long after the one-shot bodies had finished.
                 //
-                // Stage 175 (SPAWN-LIFECYCLE) stays. Its rollback destroys a scratch address space,
-                // which queues a `TlbShootdown` cross-CPU work item, and the boot ownership point
-                // sits inside the dispatch window — measured on AArch64, the selected task then
-                // never reaches user mode. Draining that shootdown is a repair to the cross-CPU
-                // work path rather than a dependency removal, so this one keeps its timer callsite
-                // and its gate term. Self-contained (scratch address space) — it does NOT spawn a
-                // real task. Arch-neutral, diagnostic only.
-                self.maybe_run_spawn_lifecycle_proof();
                 // Stage 178 (CROSS-ARCH-D6): one-shot read-only per-arch D6 restore-path
                 // audit. Runs at most once when `yarm.cross_arch_d6=1` and a real user
                 // task is current; no-op otherwise. Read-only (observes the incoming

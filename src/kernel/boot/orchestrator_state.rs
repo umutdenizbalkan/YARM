@@ -201,6 +201,7 @@ impl KernelState {
     pub fn run_one_shot_diagnostic_proofs_at_first_dispatch(&mut self) {
         self.maybe_run_cap_cnode_proof();
         self.maybe_run_fault_delivery_proof();
+        self.maybe_run_spawn_lifecycle_proof();
         self.maybe_run_global_state_audit();
         self.maybe_run_smp_ready_audit();
     }

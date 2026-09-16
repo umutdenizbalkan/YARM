@@ -69,12 +69,43 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     //
     // The audit body, its one-shot latch and its provisioning policy are untouched; only the
     // driver moved, and the historical trap-path hooks beside it are left exactly as they are.
+    // U9-TIMER4 §1 — INTERRUPTS ARE MASKED FROM HERE TO THE ARCHITECTURAL RETURN, and this is the
+    // exclusion condition the boot ownership point actually needs.
+    //
+    // `start_bsp_periodic_timer` ran above, so the BSP timer is armed, and `dispatch_ready_task()`
+    // has just selected a task whose saved user context `enter_dispatched_user_task_if_available`
+    // is about to return through. A trap taken in that window writes the EL1 BOOT frame into the
+    // selected task's TCB: its saved stack pointer becomes 0, and the entry gate — which requires
+    // `stack_ptr != 0` — then silently declines the return. The boot never reaches user mode.
+    //
+    // This was measured, not reasoned about. With `yarm.spawn_lifecycle=1` on AArch64 the failing
+    // boot differed from a passing one at exactly one place: `CROSS_ARCH_LIVE_ORIGIN origin=trap`
+    // where the passing boot has `origin=first_dispatch`, with the whole `BSP_BEFORE_ENTER_RING3` /
+    // `YARM_AARCH64_BEFORE_ERET` block absent. Probing the boundary gave the state directly —
+    // `tid=2 ctx_present=1 pc=0x40084fdc sp=0x0` — while probes inside the proof showed it had left
+    // the context untouched (`pc=0x401f54 sp=0x3f9fff70` at every step). The corruption happens
+    // between the proof and the entry, on the trap.
+    //
+    // So the hazard is the WINDOW, not anything a particular proof touches. The other four bodies
+    // escape it only by finishing inside a timer interval; the spawn-lifecycle rollback is simply
+    // the first one slow enough not to. Two earlier attributions were wrong and are recorded as
+    // such: it is not the cross-CPU shootdown (the hang survives the switch to
+    // `destroy_unresident_address_space_locked`, which posts none) and not TTBR0 (restoring it
+    // through `d2_recv_switch_incoming_asid` did not help).
+    //
+    // `irq_save`/`irq_restore` is the tree's existing arch-neutral interrupt-exclusion owner. The
+    // mask spans the diagnostics, the SMP-unlock audit and the entry, so the window is CLOSED
+    // rather than narrowed. It does not leak into userspace: the architectural return restores the
+    // user interrupt state from the saved program status, and the explicit restores below are
+    // reached only when no return happens.
+    let boot_irq_state = yarm::arch::irq_guard::irq_save();
     if initial.is_some() {
-        // U9-TIMER3 §2 — the five one-shot diagnostic proofs, driven from the same ownership point
-        // and for the same reason the SMP-unlock audit is: `dispatch_ready_task()` has just made a
-        // real user task current, which is the ONE prerequisite all five share and the only thing
-        // their historical timer callsite was providing. Before this line no real user task is
-        // current, which is measurable — every proof returns silently there.
+        // U9-TIMER3 §2 / U9-TIMER4 §2 — the five one-shot diagnostic proofs, driven from the same
+        // ownership point and for the same reason the SMP-unlock audit is: `dispatch_ready_task()`
+        // has just made a real user task current, which is the ONE prerequisite all five share and
+        // the only thing their historical timer callsite was providing. Before this line no real
+        // user task is current — measured: the probe reads `tid=Some(0)`, the bootstrap identity,
+        // which every body's `tid == 0` gate rejects.
         //
         // They run BEFORE the SMP-unlock audit, which is the order the broad timer arm called them
         // in and which is load-bearing: `smp_ready` reports `online_cpu_count()`, and the audit
@@ -96,7 +127,11 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
             yarm::yarm_log!("DISPATCH: before enter_user_call");
         }
         yarm::arch::boot_entry::enter_dispatched_user_task_if_available(kernel, Some(tid));
+        // Only reached when the entry declined; the architectural return restores the user
+        // interrupt state itself.
+        yarm::arch::irq_guard::irq_restore(boot_irq_state);
     } else {
+        yarm::arch::irq_guard::irq_restore(boot_irq_state);
         if cpu.0 == yarm::arch::platform_constants::BOOTSTRAP_CPU_ID {
             yarm::yarm_log!("BSP_REDISPATCH_SELECTED tid=None");
         } else {

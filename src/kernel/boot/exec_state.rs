@@ -2016,8 +2016,36 @@ impl KernelState {
         };
         let created = self.with_user_spaces(|spaces| spaces.get(asid).is_some());
 
-        // Rollback: destroy the scratch ASID and revoke the scratch aspace cap.
-        let destroyed = self.destroy_user_address_space_by_asid(asid).is_ok();
+        // U9-TIMER4 §1 — the rollback uses the NEVER-RESIDENT inverse, which is what this scratch
+        // space actually owes.
+        //
+        // Residency has a definition in this tree, and it is `live_cpu_bitmap_for_asid`: an ASID is
+        // CPU-resident exactly when some online, non-wake-only CPU's CURRENT task carries it via
+        // `task_asid(tid)`. A task carries one only through `tcb.asid = Some(..)`. This scratch
+        // space is never bound to a task, never activated, never mapped and never observable: the
+        // whole transaction runs under one `&mut KernelState` with no yield, trap or lock release
+        // between the create and the destroy, so nothing can interleave and bind it. Its
+        // `live_cpu_bitmap_for_asid` is therefore 0 at every instant of its existence. Reuse cannot
+        // reintroduce residency either — `allocate_asid` refuses any ASID present in `entries` or
+        // in `retired`, so the number it hands out aliases neither a live nor a recently-retired
+        // space.
+        //
+        // `destroy_user_address_space_by_asid` is the RESIDENT teardown, and using it here was not
+        // merely redundant. It passes `online & !wake_only` rather than the resident set, so it
+        // registers a retired ASID and posts mailbox work for EVERY destroy — a bounded resource
+        // consumed, and cross-CPU work owed, on behalf of a space no CPU could ever have held a
+        // translation for. `destroy_unresident_address_space_locked` is the exact inverse for this
+        // state and is the SAME one `create_user_address_space`'s own mint-failure rollback and
+        // both spawn adapters already use for an address space in precisely this condition.
+        //
+        // Composed through the established VM→memory acquisition, in that rank order. No second
+        // teardown policy is introduced, and resident teardown is untouched.
+        let destroyed = self
+            .with_vm_then_memory_mut(|vm, memory| {
+                super::vm_image_locked::destroy_unresident_address_space_locked(vm, memory, asid)
+            })
+            .is_ok();
+        // The capability cleanup is unchanged and stays in the CNode it was minted into.
         let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
 
         let aspace_gone = self.with_user_spaces(|spaces| spaces.get(asid).is_none());
@@ -2029,13 +2057,28 @@ impl KernelState {
         if !cap_gone {
             crate::yarm_log!("SPAWN_LIFECYCLE_CAP_LEAK tid={} cap={}", tid, aspace_cap.0);
         }
-        if created && destroyed && aspace_gone && cap_gone {
+        // U9-TIMER4 §2 — the final result now DEPENDS on the checks.
+        //
+        // It used to read `result=ok` unconditionally, on the same line, whether or not the four
+        // conditions held — so a boot that emitted `SPAWN_LIFECYCLE_ROLLBACK_LEAK` still signed off
+        // `result=ok`, and every profile that greps for the done marker accepted a leak as success.
+        // The failure markers above are unchanged; what changes is that the verdict is one of them.
+        let ok = created && destroyed && aspace_gone && cap_gone;
+        if ok {
             crate::yarm_log!("SPAWN_LIFECYCLE_ROLLBACK_OK tid={} asid={}", tid, asid.0);
             crate::yarm_log!("SPAWN_LIFECYCLE_INVARIANT_OK tid={}", tid);
         } else {
             crate::yarm_log!("SPAWN_LIFECYCLE_ROLLBACK_LEAK tid={} asid={}", tid, asid.0);
         }
-        crate::yarm_log!("SPAWN_LIFECYCLE_PROOF_DONE tid={} result=ok", tid);
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_PROOF_DONE tid={} created={} destroyed={} aspace_gone={} cap_gone={} result={}",
+            tid,
+            u8::from(created),
+            u8::from(destroyed),
+            u8::from(aspace_gone),
+            u8::from(cap_gone),
+            if ok { "ok" } else { "leak" }
+        );
     }
 
     /// Stage 168B (D2-GENUINE-RECV): switch the active address space to the

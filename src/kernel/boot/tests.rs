@@ -57864,21 +57864,29 @@ mod stage175_spawn_lifecycle {
     // self-contained + one-shot.
     #[test]
     fn stage175_proof_hooked_arch_neutral() {
-        // U9-TIMER3: this is the ONE proof that did not move. Its rollback calls
-        // `destroy_user_address_space_by_asid`, which queues a `TlbShootdown` cross-CPU work item,
-        // and the boot ownership point sits inside the dispatch window — measured on AArch64, the
-        // selected task then never reaches user mode while the proof itself still reports
-        // `result=ok`. So it keeps the broad timer callsite and the timer route keeps one gate
-        // term for it; see `spawn_lifecycle_proof_needs_broad_timer`.
-        assert!(
-            FAULT_SRC.contains("self.maybe_run_spawn_lifecycle_proof()"),
-            "proof must be driven from the arch-neutral fault/timer path"
-        );
+        // U9-TIMER3 / U9-TIMER4 re-derivation. The claim is unchanged — this proof must be DRIVEN,
+        // from an arch-neutral owner — but its driver moved twice. U9-TIMER3 left it on the timer
+        // on the belief that its rollback's cross-CPU shootdown could not run at first dispatch;
+        // that attribution was wrong, and U9-TIMER4 moved it with the other four once the real
+        // hazard — an interruptible window in the boot path itself — was closed.
         const ORCH175: &str = include_str!("orchestrator_state.rs");
+        const BOOT_BIN175: &str = include_str!("../../bin/kernel_boot.rs");
+        let driver = ORCH175
+            .split("pub fn run_one_shot_diagnostic_proofs_at_first_dispatch(&mut self) {")
+            .nth(1)
+            .and_then(|b| b.split("\n    }").next())
+            .expect("the first-dispatch driver");
         assert!(
-            !ORCH175.contains("self.maybe_run_spawn_lifecycle_proof()"),
-            "and must NOT also be driven from the first-dispatch owner, where its shootdown \
-             lands inside the dispatch window"
+            driver.contains("self.maybe_run_spawn_lifecycle_proof()"),
+            "the spawn-lifecycle proof must be driven from the arch-neutral first-dispatch owner"
+        );
+        assert!(
+            BOOT_BIN175.contains("kernel.run_one_shot_diagnostic_proofs_at_first_dispatch();"),
+            "and that owner must itself be driven from the boot ownership point"
+        );
+        assert!(
+            !FAULT_SRC.contains("self.maybe_run_spawn_lifecycle_proof()"),
+            "the obsolete timer callsite must be removed, not left inert"
         );
         assert!(
             EXEC_SRC.contains("fn maybe_run_spawn_lifecycle_proof(")
@@ -145660,6 +145668,7 @@ mod u9qa_not_retired {
         for relocated in [
             "self.maybe_run_cap_cnode_proof()",
             "self.maybe_run_fault_delivery_proof()",
+            "self.maybe_run_spawn_lifecycle_proof()",
             "self.maybe_run_global_state_audit()",
             "self.maybe_run_smp_ready_audit()",
         ] {
@@ -145673,21 +145682,7 @@ mod u9qa_not_retired {
                 "`{relocated}` must have no call site left in the broad trap handler at all"
             );
         }
-        // `spawn_lifecycle` is the ONE hook still owned solely by this arm, and the timer route
-        // still carries one gate term for it. Pinned explicitly so it cannot be quietly joined by
-        // a second: its shootdown lands inside the dispatch window, which is what keeps it here.
-        assert!(
-            arm.contains("self.maybe_run_spawn_lifecycle_proof()"),
-            "spawn_lifecycle keeps its timer callsite"
-        );
-        assert_eq!(
-            FAULT
-                .matches("self.maybe_run_spawn_lifecycle_proof()")
-                .count(),
-            1,
-            "and it is the only proof still driven exclusively from the broad trap handler"
-        );
-        // Every OTHER hook in the arm keeps its other caller, so none of them is timer-only and
+        // Every hook still in the arm keeps its other caller, so none of them is timer-only and
         // none can make a split timer route a silent regression.
         for retained in [
             "self.maybe_run_cross_arch_d6_audit()",
@@ -147739,34 +147734,18 @@ mod u9tm_proof_gate {
         const ORCH: &str = include_str!("orchestrator_state.rs");
         const BOOT_BIN: &str = include_str!("../../bin/kernel_boot.rs");
 
-        // (1) The five-term gate is GONE. What replaced it is not a narrower predicate over the
-        // same five — that would still need a broad timer to EXECUTE each proof — but a ONE-term
-        // gate over the single body whose mutation cannot run where the others now do.
-        assert!(
-            !MOD_SRC.contains("fn timer_proof_hooks_armed("),
-            "the five-term gate must be removed"
-        );
-        assert!(
-            MOD_SRC.contains("fn spawn_lifecycle_proof_needs_broad_timer() -> bool {"),
-            "and the one remaining dependency must name itself"
-        );
-        let remaining = MOD_SRC
-            .split("pub(crate) fn spawn_lifecycle_proof_needs_broad_timer() -> bool {")
-            .nth(1)
-            .and_then(|b| b.split("\n}").next())
-            .expect("the one-term gate");
-        assert_eq!(
-            remaining.matches("_enabled()").count(),
-            1,
-            "exactly one term: {remaining}"
-        );
-        assert!(
-            remaining.contains("spawn_lifecycle_enabled()"),
-            "and it is the spawn-lifecycle knob"
-        );
+        // (1) NO diagnostic gate remains, in any form. U9-TIMER3 reduced the five-term gate to
+        // one; U9-TIMER4 removes that too, by closing the boot-path window that kept the last
+        // proof on the timer. Neither helper may come back — a narrower predicate would still make
+        // a broad timer the thing that EXECUTES a proof.
+        for gone in [
+            "fn timer_proof_hooks_armed(",
+            "fn spawn_lifecycle_proof_needs_broad_timer(",
+        ] {
+            assert!(!MOD_SRC.contains(gone), "`{gone}` must be removed");
+        }
 
-        // (2) The split timer route consults none of the four RELOCATED knobs, under any
-        // spelling.
+        // (2) The split timer route consults NONE of the five knobs, under any spelling.
         let route: alloc::string::String = SPLIT
             .split("fn try_split_timer_into_frame(")
             .nth(1)
@@ -147782,21 +147761,18 @@ mod u9tm_proof_gate {
         for knob in [
             "cap_cnode_enabled",
             "fault_delivery_enabled",
+            "spawn_lifecycle_enabled",
             "global_state_enabled",
             "smp_ready_enabled",
             "timer_proof_hooks_armed",
+            "spawn_lifecycle_proof_needs_broad_timer",
         ] {
             assert!(
                 !route.contains(knob),
-                "the timer route must not consult `{knob}` — that is the dependency U9-TIMER3 \
-                 removed"
+                "the timer route must not consult `{knob}` — no diagnostic knob may redirect a \
+                 TimerInterrupt to the broad dispatcher"
             );
         }
-        assert!(
-            route.contains("spawn_lifecycle_proof_needs_broad_timer()"),
-            "the one remaining dependency must be consulted through its named owner, so the \
-             residual stays countable rather than being spelled out inline"
-        );
 
         // (3) EXHAUSTIVENESS, in its strongest form: no hook still called from the broad timer arm
         // is timer-ONLY, so none of them can be skipped by a split route that services the tick.
@@ -147819,12 +147795,10 @@ mod u9tm_proof_gate {
                 timer_only.push(alloc::string::String::from(name));
             }
         }
-        assert_eq!(
-            timer_only,
-            alloc::vec![alloc::string::String::from("spawn_lifecycle_proof")],
-            "exactly one hook may still be timer-only, and it is the one whose shootdown cannot \
-             run in the dispatch window — anything else reintroduces the dependency this package \
-             removed: {timer_only:?}"
+        assert!(
+            timer_only.is_empty(),
+            "a hook whose only callsite is the broad timer arm reintroduces the dependency this \
+             package removed — give it a non-timer owner: {timer_only:?}"
         );
 
         // (4) And the five relocated bodies are genuinely driven, from a non-timer owner that the
@@ -147837,6 +147811,7 @@ mod u9tm_proof_gate {
         for fn_name in [
             "maybe_run_cap_cnode_proof",
             "maybe_run_fault_delivery_proof",
+            "maybe_run_spawn_lifecycle_proof",
             "maybe_run_global_state_audit",
             "maybe_run_smp_ready_audit",
         ] {
@@ -147875,12 +147850,10 @@ mod u9tm_proof_gate {
     };
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    /// The four RELOCATED proofs and their one-shot latches, as one table so no case can drift
-    /// from another. `spawn_lifecycle` is deliberately absent — it is the one body whose rollback
-    /// queues a cross-CPU `TlbShootdown`, which cannot run in the caller's dispatch window, so it
-    /// keeps its broad timer callsite. Its exclusion is asserted rather than assumed, in
-    /// `u9t3_the_retained_proof_is_not_driven_from_first_dispatch`.
-    fn proofs() -> [(&'static str, fn(bool), &'static AtomicBool); 4] {
+    /// The five relocated proofs and their one-shot latches, as one table so no case can drift
+    /// from another. U9-TIMER4 returned `spawn_lifecycle` to it: the window hazard that kept it on
+    /// the timer was the boot path's own, and closing that closed it for every body here.
+    fn proofs() -> [(&'static str, fn(bool), &'static AtomicBool); 5] {
         [
             (
                 "cap_cnode",
@@ -147891,6 +147864,11 @@ mod u9tm_proof_gate {
                 "fault_delivery",
                 crate::kernel::boot::set_fault_delivery_enabled as fn(bool),
                 &FAULT_DELIVERY_PROOF_STARTED,
+            ),
+            (
+                "spawn_lifecycle",
+                crate::kernel::boot::set_spawn_lifecycle_enabled as fn(bool),
+                &SPAWN_LIFECYCLE_PROOF_STARTED,
             ),
             (
                 "global_state",
@@ -147913,35 +147891,28 @@ mod u9tm_proof_gate {
             set(false);
             latch.store(false, Ordering::Release);
         }
-        crate::kernel::boot::set_spawn_lifecycle_enabled(false);
-        SPAWN_LIFECYCLE_PROOF_STARTED.store(false, Ordering::Release);
     }
 
-    /// **THE RETAINED PROOF IS NOT DRIVEN FROM FIRST DISPATCH.**
+    /// **U9-TIMER4 — THE LAST PROOF IS DRIVEN FROM FIRST DISPATCH TOO.**
     ///
-    /// `spawn_lifecycle` is armed and the driver runs, and its latch stays unconsumed — because it
-    /// is not in the driver at all. This is what keeps the exclusion a fact rather than a comment:
-    /// silently adding it back would reintroduce the AArch64 dispatch-window hang that
-    /// `spawn_lifecycle_proof_needs_broad_timer` records.
+    /// U9-TIMER3 excluded `spawn_lifecycle` on the belief that its rollback's cross-CPU shootdown
+    /// could not run in the caller's window. That attribution was wrong, and this is the inverted
+    /// claim: it is driven with the others, and its knob is no longer a gate term anywhere.
     #[test]
-    fn u9t3_the_retained_proof_is_not_driven_from_first_dispatch() {
+    fn u9t4_the_last_proof_is_driven_from_first_dispatch() {
         disarm_all();
         let mut state = first_dispatch_kernel();
         crate::kernel::boot::set_spawn_lifecycle_enabled(true);
         state.run_one_shot_diagnostic_proofs_at_first_dispatch();
         assert!(
-            !SPAWN_LIFECYCLE_PROOF_STARTED.load(Ordering::Acquire),
-            "the first-dispatch driver must not run the proof whose shootdown cannot land here"
+            SPAWN_LIFECYCLE_PROOF_STARTED.load(Ordering::Acquire),
+            "the first-dispatch driver must run the spawn-lifecycle proof"
         );
         assert!(
-            crate::kernel::boot::spawn_lifecycle_proof_needs_broad_timer(),
-            "and the one-term gate must still report the dependency while the knob is armed"
+            !MOD_SRC.contains("spawn_lifecycle_proof_needs_broad_timer"),
+            "and its one-term gate must be gone, not merely unused"
         );
         disarm_all();
-        assert!(
-            !crate::kernel::boot::spawn_lifecycle_proof_needs_broad_timer(),
-            "with the knob off it is not a dependency at all"
-        );
     }
 
     /// A kernel whose current task is a real user task with a CNode — the state
@@ -148006,6 +147977,156 @@ mod u9tm_proof_gate {
         disarm_all();
     }
 
+    /// The spawn-lifecycle proof body, CODE only and brace-bounded.
+    fn spawn_lifecycle_proof_code() -> alloc::string::String {
+        const EXEC: &str = include_str!("exec_state.rs");
+        EXEC.split("pub(crate) fn maybe_run_spawn_lifecycle_proof(&mut self) {")
+            .nth(1)
+            .and_then(|b| b.split("\n    }\n").next())
+            .expect("the proof body")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// **U9-TIMER4 §3 — THE SCRATCH TRANSACTION OWES NOTHING.**
+    ///
+    /// The spawn-lifecycle rollback used the RESIDENT teardown, `destroy_user_address_space_by_asid`,
+    /// which passes `online & !wake_only` rather than the resident set — so it registered a retired
+    /// ASID and posted a `TlbShootdown` work item for a scratch space no CPU could ever have held a
+    /// translation for. The retired array is `MAX_ADDRESS_SPACES` deep and drains only on
+    /// acknowledgement, so that is a bounded resource spent per run.
+    ///
+    /// Never-residency is provable rather than assumed. `live_cpu_bitmap_for_asid` defines resident
+    /// as "some online, non-wake-only CPU's CURRENT task carries it", a task carries one only
+    /// through `tcb.asid`, and this proof never binds, activates or maps the scratch space — the
+    /// whole transaction runs under one `&mut KernelState` with no yield or trap between the create
+    /// and the destroy. Reuse cannot reintroduce it either: `allocate_asid` refuses any ASID
+    /// present in `entries` OR in `retired`.
+    ///
+    /// So the exact inverse is `destroy_unresident_address_space_locked`, the same one
+    /// `create_user_address_space`'s own mint-failure rollback and both spawn adapters already use.
+    /// This checks what that buys, against the production owners: the scratch space and its
+    /// capability are gone, and neither a retired-ASID slot nor a shootdown is consumed.
+    #[test]
+    fn u9t4_the_scratch_transaction_releases_everything_and_owes_nothing() {
+        disarm_all();
+        let mut state = first_dispatch_kernel();
+
+        let retired_before = state.with_user_spaces(|sp| sp.retired_count());
+        let shootdowns_before = state.tlb_shootdown_count();
+        let spaces_before = state.with_user_spaces(|sp| {
+            (0..crate::kernel::vm::MAX_ADDRESS_SPACES)
+                .filter(|i| sp.get(crate::kernel::vm::Asid(*i as u16)).is_some())
+                .count()
+        });
+
+        crate::kernel::boot::set_spawn_lifecycle_enabled(true);
+        state.run_one_shot_diagnostic_proofs_at_first_dispatch();
+        assert!(
+            SPAWN_LIFECYCLE_PROOF_STARTED.load(Ordering::Acquire),
+            "fixture: the proof actually ran"
+        );
+
+        // The scratch address space and its capability are released.
+        assert_eq!(
+            state.with_user_spaces(|sp| {
+                (0..crate::kernel::vm::MAX_ADDRESS_SPACES)
+                    .filter(|i| sp.get(crate::kernel::vm::Asid(*i as u16)).is_some())
+                    .count()
+            }),
+            spaces_before,
+            "the scratch address space must be gone"
+        );
+        // And nothing is owed: no retired-ASID slot taken, no shootdown posted.
+        assert_eq!(
+            state.with_user_spaces(|sp| sp.retired_count()),
+            retired_before,
+            "a never-resident destroy must consume NO retired-ASID slot — that array is bounded \
+             and drains only on acknowledgement"
+        );
+        assert_eq!(
+            state.tlb_shootdown_count(),
+            shootdowns_before,
+            "and must post no shootdown: the resident set for this ASID is empty by construction"
+        );
+        // The selected task survives the proof intact — identity, address space and continuation.
+        let tid = state.current_tid().expect("still current");
+        assert_eq!(tid, 7, "the proof must not change which task is current");
+        assert!(state.task_asid(tid).is_some(), "its address space survives");
+        let ctx = state.thread_user_context(tid).expect("its continuation");
+        assert_ne!(
+            ctx.stack_ptr.0, 0,
+            "and its saved stack pointer survives — a zero here is exactly what makes the \
+             architectural entry decline"
+        );
+        disarm_all();
+    }
+
+    /// **RESIDENT TEARDOWN IS UNTOUCHED.**
+    ///
+    /// Only the scratch rollback changed owner. The resident path keeps its shootdown submission
+    /// and its retired-ASID registration, because a space some CPU may hold translations for owes
+    /// both — that is the distinction the two owners exist to draw, and collapsing it in either
+    /// direction is a correctness bug.
+    #[test]
+    fn u9t4_resident_teardown_keeps_its_obligations() {
+        const MEM: &str = include_str!("memory_state.rs");
+        let resident = MEM
+            .split("pub(crate) fn destroy_user_address_space_by_asid(")
+            .nth(1)
+            .and_then(|b| b.split("\n    /// ").next())
+            .expect("the resident teardown");
+        assert!(
+            resident.contains("self.online_cpu_bitmap() & !self.wake_only_cpu_bitmap()")
+                && resident.contains("WorkItem::TlbShootdown"),
+            "the resident teardown must keep computing its pending set and submitting shootdowns"
+        );
+        // And the scratch rollback no longer reaches it.
+        // CODE only, brace-bounded. The proof's own comment names the resident teardown to say
+        // why it is the WRONG owner here, so a raw scan would match the prose that states the
+        // claim.
+        let proof = spawn_lifecycle_proof_code();
+        let proof = proof.as_str();
+        assert!(
+            !proof.contains("destroy_user_address_space_by_asid"),
+            "the scratch rollback must not use the RESIDENT teardown"
+        );
+        assert!(
+            proof.contains("destroy_unresident_address_space_locked(vm, memory, asid)"),
+            "it must use the never-resident inverse, through the VM→memory acquisition"
+        );
+        // The capability cleanup stays exact, in the CNode the cap was minted into.
+        assert!(
+            proof.contains("self.revoke_capability_in_cnode(cnode, aspace_cap)"),
+            "and the capability cleanup is unchanged"
+        );
+    }
+
+    /// **THE PROOF'S VERDICT DEPENDS ON ITS CHECKS.**
+    ///
+    /// The done marker used to read `result=ok` unconditionally, so a boot that emitted
+    /// `SPAWN_LIFECYCLE_ROLLBACK_LEAK` still signed off as success and every profile grepping for
+    /// the done marker accepted a leak.
+    #[test]
+    fn u9t4_the_proof_verdict_is_not_unconditional() {
+        let proof = spawn_lifecycle_proof_code();
+        let proof = proof.as_str();
+        assert!(
+            !proof.contains("SPAWN_LIFECYCLE_PROOF_DONE tid={} result=ok"),
+            "the verdict must not be a literal `result=ok`"
+        );
+        assert!(
+            proof.contains("let ok = created && destroyed && aspace_gone && cap_gone;")
+                && proof.contains("if ok { \"ok\" } else { \"leak\" }"),
+            "it must be computed from the four checks the proof performs"
+        );
+    }
+
     /// **A DISABLED PROOF LEAVES ITS EVIDENCE ABSENT.**
     ///
     /// The driver is unconditional; each body's own knob check is what decides. With the knob off
@@ -148061,15 +148182,16 @@ mod u9tm_proof_gate {
         disarm_all();
     }
 
-    /// **THE SUPPORTED COMBINATION: ALL FOUR RELOCATED PROOFS ARMED AT ONCE.**
+    /// **THE SUPPORTED COMBINATION: ALL FIVE RELOCATED PROOFS ARMED AT ONCE.**
     ///
-    /// Each still runs exactly once, and the scratch transactions strand nothing. The two that
+    /// Each still runs exactly once, and the scratch transactions strand nothing. All three that
     /// mutate — cap/CNode mints and revokes a memory-object cap, fault-delivery creates a scratch
-    /// endpoint and frees it — are checked against a full before/after resource snapshot rather
+    /// endpoint and frees it, spawn-lifecycle creates an address space and destroys it through the
+    /// never-resident inverse — are checked against a full before/after resource snapshot rather
     /// than against their own markers, so a leak shows up here even if a body stopped reporting
     /// one.
     #[test]
-    fn u9t3_all_four_together_run_once_and_strand_nothing() {
+    fn u9t4_all_five_together_run_once_and_strand_nothing() {
         disarm_all();
         let mut state = first_dispatch_kernel();
 
@@ -148116,7 +148238,7 @@ mod u9tm_proof_gate {
     /// Asserted against the route's own source, since the refusal it used to take is the thing
     /// being removed.
     #[test]
-    fn u9t3_later_ticks_stay_split_with_every_relocated_knob_armed() {
+    fn u9t4_later_ticks_stay_split_with_every_knob_armed() {
         disarm_all();
         let mut state = first_dispatch_kernel();
         for (_, set, _) in proofs() {
@@ -170796,16 +170918,14 @@ mod u9timer1_preempting_timer {
         // U9-TIMER3 re-derivation: 5 -> 4. The proof-mode gate is removed, because the dependency
         // behind it is removed — the five one-shot proof bodies are driven from the boot ownership
         // point and no diagnostic knob sends a tick to broad dispatch any more.
-        // U9-TIMER3 re-derivation: the five-term proof-mode gate became a ONE-term gate, so the
-        // decline count is unchanged at 5 while what the third of them covers shrank from five
-        // default-off knobs to one. Four of the five proof bodies are driven from the boot
-        // ownership point and no longer send a tick anywhere.
+        // U9-TIMER4 re-derivation: 5 -> 4. The last diagnostic gate term is removed, because the
+        // boot-path window that kept its proof on the timer is closed. No diagnostic knob is a
+        // reason for this route to refuse any more.
         assert_eq!(
             code.matches("return D::NotHandled;").count(),
-            5,
-            "five declines: not-a-timer, the one remaining proof hook whose shootdown cannot run \
-             in the dispatch window, a port with no idle-boundary landing that can return to user \
-             mode, a transaction decline, and the tail's fail-safe if the lookahead and the \
+            4,
+            "four declines: not-a-timer, a port with no idle-boundary landing that can return to \
+             user mode, a transaction decline, and the tail's fail-safe if the lookahead and the \
              no-switch seam ever disagreed"
         );
     }

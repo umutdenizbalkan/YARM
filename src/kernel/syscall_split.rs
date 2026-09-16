@@ -3162,30 +3162,25 @@ fn try_split_timer_into_frame(
     if !is_timer {
         return D::NotHandled;
     }
-    // U9-TIMER3 §2 — the PROOF-MODE GATE, reduced from five terms to one by REMOVING the
-    // dependency behind four of them, not by narrowing a predicate.
+    // U9-TIMER4 §2 — the PROOF-MODE GATE IS GONE, and it is gone because the dependency behind it
+    // is gone rather than because the predicate was narrowed.
     //
-    // It used to refuse the whole route whenever any of five default-off knobs was set, because
-    // all five one-shot proof bodies had their only callsite in the broad timer arm. Narrowing it
-    // to "enabled and not yet run" would have been the wrong repair — that still needs a broad
-    // timer to EXECUTE each proof — so four of the bodies are driven from the boot ownership point
-    // instead, where their one real prerequisite (a real user task current) is first satisfied.
-    // `yarm.cap_cnode`, `yarm.fault_delivery`, `yarm.global_state` and `yarm.smp_ready` no longer
-    // send a single tick to the broad dispatcher.
+    // U9-TM introduced it as a five-term disjunction, because all five one-shot proof bodies had
+    // their only callsite in the broad `Trap::TimerInterrupt` arm; U9-TIMER3 relocated four of
+    // them and left one term. That last term was attributed to `spawn_lifecycle`'s cross-CPU
+    // shootdown, and the attribution was WRONG — the hang survives the switch to
+    // `destroy_unresident_address_space_locked`, which posts no shootdown and takes no retired-ASID
+    // slot at all.
     //
-    // `spawn_lifecycle` alone remains, because its rollback queues a cross-CPU `TlbShootdown` and
-    // the boot ownership point sits inside the dispatch window; see
-    // `spawn_lifecycle_proof_needs_broad_timer` for the measurement. It still fails BEFORE the
-    // claim, the tick, the timeout work, the preemption and the re-arm, so a refused trap reaches
-    // the broad arm having changed nothing.
-    if crate::kernel::boot::spawn_lifecycle_proof_needs_broad_timer() {
-        crate::yarm_log!(
-            "TIMER_SPLIT_REFUSED cpu={} reason=spawn_lifecycle_proof_armed",
-            cpu.0
-        );
-        return D::NotHandled;
-    }
-    // (2) THE PREEMPTING TICK — U9-TIMER1.
+    // The real prerequisite, captured by diffing a failing boot against a passing one: the boot
+    // ownership point sits between `dispatch_ready_task()` and the architectural entry, with the
+    // BSP timer already armed, and a trap taken in that window writes the EL1 boot frame into the
+    // selected task's TCB. Its saved stack pointer becomes 0, and the entry gate then silently
+    // declines to return to user mode. The four short proofs escaped it only by finishing inside a
+    // timer interval. `run_scheduler_loop` now holds that whole region under the tree's existing
+    // `irq_save`/`irq_restore` owner, so the window is closed for every body in it.
+    //
+    // (1) THE PREEMPTING TICK — U9-TIMER1.
     //
     // This branch used to be the refusal: `scheduler_tick_if_no_switch_split_mut` returned `None`
     // having incremented nothing, the route answered `NotHandled`, and the ordinary preempting
@@ -3351,7 +3346,7 @@ fn try_split_timer_into_frame(
         }
     }
 
-    // (3) The NON-preempting tick, unchanged. One rank-1 acquisition decides and ticks.
+    // (2) The NON-preempting tick, unchanged. One rank-1 acquisition decides and ticks.
     let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu) else {
         // Unreachable now: the lookahead above already routed every preempting tick. Kept as the
         // fail-safe it always was — if the two ever disagreed, this refuses having ticked nothing.
@@ -3365,9 +3360,9 @@ fn try_split_timer_into_frame(
         // Unreachable: the seam returns `None` rather than a preempting outcome.
         crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => tick,
     };
-    // (4) Claim/ack — the SAME free function `Hal::acknowledge_interrupt` delegates to.
+    // (3) Claim/ack — the SAME free function `Hal::acknowledge_interrupt` delegates to.
     crate::arch::hal_adapters::acknowledge_interrupt(cpu, 0);
-    // (5) Re-arm — the SAME free function `Hal::program_timer_deadline` delegates to, with the
+    // (4) Re-arm — the SAME free function `Hal::program_timer_deadline` delegates to, with the
     // same deadline constant the broad arm passes. On RISC-V this single SBI `set_timer` both
     // clears the pending condition and programs the next deadline: it IS the completion, and
     // there is no separate end-of-interrupt.
@@ -3380,7 +3375,7 @@ fn try_split_timer_into_frame(
         cpu.0,
         tick
     );
-    // (6) The architecture tail still owes the production timeout pipeline.
+    // (5) The architecture tail still owes the production timeout pipeline.
     D::PostWorkCommitted {
         finalize_syscall: false,
     }

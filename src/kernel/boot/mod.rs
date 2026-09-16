@@ -2748,28 +2748,6 @@ pub(crate) fn set_cap_cnode_enabled(enabled: bool) {
     CAP_CNODE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
 }
 
-/// U9-TIMER3 §2 — the ONE remaining timer-only proof hook, and why it is still one.
-///
-/// This was `timer_proof_hooks_armed`, a five-term disjunction, and every term was a reason for
-/// the split timer route to hand a whole armed boot to the terminal broad dispatcher. Four of the
-/// five bodies are driven from the boot ownership point now, so their knobs are no longer reasons
-/// for anything.
-///
-/// `spawn_lifecycle` is the exception, and it is measured rather than assumed. Its rollback calls
-/// `destroy_user_address_space_by_asid`, which queues a `TlbShootdown` cross-CPU work item to every
-/// online non-wake-only CPU. The boot ownership point sits inside the dispatch window — the
-/// selected task's translation regime is installed and the task has not been entered — and on
-/// AArch64 that pending shootdown stops the task ever reaching user mode, with the proof itself
-/// still reporting `result=ok`. Restoring TTBR0 afterwards does not fix it, which is what
-/// identifies the shootdown rather than the register as the cause.
-///
-/// So this hook keeps its broad timer callsite and this gate keeps one term. Draining or reshaping
-/// the cross-CPU shootdown is a repair to that path, not a dependency removal, and it is the
-/// prerequisite for retiring the last term.
-pub(crate) fn spawn_lifecycle_proof_needs_broad_timer() -> bool {
-    spawn_lifecycle_enabled()
-}
-
 pub(crate) fn cap_cnode_enabled() -> bool {
     CAP_CNODE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
