@@ -697,6 +697,23 @@ pub fn handle_trap_entry_shared(
     // one: a terminal transition has been published, so this trap may neither enter the broad
     // dispatcher nor return through the outgoing frame — it falls through to the drains.
     let mut queue_advance_committed = false;
+    // U9-TIMER5 §1 — CONSUME THIS CPU'S IDLE-BOUNDARY PUBLICATION, once, at the top of the trap.
+    //
+    // `crate::kernel::idle_boundary` is the only thing that can distinguish the two kernel states
+    // this bridge sees with `current` empty: parked at the halt loop, where the interrupted
+    // context is dead and a user return is the right answer, and any other kernel window — boot
+    // before first dispatch, the gap between a terminal transition and its drain, a `-> !` path on
+    // its way to a halt — where redirecting the frame would resume a task on kernel code's
+    // continuation. The idle primitives publish the flag; nothing else can.
+    //
+    // The take is DESTRUCTIVE and it happens here rather than at the drain, so the authorization
+    // belongs to exactly one trap. A non-timer trap that interrupts the halt loop spends it and
+    // gets nothing for it, which is correct — and costs nothing, because the halt loop re-parks on
+    // every iteration, so the next trap at the boundary is authenticated again.
+    let idle_boundary_authenticated = crate::kernel::idle_boundary::take_parked(cpu_idx);
+    // Set by the timer route's queued-work settlement; discharged by the drain far below, after
+    // the broad guard and the off-lock timeout pipeline.
+    let mut timer_idle_queue_advance = false;
     // U9-COW1: a recovered COW fault is NOT a queue advance and NOT post-work. It is a handled
     // trap that changed no scheduler state, so it gets its own flag and its own skip reason —
     // reusing either of the others would tell an observer something false about what happened.
@@ -838,20 +855,26 @@ pub fn handle_trap_entry_shared(
                 );
             }
             SplitDispatchDisposition::TimerIdleQueueAdvance => {
-                // U9-TIMER2 §2: unreachable on this bridge, and by construction rather than by
-                // luck. The route only produces this disposition where
-                // `IDLE_BOUNDARY_TIMER_CAN_RESUME_USER` holds, and neither port served by this
-                // bridge has an idle-boundary timer landing that can return to user mode — see
-                // that constant for the derivation. It is matched EXPLICITLY, not folded into the
-                // catch-all below, so that giving either port such a landing later is a compile
-                // -time conversation here instead of a silent `debug_assert` at run time.
+                // U9-TIMER5 §2: the IDLE-BOUNDARY tick with queued work, now SERVED on this
+                // bridge. U9-TIMER2 left this arm as a `debug_assert!(false)` because neither port
+                // here had a landing; §2 builds one, and this is where the obligation is recorded.
+                //
+                // It is recorded, not discharged. The advance itself runs AFTER the broad guard is
+                // released and after the off-lock timeout pipeline — see the drain below for why
+                // that position is load-bearing — so all this arm does is skip the broad
+                // dispatcher for the ordinary reason (entering it would tick a SECOND time) and
+                // hand the drain its flag.
+                //
+                // NOTHING is published here and nothing is owed to another class's drain. There is
+                // no outgoing task at an idle boundary, so no deferral cell is set, no outgoing
+                // identity is fabricated, and no outgoing register file is captured — the capture
+                // above is keyed on `current_tid_authoritative`, which is empty by construction on
+                // this path, so a kernel-idle frame can never reach a user TCB through it.
+                timer_idle_queue_advance = true;
+                queue_advance_committed = true;
                 crate::yarm_log!(
-                    "TIMER_SPLIT_IDLE_ADVANCE_UNSUPPORTED cpu={} reason=no_user_return_path",
+                    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=timer_idle_advance_committed",
                     cpu.0
-                );
-                debug_assert!(
-                    false,
-                    "this bridge's ports have no idle-boundary timer landing that resumes user mode"
                 );
             }
             other => {
@@ -869,6 +892,12 @@ pub fn handle_trap_entry_shared(
             }
         }
     }
+    // RISC-V does not flow through this shared entry — its own bridge owns the idle-boundary
+    // landing, and it CONSTRUCTS a user return rather than converting a kernel frame, so it needs
+    // no authentication. Both cells above are therefore written and never read on that build.
+    // Naming them here keeps that a deliberate no-op rather than a warning.
+    #[cfg(target_arch = "riscv64")]
+    let _ = (idle_boundary_authenticated, timer_idle_queue_advance);
     if !post_work_committed && matches!(decode_trap_context(context), TrapEvent::Syscall) {
         if let Some(frame) = frame.as_deref_mut() {
             // Stage 160C: import the decoded syscall ABI into the frame BEFORE the
@@ -2601,6 +2630,203 @@ pub fn handle_trap_entry_shared(
     // outside `SpinLock<KernelState>`. An empty queue makes this a cheap no-op.
     #[cfg(not(target_arch = "riscv64"))]
     let _ = shared.drain_server_death_post_work(cpu);
+
+    // ── U9-TIMER5 §2: THE IDLE-BOUNDARY QUEUE ADVANCE, x86_64 + AArch64 ─────────────────────
+    //
+    // The timer route ticked once, acked and re-armed, observed queued work, and published
+    // NOTHING. What is owed is one authoritative queue advance, and this is where it happens.
+    //
+    // # Why HERE and not at the disposition
+    //
+    // Two things must already have run, and both sit above this line.
+    //
+    // The broad `with_cpu` guard must be released, because every owner below re-acquires the
+    // rank-1 scheduler seam and the rank-2 task seam; that is the same reason the FutexWait, Yield
+    // and D2 drains sit after it.
+    //
+    // And `run_due_ipc_timeout_work` must have run. THAT is what makes this the "a timer
+    // participates in making queued work dispatchable" boundary rather than a bystander: the
+    // dominant way a task becomes runnable while this CPU is parked is a deadline expiring, the
+    // off-lock timeout pipeline above is what expires it, and running the selection before it
+    // would hand every such wake to the NEXT tick. Placed here, one interrupt expires the
+    // deadline, selects the woken task and returns to it.
+    //
+    // # What authorizes it
+    //
+    // Three independent facts, all required:
+    //
+    //   1. `timer_idle_queue_advance` — the route committed the queued-work settlement, so this is
+    //      a timer, the tick/ack/re-arm are done, and `current` was empty when it decided.
+    //   2. `idle_boundary_authenticated` — this trap interrupted the halt loop, consumed once at
+    //      the top of this function. Without it the interrupted context may be live kernel code.
+    //   3. the acquire below actually yields a markable task.
+    //
+    // An unauthenticated trap is settled by DOING NOTHING FURTHER, under its own marker. Nothing
+    // has been mutated for it, the tick it earned has been taken, and the CPU returns to whatever
+    // kernel code it interrupted. It is reported separately rather than folded into the idle
+    // outcomes, because "we were not at the boundary" and "the queue was empty" are different
+    // facts and a count that conflated them could not show which one a boot saw.
+    //
+    // # The owners
+    //
+    // Every step is the one the sibling drains use, so no second scheduling policy appears:
+    //
+    //   * RE-VERIFY — `yield_reverify_ready`, which asks the only question available here: is
+    //     `current` still clear? The sibling drains re-verify an OUTGOING identity instead; there
+    //     is none at an idle boundary, and inventing one (tid 0, or some other class's deferral)
+    //     would make the rollback and the settlement be about a task that never participated.
+    //   * SELECT + MARK — `queue_advance_acquire_incoming_split` over `yield_dispatch_step_mut`,
+    //     the single dequeue-and-mark owner.
+    //   * RESUME — each port's exact-token transaction: ASID/CR3 or TTBR0 activation, the exact
+    //     saved context, the TLS restore and any parked completion.
+    //
+    // THE SETTLEMENT COMES FROM THE SELECTION, never from the run-queue count that got us here.
+    // That count was read before the tick and is an observation: between it and this dequeue a
+    // wake can arrive, the last entry can be taken, or every entry can turn out to be unmarkable.
+    // `DispatchAcquire` separates all of those and they are matched exhaustively below, so an
+    // empty queue and a queue whose candidates were all REJECTED never share a name — and a
+    // rejection leaves every entry queued, in order, because nothing was dequeued.
+    //
+    // No syscall result is encoded and no PC is adjusted. An interrupted task has no syscall in
+    // flight; `apply_user_context` reinstalls its saved continuation verbatim, and the only writes
+    // past it are the port's existing parked-completion consumers, which are identity-exact and
+    // absent for a task that never blocked.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if timer_idle_queue_advance {
+        if !idle_boundary_authenticated {
+            // NOT the idle boundary: some other kernel window with `current` empty. The tick is
+            // taken and nothing else is owed.
+            crate::yarm_log!(
+                "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=kernel_not_parked settlement=return_to_kernel",
+                cpu.0
+            );
+        } else {
+            crate::yarm_log!(
+                "TIMER_IDLE_ADVANCE_DRAIN_BEGIN cpu={} authenticated=1",
+                cpu.0
+            );
+            let reverify_ok = shared.yield_reverify_ready(cpu);
+            crate::yarm_log!(
+                "TIMER_IDLE_ADVANCE_LOCK_DROPPED_OK cpu={} current_clear={}",
+                cpu.0,
+                u8::from(reverify_ok)
+            );
+            if !reverify_ok {
+                // Something installed a current on this CPU inside this trap. Nothing is owed and
+                // nothing was mutated here; the established tail resumes whoever that is.
+                crate::yarm_log!(
+                    "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
+                    cpu.0
+                );
+            } else {
+                let acquired = shared.queue_advance_acquire_incoming_split(
+                    trap_path.authority(),
+                    "timer_idle_queue_advance",
+                    |k, a| k.yield_dispatch_step_mut(a),
+                );
+                if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+                    trap_path.retire();
+                    dispatch_torn_fatal(cpu, tid, "timer_idle_queue_advance");
+                }
+                match acquired.token() {
+                    Some(token) => {
+                        let inc = token.tid();
+                        crate::yarm_log!(
+                            "TIMER_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
+                            cpu.0,
+                            inc
+                        );
+                        crate::yarm_log!(
+                            "TIMER_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
+                            cpu.0,
+                            inc
+                        );
+                        crate::yarm_log!("TIMER_IDLE_ADVANCE_RUNNING_OK incoming={}", inc);
+                        // A marked incoming task cannot be reported resumed without a real frame,
+                        // so an absent frame takes the same refusal path as an identity refusal.
+                        #[cfg(target_arch = "x86_64")]
+                        let resumed = match frame.as_deref_mut() {
+                            Some(f) => {
+                                crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming(
+                                    shared,
+                                    token,
+                                    Some(f),
+                                )
+                                .is_ok()
+                            }
+                            None => false,
+                        };
+                        #[cfg(target_arch = "aarch64")]
+                        let resumed = match frame.as_deref_mut() {
+                            Some(f) => super::aarch64::trap::direct_dispatch_resume_incoming_core(
+                                shared, token, f,
+                            )
+                            .is_ok(),
+                            None => false,
+                        };
+                        if !resumed {
+                            // Refused AFTER the scheduler was mutated. The token's own narrowed
+                            // authority rolls the dequeue back exactly — a `ContinuedCurrent` mark
+                            // yields none and none is fabricated — and then this diverges rather
+                            // than returning through a frame that belongs to nobody.
+                            let rolled_back = token
+                                .into_dequeued_authority()
+                                .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
+                            trap_path.retire();
+                            #[cfg(target_arch = "x86_64")]
+                            crate::arch::x86_64::trap::enter_post_lock_dispatch_fatal(
+                                cpu,
+                                inc,
+                                rolled_back,
+                            );
+                            #[cfg(target_arch = "aarch64")]
+                            super::aarch64::trap::enter_post_lock_dispatch_fatal(
+                                cpu,
+                                inc,
+                                rolled_back,
+                            );
+                        }
+                        // The broad arm counts a context switch here, through
+                        // `note_context_switch_if_task_changed(None, tid)`. The outgoing side is
+                        // `None`, so the comparison is always unequal and the count always
+                        // happens; this owes it for the same reason it owes the yield count.
+                        shared.count_context_switch_split_mut();
+                        // The DEBT to the architecture tail. This bridge has established the
+                        // scheduler state and the portable frame; only the tail can establish the
+                        // hardware frame and the privilege transition, and it is the tail that
+                        // takes this.
+                        crate::kernel::idle_boundary::commit_user_return(cpu_idx);
+                        crate::yarm_log!("TIMER_IDLE_ADVANCE_FRAME_OK incoming={}", inc);
+                        crate::yarm_log!(
+                            "TIMER_IDLE_ADVANCE_USER_RETURN_ARMED cpu={} incoming={}",
+                            cpu.0,
+                            inc
+                        );
+                        crate::yarm_log!(
+                            "TIMER_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
+                            cpu.0,
+                            inc
+                        );
+                    }
+                    None => {
+                        // Every non-resuming outcome, each under its OWN reason. `Idle` means the
+                        // queue really is empty — the observation that reached this drain has been
+                        // overtaken. `NoneAcceptable` means it is NOT empty and every entry was
+                        // examined and refused; those entries are still queued, in order.
+                        // `Contended` means an accepted candidate stopped being markable and its
+                        // dequeue was already undone exactly. The two authority refusals mutated
+                        // nothing at all. No debt is committed, so the tail returns to the halt
+                        // loop it interrupted, which re-parks and waits for the next tick.
+                        crate::yarm_log!(
+                            "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                            cpu.0,
+                            acquired.marker()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // Stage 200D-0B3: the x86_64 post-lock-drain attestation. Emitted only after EVERY shared
     // post-lock drain above has actually completed — dispatch, the D2/D6 seams, FutexWait,

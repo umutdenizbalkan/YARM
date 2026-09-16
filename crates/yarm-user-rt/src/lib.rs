@@ -1207,6 +1207,78 @@ pub mod syscall {
         Ok(Some(msg))
     }
 
+    /// U9-TIMER5 §3 — ONE idle-boundary cycle, from userspace's side of it.
+    ///
+    /// Issues a blocking `IpcRecvTimeout` on an endpoint nobody will send to, so the caller parks
+    /// and — when it is the last runnable task — the CPU reaches its kernel idle boundary. The
+    /// deadline then expires on a timer tick, and a later tick's idle-boundary advance is what
+    /// selects this task and returns to it. Everything this function observes afterwards is
+    /// therefore evidence about THAT return:
+    ///
+    /// * reaching the next instruction at all is the CONTINUATION — the resume reinstalled the
+    ///   saved PC, not the syscall's entry;
+    /// * `timed_out` is the RESULT, carried through each port's own completion lane;
+    /// * `mask` is the REGISTER FILE, seeded and verified inside the one asm block so no compiler
+    ///   spill can stand in for the kernel's snapshot.
+    ///
+    /// Returns `(timed_out, mask, checked)`. `checked` is how many callee-saved registers this
+    /// port seeds, so `mask == (1 << checked) - 1` is "all intact" and `checked == 0` is "this
+    /// port does not verify registers" rather than "they were wrong".
+    ///
+    /// A message actually arriving is reported as `timed_out == false`, never as an error: the
+    /// witness's own caller decides whether that invalidates the round.
+    #[inline]
+    pub unsafe fn ipc_recv_timeout_expiry_checking_callee_saved(
+        ep_cap: u32,
+        timeout_ticks: u64,
+        sentinel: u64,
+    ) -> (bool, u32, u32) {
+        let mut payload = [0u8; 2 + Message::MAX_PAYLOAD];
+        let mut meta = IpcRecvMetaV2 {
+            status: u64::MAX,
+            opcode: 0,
+            flags: 0,
+            payload_len: 0,
+            cap_id: SYSCALL_NO_TRANSFER_CAP,
+            recv_meta_flags: 0,
+            sender_tid: 0,
+        };
+        let args = [
+            ep_cap as usize,
+            payload.as_mut_ptr() as usize,
+            payload.len(),
+            timeout_ticks as usize,
+            (&mut meta as *mut IpcRecvMetaV2) as usize,
+            core::mem::size_of::<IpcRecvMetaV2>(),
+        ];
+        // SAFETY: the same argument block `ipc_recv_with_deadline` builds, through the bracketed
+        // form of the same raw entry.
+        let (ret, mask) = unsafe {
+            crate::arch::raw_syscall_checking_callee_saved(
+                SYSCALL_IPC_RECV_TIMEOUT_NR,
+                args,
+                sentinel,
+            )
+        };
+        // The result lane each port actually uses, read exactly as `ipc_recv_with_deadline` reads
+        // it — x86_64 carries the canonical error in its own lane, the other two export it into
+        // ret0 and leave `meta.status` untouched when nothing was delivered.
+        #[cfg(target_arch = "x86_64")]
+        let timed_out = ret.error != 0
+            && matches!(
+                decode_syscall_error(ret.error),
+                SyscallError::TimedOut | SyscallError::WouldBlock
+            );
+        #[cfg(not(target_arch = "x86_64"))]
+        let timed_out = ret.ret0 != 0
+            && meta.status == u64::MAX
+            && matches!(
+                decode_syscall_error(ret.ret0),
+                SyscallError::TimedOut | SyscallError::WouldBlock
+            );
+        (timed_out, mask, crate::arch::CALLEE_SAVED_CHECKED)
+    }
+
     #[inline]
     pub(crate) fn ipc_call_prepare(
         msg: &Message,

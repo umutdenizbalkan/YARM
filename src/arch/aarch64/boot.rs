@@ -6970,12 +6970,61 @@ const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, far_el1) == 280)
 fn write_trapframe_back_to_vector_frame(
     frame: &mut Aarch64VectorFrame,
     trap_frame: &crate::kernel::trapframe::TrapFrame,
+    cpu: crate::kernel::scheduler::CpuId,
 ) {
     for idx in 0..31 {
         frame.gprs[idx] = trap_frame.user_gpr(idx) as u64;
     }
     frame.sp_el0 = trap_frame.saved_sp() as u64;
     frame.elr_el1 = trap_frame.saved_pc() as u64;
+    // U9-TIMER5 §2 — THE IDLE-BOUNDARY PRIVILEGE TRANSITION, and the one field the ordinary
+    // write-back has never had to touch.
+    //
+    // The epilogue restores `SP_EL0`, `ELR_EL1` and `SPSR_EL1` from these three slots and then
+    // `eret`s. For a trap taken from EL0 the saved `SPSR_EL1` already names EL0t, so restoring it
+    // verbatim returns to user mode and this function only had to move the continuation. A timer
+    // taken in `aarch64_idle_park_loop` is an EL1 exception: its saved `SPSR_EL1` names **EL1h**,
+    // so the identical `eret` would land back on the `wfi` no matter what `ELR_EL1` said. That is
+    // the whole of "AArch64 has no idle-boundary landing" — one field.
+    //
+    // It is rewritten only against a debt the shared bridge published, never by inspecting the
+    // frame. `take_user_return` is set when ALL of: this CPU was parked at the authenticated idle
+    // boundary (a flag only the halt loop can set, consumed once per trap), the timer route
+    // committed the queued-work settlement, and the canonical selection marked a real task whose
+    // exact-incarnation restore then succeeded. The take is destructive, so one publication
+    // converts one frame.
+    //
+    // `SPSR_EL1 = 0` is EL0t with the `DAIF` mask bits clear — byte-for-byte what
+    // `yarm_aarch64_enter_user_mode_eret` installs with `msr spsr_el1, xzr` at first entry, and
+    // what a task interrupted in EL0 carries anyway. That is the user interrupt state a resumed
+    // task is owed; the EL1 mask this trap ran under does not follow it to EL0.
+    //
+    // `SP_EL1` is untouched and needs no repair: the epilogue's `add sp, sp, #816` unwinds this
+    // vector frame exactly, leaving the anchored depth the park loop established.
+    if crate::kernel::idle_boundary::take_user_return(cpu.0 as usize) {
+        const SPSR_EL0T_IRQ_UNMASKED: u64 = 0;
+        if frame.elr_el1 == 0 || frame.sp_el0 == 0 {
+            // The bridge reported a restore, so this cannot happen without the restore owner
+            // having lied. Refuse the transition rather than `eret` to a null continuation: the
+            // debt is already taken, the frame keeps its EL1h state, and the CPU returns to the
+            // halt loop where the next tick re-selects.
+            crate::yarm_log!(
+                "AARCH64_IDLE_BOUNDARY_RETURN_REFUSED cpu={} elr=0x{:x} sp_el0=0x{:x} reason=empty_context",
+                cpu.0,
+                frame.elr_el1,
+                frame.sp_el0
+            );
+            return;
+        }
+        frame.spsr_el1 = SPSR_EL0T_IRQ_UNMASKED;
+        crate::yarm_log!(
+            "AARCH64_IDLE_BOUNDARY_USER_RETURN cpu={} elr=0x{:x} sp_el0=0x{:x} spsr=0x{:x} result=ok",
+            cpu.0,
+            frame.elr_el1,
+            frame.sp_el0,
+            frame.spsr_el1
+        );
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -7092,7 +7141,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         )
         .is_ok()
         {
-            write_trapframe_back_to_vector_frame(frame, &trap_frame);
+            write_trapframe_back_to_vector_frame(frame, &trap_frame, trap_cpu);
             if AARCH64_TRAP_TRACE {
                 let log_tid = shared.current_tid_split_read(trap_cpu).unwrap_or(0);
                 boot_trace!(
@@ -7149,7 +7198,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         )
         .is_ok()
         {
-            write_trapframe_back_to_vector_frame(frame, &trap_frame);
+            write_trapframe_back_to_vector_frame(frame, &trap_frame, trap_cpu);
             boot_trace!(
                 "AARCH64_VECTOR_FRAME_FINAL tid={} x0={} x1={} x2={}",
                 kernel.current_tid().unwrap_or(0),
@@ -7912,6 +7961,8 @@ pub fn bootstrap_first_user_task(
                 crate::kernel::boot::IPC_RESIDUAL2_PARK_WITNESS_SELECTOR
             } else if crate::kernel::boot::ipc_send_final_fault_witness_enabled() {
                 crate::kernel::boot::IPC_SEND_FINAL_FAULT_WITNESS_SELECTOR
+            } else if crate::kernel::boot::timer5_idle_return_witness_enabled() {
+                crate::kernel::boot::TIMER5_IDLE_RETURN_WITNESS_SELECTOR
             } else {
                 crate::kernel::boot::AARCH64_SHARED_REGION_ORACLE_SELECTOR
             };

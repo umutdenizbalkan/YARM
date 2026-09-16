@@ -15,6 +15,7 @@ pub mod direct_ipc_counters;
 pub mod dispatch_post_work;
 pub mod frame_allocator;
 pub mod global_allocator;
+pub mod idle_boundary;
 pub mod ipc;
 pub mod ipccall_direct;
 pub mod ipccall_direct_txn;

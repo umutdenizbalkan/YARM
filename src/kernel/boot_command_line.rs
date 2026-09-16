@@ -372,6 +372,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_xfer2_grant_witness_enabled(enabled);
         crate::yarm_log!("YARM_XFER2_GRANT_WITNESS_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.timer5_idle_return_witness {
+        // U9-TIMER5 §3: arm the idle-boundary return witness. Default off, so an ordinary boot is
+        // unchanged.
+        crate::kernel::boot::set_timer5_idle_return_witness_enabled(enabled);
+        crate::yarm_log!("YARM_TIMER5_IDLE_RETURN_WITNESS_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ipc_residual2_park_witness {
         // U9-IPC-RESIDUAL2 §4: arm the full-endpoint park witness. Default off.
         crate::kernel::boot::set_ipc_residual2_park_witness_enabled(enabled);
@@ -856,6 +862,13 @@ pub struct YarmBootOptions<'a> {
     /// Architecture-neutral, over the same disposable authority the shared-region oracle
     /// provisions.
     pub ipc_residual1_queued_cap_witness: Option<bool>,
+    /// U9-TIMER5 §3: `yarm.timer5_idle_return_witness=1` DEFAULT-OFF knob. Arms init startup slot
+    /// 5 (=16) so init runs repeated deadline-expiry cycles over the SAME disposable endpoint the
+    /// shared-region oracle provisions — the one shape that drives a uniprocessor CPU to its
+    /// kernel idle boundary WITH queued work, which no ordinary boot produces (measured: 0 on both
+    /// changed ports at base). Architecture-neutral; the register-file verification is bracketed
+    /// per port.
+    pub timer5_idle_return_witness: Option<bool>,
     /// U9-IPC-RESIDUAL2 §4: `yarm.ipc_residual2_park_witness=1` DEFAULT-OFF knob. Arms init
     /// startup slot 5 (=14) so init exercises the one newly-served shape no production workload
     /// reaches: an `IpcCall` onto an endpoint whose queue is FULL, which parks the sender.
@@ -1164,6 +1177,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.xfer2_grant_witness" {
             options.xfer2_grant_witness = parse_bool_knob(value);
+        }
+        if key == b"yarm.timer5_idle_return_witness" {
+            options.timer5_idle_return_witness = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_residual2_park_witness" {
             options.ipc_residual2_park_witness = parse_bool_knob(value);

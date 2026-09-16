@@ -78,3 +78,94 @@ pub(crate) unsafe fn raw_syscall(no: usize, args: [usize; 6]) -> SyscallReturn {
         error,
     }
 }
+
+/// U9-TIMER5 §3 — a syscall whose CALLEE-SAVED registers carry sentinels across the block.
+///
+/// The idle-boundary resume does not return through the register file the caller was using: the
+/// task blocked, the CPU parked at its halt loop, and a later timer selected the task and restored
+/// its whole GPR snapshot from the TCB (`write_task_gprs_to_saved_regs`). So "the registers came
+/// back" is a claim about the CAPTURE as much as about the restore, and an ordinary wrapper cannot
+/// test it: the compiler is free to spill anything it wants around a call, and a value that came
+/// back from the stack proves nothing about the snapshot.
+///
+/// The seed and the read-back therefore both happen through EXPLICIT register operands on the one
+/// asm block that contains the `syscall`. `inlateout` on a named register is what makes that
+/// airtight: the value is in that physical register when the syscall executes, and the value read
+/// afterwards is whatever that physical register holds — there is no intervening instruction the
+/// compiler could satisfy from a spill slot instead.
+///
+/// It is written this way rather than with in-block comparisons because the comparison form needs
+/// scratch registers, and this block has none to give: seven explicit argument registers plus
+/// `RCX`/`R11` plus these four leaves the allocator nothing, and `RBX` and `RBP` are both reserved
+/// by LLVM and cannot be named at all.
+///
+/// System V names six callee-saved registers; these are the four that an inline asm block may
+/// touch. That is a limit on the instrument, not on the claim —
+/// `write_task_gprs_to_saved_regs` restores one flat snapshot, so four registers coming back
+/// correct and another coming back wrong is not a reachable state of that code.
+#[inline(never)]
+pub(crate) unsafe fn raw_syscall_checking_callee_saved(
+    no: usize,
+    args: [usize; 6],
+    sentinel: u64,
+) -> (SyscallReturn, u32) {
+    let mut ret0 = no;
+    let ret1: usize;
+    let mut ret2 = args[2];
+    let error: usize;
+    let s = sentinel as usize;
+    // Distinct per register, so a restore that SHUFFLES the file is caught as well as one that
+    // drops it.
+    let (mut c0, mut c1, mut c2, mut c3) =
+        (s, s.wrapping_add(1), s.wrapping_add(2), s.wrapping_add(3));
+    // SAFETY: the same LSTAR ABI `raw_syscall` documents. The four extra operands are named
+    // callee-saved registers carried in and out; the compiler preserves its own uses of them
+    // around the block exactly as it does for any other explicit-register operand.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") ret0,
+            in("rdi") args[0],
+            in("rsi") args[1],
+            inlateout("rdx") ret2,
+            in("r10") args[3],
+            inlateout("r8") args[4] => ret1,
+            in("r9") args[5],
+            lateout("rcx") error,
+            lateout("r11") _,
+            inlateout("r12") c0,
+            inlateout("r13") c1,
+            inlateout("r14") c2,
+            inlateout("r15") c3,
+            options(nostack),
+        );
+    }
+    let mut mask = 0u32;
+    if c0 == s {
+        mask |= 1;
+    }
+    if c1 == s.wrapping_add(1) {
+        mask |= 2;
+    }
+    if c2 == s.wrapping_add(2) {
+        mask |= 4;
+    }
+    if c3 == s.wrapping_add(3) {
+        mask |= 8;
+    }
+    (
+        SyscallReturn {
+            ret0,
+            ret1,
+            ret2,
+            ret3: 0,
+            ret4: 0,
+            ret5: 0,
+            error,
+        },
+        mask,
+    )
+}
+
+/// How many callee-saved registers [`raw_syscall_checking_callee_saved`] seeds and verifies.
+pub(crate) const CALLEE_SAVED_CHECKED: u32 = 4;

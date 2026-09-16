@@ -2276,6 +2276,8 @@ pub fn bootstrap_first_user_task(
                 crate::kernel::boot::IPC_RESIDUAL2_PARK_WITNESS_SELECTOR
             } else if crate::kernel::boot::ipc_send_final_fault_witness_enabled() {
                 crate::kernel::boot::IPC_SEND_FINAL_FAULT_WITNESS_SELECTOR
+            } else if crate::kernel::boot::timer5_idle_return_witness_enabled() {
+                crate::kernel::boot::TIMER5_IDLE_RETURN_WITNESS_SELECTOR
             } else {
                 crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR
             };

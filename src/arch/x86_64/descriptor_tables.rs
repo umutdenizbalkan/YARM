@@ -180,6 +180,11 @@ const KERNEL_DATA_SELECTOR: u16 = 0x10;
 const TSS_SELECTOR: u16 = 0x28;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const USER_CODE_SELECTOR: u16 = 0x23;
+/// U9-TIMER5 §2: the ring-3 stack selector. The same 0x1b `enter_user_mode_iret` pushes at first
+/// entry and the same one `SYSRETQ` loads (`STAR[63:48] = USER_CODE_SELECTOR - 16`), named here
+/// because the idle-boundary conversion has to write it into a frame that carries the kernel's.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const USER_DATA_SELECTOR: u16 = 0x1b;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const IA32_EFER_MSR: u32 = 0xC000_0080;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -626,12 +631,81 @@ fn halt_forever() -> ! {
     }
 }
 
+/// U9-TIMER5 §1/§2 — the parked halt loop, running at this CPU's idle-boundary stack anchor.
+///
+/// Reached only from [`idle_halt_loop`], which has already re-based `RSP` to the anchor, so every
+/// iteration of this loop runs at the SAME depth for the life of the boot. That is what keeps the
+/// park → timer → resume → block → park cycle flat: without it each turn would abandon one more
+/// interrupt frame below the last, because the callers that reach the idle primitive all diverge
+/// from inside a trap handler and never unwind.
+///
+/// The park is inside the loop, not before it, and that is deliberate. The authorization is
+/// consumed destructively by the first trap that reads it, so ANY trap taken at the boundary —
+/// including one that is not a timer, or one whose selection finds nothing — spends it. Re-parking
+/// each time round is what makes the next trap authenticated again.
+///
+/// `sti; hlt` is one unit against interrupt delivery: `sti` defers recognition until after the
+/// following instruction, so an interrupt cannot slip between the unmask and the halt. A wake that
+/// arrives before the `sti` is still not lost — it is pending, and taken the instant interrupts
+/// open. The periodic timer re-arms on every tick besides, so the boundary is re-examined each
+/// quantum whatever the run queue did meanwhile.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-pub(crate) fn idle_halt_loop() -> ! {
+extern "C" fn x86_idle_park_loop(cpu: usize) -> ! {
     loop {
+        let rsp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+        }
+        let parked = crate::kernel::idle_boundary::park(cpu, rsp);
+        // Emitted only when this park arrived deeper than any before it on this CPU, so a flat
+        // cycle prints a handful of lines and a leaking one prints per turn. That is the whole
+        // accumulation test — see `PARK_SP_LOW`.
+        if parked.new_low {
+            crate::yarm_log!(
+                "IDLE_BOUNDARY_PARK cpu={} sp=0x{:x} anchor=0x{:x} parks={} new_low=1",
+                cpu,
+                rsp,
+                parked.anchor,
+                crate::kernel::idle_boundary::park_count(cpu)
+            );
+        }
         unsafe {
             core::arch::asm!("sti", "hlt", options(nomem, nostack));
         }
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn idle_halt_loop() -> ! {
+    let cpu = current_cpu_id().0 as usize;
+    let rsp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    }
+    // Install-once: the first park on this CPU records its own stack pointer and every later one
+    // gets that same value back.
+    let anchor = crate::kernel::idle_boundary::park(cpu, rsp).anchor;
+    if anchor == 0 || anchor == rsp {
+        // Already at the anchor (this is the first park, or we re-entered at the same depth).
+        x86_idle_park_loop(cpu);
+    }
+    // Re-base to the anchor and transfer to the loop in ONE asm block, so no Rust code ever runs
+    // on a stack the compiler did not establish. Everything below the anchor is dead: this
+    // function diverges, and so does every caller that reached it.
+    //
+    // `and rsp, -16` restores the System V 16-byte alignment `call` requires at a function
+    // boundary. The anchor is itself a real stack pointer, so this is a guard, not a repair.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {anchor}",
+            "and rsp, -16",
+            "call {park_loop}",
+            "ud2",
+            anchor = in(reg) anchor,
+            park_loop = sym x86_idle_park_loop,
+            in("rdi") cpu,
+            options(noreturn)
+        );
     }
 }
 
@@ -956,8 +1030,68 @@ unsafe fn flush_trap_context_to_iret_frame(
         return;
     }
     let frame = unsafe { &mut *interrupt_frame };
-    // Only update frames that will return to user mode (ring 3).
+    // U9-TIMER5 §2 — THE IDLE-BOUNDARY CONVERSION, and the only way a ring-0 frame ever leaves
+    // this function rewritten.
+    //
+    // The CPL check below is intact and still refuses every ring-0 frame on its own authority.
+    // What it cannot do is serve the one case where the interrupted ring-0 context is *dead*: a
+    // timer taken in `x86_idle_park_loop`'s `sti; hlt`. There the frame returns to a halt
+    // instruction and nothing else, so returning to ring 3 instead abandons nothing — while for
+    // any other ring-0 frame it would resume a user task on kernel code's continuation, which is
+    // exactly what the check exists to prevent.
+    //
+    // The two are told apart by a debt, never by inspecting the frame. `take_user_return` is
+    // published by the shared bridge only when ALL of: this CPU was parked at the authenticated
+    // idle boundary (a flag only the halt loop can set, consumed once per trap), the timer route
+    // committed the queued-work settlement, and the canonical selection marked a real task whose
+    // exact-incarnation restore then succeeded. The take is destructive, so one publication
+    // converts one frame.
+    //
+    // The whole ring-3 frame is established here, not just the two fields the ring-3 path
+    // patches, because a CPL0 interrupt frame carries the KERNEL's `CS`, `SS` and `RFLAGS`.
+    // (Long mode pushes `SS:RSP` for same-privilege interrupts too, so all five slots are
+    // present and this is a rewrite, not a rebuild.) `IRETQ` then performs the privilege
+    // transition itself: it loads ring-3 `SS:RSP`, so the kernel stack this trap ran on is
+    // released by the return, and the next entry from ring 3 comes in on the TSS `RSP0` — which
+    // is why no frame accumulates on this port.
+    //
+    // `RFLAGS = 0x202` is the same value the ring-3 path resets to and the same one
+    // `enter_user_mode_iret` builds at first entry: `IF` set, everything else clear. That is the
+    // user interrupt state a resumed task is owed — the boot-time mask this CPU may have been
+    // holding does not follow it into ring 3.
     if (frame.cs & 0x3) != 0x3 {
+        let cpu = current_cpu_id();
+        if !crate::kernel::idle_boundary::take_user_return(cpu.0 as usize) {
+            return;
+        }
+        let user_pc = trap_frame.saved_pc();
+        let user_sp = trap_frame.saved_sp();
+        if user_pc == 0 || user_sp == 0 {
+            // The bridge reported a restore, so this cannot happen without the restore owner
+            // having lied. Refuse rather than `iretq` to a null continuation: the debt is already
+            // taken, so the tail returns to the halt loop and the next tick re-selects.
+            crate::yarm_log!(
+                "X86_IDLE_BOUNDARY_RETURN_REFUSED cpu={} rip=0x{:x} rsp=0x{:x} reason=empty_context",
+                cpu.0,
+                user_pc,
+                user_sp
+            );
+            return;
+        }
+        frame.rip = user_pc as u64;
+        frame.rsp = user_sp as u64;
+        frame.cs = USER_CODE_SELECTOR as u64;
+        frame.ss = USER_DATA_SELECTOR as u64;
+        frame.rflags = 0x202;
+        crate::yarm_log!(
+            "X86_IDLE_BOUNDARY_USER_RETURN cpu={} rip=0x{:x} rsp=0x{:x} cs=0x{:x} ss=0x{:x} rflags=0x{:x} result=ok",
+            cpu.0,
+            frame.rip,
+            frame.rsp,
+            frame.cs,
+            frame.ss,
+            frame.rflags
+        );
         return;
     }
     let new_pc = trap_frame.saved_pc();

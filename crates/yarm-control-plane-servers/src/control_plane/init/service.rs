@@ -1877,6 +1877,142 @@ fn run_ipc_residual2_park_witness() {
     ipc_residual2_park_witness::run_once(entry, stack_top, tls_base);
 }
 
+/// U9-TIMER5 §3 — the IDLE-BOUNDARY RETURN witness.
+///
+/// # The shape, and why no ordinary boot has it
+///
+/// The population under test is one timer interrupt taken while this CPU is parked at its kernel
+/// idle boundary AND the run queue is not empty. Measured at the U9-TIMER5 base with
+/// `yarm.sched_quantum_ticks=1`: x86_64 reached the boundary 73 times and found an empty queue
+/// every single time, and AArch64 reached it zero times at all. So the population had to be
+/// manufactured, and this is the smallest shape on a uniprocessor that manufactures it:
+///
+///   1. init issues a BLOCKING `IpcRecvTimeout` on an endpoint nobody sends to. It parks, and
+///      with every server already blocked it is the last runnable task — so the CPU has nothing
+///      to dispatch and reaches its halt loop. (1) *No user task current; the CPU genuinely
+///      enters its idle boundary.*
+///   2. A later timer tick runs the off-lock timeout pipeline, which expires the deadline and
+///      makes init runnable again. (2) *A timer participates in making queued work dispatchable.*
+///   3. The next tick finds the boundary with a non-empty queue, commits the queued-work
+///      settlement, and the bridge's drain selects and resumes exactly this task. (3) *The split
+///      route selects and resumes the exact task.*
+///   4. Control arrives at the instruction after the syscall, with this receive's own canonical
+///      result and with the register file the task blocked with. (4) *Userspace verifies its
+///      continuation, result and preserved registers.*
+///
+/// Every mechanism in that chain is production — NR 5, its deadline registration,
+/// `run_due_ipc_timeout_work`, the canonical selection. The witness supplies the workload and the
+/// verification, never a path.
+///
+/// # What each round actually proves
+///
+/// * **Continuation** — reaching the line after the syscall at all. A resume that reinstalled the
+///   syscall's entry instead of its saved continuation would re-enter the receive forever, and a
+///   resume through some other task's frame would not return here at all.
+/// * **Result** — `timed_out`, read from each port's own completion lane. A resume that lost the
+///   completion would come back with the receive's arguments in the result registers, which is a
+///   real defect this tree has seen before (`AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED`).
+/// * **Registers** — the callee-saved sentinels, seeded and compared INSIDE one asm block by
+///   `raw_syscall_checking_callee_saved`. This is the part an ordinary wrapper cannot test: the
+///   idle-boundary resume restores the whole GPR file from the TCB snapshot, so a value that came
+///   back from a compiler spill would say nothing about the snapshot.
+///
+/// # Repetition
+///
+/// `ROUNDS` cycles, because two failure modes are only visible across cycles rather than within
+/// one. A LOST WAKE stops the boot: the witness never finishes its rounds and the smoke times out
+/// instead of passing quietly. STACK ACCUMULATION would show as the halt loop's depth drifting
+/// down one vector frame per cycle — `SP_EL1` survives an `eret`, so on AArch64 nothing would
+/// re-base it — which the kernel's own anchor telemetry reports per park.
+///
+/// Marking a task `Running` is explicitly NOT success here: every round has to come back through
+/// userspace with its result and its registers, and the counters below are what the smoke asserts.
+#[cfg(all(not(feature = "hosted-dev"), feature = "timer5-idle-return-witness"))]
+pub(super) mod timer5_idle_return_witness {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
+
+    /// How many park → timer → resume cycles to drive. Enough that a per-cycle stack drift would
+    /// be unmistakable in the anchor telemetry, and few enough that the profile stays inside the
+    /// smoke timeout.
+    const ROUNDS: u32 = 24;
+
+    /// The deadline, in scheduler ticks. Small, so each round costs a couple of timer interrupts;
+    /// non-zero, so the receive genuinely BLOCKS rather than taking the non-blocking probe lane
+    /// (`timeout_ticks == 0`), which would never park the CPU and would prove nothing.
+    const TIMEOUT_TICKS: u64 = 2;
+
+    pub(super) fn armed(slot5: Option<u32>) -> bool {
+        matches!(slot5, Some(16))
+    }
+
+    pub(super) fn run_once() {
+        let (_mem_cap, ep_cap) = super::shared_region_oracle_core::oracle_caps();
+        if ep_cap == 0 {
+            yarm_user_rt::user_log!("TIMER5_IDLE_RETURN_WITNESS step=caps result=missing");
+            RESULT.store(0xF0, Relaxed);
+            return;
+        }
+
+        let mut timed_out = 0u32;
+        let mut delivered = 0u32;
+        let mut regs_ok = 0u32;
+        let mut regs_bad = 0u32;
+        let mut checked = 0u32;
+        let mut first_bad_mask = 0u32;
+
+        for round in 0..ROUNDS {
+            // A round-dependent sentinel, so a resume that replayed an EARLIER round's register
+            // file would be caught as well as one that dropped it.
+            let sentinel = 0x5115_0000_0000u64 | ((round as u64) << 8) | 0x5A;
+            // SAFETY: `ep_cap` carries RECEIVE; the bracketed entry uses the same argument block
+            // the ordinary deadline receive builds.
+            let (to, mask, chk) = unsafe {
+                yarm_user_rt::syscall::ipc_recv_timeout_expiry_checking_callee_saved(
+                    ep_cap,
+                    TIMEOUT_TICKS,
+                    sentinel,
+                )
+            };
+            checked = chk;
+            if to {
+                timed_out += 1;
+            } else {
+                // Nobody sends to this endpoint, so a delivery would mean the round did not park
+                // at all. Counted rather than ignored — a round that did not block is not
+                // evidence about the idle boundary.
+                delivered += 1;
+            }
+            // `checked == 0` means this port does not verify registers (RISC-V and the hosted
+            // stand-in), and then an all-zero mask is the correct answer rather than a failure.
+            let want = if chk == 0 { 0 } else { (1u32 << chk) - 1 };
+            if mask == want {
+                regs_ok += 1;
+            } else {
+                if regs_bad == 0 {
+                    first_bad_mask = mask;
+                }
+                regs_bad += 1;
+            }
+        }
+
+        let all = timed_out == ROUNDS && regs_bad == 0 && delivered == 0;
+        RESULT.store(u32::from(all), Relaxed);
+        yarm_user_rt::user_log!(
+            "TIMER5_IDLE_RETURN_WITNESS rounds={} timed_out={} delivered={} regs_ok={} regs_bad={} checked={} first_bad_mask=0x{:x} result={}",
+            ROUNDS,
+            timed_out,
+            delivered,
+            regs_ok,
+            regs_bad,
+            checked,
+            first_bad_mask,
+            if all { "ok" } else { "fail" }
+        );
+    }
+}
+
 #[cfg(not(feature = "hosted-dev"))]
 pub(super) mod xfer2_grant_witness {
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -6211,6 +6347,13 @@ pub fn run() {
     #[cfg(not(feature = "hosted-dev"))]
     if xfer2_grant_witness::armed(ctx.supervisor_control_recv_ep) {
         xfer2_grant_witness::run_once();
+    }
+    // U9-TIMER5 §3: the IDLE-BOUNDARY RETURN witness, selector 16. Mutually exclusive with every
+    // other slot-5 cell, architecture-neutral, and default-off. ONE task: the shape needs the CPU
+    // to have nothing left to run, so a second task would defeat it.
+    #[cfg(all(not(feature = "hosted-dev"), feature = "timer5-idle-return-witness"))]
+    if timer5_idle_return_witness::armed(ctx.supervisor_control_recv_ep) {
+        timer5_idle_return_witness::run_once();
     }
     // U9-IPC-RESIDUAL1 §4: the queued cap-bearing reply witness, selector 13. Mutually
     // exclusive with every other slot-5 cell, architecture-neutral, and default-off.

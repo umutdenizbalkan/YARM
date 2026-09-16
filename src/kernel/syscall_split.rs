@@ -3104,53 +3104,53 @@ fn try_split_blocking_ipc_recv_into_frame(
 /// Each is taken BEFORE anything is claimed, ticked or mutated, so a decline reaches the
 /// unchanged broad arm having changed exactly nothing:
 ///
-/// 1. **any timer-only proof knob armed** — the five `maybe_run_*` hooks are called only from the
-///    broad arm; neither stage relocates them, so an armed profile takes the unchanged broad
-///    route and every hook runs exactly as before.
-/// 2. **the yield transaction declines** — `ArchGateOff`, `DeferralHeld`, `NotRunning`,
+/// 1. **the yield transaction declines** — `ArchGateOff`, `DeferralHeld`, `NotRunning`,
 ///    `ReenqueueRefused`, and the topology refusals (`CpuOutOfRange`, `NoTrapDrainer`,
 ///    `MultiDispatcher`). The broad arm performs the identical decision through `yield_current`,
 ///    which drives the SAME transaction through `BroadYieldOwners`.
-/// 3. **idle CPU with a non-empty run queue** (`no_current_runnable`) — there the broad arm's
-///    `on_preempt_current_cpu_selection()` genuinely dequeues and dispatches onto the idle CPU.
-///    That is a distinct queue-advancing consumer with no demonstrated dependency on this
-///    conversion, so it is declined under its own reason and inventoried rather than absorbed.
-/// U9-TIMER2 §1 — does this port's IDLE-BOUNDARY timer trap have a landing that can resume a user
-/// task?
 ///
-/// `current == None` on a TIMER trap means one thing: the CPU was parked at its kernel-idle
-/// boundary. (A running user task is `current` by construction, and the routes that clear
-/// `current` are syscall routes, not timer ones.) So the question is entirely about what that
-/// port's idle-boundary timer entry can return to, and the three answers are not the same:
+/// The two entries that stood beside it are gone rather than moved. U9-TIMER3 and U9-TIMER4
+/// relocated all five `maybe_run_*` diagnostic hooks to the first-dispatch driver, so no proof
+/// knob is a reason to decline; and U9-TIMER5 gives the **idle CPU with a non-empty run queue**
+/// its landing on every port, so that population commits `TimerIdleQueueAdvance` here instead of
+/// declining under `no_user_return_path`.
+/// U9-TIMER5 §1/§2 — EVERY PORT NOW HAS AN IDLE-BOUNDARY LANDING, so this route no longer asks
+/// which one does.
 ///
-/// * **RISC-V — yes.** `riscv_s_mode_timer_trap` is a real trap ENTRY: it builds a minimal
+/// U9-TIMER2 asked the question through `IDLE_BOUNDARY_TIMER_CAN_RESUME_USER`, a constant that
+/// was true only on RISC-V, and refused the queued-work settlement on the other two under
+/// `reason=no_user_return_path`. The constant is retired here together with its refusal, because
+/// the thing it reported absent has been built:
+///
+/// * **RISC-V — unchanged.** `riscv_s_mode_timer_trap` is a real trap ENTRY: it builds a minimal
 ///   `TrapFrame`, runs the arch-neutral pipeline, and then, when a task became current during the
 ///   trap, clears `SPP`, sanitizes `sstatus`, populates the hardware frame from that task's saved
 ///   context, selects one of its three resume conventions and activates the ASID
-///   (`RISCV_S_MODE_TIMER_DISPATCH`). That landing already exists and is what the broad arm uses
-///   today for exactly this population.
+///   (`RISCV_S_MODE_TIMER_DISPATCH`). It CONSTRUCTS a user return rather than converting a kernel
+///   one, which is why it needs no authentication and is not touched by U9-TIMER5.
 ///
-/// * **x86_64 — no.** The idle landing is `idle_halt_loop()`, a non-returning ring-0 `sti; hlt`.
-///   A timer taken there is a CPL0 interrupt, and `flush_trap_context_to_iret_frame` refuses by
-///   construction to rewrite a frame whose `CS` DPL is not 3 — so that trap cannot `iretq` into a
-///   user task; it returns to the `hlt`. The kernel-stack alternative is closed too:
-///   `build_dispatch_switch_plan_locked` requires an initialized incoming kernel context, which
-///   production user tasks never have. The one owner that does run from that state,
-///   `d6_genuine_local_dispatch_observe`, is explicitly non-mutating.
+/// * **x86_64 and AArch64 — built by U9-TIMER5 §2.** Both idle landings are non-returning kernel
+///   halt loops (`idle_halt_loop`'s ring-0 `sti; hlt`, `idle_no_eret_loop`'s EL1 `wfi`), and a
+///   timer taken there interrupts KERNEL state. The shared bridge now performs the authoritative
+///   advance for that trap and hands the architecture tail a debt, and each tail establishes the
+///   user frame it owns: x86_64 rewrites the full `iretq` frame — `CS`/`SS` at DPL 3, user `RIP`
+///   and `RSP`, `RFLAGS` with `IF` set — and AArch64 rewrites `SPSR_EL1` to `EL0t` alongside the
+///   `ELR_EL1`/`SP_EL0` its epilogue already restores.
 ///
-/// * **AArch64 — no.** The idle landing is `idle_no_eret_loop()`, a non-returning `wfi` loop whose
-///   own contract records that `current` is None there so no userspace ELR/SPSR is ever returned.
+/// # Why the decision is not made here any more
 ///
-/// Marking a task `Running` and current from a trap that then returns to `hlt`/`wfi` would strand
-/// it behind a current slot nothing will resume. That is what the broad arm does on those two
-/// ports today; it is a latent defect of theirs and not this package's to repair, so this branch
-/// declines there under its own reason and stays inventoried rather than being absorbed.
+/// It could not be. What separates a resumable idle-boundary timer from an unresumable kernel
+/// interruption is not the port — it is whether THIS trap interrupted the authenticated boundary,
+/// which only `crate::kernel::idle_boundary` knows and only the bridge can ask. `current == None`
+/// does not answer it: the boot path before first dispatch and the window between a terminal
+/// transition and its drain are both `current`-empty kernel states, and converting a frame taken
+/// in one of those would resume a task on kernel code's continuation.
 ///
-/// This is a structural property of each port's trap entry, which is why it is a constant rather
-/// than a runtime probe: nothing a boot can do makes an x86_64 ring-0 IRET frame return to ring 3.
-#[cfg(not(feature = "hosted-dev"))]
-const IDLE_BOUNDARY_TIMER_CAN_RESUME_USER: bool = cfg!(target_arch = "riscv64");
-
+/// So this route keeps exactly the part it owns — one tick, one claim, one re-arm, and the
+/// observation that work is queued — and the bridge decides whether a landing exists for this
+/// particular trap. The settlement below is therefore `TimerIdleQueueAdvance` on every port, and
+/// an unauthenticated trap is settled by the bridge under its own name rather than by a
+/// port-wide constant here.
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_timer_into_frame(
     shared: &SharedKernel,
@@ -3263,24 +3263,16 @@ fn try_split_timer_into_frame(
             //   service of this tick is the tick itself. That is settled here instead, with the
             //   same one tick, the same claim and the same re-arm the non-preempting route uses.
             // * runnable > 0 -> the selection DEQUEUES and the broad arm dispatches onto the idle
-            //   CPU. That is a real queue-advancing consumer, and converting it is a separate
-            //   migration this stage has no demonstrated dependency on. It declines, and is
-            //   reported under its own reason so the residual is countable rather than inferred.
+            //   CPU. U9-TIMER5 gives every port a landing for that advance, so the settlement is
+            //   `TimerIdleQueueAdvance` here and the bridge performs the one authoritative
+            //   selection — see the route doc for why the port is no longer the question.
             Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {
-                // U9-TIMER2 §2 — the ONE refusal this branch still has, and it is taken BEFORE the
-                // tick so a declining port still reaches the unchanged broad arm having changed
-                // exactly nothing. Ticking first and declining after would force a choice between
-                // double-ticking in the broad arm and dropping a quantum; that is why the order is
-                // this way here exactly as it is at the top of the preempting branch.
+                // U9-TIMER5 §2 — this branch now has NO refusal of its own, and the read below is
+                // the only thing it still asks. U9-TIMER2's `no_user_return_path` refusal stood
+                // here and is retired with the constant that drove it: the landing it reported
+                // absent exists on all three ports, and what remains port-specific — whether THIS
+                // trap interrupted the authenticated idle boundary — is not knowable from here.
                 let observed_runnable = shared.runnable_count_on_cpu_split_read(cpu);
-                if observed_runnable > 0 && !IDLE_BOUNDARY_TIMER_CAN_RESUME_USER {
-                    crate::yarm_log!(
-                        "TIMER_SPLIT_PREEMPT_REFUSED cpu={} reason=no_user_return_path runnable={}",
-                        cpu.0,
-                        observed_runnable
-                    );
-                    return D::NotHandled;
-                }
                 // Past this point the tick is taken, and it is taken for BOTH idle outcomes.
                 //
                 // It used to sit after the run-queue test, which made the count a reservation:
@@ -3305,30 +3297,41 @@ fn try_split_timer_into_frame(
                     cpu,
                     crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
                 );
-                if observed_runnable > 0 {
-                    // The broad arm reached `yield_current` for this state, and its first act is
-                    // this increment. The converted route owes it for the same reason the
-                    // committed-preempt arm above does: the broad path no longer runs.
-                    shared.count_yield_split_mut();
-                    crate::yarm_log!(
-                        "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=1 rearm=1 broad_lock=0",
-                        cpu.0,
-                        tick,
-                        observed_runnable
-                    );
-                    return D::TimerIdleQueueAdvance;
-                }
+                // The broad arm reached `yield_current` for this state, and its first act is this
+                // increment. The converted route owes it for the same reason the committed-preempt
+                // arm above does: the broad path no longer runs.
+                shared.count_yield_split_mut();
+                // U9-TIMER5 §2 — ONE settlement for BOTH idle outcomes, and the observation is
+                // reported rather than obeyed.
+                //
+                // U9-TIMER2 let the count pick the disposition: `runnable > 0` answered
+                // `TimerIdleQueueAdvance` and an empty queue answered `PostWorkCommitted`. That is
+                // the last place the count was still a reservation, and it was measurably wrong.
+                //
+                // The window is real, not theoretical. The dominant way a task becomes runnable
+                // while this CPU is parked is a DEADLINE expiring, and the off-lock timeout
+                // pipeline that expires it (`run_due_ipc_timeout_work`) runs LATER IN THIS SAME
+                // TRAP — after the broad phase, and after this probe. So on the tick that expires
+                // a deadline the probe necessarily reads zero, and answering `PostWorkCommitted`
+                // sent that tick to a tail with no drain. Measured on the §3 witness before this
+                // change: init blocked with a deadline, the CPU parked, the tick that fired the
+                // timeout answered `TIMER_SPLIT_PREEMPT_IDLE`, and the x86_64 tail's
+                // `revalidate_idle_owner_after_drains` then marked init `Running` and current and
+                // returned to the `hlt` anyway — the exact stranding the idle-boundary landing
+                // exists to end, reached by a different route.
+                //
+                // So the settlement is the same either way and the drain re-asks authoritatively
+                // once every wake in this trap has been published. An empty queue is still an
+                // empty queue there — `DispatchAcquire::Idle`, settled as kernel idle, which is
+                // what the tail did before — and nothing is claimed on the strength of a count
+                // that was read before the pipeline ran.
                 crate::yarm_log!(
-                    "TIMER_SPLIT_PREEMPT_IDLE cpu={} tick={} preempt=1 rearm=1 broad_lock=0",
+                    "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=1 rearm=1 broad_lock=0",
                     cpu.0,
-                    tick
+                    tick,
+                    observed_runnable
                 );
-                // No task changed hands, so there is no deferral for a drain to consume and no
-                // outgoing frame to switch away from — the architecture tail owns the rest, the
-                // same as for a non-preempting tick.
-                return D::PostWorkCommitted {
-                    finalize_syscall: false,
-                };
+                return D::TimerIdleQueueAdvance;
             }
             Err(decline) => {
                 // Pre-mutation, and nothing has ticked. The broad arm runs next and performs the
@@ -3375,6 +3378,51 @@ fn try_split_timer_into_frame(
         cpu.0,
         tick
     );
+    // U9-TIMER5 §2 — A NON-PREEMPTING TICK ON A PARKED CPU STILL OWES THE ADVANCE.
+    //
+    // The quantum exists to decide whether to cut a RUNNING task short. With `current` empty there
+    // is no such task, so the question the lookahead answered has no subject here and its answer
+    // carries no instruction. That is not an interpretation: the broad arm's own `yield_current`,
+    // reached for this state, takes the `NoCurrent` path — it skips the `Running -> Runnable`
+    // step, falls through to `on_preempt_current_cpu_selection()` and DISPATCHES. Applying the
+    // same policy where the quantum is vacuous is not a second policy.
+    //
+    // Without this the boundary is only examined once per quantum, and on the shipped quantum
+    // that is the difference between a parked CPU resuming its work and not resuming it at all.
+    // Measured on the §3 witness: with the AArch64 profile's shipped quantum an entire boot took
+    // 74 ticks and NOT ONE of them preempted, so a task whose deadline expired while the CPU was
+    // parked was never dispatched — init blocked on its first round and the boot went nowhere.
+    // The x86_64 tail hid the same gap behind `revalidate_idle_owner_after_drains`, which marked
+    // the woken task `Running` and current and then returned to the `hlt` anyway.
+    //
+    // `current_tid_split_read` is the NON-binding read, deliberately: this is a question about
+    // whether anything is running here, not a claim on the CPU. tid 0 is the bootstrap identity
+    // and is treated as "nothing running" for the same reason every other route does.
+    //
+    // SCOPED TO THE TWO CHANGED PORTS, and the reason is the authentication rather than the
+    // architecture. `current == None` on a NON-preempting tick is a much wider condition than on a
+    // preempting one: it is also true throughout early boot, before anything has been dispatched.
+    // The shared bridge can admit that safely because it asks `idle_boundary` whether THIS trap
+    // interrupted the parked halt loop, and settles `kernel_not_parked` when it did not. The
+    // RISC-V bridge performs its advance unconditionally — it needs no authentication for the
+    // preempting population, because its S-mode timer entry CONSTRUCTS a user return instead of
+    // converting a kernel frame — so widening the population there would let a boot-time tick
+    // dispatch through a drain nothing had authorized. Measured: it did, and the boot hung at
+    // `tick=2` in `RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io`.
+    //
+    // So RISC-V keeps exactly U9-TIMER2's behaviour, which is what "RISC-V is not a changed port"
+    // has to mean if it means anything. Giving it the same authenticated boundary is the obvious
+    // next step and is deliberately not taken here.
+    #[cfg(not(target_arch = "riscv64"))]
+    if !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0) {
+        crate::yarm_log!(
+            "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=0 rearm=1 broad_lock=0",
+            cpu.0,
+            tick,
+            shared.runnable_count_on_cpu_split_read(cpu)
+        );
+        return D::TimerIdleQueueAdvance;
+    }
     // (5) The architecture tail still owes the production timeout pipeline.
     D::PostWorkCommitted {
         finalize_syscall: false,

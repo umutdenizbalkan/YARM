@@ -19079,3 +19079,256 @@ unchanged at 8 pass / 2 fail (`required_chain_is_scoped_to_the_witnessed_transac
 * The legacy NR 2 blocking population still has no live producer.
 * The multi-page shared-region mapping defect, reproduced rather than repaired.
 * Init's mapping-run pressure.
+
+## U9-TIMER5 — the x86_64 and AArch64 idle-to-user timer boundary
+
+`reason=no_user_return_path` is gone. Both ports now select and resume a user task from a timer
+taken at their kernel idle boundary, and the evidence is a real park, a real timer, a real resume
+and a userspace check of what came back.
+
+### What was actually missing
+
+U9-TIMER2 named the gap correctly and stopped at it: the idle landings on these two ports are
+non-returning kernel halt loops, so a timer taken there interrupts KERNEL state, and marking a task
+`Running` from it would strand it behind a current slot nothing would resume. What it could not say
+is how big the gap was, because the population never arrived. Measured at this package's base, with
+`yarm.sched_quantum_ticks=1` forcing every tick to preempt so the branch could be reached at all:
+
+| port | idle-boundary preempting ticks | with queued work | idle-boundary IRQs taken |
+|---|---|---|---|
+| x86_64 | 73 | **0** | 73 |
+| AArch64 | — | **0** | **0** (14 `irq_lower_a64`, no `irq_current_spx`) |
+
+AArch64's zero is the more interesting one, and it is not about the run queue. Its vector dispatch
+executes `msr daifset, #0xf` before calling into Rust, so every path to `idle_no_eret_loop` arrived
+with IRQ and FIQ masked. `wfi` wakes on a pending interrupt whatever `DAIF` says, but a masked
+interrupt is not TAKEN — the CPU fell through to the branch and halted again, and no trap ever ran.
+The landing was not merely unreachable from the route; the boundary was a **terminus**. So
+U9-TIMER2's "zero arrivals on these two ports" was a report about a mask, not about a population,
+which is exactly why this directive said not to call it live coverage.
+
+### The entry boundary is authenticated, not inferred
+
+`current == None` does not mean "parked". It is equally true of the boot path before first
+dispatch, of the window between a terminal transition clearing `current` and the drain that settles
+it, and of any `-> !` kernel path on its way to a halt. Redirecting a frame taken in one of those
+would resume a user task on kernel code's continuation.
+
+So the authorization is **published by the idle primitive itself** — the only code that knows it has
+reached the boundary — and consumed destructively by the trap that interrupted it
+(`crate::kernel::idle_boundary`):
+
+```text
+  idle primitive             park(cpu, sp)        parked := true
+  shared bridge, trap entry  take_parked(cpu)     parked := false  -> authorizes THIS trap
+  bridge drain resumes       commit_user_return   the arch tail owes a ring-3/EL0 return
+  architecture tail          take_user_return     converts the hardware frame, exactly once
+```
+
+Three properties make it sufficient where `current` was not: it is set only by a `-> !` primitive
+that then halts, so while it is set the CPU is provably in that halt loop; it is spent by the first
+trap to read it, so a nested or subsequent trap cannot inherit it; and it authorizes nothing on its
+own — the trap must ALSO be a timer that committed the queued-work settlement, and the canonical
+selection must ALSO yield a markable task. It fired live: one AArch64 core boot recorded a single
+`reason=kernel_not_parked` settlement — a timer with `current` empty that was not at the boundary.
+
+The boot ownership point's exclusion moved with it. U9-TIMER4 opened `irq_save` one statement too
+late, after `dispatch_ready_task()`. That call is not an observation — it dequeues, installs
+`current` and marks the task `Running` — so a trap inside it already found a published current while
+the entry that makes the claim true had not run, and it is now also a window where a second selector
+could race the boot one. The mask opens before the selection and is held through the architectural
+return. TIMER4's passing boots are not evidence that the smaller window was safe.
+
+### The return path
+
+The bridge owns the scheduler half for both ports, through the owners every sibling drain uses:
+`yield_reverify_ready`, then `queue_advance_acquire_incoming_split` over `yield_dispatch_step_mut`,
+then each port's exact-token resume. No second dequeue, no second mark, no second scheduling
+policy, and no broad acquisition.
+
+Its POSITION is load-bearing. It runs after the broad guard is released — required, since every
+owner re-acquires the rank-1 seam — and after `run_due_ipc_timeout_work`. That second one is what
+makes a timer a participant in making queued work dispatchable rather than a bystander: the dominant
+way a task becomes runnable while a CPU is parked is a deadline expiring, and the off-lock pipeline
+that expires it runs later in the SAME trap than the route's run-queue probe.
+
+The architecture tail owns the hardware frame, and each port needed a different amount:
+
+* **x86_64** rewrites the whole `iretq` frame — `CS`/`SS` at DPL 3, user `RIP`/`RSP`, `RFLAGS`
+  `0x202` — because a CPL0 interrupt frame carries the kernel's. The CPL check is intact and still
+  refuses every ring-0 frame on its own authority; the conversion is a branch INSIDE that refusal,
+  reached only by taking a debt, and nothing touches the frame before the debt is taken. `IRETQ`
+  performs the privilege transition and loads ring-3 `SS:RSP`, so the kernel stack is released by
+  the return and the next entry comes in on the TSS `RSP0`.
+* **AArch64** rewrites exactly ONE field. `SP_EL0` and `ELR_EL1` were always written; `SPSR_EL1`
+  never was, because a trap from EL0 already carries `EL0t`. A trap from the halt loop carries
+  `EL1h`, so the identical `eret` landed back on the `wfi` no matter what `ELR_EL1` said. That one
+  field was the whole of "AArch64 has no idle-boundary landing". It is set to 0 — `EL0t` with
+  `DAIF` clear, byte-for-byte what `msr spsr_el1, xzr` installs at first entry.
+
+Both refuse the transition and report it rather than returning to a null continuation if the
+restore owner reported success without a context.
+
+### Two things the boundary needed before it could be a cycle
+
+**The stack anchor.** Both primitives are reached by DIVERGING from inside a trap handler, so each
+park abandons its call chain and halts at that depth. While the boundary was terminal that cost
+nothing. Making it a cycle — park, timer, resume, block, park — would otherwise leave one more
+abandoned frame below the last every turn; x86_64 re-enters through the TSS `RSP0` and would have
+re-based anyway, but `SP_EL1` survives an `eret` and nothing re-bases it. So the FIRST park on a CPU
+records its stack pointer and every later one re-bases to it, in one asm block that transfers to the
+halt loop so no Rust code runs on a stack the compiler did not establish. The boundary has one depth
+per CPU for the life of the boot. `IDLE_BOUNDARY_PARK` is emitted only on a new low-water mark, so a
+flat cycle prints a handful of lines and a leaking one would print per turn: **every witness run on
+every port reported exactly one.**
+
+**The observation stopped picking the settlement.** U9-TIMER2 let the run-queue count choose between
+`TimerIdleQueueAdvance` and `PostWorkCommitted`, and that was the last place the count acted as a
+reservation. It was measurably wrong: the probe necessarily reads zero on the tick that fires a
+deadline, because the pipeline that fires it runs later in the same trap. Both idle outcomes now
+settle the same way and the drain re-asks authoritatively; an empty queue is still `Idle` there.
+And a NON-preempting tick on a parked CPU advances too — the quantum decides whether to cut a
+RUNNING task short, and with `current` empty it has no subject, which is why the broad arm's own
+`yield_current` takes `NoCurrent` and dispatches for this state. Without that, an AArch64 boot on
+its shipped quantum took 74 ticks with not one preempting, and a task whose deadline expired while
+the CPU was parked was never dispatched at all.
+
+That second change is scoped to the two CHANGED ports, and the reason is the authentication rather
+than the architecture. `current == None` on a non-preempting tick is a far wider condition than on a
+preempting one — it is also true throughout early boot — and the shared bridge can admit it only
+because it asks whether THIS trap interrupted the parked halt loop. The RISC-V bridge performs its
+advance unconditionally, which is safe for the preempting population because its S-mode timer entry
+CONSTRUCTS a user return rather than converting a kernel frame, but which would let a boot-time tick
+dispatch through a drain nothing had authorized. Measured, not reasoned about: it did, and the boot
+hung at `tick=2` in `RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io`. RISC-V therefore keeps
+exactly U9-TIMER2's behaviour. Giving it the same authenticated boundary is the obvious next step
+and is deliberately not taken here.
+
+That change also removes a stranding, rather than adding a path. On x86_64 the tail's
+`revalidate_idle_owner_after_drains` was picking up exactly these wakes, marking the task `Running`
+and current — and then returning to the `hlt` anyway, because the frame was ring-0 and unauthorized.
+Measured directly on the §3 witness before the fix: init blocked, the CPU parked, the tick that
+fired the timeout answered `TIMER_SPLIT_PREEMPT_IDLE`, and the boot went nowhere.
+
+### The live witness
+
+No ordinary boot produces the population, so `yarm.timer5_idle_return_witness=1` (slot-5 selector
+16, cargo feature `timer5-idle-return-witness`, default off) manufactures it out of production
+mechanisms only: init issues a blocking `IpcRecvTimeout` on an endpoint nobody sends to, parks as
+the last runnable task, and the CPU reaches its halt loop; the off-lock timeout pipeline expires the
+deadline; the next tick's idle-boundary advance selects and resumes exactly that task. 24 rounds.
+
+Registers are verified inside the ONE asm block that contains the syscall, through named
+callee-saved operands carried in and out (`R12`–`R15`, `x20`–`x23`). That is not fussiness: the
+resume restores the whole GPR file from the TCB snapshot, so a value that came back from a compiler
+spill would say nothing about the snapshot — and `raw_syscall`'s own comment records that an
+ORDINARY syscall return leaves callee-saved registers alone precisely because the kernel never
+writes those slots.
+
+Three fresh runs per architecture:
+
+| port | rounds | timed out | delivered | regs bad | registers checked | idle-boundary advances | new stack lows |
+|---|---|---|---|---|---|---|---|
+| x86_64 | 24 / 24 / 24 | 24 each | 0 | **0** | 4 | 12 each | **1** |
+| AArch64 | 24 / 24 / 24 | 24 each | 0 | **0** | 4 | 42 / 24 / 24 | **1** |
+
+`new stack lows` is **1** in every run on both ports: one `IDLE_BOUNDARY_PARK` line each, so the
+boundary settled at a single depth on its first park and 24 park → timer → resume → block cycles
+never moved it. That is the accumulation check.
+
+Marking a task `Running` is not success here: every line is emitted by init, after the resume, from
+userspace. `delivered=0` says every round genuinely blocked. All 24 rounds completing is the
+missed-wake check — a lost wake strands init and times the profile out instead of passing quietly.
+
+RISC-V is **refused** by this script, and the refusal is a finding rather than a gap. It is not a
+changed port — U9-TIMER5 leaves its boundary exactly as U9-TIMER2 left it — and what it therefore
+also keeps is U9-TIMER2's limitation: only a PREEMPTING tick examines a parked CPU. An ordinary
+RISC-V core boot takes ~1540 ticks of which ~36 preempt, so this witness's shape walks straight into
+it — a task whose deadline expires while the CPU is parked waits for a preempting tick that mostly
+does not come, and the profile stalls in `RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io`
+(measured: 0 of 3 runs completed). The fix is the same non-preempting advance the two changed ports
+got, and there it is gated on the authenticated boundary; applying it to RISC-V without one hung
+the boot at `tick=2`. Giving RISC-V the same authenticated boundary is the next step and is
+deliberately outside this package. Its coverage here is its ordinary core boot.
+
+### Live traffic on ORDINARY boots
+
+| port | idle-boundary settlements | user returns | `USER_LOG` | new stack lows | `no_user_return_path` |
+|---|---|---|---|---|---|
+| x86_64 | 72, all `reason=idle` | 0 (queue always empty) | 598 | 1 | **0** |
+| AArch64 | 43 committed, 14 settled | **29** | **980** (base: 118) | 1 | **0** |
+| RISC-V | 189 advances | 189 | 1737 | n/a | **0** |
+
+AArch64's `USER_LOG` count is the plainest statement of what the mask was costing: the same profile
+that produced 118 lines at base produces 980 now, because a parked CPU gets its work back.
+
+RISC-V is **unchanged**, and that was measured rather than assumed — two base runs at `fd23312d`
+gave 131 / 135 advances and 1485 / 1494 `USER_LOG` against this tree's 131 / 189 / 193 and
+1449 / 1723 / 1737, which is run-to-run noise on one profile. TIMER2's RISC-V idle-to-user witness is preserved with its
+own numbers intact and 0 `TIMER_IDLE_ADVANCE_BROAD_ENTRY`.
+
+### Source reachability
+
+`no_user_return_path`, `IDLE_BOUNDARY_TIMER_CAN_RESUME_USER` and
+`TIMER_SPLIT_IDLE_ADVANCE_UNSUPPORTED` do not exist in the route or the bridge under any spelling —
+pinned by guard over comment-stripped source, so the stage records may still name what was retired.
+A marker that is not in the tree cannot be counted, which is the acceptance criterion stated as a
+property of the tree rather than of a log.
+
+### Acquisition census
+
+| measure | value |
+|---|---|
+| `AUDITED_WITH_CPU_TOTAL` | **2** |
+| `AUDITED_WITH_BROAD_TOTAL` | **0** |
+| raw `self.state.lock()` wrapper bodies | **3** |
+
+Census target 7/7. The drain re-acquires only the rank-1 scheduler seam and the rank-2 task seam,
+both through existing split owners, and the guard forbids `with_cpu` inside it.
+
+### Qualification
+
+Hosted **5663 passed / 0 failed / 2 ignored**, single-threaded. Three ports build. Census 7/7,
+doc-fragmentation 7/7, extraction bridge 2/2, and the RISC-V timer/IRQ/topology and x86_64 AP scopes
+all green. Ordinary core smokes clean on all three ports. Spawn-lifecycle profile `result=ok` with
+`created=1 destroyed=1 aspace_gone=1 cap_gone=1` on all three. The four relocated proof profiles are
+unchanged on x86_64. AP/SMP acceptance chain intact: recv-v2 block `-smp 2`
+`blocked_commits=1 premature_wakes=0 wrong_cpu_blocks=0 result=ok`; saved return `-smp 2`
+`fresh_entries=1 saved_dispatches=1 continuations=1 result=ok`. XFER2 grant witness
+`grants=2 releases=2 route=split result=ok`. The established carve-out is unchanged at 8 pass /
+2 fail (`required_chain_is_scoped_to_the_witnessed_transaction`,
+`required_marker_chain_is_ordered_and_complete`).
+
+The init cell is a cargo feature and not only a runtime knob, for the reason the tree already
+records twice: init's address space runs at `AddressSpace::MAX_MAPPINGS`, and compiling the cell
+unconditionally cost one more mapping run — enough to fail the XFER2 grant witness with
+`VM_FULL reason=mapping_bookkeeping_full max_mappings=128`. Gated off, every other slot-5 profile
+keeps the headroom it had.
+
+### Remaining timer edges
+
+`TimerInterrupt` is **not** closed and neither is U9. Three declines remain, and the route has none
+of its own left — every one is a classification miss or a fail-safe:
+
+| # | exit | population | live arrivals |
+|---|---|---|---|
+| 1 | `!is_timer` | the family filter, not a hand-off | n/a |
+| 2 | `reason=<legacy_reason(decline)>` | the five `YieldDecline` variants — the arch gate (`d6_genuine_off` / `not_bsp`) and the topology refusals (`cpu_out_of_range`, `no_trap_drainer`, `multi_cpu`), plus `not_running` and `reenqueue_failed` | **0** on all three ordinary core boots |
+| 3 | `reason=would_preempt` | documented-unreachable fail-safe | **0** |
+
+The next concrete escape is **(2)'s arch-gate and topology refusals**: a preempting tick on a
+non-bootstrap CPU, or on any CPU under `yarm.ap_user_dispatch=1`, still reaches the terminal broad
+dispatcher. It has zero arrivals on today's `-smp 1` and `-smp 2` core profiles, so closing it is
+AP-dispatch work and needs its own live producer before it can be claimed.
+
+### Deferred, unchanged
+
+* Init's mapping-run pressure (this package pays it the same way the two before it did).
+* The AArch64 spawn round trip does not survive `yarm.sched_quantum_ticks=1` on the provisioned
+  oracle profile (`zero_pid`). Reproduced, not repaired: the witness runs on the shipped quantum.
+* The legacy NR 2 blocking population still has no live producer.
+* The multi-page shared-region mapping defect.
+* `qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh` fails with `timeout_wins=0 reply_wins=0`.
+  PRE-EXISTING, and established by controlled comparison rather than asserted: a worktree at the
+  delivered base `fd23312d` fails it identically. Named here because it is the same RISC-V
+  deadline-wake shape the refused witness arm runs into.

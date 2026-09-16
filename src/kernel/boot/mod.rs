@@ -7941,6 +7941,48 @@ pub fn ipc_send_final_fault_witness_enabled() -> bool {
     IPC_SEND_FINAL_FAULT_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// U9-TIMER5 §3 — the IDLE-BOUNDARY RETURN witness selector. Slot 5 is mutually exclusive; 16 is
+/// the next free value after U9-SEND-FINAL's 15.
+///
+/// It exists because the population it exercises does not occur on an ordinary boot, and that was
+/// measured rather than assumed. At the U9-TIMER5 base, with `yarm.sched_quantum_ticks=1`:
+///
+/// * x86_64 took 73 preempting ticks at its idle boundary and every one of them found an EMPTY run
+///   queue (`TIMER_SPLIT_PREEMPT_IDLE` = 72, one committed preempt), so the queued-work settlement
+///   was never reached;
+/// * AArch64 reached the boundary ZERO times — 14 `irq_lower_a64` exceptions and no
+///   `irq_current_spx` at all, because its idle loop halted with `DAIF` masked.
+///
+/// A boot that never produces the population cannot be evidence about it, which is exactly what
+/// U9-TIMER2's "zero arrivals on these two ports" was. So the witness MANUFACTURES the one shape
+/// that produces it on a uniprocessor: a blocking receive with a deadline, on an endpoint nobody
+/// sends to. The caller parks, the CPU reaches its idle boundary with an empty queue, the
+/// off-lock timeout pipeline expires the deadline on a later tick and makes the caller runnable,
+/// and the NEXT tick's idle-boundary advance is what selects and resumes it.
+///
+/// Every mechanism in that chain is production: `IpcRecvTimeout` (NR 5), the deadline registration
+/// it already performs, `run_due_ipc_timeout_work`, and the canonical selection. The witness adds
+/// the workload and the verification, not a path.
+///
+/// It reuses the SAME provisioning and the same startup slots 13/14 as selectors 12..15 — it needs
+/// exactly one endpoint to receive on — so it adds no capacity requirement and no second
+/// provisioning path.
+pub const TIMER5_IDLE_RETURN_WITNESS_SELECTOR: u64 = 16;
+
+static TIMER5_IDLE_RETURN_WITNESS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the U9-TIMER5 §3 idle-boundary return witness (`yarm.timer5_idle_return_witness=1`).
+/// Default OFF, so an ordinary boot is byte-identical.
+pub(crate) fn set_timer5_idle_return_witness_enabled(enabled: bool) {
+    TIMER5_IDLE_RETURN_WITNESS_ENABLED.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the U9-TIMER5 §3 idle-boundary return witness is armed.
+pub fn timer5_idle_return_witness_enabled() -> bool {
+    TIMER5_IDLE_RETURN_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// U9-RECV-FINAL §1 — how many RECOGNIZED receives reached the terminal broad acquisition.
 ///
 /// The receive family is not closed by this package, and this is what keeps that statement
@@ -7992,6 +8034,7 @@ pub fn shared_region_oracle_provisioning_armed() -> bool {
         || ipc_residual1_queued_cap_witness_enabled()
         || ipc_residual2_park_witness_enabled()
         || ipc_send_final_fault_witness_enabled()
+        || timer5_idle_return_witness_enabled()
 }
 
 /// Stage 198E3C2B: the AArch64 init startup-slot-5 selector for the DIRECT shared-region oracle. On

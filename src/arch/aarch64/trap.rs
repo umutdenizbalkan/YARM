@@ -28,11 +28,104 @@ fn aarch64_trap_trace(args: core::fmt::Arguments) {
 
 macro_rules! trap_trace { ($($arg:tt)*) => { aarch64_trap_trace(format_args!($($arg)*)) }; }
 
+/// U9-TIMER5 §1/§2 — the parked `wfi` loop, running at this CPU's idle-boundary stack anchor.
+///
+/// Reached only from [`idle_no_eret_loop`], which has already re-based `SP_EL1` to the anchor, so
+/// every iteration runs at the SAME depth for the life of the boot. On this port that is not a
+/// tidiness argument, it is the accumulation fix: `SP_EL1` survives an `eret`, so without the
+/// anchor each park → timer → resume → block → park turn would leave one more abandoned vector
+/// frame below the last. (x86_64 re-enters through the TSS `RSP0` and would have re-based anyway;
+/// AArch64 has no such mechanism, which is why the anchor is owned for both.)
+///
+/// # `daifclr` is what makes this a boundary rather than a terminus
+///
+/// `yarm_aarch64_vector_dispatch` executes `msr daifset, #0xf` before calling into Rust, so every
+/// path that reaches this primitive — the FutexWait idle outcome, the exit outcome, the
+/// direct-dispatch idle outcome, the fatal settlement — arrives with IRQ and FIQ MASKED. `wfi`
+/// does wake on a pending interrupt whatever `DAIF` says, but a masked interrupt is not TAKEN:
+/// the CPU falls straight through to the branch and halts again, and no trap ever runs. Measured
+/// at base: an AArch64 core boot records 14 `irq_lower_a64` exceptions and ZERO `irq_current_spx`
+/// — the timer never once reached the idle boundary, which is why U9-TIMER2's "zero arrivals on
+/// this port" was a report about the mask and not about the population.
+///
+/// So the unmask is part of entering the boundary, and it is the direct analogue of RISC-V's
+/// `timer::reestablish_idle_boundary()` before its own halt. It is `daifclr`, never `daifset`:
+/// this primitive exists to be interrupted.
+///
+/// The park sits INSIDE the loop, before the unmask, for the same reason x86_64's does: the
+/// authorization is consumed destructively by the first trap that reads it, so any trap at the
+/// boundary spends it, and re-parking each time round is what makes the next one authenticated.
+/// Publishing before unmasking is also the only safe order — a trap taken between them would
+/// otherwise find the flag clear and decline a legitimate boundary.
+///
+/// A wake is not lost in the window between the run-queue observation and the halt. The
+/// interrupt is pending across it and is taken the instant `daifclr` lands, and the periodic
+/// timer re-arms every tick regardless, so the boundary is re-examined each quantum.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+extern "C" fn aarch64_idle_park_loop(cpu: usize) -> ! {
+    loop {
+        let sp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+        }
+        let parked = crate::kernel::idle_boundary::park(cpu, sp);
+        // Emitted only when this park arrived deeper than any before it on this CPU, so a flat
+        // cycle prints a handful of lines and a leaking one prints per turn. On this port that is
+        // the load-bearing test: `SP_EL1` survives an `eret`, so nothing re-bases it for us.
+        if parked.new_low {
+            crate::yarm_log!(
+                "IDLE_BOUNDARY_PARK cpu={} sp=0x{:x} anchor=0x{:x} parks={} new_low=1",
+                cpu,
+                sp,
+                parked.anchor,
+                crate::kernel::idle_boundary::park_count(cpu)
+            );
+        }
+        unsafe {
+            core::arch::asm!("msr daifclr, #0x3", "wfi", options(nomem, nostack));
+        }
+    }
+}
+
 #[inline(always)]
 fn idle_no_eret_loop() -> ! {
     crate::yarm_log!("SCHED_ENTER_IDLE_HLT");
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    {
+        let cpu = (crate::arch::aarch64::read_mpidr_el1() & 0xff) as usize;
+        let sp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+        }
+        // Install-once: the first park on this CPU records its own stack pointer and every later
+        // one gets that same value back.
+        let anchor = crate::kernel::idle_boundary::park(cpu, sp).anchor;
+        if anchor != 0 && anchor != sp {
+            // Re-base to the anchor and transfer to the loop in ONE asm block, so no Rust code
+            // ever runs on a stack the compiler did not establish. Everything below the anchor is
+            // dead: this function diverges, and so does every caller that reached it. `SP_EL1`
+            // must stay 16-byte aligned, which the anchor is by construction — it is itself a
+            // stack pointer the hardware was already running on.
+            unsafe {
+                core::arch::asm!(
+                    "mov sp, {anchor}",
+                    "mov x0, {cpu}",
+                    "bl {park_loop}",
+                    "brk #0",
+                    anchor = in(reg) anchor,
+                    cpu = in(reg) cpu,
+                    park_loop = sym aarch64_idle_park_loop,
+                    options(noreturn)
+                );
+            }
+        }
+        aarch64_idle_park_loop(cpu)
+    }
+    // Hosted and non-AArch64 builds never execute a vector return, so there is no boundary to
+    // publish and no stack to anchor. Diverging is the whole contract this primitive owes.
+    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "aarch64")))]
     loop {
-        unsafe { core::arch::asm!("wfi") };
+        core::hint::spin_loop();
     }
 }
 

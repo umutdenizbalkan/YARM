@@ -36,6 +36,15 @@ ipc-send-final-fault-witness = []
 # carry none of its literals and are byte-identical to a build without it, so every other slot-5
 # profile keeps the headroom it had.
 futex-wait-nonblock-probe = []
+# U9-TIMER5 §3: gates the IDLE-BOUNDARY RETURN witness cell in init.
+#
+# Same reason as `ipc-send-final-fault-witness`, measured the same way: init's address space runs
+# at `AddressSpace::MAX_MAPPINGS` on the provisioned oracle profiles, and compiling this cell
+# unconditionally cost one more mapping run — enough to make the XFER2 grant witness fail with
+# `VM_FULL reason=mapping_bookkeeping_full max_mappings=128 va=0x40000000`. Feature-off builds
+# carry none of its literals and are byte-identical to a build without it, so every other slot-5
+# profile keeps the headroom it had.
+timer5-idle-return-witness = []
 recv-queue1-ordinary-grant = []
 
 [dependencies]

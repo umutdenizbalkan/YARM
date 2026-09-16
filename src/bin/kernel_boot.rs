@@ -42,6 +42,27 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
         yarm::arch::platform_constants::BOOTSTRAP_CPU_ID
     );
 
+    // U9-TIMER5 §1 — THE EXCLUSION OPENS HERE, BEFORE THE SELECTION.
+    //
+    // U9-TIMER4 established that a trap taken between `dispatch_ready_task()` and the
+    // architectural entry corrupts the selected task's saved context, and closed the window with
+    // this guard. It opened it one statement too late. `dispatch_ready_task()` is not an
+    // observation: it dequeues, installs `current` and marks the task `Running`. A timer taken
+    // inside THAT call already finds a current task published on this CPU — which is precisely the
+    // state the whole trap path treats as "a user task is running here" — while the entry that
+    // makes the claim true has not run and the boot frame is what the trap will capture.
+    //
+    // It is also the state U9-TIMER5 gives a landing to: an idle-boundary timer may now select and
+    // resume. A trap inside the selection would therefore have a SECOND selector racing the boot
+    // one on the same run queue. The exclusion has to cover the publication, not merely the gap
+    // after it, so it starts before `dispatch_ready_task()` and is held continuously through the
+    // architectural return.
+    //
+    // TIMER4's boots passing is not evidence that the smaller window was safe: the measured
+    // corruption needed a timer to land in a window of a few hundred instructions, and the
+    // selection is a handful more. Passing boots distinguish "did not happen this time" from
+    // "cannot happen"; only the mask does the latter.
+    let boot_irq_state = yarm::arch::irq_guard::irq_save();
     let initial = kernel.dispatch_ready_task().ok().flatten();
     // U9-RECV-BLOCK2 §3 — the one-shot x86_64 SMP-unlock audit, driven from the BOOT OWNERSHIP
     // POINT that already holds `&mut KernelState`, so it costs no broad acquisition.
@@ -94,11 +115,12 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     // through `d2_recv_switch_incoming_asid` did not help).
     //
     // `irq_save`/`irq_restore` is the tree's existing arch-neutral interrupt-exclusion owner. The
-    // mask spans the diagnostics, the SMP-unlock audit and the entry, so the window is CLOSED
-    // rather than narrowed. It does not leak into userspace: the architectural return restores the
-    // user interrupt state from the saved program status, and the explicit restores below are
-    // reached only when no return happens.
-    let boot_irq_state = yarm::arch::irq_guard::irq_save();
+    // mask spans the selection, the diagnostics, the SMP-unlock audit and the entry, so the window
+    // is CLOSED rather than narrowed. It does not leak into userspace: the architectural return
+    // restores the user interrupt state from the saved program status — x86_64's `iretq` pops
+    // `RFLAGS` with `IF` set and AArch64's `eret` restores `PSTATE` from `SPSR_EL1`, whose EL0
+    // value has the `DAIF` mask bits clear — and the explicit restores below are reached only when
+    // no return happens.
     if initial.is_some() {
         // U9-TIMER3 §2 / U9-TIMER4 §2 — the five one-shot diagnostic proofs, driven from the same
         // ownership point and for the same reason the SMP-unlock audit is: `dispatch_ready_task()`

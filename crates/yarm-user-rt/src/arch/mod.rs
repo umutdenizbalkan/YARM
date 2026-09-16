@@ -18,17 +18,17 @@ pub(crate) struct SyscallReturn {
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
-pub(crate) use x86_64::raw_syscall;
+pub(crate) use x86_64::{CALLEE_SAVED_CHECKED, raw_syscall, raw_syscall_checking_callee_saved};
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
-pub(crate) use aarch64::raw_syscall;
+pub(crate) use aarch64::{CALLEE_SAVED_CHECKED, raw_syscall, raw_syscall_checking_callee_saved};
 
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
 #[cfg(target_arch = "riscv64")]
-pub(crate) use riscv64::raw_syscall;
+pub(crate) use riscv64::{CALLEE_SAVED_CHECKED, raw_syscall, raw_syscall_checking_callee_saved};
 
 #[cfg(not(any(
     target_arch = "x86_64",
@@ -41,4 +41,6 @@ mod unsupported;
     target_arch = "aarch64",
     target_arch = "riscv64"
 )))]
-pub(crate) use unsupported::raw_syscall;
+pub(crate) use unsupported::{
+    CALLEE_SAVED_CHECKED, raw_syscall, raw_syscall_checking_callee_saved,
+};

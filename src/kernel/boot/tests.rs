@@ -102676,7 +102676,7 @@ mod stage200d0c1_aarch64_exit_prep {
             .unwrap();
         assert!(
             A64_BOOT_SRC[at..]
-                .contains("write_trapframe_back_to_vector_frame(frame, &trap_frame);"),
+                .contains("write_trapframe_back_to_vector_frame(frame, &trap_frame, trap_cpu);"),
             "the vector frame is committed after the shared entry returns"
         );
         // It is AArch64-gated, so it cannot alter the sealed x86_64 path.
@@ -102923,10 +102923,13 @@ mod stage200d0c1_aarch64_exit_prep {
             !helper.contains("asm!(\"wfi\")"),
             "no second wfi loop is introduced"
         );
+        // U9-TIMER5 re-derivation: the `wfi` moved from `idle_no_eret_loop`'s own body into
+        // `aarch64_idle_park_loop`, the anchored loop it transfers to, so the literal this used to
+        // count changed spelling. The property is unchanged and is asserted against the new one:
+        // there is still exactly ONE `wfi` in this module, so there is still exactly one idle
+        // primitive and no second idle policy.
         assert_eq!(
-            A64_TRAP_SRC
-                .matches("unsafe { core::arch::asm!(\"wfi\") };")
-                .count(),
+            A64_TRAP_SRC.matches("\"wfi\"").count(),
             1,
             "exactly one wfi idle primitive exists in the AArch64 trap module"
         );
@@ -146626,12 +146629,17 @@ mod u9qa_split_dispatch_disposition {
         // receive against it in the broad dispatcher is exactly the corruption the disposition
         // exists to prevent. Like the other four it is an explicit disposition arm and infers
         // nothing from a stash.
+        // U9-TIMER5 §2 re-derivation: SIX. The idle-boundary timer's queued-work settlement is
+        // the sixth, and its reason is the mirror of the preempting timer's: the route has ticked,
+        // acked and re-armed, so entering the broad dispatcher would tick a SECOND time, and the
+        // authoritative advance it would perform is the one the post-lock drain now owns. Like the
+        // other five it is an explicit disposition arm and infers nothing from a stash.
         assert_eq!(
             code.matches("queue_advance_committed = true;").count(),
-            5,
-            "exactly five disposition arms may declare the broad dispatcher skipped: \
+            6,
+            "exactly six disposition arms may declare the broad dispatcher skipped: \
              FutexWait publication, terminal-fault commit, terminal-fault fail-closed, \
-             and the preempting-timer commit"
+             the preempting-timer commit, the unsettled block, and the idle-boundary advance"
         );
         // And the fourth is reached from the TIMER route's own arm, not smuggled into another
         // one: the setter and its distinct skip reason both sit between that arm's head and the
@@ -146953,16 +146961,42 @@ mod u9qa_x86_terminal_idle_landing {
 
     /// The idle primitive is the wake-capable one, so a settled CPU can be woken by an IRQ
     /// rather than being parked forever.
+    ///
+    /// U9-TIMER5 re-derivation: `idle_halt_loop` now re-bases `RSP` to this CPU's idle-boundary
+    /// anchor and transfers to `x86_idle_park_loop`, which owns the `sti; hlt`. So the halt moved
+    /// one function, and the claim is asserted where it lives — plus the two properties that
+    /// arrival gave it: the halt is still interruptible, and the loop re-publishes the boundary on
+    /// every iteration, so a trap that spends the authorization without using it does not leave
+    /// the next one unauthenticated.
     #[test]
     fn the_landing_idles_wake_capably() {
-        let body = DESC
-            .split("pub(crate) fn idle_halt_loop() -> ! {")
-            .nth(1)
-            .expect("idle_halt_loop must exist");
-        let end = body.find("\n}").unwrap_or(body.len());
         assert!(
-            body[..end].contains("\"sti\", \"hlt\""),
+            DESC.contains("pub(crate) fn idle_halt_loop() -> ! {"),
+            "idle_halt_loop must exist"
+        );
+        let body = DESC
+            .split("extern \"C\" fn x86_idle_park_loop(cpu: usize) -> ! {")
+            .nth(1)
+            .expect("the anchored halt loop must exist");
+        let end = body.find("\n}").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("\"sti\", \"hlt\""),
             "the terminal-idle landing must be interruptible (sti; hlt), not a masked halt"
+        );
+        assert_eq!(
+            DESC.matches("\"sti\", \"hlt\"").count(),
+            1,
+            "exactly one halt primitive exists — no second idle policy"
+        );
+        let park_at = body
+            .find("idle_boundary::park(cpu, rsp)")
+            .expect("the boundary publication");
+        let halt_at = body.find("\"sti\", \"hlt\"").expect("the halt");
+        assert!(
+            park_at < halt_at,
+            "the boundary is published before the CPU halts, and inside the loop so every \
+             iteration re-publishes it"
         );
     }
 
@@ -148505,13 +148539,30 @@ mod u9tm_proof_gate {
         // stays banned here for the reason it always was: it means a terminal transition was
         // published and a per-CPU deferral carries the outgoing identity, and this arm has no
         // outgoing task to name.
-        for (name, region) in [
-            ("the idle-CPU arm", &code[idle_at..tail_at]),
-            ("a non-preempting tick", &code[tail_at..]),
+        //
+        // U9-TIMER5 re-derivation: the idle arm no longer settles as `PostWorkCommitted` at all.
+        // U9-TIMER2 let the RUN-QUEUE COUNT pick between the two dispositions, and that was the
+        // last place the count acted as a reservation — measurably wrong, because the off-lock
+        // timeout pipeline that produces most idle-boundary wakes runs LATER in the same trap than
+        // this probe, so the tick that fires a deadline necessarily probes zero. Both idle
+        // outcomes now settle as `TimerIdleQueueAdvance` and the drain re-asks authoritatively;
+        // an empty queue is still an empty queue there. `PostWorkCommitted` therefore belongs to
+        // the non-preempting tail alone, which is where the table below now places it.
+        for (name, region, settlement) in [
+            (
+                "the idle-CPU arm",
+                &code[idle_at..tail_at],
+                "D::TimerIdleQueueAdvance",
+            ),
+            (
+                "a non-preempting tick",
+                &code[tail_at..],
+                "D::PostWorkCommitted",
+            ),
         ] {
             assert!(
-                region.contains("D::PostWorkCommitted"),
-                "{name} must settle an empty-queue tick as PostWorkCommitted"
+                region.contains(settlement),
+                "{name} must settle as {settlement}"
             );
             for wrong in ["D::Complete", "D::QueueAdvanceCommitted"] {
                 assert!(!region.contains(wrong), "{name} must not borrow `{wrong}`");
@@ -148528,31 +148579,64 @@ mod u9tm_proof_gate {
                 assert!(!region.contains(banned), "{name} must not `{banned}`");
             }
         }
-        // The non-preempting tail additionally owns no queue-advance settlement at all.
+        // U9-TIMER5 re-derivation: the non-preempting tail DOES owe a queue advance, but only for
+        // a parked CPU, and the distinction is what this now pins.
+        //
+        // The old claim — "a non-preempting tick owes no queue advance" — was true of a tick that
+        // interrupts a RUNNING task, which is what the quantum is about. It was never true of a
+        // tick that interrupts a parked one: the broad arm's own `yield_current`, reached for that
+        // state, takes `NoCurrent`, skips the `Running -> Runnable` step and dispatches. Measured:
+        // on the AArch64 profile's shipped quantum an entire boot took 74 ticks and none of them
+        // preempted, so under the old settlement a deadline that expired while the CPU was parked
+        // was never dispatched at all.
+        //
+        // So the tail keeps `PostWorkCommitted` as its settlement and gains ONE guarded exit, and
+        // the guard is the only thing that may open it: nothing is current on this CPU.
+        let tail = &code[tail_at..];
+        let advance_at = tail
+            .find("return D::TimerIdleQueueAdvance;")
+            .expect("the parked-CPU exit");
+        let guard_at = tail
+            .find("if !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0) {")
+            .expect("and it must be guarded on nothing being current");
         assert!(
-            !code[tail_at..].contains("D::TimerIdleQueueAdvance"),
-            "a non-preempting tick owes no queue advance"
+            guard_at < advance_at,
+            "the parked-CPU test precedes the advance it authorizes"
+        );
+        assert_eq!(
+            tail.matches("return D::TimerIdleQueueAdvance;").count(),
+            1,
+            "exactly one guarded exit — a tick that interrupted a running task still owes the \
+             architecture tail and nothing else"
         );
 
         // The idle arm's admission is the RUN QUEUE, not `current`, and what it does with the
-        // answer is now a SETTLEMENT rather than a hand-off:
+        // answer is a SETTLEMENT rather than a hand-off:
         //
         // * an empty queue settles as `PostWorkCommitted`, unchanged;
         // * a non-empty queue commits `TimerIdleQueueAdvance`, so the bridge performs the one
-        //   authoritative advance the broad arm's `on_preempt_current_cpu_selection()` used to;
-        // * a port with no idle-boundary landing declines, and declines FIRST — before the tick —
-        //   so it still reaches the broad arm having incremented nothing.
+        //   authoritative advance the broad arm's `on_preempt_current_cpu_selection()` used to.
         //
-        // The probe now precedes the tick because the tick is common to both settlements, which is
-        // what stops the count being read as a reservation: nothing is owed to the queue on the
-        // strength of it, and the bridge's own selection decides what actually happens.
-        let idle_arm = &code[idle_at..tail_at];
+        // U9-TIMER5 re-derivation: the THIRD outcome — U9-TIMER2's port decline under
+        // `no_user_return_path` — is gone, because every port now has a landing. The arm has no
+        // refusal of its own left, so what this guard checks is that there is none: an idle tick
+        // with queued work now always reaches the settlement, and the only thing that can still
+        // stop the advance is the bridge's own authentication, which is not knowable here.
+        //
+        // The probe still precedes the tick, and that ordering still carries the same meaning it
+        // did: the count is an OBSERVATION, not a reservation. The tick is common to both
+        // settlements, nothing is owed to the queue on the strength of the count, and the bridge's
+        // authoritative selection decides what actually happens.
+        // Bounded at the GENERIC decline arm, not at the tail: `Err(decline) => { .. }` sits
+        // between the two and is the transaction's own refusal, which is not this arm's.
+        let idle_end = code[idle_at..tail_at]
+            .find("Err(decline) => {")
+            .map(|o| idle_at + o)
+            .expect("the generic transaction decline arm");
+        let idle_arm = &code[idle_at..idle_end];
         let probe = idle_arm
             .find("runnable_count_on_cpu_split_read(cpu)")
             .expect("the idle arm must consult the run queue");
-        let decline = idle_arm
-            .find("reason=no_user_return_path")
-            .expect("a port with no landing must decline under its own reason");
         let tick = idle_arm
             .find("scheduler_tick_split_mut(cpu)")
             .expect("the idle arm's tick");
@@ -148560,17 +148644,24 @@ mod u9tm_proof_gate {
             .find("return D::TimerIdleQueueAdvance;")
             .expect("the queued-work settlement");
         assert!(
-            probe < decline && decline < tick,
-            "the run-queue probe and the port decline both precede the tick, so a declined idle \
-             tick reaches the broad arm having incremented nothing"
+            probe < tick && tick < advance,
+            "the run-queue probe precedes the tick it does not reserve, and the settlement is \
+             committed only after the tick it owns"
         );
+        for retired in [
+            "reason=no_current_runnable",
+            "reason=no_user_return_path",
+            "IDLE_BOUNDARY_TIMER_CAN_RESUME_USER",
+        ] {
+            assert!(
+                !idle_arm.contains(retired),
+                "`{retired}` is retired and must not survive alongside its replacement"
+            );
+        }
         assert!(
-            tick < advance,
-            "the queued-work settlement is committed only after the tick it owns"
-        );
-        assert!(
-            !idle_arm.contains("reason=no_current_runnable"),
-            "the retired decline must not survive alongside its replacement"
+            !idle_arm.contains("return D::NotHandled;"),
+            "the idle arm has no refusal left: every port has a landing, so an idle tick with \
+             queued work always reaches the settlement"
         );
     }
 
@@ -166762,21 +166853,62 @@ mod u9exit4_post_clear_totality {
     }
 
     /// **AArch64 enters EL1 with `DAIF` masked and the trap path never unmasks.** The architecture
-    /// masks on synchronous exception entry; the guard is that no `daifclr` appears in either the
-    /// AArch64 trap handler or the shared trap bridge.
+    /// masks on synchronous exception entry, and `yarm_aarch64_vector_dispatch` masks the rest
+    /// with `msr daifset, #0xf` before it calls into Rust; the guard is that nothing on the trap
+    /// path undoes that.
+    ///
+    /// U9-TIMER5 re-derivation: there is now exactly ONE `daifclr` in the AArch64 trap module, and
+    /// it is not on the trap path. It is in `aarch64_idle_park_loop` — the anchored halt loop the
+    /// trap path DIVERGES into and never returns from — where unmasking is the whole point: a
+    /// masked `wfi` wakes on a pending interrupt but never TAKES it, so the boundary would be a
+    /// terminus rather than a boundary. Measured at base: an AArch64 core boot recorded 14
+    /// `irq_lower_a64` exceptions and zero `irq_current_spx`, i.e. the timer never once reached
+    /// the idle boundary.
+    ///
+    /// This is the same shape the x86_64 sibling above already has, where the trap path carries no
+    /// `sti` and `x86_idle_park_loop`'s `sti; hlt` is the landing rather than the path. So the
+    /// assertion is made exact instead of absolute: every `daifclr` must be inside the idle
+    /// primitive, and there must be exactly one.
     #[test]
     fn the_aarch64_trap_window_runs_with_interrupts_masked() {
-        for (name, src) in [
-            ("aarch64/trap.rs", AARCH64_TRAP),
-            ("trap_entry.rs", TRAP_ENTRY),
-        ] {
-            for line in code_lines(src) {
-                assert!(
-                    !line.contains("daifclr"),
-                    "{name} unmasks IRQs on the trap path: {line}"
-                );
-            }
+        for line in code_lines(TRAP_ENTRY) {
+            assert!(
+                !line.contains("daifclr"),
+                "trap_entry.rs unmasks IRQs on the trap path: {line}"
+            );
         }
+        let park_loop = AARCH64_TRAP
+            .split_once("extern \"C\" fn aarch64_idle_park_loop(cpu: usize) -> ! {")
+            .map(|(_, r)| r.split_once("\n}").map(|(b, _)| b).unwrap_or(r))
+            .expect("the AArch64 idle primitive");
+        let park_code = code_lines(park_loop)
+            .into_iter()
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            park_code.matches("daifclr").count(),
+            1,
+            "the idle primitive unmasks exactly once, immediately before its wfi"
+        );
+        let module_code = code_lines(AARCH64_TRAP)
+            .into_iter()
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            module_code.matches("daifclr").count(),
+            1,
+            "and it is the ONLY unmask in the module — the trap path itself never has one"
+        );
+        // Ordering inside the primitive: publish the boundary, THEN unmask. A trap taken between
+        // an unmask and the park would find the flag clear and decline a legitimate boundary.
+        let park_at = park_code
+            .find("idle_boundary::park(cpu, sp)")
+            .expect("the boundary publication");
+        let unmask_at = park_code.find("daifclr").expect("the unmask");
+        assert!(
+            park_at < unmask_at,
+            "the boundary is published before interrupts are opened"
+        );
     }
 
     /// **RISC-V enters S-mode with `sstatus.SIE` clear and re-enables it at exactly one program
@@ -168119,8 +168251,13 @@ mod u9residual1_yield_family {
             );
         }
         // The timer route's SECOND committing arm, pinned in its own terms: the increment sits
-        // ahead of the disposition it commits, and the arm's only decline — the port capability
-        // refusal — is ahead of the increment, so a declining port never moves the counter.
+        // ahead of the disposition it commits.
+        //
+        // U9-TIMER5 re-derivation: the arm's one decline — U9-TIMER2's port-capability refusal —
+        // is gone with the constant that drove it, so the clause about a declining port never
+        // moving the counter has nothing left to be about. The exactness claim is unchanged and
+        // is strictly easier to hold: the arm has no decline at all, which is asserted directly
+        // below rather than by ordering the increment after one.
         {
             let at = SPLIT
                 .find("fn try_split_timer_into_frame(")
@@ -168140,12 +168277,17 @@ mod u9residual1_yield_family {
                 second < advance,
                 "the idle-advance increment belongs to the arm that commits it"
             );
-            let refusal = body
-                .find("reason=no_user_return_path")
-                .expect("the port-capability refusal");
+            let idle_at = body
+                .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {")
+                .expect("the idle-CPU arm");
+            let idle_end = body[idle_at..]
+                .find("Err(decline) => {")
+                .map(|o| idle_at + o)
+                .expect("the generic transaction decline arm");
             assert!(
-                refusal < second,
-                "a port with no landing declines BEFORE the counter moves"
+                !body[idle_at..idle_end].contains("return D::NotHandled;"),
+                "the idle-boundary arm has no decline that could move the counter and then hand \
+                 an already-ticked CPU to the broad arm"
             );
             let declines_between: alloc::vec::Vec<usize> = body
                 .match_indices("return D::NotHandled;")
@@ -170490,8 +170632,16 @@ mod u9dispatchcpu3_recovery_chain {
     #[test]
     fn every_idle_landing_is_wake_capable() {
         const A64: &str = include_str!("../../arch/aarch64/trap.rs");
+        // U9-TIMER5 re-derivation: the `wfi` lives in `aarch64_idle_park_loop`, the anchored loop
+        // `idle_no_eret_loop` transfers to, so the slice follows it there. And the claim gets the
+        // teeth it was missing: "wake-capable" was asserted only as the ABSENCE of a mask, which
+        // was true of the old body and still left the halt terminal, because
+        // `yarm_aarch64_vector_dispatch` masks `DAIF` before calling into Rust and every path to
+        // this primitive arrives through it. Measured at base — 14 `irq_lower_a64` exceptions and
+        // zero `irq_current_spx` on an AArch64 core boot. The primitive must now UNMASK, which is
+        // the direct analogue of RISC-V's `reestablish_idle_boundary()` asserted below.
         let idle = A64
-            .split_once("fn idle_no_eret_loop() -> ! {")
+            .split_once("extern \"C\" fn aarch64_idle_park_loop(cpu: usize) -> ! {")
             .map(|(_, r)| r.split_once("\n}").map(|(b, _)| b).unwrap_or(r))
             .expect("the AArch64 idle primitive");
         assert!(
@@ -170499,8 +170649,17 @@ mod u9dispatchcpu3_recovery_chain {
             "AArch64 idles on `wfi`, which wakes on an unmasked pending interrupt"
         );
         assert!(
+            idle.contains("msr daifclr"),
+            "and it must OPEN interrupts on the way in — a masked `wfi` wakes but never traps, \
+             which is what made this landing terminal before U9-TIMER5"
+        );
+        assert!(
             !idle.contains("msr daifset") && !idle.contains("DAIFSet"),
             "and it must NOT mask interrupts on the way in — that would make the halt terminal"
+        );
+        assert!(
+            A64.contains("fn idle_no_eret_loop() -> ! {"),
+            "the single named entry point into that primitive must still exist"
         );
 
         const RV: &str = include_str!("../../arch/riscv64/boot.rs");
@@ -170921,12 +171080,15 @@ mod u9timer1_preempting_timer {
         // U9-TIMER4 re-derivation: 5 -> 4. The last diagnostic gate term is removed, because the
         // boot-path window that kept its proof on the timer is closed. No diagnostic knob is a
         // reason for this route to refuse any more.
+        // U9-TIMER5 re-derivation: 4 -> 3. The port-capability refusal is removed, because the
+        // landing it reported absent is built on both ports it excluded. What is left is three
+        // declines that are not about the timer's own work at all: two classification misses and
+        // one fail-safe.
         assert_eq!(
             code.matches("return D::NotHandled;").count(),
-            4,
-            "four declines: not-a-timer, a port with no idle-boundary landing that can return to \
-             user mode, a transaction decline, and the tail's fail-safe if the lookahead and the \
-             no-switch seam ever disagreed"
+            3,
+            "three declines: not-a-timer, a transaction decline, and the tail's fail-safe if the \
+             lookahead and the no-switch seam ever disagreed"
         );
     }
 
@@ -171018,20 +171180,32 @@ mod u9timer1_preempting_timer {
             txn < tick,
             "nothing ticks until the transaction has committed"
         );
-        // In the idle arm the run-queue probe and its decline both precede the tick.
-        let arm = &code[idle..tail];
+        // U9-TIMER5 re-derivation: the idle arm HAS no decline any more, so the property is
+        // stated the only way that is still true of it — it declines nowhere, at any position.
+        // The obligation the old assertion carried is met more strongly than before: a branch with
+        // no `NotHandled` cannot hand the broad arm a half-ticked CPU, because it cannot hand the
+        // broad arm anything at all. The run-queue probe still precedes the tick, and that
+        // ordering still says the count is an observation rather than a reservation.
+        // Bounded at the GENERIC decline arm: `Err(decline) => { .. }` is the transaction's own
+        // refusal, which is pre-mutation for its own reasons and is not part of the idle arm.
+        let arm_end = code[idle..tail]
+            .find("Err(decline) => {")
+            .map(|o| idle + o)
+            .expect("the generic transaction decline arm");
+        let arm = &code[idle..arm_end];
         let probe = arm
             .find("runnable_count_on_cpu_split_read(cpu)")
             .expect("the run-queue probe");
-        let decline = arm
-            .find("return D::NotHandled;")
-            .expect("the idle arm's decline");
         let idle_tick = arm
             .find("scheduler_tick_split_mut(cpu)")
             .expect("the idle arm's tick");
         assert!(
-            probe < decline && decline < idle_tick,
-            "the idle arm decides on the run queue before it takes its tick"
+            probe < idle_tick,
+            "the idle arm reads the run queue before it takes its tick"
+        );
+        assert!(
+            !arm.contains("return D::NotHandled;"),
+            "the idle arm no longer declines at all — every port has a landing"
         );
         // And the tail's seam is atomic: it refuses without incrementing.
         let seam = RUNTIME
@@ -171188,10 +171362,13 @@ mod u9timer1_preempting_timer {
     /// | `multi_cpu` | `TerminalAdmissionRefusal` | more than one dispatching CPU (`yarm.ap_user_dispatch`) |
     /// | `not_running` | `apply_preempt_outgoing_locked` | the interrupted task is not `Running` |
     /// | `reenqueue_failed` | the scheduler | the re-enqueue was refused; `current` was restored |
-    /// | `no_current_runnable` | the route's run-queue probe | idle CPU whose run queue is NOT empty |
     ///
-    /// The first and last are the route's own; the middle seven are `YieldDecline`'s, and the
-    /// case enumerates the enum so a new variant cannot be added without landing here.
+    /// U9-TIMER5 re-derivation: the route has NO declines of its own left. `proof_hooks_armed`
+    /// went with U9-TIMER3/§4's relocation of the five diagnostic bodies, `no_current_runnable`
+    /// went with U9-TIMER2's idle settlement, and `no_user_return_path` goes here — every port has
+    /// an idle-boundary landing, so the population it named is served rather than refused. What
+    /// remains is exactly `YieldDecline`, and the case enumerates the enum so a new variant cannot
+    /// be added without landing here.
     #[test]
     fn every_remaining_timer_decline_is_inventoried() {
         // The route's own two, by their exact emitted reasons.
@@ -171208,23 +171385,33 @@ mod u9timer1_preempting_timer {
             !code.contains("timer_proof_hooks_armed"),
             "and the route must not consult the removed gate under any spelling"
         );
-        // U9-TIMER2 re-derivation: `no_current_runnable` is RETIRED as a decline. The
-        // idle-CPU-with-queued-work population is now settled by the route, which ticks once,
-        // acks, re-arms and commits `TimerIdleQueueAdvance` for the bridge to advance. What
-        // remains in its place is a narrower decline — the ports whose idle-boundary timer entry
-        // has no landing that can return to user mode — and it names itself distinctly so the
-        // residual stays countable rather than being folded into the retired reason.
-        assert!(
-            !code.contains("reason=no_current_runnable"),
-            "the idle-CPU-with-work decline is retired, not renamed alongside its replacement"
-        );
-        assert!(
-            code.contains("reason=no_user_return_path"),
-            "the port-capability decline must name itself"
-        );
+        // U9-TIMER2 retired `no_current_runnable`; U9-TIMER5 retires the narrower decline that
+        // replaced it. Both are retired by REMOVING the dependency, never by renaming: the
+        // idle-CPU-with-queued-work population is settled by the route, which ticks once, acks,
+        // re-arms and commits `TimerIdleQueueAdvance`, and the bridge performs the one
+        // authoritative advance for every port rather than only for the one that had a landing.
+        for retired in [
+            "reason=no_current_runnable",
+            "reason=no_user_return_path",
+            "IDLE_BOUNDARY_TIMER_CAN_RESUME_USER",
+        ] {
+            assert!(
+                !code.contains(retired),
+                "`{retired}` is retired, not renamed alongside its replacement"
+            );
+        }
         assert!(
             code.contains("return D::TimerIdleQueueAdvance;"),
             "and the population it replaced must be settled, not simply dropped"
+        );
+        // The whole route now has exactly the declines `YieldDecline` supplies, plus the two
+        // classification refusals that precede any timer work at all (`!is_timer`, and a tick that
+        // would preempt a running task being handled by the committing branch instead).
+        assert_eq!(
+            code.matches("return D::NotHandled;").count(),
+            3,
+            "the route's `NotHandled` sites are the non-timer refusal, the transaction's own \
+             decline and the non-preempting tail's lookahead miss — no fourth"
         );
 
         // The transaction's, from the enum rather than from a log. Every variant either has a
@@ -181267,5 +181454,538 @@ mod u9_recv_block1_closure {
                 "{name} must derive its continuation from the outcome, not flatten it"
             );
         }
+    }
+}
+
+/// U9-TIMER5 §3 — the deterministic half: the queue changes and refusal settlements the live
+/// witness cannot reach, and the authentication contract it depends on.
+///
+/// The witness is the positive evidence — a real park, a real timer, a real resume, verified from
+/// userspace. What it cannot produce on demand is a queue that empties between the observation and
+/// the dequeue, a candidate that stops being markable, or a timer that finds `current` empty
+/// somewhere that is NOT the idle boundary. Those are driven here, from the same production owners.
+#[cfg(test)]
+mod u9timer5_idle_boundary {
+    use crate::kernel::idle_boundary;
+    use crate::kernel::scheduler::MAX_CPUS;
+
+    const BRIDGE: &str = include_str!("../../arch/trap_entry.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const BOOT_BIN_SRC: &str = include_str!("../../bin/kernel_boot.rs");
+
+    /// A CPU index no other case in this module uses, so the shared statics cannot cross-talk
+    /// under `--test-threads=1` ordering.
+    const CPU: usize = MAX_CPUS - 1;
+
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn drain_body() -> alloc::string::String {
+        let code = code_only(BRIDGE);
+        let at = code
+            .find("if timer_idle_queue_advance {")
+            .expect("the idle-boundary drain");
+        let end = code[at..]
+            .find("\n    #[cfg(target_arch = \"x86_64\")]")
+            .map(|r| at + r)
+            .unwrap_or(code.len());
+        alloc::string::String::from(&code[at..end])
+    }
+
+    // ── the authentication contract ──────────────────────────────────────────────────────────
+
+    /// **The authorization is one-shot, and a second trap cannot inherit it.**
+    ///
+    /// This is the whole difference between the flag and `current == None`. `current` is empty in
+    /// several kernel windows and stays empty across as many traps as it likes; the flag is
+    /// published by a primitive that then halts, and the first trap to read it takes it away.
+    #[test]
+    fn the_boundary_publication_is_consumed_exactly_once() {
+        idle_boundary::reset_for_test(CPU);
+        assert!(
+            !idle_boundary::is_parked(CPU),
+            "nothing is parked to begin with"
+        );
+        assert!(
+            !idle_boundary::take_parked(CPU),
+            "and an unparked CPU authorizes nothing"
+        );
+
+        idle_boundary::park(CPU, 0x8000);
+        assert!(idle_boundary::is_parked(CPU));
+        assert!(
+            idle_boundary::take_parked(CPU),
+            "the first trap is authorized"
+        );
+        assert!(
+            !idle_boundary::take_parked(CPU),
+            "the second is NOT — a nested trap, or the next one after a return to kernel code, \
+             must not inherit an authorization the first already spent"
+        );
+        idle_boundary::reset_for_test(CPU);
+    }
+
+    /// **The stack anchor is install-once, so the boundary has ONE depth for the life of the boot.**
+    ///
+    /// Every park is reached by diverging from inside a trap handler, so successive parks arrive at
+    /// whatever depth their call chain happened to have. Re-basing them all to the first one is
+    /// what keeps the park → timer → resume → block → park cycle flat instead of monotone.
+    #[test]
+    fn the_stack_anchor_is_installed_once_and_never_drifts() {
+        idle_boundary::reset_for_test(CPU);
+        assert_eq!(
+            idle_boundary::stack_anchor(CPU),
+            0,
+            "no anchor before the first park"
+        );
+
+        let first = idle_boundary::park(CPU, 0x9000);
+        assert_eq!(
+            first.anchor, 0x9000,
+            "the first park installs its own depth"
+        );
+        assert!(first.new_low, "and it is trivially the lowest so far");
+
+        // Later parks arrive DEEPER (the classic accumulation shape) and SHALLOWER; neither moves
+        // the anchor.
+        for sp in [0x8f00u64, 0x8e00, 0x9100] {
+            let p = idle_boundary::park(CPU, sp);
+            assert_eq!(p.anchor, 0x9000, "the anchor is install-once");
+        }
+        assert_eq!(idle_boundary::stack_anchor(CPU), 0x9000);
+        assert_eq!(idle_boundary::park_count(CPU), 4);
+        // The low-water mark is the accumulation detector: monotone non-increasing, and it only
+        // reports `new_low` when it actually moved.
+        assert_eq!(idle_boundary::park_sp_low(CPU), 0x8e00);
+        assert!(
+            !idle_boundary::park(CPU, 0x9200).new_low,
+            "a shallower arrival is not a new low, so a flat cycle stops reporting"
+        );
+        idle_boundary::reset_for_test(CPU);
+    }
+
+    /// **The user-return debt is a debt: published by the bridge, taken by the tail, exactly once.**
+    #[test]
+    fn the_user_return_debt_is_taken_exactly_once() {
+        idle_boundary::reset_for_test(CPU);
+        assert!(
+            !idle_boundary::take_user_return(CPU),
+            "no debt to begin with"
+        );
+        assert_eq!(idle_boundary::user_return_count(CPU), 0);
+
+        idle_boundary::commit_user_return(CPU);
+        assert_eq!(idle_boundary::user_return_count(CPU), 1);
+        assert!(
+            idle_boundary::take_user_return(CPU),
+            "the tail converts one frame"
+        );
+        assert!(
+            !idle_boundary::take_user_return(CPU),
+            "and only one — a second conversion would redirect a frame nothing authorized"
+        );
+        idle_boundary::reset_for_test(CPU);
+    }
+
+    /// **An out-of-range CPU is refused everywhere**, rather than indexing past the arrays.
+    #[test]
+    fn an_out_of_range_cpu_authorizes_nothing() {
+        let bad = MAX_CPUS + 3;
+        assert_eq!(idle_boundary::park(bad, 0x1234).anchor, 0x1234);
+        assert!(!idle_boundary::is_parked(bad));
+        assert!(!idle_boundary::take_parked(bad));
+        assert_eq!(idle_boundary::stack_anchor(bad), 0);
+        idle_boundary::commit_user_return(bad);
+        assert!(!idle_boundary::take_user_return(bad));
+        assert_eq!(idle_boundary::park_count(bad), 0);
+        assert_eq!(idle_boundary::user_return_count(bad), 0);
+    }
+
+    // ── the drain: three conjuncts, and distinct settlements ─────────────────────────────────
+
+    /// **The advance requires all three facts, and each is asked in its own place.**
+    ///
+    /// `current == None` is NOT one of them, and that is the point: the disposition already
+    /// carries it, and it is exactly the fact that does not distinguish the idle boundary from a
+    /// kernel window with nothing current.
+    #[test]
+    fn the_drain_requires_the_disposition_the_authentication_and_a_markable_task() {
+        let drain = drain_body();
+        assert!(
+            drain.contains("if !idle_boundary_authenticated {"),
+            "the authentication is a gate, not a log field"
+        );
+        assert!(
+            drain.contains("shared.yield_reverify_ready(cpu)"),
+            "the re-verify is the existing rank-1 seam"
+        );
+        assert!(
+            drain.contains("queue_advance_acquire_incoming_split(")
+                && drain.contains("k.yield_dispatch_step_mut(a)"),
+            "selection and mark go through the ONE owner every sibling drain uses"
+        );
+        // No second scheduling policy, and no second dequeue.
+        for banned in [
+            "dispatch_next_selection_on",
+            "queue_advance_select_step_split",
+            "queue_advance_commit_split",
+            "preempt_reenqueue_only_on",
+            "enqueue_on_cpu",
+            "set_current",
+            "local_dispatch_step_split",
+        ] {
+            assert!(
+                !drain.contains(banned),
+                "the idle-boundary drain must not `{banned}` — that belongs to the acquire or to \
+                 the rollback, and a second copy is how two routes come to disagree"
+            );
+        }
+        // And no broad acquisition: the census total is unchanged by this package.
+        for banned in ["with_cpu(", "borrow_kernel_for_boot", "SharedKernel::with("] {
+            assert!(
+                !drain.contains(banned),
+                "the idle-boundary drain must not `{banned}`"
+            );
+        }
+    }
+
+    /// **Every non-resuming outcome keeps its own name.**
+    ///
+    /// `Idle` (the queue really did empty), `NoneAcceptable` (it did not empty and every candidate
+    /// was refused, so all of them are still queued in order), `Contended` (a candidate stopped
+    /// being markable and its dequeue was already undone) and the two authority refusals all reach
+    /// the same settlement marker through `acquired.marker()`, which is what keeps them
+    /// distinguishable in a log rather than averaged into "idle".
+    ///
+    /// The two that are NOT selection outcomes get their own reasons, because they are different
+    /// facts: `kernel_not_parked` means this trap was not at the boundary at all, and
+    /// `current_installed` means something became current inside this trap.
+    #[test]
+    fn every_non_resuming_outcome_is_settled_under_its_own_reason() {
+        let drain = drain_body();
+        assert!(
+            drain.contains("reason=kernel_not_parked settlement=return_to_kernel"),
+            "an unauthenticated timer is settled as what it is"
+        );
+        assert!(
+            drain.contains("reason=current_installed settlement=return_to_current"),
+            "a current installed inside this trap is its own outcome"
+        );
+        assert!(
+            drain.contains("reason={} settlement=kernel_idle")
+                && drain.contains("acquired.marker()"),
+            "and the selection's own outcomes are named by the acquire, never flattened"
+        );
+        // A refusal after the mark is fatal-with-rollback, never a silent return through a frame
+        // that belongs to nobody.
+        assert!(
+            drain.contains("into_dequeued_authority()")
+                && drain.contains("direct_dispatch_rollback_split(a)")
+                && drain.contains("enter_post_lock_dispatch_fatal("),
+            "a post-mark refusal rolls the dequeue back exactly and then diverges"
+        );
+        assert!(
+            drain.contains("dispatch_torn_fatal(cpu, tid, \"timer_idle_queue_advance\")"),
+            "and a torn mark is fatal under this drain's own site name"
+        );
+    }
+
+    /// **The debt is committed only after a successful resume**, so `Running` and "resumed" cannot
+    /// disagree. Marking a task `Running` is not success; converting the frame is.
+    #[test]
+    fn the_debt_follows_the_resume_and_never_precedes_it() {
+        let drain = drain_body();
+        let resumed_at = drain.find("if !resumed {").expect("the refusal branch");
+        let commit_at = drain
+            .find("idle_boundary::commit_user_return(cpu_idx)")
+            .expect("the debt");
+        assert!(
+            resumed_at < commit_at,
+            "the refusal is handled — and diverges — before any debt is published"
+        );
+        assert!(
+            drain.contains("shared.count_context_switch_split_mut()"),
+            "the switch the broad arm counted is still counted"
+        );
+    }
+
+    /// **The drain runs after the off-lock timeout pipeline**, which is what makes a timer a
+    /// participant in making queued work dispatchable rather than a bystander.
+    ///
+    /// Placed before it, every deadline that expired while the CPU was parked would be handed to
+    /// the NEXT tick — and on the shipped quantum that was measurably "never".
+    #[test]
+    fn the_drain_runs_after_the_off_lock_timeout_pipeline() {
+        let code = code_only(BRIDGE);
+        let timeouts = code
+            .find("shared.run_due_ipc_timeout_work(cpu);")
+            .expect("the off-lock timeout pipeline");
+        let drain = code
+            .find("if timer_idle_queue_advance {")
+            .expect("the idle-boundary drain");
+        assert!(
+            timeouts < drain,
+            "the timeout pipeline publishes the wakes this drain is meant to see"
+        );
+        let broad = code
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("the broad acquisition");
+        assert!(
+            broad < drain,
+            "and the broad guard is released before the drain re-acquires the rank-1 seam"
+        );
+    }
+
+    // ── the architecture tails ───────────────────────────────────────────────────────────────
+
+    /// **x86_64: the CPL check still refuses every ring-0 frame on its own authority.**
+    ///
+    /// The conversion is not a hole in it — it is a separate branch INSIDE the refusal, reached
+    /// only by taking a debt, and it returns without touching the frame when there is none.
+    #[test]
+    fn the_x86_conversion_lives_inside_the_cpl_refusal() {
+        let code = code_only(DESC_SRC);
+        let flush = code
+            .split("unsafe fn flush_trap_context_to_iret_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the iret flush");
+        let cpl = flush
+            .find("if (frame.cs & 0x3) != 0x3 {")
+            .expect("the CPL check must survive");
+        let take = flush
+            .find("idle_boundary::take_user_return(cpu.0 as usize)")
+            .expect("the debt take");
+        assert!(cpl < take, "the debt is asked INSIDE the ring-0 refusal");
+        // Between the check's own condition and the debt there is nothing but the CPU lookup —
+        // in particular no read or write of the frame, so an unauthorized ring-0 frame leaves
+        // this function exactly as it arrived.
+        let inside = &flush[cpl + "if (frame.cs & 0x3) != 0x3 {".len()..take];
+        assert!(
+            inside.contains("let cpu = current_cpu_id();") && !inside.contains("frame."),
+            "nothing touches the frame before the debt is taken"
+        );
+        // The WHOLE ring-3 frame is established, because a CPL0 frame carries the kernel's.
+        for field in [
+            "frame.rip = user_pc as u64;",
+            "frame.rsp = user_sp as u64;",
+            "frame.cs = USER_CODE_SELECTOR as u64;",
+            "frame.ss = USER_DATA_SELECTOR as u64;",
+            "frame.rflags = 0x202;",
+        ] {
+            assert!(
+                flush.contains(field),
+                "the conversion must establish `{field}`"
+            );
+        }
+        assert!(
+            DESC_SRC.contains("const USER_DATA_SELECTOR: u16 = 0x1b;"),
+            "and the ring-3 stack selector is the same 0x1b the first-entry path pushes"
+        );
+        // Fail closed rather than iret to a null continuation.
+        assert!(
+            flush.contains("if user_pc == 0 || user_sp == 0 {")
+                && flush.contains("X86_IDLE_BOUNDARY_RETURN_REFUSED"),
+            "an empty context refuses the transition instead of returning to zero"
+        );
+    }
+
+    /// **AArch64: the conversion is exactly one field, and only under the debt.**
+    ///
+    /// `SP_EL0` and `ELR_EL1` are written on every return; `SPSR_EL1` never was, because a trap
+    /// from EL0 already carries EL0t. A trap from the halt loop carries EL1h, and that single
+    /// field is the whole of "AArch64 has no idle-boundary landing".
+    #[test]
+    fn the_aarch64_conversion_is_the_spsr_and_only_under_the_debt() {
+        let code = code_only(A64_BOOT_SRC);
+        let wb = code
+            .split("fn write_trapframe_back_to_vector_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the vector write-back");
+        assert!(
+            wb.contains("frame.sp_el0 = trap_frame.saved_sp() as u64;")
+                && wb.contains("frame.elr_el1 = trap_frame.saved_pc() as u64;"),
+            "the ordinary write-back is unchanged"
+        );
+        let take = wb
+            .find("idle_boundary::take_user_return(cpu.0 as usize)")
+            .expect("the debt take");
+        let spsr = wb
+            .find("frame.spsr_el1 = SPSR_EL0T_IRQ_UNMASKED;")
+            .expect("the privilege transition");
+        assert!(take < spsr, "the SPSR is rewritten only under a taken debt");
+        assert!(
+            wb.contains("const SPSR_EL0T_IRQ_UNMASKED: u64 = 0;"),
+            "EL0t with DAIF clear — the same value the first-entry path installs with \
+             `msr spsr_el1, xzr`"
+        );
+        assert!(
+            wb.contains("AARCH64_IDLE_BOUNDARY_RETURN_REFUSED"),
+            "an empty context refuses the transition instead of eret-ing to zero"
+        );
+        // One write-back owner, so there is no second place a frame can be committed.
+        assert_eq!(
+            code.matches("fn write_trapframe_back_to_vector_frame(")
+                .count(),
+            1,
+            "exactly one vector write-back owner"
+        );
+    }
+
+    /// **Both idle primitives publish the boundary INSIDE their loop, then halt.**
+    ///
+    /// Inside, because the authorization is spent by any trap at the boundary — including one that
+    /// is not a timer. Re-publishing each time round is what keeps the next trap authenticated.
+    #[test]
+    fn both_idle_primitives_publish_before_they_halt_and_republish_each_turn() {
+        for (name, src, loop_head, halt) in [
+            (
+                "x86_64",
+                DESC_SRC,
+                "extern \"C\" fn x86_idle_park_loop(cpu: usize) -> ! {",
+                "\"sti\", \"hlt\"",
+            ),
+            (
+                "aarch64",
+                A64_TRAP_SRC,
+                "extern \"C\" fn aarch64_idle_park_loop(cpu: usize) -> ! {",
+                "\"wfi\"",
+            ),
+        ] {
+            let body = src
+                .split(loop_head)
+                .nth(1)
+                .and_then(|s| s.split("\n}").next())
+                .unwrap_or_else(|| panic!("{name} idle primitive"));
+            assert!(
+                body.trim_start().starts_with("loop {"),
+                "{name} halts in a loop"
+            );
+            let park = body
+                .find("idle_boundary::park(cpu,")
+                .unwrap_or_else(|| panic!("{name} must publish the boundary"));
+            let halt_at = body
+                .find(halt)
+                .unwrap_or_else(|| panic!("{name} must halt"));
+            assert!(
+                park < halt_at,
+                "{name} publishes the boundary before it halts, so a trap at the halt is \
+                 authenticated"
+            );
+        }
+    }
+
+    /// **Neither primitive halts at the depth it was called at**: both re-base to the anchor in
+    /// ONE asm block that transfers to the loop, so no Rust code ever runs on a stack the compiler
+    /// did not establish.
+    #[test]
+    fn both_idle_primitives_rebase_to_the_anchor_before_the_loop() {
+        for (name, src, entry, set_sp, transfer) in [
+            (
+                "x86_64",
+                DESC_SRC,
+                "pub(crate) fn idle_halt_loop() -> ! {",
+                "\"mov rsp, {anchor}\",",
+                "x86_idle_park_loop",
+            ),
+            (
+                "aarch64",
+                A64_TRAP_SRC,
+                "fn idle_no_eret_loop() -> ! {",
+                "\"mov sp, {anchor}\",",
+                "aarch64_idle_park_loop",
+            ),
+        ] {
+            let body = src
+                .split(entry)
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("{name} idle entry"));
+            assert!(body.contains(set_sp), "{name} must re-base to the anchor");
+            assert!(
+                body.contains("options(noreturn)"),
+                "{name}'s re-base and transfer are one non-returning block"
+            );
+            assert!(
+                body.contains(transfer),
+                "{name} transfers to the anchored loop, it does not fall through"
+            );
+            assert!(
+                body.contains("idle_boundary::park(cpu, ") && body.contains(".anchor"),
+                "{name} takes the anchor from the install-once owner"
+            );
+        }
+    }
+
+    // ── the route ────────────────────────────────────────────────────────────────────────────
+
+    /// **The port-capability refusal is gone from the source, not renamed.**
+    ///
+    /// This is the acceptance criterion stated as a property of the tree rather than of a log: a
+    /// marker that does not exist cannot be counted.
+    #[test]
+    fn no_port_declines_the_idle_boundary_any_more() {
+        // Code only: the stage records in the doc comments NAME what was retired, which is the
+        // point of them, and a guard that could not tell prose from a marker would forbid saying
+        // so.
+        for (name, src) in [("syscall_split.rs", SPLIT_SRC), ("trap_entry.rs", BRIDGE)] {
+            let code = code_only(src);
+            for retired in [
+                "no_user_return_path",
+                "IDLE_BOUNDARY_TIMER_CAN_RESUME_USER",
+                "TIMER_SPLIT_IDLE_ADVANCE_UNSUPPORTED",
+            ] {
+                assert!(
+                    !code.contains(retired),
+                    "{name} still carries the retired `{retired}`"
+                );
+            }
+        }
+    }
+
+    /// **The boot ownership point masks interrupts BEFORE the selection can publish a current
+    /// task, and holds the mask through the architectural entry.**
+    ///
+    /// U9-TIMER4 opened it one statement too late. `dispatch_ready_task` is not an observation —
+    /// it dequeues, installs `current` and marks the task `Running` — so a trap inside it already
+    /// finds a published current on this CPU while the entry that makes the claim true has not run.
+    #[test]
+    fn the_boot_exclusion_opens_before_the_selection() {
+        let code = code_only(BOOT_BIN_SRC);
+        let save = code
+            .find("let boot_irq_state = yarm::arch::irq_guard::irq_save();")
+            .expect("the boot exclusion");
+        let select = code
+            .find("let initial = kernel.dispatch_ready_task().ok().flatten();")
+            .expect("the boot selection");
+        let enter = code
+            .find("enter_dispatched_user_task_if_available(kernel, Some(tid));")
+            .expect("the architectural entry");
+        assert!(
+            save < select,
+            "the mask opens before the selection publishes anything"
+        );
+        assert!(
+            select < enter,
+            "and is still held at the architectural entry"
+        );
+        // Restored on BOTH paths that do not return through the architecture.
+        assert_eq!(
+            code.matches("yarm::arch::irq_guard::irq_restore(boot_irq_state);")
+                .count(),
+            2,
+            "the declined-entry path and the no-task path each restore the prior state"
+        );
     }
 }
