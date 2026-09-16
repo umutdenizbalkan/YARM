@@ -18761,3 +18761,28 @@ x86_64 and AArch64 contribute no live traffic for this branch at all, by the str
 * Init's mapping-run pressure.
 * x86_64's and AArch64's idle-boundary timer cannot resume a user task, so their broad arm would
   strand one. Recorded here, not repaired.
+
+### Next: the smallest source-derived non-syscall residual
+
+Ranked by what the source says AND by whether the population has live traffic to convert:
+
+| candidate | structure | live traffic |
+|---|---|---|
+| **`reason=proof_hooks_armed`** | ONE boolean gate at the top of the timer route | **73 of 73 ticks** on `yarm.smp_ready=1`, and the same on the other four profiles |
+| the other five `YieldDecline` reasons | five pre-mutation refusals | 0 measured; `u9residual1` also recorded none in nine boots |
+| `reason=would_preempt` | documented-unreachable fail-safe | 0 by construction |
+| `no_user_return_path` | needs x86_64/AArch64 to gain an idle-boundary landing | 0; an architectural addition, not a small one |
+| `TrapEvent::ExternalInterrupt` | no split route at all, and the broad service is tiny — an IPC-rank route lookup, one `signal_notification`, an EOI, and a `Trap::ExternalInterrupt` arm that is literally `Ok(())` | **0 on every port**: `plic_does_not_enable_any_source_in_this_pass` — RISC-V enables no PLIC source yet, and the other two delivered none on the core or FAT profiles |
+| `TrapEvent::PageFault`, non-COW | COW is already recovered off-lock; the rest is classification, `FaultPolicy`, victim blocking and replacement dispatch | 0 on ordinary boots; reachable only through the fault/terminal-fault oracles, and substantial |
+
+The target is **`proof_hooks_armed`**, measured: with `yarm.smp_ready=1` the split timer route
+services **nothing** — 73 refusals, 0 split ticks — so every tick on any of the five proof profiles
+takes the whole broad arm, tick included. Structurally it is the smallest thing left, because the
+split route already owns everything that arm does except the hooks themselves: ack, exactly one
+tick, the re-arm and all three preemption outcomes. What the conversion has to establish is that
+the five one-shot `maybe_run_*` diagnostics can run from the broad side WITHOUT the tick running
+there too — today an armed profile pays a full broad trap to get them.
+
+`ExternalInterrupt` is structurally smaller still and is worth naming for that reason, but it has no
+live traffic on any port and would be a conversion with nothing to witness; it belongs after the
+PLIC-enable pass, not before it.
