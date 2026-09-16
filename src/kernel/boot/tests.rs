@@ -147861,15 +147861,23 @@ mod u9tm_proof_gate {
         );
 
         // (b) and (c) Neither the idle arm nor the non-preempting tail changed any scheduler
-        // state beyond its own tick, so neither may claim a queue advance, and neither may
-        // select, defer or publish a transition.
+        // state beyond its own tick, so neither may claim a PUBLISHED transition, and neither may
+        // select, defer or advance the queue ITSELF.
+        //
+        // U9-TIMER2 re-derivation: the idle arm gained a second settlement, and the ban that
+        // matters is unchanged by it. `TimerIdleQueueAdvance` says an advance is OWED, not that
+        // one happened — the arm still selects nothing, marks nothing and publishes nothing, which
+        // is exactly what the banned-owner list below continues to enforce. `QueueAdvanceCommitted`
+        // stays banned here for the reason it always was: it means a terminal transition was
+        // published and a per-CPU deferral carries the outgoing identity, and this arm has no
+        // outgoing task to name.
         for (name, region) in [
             ("the idle-CPU arm", &code[idle_at..tail_at]),
             ("a non-preempting tick", &code[tail_at..]),
         ] {
             assert!(
                 region.contains("D::PostWorkCommitted"),
-                "{name} must settle as PostWorkCommitted"
+                "{name} must settle an empty-queue tick as PostWorkCommitted"
             );
             for wrong in ["D::Complete", "D::QueueAdvanceCommitted"] {
                 assert!(!region.contains(wrong), "{name} must not borrow `{wrong}`");
@@ -147877,32 +147885,58 @@ mod u9tm_proof_gate {
             for banned in [
                 "queue_advance_select_step_split",
                 "queue_advance_commit_split",
+                "queue_advance_acquire_incoming_split",
                 "yield_dispatch_try_defer",
+                "futex_wait_dispatch_try_defer",
                 "dispatch_next_selection_on",
                 "run_yield_transaction",
             ] {
                 assert!(!region.contains(banned), "{name} must not `{banned}`");
             }
         }
+        // The non-preempting tail additionally owns no queue-advance settlement at all.
+        assert!(
+            !code[tail_at..].contains("D::TimerIdleQueueAdvance"),
+            "a non-preempting tick owes no queue advance"
+        );
 
-        // The idle arm's admission is the RUN QUEUE, not `current`. `NoCurrent` alone does not
-        // license settling the tick here: with runnable work the broad arm's
-        // `on_preempt_current_cpu_selection()` genuinely dequeues and dispatches onto the idle
-        // CPU, and absorbing that would silently drop a dispatch.
+        // The idle arm's admission is the RUN QUEUE, not `current`, and what it does with the
+        // answer is now a SETTLEMENT rather than a hand-off:
+        //
+        // * an empty queue settles as `PostWorkCommitted`, unchanged;
+        // * a non-empty queue commits `TimerIdleQueueAdvance`, so the bridge performs the one
+        //   authoritative advance the broad arm's `on_preempt_current_cpu_selection()` used to;
+        // * a port with no idle-boundary landing declines, and declines FIRST — before the tick —
+        //   so it still reaches the broad arm having incremented nothing.
+        //
+        // The probe now precedes the tick because the tick is common to both settlements, which is
+        // what stops the count being read as a reservation: nothing is owed to the queue on the
+        // strength of it, and the bridge's own selection decides what actually happens.
         let idle_arm = &code[idle_at..tail_at];
         let probe = idle_arm
             .find("runnable_count_on_cpu_split_read(cpu)")
             .expect("the idle arm must consult the run queue");
         let decline = idle_arm
-            .find("reason=no_current_runnable")
-            .expect("and must decline, under its own reason, when it is not empty");
+            .find("reason=no_user_return_path")
+            .expect("a port with no landing must decline under its own reason");
         let tick = idle_arm
             .find("scheduler_tick_split_mut(cpu)")
             .expect("the idle arm's tick");
+        let advance = idle_arm
+            .find("return D::TimerIdleQueueAdvance;")
+            .expect("the queued-work settlement");
         assert!(
             probe < decline && decline < tick,
-            "the run-queue probe and its decline both precede the tick, so a declined idle tick \
-             reaches the broad arm having incremented nothing"
+            "the run-queue probe and the port decline both precede the tick, so a declined idle \
+             tick reaches the broad arm having incremented nothing"
+        );
+        assert!(
+            tick < advance,
+            "the queued-work settlement is committed only after the tick it owns"
+        );
+        assert!(
+            !idle_arm.contains("reason=no_current_runnable"),
+            "the retired decline must not survive alongside its replacement"
         );
     }
 
@@ -167380,29 +167414,43 @@ mod u9residual1_yield_family {
                 "the policy must not count; the two routes reach the counter at different points"
             );
         }
-        // And each split route counts once, on its commit arm only.
+        // And each COMMITTING ARM counts once.
         //
         // U9-TIMER1 re-derivation: there are now TWO split routes that commit a yield — NR 0,
         // whose caller asked for one, and the converted preempting timer, which performs the
         // identical transaction with a different provenance. The claim is unchanged and is what
-        // is asserted below: exactly one increment per committing route, each inside its own
-        // commit arm, and none on any declining path. Counting the timer's yield is not
-        // double-counting — the broad `yield_current` that used to run for it, and did this same
-        // increment on entry, no longer runs.
+        // is asserted below: exactly one increment per committing arm, each inside that arm, and
+        // none on any declining path. Counting the timer's yield is not double-counting — the
+        // broad `yield_current` that used to run for it, and did this same increment on entry, no
+        // longer runs.
+        //
+        // U9-TIMER2 re-derivation: the timer route now has TWO committing arms, so the unit of the
+        // claim is the ARM and not the route. Its second arm is the idle-boundary queue advance,
+        // which reaches the broad `yield_current` for exactly the same reason the first one does —
+        // a preempting tick routes through it — and for which that function's unconditional entry
+        // increment therefore also no longer runs. What must stay true is per-arm exactness, which
+        // is what the pairing below checks: an increment, then ITS OWN commit, with no decline in
+        // between and no second increment sharing the arm.
         let sites: alloc::vec::Vec<usize> = SPLIT
             .match_indices("shared.count_yield_split_mut();")
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
             sites.len(),
-            2,
-            "exactly the two committing split routes count: NR 0 and the preempting timer"
+            3,
+            "exactly the three committing arms count: NR 0, the preempting timer, and the \
+             idle-boundary timer advance"
         );
-        for (route, marker) in [
-            ("fn try_split_yield_into_frame", "D::QueueAdvanceCommitted"),
+        for (route, marker, arms) in [
+            (
+                "fn try_split_yield_into_frame",
+                "D::QueueAdvanceCommitted",
+                1,
+            ),
             (
                 "fn try_split_timer_into_frame(",
                 "TIMER_SPLIT_PREEMPT_COMMITTED",
+                2,
             ),
         ] {
             let at = SPLIT.find(route).expect("the route");
@@ -167413,8 +167461,8 @@ mod u9residual1_yield_family {
             let body = &SPLIT[at..end];
             assert_eq!(
                 body.matches("shared.count_yield_split_mut();").count(),
-                1,
-                "`{route}` counts exactly once"
+                arms,
+                "`{route}` counts once per committing arm"
             );
             let count = body
                 .find("shared.count_yield_split_mut();")
@@ -167434,6 +167482,45 @@ mod u9residual1_yield_family {
             assert!(
                 declines_after.is_empty(),
                 "`{route}`: no decline may sit between the increment and the commit"
+            );
+        }
+        // The timer route's SECOND committing arm, pinned in its own terms: the increment sits
+        // ahead of the disposition it commits, and the arm's only decline — the port capability
+        // refusal — is ahead of the increment, so a declining port never moves the counter.
+        {
+            let at = SPLIT
+                .find("fn try_split_timer_into_frame(")
+                .expect("the timer route");
+            let end = SPLIT[at..]
+                .find("\n#[cfg(feature = \"hosted-dev\")]")
+                .map(|r| at + r)
+                .unwrap_or(SPLIT.len());
+            let body = &SPLIT[at..end];
+            let second = body
+                .rfind("shared.count_yield_split_mut();")
+                .expect("the second increment");
+            let advance = body
+                .find("return D::TimerIdleQueueAdvance;")
+                .expect("the idle-boundary commit");
+            assert!(
+                second < advance,
+                "the idle-advance increment belongs to the arm that commits it"
+            );
+            let refusal = body
+                .find("reason=no_user_return_path")
+                .expect("the port-capability refusal");
+            assert!(
+                refusal < second,
+                "a port with no landing declines BEFORE the counter moves"
+            );
+            let declines_between: alloc::vec::Vec<usize> = body
+                .match_indices("return D::NotHandled;")
+                .map(|(i, _)| i)
+                .filter(|i| *i > second && *i < advance)
+                .collect();
+            assert!(
+                declines_between.is_empty(),
+                "no decline may sit between the idle-advance increment and its commit"
             );
         }
     }
@@ -170054,8 +170141,8 @@ mod u9timer1_preempting_timer {
     use crate::kernel::syscall::yield_txn::{
         SharedYieldOwners, YieldDecline, run_yield_transaction,
     };
-    use crate::kernel::task::TaskClass;
-    use crate::kernel::vm::Asid;
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::kernel::vm::{Asid, VirtAddr};
     use crate::runtime::SharedKernel;
 
     const SPLIT: &str = include_str!("../syscall_split.rs");
@@ -170473,9 +170560,23 @@ mod u9timer1_preempting_timer {
             code.contains("reason=proof_hooks_armed"),
             "the proof-mode gate must name itself"
         );
+        // U9-TIMER2 re-derivation: `no_current_runnable` is RETIRED as a decline. The
+        // idle-CPU-with-queued-work population is now settled by the route, which ticks once,
+        // acks, re-arms and commits `TimerIdleQueueAdvance` for the bridge to advance. What
+        // remains in its place is a narrower decline — the ports whose idle-boundary timer entry
+        // has no landing that can return to user mode — and it names itself distinctly so the
+        // residual stays countable rather than being folded into the retired reason.
         assert!(
-            code.contains("reason=no_current_runnable"),
-            "and so must the idle-CPU-with-work decline"
+            !code.contains("reason=no_current_runnable"),
+            "the idle-CPU-with-work decline is retired, not renamed alongside its replacement"
+        );
+        assert!(
+            code.contains("reason=no_user_return_path"),
+            "the port-capability decline must name itself"
+        );
+        assert!(
+            code.contains("return D::TimerIdleQueueAdvance;"),
+            "and the population it replaced must be settled, not simply dropped"
         );
 
         // The transaction's, from the enum rather than from a log. Every variant either has a
@@ -170517,10 +170618,11 @@ mod u9timer1_preempting_timer {
                 "unknown decline `{v}` — the timer inventory must be extended with it"
             );
         }
-        // `NoCurrent` is the only one the route settles rather than declines, and only for an
-        // empty run queue. The other five reach the broad arm through `legacy_reason`.
-        // `ArchGateOff` is the one variant with TWO spellings, chosen per architecture, and both
-        // are in the inventory because both are reachable on a supported build.
+        // `NoCurrent` is the only one the route settles rather than declines — U9-TIMER2 made that
+        // true for BOTH of its outcomes, the empty run queue and the non-empty one, on a port with
+        // a landing. The other five reach the broad arm through `legacy_reason`. `ArchGateOff` is
+        // the one variant with TWO spellings, chosen per architecture, and both are in the
+        // inventory because both are reachable on a supported build.
         for reason in [
             "\"d6_genuine_off\"",
             "\"not_bsp\"",
@@ -170760,6 +170862,503 @@ mod u9timer1_preempting_timer {
             code.contains("broad_lock=0"),
             "the committed marker must state that no broad lock was taken"
         );
+    }
+
+    // ─── U9-TIMER2 §3 — the idle-boundary queue advance, through the production owners ───────
+    //
+    // Every case below drives the SAME two owners the drain drives —
+    // `queue_advance_acquire_incoming_split` over `yield_dispatch_step_mut` — on real scheduler
+    // and task state, and then checks the state those owners left behind: placement, order,
+    // status, continuation and accounting. A disposition on its own is not the claim.
+
+    /// The state an idle-boundary timer finds: `current` CLEARED on `cpu`, nothing running.
+    ///
+    /// This is the live shape, not an approximation of it: a RISC-V idle-boundary timer reaches
+    /// `yield_reverify_ready`, which asks `current_tid_on(cpu).is_none()`, and a real boot answers
+    /// `current_clear=1` there. `Bootstrap::init` leaves the bootstrap identity current, so the
+    /// fixture clears it through the production owner rather than by reaching into the scheduler.
+    fn idle_cpu(state: &mut crate::kernel::boot::KernelState, cpu: CpuId) {
+        state.set_current_cpu(cpu).expect("cpu");
+        let _ = state.block_current_cpu();
+        assert_eq!(
+            state.current_tid_on_cpu(cpu),
+            None,
+            "fixture: the CPU starts with no current task"
+        );
+    }
+
+    /// A task the selection will accept AND the resume will take: registered, `Runnable`, with an
+    /// ASID and a restorable saved context. Production's `spawn_thread_core` establishes exactly
+    /// these before the enqueue.
+    fn resumable(state: &mut crate::kernel::boot::KernelState, tid: u64) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        super::give_task_an_incarnation(state, tid);
+    }
+
+    /// A task the acceptance filter must REFUSE: registered and `Runnable`, but with no
+    /// incarnation at all, so neither the dispatch transition nor the resume convention resolves.
+    /// This is a real production shape — a task whose address space was torn down while it sat on
+    /// a run queue.
+    fn unresumable(state: &mut crate::kernel::boot::KernelState, tid: u64) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        // deliberately no incarnation
+    }
+
+    fn queued(k: &SharedKernel, cpu: CpuId) -> alloc::vec::Vec<u64> {
+        k.with(|s| {
+            let mut out = alloc::vec::Vec::new();
+            s.for_each_queued_on_for_test(cpu, |_, tid| out.push(tid.0));
+            out
+        })
+    }
+
+    fn advance(k: &SharedKernel, cpu: CpuId) -> crate::runtime::DispatchAcquire {
+        k.queue_advance_acquire_incoming_split(
+            crate::runtime::DispatchAuthority::live_for_test(cpu),
+            "timer_idle_queue_advance",
+            |s, a| s.yield_dispatch_step_mut(a),
+        )
+    }
+
+    /// **THE QUEUE EMPTIED AFTER THE OBSERVATION.**
+    ///
+    /// The count that commits `TimerIdleQueueAdvance` is read before the tick, and the drain's
+    /// selection runs later. Between them the last entry can be taken — by a cross-CPU dispatch,
+    /// or by the very timeout work this tick is about to do. That is not a disagreement to
+    /// reconcile: the authoritative selection answers `Idle`, which is the ONLY genuinely idle
+    /// outcome, and the CPU idles having marked nothing.
+    #[test]
+    fn u9t2_a_queue_emptied_after_the_observation_settles_as_idle() {
+        let mut state = Bootstrap::init().expect("init");
+        idle_cpu(&mut state, CPU);
+        resumable(&mut state, 94001);
+        state.enqueue_on_cpu(CPU, 94001).expect("enqueue");
+        let kernel = SharedKernel::new(state);
+
+        // What the route observed.
+        assert_eq!(kernel.with(|s| s.runnable_count_on_cpu(CPU)), 1);
+        // …and then the entry is taken before the drain gets there.
+        assert_eq!(
+            kernel.with(|s| s.dispatch_next_on_cpu(CPU)),
+            Some(94001),
+            "fixture: somebody else takes the last entry"
+        );
+        kernel.with(|s| {
+            let _ = s.block_current_on_cpu(CPU);
+        });
+        assert_eq!(kernel.with(|s| s.runnable_count_on_cpu(CPU)), 0);
+
+        let acquired = advance(&kernel, CPU);
+        assert_eq!(
+            acquired,
+            crate::runtime::DispatchAcquire::Idle,
+            "an emptied queue is Idle, not a refusal wearing idle's name"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(CPU)),
+            None,
+            "nothing was installed as current"
+        );
+    }
+
+    /// **A WAKE ARRIVES DURING SELECTION.**
+    ///
+    /// The mirror of the case above, and the reason the drain must never short-circuit on its own
+    /// observation: a task enqueued after the count was read is still selected, marked and
+    /// resumed. Deciding from the count would idle a CPU that had just become runnable.
+    #[test]
+    fn u9t2_a_wake_during_selection_is_not_lost() {
+        let mut state = Bootstrap::init().expect("init");
+        idle_cpu(&mut state, CPU);
+        resumable(&mut state, 94011);
+        let kernel = SharedKernel::new(state);
+
+        // The wake lands after the route's observation and before the drain's dequeue.
+        kernel.with(|s| s.enqueue_on_cpu(CPU, 94011).expect("wake enqueue"));
+
+        let acquired = advance(&kernel, CPU);
+        let token = acquired.token().expect("the woken task must be selected");
+        assert_eq!(token.tid(), 94011);
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(CPU)),
+            Some(94011),
+            "and installed as this CPU's current"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(94011)),
+            Some(TaskStatus::Running),
+            "marked through the exact dispatch transition"
+        );
+        assert!(
+            queued(&kernel, CPU).is_empty(),
+            "and removed from the run queue exactly once"
+        );
+    }
+
+    /// **AN UNRESUMABLE HEAD WITH A VALID TASK BEHIND IT.**
+    ///
+    /// The filter asks the read-only sibling of the transition the mark will apply AND the resume
+    /// convention the apply will ask, so the head is skipped rather than dequeued-then-rolled-back
+    /// — and the task behind it is the one that runs. The refused entry is still queued
+    /// afterwards, which is what stops a filtered dequeue from quietly dropping work.
+    #[test]
+    fn u9t2_an_unresumable_head_is_skipped_and_preserved() {
+        let mut state = Bootstrap::init().expect("init");
+        idle_cpu(&mut state, CPU);
+        unresumable(&mut state, 94021);
+        resumable(&mut state, 94022);
+        state.enqueue_on_cpu(CPU, 94021).expect("enqueue head");
+        state.enqueue_on_cpu(CPU, 94022).expect("enqueue behind");
+        let kernel = SharedKernel::new(state);
+        assert_eq!(queued(&kernel, CPU), alloc::vec![94021, 94022]);
+
+        let acquired = advance(&kernel, CPU);
+        let token = acquired.token().expect("the valid task behind the head");
+        assert_eq!(
+            token.tid(),
+            94022,
+            "the head is not resumable, so the task behind it is selected"
+        );
+        assert_eq!(kernel.with(|s| s.current_tid_on_cpu(CPU)), Some(94022));
+        assert_eq!(
+            queued(&kernel, CPU),
+            alloc::vec![94021],
+            "the refused entry is PRESERVED — skipping it must not consume it"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(94021)),
+            Some(TaskStatus::Runnable),
+            "and it is untouched, still awaiting whatever can run it"
+        );
+    }
+
+    /// **EVERY CANDIDATE REFUSED IS NOT AN EMPTY QUEUE.**
+    ///
+    /// `NoneAcceptable` carries the measured count of entries examined, and the queue still holds
+    /// all of them in order. Reporting this as `Idle` would say the CPU has nothing to run when
+    /// what is true is that it cannot run any of what it has.
+    #[test]
+    fn u9t2_all_candidates_refused_keeps_the_queue_and_its_order() {
+        let mut state = Bootstrap::init().expect("init");
+        idle_cpu(&mut state, CPU);
+        for tid in [94031u64, 94032, 94033] {
+            unresumable(&mut state, tid);
+            state.enqueue_on_cpu(CPU, tid).expect("enqueue");
+        }
+        let kernel = SharedKernel::new(state);
+        let before = queued(&kernel, CPU);
+        assert_eq!(before, alloc::vec![94031, 94032, 94033]);
+
+        let acquired = advance(&kernel, CPU);
+        match acquired {
+            crate::runtime::DispatchAcquire::NoneAcceptable { examined } => {
+                assert_eq!(
+                    examined, 3,
+                    "every entry was examined, and the count says so"
+                );
+            }
+            other => panic!("a non-empty queue of refused candidates is NoneAcceptable: {other:?}"),
+        }
+        assert_ne!(
+            acquired,
+            crate::runtime::DispatchAcquire::Idle,
+            "a refusal must never wear idle's name"
+        );
+        assert_eq!(
+            queued(&kernel, CPU),
+            before,
+            "the entries and their ORDER are preserved: nothing was dequeued"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(CPU)),
+            None,
+            "and nothing became current"
+        );
+    }
+
+    /// **AN INCARNATION CHANGE BETWEEN ACCEPTANCE AND MARK.**
+    ///
+    /// The filter accepted a candidate and the mark then refused it. The dequeue is undone
+    /// EXACTLY — the task is back on its run queue and the current slot is clear — so the trap can
+    /// settle as idle without stranding it. Nothing is left half-done and nothing is retried.
+    #[test]
+    fn u9t2_a_mark_refusal_undoes_the_dequeue_exactly() {
+        let mut state = Bootstrap::init().expect("init");
+        idle_cpu(&mut state, CPU);
+        resumable(&mut state, 94041);
+        state.enqueue_on_cpu(CPU, 94041).expect("enqueue");
+        let kernel = SharedKernel::new(state);
+        let before = queued(&kernel, CPU);
+
+        // The acceptance read and the mark are separate rank-2 acquisitions. Between them the
+        // candidate's incarnation is replaced, which is exactly what the exact transition refuses.
+        let acquired = kernel.queue_advance_acquire_incoming_split(
+            crate::runtime::DispatchAuthority::live_for_test(CPU),
+            "timer_idle_queue_advance",
+            |s, a| {
+                let dispatch = s.yield_dispatch_step_mut(a);
+                // The task was accepted and dequeued; now its status stops being `Runnable`.
+                s.with_task_tcbs_split_mut(|tcbs| {
+                    if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 94041) {
+                        tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x9000)));
+                    }
+                });
+                dispatch
+            },
+        );
+        assert_eq!(
+            acquired,
+            crate::runtime::DispatchAcquire::Contended,
+            "a candidate that stopped being markable is Contended, with its dequeue undone"
+        );
+        assert_eq!(
+            queued(&kernel, CPU),
+            before,
+            "THE EXACT UNDO: the task is back on the run queue"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(CPU)),
+            None,
+            "and the current slot is clear, so nothing is stranded behind it"
+        );
+    }
+
+    /// **GENUINE IDLE-TO-USER RESUMPTION.**
+    ///
+    /// The whole point of the conversion: a CPU that was parked at its idle boundary ends the trap
+    /// with a real user task running, from that task's own continuation, with the context switch
+    /// accounted exactly once — and the broad path's own accounting field is the one that moves.
+    #[test]
+    fn u9t2_an_idle_cpu_resumes_a_real_task_with_its_continuation() {
+        use crate::kernel::trapframe::TrapFrame;
+        let mut state = Bootstrap::init().expect("init");
+        idle_cpu(&mut state, CPU);
+        resumable(&mut state, 94051);
+        state.enqueue_on_cpu(CPU, 94051).expect("enqueue");
+        let kernel = SharedKernel::new(state);
+
+        // The continuation this task must come back on — the register file it was last suspended
+        // with, committed through the same owner every resume path reads.
+        let asid = crate::kernel::vm::Asid(kernel.task_asid_for_tid_split_read(94051) as u16);
+        let mut frame = TrapFrame::zeroed();
+        frame.set_saved_pc(0x33_0000);
+        frame.set_saved_sp(0x7fcc_0000);
+        for i in 0..8 {
+            frame.set_user_gpr(i, 0xD000 + i);
+        }
+        let committed = frame.capture_user_context();
+        assert!(
+            kernel.split_return_commit_context_split(
+                crate::runtime::SplitReturnIdentity { tid: 94051, asid },
+                committed
+            ),
+            "fixture: the continuation commits into this incarnation"
+        );
+
+        let switches_before = kernel.with(|s| s.ipc_path_telemetry().scheduler_context_switches);
+        let acquired = advance(&kernel, CPU);
+        let token = acquired.token().expect("the queued task is resumable");
+        assert_eq!(token.tid(), 94051);
+
+        // The exact-token resume the per-port drain performs: activate the ASID, then apply the
+        // exact saved context to the live trap frame.
+        assert_eq!(
+            kernel.direct_dispatch_activate_asid_split(token),
+            Some(asid.0),
+            "the incoming address space is activated from the token, not from a bare TID"
+        );
+        let (context, _tls) = kernel
+            .direct_dispatch_restore_context_split(token)
+            .expect("the exact saved context");
+        let mut live = TrapFrame::zeroed();
+        live.apply_user_context(context);
+        assert_eq!(live.saved_pc() as u64, committed.instruction_ptr.0);
+        assert_eq!(live.saved_sp() as u64, committed.stack_ptr.0);
+        assert_eq!(
+            context.user_gprs, committed.user_gprs,
+            "the whole register file, so the task resumes where it was suspended"
+        );
+
+        // And the accounting the broad arm performs for this state.
+        kernel.count_context_switch_split_mut();
+        assert_eq!(
+            kernel.with(|s| s.ipc_path_telemetry().scheduler_context_switches),
+            switches_before + 1,
+            "one context switch, in the field the broad path uses"
+        );
+        assert_eq!(kernel.with(|s| s.current_tid_on_cpu(CPU)), Some(94051));
+        assert_eq!(
+            kernel.with(|s| s.task_status(94051)),
+            Some(TaskStatus::Running)
+        );
+        assert!(queued(&kernel, CPU).is_empty());
+    }
+
+    /// **THE THREE RESUME CONVENTIONS ARE UNTOUCHED.**
+    ///
+    /// The drain hands the incoming task to this bridge's existing landing, and that landing picks
+    /// exactly one of startup, pending-syscall continuation or asynchronous resume — from explicit
+    /// decisions, never inferred from register contents. This stage adds no fourth arm, consumes
+    /// no tag of its own, and writes no syscall result: an interrupted task has no syscall in
+    /// flight, and this one did not even interrupt a task.
+    #[test]
+    fn u9t2_the_existing_resume_conventions_are_unchanged() {
+        const RISCV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+        let tail = RISCV_BOOT
+            .split("RISCV_S_MODE_TIMER_DISPATCH tick={} resume_tid={}")
+            .nth(1)
+            .and_then(|s| s.split("\n            _ =>").next())
+            .expect("the S-mode timer dispatch arm");
+        // All three arms are still there, and still chosen by explicit takes.
+        assert!(
+            tail.contains("riscv_async_resume_take(cpu.0 as usize)")
+                && tail.contains("riscv_syscall_continuation_take(cpu.0 as usize)"),
+            "both explicit decisions must still select the convention"
+        );
+        for marker in [
+            "RISCV_ASYNC_PREEMPT_RESUME",
+            "RISCV_SYSCALL_CONTINUATION_RESUME",
+        ] {
+            assert!(tail.contains(marker), "{marker} must survive");
+        }
+        assert!(
+            tail.contains("sanitize_user_sstatus(frame.sstatus)"),
+            "leaving the idle lifecycle still goes through the one user-return sanitizer"
+        );
+        // The drain itself adds no convention and encodes no result.
+        const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+        let drain = RISCV_TRAP
+            .split("if timer_idle_queue_advance {")
+            .nth(1)
+            .and_then(|s| s.split("\n    // ── Stage 196D").next())
+            .expect("the idle-boundary drain");
+        for banned in [
+            "set_ok(",
+            "set_err(",
+            "snapshot_async_preempted",
+            "riscv_async_resume_publish",
+            "saved_pc() +",
+        ] {
+            assert!(
+                !drain.contains(banned),
+                "the drain must not `{banned}` — it owes no syscall result and no tag"
+            );
+        }
+        assert!(
+            drain.contains("direct_dispatch_resume_incoming(shared, token, &mut *frame)"),
+            "it resumes through the SAME exact-token transaction the sibling drains use"
+        );
+    }
+
+    /// **THE TARGETED BROAD ENTRY IS COUNTED AT THE DISPATCHER, AND ONLY FOR THIS POPULATION.**
+    ///
+    /// The source half of the claim is the route's settlement; the live half has to be measured
+    /// where the retired traffic ARRIVES. That is the broad `Trap::TimerInterrupt` arm's call into
+    /// `yield_current`, scoped to a CPU with no current task — which is precisely the population
+    /// whose selection this package moved off the broad lock. Same placement rule as
+    /// `IPC_SEND_BROAD_ENTRY` and `FUTEX_WAIT_BROAD_ENTRY`: ahead of the call, so it counts
+    /// arrivals rather than doors walked past.
+    #[test]
+    fn u9t2_the_broad_entry_census_counts_this_population_at_the_dispatcher() {
+        const FAULT: &str = include_str!("fault_state.rs");
+        assert_eq!(
+            FAULT
+                .matches("TIMER_IDLE_ADVANCE_BROAD_ENTRY cpu={}")
+                .count(),
+            1,
+            "one census marker"
+        );
+        let arm = FAULT
+            .split("Trap::TimerInterrupt => {")
+            .nth(1)
+            .and_then(|s| s.split("\n            Trap::").next())
+            .expect("the broad timer arm");
+        let census = arm
+            .find("TIMER_IDLE_ADVANCE_BROAD_ENTRY")
+            .expect("the census lives in the broad timer arm");
+        let call = arm
+            .find("self.yield_current()")
+            .expect("the dispatcher call it measures");
+        assert!(
+            census < call,
+            "the census must count the ARRIVAL, ahead of the call that performs the dispatch"
+        );
+        // Scoped to the population, not to every preempting tick.
+        let head = &arm[..census];
+        assert!(
+            head.ends_with(
+                "if self.current_tid().is_none() {\n                        crate::yarm_log!(\n                            \""
+            ),
+            "the census is gated on a CPU with NO current task — the population this package \
+             retires, and not preemptions generally"
+        );
+        // The split side does not claim the measurement.
+        assert!(
+            !SPLIT.contains("TIMER_IDLE_ADVANCE_BROAD_ENTRY"),
+            "the census belongs to the terminal acquisition, not to the route that avoids it"
+        );
+    }
+
+    /// **NO OUTGOING IDENTITY IS FABRICATED, AND NO SIBLING DEFERRAL IS BORROWED.**
+    ///
+    /// There is no outgoing task. The drain must therefore not name one — not tid 0, and not by
+    /// publishing NR 0's or NR 9's per-CPU cell to make their drains run. Its re-verify asks the
+    /// only question available to it: is `current` still clear?
+    #[test]
+    fn u9t2_the_drain_names_no_outgoing_task() {
+        const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+        // CODE only. The drain's own comments say what it deliberately does NOT reach for — that
+        // is the point of them — so a raw scan would match the very prose that states the claim.
+        let drain: alloc::string::String = RISCV_TRAP
+            .split("if timer_idle_queue_advance {")
+            .nth(1)
+            .and_then(|s| s.split("\n    // ── Stage 196D").next())
+            .expect("the idle-boundary drain")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let drain = drain.as_str();
+        for banned in [
+            "yield_dispatch_try_defer",
+            "yield_dispatch_outgoing",
+            "futex_wait_dispatch_try_defer",
+            "futex_wait_dispatch_outgoing",
+            "riscv_queue_switch_foundation_try_defer",
+            "d2_recv_dispatch_outgoing",
+            "d2_send_dispatch_outgoing",
+            "unwrap_or(0)",
+            "outgoing",
+        ] {
+            assert!(
+                !drain.contains(banned),
+                "the drain must not reach for `{banned}` — it has no outgoing task"
+            );
+        }
+        assert!(
+            drain.contains("shared.yield_reverify_ready(cpu)"),
+            "its re-verify is the one question it can actually ask"
+        );
+        // And the route publishes nothing either.
+        let code = route();
+        let arm = code
+            .split("Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {")
+            .nth(1)
+            .and_then(|s| s.split("\n            Err(decline)").next())
+            .expect("the idle-CPU arm");
+        for banned in ["_try_defer", "_dispatch_outgoing", "capture_outgoing"] {
+            assert!(
+                !arm.contains(banned),
+                "the route must not publish `{banned}` for a tick with no outgoing task"
+            );
+        }
     }
 }
 // ═══════════════════════════════════════════════════════════════════════════════════════════

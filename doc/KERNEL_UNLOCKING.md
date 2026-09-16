@@ -18560,3 +18560,204 @@ the three landings — and a timer carries no syscall frame to answer, so there 
 convention to derive.
 
 After that: `PageFault`'s non-COW population, and then deletion of the terminal acquisitions.
+
+## U9-TIMER2 — retiring the idle-boundary timer's broad dispatch
+
+Base `6a11b948`. The previous package named this branch as the next non-syscall residual: a
+preempting `TimerInterrupt` on a CPU with **no current task** and a non-empty run queue, which
+`try_split_timer_into_frame` declined under `reason=no_current_runnable` so the terminal broad
+dispatcher could perform the selection.
+
+### §1 — the branch's complete contract, and what reachability actually is
+
+`current == None` on a TIMER trap means one thing: the CPU was parked at its kernel-idle boundary.
+A running user task is `current` by construction, and the routes that clear `current` are syscall
+routes. So the whole question is what that port's idle-boundary timer entry can return to, and the
+three answers are **not** the same:
+
+| port | idle landing | can that trap resume a user task? |
+|---|---|---|
+| RISC-V | `riscv_s_mode_timer_trap` — a real trap ENTRY | **yes** — it clears `SPP`, sanitizes `sstatus`, populates the frame from the resumed task's context, picks one of its three conventions and activates the ASID (`RISCV_S_MODE_TIMER_DISPATCH`) |
+| x86_64 | `idle_halt_loop()` — non-returning ring-0 `sti; hlt` | **no** — `flush_trap_context_to_iret_frame` refuses by construction to rewrite a frame whose `CS` DPL is not 3, and the kernel-stack alternative needs an initialized incoming kernel context, which production user tasks never have |
+| AArch64 | `idle_no_eret_loop()` — non-returning `wfi` | **no** — its own contract records that `current` is None there so no userspace ELR/SPSR is ever returned |
+
+Measured before anything was changed, so the classification is evidence and not inference:
+
+| port | `no_current_runnable`, production quantum | at `yarm.sched_quantum_ticks=1` |
+|---|---|---|
+| x86_64 | 0 | 0 |
+| AArch64 | 0 | 0 |
+| RISC-V | 33 | **308** |
+
+The zeros are what the table above predicts. Marking a task `Running` and current from a trap that
+then returns to `hlt`/`wfi` would strand it behind a current slot nothing will resume — which is
+what the broad arm does on those two ports today. That is a latent defect of theirs, not this
+package's to repair, so the branch declines there under its own new reason and stays inventoried.
+
+**What the broad arm does for this state**, step by owner: `hal.acknowledge_interrupt` →
+`tick_scheduler_timer` (exactly one tick) → `process_ipc_timeout_deadlines` → seven `maybe_run_*`
+proof hooks → bounded health markers → `yield_current`, which counts `scheduler_yield_calls`, gets
+`NoCurrent` from `run_yield_transaction` (silent, nothing mutated), skips the outgoing transition
+because `outgoing_tid` is `None`, and reaches `on_preempt_current_cpu_selection()` — the
+authoritative rank-1 mutation — then `hal.switch_address_space`,
+`note_context_switch_if_task_changed(None, tid)` and `commit_dispatch_selection_in_lock` → re-arm →
+`restore_arch_thread_state` applies the new current's saved context → the S-mode tail lands it.
+
+### §2 — the settlement, composed from what already exists
+
+A new `SplitDispatchDisposition::TimerIdleQueueAdvance`. Neither existing outcome fits:
+`PostWorkCommitted` means no queue selection runs, which is exactly what must happen here;
+`QueueAdvanceCommitted` means a terminal transition was PUBLISHED and a per-CPU deferral carries the
+outgoing identity, and **there is no outgoing identity**. Fabricating one — tid 0, or borrowing
+NR 0's or NR 9's cell to activate their drains — would make a drain believe a task it can name went
+off-CPU in this trap, and its reverify, its rollback and its idle settlement would then all be about
+a task that never participated. The obligation is a local in the bridge, not a static cell, because
+there is no identity to carry and nothing may outlive the trap.
+
+**The count is an observation, not a reservation**, and the code order now says so. The tick, the
+claim and the re-arm moved AHEAD of the run-queue test, so one tick happens for this interrupt
+either way — what the interrupt earns, independent of what the queue holds — and the count only
+chooses which settlement is owed. The one refusal left in the arm is the port capability, and it is
+taken before the tick so a declining port still reaches the unchanged broad arm having changed
+exactly nothing.
+
+The drain is the same shape as its four siblings with the outgoing half removed rather than faked:
+
+* **re-verify** — `yield_reverify_ready`, the only question available here (is `current` still
+  clear?). The siblings re-verify an outgoing identity; there is none;
+* **selection and mark** — `queue_advance_acquire_incoming_split` over the shared
+  `yield_dispatch_step_mut`, so no second dequeue or mark policy comes into existence;
+* **resume** — `direct_dispatch_resume_incoming`, the same exact-token transaction the FutexWait,
+  Yield-foundation and D2 drains use: `map_kernel_shared_into_asid` + root + `write_satp` (whose
+  write issues the `sfence.vma`), then the exact saved context, the TLS take, any parked completion;
+* **landing** — `ReturnToIncoming` for a resumed task, the typed `EnterKernelIdle` for everything
+  else.
+
+**The settlement comes from the selection.** `DispatchAcquire` already distinguishes all four
+outcomes the directive names and the drain matches them exhaustively: `Resumable` (selected and
+resumed), `Idle` (the queue became empty — the only genuinely idle outcome), `NoneAcceptable`
+(candidates rejected; the queue is NOT empty and every entry is still queued, in order, because
+nothing was dequeued) and `Contended` (the dequeue already undone exactly). `Torn` is fatal.
+
+No syscall result is encoded, no PC arithmetic is performed, no async tag is published or consumed,
+and no frame is copied into a user TCB. The drain has no outgoing task, so — unlike its
+committed-preempt sibling — it owes no async-preemption snapshot either; the S-mode entry's frame is
+a `TrapFrame::zeroed()` whose `is_restorable()` is false by construction.
+
+### §3 — the boundary, through production owners
+
+Eight cases, each driving `queue_advance_acquire_incoming_split` over `yield_dispatch_step_mut` on
+real scheduler and task state and then checking what those owners left behind — placement, order,
+status, continuation and accounting, not just the disposition:
+
+| case | what it establishes |
+|---|---|
+| queue emptied after the observation | `Idle`; nothing marked, nothing current |
+| a wake arriving during selection | the late task is still selected, marked and removed from the queue exactly once |
+| an unresumable head with a valid task behind it | the head is SKIPPED, the task behind it runs, and the refused entry is still queued and `Runnable` |
+| every candidate refused | `NoneAcceptable { examined: 3 }`, never `Idle`; all three entries and their ORDER preserved |
+| incarnation change between acceptance and mark | `Contended`, the dequeue undone exactly, current slot clear |
+| genuine idle-to-user resumption | the task is `Running` and current, resumed from its committed continuation (whole register file), with one context switch in the broad path's own telemetry field |
+| the three resume conventions | startup, pending-syscall continuation and asynchronous resume all still selected by their explicit takes; the drain adds no fourth arm and encodes no result |
+| no fabricated outgoing identity | the drain reaches for no deferral cell, no outgoing accessor and no `unwrap_or(0)` |
+
+Three delivered guards were rederived rather than re-passed: the yield-count claim became per
+committing ARM (three now, not two routes); the decline inventory records `no_current_runnable` as
+RETIRED with `no_user_return_path` in its place; and the disposition guard pins the new ordering —
+probe, port decline, tick, settlement — along with the ban on the idle arm selecting, deferring or
+advancing anything itself.
+
+### Source-population reduction
+
+The route had five `NotHandled` exits and still has five, but one of them is a strictly smaller
+population than the one it replaced:
+
+| # | exit | before | now |
+|---|---|---|---|
+| 1 | `!is_timer` | the family filter, not a hand-off | unchanged |
+| 2 | `reason=proof_hooks_armed` | the five timer-only proof hooks stay in the broad arm | unchanged |
+| 3 | the idle CPU with queued work | `reason=no_current_runnable` on **every** port | **settled** where a landing exists; `reason=no_user_return_path` on the two ports where it structurally cannot |
+| 4 | `reason=<legacy_reason(decline)>` | the other five `YieldDecline` variants | unchanged |
+| 5 | `reason=would_preempt` | documented-unreachable fail-safe | unchanged |
+
+`TimerInterrupt` is **not** closed and neither is U9. Rows 2, 4 and 5 remain, and row 3 remains on
+two of three ports.
+
+### Live traffic
+
+Measured at the arrival: `TIMER_IDLE_ADVANCE_BROAD_ENTRY` sits inside the broad
+`Trap::TimerInterrupt` arm, gated on `current_tid().is_none()`, ahead of the `yield_current()` call
+that performs the dispatch — so it names this population and nothing else. Verified present in all
+three images, so a zero is a measurement.
+
+| port | runs | broad entries | advances committed | resumed | refusals |
+|---|---|---|---|---|---|
+| RISC-V, production quantum | 3 | **0 / 0 / 0** | 210 / 112 / 22 | 210 / 112 / 22 | 0 |
+| RISC-V, `sched_quantum_ticks=1` | 3 | **0 / 0 / 0** | 535 / 531 / 549 | 535 / 531 / 549 | 0 |
+| x86_64, production + test quantum | 3 + 1 | **0** | n/a | n/a | 0 |
+| AArch64, production + test quantum | 3 + 1 | **0** | n/a | n/a | 0 |
+
+Nine core-smoke runs, zero failed checks. One complete RISC-V cycle, verbatim:
+
+```
+RISCV_S_MODE_TIMER_ACCEPTED tick=49 origin=supervisor spp=1 boundary=armed
+TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu=0 tick=259 observed_runnable=1 preempt=1 rearm=1 broad_lock=0
+QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=timer_idle_advance_committed
+TIMER_IDLE_ADVANCE_LOCK_DROPPED_OK cpu=0 current_clear=1
+YIELD_DISPATCH_DEQUEUE_OK cpu=0 tid=2
+TIMER_IDLE_ADVANCE_SATP_OK incoming=2 asid=2 → SFENCE_OK → FRAME_OK → SRET_ARMED
+RISCV_S_MODE_TIMER_DISPATCH tick=49 resume_tid=2
+USER_LOG tid=2 msg=USER_RT_RECV_AFTER_SYSCALL x0=9 x1=0 x2=130 x3=1
+```
+
+The last line is the point: a real user task executing in user mode, resumed from its own
+continuation with the correct result lane, off a trap that took no broad lock.
+
+Production quantum and deadline values are unchanged; `yarm.sched_quantum_ticks` is the existing
+default-off test control and was used only to raise the branch's rate.
+
+### Acquisition census
+
+Unchanged, and deliberately: this package retired a reachability, not an acquisition.
+
+| measure | value |
+|---|---|
+| `AUDITED_WITH_CPU_TOTAL` | **2** |
+| `AUDITED_WITH_BROAD_TOTAL` | **0** |
+| raw `self.state.lock()` wrapper bodies | **3** |
+
+Census target 7/7.
+
+### Qualification
+
+Hosted **5641 passed / 0 failed / 2 ignored**. Three ports build. Doc-fragmentation 7/7, extraction
+bridge 2/2, census 7/7. Futex regressions on all three ports (`first_wake=1 second_wake=0
+waiter_resumes=1`; `wake_count=1` on AArch64 and RISC-V). AP/SMP provisioning intact: x86_64 AP
+recv-v2 block `-smp 2` `blocked_commits=1 premature_wakes=0 wrong_cpu_blocks=0 result=ok`; AP saved
+return `-smp 2` `fresh_entries=1 saved_dispatches=1 continuations=1 result=ok`. Park witness
+`proposed=12 committed=12 resumed=12 broad_entries=0 result=ok`; delivery oracle
+`late_timeout_claims=0 result=ok`; XFER2 grant witness `grants=2 releases=2 route=split result=ok`.
+The established carve-out is unchanged at 8 pass / 2 fail
+(`required_chain_is_scoped_to_the_witnessed_transaction`,
+`required_marker_chain_is_ordered_and_complete`).
+
+### What the boot exercises, and what it does not
+
+Live traffic exercises the RESUME outcome exhaustively — every one of the 22–549 advances per run
+selected a task and resumed it — and the other three settlements not at all: `Idle`,
+`NoneAcceptable` and `Contended` were never reached on any run. Those are proven by the
+deterministic §3 cases, which drive the same two production owners over real scheduler and task
+state. The zero counts are what the design predicts on a single-CPU boot with interrupts masked for
+the whole trap, not what it is proven by.
+
+x86_64 and AArch64 contribute no live traffic for this branch at all, by the structural argument in
+§1 rather than by luck, and their refusal is counted rather than assumed: `no_user_return_path` was
+0 on every run because the state never arose, not because the marker is missing.
+
+### Deferred, unchanged
+
+* The legacy NR 2 blocking population still has no live producer.
+* The multi-page shared-region mapping defect, reproduced rather than repaired.
+* Init's mapping-run pressure.
+* x86_64's and AArch64's idle-boundary timer cannot resume a user task, so their broad arm would
+  strand one. Recorded here, not repaired.

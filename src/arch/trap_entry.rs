@@ -837,8 +837,25 @@ pub fn handle_trap_entry_shared(
                     cpu.0
                 );
             }
+            SplitDispatchDisposition::TimerIdleQueueAdvance => {
+                // U9-TIMER2 §2: unreachable on this bridge, and by construction rather than by
+                // luck. The route only produces this disposition where
+                // `IDLE_BOUNDARY_TIMER_CAN_RESUME_USER` holds, and neither port served by this
+                // bridge has an idle-boundary timer landing that can return to user mode — see
+                // that constant for the derivation. It is matched EXPLICITLY, not folded into the
+                // catch-all below, so that giving either port such a landing later is a compile
+                // -time conversation here instead of a silent `debug_assert` at run time.
+                crate::yarm_log!(
+                    "TIMER_SPLIT_IDLE_ADVANCE_UNSUPPORTED cpu={} reason=no_user_return_path",
+                    cpu.0
+                );
+                debug_assert!(
+                    false,
+                    "this bridge's ports have no idle-boundary timer landing that resumes user mode"
+                );
+            }
             other => {
-                // The timer route produces only those three. Anything else would mean a
+                // The timer route produces only those four. Anything else would mean a
                 // non-preempting tick had claimed a terminal transition.
                 crate::yarm_log!(
                     "TIMER_SPLIT_UNEXPECTED_DISPOSITION cpu={} value={:?}",

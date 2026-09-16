@@ -676,6 +676,34 @@ pub(crate) enum SplitDispatchDisposition {
     /// happened. Like the disposition itself this is decided by the route, never inferred from
     /// what is in the stash.
     PostWorkCommitted { finalize_syscall: bool },
+    /// U9-TIMER2 §2 — a preempting TIMER tick on a CPU with NO current task and queued work.
+    ///
+    /// # Why none of the others fits
+    ///
+    /// `PostWorkCommitted` is what its idle sibling answers, and it is false here: it means no
+    /// queue selection runs, which for a CPU with runnable work is precisely the thing that must
+    /// happen. `QueueAdvanceCommitted` is wrong in the other direction — it means a terminal
+    /// transition was PUBLISHED and the exact outgoing identity rides on a per-CPU deferral. There
+    /// is no outgoing identity here. The CPU was parked at its kernel-idle boundary; nothing was
+    /// preempted, nothing was captured, nothing was re-enqueued, and there is no frame belonging
+    /// to a task for this trap to return through.
+    ///
+    /// Fabricating one — tid 0, or borrowing NR 0's or NR 9's deferral cell to activate their
+    /// drains — would make a drain believe a task it can name went off-CPU in this trap, and its
+    /// reverify, its rollback and its idle settlement would all then be about a task that never
+    /// participated.
+    ///
+    /// # What it means, exactly
+    ///
+    /// The tick, the claim/ack and the re-arm have COMMITTED. From here the broad dispatcher must
+    /// not run — it would tick a second time — so there is no fallback, by construction. What is
+    /// owed is one authoritative queue advance with no outgoing task, and the bridge that owns
+    /// this trap's frame and landing performs it.
+    ///
+    /// The run-queue count that selected this disposition is an OBSERVATION, not a reservation.
+    /// The queue may be empty by the time the drain's authoritative selection runs, and that is a
+    /// legitimate outcome (the CPU idles), not a disagreement to reconcile.
+    TimerIdleQueueAdvance,
 }
 
 impl SplitDispatchDisposition {
@@ -703,6 +731,9 @@ impl SplitDispatchDisposition {
             }
             Self::PostWorkCommitted { .. } => {
                 panic!("a committed post-work outcome has no pre-U9-QA equivalent")
+            }
+            Self::TimerIdleQueueAdvance => {
+                panic!("an idle-boundary timer queue advance has no pre-U9-QA equivalent")
             }
         }
     }
@@ -3084,6 +3115,42 @@ fn try_split_blocking_ipc_recv_into_frame(
 ///    `on_preempt_current_cpu_selection()` genuinely dequeues and dispatches onto the idle CPU.
 ///    That is a distinct queue-advancing consumer with no demonstrated dependency on this
 ///    conversion, so it is declined under its own reason and inventoried rather than absorbed.
+/// U9-TIMER2 §1 — does this port's IDLE-BOUNDARY timer trap have a landing that can resume a user
+/// task?
+///
+/// `current == None` on a TIMER trap means one thing: the CPU was parked at its kernel-idle
+/// boundary. (A running user task is `current` by construction, and the routes that clear
+/// `current` are syscall routes, not timer ones.) So the question is entirely about what that
+/// port's idle-boundary timer entry can return to, and the three answers are not the same:
+///
+/// * **RISC-V — yes.** `riscv_s_mode_timer_trap` is a real trap ENTRY: it builds a minimal
+///   `TrapFrame`, runs the arch-neutral pipeline, and then, when a task became current during the
+///   trap, clears `SPP`, sanitizes `sstatus`, populates the hardware frame from that task's saved
+///   context, selects one of its three resume conventions and activates the ASID
+///   (`RISCV_S_MODE_TIMER_DISPATCH`). That landing already exists and is what the broad arm uses
+///   today for exactly this population.
+///
+/// * **x86_64 — no.** The idle landing is `idle_halt_loop()`, a non-returning ring-0 `sti; hlt`.
+///   A timer taken there is a CPL0 interrupt, and `flush_trap_context_to_iret_frame` refuses by
+///   construction to rewrite a frame whose `CS` DPL is not 3 — so that trap cannot `iretq` into a
+///   user task; it returns to the `hlt`. The kernel-stack alternative is closed too:
+///   `build_dispatch_switch_plan_locked` requires an initialized incoming kernel context, which
+///   production user tasks never have. The one owner that does run from that state,
+///   `d6_genuine_local_dispatch_observe`, is explicitly non-mutating.
+///
+/// * **AArch64 — no.** The idle landing is `idle_no_eret_loop()`, a non-returning `wfi` loop whose
+///   own contract records that `current` is None there so no userspace ELR/SPSR is ever returned.
+///
+/// Marking a task `Running` and current from a trap that then returns to `hlt`/`wfi` would strand
+/// it behind a current slot nothing will resume. That is what the broad arm does on those two
+/// ports today; it is a latent defect of theirs and not this package's to repair, so this branch
+/// declines there under its own reason and stays inventoried rather than being absorbed.
+///
+/// This is a structural property of each port's trap entry, which is why it is a constant rather
+/// than a runtime probe: nothing a boot can do makes an x86_64 ring-0 IRET frame return to ring 3.
+#[cfg(not(feature = "hosted-dev"))]
+const IDLE_BOUNDARY_TIMER_CAN_RESUME_USER: bool = cfg!(target_arch = "riscv64");
+
 #[cfg(not(feature = "hosted-dev"))]
 fn try_split_timer_into_frame(
     shared: &SharedKernel,
@@ -3188,17 +3255,33 @@ fn try_split_timer_into_frame(
             //   migration this stage has no demonstrated dependency on. It declines, and is
             //   reported under its own reason so the residual is countable rather than inferred.
             Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {
-                let runnable = shared.runnable_count_on_cpu_split_read(cpu);
-                if runnable > 0 {
+                // U9-TIMER2 §2 — the ONE refusal this branch still has, and it is taken BEFORE the
+                // tick so a declining port still reaches the unchanged broad arm having changed
+                // exactly nothing. Ticking first and declining after would force a choice between
+                // double-ticking in the broad arm and dropping a quantum; that is why the order is
+                // this way here exactly as it is at the top of the preempting branch.
+                let observed_runnable = shared.runnable_count_on_cpu_split_read(cpu);
+                if observed_runnable > 0 && !IDLE_BOUNDARY_TIMER_CAN_RESUME_USER {
                     crate::yarm_log!(
-                        "TIMER_SPLIT_PREEMPT_REFUSED cpu={} reason=no_current_runnable runnable={}",
+                        "TIMER_SPLIT_PREEMPT_REFUSED cpu={} reason=no_user_return_path runnable={}",
                         cpu.0,
-                        runnable
+                        observed_runnable
                     );
                     return D::NotHandled;
                 }
-                // Nothing was mutated: `NoCurrent` is the transaction's first step. So the tick
-                // is taken here, once, exactly as the non-preempting tail takes it.
+                // Past this point the tick is taken, and it is taken for BOTH idle outcomes.
+                //
+                // It used to sit after the run-queue test, which made the count a reservation:
+                // `runnable > 0` decided to tick nothing and hand the trap away, and the broad arm
+                // re-derived the whole decision against a queue that could have changed meanwhile.
+                // Now one tick happens for this interrupt either way — which is what the interrupt
+                // itself earns, independent of what the run queue holds — and the count only
+                // chooses which settlement is OWED. If the queue empties before the authoritative
+                // selection runs, that selection says so and the CPU idles; the observation is
+                // never treated as a promise that a candidate will still be there.
+                //
+                // Nothing has been mutated at this point beyond the tick: `NoCurrent` is the yield
+                // transaction's FIRST step, so it refused before touching any scheduler state.
                 let ticked = shared.scheduler_tick_split_mut(cpu);
                 let tick = match ticked {
                     crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => tick,
@@ -3210,6 +3293,19 @@ fn try_split_timer_into_frame(
                     cpu,
                     crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
                 );
+                if observed_runnable > 0 {
+                    // The broad arm reached `yield_current` for this state, and its first act is
+                    // this increment. The converted route owes it for the same reason the
+                    // committed-preempt arm above does: the broad path no longer runs.
+                    shared.count_yield_split_mut();
+                    crate::yarm_log!(
+                        "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=1 rearm=1 broad_lock=0",
+                        cpu.0,
+                        tick,
+                        observed_runnable
+                    );
+                    return D::TimerIdleQueueAdvance;
+                }
                 crate::yarm_log!(
                     "TIMER_SPLIT_PREEMPT_IDLE cpu={} tick={} preempt=1 rearm=1 broad_lock=0",
                     cpu.0,

@@ -1714,6 +1714,27 @@ impl KernelState {
                     );
                 }
                 if should_preempt {
+                    // U9-TIMER2 §4 — the LIVE half of this package's closure claim, measured
+                    // where arrivals are.
+                    //
+                    // The population it retires is exactly this: a preempting tick on a CPU with
+                    // NO current task, which then reaches `yield_current` and, through
+                    // `on_preempt_current_cpu_selection()`, genuinely dequeues and dispatches onto
+                    // the idle CPU. Counting it HERE — inside the broad `Trap::TimerInterrupt`
+                    // arm, ahead of the call that performs it — names that population and nothing
+                    // else. A marker inside `yield_current` would be broader: its
+                    // kernel-internal callers reach the same selection with no current task for
+                    // reasons that have nothing to do with a timer.
+                    //
+                    // Same placement rule as `IPC_SEND_BROAD_ENTRY` and
+                    // `FUTEX_WAIT_BROAD_ENTRY`: at the arrival, before anything can divert it. The
+                    // source half is the split route's own settlement; this is the live half.
+                    if self.current_tid().is_none() {
+                        crate::yarm_log!(
+                            "TIMER_IDLE_ADVANCE_BROAD_ENTRY cpu={} result=broad_entry",
+                            self.current_cpu().0
+                        );
+                    }
                     self.yield_current()
                         .map_err(SyscallError::from)
                         .map_err(TrapHandleError::Syscall)?;

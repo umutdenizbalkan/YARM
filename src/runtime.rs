@@ -1432,6 +1432,27 @@ impl SharedKernel {
         });
     }
 
+    /// U9-TIMER2 §2 — the split twin of the increment
+    /// `KernelState::note_context_switch_if_task_changed` performs.
+    ///
+    /// That owner asks a TELEMETRY question — "did the running task change?" — and answers it by
+    /// comparing the outgoing identity with the incoming one. A caller with no outgoing task has
+    /// already answered it: `None != Some(incoming)` for every incoming, so the comparison is a
+    /// formality and the count is unconditional. This is that case, named, so an idle-boundary
+    /// dispatch is counted exactly once and by the same field the broad path uses — rather than a
+    /// split route either skipping the accounting or re-deriving a comparison it cannot lose.
+    ///
+    /// It is deliberately NOT a general replacement for the comparison: a caller that does have an
+    /// outgoing task must keep asking it, because a lone task re-dispatched to itself must not be
+    /// counted as a switch.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn count_context_switch_split_mut(&self) {
+        self.with_ipc_split_mut(|ipc| {
+            ipc.telemetry.scheduler_context_switches =
+                ipc.telemetry.scheduler_context_switches.saturating_add(1);
+        });
+    }
+
     /// U9-RESIDUAL1 §1/§3 — **THE** topology admission for a split route that publishes a
     /// queue-advance deferral, and the only place its three conditions are decided.
     ///
