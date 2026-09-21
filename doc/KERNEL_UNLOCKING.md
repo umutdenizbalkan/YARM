@@ -20041,3 +20041,76 @@ the timer route minting no commit of its own, base's `Err(TaskMissing)`, both IS
 route documentation stating the reversal rather than leaving the old claim standing.
 
 Hosted **5686 passed / 0 failed / 2 ignored**. Three freestanding builds clean. Census 7/7.
+
+## U9-PAGEFAULT1 §1b — outcome coverage, not matrix coverage
+
+Every row of `page_fault_route_for` that this mission can reach now says `SplitCow`,
+`SplitDemand` or `SplitTerminal` on at least one port. **That is not closure.** Each route still
+has `NotHandled` exits, and every one of them is an entry into the terminal broad dispatcher.
+
+Counted from the route bodies, comments stripped: **25 exits** — 7 COW, 7 demand, 11 terminal.
+
+### The distinction that matters
+
+An exit means one of two very different things, and they were not separated before:
+
+* **(A) "this recovery class did not handle it"** — a family filter. The fault is not this class's
+  business, and some *other* owner covers it. These are legitimate and stay.
+* **(B) "the broad dispatcher must handle it"** — a genuine residual. Nothing else covers it, so
+  the terminal broad acquisition is doing the work.
+
+### COW — `try_split_cow_page_fault_into_frame`
+
+| exit | condition | class |
+|---|---|---|
+| 427 | architecture is RISC-V | **B** — RISC-V COW is unrouted |
+| 430 | no `FaultInfo` | A — not a page fault |
+| 434 | access is not `Write` | A — COW is write-only; reads/fetches belong to demand or terminal |
+| 439 | `classify_page_fault_shared` gives no facts | **→ §3** — supervisor origin, kernel address, or no task/ASID |
+| 442 | class is not `SplitCow` | A — another class owns it |
+| 448 | `mapping_writable \|\| !mapping_present` | **B** — the already-writable arm and the absent-mapping arm |
+| 532 | `may_fall_back_to_broad()` | **B** — `RefusedIdentityChanged`, `RefusedMappingChanged`, `RefusedNoCnode`, `RefusedAllocation` |
+
+### Demand — `try_split_demand_page_fault_into_frame`
+
+| exit | condition | class |
+|---|---|---|
+| 604 | architecture is none of the three | A — no such port exists |
+| 607 | no `FaultInfo` | A |
+| 613 | access is `Execute` | A — a demand page is `USER_RW`; a fetch fault falls to terminal |
+| 618 | no facts | **→ §3** |
+| 624 | class is not `SplitDemand` | A |
+| 630 | `facts.mapping_present` | **B** — the stale-translation / permission-re-check arm |
+| 668 | `may_fall_back_to_broad()` | **B** — the five pre-mutation refusals |
+
+### Terminal — `try_split_terminal_page_fault_into_frame`
+
+| exit | condition | class |
+|---|---|---|
+| 229 | architecture is not AArch64 | **B** — x86_64 and RISC-V terminal faults |
+| 232 | no `FaultInfo` or no frame | A |
+| 236 | `cpu_idx >= MAX_CPUS` | A — no per-CPU cells; the same fact `CpuOutOfRange` reports |
+| 240 | no facts | **→ §3** |
+| 246 | class is not `SplitTerminal` | A |
+| 251 | policy read refused | **B** |
+| 254 | `!snapshot.terminates_task()` | **B** — `NotifyAndContinue`: report and RESUME, a different shape entirely |
+| 278 | buffered admission refused | **B** — `WaiterPresent`, `BufferFull`, `EndpointStale`, `NoRoute` |
+| 291 | `queue_advance_admit_split` refused | **B** |
+| 301 | deferral unavailable | **B** |
+| 352 | pre-publication commit refused | **B** |
+
+### The score
+
+**10 of 25 exits are genuine residuals (B)**, 12 are legitimate family filters (A), and 3 are the
+classification-failure path §3 owns separately. The matrix being "all split" hid every one of
+them: a route can be admitted for a class and still hand most of that class's *outcomes* away.
+
+The `Complete(Err(..))` fail-closed exits are **not** in this count and are not residuals — they
+settle without entering the broad dispatcher, which is the property that matters.
+
+### Ordering and ownership are preserved by construction
+
+All three routes are consulted in the broad arm's own order — COW (writes only), then demand, then
+terminal — on both bridges, and each is skipped once an earlier one has handled the fault. So a
+class-A exit from one route lands on the next route rather than on the broad arm, *provided* the
+next route admits it. Where it does not, the exit is class B and appears above.
