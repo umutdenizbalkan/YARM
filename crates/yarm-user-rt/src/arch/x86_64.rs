@@ -169,3 +169,65 @@ pub(crate) unsafe fn raw_syscall_checking_callee_saved(
 
 /// How many callee-saved registers [`raw_syscall_checking_callee_saved`] seeds and verifies.
 pub(crate) const CALLEE_SAVED_CHECKED: u32 = 4;
+
+/// U9-PAGEFAULT1 §3 — store `value` through `addr`, then read it back, with four callee-saved
+/// registers seeded and verified ACROSS the access.
+///
+/// The access is expected to FAULT: `addr` names a page inside a demand-backed window that
+/// `VmBrk` grew lazily, so the store takes a `#PF` the kernel must recover before the instruction
+/// can complete.
+///
+/// Returns `(read_back, preserved_mask)`. Three independent facts fall out of it:
+///
+/// * **the faulting instruction retried** — if it had been skipped, or resumed past, the store
+///   would never have landed and `read_back` would not be `value`;
+/// * **the source register survived** — `read_back` is the value the store's source operand held,
+///   so a clobbered file would write the wrong bytes rather than none;
+/// * **the rest of the file survived** — the four sentinels are carried in and out in named
+///   callee-saved registers and compared on the far side, each distinct so a restore that
+///   SHUFFLES the file is caught as well as one that drops it.
+///
+/// `rbx` is deliberately not among them: LLVM reserves it internally and it cannot be named in
+/// Rust inline asm.
+#[cfg(feature = "pagefault1-demand-witness")]
+pub(crate) unsafe fn touch_checking_callee_saved(
+    addr: usize,
+    value: u64,
+    sentinel: u64,
+) -> (u64, u32) {
+    let read_back: u64;
+    let s = sentinel as usize;
+    let (mut c0, mut c1, mut c2, mut c3) =
+        (s, s.wrapping_add(1), s.wrapping_add(2), s.wrapping_add(3));
+    // SAFETY: `addr` is inside this task's own brk window, page-aligned by the caller and sized
+    // for a `u64`. The store is the faulting access; the load that follows reads the same slot
+    // back in the same block, so no intervening code can perturb it.
+    unsafe {
+        core::arch::asm!(
+            "mov qword ptr [{addr}], {val}",
+            "mov {out}, qword ptr [{addr}]",
+            addr = in(reg) addr,
+            val = in(reg) value,
+            out = out(reg) read_back,
+            inlateout("r12") c0,
+            inlateout("r13") c1,
+            inlateout("r14") c2,
+            inlateout("r15") c3,
+            options(nostack),
+        );
+    }
+    let mut mask = 0u32;
+    if c0 == s {
+        mask |= 1;
+    }
+    if c1 == s.wrapping_add(1) {
+        mask |= 2;
+    }
+    if c2 == s.wrapping_add(2) {
+        mask |= 4;
+    }
+    if c3 == s.wrapping_add(3) {
+        mask |= 8;
+    }
+    (read_back, mask)
+}

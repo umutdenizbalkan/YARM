@@ -125,3 +125,50 @@ pub(crate) unsafe fn raw_syscall_checking_callee_saved(
 
 /// How many callee-saved registers [`raw_syscall_checking_callee_saved`] seeds and verifies.
 pub(crate) const CALLEE_SAVED_CHECKED: u32 = 4;
+
+/// U9-PAGEFAULT1 §3 — the AArch64 twin of the x86_64 helper. See that one for what the three
+/// facts it returns are and why each matters.
+///
+/// `x20..x23` are the AAPCS64 callee-saved registers an inline asm block may name here.
+#[cfg(feature = "pagefault1-demand-witness")]
+pub(crate) unsafe fn touch_checking_callee_saved(
+    addr: usize,
+    value: u64,
+    sentinel: u64,
+) -> (u64, u32) {
+    let read_back: u64;
+    let s = sentinel as usize;
+    let (mut c0, mut c1, mut c2, mut c3) =
+        (s, s.wrapping_add(1), s.wrapping_add(2), s.wrapping_add(3));
+    // SAFETY: `addr` is inside this task's own brk window, page-aligned by the caller and sized
+    // for a `u64`. The store is the faulting access; the load reads the same slot back in the
+    // same block.
+    unsafe {
+        core::arch::asm!(
+            "str {val}, [{addr}]",
+            "ldr {out}, [{addr}]",
+            addr = in(reg) addr,
+            val = in(reg) value,
+            out = out(reg) read_back,
+            inlateout("x20") c0,
+            inlateout("x21") c1,
+            inlateout("x22") c2,
+            inlateout("x23") c3,
+            options(nostack),
+        );
+    }
+    let mut mask = 0u32;
+    if c0 == s {
+        mask |= 1;
+    }
+    if c1 == s.wrapping_add(1) {
+        mask |= 2;
+    }
+    if c2 == s.wrapping_add(2) {
+        mask |= 4;
+    }
+    if c3 == s.wrapping_add(3) {
+        mask |= 8;
+    }
+    (read_back, mask)
+}

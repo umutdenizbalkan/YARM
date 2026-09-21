@@ -27,6 +27,17 @@ riscv-exit-current-task-oracle = []
 # every other slot-5 profile keeps the headroom it had. Feature-off builds carry none of its
 # literals.
 ipc-send-final-fault-witness = []
+# U9-PAGEFAULT1 §3: gates the DEMAND page-fault witness.
+#
+# A cargo feature and not only a runtime knob, for the same measured reason as the two above:
+# init's address space already runs at `AddressSpace::MAX_MAPPINGS` on the provisioned oracle
+# profiles, so an unconditional cell costs mapping runs that other slot-5 witnesses need. A
+# feature-off build is BYTE-IDENTICAL to one without the cell.
+#
+# It is ALSO default-off on its own merits, which the syscall-probe witnesses are not: this one
+# deliberately takes real page faults, so it must never sit in the path of every profile sharing
+# this image.
+pagefault1-demand-witness = ["yarm-user-rt/pagefault1-demand-witness"]
 # U9-FUTEX-WAIT-FINAL §4: gates the NR 9 NONBLOCKING-completion probe in the futex oracles.
 #
 # Same reason as `ipc-send-final-fault-witness`, measured the same way: init's address space runs

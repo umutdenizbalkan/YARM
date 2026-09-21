@@ -29,3 +29,13 @@ pub(crate) unsafe fn raw_syscall_checking_callee_saved(
 
 /// Zero: this build seeds and verifies no callee-saved register.
 pub(crate) const CALLEE_SAVED_CHECKED: u32 = 0;
+
+/// U9-PAGEFAULT1 §3 — the unsupported-target stub. Never linked into a real kernel image.
+#[cfg(feature = "pagefault1-demand-witness")]
+pub(crate) unsafe fn touch_checking_callee_saved(
+    _addr: usize,
+    _value: u64,
+    _sentinel: u64,
+) -> (u64, u32) {
+    (0, 0)
+}

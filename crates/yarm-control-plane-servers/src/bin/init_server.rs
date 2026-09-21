@@ -56,6 +56,16 @@ pub extern "C" fn yarm_user_entry() -> ! {
             .or(ctx.supervisor_fault_recv_ep);
         yarm_user_rt::vm_entry_witness::run_once(non_aspace_cap);
     }
+    // U9-PAGEFAULT1 §3 — the DEMAND page-fault witness, in the same place and for the same
+    // reason: `DemandCandidate` has zero live witnesses on any port, so nothing exercised the
+    // class `page_fault_route_for` routes `Broad` everywhere, and zero faults is zero evidence.
+    //
+    // FEATURE-GATED and default-off, unlike the NR 3/13/14 witness above. That one is a pure
+    // syscall probe; this one deliberately takes real page faults, so it must not be in the path
+    // of every profile that shares this image. It grows this task's OWN brk window and touches
+    // only inside it — init's mapping run is untouched and no capacity is increased.
+    #[cfg(feature = "pagefault1-demand-witness")]
+    yarm_user_rt::pagefault1_demand_witness::run_once();
     yarm_user_rt::user_log!("INIT_BEFORE_RUN");
     run();
     let ctx = yarm_user_rt::runtime::startup_context();

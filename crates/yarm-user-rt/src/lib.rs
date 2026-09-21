@@ -7,6 +7,8 @@ mod arch;
 pub mod recv_v3_draft;
 // U9-VM-ENTRY1 §4 — the minimal userspace witness for NR 3 / NR 13 / NR 14, which had no live
 // issuer anywhere in the system before this mission.
+#[cfg(feature = "pagefault1-demand-witness")]
+pub mod pagefault1_demand_witness;
 pub mod vm_entry_witness;
 
 #[macro_export]
@@ -1277,6 +1279,35 @@ pub mod syscall {
                 SyscallError::TimedOut | SyscallError::WouldBlock
             );
         (timed_out, mask, crate::arch::CALLEE_SAVED_CHECKED)
+    }
+
+    /// U9-PAGEFAULT1 §3 — store through `addr`, read it back, and report whether the register
+    /// file survived the fault the store is expected to take.
+    ///
+    /// `addr` must name a `u64`-sized, `u64`-aligned slot inside a demand-backed window this task
+    /// owns — one `VmBrk` grew lazily, so the page has bounds but no mapping and the store faults.
+    ///
+    /// Returns `(read_back, preserved_mask, checked)`. `read_back == value` is the load-bearing
+    /// fact: the faulting instruction RETRIED and completed with the right source operand. The
+    /// mask reports how many of `checked` callee-saved sentinels came back intact; `checked` is 0
+    /// on RISC-V, where no register may be named in inline asm here, and the value check stands
+    /// alone.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must be inside this task's own brk window and suitably aligned. A demand fault is
+    /// expected; any OTHER fault at this address is a genuine terminal fault and will be reported
+    /// as one.
+    #[cfg(feature = "pagefault1-demand-witness")]
+    pub unsafe fn touch_demand_page_checking_callee_saved(
+        addr: usize,
+        value: u64,
+        sentinel: u64,
+    ) -> (u64, u32, u32) {
+        // SAFETY: forwarded to the caller, which owns the address.
+        let (read_back, mask) =
+            unsafe { crate::arch::touch_checking_callee_saved(addr, value, sentinel) };
+        (read_back, mask, crate::arch::CALLEE_SAVED_CHECKED)
     }
 
     #[inline]

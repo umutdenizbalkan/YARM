@@ -55,3 +55,32 @@ pub(crate) unsafe fn raw_syscall_checking_callee_saved(
 
 /// Zero: this port seeds and verifies no callee-saved register (see above).
 pub(crate) const CALLEE_SAVED_CHECKED: u32 = 0;
+
+/// U9-PAGEFAULT1 §3 — the RISC-V twin. `CALLEE_SAVED_CHECKED` is 0 on this port, so no sentinel
+/// registers are seeded and the returned mask is always 0.
+///
+/// The two facts that DO survive here are the ones that matter most, and they need no named
+/// registers: the store lands (so the faulting instruction retried rather than being skipped or
+/// resumed past) and it lands with the right value (so the source operand survived the fault).
+#[cfg(feature = "pagefault1-demand-witness")]
+pub(crate) unsafe fn touch_checking_callee_saved(
+    addr: usize,
+    value: u64,
+    _sentinel: u64,
+) -> (u64, u32) {
+    let read_back: u64;
+    // SAFETY: `addr` is inside this task's own brk window, page-aligned by the caller and sized
+    // for a `u64`. The store is the faulting access; the load reads the same slot back in the
+    // same block.
+    unsafe {
+        core::arch::asm!(
+            "sd {val}, 0({addr})",
+            "ld {out}, 0({addr})",
+            addr = in(reg) addr,
+            val = in(reg) value,
+            out = out(reg) read_back,
+            options(nostack),
+        );
+    }
+    (read_back, 0)
+}
