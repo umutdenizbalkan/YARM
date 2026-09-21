@@ -1300,34 +1300,71 @@ impl SharedKernel {
         })
     }
 
-    /// U9-PAGEFAULT1 §0 — **may this trap return through the frame of `tid`?**
+    /// U9-PAGEFAULT1 §0 — **may this trap return through the frame it entered on?**
     ///
-    /// The rank-2 half of the question `current_tid_authoritative` answers at rank 1. The caller
-    /// has already established WHICH task `current` names; this establishes whether that task is
-    /// still an incarnation a trap may resume, by reading its status under the task lock and
-    /// handing it to [`classify_current_resumability`] — the one pure classifier, so the split
-    /// route and any future caller cannot come to disagree about what "resumable" means.
+    /// The question a pre-mutation refusal does NOT answer. `YieldDecline::NotRunning` proves the
+    /// transaction wrote nothing; it says nothing about whether the CPU may `iret`/`eret` back
+    /// into the task `current` names. Those are different predicates, and "the TCB exists" is not
+    /// the second one.
     ///
-    /// It is a READ: no transition is applied, no status is written, nothing is enqueued, and a
-    /// `NotResumable` answer mutates nothing. In particular it never promotes the observed task
-    /// back to `Running` — a competing winner's terminal task must stay terminal.
+    /// # Three facts, and why each is load-bearing
     ///
-    /// One acquisition, rank 2 only. It deliberately does NOT re-read `current`: the TID is the
-    /// caller's, taken from the rank-1 read that produced the refusal being classified, so the two
-    /// halves describe the same observation rather than two independent ones.
+    /// This composes the two OWNERS that already answer them rather than inventing a third:
     ///
-    /// [`classify_current_resumability`]: crate::kernel::task_transition::classify_current_resumability
-    pub(crate) fn current_resumability_split_read(
+    /// * **Exact incarnation and a resumable status** —
+    ///   [`Self::task_incarnation_is_resumable_split_read`], which compares `{tid, asid}` with
+    ///   Phase A's own `Asid(0)` normalization and admits `Runnable | Running` only. It excludes
+    ///   `Blocked(..)` deliberately, and that exclusion is the one this settlement most needs: a
+    ///   blocked task's continuation belongs to the route that blocked it, and its waker will
+    ///   resume it from THAT continuation. Returning through the interrupt frame as well would
+    ///   give one task two live continuations. It also excludes `Reserved`, `Faulted`, `Exited`
+    ///   and `Dead`, and refuses a replacement incarnation that reused the numeric TID.
+    /// * **Actual scheduler placement** — `SmpScheduler::placement_of`, in one rank-1
+    ///   acquisition, which distinguishes `Current(cpu)` from `Queued(cpu)`,
+    ///   `CurrentAndQueued(cpu)` and `Nowhere`. A `Runnable` task that is QUEUED can be dequeued
+    ///   and dispatched by another CPU at any moment, so resuming it here would run one task on
+    ///   two CPUs; `CurrentAndQueued` is a second placement and the same hazard.
+    /// * **That the placement is THIS CPU's** — a task current on another CPU is that CPU's to
+    ///   resume, never this one's.
+    ///
+    /// Only `Current(cpu) == this cpu`, with the exact incarnation resumable, authorizes the
+    /// return. That state is not hypothetical: it is precisely what
+    /// `recv_block_unwind_exact_split` constructs and calls `Restored` — rank-2 writes `Runnable`,
+    /// rank-1 restores the exact current slot, and its caller then does return through the
+    /// entering frame. This settlement admits the same state through the same owners.
+    ///
+    /// # It is a READ
+    ///
+    /// No transition is applied, no status is written, nothing is enqueued or dequeued, and a
+    /// forfeited verdict mutates nothing. In particular it never promotes the observed task back
+    /// to `Running`: a competing winner's task stays exactly as the winner left it.
+    pub(crate) fn entering_frame_authority_split_read(
         &self,
+        cpu: CpuId,
         tid: u64,
-    ) -> crate::kernel::task_transition::CurrentResumability {
-        let observed = self.with_task_tcbs_split_mut(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == tid)
-                .map(|tcb| tcb.status)
+        entering_asid: crate::kernel::vm::Asid,
+    ) -> crate::kernel::task_transition::EnteringFrameAuthority {
+        use crate::kernel::scheduler::TaskPlacement;
+        use crate::kernel::task_transition::{
+            EnteringFrameAuthority as A, FrameForfeitReason as R,
+        };
+
+        // Rank 2 first: identity and status, one acquisition, through the existing owner.
+        if !self.task_incarnation_is_resumable_split_read(tid, entering_asid) {
+            return A::Forfeited(R::IncarnationNotResumable);
+        }
+        // Rank 1: where the scheduler actually has it. Ranks are taken 2 then 1 with NO nesting —
+        // the rank-2 acquisition above has been released before this one is taken.
+        let placement = self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler).placement_of(crate::kernel::ipc::ThreadId(tid))
         });
-        crate::kernel::task_transition::classify_current_resumability(observed)
+        match placement {
+            TaskPlacement::Current(on) if on == cpu => A::OwnsEnteringFrame,
+            TaskPlacement::Current(_) => A::Forfeited(R::CurrentOnAnotherCpu),
+            TaskPlacement::CurrentAndQueued(_) => A::Forfeited(R::SecondPlacement),
+            TaskPlacement::Queued(_) => A::Forfeited(R::QueuedForDispatch),
+            TaskPlacement::Nowhere => A::Forfeited(R::PlacedNowhere),
+        }
     }
 
     /// # Validation status

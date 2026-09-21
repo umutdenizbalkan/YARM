@@ -19536,6 +19536,73 @@ Known-failing before and after, established by controlled comparison against a w
 delivered base rather than asserted: the `D6_SWITCH_PROOF=1` and `D6_SWITCH_A=1` core-smoke seals,
 and `qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh`.
 
+## U9-PAGEFAULT1 §0 CORRECTION — the `NotRunning` settlement was justified wrongly
+
+The first §0 draft claimed the split settlement "preserves the delivered contract rather than
+inventing a harsher one", on the grounds that base answered `NotRunning` with
+`Err(KernelError::TaskMissing)` and halted. **Half of that was true and the conclusion drawn from
+it was not**, and the contradiction is worth stating plainly because it is the kind that hides
+inside a correct-sounding sentence.
+
+Base halted for `Err(TaskMissing)` — verified, not assumed: x86_64's ISR calls `halt_forever()`
+and AArch64's enters a `wfe` loop when `dispatch_trap_entry_with_shared_kernel` returns `Err`. But
+the broad `yield_current` returns that error for **every** status, not only the terminal ones. So
+base halted for `Runnable` and `Blocked(_)` too, and a draft that continued for those was not
+preserving anything — it was changing behaviour while claiming parity.
+
+### "Live" is not "may this trap return through its entering frame"
+
+The draft's classifier asked whether the TCB existed and held a live status. That is the wrong
+predicate, and two of the states it admitted are exactly the ones that must not be resumed:
+
+* **`Blocked(..)`** — the route that blocked the task owns its continuation, and its waker will
+  resume it from there. Returning through the interrupt frame as well gives one task two live
+  continuations.
+* **`Runnable` while QUEUED** — another CPU can dequeue and dispatch it at any moment, so
+  resuming here runs one task on two CPUs.
+
+Neither is distinguishable from a status read alone. The missing fact is **placement**.
+
+### The repaired settlement composes the owners that already answer this
+
+`SharedKernel::entering_frame_authority_split_read(cpu, tid, entering_asid)` returns
+`EnteringFrameAuthority`, built from two existing owners and no third source of truth:
+
+| fact | owner | what it excludes |
+|---|---|---|
+| exact incarnation + resumable status | `task_incarnation_is_resumable_split_read` | a replacement that reused the TID, and `Blocked(..)`, `Reserved`, `Faulted`, `Exited`, `Dead` — it admits `Runnable \| Running` alone |
+| actual placement | `SmpScheduler::placement_of`, one rank-1 acquisition | `Queued`, `CurrentAndQueued`, `Nowhere` |
+| the placement is THIS CPU's | the same read | `Current(other cpu)` |
+
+Only `Current(this cpu)` with a resumable exact incarnation yields `OwnsEnteringFrame`, and only
+that settles as `ContinueCurrent`. The five `Forfeited` reasons — `IncarnationNotResumable`,
+`CurrentOnAnotherCpu`, `SecondPlacement`, `QueuedForDispatch`, `PlacedNowhere` — are each
+fail-closed and each named, so a fatal report says which one occurred instead of "task missing".
+
+The admitted state is not invented for this route. `recv_block_unwind_exact_split` constructs
+exactly it — rank-2 writes `Runnable`, rank-1 restores the exact current slot — calls it
+`Restored`, and its caller then returns through the entering frame. The same state, admitted
+through the same owners.
+
+### The entering incarnation is captured before the tick
+
+Step (0b) of `settle_recognized_timer` reads `{tid, asid}` before the tick and before the
+transaction. A re-read at the refusal would compare a later observation against itself and could
+authenticate against a replacement task that took the numeric TID in between — which is precisely
+what the directive forbids. `Asid(0)` is the exact-incarnation owner's own normalization for a
+task with no address space, so a kernel-task entry compares equal to what it was entered with.
+
+### How this is labelled now
+
+Continuing for `OwnsEnteringFrame` is a **deliberate improvement over base**, admitted only where
+the owners prove it — not parity. The record says so, and
+`the_replaced_behaviour_is_described_as_an_improvement_not_as_parity` asserts that the route's own
+documentation says so too, checked against the broad adapter's `Err(KernelError::TaskMissing)` and
+against both ISRs' halts.
+
+`mod u9pf1_not_running` is 10 cases. Hosted 5673 passed / 0 failed / 2 ignored, single-threaded;
+three freestanding builds clean.
+
 ## U9-PAGEFAULT1 §1 — the complete PageFault matrix, read from both bridges
 
 Base `f6544a58`. `main` stays `8f30f3b9`.

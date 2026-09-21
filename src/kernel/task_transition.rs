@@ -316,82 +316,66 @@ pub(crate) fn log_transition_refusal(
     }
 }
 
-/// U9-PAGEFAULT1 §0 — **may this trap return through the frame of the task that is `current`,
-/// given that the task is NOT `Running`?**
+/// U9-PAGEFAULT1 §0 — may a trap return through the frame it entered on?
 ///
-/// # The gap this closes
+/// The verdict [`crate::runtime::SharedKernel::entering_frame_authority_split_read`] produces by
+/// composing the exact-incarnation owner with the scheduler's placement owner. It is a TYPE rather
+/// than a `bool` because the forfeits are not one condition and a fatal report that cannot say
+/// which one occurred is not diagnosable.
 ///
-/// `run_yield_transaction` refuses with `YieldDecline::NotRunning` when `current` names a task
-/// that `TaskTransition::PreemptOutgoing` will not accept, and the timer route settled every such
-/// refusal as "continue the current task" on the reasoning that the refusal is pre-mutation. That
-/// reasoning is sound about the WORLD and says nothing about the FRAME: a refusal that wrote
-/// nothing still leaves the CPU about to `iret`/`eret` into whatever `current` names.
-///
-/// `NotRunning` is not one condition. `apply_preempt_outgoing_locked` passes `expect_asid: None`,
-/// so the refusal collapses two genuinely different facts:
-///
-/// * **the TCB is gone** (`TransitionRefusal::TaskMissing`), or
-/// * **the status is not `Running`** (`WrongStatus { observed }`) — where `observed` may be a live
-///   status or a terminal one.
-///
-/// Those have opposite answers, which is why this classifier exists rather than a bare boolean.
-///
-/// # The two classes
-///
-/// [`Self::LiveNotRunning`] — `Runnable` or `Blocked(_)`. The incarnation is PRESENT and owns
-/// this frame; what is wrong is bookkeeping, not identity. This is the reachable class: a
-/// cross-CPU wake writes `Runnable` over whatever it finds (see `SharedKernel`'s waker seams),
-/// so a task that is `Running` and `current` on the bootstrap CPU can be made `Runnable` by
-/// another CPU without its frame becoming invalid. Returning through it resumes the same task, in
-/// the same address space, at the instruction the timer interrupted. The scheduler's next
-/// dispatch reconciles the status.
-///
-/// [`Self::NotResumable`] — `Faulted`, `Exited(_)`, `Dead`, `Reserved`, or no TCB at all. The
-/// incarnation this frame belongs to is finished or never started. Returning through it would
-/// resume terminated userspace, and promoting it back to `Running` would hand a competing
-/// winner's corpse to the scheduler. Neither is permitted, which is why the route treats this as
-/// fail-closed rather than as contention.
-///
-/// `Running` cannot reach here — it is exactly the status `PreemptOutgoing` accepts — and is
-/// classified [`Self::LiveNotRunning`] so the function is total over the enum without inventing a
-/// third class for a value its one caller cannot pass.
+/// "Live" is not the predicate. A task whose TCB exists, and even one that is `Runnable`, may
+/// still be a task this CPU must not resume — see [`FrameForfeitReason`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CurrentResumability {
-    /// The incarnation is present and live; this trap may return through its frame.
-    LiveNotRunning,
-    /// The incarnation is terminal, reserved, or gone; this trap must NOT return through it.
-    NotResumable,
+pub(crate) enum EnteringFrameAuthority {
+    /// The entering incarnation is still resumable AND is this CPU's `current`, queued nowhere.
+    /// This is the only state in which a trap may return through its entering frame.
+    OwnsEnteringFrame,
+    /// It may not. The reason is carried so the settlement can name it.
+    Forfeited(FrameForfeitReason),
 }
 
-impl CurrentResumability {
-    /// A stable name for the marker, so a live run reports which class was observed.
+/// Why the entering frame may no longer be returned through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameForfeitReason {
+    /// The TCB is gone, a replacement incarnation reused the numeric TID, or the status is one
+    /// `task_incarnation_is_resumable_split_read` excludes — `Blocked(..)`, `Reserved`,
+    /// `Faulted`, `Exited`, `Dead`.
+    ///
+    /// `Blocked(..)` is here on purpose and is the subtlest member: the blocking route owns that
+    /// task's continuation and its waker will resume it from there, so returning through the
+    /// interrupt frame as well would give one task two live continuations.
+    IncarnationNotResumable,
+    /// The scheduler has it as ANOTHER CPU's `current`. That CPU owns its resume, not this one.
+    CurrentOnAnotherCpu,
+    /// `CurrentAndQueued` — a second placement exists, so another CPU can dispatch it while this
+    /// one resumes it. A scheduler invariant break, and never a licence to return.
+    SecondPlacement,
+    /// Queued and waiting for a dispatch. Resuming here would run it on this CPU while it is
+    /// still available to be dequeued by another.
+    QueuedForDispatch,
+    /// On no run queue and in no current slot. Nothing will resume it, and neither may this trap.
+    PlacedNowhere,
+}
+
+impl EnteringFrameAuthority {
+    /// A stable name for the marker, so a live run reports the exact verdict.
     pub(crate) const fn marker(self) -> &'static str {
         match self {
-            Self::LiveNotRunning => "live_not_running",
-            Self::NotResumable => "not_resumable",
+            Self::OwnsEnteringFrame => "owns_entering_frame",
+            Self::Forfeited(reason) => reason.marker(),
         }
     }
 }
 
-/// Classify the status `current` was observed in. `None` means no TCB holds that TID.
-///
-/// Pure and total over [`TaskStatus`], so the classification can be proven exhaustively without a
-/// kernel: a status added to the enum fails to compile here rather than defaulting into the
-/// resumable class.
-pub(crate) const fn classify_current_resumability(
-    observed: Option<TaskStatus>,
-) -> CurrentResumability {
-    match observed {
-        None => CurrentResumability::NotResumable,
-        Some(status) => match status {
-            TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Blocked(_) => {
-                CurrentResumability::LiveNotRunning
-            }
-            TaskStatus::Reserved
-            | TaskStatus::Faulted
-            | TaskStatus::Exited(_)
-            | TaskStatus::Dead => CurrentResumability::NotResumable,
-        },
+impl FrameForfeitReason {
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::IncarnationNotResumable => "incarnation_not_resumable",
+            Self::CurrentOnAnotherCpu => "current_on_another_cpu",
+            Self::SecondPlacement => "second_placement",
+            Self::QueuedForDispatch => "queued_for_dispatch",
+            Self::PlacedNowhere => "placed_nowhere",
+        }
     }
 }
 

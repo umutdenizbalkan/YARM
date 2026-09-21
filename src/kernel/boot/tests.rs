@@ -172471,15 +172471,17 @@ mod u9timer1_preempting_timer {
 
 #[cfg(test)]
 mod u9pf1_not_running {
-    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::scheduler::TaskPlacement;
+    use crate::kernel::task::TaskStatus;
     use crate::kernel::task_transition::{
-        CurrentResumability, TaskTransition, classify_current_resumability,
+        EnteringFrameAuthority, FrameForfeitReason, TaskTransition,
     };
 
     const SPLIT: &str = include_str!("../syscall_split.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
     const TRANSITION: &str = include_str!("../task_transition.rs");
     const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+    const SCHEDULER: &str = include_str!("../scheduler.rs");
 
     /// The recognized timer body, CODE only — same slice and same reason as `u9timer1`'s.
     fn route() -> alloc::string::String {
@@ -172500,111 +172502,193 @@ mod u9pf1_not_running {
             .join("\n")
     }
 
-    // ── the classifier ───────────────────────────────────────────────────────────────────────
-
-    /// **Every status is classified, and the dangerous ones are classified as dangerous.**
-    ///
-    /// Exhaustive over `TaskStatus` by construction: the classifier is a total `match` with no
-    /// wildcard, so a status added to the enum fails to compile rather than defaulting into the
-    /// resumable class. This case pins WHICH side each one lands on, because the compiler cannot.
-    #[test]
-    fn every_task_status_is_classified_and_the_terminal_ones_are_not_resumable() {
-        for (status, expected) in [
-            // Live: the incarnation is present and owns the frame this trap returns through.
-            (TaskStatus::Runnable, CurrentResumability::LiveNotRunning),
-            (TaskStatus::Running, CurrentResumability::LiveNotRunning),
-            (
-                TaskStatus::Blocked(WaitReason::Futex(crate::kernel::vm::VirtAddr(0x1000))),
-                CurrentResumability::LiveNotRunning,
-            ),
-            (
-                TaskStatus::Blocked(WaitReason::Join(crate::kernel::ipc::ThreadId(7))),
-                CurrentResumability::LiveNotRunning,
-            ),
-            // Terminal, or not a live task at all.
-            (TaskStatus::Faulted, CurrentResumability::NotResumable),
-            (TaskStatus::Exited(0), CurrentResumability::NotResumable),
-            (TaskStatus::Exited(9), CurrentResumability::NotResumable),
-            (TaskStatus::Dead, CurrentResumability::NotResumable),
-            (TaskStatus::Reserved, CurrentResumability::NotResumable),
-        ] {
-            assert_eq!(
-                classify_current_resumability(Some(status)),
-                expected,
-                "{status:?} must classify as {expected:?}"
-            );
-        }
-        // A missing TCB is the other half of what `NotRunning` collapses, and it is the least
-        // resumable case of all: there is no incarnation to return to.
-        assert_eq!(
-            classify_current_resumability(None),
-            CurrentResumability::NotResumable,
-            "a TID with no TCB is never resumable"
-        );
-    }
-
-    /// **`Reserved` is not resumable, and that is not an accident of grouping.**
-    ///
-    /// A spawn reservation is deliberately none of the live states — not `Runnable`, so no
-    /// dispatch accepts it; not `Blocked(_)`, so no wake names it. It has no user frame at all.
-    /// Classifying it with the terminal statuses is the fail-closed reading, and is checked
-    /// separately so a future regrouping cannot quietly move it.
-    #[test]
-    fn a_spawn_reservation_has_no_frame_to_resume() {
-        assert_eq!(
-            classify_current_resumability(Some(TaskStatus::Reserved)),
-            CurrentResumability::NotResumable
-        );
-        assert_ne!(
-            classify_current_resumability(Some(TaskStatus::Reserved)),
-            classify_current_resumability(Some(TaskStatus::Runnable)),
-            "a reservation and a runnable task must not settle the same way"
-        );
-    }
-
-    /// The classifier's live class is exactly the complement of what `PreemptOutgoing` accepts
-    /// PLUS what it accepts — i.e. the refusal it classifies can only carry a non-`Running`
-    /// status, and `Running` is included only so the function is total.
-    #[test]
-    fn the_classifier_covers_the_status_preempt_outgoing_accepts() {
-        assert_eq!(
-            TaskTransition::PreemptOutgoing.expected_from(),
-            TaskStatus::Running,
-            "the refusal being classified is exactly `status != Running`"
-        );
-        assert_eq!(
-            classify_current_resumability(Some(TaskStatus::Running)),
-            CurrentResumability::LiveNotRunning,
-            "and `Running` is total-coverage only — its caller cannot produce it"
-        );
-    }
-
-    // ── the read seam ────────────────────────────────────────────────────────────────────────
-
-    /// **The resumability read is a rank-2 READ, and it promotes nothing.**
-    ///
-    /// The directive's sharpest constraint: a competing winner's terminal task must not be put
-    /// back to `Running`. The strongest form of that guarantee is that the seam has no way to
-    /// write at all, which is what this asserts against the seam's own body.
-    #[test]
-    fn the_resumability_seam_writes_nothing_and_takes_one_rank_2_acquisition() {
-        let body = RUNTIME
-            .split("pub(crate) fn current_resumability_split_read(")
+    /// The frame-authority seam, CODE only.
+    fn seam() -> alloc::string::String {
+        RUNTIME
+            .split("pub(crate) fn entering_frame_authority_split_read(")
             .nth(1)
             .and_then(|s| s.split("\n    }").next())
-            .expect("the resumability seam")
+            .expect("the frame-authority seam")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // ── the verdict is about the FRAME, not about liveness ───────────────────────────────────
+
+    /// **`OwnsEnteringFrame` requires all three facts, and every other placement forfeits.**
+    ///
+    /// This is the case the first draft of §0 got wrong. That draft asked only "is the TCB live?"
+    /// and continued for `Runnable` and `Blocked(_)` alike. "Live" and "may this trap return
+    /// through its entering frame" are different predicates, and two of the states the draft
+    /// admitted are exactly the ones that must not be resumed:
+    ///
+    /// * a `Blocked(..)` task's continuation belongs to the route that blocked it, and its waker
+    ///   will resume it from there — returning through the interrupt frame as well gives one task
+    ///   two live continuations;
+    /// * a `Runnable` task that is QUEUED can be dequeued and dispatched by another CPU while
+    ///   this one resumes it.
+    ///
+    /// So the verdict is derived from placement as well as identity, and this case pins the map.
+    #[test]
+    fn only_current_on_this_cpu_owns_the_entering_frame() {
+        let code = seam();
+        // The three facts, each from its own owner, and no fourth source of truth.
+        assert!(
+            code.contains("self.task_incarnation_is_resumable_split_read(tid, entering_asid)"),
+            "identity and status must come from the EXISTING exact-incarnation owner"
+        );
+        assert!(
+            code.contains("placement_of(crate::kernel::ipc::ThreadId(tid))"),
+            "placement must come from the scheduler's own placement owner"
+        );
+        // The placement map, exhaustive and with only ONE admitting arm.
+        for (arm, verdict) in [
+            (
+                "TaskPlacement::Current(on) if on == cpu",
+                "A::OwnsEnteringFrame",
+            ),
+            (
+                "TaskPlacement::Current(_)",
+                "A::Forfeited(R::CurrentOnAnotherCpu)",
+            ),
+            (
+                "TaskPlacement::CurrentAndQueued(_)",
+                "A::Forfeited(R::SecondPlacement)",
+            ),
+            (
+                "TaskPlacement::Queued(_)",
+                "A::Forfeited(R::QueuedForDispatch)",
+            ),
+            ("TaskPlacement::Nowhere", "A::Forfeited(R::PlacedNowhere)"),
+        ] {
+            let at = code
+                .find(arm)
+                .unwrap_or_else(|| panic!("the placement arm `{arm}` must exist"));
+            assert!(
+                code[at..].contains(verdict),
+                "`{arm}` must map to `{verdict}`"
+            );
+        }
+        assert_eq!(
+            code.matches("A::OwnsEnteringFrame").count(),
+            1,
+            "exactly one arm may authorize the return"
+        );
+        // The identity refusal precedes the placement read, so a replacement incarnation is
+        // refused before the scheduler is even consulted about it.
+        let ident = code
+            .find("task_incarnation_is_resumable_split_read")
+            .expect("the identity read");
+        let place = code.find("placement_of(").expect("the placement read");
+        assert!(
+            ident < place,
+            "identity is checked first — a replacement that reused the TID must never reach the \
+             placement question"
+        );
+    }
+
+    /// **The excluded statuses are excluded by the owner this seam delegates to**, not by a
+    /// second list this module maintains.
+    ///
+    /// `task_incarnation_is_resumable_split_read` admits `Runnable | Running` and nothing else.
+    /// Checked against that owner's body so the exclusion cannot drift away from the settlement
+    /// that depends on it.
+    #[test]
+    fn the_exact_incarnation_owner_excludes_blocked_and_every_terminal_status() {
+        let owner = RUNTIME
+            .split("pub(crate) fn task_incarnation_is_resumable_split_read(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the exact-incarnation owner")
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
-        assert_eq!(
-            body.matches("with_task_tcbs_split_mut").count(),
-            1,
-            "one acquisition, in the task domain"
+        assert!(
+            owner.contains("matches!(t.status, TaskStatus::Runnable | TaskStatus::Running)"),
+            "the admitted status set must be exactly `Runnable | Running`"
         );
+        assert!(
+            owner.contains("t.asid.unwrap_or(crate::kernel::vm::Asid(0)) == asid"),
+            "and the identity comparison must be the exact `{{tid, asid}}` one, with the owner's \
+             own Asid(0) normalization"
+        );
+        for excluded in ["Blocked", "Reserved", "Faulted", "Exited", "Dead"] {
+            assert!(
+                !owner.contains(&alloc::format!("TaskStatus::{excluded}")),
+                "`{excluded}` must not appear in the admitted set"
+            );
+        }
+        // And the module documents WHY `Blocked` in particular is excluded, because that is the
+        // exclusion the timer settlement most depends on and the one a future edit is most
+        // likely to think is harmless.
+        assert!(
+            RUNTIME.contains("What this predicate must exclude is")
+                && RUNTIME.contains("`Blocked(..)`, `Reserved`, `Faulted`, `Exited` and `Dead`"),
+            "the owner must state its exclusion set in its own words"
+        );
+    }
+
+    /// **`TaskPlacement` distinguishes executing from queued**, which is what makes the
+    /// `Runnable` case decidable at all.
+    #[test]
+    fn placement_separates_executing_from_queued() {
+        for (variant, why) in [
+            ("Nowhere,", "no placement at all"),
+            ("Queued(CpuId),", "waiting for a dispatch"),
+            ("Current(CpuId),", "executing"),
+            ("CurrentAndQueued(CpuId),", "both — an invariant break"),
+        ] {
+            assert!(
+                SCHEDULER.contains(variant),
+                "`TaskPlacement::{variant}` must exist — {why}"
+            );
+        }
+        assert!(
+            SCHEDULER
+                .contains("pub(crate) fn placement_of(&self, tid: ThreadId) -> TaskPlacement {"),
+            "and one owner must answer all four in ONE acquisition"
+        );
+        // Executable: the four verdicts are distinct, so the settlement cannot collapse them.
+        let verdicts = [
+            EnteringFrameAuthority::OwnsEnteringFrame,
+            EnteringFrameAuthority::Forfeited(FrameForfeitReason::CurrentOnAnotherCpu),
+            EnteringFrameAuthority::Forfeited(FrameForfeitReason::SecondPlacement),
+            EnteringFrameAuthority::Forfeited(FrameForfeitReason::QueuedForDispatch),
+            EnteringFrameAuthority::Forfeited(FrameForfeitReason::PlacedNowhere),
+            EnteringFrameAuthority::Forfeited(FrameForfeitReason::IncarnationNotResumable),
+        ];
+        for (i, a) in verdicts.iter().enumerate() {
+            for (j, b) in verdicts.iter().enumerate() {
+                assert_eq!(
+                    i == j,
+                    a == b,
+                    "verdicts must be pairwise distinct: {a:?} vs {b:?}"
+                );
+                assert_eq!(
+                    i == j,
+                    a.marker() == b.marker(),
+                    "and their markers must be too: {a:?} vs {b:?}"
+                );
+            }
+        }
+        let _ = TaskPlacement::Nowhere;
+    }
+
+    // ── the seam is a read ───────────────────────────────────────────────────────────────────
+
+    /// **The frame-authority read writes nothing, promotes nothing, and takes no broad lock.**
+    ///
+    /// The directive's sharpest constraint: a competing winner's task must not be promoted. The
+    /// strongest form of that guarantee is that the seam has no way to write at all.
+    #[test]
+    fn the_frame_authority_seam_writes_nothing_and_opens_no_broad_acquisition() {
+        let code = seam();
         for broad in [".with(|", "with_cpu(", "state.lock()"] {
             assert!(
-                !body.contains(broad),
+                !code.contains(broad),
                 "the seam must not reach the broad acquisition (`{broad}`)"
             );
         }
@@ -172612,30 +172696,92 @@ mod u9pf1_not_running {
             "status =",
             "apply_task_transition",
             "enqueue",
+            "dequeue",
             "dispatch",
-            "= Some(",
             "TaskStatus::Running",
+            "restore_exact_current",
+            "withdraw",
         ] {
             assert!(
-                !body.contains(write),
-                "the seam must not write or dispatch — found `{write}`"
+                !code.contains(write),
+                "the seam must not write, place or promote — found `{write}`"
             );
         }
+        // Two acquisitions, rank 2 then rank 1, and NOT nested: the rank-2 closure has returned
+        // before the rank-1 one is taken. A task(2) -> scheduler(1) nesting would be a rank
+        // inversion.
+        assert_eq!(
+            code.matches("with_task_tcbs_split_mut").count(),
+            0,
+            "the rank-2 read is delegated to the owner, not re-implemented here"
+        );
+        let ident_end = code
+            .find("return A::Forfeited(R::IncarnationNotResumable);")
+            .expect("the identity refusal");
+        let sched_at = code
+            .find("self.with_scheduler_split_mut(")
+            .expect("the rank-1 acquisition");
         assert!(
-            body.contains("classify_current_resumability(observed)"),
-            "and it must delegate the verdict to the ONE pure classifier rather than restating it"
+            ident_end < sched_at,
+            "the rank-2 answer must be complete before the rank-1 acquisition is taken"
         );
     }
 
     // ── the route ────────────────────────────────────────────────────────────────────────────
 
-    /// **`NotRunning` is asked, not assumed — and the two answers settle differently.**
+    /// **The entering incarnation is captured BEFORE the tick, and the settlement authenticates
+    /// against that, never against a re-read.**
+    ///
+    /// A re-read at the refusal would compare a later observation against itself, and could
+    /// authenticate against a replacement task that reused the numeric TID in between.
     #[test]
-    fn not_running_consults_the_owner_and_fails_closed_on_a_terminal_incarnation() {
+    fn the_entering_incarnation_is_captured_before_anything_can_replace_it() {
+        let code = route();
+        let capture = code
+            .find("let entering_tid = shared.current_tid_split_read(cpu)")
+            .expect("the entering tid capture");
+        let asid = code
+            .find("let entering_asid = shared")
+            .expect("the entering asid capture");
+        let tick = code
+            .find("scheduler_tick_split_mut(cpu)")
+            .expect("the tick");
+        let txn = code
+            .find("run_yield_transaction(&mut owners, cpu)")
+            .expect("the transaction");
+        assert!(
+            capture < asid && asid < tick && tick < txn,
+            "capture the incarnation, then tick, then run the transaction — in that order"
+        );
+        // The settlement uses the captured values, not a fresh read.
+        let arm_at = code
+            .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
+            .expect("the NotRunning arm");
+        let arm = &code[arm_at..];
+        assert!(
+            arm.contains(
+                "shared.entering_frame_authority_split_read(cpu, entering_tid, entering_asid)"
+            ),
+            "the settlement must authenticate against the CAPTURED incarnation"
+        );
+        let end = arm.find("Err(decline) => {").unwrap_or(arm.len());
+        for reread in ["current_tid_split_read", "current_tid_authoritative"] {
+            assert!(
+                !arm[..end].contains(reread),
+                "the arm must not re-read `current` (`{reread}`) — that would authenticate \
+                 against whatever is there NOW, which may be a replacement"
+            );
+        }
+    }
+
+    /// **Only `OwnsEnteringFrame` continues. Every forfeit is fail-closed, and the arm has no
+    /// other settlement at all.**
+    #[test]
+    fn every_forfeited_verdict_fails_closed() {
         let code = route();
         let arm_at = code
             .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
-            .expect("`NotRunning` must have its own arm — the catch-all cannot tell the two apart");
+            .expect("`NotRunning` must have its own arm");
         let generic_at = code
             .find("Err(decline) => {")
             .expect("the remaining declines keep their shared arm");
@@ -172645,73 +172791,103 @@ mod u9pf1_not_running {
         );
         let arm = &code[arm_at..generic_at];
         assert!(
-            arm.contains("shared.current_resumability_split_read("),
-            "the arm must ASK the owner rather than infer resumability from the refusal"
+            arm.contains("A::OwnsEnteringFrame => TimerSettlement::ContinueCurrent,"),
+            "the one admitting verdict continues"
         );
         assert!(
-            arm.contains("CurrentResumability::LiveNotRunning => {")
-                && arm.contains("TimerSettlement::ContinueCurrent"),
-            "a live incarnation continues"
+            arm.contains("A::Forfeited(reason) => {") && arm.contains("panic!("),
+            "every forfeit must fail closed"
         );
-        assert!(
-            arm.contains("CurrentResumability::NotResumable => {") && arm.contains("panic!("),
-            "a terminal or missing incarnation must fail closed, not resume"
-        );
-        // The forbidden settlements for the terminal class, checked inside its own region so a
-        // `ContinueCurrent` belonging to the LIVE arm cannot satisfy this.
-        let terminal_at = arm
-            .find("CurrentResumability::NotResumable => {")
-            .expect("the terminal arm");
-        let terminal = &arm[terminal_at..];
+        // The forfeit region reaches NO settlement — not continue, not an advance, not a
+        // promotion.
+        let forfeit_at = arm
+            .find("A::Forfeited(reason) => {")
+            .expect("the forfeit arm");
+        let forfeit = &arm[forfeit_at..];
         for forbidden in [
             "TimerSettlement::ContinueCurrent",
             "TimerSettlement::IdleQueueAdvance",
             "TimerSettlement::QueueAdvanceCommitted",
+            "TimerSettlement::DiagnosticSwitchOwner",
             "TaskStatus::Running",
             "apply_task_transition",
             "RollbackPreemptOutgoing",
+            "enqueue",
         ] {
             assert!(
-                !terminal.contains(forbidden),
-                "a non-resumable incarnation must not reach `{forbidden}` — it must neither be \
-                 resumed nor promoted back into the scheduler"
+                !forfeit.contains(forbidden),
+                "a forfeited frame must not reach `{forbidden}` — it may neither be resumed nor \
+                 put back into the scheduler"
             );
         }
-        // And the class is reported, so a live run names which one it saw.
+        // Exactly one settlement in the whole arm, and it belongs to the admitting verdict.
+        assert_eq!(
+            arm.matches("TimerSettlement::").count(),
+            1,
+            "the arm settles once, and only on `OwnsEnteringFrame`"
+        );
+        // The verdict is reported, so a live run names which of the six it saw.
         assert!(
             code.contains("TIMER_SPLIT_CURRENT_NOT_RUNNING")
-                && code.contains("class={}")
-                && code.contains("resumability.marker()"),
-            "the observed class must be in the marker, not left to be inferred"
+                && code.contains("verdict={}")
+                && code.contains("authority.marker()")
+                && code.contains("asid={}"),
+            "the marker must carry the verdict and the entering incarnation"
         );
     }
 
-    /// **The tid handed to the rank-2 read is the one the rank-1 refusal was about.**
+    /// **The delivered behaviour this replaces was a fatal halt for EVERY status**, and the
+    /// record says so rather than claiming parity.
     ///
-    /// Two independent reads would describe two different observations, and the second could name
-    /// a replacement task that took the numeric TID. The arm reads `current` once and passes that
-    /// value down.
+    /// This is the correction the first draft needed. Base's broad `yield_current` answered
+    /// `NotRunning` with `Err(KernelError::TaskMissing)`; the broad timer arm propagated it with
+    /// `?`; both ISRs treat an `Err(TrapHandleError)` as fatal. So continuing for ANY status —
+    /// including `Runnable` — is a deliberate improvement over base, not parity, and a record
+    /// that calls it parity is wrong.
     #[test]
-    fn the_two_halves_describe_one_observation() {
-        let code = route();
-        let arm_at = code
-            .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
-            .expect("the arm");
-        let arm = &code[arm_at..];
-        let read_at = arm
-            .find("let observed_tid = shared.current_tid_split_read(cpu)")
-            .expect("the single current read");
-        let use_at = arm
-            .find("shared.current_resumability_split_read(observed_tid)")
-            .expect("the resumability read, over that same tid");
-        assert!(read_at < use_at, "the tid must be read before it is used");
-        assert_eq!(
-            arm[..use_at].matches("current_tid_split_read").count(),
-            1,
-            "exactly one `current` read feeds the classification"
+    fn the_replaced_behaviour_is_described_as_an_improvement_not_as_parity() {
+        const EXEC_STATE: &str = include_str!("exec_state.rs");
+        const X86_IDT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        const ARM_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+
+        // Base's answer, from the broad adapter itself.
+        let broad = EXEC_STATE
+            .split("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
+            .nth(1)
+            .and_then(|s| s.split("\n                }").next())
+            .expect("the broad NotRunning arm");
+        assert!(
+            broad.contains("return Err(KernelError::TaskMissing);"),
+            "the broad path answers this refusal with an error, for every status"
+        );
+        // And both ISRs treat that as fatal.
+        assert!(
+            X86_IDT.contains("halt_forever();"),
+            "x86_64 halts on a failed shared trap dispatch"
+        );
+        assert!(
+            ARM_BOOT.contains("YARM_AARCH64_TRAP_HANDLE halting"),
+            "AArch64 halts on the same"
+        );
+        // So the route must NOT describe its continue as preserving that contract.
+        let doc = SPLIT
+            .split("# U9-PAGEFAULT1 §0 — `NotRunning` is asked of the owners, not inferred")
+            .nth(1)
+            .and_then(|s| {
+                s.split("/// What `ContinueCurrent` explicitly is NOT:")
+                    .next()
+            })
+            .expect("the NotRunning derivation");
+        assert!(
+            doc.contains("base halted for **every** status"),
+            "the derivation must state what base actually did"
+        );
+        assert!(
+            doc.contains("deliberate IMPROVEMENT over base") && doc.contains("not a parity claim"),
+            "and must label the change honestly"
         );
     }
-
+    // ── the unreachability argument, derived from the writers ────────────────────────────────
     // ── the unreachability argument, derived from the writers ────────────────────────────────
 
     /// **No production writer moves a task from `Running` to a TERMINAL status on a CPU other

@@ -3289,7 +3289,7 @@ fn diagnostic_owns_switch_path() -> bool {
 /// | `ArchGateOff` (`not_bsp`) | nothing written | a non-bootstrap CPU, which arms no timer on any port — unreachable, and listed for totality |
 /// | `DeferralHeld` | nothing written | a NAMED cell is set and a NAMED drain consumes it — see below |
 /// | `RouteNotAdmitted` | nothing written | no drainer, or a CPU with no cells |
-/// | `NotRunning` | reservation released, no field written | **not settled from the post-state** — the frame's resumability is asked of the rank-2 owner; see below |
+/// | `NotRunning` | reservation released, no field written | **not settled from the post-state at all** — the entering incarnation's frame authority is asked of the exact-incarnation and placement owners; only `Current(this cpu)` continues, every other verdict is fail-closed. See below |
 /// | `ReenqueueRefused` | `current` restored by the primitive, rank-2 transition rolled back through its named inverse | the caller is `Running` and `current` again |
 ///
 /// `NoCurrent` is not in that table because it is not a refusal: it means the CPU is at its
@@ -3321,23 +3321,48 @@ fn diagnostic_owns_switch_path() -> bool {
 /// step (1)'s `scheduler_tick_split_mut` and the `current_tid_authoritative` read that precedes
 /// the gate both validate the CPU first.
 ///
-/// # U9-PAGEFAULT1 §0 — `NotRunning` is asked, not assumed
+/// # U9-PAGEFAULT1 §0 — `NotRunning` is asked of the owners, not inferred
 ///
-/// A pre-mutation refusal proves the WORLD is untouched. It does not prove the FRAME is
-/// resumable, and those are different claims: the CPU is about to `iret`/`eret` into whatever
-/// `current` names. So the route reads that task's status under the rank-2 owner and classifies
-/// it through `classify_current_resumability`:
+/// A pre-mutation refusal proves the WORLD is untouched. It does not prove the FRAME may be
+/// returned through, and those are different predicates: the CPU is about to `iret`/`eret` into
+/// whatever `current` names. **"The TCB exists" and even "the task is live" are not the second
+/// predicate.**
 ///
-/// * `Runnable` / `Blocked(_)` — the incarnation is present and owns this frame. REACHABLE: a
-///   cross-CPU wake writes `Runnable` over whatever it finds, so a task that is `Running` and
-///   `current` here can be made `Runnable` by another CPU without its frame becoming invalid.
-///   `ContinueCurrent`.
-/// * `Faulted` / `Exited` / `Dead` / `Reserved` / no TCB — the incarnation is finished. Resuming
-///   it would run terminated userspace; promoting it would hand the scheduler a competing
-///   winner's corpse. Fail-closed, exactly as the delivered broad path was: its `NotRunning`
-///   answered `Err(KernelError::TaskMissing)`, which every architecture entry treats as a fatal
-///   halt. Argued unreachable in `u9pf1_not_running`, and made loud rather than silent because an
-///   unreachability argument is not a licence to resume.
+/// ## What base did, stated correctly
+///
+/// The delivered broad path answered this refusal with `Err(KernelError::TaskMissing)`, the broad
+/// timer arm propagated it with `?`, and BOTH ISRs treat that as fatal — x86_64
+/// `halt_forever()`, AArch64 a `wfe` loop. So base halted for **every** status, not only the
+/// terminal ones. Continuing for any of them is therefore a deliberate IMPROVEMENT over base, and
+/// is admitted only where the owners prove it. It is not a parity claim, and an earlier draft of
+/// this record that presented it as one was wrong.
+///
+/// ## The three facts, and the one state they admit
+///
+/// `entering_frame_authority_split_read` composes the two owners that already answer this,
+/// against the incarnation captured at step (0b) — before the tick, so a replacement task that
+/// reused the numeric TID cannot be authenticated against:
+///
+/// * `task_incarnation_is_resumable_split_read` — exact `{tid, asid}`, and `Runnable | Running`
+///   only. It excludes `Blocked(..)`, and that exclusion is the one this settlement most needs: a
+///   blocked task's continuation belongs to the route that blocked it, and its waker resumes it
+///   from THERE. Returning through the interrupt frame as well would give one task two live
+///   continuations. It also excludes `Reserved`, `Faulted`, `Exited` and `Dead`.
+/// * `SmpScheduler::placement_of` — the ACTUAL placement, in one rank-1 acquisition. A `Runnable`
+///   task that is `Queued` can be dequeued by another CPU at any moment; `CurrentAndQueued` is a
+///   second placement with the same hazard; `Current(other)` belongs to that CPU.
+/// * that the placement is THIS CPU's.
+///
+/// Only `Current(this cpu)` with a resumable exact incarnation returns `OwnsEnteringFrame`, and
+/// only that settles as `ContinueCurrent`. That state is not invented for this route:
+/// `recv_block_unwind_exact_split` constructs exactly it — rank-2 `Runnable`, rank-1 exact
+/// current-slot restore — calls it `Restored`, and its caller then returns through the entering
+/// frame.
+///
+/// Every `Forfeited` verdict is fail-closed, which is also what base did. Each names its reason,
+/// so a fatal report says which of the five it was rather than "task missing". Argued unreachable
+/// in `u9pf1_not_running` — and made loud rather than silent, because an unreachability argument
+/// is not a licence to resume.
 ///
 /// What `ContinueCurrent` explicitly is NOT: it is not a fabricated success (the switch did not
 /// happen and nothing claims it did), it is not a panic (contention is normal), and it is not a
@@ -3407,6 +3432,21 @@ fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement
         );
         return TimerSettlement::DiagnosticSwitchOwner;
     }
+
+    // ── (0b) THE ENTERING INCARNATION, captured once, before anything is decided ─────────────
+    //
+    // U9-PAGEFAULT1 §0. The frame this trap will return through belongs to whoever was executing
+    // when the interrupt arrived, so the identity that authorizes that return has to be read HERE
+    // — before the tick, before the transaction, before any window in which another CPU could
+    // replace it. Re-reading it at the refusal would compare a later observation against itself
+    // and could authenticate against a replacement task that reused the numeric TID.
+    //
+    // `Asid(0)` is the normalization the exact-incarnation owner itself uses for a task with no
+    // address space, so a kernel-task entry compares equal to what it was entered with.
+    let entering_tid = shared.current_tid_split_read(cpu).unwrap_or(u64::MAX);
+    let entering_asid = shared
+        .task_asid_option_split_read(entering_tid)
+        .unwrap_or(crate::kernel::vm::Asid(0));
 
     // ── (1) THE TICK, and it is the authority ────────────────────────────────────────────────
     //
@@ -3513,51 +3553,58 @@ fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement
         // deferral) and leaves the interrupted task exactly as it found it. `NotRunning` says
         // something about the FRAME this trap is about to return through: `current` names a task
         // that `PreemptOutgoing` would not accept, and "nothing was written" does not establish
-        // that resuming it is safe. `apply_preempt_outgoing_locked` passes `expect_asid: None`, so
-        // the refusal collapses "the TCB is gone" and "the status is not `Running`" into one
-        // answer, and those have opposite settlements.
+        // that returning into it is safe. Those are different predicates.
         //
-        // So the route asks the rank-2 owner what it actually observed, for the SAME tid the
-        // rank-1 read produced, and classifies it through the one pure classifier.
+        // THE DELIVERED BEHAVIOUR THIS REPLACES was a fatal halt for EVERY status, not only the
+        // terminal ones: the broad `yield_current` answered this same refusal with
+        // `Err(KernelError::TaskMissing)`, the broad timer arm propagated it with `?`, and both
+        // ISRs treat that as fatal — x86_64 `halt_forever()`, AArch64 a `wfe` loop. So continuing
+        // here is a deliberate IMPROVEMENT over base, admitted only where it is provable, and not
+        // a parity claim.
+        //
+        // What makes it provable is that the authority is asked of the owners that already answer
+        // it — the exact-incarnation reader and the scheduler's placement reader — against the
+        // incarnation this trap ENTERED on, captured before the transaction ran.
         Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {
-            let observed_tid = shared.current_tid_split_read(cpu).unwrap_or(u64::MAX);
-            let resumability = shared.current_resumability_split_read(observed_tid);
+            use crate::kernel::task_transition::EnteringFrameAuthority as A;
+            let authority =
+                shared.entering_frame_authority_split_read(cpu, entering_tid, entering_asid);
             crate::yarm_log!(
-                "TIMER_SPLIT_CURRENT_NOT_RUNNING cpu={} tick={} tid={} class={} preempt=1 rearm=1 broad_lock=0",
+                "TIMER_SPLIT_CURRENT_NOT_RUNNING cpu={} tick={} tid={} asid={} verdict={} preempt=1 rearm=1 broad_lock=0",
                 cpu.0,
                 tick,
-                observed_tid,
-                resumability.marker()
+                entering_tid,
+                entering_asid.0,
+                authority.marker()
             );
-            match resumability {
-                // The incarnation is PRESENT and owns this frame. A cross-CPU wake writes
-                // `Runnable` over whatever it finds, so this is the reachable class, and it is a
-                // bookkeeping discrepancy rather than an identity one: the same task, the same
-                // address space, the same interrupted instruction. The scheduler's next dispatch
-                // reconciles the status; this route writes nothing.
-                crate::kernel::task_transition::CurrentResumability::LiveNotRunning => {
-                    TimerSettlement::ContinueCurrent
-                }
-                // The incarnation is terminal, reserved, or gone.
+            match authority {
+                // The entering incarnation is STILL this CPU's `current`, queued nowhere, with a
+                // resumable status. Nothing else can dispatch it and nothing else owns a
+                // continuation for it, so the frame this trap entered on is still its frame.
                 //
-                // This is FAIL-CLOSED on purpose, and it preserves the delivered contract rather
-                // than inventing a harsher one: before this package the broad `yield_current`
-                // answered the same refusal with `Err(KernelError::TaskMissing)`, which the broad
-                // timer arm propagated with `?`, and all three architecture entry points treat an
-                // `Err(TrapHandleError)` as a fatal kernel halt. So base halted here too — this
-                // halts with the observed class named instead of with a generic syscall error.
+                // This is not a hypothetical state: `recv_block_unwind_exact_split` constructs
+                // exactly it — rank-2 writes `Runnable`, rank-1 restores the exact current slot —
+                // calls it `Restored`, and its caller then returns through the entering frame.
+                // The same state, admitted through the same owners.
+                A::OwnsEnteringFrame => TimerSettlement::ContinueCurrent,
+                // Everything else. FAIL-CLOSED, which is what base did for all of these too.
                 //
-                // It must not become `ContinueCurrent` (that resumes terminated userspace) and it
-                // must not become a queue advance (the idle-boundary landing is authenticated by
-                // the park publication, which a CPU executing a task has not made, and advancing
-                // without it would abandon this frame at an unanchored depth). Every writer that
-                // moves a task out of `Running` to a terminal status does so on that task's own
-                // CPU inside that task's own trap, and a timer cannot nest inside another trap on
-                // the same CPU — see `u9pf1_not_running` for both halves of that proof.
-                crate::kernel::task_transition::CurrentResumability::NotResumable => {
+                // It must not become `ContinueCurrent`: that would resume a blocked task whose
+                // waker owns a different continuation, or a task another CPU is running, or one
+                // that is queued for dispatch, or a replacement incarnation that reused the TID.
+                // It must not become a queue advance either — the idle-boundary landing is
+                // authenticated by the park publication, which a CPU executing a task has not
+                // made.
+                //
+                // Argued unreachable in `u9pf1_not_running`, and made loud rather than silent
+                // because an unreachability argument is not a licence to resume.
+                A::Forfeited(reason) => {
                     panic!(
-                        "timer: current tid {observed_tid} on cpu {} is not a resumable incarnation",
-                        cpu.0
+                        "timer: cpu {} entered on tid {entering_tid} asid {} which no longer owns \
+                         this frame ({})",
+                        cpu.0,
+                        entering_asid.0,
+                        reason.marker()
                     );
                 }
             }
