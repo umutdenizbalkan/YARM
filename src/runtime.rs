@@ -1300,6 +1300,36 @@ impl SharedKernel {
         })
     }
 
+    /// U9-PAGEFAULT1 §0 — **may this trap return through the frame of `tid`?**
+    ///
+    /// The rank-2 half of the question `current_tid_authoritative` answers at rank 1. The caller
+    /// has already established WHICH task `current` names; this establishes whether that task is
+    /// still an incarnation a trap may resume, by reading its status under the task lock and
+    /// handing it to [`classify_current_resumability`] — the one pure classifier, so the split
+    /// route and any future caller cannot come to disagree about what "resumable" means.
+    ///
+    /// It is a READ: no transition is applied, no status is written, nothing is enqueued, and a
+    /// `NotResumable` answer mutates nothing. In particular it never promotes the observed task
+    /// back to `Running` — a competing winner's terminal task must stay terminal.
+    ///
+    /// One acquisition, rank 2 only. It deliberately does NOT re-read `current`: the TID is the
+    /// caller's, taken from the rank-1 read that produced the refusal being classified, so the two
+    /// halves describe the same observation rather than two independent ones.
+    ///
+    /// [`classify_current_resumability`]: crate::kernel::task_transition::classify_current_resumability
+    pub(crate) fn current_resumability_split_read(
+        &self,
+        tid: u64,
+    ) -> crate::kernel::task_transition::CurrentResumability {
+        let observed = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.status)
+        });
+        crate::kernel::task_transition::classify_current_resumability(observed)
+    }
+
     /// # Validation status
     /// - TRAP_FORBIDDEN / REQUIRES_AUTHORITATIVE_TID — stale at the pre-global-lock
     ///   x86_64 trap seam (Stage 29A proof: returned tid 0 instead of running requester).

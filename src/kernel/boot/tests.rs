@@ -172446,6 +172446,550 @@ mod u9timer1_preempting_timer {
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// U9-PAGEFAULT1 §0 — the two timer settlements whose justification was weaker than their claim.
+//
+// `settle_recognized_timer` maps every remaining `YieldDecline` to `ContinueCurrent`. For four of
+// them that is a statement about the WORLD and the post-state carries it. For two it was not:
+//
+//   * `NotRunning` said "the trap returns through that task's own frame, exactly as if the timer
+//     had done nothing". A pre-mutation refusal proves nothing was written; it does not prove the
+//     frame is resumable, and `current` naming a TERMINAL task is exactly the case where it is
+//     not. The refusal itself cannot tell the two apart, because
+//     `apply_preempt_outgoing_locked` passes `expect_asid: None` and so collapses
+//     `TaskMissing` and `WrongStatus { observed }` into one answer.
+//
+//   * `DeferralHeld` said "some route already owns this CPU's deferral; its drain will run". Two
+//     of its three producers are genuine cells with named drains; the fourth producer is an
+//     out-of-range CPU index, which has no cell and no drain and was being justified as though it
+//     did.
+//
+// These cases hold the repaired versions, and the unreachability argument the fail-closed arm
+// rests on — derived from the writers, not asserted.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod u9pf1_not_running {
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::task_transition::{
+        CurrentResumability, TaskTransition, classify_current_resumability,
+    };
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TRANSITION: &str = include_str!("../task_transition.rs");
+    const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+
+    /// The recognized timer body, CODE only — same slice and same reason as `u9timer1`'s.
+    fn route() -> alloc::string::String {
+        SPLIT
+            .split("fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement {")
+            .nth(1)
+            .and_then(|s| {
+                s.split("\n#[cfg(not(feature = \"hosted-dev\"))]\nfn try_split_timer_into_frame(")
+                    .next()
+            })
+            .expect("the recognized timer body")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // ── the classifier ───────────────────────────────────────────────────────────────────────
+
+    /// **Every status is classified, and the dangerous ones are classified as dangerous.**
+    ///
+    /// Exhaustive over `TaskStatus` by construction: the classifier is a total `match` with no
+    /// wildcard, so a status added to the enum fails to compile rather than defaulting into the
+    /// resumable class. This case pins WHICH side each one lands on, because the compiler cannot.
+    #[test]
+    fn every_task_status_is_classified_and_the_terminal_ones_are_not_resumable() {
+        for (status, expected) in [
+            // Live: the incarnation is present and owns the frame this trap returns through.
+            (TaskStatus::Runnable, CurrentResumability::LiveNotRunning),
+            (TaskStatus::Running, CurrentResumability::LiveNotRunning),
+            (
+                TaskStatus::Blocked(WaitReason::Futex(crate::kernel::vm::VirtAddr(0x1000))),
+                CurrentResumability::LiveNotRunning,
+            ),
+            (
+                TaskStatus::Blocked(WaitReason::Join(crate::kernel::ipc::ThreadId(7))),
+                CurrentResumability::LiveNotRunning,
+            ),
+            // Terminal, or not a live task at all.
+            (TaskStatus::Faulted, CurrentResumability::NotResumable),
+            (TaskStatus::Exited(0), CurrentResumability::NotResumable),
+            (TaskStatus::Exited(9), CurrentResumability::NotResumable),
+            (TaskStatus::Dead, CurrentResumability::NotResumable),
+            (TaskStatus::Reserved, CurrentResumability::NotResumable),
+        ] {
+            assert_eq!(
+                classify_current_resumability(Some(status)),
+                expected,
+                "{status:?} must classify as {expected:?}"
+            );
+        }
+        // A missing TCB is the other half of what `NotRunning` collapses, and it is the least
+        // resumable case of all: there is no incarnation to return to.
+        assert_eq!(
+            classify_current_resumability(None),
+            CurrentResumability::NotResumable,
+            "a TID with no TCB is never resumable"
+        );
+    }
+
+    /// **`Reserved` is not resumable, and that is not an accident of grouping.**
+    ///
+    /// A spawn reservation is deliberately none of the live states — not `Runnable`, so no
+    /// dispatch accepts it; not `Blocked(_)`, so no wake names it. It has no user frame at all.
+    /// Classifying it with the terminal statuses is the fail-closed reading, and is checked
+    /// separately so a future regrouping cannot quietly move it.
+    #[test]
+    fn a_spawn_reservation_has_no_frame_to_resume() {
+        assert_eq!(
+            classify_current_resumability(Some(TaskStatus::Reserved)),
+            CurrentResumability::NotResumable
+        );
+        assert_ne!(
+            classify_current_resumability(Some(TaskStatus::Reserved)),
+            classify_current_resumability(Some(TaskStatus::Runnable)),
+            "a reservation and a runnable task must not settle the same way"
+        );
+    }
+
+    /// The classifier's live class is exactly the complement of what `PreemptOutgoing` accepts
+    /// PLUS what it accepts — i.e. the refusal it classifies can only carry a non-`Running`
+    /// status, and `Running` is included only so the function is total.
+    #[test]
+    fn the_classifier_covers_the_status_preempt_outgoing_accepts() {
+        assert_eq!(
+            TaskTransition::PreemptOutgoing.expected_from(),
+            TaskStatus::Running,
+            "the refusal being classified is exactly `status != Running`"
+        );
+        assert_eq!(
+            classify_current_resumability(Some(TaskStatus::Running)),
+            CurrentResumability::LiveNotRunning,
+            "and `Running` is total-coverage only — its caller cannot produce it"
+        );
+    }
+
+    // ── the read seam ────────────────────────────────────────────────────────────────────────
+
+    /// **The resumability read is a rank-2 READ, and it promotes nothing.**
+    ///
+    /// The directive's sharpest constraint: a competing winner's terminal task must not be put
+    /// back to `Running`. The strongest form of that guarantee is that the seam has no way to
+    /// write at all, which is what this asserts against the seam's own body.
+    #[test]
+    fn the_resumability_seam_writes_nothing_and_takes_one_rank_2_acquisition() {
+        let body = RUNTIME
+            .split("pub(crate) fn current_resumability_split_read(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the resumability seam")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            body.matches("with_task_tcbs_split_mut").count(),
+            1,
+            "one acquisition, in the task domain"
+        );
+        for broad in [".with(|", "with_cpu(", "state.lock()"] {
+            assert!(
+                !body.contains(broad),
+                "the seam must not reach the broad acquisition (`{broad}`)"
+            );
+        }
+        for write in [
+            "status =",
+            "apply_task_transition",
+            "enqueue",
+            "dispatch",
+            "= Some(",
+            "TaskStatus::Running",
+        ] {
+            assert!(
+                !body.contains(write),
+                "the seam must not write or dispatch — found `{write}`"
+            );
+        }
+        assert!(
+            body.contains("classify_current_resumability(observed)"),
+            "and it must delegate the verdict to the ONE pure classifier rather than restating it"
+        );
+    }
+
+    // ── the route ────────────────────────────────────────────────────────────────────────────
+
+    /// **`NotRunning` is asked, not assumed — and the two answers settle differently.**
+    #[test]
+    fn not_running_consults_the_owner_and_fails_closed_on_a_terminal_incarnation() {
+        let code = route();
+        let arm_at = code
+            .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
+            .expect("`NotRunning` must have its own arm — the catch-all cannot tell the two apart");
+        let generic_at = code
+            .find("Err(decline) => {")
+            .expect("the remaining declines keep their shared arm");
+        assert!(
+            arm_at < generic_at,
+            "the specific arm must precede the catch-all, or it can never be reached"
+        );
+        let arm = &code[arm_at..generic_at];
+        assert!(
+            arm.contains("shared.current_resumability_split_read("),
+            "the arm must ASK the owner rather than infer resumability from the refusal"
+        );
+        assert!(
+            arm.contains("CurrentResumability::LiveNotRunning => {")
+                && arm.contains("TimerSettlement::ContinueCurrent"),
+            "a live incarnation continues"
+        );
+        assert!(
+            arm.contains("CurrentResumability::NotResumable => {") && arm.contains("panic!("),
+            "a terminal or missing incarnation must fail closed, not resume"
+        );
+        // The forbidden settlements for the terminal class, checked inside its own region so a
+        // `ContinueCurrent` belonging to the LIVE arm cannot satisfy this.
+        let terminal_at = arm
+            .find("CurrentResumability::NotResumable => {")
+            .expect("the terminal arm");
+        let terminal = &arm[terminal_at..];
+        for forbidden in [
+            "TimerSettlement::ContinueCurrent",
+            "TimerSettlement::IdleQueueAdvance",
+            "TimerSettlement::QueueAdvanceCommitted",
+            "TaskStatus::Running",
+            "apply_task_transition",
+            "RollbackPreemptOutgoing",
+        ] {
+            assert!(
+                !terminal.contains(forbidden),
+                "a non-resumable incarnation must not reach `{forbidden}` — it must neither be \
+                 resumed nor promoted back into the scheduler"
+            );
+        }
+        // And the class is reported, so a live run names which one it saw.
+        assert!(
+            code.contains("TIMER_SPLIT_CURRENT_NOT_RUNNING")
+                && code.contains("class={}")
+                && code.contains("resumability.marker()"),
+            "the observed class must be in the marker, not left to be inferred"
+        );
+    }
+
+    /// **The tid handed to the rank-2 read is the one the rank-1 refusal was about.**
+    ///
+    /// Two independent reads would describe two different observations, and the second could name
+    /// a replacement task that took the numeric TID. The arm reads `current` once and passes that
+    /// value down.
+    #[test]
+    fn the_two_halves_describe_one_observation() {
+        let code = route();
+        let arm_at = code
+            .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
+            .expect("the arm");
+        let arm = &code[arm_at..];
+        let read_at = arm
+            .find("let observed_tid = shared.current_tid_split_read(cpu)")
+            .expect("the single current read");
+        let use_at = arm
+            .find("shared.current_resumability_split_read(observed_tid)")
+            .expect("the resumability read, over that same tid");
+        assert!(read_at < use_at, "the tid must be read before it is used");
+        assert_eq!(
+            arm[..use_at].matches("current_tid_split_read").count(),
+            1,
+            "exactly one `current` read feeds the classification"
+        );
+    }
+
+    // ── the unreachability argument, derived from the writers ────────────────────────────────
+
+    /// **No production writer moves a task from `Running` to a TERMINAL status on a CPU other
+    /// than the task's own.**
+    ///
+    /// This is the first half of why the fail-closed arm is unreachable, and it is checked
+    /// against the writers rather than asserted. There are exactly three production writers of a
+    /// terminal status, and each is constrained:
+    ///
+    /// * `apply_self_exit_writes_locked` — a SELF exit. Its claim
+    ///   (`claim_self_exit_locked`) admits `Running` and nothing else, and runs in the exiting
+    ///   task's own trap on the exiting task's own CPU.
+    /// * `mark_task_dead` — reached only from `join_thread` after the target was observed
+    ///   `Exited(_)`, and from `reap_if_detached` inside the broad `exit_task` (again a self
+    ///   exit). Both targets are already terminal.
+    /// * `reap_claim` — the PM-only reap, which accepts terminal tasks only.
+    ///
+    /// `Faulted` is not in that list because it is applied through `TaskTransition::
+    /// FaultRunningCurrent`, whose `expected_from` is `Running` and whose subject is the CURRENT
+    /// task on the FAULTING CPU — again the task's own CPU.
+    #[test]
+    fn every_terminal_status_writer_is_the_tasks_own_cpu_or_already_terminal() {
+        const EXIT_CLAIM: &str = include_str!("exit_claim.rs");
+        const RESTART_STATE: &str = include_str!("restart_state.rs");
+        const REAP_CLAIM: &str = include_str!("reap_claim.rs");
+        const THREAD_STATE: &str = include_str!("thread_state.rs");
+        const PROCESS: &str = include_str!("../syscall/process.rs");
+
+        // (1) the self-exit writer, and its `Running`-only claim.
+        assert!(
+            EXIT_CLAIM.contains("tcb.status = TaskStatus::Exited(code);"),
+            "the self-exit terminal write must still live in `exit_claim`"
+        );
+        assert!(
+            EXIT_CLAIM.contains("apply_self_exit_writes_locked(tcb, code, token);"),
+            "and be reached through the claim that precedes it"
+        );
+        // The claim's precondition, from CODE rather than from prose: a self-exit is admitted
+        // from `Running` and nothing else, so a task another edge has already finished with
+        // cannot be exited a second time — and a task that IS `Running` is, by definition, the
+        // current task on the CPU executing this very trap.
+        assert!(
+            EXIT_CLAIM.contains(
+                "pub(crate) const fn status_is_self_exitable(status: TaskStatus) -> bool {"
+            ),
+            "the self-exit status predicate must be its own named owner"
+        );
+        let exitable = EXIT_CLAIM
+            .split("pub(crate) const fn status_is_self_exitable(status: TaskStatus) -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the predicate body");
+        assert!(
+            exitable.contains("matches!(status, TaskStatus::Running)"),
+            "and it must admit `Running` alone"
+        );
+        assert!(
+            EXIT_CLAIM.contains("if !status_is_self_exitable(status_before) {")
+                && EXIT_CLAIM.contains("return Err(ExitRefusal::NotRunning);"),
+            "the claim must consult it and refuse before writing anything"
+        );
+        assert_eq!(
+            crate::kernel::boot::exit_claim::status_is_self_exitable(TaskStatus::Running),
+            true,
+            "executable check, not only a source match"
+        );
+        for refused in [
+            TaskStatus::Runnable,
+            TaskStatus::Reserved,
+            TaskStatus::Faulted,
+            TaskStatus::Exited(0),
+            TaskStatus::Dead,
+        ] {
+            assert!(
+                !crate::kernel::boot::exit_claim::status_is_self_exitable(refused),
+                "a self-exit must not claim {refused:?}"
+            );
+        }
+
+        // (2) `mark_task_dead`'s two callers, each on an already-terminal target.
+        let join = THREAD_STATE
+            .split("pub fn join_thread(&mut self, tid: u64)")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub ").next())
+            .expect("join_thread");
+        let reap_at = join
+            .find("self.mark_task_dead(tid)?;")
+            .expect("join's reap of the exited target");
+        let observed_at = join
+            .find("let TaskStatus::Exited(exit_code) = status else {")
+            .expect("join observes the target's status first");
+        assert!(
+            observed_at < reap_at,
+            "join must observe `Exited(_)` BEFORE it marks the target dead — a `Running` target \
+             takes the blocking branch instead"
+        );
+        let detached = THREAD_STATE
+            .split("pub(crate) fn reap_if_detached(&mut self, tid: u64)")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub ").next())
+            .expect("reap_if_detached");
+        assert!(
+            detached.contains("ThreadDetachState::Detached"),
+            "the detached reap is gated on the detach state"
+        );
+        assert!(
+            RESTART_STATE.contains("self.reap_if_detached(tid)?;"),
+            "and its one caller is the broad self-exit"
+        );
+        // The self-exit clears `current` itself, in the same broad acquisition, BEFORE that reap.
+        let exit_body = RESTART_STATE
+            .split("if self.current_tid() == Some(tid) {")
+            .nth(1)
+            .expect("the self-exit's own current-clearing branch");
+        let clear_at = exit_body
+            .find("let _ = self.block_current_cpu();")
+            .expect("it clears `current`");
+        let detached_at = exit_body
+            .find("self.reap_if_detached(tid)?;")
+            .expect("and only then reaps");
+        assert!(
+            clear_at < detached_at,
+            "the exiting task stops being `current` before anything marks it dead"
+        );
+
+        // (3) the PM reap, terminal-only by its own documented contract.
+        assert!(
+            REAP_CLAIM.contains("tcb.status = TaskStatus::Dead;"),
+            "the reap writer"
+        );
+        assert!(
+            PROCESS.contains("terminal Faulted/Exited/Dead tasks are accepted"),
+            "and the PM reap accepts terminal tasks only"
+        );
+        // The reap's own typed refusals carry that contract, and carry a second one this
+        // argument needs: a target that is still some CPU's `current` is refused OUTRIGHT, so
+        // the reap cannot be the writer that produces a terminal-and-current task.
+        for (variant, why) in [
+            (
+                "NonTerminal,",
+                "a live task or a reservation must be refused, not reaped",
+            ),
+            (
+                "StillScheduled,",
+                "and a target that is still current or queued must be refused too",
+            ),
+        ] {
+            assert!(REAP_CLAIM.contains(variant), "{why}");
+        }
+        assert!(
+            REAP_CLAIM.contains(
+                "`Runnable | Running | Blocked(_) | Reserved` — a live task, or a spawn \
+                 reservation that has"
+            ),
+            "the `NonTerminal` refusal must still enumerate exactly the live statuses"
+        );
+        assert!(
+            REAP_CLAIM.contains("live/reserved refuses `NonTerminal`, already-`Dead` refuses"),
+            "and the claim order must classify before it writes"
+        );
+
+        // (4) `Faulted` goes through the transition owner, from `Running`, on the faulting CPU.
+        assert_eq!(
+            TaskTransition::FaultRunningCurrent.expected_from(),
+            TaskStatus::Running
+        );
+        assert_eq!(
+            TaskTransition::FaultRunningCurrent.resulting(),
+            TaskStatus::Faulted
+        );
+    }
+
+    /// **A timer cannot nest inside another trap on the same CPU**, on any of the three ports.
+    ///
+    /// The second half of the argument. Combined with the first, it says: the only agent that can
+    /// make `current` terminal is the task's own CPU inside the task's own trap, and while that
+    /// trap runs no timer can arrive to observe it.
+    #[test]
+    fn a_timer_cannot_nest_inside_another_trap_on_the_same_cpu() {
+        // x86_64 — every IDT entry is an INTERRUPT gate, which clears IF on entry. A trap gate
+        // (0x0F) would leave interrupts enabled and is what this forbids.
+        const X86_IDT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            X86_IDT.contains("const IDT_GATE_INTERRUPT: u8 = 0x0E;"),
+            "the interrupt-gate constant"
+        );
+        assert!(
+            X86_IDT.contains("type_attr: IDT_PRESENT | ((dpl & 0x3) << 5) | IDT_GATE_INTERRUPT,"),
+            "and every installed gate must use it — a trap gate would permit nesting"
+        );
+        assert!(
+            !X86_IDT.contains("IDT_GATE_TRAP"),
+            "no trap-gate spelling may exist at all"
+        );
+
+        // AArch64 — the vector dispatch masks DAIF before it calls into Rust.
+        const ARM_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+        const ARM_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+        assert!(
+            ARM_TRAP.contains(
+                "`yarm_aarch64_vector_dispatch` executes `msr daifset, #0xf` before calling into \
+                 Rust"
+            ),
+            "the documented masking contract"
+        );
+        assert!(
+            ARM_BOOT.contains("msr daifset, #0xf"),
+            "and the instruction that implements it"
+        );
+
+        // All three ports: only the bootstrap CPU ever arms a timer, so the CPU a timer can
+        // arrive on is fixed. Asserted from the arch gate's own reason vocabulary.
+        assert!(
+            YIELD_TXN.contains("\"not_bsp\""),
+            "the non-bootstrap spelling exists, and no timer reaches it"
+        );
+    }
+
+    // ── DeferralHeld names its obligation ────────────────────────────────────────────────────
+
+    /// **Every producer of `DeferralHeld` is named with the drain that consumes it — and the one
+    /// producer that has NO drain is not described as though it had one.**
+    #[test]
+    fn deferral_held_identifies_the_obligation_that_will_actually_drain() {
+        let predicate = YIELD_TXN
+            .split("fn colliding_deferral_pending_for(cpu_idx: usize) -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the collision predicate")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        // The three genuine cells.
+        for cell in [
+            "yield_dispatch_is_deferred(cpu_idx)",
+            "futex_wait_dispatch_is_deferred(cpu_idx)",
+            "riscv_queue_switch_foundation_is_deferred(cpu_idx)",
+        ] {
+            assert!(
+                predicate.contains(cell),
+                "`{cell}` must still be a producer"
+            );
+        }
+        // And the fourth producer, which is not a cell at all.
+        assert!(
+            predicate.contains("if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {"),
+            "the out-of-range arm must still be there — it is the producer the old justification \
+             mis-described"
+        );
+
+        // The route's documentation accounts for all four, and says which has no drain.
+        let doc = SPLIT
+            .split("# U9-PAGEFAULT1 §0 — `DeferralHeld` names its obligation")
+            .nth(1)
+            .and_then(|s| s.split("/// # U9-PAGEFAULT1 §0 — `NotRunning`").next())
+            .expect("the DeferralHeld derivation");
+        for producer in [
+            "yield_dispatch_is_deferred(cpu)",
+            "futex_wait_dispatch_is_deferred(cpu)",
+            "riscv_queue_switch_foundation_is_deferred(cpu)",
+            "cpu_idx >= MAX_CPUS",
+        ] {
+            assert!(
+                doc.contains(producer),
+                "the derivation must name the producer `{producer}`"
+            );
+        }
+        assert!(
+            doc.contains("**nothing**"),
+            "and must say plainly that the out-of-range producer has no drain"
+        );
+        assert!(
+            doc.contains("post-lock Yield drain"),
+            "while the genuine cells name the drain that consumes them"
+        );
+    }
+}
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 // U9-VM-ENTRY1 — the mapping transaction's OWNERSHIP and ROLLBACK contract.
 //

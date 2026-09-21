@@ -316,6 +316,85 @@ pub(crate) fn log_transition_refusal(
     }
 }
 
+/// U9-PAGEFAULT1 §0 — **may this trap return through the frame of the task that is `current`,
+/// given that the task is NOT `Running`?**
+///
+/// # The gap this closes
+///
+/// `run_yield_transaction` refuses with `YieldDecline::NotRunning` when `current` names a task
+/// that `TaskTransition::PreemptOutgoing` will not accept, and the timer route settled every such
+/// refusal as "continue the current task" on the reasoning that the refusal is pre-mutation. That
+/// reasoning is sound about the WORLD and says nothing about the FRAME: a refusal that wrote
+/// nothing still leaves the CPU about to `iret`/`eret` into whatever `current` names.
+///
+/// `NotRunning` is not one condition. `apply_preempt_outgoing_locked` passes `expect_asid: None`,
+/// so the refusal collapses two genuinely different facts:
+///
+/// * **the TCB is gone** (`TransitionRefusal::TaskMissing`), or
+/// * **the status is not `Running`** (`WrongStatus { observed }`) — where `observed` may be a live
+///   status or a terminal one.
+///
+/// Those have opposite answers, which is why this classifier exists rather than a bare boolean.
+///
+/// # The two classes
+///
+/// [`Self::LiveNotRunning`] — `Runnable` or `Blocked(_)`. The incarnation is PRESENT and owns
+/// this frame; what is wrong is bookkeeping, not identity. This is the reachable class: a
+/// cross-CPU wake writes `Runnable` over whatever it finds (see `SharedKernel`'s waker seams),
+/// so a task that is `Running` and `current` on the bootstrap CPU can be made `Runnable` by
+/// another CPU without its frame becoming invalid. Returning through it resumes the same task, in
+/// the same address space, at the instruction the timer interrupted. The scheduler's next
+/// dispatch reconciles the status.
+///
+/// [`Self::NotResumable`] — `Faulted`, `Exited(_)`, `Dead`, `Reserved`, or no TCB at all. The
+/// incarnation this frame belongs to is finished or never started. Returning through it would
+/// resume terminated userspace, and promoting it back to `Running` would hand a competing
+/// winner's corpse to the scheduler. Neither is permitted, which is why the route treats this as
+/// fail-closed rather than as contention.
+///
+/// `Running` cannot reach here — it is exactly the status `PreemptOutgoing` accepts — and is
+/// classified [`Self::LiveNotRunning`] so the function is total over the enum without inventing a
+/// third class for a value its one caller cannot pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentResumability {
+    /// The incarnation is present and live; this trap may return through its frame.
+    LiveNotRunning,
+    /// The incarnation is terminal, reserved, or gone; this trap must NOT return through it.
+    NotResumable,
+}
+
+impl CurrentResumability {
+    /// A stable name for the marker, so a live run reports which class was observed.
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::LiveNotRunning => "live_not_running",
+            Self::NotResumable => "not_resumable",
+        }
+    }
+}
+
+/// Classify the status `current` was observed in. `None` means no TCB holds that TID.
+///
+/// Pure and total over [`TaskStatus`], so the classification can be proven exhaustively without a
+/// kernel: a status added to the enum fails to compile here rather than defaulting into the
+/// resumable class.
+pub(crate) const fn classify_current_resumability(
+    observed: Option<TaskStatus>,
+) -> CurrentResumability {
+    match observed {
+        None => CurrentResumability::NotResumable,
+        Some(status) => match status {
+            TaskStatus::Running | TaskStatus::Runnable | TaskStatus::Blocked(_) => {
+                CurrentResumability::LiveNotRunning
+            }
+            TaskStatus::Reserved
+            | TaskStatus::Faulted
+            | TaskStatus::Exited(_)
+            | TaskStatus::Dead => CurrentResumability::NotResumable,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

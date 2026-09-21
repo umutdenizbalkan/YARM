@@ -19535,3 +19535,94 @@ stays open until those acquisitions are removed**, not until the last family sto
 Known-failing before and after, established by controlled comparison against a worktree at the
 delivered base rather than asserted: the `D6_SWITCH_PROOF=1` and `D6_SWITCH_A=1` core-smoke seals,
 and `qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh`.
+
+## U9-PAGEFAULT1 §1 — the complete PageFault matrix, read from both bridges
+
+Base `f6544a58`. `main` stays `8f30f3b9`.
+
+Derived from the actual decoders and the actual bridge call sites on each architecture, not from
+the shared classifier — which is what makes the first two rows of the decode table a finding
+rather than a restatement.
+
+### Decode: what each port turns into a `TrapEvent::PageFault`
+
+| port | decoder | instruction fetch | load | store |
+|---|---|---|---|---|
+| x86_64 | `arch/x86_64/trap.rs::decode_trap_context` | `PageFault{Execute}` — error-code bit 4 | `PageFault{Read}` | `PageFault{Write}` — error-code bit 1 |
+| AArch64 | `arch/aarch64/trap.rs::decode_trap_context` | `PageFault{Execute}` — `ESR_EC_IABT_LOW`/`_CUR` | `PageFault{Read}` | `PageFault{Write}` — `WnR` |
+| RISC-V | `arch/riscv64/trap.rs::decode_trap_context` | **not decoded** — `scause` 12 falls to `TrapEvent::Unknown` | `PageFault{Read}` — `scause` 13 | `PageFault{Write}` — `scause` 15 |
+
+**RISC-V instruction page faults are not in the PageFault family at all.** `EXC_LOAD_PAGE_FAULT`
+(13) and `EXC_STORE_PAGE_FAULT` (15) are the only two fault codes the port names; 12 is absent, so
+an instruction-fetch fault reaches the `Unknown` arm and is reported as an unrecognized trap. That
+is an evidence gap in the *decode*, upstream of every routing decision below.
+
+x86_64's ordering is correct for the same question: write (bit 1) is tested before execute (bit 4),
+and an instruction-fetch fault has bit 4 set with bit 1 clear, so it reports `Execute`.
+
+### Bridge: which bridge calls a split fault route at all
+
+| bridge | ports | COW route | terminal route |
+|---|---|---|---|
+| `arch/trap_entry.rs` | x86_64, AArch64 | `try_split_cow_page_fault_dispatch` | `try_split_terminal_page_fault_dispatch` |
+| `arch/riscv64/trap.rs` | RISC-V | **none** | **none** |
+
+**The RISC-V bridge has no split PageFault seam.** It decodes the two fault codes above and goes
+straight to `handle_trap_entry_with_fault_bookkeeping_mode` under the broad acquisition, so on that
+port *every* page fault of *every* class takes the terminal broad acquisition. This is not a
+refusal that falls back — there is nothing to refuse.
+
+### Class: `page_fault_route_for(arch, class)`, exhaustively
+
+| arch | class | route | reaches the broad acquisition? |
+|---|---|---|---|
+| x86_64 | `CowCandidate` | `SplitCow` | only via the route's own pre-mutation refusals |
+| x86_64 | `DemandCandidate` | `Broad` | **yes — always** |
+| x86_64 | `TerminallyUnhandled` | `Broad` | **yes — always** |
+| x86_64 | `KernelOrAbsentTask` | `Broad` | **yes — always** |
+| AArch64 | `CowCandidate` | `SplitCow` | only via the route's own refusals |
+| AArch64 | `DemandCandidate` | `Broad` | **yes — always** |
+| AArch64 | `TerminallyUnhandled` | `SplitTerminal` | only via the route's own refusals |
+| AArch64 | `KernelOrAbsentTask` | `Broad` | **yes — always** |
+| RISC-V | every class | never consulted | **yes — no seam exists** |
+
+### Route-local refusals: the fall-throughs inside an admitted class
+
+Both admitted routes are pre-mutation-refusal shaped, so an admitted class still reaches the broad
+arm through any of these. Enumerated from the route bodies:
+
+**COW** (`try_split_cow_page_fault_into_frame`): architecture not x86_64/AArch64; no `FaultInfo`;
+access not `Write`; `classify_page_fault_shared` returns `Err(_)` or `Ok((_, None))`; class not
+`SplitCow`; `facts.mapping_writable` (the already-writable arm, deliberately left broad);
+`!facts.mapping_present`; and the four `CowRecovery::may_fall_back_to_broad()` outcomes —
+`RefusedIdentityChanged`, `RefusedMappingChanged`, `RefusedNoCnode`, `RefusedAllocation`.
+
+**Terminal** (`try_split_terminal_page_fault_into_frame`): `!cfg!(target_arch = "aarch64")`; no
+`FaultInfo` or no frame; `cpu_idx >= MAX_CPUS`; no facts; class not `SplitTerminal`; policy read
+refused; `!snapshot.terminates_task()` (i.e. `NotifyAndContinue`); the four
+`BufferedFaultAdmission` refusals — `WaiterPresent`, `BufferFull`, `EndpointStale`, `NoRoute`;
+`queue_advance_admit_split` refusal; `futex_wait_dispatch_try_defer` unavailable; and a
+pre-publication `commit_buffered_fault_report_shared` refusal.
+
+Past publication the terminal route is fail-closed and returns `Complete(Ok(()))` rather than
+falling back — `TERMINAL_FAULT_SPLIT_FAILED_CLOSED` — which is the FT3 defect's fix and is
+unchanged here.
+
+### Evidence available at base, measured rather than assumed
+
+| profile | page-fault traffic |
+|---|---|
+| x86_64 core, default | none |
+| x86_64 core, `VM_COW=1` | 4 COW faults, **4 `VM_COW_SPLIT_COMMITTED`, 0 `VM_COW_SPLIT_REFUSED`** — the split route services all of them |
+| x86_64 core, `FAULT_DELIVERY=1` | none |
+| AArch64 core, default | none |
+| RISC-V core, default | none |
+
+So the only live page-fault population any current profile produces is x86_64 COW, and it is
+already fully converted. Every other cell in the matrix above is an **evidence gap**: the AArch64
+terminal route's original witness is not in the current default profile, and the demand class has
+never been witnessed on any port.
+
+This is the honest starting point for §2/§3: the classes that still reach the broad acquisition are
+reachable *by construction* but are not exercised by anything that runs today, so admitting them
+requires building the witness as well as the route.
