@@ -20114,3 +20114,236 @@ All three routes are consulted in the broad arm's own order — COW (writes only
 terminal — on both bridges, and each is skipped once an earlier one has handled the fault. So a
 class-A exit from one route lands on the next route rather than on the broad arm, *provided* the
 next route admits it. Where it does not, the exit is class B and appears above.
+
+## U9-PAGEFAULT1 §1c/§1d/§1e — composing the residuals through their canonical owners
+
+§1b counted 10 genuine residuals. This section closes seven of them, and it closes them the way
+the directive asks: not by widening a route's admission, but by finding the outcome the existing
+owner already produces and producing exactly that.
+
+### The mistake the three routes shared
+
+Each route was written around ONE outcome of its family — the private copy, the fresh mapping, the
+publishable terminating report — and treated every other outcome of the same family as "not mine".
+But an owner's other outcomes are still its outcomes. `try_handle_cow_fault` has three endings,
+not one; `try_handle_demand_page_fault` has two; the terminal path has a report step with five
+endings and a policy step with two, which multiply out to ten, not one.
+
+So the residual set was never "faults the broad dispatcher must handle". It was "outcomes nobody
+had written down yet".
+
+### §1c — the COW arm that is not the private copy
+
+`try_handle_cow_fault` re-reads the mapping after confirming the COW mark and splits three ways.
+The route owned the third. The other two are now `CowNonPrivateSettlement`:
+
+| broad arm | fact | split settlement |
+|---|---|---|
+| `clear_cow_page`; `path=already_writable`; `Ok(true)` | `mapping.flags.write` | `MarkCleared` → `PAGE_FAULT_HANDLED_COW`, `Complete(Ok(()))` |
+| `.ok_or(KernelError::UserMemoryFault)?` | no mapping | `NoMapping` → `Complete(Err(Syscall(UserMemoryFault)))` |
+| `is_cow_page` false → `Ok(false)` | mark gone | `Raced` → `NotHandled`, continues down the route order |
+
+The second row is the one worth stating plainly: **a COW-marked page with no mapping is not an
+unhandled fault.** The broad arm leaves `try_handle_cow_fault` through `?`, so the demand attempt
+below it never runs and `PAGE_FAULT_UNHANDLED` is never printed. Settling it as a fallback would
+have been wrong in a way the old fold hid — the broad arm would have re-derived the same facts and
+produced the same error, but only after a broad acquisition that bought nothing.
+
+`Raced` is the honest third: it mutated nothing, and the broad arm's own `Ok(false)` at the same
+point also continues to the next handler rather than erroring. So `NotHandled` here is a family
+filter, not a residual — the demand route is consulted next, exactly as the broad arm consults
+demand next.
+
+### §1d — the demand arm that is not a fresh mapping
+
+`try_handle_demand_page_fault`'s present-mapping branch is a stale-translation repair: no frame,
+no cap, no mapping insert, no bookkeeping. It re-checks that the existing mapping satisfies the
+access and then retires the cached walk — for a write fault by widening any intermediate entry
+that lacks USER|WRITABLE, invalidating the page and reloading the local TLB; for anything else by
+the single-page invalidation alone.
+
+Two properties make this safe to compose and worth composing:
+
+* **It is idempotent.** There is no allocation, so there is no rollback half and no fail-closed
+  outcome. Either it repairs against a mapping that still satisfies the access, or it finds the
+  facts changed and declines having written nothing.
+* **The `!write_satisfied` decline never arrives here.** `evaluate_page_fault_class` admits a
+  present mapping as a `DemandCandidate` only when the access is already satisfied, so the broad
+  arm's "a write fault on a present read-only page is a protection fault" decline is a CLASS
+  decision taken upstream of both owners. The split route cannot receive it.
+
+### §1e — the terminal route's report and policy steps are independent
+
+This is the largest of the three, and the defect was an ordering assumption.
+
+The route read the terminal policy FIRST and declined a non-terminating one, then required a
+buffered-eligible report and declined the other four admissions. The broad arm does the opposite:
+`fault_current_task_with_fault` emits the report and only *then* asks
+`effective_fault_policy_for`, returning `Ok(())` for `NotifyAndContinue`. Report admission and
+policy are two independent decisions, and the route was treating their conjunction as its
+admission criterion.
+
+Separated, the ten combinations settle like this:
+
+| report admission | terminating | settlement |
+|---|---|---|
+| eligible | yes | publish, transition, `QueueAdvanceCommitted` (unchanged) |
+| eligible | no | publish, no transition, `Complete(Ok(()))` |
+| no route | either | `TASK_FAULT_NO_SUPERVISOR_ROUTE`, then the policy branch |
+| endpoint stale | either | `TASK_FAULT_REPORT_ENQUEUE_FAIL reason=missing-endpoint`, then the policy branch |
+| waiter present | either | `NotHandled` |
+| buffer full | either | `NotHandled` |
+
+Three points of care in that table:
+
+1. **The two no-publication endings publish nothing in the broad arm either.** Each is a bare
+   `return` from `emit_fault_report_for_fault` after ONE ungated marker. Handing the whole fault
+   away over a report that was never going to exist is what the old admission check did.
+2. **Marker positions are the emitter's, not a tidied version of them.** Both endings return
+   *before* `TASK_FAULT_REPORT_TARGET`, so no target and no queue-state line is printed for
+   either. That position is precisely what makes them reproducible from a preflight.
+3. **A non-terminating policy reserves nothing.** No queue-advance admission, no deferral, no
+   outgoing capture. Reserving a deferral for a task that is not transitioning would strand the
+   CPU on a reservation no drain would ever consume — the FT3 defect in mirror image.
+
+The full-queue ending was drafted into this table and then taken back out, which is worth
+recording because the reason generalises. The broad emitter does not *predict* a full queue: it
+discovers one inside the enqueue, having already printed `TASK_FAULT_REPORT_TARGET`, the
+queue-state line, `TASK_FAULT_REPORT_SENDER` and `TASK_FAULT_REPORT_ENQUEUE_BEGIN` against a
+generation and a queue depth the preflight does not carry. A split route that printed that prefix
+from a prediction would be reporting an enqueue attempt it never made. Reproducing an owner's
+outcome means reproducing what the owner did, not what it would have concluded.
+
+`NotifyAndContinue` resumes the faulting instruction, which for a terminal fault means it will
+fault again. That is the EXISTING behaviour of this policy in the broad arm, reached by the same
+`return Ok(())`. The owner changed; the policy did not.
+
+### Why two report endings stay
+
+Neither is a different outcome of buffered publication. Both are places where the broad emitter
+does something *mechanically* different, and a split route that reproduced the outcome without the
+mechanism would be lying about what happened.
+
+* **`WaiterPresent`** — the emitter completes the blocked receive directly into the waiter, clears
+  the receiver slot, and drives a receiver wake plan: a writeback into another task's buffers plus
+  a rank-1 scheduler transition, with its own failure ladder. That is a receive-family transaction,
+  not a fault-family one.
+* **`BufferFull`** — a refusal discovered inside the enqueue, four markers deep, as described
+  above.
+
+Both decline having touched nothing.
+
+### The score after §1c/§1d/§1e
+
+| route | §1b residuals | closed here | remaining |
+|---|---|---|---|
+| COW | 3 | 2 (already-writable, absent mapping) | 1 — RISC-V arch gate |
+| demand | 2 | 1 (stale translation) | 1 — the five pre-mutation refusals |
+| terminal | 5 | 3 (`NotifyAndContinue`, no-route, endpoint stale) | 2 — `WaiterPresent`, `BufferFull` |
+| *(terminal, counted separately in §1b)* | *(policy read, queue admit, defer, commit)* | — | 4 pre-mutation refusals |
+
+**6 of 10 closed.** What remains is one architecture gate (§2 builds its witness), two
+publication mechanisms (`WaiterPresent`, `BufferFull`), and the pre-mutation refusal sets — which
+are race and resource-exhaustion branches where the broad arm re-derives the same facts under its
+own lock and reaches the same answer. Those are labelled as what they are: not outcomes nobody
+wrote down, but outcomes where falling back is the correct settlement.
+
+## U9-PAGEFAULT1 §3 — the combined class, taken apart
+
+`PageFaultClass::KernelOrAbsentTask` named four unrelated things at once: a supervisor-mode fault,
+a CPU with no current task, a current task with no address space, and **a user task dereferencing
+a kernel address**. §3's instruction was blunt about the last of these — *"Do not let a userspace
+address choice become a kernel panic through the combined class name"* — and it was right to be.
+
+### The live gap this found first
+
+Before any of that: **the off-lock classifier had no origin test at all.**
+
+§2 added the privilege-origin test to `classify_page_fault_split`, the broad-form evaluator, and
+recorded that as the fix. It was not the fix. The split routes call
+`SharedKernel::classify_page_fault_shared`, they run BEFORE the broad arm on both bridges, and
+that function tested current task, address space and address — never origin. A supervisor-mode
+fault on a user address, with a user task current, satisfies every one of those checks. The COW
+or demand owner would have taken it, minted a frame, installed a translation and returned to the
+KERNEL at the faulting instruction as though a user page had been demanded.
+
+The test is now step (0) of the off-lock form, in the same position and reading the same
+architectural bit as the broad one. Two evaluators that disagree about what a user fault is are
+worse than one evaluator that is wrong, because only one of them is ever audited.
+
+### Four outcomes where there was one
+
+| cause | facts available? | what it is | class |
+|---|---|---|---|
+| supervisor-mode fault | no | a kernel bug | `KernelOrAbsentTask(SupervisorOrigin)` |
+| no current task | no | a dispatch-state bug | `KernelOrAbsentTask(NoCurrentTask)` |
+| task with no ASID | no | a construction bug | `KernelOrAbsentTask(NoAddressSpace)` |
+| user access to a kernel address | **yes** | an ordinary user fault | `UserKernelAddress` |
+
+The fourth row is the one that did not belong. Its `{tid, asid}` coordinate is in hand one line
+above the test that used to discard it, and its settlement in the broad arm is byte-for-byte the
+terminal user-fault settlement: both recovery owners decline, `PAGE_FAULT_UNHANDLED` prints, the
+report is emitted, the task is terminated. **The kernel does not die; the task does.** It routes
+`SplitTerminal` on AArch64 — the port with a terminal owner — and settles there.
+
+The other three share one property, and it is the property that actually unites them: no
+`PageFaultFacts` can be built. There is no incarnation to revalidate against, so no recovery
+owner may run and no fault report can name a victim. That is a real class. "The address had a
+high bit set" was not.
+
+### Why the recovery owners' refusal had to be derived, not inherited
+
+Both owners already refuse a kernel address today, and both refuse it **incidentally**:
+`try_handle_cow_fault` because no kernel page is ever COW-marked, and
+`try_handle_demand_page_fault` because no kernel page is ever inside a demand-backed region. Both
+are true and neither is a rule — they are properties of two data structures that nothing forces to
+stay that way. `evaluate_page_fault_class` now tests the address before either screen, so the
+refusal is a derived property of the class.
+
+### What §3 did NOT change
+
+The three unattributable causes still decline to the broad dispatcher, and that is deliberate:
+
+* **`NoCurrentTask`** — the broad arm reaches `try_handle_demand_page_fault`'s
+  `current_tid().ok_or(KernelError::TaskMissing)?` and the trap returns `Err`, which both ISRs
+  treat as a fatal halt. Reproducible, but nothing is gained by reproducing it off-lock.
+* **`NoAddressSpace`** — the broad arm terminates the task through the ordinary report path.
+* **`SupervisorOrigin`** — and here is a finding, stated plainly rather than acted on. The broad
+  arm has **no origin test**: `handle_trap_event`'s PageFault arm calls the recovery owners
+  directly and never consults either classifier. So a supervisor-mode fault on a *user* address
+  reaching the broad arm today terminates whichever user task happens to be current, for a bug in
+  the kernel. That is wrong, and the fail-closed answer is kernel-fatal — but converting it is a
+  policy change, and this mission's rule is that a policy change needs a measurement first.
+
+`PF1_UNATTRIBUTABLE_FAULT` now names the cause at each route's decline, for exactly that
+measurement. The population is expected to be empty on every profile, and a marker that never
+prints is the evidence that it is. If the live matrix confirms zero supervisor-origin page faults,
+the conversion is safe and fail-closed; until it does, the behaviour stands as it is.
+
+## U9-PAGEFAULT1 §2 — measuring broad arrivals positively
+
+Every claim in §1b, §1c and §1e is a claim about a population: how many page faults still reach
+the broad dispatcher, and which. Until now that population could only be *inferred*, and the
+marker everyone would reach for to count it cannot do the job.
+
+`PAGE_FAULT_ENTRY` is emitted by the broad arm **and by every split route**, deliberately: a
+route that intercepts before the broad arm still owes the marker stream what an observer saw
+before the owner changed. So a count of `PAGE_FAULT_ENTRY` is a count of all page faults, and a
+residual count derived from it is a subtraction between two things neither of which is measured.
+
+`PF1_BROAD_ARRIVAL` prints **only** in the broad arm's PageFault entry. One line per fault that
+actually reached the broad dispatcher, carrying the CPU, the tid, the address, the access and the
+privilege origin — the last because it is the one fact the broad arm still does not test and both
+split classifiers do. With the split routes' own settlement markers, the accounting closes:
+
+| marker | means |
+|---|---|
+| `VM_COW_SPLIT_COMMITTED` / `VM_COW_SPLIT_NONPRIVATE` | the COW family settled it |
+| `PF1_DEMAND_SPLIT_COMMITTED` / `PF1_DEMAND_SPLIT_STALE_REPAIRED` | the demand family settled it |
+| `TERMINAL_FAULT_SPLIT_COMMITTED` / `..._UNPUBLISHED` / `..._NOTIFY_CONTINUE` | the terminal family settled it |
+| `PF1_UNATTRIBUTABLE_FAULT` | no family could attribute it (three named causes) |
+| `PF1_BROAD_ARRIVAL` | **the broad dispatcher took it** |
+
+Every page fault produces exactly one line from the first three groups or one
+`PF1_BROAD_ARRIVAL`, so "how much of this class is still broad" becomes a count rather than an
+argument.

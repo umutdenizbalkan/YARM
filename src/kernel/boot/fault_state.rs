@@ -29,9 +29,58 @@ pub(crate) enum PageFaultClass {
     /// Neither recovery owner would claim it, so existing policy reaches `PAGE_FAULT_UNHANDLED`
     /// and terminal settlement.
     TerminallyUnhandled,
-    /// No current task, no user address space, or a kernel-space address — the boundary current
-    /// policy already treats as the kernel/fallback case.
-    KernelOrAbsentTask,
+    /// U9-PAGEFAULT1 §3 — a USER-mode access to a kernel-space address.
+    ///
+    /// This used to be folded into [`Self::KernelOrAbsentTask`], and the fold was the hazard §3
+    /// names: the two have nothing in common except the word "kernel". A user task dereferencing
+    /// a kernel address is an ORDINARY user fault — the broad arm declines both recovery owners
+    /// (`is_cow_page` is false for it, and `try_handle_demand_page_fault` returns `Ok(false)` at
+    /// its own `page.0 >= KERNEL_SPACE_BASE` test), reaches `PAGE_FAULT_UNHANDLED`, reports the
+    /// fault and terminates the task. The kernel does not die; the task does.
+    ///
+    /// Folding it with a supervisor-mode fault would have let a userspace ADDRESS CHOICE decide
+    /// the kernel's fate. It is a distinct class so the settlement is chosen by who faulted, not
+    /// by which half of the address space they named. Facts ARE available for it — the tid and
+    /// the ASID are both known — so it settles through the existing terminal owner.
+    UserKernelAddress,
+    /// U9-PAGEFAULT1 §3 — a fault this kernel cannot attribute to a running user incarnation:
+    /// a SUPERVISOR-mode fault, an absent current task, or a current task with no address space.
+    ///
+    /// What unites these three — and what `UserKernelAddress` never had in common with them — is
+    /// that no `PageFaultFacts` can be built. There is no `{tid, asid}` coordinate to revalidate
+    /// against, so no recovery owner may run and no fault report can name a victim.
+    ///
+    /// It carries WHICH cause produced it, so the three stop being indistinguishable at the
+    /// point that has to settle them.
+    KernelOrAbsentTask(UnattributableFault),
+}
+
+/// U9-PAGEFAULT1 §3 — WHY a fault could not be attributed to a running user incarnation.
+///
+/// `KernelOrAbsentTask` names one settlement class; this names which of its three causes
+/// produced it. The distinction is not cosmetic: a supervisor-mode fault is a kernel bug, an
+/// absent current task is a dispatch-state bug, and a task without an address space is a
+/// construction bug — and each is reported differently by the fatal path that receives it.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnattributableFault {
+    /// The architectural decoder reported a fault taken in supervisor mode.
+    SupervisorOrigin,
+    /// No task is current on the faulting CPU.
+    NoCurrentTask,
+    /// A task is current but has no address space, so no mapping could ever be resolved for it.
+    NoAddressSpace,
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl UnattributableFault {
+    pub(crate) fn marker(self) -> &'static str {
+        match self {
+            Self::SupervisorOrigin => "supervisor_origin",
+            Self::NoCurrentTask => "no_current_task",
+            Self::NoAddressSpace => "no_address_space",
+        }
+    }
 }
 
 /// U9-PF §1 — the read-only facts a classification rests on, captured once under one VM
@@ -135,6 +184,84 @@ impl CowRecovery {
             | Self::FailedClosedCopy(e)
             | Self::FailedClosedRemap(e) => Some(e),
             _ => None,
+        }
+    }
+}
+
+/// U9-PAGEFAULT1 §1c — the outcome of the COW arm that is NOT the private copy.
+///
+/// `try_handle_cow_fault` has three endings for a page it accepts as COW-marked, and the split
+/// route previously owned only one of them. The other two were folded into a single decline
+/// (`mapping_writable || !mapping_present`) that reached the broad dispatcher — yet they are not
+/// the same outcome at all, and neither of them is `PAGE_FAULT_UNHANDLED`:
+///
+/// * **already writable** — `mapping.flags.write` is set, so the broad arm clears the stale COW
+///   mark, prints `path=already_writable` and returns `Ok(true)`, i.e. `PAGE_FAULT_HANDLED_COW`.
+///   No allocation, no copy, no shootdown.
+/// * **no mapping at all** — the broad arm's `.ok_or(KernelError::UserMemoryFault)?` propagates
+///   out of `try_handle_cow_fault`, through the trap handler's `map_err` chain, and the trap
+///   reports an error. It never reaches the demand attempt and never prints `UNHANDLED`.
+///
+/// Composing them here is what lets the COW family settle its own outcomes instead of handing
+/// two thirds of them away.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CowNonPrivateSettlement {
+    /// The stale COW mark was cleared against a mapping that is present and already writable.
+    /// The faulting instruction retries and the write now succeeds. Mirrors the broad arm's
+    /// `path=already_writable` return exactly: metadata only, nothing allocated.
+    MarkCleared { phys: crate::kernel::vm::PhysAddr },
+    /// The page is COW-marked with no mapping to copy from. The broad arm reports
+    /// `UserMemoryFault` here, so this settles as that error rather than as a fallback.
+    NoMapping,
+    /// Re-read under the lock, the page is no longer what classification saw: the mark is gone,
+    /// or it became the private-copy shape. Nothing was mutated, so the fault continues down the
+    /// route order exactly as the broad arm would continue past `Ok(false)`.
+    Raced,
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl CowNonPrivateSettlement {
+    /// The marker text for this settlement, so no call site invents its own spelling.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::MarkCleared { .. } => "already_writable",
+            Self::NoMapping => "no_mapping",
+            Self::Raced => "raced",
+        }
+    }
+}
+
+/// U9-PAGEFAULT1 §1d — the outcome of the demand arm that is NOT a fresh mapping.
+///
+/// `try_handle_demand_page_fault`'s present-mapping branch is a stale-translation repair, not an
+/// allocation: the software mapping already satisfies the access, so the only thing wrong is the
+/// translation the CPU cached. The broad arm repairs it and returns `Ok(true)`, which reaches its
+/// handled-demand completion marker. The split route used to decline the whole branch.
+///
+/// Note which shapes never arrive here. `evaluate_page_fault_class` admits a present mapping as a
+/// `DemandCandidate` only when the access is already satisfied, so the broad arm's
+/// `!write_satisfied` decline is a CLASS decision taken upstream, not an outcome this settles.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DemandStaleTranslation {
+    /// The cached translation was retired against a mapping that is present and satisfies the
+    /// access. `write` records which repair the broad arm performs for this access: a write fault
+    /// widens the intermediate entries and reloads the whole local TLB, any other fault issues
+    /// the single-page invalidation.
+    Repaired { write: bool },
+    /// Re-read under the lock, the mapping is absent, no longer satisfies the access, or the
+    /// incarnation changed. Nothing was mutated.
+    Raced,
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl DemandStaleTranslation {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Repaired { write: true } => "already_writable_after_flush",
+            Self::Repaired { write: false } => "invalidated",
+            Self::Raced => "raced",
         }
     }
 }
@@ -310,6 +437,20 @@ pub(crate) fn page_fault_addr_is_kernel_space(page: crate::kernel::vm::VirtAddr)
 /// fall-through.
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 pub(crate) fn evaluate_page_fault_class(facts: PageFaultFacts) -> PageFaultClass {
+    // U9-PAGEFAULT1 §3 — the kernel-space ADDRESS screen, and it comes first.
+    //
+    // Both fact-gathering forms already return `UserKernelAddress` before they reach here, so
+    // this is the BACKSTOP rather than the producer — and it has to exist, because without it
+    // the recovery owners' refusal of a kernel address would remain INCIDENTAL:
+    // `try_handle_cow_fault` refuses one only because no kernel page is ever COW-marked, and
+    // `try_handle_demand_page_fault` only because no kernel page is ever inside a demand-backed
+    // region. Both are true today and neither is a rule. Testing the address here makes the
+    // refusal a derived property of the class rather than a coincidence of two data structures,
+    // so a future caller that builds facts some third way still cannot reach a recovery owner
+    // with a kernel address.
+    if page_fault_addr_is_kernel_space(facts.page) {
+        return PageFaultClass::UserKernelAddress;
+    }
     // COW is attempted FIRST and ONLY for writes, mirroring the broad arm.
     if matches!(facts.access, FaultAccess::Write) && facts.cow_marked {
         return PageFaultClass::CowCandidate;
@@ -478,6 +619,14 @@ pub(crate) fn page_fault_route_for(arch: &str, class: PageFaultClass) -> PageFau
         }
         // Any other architecture keeps the unchanged broad path.
         (_, PageFaultClass::DemandCandidate) => PageFaultRoute::Broad,
+        // U9-PAGEFAULT1 §3 — a user access to a kernel address is an ORDINARY user fault and
+        // settles through the terminal owner, on the port that has one.
+        //
+        // Its broad settlement is byte-for-byte the terminal settlement: both recovery owners
+        // decline it, `PAGE_FAULT_UNHANDLED` prints, the report is emitted and the task is
+        // terminated. The class exists to make that arrival REASONED rather than incidental —
+        // and to keep the kernel's own fate out of a userspace address choice.
+        ("aarch64", PageFaultClass::UserKernelAddress) => PageFaultRoute::SplitTerminal,
         // No other architecture/class pair has a witness.
         _ => PageFaultRoute::Broad,
     }
@@ -831,19 +980,54 @@ impl KernelState {
         // the recovery owners, which would mint a frame, replace a mapping and resume the kernel
         // at the faulting instruction as though a user page had been demanded.
         if matches!(fault.origin, crate::kernel::trap::FaultOrigin::Supervisor) {
-            return (PageFaultClass::KernelOrAbsentTask, None);
+            return (
+                PageFaultClass::KernelOrAbsentTask(UnattributableFault::SupervisorOrigin),
+                None,
+            );
         }
-        // The rest of the kernel/fallback boundary is exactly what current policy already treats
-        // as one: an absent current task, an absent user address space, or a kernel-space address.
+        // Two more causes reach the same class, and for the same structural reason: without a
+        // `{tid, asid}` coordinate no facts can be built, so no owner can revalidate and no
+        // report can name a victim.
         let Some(tid) = self.current_tid() else {
-            return (PageFaultClass::KernelOrAbsentTask, None);
+            return (
+                PageFaultClass::KernelOrAbsentTask(UnattributableFault::NoCurrentTask),
+                None,
+            );
         };
         let Some(asid) = self.task_asid(tid) else {
-            return (PageFaultClass::KernelOrAbsentTask, None);
+            return (
+                PageFaultClass::KernelOrAbsentTask(UnattributableFault::NoAddressSpace),
+                None,
+            );
         };
+        // U9-PAGEFAULT1 §3 — the kernel-space ADDRESS test, still decided HERE, before any VM
+        // read, and still costing no rank-5 acquisition. What changed is its ANSWER.
+        //
+        // It used to `return (KernelOrAbsentTask, None)`, which let a user task's choice of
+        // address decide whether the kernel could attribute the fault at all. It can: the tid and
+        // the ASID are both in hand one line above. What the address decides is that NO RECOVERY
+        // OWNER MAY RUN — a class, not an absence of facts.
+        //
+        // The mapping facts are recorded ABSENT rather than looked up, and that is a statement
+        // about this class, not a shortcut: no recovery owner may consult them, and the terminal
+        // owner that settles this class reads only `{tid, asid}`. Looking them up would buy a
+        // rank-5 and a rank-6 acquisition for a fault whose settlement cannot depend on either.
         let page = fault.addr.page_align_down();
         if page_fault_addr_is_kernel_space(page) {
-            return (PageFaultClass::KernelOrAbsentTask, None);
+            return (
+                PageFaultClass::UserKernelAddress,
+                Some(PageFaultFacts {
+                    cpu,
+                    tid,
+                    asid,
+                    page,
+                    access: fault.access,
+                    mapping_present: false,
+                    mapping_writable: false,
+                    cow_marked: false,
+                    demand_region: false,
+                }),
+            );
         }
         let mapping = self.with_user_spaces(|s| s.get(asid).and_then(|a| a.resolve(page)));
         let cow_marked = self.is_cow_page(asid, page);
@@ -1917,6 +2101,25 @@ impl KernelState {
 
         match event {
             TrapEvent::PageFault(fault) => {
+                // U9-PAGEFAULT1 §2 — MEASURE BROAD ARRIVALS POSITIVELY.
+                //
+                // `PAGE_FAULT_ENTRY` cannot do this job. Every split route emits it too, in this
+                // arm's position, precisely so the marker stream stays faithful to what an
+                // observer saw before the owner changed — which means a count of it is a count
+                // of ALL page faults, not of the ones that reached the broad dispatcher.
+                //
+                // This marker prints only here, so the residual population is counted rather
+                // than inferred from the absence of something else. It carries the privilege
+                // origin because that is the one fact the broad arm still does not test and the
+                // split classifiers do.
+                crate::yarm_log!(
+                    "PF1_BROAD_ARRIVAL cpu={} tid={} addr=0x{:x} access={:?} origin={:?} broad_lock=1",
+                    self.current_cpu().0,
+                    self.current_tid().unwrap_or(u64::MAX),
+                    fault.addr.0,
+                    fault.access,
+                    fault.origin
+                );
                 crate::yarm_log!(
                     "PAGE_FAULT_ENTRY tid={} addr=0x{:x} access={:?} rip=0x{:x}",
                     self.current_tid().unwrap_or(u64::MAX),

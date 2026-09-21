@@ -7037,9 +7037,30 @@ impl SharedKernel {
         SharedPageFaultRefusal,
     > {
         use crate::kernel::boot as fs;
+        // (0) U9-PAGEFAULT1 §3 — THE ORIGIN TEST, and it comes first, exactly as it does in the
+        // broad twin `classify_page_fault_split`.
+        //
+        // §2 added the test to the broad form only, and that was not enough — it was worse than
+        // not enough. THESE ROUTES RUN FIRST. A supervisor-mode fault on a user address with a
+        // user task current satisfies every check below it, so an off-lock form without this test
+        // would hand a kernel bug to the COW or demand owner, which would mint a frame, install a
+        // translation and resume the KERNEL at the faulting instruction as though a user page had
+        // been demanded — before the broad form's test was ever consulted.
+        //
+        // The two evaluators must agree about what a user fault is, and they agree here because
+        // this is the same test in the same position reading the same architectural bit.
+        if matches!(fault.origin, crate::kernel::trap::FaultOrigin::Supervisor) {
+            return Ok((
+                fs::PageFaultClass::KernelOrAbsentTask(fs::UnattributableFault::SupervisorOrigin),
+                None,
+            ));
+        }
         // (1) rank 1 — the current task on the EXPLICIT cpu. Never an ambient current read.
         let Some(tid) = self.current_tid_split_read(cpu) else {
-            return Ok((fs::PageFaultClass::KernelOrAbsentTask, None));
+            return Ok((
+                fs::PageFaultClass::KernelOrAbsentTask(fs::UnattributableFault::NoCurrentTask),
+                None,
+            ));
         };
         // (2) rank 2 — identity and the stack top the demand rule needs.
         let Some((asid_opt, user_stack_top)) = self.with_task_tcbs_split_mut(|tcbs| {
@@ -7048,16 +7069,45 @@ impl SharedKernel {
                 .find(|t| t.tid.0 == tid)
                 .map(|t| (t.asid, t.user_stack_top))
         }) else {
-            return Ok((fs::PageFaultClass::KernelOrAbsentTask, None));
+            // The scheduler named a current task the task owner does not have: the same
+            // "no incarnation to attribute this to" state, discovered one rank later.
+            return Ok((
+                fs::PageFaultClass::KernelOrAbsentTask(fs::UnattributableFault::NoCurrentTask),
+                None,
+            ));
         };
         let Some(asid) = asid_opt else {
-            return Ok((fs::PageFaultClass::KernelOrAbsentTask, None));
+            return Ok((
+                fs::PageFaultClass::KernelOrAbsentTask(fs::UnattributableFault::NoAddressSpace),
+                None,
+            ));
         };
         let page = fault.addr.page_align_down();
-        // The kernel boundary is decided BEFORE any VM read, exactly as the broad form decides
-        // it, so a kernel-space fault costs no rank-5 acquisition here either.
+        // U9-PAGEFAULT1 §3 — the kernel boundary, still decided BEFORE any VM read, exactly as
+        // the broad form decides it, so a kernel-space fault still costs no rank-5 acquisition.
+        // What changed is the answer: it used to be `KernelOrAbsentTask` with NO facts, which
+        // let a user task's choice of address decide whether the kernel could attribute the
+        // fault. It can — tid and asid are both in hand — so the class is `UserKernelAddress`
+        // and it carries them.
+        //
+        // The mapping facts are recorded ABSENT rather than looked up, for the reason the broad
+        // form gives at the same point: no recovery owner may consult them for this class, and
+        // the terminal owner that settles it reads only `{tid, asid}`.
         if fs::page_fault_addr_is_kernel_space(page) {
-            return Ok((fs::PageFaultClass::KernelOrAbsentTask, None));
+            return Ok((
+                fs::PageFaultClass::UserKernelAddress,
+                Some(fs::PageFaultFacts {
+                    cpu,
+                    tid,
+                    asid,
+                    page,
+                    access: fault.access,
+                    mapping_present: false,
+                    mapping_writable: false,
+                    cow_marked: false,
+                    demand_region: false,
+                }),
+            ));
         }
         // (3) rank 5 — the mapping.
         let mapping = self.with_vm_user_spaces_split_mut(|spaces| {
@@ -7570,6 +7620,152 @@ impl SharedKernel {
         crate::arch::selected_isa::page_table::invalidate_page(page);
 
         R::Committed { phys }
+    }
+
+    /// U9-PAGEFAULT1 §1c — the COW arm that is NOT the private copy, off the broad lock.
+    ///
+    /// `try_handle_cow_fault` re-reads the mapping after confirming the COW mark and then splits
+    /// three ways. This transaction is the other two thirds of that split, in the broad arm's own
+    /// order and against re-read facts:
+    ///
+    /// 1. rank 6 — the COW mark must still be set. The broad arm's first act is `is_cow_page`,
+    ///    and its `Ok(false)` there means "not my fault to handle", which continues down the
+    ///    handler chain rather than erroring.
+    /// 2. rank 5 — the mapping, re-read. Absent is `UserMemoryFault`, exactly the `ok_or` the
+    ///    broad arm propagates; writable is the `already_writable` arm.
+    /// 3. rank 1/2 — the exact incarnation, so a mark is never cleared on behalf of a task that
+    ///    is no longer the one that faulted.
+    /// 4. rank 6 — the clear itself, through `clear_cow_page_locked`, which is the byte-identical
+    ///    sibling of the broad arm's own `clear_cow_page`.
+    ///
+    /// No frame is allocated, no page is copied and no translation is replaced, so there is
+    /// nothing to roll back and no fail-closed half: every outcome is decided before or by a
+    /// single metadata write.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) fn cow_settle_non_private_copy_split(
+        &self,
+        facts: crate::kernel::boot::PageFaultFacts,
+    ) -> crate::kernel::boot::CowNonPrivateSettlement {
+        use crate::kernel::boot::{CowNonPrivateSettlement as S, KernelState as KS};
+
+        let asid = facts.asid;
+        let page = facts.page;
+
+        // (1) rank 6 — still COW-marked. A cleared mark is the broad arm's `Ok(false)`: not this
+        // family's fault any more, and the route order continues past it.
+        let still_cow = self.with_memory_split_mut(|memory| {
+            memory
+                .cow_pages
+                .get(&asid.0)
+                .is_some_and(|set| set.contains(&page.0))
+        });
+        if !still_cow {
+            return S::Raced;
+        }
+        // (2) rank 5 — the mapping, re-read.
+        let mapping = self.with_vm_user_spaces_split_mut(|spaces| {
+            spaces.get(asid).and_then(|space| space.resolve(page))
+        });
+        let Some(mapping) = mapping else {
+            // The broad arm's `.ok_or(KernelError::UserMemoryFault)?`. It does NOT fall through
+            // to the demand attempt and does NOT print `PAGE_FAULT_UNHANDLED`: the `?` leaves
+            // `try_handle_cow_fault` and the trap reports the error.
+            return S::NoMapping;
+        };
+        if !mapping.flags.write {
+            // It became the private-copy shape under us. That arm allocates and copies, which
+            // this transaction deliberately does not do.
+            return S::Raced;
+        }
+        // (3) rank 1/2 — the exact incarnation that faulted, still current where it faulted.
+        if self.current_tid_split_read(facts.cpu) != Some(facts.tid) {
+            return S::Raced;
+        }
+        if self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == facts.tid)
+                .map(|t| t.asid)
+        }) != Some(Some(asid))
+        {
+            return S::Raced;
+        }
+        // (4) rank 6 — the only mutation, and it is the broad arm's own clear.
+        self.with_memory_split_mut(|memory| KS::clear_cow_page_locked(memory, asid, page));
+        S::MarkCleared { phys: mapping.phys }
+    }
+
+    /// U9-PAGEFAULT1 §1d — the demand arm that is NOT a fresh mapping, off the broad lock.
+    ///
+    /// The broad handler's present-mapping branch repairs a stale translation. Nothing is
+    /// allocated, nothing is mapped and no bookkeeping moves — the software mapping already
+    /// satisfies the access, and only the CPU's cached walk disagrees. The repair is therefore
+    /// idempotent and has no rollback half.
+    ///
+    /// The order is the broad arm's, step for step: re-read the mapping, confirm the access is
+    /// satisfied, and then — for a write fault only — widen any intermediate entry that lacks
+    /// USER/WRITABLE before invalidating and reloading the local TLB. A non-write fault takes the
+    /// single-page invalidation alone. Both halves run under the rank-5 section that owns the
+    /// address space they repair, and neither acquires a second domain lock.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) fn demand_settle_stale_translation_split(
+        &self,
+        facts: crate::kernel::boot::PageFaultFacts,
+    ) -> crate::kernel::boot::DemandStaleTranslation {
+        use crate::kernel::boot::DemandStaleTranslation as S;
+        use crate::kernel::trap::FaultAccess;
+
+        let asid = facts.asid;
+        let page = facts.page;
+        let write = matches!(facts.access, FaultAccess::Write);
+
+        // (1) The demand-region rule, through the ONE owner both classification forms call.
+        if !self.fault_addr_in_demand_backed_region_split_read(facts.tid, page.0) {
+            return S::Raced;
+        }
+        // (2) rank 1/2 — the exact incarnation, still current on the CPU that classified it.
+        if self.current_tid_split_read(facts.cpu) != Some(facts.tid) {
+            return S::Raced;
+        }
+        if self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == facts.tid)
+                .and_then(|t| t.asid)
+        }) != Some(asid)
+        {
+            return S::Raced;
+        }
+        // (3) rank 5 — the mapping must still be present AND still satisfy the access. This is
+        // the broad arm's `write_satisfied` test, re-run against facts read now: a mapping that
+        // lost its write permission is a protection fault, and repairing its translation would
+        // loop on an unchanged read-only entry.
+        let repaired = self.with_vm_user_spaces_split_mut(|spaces| {
+            let Some(mapping) = spaces.get(asid).and_then(|space| space.resolve(page)) else {
+                return false;
+            };
+            if write && !mapping.flags.write {
+                return false;
+            }
+            if write {
+                // The broad arm's two real causes, in its order: an intermediate entry that
+                // lacks USER|WRITABLE denies the write regardless of the leaf, and a stale
+                // local entry that the single-page invalidation missed.
+                let _ = crate::arch::selected_isa::page_table::repair_user_path_intermediates(
+                    asid, page,
+                );
+                crate::arch::selected_isa::page_table::invalidate_page(page);
+                crate::arch::selected_isa::page_table::flush_tlb_local_full();
+            } else {
+                crate::arch::selected_isa::page_table::invalidate_page(page);
+            }
+            true
+        });
+        if repaired {
+            S::Repaired { write }
+        } else {
+            S::Raced
+        }
     }
 
     /// U9-COW1 §3 — `KernelState::resolve_memory_object_phys` bound to an EXACT task rather than

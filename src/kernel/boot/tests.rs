@@ -148765,13 +148765,20 @@ mod u9pf_classification {
     /// THE ROUTING MATRIX, pinned exhaustively for all three ports.
     #[test]
     fn the_routing_matrix_is_exactly_the_witnessed_subset() {
+        use crate::kernel::boot::UnattributableFault;
         use PageFaultClass::*;
         use PageFaultRoute::*;
+        // U9-PAGEFAULT1 §3 split the old combined class. `UserKernelAddress` is its own class
+        // now, and `KernelOrAbsentTask` carries which of three causes produced it — so the
+        // exhaustive sweep must cover all three, not one representative.
         let classes = [
             CowCandidate,
             DemandCandidate,
             TerminallyUnhandled,
-            KernelOrAbsentTask,
+            UserKernelAddress,
+            KernelOrAbsentTask(UnattributableFault::SupervisorOrigin),
+            KernelOrAbsentTask(UnattributableFault::NoCurrentTask),
+            KernelOrAbsentTask(UnattributableFault::NoAddressSpace),
         ];
         for arch in ["x86_64", "aarch64", "riscv64"] {
             for class in classes {
@@ -148784,6 +148791,11 @@ mod u9pf_classification {
                     // died at the first recovered fault for a reason outside COW entirely.
                     ("aarch64", CowCandidate) => SplitCow,
                     ("aarch64", TerminallyUnhandled) => SplitTerminal,
+                    // U9-PAGEFAULT1 §3 — a USER access to a kernel address is an ordinary user
+                    // fault, and its broad settlement is byte-for-byte the terminal one. It
+                    // routes to the same owner on the port that has one; it is NOT a kernel
+                    // fault and must never be settled as one.
+                    ("aarch64", UserKernelAddress) => SplitTerminal,
                     // U9-PAGEFAULT1 §2c/§3: admitted on a witness earned in that increment, on
                     // ALL THREE ports. `VmBrk` growth leaves the pages lazy, so touching inside
                     // the grown window is a demand fault by construction; the witness measured
@@ -149270,6 +149282,7 @@ mod u9ft2_one_evaluator {
     /// classes, still AArch64-terminal and x86_64-COW only.
     #[test]
     fn the_routing_matrix_is_unchanged() {
+        use crate::kernel::boot::UnattributableFault;
         use PageFaultClass::*;
         use PageFaultRoute::*;
         for arch in ["x86_64", "aarch64", "riscv64"] {
@@ -149277,7 +149290,10 @@ mod u9ft2_one_evaluator {
                 CowCandidate,
                 DemandCandidate,
                 TerminallyUnhandled,
-                KernelOrAbsentTask,
+                UserKernelAddress,
+                KernelOrAbsentTask(UnattributableFault::SupervisorOrigin),
+                KernelOrAbsentTask(UnattributableFault::NoCurrentTask),
+                KernelOrAbsentTask(UnattributableFault::NoAddressSpace),
             ] {
                 let want = match (arch, class) {
                     ("x86_64", CowCandidate) => SplitCow,
@@ -149287,6 +149303,11 @@ mod u9ft2_one_evaluator {
                     // died at the first recovered fault for a reason outside COW entirely.
                     ("aarch64", CowCandidate) => SplitCow,
                     ("aarch64", TerminallyUnhandled) => SplitTerminal,
+                    // U9-PAGEFAULT1 §3 — a USER access to a kernel address is an ordinary user
+                    // fault, and its broad settlement is byte-for-byte the terminal one. It
+                    // routes to the same owner on the port that has one; it is NOT a kernel
+                    // fault and must never be settled as one.
+                    ("aarch64", UserKernelAddress) => SplitTerminal,
                     // U9-PAGEFAULT1 §2c/§3 — the demand class, admitted on a witness earned
                     // there and measured on all three ports before the row changed.
                     (_, DemandCandidate) => SplitDemand,
@@ -150237,11 +150258,35 @@ mod u9ft4_route {
     }
 
     /// Waiter delivery, COW and demand all stay broad: the route admits none of them.
+    ///
+    /// U9-PAGEFAULT1 §1e re-derived this. The route now settles three of the five report
+    /// admissions, so "the route admits none of them" is narrower than it was: it is exactly the
+    /// WAITER and BUFFER-FULL admissions that still decline, and both decline because the broad
+    /// emitter reaches them through a different MECHANISM — a direct hand-off, and a refusal
+    /// discovered inside the enqueue — not because the fault is not this family's.
     #[test]
     fn waiter_cow_and_demand_stay_broad() {
         let r = route();
         assert!(r.contains("PageFaultRoute::SplitTerminal"));
-        assert!(r.contains("A::WaiterPresent"), "waiter declines explicitly");
+        assert!(
+            r.contains("A::WaiterPresent { .. } | A::BufferFull { .. } => {"),
+            "the two mechanism declines must share one explicit arm"
+        );
+        // That arm must be the one that declines, having published nothing.
+        let decline_arm = r
+            .split("A::WaiterPresent { .. } | A::BufferFull { .. } => {")
+            .nth(1)
+            .expect("decline arm present");
+        let arm_body = decline_arm
+            .split("A::EndpointStale")
+            .next()
+            .expect("arm is bounded by the next admission arm");
+        assert!(
+            arm_body.contains("\"waiter_present\"")
+                && arm_body.contains("\"buffer_full\"")
+                && arm_body.contains("return D::NotHandled"),
+            "the decline arm names both reasons and declines: {arm_body}"
+        );
         for forbidden in [
             "complete_blocked_recv_for_waiter",
             "try_handle_cow_fault",
@@ -150249,6 +150294,84 @@ mod u9ft4_route {
             "SplitCow",
         ] {
             assert!(!r.contains(forbidden), "must not touch `{forbidden}`");
+        }
+    }
+
+    /// U9-PAGEFAULT1 §1e — the report admission and the terminal policy are INDEPENDENT.
+    ///
+    /// The route used to require their conjunction, which handed eight of the ten combinations
+    /// to the broad dispatcher. This pins the separation itself, not just its symptoms: the
+    /// policy is read into a `terminates` binding rather than used as an early decline, the
+    /// reservations are taken only when it is true, and a non-terminating fault settles as a
+    /// completed trap rather than as a queue advance.
+    #[test]
+    fn report_admission_and_policy_are_independent() {
+        let r = route();
+        assert!(
+            r.contains("let terminates = snapshot.terminates_task();"),
+            "the policy must be BOUND, not used as an early decline"
+        );
+        assert!(
+            !r.contains("if !snapshot.terminates_task() {"),
+            "the notify-and-continue early decline must be gone"
+        );
+        // The reservations are inside the terminating branch, so a non-terminating fault never
+        // strands the CPU on a deferral no drain would consume.
+        let terminating = r
+            .split("if terminates {")
+            .nth(1)
+            .expect("the terminating branch exists");
+        for reserved in ["queue_advance_admit_split", "futex_wait_dispatch_try_defer"] {
+            assert!(
+                terminating.contains(reserved),
+                "`{reserved}` must sit inside the terminating branch"
+            );
+        }
+        assert!(
+            r.contains("if !terminates {") && r.contains("TERMINAL_FAULT_SPLIT_NOTIFY_CONTINUE"),
+            "a non-terminating policy settles here with its own marker"
+        );
+    }
+
+    /// U9-PAGEFAULT1 §1e — the two no-publication report endings settle in-route.
+    ///
+    /// Each is a bare `return` from the broad emitter after ONE marker, so the split route owes
+    /// that same marker and nothing else. Neither may print a target or queue-state line: the
+    /// broad emitter returns before both, and that position is exactly what makes these two
+    /// reproducible from a preflight while the full-queue ending is not.
+    #[test]
+    fn unpublished_report_endings_reproduce_the_emitter() {
+        let r = route();
+        for required in [
+            "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
+            "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason=missing-endpoint",
+            "TERMINAL_FAULT_SPLIT_UNPUBLISHED",
+        ] {
+            assert!(r.contains(required), "the route must emit `{required}`");
+        }
+        // The route must NOT predict a full queue's markers — the emitter prints those only
+        // after an enqueue attempt this route never makes.
+        assert!(
+            !r.contains("EndpointQueueFull"),
+            "a preflight must not report an enqueue attempt that never happened"
+        );
+        // The target/queue-state pair belongs to the PUBLISHABLE branch only. Bound the
+        // unpublished branch by its own marker rather than by brace shape.
+        let unpublished = r
+            .split("A::NoRoute => {")
+            .nth(1)
+            .expect("the unpublished branch exists")
+            .split("TERMINAL_FAULT_SPLIT_UNPUBLISHED")
+            .next()
+            .expect("bounded by its own settlement marker");
+        for forbidden in [
+            "TASK_FAULT_REPORT_TARGET",
+            "TASK_FAULT_REPORT_QUEUE_STATE_BEFORE",
+        ] {
+            assert!(
+                !unpublished.contains(forbidden),
+                "`{forbidden}` must not be printed for an unpublished report"
+            );
         }
     }
 
@@ -150403,7 +150526,20 @@ mod u9rx_blocked_recv {
             !FAULT_SRC.contains("BlockedWaiterPlainDelivery"),
             "the fault waiter arm must not be routed without a live witness"
         );
-        assert!(SPLIT_SRC.contains("A::WaiterPresent { .. } => \"waiter_present\""));
+        // U9-PAGEFAULT1 §1e re-derived the shape this pins. The waiter admission used to be one
+        // arm of a `match` that mapped every non-eligible ending to the same decline; the
+        // no-route and endpoint-stale endings no longer decline at all, so the decline arm now
+        // names only the two MECHANISM refusals. What this guard has always been for is
+        // unchanged: the WAITER ending reaches the broad emitter's direct hand-off, and no split
+        // route performs that hand-off itself.
+        assert!(
+            SPLIT_SRC.contains("\"waiter_present\""),
+            "the split terminal route must still name the waiter decline"
+        );
+        assert!(
+            !SPLIT_SRC.contains("complete_blocked_recv_for_waiter("),
+            "no split route may CALL the blocked-recv completion itself"
+        );
     }
 
     /// U9-RX introduced no new surface.
@@ -162256,9 +162392,22 @@ mod u9a64cow2_split_route {
             "one routing matrix evaluator"
         );
         assert!(
-            route_body().contains("shared.classify_page_fault_shared(cpu, fault)")
+            // U9-PAGEFAULT1 §3 re-derivation: the routes reach the shared classifier through
+            // ONE entry, `classify_for_split`, which exists so an unattributable fault declines
+            // with its cause named instead of vanishing into a wildcard. The property this
+            // guard has always pinned is unchanged and is now checked in both halves — the
+            // route reaches the shared classifier, and the entry it reaches it through calls
+            // exactly that owner.
+            route_body().contains("classify_for_split(shared, cpu, fault,")
                 && route_body().contains("page_fault_route_for(arch, class)"),
             "the route must classify and route through the shared owners"
+        );
+        assert!(
+            SPLIT
+                .split("fn classify_for_split(")
+                .nth(1)
+                .is_some_and(|b| b.contains("shared.classify_page_fault_shared(cpu, fault)")),
+            "the one classification entry must call the shared classifier itself"
         );
         // The arch is derived, never hard-coded, so the row is the only thing that admits a port.
         assert!(
@@ -162293,7 +162442,10 @@ mod u9a64cow2_split_route {
                 "demand is witnessed and routed on {arch}"
             );
             assert_eq!(
-                page_fault_route_for(arch, PageFaultClass::KernelOrAbsentTask),
+                page_fault_route_for(
+                    arch,
+                    PageFaultClass::KernelOrAbsentTask(UnattributableFault::SupervisorOrigin),
+                ),
                 PageFaultRoute::Broad,
                 "a kernel or absent-task fault is never split-routed on {arch}"
             );
@@ -182862,10 +183014,13 @@ mod u9pf1_fault_origin {
         let origin = body
             .find("if matches!(fault.origin, crate::kernel::trap::FaultOrigin::Supervisor) {")
             .expect("the origin test must exist");
+        // U9-PAGEFAULT1 §3: the refusal now NAMES its cause. `KernelOrAbsentTask` used to
+        // stand for four unrelated things at once; the supervisor-origin arm must refuse to the
+        // cause that is actually its own, not to the old combined spelling.
         let refusal = body[origin..]
-            .find("return (PageFaultClass::KernelOrAbsentTask, None);")
+            .find("PageFaultClass::KernelOrAbsentTask(UnattributableFault::SupervisorOrigin)")
             .map(|o| origin + o)
-            .expect("and refuse to the existing kernel boundary");
+            .expect("and refuse as a supervisor-origin fault specifically");
         for later in [
             "let Some(tid) = self.current_tid()",
             "let Some(asid) = self.task_asid(tid)",
@@ -183520,12 +183675,22 @@ mod u9pf1_demand_route {
             PageFaultRoute::Broad,
             "RISC-V COW is a separate class with its own witness, and it is not admitted here"
         );
+        // U9-PAGEFAULT1 §3 — all THREE causes stay broad, not one representative. The class
+        // carries its cause now, and a sweep that pinned only one would miss a row added for
+        // another.
+        use crate::kernel::boot::UnattributableFault;
         for arch in ["x86_64", "aarch64", "riscv64"] {
-            assert_eq!(
-                page_fault_route_for(arch, PageFaultClass::KernelOrAbsentTask),
-                PageFaultRoute::Broad,
-                "a kernel or absent-task fault is never split-routed on {arch}"
-            );
+            for cause in [
+                UnattributableFault::SupervisorOrigin,
+                UnattributableFault::NoCurrentTask,
+                UnattributableFault::NoAddressSpace,
+            ] {
+                assert_eq!(
+                    page_fault_route_for(arch, PageFaultClass::KernelOrAbsentTask(cause)),
+                    PageFaultRoute::Broad,
+                    "an unattributable fault ({cause:?}) is never split-routed on {arch}"
+                );
+            }
         }
     }
 
@@ -183558,6 +183723,356 @@ mod u9pf1_demand_route {
             assert!(
                 src.contains("if pf.is_some() && !cow_recovered && !demand_recovered {"),
                 "{name}: a handled demand fault must not also reach the terminal route"
+            );
+        }
+    }
+}
+
+/// U9-PAGEFAULT1 §1c/§1d/§1e/§3 — OUTCOME coverage, not matrix coverage.
+///
+/// §1b counted 25 `NotHandled` exits across the three split PageFault routes and separated two
+/// things that had been conflated: "this recovery class did not handle it" (a family filter, and
+/// legitimate) from "the broad dispatcher must handle it" (a genuine residual). These guards pin
+/// the residuals that were closed, and — just as importantly — the reasons the remaining ones
+/// stay, so a later increment cannot quietly close one by reproducing an owner's conclusion
+/// without reproducing what the owner did.
+mod u9pf1_outcome_coverage {
+    use crate::kernel::boot::{
+        CowNonPrivateSettlement, DemandStaleTranslation, PageFaultClass, PageFaultRoute,
+        UnattributableFault, page_fault_route_for,
+    };
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    /// A named function's body, comments stripped, so a guard reads CODE and never prose.
+    fn body_of(src: &str, header: &str) -> alloc::string::String {
+        let i = src
+            .find(header)
+            .unwrap_or_else(|| panic!("`{header}` must exist"));
+        let rest = &src[i..];
+        let end = rest[header.len()..]
+            .find("\n    /// ")
+            .or_else(|| rest[header.len()..].find("\n/// "))
+            .map(|o| o + header.len())
+            .unwrap_or(rest.len());
+        rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // ── §1c — the COW arm that is not the private copy ──────────────────────────────────────
+
+    /// `try_handle_cow_fault` has THREE endings for a page it accepts as COW-marked. The split
+    /// route owned one and folded the other two into a single decline. All three are named now.
+    #[test]
+    fn the_cow_non_private_settlement_has_exactly_three_outcomes() {
+        // The two committed-or-errored endings differ, and the difference is the point.
+        assert_ne!(
+            CowNonPrivateSettlement::NoMapping.reason(),
+            CowNonPrivateSettlement::Raced.reason()
+        );
+        assert_eq!(
+            CowNonPrivateSettlement::NoMapping.reason(),
+            "no_mapping",
+            "the absent-mapping ending must be named, not folded"
+        );
+        let txn = body_of(
+            RUNTIME_SRC,
+            "pub(crate) fn cow_settle_non_private_copy_split(",
+        );
+        // It is metadata-only: no allocation, no copy, no mapping install. That is what makes
+        // every outcome decidable before or by a single write, with no rollback half.
+        for forbidden in [
+            "alloc_contiguous",
+            "create_memory_object_slot_locked",
+            "copy_cow_frame_contents_split",
+            "map_page(",
+        ] {
+            assert!(
+                !txn.contains(forbidden),
+                "the already-writable arm must not `{forbidden}` — it is a mark clear"
+            );
+        }
+        // And the one mutation it does perform is the broad arm's own clear.
+        assert!(
+            txn.contains("KS::clear_cow_page_locked(memory, asid, page)"),
+            "the mark clear must go through the owner the broad arm uses"
+        );
+    }
+
+    /// **A COW-marked page with no mapping is NOT an unhandled fault.**
+    ///
+    /// The broad arm leaves `try_handle_cow_fault` through
+    /// `.ok_or(KernelError::UserMemoryFault)?`, so the demand attempt below it never runs and
+    /// `PAGE_FAULT_UNHANDLED` is never printed. Settling it as a fallback would have lost both
+    /// properties; settling it as that error keeps them.
+    #[test]
+    fn the_absent_mapping_ending_settles_as_the_error_the_broad_arm_produces() {
+        assert!(
+            FAULT_SRC.contains(".ok_or(KernelError::UserMemoryFault)?"),
+            "the broad COW arm must still produce this error for an absent mapping"
+        );
+        let settle = body_of(SPLIT_SRC, "fn settle_cow_non_private_copy(");
+        let no_mapping = settle
+            .split("S::NoMapping => {")
+            .nth(1)
+            .and_then(|a| a.split("S::Raced =>").next())
+            .expect("the absent-mapping arm, bounded by the next arm");
+        assert!(
+            no_mapping.contains("KernelError::UserMemoryFault"),
+            "it must carry the broad arm's own error"
+        );
+        assert!(
+            !no_mapping.contains("D::NotHandled"),
+            "it must NOT fall back — the broad arm would re-derive the same error after a \
+             broad acquisition that buys nothing"
+        );
+    }
+
+    /// A race declines BEFORE the entry marker, so `PAGE_FAULT_ENTRY` still prints exactly once
+    /// whichever owner ends up taking the fault.
+    #[test]
+    fn a_raced_cow_settlement_declines_before_the_entry_marker() {
+        let settle = body_of(SPLIT_SRC, "fn settle_cow_non_private_copy(");
+        let raced = settle
+            .find("matches!(settlement, S::Raced)")
+            .expect("the race is tested up front");
+        let entry = settle
+            .find("PAGE_FAULT_ENTRY")
+            .expect("the route owes the entry marker when it settles");
+        assert!(
+            raced < entry,
+            "the race must decline before any marker is printed"
+        );
+    }
+
+    // ── §1d — the demand arm that is not a fresh mapping ────────────────────────────────────
+
+    /// The stale-translation repair allocates nothing, so it has no fail-closed half.
+    #[test]
+    fn the_stale_translation_repair_allocates_nothing() {
+        let txn = body_of(
+            RUNTIME_SRC,
+            "pub(crate) fn demand_settle_stale_translation_split(",
+        );
+        for forbidden in [
+            "alloc_contiguous",
+            "mint_capability_with_memory_ref_split",
+            "note_mapping_inserted_locked",
+            "map_page(",
+        ] {
+            assert!(
+                !txn.contains(forbidden),
+                "the repair must not `{forbidden}` — the mapping already exists"
+            );
+        }
+        // Two outcomes only, and neither is fail-closed.
+        assert_eq!(DemandStaleTranslation::Raced.reason(), "raced");
+        assert_ne!(
+            DemandStaleTranslation::Repaired { write: true }.reason(),
+            DemandStaleTranslation::Repaired { write: false }.reason(),
+            "the write and non-write repairs are different repairs"
+        );
+    }
+
+    /// The write repair performs the broad arm's three steps IN ITS ORDER: widen the
+    /// intermediates, invalidate the page, reload the local TLB. A non-write fault takes the
+    /// single-page invalidation alone.
+    #[test]
+    fn the_write_repair_matches_the_broad_arms_order() {
+        let txn = body_of(
+            RUNTIME_SRC,
+            "pub(crate) fn demand_settle_stale_translation_split(",
+        );
+        let repair = txn
+            .find("repair_user_path_intermediates")
+            .expect("the intermediate widening");
+        let invlpg = txn[repair..]
+            .find("invalidate_page(page)")
+            .map(|o| repair + o)
+            .expect("the page invalidation");
+        let flush = txn[invlpg..]
+            .find("flush_tlb_local_full()")
+            .map(|o| invlpg + o)
+            .expect("the local TLB reload");
+        assert!(
+            repair < invlpg && invlpg < flush,
+            "repair -> invlpg -> flush"
+        );
+        // The permission re-check is the broad arm's `write_satisfied`, re-run under the lock.
+        assert!(
+            txn.contains("if write && !mapping.flags.write {"),
+            "a mapping that lost its write permission is a protection fault, not a stale \
+             translation — repairing it would loop on an unchanged read-only entry"
+        );
+    }
+
+    // ── §1e — report admission and terminal policy are independent ──────────────────────────
+
+    /// The two report endings that STAY do so for a reason about mechanism, and the guard says
+    /// which, so a later increment cannot close one by reproducing a conclusion.
+    #[test]
+    fn the_two_remaining_report_endings_are_mechanism_refusals() {
+        let route = body_of(SPLIT_SRC, "fn try_split_terminal_page_fault_into_frame(");
+        // Buffer-full must NOT be predicted: the broad emitter discovers it inside the enqueue,
+        // four markers deep, against a generation and a queue depth no preflight carries.
+        assert!(
+            !route.contains("EndpointQueueFull"),
+            "a preflight must not report an enqueue attempt that never happened"
+        );
+        // Waiter delivery is a different publication mechanism entirely.
+        assert!(
+            !route.contains("complete_blocked_recv_for_waiter("),
+            "the direct hand-off is receive-family work, not fault-family work"
+        );
+    }
+
+    // ── §3 — the combined class, taken apart ────────────────────────────────────────────────
+
+    /// **Both classifiers test the privilege origin, and both test it FIRST.**
+    ///
+    /// §2 added the test to the broad form only. That was not enough and it was worse than not
+    /// enough: the split routes run BEFORE the broad arm on both bridges and call the OFF-LOCK
+    /// form, which had no origin test at all. A supervisor-mode fault on a user address with a
+    /// user task current satisfies every other check, so a recovery owner would have taken it.
+    #[test]
+    fn both_classifiers_test_the_origin_and_test_it_first() {
+        let shared = body_of(RUNTIME_SRC, "pub(crate) fn classify_page_fault_shared(");
+        let origin = shared
+            .find("matches!(fault.origin, crate::kernel::trap::FaultOrigin::Supervisor)")
+            .expect("THE OFF-LOCK FORM MUST TEST THE ORIGIN — the split routes run first");
+        for later in [
+            "self.current_tid_split_read(cpu)",
+            "page_fault_addr_is_kernel_space(page)",
+            "with_vm_user_spaces_split_mut",
+            "with_memory_split_mut",
+        ] {
+            let at = shared
+                .find(later)
+                .unwrap_or_else(|| panic!("the off-lock form must still perform `{later}`"));
+            assert!(
+                origin < at,
+                "the origin test must precede `{later}` in the OFF-LOCK form too"
+            );
+        }
+    }
+
+    /// A user access to a kernel address is an ordinary USER fault: it has facts, and it settles
+    /// through the terminal owner. It is not, and must never become, a kernel fault.
+    #[test]
+    fn a_user_access_to_a_kernel_address_is_a_user_fault() {
+        assert_eq!(
+            page_fault_route_for("aarch64", PageFaultClass::UserKernelAddress),
+            PageFaultRoute::SplitTerminal,
+            "it settles through the same owner its broad settlement already uses"
+        );
+        // Both forms return it WITH facts — that is the whole distinction from the class it
+        // used to be folded into.
+        for (src, header) in [
+            (RUNTIME_SRC, "pub(crate) fn classify_page_fault_shared("),
+            (FAULT_SRC, "pub(crate) fn classify_page_fault_split("),
+        ] {
+            let b = body_of(src, header);
+            let at = b
+                .find("PageFaultClass::UserKernelAddress,")
+                .expect("the class must be produced here, as a returned value");
+            let tail = &b[at..];
+            assert!(
+                tail.contains("PageFaultFacts {")
+                    && tail.contains("mapping_present: false")
+                    && tail.contains("cow_marked: false")
+                    && tail.contains("demand_region: false"),
+                "`{header}` must return UserKernelAddress WITH facts, and with the mapping                  facts recorded ABSENT rather than looked up"
+            );
+        }
+    }
+
+    /// The kernel boundary still costs no VM acquisition, in either form. §3 changed the
+    /// boundary's ANSWER, not its position.
+    #[test]
+    fn the_kernel_boundary_still_precedes_every_vm_read() {
+        let shared = body_of(RUNTIME_SRC, "pub(crate) fn classify_page_fault_shared(");
+        let b = shared
+            .find("fs::page_fault_addr_is_kernel_space(page)")
+            .expect("the boundary");
+        let vm = shared
+            .find("with_vm_user_spaces_split_mut")
+            .expect("the rank-5 read");
+        assert!(b < vm, "the boundary must precede the rank-5 acquisition");
+    }
+
+    /// The recovery owners' refusal of a kernel address is DERIVED, not inherited.
+    ///
+    /// Both owners refuse one today only incidentally — no kernel page is COW-marked, and none
+    /// is inside a demand-backed region. Both are true and neither is a rule.
+    #[test]
+    fn the_shared_evaluator_screens_the_address_before_either_recovery_screen() {
+        let ev = body_of(FAULT_SRC, "pub(crate) fn evaluate_page_fault_class(");
+        let addr = ev
+            .find("page_fault_addr_is_kernel_space(facts.page)")
+            .expect("the address screen must exist in the shared evaluator");
+        for later in ["facts.cow_marked", "facts.demand_region"] {
+            let at = ev.find(later).unwrap_or_else(|| panic!("`{later}`"));
+            assert!(
+                addr < at,
+                "the address screen must precede `{later}` so the refusal is derived"
+            );
+        }
+    }
+
+    /// The three unattributable causes are distinct, all stay broad, and each declines with its
+    /// cause NAMED — which is what makes the population countable rather than inferred.
+    #[test]
+    fn every_unattributable_cause_is_named_and_stays_broad() {
+        let causes = [
+            UnattributableFault::SupervisorOrigin,
+            UnattributableFault::NoCurrentTask,
+            UnattributableFault::NoAddressSpace,
+        ];
+        for (i, a) in causes.iter().enumerate() {
+            for b in causes.iter().skip(i + 1) {
+                assert_ne!(a.marker(), b.marker(), "each cause has its own marker");
+            }
+            for arch in ["x86_64", "aarch64", "riscv64"] {
+                assert_eq!(
+                    page_fault_route_for(arch, PageFaultClass::KernelOrAbsentTask(*a)),
+                    PageFaultRoute::Broad,
+                    "no facts exist for {a:?}, so no split owner may take it on {arch}"
+                );
+            }
+        }
+        let entry = body_of(SPLIT_SRC, "fn classify_for_split(");
+        assert!(
+            entry.contains("PF1_UNATTRIBUTABLE_FAULT") && entry.contains("cause.marker()"),
+            "the one classification entry must record WHICH cause declined"
+        );
+        assert!(
+            entry.contains("route={}"),
+            "and which route saw it, so three declines for one fault read as three"
+        );
+    }
+
+    /// All three routes classify through the ONE entry, so none of them can bypass the cause
+    /// recording by calling the seam directly.
+    #[test]
+    fn all_three_routes_classify_through_the_one_entry() {
+        for route in [
+            "fn try_split_cow_page_fault_into_frame(",
+            "fn try_split_demand_page_fault_into_frame(",
+            "fn try_split_terminal_page_fault_into_frame(",
+        ] {
+            let b = body_of(SPLIT_SRC, route);
+            assert!(
+                b.contains("classify_for_split(shared, cpu, fault,"),
+                "`{route}` must classify through the one entry"
+            );
+            assert!(
+                !b.contains("shared.classify_page_fault_shared("),
+                "`{route}` must not call the seam directly and skip the cause recording"
             );
         }
     }
