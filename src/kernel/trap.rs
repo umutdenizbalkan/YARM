@@ -6,5 +6,5 @@
 //! kernel/service call sites during the PR-B trap-normalization split.
 
 pub use crate::arch::trap::{
-    FaultAccess, FaultInfo, IrqNumber, Trap, TrapAction, TrapEvent, route_trap,
+    FaultAccess, FaultInfo, FaultOrigin, IrqNumber, Trap, TrapAction, TrapEvent, route_trap,
 };

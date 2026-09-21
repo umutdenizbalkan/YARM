@@ -19693,3 +19693,74 @@ never been witnessed on any port.
 This is the honest starting point for §2/§3: the classes that still reach the broad acquisition are
 reachable *by construction* but are not exercised by anything that runs today, so admitting them
 requires building the witness as well as the route.
+
+## U9-PAGEFAULT1 §2a — the privilege origin, and the RISC-V instruction-fetch ingress
+
+Two of §1's three findings are closed here. The third (no split fault seam on the RISC-V bridge)
+and the matrix widening remain open.
+
+### The origin was missing, and the classifier said so
+
+`KernelState::classify_page_fault_split` carried this note: *"`FaultInfo` carries no
+privilege-origin bit and the broad arm performs no origin test, so none is invented here."* The
+consequence is sharper than the note suggests. With no origin, the kernel/user boundary is
+inferred from the **address** and from whether a user task is **current** — and a supervisor fault
+on a *user-space* address, taken while a user task is current, satisfies both. It would be
+classified as that task's recoverable fault, and the recovery owners would mint a frame, replace a
+mapping and resume **the kernel** at the faulting instruction as though a user page had been
+demanded.
+
+This was live on two ports. AArch64 folded `ESR_EC_IABT_CUR` and `ESR_EC_DABT_CUR` — the
+*current-EL*, i.e. kernel, abort classes — into the same `TrapEvent::PageFault` arm as the EL0
+ones. x86_64 ignored error-code bit 2 entirely.
+
+### Every architecture already reported it
+
+`FaultInfo` now carries `origin: FaultOrigin { User | Supervisor }`, set by each decoder from the
+architectural source. Nothing is inferred or fabricated:
+
+| port | source | user | supervisor |
+|---|---|---|---|
+| x86_64 | `#PF` error-code **bit 2** (U/S) | set | clear |
+| AArch64 | the EC itself | `ESR_EC_IABT_LOW`, `ESR_EC_DABT_LOW` | `ESR_EC_IABT_CUR`, `ESR_EC_DABT_CUR` |
+| RISC-V | the bridge, upstream — see below | every fault that reaches the decoder | never reaches it |
+
+The classifier tests it **first**, before the current-task and address reads, and refuses to the
+existing `KernelOrAbsentTask` boundary rather than inventing a class. Order is the whole point: a
+test placed after those reads would never be reached for exactly the case it exists for.
+
+### RISC-V: `scause` 12 now decodes, and the bridge is why that is safe
+
+`EXC_INSTRUCTION_PAGE_FAULT` (12) was absent from the decoder, so an instruction-fetch fault
+reached `TrapEvent::Unknown` and never entered the PageFault family at all. It now decodes as
+`PageFault{Execute}` at `stval`.
+
+That is safe on privilege grounds **because of the bridge, not because the decoder checks**.
+`riscv_trap_entry`'s `if !from_u` arm admits exactly one supervisor trap — the audited kernel-idle
+boundary timer, gated on `is_accepted_s_mode_timer_trap` requiring an interrupt cause, the
+supervisor-timer code, `sstatus.SPP` set and the boundary latch armed — and sends everything else
+to `riscv_trap_halt("trap_from_s_mode")`. So every exception reaching the decoder was taken from
+U-mode, and RISC-V preserves the user/kernel distinction more strictly than either other port.
+
+`the_riscv_bridge_admits_exactly_one_supervisor_trap_and_halts_on_the_rest` pins that screen, so
+relaxing it fails a guard rather than silently widening this decode.
+
+### What an existing test was hiding
+
+`decode_page_fault_uses_cr2_and_access_bits` asserted on `error_code: 0b10` — bit 1 set, bit 2
+clear. That is a **supervisor** write fault, and the test could not say so. It now does, and
+`decode_page_fault_reports_the_privilege_origin_from_error_code_bit_2` checks each access class at
+both origins, so the origin cannot be inferred from the access nor the access perturbed by the
+origin.
+
+### Qualification at this checkpoint
+
+Hosted **5680 passed / 0 failed / 2 ignored**, single-threaded. Three freestanding builds clean.
+`broad_lock_census_guard` 7/7 — `with_cpu=2`, `with_broad=0`, raw wrapper bodies 3, unchanged.
+
+### Still open
+
+The RISC-V bridge still calls no split fault route, so that port's faults all take the broad
+acquisition. `page_fault_route_for` is unchanged, so x86_64 terminal, RISC-V COW/terminal and
+demand on every port remain broad. No new class has been admitted, and no live fault evidence has
+been produced beyond the existing x86_64 COW population.

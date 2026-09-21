@@ -9664,7 +9664,7 @@ impl SharedKernel {
     ///    `validate_online_cpu` predicate, `scheduler.current_cpu` left untouched on refusal,
     ///    bound unconditionally on success. No second binding implementation is introduced.
     /// 2. **rank 8** — the existing `record_fault_split_mut`, recording the identical
-    ///    `FaultInfo { addr: VirtAddr(addr as u64), access: FaultAccess::Write }`.
+    ///    `FaultInfo::user(VirtAddr(addr as u64), FaultAccess::Write)`.
     /// 3. **no lock held** — `frame.set_err(SyscallError::PageFault.code())`.
     ///
     /// The record precedes the frame error, exactly as `record_user_fault` ordered them.
@@ -9711,10 +9711,8 @@ impl SharedKernel {
         // (1) rank 1 — the CPU authentication and binding `with_cpu` performed on entry.
         self.bind_current_cpu_split(cpu)?;
         // (2) rank 8 — the fault record, identical to `record_user_fault`'s.
-        self.record_fault_split_mut(FaultInfo {
-            addr: VirtAddr(addr as u64),
-            access,
-        });
+        // U9-PAGEFAULT1 §2: the split twin of `record_user_fault`, same origin by construction.
+        self.record_fault_split_mut(FaultInfo::user(VirtAddr(addr as u64), access));
         // (3) no lock held — the frame error, after the record, as `record_user_fault` ordered.
         frame.set_err(SyscallError::PageFault.code());
         Ok(())
@@ -17672,10 +17670,7 @@ mod tests {
         use crate::kernel::vm::VirtAddr;
 
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
-        let fault = FaultInfo {
-            addr: VirtAddr(0xdead_beef),
-            access: FaultAccess::Write,
-        };
+        let fault = FaultInfo::user(VirtAddr(0xdead_beef), FaultAccess::Write);
         let mut frame = TrapFrame::new(11, [1, 2, 3, 4, 5, 6]);
         frame.set_saved_pc(0x4000);
         frame.set_saved_sp(0x8000);
@@ -17860,10 +17855,7 @@ mod tests {
         assert_eq!(kernel.last_fault_split_read(), None);
         assert_eq!(kernel.last_fault_frame_split_read(), None);
 
-        let fault = FaultInfo {
-            addr: VirtAddr(0xDEAD_0000),
-            access: FaultAccess::Write,
-        };
+        let fault = FaultInfo::user(VirtAddr(0xDEAD_0000), FaultAccess::Write);
         kernel.record_fault_split_mut(fault);
 
         // Split-read must match the global-lock read.

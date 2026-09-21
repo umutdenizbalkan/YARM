@@ -596,9 +596,21 @@ pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
             } else {
                 FaultAccess::Read
             };
+            // U9-PAGEFAULT1 §2 — the U/S bit, from the architectural source.
+            //
+            // `#PF` error-code bit 2: set when the access originated at CPL 3, clear when it
+            // originated in the kernel. Before this the origin was not reported at all, so a
+            // supervisor fault on a user-space address — a bad kernel access to a user pointer —
+            // reached the classifier indistinguishable from the faulting task's own fault.
+            let origin = if (context.error_code & (1 << 2)) != 0 {
+                crate::kernel::trap::FaultOrigin::User
+            } else {
+                crate::kernel::trap::FaultOrigin::Supervisor
+            };
             TrapEvent::PageFault(FaultInfo {
                 addr: VirtAddr(context.fault_addr),
                 access,
+                origin,
             })
         }
         v if (VEC_EXTERNAL_BASE..VEC_EXTERNAL_LIMIT).contains(&v) => {
@@ -1032,6 +1044,10 @@ mod tests {
 
     #[test]
     fn decode_page_fault_uses_cr2_and_access_bits() {
+        // U9-PAGEFAULT1 §2: this case's `error_code` has bit 1 (write) set and bit 2 (U/S)
+        // CLEAR, which is a SUPERVISOR write fault. Before the origin bit was decoded the
+        // distinction was invisible here and downstream, so a kernel fault on a user address
+        // reached the user-fault classifier.
         let ev = decode_trap_context(X86TrapContext {
             vector: VEC_PAGE_FAULT,
             error_code: 0b10,
@@ -1040,11 +1056,46 @@ mod tests {
         assert_eq!(ev.trap(), Trap::PageFault);
         assert_eq!(
             ev.fault(),
-            Some(FaultInfo {
-                addr: VirtAddr(0xFACE_1000),
-                access: FaultAccess::Write,
-            })
+            Some(FaultInfo::supervisor(
+                VirtAddr(0xFACE_1000),
+                FaultAccess::Write
+            ))
         );
+    }
+
+    /// U9-PAGEFAULT1 §2 — the U/S bit is read, and it is bit 2.
+    ///
+    /// Each access class is checked at BOTH origins, because the origin must not be inferred from
+    /// the access and the access must not be perturbed by the origin.
+    #[test]
+    fn decode_page_fault_reports_the_privilege_origin_from_error_code_bit_2() {
+        const US: u64 = 1 << 2;
+        for (bits, access) in [
+            (0u64, FaultAccess::Read),
+            (0b10, FaultAccess::Write),
+            (1 << 4, FaultAccess::Execute),
+        ] {
+            let kernel = decode_trap_context(X86TrapContext {
+                vector: VEC_PAGE_FAULT,
+                error_code: bits,
+                fault_addr: 0x1000,
+            });
+            assert_eq!(
+                kernel.fault(),
+                Some(FaultInfo::supervisor(VirtAddr(0x1000), access)),
+                "U/S clear is a kernel fault, whatever the access"
+            );
+            let user = decode_trap_context(X86TrapContext {
+                vector: VEC_PAGE_FAULT,
+                error_code: bits | US,
+                fault_addr: 0x1000,
+            });
+            assert_eq!(
+                user.fault(),
+                Some(FaultInfo::user(VirtAddr(0x1000), access)),
+                "U/S set is a user fault, whatever the access"
+            );
+        }
     }
 
     #[test]

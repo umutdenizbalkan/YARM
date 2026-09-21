@@ -16,10 +16,67 @@ pub enum FaultAccess {
     Execute,
 }
 
+/// U9-PAGEFAULT1 §2 — **which privilege level was executing when the fault was taken.**
+///
+/// The fact `FaultInfo` was missing, and whose absence
+/// `KernelState::classify_page_fault_split` recorded in its own words: *"`FaultInfo` carries no
+/// privilege-origin bit and the broad arm performs no origin test, so none is invented here."*
+///
+/// Without it the kernel/user boundary is inferred from the ADDRESS and from whether a user task
+/// is current — neither of which is the question. A supervisor-mode fault on a *user-space*
+/// address, taken while a user task happens to be current, satisfies both and would be classified
+/// as that task's recoverable fault. It is not: it is a kernel bug, and the recovery owners would
+/// mint a frame, replace a mapping and resume the kernel at the faulting instruction as though a
+/// user page had been demanded.
+///
+/// Every architecture already reports this; nothing here is inferred or fabricated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultOrigin {
+    /// Taken while executing at the user privilege level — x86_64 ring 3, AArch64 EL0, RISC-V
+    /// U-mode. The only origin a recovery or terminal-fault transaction may act on.
+    User,
+    /// Taken while executing in the kernel. Never recoverable as a user fault, whatever address
+    /// it names and whatever task is current.
+    Supervisor,
+}
+
+impl FaultOrigin {
+    /// A stable name for the marker.
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Supervisor => "supervisor",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FaultInfo {
     pub addr: VirtAddr,
     pub access: FaultAccess,
+    /// See [`FaultOrigin`]. Set by the architecture decoder from the architectural source — it is
+    /// never derived from the address or from the current task.
+    pub origin: FaultOrigin,
+}
+
+impl FaultInfo {
+    /// A fault taken from user mode.
+    pub const fn user(addr: VirtAddr, access: FaultAccess) -> Self {
+        Self {
+            addr,
+            access,
+            origin: FaultOrigin::User,
+        }
+    }
+
+    /// A fault taken from kernel mode.
+    pub const fn supervisor(addr: VirtAddr, access: FaultAccess) -> Self {
+        Self {
+            addr,
+            access,
+            origin: FaultOrigin::Supervisor,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -713,10 +713,24 @@ impl KernelState {
         cpu: crate::kernel::scheduler::CpuId,
         fault: FaultInfo,
     ) -> (PageFaultClass, Option<PageFaultFacts>) {
-        // The kernel/fallback boundary is exactly what current policy already treats as one:
-        // an absent current task, an absent user address space, or a kernel-space address.
-        // `FaultInfo` carries no privilege-origin bit and the broad arm performs no origin
-        // test, so none is invented here.
+        // U9-PAGEFAULT1 §2 — THE ORIGIN TEST, and it comes first.
+        //
+        // This function used to record that "`FaultInfo` carries no privilege-origin bit and the
+        // broad arm performs no origin test, so none is invented here". The bit exists now, set
+        // by each decoder from the architectural source — x86_64 `#PF` error-code bit 2, AArch64
+        // `ESR_EC_*_LOW` versus `_CUR`, RISC-V from a bridge that admits no supervisor fault at
+        // all — so the test is no longer an invention.
+        //
+        // It precedes the current-task and address reads DELIBERATELY. Those two answer "is there
+        // a user task and is this a user address", and a kernel fault on a user address with a
+        // user task current satisfies both. Classifying it from them would hand a kernel bug to
+        // the recovery owners, which would mint a frame, replace a mapping and resume the kernel
+        // at the faulting instruction as though a user page had been demanded.
+        if matches!(fault.origin, crate::kernel::trap::FaultOrigin::Supervisor) {
+            return (PageFaultClass::KernelOrAbsentTask, None);
+        }
+        // The rest of the kernel/fallback boundary is exactly what current policy already treats
+        // as one: an absent current task, an absent user address space, or a kernel-space address.
         let Some(tid) = self.current_tid() else {
             return (PageFaultClass::KernelOrAbsentTask, None);
         };
@@ -1334,10 +1348,11 @@ impl KernelState {
             self.current_tid().unwrap_or(u64::MAX),
             pc.0
         );
-        self.fault_current_task_for_fault(crate::kernel::trap::FaultInfo {
-            addr: pc,
-            access: crate::kernel::trap::FaultAccess::Execute,
-        })
+        // U9-PAGEFAULT1 §2: a USER instruction the kernel refused to emulate, at a user PC.
+        self.fault_current_task_for_fault(crate::kernel::trap::FaultInfo::user(
+            pc,
+            crate::kernel::trap::FaultAccess::Execute,
+        ))
     }
 
     #[cfg(test)]

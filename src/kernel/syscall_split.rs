@@ -7292,10 +7292,11 @@ fn try_split_recv_shared_v3_into_frame(
         Ok(V3Delivery::PayloadFault { user_ptr }) => {
             // §58 semantics, unchanged: the message IS consumed, a user fault is recorded, and
             // the syscall returns Ok without a result lane.
-            shared.record_fault_split_mut(crate::kernel::trap::FaultInfo {
-                addr: crate::kernel::vm::VirtAddr(user_ptr as u64),
-                access: crate::kernel::trap::FaultAccess::Write,
-            });
+            // U9-PAGEFAULT1 §2: the receiver's own buffer pointer, faulted on its behalf.
+            shared.record_fault_split_mut(crate::kernel::trap::FaultInfo::user(
+                crate::kernel::vm::VirtAddr(user_ptr as u64),
+                crate::kernel::trap::FaultAccess::Write,
+            ));
             frame.set_err(SyscallError::PageFault.code());
             Ok(())
         }

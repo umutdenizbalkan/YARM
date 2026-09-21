@@ -28,10 +28,9 @@ pub(super) fn record_user_fault(
     addr: usize,
     access: FaultAccess,
 ) {
-    kernel.record_fault(FaultInfo {
-        addr: VirtAddr(addr as u64),
-        access,
-    });
+    // U9-PAGEFAULT1 §2: this owner's NAME is the origin — it records a fault against the
+    // CURRENT USER TASK's address, reached from a syscall that task made.
+    kernel.record_fault(FaultInfo::user(VirtAddr(addr as u64), access));
     frame.set_err(SyscallError::PageFault.code());
 }
 

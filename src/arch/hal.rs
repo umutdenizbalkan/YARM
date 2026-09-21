@@ -172,10 +172,10 @@ mod tests {
             if context.scause == 8 {
                 TrapEvent::Syscall
             } else {
-                TrapEvent::PageFault(FaultInfo {
-                    addr: VirtAddr(context.stval as u64),
-                    access: FaultAccess::Write,
-                })
+                TrapEvent::PageFault(FaultInfo::user(
+                    VirtAddr(context.stval as u64),
+                    FaultAccess::Write,
+                ))
             }
         }
     }
@@ -217,10 +217,10 @@ mod tests {
             if context.vector == 0x80 {
                 TrapEvent::Syscall
             } else {
-                TrapEvent::PageFault(FaultInfo {
-                    addr: VirtAddr(context.fault_addr as u64),
-                    access: FaultAccess::Read,
-                })
+                TrapEvent::PageFault(FaultInfo::user(
+                    VirtAddr(context.fault_addr as u64),
+                    FaultAccess::Read,
+                ))
             }
         }
     }
@@ -262,10 +262,7 @@ mod tests {
             if context.esr == 0x15 {
                 TrapEvent::Syscall
             } else {
-                TrapEvent::PageFault(FaultInfo {
-                    addr: VirtAddr(context.far),
-                    access: FaultAccess::Read,
-                })
+                TrapEvent::PageFault(FaultInfo::user(VirtAddr(context.far), FaultAccess::Read))
             }
         }
     }
@@ -303,10 +300,7 @@ mod tests {
         });
         assert_eq!(
             trap,
-            TrapEvent::PageFault(FaultInfo {
-                addr: VirtAddr(0xDEAD_0000),
-                access: FaultAccess::Read,
-            })
+            TrapEvent::PageFault(FaultInfo::user(VirtAddr(0xDEAD_0000), FaultAccess::Read))
         );
         assert_eq!(hal.last_asid, Some((CpuId(1), Asid(7))));
         assert_eq!(hal.last_irq, Some((CpuId(1), 33)));
@@ -328,10 +322,7 @@ mod tests {
         });
         assert_eq!(
             trap,
-            TrapEvent::PageFault(FaultInfo {
-                addr: VirtAddr(0xABCD_1000),
-                access: FaultAccess::Read,
-            })
+            TrapEvent::PageFault(FaultInfo::user(VirtAddr(0xABCD_1000), FaultAccess::Read))
         );
         assert_eq!(hal.last_asid, Some((CpuId(2), Asid(9))));
         assert_eq!(hal.last_irq, Some((CpuId(2), 41)));

@@ -879,22 +879,36 @@ pub fn decode_trap_context(context: Aarch64TrapContext) -> TrapEvent {
         return TrapEvent::ExternalInterrupt(irq);
     }
 
+    // U9-PAGEFAULT1 §2 — the origin, from the architectural source.
+    //
+    // The EC itself carries it: `_LOW` classes are aborts taken from a LOWER exception level
+    // (EL0, i.e. user), `_CUR` classes are aborts taken at the CURRENT one (EL1, the kernel).
+    // Before this both were folded into the same `TrapEvent::PageFault`, so an EL1 abort reached
+    // the user-fault classifier and, if a user task happened to be current on a user-space
+    // address, would have been classified as that task's recoverable fault.
     match (context.esr_el1 >> 26) & ESR_EC_MASK {
         ESR_EC_SVC64 => TrapEvent::Syscall,
-        ESR_EC_IABT_LOW | ESR_EC_IABT_CUR => TrapEvent::PageFault(FaultInfo {
-            addr: VirtAddr(context.far_el1),
-            access: FaultAccess::Execute,
-        }),
+        ESR_EC_IABT_LOW => TrapEvent::PageFault(FaultInfo::user(
+            VirtAddr(context.far_el1),
+            FaultAccess::Execute,
+        )),
+        ESR_EC_IABT_CUR => TrapEvent::PageFault(FaultInfo::supervisor(
+            VirtAddr(context.far_el1),
+            FaultAccess::Execute,
+        )),
         ESR_EC_DABT_LOW | ESR_EC_DABT_CUR => {
             let is_write = ((context.esr_el1 >> 6) & 1) != 0;
-            TrapEvent::PageFault(FaultInfo {
-                addr: VirtAddr(context.far_el1),
-                access: if is_write {
-                    FaultAccess::Write
-                } else {
-                    FaultAccess::Read
-                },
-            })
+            let access = if is_write {
+                FaultAccess::Write
+            } else {
+                FaultAccess::Read
+            };
+            let addr = VirtAddr(context.far_el1);
+            if ((context.esr_el1 >> 26) & ESR_EC_MASK) == ESR_EC_DABT_CUR {
+                TrapEvent::PageFault(FaultInfo::supervisor(addr, access))
+            } else {
+                TrapEvent::PageFault(FaultInfo::user(addr, access))
+            }
         }
         _ => TrapEvent::Unknown {
             arch_code: context.esr_el1 as u64,
@@ -1434,10 +1448,7 @@ mod tests {
         assert_eq!(ev.trap(), Trap::PageFault);
         assert_eq!(
             ev.fault(),
-            Some(FaultInfo {
-                addr: VirtAddr(0xABCD_4000),
-                access: FaultAccess::Write,
-            })
+            Some(FaultInfo::user(VirtAddr(0xABCD_4000), FaultAccess::Write))
         );
     }
 
@@ -1451,10 +1462,7 @@ mod tests {
         });
         assert_eq!(
             ev,
-            TrapEvent::PageFault(FaultInfo {
-                addr: VirtAddr(0x6000),
-                access: FaultAccess::Read,
-            })
+            TrapEvent::PageFault(FaultInfo::user(VirtAddr(0x6000), FaultAccess::Read))
         );
     }
 

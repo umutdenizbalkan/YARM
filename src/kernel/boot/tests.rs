@@ -2215,10 +2215,10 @@ fn normalized_page_fault_event_faults_current_task() {
 
     state
         .handle_trap_event(
-            TrapEvent::PageFault(FaultInfo {
-                addr: VirtAddr(0x1200),
-                access: super::super::trap::FaultAccess::Read,
-            }),
+            TrapEvent::PageFault(FaultInfo::user(
+                VirtAddr(0x1200),
+                super::super::trap::FaultAccess::Read,
+            )),
             None,
         )
         .expect("page fault event handled");
@@ -2227,10 +2227,10 @@ fn normalized_page_fault_event_faults_current_task() {
     assert_eq!(state.current_tid(), Some(1));
     assert_eq!(
         state.last_fault(),
-        Some(FaultInfo {
-            addr: VirtAddr(0x1200),
-            access: super::super::trap::FaultAccess::Read,
-        })
+        Some(FaultInfo::user(
+            VirtAddr(0x1200),
+            super::super::trap::FaultAccess::Read
+        ))
     );
 }
 
@@ -4699,10 +4699,10 @@ fn syscall_recv_reports_page_fault_on_unwritable_user_buffer() {
     );
     assert_eq!(
         state.last_fault(),
-        Some(super::super::trap::FaultInfo {
-            addr: VirtAddr(8),
-            access: super::super::trap::FaultAccess::Write,
-        })
+        Some(super::super::trap::FaultInfo::user(
+            VirtAddr(8),
+            super::super::trap::FaultAccess::Write
+        ))
     );
 }
 
@@ -4845,16 +4845,16 @@ fn run_page_fault_report_uses_current_fault_not_stale_last_fault() {
         .grant_capability_task_to_task(0, handler_recv, 1)
         .expect("dup handler recv to task1");
 
-    let stale_fault = super::super::trap::FaultInfo {
-        addr: VirtAddr(0x1111),
-        access: super::super::trap::FaultAccess::Read,
-    };
+    let stale_fault = super::super::trap::FaultInfo::user(
+        VirtAddr(0x1111),
+        super::super::trap::FaultAccess::Read,
+    );
     state.record_fault(stale_fault);
 
-    let current_fault = super::super::trap::FaultInfo {
-        addr: VirtAddr(0x2222),
-        access: super::super::trap::FaultAccess::Execute,
-    };
+    let current_fault = super::super::trap::FaultInfo::user(
+        VirtAddr(0x2222),
+        super::super::trap::FaultAccess::Execute,
+    );
     state
         .handle_trap_event(TrapEvent::PageFault(current_fault), None)
         .expect("handle page fault");
@@ -6562,10 +6562,7 @@ fn yield_current_rotates_to_next_runnable_task() {
 #[test]
 fn trap_event_page_fault_records_fault_then_faults_current_task() {
     let mut state = Bootstrap::init().expect("init");
-    let fault = FaultInfo {
-        addr: VirtAddr(0x4000),
-        access: FaultAccess::Execute,
-    };
+    let fault = FaultInfo::user(VirtAddr(0x4000), FaultAccess::Execute);
 
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
@@ -6582,10 +6579,7 @@ fn raw_page_fault_records_last_fault_frame() {
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let mut state = Bootstrap::init().expect("init");
-            let fault = FaultInfo {
-                addr: VirtAddr(0x4444),
-                access: FaultAccess::Read,
-            };
+            let fault = FaultInfo::user(VirtAddr(0x4444), FaultAccess::Read);
             let mut frame = TrapFrame::new(0, [0; 6]);
             frame.saved_pc = 0x1111;
             frame.saved_sp = 0x2222;
@@ -6610,10 +6604,7 @@ fn shared_prerecorded_fault_bookkeeping_skips_duplicate_recording() {
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let shared = SharedKernel::new(Bootstrap::init().expect("init"));
-            let fault = FaultInfo {
-                addr: VirtAddr(0x5555),
-                access: FaultAccess::Execute,
-            };
+            let fault = FaultInfo::user(VirtAddr(0x5555), FaultAccess::Execute);
             let mut prerecord_frame = TrapFrame::new(0, [0; 6]);
             prerecord_frame.saved_pc = 0x1234;
             prerecord_frame.saved_sp = 0x5678;
@@ -6662,16 +6653,10 @@ fn shared_prerecorded_fault_report_uses_current_fault() {
                     .expect("dup handler recv to task1")
             });
 
-            let stale_fault = FaultInfo {
-                addr: VirtAddr(0x1111),
-                access: FaultAccess::Read,
-            };
+            let stale_fault = FaultInfo::user(VirtAddr(0x1111), FaultAccess::Read);
             shared.with(|state| state.record_fault(stale_fault));
 
-            let current_fault = FaultInfo {
-                addr: VirtAddr(0x6666),
-                access: FaultAccess::Execute,
-            };
+            let current_fault = FaultInfo::user(VirtAddr(0x6666), FaultAccess::Execute);
             let mut frame = TrapFrame::new(0, [0; 6]);
             frame.saved_pc = 0x7777;
             frame.saved_sp = 0x8888;
@@ -6716,10 +6701,7 @@ fn demand_page_fault_maps_heap_page_for_current_task() {
         .set_task_brk_bounds(0, 0x4000, 0x8000)
         .expect("brk bounds");
 
-    let fault = FaultInfo {
-        addr: VirtAddr(0x5001),
-        access: FaultAccess::Write,
-    };
+    let fault = FaultInfo::user(VirtAddr(0x5001), FaultAccess::Write);
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("demand page fault");
@@ -6742,10 +6724,7 @@ fn page_fault_outside_demand_regions_still_faults_task() {
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
     state.bind_task_asid(0, asid).expect("bind");
 
-    let fault = FaultInfo {
-        addr: VirtAddr(0x9000),
-        access: FaultAccess::Read,
-    };
+    let fault = FaultInfo::user(VirtAddr(0x9000), FaultAccess::Read);
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("page fault handled");
@@ -7642,10 +7621,7 @@ fn demand_declines_present_read_only_write_fault() {
         .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(0x5000), PageFlags::USER_RX)
         .expect("map ro");
 
-    let write_fault = FaultInfo {
-        addr: VirtAddr(0x5000),
-        access: FaultAccess::Write,
-    };
+    let write_fault = FaultInfo::user(VirtAddr(0x5000), FaultAccess::Write);
     assert!(
         !state
             .try_handle_demand_page_fault(write_fault)
@@ -7654,10 +7630,7 @@ fn demand_declines_present_read_only_write_fault() {
     );
 
     // A READ fault on the same present page is still satisfiable → demand handles it.
-    let read_fault = FaultInfo {
-        addr: VirtAddr(0x5000),
-        access: FaultAccess::Read,
-    };
+    let read_fault = FaultInfo::user(VirtAddr(0x5000), FaultAccess::Read);
     assert!(
         state
             .try_handle_demand_page_fault(read_fault)
@@ -13239,10 +13212,7 @@ fn demand_page_stage8_explicit_asid_maps_into_faulting_task_address_space() {
     state.bind_task_asid(0, asid).expect("bind");
     state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
 
-    let fault = FaultInfo {
-        addr: VirtAddr(0x5001),
-        access: FaultAccess::Read,
-    };
+    let fault = FaultInfo::user(VirtAddr(0x5001), FaultAccess::Read);
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("demand page fault handled");
@@ -13266,10 +13236,7 @@ fn demand_page_stage8_task_without_asid_falls_through_to_task_fault() {
     // task 0 has no ASID bound after Bootstrap::init()
     state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
 
-    let fault = FaultInfo {
-        addr: VirtAddr(0x5000),
-        access: FaultAccess::Write,
-    };
+    let fault = FaultInfo::user(VirtAddr(0x5000), FaultAccess::Write);
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("page fault handled");
@@ -13285,10 +13252,7 @@ fn demand_page_stage8_execute_fault_not_demand_mapped() {
     state.bind_task_asid(0, asid).expect("bind");
     state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
 
-    let fault = FaultInfo {
-        addr: VirtAddr(0x5000),
-        access: FaultAccess::Execute,
-    };
+    let fault = FaultInfo::user(VirtAddr(0x5000), FaultAccess::Execute);
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("page fault handled");
@@ -13325,10 +13289,7 @@ fn demand_page_stage8_already_mapped_page_skips_remap() {
         .expect("pre-mapped")
         .phys;
 
-    let fault = FaultInfo {
-        addr: VirtAddr(0x5000),
-        access: FaultAccess::Write,
-    };
+    let fault = FaultInfo::user(VirtAddr(0x5000), FaultAccess::Write);
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("demand page handled");
@@ -13356,10 +13317,7 @@ fn demand_page_stage8_mapped_page_has_user_rw_flags() {
     state.bind_task_asid(0, asid).expect("bind");
     state.set_task_brk_bounds(0, 0x1000, 0x9000).expect("brk");
 
-    let fault = FaultInfo {
-        addr: VirtAddr(0x3001),
-        access: FaultAccess::Write,
-    };
+    let fault = FaultInfo::user(VirtAddr(0x3001), FaultAccess::Write);
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("demand page");
@@ -13391,10 +13349,7 @@ fn demand_page_stage8_stack_region_demand_maps() {
         }
     });
 
-    let fault = FaultInfo {
-        addr: VirtAddr(0xFF_F001),
-        access: FaultAccess::Write,
-    };
+    let fault = FaultInfo::user(VirtAddr(0xFF_F001), FaultAccess::Write);
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("stack demand page");
@@ -16899,10 +16854,10 @@ fn fault_handler_report_message_visible_via_ipc_state() {
         .set_fault_handler(recv_cap)
         .expect("set fault handler");
 
-    let fault = super::super::trap::FaultInfo {
-        addr: VirtAddr(0xDEAD),
-        access: super::super::trap::FaultAccess::Write,
-    };
+    let fault = super::super::trap::FaultInfo::user(
+        VirtAddr(0xDEAD),
+        super::super::trap::FaultAccess::Write,
+    );
     state.emit_fault_report_for_fault_for_test(0, fault);
 
     let queued = state.with_ipc_state(|ipc| {
@@ -16929,10 +16884,10 @@ fn page_fault_report_falls_back_to_supervisor_endpoint_when_no_fault_handler() {
         .set_supervisor_endpoint(recv_cap)
         .expect("set supervisor endpoint");
 
-    let fault = super::super::trap::FaultInfo {
-        addr: VirtAddr(0xBEEF),
-        access: super::super::trap::FaultAccess::Write,
-    };
+    let fault = super::super::trap::FaultInfo::user(
+        VirtAddr(0xBEEF),
+        super::super::trap::FaultAccess::Write,
+    );
     state.emit_fault_report_for_fault_for_test(10008, fault);
 
     let queued = state.with_ipc_state(|ipc| {
@@ -16997,10 +16952,10 @@ fn kernel_fault_report_completes_blocked_supervisor_recv_v2_without_stranding_qu
         "supervisor must be the fault endpoint waiter"
     );
 
-    let fault = super::super::trap::FaultInfo {
-        addr: VirtAddr(0xCAFE),
-        access: super::super::trap::FaultAccess::Write,
-    };
+    let fault = super::super::trap::FaultInfo::user(
+        VirtAddr(0xCAFE),
+        super::super::trap::FaultAccess::Write,
+    );
     state.emit_fault_report_for_fault_for_test(10008, fault);
 
     let (waiter, queued) = state.with_ipc_state(|ipc| {
@@ -57475,10 +57430,10 @@ fn stage174_fault_delivery_markers_do_not_change_delivery_behavior() {
         .set_supervisor_endpoint(recv_cap)
         .expect("set supervisor endpoint");
 
-    let fault = super::super::trap::FaultInfo {
-        addr: VirtAddr(0xBEEF),
-        access: super::super::trap::FaultAccess::Write,
-    };
+    let fault = super::super::trap::FaultInfo::user(
+        VirtAddr(0xBEEF),
+        super::super::trap::FaultAccess::Write,
+    );
     state.emit_fault_report_for_fault_for_test(10008, fault);
 
     // Exactly one queued (no duplicate/stranding) — identical to knob-off behavior.
@@ -129284,10 +129239,10 @@ mod u3_recv_copy_fault_completion {
         );
         assert_eq!(
             k.with(|s| s.last_fault()),
-            Some(FaultInfo {
-                addr: VirtAddr(FAULT_ADDR as u64),
-                access: FaultAccess::Write,
-            }),
+            Some(FaultInfo::user(
+                VirtAddr(FAULT_ADDR as u64),
+                FaultAccess::Write
+            )),
             "exact address, and Write access — never Read or Execute"
         );
         assert_eq!(f.error, SyscallError::PageFault.code());
@@ -129332,10 +129287,7 @@ mod u3_recv_copy_fault_completion {
         let k = fixture();
         // Give the fault slot a distinguishable prior value so a refusal that overwrote it
         // would be visible rather than hidden behind `None`.
-        let prior = FaultInfo {
-            addr: VirtAddr(0x1234),
-            access: FaultAccess::Read,
-        };
+        let prior = FaultInfo::user(VirtAddr(0x1234), FaultAccess::Read);
         k.with(|s| s.record_fault(prior));
         let before_cpu = k.with(|s| s.current_cpu());
         let before_frame_snapshot = k.with(|s| s.last_fault_frame());
@@ -129466,10 +129418,7 @@ mod u3_recv_copy_fault_completion {
         );
         assert_eq!(
             k.with(|s| s.last_fault()),
-            Some(FaultInfo {
-                addr: VirtAddr(0x9000),
-                access: FaultAccess::Write,
-            })
+            Some(FaultInfo::user(VirtAddr(0x9000), FaultAccess::Write))
         );
         assert_eq!(f.error, SyscallError::PageFault.code());
     }
@@ -129490,10 +129439,7 @@ mod u3_recv_copy_fault_completion {
         );
         assert_eq!(
             k.with(|s| s.last_fault()),
-            Some(FaultInfo {
-                addr: VirtAddr(0x9000),
-                access: FaultAccess::Write,
-            })
+            Some(FaultInfo::user(VirtAddr(0x9000), FaultAccess::Write))
         );
         assert_eq!(f.error, SyscallError::PageFault.code());
         // The meta really did land first — proving this is the payload arm, not the meta arm.
@@ -129628,11 +129574,25 @@ mod u3_recv_copy_fault_completion {
             !t.contains("with_scheduler_split_mut"),
             "the binding is delegated, never re-implemented or held open"
         );
-        // Exactly the legacy record, and no frame snapshot. The direction is now the shared
-        // body's PARAMETER — `record_user_fault` always took it as one — and each wrapper's
-        // choice is pinned above.
-        assert!(t.contains("access,"));
-        assert!(t.contains("addr: VirtAddr(addr as u64)"));
+        // Exactly the legacy record, and no frame snapshot. The direction is the shared body's
+        // PARAMETER — `record_user_fault` always took it as one — and each wrapper's choice is
+        // pinned above.
+        //
+        // U9-PAGEFAULT1 §2 re-derivation: the record is now built through `FaultInfo::user`
+        // rather than a struct literal, because `FaultInfo` carries a privilege origin. The claim
+        // is unchanged and is strengthened by it — the same address, the same parameterised
+        // access, and now an origin that is `User` BY CONSTRUCTION rather than by omission. This
+        // seam is the split twin of `record_user_fault`, whose subject is always the current user
+        // task, so any other origin here would be a category error.
+        assert!(
+            t.contains("FaultInfo::user(VirtAddr(addr as u64), access)"),
+            "the record must name the address, take the direction as a parameter, and declare a \
+             user origin through the constructor"
+        );
+        assert!(
+            !t.contains("FaultOrigin::Supervisor") && !t.contains("FaultInfo::supervisor"),
+            "a user-fault record must never mint a supervisor origin"
+        );
         assert!(!t.contains("record_fault_frame_snapshot"));
         // The refusal propagates before anything else runs.
         assert!(t.contains("self.bind_current_cpu_split(cpu)?;"));
@@ -182956,6 +182916,302 @@ mod u9timer5_idle_boundary {
                 .count(),
             2,
             "the declined-entry path and the no-task path each restore the prior state"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// U9-PAGEFAULT1 §2 — the PRIVILEGE ORIGIN of a page fault, and the RISC-V instruction-fetch
+// ingress that needed it.
+//
+// The classifier used to record, in its own words, that "`FaultInfo` carries no privilege-origin
+// bit and the broad arm performs no origin test, so none is invented here". The consequence was
+// that the kernel/user boundary was inferred from the ADDRESS and from whether a user task was
+// current — and a supervisor fault on a USER-space address, taken while a user task is current,
+// satisfies both. It would have been classified as that task's recoverable fault, and the
+// recovery owners would have minted a frame, replaced a mapping and resumed the KERNEL at the
+// faulting instruction as though a user page had been demanded.
+//
+// Every architecture already reports the origin; nothing here is inferred. These cases pin that
+// each decoder reads it from the architectural source, that the classifier tests it FIRST, and
+// that RISC-V's new `scause` 12 decode is safe because that port screens supervisor traps far
+// upstream rather than because this decoder checks.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod u9pf1_fault_origin {
+    use crate::kernel::trap::{FaultAccess, FaultInfo, FaultOrigin};
+    use crate::kernel::vm::VirtAddr;
+
+    const FAULT_STATE: &str = include_str!("fault_state.rs");
+    const ARCH_TRAP: &str = include_str!("../../arch/trap.rs");
+    const X86: &str = include_str!("../../arch/x86_64/trap.rs");
+    const ARM: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_TIMER: &str = include_str!("../../arch/riscv64/timer.rs");
+
+    /// **The origin is a fact the fault carries, and the two constructors are total.**
+    #[test]
+    fn fault_info_carries_an_origin_and_both_constructors_set_it() {
+        assert_eq!(
+            FaultInfo::user(VirtAddr(0x1000), FaultAccess::Read).origin,
+            FaultOrigin::User
+        );
+        assert_eq!(
+            FaultInfo::supervisor(VirtAddr(0x1000), FaultAccess::Read).origin,
+            FaultOrigin::Supervisor
+        );
+        // The two are distinguishable, in value and in marker text, so a log can report which.
+        assert_ne!(FaultOrigin::User, FaultOrigin::Supervisor);
+        assert_eq!(FaultOrigin::User.marker(), "user");
+        assert_eq!(FaultOrigin::Supervisor.marker(), "supervisor");
+        // Neither constructor perturbs the other two facts.
+        for access in [FaultAccess::Read, FaultAccess::Write, FaultAccess::Execute] {
+            for f in [
+                FaultInfo::user(VirtAddr(0xDEAD_000), access),
+                FaultInfo::supervisor(VirtAddr(0xDEAD_000), access),
+            ] {
+                assert_eq!(f.addr, VirtAddr(0xDEAD_000));
+                assert_eq!(f.access, access);
+            }
+        }
+        // And the field is documented as decoder-set, never derived.
+        assert!(
+            ARCH_TRAP
+                .contains("it is\n    /// never derived from the address or from the current task"),
+            "the field must state that it is not inferred"
+        );
+    }
+
+    /// **The classifier tests the origin FIRST**, before the current-task and address reads.
+    ///
+    /// Order is the whole point. Those two reads answer "is there a user task" and "is this a
+    /// user address", and a kernel fault on a user address with a user task current satisfies
+    /// both. A test placed after them would never be reached for exactly the case it exists for.
+    #[test]
+    fn the_classifier_refuses_a_supervisor_origin_before_it_reads_anything_else() {
+        let body = FAULT_STATE
+            .split("pub(crate) fn classify_page_fault_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the classifier")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let origin = body
+            .find("if matches!(fault.origin, crate::kernel::trap::FaultOrigin::Supervisor) {")
+            .expect("the origin test must exist");
+        let refusal = body[origin..]
+            .find("return (PageFaultClass::KernelOrAbsentTask, None);")
+            .map(|o| origin + o)
+            .expect("and refuse to the existing kernel boundary");
+        for later in [
+            "let Some(tid) = self.current_tid()",
+            "let Some(asid) = self.task_asid(tid)",
+            "page_fault_addr_is_kernel_space(page)",
+            "self.with_user_spaces(",
+            "self.is_cow_page(",
+            "self.fault_addr_in_demand_backed_region(",
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("the classifier must still perform `{later}`"));
+            assert!(
+                origin < at,
+                "the origin test must precede `{later}` — a kernel fault on a user address with \
+                 a user task current satisfies the later reads"
+            );
+        }
+        assert!(refusal > origin);
+        // It refuses to the EXISTING kernel boundary rather than inventing a class.
+        assert!(
+            FAULT_STATE.contains("KernelOrAbsentTask"),
+            "the existing kernel/fallback class is reused"
+        );
+        // And the superseded disclaimer is gone rather than left standing next to the new test.
+        assert!(
+            !FAULT_STATE.contains("`FaultInfo` carries no privilege-origin bit and the broad arm"),
+            "the note that no origin bit exists must be retired, not contradicted in place"
+        );
+    }
+
+    /// **x86_64 reads the U/S bit, and it is error-code bit 2.**
+    #[test]
+    fn x86_reads_the_user_supervisor_bit_from_the_error_code() {
+        let decode = X86
+            .split("pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the x86 decoder");
+        assert!(
+            decode.contains("let origin = if (context.error_code & (1 << 2)) != 0 {"),
+            "bit 2 is the U/S bit"
+        );
+        assert!(
+            decode.contains("crate::kernel::trap::FaultOrigin::User")
+                && decode.contains("crate::kernel::trap::FaultOrigin::Supervisor"),
+            "both origins must be produced"
+        );
+        // The access decode is untouched by the origin: bit 1 write, bit 4 execute, else read.
+        assert!(
+            decode.contains("if (context.error_code & (1 << 1)) != 0 {")
+                && decode.contains("} else if (context.error_code & (1 << 4)) != 0 {"),
+            "the access bits must be unchanged"
+        );
+    }
+
+    /// **AArch64 splits the abort classes by exception level**, which is where its origin lives.
+    ///
+    /// `_LOW` is an abort taken from a LOWER EL (EL0, user); `_CUR` is one taken at the CURRENT
+    /// EL (EL1, the kernel). Before this both folded into one `PageFault` arm.
+    #[test]
+    fn aarch64_separates_lower_el_aborts_from_current_el_aborts() {
+        let decode = ARM
+            .split("match (context.esr_el1 >> 26) & ESR_EC_MASK {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the aarch64 decoder match");
+        // The instruction-abort classes are now separate arms with opposite origins.
+        let iabt_low = decode
+            .find("ESR_EC_IABT_LOW => TrapEvent::PageFault(FaultInfo::user(")
+            .expect("EL0 instruction abort is a user fault");
+        let iabt_cur = decode
+            .find("ESR_EC_IABT_CUR => TrapEvent::PageFault(FaultInfo::supervisor(")
+            .expect("EL1 instruction abort is a kernel fault");
+        assert!(iabt_low < iabt_cur || iabt_cur < iabt_low);
+        // They are no longer folded together.
+        assert!(
+            !decode.contains("ESR_EC_IABT_LOW | ESR_EC_IABT_CUR"),
+            "the two instruction-abort classes must not share an arm — they have different origins"
+        );
+        // The data-abort arm keeps one body (the access decode is shared) but branches on the EC
+        // for the origin.
+        assert!(
+            decode.contains("if ((context.esr_el1 >> 26) & ESR_EC_MASK) == ESR_EC_DABT_CUR {")
+                && decode.contains("TrapEvent::PageFault(FaultInfo::supervisor(addr, access))")
+                && decode.contains("TrapEvent::PageFault(FaultInfo::user(addr, access))"),
+            "the data-abort arm must choose its origin from the EC"
+        );
+    }
+
+    /// **RISC-V decodes `scause` 12 as an instruction page fault with `Execute` access.**
+    ///
+    /// The gap §1 found: 12 was absent, so an instruction-fetch fault reached
+    /// `TrapEvent::Unknown` and never entered the PageFault family at all.
+    #[test]
+    fn riscv_decodes_the_instruction_page_fault() {
+        assert!(
+            RISCV.contains("const EXC_INSTRUCTION_PAGE_FAULT: usize = 12;"),
+            "the constant must exist, with the architectural value"
+        );
+        let decode = RISCV
+            .split("pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the riscv decoder");
+        let at = decode
+            .find("EXC_INSTRUCTION_PAGE_FAULT => TrapEvent::PageFault(FaultInfo::user(")
+            .expect("12 must decode as a page fault");
+        assert!(
+            decode[at..].contains("FaultAccess::Execute"),
+            "and with Execute access"
+        );
+        // The other two are unchanged and keep their accesses.
+        for (code, access) in [
+            ("EXC_LOAD_PAGE_FAULT", "FaultAccess::Read"),
+            ("EXC_STORE_PAGE_FAULT", "FaultAccess::Write"),
+        ] {
+            let a = decode.find(code).unwrap_or_else(|| panic!("{code}"));
+            assert!(decode[a..].contains(access), "{code} keeps {access}");
+        }
+        // All three name `stval` as the faulting address and `FaultInfo::user` as the origin.
+        // Checked from source rather than executed: the `riscv64` arch module is not compiled
+        // into the hosted build, so the decoder cannot be called from here.
+        assert_eq!(
+            decode
+                .matches("TrapEvent::PageFault(FaultInfo::user(")
+                .count(),
+            3,
+            "exactly three page-fault codes, each user-origin by construction"
+        );
+        assert_eq!(
+            decode.matches("VirtAddr(context.stval as u64)").count(),
+            3,
+            "and each takes its address from stval"
+        );
+        assert!(
+            !decode.contains("FaultInfo::supervisor"),
+            "this decoder must never mint a supervisor origin — the bridge screens those out \
+             upstream, and minting one here would imply it did not"
+        );
+    }
+
+    /// **RISC-V's new decode is safe on privilege grounds because the BRIDGE screens supervisor
+    /// traps, not because the decoder checks.**
+    ///
+    /// This is the reason the scause-12 arm may exist at all, and it is checked against the
+    /// screen rather than asserted. `riscv_trap_entry`'s `if !from_u` arm admits exactly ONE
+    /// supervisor trap — the audited kernel-idle boundary timer — and halts on everything else.
+    /// So every exception reaching `decode_trap_context` was taken from U-mode.
+    ///
+    /// If that screen is ever relaxed, this case fails, and the decode has to grow its own origin
+    /// test before the relaxation can land.
+    #[test]
+    fn the_riscv_bridge_admits_exactly_one_supervisor_trap_and_halts_on_the_rest() {
+        assert!(
+            RISCV_BOOT.contains("if !from_u {"),
+            "the bridge must branch on the trap's privilege origin"
+        );
+        let screen = RISCV_BOOT
+            .split("if !from_u {")
+            .nth(1)
+            .and_then(|s| s.split("\n    // Build the generic TrapFrame").next())
+            .expect("the S-mode screen");
+        assert!(
+            screen.contains("is_accepted_s_mode_timer_trap("),
+            "the one admitted supervisor trap is decided by a named predicate"
+        );
+        assert!(
+            screen.contains("riscv_trap_halt(\"trap_from_s_mode\");"),
+            "and every other supervisor trap halts fail-closed"
+        );
+        assert!(
+            screen.contains("reason=trap_from_s_mode"),
+            "the halt must name itself in the log"
+        );
+        // The predicate really does require SPP = Supervisor plus a timer cause plus the armed
+        // boundary — it is not a blanket admission.
+        let pred = RISCV_TIMER
+            .split("pub fn is_accepted_s_mode_timer_trap(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the predicate");
+        assert!(
+            pred.contains("const SPP_BIT: usize = 1usize << 8;")
+                && pred.contains("let from_supervisor = (sstatus & SPP_BIT) != 0;"),
+            "SPP is read from sstatus"
+        );
+        assert!(
+            pred.contains(
+                "is_interrupt && code == IRQ_SUPERVISOR_TIMER_CODE && from_supervisor \
+                 && boundary_armed"
+            ),
+            "and all four conditions are required — the admission is not a blanket one"
+        );
+        // The case that matters for the decode this guard protects: a SUPERVISOR page fault.
+        // scause 12/13/15 are exceptions, so the interrupt bit is clear, and the predicate's
+        // first conjunct (`is_interrupt`) is therefore false regardless of SPP or the boundary
+        // latch. Derived from the predicate's own text because the `riscv64` module is not
+        // compiled into the hosted build.
+        assert!(
+            pred.contains("let is_interrupt = (scause & INTERRUPT_BIT) != 0;"),
+            "the predicate must require an INTERRUPT, which a page fault never is"
+        );
+        assert!(
+            pred.contains("let code = scause & !INTERRUPT_BIT;"),
+            "and must compare the cause code with the interrupt bit masked off"
         );
     }
 }

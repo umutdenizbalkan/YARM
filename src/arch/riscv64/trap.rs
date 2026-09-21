@@ -16,6 +16,14 @@ const SCAUSE_EXCEPTION_MASK: usize = !INTERRUPT_BIT;
 
 const EXC_ILLEGAL_INSTRUCTION: usize = 2;
 const EXC_USER_ECALL: usize = 8;
+/// U9-PAGEFAULT1 — RV privileged spec, `scause` 12. An instruction FETCH that faulted, which is a
+/// page fault exactly as loads (13) and stores (15) are.
+///
+/// It was absent from this decoder, so an instruction page fault reached `TrapEvent::Unknown` and
+/// was reported as an unrecognized trap rather than entering the PageFault family at all — a gap
+/// upstream of every routing decision, and one neither other port has (x86_64 reports it through
+/// error-code bit 4, AArch64 through `ESR_EC_IABT_*`).
+const EXC_INSTRUCTION_PAGE_FAULT: usize = 12;
 const EXC_LOAD_PAGE_FAULT: usize = 13;
 const EXC_STORE_PAGE_FAULT: usize = 15;
 
@@ -382,14 +390,27 @@ pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
 
     match code {
         EXC_USER_ECALL => TrapEvent::Syscall,
-        EXC_LOAD_PAGE_FAULT => TrapEvent::PageFault(FaultInfo {
-            addr: VirtAddr(context.stval as u64),
-            access: FaultAccess::Read,
-        }),
-        EXC_STORE_PAGE_FAULT => TrapEvent::PageFault(FaultInfo {
-            addr: VirtAddr(context.stval as u64),
-            access: FaultAccess::Write,
-        }),
+        // U9-PAGEFAULT1 — the instruction-fetch fault, with `Execute` access.
+        //
+        // SAFE WITH RESPECT TO PRIVILEGE ORIGIN, and not because this decoder checks: the RISC-V
+        // bridge screens `sstatus.SPP` far upstream. `riscv_trap_entry`'s `if !from_u` arm admits
+        // exactly ONE supervisor trap — the audited kernel-idle boundary timer — and sends
+        // everything else to `riscv_trap_halt("trap_from_s_mode")`. So every exception that
+        // reaches this `match` was taken from U-mode, and decoding a fetch fault here cannot turn
+        // a kernel exception into a recoverable user fault. `u9pf1_riscv_ingress` pins that screen
+        // as the reason, so relaxing it fails a guard rather than silently widening this decode.
+        EXC_INSTRUCTION_PAGE_FAULT => TrapEvent::PageFault(FaultInfo::user(
+            VirtAddr(context.stval as u64),
+            FaultAccess::Execute,
+        )),
+        EXC_LOAD_PAGE_FAULT => TrapEvent::PageFault(FaultInfo::user(
+            VirtAddr(context.stval as u64),
+            FaultAccess::Read,
+        )),
+        EXC_STORE_PAGE_FAULT => TrapEvent::PageFault(FaultInfo::user(
+            VirtAddr(context.stval as u64),
+            FaultAccess::Write,
+        )),
         _ => TrapEvent::Unknown {
             arch_code: context.scause as u64,
         },
