@@ -19833,3 +19833,81 @@ RISC-V core smoke green.
 `TerminallyUnhandled`, `KernelOrAbsentTask` everywhere and `DemandCandidate` everywhere still
 route `Broad`. No class has been admitted and no new live fault evidence exists beyond the
 x86_64 COW population §1 measured.
+
+## U9-PAGEFAULT1 §3a — the demand page-fault witness, and the first live demand population
+
+§1 measured that `DemandCandidate` had **zero witnesses on all three ports**, which is why
+`page_fault_route_for` routes it `Broad` everywhere. That is now fixed: the class has a live,
+repeatable population and a measured baseline.
+
+### The mechanism is entirely existing
+
+No new ABI, no new syscall, no capacity increase. `VmBrk` growth moves the break bounds up and
+leaves the pages lazy — `vm_entry_witness` already witnesses that `growth` case. Touching inside
+the grown window produces a fault whose address is in `[brk_base, brk_end)`, the first arm of
+`evaluate_demand_backed_region`. A `DemandCandidate` **by construction**, produced by the
+production owner rather than simulated.
+
+### Where it runs, and why that was measured rather than chosen
+
+The first live run placed the witness in the **init server**. The fault fired exactly as designed
+— `PAGE_FAULT_ENTRY tid=1 addr=0x479000 access=Write`, x86 error `0x6` (not-present, write, user)
+— and then the recovery allocated its frame and **failed**:
+
+```
+VM_FULL reason=mapping_bookkeeping_full asid=Some(1) len=128 max_mappings=128 va=0x479000
+```
+
+Init's address space is *at* its mapping ceiling on the provisioned profiles. That is the same
+pressure `ipc-send-final-fault-witness`, `futex-wait-nonblock-probe` and
+`timer5-idle-return-witness` each measured and recorded in their own feature comments. Raising
+`MAX_MAPPINGS` is forbidden — a witness that needs a capacity increase to pass is not a witness —
+so the witness moved to a task with headroom. Measured on the same boot: init performs 317 mapping
+operations, the supervisor 99, the process manager 97. The supervisor is the host.
+
+The failed init run is kept in the record rather than discarded: it is a real, production-owner
+exercise of the **allocation-failure** arm §3 asks for, and it is the reason the placement is what
+it is.
+
+### Result, x86_64
+
+```
+PF1_DEMAND_WITNESS_SEAL rounds=8 recovered=8 value_bad=0 regs_ok=8 regs_bad=0
+                        checked=4 first_bad=0x0 result=ok
+```
+
+Boot exit 0, no `VM_FULL`. Kernel side, same run: **8 `PAGE_FAULT_ENTRY`, 8
+`PAGE_FAULT_HANDLED_DEMAND`, 8 `PAGE_FAULT_DEMAND_VERIFY`**, and every one of the eight reports
+`rip=0x40cb4d` — the *same* faulting instruction, retried once per round.
+
+What each number carries:
+
+| fact | evidence |
+|---|---|
+| the faulting instruction retried | `recovered=8`: a store skipped or resumed past leaves the slot holding something else |
+| the source register survived | the value read back is the round-dependent operand, so a clobbered file would write wrong bytes rather than none |
+| the rest of the file survived | `regs_ok=8` with `checked=4`: four callee-saved registers seeded with DISTINCT sentinels, so a restore that SHUFFLES the file is caught as well as one that drops it |
+| the owner | all eight `PAGE_FAULT_HANDLED_DEMAND` — the **broad** handler, as expected while the matrix routes this class `Broad` |
+
+`checked=` is reported precisely because it is 0 on RISC-V, where no register may be named in
+inline asm here. A reader can then tell the proven case from the vacuous one instead of reading a
+passing mask as evidence.
+
+### What this is and is not
+
+It is the **measured broad-arrival baseline** for the demand class: 8 faults, 8 broad services,
+on a repeatable profile. It is the thing that has to exist before the class can be admitted, and
+the thing a conversion would be measured against.
+
+It is **not** a conversion. `page_fault_route_for` is unchanged and every one of those eight
+faults still takes the terminal broad acquisition — which is exactly what the kernel markers say.
+
+### Qualification at this checkpoint
+
+Hosted **5682 passed / 0 failed / 2 ignored**, single-threaded. Three freestanding builds clean.
+x86_64 core smoke with the witness armed: exit 0.
+
+### Still open
+
+AArch64 and RISC-V witness runs; the split demand route; and the matrix rows for x86_64 terminal,
+RISC-V COW/terminal and demand everywhere.

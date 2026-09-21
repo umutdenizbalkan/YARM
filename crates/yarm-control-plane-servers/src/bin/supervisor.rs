@@ -21,6 +21,25 @@ fn main() {
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_user_entry() -> ! {
     yarm_user_rt::user_log!("SUP_BIN_ENTRY_START");
+    // U9-PAGEFAULT1 §3 — the DEMAND page-fault witness.
+    //
+    // IT RUNS HERE, NOT IN INIT, and the reason is measured rather than chosen. The first live
+    // run placed it in the init server and the fault fired exactly as designed — a user write to
+    // a non-present page inside the grown brk window, error 0x6 — but the recovery allocated its
+    // frame and then failed: `VM_FULL reason=mapping_bookkeeping_full asid=Some(1)
+    // max_mappings=128`. Init's address space is AT its mapping ceiling on the provisioned
+    // profiles, which is the same pressure `ipc-send-final-fault-witness` and
+    // `timer5-idle-return-witness` each measured and documented in their own feature comments.
+    //
+    // Raising `MAX_MAPPINGS` is forbidden — a witness must not need a capacity increase to pass —
+    // so the witness moves to a task that has headroom instead. The supervisor is that task:
+    // measured on the same boot it performs roughly a third of init's mapping work.
+    //
+    // It runs FIRST, before any service work, so its markers cannot interleave with the
+    // supervisor's own and so a page it demands cannot be mistaken for one a service needed. It
+    // grows only THIS task's brk window and touches only inside it.
+    #[cfg(feature = "pagefault1-demand-witness")]
+    yarm_user_rt::pagefault1_demand_witness::run_once();
     yarm_user_rt::user_log!("SUP_BEFORE_RUN");
     run();
     let ctx = yarm_user_rt::runtime::startup_context();

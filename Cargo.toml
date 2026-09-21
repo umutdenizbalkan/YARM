@@ -104,6 +104,9 @@ aarch64-exit-current-task-oracle = []
 # U9-SEND-FINAL §3: accepted and inert here, so one `--features` argument can reach every
 # package the artifact build touches. Only yarm-control-plane-servers acts on it.
 ipc-send-final-fault-witness = []
+# U9-PAGEFAULT1 §3: accepted and inert here, so one `--features` argument can reach every package
+# the artifact build touches. Only yarm-control-plane-servers and yarm-user-rt act on it.
+pagefault1-demand-witness = []
 # U9-FUTEX-WAIT-FINAL §4: gates the NR 9 NONBLOCKING-completion probe in the futex oracles.
 #
 # Same reason as `ipc-send-final-fault-witness`, measured the same way: init's address space runs
