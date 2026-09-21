@@ -172804,10 +172804,15 @@ mod u9pf1_not_running {
         }
     }
 
-    /// **Only `OwnsEnteringFrame` continues. Every forfeit is fail-closed, and the arm has no
-    /// other settlement at all.**
+    /// **EVERY verdict is fail-closed, including `OwnsEnteringFrame`. The arm reaches no
+    /// settlement at all.**
+    ///
+    /// This case previously read "only `OwnsEnteringFrame` continues". That continue has been
+    /// DROPPED, and the reason is the precedent it rested on turning out not to exist — see
+    /// `the_recv_restoration_precedent_requires_a_running_commit` below. The claim the case
+    /// carries is now the stronger one: the route writes nothing and returns through nothing.
     #[test]
-    fn every_forfeited_verdict_fails_closed() {
+    fn every_verdict_fails_closed() {
         let code = route();
         let arm_at = code
             .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
@@ -172820,67 +172825,128 @@ mod u9pf1_not_running {
             "the specific arm must precede the catch-all, or it can never be reached"
         );
         let arm = &code[arm_at..generic_at];
-        assert!(
-            arm.contains("A::OwnsEnteringFrame => TimerSettlement::ContinueCurrent,"),
-            "the one admitting verdict continues"
-        );
-        assert!(
-            arm.contains("A::Forfeited(reason) => {") && arm.contains("panic!("),
-            "every forfeit must fail closed"
-        );
-        // The forfeit region reaches NO settlement — not continue, not an advance, not a
-        // promotion.
-        let forfeit_at = arm
-            .find("A::Forfeited(reason) => {")
-            .expect("the forfeit arm");
-        let forfeit = &arm[forfeit_at..];
+        assert!(arm.contains("panic!("), "the arm must fail closed");
+        // NO settlement is reached, on any verdict. That is the whole claim.
         for forbidden in [
             "TimerSettlement::ContinueCurrent",
             "TimerSettlement::IdleQueueAdvance",
             "TimerSettlement::QueueAdvanceCommitted",
             "TimerSettlement::DiagnosticSwitchOwner",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "no verdict may reach `{forbidden}` — the arm settles nothing"
+            );
+        }
+        assert_eq!(
+            arm.matches("TimerSettlement::").count(),
+            0,
+            "the arm reaches no settlement at all"
+        );
+        // And it writes nothing — no promotion, no transition, no placement.
+        for forbidden in [
             "TaskStatus::Running",
             "apply_task_transition",
             "RollbackPreemptOutgoing",
             "enqueue",
+            "restore_exact_current",
         ] {
             assert!(
-                !forfeit.contains(forbidden),
-                "a forfeited frame must not reach `{forbidden}` — it may neither be resumed nor \
-                 put back into the scheduler"
+                !arm.contains(forbidden),
+                "the arm must not reach `{forbidden}` — a decline writes nothing"
             );
         }
-        // Exactly one settlement in the whole arm, and it belongs to the admitting verdict.
-        assert_eq!(
-            arm.matches("TimerSettlement::").count(),
-            1,
-            "the arm settles once, and only on `OwnsEnteringFrame`"
+        // The verdict is still read, and still reported, because a fatal that names which of six
+        // states occurred is materially better than one that says "task missing".
+        assert!(
+            arm.contains(
+                "shared.entering_frame_authority_split_read(cpu, entering_tid, entering_asid)"
+            ),
+            "the verdict must still be read for the report"
         );
-        // The verdict is reported, so a live run names which of the six it saw.
         assert!(
             code.contains("TIMER_SPLIT_CURRENT_NOT_RUNNING")
                 && code.contains("verdict={}")
-                && code.contains("authority.marker()")
-                && code.contains("asid={}"),
+                && code.contains("authority.marker()"),
             "the marker must carry the verdict and the entering incarnation"
+        );
+        assert!(
+            arm.contains("authority.marker()"),
+            "and the panic itself must name the verdict"
         );
     }
 
-    /// **The delivered behaviour this replaces was a fatal halt for EVERY status**, and the
-    /// record says so rather than claiming parity.
+    /// **The precedent the dropped continue rested on requires a `Running` COMMIT, which this
+    /// route does not perform — so the continue is gone.**
     ///
-    /// This is the correction the first draft needed. Base's broad `yield_current` answered
-    /// `NotRunning` with `Err(KernelError::TaskMissing)`; the broad timer arm propagated it with
-    /// `?`; both ISRs treat an `Err(TrapHandleError)` as fatal. So continuing for ANY status —
-    /// including `Runnable` — is a deliberate improvement over base, not parity, and a record
-    /// that calls it parity is wrong.
+    /// An earlier draft continued on `OwnsEnteringFrame` and justified it by citing
+    /// `recv_block_unwind_exact_split`. Verified against executable code, that citation was
+    /// wrong in the one way that matters.
+    ///
+    /// `RecvUnwindOutcome::Restored` is a claim about a RUNNING incarnation: the rank-1 restore
+    /// is followed by an exact-incarnation `apply_task_transition` COMMIT that establishes
+    /// `Running`, and `restore_entering_incarnation_exact_split` records why in its own words —
+    /// reporting `Restored` for a `Runnable` task "permitted userspace execution from a status
+    /// that says otherwise". That was a DEFECT U9-RECV-BLOCK2 §2 closed.
+    ///
+    /// The timer route commits nothing, so continuing would have returned through the frame of a
+    /// `Runnable` task — the state that documentation calls out, not the state it permits. And
+    /// the continue was optional: base halted for every status. So it is dropped rather than
+    /// bought with a mutation this route has no business performing.
     #[test]
-    fn the_replaced_behaviour_is_described_as_an_improvement_not_as_parity() {
+    fn the_recv_restoration_precedent_requires_a_running_commit() {
         const EXEC_STATE: &str = include_str!("exec_state.rs");
         const X86_IDT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
         const ARM_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
 
-        // Base's answer, from the broad adapter itself.
+        // (1) `Restored` is documented as a RUNNING claim, not a live-TCB claim.
+        const RECV_SPLIT: &str = include_str!("../recv_waiter_split.rs");
+        assert!(
+            RECV_SPLIT.contains("its TCB says `Running`"),
+            "`Restored` must claim a RUNNING incarnation"
+        );
+        // (2) And the owner that produces it says why `Runnable` is not enough.
+        assert!(
+            RUNTIME.contains("A task whose TCB says `Runnable` is, to every dispatch transition"),
+            "the restoration owner must still record why `Runnable` is insufficient"
+        );
+        // Matched in the two fragments the doc comment wraps it into, so the assertion pins the
+        // whole claim without assuming a line width.
+        assert!(
+            RUNTIME.contains("Reporting `Restored` for it permitted")
+                && RUNTIME.contains("userspace execution from a status that says otherwise"),
+            "and must name the defect that reading it as sufficient caused"
+        );
+        assert!(
+            RUNTIME.contains("a second CPU could select and mark it while this one"),
+            "including the concrete race it admitted"
+        );
+        // (3) The commit exists, is exact-incarnation, and establishes `Running`.
+        // Matched in fragments the doc comment wraps it into: "This is the" ends one line and
+        // "commit, and it is also ..." begins the next, so a whole-sentence anchor would assert
+        // nothing here.
+        assert!(
+            RUNTIME.contains("It is exact-incarnation and fail-closed")
+                && RUNTIME.contains("commit, and it is also what establishes `Running`"),
+            "the restoration must COMMIT through the transition owner"
+        );
+        assert!(
+            RUNTIME.contains("apply_task_transition(tid, Some(asid)"),
+            "and the commit must be the EXACT-INCARNATION transition, not a bare-TID write"
+        );
+
+        // (4) The timer route performs no such commit — which is why it may not continue.
+        let code = route();
+        let arm_at = code
+            .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
+            .expect("the arm");
+        let generic_at = code.find("Err(decline) => {").expect("the catch-all");
+        assert!(
+            !code[arm_at..generic_at].contains("apply_task_transition"),
+            "the timer route must not mint a commit to justify continuing"
+        );
+
+        // (5) Base's answer, and what both ISRs do with it — the behaviour this route restores.
         let broad = EXEC_STATE
             .split("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
             .nth(1)
@@ -172890,7 +172956,6 @@ mod u9pf1_not_running {
             broad.contains("return Err(KernelError::TaskMissing);"),
             "the broad path answers this refusal with an error, for every status"
         );
-        // And both ISRs treat that as fatal.
         assert!(
             X86_IDT.contains("halt_forever();"),
             "x86_64 halts on a failed shared trap dispatch"
@@ -172899,300 +172964,24 @@ mod u9pf1_not_running {
             ARM_BOOT.contains("YARM_AARCH64_TRAP_HANDLE halting"),
             "AArch64 halts on the same"
         );
-        // So the route must NOT describe its continue as preserving that contract.
+
+        // (6) The route's own documentation states the reversal rather than leaving the old
+        // claim standing.
         let doc = SPLIT
-            .split("# U9-PAGEFAULT1 §0 — `NotRunning` is asked of the owners, not inferred")
+            .split("## What base did, and what this route now does")
             .nth(1)
             .and_then(|s| {
                 s.split("/// What `ContinueCurrent` explicitly is NOT:")
                     .next()
             })
-            .expect("the NotRunning derivation");
+            .expect("the corrected derivation");
         assert!(
-            doc.contains("base halted for **every** status"),
-            "the derivation must state what base actually did"
-        );
-        assert!(
-            doc.contains("deliberate IMPROVEMENT over base") && doc.contains("not a parity claim"),
-            "and must label the change honestly"
-        );
-    }
-    // ── the unreachability argument, derived from the writers ────────────────────────────────
-    // ── the unreachability argument, derived from the writers ────────────────────────────────
-
-    /// **No production writer moves a task from `Running` to a TERMINAL status on a CPU other
-    /// than the task's own.**
-    ///
-    /// This is the first half of why the fail-closed arm is unreachable, and it is checked
-    /// against the writers rather than asserted. There are exactly three production writers of a
-    /// terminal status, and each is constrained:
-    ///
-    /// * `apply_self_exit_writes_locked` — a SELF exit. Its claim
-    ///   (`claim_self_exit_locked`) admits `Running` and nothing else, and runs in the exiting
-    ///   task's own trap on the exiting task's own CPU.
-    /// * `mark_task_dead` — reached only from `join_thread` after the target was observed
-    ///   `Exited(_)`, and from `reap_if_detached` inside the broad `exit_task` (again a self
-    ///   exit). Both targets are already terminal.
-    /// * `reap_claim` — the PM-only reap, which accepts terminal tasks only.
-    ///
-    /// `Faulted` is not in that list because it is applied through `TaskTransition::
-    /// FaultRunningCurrent`, whose `expected_from` is `Running` and whose subject is the CURRENT
-    /// task on the FAULTING CPU — again the task's own CPU.
-    #[test]
-    fn every_terminal_status_writer_is_the_tasks_own_cpu_or_already_terminal() {
-        const EXIT_CLAIM: &str = include_str!("exit_claim.rs");
-        const RESTART_STATE: &str = include_str!("restart_state.rs");
-        const REAP_CLAIM: &str = include_str!("reap_claim.rs");
-        const THREAD_STATE: &str = include_str!("thread_state.rs");
-        const PROCESS: &str = include_str!("../syscall/process.rs");
-
-        // (1) the self-exit writer, and its `Running`-only claim.
-        assert!(
-            EXIT_CLAIM.contains("tcb.status = TaskStatus::Exited(code);"),
-            "the self-exit terminal write must still live in `exit_claim`"
+            doc.contains("**The precedent does not hold.**"),
+            "the derivation must say plainly that the cited precedent does not hold"
         );
         assert!(
-            EXIT_CLAIM.contains("apply_self_exit_writes_locked(tcb, code, token);"),
-            "and be reached through the claim that precedes it"
-        );
-        // The claim's precondition, from CODE rather than from prose: a self-exit is admitted
-        // from `Running` and nothing else, so a task another edge has already finished with
-        // cannot be exited a second time — and a task that IS `Running` is, by definition, the
-        // current task on the CPU executing this very trap.
-        assert!(
-            EXIT_CLAIM.contains(
-                "pub(crate) const fn status_is_self_exitable(status: TaskStatus) -> bool {"
-            ),
-            "the self-exit status predicate must be its own named owner"
-        );
-        let exitable = EXIT_CLAIM
-            .split("pub(crate) const fn status_is_self_exitable(status: TaskStatus) -> bool {")
-            .nth(1)
-            .and_then(|s| s.split("\n}").next())
-            .expect("the predicate body");
-        assert!(
-            exitable.contains("matches!(status, TaskStatus::Running)"),
-            "and it must admit `Running` alone"
-        );
-        assert!(
-            EXIT_CLAIM.contains("if !status_is_self_exitable(status_before) {")
-                && EXIT_CLAIM.contains("return Err(ExitRefusal::NotRunning);"),
-            "the claim must consult it and refuse before writing anything"
-        );
-        assert_eq!(
-            crate::kernel::boot::exit_claim::status_is_self_exitable(TaskStatus::Running),
-            true,
-            "executable check, not only a source match"
-        );
-        for refused in [
-            TaskStatus::Runnable,
-            TaskStatus::Reserved,
-            TaskStatus::Faulted,
-            TaskStatus::Exited(0),
-            TaskStatus::Dead,
-        ] {
-            assert!(
-                !crate::kernel::boot::exit_claim::status_is_self_exitable(refused),
-                "a self-exit must not claim {refused:?}"
-            );
-        }
-
-        // (2) `mark_task_dead`'s two callers, each on an already-terminal target.
-        let join = THREAD_STATE
-            .split("pub fn join_thread(&mut self, tid: u64)")
-            .nth(1)
-            .and_then(|s| s.split("\n    pub ").next())
-            .expect("join_thread");
-        let reap_at = join
-            .find("self.mark_task_dead(tid)?;")
-            .expect("join's reap of the exited target");
-        let observed_at = join
-            .find("let TaskStatus::Exited(exit_code) = status else {")
-            .expect("join observes the target's status first");
-        assert!(
-            observed_at < reap_at,
-            "join must observe `Exited(_)` BEFORE it marks the target dead — a `Running` target \
-             takes the blocking branch instead"
-        );
-        let detached = THREAD_STATE
-            .split("pub(crate) fn reap_if_detached(&mut self, tid: u64)")
-            .nth(1)
-            .and_then(|s| s.split("\n    pub ").next())
-            .expect("reap_if_detached");
-        assert!(
-            detached.contains("ThreadDetachState::Detached"),
-            "the detached reap is gated on the detach state"
-        );
-        assert!(
-            RESTART_STATE.contains("self.reap_if_detached(tid)?;"),
-            "and its one caller is the broad self-exit"
-        );
-        // The self-exit clears `current` itself, in the same broad acquisition, BEFORE that reap.
-        let exit_body = RESTART_STATE
-            .split("if self.current_tid() == Some(tid) {")
-            .nth(1)
-            .expect("the self-exit's own current-clearing branch");
-        let clear_at = exit_body
-            .find("let _ = self.block_current_cpu();")
-            .expect("it clears `current`");
-        let detached_at = exit_body
-            .find("self.reap_if_detached(tid)?;")
-            .expect("and only then reaps");
-        assert!(
-            clear_at < detached_at,
-            "the exiting task stops being `current` before anything marks it dead"
-        );
-
-        // (3) the PM reap, terminal-only by its own documented contract.
-        assert!(
-            REAP_CLAIM.contains("tcb.status = TaskStatus::Dead;"),
-            "the reap writer"
-        );
-        assert!(
-            PROCESS.contains("terminal Faulted/Exited/Dead tasks are accepted"),
-            "and the PM reap accepts terminal tasks only"
-        );
-        // The reap's own typed refusals carry that contract, and carry a second one this
-        // argument needs: a target that is still some CPU's `current` is refused OUTRIGHT, so
-        // the reap cannot be the writer that produces a terminal-and-current task.
-        for (variant, why) in [
-            (
-                "NonTerminal,",
-                "a live task or a reservation must be refused, not reaped",
-            ),
-            (
-                "StillScheduled,",
-                "and a target that is still current or queued must be refused too",
-            ),
-        ] {
-            assert!(REAP_CLAIM.contains(variant), "{why}");
-        }
-        assert!(
-            REAP_CLAIM.contains(
-                "`Runnable | Running | Blocked(_) | Reserved` — a live task, or a spawn \
-                 reservation that has"
-            ),
-            "the `NonTerminal` refusal must still enumerate exactly the live statuses"
-        );
-        assert!(
-            REAP_CLAIM.contains("live/reserved refuses `NonTerminal`, already-`Dead` refuses"),
-            "and the claim order must classify before it writes"
-        );
-
-        // (4) `Faulted` goes through the transition owner, from `Running`, on the faulting CPU.
-        assert_eq!(
-            TaskTransition::FaultRunningCurrent.expected_from(),
-            TaskStatus::Running
-        );
-        assert_eq!(
-            TaskTransition::FaultRunningCurrent.resulting(),
-            TaskStatus::Faulted
-        );
-    }
-
-    /// **A timer cannot nest inside another trap on the same CPU**, on any of the three ports.
-    ///
-    /// The second half of the argument. Combined with the first, it says: the only agent that can
-    /// make `current` terminal is the task's own CPU inside the task's own trap, and while that
-    /// trap runs no timer can arrive to observe it.
-    #[test]
-    fn a_timer_cannot_nest_inside_another_trap_on_the_same_cpu() {
-        // x86_64 — every IDT entry is an INTERRUPT gate, which clears IF on entry. A trap gate
-        // (0x0F) would leave interrupts enabled and is what this forbids.
-        const X86_IDT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
-        assert!(
-            X86_IDT.contains("const IDT_GATE_INTERRUPT: u8 = 0x0E;"),
-            "the interrupt-gate constant"
-        );
-        assert!(
-            X86_IDT.contains("type_attr: IDT_PRESENT | ((dpl & 0x3) << 5) | IDT_GATE_INTERRUPT,"),
-            "and every installed gate must use it — a trap gate would permit nesting"
-        );
-        assert!(
-            !X86_IDT.contains("IDT_GATE_TRAP"),
-            "no trap-gate spelling may exist at all"
-        );
-
-        // AArch64 — the vector dispatch masks DAIF before it calls into Rust.
-        const ARM_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
-        const ARM_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
-        assert!(
-            ARM_TRAP.contains(
-                "`yarm_aarch64_vector_dispatch` executes `msr daifset, #0xf` before calling into \
-                 Rust"
-            ),
-            "the documented masking contract"
-        );
-        assert!(
-            ARM_BOOT.contains("msr daifset, #0xf"),
-            "and the instruction that implements it"
-        );
-
-        // All three ports: only the bootstrap CPU ever arms a timer, so the CPU a timer can
-        // arrive on is fixed. Asserted from the arch gate's own reason vocabulary.
-        assert!(
-            YIELD_TXN.contains("\"not_bsp\""),
-            "the non-bootstrap spelling exists, and no timer reaches it"
-        );
-    }
-
-    // ── DeferralHeld names its obligation ────────────────────────────────────────────────────
-
-    /// **Every producer of `DeferralHeld` is named with the drain that consumes it — and the one
-    /// producer that has NO drain is not described as though it had one.**
-    #[test]
-    fn deferral_held_identifies_the_obligation_that_will_actually_drain() {
-        let predicate = YIELD_TXN
-            .split("fn colliding_deferral_pending_for(cpu_idx: usize) -> bool {")
-            .nth(1)
-            .and_then(|s| s.split("\n}").next())
-            .expect("the collision predicate")
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<alloc::vec::Vec<_>>()
-            .join("\n");
-        // The three genuine cells.
-        for cell in [
-            "yield_dispatch_is_deferred(cpu_idx)",
-            "futex_wait_dispatch_is_deferred(cpu_idx)",
-            "riscv_queue_switch_foundation_is_deferred(cpu_idx)",
-        ] {
-            assert!(
-                predicate.contains(cell),
-                "`{cell}` must still be a producer"
-            );
-        }
-        // And the fourth producer, which is not a cell at all.
-        assert!(
-            predicate.contains("if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {"),
-            "the out-of-range arm must still be there — it is the producer the old justification \
-             mis-described"
-        );
-
-        // The route's documentation accounts for all four, and says which has no drain.
-        let doc = SPLIT
-            .split("# U9-PAGEFAULT1 §0 — `DeferralHeld` names its obligation")
-            .nth(1)
-            .and_then(|s| s.split("/// # U9-PAGEFAULT1 §0 — `NotRunning`").next())
-            .expect("the DeferralHeld derivation");
-        for producer in [
-            "yield_dispatch_is_deferred(cpu)",
-            "futex_wait_dispatch_is_deferred(cpu)",
-            "riscv_queue_switch_foundation_is_deferred(cpu)",
-            "cpu_idx >= MAX_CPUS",
-        ] {
-            assert!(
-                doc.contains(producer),
-                "the derivation must name the producer `{producer}`"
-            );
-        }
-        assert!(
-            doc.contains("**nothing**"),
-            "and must say plainly that the out-of-range producer has no drain"
-        );
-        assert!(
-            doc.contains("post-lock Yield drain"),
-            "while the genuine cells name the drain that consumes them"
+            doc.contains("the optional change is dropped"),
+            "and that the behaviour change was dropped rather than kept"
         );
     }
 }

@@ -19985,3 +19985,59 @@ the transaction opens no broad acquisition. All affected integration gates green
 `CowCandidate`, and `KernelOrAbsentTask` on every port. The last of those is the kernel-fatal
 boundary and is not a conversion candidate; the other three are evidence gaps of the same shape
 demand had, and each needs its own witness before its row can move.
+
+## U9-PAGEFAULT1 §4a — the timer's `ContinueCurrent` continue is DROPPED
+
+A correction to §0, found by checking the precedent it rested on against executable code rather
+than against my own summary of it.
+
+### The cited precedent does not hold
+
+§0 continued the timer when `entering_frame_authority_split_read` answered `OwnsEnteringFrame`,
+and justified it this way: *"`recv_block_unwind_exact_split` constructs exactly it — rank-2 writes
+`Runnable`, rank-1 restores the exact current slot — calls it `Restored`, and its caller then
+returns through the entering frame."*
+
+The first half is right and the conclusion is wrong. `RecvUnwindOutcome::Restored` is a claim about
+a **running** incarnation — *"its TCB says `Running`"* — and the rank-2 `Runnable` write is
+followed by an exact-incarnation `apply_task_transition(tid, Some(asid), …)` **commit** that
+establishes it. `restore_entering_incarnation_exact_split` records why, in its own words:
+
+> **Status.** A task whose TCB says `Runnable` is, to every dispatch transition in the tree, a task
+> that has not been selected to run. Reporting `Restored` for it permitted userspace execution from
+> a status that says otherwise — `dispatch_transition_would_be_accepted` would still accept it, so
+> a second CPU could select and mark it while this one was returning to ring 3 through the same
+> incarnation.
+
+That is a **defect U9-RECV-BLOCK2 §2 closed**, not a pattern to copy. The timer route commits
+nothing, so continuing returned through the frame of a `Runnable` task — the state that
+documentation calls out, not the state it permits.
+
+### Why it is dropped rather than repaired
+
+Two ways to keep the continue, and both are wrong here:
+
+* **Buy it with a commit.** A `Runnable → Running` transition would satisfy the precedent, and it
+  would put a mutation into a route whose entire contract is that a decline writes nothing.
+* **Keep it on the narrower argument** that `placement_of == Current(this cpu)` blocks the specific
+  race, since an unqueued task cannot be dequeued. That may well be true, and it is not the point:
+  the change was **optional**. Base answered this refusal with `Err(KernelError::TaskMissing)`,
+  which both ISRs treat as fatal, so continuing was never required by anything.
+
+So every `NotRunning` verdict is now fail-closed, exactly as delivered.
+
+### What the authority read is still for
+
+It no longer decides anything; it names things. The fatal report now says which of six states the
+CPU was actually in — `owns_entering_frame`, `incarnation_not_resumable`, `current_on_another_cpu`,
+`second_placement`, `queued_for_dispatch`, `placed_nowhere` — instead of "task missing", which
+cannot distinguish a blocked task from a replacement incarnation from a task another CPU is
+running. That is worth one read on a path about to halt the kernel. It is not worth a behaviour
+change, and the helper is justified on the diagnostic ground alone rather than on the dropped one.
+
+`the_recv_restoration_precedent_requires_a_running_commit` pins all of it: `Restored`'s `Running`
+claim, the owner's own account of why `Runnable` is insufficient, the exact-incarnation commit,
+the timer route minting no commit of its own, base's `Err(TaskMissing)`, both ISRs' halts, and the
+route documentation stating the reversal rather than leaving the old claim standing.
+
+Hosted **5686 passed / 0 failed / 2 ignored**. Three freestanding builds clean. Census 7/7.
