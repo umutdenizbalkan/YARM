@@ -329,6 +329,89 @@ pub(crate) fn evaluate_page_fault_class(facts: PageFaultFacts) -> PageFaultClass
     PageFaultClass::TerminallyUnhandled
 }
 
+/// U9-PAGEFAULT1 §2c — the outcome of the owner-local DEMAND recovery.
+///
+/// The same three-way split `CowRecovery` uses, and for the same reason: "declined" and "failed"
+/// have different rights. Everything named `Refused*` happened BEFORE the first mutation and may
+/// fall through to the unchanged broad dispatcher, which will re-derive the same facts and do
+/// whatever it would have done. Everything named `FailedClosed*` happened AFTER a frame was
+/// allocated: the allocation has been rolled back exactly, but the broad path must NOT run,
+/// because it would allocate a SECOND frame for a fault it never saw declined.
+///
+/// A demand recovery is strictly simpler than a COW one — there is no old frame, no page copy, no
+/// refcount transition and no shootdown, because nothing was mapped at this address before. What
+/// it keeps unchanged is the allocation/rollback discipline, step for step.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DemandRecovery {
+    /// An anonymous page is mapped `USER_RW` at the faulting address and the task may resume at
+    /// the same instruction.
+    Committed { phys: crate::kernel::vm::PhysAddr },
+    /// Pre-mutation: the faulting incarnation is no longer the one that was classified.
+    RefusedIdentityChanged,
+    /// Pre-mutation: a mapping is already present. Another owner serviced this page between
+    /// classification and here, so this route has nothing to install — and installing anyway
+    /// would replace a translation it did not create.
+    RefusedMappingPresent,
+    /// Pre-mutation: the address is no longer inside a demand-backed region. The brk window can
+    /// shrink, and a route that ignored that would map a page the task no longer owns.
+    RefusedNotDemandRegion,
+    /// Pre-mutation: the faulting task has no resolvable CNode, so a cap cannot be minted for it.
+    RefusedNoCnode,
+    /// Pre-mutation: no frame, no object slot, or no cnode slot. Nothing was left allocated.
+    ///
+    /// This is the arm the first live witness run exercised for real: init's address space was at
+    /// `MAX_MAPPINGS`, so the broad twin's equivalent step answered
+    /// `VM_FULL reason=mapping_bookkeeping_full`.
+    RefusedAllocation,
+    /// Post-allocation: the freshly minted cap did not resolve to the frame it was minted for.
+    /// The allocation is rolled back.
+    ///
+    /// Each `FailedClosed*` carries the EXACT `KernelError` the broad arm produces at the same
+    /// step, so the trap the caller finally reports is the one it would have reported anyway.
+    FailedClosedResolve(crate::kernel::boot::KernelError),
+    /// Post-allocation: installing the mapping failed. The allocation is rolled back and the
+    /// address space is untouched — `map_page` either inserted the entry or it did not.
+    FailedClosedMap(crate::kernel::boot::KernelError),
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl DemandRecovery {
+    /// True only for the outcomes that mutated nothing and may therefore reach the broad arm.
+    pub(crate) fn may_fall_back_to_broad(self) -> bool {
+        matches!(
+            self,
+            Self::RefusedIdentityChanged
+                | Self::RefusedMappingPresent
+                | Self::RefusedNotDemandRegion
+                | Self::RefusedNoCnode
+                | Self::RefusedAllocation
+        )
+    }
+
+    /// The refusal/failure reason as the marker text, so no call site invents its own spelling.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Committed { .. } => "committed",
+            Self::RefusedIdentityChanged => "identity_changed",
+            Self::RefusedMappingPresent => "mapping_present",
+            Self::RefusedNotDemandRegion => "not_demand_region",
+            Self::RefusedNoCnode => "no_cnode",
+            Self::RefusedAllocation => "allocation",
+            Self::FailedClosedResolve(_) => "resolve_failed",
+            Self::FailedClosedMap(_) => "map_failed",
+        }
+    }
+
+    /// The error a `FailedClosed*` outcome must report, or `None` for everything else.
+    pub(crate) fn failed_closed_error(self) -> Option<crate::kernel::boot::KernelError> {
+        match self {
+            Self::FailedClosedResolve(e) | Self::FailedClosedMap(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// U9-PF §1 — the authorized routing matrix, in ONE place.
 ///
 /// A class is routed off the broad dispatcher only where an EXISTING live witness proves the
@@ -344,6 +427,8 @@ pub(crate) enum PageFaultRoute {
     SplitCow,
     /// AArch64 terminal user fault — the owner-local terminal fault transaction.
     SplitTerminal,
+    /// U9-PAGEFAULT1 §2c — demand candidate, the owner-local demand recovery.
+    SplitDemand,
     /// The unchanged broad path, entered before any mutation.
     Broad,
 }
@@ -372,7 +457,26 @@ pub(crate) fn page_fault_route_for(arch: &str, class: PageFaultClass) -> PageFau
         ("aarch64", PageFaultClass::CowCandidate) => PageFaultRoute::SplitCow,
         // Live-witnessed at base: 1 x terminal user read at 0x0 in the core profile.
         ("aarch64", PageFaultClass::TerminallyUnhandled) => PageFaultRoute::SplitTerminal,
-        // EVERY demand candidate stays broad, on every architecture: zero live witnesses.
+        // U9-PAGEFAULT1 §2c/§3 — the demand class, on all three architectures.
+        //
+        // This row read "EVERY demand candidate stays broad, on every architecture: zero live
+        // witnesses" and that was accurate: nothing in any profile produced a demand fault, so
+        // the class could not be admitted on evidence. §3 built the witness — `VmBrk` grows the
+        // break and leaves the pages lazy, so touching inside the grown window is a demand fault
+        // by construction — and measured the baseline on each port, all three 8/8 recovered with
+        // the faulting instruction retried and the register file intact.
+        //
+        // The transaction is architecture-neutral in substance, not by assertion: it allocates a
+        // frame, mints a cap and installs one `USER_RW` mapping through the same owners the COW
+        // transaction already drives on every port, and it needs none of the per-architecture
+        // obligations COW does — no old frame, no page copy, no refcount transition, no
+        // shootdown, because nothing was mapped at the faulting address before. The one
+        // architecture-sensitive step, dropping a cached negative walk, is the same
+        // `invalidate_page` the broad demand handler calls at the same point.
+        ("x86_64" | "aarch64" | "riscv64", PageFaultClass::DemandCandidate) => {
+            PageFaultRoute::SplitDemand
+        }
+        // Any other architecture keeps the unchanged broad path.
         (_, PageFaultClass::DemandCandidate) => PageFaultRoute::Broad,
         // No other architecture/class pair has a witness.
         _ => PageFaultRoute::Broad,

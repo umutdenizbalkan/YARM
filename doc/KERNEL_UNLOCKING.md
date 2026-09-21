@@ -19911,3 +19911,77 @@ x86_64 core smoke with the witness armed: exit 0.
 
 AArch64 and RISC-V witness runs; the split demand route; and the matrix rows for x86_64 terminal,
 RISC-V COW/terminal and demand everywhere.
+
+## U9-PAGEFAULT1 §2c — the demand class is converted, on all three ports
+
+The first PageFault class this mission moves off the terminal broad acquisition, and the first one
+admitted on a witness built for it rather than found lying around.
+
+### Order of work, which is the point
+
+§3 built the witness and measured the baseline **first** — 8 faults, 8 broad services, per boot on
+each port. Only then did §2c change `page_fault_route_for`. The guard that previously read *"every
+demand candidate stays broad — this is the guard that must fail if a later increment routes demand
+without first providing a witness"* did exactly its job; it is re-derived, not deleted, and the
+standard it enforced is preserved in the arm that still answers `Broad` for an unwitnessed
+architecture.
+
+### The transaction composes existing owners and invents none
+
+`SharedKernel::demand_recover_page_split` is the `DemandCandidate` twin of
+`cow_recover_private_copy_split`, built from the owners that transaction already drives: the frame
+allocator, `create_memory_object_slot_locked`, `mint_capability_with_memory_ref_split`,
+`resolve_memory_object_phys_for_task_split`, `with_vm_user_spaces_split_mut`'s `map_page`,
+`note_mapping_inserted_locked`, and for rollback `rollback_minted_cap_split` +
+`reclaim_memory_object_for_phys_locked`. A guard asserts each, and asserts the four COW-only steps
+are **absent** — no shootdown, no page copy, no refcount removal, no COW-mark clear — because
+nothing was mapped at the faulting address before.
+
+**Revalidation.** Classification happens earlier and off-lock, so all four facts it rested on are
+re-read before the first frame is taken: the mapping is still absent, the address is still inside a
+demand-backed region (re-evaluated through `evaluate_demand_backed_region`, the one rule owner —
+the captured `facts.demand_region` is deliberately *not* trusted, because the brk window can
+shrink), the task is still `current` on the classifying CPU, and its ASID still matches. Each has
+its own typed refusal.
+
+**The allocation is the fallback boundary.** Before it every outcome is `Refused*` and may fall
+through; after it every outcome is `FailedClosed*` and must not, because the broad path would
+allocate a second frame for a fault it never saw declined. Every post-allocation failure runs one
+exact inverse, asserted as an enumeration rather than a count.
+
+### Attribution: the demand route does not borrow the COW route's reason
+
+A first draft had the demand route set `cow_recovered`. The two outcomes are structurally
+identical — a handled trap that changed no scheduler state, whose task resumes at the same
+instruction — and that is precisely why borrowing is wrong: an observer reading
+`reason=cow_recovered` for a demand fault would be told a private copy was made when none was. The
+route has its own flag, its own result cell and its own skip reason, and the bridges chain the two
+results with `or`, which is exact because each route is skipped once the other has handled the
+fault.
+
+### Live evidence: before and after, all three ports
+
+| port | before (§3a baseline) | after (§2c) | witness seal |
+|---|---|---|---|
+| x86_64 | 8 `PAGE_FAULT_ENTRY`, 8 `PAGE_FAULT_HANDLED_DEMAND` (broad) | 8 `PF1_DEMAND_SPLIT_COMMITTED`, 0 refused | `rounds=8 recovered=8 regs_ok=8 checked=4 result=ok` |
+| AArch64 | — | 8 `PF1_DEMAND_SPLIT_COMMITTED`, 0 refused | `rounds=8 recovered=8 regs_ok=8 checked=4 result=ok` |
+| RISC-V | — | 8 `PF1_DEMAND_SPLIT_COMMITTED`, 0 refused | `rounds=8 recovered=8 regs_ok=8 checked=0 result=ok` |
+
+Boot exit 0 on every port, before and after. The userspace seal is the part that matters: the
+faulting instruction retried, the store landed with its round-dependent operand, and on the two
+ports where registers can be named in inline asm all four callee-saved sentinels came back intact.
+RISC-V reports `checked=0` — the vacuous case, visible rather than hidden.
+
+### Qualification
+
+Hosted **5689 passed / 0 failed / 2 ignored**, single-threaded. Three freestanding builds clean.
+`broad_lock_census_guard` 7/7 — `with_cpu=2`, `with_broad=0`, raw wrapper bodies 3, **unchanged**:
+the transaction opens no broad acquisition. All affected integration gates green;
+`server_dies_runner_scope` exactly 8 pass / 2 fail on the two established cases.
+
+### Still open
+
+`page_fault_route_for` rows that remain `Broad`: x86_64 and RISC-V `TerminallyUnhandled`, RISC-V
+`CowCandidate`, and `KernelOrAbsentTask` on every port. The last of those is the kernel-fatal
+boundary and is not a conversion candidate; the other three are evidence gaps of the same shape
+demand had, and each needs its own witness before its row can move.

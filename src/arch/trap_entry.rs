@@ -719,6 +719,11 @@ pub fn handle_trap_entry_shared(
     // reusing either of the others would tell an observer something false about what happened.
     let mut cow_recovered = false;
     let mut cow_result: Option<Result<(), TrapHandleError>> = None;
+    // U9-PAGEFAULT1 §2c: the DEMAND route's own pair. Separate from the COW route's for the
+    // reason every other disposition here is separate — a borrowed reason tells an observer
+    // something false about what happened.
+    let mut demand_recovered = false;
+    let mut demand_result: Option<Result<(), TrapHandleError>> = None;
     // U9-TM §2: the pre-lock TIMER route. It runs before the syscall seam and is mutually
     // exclusive with it — a timer interrupt carries no syscall NR — and it refuses BEFORE any
     // claim, tick or mutation when a proof knob is armed or when this tick would preempt, so a
@@ -766,7 +771,37 @@ pub fn handle_trap_entry_shared(
                 }
             }
         }
-        if pf.is_some() && !cow_recovered {
+        // U9-PAGEFAULT1 §2c: the DEMAND route, between COW and terminal — the broad arm's own
+        // order.
+        //
+        // It carries its OWN flag and its OWN skip reason rather than reusing the COW route's.
+        // The two outcomes are structurally identical — a handled trap that changed no scheduler
+        // state, whose task resumes at the same instruction — and that is exactly why borrowing
+        // would be wrong: an observer reading `reason=cow_recovered` for a demand fault would be
+        // told a private copy was made when none was.
+        if pf.is_some() && !cow_recovered && !demand_recovered {
+            match crate::kernel::syscall_split::try_split_demand_page_fault_dispatch(
+                shared, cpu, pf,
+            ) {
+                SplitDispatchDisposition::NotHandled => {}
+                SplitDispatchDisposition::Complete(result) => {
+                    demand_recovered = true;
+                    demand_result = Some(result);
+                }
+                other => {
+                    crate::yarm_log!(
+                        "PF1_DEMAND_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(
+                        false,
+                        "the demand PageFault route yields NotHandled or Complete"
+                    );
+                }
+            }
+        }
+        if pf.is_some() && !cow_recovered && !demand_recovered {
             match crate::kernel::syscall_split::try_split_terminal_page_fault_dispatch(
                 shared,
                 cpu,
@@ -1275,12 +1310,15 @@ pub fn handle_trap_entry_shared(
     // a successful acquisition of nothing and a successful handler, so both `?` sites below stay
     // untouched.
     let inner_result: Result<Result<(), TrapHandleError>, TrapHandleError> =
-        if queue_advance_committed || post_work_committed || cow_recovered {
+        if queue_advance_committed || post_work_committed || cow_recovered || demand_recovered {
             crate::yarm_log!(
                 "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason={}",
                 cpu.0,
                 if queue_advance_committed {
                     "publication_committed"
+                } else if demand_recovered {
+                    // U9-PAGEFAULT1 §2c — its own reason, never the COW route's.
+                    "demand_recovered"
                 } else if post_work_committed {
                     // Set by the timer route (a tick that changed no scheduler state) or, since
                     // 199G-C4 §2, by the NR 1 route (a delivery or a blocking publication the
@@ -1294,7 +1332,7 @@ pub fn handle_trap_entry_shared(
             // U9-COW1: a recovered COW fault carries the SAME result the broad arm would have
             // returned — `Ok(())` on success, the rolled-back failure's error otherwise — so the
             // two `?` sites below behave identically whichever owner handled the fault.
-            Ok(cow_result.unwrap_or(Ok(())))
+            Ok(demand_result.or(cow_result).unwrap_or(Ok(())))
         } else {
             shared
                 .with_cpu(cpu, |kernel| {

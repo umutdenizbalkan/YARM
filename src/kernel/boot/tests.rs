@@ -146848,11 +146848,15 @@ mod u9qa_split_dispatch_disposition {
             "the committed arm must fall through to the drains, never return early"
         );
         // The broad phase is gated on the disposition, never on a stash inspection.
-        // U9-TM §2 added the post-work term to the same gate; U9-PAGEFAULT1 §2b added the
-        // COW term when this bridge gained a page-fault seam. The claim each carries is
-        // unchanged: every term is a ROUTE reporting its own outcome.
+        // U9-TM §2 added the post-work term to the same gate; U9-PAGEFAULT1 §2b added the COW
+        // term when this bridge gained a page-fault seam, and §2c the demand term when the
+        // demand class was admitted. The claim each carries is unchanged: every term is a ROUTE
+        // reporting its OWN outcome, never borrowing another's.
         let gate_at = RISCV_TRAP
-            .find("if queue_advance_committed || post_work_committed || cow_recovered {")
+            .find(
+                "if queue_advance_committed || post_work_committed || cow_recovered \
+                 || demand_recovered {",
+            )
             .expect("the broad-dispatch gate");
         let call = RISCV_TRAP
             .find(".with_cpu(cpu, |kernel| {")
@@ -148563,12 +148567,14 @@ mod u9tm_proof_gate {
             (
                 "shared",
                 include_str!("../../arch/trap_entry.rs"),
-                "if queue_advance_committed || post_work_committed || cow_recovered {",
+                "if queue_advance_committed || post_work_committed || cow_recovered \
+                 || demand_recovered {",
             ),
             (
                 "riscv",
                 include_str!("../../arch/riscv64/trap.rs"),
-                "if queue_advance_committed || post_work_committed || cow_recovered {",
+                "if queue_advance_committed || post_work_committed || cow_recovered \
+                 || demand_recovered {",
             ),
         ] {
             assert!(
@@ -148595,14 +148601,25 @@ mod u9tm_proof_gate {
             // would claim a terminal transition that never happened, and reusing
             // `post_work_committed` would claim work the route did not do.
             assert!(
-                src.contains("\"cow_recovered\"") || src.contains("cow_result.unwrap_or(Ok(()))"),
+                src.contains("\"cow_recovered\"")
+                    || src.contains("demand_result.or(cow_result).unwrap_or(Ok(()))"),
                 "{name} bridge: the COW arm must report its own outcome rather than borrow one"
             );
             // And it carries the route's OWN result, so every `?` below behaves identically
             // whichever owner handled the fault.
+            // U9-PAGEFAULT1 §2c: two recovery routes now, each with its own result cell, and
+            // the chain must prefer the one that actually ran. `or` is the right combinator —
+            // at most one of them is ever `Some`, because each route is skipped once the other
+            // has handled the fault.
             assert!(
-                src.contains("Ok(cow_result.unwrap_or(Ok(())))"),
+                src.contains("Ok(demand_result.or(cow_result).unwrap_or(Ok(())))"),
                 "{name} bridge: the recovered result must be the route's, not a fabricated Ok"
+            );
+            // Each route declares its own recovery exactly once.
+            assert_eq!(
+                src.matches("demand_recovered = true;").count(),
+                1,
+                "{name} bridge: exactly one place may declare a DEMAND recovery committed"
             );
             let gate = src.find(arms).expect("the gate");
             let call = src
@@ -148767,6 +148784,12 @@ mod u9pf_classification {
                     // died at the first recovered fault for a reason outside COW entirely.
                     ("aarch64", CowCandidate) => SplitCow,
                     ("aarch64", TerminallyUnhandled) => SplitTerminal,
+                    // U9-PAGEFAULT1 §2c/§3: admitted on a witness earned in that increment, on
+                    // ALL THREE ports. `VmBrk` growth leaves the pages lazy, so touching inside
+                    // the grown window is a demand fault by construction; the witness measured
+                    // 8/8 recovered on each architecture with the faulting instruction retried
+                    // and the register file intact.
+                    (_, DemandCandidate) => SplitDemand,
                     _ => Broad,
                 };
                 assert_eq!(got, want, "route drifted for arch={arch} class={class:?}");
@@ -148774,18 +148797,37 @@ mod u9pf_classification {
         }
     }
 
-    /// EVERY demand candidate stays broad on EVERY architecture — the class has zero live
-    /// witnesses, so U9-PF routes none of it. This is the guard that must fail if a later
-    /// increment routes demand without first providing a witness.
+    /// **Every demand candidate is now ROUTED on every supported architecture — and the guard
+    /// that demanded a witness first is what made that legitimate.**
+    ///
+    /// This case read "every demand candidate stays broad on every architecture — the class has
+    /// zero live witnesses, so U9-PF routes none of it. This is the guard that must fail if a
+    /// later increment routes demand without first providing a witness."
+    ///
+    /// It did its job exactly as written. U9-PAGEFAULT1 §3 provided the witness before §2c
+    /// changed the matrix: `VmBrk` growth leaves the pages lazy, so a touch inside the grown
+    /// window is a demand fault produced by the production owner rather than simulated, and the
+    /// measured baseline was 8 faults and 8 broad services per boot on each port. Only then was
+    /// the row changed.
+    ///
+    /// So the claim inverts, and the standard it enforced does not: an architecture may be here
+    /// only with a live witness behind it, which is why the unsupported-architecture arm still
+    /// answers `Broad`.
     #[test]
-    fn every_demand_candidate_stays_broad() {
+    fn every_demand_candidate_is_routed_on_the_witnessed_architectures() {
         for arch in ["x86_64", "aarch64", "riscv64"] {
             assert_eq!(
                 page_fault_route_for(arch, PageFaultClass::DemandCandidate),
-                PageFaultRoute::Broad,
-                "demand must stay broad on {arch}: the class has no live witness"
+                PageFaultRoute::SplitDemand,
+                "demand is witnessed on {arch} and must be routed"
             );
         }
+        // An architecture with no witness — and no port at all — keeps the unchanged broad path.
+        assert_eq!(
+            page_fault_route_for("nonesuch", PageFaultClass::DemandCandidate),
+            PageFaultRoute::Broad,
+            "an unwitnessed architecture must not inherit the admission"
+        );
     }
 
     /// The two split routes are claimed for exactly ONE architecture each, never widened to an
@@ -149245,6 +149287,9 @@ mod u9ft2_one_evaluator {
                     // died at the first recovered fault for a reason outside COW entirely.
                     ("aarch64", CowCandidate) => SplitCow,
                     ("aarch64", TerminallyUnhandled) => SplitTerminal,
+                    // U9-PAGEFAULT1 §2c/§3 — the demand class, admitted on a witness earned
+                    // there and measured on all three ports before the row changed.
+                    (_, DemandCandidate) => SplitDemand,
                     _ => Broad,
                 };
                 assert_eq!(
@@ -151001,9 +151046,18 @@ mod u9cow2_route {
                 "a recovered COW fault must not reach `{forbidden}`"
             );
         }
+        // U9-PAGEFAULT1 §2c re-derivation: the bridge now has TWO recovery routes, each with
+        // its own result cell, so the carry is a chain rather than a single cell. The claim is
+        // unchanged — the result is the ROUTE's, never a fabricated `Ok` — and `or` is exact:
+        // at most one cell is ever `Some`, because each route is skipped once the other has
+        // handled the fault.
         assert!(
-            TRAP_SRC.contains("Ok(cow_result.unwrap_or(Ok(())))"),
+            TRAP_SRC.contains("Ok(demand_result.or(cow_result).unwrap_or(Ok(())))"),
             "the bridge must carry the route's own result, exactly as the broad arm would"
+        );
+        assert!(
+            !TRAP_SRC.contains("Ok(cow_result.unwrap_or(Ok(())))"),
+            "and the single-cell form must be gone, not left beside the chain"
         );
     }
 }
@@ -162229,10 +162283,14 @@ mod u9a64cow2_split_route {
             "RISC-V has no independent COW witness and stays broad"
         );
         for arch in ["x86_64", "aarch64", "riscv64"] {
+            // U9-PAGEFAULT1 §2c/§3 re-derivation: demand paging WAS out of scope for the
+            // AArch64 COW increment, and is now admitted on all three ports — on a witness
+            // earned first, measured at 8/8 recovered per boot on each. The claim this case
+            // still carries is the one below it: a KERNEL fault is never split-routed.
             assert_eq!(
                 page_fault_route_for(arch, PageFaultClass::DemandCandidate),
-                PageFaultRoute::Broad,
-                "demand paging is out of scope on {arch}"
+                PageFaultRoute::SplitDemand,
+                "demand is witnessed and routed on {arch}"
             );
             assert_eq!(
                 page_fault_route_for(arch, PageFaultClass::KernelOrAbsentTask),
@@ -183334,5 +183392,384 @@ mod u9pf1_fault_origin {
             pred.contains("let code = scause & !INTERRUPT_BIT;"),
             "and must compare the cause code with the interrupt bit masked off"
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// U9-PAGEFAULT1 §2c — the DEMAND recovery transaction and its route.
+//
+// The class §1 found routed `Broad` on every port with zero live witnesses. §3 built the witness
+// first and measured the baseline; only then was the matrix row changed. These cases hold what
+// the transaction owes: it composes the owners the COW transaction already drives rather than
+// inventing any, it revalidates every fact classification rested on, its first allocation is the
+// fallback boundary, and every failure past that boundary runs one exact inverse.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod u9pf1_demand_route {
+    use crate::kernel::boot::{
+        DemandRecovery, PageFaultClass, PageFaultRoute, page_fault_route_for,
+    };
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    /// The demand transaction, CODE only.
+    fn txn() -> alloc::string::String {
+        let i = RUNTIME_SRC
+            .find("pub(crate) fn demand_recover_page_split(")
+            .expect("the demand transaction must exist");
+        let rest = &RUNTIME_SRC[i..];
+        let end = rest
+            .find("\n    /// U9-COW1 §3 — the page copy")
+            .or_else(|| rest.find("\n    /// U9-"))
+            .expect("the transaction is followed by another documented item");
+        rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The split route, CODE only.
+    fn route() -> alloc::string::String {
+        SPLIT_SRC
+            .split("fn try_split_demand_page_fault_into_frame(\n    shared: &SharedKernel,")
+            .nth(1)
+            .and_then(|s| {
+                s.split("\n#[cfg(feature = \"hosted-dev\")]\nfn try_split_demand_page_fault_into_frame(")
+                    .next()
+            })
+            .expect("the demand route")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn at(hay: &str, needle: &str) -> usize {
+        hay.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` must exist"))
+    }
+
+    // ── the outcome type ─────────────────────────────────────────────────────────────────────
+
+    /// **The three-way split is exact: pre-mutation outcomes may fall back, post-allocation ones
+    /// may not.**
+    ///
+    /// The distinction is the whole safety argument. A `FailedClosed*` that fell back would let
+    /// the broad path allocate a SECOND frame for a fault it never saw declined.
+    #[test]
+    fn only_pre_mutation_outcomes_may_reach_the_broad_arm() {
+        use DemandRecovery as R;
+        for refused in [
+            R::RefusedIdentityChanged,
+            R::RefusedMappingPresent,
+            R::RefusedNotDemandRegion,
+            R::RefusedNoCnode,
+            R::RefusedAllocation,
+        ] {
+            assert!(
+                refused.may_fall_back_to_broad(),
+                "{refused:?} mutated nothing and must be able to fall back"
+            );
+            assert!(
+                refused.failed_closed_error().is_none(),
+                "{refused:?} is not a failure and carries no error"
+            );
+        }
+        for failed in [
+            R::FailedClosedResolve(crate::kernel::boot::KernelError::MemoryObjectMissing),
+            R::FailedClosedMap(crate::kernel::boot::KernelError::MemoryObjectMissing),
+        ] {
+            assert!(
+                !failed.may_fall_back_to_broad(),
+                "{failed:?} allocated a frame and must NOT fall back"
+            );
+            assert!(
+                failed.failed_closed_error().is_some(),
+                "{failed:?} must carry the exact error the broad arm would produce"
+            );
+        }
+        // A commit is neither.
+        let committed = R::Committed {
+            phys: crate::kernel::vm::PhysAddr(0x1000),
+        };
+        assert!(!committed.may_fall_back_to_broad());
+        assert!(committed.failed_closed_error().is_none());
+        // Every outcome names itself distinctly, so a marker cannot conflate two.
+        let all = [
+            R::Committed {
+                phys: crate::kernel::vm::PhysAddr(0x1000),
+            },
+            R::RefusedIdentityChanged,
+            R::RefusedMappingPresent,
+            R::RefusedNotDemandRegion,
+            R::RefusedNoCnode,
+            R::RefusedAllocation,
+            R::FailedClosedResolve(crate::kernel::boot::KernelError::MemoryObjectMissing),
+            R::FailedClosedMap(crate::kernel::boot::KernelError::MemoryObjectMissing),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(i == j, a.reason() == b.reason(), "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    // ── the transaction ──────────────────────────────────────────────────────────────────────
+
+    /// **Every fact classification rested on is RE-READ before anything is allocated.**
+    ///
+    /// Classification happened earlier and off-lock. The brk window can shrink, another owner can
+    /// service the page, and the task can be replaced — so trusting the captured facts would map
+    /// a page the task no longer owns, replace a translation this route did not create, or act
+    /// for an incarnation that is gone.
+    #[test]
+    fn the_transaction_revalidates_every_classified_fact_before_the_first_frame() {
+        let t = txn();
+        let alloc = at(&t, "alloc_contiguous(1)");
+        for (needle, why) in [
+            ("space.resolve(page)", "the mapping must be re-read"),
+            (
+                "fault_addr_in_demand_backed_region_split_read(facts.tid, page.0)",
+                "the demand-region rule must be re-evaluated",
+            ),
+            (
+                "self.current_tid_split_read(facts.cpu) != Some(facts.tid)",
+                "the faulting task must still be current on the classifying CPU",
+            ),
+            ("task_cnode_split(facts.tid)", "the cnode must be resolved"),
+        ] {
+            let pos = at(&t, needle);
+            assert!(pos < alloc, "{why}, and BEFORE the first allocation");
+        }
+        // Each re-read has its own typed refusal, so a marker says which fact moved.
+        for refusal in [
+            "return R::RefusedMappingPresent;",
+            "return R::RefusedNotDemandRegion;",
+            "return R::RefusedIdentityChanged;",
+            "return R::RefusedNoCnode;",
+        ] {
+            let pos = at(&t, refusal);
+            assert!(pos < alloc, "`{refusal}` must precede the first allocation");
+        }
+        // The captured `facts.demand_region` is NOT trusted — it is re-derived.
+        assert!(
+            !t.contains("facts.demand_region"),
+            "the captured demand-region flag must not be trusted; it can go stale"
+        );
+    }
+
+    /// **The first frame is the fallback boundary, and every failure past it runs ONE exact
+    /// inverse.**
+    ///
+    /// Stated as the enumeration rather than a count: every `FailedClosed` return must be
+    /// preceded by the rollback. A bare count lets a newly added arm slip through by coincidence.
+    #[test]
+    fn every_post_allocation_failure_runs_the_one_inverse() {
+        let t = txn();
+        let alloc = at(&t, "alloc_contiguous(1)");
+        let after = &t[alloc..];
+        let mut failures = 0usize;
+        for (idx, _) in after.match_indices("return R::FailedClosed") {
+            failures += 1;
+            let before = &after[..idx];
+            assert!(
+                before.rfind("rollback(self);").unwrap_or(0) > 0,
+                "a FailedClosed return at byte {idx} is not preceded by the inverse"
+            );
+        }
+        assert!(
+            failures >= 4,
+            "resolve (mismatch + error) and map (error + no-aspace) are the post-allocation failure arms, found {failures}"
+        );
+        // The inverse itself: revoke the slot + drop the mint refcount, then reclaim the frame
+        // once the object is unreferenced. ONE closure, not N hand-written cleanups.
+        let rb = after
+            .split("let rollback = |shared: &Self| {")
+            .nth(1)
+            .expect("the rollback closure")
+            .split("};")
+            .next()
+            .expect("its body");
+        assert!(
+            rb.contains("rollback_minted_cap_split(cnode, mem_cap, object)")
+                && rb.contains("reclaim_memory_object_for_phys_locked(memory, phys)"),
+            "the inverse must revoke the mint and reclaim the object/frame"
+        );
+        // And the two pre-mint allocation failures release what they took, without the closure —
+        // which does not exist yet at those points.
+        assert!(
+            after.contains("free_frame(phys.0)"),
+            "a failed object slot must return the frame it would have owned"
+        );
+    }
+
+    /// **The transaction composes EXISTING owners and invents none.**
+    #[test]
+    fn the_transaction_drives_the_owners_the_cow_transaction_already_drives() {
+        let t = txn();
+        for owner in [
+            "with_vm_user_spaces_split_mut",
+            "with_memory_split_mut",
+            "with_task_tcbs_split_mut",
+            "mint_capability_with_memory_ref_split",
+            "resolve_memory_object_phys_for_task_split",
+            "create_memory_object_slot_locked",
+            "note_mapping_inserted_locked",
+            "rollback_minted_cap_split",
+            "reclaim_memory_object_for_phys_locked",
+        ] {
+            assert!(
+                t.contains(owner),
+                "the transaction must drive the existing owner `{owner}`"
+            );
+            assert!(
+                RUNTIME_SRC.matches(&alloc::format!("fn {owner}")).count()
+                    + RUNTIME_SRC.matches(owner).count()
+                    > 0,
+                "`{owner}` must be a real owner"
+            );
+        }
+        // No broad acquisition anywhere.
+        for broad in [".with(|", "with_cpu(", "state.lock()"] {
+            assert!(
+                !t.contains(broad),
+                "the transaction must not open the broad acquisition (`{broad}`)"
+            );
+        }
+        // It maps exactly USER_RW, the flag set the broad demand handler uses — nothing widened.
+        assert!(
+            t.contains("flags: crate::kernel::vm::PageFlags::USER_RW,"),
+            "an anonymous demand page is mapped USER_RW, exactly as the broad handler maps it"
+        );
+        // No shootdown, no copy, no refcount removal: there was no old frame.
+        for absent in [
+            "complete_unmap_shootdown_split",
+            "copy_cow_frame_contents_split",
+            "note_mapping_removed_locked",
+            "clear_cow_page_locked",
+        ] {
+            assert!(
+                !t.contains(absent),
+                "`{absent}` belongs to COW — a demand fault has no old frame"
+            );
+        }
+    }
+
+    // ── the route ────────────────────────────────────────────────────────────────────────────
+
+    /// **The route screens exactly what the broad demand handler screens, in the same places.**
+    #[test]
+    fn the_route_keeps_the_broad_handlers_screens() {
+        let r = route();
+        // Instruction fetches are refused: a demand page is USER_RW, never executable, and the
+        // broad handler's first act is the same refusal.
+        assert!(
+            r.contains("if matches!(fault.access, FaultAccess::Execute) {"),
+            "an instruction fetch must be refused, as the broad handler refuses it"
+        );
+        // A present mapping is the broad handler's stale-translation branch, not this route's.
+        assert!(
+            r.contains("if facts.mapping_present {"),
+            "a present mapping must be left to the broad stale-translation branch"
+        );
+        // Routing is the matrix's decision, taken through the one evaluator.
+        assert!(
+            r.contains("page_fault_route_for(arch, class)")
+                && r.contains("PageFaultRoute::SplitDemand"),
+            "the route must ask the matrix rather than re-deciding"
+        );
+        // A recovered demand fault changes no scheduler state.
+        for forbidden in [
+            "QueueAdvanceCommitted",
+            "dispatch_try_defer",
+            "PostWorkCommitted",
+            "TimerIdleQueueAdvance",
+        ] {
+            assert!(
+                !r.contains(forbidden),
+                "a recovered demand fault must not reach `{forbidden}` — it publishes nothing"
+            );
+        }
+        // Fallback is decided by the typed predicate, never by re-reading variants.
+        assert!(
+            r.contains("other.may_fall_back_to_broad()"),
+            "the route must decide fallback by the typed predicate"
+        );
+        // And a failed-closed outcome reports the route's own error, not a fabricated one.
+        // Matched on the method alone: rustfmt breaks the receiver onto its own line, and an
+        // anchor that assumed one line would assert nothing.
+        assert!(
+            r.contains(".failed_closed_error()"),
+            "a failed-closed outcome must carry the exact error the broad arm would produce"
+        );
+        assert!(
+            r.contains("KernelError::UserMemoryFault"),
+            "and its fallback must be the same one the COW route uses"
+        );
+    }
+
+    /// **The matrix admits demand on exactly the witnessed architectures.**
+    #[test]
+    fn the_matrix_row_matches_the_witnessed_ports() {
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert_eq!(
+                page_fault_route_for(arch, PageFaultClass::DemandCandidate),
+                PageFaultRoute::SplitDemand,
+                "{arch} has a live demand witness"
+            );
+        }
+        assert_eq!(
+            page_fault_route_for("nonesuch", PageFaultClass::DemandCandidate),
+            PageFaultRoute::Broad
+        );
+        // The other classes are untouched by this admission.
+        assert_eq!(
+            page_fault_route_for("riscv64", PageFaultClass::CowCandidate),
+            PageFaultRoute::Broad,
+            "RISC-V COW is a separate class with its own witness, and it is not admitted here"
+        );
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert_eq!(
+                page_fault_route_for(arch, PageFaultClass::KernelOrAbsentTask),
+                PageFaultRoute::Broad,
+                "a kernel or absent-task fault is never split-routed on {arch}"
+            );
+        }
+    }
+
+    /// **Both bridges consult the demand route, between COW and terminal.**
+    #[test]
+    fn both_bridges_consult_it_in_the_broad_arms_order() {
+        for (name, src) in [
+            ("shared", include_str!("../../arch/trap_entry.rs")),
+            ("riscv", include_str!("../../arch/riscv64/trap.rs")),
+        ] {
+            let cow = at(src, "try_split_cow_page_fault_dispatch(");
+            let demand = at(src, "try_split_demand_page_fault_dispatch(");
+            let terminal = at(src, "try_split_terminal_page_fault_dispatch(");
+            assert!(
+                cow < demand && demand < terminal,
+                "{name}: COW, then demand, then terminal — the broad arm's own order"
+            );
+            // Its own flag and its own result cell, never the COW route's.
+            assert_eq!(
+                src.matches("demand_recovered = true;").count(),
+                1,
+                "{name}: exactly one place may declare a demand recovery"
+            );
+            assert!(
+                src.contains("\"demand_recovered\"")
+                    || src.contains("demand_result.or(cow_result)"),
+                "{name}: the demand arm must carry its own outcome"
+            );
+            // The terminal route is skipped once demand handled the fault.
+            assert!(
+                src.contains("if pf.is_some() && !cow_recovered && !demand_recovered {"),
+                "{name}: a handled demand fault must not also reach the terminal route"
+            );
+        }
     }
 }

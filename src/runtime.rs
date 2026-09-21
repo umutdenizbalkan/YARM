@@ -7352,6 +7352,226 @@ impl SharedKernel {
         Ok(())
     }
 
+    /// U9-PAGEFAULT1 §2c — the demand-region rule, re-evaluated off-lock against live state.
+    ///
+    /// The rank-local twin of `KernelState::fault_addr_in_demand_backed_region`, reading the same
+    /// two facts from the same two owners `classify_page_fault_shared` already reads them from —
+    /// the task's `user_stack_top` at rank 2 and its brk bounds at rank 6 — and handing both to
+    /// the ONE rule owner, `evaluate_demand_backed_region`. No second notion of "demand backed"
+    /// comes into existence.
+    ///
+    /// It exists because the recovery has to REVALIDATE: the brk window can shrink between
+    /// classification and recovery, and a route that trusted the captured `facts.demand_region`
+    /// would map a page the task no longer owns.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) fn fault_addr_in_demand_backed_region_split_read(
+        &self,
+        tid: u64,
+        fault_addr: u64,
+    ) -> bool {
+        let user_stack_top = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.user_stack_top)
+        });
+        let brk_bounds = self.with_memory_split_mut(|memory| {
+            crate::kernel::boot::KernelState::task_brk_bounds_locked(memory, tid)
+        });
+        crate::kernel::boot::evaluate_demand_backed_region(brk_bounds, user_stack_top, fault_addr)
+    }
+
+    /// U9-PAGEFAULT1 §2c — the owner-local DEMAND recovery, off the broad lock.
+    ///
+    /// The `DemandCandidate` twin of [`Self::cow_recover_private_copy_split`], composed from the
+    /// SAME owners that transaction already drives. Nothing new is invented: the frame allocator,
+    /// the memory-object slot creator, the capability mint, the resolve-and-rights check and the
+    /// address-space `map_page` are each the one the broad
+    /// `KernelState::try_handle_demand_page_fault` reaches through its own `&mut self`.
+    ///
+    /// # It is simpler than COW, and the difference is the point
+    ///
+    /// Nothing is mapped at this address, so there is no old frame, no page copy, no refcount
+    /// transition to reverse and no shootdown to acknowledge. What is kept step for step is the
+    /// ALLOCATION AND ROLLBACK discipline: every pre-mutation condition is checked before the
+    /// first frame is taken, and every failure after that point runs the same exact inverse —
+    /// revoke the slot, drop the mint's refcount, free the frame once the object is unreferenced.
+    ///
+    /// # Revalidation, against the exact coordinates that were classified
+    ///
+    /// Classification happened earlier and off-lock, so all three facts it rested on are re-read
+    /// here before anything is allocated:
+    ///
+    /// * the faulting incarnation is still `current` on this CPU and still `{tid, asid}`;
+    /// * the mapping is still ABSENT — a present one means another owner serviced the page, and
+    ///   installing over it would replace a translation this route did not create;
+    /// * the address is still inside a demand-backed region — the brk window can shrink, and a
+    ///   route that ignored that would map a page the task no longer owns.
+    ///
+    /// # No broad fallback after mutation
+    ///
+    /// The first frame is the boundary. Before it, every outcome is `Refused*` and may fall
+    /// through. After it, every outcome is `FailedClosed*` and must not: the broad path would
+    /// allocate a second frame for a fault it never saw declined.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) fn demand_recover_page_split(
+        &self,
+        facts: crate::kernel::boot::PageFaultFacts,
+    ) -> crate::kernel::boot::DemandRecovery {
+        use crate::kernel::boot::{DemandRecovery as R, KernelState as KS};
+        use crate::kernel::capabilities::{CapObject, Capability};
+        use crate::kernel::vm::{Mapping, PhysAddr};
+
+        let asid = facts.asid;
+        let page = facts.page;
+
+        // (1) rank 2 + rank 4 — the EXACT faulting task's cnode.
+        let Some(cnode) = self.task_cnode_split(facts.tid) else {
+            return R::RefusedNoCnode;
+        };
+        // (2) rank 5 — the mapping, re-read. It must still be ABSENT: a present mapping is
+        // another owner's work, and the broad path's own stale-translation arm, not this one's.
+        let present = self.with_vm_user_spaces_split_mut(|spaces| {
+            spaces.get(asid).and_then(|space| space.resolve(page))
+        });
+        if present.is_some() {
+            return R::RefusedMappingPresent;
+        }
+        // (3) The demand-region rule, through the ONE owner both classification forms call, on
+        // facts re-read now rather than the ones captured earlier.
+        if !self.fault_addr_in_demand_backed_region_split_read(facts.tid, page.0) {
+            return R::RefusedNotDemandRegion;
+        }
+        // (4) The exact incarnation, still current on the CPU that classified it.
+        if self.current_tid_split_read(facts.cpu) != Some(facts.tid) {
+            return R::RefusedIdentityChanged;
+        }
+        if self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == facts.tid)
+                .and_then(|t| t.asid)
+        }) != Some(asid)
+        {
+            return R::RefusedIdentityChanged;
+        }
+
+        // ── FIRST MUTATION. Broad fallback is forbidden from here on. ───────────────────────
+        // (5a) rank 6 — one frame.
+        let Some(phys_raw) = self.with_memory_split_mut(|memory| {
+            crate::kernel::boot::kernel_mut(&mut memory.frame_allocator)
+                .alloc_contiguous(1)
+                .ok()
+        }) else {
+            return R::RefusedAllocation;
+        };
+        let phys = PhysAddr(phys_raw);
+        // (5b) rank 6 — the object slot, through the owner the broad creator also drives.
+        let max_objects = self.runtime_capacity_config_split_read().max_memory_objects;
+        let object_id = match self.with_memory_split_mut(|memory| {
+            KS::create_memory_object_slot_locked(
+                memory,
+                phys,
+                crate::kernel::vm::PAGE_SIZE,
+                crate::kernel::boot::MemoryObjectKind::Anonymous,
+                max_objects,
+            )
+        }) {
+            Ok(id) => id,
+            Err(_) => {
+                // The object slot is what would have owned the frame; without it nothing does,
+                // so the frame is returned here rather than being tracked by an absent owner.
+                self.with_memory_split_mut(|memory| {
+                    let _ = crate::kernel::boot::kernel_mut(&mut memory.frame_allocator)
+                        .free_frame(phys.0);
+                });
+                return R::RefusedAllocation;
+            }
+        };
+        let object = CapObject::MemoryObject { id: object_id };
+        // (5c) rank 6 then rank 4 — the cap, with the rights rule the broad creator uses.
+        let Ok(mem_cap) = self.mint_capability_with_memory_ref_split(
+            cnode,
+            Capability::new(
+                object,
+                KS::memory_object_rights_for_kind(crate::kernel::boot::MemoryObjectKind::Anonymous),
+            ),
+        ) else {
+            // The mint rolled back its own refcount bump; the object still holds the frame, so
+            // release both together through the same reclaim rule.
+            self.with_memory_split_mut(|memory| {
+                KS::reclaim_memory_object_for_phys_locked(memory, phys)
+            });
+            return R::RefusedAllocation;
+        };
+        // From here every failure runs this exact inverse.
+        let rollback = |shared: &Self| {
+            shared.rollback_minted_cap_split(cnode, mem_cap, object);
+            shared.with_memory_split_mut(|memory| {
+                KS::reclaim_memory_object_for_phys_locked(memory, phys)
+            });
+        };
+
+        // (6) The broad path's rights + object resolution, against the exact task.
+        match self.resolve_memory_object_phys_for_task_split(
+            facts.tid,
+            mem_cap,
+            crate::kernel::vm::PageFlags::USER_RW,
+        ) {
+            Ok(p) if p == phys => {}
+            Ok(_) => {
+                rollback(self);
+                return R::FailedClosedResolve(
+                    crate::kernel::boot::KernelError::MemoryObjectMissing,
+                );
+            }
+            Err(e) => {
+                rollback(self);
+                return R::FailedClosedResolve(e);
+            }
+        }
+
+        // (7) rank 5 — install the mapping. `USER_RW` is exactly the flag set the broad demand
+        // handler uses for an anonymous demand page; nothing is widened.
+        let installed = self.with_vm_user_spaces_split_mut(|spaces| {
+            spaces.get_mut(asid).map(|space| {
+                space.map_page(
+                    page,
+                    Mapping {
+                        phys,
+                        flags: crate::kernel::vm::PageFlags::USER_RW,
+                    },
+                )
+            })
+        });
+        match installed {
+            // `None` is the pre-mutation-shaped answer arriving AFTER the allocation, so it is
+            // still fail-closed: the address space vanished under us.
+            Some(Ok(_)) => {}
+            Some(Err(e)) => {
+                rollback(self);
+                return R::FailedClosedMap(crate::kernel::boot::KernelError::Vm(e));
+            }
+            None => {
+                rollback(self);
+                return R::FailedClosedMap(crate::kernel::boot::KernelError::Vm(
+                    crate::kernel::vm::VmError::InvalidAsid,
+                ));
+            }
+        }
+
+        // (8) rank 6 — the mapping bookkeeping the broad path performs for an inserted entry.
+        // There is no removal half: nothing was mapped here.
+        self.with_memory_split_mut(|memory| KS::note_mapping_inserted_locked(memory, phys));
+
+        // (9) The stale not-present translation. The fault was taken on an ABSENT entry, so some
+        // ports cache a negative walk; the broad handler invalidates the page for exactly this
+        // reason and this route does the same, with no domain lock held.
+        crate::arch::selected_isa::page_table::invalidate_page(page);
+
+        R::Committed { phys }
+    }
+
     /// U9-COW1 §3 — `KernelState::resolve_memory_object_phys` bound to an EXACT task rather than
     /// the ambient current one, through the task(2) → capability(4) → memory(6) split reads.
     ///

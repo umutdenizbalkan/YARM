@@ -571,6 +571,148 @@ fn try_split_cow_page_fault_into_frame(
     SplitDispatchDisposition::NotHandled
 }
 
+/// U9-PAGEFAULT1 §2c — the pre-lock DEMAND PageFault route.
+///
+/// Admits the class §3 witnessed on all three ports: a user fault inside a demand-backed region
+/// with no mapping present, which `page_fault_route_for` now routes `SplitDemand`.
+///
+/// It refuses BEFORE any mutation for every condition it does not admit, so a declined trap
+/// reaches the unchanged broad arm having changed nothing — and it is fail-closed after its first
+/// allocation, because the broad path would otherwise allocate a SECOND frame for a fault it
+/// never saw declined.
+///
+/// A recovered demand fault changes no scheduler state and publishes no deferral: the faulting
+/// task is still `Running` and still `current`, and it resumes at the same instruction. So this
+/// route returns `Complete`, exactly as the COW route does, never a queue advance.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_demand_page_fault_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    fault: Option<crate::kernel::trap::FaultInfo>,
+) -> SplitDispatchDisposition {
+    use crate::kernel::boot::{DemandRecovery as R, PageFaultRoute, page_fault_route_for};
+    use crate::kernel::trap::FaultAccess;
+    use SplitDispatchDisposition as D;
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "riscv64") {
+        "riscv64"
+    } else {
+        return D::NotHandled;
+    };
+    let Some(fault) = fault else {
+        return D::NotHandled;
+    };
+    // The broad demand handler refuses an instruction fetch outright — a demand page is mapped
+    // `USER_RW`, never executable — and this route keeps that screen in the same place, so the
+    // two cannot disagree about which accesses the class covers.
+    if matches!(fault.access, FaultAccess::Execute) {
+        return D::NotHandled;
+    }
+    // (1) Classify off-lock, through the ONE evaluator the broad arm uses. A supervisor origin,
+    // a stale identity or a kernel address all refuse here, before anything is decided.
+    let Ok((class, Some(facts))) = shared.classify_page_fault_shared(cpu, fault) else {
+        return D::NotHandled;
+    };
+    if !matches!(
+        page_fault_route_for(arch, class),
+        PageFaultRoute::SplitDemand
+    ) {
+        return D::NotHandled;
+    }
+    // (2) This route owns the FRESH-MAP arm only. A present mapping is the broad handler's
+    // stale-translation branch — an invalidate and a permission re-check, with no allocation —
+    // and it stays there rather than being reimplemented.
+    if facts.mapping_present {
+        return D::NotHandled;
+    }
+    // The marker the broad arm prints on entry, in the broad arm's position: this route
+    // intercepts BEFORE the arm that would have printed it, and the stream must stay faithful.
+    crate::yarm_log!(
+        "PAGE_FAULT_ENTRY tid={} addr=0x{:x} access={:?} rip=0x{:x}",
+        facts.tid,
+        fault.addr.0,
+        fault.access,
+        0usize
+    );
+
+    // (3) THE TRANSACTION.
+    let outcome = shared.demand_recover_page_split(facts);
+    match outcome {
+        R::Committed { phys } => {
+            crate::yarm_log!(
+                "PF1_DEMAND_SPLIT_COMMITTED cpu={} tid={} asid={} va=0x{:x} pa=0x{:x} broad_lock=0",
+                cpu.0,
+                facts.tid,
+                facts.asid.0,
+                facts.page.0,
+                phys.0
+            );
+            // The marker the broad arm prints for a serviced demand fault, so an observer sees
+            // the same completion whichever owner performed it.
+            crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
+            D::Complete(Ok(()))
+        }
+        // Pre-mutation: nothing was written, so the broad arm may re-derive and decide.
+        other if other.may_fall_back_to_broad() => {
+            crate::yarm_log!(
+                "PF1_DEMAND_SPLIT_REFUSED cpu={} tid={} va=0x{:x} reason={}",
+                cpu.0,
+                facts.tid,
+                facts.page.0,
+                other.reason()
+            );
+            D::NotHandled
+        }
+        // Post-allocation: the allocation is rolled back exactly, and the broad path must NOT
+        // run — it would allocate a second frame for a fault it never saw declined.
+        other => {
+            crate::yarm_log!(
+                "PF1_DEMAND_SPLIT_FAILED_CLOSED cpu={} tid={} va=0x{:x} reason={}",
+                cpu.0,
+                facts.tid,
+                facts.page.0,
+                other.reason()
+            );
+            // The EXACT error the broad arm produces at the same step, through the SAME
+            // `KernelError -> SyscallError` conversion its `map_err` chain uses.
+            D::Complete(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::from(
+                    other
+                        .failed_closed_error()
+                        .unwrap_or(crate::kernel::boot::KernelError::UserMemoryFault),
+                ),
+            )))
+        }
+    }
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_demand_page_fault_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _fault: Option<crate::kernel::trap::FaultInfo>,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
+}
+
+/// U9-PAGEFAULT1 §2c — the bridge entry for the demand PageFault route.
+///
+/// Tried AFTER the COW route and BEFORE the terminal one, because that is the order the broad arm
+/// uses: COW first and only for writes, then the demand screen, then the terminal fall-through.
+/// The three are mutually exclusive by class anyway, but preserving the order is what makes
+/// "split and broad cannot disagree about a fault" true for the sequencing as well as the verdict.
+pub(crate) fn try_split_demand_page_fault_dispatch(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    fault: Option<crate::kernel::trap::FaultInfo>,
+) -> SplitDispatchDisposition {
+    try_split_demand_page_fault_into_frame(shared, cpu, fault)
+}
+
 /// U9-COW1 — the bridge entry for the x86_64 private-copy COW PageFault route.
 ///
 /// Tried BEFORE the terminal route, because that is the order the broad arm uses: COW first and

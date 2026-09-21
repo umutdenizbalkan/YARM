@@ -788,6 +788,11 @@ pub fn handle_riscv_trap_entry_shared(
     // of the others would tell an observer something false about what happened.
     let mut cow_recovered = false;
     let mut cow_result: Option<Result<(), TrapHandleError>> = None;
+    // U9-PAGEFAULT1 §2c: the DEMAND route's own pair. Separate from the COW route's for the
+    // reason every other disposition here is separate — a borrowed reason tells an observer
+    // something false about what happened.
+    let mut demand_recovered = false;
+    let mut demand_result: Option<Result<(), TrapHandleError>> = None;
     // U9-TM §2: the pre-lock TIMER route, refusing before any claim, tick or mutation when a
     // proof knob is armed or when this tick would preempt.
     let mut post_work_committed = false;
@@ -949,7 +954,37 @@ pub fn handle_riscv_trap_entry_shared(
                 }
             }
         }
-        if pf.is_some() && !cow_recovered {
+        // U9-PAGEFAULT1 §2c: the DEMAND route, between COW and terminal — the broad arm's own
+        // order.
+        //
+        // It carries its OWN flag and its OWN skip reason rather than reusing the COW route's.
+        // The two outcomes are structurally identical — a handled trap that changed no scheduler
+        // state, whose task resumes at the same instruction — and that is exactly why borrowing
+        // would be wrong: an observer reading `reason=cow_recovered` for a demand fault would be
+        // told a private copy was made when none was.
+        if pf.is_some() && !cow_recovered && !demand_recovered {
+            match crate::kernel::syscall_split::try_split_demand_page_fault_dispatch(
+                shared, cpu, pf,
+            ) {
+                crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
+                crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) => {
+                    demand_recovered = true;
+                    demand_result = Some(result);
+                }
+                other => {
+                    crate::yarm_log!(
+                        "PF1_DEMAND_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(
+                        false,
+                        "the demand PageFault route yields NotHandled or Complete"
+                    );
+                }
+            }
+        }
+        if pf.is_some() && !cow_recovered && !demand_recovered {
             match crate::kernel::syscall_split::try_split_terminal_page_fault_dispatch(
                 shared,
                 cpu,
@@ -1446,41 +1481,42 @@ pub fn handle_riscv_trap_entry_shared(
     // canonical handler would re-execute FutexWait against it and `dispatch_next_task` would
     // advance the queue a second time for one publication. The gate is the DISPOSITION, never an
     // inspection of any stash.
-    let inner_result = if queue_advance_committed || post_work_committed || cow_recovered {
-        // U9-PAGEFAULT1 §2b: a recovered COW fault carries the SAME result the broad arm would
-        // have returned — `Ok(())` on success, the rolled-back failure's error otherwise — so
-        // every `?` site below behaves identically whichever owner handled the fault.
-        Ok(cow_result.unwrap_or(Ok(())))
-    } else {
-        shared
-            .with_cpu(cpu, |kernel| {
-                // Foundation oracle PUBLISH — during the broad-lock phase, stash a
-                // one-shot post-work token (the requester tid, +1 biased). This is a
-                // pure atomic write: it mutates NO scheduler / capability / user / task
-                // state and copies no user data. It only records "a post-lock drain is
-                // owed for this tid".
-                if oracle_arm && cpu_idx < MAX_CPUS {
-                    let tid = kernel.current_tid().unwrap_or(0);
-                    RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]
-                        .store(tid.wrapping_add(1), Ordering::Release);
-                    crate::yarm_log!(
-                        "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu={} tid={}",
-                        cpu.0,
-                        tid
-                    );
-                }
-                // Reborrow so `frame` stays available for the Stage 196D post-lock switch drain
-                // (which restores the INCOMING task's frame after the broad guard drops).
-                handle_trap_entry_with_fault_bookkeeping_mode(
-                    kernel,
-                    cpu,
-                    context,
-                    Some(&mut *frame),
-                    FaultBookkeepingMode::RecordInHandleTrapEvent,
-                )
-            })
-            .map_err(|err| TrapHandleError::Syscall(err.into()))
-    };
+    let inner_result =
+        if queue_advance_committed || post_work_committed || cow_recovered || demand_recovered {
+            // U9-PAGEFAULT1 §2b: a recovered COW fault carries the SAME result the broad arm would
+            // have returned — `Ok(())` on success, the rolled-back failure's error otherwise — so
+            // every `?` site below behaves identically whichever owner handled the fault.
+            Ok(demand_result.or(cow_result).unwrap_or(Ok(())))
+        } else {
+            shared
+                .with_cpu(cpu, |kernel| {
+                    // Foundation oracle PUBLISH — during the broad-lock phase, stash a
+                    // one-shot post-work token (the requester tid, +1 biased). This is a
+                    // pure atomic write: it mutates NO scheduler / capability / user / task
+                    // state and copies no user data. It only records "a post-lock drain is
+                    // owed for this tid".
+                    if oracle_arm && cpu_idx < MAX_CPUS {
+                        let tid = kernel.current_tid().unwrap_or(0);
+                        RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]
+                            .store(tid.wrapping_add(1), Ordering::Release);
+                        crate::yarm_log!(
+                            "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu={} tid={}",
+                            cpu.0,
+                            tid
+                        );
+                    }
+                    // Reborrow so `frame` stays available for the Stage 196D post-lock switch drain
+                    // (which restores the INCOMING task's frame after the broad guard drops).
+                    handle_trap_entry_with_fault_bookkeeping_mode(
+                        kernel,
+                        cpu,
+                        context,
+                        Some(&mut *frame),
+                        FaultBookkeepingMode::RecordInHandleTrapEvent,
+                    )
+                })
+                .map_err(|err| TrapHandleError::Syscall(err.into()))
+        };
 
     if log_structural {
         crate::yarm_log!("RISCV_GLOBAL_LOCK_PHASE_DONE cpu={}", cpu.0);
