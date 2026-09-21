@@ -19764,3 +19764,72 @@ The RISC-V bridge still calls no split fault route, so that port's faults all ta
 acquisition. `page_fault_route_for` is unchanged, so x86_64 terminal, RISC-V COW/terminal and
 demand on every port remain broad. No new class has been admitted, and no live fault evidence has
 been produced beyond the existing x86_64 COW population.
+
+## U9-PAGEFAULT1 §2b — the RISC-V bridge gains the fault seam it never had
+
+§1's third finding closed. The matrix is still unchanged; what changes is that the routes are now
+**reachable** on all three ports, which is the prerequisite for admitting anything on RISC-V at
+all.
+
+### What was actually missing
+
+`handle_riscv_trap_entry_shared` consulted the timer route and the syscall route and then went
+straight to `with_cpu`. Neither fault route was ever called, so on that port every page fault of
+every class took the terminal broad acquisition. This was **not** a refusal that falls back —
+there was nothing to refuse.
+
+The record that justified the gap said the COW route "is x86_64-only and RISC-V has no witness for
+it". Both halves were wrong as a reason. The route's architecture set is `page_fault_route_for`'s
+business, not the bridge's; and the absence of a witness is an argument about *admission*, not
+about *reachability*. A bridge that never calls a route cannot refuse one either.
+
+### The seam
+
+The same two dispatch entry points, in the same order the broad arm and the shared bridge both
+use — COW for writes first, then terminal — with the same dispositions handled the same way:
+
+| disposition | COW arm | terminal arm |
+|---|---|---|
+| `NotHandled` | fall through to the broad arm, nothing mutated | same |
+| `Complete(result)` | `cow_recovered`, carrying the route's own result | fail-closed after publication: skip the broad emitter |
+| `QueueAdvanceCommitted` | — | `queue_advance_committed`; the route holds a reserved `futex_wait_dispatch` deferral, consumed by **this bridge's own** FutexWait drain |
+
+It introduces no fault policy. The bridge names no `PageFaultClass`, never calls
+`page_fault_route_for`, and reaches for neither `CowRecovery` nor `TerminalFaultTransition` — a
+guard asserts all four absences. Which classes are admitted remains the matrix's answer alone.
+
+### Return behaviour, which is where architecture-neutrality actually bites
+
+Neutrality here is not a `cfg` gate and an architecture string. The three obligations, checked on
+this port specifically:
+
+* **Retry the faulting instruction.** This bridge pre-advances `sepc` by 4 for `ecall` **only**
+  (`is_syscall` gates it), so a fault trap arrives with `saved_pc` still naming the faulting
+  instruction and `ReturnToCurrent` resumes it. A guard asserts the seam touches no `set_saved_pc`.
+* **Encode no syscall result.** A fault has no caller to answer. The seam touches no `set_ok`,
+  `set_err` or `syscall_num()`.
+* **Scheduling.** The terminal route's `QueueAdvanceCommitted` is backed by a reserved deferral in
+  the cell this bridge's existing FutexWait drain consumes, through the same exact-token resume
+  convention — `direct_dispatch_resume_incoming`. No second drain and no new scheduling policy.
+
+### Measured: a strict no-op, as designed
+
+RISC-V core smoke at head: **exit 0**, 1327 `USER_LOG`, and **zero** page faults of any kind — so
+the seam is not exercised on this profile and cannot have changed its behaviour. Timer markers
+(97 idle advances, 31 preempting commits, 1163 ticks) sit in the same range as the base boot.
+
+That is the honest status: the seam is correct and reachable, and **nothing yet proves it does the
+right thing under load**, because nothing on this port produces a fault. That is §3's problem, not
+a claim made here.
+
+### Qualification at this checkpoint
+
+Hosted **5682 passed / 0 failed / 2 ignored**, single-threaded. Three freestanding builds clean.
+RISC-V core smoke green.
+
+### Still open
+
+`page_fault_route_for` is unchanged: x86_64 `TerminallyUnhandled`, RISC-V `CowCandidate` and
+`TerminallyUnhandled`, `KernelOrAbsentTask` everywhere and `DemandCandidate` everywhere still
+route `Broad`. No class has been admitted and no new live fault evidence exists beyond the
+x86_64 COW population §1 measured.

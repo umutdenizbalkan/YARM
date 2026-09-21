@@ -782,6 +782,12 @@ pub fn handle_riscv_trap_entry_shared(
     // obligation begins and ends inside this one trap, so nothing can outlive it or be mistaken
     // for another class's deferral.
     let mut timer_idle_queue_advance = false;
+    // U9-PAGEFAULT1 §2b: a recovered COW fault is NOT a queue advance and NOT post-work. It is a
+    // handled trap that changed no scheduler state, so it carries its own flag and its own skip
+    // reason — the same separation the shared bridge makes, for the same reason: reusing either
+    // of the others would tell an observer something false about what happened.
+    let mut cow_recovered = false;
+    let mut cow_result: Option<Result<(), TrapHandleError>> = None;
     // U9-TM §2: the pre-lock TIMER route, refusing before any claim, tick or mutation when a
     // proof knob is armed or when this tick would preempt.
     let mut post_work_committed = false;
@@ -890,6 +896,95 @@ pub fn handle_riscv_trap_entry_shared(
                     false,
                     "the timer route yields NotHandled, PostWorkCommitted or QueueAdvanceCommitted"
                 );
+            }
+        }
+    }
+
+    // ── U9-PAGEFAULT1 §2b — the pre-lock PAGE FAULT seam, on the bridge that had none ────────
+    //
+    // §1's second finding: this bridge decoded `PageFault` and went straight to the broad
+    // acquisition, so every page fault of every class on this port took it. That was not a
+    // refusal that falls back — there was nothing to refuse, because the routes were never
+    // consulted. The shared x86_64/AArch64 bridge has consulted them since U9-COW1/U9-FT4.
+    //
+    // This block is the SAME two dispatch entry points in the SAME order the shared bridge and
+    // the broad arm both use — COW for writes first, then terminal — with the same dispositions
+    // handled the same way. It introduces no fault policy of its own: which classes are admitted
+    // remains `page_fault_route_for`'s answer alone, and that matrix is unchanged by this block.
+    // On a port whose matrix rows are still `Broad` this is therefore a strict no-op that makes
+    // the ROUTES reachable, which is the prerequisite for admitting anything here at all.
+    //
+    // RETURN BEHAVIOUR, which is the part architecture-neutrality actually turns on. A recovered
+    // COW fault must retry the faulting instruction. On this bridge `sepc` is pre-advanced by 4
+    // for `ecall` ONLY — `is_syscall` gates that advance — so a page-fault trap reaches here with
+    // `saved_pc` still naming the faulting instruction, and returning `ReturnToCurrent` resumes
+    // it. Nothing in this block writes a syscall result lane: a fault has no `a0` to fill, and
+    // `frame.syscall_num()` is not consulted.
+    {
+        let pf = match decode_trap_context(context) {
+            TrapEvent::PageFault(f) => Some(f),
+            _ => None,
+        };
+        if pf.is_some() && !cow_recovered {
+            match crate::kernel::syscall_split::try_split_cow_page_fault_dispatch(shared, cpu, pf) {
+                crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
+                crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) => {
+                    // Success, or a post-allocation failure that rolled its allocation back
+                    // exactly. Either way the broad COW handler must NOT run again for this
+                    // fault, and the result is carried exactly as the broad arm would have
+                    // returned it.
+                    cow_recovered = true;
+                    cow_result = Some(result);
+                }
+                other => {
+                    crate::yarm_log!(
+                        "VM_COW_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(
+                        false,
+                        "the COW PageFault route yields NotHandled or Complete"
+                    );
+                }
+            }
+        }
+        if pf.is_some() && !cow_recovered {
+            match crate::kernel::syscall_split::try_split_terminal_page_fault_dispatch(
+                shared,
+                cpu,
+                pf,
+                Some(&*frame),
+            ) {
+                crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
+                crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted => {
+                    // The route holds a RESERVED `futex_wait_dispatch` deferral, which is the
+                    // cell this bridge's own FutexWait drain consumes below — the same drain,
+                    // the same exact-token resume convention. `QueueAdvanceCommitted` without a
+                    // reservation was the FT3 defect, and the route still returns it only with
+                    // one.
+                    crate::yarm_log!(
+                        "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=terminal_fault_committed",
+                        cpu.0
+                    );
+                    queue_advance_committed = true;
+                }
+                crate::kernel::syscall_split::SplitDispatchDisposition::Complete(_) => {
+                    // Fail-closed AFTER publication: the report is out, so the broad emitter must
+                    // not run again. No deferral is held on this path.
+                    queue_advance_committed = true;
+                }
+                other => {
+                    crate::yarm_log!(
+                        "TERMINAL_FAULT_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(
+                        false,
+                        "the terminal PageFault route yields NotHandled, QueueAdvanceCommitted or Complete"
+                    );
+                }
             }
         }
     }
@@ -1351,8 +1446,11 @@ pub fn handle_riscv_trap_entry_shared(
     // canonical handler would re-execute FutexWait against it and `dispatch_next_task` would
     // advance the queue a second time for one publication. The gate is the DISPOSITION, never an
     // inspection of any stash.
-    let inner_result = if queue_advance_committed || post_work_committed {
-        Ok(Ok(()))
+    let inner_result = if queue_advance_committed || post_work_committed || cow_recovered {
+        // U9-PAGEFAULT1 §2b: a recovered COW fault carries the SAME result the broad arm would
+        // have returned — `Ok(())` on success, the rolled-back failure's error otherwise — so
+        // every `?` site below behaves identically whichever owner handled the fault.
+        Ok(cow_result.unwrap_or(Ok(())))
     } else {
         shared
             .with_cpu(cpu, |kernel| {

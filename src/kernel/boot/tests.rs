@@ -146848,9 +146848,11 @@ mod u9qa_split_dispatch_disposition {
             "the committed arm must fall through to the drains, never return early"
         );
         // The broad phase is gated on the disposition, never on a stash inspection.
-        // U9-TM §2 added the post-work term to the same gate; the claim it carries is unchanged.
+        // U9-TM §2 added the post-work term to the same gate; U9-PAGEFAULT1 §2b added the
+        // COW term when this bridge gained a page-fault seam. The claim each carries is
+        // unchanged: every term is a ROUTE reporting its own outcome.
         let gate_at = RISCV_TRAP
-            .find("if queue_advance_committed || post_work_committed {")
+            .find("if queue_advance_committed || post_work_committed || cow_recovered {")
             .expect("the broad-dispatch gate");
         let call = RISCV_TRAP
             .find(".with_cpu(cpu, |kernel| {")
@@ -148547,8 +148549,16 @@ mod u9tm_proof_gate {
         // it into either would tell an observer something false about what happened, so the
         // gate names it, and this guard enumerates every arm rather than counting to two.
         //
-        // The shared bridge carries all three; the RISC-V bridge carries the original two,
-        // because the COW route is x86_64-only and RISC-V has no witness for it.
+        // U9-PAGEFAULT1 §2b re-derivation: BOTH bridges now carry all three terms.
+        //
+        // The RISC-V bridge carried only two, and the reason recorded here was that "the COW
+        // route is x86_64-only and RISC-V has no witness for it". The first half was never the
+        // reason — the route's architecture set is `page_fault_route_for`'s business, not the
+        // bridge's — and the second confused ADMISSION with REACHABILITY. This bridge simply had
+        // no page-fault seam at all, so neither fault route was consulted on this port and every
+        // fault of every class took the broad acquisition. §2b gives it the same two dispatch
+        // entry points in the same order, which makes the routes REACHABLE; which classes they
+        // admit is still the matrix's answer alone, and the matrix is unchanged.
         for (name, src, arms) in [
             (
                 "shared",
@@ -148558,7 +148568,7 @@ mod u9tm_proof_gate {
             (
                 "riscv",
                 include_str!("../../arch/riscv64/trap.rs"),
-                "if queue_advance_committed || post_work_committed {",
+                "if queue_advance_committed || post_work_committed || cow_recovered {",
             ),
         ] {
             assert!(
@@ -148574,24 +148584,26 @@ mod u9tm_proof_gate {
                 2,
                 "{name} bridge: exactly the timer and NR 1 routes may declare post-work committed"
             );
-            if name == "shared" {
-                assert_eq!(
-                    src.matches("cow_recovered = true;").count(),
-                    1,
-                    "{name} bridge: exactly one place may declare a COW recovery committed"
-                );
-                // The third arm must carry its OWN skip reason. Reusing `publication_committed`
-                // would claim a terminal transition that never happened.
-                assert!(
-                    src.contains("\"cow_recovered\""),
-                    "{name} bridge: the COW arm must report its own skip reason"
-                );
-            } else {
-                assert!(
-                    !src.contains("cow_recovered"),
-                    "{name} bridge: the COW route is x86_64-only and must not reach RISC-V"
-                );
-            }
+            // U9-PAGEFAULT1 §2b: the COW term is now on BOTH bridges, with the same contract
+            // on each — exactly one declaration site, and its own skip reason.
+            assert_eq!(
+                src.matches("cow_recovered = true;").count(),
+                1,
+                "{name} bridge: exactly one place may declare a COW recovery committed"
+            );
+            // The third arm must carry its OWN skip reason. Reusing `publication_committed`
+            // would claim a terminal transition that never happened, and reusing
+            // `post_work_committed` would claim work the route did not do.
+            assert!(
+                src.contains("\"cow_recovered\"") || src.contains("cow_result.unwrap_or(Ok(()))"),
+                "{name} bridge: the COW arm must report its own outcome rather than borrow one"
+            );
+            // And it carries the route's OWN result, so every `?` below behaves identically
+            // whichever owner handled the fault.
+            assert!(
+                src.contains("Ok(cow_result.unwrap_or(Ok(())))"),
+                "{name} bridge: the recovered result must be the route's, not a fabricated Ok"
+            );
             let gate = src.find(arms).expect("the gate");
             let call = src
                 .find(".with_cpu(cpu, |kernel| {")
@@ -183094,6 +183106,115 @@ mod u9pf1_fault_origin {
                 && decode.contains("TrapEvent::PageFault(FaultInfo::user(addr, access))"),
             "the data-abort arm must choose its origin from the EC"
         );
+    }
+
+    /// **The RISC-V bridge now consults the two fault routes, in the canonical order.**
+    ///
+    /// §1's second finding: this bridge decoded `PageFault` and went straight to the broad
+    /// acquisition, so every fault of every class on this port took it. That was not a refusal
+    /// that falls back — the routes were never consulted at all.
+    ///
+    /// The seam introduces NO fault policy: which classes are admitted is still
+    /// `page_fault_route_for`'s answer alone. What it changes is reachability, which is the
+    /// prerequisite for admitting anything on this port.
+    #[test]
+    fn the_riscv_bridge_consults_both_fault_routes_in_the_canonical_order() {
+        let bridge = RISCV
+            .split("pub fn handle_riscv_trap_entry_shared(")
+            .nth(1)
+            .and_then(|s| s.split("\n/// ").next())
+            .expect("the riscv shared bridge")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let cow = bridge
+            .find("try_split_cow_page_fault_dispatch(shared, cpu, pf)")
+            .expect("the COW route must be consulted");
+        let terminal = bridge
+            .find("try_split_terminal_page_fault_dispatch(")
+            .expect("the terminal route must be consulted");
+        assert!(
+            cow < terminal,
+            "COW first, then terminal — the same order the broad arm and the shared bridge use"
+        );
+        // The broad acquisition comes after both.
+        let broad = bridge
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("the broad acquisition");
+        assert!(
+            terminal < broad,
+            "both routes must be consulted BEFORE the broad acquisition, or they cannot avoid it"
+        );
+        // The terminal route is given the frame, which it needs for the outgoing capture and the
+        // faulting PC in its markers.
+        assert!(
+            bridge.contains("Some(&*frame),"),
+            "the terminal route must receive the entering frame"
+        );
+        // Each disposition is handled, and the two committed ones are kept DISTINCT.
+        for arm in [
+            "SplitDispatchDisposition::NotHandled => {}",
+            "SplitDispatchDisposition::Complete(result) => {",
+            "SplitDispatchDisposition::QueueAdvanceCommitted => {",
+        ] {
+            assert!(bridge.contains(arm), "the bridge must handle `{arm}`");
+        }
+        assert!(
+            bridge.contains("cow_recovered = true;")
+                && bridge.contains("cow_result = Some(result)"),
+            "a recovered COW fault must set its own flag and carry its own result"
+        );
+        // No fault policy of its own: the bridge names no class and no architecture.
+        for policy in [
+            "PageFaultClass",
+            "page_fault_route_for",
+            "CowRecovery",
+            "TerminalFaultTransition",
+        ] {
+            assert!(
+                !bridge.contains(policy),
+                "the bridge must not reach for `{policy}` — routing is the matrix's decision"
+            );
+        }
+    }
+
+    /// **A page fault does not take the `ecall` PC advance**, so a recovered fault retries the
+    /// faulting instruction.
+    ///
+    /// The return-behaviour half of architecture neutrality. On this bridge `sepc` is
+    /// pre-advanced by 4 for `ecall` only; a fault trap therefore arrives with `saved_pc` still
+    /// naming the faulting instruction, and `ReturnToCurrent` resumes it.
+    #[test]
+    fn a_recovered_riscv_fault_retries_the_faulting_instruction() {
+        // The advance is gated on the trap being a syscall, in the boot-side entry.
+        assert!(
+            RISCV_BOOT.contains("For ecall we pre-advance saved_pc by 4"),
+            "the PC advance must still be documented as ecall-only"
+        );
+        // And the fault seam writes no syscall result lane: a fault has no caller to answer.
+        // CODE only: the seam's own comment states which of these it deliberately does not
+        // consult, so a raw scan would match the very prose that makes the claim.
+        let bridge = RISCV
+            .split("U9-PAGEFAULT1 §2b — the pre-lock PAGE FAULT seam")
+            .nth(1)
+            .and_then(|s| s.split("── Phase 1: pre-lock split dispatch").next())
+            .expect("the fault seam")
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let bridge = bridge.as_str();
+        for forbidden in ["set_ok", "set_err", "syscall_num()", "set_saved_pc"] {
+            assert!(
+                !bridge.contains(forbidden),
+                "the fault seam must not touch `{forbidden}` — a fault encodes no syscall result \
+                 and must not move the PC"
+            );
+        }
     }
 
     /// **RISC-V decodes `scause` 12 as an instruction page fault with `Execute` access.**
