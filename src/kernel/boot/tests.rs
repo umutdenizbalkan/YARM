@@ -148316,155 +148316,120 @@ mod u9tm_proof_gate {
         disarm_all();
     }
 
-    /// FAIL BEFORE MUTATION: every refusal precedes the claim, the tick and the re-arm.
-    ///
-    /// U9-TIMER1 re-derivation. The route now has TWO branches, and the property this guard
-    /// exists to hold is unchanged for both: nothing is claimed, ticked or re-armed until the
-    /// last thing that can refuse has already answered, so a fallback reaches the unchanged
-    /// broad arm having mutated nothing.
-    ///
-    /// What moved is the arity. There used to be one refusal ordered against one mutation
-    /// sequence; the would-preempt case was itself a refusal, because the preempting timer was
-    /// serviced by broad dispatch. It is now a serviced branch with its own transaction, so the
-    /// ordering is asserted per branch:
-    ///
-    /// * shared prologue — the proof-mode gate, ahead of everything;
-    /// * the preempting branch — the lookahead, then `run_yield_transaction` (whose every step
-    ///   refuses before it mutates), and only on `Ok` the tick, claim and re-arm;
-    /// * the non-preempting tail — the atomic no-switch seam, then claim and re-arm.
-    ///
-    /// The lookahead must also be asked BEFORE anything ticks, which is what makes a declined
-    /// preemption byte-for-byte the pre-conversion behaviour: ticking first would leave the
-    /// broad arm to either double-tick or drop the quantum.
-    #[test]
-    fn both_refusals_precede_every_mutation() {
-        // Positions are read from CODE only. The branch comments name the seams they replaced,
-        // and an anchor that matched prose rather than a call would order the wrong things.
-        let route: alloc::string::String = SPLIT
-            .split("fn try_split_timer_into_frame(")
+    /// The recognized timer body, comments stripped. Every guard below asks about CODE, and the
+    /// body's own comments name the seams they replaced — so an anchor matched against prose
+    /// would order the wrong things or report a retired marker as live.
+    fn route_code() -> alloc::string::String {
+        SPLIT
+            .split(
+                "fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement {",
+            )
             .nth(1)
-            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
-            .expect("the timer route")
+            .and_then(|s| {
+                s.split("\n#[cfg(not(feature = \"hosted-dev\"))]\nfn try_split_timer_into_frame(")
+                    .next()
+            })
+            .expect("the recognized timer body")
             .lines()
             .filter(|l| {
                 let t = l.trim_start();
                 !t.starts_with("//") && !t.starts_with('*')
             })
             .collect::<alloc::vec::Vec<_>>()
-            .join("\n");
+            .join("\n")
+    }
+
+    /// **Nothing is ticked, claimed or re-armed twice, and nothing is settled from a half-applied
+    /// state.**
+    ///
+    /// U9-TIMER-FINAL re-derivation, and the guard changes shape because the route did.
+    ///
+    /// It used to order TWO refusals against TWO mutation sequences: the lookahead had to precede
+    /// every tick, and each branch had to tick, claim and re-arm in its own order, because a
+    /// refusal fell through to the broad arm and the broad arm would tick. That is why the
+    /// transaction ran before the tick.
+    ///
+    /// Neither refusal falls anywhere now. The recognized body cannot ask for broad handling, so
+    /// the ordering that made the hand-off safe has nothing to protect, and keeping it cost a
+    /// SECOND read of the quantum in its own acquisition — which `Timer`'s contract says may go
+    /// stale, and which the route answered with a `reason=would_preempt` fail-safe.
+    ///
+    /// So the tick is the prologue and the sole authority. What this case asserts now is the
+    /// property that actually matters: the tick, the claim and the re-arm happen ONCE, ahead of
+    /// every branch, and the only mutating step after them undoes itself exactly.
+    #[test]
+    fn both_refusals_precede_every_mutation() {
+        // Positions are read from CODE only. The body's comments name the seams they replaced,
+        // and an anchor that matched prose rather than a call would order the wrong things.
+        let route = route_code();
         let route = route.as_str();
-        let lookahead = route
-            .find("timer_would_preempt_split_read(cpu)")
-            .expect("the preempting-branch lookahead");
-        // U9-TIMER3 re-derivation: the proof-mode refusal that used to be ordered here is GONE,
-        // so there is no longer a prologue refusal to order against the lookahead. The property
-        // the guard exists for is untouched and is asserted below for the refusals that remain:
-        // nothing is claimed, ticked or re-armed until the last thing that can refuse has already
-        // answered.
+
+        // The retired gates: neither the proof-mode refusal nor the second quantum read survives,
+        // and both are gone by removal rather than by narrowing.
+        for retired in [
+            "timer_proof_hooks_armed",
+            "timer_would_preempt_split_read",
+            "scheduler_tick_if_no_switch_split_mut",
+        ] {
+            assert!(
+                !route.contains(retired),
+                "`{retired}` is retired, so nothing may still order against it"
+            );
+        }
+
+        // ── the prologue: tick, claim, re-arm, once each, before any branch ──────────────────
+        let tick = route
+            .find("scheduler_tick_split_mut(cpu)")
+            .expect("the tick");
+        let claim = route
+            .find("acknowledge_interrupt(cpu, 0)")
+            .expect("the claim");
+        let rearm = route.find("program_timer_deadline(").expect("the re-arm");
+        let first_branch = route.find("if !preempting {").expect("the first branch");
         assert!(
-            !route.contains("timer_proof_hooks_armed"),
-            "the proof-mode refusal is removed, so nothing may still order against it"
-        );
-        assert!(
-            route[..lookahead].find("scheduler_tick").is_none()
-                && route[..lookahead]
-                    .find("acknowledge_interrupt(cpu, 0)")
-                    .is_none(),
-            "the lookahead must be asked before ANY tick or claim — a decline has to be able to \
-             fall through to the broad arm having changed nothing"
+            tick < claim && claim < rearm && rearm < first_branch,
+            "order must be: tick -> claim -> re-arm -> branch, so every settlement inherits all \
+             three and none can take a second"
         );
 
-        // ── the preempting branch ────────────────────────────────────────────────────────────
-        // The tail begins at the no-switch seam, which is the only statement outside the
-        // preempting branch that can still refuse.
-        let split_at = route
-            .find("let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu)")
-            .expect("the boundary between the two branches");
-        let preempting = &route[lookahead..split_at];
-        let txn = preempting
+        // ── the only mutating step after the prologue is the transaction ─────────────────────
+        let txn = route
             .find("run_yield_transaction(&mut owners, cpu)")
             .expect("the transaction");
-        let tick = preempting
-            .find("scheduler_tick_split_mut(cpu)")
-            .expect("the preempting branch's tick");
-        let claim = preempting
-            .find("acknowledge_interrupt(cpu, 0)")
-            .expect("the preempting branch's claim");
-        let rearm = preempting
-            .find("program_timer_deadline(")
-            .expect("the preempting branch's re-arm");
         assert!(
-            txn < tick && tick < claim && claim < rearm,
-            "preempting order must be: transaction -> tick -> claim -> re-arm"
+            txn > first_branch,
+            "the transaction runs only on the preempting branch"
         );
-        // The declining arm sits past every one of those mutations, so it cannot be reached
-        // from a half-applied state.
-        let decline = preempting
-            .find("TIMER_SPLIT_PREEMPT_REFUSED")
-            .expect("the transaction's decline");
         assert!(
-            decline > rearm,
-            "the decline is the transaction's own `Err`, not a bail-out after mutation"
+            route[first_branch..txn].find("scheduler_tick").is_none(),
+            "and nothing ticks again on the way to it"
         );
-
-        // ── the non-preempting tail, unchanged ───────────────────────────────────────────────
-        let tail = &route[split_at..];
-        let seam = tail
-            .find("scheduler_tick_if_no_switch_split_mut(cpu)")
-            .expect("the no-switch seam");
-        let tail_claim = tail
-            .find("acknowledge_interrupt(cpu, 0)")
-            .expect("the tail's claim");
-        let tail_rearm = tail
-            .find("program_timer_deadline(")
-            .expect("the tail's re-arm");
+        // Its decline is its own `Err`, produced by the transaction rather than by a bail-out
+        // this body invented, and it settles rather than hands off.
+        let decline = route
+            .find("TIMER_SPLIT_PREEMPT_DEFERRED")
+            .expect("the transaction's decline settlement");
         assert!(
-            seam < tail_claim && tail_claim < tail_rearm,
-            "non-preempting order must be: atomic seam -> claim -> re-arm"
+            decline > txn,
+            "the decline is the transaction's own `Err`, not a bail-out before it"
+        );
+        assert!(
+            !route.contains("TIMER_SPLIT_PREEMPT_REFUSED"),
+            "the retired marker said `the broad arm will do this instead`, and nothing will"
         );
     }
 
-    /// The would-preempt refusal is ATOMIC with the tick: one acquisition, and the declining
-    /// path increments nothing.
-    #[test]
-    fn the_would_preempt_refusal_increments_nothing() {
-        let seam = RUNTIME
-            .split("pub(crate) fn scheduler_tick_if_no_switch_split_mut(")
-            .nth(1)
-            .and_then(|s| s.split("\n    }").next())
-            .expect("the no-switch tick seam");
-        assert_eq!(
-            seam.matches("with_scheduler_split_mut").count(),
-            1,
-            "the lookahead and the tick must share ONE acquisition"
-        );
-        let look = seam.find("would_preempt_next()").expect("the lookahead");
-        let tick = seam.find("tick_and_check()").expect("the tick");
-        assert!(look < tick, "the lookahead must precede the tick");
-        let refusal = seam.find("return None;").expect("the refusal");
-        assert!(
-            refusal < tick,
-            "the refusal must return BEFORE the tick, having incremented nothing"
-        );
-        // And it delegates rather than restating the quantum arithmetic.
-        assert!(
-            !seam.contains("quantum_ticks"),
-            "the seam must not restate the quantum calculation"
-        );
-        let la = TIMER
-            .split("pub fn would_preempt_next(&self) -> bool {")
-            .nth(1)
-            .and_then(|s| s.split("\n    }").next())
-            .expect("the lookahead body");
-        assert!(
-            la.contains("self.ticks_remaining == 1") && !la.contains("quantum_ticks"),
-            "the lookahead reads remaining budget only"
-        );
-    }
-
-    /// A non-preempting tick uses its OWN disposition. Borrowing `Complete` would skip the
-    /// production timeout pipeline; borrowing `QueueAdvanceCommitted` would send a tick that
-    /// changed no scheduler state into the queue-advance drains.
+    /// **Every settlement names what actually happened.**
+    ///
+    /// A settlement that borrows another's disposition tells an observer something false, and two
+    /// of the three ways to get this wrong are dangerous rather than merely untidy: `Complete`
+    /// would skip the production timeout pipeline, and `QueueAdvanceCommitted` would send a tick
+    /// that published no terminal transition into the queue-advance drains.
+    ///
+    /// U9-TIMER-FINAL re-derivation: the recognized body no longer names dispositions at all. It
+    /// returns a `TimerSettlement`, and ONE total mapping turns each into a disposition — so the
+    /// claim this case protects becomes a property of that mapping plus the arm that produces each
+    /// settlement, rather than of statement positions scattered through the route.
     #[test]
     fn a_non_preempting_tick_uses_its_own_disposition() {
         assert!(
@@ -148472,181 +148437,106 @@ mod u9tm_proof_gate {
             "the fourth disposition must exist, and since 199G-C4 §2 it carries the route's own \
              answer to whether the CALLER's syscall is finished"
         );
-        // A tick has no syscall to finish, so it always answers `false`.
+        // ── the mapping ──────────────────────────────────────────────────────────────────────
+        let mapping = SPLIT
+            .split("fn disposition(self) -> SplitDispatchDisposition {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the settlement mapping");
+        for (settlement, disposition) in [
+            (
+                "Self::QueueAdvanceCommitted",
+                "SplitDispatchDisposition::QueueAdvanceCommitted",
+            ),
+            (
+                "Self::IdleQueueAdvance",
+                "SplitDispatchDisposition::TimerIdleQueueAdvance",
+            ),
+            (
+                "Self::ContinueCurrent",
+                "SplitDispatchDisposition::PostWorkCommitted",
+            ),
+            // U9-TIMER-FINAL's named residual: the ONE settlement that maps to broad handling,
+            // reachable only while a default-off x86_64 diagnostic owns the switch path. See
+            // `u9timer1_preempting_timer::the_only_broad_hand_off_is_the_default_off_diagnostic`
+            // for why it is kept and what would retire it.
+            (
+                "Self::DiagnosticSwitchOwner",
+                "SplitDispatchDisposition::NotHandled",
+            ),
+        ] {
+            let at = mapping
+                .find(settlement)
+                .unwrap_or_else(|| panic!("`{settlement}` must be mapped"));
+            assert!(
+                mapping[at..].contains(disposition),
+                "`{settlement}` must map to `{disposition}`"
+            );
+        }
+        // A tick has no syscall to finish, so the continuing settlement always answers `false`.
         assert!(
-            SPLIT.contains("D::PostWorkCommitted {\n        finalize_syscall: false,\n    }"),
+            mapping.contains("finalize_syscall: false"),
             "a timer tick finalizes no syscall"
         );
-        let route = SPLIT
-            .split("fn try_split_timer_into_frame(")
-            .nth(1)
-            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
-            .expect("the timer route");
-        // U9-TIMER1 re-derivation. The claim this guard protects is unchanged: a settlement must
-        // name what actually happened, and a tick that changed no scheduler state must not borrow
-        // a disposition that says it did. What changed is that the route now has THREE settlement
-        // points instead of one, so "the route does not contain `QueueAdvanceCommitted`" is no
-        // longer an adequate stand-in for it. Each is asserted against its own post-state:
-        //
-        // | settlement | scheduler state changed | disposition |
-        // |---|---|---|
-        // | a preempting tick that re-enqueued the current task | yes — a deferral is published | `QueueAdvanceCommitted`, so the drain performs the switch |
-        // | a preempting tick on an idle CPU with an empty run queue | no — there was nothing to preempt | `PostWorkCommitted`, the architecture tail |
-        // | a non-preempting tick | no — only the tick itself | `PostWorkCommitted`, the architecture tail |
-        //
-        // Positions are read from CODE: the branch comments quote the dispositions they
-        // deliberately do NOT use, and an anchor that matched prose would slice the wrong region.
-        let code: alloc::string::String = route
+        assert!(
+            !mapping.contains("Complete"),
+            "no settlement may map to a syscall completion — a timer has no caller to answer"
+        );
+        // Exactly one settlement maps to broad handling, and it is the diagnostic residual.
+        // Comments stripped: the mapping's own comment names the disposition it is the single
+        // legitimate producer of.
+        let broad_arms: alloc::vec::Vec<&str> = mapping
             .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//") && !t.starts_with('*')
-            })
-            .collect::<alloc::vec::Vec<_>>()
-            .join("\n");
-        let code = code.as_str();
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("NotHandled"))
+            .collect();
+        assert_eq!(
+            broad_arms.len(),
+            1,
+            "exactly one broad arm in the mapping, found {broad_arms:?}"
+        );
+        assert!(
+            broad_arms[0].contains("Self::DiagnosticSwitchOwner"),
+            "and it belongs to the diagnostic residual, not to an ordinary settlement"
+        );
+
+        // ── the arms that produce each settlement ────────────────────────────────────────────
+        let code = route_code();
+        let tail_at = code
+            .find("if !preempting {")
+            .expect("the non-preempting tail");
         let commit_at = code
-            .find("if shared.timer_would_preempt_split_read(cpu) {")
-            .expect("the preempting branch");
+            .find("Ok(preempted) => {")
+            .expect("the preempting commit");
         let idle_at = code
             .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {")
             .expect("the idle-CPU arm");
-        let tail_at = code
-            .find("let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu)")
-            .expect("the non-preempting tail");
-        assert!(
-            commit_at < idle_at && idle_at < tail_at,
-            "the three settlements appear in the order the route decides them"
-        );
-
-        // (a) The committing branch hands the CPU to the drain — never to the architecture tail,
-        // which would return through the outgoing frame it just switched away from.
-        let committing = &code[commit_at..idle_at];
-        assert!(
-            committing.contains("return D::QueueAdvanceCommitted;")
-                && !committing.contains("D::PostWorkCommitted"),
-            "a preempting tick that re-enqueued the current task hands off to the drain"
-        );
-
-        // (b) and (c) Neither the idle arm nor the non-preempting tail changed any scheduler
-        // state beyond its own tick, so neither may claim a PUBLISHED transition, and neither may
-        // select, defer or advance the queue ITSELF.
-        //
-        // U9-TIMER2 re-derivation: the idle arm gained a second settlement, and the ban that
-        // matters is unchanged by it. `TimerIdleQueueAdvance` says an advance is OWED, not that
-        // one happened — the arm still selects nothing, marks nothing and publishes nothing, which
-        // is exactly what the banned-owner list below continues to enforce. `QueueAdvanceCommitted`
-        // stays banned here for the reason it always was: it means a terminal transition was
-        // published and a per-CPU deferral carries the outgoing identity, and this arm has no
-        // outgoing task to name.
-        //
-        // U9-TIMER5 re-derivation: the idle arm no longer settles as `PostWorkCommitted` at all.
-        // U9-TIMER2 let the RUN-QUEUE COUNT pick between the two dispositions, and that was the
-        // last place the count acted as a reservation — measurably wrong, because the off-lock
-        // timeout pipeline that produces most idle-boundary wakes runs LATER in the same trap than
-        // this probe, so the tick that fires a deadline necessarily probes zero. Both idle
-        // outcomes now settle as `TimerIdleQueueAdvance` and the drain re-asks authoritatively;
-        // an empty queue is still an empty queue there. `PostWorkCommitted` therefore belongs to
-        // the non-preempting tail alone, which is where the table below now places it.
-        for (name, region, settlement) in [
-            (
-                "the idle-CPU arm",
-                &code[idle_at..tail_at],
-                "D::TimerIdleQueueAdvance",
-            ),
-            (
-                "a non-preempting tick",
-                &code[tail_at..],
-                "D::PostWorkCommitted",
-            ),
-        ] {
-            assert!(
-                region.contains(settlement),
-                "{name} must settle as {settlement}"
-            );
-            for wrong in ["D::Complete", "D::QueueAdvanceCommitted"] {
-                assert!(!region.contains(wrong), "{name} must not borrow `{wrong}`");
-            }
-            for banned in [
-                "queue_advance_select_step_split",
-                "queue_advance_commit_split",
-                "queue_advance_acquire_incoming_split",
-                "yield_dispatch_try_defer",
-                "futex_wait_dispatch_try_defer",
-                "dispatch_next_selection_on",
-                "run_yield_transaction",
-            ] {
-                assert!(!region.contains(banned), "{name} must not `{banned}`");
-            }
-        }
-        // U9-TIMER5 re-derivation: the non-preempting tail DOES owe a queue advance, but only for
-        // a parked CPU, and the distinction is what this now pins.
-        //
-        // The old claim — "a non-preempting tick owes no queue advance" — was true of a tick that
-        // interrupts a RUNNING task, which is what the quantum is about. It was never true of a
-        // tick that interrupts a parked one: the broad arm's own `yield_current`, reached for that
-        // state, takes `NoCurrent`, skips the `Running -> Runnable` step and dispatches. Measured:
-        // on the AArch64 profile's shipped quantum an entire boot took 74 ticks and none of them
-        // preempted, so under the old settlement a deadline that expired while the CPU was parked
-        // was never dispatched at all.
-        //
-        // So the tail keeps `PostWorkCommitted` as its settlement and gains ONE guarded exit, and
-        // the guard is the only thing that may open it: nothing is current on this CPU.
-        let tail = &code[tail_at..];
-        let advance_at = tail
-            .find("return D::TimerIdleQueueAdvance;")
-            .expect("the parked-CPU exit");
-        let guard_at = tail
-            .find("if !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0) {")
-            .expect("and it must be guarded on nothing being current");
-        assert!(
-            guard_at < advance_at,
-            "the parked-CPU test precedes the advance it authorizes"
-        );
-        assert_eq!(
-            tail.matches("return D::TimerIdleQueueAdvance;").count(),
-            1,
-            "exactly one guarded exit — a tick that interrupted a running task still owes the \
-             architecture tail and nothing else"
-        );
-
-        // The idle arm's admission is the RUN QUEUE, not `current`, and what it does with the
-        // answer is a SETTLEMENT rather than a hand-off:
-        //
-        // * an empty queue settles as `PostWorkCommitted`, unchanged;
-        // * a non-empty queue commits `TimerIdleQueueAdvance`, so the bridge performs the one
-        //   authoritative advance the broad arm's `on_preempt_current_cpu_selection()` used to.
-        //
-        // U9-TIMER5 re-derivation: the THIRD outcome — U9-TIMER2's port decline under
-        // `no_user_return_path` — is gone, because every port now has a landing. The arm has no
-        // refusal of its own left, so what this guard checks is that there is none: an idle tick
-        // with queued work now always reaches the settlement, and the only thing that can still
-        // stop the advance is the bridge's own authentication, which is not knowable here.
-        //
-        // The probe still precedes the tick, and that ordering still carries the same meaning it
-        // did: the count is an OBSERVATION, not a reservation. The tick is common to both
-        // settlements, nothing is owed to the queue on the strength of the count, and the bridge's
-        // authoritative selection decides what actually happens.
-        // Bounded at the GENERIC decline arm, not at the tail: `Err(decline) => { .. }` sits
-        // between the two and is the transaction's own refusal, which is not this arm's.
-        let idle_end = code[idle_at..tail_at]
+        let deferred_at = code
             .find("Err(decline) => {")
-            .map(|o| idle_at + o)
-            .expect("the generic transaction decline arm");
-        let idle_arm = &code[idle_at..idle_end];
-        let probe = idle_arm
-            .find("runnable_count_on_cpu_split_read(cpu)")
-            .expect("the idle arm must consult the run queue");
-        let tick = idle_arm
-            .find("scheduler_tick_split_mut(cpu)")
-            .expect("the idle arm's tick");
-        let advance = idle_arm
-            .find("return D::TimerIdleQueueAdvance;")
-            .expect("the queued-work settlement");
+            .expect("the deferred settlement");
         assert!(
-            probe < tick && tick < advance,
-            "the run-queue probe precedes the tick it does not reserve, and the settlement is \
-             committed only after the tick it owns"
+            tail_at < commit_at && commit_at < idle_at && idle_at < deferred_at,
+            "the arms appear in the order the body decides them"
+        );
+
+        // The COMMITTING arm is the only one that may claim a published transition, and it is the
+        // only one that reached it through the transaction.
+        let commit_arm = &code[commit_at..idle_at];
+        assert!(
+            commit_arm.contains("TimerSettlement::QueueAdvanceCommitted"),
+            "a committed preemption publishes a queue advance"
+        );
+        assert!(
+            commit_arm.contains("log_yield_deferred(cpu, preempted.outgoing)"),
+            "and names the exact outgoing identity the drain will consume"
+        );
+
+        // The IDLE arm publishes nothing and names no outgoing task — see
+        // `u9t2_the_drain_names_no_outgoing_task` for the full derivation.
+        let idle_arm = &code[idle_at..deferred_at];
+        assert!(
+            idle_arm.contains("TimerSettlement::IdleQueueAdvance"),
+            "an idle-boundary tick owes an advance with no outgoing side"
         );
         for retired in [
             "reason=no_current_runnable",
@@ -148658,10 +148548,29 @@ mod u9tm_proof_gate {
                 "`{retired}` is retired and must not survive alongside its replacement"
             );
         }
+
+        // The NON-PREEMPTING tail has exactly one guarded exit to the idle settlement — the
+        // U9-TIMER5 parked-CPU case — and continues otherwise.
+        let tail = &code[tail_at..commit_at];
+        let advance_at = tail
+            .find("TimerSettlement::IdleQueueAdvance")
+            .expect("the parked-CPU exit");
+        let guard_at = tail
+            .find("if !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0) {")
+            .expect("and it must be guarded on nothing being current");
         assert!(
-            !idle_arm.contains("return D::NotHandled;"),
-            "the idle arm has no refusal left: every port has a landing, so an idle tick with \
-             queued work always reaches the settlement"
+            guard_at < advance_at,
+            "the parked-CPU test precedes the advance it authorizes"
+        );
+        assert_eq!(
+            tail.matches("TimerSettlement::IdleQueueAdvance").count(),
+            1,
+            "exactly one guarded exit — a tick that interrupted a running task still owes the \
+             architecture tail and nothing else"
+        );
+        assert!(
+            tail.contains("TimerSettlement::ContinueCurrent"),
+            "and a tick that interrupted a running task continues it"
         );
     }
 
@@ -168213,15 +168122,19 @@ mod u9residual1_yield_family {
                 "D::QueueAdvanceCommitted",
                 1,
             ),
+            // U9-TIMER-FINAL re-derivation: the recognized timer body is its own function now,
+            // and the counting arms went with it. `try_split_timer_into_frame` is the family
+            // filter and counts nothing at all.
             (
-                "fn try_split_timer_into_frame(",
+                "fn settle_recognized_timer(",
                 "TIMER_SPLIT_PREEMPT_COMMITTED",
                 2,
             ),
         ] {
             let at = SPLIT.find(route).expect("the route");
             let end = SPLIT[at..]
-                .find("\n#[cfg(feature = \"hosted-dev\")]")
+                .find("\n#[cfg(not(feature = \"hosted-dev\"))]\nfn try_split_timer_into_frame(")
+                .or_else(|| SPLIT[at..].find("\n#[cfg(feature = \"hosted-dev\")]"))
                 .map(|r| at + r)
                 .unwrap_or(SPLIT.len());
             let body = &SPLIT[at..end];
@@ -168241,7 +168154,7 @@ mod u9residual1_yield_family {
             // No decline may reach it: every `NotHandled` in the route is either before the
             // increment or in a different arm, so the counter never moves on a fallback.
             let declines_after: alloc::vec::Vec<usize> = body
-                .match_indices("return D::NotHandled;")
+                .match_indices("NotHandled")
                 .map(|(i, _)| i)
                 .filter(|i| *i > count && *i < commit)
                 .collect();
@@ -168260,18 +168173,21 @@ mod u9residual1_yield_family {
         // below rather than by ordering the increment after one.
         {
             let at = SPLIT
-                .find("fn try_split_timer_into_frame(")
+                .find("fn settle_recognized_timer(")
                 .expect("the timer route");
             let end = SPLIT[at..]
-                .find("\n#[cfg(feature = \"hosted-dev\")]")
+                .find("\n#[cfg(not(feature = \"hosted-dev\"))]\nfn try_split_timer_into_frame(")
                 .map(|r| at + r)
-                .unwrap_or(SPLIT.len());
+                .expect("the recognized body is followed by its family filter");
             let body = &SPLIT[at..end];
             let second = body
                 .rfind("shared.count_yield_split_mut();")
                 .expect("the second increment");
+            // `rfind`, because the non-preempting tail commits the same settlement from a
+            // DIFFERENT arm — the U9-TIMER5 parked-CPU exit — which takes no transaction and
+            // therefore owes no count. The one this pairing is about is the transaction's own.
             let advance = body
-                .find("return D::TimerIdleQueueAdvance;")
+                .rfind("TimerSettlement::IdleQueueAdvance")
                 .expect("the idle-boundary commit");
             assert!(
                 second < advance,
@@ -168285,18 +168201,17 @@ mod u9residual1_yield_family {
                 .map(|o| idle_at + o)
                 .expect("the generic transaction decline arm");
             assert!(
-                !body[idle_at..idle_end].contains("return D::NotHandled;"),
+                !body[idle_at..idle_end].contains("NotHandled"),
                 "the idle-boundary arm has no decline that could move the counter and then hand \
                  an already-ticked CPU to the broad arm"
             );
-            let declines_between: alloc::vec::Vec<usize> = body
-                .match_indices("return D::NotHandled;")
-                .map(|(i, _)| i)
-                .filter(|i| *i > second && *i < advance)
-                .collect();
-            assert!(
-                declines_between.is_empty(),
-                "no decline may sit between the idle-advance increment and its commit"
+            // U9-TIMER-FINAL strengthens this from "none between the increment and the commit" to
+            // "none anywhere": the recognized body returns a `TimerSettlement`, which has no
+            // broad variant, so there is no fallback for the counter to precede.
+            assert_eq!(
+                body.matches("NotHandled").count(),
+                0,
+                "no decline anywhere in the recognized body may hand off after counting"
             );
         }
     }
@@ -168335,6 +168250,12 @@ mod u9residual1_yield_family {
         ] {
             // `no_trap_drainer` and `multi_cpu` are owned by `TerminalAdmissionRefusal::marker`,
             // which the policy delegates to; the rest are the policy's own.
+            //
+            // U9-TIMER-FINAL §1: this is a VOCABULARY guard, and `multi_cpu` staying in the
+            // vocabulary is not a claim that a yield or a timer can produce it. It cannot — the
+            // transaction is authority-bound and `split_terminal_route_admission` returns before
+            // that check. The spelling survives for the `AmbientBound` families that still reach
+            // it. `every_remaining_timer_decline_is_inventoried` asserts the unreachability.
             const BOOT_MOD: &str = include_str!("mod.rs");
             assert!(
                 YIELD_TXN.contains(reason) || BOOT_MOD.contains(reason),
@@ -170948,10 +170869,13 @@ mod u9timer1_preempting_timer {
     /// dispositions the branches deliberately avoid — an anchor that matched prose would slice
     /// the wrong region and assert the opposite of what is meant.
     fn route() -> alloc::string::String {
+        // U9-TIMER-FINAL re-derivation: the recognized body is its own function now, and the
+        // slice follows it there. `try_split_timer_into_frame` is the family filter and nothing
+        // else — slicing THAT would test three lines and miss the route entirely.
         SPLIT
-            .split("fn try_split_timer_into_frame(")
+            .split("fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement {")
             .nth(1)
-            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .and_then(|s| s.split("\n#[cfg(not(feature = \"hosted-dev\"))]\nfn try_split_timer_into_frame(").next())
             .expect("the timer route")
             .lines()
             .filter(|l| {
@@ -170962,18 +170886,36 @@ mod u9timer1_preempting_timer {
             .join("\n")
     }
 
-    /// The route's three settlements, in the order it decides them, each as its own region.
-    fn settlements(code: &str) -> (usize, usize, usize) {
+    /// The route's settlements, each as its own region.
+    ///
+    /// U9-TIMER-FINAL re-derivation: the ORDER changed, and the change is the point. The tick is
+    /// taken first and is the sole authority on whether this interrupt preempts, so the
+    /// non-preempting tail is decided BEFORE the preempting branch rather than after it, and the
+    /// separate lookahead that used to open the body is gone. There are now four settlements, not
+    /// three: the fourth is the one that closed this family — every transaction decline continues
+    /// the current task here instead of asking for broad handling.
+    fn settlements(code: &str) -> (usize, usize, usize, usize) {
+        let tail = code
+            .find("if !preempting {")
+            .expect("the non-preempting tail");
         let commit = code
-            .find("if shared.timer_would_preempt_split_read(cpu) {")
-            .expect("the preempting branch");
+            .find("Ok(preempted) => {")
+            .expect("the preempting commit");
         let idle = code
             .find("Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {")
             .expect("the idle-CPU arm");
-        let tail = code
-            .find("let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu)")
+        let deferred = code
+            .find("Err(decline) => {")
+            .expect("the deferred settlement");
+        (tail, commit, idle, deferred)
+    }
+
+    /// The ONE tick/claim/re-arm prologue, which every settlement below inherits.
+    fn prologue(code: &str) -> &str {
+        let end = code
+            .find("if !preempting {")
             .expect("the non-preempting tail");
-        (commit, idle, tail)
+        &code[..end]
     }
 
     // ── one policy ───────────────────────────────────────────────────────────────────────────
@@ -170988,8 +170930,10 @@ mod u9timer1_preempting_timer {
     #[test]
     fn the_preempting_branch_drives_the_existing_yield_transaction() {
         let code = route();
-        let (commit, idle, _) = settlements(&code);
-        let branch = &code[commit..idle];
+        let (tail, _commit, _idle, _deferred) = settlements(&code);
+        // The transaction and its owners sit between the non-preempting tail and the match that
+        // settles its outcomes, which is the whole of the preempting branch.
+        let branch = &code[tail..];
         assert!(
             branch.contains("yield_txn::SharedYieldOwners { shared }"),
             "the timer must drive the transaction through the EXISTING split owners"
@@ -170997,6 +170941,13 @@ mod u9timer1_preempting_timer {
         assert!(
             branch.contains("run_yield_transaction(&mut owners, cpu)"),
             "and through the existing transaction"
+        );
+        assert_eq!(
+            branch
+                .matches("run_yield_transaction(&mut owners, cpu)")
+                .count(),
+            1,
+            "and exactly once — a second drive is a second policy"
         );
         // No selection, requeue or transition of its own — every one of those belongs to the
         // transaction or to the drain that consumes its deferral.
@@ -171025,70 +170976,236 @@ mod u9timer1_preempting_timer {
         );
     }
 
-    /// **Exactly one tick, one claim and one re-arm on every settlement.**
+    /// **Exactly one tick, one claim and one re-arm — for the whole body, on every settlement.**
     ///
-    /// §2's first invariant. A route with three exits is exactly where a tick gets taken twice or
-    /// not at all, so it is counted per region rather than over the whole route.
+    /// §2's first invariant, and U9-TIMER-FINAL makes it structural rather than arithmetic.
+    ///
+    /// It used to be counted per region, because the route had three exits each taking its own
+    /// tick, and "three regions with one tick each" is a property that a fourth exit silently
+    /// breaks. The tick is now a PROLOGUE: one call, before the body branches at all, whose report
+    /// is the only thing that decides which settlement runs. So the count is over the entire body
+    /// and no settlement can add or skip one.
     #[test]
     fn every_settlement_ticks_claims_and_rearms_exactly_once() {
         let code = route();
-        let (commit, idle, tail) = settlements(&code);
-        for (name, region, tick_call) in [
-            (
-                "the preempting commit",
-                &code[commit..idle],
-                "scheduler_tick_split_mut(cpu)",
-            ),
-            (
-                "the idle-CPU settlement",
-                &code[idle..tail],
-                "scheduler_tick_split_mut(cpu)",
-            ),
-            (
-                "the non-preempting tail",
-                &code[tail..],
-                "scheduler_tick_if_no_switch_split_mut(cpu)",
-            ),
+        for (what, needle) in [
+            ("tick", "scheduler_tick_split_mut(cpu)"),
+            ("claim", "acknowledge_interrupt(cpu, 0)"),
+            ("re-arm", "program_timer_deadline("),
         ] {
             assert_eq!(
-                region.matches(tick_call).count(),
+                code.matches(needle).count(),
                 1,
-                "{name} must tick exactly once"
-            );
-            assert_eq!(
-                region.matches("acknowledge_interrupt(cpu, 0)").count(),
-                1,
-                "{name} must claim exactly once"
-            );
-            assert_eq!(
-                region.matches("program_timer_deadline(").count(),
-                1,
-                "{name} must re-arm exactly once"
-            );
-            // The same deadline constant the broad arm passes — the quantum override separates
-            // the interrupt count from the interval and must never reach the interval.
-            assert!(
-                region.contains("crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,"),
-                "{name} must re-arm from the shipped hardware constant"
+                "the recognized timer body must {what} exactly once, for every settlement"
             );
         }
-        // The declining paths tick nothing at all: they hand an unchanged CPU to the broad arm,
-        // which ticks and preempts exactly as it always has.
-        // U9-TIMER3 re-derivation: 5 -> 4. The proof-mode gate is removed, because the dependency
-        // behind it is removed — the five one-shot proof bodies are driven from the boot ownership
-        // point and no diagnostic knob sends a tick to broad dispatch any more.
-        // U9-TIMER4 re-derivation: 5 -> 4. The last diagnostic gate term is removed, because the
-        // boot-path window that kept its proof on the timer is closed. No diagnostic knob is a
-        // reason for this route to refuse any more.
-        // U9-TIMER5 re-derivation: 4 -> 3. The port-capability refusal is removed, because the
-        // landing it reported absent is built on both ports it excluded. What is left is three
-        // declines that are not about the timer's own work at all: two classification misses and
-        // one fail-safe.
+        // The same deadline constant the broad arm passes — the quantum override separates the
+        // interrupt count from the interval and must never reach the interval.
+        assert!(
+            code.contains("crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,"),
+            "the re-arm must use the shipped hardware constant"
+        );
+        // All three are in the PROLOGUE, ahead of every branch, so no settlement can be reached
+        // without them and none can take a second one.
+        let prologue = prologue(&code);
+        for needle in [
+            "scheduler_tick_split_mut(cpu)",
+            "acknowledge_interrupt(cpu, 0)",
+            "program_timer_deadline(",
+        ] {
+            assert!(
+                prologue.contains(needle),
+                "`{needle}` must sit ahead of the first branch"
+            );
+        }
+        // And the retired two-acquisition lookahead is gone. It was the only thing that could
+        // disagree with the tick, and its disagreement was answered with `NotHandled`.
+        for retired in [
+            "timer_would_preempt_split_read",
+            "scheduler_tick_if_no_switch_split_mut",
+            "reason=would_preempt",
+        ] {
+            assert!(
+                !code.contains(retired),
+                "`{retired}` is retired: the tick is the one authority on whether this interrupt \
+                 preempts, so there is nothing left for a second read to contradict"
+            );
+        }
+    }
+
+    /// **A recognized PRODUCTION timer cannot ask for broad handling, and the one hand-off that
+    /// remains is a default-off diagnostic that takes no work before it hands over.**
+    ///
+    /// This is U9-TIMER-FINAL's acceptance claim, stated exactly rather than optimistically.
+    ///
+    /// The §2 draft had `TimerSettlement` with three variants and no `NotHandled` at all, and
+    /// settled `ArchGateOff` locally as `ContinueCurrent`. **That was measured and was wrong.**
+    /// Under `D6_SWITCH_A=1 yarm.sched_quantum_ticks=1`, all 74 preempting ticks of a boot decline
+    /// with `d6_genuine_off` — so continuing locally does not defer the preemption by one tick, it
+    /// drops it permanently, which is precisely what §2 forbids, and the boot stops progressing
+    /// (base reaches `KSPAWN_ENTER`; a `ContinueCurrent` head does not).
+    ///
+    /// So the hand-off is kept for that one population, and this case pins the three properties
+    /// that make it a named residual instead of a hole: it is produced from ONE site, that site is
+    /// the body's FIRST act so nothing has been ticked or re-armed, and its gate is a default-off
+    /// knob on one architecture.
+    #[test]
+    fn the_only_broad_hand_off_is_the_default_off_diagnostic() {
+        let code = route();
+        for settlement in [
+            "TimerSettlement::QueueAdvanceCommitted",
+            "TimerSettlement::IdleQueueAdvance",
+            "TimerSettlement::ContinueCurrent",
+            "TimerSettlement::DiagnosticSwitchOwner",
+        ] {
+            assert!(
+                code.contains(settlement),
+                "`{settlement}` must be reachable"
+            );
+        }
+        assert!(
+            !code.contains("NotHandled"),
+            "even the residual must be named as a SETTLEMENT — the body must not be able to spell \
+             the terminal broad dispatcher directly"
+        );
+        assert!(
+            !code.contains("SplitDispatchDisposition"),
+            "and must not reach the disposition type at all — the mapping is the settlement's"
+        );
+
+        // ── the residual is produced ONCE, and FIRST ─────────────────────────────────────────
         assert_eq!(
-            code.matches("return D::NotHandled;").count(),
-            3,
-            "three declines: not-a-timer, a transaction decline, and the tail's fail-safe if the \
-             lookahead and the no-switch seam ever disagreed"
+            code.matches("TimerSettlement::DiagnosticSwitchOwner")
+                .count(),
+            1,
+            "exactly one producer, so the hand-off cannot acquire a second reason"
+        );
+        let handoff = code
+            .find("TimerSettlement::DiagnosticSwitchOwner")
+            .expect("the residual");
+        for after in [
+            "scheduler_tick_split_mut(cpu)",
+            "acknowledge_interrupt(cpu, 0)",
+            "program_timer_deadline(",
+            "run_yield_transaction(&mut owners, cpu)",
+        ] {
+            let at = code.find(after).unwrap_or_else(|| panic!("`{after}`"));
+            assert!(
+                handoff < at,
+                "the hand-off must precede `{after}` — handing over AFTER the prologue would make \
+                 the broad arm tick, acknowledge and re-arm a SECOND time"
+            );
+        }
+        assert!(
+            code.contains("ticked=0 rearm=0 settlement=broad_owner"),
+            "and the marker must say so, so a live run reports an untouched hand-off rather than \
+             leaving it to be inferred"
+        );
+
+        // ── its gate is a default-off knob on ONE architecture ───────────────────────────────
+        let gate = SPLIT
+            .split("fn diagnostic_owns_switch_path() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the residual's gate")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            gate.contains("#[cfg(target_arch = \"x86_64\")]")
+                && gate.contains("#[cfg(not(target_arch = \"x86_64\"))]")
+                && gate.contains("false"),
+            "the gate must be architecture-total: x86_64 asks the knobs, every other port is \
+             unconditionally closed"
+        );
+        for knob in [
+            "d6_controlled_switch_proof_enabled()",
+            "d6_switch_a_enabled()",
+        ] {
+            assert!(gate.contains(knob), "the gate must ask `{knob}`");
+        }
+        // Both knobs are default-off, which is what makes the residual unreachable in production.
+        // Read from THEIR owner, so a default that changed would fail here rather than silently
+        // widen the residual.
+        const BOOT_MOD: &str = include_str!("mod.rs");
+        for flag in ["D6_CONTROLLED_SWITCH_PROOF_ENABLED", "D6_SWITCH_A_ENABLED"] {
+            let decl = BOOT_MOD
+                .split(&alloc::format!(
+                    "static {flag}: core::sync::atomic::AtomicBool ="
+                ))
+                .nth(1)
+                .and_then(|s| s.split(';').next())
+                .unwrap_or_else(|| panic!("`{flag}` must be an AtomicBool with a literal default"));
+            assert!(
+                decl.contains("AtomicBool::new(false)"),
+                "`{flag}` must default to false — it is what makes the residual non-production"
+            );
+        }
+        // The filter is separate, and it is the ONLY `NotHandled`. Comments are stripped here for
+        // the same reason they are in `route()`: the filter's own comment names the disposition it
+        // is the single legitimate producer of, and counting prose would report two.
+        let filter: alloc::string::String = SPLIT
+            .split("fn try_split_timer_into_frame(\n    shared: &SharedKernel,")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the family filter")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let filter = filter.as_str();
+        assert!(
+            filter.contains("if !is_timer {") && filter.contains("NotHandled"),
+            "the family filter rejects a non-timer event and nothing else"
+        );
+        assert_eq!(
+            filter.matches("NotHandled").count(),
+            1,
+            "exactly one, and it is the family filter's"
+        );
+        // The residual's `NotHandled` lives in the MAPPING, not in the body and not in the filter,
+        // so there are exactly two in the whole route: "this is not a timer", and "a diagnostic
+        // owns the switch path".
+        assert_eq!(
+            SPLIT
+                .split("fn disposition(self) -> SplitDispatchDisposition {")
+                .nth(1)
+                .and_then(|s| s.split("\n    }").next())
+                .expect("the mapping")
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains("NotHandled"))
+                .count(),
+            1,
+            "the mapping has exactly one broad arm, and it belongs to the diagnostic residual"
+        );
+        assert!(
+            filter.contains("settle_recognized_timer(shared, cpu).disposition()"),
+            "and everything else is the recognized body's settlement, mapped"
+        );
+        // The mapping is total over a closed enum, so a new settlement cannot be added without
+        // choosing a disposition for it.
+        let mapping = SPLIT
+            .split("fn disposition(self) -> SplitDispatchDisposition {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the settlement mapping");
+        // A wildcard arm would make the mapping total by DEFAULTING, which is exactly what must
+        // not be possible: adding a fourth settlement has to be a choice about where it goes. The
+        // test is for a wildcard PATTERN — `mapping.contains('_')` would match `finalize_syscall`
+        // and assert nothing.
+        for arm in mapping.lines().map(str::trim) {
+            assert!(
+                !arm.starts_with("_ =>") && !arm.starts_with("_ if "),
+                "the mapping must enumerate every settlement rather than defaulting one, found \
+                 `{arm}`"
+            );
+        }
+        assert_eq!(
+            mapping.matches("Self::").count(),
+            4,
+            "and it names all four settlements explicitly"
         );
     }
 
@@ -171150,75 +171267,106 @@ mod u9timer1_preempting_timer {
 
     // ── settlement and error cases ───────────────────────────────────────────────────────────
 
-    /// **Every decline is pre-mutation, so the broad fallback is always safe.**
+    /// **No decline can follow a mutation — and there is no longer anywhere for one to fall to.**
     ///
-    /// §2 forbids a broad fallback after mutation. The route's ordering is what makes that true:
-    /// the lookahead is asked before anything ticks, the transaction's every step refuses before
-    /// it writes, and the idle arm probes the run queue before it takes its tick. So a decline
-    /// hands the broad arm a CPU in exactly the state it would have found before this conversion
-    /// — no double tick, and no silently dropped quantum.
+    /// The obligation this case has always carried is that a refusal must not leave the world
+    /// half-changed. Earlier stages met it by ordering the route so that every decline preceded
+    /// the tick, because a decline handed the CPU to the broad arm and the broad arm would tick.
+    ///
+    /// U9-TIMER-FINAL meets it differently and more strongly. There is no broad arm to fall to, so
+    /// the ordering constraint that existed to make the hand-off safe is gone; what replaces it is
+    /// the transaction's own guarantee, which is the thing that was actually load-bearing all
+    /// along: every `YieldDecline` is either produced before any write, or exactly reversed by the
+    /// named inverse of the one step that can fail after a write. This case asserts that
+    /// guarantee at its source rather than re-deriving it from statement order.
     #[test]
     fn no_decline_can_follow_a_mutation() {
         let code = route();
-        let (commit, idle, tail) = settlements(&code);
-        // Nothing may tick or claim before the branch is chosen.
+        let (tail, commit, idle, deferred) = settlements(&code);
         assert!(
-            code[..commit].find("scheduler_tick").is_none()
-                && code[..commit].find("acknowledge_interrupt").is_none(),
-            "the lookahead must precede every mutation"
+            tail < commit && commit < idle && idle < deferred,
+            "the settlements appear in the order the body decides them"
         );
-        // In the committing branch the decline is the transaction's own `Err`, which is
-        // unreachable once the transaction returned `Ok`.
-        let branch = &code[commit..idle];
+
+        // (a) The transaction is driven ONCE, after the tick, and every arm of its result is
+        // settled locally. Nothing in the body returns to a caller that could re-run it.
+        let branch = &code[tail..];
         let txn = branch
             .find("run_yield_transaction(&mut owners, cpu)")
             .expect("the transaction");
-        let tick = branch
-            .find("scheduler_tick_split_mut(cpu)")
-            .expect("the tick");
         assert!(
-            txn < tick,
-            "nothing ticks until the transaction has committed"
+            branch[txn..].contains("Ok(preempted) => {")
+                && branch[txn..].contains("Err(decline) => {"),
+            "every outcome of the one drive is matched where it is produced"
         );
-        // U9-TIMER5 re-derivation: the idle arm HAS no decline any more, so the property is
-        // stated the only way that is still true of it — it declines nowhere, at any position.
-        // The obligation the old assertion carried is met more strongly than before: a branch with
-        // no `NotHandled` cannot hand the broad arm a half-ticked CPU, because it cannot hand the
-        // broad arm anything at all. The run-queue probe still precedes the tick, and that
-        // ordering still says the count is an observation rather than a reservation.
-        // Bounded at the GENERIC decline arm: `Err(decline) => { .. }` is the transaction's own
-        // refusal, which is pre-mutation for its own reasons and is not part of the idle arm.
-        let arm_end = code[idle..tail]
-            .find("Err(decline) => {")
-            .map(|o| idle + o)
-            .expect("the generic transaction decline arm");
-        let arm = &code[idle..arm_end];
-        let probe = arm
-            .find("runnable_count_on_cpu_split_read(cpu)")
-            .expect("the run-queue probe");
-        let idle_tick = arm
-            .find("scheduler_tick_split_mut(cpu)")
-            .expect("the idle arm's tick");
-        assert!(
-            probe < idle_tick,
-            "the idle arm reads the run queue before it takes its tick"
-        );
-        assert!(
-            !arm.contains("return D::NotHandled;"),
-            "the idle arm no longer declines at all — every port has a landing"
-        );
-        // And the tail's seam is atomic: it refuses without incrementing.
-        let seam = RUNTIME
-            .split("pub(crate) fn scheduler_tick_if_no_switch_split_mut(")
+
+        // (b) The transaction's own contract: the ONLY step that can fail after a write undoes
+        // that write through its named inverse, and releases the reservation it took.
+        let reenqueue = YIELD_TXN
+            .split("let Some(reenqueued) = owners.reenqueue_and_clear_current(cpu) else {")
             .nth(1)
-            .and_then(|s| s.split("\n    }").next())
-            .expect("the no-switch seam");
-        assert_eq!(
-            seam.matches("with_scheduler_split_mut").count(),
-            1,
-            "the tail's lookahead and tick must share ONE acquisition"
+            .and_then(|b| b.split("};").next())
+            .expect("the only post-write failure");
+        assert!(
+            reenqueue.contains("owners.rollback_preempt_outgoing(outgoing, applied)")
+                && reenqueue.contains("owners.release_yield_deferral(cpu)")
+                && reenqueue.contains("YieldDecline::ReenqueueRefused"),
+            "the one reversible failure must apply the named inverse and release the reservation"
         );
-        let _ = tail;
+        // And the primitive it calls restores `current` itself before reporting the refusal, so
+        // the caller is `Running` and current again when the settlement runs.
+        const SCHED: &str = include_str!("../scheduler.rs");
+        let primitive = SCHED
+            .split("pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId> {")
+            .nth(1)
+            .and_then(|b| b.split("\n    }").next())
+            .expect("the re-enqueue primitive");
+        assert!(
+            primitive.contains("self.current = Some(running);")
+                && primitive.contains("return None;"),
+            "a refused re-enqueue restores `current` before it reports"
+        );
+        // The other post-reservation failure writes no field at all, so releasing the reservation
+        // is the whole of its undo.
+        let not_running = YIELD_TXN
+            .split("let Some(applied) = owners.preempt_outgoing(outgoing) else {")
+            .nth(1)
+            .and_then(|b| b.split("};").next())
+            .expect("the rank-2 refusal");
+        assert!(
+            not_running.contains("owners.release_yield_deferral(cpu)")
+                && not_running.contains("YieldDecline::NotRunning")
+                && !not_running.contains("rollback"),
+            "a refused transition wrote nothing, so its undo is the release and nothing more"
+        );
+
+        // (c) The settlement for every decline is the current task continuing — never a
+        // hand-off, never an error, never a panic.
+        let deferred_arm = &code[deferred..];
+        assert!(
+            deferred_arm.contains("TimerSettlement::ContinueCurrent"),
+            "a declined preemption continues the interrupted task"
+        );
+        for banned in [
+            "NotHandled",
+            "panic!",
+            "unreachable!",
+            "SyscallError",
+            "Complete(",
+        ] {
+            assert!(
+                !deferred_arm.contains(banned),
+                "a declined preemption must not `{banned}` — contention is normal, and a timer \
+                 has no caller to hand an error to"
+            );
+        }
+        // It NAMES which decline it settled, through the one vocabulary owner, so the population
+        // stays countable rather than inferred.
+        assert!(
+            deferred_arm.contains("yield_txn::legacy_reason(decline)"),
+            "the settlement must name the decline through the shared vocabulary"
+        );
+        let _ = (commit, idle);
     }
 
     /// **A tick that changed nothing may not claim a queue advance — driven, not read.**
@@ -171346,32 +171494,45 @@ mod u9timer1_preempting_timer {
 
     // ── the remaining timer declines, derived from source ────────────────────────────────────
 
-    /// **Every remaining route into the broad timer arm, enumerated from source.**
+    /// **Every decline a recognized timer can actually produce, enumerated from source, with the
+    /// settlement each one now receives.**
     ///
-    /// §4 requires the inventory to be derived independently of marker counts, and forbids
-    /// claiming the TimerInterrupt family closed while any supported branch still reaches broad
-    /// dispatch. It is not closed, and this is the complete list of what is left:
+    /// §1 requires the inventory to be derived from what the code can EXECUTE, not from what the
+    /// vocabulary can SPELL. Those differ here, and the difference is the correction U9-TIMER-FINAL
+    /// §1 names: earlier stages listed `multi_cpu` (and, implicitly, `not_dispatch_cpu`) as live
+    /// timer declines because `TerminalAdmissionRefusal` declares them and `legacy_reason` spells
+    /// them. A timer reaches admission through exactly one adapter — `SharedYieldOwners`, which
+    /// passes [`TerminalRouteTopology::AuthorityBound`] — and `split_terminal_route_admission`
+    /// RETURNS `Ok(())` immediately after the authority-bound prefix under that topology, before
+    /// the dispatcher-count and bound-CPU checks run at all. Those two variants are therefore
+    /// unreachable from any timer, on any supported configuration, and an enum variant existing is
+    /// not evidence that a timer can produce it.
     ///
-    /// | decline | owner | when |
-    /// |---|---|---|
-    /// | `proof_hooks_armed` | the route's own gate | any of the five timer-only `maybe_run_*` proof knobs armed |
-    /// | `d6_genuine_off` / `not_bsp` | `yield_deferral_arch_gate` | x86_64 under `d6_switch_proof`/`d6_switch_a`; non-bootstrap CPU on AArch64/RISC-V — ONE variant, two per-architecture spellings |
-    /// | `already_deferred` | the one-shot deferral | some route already holds this CPU's Yield deferral |
-    /// | `no_trap_drainer` | `TerminalAdmissionRefusal` | the shared trap drain is not active on this CPU |
-    /// | `cpu_out_of_range` | `TerminalAdmissionRefusal` | CPU index beyond `MAX_CPUS` |
-    /// | `multi_cpu` | `TerminalAdmissionRefusal` | more than one dispatching CPU (`yarm.ap_user_dispatch`) |
-    /// | `not_running` | `apply_preempt_outgoing_locked` | the interrupted task is not `Running` |
-    /// | `reenqueue_failed` | the scheduler | the re-enqueue was refused; `current` was restored |
+    /// The corrected matrix — what a recognized `TimerInterrupt` can actually decline with, and
+    /// where each one lands now that the body settles rather than hands off:
     ///
-    /// U9-TIMER5 re-derivation: the route has NO declines of its own left. `proof_hooks_armed`
-    /// went with U9-TIMER3/§4's relocation of the five diagnostic bodies, `no_current_runnable`
-    /// went with U9-TIMER2's idle settlement, and `no_user_return_path` goes here — every port has
-    /// an idle-boundary landing, so the population it named is served rather than refused. What
-    /// remains is exactly `YieldDecline`, and the case enumerates the enum so a new variant cannot
-    /// be added without landing here.
+    /// | decline | reason | owner | when | settlement |
+    /// |---|---|---|---|---|
+    /// | `NoCurrent` | — | the transaction | nothing is current on this CPU | `IdleQueueAdvance` |
+    /// | — (pre-empted at step 0) | `d6_genuine_off` | `diagnostic_owns_switch_path` | x86_64 under `d6_switch_proof`/`d6_switch_a` — an ACTIVE diagnostic that owns the switch path | `DiagnosticSwitchOwner` → the broad arm, **untouched** |
+    /// | `ArchGateOff` | `not_bsp` | `yield_deferral_arch_gate` | a non-bootstrap CPU — no AP arms a timer on any port, so no timer reaches this spelling | `ContinueCurrent` |
+    /// | `DeferralHeld` | `already_deferred` | the one-shot deferral | some route already holds this CPU's Yield deferral | `ContinueCurrent` |
+    /// | `RouteNotAdmitted` | `no_trap_drainer` | `TerminalAdmissionRefusal` | the shared trap drain is not active on this CPU | `ContinueCurrent` |
+    /// | `RouteNotAdmitted` | `cpu_out_of_range` | `TerminalAdmissionRefusal` | CPU index beyond `MAX_CPUS` | `ContinueCurrent` |
+    /// | `NotRunning` | `not_running` | `apply_preempt_outgoing_locked` | the interrupted task is not `Running` | `ContinueCurrent` |
+    /// | `ReenqueueRefused` | `reenqueue_failed` | the scheduler | the re-enqueue was refused; `current` was restored | `ContinueCurrent` |
+    ///
+    /// UNREACHABLE from a timer, and asserted so below rather than merely omitted:
+    /// `RouteNotAdmitted(MultiDispatcher)` and `RouteNotAdmitted(NotDispatchCpu)`.
+    ///
+    /// The route has no declines of its OWN left: `proof_hooks_armed` went with U9-TIMER3's
+    /// relocation of the five diagnostic bodies, `no_current_runnable` with U9-TIMER2's idle
+    /// settlement, `no_user_return_path` with U9-TIMER5's idle-boundary landing, and
+    /// `would_preempt` with U9-TIMER-FINAL's single-tick prologue. What remains is exactly
+    /// `YieldDecline`, and the case enumerates the enum so a new variant cannot be added without
+    /// landing here.
     #[test]
     fn every_remaining_timer_decline_is_inventoried() {
-        // The route's own two, by their exact emitted reasons.
         let code = route();
         // U9-TIMER3 re-derivation: `proof_hooks_armed` is RETIRED as a decline, and retired by
         // removing the dependency rather than by narrowing the predicate. The five one-shot proof
@@ -171401,17 +171562,25 @@ mod u9timer1_preempting_timer {
             );
         }
         assert!(
-            code.contains("return D::TimerIdleQueueAdvance;"),
+            code.contains("TimerSettlement::IdleQueueAdvance"),
             "and the population it replaced must be settled, not simply dropped"
         );
-        // The whole route now has exactly the declines `YieldDecline` supplies, plus the two
-        // classification refusals that precede any timer work at all (`!is_timer`, and a tick that
-        // would preempt a running task being handled by the committing branch instead).
+        // U9-TIMER-FINAL: the fourth retirement. The second quantum read is gone with the
+        // hand-off it protected, so there is no `would_preempt` fail-safe left either.
+        for retired in ["reason=would_preempt", "timer_would_preempt_split_read"] {
+            assert!(
+                !code.contains(retired),
+                "`{retired}` is retired with the hand-off it existed to make safe"
+            );
+        }
+        // And the recognized body has NO way to reach broad dispatch at all — not three sites,
+        // none. See `the_recognized_timer_body_has_no_broad_hand_off` for the type-level claim;
+        // this is the inventory's own restatement of it, so the table above cannot quietly grow a
+        // row that escapes instead of settling.
         assert_eq!(
-            code.matches("return D::NotHandled;").count(),
-            3,
-            "the route's `NotHandled` sites are the non-timer refusal, the transaction's own \
-             decline and the non-preempting tail's lookahead miss — no fourth"
+            code.matches("NotHandled").count(),
+            0,
+            "a recognized timer decline settles; none of them may name the broad dispatcher"
         );
 
         // The transaction's, from the enum rather than from a log. Every variant either has a
@@ -171453,11 +171622,32 @@ mod u9timer1_preempting_timer {
                 "unknown decline `{v}` — the timer inventory must be extended with it"
             );
         }
-        // `NoCurrent` is the only one the route settles rather than declines — U9-TIMER2 made that
-        // true for BOTH of its outcomes, the empty run queue and the non-empty one, on a port with
-        // a landing. The other five reach the broad arm through `legacy_reason`. `ArchGateOff` is
-        // the one variant with TWO spellings, chosen per architecture, and both are in the
-        // inventory because both are reachable on a supported build.
+        // And the ROUTE documents each of them too, in its own post-state table. §1 asks for the
+        // producer, the preconditions and the owed work per path; the table is where the route
+        // states them, so a variant that exists but is not accounted for there fails here rather
+        // than being silently settled by the catch-all arm.
+        let route_doc = SPLIT
+            .split("/// U9-TIMER-FINAL §2 — THE RECOGNIZED TIMER BODY.")
+            .nth(1)
+            .and_then(|s| s.split("\nfn settle_recognized_timer(").next())
+            .expect("the route's documentation");
+        for v in &variants {
+            // `ArchGateOff`'s D6 spelling is pre-empted at step (0) and is documented under the
+            // settlement that handles it; its `not_bsp` spelling is in the table.
+            assert!(
+                route_doc.contains(v.as_str()),
+                "the route must account for `{v}` in its own documentation"
+            );
+        }
+        assert!(
+            route_doc.contains("DiagnosticSwitchOwner"),
+            "including the one hand-off that is NOT a decline of the transaction at all"
+        );
+        // `NoCurrent` is the only one that settles as an ADVANCE; the other five continue the
+        // interrupted task. `ArchGateOff` is the one variant with TWO spellings, chosen per
+        // architecture, and both stay in the inventory: `d6_genuine_off` is produced by an ACTIVE
+        // diagnostic on x86_64, and `not_bsp` is in the vocabulary although no timer reaches it,
+        // because no AP arms a timer on any port.
         for reason in [
             "\"d6_genuine_off\"",
             "\"not_bsp\"",
@@ -171471,12 +171661,70 @@ mod u9timer1_preempting_timer {
             );
         }
         const BOOT_MOD: &str = include_str!("mod.rs");
-        for reason in ["\"no_trap_drainer\"", "\"multi_cpu\""] {
+        for reason in ["\"no_trap_drainer\"", "\"cpu_out_of_range\""] {
             assert!(
                 BOOT_MOD.contains(reason),
-                "the topology reason {reason} is owned by TerminalAdmissionRefusal"
+                "the topology reason {reason} is owned by TerminalAdmissionRefusal and IS \
+                 reachable from a timer"
             );
         }
+
+        // ── the §1 correction, asserted against the admission owner itself ───────────────────
+        //
+        // `multi_cpu` and `not_dispatch_cpu` are spellings this vocabulary owns and a TIMER can
+        // never produce. The proof is structural and lives in two places, so both are pinned:
+        //  (1) the only adapter a timer reaches admission through selects `AuthorityBound`; and
+        //  (2) `split_terminal_route_admission` returns before either check under that topology.
+        //
+        // CODE only on the transaction side: this file's own module documentation now states the
+        // correction in prose, and counting prose would report two topologies where there is one.
+        let txn_code: alloc::string::String = YIELD_TXN
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            txn_code.contains("crate::runtime::TerminalRouteTopology::AuthorityBound,"),
+            "the yield transaction — the timer's only admission caller — must be authority-bound"
+        );
+        assert_eq!(
+            txn_code.matches("TerminalRouteTopology::").count(),
+            1,
+            "and it must name exactly one topology, so no second spelling can reach the ambient \
+             checks behind the timer's back"
+        );
+        let admission = RUNTIME
+            .split("pub(crate) fn split_terminal_route_admission(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the admission owner")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let early_return = admission
+            .find("if topology == TerminalRouteTopology::AuthorityBound {")
+            .expect("the authority-bound early return");
+        for unreachable in ["R::MultiDispatcher", "R::NotDispatchCpu"] {
+            let at = admission
+                .find(unreachable)
+                .unwrap_or_else(|| panic!("`{unreachable}` must still exist for AmbientBound"));
+            assert!(
+                at > early_return,
+                "`{unreachable}` must sit AFTER the authority-bound return — if it moved above \
+                 it, a timer could produce it and this inventory would be wrong again"
+            );
+        }
+        assert!(
+            admission[early_return..]
+                .lines()
+                .take(6)
+                .any(|l| l.trim() == "return Ok(());"),
+            "the authority-bound topology must RETURN, not merely skip a branch"
+        );
         // The five timer-only proof hooks are NOT relocated by this stage, so an armed profile
         // still takes the whole unchanged broad arm. That is the first row of the table, and it
         // is what stops any claim that the family is closed.
@@ -171676,8 +171924,11 @@ mod u9timer1_preempting_timer {
             !code.contains(".with(|") && !code.contains("with_cpu("),
             "the timer route must open no broad acquisition"
         );
+        // U9-TIMER-FINAL re-derivation: the route's seams changed with its shape. The second
+        // quantum read is gone, so `timer_would_preempt_split_read` is no longer one of them —
+        // the tick itself is, and it is the seam that now carries the whole decision.
         for seam in [
-            "pub(crate) fn timer_would_preempt_split_read",
+            "pub(crate) fn scheduler_tick_split_mut",
             "pub(crate) fn set_scheduler_quantum_split_mut",
         ] {
             let body = RUNTIME
@@ -172181,13 +172432,12 @@ mod u9timer1_preempting_timer {
             drain.contains("shared.yield_reverify_ready(cpu)"),
             "its re-verify is the one question it can actually ask"
         );
-        // And the route publishes nothing either.
+        // And the route publishes nothing either. The arm's bounds come from the route's own
+        // settlement map rather than from a second hand-written anchor, so a re-ordering of the
+        // body moves this slice with it instead of silently emptying it.
         let code = route();
-        let arm = code
-            .split("Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {")
-            .nth(1)
-            .and_then(|s| s.split("\n            Err(decline)").next())
-            .expect("the idle-CPU arm");
+        let (_tail, _commit, idle, deferred) = settlements(&code);
+        let arm = &code[idle..deferred];
         for banned in ["_try_defer", "_dispatch_outgoing", "capture_outgoing"] {
             assert!(
                 !arm.contains(banned),

@@ -3151,55 +3151,272 @@ fn try_split_blocking_ipc_recv_into_frame(
 /// particular trap. The settlement below is therefore `TimerIdleQueueAdvance` on every port, and
 /// an unauthenticated trap is settled by the bridge under its own name rather than by a
 /// port-wide constant here.
-#[cfg(not(feature = "hosted-dev"))]
-fn try_split_timer_into_frame(
-    shared: &SharedKernel,
-    cpu: CpuId,
-    is_timer: bool,
-) -> SplitDispatchDisposition {
-    use SplitDispatchDisposition as D;
+/// U9-TIMER-FINAL §2 — what a RECOGNIZED timer interrupt settles as. There is no `NotHandled`
+/// here, and that absence is the whole point of the type.
+///
+/// Every earlier stage left the recognized timer body returning [`SplitDispatchDisposition`],
+/// whose `NotHandled` is an entry into the terminal broad dispatcher. Each stage then argued that
+/// its particular `NotHandled` was rare, or unreachable, or someone else's. This type removes the
+/// argument: a recognized timer cannot ask for broad handling because it has no way to say so.
+/// The family filter that rejects a NON-timer event still exists, and still answers `NotHandled` —
+/// but it runs in [`try_split_timer_dispatch`], outside this body, where "this is not a timer" is
+/// the only thing it can mean.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimerSettlement {
+    /// The preempting transaction COMMITTED: the interrupted task is `Runnable`, re-enqueued at
+    /// its priority tail exactly once, `current` is clear, and the one-shot Yield deferral carries
+    /// its identity. The bridge's existing queue-advance drain owes the switch.
+    QueueAdvanceCommitted,
+    /// An IDLE-BOUNDARY tick. Nothing was preempted and nothing was published, because there was
+    /// no current task; what is owed is one authoritative queue advance with no outgoing side.
+    IdleQueueAdvance,
+    /// The current task CONTINUES on this CPU. The tick, the claim and the re-arm have happened;
+    /// no scheduler state changed, or what changed was rolled back exactly.
+    ///
+    /// This is the settlement for every refusal, and it is a real outcome rather than a
+    /// disguised failure: a quantum boundary that cannot switch simply extends the quantum. The
+    /// interrupted task is still `Running`, still `current`, and still owns the frame this trap
+    /// will return through — which is precisely why returning to it is safe.
+    ContinueCurrent,
+    /// **THE ONE SETTLEMENT THAT HANDS A RECOGNIZED TIMER AWAY, and the honest residual of
+    /// U9-TIMER-FINAL.**
+    ///
+    /// It exists because on x86_64 the `yarm.d6_switch_proof` / `yarm.d6_switch_a` knobs make an
+    /// ACTIVE diagnostic the owner of the switch path, and in that mode the only code that can
+    /// complete a preempting timer is the broad in-lock dispatch inside `yield_current`. §2
+    /// forbids disabling a supported knob to manufacture closure, and forbids a dropped
+    /// preemption — and settling this population as [`Self::ContinueCurrent`] would be exactly a
+    /// dropped preemption, because under those knobs EVERY tick declines identically, so the
+    /// switch would never happen at all rather than happening one tick later.
+    ///
+    /// Three properties make it a residual rather than a hole:
+    ///
+    /// * **It is decided BEFORE any work.** `settle_recognized_timer` returns it as its first
+    ///   act, so no tick, acknowledgement or re-arm has been taken and the broad arm performs all
+    ///   three exactly once — the same sequence it performed before this package.
+    /// * **It is unreachable in production.** Both predicates are default-off boot knobs, and the
+    ///   gate is additionally `cfg(target_arch = "x86_64")`. With no knob armed,
+    ///   `d6_genuine_enabled()` is true and this settlement cannot be produced.
+    /// * **Its removal has a named prerequisite**, which is D6's and not the timer's: the
+    ///   `DispatchSwitchPlan` stash is produced from inside the broad acquisition, so a split
+    ///   route cannot publish one without becoming a SECOND switch owner in the one mode whose
+    ///   entire contract is that there is exactly one. Re-homing that production onto the split
+    ///   seams is what would retire this variant.
+    DiagnosticSwitchOwner,
+}
 
-    if !is_timer {
-        return D::NotHandled;
+#[cfg(not(feature = "hosted-dev"))]
+impl TimerSettlement {
+    /// How the bridge sees it. Total, and deliberately written as a `match` over a closed enum so
+    /// a new settlement cannot be added without choosing a disposition for it.
+    fn disposition(self) -> SplitDispatchDisposition {
+        match self {
+            Self::QueueAdvanceCommitted => SplitDispatchDisposition::QueueAdvanceCommitted,
+            Self::IdleQueueAdvance => SplitDispatchDisposition::TimerIdleQueueAdvance,
+            // The tick and the re-arm are done and no scheduler state changed, so the broad
+            // dispatcher must be skipped — entering it would tick a SECOND time — while the
+            // architecture tail still runs the production timeout pipeline.
+            Self::ContinueCurrent => SplitDispatchDisposition::PostWorkCommitted {
+                finalize_syscall: false,
+            },
+            // The ONE broad hand-off, and it is taken before any work — see the variant's own
+            // documentation for why it is a named residual rather than an escape.
+            Self::DiagnosticSwitchOwner => SplitDispatchDisposition::NotHandled,
+        }
     }
-    // U9-TIMER4 §2 — the PROOF-MODE GATE IS GONE, and it is gone because the dependency behind it
-    // is gone rather than because the predicate was narrowed.
+}
+
+/// Does an ACTIVE diagnostic own this architecture's switch path?
+///
+/// The exact complement of `d6_genuine_enabled()`, which is what
+/// [`crate::kernel::syscall::yield_txn::yield_deferral_arch_gate`] tests on x86_64 — so asking it
+/// here answers "would the transaction decline with `ArchGateOff`, for the D6 reason?" WITHOUT
+/// running the transaction, which is what lets the hand-off be taken before the tick.
+///
+/// It is deliberately NOT the whole of `ArchGateOff`. The other spelling of that decline is
+/// `not_bsp` on AArch64 and RISC-V, which no timer reaches (no AP arms a timer on any port) and
+/// which would in any case be wrong to hand to the broad arm: a non-bootstrap CPU has no
+/// diagnostic owner waiting for it.
+#[cfg(not(feature = "hosted-dev"))]
+fn diagnostic_owns_switch_path() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::kernel::boot::d6_controlled_switch_proof_enabled()
+            || crate::kernel::boot::d6_switch_a_enabled()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// U9-TIMER-FINAL §2 — THE RECOGNIZED TIMER BODY. One tick, one claim, one re-arm, and exactly
+/// one of three settlements — plus, before any of that, one hand-off that exists only while a
+/// default-off diagnostic owns the switch path.
+///
+/// # The tick is taken FIRST, and that is a correction
+///
+/// Every stage up to U9-TIMER5 ran the yield transaction BEFORE the tick, so that a refusal could
+/// hand an untouched CPU to the broad arm. That ordering was load-bearing only while a refusal had
+/// somewhere to go. It does not any more, and keeping it cost two things:
+///
+/// * a SECOND read of the quantum. The route asked `timer_would_preempt_split_read` and the tick
+///   seam asked `would_preempt_next()` again, in a separate rank-1 acquisition. `Timer`'s own
+///   contract says the lookahead and the tick "must happen under one acquisition, or the answer is
+///   stale", and between the route's two acquisitions another dispatching CPU can call
+///   `reset_quantum` — which is reachable on x86_64 under `yarm.ap_user_dispatch=1`. The route
+///   carried a `reason=would_preempt` fail-safe for exactly that disagreement, and answered it
+///   with `NotHandled`.
+/// * an ordering obligation that no longer buys anything: a decline after the tick was said to
+///   force a choice "between double-ticking in the broad arm and silently dropping a quantum's
+///   preemption". With no broad arm in the picture, neither horn exists.
+///
+/// So the tick is now the ONE authority on whether this interrupt preempts. `scheduler_tick_split
+/// _mut` ticks and reports, in a single acquisition, and the body branches on its report. The
+/// lookahead is gone, and with it the discrepancy it existed to detect: there is nothing left for
+/// two reads to disagree about.
+///
+/// # Every refusal settles here
+///
+/// `run_yield_transaction` is the one scheduling policy, and this body drives it through the same
+/// `SharedYieldOwners` the split NR 0 does. What changed is where its refusals go. Each is settled
+/// as `ContinueCurrent`, and each is settleable that way because of a property the transaction
+/// itself guarantees — every decline is either pre-mutation or exactly reversed:
+///
+/// | decline | post-state | why continuing is correct |
+/// |---|---|---|
+/// | `ArchGateOff` (`not_bsp`) | nothing written | a non-bootstrap CPU, which arms no timer on any port — unreachable, and listed for totality |
+/// | `DeferralHeld` | nothing written | some route already owns this CPU's deferral; its drain will run |
+/// | `RouteNotAdmitted` | nothing written | no drainer, or a CPU with no cells |
+/// | `NotRunning` | reservation released, no field written | `current` names a task that is not `Running`; the trap returns through that task's own frame, exactly as if the timer had done nothing |
+/// | `ReenqueueRefused` | `current` restored by the primitive, rank-2 transition rolled back through its named inverse | the caller is `Running` and `current` again |
+///
+/// `NoCurrent` is not in that table because it is not a refusal: it means the CPU is at its
+/// idle boundary, and it has its own settlement.
+///
+/// What `ContinueCurrent` explicitly is NOT: it is not a fabricated success (the switch did not
+/// happen and nothing claims it did), it is not a panic (contention is normal), and it is not a
+/// syscall error — a timer has no caller to answer, and handing one an error code would describe
+/// an unfinished SCHEDULING transition as a failed SYSCALL. The preemption is deferred to the
+/// next tick, which is the same thing the quantum does for a task that yields early.
+///
+/// # `ArchGateOff` is an ACTIVE gate, and is kept
+///
+/// On x86_64 the gate is `!d6_genuine_enabled()`, true while `yarm.d6_switch_proof` or
+/// `yarm.d6_switch_a` is armed. It is not a stale restriction: under those two knobs the Yield
+/// DRAIN in `arch/trap_entry.rs` is disabled by the same predicate, because the switch path is
+/// owned by the `DispatchSwitchPlan` stash instead. Publishing a deferral there would strand the
+/// caller behind a drain that cannot run, and draining it here would make this route a SECOND
+/// switch owner in a mode whose whole purpose is that there is exactly one.
+///
+/// So the gate stays — and, MEASURED rather than assumed, it does not settle as `ContinueCurrent`
+/// either. Under `D6_SWITCH_A=1 yarm.sched_quantum_ticks=1`, every one of 74 preempting ticks
+/// declines for this same reason, so "the next tick will preempt" is false: continuing locally
+/// would drop the preemption permanently rather than defer it, and the boot stops making progress
+/// (base reaches `KSPAWN_ENTER`, a `ContinueCurrent` head does not). That is what §2 forbids when
+/// it says normal contention must not become a dropped preemption, and it is why this one
+/// population is handed to the diagnostic's own owner through
+/// [`TimerSettlement::DiagnosticSwitchOwner`], before any work is taken.
+///
+/// On AArch64 and RISC-V the gate is `!is_bootstrap_cpu(cpu)`, and it is UNREACHABLE for a timer:
+/// no AP arms a timer on either port. `start_bsp_periodic_timer` programs only the bootstrap CPU,
+/// `yarm_aarch64_secondary_cpu_boot` records that "APs do NOT arm a timer" because
+/// `SchedulerState.timer` is one shared counter, and RISC-V parks its secondary harts outright.
+/// Measured rather than inferred: in the x86_64 `-smp 2` AP profile every `TIMER_SPLIT_*` marker
+/// carries `cpu=0`.
+///
+/// # What is still handed away, and where
+///
+/// Exactly two things, and neither is a recognized production timer:
+///
+/// 1. `!is_timer`, in `try_split_timer_into_frame`. That is the family filter — an event that is
+///    not a timer at all — and it is not a timer escape.
+/// 2. [`TimerSettlement::DiagnosticSwitchOwner`], from step (0) below, reachable only on x86_64
+///    with `yarm.d6_switch_proof=1` or `yarm.d6_switch_a=1`. Both default off, so with no knob
+///    armed this body has no path to `NotHandled` at all.
+///
+/// **Acceptance, stated exactly:** no recognized PRODUCTION `TimerInterrupt` can reach the
+/// terminal broad acquisition. The residual is a default-off diagnostic, and its prerequisite for
+/// removal is D6's own: re-home `DispatchSwitchPlan` production onto the split seams.
+#[cfg(not(feature = "hosted-dev"))]
+fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement {
+    // ── (0) THE DIAGNOSTIC SWITCH OWNER — decided FIRST, and that position is the contract ───
     //
-    // U9-TM introduced it as a five-term disjunction, because all five one-shot proof bodies had
-    // their only callsite in the broad `Trap::TimerInterrupt` arm; U9-TIMER3 relocated four of
-    // them and left one term. That last term was attributed to `spawn_lifecycle`'s cross-CPU
-    // shootdown, and the attribution was WRONG — the hang survives the switch to
-    // `destroy_unresident_address_space_locked`, which posts no shootdown and takes no retired-ASID
-    // slot at all.
+    // Under `yarm.d6_switch_proof` / `yarm.d6_switch_a` the switch path belongs to the
+    // `DispatchSwitchPlan` stash, produced from inside the broad acquisition. A preempting tick
+    // in that mode can only be completed there, so this body hands the whole interrupt over
+    // untouched.
     //
-    // The real prerequisite, captured by diffing a failing boot against a passing one: the boot
-    // ownership point sits between `dispatch_ready_task()` and the architectural entry, with the
-    // BSP timer already armed, and a trap taken in that window writes the EL1 boot frame into the
-    // selected task's TCB. Its saved stack pointer becomes 0, and the entry gate then silently
-    // declines to return to user mode. The four short proofs escaped it only by finishing inside a
-    // timer interval. `run_scheduler_loop` now holds that whole region under the tree's existing
-    // `irq_save`/`irq_restore` owner, so the window is closed for every body in it.
+    // UNTOUCHED is the point. If this test sat after the prologue, the broad arm would tick,
+    // acknowledge and re-arm a SECOND time — §2's exactly-once obligation, broken by the very
+    // hand-off meant to preserve the diagnostic. Deciding it here means the broad arm services
+    // the interrupt exactly as it did before this package, byte for byte.
     //
-    // (1) THE PREEMPTING TICK — U9-TIMER1.
+    // It also cannot be replaced by settling `ArchGateOff` locally as `ContinueCurrent`: under
+    // these knobs EVERY tick declines for the same reason, so "the next tick will preempt" is
+    // false and the preemption would be dropped forever rather than deferred.
+    if diagnostic_owns_switch_path() {
+        crate::yarm_log!(
+            "TIMER_SPLIT_DIAGNOSTIC_SWITCH_OWNER cpu={} reason=d6_genuine_off ticked=0 rearm=0 settlement=broad_owner",
+            cpu.0
+        );
+        return TimerSettlement::DiagnosticSwitchOwner;
+    }
+
+    // ── (1) THE TICK, and it is the authority ────────────────────────────────────────────────
     //
-    // This branch used to be the refusal: `scheduler_tick_if_no_switch_split_mut` returned `None`
-    // having incremented nothing, the route answered `NotHandled`, and the ordinary preempting
-    // timer was serviced by the terminal broad dispatcher. That was the whole remaining
-    // TimerInterrupt population, and it is what this stage removes.
+    // One acquisition, which both advances the quantum and reports whether this interrupt
+    // preempts. Nothing else in this body reads the quantum, so nothing can disagree with it.
+    let ticked = shared.scheduler_tick_split_mut(cpu);
+    let (tick, preempting) = match ticked {
+        crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => (tick, true),
+        crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => (tick, false),
+    };
+
+    // ── (2) CLAIM/ACK and (3) RE-ARM — the same free functions the `Hal` methods delegate to,
+    // and the same deadline constant the broad arm passes. Taken here, once, for every settlement
+    // below: they are what this INTERRUPT earns, and they do not depend on what the scheduler then
+    // decides. On RISC-V the single SBI `set_timer` is itself the completion.
+    crate::arch::hal_adapters::acknowledge_interrupt(cpu, 0);
+    crate::arch::hal_adapters::program_timer_deadline(
+        cpu,
+        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    );
+
+    // ── (4) A NON-PREEMPTING TICK ────────────────────────────────────────────────────────────
+    if !preempting {
+        // U9-TIMER5 §2 — a parked CPU is examined on every tick, not once per quantum. The
+        // quantum decides whether to cut a RUNNING task short; with `current` empty it has no
+        // subject, which is why the broad arm's own `yield_current` takes `NoCurrent` and
+        // dispatches for this state. Scoped to the two ports whose bridge authenticates the idle
+        // boundary — see the U9-TIMER5 record for the RISC-V derivation.
+        #[cfg(not(target_arch = "riscv64"))]
+        if !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0) {
+            crate::yarm_log!(
+                "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=0 rearm=1 broad_lock=0",
+                cpu.0,
+                tick,
+                shared.runnable_count_on_cpu_split_read(cpu)
+            );
+            return TimerSettlement::IdleQueueAdvance;
+        }
+        crate::yarm_log!(
+            "TIMER_SPLIT_TICK_OK cpu={} tick={} preempt=0 rearm=1",
+            cpu.0,
+            tick
+        );
+        return TimerSettlement::ContinueCurrent;
+    }
+
+    // ── (5) A PREEMPTING TICK ────────────────────────────────────────────────────────────────
     //
-    // The order is the point. The lookahead is asked FIRST, so the transaction below runs before
-    // anything has ticked — and every step of `run_yield_transaction` refuses before it mutates.
-    // A decline therefore falls back to the unchanged broad arm having changed exactly nothing,
-    // which is the same property the non-preempting refusal has always had. Ticking first and
-    // declining afterwards would force a choice between double-ticking in the broad arm and
-    // silently dropping a quantum's preemption; neither is acceptable, so it is not the order.
-    //
-    // A preempting timer IS a yield, with a different provenance. It re-enqueues the running task
+    // A preempting timer IS a yield with a different provenance: it re-enqueues the running task
     // at its priority tail, clears `current`, and defers the selection to the post-lock drain —
-    // exactly what NR 0 publishes. So it drives the SAME transaction, through the SAME owners
-    // (`SharedYieldOwners`), and no second scheduling policy is introduced: the arch gate, the
-    // topology admission, the deferral reservation, the exact `Running -> Runnable` transition and
-    // its inverse are all the ones NR 0 already uses.
+    // exactly what NR 0 publishes. So it drives the SAME transaction through the SAME owners, and
+    // no second scheduling policy is introduced: the arch gate, the topology admission, the
+    // deferral reservation, the exact `Running -> Runnable` transition and its inverse are all the
+    // ones NR 0 already uses.
     //
     // What it must NOT do, and does not: encode a syscall return. NR 0 finishes with
     // `frame.set_ok(0, 0, 0)` because a yield is a syscall whose caller observes a result. An
@@ -3207,226 +3424,76 @@ fn try_split_timer_into_frame(
     // shared bridge has ALREADY captured that frame into the outgoing TCB before this route runs
     // (`capture_outgoing_user_context_split`, keyed on `current_tid_authoritative`). Writing a
     // result here would corrupt the resumed register file.
-    if shared.timer_would_preempt_split_read(cpu) {
-        let mut owners = crate::kernel::syscall::yield_txn::SharedYieldOwners { shared };
-        match crate::kernel::syscall::yield_txn::run_yield_transaction(&mut owners, cpu) {
-            Ok(preempted) => {
-                // The publish-side vocabulary NR 0 emits, so the post-lock drain's own markers
-                // read identically whichever route published the deferral.
-                crate::kernel::syscall::yield_txn::log_yield_deferred(cpu, preempted.outgoing);
-                // The broad timer arm reached `yield_current`, whose first act is this increment.
-                // The converted route owes it for the same reason NR 0's split route does: the
-                // broad path no longer runs, so the count would otherwise be lost.
-                shared.count_yield_split_mut();
-                // Exactly ONE tick, taken only now that the transaction has committed. The
-                // lookahead above and this tick cannot disagree: nothing else ticks this CPU's
-                // timer and interrupts are masked for the whole trap.
-                let ticked = shared.scheduler_tick_split_mut(cpu);
-                let tick = match ticked {
-                    crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => tick,
-                    // Unreachable: the lookahead said this tick preempts.
-                    crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => tick,
-                };
-                // Claim/ack and re-arm — the SAME free functions the `Hal` methods delegate to,
-                // and the same deadline constant the broad arm passes. On RISC-V the single SBI
-                // `set_timer` is itself the completion.
-                crate::arch::hal_adapters::acknowledge_interrupt(cpu, 0);
-                crate::arch::hal_adapters::program_timer_deadline(
-                    cpu,
-                    crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
-                );
-                crate::yarm_log!(
-                    "TIMER_SPLIT_PREEMPT_COMMITTED cpu={} tick={} outgoing={} preempt=1 rearm=1 broad_lock=0",
-                    cpu.0,
-                    tick,
-                    preempted.outgoing
-                );
-                return D::QueueAdvanceCommitted;
-            }
-            // A PREEMPTING TICK WITH NOTHING TO PREEMPT — the dominant live population.
-            //
-            // `NoCurrent` is unreachable for a userspace NR 0 (a syscall always has a caller), so
-            // it was documented as an unreachable decline. A TIMER has a different provenance: it
-            // fires on a CPU that has already parked in its idle halt, where `current` is empty by
-            // construction. Measured on the x86_64 core profile at `yarm.sched_quantum_ticks=1`:
-            // 73 of 74 preempting ticks land here, because everything blocks shortly after boot.
-            //
-            // Declining them would leave the ordinary preempting-timer population reaching broad
-            // dispatch on every idle tick, so the decline is not the answer. What the answer must
-            // preserve is what the broad arm ACTUALLY does for this state, and that turns on the
-            // run queue rather than on `current`. In `yield_current`, `NoCurrent` is silent, the
-            // `Running -> Runnable` step is skipped because `outgoing_tid` is `None`, and control
-            // reaches `on_preempt_current_cpu_selection()`:
-            //
-            // * runnable == 0 -> the selection answers `None`, the `else` arm is guarded by
-            //   `if let Some(tid) = outgoing_tid` and so does nothing at all. The whole broad
-            //   service of this tick is the tick itself. That is settled here instead, with the
-            //   same one tick, the same claim and the same re-arm the non-preempting route uses.
-            // * runnable > 0 -> the selection DEQUEUES and the broad arm dispatches onto the idle
-            //   CPU. U9-TIMER5 gives every port a landing for that advance, so the settlement is
-            //   `TimerIdleQueueAdvance` here and the bridge performs the one authoritative
-            //   selection — see the route doc for why the port is no longer the question.
-            Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {
-                // U9-TIMER5 §2 — this branch now has NO refusal of its own, and the read below is
-                // the only thing it still asks. U9-TIMER2's `no_user_return_path` refusal stood
-                // here and is retired with the constant that drove it: the landing it reported
-                // absent exists on all three ports, and what remains port-specific — whether THIS
-                // trap interrupted the authenticated idle boundary — is not knowable from here.
-                let observed_runnable = shared.runnable_count_on_cpu_split_read(cpu);
-                // Past this point the tick is taken, and it is taken for BOTH idle outcomes.
-                //
-                // It used to sit after the run-queue test, which made the count a reservation:
-                // `runnable > 0` decided to tick nothing and hand the trap away, and the broad arm
-                // re-derived the whole decision against a queue that could have changed meanwhile.
-                // Now one tick happens for this interrupt either way — which is what the interrupt
-                // itself earns, independent of what the run queue holds — and the count only
-                // chooses which settlement is OWED. If the queue empties before the authoritative
-                // selection runs, that selection says so and the CPU idles; the observation is
-                // never treated as a promise that a candidate will still be there.
-                //
-                // Nothing has been mutated at this point beyond the tick: `NoCurrent` is the yield
-                // transaction's FIRST step, so it refused before touching any scheduler state.
-                let ticked = shared.scheduler_tick_split_mut(cpu);
-                let tick = match ticked {
-                    crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => tick,
-                    // Unreachable: the lookahead said this tick preempts.
-                    crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => tick,
-                };
-                crate::arch::hal_adapters::acknowledge_interrupt(cpu, 0);
-                crate::arch::hal_adapters::program_timer_deadline(
-                    cpu,
-                    crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
-                );
-                // The broad arm reached `yield_current` for this state, and its first act is this
-                // increment. The converted route owes it for the same reason the committed-preempt
-                // arm above does: the broad path no longer runs.
-                shared.count_yield_split_mut();
-                // U9-TIMER5 §2 — ONE settlement for BOTH idle outcomes, and the observation is
-                // reported rather than obeyed.
-                //
-                // U9-TIMER2 let the count pick the disposition: `runnable > 0` answered
-                // `TimerIdleQueueAdvance` and an empty queue answered `PostWorkCommitted`. That is
-                // the last place the count was still a reservation, and it was measurably wrong.
-                //
-                // The window is real, not theoretical. The dominant way a task becomes runnable
-                // while this CPU is parked is a DEADLINE expiring, and the off-lock timeout
-                // pipeline that expires it (`run_due_ipc_timeout_work`) runs LATER IN THIS SAME
-                // TRAP — after the broad phase, and after this probe. So on the tick that expires
-                // a deadline the probe necessarily reads zero, and answering `PostWorkCommitted`
-                // sent that tick to a tail with no drain. Measured on the §3 witness before this
-                // change: init blocked with a deadline, the CPU parked, the tick that fired the
-                // timeout answered `TIMER_SPLIT_PREEMPT_IDLE`, and the x86_64 tail's
-                // `revalidate_idle_owner_after_drains` then marked init `Running` and current and
-                // returned to the `hlt` anyway — the exact stranding the idle-boundary landing
-                // exists to end, reached by a different route.
-                //
-                // So the settlement is the same either way and the drain re-asks authoritatively
-                // once every wake in this trap has been published. An empty queue is still an
-                // empty queue there — `DispatchAcquire::Idle`, settled as kernel idle, which is
-                // what the tail did before — and nothing is claimed on the strength of a count
-                // that was read before the pipeline ran.
-                crate::yarm_log!(
-                    "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=1 rearm=1 broad_lock=0",
-                    cpu.0,
-                    tick,
-                    observed_runnable
-                );
-                return D::TimerIdleQueueAdvance;
-            }
-            Err(decline) => {
-                // Pre-mutation, and nothing has ticked. The broad arm runs next and performs the
-                // identical decision through `yield_current` — including its own in-lock dispatch
-                // fallback — so a declined preemption is byte-for-byte what it was before this
-                // conversion. Named distinctly from the yield route's refusal so the two events
-                // are separable in a log.
-                crate::yarm_log!(
-                    "TIMER_SPLIT_PREEMPT_REFUSED cpu={} reason={}",
-                    cpu.0,
-                    crate::kernel::syscall::yield_txn::legacy_reason(decline)
-                );
-                return D::NotHandled;
-            }
+    let mut owners = crate::kernel::syscall::yield_txn::SharedYieldOwners { shared };
+    match crate::kernel::syscall::yield_txn::run_yield_transaction(&mut owners, cpu) {
+        Ok(preempted) => {
+            // The publish-side vocabulary NR 0 emits, so the post-lock drain's own markers read
+            // identically whichever route published the deferral.
+            crate::kernel::syscall::yield_txn::log_yield_deferred(cpu, preempted.outgoing);
+            // The broad timer arm reached `yield_current`, whose first act is this increment. The
+            // converted route owes it for the same reason NR 0's split route does: the broad path
+            // no longer runs, so the count would otherwise be lost.
+            shared.count_yield_split_mut();
+            crate::yarm_log!(
+                "TIMER_SPLIT_PREEMPT_COMMITTED cpu={} tick={} outgoing={} preempt=1 rearm=1 broad_lock=0",
+                cpu.0,
+                tick,
+                preempted.outgoing
+            );
+            TimerSettlement::QueueAdvanceCommitted
+        }
+        // A PREEMPTING TICK WITH NOTHING TO PREEMPT — the dominant live population.
+        //
+        // `NoCurrent` is unreachable for a userspace NR 0 (a syscall always has a caller), so it
+        // was documented as an unreachable decline. A TIMER has a different provenance: it fires
+        // on a CPU that has already parked in its idle halt, where `current` is empty by
+        // construction. The settlement is the idle-boundary advance, and the run-queue count it
+        // reports is an OBSERVATION — the bridge's drain re-asks authoritatively, after the
+        // off-lock timeout pipeline has published this trap's wakes.
+        Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {
+            crate::yarm_log!(
+                "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=1 rearm=1 broad_lock=0",
+                cpu.0,
+                tick,
+                shared.runnable_count_on_cpu_split_read(cpu)
+            );
+            // The broad arm reached `yield_current` for this state, and its first act is this
+            // increment. The converted route owes it for the same reason the committed-preempt arm
+            // above does: the broad path no longer runs.
+            shared.count_yield_split_mut();
+            TimerSettlement::IdleQueueAdvance
+        }
+        // EVERY OTHER DECLINE — settled here, on this CPU, with the interrupted task continuing.
+        //
+        // See the table in this function's documentation for the exact post-state each one leaves
+        // and why continuing is the correct answer to it. The reason is named so the population
+        // stays countable rather than inferred, and `TIMER_SPLIT_PREEMPT_DEFERRED` is a DIFFERENT
+        // marker from the retired `TIMER_SPLIT_PREEMPT_REFUSED`: a refusal used to mean "the broad
+        // arm will do this instead", and nothing will now.
+        Err(decline) => {
+            crate::yarm_log!(
+                "TIMER_SPLIT_PREEMPT_DEFERRED cpu={} tick={} reason={} preempt=1 rearm=1 broad_lock=0 settlement=continue_current",
+                cpu.0,
+                tick,
+                crate::kernel::syscall::yield_txn::legacy_reason(decline)
+            );
+            TimerSettlement::ContinueCurrent
         }
     }
+}
 
-    // (2) The NON-preempting tick, unchanged. One rank-1 acquisition decides and ticks.
-    let Some(outcome) = shared.scheduler_tick_if_no_switch_split_mut(cpu) else {
-        // Unreachable now: the lookahead above already routed every preempting tick. Kept as the
-        // fail-safe it always was — if the two ever disagreed, this refuses having ticked nothing.
-        crate::yarm_log!("TIMER_SPLIT_REFUSED cpu={} reason=would_preempt", cpu.0);
-        return D::NotHandled;
-    };
-    // Past this point the tick HAS happened; there is no route back to the broad arm, which
-    // would tick a second time.
-    let tick = match outcome {
-        crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => tick,
-        // Unreachable: the seam returns `None` rather than a preempting outcome.
-        crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => tick,
-    };
-    // (3) Claim/ack — the SAME free function `Hal::acknowledge_interrupt` delegates to.
-    crate::arch::hal_adapters::acknowledge_interrupt(cpu, 0);
-    // (4) Re-arm — the SAME free function `Hal::program_timer_deadline` delegates to, with the
-    // same deadline constant the broad arm passes. On RISC-V this single SBI `set_timer` both
-    // clears the pending condition and programs the next deadline: it IS the completion, and
-    // there is no separate end-of-interrupt.
-    crate::arch::hal_adapters::program_timer_deadline(
-        cpu,
-        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
-    );
-    crate::yarm_log!(
-        "TIMER_SPLIT_TICK_OK cpu={} tick={} preempt=0 rearm=1",
-        cpu.0,
-        tick
-    );
-    // U9-TIMER5 §2 — A NON-PREEMPTING TICK ON A PARKED CPU STILL OWES THE ADVANCE.
-    //
-    // The quantum exists to decide whether to cut a RUNNING task short. With `current` empty there
-    // is no such task, so the question the lookahead answered has no subject here and its answer
-    // carries no instruction. That is not an interpretation: the broad arm's own `yield_current`,
-    // reached for this state, takes the `NoCurrent` path — it skips the `Running -> Runnable`
-    // step, falls through to `on_preempt_current_cpu_selection()` and DISPATCHES. Applying the
-    // same policy where the quantum is vacuous is not a second policy.
-    //
-    // Without this the boundary is only examined once per quantum, and on the shipped quantum
-    // that is the difference between a parked CPU resuming its work and not resuming it at all.
-    // Measured on the §3 witness: with the AArch64 profile's shipped quantum an entire boot took
-    // 74 ticks and NOT ONE of them preempted, so a task whose deadline expired while the CPU was
-    // parked was never dispatched — init blocked on its first round and the boot went nowhere.
-    // The x86_64 tail hid the same gap behind `revalidate_idle_owner_after_drains`, which marked
-    // the woken task `Running` and current and then returned to the `hlt` anyway.
-    //
-    // `current_tid_split_read` is the NON-binding read, deliberately: this is a question about
-    // whether anything is running here, not a claim on the CPU. tid 0 is the bootstrap identity
-    // and is treated as "nothing running" for the same reason every other route does.
-    //
-    // SCOPED TO THE TWO CHANGED PORTS, and the reason is the authentication rather than the
-    // architecture. `current == None` on a NON-preempting tick is a much wider condition than on a
-    // preempting one: it is also true throughout early boot, before anything has been dispatched.
-    // The shared bridge can admit that safely because it asks `idle_boundary` whether THIS trap
-    // interrupted the parked halt loop, and settles `kernel_not_parked` when it did not. The
-    // RISC-V bridge performs its advance unconditionally — it needs no authentication for the
-    // preempting population, because its S-mode timer entry CONSTRUCTS a user return instead of
-    // converting a kernel frame — so widening the population there would let a boot-time tick
-    // dispatch through a drain nothing had authorized. Measured: it did, and the boot hung at
-    // `tick=2` in `RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io`.
-    //
-    // So RISC-V keeps exactly U9-TIMER2's behaviour, which is what "RISC-V is not a changed port"
-    // has to mean if it means anything. Giving it the same authenticated boundary is the obvious
-    // next step and is deliberately not taken here.
-    #[cfg(not(target_arch = "riscv64"))]
-    if !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0) {
-        crate::yarm_log!(
-            "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=0 rearm=1 broad_lock=0",
-            cpu.0,
-            tick,
-            shared.runnable_count_on_cpu_split_read(cpu)
-        );
-        return D::TimerIdleQueueAdvance;
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_timer_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    is_timer: bool,
+) -> SplitDispatchDisposition {
+    // THE FAMILY FILTER, and the only `NotHandled` a timer trap can produce. It says "this event
+    // is not a TimerInterrupt", never "this timer is someone else's problem".
+    if !is_timer {
+        return SplitDispatchDisposition::NotHandled;
     }
-    // (5) The architecture tail still owes the production timeout pipeline.
-    D::PostWorkCommitted {
-        finalize_syscall: false,
-    }
+    settle_recognized_timer(shared, cpu).disposition()
 }
 
 #[cfg(feature = "hosted-dev")]

@@ -19332,3 +19332,206 @@ AP-dispatch work and needs its own live producer before it can be claimed.
   PRE-EXISTING, and established by controlled comparison rather than asserted: a worktree at the
   delivered base `fd23312d` fails it identically. Named here because it is the same RISC-V
   deadline-wake shape the refused witness arm runs into.
+
+## U9-TIMER-FINAL — the recognized timer body can no longer request broad handling in production
+
+Base `16298722`. `main` stays `8f30f3b9`. Every WIP ref preserved.
+
+This package does **not** retire a live population — and saying so plainly is the first honest
+thing in the record, because §3 forbids counting an already-converted population as a new
+reduction. The production timer populations were converted by U9-TIMER1 (the preempting tick),
+U9-TIMER2 (the idle-boundary tick) and U9-TIMER5 (the idle-to-user return). Measured at base and
+at head, the default x86_64, AArch64 and RISC-V profiles all report **zero** broad timer service
+already.
+
+What this package does is three things: correct a residual matrix that had been carried forward
+after the code beneath it changed; make the recognized body's return type structurally incapable
+of naming the broad dispatcher; and — after a measurement that contradicted the first draft — keep
+exactly one hand-off, gated on a default-off diagnostic, named as a residual with its prerequisite
+rather than quietly settled.
+
+### §1 — the correction: `multi_cpu` and `not_dispatch_cpu` were never reachable from a timer
+
+Earlier records (U9-YIELD2 §1, carried into the U9-TIMER5 record and into two guards) listed
+`RouteNotAdmitted::MultiDispatcher` as a live decline for NR 0 and, by inheritance, for the timer —
+witnessed as `YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu` under `yarm.ap_user_dispatch=1`. That
+statement was true when it was written and had been **superseded by the code beneath it**:
+
+* a timer reaches admission through exactly one adapter, `SharedYieldOwners::queue_advance_admission`;
+* U9-DISPATCH-CPU1 §3 migrated it to `TerminalRouteTopology::AuthorityBound`;
+* `SharedKernel::split_terminal_route_admission` **returns `Ok(())`** under that topology
+  immediately after the authority-bound prefix — before the dispatcher-count and bound-CPU checks
+  execute at all;
+* the broad adapter calls `terminal_route_admission_authority_bound` directly, which contains
+  neither check.
+
+So neither variant is producible by any caller of `run_yield_transaction`. They remain in
+`TerminalAdmissionRefusal` because `AmbientBound` families still reach them, and they remain in
+`legacy_reason`'s vocabulary — **an enum variant existing, and a reason string existing, is not
+evidence that a timer can produce it.** Corrected in `src/kernel/syscall/yield_txn.rs`'s module
+documentation (the retired witness line is kept there so the correction is auditable rather than
+silent), in `log_yield_declined`'s vocabulary note, and in the two guards that enforced the stale
+claim. `every_remaining_timer_decline_is_inventoried` now asserts the unreachability structurally:
+the transaction names exactly one topology, and both refusals sit after the authority-bound
+`return Ok(());`.
+
+The corrected matrix — every path a recognized `TimerInterrupt` can take, its producer, its
+preconditions and its settlement — is in that guard's documentation and in
+`settle_recognized_timer`'s own post-state table, and the two are cross-checked: a `YieldDecline`
+variant the route does not account for fails the guard.
+
+`!is_timer` is separated from the family escapes throughout: it is the family FILTER, in
+`try_split_timer_into_frame`, and it means "this event is not a timer", never "this timer is
+someone else's problem".
+
+### §2 — the body's shape, and the measurement that corrected its first draft
+
+`settle_recognized_timer` is now its own function returning `TimerSettlement`, mapped to a
+disposition by one total `match`. The ordering changed, and the change is the point:
+
+* **the tick is the sole authority.** `scheduler_tick_split_mut` ticks and reports in one
+  acquisition, and the body branches on its report. The separate lookahead
+  (`timer_would_preempt_split_read` + `scheduler_tick_if_no_switch_split_mut`) is gone, and with it
+  the `reason=would_preempt` fail-safe that existed only because two acquisitions could disagree —
+  `Timer`'s own contract says they can, and `reset_quantum` from another dispatching CPU is
+  reachable under `yarm.ap_user_dispatch=1`. There is nothing left for two reads to contradict.
+* **tick, acknowledge, re-arm happen once, ahead of every branch**, so every settlement inherits
+  all three and none can take a second.
+* the only mutating step after the prologue is `run_yield_transaction`, whose every decline is
+  either pre-mutation or exactly reversed — established from the transaction's own body, not
+  asserted.
+
+| decline | post-state | settlement |
+|---|---|---|
+| `NoCurrent` | nothing written | `IdleQueueAdvance` |
+| `ArchGateOff` (`not_bsp`) | nothing written | `ContinueCurrent` — unreachable: no AP arms a timer on any port |
+| `DeferralHeld` | nothing written | `ContinueCurrent`; the other route's drain still runs, because `PostWorkCommitted` falls through to the architecture tail |
+| `RouteNotAdmitted(NoTrapDrainer \| CpuOutOfRange)` | nothing written | `ContinueCurrent` |
+| `NotRunning` | reservation released, no field written | `ContinueCurrent` |
+| `ReenqueueRefused` | `current` restored, rank-2 write undone through its named inverse | `ContinueCurrent` |
+
+`ContinueCurrent` is not a fabricated success, not a panic, and not a syscall error: a timer has no
+caller to answer, and handing one an error code would describe an unfinished SCHEDULING transition
+as a failed SYSCALL.
+
+#### The draft that was wrong, and the measurement that showed it
+
+The first §2 draft had three settlements and no `NotHandled` at all: `ArchGateOff` settled locally
+as `ContinueCurrent` on the reasoning that a quantum boundary which cannot switch simply extends
+the quantum.
+
+**Measured, that is a dropped preemption.** Under `D6_SWITCH_A=1 yarm.sched_quantum_ticks=1`, all
+74 preempting ticks of the boot decline with `d6_genuine_off` — the same reason, every time — so
+"the next tick will preempt" is false. The boot stops making progress:
+
+| | base `16298722` | draft head (`ContinueCurrent`) | delivered head |
+|---|---|---|---|
+| `KSPAWN_ENTER` | 1 | **0** | 1 |
+| `YARM_SCHED_TICK` | 4 | **0** | 4 |
+| `YARM_TIMER_IRQ_DELIVERED` | 4 | **0** | 4 |
+| timer marker | 74 `TIMER_SPLIT_PREEMPT_REFUSED` | 74 `TIMER_SPLIT_PREEMPT_DEFERRED` | 74 `TIMER_SPLIT_DIAGNOSTIC_SWITCH_OWNER` |
+
+§2 forbids exactly this: an active diagnostic's obligations must still execute, supported knobs
+must not be disabled to manufacture closure, and normal contention must not become a dropped
+preemption.
+
+#### The delivered answer: one named residual, taken before any work
+
+`TimerSettlement::DiagnosticSwitchOwner` maps to `NotHandled` and is produced from step (0) of the
+body — its **first** act, before the tick, the acknowledgement or the re-arm. That position is the
+contract: handing over afterwards would make the broad arm tick, acknowledge and re-arm a second
+time, breaking the exactly-once obligation with the very hand-off meant to preserve the diagnostic.
+Taken at step (0), the broad arm services the interrupt exactly as it did before this package.
+
+Its gate, `diagnostic_owns_switch_path()`, is the exact complement of `d6_genuine_enabled()` on
+x86_64 and unconditionally `false` everywhere else. Both knobs default off — read from their own
+declarations by the guard, so a changed default fails there rather than silently widening the
+residual.
+
+**The prerequisite for removing it is D6's, not the timer's.** Under those knobs the switch path is
+owned by the `DispatchSwitchPlan` stash, which is produced from inside the broad acquisition. A
+split route cannot publish one without becoming a SECOND switch owner in the one mode whose entire
+contract is that there is exactly one. The exact reachable transition is: a preempting tick on the
+BSP with `d6_controlled_switch_proof_enabled() || d6_switch_a_enabled()`, whose switch must be
+completed by `yield_current`'s in-lock dispatch. The smallest necessary prerequisite is re-homing
+`DispatchSwitchPlan` production onto the split seams.
+
+Retired markers and seams: `TIMER_SPLIT_PREEMPT_REFUSED` (a refusal meant "the broad arm will do
+this instead", and for a production timer nothing will), `reason=would_preempt`. The two runtime
+seams `timer_would_preempt_split_read` and `scheduler_tick_if_no_switch_split_mut` are **kept**:
+the timer no longer calls either, but they remain the scheduler's own tested lookahead contract and
+deleting them is outside this package's scope.
+
+### §3 — evidence, reported separately: source closure, live traffic, census
+
+**Source closure.** A recognized `TimerInterrupt` has no path to `NotHandled` except the default-off
+diagnostic residual. Held by `the_only_broad_hand_off_is_the_default_off_diagnostic` (one producer,
+before the prologue, knob-gated, both knobs default-off), by the total mapping over a closed enum,
+and by `every_remaining_timer_decline_is_inventoried`.
+
+**Live traffic.** Three ports, head against base `16298722`, `-smp 1` unless stated:
+
+| profile | base | head |
+|---|---|---|
+| x86_64 core, default | 73 idle advances, 74 `TICK_OK`, **0** broad timer entries, pass | 73 idle advances, 1 `TICK_OK`, **0** broad, pass |
+| x86_64 core, `sched_quantum_ticks=1` | 73 idle + 1 `PREEMPT_COMMITTED`, **0** broad, pass | 72 idle + 1 `PREEMPT_COMMITTED`, **0** broad, pass |
+| x86_64 core, `D6_SWITCH_A=1` (default quantum) | 74 `TICK_OK`, fails (pre-existing) | identical |
+| x86_64 core, `D6_SWITCH_A=1 sched_quantum_ticks=1` | 74 refusals → broad arm | 74 hand-offs → broad arm, untouched; **every `[ok]`/`[error]` line identical to base**, and the only difference in the whole marker vocabulary is the renamed marker |
+| x86_64 AP saved-return, `-smp 2` | — | seal `result=ok`; 180 idle advances, **every `TIMER_SPLIT_*` marker `cpu=0`**; `X86_AP_LAPIC_TIMER_DEFERRED cpu=1 reason=no_ap_idt_interrupts_masked` |
+| AArch64 core | 59 idle + 75 `TICK_OK`, **0** broad, pass | 57 idle + 18 `TICK_OK`, **0** broad, pass |
+| RISC-V core | 157 idle + 28 `PREEMPT_COMMITTED` + 1676 `TICK_OK`, pass | 149 idle + 28 `PREEMPT_COMMITTED` + 1607 `TICK_OK`, pass — U9-TIMER2 behaviour preserved |
+
+The `TICK_OK` drop is a marker consolidation, not a behaviour change: a tick that commits an idle
+advance now emits only `TIMER_SPLIT_IDLE_ADVANCE_COMMITTED`, where before it emitted `TICK_OK` as
+well. Total ticks are unchanged (x86_64 74 = 73 + 1 on both sides; AArch64 75 on both sides).
+
+**AP timer preemption is genuinely unavailable, and is not claimed.** §3 asks for an actual timer
+interrupt while an AP user task executes. The existing AP profile puts a real userspace task on
+CPU 1 and proves its saved-frame resume there — and the same boot states in its own words that no
+AP timer exists: `X86_AP_LAPIC_TIMER_DEFERRED cpu=1 reason=no_ap_idt_interrupts_masked`, with every
+timer marker in the run carrying `cpu=0`. `start_bsp_periodic_timer` programs only the bootstrap
+CPU, `yarm_aarch64_secondary_cpu_boot` records that APs do not arm a timer, and RISC-V parks its
+secondary harts. **No minimal feature-gated producer was written**, because building one would
+manufacture a population production does not have; the guarded construction proofs below stand in
+its place, and no live AP-timer claim is made.
+
+**Refusal and race settlements, through production owners.** Every `YieldDecline` is constructed
+against the real `run_yield_transaction` and checked on post-state, not markers:
+`every_decline_is_pre_mutation` (all six, each `assert_eq!(h.snapshot(), before)`),
+`a_refused_reenqueue_rolls_the_transition_back_exactly` (the one post-write failure: status
+`Running`, `current` intact, deferral released, rollback strictly before release),
+`the_idle_twin_needs_no_rollback_and_says_so`, and
+`the_arch_gate_precedes_the_admission_and_the_reservation`.
+
+**U9-TIMER5's witnesses preserved.** `qemu-timer5-idle-return-witness-smoke.sh` re-run at head on
+both supported ports: x86_64 3/3 `result=ok` (`rounds=24 advances=12 parks=1`), AArch64 3/3
+`result=ok` (`rounds=24 advances=24 parks=1`). The repeated park → timer → resume → block → park
+cycle still reports `parks=1` per run, so the stack anchor still holds the boundary flat.
+
+**Census, reported separately and unchanged:** `with_cpu=2`, `with_broad=0`, raw `self.state.lock()`
+wrapper bodies `3`. `tests/broad_lock_census_guard.rs` 7/7.
+
+### §4 — qualification
+
+* Hosted, single-threaded: **5663 passed, 0 failed, 2 ignored**.
+* Three freestanding builds: x86_64 (`x86-none`), AArch64 (`aarch64-none`), RISC-V (`release`) —
+  all clean.
+* Integration gates: `broad_lock_census_guard` 7/7, `doc_fragmentation_guard` 7/7,
+  `extraction_bridge_tests` 2/2, `riscv64_timer_admission_scope` 11/11, `riscv64_timer_plic_scope`
+  18/18, `riscv64_live_irq_scope` 13/13, `riscv64_regular_smoke_scope` 12/12,
+  `riscv64_smp_topology_scope` 17/17, `riscv_core_smoke_capacity_rejection` 11/11,
+  `rpi5_stage1_scope` 19/19, `x86_64_ap_env_scope` 25/25, `x86_64_ap_percpu_scope` 16/16.
+* The carve-out, exactly: `server_dies_runner_scope` **8 pass / 2 fail**, the two being
+  `required_chain_is_scoped_to_the_witnessed_transaction` and
+  `required_marker_chain_is_ordered_and_complete`.
+* Artifacts rebuilt fresh for every measurement above; the tree was frozen for the final matrix.
+
+### What U9 still owes
+
+The TimerInterrupt boundary is closed for production. `PageFault`, `ExternalInterrupt` and
+`Unknown` remain, and after them the actual deletion of the two terminal broad acquisitions. **U9
+stays open until those acquisitions are removed**, not until the last family stops reaching them.
+
+Known-failing before and after, established by controlled comparison against a worktree at the
+delivered base rather than asserted: the `D6_SWITCH_PROOF=1` and `D6_SWITCH_A=1` core-smoke seals,
+and `qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh`.

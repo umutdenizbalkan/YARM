@@ -63,22 +63,37 @@
 //! matrix row it wrote nonetheless reads as a closed family, so it is corrected here.
 //!
 //! Of the six declines, four are unreachable for a **userspace** NR 0 by construction (`NoCurrent`,
-//! `DeferralHeld`, `RouteNotAdmitted::CpuOutOfRange` and `RouteNotAdmitted::NoTrapDrainer`), and
-//! two more are unreachable only on the single-dispatcher default. Two are genuinely reachable in
-//! supported configurations, and both are witnessed or constructible rather than inferred:
+//! `DeferralHeld`, `RouteNotAdmitted::CpuOutOfRange` and `RouteNotAdmitted::NoTrapDrainer`). One is
+//! genuinely reachable in a supported configuration:
 //!
-//! * **`RouteNotAdmitted::MultiDispatcher`** under the default-off `yarm.ap_user_dispatch` knob.
-//!   Live at base: `YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu` in
-//!   `scripts/qemu-x86_64-ap-saved-return-smoke.sh`, on the AP, for a real userspace `Yield`.
 //! * **`ArchGateOff`** on x86_64 under `yarm.d6_switch_proof` / `yarm.d6_switch_a`, where
 //!   `d6_genuine_enabled()` is false — and where the Yield DRAIN in `arch/trap_entry.rs` is gated
 //!   off by the same two predicates, so no deferral could be consumed even if one were published.
 //!
-//! Neither can be closed by this route. The reason is not Yield's: it is that
-//! `SharedKernel::queue_advance_select_step_split` — the ONE selection owner every queue-advancing
-//! drain uses — authenticates `sched.current_cpu == cpu` before dequeuing, and `current_cpu` is a
-//! single global field that any CPU's `with_cpu` rebinds. See `doc/KERNEL_UNLOCKING.md`, U9-YIELD2
-//! §2/§3, for the derivation and the exact missing contract.
+//! ## U9-TIMER-FINAL §1 CORRECTION — `MultiDispatcher` and `NotDispatchCpu` are no longer live
+//!
+//! The paragraph above used to name `RouteNotAdmitted::MultiDispatcher` as a second reachable
+//! decline, witnessed as `YIELD_SPLIT_REFUSED cpu=1 reason=multi_cpu` under the default-off
+//! `yarm.ap_user_dispatch` knob, and explained that the ambient `sched.current_cpu` binding was
+//! what made it necessary. **That statement was true when it was written and has since been
+//! superseded by this file's own code.**
+//!
+//! U9-DISPATCH-CPU1 §3 migrated NR 0's drain onto `queue_advance_acquire_incoming_split`, which
+//! authenticates the trap's own `DispatchAuthority` rather than the ambient binding — so
+//! [`SharedYieldOwners::queue_advance_admission`] now passes
+//! [`TerminalRouteTopology::AuthorityBound`] (see its body below), and
+//! `SharedKernel::split_terminal_route_admission` **returns `Ok(())` under that topology before
+//! the dispatcher-count and bound-CPU checks run at all**. The broad adapter reaches the same
+//! conclusion by calling `terminal_route_admission_authority_bound` directly, which contains
+//! neither check.
+//!
+//! Both variants therefore remain in `TerminalAdmissionRefusal` — `AmbientBound` families still
+//! produce them — while being **unreachable from this transaction**, and so from every route that
+//! drives it: userspace NR 0 and the recognized `TimerInterrupt` alike. An enum variant existing,
+//! and `legacy_reason` having a spelling for it, is not evidence that a caller can produce it: the
+//! reachability question is settled by which topology the caller passes, which is exactly one.
+//!
+//! The retired witness line is kept here so the correction is auditable rather than silent.
 
 use crate::kernel::scheduler::CpuId;
 
@@ -540,8 +555,15 @@ pub(crate) fn log_yield_deferred(cpu: CpuId, outgoing: u64) {
 
 /// Attest a decline, in this architecture's exact delivered vocabulary.
 ///
-/// The reason strings are the delivered ones — `no_trap_drainer`, `multi_cpu`, `not_bsp`,
-/// `already_deferred`, `reenqueue_failed` — mapped from [`YieldDecline`] so no attribution is lost.
+/// The reason strings are the delivered ones — `no_trap_drainer`, `cpu_out_of_range`, `not_bsp`,
+/// `d6_genuine_off`, `already_deferred`, `not_running`, `reenqueue_failed` — mapped from
+/// [`YieldDecline`] so no attribution is lost.
+///
+/// U9-TIMER-FINAL §1: `multi_cpu` and `not_dispatch_cpu` are spellings
+/// [`crate::kernel::boot::TerminalAdmissionRefusal`] still owns for `AmbientBound` families and
+/// that NO caller of this transaction can produce — see the module documentation. They are listed
+/// here as reachable in earlier records; that listing was wrong and is corrected rather than
+/// carried forward.
 pub(crate) fn log_yield_declined(_cpu: CpuId, outgoing: u64, decline: YieldDecline) {
     let reason = legacy_reason(decline);
     let _ = (outgoing, reason);
