@@ -2507,13 +2507,37 @@ pf1t_require_one "broad dispatcher skipped for the terminal fault" \
   'QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=terminal_fault_committed'
 pf1t_require_zero "the fault never reaches the broad dispatcher" \
   "PF1_BROAD_ARRIVAL cpu=0 tid=1 addr=0x0 access=${pf1t_access}"
-# ANOTHER TASK PROGRESSES: the drain selects tid 2, gives it its exact frame, and it runs.
-pf1t_require_one "queue selection happens once and chooses tid 2" \
-  'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=2'
-pf1t_require_one "replacement tid 2 is made current" \
-  'QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu=0 tid=2'
-pf1t_require_one "replacement tid 2 gets its exact frame" \
-  'QUEUE_ADVANCING_DISPATCH_FRAME_OK cpu=0 tid=2'
+# ANOTHER TASK PROGRESSES: the drain selects a replacement, gives it its exact frame, and it runs.
+#
+# U9-PAGEFAULT2 §4 — the replacement's TID is DERIVED from the log, not written into the
+# assertion. It used to be the literal `2`, and that was testing the boot clock rather than the
+# fault route: which task sits at the run-queue head when the fault lands depends on how many
+# timer ticks elapsed during boot, and ~300 bytes of extra init was enough to move it (measured
+# on RISC-V, where base takes 10 ticks before the fault and re-enqueues tid 2 ahead of tid 3,
+# while the larger init sees only 6 and tid 3 is still the head). Neither answer says anything
+# about the terminal route.
+#
+# What the route actually owes is asserted instead, and it is stricter than the literal was: a
+# replacement is selected exactly once, it is NOT the task that just faulted, and every step
+# that follows names that SAME task.
+pf1t_replacement="$(printf '%s\n' "$pf1t_log" \
+  | rg -a -o -N 'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=([0-9]+)' -r '$1' \
+  | head -n1)"
+if [[ -z "$pf1t_replacement" ]]; then
+  echo "[error] U9-PF1-TERM: no replacement task was selected after the terminal fault"
+  pf1t_fail=1
+elif [[ "$pf1t_replacement" == "1" ]]; then
+  echo "[error] U9-PF1-TERM: the drain selected the FAULTED task (tid 1) as its own replacement"
+  pf1t_fail=1
+else
+  echo "[ok] U9-PF1-TERM: a replacement task is selected, and it is not the faulted one (tid=${pf1t_replacement})"
+fi
+pf1t_require_one "queue selection happens exactly once" \
+  "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=${pf1t_replacement}"
+pf1t_require_one "the SAME replacement is made current" \
+  "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu=0 tid=${pf1t_replacement}"
+pf1t_require_one "the SAME replacement gets its exact frame" \
+  "QUEUE_ADVANCING_DISPATCH_FRAME_OK cpu=0 tid=${pf1t_replacement}"
 # The faulting PC must NEVER resume, and no refusal or fail-closed settlement may occur.
 pf1t_require_zero "the faulting PC never resumes (no ownerless re-fault)" \
   'PAGE_FAULT_ENTRY tid=18446744073709551615'

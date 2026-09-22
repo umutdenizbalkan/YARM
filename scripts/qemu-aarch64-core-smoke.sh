@@ -399,14 +399,38 @@ u9ft4_require_one "the queue-advance deferral is published exactly once" \
 u9ft4_require_one "broad dispatcher skipped for the terminal fault" \
   'QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=terminal_fault_committed'
 # The existing drain selects the replacement and applies its exact context.
-u9ft4_require_one "queue selection happens once and chooses tid 2" \
-  'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=2'
-u9ft4_require_one "replacement tid 2 is marked Running" \
-  'AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK tid=2'
-u9ft4_require_one "replacement tid 2 gets its exact address space" \
-  'AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid=2 asid=2'
-u9ft4_require_one "replacement tid 2 gets its exact EL0 frame" \
-  'AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid=2'
+#
+# U9-PAGEFAULT2 §4 — the replacement's TID is DERIVED from the log, not written into the
+# assertion. It used to be the literal `2`, and that was testing the boot clock rather than the
+# fault route: which task sits at the run-queue head when the fault lands depends on how many
+# timer ticks elapsed during boot, and ~300 bytes of extra init was enough to move it (measured
+# on RISC-V, where base takes 10 ticks before the fault and re-enqueues tid 2 ahead of tid 3,
+# while the larger init sees only 6 and tid 3 is still the head). Neither answer says anything
+# about the terminal route.
+#
+# What the route actually owes is asserted instead, and it is stricter than the literal was: a
+# replacement is selected exactly once, it is NOT the task that just faulted, and every step
+# that follows names that SAME task.
+u9ft4_replacement="$(printf '%s\n' "$u9ft4_log" \
+  | rg -a -o -N 'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=([0-9]+)' -r '$1' \
+  | head -n1)"
+if [[ -z "$u9ft4_replacement" ]]; then
+  echo "[error] U9-FT4: no replacement task was selected after the terminal fault"
+  u9ft4_fail=1
+elif [[ "$u9ft4_replacement" == "1" ]]; then
+  echo "[error] U9-FT4: the drain selected the FAULTED task (tid 1) as its own replacement"
+  u9ft4_fail=1
+else
+  echo "[ok] U9-FT4: a replacement task is selected, and it is not the faulted one (tid=${u9ft4_replacement})"
+fi
+u9ft4_require_one "queue selection happens exactly once" \
+  "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=${u9ft4_replacement}"
+u9ft4_require_one "the SAME replacement is marked Running" \
+  "AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK tid=${u9ft4_replacement}"
+u9ft4_require_one "the SAME replacement gets its exact address space" \
+  "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid=${u9ft4_replacement} asid=${u9ft4_replacement}"
+u9ft4_require_one "the SAME replacement gets its exact EL0 frame" \
+  "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid=${u9ft4_replacement}"
 u9ft4_require_one "the drain completes once" \
   'AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok'
 # The faulting PC must NEVER resume: a second entry at the same rip, or a fault with no
