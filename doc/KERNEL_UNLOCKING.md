@@ -21261,3 +21261,238 @@ hardware bring-up and is deliberately not attempted here.
    started there), so that port's demand row is "not issued", not "passed".
 4. **`ap-cross-cpu-reply` is red, at the base too** — an AP TLB-shootdown liveness defect,
    outside this mission's scope.
+
+---
+
+# U9-IRQ-FINAL — closing the RISC-V IRQ escape and the hosted Unknown hand-off
+
+Base: `ade97a65`. Main untouched at `8f30f3b9`.
+
+## §1 — the claim, read once, at the actual entry boundary
+
+### What was missing
+
+IRQ-UNKNOWN1 wired the split delivery route on every port and then had RISC-V refuse every
+arrival, because the identity it was handed was `stval` — architecturally `0` for a supervisor
+external interrupt — and `external_irq_eoi` refuses source `0` as the PLIC's reserved "no
+interrupt" encoding. No claim was read and no completion was ever issued, on either the split
+route or the broad arm. That refusal was the port's remaining escape to terminal broad dispatch.
+
+### The four things the claim depends on, derived
+
+| input | answer, on QEMU virt |
+|---|---|
+| configured controller address | `0x0C00_0000`, DTB-discovered with a `qemu_virt_fallback`; unchanged |
+| accessing hart / context | S-mode context `1` on the boot hart; unchanged |
+| **MMIO accessibility under the entering address space** | **not reachable** — see below |
+| privilege-entry restrictions | unchanged: the claim sits *after* `if !from_u`, which admits exactly one S-mode trap (the audited kernel-idle timer) and halts on everything else |
+
+**The reachability answer is the substantive one.** The claim/complete register for context 1 is
+at `0xC20_1004`. A trap is handled in S-mode under whatever address space was active when it was
+taken — a user ASID, whose only kernel mapping is the shared gigapage at
+`0x8000_0000..0xC000_0000`. The PLIC window sits below RAM and is never covered by it, so reading
+the claim register would raise a supervisor load fault and land in
+`riscv_trap_halt("trap_from_s_mode")`. This is the same fact the existing
+`RISCV_PLIC_DEFERRED reason=plic_mmio_unmapped_under_active_satp` records for the threshold
+write; IRQ-FINAL derives it for the claim too, and the boot now says so on every RISC-V run:
+
+```
+RISCV_EXTIRQ_CLAIM_READINESS context=1 addr=0xc201004 configured=1 reachable=0 \
+  reason=mmio_unreachable_under_entering_satp
+```
+
+That marker is a **pure derivation** — it reads no MMIO. Mapping the PLIC into every user ASID
+would change it, and that is a platform-mapping decision this package is explicitly not making.
+
+### Where the claim is read
+
+`yarm_riscv64_trap_bridge`, the trap entry owner, exactly once per trap, carried in
+`Riscv64TrapContext::external_claim`. A claim read is **destructive** — it dequeues the
+highest-priority pending source and marks it in flight until the matching completion is written —
+so it cannot live in `decode_trap_context`, which runs several times during one trap. The
+decoder's external arm now reads the carried claim and, when there is no claim or the source is
+too wide to be a route line, names no line at all.
+
+No source is enabled, no priority is written, no driver is introduced.
+
+## §2 — one claim, one settlement
+
+### Three claim states, three settled endings, no fall-through
+
+| state | settlement | completed? |
+|---|---|---|
+| `Unavailable { NotConfigured \| MmioUnreachable }` | `Complete(Ok(()))`, reason `irq_claim_unavailable` | no — nothing is in flight |
+| `NoPending` | `Complete(Ok(()))`, reason `irq_no_pending_claim` | no — a completion nobody claimed is a duplicate |
+| `Claimed { source, context }` | the same delivery policy x86_64 and AArch64 use | **yes, exactly once** |
+
+**The unconditional RISC-V `NotHandled` arm is removed**, and the bridge raises `irq_handled`
+unconditionally for the family. The broad arm's `TrapEvent::ExternalInterrupt` route — which
+would `route_external_irq` and then write a second completion — is therefore unreachable on this
+port.
+
+### One completion owner
+
+`InterruptCompletion` names what a trap owes the controller, decided where the claim was taken
+and carried to the one place that writes it:
+
+* `ArchSingleStep { line }` — x86_64's LAPIC EOI, and AArch64's deliberately inert seam (its
+  vector tail already completed the claim its vector entry took). Nothing is in flight, so a
+  decline completes nothing and the broad arm still owns the interrupt. **Both unchanged.**
+* `PlicClaim { source, base, context_index }` — a source that IS in flight, completed against the
+  same context that produced it.
+
+`settle_external_interrupt_at_bridge` holds the single write site, under two disjoint conditions
+and no unconditional one:
+
+```rust
+if settled.is_some() || completion.is_in_flight() { … completion.complete(cpu) … }
+```
+
+So valid claimed work is completed exactly once on **every** ending — delivered, unbound line,
+delivery error, and even a route that declines — while a decline with nothing in flight completes
+nothing. `PlicClaim::in_flight()` is the only source of completion arguments, which makes
+"no-claim outcomes must not complete anything" a property of the type rather than of a comment.
+
+### Never manufacture a line, never truncate an identifier
+
+The controller's identifier arrives at its own width and is narrowed once, checked:
+`u16::try_from(source)`. A source too wide to be a route line is refused by name
+(`IRQFINAL_SOURCE_UNROUTABLE`), delivered nowhere, and **completed anyway** — truncating it would
+complete a *different* source and leave this one in flight forever. There is no `as u16` anywhere
+in the path and no line-0 authority is ever fabricated.
+
+The interrupted continuation is untouched: neither the route, the bridge owner nor the RISC-V
+settlement can name a frame, encode a syscall result, advance a PC or publish a placement.
+
+## §3 — hosted Unknown, closed without changing its policy
+
+Preserving hosted's non-strict behaviour never required preserving the broad acquisition. The
+broad arm's hosted answer for an unknown trap is exactly three things: the diagnostic line, the
+default-off `FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL` marker, and `handle_trap(Trap::Unknown)` —
+whose entire body for this trap is `Ok(())`. All three are now produced pre-lock, from the same
+hardware-derived CPU and code, in the same body that holds the strict divergence:
+
+```rust
+if crate::kernel::boot::strict_unknown_traps() { unknown_trap_fatal(cpu, arch_code); }
+… same diagnostic, same marker, strict=0 …
+SplitDispatchDisposition::Complete(Ok(()))
+```
+
+One body, one policy bit — not two `cfg`'d functions that can drift apart. Production still
+diverges and still retires the trap window first. No reclassification into a user fault, no
+fabricated victim, and no new production recovery behaviour. The bridges gain a fifth gate arm
+(`unknown_handled`, reason `unknown_settled`) and a fifth join cell, so the settlement is carried
+rather than discarded.
+
+## §4 — the evidence
+
+**Controller-model evidence (7).** The real claim and completion owners, driven against a model
+that answers the claim read destructively and records completions with their context: the read is
+destructive so a second read in one trap finds nothing; the completion names the claim's own
+source and context even after the controller is reconfigured underneath; an empty controller is
+`NoPending` with nothing to complete; both configuration refusals refuse *without reading the
+register*; the states are separately nameable; the claim is read at exactly one site, after the
+S-mode screen, only for a supervisor external interrupt; and no source is enabled.
+
+**Bridge-completion evidence (8), injected and labelled.** A claimed source carried through
+delivery to completion on every ending: delivered and completed once against its own context; an
+unbound line delivered nowhere and completed anyway; a delivery error completed *and* still
+propagating; a wide identifier refused rather than truncated into the real line it would have hit;
+a declined route still returning the claim (`IRQFINAL_DECLINED_CLAIM_COMPLETED`); a decline with
+nothing in flight completing nothing; a blocked notification waiter proven, woken, enqueued and
+the source completed once; and three arrivals producing exactly three completions.
+
+**Source-derived per-port facts (7)** and the **Unknown closure (7)**, including the isolated
+expected-fatal case that runs the diverging body production reaches.
+
+**Mutation guards.** A renewed RISC-V fall-through fails
+`the_riscv_external_family_can_no_longer_reach_the_broad_dispatcher` (no `NotHandled` arm, no
+architecture gate in the route, the flag raised unconditionally, the gate admitting it). A
+duplicate claim or completion fails `no_second_claim_and_no_second_completion` (one claim site,
+one register read, one completion write, one call to it). Delivery from `stval` fails both the
+decoder guard and the settlement guard.
+
+**No real IRQ arrivals means no hardware-delivery witness, and none is claimed.** No port enables
+a source; every default-profile boot takes zero external interrupts. Model and injected evidence
+cannot show that a controller raises a line, that the MMIO addresses are right, or that an
+asynchronous architectural entry resumes the interrupted context.
+
+## §5 — qualification
+
+Frozen at `47e98fa9`, working tree clean, artifacts rebuilt from it.
+
+### 1. Source closure
+
+| event family | reaches terminal broad dispatch | settles pre-lock |
+|---|---|---|
+| `ExternalInterrupt`, x86_64 / AArch64 | never | all six delivery outcomes |
+| `ExternalInterrupt`, RISC-V | **never** — the escape is closed | all three claim states |
+| `Unknown`, production | never | diverges, window retired first |
+| `Unknown`, hosted | **never** — the hand-off is closed | normal return, same diagnostic |
+
+Both residuals IRQ-UNKNOWN1 named are gone. What remains is not a fall-through: on QEMU virt the
+claim answers `Unavailable{MmioUnreachable}`, which is a *settled* ending with a named reason, and
+mapping the PLIC window into user ASIDs is the platform change that would turn it into a claim.
+
+### 2. Exercised evidence
+
+| cell | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| default profile: IRQ arrivals / unknown traps / broad PF / abandoned windows | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| claim readiness marker | — | — | `configured=1 reachable=0 reason=mmio_unreachable_under_entering_satp` |
+| terminal READ witness | chain complete, broad=0 | chain complete, broad=0 | chain complete, broad=0 |
+| terminal FETCH witness | chain complete, broad=0 | chain complete, broad=0 | **flaky, at the base too** — see below |
+| demand witness (issuing profiles) | `recovered=8 regs_ok=8 result=ok` | not issued on this profile | `recovered=8 regs_ok=8 result=ok` |
+| timer idle return | `rounds=24 advances=12 parks=1 result=ok` | — | — |
+| IPC recv/reply/transfer oracle | passed | — | — |
+| IPC call reply-direct live seal | `duplicate_replies=0 duplicate_wakes=0 result=ok` | — | — |
+| AP generic / saved return / recv-v2 block | all `result=ok` | — | — |
+
+**The RISC-V terminal-FETCH cell is flaky, and it is flaky at the base.** Measured: **5 of 6** on
+`47e98fa9`, **2 of 3** on `ade97a65`, with the identical failure shape — no replacement task is
+runnable at the moment the deliberate fetch fault lands, so
+`RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK` never appears and the kernel idles
+(`kernel_idle_awaiting_io`). This is the boot-clock sensitivity the script's own comment
+documents at the replacement-selection step. The terminal route itself passes its full positive
+chain on every run, including the failing ones. It is reported as flaky, not as passing.
+
+**The AP cross-CPU reply suite stays red and stays deferred**, unchanged and separately labelled:
+measured failing identically at `fc582912` in the previous package (x86 TLB-shootdown
+acknowledgement storm, `X86_TLB_REMOTE_ACK_TIMEOUT`), it is an AP liveness defect outside this
+package's scope and was not re-run here.
+
+### 3. Acquisition census — reported separately
+
+| | value | required |
+|---|---|---|
+| `AUDITED_WITH_CPU_TOTAL` | 2 | 2 |
+| `AUDITED_WITH_BROAD_TOTAL` | 0 | 0 |
+| `AUDITED_STATE_LOCK_TOTAL` (raw wrapper bodies) | 3 | 3 |
+| `broad_lock_census_guard` | 7 pass / 0 fail | 7/7 |
+
+**No broad acquisition was added or reclassified.** The hosted Unknown closure *removed* a
+reachable path to one without changing the census, because that acquisition remains for the
+classes that still take it.
+
+### 4. Gates
+
+| gate | result |
+|---|---|
+| hosted lib, `--test-threads=1` | **5777 pass / 0 fail** / 2 ignored |
+| every other integration target | all pass |
+| `server_dies_runner_scope` | **8 pass / 2 fail** — the exact carve-out, the named pair |
+| `broad_lock_census_guard` | 7/7 |
+| `doc_fragmentation_guard` | 7/7 |
+| `run-external-irq-targeted-tests.sh` | 3/3 |
+| `yarm-ipc-abi` | 211 pass |
+| freestanding builds | x86_64, AArch64, RISC-V — all clean |
+
+### 5. The remaining barrier, named
+
+**One, and it is a platform-mapping decision, not an unlocking one.** The RISC-V claim register
+is not mapped under the address space a trap is taken in, so no claim can be read on QEMU virt
+today and the claim path answers `Unavailable{MmioUnreachable}` on every arrival. Closing it
+means mapping the PLIC window (kernel-only) into every user ASID — a change to
+`map_kernel_shared_into_asid` with its own isolation argument to make, and one that would still
+produce no arrivals because no source is enabled. The escape to broad dispatch is closed either
+way: the unavailable case settles pre-lock with a named reason instead of falling through.
