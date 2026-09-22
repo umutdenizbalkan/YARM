@@ -83,6 +83,37 @@ impl UnattributableFault {
     }
 }
 
+/// U9-PAGEFAULT3 §2 — why the off-lock classifier produced no `{class, facts}` pair.
+///
+/// This replaces an `Option`. The routes used to call a helper that mapped BOTH of these to
+/// `None` and then mapped `None` to `NotHandled`, which sent the fault to the broad dispatcher
+/// — and the two causes do not deserve the same answer at all. One is a kernel bug that must
+/// never reach a recovery owner; the other is a lost race that mutated nothing.
+///
+/// Erasing them into `Option` is what made that conflation invisible: by the time the route
+/// saw the value, the reason no longer existed.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageFaultClassifyRefusal {
+    /// The fault cannot be attributed to a running user incarnation. Carries WHICH of the three
+    /// causes, because they are settled differently and reported differently.
+    Unattributable(UnattributableFault),
+    /// The identity moved between the classifier's separate rank-local acquisitions, so the
+    /// facts describe a departed incarnation. Nothing was read into the marker stream and
+    /// nothing was written.
+    IdentityChanged,
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl PageFaultClassifyRefusal {
+    pub(crate) fn marker(self) -> &'static str {
+        match self {
+            Self::Unattributable(cause) => cause.marker(),
+            Self::IdentityChanged => "identity_changed",
+        }
+    }
+}
+
 /// U9-PF §1 — the read-only facts a classification rests on, captured once under one VM
 /// snapshot so a later phase can revalidate against the exact same coordinates.
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
@@ -900,6 +931,22 @@ pub(crate) enum TerminalFaultPolicyRefusal {
     NotCurrentTask,
     /// The tid has no TCB.
     TaskNotFound,
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl TerminalFaultPolicyRefusal {
+    /// U9-PAGEFAULT3 §3 — which settlement this refusal takes, as the marker prints it.
+    ///
+    /// `NotCurrentTask` no longer reads `retry_instruction`. The refusal is raised because the
+    /// owner has proved the faulting task is not this CPU's current task, so the one thing the
+    /// route may not do is return through that task's frame — and the marker says which
+    /// settlement actually runs rather than restating an outcome the route stopped producing.
+    pub(crate) fn settlement_marker(self) -> &'static str {
+        match self {
+            Self::NotCurrentTask => "authenticated_entering_frame",
+            Self::NoCurrentTask | Self::TaskNotFound => "fatal_task_missing",
+        }
+    }
 }
 
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");

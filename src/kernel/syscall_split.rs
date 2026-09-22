@@ -176,6 +176,168 @@ pub(crate) fn try_split_dispatch(
     }
 }
 
+/// U9-PAGEFAULT3 §3 — the incarnation this trap ENTERED from, captured before anything is
+/// classified.
+///
+/// It is captured at route entry rather than derived from `PageFaultFacts` for a reason the
+/// directive states exactly: a settlement must not authenticate the frame against a replacement
+/// discovered later. `facts` is a product of classification, so a classification that REFUSED
+/// has no facts to authenticate against — and those are precisely the settlements that used to
+/// return through the frame with nothing checked at all.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EnteringFaultIncarnation {
+    pub(crate) tid: u64,
+    pub(crate) asid: crate::kernel::vm::Asid,
+}
+
+/// Read the entering incarnation through the same authoritative owners the syscall bridge uses.
+#[cfg(not(feature = "hosted-dev"))]
+fn entering_fault_incarnation(shared: &SharedKernel, cpu: CpuId) -> EnteringFaultIncarnation {
+    let tid = shared.current_tid_authoritative(cpu).unwrap_or(0);
+    EnteringFaultIncarnation {
+        tid,
+        asid: crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16),
+    }
+}
+
+/// U9-PAGEFAULT3 §3 — **the kernel-fatal settlement, through the existing architecture path.**
+///
+/// `Err(TrapHandleError::Syscall(TaskMissing))` is not a new policy and not a new halt owner: it
+/// is what `fault_current_task_with_fault` returns when it cannot name a victim, and every
+/// architecture entry already turns it into a decoded trap dump and `halt_forever()`. The only
+/// thing that changes is which owner produces it.
+#[cfg(not(feature = "hosted-dev"))]
+fn settle_fault_kernel_fatal(
+    cpu: CpuId,
+    marker: &'static str,
+    reason: &'static str,
+    tid: u64,
+) -> SplitDispatchDisposition {
+    crate::yarm_log!(
+        "{} cpu={} tid={} reason={} settlement=kernel_fatal broad_lock=0",
+        marker,
+        cpu.0,
+        tid,
+        reason
+    );
+    SplitDispatchDisposition::Complete(Err(TrapHandleError::Syscall(
+        crate::kernel::syscall::SyscallError::from(crate::kernel::boot::KernelError::TaskMissing),
+    )))
+}
+
+/// U9-PAGEFAULT3 §3 — **every return through the entering frame is authenticated here, or it
+/// does not happen.**
+///
+/// `Complete(Ok(()))` is not "success". At the PageFault bridge it sets
+/// `queue_advance_committed`, skips the broad dispatcher, skips the queue-advance drains when no
+/// deferral is armed, and the architecture epilogue then `iret`/`eret`/`sret`s through the LIVE
+/// TRAP FRAME. That frame belongs to whichever task entered the trap. Returning through it is
+/// only correct while that task is still the one this CPU is running.
+///
+/// Five settlements reached it without checking: the raced recovery class, the policy read's
+/// `NotCurrentTask`, the queue-advance admission refusal, the deferral refusal, and — the one
+/// that is reachable and actually wrong — the post-publication transition refusal.
+/// `commit_terminal_fault_transition_shared` clears `current` at its step (3), calls that step
+/// irreversible in its own comment, and can still refuse at step (5). The route answered that
+/// with `Complete(Ok(()))`, so the trap returned through the faulting frame while the scheduler
+/// had `current = None` and the task placed nowhere. The task would re-fault at the same PC
+/// forever with no current task on the CPU.
+///
+/// "This route mutated nothing" never established that the frame was still resumable, because
+/// the question is not what THIS route did — it is what the scheduler now believes.
+///
+/// [`SharedKernel::entering_frame_authority_split_read`] already answers it, and its own
+/// documentation says `OwnsEnteringFrame` is "the only state in which a trap may return through
+/// its entering frame". This composes that owner; it does not restate its rule.
+///
+/// A forfeited frame fails CLOSED. There is no third option: the trap cannot return through a
+/// frame the scheduler has disowned, and it cannot hand the fault to the broad dispatcher —
+/// which would re-derive against whoever is current now and report THIS fault against a
+/// replacement.
+#[cfg(not(feature = "hosted-dev"))]
+fn settle_via_entering_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    entering: EnteringFaultIncarnation,
+    marker: &'static str,
+    reason: &'static str,
+) -> SplitDispatchDisposition {
+    use crate::kernel::task_transition::EnteringFrameAuthority as A;
+
+    match shared.entering_frame_authority_split_read(cpu, entering.tid, entering.asid) {
+        A::OwnsEnteringFrame => {
+            crate::yarm_log!(
+                "{} cpu={} tid={} asid={} reason={} authority=owns_entering_frame \
+                 settlement=retry_instruction broad_lock=0",
+                marker,
+                cpu.0,
+                entering.tid,
+                entering.asid.0,
+                reason
+            );
+            SplitDispatchDisposition::Complete(Ok(()))
+        }
+        A::Forfeited(forfeit) => {
+            crate::yarm_log!(
+                "{} cpu={} tid={} asid={} reason={} authority=forfeited forfeit={:?} \
+                 settlement=kernel_fatal broad_lock=0",
+                marker,
+                cpu.0,
+                entering.tid,
+                entering.asid.0,
+                reason,
+                forfeit
+            );
+            settle_fault_kernel_fatal(cpu, marker, "entering_frame_forfeited", entering.tid)
+        }
+    }
+}
+
+/// U9-PAGEFAULT3 §2 — **the supervisor-origin guard, ahead of every recovery owner.**
+///
+/// It runs at the TOP of all three routes, before each route's access screen, because the
+/// screens are not the same and a kernel fault must not be able to slip past one of them into
+/// the next route. A write screen refuses a supervisor READ; an execute screen refuses a
+/// supervisor FETCH; between them a kernel fault reached whichever route had no screen for it.
+///
+/// ## This is an ATTRIBUTION CORRECTION, not parity
+///
+/// The broad arm performs no privilege-origin test at any point. A supervisor-mode page fault
+/// runs its COW attempt, its demand attempt, then `PAGE_FAULT_UNHANDLED` and
+/// `fault_current_task_for_fault` — which reports the fault against, and terminates, whichever
+/// USER task happens to be current. That is wrong twice over: a kernel bug is blamed on a user
+/// task, and a recovery owner is offered a kernel fault to service.
+///
+/// This does not reproduce that behaviour and does not claim parity with it. A supervisor fault
+/// reaches the architecture's kernel-fatal path before any user recovery runs, before any report
+/// is published and before any task is terminated — which is what a kernel-mode fault has always
+/// meant, and what the decoded trap dump on the other side of `Err` exists to report.
+#[cfg(not(feature = "hosted-dev"))]
+fn guard_supervisor_origin(
+    cpu: CpuId,
+    fault: crate::kernel::trap::FaultInfo,
+    route: &'static str,
+) -> Option<SplitDispatchDisposition> {
+    if !matches!(fault.origin, crate::kernel::trap::FaultOrigin::Supervisor) {
+        return None;
+    }
+    crate::yarm_log!(
+        "PF3_SUPERVISOR_FAULT cpu={} route={} addr=0x{:x} access={:?} \
+         attributed_to=none settlement=kernel_fatal broad_lock=0",
+        cpu.0,
+        route,
+        fault.addr.0,
+        fault.access
+    );
+    Some(settle_fault_kernel_fatal(
+        cpu,
+        "PF3_SUPERVISOR_FAULT",
+        "supervisor_origin",
+        u64::MAX,
+    ))
+}
+
 /// # Validation status
 /// - LIVE_TRAP_SMOKE_X86_64 — entry point for the NR 8 live split-dispatch path;
 ///   called from `handle_trap_entry_shared` before the global lock; x86_64 smoke
@@ -200,49 +362,104 @@ pub(crate) fn try_split_dispatch(
 /// frame. The third meaning names that state explicitly, so neither mistake is representable.
 // `QueueAdvanceCommitted` is constructed only by the pre-lock FutexWait route, which is
 // `cfg(not(hosted-dev))`; the hosted build compiles the type but never mints that variant.
-/// U9-PAGEFAULT1 §3 — the ONE classification entry every split PageFault route uses.
+/// U9-PAGEFAULT3 §2 — settle a classifier refusal, identically in all three routes.
 ///
-/// It exists for a reason the raw seam call could not serve: the classifier can answer "this
-/// fault cannot be attributed to a running user incarnation", and that answer has three distinct
-/// causes which the old `Ok((_, Some(facts)))` pattern discarded along with the class. A
-/// supervisor-mode fault, a CPU with no current task, and a current task with no address space
-/// are three different bugs, and a route that declined all of them identically told an observer
-/// nothing about which one occurred.
+/// Each of the three unattributable causes reaches the architecture's kernel-fatal path, and
+/// each keeps its own reason so the decoded trap dump names which one occurred:
 ///
-/// Every cause still DECLINES — none of them may reach a recovery owner, and none of them can
-/// produce a fault report, because there is no victim to name. What changes is that the decline
-/// is now recorded with its cause, which is what makes the population countable. It is expected
-/// to be empty: a supervisor page fault is a kernel bug, and the other two are dispatch-state
-/// bugs. A marker that never prints is the evidence that it is empty.
+/// * **`SupervisorOrigin`** — handled earlier still, by [`guard_supervisor_origin`] at the top of
+///   every route, so it can never reach a recovery owner's access screen. Reaching it here would
+///   mean the guard was bypassed, so it fails closed for the same reason.
+/// * **`NoCurrentTask`** — this is where the BROAD arm gives up too:
+///   `fault_current_task_with_fault`'s `current_tid()` `ok_or` produces `TaskMissing`, and the
+///   architecture entry halts. That is the derived error boundary, reached without first
+///   offering the fault to two recovery owners.
+/// * **`NoAddressSpace`** — a current task with no address space cannot own a user mapping, so
+///   there is no `{tid, asid}` coordinate to revalidate and no victim a report could name. The
+///   same boundary, for the same reason.
 ///
-/// `None` also covers the seam's own typed refusal (`SharedPageFaultRefusal`), which is a stale
-/// identity discovered between the ranked reads — an ordinary race, not a kernel state, and
-/// already named by the seam.
+/// `IdentityChanged` is NOT in that list and must not be: it is an ordinary lost race that
+/// mutated nothing. It settles through the entering frame, which is authorized exactly when the
+/// task that entered the trap is still the one this CPU is running.
+#[cfg(not(feature = "hosted-dev"))]
+fn settle_classify_refusal(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    entering: EnteringFaultIncarnation,
+    refusal: crate::kernel::boot::PageFaultClassifyRefusal,
+    route: &'static str,
+) -> SplitDispatchDisposition {
+    use crate::kernel::boot::PageFaultClassifyRefusal as R;
+    let _ = route;
+    match refusal {
+        R::Unattributable(cause) => settle_fault_kernel_fatal(
+            cpu,
+            "PF3_UNATTRIBUTABLE_SETTLED",
+            cause.marker(),
+            entering.tid,
+        ),
+        R::IdentityChanged => settle_via_entering_frame(
+            shared,
+            cpu,
+            entering,
+            "PF3_CLASSIFY_RACED",
+            "identity_changed",
+        ),
+    }
+}
+
+/// U9-PAGEFAULT1 §3 / U9-PAGEFAULT3 §2 — the ONE classification entry every split PageFault
+/// route uses, and it now PRESERVES its refusal instead of erasing it.
+///
+/// It used to return `Option`, and every route mapped `None` to `NotHandled`. That collapsed two
+/// unrelated answers into one, and then sent both to the broad dispatcher:
+///
+/// * **unattributable** — a supervisor-mode fault, a CPU with no current task, or a current task
+///   with no address space. None of these may reach a recovery owner and none can produce a
+///   fault report, because there is no victim to name. Handing them to the broad arm is the
+///   worst available answer: it performs no origin test, so it offers a KERNEL fault to its COW
+///   and demand handlers and then terminates whichever user task is current.
+/// * **identity changed** — the seam's own `SharedPageFaultRefusal`, a stale identity discovered
+///   between the ranked reads. An ordinary race that mutated nothing.
+///
+/// By the time a route saw `None`, the reason no longer existed, so no route could settle either
+/// one correctly. The typed refusal is what makes the two settlements expressible at all.
 #[cfg(not(feature = "hosted-dev"))]
 fn classify_for_split(
     shared: &SharedKernel,
     cpu: CpuId,
     fault: crate::kernel::trap::FaultInfo,
     route: &'static str,
-) -> Option<(
-    crate::kernel::boot::PageFaultClass,
-    crate::kernel::boot::PageFaultFacts,
-)> {
+) -> Result<
+    (
+        crate::kernel::boot::PageFaultClass,
+        crate::kernel::boot::PageFaultFacts,
+    ),
+    crate::kernel::boot::PageFaultClassifyRefusal,
+> {
+    use crate::kernel::boot::PageFaultClassifyRefusal as R;
     match shared.classify_page_fault_shared(cpu, fault) {
-        Ok((class, Some(facts))) => Some((class, facts)),
+        Ok((class, Some(facts))) => Ok((class, facts)),
         Ok((crate::kernel::boot::PageFaultClass::KernelOrAbsentTask(cause), None)) => {
             crate::yarm_log!(
-                "PF1_UNATTRIBUTABLE_FAULT cpu={} route={} cause={} addr=0x{:x} access={:?} settled=0",
+                "PF1_UNATTRIBUTABLE_FAULT cpu={} route={} cause={} addr=0x{:x} access={:?} settled=1",
                 cpu.0,
                 route,
                 cause.marker(),
                 fault.addr.0,
                 fault.access
             );
-            None
+            Err(R::Unattributable(cause))
         }
+        // The seam's own typed refusal, kept typed. Nothing was read into the marker stream and
+        // nothing was written, so this is the one classifier outcome a route may settle by
+        // returning to the faulting instruction — IF the entering frame is still its own.
+        Err(crate::runtime::SharedPageFaultRefusal::IdentityChanged) => Err(R::IdentityChanged),
         // No other class can arrive without facts: every one of them is derived FROM facts.
-        Ok((_, None)) | Err(_) => None,
+        // `NoCurrentTask` is the honest name for a coordinate the classifier could not build.
+        Ok((_, None)) => Err(R::Unattributable(
+            crate::kernel::boot::UnattributableFault::NoCurrentTask,
+        )),
     }
 }
 
@@ -303,24 +520,18 @@ fn try_split_terminal_page_fault_into_frame(
     };
     use SplitDispatchDisposition as D;
 
-    // U9-PAGEFAULT2 §3 — the two canonical endings this route settles its own refusals with.
+    // U9-PAGEFAULT3 §3 — the two canonical endings, and `retry` is now AUTHENTICATED.
     //
-    // `retry` is the faulting instruction re-executing. Nothing was published, nothing woken, no
-    // scheduler state moved, so the architecture epilogue returns through the same frame and the
-    // access is taken again — against whatever the competing owner left behind.
+    // It used to be `D::Complete(Ok(()))` written inline, on the argument that the route had
+    // mutated nothing. That argument is about what this route did; the question is what the
+    // SCHEDULER now believes, and `Complete(Ok(()))` here makes the architecture epilogue
+    // `iret`/`eret`/`sret` through the live trap frame. Returning through it is correct only
+    // while the task that entered the trap is still the one this CPU is running, which is
+    // exactly what `entering_frame_authority_split_read` decides.
     //
-    // `fatal` is `Err(TrapHandleError::Syscall(TaskMissing))`, which is not a new policy: it is
-    // byte-for-byte what `fault_current_task_with_fault` returns when it cannot name a victim,
-    // carried out of the trap by the same `?` and turned into the same halt by the same
-    // architecture entry. The only thing that changed is which owner produced it.
-    let retry = || D::Complete(Ok(()));
-    let fatal = || {
-        D::Complete(Err(TrapHandleError::Syscall(
-            crate::kernel::syscall::SyscallError::from(
-                crate::kernel::boot::KernelError::TaskMissing,
-            ),
-        )))
-    };
+    // `fatal` is `Err(TrapHandleError::Syscall(TaskMissing))` — byte-for-byte what
+    // `fault_current_task_with_fault` returns when it cannot name a victim, carried out by the
+    // same `?` and turned into the same decoded halt by the same architecture entry.
 
     // U9-PAGEFAULT1 §2 — all three ports, each on a witness of its own.
     //
@@ -341,13 +552,23 @@ fn try_split_terminal_page_fault_into_frame(
     let (Some(fault), Some(frame)) = (fault, frame) else {
         return D::NotHandled;
     };
+    // U9-PAGEFAULT3 §2 — the origin guard. Unreachable here in practice, because the two routes
+    // ahead of this one guard first and return `Complete`, which the bridge treats as handled.
+    // It is present because this route must be correct when read on its own: a route that
+    // depends on another route having run is a route whose contract is somewhere else.
+    if let Some(fatal) = guard_supervisor_origin(cpu, fault, "terminal") {
+        return fatal;
+    }
+    let entering = entering_fault_incarnation(shared, cpu);
     let cpu_idx = cpu.0 as usize;
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return D::NotHandled;
     }
-    // (1) Classify off-lock. A stale identity refuses before anything is decided.
-    let Some((class, facts)) = classify_for_split(shared, cpu, fault, "terminal") else {
-        return D::NotHandled;
+    // (1) Classify off-lock. A stale identity refuses before anything is decided, and is settled
+    // through the entering frame rather than handed to the broad dispatcher.
+    let (class, facts) = match classify_for_split(shared, cpu, fault, "terminal") {
+        Ok(pair) => pair,
+        Err(refusal) => return settle_classify_refusal(shared, cpu, entering, refusal, "terminal"),
     };
     if !matches!(
         page_fault_route_for(arch, class),
@@ -369,20 +590,24 @@ fn try_split_terminal_page_fault_into_frame(
         //
         // A non-recovery class cannot arrive here: `UserKernelAddress` and `TerminallyUnhandled`
         // both route `SplitTerminal` on all three ports, and `KernelOrAbsentTask` never reaches
-        // this point because `classify_for_split` returns `None` for it above.
+        // this point because `classify_for_split` settles it above.
+        //
+        // U9-PAGEFAULT3 §3: the retry is AUTHENTICATED. A mapping race is the one condition that
+        // can legitimately satisfy it — the page changed under us and the faulting task is still
+        // the task this CPU is running — and that is precisely what the authority read decides,
+        // rather than being assumed from "nothing was mutated here".
         if matches!(
             class,
             crate::kernel::boot::PageFaultClass::CowCandidate
                 | crate::kernel::boot::PageFaultClass::DemandCandidate
         ) {
-            crate::yarm_log!(
-                "TERMINAL_FAULT_SPLIT_RACED cpu={} tid={} va=0x{:x} class={:?} settlement=retry_instruction broad_lock=0",
-                cpu.0,
-                facts.tid,
-                facts.page.0,
-                class
+            return settle_via_entering_frame(
+                shared,
+                cpu,
+                entering,
+                "TERMINAL_FAULT_SPLIT_RACED",
+                "recovery_class_raced",
             );
-            return retry();
         }
         return D::NotHandled;
     }
@@ -404,25 +629,43 @@ fn try_split_terminal_page_fault_into_frame(
                 cpu.0,
                 facts.tid,
                 refusal,
-                match refusal {
-                    PR::NotCurrentTask => "retry_instruction",
-                    PR::NoCurrentTask | PR::TaskNotFound => "fatal_task_missing",
-                }
+                refusal.settlement_marker()
             );
             return match refusal {
-                // The victim we classified is no longer this CPU's current task. The broad arm
-                // does not ask this question at all — it reads `current_tid()` afresh and faults
-                // whoever answers — so falling back would report THIS fault against a DIFFERENT
-                // task and terminate it. Honoring the competing winner means publishing nothing:
-                // the frame still belongs to the faulting context, so returning re-executes the
-                // access and the fault is re-classified against current state.
-                PR::NotCurrentTask => retry(),
+                // U9-PAGEFAULT3 §3 — `NotCurrentTask` IS NO LONGER A RETRY.
+                //
+                // PAGEFAULT2 settled it as one and justified it as "honoring the competing
+                // winner", on the reasoning that nothing had been published so the frame still
+                // belonged to the faulting context. The second half does not follow from the
+                // first. This refusal is raised BECAUSE the owner has just proved the faulting
+                // task is not this CPU's current task, and returning `Complete(Ok(()))` makes
+                // the epilogue return through that task's frame anyway — against a different
+                // current, and against whatever address space the winner installed. The refusal
+                // states the exact condition under which the frame may not be returned through,
+                // and the old settlement returned through it.
+                //
+                // It goes to the authority read like every other return in this route. That read
+                // is not a formality here: `NotCurrentTask` guarantees a `Forfeited` answer, so
+                // this settles as the architecture's kernel-fatal path and the fatal names which
+                // placement the CPU was actually in.
+                PR::NotCurrentTask => settle_via_entering_frame(
+                    shared,
+                    cpu,
+                    entering,
+                    "TERMINAL_FAULT_SPLIT_REFUSED",
+                    "policy_not_current_task",
+                ),
                 // No current task, or a tid with no TCB. Both are exactly where
                 // `fault_current_task_with_fault` gives up — the first at its `current_tid()`
                 // `ok_or`, the second at the `FaultRunningCurrent` acceptance check — and both
                 // of its answers are `Err(TaskMissing)`. Nothing was published and nothing
                 // mutated, so this is that answer and not a substitute for it.
-                PR::NoCurrentTask | PR::TaskNotFound => fatal(),
+                PR::NoCurrentTask | PR::TaskNotFound => settle_fault_kernel_fatal(
+                    cpu,
+                    "TERMINAL_FAULT_SPLIT_REFUSED",
+                    "policy_victim_unnameable",
+                    facts.tid,
+                ),
             };
         }
     };
@@ -464,42 +707,81 @@ fn try_split_terminal_page_fault_into_frame(
             crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
         ) {
             crate::yarm_log!(
-                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=queue_admit reason={:?} settlement=retry_instruction broad_lock=0",
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=queue_admit reason={:?} broad_lock=0",
                 cpu.0,
                 facts.tid,
                 refusal
             );
-            // The two variants that survive the migration are properties of the TRAP, not of the
-            // fault: `NoTrapDrainer` means this CPU's lock-drop window is not open, and
-            // `OutgoingIdentityStale` means the authority is not live. The bridge established
-            // the window before it called this route and retires it at the real trap boundary,
-            // so neither is reachable from a bridge-supplied authority — and if one ever were,
-            // nothing has been published or mutated, so the faulting instruction is the settled
-            // answer. It is not a fatal: the fault is real and unhandled, but the reason we
-            // could not settle it here is contention for the trap's own machinery.
-            return retry();
+            // U9-PAGEFAULT3 §3 — INVALID TRAP AUTHORITY IS NOT ORDINARY CONTENTION, and the two
+            // kinds of refusal here are not the same kind of fact.
+            //
+            // `NoTrapDrainer` says this CPU's lock-drop window is not open. `OutgoingIdentityStale`
+            // says the authority is not live. Both are statements about THE TRAP, and both
+            // contradict the caller: the bridge established the window before it called this
+            // route and hands it its own live authority, so neither can be true while this route
+            // is executing. PAGEFAULT2 settled them as a retry on the grounds that "nothing was
+            // published", which is true and irrelevant — a trap whose own window is not open has
+            // no authenticated frame to return through either. They fail closed.
+            //
+            // Everything else is ordinary: `IncomingUnavailable` means a candidate exists and is
+            // not resumable by this convention, which is a real and reachable scheduling state.
+            // The fault stays unsettled, the task is still `Running` and still this CPU's
+            // current, and it re-faults on its next attempt — settled through the authenticated
+            // frame like every other return in this route.
+            return match refusal {
+                crate::kernel::boot::QueueAdvanceRefusal::NoTrapDrainer
+                | crate::kernel::boot::QueueAdvanceRefusal::OutgoingIdentityStale => {
+                    settle_fault_kernel_fatal(
+                        cpu,
+                        "TERMINAL_FAULT_SPLIT_REFUSED",
+                        "trap_authority_invalid",
+                        facts.tid,
+                    )
+                }
+                _ => settle_via_entering_frame(
+                    shared,
+                    cpu,
+                    entering,
+                    "TERMINAL_FAULT_SPLIT_REFUSED",
+                    "queue_admit_contended",
+                ),
+            };
         }
         // RESERVE THE DEFERRAL BEFORE ANY PUBLICATION. Holding it is what guarantees the drain
         // will apply an incoming context.
         if !crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, facts.tid) {
+            // U9-PAGEFAULT3 §3 — ORDINARY CONTENTION, with the INCUMBENT NAMED.
+            //
+            // The CAS fails only when a deferral is already armed for this CPU. PAGEFAULT2
+            // settled that as a retry and said so; what it did not do is establish WHOSE debt it
+            // was walking away from, which is the difference between leaving another owner's
+            // reservation alone and not having looked.
+            //
+            // So the incumbent is read and printed. It is the one cell this bridge's FutexWait
+            // drain consumes: `futex_wait_dispatch_is_deferred(cpu_idx)` is sampled AFTER this
+            // route runs, so the drain sees the incumbent reservation and honours it with the
+            // incumbent's own outgoing identity — this route's refusal changes nothing about
+            // that. Nothing here clears it, overwrites it or re-targets it: the CAS that failed
+            // is the only write this route would have made.
+            //
+            // The consequence for THIS fault is stated rather than implied: the incumbent's
+            // drain may install an incoming context over the live frame, which is its right and
+            // not this route's business. This route publishes nothing and terminates nothing, so
+            // the fault is simply unsettled and will be re-taken.
             crate::yarm_log!(
-                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=defer reason=defer_unavailable settlement=retry_instruction broad_lock=0",
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=defer reason=defer_unavailable \
+                 incumbent_outgoing={:?} consumer=futex_wait_drain broad_lock=0",
                 cpu.0,
-                facts.tid
+                facts.tid,
+                crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
             );
-            // U9-PAGEFAULT2 §3 — ORDINARY CONTENTION, settled as such.
-            //
-            // The CAS fails only when a deferral is already armed for this CPU, which means a
-            // queue advance is already owed and this trap's drain has not consumed it yet.
-            // Publishing a second one would lose the first. Nothing here has been published and
-            // nothing mutated, so the settlement is the faulting instruction: the owed advance
-            // drains, and the task — which is still `Running` and still `current`, because a
-            // terminal fault has not been acted on yet — re-faults into a clean reservation.
-            //
-            // Deliberately NOT a fatal and NOT a retry loop. The directive's own rule is that a
-            // panic must not be substituted for contention, and a bounded in-route retry would
-            // spin against a cell only the drain can clear.
-            return retry();
+            return settle_via_entering_frame(
+                shared,
+                cpu,
+                entering,
+                "TERMINAL_FAULT_SPLIT_REFUSED",
+                "deferral_occupied",
+            );
         }
     }
     // (5) Capture the outgoing context while the reservation is held and nothing is published.
@@ -563,23 +845,73 @@ fn try_split_terminal_page_fault_into_frame(
             facts.tid,
             u8::from(!matches!(report, R::Failed(_)))
         );
-        return D::Complete(Ok(()));
+        // U9-PAGEFAULT3 §3 — the POLICY is preserved and the RETURN is authenticated.
+        //
+        // `NotifyAndContinue` means exactly what it meant: the report is published, no
+        // transition is performed, and the faulting task resumes at the same instruction. This
+        // route reserved no deferral for it and terminates nothing, so nothing about the policy
+        // changes here.
+        //
+        // What the policy does NOT say is that the frame is still returnable. This arm is
+        // reached AFTER a publication, and the publication's waiter ending wakes another task
+        // through a post-work drain — so the one settlement in this route that runs after an
+        // external effect is also the one that most needs the placement re-read rather than
+        // assumed. If the entering task still owns the frame the return is exactly the old one.
+        return settle_via_entering_frame(
+            shared,
+            cpu,
+            entering,
+            "TERMINAL_FAULT_SPLIT_NOTIFY_CONTINUE",
+            "notify_and_continue",
+        );
     }
     // (8) The terminal task transition. Fail-closed from here.
     match shared.commit_terminal_fault_transition_shared(cpu, facts.tid, facts.asid, frame) {
         T::Committed { .. } => {}
-        _ => {
-            // The report is published, so the broad emitter must NOT run again. The deferral is
-            // released because the outgoing task is NOT `Faulted` — the drain's reverify would
-            // decline it anyway, and leaving it armed would strand the CPU.
+        refusal => {
+            // U9-PAGEFAULT3 §1/§3 — **THE ONE REACHABLE UNVERIFIED RESUME, and it was here.**
+            //
+            // The transaction's own comment calls its step (3) irreversible: it clears `current`
+            // through `block_current_on_cpu_split`, and it can still refuse at step (5) when the
+            // status write is rejected, or at step (4) when the removed victim is not the one it
+            // validated. At that point `current` is CLEARED, the task is NOT `Faulted`, and the
+            // report is already published.
+            //
+            // The old settlement was `Complete(Ok(()))`. At this bridge that skips the broad
+            // dispatcher, and — because the deferral has just been cleared — skips the
+            // queue-advance drain too, so the architecture epilogue returns through the faulting
+            // task's frame while the scheduler holds `current = None` and places that task
+            // nowhere. It re-faults at the same PC, forever, on a CPU with no current task.
+            // "The route mutated nothing after this point" was true and did not help: the
+            // mutation that mattered had already happened inside the transaction.
+            //
+            // Clearing the deferral stays, and is now justified rather than assumed: this route
+            // armed that reservation itself, a few lines above, under the CAS that fails when
+            // anyone else owns it. It is the only cell this route may clear, and it is cleared
+            // because the outgoing task is not `Faulted` and the drain's reverify would decline
+            // it anyway.
+            //
+            // The RETURN is then authenticated like every other one. `PlacedNowhere` is what the
+            // authority read answers here, so this settles through the architecture's
+            // kernel-fatal path — which is the correct end for a CPU whose scheduler state the
+            // kernel has just failed to complete, and is what the decoded trap dump exists to
+            // report.
             crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
             crate::yarm_log!(
-                "TERMINAL_FAULT_SPLIT_FAILED_CLOSED cpu={} tid={} captured={}",
+                "TERMINAL_FAULT_SPLIT_FAILED_CLOSED cpu={} tid={} captured={} refusal={:?} \
+                 deferral=cleared_own broad_lock=0",
                 cpu.0,
                 facts.tid,
-                u8::from(captured)
+                u8::from(captured),
+                refusal
             );
-            return D::Complete(Ok(()));
+            return settle_via_entering_frame(
+                shared,
+                cpu,
+                entering,
+                "TERMINAL_FAULT_SPLIT_FAILED_CLOSED",
+                "transition_refused_after_publication",
+            );
         }
     }
     crate::yarm_log!(
@@ -623,7 +955,9 @@ fn try_split_terminal_page_fault_into_frame(
 ///   exact error out of the trap. Nothing was allocated, so there is nothing to roll back.
 #[cfg(not(feature = "hosted-dev"))]
 fn settle_pre_mutation(
+    shared: &SharedKernel,
     cpu: CpuId,
+    entering: EnteringFaultIncarnation,
     facts: crate::kernel::boot::PageFaultFacts,
     marker: &'static str,
     reason: &'static str,
@@ -647,7 +981,14 @@ fn settle_pre_mutation(
         }
     );
     match settlement {
-        P::RetryInstruction => D::Complete(Ok(())),
+        // U9-PAGEFAULT3 §3 — the recovery family's retry is authenticated by the same owner the
+        // terminal route's is. A mapping race IS the condition under which returning to the
+        // faulting instruction is correct — another owner installed the mapping and the faulting
+        // task is still the one this CPU runs — but "another owner installed the mapping" does
+        // not by itself establish the second half. The authority read establishes it.
+        P::RetryInstruction => {
+            settle_via_entering_frame(shared, cpu, entering, marker, "pre_mutation_retry")
+        }
         P::ContinueFamily => D::NotHandled,
         // Settled by the ROUTE, which is the only place that holds the owner to re-enter. Each
         // route matches this variant ahead of the call above, so reaching here would mean a
@@ -678,6 +1019,7 @@ fn settle_pre_mutation(
 fn settle_cow_non_private_copy(
     shared: &SharedKernel,
     cpu: CpuId,
+    entering: EnteringFaultIncarnation,
     fault: crate::kernel::trap::FaultInfo,
     facts: crate::kernel::boot::PageFaultFacts,
 ) -> SplitDispatchDisposition {
@@ -741,7 +1083,11 @@ fn settle_cow_non_private_copy(
             if crate::kernel::boot::fault_delivery_enabled() {
                 crate::yarm_log!("FAULT_DELIVERY_CLASSIFY_HANDLED kind=cow");
             }
-            D::Complete(Ok(()))
+            // U9-PAGEFAULT3 §3 — a RECOVERY SUCCESS is a retry of the faulting instruction, so
+            // it is authenticated like every other one. The mapping is installed either way;
+            // what the authority read decides is whether this trap may be the one that returns
+            // to the instruction that needed it.
+            settle_via_entering_frame(shared, cpu, entering, "PAGE_FAULT_HANDLED_COW", "recovered")
         }
         // The broad arm's `.ok_or(KernelError::UserMemoryFault)?`: the COW handler exits by `?`,
         // so the demand attempt below it never runs and `PAGE_FAULT_UNHANDLED` is never printed.
@@ -813,14 +1159,27 @@ fn try_split_cow_page_fault_into_frame(
     let Some(fault) = fault else {
         return D::NotHandled;
     };
+    // U9-PAGEFAULT3 §2 — THE ORIGIN GUARD, ahead of the access screen.
+    //
+    // It has to precede the screen, not follow it. A supervisor READ is refused by the write
+    // screen below and a supervisor FETCH by the demand route's execute screen, so between them
+    // a kernel fault reached whichever route had no screen for it — and this is the FIRST route,
+    // so putting the guard here is what keeps a kernel fault away from every recovery owner.
+    if let Some(fatal) = guard_supervisor_origin(cpu, fault, "cow") {
+        return fatal;
+    }
+    // The entering incarnation, captured BEFORE classification, because a classification that
+    // refuses has no facts to authenticate a return against.
+    let entering = entering_fault_incarnation(shared, cpu);
     // The broad arm attempts COW only for writes, before anything else. Same screen, same place.
     if !matches!(fault.access, FaultAccess::Write) {
         return D::NotHandled;
     }
     // (1) Classify off-lock, through the ONE evaluator the broad arm uses. A stale identity
-    // refuses here, before anything is decided.
-    let Some((class, facts)) = classify_for_split(shared, cpu, fault, "cow") else {
-        return D::NotHandled;
+    // refuses here, before anything is decided — and is settled rather than handed away.
+    let (class, facts) = match classify_for_split(shared, cpu, fault, "cow") {
+        Ok(pair) => pair,
+        Err(refusal) => return settle_classify_refusal(shared, cpu, entering, refusal, "cow"),
     };
     if !matches!(page_fault_route_for(arch, class), PageFaultRoute::SplitCow) {
         return D::NotHandled;
@@ -832,7 +1191,7 @@ fn try_split_cow_page_fault_into_frame(
     // with no mapping is the broad arm's `UserMemoryFault`, which leaves the COW handler through
     // `?` without ever trying demand. Both settle here, through the same owners.
     if facts.mapping_writable || !facts.mapping_present {
-        return settle_cow_non_private_copy(shared, cpu, fault, facts);
+        return settle_cow_non_private_copy(shared, cpu, entering, fault, facts);
     }
     // The marker the broad arm prints on entry, in the broad arm's position: this route
     // intercepts before it, and the stream an observer sees must not change because the owner did.
@@ -906,7 +1265,11 @@ fn try_split_cow_page_fault_into_frame(
             if crate::kernel::boot::fault_delivery_enabled() {
                 crate::yarm_log!("FAULT_DELIVERY_CLASSIFY_HANDLED kind=cow");
             }
-            D::Complete(Ok(()))
+            // U9-PAGEFAULT3 §3 — a RECOVERY SUCCESS is a retry of the faulting instruction, so
+            // it is authenticated like every other one. The mapping is installed either way;
+            // what the authority read decides is whether this trap may be the one that returns
+            // to the instruction that needed it.
+            settle_via_entering_frame(shared, cpu, entering, "PAGE_FAULT_HANDLED_COW", "recovered")
         }
         // U9-PAGEFAULT2 §3 — the page raced back into the shape the NON-PRIVATE-COPY owner
         // handles. Re-enter that owner, which is the same one the pre-transaction screen above
@@ -925,12 +1288,14 @@ fn try_split_cow_page_fault_into_frame(
                 facts.page.0,
                 other.reason()
             );
-            settle_cow_non_private_copy(shared, cpu, fault, facts)
+            settle_cow_non_private_copy(shared, cpu, entering, fault, facts)
         }
         // A pre-mutation refusal settles through its CANONICAL outcome, not through the broad
         // dispatcher. Which outcome it is comes from which refusal was raised.
         other if other.may_fall_back_to_broad() => settle_pre_mutation(
+            shared,
             cpu,
+            entering,
             facts,
             "VM_COW_SPLIT_REFUSED",
             other.reason(),
@@ -987,6 +1352,7 @@ fn try_split_cow_page_fault_into_frame(
 fn settle_demand_stale_translation(
     shared: &SharedKernel,
     cpu: CpuId,
+    entering: EnteringFaultIncarnation,
     fault: crate::kernel::trap::FaultInfo,
     facts: crate::kernel::boot::PageFaultFacts,
 ) -> SplitDispatchDisposition {
@@ -1015,7 +1381,15 @@ fn settle_demand_stale_translation(
             // The same completion marker the broad arm prints once its own repair returns
             // `Ok(true)` and the post-demand verification passes.
             crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
-            D::Complete(Ok(()))
+            // U9-PAGEFAULT3 §3 — as above: the recovery succeeded, and returning to the
+            // faulting instruction still requires the entering context to be authorized.
+            settle_via_entering_frame(
+                shared,
+                cpu,
+                entering,
+                "PAGE_FAULT_HANDLED_DEMAND",
+                "recovered",
+            )
         }
         // Nothing read into the marker stream, nothing written: the next owner in the route
         // order prints `PAGE_FAULT_ENTRY` when it takes the fault.
@@ -1067,6 +1441,13 @@ fn try_split_demand_page_fault_into_frame(
     let Some(fault) = fault else {
         return D::NotHandled;
     };
+    // U9-PAGEFAULT3 §2 — the origin guard, ahead of this route's own screen for the same reason
+    // it precedes the COW route's: a supervisor FETCH would otherwise pass straight through the
+    // execute screen below into the terminal route.
+    if let Some(fatal) = guard_supervisor_origin(cpu, fault, "demand") {
+        return fatal;
+    }
+    let entering = entering_fault_incarnation(shared, cpu);
     // The broad demand handler refuses an instruction fetch outright — a demand page is mapped
     // `USER_RW`, never executable — and this route keeps that screen in the same place, so the
     // two cannot disagree about which accesses the class covers.
@@ -1077,8 +1458,9 @@ fn try_split_demand_page_fault_into_frame(
     // or a stale identity refuses here, before anything is decided. A kernel ADDRESS no longer
     // refuses here — U9-PAGEFAULT1 §3 gives it a class of its own, which this route declines
     // below on the ordinary class test, because it is a user fault and not a demand candidate.
-    let Some((class, facts)) = classify_for_split(shared, cpu, fault, "demand") else {
-        return D::NotHandled;
+    let (class, facts) = match classify_for_split(shared, cpu, fault, "demand") {
+        Ok(pair) => pair,
+        Err(refusal) => return settle_classify_refusal(shared, cpu, entering, refusal, "demand"),
     };
     if !matches!(
         page_fault_route_for(arch, class),
@@ -1092,7 +1474,7 @@ fn try_split_demand_page_fault_into_frame(
     // software mapping already satisfies the access (the class evaluator admits a present mapping
     // only when it does), so the repair retires the cached walk and the instruction retries.
     if facts.mapping_present {
-        return settle_demand_stale_translation(shared, cpu, fault, facts);
+        return settle_demand_stale_translation(shared, cpu, entering, fault, facts);
     }
     // The marker the broad arm prints on entry, in the broad arm's position: this route
     // intercepts BEFORE the arm that would have printed it, and the stream must stay faithful.
@@ -1119,7 +1501,15 @@ fn try_split_demand_page_fault_into_frame(
             // The marker the broad arm prints for a serviced demand fault, so an observer sees
             // the same completion whichever owner performed it.
             crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
-            D::Complete(Ok(()))
+            // U9-PAGEFAULT3 §3 — as above: the recovery succeeded, and returning to the
+            // faulting instruction still requires the entering context to be authorized.
+            settle_via_entering_frame(
+                shared,
+                cpu,
+                entering,
+                "PAGE_FAULT_HANDLED_DEMAND",
+                "recovered",
+            )
         }
         // U9-PAGEFAULT2 §3 — a mapping appeared under us, which is the shape the
         // STALE-TRANSLATION owner handles. Re-enter it, exactly as the pre-transaction screen
@@ -1137,12 +1527,14 @@ fn try_split_demand_page_fault_into_frame(
                 facts.page.0,
                 other.reason()
             );
-            settle_demand_stale_translation(shared, cpu, fault, facts)
+            settle_demand_stale_translation(shared, cpu, entering, fault, facts)
         }
         // Pre-mutation: nothing was written. U9-PAGEFAULT2 §3 — the canonical settlement,
         // derived from the refusal.
         other if other.may_fall_back_to_broad() => settle_pre_mutation(
+            shared,
             cpu,
+            entering,
             facts,
             "PF1_DEMAND_SPLIT_REFUSED",
             other.reason(),

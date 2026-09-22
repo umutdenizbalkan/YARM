@@ -20826,3 +20826,61 @@ every fact read.
 
 The other residuals are not recognized faults: an architecture with no matrix row, a bridge call
 with no `FaultInfo`, and a CPU index outside `MAX_CPUS`.
+
+## U9-PAGEFAULT3 §1 — every PageFault exit, traced to the architectural return
+
+`Complete(Ok(()))` is not "success". At the PageFault bridge it sets `queue_advance_committed`,
+skips the broad dispatcher, skips the queue-advance drain whenever no deferral is armed, and the
+architecture epilogue then `iret`s / `eret`s / `sret`s **through the live trap frame** — the frame
+of whichever task entered the trap. So every settlement that produces it is a claim that the
+entering task is still the one this CPU is running, and until this package not one of them checked.
+
+"This route mutated nothing" was the standing justification, and it answers the wrong question.
+It describes what the route did; the frame's returnability is a fact about what the **scheduler
+now believes**.
+
+### The table, as delivered at 56efc368
+
+| # | exit | route return | deferral | what the architecture then does | verified? |
+|---|---|---|---|---|---|
+| A | classifier `IdentityChanged` | `NotHandled` | none | broad dispatcher re-derives under its own lock | n/a — escapes |
+| B | classifier `Unattributable(_)` | `NotHandled` | none | broad arm, **which performs no origin test** | n/a — escapes |
+| C | recovery class raced at the terminal route | `Complete(Ok(()))` | none | return through entering frame | **no** |
+| D | policy `NotCurrentTask` | `Complete(Ok(()))` | none | return through entering frame | **no — and the refusal itself says the task is not current** |
+| E | policy `NoCurrentTask` / `TaskNotFound` | `Complete(Err(TaskMissing))` | none | decoded trap dump, `halt_forever()` | yes |
+| F | queue-advance admission refused | `Complete(Ok(()))` | none | return through entering frame | **no** |
+| G | deferral occupied | `Complete(Ok(()))` | **another owner's** | drain honours the incumbent, may replace the frame | **no, and the incumbent was never read** |
+| H | transition refused **after publication** | clear deferral, `Complete(Ok(()))` | cleared | return through entering frame | **no** |
+| I | COW / demand pre-mutation retry | `Complete(Ok(()))` | none | return through entering frame | **no** |
+| J | COW / demand recovery **success** | `Complete(Ok(()))` | none | return through entering frame | **no** |
+| K | COW / demand resource failure | `Complete(Err(..))` | none | decoded trap dump, `halt_forever()` | yes |
+
+### H is reachable, and it is the one that is actually wrong
+
+`commit_terminal_fault_transition_shared` clears `current` at its step (3) through
+`block_current_on_cpu_split` and calls that step irreversible in its own comment. It can still
+refuse afterwards — `RefusedVictimChanged` at step (4), `RefusedTransitionRejected` at step (5).
+
+On that path the report is **already published**, `current` is **cleared**, and the task is **not**
+`Faulted`. The route answered with `Complete(Ok(()))` and cleared the deferral, so the drain did
+not run either: the trap returned through the faulting task's frame with the scheduler holding
+`current = None` and the task placed nowhere. It re-faults at the same PC forever, on a CPU with
+no current task.
+
+### Mechanically impossible versus ordinary contention
+
+The distinction rests on one fact, and it is checkable rather than asserted: **the only writers of
+a CPU's `current` slot are that CPU's own trap path.** `block_current_on`,
+`block_current_exact_on` and `install_ap_idle_current` are the whole set, and every production
+call site passes the `cpu` its own trap entered on.
+
+| exit | class | why |
+|---|---|---|
+| D, E | impossible within one trap | `current` cannot change between the classifier's revalidation and the policy read: no other CPU writes it, and this CPU is inside this trap |
+| H | **reachable** | the route's own transaction cleared `current`; the refusal that follows is its own mutation, not a competitor's |
+| F (`NoTrapDrainer`, stale authority) | impossible | the bridge established the window and hands this route its own live authority |
+| F (`IncomingUnavailable`) | ordinary contention | a candidate exists and is not resumable by this convention |
+| G | ordinary contention | a queue advance is already owed and this trap's drain has not consumed it |
+| I, J | ordinary contention | a competing owner serviced the page |
+
+`u9pagefault3_construction` pins the writer set, so the proof fails if a fourth writer appears.

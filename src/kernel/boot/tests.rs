@@ -151379,6 +151379,355 @@ mod u9pagefault2_settlement {
     }
 }
 
+/// U9-PAGEFAULT3 §4 — **every return through the entering frame is authenticated, and the
+/// classifier's refusal is settled rather than erased.**
+///
+/// The PAGEFAULT2 closure module proves no recognized fault reaches the broad dispatcher. That
+/// is a statement about which OWNER handles the fault. This module proves the other half: that
+/// the owner which handles it does not then return through a frame the scheduler has disowned.
+///
+/// The two are independent. A family can be perfectly closed against fallback and still
+/// `iret` through a task that is no longer current — which is exactly what U9-PAGEFAULT2
+/// delivered, in six places.
+mod u9pagefault3_authenticated_return {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SCHED_SRC: &str = include_str!("../scheduler.rs");
+    const TRANSITION_SRC: &str = include_str!("../task_transition.rs");
+
+    /// The fault family's production bodies, comments stripped.
+    fn family_bodies() -> alloc::vec::Vec<(&'static str, alloc::string::String)> {
+        [
+            "fn try_split_terminal_page_fault_into_frame(",
+            "fn try_split_cow_page_fault_into_frame(",
+            "fn try_split_demand_page_fault_into_frame(",
+            "fn settle_cow_non_private_copy(",
+            "fn settle_demand_stale_translation(",
+            "fn settle_pre_mutation(",
+            "fn settle_classify_refusal(",
+        ]
+        .into_iter()
+        .map(|marker| {
+            let part = SPLIT_SRC
+                .split(marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{marker}` must exist"));
+            let end = part.find("\n}\n").expect("a body must terminate");
+            let code = part[..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            (marker, code)
+        })
+        .collect()
+    }
+
+    /// **THE PROPERTY. No fault-family body returns `Complete(Ok(()))` on its own.**
+    ///
+    /// This is the mutation-testable shape of the whole package. Every return through the
+    /// entering frame goes through [`settle_via_entering_frame`], which reads
+    /// `entering_frame_authority_split_read` and fails closed when the frame is forfeited.
+    /// A body that writes `D::Complete(Ok(()))` inline has re-created, in one place, the exact
+    /// unverified resume this package removed from six.
+    ///
+    /// Counting occurrences would not catch it: PAGEFAULT2's family had the right number of
+    /// `NotHandled` sites throughout and still returned through unchecked frames.
+    #[test]
+    fn no_family_body_returns_through_the_frame_unauthenticated() {
+        for (marker, code) in family_bodies() {
+            assert!(
+                !code.contains("D::Complete(Ok(()))"),
+                "{marker}: a return through the entering frame must go through \
+                 `settle_via_entering_frame`, which is the only place that checks whether the \
+                 frame is still this task's to return through"
+            );
+        }
+        // And the one owner that IS allowed to produce it does so exactly once, in the arm the
+        // authority read authorized.
+        let owner = SPLIT_SRC
+            .split("fn settle_via_entering_frame(")
+            .nth(1)
+            .expect("the settlement owner")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert_eq!(
+            owner
+                .matches("SplitDispatchDisposition::Complete(Ok(()))")
+                .count(),
+            1,
+            "exactly one authorized return exists, in the `OwnsEnteringFrame` arm"
+        );
+        assert!(
+            owner.contains("A::OwnsEnteringFrame =>") && owner.contains("A::Forfeited("),
+            "the owner must decide on the authority, not on a structural predicate"
+        );
+        assert!(
+            owner.contains("settle_fault_kernel_fatal("),
+            "a forfeited frame must fail closed, never fall back and never resume"
+        );
+    }
+
+    /// **The authority read is the existing owner, and its contract is the one being relied on.**
+    #[test]
+    fn the_authority_owner_is_composed_not_restated() {
+        assert!(
+            SPLIT_SRC.contains(
+                "shared.entering_frame_authority_split_read(cpu, entering.tid, entering.asid)"
+            ),
+            "the settlement must call the existing authority owner with the ENTERING identity"
+        );
+        // That owner's own rule, unchanged, is what makes the composition sound.
+        assert!(
+            TRANSITION_SRC.contains(
+                "This is the only state in which a trap may return through its entering frame"
+            ),
+            "the owner must still declare `OwnsEnteringFrame` as the sole returnable state"
+        );
+        // It composes both halves: the exact incarnation AND the placement.
+        let read = RUNTIME_SRC
+            .split("pub(crate) fn entering_frame_authority_split_read(")
+            .nth(1)
+            .expect("the authority read")
+            .split("\n    }\n")
+            .next()
+            .expect("its body");
+        assert!(
+            read.contains("task_incarnation_is_resumable_split_read(tid, entering_asid)")
+                && read.contains("placement_of("),
+            "the authority must rest on the exact incarnation AND the scheduler's placement"
+        );
+    }
+
+    /// **The entering incarnation is captured BEFORE classification, in every route.**
+    ///
+    /// §3's rule is that the frame must not be authenticated against a replacement discovered
+    /// later. A classification that REFUSED produces no facts, so a settlement derived from
+    /// `facts` could not authenticate those paths at all — which is why they were the ones that
+    /// returned unchecked.
+    #[test]
+    fn the_entering_incarnation_precedes_classification_in_every_route() {
+        for route in [
+            "fn try_split_terminal_page_fault_into_frame(",
+            "fn try_split_cow_page_fault_into_frame(",
+            "fn try_split_demand_page_fault_into_frame(",
+        ] {
+            let body = SPLIT_SRC
+                .split(route)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{route}` must exist"));
+            let capture = body
+                .find("let entering = entering_fault_incarnation(shared, cpu);")
+                .unwrap_or_else(|| panic!("{route}: the entering incarnation must be captured"));
+            let classify = body
+                .find("classify_for_split(shared, cpu, fault,")
+                .unwrap_or_else(|| panic!("{route}: the classification must exist"));
+            assert!(
+                capture < classify,
+                "{route}: the entering incarnation must be captured BEFORE classification"
+            );
+        }
+    }
+
+    /// **The supervisor-origin guard precedes every access screen, in every route.**
+    ///
+    /// The screens are not the same. A write screen refuses a supervisor READ; an execute screen
+    /// refuses a supervisor FETCH. A guard placed after either one leaves the other kind of
+    /// kernel fault free to reach the next route, which is how a supervisor fault reached the
+    /// broad arm's recovery owners before this package.
+    #[test]
+    fn the_origin_guard_precedes_every_access_screen() {
+        for (route, screen) in [
+            (
+                "fn try_split_cow_page_fault_into_frame(",
+                "if !matches!(fault.access, FaultAccess::Write)",
+            ),
+            (
+                "fn try_split_demand_page_fault_into_frame(",
+                "if matches!(fault.access, FaultAccess::Execute)",
+            ),
+        ] {
+            let body = SPLIT_SRC
+                .split(route)
+                .nth(1)
+                .unwrap_or_else(|| panic!("`{route}` must exist"));
+            let guard = body
+                .find("guard_supervisor_origin(cpu, fault,")
+                .unwrap_or_else(|| panic!("{route}: the origin guard must exist"));
+            let screen_at = body
+                .find(screen)
+                .unwrap_or_else(|| panic!("{route}: its access screen must exist"));
+            assert!(
+                guard < screen_at,
+                "{route}: the origin guard must precede the access screen"
+            );
+        }
+        // The terminal route has no access screen, so the guard is pinned to precede its
+        // classification instead — the point at which facts a recovery owner could read exist.
+        let terminal = SPLIT_SRC
+            .split("fn try_split_terminal_page_fault_into_frame(")
+            .nth(1)
+            .expect("the terminal route");
+        assert!(
+            terminal
+                .find("guard_supervisor_origin(cpu, fault,")
+                .expect("guard")
+                < terminal
+                    .find("classify_for_split(shared, cpu, fault,")
+                    .expect("classify"),
+            "terminal route: the origin guard must precede classification"
+        );
+    }
+
+    /// **A supervisor fault is settled as a kernel fault, and attributed to no user task.**
+    ///
+    /// This is the ATTRIBUTION CORRECTION, and it is stated as one. The broad arm performs no
+    /// origin test at any point: a supervisor page fault runs its COW attempt, its demand
+    /// attempt, then `PAGE_FAULT_UNHANDLED` and `fault_current_task_for_fault`, which reports
+    /// the fault against — and terminates — whichever USER task happens to be current.
+    #[test]
+    fn a_supervisor_fault_is_attributed_to_no_user_task() {
+        let guard = SPLIT_SRC
+            .split("fn guard_supervisor_origin(")
+            .nth(1)
+            .expect("the guard")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            guard.contains("crate::kernel::trap::FaultOrigin::Supervisor"),
+            "the guard must test the architectural origin bit, not the address"
+        );
+        assert!(
+            guard.contains("attributed_to=none"),
+            "and must record that no user task was named"
+        );
+        assert!(
+            guard.contains("settle_fault_kernel_fatal("),
+            "a kernel-mode fault settles as a kernel fault"
+        );
+        // It publishes nothing and terminates nothing — there is no report owner, no transition
+        // owner and no recovery owner anywhere in it.
+        for forbidden in [
+            "deliver_fault_report_split",
+            "commit_terminal_fault_transition_shared",
+            "cow_recover_private_copy_split",
+            "demand_recover_page_split",
+            "futex_wait_dispatch_try_defer",
+        ] {
+            assert!(
+                !guard.contains(forbidden),
+                "the supervisor guard must not reach `{forbidden}`: a kernel fault is settled \
+                 before any user recovery, report or termination"
+            );
+        }
+        // And the broad arm it is NOT claiming parity with still has no origin test.
+        let broad = include_str!("fault_state.rs")
+            .split("TrapEvent::PageFault(fault) => {")
+            .nth(1)
+            .expect("the broad PageFault arm")
+            .split("TrapEvent::ExternalInterrupt")
+            .next()
+            .expect("its extent");
+        assert!(
+            !broad.contains("FaultOrigin::Supervisor"),
+            "the broad arm performs no origin test; this package corrects that attribution \
+             rather than reproducing it, and this case fails if the broad arm ever gains one \
+             so the claim is re-derived rather than inherited"
+        );
+    }
+
+    /// **The classifier's refusal is typed, and each cause is settled by name.**
+    #[test]
+    fn the_classifier_refusal_is_typed_and_settled_by_cause() {
+        let classify = SPLIT_SRC
+            .split("fn classify_for_split(")
+            .nth(1)
+            .expect("the classifier entry")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            classify.contains("PageFaultClassifyRefusal"),
+            "the classifier entry must return its refusal, not erase it into `Option`"
+        );
+        assert!(
+            !classify.contains("-> Option<("),
+            "the `Option` form must be gone, not left beside the typed one"
+        );
+        // Both causes reach a settlement, and they are NOT the same settlement.
+        let settle = SPLIT_SRC
+            .split("fn settle_classify_refusal(")
+            .nth(1)
+            .expect("the refusal settlement")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            settle.contains("R::Unattributable(cause) => settle_fault_kernel_fatal("),
+            "an unattributable fault settles at its derived error boundary"
+        );
+        assert!(
+            settle.contains("R::IdentityChanged => settle_via_entering_frame("),
+            "a lost race settles through the authenticated frame, never as a fatal"
+        );
+        assert!(
+            !settle.contains("D::NotHandled"),
+            "neither cause may reach the broad dispatcher"
+        );
+    }
+
+    /// **THE CONSTRUCTION PROOF — the writer set for a CPU's `current` slot.**
+    ///
+    /// §1 separates mechanically impossible states from ordinary contention, and the separation
+    /// rests entirely on this: the only writers of a CPU's `current` slot are that CPU's own
+    /// trap path. That is what makes the policy read's `NotCurrentTask` unreachable WITHIN one
+    /// trap, and it is what makes the post-publication refusal reachable — there the route's own
+    /// transaction cleared `current`, so no competitor is needed.
+    ///
+    /// Pinned by enumeration so the proof fails if a fourth writer appears, rather than being an
+    /// assertion someone has to re-check by hand.
+    #[test]
+    fn only_a_cpus_own_trap_path_writes_its_current_slot() {
+        let writers: alloc::vec::Vec<&str> = SCHED_SRC
+            .lines()
+            .filter(|l| l.contains("pub fn ") && l.contains("&mut self"))
+            .filter(|l| {
+                let n = l;
+                n.contains("block_current")
+                    || n.contains("restore_exact_current")
+                    || n.contains("install_ap_idle_current")
+                    || n.contains("dispatch_next_on_cpu")
+            })
+            .collect();
+        assert!(
+            writers.len() >= 4,
+            "the scheduler's current-slot writers must be enumerable, found {writers:?}"
+        );
+        // Every one that names an explicit CPU is given it by the caller's own trap. The two
+        // that do not take a CPU operate on `current_cpu`, which is this CPU by construction.
+        for w in ["block_current_on", "block_current_exact_on"] {
+            assert!(
+                SCHED_SRC.contains(&alloc::format!("pub fn {w}(&mut self, cpu: CpuId")),
+                "`{w}` must take its CPU explicitly, so a caller cannot write another CPU's slot \
+                 by omission"
+            );
+        }
+        // And no production seam hands one of them a CPU it did not enter on: the split seams
+        // take `cpu` as a parameter and pass it straight through.
+        for seam in [
+            ".block_current_on(cpu)",
+            ".block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(expected_tid))",
+        ] {
+            assert!(
+                RUNTIME_SRC.contains(seam),
+                "the split seam `{seam}` must pass its own `cpu` through unchanged"
+            );
+        }
+    }
+}
+
 mod u9pagefault2_closure {
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
@@ -151418,29 +151767,33 @@ mod u9pagefault2_closure {
     ///
     /// | body | sites | what each one is |
     /// |---|---|---|
-    /// | terminal route | 5 | unrouted arch; no fault/frame; CPU out of range; unattributable class; end-of-order non-recovery |
-    /// | COW route | 5 | unrouted arch; no fault; non-write access; unattributable class; not this route's class |
-    /// | demand route | 5 | unrouted arch; no fault; execute access; unattributable class; not this route's class |
+    /// | terminal route | 4 | unrouted arch; no fault/frame; CPU out of range; end-of-order non-recovery |
+    /// | COW route | 4 | unrouted arch; no fault; non-write access; not this route's class |
+    /// | demand route | 4 | unrouted arch; no fault; execute access; not this route's class |
     /// | `settle_cow_non_private_copy` | 2 | raced re-read (early, and in the match) |
     /// | `settle_demand_stale_translation` | 1 | raced re-read |
     /// | `settle_pre_mutation` | 2 | `ContinueFamily`; the unreachable `ReenterFamilyOwner` arm |
     ///
-    /// Twenty in total. A twenty-first is a new way for a page fault to reach the broad
-    /// dispatcher, and it fails here whether or not anyone thought to write a case for it.
+    /// Seventeen in total — three fewer than U9-PAGEFAULT2 delivered, because the classifier
+    /// refusal is no longer one of them in ANY route. An eighteenth is a new way for a page
+    /// fault to reach the broad dispatcher, and it fails here whether or not anyone thought to
+    /// write a case for it.
     #[test]
     fn every_not_handled_site_is_enumerated() {
         for (marker, occurrence, expected, name) in [
+            // U9-PAGEFAULT3 §2: each route lost ONE — the classifier refusal, now settled by
+            // cause instead of handed to the broad dispatcher.
             (
                 "fn try_split_terminal_page_fault_into_frame(",
                 1usize,
-                5usize,
+                4usize,
                 "terminal route",
             ),
-            ("fn try_split_cow_page_fault_into_frame(", 1, 5, "COW route"),
+            ("fn try_split_cow_page_fault_into_frame(", 1, 4, "COW route"),
             (
                 "fn try_split_demand_page_fault_into_frame(",
                 1,
-                5,
+                4,
                 "demand route",
             ),
             ("fn settle_cow_non_private_copy(", 1, 2, "COW non-private"),
@@ -151476,16 +151829,28 @@ mod u9pagefault2_closure {
                 && r.contains("TERMINAL_FAULT_SPLIT_RACED"),
             "the terminal route must settle a recovery class that reaches it"
         );
-        // And it settles it by RETRY, never by handing it on: a `NotHandled` there would put the
-        // fault back where the two routes above already declined it.
+        // U9-PAGEFAULT3 §3: it settles through the AUTHENTICATED return, never by handing the
+        // fault on and never by an inline `Complete(Ok(()))`. A `NotHandled` would put the fault
+        // back where the two routes above already declined it; a raw `Complete(Ok(()))` would
+        // return through a frame nothing had checked.
+        // The arm is sliced from the CLASS TEST, not from the marker: the marker is an argument
+        // to the settlement owner now, so it appears after the call rather than before it.
         let raced = r
-            .split("TERMINAL_FAULT_SPLIT_RACED")
+            .split("PageFaultClass::DemandCandidate")
             .nth(1)
-            .expect("the raced arm");
-        let arm_end = raced.find("return D::NotHandled").unwrap_or(raced.len());
+            .expect("the raced arm's class test");
+        let arm_end = raced
+            .find("return D::NotHandled")
+            .expect("the arm ends at the non-recovery fall-through");
+        let arm = &raced[..arm_end];
         assert!(
-            raced[..arm_end].contains("return retry();"),
-            "a raced recovery class settles as the faulting instruction, not as a fall-through"
+            arm.contains("settle_via_entering_frame(")
+                && arm.contains("TERMINAL_FAULT_SPLIT_RACED"),
+            "a raced recovery class settles through the authenticated return, under its own marker"
+        );
+        assert!(
+            !arm.contains("D::Complete(Ok(()))"),
+            "and never through an inline return that checks nothing"
         );
     }
 
@@ -151496,14 +151861,20 @@ mod u9pagefault2_closure {
     #[test]
     fn the_four_refusals_produce_their_own_outcomes() {
         let r = body("fn try_split_terminal_page_fault_into_frame(", 1);
-        // Both settlement shapes exist and are named, so neither can silently become the other.
+        // U9-PAGEFAULT3 §3: both settlement shapes are OWNERS now, not inline closures —
+        // `settle_via_entering_frame` for every return through the frame, and
+        // `settle_fault_kernel_fatal` for every state that may not return at all.
         assert!(
-            r.contains("let retry = ||") && r.contains("let fatal = ||"),
-            "the route must name both of its settlement endings"
+            r.contains("settle_via_entering_frame(") && r.contains("settle_fault_kernel_fatal("),
+            "the route must reach both settlement owners"
+        );
+        assert!(
+            !r.contains("let retry = ||"),
+            "the unauthenticated inline retry must be gone, not left beside the owner"
         );
         // The fatal is the broad emitter's OWN answer, not an invented one.
         assert!(
-            r.contains("KernelError::TaskMissing"),
+            SPLIT_SRC.contains("KernelError::TaskMissing"),
             "the fatal ending must be the broad arm's `TaskMissing`, not a new error"
         );
         assert!(
@@ -151598,20 +151969,22 @@ mod u9pagefault2_closure {
         }
     }
 
-    /// **The unattributable class is a DECLARED residual, not an accident.**
+    /// **The unattributable class has no routed row — and since U9-PAGEFAULT3 §2 it is no
+    /// longer a residual either.**
     ///
-    /// `KernelOrAbsentTask` is the one recognized-fault coordinate this family still hands to the
-    /// broad dispatcher, and it is the only `NotHandled` in the three routes that carries a
-    /// classified fault. That is deliberate and it is visible in the matrix: it has no `Split*`
-    /// row on any port, so no recovery owner can run for it.
+    /// The absence of a `Split*` row is what keeps every RECOVERY owner away from it, and that
+    /// part is unchanged: no row, on any port, so nothing can mint a frame or replace a mapping
+    /// for a fault that cannot name a victim.
     ///
-    /// Keeping it broad is the conservative direction for the reason the classifier's own origin
-    /// test records — a supervisor-origin fault must not reach an owner that would mint a frame,
-    /// replace a mapping and resume the KERNEL at the faulting instruction. What it costs is
-    /// stated rather than hidden: these faults still reach the broad arm, which does not test
-    /// privilege origin at all and terminates whichever user task is current.
+    /// What changed is where it goes instead. U9-PAGEFAULT2 handed it to the broad dispatcher
+    /// and recorded the cost — the broad arm performs no origin test, so it offered a KERNEL
+    /// fault to its own COW and demand handlers and then terminated whichever user task was
+    /// current. §2 settles it pre-lock instead, at its derived error boundary, so that cost is
+    /// gone rather than documented.
+    ///
+    /// This case keeps the matrix half of the claim, which is the half that still does work.
     #[test]
-    fn the_unattributable_class_stays_broad_by_declaration() {
+    fn the_unattributable_class_has_no_routed_row() {
         // No `Split*` row for it, on any port.
         let matrix = FAULT_SRC
             .split("pub(crate) fn page_fault_route_for(")
@@ -151635,6 +152008,12 @@ mod u9pagefault2_closure {
             SPLIT_SRC.contains("PageFaultClass::KernelOrAbsentTask(cause)")
                 && SPLIT_SRC.contains("PF1_UNATTRIBUTABLE_FAULT"),
             "the classifier must name the cause and refuse to produce facts"
+        );
+        // U9-PAGEFAULT3 §2: and the named cause is now SETTLED rather than handed on. The
+        // marker says so on its own line, so a reader of the log can tell the two eras apart.
+        assert!(
+            SPLIT_SRC.contains("PF1_UNATTRIBUTABLE_FAULT cpu={} route={} cause={} addr=0x{:x} access={:?} settled=1"),
+            "an unattributable fault must record that it was settled, not merely observed"
         );
         // The origin test comes FIRST, before any fact could tempt a recovery owner.
         let classify = FAULT_SRC
