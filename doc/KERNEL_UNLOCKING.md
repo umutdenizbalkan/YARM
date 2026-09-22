@@ -20652,6 +20652,22 @@ across the fault.
 | `doc_fragmentation_guard` | 7/7 |
 | `yarm-ipc-abi` | 211 pass |
 | freestanding builds | x86_64, AArch64, RISC-V — all clean |
+| `yarm-ipc-abi` | 211 pass |
+
+### 5. The remaining barriers, named
+
+1. **RISC-V has no device-interrupt identity.** `decode_trap_context` yields
+   `ExternalInterrupt(stval as u16)` and `stval` is 0 for interrupts. Until `PLIC_CLAIM` is read
+   in the vector entry, this port has nothing to route and the split route refuses, measurably.
+   Closing it is controller bring-up.
+2. **No port has a production IRQ producer.** Every default-profile boot takes zero device
+   interrupts. The delivery evidence is therefore production-owner and injected work, labelled as
+   such in §4; it is not hardware-controller qualification, and no zero-arrival count is offered
+   as closure.
+3. **AArch64 does not issue the demand witness on its default profile** (its supervisor is not
+   started there), so that port's demand row is "not issued", not "passed".
+4. **`ap-cross-cpu-reply` is red, at the base too** — an AP TLB-shootdown liveness defect,
+   outside this mission's scope.
 
 The established witnesses are preserved: the AArch64 terminal-fault chain (U9-FT4) passes
 unchanged after the §1e restructure, the AP scope suites pass (25 + 16), every RISC-V scope suite
@@ -21187,6 +21203,21 @@ IRQ identity to route until `PLIC_CLAIM` is read in its vector entry.
 | terminal FETCH witness | chain complete, broad=0 | chain complete, broad=0 | chain complete, broad=0 |
 | demand witness (issuing profiles) | `rounds=8 recovered=8 regs_ok=8 result=ok` | not issued on this profile | `rounds=8 recovered=8 regs_ok=8 result=ok` |
 | timer idle return | `rounds=24 advances=12 parks=1 result=ok` | — | — |
+| IPC recv/reply/transfer oracle | passed | — | — |
+| IPC call reply-direct live seal | `classes=2 live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok` | — | — |
+| AP generic return | `fresh_entries=1 duplicate_entries=0 wrong_cpu_entries=0 result=ok` | — | — |
+| AP saved return | `saved_dispatches=1 continuations=1 duplicate_continuations=0 result=ok` | — | — |
+| AP recv-v2 block | `real_syscall=1 blocked_commits=1 premature_wakes=0 result=ok` | — | — |
+| AP cross-CPU reply | **fail — `timeout_before_completion`, and it fails identically at the base** | — | — |
+
+**The AP cross-CPU reply failure is pre-existing and is reported as a failure, not explained
+away.** Measured both ways: `qemu-x86_64-ap-cross-cpu-reply-smoke` fails at `fbfc2eaa` and fails
+at the base `fc582912` with the byte-identical shape — the cross-CPU reply itself succeeds
+(`IPCREPLY_DIRECT_SMP_REPLY_OK ... reply_copies=1 caller_wakes=1 one_shot=1 result=ok`, once, on
+both trees), and the boot then stalls on an x86 TLB-shootdown acknowledgement storm
+(`X86_TLB_REMOTE_ACK_TIMEOUT`, 8 occurrences on both trees) until the 300s ceiling. It is an AP
+liveness defect in the TLB shootdown path, not in IRQ delivery, and this mission neither caused
+it nor fixed it. The other three AP suites pass.
 
 **Zero IRQ arrivals is the honest count, and it proves nothing about delivery.** What it does
 establish is that this change is inert on every default profile: no port's ordinary boot takes a
@@ -21209,7 +21240,24 @@ hardware bring-up and is deliberately not attempted here.
 |---|---|
 | hosted lib, `--test-threads=1` | **5760 pass / 0 fail** / 2 ignored |
 | every other integration target | all pass |
+| AP QEMU suites | 3 of 4 pass; `ap-cross-cpu-reply` fails identically at the base (see above) |
 | `server_dies_runner_scope` | **8 pass / 2 fail** — the exact carve-out, the named pair |
 | `broad_lock_census_guard` | 7/7 |
 | `doc_fragmentation_guard` | 7/7 |
 | freestanding builds | x86_64, AArch64, RISC-V — all clean |
+| `yarm-ipc-abi` | 211 pass |
+
+### 5. The remaining barriers, named
+
+1. **RISC-V has no device-interrupt identity.** `decode_trap_context` yields
+   `ExternalInterrupt(stval as u16)` and `stval` is 0 for interrupts. Until `PLIC_CLAIM` is read
+   in the vector entry, this port has nothing to route and the split route refuses, measurably.
+   Closing it is controller bring-up.
+2. **No port has a production IRQ producer.** Every default-profile boot takes zero device
+   interrupts. The delivery evidence is therefore production-owner and injected work, labelled as
+   such in §4; it is not hardware-controller qualification, and no zero-arrival count is offered
+   as closure.
+3. **AArch64 does not issue the demand witness on its default profile** (its supervisor is not
+   started there), so that port's demand row is "not issued", not "passed".
+4. **`ap-cross-cpu-reply` is red, at the base too** — an AP TLB-shootdown liveness defect,
+   outside this mission's scope.
