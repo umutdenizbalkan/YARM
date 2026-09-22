@@ -187465,3 +187465,318 @@ mod u9irq1_injected_evidence {
         );
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// U9-IRQ-FINAL §4 — the claim carried through delivery to completion, at the bridge owner.
+//
+// **INJECTED evidence, and the label is a limitation.** The claim is synthetic and the
+// controller is a model. What these cases do establish is the part that was previously
+// unprovable on any port: that a source which is in flight is completed exactly once, against
+// its own context, on every ending the delivery policy can produce — an unbound line, a delivery
+// error, a successful wake, and a route that declines.
+//
+// What they do NOT establish: that a controller raises a line (no port enables a source), that
+// the MMIO addresses are right, or that an asynchronous architectural entry resumes the
+// interrupted context.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+mod u9irqfinal_bridge_completion {
+    use super::*;
+    use crate::arch::external_irq_claim::model;
+    use crate::arch::hal_adapters::InterruptCompletion;
+    use crate::kernel::boot::{EndpointWaiterRecord, ReceiverWaiterIdentity};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall_split::settle_external_interrupt_at_bridge;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const BASE: usize = 0x0C00_0000;
+    const CTX: usize = 1;
+    const LINE: u16 = 31;
+    const RECEIVER: u64 = 4600;
+
+    /// Arms the hosted bridge admission and resets the controller model, restoring both on the
+    /// way out — including on a panicking assertion. Either left set would change how every
+    /// other test in this single-threaded suite behaves.
+    struct Injected;
+
+    impl Injected {
+        fn arm() -> Self {
+            model::reset();
+            crate::kernel::boot::set_irq1_hosted_bridge_injection(true);
+            Self
+        }
+        fn disarmed() -> Self {
+            model::reset();
+            crate::kernel::boot::set_irq1_hosted_bridge_injection(false);
+            Self
+        }
+    }
+
+    impl Drop for Injected {
+        fn drop(&mut self) {
+            crate::kernel::boot::set_irq1_hosted_bridge_injection(false);
+            model::reset();
+        }
+    }
+
+    fn claim_token(source: u32) -> InterruptCompletion {
+        InterruptCompletion::PlicClaim {
+            source,
+            base: BASE,
+            context_index: CTX,
+        }
+    }
+
+    fn kernel_with_route() -> (SharedKernel, usize) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let idx = kernel.with(|state| {
+            state
+                .register_task_with_class(RECEIVER, TaskClass::App)
+                .expect("receiver");
+            let (idx, notif_cap, _recv) = state.create_notification(4).expect("notification");
+            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+            idx
+        });
+        (kernel, idx)
+    }
+
+    /// **A claimed source with a bound route: delivered, then completed exactly once, against
+    /// the context the claim came from.**
+    #[test]
+    fn a_delivered_claim_is_completed_once_against_its_own_context() {
+        let (kernel, _idx) = kernel_with_route();
+        let _injected = Injected::arm();
+
+        let settled = settle_external_interrupt_at_bridge(
+            &kernel,
+            CpuId(0),
+            u32::from(LINE),
+            claim_token(u32::from(LINE)),
+        );
+        assert_eq!(settled, Some(Ok(())), "a routed claim settles the trap");
+        assert_eq!(model::completions(), 1, "and is completed exactly once");
+        assert_eq!(
+            model::last_completion(),
+            (u32::from(LINE), BASE, CTX),
+            "with its own source and its own controller context"
+        );
+    }
+
+    /// **A claimed source on an UNBOUND line is still completed.** No route means nothing is
+    /// delivered — and the controller is still waiting for this source to come back.
+    #[test]
+    fn an_unbound_line_delivers_nothing_and_is_completed_anyway() {
+        let (kernel, _idx) = kernel_with_route();
+        let _injected = Injected::arm();
+
+        let unbound = u32::from(LINE) + 5;
+        let settled =
+            settle_external_interrupt_at_bridge(&kernel, CpuId(0), unbound, claim_token(unbound));
+        assert_eq!(
+            settled,
+            Some(Ok(())),
+            "no route is a settled, benign ending — not a fall-through"
+        );
+        assert_eq!(model::completions(), 1, "claimed work is completed");
+        assert_eq!(model::last_completion(), (unbound, BASE, CTX));
+    }
+
+    /// **A delivery ERROR is completed too, and the error still reaches the bridge.** Dropping
+    /// the completion on an error would wedge the controller; swallowing the error would hide a
+    /// full notification queue.
+    #[test]
+    fn a_delivery_error_is_completed_and_still_propagates() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            let (_idx, notif_cap, _recv) = state.create_notification(1).expect("depth-1");
+            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+        });
+        let _injected = Injected::arm();
+
+        let first = settle_external_interrupt_at_bridge(
+            &kernel,
+            CpuId(0),
+            u32::from(LINE),
+            claim_token(u32::from(LINE)),
+        );
+        assert_eq!(first, Some(Ok(())), "the queue takes one");
+        assert_eq!(model::completions(), 1);
+
+        let overflow = settle_external_interrupt_at_bridge(
+            &kernel,
+            CpuId(0),
+            u32::from(LINE),
+            claim_token(u32::from(LINE)),
+        );
+        assert!(
+            matches!(overflow, Some(Err(_))),
+            "the error reaches the bridge rather than being swallowed: {overflow:?}"
+        );
+        assert_eq!(
+            model::completions(),
+            2,
+            "and the failed delivery's claim is completed too — it is still in flight"
+        );
+        assert_eq!(model::last_completion(), (u32::from(LINE), BASE, CTX));
+    }
+
+    /// **A source too wide to be a route line is refused, not truncated — and completed.**
+    ///
+    /// `0x1_0000 + LINE` truncates to `LINE`. If the narrowing were a cast, this would deliver
+    /// to a real route and complete a source the controller never handed over.
+    #[test]
+    fn an_identifier_too_wide_to_route_is_not_truncated_into_a_real_line() {
+        let (kernel, idx) = kernel_with_route();
+        let _injected = Injected::arm();
+
+        let wide = 0x1_0000u32 + u32::from(LINE);
+        let settled =
+            settle_external_interrupt_at_bridge(&kernel, CpuId(0), wide, claim_token(wide));
+        assert_eq!(settled, Some(Ok(())), "it settles");
+        assert_eq!(model::completions(), 1, "and is completed");
+        assert_eq!(
+            model::last_completion(),
+            (wide, BASE, CTX),
+            "with the source the controller actually gave, not a truncation of it"
+        );
+        // And the real line's notification was NOT signalled.
+        let (_idx2, _cap, recv) = kernel.with(|state| {
+            let _ = idx;
+            state.create_notification(2).expect("probe")
+        });
+        let _ = recv;
+        assert_eq!(
+            kernel.with(|state| state.with_ipc_state(|ipc| ipc.notification_waiters[idx])),
+            None,
+            "nothing was delivered to the line the truncation would have hit"
+        );
+    }
+
+    /// **A route that DECLINES must not leak the claim.** With the hosted admission disarmed the
+    /// delivery policy declines, so the trap is not settled — but a source is in flight, and the
+    /// controller must get it back.
+    #[test]
+    fn a_declined_route_still_returns_a_claimed_source_to_the_controller() {
+        let (kernel, _idx) = kernel_with_route();
+        let _injected = Injected::disarmed();
+
+        let settled = settle_external_interrupt_at_bridge(
+            &kernel,
+            CpuId(0),
+            u32::from(LINE),
+            claim_token(u32::from(LINE)),
+        );
+        assert_eq!(
+            settled, None,
+            "the route declined, so the trap is not settled here"
+        );
+        assert_eq!(
+            model::completions(),
+            1,
+            "but the claim is not leaked — a leaked claim wedges that PLIC context forever"
+        );
+        assert_eq!(model::last_completion(), (u32::from(LINE), BASE, CTX));
+    }
+
+    /// **A decline with nothing in flight completes nothing.** This is the x86_64/AArch64 shape,
+    /// and it is the half that keeps an interrupt from being completed twice: at that point the
+    /// broad arm still owns it.
+    #[test]
+    fn a_decline_with_nothing_in_flight_completes_nothing() {
+        let (kernel, _idx) = kernel_with_route();
+        let _injected = Injected::disarmed();
+
+        let settled = settle_external_interrupt_at_bridge(
+            &kernel,
+            CpuId(0),
+            u32::from(LINE),
+            InterruptCompletion::ArchSingleStep { line: LINE },
+        );
+        assert_eq!(settled, None);
+        assert_eq!(
+            model::completions(),
+            0,
+            "the single-step seam has nothing in flight, so a decline writes nothing"
+        );
+        assert!(
+            !InterruptCompletion::ArchSingleStep { line: LINE }.is_in_flight(),
+            "and the token says so"
+        );
+        assert!(claim_token(1).is_in_flight(), "while a claim does");
+    }
+
+    /// **A claimed source wakes a real blocked notification waiter, and is completed once.**
+    /// The whole chain — claim, route, notification, task transition, scheduler enqueue,
+    /// completion — in one case.
+    #[test]
+    fn a_claimed_source_wakes_a_blocked_waiter_and_is_completed_once() {
+        let (kernel, idx) = kernel_with_route();
+        kernel.with(|state| {
+            let generation = state
+                .bump_blocked_recv_generation(RECEIVER)
+                .expect("receiver");
+            state.set_task_status_for_test(
+                RECEIVER,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(0))),
+            );
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[idx] = Some(EndpointWaiterRecord::new(
+                    ReceiverWaiterIdentity::new(ThreadId(RECEIVER), Asid(0)),
+                    generation,
+                ));
+            });
+        });
+        let _injected = Injected::arm();
+
+        let settled = settle_external_interrupt_at_bridge(
+            &kernel,
+            CpuId(0),
+            u32::from(LINE),
+            claim_token(u32::from(LINE)),
+        );
+        assert_eq!(settled, Some(Ok(())));
+        assert_eq!(
+            kernel.with(|state| state.task_status(RECEIVER)),
+            Some(TaskStatus::Runnable),
+            "the waiter was proven and woken"
+        );
+        assert_eq!(
+            kernel.entering_frame_authority_split_read(CpuId(0), RECEIVER, Asid(0)),
+            crate::kernel::task_transition::EnteringFrameAuthority::Forfeited(
+                crate::kernel::task_transition::FrameForfeitReason::QueuedForDispatch
+            ),
+            "and queued for dispatch"
+        );
+        assert_eq!(
+            model::completions(),
+            1,
+            "and the source went back to the controller exactly once"
+        );
+        assert_eq!(model::last_completion(), (u32::from(LINE), BASE, CTX));
+    }
+
+    /// **Mutation guard — a duplicate completion.** Two arrivals are two claims and two
+    /// completions; one arrival is never two.
+    #[test]
+    fn one_arrival_is_one_completion() {
+        let (kernel, _idx) = kernel_with_route();
+        let _injected = Injected::arm();
+
+        for expected in 1..=3usize {
+            let settled = settle_external_interrupt_at_bridge(
+                &kernel,
+                CpuId(0),
+                u32::from(LINE),
+                claim_token(u32::from(LINE)),
+            );
+            assert_eq!(settled, Some(Ok(())));
+            assert_eq!(
+                model::completions(),
+                expected,
+                "arrival {expected} must add exactly one completion"
+            );
+        }
+    }
+}

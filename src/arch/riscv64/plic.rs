@@ -41,6 +41,9 @@ pub const QEMU_VIRT_VIRTIO_MMIO_LAST_SOURCE_ID: u16 = 8;
 /// check in `init_plic_after_idle_safe_point` and `write_plic_threshold`.
 const PLIC_CONTEXT_BASE_OFFSET: usize = 0x0020_0000;
 const PLIC_CONTEXT_STRIDE: usize = 0x1000;
+/// The claim/complete register sits one word into a context's region. Kept beside the other two
+/// offsets so the readiness derivation below names the SAME address the claim path reads.
+const PLIC_CLAIM_COMPLETE_REGISTER_OFFSET: usize = 0x4;
 
 static PLIC_INIT_FIRED: AtomicBool = AtomicBool::new(false);
 static PLIC_DISCOVERED_SOURCES: AtomicUsize = AtomicUsize::new(0);
@@ -101,6 +104,30 @@ pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
     // claim/complete plumbing in `super::irq`. This is a write to the
     // module-local atomics only; no MMIO is performed.
     irq::configure_plic_from_platform_layout();
+
+    // U9-IRQ-FINAL §1 — report, on the real boot, what the claim owner would answer.
+    //
+    // This is a pure DERIVATION: it reads no MMIO. It records whether the claim/complete
+    // register for this context is reachable under the address space a trap would be taken in,
+    // which is the fact the claim path refuses on. Emitting it here is what turns "no claim can
+    // be read on this platform" from a comment into a measured line on every RISC-V boot.
+    let claim_addr = base
+        + PLIC_CONTEXT_BASE_OFFSET
+        + (context * PLIC_CONTEXT_STRIDE)
+        + PLIC_CLAIM_COMPLETE_REGISTER_OFFSET;
+    let claim_reachable =
+        addr_range_covered_by_kernel_shared_mapping(claim_addr, core::mem::size_of::<u32>());
+    emit_marker(format_args!(
+        "RISCV_EXTIRQ_CLAIM_READINESS context={} addr=0x{:x} configured=1 reachable={} reason={}",
+        context,
+        claim_addr,
+        claim_reachable as u8,
+        if claim_reachable {
+            "claimable"
+        } else {
+            "mmio_unreachable_under_entering_satp"
+        }
+    ));
 
     let threshold_addr = base + PLIC_CONTEXT_BASE_OFFSET + (context * PLIC_CONTEXT_STRIDE);
     if addr_range_covered_by_kernel_shared_mapping(threshold_addr, core::mem::size_of::<u32>()) {
