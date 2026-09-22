@@ -20671,3 +20671,66 @@ not one it permits. The continue was an optional behaviour change resting on a c
 hold, so it was dropped rather than kept — every `NotRunning` verdict is fail-closed, and the
 verdict is now diagnostic: it names which of six states the CPU was in so a fatal report says
 that instead of "task missing".
+
+---
+
+# U9-PAGEFAULT2 — closing the remaining PageFault fall-throughs
+
+Base: `fedd4ce0`.
+
+## §1 — the source-coordinate table, recomputed
+
+### First, the reconciliation PAGEFAULT1 owed
+
+PAGEFAULT1 reported "12 residuals, 8 closed, 6 remaining". **Those are BRANCH counts, and they
+were reported as if they were outcome counts.** A single `return D::NotHandled` can carry one
+outcome or five. Recomputed from `src/kernel/syscall_split.rs` at `fedd4ce0` — 26 `NotHandled` /
+`None` exits across six functions — the two counts separate like this:
+
+| branch | guard | outcomes it carries |
+|---|---|---|
+| terminal 352 | policy read refused | **3** — `NoCurrentTask`, `NotCurrentTask`, `TaskNotFound` |
+| terminal 391 | admission not eligible | **2** — `WaiterPresent`, `BufferFull` |
+| terminal 410 | queue-advance admission refused | **4** — `OutgoingIdentityStale`, `NoTrapDrainer`, `MultiCpu`, `CpuNotAuthoritative` |
+| terminal 420 | deferral unavailable | **1** |
+| terminal 481 | commit not `Buffered` | **4** — `RefusedWaiterArrived`, `RefusedBufferFull`, `RefusedEndpointStale`, `RefusedMessageBuild` |
+| COW 824 | `may_fall_back_to_broad()` | **4** — identity changed, mapping changed, no cnode, allocation |
+| demand 1018 | `may_fall_back_to_broad()` | **5** — identity changed, mapping present, not demand region, no cnode, allocation |
+| COW-nonpriv 603 | `Raced` | **1** |
+| demand-stale 915 | `Raced` | **1** |
+| classify 242 | unattributable / seam refusal | **4** — supervisor origin, no current task, no address space, stale identity |
+
+**6 residual branches carry 29 residual outcomes.** The headline figure was a tenth of the real
+population, and the three architecture-gate branches that PAGEFAULT1 closed are now dead code on
+supported ports rather than residuals — so the branch count flattered the closure twice over.
+
+### Second, the justification that does not hold
+
+PAGEFAULT1 §2d argued the four pre-mutation refusals were acceptable because "the broad arm
+re-derives the same facts under its own lock and reaches the same answer." **That is a description
+of the dependency, not a defence of it**, and its safety premise is false besides: the broad lock
+is a `SpinLock<KernelState>`, and every split seam takes the rank-ordered subsystem lock *inside*
+that state directly. A broad-lock holder therefore does not exclude a concurrent split writer at
+all. "Fall back and it will be re-derived" says only that the outcome is currently correct; it
+says nothing about the outcome being *ours*, which is the whole point of the family boundary.
+
+### The four pre-mutation refusals, precisely
+
+| refusal | producer | mutation state | canonical outcome | settlement owner |
+|---|---|---|---|---|
+| policy read | `read_terminal_fault_policy_shared` — rank 1 current, rank 2 `{asid,status,override}`, rank 8 default policy | **none** | the victim is not the incarnation we classified | re-classify within the family; if still absent, `classify_for_split`'s unattributable path |
+| queue-advance admission | `queue_advance_admit_split(cpu, ExactTokenResume)` with no authority | **none** | this CPU may not perform a queue advance right now | report still publishes; the fault settles without an advance |
+| deferral reservation | `futex_wait_dispatch_try_defer(cpu_idx, tid)` — one per-CPU cell | **none** | another class already owns this CPU's deferral | same — publish, settle without an advance |
+| commit revalidation | `commit_buffered_fault_report_shared` under one rank-3 acquisition | **none** (raised before the enqueue) | a waiter arrived, the buffer filled, the endpoint went stale, or the message would not build | each is a *report* outcome the broad emitter also produces — see §2 |
+
+### Report admission: the two endings PAGEFAULT1 declined
+
+| ending | broad emitter's actual behaviour | why PAGEFAULT1 declined | what §2 does |
+|---|---|---|---|
+| `WaiterPresent` | `complete_blocked_recv_for_waiter` → clear receiver slot → `apply_split_receiver_wake_plan` | "a different publication mechanism, receive-family work" | compose it — **the off-lock owners already exist**: `sr_claim_endpoint_waiter_split`, `plan_blocked_waiter_plain_delivery`, `copy_to_user_split`, `complete_blocked_waiter_delivery_split` |
+| `BufferFull` | `ENQUEUE_BEGIN` → `send` fails → `ENQUEUE_FAIL` + `REPORT_FAIL` → **emitter returns, and the task is still terminated** | "discovered inside an enqueue this route never makes" | stop predicting: let the commit owner *attempt* it and report the canonical failure |
+
+The second row's last column is the important one. The full-buffer outcome is not "reporting must
+succeed or we fall back" — the broad arm's faulted task **is terminated anyway**, with the report
+lost and two markers recording that. Preserving that is preserving a real policy, not inventing
+one.
