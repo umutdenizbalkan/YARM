@@ -150362,9 +150362,14 @@ mod u9ft4_route {
             "TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred",
             "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid=1 cpu=0",
             "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=terminal_fault_committed",
-            "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=2",
-            "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid=2 asid=2",
-            "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid=2",
+            // U9-PAGEFAULT2 §4: the replacement's TID is DERIVED from the log, not written
+            // here. The literal `2` was measuring the boot clock — which task sits at the
+            // run-queue head when the fault lands depends on how many timer ticks elapsed — and
+            // it broke on RISC-V for exactly that reason when init grew by ~300 bytes. What the
+            // cell asserts now is stricter, so the guard checks THAT instead.
+            "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=${u9ft4_replacement}",
+            "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid=${u9ft4_replacement} asid=${u9ft4_replacement}",
+            "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid=${u9ft4_replacement}",
             "PAGE_FAULT_ENTRY tid=18446744073709551615",
         ] {
             assert!(
@@ -150372,6 +150377,18 @@ mod u9ft4_route {
                 "the AArch64 smoke must assert `{required}`"
             );
         }
+        // And the derivation is REAL: the replacement is extracted from the log, and the one
+        // outcome that would mean the drain resumed the faulting PC is refused by name. A
+        // parameter that was never bound would satisfy the `contains` checks above.
+        assert!(
+            ARM_SMOKE.contains("u9ft4_replacement=\"$(printf"),
+            "the replacement must be extracted from the log, not left unbound"
+        );
+        assert!(
+            ARM_SMOKE
+                .contains("the drain selected the FAULTED task (tid 1) as its own replacement"),
+            "and selecting the faulted task as its own replacement must be an error"
+        );
         assert!(ARM_SMOKE.contains("u9ft4_require_one"));
         assert!(ARM_SMOKE.contains("u9ft4_require_zero"));
     }

@@ -20734,3 +20734,95 @@ The second row's last column is the important one. The full-buffer outcome is no
 succeed or we fall back" — the broad arm's faulted task **is terminated anyway**, with the report
 lost and two markers recording that. Preserving that is preserving a real policy, not inventing
 one.
+
+## U9-PAGEFAULT2 §2/§3/§4 — what was closed, and what remains
+
+### §2 — one total report-delivery owner
+
+`SharedKernel::deliver_fault_report_split` replaces the route's single
+`commit_buffered_fault_report_shared` call. It has three endings and no decline:
+
+| ending | owner composed | markers |
+|---|---|---|
+| `DeliveredToWaiter` | `produce_blocked_waiter_plain_delivery_split` — the receive family's own off-lock producer | `BLOCKED_WAITER_FOUND`, then the drain's copy/wake |
+| `Buffered` | `commit_buffered_fault_report_shared`, unchanged | `ENQUEUE_BEGIN` / `QUEUE_STATE_AFTER` / `ENQUEUE_OK` |
+| `Failed(NoRoute \| EndpointStale \| BufferFull \| MessageBuild \| WaiterDelivery)` | — | the emitter's own failure markers |
+
+The waiter arm is bounded to **one** retry, on the single race that can legitimately flip the
+decision: `RefusedWaiterArrived` from the commit means a waiter appeared under the commit's own
+acquisition, so the loop goes back to serve it once and then reports `WaiterDelivery` rather than
+spinning.
+
+PAGEFAULT1's stated reason for declining the waiter ending — "a different publication MECHANISM,
+receive-family work" — was true about the mechanism and false as a reason. The receive family
+already exposes that work off-lock, and the fault route now *uses* that owner rather than
+reproducing it. `u9rx_blocked_recv::arm_a_fault_waiter_delivery_reuses_the_receive_producer`
+records the correction rather than deleting the case.
+
+### §3 — the four refusals, settled
+
+| refusal | settlement | why it is the canonical one |
+|---|---|---|
+| policy `NotCurrentTask` | retry the instruction | the broad arm does not ask this question — it re-reads `current_tid()` and would report THIS fault against a DIFFERENT task |
+| policy `NoCurrentTask` / `TaskNotFound` | `Complete(Err(TaskMissing))` | byte-for-byte where `fault_current_task_with_fault` gives up, carried out by the same `?` and turned into the same halt by the same architecture entry |
+| queue-advance admission | migrated to `queue_advance_admit_with_authority_split` | the drain already authenticates on the trap authority and nothing else; the ambient form's `MultiCpu` refused **every terminal fault on every SMP boot** on behalf of a consumer that had stopped asking |
+| deferral reservation | retry the instruction | ordinary contention: an advance is already owed and only the drain can clear it. Not a fatal, and not an in-route spin |
+| commit revalidation | unchanged — fail-closed after publication | already settled by PAGEFAULT1 |
+
+Two further closures fell out of the same derivation:
+
+* **the end of the route order.** The terminal route is last, so a recovery class reaching it
+  means COW or demand raced in this trap. That settles as the faulting instruction, which closes
+  every `ContinueFamily` and `Raced` continuation the other two routes produce. It terminates
+  because each repetition requires another competing commit, and it is not a loop — control
+  leaves the kernel between attempts.
+* **the already-writable race.** `RefusedAlreadyWritable` settled as a bare retry, which diverged
+  from the broad arm: `try_handle_cow_fault` calls `clear_cow_page` BEFORE returning `Ok(true)`,
+  and a bare retry leaves the stale mark a later `fork` reads. It now re-enters the family's own
+  non-private-copy owner — the same owner the pre-transaction screen calls — exactly once.
+
+### §4 — source closure, exercised outcomes and census, separately
+
+**Source closure.** `u9pagefault2_closure` walks the family's control flow rather than asserting
+a matrix row: twenty `NotHandled` sites across six production bodies, pinned by exact count;
+the end of the route order settled; each refusal returning its own outcome; both bridges carrying
+what the routes return. Mutation-tested three ways (a new escape after the policy read; the
+bridge reverted to discarding the terminal result; the raced arm reverted to `NotHandled`), each
+caught by the intended guard.
+
+**Exercised outcomes.** `u9pagefault2_settlement` drives the production owners on a real
+`SharedKernel` and reads the post-state back — report count from the endpoint's own queued
+length, wake count, exact task identity and status. Every fixture builds the interleaving it
+names. The admission differential runs both admission forms against the same two-CPU kernel one
+line apart, and they disagree exactly where the migration says they should.
+
+Live, on real boots: the buffered ending on all three ports; the **waiter-delivery** ending on
+x86_64 under its own oracle, with `waiters=1` before publication, the waiter found once, the
+report delivered and **nothing buffered**; demand ×8 and the RISC-V COW ×6 preserved;
+`PF1_BROAD_ARRIVAL` **zero** on every x86_64 cell — measured on boots that produce nine real
+faults each, not on boots that produce none.
+
+**Census.** `AUDITED_WITH_CPU_TOTAL = 2`, `AUDITED_WITH_BROAD_TOTAL = 0`,
+`AUDITED_STATE_LOCK_TOTAL = 3`; `tests/broad_lock_census_guard.rs` 7/7. The
+`server_dies_runner_scope` carve-out is exactly 8 pass / 2 fail, unchanged.
+
+### What remains a residual, and why
+
+`PageFaultClass::KernelOrAbsentTask` — supervisor-origin, no current task, no address space —
+has **no `Split*` row on any port** and still reaches the broad dispatcher. That is deliberate
+and it is visible in the matrix rather than hidden in a route:
+
+* **supervisor origin.** The classifier's origin test runs FIRST, before any fact a recovery
+  owner would read, precisely so a kernel-mode fault cannot reach an owner that would mint a
+  frame, install a mapping and resume the KERNEL at the faulting instruction. What that costs is
+  stated rather than hidden: these faults reach the broad arm, which performs no origin test at
+  all and terminates whichever user task is current.
+* **no current task / no address space.** Without a `{tid, asid}` coordinate no facts can be
+  built, so no owner can revalidate and no report can name a victim.
+
+`u9pagefault2_closure::the_unattributable_class_stays_broad_by_declaration` pins all of it: no
+routed row, the classifier still refusing to produce facts, and the origin test still ahead of
+every fact read.
+
+The other residuals are not recognized faults: an architecture with no matrix row, a bridge call
+with no `FaultInfo`, and a CPU index outside `MAX_CPUS`.
