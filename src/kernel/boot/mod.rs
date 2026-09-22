@@ -3624,6 +3624,41 @@ pub fn terminal_fault_waiter_oracle_enabled() -> bool {
 pub const TERMINAL_FAULT_WAITER_ORACLE_SELECTOR: u64 =
     yarm_ipc_abi::terminal_fault_oracle_abi::TERMINAL_FAULT_WAITER_SELECTOR as u64;
 
+/// U9-IRQ-UNKNOWN1 §4 — **the hosted bridge-injection admission, default-off.**
+///
+/// No production IRQ producer exists on any port: RISC-V enumerates PLIC sources and
+/// deliberately enables none, and neither of the other two binds a device line. So the split
+/// route's *bridge body* — dispatch, then acknowledge under a masked window — has no arrival to
+/// exercise it, and "zero IRQ arrivals" is not evidence of anything.
+///
+/// This bit is what lets a hosted test drive that body: armed, the route stops declining on a
+/// hosted build and runs the same delivery, acknowledgement and encoding production runs.
+/// **Evidence produced this way is INJECTED evidence, not hardware-controller qualification** —
+/// the hardware claim, the controller's completion against a real claim, and the architectural
+/// return from a genuine asynchronous entry are all outside what it can show.
+///
+/// Two properties keep it narrow. It is compiled only into `test`/`hosted-dev` builds, so
+/// production has no such bit to set; and it is read behind `cfg!(feature = "hosted-dev")`, so
+/// an unarmed hosted build behaves exactly as it did before this knob existed.
+#[cfg(any(test, feature = "hosted-dev"))]
+pub(crate) static IRQ1_HOSTED_BRIDGE_INJECTION: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "hosted-dev"))]
+pub(crate) fn set_irq1_hosted_bridge_injection(armed: bool) {
+    IRQ1_HOSTED_BRIDGE_INJECTION.store(armed, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(any(test, feature = "hosted-dev"))]
+pub(crate) fn irq1_hosted_bridge_injection_armed() -> bool {
+    IRQ1_HOSTED_BRIDGE_INJECTION.load(core::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(not(any(test, feature = "hosted-dev")))]
+pub(crate) fn irq1_hosted_bridge_injection_armed() -> bool {
+    false
+}
+
 /// Stage 196A: default-off RISC-V post-lock-drain FOUNDATION oracle selector.
 /// When enabled, the RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`)
 /// publishes a one-shot post-work token during its broad-lock (`with_cpu`) phase

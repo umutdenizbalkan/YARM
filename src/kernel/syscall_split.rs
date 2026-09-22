@@ -1645,18 +1645,24 @@ pub(crate) fn try_split_cow_page_fault_dispatch(
 /// refused to the unchanged broad arm, which behaves exactly as it does now, and the barrier is
 /// named rather than hidden: RISC-V needs `PLIC_CLAIM` read in its vector entry before a device
 /// interrupt has an identity to route. That is controller work, not unlocking work.
-#[cfg(not(feature = "hosted-dev"))]
 fn try_split_external_interrupt_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     irq: Option<u16>,
 ) -> SplitDispatchDisposition {
-    use crate::kernel::boot::IrqDeliveryOutcome as O;
     use SplitDispatchDisposition as D;
 
     let Some(irq_line) = irq else {
         return D::NotHandled;
     };
+    // U9-IRQ-UNKNOWN1 §4 — the hosted admission. On a production build this whole test compiles
+    // out (`cfg!` is a constant `false`), so the route below is unconditional there. On a hosted
+    // build the route DECLINES unless a test has explicitly armed the injection, which is what
+    // keeps hosted behaviour identical to what it was before this route existed. Evidence
+    // gathered with it armed is INJECTED evidence; it is not hardware-controller qualification.
+    if cfg!(feature = "hosted-dev") && !crate::kernel::boot::irq1_hosted_bridge_injection_armed() {
+        return D::NotHandled;
+    }
     // The RISC-V barrier, refused explicitly rather than by omission. See the doc comment: the
     // decoded value is `stval`, which is not a controller claim.
     if cfg!(target_arch = "riscv64") {
@@ -1686,15 +1692,6 @@ fn try_split_external_interrupt_into_frame(
             crate::kernel::syscall::SyscallError::from(error),
         ))),
     }
-}
-
-#[cfg(feature = "hosted-dev")]
-fn try_split_external_interrupt_into_frame(
-    _shared: &SharedKernel,
-    _cpu: CpuId,
-    _irq: Option<u16>,
-) -> SplitDispatchDisposition {
-    SplitDispatchDisposition::NotHandled
 }
 
 /// U9-IRQ-UNKNOWN1 §2 — the bridge entry for the external-interrupt route.
@@ -1739,7 +1736,11 @@ pub(crate) fn settle_external_interrupt_at_bridge(
             Some(result)
         }
         other => {
-            crate::yarm_log!("IRQ1_UNEXPECTED_DISPOSITION cpu={} value={:?}", cpu.0, other);
+            crate::yarm_log!(
+                "IRQ1_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                cpu.0,
+                other
+            );
             debug_assert!(false, "the IRQ route yields NotHandled or Complete");
             None
         }

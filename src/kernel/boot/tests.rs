@@ -186791,3 +186791,208 @@ mod u9irq1_unknown {
         }
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// U9-IRQ-UNKNOWN1 §4 — INJECTED bridge evidence.
+//
+// **Read this heading as a limitation, not a credential.** Everything below is produced by
+// arming a narrow, default-off admission (`IRQ1_HOSTED_BRIDGE_INJECTION`) so a hosted test can
+// call the bridge's own body. It exercises the real delivery policy, the real acknowledgement
+// seam, the real `Option` encoding the bridge joins on, and the real kernel state — but the
+// arrival is synthetic.
+//
+// What it therefore does NOT establish, precisely:
+//   * that any controller ever raises a line into this kernel — **no port has a production IRQ
+//     producer**. RISC-V enumerates PLIC sources and deliberately enables none; neither other
+//     port binds a device line. Zero arrivals is the honest count.
+//   * that the acknowledgement lands correctly against a REAL claim. On this host the LAPIC is
+//     unconfigured, so `acknowledge_interrupt` returns before writing. Per-port completion
+//     semantics are derived in `u9irq1_acknowledgement` from the executed bodies, which is a
+//     different kind of evidence and is labelled as such there.
+//   * that an asynchronous architectural entry resumes the interrupted context. The bridge
+//     never touches the frame (pinned by
+//     `u9irq1_acknowledgement::the_irq_arm_never_touches_the_interrupted_frame`), but no
+//     asynchronous entry is performed here.
+//
+// This is not hardware-controller qualification, and no conclusion below should be read as one.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+mod u9irq1_injected_evidence {
+    use super::*;
+    use crate::kernel::boot::{EndpointWaiterRecord, ReceiverWaiterIdentity};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall_split::settle_external_interrupt_at_bridge;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const LINE: u16 = 27;
+    const RECEIVER: u64 = 4500;
+
+    /// Arms the injection for the duration of a case and disarms it on the way out, including on
+    /// a panicking assertion — an armed bit leaking into the rest of the single-threaded suite
+    /// would change how every other test's traps behave.
+    struct ArmedInjection;
+
+    impl ArmedInjection {
+        fn arm() -> Self {
+            crate::kernel::boot::set_irq1_hosted_bridge_injection(true);
+            Self
+        }
+    }
+
+    impl Drop for ArmedInjection {
+        fn drop(&mut self) {
+            crate::kernel::boot::set_irq1_hosted_bridge_injection(false);
+        }
+    }
+
+    fn fixture() -> (SharedKernel, usize) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let notif_idx = kernel.with(|state| {
+            state
+                .register_task_with_class(RECEIVER, TaskClass::App)
+                .expect("receiver");
+            let (idx, notif_cap, _recv) = state.create_notification(4).expect("notification");
+            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+            idx
+        });
+        (kernel, notif_idx)
+    }
+
+    /// Unarmed, the hosted route declines exactly as it did before this route existed. This is
+    /// the control case, and it is what makes every other case in this module scoped.
+    #[test]
+    fn the_injection_is_off_by_default_and_the_bridge_declines() {
+        let (kernel, _idx) = fixture();
+        assert!(
+            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE).is_none(),
+            "an unarmed hosted build must leave the interrupt to the broad arm"
+        );
+    }
+
+    /// **Injected:** the bridge body settles a routed delivery and hands back the route's own
+    /// `Ok(())`, which is what the bridge joins into `inner_result`.
+    #[test]
+    fn an_injected_arrival_settles_at_the_bridge_without_broad_fallback() {
+        let (kernel, _idx) = fixture();
+        let _armed = ArmedInjection::arm();
+        assert_eq!(
+            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE),
+            Some(Ok(())),
+            "a routed delivery settles here; `None` would send it to the broad dispatcher"
+        );
+    }
+
+    /// **Injected:** an unrouted line is still settled by this route — `NoRoute` is a recognized
+    /// ending, not a decline. §2 requires every recognized outcome to settle without broad
+    /// fallback, including this one.
+    #[test]
+    fn an_injected_unrouted_arrival_settles_rather_than_falling_back() {
+        let (kernel, _idx) = fixture();
+        let _armed = ArmedInjection::arm();
+        assert_eq!(
+            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE + 3),
+            Some(Ok(())),
+            "no route is a settled, benign ending — exactly as the broad form answers it"
+        );
+    }
+
+    /// **Injected:** a blocked notification waiter is woken through the bridge body, and the
+    /// task and scheduler post-states are the ones the production owner produces.
+    #[test]
+    fn an_injected_arrival_wakes_a_real_blocked_waiter_through_the_bridge() {
+        let (kernel, notif_idx) = fixture();
+        kernel.with(|state| {
+            let generation = state
+                .bump_blocked_recv_generation(RECEIVER)
+                .expect("receiver");
+            state.set_task_status_for_test(
+                RECEIVER,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(0))),
+            );
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[notif_idx] = Some(EndpointWaiterRecord::new(
+                    ReceiverWaiterIdentity::new(ThreadId(RECEIVER), Asid(0)),
+                    generation,
+                ));
+            });
+        });
+
+        let _armed = ArmedInjection::arm();
+        assert_eq!(
+            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            kernel.with(|state| state.task_status(RECEIVER)),
+            Some(TaskStatus::Runnable),
+            "the waiter is runnable after the bridge body ran"
+        );
+        assert_eq!(
+            kernel.entering_frame_authority_split_read(CpuId(0), RECEIVER, Asid(0)),
+            crate::kernel::task_transition::EnteringFrameAuthority::Forfeited(
+                crate::kernel::task_transition::FrameForfeitReason::QueuedForDispatch
+            ),
+            "and queued for dispatch"
+        );
+        assert_eq!(
+            kernel.with(|state| state.with_ipc_state(|ipc| ipc.notification_waiters[notif_idx])),
+            None,
+            "with its record consumed, so a repeat arrival cannot wake it twice"
+        );
+    }
+
+    /// **Injected:** a delivery error reaches the bridge as `Some(Err(..))` rather than being
+    /// swallowed. This is the case the bridge's four-cell join exists for.
+    #[test]
+    fn an_injected_delivery_error_reaches_the_bridge_as_an_error() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            let (_idx, notif_cap, _recv) = state.create_notification(1).expect("depth-1");
+            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+        });
+        let _armed = ArmedInjection::arm();
+
+        assert_eq!(
+            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE),
+            Some(Ok(())),
+            "the queue takes one"
+        );
+        let overflow = settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE);
+        assert!(
+            matches!(overflow, Some(Err(_))),
+            "and the second must arrive at the bridge as an error, not a fabricated Ok: \
+             {overflow:?}"
+        );
+    }
+
+    /// The admission is narrow by construction: production compiles the test out entirely, and
+    /// the route has no second way in.
+    #[test]
+    fn the_admission_is_compiled_out_of_production() {
+        const SPLIT: &str = include_str!("../syscall_split.rs");
+        const BOOT: &str = include_str!("mod.rs");
+        assert!(
+            SPLIT.contains(
+                "if cfg!(feature = \"hosted-dev\")\n        && !crate::kernel::boot::irq1_hosted_bridge_injection_armed()"
+            ) || SPLIT.contains("cfg!(feature = \"hosted-dev\")"),
+            "the admission must be behind a `cfg!` constant, so production has no branch at all"
+        );
+        assert_eq!(
+            SPLIT
+                .matches("irq1_hosted_bridge_injection_armed()")
+                .count(),
+            1,
+            "and exactly one place may consult it"
+        );
+        assert!(
+            BOOT.contains("#[cfg(any(test, feature = \"hosted-dev\"))]\npub(crate) static IRQ1_HOSTED_BRIDGE_INJECTION"),
+            "the bit itself must not exist in a production build"
+        );
+        assert!(
+            BOOT.contains("INJECTED evidence, not hardware-controller qualification"),
+            "and the limitation must stay recorded beside it"
+        );
+    }
+}
