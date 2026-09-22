@@ -7495,7 +7495,10 @@ impl KernelState {
             if tcb.blocked_recv_generation != record.wait_generation {
                 return Ok(false);
             }
-            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointReceive(_))) {
+            if !matches!(
+                tcb.status,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+            ) {
                 return Ok(false);
             }
             tcb.status = TaskStatus::Runnable;

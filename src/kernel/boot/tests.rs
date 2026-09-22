@@ -76689,13 +76689,31 @@ mod stage196a_riscv_shared_trap_foundation {
         let broad = RISCV_TRAP_SRC
             .find(".with_cpu(cpu, |kernel| {")
             .expect("the broad phase");
-        let settle = RISCV_TRAP_SRC
+        // U9-IRQ-UNKNOWN1 §3 re-derivation. The ORDINARY settlement still follows the broad
+        // phase, and that is what this guard has always been about. What changed is that a
+        // settle may now also appear BEFORE the broad phase — but only as half of a diverging
+        // landing's pre-retirement, where production's strict Unknown policy panics and `Drop`
+        // will never run. So the guard no longer takes "the first settle" as the wrapper's
+        // settlement (which would silently start measuring the divergence instead); it requires
+        // a settle after the broad phase, and requires every settle before it to be inside the
+        // divergence guard, paired with the retirement.
+        let settle = RISCV_TRAP_SRC[broad..]
             .find("trap_path.settle();")
-            .expect("the wrapper must settle the window");
+            .map(|i| broad + i)
+            .expect("the wrapper must settle the window after the broad phase");
         assert!(
             establish < broad && broad < settle,
             "wrapper must set the active flag true before the broad phase and clear it after"
         );
+        for (at, _) in RISCV_TRAP_SRC[..broad].match_indices("trap_path.settle();") {
+            let preceding = &RISCV_TRAP_SRC[at.saturating_sub(200)..at];
+            assert!(
+                preceding.contains("if crate::kernel::boot::strict_unknown_traps() {")
+                    && preceding.contains("trap_path.retire();"),
+                "a settle before the broad phase is only legal as a diverging landing's \
+                 pre-retirement, guarded by the policy's own divergence bit"
+            );
+        }
         // The canonical handler must NOT force-clear the flag anymore (the old force-false
         // comment/store is retired; the wrapper owns the flag lifecycle).
         assert!(
@@ -185842,6 +185860,933 @@ mod u9pf1_terminal_ports {
             assert!(
                 before.contains("init_args[5] == 0"),
                 "{port}'s fetch write must be guarded on slot 5 still being free"
+            );
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// U9-IRQ-UNKNOWN1 §4 — evidence for the IRQ delivery owner and the Unknown closure.
+//
+// What this module is, precisely: **tests of the production owners**
+// `SharedKernel::deliver_external_irq_split` and
+// `SharedKernel::wake_notification_waiter_exact_split`, plus source-derived per-port
+// acknowledgement facts. It is NOT hardware-controller qualification, and it does not claim to
+// be: see `u9irq1_injected_evidence` below, which states the barrier explicitly.
+//
+// The owner is reachable from hosted builds because it lives on `SharedKernel` and takes only
+// the three subsystem acquisitions it needs; that is the same reason it is usable from the
+// split bridges. Every case below drives the REAL owner and then compares the REAL post-state
+// of the notification object, the TCB and the scheduler — never just the returned enum.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+mod u9irq1_delivery {
+    use super::*;
+    use crate::kernel::boot::{
+        EndpointWaiterRecord, IrqDeliveryOutcome as O, KernelError, ReceiverWaiterIdentity,
+    };
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const LINE: u16 = 21;
+    const RECEIVER: u64 = 4400;
+
+    /// A booted kernel with one notification bound to `LINE` and one registered receiver task.
+    ///
+    /// The receiver is registered but NOT blocked — every case that needs a published waiter
+    /// publishes the exact record it wants to test, because the point of the repair is that the
+    /// record is what the wake answers to.
+    fn fixture() -> (SharedKernel, usize, CapId) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (notif_idx, recv_cap) = kernel.with(|state| {
+            state
+                .register_task_with_class(RECEIVER, TaskClass::App)
+                .expect("receiver");
+            let (idx, notif_cap, recv_cap) = state.create_notification(4).expect("notification");
+            state
+                .bind_irq_notification(LINE, notif_cap)
+                .expect("bind the line");
+            (idx, recv_cap)
+        });
+        (kernel, notif_idx, recv_cap)
+    }
+
+    /// Park `RECEIVER` as this notification's waiter with a record that WILL pass the proof.
+    fn publish_live_waiter(kernel: &SharedKernel, notif_idx: usize) -> EndpointWaiterRecord {
+        kernel.with(|state| {
+            let generation = state
+                .bump_blocked_recv_generation(RECEIVER)
+                .expect("the receiver exists");
+            state.set_task_status_for_test(
+                RECEIVER,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(0))),
+            );
+            let record = EndpointWaiterRecord::new(
+                ReceiverWaiterIdentity::new(ThreadId(RECEIVER), Asid(0)),
+                generation,
+            );
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[notif_idx] = Some(record);
+            });
+            record
+        })
+    }
+
+    fn waiter_slot(kernel: &SharedKernel, notif_idx: usize) -> Option<EndpointWaiterRecord> {
+        kernel.with(|state| state.with_ipc_state(|ipc| ipc.notification_waiters[notif_idx]))
+    }
+
+    /// **Pending delivery with no waiter.** The signal lands in the notification's own queue and
+    /// is there for the next receive — the outcome is `Delivered`, not `DeliveredAndWoke`, and
+    /// no task changed status.
+    #[test]
+    fn a_signal_with_no_waiter_is_delivered_and_left_pending() {
+        let (kernel, notif_idx, recv_cap) = fixture();
+        let before = kernel.with(|state| state.task_status(RECEIVER));
+
+        let outcome = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert!(
+            matches!(outcome, O::Delivered { notification_idx, .. } if notification_idx == notif_idx),
+            "an unparked signal is Delivered, not woken: {outcome:?}"
+        );
+        assert_eq!(outcome.marker(), "delivered");
+        assert_eq!(outcome.propagated_error(), None, "and it is not an error");
+
+        assert_eq!(
+            kernel.with(|state| state.task_status(RECEIVER)),
+            before,
+            "no waiter means no task transition"
+        );
+        // The post-state that matters is the NOTIFICATION's, not the enum's: the signal must be
+        // receivable.
+        assert!(
+            kernel
+                .with(|state| state.try_ipc_recv(recv_cap).expect("recv"))
+                .is_some(),
+            "the delivered signal must be pending for the next receive"
+        );
+    }
+
+    /// **Blocked-waiter wake.** The exact published record is proven, the task is made runnable,
+    /// and the scheduler is given it — three post-states, through the production owners.
+    #[test]
+    fn a_published_waiter_is_proven_woken_and_enqueued() {
+        let (kernel, notif_idx, _recv) = fixture();
+        let record = publish_live_waiter(&kernel, notif_idx);
+
+        let outcome = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert!(
+            matches!(
+                outcome,
+                O::DeliveredAndWoke { waiter_tid, notification_idx, .. }
+                    if waiter_tid == RECEIVER && notification_idx == notif_idx
+            ),
+            "the proven waiter must be woken: {outcome:?}"
+        );
+        assert_eq!(outcome.marker(), "delivered_and_woke");
+
+        assert_eq!(
+            kernel.with(|state| state.task_status(RECEIVER)),
+            Some(TaskStatus::Runnable),
+            "the task layer post-state: Blocked -> Runnable"
+        );
+        // The scheduler post-state, read through the same production authority the fault routes
+        // use. `QueuedForDispatch` is exactly right: the task is on a run queue and is not the
+        // current task of any CPU.
+        assert_eq!(
+            kernel.entering_frame_authority_split_read(CpuId(0), RECEIVER, Asid(0)),
+            crate::kernel::task_transition::EnteringFrameAuthority::Forfeited(
+                crate::kernel::task_transition::FrameForfeitReason::QueuedForDispatch
+            ),
+            "the scheduler post-state: the woken task is queued for dispatch"
+        );
+        assert_eq!(
+            waiter_slot(&kernel, notif_idx),
+            None,
+            "the slot is consumed in the same rank-3 acquisition that signalled, so no second \
+             delivery can wake the same record"
+        );
+        assert_eq!(record.receiver.tid.0, RECEIVER);
+    }
+
+    /// **Repeated signals.** The waiter is woken at most once; the second and third signals find
+    /// an empty slot and are ordinary pending deliveries. One record, one wake.
+    #[test]
+    fn repeated_signals_wake_the_waiter_exactly_once() {
+        let (kernel, notif_idx, _recv) = fixture();
+        publish_live_waiter(&kernel, notif_idx);
+
+        let first = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        let second = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        let third = kernel.deliver_external_irq_split(CpuId(0), LINE);
+
+        assert_eq!(first.marker(), "delivered_and_woke");
+        assert_eq!(second.marker(), "delivered", "no second wake: {second:?}");
+        assert_eq!(third.marker(), "delivered", "nor a third: {third:?}");
+        assert_eq!(
+            kernel.with(|state| state.task_status(RECEIVER)),
+            Some(TaskStatus::Runnable),
+            "and the task is runnable once, not re-transitioned"
+        );
+    }
+
+    /// **No route.** An unrouted line settles as `NoRoute` — it does not fall through, does not
+    /// error, and touches nothing.
+    #[test]
+    fn an_unrouted_line_settles_as_no_route_and_mutates_nothing() {
+        let (kernel, notif_idx, _recv) = fixture();
+        let record = publish_live_waiter(&kernel, notif_idx);
+
+        let outcome = kernel.deliver_external_irq_split(CpuId(0), LINE + 1);
+        assert_eq!(outcome, O::NoRoute);
+        assert_eq!(outcome.marker(), "no_route");
+        assert_eq!(outcome.propagated_error(), None);
+        assert_eq!(
+            waiter_slot(&kernel, notif_idx),
+            Some(record),
+            "an unrouted line must not consume another line's waiter"
+        );
+        assert_eq!(
+            kernel.with(|state| state.task_status(RECEIVER)),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(0)))),
+            "and must not wake it"
+        );
+    }
+
+    /// **Teardown/reuse.** The route outlives its object. This is the destroy/deliver race, and
+    /// it is benign — `TargetGone`, never a fatal and never a delivery into the replacement that
+    /// took the slot.
+    #[test]
+    fn a_route_that_outlived_its_object_settles_as_target_gone() {
+        let (kernel, notif_idx, _recv) = fixture();
+        kernel.with(|state| {
+            state.destroy_notification(notif_idx).expect("destroy");
+            // `destroy_notification` clears matching routes, so force the stale route back: the
+            // arm under test is defence in depth for exactly that window.
+            state.with_ipc_state_mut(|ipc| {
+                ipc.irq_routes[LINE as usize] = Some(notif_idx);
+            });
+        });
+
+        let outcome = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert_eq!(
+            outcome,
+            O::TargetGone {
+                notification_idx: notif_idx
+            }
+        );
+        assert_eq!(outcome.marker(), "target_gone");
+        assert_eq!(
+            outcome.propagated_error(),
+            None,
+            "a destroy/deliver race is benign, exactly as the broad form's WrongObject arm is"
+        );
+    }
+
+    /// **Slot reuse.** A NEW notification takes the destroyed one's slot and the stale route
+    /// still names it. The delivery must not land in the replacement object.
+    ///
+    /// This is the concurrency boundary §2 names: "must not deliver into a replacement object
+    /// after teardown/reuse". The generation is what separates them, and the outcome carries it.
+    #[test]
+    fn a_reused_notification_slot_is_distinguished_by_its_generation() {
+        let (kernel, notif_idx, _recv) = fixture();
+        let first_generation = kernel
+            .with(|state| state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]));
+
+        let delivered = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert!(
+            matches!(delivered, O::Delivered { generation, .. } if generation == first_generation),
+            "the first delivery names the incarnation it reached: {delivered:?}"
+        );
+
+        // Destroy and recreate. `create_notification` bumps the slot's generation.
+        let (reused_idx, second_generation) = kernel.with(|state| {
+            state.destroy_notification(notif_idx).expect("destroy");
+            let (idx, notif_cap, _recv) = state.create_notification(4).expect("recreate");
+            state
+                .bind_irq_notification(LINE, notif_cap)
+                .expect("rebind the line");
+            (
+                idx,
+                state.with_ipc_state(|ipc| ipc.notification_generations[idx]),
+            )
+        });
+
+        let after = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert!(
+            matches!(after, O::Delivered { notification_idx, generation }
+                if notification_idx == reused_idx && generation == second_generation),
+            "the second delivery names the REPLACEMENT incarnation: {after:?}"
+        );
+        assert_ne!(
+            first_generation, second_generation,
+            "and the two deliveries are distinguishable — a bare index is not an identity"
+        );
+    }
+
+    /// **A recycled TID in the waiter slot is not woken.** The record names `{tid, asid,
+    /// generation}`; if the task at that TID has since blocked again, the generation differs and
+    /// the wake refuses.
+    ///
+    /// This is the case a bare `Blocked(_)` gate cannot see, and the one that used to land a
+    /// notification wake on an unrelated endpoint wait.
+    #[test]
+    fn a_later_block_by_the_same_tid_is_not_woken_by_the_stale_record() {
+        let (kernel, notif_idx, _recv) = fixture();
+        publish_live_waiter(&kernel, notif_idx);
+        // The receiver's wait ended and it blocked again on something else: same TID, same asid,
+        // still `Blocked(EndpointReceive)`, NEW generation.
+        let later = kernel.with(|state| {
+            state
+                .bump_blocked_recv_generation(RECEIVER)
+                .expect("the later block")
+        });
+
+        let outcome = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert!(
+            matches!(outcome, O::DeliveredWaiterStale { waiter_tid, .. } if waiter_tid == RECEIVER),
+            "the stale record must not wake the later wait: {outcome:?}"
+        );
+        assert_eq!(outcome.marker(), "delivered_waiter_stale");
+        assert_eq!(
+            kernel.with(|state| state.task_status(RECEIVER)),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(0)))),
+            "the LATER wait is left intact — the wake is lost, the wait is not"
+        );
+        assert_ne!(later, 0, "the fixture really did mint a second generation");
+    }
+
+    /// **A competing exit.** The waiter left the wait entirely before the interrupt arrived. The
+    /// status gate refuses, and a dead task is not made runnable.
+    #[test]
+    fn a_competing_exit_is_not_woken() {
+        let (kernel, notif_idx, _recv) = fixture();
+        publish_live_waiter(&kernel, notif_idx);
+        kernel.with(|state| state.set_task_status_for_test(RECEIVER, TaskStatus::Dead));
+
+        let outcome = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert_eq!(outcome.marker(), "delivered_waiter_stale");
+        assert_eq!(
+            kernel.with(|state| state.task_status(RECEIVER)),
+            Some(TaskStatus::Dead),
+            "an exited task must not be resurrected by an interrupt"
+        );
+    }
+
+    /// **A competing wake.** Another owner already made the waiter runnable. The status gate
+    /// refuses rather than re-transitioning a task that is no longer in the wait.
+    #[test]
+    fn a_competing_wake_is_not_applied_twice() {
+        let (kernel, notif_idx, _recv) = fixture();
+        publish_live_waiter(&kernel, notif_idx);
+        kernel.with(|state| state.set_task_status_for_test(RECEIVER, TaskStatus::Runnable));
+
+        let outcome = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert_eq!(
+            outcome.marker(),
+            "delivered_waiter_stale",
+            "a task already woken is not this delivery's to wake: {outcome:?}"
+        );
+        // And nothing was enqueued for it — the enqueue is Phase 3, reached only on a proven
+        // wake, so a double enqueue for one wake is unreachable by construction.
+        assert_eq!(
+            kernel.entering_frame_authority_split_read(CpuId(0), RECEIVER, Asid(0)),
+            crate::kernel::task_transition::EnteringFrameAuthority::Forfeited(
+                crate::kernel::task_transition::FrameForfeitReason::PlacedNowhere
+            ),
+            "a refused wake must not enqueue"
+        );
+    }
+
+    /// **A different address space is a different incarnation.** Same TID, same generation,
+    /// same status — different asid. The wake refuses.
+    #[test]
+    fn a_replacement_incarnation_at_the_same_tid_is_not_woken() {
+        let (kernel, notif_idx, _recv) = fixture();
+        let live = publish_live_waiter(&kernel, notif_idx);
+        // Publish a record naming a DIFFERENT address space at the same TID and generation.
+        kernel.with(|state| {
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[notif_idx] = Some(EndpointWaiterRecord::new(
+                    ReceiverWaiterIdentity::new(ThreadId(RECEIVER), Asid(7)),
+                    live.wait_generation,
+                ));
+            });
+        });
+
+        let outcome = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert_eq!(outcome.marker(), "delivered_waiter_stale");
+        assert_eq!(
+            kernel.with(|state| state.task_status(RECEIVER)),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(0)))),
+            "a TID match alone is not an identity proof"
+        );
+    }
+
+    /// **Delivery errors propagate.** A full notification queue is `EndpointQueueFull`, and the
+    /// route carries it out of the trap exactly as the broad arm's `?` would. This route does
+    /// not start dropping interrupts to make itself total.
+    #[test]
+    fn a_full_notification_queue_propagates_its_error() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let notif_idx = kernel.with(|state| {
+            let (idx, notif_cap, _recv) = state.create_notification(1).expect("depth-1 queue");
+            state.bind_irq_notification(LINE, notif_cap).expect("bind");
+            idx
+        });
+
+        let first = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert_eq!(
+            first.marker(),
+            "delivered",
+            "the queue takes one: {first:?}"
+        );
+
+        let overflow = kernel.deliver_external_irq_split(CpuId(0), LINE);
+        assert!(
+            matches!(overflow, O::Failed { notification_idx, .. } if notification_idx == notif_idx),
+            "the second must fail rather than be silently dropped: {overflow:?}"
+        );
+        assert_eq!(overflow.marker(), "failed");
+        assert_eq!(
+            overflow.propagated_error(),
+            Some(KernelError::EndpointQueueFull),
+            "and the error is the one the broad form propagates"
+        );
+    }
+
+    /// Only `Failed` propagates. Every other ending settles the trap successfully, which is what
+    /// "settle without broad fallback" means at the bridge: five of the six become `Ok(())`.
+    #[test]
+    fn exactly_one_outcome_family_propagates_an_error() {
+        let benign = [
+            O::NoRoute,
+            O::TargetGone {
+                notification_idx: 0,
+            },
+            O::Delivered {
+                notification_idx: 0,
+                generation: 1,
+            },
+            O::DeliveredAndWoke {
+                notification_idx: 0,
+                generation: 1,
+                waiter_tid: RECEIVER,
+            },
+            O::DeliveredWaiterStale {
+                notification_idx: 0,
+                generation: 1,
+                waiter_tid: RECEIVER,
+            },
+        ];
+        for outcome in benign {
+            assert_eq!(
+                outcome.propagated_error(),
+                None,
+                "{} must settle the trap, not error it",
+                outcome.marker()
+            );
+        }
+        assert_eq!(
+            O::Failed {
+                notification_idx: 0,
+                error: KernelError::EndpointQueueFull,
+            }
+            .propagated_error(),
+            Some(KernelError::EndpointQueueFull)
+        );
+        // Six distinct markers — no two endings report as the same thing.
+        let markers = [
+            O::NoRoute.marker(),
+            O::TargetGone {
+                notification_idx: 0,
+            }
+            .marker(),
+            O::Delivered {
+                notification_idx: 0,
+                generation: 0,
+            }
+            .marker(),
+            O::DeliveredAndWoke {
+                notification_idx: 0,
+                generation: 0,
+                waiter_tid: 0,
+            }
+            .marker(),
+            O::DeliveredWaiterStale {
+                notification_idx: 0,
+                generation: 0,
+                waiter_tid: 0,
+            }
+            .marker(),
+            O::Failed {
+                notification_idx: 0,
+                error: KernelError::EndpointQueueFull,
+            }
+            .marker(),
+        ];
+        let mut seen: alloc::vec::Vec<&str> = markers.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 6, "every ending must be separately nameable");
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// U9-IRQ-UNKNOWN1 §4 — per-port acknowledgement, the Unknown closure, and the mutation guards.
+//
+// Acknowledgement is not something a hosted test can *observe* happening on a controller, so it
+// is derived from the executed source instead: which seam each bridge calls, how many times,
+// where in the sequence, and what each port's seam actually does. That derivation is exact —
+// these are the bodies that run — and it is the only honest way to state a controller-protocol
+// property from a host build.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+mod u9irq1_acknowledgement {
+    const TRAP: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+    const X86_IRQ: &str = include_str!("../../arch/x86_64/irq.rs");
+    const ARM_IRQ: &str = include_str!("../../arch/aarch64/irq.rs");
+    const RISCV_IRQ: &str = include_str!("../../arch/riscv64/irq.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+
+    /// The IRQ arm of a bridge: from the owner call to the close of the settled arm.
+    fn irq_arm(src: &str) -> &str {
+        let at = src
+            .find("settle_external_interrupt_at_bridge(shared, cpu, irq)")
+            .expect("the bridge must delegate to the one dispatch-and-acknowledge owner");
+        let end = src[at..]
+            .find("else if let TrapEvent::Unknown")
+            .expect("the Unknown arm closes the IRQ block");
+        &src[at..at + end]
+    }
+
+    /// The one dispatch-and-acknowledge owner both bridges call.
+    fn bridge_owner() -> &'static str {
+        SPLIT
+            .split("pub(crate) fn settle_external_interrupt_at_bridge(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the bridge-body owner")
+    }
+
+    /// **Exactly one completion per handled interrupt, per bridge**, and it is the scoped seam.
+    ///
+    /// `acknowledge_interrupt` is the per-port seam meaning "the shared handler's single-step
+    /// acknowledgement". `external_irq_eoi` / `complete_external_interrupt` are the raw writes,
+    /// and on AArch64 the raw write is a SECOND `GICC_EOIR` beside the one the vector tail
+    /// already issues for the same claim. Neither may appear here.
+    #[test]
+    fn each_bridge_completes_exactly_once_through_the_scoped_seam() {
+        // ONE acknowledgement, in ONE body, which both bridges call. Two inline copies of an
+        // acknowledgement sequence is exactly the shape that produces a second completion when
+        // one of them is edited, so the guard requires there to be one copy at all.
+        let owner = bridge_owner();
+        assert_eq!(
+            owner.matches("acknowledge_interrupt(").count(),
+            1,
+            "one handled interrupt is one acknowledgement"
+        );
+        for raw in ["external_irq_eoi(", "complete_external_interrupt("] {
+            assert!(
+                !owner.contains(raw),
+                "`{raw}` is the RAW write — on AArch64 it is a second EOIR beside the \
+                 vector tail's completion for the same claim"
+            );
+        }
+        // A DECLINED interrupt completes nothing: the acknowledgement is inside the settled arm,
+        // and the `NotHandled` arm yields `None` having done nothing at all.
+        let decline = owner
+            .find("SplitDispatchDisposition::NotHandled => None,")
+            .expect("a declined interrupt must complete nothing, and say so by yielding None");
+        let ack = owner
+            .find("acknowledge_interrupt(")
+            .expect("the acknowledgement");
+        assert!(
+            decline < ack,
+            "and the decline must not fall through into the acknowledgement"
+        );
+        // Both bridges reach it, and neither keeps a copy.
+        for (port, src) in [("shared", TRAP), ("riscv", RISCV)] {
+            let arm = irq_arm(src);
+            assert!(
+                !arm.contains("acknowledge_interrupt(") && !arm.contains("irq_guard::irq_save()"),
+                "{port}: the bridge must delegate the acknowledgement, not keep a second copy"
+            );
+        }
+    }
+
+    /// **Acknowledgement follows the delivery policy and is masked across the pair**, exactly as
+    /// the broad arm's `TrapEvent::ExternalInterrupt` did it.
+    #[test]
+    fn acknowledgement_follows_delivery_under_a_masked_window() {
+        let owner = bridge_owner();
+        let dispatch = owner
+            .find("try_split_external_interrupt_dispatch(")
+            .expect("the delivery policy");
+        let save = owner.find("irq_guard::irq_save()").expect("the mask");
+        let ack = owner
+            .find("acknowledge_interrupt(")
+            .expect("the acknowledgement");
+        let restore = owner.find("irq_guard::irq_restore(").expect("the unmask");
+        assert!(
+            dispatch < save && save < ack && ack < restore,
+            "delivery first, then the acknowledgement inside the masked window"
+        );
+    }
+
+    /// **The asynchronous interrupt preserves the interrupted continuation.** The arm may not
+    /// touch the trap frame at all: no register write, no PC advance, no syscall-result encoding.
+    #[test]
+    fn the_irq_arm_never_touches_the_interrupted_frame() {
+        for (port, src) in [
+            ("shared", TRAP),
+            ("riscv", RISCV),
+            ("owner", bridge_owner()),
+        ] {
+            let arm = if port == "owner" { src } else { irq_arm(src) };
+            for forbidden in [
+                "frame",
+                "set_return_value",
+                "advance_pc",
+                "saved_pc",
+                "finalize_syscall",
+                "encode_syscall",
+            ] {
+                assert!(
+                    !arm.contains(forbidden),
+                    "{port}: an asynchronous interrupt must return through the frame it \
+                     interrupted, untouched — `{forbidden}` has no business here"
+                );
+            }
+        }
+        // And the route itself never sees a frame: it takes only `(shared, cpu, irq)`.
+        let signature = SPLIT
+            .split("pub(crate) fn try_split_external_interrupt_dispatch(")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .expect("the IRQ bridge entry");
+        assert!(
+            !signature.contains("frame"),
+            "the IRQ route must not be able to express a frame mutation: {signature}"
+        );
+    }
+
+    /// **Per-port protocol, derived from each port's own seam.** The three ports answer
+    /// differently and must keep answering differently — a single "always EOI" would be wrong on
+    /// two of them.
+    #[test]
+    fn each_port_completes_only_the_work_it_actually_owns() {
+        // x86_64: the LAPIC EOI is the single-step completion, and it is refused before the
+        // controller is configured rather than written into an unmapped MMIO window.
+        let x86 = X86_IRQ
+            .split("pub fn acknowledge_interrupt(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the x86_64 seam");
+        assert!(
+            x86.contains("LAPIC_CONFIGURED.load(Ordering::Relaxed)")
+                && x86.contains("lapic_write_eoi("),
+            "x86_64 completes at the LAPIC, and only once the LAPIC is configured"
+        );
+
+        // AArch64: deliberately inert. The vector entry claims via GICC_IAR and the vector tail
+        // completes — exactly one completion per claim, owned by the architecture, not by this
+        // handler. Calling the raw EOIR here would be the second one.
+        let arm = ARM_IRQ
+            .split("pub fn acknowledge_interrupt(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the AArch64 seam");
+        assert!(
+            arm.contains("let _ = irq_line;")
+                && !arm.contains("gic_write_eoir(")
+                && !arm.contains("external_irq_eoi("),
+            "AArch64's single-step seam must stay inert: the vector tail owns completion"
+        );
+        assert!(
+            ARM_IRQ.contains(
+                "Reading `GICC_IAR` here as well would consume a\n/// second, \
+                              unrelated claim."
+            ) || ARM_IRQ.contains("would consume a"),
+            "and the reason must stay recorded beside it"
+        );
+
+        // RISC-V: the PLIC completion, which refuses source 0 because the spec reserves it to
+        // mean \"no interrupt\".
+        let riscv = RISCV_IRQ
+            .split("pub fn external_irq_eoi(irq_line: u16) {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the RISC-V completion");
+        assert!(
+            riscv.contains("if irq_line == 0 {")
+                && riscv.contains("PLIC_CONFIGURED.load(Ordering::Relaxed)")
+                && riscv.contains("plic_write_complete("),
+            "RISC-V completes at the PLIC, refusing the reserved source and an unconfigured \
+             controller"
+        );
+    }
+
+    /// **RISC-V has no IRQ identity yet, and the route says so rather than inventing one.**
+    ///
+    /// `decode_trap_context` builds `ExternalInterrupt(context.stval as u16)`. `stval` is
+    /// architecturally 0 for an interrupt, and the PLIC completion above refuses source 0, so
+    /// treating that value as a controller claim would deliver to line 0 and complete nothing.
+    /// The route refuses on this port, measurably, and names the barrier.
+    #[test]
+    fn the_riscv_route_refuses_rather_than_treating_stval_as_a_claim() {
+        let body = SPLIT
+            .split("fn try_split_external_interrupt_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the IRQ route body");
+        assert!(
+            body.contains("cfg!(target_arch = \"riscv64\")")
+                && body.contains("reason=riscv_identifier_is_not_a_claim"),
+            "the RISC-V refusal must be explicit and measurable, not an accident of decoding"
+        );
+        let refusal = body
+            .find("riscv_identifier_is_not_a_claim")
+            .expect("the refusal");
+        let delivery = body
+            .find("deliver_external_irq_split(")
+            .expect("the delivery");
+        assert!(
+            refusal < delivery,
+            "and it must refuse BEFORE any delivery is attempted"
+        );
+    }
+
+    /// **Mutation guard — a renewed broad fall-through.** If an `ExternalInterrupt` that the
+    /// route handled could still reach the broad dispatcher, the interrupt would be delivered
+    /// twice and completed twice. The two facts that make that impossible are that the `Complete`
+    /// arm raises `irq_handled`, and that the gate admits it.
+    #[test]
+    fn a_handled_interrupt_cannot_reach_the_broad_dispatcher() {
+        for (port, src) in [("shared", TRAP), ("riscv", RISCV)] {
+            let arm = irq_arm(src);
+            assert!(
+                arm.contains("irq_handled = true;") && arm.contains("irq_result = Some(result);"),
+                "{port}: the Complete arm must raise the flag AND carry the result"
+            );
+            let flat = src
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
+            assert!(
+                flat.contains(
+                    "if queue_advance_committed || post_work_committed || cow_recovered \
+                     || demand_recovered || irq_handled {"
+                ),
+                "{port}: and the gate must admit it, or the flag decides nothing"
+            );
+            // The flag is raised in exactly one place and cleared nowhere: there is no path that
+            // handles an interrupt and then un-handles it.
+            assert_eq!(
+                src.matches("irq_handled = true;").count(),
+                1,
+                "{port}: one place raises it"
+            );
+            assert_eq!(
+                src.matches("irq_handled = false;").count(),
+                1,
+                "{port}: and the only `false` is its declaration"
+            );
+        }
+    }
+
+    /// **Mutation guard — duplicate completion.** One acknowledgement per bridge, in the IRQ arm,
+    /// and no second one hiding elsewhere in the file's split phase.
+    #[test]
+    fn no_second_completion_is_issued_for_one_claim() {
+        // The DEVICE-interrupt acknowledgement is one site. The timer route's
+        // `acknowledge_interrupt(cpu, 0)` is a different event family with its own claim and its
+        // own re-arm, and keeping the two apart is the point — a device line is never 0, and the
+        // RISC-V PLIC completion explicitly refuses source 0 as reserved.
+        assert_eq!(
+            SPLIT
+                .matches("hal_adapters::acknowledge_interrupt(cpu, irq)")
+                .count(),
+            1,
+            "the split phase issues exactly one DEVICE acknowledgement, in one place"
+        );
+        assert_eq!(
+            SPLIT
+                .matches("hal_adapters::acknowledge_interrupt(cpu, 0)")
+                .count(),
+            1,
+            "and the timer's own acknowledgement stays where it was, unduplicated"
+        );
+        for (port, src) in [("shared", TRAP), ("riscv", RISCV)] {
+            assert_eq!(
+                src.matches("hal_adapters::acknowledge_interrupt(").count(),
+                0,
+                "{port}: and the bridge itself issues none — it delegates"
+            );
+            assert_eq!(
+                src.matches("settle_external_interrupt_at_bridge(shared, cpu, irq)")
+                    .count(),
+                1,
+                "{port}: through exactly one call to the one owner"
+            );
+        }
+    }
+}
+
+/// U9-IRQ-UNKNOWN1 §3/§4 — the Unknown closure: one owner, production strict, hosted unchanged.
+mod u9irq1_unknown {
+    use crate::kernel::scheduler::CpuId;
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const FAULT: &str = include_str!("fault_state.rs");
+    const TRAP: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    /// **Isolated expected-fatal evidence.** The fatal encoding is one diverging body, and this
+    /// runs THAT body — the same one production reaches — rather than asserting about it from
+    /// outside. Only reachability is `cfg`-gated, which is what keeps hosted non-strict.
+    #[test]
+    #[should_panic(expected = "strict unknown trap policy: cpu=3 arch_code=0x2d")]
+    fn the_fatal_encoding_diverges_with_the_broad_arms_message() {
+        crate::kernel::boot::unknown_trap_fatal(CpuId(3), 0x2d);
+    }
+
+    /// The policy's divergence bit is exactly `!hosted-dev`, so hosted is not strict and
+    /// production is — unchanged from the broad arm's `STRICT_UNKNOWN_TRAPS`.
+    #[test]
+    fn hosted_is_not_strict_and_says_so_from_the_one_owner() {
+        assert!(
+            !crate::kernel::boot::strict_unknown_traps(),
+            "this suite runs under hosted-dev, where the Unknown policy declines"
+        );
+        assert!(
+            FAULT.contains("const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = \"hosted-dev\");"),
+            "and the bit is still derived from the feature, in one place"
+        );
+    }
+
+    /// Hosted keeps its existing route: the split owner declines and the broad arm's
+    /// `handle_trap(Trap::Unknown)` answers as it always did.
+    #[test]
+    fn the_hosted_route_declines_to_the_existing_broad_answer() {
+        assert!(
+            matches!(
+                crate::kernel::syscall_split::try_split_unknown_trap_dispatch(CpuId(0), Some(0x2d)),
+                crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled
+            ),
+            "hosted must not become strict"
+        );
+        assert!(
+            matches!(
+                crate::kernel::syscall_split::try_split_unknown_trap_dispatch(CpuId(0), None),
+                crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled
+            ),
+            "and an absent code is not a recognized Unknown"
+        );
+    }
+
+    /// **One policy owner, and the diagnostic markers are preserved.** The broad arm's
+    /// diagnostic line and its default-off classification marker both live in the moved body,
+    /// and both take the hardware-derived CPU and code.
+    #[test]
+    fn the_markers_move_with_the_policy_and_are_not_restated() {
+        let body = FAULT
+            .split("pub(crate) fn unknown_trap_fatal(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the fatal owner");
+        for marker in [
+            "\"unknown trap event cpu={} arch_code=0x{:x}\"",
+            "\"FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL vector=0x{:x}\"",
+            "\"IRQ1_UNKNOWN_SETTLED cpu={} arch_code=0x{:x} strict=1 broad_lock=0\"",
+        ] {
+            assert!(body.contains(marker), "the owner must keep {marker}");
+        }
+        assert!(
+            body.contains("fault_delivery_enabled()"),
+            "and the classification marker stays default-off, exactly as the broad arm has it"
+        );
+        // The split route does not restate any of it — it calls the one owner.
+        let route = SPLIT
+            .split("fn try_split_unknown_trap_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production route");
+        assert!(
+            route.contains("crate::kernel::boot::unknown_trap_fatal(cpu, arch_code);")
+                && !route.contains("panic!("),
+            "the route must delegate to the one policy owner, not carry a second copy"
+        );
+    }
+
+    /// **An unknown trap is not a user fault.** It is not reclassified, no victim is fabricated
+    /// for it, and it is never a successful production return.
+    #[test]
+    fn an_unknown_trap_is_never_turned_into_a_user_fault() {
+        for (name, body) in [
+            (
+                "the fatal owner",
+                FAULT
+                    .split("pub(crate) fn unknown_trap_fatal(")
+                    .nth(1)
+                    .and_then(|s| s.split("\n}").next())
+                    .expect("the fatal owner"),
+            ),
+            (
+                "the production route",
+                SPLIT
+                    .split("fn try_split_unknown_trap_into_frame(")
+                    .nth(1)
+                    .and_then(|s| s.split("\n}").next())
+                    .expect("the production route"),
+            ),
+        ] {
+            for forbidden in [
+                "fault_current_task",
+                "PageFault",
+                "emit_fault_report",
+                "current_tid",
+                "Complete(Ok(()))",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{name} must not reach `{forbidden}` — an unknown trap has no victim and no \
+                     successful production return"
+                );
+            }
+        }
+    }
+
+    /// **Trap-window retirement at the diverging boundary**, on both bridges. A `panic!` never
+    /// unwinds back to `TrapPathWindow::drop`, so an abandoned window would be reported against
+    /// the next trap on this CPU — an artefact of this boundary, not of anything real.
+    #[test]
+    fn both_bridges_retire_the_window_before_the_divergence() {
+        for (port, src) in [("shared", TRAP), ("riscv", RISCV)] {
+            let arm = src
+                .split("else if let TrapEvent::Unknown { arch_code } = decoded {")
+                .nth(1)
+                .and_then(|s| s.split("\n        }").next())
+                .unwrap_or_else(|| panic!("{port}: the Unknown arm"));
+            let guard = arm
+                .find("if crate::kernel::boot::strict_unknown_traps() {")
+                .unwrap_or_else(|| panic!("{port}: the divergence guard"));
+            let retire = arm
+                .find("trap_path.retire();")
+                .unwrap_or_else(|| panic!("{port}: the retirement"));
+            let settle = arm
+                .find("trap_path.settle();")
+                .unwrap_or_else(|| panic!("{port}: the settlement"));
+            let dispatch = arm
+                .find("try_split_unknown_trap_dispatch(")
+                .unwrap_or_else(|| panic!("{port}: the route call"));
+            assert!(
+                guard < retire && retire < settle && settle < dispatch,
+                "{port}: retire and settle, guarded by the policy's own bit, BEFORE the route \
+                 that may never return"
             );
         }
     }

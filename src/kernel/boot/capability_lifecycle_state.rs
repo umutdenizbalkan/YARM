@@ -1293,7 +1293,10 @@ impl crate::runtime::SharedKernel {
             if tcb.blocked_recv_generation != record.wait_generation {
                 return None;
             }
-            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointReceive(_))) {
+            if !matches!(
+                tcb.status,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+            ) {
                 return None;
             }
             tcb.status = TaskStatus::Runnable;

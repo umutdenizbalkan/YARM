@@ -1706,6 +1706,46 @@ pub(crate) fn try_split_external_interrupt_dispatch(
     try_split_external_interrupt_into_frame(shared, cpu, irq)
 }
 
+/// U9-IRQ-UNKNOWN1 §2/§4 — **the bridge's whole external-interrupt body, in one owner.**
+///
+/// Both bridges had a byte-identical copy of this: dispatch, and on a settled delivery
+/// acknowledge the controller with interrupts masked across the pair. Two copies of an
+/// acknowledgement sequence is exactly the shape that produces a second completion when one of
+/// them is edited, so there is one.
+///
+/// `Some(result)` means *this route settled the trap* — the caller raises its own skip flag and
+/// carries the result into the bridge's join. `None` means the route declined and the broad arm
+/// still owns the interrupt, in which case **nothing is acknowledged**: completing work this
+/// kernel did not perform is how an interrupt gets completed twice.
+///
+/// Acknowledgement goes through `acknowledge_interrupt`, the per-port seam scoped to "the shared
+/// handler's single-step acknowledgement" — never the raw `external_irq_eoi`, which on AArch64
+/// is a second `GICC_EOIR` beside the one the vector tail already writes for the same claim.
+///
+/// Being one ordinary function rather than two inline blocks is also what lets a live witness
+/// execute the bridge's own body (see `IRQ1_INJECTED_DELIVERY`) instead of a re-implementation
+/// of it.
+pub(crate) fn settle_external_interrupt_at_bridge(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    irq: u16,
+) -> Option<Result<(), TrapHandleError>> {
+    match try_split_external_interrupt_dispatch(shared, cpu, Some(irq)) {
+        SplitDispatchDisposition::NotHandled => None,
+        SplitDispatchDisposition::Complete(result) => {
+            let irq_state = crate::arch::irq_guard::irq_save();
+            crate::arch::hal_adapters::acknowledge_interrupt(cpu, irq);
+            crate::arch::irq_guard::irq_restore(irq_state);
+            Some(result)
+        }
+        other => {
+            crate::yarm_log!("IRQ1_UNEXPECTED_DISPOSITION cpu={} value={:?}", cpu.0, other);
+            debug_assert!(false, "the IRQ route yields NotHandled or Complete");
+            None
+        }
+    }
+}
+
 /// U9-IRQ-UNKNOWN1 §3 — **the Unknown policy, before the broad acquisition.**
 ///
 /// One owner, and it moves the existing policy rather than restating it. The broad arm's arm is
@@ -1727,31 +1767,15 @@ fn try_split_unknown_trap_into_frame(
     let Some(arch_code) = arch_code else {
         return SplitDispatchDisposition::NotHandled;
     };
-    // The broad arm's own diagnostic, in the broad arm's words, from the HARDWARE-derived CPU
-    // and code rather than an ambient re-read.
-    crate::yarm_log!(
-        "unknown trap event cpu={} arch_code=0x{:x}",
-        cpu.0,
-        arch_code
-    );
-    if crate::kernel::boot::fault_delivery_enabled() {
-        crate::yarm_log!(
-            "FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL vector=0x{:x}",
-            arch_code
-        );
-    }
-    crate::yarm_log!(
-        "IRQ1_UNKNOWN_SETTLED cpu={} arch_code=0x{:x} strict=1 broad_lock=0",
-        cpu.0,
-        arch_code
-    );
-    // Production is strict, and the panic is the policy — not a substitute for one. The trap
-    // window is retired by the caller before this diverges, which is why the bridge calls this
-    // from a position that owns that retirement.
-    panic!(
-        "strict unknown trap policy: cpu={} arch_code=0x{:x}",
-        cpu.0, arch_code
-    );
+    // Production is strict, and the panic is the policy — not a substitute for one. The encoding
+    // itself lives in ONE body, `crate::kernel::boot::unknown_trap_fatal`, which emits the broad
+    // arm's own diagnostic and marker from the HARDWARE-derived CPU and code and then diverges.
+    // It is not `cfg`-gated, so a hosted test can exercise the exact ending production takes;
+    // only reachability is, which is what keeps hosted non-strict.
+    //
+    // The trap window is retired by the caller before this diverges, which is why the bridge
+    // calls this from a position that owns that retirement.
+    crate::kernel::boot::unknown_trap_fatal(cpu, arch_code);
 }
 
 #[cfg(feature = "hosted-dev")]

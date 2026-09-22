@@ -1018,6 +1018,54 @@ impl TerminalFaultPolicyRefusal {
 }
 
 const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
+
+/// U9-IRQ-UNKNOWN1 §3 — the Unknown policy's divergence bit, readable by the bridges.
+///
+/// The bridges need it for one reason only: a diverging landing must retire its trap window
+/// FIRST, because a panic never unwinds back to `TrapPathWindow::drop`, and the next trap on
+/// this CPU would otherwise report an abandoned window that this boundary manufactured. The
+/// policy itself stays in one place — this is a read of it, not a second copy.
+pub(crate) fn strict_unknown_traps() -> bool {
+    STRICT_UNKNOWN_TRAPS
+}
+
+/// U9-IRQ-UNKNOWN1 §3 — **the fatal encoding for an unrecognized trap, in one diverging body.**
+///
+/// This is the broad arm's own ending, moved rather than restated: the same diagnostic line, the
+/// same default-off `FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL` marker, and the same panic message.
+/// It takes the CPU and architectural code the hardware supplied, never an ambient re-read.
+///
+/// It is deliberately **not** `cfg`-gated, for one reason: the divergence is the policy, and a
+/// policy that only exists in the build that cannot execute its own tests is a policy nothing
+/// checks. What is `cfg`-gated is REACHABILITY — production calls this, hosted declines to the
+/// broad arm's existing `Ok(())` route — so a hosted test can exercise the exact ending
+/// production takes (`the_fatal_encoding_diverges_with_the_broad_arms_message`) without making
+/// hosted strict.
+///
+/// The caller must have retired its trap window first: `panic!` never unwinds back to
+/// `TrapPathWindow::drop`.
+pub(crate) fn unknown_trap_fatal(cpu: crate::kernel::scheduler::CpuId, arch_code: u64) -> ! {
+    crate::yarm_log!(
+        "unknown trap event cpu={} arch_code=0x{:x}",
+        cpu.0,
+        arch_code
+    );
+    if crate::kernel::boot::fault_delivery_enabled() {
+        crate::yarm_log!(
+            "FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL vector=0x{:x}",
+            arch_code
+        );
+    }
+    crate::yarm_log!(
+        "IRQ1_UNKNOWN_SETTLED cpu={} arch_code=0x{:x} strict=1 broad_lock=0",
+        cpu.0,
+        arch_code
+    );
+    panic!(
+        "strict unknown trap policy: cpu={} arch_code=0x{:x}",
+        cpu.0, arch_code
+    );
+}
 const DEMAND_STACK_GROWTH_WINDOW: u64 = 8 * 1024 * 1024;
 #[allow(dead_code)]
 const DEBUG_TIMER_LOG: bool = false;

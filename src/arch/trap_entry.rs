@@ -758,32 +758,28 @@ pub fn handle_trap_entry_shared(
     if !irq_handled {
         let decoded = decode_trap_context(context);
         if let TrapEvent::ExternalInterrupt(irq) = decoded {
-            let disposition = crate::kernel::syscall_split::try_split_external_interrupt_dispatch(
-                shared,
-                cpu,
-                Some(irq),
-            );
-            match disposition {
-                SplitDispatchDisposition::NotHandled => {}
-                SplitDispatchDisposition::Complete(result) => {
-                    let irq_state = crate::arch::irq_guard::irq_save();
-                    crate::arch::hal_adapters::acknowledge_interrupt(cpu, irq);
-                    crate::arch::irq_guard::irq_restore(irq_state);
-                    irq_handled = true;
-                    irq_result = Some(result);
-                }
-                other => {
-                    crate::yarm_log!(
-                        "IRQ1_UNEXPECTED_DISPOSITION cpu={} value={:?}",
-                        cpu.0,
-                        other
-                    );
-                    debug_assert!(false, "the IRQ route yields NotHandled or Complete");
-                }
+            // The dispatch-and-acknowledge body is ONE owner, shared with the RISC-V bridge:
+            // `Some` means this route settled the trap, `None` that the broad arm still owns the
+            // interrupt and nothing was completed.
+            if let Some(result) =
+                crate::kernel::syscall_split::settle_external_interrupt_at_bridge(shared, cpu, irq)
+            {
+                irq_handled = true;
+                irq_result = Some(result);
             }
         } else if let TrapEvent::Unknown { arch_code } = decoded {
-            // Diverges in production under `STRICT_UNKNOWN_TRAPS`. The trap window is retired
-            // first, because a panic never unwinds back to `TrapPathWindow::drop`.
+            // Diverges in production under `STRICT_UNKNOWN_TRAPS`, so the trap window is retired
+            // and settled FIRST: a panic never unwinds back to `TrapPathWindow::drop`, and a
+            // window left open would make the next trap on this CPU report
+            // `TRAP_DISPATCH_WINDOW_ABANDONED` for an abandonment this boundary manufactured.
+            // Both calls are idempotent, so the `Drop` that still runs on the hosted path
+            // retires exactly once. The guard is the policy's own divergence bit — under hosted
+            // the route declines and the trap continues, and settling early there would clear
+            // the publication flag out from under the broad arm that is about to run.
+            if crate::kernel::boot::strict_unknown_traps() {
+                trap_path.retire();
+                trap_path.settle();
+            }
             let probe =
                 crate::kernel::syscall_split::try_split_unknown_trap_dispatch(cpu, Some(arch_code));
             debug_assert!(

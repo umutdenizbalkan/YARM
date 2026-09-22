@@ -814,39 +814,33 @@ pub fn handle_riscv_trap_entry_shared(
     {
         let decoded = decode_trap_context(context);
         if let TrapEvent::ExternalInterrupt(irq) = decoded {
-            match crate::kernel::syscall_split::try_split_external_interrupt_dispatch(
-                shared,
-                cpu,
-                Some(irq),
-            ) {
-                crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
-                crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) => {
-                    let irq_state = crate::arch::irq_guard::irq_save();
-                    crate::arch::hal_adapters::acknowledge_interrupt(cpu, irq);
-                    crate::arch::irq_guard::irq_restore(irq_state);
-                    irq_handled = true;
-                    irq_result = Some(result);
-                    // U9-IRQ-UNKNOWN1 §2 — this port raises its skip flags where each route
-                    // settles rather than in one `else if` chain at the gate, so the IRQ arm
-                    // names its own reason here. It is not any of the other three: nothing was
-                    // recovered, no deferral was published, and the architecture tail owes no
-                    // syscall work.
-                    crate::yarm_log!(
-                        "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason={}",
-                        cpu.0,
-                        "irq_delivered"
-                    );
-                }
-                other => {
-                    crate::yarm_log!(
-                        "IRQ1_UNEXPECTED_DISPOSITION cpu={} value={:?}",
-                        cpu.0,
-                        other
-                    );
-                    debug_assert!(false, "the IRQ route yields NotHandled or Complete");
-                }
+            // The dispatch-and-acknowledge body is ONE owner, shared with the x86_64/AArch64
+            // bridge. `Some` means this route settled the trap; `None` that it declined and
+            // nothing was completed.
+            if let Some(result) =
+                crate::kernel::syscall_split::settle_external_interrupt_at_bridge(shared, cpu, irq)
+            {
+                irq_handled = true;
+                irq_result = Some(result);
+                // U9-IRQ-UNKNOWN1 §2 — this port raises its skip flags where each route settles
+                // rather than in one `else if` chain at the gate, so the IRQ arm names its own
+                // reason here. It is not any of the other three: nothing was recovered, no
+                // deferral was published, and the architecture tail owes no syscall work.
+                crate::yarm_log!(
+                    "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason={}",
+                    cpu.0,
+                    "irq_delivered"
+                );
             }
         } else if let TrapEvent::Unknown { arch_code } = decoded {
+            // U9-IRQ-UNKNOWN1 §3 — same contract as the shared bridge: production diverges here,
+            // and a panic never unwinds back to `TrapPathWindow::drop`, so the window is retired
+            // and settled first. Both are idempotent; the hosted path declines and its `Drop`
+            // still does the work exactly once.
+            if crate::kernel::boot::strict_unknown_traps() {
+                trap_path.retire();
+                trap_path.settle();
+            }
             let probe =
                 crate::kernel::syscall_split::try_split_unknown_trap_dispatch(cpu, Some(arch_code));
             debug_assert!(
