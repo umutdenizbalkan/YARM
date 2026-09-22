@@ -150976,12 +150976,16 @@ mod u9pagefault2_settlement {
         })
     }
 
-    /// Register an endpoint of `capacity` as the FAULT HANDLER route, and return its index.
-    fn fault_endpoint(k: &SharedKernel, capacity: usize) -> usize {
+    /// Register an endpoint of `capacity` as the FAULT HANDLER route. Returns its index and the
+    /// root task's receive capability, which a waiter fixture grants onward.
+    fn fault_endpoint(
+        k: &SharedKernel,
+        capacity: usize,
+    ) -> (usize, crate::kernel::capabilities::CapId) {
         k.with(|s| {
             let (eid, _send, recv) = s.create_endpoint(capacity).expect("endpoint");
             s.set_fault_handler(recv).expect("set handler");
-            eid
+            (eid, recv)
         })
     }
 
@@ -150996,7 +151000,7 @@ mod u9pagefault2_settlement {
     #[test]
     fn the_policy_read_refuses_an_absent_current_task_without_publishing() {
         let (k, asid) = kernel_with_current();
-        let ep = fault_endpoint(&k, 4);
+        let (ep, _recv) = fault_endpoint(&k, 4);
         let queued_before = queued(&k, ep);
 
         // THE INTERLEAVING: `current` is cleared between classification and the policy read,
@@ -151090,7 +151094,7 @@ mod u9pagefault2_settlement {
     #[test]
     fn a_routable_fault_buffers_exactly_one_report() {
         let (k, asid) = kernel_with_current();
-        let ep = fault_endpoint(&k, 4);
+        let (ep, _recv) = fault_endpoint(&k, 4);
         let snapshot = k
             .read_terminal_fault_policy_shared(CPU, 0, asid)
             .expect("policy");
@@ -151129,7 +151133,7 @@ mod u9pagefault2_settlement {
     #[test]
     fn a_full_buffer_loses_the_report_and_publishes_nothing_further() {
         let (k, asid) = kernel_with_current();
-        let ep = fault_endpoint(&k, 1);
+        let (ep, _recv) = fault_endpoint(&k, 1);
         let snapshot = k
             .read_terminal_fault_policy_shared(CPU, 0, asid)
             .expect("policy");
@@ -151161,7 +151165,7 @@ mod u9pagefault2_settlement {
     #[test]
     fn a_stale_endpoint_generation_refuses_before_the_target() {
         let (k, asid) = kernel_with_current();
-        let ep = fault_endpoint(&k, 4);
+        let (ep, _recv) = fault_endpoint(&k, 4);
         let mut snapshot = k
             .read_terminal_fault_policy_shared(CPU, 0, asid)
             .expect("policy");
@@ -151179,6 +151183,91 @@ mod u9pagefault2_settlement {
             "a moved generation is refused, never published into"
         );
         assert_eq!(queued(&k, ep), 0, "and nothing reaches the live endpoint");
+    }
+
+    /// **A BLOCKED WAITER is found, and a failed delivery does NOT fall back to the buffer.**
+    ///
+    /// Two properties, and the second is the one that matters for "no duplicate report".
+    ///
+    /// The waiter is built through the production receive path — task 1 issues a real `IpcRecv`
+    /// trap against an empty fault endpoint and blocks — so the state the delivery owner reads is
+    /// one production creates, not a record poked into the IPC table.
+    ///
+    /// The hosted build stubs the hand-off itself (it stashes post-work for a trap drain hosted
+    /// has no architecture entry for), so the delivery reports failure here. That is exactly the
+    /// interleaving worth pinning: the emitter's `BLOCKED_COMPLETE_FAIL` arm does NOT try the
+    /// buffer afterwards, and neither does this. A report that failed to reach the waiter must
+    /// not also appear in the queue — that is the duplicate the waiter-first ordering exists to
+    /// prevent, and falling back would produce it on every failed hand-off.
+    #[test]
+    fn a_blocked_waiter_is_found_and_a_failed_delivery_does_not_reach_the_buffer() {
+        use crate::kernel::task::TaskStatus;
+
+        let (k, _asid0) = kernel_with_current();
+        let (ep, root_recv) = fault_endpoint(&k, 4);
+
+        // Task 1 will be the WAITER; task 5 will be the fault victim. Neither is task 0, so the
+        // fixture never has to un-block anything: each task is dispatched once, in order.
+        k.with(|s| {
+            for tid in [1u64, 5u64] {
+                s.register_task(tid).expect("task");
+                s.enqueue_on_cpu(CPU, tid).expect("enqueue");
+                let (asid, _map) = s.create_user_address_space().expect("asid");
+                s.bind_task_asid(tid, asid).expect("bind");
+            }
+        });
+        let waiter_recv = k.with(|s| {
+            s.grant_capability_task_to_task(0, root_recv, 1)
+                .expect("the fault endpoint's receive capability, granted to the waiter")
+        });
+
+        // THE WAITER, through the receive family's own trap. Task 1 takes the CPU and blocks on
+        // an empty fault endpoint.
+        let blocked = k.with(|s| {
+            s.block_current_cpu().expect("task 0 was current");
+            assert_eq!(s.dispatch_next_on_cpu(CPU), Some(1), "task 1 takes the CPU");
+            let mut frame = crate::kernel::trapframe::TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [waiter_recv.0 as usize, 0, 0, 0, 0, 0],
+            );
+            let _ = s.handle_trap(crate::kernel::boot::Trap::Syscall, Some(&mut frame));
+            s.task_status(1)
+        });
+        assert!(
+            matches!(blocked, Some(TaskStatus::Blocked(_))),
+            "fixture: the waiter must be blocked on the fault endpoint, got {blocked:?}"
+        );
+
+        // THE VICTIM. Task 5 takes the now-free CPU and is the task the fault is attributed to.
+        let victim_asid = k.with(|s| {
+            assert_eq!(s.dispatch_next_on_cpu(CPU), Some(5), "task 5 takes the CPU");
+            s.task_asid(5).expect("task 5 has an address space")
+        });
+        let snapshot = k
+            .read_terminal_fault_policy_shared(CPU, 5, victim_asid)
+            .expect("policy");
+        assert_eq!(
+            snapshot.target.map(|t| t.waiters_before),
+            Some(1),
+            "the snapshot must SEE the waiter, which is what selects the waiter branch"
+        );
+
+        let queued_before = queued(&k, ep);
+        assert_eq!(queued_before, 0, "fixture: nothing is buffered yet");
+        assert_eq!(
+            k.deliver_fault_report_split(CPU, 5, fault(), &snapshot),
+            O::Failed(F::WaiterDelivery),
+            "the waiter branch is taken, and its failure is named rather than swallowed"
+        );
+        assert_eq!(
+            queued(&k, ep),
+            queued_before,
+            "a failed waiter delivery must NOT fall back to the buffer"
+        );
+        assert!(
+            matches!(k.with(|s| s.task_status(1)), Some(TaskStatus::Blocked(_))),
+            "and the waiter is left blocked, never half-woken"
+        );
     }
 
     // ── The queue-advance admission: the migration's actual difference ─────────────────────

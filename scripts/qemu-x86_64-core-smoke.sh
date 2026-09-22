@@ -54,6 +54,7 @@ VM_COW=${VM_COW:-0}
 CAP_CNODE=${CAP_CNODE:-0}
 TERMINAL_FAULT_ORACLE=${TERMINAL_FAULT_ORACLE:-0}
 TERMINAL_FAULT_FETCH_ORACLE=${TERMINAL_FAULT_FETCH_ORACLE:-0}
+TERMINAL_FAULT_WAITER_ORACLE=${TERMINAL_FAULT_WAITER_ORACLE:-0}
 FAULT_DELIVERY=${FAULT_DELIVERY:-0}
 SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
 GLOBAL_STATE=${GLOBAL_STATE:-0}
@@ -108,10 +109,19 @@ if [[ "$TERMINAL_FAULT_FETCH_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.termi
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.terminal_fault_fetch_oracle=1"
   TERMINAL_FAULT_ORACLE=1
 fi
+# U9-PAGEFAULT2 §4: the WAITER-DELIVERY variant. Same fault, different report ending -- init
+# yields until the supervisor is parked on the fault endpoint, so the report is DELIVERED to a
+# blocked waiter instead of buffered. It reuses the terminal cell's marker chain, so it arms
+# TERMINAL_FAULT_ORACLE too, and it is mutually exclusive with both other scenarios below.
+if [[ "$TERMINAL_FAULT_WAITER_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_waiter_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.terminal_fault_waiter_oracle=1"
+  TERMINAL_FAULT_ORACLE=1
+fi
 # Slot 5 carries exactly ONE scenario and the kernel writes the read selector first, so the two
 # knobs are mutually exclusive here too: arming the fetch scenario must not also pass the read
 # knob, or the read would silently win and the cell would assert a fetch that never happened.
 if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$TERMINAL_FAULT_FETCH_ORACLE" != "1" \
+      && "$TERMINAL_FAULT_WAITER_ORACLE" != "1" \
       && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_oracle="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.terminal_fault_oracle=1"
 fi
@@ -2311,11 +2321,24 @@ u9rx4_require_one "the caller side of the one-shot is revoked once" \
 # `IPC_REPLY_WAKE_CALLER tid=2` count is kept alongside it purely as a reported breakdown.
 u9rx4_caller_wake_legacy="$(u9rx4_count 'IPC_REPLY_WAKE_CALLER tid=2')"
 u9rx4_caller_resume="$(u9rx4_count 'IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 ')"
-if (( u9rx4_caller_resume != 1 )); then
-  echo "[error] U9-RX4: the blocked caller resumes exactly once -- expected exactly 1, got resume=${u9rx4_caller_resume} (legacy_wake=${u9rx4_caller_wake_legacy})"
+# U9-PAGEFAULT2 §4: under the WAITER-DELIVERY oracle tid 2 resumes TWICE, and the second one is
+# the thing that witness exists to observe. That profile registers the supervisor's control
+# endpoint as the fault-handler route, so tid 2 is the blocked waiter the terminal fault's report
+# is delivered to -- through this very marker, because the fault route uses the receive family's
+# own producer rather than a mechanism of its own. Two is therefore the EXACT count there, not a
+# relaxation: one resume for the RX4 reply transaction, one for the fault report.
+if [[ "$TERMINAL_FAULT_WAITER_ORACLE" == "1" ]]; then
+  u9rx4_caller_resume_expected=2
+  u9rx4_caller_resume_desc="the blocked caller resumes exactly twice (reply + fault report)"
+else
+  u9rx4_caller_resume_expected=1
+  u9rx4_caller_resume_desc="the blocked caller resumes exactly once"
+fi
+if (( u9rx4_caller_resume != u9rx4_caller_resume_expected )); then
+  echo "[error] U9-RX4: ${u9rx4_caller_resume_desc} -- expected exactly ${u9rx4_caller_resume_expected}, got resume=${u9rx4_caller_resume} (legacy_wake=${u9rx4_caller_wake_legacy})"
   u9rx4_fail=1
 else
-  echo "[ok] U9-RX4: the blocked caller resumes exactly once (resume=${u9rx4_caller_resume} legacy_wake=${u9rx4_caller_wake_legacy})"
+  echo "[ok] U9-RX4: ${u9rx4_caller_resume_desc} (resume=${u9rx4_caller_resume} legacy_wake=${u9rx4_caller_wake_legacy})"
 fi
 # The defect's own signatures must be gone.
 u9rx4_require_zero "no reply cap is lost to the u32::MAX sentinel" 'reply_cap=4294967295'
@@ -2372,16 +2395,30 @@ pf1t_fail=0
 # U9-PAGEFAULT1 §2: one cell, two scenarios. The chain is identical apart from the access the
 # CPU reports and which decoder produced it, so the assertions are parameterised rather than
 # duplicated -- a second copy would drift.
+# U9-PAGEFAULT2 §4 adds a THIRD: the same read, taken after a waiter is parked, so the report
+# takes the delivery ending instead of the buffered one. `pf1t_report` carries which ending the
+# chain must show, so the report assertions stay parameterised with the rest.
 if [[ "$TERMINAL_FAULT_FETCH_ORACLE" == "1" ]]; then
   pf1t_access=Execute
   pf1t_user_access=fetch
   pf1t_provision=TERMINAL_FAULT_FETCH_ORACLE_PROVISION_OK
   pf1t_slot5=24
+  pf1t_report=buffered
+  pf1t_ep=3
+elif [[ "$TERMINAL_FAULT_WAITER_ORACLE" == "1" ]]; then
+  pf1t_access=Read
+  pf1t_user_access=read
+  pf1t_provision=TERMINAL_FAULT_WAITER_ORACLE_PROVISION_OK
+  pf1t_slot5=25
+  pf1t_report=delivered_to_waiter
+  pf1t_ep=4
 else
   pf1t_access=Read
   pf1t_user_access=read
   pf1t_provision=TERMINAL_FAULT_ORACLE_PROVISION_OK
   pf1t_slot5=23
+  pf1t_report=buffered
+  pf1t_ep=3
 fi
 pf1t_log="$(tr '\r' '\n' <"$LOGFILE")"
 pf1t_count() {
@@ -2422,22 +2459,42 @@ pf1t_require_one "tid 1 ${pf1t_access} fault at 0x0 entered once" \
 pf1t_require_one "the fault is reported unhandled exactly once" \
   "PAGE_FAULT_UNHANDLED tid=1 addr=0x0 access=${pf1t_access}"
 # The exact fault REPORT: buffered to endpoint 3 at its exact generation, with no wake.
-pf1t_require_one "report targets endpoint 3 at its exact generation" \
-  'TASK_FAULT_REPORT_TARGET tid=1 endpoint=3 generation=1'
-pf1t_require_one "report is BUFFERED exactly once with woke=0" \
-  'TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=3 queued=1 woke=0'
+pf1t_require_one "report targets endpoint ${pf1t_ep} at its exact generation" \
+  "TASK_FAULT_REPORT_TARGET tid=1 endpoint=${pf1t_ep} generation=1"
+if [[ "$pf1t_report" == "buffered" ]]; then
+  pf1t_require_one "report is BUFFERED exactly once with woke=0" \
+    "TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=${pf1t_ep} queued=1 woke=0"
+  pf1t_require_zero "and the waiter ending is not taken when no waiter is blocked" \
+    'TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND'
+else
+  # U9-PAGEFAULT2 §4 -- THE WAITER-DELIVERY ENDING, which PAGEFAULT1 declined as "a different
+  # mechanism". The chain proves it is the receive family's own mechanism, driven off-lock:
+  # the endpoint is seen with a waiter BEFORE anything is published, the waiter is found once,
+  # and the report reaches it. Nothing is buffered -- a queued report here would be the
+  # duplicate the waiter-first ordering exists to prevent.
+  pf1t_require_one "the endpoint carries a blocked waiter before anything is published" \
+    "TASK_FAULT_REPORT_QUEUE_STATE_BEFORE endpoint=${pf1t_ep} waiters=1 queued=0"
+  pf1t_require_one "the waiter oracle routed the report to the endpoint the supervisor waits on" \
+    'TERMINAL_FAULT_WAITER_ORACLE_ROUTE_OK tid=2'
+  pf1t_require_one "the blocked waiter is found exactly once" \
+    "TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND endpoint=${pf1t_ep} waiter_tid=2"
+  pf1t_require_zero "and NOTHING is buffered -- no duplicate report" \
+    "TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=${pf1t_ep}"
+  pf1t_require_zero "the waiter hand-off does not fail" \
+    'TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL'
+  pf1t_require_one "init yielded the turns the waiter needed" \
+    "TERMINAL_FAULT_WAITER_ORACLE_YIELD_DONE init_tid=1"
+fi
 # U9-PAGEFAULT2 §2: the report is now delivered by ONE total owner, which names its own ending.
 # The three assertions below are what make "one publication, and the route knows which" live
 # rather than structural: the owner announced itself, it reported exactly one outcome, and that
 # outcome is the buffered one -- not a decline the route used to make before reaching here.
 pf1t_require_one "the report delivery owner runs exactly once" \
   'TASK_FAULT_REPORT_BEGIN tid=1'
-pf1t_require_one "and it reports the BUFFERED ending, off the broad lock" \
-  'TERMINAL_FAULT_SPLIT_REPORT cpu=0 tid=1 outcome=buffered terminates=1 broad_lock=0'
+pf1t_require_one "and it reports the ${pf1t_report} ending, off the broad lock" \
+  "TERMINAL_FAULT_SPLIT_REPORT cpu=0 tid=1 outcome=${pf1t_report} terminates=1 broad_lock=0"
 pf1t_require_zero "no reporting failure on the witnessed path" \
   'TERMINAL_FAULT_SPLIT_REPORT cpu=0 tid=1 outcome=no_route'
-pf1t_require_zero "and the waiter ending is not taken when no waiter is blocked" \
-  'TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND'
 # The task TRANSITION, and the deferral that guarantees the drain applies an incoming context.
 pf1t_require_one "terminal task transition commits exactly once" \
   'TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred'

@@ -61,6 +61,22 @@ pub enum TerminalFaultScenario {
     /// refused outright by the demand screen (a demand page is mapped `USER_RW`, never
     /// executable), so a fetch fault is terminal by construction rather than by elimination.
     DeliberateUnhandledFetch,
+    /// U9-PAGEFAULT2 §4 — the same deliberate unhandled READ, taken only once a fault-report
+    /// WAITER is parked on the supervisor endpoint.
+    ///
+    /// It is a third scenario rather than a flag on the first, because it exercises a different
+    /// ending of the report delivery owner. The read scenario's report is BUFFERED: measured on
+    /// x86_64, the supervisor has not reached its fault-endpoint receive when init faults, so
+    /// `TASK_FAULT_REPORT_QUEUE_STATE_BEFORE` prints `waiters=0` and the report goes to the
+    /// queue. The waiter-delivery ending — the one U9-PAGEFAULT1 declined as "a different
+    /// mechanism" and U9-PAGEFAULT2 §2 converted — has no live witness at all in that ordering.
+    ///
+    /// The only difference is WHEN init faults. It yields, bounded, until the supervisor has had
+    /// enough turns to reach its idle fault receive and block there, and then takes the same
+    /// read at the same address. Nothing about the fault changes; what changes is the state of
+    /// the endpoint the report is routed to, which is exactly the coordinate that selects the
+    /// delivery ending.
+    DeliberateUnhandledReadAfterWaiter,
 }
 
 /// The slot-5 terminal-fault selector. Distinct from every value in the reserved
@@ -83,12 +99,17 @@ pub const AARCH64_TERMINAL_FAULT_SELECTOR: usize = TERMINAL_FAULT_SELECTOR;
 /// range.
 pub const TERMINAL_FAULT_FETCH_SELECTOR: usize = 24;
 
+/// U9-PAGEFAULT2 §4 — the waiter-delivery scenario's selector. The next free value, still clear
+/// of the reserved `ExitCurrentTask` block and the `1..=9` range.
+pub const TERMINAL_FAULT_WAITER_SELECTOR: usize = 25;
+
 /// The selector to write into init's startup slot 5 for `scenario`.
 #[must_use]
 pub const fn terminal_fault_selector(scenario: TerminalFaultScenario) -> usize {
     match scenario {
         TerminalFaultScenario::DeliberateUnhandledRead => TERMINAL_FAULT_SELECTOR,
         TerminalFaultScenario::DeliberateUnhandledFetch => TERMINAL_FAULT_FETCH_SELECTOR,
+        TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter => TERMINAL_FAULT_WAITER_SELECTOR,
     }
 }
 
@@ -100,6 +121,8 @@ pub const fn terminal_fault_scenario_for(slot5: usize) -> Option<TerminalFaultSc
         Some(TerminalFaultScenario::DeliberateUnhandledRead)
     } else if slot5 == TERMINAL_FAULT_FETCH_SELECTOR {
         Some(TerminalFaultScenario::DeliberateUnhandledFetch)
+    } else if slot5 == TERMINAL_FAULT_WAITER_SELECTOR {
+        Some(TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter)
     } else {
         None
     }
@@ -116,6 +139,7 @@ mod tests {
         for s in [
             TerminalFaultScenario::DeliberateUnhandledRead,
             TerminalFaultScenario::DeliberateUnhandledFetch,
+            TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter,
         ] {
             assert_eq!(
                 terminal_fault_scenario_for(terminal_fault_selector(s)),
@@ -127,6 +151,11 @@ mod tests {
         assert_ne!(
             terminal_fault_selector(TerminalFaultScenario::DeliberateUnhandledRead),
             terminal_fault_selector(TerminalFaultScenario::DeliberateUnhandledFetch)
+        );
+        assert_ne!(
+            terminal_fault_selector(TerminalFaultScenario::DeliberateUnhandledRead),
+            terminal_fault_selector(TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter),
+            "the waiter scenario must be distinguishable from the plain read it is built on"
         );
     }
 
@@ -140,6 +169,11 @@ mod tests {
             exit::AARCH64_EXIT_SELECTOR,
             exit::RISCV64_EXIT_SELECTOR,
         ] {
+            assert_ne!(
+                TERMINAL_FAULT_WAITER_SELECTOR, taken,
+                "the waiter scenario's selector may not share a value with a reserved \
+                 ExitCurrentTask selector either"
+            );
             assert_ne!(
                 TERMINAL_FAULT_FETCH_SELECTOR, taken,
                 "the fetch scenario's selector may not share a value with a reserved \

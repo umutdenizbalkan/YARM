@@ -3596,6 +3596,32 @@ pub fn terminal_fault_fetch_oracle_enabled() -> bool {
 pub const TERMINAL_FAULT_FETCH_ORACLE_SELECTOR: u64 =
     yarm_ipc_abi::terminal_fault_oracle_abi::TERMINAL_FAULT_FETCH_SELECTOR as u64;
 
+/// U9-PAGEFAULT2 §4 — the WAITER-DELIVERY terminal-fault oracle.
+///
+/// The same deliberate unhandled read, taken only after init has yielded enough turns for the
+/// supervisor to reach its idle fault-endpoint receive and block there. It exists because the
+/// read scenario's ordering was MEASURED and does not produce a waiter: the supervisor has not
+/// reached that receive when init faults, so `TASK_FAULT_REPORT_QUEUE_STATE_BEFORE` prints
+/// `waiters=0` on every boot and the report is buffered. The waiter-delivery ending — converted
+/// by §2 from a decline into a settlement — therefore had no live witness at all.
+///
+/// Default-off, and mutually exclusive with the other two scenarios by the shared
+/// `init_args[5] == 0` guard; `yarm.terminal_fault_waiter_oracle=1` arms it.
+pub(crate) static TERMINAL_FAULT_WAITER_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_terminal_fault_waiter_oracle_enabled(enabled: bool) {
+    TERMINAL_FAULT_WAITER_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn terminal_fault_waiter_oracle_enabled() -> bool {
+    TERMINAL_FAULT_WAITER_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The waiter scenario's slot-5 selector, from the same single owner.
+pub const TERMINAL_FAULT_WAITER_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::terminal_fault_oracle_abi::TERMINAL_FAULT_WAITER_SELECTOR as u64;
+
 /// Stage 196A: default-off RISC-V post-lock-drain FOUNDATION oracle selector.
 /// When enabled, the RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`)
 /// publishes a one-shot post-work token during its broad-lock (`with_cpu`) phase

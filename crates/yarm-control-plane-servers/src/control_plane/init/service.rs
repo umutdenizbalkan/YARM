@@ -887,7 +887,7 @@ fn run_terminal_fault_oracle(
         "riscv64"
     };
     let access = match scenario {
-        S::DeliberateUnhandledRead => "read",
+        S::DeliberateUnhandledRead | S::DeliberateUnhandledReadAfterWaiter => "read",
         S::DeliberateUnhandledFetch => "fetch",
     };
     yarm_user_rt::user_log!(
@@ -941,6 +941,41 @@ fn run_terminal_fault_oracle(
         unsafe {
             core::arch::asm!("li t0, 0", "jr t0", options(noreturn))
         };
+    }
+    // U9-PAGEFAULT2 §4 — THE WAITER SCENARIO: yield first, then take the same read.
+    //
+    // The fault is identical; what differs is the state of the endpoint the report is routed to.
+    // Measured on x86_64 with the plain read scenario, `TASK_FAULT_REPORT_QUEUE_STATE_BEFORE`
+    // prints `waiters=0` on every boot — init faults before the supervisor has reached its idle
+    // fault-endpoint receive, so the report is BUFFERED and the waiter-delivery ending §2
+    // converted has no live witness.
+    //
+    // Yielding hands the CPU to the supervisor and takes it straight back, which is exactly what
+    // this needs: init stays Runnable throughout, so it is re-dispatched and reaches the read,
+    // while the supervisor gets the turns it needs to finish registering and park on the fault
+    // endpoint. The bound is a fixed count rather than a condition on the supervisor's state:
+    // init has no way to observe that state, and a wait predicated on something unobservable
+    // would be a hang rather than a witness. If the count is not enough, the report simply takes
+    // the buffered ending and the cell FAILS — it does not pass on a weaker chain.
+    if matches!(scenario, S::DeliberateUnhandledReadAfterWaiter) {
+        const YIELD_TURNS: u32 = 4096;
+        yarm_user_rt::user_log!(
+            "TERMINAL_FAULT_WAITER_ORACLE_YIELD_BEGIN init_tid={} turns={}",
+            init_tid,
+            YIELD_TURNS
+        );
+        let mut completed = 0u32;
+        for _ in 0..YIELD_TURNS {
+            if yarm_user_rt::syscall::yield_now().is_err() {
+                break;
+            }
+            completed += 1;
+        }
+        yarm_user_rt::user_log!(
+            "TERMINAL_FAULT_WAITER_ORACLE_YIELD_DONE init_tid={} completed={}",
+            init_tid,
+            completed
+        );
     }
     // SAFETY: this read is INTENDED to fault. Address 0 is never mapped in a user address space,
     // so the access raises a translation fault the kernel reports unhandled and turns into a

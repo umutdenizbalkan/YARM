@@ -340,6 +340,10 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::yarm_log!("YARM_TERMINAL_FAULT_FETCH_ORACLE_SET enabled={}", enabled);
         crate::kernel::boot::set_terminal_fault_fetch_oracle_enabled(enabled);
     }
+    if let Some(enabled) = parsed.terminal_fault_waiter_oracle {
+        crate::yarm_log!("YARM_TERMINAL_FAULT_WAITER_ORACLE_SET enabled={}", enabled);
+        crate::kernel::boot::set_terminal_fault_waiter_oracle_enabled(enabled);
+    }
     if let Some(enabled) = parsed.aarch64_terminal_fault_oracle {
         // 199E-A64CALL: default-off AArch64 TERMINAL-FAULT oracle knob (slot 5 = 23, A64-DEPTH; it
         // was 21 until that collided with the reserved AArch64 ExitCurrentTask selector). Gives the
@@ -838,6 +842,11 @@ pub struct YarmBootOptions<'a> {
     /// deliberate unhandled INSTRUCTION FETCH from address 0, exercising each architecture's
     /// instruction-abort decode rather than its data-abort decode.
     pub terminal_fault_fetch_oracle: Option<bool>,
+    /// U9-PAGEFAULT2 §4: `yarm.terminal_fault_waiter_oracle=1` DEFAULT-OFF knob — init takes the
+    /// same deliberate unhandled read, but only after yielding enough turns for the supervisor to
+    /// park on the fault endpoint, so the report takes the WAITER-DELIVERY ending instead of the
+    /// buffered one.
+    pub terminal_fault_waiter_oracle: Option<bool>,
     /// Stage 196A: `yarm.riscv64_post_lock_foundation_oracle=1` DEFAULT-OFF knob. Arms the RISC-V
     /// shared trap wrapper's one-shot post-lock-drain FOUNDATION oracle (publish token in the
     /// broad-lock phase, consume it after the lock drops via a real `with_cpu` re-acquire). It
@@ -1179,6 +1188,11 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         // be confused by a typo in a numeric argument.
         if key == b"yarm.terminal_fault_fetch_oracle" {
             options.terminal_fault_fetch_oracle = parse_bool_knob(value);
+        }
+        // U9-PAGEFAULT2 §4: the waiter-delivery scenario's own knob, named for the same reason
+        // the fetch scenario has one — each scenario is armed by name, never by a number.
+        if key == b"yarm.terminal_fault_waiter_oracle" {
+            options.terminal_fault_waiter_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.riscv64_post_lock_foundation_oracle" {
             options.riscv64_post_lock_foundation_oracle = parse_bool_knob(value);

@@ -821,6 +821,36 @@ pub fn bootstrap_first_user_task(
         kernel.set_supervisor_endpoint_for_task(RING3_SUPERVISOR_TID, fault_cap)?;
     }
 
+    // U9-PAGEFAULT2 §4 — the WAITER-DELIVERY witness's one provisioning difference.
+    //
+    // The fault report is routed to the FAULT-HANDLER endpoint when one is registered, and to
+    // the supervisor endpoint otherwise. This profile registers only the latter, and the
+    // supervisor does not wait on it: MEASURED on this boot, the supervisor is blocked in
+    // `recv` on its CONTROL endpoint when init faults, and the supervisor endpoint shows
+    // `waiters=0`. So every terminal fault takes the buffered ending and the waiter-delivery
+    // ending — the one U9-PAGEFAULT1 declined as "a different mechanism" and §2 converted — has
+    // no live witness in any profile.
+    //
+    // Registering the endpoint the supervisor ACTUALLY waits on as the fault handler is not a
+    // contrivance: that is what a fault-handler registration is for, and it is the ordinary
+    // configuration for a system whose supervisor services faults from its main receive. The
+    // route, the delivery owner and the waiter's own receive machinery are all unchanged — the
+    // only thing that changes is which registered endpoint the report resolves to, which is
+    // exactly the coordinate that selects the delivery ending.
+    //
+    // Default-off, and scoped to this oracle: with the knob unarmed nothing here runs and the
+    // fault-handler route stays unregistered, exactly as it is today.
+    if crate::kernel::boot::terminal_fault_waiter_oracle_enabled()
+        && let Some(ctrl_cap) = sup_ctrl_recv_sup
+    {
+        kernel.set_fault_handler_for_task(RING3_SUPERVISOR_TID, ctrl_cap)?;
+        crate::yarm_log!(
+            "TERMINAL_FAULT_WAITER_ORACLE_ROUTE_OK tid={} cap={} result=ok",
+            RING3_SUPERVISOR_TID,
+            ctrl_cap.0
+        );
+    }
+
     if let Some((sup_asid, sup_entry, sup_heap)) = supervisor_aei {
         let mut sup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
         sup_args[0] = RING3_SUPERVISOR_TID;
@@ -1133,6 +1163,18 @@ pub fn bootstrap_first_user_task(
         init_args[5] = crate::kernel::boot::TERMINAL_FAULT_FETCH_ORACLE_SELECTOR;
         crate::yarm_log!(
             "TERMINAL_FAULT_FETCH_ORACLE_PROVISION_OK arch=x86_64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
+    }
+    // U9-PAGEFAULT2 §4: the WAITER-DELIVERY scenario. Mutually exclusive with the other two by
+    // the same `init_args[5] == 0` guard, and it needs no provisioned caps either — the waiter
+    // it depends on is the SUPERVISOR, which already holds the fault endpoint's receive
+    // capability from its own boot grant. The only thing this scenario changes is when init
+    // faults relative to that supervisor reaching its idle receive.
+    if crate::kernel::boot::terminal_fault_waiter_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::TERMINAL_FAULT_WAITER_ORACLE_SELECTOR;
+        crate::yarm_log!(
+            "TERMINAL_FAULT_WAITER_ORACLE_PROVISION_OK arch=x86_64 slot5={} caps=none result=ok",
             init_args[5]
         );
     }
