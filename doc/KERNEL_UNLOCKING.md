@@ -20958,3 +20958,258 @@ numeric TID is still current; a blocked entering task forfeits even while curren
 deferral case proves both halves of the incumbent argument — the cell still names the incumbent
 after the refused CAS, and the bridge samples that cell *after* the PageFault routes, so the
 drain still sees it.
+
+---
+
+# U9-IRQ-UNKNOWN1 — removing ExternalInterrupt and Unknown from terminal broad dispatch
+
+Base: `fc582912`. Main untouched at `8f30f3b9`.
+
+## §1 — the per-port boundary, derived
+
+### The chain, per architecture
+
+| step | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| hardware entry | IDT vector → `trap_entry` | vector table entry, claims via `GICC_IAR` | `stvec` → `handle_riscv_trap_entry_shared` |
+| event decoding | `decode_trap_context` → `TrapEvent::ExternalInterrupt(vector)` | same, from the claimed IRQ id | `decode_trap_context` → `ExternalInterrupt(context.stval as u16)` |
+| IRQ identity / claim | the vector number IS the identity | `GICC_IAR` read in the vector entry | **none — see below** |
+| route lookup | `ipc.irq_routes[line]` | same | same |
+| notification publication | `Notification::send_irq` | same | same |
+| waiter wake / enqueue | `notification_waiters[idx]` → task transition → `enqueue_task` | same | same |
+| controller completion | LAPIC EOI, via `acknowledge_interrupt` | **vector tail** `complete_interrupt` — `acknowledge_interrupt` is inert | PLIC complete, via `acknowledge_interrupt` → `external_irq_eoi` |
+| architectural return | `iret` through the untouched frame | `eret` | `sret` |
+
+**Timers, IPIs and spurious interrupts are separate and stay separate.** A timer is
+`TrapEvent::TimerInterrupt` with its own route, its own `acknowledge_interrupt(cpu, 0)` and its
+own re-arm; on RISC-V the SBI `set_timer` is itself the completion. IPIs do not reach this
+decode. A spurious or unrouted line decodes as an ordinary `ExternalInterrupt` and is answered by
+`IrqDeliveryOutcome::NoRoute`, which is benign — exactly as the broad form answers it.
+
+### Two defects the derivation found
+
+**1. AArch64 issued TWO EOIRs per claim.** The vector entry claims via `GICC_IAR`
+(`aarch64/boot.rs`) and the vector tail completes via `complete_interrupt`, whose own comment says
+"exactly one completion per claim". The broad arm then ALSO called `external_irq_eoi` →
+`gic_write_eoir` for the same claim. `acknowledge_interrupt` exists precisely to be the correctly
+scoped seam — it is deliberately inert on this port, and its doc comment says why — but the broad
+arm used the raw write instead. The split route uses the scoped seam, so nothing is added beside
+the architecture tail that already completes the interrupt.
+
+**2. RISC-V has no IRQ identity at all.** `decode_trap_context` builds
+`ExternalInterrupt(context.stval as u16)`. `stval` is architecturally **0** for an interrupt, and
+`external_irq_eoi` explicitly refuses source 0 because the PLIC spec reserves it to mean "no
+interrupt". So on this port the decoded value is not a controller claim, no claim is ever read,
+and no completion is ever issued. **The route refuses on RISC-V**, measurably
+(`IRQ1_SPLIT_REFUSED ... reason=riscv_identifier_is_not_a_claim`), rather than treating `stval` as
+an identity and delivering every arrival to line 0. The barrier is named, not hidden: RISC-V needs
+`PLIC_CLAIM` read in its vector entry before a device interrupt has an identity to route. That is
+controller work, not unlocking work, and it is out of this mission's scope.
+
+### Unknown — the production and hosted contracts
+
+`STRICT_UNKNOWN_TRAPS = !cfg!(feature = "hosted-dev")`. The broad arm's `TrapEvent::Unknown` arm
+is three things: a diagnostic line naming the CPU and architectural code, a default-off
+`FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL` classification marker, and `panic!` under the strict bit.
+Hosted is not strict and falls through to `handle_trap(Trap::Unknown)`, which returns `Ok(())`.
+All three parts are preserved, including which build is strict.
+
+## §2 — one IRQ delivery policy, subsystem acquisitions
+
+### The owner
+
+`SharedKernel::deliver_external_irq_split(cpu, irq_line) -> IrqDeliveryOutcome`, in three
+**disjoint, never-nested** acquisitions in descending rank:
+
+1. **rank 3 (IPC), one acquisition** — resolve `irq_routes[line]`, verify the notification object
+   is still there, `send_irq`, read the slot's generation, and **take** the waiter record. Doing
+   all five under one acquisition is what closes the first concurrency boundary §2 names: the
+   route cannot be resolved against one object and published into a replacement that took the
+   slot afterwards, and the taken record cannot be delivered twice.
+2. **rank 2 (task)** — `wake_notification_waiter_exact_split(record)`: the three-part identity
+   proof, below.
+3. **rank 1 (scheduler)** — `enqueue_task_split`, the same planner and committer the broad
+   `enqueue_task` drives, so placement cannot drift from it.
+
+Higher-ranked domains are released before the lower-ranked wake and scheduler work, which is the
+rank discipline this codebase has maintained throughout.
+
+### Six nameable endings, none of them a broad fallback
+
+`NoRoute | TargetGone | Delivered | DeliveredAndWoke | DeliveredWaiterStale | Failed`. Five settle
+the trap; only `Failed` propagates, carrying the same error the broad form's `?` carried — a full
+notification queue is `EndpointQueueFull` and leaves the trap as an error rather than being
+silently dropped. **Every recognized `ExternalInterrupt` outcome settles without broad fallback**,
+including no route, a stale target and a delivery error.
+
+### The waiter identity repair
+
+`notification_waiters` was `[Option<ThreadId>; N]` and the wake gated on
+`matches!(tcb.status, TaskStatus::Blocked(_))` — a bare TID plus `Blocked(_)`. If the task at that
+TID had since re-blocked on an endpoint receive, the wake landed on a **valid, unrelated** wait.
+Off the broad lock this stops being a latent hazard and becomes a live one, because a device
+interrupt is exactly the event that arrives asynchronously against a receive.
+
+The slot now holds `EndpointWaiterRecord { ReceiverWaiterIdentity { tid, asid }, wait_generation }`
+— the same record `endpoint_waiters` has carried since WA3C1 — and the producer
+(`ipc_recv_with_optional_deadline`'s notification arm) bumps `blocked_recv_generation` and
+publishes the record it just minted. The wake requires **all three** of asid, that generation, and
+`Blocked(EndpointReceive(_))`. A mismatch returns `false`: the signal stands, nothing is woken, and
+no unrelated endpoint waiter is consumed, cancelled or retired.
+
+No new `WaitReason` variant was added. That substitution is stated in
+`KERNEL_UNLOCK_AUDIT.md §E.2-R` rather than reported as parity: a notification receive blocks as
+an endpoint receive at the task layer, so the exact token that answers "is this task still in the
+wait I published?" already existed, and a new reason tag would restate the first three facts
+rather than add a fourth.
+
+**One rule, written once.** `signal_notification` and `wake_destroyed_notification_waiter` each
+carried a copy of the old rule; both now call `wake_notification_waiter_exact`, and off-lock
+callers call `wake_notification_waiter_exact_split`, which applies the identical proof under a
+rank-2 acquisition because off-lock code can never obtain a `&mut KernelState`. The status-writer
+census moves −2 +1 in `ipc_state.rs` and +1 in `runtime.rs`, and the total is unchanged at 47.
+
+### Both bridges, and the acknowledgement
+
+`settle_external_interrupt_at_bridge(shared, cpu, irq)` is the bridges' **whole** external-
+interrupt body, in one owner: dispatch, and on a settled delivery acknowledge the controller with
+interrupts masked across the pair. `Some(result)` means the route settled the trap; `None` means
+it declined and **nothing was acknowledged**, because completing work this kernel did not perform
+is how an interrupt gets completed twice. Both bridges call it and neither keeps a copy — two
+inline copies of an acknowledgement sequence is exactly the shape that grows a duplicate when one
+of them is edited.
+
+The gate gains a fourth arm, `irq_handled`, with its own skip reason `irq_delivered`: a delivered
+interrupt recovered nothing, published no deferral and owes the architecture tail no syscall work,
+so it names itself rather than borrowing another route's reason. The join gains a fourth cell,
+`Ok(irq_result.or(terminal_result).or(demand_result).or(cow_result).unwrap_or(Ok(())))`, with the
+IRQ cell first — not a precedence claim, since the IRQ route runs before the fault decode and
+gates all three fault routes out, but because a delivery error would otherwise be downgraded to
+`Ok(())` at the tail, exactly as the terminal route's result once was.
+
+**The interrupted continuation is preserved.** The route takes no frame — it cannot express a
+frame mutation — and the bridge arm touches no register, no PC and no syscall result. An
+asynchronous interrupt returns through the frame it interrupted, untouched.
+
+**No broad acquisition was added or reclassified.** Every seam composes existing ranked owners.
+
+## §3 — Unknown, closed independently
+
+The policy moves before the broad acquisition, into one owner. The fatal encoding is
+`crate::kernel::boot::unknown_trap_fatal(cpu, arch_code) -> !`: the same diagnostic line, the same
+default-off classification marker, the same panic message, taking the CPU and architectural code
+the hardware supplied rather than an ambient re-read.
+
+It is deliberately **not** `cfg`-gated. A divergence that exists only in the build which cannot
+execute its own tests is a policy nothing checks; what is gated is *reachability* — production
+calls it, hosted declines to the broad arm's existing `Ok(())` route — so a hosted test exercises
+the exact ending production takes without making hosted strict.
+
+An unknown trap is not reclassified as a user page fault, no victim is fabricated for it, and it
+is never a successful production return; guards assert the absence of each.
+
+**Trap-window retirement at the diverging boundary.** A `panic!` never unwinds back to
+`TrapPathWindow::drop`, so both bridges now `retire()` and `settle()` before calling the route,
+guarded by the policy's own divergence bit. Without it the next trap on that CPU would report
+`TRAP_DISPATCH_WINDOW_ABANDONED` for an abandonment this boundary manufactured. Both calls are
+idempotent, so the hosted path — which declines and continues — loses nothing.
+
+## §4 — the evidence, and what each kind of it is worth
+
+Three kinds, kept apart on purpose.
+
+**Production-owner tests (12).** `deliver_external_irq_split` and
+`wake_notification_waiter_exact_split` driven against real kernel state, comparing the real
+post-state of the notification object, the TCB and the scheduler — not just the returned enum:
+pending delivery with no waiter (and the signal receivable afterwards); a published waiter proven,
+woken to `Runnable` and `QueuedForDispatch`, with its record consumed; repeated signals waking
+exactly once; an unrouted line mutating nothing; a route that outlived its object; a **reused
+notification slot** distinguished by generation; a later block by the same TID left intact; a
+competing exit not resurrected; a competing wake not applied twice; a replacement incarnation at
+the same TID refused; a full queue propagating `EndpointQueueFull`.
+
+**Source-derived per-port acknowledgement facts (7).** One acknowledgement, in one body, inside
+the masked window, after the delivery policy, never on a decline; the raw `external_irq_eoi` /
+`complete_external_interrupt` absent from it; each port's own seam doing what that port owns
+(x86_64 LAPIC EOI guarded on `LAPIC_CONFIGURED`; AArch64 inert with the vector tail owning
+completion; RISC-V PLIC complete refusing the reserved source 0); the RISC-V refusal preceding any
+delivery attempt; and the frame untouched. This is derivation from the executed bodies, which is
+the only honest way to state a controller-protocol property from a host build.
+
+**Injected bridge evidence (6) — read the label as a limitation.** No port has a production IRQ
+producer: RISC-V enumerates PLIC sources and deliberately enables none, and neither other port
+binds a device line. A narrow, default-off admission (`IRQ1_HOSTED_BRIDGE_INJECTION`, compiled
+only into `test`/`hosted-dev` builds, read behind `cfg!(feature = "hosted-dev")`) lets a hosted
+test drive the bridge's own body. It exercises the real delivery policy, the real acknowledgement
+seam, the real `Option` encoding and real kernel state; the arrival is synthetic. It does **not**
+establish that any controller raises a line into this kernel, that the acknowledgement lands
+correctly against a real claim, or that an asynchronous architectural entry resumes the
+interrupted context. It is not hardware-controller qualification.
+
+**Unknown (5).** `the_fatal_encoding_diverges_with_the_broad_arms_message` runs the diverging body
+production reaches, under `#[should_panic]`. The rest pin the divergence bit, the hosted decline,
+the preserved markers, the absence of user-fault reclassification, and window retirement on both
+bridges.
+
+**Mutation guards.** A renewed broad fall-through fails
+`a_handled_interrupt_cannot_reach_the_broad_dispatcher` (the flag is raised in exactly one place,
+cleared nowhere, and admitted by the gate). A duplicate completion fails
+`no_second_completion_is_issued_for_one_claim` (exactly one device acknowledgement in the split
+phase, zero in either bridge, one call to the one owner from each). The timer's own
+`acknowledge_interrupt(cpu, 0)` is counted separately and must stay unduplicated — a device line
+is never 0, and the RISC-V PLIC completion refuses 0 as reserved.
+
+## §5 — qualification
+
+Frozen at `fbfc2eaa`, tree `b812ac8d`, working tree clean, artifacts rebuilt from it.
+
+### 1. Source reachability
+
+| event family | reaches broad dispatch | settles pre-lock |
+|---|---|---|
+| `ExternalInterrupt`, x86_64 / AArch64 | never, for any recognized line | all six outcomes |
+| `ExternalInterrupt`, RISC-V | **yes — refused by the route** | none, and the refusal is measurable |
+| `Unknown`, production | never | diverges, window retired first |
+| `Unknown`, hosted | yes, unchanged | declines by design |
+
+The RISC-V row is the mission's one remaining barrier and it is named precisely: this port has no
+IRQ identity to route until `PLIC_CLAIM` is read in its vector entry.
+
+### 2. Exercised outcomes
+
+| cell | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| default profile, IRQ arrivals | 0 | 0 | 0 |
+| default profile, Unknown traps | 0 | 0 | 0 |
+| default profile, `PF1_BROAD_ARRIVAL` | 0 | 0 | 0 |
+| default profile, abandoned trap windows | 0 | 0 | 0 |
+| terminal READ witness | chain complete, broad=0 | chain complete, broad=0 | chain complete, broad=0 |
+| terminal FETCH witness | chain complete, broad=0 | chain complete, broad=0 | chain complete, broad=0 |
+| demand witness (issuing profiles) | `rounds=8 recovered=8 regs_ok=8 result=ok` | not issued on this profile | `rounds=8 recovered=8 regs_ok=8 result=ok` |
+| timer idle return | `rounds=24 advances=12 parks=1 result=ok` | — | — |
+
+**Zero IRQ arrivals is the honest count, and it proves nothing about delivery.** What it does
+establish is that this change is inert on every default profile: no port's ordinary boot takes a
+device interrupt or an unknown trap, and the service chains are unchanged. The delivery evidence
+is the production-owner and injected work in §4, labelled as such. Enabling a real source is
+hardware bring-up and is deliberately not attempted here.
+
+### 3. Acquisition census — reported separately
+
+| | value | required |
+|---|---|---|
+| `AUDITED_WITH_CPU_TOTAL` | 2 | 2 |
+| `AUDITED_WITH_BROAD_TOTAL` | 0 | 0 |
+| `AUDITED_STATE_LOCK_TOTAL` (raw wrapper bodies) | 3 | 3 |
+| `broad_lock_census_guard` | 7 pass / 0 fail | 7/7 |
+
+### 4. Gates
+
+| gate | result |
+|---|---|
+| hosted lib, `--test-threads=1` | **5760 pass / 0 fail** / 2 ignored |
+| every other integration target | all pass |
+| `server_dies_runner_scope` | **8 pass / 2 fail** — the exact carve-out, the named pair |
+| `broad_lock_census_guard` | 7/7 |
+| `doc_fragmentation_guard` | 7/7 |
+| freestanding builds | x86_64, AArch64, RISC-V — all clean |
