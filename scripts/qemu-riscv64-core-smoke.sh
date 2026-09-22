@@ -1208,6 +1208,14 @@ pf1t_require_one "report targets endpoint 3 at its exact generation" \
   'TASK_FAULT_REPORT_TARGET tid=1 endpoint=3 generation=1'
 pf1t_require_one "report is BUFFERED exactly once with woke=0" \
   'TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=3 queued=1 woke=0'
+# U9-PAGEFAULT2 §2: ONE total delivery owner now names its own ending. These make "exactly one
+# publication, and the route knows which" live rather than structural.
+pf1t_require_one "the report delivery owner runs exactly once" \
+  'TASK_FAULT_REPORT_BEGIN tid=1'
+pf1t_require_one "and it reports the BUFFERED ending, off the broad lock" \
+  'TERMINAL_FAULT_SPLIT_REPORT cpu=0 tid=1 outcome=buffered terminates=1 broad_lock=0'
+pf1t_require_zero "and the waiter ending is not taken when no waiter is blocked" \
+  'TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND'
 pf1t_require_one "terminal task transition commits exactly once" \
   'TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred'
 pf1t_require_one "the queue-advance deferral is published exactly once" \
@@ -1231,6 +1239,15 @@ pf1t_require_zero "no split refusal on the witnessed path" 'TERMINAL_FAULT_SPLIT
 pf1t_require_zero "no fail-closed settlement on the witnessed path" \
   'TERMINAL_FAULT_SPLIT_FAILED_CLOSED'
 pf1t_require_zero "no unattributable fault on the witnessed path" 'PF1_UNATTRIBUTABLE_FAULT'
+# U9-PAGEFAULT2 §3: none of the newly settled refusals fire on the clean path. Each is a real
+# settlement now rather than a fall-through, so a silent appearance here would change the
+# witnessed outcome rather than merely hand it to the broad arm.
+pf1t_require_zero "no raced recovery class reaches the terminal route" \
+  'TERMINAL_FAULT_SPLIT_RACED'
+pf1t_require_zero "the queue admission is not refused under the trap authority" \
+  'TERMINAL_FAULT_SPLIT_REFUSED cpu=0 tid=1 phase=queue_admit'
+pf1t_require_zero "the deferral is not contended" \
+  'TERMINAL_FAULT_SPLIT_REFUSED cpu=0 tid=1 phase=defer'
 if [[ "$pf1t_fail" -eq 1 ]]; then
   echo "[error] U9-PAGEFAULT1 RISC-V terminal-fault witness FAILED"
   exit 1

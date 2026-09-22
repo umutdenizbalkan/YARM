@@ -150872,6 +150872,680 @@ mod u9rx3_route {
 /// These pin the properties whose violation is a leak or a hang rather than a wrong value, so
 /// each is asserted positively over the transaction's own source and typed outcomes rather than
 /// inferred from the absence of a marker.
+/// U9-PAGEFAULT2 §4 — **THE PAGEFAULT FAMILY CLOSURE PROOF.**
+///
+/// A `Split*` row in `page_fault_route_for` is not closure and never was. A row says the family
+/// is ALLOWED to take a class; it says nothing about whether the route then hands the fault back.
+/// Between the row and the broad dispatcher sit three route bodies, three settlement helpers, a
+/// disposition encoding and two architecture bridges, and a fault escapes if ANY of them yields
+/// `NotHandled` for a coordinate the family recognizes.
+///
+/// So this module follows that control flow instead of asserting the row: it enumerates every
+/// `NotHandled` the family can produce, in the routes AND in the helpers they tail-call, pins
+/// each to a named reason, and then checks that the bridges encode what the routes return.
+///
+/// A new escape fails `every_not_handled_site_is_enumerated` by COUNT before anyone has to
+/// notice it, which is the property a whitelist buys and a matrix row does not.
+/// U9-PAGEFAULT2 §4 — **DIFFERENTIAL AND INTERLEAVING CASES FOR THE NEWLY SETTLED OUTCOMES.**
+///
+/// Source guards prove the route has an arm. These prove the arm is the right one, by driving
+/// the PRODUCTION owners on a real `SharedKernel` and reading the post-state back: the report
+/// count, the wake count, the exact task identity and status, and the endpoint's own queue.
+///
+/// Every fixture below builds the interleaving it names rather than asserting that it cannot
+/// happen — a refusal that is merely unreachable in the fixture proves nothing about the refusal.
+mod u9pagefault2_settlement {
+    use crate::kernel::boot::{
+        Bootstrap, FaultReportFailure as F, FaultReportOutcome as O, QueueAdvanceApply,
+        QueueAdvanceRefusal, TerminalFaultPolicyRefusal as PR,
+    };
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::trap::{FaultAccess, FaultInfo};
+    use crate::kernel::vm::VirtAddr;
+    use crate::runtime::{DispatchAuthority, SharedKernel};
+
+    const CPU: CpuId = CpuId(0);
+    const VA: u64 = 0x4_1000;
+
+    fn fault() -> FaultInfo {
+        FaultInfo::user(VirtAddr(VA), FaultAccess::Read)
+    }
+
+    /// A kernel whose task 0 is current, bound to an address space, with `tid` registered and
+    /// enqueued behind it. Returns task 0's ASID — the coordinate every policy read below is
+    /// revalidated against.
+    fn kernel_with_current() -> (SharedKernel, crate::kernel::vm::Asid) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            let (asid, _map) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(0, asid).expect("bind");
+            asid
+        });
+        (k, asid)
+    }
+
+    /// A scoped arming of this CPU's lock-drop window, RESTORED on drop.
+    ///
+    /// The flag and the trap-dispatch window are process globals, and the hosted suite runs
+    /// single-threaded — a test that arms one and walks away changes the world every later test
+    /// runs in. Restoring is not tidiness here: leaving the drainer flag set made a later case
+    /// take an off-lock path its fixture had not prepared and spin.
+    struct ArmedTrapWindow {
+        idx: usize,
+        previous_flag: bool,
+        epoch: u64,
+    }
+
+    impl ArmedTrapWindow {
+        fn establish(cpu: CpuId) -> Self {
+            let idx = cpu.0 as usize;
+            let previous_flag = crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[idx]
+                .load(core::sync::atomic::Ordering::Relaxed);
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[idx]
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+            let (epoch, _displaced) = crate::kernel::boot::open_trap_dispatch_window(idx);
+            Self {
+                idx,
+                previous_flag,
+                epoch,
+            }
+        }
+
+        fn authority(&self) -> DispatchAuthority {
+            DispatchAuthority::mint(CpuId(self.idx as u8), self.epoch)
+        }
+    }
+
+    impl Drop for ArmedTrapWindow {
+        fn drop(&mut self) {
+            crate::kernel::boot::close_trap_dispatch_window(self.idx, self.epoch);
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[self.idx]
+                .store(self.previous_flag, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// How many reports the endpoint is holding, read through the IPC owner's own accessor.
+    fn queued(k: &SharedKernel, ep: usize) -> usize {
+        k.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.endpoints[ep]
+                    .as_ref()
+                    .map(|e| crate::kernel::boot::kernel_ref(e).queued())
+                    .expect("the endpoint exists")
+            })
+        })
+    }
+
+    /// Register an endpoint of `capacity` as the FAULT HANDLER route, and return its index.
+    fn fault_endpoint(k: &SharedKernel, capacity: usize) -> usize {
+        k.with(|s| {
+            let (eid, _send, recv) = s.create_endpoint(capacity).expect("endpoint");
+            s.set_fault_handler(recv).expect("set handler");
+            eid
+        })
+    }
+
+    // ── The policy read: three refusals that used to be one decline ────────────────────────
+
+    /// **`NoCurrentTask` — and nothing is published for it.**
+    ///
+    /// The route answers this with the broad emitter's own `Err(TaskMissing)`, which is a fatal.
+    /// What must be true BEFORE that is that the owner refused without touching anything: the
+    /// endpoint is untouched, so the fatal is a settlement of an unreportable fault rather than
+    /// a fatal taken after a partial publication.
+    #[test]
+    fn the_policy_read_refuses_an_absent_current_task_without_publishing() {
+        let (k, asid) = kernel_with_current();
+        let ep = fault_endpoint(&k, 4);
+        let queued_before = queued(&k, ep);
+
+        // THE INTERLEAVING: `current` is cleared between classification and the policy read,
+        // through the SAME owner a competing descheduler uses — `block_current_cpu` is what the
+        // broad emitter itself calls, so the state under test is one production can reach.
+        k.with(|s| {
+            s.block_current_cpu().expect("fixture: task 0 was current");
+        });
+
+        assert_eq!(
+            k.read_terminal_fault_policy_shared(CPU, 0, asid),
+            Err(PR::NoCurrentTask),
+            "no current task is its own refusal, not a generic policy failure"
+        );
+        assert_eq!(
+            queued(&k, ep),
+            queued_before,
+            "a refused policy read publishes nothing"
+        );
+    }
+
+    /// **`NotCurrentTask` — the victim we classified is not the victim the CPU is running.**
+    ///
+    /// This is the refusal the route settles by RETRYING rather than falling back, and the
+    /// reason is visible here: the owner still reports a refusal for tid 0 while the CPU is
+    /// running someone else. Falling back would hand the fault to the broad arm, which reads
+    /// `current_tid()` afresh and would terminate THAT task for THIS fault.
+    #[test]
+    fn the_policy_read_refuses_a_victim_that_is_no_longer_current() {
+        let (k, asid) = kernel_with_current();
+        // THE INTERLEAVING: a competing dispatch takes the CPU, through the scheduler's own
+        // owners — task 0 is blocked out and task 1 is dispatched in its place.
+        k.with(|s| {
+            s.register_task(1).expect("task 1");
+            s.enqueue_on_cpu(CPU, 1).expect("enqueue task 1");
+            s.block_current_cpu().expect("fixture: task 0 was current");
+            assert_eq!(s.dispatch_next_on_cpu(CPU), Some(1), "fixture: task 1 wins");
+        });
+        assert_eq!(
+            k.read_terminal_fault_policy_shared(CPU, 0, asid),
+            Err(PR::NotCurrentTask),
+            "a stale victim is refused by identity, never silently retargeted"
+        );
+        // And the competing winner is untouched: no status moved, nothing was blocked.
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            Some(1),
+            "the competing winner keeps the CPU"
+        );
+    }
+
+    /// **`NotCurrentTask` again — same tid, different address space.**
+    ///
+    /// `{tid, asid}` is the incarnation coordinate, so a reused numeric TID in a fresh address
+    /// space must not satisfy a policy read taken against the old one.
+    #[test]
+    fn the_policy_read_refuses_a_reused_tid_in_a_new_address_space() {
+        let (k, _asid) = kernel_with_current();
+        let stale = k.with(|s| {
+            let (other, _map) = s.create_user_address_space().expect("second asid");
+            other
+        });
+        assert_eq!(
+            k.read_terminal_fault_policy_shared(CPU, 0, stale),
+            Err(PR::NotCurrentTask),
+            "the ASID is revalidated, so a reused TID cannot inherit the old incarnation"
+        );
+    }
+
+    // ── The report: four endings, each read back from the endpoint ─────────────────────────
+
+    /// **No route — one canonical failure, nothing published, nothing woken.**
+    #[test]
+    fn a_fault_with_no_supervisor_route_fails_canonically() {
+        let (k, asid) = kernel_with_current();
+        let snapshot = k
+            .read_terminal_fault_policy_shared(CPU, 0, asid)
+            .expect("policy");
+        assert!(
+            snapshot.target.is_none(),
+            "fixture: no fault-handler and no supervisor endpoint"
+        );
+        assert_eq!(
+            k.deliver_fault_report_split(CPU, 0, fault(), &snapshot),
+            O::Failed(F::NoRoute),
+            "an unroutable report is a named failure, not a decline"
+        );
+    }
+
+    /// **A routable fault with an empty buffer publishes EXACTLY ONE report and wakes nobody.**
+    #[test]
+    fn a_routable_fault_buffers_exactly_one_report() {
+        let (k, asid) = kernel_with_current();
+        let ep = fault_endpoint(&k, 4);
+        let snapshot = k
+            .read_terminal_fault_policy_shared(CPU, 0, asid)
+            .expect("policy");
+        assert_eq!(
+            snapshot.target.map(|t| t.endpoint_idx),
+            Some(ep),
+            "the snapshot must resolve the fault-handler route"
+        );
+        assert_eq!(queued(&k, ep), 0);
+
+        assert_eq!(
+            k.deliver_fault_report_split(CPU, 0, fault(), &snapshot),
+            O::Buffered { endpoint_idx: ep }
+        );
+        assert_eq!(
+            queued(&k, ep),
+            1,
+            "exactly one report, not zero and not two"
+        );
+        // The report step does NOT decide the faulting task's fate: the broad emitter returns
+        // from all three endings and the transition happens after, on policy alone.
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            Some(0),
+            "reporting moves no scheduler state"
+        );
+    }
+
+    /// **A FULL buffer is discovered inside the enqueue, and the report is lost — not retried,
+    /// not dropped silently, and not fatal.**
+    ///
+    /// This is the ending PAGEFAULT1 declined on the grounds that the emitter "does not predict
+    /// a full queue, it discovers one inside the enqueue". That is still true, and it is why the
+    /// route composes the commit owner rather than a preflight: the refusal below comes from the
+    /// same acquisition that would have enqueued.
+    #[test]
+    fn a_full_buffer_loses_the_report_and_publishes_nothing_further() {
+        let (k, asid) = kernel_with_current();
+        let ep = fault_endpoint(&k, 1);
+        let snapshot = k
+            .read_terminal_fault_policy_shared(CPU, 0, asid)
+            .expect("policy");
+
+        // Fill it through the same owner, so the "full" state is one this route itself produced.
+        assert_eq!(
+            k.deliver_fault_report_split(CPU, 0, fault(), &snapshot),
+            O::Buffered { endpoint_idx: ep }
+        );
+        let queued_full = queued(&k, ep);
+        assert_eq!(queued_full, 1, "fixture: the endpoint is now at capacity");
+
+        // The SECOND report has nowhere to go.
+        assert_eq!(
+            k.deliver_fault_report_split(CPU, 0, fault(), &snapshot),
+            O::Failed(F::BufferFull),
+            "a full buffer is a canonical reporting failure"
+        );
+        assert_eq!(
+            queued(&k, ep),
+            queued_full,
+            "and it adds nothing — no overwrite, no second slot, no eviction"
+        );
+        // The task's fate is still policy's to decide, unchanged by the lost report.
+        assert_eq!(k.with(|s| s.current_tid_on_cpu(CPU)), Some(0));
+    }
+
+    /// **A stale endpoint generation refuses before the target line, and publishes nothing.**
+    #[test]
+    fn a_stale_endpoint_generation_refuses_before_the_target() {
+        let (k, asid) = kernel_with_current();
+        let ep = fault_endpoint(&k, 4);
+        let mut snapshot = k
+            .read_terminal_fault_policy_shared(CPU, 0, asid)
+            .expect("policy");
+
+        // THE INTERLEAVING: the slot the snapshot named is recycled underneath it. Forging the
+        // generation forward is the same thing a real recycle does to this comparison, and it is
+        // done on the SNAPSHOT — the endpoint itself is untouched, so a publication would
+        // succeed if the generation were not checked.
+        let target = snapshot.target.as_mut().expect("a target");
+        target.generation = target.generation.wrapping_add(1);
+
+        assert_eq!(
+            k.deliver_fault_report_split(CPU, 0, fault(), &snapshot),
+            O::Failed(F::EndpointStale),
+            "a moved generation is refused, never published into"
+        );
+        assert_eq!(queued(&k, ep), 0, "and nothing reaches the live endpoint");
+    }
+
+    // ── The queue-advance admission: the migration's actual difference ─────────────────────
+
+    /// **THE DIFFERENTIAL. The ambient admission and the authority admission disagree, and the
+    /// disagreement is exactly the population the terminal route was losing.**
+    ///
+    /// Both forms run against the SAME kernel, in the same state, one line apart. The ambient
+    /// one refuses because the scheduler's `current_cpu` is not this caller's CPU; the authority
+    /// one admits, because a live trap window names this CPU unforgeably and the selection owner
+    /// the drain will call authenticates against that same value and nothing else.
+    ///
+    /// Run on a single-CPU kernel this would prove nothing, because both forms would agree.
+    #[test]
+    fn the_authority_admission_admits_what_the_ambient_one_refused() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let window = ArmedTrapWindow::establish(CPU);
+
+        // THE INTERLEAVING: the scheduler's authoritative dispatch CPU is NOT ours. That is the
+        // ambient contract's whole question, and on any multi-CPU boot it is routinely false for
+        // whichever CPU is not currently dispatching.
+        k.with(|s| {
+            // A genuinely online second CPU, brought up through the scheduler's own owner. A
+            // one-CPU kernel would make both forms agree and the differential would be vacuous.
+            s.bring_up_cpu(CpuId(1))
+                .expect("fixture: bring CPU 1 online");
+            s.set_current_cpu(CpuId(1))
+                .expect("fixture: CPU 1 is now an online scheduler CPU");
+        });
+
+        // `MultiCpu` is raised first, and it is the more damaging of the two ambient questions:
+        // it does not ask whether THIS caller is authoritative, it refuses outright as soon as a
+        // second CPU is dispatching. On any SMP boot that is every terminal fault on every CPU,
+        // including the one that IS authoritative.
+        assert_eq!(
+            k.queue_advance_admit_split(CPU, QueueAdvanceApply::ExactTokenResume),
+            Err(QueueAdvanceRefusal::MultiCpu),
+            "the ambient form refuses as soon as a second CPU dispatches"
+        );
+        assert_eq!(
+            k.queue_advance_admit_with_authority_split(
+                window.authority(),
+                QueueAdvanceApply::ExactTokenResume,
+            ),
+            Ok(None),
+            "the authority form admits — there is simply no candidate to name"
+        );
+    }
+
+    /// **A STALE authority admits nothing, and mutates nothing.**
+    ///
+    /// The migration removes two questions; it must not remove the one that matters. An
+    /// authority whose trap has returned names a CPU that is running arbitrary code.
+    #[test]
+    fn a_retired_authority_admits_nothing() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let _window = ArmedTrapWindow::establish(CPU);
+        assert_eq!(
+            k.queue_advance_admit_with_authority_split(
+                DispatchAuthority::stale_for_test(CPU),
+                QueueAdvanceApply::ExactTokenResume,
+            ),
+            Err(QueueAdvanceRefusal::OutgoingIdentityStale),
+            "a token kept past its trap authorizes nothing"
+        );
+    }
+
+    /// **The deferral is exclusive, and a second reservation does not steal the first.**
+    ///
+    /// This is the contention the route settles as the faulting instruction. What must be true
+    /// for that settlement to be safe is that the refused caller left the INCUMBENT reservation
+    /// intact — a refusal that cleared or retargeted it would strand the CPU whose advance is
+    /// already owed.
+    #[test]
+    fn a_contended_deferral_leaves_the_incumbent_reservation_intact() {
+        let idx = CPU.0 as usize;
+        crate::kernel::boot::futex_wait_dispatch_clear(idx);
+        assert!(
+            crate::kernel::boot::futex_wait_dispatch_try_defer(idx, 4242),
+            "fixture: the first reservation is taken"
+        );
+        assert!(
+            !crate::kernel::boot::futex_wait_dispatch_try_defer(idx, 7777),
+            "a second reservation must be refused, not granted"
+        );
+        assert_eq!(
+            crate::kernel::boot::futex_wait_dispatch_outgoing(idx),
+            Some(4242),
+            "and the refusal must not have retargeted the incumbent"
+        );
+        crate::kernel::boot::futex_wait_dispatch_clear(idx);
+    }
+}
+
+mod u9pagefault2_closure {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    /// A production body with comments stripped. Every guard below asks about CODE, and a
+    /// comment naming `NotHandled` while explaining why one is absent would otherwise be
+    /// counted as one.
+    fn body(marker: &str, occurrence: usize) -> alloc::string::String {
+        let part = SPLIT_SRC
+            .split(marker)
+            .nth(occurrence)
+            .unwrap_or_else(|| panic!("`{marker}` occurrence {occurrence} must exist"));
+        let end = part.find("\n}\n").expect("a body must terminate");
+        part[..end]
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn not_handled_count(src: &str) -> usize {
+        src.matches("D::NotHandled").count()
+            + src.matches("SplitDispatchDisposition::NotHandled").count()
+    }
+
+    /// **Every `NotHandled` the family can produce is enumerated, and the count is exact.**
+    ///
+    /// The six production bodies below are the whole of the family's control flow: the three
+    /// routes, and the three helpers they tail-call. Nothing else in the family returns a
+    /// disposition — `classify_for_split` returns an `Option` and the transactions return typed
+    /// outcomes, neither of which can reach a bridge without passing through one of these.
+    ///
+    /// | body | sites | what each one is |
+    /// |---|---|---|
+    /// | terminal route | 5 | unrouted arch; no fault/frame; CPU out of range; unattributable class; end-of-order non-recovery |
+    /// | COW route | 5 | unrouted arch; no fault; non-write access; unattributable class; not this route's class |
+    /// | demand route | 5 | unrouted arch; no fault; execute access; unattributable class; not this route's class |
+    /// | `settle_cow_non_private_copy` | 2 | raced re-read (early, and in the match) |
+    /// | `settle_demand_stale_translation` | 1 | raced re-read |
+    /// | `settle_pre_mutation` | 2 | `ContinueFamily`; the unreachable `ReenterFamilyOwner` arm |
+    ///
+    /// Twenty in total. A twenty-first is a new way for a page fault to reach the broad
+    /// dispatcher, and it fails here whether or not anyone thought to write a case for it.
+    #[test]
+    fn every_not_handled_site_is_enumerated() {
+        for (marker, occurrence, expected, name) in [
+            (
+                "fn try_split_terminal_page_fault_into_frame(",
+                1usize,
+                5usize,
+                "terminal route",
+            ),
+            ("fn try_split_cow_page_fault_into_frame(", 1, 5, "COW route"),
+            (
+                "fn try_split_demand_page_fault_into_frame(",
+                1,
+                5,
+                "demand route",
+            ),
+            ("fn settle_cow_non_private_copy(", 1, 2, "COW non-private"),
+            (
+                "fn settle_demand_stale_translation(",
+                1,
+                1,
+                "demand stale translation",
+            ),
+            ("fn settle_pre_mutation(", 1, 2, "pre-mutation settlement"),
+        ] {
+            let src = body(marker, occurrence);
+            assert_eq!(
+                not_handled_count(&src),
+                expected,
+                "{name}: the family's fall-throughs are enumerated; a new one is a new escape"
+            );
+        }
+    }
+
+    /// **The terminal route settles the end of the route order, rather than falling off it.**
+    ///
+    /// COW and demand both continue in-family by design — that is what the broad handler chain's
+    /// own `Ok(false)` does. The continuation is only safe because SOMETHING takes the fault at
+    /// the end, and the terminal route is that something: it is tried last on both bridges, and
+    /// a recovery class arriving there means a competing owner committed while we classified.
+    #[test]
+    fn the_end_of_the_route_order_is_settled() {
+        let r = body("fn try_split_terminal_page_fault_into_frame(", 1);
+        assert!(
+            r.contains("PageFaultClass::CowCandidate")
+                && r.contains("PageFaultClass::DemandCandidate")
+                && r.contains("TERMINAL_FAULT_SPLIT_RACED"),
+            "the terminal route must settle a recovery class that reaches it"
+        );
+        // And it settles it by RETRY, never by handing it on: a `NotHandled` there would put the
+        // fault back where the two routes above already declined it.
+        let raced = r
+            .split("TERMINAL_FAULT_SPLIT_RACED")
+            .nth(1)
+            .expect("the raced arm");
+        let arm_end = raced.find("return D::NotHandled").unwrap_or(raced.len());
+        assert!(
+            raced[..arm_end].contains("return retry();"),
+            "a raced recovery class settles as the faulting instruction, not as a fall-through"
+        );
+    }
+
+    /// **Each settled refusal returns a settlement, and the settlements are distinct.**
+    ///
+    /// The four pre-mutation refusals U9-PAGEFAULT1 left open had ONE answer between them. Their
+    /// canonical outcomes are not one answer, so the route must produce more than one shape.
+    #[test]
+    fn the_four_refusals_produce_their_own_outcomes() {
+        let r = body("fn try_split_terminal_page_fault_into_frame(", 1);
+        // Both settlement shapes exist and are named, so neither can silently become the other.
+        assert!(
+            r.contains("let retry = ||") && r.contains("let fatal = ||"),
+            "the route must name both of its settlement endings"
+        );
+        // The fatal is the broad emitter's OWN answer, not an invented one.
+        assert!(
+            r.contains("KernelError::TaskMissing"),
+            "the fatal ending must be the broad arm's `TaskMissing`, not a new error"
+        );
+        assert!(
+            FAULT_SRC.contains("KernelError::TaskMissing\n        })?;")
+                || FAULT_SRC.contains("KernelError::TaskMissing"),
+            "and that answer must still be what the broad emitter produces"
+        );
+        // The policy read's three refusals are discriminated, not collapsed.
+        for refusal in ["PR::NotCurrentTask", "PR::NoCurrentTask | PR::TaskNotFound"] {
+            assert!(
+                r.contains(refusal),
+                "the policy read's refusals must be settled by variant, not as one decline"
+            );
+        }
+        // The queue admission and the deferral each settle, and neither falls back.
+        let admit = r
+            .find("queue_advance_admit_with_authority_split(")
+            .expect("the authority admission");
+        let defer = r
+            .find("futex_wait_dispatch_try_defer(")
+            .expect("the deferral");
+        let transition = r
+            .find("commit_terminal_fault_transition_shared(")
+            .expect("the transition");
+        assert!(admit < defer && defer < transition);
+        // THE STRONG FORM. Once the policy read has succeeded, the route holds a snapshot of a
+        // task it has confirmed is current on this CPU, with this ASID, and it has decided the
+        // fault is terminal. The fault is this route's from that point, and every remaining
+        // refusal — the admission, the deferral, the commit's own revalidation — must settle it
+        // rather than hand it back.
+        //
+        // Bounding the window at the admission instead would miss an escape inserted between
+        // the snapshot and the admission, which is precisely where a new precondition would
+        // naturally be written.
+        let snapshot = r
+            .find("read_terminal_fault_policy_shared(")
+            .expect("the policy read");
+        let after_snapshot = r[snapshot..]
+            .find("let terminates = snapshot.terminates_task();")
+            .map(|i| snapshot + i)
+            .expect("the policy read must be followed by the terminating decision");
+        assert!(
+            !r[after_snapshot..].contains("D::NotHandled"),
+            "once the policy snapshot is in hand the fault is this route's; nothing after it \
+             may fall back to the broad dispatcher"
+        );
+    }
+
+    /// **Both bridges encode the disposition the same way, and both carry the route's result.**
+    ///
+    /// This is the step a matrix row cannot reach. A route can settle every outcome it has and
+    /// still lose the settlement at the bridge — which is exactly what the terminal arm did with
+    /// `Complete(_)`, discarding a result that is now sometimes a fatal.
+    #[test]
+    fn both_bridges_encode_what_the_routes_return() {
+        for (name, src) in [("shared", TRAP_SRC), ("riscv", RISCV_SRC)] {
+            // The order is the broad arm's own: COW, then demand, then terminal.
+            let cow = src
+                .find("try_split_cow_page_fault_dispatch(")
+                .unwrap_or_else(|| panic!("{name}: the COW bridge arm"));
+            let demand = src
+                .find("try_split_demand_page_fault_dispatch(")
+                .unwrap_or_else(|| panic!("{name}: the demand bridge arm"));
+            let terminal = src
+                .find("try_split_terminal_page_fault_dispatch(")
+                .unwrap_or_else(|| panic!("{name}: the terminal bridge arm"));
+            assert!(cow < demand && demand < terminal, "{name}: route order");
+            // All three results reach the handler's own inner result.
+            assert!(
+                src.contains("terminal_result = Some(result);")
+                    && src.contains("demand_result = Some(result);")
+                    && src.contains("cow_result = Some(result);"),
+                "{name}: every page-fault route's result must be carried, not discarded"
+            );
+            assert!(
+                src.contains("Ok(terminal_result")
+                    && src.contains(".or(demand_result)")
+                    && src.contains(".or(cow_result)"),
+                "{name}: and all three must reach the handler's inner result"
+            );
+            // The terminal route is handed the TRAP'S authority, not one it minted for itself.
+            let call = &src[terminal..];
+            let call_end = call.find(") {").expect("the terminal call must close");
+            assert!(
+                call[..call_end].contains("trap_path.authority()"),
+                "{name}: the terminal route must receive this trap's own authority"
+            );
+            assert!(
+                !call[..call_end].contains("DispatchAuthority::for_open_window"),
+                "{name}: and must not be handed a window read in place of it"
+            );
+        }
+    }
+
+    /// **The unattributable class is a DECLARED residual, not an accident.**
+    ///
+    /// `KernelOrAbsentTask` is the one recognized-fault coordinate this family still hands to the
+    /// broad dispatcher, and it is the only `NotHandled` in the three routes that carries a
+    /// classified fault. That is deliberate and it is visible in the matrix: it has no `Split*`
+    /// row on any port, so no recovery owner can run for it.
+    ///
+    /// Keeping it broad is the conservative direction for the reason the classifier's own origin
+    /// test records — a supervisor-origin fault must not reach an owner that would mint a frame,
+    /// replace a mapping and resume the KERNEL at the faulting instruction. What it costs is
+    /// stated rather than hidden: these faults still reach the broad arm, which does not test
+    /// privilege origin at all and terminates whichever user task is current.
+    #[test]
+    fn the_unattributable_class_stays_broad_by_declaration() {
+        // No `Split*` row for it, on any port.
+        let matrix = FAULT_SRC
+            .split("pub(crate) fn page_fault_route_for(")
+            .nth(1)
+            .expect("the matrix")
+            .split("\n}\n")
+            .next()
+            .expect("the matrix body");
+        let code = matrix
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("KernelOrAbsentTask"),
+            "the unattributable class must have no routed row; it falls to the `_ => Broad` arm"
+        );
+        // And the classifier still refuses to build facts for it, which is what makes the
+        // absence of a row unexploitable rather than merely untested.
+        assert!(
+            SPLIT_SRC.contains("PageFaultClass::KernelOrAbsentTask(cause)")
+                && SPLIT_SRC.contains("PF1_UNATTRIBUTABLE_FAULT"),
+            "the classifier must name the cause and refuse to produce facts"
+        );
+        // The origin test comes FIRST, before any fact could tempt a recovery owner.
+        let classify = FAULT_SRC
+            .split("pub(crate) fn classify_page_fault_split(")
+            .nth(1)
+            .expect("the classifier");
+        let origin = classify
+            .find("FaultOrigin::Supervisor")
+            .expect("the origin test");
+        let current = classify.find("self.current_tid()").expect("the tid read");
+        assert!(
+            origin < current,
+            "the privilege-origin test must precede every fact the recovery owners would read"
+        );
+    }
+}
+
 mod u9cow2_route {
     use crate::kernel::boot::{CowRecovery, KernelError};
 

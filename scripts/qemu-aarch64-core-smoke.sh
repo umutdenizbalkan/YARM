@@ -373,6 +373,23 @@ u9ft4_require_one "report targets endpoint 3 at its exact generation" \
   'TASK_FAULT_REPORT_TARGET tid=1 endpoint=3 generation=1'
 u9ft4_require_one "report is BUFFERED exactly once with woke=0" \
   'TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=3 queued=1 woke=0'
+# U9-PAGEFAULT2 §2: ONE total delivery owner now names its own ending. These make "exactly one
+# publication, and the route knows which" live rather than structural.
+u9ft4_require_one "the report delivery owner runs exactly once" \
+  'TASK_FAULT_REPORT_BEGIN tid=1'
+u9ft4_require_one "and it reports the BUFFERED ending, off the broad lock" \
+  'TERMINAL_FAULT_SPLIT_REPORT cpu=0 tid=1 outcome=buffered terminates=1 broad_lock=0'
+u9ft4_require_zero "and the waiter ending is not taken when no waiter is blocked" \
+  'TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND'
+# U9-PAGEFAULT2 §3: none of the newly settled refusals fire on the clean path. Each is a real
+# settlement now rather than a fall-through, so a silent appearance here would change the
+# witnessed outcome rather than merely hand it to the broad arm.
+u9ft4_require_zero "no raced recovery class reaches the terminal route" \
+  'TERMINAL_FAULT_SPLIT_RACED'
+u9ft4_require_zero "the queue admission is not refused under the trap authority" \
+  'TERMINAL_FAULT_SPLIT_REFUSED cpu=0 tid=1 phase=queue_admit'
+u9ft4_require_zero "the deferral is not contended" \
+  'TERMINAL_FAULT_SPLIT_REFUSED cpu=0 tid=1 phase=defer'
 # The terminal transition and the deferral, each exactly once.
 u9ft4_require_one "terminal task transition commits exactly once" \
   'TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred'
