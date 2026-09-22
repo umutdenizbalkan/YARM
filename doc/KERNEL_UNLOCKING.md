@@ -20884,3 +20884,77 @@ call site passes the `cpu` its own trap entered on.
 | I, J | ordinary contention | a competing owner serviced the page |
 
 `u9pagefault3_construction` pins the writer set, so the proof fails if a fourth writer appears.
+
+## U9-PAGEFAULT3 §2/§3/§4 — what closed, and what the guards now hold
+
+### §2 — the classifier keeps its reason
+
+`classify_for_split` returned `Option`. Both of its refusals became `None`, and every route
+mapped `None` to `NotHandled`, so by the time a route could act the reason no longer existed.
+It now returns `PageFaultClassifyRefusal`, and the two causes settle differently:
+
+| refusal | settlement | derivation |
+|---|---|---|
+| `Unattributable(SupervisorOrigin)` | architecture kernel-fatal, before any recovery owner | a kernel-mode fault has no user victim |
+| `Unattributable(NoCurrentTask)` | architecture kernel-fatal | exactly where the broad arm gives up: `fault_current_task_with_fault`'s `current_tid()` `ok_or` |
+| `Unattributable(NoAddressSpace)` | architecture kernel-fatal | no `{tid, asid}` coordinate exists, so nothing can be revalidated and no report can name a victim |
+| `IdentityChanged` | authenticated return through the entering frame | an ordinary lost race that mutated nothing |
+
+The supervisor guard sits at the **top of all three routes**, ahead of every access screen, and
+that position is the content rather than a detail: a write screen refuses a supervisor READ and
+an execute screen refuses a supervisor FETCH, so a guard behind either one leaves the other kind
+of kernel fault free to reach the next route.
+
+**This is an attribution correction, and it is not parity.** The broad arm performs no origin
+test anywhere. A supervisor page fault there runs the COW attempt, the demand attempt, then
+`PAGE_FAULT_UNHANDLED` and `fault_current_task_for_fault` — reporting against, and terminating,
+whichever user task happens to be current. `a_supervisor_fault_is_attributed_to_no_user_task`
+asserts both halves: that the split guard reaches no report, transition or recovery owner, and
+that the broad arm still has no origin test, so the claim is re-derived rather than inherited.
+
+### §3 — one authenticated return
+
+`settle_via_entering_frame` composes `entering_frame_authority_split_read`, whose own
+documentation already declares `OwnsEnteringFrame` "the only state in which a trap may return
+through its entering frame". Forfeited fails closed through the existing `Err(TaskMissing)`
+encoding — the same decoded trap dump and `halt_forever()` every architecture entry already runs.
+
+| exit | settlement now |
+|---|---|
+| recovery success (COW ×2, demand ×2) | authenticated return |
+| recovery pre-mutation retry | authenticated return |
+| classifier `IdentityChanged` | authenticated return |
+| recovery class raced at the terminal route | authenticated return |
+| policy `NotCurrentTask` | authenticated return — which is always `Forfeited`, so always fatal |
+| policy `NoCurrentTask` / `TaskNotFound` | kernel-fatal |
+| admission `NoTrapDrainer` / stale authority | kernel-fatal — invalid trap authority is not contention |
+| admission `IncomingUnavailable` | authenticated return |
+| deferral occupied | authenticated return, incumbent named and left alone |
+| transition refused after publication | authenticated return — `PlacedNowhere`, so fatal |
+| `NotifyAndContinue` | authenticated return; the policy itself is unchanged |
+
+The entering incarnation is captured **before** classification in every route, because a
+classification that refused produces no facts — and those were precisely the settlements that
+returned with nothing checked.
+
+### §4 — what the guards hold
+
+**Closure and authentication are independent properties**, and the mutation record shows it: the
+unverified-resume mutation (reverting `NotCurrentTask` to a bare `Complete(Ok(()))`) passes every
+PAGEFAULT2 closure guard and fails only `no_family_body_returns_through_the_frame_unauthenticated`.
+The broad-escape mutation fails only the count guard. The origin-guard reordering fails only the
+ordering guard.
+
+`no_family_body_returns_through_the_frame_unauthenticated` is the shape guard, not a count: it
+asserts that **no** fault-family body contains an inline `D::Complete(Ok(()))`, and that the one
+owner allowed to produce it does so exactly once, in the arm the authority read authorized.
+Counting would not have caught the delivered defect — PAGEFAULT2's family had the right number of
+`NotHandled` sites throughout and still returned through unchecked frames.
+
+The interleavings drive production owners and assert the **continuation**: a same-context mapping
+retry is authorized; a changed current is `QueuedForDispatch`; a cleared current is
+`PlacedNowhere`; a reused TID in a new address space is `IncarnationNotResumable` even though the
+numeric TID is still current; a blocked entering task forfeits even while current. The occupied
+deferral case proves both halves of the incumbent argument — the cell still names the incumbent
+after the refused CAS, and the bridge samples that cell *after* the PageFault routes, so the
+drain still sees it.

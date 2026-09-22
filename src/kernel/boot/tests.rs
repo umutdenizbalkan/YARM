@@ -151389,6 +151389,257 @@ mod u9pagefault2_settlement {
 /// The two are independent. A family can be perfectly closed against fallback and still
 /// `iret` through a task that is no longer current — which is exactly what U9-PAGEFAULT2
 /// delivered, in six places.
+/// U9-PAGEFAULT3 §4 — **the interleavings, driven through production owners, checked against
+/// the resulting CONTINUATION rather than the returned enum.**
+///
+/// Every fixture builds the state it names through the scheduler's and the fault family's own
+/// owners, then asks the authority read what the trap is allowed to do next. The assertion is on
+/// the answer's consequence — may this trap return through the live frame, or may it not — which
+/// is the question the settlement actually turns on.
+mod u9pagefault3_interleavings {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::task_transition::{EnteringFrameAuthority as A, FrameForfeitReason as R};
+    use crate::runtime::SharedKernel;
+
+    const CPU: CpuId = CpuId(0);
+
+    /// Task 0 current on CPU 0 with an address space. Returns its ASID — the entering
+    /// incarnation's second half.
+    fn kernel_with_entering() -> (SharedKernel, crate::kernel::vm::Asid) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            let (asid, _map) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(0, asid).expect("bind");
+            asid
+        });
+        (k, asid)
+    }
+
+    /// **The baseline: the entering task still owns its frame, so the retry is authorized.**
+    ///
+    /// This is the legitimate same-context mapping retry — a competing owner serviced the page
+    /// and the faulting task is still the one this CPU runs. It is the ONLY shape in which a
+    /// PageFault settlement may return through the live frame, and every other case below is a
+    /// shape in which it may not.
+    #[test]
+    fn a_same_context_mapping_retry_is_authorized() {
+        let (k, asid) = kernel_with_entering();
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            Some(0),
+            "fixture: the entering task is current"
+        );
+        assert_eq!(
+            k.entering_frame_authority_split_read(CPU, 0, asid),
+            A::OwnsEnteringFrame,
+            "an unchanged entering context authorizes the return to the faulting instruction"
+        );
+        // And the settlement it authorizes changes nothing: no placement moved, no status moved.
+        assert_eq!(k.with(|s| s.current_tid_on_cpu(CPU)), Some(0));
+        assert_eq!(k.with(|s| s.task_status(0)), Some(TaskStatus::Running));
+    }
+
+    /// **CHANGED CURRENT — the `NotCurrentTask` shape, and the frame is forfeited.**
+    ///
+    /// U9-PAGEFAULT2 settled this by returning through the entering frame. The authority read
+    /// says `QueuedForDispatch`: the entering task has been blocked out and re-enqueued, so it
+    /// is available to be dequeued by a dispatch while this trap would be resuming it.
+    #[test]
+    fn a_changed_current_forfeits_the_entering_frame() {
+        let (k, asid) = kernel_with_entering();
+        // THE INTERLEAVING, through the scheduler's own owners: a competing dispatch takes the
+        // CPU and the entering task goes back on the queue.
+        k.with(|s| {
+            s.register_task(1).expect("task 1");
+            s.enqueue_on_cpu(CPU, 1).expect("enqueue 1");
+            s.block_current_cpu().expect("task 0 was current");
+            s.enqueue_on_cpu(CPU, 0).expect("re-enqueue 0");
+            assert_eq!(s.dispatch_next_on_cpu(CPU), Some(1), "task 1 wins the CPU");
+        });
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            Some(1),
+            "fixture: a different task is current"
+        );
+        let authority = k.entering_frame_authority_split_read(CPU, 0, asid);
+        assert_eq!(
+            authority,
+            A::Forfeited(R::QueuedForDispatch),
+            "the entering task is queued and available to be dequeued by a dispatch, so \
+             resuming it here would run it on this CPU while another could take it"
+        );
+        // The competing winner is untouched by the read — settling must not disturb its
+        // placement. Its STATUS is still `Runnable`: `dispatch_next_on_cpu` is the rank-1
+        // placement owner and the `Running` write belongs to the dispatch transition owner, so
+        // asserting `Running` here would be asserting a step this fixture never ran.
+        assert_eq!(k.with(|s| s.current_tid_on_cpu(CPU)), Some(1));
+        assert_eq!(k.with(|s| s.task_status(1)), Some(TaskStatus::Runnable));
+    }
+
+    /// **THE POST-PUBLICATION SHAPE — `current` cleared, task placed nowhere.**
+    ///
+    /// This is the state `commit_terminal_fault_transition_shared` leaves behind when it clears
+    /// `current` at step (3) and then refuses: the report is out, the CPU has no current task,
+    /// and the faulting task is on no run queue. Built here through the same rank-1 owner the
+    /// transaction uses, so it is the state production reaches and not an approximation of it.
+    ///
+    /// `PlacedNowhere` is the exact answer, and it is the one that matters most: nothing will
+    /// ever resume this task, so a trap that returned through its frame would run it anyway, at
+    /// the faulting PC, on a CPU the scheduler believes is idle.
+    #[test]
+    fn a_cleared_current_places_the_entering_task_nowhere() {
+        let (k, asid) = kernel_with_entering();
+        k.with(|s| {
+            s.block_current_cpu().expect("task 0 was current");
+        });
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            None,
+            "fixture: the CPU has no current task"
+        );
+        assert_eq!(
+            k.entering_frame_authority_split_read(CPU, 0, asid),
+            A::Forfeited(R::PlacedNowhere),
+            "a task the scheduler places nowhere may not be resumed through this trap"
+        );
+    }
+
+    /// **A REPLACEMENT INCARNATION on the same numeric TID forfeits the frame.**
+    ///
+    /// The entering identity is `{tid, asid}` precisely so a reused numeric TID cannot inherit
+    /// the departed incarnation's right to the frame. Authenticating on the TID alone would
+    /// return into a different address space at the old task's PC.
+    #[test]
+    fn a_reused_tid_in_a_new_address_space_forfeits_the_frame() {
+        let (k, _asid) = kernel_with_entering();
+        let stale = k.with(|s| {
+            let (other, _map) = s.create_user_address_space().expect("second asid");
+            other
+        });
+        assert_eq!(
+            k.entering_frame_authority_split_read(CPU, 0, stale),
+            A::Forfeited(R::IncarnationNotResumable),
+            "the ASID is part of the identity, so a replacement cannot inherit the frame"
+        );
+        // The TID alone would have said yes — which is the whole reason the ASID is carried.
+        assert_eq!(
+            k.with(|s| s.current_tid_on_cpu(CPU)),
+            Some(0),
+            "the numeric TID is still current, and that is not sufficient"
+        );
+    }
+
+    /// **A BLOCKED entering task forfeits the frame, even while it is current.**
+    ///
+    /// The subtlest member of the forfeit set, and the reason the authority read asks about
+    /// status and not only placement: a blocking route owns that task's continuation and its
+    /// waker will resume it from there. Returning through the interrupt frame as well would give
+    /// one task two live continuations. The wait reason is immaterial — what forfeits the frame
+    /// is that the task is Blocked at all.
+    #[test]
+    fn a_blocked_entering_task_forfeits_the_frame() {
+        use crate::kernel::ipc::ThreadId;
+        let (k, asid) = kernel_with_entering();
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid == ThreadId(0))
+                    .expect("task 0");
+                t.status = TaskStatus::Blocked(crate::kernel::task::WaitReason::Poll);
+            });
+        });
+        assert_eq!(
+            k.entering_frame_authority_split_read(CPU, 0, asid),
+            A::Forfeited(R::IncarnationNotResumable),
+            "a blocked task's continuation belongs to its waker, not to this trap"
+        );
+    }
+
+    /// **AN OCCUPIED DEFERRAL keeps its incumbent, and names a consumer that will honour it.**
+    ///
+    /// The route's settlement for a failed reservation is only safe if the incumbent survives
+    /// untouched — a refusal that cleared or re-targeted it would strand the CPU whose advance
+    /// is already owed. Both halves are checked: the cell still names the incumbent, and the
+    /// bridge still reads that cell AFTER the PageFault routes run, so the drain sees it.
+    #[test]
+    fn an_occupied_deferral_keeps_its_incumbent_and_its_consumer() {
+        const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
+        let idx = CPU.0 as usize;
+        crate::kernel::boot::futex_wait_dispatch_clear(idx);
+        assert!(
+            crate::kernel::boot::futex_wait_dispatch_try_defer(idx, 9001),
+            "fixture: the incumbent takes the reservation"
+        );
+        // The terminal route's own reservation attempt, refused.
+        assert!(
+            !crate::kernel::boot::futex_wait_dispatch_try_defer(idx, 9002),
+            "a second reservation must be refused"
+        );
+        assert_eq!(
+            crate::kernel::boot::futex_wait_dispatch_outgoing(idx),
+            Some(9001),
+            "and the incumbent must be intact — not cleared, not re-targeted"
+        );
+        crate::kernel::boot::futex_wait_dispatch_clear(idx);
+
+        // The consumer, proven from the bridge's own ordering: the deferral is SAMPLED after the
+        // PageFault block, so an incumbent armed before this trap is seen by the drain.
+        let pf_block = TRAP_SRC
+            .find("try_split_terminal_page_fault_dispatch(")
+            .expect("the PageFault bridge arm");
+        let sample = TRAP_SRC
+            .find("let futex_wait_was_deferred = crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);")
+            .expect("the deferral sample");
+        assert!(
+            pf_block < sample,
+            "the bridge must sample the deferral AFTER the PageFault routes, so an incumbent \
+             reservation this route refused to overwrite still reaches its drain"
+        );
+    }
+
+    /// **The route's own reservation is the only one it clears.**
+    ///
+    /// The post-publication settlement clears a deferral. That is correct only because the route
+    /// armed that reservation itself, under a CAS that fails when anyone else owns it — so the
+    /// clear can never reach another owner's debt.
+    #[test]
+    fn the_post_publication_clear_can_only_reach_its_own_reservation() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        let route = SPLIT_SRC
+            .split("fn try_split_terminal_page_fault_into_frame(")
+            .nth(1)
+            .expect("the terminal route");
+        let arm = route
+            .find("futex_wait_dispatch_try_defer(cpu_idx, facts.tid)")
+            .expect("the route's own reservation");
+        let clear = route
+            .find("futex_wait_dispatch_clear(cpu_idx)")
+            .expect("the post-publication clear");
+        assert!(
+            arm < clear,
+            "the clear must be downstream of the reservation that makes it this route's own"
+        );
+        // Exactly one clear, and exactly one reservation: a second of either would break the
+        // pairing the argument rests on.
+        assert_eq!(
+            route.matches("futex_wait_dispatch_clear(cpu_idx)").count(),
+            1,
+            "exactly one clear, so ownership is provable by position"
+        );
+        assert_eq!(
+            route
+                .matches("futex_wait_dispatch_try_defer(cpu_idx, facts.tid)")
+                .count(),
+            1,
+            "exactly one reservation, for the same reason"
+        );
+    }
+}
+
 mod u9pagefault3_authenticated_return {
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
