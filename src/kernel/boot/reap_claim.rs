@@ -392,7 +392,7 @@ pub(crate) fn clear_ipc_waiters_for_identity_locked(
         }
     }
     for waiter in ipc.notification_waiters.iter_mut() {
-        if *waiter == Some(identity.tid) {
+        if waiter.is_some_and(|w| w.receiver.tid == identity.tid) {
             *waiter = None;
         }
     }

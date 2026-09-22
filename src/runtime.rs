@@ -8226,6 +8226,147 @@ impl SharedKernel {
     ///
     /// Callers must not hold any lock of rank ≤ 3 (scheduler, task, or IPC)
     /// when invoking this seam.
+    /// U9-IRQ-UNKNOWN1 §2 — **the whole IRQ delivery policy, in subsystem acquisitions.**
+    ///
+    /// It reproduces `KernelState::route_external_irq` composed with `signal_notification`, with
+    /// two boundaries closed that the broad pair leaves open.
+    ///
+    /// # Boundary 1 — route lookup and publication are ONE acquisition
+    ///
+    /// The broad pair takes rank 3 twice: `route_external_irq` reads `irq_routes[line]` and
+    /// releases, then `signal_notification` re-acquires to signal the object it named. Between
+    /// them a `destroy_notification` can remove that object AND a `create` can occupy the same
+    /// slot, because creation deliberately sanitises a reused slot rather than refusing it. The
+    /// `WrongObject` arm only catches a slot left EMPTY, so the reused case delivered the
+    /// interrupt into a replacement object that was never routed to this line.
+    ///
+    /// Resolving and signalling under one acquisition removes the window rather than narrowing
+    /// it. The generation is read in the same acquisition and returned, so a caller that wants
+    /// to name what it delivered into can, without a second lookup that could see a third state.
+    ///
+    /// # Boundary 2 — the waiter is an identity, proven in its own domain
+    ///
+    /// The waiter record is taken here (rank 3) and PROVEN in `wake_notification_waiter_exact`
+    /// (rank 2), then enqueued (rank 1). Three acquisitions, descending, none nested — the
+    /// higher-ranked IPC domain is released before any task or scheduler work, which is the
+    /// ordering the broad form documents and this one keeps.
+    ///
+    /// # What is preserved exactly
+    ///
+    /// No route and a destroyed target are both benign: the broad form returns `Ok(())` for
+    /// each, and a spurious line with no binding must not fail a trap. A full notification queue
+    /// is `EndpointQueueFull` and PROPAGATES — that is the delivered behaviour, and this owner
+    /// does not quietly start dropping interrupts to make the route total.
+    pub(crate) fn deliver_external_irq_split(
+        &self,
+        cpu: CpuId,
+        irq_line: u16,
+    ) -> crate::kernel::boot::IrqDeliveryOutcome {
+        use crate::kernel::boot::IrqDeliveryOutcome as O;
+
+        // Phase 1 — rank 3, ONE acquisition: resolve, verify, signal, take the waiter.
+        let resolved = self.with_ipc_split_mut(|ipc| {
+            let Some(notification_idx) = ipc.irq_routes.get(irq_line as usize).copied().flatten()
+            else {
+                return Err(O::NoRoute);
+            };
+            let Some(notif) = ipc
+                .notifications
+                .get_mut(notification_idx)
+                .and_then(|n| n.as_mut())
+            else {
+                // The route outlived its object. `destroy_notification` clears matching routes,
+                // so this is defence in depth for the destroy/deliver race — benign, exactly as
+                // the broad form's `WrongObject` arm is.
+                return Err(O::TargetGone { notification_idx });
+            };
+            if let Err(e) = notif.send_irq(irq_line) {
+                return Err(O::Failed {
+                    notification_idx,
+                    error: e,
+                });
+            }
+            let generation = ipc
+                .notification_generations
+                .get(notification_idx)
+                .copied()
+                .unwrap_or(0);
+            let waiter = ipc.notification_waiters[notification_idx].take();
+            Ok((notification_idx, generation, waiter))
+        });
+        let (notification_idx, generation, waiter) = match resolved {
+            Ok(v) => v,
+            Err(outcome) => return outcome,
+        };
+
+        // Phase 2 — rank 2, in its own acquisition: prove the waiter's identity and transition
+        // it. The IPC domain is already released.
+        let Some(record) = waiter else {
+            return O::Delivered {
+                notification_idx,
+                generation,
+            };
+        };
+        match self.wake_notification_waiter_exact_split(record) {
+            false => O::DeliveredWaiterStale {
+                notification_idx,
+                generation,
+                waiter_tid: record.receiver.tid.0,
+            },
+            true => {
+                // Phase 3 — rank 1: the enqueue, through the shared planner and committer the
+                // broad `enqueue_task` uses, so placement cannot drift from it.
+                match self.enqueue_task_split(cpu, record.receiver.tid.0) {
+                    Ok(_) => O::DeliveredAndWoke {
+                        notification_idx,
+                        generation,
+                        waiter_tid: record.receiver.tid.0,
+                    },
+                    Err(error) => O::Failed {
+                        notification_idx,
+                        error,
+                    },
+                }
+            }
+        }
+    }
+
+    /// U9-IRQ-UNKNOWN1 §2 — the off-lock twin of
+    /// `KernelState::wake_notification_waiter_exact`, with the identical three-part proof.
+    ///
+    /// Separate only because off-lock code cannot obtain a `&mut KernelState`; the rule it
+    /// applies is the same one, and `the_two_notification_wakes_apply_the_same_proof` pins that
+    /// they stay the same rule.
+    pub(crate) fn wake_notification_waiter_exact_split(
+        &self,
+        record: crate::kernel::boot::EndpointWaiterRecord,
+    ) -> bool {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid == record.receiver.tid)
+            else {
+                return false;
+            };
+            if tcb.asid.unwrap_or(crate::kernel::vm::Asid(0)) != record.receiver.asid {
+                return false;
+            }
+            if tcb.blocked_recv_generation != record.wait_generation {
+                return false;
+            }
+            if !matches!(
+                tcb.status,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+            ) {
+                return false;
+            }
+            tcb.status = TaskStatus::Runnable;
+            true
+        })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_ipc_split_mut<R>(
         &self,
@@ -15563,15 +15704,16 @@ impl SharedKernel {
             let stranded = self.with_ipc_split_mut(|ipc| {
                 ipc.clear_endpoint_waiters_for_identity(identity);
                 for waiter in ipc.notification_waiters.iter_mut() {
-                    if *waiter == Some(crate::kernel::ipc::ThreadId(work.tid)) {
+                    if waiter
+                        .is_some_and(|w| w.receiver.tid == crate::kernel::ipc::ThreadId(work.tid))
+                    {
                         *waiter = None;
                     }
                 }
                 ipc.any_endpoint_waiter_is(identity)
-                    || ipc
-                        .notification_waiters
-                        .iter()
-                        .any(|w| *w == Some(crate::kernel::ipc::ThreadId(work.tid)))
+                    || ipc.notification_waiters.iter().any(|w| {
+                        w.is_some_and(|w| w.receiver.tid == crate::kernel::ipc::ThreadId(work.tid))
+                    })
             });
             if stranded {
                 crate::yarm_log!("SCHED_TIMEOUT_STRANDED_WAITER tid={}", work.tid);
@@ -19616,7 +19758,9 @@ mod tests {
         // Inject a waiter through the ipc domain.
         kernel.with(|state| {
             state.with_ipc_state_mut(|ipc| {
-                ipc.notification_waiters[notif_idx] = Some(ThreadId(610));
+                ipc.notification_waiters[notif_idx] = Some(
+                    crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(610)),
+                );
             });
         });
 

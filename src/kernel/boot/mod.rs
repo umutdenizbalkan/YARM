@@ -43,7 +43,7 @@ mod fault_state;
 pub(crate) use fault_state::{
     BufferedFaultAdmission, BufferedFaultCommit, CowNonPrivateSettlement, CowRecovery,
     DemandRecovery, DemandStaleTranslation, FaultReportFailure, FaultReportOutcome,
-    FaultReportTarget, PageFaultClass, PageFaultClassifyRefusal, PageFaultFacts, PageFaultRoute,
+    FaultReportTarget, IrqDeliveryOutcome, PageFaultClass, PageFaultClassifyRefusal, PageFaultFacts, PageFaultRoute,
     PreMutationSettlement, SUPERVISOR_FAULT_REPORT_WIRE_LEN, SupervisorFaultReportWire,
     TerminalFaultPolicyRefusal, TerminalFaultPolicySnapshot, TerminalFaultTransition,
     UnattributableFault, evaluate_cow_marked, evaluate_demand_backed_region, evaluate_fault_policy,

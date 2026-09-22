@@ -724,6 +724,11 @@ pub fn handle_trap_entry_shared(
     // something false about what happened.
     let mut demand_recovered = false;
     let mut demand_result: Option<Result<(), TrapHandleError>> = None;
+    // U9-IRQ-UNKNOWN1 §2: the external-interrupt route's flag and result. Its own pair, for the
+    // reason every other pair here is its own: a borrowed flag would tell an observer that a
+    // recovery happened for an interrupt that recovered nothing.
+    let mut irq_handled = false;
+    let mut irq_result: Option<Result<(), TrapHandleError>> = None;
     // U9-PAGEFAULT2 §3: the TERMINAL route's result. It has no `_recovered` companion because
     // the terminal route already owns `queue_advance_committed` — a terminating fault advances
     // the queue, which the other two never do — so only the result itself was missing.
@@ -738,6 +743,55 @@ pub fn handle_trap_entry_shared(
     // reaches the unchanged broad arm having changed nothing. When it commits it holds a
     // RESERVED deferral, so the existing post-lock drain is guaranteed to apply an incoming
     // context — `QueueAdvanceCommitted` without one is what FT3 got wrong.
+    // U9-IRQ-UNKNOWN1 §2/§3 — the EXTERNAL INTERRUPT and UNKNOWN routes, ahead of the
+    // PageFault block and ahead of the broad acquisition.
+    //
+    // Both are mutually exclusive with every other class by decode: a trap is one event.
+    //
+    // ACKNOWLEDGEMENT is performed HERE, in the broad arm's own position — after the delivery
+    // policy has run and with interrupts masked across the pair, exactly as
+    // `TrapEvent::ExternalInterrupt` does it — and through `acknowledge_interrupt`, which is the
+    // per-port seam scoped to "the shared handler's single-step acknowledgement". The broad arm
+    // used `external_irq_eoi`, the raw write, and on AArch64 that is a SECOND `GICC_EOIR` beside
+    // the one the vector tail already writes for the same claim. Nothing is added beside the
+    // tail; the correctly scoped seam is inert exactly where the architecture owns completion.
+    if !irq_handled {
+        let decoded = decode_trap_context(context);
+        if let TrapEvent::ExternalInterrupt(irq) = decoded {
+            let disposition = crate::kernel::syscall_split::try_split_external_interrupt_dispatch(
+                shared,
+                cpu,
+                Some(irq),
+            );
+            match disposition {
+                SplitDispatchDisposition::NotHandled => {}
+                SplitDispatchDisposition::Complete(result) => {
+                    let irq_state = crate::arch::irq_guard::irq_save();
+                    crate::arch::hal_adapters::acknowledge_interrupt(cpu, irq);
+                    crate::arch::irq_guard::irq_restore(irq_state);
+                    irq_handled = true;
+                    irq_result = Some(result);
+                }
+                other => {
+                    crate::yarm_log!(
+                        "IRQ1_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(false, "the IRQ route yields NotHandled or Complete");
+                }
+            }
+        } else if let TrapEvent::Unknown { arch_code } = decoded {
+            // Diverges in production under `STRICT_UNKNOWN_TRAPS`. The trap window is retired
+            // first, because a panic never unwinds back to `TrapPathWindow::drop`.
+            let probe =
+                crate::kernel::syscall_split::try_split_unknown_trap_dispatch(cpu, Some(arch_code));
+            debug_assert!(
+                matches!(probe, SplitDispatchDisposition::NotHandled),
+                "the Unknown route either diverges or declines"
+            );
+        }
+    }
     {
         let pf = match decode_trap_context(context) {
             TrapEvent::PageFault(f) => Some(f),
@@ -1330,12 +1384,21 @@ pub fn handle_trap_entry_shared(
     // a successful acquisition of nothing and a successful handler, so both `?` sites below stay
     // untouched.
     let inner_result: Result<Result<(), TrapHandleError>, TrapHandleError> =
-        if queue_advance_committed || post_work_committed || cow_recovered || demand_recovered {
+        if queue_advance_committed
+            || post_work_committed
+            || cow_recovered
+            || demand_recovered
+            || irq_handled
+        {
             crate::yarm_log!(
                 "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason={}",
                 cpu.0,
                 if queue_advance_committed {
                     "publication_committed"
+                } else if irq_handled {
+                    // U9-IRQ-UNKNOWN1 §2 — its own reason. An interrupt recovered nothing and
+                    // advanced no queue; it delivered a notification and was acknowledged.
+                    "irq_delivered"
                 } else if demand_recovered {
                     // U9-PAGEFAULT1 §2c — its own reason, never the COW route's.
                     "demand_recovered"
@@ -1357,7 +1420,8 @@ pub fn handle_trap_entry_shared(
             // `cow_recovered` / `demand_recovered`, and the terminal route runs only when
             // neither fired — so the order among them expresses precedence that cannot arise,
             // and the value is simply whichever route handled the fault.
-            Ok(terminal_result
+            Ok(irq_result
+                .or(terminal_result)
                 .or(demand_result)
                 .or(cow_result)
                 .unwrap_or(Ok(())))

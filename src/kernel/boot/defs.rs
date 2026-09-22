@@ -204,6 +204,17 @@ pub(crate) struct EndpointWaiterRecord {
 }
 
 impl EndpointWaiterRecord {
+    /// U9-IRQ-UNKNOWN1 §2 — a record for a bare TID, for fixtures that predate the record and
+    /// only ever needed "a waiter is published here".
+    ///
+    /// `Asid(0)` and generation `0` are the values a TCB that was never given either already
+    /// carries, so a fixture using this still satisfies the identity proof — which is the point:
+    /// the proof is not weakened for tests, the fixture simply names the identity it always had.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn for_bare_tid(tid: ThreadId) -> Self {
+        Self::new(ReceiverWaiterIdentity::new(tid, Asid(0)), 0)
+    }
+
     pub(crate) fn new(receiver: ReceiverWaiterIdentity, wait_generation: u64) -> Self {
         Self {
             receiver,
@@ -428,7 +439,18 @@ pub(crate) struct IpcSubsystem {
         [[Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS]; ENDPOINT_WAITER_SLOTS],
     pub(crate) endpoint_generations: [u64; ENDPOINT_WAITER_SLOTS],
     pub(crate) notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
-    pub(crate) notification_waiters: [Option<ThreadId>; MAX_NOTIFICATIONS],
+    /// U9-IRQ-UNKNOWN1 §2 — the notification waiter, carried as the SAME record the endpoint
+    /// waiter family already uses.
+    ///
+    /// It was `Option<ThreadId>`, and a bare TID cannot prove an identity. The wake that
+    /// consumed it found the TCB by numeric TID and accepted any `Blocked(_)`, so a recycled TID
+    /// parked on a DIFFERENT blocked operation — a futex, a join, another endpoint — satisfied
+    /// it and was woken out of a wait nothing had completed.
+    ///
+    /// `EndpointWaiterRecord` is the existing answer to exactly that: `{tid, asid}` for the
+    /// incarnation, plus the receiver's `blocked_recv_generation` at the moment it committed
+    /// THIS block, which separates the same incarnation blocking twice.
+    pub(crate) notification_waiters: [Option<EndpointWaiterRecord>; MAX_NOTIFICATIONS],
     pub(crate) notification_generations: [u64; MAX_NOTIFICATIONS],
     pub(crate) irq_routes: [Option<usize>; MAX_IRQ_LINES],
     pub(crate) transfer_envelopes: [Option<TransferEnvelope>; MAX_TRANSFER_ENVELOPES],

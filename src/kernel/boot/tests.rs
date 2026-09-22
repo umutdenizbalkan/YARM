@@ -17652,7 +17652,10 @@ fn exit_task_clears_notification_waiter_slot() {
 
     // Inject the task as a notification waiter.
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(crate::kernel::ipc::ThreadId(201));
+        ipc.notification_waiters[notif_idx] =
+            Some(crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(
+                crate::kernel::ipc::ThreadId(201),
+            ));
     });
 
     let waiter_before = state.with_ipc_state(|ipc| ipc.notification_waiters[notif_idx]);
@@ -18596,7 +18599,10 @@ fn notification_waiter_count_reflects_exit_cleanup() {
         state.create_notification(4).expect("notif");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(crate::kernel::ipc::ThreadId(291));
+        ipc.notification_waiters[notif_idx] =
+            Some(crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(
+                crate::kernel::ipc::ThreadId(291),
+            ));
     });
     assert_eq!(
         state.notification_waiter_count(notif_idx),
@@ -18756,7 +18762,10 @@ fn clear_ipc_waiters_is_idempotent_for_all_waiter_types() {
             tid: crate::kernel::ipc::ThreadId(301),
             msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
         });
-        ipc.notification_waiters[notif_idx] = Some(crate::kernel::ipc::ThreadId(301));
+        ipc.notification_waiters[notif_idx] =
+            Some(crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(
+                crate::kernel::ipc::ThreadId(301),
+            ));
     });
 
     state.clear_ipc_waiters_for_tid(301);
@@ -19006,7 +19015,10 @@ fn repeated_mixed_waiter_block_exit_no_stale_state() {
     // TID 317: notification waiter
     state.register_task(317).expect("task 317");
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(crate::kernel::ipc::ThreadId(317));
+        ipc.notification_waiters[notif_idx] =
+            Some(crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(
+                crate::kernel::ipc::ThreadId(317),
+            ));
     });
     state.exit_task(317, 0).expect("exit 317");
     assert_eq!(
@@ -21243,7 +21255,9 @@ fn stage21_signal_wakes_waiting_task_exactly_once() {
 
     stage21_block_on_notification(&mut state, 2101);
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(ThreadId(2101));
+        ipc.notification_waiters[notif_idx] = Some(
+            crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2101)),
+        );
     });
     assert!(state.task_is_blocked(2101), "waiter blocked before signal");
     assert_eq!(
@@ -21283,7 +21297,9 @@ fn stage21_signal_skips_dead_waiter_safely() {
     assert!(state.task_is_dead(2102), "dead before injection");
     // Simulate a stale waiter reference surviving (defence-in-depth).
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(ThreadId(2102));
+        ipc.notification_waiters[notif_idx] = Some(
+            crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2102)),
+        );
     });
 
     state.route_external_irq(10).expect("irq");
@@ -21304,7 +21320,9 @@ fn stage21_signal_skips_exited_waiter_safely() {
     state.exit_task(2103, 0).expect("exit");
     assert!(state.task_is_exited(2103), "exited before injection");
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(ThreadId(2103));
+        ipc.notification_waiters[notif_idx] = Some(
+            crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2103)),
+        );
     });
 
     state.route_external_irq(11).expect("irq");
@@ -21322,7 +21340,9 @@ fn stage21_exit_task_clears_notification_waiter() {
     let (notif_idx, _cap, _recv) = state.create_notification(4).expect("notif");
     stage21_block_on_notification(&mut state, 2104);
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(ThreadId(2104));
+        ipc.notification_waiters[notif_idx] = Some(
+            crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2104)),
+        );
     });
     assert_eq!(state.notification_waiter_count(notif_idx), 1, "before exit");
 
@@ -21342,7 +21362,9 @@ fn stage21_mark_task_dead_clears_notification_waiter() {
     let (notif_idx, _cap, _recv) = state.create_notification(4).expect("notif");
     stage21_block_on_notification(&mut state, 2105);
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(ThreadId(2105));
+        ipc.notification_waiters[notif_idx] = Some(
+            crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2105)),
+        );
     });
     assert_eq!(
         state.notification_waiter_count(notif_idx),
@@ -21376,13 +21398,17 @@ fn stage21_destroy_notification_clears_waiter_and_invalidates_caps() {
         "notification cap live before destroy"
     );
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(ThreadId(2106));
+        ipc.notification_waiters[notif_idx] = Some(
+            crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2106)),
+        );
     });
 
     let waiter = state.destroy_notification(notif_idx).expect("destroy");
     assert_eq!(
         waiter,
-        Some(ThreadId(2106)),
+        Some(crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(
+            ThreadId(2106)
+        )),
         "destroy returns snapshotted waiter"
     );
     assert_eq!(
@@ -21433,7 +21459,9 @@ fn stage21_wait_before_signal_registers_then_wakes() {
 
     stage21_block_on_notification(&mut state, 2108);
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(ThreadId(2108));
+        ipc.notification_waiters[notif_idx] = Some(
+            crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2108)),
+        );
     });
     assert_eq!(
         state.notification_waiter_count(notif_idx),
@@ -21597,7 +21625,9 @@ fn stage22_notification_cap_revoke_clears_waiter() {
     let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
     stage21_block_on_notification(&mut state, 2201);
     state.with_ipc_state_mut(|ipc| {
-        ipc.notification_waiters[notif_idx] = Some(ThreadId(2201));
+        ipc.notification_waiters[notif_idx] = Some(
+            crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2201)),
+        );
     });
     assert_eq!(
         state.notification_waiter_count(notif_idx),
@@ -22813,7 +22843,9 @@ mod stage27_split_mut_tests {
                     .register_task_with_class(APP, TaskClass::App)
                     .expect("app");
                 state.with_ipc_state_mut(|ipc| {
-                    ipc.notification_waiters[NOTIF_IDX] = Some(ThreadId(SS));
+                    ipc.notification_waiters[NOTIF_IDX] = Some(
+                        crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(SS)),
+                    );
                 });
                 let app_cnode = state.process_cnode_for_pid(APP).expect("app cnode");
                 let before = state.cnode_slot_capacity(app_cnode).expect("capacity");
@@ -119703,7 +119735,14 @@ mod stage199d_waiter_ownership_exclusivity_audit {
         );
     }
 
-    /// The notification wake reaches the receiver by TID, guarded only by `Blocked(_)`.
+    /// The notification wake reaches its receiver through the notification waiter table alone —
+    /// and, since U9-IRQ-UNKNOWN1 §2, by a proven identity rather than by TID.
+    ///
+    /// The exclusivity claim this case exists for is unchanged: the notification wake consults
+    /// no endpoint waiter. What changed is the other half. It used to reach "any `Blocked(_)`
+    /// task with this numeric TID", and that is now the exact `{tid, asid}` incarnation, the
+    /// exact `blocked_recv_generation` the block was published under, and
+    /// `Blocked(EndpointReceive(_))` — the operation the notification receive actually parks in.
     #[test]
     fn the_notification_wake_never_consults_the_endpoint_waiter() {
         let at = IPC_STATE
@@ -119711,9 +119750,19 @@ mod stage199d_waiter_ownership_exclusivity_audit {
             .expect("the notification take");
         let body = &IPC_STATE[at..at + 2000];
         assert!(
-            body.contains("if matches!(tcb.status, TaskStatus::Blocked(_)) {")
-                && body.contains("tcb.status = TaskStatus::Runnable;"),
-            "it wakes any Blocked task by TID"
+            body.contains("wake_notification_waiter_exact("),
+            "the take must hand its record to the identity-proving owner"
+        );
+        let owner = IPC_STATE
+            .split("pub(crate) fn wake_notification_waiter_exact(")
+            .nth(1)
+            .expect("the owner");
+        let owner = &owner[..owner.len().min(1400)];
+        assert!(
+            !owner.contains("TaskStatus::Blocked(_)")
+                && owner.contains("TaskStatus::Blocked(WaitReason::EndpointReceive(_))")
+                && owner.contains("tcb.status = TaskStatus::Runnable;"),
+            "it must prove the exact blocked operation, not accept any Blocked task"
         );
         assert!(
             !body.contains("endpoint_waiter"),
@@ -121083,7 +121132,12 @@ mod stage199d_wa2a_ownership_boundary {
             //   of exactly the same class as `wake_joiners_for` in thread_state.rs, whose rank-2
             //   half this is: one body, two owners, with the rank-1 enqueues left to the caller.
             ("src/kernel/boot/exit_claim.rs", 3),
-            ("src/kernel/boot/ipc_state.rs", 9),
+            // U9-IRQ-UNKNOWN1 §2: 9 -> 8. `signal_notification` and
+            // `wake_destroyed_notification_waiter` had a status writer each, applying the same
+            // rule twice; both now reach one owner, `wake_notification_waiter_exact`, so the
+            // rule has ONE site and cannot be strengthened in one copy and left weak in the
+            // other.
+            ("src/kernel/boot/ipc_state.rs", 8),
             // U9-REAP1 §2: a NEW file with 2 writes, and both are the same site's two halves.
             //
             // - `claim_faulted_task_for_reap_locked` writes `Faulted|Exited -> Dead`. This is the
@@ -121176,7 +121230,10 @@ mod stage199d_wa2a_ownership_boundary {
             // rank-1 compare-and-clear then refuses, UNDOES that registration exactly. Its
             // predecessor wrote once and left the TCB `Blocked` on a transaction it could not
             // complete, which is a parked task the scheduler believes is elsewhere.
-            ("src/runtime.rs", 12),
+            // U9-IRQ-UNKNOWN1 §2: 12 -> 13. `wake_notification_waiter_exact_split` is the
+            // off-lock twin of that owner, needed because off-lock code can never obtain a
+            // `&mut KernelState`; it applies the identical three-part proof.
+            ("src/runtime.rs", 13),
         ];
         let mut found: alloc::vec::Vec<(alloc::string::String, usize)> = alloc::vec::Vec::new();
         for (rel, src) in production_sources() {
@@ -121348,7 +121405,8 @@ mod stage199d_wa2a_ownership_boundary {
     fn the_newly_found_unguarded_wake_owners_are_recorded() {
         for owner in [
             "wake_tid_to_runnable",
-            "wake_destroyed_notification_waiter",
+            // U9-IRQ-UNKNOWN1 §2: `wake_destroyed_notification_waiter` is no longer one of
+            // them — it reaches the identity-proving owner, which the case below asserts.
             "apply_cross_cpu_wake_task",
             "sr_wake_receiver_split",
             "exit_task",
@@ -121360,18 +121418,10 @@ mod stage199d_wa2a_ownership_boundary {
                 "§6.1.32 must record the newly found wake owner `{owner}`"
             );
         }
-        // …and each really is guarded only on `Blocked(_)` or not at all.
-        for (src, needle) in [
-            (
-                IPC_STATE,
-                "fn wake_tid_to_runnable(&mut self, tid: ThreadId)",
-            ),
-            (
-                IPC_STATE,
-                "pub(crate) fn wake_destroyed_notification_waiter(",
-            ),
-        ] {
-            let body = src.split(needle).nth(1).expect(needle);
+        // …and `wake_tid_to_runnable` really is guarded only on `Blocked(_)`.
+        {
+            let needle = "fn wake_tid_to_runnable(&mut self, tid: ThreadId)";
+            let body = IPC_STATE.split(needle).nth(1).expect(needle);
             let window = &body[..body.len().min(1200)];
             assert!(
                 window.contains("TaskStatus::Blocked(_)"),
@@ -121380,6 +121430,52 @@ mod stage199d_wa2a_ownership_boundary {
             assert!(
                 !window.contains("endpoint_waiters"),
                 "`{needle}` consults no endpoint waiter"
+            );
+        }
+        // U9-IRQ-UNKNOWN1 §2 — THE NOTIFICATION WAKE IS NO LONGER ONE OF THEM.
+        //
+        // This case recorded `wake_destroyed_notification_waiter` as a wake owner guarded only
+        // on `Blocked(_)`. That was an accurate finding and it is now a fixed one, so the case
+        // records the FIX rather than being deleted: both notification wakes go through one
+        // owner that proves the exact `{tid, asid}` incarnation, the exact
+        // `blocked_recv_generation`, and the exact blocked OPERATION.
+        //
+        // `Blocked(_)` was the whole defect. It matched a futex wait, a join and a blocked send
+        // by whatever task held the numeric TID, so a signal could wake a task out of a wait
+        // nothing had completed while the notification's real waiter slept on.
+        {
+            let needle = "pub(crate) fn wake_notification_waiter_exact(";
+            let body = IPC_STATE.split(needle).nth(1).expect(needle);
+            let window = &body[..body.len().min(1400)];
+            assert!(
+                !window.contains("TaskStatus::Blocked(_)"),
+                "the notification wake must no longer accept any Blocked wait reason"
+            );
+            assert!(
+                window.contains("TaskStatus::Blocked(WaitReason::EndpointReceive(_))"),
+                "it must require the exact blocked operation"
+            );
+            assert!(
+                window.contains("record.receiver.asid")
+                    && window.contains("record.wait_generation"),
+                "and the exact incarnation and the exact block it was published for"
+            );
+            assert!(
+                !window.contains("endpoint_waiters"),
+                "while still consulting no endpoint waiter"
+            );
+        }
+        // Both callers reach that one owner, so the rule cannot be strong in one and weak in
+        // the other.
+        for caller in [
+            "pub(crate) fn wake_destroyed_notification_waiter(",
+            "fn signal_notification(",
+        ] {
+            let body = IPC_STATE.split(caller).nth(1).expect(caller);
+            let window = &body[..body.len().min(2400)];
+            assert!(
+                window.contains("wake_notification_waiter_exact("),
+                "`{caller}` must reach the shared identity proof rather than re-implement it"
             );
         }
     }
@@ -121656,13 +121752,7 @@ mod stage199d_wa2b_wake_owner_census {
         ),
         (
             "src/kernel/boot/ipc_state.rs",
-            "signal_notification",
-            1,
-            Verdict::Can,
-        ),
-        (
-            "src/kernel/boot/ipc_state.rs",
-            "wake_destroyed_notification_waiter",
+            "wake_notification_waiter_exact",
             1,
             Verdict::Can,
         ),
@@ -121830,6 +121920,15 @@ mod stage199d_wa2b_wake_owner_census {
         (
             "src/runtime.rs",
             "wake_tid_to_runnable_split",
+            1,
+            Verdict::Can,
+        ),
+        // U9-IRQ-UNKNOWN1 §2: the off-lock twin of `wake_notification_waiter_exact`, added
+        // because off-lock code can never obtain a `&mut KernelState`. Same class as the
+        // in-lock owner it mirrors, and the same three-part identity proof.
+        (
+            "src/runtime.rs",
+            "wake_notification_waiter_exact_split",
             1,
             Verdict::Can,
         ),
@@ -122220,20 +122319,15 @@ mod stage199d_wa2b_wake_owner_census {
             "if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {",
             "tcb.ipc_timeout_deadline = None;",
         ),
+        // U9-IRQ-UNKNOWN1 §2: `signal_notification` and `wake_destroyed_notification_waiter`
+        // had a writer each, applying the same rule twice. Both now reach ONE owner, and its
+        // gate is an identity rather than `Blocked(_)`.
         (
             "src/kernel/boot/ipc_state.rs",
-            "signal_notification",
+            "wake_notification_waiter_exact",
             "tcb.status",
             "TaskStatus::Runnable",
-            "if matches!(tcb.status, TaskStatus::Blocked(_)) {",
-            "Ok(true)",
-        ),
-        (
-            "src/kernel/boot/ipc_state.rs",
-            "wake_destroyed_notification_waiter",
-            "tcb.status",
-            "TaskStatus::Runnable",
-            "if matches!(tcb.status, TaskStatus::Blocked(_)) {",
+            "}",
             "Ok(true)",
         ),
         (
@@ -122353,6 +122447,18 @@ mod stage199d_wa2b_wake_owner_census {
             "tcb.status",
             "TaskStatus::Runnable",
             "tcb.ipc_timeout_fired = false;",
+            "true",
+        ),
+        // U9-IRQ-UNKNOWN1 §2: the notification wake's off-lock twin, gated on the identity
+        // rather than on `Blocked(_)`. The preceding line is the close of the third and last
+        // identity guard — asid, wait generation and `Blocked(EndpointReceive(_))` — so the
+        // fingerprint pins the order the repair depends on: prove the exact waiter, then wake.
+        (
+            "src/runtime.rs",
+            "wake_notification_waiter_exact_split",
+            "tcb.status",
+            "TaskStatus::Runnable",
+            "}",
             "true",
         ),
         (
@@ -122530,7 +122636,14 @@ mod stage199d_wa2b_wake_owner_census {
              199E added `drain_recv_timeout_post_work`, the same relocation for the ordinary \
              receive timeout; U9-EXIT1 §4 retired TWO, `restart_state::exit_task`'s and \
              `thread_state::wake_joiners_for`'s, when the broad NR 16 began driving the same two \
-             bodies the split route does — 38 -> 36, a de-duplication rather than a removal"
+             bodies the split route does — 38 -> 36, a de-duplication rather than a removal. \
+             U9-IRQ-UNKNOWN1 §2 leaves the total at 37 by two offsetting moves, not by accident: \
+             `signal_notification` and `wake_destroyed_notification_waiter` each carried their own \
+             copy of the notification wake, and both now call ONE owner \
+             (`wake_notification_waiter_exact`), 37 -> 36; the off-lock twin that owner needs, \
+             `wake_notification_waiter_exact_split`, is a genuinely new writer, 36 -> 37. \
+             Reporting 37 is the honest result — one rule stopped being written twice, and one \
+             split form of that same rule appeared"
         );
         for (i, (file, function, lhs, rhs, before, after)) in sites.iter().enumerate() {
             let (pf, pfn, plhs, prhs, pbefore, pafter) = FINGERPRINTS[i];
@@ -134489,10 +134602,9 @@ mod u8_production_timeout_coverage {
                 Some(TaskStatus::Blocked(WaitReason::EndpointReceive(_)))
             ));
             assert!(
-                s.with_ipc_state(|ipc| ipc
-                    .notification_waiters
-                    .iter()
-                    .any(|w| *w == Some(crate::kernel::ipc::ThreadId(tid)))),
+                s.with_ipc_state(|ipc| ipc.notification_waiters.iter().any(
+                    |w| w.is_some_and(|w| w.receiver.tid == crate::kernel::ipc::ThreadId(tid))
+                )),
                 "the notification waiter slot is occupied while blocked"
             );
             let deadline = s
@@ -134519,10 +134631,9 @@ mod u8_production_timeout_coverage {
             );
             assert_eq!(s.ipc_deadline_count_for_tid(tid), 0, "deadline retired");
             assert!(
-                s.with_ipc_state(|ipc| ipc
-                    .notification_waiters
-                    .iter()
-                    .all(|w| *w != Some(crate::kernel::ipc::ThreadId(tid)))),
+                s.with_ipc_state(|ipc| ipc.notification_waiters.iter().all(
+                    |w| !w.is_some_and(|w| w.receiver.tid == crate::kernel::ipc::ThreadId(tid))
+                )),
                 "the notification waiter slot must be released by the off-lock settle"
             );
         });
@@ -142091,7 +142202,9 @@ mod u9f_split_capability_revocation {
             let (idx, cap, _recv) = state.create_notification(4).expect("notif");
             stage21_block_on_notification(state, 2901);
             state.with_ipc_state_mut(|ipc| {
-                ipc.notification_waiters[idx] = Some(ThreadId(2901));
+                ipc.notification_waiters[idx] = Some(
+                    crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2901)),
+                );
             });
             let tid = state.current_tid().expect("current tid");
             (idx, cap, tid)
@@ -142126,7 +142239,9 @@ mod u9f_split_capability_revocation {
             state.register_task(2902).expect("task");
             let (idx, cap, _recv) = state.create_notification(4).expect("notif");
             state.with_ipc_state_mut(|ipc| {
-                ipc.notification_waiters[idx] = Some(ThreadId(2902));
+                ipc.notification_waiters[idx] = Some(
+                    crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2902)),
+                );
             });
             state
                 .with_tcbs_mut(|tcbs| {
@@ -142173,7 +142288,9 @@ mod u9f_split_capability_revocation {
             let (idx, cap, _recv) = state.create_notification(4).expect("notif");
             stage21_block_on_notification(state, 2903);
             state.with_ipc_state_mut(|ipc| {
-                ipc.notification_waiters[idx] = Some(ThreadId(2903));
+                ipc.notification_waiters[idx] = Some(
+                    crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2903)),
+                );
             });
             (cap, state.current_tid().expect("current tid"))
         });
@@ -142365,7 +142482,9 @@ mod u9f_split_capability_revocation {
             // exactly the shape a death-and-replacement leaves behind.
             state.register_task(2904).expect("replacement task");
             state.with_ipc_state_mut(|ipc| {
-                ipc.notification_waiters[idx] = Some(ThreadId(2904));
+                ipc.notification_waiters[idx] = Some(
+                    crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2904)),
+                );
             });
             (idx, cap, state.current_tid().expect("tid"))
         });
@@ -142403,7 +142522,9 @@ mod u9f_split_capability_revocation {
             let (idx, cap, _recv) = state.create_notification(4).expect("notif");
             stage21_block_on_notification(state, 2905);
             state.with_ipc_state_mut(|ipc| {
-                ipc.notification_waiters[idx] = Some(ThreadId(2905));
+                ipc.notification_waiters[idx] = Some(
+                    crate::kernel::boot::EndpointWaiterRecord::for_bare_tid(ThreadId(2905)),
+                );
             });
             (idx, cap, state.current_tid().expect("tid"))
         });
@@ -146852,18 +146973,26 @@ mod u9qa_split_dispatch_disposition {
         // term when this bridge gained a page-fault seam, and §2c the demand term when the
         // demand class was admitted. The claim each carries is unchanged: every term is a ROUTE
         // reporting its OWN outcome, never borrowing another's.
-        let gate_at = RISCV_TRAP
+        // U9-IRQ-UNKNOWN1 §2 added the fourth term, `irq_handled`, under the same rule — and the
+        // gate stopped fitting on one source line, so it is located in a whitespace-normalized
+        // copy. Line breaking is rustfmt's business; the admitted set is this guard's.
+        let flattened = RISCV_TRAP
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        let riscv_flat: &str = &flattened;
+        let gate_at = riscv_flat
             .find(
                 "if queue_advance_committed || post_work_committed || cow_recovered \
-                 || demand_recovered {",
+                 || demand_recovered || irq_handled {",
             )
             .expect("the broad-dispatch gate");
-        let call = RISCV_TRAP
+        let call = riscv_flat
             .find(".with_cpu(cpu, |kernel| {")
             .expect("the broad dispatch");
         assert!(gate_at < call, "the gate must precede the acquisition");
         assert!(
-            !RISCV_TRAP[gate_at..call].contains("DISPATCH_SWITCH_PLAN_STASH"),
+            !riscv_flat[gate_at..call].contains("DISPATCH_SWITCH_PLAN_STASH"),
             "a stale or unrelated stash must not alter RISC-V dispatch control flow"
         );
         // No second drain: the Stage 196E FutexWait drain remains the only one, entered once.
@@ -148563,20 +148692,35 @@ mod u9tm_proof_gate {
         // fault of every class took the broad acquisition. §2b gives it the same two dispatch
         // entry points in the same order, which makes the routes REACHABLE; which classes they
         // admit is still the matrix's answer alone, and the matrix is unchanged.
-        for (name, src, arms) in [
+        //
+        // U9-IRQ-UNKNOWN1 §2 re-derivation: a FOURTH arm, `irq_handled`, on both bridges. A
+        // delivered device interrupt is none of the other three — it recovered no mapping, owes
+        // the architecture tail no syscall work, and published no deferral — so, by the same rule
+        // the COW arm was admitted under, it names itself rather than borrowing a reason. The
+        // gate outgrew one source line when the term was added, so the guard now matches against
+        // a whitespace-normalized copy of each bridge: rustfmt's line breaking is not the
+        // property under test, the set of admitted arms and their order is.
+        fn flat(src: &str) -> alloc::string::String {
+            src.split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ")
+        }
+        for (name, raw, arms) in [
             (
                 "shared",
                 include_str!("../../arch/trap_entry.rs"),
                 "if queue_advance_committed || post_work_committed || cow_recovered \
-                 || demand_recovered {",
+                 || demand_recovered || irq_handled {",
             ),
             (
                 "riscv",
                 include_str!("../../arch/riscv64/trap.rs"),
                 "if queue_advance_committed || post_work_committed || cow_recovered \
-                 || demand_recovered {",
+                 || demand_recovered || irq_handled {",
             ),
         ] {
+            let flattened = flat(raw);
+            let src: &str = &flattened;
             assert!(
                 src.contains(arms),
                 "{name} bridge must skip the broad arm on exactly its enumerated committed \
@@ -148610,12 +148754,37 @@ mod u9tm_proof_gate {
             // the chain when it began settling its own pre-mutation refusals. `or` is still the
             // right combinator: at most one of them is ever `Some`, because each route is
             // skipped once an earlier one has handled the fault.
+            // U9-IRQ-UNKNOWN1 §2: FOUR, and the IRQ cell is first. It is not a precedence claim
+            // — the IRQ route runs before the fault decode and gates the fault routes out
+            // entirely, so no two cells can be `Some` on one trap — it is the same "whichever
+            // owner handled this trap" join, extended to the owner that now handles interrupts
+            // off the broad lock. The cell must be in the chain or a delivery error would be
+            // silently downgraded to `Ok(())` at the tail.
             assert!(
-                src.contains("Ok(terminal_result")
+                src.contains("Ok(irq_result")
+                    && src.contains(".or(terminal_result)")
                     && src.contains(".or(demand_result)")
                     && src.contains(".or(cow_result)")
                     && src.contains(".unwrap_or(Ok(())))"),
                 "{name} bridge: the recovered result must be the route's, not a fabricated Ok"
+            );
+            // Exactly one place per bridge may carry the IRQ route's result, and it is the same
+            // place that raises the skip flag — so a delivery can never be reported as handled
+            // without its result, nor its result carried without the broad arm being skipped.
+            assert_eq!(
+                src.matches("irq_result = Some(result);").count(),
+                1,
+                "{name} bridge: exactly one place may carry the IRQ route's result"
+            );
+            assert_eq!(
+                src.matches("irq_handled = true;").count(),
+                1,
+                "{name} bridge: exactly one place may declare an interrupt delivered"
+            );
+            assert!(
+                src.contains("\"irq_delivered\""),
+                "{name} bridge: the IRQ arm must report its own skip reason rather than borrow \
+                 a fault route's"
             );
             assert_eq!(
                 src.matches("terminal_result = Some(result);").count(),
@@ -152200,11 +152369,17 @@ mod u9pagefault2_closure {
                     && src.contains("cow_result = Some(result);"),
                 "{name}: every page-fault route's result must be carried, not discarded"
             );
+            // U9-IRQ-UNKNOWN1 §2: the join gained a fourth cell, and it is the IRQ route's. The
+            // page-fault claim this guard exists for is unchanged — all three fault results must
+            // still be in the chain — but the chain must now START at `irq_result`, because the
+            // IRQ route settles before the fault decode runs and its `Complete(Err(..))` would
+            // otherwise be dropped on the floor exactly as the terminal route's once was.
             assert!(
-                src.contains("Ok(terminal_result")
+                src.contains("Ok(irq_result")
+                    && src.contains(".or(terminal_result)")
                     && src.contains(".or(demand_result)")
                     && src.contains(".or(cow_result)"),
-                "{name}: and all three must reach the handler's inner result"
+                "{name}: and all four must reach the handler's inner result"
             );
             // The terminal route is handed the TRAP'S authority, not one it minted for itself.
             let call = &src[terminal..];
@@ -152600,8 +152775,14 @@ mod u9cow2_route {
         // victim now produces. The claim is unchanged: the result is the ROUTE's, never a
         // fabricated `Ok`, and `or` is exact because at most one cell is ever `Some` — each
         // route is skipped once an earlier one has handled the fault.
+        // U9-IRQ-UNKNOWN1 §2 re-derivation: FOUR cells, the IRQ route's first. The COW claim this
+        // guard protects is untouched — a recovered COW fault still returns its own result and
+        // never a fabricated `Ok` — and `or` stays exact for the same reason, extended by one:
+        // the IRQ route runs before the fault decode and gates all three fault routes out when it
+        // handles the trap, so no two cells can be `Some` on a single entry.
         assert!(
-            TRAP_SRC.contains("Ok(terminal_result")
+            TRAP_SRC.contains("Ok(irq_result")
+                && TRAP_SRC.contains(".or(terminal_result)")
                 && TRAP_SRC.contains(".or(demand_result)")
                 && TRAP_SRC.contains(".or(cow_result)")
                 && TRAP_SRC.contains(".unwrap_or(Ok(())))"),
@@ -152609,7 +152790,11 @@ mod u9cow2_route {
         );
         assert!(
             !TRAP_SRC.contains("Ok(cow_result.unwrap_or(Ok(())))")
-                && !TRAP_SRC.contains("Ok(demand_result.or(cow_result).unwrap_or(Ok(())))"),
+                && !TRAP_SRC.contains("Ok(demand_result.or(cow_result).unwrap_or(Ok(())))")
+                && !TRAP_SRC.contains(
+                    "Ok(terminal_result\n                .or(demand_result)\n                \
+                     .or(cow_result)\n                .unwrap_or(Ok(())))"
+                ),
             "and no shorter form may be left beside the chain"
         );
         // The terminal arm must BIND the result, not discard it: `Complete(_)` is exactly the

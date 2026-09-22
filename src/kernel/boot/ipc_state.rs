@@ -4169,7 +4169,7 @@ impl KernelState {
                 }
             }
             for waiter in ipc.notification_waiters.iter_mut() {
-                if *waiter == Some(tid_id) {
+                if waiter.is_some_and(|w| w.receiver.tid == tid_id) {
                     *waiter = None;
                 }
             }
@@ -5466,7 +5466,7 @@ impl KernelState {
                         }
                     }
                     for waiter in ipc.notification_waiters.iter_mut() {
-                        if *waiter == Some(tid) {
+                        if waiter.is_some_and(|w| w.receiver.tid == tid) {
                             *waiter = None;
                         }
                     }
@@ -5482,7 +5482,10 @@ impl KernelState {
                             .endpoint_sender_waiters
                             .iter()
                             .any(|q| q.iter().any(|s| s.as_ref().is_some_and(|w| w.tid == tid)))
-                        || ipc.notification_waiters.iter().any(|w| *w == Some(tid));
+                        || ipc
+                            .notification_waiters
+                            .iter()
+                            .any(|w| w.is_some_and(|w| w.receiver.tid == tid));
                     if remains {
                         stranded_in_batch = true;
                     }
@@ -7353,25 +7356,21 @@ impl KernelState {
         // is now Dead/Exited/Runnable/Running/Faulted, signalling must NOT
         // resurrect or double-enqueue it.  This mirrors the cross-CPU
         // `apply_cross_cpu_wake_task` guard and the WakeTask work-item policy.
-        if let Some(waiter_tid) = opt_waiter_tid {
-            let should_enqueue = self.with_tcbs_mut(|tcbs| {
-                let Some(tcb) = tcbs
-                    .iter_mut()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
-                else {
-                    // Missing TID (recycled/never registered): silent no-op.
-                    return Ok::<bool, KernelError>(false);
-                };
-                if matches!(tcb.status, TaskStatus::Blocked(_)) {
-                    tcb.status = TaskStatus::Runnable;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            })?;
-            if should_enqueue {
-                self.enqueue_task(waiter_tid.0)?;
+        if let Some(record) = opt_waiter_tid {
+            // U9-IRQ-UNKNOWN1 §2 — the wake now proves an IDENTITY, not a numeric TID.
+            //
+            // This used to find the TCB by `tid.0` and accept any `Blocked(_)`. Both halves were
+            // too weak. A recycled TID names a different task entirely, and `Blocked(_)` matches
+            // a futex wait, a join, a send and a receive on some other object — so a signal
+            // could wake a task out of a wait nothing had completed, and the waiter this
+            // notification actually had would sleep on.
+            //
+            // The record carries what the published block was: the exact `{tid, asid}`
+            // incarnation and the `blocked_recv_generation` it committed under. All three are
+            // checked, under the ONE rank-2 acquisition that performs the transition, so nothing
+            // can move between the proof and the write.
+            if self.wake_notification_waiter_exact(record)? {
+                self.enqueue_task(record.receiver.tid.0)?;
             }
         }
         Ok(())
@@ -7406,7 +7405,7 @@ impl KernelState {
     pub(crate) fn destroy_notification(
         &mut self,
         notification_idx: usize,
-    ) -> Result<Option<ThreadId>, KernelError> {
+    ) -> Result<Option<EndpointWaiterRecord>, KernelError> {
         if notification_idx >= self.runtime_capacity_config().max_notifications {
             return Err(KernelError::WrongObject);
         }
@@ -7429,7 +7428,7 @@ impl KernelState {
                 next_gen = 1;
             }
             ipc.notification_generations[notification_idx] = next_gen;
-            Ok::<Option<ThreadId>, KernelError>(waiter)
+            Ok::<Option<EndpointWaiterRecord>, KernelError>(waiter)
         })
     }
 
@@ -7450,27 +7449,58 @@ impl KernelState {
     /// extra cancellation signalling is needed here.
     pub(crate) fn wake_destroyed_notification_waiter(
         &mut self,
-        waiter_tid: ThreadId,
+        record: EndpointWaiterRecord,
     ) -> Result<(), KernelError> {
-        let should_enqueue = self.with_tcbs_mut(|tcbs| {
+        // U9-IRQ-UNKNOWN1 §2 — the SAME identity proof the signal path uses. The two wakes have
+        // always had the same gating rule; they now share the owner that implements it, so the
+        // rule cannot be strengthened in one and left weak in the other.
+        if self.wake_notification_waiter_exact(record)? {
+            self.enqueue_task(record.receiver.tid.0)?;
+        }
+        Ok(())
+    }
+
+    /// U9-IRQ-UNKNOWN1 §2 — prove a published notification waiter and move it to `Runnable`.
+    ///
+    /// ONE rank-2 acquisition performs the proof and the transition together, which is what
+    /// makes it a proof rather than a precheck: nothing can move the TCB between them.
+    ///
+    /// Three facts are required, and each rules out a wake that the old bare-TID form allowed:
+    ///
+    /// * the **exact incarnation** — a recycled numeric TID is a different task;
+    /// * the **exact blocked operation** — `Blocked(EndpointReceive(_))`, so a futex wait, a
+    ///   join or a blocked send by the same task is not mistaken for this receive;
+    /// * the **exact generation** — the same `{tid, asid}` may block on this notification,
+    ///   unblock and block again, and only the block this record was published for may be woken
+    ///   by it.
+    ///
+    /// Returns whether the caller owes an enqueue. The enqueue itself is rank 1 and is performed
+    /// by the caller AFTER this acquisition has been released.
+    pub(crate) fn wake_notification_waiter_exact(
+        &mut self,
+        record: EndpointWaiterRecord,
+    ) -> Result<bool, KernelError> {
+        self.with_tcbs_mut(|tcbs| {
             let Some(tcb) = tcbs
                 .iter_mut()
                 .flatten()
-                .find(|tcb| tcb.tid.0 == waiter_tid.0)
+                .find(|tcb| tcb.tid == record.receiver.tid)
             else {
+                // Missing TID (recycled away / never registered): silent no-op, as before.
                 return Ok::<bool, KernelError>(false);
             };
-            if matches!(tcb.status, TaskStatus::Blocked(_)) {
-                tcb.status = TaskStatus::Runnable;
-                Ok(true)
-            } else {
-                Ok(false)
+            if tcb.asid.unwrap_or(crate::kernel::vm::Asid(0)) != record.receiver.asid {
+                return Ok(false);
             }
-        })?;
-        if should_enqueue {
-            self.enqueue_task(waiter_tid.0)?;
-        }
-        Ok(())
+            if tcb.blocked_recv_generation != record.wait_generation {
+                return Ok(false);
+            }
+            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointReceive(_))) {
+                return Ok(false);
+            }
+            tcb.status = TaskStatus::Runnable;
+            Ok(true)
+        })
     }
 
     pub fn route_external_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {
@@ -8332,7 +8362,15 @@ impl KernelState {
             }
             // Nothing available — block.
             let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
-            self.with_tcbs_mut(|tcbs| {
+            // U9-IRQ-UNKNOWN1 §2 — the waiter's identity is CAPTURED here, where it is true.
+            //
+            // The generation is bumped through the receive family's own owner before the block
+            // is committed, so the record names THIS block and not a previous one by the same
+            // `{tid, asid}`. Reading it afterwards would name whatever a later receive left.
+            let wait_generation = self
+                .bump_blocked_recv_generation(blocked_tid)
+                .ok_or(KernelError::TaskMissing)?;
+            let blocked_asid = self.with_tcbs_mut(|tcbs| {
                 let tcb = tcbs
                     .iter_mut()
                     .flatten()
@@ -8341,11 +8379,14 @@ impl KernelState {
                 tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
                 tcb.ipc_timeout_deadline = deadline;
                 tcb.ipc_timeout_fired = false;
-                Ok::<_, KernelError>(())
+                Ok::<_, KernelError>(tcb.asid.unwrap_or(crate::kernel::vm::Asid(0)))
             })?;
             // Publish waiter under ipc_state_lock after TCB is Blocked.
             self.with_ipc_state_mut(|ipc| {
-                ipc.notification_waiters[notif_idx] = Some(ThreadId(blocked_tid));
+                ipc.notification_waiters[notif_idx] = Some(EndpointWaiterRecord::new(
+                    ReceiverWaiterIdentity::new(ThreadId(blocked_tid), blocked_asid),
+                    wait_generation,
+                ));
             });
             let _ = self.dispatch_next_task()?;
             return Ok(None);

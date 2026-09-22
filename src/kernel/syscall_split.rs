@@ -1603,6 +1603,175 @@ pub(crate) fn try_split_cow_page_fault_dispatch(
     try_split_cow_page_fault_into_frame(shared, cpu, fault)
 }
 
+/// U9-IRQ-UNKNOWN1 §2 — the pre-lock EXTERNAL INTERRUPT route.
+///
+/// # What this family is, and what it is not
+///
+/// A device interrupt only. Timers reach `TrapEvent::TimerInterrupt` and never arrive here; IPIs
+/// on x86_64 are serviced by their own vector stubs (`yarm_ap_*`), which EOI themselves and never
+/// enter this bridge; AArch64's GICv2 special INTIDs (1020..=1023) are refused in the vector
+/// entry before a trap event is built at all. So every arrival here is a routed device line, a
+/// spurious one, or one whose route has been torn down.
+///
+/// # Acknowledgement is the ARCHITECTURE'S, and it is not reproduced here
+///
+/// This route performs NO controller completion, and that is the whole of its contract with the
+/// hardware. `acknowledge_interrupt` is the per-port seam whose documented job is "the shared
+/// handler's single-step acknowledgement", and the bridge calls it — once — in exactly the
+/// position the broad arm called it from.
+///
+/// It matters which seam. `external_irq_eoi` is the RAW write and is not equivalent:
+///
+/// * **x86_64** — `acknowledge_interrupt` IS the LAPIC EOI, and the shared handler is its only
+///   owner for a routed vector. Unchanged.
+/// * **AArch64** — `acknowledge_interrupt` is deliberately INERT, because the claim is taken in
+///   the vector entry (`GICC_IAR`) and completed in the vector tail (`GICC_EOIR`), exactly once
+///   per claim, after the handler has run. The broad arm called `external_irq_eoi`, which writes
+///   `GICC_EOIR` — so a routed device interrupt received TWO completions for ONE claim, and a
+///   GICv2 CPU interface's active-priority stack does not survive that. Using the correctly
+///   scoped seam is what removes the second write; nothing is added beside the tail.
+/// * **RISC-V** — `acknowledge_interrupt` forwards to the PLIC completion, which is where the
+///   port's own barrier sits; see the route's refusal below.
+///
+/// # The RISC-V identifier is not a claim, and this route says so
+///
+/// `decode_trap_context` builds `ExternalInterrupt(context.stval as u16)`. `stval` is not the
+/// PLIC's claim register — on a supervisor external interrupt it is architecturally zero — so the
+/// line number is not a device identity, and `external_irq_eoi` refuses source 0 because source 0
+/// is the PLIC's reserved "no interrupt" encoding. The port therefore has no claim and performs
+/// no completion today.
+///
+/// This route does not paper over that by treating the value as an identity. A RISC-V arrival is
+/// refused to the unchanged broad arm, which behaves exactly as it does now, and the barrier is
+/// named rather than hidden: RISC-V needs `PLIC_CLAIM` read in its vector entry before a device
+/// interrupt has an identity to route. That is controller work, not unlocking work.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_external_interrupt_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    irq: Option<u16>,
+) -> SplitDispatchDisposition {
+    use crate::kernel::boot::IrqDeliveryOutcome as O;
+    use SplitDispatchDisposition as D;
+
+    let Some(irq_line) = irq else {
+        return D::NotHandled;
+    };
+    // The RISC-V barrier, refused explicitly rather than by omission. See the doc comment: the
+    // decoded value is `stval`, which is not a controller claim.
+    if cfg!(target_arch = "riscv64") {
+        crate::yarm_log!(
+            "IRQ1_SPLIT_REFUSED cpu={} line={} reason=riscv_identifier_is_not_a_claim broad_lock=0",
+            cpu.0,
+            irq_line
+        );
+        return D::NotHandled;
+    }
+    let outcome = shared.deliver_external_irq_split(cpu, irq_line);
+    crate::yarm_log!(
+        "IRQ1_SPLIT_DELIVERY cpu={} line={} outcome={} broad_lock=0",
+        cpu.0,
+        irq_line,
+        outcome.marker()
+    );
+    // An asynchronous interrupt owns none of the interrupted context. No syscall result is
+    // encoded, no PC is advanced, no scheduler placement is published for the interrupted task —
+    // it resumes exactly where it was, which is what `Complete` means for a class that produced
+    // no result of its own.
+    match outcome.propagated_error() {
+        None => D::Complete(Ok(())),
+        // The delivered behaviour, preserved: a full notification queue leaves the trap as an
+        // error rather than being silently dropped.
+        Some(error) => D::Complete(Err(TrapHandleError::Syscall(
+            crate::kernel::syscall::SyscallError::from(error),
+        ))),
+    }
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_external_interrupt_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _irq: Option<u16>,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
+}
+
+/// U9-IRQ-UNKNOWN1 §2 — the bridge entry for the external-interrupt route.
+pub(crate) fn try_split_external_interrupt_dispatch(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    irq: Option<u16>,
+) -> SplitDispatchDisposition {
+    try_split_external_interrupt_into_frame(shared, cpu, irq)
+}
+
+/// U9-IRQ-UNKNOWN1 §3 — **the Unknown policy, before the broad acquisition.**
+///
+/// One owner, and it moves the existing policy rather than restating it. The broad arm's arm is
+/// three things: a diagnostic line naming the CPU and the architectural code, a default-off
+/// `FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL` marker, and `panic!` under `STRICT_UNKNOWN_TRAPS` —
+/// which is `!cfg!(feature = "hosted-dev")`, so production is strict and hosted is not.
+///
+/// All three are preserved, including which build is strict. What an unknown trap must NOT
+/// become is the thing the broad arm is careful not to make it: it is not reclassified as a user
+/// page fault, no victim is fabricated for it, and it is not a successful production return.
+///
+/// The hosted build keeps its existing behaviour by declining — `handle_trap(Trap::Unknown)`
+/// returns `Ok(())` there and nothing about that changes.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_unknown_trap_into_frame(
+    cpu: CpuId,
+    arch_code: Option<u64>,
+) -> SplitDispatchDisposition {
+    let Some(arch_code) = arch_code else {
+        return SplitDispatchDisposition::NotHandled;
+    };
+    // The broad arm's own diagnostic, in the broad arm's words, from the HARDWARE-derived CPU
+    // and code rather than an ambient re-read.
+    crate::yarm_log!(
+        "unknown trap event cpu={} arch_code=0x{:x}",
+        cpu.0,
+        arch_code
+    );
+    if crate::kernel::boot::fault_delivery_enabled() {
+        crate::yarm_log!(
+            "FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL vector=0x{:x}",
+            arch_code
+        );
+    }
+    crate::yarm_log!(
+        "IRQ1_UNKNOWN_SETTLED cpu={} arch_code=0x{:x} strict=1 broad_lock=0",
+        cpu.0,
+        arch_code
+    );
+    // Production is strict, and the panic is the policy — not a substitute for one. The trap
+    // window is retired by the caller before this diverges, which is why the bridge calls this
+    // from a position that owns that retirement.
+    panic!(
+        "strict unknown trap policy: cpu={} arch_code=0x{:x}",
+        cpu.0, arch_code
+    );
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_unknown_trap_into_frame(
+    _cpu: CpuId,
+    _arch_code: Option<u64>,
+) -> SplitDispatchDisposition {
+    // Hosted is NOT strict, and keeps its existing route: the broad arm's `handle_trap`
+    // answers `Ok(())` and nothing here may change that.
+    SplitDispatchDisposition::NotHandled
+}
+
+/// U9-IRQ-UNKNOWN1 §3 — the bridge entry for the Unknown route.
+pub(crate) fn try_split_unknown_trap_dispatch(
+    cpu: CpuId,
+    arch_code: Option<u64>,
+) -> SplitDispatchDisposition {
+    try_split_unknown_trap_into_frame(cpu, arch_code)
+}
+
 /// U9-FT4 — the bridge entry for the terminal PageFault route.
 ///
 /// U9-PAGEFAULT2 §3 — it takes the TRAP'S OWN AUTHORITY, and the bridge passes the one it

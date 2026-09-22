@@ -702,8 +702,8 @@ impl KernelState {
             return;
         };
         match self.destroy_notification(index) {
-            Ok(Some(waiter_tid)) => {
-                let _ = self.wake_destroyed_notification_waiter(waiter_tid);
+            Ok(Some(waiter)) => {
+                let _ = self.wake_destroyed_notification_waiter(waiter);
             }
             // Object already gone (paired cap / double-revoke) or out of range:
             // benign no-op — nothing left to tear down.
@@ -1223,7 +1223,10 @@ impl crate::runtime::SharedKernel {
     /// and no live `Notification` cap can name such an index (`create_notification` allocates
     /// within the config bound). The same array bound is what `capability_object_live` already
     /// uses for this class.
-    fn destroy_notification_split(&self, index: usize) -> Option<crate::kernel::ipc::ThreadId> {
+    fn destroy_notification_split(
+        &self,
+        index: usize,
+    ) -> Option<crate::kernel::boot::EndpointWaiterRecord> {
         if index >= MAX_NOTIFICATIONS {
             return None;
         }
@@ -1266,19 +1269,31 @@ impl crate::runtime::SharedKernel {
     /// shared committer, so this can no longer drift from the broad path it claims to mirror.
     /// The Blocked-only status transition stays in the SAME rank-2 acquisition as the plan,
     /// which is what the broad path had under its single guard.
+    ///
+    /// U9-IRQ-UNKNOWN1 §2: the Blocked-only gate is now an IDENTITY gate, matching the broad
+    /// owner it mirrors. `Blocked(_)` accepted a futex wait, a join or a blocked send by a task
+    /// that happened to hold the same numeric TID; the record's `{tid, asid}` and
+    /// `blocked_recv_generation` name the exact block that was published, and the status test
+    /// names the exact operation.
     fn wake_destroyed_notification_waiter_split(
         &self,
-        waiter_tid: crate::kernel::ipc::ThreadId,
+        record: crate::kernel::boot::EndpointWaiterRecord,
     ) -> bool {
-        use crate::kernel::task::TaskStatus;
-        let tid = waiter_tid.0;
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let tid = record.receiver.tid.0;
         // Phase 1 (rank 1): the CPU the driver pin would use, read and released before the task
         // domain is entered.
         let current_cpu = self.with_scheduler_split_mut(|sched| sched.current_cpu);
         // Phase 2 (rank 2): the Blocked-only transition and the placement plan, one acquisition.
         let plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
             let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
-            if !matches!(tcb.status, TaskStatus::Blocked(_)) {
+            if tcb.asid.unwrap_or(crate::kernel::vm::Asid(0)) != record.receiver.asid {
+                return None;
+            }
+            if tcb.blocked_recv_generation != record.wait_generation {
+                return None;
+            }
+            if !matches!(tcb.status, TaskStatus::Blocked(WaitReason::EndpointReceive(_))) {
                 return None;
             }
             tcb.status = TaskStatus::Runnable;

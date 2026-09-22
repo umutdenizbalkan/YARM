@@ -4057,8 +4057,8 @@ classification table's):
 
 | file | function | sites |
 |---|---|---|
-| `ipc_state.rs` | `rt_commit_receiver_runnable`, `wake_tid_to_runnable`, `process_ipc_timeout_deadlines`, `signal_notification`, `wake_destroyed_notification_waiter` | 5 |
-| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`, `wake_tid_to_runnable_split`, `drain_recv_timeout_post_work`, `recv_block_unwind_exact_split` | 7 |
+| `ipc_state.rs` | `rt_commit_receiver_runnable`, `wake_tid_to_runnable`, `process_ipc_timeout_deadlines`, `wake_notification_waiter_exact` | 4 |
+| `runtime.rs` | `sr_commit_blocked_receiver_split`, `sr_wake_receiver_split`, `d6_genuine_mark_running_via_task_seam`, `direct_dispatch_rollback_split`, `wake_tid_to_runnable_split`, `drain_recv_timeout_post_work`, `recv_block_unwind_exact_split`, `wake_notification_waiter_exact_split` | 8 |
 | `restart_state.rs` | `exit_task`, `restart_task`, `mark_task_dead`, `reap_faulted_task_noalloc_cleanup` | 4 |
 | `exec_state.rs` | `spawn_user_task_from_image`, `dispatch_next_task`, `yield_current` ×2, `yield_current_to` ×2 | 6 |
 | `scheduler_state.rs` | `apply_cross_cpu_wake_task` | 1 |
@@ -4172,10 +4172,14 @@ one must derive from the other.
 
 ##### E.2 Notification is not an endpoint owner
 
-`signal_notification` and `wake_destroyed_notification_waiter` take a **bare TID** out of
-`notification_waiters`, guard only on `matches!(tcb.status, TaskStatus::Blocked(_))`, and never
-read `endpoint_waiters`. If that TID has since re-blocked on an endpoint receive, the wake lands on
-a *valid, unrelated* endpoint wait.
+*(As found. The defect described here is repaired — see **E.2-R** below, which is the current
+state. This paragraph is kept in the past tense it was written in, because the retraction that
+follows it only makes sense against what was found.)*
+
+`signal_notification` and `wake_destroyed_notification_waiter` took a **bare TID** out of
+`notification_waiters`, guarded only on `matches!(tcb.status, TaskStatus::Blocked(_))`, and never
+read `endpoint_waiters`. If that TID had since re-blocked on an endpoint receive, the wake landed
+on a *valid, unrelated* endpoint wait.
 
 The earlier matrix said these should claim the endpoint slot and settle it with `cancel`. **That
 is wrong and is retracted.** Cancelling would make a stale notification destroy a live endpoint
@@ -4200,6 +4204,37 @@ production-enforced proven-negative / refusal set. The required future repair:
 > identity, a notification can no longer collide with an endpoint wait, and the variant may become
 > obsolete. It is **kept** for now: removing it before the exact-identity design exists would
 > lose the record that this collision was found. Decide at the wiring increment, not here.
+
+###### E.2-R — U9-IRQ-UNKNOWN1 §2: the repair, and exactly how far it goes
+
+The four requirements above were not a future increment's problem once IRQ delivery had to run
+off the broad lock: the split route's whole point is that a device interrupt wakes a blocked
+notification receiver, so the waiter slot became a *production* identity boundary rather than a
+hosted-only one. Requirements **1, 3 and 4 are implemented**; requirement **2 is satisfied by a
+different, already-minted token**, and that substitution is stated here rather than reported as
+parity.
+
+| requirement | state | how |
+|---|---|---|
+| 1. generation-bearing `{tid, asid}` waiter identity | **done** | `notification_waiters` is `[Option<EndpointWaiterRecord>; MAX_NOTIFICATIONS]` — the same `{ReceiverWaiterIdentity{tid, asid}, wait_generation}` record `endpoint_waiters` stores. The producer (`ipc_recv_with_optional_deadline`'s notification arm) bumps `blocked_recv_generation` and publishes the record it just minted. |
+| 2. a notification-specific blocked reason | **substituted, not added** | No new `WaitReason` variant. The notification receive *is* an endpoint receive at the task layer — it blocks as `Blocked(WaitReason::EndpointReceive(_))` and mints the receive wait generation — so the exact token that answers "is this task still in the wait I published?" already existed: `blocked_recv_generation`. The wake requires all three of asid, that generation, and `Blocked(EndpointReceive(_))`. A new reason would be a *fourth* fact restating the first three; the collision E.2 found is closed by the generation, not by the reason tag. If notification waits are ever allowed to block under some other reason, this row must be re-derived — the guard pins the `Blocked(EndpointReceive(_))` arm so that change cannot pass silently. |
+| 3. mismatch or stale record → ignore, never wake | **done** | `wake_notification_waiter_exact` (and its off-lock twin) return `false` on any of the three mismatches. The caller enqueues only on `true`, so a stale record costs a lost signal-wake, never a wrong wake. |
+| 4. never settle an unrelated endpoint waiter | **done, and pinned** | Neither owner reads or writes `endpoint_waiters`; `the_notification_wake_never_consults_the_endpoint_waiter` asserts the absence. |
+
+**One owner, two acquisitions of it.** The rule was previously written twice —
+`signal_notification` and `wake_destroyed_notification_waiter` each carried a copy, both gated on
+`matches!(tcb.status, TaskStatus::Blocked(_))`. Both now call `wake_notification_waiter_exact`,
+and the off-lock callers (split IRQ delivery, `wake_destroyed_notification_waiter_split`) call
+`SharedKernel::wake_notification_waiter_exact_split`, which applies the identical three-part
+proof under a rank-2 acquisition because off-lock code can never obtain a `&mut KernelState`.
+Layer 1 therefore records **−2 +1 in `ipc_state.rs` and +1 in `runtime.rs`**: the transition did
+not multiply, one duplicate was removed and one split form of the same rule appeared.
+
+**`WaiterOwner::Notification` is still kept, and the reason has changed.** It is no longer kept
+to preserve the record of a collision — the collision is closed. It is kept because IRQ delivery
+now has a production origin (`deliver_external_irq_split`) that the design matrix must be able to
+name, which is precisely the wiring question E.2 deferred. Deciding it still belongs to the
+wiring increment.
 
 ##### E.3 `wake_tid_to_runnable` — three origins, three different policies
 

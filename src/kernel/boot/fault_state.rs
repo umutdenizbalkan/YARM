@@ -83,6 +83,74 @@ impl UnattributableFault {
     }
 }
 
+/// U9-IRQ-UNKNOWN1 §2 — what an external-interrupt delivery actually did.
+///
+/// The broad pair answers `Result<(), KernelError>`, which cannot distinguish "there was no
+/// route" from "the target was destroyed" from "a waiter was woken" — all three are `Ok(())`.
+/// That was tolerable while the only consumer discarded the value; a split bridge has to settle
+/// every ending WITHOUT falling back, so each ending has to be nameable.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IrqDeliveryOutcome {
+    /// No route is bound to this line. A spurious or unrouted interrupt is benign, exactly as it
+    /// is in the broad form, which returns `Ok(())` before it ever reaches a notification.
+    NoRoute,
+    /// A route named a notification slot that holds no object. `destroy_notification` clears
+    /// matching routes, so this is the destroy/deliver race — benign, and the broad form's
+    /// `WrongObject` arm answers it the same way.
+    TargetGone { notification_idx: usize },
+    /// Signalled, and nobody was parked on it. The signal is pending in the notification's own
+    /// queue for the next receive.
+    Delivered {
+        notification_idx: usize,
+        generation: u64,
+    },
+    /// Signalled, and the published waiter was proven and made runnable.
+    DeliveredAndWoke {
+        notification_idx: usize,
+        generation: u64,
+        waiter_tid: u64,
+    },
+    /// Signalled, and the published waiter did NOT survive its identity proof — a recycled TID,
+    /// a replacement incarnation, a later block by the same task, or a task already woken by a
+    /// timeout or an exit. The signal stands; nothing is woken. The broad form reaches the same
+    /// state and cannot report it.
+    DeliveredWaiterStale {
+        notification_idx: usize,
+        generation: u64,
+        waiter_tid: u64,
+    },
+    /// The delivery failed and the error PROPAGATES, exactly as the broad form propagates it:
+    /// a full notification queue is `EndpointQueueFull` and leaves the trap as an error. This
+    /// route does not start dropping interrupts to make itself total.
+    Failed {
+        notification_idx: usize,
+        error: crate::kernel::boot::KernelError,
+    },
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl IrqDeliveryOutcome {
+    pub(crate) fn marker(self) -> &'static str {
+        match self {
+            Self::NoRoute => "no_route",
+            Self::TargetGone { .. } => "target_gone",
+            Self::Delivered { .. } => "delivered",
+            Self::DeliveredAndWoke { .. } => "delivered_and_woke",
+            Self::DeliveredWaiterStale { .. } => "delivered_waiter_stale",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    /// The error a failed delivery carries out of the trap, mirroring the broad form's `?`.
+    pub(crate) fn propagated_error(self) -> Option<crate::kernel::boot::KernelError> {
+        match self {
+            Self::Failed { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// U9-PAGEFAULT3 §2 — why the off-lock classifier produced no `{class, facts}` pair.
 ///
 /// This replaces an `Option`. The routes used to call a helper that mapped BOTH of these to
