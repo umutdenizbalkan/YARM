@@ -20577,3 +20577,97 @@ failed because the assertion named the access — `access=Execute` — and the a
 scenario exists to produce. An indirect branch through a zeroed register (`jmp rax`, `br x16`,
 `jr t0`) cannot be folded that way: `rip=0x0` in all three logs is the CPU confirming it fetched
 at address 0.
+
+## U9-PAGEFAULT1 §4 — qualification and delivery
+
+Frozen at `fe0d1ef5`. Everything below was measured on that tree, with the working tree clean and
+the artifacts rebuilt from it.
+
+### 1. Source closure
+
+What the split page-fault routes settle without the broad dispatcher, and what they still hand to
+it. Counted from `§1b`'s 25 `NotHandled` exits (12 genuine residuals, after the correction
+recorded there):
+
+| | closed | open |
+|---|---|---|
+| architecture gates | 2 — terminal on x86_64/RISC-V, COW on RISC-V | 0 |
+| outcomes never written down | 4 — COW already-writable, COW absent-mapping, demand stale-translation, `NotifyAndContinue` | 0 |
+| report endings | 2 — no-route, endpoint stale | 2 — waiter present, buffer full (**mechanism**) |
+| pre-mutation refusals | 0 | 4 — policy read, queue admit, defer, commit revalidation |
+
+The classification-failure path §3 owns is separate from all of it: `UserKernelAddress` became its
+own class with facts and a terminal row, and `KernelOrAbsentTask` now carries which of three
+causes produced it, each named at the decline by `PF1_UNATTRIBUTABLE_FAULT`.
+
+Two source-level repairs that were not on anyone's list:
+
+* **The off-lock classifier had no privilege-origin test.** §2 added one to the broad form only,
+  and the split routes — which run FIRST — call the off-lock form. It is step (0) of both now.
+* **The x86_64 queue-advance drain claimed to admit the `Faulted` outgoing state and did not.**
+  Its comment said so; its predicate did not test for it. RISC-V's neither said nor did. Both
+  carry the same exact predicate the AArch64 drain has had since U9-FT4.
+
+### 2. Exercised outcomes — the scoped live matrix, from fresh frozen artifacts
+
+Every cell below ran on artifacts built from `fe0d1ef5`. `broad` is `PF1_BROAD_ARRIVAL`, which
+prints only in the broad arm's PageFault entry.
+
+| cell | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| default profile (no oracle) | rc=0, 0 faults, broad=0 | rc=0, 0 faults, broad=0 | rc=0, 0 faults, broad=0 |
+| terminal READ | 19/19, broad=0, split=1 | 20/20, broad=0, split=1 | 20/20, broad=0, split=1 |
+| terminal FETCH | 19/19, broad=0, split=1 | 20/20, broad=0, split=1 | 20/20, broad=0, split=1 |
+| demand (8 rounds) | 8/8, broad=0, refused=0 | 8/8, broad=0, refused=0 | 8/8, broad=0, refused=0 |
+| COW (fork witness) | — | — | 6 split, broad=0, 2 isolation OK |
+
+The default row is the one that says the oracles are genuinely default-off: with no knob the
+ordinary boot takes no page fault at all on any port, and the service chain runs unchanged.
+
+Every demand seal reports `recovered=8 value_bad=0 regs_ok=8 regs_bad=0 result=ok` — the faulting
+instruction retried, the value read back correct, and the callee-saved register file intact
+across the fault.
+
+### 3. Acquisition census — reported separately, and unchanged
+
+| | value | required |
+|---|---|---|
+| `AUDITED_WITH_CPU_TOTAL` | 2 | 2 |
+| `AUDITED_WITH_BROAD_TOTAL` | 0 | 0 |
+| `AUDITED_STATE_LOCK_TOTAL` (raw wrapper bodies) | 3 | 3 |
+| `broad_lock_census_guard` | 7 pass / 0 fail | 7/7 |
+
+**This mission added no broad-lock acquisition.** Every seam it introduced —
+`cow_settle_non_private_copy_split`, `demand_settle_stale_translation_split`,
+`entering_frame_authority_split_read`, `classify_for_split` — composes existing ranked owners.
+
+### 4. Gates
+
+| gate | result |
+|---|---|
+| hosted lib, `--test-threads=1` | **5704 pass / 0 fail** / 2 ignored |
+| every integration target (16) | all pass |
+| `server_dies_runner_scope` | **8 pass / 2 fail** — the exact carve-out, and the two failures are the named pair |
+| `broad_lock_census_guard` | 7/7 |
+| `doc_fragmentation_guard` | 7/7 |
+| `yarm-ipc-abi` | 211 pass |
+| freestanding builds | x86_64, AArch64, RISC-V — all clean |
+
+The established witnesses are preserved: the AArch64 terminal-fault chain (U9-FT4) passes
+unchanged after the §1e restructure, the AP scope suites pass (25 + 16), every RISC-V scope suite
+passes, and the demand witness holds at 8/8 on all three ports.
+
+### 5. The timer's `ContinueCurrent`, reconciled
+
+§4 asked for this to be settled against the actual task-transition contract before freezing, and
+it was — in `§4a`, before any of the work above.
+
+The draft continued on `OwnsEnteringFrame` and justified it by citing
+`recv_block_unwind_exact_split` as precedent. **That citation was false**, verified against
+executable code: `RecvUnwindOutcome::Restored` requires the TCB to say `Running`, established by
+an exact-incarnation `apply_task_transition` COMMIT after the rank-1 restore. Returning through
+the frame of a `Runnable` task is the state that owner's own documentation calls out as a hazard,
+not one it permits. The continue was an optional behaviour change resting on a claim that did not
+hold, so it was dropped rather than kept — every `NotRunning` verdict is fail-closed, and the
+verdict is now diagnostic: it names which of six states the CPU was in so a fatal report says
+that instead of "task missing".
