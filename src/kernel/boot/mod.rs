@@ -42,12 +42,12 @@ mod fault_state;
 #[cfg_attr(feature = "hosted-dev", allow(unused_imports))]
 pub(crate) use fault_state::{
     BufferedFaultAdmission, BufferedFaultCommit, CowNonPrivateSettlement, CowRecovery,
-    DemandRecovery, DemandStaleTranslation, FaultReportTarget, PageFaultClass, PageFaultFacts,
-    PageFaultRoute, SUPERVISOR_FAULT_REPORT_WIRE_LEN, SupervisorFaultReportWire,
-    TerminalFaultPolicyRefusal, TerminalFaultPolicySnapshot, TerminalFaultTransition,
-    UnattributableFault, evaluate_cow_marked, evaluate_demand_backed_region, evaluate_fault_policy,
-    evaluate_fault_report_route, evaluate_page_fault_class, page_fault_addr_is_kernel_space,
-    page_fault_route_for,
+    DemandRecovery, DemandStaleTranslation, FaultReportFailure, FaultReportOutcome,
+    FaultReportTarget, PageFaultClass, PageFaultFacts, PageFaultRoute, PreMutationSettlement,
+    SUPERVISOR_FAULT_REPORT_WIRE_LEN, SupervisorFaultReportWire, TerminalFaultPolicyRefusal,
+    TerminalFaultPolicySnapshot, TerminalFaultTransition, UnattributableFault, evaluate_cow_marked,
+    evaluate_demand_backed_region, evaluate_fault_policy, evaluate_fault_report_route,
+    evaluate_page_fault_class, page_fault_addr_is_kernel_space, page_fault_route_for,
 };
 mod ipc_state;
 // Stage 200C2B: the reply-timeout completion transaction abstraction + single generic

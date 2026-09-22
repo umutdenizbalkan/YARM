@@ -724,6 +724,10 @@ pub fn handle_trap_entry_shared(
     // something false about what happened.
     let mut demand_recovered = false;
     let mut demand_result: Option<Result<(), TrapHandleError>> = None;
+    // U9-PAGEFAULT2 §3: the TERMINAL route's result. It has no `_recovered` companion because
+    // the terminal route already owns `queue_advance_committed` — a terminating fault advances
+    // the queue, which the other two never do — so only the result itself was missing.
+    let mut terminal_result: Option<Result<(), TrapHandleError>> = None;
     // U9-TM §2: the pre-lock TIMER route. It runs before the syscall seam and is mutually
     // exclusive with it — a timer interrupt carries no syscall NR — and it refuses BEFORE any
     // claim, tick or mutation when a proof knob is armed or when this tick would preempt, so a
@@ -807,6 +811,9 @@ pub fn handle_trap_entry_shared(
                 cpu,
                 pf,
                 frame.as_deref(),
+                // U9-PAGEFAULT2 §3: THIS trap's authority — the same value this bridge hands the
+                // drain that will consume what the route publishes.
+                trap_path.authority(),
             ) {
                 SplitDispatchDisposition::NotHandled => {}
                 SplitDispatchDisposition::QueueAdvanceCommitted => {
@@ -816,9 +823,22 @@ pub fn handle_trap_entry_shared(
                     );
                     queue_advance_committed = true;
                 }
-                SplitDispatchDisposition::Complete(_) => {
-                    // Fail-closed after publication: the report is out, so the broad emitter must
-                    // NOT run again. No deferral is held on this path.
+                SplitDispatchDisposition::Complete(result) => {
+                    // The broad emitter must NOT run again, so the fault is finished here either
+                    // way. U9-PAGEFAULT2 §3 — and the RESULT is carried, which it was not.
+                    //
+                    // Discarding it was harmless while this route's only `Complete` was a
+                    // fail-closed `Ok(())` after publication. It stopped being harmless the
+                    // moment the route began settling its own pre-mutation refusals: the broad
+                    // arm answers an absent or unknown fault victim with
+                    // `Err(TrapHandleError::Syscall(TaskMissing))`, which each architecture entry
+                    // turns into a fatal halt, and swallowing that would have converted a
+                    // fatal into a silent resume of a task the kernel could not identify.
+                    //
+                    // Carried exactly as the COW and demand arms carry theirs — through
+                    // `terminal_result`, into this handler's own inner result — so the fatal is
+                    // reproduced by the EXISTING mechanism and no second halt owner is invented.
+                    terminal_result = Some(result);
                     queue_advance_committed = true;
                 }
                 other => {
@@ -1332,7 +1352,15 @@ pub fn handle_trap_entry_shared(
             // U9-COW1: a recovered COW fault carries the SAME result the broad arm would have
             // returned — `Ok(())` on success, the rolled-back failure's error otherwise — so the
             // two `?` sites below behave identically whichever owner handled the fault.
-            Ok(demand_result.or(cow_result).unwrap_or(Ok(())))
+            // U9-PAGEFAULT2 §3: the terminal route joins the other two. At most ONE of the three
+            // can be set — each is written by a route the other two are gated out of by
+            // `cow_recovered` / `demand_recovered`, and the terminal route runs only when
+            // neither fired — so the order among them expresses precedence that cannot arise,
+            // and the value is simply whichever route handled the fault.
+            Ok(terminal_result
+                .or(demand_result)
+                .or(cow_result)
+                .unwrap_or(Ok(())))
         } else {
             shared
                 .with_cpu(cpu, |kernel| {

@@ -127,9 +127,16 @@ pub(crate) enum CowRecovery {
     },
     /// Pre-mutation: the faulting incarnation is no longer the one that was classified.
     RefusedIdentityChanged,
-    /// Pre-mutation: the mapping is gone, already writable, or no longer COW-marked. Another
-    /// owner serviced this page between classification and here.
-    RefusedMappingChanged,
+    /// U9-PAGEFAULT2 §3 — the mapping is GONE. The broad arm's
+    /// `.ok_or(KernelError::UserMemoryFault)?` for a COW-marked page with nothing to copy from.
+    RefusedMappingAbsent,
+    /// U9-PAGEFAULT2 §3 — the mapping is already WRITABLE. Another owner completed the copy
+    /// between classification and here, so the faulting write will now succeed: the canonical
+    /// answer is to retry the instruction, not to hand the fault anywhere.
+    RefusedAlreadyWritable,
+    /// U9-PAGEFAULT2 §3 — the page is no longer COW-marked. `is_cow_page` false is the broad
+    /// arm's `Ok(false)`: not this family's fault, continue down the handler chain.
+    RefusedNotCowMarked,
     /// Pre-mutation: the faulting task has no resolvable CNode, so a cap cannot be minted for it.
     RefusedNoCnode,
     /// Pre-mutation: no frame, no object slot, or no cnode slot. Nothing was left allocated.
@@ -155,7 +162,9 @@ impl CowRecovery {
         matches!(
             self,
             Self::RefusedIdentityChanged
-                | Self::RefusedMappingChanged
+                | Self::RefusedMappingAbsent
+                | Self::RefusedAlreadyWritable
+                | Self::RefusedNotCowMarked
                 | Self::RefusedNoCnode
                 | Self::RefusedAllocation
         )
@@ -166,13 +175,50 @@ impl CowRecovery {
         match self {
             Self::Committed { .. } => "committed",
             Self::RefusedIdentityChanged => "identity_changed",
-            Self::RefusedMappingChanged => "mapping_changed",
+            Self::RefusedMappingAbsent => "mapping_absent",
+            Self::RefusedAlreadyWritable => "already_writable",
+            Self::RefusedNotCowMarked => "not_cow_marked",
             Self::RefusedNoCnode => "no_cnode",
             Self::RefusedAllocation => "allocation",
             Self::FailedClosedResolve(_) => "resolve_phys",
             Self::FailedClosedCopy(_) => "copy_frame",
             Self::FailedClosedRemap(_) => "remap",
         }
+    }
+
+    /// U9-PAGEFAULT2 §3 — the canonical settlement for a pre-mutation refusal, or `None` for an
+    /// outcome that is not one.
+    pub(crate) fn pre_mutation_settlement(self) -> Option<PreMutationSettlement> {
+        use PreMutationSettlement as S;
+        Some(match self {
+            // The page became writable under us. This is NOT `RetryInstruction`: the broad arm's
+            // `path=already_writable` arm clears the stale COW mark before returning, and only
+            // the non-private-copy owner does that. Re-enter it.
+            Self::RefusedAlreadyWritable => S::ReenterFamilyOwner,
+            // `is_cow_page` false — the broad arm's `Ok(false)`, which tries demand next.
+            Self::RefusedNotCowMarked => S::ContinueFamily,
+            // The exact incarnation left. The next route re-classifies against whoever is
+            // current now, which is the only correct thing to do with this fault.
+            Self::RefusedIdentityChanged => S::ContinueFamily,
+            // The mapping vanished under us. The broad arm's answer is
+            // `.ok_or(KernelError::UserMemoryFault)?` — which is precisely what the
+            // non-private-copy owner's `NoMapping` ending already produces, revalidated under
+            // rank 5 rather than predicted from a stale read.
+            Self::RefusedMappingAbsent => S::ReenterFamilyOwner,
+            // No CNode to mint into: the capability the recovery needs cannot be created, which is
+            // the broad arm's own answer when `resolve_memory_object_phys` finds no cspace.
+            Self::RefusedNoCnode => {
+                S::ResourceFailure(crate::kernel::boot::KernelError::InvalidCapability)
+            }
+            // `alloc_anonymous_memory_object` exhaustion, in the broad arm's own spelling.
+            Self::RefusedAllocation => {
+                S::ResourceFailure(crate::kernel::boot::KernelError::MemoryObjectFull)
+            }
+            Self::Committed { .. }
+            | Self::FailedClosedResolve(_)
+            | Self::FailedClosedCopy(_)
+            | Self::FailedClosedRemap(_) => return None,
+        })
     }
 
     /// The error a post-allocation failure carries. `None` for every outcome that is not one —
@@ -186,6 +232,49 @@ impl CowRecovery {
             _ => None,
         }
     }
+}
+
+/// U9-PAGEFAULT2 §3 — what a PRE-MUTATION refusal settles as.
+///
+/// PAGEFAULT1 mapped every one of these to `NotHandled`, and defended it with "the broad arm
+/// re-derives the same facts under its own lock and reaches the same answer". That is a
+/// description of a dependency, not a reason to keep it — and its premise is wrong besides,
+/// because a broad-lock holder does not exclude the split writers that take the rank-ordered
+/// subsystem locks directly.
+///
+/// Each refusal has a canonical answer that the broad arm itself would reach, and every one of
+/// those answers is available here. Which one it is comes from WHICH refusal was raised, which
+/// is why the refusal set is split finely enough to tell them apart rather than collapsed into
+/// "something changed".
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreMutationSettlement {
+    /// The world already satisfies the faulting access — another owner did this work while we
+    /// were classifying. Return to the faulting instruction; it succeeds now. Nothing is
+    /// published, nothing is woken, no scheduler state moves.
+    RetryInstruction,
+    /// Not this recovery class's fault after all. Continue down the route order, which is what
+    /// the broad handler chain does with its own `Ok(false)`.
+    ContinueFamily,
+    /// U9-PAGEFAULT2 §3 — the page changed, between classification and the transaction's
+    /// revalidation, into the shape THIS family's OTHER owner handles. Re-enter that owner.
+    ///
+    /// This exists because `RetryInstruction` was wrong for it, and wrong in a way that only
+    /// shows up against the broad arm's body. `try_handle_cow_fault`'s already-writable arm does
+    /// not merely return success: it calls `clear_cow_page` FIRST and then returns `Ok(true)`.
+    /// Settling the same race by returning to the instruction leaves the write to succeed — and
+    /// leaves the stale COW mark set, which the broad arm would have cleared. The mark is not
+    /// cosmetic: it is what a later `fork` reads to decide whether a page needs copying.
+    ///
+    /// The owner re-entered is the one the route already calls from its PRE-transaction screen,
+    /// so this is the same code path the non-raced form takes, not a second implementation. It
+    /// revalidates under its own domain lock, which is what makes the re-entry safe, and it is
+    /// entered AT MOST ONCE: its own "raced again" ending continues down the route order rather
+    /// than coming back here, so there is no loop.
+    ReenterFamilyOwner,
+    /// A resource the recovery needs does not exist, and the broad arm propagates this exact
+    /// error out of the trap. Nothing was allocated, so there is nothing to roll back.
+    ResourceFailure(crate::kernel::boot::KernelError),
 }
 
 /// U9-PAGEFAULT1 §1c — the outcome of the COW arm that is NOT the private copy.
@@ -262,6 +351,68 @@ impl DemandStaleTranslation {
             Self::Repaired { write: true } => "already_writable_after_flush",
             Self::Repaired { write: false } => "invalidated",
             Self::Raced => "raced",
+        }
+    }
+}
+
+/// U9-PAGEFAULT2 §2 — the outcome of ONE fault-report delivery attempt.
+///
+/// `emit_fault_report_for_fault` is a total function: for every state of the world it either
+/// publishes the report somewhere or records that it could not, and then RETURNS. It never
+/// declines in a way that leaves the caller to try something else, and it never prevents the
+/// faulted task from being terminated. This type is that totality, made explicit.
+///
+/// The three endings are not ranked. A buffered report that wakes nobody is not a degraded
+/// direct delivery, and a delivery failure is not an error the caller must handle — it is what
+/// the broad emitter does when reporting cannot succeed, and the task is still terminated after
+/// it.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FaultReportOutcome {
+    /// Handed DIRECTLY to a blocked receiver, which is woken exactly once. The broad emitter's
+    /// waiter arm.
+    DeliveredToWaiter {
+        endpoint_idx: usize,
+        waiter_tid: u64,
+    },
+    /// Enqueued on the endpoint's buffer, waking nobody. A valid outcome, not a degraded one.
+    Buffered { endpoint_idx: usize },
+    /// Reporting could not succeed. The broad emitter records the same and returns; the faulted
+    /// task is terminated regardless.
+    Failed(FaultReportFailure),
+}
+
+/// U9-PAGEFAULT2 §2 — why a fault report could not be published.
+///
+/// Each of these is a spelling the broad emitter already produces. None of them is a new policy,
+/// and none of them changes what happens to the faulted task.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FaultReportFailure {
+    /// Neither a fault-handler nor a supervisor endpoint is registered.
+    NoRoute,
+    /// The route named an endpoint slot that no longer exists, or whose generation moved.
+    EndpointStale,
+    /// The endpoint's buffer is full. The broad emitter discovers this INSIDE the enqueue and
+    /// prints `..._ENQUEUE_FAIL` + `..._FAIL`; the report is lost and the task still dies.
+    BufferFull,
+    /// The wire payload would not fit a `Message`.
+    MessageBuild,
+    /// A waiter was present and the direct hand-off failed — the broad emitter's
+    /// `TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL` arm, which also does not fall back to the
+    /// buffer.
+    WaiterDelivery,
+}
+
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+impl FaultReportFailure {
+    pub(crate) fn marker(self) -> &'static str {
+        match self {
+            Self::NoRoute => "no_route",
+            Self::EndpointStale => "endpoint_stale",
+            Self::BufferFull => "buffer_full",
+            Self::MessageBuild => "message_build",
+            Self::WaiterDelivery => "waiter_delivery",
         }
     }
 }
@@ -542,6 +693,31 @@ impl DemandRecovery {
             Self::FailedClosedResolve(_) => "resolve_failed",
             Self::FailedClosedMap(_) => "map_failed",
         }
+    }
+
+    /// U9-PAGEFAULT2 §3 — the canonical settlement for a pre-mutation refusal.
+    pub(crate) fn pre_mutation_settlement(self) -> Option<PreMutationSettlement> {
+        use PreMutationSettlement as S;
+        Some(match self {
+            // Another owner installed the mapping. The route's PRE-transaction screen sends
+            // exactly this shape to the stale-translation owner, which retires the cached
+            // negative walk before the instruction retries — returning straight to the
+            // instruction would skip that and re-fault on the stale walk.
+            Self::RefusedMappingPresent => S::ReenterFamilyOwner,
+            // The brk window moved. Not a demand page any more; the terminal owner takes it,
+            // exactly as the broad handler's `Ok(false)` leads to `PAGE_FAULT_UNHANDLED`.
+            Self::RefusedNotDemandRegion => S::ContinueFamily,
+            Self::RefusedIdentityChanged => S::ContinueFamily,
+            Self::RefusedNoCnode => {
+                S::ResourceFailure(crate::kernel::boot::KernelError::InvalidCapability)
+            }
+            Self::RefusedAllocation => {
+                S::ResourceFailure(crate::kernel::boot::KernelError::MemoryObjectFull)
+            }
+            Self::Committed { .. } | Self::FailedClosedResolve(_) | Self::FailedClosedMap(_) => {
+                return None;
+            }
+        })
     }
 
     /// The error a `FailedClosed*` outcome must report, or `None` for everything else.

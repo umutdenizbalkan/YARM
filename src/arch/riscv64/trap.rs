@@ -793,6 +793,9 @@ pub fn handle_riscv_trap_entry_shared(
     // something false about what happened.
     let mut demand_recovered = false;
     let mut demand_result: Option<Result<(), TrapHandleError>> = None;
+    // U9-PAGEFAULT2 §3: the TERMINAL route's result, carried here as the shared bridge carries
+    // it. No `_recovered` companion: the terminal route already owns `queue_advance_committed`.
+    let mut terminal_result: Option<Result<(), TrapHandleError>> = None;
     // U9-TM §2: the pre-lock TIMER route, refusing before any claim, tick or mutation when a
     // proof knob is armed or when this tick would preempt.
     let mut post_work_committed = false;
@@ -990,6 +993,9 @@ pub fn handle_riscv_trap_entry_shared(
                 cpu,
                 pf,
                 Some(&*frame),
+                // U9-PAGEFAULT2 §3: THIS trap's authority — the same value this bridge hands the
+                // FutexWait drain below, which is what consumes the route's deferral.
+                trap_path.authority(),
             ) {
                 crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
                 crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted => {
@@ -1004,9 +1010,15 @@ pub fn handle_riscv_trap_entry_shared(
                     );
                     queue_advance_committed = true;
                 }
-                crate::kernel::syscall_split::SplitDispatchDisposition::Complete(_) => {
-                    // Fail-closed AFTER publication: the report is out, so the broad emitter must
-                    // not run again. No deferral is held on this path.
+                crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) => {
+                    // The broad emitter must not run again, so the fault is finished here either
+                    // way. U9-PAGEFAULT2 §3 — and the RESULT is carried, as it is on the shared
+                    // bridge: the route now settles its own pre-mutation refusals, and the broad
+                    // arm's answer to an absent or unknown fault victim is
+                    // `Err(TrapHandleError::Syscall(TaskMissing))`, which this entry turns into a
+                    // fatal halt. Swallowing it would silently resume a task the kernel could
+                    // not identify.
+                    terminal_result = Some(result);
                     queue_advance_committed = true;
                 }
                 other => {
@@ -1486,7 +1498,14 @@ pub fn handle_riscv_trap_entry_shared(
             // U9-PAGEFAULT1 §2b: a recovered COW fault carries the SAME result the broad arm would
             // have returned — `Ok(())` on success, the rolled-back failure's error otherwise — so
             // every `?` site below behaves identically whichever owner handled the fault.
-            Ok(demand_result.or(cow_result).unwrap_or(Ok(())))
+            // U9-PAGEFAULT2 §3: the terminal route joins the other two. At most one of the three
+            // can be set — each route is gated out by the flags the earlier ones raise — so the
+            // order expresses a precedence that cannot arise, and the value is simply whichever
+            // route handled the fault.
+            Ok(terminal_result
+                .or(demand_result)
+                .or(cow_result)
+                .unwrap_or(Ok(())))
         } else {
             shared
                 .with_cpu(cpu, |kernel| {

@@ -6786,6 +6786,311 @@ impl SharedKernel {
         })
     }
 
+    /// U9-PAGEFAULT2 §2 — the emitter's `endpoint_fault_report_stats`, at an EXACT generation.
+    ///
+    /// The broad form reads the slot it was handed; this one additionally requires the
+    /// generation the policy snapshot recorded, because an off-lock caller can be handed a slot
+    /// that was recycled between the snapshot and here. A generation mismatch is the emitter's
+    /// stale-endpoint ending, which it reaches through a vanished slot instead.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn endpoint_fault_report_stats_split(
+        &self,
+        endpoint_idx: usize,
+        expected_generation: u64,
+    ) -> Option<(u64, usize, usize)> {
+        self.with_ipc_split_mut(|ipc| {
+            let &generation = ipc.endpoint_generations.get(endpoint_idx)?;
+            if generation != expected_generation {
+                return None;
+            }
+            let Some(Some(storage)) = ipc.endpoints.get(endpoint_idx) else {
+                return None;
+            };
+            let endpoint = crate::kernel::boot::kernel_ref(storage);
+            Some((
+                generation,
+                usize::from(ipc.endpoint_waiter_present(endpoint_idx)),
+                endpoint.queued(),
+            ))
+        })
+    }
+
+    /// U9-PAGEFAULT2 §2 — the emitter's `endpoint_fault_report_waiter`, off the broad lock.
+    ///
+    /// Returns the blocked receiver's tid, and only when the receive it is blocked on is one the
+    /// plain delivery can complete — the same `is_task_recv_v2_blocked` screen the broad emitter
+    /// applies before it enters its direct arm.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn endpoint_fault_report_waiter_split(&self, endpoint_idx: usize) -> Option<u64> {
+        let waiter = self.with_ipc_split_mut(|ipc| {
+            ipc.endpoint_waiter_record(endpoint_idx)
+                .map(|r| r.tid().0)
+                .filter(|_| ipc.endpoint_waiter_present(endpoint_idx))
+        })?;
+        // rank 2 — the waiter must actually hold a completable blocked receive. A waiter record
+        // without one is the emitter's `is_task_recv_v2_blocked` false arm, which skips the
+        // direct delivery and enqueues instead.
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == waiter)
+                .map(|t| t.blocked_recv_state.is_some() && t.asid.is_some())
+                .unwrap_or(false)
+        })
+        .then_some(waiter)
+    }
+
+    /// U9-PAGEFAULT2 §2 — THE fault-report delivery, total and off-lock.
+    ///
+    /// `emit_fault_report_for_fault` never declines. For every state of the world it publishes
+    /// the report somewhere or records that it could not, and then returns — and the faulted
+    /// task is terminated after all three endings. This is that function, composed from owners
+    /// that already exist rather than reimplemented:
+    ///
+    /// * the route and its generation come from the policy snapshot the caller already read;
+    /// * the payload comes from `SupervisorFaultReportWire::encode`, the one encoder;
+    /// * a waiting receiver is served by `produce_blocked_waiter_plain_delivery_split`, which
+    ///   plans the delivery through `plan_blocked_waiter_plain_delivery`, validates the waiter's
+    ///   writable ranges and stashes the post-work the existing drain executes — user copy,
+    ///   register projection, receiver-slot clear and exactly one wake;
+    /// * everything else is `commit_buffered_fault_report_shared`, unchanged.
+    ///
+    /// ## Order is the emitter's
+    ///
+    /// Waiter first, then the buffer. That is not a preference: the broad emitter checks
+    /// `endpoint_fault_report_waiter` before it reaches its enqueue, and a report handed to a
+    /// blocked receiver must not ALSO be queued.
+    ///
+    /// ## The one race, resolved once
+    ///
+    /// A waiter can arrive between the preflight and the commit. The commit sees it under the
+    /// same rank-3 acquisition that would have enqueued, refuses as `RefusedWaiterArrived`, and
+    /// this function retries the waiter path EXACTLY once. One retry, not a loop: the second
+    /// attempt either claims the waiter or finds the endpoint in a state the buffer accepts, and
+    /// a third would be chasing an adversary rather than resolving a race.
+    ///
+    /// ## What it never does
+    ///
+    /// It never returns a "try something else" answer to its caller, never publishes twice, and
+    /// never converts a reporting failure into a reason not to terminate the task. The broad
+    /// emitter does none of those either.
+    #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+    pub(crate) fn deliver_fault_report_split(
+        &self,
+        cpu: CpuId,
+        faulted_tid: u64,
+        fault: crate::kernel::trap::FaultInfo,
+        snapshot: &crate::kernel::boot::TerminalFaultPolicySnapshot,
+    ) -> crate::kernel::boot::FaultReportOutcome {
+        use crate::kernel::boot::{
+            BufferedFaultCommit as C, FaultReportFailure as F, FaultReportOutcome as O,
+        };
+
+        crate::yarm_log!("TASK_FAULT_REPORT_BEGIN tid={}", faulted_tid);
+
+        // (1) The route. `None` is the emitter's `TASK_FAULT_NO_SUPERVISOR_ROUTE` ending, which
+        // prints one marker and returns before any target line.
+        let Some(target) = snapshot.target else {
+            crate::yarm_log!(
+                "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
+                faulted_tid
+            );
+            return O::Failed(F::NoRoute);
+        };
+        let endpoint_idx = target.endpoint_idx;
+
+        // (2) The emitter's stats read. A slot that vanished or whose generation moved is the
+        // stale ending, and it too returns BEFORE `TASK_FAULT_REPORT_TARGET`.
+        let Some((generation, waiters_before, queued_before)) =
+            self.endpoint_fault_report_stats_split(endpoint_idx, target.generation)
+        else {
+            crate::yarm_log!(
+                "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason=missing-endpoint",
+                faulted_tid,
+                endpoint_idx
+            );
+            return O::Failed(F::EndpointStale);
+        };
+        crate::yarm_log!(
+            "TASK_FAULT_REPORT_TARGET tid={} endpoint={} generation={}",
+            faulted_tid,
+            endpoint_idx,
+            generation
+        );
+        crate::yarm_log!(
+            "TASK_FAULT_REPORT_QUEUE_STATE_BEFORE endpoint={} waiters={} queued={}",
+            endpoint_idx,
+            waiters_before,
+            queued_before
+        );
+
+        // (3) Waiter first, exactly as the emitter orders it. One retry, on the one race that
+        // can legitimately flip this decision.
+        for attempt in 0..2u8 {
+            if let Some(waiter_tid) = self.endpoint_fault_report_waiter_split(endpoint_idx) {
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND endpoint={} waiter_tid={}",
+                    endpoint_idx,
+                    waiter_tid
+                );
+                return match self.deliver_fault_report_to_waiter_split(
+                    faulted_tid,
+                    fault,
+                    endpoint_idx,
+                    waiter_tid,
+                    target.via_fault_handler,
+                ) {
+                    Some(()) => O::DeliveredToWaiter {
+                        endpoint_idx,
+                        waiter_tid,
+                    },
+                    // The emitter's `TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL` arm. It does NOT
+                    // fall back to the buffer, and neither does this.
+                    None => {
+                        crate::yarm_log!(
+                            "TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL endpoint={} waiter_tid={} reason=delivery",
+                            endpoint_idx,
+                            waiter_tid
+                        );
+                        crate::yarm_log!(
+                            "TASK_FAULT_REPORT_FAIL tid={} reason=waiter_delivery",
+                            faulted_tid
+                        );
+                        O::Failed(F::WaiterDelivery)
+                    }
+                };
+            }
+            // (4) No waiter — the buffered publication, through the unchanged owner. It
+            // revalidates generation, waiter absence and capacity under the SAME acquisition
+            // that enqueues, so the refusals below are decided against the real endpoint rather
+            // than against a prediction.
+            match self.commit_buffered_fault_report_shared(
+                faulted_tid,
+                fault,
+                endpoint_idx,
+                generation,
+                target.via_fault_handler,
+            ) {
+                C::Buffered { .. } => return O::Buffered { endpoint_idx },
+                // THE race. A waiter arrived under the commit's own acquisition; go serve it.
+                // `attempt` bounds this to one retry.
+                C::RefusedWaiterArrived { .. } if attempt == 0 => continue,
+                C::RefusedWaiterArrived { .. } => {
+                    crate::yarm_log!(
+                        "TASK_FAULT_REPORT_FAIL tid={} reason=waiter_contended",
+                        faulted_tid
+                    );
+                    return O::Failed(F::WaiterDelivery);
+                }
+                // The emitter discovers a full buffer INSIDE the enqueue and prints both lines.
+                // The report is lost. The task is still terminated — that is the policy, and it
+                // is preserved rather than repaired.
+                C::RefusedBufferFull { .. } => {
+                    crate::yarm_log!(
+                        "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason={:?}",
+                        faulted_tid,
+                        endpoint_idx,
+                        crate::kernel::boot::KernelError::EndpointQueueFull
+                    );
+                    crate::yarm_log!(
+                        "TASK_FAULT_REPORT_FAIL tid={} reason={:?}",
+                        faulted_tid,
+                        crate::kernel::boot::KernelError::EndpointQueueFull
+                    );
+                    return O::Failed(F::BufferFull);
+                }
+                C::RefusedEndpointStale { .. } => {
+                    crate::yarm_log!(
+                        "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason=missing-endpoint",
+                        faulted_tid,
+                        endpoint_idx
+                    );
+                    return O::Failed(F::EndpointStale);
+                }
+                // The commit already printed `TASK_FAULT_REPORT_FAIL tid=.. reason=message`.
+                C::RefusedMessageBuild => return O::Failed(F::MessageBuild),
+            }
+        }
+        // Unreachable: the loop returns on every path except the single `continue`.
+        O::Failed(F::WaiterDelivery)
+    }
+
+    /// U9-PAGEFAULT2 §2 — hand ONE fault report to a blocked receiver, off the broad lock.
+    ///
+    /// The mechanism is the receive family's, and it is used rather than reproduced: the same
+    /// producer the IPC-send split path calls plans the delivery, validates the waiter's
+    /// writable ranges and stashes the post-work whose existing drain performs the user copy,
+    /// the register projection, the receiver-slot clear and exactly one wake.
+    ///
+    /// `Some(())` means the delivery is published and the wake is owed to the drain. `None`
+    /// means it is not — nothing was copied, nothing was woken, and the caller reports the
+    /// emitter's delivery-failure ending rather than trying the buffer.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) fn deliver_fault_report_to_waiter_split(
+        &self,
+        faulted_tid: u64,
+        fault: crate::kernel::trap::FaultInfo,
+        endpoint_idx: usize,
+        waiter_tid: u64,
+        via_fault_handler: bool,
+    ) -> Option<()> {
+        // The ONE encoder, and the same bytes the buffered commit would have enqueued.
+        let payload = crate::kernel::boot::SupervisorFaultReportWire {
+            faulting_tid: faulted_tid,
+            fault_addr: fault.addr.0,
+            access: fault.access,
+        }
+        .encode();
+        let msg = crate::kernel::ipc::Message::new(0, &payload).ok()?;
+        crate::yarm_log!(
+            "TASK_FAULT_REPORT_SENDER tid={} sender_tid=0 opcode={} len={}",
+            faulted_tid,
+            msg.opcode,
+            msg.len
+        );
+        crate::yarm_log!(
+            "TASK_FAULT_REPORT_BLOCKED_COMPLETE_BEGIN endpoint={} waiter_tid={}",
+            endpoint_idx,
+            waiter_tid
+        );
+        // The receive family's own producer. It consumes the waiter's blocked state under rank
+        // 2, plans through the shared planner, validates both writable ranges against the
+        // waiter's ASID, and stashes the post-work. `Ok(false)` means it declined a
+        // precondition — the message class or the trap-drain path — and published nothing.
+        match self.produce_blocked_waiter_plain_delivery_split(waiter_tid, endpoint_idx, &msg) {
+            Ok(true) => {
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_WAKE_RUNNABLE endpoint={} waiter_tid={}",
+                    endpoint_idx,
+                    waiter_tid
+                );
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_SENT tid={} target={}",
+                    faulted_tid,
+                    if via_fault_handler {
+                        "fault-handler"
+                    } else {
+                        "supervisor"
+                    }
+                );
+                Some(())
+            }
+            Ok(false) | Err(_) => None,
+        }
+    }
+
+    #[cfg(feature = "hosted-dev")]
+    pub(crate) fn deliver_fault_report_to_waiter_split(
+        &self,
+        _faulted_tid: u64,
+        _fault: crate::kernel::trap::FaultInfo,
+        _endpoint_idx: usize,
+        _waiter_tid: u64,
+        _via_fault_handler: bool,
+    ) -> Option<()> {
+        None
+    }
+
     /// U9-FT3 §2 — the rank-3 buffered commit.
     ///
     /// REVALIDATES generation, waiter absence and capacity under the SAME acquisition that
@@ -7212,10 +7517,14 @@ impl SharedKernel {
         let Some(old_mapping) = self.with_vm_user_spaces_split_mut(|spaces| {
             spaces.get(asid).and_then(|space| space.resolve(page))
         }) else {
-            return R::RefusedMappingChanged;
+            // U9-PAGEFAULT2 §3: three distinct states, three distinct refusals. They used to
+            // share `RefusedMappingChanged`, which made their settlements indistinguishable —
+            // and they are not the same at all: an absent mapping is an error, an
+            // already-writable one is a retry, and a cleared mark is the next owner's business.
+            return R::RefusedMappingAbsent;
         };
         if old_mapping.flags.write {
-            return R::RefusedMappingChanged;
+            return R::RefusedAlreadyWritable;
         }
         // (3) rank 6 — still COW-marked, and rank 1/2 — still the same incarnation.
         let still_cow = self.with_memory_split_mut(|memory| {
@@ -7225,7 +7534,7 @@ impl SharedKernel {
                 .is_some_and(|set| set.contains(&page.0))
         });
         if !still_cow {
-            return R::RefusedMappingChanged;
+            return R::RefusedNotCowMarked;
         }
         if self.current_tid_split_read(facts.cpu) != Some(facts.tid) {
             return R::RefusedIdentityChanged;

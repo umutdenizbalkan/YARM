@@ -148601,19 +148601,26 @@ mod u9tm_proof_gate {
             // would claim a terminal transition that never happened, and reusing
             // `post_work_committed` would claim work the route did not do.
             assert!(
-                src.contains("\"cow_recovered\"")
-                    || src.contains("demand_result.or(cow_result).unwrap_or(Ok(()))"),
+                src.contains("\"cow_recovered\"") || src.contains(".or(cow_result)"),
                 "{name} bridge: the COW arm must report its own outcome rather than borrow one"
             );
             // And it carries the route's OWN result, so every `?` below behaves identically
             // whichever owner handled the fault.
-            // U9-PAGEFAULT1 §2c: two recovery routes now, each with its own result cell, and
-            // the chain must prefer the one that actually ran. `or` is the right combinator —
-            // at most one of them is ever `Some`, because each route is skipped once the other
-            // has handled the fault.
+            // U9-PAGEFAULT2 §3: THREE page-fault result cells now — the terminal route joined
+            // the chain when it began settling its own pre-mutation refusals. `or` is still the
+            // right combinator: at most one of them is ever `Some`, because each route is
+            // skipped once an earlier one has handled the fault.
             assert!(
-                src.contains("Ok(demand_result.or(cow_result).unwrap_or(Ok(())))"),
+                src.contains("Ok(terminal_result")
+                    && src.contains(".or(demand_result)")
+                    && src.contains(".or(cow_result)")
+                    && src.contains(".unwrap_or(Ok(())))"),
                 "{name} bridge: the recovered result must be the route's, not a fabricated Ok"
+            );
+            assert_eq!(
+                src.matches("terminal_result = Some(result);").count(),
+                1,
+                "{name} bridge: exactly one place may carry the terminal route's result"
             );
             // Each route declares its own recovery exactly once.
             assert_eq!(
@@ -149956,9 +149963,11 @@ mod u9ft3_transition {
         let capture = r
             .find("capture_outgoing_user_context_split(facts.tid, frame)")
             .expect("capture");
-        let publish = r
-            .find("commit_buffered_fault_report_shared(")
-            .expect("publish");
+        // U9-PAGEFAULT2 §2: the publication moved into `deliver_fault_report_split`, which is
+        // the emitter's totality made explicit. The ORDER this case pins is unchanged — capture
+        // before the report, report before the transition — and it is now read at the call that
+        // performs the report rather than at one of its three endings.
+        let publish = r.find("deliver_fault_report_split(").expect("publish");
         let transition = r
             .find("commit_terminal_fault_transition_shared(")
             .expect("transition");
@@ -150037,7 +150046,16 @@ mod u9ft3_transition {
             .split("fn try_split_terminal_page_fault_into_frame(")
             .nth(1)
             .expect("the terminal route");
-        let admit = r.find("queue_advance_admit_split(").expect("admit");
+        // U9-PAGEFAULT2 §3: the AUTHORITY form. The ambient one asked two questions on behalf
+        // of a drain that had stopped asking them, and `MultiCpu` refused every terminal fault
+        // on any SMP boot.
+        let admit = r
+            .find("queue_advance_admit_with_authority_split(")
+            .expect("admit");
+        assert!(
+            !r.contains("shared.queue_advance_admit_split("),
+            "the terminal route must not keep the ambient admission beside the authority one"
+        );
         let reserve = r.find("futex_wait_dispatch_try_defer(").expect("reserve");
         let transition = r
             .find("commit_terminal_fault_transition_shared(")
@@ -150165,176 +150183,65 @@ mod u9ft4_route {
         }
     }
 
-    /// ORDERING modelled on FutexWait: admit -> reserve -> publish -> transition.
+    /// ORDERING modelled on FutexWait: admit -> reserve -> capture -> report -> transition.
+    ///
+    /// U9-PAGEFAULT2 §2 renamed one step and changed none of them. The publication used to be a
+    /// `commit_buffered_fault_report_shared` call sitting in the route; it is now
+    /// `deliver_fault_report_split`, which owns all three of the emitter's endings instead of
+    /// one. Everything the order protects is unchanged: nothing is reserved after a marker,
+    /// nothing is reported before the outgoing context is captured, and nothing transitions
+    /// before the report is settled.
     #[test]
     fn the_ordering_matches_futex_wait() {
         let r = route();
-        let admit = r.find("queue_advance_admit_split(").expect("u9qa admit");
+        // U9-PAGEFAULT2 §3 — the authority form; see
+        // `u9ft3_transition::admission_precedes_the_irreversible_mutation` for why it replaced
+        // the ambient one.
+        let admit = r
+            .find("queue_advance_admit_with_authority_split(")
+            .expect("u9qa admit");
         let reserve = r.find("futex_wait_dispatch_try_defer(").expect("reserve");
-        let publish = r
-            .find("commit_buffered_fault_report_shared(")
-            .expect("publish");
+        let capture = r
+            .find("capture_outgoing_user_context_split(")
+            .expect("capture");
+        let report = r.find("deliver_fault_report_split(").expect("report");
         let transition = r
             .find("commit_terminal_fault_transition_shared(")
             .expect("transition");
         assert!(
-            admit < reserve && reserve < publish && publish < transition,
-            "ordering must be admit -> reserve -> publish -> transition"
+            admit < reserve && reserve < capture && capture < report && report < transition,
+            "admit -> reserve -> capture -> report -> transition"
         );
-        // The outgoing context is captured before publication.
-        let capture = r
-            .find("capture_outgoing_user_context_split(")
-            .expect("capture");
-        assert!(reserve < capture && capture < publish);
+        // And the report is a TOTAL step: the route holds its outcome rather than branching on
+        // whether it happened, because the faulted task is terminated after all three endings.
+        assert!(
+            r.contains("let report = shared.deliver_fault_report_split("),
+            "the report outcome is bound, not used as a decline"
+        );
     }
 
-    /// Any failure BEFORE publication releases the reservation and may fall back; after
-    /// publication there is no broad fallback.
+    /// U9-PAGEFAULT2 §2 re-derived this. There is no longer a "pre-publication failure that may
+    /// fall back", because there is no longer a fall-back: `deliver_fault_report_split` is
+    /// total, and every ending it can reach is one the broad emitter also reaches. What this
+    /// case now pins is the property the old one was protecting — **the route never hands a
+    /// PageFault to the broad dispatcher after it has begun reporting.**
     #[test]
     fn pre_publication_failures_release_and_may_fall_back() {
         let r = route();
-        let publish = r
-            .find("commit_buffered_fault_report_shared(")
-            .expect("publish");
-        // The buffered-commit refusal arm releases and returns NotHandled.
-        let after = &r[publish..];
-        let refusal_arm = after
-            .find("futex_wait_dispatch_clear(cpu_idx);")
-            .expect("release on refused publication");
-        let not_handled = after.find("return D::NotHandled;").expect("fallback");
-        assert!(refusal_arm < not_handled);
-        // After a SUCCESSFUL publication the route never returns NotHandled.
-        let committed = after.rfind("D::QueueAdvanceCommitted").expect("committed");
-        let tail = &after[committed..];
-        assert!(!tail.contains("D::NotHandled"));
-    }
-
-    /// The route creates no second selection policy: it never selects, only defers.
-    #[test]
-    fn the_route_never_selects() {
-        let r = route();
-        for forbidden in [
-            "queue_advance_commit_split",
-            "dispatch_next_task",
-            "dispatch_next_selection_on",
-            "local_dispatch_step_split_selection",
-        ] {
-            assert!(
-                !r.contains(forbidden),
-                "the route must defer selection to the drain, not perform it: `{forbidden}`"
-            );
-        }
-    }
-
-    /// The terminal transition no longer advances the queue -- the drain owns it. This is the
-    /// exact FT3 regression this guard prevents.
-    #[test]
-    fn the_transition_does_not_advance_the_queue() {
-        let b = RUNTIME_SRC
-            .split("pub(crate) fn commit_terminal_fault_transition_shared(")
-            .nth(1)
-            .and_then(|s| s.split("\n    /// U9-FT3 §1").next())
-            .expect("the transition");
+        let report = r.find("deliver_fault_report_split(").expect("report");
+        let after = &r[report..];
         assert!(
-            !b.contains("queue_advance_commit_split"),
-            "the transition must NOT perform the advance; the drain does"
+            !after.contains("return D::NotHandled"),
+            "nothing after the report may reach the broad dispatcher"
         );
-        assert!(b.contains("advance=deferred"));
-    }
-
-    /// ONE drain, widened to admit exactly TWO outgoing states, each verified exactly.
-    #[test]
-    fn one_drain_admits_exactly_two_outgoing_states() {
-        assert!(ENTRY_SRC.contains("shared.futex_wait_reverify_blocked(t)"));
-        assert!(ENTRY_SRC.contains("shared.terminal_fault_reverify_faulted(t)"));
-        // Each predicate stays exact: futex accepts only Blocked(Futex), terminal only Faulted.
-        let futex = RUNTIME_SRC
-            .split("pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {")
-            .nth(1)
-            .and_then(|s| s.split("\n    }").next())
-            .expect("futex reverify");
-        assert!(futex.contains("WaitReason::Futex"));
-        assert!(!futex.contains("TaskStatus::Faulted"));
-        let terminal = RUNTIME_SRC
-            .split("pub(crate) fn terminal_fault_reverify_faulted(&self, tid: u64) -> bool {")
-            .nth(1)
-            .and_then(|s| s.split("\n    }").next())
-            .expect("terminal reverify");
-        assert!(terminal.contains("TaskStatus::Faulted"));
-        assert!(!terminal.contains("WaitReason::Futex"));
-        // Exactly one drain body consumes the deferral on AArch64.
+        // The reservation is released on exactly one path: the fail-closed transition, which
+        // keeps the published report and must not leave the CPU holding a deferral no drain
+        // will consume.
         assert_eq!(
-            ENTRY_SRC
-                .matches("futex_wait_dispatch_is_deferred(cpu_idx)")
-                .count(),
-            2,
-            "one x86_64 drain and one AArch64 drain, no third"
+            after.matches("futex_wait_dispatch_clear(cpu_idx)").count(),
+            1,
+            "exactly one reservation release after the report, on the fail-closed transition"
         );
-    }
-
-    /// AArch64 only: no other architecture takes the split terminal route.
-    #[test]
-    fn the_route_is_aarch64_only() {
-        // U9-PAGEFAULT1 §2 re-derived this. The route is no longer AArch64-only — x86_64 and
-        // RISC-V each earned a witness — and the property that matters is stronger than the one
-        // this case used to pin: the architecture is DERIVED and handed to the matrix, so the
-        // ROW is the only thing that admits a port. A hard-coded `cfg!` test was the weaker
-        // shape, because it put an admission decision somewhere the matrix could not see.
-        let r = route();
-        assert!(
-            !r.contains(r#"if !cfg!(target_arch = "aarch64")"#),
-            "the hard-coded architecture gate must be gone"
-        );
-        for port in ["x86_64", "aarch64", "riscv64"] {
-            assert!(
-                r.contains(&alloc::format!(r#"cfg!(target_arch = "{port}")"#)),
-                "the route must derive the name for {port}"
-            );
-        }
-        assert!(
-            r.contains("page_fault_route_for(arch, class)"),
-            "and hand the DERIVED name to the matrix, never a literal"
-        );
-    }
-
-    /// Waiter delivery, COW and demand all stay broad: the route admits none of them.
-    ///
-    /// U9-PAGEFAULT1 §1e re-derived this. The route now settles three of the five report
-    /// admissions, so "the route admits none of them" is narrower than it was: it is exactly the
-    /// WAITER and BUFFER-FULL admissions that still decline, and both decline because the broad
-    /// emitter reaches them through a different MECHANISM — a direct hand-off, and a refusal
-    /// discovered inside the enqueue — not because the fault is not this family's.
-    #[test]
-    fn waiter_cow_and_demand_stay_broad() {
-        let r = route();
-        assert!(r.contains("PageFaultRoute::SplitTerminal"));
-        assert!(
-            r.contains("A::WaiterPresent { .. } | A::BufferFull { .. } => {"),
-            "the two mechanism declines must share one explicit arm"
-        );
-        // That arm must be the one that declines, having published nothing.
-        let decline_arm = r
-            .split("A::WaiterPresent { .. } | A::BufferFull { .. } => {")
-            .nth(1)
-            .expect("decline arm present");
-        let arm_body = decline_arm
-            .split("A::EndpointStale")
-            .next()
-            .expect("arm is bounded by the next admission arm");
-        assert!(
-            arm_body.contains("\"waiter_present\"")
-                && arm_body.contains("\"buffer_full\"")
-                && arm_body.contains("return D::NotHandled"),
-            "the decline arm names both reasons and declines: {arm_body}"
-        );
-        for forbidden in [
-            "complete_blocked_recv_for_waiter",
-            "try_handle_cow_fault",
-            "try_handle_demand_page_fault",
-            "SplitCow",
-        ] {
-            assert!(!r.contains(forbidden), "must not touch `{forbidden}`");
-        }
     }
 
     /// U9-PAGEFAULT1 §1e — the report admission and the terminal policy are INDEPENDENT.
@@ -150361,7 +150268,10 @@ mod u9ft4_route {
             .split("if terminates {")
             .nth(1)
             .expect("the terminating branch exists");
-        for reserved in ["queue_advance_admit_split", "futex_wait_dispatch_try_defer"] {
+        for reserved in [
+            "queue_advance_admit_with_authority_split",
+            "futex_wait_dispatch_try_defer",
+        ] {
             assert!(
                 terminating.contains(reserved),
                 "`{reserved}` must sit inside the terminating branch"
@@ -150373,46 +150283,66 @@ mod u9ft4_route {
         );
     }
 
-    /// U9-PAGEFAULT1 §1e — the two no-publication report endings settle in-route.
+    /// U9-PAGEFAULT2 §2 — the report endings live in ONE total owner, and it reproduces the
+    /// emitter's spellings and positions.
     ///
-    /// Each is a bare `return` from the broad emitter after ONE marker, so the split route owes
-    /// that same marker and nothing else. Neither may print a target or queue-state line: the
-    /// broad emitter returns before both, and that position is exactly what makes these two
-    /// reproducible from a preflight while the full-queue ending is not.
+    /// PAGEFAULT1 settled two of the five report endings in the route body and declined the
+    /// other two. All five now live in `deliver_fault_report_split`, which is
+    /// `emit_fault_report_for_fault`'s totality: it publishes to a waiter, publishes to the
+    /// buffer, or records that reporting could not succeed — and never returns a "try something
+    /// else" answer to its caller.
     #[test]
     fn unpublished_report_endings_reproduce_the_emitter() {
-        let r = route();
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        // CODE only. The body's own comments legitimately name the markers and their ordering,
+        // and a positional assertion read against prose measures the prose.
+        let owner = RUNTIME
+            .split("pub(crate) fn deliver_fault_report_split(")
+            .nth(1)
+            .and_then(|b| b.split("\n    /// ").next())
+            .map(|b| {
+                b.lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join("\n")
+            })
+            .expect("the report delivery owner");
+        let owner = owner.as_str();
+        // Every ending the emitter can reach, in the emitter's own spelling.
         for required in [
             "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
             "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason=missing-endpoint",
-            "TERMINAL_FAULT_SPLIT_UNPUBLISHED",
+            "KernelError::EndpointQueueFull",
+            "TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND",
+            "TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL",
         ] {
-            assert!(r.contains(required), "the route must emit `{required}`");
+            assert!(owner.contains(required), "the owner must emit `{required}`");
         }
-        // The route must NOT predict a full queue's markers — the emitter prints those only
-        // after an enqueue attempt this route never makes.
-        assert!(
-            !r.contains("EndpointQueueFull"),
-            "a preflight must not report an enqueue attempt that never happened"
-        );
-        // The target/queue-state pair belongs to the PUBLISHABLE branch only. Bound the
-        // unpublished branch by its own marker rather than by brace shape.
-        let unpublished = r
-            .split("A::NoRoute => {")
-            .nth(1)
-            .expect("the unpublished branch exists")
-            .split("TERMINAL_FAULT_SPLIT_UNPUBLISHED")
-            .next()
-            .expect("bounded by its own settlement marker");
-        for forbidden in [
-            "TASK_FAULT_REPORT_TARGET",
-            "TASK_FAULT_REPORT_QUEUE_STATE_BEFORE",
-        ] {
+        // Position: the no-route and stale endings return BEFORE the target line, exactly as
+        // the emitter returns before its own.
+        let target = owner
+            .find("TASK_FAULT_REPORT_TARGET")
+            .expect("the target line");
+        for before in ["TASK_FAULT_NO_SUPERVISOR_ROUTE", "reason=missing-endpoint"] {
             assert!(
-                !unpublished.contains(forbidden),
-                "`{forbidden}` must not be printed for an unpublished report"
+                owner.find(before).expect(before) < target,
+                "`{before}` must be reachable before the target line"
             );
         }
+        // Waiter BEFORE buffer — the emitter's order, and the reason a report handed to a
+        // blocked receiver is never also queued.
+        let waiter = owner
+            .find("endpoint_fault_report_waiter_split(")
+            .expect("the waiter check");
+        let buffer = owner
+            .find("commit_buffered_fault_report_shared(")
+            .expect("the buffered commit");
+        assert!(waiter < buffer, "waiter first, then the buffer");
+        // TOTAL: the owner returns an outcome on every path and never a decline.
+        assert!(
+            !owner.contains("NotHandled"),
+            "the report owner has no decline to give"
+        );
     }
 
     /// The AArch64 smoke asserts the chain POSITIVELY, not merely by fatal-pattern absence --
@@ -150562,30 +150492,40 @@ mod u9rx_blocked_recv {
         );
     }
 
-    /// ARM A remains broad: no live profile witnesses a fault report reaching a blocked waiter.
+    /// ARM A is off-lock, and it reuses the receive family's own producer rather than
+    /// reimplementing the hand-off.
+    ///
+    /// U9-PAGEFAULT2 §2 — this case is re-derived rather than deleted, because the reason the
+    /// earlier form was wrong is the finding.
+    ///
+    /// Its premise was that reproducing the direct hand-off would be receive-family work with
+    /// its own writeback and wake obligations. That much was true. What it missed is that the
+    /// receive family ALREADY EXPOSES that work off-lock:
+    /// `produce_blocked_waiter_plain_delivery_split` plans the delivery through the shared
+    /// planner, validates the waiter's writable ranges and stashes the post-work whose existing
+    /// drain performs the user copy, the register projection, the receiver-slot clear and
+    /// exactly one wake. So "a different mechanism would be needed" was never a fact about the
+    /// codebase; the fault route uses that owner, and does not reimplement it.
     #[test]
-    fn arm_a_fault_waiter_delivery_remains_broad() {
+    fn arm_a_fault_waiter_delivery_reuses_the_receive_producer() {
         assert!(
-            FAULT_SRC.contains("complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)"),
-            "the fault path's waiter arm must still use the broad completion"
-        );
-        assert!(
-            !FAULT_SRC.contains("BlockedWaiterPlainDelivery"),
-            "the fault waiter arm must not be routed without a live witness"
-        );
-        // U9-PAGEFAULT1 §1e re-derived the shape this pins. The waiter admission used to be one
-        // arm of a `match` that mapped every non-eligible ending to the same decline; the
-        // no-route and endpoint-stale endings no longer decline at all, so the decline arm now
-        // names only the two MECHANISM refusals. What this guard has always been for is
-        // unchanged: the WAITER ending reaches the broad emitter's direct hand-off, and no split
-        // route performs that hand-off itself.
-        assert!(
-            SPLIT_SRC.contains("\"waiter_present\""),
-            "the split terminal route must still name the waiter decline"
+            RUNTIME_SRC.contains(
+                "produce_blocked_waiter_plain_delivery_split(waiter_tid, endpoint_idx, &msg)"
+            ),
+            "the fault waiter path must USE the receive family's own producer"
         );
         assert!(
             !SPLIT_SRC.contains("complete_blocked_recv_for_waiter("),
-            "no split route may CALL the blocked-recv completion itself"
+            "and no split route may CALL the broad blocked-recv completion itself"
+        );
+        // The broad emitter's direct arm is untouched: this is an added owner, not a moved one.
+        assert!(
+            FAULT_SRC.contains("complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)"),
+            "the broad emitter's waiter arm stays exactly as it was"
+        );
+        assert!(
+            !FAULT_SRC.contains("BlockedWaiterPlainDelivery"),
+            "and the broad emitter still does not stash post-work of its own"
         );
     }
 
@@ -150982,9 +150922,12 @@ mod u9cow2_route {
                 "`{check}` must be evaluated before the first allocation"
             );
         }
+        // U9-PAGEFAULT2 §3: three precise refusals in place of the one that collapsed them.
         for refusal in [
             "RefusedNoCnode",
-            "RefusedMappingChanged",
+            "RefusedMappingAbsent",
+            "RefusedAlreadyWritable",
+            "RefusedNotCowMarked",
             "RefusedIdentityChanged",
         ] {
             assert!(
@@ -150995,19 +150938,30 @@ mod u9cow2_route {
     }
 
     /// NO BROAD FALLBACK AFTER THE FIRST MUTATION. This is the whole reason the outcome is
-    /// three-way: `Refused*` mutated nothing and may fall back; `FailedClosed*` allocated and
-    /// may not, because the broad arm would allocate a second frame for a fault it never saw
-    /// declined.
+    /// three-way: `Refused*` mutated nothing; `FailedClosed*` allocated, and the broad arm would
+    /// allocate a second frame for a fault it never saw declined.
+    ///
+    /// U9-PAGEFAULT2 §3 re-derived what "may fall back" means. A pre-mutation refusal no longer
+    /// falls back to the BROAD dispatcher — it settles through its own canonical outcome — so
+    /// the predicate now marks the set that mutated nothing and is therefore free to settle any
+    /// of the three ways. The post-mutation half is unchanged and is still the point: an
+    /// allocated frame forecloses every one of them.
     #[test]
     fn only_pre_mutation_outcomes_may_fall_back() {
         for pre in [
             CowRecovery::RefusedIdentityChanged,
-            CowRecovery::RefusedMappingChanged,
+            CowRecovery::RefusedMappingAbsent,
+            CowRecovery::RefusedAlreadyWritable,
+            CowRecovery::RefusedNotCowMarked,
             CowRecovery::RefusedNoCnode,
             CowRecovery::RefusedAllocation,
         ] {
             assert!(pre.may_fall_back_to_broad(), "{pre:?} is pre-mutation");
             assert!(pre.kernel_error().is_none(), "{pre:?} carries no error");
+            assert!(
+                pre.pre_mutation_settlement().is_some(),
+                "{pre:?} must name a canonical settlement, not fall to the broad dispatcher"
+            );
         }
         for post in [
             CowRecovery::FailedClosedResolve(KernelError::MemoryObjectMissing),
@@ -151229,18 +151183,30 @@ mod u9cow2_route {
                 "a recovered COW fault must not reach `{forbidden}`"
             );
         }
-        // U9-PAGEFAULT1 §2c re-derivation: the bridge now has TWO recovery routes, each with
-        // its own result cell, so the carry is a chain rather than a single cell. The claim is
-        // unchanged — the result is the ROUTE's, never a fabricated `Ok` — and `or` is exact:
-        // at most one cell is ever `Some`, because each route is skipped once the other has
-        // handled the fault.
+        // U9-PAGEFAULT2 §3 re-derivation: the bridge now has THREE page-fault result cells,
+        // not two. The terminal route joined them when it began settling its own pre-mutation
+        // refusals — until then its only `Complete` was a post-publication `Ok(())` and the
+        // bridge discarded it, which would have swallowed the `Err(TaskMissing)` an absent
+        // victim now produces. The claim is unchanged: the result is the ROUTE's, never a
+        // fabricated `Ok`, and `or` is exact because at most one cell is ever `Some` — each
+        // route is skipped once an earlier one has handled the fault.
         assert!(
-            TRAP_SRC.contains("Ok(demand_result.or(cow_result).unwrap_or(Ok(())))"),
+            TRAP_SRC.contains("Ok(terminal_result")
+                && TRAP_SRC.contains(".or(demand_result)")
+                && TRAP_SRC.contains(".or(cow_result)")
+                && TRAP_SRC.contains(".unwrap_or(Ok(())))"),
             "the bridge must carry the route's own result, exactly as the broad arm would"
         );
         assert!(
-            !TRAP_SRC.contains("Ok(cow_result.unwrap_or(Ok(())))"),
-            "and the single-cell form must be gone, not left beside the chain"
+            !TRAP_SRC.contains("Ok(cow_result.unwrap_or(Ok(())))")
+                && !TRAP_SRC.contains("Ok(demand_result.or(cow_result).unwrap_or(Ok(())))"),
+            "and no shorter form may be left beside the chain"
+        );
+        // The terminal arm must BIND the result, not discard it: `Complete(_)` is exactly the
+        // shape that swallowed it.
+        assert!(
+            TRAP_SRC.contains("terminal_result = Some(result);"),
+            "the terminal arm must bind its route's result into the chain"
         );
     }
 }
@@ -162530,9 +162496,15 @@ mod u9a64cow2_split_route {
             "the boundary must be stated before anything is allocated"
         );
         // Refusals that may fall back to the broad arm all sit BEFORE the boundary.
+        // U9-PAGEFAULT2 §3 split `RefusedMappingChanged` into the three states it was hiding,
+        // because their canonical settlements differ: absent is an error, already-writable is a
+        // retry, and a cleared mark is the next owner's business. All three still refuse before
+        // the first mutation, which is what this case exists to pin.
         for refusal in [
             "R::RefusedNoCnode",
-            "R::RefusedMappingChanged",
+            "R::RefusedMappingAbsent",
+            "R::RefusedAlreadyWritable",
+            "R::RefusedNotCowMarked",
             "R::RefusedIdentityChanged",
         ] {
             let at = txn.find(refusal).unwrap_or(usize::MAX);
@@ -183781,8 +183753,7 @@ mod u9pf1_demand_route {
                 "{name}: exactly one place may declare a demand recovery"
             );
             assert!(
-                src.contains("\"demand_recovered\"")
-                    || src.contains("demand_result.or(cow_result)"),
+                src.contains("\"demand_recovered\"") || src.contains(".or(demand_result)"),
                 "{name}: the demand arm must carry its own outcome"
             );
             // The terminal route is skipped once demand handled the fault.

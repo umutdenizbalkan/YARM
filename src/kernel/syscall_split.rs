@@ -295,12 +295,32 @@ fn try_split_terminal_page_fault_into_frame(
     cpu: CpuId,
     fault: Option<crate::kernel::trap::FaultInfo>,
     frame: Option<&crate::kernel::trapframe::TrapFrame>,
+    authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
     use crate::kernel::boot::{
-        BufferedFaultAdmission as A, BufferedFaultCommit as C, PageFaultRoute,
+        FaultReportOutcome as R, PageFaultRoute, TerminalFaultPolicyRefusal as PR,
         TerminalFaultTransition as T, page_fault_route_for,
     };
     use SplitDispatchDisposition as D;
+
+    // U9-PAGEFAULT2 §3 — the two canonical endings this route settles its own refusals with.
+    //
+    // `retry` is the faulting instruction re-executing. Nothing was published, nothing woken, no
+    // scheduler state moved, so the architecture epilogue returns through the same frame and the
+    // access is taken again — against whatever the competing owner left behind.
+    //
+    // `fatal` is `Err(TrapHandleError::Syscall(TaskMissing))`, which is not a new policy: it is
+    // byte-for-byte what `fault_current_task_with_fault` returns when it cannot name a victim,
+    // carried out of the trap by the same `?` and turned into the same halt by the same
+    // architecture entry. The only thing that changed is which owner produced it.
+    let retry = || D::Complete(Ok(()));
+    let fatal = || {
+        D::Complete(Err(TrapHandleError::Syscall(
+            crate::kernel::syscall::SyscallError::from(
+                crate::kernel::boot::KernelError::TaskMissing,
+            ),
+        )))
+    };
 
     // U9-PAGEFAULT1 §2 — all three ports, each on a witness of its own.
     //
@@ -333,6 +353,37 @@ fn try_split_terminal_page_fault_into_frame(
         page_fault_route_for(arch, class),
         PageFaultRoute::SplitTerminal
     ) {
+        // U9-PAGEFAULT2 §3 — THE END OF THE ROUTE ORDER, and the only place it can be settled.
+        //
+        // This route is last. Reaching it with a RECOVERY class means the COW or demand route
+        // already saw this fault in this trap and declined it — and every way either of them
+        // declines a fault of its own class is a race: `RefusedNotCowMarked`, `Raced`,
+        // `RefusedIdentityChanged`, `RefusedNotDemandRegion`. Each one means a competing owner
+        // committed a mutation on this page or this task while we were classifying.
+        //
+        // So the honest settlement is the faulting instruction, not the broad dispatcher. The
+        // competitor made progress; re-executing either succeeds against what it left, or takes
+        // a fresh fault that re-enters the family classified from current state. It terminates
+        // because every repetition requires ANOTHER competing commit, and it is not a loop —
+        // control leaves the kernel between attempts.
+        //
+        // A non-recovery class cannot arrive here: `UserKernelAddress` and `TerminallyUnhandled`
+        // both route `SplitTerminal` on all three ports, and `KernelOrAbsentTask` never reaches
+        // this point because `classify_for_split` returns `None` for it above.
+        if matches!(
+            class,
+            crate::kernel::boot::PageFaultClass::CowCandidate
+                | crate::kernel::boot::PageFaultClass::DemandCandidate
+        ) {
+            crate::yarm_log!(
+                "TERMINAL_FAULT_SPLIT_RACED cpu={} tid={} va=0x{:x} class={:?} settlement=retry_instruction broad_lock=0",
+                cpu.0,
+                facts.tid,
+                facts.page.0,
+                class
+            );
+            return retry();
+        }
         return D::NotHandled;
     }
     // (2) Terminal policy, against the EXACT coordinate we classified with.
@@ -343,81 +394,112 @@ fn try_split_terminal_page_fault_into_frame(
     // notify-and-continue fault is a published report with no transition and no deferral, and
     // this route can produce exactly that. The policy still decides everything below, it just no
     // longer decides whether this route participates.
-    let Ok(snapshot) = shared.read_terminal_fault_policy_shared(cpu, facts.tid, facts.asid) else {
-        crate::yarm_log!(
-            "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=policy reason=policy_read",
-            cpu.0,
-            facts.tid
-        );
-        return D::NotHandled;
-    };
-    let terminates = snapshot.terminates_task();
-    // (3) Report admission. U9-PAGEFAULT1 §1e — four of its five endings settle here now.
-    //
-    // `NoRoute` and `EndpointStale` publish NOTHING in the broad arm either: each is exactly ONE
-    // ungated marker followed by a bare `return` from `emit_fault_report_for_fault`, with the
-    // policy branch below then running exactly as it does for a published report. The preflight
-    // determines both markers completely, so this route reproduces them rather than handing the
-    // whole fault away over a report that was never going to exist.
-    //
-    // The other two still decline, for reasons that are about MECHANISM, not about outcome:
-    //
-    // * `WaiterPresent` — the broad emitter hands the report DIRECTLY to a blocked receiver, a
-    //   writeback into another task's buffers plus a rank-1 wake, with its own failure ladder.
-    //   That is a different publication mechanism, and reproducing it is receive-family work.
-    // * `BufferFull` — the broad emitter does not discover a full queue at a preflight; it
-    //   discovers it INSIDE the enqueue, having already printed the target, the queue state, the
-    //   sender line and `TASK_FAULT_REPORT_ENQUEUE_BEGIN` against data a preflight does not
-    //   carry. Reproducing that prefix from a prediction would be reporting an enqueue attempt
-    //   this route never made.
-    let admission = shared.admit_buffered_fault_report_shared(&snapshot);
-    let publishable = match admission {
-        A::BufferedEligible {
-            endpoint_idx,
-            generation,
-            queued_before,
-            via_fault_handler,
-        } => Some((endpoint_idx, generation, queued_before, via_fault_handler)),
-        A::WaiterPresent { .. } | A::BufferFull { .. } => {
+    let snapshot = match shared.read_terminal_fault_policy_shared(cpu, facts.tid, facts.asid) {
+        Ok(snapshot) => snapshot,
+        // U9-PAGEFAULT2 §3 — the policy read's three refusals, each settled as the broad arm
+        // settles the same condition. They were ONE decline; they are not one outcome.
+        Err(refusal) => {
             crate::yarm_log!(
-                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=admit reason={}",
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=policy reason={:?} settlement={} broad_lock=0",
                 cpu.0,
                 facts.tid,
-                match admission {
-                    A::WaiterPresent { .. } => "waiter_present",
-                    _ => "buffer_full",
+                refusal,
+                match refusal {
+                    PR::NotCurrentTask => "retry_instruction",
+                    PR::NoCurrentTask | PR::TaskNotFound => "fatal_task_missing",
                 }
             );
-            return D::NotHandled;
+            return match refusal {
+                // The victim we classified is no longer this CPU's current task. The broad arm
+                // does not ask this question at all — it reads `current_tid()` afresh and faults
+                // whoever answers — so falling back would report THIS fault against a DIFFERENT
+                // task and terminate it. Honoring the competing winner means publishing nothing:
+                // the frame still belongs to the faulting context, so returning re-executes the
+                // access and the fault is re-classified against current state.
+                PR::NotCurrentTask => retry(),
+                // No current task, or a tid with no TCB. Both are exactly where
+                // `fault_current_task_with_fault` gives up — the first at its `current_tid()`
+                // `ok_or`, the second at the `FaultRunningCurrent` acceptance check — and both
+                // of its answers are `Err(TaskMissing)`. Nothing was published and nothing
+                // mutated, so this is that answer and not a substitute for it.
+                PR::NoCurrentTask | PR::TaskNotFound => fatal(),
+            };
         }
-        A::EndpointStale { .. } | A::NoRoute => None,
     };
+    let terminates = snapshot.terminates_task();
+    // (3) U9-PAGEFAULT2 §2 — REPORT DELIVERY, as one total function.
+    //
+    // PAGEFAULT1 admitted only the buffered-eligible ending and declined the other two on the
+    // grounds that they were "a different publication MECHANISM". That was true and it was not
+    // a reason: the mechanisms have off-lock owners, and the whole point of the family boundary
+    // is that the family owns its own outcomes.
+    //
+    // `deliver_fault_report_split` is `emit_fault_report_for_fault`'s totality made explicit —
+    // it publishes to a waiter, publishes to the buffer, or records that reporting could not
+    // succeed, and it never declines. Its outcome does NOT decide what happens to the faulted
+    // task: the broad emitter returns from all three endings and the task is terminated after
+    // every one of them.
     // (4) For a TERMINATING policy only: the capability check and the deferral reservation, both
     // before any marker is printed and before anything is published. A non-terminating policy
     // performs no transition, so it owes no queue advance and reserves nothing — reserving one
     // would strand the CPU on a deferral no drain would ever consume.
     if terminates {
-        if let Err(refusal) = shared.queue_advance_admit_split(
-            cpu,
+        // U9-PAGEFAULT2 §3 — THE TRAP'S OWN AUTHORITY, not the ambient dispatch CPU.
+        //
+        // `queue_advance_admit_with_authority_split`'s own documentation names the families that
+        // "keep the ambient contract until they migrate themselves", and terminal-fault was one
+        // of them. Migrating it is not a loosening: the DRAIN that consumes what this route
+        // publishes already authenticates on the authority and on nothing else. Both bridges
+        // call `queue_advance_acquire_incoming_split(trap_path.authority(), ..)`, and
+        // `queue_advance_select_step_split` asks only `is_live()` and `validate_online_cpu`
+        // before operating on THAT CPU's queue. So this drain is
+        // `TerminalRouteTopology::AuthorityBound`, and the two questions the ambient form asked
+        // were being asked on behalf of a consumer that had stopped asking them.
+        //
+        // What that cost is not theoretical. `MultiCpu` refuses whenever more than one CPU is
+        // dispatching, so on any SMP boot this route refused EVERY terminal fault and the whole
+        // class went broad — the converted population was single-CPU profiles only.
+        if let Err(refusal) = shared.queue_advance_admit_with_authority_split(
+            authority,
             crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
         ) {
             crate::yarm_log!(
-                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=queue_admit reason={:?}",
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=queue_admit reason={:?} settlement=retry_instruction broad_lock=0",
                 cpu.0,
                 facts.tid,
                 refusal
             );
-            return D::NotHandled;
+            // The two variants that survive the migration are properties of the TRAP, not of the
+            // fault: `NoTrapDrainer` means this CPU's lock-drop window is not open, and
+            // `OutgoingIdentityStale` means the authority is not live. The bridge established
+            // the window before it called this route and retires it at the real trap boundary,
+            // so neither is reachable from a bridge-supplied authority — and if one ever were,
+            // nothing has been published or mutated, so the faulting instruction is the settled
+            // answer. It is not a fatal: the fault is real and unhandled, but the reason we
+            // could not settle it here is contention for the trap's own machinery.
+            return retry();
         }
-        // RESERVE THE DEFERRAL BEFORE ANY PUBLICATION. A reservation failure is pre-mutation and
-        // may fall back; holding it is what guarantees the drain will apply an incoming context.
+        // RESERVE THE DEFERRAL BEFORE ANY PUBLICATION. Holding it is what guarantees the drain
+        // will apply an incoming context.
         if !crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, facts.tid) {
             crate::yarm_log!(
-                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=defer reason=defer_unavailable",
+                "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=defer reason=defer_unavailable settlement=retry_instruction broad_lock=0",
                 cpu.0,
                 facts.tid
             );
-            return D::NotHandled;
+            // U9-PAGEFAULT2 §3 — ORDINARY CONTENTION, settled as such.
+            //
+            // The CAS fails only when a deferral is already armed for this CPU, which means a
+            // queue advance is already owed and this trap's drain has not consumed it yet.
+            // Publishing a second one would lose the first. Nothing here has been published and
+            // nothing mutated, so the settlement is the faulting instruction: the owed advance
+            // drains, and the task — which is still `Running` and still `current`, because a
+            // terminal fault has not been acted on yet — re-faults into a clean reservation.
+            //
+            // Deliberately NOT a fatal and NOT a retry loop. The directive's own rule is that a
+            // panic must not be substituted for contention, and a bounded in-route retry would
+            // spin against a cell only the drain can clear.
+            return retry();
         }
     }
     // (5) Capture the outgoing context while the reservation is held and nothing is published.
@@ -450,74 +532,23 @@ fn try_split_terminal_page_fault_into_frame(
         fault.addr.0,
         Some(fault.access)
     );
-    crate::yarm_log!("TASK_FAULT_REPORT_BEGIN tid={}", facts.tid);
-    // (6) PUBLISH, or reproduce the broad emitter's own no-publication ending.
-    if let Some((endpoint_idx, generation, queued_before, via_fault_handler)) = publishable {
-        crate::yarm_log!(
-            "TASK_FAULT_REPORT_TARGET tid={} endpoint={} generation={}",
-            facts.tid,
-            endpoint_idx,
-            generation
-        );
-        crate::yarm_log!(
-            "TASK_FAULT_REPORT_QUEUE_STATE_BEFORE endpoint={} waiters=0 queued={}",
-            endpoint_idx,
-            queued_before
-        );
-        // Past this line broad fallback is forbidden.
-        match shared.commit_buffered_fault_report_shared(
-            facts.tid,
-            fault,
-            endpoint_idx,
-            generation,
-            via_fault_handler,
-        ) {
-            C::Buffered { .. } => {}
-            // Pre-publication refusal: release any reservation and let the broad path run.
-            _ => {
-                if terminates {
-                    crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
-                }
-                return D::NotHandled;
-            }
-        }
-    } else {
-        // U9-PAGEFAULT1 §1e — the broad emitter's two no-publication endings, in its own
-        // spellings. Each is a bare `return` from `emit_fault_report_for_fault` after one marker,
-        // and the policy branch below then runs exactly as it does for a published report.
-        //
-        // Neither prints a target or a queue-state line, because the emitter returns before both
-        // of those. That position is the whole reason these two can be reproduced from a
-        // preflight while the full-queue ending cannot.
-        match admission {
-            A::NoRoute => {
-                crate::yarm_log!(
-                    "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
-                    facts.tid
-                );
-            }
-            A::EndpointStale { endpoint_idx } => {
-                crate::yarm_log!(
-                    "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason=missing-endpoint",
-                    facts.tid,
-                    endpoint_idx
-                );
-            }
-            // Handled above: eligible publishes, the other two declined before this point.
-            A::BufferedEligible { .. } | A::WaiterPresent { .. } | A::BufferFull { .. } => {}
-        }
-        crate::yarm_log!(
-            "TERMINAL_FAULT_SPLIT_UNPUBLISHED cpu={} tid={} reason={} terminates={} broad_lock=0",
-            cpu.0,
-            facts.tid,
-            match admission {
-                A::NoRoute => "no_route",
-                A::EndpointStale { .. } => "endpoint_stale",
-                _ => "unreachable",
-            },
-            u8::from(terminates)
-        );
-    }
+    // (6) REPORT DELIVERY — one call, three endings, never a decline.
+    //
+    // `deliver_fault_report_split` owns `TASK_FAULT_REPORT_BEGIN` and everything below it,
+    // because the emitter it reproduces owns them. It publishes to a blocked waiter, publishes
+    // to the buffer, or records that reporting could not succeed.
+    let report = shared.deliver_fault_report_split(cpu, facts.tid, fault, &snapshot);
+    crate::yarm_log!(
+        "TERMINAL_FAULT_SPLIT_REPORT cpu={} tid={} outcome={} terminates={} broad_lock=0",
+        cpu.0,
+        facts.tid,
+        match report {
+            R::DeliveredToWaiter { .. } => "delivered_to_waiter",
+            R::Buffered { .. } => "buffered",
+            R::Failed(f) => f.marker(),
+        },
+        u8::from(terminates)
+    );
     // (7) U9-PAGEFAULT1 §1e — the non-terminating policy settles here, with no transition.
     //
     // This is the broad arm's `if effective_fault_policy_for(..) == NotifyAndContinue { return
@@ -530,7 +561,7 @@ fn try_split_terminal_page_fault_into_frame(
             "TERMINAL_FAULT_SPLIT_NOTIFY_CONTINUE cpu={} tid={} published={} broad_lock=0",
             cpu.0,
             facts.tid,
-            u8::from(publishable.is_some())
+            u8::from(!matches!(report, R::Failed(_)))
         );
         return D::Complete(Ok(()));
     }
@@ -565,8 +596,72 @@ fn try_split_terminal_page_fault_into_frame(
     _cpu: CpuId,
     _fault: Option<crate::kernel::trap::FaultInfo>,
     _frame: Option<&crate::kernel::trapframe::TrapFrame>,
+    _authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
     SplitDispatchDisposition::NotHandled
+}
+
+/// U9-PAGEFAULT2 §3 — settle ONE pre-mutation refusal through its canonical outcome.
+///
+/// Every refusal routed here mutated nothing, which is what makes all three settlements safe —
+/// and what made `NotHandled` *look* safe. It was: the broad arm would have re-derived the same
+/// facts and produced one of exactly these three answers. What it was not is ours, and the
+/// argument that defended it does not survive contact with the lock structure: a broad-lock
+/// holder does not exclude a split writer, because every split seam takes the rank-ordered
+/// subsystem lock inside `KernelState` directly.
+///
+/// So the answer is produced here instead of being asked for:
+///
+/// * **`RetryInstruction`** — another owner already did this work. The faulting access now
+///   succeeds, so returning to it IS the settlement. No marker stream is owed: nothing was
+///   published, nothing was woken, and no scheduler state moved.
+/// * **`ContinueFamily`** — not this class's fault. `NotHandled` is CORRECT here and means
+///   something different from a residual: the next route in the order takes it, exactly as the
+///   broad handler chain passes its own `Ok(false)` to the next handler. The terminal route is
+///   last, so nothing falls off the end.
+/// * **`ResourceFailure`** — the resource does not exist, and the broad arm propagates this
+///   exact error out of the trap. Nothing was allocated, so there is nothing to roll back.
+#[cfg(not(feature = "hosted-dev"))]
+fn settle_pre_mutation(
+    cpu: CpuId,
+    facts: crate::kernel::boot::PageFaultFacts,
+    marker: &'static str,
+    reason: &'static str,
+    settlement: crate::kernel::boot::PreMutationSettlement,
+) -> SplitDispatchDisposition {
+    use crate::kernel::boot::PreMutationSettlement as P;
+    use SplitDispatchDisposition as D;
+
+    crate::yarm_log!(
+        "{} cpu={} tid={} va=0x{:x} reason={} settlement={} broad_lock=0",
+        marker,
+        cpu.0,
+        facts.tid,
+        facts.page.0,
+        reason,
+        match settlement {
+            P::RetryInstruction => "retry_instruction",
+            P::ContinueFamily => "continue_family",
+            P::ReenterFamilyOwner => "reenter_family_owner",
+            P::ResourceFailure(_) => "resource_failure",
+        }
+    );
+    match settlement {
+        P::RetryInstruction => D::Complete(Ok(())),
+        P::ContinueFamily => D::NotHandled,
+        // Settled by the ROUTE, which is the only place that holds the owner to re-enter. Each
+        // route matches this variant ahead of the call above, so reaching here would mean a
+        // refusal was given the variant without being given its arm — a source defect, not a
+        // runtime condition. `ContinueFamily` is the fail-safe reading: it mutates nothing and
+        // the terminal route settles whatever reaches the end of the order.
+        P::ReenterFamilyOwner => {
+            debug_assert!(false, "a re-entering refusal must be settled by its route");
+            D::NotHandled
+        }
+        P::ResourceFailure(err) => D::Complete(Err(TrapHandleError::Syscall(
+            crate::kernel::syscall::SyscallError::from(err),
+        ))),
+    }
 }
 
 /// U9-PAGEFAULT1 §1c — settle the two COW outcomes that are not the private copy.
@@ -813,16 +908,36 @@ fn try_split_cow_page_fault_into_frame(
             }
             D::Complete(Ok(()))
         }
-        other if other.may_fall_back_to_broad() => {
+        // U9-PAGEFAULT2 §3 — the page raced back into the shape the NON-PRIVATE-COPY owner
+        // handles. Re-enter that owner, which is the same one the pre-transaction screen above
+        // calls, so the raced and unraced forms take one code path. It revalidates under rank 5
+        // and rank 6 itself; nothing here is predicted from the stale read.
+        other
+            if matches!(
+                other.pre_mutation_settlement(),
+                Some(crate::kernel::boot::PreMutationSettlement::ReenterFamilyOwner)
+            ) =>
+        {
             crate::yarm_log!(
-                "VM_COW_SPLIT_REFUSED cpu={} tid={} va=0x{:x} reason={}",
+                "VM_COW_SPLIT_REENTER cpu={} tid={} va=0x{:x} reason={} owner=non_private broad_lock=0",
                 cpu.0,
                 facts.tid,
                 facts.page.0,
                 other.reason()
             );
-            D::NotHandled
+            settle_cow_non_private_copy(shared, cpu, fault, facts)
         }
+        // A pre-mutation refusal settles through its CANONICAL outcome, not through the broad
+        // dispatcher. Which outcome it is comes from which refusal was raised.
+        other if other.may_fall_back_to_broad() => settle_pre_mutation(
+            cpu,
+            facts,
+            "VM_COW_SPLIT_REFUSED",
+            other.reason(),
+            other
+                .pre_mutation_settlement()
+                .expect("a fall-back-eligible refusal has a canonical settlement"),
+        ),
         other => {
             // Post-allocation failure. The allocation is rolled back; the broad arm must not
             // run, so this carries the error the broad arm's own failure would have carried.
@@ -1006,17 +1121,35 @@ fn try_split_demand_page_fault_into_frame(
             crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
             D::Complete(Ok(()))
         }
-        // Pre-mutation: nothing was written, so the broad arm may re-derive and decide.
-        other if other.may_fall_back_to_broad() => {
+        // U9-PAGEFAULT2 §3 — a mapping appeared under us, which is the shape the
+        // STALE-TRANSLATION owner handles. Re-enter it, exactly as the pre-transaction screen
+        // above does, so the cached negative walk is retired before the instruction retries.
+        other
+            if matches!(
+                other.pre_mutation_settlement(),
+                Some(crate::kernel::boot::PreMutationSettlement::ReenterFamilyOwner)
+            ) =>
+        {
             crate::yarm_log!(
-                "PF1_DEMAND_SPLIT_REFUSED cpu={} tid={} va=0x{:x} reason={}",
+                "PF1_DEMAND_SPLIT_REENTER cpu={} tid={} va=0x{:x} reason={} owner=stale_translation broad_lock=0",
                 cpu.0,
                 facts.tid,
                 facts.page.0,
                 other.reason()
             );
-            D::NotHandled
+            settle_demand_stale_translation(shared, cpu, fault, facts)
         }
+        // Pre-mutation: nothing was written. U9-PAGEFAULT2 §3 — the canonical settlement,
+        // derived from the refusal.
+        other if other.may_fall_back_to_broad() => settle_pre_mutation(
+            cpu,
+            facts,
+            "PF1_DEMAND_SPLIT_REFUSED",
+            other.reason(),
+            other
+                .pre_mutation_settlement()
+                .expect("a fall-back-eligible refusal has a canonical settlement"),
+        ),
         // Post-allocation: the allocation is rolled back exactly, and the broad path must NOT
         // run — it would allocate a second frame for a fault it never saw declined.
         other => {
@@ -1079,13 +1212,19 @@ pub(crate) fn try_split_cow_page_fault_dispatch(
 }
 
 /// U9-FT4 — the bridge entry for the terminal PageFault route.
+///
+/// U9-PAGEFAULT2 §3 — it takes the TRAP'S OWN AUTHORITY, and the bridge passes the one it
+/// already holds. The route cannot mint one and does not read the window cell for itself: an
+/// authority is only as strong as the `TrapPathWindow` it came from, and threading the caller's
+/// is what makes "this CPU is provably running this trap" a fact rather than a claim.
 pub(crate) fn try_split_terminal_page_fault_dispatch(
     shared: &SharedKernel,
     cpu: CpuId,
     fault: Option<crate::kernel::trap::FaultInfo>,
     frame: Option<&crate::kernel::trapframe::TrapFrame>,
+    authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
-    try_split_terminal_page_fault_into_frame(shared, cpu, fault, frame)
+    try_split_terminal_page_fault_into_frame(shared, cpu, fault, frame, authority)
 }
 
 /// U9-RECV-BLOCK2 §2 — a receive whose `current` was cleared and could not be put back, handed to
