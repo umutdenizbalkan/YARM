@@ -3552,10 +3552,49 @@ pub fn aarch64_terminal_fault_oracle_enabled() -> bool {
     AARCH64_TERMINAL_FAULT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// U9-PAGEFAULT1 §2 — the same knob, under the name the other two ports use.
+///
+/// The scenario is architecture-neutral: a user task reads address 0 and the kernel reports the
+/// fault and takes the task down. Nothing in it is AArch64's. The flag keeps its original name so
+/// the AArch64 cell and its guards are untouched, and `yarm.terminal_fault_oracle=1` sets the
+/// same flag as `yarm.aarch64_terminal_fault_oracle=1` — one knob, three ports, one selector.
+pub fn terminal_fault_oracle_enabled() -> bool {
+    aarch64_terminal_fault_oracle_enabled()
+}
+
 /// The init startup-slot-5 selector for the terminal-fault oracle. Slot-5 values 1-8 and 20 are
-/// already claimed on AArch64, so this takes the next clearly free value.
-pub const AARCH64_TERMINAL_FAULT_ORACLE_SELECTOR: u64 =
-    yarm_ipc_abi::terminal_fault_oracle_abi::AARCH64_TERMINAL_FAULT_SELECTOR as u64;
+/// already claimed, so this takes the next clearly free value. Shared by all three ports since
+/// U9-PAGEFAULT1 §2 — see `terminal_fault_oracle_abi` for why one value suffices where the
+/// `ExitCurrentTask` block needed three.
+pub const TERMINAL_FAULT_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::terminal_fault_oracle_abi::TERMINAL_FAULT_SELECTOR as u64;
+
+/// The name this selector had while only AArch64 used it.
+pub const AARCH64_TERMINAL_FAULT_ORACLE_SELECTOR: u64 = TERMINAL_FAULT_ORACLE_SELECTOR;
+
+/// U9-PAGEFAULT1 §2 — the INSTRUCTION-FETCH terminal-fault oracle.
+///
+/// A second scenario rather than a variation on the first, because it exercises the other half
+/// of every architecture's fault decoder: a read at an unmapped address is a data abort, a call
+/// to one is an instruction abort, decoded from a different exception class on each port. §2c
+/// added RISC-V's `EXC_INSTRUCTION_PAGE_FAULT` arm and nothing exercised it.
+///
+/// Default-off and mutually exclusive with the read scenario by the shared `init_args[5] == 0`
+/// guard; `yarm.terminal_fault_fetch_oracle=1` arms it.
+pub(crate) static TERMINAL_FAULT_FETCH_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_terminal_fault_fetch_oracle_enabled(enabled: bool) {
+    TERMINAL_FAULT_FETCH_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn terminal_fault_fetch_oracle_enabled() -> bool {
+    TERMINAL_FAULT_FETCH_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The fetch scenario's slot-5 selector, from the same single owner.
+pub const TERMINAL_FAULT_FETCH_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::terminal_fault_oracle_abi::TERMINAL_FAULT_FETCH_SELECTOR as u64;
 
 /// Stage 196A: default-off RISC-V post-lock-drain FOUNDATION oracle selector.
 /// When enabled, the RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`)

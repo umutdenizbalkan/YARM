@@ -2416,6 +2416,27 @@ pub fn bootstrap_first_user_task(
             init_args[5]
         );
     }
+    // U9-PAGEFAULT1 §2 — the RISC-V TERMINAL-FAULT oracle slot-5 write.
+    //
+    // The same scenario, selector and knob the other two ports use: init takes one deliberate
+    // unhandled read at address 0. Default-off, mutually exclusive with every slot-5 oracle
+    // above (guarded by `init_args[5] == 0`), and needs no provisioned caps.
+    if crate::kernel::boot::terminal_fault_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::TERMINAL_FAULT_ORACLE_SELECTOR;
+        crate::yarm_log!(
+            "TERMINAL_FAULT_ORACLE_PROVISION_OK arch=riscv64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
+    }
+    // U9-PAGEFAULT1 §2: the INSTRUCTION-FETCH scenario. Mutually exclusive with the read
+    // scenario by the same `init_args[5] == 0` guard, so arming both knobs arms the read.
+    if crate::kernel::boot::terminal_fault_fetch_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::TERMINAL_FAULT_FETCH_ORACLE_SELECTOR;
+        crate::yarm_log!(
+            "TERMINAL_FAULT_FETCH_ORACLE_PROVISION_OK arch=riscv64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

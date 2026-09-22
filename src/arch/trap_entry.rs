@@ -2000,6 +2000,12 @@ pub fn handle_trap_entry_shared(
             // failure. Neither existing predicate is loosened.
             .map(|t| {
                 shared.futex_wait_reverify_blocked(t)
+                    // U9-PAGEFAULT1 §2: the terminally-faulted state, admitted here as it has
+                    // been in the AArch64 drain since U9-FT4 — and verified by the SAME exact
+                    // predicate, not by loosening either of the others. The comment above this
+                    // block already described this state as admitted; it was not, which is why
+                    // the x86_64 terminal PageFault row could not be opened.
+                    || shared.terminal_fault_reverify_faulted(t)
                     || crate::kernel::boot::exit_queue_advance_pending(cpu_idx)
                         .is_some_and(|(et, _)| et == t && shared.exit_reverify_ok(t))
             })

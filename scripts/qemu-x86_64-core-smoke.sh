@@ -52,6 +52,8 @@ D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}
 SCHED_TIMEOUT=${SCHED_TIMEOUT:-0}
 VM_COW=${VM_COW:-0}
 CAP_CNODE=${CAP_CNODE:-0}
+TERMINAL_FAULT_ORACLE=${TERMINAL_FAULT_ORACLE:-0}
+TERMINAL_FAULT_FETCH_ORACLE=${TERMINAL_FAULT_FETCH_ORACLE:-0}
 FAULT_DELIVERY=${FAULT_DELIVERY:-0}
 SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
 GLOBAL_STATE=${GLOBAL_STATE:-0}
@@ -96,6 +98,23 @@ fi
 # Stage 166 (D6-SWITCH-A): D6_SWITCH_A=1 appends yarm.d6_switch_a=1 to opt the
 # first narrow production unlocked switch in (default-off; x86_64-only).
 D6_SWITCH_A=${D6_SWITCH_A:-0}
+# U9-PAGEFAULT1 §2: the x86_64 terminal-fault witness cell. Default-off — with the knob unset
+# the x86_64 core profile produces ZERO page faults of any class, which is exactly why the
+# terminal row could not be admitted on evidence before this oracle existed.
+# U9-PAGEFAULT1 §2: the INSTRUCTION-FETCH variant of the same cell. It exercises the
+# instruction-abort decode rather than the data-abort decode, and reaches the terminal class by
+# construction (the demand screen refuses Execute outright) rather than by elimination.
+if [[ "$TERMINAL_FAULT_FETCH_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_fetch_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.terminal_fault_fetch_oracle=1"
+  TERMINAL_FAULT_ORACLE=1
+fi
+# Slot 5 carries exactly ONE scenario and the kernel writes the read selector first, so the two
+# knobs are mutually exclusive here too: arming the fetch scenario must not also pass the read
+# knob, or the read would silently win and the cell would assert a fetch that never happened.
+if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$TERMINAL_FAULT_FETCH_ORACLE" != "1" \
+      && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.terminal_fault_oracle=1"
+fi
 if [[ "$D6_SWITCH_A" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_a="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_a=1"
 fi
@@ -2337,6 +2356,109 @@ if [[ "$u9rx4_fail" -eq 1 ]]; then
   exit 1
 fi
 echo "[ok] U9-RX4: x86_64 queued-plain reply-cap + framing witness chain complete"
+
+# U9-PAGEFAULT1 §2: the x86_64 terminal PageFault route, asserted POSITIVELY in its own cell.
+#
+# The AArch64 witness (U9-FT4) has asserted this chain since 199E-A64CALL. x86_64 could not,
+# because no x86_64 profile produced a terminal fault to watch — a measured fact: the core
+# profile emits zero PAGE_FAULT_ENTRY lines of any class. The terminal-fault oracle gives it the
+# same deliberate trigger AArch64 has, and the BASELINE was measured before the routing row was
+# added: exactly one fault, reaching the broad dispatcher (PF1_BROAD_ARRIVAL), report buffered to
+# endpoint 3, task terminated. Every assertion below is against that chain.
+if [[ "$TERMINAL_FAULT_ORACLE" != "1" ]]; then
+  echo "[info] U9-PF1-TERM: not armed (set TERMINAL_FAULT_ORACLE=1) -- the x86_64 terminal-fault witness runs in its own cell"
+else
+pf1t_fail=0
+# U9-PAGEFAULT1 §2: one cell, two scenarios. The chain is identical apart from the access the
+# CPU reports and which decoder produced it, so the assertions are parameterised rather than
+# duplicated -- a second copy would drift.
+if [[ "$TERMINAL_FAULT_FETCH_ORACLE" == "1" ]]; then
+  pf1t_access=Execute
+  pf1t_user_access=fetch
+  pf1t_provision=TERMINAL_FAULT_FETCH_ORACLE_PROVISION_OK
+  pf1t_slot5=24
+else
+  pf1t_access=Read
+  pf1t_user_access=read
+  pf1t_provision=TERMINAL_FAULT_ORACLE_PROVISION_OK
+  pf1t_slot5=23
+fi
+pf1t_log="$(tr '\r' '\n' <"$LOGFILE")"
+pf1t_count() {
+  local n
+  n="$(printf '%s\n' "$pf1t_log" | rg -a -F -c -- "$1" || true)"
+  printf '%s' "${n:-0}"
+}
+pf1t_require_one() {
+  local want_desc="$1" pat="$2" n
+  n="$(pf1t_count "$pat")"
+  if [[ "$n" != "1" ]]; then
+    echo "[error] U9-PF1-TERM: $want_desc -- expected exactly 1, got ${n:-0}: $pat"
+    pf1t_fail=1
+  else
+    echo "[ok] U9-PF1-TERM: $want_desc"
+  fi
+}
+pf1t_require_zero() {
+  local want_desc="$1" pat="$2" n
+  n="$(pf1t_count "$pat")"
+  if [[ "$n" != "0" ]]; then
+    echo "[error] U9-PF1-TERM: $want_desc -- expected 0, got $n: $pat"
+    pf1t_fail=1
+  else
+    echo "[ok] U9-PF1-TERM: $want_desc"
+  fi
+}
+# The trigger fired, on this architecture, from init.
+pf1t_require_one "the x86_64 terminal-fault oracle is provisioned once" \
+  "${pf1t_provision} arch=x86_64 slot5=${pf1t_slot5} caps=none result=ok"
+pf1t_require_one "init takes exactly one deliberate ${pf1t_user_access} at 0x0" \
+  "TERMINAL_FAULT_ORACLE_BEGIN arch=x86_64 init_tid=1 addr=0x0 access=${pf1t_user_access}"
+pf1t_require_zero "the deliberate ${pf1t_user_access} never returns" \
+  'TERMINAL_FAULT_ORACLE_UNREACHABLE'
+# The exact fault facts, each exactly once.
+pf1t_require_one "tid 1 ${pf1t_access} fault at 0x0 entered once" \
+  "PAGE_FAULT_ENTRY tid=1 addr=0x0 access=${pf1t_access}"
+pf1t_require_one "the fault is reported unhandled exactly once" \
+  "PAGE_FAULT_UNHANDLED tid=1 addr=0x0 access=${pf1t_access}"
+# The exact fault REPORT: buffered to endpoint 3 at its exact generation, with no wake.
+pf1t_require_one "report targets endpoint 3 at its exact generation" \
+  'TASK_FAULT_REPORT_TARGET tid=1 endpoint=3 generation=1'
+pf1t_require_one "report is BUFFERED exactly once with woke=0" \
+  'TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=3 queued=1 woke=0'
+# The task TRANSITION, and the deferral that guarantees the drain applies an incoming context.
+pf1t_require_one "terminal task transition commits exactly once" \
+  'TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred'
+pf1t_require_one "the queue-advance deferral is published exactly once" \
+  'QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid=1 cpu=0'
+# THE MEASUREMENT: the fault settles WITHOUT the broad dispatcher. Asserted both ways --
+# positively, that the broad arm was skipped for this reason, and by the broad-entry counter,
+# which prints only in the broad arm and must not name this fault.
+pf1t_require_one "broad dispatcher skipped for the terminal fault" \
+  'QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=terminal_fault_committed'
+pf1t_require_zero "the fault never reaches the broad dispatcher" \
+  "PF1_BROAD_ARRIVAL cpu=0 tid=1 addr=0x0 access=${pf1t_access}"
+# ANOTHER TASK PROGRESSES: the drain selects tid 2, gives it its exact frame, and it runs.
+pf1t_require_one "queue selection happens once and chooses tid 2" \
+  'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=2'
+pf1t_require_one "replacement tid 2 is made current" \
+  'QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu=0 tid=2'
+pf1t_require_one "replacement tid 2 gets its exact frame" \
+  'QUEUE_ADVANCING_DISPATCH_FRAME_OK cpu=0 tid=2'
+# The faulting PC must NEVER resume, and no refusal or fail-closed settlement may occur.
+pf1t_require_zero "the faulting PC never resumes (no ownerless re-fault)" \
+  'PAGE_FAULT_ENTRY tid=18446744073709551615'
+pf1t_require_zero "no split refusal on the witnessed path" 'TERMINAL_FAULT_SPLIT_REFUSED'
+pf1t_require_zero "no fail-closed settlement on the witnessed path" \
+  'TERMINAL_FAULT_SPLIT_FAILED_CLOSED'
+pf1t_require_zero "no unattributable fault on the witnessed path" \
+  'PF1_UNATTRIBUTABLE_FAULT'
+if [[ "$pf1t_fail" -eq 1 ]]; then
+  echo "[error] U9-PAGEFAULT1 x86_64 terminal-fault witness FAILED"
+  exit 1
+fi
+echo "[ok] U9-PF1-TERM: x86_64 terminal PageFault route witness chain complete"
+fi
 
 # Stage 197A (X86 FUTEXWAKE LIVE ORACLE): when armed, the parent/child split-FutexWake proof must
 # complete — split dispatch (nr=10), arch-tagged retirement, wake counts 1 then 0, waiter resumes.

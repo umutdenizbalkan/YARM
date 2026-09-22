@@ -20101,9 +20101,22 @@ An exit means one of two very different things, and they were not separated befo
 
 ### The score
 
-**10 of 25 exits are genuine residuals (B)**, 12 are legitimate family filters (A), and 3 are the
-classification-failure path §3 owns separately. The matrix being "all split" hid every one of
-them: a route can be admitted for a class and still hand most of that class's *outcomes* away.
+**CORRECTION (made while composing §2d).** This section first read "10 of 25 exits are genuine
+residuals (B), 12 are legitimate family filters (A)". Those two numbers are transposed, and the
+tables above are the authority. Counted from them:
+
+| class | exits | which |
+|---|---|---|
+| **B** — genuine residuals | **12** | COW 427, 448, 532; demand 630, 668; terminal 229, 251, 254, 278, 291, 301, 352 |
+| **A** — family filters | **10** | COW 430, 434, 442; demand 604, 607, 613, 624; terminal 232, 236, 246 |
+| **→ §3** — classification failure | **3** | COW 439; demand 618; terminal 240 |
+
+12 + 10 + 3 = 25, and 7 + 7 + 11 = 25 by route. The error was arithmetic in the prose, not in the
+tables, and it understated the residual count — so every "N of 10" figure in the sections that
+follow is restated against 12 in §2d's final tally.
+
+The matrix being "all split" hid every one of them: a route can be admitted for a class and still
+hand most of that class's *outcomes* away.
 
 The `Complete(Err(..))` fail-closed exits are **not** in this count and are not residuals — they
 settle without entering the broad dispatcher, which is the property that matters.
@@ -20235,18 +20248,8 @@ Both decline having touched nothing.
 
 ### The score after §1c/§1d/§1e
 
-| route | §1b residuals | closed here | remaining |
-|---|---|---|---|
-| COW | 3 | 2 (already-writable, absent mapping) | 1 — RISC-V arch gate |
-| demand | 2 | 1 (stale translation) | 1 — the five pre-mutation refusals |
-| terminal | 5 | 3 (`NotifyAndContinue`, no-route, endpoint stale) | 2 — `WaiterPresent`, `BufferFull` |
-| *(terminal, counted separately in §1b)* | *(policy read, queue admit, defer, commit)* | — | 4 pre-mutation refusals |
-
-**6 of 10 closed.** What remains is one architecture gate (§2 builds its witness), two
-publication mechanisms (`WaiterPresent`, `BufferFull`), and the pre-mutation refusal sets — which
-are race and resource-exhaustion branches where the broad arm re-derives the same facts under its
-own lock and reaches the same answer. Those are labelled as what they are: not outcomes nobody
-wrote down, but outcomes where falling back is the correct settlement.
+See §2d for the final tally across all of §1 and §2 together; the intermediate figure this
+section originally gave was computed against the transposed total corrected above.
 
 ## U9-PAGEFAULT1 §3 — the combined class, taken apart
 
@@ -20347,3 +20350,230 @@ split classifiers do. With the split routes' own settlement markers, the account
 Every page fault produces exactly one line from the first three groups or one
 `PF1_BROAD_ARRIVAL`, so "how much of this class is still broad" becomes a count rather than an
 argument.
+
+## U9-PAGEFAULT1 §2b — the terminal PageFault route, on all three ports
+
+The terminal row read "AArch64 only". That was accurate and it was also the whole problem: the
+route had been correct on every port since U9-FT4, and only AArch64 had a fault to prove it with.
+
+### What the measurement found first
+
+Running the x86_64 core profile with `PF1_BROAD_ARRIVAL` in place answered the question the
+routing matrix had been guessing at: **the x86_64 core profile takes zero page faults of any
+class.** Not "a few that go broad" — none at all. There was nothing to admit a row on, and no
+amount of reading the code would have produced one.
+
+So the trigger came first. The terminal-fault oracle — one deliberate unhandled read at address 0,
+taken by init before the SpawnV5 chain — has existed on AArch64 since 199E-A64CALL, and nothing
+about it is AArch64's: it needs a user task and an unmapped address 0, and that is all. It now has
+a slot-5 provisioning point on the other two ports, under one shared selector and one knob with
+two spellings.
+
+### The baseline, then the row — in that order, on each port
+
+| port | baseline (row absent) | after the row |
+|---|---|---|
+| x86_64 | 1 fault → `PF1_BROAD_ARRIVAL`, report buffered to endpoint 3, task terminated | 1 fault → `TERMINAL_FAULT_SPLIT_COMMITTED`, **0 broad arrivals** |
+| RISC-V | 1 fault → `PF1_BROAD_ARRIVAL`, same chain | 1 fault → `TERMINAL_FAULT_SPLIT_COMMITTED`, **0 broad arrivals** |
+
+Each baseline was a separate build with the port's row removed. That is what makes the row rest on
+a fault the port actually produces rather than on the other ports' evidence.
+
+### What had to change besides the row
+
+One thing, and it was a real defect rather than a missing feature. The queue-advance drain admits
+a set of outgoing states and verifies each exactly; the AArch64 drain has admitted `Faulted` since
+U9-FT4. **The x86_64 drain's comment said it admitted `Faulted` and its predicate did not.** The
+RISC-V drain neither said nor did. A terminal route returning `QueueAdvanceCommitted` on either
+port would have published a transition the drain then refused to act on. Both now carry the same
+`terminal_fault_reverify_faulted` predicate — not a loosened version of the other two, the same
+exact one.
+
+### What each witness asserts
+
+Nineteen assertions per port, all positive, all counted exactly. The trigger fired on this
+architecture; the fault entered once with the exact tid, address and access; the report targeted
+endpoint 3 at its exact generation and was buffered with no wake; the transition committed once
+with the outgoing context captured; the deferral published once. Then the part that matters most:
+
+* **the fault never reaches the broad dispatcher** — asserted twice, once positively
+  (`QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED ... reason=terminal_fault_committed`) and once by the
+  broad-entry counter, which prints only in the broad arm and must not name this fault;
+* **another task progresses** — the drain dequeues tid 2, makes it current, restores its exact
+  frame, and the supervisor goes on to receive the fault report and run its event loop;
+* **the faulting PC never resumes** — no ownerless re-fault, no refusal, no fail-closed
+  settlement, no unattributable fault.
+
+### Why the two cells relax their profile's service-chain checks
+
+The RISC-V core profile requires the SpawnV5 service chain's markers and rejects
+`PAGE_FAULT_UNHANDLED` outright. Both describe a boot in which init survives. The terminal-fault
+cell is a boot in which init deliberately does not, so asserting the service chain there would be
+asserting that the deliberate fault did not happen. The cell replaces those checks with its own
+positive chain, which asserts `PAGE_FAULT_UNHANDLED` appears **exactly once** with the exact tid,
+address and access — strictly stronger than a blanket reject, and something a relaxed reject could
+not check at all.
+
+## U9-PAGEFAULT1 §2c — the RISC-V COW witness
+
+The COW row said *"RISC-V is deliberately absent — it has no independent COW witness of its own,
+and §3 admits a class only on one."* That was true and it stayed true for a reason worth stating:
+nobody had run the workload that would produce one.
+
+**No new workload was needed.** `run_vm_cow_fork_witness_early` has been architecture-neutral
+since U9-COW2 — no `target_arch` gate, dispatched on every port — and RISC-V already provisions
+the slot-13 selector it reads. What was missing was a *profile*: the selector's provisioning
+requires BOTH the oracle knob and the sender-wake sub-knob, and no RISC-V profile armed both. One
+run with `IPC_RECV_PROOF=1 IPC_RECV_PROOF_SENDER_WAKE=1` produced it.
+
+| | baseline (row absent) | after the row |
+|---|---|---|
+| COW faults | 6 | 6 |
+| `PAGE_FAULT_HANDLED_COW` | 6 | 6 |
+| `PF1_BROAD_ARRIVAL` | **6** | **0** |
+| `VM_COW_SPLIT_COMMITTED` | 0 | **6** |
+| userspace isolation checks | 2 pass | 2 pass |
+
+Six faults is the historical witness shape: two forks, parent and child each writing the same
+virtual address in its own ASID, three faults per side. The isolation check is the one that
+matters most and it is made FROM USERSPACE — if the copy were not private, one side would observe
+the other's value. It passes identically before and after, which is the statement that the owner
+changed and the behaviour did not.
+
+The transaction needed nothing architecture-specific. The AArch64 row documents two obligations
+COW has on that port — an inner-shareable broadcast invalidation, and a context-synchronizing
+return to EL0 — and RISC-V discharges the equivalents the same way: `arch_map_page` ends in its
+own `sfence.vma`, and `sret` to U-mode is itself synchronizing.
+
+## U9-PAGEFAULT1 §2d — what the rows rest on now
+
+Every row in `page_fault_route_for` is `Split*` for every supported port, and each one was earned
+the same way: **measure the port's baseline with its own row absent, then add the row.**
+
+| class | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| COW | base (2 faults) | U9-A64-COW2 §4 (6 faults) | **§2c (6 faults)** |
+| demand | §2c (8 faults) | §2c (8 faults) | §2c (8 faults) |
+| terminal | **§2b (1 fault)** | base (1 fault) | **§2b (1 fault)** |
+| user→kernel address | §3 | §3 | §3 |
+
+The guard that used to read "neither split route is claimed beyond its witness" was a list of
+rows that must stay `Broad`. It is now the positive claim — every row that exists is named — plus
+one unported architecture that must still get `Broad`, because a matrix whose every row is
+`Split*` and whose default is also `Split*` is not a matrix, it is a default. The rule it encodes
+never changed: **no route without a witness.**
+
+### The residual tally across §1 and §2, against the corrected total
+
+§1b's 25 `NotHandled` exits, of which **12** were genuine residuals (see the correction there).
+Here is every one of the twelve and where it stands:
+
+| exit | residual | status |
+|---|---|---|
+| COW 427 | RISC-V arch gate | **closed — §2c**, six-fault witness |
+| COW 448 | already-writable / absent mapping | **closed — §1c**, both settled through the owner |
+| COW 532 | 4 pre-mutation refusals | open — pre-mutation, fallback is correct |
+| demand 630 | stale translation | **closed — §1d** |
+| demand 668 | 5 pre-mutation refusals | open — pre-mutation, fallback is correct |
+| terminal 229 | x86_64 / RISC-V arch gate | **closed — §2b**, a witness on each |
+| terminal 251 | policy read refused | open — pre-mutation |
+| terminal 254 | `NotifyAndContinue` | **closed — §1e** |
+| terminal 278 | admission: no-route, stale | **closed — §1e** |
+| terminal 278 | admission: waiter, buffer full | open — MECHANISM, see §1e |
+| terminal 291 | queue-advance admission refused | open — pre-mutation |
+| terminal 301 | deferral unavailable | open — pre-mutation |
+| terminal 352 | pre-publication commit refused | open — pre-mutation |
+
+**Six closed outright** (two architecture gates and four outcomes that had never been written
+down), **one closed in half** (two of the four report admissions), **six open**. And the six that
+are open are not the same kind of thing as the six that closed:
+
+* **Two are mechanism refusals** — `WaiterPresent` is a direct hand-off into a blocked receiver,
+  receive-family work; `BufferFull` is discovered four markers inside an enqueue this route never
+  makes. Reproducing an owner's conclusion without its mechanism is the thing §1e refused to do.
+* **Four are pre-mutation refusals** — a policy read that lost its coordinate, a capability
+  admission, a per-CPU reservation, a commit whose revalidation failed. Each leaves the fault
+  exactly as the broad arm would find it, and the broad arm then re-derives the same facts under
+  its own lock and reaches the same answer. Falling back there is not a gap; it is the correct
+  settlement, and the split/broad boundary is what makes it safe.
+
+What changed is which category the residuals are in. Before §1 they included two architecture
+gates and four outcomes nobody had written down. After it they are races, resource exhaustion, and
+one publication mechanism — and every one of them is counted, at the broad entry, by a marker that
+prints nowhere else.
+
+## U9-PAGEFAULT1 §2e — the instruction-fetch scenario
+
+Every fault witness in this mission so far has been a **data** abort. The RISC-V instruction
+page-fault decode arm (`EXC_INSTRUCTION_PAGE_FAULT`, cause 12) was added in §2c and nothing
+exercised it; the same half of the x86_64 and AArch64 decoders was equally unwitnessed.
+
+So the terminal-fault oracle gained a second scenario: a call through a null function pointer
+instead of a read from one. It is a different scenario rather than a parameter on the first,
+because it is a different fault in the two ways that matter here:
+
+* **A different decoder.** x86_64 reports it as `#PF` with the instruction-fetch error bit,
+  AArch64 as `ESR_EC_IABT_LOW` rather than `ESR_EC_DABT_LOW`, RISC-V as cause 12 rather than 13.
+  Three arms of three decoders that no profile had ever reached.
+* **A different arrival at the terminal class.** A read at an unmapped address is terminal by
+  *elimination* — COW declines it, demand declines it, so it falls through. A fetch is terminal
+  by *construction*: `FaultAccess::Execute` is refused outright by the demand screen, because a
+  demand page is mapped `USER_RW` and is never executable, and the COW screen is write-only so
+  it never sees it either. Nothing about the address's bookkeeping can change that.
+
+The two scenarios share one slot-5 owner (`23` for the read, `24` for the fetch), one guard
+(`init_args[5] == 0`, so slot 5 still carries exactly one scenario), and one witness cell per
+port — parameterised on the access rather than copied, because a second copy of nineteen
+assertions would drift from the first.
+
+### Honest labelling: what the non-live branches rest on
+
+§2 asks for the race and failure branches to be handled "with deterministic production-owner
+cases", and to label that evidence honestly. Here is the honest label.
+
+The `Refused*` arms of `CowRecovery`, `DemandRecovery`, `CowNonPrivateSettlement` and
+`DemandStaleTranslation` are **not** covered by executed tests, and cannot be from the hosted
+suite: every one of those transactions is `#[cfg(not(feature = "hosted-dev"))]`, because they
+drive the split seams against real page tables. What covers them is:
+
+1. **Source-derived guards** over the transaction bodies — that each refusal is raised before the
+   first mutation, that the rollback is the exact inverse of the allocation, that no `Refused*`
+   variant appears in a `may_fall_back_to_broad()` set it does not belong to, and that the
+   metadata-only settlements allocate nothing.
+2. **The typed split itself.** `may_fall_back_to_broad()` is what makes "declined" and "failed"
+   structurally different rights rather than a convention, so a future arm added to the wrong
+   group is a compile-visible change to one function, not a silent behaviour change.
+3. **The live populations that do exercise them.** `VM_COW_SPLIT_REFUSED` and
+   `PF1_DEMAND_SPLIT_REFUSED` are counted as zero in every witness cell, which is a measurement
+   that the witnessed paths take no refusal — not a measurement of what a refusal does.
+
+That is weaker evidence than the committed paths have, and it is recorded as weaker. What it is
+not is unbounded: a refusal that mutated something would have to pass a guard that reads the
+transaction body, and the one thing every refusal must do — leave the fault exactly as the broad
+arm would find it — is the property the route's structure enforces rather than the test.
+
+### §2e measured
+
+| port | read scenario | fetch scenario | decoder arm exercised |
+|---|---|---|---|
+| x86_64 | 19/19, `access=Read rip=0x407523` | 19/19, `access=Execute rip=0x0` | `#PF` error-code bit 4 |
+| AArch64 | 18/18, `access=Read` | 20/20, `access=Execute rip=0x0` | `ESR_EC_IABT_LOW` |
+| RISC-V | 19/19, `access=Read` | 19/19, `access=Execute rip=0x0` | cause 12 |
+
+Both scenarios settle split on every port, with zero broad arrivals, and the replacement task
+progresses in every case.
+
+### The first attempt measured as a data fault, and that is the useful part
+
+Written in Rust, the fetch scenario was a call through a null function pointer. It produced
+`PAGE_FAULT_ENTRY tid=1 addr=0x0 access=Read rip=0x407560` — a **data** fault, at an address in
+init's own text. The kernel's decoder was right and the test was wrong: calling a null function
+pointer is undefined behaviour, so LLVM is entitled to fold it into anything, and it folded it
+into a load from address 0.
+
+Had the assertion been "a terminal fault occurred", that run would have passed and the
+instruction-abort arms would have stayed unwitnessed while a document claimed otherwise. It
+failed because the assertion named the access — `access=Execute` — and the access is what the
+scenario exists to produce. An indirect branch through a zeroed register (`jmp rax`, `br x16`,
+`jr t0`) cannot be folded that way: `rip=0x0` in all three logs is the CPU confirming it fetched
+at address 0.

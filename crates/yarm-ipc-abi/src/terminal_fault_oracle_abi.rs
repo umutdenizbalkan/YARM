@@ -49,17 +49,46 @@
 pub enum TerminalFaultScenario {
     /// One deliberate unhandled read at address 0, taken by init before the SpawnV5 chain.
     DeliberateUnhandledRead,
+    /// U9-PAGEFAULT1 §2 — one deliberate unhandled INSTRUCTION FETCH from address 0.
+    ///
+    /// A different scenario, not a variation on the read, because it exercises a different half
+    /// of every architecture's fault decoder. A read at an unmapped address is a data abort; a
+    /// call to one is an instruction abort, decoded from a different exception class on each
+    /// port — x86_64 `#PF` with the instruction-fetch error bit, AArch64 `ESR_EC_IABT_LOW`,
+    /// RISC-V exception cause 12. §2c added the RISC-V arm and nothing exercised it.
+    ///
+    /// It also reaches the terminal class by a different route: `FaultAccess::Execute` is
+    /// refused outright by the demand screen (a demand page is mapped `USER_RW`, never
+    /// executable), so a fetch fault is terminal by construction rather than by elimination.
+    DeliberateUnhandledFetch,
 }
 
-/// AArch64's slot-5 terminal-fault selector. Distinct from every value in the reserved
+/// The slot-5 terminal-fault selector. Distinct from every value in the reserved
 /// `ExitCurrentTask` block (20/21/22) and from the `1..=9` range the earlier oracles use.
-pub const AARCH64_TERMINAL_FAULT_SELECTOR: usize = 23;
+///
+/// U9-PAGEFAULT1 §2: this is now ONE selector for all three ports, not AArch64's. The scenario
+/// it encodes — a deliberate unhandled user read at address 0 — is architecture-neutral in
+/// substance: nothing about it depends on the ISA, only on there being a user task and an
+/// unmapped address 0. The `ExitCurrentTask` block needs three values because each port reaches
+/// its exit through different arch code; this one does not, so a second and third value would be
+/// two more literals to keep in step for no gain.
+pub const TERMINAL_FAULT_SELECTOR: usize = 23;
+
+/// The name this selector had while only AArch64 used it. Kept so the AArch64 witness's
+/// references still resolve; it is the same value and the same scenario.
+pub const AARCH64_TERMINAL_FAULT_SELECTOR: usize = TERMINAL_FAULT_SELECTOR;
+
+/// U9-PAGEFAULT1 §2 — the instruction-fetch scenario's selector. The next free value after the
+/// read scenario's, and still clear of the reserved `ExitCurrentTask` block and the `1..=9`
+/// range.
+pub const TERMINAL_FAULT_FETCH_SELECTOR: usize = 24;
 
 /// The selector to write into init's startup slot 5 for `scenario`.
 #[must_use]
 pub const fn terminal_fault_selector(scenario: TerminalFaultScenario) -> usize {
     match scenario {
-        TerminalFaultScenario::DeliberateUnhandledRead => AARCH64_TERMINAL_FAULT_SELECTOR,
+        TerminalFaultScenario::DeliberateUnhandledRead => TERMINAL_FAULT_SELECTOR,
+        TerminalFaultScenario::DeliberateUnhandledFetch => TERMINAL_FAULT_FETCH_SELECTOR,
     }
 }
 
@@ -67,8 +96,10 @@ pub const fn terminal_fault_selector(scenario: TerminalFaultScenario) -> usize {
 /// value belongs to some other oracle.
 #[must_use]
 pub const fn terminal_fault_scenario_for(slot5: usize) -> Option<TerminalFaultScenario> {
-    if slot5 == AARCH64_TERMINAL_FAULT_SELECTOR {
+    if slot5 == TERMINAL_FAULT_SELECTOR {
         Some(TerminalFaultScenario::DeliberateUnhandledRead)
+    } else if slot5 == TERMINAL_FAULT_FETCH_SELECTOR {
+        Some(TerminalFaultScenario::DeliberateUnhandledFetch)
     } else {
         None
     }
@@ -82,10 +113,20 @@ mod tests {
     /// Stage 200D-0C1 both claim 21.
     #[test]
     fn encode_decode_round_trips() {
-        let s = TerminalFaultScenario::DeliberateUnhandledRead;
-        assert_eq!(
-            terminal_fault_scenario_for(terminal_fault_selector(s)),
-            Some(s)
+        for s in [
+            TerminalFaultScenario::DeliberateUnhandledRead,
+            TerminalFaultScenario::DeliberateUnhandledFetch,
+        ] {
+            assert_eq!(
+                terminal_fault_scenario_for(terminal_fault_selector(s)),
+                Some(s)
+            );
+        }
+        // And the two scenarios are distinguishable, which is the property a second bare
+        // literal would not have given.
+        assert_ne!(
+            terminal_fault_selector(TerminalFaultScenario::DeliberateUnhandledRead),
+            terminal_fault_selector(TerminalFaultScenario::DeliberateUnhandledFetch)
         );
     }
 
@@ -99,6 +140,11 @@ mod tests {
             exit::AARCH64_EXIT_SELECTOR,
             exit::RISCV64_EXIT_SELECTOR,
         ] {
+            assert_ne!(
+                TERMINAL_FAULT_FETCH_SELECTOR, taken,
+                "the fetch scenario's selector may not share a value with a reserved \
+                 ExitCurrentTask selector either"
+            );
             assert_ne!(
                 AARCH64_TERMINAL_FAULT_SELECTOR, taken,
                 "slot 5 is mutually exclusive; the terminal-fault oracle may not share a value \

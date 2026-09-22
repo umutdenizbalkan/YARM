@@ -302,9 +302,22 @@ fn try_split_terminal_page_fault_into_frame(
     };
     use SplitDispatchDisposition as D;
 
-    if !cfg!(target_arch = "aarch64") {
+    // U9-PAGEFAULT1 §2 — all three ports, each on a witness of its own.
+    //
+    // The architecture is a derived string rather than a `cfg!` test, exactly as the COW and
+    // demand routes derive theirs, so the routing matrix row is the ONLY thing that admits a
+    // port. Opening the gate is not what admitted x86_64 and RISC-V: their rows were added after
+    // the terminal-fault oracle produced a fault on each and the baseline was measured going
+    // broad.
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "riscv64") {
+        "riscv64"
+    } else {
         return D::NotHandled;
-    }
+    };
     let (Some(fault), Some(frame)) = (fault, frame) else {
         return D::NotHandled;
     };
@@ -317,7 +330,7 @@ fn try_split_terminal_page_fault_into_frame(
         return D::NotHandled;
     };
     if !matches!(
-        page_fault_route_for("aarch64", class),
+        page_fault_route_for(arch, class),
         PageFaultRoute::SplitTerminal
     ) {
         return D::NotHandled;
@@ -687,12 +700,18 @@ fn try_split_cow_page_fault_into_frame(
     use crate::kernel::trap::FaultAccess;
     use SplitDispatchDisposition as D;
 
-    // U9-A64-COW2 §4: x86_64 and AArch64. RISC-V is deliberately absent — it has no independent
-    // COW witness of its own, and §3 admits a class only on one.
+    // U9-A64-COW2 §4 admitted x86_64 and AArch64 and left RISC-V out, because RISC-V had no COW
+    // witness of its own and §3 admits a class only on one.
+    //
+    // U9-PAGEFAULT1 §2: the architecture is derived here, as it is in the other two routes, so
+    // the routing matrix row remains the ONLY thing that admits a port. Deriving a third name
+    // does not admit RISC-V — its row does, and its row rests on a measured baseline.
     let arch = if cfg!(target_arch = "x86_64") {
         "x86_64"
     } else if cfg!(target_arch = "aarch64") {
         "aarch64"
+    } else if cfg!(target_arch = "riscv64") {
+        "riscv64"
     } else {
         return D::NotHandled;
     };

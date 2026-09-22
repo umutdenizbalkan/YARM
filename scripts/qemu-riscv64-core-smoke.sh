@@ -58,7 +58,23 @@ fi
 # drain-ordering proof (publish token in the bounded broad-lock phase, consume
 # it after the guard drops via a real with_cpu re-acquire, return to the same
 # task through sret). It enables no retirement class and does not alter boot.
+TERMINAL_FAULT_ORACLE=${TERMINAL_FAULT_ORACLE:-0}
+TERMINAL_FAULT_FETCH_ORACLE=${TERMINAL_FAULT_FETCH_ORACLE:-0}
 POST_LOCK_FOUNDATION_ORACLE=${POST_LOCK_FOUNDATION_ORACLE:-0}
+# U9-PAGEFAULT1 §2: the RISC-V terminal-fault witness cell, default-off.
+# U9-PAGEFAULT1 §2: the INSTRUCTION-FETCH variant of the same cell. It exercises the
+# instruction-abort decode rather than the data-abort decode, and reaches the terminal class by
+# construction (the demand screen refuses Execute outright) rather than by elimination.
+if [[ "$TERMINAL_FAULT_FETCH_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_fetch_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.terminal_fault_fetch_oracle=1"
+  TERMINAL_FAULT_ORACLE=1
+fi
+# Slot 5 carries exactly ONE scenario and the kernel writes the read selector first, so the two
+# knobs are mutually exclusive here too.
+if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$TERMINAL_FAULT_FETCH_ORACLE" != "1" \
+      && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.terminal_fault_oracle=1"
+fi
 if [[ "$POST_LOCK_FOUNDATION_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_post_lock_foundation_oracle="* ]]; then
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_post_lock_foundation_oracle=1"
 fi
@@ -429,6 +445,8 @@ REJECT_PATTERNS=(
   '\bPANIC\b'
   '\bFATAL\b'
   '\bASSERT\b'
+  # U9-PAGEFAULT1 §2: removed from the reject list ONLY in the terminal-fault cell, below,
+  # where exactly one is the point. Everywhere else it stays fatal.
   'PAGE_FAULT_UNHANDLED'
   'TRAP_HANDLE failed'
   'Vm\(Full\)'
@@ -507,12 +525,23 @@ REJECT_PATTERNS=(
 
 failures=0
 
+# U9-PAGEFAULT1 §2: REQUIRED_PATTERNS describes a boot in which init survives to drive the
+# SpawnV5 service chain. The terminal-fault cell is a boot in which init DELIBERATELY does not:
+# it takes one unhandled read at address 0 so the terminal PageFault route has a trigger of its
+# own. Asserting the service chain there would be asserting that the deliberate fault did not
+# happen. The cell replaces these with its own POSITIVE chain — every marker of the fault, the
+# report, the transition, the drain and the replacement task, each exactly once — which is
+# strictly stronger for what this cell exists to prove.
+if [[ "$TERMINAL_FAULT_ORACLE" == "1" ]]; then
+  echo "[info] U9-PF1-TERM: service-chain required markers are not asserted in the terminal-fault cell (init faults by design); the cell's own positive chain replaces them"
+else
 for pat in "${REQUIRED_PATTERNS[@]}"; do
   if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] required marker missing: $pat"
     failures=$((failures + 1))
   fi
 done
+fi
 
 for pat in "${OPTIONAL_FS_PATTERNS[@]}"; do
   if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
@@ -563,6 +592,12 @@ if (( missing_dtb_count > 1 )); then
 fi
 
 for pat in "${REJECT_PATTERNS[@]}"; do
+  # U9-PAGEFAULT1 §2: in the terminal-fault cell the unhandled fault is the SUBJECT, not a
+  # defect. The cell asserts it appears EXACTLY once, with the exact tid, address and access —
+  # which a blanket reject cannot express and a relaxed reject would not check at all.
+  if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$pat" == 'PAGE_FAULT_UNHANDLED' ]]; then
+    continue
+  fi
   if rg -n "$pat" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] rejected pattern present: $pat"
     failures=$((failures + 1))
@@ -791,11 +826,19 @@ if (( riscv_split_nr29 != riscv_split_nr29_ok )); then
 fi
 # And the counts are the boot's own spawn census: three NR 23 and five NR 29, matching
 # KSPAWN_ENTER and SPAWN_FROM_MO_OK. A route that silently stopped firing would show here.
-if (( riscv_split_nr23 != 3 )); then
+#
+# U9-PAGEFAULT1 §2: this census counts spawns INIT performs. In the terminal-fault cell init
+# faults before the SpawnV5 chain by design, so the census is zero and asserting three and five
+# would be asserting that the deliberate fault did not happen. The equality checks above still
+# run — a switching disposition would still be caught — and the cell's own chain covers what
+# this boot is for.
+if [[ "$TERMINAL_FAULT_ORACLE" == "1" ]]; then
+  echo "[info] U9-PF1-TERM: the spawn census is not asserted in the terminal-fault cell (init faults before the SpawnV5 chain by design)"
+elif (( riscv_split_nr23 != 3 )); then
   echo "[fail] RISC-V SpawnProcess split count is ${riscv_split_nr23}, expected 3"
   failures=$((failures + 1))
 fi
-if (( riscv_split_nr29 != 5 )); then
+if [[ "$TERMINAL_FAULT_ORACLE" != "1" ]] && (( riscv_split_nr29 != 5 )); then
   echo "[fail] RISC-V SpawnFromMemoryObject split count is ${riscv_split_nr29}, expected 5"
   failures=$((failures + 1))
 fi
@@ -1100,6 +1143,99 @@ if [[ "$YIELD_LONE_TASK_ORACLE" == "1" ]]; then
     echo "[fail] yield lone-task oracle reported a Yield-transition failure"
     failures=$((failures + 1))
   fi
+fi
+
+# U9-PAGEFAULT1 §2: the RISC-V terminal PageFault route, asserted POSITIVELY in its own cell.
+#
+# Same trigger, same selector and same knob as the AArch64 and x86_64 cells: one deliberate
+# unhandled read at address 0, taken by init before the service chain. The BASELINE was measured
+# before the routing row was added — one fault per boot, reaching the broad dispatcher — so the
+# row rests on a fault this port actually produces, not on the other two ports' evidence.
+if [[ "$TERMINAL_FAULT_ORACLE" != "1" ]]; then
+  echo "[info] U9-PF1-TERM: not armed (set TERMINAL_FAULT_ORACLE=1) -- the RISC-V terminal-fault witness runs in its own cell"
+else
+pf1t_fail=0
+# U9-PAGEFAULT1 §2: one cell, two scenarios. The chain is identical apart from the access the
+# CPU reports and which decoder produced it, so the assertions are parameterised rather than
+# duplicated -- a second copy would drift.
+if [[ "$TERMINAL_FAULT_FETCH_ORACLE" == "1" ]]; then
+  pf1t_access=Execute
+  pf1t_user_access=fetch
+  pf1t_provision=TERMINAL_FAULT_FETCH_ORACLE_PROVISION_OK
+  pf1t_slot5=24
+else
+  pf1t_access=Read
+  pf1t_user_access=read
+  pf1t_provision=TERMINAL_FAULT_ORACLE_PROVISION_OK
+  pf1t_slot5=23
+fi
+pf1t_log="$(tr '\r' '\n' <"$LOGFILE")"
+pf1t_count() {
+  local n
+  n="$(printf '%s\n' "$pf1t_log" | rg -a -F -c -- "$1" || true)"
+  printf '%s' "${n:-0}"
+}
+pf1t_require_one() {
+  local want_desc="$1" pat="$2" n
+  n="$(pf1t_count "$pat")"
+  if [[ "$n" != "1" ]]; then
+    echo "[error] U9-PF1-TERM: $want_desc -- expected exactly 1, got ${n:-0}: $pat"
+    pf1t_fail=1
+  else
+    echo "[ok] U9-PF1-TERM: $want_desc"
+  fi
+}
+pf1t_require_zero() {
+  local want_desc="$1" pat="$2" n
+  n="$(pf1t_count "$pat")"
+  if [[ "$n" != "0" ]]; then
+    echo "[error] U9-PF1-TERM: $want_desc -- expected 0, got $n: $pat"
+    pf1t_fail=1
+  else
+    echo "[ok] U9-PF1-TERM: $want_desc"
+  fi
+}
+pf1t_require_one "the RISC-V terminal-fault oracle is provisioned once" \
+  "${pf1t_provision} arch=riscv64 slot5=${pf1t_slot5} caps=none result=ok"
+pf1t_require_one "init takes exactly one deliberate ${pf1t_user_access} at 0x0" \
+  "TERMINAL_FAULT_ORACLE_BEGIN arch=riscv64 init_tid=1 addr=0x0 access=${pf1t_user_access}"
+pf1t_require_zero "the deliberate ${pf1t_user_access} never returns" 'TERMINAL_FAULT_ORACLE_UNREACHABLE'
+pf1t_require_one "tid 1 ${pf1t_access} fault at 0x0 entered once" \
+  "PAGE_FAULT_ENTRY tid=1 addr=0x0 access=${pf1t_access}"
+pf1t_require_one "the fault is reported unhandled exactly once" \
+  "PAGE_FAULT_UNHANDLED tid=1 addr=0x0 access=${pf1t_access}"
+pf1t_require_one "report targets endpoint 3 at its exact generation" \
+  'TASK_FAULT_REPORT_TARGET tid=1 endpoint=3 generation=1'
+pf1t_require_one "report is BUFFERED exactly once with woke=0" \
+  'TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=3 queued=1 woke=0'
+pf1t_require_one "terminal task transition commits exactly once" \
+  'TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred'
+pf1t_require_one "the queue-advance deferral is published exactly once" \
+  'QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid=1 cpu=0'
+# THE MEASUREMENT: settled without the broad dispatcher, asserted both ways.
+pf1t_require_one "broad dispatcher skipped for the terminal fault" \
+  'QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=terminal_fault_committed'
+pf1t_require_zero "the fault never reaches the broad dispatcher" \
+  "PF1_BROAD_ARRIVAL cpu=0 tid=1 addr=0x0 access=${pf1t_access}"
+# ANOTHER TASK PROGRESSES: the existing RISC-V drain selects tid 2 and restores its exact frame.
+pf1t_require_one "queue selection happens once and chooses tid 2" \
+  'RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu=0 incoming=2'
+pf1t_require_one "replacement tid 2 is marked Running" \
+  'RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming=2'
+pf1t_require_one "replacement tid 2 gets its exact frame" \
+  'RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming=2'
+pf1t_require_one "the drain completes once" 'RISCV_FUTEX_WAIT_DISPATCH_DONE result=ok'
+pf1t_require_zero "the faulting PC never resumes (no ownerless re-fault)" \
+  'PAGE_FAULT_ENTRY tid=18446744073709551615'
+pf1t_require_zero "no split refusal on the witnessed path" 'TERMINAL_FAULT_SPLIT_REFUSED'
+pf1t_require_zero "no fail-closed settlement on the witnessed path" \
+  'TERMINAL_FAULT_SPLIT_FAILED_CLOSED'
+pf1t_require_zero "no unattributable fault on the witnessed path" 'PF1_UNATTRIBUTABLE_FAULT'
+if [[ "$pf1t_fail" -eq 1 ]]; then
+  echo "[error] U9-PAGEFAULT1 RISC-V terminal-fault witness FAILED"
+  exit 1
+fi
+echo "[ok] U9-PF1-TERM: RISC-V terminal PageFault route witness chain complete"
 fi
 
 if (( failures > 0 )); then

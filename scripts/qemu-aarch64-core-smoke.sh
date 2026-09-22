@@ -131,7 +131,15 @@ YIELD_LONE_ORACLE=${YIELD_LONE_ORACLE:-0}
 # AArch64 profile produced. The default cell now boots its service chain clean; U9-FT4 asserts,
 # unchanged and still fully positive, only in this cell.
 TERMINAL_FAULT_ORACLE=${TERMINAL_FAULT_ORACLE:-0}
-if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_terminal_fault_oracle="* ]]; then
+# U9-PAGEFAULT1 §2: the INSTRUCTION-FETCH variant. The existing witness is a data abort
+# (`ESR_EC_DABT_LOW`); this one is an instruction abort (`ESR_EC_IABT_LOW`), so it exercises the
+# other half of the AArch64 fault decoder. It also reaches the terminal class by construction
+# rather than by elimination: the demand screen refuses `FaultAccess::Execute` outright.
+TERMINAL_FAULT_FETCH_ORACLE=${TERMINAL_FAULT_FETCH_ORACLE:-0}
+if [[ "$TERMINAL_FAULT_FETCH_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_fetch_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.terminal_fault_fetch_oracle=1"
+  TERMINAL_FAULT_ORACLE=1
+elif [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_terminal_fault_oracle="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.aarch64_terminal_fault_oracle=1"
 fi
 if [[ "$YIELD_LONE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_yield_lone_oracle="* ]]; then
@@ -313,6 +321,15 @@ if [[ "$TERMINAL_FAULT_ORACLE" != "1" ]]; then
   echo "[info] U9-FT4: not armed (set TERMINAL_FAULT_ORACLE=1) — the terminal-fault witness runs in its own cell"
 else
 u9ft4_fail=0
+# U9-PAGEFAULT1 §2: one cell, two scenarios — the chain differs only in the access the CPU
+# reports and which decoder produced it, so the assertions are parameterised rather than copied.
+if [[ "$TERMINAL_FAULT_FETCH_ORACLE" == "1" ]]; then
+  u9ft4_access=Execute
+  u9ft4_user_access=fetch
+else
+  u9ft4_access=Read
+  u9ft4_user_access=read
+fi
 u9ft4_log="$(tr '\r' '\n' <"$LOGFILE")"
 # `rg -c` prints nothing and exits non-zero when there are no matches, so normalise to 0.
 u9ft4_count() {
@@ -341,10 +358,16 @@ u9ft4_require_zero() {
   fi
 }
 # The faulting task, the exact fault facts, and exactly one of each.
-u9ft4_require_one "tid 1 read fault at 0x0 entered once" \
-  'PAGE_FAULT_ENTRY tid=1 addr=0x0 access=Read'
+u9ft4_require_one "tid 1 ${u9ft4_user_access} fault at 0x0 entered once" \
+  "PAGE_FAULT_ENTRY tid=1 addr=0x0 access=${u9ft4_access}"
 u9ft4_require_one "the fault is reported unhandled exactly once" \
-  'PAGE_FAULT_UNHANDLED tid=1 addr=0x0 access=Read'
+  "PAGE_FAULT_UNHANDLED tid=1 addr=0x0 access=${u9ft4_access}"
+# U9-PAGEFAULT1 §2: and the fault never reaches the broad dispatcher. The broad-entry counter
+# prints only in the broad arm, so this is the positive measurement, not an absence proof.
+u9ft4_require_zero "the fault never reaches the broad dispatcher" \
+  "PF1_BROAD_ARRIVAL cpu=0 tid=1 addr=0x0 access=${u9ft4_access}"
+u9ft4_require_one "the oracle names its own scenario once" \
+  "TERMINAL_FAULT_ORACLE_BEGIN arch=aarch64 init_tid=1 addr=0x0 access=${u9ft4_user_access}"
 # Buffered publication to endpoint 3, no wake.
 u9ft4_require_one "report targets endpoint 3 at its exact generation" \
   'TASK_FAULT_REPORT_TARGET tid=1 endpoint=3 generation=1'

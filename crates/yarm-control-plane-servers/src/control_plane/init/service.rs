@@ -826,22 +826,31 @@ fn dispatch_aarch64_unlocking_oracle_early(ctx: &yarm_user_rt::runtime::StartupC
     if ctx.supervisor_control_recv_ep == Some(7) {
         run_aarch64_ipccall_direct_oracle(ctx.task_id);
     }
-    // 199E-A64CALL: the TERMINAL-FAULT oracle. It runs HERE, before the SpawnV5 service chain,
-    // which is where init used to fault by accident — so the replacement the queue advance
-    // selects is still the supervisor (tid 2), exactly as U9-FT4 asserts.
-    //
-    // A64-DEPTH: this arm used to compare a bare literal `Some(21)`, and Stage 200D-0C1 assigned
-    // 21 to the AArch64 `ExitCurrentTask` oracle. Slot 5 is mutually exclusive, so the two
-    // scenarios became indistinguishable to init; this arm is checked first and diverges, so the
-    // exit oracle was unreachable from the day it landed. The selector now comes from the single
-    // shared owner, which also asserts it cannot collide with the reserved exit block.
-    if ctx
+    // U9-PAGEFAULT1 §2: the TERMINAL-FAULT arm moved OUT of this AArch64-only dispatcher into
+    // `dispatch_terminal_fault_oracle_early`, which all three ports call. The scenario never
+    // needed an architecture — see that function.
+}
+
+/// U9-PAGEFAULT1 §2 — the TERMINAL-FAULT oracle, on every port.
+///
+/// It runs HERE, before the SpawnV5 service chain, which is where init used to fault by accident
+/// on AArch64 — so the replacement the queue advance selects is still the supervisor (tid 2),
+/// exactly as the witness asserts. The same position is the right one on the other two ports for
+/// the same reason: nothing else has been spawned yet, so the replacement is deterministic.
+///
+/// A64-DEPTH: this arm used to compare a bare literal `Some(21)`, and Stage 200D-0C1 assigned 21
+/// to the AArch64 `ExitCurrentTask` oracle. Slot 5 is mutually exclusive, so the two scenarios
+/// became indistinguishable to init; this arm is checked first and diverges, so the exit oracle
+/// was unreachable from the day it landed. The selector comes from the single shared owner, which
+/// also asserts it cannot collide with the reserved exit block.
+#[cfg(not(feature = "hosted-dev"))]
+fn dispatch_terminal_fault_oracle_early(ctx: &yarm_user_rt::runtime::StartupContext) {
+    if let Some(scenario) = ctx
         .supervisor_control_recv_ep
         .map(|v| v as usize)
         .and_then(yarm_ipc_abi::terminal_fault_oracle_abi::terminal_fault_scenario_for)
-        .is_some()
     {
-        run_aarch64_terminal_fault_oracle(ctx.task_id);
+        run_terminal_fault_oracle(ctx.task_id, scenario);
     }
 }
 
@@ -860,19 +869,86 @@ fn dispatch_aarch64_unlocking_oracle_early(ctx: &yarm_user_rt::runtime::StartupC
 /// This never returns: the read is unhandled by construction, so the kernel takes the task down
 /// and hands the CPU to the replacement. That is the point — the marker chain U9-FT4 greps for
 /// is emitted by the kernel, not by init.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-fn run_aarch64_terminal_fault_oracle(init_tid: u64) -> ! {
+#[cfg(not(feature = "hosted-dev"))]
+fn run_terminal_fault_oracle(
+    init_tid: u64,
+    scenario: yarm_ipc_abi::terminal_fault_oracle_abi::TerminalFaultScenario,
+) -> ! {
+    use yarm_ipc_abi::terminal_fault_oracle_abi::TerminalFaultScenario as S;
+    // U9-PAGEFAULT1 §2: the marker keeps its original spelling on AArch64 so the U9-FT4 cell's
+    // greps are untouched, and carries the architecture so the x86_64 and RISC-V cells can
+    // assert their own trigger fired rather than inferring it from the kernel's side of the
+    // chain.
+    const ARCH: &str = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "riscv64"
+    };
+    let access = match scenario {
+        S::DeliberateUnhandledRead => "read",
+        S::DeliberateUnhandledFetch => "fetch",
+    };
     yarm_user_rt::user_log!(
-        "AARCH64_TERMINAL_FAULT_ORACLE_BEGIN init_tid={} addr=0x0 access=read",
-        init_tid
+        "TERMINAL_FAULT_ORACLE_BEGIN arch={} init_tid={} addr=0x0 access={}",
+        ARCH,
+        init_tid,
+        access
     );
+    #[cfg(target_arch = "aarch64")]
+    if matches!(scenario, S::DeliberateUnhandledRead) {
+        yarm_user_rt::user_log!(
+            "AARCH64_TERMINAL_FAULT_ORACLE_BEGIN init_tid={} addr=0x0 access=read",
+            init_tid
+        );
+    }
+    // U9-PAGEFAULT1 §2 — the INSTRUCTION-FETCH scenario.
+    //
+    // A call through a null function pointer. It is a different fault from the read below in
+    // every way that matters here: the CPU reports it through its instruction-abort decode
+    // rather than its data-abort decode, and it arrives at the terminal class BY CONSTRUCTION
+    // rather than by elimination — `FaultAccess::Execute` is refused outright by the demand
+    // screen, because a demand page is mapped `USER_RW` and never executable.
+    if matches!(scenario, S::DeliberateUnhandledFetch) {
+        // It has to be ASSEMBLY, and the first attempt at this is worth recording because it
+        // measured as a data fault. Written in Rust as a call through a null function pointer,
+        // the fault arrived as `access=Read` at `rip=0x407560` — the kernel's decoder was
+        // right and the code was wrong. Calling a null function pointer is undefined
+        // behaviour, so LLVM is entitled to fold it into anything, and it folded it into a
+        // LOAD from address 0. That is a data abort: the exact fault this scenario exists to
+        // NOT be.
+        //
+        // An indirect branch through a zeroed register cannot be folded that way. The CPU
+        // fetches at address 0, which is never mapped in a user address space, and reports a
+        // translation fault on the FETCH — x86_64 `#PF` with error-code bit 4 set, AArch64
+        // `ESR_EC_IABT_LOW`, RISC-V cause 12.
+        //
+        // SAFETY: this branch is INTENDED to fault and never returns. `noreturn` is accurate:
+        // the kernel takes the task down rather than resuming it.
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: see above — an intentional fetch fault at address 0, `noreturn`.
+        unsafe {
+            core::arch::asm!("xor rax, rax", "jmp rax", options(noreturn))
+        };
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: see above — an intentional fetch fault at address 0, `noreturn`.
+        unsafe {
+            core::arch::asm!("mov x16, xzr", "br x16", options(noreturn))
+        };
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: see above — an intentional fetch fault at address 0, `noreturn`.
+        unsafe {
+            core::arch::asm!("li t0, 0", "jr t0", options(noreturn))
+        };
+    }
     // SAFETY: this read is INTENDED to fault. Address 0 is never mapped in a user address space,
     // so the access raises a translation fault the kernel reports unhandled and turns into a
     // terminal task transition. `read_volatile` keeps the access from being optimized away.
     let observed = unsafe { core::ptr::read_volatile(core::ptr::null::<u8>()) };
     // Not reached. Kept so the read cannot be treated as dead and elided.
     yarm_user_rt::user_log!(
-        "AARCH64_TERMINAL_FAULT_ORACLE_UNREACHABLE init_tid={} observed={}",
+        "TERMINAL_FAULT_ORACLE_UNREACHABLE init_tid={} observed={}",
         init_tid,
         observed
     );
@@ -5820,6 +5896,12 @@ pub fn run() {
     // With slot 5 unset this is a no-op and the ordinary service chain runs unchanged.
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     dispatch_aarch64_unlocking_oracle_early(&ctx);
+
+    // U9-PAGEFAULT1 §2: the terminal-fault oracle is dispatched on ALL THREE ports, from the
+    // same position and for the same reason as the AArch64 oracles above. With slot 5 unset this
+    // is a no-op and the ordinary service chain runs unchanged.
+    #[cfg(not(feature = "hosted-dev"))]
+    dispatch_terminal_fault_oracle_early(&ctx);
 
     // U9-COW2: the COW witness runs HERE, for exactly the reason the AArch64 oracles above
     // moved here. The sender-wake proof workload — the only shipped code that calls Fork

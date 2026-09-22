@@ -8071,6 +8071,18 @@ pub fn bootstrap_first_user_task(
             "AARCH64_TERMINAL_FAULT_ORACLE_PROVISION_OK slot5={}",
             init_args[5]
         );
+        crate::yarm_log!(
+            "TERMINAL_FAULT_ORACLE_PROVISION_OK arch=aarch64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
+    }
+    // U9-PAGEFAULT1 §2: the INSTRUCTION-FETCH scenario, same guard, same mutual exclusion.
+    if init_args[5] == 0 && crate::kernel::boot::terminal_fault_fetch_oracle_enabled() {
+        init_args[5] = crate::kernel::boot::TERMINAL_FAULT_FETCH_ORACLE_SELECTOR;
+        crate::yarm_log!(
+            "TERMINAL_FAULT_FETCH_ORACLE_PROVISION_OK arch=aarch64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
     }
     // Stage 200D-0C1: the AArch64 ExitCurrentTask live-oracle slot-5 write. This IS the
     // production activation — without it the feature and the knob arm nothing and init never

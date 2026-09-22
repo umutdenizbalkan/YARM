@@ -148784,18 +148784,21 @@ mod u9pf_classification {
             for class in classes {
                 let got = page_fault_route_for(arch, class);
                 let want = match (arch, class) {
-                    ("x86_64", CowCandidate) => SplitCow,
                     // U9-A64-COW2 §4: admitted on a witness earned in that increment — six
                     // private-copy COW faults per boot with parent AND child completing the
                     // userspace isolation check. Before it, AArch64's post-Fork COW workload
                     // died at the first recovered fault for a reason outside COW entirely.
-                    ("aarch64", CowCandidate) => SplitCow,
-                    ("aarch64", TerminallyUnhandled) => SplitTerminal,
+                    // U9-PAGEFAULT1 §2: every port earned this row, each on a baseline
+                    // measured with its own row absent — x86_64's and RISC-V's terminal faults
+                    // reached the broad dispatcher before the rows were added, and RISC-V's six
+                    // COW faults did too.
+                    (_, CowCandidate) => SplitCow,
+                    (_, TerminallyUnhandled) => SplitTerminal,
                     // U9-PAGEFAULT1 §3 — a USER access to a kernel address is an ordinary user
                     // fault, and its broad settlement is byte-for-byte the terminal one. It
                     // routes to the same owner on the port that has one; it is NOT a kernel
                     // fault and must never be settled as one.
-                    ("aarch64", UserKernelAddress) => SplitTerminal,
+                    (_, UserKernelAddress) => SplitTerminal,
                     // U9-PAGEFAULT1 §2c/§3: admitted on a witness earned in that increment, on
                     // ALL THREE ports. `VmBrk` growth leaves the pages lazy, so touching inside
                     // the grown window is a demand fault by construction; the witness measured
@@ -148842,33 +148845,50 @@ mod u9pf_classification {
         );
     }
 
-    /// The two split routes are claimed for exactly ONE architecture each, never widened to an
-    /// architecture whose witness does not exist.
+    /// No split route is claimed for an architecture whose witness does not exist.
+    ///
+    /// The rule this encodes has never been "never widen" — it is "no route without a witness",
+    /// and each increment that widened a row earned one first. U9-A64-COW2 §4 earned AArch64's
+    /// COW row. U9-PAGEFAULT1 §2c earned the demand row on all three ports. U9-PAGEFAULT1 §2
+    /// earned the terminal row on x86_64 and RISC-V, and RISC-V's COW row, each by measuring the
+    /// port's BASELINE with the row absent before adding it.
+    ///
+    /// So this case is now the POSITIVE claim: every row that exists is named here, so a row
+    /// cannot be silently dropped either — which is the failure the negative form could not see.
     #[test]
     fn neither_split_route_is_claimed_beyond_its_witness() {
-        // U9-A64-COW2 §4 moved AArch64's COW class out of this list — it now HAS a witness, and
-        // the rule the list encodes is "no route without one", not "never widen". The positive
-        // claim is asserted here so the row cannot be silently dropped either.
-        assert_eq!(
-            page_fault_route_for("aarch64", PageFaultClass::CowCandidate),
-            PageFaultRoute::SplitCow,
-            "AArch64's COW witness was earned in U9-A64-COW2 and must keep its route"
-        );
-        assert_eq!(
-            page_fault_route_for("riscv64", PageFaultClass::CowCandidate),
-            PageFaultRoute::Broad,
-            "RISC-V has no COW witness"
-        );
-        assert_eq!(
-            page_fault_route_for("x86_64", PageFaultClass::TerminallyUnhandled),
-            PageFaultRoute::Broad,
-            "x86_64 has no terminal PageFault witness"
-        );
-        assert_eq!(
-            page_fault_route_for("riscv64", PageFaultClass::TerminallyUnhandled),
-            PageFaultRoute::Broad,
-            "RISC-V has no terminal PageFault witness"
-        );
+        // COW — x86_64 and AArch64 at base, RISC-V since §2 (six faults per boot, two forks,
+        // both userspace isolation checks passing).
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert_eq!(
+                page_fault_route_for(arch, PageFaultClass::CowCandidate),
+                PageFaultRoute::SplitCow,
+                "{arch}'s COW witness was earned and its row must keep its route"
+            );
+        }
+        // Terminal — AArch64 at base, x86_64 and RISC-V since §2 (one deliberate unhandled read
+        // at address 0 per boot, measured going broad before the row was added).
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert_eq!(
+                page_fault_route_for(arch, PageFaultClass::TerminallyUnhandled),
+                PageFaultRoute::SplitTerminal,
+                "{arch}'s terminal witness was earned and its row must keep its route"
+            );
+        }
+        // An architecture with no port at all still has no row, which is what keeps the matrix a
+        // matrix rather than a default.
+        for class in [
+            PageFaultClass::CowCandidate,
+            PageFaultClass::DemandCandidate,
+            PageFaultClass::TerminallyUnhandled,
+            PageFaultClass::UserKernelAddress,
+        ] {
+            assert_eq!(
+                page_fault_route_for("mips64", class),
+                PageFaultRoute::Broad,
+                "an unported architecture has no witness and therefore no row"
+            );
+        }
     }
 }
 
@@ -149296,18 +149316,21 @@ mod u9ft2_one_evaluator {
                 KernelOrAbsentTask(UnattributableFault::NoAddressSpace),
             ] {
                 let want = match (arch, class) {
-                    ("x86_64", CowCandidate) => SplitCow,
                     // U9-A64-COW2 §4: admitted on a witness earned in that increment — six
                     // private-copy COW faults per boot with parent AND child completing the
                     // userspace isolation check. Before it, AArch64's post-Fork COW workload
                     // died at the first recovered fault for a reason outside COW entirely.
-                    ("aarch64", CowCandidate) => SplitCow,
-                    ("aarch64", TerminallyUnhandled) => SplitTerminal,
+                    // U9-PAGEFAULT1 §2: every port earned this row, each on a baseline
+                    // measured with its own row absent — x86_64's and RISC-V's terminal faults
+                    // reached the broad dispatcher before the rows were added, and RISC-V's six
+                    // COW faults did too.
+                    (_, CowCandidate) => SplitCow,
+                    (_, TerminallyUnhandled) => SplitTerminal,
                     // U9-PAGEFAULT1 §3 — a USER access to a kernel address is an ordinary user
                     // fault, and its broad settlement is byte-for-byte the terminal one. It
                     // routes to the same owner on the port that has one; it is NOT a kernel
                     // fault and must never be settled as one.
-                    ("aarch64", UserKernelAddress) => SplitTerminal,
+                    (_, UserKernelAddress) => SplitTerminal,
                     // U9-PAGEFAULT1 §2c/§3 — the demand class, admitted on a witness earned
                     // there and measured on all three ports before the row changed.
                     (_, DemandCandidate) => SplitDemand,
@@ -150252,9 +150275,26 @@ mod u9ft4_route {
     /// AArch64 only: no other architecture takes the split terminal route.
     #[test]
     fn the_route_is_aarch64_only() {
+        // U9-PAGEFAULT1 §2 re-derived this. The route is no longer AArch64-only — x86_64 and
+        // RISC-V each earned a witness — and the property that matters is stronger than the one
+        // this case used to pin: the architecture is DERIVED and handed to the matrix, so the
+        // ROW is the only thing that admits a port. A hard-coded `cfg!` test was the weaker
+        // shape, because it put an admission decision somewhere the matrix could not see.
         let r = route();
-        assert!(r.contains(r#"if !cfg!(target_arch = "aarch64")"#));
-        assert!(r.contains(r#"page_fault_route_for("aarch64", class)"#));
+        assert!(
+            !r.contains(r#"if !cfg!(target_arch = "aarch64")"#),
+            "the hard-coded architecture gate must be gone"
+        );
+        for port in ["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                r.contains(&alloc::format!(r#"cfg!(target_arch = "{port}")"#)),
+                "the route must derive the name for {port}"
+            );
+        }
+        assert!(
+            r.contains("page_fault_route_for(arch, class)"),
+            "and hand the DERIVED name to the matrix, never a literal"
+        );
     }
 
     /// Waiter delivery, COW and demand all stay broad: the route admits none of them.
@@ -150379,8 +150419,15 @@ mod u9ft4_route {
     /// the FT3 attempt exited 0 while the faulting PC resumed.
     #[test]
     fn the_smoke_asserts_the_chain_positively() {
+        // U9-PAGEFAULT1 §2: the access is parameterised now — one cell, two scenarios, a data
+        // abort and an instruction abort — so the literal that used to appear here is built
+        // from `${u9ft4_access}`. The property is unchanged and is checked in both halves: the
+        // pattern is still anchored on tid 1 at address 0x0, and the parameter is still set to
+        // exactly one of the two accesses the oracle can produce.
         for required in [
-            "PAGE_FAULT_ENTRY tid=1 addr=0x0 access=Read",
+            "PAGE_FAULT_ENTRY tid=1 addr=0x0 access=${u9ft4_access}",
+            "u9ft4_access=Read",
+            "u9ft4_access=Execute",
             "TASK_FAULT_REPORT_ENQUEUE_OK tid=1 endpoint=3 queued=1 woke=0",
             "TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred",
             "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid=1 cpu=0",
@@ -157332,13 +157379,23 @@ mod a64depth_writeback_and_selector {
     /// the terminal-fault oracle and the AArch64 ExitCurrentTask oracle both claim 21.
     #[test]
     fn the_slot5_selectors_have_owners_and_do_not_overlap() {
+        // U9-PAGEFAULT1 §2: the selector became port-neutral when x86_64 and RISC-V earned
+        // terminal-fault witnesses of their own. It is still ONE declared constant with ONE
+        // value — which is the property this guard exists for — and the AArch64 spelling is
+        // kept as an alias of it so nothing that referenced it had to change.
         assert!(
-            FT4_ABI.contains("pub const AARCH64_TERMINAL_FAULT_SELECTOR: usize = 23;"),
+            FT4_ABI.contains("pub const TERMINAL_FAULT_SELECTOR: usize = 23;"),
             "the terminal-fault selector has a single declared owner"
         );
         assert!(
+            FT4_ABI.contains(
+                "pub const AARCH64_TERMINAL_FAULT_SELECTOR: usize = TERMINAL_FAULT_SELECTOR;"
+            ),
+            "and the AArch64 spelling is an alias of it, not a second value"
+        );
+        assert!(
             BOOT.contains(
-                "yarm_ipc_abi::terminal_fault_oracle_abi::AARCH64_TERMINAL_FAULT_SELECTOR as u64"
+                "yarm_ipc_abi::terminal_fault_oracle_abi::TERMINAL_FAULT_SELECTOR as u64"
             ),
             "and the kernel writes it from that owner, not from a literal"
         );
@@ -162417,8 +162474,9 @@ mod u9a64cow2_split_route {
         );
     }
 
-    /// AArch64's write-COW class routes split; RISC-V's does not, and demand stays broad
-    /// everywhere. The witness rule is intact in both directions.
+    /// AArch64's write-COW class routes split, and so — since U9-PAGEFAULT1 §2c — does
+    /// RISC-V's. The witness rule is intact in both directions: each row exists because a
+    /// baseline measured with that row absent showed the fault reaching the broad dispatcher.
     #[test]
     fn the_aarch64_write_cow_class_is_routed_and_riscv_is_not() {
         assert_eq!(
@@ -162426,10 +162484,15 @@ mod u9a64cow2_split_route {
             PageFaultRoute::SplitCow,
             "AArch64's COW witness was earned in §2"
         );
+        // U9-PAGEFAULT1 §2c: RISC-V's COW row was the last one this case pinned as absent. It
+        // is present now, and it needed no new workload — `run_vm_cow_fork_witness_early` was
+        // already architecture-neutral; what was missing was a profile arming BOTH the oracle
+        // knob and the sender-wake sub-knob. Measured baseline with the row absent: six COW
+        // faults, all reaching the broad dispatcher, both userspace isolation checks passing.
         assert_eq!(
             page_fault_route_for("riscv64", PageFaultClass::CowCandidate),
-            PageFaultRoute::Broad,
-            "RISC-V has no independent COW witness and stays broad"
+            PageFaultRoute::SplitCow,
+            "RISC-V's COW witness was earned in §2c and must keep its route"
         );
         for arch in ["x86_64", "aarch64", "riscv64"] {
             // U9-PAGEFAULT1 §2c/§3 re-derivation: demand paging WAS out of scope for the
@@ -183669,11 +183732,14 @@ mod u9pf1_demand_route {
             page_fault_route_for("nonesuch", PageFaultClass::DemandCandidate),
             PageFaultRoute::Broad
         );
-        // The other classes are untouched by this admission.
+        // RISC-V COW is a SEPARATE class with a witness of its own, earned in §2c — six faults
+        // from two forks, measured going broad before its row was added. The point this case
+        // has always made is unchanged: the demand admission did not grant it, its own
+        // evidence did.
         assert_eq!(
             page_fault_route_for("riscv64", PageFaultClass::CowCandidate),
-            PageFaultRoute::Broad,
-            "RISC-V COW is a separate class with its own witness, and it is not admitted here"
+            PageFaultRoute::SplitCow,
+            "RISC-V COW is a separate class admitted by its own witness, not by this one"
         );
         // U9-PAGEFAULT1 §3 — all THREE causes stay broad, not one representative. The class
         // carries its cause now, and a sweep that pinned only one would miss a row added for
@@ -184073,6 +184139,143 @@ mod u9pf1_outcome_coverage {
             assert!(
                 !b.contains("shared.classify_page_fault_shared("),
                 "`{route}` must not call the seam directly and skip the cause recording"
+            );
+        }
+    }
+}
+
+/// U9-PAGEFAULT1 §2 — the terminal PageFault route on all three ports, and the two scenarios
+/// that prove it.
+///
+/// The row read "AArch64 only" not because the route was AArch64's but because AArch64 was the
+/// only port with a fault to prove it with — the x86_64 core profile takes zero page faults of
+/// any class, which `PF1_BROAD_ARRIVAL` measured rather than assumed. These guards pin what the
+/// other two ports needed: a trigger, a drain that admits the faulted outgoing state, and a row
+/// added only after a baseline measured with that row absent.
+mod u9pf1_terminal_ports {
+    use crate::kernel::boot::{PageFaultClass, PageFaultRoute, page_fault_route_for};
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const X86_BOOT: &str = include_str!("../../arch/x86_64/boot.rs");
+    const ARM_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+    const FT4_ABI: &str =
+        include_str!("../../../crates/yarm-ipc-abi/src/terminal_fault_oracle_abi.rs");
+
+    /// **Every bridge's queue-advance drain admits the FAULTED outgoing state.**
+    ///
+    /// This is the defect the port found, and it was a documentation/code mismatch rather than a
+    /// missing feature: the x86_64 drain's comment described `Faulted` as one of the states it
+    /// admits and its predicate did not test for it. A terminal route returning
+    /// `QueueAdvanceCommitted` there would have published a transition the drain then refused to
+    /// act on. All three carry the SAME exact predicate now — not a loosened variant of another.
+    #[test]
+    fn every_drain_admits_the_faulted_outgoing_state() {
+        // trap_entry.rs holds two drains (the shared/x86_64 one and the AArch64 one); riscv has
+        // its own file. Each must name the predicate.
+        assert_eq!(
+            TRAP_ENTRY
+                .matches("shared.terminal_fault_reverify_faulted(t)")
+                .count(),
+            2,
+            "both drains in the shared bridge must admit the faulted state"
+        );
+        assert!(
+            RISCV_TRAP.contains("shared.terminal_fault_reverify_faulted(t)"),
+            "the RISC-V drain must admit it too"
+        );
+        // And it is an ADDITIONAL disjunct, never a replacement for the blocked-futex one.
+        for (name, src) in [("trap_entry", TRAP_ENTRY), ("riscv64/trap", RISCV_TRAP)] {
+            assert!(
+                src.contains("shared.futex_wait_reverify_blocked(t)"),
+                "{name} must still verify the blocked-futex state by its own predicate"
+            );
+        }
+    }
+
+    /// The terminal route derives its architecture and hands it to the matrix, so a row is the
+    /// only thing that admits a port.
+    #[test]
+    fn the_terminal_route_admits_ports_only_through_the_matrix() {
+        let route = SPLIT_SRC
+            .split("fn try_split_terminal_page_fault_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(feature = \"hosted-dev\")]").next())
+            .expect("the terminal route");
+        assert!(
+            !route.contains(r#"if !cfg!(target_arch = "aarch64")"#),
+            "the hard-coded architecture gate must be gone"
+        );
+        assert!(
+            route.contains("page_fault_route_for(arch, class)"),
+            "the DERIVED name goes to the matrix, never a literal"
+        );
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert_eq!(
+                page_fault_route_for(arch, PageFaultClass::TerminallyUnhandled),
+                PageFaultRoute::SplitTerminal,
+                "{arch} earned its terminal row"
+            );
+        }
+    }
+
+    /// **An instruction FETCH fault reaches the terminal class by construction.**
+    ///
+    /// Not by elimination, which is the weaker way to arrive: the demand screen refuses
+    /// `FaultAccess::Execute` outright, because a demand page is mapped `USER_RW` and is never
+    /// executable. So a fetch fault cannot be a demand candidate whatever the address's
+    /// bookkeeping says, and the COW screen never sees it either — COW is write-only.
+    #[test]
+    fn a_fetch_fault_is_terminal_by_construction() {
+        let ev = FAULT_SRC
+            .split("pub(crate) fn evaluate_page_fault_class(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the shared evaluator");
+        assert!(
+            ev.contains("!matches!(facts.access, FaultAccess::Execute)"),
+            "the demand screen must refuse an instruction fetch outright"
+        );
+        assert!(
+            ev.contains("matches!(facts.access, FaultAccess::Write) && facts.cow_marked"),
+            "and the COW screen is write-only, so a fetch never reaches it either"
+        );
+    }
+
+    /// The two scenarios are distinct selectors from ONE owner, and every port writes both from
+    /// that owner rather than from a literal.
+    #[test]
+    fn both_scenarios_come_from_one_owner_on_every_port() {
+        assert!(
+            FT4_ABI.contains("pub const TERMINAL_FAULT_SELECTOR: usize = 23;")
+                && FT4_ABI.contains("pub const TERMINAL_FAULT_FETCH_SELECTOR: usize = 24;"),
+            "both selectors are declared once, in the owner"
+        );
+        assert!(
+            FT4_ABI.contains("DeliberateUnhandledFetch => TERMINAL_FAULT_FETCH_SELECTOR"),
+            "and the encoder maps the fetch scenario to its own value"
+        );
+        for (port, boot) in [
+            ("x86_64", X86_BOOT),
+            ("aarch64", ARM_BOOT),
+            ("riscv64", RISCV_BOOT),
+        ] {
+            assert!(
+                boot.contains("crate::kernel::boot::TERMINAL_FAULT_FETCH_ORACLE_SELECTOR"),
+                "{port} must provision the fetch scenario from the owner, not a literal"
+            );
+            // Mutual exclusion: slot 5 carries ONE scenario, so every write is guarded on the
+            // slot still being free.
+            let at = boot
+                .find("crate::kernel::boot::TERMINAL_FAULT_FETCH_ORACLE_SELECTOR")
+                .expect("the write");
+            let before = &boot[at.saturating_sub(400)..at];
+            assert!(
+                before.contains("init_args[5] == 0"),
+                "{port}'s fetch write must be guarded on slot 5 still being free"
             );
         }
     }

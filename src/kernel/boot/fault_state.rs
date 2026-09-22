@@ -596,8 +596,43 @@ pub(crate) fn page_fault_route_for(arch: &str, class: PageFaultClass) -> PageFau
         // is itself context-synchronizing. `complete_unmap_shootdown_split` therefore gates only
         // the OLD-frame reclaim on AArch64, which is exactly the fail-safe direction.
         ("aarch64", PageFaultClass::CowCandidate) => PageFaultRoute::SplitCow,
+        // U9-PAGEFAULT1 §2 — RISC-V, live-witnessed here for the first time.
+        //
+        // This row read "RISC-V is deliberately absent — it has no independent COW witness of its
+        // own", and that was exactly right at the time. It has one now, and it needed no new
+        // workload: `run_vm_cow_fork_witness_early` was already architecture-neutral and already
+        // dispatched on every port, and RISC-V already provisions the slot-13 selector it reads.
+        // What was missing was a profile that armed BOTH the oracle knob and the sender-wake
+        // sub-knob together, which is what `provision_init_ipc_recv_proof_sender_wake_e2`
+        // requires.
+        //
+        // Measured baseline, row absent: SIX COW faults per boot — two forks, parent and child
+        // each writing the same virtual address in its own ASID, with both isolation checks
+        // passing from userspace — every one of them reaching the broad dispatcher. The
+        // transaction is architecture-neutral and unchanged; RISC-V needed none of the
+        // per-architecture obligations the AArch64 row documents, because its `arch_map_page`
+        // ends in its own `sfence.vma` and the `sret` to U-mode is itself synchronizing.
+        ("riscv64", PageFaultClass::CowCandidate) => PageFaultRoute::SplitCow,
         // Live-witnessed at base: 1 x terminal user read at 0x0 in the core profile.
-        ("aarch64", PageFaultClass::TerminallyUnhandled) => PageFaultRoute::SplitTerminal,
+        //
+        // U9-PAGEFAULT1 §2 — x86_64 and RISC-V join it, each on a witness of its own.
+        //
+        // This row read "AArch64 only" because AArch64 was the only port with a terminal fault to
+        // watch. That was measured, not assumed: the x86_64 core profile produces ZERO page
+        // faults of any class, so there was nothing to admit. §2 gave the terminal-fault oracle
+        // — the same deliberate unhandled read at address 0, the same slot-5 selector, the same
+        // default-off knob AArch64 has used since 199E-A64CALL — a provisioning point on the
+        // other two ports, and measured each BASELINE first: one fault per boot, reaching the
+        // broad dispatcher, with the report buffered to the supervisor endpoint and the task
+        // terminated. The rows were added after that, against the chain the baseline printed.
+        //
+        // The route itself needed no per-architecture policy. What it needed was the queue-
+        // advance drain on each bridge to admit the `Faulted` outgoing state, which the AArch64
+        // drain has done since U9-FT4 — the x86_64 drain's comment already claimed it did, and
+        // did not.
+        ("x86_64" | "aarch64" | "riscv64", PageFaultClass::TerminallyUnhandled) => {
+            PageFaultRoute::SplitTerminal
+        }
         // U9-PAGEFAULT1 §2c/§3 — the demand class, on all three architectures.
         //
         // This row read "EVERY demand candidate stays broad, on every architecture: zero live
@@ -626,7 +661,9 @@ pub(crate) fn page_fault_route_for(arch: &str, class: PageFaultClass) -> PageFau
         // decline it, `PAGE_FAULT_UNHANDLED` prints, the report is emitted and the task is
         // terminated. The class exists to make that arrival REASONED rather than incidental —
         // and to keep the kernel's own fate out of a userspace address choice.
-        ("aarch64", PageFaultClass::UserKernelAddress) => PageFaultRoute::SplitTerminal,
+        ("x86_64" | "aarch64" | "riscv64", PageFaultClass::UserKernelAddress) => {
+            PageFaultRoute::SplitTerminal
+        }
         // No other architecture/class pair has a witness.
         _ => PageFaultRoute::Broad,
     }

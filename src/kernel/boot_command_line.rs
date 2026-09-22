@@ -336,6 +336,10 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_aarch64_yield_lone_oracle_enabled(enabled);
         crate::yarm_log!("YARM_AARCH64_YIELD_LONE_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.terminal_fault_fetch_oracle {
+        crate::yarm_log!("YARM_TERMINAL_FAULT_FETCH_ORACLE_SET enabled={}", enabled);
+        crate::kernel::boot::set_terminal_fault_fetch_oracle_enabled(enabled);
+    }
     if let Some(enabled) = parsed.aarch64_terminal_fault_oracle {
         // 199E-A64CALL: default-off AArch64 TERMINAL-FAULT oracle knob (slot 5 = 23, A64-DEPTH; it
         // was 21 until that collided with the reserved AArch64 ExitCurrentTask selector). Gives the
@@ -830,6 +834,10 @@ pub struct YarmBootOptions<'a> {
     /// makes init take one deliberate unhandled read at 0x0, the trigger the U9-FT4 terminal
     /// PageFault witness needs now that the defect it used to observe is repaired.
     pub aarch64_terminal_fault_oracle: Option<bool>,
+    /// U9-PAGEFAULT1 §2: `yarm.terminal_fault_fetch_oracle=1` DEFAULT-OFF knob — init takes one
+    /// deliberate unhandled INSTRUCTION FETCH from address 0, exercising each architecture's
+    /// instruction-abort decode rather than its data-abort decode.
+    pub terminal_fault_fetch_oracle: Option<bool>,
     /// Stage 196A: `yarm.riscv64_post_lock_foundation_oracle=1` DEFAULT-OFF knob. Arms the RISC-V
     /// shared trap wrapper's one-shot post-lock-drain FOUNDATION oracle (publish token in the
     /// broad-lock phase, consume it after the lock drops via a real `with_cpu` re-acquire). It
@@ -1160,8 +1168,17 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         if key == b"yarm.aarch64_yield_lone_oracle" {
             options.aarch64_yield_lone_oracle = parse_bool_knob(value);
         }
-        if key == b"yarm.aarch64_terminal_fault_oracle" {
+        // U9-PAGEFAULT1 §2: one knob, two spellings, one flag. The scenario is
+        // architecture-neutral, so the neutral name is the one the x86_64 and RISC-V cells pass;
+        // the AArch64 spelling stays valid so its existing cell is untouched.
+        if key == b"yarm.aarch64_terminal_fault_oracle" || key == b"yarm.terminal_fault_oracle" {
             options.aarch64_terminal_fault_oracle = parse_bool_knob(value);
+        }
+        // U9-PAGEFAULT1 §2: the instruction-fetch scenario's own knob. A separate knob rather
+        // than a value on the one above, so each scenario is armed by name and the two cannot
+        // be confused by a typo in a numeric argument.
+        if key == b"yarm.terminal_fault_fetch_oracle" {
+            options.terminal_fault_fetch_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.riscv64_post_lock_foundation_oracle" {
             options.riscv64_post_lock_foundation_oracle = parse_bool_knob(value);
