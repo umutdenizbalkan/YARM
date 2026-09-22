@@ -960,7 +960,47 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // `sync_current_thread_from_frame`. Stage 163L's restore_arch_thread_state
     // reloads that sepc+4 into tframe.saved_pc; handle_trap_entry does NOT apply
     // its own +4 (Stage 163M fix), so the net resumed PC is sepc+4 exactly once.
-    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext { scause, stval };
+    // ── U9-IRQ-FINAL §1 — THE claim, read once, here ──────────────────────────────────────
+    //
+    // This is the trap's entry owner and the only place a claim may be taken. Reading the PLIC
+    // claim/complete register DEQUEUES the highest-priority pending source for this context and
+    // marks it in flight until the matching completion is written, so it must happen exactly
+    // once per trap — which rules out `decode_trap_context`, called several times below.
+    //
+    // Three restrictions are preserved rather than widened:
+    //
+    // * PRIVILEGE. This point is past the `if !from_u` block, which admits exactly one S-mode
+    //   trap (the audited kernel-idle timer, which returns above) and halts on everything else.
+    //   A claim is therefore only ever read for a trap taken from U-mode, exactly as before.
+    // * CAUSE. Only a supervisor external interrupt claims. Every other trap carries `None`, and
+    //   a `None` claim is what keeps the whole external family out of the Unknown arm.
+    // * REACHABILITY. `claim_external_interrupt_once` refuses when the controller is not
+    //   configured or when its claim register is not mapped under the address space this trap
+    //   was taken in. On QEMU virt the latter is the standing answer — the PLIC window sits
+    //   below RAM and no user ASID maps it — and reading anyway would raise a supervisor load
+    //   fault that lands in `riscv_trap_halt("trap_from_s_mode")`.
+    //
+    // No source is enabled, no priority is written and no driver is introduced by any of this.
+    const IRQ_SUPERVISOR_EXTERNAL_CAUSE: usize = 9;
+    const SCAUSE_INTERRUPT_BIT: usize = 1usize << 63;
+    let is_external_interrupt = (scause & SCAUSE_INTERRUPT_BIT) != 0
+        && (scause & !SCAUSE_INTERRUPT_BIT) == IRQ_SUPERVISOR_EXTERNAL_CAUSE;
+    let external_claim = if is_external_interrupt {
+        let claim = crate::arch::external_irq_claim::claim_external_interrupt_once();
+        early_marker!(
+            "RISCV_EXTIRQ_CLAIM_READ tid={} outcome={} claims=1",
+            entering_tid,
+            claim.marker()
+        );
+        Some(claim)
+    } else {
+        None
+    };
+    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {
+        scause,
+        stval,
+        external_claim,
+    };
     // Stage 196A: route through the RISC-V shared trap-entry wrapper. It owns the
     // `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag lifecycle, runs the UNCHANGED
     // canonical handler inside a bounded `with_cpu` broad-lock phase, and drains
@@ -1504,10 +1544,12 @@ fn riscv_s_mode_timer_trap(
     // timer arm reads none of the syscall lanes.
     let mut tframe = crate::kernel::trapframe::TrapFrame::zeroed();
     tframe.set_saved_pc(sepc);
-    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {
-        scause: frame.scause as usize,
-        stval: frame.stval as usize,
-    };
+    // U9-IRQ-FINAL §1 — the audited S-mode timer boundary is, by its own admission predicate, a
+    // supervisor TIMER interrupt. It is not an external interrupt and claims nothing.
+    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext::exception(
+        frame.scause as usize,
+        frame.stval as usize,
+    );
     let outcome = handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe);
 
     // NO S-mode-local re-arm. The re-arm is owned by the ONE common point — the arch-neutral

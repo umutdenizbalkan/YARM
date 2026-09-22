@@ -85,6 +85,56 @@ pub fn acknowledge_interrupt(_cpu: CpuId, irq_line: u16) {
     crate::arch::selected_isa::irq::acknowledge_interrupt(irq_line);
 }
 
+/// U9-IRQ-FINAL §2 — **the completion token**: what this trap owes the controller, decided
+/// where the claim was taken and carried to the one place that writes it.
+///
+/// The two ports complete differently, and a token that names which is the difference between
+/// one completion and either a missing one or a duplicate:
+///
+/// * `ArchSingleStep` — x86_64's LAPIC EOI, and AArch64's deliberately inert seam (its vector
+///   tail already completed the claim its vector entry took). Nothing is in flight here as far
+///   as this handler is concerned: a route that declines completes nothing.
+/// * `PlicClaim` — a RISC-V source dequeued by the claim read at the trap entry owner. It IS in
+///   flight, and it must be completed against the SAME context that produced it, exactly once,
+///   whatever the routing policy then decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptCompletion {
+    ArchSingleStep {
+        line: u16,
+    },
+    PlicClaim {
+        source: u32,
+        base: usize,
+        context_index: usize,
+    },
+}
+
+impl InterruptCompletion {
+    /// True when the controller has already handed this kernel a source that it must give back.
+    /// Leaking one wedges that PLIC context; completing one nobody took is a duplicate.
+    pub fn is_in_flight(self) -> bool {
+        matches!(self, Self::PlicClaim { .. })
+    }
+
+    /// THE completion write. There is exactly one call site of this in the split phase.
+    pub fn complete(self, cpu: CpuId) {
+        match self {
+            Self::ArchSingleStep { line } => acknowledge_interrupt(cpu, line),
+            Self::PlicClaim {
+                source,
+                base,
+                context_index,
+            } => crate::arch::external_irq_claim::complete_external_interrupt_claim(
+                source,
+                crate::arch::external_irq_claim::PlicContext {
+                    base,
+                    context_index,
+                },
+            ),
+        }
+    }
+}
+
 #[inline]
 pub fn complete_external_interrupt(irq_line: u16) {
     crate::arch::selected_isa::irq::external_irq_eoi(irq_line);

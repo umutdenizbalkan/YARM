@@ -160,6 +160,60 @@ pub fn acknowledge_interrupt(irq_line: u16) {
     external_irq_eoi(irq_line);
 }
 
+// U9-IRQ-FINAL §1/§2 — the RISC-V half of the claim/complete pair.
+//
+// The POLICY (what a claim can be, when one may be read, and the exactly-once completion
+// discipline) lives in `crate::arch::external_irq_claim`, which is compiled on every target so
+// it can be tested against a controller model. Only the two MMIO accesses are here, because
+// only here is there a PLIC.
+//
+// A claim READ is destructive: it dequeues the highest-priority pending source for this context
+// and marks it in flight until the matching completion is written. That is why the policy reads
+// it at the trap ENTRY owner, exactly once per trap.
+
+pub use crate::arch::external_irq_claim::{
+    PlicClaim, PlicContext, PlicUnavailableReason, claim_external_interrupt_once,
+    complete_external_interrupt_claim,
+};
+
+/// The claim/complete register address for a context. Shared by the claim read and the
+/// completion write so the two can never disagree about where the controller is.
+#[cfg(any(test, target_arch = "riscv64"))]
+pub(crate) fn claim_complete_register(context: PlicContext) -> usize {
+    plic_claim_complete_addr(context.base, context.context_index)
+}
+
+/// The configured controller, or `None` when nothing has configured one for this hart.
+#[cfg(any(test, target_arch = "riscv64"))]
+pub(crate) fn configured_context() -> Option<PlicContext> {
+    if !PLIC_CONFIGURED.load(Ordering::Relaxed) {
+        return None;
+    }
+    Some(PlicContext {
+        base: PLIC_MMIO_BASE.load(Ordering::Relaxed),
+        context_index: PLIC_CONTEXT_INDEX.load(Ordering::Relaxed),
+    })
+}
+
+#[cfg(all(not(test), not(target_arch = "riscv64")))]
+pub(crate) fn configured_context() -> Option<PlicContext> {
+    None
+}
+
+/// THE destructive claim read. One caller, in the policy owner.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub(crate) fn read_claim_register(context: PlicContext) -> u32 {
+    unsafe { core::ptr::read_volatile(claim_complete_register(context) as *const u32) }
+}
+
+/// THE completion write. One caller, in the policy owner.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub(crate) fn write_claim_completion(context: PlicContext, source: u32) {
+    unsafe {
+        write_volatile(claim_complete_register(context) as *mut u32, source);
+    }
+}
+
 /// 199E-R1 — the SINGLE RISC-V timer re-arm point.
 ///
 /// The arch-neutral `Trap::TimerInterrupt` arm calls this at its tail, and BOTH accepted origins

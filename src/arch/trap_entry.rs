@@ -729,6 +729,11 @@ pub fn handle_trap_entry_shared(
     // recovery happened for an interrupt that recovered nothing.
     let mut irq_handled = false;
     let mut irq_result: Option<Result<(), TrapHandleError>> = None;
+    // U9-IRQ-FINAL §3 — the Unknown route's own pair. Hosted now settles pre-lock instead of
+    // reaching the broad arm for its `Ok(())`; production still diverges. It is not the IRQ
+    // route's pair, because an unknown trap delivered nothing and completed nothing.
+    let mut unknown_handled = false;
+    let mut unknown_result: Option<Result<(), TrapHandleError>> = None;
     // U9-PAGEFAULT2 §3: the TERMINAL route's result. It has no `_recovered` companion because
     // the terminal route already owns `queue_advance_committed` — a terminating fault advances
     // the queue, which the other two never do — so only the result itself was missing.
@@ -761,9 +766,19 @@ pub fn handle_trap_entry_shared(
             // The dispatch-and-acknowledge body is ONE owner, shared with the RISC-V bridge:
             // `Some` means this route settled the trap, `None` that the broad arm still owns the
             // interrupt and nothing was completed.
-            if let Some(result) =
-                crate::kernel::syscall_split::settle_external_interrupt_at_bridge(shared, cpu, irq)
-            {
+            // U9-IRQ-FINAL §2 — the completion token names what this port owes: the shared
+            // handler's single-step acknowledgement (the LAPIC EOI on x86_64; deliberately inert
+            // on AArch64, whose vector tail already completed the claim its vector entry took).
+            // Nothing is in flight here, so a decline completes nothing and the broad arm still
+            // owns the interrupt.
+            let completion =
+                crate::arch::hal_adapters::InterruptCompletion::ArchSingleStep { line: irq };
+            if let Some(result) = crate::kernel::syscall_split::settle_external_interrupt_at_bridge(
+                shared,
+                cpu,
+                u32::from(irq),
+                completion,
+            ) {
                 irq_handled = true;
                 irq_result = Some(result);
             }
@@ -780,12 +795,23 @@ pub fn handle_trap_entry_shared(
                 trap_path.retire();
                 trap_path.settle();
             }
-            let probe =
-                crate::kernel::syscall_split::try_split_unknown_trap_dispatch(cpu, Some(arch_code));
-            debug_assert!(
-                matches!(probe, SplitDispatchDisposition::NotHandled),
-                "the Unknown route either diverges or declines"
-            );
+            match crate::kernel::syscall_split::try_split_unknown_trap_dispatch(
+                cpu,
+                Some(arch_code),
+            ) {
+                SplitDispatchDisposition::Complete(result) => {
+                    unknown_handled = true;
+                    unknown_result = Some(result);
+                }
+                other => {
+                    crate::yarm_log!(
+                        "IRQ1_UNKNOWN_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(false, "the Unknown route diverges or settles");
+                }
+            }
         }
     }
     {
@@ -1385,12 +1411,17 @@ pub fn handle_trap_entry_shared(
             || cow_recovered
             || demand_recovered
             || irq_handled
+            || unknown_handled
         {
             crate::yarm_log!(
                 "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason={}",
                 cpu.0,
                 if queue_advance_committed {
                     "publication_committed"
+                } else if unknown_handled {
+                    // U9-IRQ-FINAL §3 — its own reason. An unknown trap recovered nothing,
+                    // delivered nothing and completed nothing; it was classified and returned.
+                    "unknown_settled"
                 } else if irq_handled {
                     // U9-IRQ-UNKNOWN1 §2 — its own reason. An interrupt recovered nothing and
                     // advanced no queue; it delivered a notification and was acknowledged.
@@ -1417,6 +1448,7 @@ pub fn handle_trap_entry_shared(
             // neither fired — so the order among them expresses precedence that cannot arise,
             // and the value is simply whichever route handled the fault.
             Ok(irq_result
+                .or(unknown_result)
                 .or(terminal_result)
                 .or(demand_result)
                 .or(cow_result)

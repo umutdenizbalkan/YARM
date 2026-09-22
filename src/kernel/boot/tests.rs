@@ -117043,15 +117043,31 @@ mod stage199d_riscv_remote_wake_readiness {
             !RISCV_TRAP.contains("IRQ_SUPERVISOR_SOFT"),
             "cause 1 has no named constant, so no decoder arm can reference it"
         );
+        // U9-IRQ-FINAL §1 re-derivation: the arms are located by the `if is_interrupt` block
+        // rather than by a byte window. The claim of this guard is unchanged — timer, external,
+        // and everything else to `Unknown`, with no software-interrupt arm — but the external
+        // arm is no longer one line: it reads the claim the trap entry owner carried instead of
+        // fabricating an identity from `stval`, and a fixed-size window silently stopped
+        // covering it.
         let at = RISCV_TRAP
             .find("pub fn decode_trap_context")
             .expect("the decoder");
-        let body = &RISCV_TRAP[at..at + 700];
+        let body = RISCV_TRAP[at..]
+            .split("    if is_interrupt {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("the interrupt-cause match");
         assert!(
             body.contains("IRQ_SUPERVISOR_TIMER => TrapEvent::TimerInterrupt")
-                && body.contains("IRQ_SUPERVISOR_EXTERNAL => TrapEvent::ExternalInterrupt")
+                && body.contains("IRQ_SUPERVISOR_EXTERNAL => match context.external_claim")
                 && body.contains("_ => TrapEvent::Unknown"),
             "an unrecognised interrupt cause falls to Unknown — there is no software-interrupt arm"
+        );
+        // And the external arm takes its identity from the CARRIED claim, never from `stval`
+        // and never from a claim read of its own: this decoder runs several times per trap.
+        assert!(
+            !body.contains("context.stval") && !body.contains("claim_external_interrupt_once"),
+            "the decoder must neither fabricate an identity from `stval` nor claim one itself"
         );
     }
 
@@ -147002,7 +147018,7 @@ mod u9qa_split_dispatch_disposition {
         let gate_at = riscv_flat
             .find(
                 "if queue_advance_committed || post_work_committed || cow_recovered \
-                 || demand_recovered || irq_handled {",
+                 || demand_recovered || irq_handled || unknown_handled {",
             )
             .expect("the broad-dispatch gate");
         let call = riscv_flat
@@ -148728,13 +148744,13 @@ mod u9tm_proof_gate {
                 "shared",
                 include_str!("../../arch/trap_entry.rs"),
                 "if queue_advance_committed || post_work_committed || cow_recovered \
-                 || demand_recovered || irq_handled {",
+                 || demand_recovered || irq_handled || unknown_handled {",
             ),
             (
                 "riscv",
                 include_str!("../../arch/riscv64/trap.rs"),
                 "if queue_advance_committed || post_work_committed || cow_recovered \
-                 || demand_recovered || irq_handled {",
+                 || demand_recovered || irq_handled || unknown_handled {",
             ),
         ] {
             let flattened = flat(raw);
@@ -186336,13 +186352,267 @@ mod u9irq1_delivery {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
-// U9-IRQ-UNKNOWN1 §4 — per-port acknowledgement, the Unknown closure, and the mutation guards.
+// U9-IRQ-UNKNOWN1 §4 / U9-IRQ-FINAL §4 — the claim, the completion and the Unknown closure.
 //
-// Acknowledgement is not something a hosted test can *observe* happening on a controller, so it
-// is derived from the executed source instead: which seam each bridge calls, how many times,
-// where in the sequence, and what each port's seam actually does. That derivation is exact —
-// these are the bodies that run — and it is the only honest way to state a controller-protocol
-// property from a host build.
+// Three kinds of evidence, kept apart on purpose because they are worth different things:
+//
+//  * the CONTROLLER MODEL below drives the real claim and completion owners and measures what
+//    they did — one claim per trap, one completion per claim, against the claim's own context.
+//    It is a model: it cannot show that a controller raises a line or that the MMIO addresses
+//    are right.
+//  * SOURCE-DERIVED facts about each port's acknowledgement protocol, read from the bodies that
+//    execute. Exact, and the only honest way to state a controller-protocol property from a host
+//    build.
+//  * INJECTED bridge evidence, in `u9irq1_injected_evidence`, labelled there.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+/// U9-IRQ-FINAL §4 — the claim and completion owners, against the controller model.
+mod u9irqfinal_claim {
+    use crate::arch::external_irq_claim::{
+        PlicClaim, PlicContext, PlicUnavailableReason, claim_external_interrupt_once,
+        complete_external_interrupt_claim, model,
+    };
+
+    const BASE: usize = 0x0C00_0000;
+    const CONTEXT: usize = 1;
+
+    /// Restores the model on the way out, including on a panicking assertion — a model left
+    /// armed would answer the next test's claim read.
+    struct ArmedModel;
+
+    impl ArmedModel {
+        fn with(source: u32) -> Self {
+            model::reset();
+            model::arm(source, BASE, CONTEXT);
+            Self
+        }
+        fn unconfigured() -> Self {
+            model::reset();
+            model::set_configured(false);
+            Self
+        }
+        fn unreachable() -> Self {
+            model::reset();
+            model::arm(7, BASE, CONTEXT);
+            model::set_reachable(false);
+            Self
+        }
+    }
+
+    impl Drop for ArmedModel {
+        fn drop(&mut self) {
+            model::reset();
+        }
+    }
+
+    /// **One claim read, and it is destructive.** The second read of the same trap would find an
+    /// empty controller — which is exactly why the claim is taken once at the entry owner and
+    /// carried, rather than re-derived by a decoder that runs several times per trap.
+    #[test]
+    fn the_claim_read_is_destructive_so_a_second_read_finds_nothing() {
+        let _armed = ArmedModel::with(10);
+        let first = claim_external_interrupt_once();
+        assert_eq!(
+            first,
+            PlicClaim::Claimed {
+                source: 10,
+                context: PlicContext {
+                    base: BASE,
+                    context_index: CONTEXT
+                }
+            },
+            "the first read dequeues the pending source"
+        );
+        let second = claim_external_interrupt_once();
+        assert!(
+            matches!(second, PlicClaim::NoPending { .. }),
+            "and it is gone: a second read in one trap would lose the source, {second:?}"
+        );
+        assert_eq!(model::claim_reads(), 2, "both reads went to the controller");
+        assert_eq!(
+            model::completions(),
+            0,
+            "and reading a claim completes nothing"
+        );
+    }
+
+    /// **The completion carries the claim's own context**, not a re-read of a global that may
+    /// have been reconfigured since.
+    #[test]
+    fn the_completion_goes_to_the_context_that_produced_the_claim() {
+        let _armed = ArmedModel::with(10);
+        let claim = claim_external_interrupt_once();
+        let (source, context) = claim.in_flight().expect("a source is in flight");
+        // Reconfigure the controller underneath, exactly as a later `configure_plic_*` would.
+        model::arm(99, 0xDEAD_0000, 7);
+        complete_external_interrupt_claim(source, context);
+        assert_eq!(
+            model::last_completion(),
+            (10, BASE, CONTEXT),
+            "the completion names the claim's source and ITS context, not the current globals"
+        );
+        assert_eq!(model::completions(), 1, "exactly one completion");
+    }
+
+    /// **No pending claim.** Nothing is in flight, so there is nothing to complete — and the
+    /// type says so: `in_flight` yields `None`, which is the only source of completion
+    /// arguments.
+    #[test]
+    fn an_empty_controller_yields_no_pending_and_nothing_to_complete() {
+        let _armed = ArmedModel::with(0);
+        let claim = claim_external_interrupt_once();
+        assert!(
+            matches!(claim, PlicClaim::NoPending { .. }),
+            "source 0 is the spec's reserved `no interrupt` encoding: {claim:?}"
+        );
+        assert_eq!(claim.marker(), "no_pending");
+        assert_eq!(
+            claim.in_flight(),
+            None,
+            "a no-claim outcome cannot produce completion arguments"
+        );
+        assert_eq!(model::completions(), 0);
+    }
+
+    /// **Configuration refusal, both reasons, distinctly named.** Neither reads the register,
+    /// and neither completes anything.
+    #[test]
+    fn an_unusable_controller_refuses_by_name_without_touching_the_register() {
+        {
+            let _armed = ArmedModel::unconfigured();
+            let claim = claim_external_interrupt_once();
+            assert_eq!(
+                claim,
+                PlicClaim::Unavailable {
+                    reason: PlicUnavailableReason::NotConfigured
+                }
+            );
+            assert_eq!(claim.in_flight(), None);
+            assert_eq!(model::claim_reads(), 0, "the register was never read");
+            assert_eq!(model::completions(), 0);
+        }
+        {
+            let _armed = ArmedModel::unreachable();
+            let claim = claim_external_interrupt_once();
+            assert_eq!(
+                claim,
+                PlicClaim::Unavailable {
+                    reason: PlicUnavailableReason::MmioUnreachable
+                },
+                "an unmapped claim register must refuse, not fault in S-mode"
+            );
+            assert_eq!(model::claim_reads(), 0, "the register was never read");
+            assert_eq!(model::completions(), 0);
+        }
+    }
+
+    /// The three refusal reasons and the three claim states are separately nameable — a shared
+    /// marker would hide which one happened.
+    #[test]
+    fn every_claim_state_is_separately_nameable() {
+        let markers = [
+            PlicClaim::Claimed {
+                source: 1,
+                context: PlicContext {
+                    base: BASE,
+                    context_index: CONTEXT,
+                },
+            }
+            .marker(),
+            PlicClaim::NoPending {
+                context: PlicContext {
+                    base: BASE,
+                    context_index: CONTEXT,
+                },
+            }
+            .marker(),
+            PlicClaim::Unavailable {
+                reason: PlicUnavailableReason::NotConfigured,
+            }
+            .marker(),
+        ];
+        let mut seen: alloc::vec::Vec<&str> = markers.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 3);
+        assert_ne!(
+            PlicUnavailableReason::NotConfigured.marker(),
+            PlicUnavailableReason::MmioUnreachable.marker(),
+            "a controller nobody configured and one this address space cannot see are different \
+             facts"
+        );
+    }
+
+    /// **The RISC-V claim is read at the trap ENTRY owner, once, and never by a decoder.**
+    #[test]
+    fn the_claim_is_read_only_at_the_entry_owner() {
+        const RISCV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+        const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+        assert_eq!(
+            RISCV_BOOT
+                .matches("claim_external_interrupt_once()")
+                .count(),
+            1,
+            "exactly one claim site, in the trap entry owner"
+        );
+        assert_eq!(
+            RISCV_TRAP.matches("claim_external_interrupt_once").count(),
+            0,
+            "and none in the bridge, whose decoder runs several times per trap"
+        );
+        let bridge = RISCV_BOOT
+            .split("extern \"C\" fn yarm_riscv64_trap_bridge(")
+            .nth(1)
+            .expect("the entry owner");
+        let halt = bridge
+            .find("riscv_trap_halt(\"trap_from_s_mode\")")
+            .expect("the supervisor-origin screen");
+        let claim = bridge
+            .find("claim_external_interrupt_once()")
+            .expect("the claim");
+        assert!(
+            halt < claim,
+            "the claim must sit AFTER the S-mode screen — the existing privilege restriction is \
+             preserved, not widened to manufacture a witness"
+        );
+        // And only for a supervisor external interrupt.
+        let window = &bridge[claim.saturating_sub(600)..claim];
+        assert!(
+            window.contains("let external_claim = if is_external_interrupt {"),
+            "no other trap may claim"
+        );
+    }
+
+    /// **No source is enabled, no priority written, no driver introduced.** This package supplies
+    /// an identity; it does not bring a device up.
+    #[test]
+    fn nothing_here_enables_a_source() {
+        const PLIC: &str = include_str!("../../arch/riscv64/plic.rs");
+        assert!(
+            PLIC.contains("RISCV_EXTIRQ_DEFERRED reason={}")
+                && PLIC.contains("DEFER_REASON_NO_SAFE_SOURCE"),
+            "external-IRQ enable stays deferred with its existing reason"
+        );
+        // The counter exists and is reset; what must not exist is a store of a NONZERO count,
+        // which is what "a source was enabled" would look like.
+        for store in PLIC.match_indices("EXTIRQ_ENABLED_SOURCES.store(") {
+            let (at, _) = store;
+            let stmt = &PLIC[at..at + 60];
+            assert!(
+                stmt.contains("store(0,"),
+                "the enabled-source count may only ever be reset, never raised: {stmt}"
+            );
+        }
+        assert_eq!(
+            PLIC.matches("EXTIRQ_ENABLED_SOURCES.store(0,").count(),
+            PLIC.matches("EXTIRQ_ENABLED_SOURCES.store(").count(),
+            "no source is enabled"
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// U9-IRQ-UNKNOWN1 §4 / U9-IRQ-FINAL §2 — per-port acknowledgement, derived from executed bodies.
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 mod u9irq1_acknowledgement {
     const TRAP: &str = include_str!("../../arch/trap_entry.rs");
@@ -186351,16 +186621,21 @@ mod u9irq1_acknowledgement {
     const ARM_IRQ: &str = include_str!("../../arch/aarch64/irq.rs");
     const RISCV_IRQ: &str = include_str!("../../arch/riscv64/irq.rs");
     const SPLIT: &str = include_str!("../syscall_split.rs");
+    const HAL: &str = include_str!("../../arch/hal_adapters.rs");
+    const CLAIM: &str = include_str!("../../arch/external_irq_claim.rs");
 
-    /// The IRQ arm of a bridge: from the owner call to the close of the settled arm.
-    fn irq_arm(src: &str) -> &str {
-        let at = src
-            .find("settle_external_interrupt_at_bridge(shared, cpu, irq)")
-            .expect("the bridge must delegate to the one dispatch-and-acknowledge owner");
-        let end = src[at..]
-            .find("else if let TrapEvent::Unknown")
-            .expect("the Unknown arm closes the IRQ block");
-        &src[at..at + end]
+    /// The RISC-V bridge's external-interrupt block.
+    ///
+    /// Anchored on the bridge's own cells rather than on `match context.external_claim`, because
+    /// the DECODER matches on the same field a few hundred lines earlier and a bare split would
+    /// silently measure that instead.
+    pub(super) fn riscv_external_block() -> &'static str {
+        RISCV
+            .split("let mut unknown_result: Option<Result<(), TrapHandleError>> = None;")
+            .nth(1)
+            .and_then(|s| s.split("match context.external_claim {").nth(1))
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("the RISC-V external block")
     }
 
     /// The one dispatch-and-acknowledge owner both bridges call.
@@ -186372,81 +186647,164 @@ mod u9irq1_acknowledgement {
             .expect("the bridge-body owner")
     }
 
-    /// **Exactly one completion per handled interrupt, per bridge**, and it is the scoped seam.
+    /// **Exactly one completion write, in one body, for the whole split phase.**
     ///
-    /// `acknowledge_interrupt` is the per-port seam meaning "the shared handler's single-step
-    /// acknowledgement". `external_irq_eoi` / `complete_external_interrupt` are the raw writes,
-    /// and on AArch64 the raw write is a SECOND `GICC_EOIR` beside the one the vector tail
-    /// already issues for the same claim. Neither may appear here.
+    /// Two inline copies of an acknowledgement sequence is the shape that grows a duplicate when
+    /// one of them is edited, so the guard requires there to be one copy at all — and it is the
+    /// token's `complete`, which is itself the only thing that reaches either port's register.
     #[test]
-    fn each_bridge_completes_exactly_once_through_the_scoped_seam() {
-        // ONE acknowledgement, in ONE body, which both bridges call. Two inline copies of an
-        // acknowledgement sequence is exactly the shape that produces a second completion when
-        // one of them is edited, so the guard requires there to be one copy at all.
+    fn one_completion_site_serves_both_bridges_and_both_protocols() {
         let owner = bridge_owner();
         assert_eq!(
-            owner.matches("acknowledge_interrupt(").count(),
+            owner.matches("completion.complete(cpu);").count(),
             1,
-            "one handled interrupt is one acknowledgement"
+            "one handled interrupt is one completion, written in one place"
         );
-        for raw in ["external_irq_eoi(", "complete_external_interrupt("] {
+        for raw in [
+            "external_irq_eoi(",
+            "complete_external_interrupt(",
+            "acknowledge_interrupt(",
+        ] {
             assert!(
                 !owner.contains(raw),
-                "`{raw}` is the RAW write — on AArch64 it is a second EOIR beside the \
-                 vector tail's completion for the same claim"
+                "`{raw}` bypasses the completion token — the token is what names WHICH protocol \
+                 this port owes, and on AArch64 the raw write is a second EOIR beside the vector \
+                 tail's completion for the same claim"
             );
         }
-        // A DECLINED interrupt completes nothing: the acknowledgement is inside the settled arm,
-        // and the `NotHandled` arm yields `None` having done nothing at all.
-        let decline = owner
-            .find("SplitDispatchDisposition::NotHandled => None,")
-            .expect("a declined interrupt must complete nothing, and say so by yielding None");
-        let ack = owner
-            .find("acknowledge_interrupt(")
-            .expect("the acknowledgement");
-        assert!(
-            decline < ack,
-            "and the decline must not fall through into the acknowledgement"
-        );
-        // Both bridges reach it, and neither keeps a copy.
+        // Neither bridge keeps a copy, and each reaches the owner exactly once.
         for (port, src) in [("shared", TRAP), ("riscv", RISCV)] {
-            let arm = irq_arm(src);
-            assert!(
-                !arm.contains("acknowledge_interrupt(") && !arm.contains("irq_guard::irq_save()"),
-                "{port}: the bridge must delegate the acknowledgement, not keep a second copy"
+            assert_eq!(
+                src.matches("hal_adapters::acknowledge_interrupt(").count(),
+                0,
+                "{port}: the bridge itself completes nothing — it delegates"
+            );
+            assert_eq!(
+                src.matches("complete_external_interrupt_claim(").count(),
+                0,
+                "{port}: nor does it write a PLIC completion of its own"
+            );
+            assert_eq!(
+                src.matches("settle_external_interrupt_at_bridge(").count(),
+                1,
+                "{port}: through exactly one call to the one owner"
             );
         }
+        // The RISC-V claim settlement helper is a policy step, not a second write site.
+        let riscv_settle = RISCV
+            .split("fn settle_riscv_external_claim(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the RISC-V claim settlement");
+        assert!(
+            !riscv_settle.contains("complete_external_interrupt_claim(")
+                && !riscv_settle.contains("acknowledge_interrupt("),
+            "the RISC-V settlement must hand the token to the owner, not write a completion"
+        );
+        // And the token itself has exactly one write per protocol.
+        assert_eq!(
+            HAL.matches("acknowledge_interrupt(cpu, line)").count(),
+            1,
+            "one single-step write"
+        );
+        assert_eq!(
+            HAL.matches("complete_external_interrupt_claim(").count(),
+            1,
+            "one claim-completion write"
+        );
     }
 
-    /// **Acknowledgement follows the delivery policy and is masked across the pair**, exactly as
-    /// the broad arm's `TrapEvent::ExternalInterrupt` did it.
+    /// **A decline completes nothing — unless the controller already handed us a source.**
+    ///
+    /// The two disjoint reasons to write a completion, and the absence of an unconditional one.
     #[test]
-    fn acknowledgement_follows_delivery_under_a_masked_window() {
+    fn a_decline_completes_nothing_but_a_claim_is_never_leaked() {
+        let owner = bridge_owner();
+        assert!(
+            owner.contains("if settled.is_some() || completion.is_in_flight() {"),
+            "the completion is conditional on real work: the route settled it, or the controller \
+             has a source in flight"
+        );
+        assert!(
+            owner.contains("SplitDispatchDisposition::NotHandled => None,"),
+            "a decline yields None"
+        );
+        // `is_in_flight` is true for a claim and false for the single-step seam, which is what
+        // makes the x86_64/AArch64 behaviour "complete only on a settlement" unchanged.
+        assert!(
+            HAL.contains("matches!(self, Self::PlicClaim { .. })"),
+            "only a claimed source counts as in flight"
+        );
+        // And the only way to build a claim completion is from a claim that really is in flight.
+        assert!(
+            CLAIM.contains("pub fn in_flight(self) -> Option<(u32, PlicContext)> {")
+                && CLAIM.contains("Self::Claimed { source, context } => Some((source, context)),"),
+            "`in_flight` is the sole source of completion arguments"
+        );
+    }
+
+    /// **Completion follows delivery, inside the masked window.**
+    #[test]
+    fn completion_follows_delivery_under_a_masked_window() {
         let owner = bridge_owner();
         let dispatch = owner
             .find("try_split_external_interrupt_dispatch(")
             .expect("the delivery policy");
         let save = owner.find("irq_guard::irq_save()").expect("the mask");
-        let ack = owner
-            .find("acknowledge_interrupt(")
-            .expect("the acknowledgement");
+        let complete = owner
+            .find("completion.complete(cpu)")
+            .expect("the completion");
         let restore = owner.find("irq_guard::irq_restore(").expect("the unmask");
         assert!(
-            dispatch < save && save < ack && ack < restore,
-            "delivery first, then the acknowledgement inside the masked window"
+            dispatch < save && save < complete && complete < restore,
+            "delivery first, then the completion inside the masked window"
         );
     }
 
-    /// **The asynchronous interrupt preserves the interrupted continuation.** The arm may not
-    /// touch the trap frame at all: no register write, no PC advance, no syscall-result encoding.
+    /// **A controller identifier is never truncated.** The narrowing is explicit, its failure is
+    /// named, and the unroutable source is still completed — truncating would complete a
+    /// DIFFERENT source and leave this one in flight forever.
     #[test]
-    fn the_irq_arm_never_touches_the_interrupted_frame() {
-        for (port, src) in [
-            ("shared", TRAP),
-            ("riscv", RISCV),
+    fn an_identifier_too_wide_to_route_is_refused_not_truncated() {
+        let owner = bridge_owner();
+        assert!(
+            owner.contains("match u16::try_from(source) {") && owner.contains("Err(_) => {"),
+            "the narrowing must be checked, not a cast"
+        );
+        assert!(
+            !owner.contains("source as u16"),
+            "a silent truncation is exactly what this guard exists to forbid"
+        );
+        assert!(
+            owner.contains("IRQFINAL_SOURCE_UNROUTABLE"),
+            "and the refusal must be named"
+        );
+        let unroutable = owner
+            .find("IRQFINAL_SOURCE_UNROUTABLE")
+            .expect("the refusal");
+        let settle = owner
+            .find("SplitDispatchDisposition::Complete(Ok(()))")
+            .expect("its settlement");
+        assert!(
+            unroutable < settle,
+            "an unroutable source is still claimed work: it settles, and the completion below \
+             writes it"
+        );
+    }
+
+    /// **The asynchronous interrupt preserves the interrupted continuation.** Nothing in the
+    /// delivery path can express a frame mutation.
+    #[test]
+    fn the_irq_path_never_touches_the_interrupted_frame() {
+        let riscv_settle = RISCV
+            .split("fn settle_riscv_external_claim(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the RISC-V claim settlement");
+        for (name, body) in [
             ("owner", bridge_owner()),
+            ("riscv settlement", riscv_settle),
         ] {
-            let arm = if port == "owner" { src } else { irq_arm(src) };
             for forbidden in [
                 "frame",
                 "set_return_value",
@@ -186456,13 +186814,13 @@ mod u9irq1_acknowledgement {
                 "encode_syscall",
             ] {
                 assert!(
-                    !arm.contains(forbidden),
-                    "{port}: an asynchronous interrupt must return through the frame it \
-                     interrupted, untouched — `{forbidden}` has no business here"
+                    !body.contains(forbidden),
+                    "{name}: an asynchronous interrupt returns through the frame it interrupted, \
+                     untouched — `{forbidden}` has no business here"
                 );
             }
         }
-        // And the route itself never sees a frame: it takes only `(shared, cpu, irq)`.
+        // The route itself cannot take a frame.
         let signature = SPLIT
             .split("pub(crate) fn try_split_external_interrupt_dispatch(")
             .nth(1)
@@ -186479,8 +186837,8 @@ mod u9irq1_acknowledgement {
     /// two of them.
     #[test]
     fn each_port_completes_only_the_work_it_actually_owns() {
-        // x86_64: the LAPIC EOI is the single-step completion, and it is refused before the
-        // controller is configured rather than written into an unmapped MMIO window.
+        // x86_64: the LAPIC EOI is the single-step completion, refused before the controller is
+        // configured rather than written into an unmapped MMIO window.
         let x86 = X86_IRQ
             .split("pub fn acknowledge_interrupt(")
             .nth(1)
@@ -186493,8 +186851,7 @@ mod u9irq1_acknowledgement {
         );
 
         // AArch64: deliberately inert. The vector entry claims via GICC_IAR and the vector tail
-        // completes — exactly one completion per claim, owned by the architecture, not by this
-        // handler. Calling the raw EOIR here would be the second one.
+        // completes — exactly one completion per claim, owned by the architecture.
         let arm = ARM_IRQ
             .split("pub fn acknowledge_interrupt(")
             .nth(1)
@@ -186506,85 +186863,85 @@ mod u9irq1_acknowledgement {
                 && !arm.contains("external_irq_eoi("),
             "AArch64's single-step seam must stay inert: the vector tail owns completion"
         );
-        assert!(
-            ARM_IRQ.contains(
-                "Reading `GICC_IAR` here as well would consume a\n/// second, \
-                              unrelated claim."
-            ) || ARM_IRQ.contains("would consume a"),
-            "and the reason must stay recorded beside it"
-        );
 
-        // RISC-V: the PLIC completion, which refuses source 0 because the spec reserves it to
-        // mean \"no interrupt\".
-        let riscv = RISCV_IRQ
-            .split("pub fn external_irq_eoi(irq_line: u16) {")
+        // RISC-V: the claim/complete pair, at one register address shared by both halves so they
+        // can never disagree about where the controller is.
+        assert!(
+            RISCV_IRQ
+                .contains("pub(crate) fn claim_complete_register(context: PlicContext) -> usize {")
+                && RISCV_IRQ.contains("pub(crate) fn read_claim_register(")
+                && RISCV_IRQ.contains("pub(crate) fn write_claim_completion("),
+            "RISC-V's claim and completion must address the controller through one helper"
+        );
+        let hw_claim = CLAIM
+            .split("fn hardware_claim_once() -> PlicClaim {")
             .nth(1)
             .and_then(|s| s.split("\n}").next())
-            .expect("the RISC-V completion");
+            .expect("the hardware claim");
         assert!(
-            riscv.contains("if irq_line == 0 {")
-                && riscv.contains("PLIC_CONFIGURED.load(Ordering::Relaxed)")
-                && riscv.contains("plic_write_complete("),
-            "RISC-V completes at the PLIC, refusing the reserved source and an unconfigured \
-             controller"
+            hw_claim.contains("mmio_range_reachable_under_active_satp(")
+                && hw_claim.contains("PlicUnavailableReason::MmioUnreachable"),
+            "the claim must test reachability under the ENTERING address space before reading"
+        );
+        // And the completion deliberately does NOT re-test it: a check that could refuse the
+        // completion half is how a claim gets leaked.
+        let completion = CLAIM
+            .split("pub fn complete_external_interrupt_claim(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the completion owner");
+        assert!(
+            !completion.contains("mmio_range_reachable_under_active_satp("),
+            "the claim/complete pair must not be separable by a second reachability test"
         );
     }
 
-    /// **RISC-V has no IRQ identity yet, and the route says so rather than inventing one.**
-    ///
-    /// `decode_trap_context` builds `ExternalInterrupt(context.stval as u16)`. `stval` is
-    /// architecturally 0 for an interrupt, and the PLIC completion above refuses source 0, so
-    /// treating that value as a controller claim would deliver to line 0 and complete nothing.
-    /// The route refuses on this port, measurably, and names the barrier.
+    /// **Mutation guard — a renewed RISC-V fall-through.** The port's escape is what IRQ-FINAL
+    /// closed: there is no `NotHandled` arm left for a recognized external interrupt, and no
+    /// `stval`-derived identity anywhere in the delivery path.
     #[test]
-    fn the_riscv_route_refuses_rather_than_treating_stval_as_a_claim() {
-        let body = SPLIT
+    fn the_riscv_external_family_can_no_longer_reach_the_broad_dispatcher() {
+        // The refusal is gone from the whole file — its marker no longer exists anywhere — and
+        // the IRQ route in particular carries no architecture gate at all. The file still has
+        // unrelated `cfg!(target_arch = "riscv64")` uses in the PAGE-FAULT routes, which are a
+        // different family with a different (and correct) reason to be arch-gated, so the guard
+        // is scoped to the route it is about rather than banning the idiom globally.
+        assert!(
+            !SPLIT.contains("riscv_identifier_is_not_a_claim"),
+            "the unconditional RISC-V refusal is removed, not merely bypassed"
+        );
+        let route = SPLIT
             .split("fn try_split_external_interrupt_into_frame(")
             .nth(1)
             .and_then(|s| s.split("\n}").next())
-            .expect("the IRQ route body");
+            .expect("the IRQ route");
         assert!(
-            body.contains("cfg!(target_arch = \"riscv64\")")
-                && body.contains("reason=riscv_identifier_is_not_a_claim"),
-            "the RISC-V refusal must be explicit and measurable, not an accident of decoding"
+            !route.contains("target_arch"),
+            "the IRQ delivery route must not be gated by architecture at all: every port that \
+             can name a source now uses the same policy"
         );
-        let refusal = body
-            .find("riscv_identifier_is_not_a_claim")
-            .expect("the refusal");
-        let delivery = body
-            .find("deliver_external_irq_split(")
-            .expect("the delivery");
+        let block = riscv_external_block();
+        let some_arm = block.split("None => {").next().expect("the Some arm");
         assert!(
-            refusal < delivery,
-            "and it must refuse BEFORE any delivery is attempted"
+            some_arm.contains("irq_handled = true;"),
+            "EVERY claim state must settle: the flag is raised unconditionally for the family"
         );
-    }
-
-    /// **Mutation guard — a renewed broad fall-through.** If an `ExternalInterrupt` that the
-    /// route handled could still reach the broad dispatcher, the interrupt would be delivered
-    /// twice and completed twice. The two facts that make that impossible are that the `Complete`
-    /// arm raises `irq_handled`, and that the gate admits it.
-    #[test]
-    fn a_handled_interrupt_cannot_reach_the_broad_dispatcher() {
+        assert!(
+            !some_arm.contains("if let Some(result)") && !some_arm.contains("NotHandled"),
+            "no conditional handling — a recognized external interrupt cannot fall through"
+        );
+        // The identity is the carried claim, never `stval`.
+        let settle = RISCV
+            .split("fn settle_riscv_external_claim(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the settlement");
+        assert!(
+            !settle.contains("stval"),
+            "delivery must never be driven from `stval`, which is 0 for an interrupt"
+        );
+        // The flag is raised in one place per bridge and cleared nowhere.
         for (port, src) in [("shared", TRAP), ("riscv", RISCV)] {
-            let arm = irq_arm(src);
-            assert!(
-                arm.contains("irq_handled = true;") && arm.contains("irq_result = Some(result);"),
-                "{port}: the Complete arm must raise the flag AND carry the result"
-            );
-            let flat = src
-                .split_whitespace()
-                .collect::<alloc::vec::Vec<_>>()
-                .join(" ");
-            assert!(
-                flat.contains(
-                    "if queue_advance_committed || post_work_committed || cow_recovered \
-                     || demand_recovered || irq_handled {"
-                ),
-                "{port}: and the gate must admit it, or the flag decides nothing"
-            );
-            // The flag is raised in exactly one place and cleared nowhere: there is no path that
-            // handles an interrupt and then un-handles it.
             assert_eq!(
                 src.matches("irq_handled = true;").count(),
                 1,
@@ -186595,48 +186952,64 @@ mod u9irq1_acknowledgement {
                 1,
                 "{port}: and the only `false` is its declaration"
             );
+            let flat = src
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
+            assert!(
+                flat.contains(
+                    "if queue_advance_committed || post_work_committed || cow_recovered \
+                     || demand_recovered || irq_handled || unknown_handled {"
+                ),
+                "{port}: and the gate must admit it, or the flag decides nothing"
+            );
         }
     }
 
-    /// **Mutation guard — duplicate completion.** One acknowledgement per bridge, in the IRQ arm,
-    /// and no second one hiding elsewhere in the file's split phase.
+    /// **Mutation guard — duplicate claim or duplicate completion.** One claim site, one
+    /// completion site, and the RISC-V bridge reaches the owner once.
     #[test]
-    fn no_second_completion_is_issued_for_one_claim() {
-        // The DEVICE-interrupt acknowledgement is one site. The timer route's
-        // `acknowledge_interrupt(cpu, 0)` is a different event family with its own claim and its
-        // own re-arm, and keeping the two apart is the point — a device line is never 0, and the
-        // RISC-V PLIC completion explicitly refuses source 0 as reserved.
+    fn no_second_claim_and_no_second_completion() {
+        const RISCV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
         assert_eq!(
-            SPLIT
-                .matches("hal_adapters::acknowledge_interrupt(cpu, irq)")
+            RISCV_BOOT
+                .matches("claim_external_interrupt_once()")
                 .count(),
             1,
-            "the split phase issues exactly one DEVICE acknowledgement, in one place"
+            "one claim read in the whole port"
         );
+        assert_eq!(
+            CLAIM.matches("read_claim_register(context)").count(),
+            1,
+            "and one register read behind it"
+        );
+        assert_eq!(
+            CLAIM
+                .matches("write_claim_completion(context, source)")
+                .count(),
+            1,
+            "one completion write behind the completion owner"
+        );
+        assert_eq!(
+            SPLIT.matches("completion.complete(cpu);").count(),
+            1,
+            "and one call to it from the split phase"
+        );
+        // The timer's own acknowledgement is a different event family with its own claim and
+        // re-arm, and must stay separate and unduplicated. A device line is never 0, and the
+        // RISC-V PLIC completion refuses 0 as reserved.
         assert_eq!(
             SPLIT
                 .matches("hal_adapters::acknowledge_interrupt(cpu, 0)")
                 .count(),
             1,
-            "and the timer's own acknowledgement stays where it was, unduplicated"
+            "the timer's acknowledgement stays where it was"
         );
-        for (port, src) in [("shared", TRAP), ("riscv", RISCV)] {
-            assert_eq!(
-                src.matches("hal_adapters::acknowledge_interrupt(").count(),
-                0,
-                "{port}: and the bridge itself issues none — it delegates"
-            );
-            assert_eq!(
-                src.matches("settle_external_interrupt_at_bridge(shared, cpu, irq)")
-                    .count(),
-                1,
-                "{port}: through exactly one call to the one owner"
-            );
-        }
     }
 }
 
-/// U9-IRQ-UNKNOWN1 §3/§4 — the Unknown closure: one owner, production strict, hosted unchanged.
+/// U9-IRQ-UNKNOWN1 §3 / U9-IRQ-FINAL §3 — the Unknown closure: one policy owner, production
+/// strict, hosted unchanged but settled pre-lock.
 mod u9irq1_unknown {
     use crate::kernel::scheduler::CpuId;
 
@@ -186645,22 +187018,21 @@ mod u9irq1_unknown {
     const TRAP: &str = include_str!("../../arch/trap_entry.rs");
     const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
 
-    /// **Isolated expected-fatal evidence.** The fatal encoding is one diverging body, and this
-    /// runs THAT body — the same one production reaches — rather than asserting about it from
-    /// outside. Only reachability is `cfg`-gated, which is what keeps hosted non-strict.
+    /// **Isolated expected-fatal evidence.** This runs the diverging body production reaches,
+    /// not an assertion about it. Only reachability is `cfg`-gated, which is what keeps hosted
+    /// non-strict.
     #[test]
     #[should_panic(expected = "strict unknown trap policy: cpu=3 arch_code=0x2d")]
     fn the_fatal_encoding_diverges_with_the_broad_arms_message() {
         crate::kernel::boot::unknown_trap_fatal(CpuId(3), 0x2d);
     }
 
-    /// The policy's divergence bit is exactly `!hosted-dev`, so hosted is not strict and
-    /// production is — unchanged from the broad arm's `STRICT_UNKNOWN_TRAPS`.
+    /// The divergence bit is exactly `!hosted-dev`, in one place.
     #[test]
     fn hosted_is_not_strict_and_says_so_from_the_one_owner() {
         assert!(
             !crate::kernel::boot::strict_unknown_traps(),
-            "this suite runs under hosted-dev, where the Unknown policy declines"
+            "this suite runs under hosted-dev, where the Unknown policy returns normally"
         );
         assert!(
             FAULT.contains("const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = \"hosted-dev\");"),
@@ -186668,16 +187040,20 @@ mod u9irq1_unknown {
         );
     }
 
-    /// Hosted keeps its existing route: the split owner declines and the broad arm's
-    /// `handle_trap(Trap::Unknown)` answers as it always did.
+    /// **U9-IRQ-FINAL §3 — hosted keeps its policy and loses the acquisition.**
+    ///
+    /// The broad arm's hosted answer for an unknown trap is exactly `Ok(())`
+    /// (`Trap::PageFault | Trap::ExternalInterrupt | Trap::Unknown => Ok(())`). The split owner
+    /// now produces that same answer before the broad acquisition, so the behaviour is identical
+    /// and the lock is not taken.
     #[test]
-    fn the_hosted_route_declines_to_the_existing_broad_answer() {
+    fn the_hosted_route_settles_with_the_same_answer_the_broad_arm_gave() {
         assert!(
             matches!(
                 crate::kernel::syscall_split::try_split_unknown_trap_dispatch(CpuId(0), Some(0x2d)),
-                crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled
+                crate::kernel::syscall_split::SplitDispatchDisposition::Complete(Ok(()))
             ),
-            "hosted must not become strict"
+            "hosted settles pre-lock with a normal return"
         );
         assert!(
             matches!(
@@ -186686,11 +187062,14 @@ mod u9irq1_unknown {
             ),
             "and an absent code is not a recognized Unknown"
         );
+        // The broad arm's answer, unchanged, is what this reproduces.
+        assert!(
+            FAULT.contains("Trap::PageFault | Trap::ExternalInterrupt | Trap::Unknown => Ok(()),"),
+            "the answer being reproduced must still be the broad arm's own"
+        );
     }
 
-    /// **One policy owner, and the diagnostic markers are preserved.** The broad arm's
-    /// diagnostic line and its default-off classification marker both live in the moved body,
-    /// and both take the hardware-derived CPU and code.
+    /// **One policy owner, and the diagnostic markers are preserved on both sides.**
     #[test]
     fn the_markers_move_with_the_policy_and_are_not_restated() {
         let body = FAULT
@@ -186703,27 +187082,39 @@ mod u9irq1_unknown {
             "\"FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL vector=0x{:x}\"",
             "\"IRQ1_UNKNOWN_SETTLED cpu={} arch_code=0x{:x} strict=1 broad_lock=0\"",
         ] {
-            assert!(body.contains(marker), "the owner must keep {marker}");
+            assert!(body.contains(marker), "the fatal owner must keep {marker}");
         }
-        assert!(
-            body.contains("fault_delivery_enabled()"),
-            "and the classification marker stays default-off, exactly as the broad arm has it"
-        );
-        // The split route does not restate any of it — it calls the one owner.
+        // The hosted half emits the SAME diagnostic and the SAME default-off classification
+        // marker, and says which policy produced it.
         let route = SPLIT
             .split("fn try_split_unknown_trap_into_frame(")
             .nth(1)
             .and_then(|s| s.split("\n}").next())
-            .expect("the production route");
+            .expect("the policy route");
         assert!(
             route.contains("crate::kernel::boot::unknown_trap_fatal(cpu, arch_code);")
                 && !route.contains("panic!("),
-            "the route must delegate to the one policy owner, not carry a second copy"
+            "production must delegate to the one fatal owner, not carry a second copy"
+        );
+        for marker in [
+            "\"unknown trap event cpu={} arch_code=0x{:x}\"",
+            "\"FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL vector=0x{:x}\"",
+            "\"IRQ1_UNKNOWN_SETTLED cpu={} arch_code=0x{:x} strict=0 broad_lock=0\"",
+        ] {
+            assert!(route.contains(marker), "the hosted half must keep {marker}");
+        }
+        assert!(
+            route.contains("fault_delivery_enabled()"),
+            "and the classification marker stays default-off, exactly as the broad arm has it"
+        );
+        assert!(
+            route.contains("if crate::kernel::boot::strict_unknown_traps() {"),
+            "one body, one policy bit — not two cfg'd functions that can drift apart"
         );
     }
 
-    /// **An unknown trap is not a user fault.** It is not reclassified, no victim is fabricated
-    /// for it, and it is never a successful production return.
+    /// **An unknown trap is not a user fault.** Not reclassified, no victim fabricated, and no
+    /// new production recovery behaviour.
     #[test]
     fn an_unknown_trap_is_never_turned_into_a_user_fault() {
         for (name, body) in [
@@ -186736,12 +187127,12 @@ mod u9irq1_unknown {
                     .expect("the fatal owner"),
             ),
             (
-                "the production route",
+                "the policy route",
                 SPLIT
                     .split("fn try_split_unknown_trap_into_frame(")
                     .nth(1)
                     .and_then(|s| s.split("\n}").next())
-                    .expect("the production route"),
+                    .expect("the policy route"),
             ),
         ] {
             for forbidden in [
@@ -186749,27 +187140,39 @@ mod u9irq1_unknown {
                 "PageFault",
                 "emit_fault_report",
                 "current_tid",
-                "Complete(Ok(()))",
             ] {
                 assert!(
                     !body.contains(forbidden),
-                    "{name} must not reach `{forbidden}` — an unknown trap has no victim and no \
-                     successful production return"
+                    "{name} must not reach `{forbidden}` — an unknown trap has no victim"
                 );
             }
         }
+        // Production still diverges: its only successful return is the hosted one, and it is
+        // behind the policy bit.
+        let route = SPLIT
+            .split("fn try_split_unknown_trap_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the policy route");
+        let strict = route
+            .find("if crate::kernel::boot::strict_unknown_traps() {")
+            .expect("the policy bit");
+        let ok = route
+            .find("SplitDispatchDisposition::Complete(Ok(()))")
+            .expect("the hosted return");
+        assert!(
+            strict < ok,
+            "the strict divergence must precede the only successful return"
+        );
     }
 
-    /// **Trap-window retirement at the diverging boundary**, on both bridges. A `panic!` never
-    /// unwinds back to `TrapPathWindow::drop`, so an abandoned window would be reported against
-    /// the next trap on this CPU — an artefact of this boundary, not of anything real.
+    /// **Trap-window retirement at the diverging boundary**, on both bridges.
     #[test]
     fn both_bridges_retire_the_window_before_the_divergence() {
         for (port, src) in [("shared", TRAP), ("riscv", RISCV)] {
             let arm = src
-                .split("else if let TrapEvent::Unknown { arch_code } = decoded {")
+                .split("if let TrapEvent::Unknown { arch_code } = decode")
                 .nth(1)
-                .and_then(|s| s.split("\n        }").next())
                 .unwrap_or_else(|| panic!("{port}: the Unknown arm"));
             let guard = arm
                 .find("if crate::kernel::boot::strict_unknown_traps() {")
@@ -186788,7 +187191,35 @@ mod u9irq1_unknown {
                 "{port}: retire and settle, guarded by the policy's own bit, BEFORE the route \
                  that may never return"
             );
+            // And the hosted settlement is carried, not discarded.
+            assert!(
+                arm.contains("unknown_result = Some(result);")
+                    && arm.contains("unknown_handled = true;"),
+                "{port}: the Unknown route's result must reach the bridge's join"
+            );
         }
+    }
+
+    /// **An external interrupt never reaches the Unknown arm on RISC-V**, whatever the decoder
+    /// makes of a trap whose source it cannot name. The family branches on the carried claim.
+    #[test]
+    fn the_riscv_bridge_settles_every_external_claim_before_any_decode() {
+        let block = super::u9irq1_acknowledgement::riscv_external_block();
+        let some_at = block.find("Some(claim) => {").expect("the claim arm");
+        let none_at = block.find("None => {").expect("the non-external arm");
+        assert!(
+            some_at < none_at,
+            "the claim arm is taken first, so no external interrupt can reach the Unknown probe"
+        );
+        let some_arm = &block[some_at..none_at];
+        assert!(
+            !some_arm.contains("decode_trap_context"),
+            "the external family must not consult the decoder at all"
+        );
+        assert!(
+            block[none_at..].contains("decode_trap_context(context)"),
+            "and the Unknown probe stays on the non-external path"
+        );
     }
 }
 
@@ -186829,6 +187260,13 @@ mod u9irq1_injected_evidence {
     const LINE: u16 = 27;
     const RECEIVER: u64 = 4500;
 
+    /// The completion token x86_64 and AArch64 pass: the shared handler's single-step seam, with
+    /// nothing in flight. Under hosted it is inert, which is why these cases can assert the
+    /// bridge body's RESULT without asserting anything about a controller.
+    fn single_step(line: u16) -> crate::arch::hal_adapters::InterruptCompletion {
+        crate::arch::hal_adapters::InterruptCompletion::ArchSingleStep { line }
+    }
+
     /// Arms the injection for the duration of a case and disarms it on the way out, including on
     /// a panicking assertion — an armed bit leaking into the rest of the single-threaded suite
     /// would change how every other test's traps behave.
@@ -186866,7 +187304,13 @@ mod u9irq1_injected_evidence {
     fn the_injection_is_off_by_default_and_the_bridge_declines() {
         let (kernel, _idx) = fixture();
         assert!(
-            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE).is_none(),
+            settle_external_interrupt_at_bridge(
+                &kernel,
+                CpuId(0),
+                u32::from(LINE),
+                single_step(LINE)
+            )
+            .is_none(),
             "an unarmed hosted build must leave the interrupt to the broad arm"
         );
     }
@@ -186878,7 +187322,12 @@ mod u9irq1_injected_evidence {
         let (kernel, _idx) = fixture();
         let _armed = ArmedInjection::arm();
         assert_eq!(
-            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE),
+            settle_external_interrupt_at_bridge(
+                &kernel,
+                CpuId(0),
+                u32::from(LINE),
+                single_step(LINE)
+            ),
             Some(Ok(())),
             "a routed delivery settles here; `None` would send it to the broad dispatcher"
         );
@@ -186892,7 +187341,12 @@ mod u9irq1_injected_evidence {
         let (kernel, _idx) = fixture();
         let _armed = ArmedInjection::arm();
         assert_eq!(
-            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE + 3),
+            settle_external_interrupt_at_bridge(
+                &kernel,
+                CpuId(0),
+                u32::from(LINE + 3),
+                single_step(LINE + 3)
+            ),
             Some(Ok(())),
             "no route is a settled, benign ending — exactly as the broad form answers it"
         );
@@ -186921,7 +187375,12 @@ mod u9irq1_injected_evidence {
 
         let _armed = ArmedInjection::arm();
         assert_eq!(
-            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE),
+            settle_external_interrupt_at_bridge(
+                &kernel,
+                CpuId(0),
+                u32::from(LINE),
+                single_step(LINE)
+            ),
             Some(Ok(()))
         );
         assert_eq!(
@@ -186955,11 +187414,21 @@ mod u9irq1_injected_evidence {
         let _armed = ArmedInjection::arm();
 
         assert_eq!(
-            settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE),
+            settle_external_interrupt_at_bridge(
+                &kernel,
+                CpuId(0),
+                u32::from(LINE),
+                single_step(LINE)
+            ),
             Some(Ok(())),
             "the queue takes one"
         );
-        let overflow = settle_external_interrupt_at_bridge(&kernel, CpuId(0), LINE);
+        let overflow = settle_external_interrupt_at_bridge(
+            &kernel,
+            CpuId(0),
+            u32::from(LINE),
+            single_step(LINE),
+        );
         assert!(
             matches!(overflow, Some(Err(_))),
             "and the second must arrive at the bridge as an error, not a fabricated Ok: \

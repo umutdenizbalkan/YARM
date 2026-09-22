@@ -151,11 +151,23 @@ fn resolve_plic_base() -> (usize, &'static str) {
     (platform_layout::PLIC_MMIO_BASE, "qemu_virt_fallback")
 }
 
+/// U9-IRQ-FINAL §1 — the same reachability question the PLIC claim must ask.
+///
+/// The claim/complete register is read in S-mode under whatever address space was active when
+/// the trap was taken. That is a user ASID, whose only kernel mapping is the shared gigapage at
+/// `RISCV_KERNEL_SHARED_BASE`; the PLIC window sits below RAM and is never covered by it. An
+/// unreachable claim register is therefore the ORDINARY state on this platform, and naming it is
+/// what lets the claim refuse instead of faulting into `trap_from_s_mode`.
+///
 /// Returns true if the inclusive byte range `[addr, addr+len)` falls
 /// entirely within the single kernel-shared gigapage that
 /// `map_kernel_shared_into_asid` installs into every user ASID's page
 /// table. A PLIC MMIO write is only safe to perform under the active
 /// `satp` if its physical address is covered by that mapping.
+pub fn mmio_range_reachable_under_active_satp(addr: usize, len: usize) -> bool {
+    addr_range_covered_by_kernel_shared_mapping(addr, len)
+}
+
 fn addr_range_covered_by_kernel_shared_mapping(addr: usize, len: usize) -> bool {
     let start = addr as u64;
     let end = start.saturating_add(len as u64);

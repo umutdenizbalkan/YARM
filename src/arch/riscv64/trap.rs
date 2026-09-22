@@ -34,6 +34,24 @@ const IRQ_SUPERVISOR_EXTERNAL: usize = 9;
 pub struct Riscv64TrapContext {
     pub scause: usize,
     pub stval: usize,
+    /// U9-IRQ-FINAL §1 — the PLIC claim this trap read, once, at its entry owner.
+    ///
+    /// `None` means no claim was attempted, which is the right answer for every trap that is not
+    /// a supervisor external interrupt. It is deliberately a CARRIED value rather than something
+    /// a decoder can produce: reading the claim register dequeues a source and marks it in
+    /// flight, and `decode_trap_context` runs several times per trap.
+    pub external_claim: Option<crate::arch::external_irq_claim::PlicClaim>,
+}
+
+impl Riscv64TrapContext {
+    /// A trap that is not a supervisor external interrupt, so no claim was read.
+    pub fn exception(scause: usize, stval: usize) -> Self {
+        Self {
+            scause,
+            stval,
+            external_claim: None,
+        }
+    }
 }
 
 /// Stage 197B: why the RISC-V trap wrapper decided to enter the kernel idle terminal. Idle is a
@@ -381,7 +399,33 @@ pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
     if is_interrupt {
         return match code {
             IRQ_SUPERVISOR_TIMER => TrapEvent::TimerInterrupt,
-            IRQ_SUPERVISOR_EXTERNAL => TrapEvent::ExternalInterrupt(context.stval as u16),
+            // U9-IRQ-FINAL §1 — the identity comes from the CARRIED claim, never from `stval`
+            // (architecturally 0 for an interrupt) and never from a claim read here: this
+            // decoder runs several times per trap and a claim read is destructive.
+            //
+            // Only a claimed source that fits the route table's line width names a line. Every
+            // other case — no claim attempted, nothing pending, an unreachable controller, or a
+            // source too wide to be a line — has no source to name, and naming one would be a
+            // fabrication. Those answer `Unknown`, which is exactly what they are.
+            //
+            // This arm is unreachable for dispatch in production: the RISC-V bridge settles the
+            // whole external family from `context.external_claim` BEFORE any decode-driven arm
+            // runs, and `the_riscv_bridge_settles_every_external_claim_before_any_decode` pins
+            // that. It is written to be correct rather than convenient anyway, because a decoder
+            // that fabricates an identity is how this port got here.
+            IRQ_SUPERVISOR_EXTERNAL => match context.external_claim {
+                Some(crate::arch::external_irq_claim::PlicClaim::Claimed { source, .. }) => {
+                    match u16::try_from(source) {
+                        Ok(line) => TrapEvent::ExternalInterrupt(line),
+                        Err(_) => TrapEvent::Unknown {
+                            arch_code: context.scause as u64,
+                        },
+                    }
+                }
+                _ => TrapEvent::Unknown {
+                    arch_code: context.scause as u64,
+                },
+            },
             _ => TrapEvent::Unknown {
                 arch_code: context.scause as u64,
             },
@@ -414,6 +458,67 @@ pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
         _ => TrapEvent::Unknown {
             arch_code: context.scause as u64,
         },
+    }
+}
+
+/// U9-IRQ-FINAL §2 — **one claim, one settlement.** Turns the claim this trap read into the
+/// result the bridge returns, and names the reason the broad dispatcher was skipped.
+///
+/// All three claim states settle; none of them falls back. They are kept apart because they are
+/// different facts and a shared marker would hide which one happened:
+///
+/// * `Unavailable` — no claim was attempted, so nothing is in flight and nothing is completed.
+///   On QEMU virt this is the standing answer: the PLIC window sits below RAM and no user ASID
+///   maps it, so the claim register cannot be read from the address space the trap was taken in.
+/// * `NoPending` — the controller had nothing for this context. Nothing is in flight, so again
+///   nothing may be completed; completing here would be a write nobody claimed.
+/// * `Claimed` — a source is in flight. It goes to the SAME delivery policy x86_64 and AArch64
+///   use, and the bridge owner completes it exactly once against the context it came from,
+///   including when the line is unbound and when notification delivery fails.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+fn settle_riscv_external_claim(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    claim: crate::arch::external_irq_claim::PlicClaim,
+) -> (Result<(), TrapHandleError>, &'static str) {
+    use crate::arch::external_irq_claim::PlicClaim as C;
+    match claim {
+        C::Unavailable { reason } => {
+            crate::yarm_log!(
+                "IRQFINAL_RISCV_CLAIM_UNAVAILABLE cpu={} reason={} completed=0 broad_lock=0",
+                cpu.0,
+                reason.marker()
+            );
+            (Ok(()), "irq_claim_unavailable")
+        }
+        C::NoPending { context } => {
+            crate::yarm_log!(
+                "IRQFINAL_RISCV_NO_PENDING_CLAIM cpu={} context={} completed=0 broad_lock=0",
+                cpu.0,
+                context.context_index
+            );
+            (Ok(()), "irq_no_pending_claim")
+        }
+        C::Claimed { source, context } => {
+            crate::yarm_log!(
+                "IRQFINAL_RISCV_CLAIMED cpu={} source={} context={} broad_lock=0",
+                cpu.0,
+                source,
+                context.context_index
+            );
+            let completion = crate::arch::hal_adapters::InterruptCompletion::PlicClaim {
+                source,
+                base: context.base,
+                context_index: context.context_index,
+            };
+            // The bridge owner performs the completion — this function never writes one, which
+            // is what keeps "one completion owner, no second write in the route or tail" a
+            // structural fact rather than a convention.
+            let settled = crate::kernel::syscall_split::settle_external_interrupt_at_bridge(
+                shared, cpu, source, completion,
+            );
+            (settled.unwrap_or(Ok(())), "irq_delivered")
+        }
     }
 }
 
@@ -796,60 +901,76 @@ pub fn handle_riscv_trap_entry_shared(
     // U9-PAGEFAULT2 §3: the TERMINAL route's result, carried here as the shared bridge carries
     // it. No `_recovered` companion: the terminal route already owns `queue_advance_committed`.
     let mut terminal_result: Option<Result<(), TrapHandleError>> = None;
-    // U9-IRQ-UNKNOWN1 §2/§3 — the EXTERNAL INTERRUPT and UNKNOWN routes.
+    // U9-IRQ-UNKNOWN1 §2/§3, U9-IRQ-FINAL §1/§2/§3 — the EXTERNAL INTERRUPT and UNKNOWN routes.
     //
-    // Both are wired here for the same reason they are wired on the shared bridge: a route that
-    // exists on one bridge and not the other is a route whose contract depends on which entry
-    // the hardware happened to use.
+    // The interrupt route no longer refuses on this port. IRQ1 wired it and then declined every
+    // arrival because `decode_trap_context` supplied `stval`, which is architecturally 0 for a
+    // supervisor external interrupt and is not a controller claim. IRQ-FINAL supplies the
+    // identity the delivery owner needed: `yarm_riscv64_trap_bridge` reads the PLIC claim ONCE,
+    // at the entry boundary, and carries it in `Riscv64TrapContext::external_claim`.
     //
-    // The interrupt route REFUSES on this port, by its own test, and the refusal is the honest
-    // answer rather than a gap. `decode_trap_context` builds `ExternalInterrupt(stval)`, and
-    // `stval` is not the PLIC's claim register — it is architecturally zero for a supervisor
-    // external interrupt — so there is no device identity to route and `external_irq_eoi`
-    // refuses source 0 as the PLIC's reserved "no interrupt" encoding. Wiring the call anyway
-    // keeps the two bridges structurally identical and keeps the refusal MEASURABLE through
-    // `IRQ1_SPLIT_REFUSED`, instead of the port silently having no route at all.
+    // Every one of the claim's three states settles here, before the terminal acquisition. The
+    // family branches on the CARRIED claim, never on a re-decode, which is also what keeps an
+    // external interrupt out of the Unknown arm below regardless of what the decoder makes of a
+    // trap it cannot name.
     let mut irq_handled = false;
     let mut irq_result: Option<Result<(), TrapHandleError>> = None;
+    // U9-IRQ-FINAL §3 — the Unknown route's own pair. It is not the IRQ route's: an unknown trap
+    // delivered nothing and completed nothing, and borrowing the interrupt arm's reason would
+    // tell an observer a device interrupt arrived.
+    let mut unknown_handled = false;
+    let mut unknown_result: Option<Result<(), TrapHandleError>> = None;
     {
-        let decoded = decode_trap_context(context);
-        if let TrapEvent::ExternalInterrupt(irq) = decoded {
-            // The dispatch-and-acknowledge body is ONE owner, shared with the x86_64/AArch64
-            // bridge. `Some` means this route settled the trap; `None` that it declined and
-            // nothing was completed.
-            if let Some(result) =
-                crate::kernel::syscall_split::settle_external_interrupt_at_bridge(shared, cpu, irq)
-            {
+        match context.external_claim {
+            Some(claim) => {
+                let (result, reason) = settle_riscv_external_claim(shared, cpu, claim);
+                // ALWAYS handled. There is no arm left that hands a recognized external
+                // interrupt to the broad dispatcher, so the broad arm's own
+                // `TrapEvent::ExternalInterrupt` route — which would `route_external_irq` and
+                // then write a SECOND completion — is unreachable on this port.
                 irq_handled = true;
                 irq_result = Some(result);
-                // U9-IRQ-UNKNOWN1 §2 — this port raises its skip flags where each route settles
-                // rather than in one `else if` chain at the gate, so the IRQ arm names its own
-                // reason here. It is not any of the other three: nothing was recovered, no
-                // deferral was published, and the architecture tail owes no syscall work.
                 crate::yarm_log!(
                     "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason={}",
                     cpu.0,
-                    "irq_delivered"
+                    reason
                 );
             }
-        } else if let TrapEvent::Unknown { arch_code } = decoded {
-            // U9-IRQ-UNKNOWN1 §3 — same contract as the shared bridge: production diverges here,
-            // and a panic never unwinds back to `TrapPathWindow::drop`, so the window is retired
-            // and settled first. Both are idempotent; the hosted path declines and its `Drop`
-            // still does the work exactly once.
-            if crate::kernel::boot::strict_unknown_traps() {
-                trap_path.retire();
-                trap_path.settle();
+            None => {
+                if let TrapEvent::Unknown { arch_code } = decode_trap_context(context) {
+                    // U9-IRQ-UNKNOWN1 §3 — production diverges here, and a panic never unwinds
+                    // back to `TrapPathWindow::drop`, so the window is retired and settled first.
+                    // Both are idempotent.
+                    if crate::kernel::boot::strict_unknown_traps() {
+                        trap_path.retire();
+                        trap_path.settle();
+                    }
+                    match crate::kernel::syscall_split::try_split_unknown_trap_dispatch(
+                        cpu,
+                        Some(arch_code),
+                    ) {
+                        crate::kernel::syscall_split::SplitDispatchDisposition::Complete(
+                            result,
+                        ) => {
+                            unknown_handled = true;
+                            unknown_result = Some(result);
+                            crate::yarm_log!(
+                                "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason={}",
+                                cpu.0,
+                                "unknown_settled"
+                            );
+                        }
+                        other => {
+                            crate::yarm_log!(
+                                "IRQ1_UNKNOWN_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                                cpu.0,
+                                other
+                            );
+                            debug_assert!(false, "the Unknown route diverges or settles");
+                        }
+                    }
+                }
             }
-            let probe =
-                crate::kernel::syscall_split::try_split_unknown_trap_dispatch(cpu, Some(arch_code));
-            debug_assert!(
-                matches!(
-                    probe,
-                    crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled
-                ),
-                "the Unknown route either diverges or declines"
-            );
         }
     }
     // U9-TM §2: the pre-lock TIMER route, refusing before any claim, tick or mutation when a
@@ -1554,6 +1675,7 @@ pub fn handle_riscv_trap_entry_shared(
         || cow_recovered
         || demand_recovered
         || irq_handled
+        || unknown_handled
     {
         // U9-PAGEFAULT1 §2b: a recovered COW fault carries the SAME result the broad arm would
         // have returned — `Ok(())` on success, the rolled-back failure's error otherwise — so
@@ -1563,6 +1685,7 @@ pub fn handle_riscv_trap_entry_shared(
         // order expresses a precedence that cannot arise, and the value is simply whichever
         // route handled the fault.
         Ok(irq_result
+            .or(unknown_result)
             .or(terminal_result)
             .or(demand_result)
             .or(cow_result)
@@ -2863,10 +2986,7 @@ mod tests {
 
     #[test]
     fn decode_user_ecall_to_syscall() {
-        let event = decode_trap_context(Riscv64TrapContext {
-            scause: EXC_USER_ECALL,
-            stval: 0,
-        });
+        let event = decode_trap_context(Riscv64TrapContext::exception(EXC_USER_ECALL, 0));
         assert_eq!(event.trap(), Trap::Syscall);
     }
 
@@ -2880,10 +3000,7 @@ mod tests {
         handle_trap_entry(
             &mut state,
             CpuId(1),
-            Riscv64TrapContext {
-                scause: INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER,
-                stval: 0,
-            },
+            Riscv64TrapContext::exception(INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER, 0),
             None,
         )
         .expect("timer");
@@ -2893,10 +3010,7 @@ mod tests {
 
     #[test]
     fn decode_unknown_scause_maps_to_unknown_event() {
-        let event = decode_trap_context(Riscv64TrapContext {
-            scause: INTERRUPT_BIT | 0x3f,
-            stval: 0,
-        });
+        let event = decode_trap_context(Riscv64TrapContext::exception(INTERRUPT_BIT | 0x3f, 0));
         assert_eq!(event.trap(), Trap::Unknown);
     }
 
@@ -2927,10 +3041,7 @@ mod tests {
         handle_trap_entry(
             &mut state,
             CpuId(1),
-            Riscv64TrapContext {
-                scause: INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER,
-                stval: 0,
-            },
+            Riscv64TrapContext::exception(INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER, 0),
             Some(&mut frame),
         )
         .expect("trap");
@@ -2965,10 +3076,7 @@ mod tests {
         handle_trap_entry(
             &mut state,
             CpuId(1),
-            Riscv64TrapContext {
-                scause: INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER,
-                stval: 0,
-            },
+            Riscv64TrapContext::exception(INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER, 0),
             Some(&mut frame_a),
         )
         .expect("trap a");
@@ -2981,10 +3089,7 @@ mod tests {
         handle_trap_entry(
             &mut state,
             CpuId(0),
-            Riscv64TrapContext {
-                scause: INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER,
-                stval: 0,
-            },
+            Riscv64TrapContext::exception(INTERRUPT_BIT | IRQ_SUPERVISOR_TIMER, 0),
             Some(&mut frame_b),
         )
         .expect("trap b");

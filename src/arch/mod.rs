@@ -7,6 +7,10 @@ pub mod aarch64;
 pub mod aarch64_boot_policy;
 pub mod boot_entry;
 pub mod cpu_mapping;
+/// U9-IRQ-FINAL §1/§2 — the external-interrupt claim policy, arch-neutral on purpose so it can
+/// be exercised against a controller model on any host. Only the MMIO accesses it delegates to
+/// are target-specific.
+pub mod external_irq_claim;
 #[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub(crate) mod fdt;
 pub mod hal;

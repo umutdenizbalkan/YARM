@@ -1663,16 +1663,6 @@ fn try_split_external_interrupt_into_frame(
     if cfg!(feature = "hosted-dev") && !crate::kernel::boot::irq1_hosted_bridge_injection_armed() {
         return D::NotHandled;
     }
-    // The RISC-V barrier, refused explicitly rather than by omission. See the doc comment: the
-    // decoded value is `stval`, which is not a controller claim.
-    if cfg!(target_arch = "riscv64") {
-        crate::yarm_log!(
-            "IRQ1_SPLIT_REFUSED cpu={} line={} reason=riscv_identifier_is_not_a_claim broad_lock=0",
-            cpu.0,
-            irq_line
-        );
-        return D::NotHandled;
-    }
     let outcome = shared.deliver_external_irq_split(cpu, irq_line);
     crate::yarm_log!(
         "IRQ1_SPLIT_DELIVERY cpu={} line={} outcome={} broad_lock=0",
@@ -1725,16 +1715,27 @@ pub(crate) fn try_split_external_interrupt_dispatch(
 pub(crate) fn settle_external_interrupt_at_bridge(
     shared: &SharedKernel,
     cpu: CpuId,
-    irq: u16,
+    source: u32,
+    completion: crate::arch::hal_adapters::InterruptCompletion,
 ) -> Option<Result<(), TrapHandleError>> {
-    match try_split_external_interrupt_dispatch(shared, cpu, Some(irq)) {
-        SplitDispatchDisposition::NotHandled => None,
-        SplitDispatchDisposition::Complete(result) => {
-            let irq_state = crate::arch::irq_guard::irq_save();
-            crate::arch::hal_adapters::acknowledge_interrupt(cpu, irq);
-            crate::arch::irq_guard::irq_restore(irq_state);
-            Some(result)
+    // U9-IRQ-FINAL §2 — the identifier arrives as the controller's own width and is narrowed
+    // HERE, once, with the failure named. A source too wide to be a route line is still claimed
+    // work: it is delivered nowhere and completed anyway, because truncating it to a `u16` would
+    // complete a DIFFERENT source and leave this one in flight forever.
+    let disposition = match u16::try_from(source) {
+        Ok(line) => try_split_external_interrupt_dispatch(shared, cpu, Some(line)),
+        Err(_) => {
+            crate::yarm_log!(
+                "IRQFINAL_SOURCE_UNROUTABLE cpu={} source={} delivered=0 broad_lock=0",
+                cpu.0,
+                source
+            );
+            SplitDispatchDisposition::Complete(Ok(()))
         }
+    };
+    let settled: Option<Result<(), TrapHandleError>> = match disposition {
+        SplitDispatchDisposition::NotHandled => None,
+        SplitDispatchDisposition::Complete(result) => Some(result),
         other => {
             crate::yarm_log!(
                 "IRQ1_UNEXPECTED_DISPOSITION cpu={} value={:?}",
@@ -1744,7 +1745,32 @@ pub(crate) fn settle_external_interrupt_at_bridge(
             debug_assert!(false, "the IRQ route yields NotHandled or Complete");
             None
         }
+    };
+    // ── THE completion, and the only one ───────────────────────────────────────────────────
+    //
+    // Two disjoint reasons to write it, and neither of them is "always":
+    //
+    // * the route settled the trap, so this kernel performed the work the controller is waiting
+    //   on; or
+    // * the controller already handed us a source (a RISC-V claim), which is in flight whatever
+    //   the routing policy then decided. Leaking it wedges that PLIC context permanently.
+    //
+    // A DECLINE with nothing in flight completes nothing — on x86_64 and AArch64 the broad arm
+    // still owns the interrupt at that point, and completing work this kernel did not perform is
+    // how an interrupt gets completed twice.
+    if settled.is_some() || completion.is_in_flight() {
+        if settled.is_none() {
+            crate::yarm_log!(
+                "IRQFINAL_DECLINED_CLAIM_COMPLETED cpu={} source={} reason=claim_must_not_leak",
+                cpu.0,
+                source
+            );
+        }
+        let irq_state = crate::arch::irq_guard::irq_save();
+        completion.complete(cpu);
+        crate::arch::irq_guard::irq_restore(irq_state);
     }
+    settled
 }
 
 /// U9-IRQ-UNKNOWN1 §3 — **the Unknown policy, before the broad acquisition.**
@@ -1760,7 +1786,6 @@ pub(crate) fn settle_external_interrupt_at_bridge(
 ///
 /// The hosted build keeps its existing behaviour by declining — `handle_trap(Trap::Unknown)`
 /// returns `Ok(())` there and nothing about that changes.
-#[cfg(not(feature = "hosted-dev"))]
 fn try_split_unknown_trap_into_frame(
     cpu: CpuId,
     arch_code: Option<u64>,
@@ -1768,25 +1793,44 @@ fn try_split_unknown_trap_into_frame(
     let Some(arch_code) = arch_code else {
         return SplitDispatchDisposition::NotHandled;
     };
-    // Production is strict, and the panic is the policy — not a substitute for one. The encoding
-    // itself lives in ONE body, `crate::kernel::boot::unknown_trap_fatal`, which emits the broad
-    // arm's own diagnostic and marker from the HARDWARE-derived CPU and code and then diverges.
-    // It is not `cfg`-gated, so a hosted test can exercise the exact ending production takes;
-    // only reachability is, which is what keeps hosted non-strict.
+    if crate::kernel::boot::strict_unknown_traps() {
+        // Production is strict, and the panic is the policy — not a substitute for one. The
+        // encoding itself lives in ONE body, `crate::kernel::boot::unknown_trap_fatal`, which
+        // emits the broad arm's own diagnostic and marker from the HARDWARE-derived CPU and code
+        // and then diverges. It is not `cfg`-gated, so a hosted test can exercise the exact
+        // ending production takes; only reachability is, which is what keeps hosted non-strict.
+        //
+        // The trap window is retired by the caller before this diverges, which is why the bridge
+        // calls this from a position that owns that retirement.
+        crate::kernel::boot::unknown_trap_fatal(cpu, arch_code);
+    }
+    // ── U9-IRQ-FINAL §3 — hosted, settled HERE rather than by a broad acquisition ───────────
     //
-    // The trap window is retired by the caller before this diverges, which is why the bridge
-    // calls this from a position that owns that retirement.
-    crate::kernel::boot::unknown_trap_fatal(cpu, arch_code);
-}
-
-#[cfg(feature = "hosted-dev")]
-fn try_split_unknown_trap_into_frame(
-    _cpu: CpuId,
-    _arch_code: Option<u64>,
-) -> SplitDispatchDisposition {
-    // Hosted is NOT strict, and keeps its existing route: the broad arm's `handle_trap`
-    // answers `Ok(())` and nothing here may change that.
-    SplitDispatchDisposition::NotHandled
+    // Preserving hosted's non-strict behaviour never required preserving the broad lock. The
+    // broad arm's hosted answer is exactly three things: the diagnostic line, the default-off
+    // classification marker, and `handle_trap(Trap::Unknown)` — whose entire body for this trap
+    // is `Ok(())`. All three are reproduced here, from the same hardware-derived CPU and code,
+    // so the observable behaviour is identical and the acquisition is not taken.
+    //
+    // The policy is UNCHANGED: hosted still returns normally and production still diverges. What
+    // changed is only where hosted's return is produced.
+    crate::yarm_log!(
+        "unknown trap event cpu={} arch_code=0x{:x}",
+        cpu.0,
+        arch_code
+    );
+    if crate::kernel::boot::fault_delivery_enabled() {
+        crate::yarm_log!(
+            "FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL vector=0x{:x}",
+            arch_code
+        );
+    }
+    crate::yarm_log!(
+        "IRQ1_UNKNOWN_SETTLED cpu={} arch_code=0x{:x} strict=0 broad_lock=0",
+        cpu.0,
+        arch_code
+    );
+    SplitDispatchDisposition::Complete(Ok(()))
 }
 
 /// U9-IRQ-UNKNOWN1 §3 — the bridge entry for the Unknown route.
