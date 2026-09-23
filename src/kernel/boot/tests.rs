@@ -35660,9 +35660,11 @@ mod stage120_controlled_switch_proof {
     #[test]
     fn stage120_proof_is_single_cpu_and_one_shot() {
         assert!(
-            EXEC_STATE_SRC.contains("self.online_cpu_count() != 1")
+            EXEC_STATE_SRC.contains("let online = shared.online_cpu_count_split_read();")
+                && EXEC_STATE_SRC.contains("if online != 1 {")
                 && EXEC_STATE_SRC.contains("reason=multi_cpu"),
-            "proof harness must defer unless exactly one CPU is online"
+            "proof harness must defer unless exactly one CPU is online \u{2014} U9-D6-FINAL \u{a7}2 \
+             asks the SAME question through the rank-1 split reader instead of `&mut self`"
         );
         assert!(
             MOD_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_STARTED")
@@ -35683,9 +35685,14 @@ mod stage120_controlled_switch_proof {
         );
         assert!(
             EXEC_STATE_SRC
-                .contains("self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)")
-                && MOD_SRC.contains("pub(crate) struct DispatchSwitchPlan"),
-            "proof harness must reuse the existing DispatchSwitchPlan path"
+                .contains("shared.d6_publish_switch_plan_split(cpu, outgoing_tid, incoming_tid)")
+                && MOD_SRC.contains("pub(crate) struct DispatchSwitchPlan")
+                && include_str!("../../runtime.rs").contains(
+                    "build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming_tid)"
+                ),
+            "proof harness must reuse the existing DispatchSwitchPlan path \u{2014} U9-D6-FINAL \u{a7}2 \
+             publishes through the split owner, which builds with the SAME free-function builder \
+             the broad path uses"
         );
         assert!(
             TRAP_ENTRY_SRC.contains("DISPATCH_SWITCH_PLAN_STASH")
@@ -37003,13 +37010,20 @@ mod stage129_active_root_repair {
     // 7. Active/outgoing ASID is checked before stashing the proof plan.
     #[test]
     fn stage129_active_asid_checked_before_proof_stash() {
-        let proof = EXEC_STATE_SRC;
+        // U9-D6-FINAL §2: the preparation calls take `(shared, cpu, tid)` now and rustfmt wraps
+        // them, so the ordering is read from a whitespace-normalized copy. The claim is the same
+        // one: the active-root check precedes the publication.
+        let flat = EXEC_STATE_SRC
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        let proof: &str = &flat;
         let active_check = proof
-            .find("ensure_active_root_can_use_kernel_switch_stack(incoming_tid)")
+            .find("ensure_active_root_can_use_kernel_switch_stack( shared, cpu, incoming_tid, )")
             .expect("active-root guard call in proof path");
         let stash = proof
-            .find("self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?")
-            .expect("proof stash call");
+            .find("shared.d6_publish_switch_plan_split(cpu, outgoing_tid, incoming_tid)")
+            .expect("proof publication call");
         assert!(
             active_check < stash,
             "Stage 129 active-root check must precede the proof stash call"
@@ -37208,21 +37222,25 @@ mod stage128_active_cr3_switch_stack_mapping {
     #[test]
     fn stage128_proof_checks_active_outgoing_root_before_stashing() {
         let active = active_check_source();
-        let proof = EXEC_STATE_SRC;
+        let flat = EXEC_STATE_SRC
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        let proof: &str = &flat;
         assert!(
             active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_ROOT")
                 && active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK")
                 && active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED")
-                && active.contains("self.hal.active_asid_on(self.current_cpu())")
+                && active.contains("crate::arch::hal::active_address_space(cpu)")
                 && active.contains("page_table::resolve_page(active_asid, stack_page)"),
             "Stage 128 must expose active-root diagnostics and check the currently active ASID"
         );
         let active_check = proof
-            .find("ensure_active_root_can_use_kernel_switch_stack(incoming_tid)")
+            .find("ensure_active_root_can_use_kernel_switch_stack( shared, cpu, incoming_tid, )")
             .expect("active-root guard call");
         let stash = proof
-            .find("self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?")
-            .expect("proof stash call");
+            .find("shared.d6_publish_switch_plan_split(cpu, outgoing_tid, incoming_tid)")
+            .expect("proof publication call");
         assert!(
             active_check < stash && proof.contains("reason=active_stack_unmapped"),
             "Stage 128 proof must check the active/outgoing root before stashing switch_frames"
@@ -39398,12 +39416,15 @@ mod stage139_d6_proof_cr3_cleanup {
         let before_pos = EXEC_STATE_SRC
             .find("D6_PROOF_CR3_BEFORE")
             .expect("D6_PROOF_CR3_BEFORE must be present");
+        // U9-D6-FINAL §2: the plan is published through the split owner now, so the ordering
+        // claim is stated against THAT call. The claim is unchanged — the CR3 snapshot must be
+        // taken before the switch is published, or the cleanup has nothing to compare against.
         let switch_pos = EXEC_STATE_SRC
-            .find("maybe_switch_kernel_context(Some(outgoing_tid)")
-            .expect("maybe_switch_kernel_context(Some(outgoing_tid)) call must be present");
+            .find("d6_publish_switch_plan_split(cpu, outgoing_tid, incoming_tid)")
+            .expect("the switch-plan publication must be present");
         assert!(
             before_pos < switch_pos,
-            "D6_PROOF_CR3_BEFORE must appear before maybe_switch_kernel_context: before@{before_pos} switch@{switch_pos}"
+            "D6_PROOF_CR3_BEFORE must appear before the switch publication: before@{before_pos} switch@{switch_pos}"
         );
     }
 
@@ -53387,7 +53408,7 @@ mod stage165b_d6_live_rsp_stack_map {
             "proof must sample the live RSP via inline asm"
         );
         assert!(
-            body.contains("d6_ensure_live_rsp_region_mapped(sampled_rsp)"),
+            body.contains("d6_ensure_live_rsp_region_mapped(shared, cpu, sampled_rsp)"),
             "proof must call d6_ensure_live_rsp_region_mapped with the sampled RSP"
         );
     }
@@ -148585,14 +148606,6 @@ mod u9tm_proof_gate {
                 "Self::ContinueCurrent",
                 "SplitDispatchDisposition::PostWorkCommitted",
             ),
-            // U9-TIMER-FINAL's named residual: the ONE settlement that maps to broad handling,
-            // reachable only while a default-off x86_64 diagnostic owns the switch path. See
-            // `u9timer1_preempting_timer::the_only_broad_hand_off_is_the_default_off_diagnostic`
-            // for why it is kept and what would retire it.
-            (
-                "Self::DiagnosticSwitchOwner",
-                "SplitDispatchDisposition::NotHandled",
-            ),
         ] {
             let at = mapping
                 .find(settlement)
@@ -148611,9 +148624,9 @@ mod u9tm_proof_gate {
             !mapping.contains("Complete"),
             "no settlement may map to a syscall completion — a timer has no caller to answer"
         );
-        // Exactly one settlement maps to broad handling, and it is the diagnostic residual.
-        // Comments stripped: the mapping's own comment names the disposition it is the single
-        // legitimate producer of.
+        // U9-D6-FINAL §3: ZERO settlements map to broad handling. The one that did was the
+        // diagnostic residual, and retiring it means the mapping can no longer spell the terminal
+        // dispatcher at all — a recognized timer has nowhere else to go.
         let broad_arms: alloc::vec::Vec<&str> = mapping
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -148621,12 +148634,8 @@ mod u9tm_proof_gate {
             .collect();
         assert_eq!(
             broad_arms.len(),
-            1,
-            "exactly one broad arm in the mapping, found {broad_arms:?}"
-        );
-        assert!(
-            broad_arms[0].contains("Self::DiagnosticSwitchOwner"),
-            "and it belongs to the diagnostic residual, not to an ordinary settlement"
+            0,
+            "no settlement may map to the terminal broad dispatcher, found {broad_arms:?}"
         );
 
         // ── the arms that produce each settlement ────────────────────────────────────────────
@@ -172879,22 +172888,20 @@ mod u9timer1_preempting_timer {
         }
     }
 
-    /// **A recognized PRODUCTION timer cannot ask for broad handling, and the one hand-off that
-    /// remains is a default-off diagnostic that takes no work before it hands over.**
+    /// U9-D6-FINAL §3 — **the hand-off is gone, and the settlement enum has no way to spell one.**
     ///
-    /// This is U9-TIMER-FINAL's acceptance claim, stated exactly rather than optimistically.
+    /// U9-TIMER-FINAL kept `DiagnosticSwitchOwner` as a named residual and recorded its exact
+    /// prerequisite for removal: "re-home `DispatchSwitchPlan` production onto the split seams".
+    /// That is what U9-D6-FINAL §2 did, so the residual is retired rather than tolerated.
     ///
-    /// The §2 draft had `TimerSettlement` with three variants and no `NotHandled` at all, and
-    /// settled `ArchGateOff` locally as `ContinueCurrent`. **That was measured and was wrong.**
-    /// Under `D6_SWITCH_A=1 yarm.sched_quantum_ticks=1`, all 74 preempting ticks of a boot decline
-    /// with `d6_genuine_off` — so continuing locally does not defer the preemption by one tick, it
-    /// drops it permanently, which is precisely what §2 forbids, and the boot stops progressing
-    /// (base reaches `KSPAWN_ENTER`; a `ContinueCurrent` head does not).
+    /// The measurement that justified keeping it is not contradicted — it is superseded. Under
+    /// the old gate every preempting tick of a D6 run declined for the same boot-long reason, so
+    /// settling locally as `ContinueCurrent` would have dropped the preemption permanently. The
+    /// gate is now the per-trap switch-plan stash, and the diagnostic that occupies it is
+    /// one-shot: at most one tick can collide, and the next one is admitted.
     ///
-    /// So the hand-off is kept for that one population, and this case pins the three properties
-    /// that make it a named residual instead of a hole: it is produced from ONE site, that site is
-    /// the body's FIRST act so nothing has been ticked or re-armed, and its gate is a default-off
-    /// knob on one architecture.
+    /// This case pins what is left: three settlements, all of them settlements, and no path from
+    /// this body to the terminal broad dispatcher in ANY configuration.
     #[test]
     fn the_only_broad_hand_off_is_the_default_off_diagnostic() {
         let code = route();
@@ -172902,13 +172909,20 @@ mod u9timer1_preempting_timer {
             "TimerSettlement::QueueAdvanceCommitted",
             "TimerSettlement::IdleQueueAdvance",
             "TimerSettlement::ContinueCurrent",
-            "TimerSettlement::DiagnosticSwitchOwner",
         ] {
             assert!(
                 code.contains(settlement),
                 "`{settlement}` must be reachable"
             );
         }
+        assert!(
+            !code.contains("DiagnosticSwitchOwner"),
+            "the diagnostic hand-off must be REMOVED, not merely unreachable"
+        );
+        assert!(
+            !code.contains("diagnostic_owns_switch_path"),
+            "and its predicate with it — a knob is not a per-trap ownership fact"
+        );
         assert!(
             !code.contains("NotHandled"),
             "even the residual must be named as a SETTLEMENT — the body must not be able to spell \
@@ -172919,140 +172933,23 @@ mod u9timer1_preempting_timer {
             "and must not reach the disposition type at all — the mapping is the settlement's"
         );
 
-        // ── the residual is produced ONCE, and FIRST ─────────────────────────────────────────
-        assert_eq!(
-            code.matches("TimerSettlement::DiagnosticSwitchOwner")
-                .count(),
-            1,
-            "exactly one producer, so the hand-off cannot acquire a second reason"
-        );
-        let handoff = code
-            .find("TimerSettlement::DiagnosticSwitchOwner")
-            .expect("the residual");
-        for after in [
+        // ── and the tick/acknowledge/re-arm prologue now runs for EVERY recognized timer ────
+        //
+        // The hand-off was taken before any of them, which is what made "the broad arm services
+        // this interrupt exactly once" true. With no hand-off there is nothing to take it before:
+        // every recognized tick reaches the prologue, so the three obligations are discharged
+        // here, once, on every path out of this body.
+        for owed in [
             "scheduler_tick_split_mut(cpu)",
             "acknowledge_interrupt(cpu, 0)",
             "program_timer_deadline(",
-            "run_yield_transaction(&mut owners, cpu)",
         ] {
-            let at = code.find(after).unwrap_or_else(|| panic!("`{after}`"));
-            assert!(
-                handoff < at,
-                "the hand-off must precede `{after}` — handing over AFTER the prologue would make \
-                 the broad arm tick, acknowledge and re-arm a SECOND time"
+            assert_eq!(
+                code.matches(owed).count(),
+                1,
+                "`{owed}` must appear exactly once — one tick, one acknowledgement, one re-arm"
             );
         }
-        assert!(
-            code.contains("ticked=0 rearm=0 settlement=broad_owner"),
-            "and the marker must say so, so a live run reports an untouched hand-off rather than \
-             leaving it to be inferred"
-        );
-
-        // ── its gate is a default-off knob on ONE architecture ───────────────────────────────
-        let gate = SPLIT
-            .split("fn diagnostic_owns_switch_path() -> bool {")
-            .nth(1)
-            .and_then(|s| s.split("\n}").next())
-            .expect("the residual's gate")
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<alloc::vec::Vec<_>>()
-            .join("\n");
-        assert!(
-            gate.contains("#[cfg(target_arch = \"x86_64\")]")
-                && gate.contains("#[cfg(not(target_arch = \"x86_64\"))]")
-                && gate.contains("false"),
-            "the gate must be architecture-total: x86_64 asks the knobs, every other port is \
-             unconditionally closed"
-        );
-        for knob in [
-            "d6_controlled_switch_proof_enabled()",
-            "d6_switch_a_enabled()",
-        ] {
-            assert!(gate.contains(knob), "the gate must ask `{knob}`");
-        }
-        // Both knobs are default-off, which is what makes the residual unreachable in production.
-        // Read from THEIR owner, so a default that changed would fail here rather than silently
-        // widen the residual.
-        const BOOT_MOD: &str = include_str!("mod.rs");
-        for flag in ["D6_CONTROLLED_SWITCH_PROOF_ENABLED", "D6_SWITCH_A_ENABLED"] {
-            let decl = BOOT_MOD
-                .split(&alloc::format!(
-                    "static {flag}: core::sync::atomic::AtomicBool ="
-                ))
-                .nth(1)
-                .and_then(|s| s.split(';').next())
-                .unwrap_or_else(|| panic!("`{flag}` must be an AtomicBool with a literal default"));
-            assert!(
-                decl.contains("AtomicBool::new(false)"),
-                "`{flag}` must default to false — it is what makes the residual non-production"
-            );
-        }
-        // The filter is separate, and it is the ONLY `NotHandled`. Comments are stripped here for
-        // the same reason they are in `route()`: the filter's own comment names the disposition it
-        // is the single legitimate producer of, and counting prose would report two.
-        let filter: alloc::string::String = SPLIT
-            .split("fn try_split_timer_into_frame(\n    shared: &SharedKernel,")
-            .nth(1)
-            .and_then(|s| s.split("\n}").next())
-            .expect("the family filter")
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<alloc::vec::Vec<_>>()
-            .join("\n");
-        let filter = filter.as_str();
-        assert!(
-            filter.contains("if !is_timer {") && filter.contains("NotHandled"),
-            "the family filter rejects a non-timer event and nothing else"
-        );
-        assert_eq!(
-            filter.matches("NotHandled").count(),
-            1,
-            "exactly one, and it is the family filter's"
-        );
-        // The residual's `NotHandled` lives in the MAPPING, not in the body and not in the filter,
-        // so there are exactly two in the whole route: "this is not a timer", and "a diagnostic
-        // owns the switch path".
-        assert_eq!(
-            SPLIT
-                .split("fn disposition(self) -> SplitDispatchDisposition {")
-                .nth(1)
-                .and_then(|s| s.split("\n    }").next())
-                .expect("the mapping")
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .filter(|l| l.contains("NotHandled"))
-                .count(),
-            1,
-            "the mapping has exactly one broad arm, and it belongs to the diagnostic residual"
-        );
-        assert!(
-            filter.contains("settle_recognized_timer(shared, cpu).disposition()"),
-            "and everything else is the recognized body's settlement, mapped"
-        );
-        // The mapping is total over a closed enum, so a new settlement cannot be added without
-        // choosing a disposition for it.
-        let mapping = SPLIT
-            .split("fn disposition(self) -> SplitDispatchDisposition {")
-            .nth(1)
-            .and_then(|s| s.split("\n    }").next())
-            .expect("the settlement mapping");
-        // A wildcard arm would make the mapping total by DEFAULTING, which is exactly what must
-        // not be possible: adding a fourth settlement has to be a choice about where it goes. The
-        // test is for a wildcard PATTERN — `mapping.contains('_')` would match `finalize_syscall`
-        // and assert nothing.
-        for arm in mapping.lines().map(str::trim) {
-            assert!(
-                !arm.starts_with("_ =>") && !arm.starts_with("_ if "),
-                "the mapping must enumerate every settlement rather than defaulting one, found \
-                 `{arm}`"
-            );
-        }
-        assert_eq!(
-            mapping.matches("Self::").count(),
-            4,
-            "and it names all four settlements explicitly"
-        );
     }
 
     /// **No syscall-return encoding.** NR 0 finishes with `frame.set_ok(0, 0, 0)` because a yield

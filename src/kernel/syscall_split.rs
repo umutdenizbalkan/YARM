@@ -4440,31 +4440,6 @@ pub(crate) enum TimerSettlement {
     /// interrupted task is still `Running`, still `current`, and still owns the frame this trap
     /// will return through — which is precisely why returning to it is safe.
     ContinueCurrent,
-    /// **THE ONE SETTLEMENT THAT HANDS A RECOGNIZED TIMER AWAY, and the honest residual of
-    /// U9-TIMER-FINAL.**
-    ///
-    /// It exists because on x86_64 the `yarm.d6_switch_proof` / `yarm.d6_switch_a` knobs make an
-    /// ACTIVE diagnostic the owner of the switch path, and in that mode the only code that can
-    /// complete a preempting timer is the broad in-lock dispatch inside `yield_current`. §2
-    /// forbids disabling a supported knob to manufacture closure, and forbids a dropped
-    /// preemption — and settling this population as [`Self::ContinueCurrent`] would be exactly a
-    /// dropped preemption, because under those knobs EVERY tick declines identically, so the
-    /// switch would never happen at all rather than happening one tick later.
-    ///
-    /// Three properties make it a residual rather than a hole:
-    ///
-    /// * **It is decided BEFORE any work.** `settle_recognized_timer` returns it as its first
-    ///   act, so no tick, acknowledgement or re-arm has been taken and the broad arm performs all
-    ///   three exactly once — the same sequence it performed before this package.
-    /// * **It is unreachable in production.** Both predicates are default-off boot knobs, and the
-    ///   gate is additionally `cfg(target_arch = "x86_64")`. With no knob armed,
-    ///   `d6_genuine_enabled()` is true and this settlement cannot be produced.
-    /// * **Its removal has a named prerequisite**, which is D6's and not the timer's: the
-    ///   `DispatchSwitchPlan` stash is produced from inside the broad acquisition, so a split
-    ///   route cannot publish one without becoming a SECOND switch owner in the one mode whose
-    ///   entire contract is that there is exactly one. Re-homing that production onto the split
-    ///   seams is what would retire this variant.
-    DiagnosticSwitchOwner,
 }
 
 #[cfg(not(feature = "hosted-dev"))]
@@ -4481,34 +4456,7 @@ impl TimerSettlement {
             Self::ContinueCurrent => SplitDispatchDisposition::PostWorkCommitted {
                 finalize_syscall: false,
             },
-            // The ONE broad hand-off, and it is taken before any work — see the variant's own
-            // documentation for why it is a named residual rather than an escape.
-            Self::DiagnosticSwitchOwner => SplitDispatchDisposition::NotHandled,
         }
-    }
-}
-
-/// Does an ACTIVE diagnostic own this architecture's switch path?
-///
-/// The exact complement of `d6_genuine_enabled()`, which is what
-/// [`crate::kernel::syscall::yield_txn::yield_deferral_arch_gate`] tests on x86_64 — so asking it
-/// here answers "would the transaction decline with `ArchGateOff`, for the D6 reason?" WITHOUT
-/// running the transaction, which is what lets the hand-off be taken before the tick.
-///
-/// It is deliberately NOT the whole of `ArchGateOff`. The other spelling of that decline is
-/// `not_bsp` on AArch64 and RISC-V, which no timer reaches (no AP arms a timer on any port) and
-/// which would in any case be wrong to hand to the broad arm: a non-bootstrap CPU has no
-/// diagnostic owner waiting for it.
-#[cfg(not(feature = "hosted-dev"))]
-fn diagnostic_owns_switch_path() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        crate::kernel::boot::d6_controlled_switch_proof_enabled()
-            || crate::kernel::boot::d6_switch_a_enabled()
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
     }
 }
 
@@ -4635,67 +4583,47 @@ fn diagnostic_owns_switch_path() -> bool {
 ///
 /// # `ArchGateOff` is an ACTIVE gate, and is kept
 ///
-/// On x86_64 the gate is `!d6_genuine_enabled()`, true while `yarm.d6_switch_proof` or
-/// `yarm.d6_switch_a` is armed. It is not a stale restriction: under those two knobs the Yield
-/// DRAIN in `arch/trap_entry.rs` is disabled by the same predicate, because the switch path is
-/// owned by the `DispatchSwitchPlan` stash instead. Publishing a deferral there would strand the
-/// caller behind a drain that cannot run, and draining it here would make this route a SECOND
-/// switch owner in a mode whose whole purpose is that there is exactly one.
+/// U9-D6-FINAL §3 — **the arch gate no longer asks about a knob, and nothing is handed away.**
 ///
-/// So the gate stays — and, MEASURED rather than assumed, it does not settle as `ContinueCurrent`
-/// either. Under `D6_SWITCH_A=1 yarm.sched_quantum_ticks=1`, every one of 74 preempting ticks
-/// declines for this same reason, so "the next tick will preempt" is false: continuing locally
-/// would drop the preemption permanently rather than defer it, and the boot stops making progress
-/// (base reaches `KSPAWN_ENTER`, a `ContinueCurrent` head does not). That is what §2 forbids when
-/// it says normal contention must not become a dropped preemption, and it is why this one
-/// population is handed to the diagnostic's own owner through
-/// [`TimerSettlement::DiagnosticSwitchOwner`], before any work is taken.
+/// The x86_64 arm used to be `!d6_genuine_enabled()`, true while `yarm.d6_switch_proof` or
+/// `yarm.d6_switch_a` was armed, and a decline for that reason was handed to the broad arm as
+/// `TimerSettlement::DiagnosticSwitchOwner` — the last route by which a recognized timer could
+/// reach the terminal acquisition.
 ///
-/// On AArch64 and RISC-V the gate is `!is_bootstrap_cpu(cpu)`, and it is UNREACHABLE for a timer:
-/// no AP arms a timer on either port. `start_bsp_periodic_timer` programs only the bootstrap CPU,
-/// `yarm_aarch64_secondary_cpu_boot` records that "APs do NOT arm a timer" because
+/// It is gone, and not by disabling anything. The question the gate was really asking was "does
+/// something else already own this trap's switch?", and it answered it with a proxy: a knob that
+/// is armed for the whole boot. That proxy was wrong in both directions — it was true on every
+/// tick of a D6 run, including the thousands after the one-shot proof had finished and nothing
+/// owned the switch at all, and it could never have seen an ordinary queue-advance deferral.
+///
+/// The real question is now asked of the real thing. The switch-plan stash IS the ownership
+/// token — the drain applies exactly one plan per trap — so `colliding_deferral_pending_for`
+/// tests it directly, and a Yield or a preempting tick that would publish a second plan declines
+/// `DeferralHeld`, an existing decline this route already settles as `ContinueCurrent`.
+///
+/// **That is a deferral and not a dropped preemption**, which is what the old note measured and
+/// feared. Under the old gate every tick declined identically, forever, so continuing locally
+/// would have lost the preemption permanently. Now the only tick that can collide is one whose
+/// trap the D6 proof published on, and the proof is one-shot: the next tick finds the stash
+/// empty, the transaction is admitted, and the preemption happens one tick later.
+///
+/// On AArch64 and RISC-V the gate is still `!is_bootstrap_cpu(cpu)`, and it is still UNREACHABLE
+/// for a timer: no AP arms a timer on either port. `start_bsp_periodic_timer` programs only the
+/// bootstrap CPU, `yarm_aarch64_secondary_cpu_boot` records that "APs do NOT arm a timer" because
 /// `SchedulerState.timer` is one shared counter, and RISC-V parks its secondary harts outright.
 /// Measured rather than inferred: in the x86_64 `-smp 2` AP profile every `TIMER_SPLIT_*` marker
 /// carries `cpu=0`.
 ///
-/// # What is still handed away, and where
+/// # What is still handed away
 ///
-/// Exactly two things, and neither is a recognized production timer:
+/// One thing, and it is not a timer: `!is_timer`, in `try_split_timer_into_frame`. That is the
+/// family filter — an event that is not a timer at all.
 ///
-/// 1. `!is_timer`, in `try_split_timer_into_frame`. That is the family filter — an event that is
-///    not a timer at all — and it is not a timer escape.
-/// 2. [`TimerSettlement::DiagnosticSwitchOwner`], from step (0) below, reachable only on x86_64
-///    with `yarm.d6_switch_proof=1` or `yarm.d6_switch_a=1`. Both default off, so with no knob
-///    armed this body has no path to `NotHandled` at all.
-///
-/// **Acceptance, stated exactly:** no recognized PRODUCTION `TimerInterrupt` can reach the
-/// terminal broad acquisition. The residual is a default-off diagnostic, and its prerequisite for
-/// removal is D6's own: re-home `DispatchSwitchPlan` production onto the split seams.
+/// **Acceptance, stated exactly:** no recognized `TimerInterrupt` can reach the terminal broad
+/// acquisition, in ANY supported configuration, including both diagnostic profiles and their
+/// combined-knob precedence. The settlement enum has no `NotHandled` disposition left.
 #[cfg(not(feature = "hosted-dev"))]
 fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement {
-    // ── (0) THE DIAGNOSTIC SWITCH OWNER — decided FIRST, and that position is the contract ───
-    //
-    // Under `yarm.d6_switch_proof` / `yarm.d6_switch_a` the switch path belongs to the
-    // `DispatchSwitchPlan` stash, produced from inside the broad acquisition. A preempting tick
-    // in that mode can only be completed there, so this body hands the whole interrupt over
-    // untouched.
-    //
-    // UNTOUCHED is the point. If this test sat after the prologue, the broad arm would tick,
-    // acknowledge and re-arm a SECOND time — §2's exactly-once obligation, broken by the very
-    // hand-off meant to preserve the diagnostic. Deciding it here means the broad arm services
-    // the interrupt exactly as it did before this package, byte for byte.
-    //
-    // It also cannot be replaced by settling `ArchGateOff` locally as `ContinueCurrent`: under
-    // these knobs EVERY tick declines for the same reason, so "the next tick will preempt" is
-    // false and the preemption would be dropped forever rather than deferred.
-    if diagnostic_owns_switch_path() {
-        crate::yarm_log!(
-            "TIMER_SPLIT_DIAGNOSTIC_SWITCH_OWNER cpu={} reason=d6_genuine_off ticked=0 rearm=0 settlement=broad_owner",
-            cpu.0
-        );
-        return TimerSettlement::DiagnosticSwitchOwner;
-    }
-
     // ── (0b) THE ENTERING INCARNATION, captured once, before anything is decided ─────────────
     //
     // U9-PAGEFAULT1 §0. The frame this trap will return through belongs to whoever was executing

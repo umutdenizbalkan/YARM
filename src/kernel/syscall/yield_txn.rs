@@ -208,12 +208,14 @@ pub(crate) fn yield_deferral_arch_gate<O: YieldOwners>(
     owners: &O,
     cpu: CpuId,
 ) -> Result<(), YieldDecline> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if !crate::kernel::boot::d6_genuine_enabled() {
-            return Err(YieldDecline::ArchGateOff);
-        }
-    }
+    // U9-D6-FINAL §3 — the x86_64 arm is gone, and nothing replaced it in this position.
+    //
+    // It was `!d6_genuine_enabled()`, i.e. "a D6 switch knob is armed", used as a proxy for
+    // "something else owns this trap's switch". The proxy was a boot-long predicate standing in
+    // for a per-trap fact, so it declined every yield of a D6 run — including all the ones after
+    // the one-shot proof had finished — and could not see an ordinary queue-advance deferral at
+    // all. The real ownership token is the switch-plan stash, and `colliding_deferral_pending`
+    // below now tests it, which makes the collision a `DeferralHeld` decline about THIS trap.
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     {
         if !owners.is_bootstrap_cpu(cpu) {
@@ -434,6 +436,19 @@ fn colliding_deferral_pending_for(cpu_idx: usize) -> bool {
         return true;
     }
     if crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx) {
+        return true;
+    }
+    // U9-D6-FINAL §3 — a pending switch plan is this trap's switch owner.
+    //
+    // The Stage 117 drain applies exactly one plan per trap, so a route that published one owns
+    // the switch and a second publisher would either be lost or overwrite it. Testing the stash
+    // here is what makes "one owner for each trap's switch" a fact about the trap rather than
+    // about which boot knobs happen to be armed, and it covers the diagnostic switch and an
+    // ordinary queue advance with the same test.
+    //
+    // SAFETY: single CPU, interrupts disabled by hardware trap entry, no concurrent accessor —
+    // the same conditions under which the stash is stored and drained.
+    if unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() } {
         return true;
     }
     #[cfg(target_arch = "riscv64")]
