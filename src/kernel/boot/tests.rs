@@ -188472,30 +188472,59 @@ mod u9d6final_closure {
     const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
 
-    /// **The hook runs OUTSIDE the broad acquisition's closure**, and the acquisition no longer
-    /// carries it.
+    /// **The hook does not depend on the terminal acquisition, nor on the trap falling through
+    /// to it** — and its position is derived from its own prerequisites.
     ///
-    /// The claim is not merely textual ordering: what matters is that the call is not inside the
-    /// `with_cpu(cpu, |kernel| { … })` closure, because that is what made the acquisition the
-    /// diagnostic's supplier of `&mut KernelState`. It sits at the head of the same arm, so it
-    /// samples the same traps — MEASURED: at the top of the function it only ever observes the
-    /// supervisor as current and defers with `wrong_outgoing_tid` forever.
+    /// U9-D6-FINAL §2 first moved the call out of the `with_cpu(cpu, |kernel| { … })` closure but
+    /// left it at the head of the same `else` arm, which is the arm the terminal acquisition
+    /// lives in. That still made a default-off diagnostic depend on a trap going UNHANDLED —
+    /// MEASURED: with the four drain gates repaired, every trap settled pre-lock, the arm never
+    /// ran, and the proof reported nothing at all. §5 then deletes that arm, which would have
+    /// made the hook dead code.
+    ///
+    /// What is asserted now is the property that survives that deletion: the call sits at
+    /// statement level in `handle_trap_entry_shared`, AFTER the whole `let inner_result = …;`
+    /// binding that both arms feed, so no branch of the disposition match can skip it — and
+    /// before the two things it needs, the publication window's settlement and the drain.
     #[test]
     fn the_proof_hook_precedes_the_terminal_acquisition() {
+        assert_eq!(
+            TRAP.matches("maybe_run_d6_controlled_switch_proof_split(")
+                .count(),
+            1,
+            "one hook"
+        );
         let hook = TRAP
             .find("maybe_run_d6_controlled_switch_proof_split(")
             .expect("the pre-lock hook");
-        let acquisition = TRAP
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the terminal acquisition");
+        // The `let inner_result = <if/else>;` binding ends here; both arms are behind us.
+        let arms_closed = TRAP
+            .find(".map_err(|err| TrapHandleError::Syscall(err.into()))\n        };")
+            .expect("the end of the disposition binding");
         assert!(
-            hook < acquisition,
-            "the diagnostic must not be a reason for the acquisition to exist"
+            arms_closed < hook,
+            "the hook must be outside BOTH arms, so deleting the fall-through cannot orphan it"
         );
-        // And nothing between them opens the closure, so the hook is genuinely outside it.
+        // It is not inside any acquisition closure: no `with_cpu(` is opened between the end of
+        // that binding and the call.
         assert!(
-            !TRAP[hook..acquisition].contains("with_cpu("),
-            "the hook must be outside the acquisition's closure, not merely before some later one"
+            !TRAP[arms_closed..hook].contains("with_cpu("),
+            "the hook must not sit inside an acquisition's closure"
+        );
+        // The publication window must still be OPEN — `settle()` closes it before the drains,
+        // and a publisher after that point is refused `NoTrapDrainer`.
+        let settle = TRAP[hook..]
+            .find("trap_path.settle();")
+            .map(|at| at + hook)
+            .expect("the publication window settlement");
+        let drain = TRAP[hook..]
+            .find("drain_switch_plan_stash(shared, cpu, ")
+            .map(|at| at + hook)
+            .expect("the drain");
+        assert!(
+            hook < settle && settle < drain,
+            "the hook publishes while the window is open, and its drainer runs later in the \
+             same trap"
         );
         assert!(
             !TRAP.contains("kernel.maybe_run_d6_controlled_switch_proof()"),

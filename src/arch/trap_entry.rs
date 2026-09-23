@@ -1567,43 +1567,6 @@ pub fn handle_trap_entry_shared(
                 .or(cow_result)
                 .unwrap_or(Ok(())))
         } else {
-            // ── U9-D6-FINAL §2/§3 — the D6 switch proof, OUTSIDE the broad acquisition ────────
-            //
-            // Stage 120 ran this from inside `with_cpu`, which is what made the terminal
-            // acquisition a dependency of a default-off diagnostic rather than of any production
-            // work. It publishes a `DispatchSwitchPlan` for the Stage 117 drain at the bottom of
-            // this function, and that drain has held no broad lock since U9-D3 §7 — so the only
-            // thing the acquisition was still supplying here was a `&mut KernelState` for the
-            // preparation steps. Those now compose the ranked split owners directly.
-            //
-            // **Position is the same statement it always was, minus the lock.** It sits at the
-            // head of the arm the in-lock call occupied: the traps no split route settled. That
-            // is deliberate rather than incidental — MEASURED, moving it to the top of the
-            // function changes which traps it samples, and it then only ever observes the
-            // supervisor as current and defers with `wrong_outgoing_tid` forever. The diagnostic
-            // is entitled to see the same traps it always saw; what it is not entitled to is the
-            // broad lock.
-            //
-            // One owner per trap is not supplied by ordering: it is supplied by the stash
-            // reservation inside `d6_publish_switch_plan_split`, which refuses `stash_occupied`
-            // rather than overwriting a plan an ordinary queue advance already published.
-            //
-            // Default-off and one-shot: with neither knob armed the first test inside returns
-            // immediately, so an ordinary trap pays a predicate read and nothing else.
-            #[cfg(target_arch = "x86_64")]
-            let d6_proof_result =
-                crate::kernel::boot::KernelState::maybe_run_d6_controlled_switch_proof_split(
-                    shared, cpu,
-                );
-            #[cfg(not(target_arch = "x86_64"))]
-            let d6_proof_result: Result<(), crate::kernel::boot::KernelError> = Ok(());
-            if let Err(err) = d6_proof_result {
-                crate::yarm_log!(
-                    "D6_CONTROLLED_SWITCH_PROOF_FAILED cpu={} err={:?}",
-                    cpu.0,
-                    err
-                );
-            }
             shared
                 .with_cpu(cpu, |kernel| {
                     handle_trap_entry_with_fault_bookkeeping_mode(
@@ -1616,6 +1579,59 @@ pub fn handle_trap_entry_shared(
                 })
                 .map_err(|err| TrapHandleError::Syscall(err.into()))
         };
+
+    // ── U9-D6-FINAL §2/§3 (C2) — THE D6 SWITCH PROOF, at a point chosen from its PREREQUISITES ──
+    //
+    // # Why it is not in the fall-through arm any more
+    //
+    // Until this revision the hook sat at the head of the `else` arm above — the traps no split
+    // route settled — because that is where the in-lock call had been. That position is not a
+    // prerequisite of anything the proof does; it is a leftover of where the broad acquisition
+    // happened to be, and it made the diagnostic's execution depend on a trap going UNHANDLED.
+    // The dependency is not theoretical: with the four drain gates repaired, the diagnostic boot
+    // settles every trap pre-lock, the `else` arm never runs, and the proof reported nothing at
+    // all. §5 then deletes that arm outright, at which point the hook would be dead code.
+    //
+    // # The prerequisites it actually has, and where they are all true
+    //
+    //  * **an appropriate current task** — the proof switches FROM this CPU's `current`, and the
+    //    owner below refuses any other outgoing task by name. `current` is settled here: the
+    //    broad acquisition has returned and the post-work drain has run, so this is the task the
+    //    trap will return to.
+    //  * **initialized kernel contexts** on both sides — re-read by the owner, and by the plan
+    //    builder under its own acquisition.
+    //  * **an OPEN PUBLICATION WINDOW** — the hook publishes a plan, and `TrapPathWindow` exists
+    //    to say when publishing is allowed: it is open from trap entry until `settle()` directly
+    //    below, which is documented as closing "before the drains". A publisher after that point
+    //    is refused `NoTrapDrainer`, which is how the first attempt at this move failed — 200
+    //    `trap_path_inactive` deferrals and no proof. So the hook goes immediately BEFORE the
+    //    settlement, the last instant at which publishing is legal.
+    //  * **a drainer downstream** — `drain_switch_plan_stash` at the end of this function, which
+    //    is exactly what the open window asserts.
+    //  * **exclusive ownership of this trap's switch** — the four deferral cells are still armed
+    //    here, because the drains that clear them are downstream. A cell armed at this instant
+    //    means some route is owed a queue-advancing dispatch in this same trap, and
+    //    `d6_publish_switch_plan_split` refuses with `DeferralReserved`. Placing the hook after
+    //    the drains would read those cells as clear — the drains clear them — and the proof would
+    //    publish a second switch into a trap that had just performed one.
+    //
+    // Nothing here depends on how the trap was handled: it is outside both arms of the
+    // disposition match, so the deletion of the fall-through arm cannot make it unreachable.
+    //
+    // Default-off and one-shot: with neither knob armed the first test inside returns
+    // immediately, so an ordinary trap pays a predicate read and nothing else.
+    #[cfg(target_arch = "x86_64")]
+    let d6_proof_result =
+        crate::kernel::boot::KernelState::maybe_run_d6_controlled_switch_proof_split(shared, cpu);
+    #[cfg(not(target_arch = "x86_64"))]
+    let d6_proof_result: Result<(), crate::kernel::boot::KernelError> = Ok(());
+    if let Err(err) = d6_proof_result {
+        crate::yarm_log!(
+            "D6_CONTROLLED_SWITCH_PROOF_FAILED cpu={} err={:?}",
+            cpu.0,
+            err
+        );
+    }
 
     // U9-QA §2: the SINGLE settlement point for the trap-path-active window, covering both
     // paths that reach the drains. It is explicit rather than left to `Drop` because the drains

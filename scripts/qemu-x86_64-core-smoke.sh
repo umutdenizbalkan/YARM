@@ -917,7 +917,42 @@ if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
   if [[ "$map_fail" -eq 0 ]]; then
     echo "[ok] D6 switch proof: no unresolved stack-mapping failures"
   fi
-  if [[ "$proof_fail" -eq 1 || "$fatal_after_proof" -eq 1 || "$map_fail" -eq 1 ]]; then
+  # U9-D6-FINAL (C4): the BLOCKING RECEIVE must keep working under this diagnostic, and the
+  # absence of `already_deferred` does not prove that — it is equally consistent with no receive
+  # ever being attempted. The defect this replaces was exactly that shape: the split receive
+  # route reserved `d2_recv_dispatch` unconditionally while its drain was D6-knob-gated, so the
+  # first receive latched the cell and every later one failed closed with
+  # `IPC_RECV_BLOCK_SPLIT_REFUSED reason=already_deferred` forever.
+  #
+  # So the assertion is POSITIVE and paired: every published receive waiter must have a
+  # corresponding drain that RAN, and there must be many of them, which together say that each
+  # reservation was consumed and that subsequent receives kept progressing.
+  recv_fail=0
+  if [[ -f "$LOGFILE" ]]; then
+    recv_published="$(tr '\r' '\n' <"$LOGFILE" | rg -a -c -- 'IPC_RECV_BLOCK_SPLIT_DONE' || true)"
+    recv_drained="$(tr '\r' '\n' <"$LOGFILE" | rg -a -c -- 'D2_RECV_GENUINE_DISPATCH_DONE' || true)"
+    recv_latched="$(tr '\r' '\n' <"$LOGFILE" | rg -a -c -- 'reason=already_deferred' || true)"
+    recv_published=${recv_published:-0}
+    recv_drained=${recv_drained:-0}
+    recv_latched=${recv_latched:-0}
+    echo "[info] D6 switch proof: receives published=$recv_published drained=$recv_drained latched=$recv_latched"
+    if [[ "$recv_latched" -ne 0 ]]; then
+      echo "[error] D6 switch proof: a receive reservation latched (already_deferred x$recv_latched)"
+      recv_fail=1
+    fi
+    if [[ "$recv_published" -lt 2 ]]; then
+      echo "[error] D6 switch proof: fewer than two blocking receives ran; the reservation was never exercised"
+      recv_fail=1
+    fi
+    if [[ "$recv_drained" -ne "$recv_published" ]]; then
+      echo "[error] D6 switch proof: receive reservations not consumed one-for-one (published=$recv_published drained=$recv_drained)"
+      recv_fail=1
+    fi
+    if [[ "$recv_fail" -eq 0 ]]; then
+      echo "[ok] D6 switch proof: every receive reservation was consumed and subsequent receives progressed"
+    fi
+  fi
+  if [[ "$proof_fail" -eq 1 || "$fatal_after_proof" -eq 1 || "$map_fail" -eq 1 || "$recv_fail" -eq 1 ]]; then
     echo "[error] D6 switch proof mode FAILED"
     exit 1
   fi
@@ -2020,9 +2055,33 @@ if [[ -n "$UNLOCK_GRADUATED" ]]; then
   fi
 fi
 
-# The graduated path is the production path on every boot. Require the graduated verdict
-# (result=ok) and the accepted seam OK markers; a missing/failed verdict is fatal now
+# The graduated path is the production path on every ORDINARY boot. Require the graduated
+# verdict (result=ok) and the accepted seam OK markers; a missing/failed verdict is fatal now
 # (no longer a soft-observe — there is no other path to fall back to).
+#
+# U9-D6-FINAL (C4): this block is skipped under the two D6 SWITCH diagnostics, and only under
+# them. `unlock_graduated_enabled()` IS `d6_genuine_enabled()` in the kernel, and that predicate
+# is false whenever `yarm.d6_switch_proof=1` or `yarm.d6_switch_a=1` is armed — the same
+# mutually-exclusive precedence this script already enforces at its top by forcing D6_GENUINE=0
+# for those runs. So the graduated proof does not run in those profiles BY DESIGN, and requiring
+# its markers there asserts something the kernel never promised.
+#
+# This is not a weakened gate: it is a gate that was previously unreachable in these two
+# profiles, because the D6 proof block above exited first when the proof did not complete. The
+# knob-off path is untouched and still fails hard on a missing marker.
+if [[ "$D6_SWITCH_PROOF" == "1" || "$D6_SWITCH_A" == "1" ]]; then
+  echo "[info] REMOVE-FALLBACKS: skipped — the D6 switch diagnostics disable the graduated path (unlock_graduated_enabled() == d6_genuine_enabled())"
+  for m in \
+    "UNLOCK_GRADUATED_BEGIN" \
+    "UNLOCK_GRADUATED_DONE"; do
+    if log_has_pattern "$m"; then
+      echo "[error] REMOVE-FALLBACKS: $m present although the graduated path is disabled in this profile"
+      exit 1
+    fi
+  done
+  echo "[ok] REMOVE-FALLBACKS: graduated path correctly inert under the D6 switch diagnostic"
+  ug_fail=0
+else
 ug_fail=0
 for m in \
   "UNLOCK_GRADUATED_D2_RECV_OK" \
@@ -2040,6 +2099,7 @@ done
 if ! log_has_pattern "UNLOCK_GRADUATED_DONE result=ok"; then
   echo "[error] REMOVE-FALLBACKS: UNLOCK_GRADUATED_DONE result=ok missing (graduated path must run)"
   ug_fail=1
+fi
 fi
 if [[ "$ug_fail" -eq 1 ]]; then
   echo "[error] REMOVE-FALLBACKS: graduated production path verification FAILED"
@@ -2194,10 +2254,26 @@ fi
 # Stage 184 (CROSS-ARCH-LIVE): the default-on cross-arch live audit runs on x86_64
 # too (regression). x86_64's graduated dispatch is out-of-lock, so the mode is
 # out_of_lock; the topology stays single-dispatcher (wake-only APs don't dispatch).
+#
+# U9-D6-FINAL (C4): the D2 recv/send verdicts in this audit are `unlock_graduated_enabled()`,
+# which IS `d6_genuine_enabled()` and is therefore false under either D6 SWITCH diagnostic —
+# the same mutual exclusion the script enforces at its top. In those two profiles the audit
+# emits `CROSS_ARCH_D2_{RECV,SEND}_FAIL reason=not_graduated` by design.
+#
+# The gate is made profile-aware rather than skipped: each profile asserts POSITIVELY what the
+# kernel actually promises there, so a D6 run still fails if the audit reports anything else.
+# The knob-off expectation is unchanged, including the forbidden-marker scan.
+cal_expect_ok=("CROSS_ARCH_D2_RECV_OK arch=x86_64 mode=out_of_lock" "CROSS_ARCH_D2_SEND_OK arch=x86_64 mode=out_of_lock")
+cal_forbidden=("CROSS_ARCH_TOPOLOGY_BLOCKED arch=x86_64" "CROSS_ARCH_D2_RECV_FAIL" "CROSS_ARCH_D2_SEND_FAIL")
+if [[ "$D6_SWITCH_PROOF" == "1" || "$D6_SWITCH_A" == "1" ]]; then
+  cal_expect_ok=("CROSS_ARCH_D2_RECV_FAIL arch=x86_64 reason=not_graduated" "CROSS_ARCH_D2_SEND_FAIL arch=x86_64 reason=not_graduated")
+  cal_forbidden=("CROSS_ARCH_TOPOLOGY_BLOCKED arch=x86_64" "CROSS_ARCH_D2_RECV_OK arch=x86_64" "CROSS_ARCH_D2_SEND_OK arch=x86_64")
+  echo "[info] CROSS-ARCH-LIVE: D6 switch diagnostic active; the D2 seam verdicts are expected not_graduated"
+fi
 for m in \
   "CROSS_ARCH_TOPOLOGY_OK arch=x86_64 reason=single_dispatcher" \
-  "CROSS_ARCH_D2_RECV_OK arch=x86_64 mode=out_of_lock" \
-  "CROSS_ARCH_D2_SEND_OK arch=x86_64 mode=out_of_lock" \
+  "${cal_expect_ok[0]}" \
+  "${cal_expect_ok[1]}" \
   "CROSS_ARCH_D6_OK arch=x86_64 mode=out_of_lock" \
   "CROSS_ARCH_D3_OK arch=x86_64 mode=out_of_lock" \
   "CROSS_ARCH_SYSCALL_PARITY_OK arch=x86_64" \
@@ -2207,10 +2283,7 @@ for m in \
     exit 1
   fi
 done
-for f in \
-  "CROSS_ARCH_TOPOLOGY_BLOCKED arch=x86_64" \
-  "CROSS_ARCH_D2_RECV_FAIL" \
-  "CROSS_ARCH_D2_SEND_FAIL"; do
+for f in "${cal_forbidden[@]}"; do
   if log_has_pattern "$f"; then
     echo "[error] CROSS-ARCH-LIVE: forbidden x86_64 marker: $f"
     exit 1
