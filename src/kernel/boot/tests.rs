@@ -187677,3 +187677,527 @@ mod u9irqfinal_bridge_completion {
         }
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// U9-D6-FINAL §4 — the switch-plan publication owner, and the closure it makes possible.
+//
+// The D6 switch proof was the last thing that needed the terminal broad acquisition, and it
+// needed it for one reason: it produced a `DispatchSwitchPlan` from inside a `&mut KernelState`.
+// These cases drive the owner that replaced that production and check what it actually did to
+// the stash — not that a marker was printed and not that a count came out zero.
+//
+// The publication owner is arch-neutral and lives on `SharedKernel`, so it runs here against
+// real kernel state. What a hosted build cannot do is perform `switch_frames`; the unlocked
+// switch entry, the return/first-resume and the cleanup are live-only and are qualified in the
+// x86_64 smoke profiles, which assert the same marker chain they always did.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+mod u9d6final_switch_publication {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::{D6PublishRefusal, D6SwitchPublication, SharedKernel};
+
+    const OUTGOING: u64 = 7100;
+    const INCOMING: u64 = 7101;
+
+    /// Arms the per-CPU drainer flag the publication requires and clears both it and the stash on
+    /// the way out, including on a panicking assertion. A stash left occupied would be applied by
+    /// the next test's trap path, and a drainer flag left set changes how every other route
+    /// behaves in this single-threaded suite.
+    struct TrapWindow(usize);
+
+    impl TrapWindow {
+        fn open(cpu: CpuId) -> Self {
+            let idx = cpu.0 as usize;
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[idx]
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+            // SAFETY: single-threaded test, no concurrent accessor.
+            unsafe {
+                let _ = crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[idx].take();
+            }
+            Self(idx)
+        }
+    }
+
+    impl Drop for TrapWindow {
+        fn drop(&mut self) {
+            // SAFETY: single-threaded test, no concurrent accessor.
+            unsafe {
+                let _ = crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[self.0].take();
+            }
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[self.0]
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn stashed(cpu: CpuId) -> Option<(u64, u64)> {
+        let idx = cpu.0 as usize;
+        // SAFETY: single-threaded test; the plan is put straight back so the observation does
+        // not consume the reservation the case under test is about.
+        unsafe {
+            let plan = crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[idx].take();
+            let seen = plan.as_ref().map(|p| (p.outgoing_tid, p.incoming_tid));
+            if let Some(p) = plan {
+                crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[idx].store(p);
+            }
+            seen
+        }
+    }
+
+    /// Two tasks with initialized kernel switch frames — the exact precondition
+    /// `build_dispatch_switch_plan_locked` requires before it will produce a plan.
+    fn kernel_with_pair() -> SharedKernel {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            for (tid, base) in [(OUTGOING, 0x9000_0000usize), (INCOMING, 0x9001_0000usize)] {
+                state.register_task(tid).expect("task");
+                state
+                    .set_thread_kernel_stack(tid, base, base + 0x4000)
+                    .expect("stack");
+                state
+                    .initialize_thread_kernel_switch_frame(tid, 0x1234_5678)
+                    .expect("frame");
+            }
+        });
+        kernel
+    }
+
+    /// **The ordinary publication.** A real plan reaches the stash, naming both tasks.
+    #[test]
+    fn a_published_plan_reaches_the_stash_with_both_identities() {
+        let kernel = kernel_with_pair();
+        let _window = TrapWindow::open(CpuId(0));
+
+        let outcome = kernel.d6_publish_switch_plan_split(CpuId(0), OUTGOING, INCOMING);
+        assert_eq!(
+            outcome,
+            D6SwitchPublication::Published {
+                outgoing_tid: OUTGOING,
+                incoming_tid: INCOMING
+            }
+        );
+        assert_eq!(
+            stashed(CpuId(0)),
+            Some((OUTGOING, INCOMING)),
+            "a real plan, not a marker"
+        );
+    }
+
+    /// **Occupied publication never overwrites.** The second publisher is refused by name and the
+    /// FIRST plan is still the one the drain will apply — losing a switch and applying the wrong
+    /// one is the failure this reservation exists to prevent.
+    #[test]
+    fn a_second_publisher_is_refused_and_the_pending_plan_survives() {
+        let kernel = kernel_with_pair();
+        let _window = TrapWindow::open(CpuId(0));
+
+        assert!(matches!(
+            kernel.d6_publish_switch_plan_split(CpuId(0), OUTGOING, INCOMING),
+            D6SwitchPublication::Published { .. }
+        ));
+        // A different pair, so an overwrite would be visible.
+        let second = kernel.d6_publish_switch_plan_split(CpuId(0), INCOMING, OUTGOING);
+        assert_eq!(
+            second,
+            D6SwitchPublication::Refused(D6PublishRefusal::StashOccupied)
+        );
+        assert_eq!(
+            stashed(CpuId(0)),
+            Some((OUTGOING, INCOMING)),
+            "the pending plan is untouched — one owner per trap"
+        );
+    }
+
+    /// **Repeated entry is idempotent in effect**: the owner can be called again and again, and
+    /// after the first success nothing more is published.
+    #[test]
+    fn repeated_entry_publishes_exactly_once() {
+        let kernel = kernel_with_pair();
+        let _window = TrapWindow::open(CpuId(0));
+
+        let mut published = 0usize;
+        for _ in 0..4 {
+            if matches!(
+                kernel.d6_publish_switch_plan_split(CpuId(0), OUTGOING, INCOMING),
+                D6SwitchPublication::Published { .. }
+            ) {
+                published += 1;
+            }
+        }
+        assert_eq!(published, 1, "one trap, one switch owner");
+        assert_eq!(stashed(CpuId(0)), Some((OUTGOING, INCOMING)));
+    }
+
+    /// **Same task is not a switch**, and it is refused before the plan is built.
+    #[test]
+    fn the_same_task_is_refused_without_a_plan() {
+        let kernel = kernel_with_pair();
+        let _window = TrapWindow::open(CpuId(0));
+
+        assert_eq!(
+            kernel.d6_publish_switch_plan_split(CpuId(0), OUTGOING, OUTGOING),
+            D6SwitchPublication::Refused(D6PublishRefusal::SameTask)
+        );
+        assert_eq!(stashed(CpuId(0)), None, "nothing was written");
+    }
+
+    /// **Preparation failure: an uninitialized kernel context.** The builder's `Ok(None)` is a
+    /// refusal, not a silent success, and it leaves the stash empty.
+    #[test]
+    fn an_uninitialized_kernel_context_is_refused_with_nothing_written() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.register_task(OUTGOING).expect("outgoing");
+            state
+                .set_thread_kernel_stack(OUTGOING, 0x9000_0000, 0x9000_4000)
+                .expect("stack");
+            state
+                .initialize_thread_kernel_switch_frame(OUTGOING, 0x1234_5678)
+                .expect("frame");
+            // The incoming task exists but was never given a switch frame.
+            state.register_task(INCOMING).expect("incoming");
+        });
+        let _window = TrapWindow::open(CpuId(0));
+
+        assert_eq!(
+            kernel.d6_publish_switch_plan_split(CpuId(0), OUTGOING, INCOMING),
+            D6SwitchPublication::Refused(D6PublishRefusal::IncomingUnavailable)
+        );
+        assert_eq!(stashed(CpuId(0)), None);
+    }
+
+    /// **A missing outgoing task** is the builder's `Err`, and it too writes nothing.
+    #[test]
+    fn a_missing_outgoing_task_is_refused_with_nothing_written() {
+        let kernel = kernel_with_pair();
+        let _window = TrapWindow::open(CpuId(0));
+
+        assert_eq!(
+            kernel.d6_publish_switch_plan_split(CpuId(0), 999_999, INCOMING),
+            D6SwitchPublication::Refused(D6PublishRefusal::OutgoingUnavailable)
+        );
+        assert_eq!(stashed(CpuId(0)), None);
+    }
+
+    /// **No drainer, no publication.** A plan nobody will apply is a plan that strands the trap,
+    /// and the condition is tested before the TCB acquisition.
+    #[test]
+    fn no_trap_drainer_refuses_before_anything_is_taken() {
+        let kernel = kernel_with_pair();
+        // Deliberately NOT opening the window.
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            kernel.d6_publish_switch_plan_split(CpuId(0), OUTGOING, INCOMING),
+            D6SwitchPublication::Refused(D6PublishRefusal::NoTrapDrainer)
+        );
+        assert_eq!(stashed(CpuId(0)), None);
+    }
+
+    /// **The incarnation check is the other half of the raw pointers.**
+    ///
+    /// Fixed storage proves the address; it does not prove the same task still occupies the slot
+    /// when the drain dereferences it, because the broad handler runs in between.
+    #[test]
+    fn the_incarnation_check_answers_what_fixed_storage_cannot() {
+        let kernel = kernel_with_pair();
+        assert!(
+            kernel.d6_switch_plan_incarnations_valid_split(OUTGOING, INCOMING),
+            "both tasks present with initialized kernel contexts"
+        );
+        assert!(
+            !kernel.d6_switch_plan_incarnations_valid_split(OUTGOING, 999_999),
+            "a vanished incoming task must not be dereferenced"
+        );
+        // An incarnation whose kernel context is not initialized is exactly what the builder
+        // refused to take a pointer from in the first place.
+        let fresh = SharedKernel::new(Bootstrap::init().expect("init"));
+        fresh.with(|state| {
+            state.register_task(OUTGOING).expect("task");
+            state.register_task(INCOMING).expect("task");
+        });
+        assert!(
+            !fresh.d6_switch_plan_incarnations_valid_split(OUTGOING, INCOMING),
+            "an uninitialized kernel context is not a switchable incarnation"
+        );
+    }
+
+    /// **Exact rollback: a refused publication leaves the world untouched.** Every refusal is
+    /// raised before the store, and all but `StashOccupied` before the plan is even built, so a
+    /// refused caller is in the state it started in.
+    #[test]
+    fn every_refusal_leaves_the_stash_exactly_as_it_found_it() {
+        let kernel = kernel_with_pair();
+        let _window = TrapWindow::open(CpuId(0));
+
+        // From empty.
+        for (outgoing, incoming) in [(OUTGOING, OUTGOING), (999_999, INCOMING)] {
+            assert!(matches!(
+                kernel.d6_publish_switch_plan_split(CpuId(0), outgoing, incoming),
+                D6SwitchPublication::Refused(_)
+            ));
+            assert_eq!(stashed(CpuId(0)), None, "still empty");
+        }
+        // From occupied.
+        assert!(matches!(
+            kernel.d6_publish_switch_plan_split(CpuId(0), OUTGOING, INCOMING),
+            D6SwitchPublication::Published { .. }
+        ));
+        for (outgoing, incoming) in [
+            (OUTGOING, OUTGOING),
+            (999_999, INCOMING),
+            (INCOMING, OUTGOING),
+        ] {
+            assert!(matches!(
+                kernel.d6_publish_switch_plan_split(CpuId(0), outgoing, incoming),
+                D6SwitchPublication::Refused(_)
+            ));
+            assert_eq!(
+                stashed(CpuId(0)),
+                Some((OUTGOING, INCOMING)),
+                "still the first plan"
+            );
+        }
+    }
+
+    /// Seven refusal reasons, seven markers — a shared one would hide which condition refused.
+    #[test]
+    fn every_refusal_is_separately_nameable() {
+        let markers = [
+            D6PublishRefusal::SameTask.marker(),
+            D6PublishRefusal::ArchUnsupported.marker(),
+            D6PublishRefusal::NoTrapDrainer.marker(),
+            D6PublishRefusal::MultiCpu.marker(),
+            D6PublishRefusal::StashOccupied.marker(),
+            D6PublishRefusal::IncomingUnavailable.marker(),
+            D6PublishRefusal::OutgoingUnavailable.marker(),
+        ];
+        let mut seen: alloc::vec::Vec<&str> = markers.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 7);
+    }
+}
+
+/// U9-D6-FINAL §4 — the source facts the hosted cases cannot reach: where the hook runs, who
+/// owns the switch, and what the drain still does in what order.
+mod u9d6final_closure {
+    const TRAP: &str = include_str!("../../arch/trap_entry.rs");
+    const EXEC: &str = include_str!("exec_state.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    /// **The hook runs BEFORE the broad acquisition**, and the acquisition no longer carries it.
+    #[test]
+    fn the_proof_hook_precedes_the_terminal_acquisition() {
+        let hook = TRAP
+            .find("maybe_run_d6_controlled_switch_proof_split(shared, cpu)")
+            .expect("the pre-lock hook");
+        let acquisition = TRAP
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("the terminal acquisition");
+        assert!(
+            hook < acquisition,
+            "the diagnostic must not be a reason for the acquisition to exist"
+        );
+        assert!(
+            !TRAP.contains("kernel.maybe_run_d6_controlled_switch_proof()"),
+            "and the in-lock call must be removed, not merely bypassed"
+        );
+        assert_eq!(
+            TRAP.matches("maybe_run_d6_controlled_switch_proof").count(),
+            1,
+            "exactly one call site"
+        );
+    }
+
+    /// **No broad acquisition was added to carry it.** The hook and everything it drives take
+    /// ranked subsystem seams, never `with_cpu` or `with`.
+    #[test]
+    fn the_migration_added_no_broad_acquisition() {
+        let proof = EXEC
+            .split("pub(crate) fn maybe_run_d6_controlled_switch_proof_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the split proof");
+        for forbidden in [".with_cpu(", "shared.with(", "&mut self", "kernel_mut("] {
+            assert!(
+                !proof.contains(forbidden),
+                "the split proof must not reach `{forbidden}`"
+            );
+        }
+        // And it composes the seams it is supposed to.
+        for owner in [
+            "shared.online_cpu_count_split_read()",
+            "shared.current_tid_split_read(cpu)",
+            "shared.with_task_tcbs_split_mut(",
+            "shared.d6_publish_switch_plan_split(",
+        ] {
+            assert!(
+                proof.contains(owner),
+                "the split proof must compose `{owner}`"
+            );
+        }
+    }
+
+    /// **One switch owner per trap, and the reservation precedes every irreversible change.**
+    #[test]
+    fn the_publication_reserves_before_it_builds() {
+        let owner = RUNTIME
+            .split("pub(crate) fn d6_publish_switch_plan_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the publication owner");
+        let reserve = owner
+            .find("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan()")
+            .expect("the reservation");
+        let build = owner
+            .find("build_dispatch_switch_plan_locked(")
+            .expect("the plan build");
+        let store = owner
+            .find("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan)")
+            .expect("the store");
+        assert!(
+            reserve < build && build < store,
+            "reserve, then build, then store — a build before the reservation could be thrown \
+             away, and a store before it would overwrite another owner's plan"
+        );
+        // Exactly one production store site, and it is this one.
+        assert_eq!(
+            RUNTIME
+                .matches("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(")
+                .count(),
+            1,
+            "one publication owner"
+        );
+    }
+
+    /// **The drain revalidates the incarnations before it dereferences the plan.**
+    #[test]
+    fn the_drain_checks_the_incarnations_before_switching() {
+        let drain = TRAP
+            .split("fn drain_switch_plan_stash(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the drain");
+        let check = drain
+            .find("d6_switch_plan_incarnations_valid_split(")
+            .expect("the revalidation");
+        let switch = drain
+            .find("context_switch::switch_frames(")
+            .expect("the switch");
+        assert!(
+            check < switch,
+            "the pointers must be revalidated before they are dereferenced"
+        );
+        assert!(
+            drain.contains("reason=incarnation_moved"),
+            "and a refusal must be named rather than silent"
+        );
+    }
+
+    /// **The functional effects are preserved, in order.** Markers are not a substitute for them,
+    /// so the guard pins the calls, not the log lines.
+    #[test]
+    fn the_switch_return_first_resume_and_cleanup_keep_their_order() {
+        let drain = TRAP
+            .split("fn drain_switch_plan_stash(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the drain");
+        let steps = [
+            "FIRST_RESUME_STASH[cpu_idx].store(ctx)",
+            "context_switch::switch_frames(",
+            "d6_controlled_switch_proof_take_pending_done()",
+            "post_switch_restore_arch_thread_state_split(",
+            "post_switch_d6_cleanup_split(shared, cpu, d6_switch_a_mode)",
+        ];
+        let mut last = 0usize;
+        for step in steps {
+            let at = drain
+                .find(step)
+                .unwrap_or_else(|| panic!("the drain must still perform `{step}`"));
+            assert!(at > last, "`{step}` is out of order");
+            last = at;
+        }
+        // The restore's result is still propagated AFTER the cleanup, so a restore error still
+        // surfaces only once the overlay has run.
+        let cleanup = drain
+            .find("post_switch_d6_cleanup_split(")
+            .expect("cleanup");
+        let propagate = drain.find("restore_result?;").expect("the propagation");
+        assert!(cleanup < propagate);
+    }
+
+    /// **Mutation guard — renewed broad fallback.** Neither the timer settlement nor the Yield
+    /// gate may reacquire a D6-shaped escape.
+    #[test]
+    fn no_d6_predicate_can_produce_a_broad_hand_off_again() {
+        // Executable source only: the section that records WHY the hand-off existed and what
+        // retired it names it, and that record is the point. What must be gone is any code that
+        // can produce it.
+        let code: alloc::string::String = SPLIT
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("DiagnosticSwitchOwner")
+                && !code.contains("diagnostic_owns_switch_path"),
+            "the timer hand-off and its predicate are removed, not disabled"
+        );
+        let gate_src = YIELD_TXN
+            .split("pub(crate) fn yield_deferral_arch_gate<O: YieldOwners>(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the arch gate");
+        // Executable source only, for the same reason as above: the comment in that position
+        // records which predicate was removed and why, which is exactly what a later reader
+        // needs in order not to put it back.
+        let gate: alloc::string::String = gate_src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !gate.contains("d6_genuine_enabled")
+                && !gate.contains("d6_switch_a_enabled")
+                && !gate.contains("d6_controlled_switch_proof_enabled"),
+            "the Yield gate must not ask about a D6 knob again — ownership is a per-trap fact"
+        );
+        // And the per-trap fact is the one being asked.
+        assert!(
+            YIELD_TXN.contains("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan()"),
+            "the collision test must read the switch-plan stash"
+        );
+    }
+
+    /// **Mutation guard — duplicate switch ownership.** One production store site, one drain,
+    /// one take, and the collision test that keeps a second publisher out.
+    #[test]
+    fn a_trap_cannot_acquire_two_switch_owners() {
+        assert_eq!(
+            TRAP.matches("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()")
+                .count(),
+            1,
+            "one drain takes the plan"
+        );
+        assert_eq!(
+            TRAP.matches("context_switch::switch_frames(").count(),
+            1,
+            "and performs one switch"
+        );
+        assert_eq!(
+            RUNTIME
+                .matches("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(")
+                .count(),
+            1,
+            "one publication owner writes it"
+        );
+        assert!(
+            EXEC.contains("D6_GLOBAL_LOCK_DROP_DEFERRED reason={}"),
+            "and a refused publisher says which condition refused it"
+        );
+    }
+}
