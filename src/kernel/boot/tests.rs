@@ -187988,11 +187988,18 @@ mod u9d6final_closure {
     const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
     const RUNTIME: &str = include_str!("../../runtime.rs");
 
-    /// **The hook runs BEFORE the broad acquisition**, and the acquisition no longer carries it.
+    /// **The hook runs OUTSIDE the broad acquisition's closure**, and the acquisition no longer
+    /// carries it.
+    ///
+    /// The claim is not merely textual ordering: what matters is that the call is not inside the
+    /// `with_cpu(cpu, |kernel| { … })` closure, because that is what made the acquisition the
+    /// diagnostic's supplier of `&mut KernelState`. It sits at the head of the same arm, so it
+    /// samples the same traps — MEASURED: at the top of the function it only ever observes the
+    /// supervisor as current and defers with `wrong_outgoing_tid` forever.
     #[test]
     fn the_proof_hook_precedes_the_terminal_acquisition() {
         let hook = TRAP
-            .find("maybe_run_d6_controlled_switch_proof_split(shared, cpu)")
+            .find("maybe_run_d6_controlled_switch_proof_split(")
             .expect("the pre-lock hook");
         let acquisition = TRAP
             .find(".with_cpu(cpu, |kernel| {")
@@ -188000,6 +188007,11 @@ mod u9d6final_closure {
         assert!(
             hook < acquisition,
             "the diagnostic must not be a reason for the acquisition to exist"
+        );
+        // And nothing between them opens the closure, so the hook is genuinely outside it.
+        assert!(
+            !TRAP[hook..acquisition].contains("with_cpu("),
+            "the hook must be outside the acquisition's closure, not merely before some later one"
         );
         assert!(
             !TRAP.contains("kernel.maybe_run_d6_controlled_switch_proof()"),

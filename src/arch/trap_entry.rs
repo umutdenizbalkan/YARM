@@ -787,35 +787,6 @@ pub fn handle_trap_entry_shared(
     // used `external_irq_eoi`, the raw write, and on AArch64 that is a SECOND `GICC_EOIR` beside
     // the one the vector tail already writes for the same claim. Nothing is added beside the
     // tail; the correctly scoped seam is inert exactly where the architecture owns completion.
-    // ── U9-D6-FINAL §2/§3 — the D6 switch proof, BEFORE the broad acquisition ──────────────
-    //
-    // Stage 120 ran this from inside `with_cpu`, which is what made the terminal acquisition a
-    // dependency of a default-off diagnostic rather than of any production work. It publishes a
-    // `DispatchSwitchPlan` for the Stage 117 drain at the bottom of this function, and that drain
-    // has held no broad lock since U9-D3 §7 — so the only thing the acquisition was still
-    // supplying here was a `&mut KernelState` for the preparation steps. Those now compose the
-    // ranked split owners directly.
-    //
-    // Position matters and is deliberate: it runs FIRST, ahead of every split route, because it
-    // is the trap's switch owner when it publishes. A route that would also publish (the timer's
-    // queue advance) then finds the stash reserved and settles without a second plan, which is
-    // what `d6_publish_switch_plan_split` refuses with `stash_occupied`.
-    //
-    // Default-off and one-shot: with neither knob armed the first test inside returns
-    // immediately, so an ordinary trap pays a predicate read and nothing else.
-    #[cfg(target_arch = "x86_64")]
-    let d6_proof_result =
-        crate::kernel::boot::KernelState::maybe_run_d6_controlled_switch_proof_split(shared, cpu);
-    #[cfg(not(target_arch = "x86_64"))]
-    let d6_proof_result: Result<(), crate::kernel::boot::KernelError> = Ok(());
-    if let Err(err) = d6_proof_result {
-        crate::yarm_log!(
-            "D6_CONTROLLED_SWITCH_PROOF_FAILED cpu={} err={:?}",
-            cpu.0,
-            err
-        );
-    }
-
     if !irq_handled {
         let decoded = decode_trap_context(context);
         if let TrapEvent::ExternalInterrupt(irq) = decoded {
@@ -1510,6 +1481,43 @@ pub fn handle_trap_entry_shared(
                 .or(cow_result)
                 .unwrap_or(Ok(())))
         } else {
+            // ── U9-D6-FINAL §2/§3 — the D6 switch proof, OUTSIDE the broad acquisition ────────
+            //
+            // Stage 120 ran this from inside `with_cpu`, which is what made the terminal
+            // acquisition a dependency of a default-off diagnostic rather than of any production
+            // work. It publishes a `DispatchSwitchPlan` for the Stage 117 drain at the bottom of
+            // this function, and that drain has held no broad lock since U9-D3 §7 — so the only
+            // thing the acquisition was still supplying here was a `&mut KernelState` for the
+            // preparation steps. Those now compose the ranked split owners directly.
+            //
+            // **Position is the same statement it always was, minus the lock.** It sits at the
+            // head of the arm the in-lock call occupied: the traps no split route settled. That
+            // is deliberate rather than incidental — MEASURED, moving it to the top of the
+            // function changes which traps it samples, and it then only ever observes the
+            // supervisor as current and defers with `wrong_outgoing_tid` forever. The diagnostic
+            // is entitled to see the same traps it always saw; what it is not entitled to is the
+            // broad lock.
+            //
+            // One owner per trap is not supplied by ordering: it is supplied by the stash
+            // reservation inside `d6_publish_switch_plan_split`, which refuses `stash_occupied`
+            // rather than overwriting a plan an ordinary queue advance already published.
+            //
+            // Default-off and one-shot: with neither knob armed the first test inside returns
+            // immediately, so an ordinary trap pays a predicate read and nothing else.
+            #[cfg(target_arch = "x86_64")]
+            let d6_proof_result =
+                crate::kernel::boot::KernelState::maybe_run_d6_controlled_switch_proof_split(
+                    shared, cpu,
+                );
+            #[cfg(not(target_arch = "x86_64"))]
+            let d6_proof_result: Result<(), crate::kernel::boot::KernelError> = Ok(());
+            if let Err(err) = d6_proof_result {
+                crate::yarm_log!(
+                    "D6_CONTROLLED_SWITCH_PROOF_FAILED cpu={} err={:?}",
+                    cpu.0,
+                    err
+                );
+            }
             shared
                 .with_cpu(cpu, |kernel| {
                     handle_trap_entry_with_fault_bookkeeping_mode(
