@@ -788,7 +788,8 @@ impl KernelState {
     /// not user-space VM regions.
     #[cfg(all(target_arch = "x86_64", not(test)))]
     pub(crate) fn ensure_active_root_can_use_kernel_switch_stack(
-        &mut self,
+        shared: &crate::runtime::SharedKernel,
+        cpu: crate::kernel::scheduler::CpuId,
         tid: u64,
     ) -> Result<(), KernelError> {
         use core::sync::atomic::Ordering;
@@ -804,11 +805,11 @@ impl KernelState {
         static ACTIVE_ROOT_REPAIR_FAILED: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
 
-        let active_asid = self.hal.active_asid_on(self.current_cpu());
+        let active_asid = crate::arch::hal::active_address_space(cpu);
         let cr3 = active_asid.and_then(page_table::cr3_for_asid).unwrap_or(0);
         crate::yarm_log!(
             "D6_KERNEL_SWITCH_STACK_ACTIVE_ROOT cpu={} active_asid={} cr3=0x{:x}",
-            self.current_cpu().0,
+            cpu.0,
             active_asid.map_or(0, |asid| asid.0),
             cr3
         );
@@ -819,7 +820,7 @@ impl KernelState {
             );
             return Err(KernelError::UserMemoryFault);
         };
-        let (stack_base, stack_top) = self.with_tcbs(|tcbs| {
+        let (stack_base, stack_top) = shared.with_task_tcbs_split_mut(|tcbs| {
             let tcb = tcbs
                 .iter()
                 .flatten()
@@ -907,7 +908,7 @@ impl KernelState {
         }
 
         // Get the target ASID (incoming task's address space).
-        let target_asid = match self.task_asid(tid) {
+        let target_asid = match shared.task_asid_opt_split_read(tid) {
             Some(asid) => asid,
             None => {
                 crate::yarm_log!(
@@ -1065,7 +1066,8 @@ impl KernelState {
 
     #[cfg(any(not(target_arch = "x86_64"), test))]
     pub(crate) fn ensure_active_root_can_use_kernel_switch_stack(
-        &mut self,
+        _shared: &crate::runtime::SharedKernel,
+        _cpu: crate::kernel::scheduler::CpuId,
         _tid: u64,
     ) -> Result<(), KernelError> {
         Ok(())
@@ -1081,7 +1083,8 @@ impl KernelState {
     /// without using the region-size constant (preserving Stage 127–129 invariants).
     #[cfg(all(target_arch = "x86_64", not(test)))]
     pub(crate) fn d6_ensure_full_proof_switch_stack_mapped(
-        &mut self,
+        shared: &crate::runtime::SharedKernel,
+        cpu: crate::kernel::scheduler::CpuId,
         tid: u64,
     ) -> Result<(), KernelError> {
         use crate::arch::selected_isa::page_table::{self, PageTableEntry};
@@ -1091,7 +1094,7 @@ impl KernelState {
             (entry.0 & PageTableEntry::WRITABLE) != 0 && (entry.0 & PageTableEntry::USER) == 0
         }
 
-        let (stack_base, stack_top) = self.with_tcbs(|tcbs| {
+        let (stack_base, stack_top) = shared.with_task_tcbs_split_mut(|tcbs| {
             let tcb = tcbs
                 .iter()
                 .flatten()
@@ -1114,7 +1117,7 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
 
-        let Some(target_asid) = self.task_asid(tid) else {
+        let Some(target_asid) = shared.task_asid_opt_split_read(tid) else {
             return Err(KernelError::UserMemoryFault);
         };
 
@@ -1122,13 +1125,13 @@ impl KernelState {
         // alloc_user_data_frame without nested borrow conflicts.
         let mut roots = [None; D6_PROOF_MAX_TASKS];
         roots[0] = Some(target_asid);
-        self.with_tcbs(|tcbs| {
+        shared.with_task_tcbs_split_mut(|tcbs| {
             let mut len = 1usize;
             for tcb in tcbs.iter().flatten() {
                 let Some(asid) = tcb.asid else {
                     continue;
                 };
-                if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
+                if shared.with_vm_user_spaces_split_mut(|spaces| spaces.get(asid).is_none()) {
                     continue;
                 }
                 if roots[..len].iter().any(|e| *e == Some(asid)) {
@@ -1174,7 +1177,7 @@ impl KernelState {
                 }
                 return Err(KernelError::VmFull);
             } else {
-                let phys = self.alloc_user_data_frame()?;
+                let phys = KernelState::alloc_user_data_frame_split(shared)?;
                 page_table::map_page(
                     target_asid,
                     stack_page,
@@ -1216,7 +1219,8 @@ impl KernelState {
 
     #[cfg(any(not(target_arch = "x86_64"), test))]
     pub(crate) fn d6_ensure_full_proof_switch_stack_mapped(
-        &mut self,
+        _shared: &crate::runtime::SharedKernel,
+        _cpu: crate::kernel::scheduler::CpuId,
         _tid: u64,
     ) -> Result<(), KernelError> {
         Ok(())
@@ -1258,9 +1262,23 @@ impl KernelState {
     ///
     /// This path runs solely under `yarm.d6_switch_proof=1`; production stacks are
     /// untouched.
+    /// The same entry point on every other configuration: there is no live RSP region to map
+    /// when there is no x86_64 kernel stack under it. Present so the ONE caller compiles
+    /// unconditionally rather than being wrapped in a second `cfg` that could drift from this
+    /// one.
+    #[cfg(not(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev"))))]
+    pub(crate) fn d6_ensure_live_rsp_region_mapped(
+        _shared: &crate::runtime::SharedKernel,
+        _cpu: crate::kernel::scheduler::CpuId,
+        _sampled_rsp: usize,
+    ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
     #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
     pub(crate) fn d6_ensure_live_rsp_region_mapped(
-        &mut self,
+        shared: &crate::runtime::SharedKernel,
+        cpu: crate::kernel::scheduler::CpuId,
         sampled_rsp: usize,
     ) -> Result<(), KernelError> {
         use crate::arch::selected_isa::page_table::{self, PageTableEntry};
@@ -1298,7 +1316,7 @@ impl KernelState {
             rsp_page
         );
 
-        let Some(target_asid) = self.hal.active_asid_on(self.current_cpu()) else {
+        let Some(target_asid) = crate::arch::hal::active_address_space(cpu) else {
             crate::yarm_log!(
                 "D6_PROOF_LIVE_RSP_STACK_SKIP reason=no_active_asid rsp=0x{:x}",
                 sampled_rsp
@@ -1373,13 +1391,13 @@ impl KernelState {
         // shared into every root that may be active during a post-proof trap.
         let mut roots = [None; D6_PROOF_MAX_TASKS];
         roots[0] = Some(target_asid);
-        self.with_tcbs(|tcbs| {
+        shared.with_task_tcbs_split_mut(|tcbs| {
             let mut len = 1usize;
             for tcb in tcbs.iter().flatten() {
                 let Some(asid) = tcb.asid else {
                     continue;
                 };
-                if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
+                if shared.with_vm_user_spaces_split_mut(|spaces| spaces.get(asid).is_none()) {
                     continue;
                 }
                 if roots[..len].iter().any(|e| *e == Some(asid)) {
@@ -1418,7 +1436,7 @@ impl KernelState {
                 }
                 return Err(KernelError::VmFull);
             } else {
-                let phys = self.alloc_user_data_frame()?;
+                let phys = KernelState::alloc_user_data_frame_split(shared)?;
                 page_table::map_page(
                     target_asid,
                     stack_page,

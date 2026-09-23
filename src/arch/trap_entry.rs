@@ -347,6 +347,33 @@ fn drain_switch_plan_stash(
     if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
         // SAFETY: single CPU, interrupts disabled, no concurrent accessor.
         let plan = unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take() };
+        // U9-D6-FINAL §2 — REVALIDATE the incarnations before dereferencing the plan's raw
+        // frame pointers.
+        //
+        // The pointers are derived from `KernelState::tcbs`, a fixed-size array, and that is
+        // what makes the ADDRESSES stay valid across the lock release. It is not what makes
+        // them point at the same tasks: the broad handler runs between publication and this
+        // drain and can reap a task and hand its slot to a replacement, at which point the
+        // pointer names a different incarnation's `ArchSwitchContext` and `switch_frames` would
+        // save the outgoing context into a stranger.
+        //
+        // Refusing here is coherent by construction. Publishing a plan changes no scheduler
+        // state — no `current`, no queue, no status — so an unapplied plan leaves the
+        // interrupted task exactly as it was, still current and still owning the frame this
+        // trap returns through.
+        let plan = plan.filter(|plan| {
+            if shared.d6_switch_plan_incarnations_valid_split(plan.outgoing_tid, plan.incoming_tid)
+            {
+                return true;
+            }
+            crate::yarm_log!(
+                "D6_SWITCH_PLAN_REFUSED cpu={} outgoing={} incoming={} reason=incarnation_moved",
+                cpu.0,
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
+            false
+        });
         if let Some(plan) = plan {
             // Stage 166 (D6-SWITCH-A): tag this as a real production unlocked
             // switch when driven by `yarm.d6_switch_a=1` (proof knob off).
@@ -760,6 +787,35 @@ pub fn handle_trap_entry_shared(
     // used `external_irq_eoi`, the raw write, and on AArch64 that is a SECOND `GICC_EOIR` beside
     // the one the vector tail already writes for the same claim. Nothing is added beside the
     // tail; the correctly scoped seam is inert exactly where the architecture owns completion.
+    // ── U9-D6-FINAL §2/§3 — the D6 switch proof, BEFORE the broad acquisition ──────────────
+    //
+    // Stage 120 ran this from inside `with_cpu`, which is what made the terminal acquisition a
+    // dependency of a default-off diagnostic rather than of any production work. It publishes a
+    // `DispatchSwitchPlan` for the Stage 117 drain at the bottom of this function, and that drain
+    // has held no broad lock since U9-D3 §7 — so the only thing the acquisition was still
+    // supplying here was a `&mut KernelState` for the preparation steps. Those now compose the
+    // ranked split owners directly.
+    //
+    // Position matters and is deliberate: it runs FIRST, ahead of every split route, because it
+    // is the trap's switch owner when it publishes. A route that would also publish (the timer's
+    // queue advance) then finds the stash reserved and settles without a second plan, which is
+    // what `d6_publish_switch_plan_split` refuses with `stash_occupied`.
+    //
+    // Default-off and one-shot: with neither knob armed the first test inside returns
+    // immediately, so an ordinary trap pays a predicate read and nothing else.
+    #[cfg(target_arch = "x86_64")]
+    let d6_proof_result =
+        crate::kernel::boot::KernelState::maybe_run_d6_controlled_switch_proof_split(shared, cpu);
+    #[cfg(not(target_arch = "x86_64"))]
+    let d6_proof_result: Result<(), crate::kernel::boot::KernelError> = Ok(());
+    if let Err(err) = d6_proof_result {
+        crate::yarm_log!(
+            "D6_CONTROLLED_SWITCH_PROOF_FAILED cpu={} err={:?}",
+            cpu.0,
+            err
+        );
+    }
+
     if !irq_handled {
         let decoded = decode_trap_context(context);
         if let TrapEvent::ExternalInterrupt(irq) = decoded {
@@ -1456,19 +1512,6 @@ pub fn handle_trap_entry_shared(
         } else {
             shared
                 .with_cpu(cpu, |kernel| {
-                    // Stage 120: diagnostic-only x86_64 proof hook. Default-off and
-                    // one-shot; when enabled it stashes a normal DispatchSwitchPlan
-                    // before regular trap handling, so the existing Stage 117 drain
-                    // below proves the unlocked switch_frames path without changing
-                    // scheduler policy or syscall ABI.
-                    #[cfg(target_arch = "x86_64")]
-                    kernel
-                        .maybe_run_d6_controlled_switch_proof()
-                        .map_err(|err| {
-                            TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::from(
-                                err,
-                            ))
-                        })?;
                     handle_trap_entry_with_fault_bookkeeping_mode(
                         kernel,
                         cpu,

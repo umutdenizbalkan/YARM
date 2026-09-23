@@ -722,15 +722,34 @@ impl KernelState {
         Ok(())
     }
 
-    /// Stage 120: x86_64-only, single-CPU-only, boot-knob-gated, one-shot proof
-    /// harness for the existing unlocked `switch_frames` path.
+    /// Stage 120, re-homed by U9-D6-FINAL §2/§3: the x86_64-only, single-CPU-only,
+    /// knob-gated, one-shot proof harness for the unlocked `switch_frames` path — **off the
+    /// broad lock**.
     ///
-    /// This is not a scheduler policy path: it only runs when the boot command
-    /// line contains `yarm.d6_switch_proof=1`, the current task is tid=1, tid=2
-    /// has an initialized kernel switch frame, and the Stage 117 trap-path stash
-    /// is active. It reuses `DispatchSwitchPlan` via `maybe_switch_kernel_context`
-    /// and disables itself permanently after one stashed proof pair.
-    pub(crate) fn maybe_run_d6_controlled_switch_proof(&mut self) -> Result<(), KernelError> {
+    /// # What moved, and what did not
+    ///
+    /// Nothing about the proof's sequence changed. It still asks the same admission questions in
+    /// the same order, performs the same three stack preparations, emits the same markers, and
+    /// publishes the same `DispatchSwitchPlan` for the same Stage 117 drain to apply. What
+    /// changed is that every step now runs through the ranked split owners instead of a
+    /// `&mut KernelState`, so the hook no longer needs the terminal broad acquisition to exist.
+    ///
+    /// The preparation bodies were not copied — `ensure_active_root_can_use_kernel_switch_stack`,
+    /// `d6_ensure_full_proof_switch_stack_mapped` and `d6_ensure_live_rsp_region_mapped` are the
+    /// same functions, converted in place to take `(shared, cpu)`. There is one implementation of
+    /// each and this is its only caller, so there is no parallel D6 path to drift.
+    ///
+    /// # One switch owner per trap
+    ///
+    /// The plan goes through `SharedKernel::d6_publish_switch_plan_split`, which reserves the
+    /// stash slot before it builds anything and refuses rather than overwriting a plan an
+    /// ordinary queue advance already published. Whichever publisher reserves first owns this
+    /// trap's switch; the other settles without one.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+    pub(crate) fn maybe_run_d6_controlled_switch_proof_split(
+        shared: &crate::runtime::SharedKernel,
+        cpu: crate::kernel::scheduler::CpuId,
+    ) -> Result<(), KernelError> {
         #[cfg(not(target_arch = "x86_64"))]
         {
             return Ok(());
@@ -738,13 +757,11 @@ impl KernelState {
 
         #[cfg(target_arch = "x86_64")]
         {
-            // Stage 166 (D6-SWITCH-A): the same proven production kernel-context
-            // switch path (the stash → unlocked `switch_frames` path below) is
-            // driven either by the diagnostic proof knob (`yarm.d6_switch_proof=1`)
-            // or by the first-narrow production Outcome A knob
-            // (`yarm.d6_switch_a=1`).  Both are x86_64-only, single-CPU, one-shot,
-            // default-off.  When `d6_switch_a` drives it (and the proof knob is
-            // off), additional `D6_SWITCH_A_*` markers tag the run as a real
+            // Stage 166 (D6-SWITCH-A): the same proven production kernel-context switch path is
+            // driven either by the diagnostic proof knob (`yarm.d6_switch_proof=1`) or by the
+            // first-narrow production Outcome A knob (`yarm.d6_switch_a=1`). Both are
+            // x86_64-only, single-CPU, one-shot, default-off. When `d6_switch_a` drives it (and
+            // the proof knob is off), additional `D6_SWITCH_A_*` markers tag the run as a real
             // production unlocked switch.
             let proof_enabled = crate::kernel::boot::d6_controlled_switch_proof_enabled();
             let switch_a_enabled = crate::kernel::boot::d6_switch_a_enabled();
@@ -754,17 +771,18 @@ impl KernelState {
             {
                 return Ok(());
             }
-            if self.online_cpu_count() != 1 {
+            let online = shared.online_cpu_count_split_read();
+            if online != 1 {
                 crate::yarm_log!(
                     "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=multi_cpu online_cpus={}",
-                    self.online_cpu_count()
+                    online
                 );
                 if switch_a_mode {
                     crate::yarm_log!("D6_SWITCH_A_FALLBACK reason=multi_cpu");
                 }
                 return Ok(());
             }
-            let cpu_idx = self.current_cpu().0 as usize;
+            let cpu_idx = cpu.0 as usize;
             let trap_path_active = cpu_idx < crate::kernel::scheduler::MAX_CPUS
                 && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
                     .load(core::sync::atomic::Ordering::Relaxed);
@@ -772,7 +790,7 @@ impl KernelState {
                 crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=trap_path_inactive");
                 return Ok(());
             }
-            let outgoing_tid = match self.current_tid() {
+            let outgoing_tid = match shared.current_tid_split_read(cpu) {
                 Some(BOOTSTRAP_FIRST_USER_TID) => BOOTSTRAP_FIRST_USER_TID,
                 Some(other) => {
                     if other == BOOTSTRAP_SUPERVISOR_TID {
@@ -789,7 +807,7 @@ impl KernelState {
                 }
             };
             let incoming_tid = BOOTSTRAP_SUPERVISOR_TID;
-            let frames_ready = self.with_tcbs_mut(|tcbs| {
+            let frames_ready = shared.with_task_tcbs_split_mut(|tcbs| {
                 let has_initialized = |tid| {
                     tcbs.iter()
                         .flatten()
@@ -808,11 +826,14 @@ impl KernelState {
                 }
                 return Ok(());
             }
-            // Stage 128: `switch_frames` does not switch CR3; it changes the
-            // kernel stack while the outgoing/current root is still active.
-            // Before stashing the proof plan, prove that the incoming stack page
-            // is visible and supervisor-writable in that active root.
-            if let Err(err) = self.ensure_active_root_can_use_kernel_switch_stack(incoming_tid) {
+            // Stage 128: `switch_frames` does not switch CR3; it changes the kernel stack while
+            // the outgoing/current root is still active. Before stashing the proof plan, prove
+            // that the incoming stack page is visible and supervisor-writable in that active root.
+            if let Err(err) = KernelState::ensure_active_root_can_use_kernel_switch_stack(
+                shared,
+                cpu,
+                incoming_tid,
+            ) {
                 crate::yarm_log!(
                     "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=active_stack_unmapped outgoing={} incoming={} err={:?}",
                     outgoing_tid,
@@ -841,18 +862,16 @@ impl KernelState {
                 );
             }
             // Stage 131: ArchSwitchContext / switch_frames ABI audit markers.
-            // Emitted once per proof run to record that the layout was verified:
-            // words[0..7] at offsets 0,8,16..56 (rsp,rip,rbx,rbp,r12-r15);
-            // fxsave at offset 64; total 576 bytes; r14 saved/restored at offset 48.
             crate::yarm_log!("D6_SWITCH_CONTEXT_AUDIT_BEGIN");
             crate::yarm_log!("D6_SWITCH_CONTEXT_LAYOUT_OK");
             crate::yarm_log!("D6_SWITCH_CONTEXT_R14_RESTORE_CHECK");
             crate::yarm_log!("D6_SWITCH_CONTEXT_AUDIT_DONE");
-            // Stage 132: map all kernel-switch-stack pages for both proof tasks
-            // before the switch.  The top-page-only mapping left by Stage 127 is
-            // insufficient: the first post-proof trap handler grows ~9 KB deep,
-            // crashing below the single mapped page (#PF write to unmapped stack).
-            if let Err(err) = self.d6_ensure_full_proof_switch_stack_mapped(outgoing_tid) {
+            // Stage 132: map all kernel-switch-stack pages for both proof tasks before the
+            // switch. The top-page-only mapping left by Stage 127 is insufficient: the first
+            // post-proof trap handler grows ~9 KB deep, crashing below the single mapped page.
+            if let Err(err) =
+                KernelState::d6_ensure_full_proof_switch_stack_mapped(shared, cpu, outgoing_tid)
+            {
                 crate::yarm_log!(
                     "D6_PROOF_FULL_STACK_MAP_FAILED tid={} err={:?}",
                     outgoing_tid,
@@ -860,7 +879,9 @@ impl KernelState {
                 );
                 return Ok(());
             }
-            if let Err(err) = self.d6_ensure_full_proof_switch_stack_mapped(incoming_tid) {
+            if let Err(err) =
+                KernelState::d6_ensure_full_proof_switch_stack_mapped(shared, cpu, incoming_tid)
+            {
                 crate::yarm_log!(
                     "D6_PROOF_FULL_STACK_MAP_FAILED tid={} err={:?}",
                     incoming_tid,
@@ -868,15 +889,7 @@ impl KernelState {
                 );
                 return Ok(());
             }
-            // Stage 165B/165C: ensure the kernel stack the proof is running on is
-            // fully backed.  The per-tid full-stack maps above cover the per-task
-            // `[region_base, stack_top)` ranges; this additionally ensures the
-            // region containing the *sampled live RSP*.  Stage 165C: that sampled
-            // RSP is the boot/CPU kernel stack in the image high half
-            // (`>= KERNEL_BOOTSTRAP_VIRT_BASE`), which is already kernel-mapped in
-            // every root — `d6_ensure_live_rsp_region_mapped` classifies it and
-            // verifies (it does NOT allocate or it would trip VmFull).  Selection
-            // is by RSP containment, not target task identity.
+            // Stage 165B/165C: ensure the kernel stack the proof is running on is fully backed.
             #[cfg(not(feature = "hosted-dev"))]
             {
                 let sampled_rsp: usize;
@@ -888,7 +901,9 @@ impl KernelState {
                         options(nomem, nostack, preserves_flags)
                     );
                 }
-                if let Err(err) = self.d6_ensure_live_rsp_region_mapped(sampled_rsp) {
+                if let Err(err) =
+                    KernelState::d6_ensure_live_rsp_region_mapped(shared, cpu, sampled_rsp)
+                {
                     crate::yarm_log!(
                         "D6_PROOF_LIVE_RSP_STACK_MAP_FAILED rsp=0x{:x} err={:?}",
                         sampled_rsp,
@@ -897,15 +912,44 @@ impl KernelState {
                     return Ok(());
                 }
             }
-            // Stage 139: capture hardware CR3 just before the proof switch so the
-            // cleanup can detect any divergence and restore it.
+            // Stage 139: capture hardware CR3 just before the proof switch so the cleanup can
+            // detect any divergence and restore it.
             #[cfg(not(feature = "hosted-dev"))]
             {
                 let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
                 crate::yarm_log!("D6_PROOF_CR3_BEFORE cr3=0x{:016x}", hw_cr3);
             }
-            self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?;
-            crate::kernel::boot::d6_controlled_switch_proof_mark_pending_done();
+            // The markers `maybe_switch_kernel_context` emitted around the plan build, preserved
+            // verbatim so the smoke gates read the same stream.
+            crate::yarm_log!(
+                "D6_SWITCH_PLAN_BEGIN outgoing={} incoming={}",
+                outgoing_tid,
+                incoming_tid
+            );
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROP_PLAN_BEGIN outgoing={} incoming={}",
+                outgoing_tid,
+                incoming_tid
+            );
+            match shared.d6_publish_switch_plan_split(cpu, outgoing_tid, incoming_tid) {
+                crate::runtime::D6SwitchPublication::Published { .. } => {
+                    crate::yarm_log!(
+                        "D6_GLOBAL_LOCK_DROP_PLAN_READY outgoing={} incoming={}",
+                        outgoing_tid,
+                        incoming_tid
+                    );
+                    crate::kernel::boot::d6_controlled_switch_proof_mark_pending_done();
+                }
+                crate::runtime::D6SwitchPublication::Refused(refusal) => {
+                    // Nothing was mutated. The proof's one-shot latch is NOT marked done, so a
+                    // later trap may try again — and `PENDING_DONE` stays clear, so the drain
+                    // will not claim a completion that never happened.
+                    crate::yarm_log!("D6_GLOBAL_LOCK_DROP_DEFERRED reason={}", refusal.marker());
+                    if switch_a_mode {
+                        crate::yarm_log!("D6_SWITCH_A_FALLBACK reason={}", refusal.marker());
+                    }
+                }
+            }
             Ok(())
         }
     }

@@ -1177,6 +1177,54 @@ pub(crate) enum SharedPageFaultRefusal {
     IdentityChanged,
 }
 
+/// U9-D6-FINAL §2 — the outcome of one switch-plan publication.
+///
+/// There is no third state: either this trap's switch is now owned by the published plan, or
+/// nothing at all was written and the caller is where it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum D6SwitchPublication {
+    Published {
+        outgoing_tid: u64,
+        incoming_tid: u64,
+    },
+    Refused(D6PublishRefusal),
+}
+
+/// Why a switch plan was not published. Every variant is raised BEFORE the store, and all but
+/// `StashOccupied` before the plan is even built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum D6PublishRefusal {
+    /// The two TIDs are the same task — there is no switch to make.
+    SameTask,
+    /// This architecture has no off-lock drain for the stash (RISC-V).
+    ArchUnsupported,
+    /// No drainer is active for this CPU, so a stored plan would never be applied.
+    NoTrapDrainer,
+    /// More than one CPU is online; the lock-drop switch window is single-online only.
+    MultiCpu,
+    /// **A plan is already pending for this trap.** The other publisher owns the switch; this
+    /// one mutates nothing and must not overwrite it.
+    StashOccupied,
+    /// The incoming task vanished, or a kernel context is uninitialized.
+    IncomingUnavailable,
+    /// The outgoing task has no TCB.
+    OutgoingUnavailable,
+}
+
+impl D6PublishRefusal {
+    pub(crate) fn marker(self) -> &'static str {
+        match self {
+            Self::SameTask => "same_task",
+            Self::ArchUnsupported => "arch_unsupported",
+            Self::NoTrapDrainer => "no_trap_drainer",
+            Self::MultiCpu => "multi_cpu",
+            Self::StashOccupied => "stash_occupied",
+            Self::IncomingUnavailable => "incoming_unavailable",
+            Self::OutgoingUnavailable => "outgoing_unavailable",
+        }
+    }
+}
+
 impl SharedKernel {
     /// Stage 114 fix: this used to also cache `scheduler_state` /
     /// `boot_config_state_lock` / `boot_config` raw pointers computed from
@@ -12044,6 +12092,105 @@ impl SharedKernel {
         self.with_fault_split_read(|faults| {
             faults.fault_handler_endpoint == Some(endpoint_idx)
                 || faults.supervisor_endpoint == Some(endpoint_idx)
+        })
+    }
+
+    /// U9-D6-FINAL §2 — **THE switch-plan publication, off the broad lock.**
+    ///
+    /// The diagnostic switch and the ordinary queue advance both publish into
+    /// `DISPATCH_SWITCH_PLAN_STASH`, and the drain takes exactly one plan per trap. So the stash
+    /// slot IS the "one owner per trap" token, and this is where it is taken.
+    ///
+    /// # Reservation precedes every irreversible change
+    ///
+    /// Occupancy is tested FIRST, before the plan is built and before anything is written. A
+    /// second publisher is refused by name and mutates nothing, so it may settle however its own
+    /// route settles — what it may not do is overwrite a plan the drain is already going to
+    /// apply, which would lose one switch and apply the wrong one.
+    ///
+    /// Every other refusal is also raised before the store, so a refused caller is in exactly
+    /// the state it was in before calling.
+    ///
+    /// # What the raw pointers are worth
+    ///
+    /// The plan carries `*mut ArchSwitchContext` derived from the TCB array under rank 2. That
+    /// the array is fixed-size proves the ADDRESS stays valid; it does **not** prove the same
+    /// incarnation still occupies the slot when the drain dereferences it, because the broad
+    /// handler runs in between and can reap or spawn. `d6_switch_plan_incarnations_valid_split`
+    /// is the missing half, and the drain calls it before `switch_frames`.
+    pub(crate) fn d6_publish_switch_plan_split(
+        &self,
+        cpu: CpuId,
+        outgoing_tid: u64,
+        incoming_tid: u64,
+    ) -> D6SwitchPublication {
+        use D6PublishRefusal as R;
+        if outgoing_tid == incoming_tid {
+            return D6SwitchPublication::Refused(R::SameTask);
+        }
+        // The Stage 117 stash gate's own conditions, asked here rather than inside the plan
+        // build, so an ineligible configuration never reaches the TCB acquisition at all.
+        if cfg!(target_arch = "riscv64") {
+            return D6SwitchPublication::Refused(R::ArchUnsupported);
+        }
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+            return D6SwitchPublication::Refused(R::NoTrapDrainer);
+        }
+        if !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return D6SwitchPublication::Refused(R::NoTrapDrainer);
+        }
+        if self.online_cpu_count_split_read() > 1 {
+            return D6SwitchPublication::Refused(R::MultiCpu);
+        }
+        // ── RESERVATION. Nothing below this point may be reached with a plan already pending.
+        // SAFETY: single CPU, interrupts disabled by hardware trap entry, no concurrent accessor.
+        if unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() } {
+            return D6SwitchPublication::Refused(R::StashOccupied);
+        }
+        // rank 2, ONE acquisition, through the SAME builder the broad path uses.
+        let built = self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::boot::build_dispatch_switch_plan_locked(tcbs, outgoing_tid, incoming_tid)
+        });
+        let plan = match built {
+            Ok(Some(plan)) => plan,
+            // `Ok(None)` is the builder's "same slot, or a kernel context is uninitialized".
+            Ok(None) => return D6SwitchPublication::Refused(R::IncomingUnavailable),
+            Err(_) => return D6SwitchPublication::Refused(R::OutgoingUnavailable),
+        };
+        // SAFETY: as above; the slot was observed empty a moment ago on this same CPU with
+        // interrupts disabled, and nothing between then and here can publish.
+        unsafe {
+            crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan);
+        }
+        D6SwitchPublication::Published {
+            outgoing_tid,
+            incoming_tid,
+        }
+    }
+
+    /// U9-D6-FINAL §2 — do the plan's two raw frame pointers still name the incarnations the
+    /// plan was built from?
+    ///
+    /// Rank 2, one acquisition, no reference escaping it. Checks that each TID is still present
+    /// and still has an initialized kernel context — the exact two facts
+    /// `build_dispatch_switch_plan_locked` established when it took the pointers. Fixed storage
+    /// alone proves neither: a task can be reaped and its slot reused by the broad handler that
+    /// runs between publication and the drain.
+    pub(crate) fn d6_switch_plan_incarnations_valid_split(
+        &self,
+        outgoing_tid: u64,
+        incoming_tid: u64,
+    ) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let initialized = |tid: u64| {
+                tcbs.iter()
+                    .flatten()
+                    .any(|tcb| tcb.tid.0 == tid && tcb.kernel_context.initialized)
+            };
+            initialized(outgoing_tid) && initialized(incoming_tid)
         })
     }
 

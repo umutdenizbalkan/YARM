@@ -29,7 +29,7 @@ pub(crate) mod fork_owners;
 // pre-lock split route), so it is re-exported alongside the transaction it parameterises.
 pub(crate) use exec_state::{
     IncomingResumeConvention, QueueAdvanceApply, QueueAdvanceOutcome, QueueAdvanceRefusal,
-    classify_incoming_resume_convention,
+    build_dispatch_switch_plan_locked, classify_incoming_resume_convention,
 };
 #[cfg_attr(feature = "hosted-dev", allow(unused_imports))]
 pub(crate) use memory_lifecycle_state::{TransferPinRefusal, TransferPinToken};
