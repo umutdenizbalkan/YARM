@@ -188463,6 +188463,166 @@ mod u9d6final_switch_ownership {
     }
 }
 
+/// U9-D6-FINAL §5 — **THE TERMINAL-ACQUISITION RESIDUAL, pinned from source.**
+///
+/// §5 asks whether the two terminal `with_cpu` acquisitions can be removed. They cannot, and the
+/// reason is not that a workload failed to reach them — it is that the split dispatcher still has
+/// `None`/`NotHandled` producers that hand a trap to the broad path by construction. This module
+/// enumerates them from source so the list is a derived fact rather than a claim, and so it
+/// cannot grow quietly: every producer below is either named here with its owner-in-waiting, or
+/// the guard fails.
+///
+/// The live counts belong to the report, not here — a marker that never fired proves only that
+/// the arguments never arrived. One DID arrive, on RISC-V, through `RESIDUAL_NR8` below.
+mod u9d6final_residual {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TRAP: &str = include_str!("../../arch/trap_entry.rs");
+    const RV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    fn code(src: &str) -> alloc::string::String {
+        src.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// **NR 0 — the Yield decline.** `try_split_yield_into_frame` answers `D::NotHandled` for
+    /// EVERY `YieldDecline`, and all six variants are raised by `yield_deferral_arch_gate` /
+    /// `run_yield_transaction`. Owner-in-waiting: an off-lock settlement for NR 0's declines, the
+    /// same shape every other family in this programme received.
+    ///
+    /// U9-D6-FINAL (C2) made `DeferralHeld` MORE reachable, deliberately:
+    /// `colliding_deferral_pending_for` now also tests the switch-plan stash.
+    #[test]
+    fn residual_nr0_yield_decline_still_reaches_the_broad_dispatcher() {
+        let c = code(SPLIT);
+        let route = c
+            .split("fn try_split_yield_into_frame(")
+            .nth(1)
+            .expect("the yield route");
+        assert!(
+            route.contains("YIELD_SPLIT_REFUSED") && route.contains("D::NotHandled"),
+            "NR 0's decline must still be the named residual it is — if this route stops \
+             answering NotHandled, this guard is what says the residual list shrank"
+        );
+    }
+
+    /// **NR 8 — the argument-validation refusal, and the ONE producer with a live arrival.**
+    ///
+    /// `classify_split_eligible` refuses `target_pid == 0 || slots == 0` with `None`, which `?`
+    /// propagates out of `try_split_dispatch` and then out of the non-switching dispatcher. A
+    /// RISC-V core-smoke boot took it exactly once (`TERMINAL_BROAD_DISPATCH_ENTER cpu=0
+    /// event=Syscall nr=8`). Owner-in-waiting: the canonical argument error, answered pre-lock
+    /// beside the retired-NR arm that already does this for a different refusal.
+    #[test]
+    fn residual_nr8_argument_refusal_falls_through_by_construction() {
+        let c = code(SPLIT);
+        let classify = c
+            .split("fn classify_split_eligible(")
+            .nth(1)
+            .expect("the eligibility classifier");
+        assert!(
+            classify.contains("if target_pid == 0 || slots == 0 {"),
+            "the NR 8 argument refusal is the live residual; its shape is pinned here"
+        );
+        let dispatcher = c
+            .split("fn try_split_dispatch_nonswitching_into_frame(")
+            .nth(1)
+            .expect("the non-switching dispatcher");
+        assert!(
+            dispatcher.contains("try_split_dispatch(shared, syscall, requester_tid, args)?"),
+            "and it reaches the bridge through this `?`, which is why a `None` here is a broad \
+             entry rather than an error"
+        );
+    }
+
+    /// **The undecodable NR.** A number that is neither decodable nor retired leaves the
+    /// dispatcher as `None`. Owner-in-waiting: `SyscallError::InvalidNumber`, which is exactly
+    /// what the adjacent retired-NR arm already returns for its own case.
+    #[test]
+    fn residual_undecodable_nr_falls_through_while_the_retired_one_does_not() {
+        let c = code(SPLIT);
+        let dispatcher = c
+            .split("fn try_split_dispatch_nonswitching_into_frame(")
+            .nth(1)
+            .expect("the non-switching dispatcher");
+        assert!(
+            dispatcher.contains(
+                "if let Some(reason) = crate::kernel::syscall::retired_syscall_number(raw_nr) {"
+            ),
+            "a RETIRED number is answered pre-lock"
+        );
+        assert!(
+            dispatcher.contains("let Ok(syscall) = Syscall::decode(raw_nr) else {"),
+            "an UNDECODABLE one is not — it is the residual this names"
+        );
+    }
+
+    /// **`current_tid_authoritative` is the most widely shared producer.** Seven whitelisted
+    /// routes take it with `?`, so "this CPU has no authoritative current task" is a broad entry
+    /// on all of them. Owner-in-waiting: ONE settlement for that condition, composed by each
+    /// route, rather than seven independent fall-throughs.
+    #[test]
+    fn residual_no_authoritative_current_is_shared_by_several_routes() {
+        let c = code(SPLIT);
+        let takes = c.matches("shared.current_tid_authoritative(cpu)?").count();
+        assert!(
+            takes >= 5,
+            "the shared residual is real and widespread (found {takes} `?` takes); if this \
+             drops to zero the condition has been given an owner and the list shrinks"
+        );
+    }
+
+    /// **NR 10 — three named legacy fall-throughs.** `try_split_futex_wake_into_frame` declines
+    /// to the broad path on every validation miss, and says so in its own comments. Owner-in-
+    /// waiting: the canonical `WrongObject` / `UserMemoryFault` answers, pre-lock.
+    #[test]
+    fn residual_nr10_futex_wake_validation_misses_are_named_fall_throughs() {
+        let route = SPLIT
+            .split("fn try_split_futex_wake_into_frame(")
+            .nth(1)
+            .expect("the futex-wake route");
+        let body = route.split("\n}\n").next().unwrap_or(route);
+        assert_eq!(
+            body.matches("return None; // legacy:").count(),
+            3,
+            "three validation misses fall through, each naming the legacy error it wants the \
+             broad path to produce"
+        );
+    }
+
+    /// **The census marker exists on BOTH bridges.** Without it a boot cannot distinguish "the
+    /// acquisition was never entered" from "nobody was looking", and §5's reachability report
+    /// would rest on absence of evidence.
+    #[test]
+    fn both_bridges_announce_a_terminal_broad_entry() {
+        for (name, src) in [("shared", TRAP), ("riscv64", RV_TRAP)] {
+            assert!(
+                src.contains("TERMINAL_BROAD_DISPATCH_ENTER cpu={} event={:?} nr={}"),
+                "{name}: the fall-through census marker must be present"
+            );
+        }
+    }
+
+    /// **A side effect still attached only to the fall-through.** The RISC-V foundation oracle
+    /// publishes its one-shot token from INSIDE the broad closure, so deleting that acquisition
+    /// would delete the publish with it. Default-off and one-shot, but it is a side effect §5
+    /// requires named rather than discovered later.
+    #[test]
+    fn the_riscv_foundation_oracle_publish_is_inside_the_acquisition() {
+        let arm = RV_TRAP
+            .split(".with_cpu(cpu, |kernel| {")
+            .nth(1)
+            .expect("the RISC-V terminal acquisition");
+        assert!(
+            arm.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK"),
+            "the oracle publish is a fall-through-only side effect and must be relocated before \
+             the acquisition can go"
+        );
+    }
+}
+
 /// U9-D6-FINAL §4 — the source facts the hosted cases cannot reach: where the hook runs, who
 /// owns the switch, and what the drain still does in what order.
 mod u9d6final_closure {

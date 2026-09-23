@@ -1691,6 +1691,15 @@ pub fn handle_riscv_trap_entry_shared(
             .or(cow_result)
             .unwrap_or(Ok(())))
     } else {
+        // U9-D6-FINAL §5 — the fall-through census marker, the RISC-V twin of the shared
+        // bridge's. Same reason: without it a boot cannot say whether this acquisition was
+        // entered at all.
+        crate::yarm_log!(
+            "TERMINAL_BROAD_DISPATCH_ENTER cpu={} event={:?} nr={}",
+            cpu.0,
+            decode_trap_context(context).trap(),
+            frame.syscall_num()
+        );
         shared
             .with_cpu(cpu, |kernel| {
                 // Foundation oracle PUBLISH — during the broad-lock phase, stash a

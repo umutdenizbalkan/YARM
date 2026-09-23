@@ -21496,3 +21496,205 @@ means mapping the PLIC window (kernel-only) into every user ASID — a change to
 `map_kernel_shared_into_asid` with its own isolation argument to make, and one that would still
 produce no arrivals because no source is enabled. The escape to broad dispatch is closed either
 way: the unavailable case settles pre-lock with a named reason instead of falling through.
+
+---
+
+# U9-D6-FINAL — the diagnostic switch dependency, and the terminal-acquisition residual
+
+## §1 — the D6 ownership chain, derived
+
+`yarm.d6_switch_proof` and `yarm.d6_switch_a` reach a real kernel-context switch through one
+chain, and every link of it is now an owner that exists off the broad lock:
+
+```
+  maybe_run_d6_controlled_switch_proof_split   (exec_state.rs)
+    online_cpu_count_split_read                 topology
+    current_tid_split_read                      outgoing identity
+    with_task_tcbs_split_mut                    both contexts initialized
+    ensure_active_root_can_use_kernel_switch_stack (split)   preparation
+    d6_ensure_full_proof_switch_stack_mapped       (split)   preparation x2
+    d6_ensure_live_rsp_region_mapped               (split)   preparation
+    d6_publish_switch_plan_split                (runtime.rs) ONE publication
+      -> build_dispatch_switch_plan_locked      (exec_state.rs) the SHARED builder
+      -> DISPATCH_SWITCH_PLAN_STASH[cpu]
+  drain_switch_plan_stash                       (trap_entry.rs)
+    d6_switch_plan_incarnations_valid_split     authentication
+    switch_frames / FIRST_RESUME_STASH / post_switch_restore / cleanup
+```
+
+The three preparation owners were converted IN PLACE to split form: one body, one owner, one
+caller. No parallel D6 implementation exists, and no broad borrow is disguised as a subsystem
+seam.
+
+## §2 — the five D6 gates, derived separately
+
+Four of the five gates guarded a DRAIN whose cell has reserve sites that never consulted a D6
+knob. A gate that suppresses an owed drain leaks the reservation for the rest of the boot:
+
+| cell | ungated reserve site | verdict |
+|---|---|---|
+| `d2_send_dispatch` | `runtime.rs` split blocking-send commit | asymmetric — knob terms removed |
+| `d2_recv_dispatch` | `syscall_split.rs` step (7) of the split receive route | asymmetric — **proven live** |
+| `futex_wait_dispatch` | terminal-fault route, split FutexWait route, `exit_txn::reserve_queue_advance` | asymmetric — knob terms removed |
+| `yield_dispatch` | `yield_txn.rs`, ungated since §3 removed the arch gate's x86 D6 arm | asymmetric — knob terms removed |
+| `d6_genuine_mode` | not a drain — a queue-neutral observation slice | **coordination gate, KEPT** |
+
+The recv one was the wedge. Live sequence under `D6_SWITCH_PROOF=1`: tid 3 issues NR 2, step (7)
+arms the cell, the drain declines, and the next NR 2 answers `IPC_RECV_BLOCK_SPLIT_REFUSED
+reason=already_deferred` -> `IPC_RECV_SPLIT_INVARIANT result=failed_closed` -> `handled_err
+code=255` -> retry forever. A diagnostic knob had turned a supported blocking receive into an
+invariant error.
+
+## §3 — ownership covers publication AND consumption
+
+Stash occupancy is now a reservation, with both publication orders closed and the serialization
+argument recorded at `boot::switch_plan_stash_is_reserved` (per-CPU locality; interrupts masked
+at vector entry; no nesting; `online_cpu_count() <= 1` for the stash path):
+
+* **order A** — a queue-advancing deferral reserved first: `d6_publish_switch_plan_split` refuses
+  `D6PublishRefusal::DeferralReserved`, naming the incumbent cell. An empty stash slot is not
+  whole-trap ownership.
+* **order B** — a plan published first: each of the four `*_try_defer` primitives refuses BEFORE
+  its CAS, so the cell is left clear.
+
+Neither check is applied at a drain. A drain settles a reservation that already exists; asking it
+whether one exists would make it refuse on account of its own.
+
+The one-shot start latch is handed back by `d6_controlled_switch_proof_release_start` on
+preparation failure, on a refused publication, and on a stale-plan rejection. Before this, any of
+those consumed the proof's only attempt and the run reported no proof at all rather than a refused
+one — while the code's own comment promised "a later trap may try again". The stale-plan path also
+clears `PENDING_DONE`, so no later applied plan inherits a completion the proof never earned.
+
+## §4 — the plan is authenticated against its actual storage
+
+`{slot, tid, asid}` is not an identity. A reap-and-respawn into the same slot reproduces all three
+AND the frame address, because the TCB array is fixed-size. The separator is a stamp taken from
+`spawn_reservation_generation` — the tree's existing uniqueness authority, whose documented rule
+is that no two reservations ever receive the same value. A per-context counter does NOT work and
+an earlier revision used one: it is destroyed with the TCB and starts again at zero in the
+replacement.
+
+`d6_switch_plan_incarnations_valid_split` checks, per side, in one rank-2 acquisition: the
+recorded SLOT (not a search by TID), `{tid, asid}`, `switch_generation`, `initialized`, and
+`core::ptr::eq` against the pointer re-derived from that slot.
+
+Exercised against the production builder and validator, each case requiring the PREDECESSOR check
+(TID exists + initialized) to pass where the new proof fails: same-slot re-initialization,
+movement to another slot, a stranger occupying the recorded slot, and stamp uniqueness across slot
+reuse.
+
+**The drain's refusal argument is corrected.** "Publishing a plan changes no scheduler state" is
+about the publisher; it says nothing about the intervening handler, and it is false outright for
+the queue-advance publisher, which dequeues the incoming task INTO this CPU's `current` slot
+before it stashes. `settle_refused_switch_plan` reads the scheduler's actual `current` and
+`entering_frame_authority_split_read` against the outgoing identity, and admits the discard in
+exactly one state — the incoming task was never committed here and the outgoing side still owns
+the entering frame. Every other state fails closed: the plan cannot be applied, the trap cannot
+return through a frame the scheduler has disowned, and re-entering the dispatcher would re-derive
+against whoever is current now.
+
+## §5 — the hook's position, derived from prerequisites
+
+Keeping the hook in the fall-through `else` arm made a default-off diagnostic depend on a trap
+going UNHANDLED. Once the four drain gates were repaired, the diagnostic boot settled every trap
+pre-lock, the arm never ran, and the proof reported nothing at all.
+
+Three positions were measured:
+
+| position | result |
+|---|---|
+| top of `handle_trap_entry_shared` | 32 x `wrong_outgoing_tid tid=2`, zero proof starts |
+| after `trap_path.settle()` | 200 x `trap_path_inactive` — publishing is refused once the window closes |
+| **immediately before `trap_path.settle()`** | **the full chain runs** |
+
+The chosen point satisfies all four prerequisites at once: statement level, after the disposition
+binding both arms feed (so §6's deletion cannot orphan it); the publication window still open; the
+drain downstream; and the four deferral cells still armed, so `DeferralReserved` can see an
+outstanding claim.
+
+## §6 — the live witness
+
+| profile | result |
+|---|---|
+| `D6_SWITCH_PROOF=1` | exit 0 — BEGIN, PAIR, CURRENT_OK, TSS_OK, CR3, `GLOBAL_LOCK_DROPPED_BEFORE_SWITCH`, `SWITCH_FRAMES_ENTER_UNLOCKED`, `FIRST_RESUME_ENTER`, `SWITCH_FRAMES_RETURNED_UNLOCKED`, CLEANUP_DONE, STASH_CLEAR_OK, STATE_CLEAR_OK, no fatal |
+| `D6_SWITCH_A=1` | exit 0 — CANDIDATE, LOCK_DROPPED, SWITCH_ENTER, RETURNED, FIRST_RESUME, DONE |
+| both knobs | exit 0 — precedence forces `D6_SWITCH_A=0` |
+| knob-off | exit 0, zero errors |
+
+**The receive reservation is proven consumed**, not merely unlatched: 116 receives published, 116
+drains completed, 0 `already_deferred`, asserted positively and one-for-one in the smoke.
+
+Two smoke gates were made profile-aware, because the repaired D6 block reaches them for the first
+time under these knobs. `unlock_graduated_enabled()` IS `d6_genuine_enabled()`, so the graduated
+path and the cross-arch D2 seam verdicts are inert by design under either D6 switch diagnostic;
+each profile now asserts positively what the kernel actually promises there. The knob-off
+expectations are unchanged.
+
+### The corrected stack-check attribution
+
+`D6_KERNEL_SWITCH_STACK_CHECK_FAILED` is **not** the failing owner, and attributing the wedge to
+capacity was wrong. The chain self-repairs, for both tids:
+
+```
+CHECK_FAILED tid=N reason=target_asid_unavailable
+  -> FRAME_INIT_RETRY -> MAP_BEGIN/DONE -> MAP_SHARED_*
+  -> CHECK_OK tid=N -> FRAME_INIT_DONE tid=N
+```
+
+The smoke's `CHECK_FAILED with no later CHECK_OK` heuristic only runs when the proof did not
+complete, which is why it looked like the cause. The qualifying run now reports
+`completed clean ... skipping stale CHECK_FAILED-without-CHECK_OK heuristic` itself. The real
+first failing owner was the receive-cell wedge in §2.
+
+## §7 — THE TERMINAL-ACQUISITION RESIDUAL: the acquisitions are NOT removed
+
+Census unchanged, before and after: `with_cpu = 2`, `with_broad = 0`, `state_lock = 3`,
+`tests/broad_lock_census_guard.rs` 7/7.
+
+### Reachability, from source
+
+All 22 `Syscall` variants have an owner, and no whitelisted route answers `None` after its NR
+gate. What remains are producers INSIDE those owners:
+
+| # | producer | condition | owner-in-waiting |
+|---|---|---|---|
+| R1 | `try_split_yield_into_frame` | `Err(decline) => D::NotHandled` — all six `YieldDecline` variants | an off-lock settlement for NR 0's declines |
+| R2 | `classify_split_eligible` (NR 8) | `target_pid == 0 \|\| slots == 0` -> `None`, propagated by `?` | the canonical argument error, pre-lock |
+| R3 | non-switching dispatcher | `Syscall::decode` Err — an undecodable NR | `InvalidNumber`, beside the retired-NR arm that already does this |
+| R4 | `current_tid_authoritative(cpu)?` | no authoritative current task — taken by NR 8, 10, 11, 12, 15, 23, 28, 29, 31 | ONE settlement for that condition, composed by each route |
+| R5 | `try_split_futex_wake_into_frame` (NR 10) | three named misses (`addr == 0`, `end >= KERNEL_SPACE_BASE`, user-copy miss) plus two `?` conversions | canonical `WrongObject` / `UserMemoryFault`, pre-lock |
+| R6 | NR 11 / 12 / 23 / 29 | `task_cnode_split?`, `spawn_owners_for?`, `owners.spawner_tid?`, MO-kind `_ => None` | per-route pre-mutation refusals |
+| R7 | `try_split_ipccall_into_frame` | `unrouted("admission_disabled")`, `unrouted("cpu_out_of_range")` | none needed — statically unreachable |
+| R8 | terminal PageFault route | `fault`/`frame` absent, `cpu_idx >= MAX_CPUS`, non-recovery class at route end, arch not one of three | defensive / argued unreachable |
+| R9 | the bridge itself | a `TrapEvent::Syscall` with no frame skips the split dispatcher entirely | defensive |
+
+Closed and NOT residual: `TrapEvent::Unknown` (always `Complete`), `TrapEvent::TimerInterrupt`
+(`NotHandled` only when the event is not a timer), `TrapEvent::ExternalInterrupt` (`irq: None` is
+unreachable at the bridge; the hosted decline is hosted-only).
+
+### A side effect still attached only to the fall-through
+
+The RISC-V foundation-oracle PUBLISH (`RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK`) is inside
+the `with_cpu` closure. Default-off and one-shot, but deleting the acquisition would delete the
+publish with it, so it must be relocated first.
+
+### Live evidence, kept separate from the source derivation
+
+Both bridges now emit `TERMINAL_BROAD_DISPATCH_ENTER cpu=<n> event=<trap> nr=<n>`, so a boot can
+distinguish "never entered" from "nobody was looking".
+
+| run | terminal broad entries |
+|---|---|
+| x86_64 core smoke, knob-off | 0 |
+| x86_64 core smoke, `D6_SWITCH_PROOF=1` | 0 |
+| x86_64 core smoke, `D6_SWITCH_A=1` | 0 |
+| AArch64 core smoke | 0 |
+| **RISC-V core smoke** | **1 — `cpu=0 event=Syscall nr=8`** |
+
+That single arrival is R2, and it settles the question on its own: the acquisitions are reachable
+in production today, so zero arrivals on the other four runs discharge nothing. U9 does not close
+here.
+
+The residual list is pinned from source by `kernel::boot::tests::u9d6final_residual` (7 cases), so
+it cannot shrink or grow without a guard failing.

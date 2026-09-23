@@ -1567,6 +1567,26 @@ pub fn handle_trap_entry_shared(
                 .or(cow_result)
                 .unwrap_or(Ok(())))
         } else {
+            // U9-D6-FINAL §5 — THE FALL-THROUGH CENSUS MARKER.
+            //
+            // The reachability question this directive asks is "does anything still reach the
+            // terminal acquisition", and until now a live boot could not answer it: the arm was
+            // silent, so a run that entered it a hundred times and one that never entered it
+            // looked identical. It names, per trap, that the acquisition was actually entered,
+            // with the decoded event and the syscall number, so a live run can be cross-checked
+            // against the source-derived residual table rather than trusted on its own.
+            //
+            // It stays until the arm itself goes: a marker that is absent because the arm is
+            // unreachable is evidence, and one that is absent because nobody looked is not.
+            crate::yarm_log!(
+                "TERMINAL_BROAD_DISPATCH_ENTER cpu={} event={:?} nr={}",
+                cpu.0,
+                decode_trap_context(context).trap(),
+                frame
+                    .as_deref()
+                    .map(|f| f.syscall_num())
+                    .unwrap_or(usize::MAX)
+            );
             shared
                 .with_cpu(cpu, |kernel| {
                     handle_trap_entry_with_fault_bookkeeping_mode(
