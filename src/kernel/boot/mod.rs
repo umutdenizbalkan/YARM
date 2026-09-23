@@ -715,6 +715,29 @@ pub(crate) struct DispatchSwitchPlan {
     /// Used by the first-resume trampoline when switching back to the outgoing
     /// task: passed as `next_kernel_stack_top` to update TSS RSP0 on x86_64.
     pub(crate) outgoing_stack_top: Option<u64>,
+    /// U9-D6-FINAL §1 — **the facts that make the two raw pointers authenticable.**
+    ///
+    /// Recorded under the same rank-2 acquisition that derived the pointers, and re-checked by
+    /// `SharedKernel::d6_switch_plan_incarnations_valid_split` before the drain dereferences
+    /// them. The slot index is what lets the check look at the SAME storage rather than at
+    /// whatever slot now happens to hold that TID; `{tid, asid}` is the incarnation coordinate
+    /// the rest of the tree uses; and the context generation is what separates a reused slot's
+    /// replacement from the incarnation the pointer was taken from, which `{slot, tid, asid}`
+    /// alone cannot do because a replacement can reproduce all three.
+    pub(crate) outgoing_identity: SwitchPlanIdentity,
+    pub(crate) incoming_identity: SwitchPlanIdentity,
+}
+
+/// U9-D6-FINAL §1 — one side's authentication facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SwitchPlanIdentity {
+    /// Which `KernelState::tcbs` slot the pointer was derived from.
+    pub(crate) slot: usize,
+    pub(crate) tid: u64,
+    /// `None` for a task with no bound address space, compared as-is.
+    pub(crate) asid: Option<crate::kernel::vm::Asid>,
+    /// `KernelExecutionContext::switch_generation` as read when the pointer was taken.
+    pub(crate) switch_generation: u64,
 }
 
 /// Stage 117: per-CPU stash cell for a `DispatchSwitchPlan` that will be
@@ -781,6 +804,89 @@ impl PerCpuSwitchPlanStash {
 pub(crate) static DISPATCH_SWITCH_PLAN_STASH: [PerCpuSwitchPlanStash;
     crate::kernel::scheduler::MAX_CPUS] =
     [const { PerCpuSwitchPlanStash::new() }; crate::kernel::scheduler::MAX_CPUS];
+
+/// U9-D6-FINAL (C2) — **the stash read that makes occupancy a RESERVATION, and the serialization
+/// that makes the reservation authoritative.**
+///
+/// A shared occupancy check is not by itself a reservation: two actors that each merely LOOK
+/// before acting can both look, both find the slot free, and both act. What turns this one into
+/// a reservation is that look-and-act is ATOMIC WITH RESPECT TO EVERY OTHER ACTOR here, for
+/// reasons that are properties of the trap path, not of the cell:
+///
+/// * **Locality.** Both the stash and the four deferral cells are indexed per CPU and are read
+///   and written only through `cpu_idx`/`CpuId` values taken from the CPU executing the trap.
+///   No code path reaches another CPU's entry. So the only actors that can race are on this CPU.
+/// * **Non-preemptibility.** Every writer runs inside a trap with interrupts disabled — cleared
+///   by the x86_64 IDT interrupt gate and masked by `DAIF` on AArch64 at vector entry — and
+///   `SpinLock` does not restore IRQ state, so dropping the broad lock mid-trap does not re-open
+///   a window. Nothing on this CPU runs between the look and the act.
+/// * **No nesting.** The stash path is admitted only when `online_cpu_count() <= 1` and the
+///   trap-path flag is set (`exec_state.rs`), and a trap cannot re-enter the same section
+///   because interrupts stay masked for its whole duration. There is therefore exactly one
+///   look-and-act sequence in flight per CPU at any time.
+///
+/// Both publication orders are consequently excluded by ONE pair of checks, without a lock:
+///
+/// * **Order A — deferral first, plan second.** `d6_publish_switch_plan_split` calls
+///   `queue_advance_deferral_reserved_by` and refuses with `D6PublishRefusal::DeferralReserved`.
+/// * **Order B — plan first, deferral second.** Each of the four `*_try_defer` reservation
+///   primitives calls this function and refuses before its CAS.
+///
+/// The DRAINS deliberately do NOT consult either check. A drain settles a reservation that
+/// already exists; asking it whether a reservation exists would make it refuse on account of its
+/// own, which is the leak C1 has just finished repairing.
+///
+/// # Safety
+///
+/// Same discipline as every other access to the stash: local CPU, trap path, interrupts
+/// disabled.
+pub(crate) fn switch_plan_stash_is_reserved(cpu_idx: usize) -> bool {
+    // SAFETY: local CPU, trap path, interrupts disabled — see the doc comment above.
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && unsafe { DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() }
+}
+
+/// U9-D6-FINAL (C2) — which queue-advancing deferral, if any, this CPU has reserved.
+///
+/// Returns the cell's stable name so a refusal can NAME the incumbent rather than reporting an
+/// anonymous "busy". The order is the drains' order in `handle_trap_entry_shared`.
+///
+/// `d6_genuine_dispatch` is deliberately absent. It is not a queue-advancing reservation owed to
+/// a committed route — it is the D6-GENUINE observation slice, whose exclusion against the other
+/// switch mechanisms is the coordination gate kept at the fifth D6 gate in `trap_entry.rs`.
+/// Folding it in here would express the same precedence twice, in two places that could drift.
+pub(crate) fn queue_advance_deferral_reserved_by(cpu_idx: usize) -> Option<&'static str> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    if d2_send_dispatch_is_deferred(cpu_idx) {
+        return Some("d2_send");
+    }
+    if d2_recv_dispatch_is_deferred(cpu_idx) {
+        return Some("d2_recv");
+    }
+    if futex_wait_dispatch_is_deferred(cpu_idx) {
+        return Some("futex_wait");
+    }
+    if yield_dispatch_is_deferred(cpu_idx) {
+        return Some("yield");
+    }
+    None
+}
+
+/// U9-D6-FINAL (C2) — the order-B half, shared by all four reservation primitives so there is one
+/// body and one policy. Logs the refusal with the cell that was asking.
+fn deferral_reservation_refused_by_switch_plan(cpu_idx: usize, cell: &'static str) -> bool {
+    if !switch_plan_stash_is_reserved(cpu_idx) {
+        return false;
+    }
+    crate::yarm_log!(
+        "QUEUE_ADVANCE_DEFER_REFUSED cpu={} cell={} reason=switch_plan_reserved",
+        cpu_idx,
+        cell
+    );
+    true
+}
 
 /// Stage 188A: per-CPU stash cell for a [`crate::kernel::dispatch_post_work::DispatchPostWork`]
 /// item that a syscall/IPC handler produced under the broad `with_cpu` /
@@ -1203,6 +1309,11 @@ pub(crate) fn d2_recv_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool 
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return false;
     }
+    // U9-D6-FINAL (C2, order B) — a published switch plan already owns this trap's
+    // switch. Refuse BEFORE the CAS so a refused reservation leaves the cell clear.
+    if deferral_reservation_refused_by_switch_plan(cpu_idx, "d2_recv") {
+        return false;
+    }
     if D2_RECV_DISPATCH_DEFERRED[cpu_idx]
         .compare_exchange(
             false,
@@ -1276,6 +1387,11 @@ pub(crate) static FUTEX_WAIT_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
 /// (decline; caller falls back to the in-lock dispatch) if an intent is already pending.
 pub(crate) fn futex_wait_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    // U9-D6-FINAL (C2, order B) — a published switch plan already owns this trap's
+    // switch. Refuse BEFORE the CAS so a refused reservation leaves the cell clear.
+    if deferral_reservation_refused_by_switch_plan(cpu_idx, "futex_wait") {
         return false;
     }
     if FUTEX_WAIT_DISPATCH_DEFERRED[cpu_idx]
@@ -1501,6 +1617,11 @@ pub(crate) static YIELD_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
 /// caller falls back to the in-lock dispatch) if an intent is already pending.
 pub(crate) fn yield_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    // U9-D6-FINAL (C2, order B) — a published switch plan already owns this trap's
+    // switch. Refuse BEFORE the CAS so a refused reservation leaves the cell clear.
+    if deferral_reservation_refused_by_switch_plan(cpu_idx, "yield") {
         return false;
     }
     if YIELD_DISPATCH_DEFERRED[cpu_idx]
@@ -2641,6 +2762,11 @@ pub(crate) fn d2_send_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool 
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return false;
     }
+    // U9-D6-FINAL (C2, order B) — a published switch plan already owns this trap's
+    // switch. Refuse BEFORE the CAS so a refused reservation leaves the cell clear.
+    if deferral_reservation_refused_by_switch_plan(cpu_idx, "d2_send") {
+        return false;
+    }
     if D2_SEND_DISPATCH_DEFERRED[cpu_idx]
         .compare_exchange(
             false,
@@ -3103,6 +3229,34 @@ pub(crate) fn d6_controlled_switch_proof_try_start() -> bool {
             core::sync::atomic::Ordering::Acquire,
         )
         .is_ok()
+}
+
+/// U9-D6-FINAL (C2) — **give the one-shot start latch back when the attempt did not happen.**
+///
+/// `d6_controlled_switch_proof_try_start` is a CAS `false → true`, and every caller that wins it
+/// then has work to do that CAN FAIL: two full switch-stack mappings, the live-RSP mapping, and
+/// the publication itself. Without this release, any of those failing consumed the only attempt
+/// the proof will ever get — the latch stayed `true`, every later trap's `try_start` returned
+/// `false`, and the run reported no proof at all rather than a proof that was refused. That is
+/// the "silently permanent disarming of a promised retry" the directive forbids: the caller's
+/// own comment already PROMISED that "a later trap may try again".
+///
+/// Releasing is safe precisely because these are the pre-publication failures. They mutate no
+/// scheduler state, publish no plan, and never set `PENDING_DONE`, so nothing downstream can
+/// observe a completion that did not occur — a released attempt is indistinguishable from one
+/// that was never started, which is exactly what it should be.
+///
+/// It is NOT called after a successful publication. From that point the proof has committed and
+/// its completion is owned by the drain.
+pub(crate) fn d6_controlled_switch_proof_release_start(reason: &'static str) {
+    D6_CONTROLLED_SWITCH_PROOF_STARTED.store(false, core::sync::atomic::Ordering::Release);
+    crate::yarm_log!(
+        "D6_CONTROLLED_SWITCH_PROOF_RETRY_ARMED reason={} pending_done={}",
+        reason,
+        u8::from(
+            D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE.load(core::sync::atomic::Ordering::Acquire)
+        )
+    );
 }
 
 pub(crate) fn d6_controlled_switch_proof_mark_pending_done() {

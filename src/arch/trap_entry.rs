@@ -338,6 +338,93 @@ fn post_switch_d6_cleanup_split(
 /// Nothing about the apply changed. It still takes the plan, performs the arch switch with no
 /// lock held, runs the U9/203C off-lock incoming restore on x86_64 and AArch64, and runs the
 /// U9-D3 §7 split D6 cleanup when a proof/D6-SWITCH-A run has just completed.
+/// U9-D6-FINAL §1 — **what to do with a plan whose incarnations no longer authenticate.**
+///
+/// Discarding a plan is a control decision with two distinct ways to be wrong, and neither is
+/// visible from the publisher's side:
+///
+/// 1. **Resuming a displaced task.** Returning from this trap resumes whatever the live trap
+///    frame belongs to — the task that ENTERED the trap, i.e. the plan's outgoing side. If the
+///    intervening handler blocked, reaped, re-queued or migrated it, that task now has another
+///    continuation (or none), and returning through the frame gives it a second one.
+/// 2. **Abandoning a committed dispatch.** The queue-advance publisher DEQUEUES the incoming
+///    task and installs it as this CPU's `current` before it publishes. Silently dropping the
+///    plan there leaves a runnable task sitting behind a `current` slot that nothing will ever
+///    resume, and this CPU returns into a frame belonging to a task the scheduler no longer has
+///    as current.
+///
+/// So the settlement is derived from two live observations — the scheduler's actual `current`
+/// for this CPU, and `entering_frame_authority_split_read` against the OUTGOING identity the
+/// plan was built from — and it admits the discard in exactly one state: the incoming task was
+/// never committed here, and the outgoing task is still this CPU's `current`, queued nowhere and
+/// resumable. That is the advisory-publication case (the D6 proof / D6-SWITCH-A hook), and there
+/// the discard really does leave the trap returning through a frame its owner still holds.
+///
+/// Every other state fails CLOSED. There is no third option available at this point: the plan
+/// cannot be applied (its pointers do not authenticate — that is why we are here), the trap
+/// cannot return through a frame the scheduler has disowned, and re-entering the dispatcher to
+/// "pick something else" would re-derive against whoever is current now while this CPU still
+/// holds a committed placement it did not make.
+fn settle_refused_switch_plan(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    plan: &crate::kernel::boot::DispatchSwitchPlan,
+) -> Result<(), TrapHandleError> {
+    use crate::kernel::task_transition::EnteringFrameAuthority as A;
+
+    // `Asid(0)` is the established stand-in for a task with no address space — the same
+    // `unwrap_or` the exact-incarnation reader itself applies.
+    let outgoing_asid = plan
+        .outgoing_identity
+        .asid
+        .unwrap_or(crate::kernel::vm::Asid(0));
+    let current = shared.current_tid_split_read(cpu);
+    let incoming_committed = current == Some(plan.incoming_tid);
+    let authority =
+        shared.entering_frame_authority_split_read(cpu, plan.outgoing_tid, outgoing_asid);
+    let discardable = !incoming_committed && matches!(authority, A::OwnsEnteringFrame);
+    // U9-D6-FINAL (C2) — STALE-PLAN REJECTION and the one-shot latch.
+    //
+    // A publication that reached the stash set `PENDING_DONE`; the drain converts that into
+    // `D6_CONTROLLED_SWITCH_PROOF_DONE` when it applies a plan. This plan is not going to be
+    // applied, so leaving `PENDING_DONE` set would hand the NEXT applied plan — possibly an
+    // ordinary queue advance that has nothing to do with the proof — a completion the proof
+    // never earned. Taking it here clears it and reports whether it was set, and the start latch
+    // goes back for the same reason it does on a refused publication: the attempt did not
+    // happen, so the promised retry must still be possible.
+    let pending_done_cleared = crate::kernel::boot::d6_controlled_switch_proof_take_pending_done();
+    if pending_done_cleared {
+        crate::kernel::boot::d6_controlled_switch_proof_release_start("stale_plan_rejected");
+    }
+    crate::yarm_log!(
+        "D6_SWITCH_PLAN_REFUSED_LATCH cpu={} pending_done_cleared={} proof_done={}",
+        cpu.0,
+        u8::from(pending_done_cleared),
+        u8::from(crate::kernel::boot::d6_controlled_switch_proof_done())
+    );
+    crate::yarm_log!(
+        "D6_SWITCH_PLAN_REFUSED cpu={} outgoing={} incoming={} reason=incarnation_moved \
+         current={} incoming_committed={} authority={} settlement={}",
+        cpu.0,
+        plan.outgoing_tid,
+        plan.incoming_tid,
+        current.unwrap_or(u64::MAX),
+        u8::from(incoming_committed),
+        authority.marker(),
+        if discardable {
+            "discard_return_through_entering_frame"
+        } else {
+            "kernel_fatal"
+        }
+    );
+    if discardable {
+        return Ok(());
+    }
+    Err(TrapHandleError::Syscall(
+        crate::kernel::syscall::SyscallError::from(crate::kernel::boot::KernelError::TaskMissing),
+    ))
+}
+
 fn drain_switch_plan_stash(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
@@ -357,23 +444,22 @@ fn drain_switch_plan_stash(
         // pointer names a different incarnation's `ArchSwitchContext` and `switch_frames` would
         // save the outgoing context into a stranger.
         //
-        // Refusing here is coherent by construction. Publishing a plan changes no scheduler
-        // state — no `current`, no queue, no status — so an unapplied plan leaves the
-        // interrupted task exactly as it was, still current and still owning the frame this
-        // trap returns through.
-        let plan = plan.filter(|plan| {
-            if shared.d6_switch_plan_incarnations_valid_split(plan.outgoing_tid, plan.incoming_tid)
-            {
-                return true;
+        // Refusing is NOT coherent by construction, and an earlier revision of this comment
+        // claimed it was: "publishing a plan changes no scheduler state, so an unapplied plan
+        // leaves the interrupted task exactly as it was". That argument is about the PUBLISHER.
+        // It says nothing about the intervening handler, which is the very actor whose writes
+        // invalidated the plan, and it is false outright for the queue-advance publisher, which
+        // dequeues the incoming task INTO this CPU's `current` slot before it stashes
+        // (`exec_state.rs` steps (1) and (5)). Whether discarding is safe is a question about
+        // the state the scheduler is in NOW, so `settle_refused_switch_plan` asks that state.
+        let plan = match plan {
+            Some(plan) if shared.d6_switch_plan_incarnations_valid_split(&plan) => Some(plan),
+            Some(plan) => {
+                settle_refused_switch_plan(shared, cpu, &plan)?;
+                None
             }
-            crate::yarm_log!(
-                "D6_SWITCH_PLAN_REFUSED cpu={} outgoing={} incoming={} reason=incarnation_moved",
-                cpu.0,
-                plan.outgoing_tid,
-                plan.incoming_tid
-            );
-            false
-        });
+            None => None,
+        };
         if let Some(plan) = plan {
             // Stage 166 (D6-SWITCH-A): tag this as a real production unlocked
             // switch when driven by `yarm.d6_switch_a=1` (proof knob off).
@@ -1705,11 +1791,25 @@ pub fn handle_trap_entry_shared(
 
     // Stage 169 (D2-GENUINE-SEND): drain the deferred blocking-SEND queue-
     // advancing dispatch OUTSIDE the global lock (mirrors the recv drain below).
+    // U9-D6-FINAL (C1, gate 1 of 5) — THE D6-KNOB TERMS ARE REMOVED HERE.
+    //
+    // Derivation, from the reserve sites of THIS cell rather than from the other four:
+    // `d2_send_dispatch` is reserved at `ipc_state.rs:5134` (inside a D6-knob-gated arm) AND at
+    // `runtime.rs:10975`, the split blocking-send commit, which is NOT knob-gated. With either
+    // diagnostic knob on, the second site still arms the cell and this drain then refused to
+    // settle it, so the reservation stayed latched across traps and every later
+    // `d2_send_dispatch_try_defer` on this CPU failed closed.
+    //
+    // A gate that suppresses an OWED drain is not a coordination gate — it is a leak. The cell
+    // is armed only by a route that has already committed a block and is relying on this drain
+    // to perform the one authoritative queue-advancing dispatch; there is no state in which
+    // skipping it is correct. Mutual exclusion against the D6 switch mechanisms is NOT what
+    // this term bought and is not lost by removing it: exclusion is now established at
+    // reservation time, in `d2_send_dispatch_try_defer` (stash occupied ⇒ refuse) and in
+    // `d6_publish_switch_plan_split` (cell armed ⇒ `StashOccupied`), so the two mechanisms can
+    // never both hold this CPU's switch in the same trap.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
-        && !crate::kernel::boot::d6_switch_a_enabled()
-        && d2_send_was_deferred
-    {
+    if d2_send_was_deferred {
         crate::yarm_log!("D2_SEND_GENUINE_GLOBAL_DROPPED cpu={}", cpu.0);
         let outgoing = crate::kernel::boot::d2_send_dispatch_outgoing(cpu_idx);
         // Re-verify the deferred sender is still Blocked(EndpointSend).
@@ -1812,11 +1912,22 @@ pub fn handle_trap_entry_shared(
             crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
         }
     }
+    // U9-D6-FINAL (C1, gate 2 of 5) — THE D6-KNOB TERMS ARE REMOVED HERE.
+    //
+    // This is the gate that was PROVEN live, and it is the reason the diagnostic profiles never
+    // reached a switch at all. `d2_recv_dispatch` has two reserve sites: `ipc_state.rs:4770`,
+    // knob-gated, and `syscall_split.rs:3873` — step (7) of the split receive route, which
+    // reserves unconditionally, before any publication, because holding the reservation is what
+    // guarantees the drain applies an incoming context.
+    //
+    // With `D6_SWITCH_PROOF=1` the observed live sequence was: tid 3 issues NR 2, step (7)
+    // arms the cell, this drain declines, the cell stays armed, and the NEXT NR 2 hits
+    // `IPC_RECV_BLOCK_SPLIT_REFUSED reason=already_deferred` → `IPC_RECV_SPLIT_INVARIANT
+    // result=failed_closed` → `handled_err code=255` → userspace retries → forever. The
+    // diagnostic knob turned a supported blocking receive into an invariant error, which is
+    // exactly what §3 of the directive forbids.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
-        && !crate::kernel::boot::d6_switch_a_enabled()
-        && d2_recv_was_deferred
-    {
+    if d2_recv_was_deferred {
         // Stage 168B (D2-GENUINE-RECV completion): drain the deferred
         // blocking-recv queue-advancing dispatch OUTSIDE the global lock. The
         // in-lock `block_current_on_receive_with_deadline` published the waiter
@@ -2156,11 +2267,18 @@ pub fn handle_trap_entry_shared(
     // authoritative dispatch under only the rank-1 scheduler seam, mark the incoming task
     // Running (rank-2), then a brief `with_cpu` re-acquire performs ONLY the arch restore
     // (incoming ASID/CR3 switch + trap-frame restore) via the hardened D6-SWITCH-A path.
+    // U9-D6-FINAL (C1, gate 3 of 5) — THE D6-KNOB TERMS ARE REMOVED HERE.
+    //
+    // The `futex_wait_dispatch` cell is the most widely shared of the four: `exec_state.rs`
+    // arms it at three sites under `d6_genuine_enabled()`, but `syscall_split.rs:752` (the
+    // terminal-fault route), `syscall_split.rs:5028` (the split FutexWait route) and
+    // `exit_txn.rs:800` (`reserve_queue_advance`, the exit transaction's own reservation hook)
+    // all arm it with no reference to any D6 knob. The exit site is the sharpest: a task
+    // reserving the queue advance as part of its own teardown cannot clear the cell itself —
+    // `release_queue_advance` runs only on an unwind — so a suppressed drain strands the
+    // reservation on a CPU whose owner no longer exists.
     #[cfg(target_arch = "x86_64")]
-    if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
-        && !crate::kernel::boot::d6_switch_a_enabled()
-        && futex_wait_was_deferred
-    {
+    if futex_wait_was_deferred {
         crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_BEGIN cpu={}", cpu.0);
         let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
         let reverify_ok = outgoing
@@ -2609,11 +2727,17 @@ pub fn handle_trap_entry_shared(
     // cleared, run the authoritative dispatch under only the rank-1 scheduler seam, mark the
     // incoming task Running (rank-2), then a brief `with_cpu` re-acquire performs ONLY the
     // arch restore (incoming ASID/CR3 switch + trap-frame restore) via the D6-SWITCH-A path.
+    // U9-D6-FINAL (C1, gate 4 of 5) — THE D6-KNOB TERMS ARE REMOVED HERE.
+    //
+    // This asymmetry is one THIS directive introduced and must therefore repair. Until §3 the
+    // Yield cell was reserved only behind `yield_deferral_arch_gate`, whose x86_64 arm itself
+    // excluded both D6 knobs, so gate and reserve agreed and no reservation could outlive a
+    // suppressed drain. §3 removed that arm — it was one of the "D6-caused Yield escapes" the
+    // directive orders closed — which left `yield_txn.rs:339`/`:408` arming the cell under the
+    // knobs while this drain still refused it. Removing the terms here restores the agreement
+    // in the direction the directive requires: the escape stays closed AND the drain is owed.
     #[cfg(target_arch = "x86_64")]
-    if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
-        && !crate::kernel::boot::d6_switch_a_enabled()
-        && yield_was_deferred
-    {
+    if yield_was_deferred {
         crate::yarm_log!("YIELD_DISPATCH_DEFER_BEGIN cpu={} drain=1", cpu.0);
         let reverify_ok = shared.yield_reverify_ready(cpu);
         if reverify_ok {
@@ -2700,6 +2824,26 @@ pub fn handle_trap_entry_shared(
         }
     }
 
+    // U9-D6-FINAL (C1, gate 5 of 5) — THE D6-KNOB TERMS ARE KEPT HERE, deliberately.
+    //
+    // The four gates above each guarded a DRAIN: a reservation had already been taken by some
+    // route that is now waiting for this section to settle it, so suppressing the drain leaked
+    // the reservation. Nothing about this block matches that shape. `d6_genuine_mode` does not
+    // settle a debt — `d6_genuine_enabled()` is itself a diagnostic knob, the cell it reads is
+    // armed only by the in-lock `dispatch_next_task` decline on a QUEUE-NEUTRAL cycle, and if
+    // this block does not run, nothing is owed to anybody: the interrupted task simply keeps
+    // running and the cell is re-evaluated next trap.
+    //
+    // What the two D6-knob terms actually buy here is MUTUAL EXCLUSION between three separate
+    // switch mechanisms that would otherwise all try to own this CPU's switch in one trap:
+    // D6-GENUINE's observation dispatch, the controlled-switch proof, and D6-SWITCH-A. That is
+    // the "gate coordinating mutually exclusive switch mechanisms" the directive distinguishes,
+    // and removing it would give one trap two selectors. The four `!*_was_deferred` terms are
+    // the same kind of exclusion against the four drains above, for the same reason.
+    //
+    // The knobs are documented as mutually exclusive with a fixed precedence (PROOF beats
+    // SWITCH_A beats GENUINE), so this gate expresses a precedence that already exists rather
+    // than inventing one.
     #[cfg(target_arch = "x86_64")]
     {
         let d6_genuine_mode = crate::kernel::boot::d6_genuine_enabled()

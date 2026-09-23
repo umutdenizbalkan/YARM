@@ -395,6 +395,22 @@ pub(crate) fn build_dispatch_switch_plan_locked(
         &mut incoming_tcb.kernel_context.frame;
     let outgoing_stack_top = outgoing_tcb.kernel_context.stack_top.map(|t| t.0);
 
+    // U9-D6-FINAL §1 — the authentication facts, read HERE, under the same acquisition that
+    // derived the pointers. Reading them later would authenticate the plan against a world it
+    // did not come from.
+    let outgoing_identity = crate::kernel::boot::SwitchPlanIdentity {
+        slot: outgoing_idx,
+        tid: outgoing_tid,
+        asid: outgoing_tcb.asid,
+        switch_generation: outgoing_tcb.kernel_context.switch_generation,
+    };
+    let incoming_identity = crate::kernel::boot::SwitchPlanIdentity {
+        slot: incoming_idx,
+        tid: incoming_tid,
+        asid: incoming_tcb.asid,
+        switch_generation: incoming_tcb.kernel_context.switch_generation,
+    };
+
     Ok(Some(DispatchSwitchPlan {
         outgoing_tid,
         incoming_tid,
@@ -402,6 +418,8 @@ pub(crate) fn build_dispatch_switch_plan_locked(
         incoming_frame_ptr,
         incoming_stack_top,
         outgoing_stack_top,
+        outgoing_identity,
+        incoming_identity,
     }))
 }
 
@@ -877,6 +895,10 @@ impl KernelState {
                     outgoing_tid,
                     err
                 );
+                // U9-D6-FINAL (C2): a preparation failure must not consume the one-shot start.
+                crate::kernel::boot::d6_controlled_switch_proof_release_start(
+                    "full_stack_map_failed_outgoing",
+                );
                 return Ok(());
             }
             if let Err(err) =
@@ -886,6 +908,10 @@ impl KernelState {
                     "D6_PROOF_FULL_STACK_MAP_FAILED tid={} err={:?}",
                     incoming_tid,
                     err
+                );
+                // U9-D6-FINAL (C2): as above — the incoming side's preparation failed.
+                crate::kernel::boot::d6_controlled_switch_proof_release_start(
+                    "full_stack_map_failed_incoming",
                 );
                 return Ok(());
             }
@@ -908,6 +934,10 @@ impl KernelState {
                         "D6_PROOF_LIVE_RSP_STACK_MAP_FAILED rsp=0x{:x} err={:?}",
                         sampled_rsp,
                         err
+                    );
+                    // U9-D6-FINAL (C2): as above — the live kernel stack could not be backed.
+                    crate::kernel::boot::d6_controlled_switch_proof_release_start(
+                        "live_rsp_map_failed",
                     );
                     return Ok(());
                 }
@@ -941,10 +971,16 @@ impl KernelState {
                     crate::kernel::boot::d6_controlled_switch_proof_mark_pending_done();
                 }
                 crate::runtime::D6SwitchPublication::Refused(refusal) => {
-                    // Nothing was mutated. The proof's one-shot latch is NOT marked done, so a
-                    // later trap may try again — and `PENDING_DONE` stays clear, so the drain
-                    // will not claim a completion that never happened.
+                    // Nothing was mutated, and `PENDING_DONE` stays clear, so the drain will not
+                    // claim a completion that never happened.
+                    //
+                    // U9-D6-FINAL (C2): the retry this comment promises is only real because the
+                    // start latch is handed back here. `try_start` won above; without the release
+                    // a refusal — including the ordinary `DeferralReserved`/`StashOccupied`
+                    // contention that simply means "another mechanism owns THIS trap" — would
+                    // have spent the proof's single attempt on a trap in which it never ran.
                     crate::yarm_log!("D6_GLOBAL_LOCK_DROP_DEFERRED reason={}", refusal.marker());
+                    crate::kernel::boot::d6_controlled_switch_proof_release_start(refusal.marker());
                     if switch_a_mode {
                         crate::yarm_log!("D6_SWITCH_A_FALLBACK reason={}", refusal.marker());
                     }

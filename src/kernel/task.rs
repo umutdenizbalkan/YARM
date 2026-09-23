@@ -318,6 +318,32 @@ pub struct KernelExecutionContext {
     pub frame: ArchSwitchContext,
     pub initialized: bool,
     pub owns_stack: bool,
+    /// U9-D6-FINAL §1 — **the authority that makes a saved `&mut frame` pointer authenticable.**
+    ///
+    /// A `DispatchSwitchPlan` stores a raw pointer into `frame`, derived under rank 2 and
+    /// dereferenced later with the lock released. That the TCB array is fixed-size proves the
+    /// ADDRESS survives; it proves nothing about who occupies the slot. `{slot, tid, asid}` is
+    /// not enough either, because a slot can be reused by a replacement that reproduces all
+    /// three.
+    ///
+    /// This field is STAMPED from `KernelState::spawn_reservation_generation` every time
+    /// `initialize_thread_kernel_switch_frame` publishes a context — which is exactly the
+    /// operation any replacement must perform before the builder will take a pointer from it,
+    /// since the builder requires `initialized`. So a plan that records the stamp it read can
+    /// tell "the same context I pointed at" from "a context that was re-published in the same
+    /// storage", which is the one distinction the raw pointer cannot make for itself.
+    ///
+    /// **It is deliberately not a per-context counter.** A counter living in this struct is
+    /// destroyed with the TCB and starts again at zero in the replacement, so a reap-and-respawn
+    /// into the same slot reproduces the same stamp along with the same `{slot, tid, asid}` and
+    /// the same frame address. `spawn_reservation_generation` is the tree's existing authority
+    /// for exactly this hazard — its rule is that no two reservations ever receive the same
+    /// value — so a stamp taken from it is unique for the life of the boot no matter what is
+    /// recycled. Stamps are taken with the counter's own protocol (`issued = *g; *g += 1`), so
+    /// the first one issued is `0`, which is also the unstamped default. That collision is inert:
+    /// `initialized` is checked alongside the stamp, an unstamped context is never `initialized`,
+    /// and the builder refuses to take a pointer from one.
+    pub switch_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

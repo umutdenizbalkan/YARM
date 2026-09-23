@@ -1205,6 +1205,12 @@ pub(crate) enum D6PublishRefusal {
     /// **A plan is already pending for this trap.** The other publisher owns the switch; this
     /// one mutates nothing and must not overwrite it.
     StashOccupied,
+    /// **A queue-advancing deferral is already reserved for this trap.** The reserving route
+    /// will dispatch and apply an incoming task through its own drain, so this trap's switch is
+    /// already owned even though the stash slot is still empty. Distinct from `StashOccupied`
+    /// because the incumbent is a different mechanism at a different stage, and a refusal that
+    /// cannot say which one occurred is not diagnosable.
+    DeferralReserved,
     /// The incoming task vanished, or a kernel context is uninitialized.
     IncomingUnavailable,
     /// The outgoing task has no TCB.
@@ -1219,6 +1225,7 @@ impl D6PublishRefusal {
             Self::NoTrapDrainer => "no_trap_drainer",
             Self::MultiCpu => "multi_cpu",
             Self::StashOccupied => "stash_occupied",
+            Self::DeferralReserved => "deferral_reserved",
             Self::IncomingUnavailable => "incoming_unavailable",
             Self::OutgoingUnavailable => "outgoing_unavailable",
         }
@@ -12146,9 +12153,30 @@ impl SharedKernel {
             return D6SwitchPublication::Refused(R::MultiCpu);
         }
         // ── RESERVATION. Nothing below this point may be reached with a plan already pending.
-        // SAFETY: single CPU, interrupts disabled by hardware trap entry, no concurrent accessor.
-        if unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() } {
+        if crate::kernel::boot::switch_plan_stash_is_reserved(cpu_idx) {
             return D6SwitchPublication::Refused(R::StashOccupied);
+        }
+        // U9-D6-FINAL (C2, order A) — the OTHER direction of the same exclusion.
+        //
+        // An empty stash slot is not whole-trap ownership. A queue-advancing deferral reserved
+        // earlier in this same trap is an outstanding claim on this CPU's switch: its drain will
+        // dispatch an incoming task and apply it, so publishing a diagnostic plan alongside it
+        // would give one trap two selectors and two applies. The stash slot is empty at this
+        // moment only because that mechanism has not reached its publication yet.
+        //
+        // Order B — a plan published first, a deferral reserved second — is refused by the four
+        // `*_try_defer` primitives themselves. The two halves together are what make occupancy a
+        // reservation; see `boot::switch_plan_stash_is_reserved` for the serialization argument.
+        if let Some(cell) = crate::kernel::boot::queue_advance_deferral_reserved_by(cpu_idx) {
+            crate::yarm_log!(
+                "D6_SWITCH_PUBLISH_REFUSED cpu={} outgoing={} incoming={} \
+                 reason=deferral_reserved cell={}",
+                cpu.0,
+                outgoing_tid,
+                incoming_tid,
+                cell
+            );
+            return D6SwitchPublication::Refused(R::DeferralReserved);
         }
         // rank 2, ONE acquisition, through the SAME builder the broad path uses.
         let built = self.with_task_tcbs_split_mut(|tcbs| {
@@ -12171,26 +12199,62 @@ impl SharedKernel {
         }
     }
 
-    /// U9-D6-FINAL §2 — do the plan's two raw frame pointers still name the incarnations the
-    /// plan was built from?
+    /// U9-D6-FINAL §1 — **authenticate the plan against its actual storage and incarnation.**
     ///
-    /// Rank 2, one acquisition, no reference escaping it. Checks that each TID is still present
-    /// and still has an initialized kernel context — the exact two facts
-    /// `build_dispatch_switch_plan_locked` established when it took the pointers. Fixed storage
-    /// alone proves neither: a task can be reaped and its slot reused by the broad handler that
-    /// runs between publication and the drain.
+    /// The predecessor asked only "does each numeric TID still exist with an initialized kernel
+    /// context?". That is not an authentication of anything: a TID recreated in a different slot
+    /// satisfies it while the stored pointer names the old slot, and a replacement occupying the
+    /// ORIGINAL slot satisfies it while the pointer names storage that is now somebody else's.
+    /// Both would pass and then be dereferenced.
+    ///
+    /// What is checked now, per side, in one rank-2 acquisition:
+    ///
+    /// 1. **the slot**, not a search by TID — the pointer came from a fixed array position, so
+    ///    that position is what has to be looked at;
+    /// 2. **`{tid, asid}`**, the incarnation coordinate the rest of the tree uses;
+    /// 3. **`kernel_context.switch_generation`**, which separates a reused slot's replacement
+    ///    from the incarnation the pointer was taken from. `{slot, tid, asid}` can repeat — a
+    ///    reaped task's TID and ASID are both recyclable — and the generation is bumped by
+    ///    `initialize_thread_kernel_switch_frame`, the one operation any replacement must
+    ///    perform before the builder would take a pointer from it;
+    /// 4. **`initialized`**, the builder's own precondition; and
+    /// 5. **the pointer itself**, re-derived from that slot and compared. This is what ties the
+    ///    saved address to the storage the four facts above describe, rather than to an address
+    ///    that merely still lies inside the array.
+    ///
+    /// **From validation through dereference** there is no window: this runs on the trapping CPU
+    /// with interrupts disabled by hardware trap entry, traps do not nest on any supported port,
+    /// and the only code between here and `switch_frames` is the drain's own marker emission and
+    /// the first-resume stash — none of which touches the TCB array. That is the lifetime
+    /// argument; "the array is fixed-size" is not, and never was.
     pub(crate) fn d6_switch_plan_incarnations_valid_split(
         &self,
-        outgoing_tid: u64,
-        incoming_tid: u64,
+        plan: &crate::kernel::boot::DispatchSwitchPlan,
     ) -> bool {
+        let sides = [
+            (plan.outgoing_identity, plan.outgoing_frame_ptr),
+            (plan.incoming_identity, plan.incoming_frame_ptr),
+        ];
         self.with_task_tcbs_split_mut(|tcbs| {
-            let initialized = |tid: u64| {
-                tcbs.iter()
-                    .flatten()
-                    .any(|tcb| tcb.tid.0 == tid && tcb.kernel_context.initialized)
-            };
-            initialized(outgoing_tid) && initialized(incoming_tid)
+            sides.iter().all(|(identity, saved_ptr)| {
+                let Some(slot) = tcbs.get_mut(identity.slot) else {
+                    return false;
+                };
+                let Some(tcb) = slot.as_mut() else {
+                    return false;
+                };
+                if tcb.tid.0 != identity.tid || tcb.asid != identity.asid {
+                    return false;
+                }
+                if !tcb.kernel_context.initialized
+                    || tcb.kernel_context.switch_generation != identity.switch_generation
+                {
+                    return false;
+                }
+                let live_ptr: *mut crate::kernel::task::ArchSwitchContext =
+                    &mut tcb.kernel_context.frame;
+                core::ptr::eq(live_ptr, *saved_ptr)
+            })
         })
     }
 

@@ -2207,7 +2207,12 @@ impl KernelState {
             Ok((stack_base, stack_top))
         })?;
         self.ensure_kernel_switch_stack_mapped(tid, stack_base, stack_top)?;
-        self.with_tcbs_mut(|tcbs| {
+        // U9-D6-FINAL §1 — the same rank-2 acquisition, widened to carry the SPAWN-RESERVATION
+        // GENERATION alongside the TCB array. See the stamp below for why this counter and not
+        // a per-context one.
+        self.with_task_spawn_generation_mut(|tcbs, spawn_generation| {
+            let issued = *spawn_generation;
+            *spawn_generation = spawn_generation.saturating_add(1);
             let tcb = tcbs
                 .iter_mut()
                 .flatten()
@@ -2239,6 +2244,29 @@ impl KernelState {
             crate::arch::selected_isa::context_switch::initialize_frame_fpu_state(
                 &mut tcb.kernel_context.frame,
             );
+            // U9-D6-FINAL §1 — publishing a kernel context STAMPS it from the spawn-reservation
+            // generation. This is the one operation a replacement occupying a reused slot must
+            // perform before `build_dispatch_switch_plan_locked` will take a pointer from it, so
+            // a plan that recorded the stamp it read can tell its own context from a later one in
+            // the same storage.
+            //
+            // A PER-CONTEXT counter would not do this, and an earlier revision used one. A fresh
+            // `ThreadControlBlock` dropped into a reaped slot starts at zero and is stamped 1 by
+            // its own initialization — exactly what the original occupant carried. `{slot, tid,
+            // asid}` all repeat across a reap-and-respawn (the numeric TID and the ASID are both
+            // recyclable) and the re-derived frame pointer is the same array offset, so with a
+            // per-context counter EVERY field of the identity could repeat and a stale plan would
+            // authenticate against a stranger.
+            //
+            // `spawn_reservation_generation` is the tree's existing authority for precisely this
+            // question: its documented rule is that no two reservations ever receive the same
+            // value, which is "what makes a token for an earlier occupant of a numeric TID unable
+            // to match a later one". Consuming a value here does not disturb spawn: the counter's
+            // contract is uniqueness, not density, and no reader interprets the gaps.
+            //
+            // Stamped BEFORE `initialized` is published, so no reader can ever observe an
+            // initialized context carrying the previous stamp.
+            tcb.kernel_context.switch_generation = issued;
             tcb.kernel_context.initialized = true;
             Ok(())
         })

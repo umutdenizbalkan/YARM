@@ -64742,15 +64742,15 @@ mod stage192b_yield_queue_advancing_dispatch {
         // are now owned by `run_yield_transaction` — ONE policy driven by both the broad adapter
         // (`yield_current`, through `BroadYieldOwners`) and the split NR 0 route. This guard
         // follows them to their owner rather than asserting they are still inlined here.
-        const YIELD_TXN_SRC: &str = include_str!("../syscall/yield_txn.rs");
+        const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
         assert!(
-            YIELD_TXN_SRC.contains("owners.reenqueue_and_clear_current(cpu)")
-                && YIELD_TXN_SRC.contains("owners.reserve_yield_deferral(cpu, outgoing)"),
+            YIELD_TXN.contains("owners.reenqueue_and_clear_current(cpu)")
+                && YIELD_TXN.contains("owners.reserve_yield_deferral(cpu, outgoing)"),
             "the yield transaction must re-enqueue + reserve the deferral"
         );
         assert!(
-            YIELD_TXN_SRC.contains("fn reenqueue_and_clear_current(&mut self, _cpu: CpuId) -> Option<u64> {\n        self.kernel.preempt_reenqueue_current_cpu()")
-                && YIELD_TXN_SRC.contains("crate::kernel::boot::yield_dispatch_try_defer(cpu.0 as usize, outgoing)"),
+            YIELD_TXN.contains("fn reenqueue_and_clear_current(&mut self, _cpu: CpuId) -> Option<u64> {\n        self.kernel.preempt_reenqueue_current_cpu()")
+                && YIELD_TXN.contains("crate::kernel::boot::yield_dispatch_try_defer(cpu.0 as usize, outgoing)"),
             "and the BROAD adapter must reach the same two owners `yield_current` always used"
         );
         assert!(
@@ -64760,7 +64760,7 @@ mod stage192b_yield_queue_advancing_dispatch {
             "yield_current must drive that transaction"
         );
         assert!(
-            YIELD_TXN_SRC.contains("YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}")
+            YIELD_TXN.contains("YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}")
                 && EXEC_SRC.contains("let selection = self.on_preempt_current_cpu_selection();"),
             "the in-lock on_preempt fallback must be preserved, and its decline must still name \
              itself in the x86_64 vocabulary"
@@ -78191,8 +78191,8 @@ mod stage196g_riscv_yield_default_on {
         // three "pending" checks are now `colliding_deferral_pending_for`, whose RISC-V arm names
         // exactly the same three cells for exactly the same reason (one drain tail serves all
         // three).
-        const YIELD_TXN_SRC: &str = include_str!("../syscall/yield_txn.rs");
-        let block = YIELD_TXN_SRC
+        const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+        let block = YIELD_TXN
             .split("fn colliding_deferral_pending_for(cpu_idx: usize) -> bool {")
             .nth(1)
             .expect("the colliding-deferral owner")
@@ -78205,7 +78205,7 @@ mod stage196g_riscv_yield_default_on {
                 && block.contains(
                     "crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx)"
                 )
-                && YIELD_TXN_SRC.contains(
+                && YIELD_TXN.contains(
                     "crate::kernel::boot::yield_dispatch_try_defer(cpu.0 as usize, outgoing)"
                 ),
             "the Yield publish must be structurally gated (no oracle) + exclude conflicting deferrals"
@@ -78223,8 +78223,7 @@ mod stage196g_riscv_yield_default_on {
             "the DEFAULT_ON marker must be a one-shot latch"
         );
         assert!(
-            YIELD_TXN_SRC
-                .contains("crate::kernel::boot::maybe_log_riscv_yield_retire_default_on();"),
+            YIELD_TXN.contains("crate::kernel::boot::maybe_log_riscv_yield_retire_default_on();"),
             "the Yield publish must log the DEFAULT_ON marker"
         );
     }
@@ -78253,15 +78252,15 @@ mod stage196g_riscv_yield_default_on {
         // U9-RESIDUAL1 §3: same seam, same markers, now owned by the one yield policy. The
         // 196D foundation block still uses the in-lock `match self.preempt_reenqueue_current_cpu()`
         // shape directly, which is why that string is still expected in exec_state.
-        const YIELD_TXN_SRC2: &str = include_str!("../syscall/yield_txn.rs");
+        const YIELD_TXN2: &str = include_str!("../syscall/yield_txn.rs");
         assert!(
             EXEC_STATE_SRC.contains("match self.preempt_reenqueue_current_cpu() {"),
             "the 196D foundation publish must keep the accepted preempt seam"
         );
         assert!(
-            YIELD_TXN_SRC2.contains("self.kernel.preempt_reenqueue_current_cpu()")
-                && YIELD_TXN_SRC2.contains("RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu={} outgoing={}")
-                && YIELD_TXN_SRC2.contains("RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu={} outgoing={}"),
+            YIELD_TXN2.contains("self.kernel.preempt_reenqueue_current_cpu()")
+                && YIELD_TXN2.contains("RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu={} outgoing={}")
+                && YIELD_TXN2.contains("RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu={} outgoing={}"),
             "the yield policy must re-enqueue via the accepted preempt seam and keep the RISC-V \
              vocabulary"
         );
@@ -78270,10 +78269,10 @@ mod stage196g_riscv_yield_default_on {
         // scheduler primitive restores `current` itself, and the policy undoes the rank-2 write
         // through the named inverse before releasing the reservation.
         assert!(
-            YIELD_TXN_SRC2.contains("YieldDecline::ReenqueueRefused => \"reenqueue_failed\",")
-                && YIELD_TXN_SRC2.contains("RISCV_YIELD_DISPATCH_FALLBACK reason={} tid={}")
-                && YIELD_TXN_SRC2.contains("owners.rollback_preempt_outgoing(outgoing, applied)")
-                && YIELD_TXN_SRC2.contains("owners.release_yield_deferral(cpu);"),
+            YIELD_TXN2.contains("YieldDecline::ReenqueueRefused => \"reenqueue_failed\",")
+                && YIELD_TXN2.contains("RISCV_YIELD_DISPATCH_FALLBACK reason={} tid={}")
+                && YIELD_TXN2.contains("owners.rollback_preempt_outgoing(outgoing, applied)")
+                && YIELD_TXN2.contains("owners.release_yield_deferral(cpu);"),
             "a re-enqueue failure must roll back exactly, release the deferral and name itself"
         );
         assert!(
@@ -78614,9 +78613,9 @@ mod stage197_first_cohort_seal {
                 .contains("TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"),
             "FutexWait must publish Blocked(Futex)"
         );
-        const YIELD_TXN_SRC: &str = include_str!("../syscall/yield_txn.rs");
+        const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
         assert!(
-            YIELD_TXN_SRC.contains("self.kernel.preempt_reenqueue_current_cpu()"),
+            YIELD_TXN.contains("self.kernel.preempt_reenqueue_current_cpu()"),
             "Yield must re-enqueue Runnable via the preempt seam"
         );
     }
@@ -170533,27 +170532,56 @@ mod u9yield2_family_edge {
         }
     }
 
-    /// **`ArchGateOff` on x86_64 is the drain's own availability.** The Yield deferral gate and
-    /// the Yield DRAIN are switched by exactly the same two predicates, so under either D6-switch
-    /// diagnostic there is no consumer for a deferral — which is why refusing is correct there and
-    /// why removing that edge would mean giving a controlled switch proof a competing switch path.
+    /// **The Yield reserve and the Yield DRAIN must agree about when a deferral is admissible**,
+    /// because a reservation armed with no consumer latches the cell for the rest of the boot.
+    ///
+    /// U9-YIELD2 established this invariant and satisfied it one way: BOTH sides carried the two
+    /// D6-switch predicates, so under either diagnostic neither armed nor drained. U9-D6-FINAL
+    /// satisfies the SAME invariant the other way, and had to: §3 removed the x86_64 D6 arm from
+    /// `yield_deferral_arch_gate` — it was a boot-long proxy for a per-trap fact, and it was one
+    /// of the D6-caused Yield escapes the directive orders closed — which left the reserve side
+    /// ungated. Leaving the drain gated would then have been the asymmetry this test exists to
+    /// forbid, with the reservation surviving every trap of a diagnostic run.
+    ///
+    /// So the assertion is inverted, not dropped: NEITHER side may name a D6 knob, and the
+    /// per-trap ownership question both sides now ask is the switch-plan stash.
     #[test]
     fn the_x86_yield_gate_and_the_x86_yield_drain_share_one_pair_of_predicates() {
-        let gate = code(body_of(BOOT_MOD, "pub(crate) fn d6_genuine_enabled()", 220));
+        let gate = code(body_of(
+            YIELD_TXN,
+            "pub(crate) fn yield_deferral_arch_gate<O: YieldOwners>(",
+            1400,
+        ));
         assert!(
-            gate.contains("d6_controlled_switch_proof_enabled()")
-                && gate.contains("d6_switch_a_enabled()"),
-            "the gate must be exactly the two D6-switch predicates"
+            !gate.contains("d6_controlled_switch_proof_enabled()")
+                && !gate.contains("d6_switch_a_enabled()")
+                && !gate.contains("d6_genuine_enabled()"),
+            "no boot-long D6 knob may gate the reserve side"
+        );
+        assert!(
+            gate.contains("owners.colliding_deferral_pending(cpu)"),
+            "the per-trap ownership question replaces it"
         );
         let drain = code(body_of(
             TRAP_ENTRY,
             "Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): drain the deferred Yield",
-            1400,
+            3000,
         ));
         assert!(
-            drain.contains("!crate::kernel::boot::d6_controlled_switch_proof_enabled()")
-                && drain.contains("!crate::kernel::boot::d6_switch_a_enabled()"),
-            "and the drain must be gated on the same two, or the gate would not track its consumer"
+            !drain.contains("!crate::kernel::boot::d6_controlled_switch_proof_enabled()")
+                && !drain.contains("!crate::kernel::boot::d6_switch_a_enabled()"),
+            "and the drain must not be gated on them either, or the reserve side would arm a \
+             cell nothing will settle"
+        );
+        assert!(
+            drain.contains("if yield_was_deferred {"),
+            "the drain is owed whenever the cell is armed, full stop"
+        );
+        // The stash is what both sides consult instead: the reserve through
+        // `colliding_deferral_pending_for`, the publication through its own reservation.
+        assert!(
+            code(YIELD_TXN).contains("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan()"),
+            "the collision predicate must test the actual switch-plan reservation"
         );
     }
 
@@ -187894,31 +187922,223 @@ mod u9d6final_switch_publication {
         assert_eq!(stashed(CpuId(0)), None);
     }
 
-    /// **The incarnation check is the other half of the raw pointers.**
-    ///
-    /// Fixed storage proves the address; it does not prove the same task still occupies the slot
-    /// when the drain dereferences it, because the broad handler runs in between.
+    /// The plan the PRODUCTION builder produces, through the production acquisition. Every
+    /// authentication case below starts from one of these — never from a hand-assembled struct,
+    /// because a hand-assembled identity proves nothing about what the builder records.
+    fn plan_for(
+        kernel: &SharedKernel,
+        outgoing: u64,
+        incoming: u64,
+    ) -> crate::kernel::boot::DispatchSwitchPlan {
+        kernel
+            .with_task_tcbs_split_mut(|tcbs| {
+                crate::kernel::boot::build_dispatch_switch_plan_locked(tcbs, outgoing, incoming)
+            })
+            .expect("builder")
+            .expect("plan")
+    }
+
+    /// The PREDECESSOR check, reproduced exactly: "does each numeric TID still exist with an
+    /// initialized kernel context?". Kept here so every case below can assert that the old check
+    /// says yes where the new proof says no — a difference no amount of restating the new rule
+    /// would demonstrate.
+    fn old_check(kernel: &SharedKernel, plan: &crate::kernel::boot::DispatchSwitchPlan) -> bool {
+        kernel.with_task_tcbs_split_mut(|tcbs| {
+            [plan.outgoing_tid, plan.incoming_tid].iter().all(|tid| {
+                tcbs.iter()
+                    .flatten()
+                    .any(|t| t.tid.0 == *tid && t.kernel_context.initialized)
+            })
+        })
+    }
+
+    /// **The plan the builder just produced authenticates.** The baseline: without this, every
+    /// negative below would pass for the wrong reason.
     #[test]
-    fn the_incarnation_check_answers_what_fixed_storage_cannot() {
+    fn a_freshly_built_plan_authenticates_against_its_own_world() {
         let kernel = kernel_with_pair();
-        assert!(
-            kernel.d6_switch_plan_incarnations_valid_split(OUTGOING, INCOMING),
-            "both tasks present with initialized kernel contexts"
-        );
-        assert!(
-            !kernel.d6_switch_plan_incarnations_valid_split(OUTGOING, 999_999),
-            "a vanished incoming task must not be dereferenced"
-        );
-        // An incarnation whose kernel context is not initialized is exactly what the builder
-        // refused to take a pointer from in the first place.
-        let fresh = SharedKernel::new(Bootstrap::init().expect("init"));
-        fresh.with(|state| {
-            state.register_task(OUTGOING).expect("task");
-            state.register_task(INCOMING).expect("task");
+        let plan = plan_for(&kernel, OUTGOING, INCOMING);
+        assert!(kernel.d6_switch_plan_incarnations_valid_split(&plan));
+        assert!(old_check(&kernel, &plan), "and so does the old check");
+    }
+
+    /// **A vanished task.** Both checks agree here; it is the one case the predecessor did catch.
+    #[test]
+    fn a_vanished_incarnation_is_refused_by_both_checks() {
+        let kernel = kernel_with_pair();
+        let plan = plan_for(&kernel, OUTGOING, INCOMING);
+        kernel.with_task_tcbs_split_mut(|tcbs| {
+            let slot = plan.incoming_identity.slot;
+            tcbs[slot] = None;
         });
+        assert!(!kernel.d6_switch_plan_incarnations_valid_split(&plan));
+        assert!(!old_check(&kernel, &plan));
+    }
+
+    /// **SAME-SLOT REUSE — the case the predecessor could not see at all.**
+    ///
+    /// The slot is re-published in place: same index, same numeric TID, same ASID, and the frame
+    /// therefore at the same address. Every coordinate the plan recorded except the stamp is
+    /// reproduced, which is why `{slot, tid, asid}` is not an identity and why the stamp is taken
+    /// from the tree's uniqueness authority rather than from a counter inside the context.
+    ///
+    /// The old check passes. It would have handed `switch_frames` a pointer into a context that
+    /// was re-initialized underneath it — a live stack pointer and instruction pointer belonging
+    /// to a different continuation.
+    #[test]
+    fn a_reinitialized_context_in_the_same_slot_fails_the_new_proof_and_passes_the_old_one() {
+        let kernel = kernel_with_pair();
+        let plan = plan_for(&kernel, OUTGOING, INCOMING);
+        let (slot_before, tid_before, asid_before) = (
+            plan.outgoing_identity.slot,
+            plan.outgoing_identity.tid,
+            plan.outgoing_identity.asid,
+        );
+
+        // The one operation any replacement must perform before the builder would take a pointer
+        // from it — run again, in place, on the same slot.
+        kernel.with(|state| {
+            state
+                .initialize_thread_kernel_switch_frame(OUTGOING, 0x1234_5678)
+                .expect("re-init");
+        });
+
+        // Every coordinate but the stamp is unchanged, and the pointer still resolves.
+        let after = plan_for(&kernel, OUTGOING, INCOMING).outgoing_identity;
+        assert_eq!(after.slot, slot_before, "same slot");
+        assert_eq!(after.tid, tid_before, "same numeric TID");
+        assert_eq!(after.asid, asid_before, "same ASID");
+        assert_ne!(
+            after.switch_generation, plan.outgoing_identity.switch_generation,
+            "only the stamp separates them"
+        );
+
         assert!(
-            !fresh.d6_switch_plan_incarnations_valid_split(OUTGOING, INCOMING),
-            "an uninitialized kernel context is not a switchable incarnation"
+            !kernel.d6_switch_plan_incarnations_valid_split(&plan),
+            "the stale plan must not authenticate against the re-published context"
+        );
+        assert!(
+            old_check(&kernel, &plan),
+            "and the predecessor check passes — this is the case it could not see"
+        );
+    }
+
+    /// **MOVEMENT TO ANOTHER SLOT.** The incarnation is intact and initialized, but it no longer
+    /// lives where the pointer points. The old check searches BY TID and finds it; the new proof
+    /// looks at the recorded slot and finds it empty.
+    #[test]
+    fn an_incarnation_moved_to_another_slot_fails_the_new_proof_and_passes_the_old_one() {
+        let kernel = kernel_with_pair();
+        let plan = plan_for(&kernel, OUTGOING, INCOMING);
+        kernel.with_task_tcbs_split_mut(|tcbs| {
+            let from = plan.outgoing_identity.slot;
+            let to = tcbs
+                .iter()
+                .position(|slot| slot.is_none())
+                .expect("a free slot");
+            let tcb = tcbs[from].take().expect("occupied");
+            tcbs[to] = Some(tcb);
+        });
+        assert!(!kernel.d6_switch_plan_incarnations_valid_split(&plan));
+        assert!(
+            old_check(&kernel, &plan),
+            "the predecessor searched by TID, so movement was invisible to it"
+        );
+    }
+
+    /// **A DIFFERENT TASK OCCUPYING THE RECORDED SLOT.** The plan's slot now holds a stranger.
+    /// The old check still passes, because it never looked at the slot — both numeric TIDs are
+    /// still somewhere in the array with initialized contexts.
+    #[test]
+    fn a_stranger_in_the_recorded_slot_fails_the_new_proof_and_passes_the_old_one() {
+        let kernel = kernel_with_pair();
+        const THIRD: u64 = 7102;
+        kernel.with(|state| {
+            state.register_task(THIRD).expect("task");
+            state
+                .set_thread_kernel_stack(THIRD, 0x9002_0000usize, 0x9002_0000usize + 0x4000)
+                .expect("stack");
+            state
+                .initialize_thread_kernel_switch_frame(THIRD, 0x1234_5678)
+                .expect("frame");
+        });
+        let plan = plan_for(&kernel, OUTGOING, INCOMING);
+        kernel.with_task_tcbs_split_mut(|tcbs| {
+            let victim = plan.outgoing_identity.slot;
+            let stranger_slot = tcbs
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|t| t.tid.0 == THIRD))
+                .expect("third task");
+            let displaced = tcbs[victim].take().expect("occupied");
+            let stranger = tcbs[stranger_slot].take().expect("occupied");
+            tcbs[victim] = Some(stranger);
+            tcbs[stranger_slot] = Some(displaced);
+        });
+        assert!(!kernel.d6_switch_plan_incarnations_valid_split(&plan));
+        assert!(old_check(&kernel, &plan));
+    }
+
+    /// **An uninitialized context is not a switchable incarnation** — the builder's own
+    /// precondition, re-asserted at validation time because the drain runs much later.
+    #[test]
+    fn an_uninitialized_context_never_authenticates() {
+        let kernel = kernel_with_pair();
+        let plan = plan_for(&kernel, OUTGOING, INCOMING);
+        kernel.with_task_tcbs_split_mut(|tcbs| {
+            tcbs[plan.incoming_identity.slot]
+                .as_mut()
+                .expect("occupied")
+                .kernel_context
+                .initialized = false;
+        });
+        assert!(!kernel.d6_switch_plan_incarnations_valid_split(&plan));
+        assert!(!old_check(&kernel, &plan));
+    }
+
+    /// **The stamp is unique across a reap-and-respawn, not merely per context.**
+    ///
+    /// This is the property the whole authentication rests on, so it is asserted directly: tear
+    /// the slot down, build a replacement that reproduces `{slot, tid, asid}` exactly, and the
+    /// stamps must still differ. A counter living inside `KernelExecutionContext` would fail
+    /// this — it would be destroyed with the TCB and start again at zero.
+    #[test]
+    fn the_switch_stamp_survives_slot_reuse_by_a_replacement() {
+        let kernel = kernel_with_pair();
+        let original = plan_for(&kernel, OUTGOING, INCOMING).outgoing_identity;
+
+        // Reap: the slot is genuinely emptied, taking any per-context state with it.
+        kernel.with_task_tcbs_split_mut(|tcbs| {
+            tcbs[original.slot] = None;
+        });
+        // Respawn the SAME numeric TID and force it back into the SAME slot, so the replacement
+        // reproduces every coordinate the plan recorded except the stamp.
+        kernel.with(|state| {
+            state.register_task(OUTGOING).expect("task");
+            state
+                .set_thread_kernel_stack(OUTGOING, 0x9003_0000usize, 0x9003_0000usize + 0x4000)
+                .expect("stack");
+            state
+                .initialize_thread_kernel_switch_frame(OUTGOING, 0x1234_5678)
+                .expect("frame");
+        });
+        kernel.with_task_tcbs_split_mut(|tcbs| {
+            let landed = tcbs
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|t| t.tid.0 == OUTGOING))
+                .expect("replacement");
+            if landed != original.slot {
+                let tcb = tcbs[landed].take().expect("occupied");
+                tcbs[original.slot] = Some(tcb);
+            }
+        });
+
+        let replacement = plan_for(&kernel, OUTGOING, INCOMING).outgoing_identity;
+        assert_eq!(replacement.slot, original.slot);
+        assert_eq!(replacement.tid, original.tid);
+        assert_eq!(replacement.asid, original.asid);
+        assert_ne!(
+            replacement.switch_generation, original.switch_generation,
+            "a per-context counter would have produced the same stamp here"
         );
     }
 
@@ -187969,13 +188189,277 @@ mod u9d6final_switch_publication {
             D6PublishRefusal::NoTrapDrainer.marker(),
             D6PublishRefusal::MultiCpu.marker(),
             D6PublishRefusal::StashOccupied.marker(),
+            D6PublishRefusal::DeferralReserved.marker(),
             D6PublishRefusal::IncomingUnavailable.marker(),
             D6PublishRefusal::OutgoingUnavailable.marker(),
         ];
         let mut seen: alloc::vec::Vec<&str> = markers.to_vec();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), 7);
+        assert_eq!(seen.len(), 8);
+    }
+}
+
+/// U9-D6-FINAL (C2) — **ownership covers publication AND consumption.**
+///
+/// A shared occupancy check is not a reservation on its own. These cases exercise the two
+/// publication orders against the PRODUCTION primitives, check that a drain is never refused on
+/// account of its own reservation, and pin the one-shot start latch's behaviour on each way an
+/// attempt can fail to happen.
+mod u9d6final_switch_ownership {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::{D6PublishRefusal, D6SwitchPublication, SharedKernel};
+
+    const OUTGOING: u64 = 7200;
+    const INCOMING: u64 = 7201;
+
+    /// Arms the drainer flag and leaves the CPU's stash, all four deferral cells and the proof
+    /// latches exactly as it found them — these are process-global statics in a single-threaded
+    /// suite, so anything left set would leak into the next case.
+    struct Cpu0(());
+
+    impl Cpu0 {
+        fn open() -> Self {
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+            Self::scrub();
+            Self(())
+        }
+
+        fn scrub() {
+            // SAFETY: single-threaded test, no concurrent accessor.
+            unsafe {
+                let _ = crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[0].take();
+            }
+            crate::kernel::boot::d2_send_dispatch_clear(0);
+            crate::kernel::boot::d2_recv_dispatch_clear(0);
+            crate::kernel::boot::futex_wait_dispatch_clear(0);
+            crate::kernel::boot::yield_dispatch_clear(0);
+            crate::kernel::boot::D6_CONTROLLED_SWITCH_PROOF_STARTED
+                .store(false, core::sync::atomic::Ordering::Release);
+            crate::kernel::boot::D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE
+                .store(false, core::sync::atomic::Ordering::Release);
+            crate::kernel::boot::D6_CONTROLLED_SWITCH_PROOF_DONE
+                .store(false, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl Drop for Cpu0 {
+        fn drop(&mut self) {
+            Self::scrub();
+            crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn kernel_with_pair() -> SharedKernel {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            for (tid, base) in [(OUTGOING, 0x9200_0000usize), (INCOMING, 0x9201_0000usize)] {
+                state.register_task(tid).expect("task");
+                state
+                    .set_thread_kernel_stack(tid, base, base + 0x4000)
+                    .expect("stack");
+                state
+                    .initialize_thread_kernel_switch_frame(tid, 0x1234_5678)
+                    .expect("frame");
+            }
+        });
+        kernel
+    }
+
+    fn stash_occupied() -> bool {
+        crate::kernel::boot::switch_plan_stash_is_reserved(0)
+    }
+
+    /// The four reservation primitives, paired with the readers that say whether the cell took.
+    #[allow(clippy::type_complexity)]
+    fn cells() -> [(
+        &'static str,
+        fn(usize, u64) -> bool,
+        fn(usize) -> bool,
+        fn(usize),
+    ); 4] {
+        [
+            (
+                "d2_send",
+                crate::kernel::boot::d2_send_dispatch_try_defer,
+                crate::kernel::boot::d2_send_dispatch_is_deferred,
+                crate::kernel::boot::d2_send_dispatch_clear,
+            ),
+            (
+                "d2_recv",
+                crate::kernel::boot::d2_recv_dispatch_try_defer,
+                crate::kernel::boot::d2_recv_dispatch_is_deferred,
+                crate::kernel::boot::d2_recv_dispatch_clear,
+            ),
+            (
+                "futex_wait",
+                crate::kernel::boot::futex_wait_dispatch_try_defer,
+                crate::kernel::boot::futex_wait_dispatch_is_deferred,
+                crate::kernel::boot::futex_wait_dispatch_clear,
+            ),
+            (
+                "yield",
+                crate::kernel::boot::yield_dispatch_try_defer,
+                crate::kernel::boot::yield_dispatch_is_deferred,
+                crate::kernel::boot::yield_dispatch_clear,
+            ),
+        ]
+    }
+
+    /// **ORDER A — deferral first, plan second.** Each of the four cells, reserved on its own,
+    /// refuses the publication by name, and the refusal is distinguishable from `StashOccupied`
+    /// because the incumbent is a different mechanism at a different stage.
+    #[test]
+    fn a_reserved_deferral_refuses_the_publication_for_every_cell() {
+        for (name, try_defer, is_deferred, clear) in cells() {
+            let kernel = kernel_with_pair();
+            let _cpu = Cpu0::open();
+            assert!(try_defer(0, OUTGOING), "{name}: reservation must take");
+            assert!(is_deferred(0), "{name}: and must be observable");
+            assert!(
+                !stash_occupied(),
+                "{name}: the stash is still EMPTY — this is the point of the case"
+            );
+
+            let outcome = kernel.d6_publish_switch_plan_split(CpuId(0), OUTGOING, INCOMING);
+            assert_eq!(
+                outcome,
+                D6SwitchPublication::Refused(D6PublishRefusal::DeferralReserved),
+                "{name}: an empty stash slot is not whole-trap ownership"
+            );
+            assert!(!stash_occupied(), "{name}: and the refusal wrote nothing");
+            assert!(
+                is_deferred(0),
+                "{name}: the incumbent's reservation is untouched"
+            );
+            clear(0);
+        }
+    }
+
+    /// **ORDER B — plan first, deferral second.** With a plan published, every one of the four
+    /// reservation primitives refuses, and refuses BEFORE its CAS, so the cell is left clear and
+    /// the refusing route can settle however it settles.
+    #[test]
+    fn a_published_plan_refuses_every_deferral_reservation() {
+        for (name, try_defer, is_deferred, _clear) in cells() {
+            let kernel = kernel_with_pair();
+            let _cpu = Cpu0::open();
+            assert!(matches!(
+                kernel.d6_publish_switch_plan_split(CpuId(0), OUTGOING, INCOMING),
+                D6SwitchPublication::Published { .. }
+            ));
+            assert!(stash_occupied());
+
+            assert!(
+                !try_defer(0, OUTGOING),
+                "{name}: reservation must be refused"
+            );
+            assert!(
+                !is_deferred(0),
+                "{name}: refused BEFORE the CAS — the cell must not be left armed"
+            );
+        }
+    }
+
+    /// **A drain is never refused on account of its own reservation.**
+    ///
+    /// The exclusion lives in the two PRODUCTION acts — reserving and publishing — and nowhere
+    /// else. If it were also applied at consumption, a route that reserved a deferral and then
+    /// reached its own drain would find "something is reserved" and decline to settle the very
+    /// debt it took on. That is the leak C1 repaired, so it is asserted here from the source: no
+    /// drain gate consults either shared check.
+    #[test]
+    fn the_shared_checks_are_not_consulted_by_any_drain() {
+        const TRAP: &str = include_str!("../../arch/trap_entry.rs");
+        for (cell, marker) in [
+            ("d2_send_was_deferred", "D2_SEND_GENUINE_GLOBAL_DROPPED"),
+            ("d2_recv_was_deferred", "D2_GENUINE_RECV"),
+            ("futex_wait_was_deferred", "QUEUE_ADVANCING_DISPATCH_BEGIN"),
+            ("yield_was_deferred", "YIELD_DISPATCH_DEFER_BEGIN"),
+        ] {
+            let gate = alloc::format!("if {cell} {{");
+            assert!(
+                TRAP.contains(&gate),
+                "the {cell} drain gate must be the bare cell test, not a composite ({marker})"
+            );
+        }
+        assert!(
+            !TRAP.contains("if switch_plan_stash_is_reserved")
+                && !TRAP.contains("queue_advance_deferral_reserved_by"),
+            "no drain may consult the reservation checks"
+        );
+    }
+
+    /// **A REFUSED PUBLICATION does not consume the one-shot start latch.**
+    ///
+    /// `try_start` is a CAS the caller wins before its preparation and publication run. If the
+    /// publication is then refused — ordinary contention, most often — the attempt never
+    /// happened, and a latch left consumed would mean the proof reports nothing for the whole
+    /// boot rather than reporting a refusal and retrying.
+    #[test]
+    fn a_refused_attempt_hands_the_start_latch_back() {
+        let _cpu = Cpu0::open();
+        assert!(
+            crate::kernel::boot::d6_controlled_switch_proof_try_start(),
+            "the first attempt wins the latch"
+        );
+        assert!(
+            !crate::kernel::boot::d6_controlled_switch_proof_try_start(),
+            "and holds it against a second"
+        );
+        crate::kernel::boot::d6_controlled_switch_proof_release_start("stash_occupied");
+        assert!(
+            crate::kernel::boot::d6_controlled_switch_proof_try_start(),
+            "a released attempt is indistinguishable from one never started"
+        );
+    }
+
+    /// **A released attempt never manufactures a completion.** Releasing the start latch must not
+    /// touch `PENDING_DONE` or `DONE`; only an applied plan may set those.
+    #[test]
+    fn releasing_the_start_latch_claims_no_completion() {
+        let _cpu = Cpu0::open();
+        assert!(crate::kernel::boot::d6_controlled_switch_proof_try_start());
+        crate::kernel::boot::d6_controlled_switch_proof_release_start("full_stack_map_failed");
+        assert!(
+            !crate::kernel::boot::d6_controlled_switch_proof_take_pending_done(),
+            "no pending completion may appear"
+        );
+        assert!(
+            !crate::kernel::boot::d6_controlled_switch_proof_done(),
+            "and certainly no completion"
+        );
+    }
+
+    /// **A stale-plan rejection clears the pending completion.**
+    ///
+    /// A publication that reached the stash sets `PENDING_DONE`; the drain converts it into
+    /// `DONE` when it APPLIES a plan. A plan that is rejected at drain time is not applied, so
+    /// leaving `PENDING_DONE` set would hand the next applied plan — possibly an ordinary queue
+    /// advance — a completion the proof never earned.
+    #[test]
+    fn a_rejected_plan_must_not_leave_a_completion_owed() {
+        let _cpu = Cpu0::open();
+        assert!(crate::kernel::boot::d6_controlled_switch_proof_try_start());
+        crate::kernel::boot::d6_controlled_switch_proof_mark_pending_done();
+
+        // The settlement's own sequence, in order.
+        let cleared = crate::kernel::boot::d6_controlled_switch_proof_take_pending_done();
+        assert!(cleared, "the pending completion was outstanding");
+        crate::kernel::boot::d6_controlled_switch_proof_release_start("stale_plan_rejected");
+
+        assert!(
+            !crate::kernel::boot::d6_controlled_switch_proof_take_pending_done(),
+            "and is now gone, so no later plan inherits it"
+        );
+        assert!(!crate::kernel::boot::d6_controlled_switch_proof_done());
+        assert!(
+            crate::kernel::boot::d6_controlled_switch_proof_try_start(),
+            "and the promised retry is still possible"
+        );
     }
 }
 
@@ -188062,11 +188546,20 @@ mod u9d6final_closure {
             .and_then(|s| s.split("\n    }").next())
             .expect("the publication owner");
         let reserve = owner
-            .find("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan()")
-            .expect("the reservation");
+            .find("switch_plan_stash_is_reserved(cpu_idx)")
+            .expect("the stash reservation");
+        // U9-D6-FINAL (C2): the OTHER half of the same reservation — an empty stash slot is not
+        // whole-trap ownership while a queue-advancing deferral is outstanding.
+        let deferral = owner
+            .find("queue_advance_deferral_reserved_by(cpu_idx)")
+            .expect("the deferral reservation");
         let build = owner
             .find("build_dispatch_switch_plan_locked(")
             .expect("the plan build");
+        assert!(
+            deferral < build,
+            "order A must be settled before anything is built"
+        );
         let store = owner
             .find("DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan)")
             .expect("the store");
@@ -188103,9 +188596,43 @@ mod u9d6final_closure {
             check < switch,
             "the pointers must be revalidated before they are dereferenced"
         );
+        // U9-D6-FINAL (C2/§1): the refusal is SETTLED, not merely logged, and the settlement is
+        // its own owner — the drain propagates its verdict with `?`.
         assert!(
-            drain.contains("reason=incarnation_moved"),
+            drain.contains("settle_refused_switch_plan(shared, cpu, &plan)?"),
+            "a rejected plan must be settled through the settlement owner, and its verdict must \
+             be propagated rather than discarded"
+        );
+        let settlement = TRAP
+            .split("fn settle_refused_switch_plan(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the settlement owner");
+        assert!(
+            settlement.contains("reason=incarnation_moved"),
             "and a refusal must be named rather than silent"
+        );
+        // It settles from ACTUAL placement and frame authority — not from what publication did.
+        for owner in [
+            "shared.current_tid_split_read(cpu)",
+            "shared.entering_frame_authority_split_read(cpu, plan.outgoing_tid, outgoing_asid)",
+        ] {
+            assert!(
+                settlement.contains(owner),
+                "the settlement must compose `{owner}`"
+            );
+        }
+        assert!(
+            !settlement.contains("changes no scheduler state")
+                && !settlement.contains("Publishing a plan changes"),
+            "the publisher-side argument is not a settlement and must not return"
+        );
+        // And the one state in which discarding is admitted is spelled out, not assumed.
+        assert!(
+            settlement.contains("let discardable = !incoming_committed")
+                && settlement.contains("A::OwnsEnteringFrame"),
+            "discarding is admitted only for an uncommitted incoming task whose outgoing side \
+             still owns the entering frame"
         );
     }
 
