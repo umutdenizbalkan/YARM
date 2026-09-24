@@ -189809,3 +189809,236 @@ mod u9d6final_closure {
         );
     }
 }
+
+/// U9-TERMINAL-FINAL §4 — **mutation tests: do the closure guards actually catch anything?**
+///
+/// Every other module in this pass asserts a property of the tree as it stands. That is only
+/// evidence if the assertion would FAIL on a tree that lost the property, and a source guard is
+/// unusually easy to write so that it cannot: `drain_is_post_lock_after_broad_guard_drops`
+/// searched a whole file for a string, matched an unrelated site hundreds of lines away, and
+/// passed for the entire lifetime of the code it was supposed to be watching.
+///
+/// Each case here states a predicate, shows it holds on the real source, then applies ONE
+/// mutation — the specific regression §4 names — and requires the predicate to fail. The
+/// predicates mirror the live guards, and each case says which.
+#[cfg(test)]
+mod u9terminalfinal_mutation {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    /// Code lines only — the same filter the live guards use, and the reason they need it: this
+    /// tree records every retirement in a comment that names what it retired.
+    fn code_of(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn body_of(src: &str, head: &str) -> alloc::string::String {
+        let at = src.split(head).nth(1).unwrap_or_else(|| panic!("{head}"));
+        let end = at.find("\n}\n").unwrap_or(at.len());
+        code_of(&at[..end])
+    }
+
+    // ── A. RENEWED IMPLICIT ESCAPE ───────────────────────────────────────────────────────────
+    //
+    // The class that survived three prior closure passes: `?` applied to an `Option`, which
+    // returns `None` from the route with no `None` token anywhere on the line. Counting literal
+    // `None`s cannot see it; the scanner has to know which owners return `Option`.
+
+    /// The owners whose results are `Option`, so that a `?` on one is an invisible escape.
+    /// Derived from the U9-TERMINAL-FINAL §1 caller-resolution work, where each of these was
+    /// found behind exactly this shape.
+    const OPTION_OWNERS: &[&str] = &[
+        "current_tid_authoritative(cpu)",
+        "current_tid_split_read(cpu)",
+        "task_cnode_split(",
+        "try_split_dispatch(",
+        "Syscall::decode(",
+    ];
+
+    /// Line-scoped, so a `?` belonging to some other call further down cannot be misread as
+    /// this owner's. A `?` on an `Option` is a single-line construct in this tree.
+    fn has_implicit_option_escape(body: &str) -> bool {
+        body.lines().any(|line| {
+            OPTION_OWNERS.iter().any(|owner| line.contains(owner))
+                && (line.contains(")?") || line.contains("?;"))
+        })
+    }
+
+    /// Mirrors the live closure guards on the non-switching dispatcher (which is where §1's
+    /// caller-resolution table is applied).
+    #[test]
+    fn the_implicit_escape_scanner_fails_on_a_renewed_escape() {
+        let route = body_of(SPLIT, "fn try_split_dispatch_nonswitching_into_frame(");
+        assert!(
+            !has_implicit_option_escape(&route),
+            "the real route must carry no implicit Option escape"
+        );
+
+        // THE MUTATION: one caller resolution reverts to the pre-§1 shape. Nothing about it
+        // looks like a fall-through — there is no `None` on the line — which is exactly why
+        // this class survived three closure passes that counted `None`s.
+        let mutated = route.replace(
+            "let requester_tid = match split_caller(shared, cpu).or_internal(raw_nr, cpu) {\n        Ok(tid) => tid,\n        Err(settlement) => return settlement,\n    };",
+            "let requester_tid = shared.current_tid_authoritative(cpu)?;",
+        );
+        assert_ne!(mutated, route, "the mutation must actually apply");
+        assert!(
+            has_implicit_option_escape(&mutated),
+            "the scanner must FAIL on a renewed implicit escape — otherwise every closure claim \
+             in this pass rests on a guard that cannot see the defect it was written for"
+        );
+
+        // And the negative control: counting literal `None`s would NOT have caught it, which is
+        // the reason the scanner exists at all rather than a count.
+        assert_eq!(
+            mutated.matches("None").count(),
+            route.matches("None").count(),
+            "a literal-None count is blind to this mutation, by construction"
+        );
+    }
+
+    // ── B. UNSAFE FRAME RETURN ───────────────────────────────────────────────────────────────
+    //
+    // A settlement that writes a result into the ENTERING frame, or encodes an error that
+    // returns through it, without first establishing that the frame is still the entering
+    // task's to return through. §2 required this of every one of NR 0's decline settlements.
+
+    fn authenticates_before_returning_through_the_frame(body: &str) -> bool {
+        let Some(auth) = body.find("entering_frame_authority_split_read(") else {
+            return false;
+        };
+        // Every write into the entering frame, and every encoded error, must come after the
+        // authority is established.
+        let writes = body
+            .match_indices("frame.set_ok(")
+            .chain(body.match_indices("TrapHandleError::Syscall("))
+            .map(|(at, _)| at);
+        writes.into_iter().all(|at| at > auth)
+    }
+
+    /// Mirrors the U9-D6-FINAL §1 / U9-TERMINAL-FINAL §2 frame-authority guards.
+    #[test]
+    fn the_frame_authority_scanner_fails_when_the_authority_is_dropped() {
+        let settle = body_of(SPLIT, "fn settle_declined_yield(");
+        assert!(
+            authenticates_before_returning_through_the_frame(&settle),
+            "the real settlement must establish frame authority before returning through it"
+        );
+
+        // THE MUTATION: the authority read is dropped. The settlement still compiles in shape,
+        // still answers the canonical error, and still writes the canonical lanes — it simply
+        // returns through a frame it has not proven is still the caller's. That is the failure
+        // mode §2 names: "a returned error still needs authority to return through the entering
+        // frame."
+        let mutated = settle.replace("entering_frame_authority_split_read(", "no_authority_read(");
+        assert_ne!(mutated, settle, "the mutation must actually apply");
+        assert!(
+            !authenticates_before_returning_through_the_frame(&mutated),
+            "the scanner must FAIL when the authority read is removed"
+        );
+
+        // The second half of the same property: authority must precede the FIRST write, not
+        // merely appear somewhere. Moving it after them is the subtler regression.
+        let first_write = settle.find("frame.set_ok(").expect("a frame write");
+        let auth = settle
+            .find("entering_frame_authority_split_read(")
+            .expect("the authority read");
+        assert!(
+            auth < first_write,
+            "and it must precede the first write, not merely exist"
+        );
+    }
+
+    // ── C. A REINTRODUCED BROAD ACQUISITION ──────────────────────────────────────────────────
+
+    fn holds_a_broad_acquisition(code: &str) -> bool {
+        code.contains(".with_cpu(") || code.contains(".state.lock()") || code.contains(".with(|")
+    }
+
+    /// Mirrors `broad_lock_census_guard::no_production_broad_acquisition_exists_anywhere` and
+    /// `neither_bridge_regrew_a_replacement_for_the_deleted_acquisition`.
+    #[test]
+    fn the_census_ratchet_fails_on_a_reintroduced_acquisition() {
+        for (name, src) in [("shared", TRAP_ENTRY), ("riscv64", RV_TRAP)] {
+            let code = code_of(src);
+            assert!(
+                !holds_a_broad_acquisition(&code),
+                "{name}: the real bridge holds no broad acquisition"
+            );
+            // THE MUTATION: the deleted acquisition comes back, in the place it was deleted from.
+            let mutated = code.replace(
+                "settle_unowned_trap",
+                "shared.with_cpu(cpu, |kernel| ()).ok(); settle_unowned_trap",
+            );
+            assert_ne!(mutated, code, "{name}: the mutation must actually apply");
+            assert!(
+                holds_a_broad_acquisition(&mutated),
+                "{name}: the ratchet must FAIL on a reintroduced acquisition"
+            );
+        }
+    }
+
+    // ── D. A BLANKET SETTLEMENT ──────────────────────────────────────────────────────────────
+    //
+    // §5 forbids a blanket catch-all in the same sentence as the deletion, and a blanket error
+    // is the cheapest way to make every other assertion in this pass pass.
+
+    fn settles_per_class(body: &str) -> bool {
+        let reasons = [
+            "syscall_unrecognized",
+            "page_fault_unclaimed",
+            "timer_unsettled",
+            "interrupt_unsettled",
+            "unknown_unsettled",
+        ];
+        reasons.iter().all(|r| body.contains(r))
+            // …and the Syscall class keeps its own CHANNEL, which is the half a value-only
+            // collapse silently loses.
+            && body.contains("frame.set_err(SyscallError::InvalidNumber.code())")
+    }
+
+    /// Mirrors the per-class assertions in `neither_bridge_regrew_a_replacement_for_the_deleted_acquisition`
+    /// and `u9tf_the_other_four_classes_keep_distinct_fatal_answers`.
+    #[test]
+    fn the_per_class_guard_fails_on_a_blanket_settlement() {
+        let settle = body_of(TRAP_ENTRY, "pub(crate) fn settle_unowned_trap(");
+        assert!(
+            settles_per_class(&settle),
+            "the real settlement names every class and keeps the userspace channel"
+        );
+
+        // MUTATION 1: every class collapses onto one reason. The acquisition is still gone, the
+        // census still reads zero, and every ordering guard still passes — this is the one that
+        // notices.
+        let blanket = settle
+            .replace("page_fault_unclaimed", "trap_unsettled")
+            .replace("timer_unsettled", "trap_unsettled")
+            .replace("interrupt_unsettled", "trap_unsettled")
+            .replace("unknown_unsettled", "trap_unsettled")
+            .replace("syscall_unrecognized", "trap_unsettled");
+        assert!(
+            !settles_per_class(&blanket),
+            "the guard must FAIL when five per-class reasons become one"
+        );
+
+        // MUTATION 2: the values are kept per class but the Syscall CHANNEL is lost — the errno
+        // is returned on `Err` instead of being written into the caller's frame. Every reason is
+        // still distinct, so only the channel half of the predicate catches it. This is the
+        // defect the differential in `syscall_split` found in the first draft of this settlement.
+        let wrong_channel = settle.replace(
+            "frame.set_err(SyscallError::InvalidNumber.code())",
+            "let _ = frame",
+        );
+        assert!(
+            !settles_per_class(&wrong_channel),
+            "the guard must FAIL when a userspace errno is moved onto the fatal channel"
+        );
+    }
+}

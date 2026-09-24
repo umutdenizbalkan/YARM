@@ -21698,3 +21698,217 @@ here.
 
 The residual list is pinned from source by `kernel::boot::tests::u9d6final_residual` (7 cases), so
 it cannot shrink or grow without a guard failing.
+
+---
+
+# U9-TERMINAL-FINAL — removing both terminal broad acquisitions
+
+**Census: `with_cpu` 2 → 0, `with_broad` 0, `state_lock` 3 (unchanged).** The three raw
+`self.state.lock()` sites are the BODIES of `SharedKernel::lock` / `with` / `with_cpu` — the
+wrapper definitions every callsite goes through — and are reported separately for exactly that
+reason: deleting the last callsite does not delete the wrappers, and counting their bodies as
+acquisitions would make the figure above unreachable by construction.
+`tests/broad_lock_census_guard.rs` 9/9 (7 existing + 2 new ratchets).
+
+There is no production acquisition of the broad `SpinLock<KernelState>` left in the tree, in any
+form.
+
+## §0 — what the U9-D6-FINAL §7 inventory actually said
+
+The previous pass refused to delete the acquisitions and recorded why: its RISC-V core smoke
+logged **`TERMINAL_BROAD_DISPATCH_ENTER cpu=0 event=Syscall nr=8`** on every run. One live
+arrival was enough to make the four zero-arrival runs worthless as evidence — a workload zero is
+not a closure — so the residual list R1–R9 became this pass's starting set, and was treated as a
+starting set rather than as a complete one.
+
+**The arrival was misattributed at first, and the correction is the most useful thing in this
+pass.** R2 said NR 8's split route answered `None` for an invalid `target_pid`, and the obvious
+reading was that PM's Stage 29A boot self-probe was hitting that refusal. It was not. NR 8 was
+absent from the RISC-V `split_eligible` whitelist AND from the AArch64 ABI import list — the two
+per-port gates that decide whether the shared dispatcher is consulted **at all**. On RISC-V the
+dispatcher was never called for NR 8, valid or invalid, so every NR 8 on that port went to the
+terminal acquisition while x86_64 served the same trap pre-lock.
+
+That is a class of defect no source guard about the ROUTE can see, and it had already happened
+four times before (NR 2, NR 28, NR 4, NR 30). `u9terminalfinal_ingress` now requires every class
+the shared dispatcher can service to appear in both port ingress gates, so the fifth occurrence
+fails a test instead of a smoke.
+
+## §1 — validation and caller-resolution escapes (R2–R6)
+
+### The invisible-escape class
+
+`?` applied to an `Option` returns `None` from the route with **no `None` token anywhere on the
+line**. Three prior closure passes counted literal `None`s and missed every one of these. They
+were found by walking the `Option`-returning call graph instead.
+
+### Why a universal "no current task → Internal" prologue is wrong
+
+Derived from the canonical handlers rather than assumed:
+
+| NR | canonical resolution | position | answer when absent |
+|---|---|---|---|
+| 8, 11, 12, 23, 28, 29, 31 | `helpers::current_tid(kernel)?` | before argument validation | `SyscallError::Internal` |
+| 10 | `validate_current_user_futex_word` → `current_tid().ok_or(TaskMissing)` | **after** `max_wake` conversion and range check | `KernelError::TaskMissing` |
+| 15 | `kernel.current_tid().unwrap_or(0)` | trace only | **no error at all** |
+
+A global prologue would answer NR 10 before its argument validation (changing which validation
+wins) and would give NR 15 an error it never had. So `SplitCaller` shares the IDENTITY RESOLUTION
+and each route composes its own settlement.
+
+Other corrections in this section:
+
+* **NR 10's transcription had drifted.** The hand-rolled range check turned a `checked_add`
+  overflow into a fall-through where the shared `sched::futex_word_range_check` answers
+  `UserMemoryFault`. The route now calls the shared checker.
+* **NR 11 provisions its CNode.** The broad path does
+  `process_cnode_for_pid(pid).unwrap_or(CNodeId(pid))` + ensure + set. Declining a missing CNode
+  would have replaced a completed spawn with a detour, so `ensure_process_cnode_split` composes
+  that creation owner instead.
+* **Family recognition vs. request failure.** `split_family_recheck` separates "not this family"
+  from "recognized request failed", so a handled outcome cannot leak back out through `Option::?`.
+
+## §2 — NR 0's switching residual (R1)
+
+All six `YieldDecline` variants plus invalid-CPU admission settle through `settle_declined_yield`,
+which reuses the existing dispatch, rollback, frame-authority and deferral owners. `NotRunning`
+is `TaskMissing`; `NoCurrent` with no caller returns as the trap entered; everything else takes
+the queue-advance path.
+
+The constraints §2 named are each visible in the code:
+
+* **An occupied cell names an owner.** `colliding_deferral_pending` settles
+  `QueueAdvanceCommitted` with `settlement=switch_owned_elsewhere` — the incumbent's drain pays
+  the debt — rather than reserving over it, clearing it, or selecting twice.
+* **A returned error still needs authority.** Both frame-returning arms consult
+  `entering_frame_authority_split_read` before encoding anything.
+* **Yield telemetry exactly once.** `count_yield_split_mut` is paid at the top, for every
+  settlement, because the broad `yield_current` that used to count a declined yield no longer runs.
+
+## §3 — ingress, and the last hook
+
+NR 8 joins the AArch64 import list and the RISC-V `split_eligible` whitelist. With it, every
+ASSIGNED number is on both — so the selectivity those lists still have is (a) NR 6/7 behind the
+canonical direct-admission predicate and (b) retired/unassigned numbers, which match no term,
+keep `nr = 0` and are declined. The AArch64 `nr = 0` ambiguity is why the split Yield route reads
+raw `x8` through `trapped_syscall_nr` rather than the frame's decoded number.
+
+The RISC-V foundation-oracle publish moved out of the closure onto its own prerequisites (a
+syscall trap, the knob armed, the one-shot unfired, a valid CPU, a post-lock drain downstream —
+all decidable there), with token identity, the `+1` bias and the consumer unchanged. Relocating
+only its marker would not have been enough; the whole publication moved.
+
+## §4 — closure and behavior, proved separately
+
+**Production-owner differentials.** Each changed validation runs the split route and the broad
+dispatcher over the same frame and requires them to agree on the error AND the return lanes,
+including the combined-invalid cases. `settle_unowned_trap` is differentialled against
+`KernelState::handle_trap` the same way — and that differential found a real defect in the first
+draft of the settlement (see §5).
+
+**Mutation tests** (`u9terminalfinal_mutation`), because a source guard is unusually easy to write
+so that it cannot fail. Each states a predicate, shows it holds, applies one mutation and requires
+it to fail: a renewed implicit `Option::?` escape (with a negative control showing a literal-`None`
+count is blind to it), a dropped frame-authority read, a reintroduced broad acquisition, and a
+blanket settlement — twice, once collapsing the five reasons and once moving the `Syscall` errno
+onto the fatal channel.
+
+**A stale guard the deletion exposed.** `drain_is_post_lock_after_broad_guard_drops` asserted the
+queue-switch drain used "a fresh bounded `with_cpu` re-acquire" by finding that text ANYWHERE in
+the file. U3/203C had already retired that re-acquire; the only match left was the terminal
+acquisition hundreds of lines away. It has been asserting a property of unrelated code ever since.
+Re-derived against the drain itself.
+
+## §5 — the deletion
+
+Both acquisitions are replaced by **one per-class settlement with two drivers**,
+`arch::trap_entry::settle_unowned_trap`, exactly as `drain_dispatch_post_work` has had two drivers
+since U6 §4. The per-port reasoning stays at the two call sites, because the route sets differ.
+
+### Each answer is read off the broad dispatcher, including its CHANNEL
+
+The error value is only half of a canonical outcome. `KernelState::handle_trap`'s `Trap::Syscall`
+arm does `if let Err(e) = dispatch_syscall(..) { trapframe.set_err(e.code()); } … Ok(())`, with its
+own comment recording why: every arch entry point treats `Err(TrapHandleError)` as a **fatal
+kernel halt**, so a normal `SyscallError` must return to userspace as the error lane.
+
+| class | what the broad arm did | settled as |
+|---|---|---|
+| `Syscall` | `dispatch_syscall` → `InvalidNumber`, written into the frame, `Ok(())` | `frame.set_err(InvalidNumber)` + `Ok(())` — **returns to userspace** |
+| `PageFault` | `fault_current_task_for_fault` could not name a victim → `TaskMissing` | `Err(Syscall(TaskMissing))` — fatal, as canonically |
+| `TimerInterrupt` | ticked, then `Ok(())` | `Err(Syscall(Internal))` |
+| `ExternalInterrupt` | routed the line, EOI'd it, then `Ok(())` | `Err(Syscall(Internal))` |
+| `Unknown` | fatal since Stage 174 | `Err(Syscall(Internal))` |
+
+**The first draft got the `Syscall` row wrong** — it answered `Err(Syscall(InvalidNumber))`, which
+has the right value on the wrong channel and would have converted a userspace errno into a kernel
+halt. The differential against `handle_trap` caught it.
+
+The three asynchronous classes are where `Ok(())` would be a LIE rather than a reproduction: the
+broad arm's `Ok(())` was EARNED by the tick, the routing and the EOI it had just performed, and
+this settlement cannot perform them — an EOI issued here would be a SECOND one if the owner did
+run. Returning `Ok(())` would resume a CPU whose interrupt controller was never acknowledged, with
+no marker any smoke could see.
+
+### Where the per-class distinction lives
+
+Four of the five rows carry the same error value, and that is the canonical conversion, not a
+catch-all creeping back: `SyscallError::from(KernelError::TaskMissing)` **is** `Internal`, and the
+PageFault arm of `handle_trap_event` applies exactly it. So the fact §5 asks for — which owner
+failed to settle its own class — is carried by the marker's `reason`, one per class, plus the
+`Syscall` class's different channel. A blanket settlement would emit one reason; this emits five.
+
+### The one arm reachable in principle
+
+RISC-V's `split_eligible` is a whitelist of assigned numbers, so a **retired or unassigned**
+number never consults the dispatcher there and lands on the settlement — where it gets the
+canonical `InvalidNumber` in its own frame and returns to userspace, precisely as
+`dispatch_syscall` + `set_err` did. Every other arm is unreachable by the route tables at the two
+call sites.
+
+### Two things the deleted `with_cpu` did
+
+Only one of them was the broad borrow.
+
+* **The CPU admission and binding.** `with_cpu(cpu, f)` is `lock` + `set_current_cpu(cpu)?` + `f`,
+  and `set_current_cpu` is `validate_online_cpu` + `sched.current_cpu = cpu`. That refusal was
+  never about the lock. The RISC-V driver composes `SharedKernel::bind_current_cpu_split`, the
+  existing rank-1 owner of exactly those two steps, BEFORE the settlement, so an invalid CPU still
+  refuses first with the same `KernelError` class.
+* **The frame.** The broad arm passed `Some(&mut *frame)` so the handler could write the caller's
+  return lanes; the `Syscall` settlement needs it for that same reason.
+
+### A silent discard the deletion forced out
+
+The RISC-V bridge's `inner_result` was `Result<Result<(), TrapHandleError>, _>` because its `else`
+arm was `with_cpu(…).map_err(…)`: the OUTER channel carried `with_cpu`'s admission refusal and the
+INNER one carried the canonical handler's result. The `?` below consumed one level, so the
+handler's result — and, on the other arm, every split route's result — was **discarded**, in flat
+contradiction of both comments sitting on it ("the rolled-back failure's error otherwise — so
+every `?` site below behaves identically", and "an Err here takes the fatal
+`RISCV_TRAP_HANDLE_FAILED` bridge path").
+
+It is the invisible-escape shape again, followed through a caller rather than counted. It could
+not survive this section: with the acquisition gone the inner channel is the settlement's ONLY
+channel, so leaving it would have been manufacturing closure rather than earning it. Collapsed to
+one level.
+
+### Other stale claims the deletion exposed
+
+* `EXIT_TASK_BROAD_LOCK_RELEASED` said `holder=with_cpu` on all three ports, naming a guard that
+  no longer exists — the same false-claim shape Stage 200D-0B3 removed the x86 markers for. It
+  reads `holder=none`; `broad_lock=0` is unchanged and now unconditionally true.
+* The shared bridge computed a `FaultBookkeepingMode` whose only reader was the deleted closure.
+  Both fault recordings stay; the unread value goes.
+* `TERMINAL_BROAD_DISPATCH_ENTER` is deleted with the acquisitions it counted. It earned its keep
+  — it is how the NR 8 ingress gap was found — but a marker nothing can emit is a vacuous gate, so
+  the three core-smoke TERMINAL-ACQUISITION gates now require `TRAP_UNOWNED` to be absent: the
+  same question against the structure that exists.
+
+### No evasions
+
+No blanket error, no hidden wrapper, no raw-lock replacement, no supported knob disabled to
+manufacture closure. `neither_bridge_regrew_a_replacement_for_the_deleted_acquisition` rejects all
+four by name, and `no_production_broad_acquisition_exists_anywhere` states the absolute rather
+than a delta — the census is a per-file expectation and cannot see an acquisition appearing in a
+file that was never on the list.
