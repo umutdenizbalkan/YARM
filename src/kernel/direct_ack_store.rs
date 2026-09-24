@@ -256,6 +256,13 @@ pub(crate) enum AckConsume {
     /// endpoint destruction, stale cleanup). This is the mutual-exclusion refusal — the two
     /// terminal edges can never both resolve one pair.
     AlreadyReleased,
+    /// POST-U9-STABILIZATION §3A — an ENDPOINT-KEYED PROBE (no expected waiter) found this
+    /// endpoint's previous lease already spent, consumed or released, and no new one published
+    /// yet. **Expected and benign**: the server is between requests, which is exactly the state
+    /// in which the request route takes its buffered lane. It is not a second consumption of
+    /// any lease — a probe names no publication — so it is not counted as a duplicate or a
+    /// crossed terminal; it has its own counter, as `release`'s `AlreadyConsumed` does.
+    Spent,
 }
 
 impl AckConsume {
@@ -445,6 +452,8 @@ pub(crate) struct DirectAckStore {
     /// Consumption refused because the lease had already ended through a non-direct edge.
     /// The mutual-exclusion counter: it is the direct edge arriving after the waiter left.
     crossed_terminal_rejections: AtomicU64,
+    /// Endpoint-keyed probes that found a spent lease — see [`AckConsume::Spent`]. Not a fuse.
+    spent_probes: AtomicU64,
     commits: AtomicU64,
     consumes: AtomicU64,
     /// Leases retired through the non-direct terminal edge. The fourth resolution alongside
@@ -474,6 +483,7 @@ impl DirectAckStore {
             duplicate_consume_rejections: AtomicU64::new(0),
             duplicate_release_rejections: AtomicU64::new(0),
             crossed_terminal_rejections: AtomicU64::new(0),
+            spent_probes: AtomicU64::new(0),
             commits: AtomicU64::new(0),
             consumes: AtomicU64::new(0),
             releases: AtomicU64::new(0),
@@ -506,6 +516,7 @@ impl DirectAckStore {
         self.duplicate_release_rejections
             .store(0, Ordering::Relaxed);
         self.crossed_terminal_rejections.store(0, Ordering::Relaxed);
+        self.spent_probes.store(0, Ordering::Relaxed);
         self.commits.store(0, Ordering::Relaxed);
         self.consumes.store(0, Ordering::Relaxed);
         self.releases.store(0, Ordering::Relaxed);
@@ -688,6 +699,25 @@ impl DirectAckStore {
             self.stale_generation_rejections
                 .fetch_add(1, Ordering::Relaxed);
             return AckConsume::StaleGeneration;
+        }
+        // POST-U9-STABILIZATION §3A — A PROBE IS NOT A CONSUMER OF ANY PARTICULAR LEASE.
+        //
+        // Both production consumers are endpoint-keyed probes: "is there a live acknowledgement
+        // for this endpoint incarnation right now?". A slot in a SPENT state answers "no" — the
+        // endpoint's previous lease ended and its server has not re-published — and that is the
+        // ordinary between-requests state in which the request route takes its buffered lane.
+        // It used to be counted as `duplicate_consume` (or `crossed_terminal` for a released
+        // slot), fuses that name a second resolution of ONE lease, so a boot whose client merely
+        // called while the server was busy failed its quiescent seal intermittently.
+        //
+        // What stays a fuse is unchanged: an ENTITLED consumer (`expect_waiter` is `Some`)
+        // finding its lease spent, and a lost compare-exchange on a committed pair below.
+        if expect_waiter.is_none() {
+            let state = slot.state.load(Ordering::Acquire);
+            if state == SLOT_CONSUMED || state == SLOT_RELEASED {
+                self.spent_probes.fetch_add(1, Ordering::Relaxed);
+                return AckConsume::Spent;
+            }
         }
         // MUTUAL EXCLUSION, checked before the waiter compare: a released slot has had its
         // waiter identity wiped, so comparing identities first would misreport an ended lease
@@ -1143,6 +1173,12 @@ impl DirectAckStore {
     /// The mutual-exclusion counter.
     pub(crate) fn crossed_terminal_rejection_count(&self) -> u64 {
         self.crossed_terminal_rejections.load(Ordering::Acquire)
+    }
+
+    /// Endpoint-keyed probes that found this endpoint's previous lease already spent — the
+    /// ordinary "server between requests" state. Reported, never a fuse.
+    pub(crate) fn spent_probe_count(&self) -> u64 {
+        self.spent_probes.load(Ordering::Acquire)
     }
 
     /// Number of slots holding a lease that has been released (spent, never consumed).

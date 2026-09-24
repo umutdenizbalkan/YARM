@@ -433,6 +433,36 @@ pub(crate) fn quiescent_verdict(
     }
 }
 
+/// POST-U9-STABILIZATION §2 — the disabled-production seal's verdict.
+///
+/// The seal's contract is the Stage 199D-WA1-GATE one, unchanged: with the production default
+/// DISABLED, no ordinary NR6/NR7 may have completed on the direct path. It says nothing about a
+/// configuration whose production path is enabled — there, ordinary traffic completing directly is
+/// the supported behaviour, and whether it did so correctly is the quiescent seal's question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisabledSealVerdict {
+    /// The production predicate is true: the disabled-mode contract does not apply.
+    NotApplicable,
+    /// Disabled, and no ordinary direct completion in either direction.
+    Clean,
+    /// Disabled, yet an ordinary transaction completed on the direct path.
+    Violated,
+}
+
+pub(crate) const fn disabled_seal_verdict(
+    production_enabled: bool,
+    ordinary_nr6: u64,
+    ordinary_nr7: u64,
+) -> DisabledSealVerdict {
+    if production_enabled {
+        DisabledSealVerdict::NotApplicable
+    } else if ordinary_nr6 == 0 && ordinary_nr7 == 0 {
+        DisabledSealVerdict::Clean
+    } else {
+        DisabledSealVerdict::Violated
+    }
+}
+
 /// Emit the FINAL quiescent production attestation, exactly once, only after the normal
 /// service chain has reported healthy. Read-only and one-shot.
 pub(crate) fn maybe_emit_quiescent_attestation(
@@ -481,16 +511,32 @@ pub(crate) fn maybe_emit_quiescent_attestation(
         // selector instead would read `0` on an ordinary boot and wrongly suggest the mechanism
         // had been removed. Pinned by `every_explicit_proof_selector_is_preserved`.
         let proof_available = true;
-        let ordinary_clean = !production_enabled && ordinary_nr6 == 0 && ordinary_nr7 == 0;
-        crate::yarm_log!(
-            "IPC_DIRECT_PRODUCTION_DISABLED_SEAL production_enabled={} ordinary_nr6_direct={} ordinary_nr7_direct={} proof_nr6_available={} proof_nr7_available={} result={}",
-            u8::from(production_enabled),
-            ordinary_nr6,
-            ordinary_nr7,
-            u8::from(proof_available),
-            u8::from(proof_available),
-            if ordinary_clean { "ok" } else { "fail" },
-        );
+        // POST-U9-STABILIZATION §2 — the seal attests the DISABLED mode, so it applies only
+        // when the production predicate is false. It used to be emitted unconditionally and so
+        // read `result=fail` on every boot of a port whose supported production path is on —
+        // which, since WA3C2 and the AArch64/RISC-V admissions, is every port. In that mode the
+        // meaningful checks are the production-ON ones, which the QUIESCENT seal below carries;
+        // this one is skipped with a marker that names why and still reports the counters.
+        match disabled_seal_verdict(production_enabled, ordinary_nr6, ordinary_nr7) {
+            DisabledSealVerdict::NotApplicable => crate::yarm_log!(
+                "IPC_DIRECT_PRODUCTION_DISABLED_SEAL_SKIPPED reason=production_enabled ordinary_nr6_direct={} ordinary_nr7_direct={} result=ok",
+                ordinary_nr6,
+                ordinary_nr7,
+            ),
+            verdict => crate::yarm_log!(
+                "IPC_DIRECT_PRODUCTION_DISABLED_SEAL production_enabled={} ordinary_nr6_direct={} ordinary_nr7_direct={} proof_nr6_available={} proof_nr7_available={} result={}",
+                u8::from(production_enabled),
+                ordinary_nr6,
+                ordinary_nr7,
+                u8::from(proof_available),
+                u8::from(proof_available),
+                if verdict == DisabledSealVerdict::Clean {
+                    "ok"
+                } else {
+                    "fail"
+                },
+            ),
+        }
     }
     // Stage 199D-WA1-GATE: the production-ON seal attests the PRODUCTION path. With the
     // production default disabled there is no production path to attest, and its verdict
@@ -600,6 +646,22 @@ fn emit_quiescent(
         v.terminals_mutually_exclusive as u8,
         v.watermark_bounded as u8,
         v.fuses_clear as u8,
+    );
+    // POST-U9-STABILIZATION §3A — `fuses_clear` is a conjunction of seven rejection counters,
+    // and a `0` there named no transaction. Each fuse is reported by name so a failing seal
+    // identifies WHICH store edge refused, not merely that one did.
+    crate::yarm_log!(
+        "IPC_DIRECT_PRODUCTION_ACK_FUSES dir={} capacity={} endpoint_live={} stale_generation={} foreign_waiter={} not_committed={} duplicate_consume={} duplicate_release={} spent_probes={}",
+        which,
+        store.capacity_refusal_count(),
+        store.endpoint_live_refusal_count(),
+        store.stale_generation_rejection_count(),
+        store.foreign_waiter_rejection_count(),
+        store.not_committed_rejection_count(),
+        store.duplicate_consume_rejection_count(),
+        store.duplicate_release_rejection_count(),
+        // Not a fuse — reported so the between-requests population stays visible.
+        store.spent_probe_count(),
     );
 }
 

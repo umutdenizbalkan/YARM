@@ -13,6 +13,13 @@ const COMMON: &str = include_str!("../scripts/lib/serverdies-runner-common.sh");
 const X86: &str = include_str!("../scripts/qemu-x86_64-server-dies-smoke.sh");
 const AARCH64: &str = include_str!("../scripts/qemu-aarch64-server-dies-smoke.sh");
 const RISCV64: &str = include_str!("../scripts/qemu-riscv64-server-dies-smoke.sh");
+// POST-U9-STABILIZATION §1 — the production owners whose literals the chain grades. Every
+// exit-lifecycle marker the runner requires must be one these still EMIT, in that format; a
+// runner that requires an obsolete marker, or a marker whose owner changed its text, fails here
+// before a live boot ever reports it missing.
+const EXIT_TXN: &str = include_str!("../src/kernel/syscall/exit_txn.rs");
+const SYSCALL_SPLIT: &str = include_str!("../src/kernel/syscall_split.rs");
+const SYSCALL: &str = include_str!("../src/kernel/syscall.rs");
 
 fn arch_runners() -> [(&'static str, &'static str); 3] {
     [("x86_64", X86), ("aarch64", AARCH64), ("riscv64", RISCV64)]
@@ -124,7 +131,12 @@ fn required_marker_chain_is_ordered_and_complete() {
         "IPC_SERVER_DEATH_EXIT_ENTERED nr=16 role=server",
         "IPC_SERVER_DEATH_LINK_CAPTURED",
         "IPC_SERVER_DEATH_DEFERRED_PUBLISHED",
-        "EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG}",
+        // U9-EXIT1: the dying server's NR 16 is served by the split exit transaction, so the
+        // in-lock consumer's `EXIT_TASK_DISPOSITION_CONSUMED` is not emitted for it. The
+        // lifecycle is graded through what the split owners emit for the same incarnation:
+        // the route's entry edge, then the retired claim.
+        "EXIT_TASK_SPLIT_ENTER tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID} result=ok",
+        "EXIT_TASK_CLAIM_RETIRED tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}",
         "IPC_SERVER_DEATH_BROAD_LOCK_RELEASED",
         "IPC_SERVER_DEATH_POST_LOCK_DRAIN_BEGIN",
         "IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won",
@@ -141,6 +153,34 @@ fn required_marker_chain_is_ordered_and_complete() {
     assert!(
         COMMON.contains("marker out of order"),
         "the chain must be ORDERED, not merely present"
+    );
+    // The obsolete in-lock marker is not REQUIRED anywhere in the chain: requiring it would
+    // make every live boot fail on a marker the current lifecycle never emits.
+    let required = COMMON
+        .split("serverdies_required_markers() {")
+        .nth(1)
+        .and_then(|s| s.split("\nMARKERS\n").next())
+        .expect("the required-marker heredoc");
+    assert!(
+        !required.contains("EXIT_TASK_DISPOSITION_CONSUMED"),
+        "the chain must not require the in-lock consumer's marker"
+    );
+    // Order inside the chain: entry edge, server-death reservation and publication, then the
+    // retired claim, then the post-lock drain that settles the caller.
+    let at = |m: &str| {
+        required
+            .find(m)
+            .unwrap_or_else(|| panic!("chain lacks {m}"))
+    };
+    assert!(
+        at("EXIT_TASK_SPLIT_ENTER") < at("IPC_SERVER_DEATH_DEFERRED_RESERVED")
+            && at("IPC_SERVER_DEATH_DEFERRED_PUBLISHED") < at("EXIT_TASK_CLAIM_RETIRED")
+            && at("EXIT_TASK_CLAIM_RETIRED") < at("IPC_SERVER_DEATH_POST_LOCK_DRAIN_BEGIN")
+            && at("IPC_SERVER_DEATH_TERMINAL_CLAIM") < at("IPC_SERVER_DEATH_CALLER_ENQUEUED")
+            && at("IPC_SERVER_DEATH_CALLER_ENQUEUED") < at("IPC_SERVER_DEATH_USER_VALIDATED")
+            && at("IPC_SERVER_DEATH_USER_VALIDATED") < at("IPC_SERVER_DEATH_SURVIVOR_PROGRESS_OK"),
+        "the causal order: exit, publication, retirement, drain, one winner, one wake, \
+         userspace validation, then subsequent progress"
     );
     // Exactly one wake and one winner — a duplicate is as bad as none.
     assert!(
@@ -185,10 +225,36 @@ fn required_chain_is_scoped_to_the_witnessed_transaction() {
     // an unrelated earlier exit can neither satisfy nor fail the chain.
     for scoped in [
         "IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID}",
-        "EXIT_TASK_DISPOSITION_CONSUMED arch=${ARCH_TAG} tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}",
+        "EXIT_TASK_SPLIT_ENTER tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID} result=ok",
+        "EXIT_TASK_CLAIM_RETIRED tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}",
     ] {
         assert!(COMMON.contains(scoped), "unscoped shared marker: {scoped}");
     }
+    // Each scoped exit literal is the PRODUCTION owner's own format, field for field — derived
+    // from the emitter rather than restated, so the runner cannot drift from what boots print.
+    assert!(
+        SYSCALL_SPLIT.contains("\"EXIT_TASK_SPLIT_ENTER tid={} asid={} result=ok\""),
+        "the split exit route emits the entry edge the chain requires"
+    );
+    assert!(
+        EXIT_TXN.contains("\"EXIT_TASK_CLAIM_RETIRED tid={} asid={} pid={}")
+            && EXIT_TXN.contains("server_death={}\""),
+        "the exit owner emits the retired claim, carrying the server-death handoff bit"
+    );
+    // The two facts the obsolete marker used to imply are asserted DIRECTLY: the exit never
+    // reached the terminal broad dispatcher (whose edge marker still exists in the broad arm,
+    // so counting zero is meaningful), and the retired claim attests the server-death handoff.
+    assert!(
+        SYSCALL.contains("\"EXIT_TASK_BROAD_ENTER tid={} asid={} result=ok\"")
+            && COMMON.contains("broad_edges=$(grep -c -F \"EXIT_TASK_BROAD_ENTER\" \"$log\"")
+            && COMMON.contains("[[ \"$broad_edges\" == \"0\" ]]"),
+        "the dying server's NR 16 must be shown never to reach the broad dispatcher"
+    );
+    assert!(
+        COMMON.contains("*\"server_death=1\"*) ;;")
+            && COMMON.contains("the retired claim does not attest the server-death handoff"),
+        "the retired claim must attest that this exit owed and handed off a completion"
+    );
     // The completion half is scoped by the caller and the reply record's generation.
     for scoped in [
         "caller_tid=${SD_CALLER_TID} caller_asid=${SD_CALLER_ASID}",

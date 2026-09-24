@@ -22325,3 +22325,107 @@ the three raw `state.lock()` sites are the wrapper bodies themselves.
 last settlement debts the deletion exposed — the declined Yield's frame authority
 (U9-TERMINAL-SETTLEMENT), the switch-plan hand-off and the relocated oracle (this section) — are
 discharged. No further unlock package follows from this programme.
+
+---
+
+# POST-U9-STABILIZATION — the four recorded failures, and the hardware bring-up reference
+
+Base: `93900ae050aa67c57bd088dda41f43dce6a6c0a9` (main, U9 closed). One bounded package: the four
+failures carried out of U9, and nothing else. The broad-lock position is unchanged: `with_cpu` 0,
+`with_broad` 0, and the three raw `state.lock()` sites are the wrapper bodies, reported separately.
+Every cause below was reproduced on fresh base artifacts before any code changed. The qualification
+results are recorded with the delivery report, not in this tree, so that the reference tree is the
+exact tree that was qualified.
+
+## 1 — the server-death contract tests (`server_dies_runner_scope`, 8/2 → 10/10)
+
+**Cause: a stale checker, not a runtime defect.** U9-EXIT1 moved the dying server's NR 16 off both
+terminal dispatchers. The live runner (`scripts/lib/serverdies-runner-common.sh`) was re-derived at
+the time: it grades the split exit owners' own markers, `EXIT_TASK_SPLIT_ENTER` and
+`EXIT_TASK_CLAIM_RETIRED … server_death=1`. It also asserts directly the two facts the old marker
+implied: `EXIT_TASK_BROAD_ENTER` counts zero, and the retired claim attests the server-death
+handoff. The two source-contract tests still required `EXIT_TASK_DISPOSITION_CONSUMED`, which only
+the in-lock consumer emits, so they failed against a runner that was correct.
+
+**Repair.** The tests now require the split owners' markers, scoped to the witnessed server
+`{tid, asid}`, and check each literal against the production format string that emits it
+(`syscall_split.rs`, `exit_txn.rs`, `syscall.rs`). They pin the causal order: entry edge,
+server-death reservation and publication, retired claim, post-lock drain, one PeerDeath winner,
+one caller wake, userspace `ServerDied` validation, then survivor progress. The obsolete marker
+must not be required anywhere in the chain. Record generation, caller identity, exactly-one-wake,
+exactly-one-winner and the transition audit are unchanged. Both mutations are rejected: requiring
+the obsolete marker again, and a production owner dropping `server_death=`.
+
+**Live witness.** The x86_64 runner is the supported live cell, and it passes on the base
+(`live_cells=1 caller_wakes=1 peer_death_winners=1 exit_returns=0 result=ok`).
+
+**Finding, not fixed (harness boundary).** The AArch64 and RISC-V server-death runners are recorded
+as prepare-only and have never been live cells. Run at base, both boots stop at
+`BOOT_FATAL_INITRAMFS_MISSING`: the runner's QEMU invocation supplies no initramfs, so the scenario
+never starts. Making them live is runner work, not a server-death defect.
+
+## 2 — `IPC_DIRECT_PRODUCTION_DISABLED_SEAL`
+
+**Cause: an inapplicable seal emitted unconditionally.** The seal attests the DISABLED-production
+contract: with the production default off, no ordinary NR 6/NR 7 completed on the direct path.
+`ipccall_direct_production_enabled()` is now a compile-time `true` on all three ports, so the seal
+read `result=fail` on every boot for the supported configuration.
+
+**Repair.** A pure `disabled_seal_verdict(production_enabled, nr6, nr7)` decides applicability:
+`NotApplicable` when production is enabled, `Clean` or `Violated` when it is disabled. In enabled
+mode the seal is skipped with `IPC_DIRECT_PRODUCTION_DISABLED_SEAL_SKIPPED reason=production_enabled`,
+which still reports the counters, and the enabled-mode checks stay where they were, in the
+QUIESCENT seal. The disabled-mode text and contract are unchanged. The behavioral test requires that
+a disabled boot with any ordinary direct completion, in either direction, is still `Violated`.
+
+## 3A — the intermittent `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL`
+
+**Reproduced:** 1 failing run in 6 fresh RISC-V core boots. The first false predicate is NR 6's
+`fuses_clear`. A new `IPC_DIRECT_PRODUCTION_ACK_FUSES` line names the fuse: `duplicate_consume=1`.
+Every bijection, no-orphan, census and counter-balance check stays exact.
+
+**The transaction.** A client's NR 6 probed endpoint 10 while that endpoint's server was still
+handling the previous request, so its lease was Consumed and not yet re-published. The route took
+its buffered lane, as it should (`IPCCALL_QUEUED_SPLIT_OK tid=3 endpoint=10`). But
+`DirectAckStore::consume` counted the probe as a second consumption of the spent lease.
+
+**Classification: incorrect accounting.** It is not a leak and not a timing artefact of the
+attestation. Both production consumers are endpoint-keyed probes that name no publication, and a
+spent slot answers "no live lease", which is the ordinary between-requests state. The release edge
+already treats the mirror case (`release` after `consume`) as expected and benign, with its own
+counter.
+
+**Repair, in the owner.** A probe (`expect_waiter == None`) that finds a spent slot, Consumed or
+Released, returns `AckConsume::Spent` and increments `spent_probes`, reported but not a fuse. What
+remains a fuse is unchanged: an entitled consumer (`Some(waiter)`) finding its lease spent, a lost
+compare-exchange on a committed pair, and every other rejection. The released-slot probe was the
+same misclassification, under `crossed_terminal`, and is fixed with it.
+`a_probe_of_a_spent_lease_is_not_a_fuse` fails when only the reclassification is reverted
+(checked). `an_entitled_second_consume_is_still_a_fuse` shows the corrected checker still fails
+the quiescent verdict on a genuine duplicate.
+
+## 3B — the ordinary-cap seal's `x86_64 class=IpcSendOrdinaryCap` cell: an unrelated-subsystem BOUNDARY
+
+**Reproduced** on fresh base artifacts: `live_cells=5 result=fail`, with the missing cell
+`arch=x86_64 class=IpcSendOrdinaryCap`. AArch64 and RISC-V pass both classes, and x86_64 passes
+the enqueue class.
+
+**First failing predicate — not in IPC.** The x86_64 capdirect boot never reaches the ordinary-cap
+transaction: no `IPC_SEND_CAP_BOUNDARY_*` marker is emitted. Init forks
+(`FORK_TXN_COMMITTED parent_tid=1 child_tid=10000`). Its next write, to its own now-COW stack at
+`0x7fffffbff000`, fails: `VM_COW_SPLIT_FAILED_CLOSED … reason=remap`, and a diagnostic run gives the
+error as `Vm(Full)`. The COW private copy must split init's multi-page stack run, which needs one
+more mapping-run slot, and init's address space already sits at `MAX_MAPPINGS` (128/128 runs) on
+this provisioned oracle profile, as `init/service.rs` documents. The fault fails closed, the boot
+stalls, and the oracle never runs.
+
+**Boundary.** Neither delivery, authority, lifetime, wake nor classification is at fault. The cell
+is blocked by per-address-space mapping capacity, which this package excludes. No IPC code was
+changed for it, and it is not claimed fixed. It needs a VM mapping-capacity change: splitting a run
+without a free slot, a larger or dynamic run table, or a smaller init footprint on this profile.
+
+## Unrelated findings, recorded and not fixed
+
+* `IPC_SERVER_DEATH_BROAD_LOCK_RELEASED … holder=with_cpu`: no `with_cpu` exists any more. The
+  runner matches only the marker prefix, so nothing grades the stale field.
+* The AArch64 and RISC-V server-death runners boot with no initramfs (§1).

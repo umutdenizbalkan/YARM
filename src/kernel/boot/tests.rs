@@ -109418,11 +109418,91 @@ mod stage199d_ack_lease_lifecycle {
 
         assert!(store.release(e, waiter).released_seq().is_some());
         assert_eq!(store.consume(e, Some(waiter)), AckConsume::AlreadyReleased);
-        // The identity-blind consumer is refused too — a released lease is gone for everyone.
-        assert_eq!(store.consume(e, None), AckConsume::AlreadyReleased);
+        // The identity-blind PROBE is refused too — a released lease is gone for everyone —
+        // but it is not a crossed terminal: it named no lease, it asked whether one is live.
+        // POST-U9-STABILIZATION §3A reclassified it; see `a_probe_of_a_spent_lease_is_not_a_fuse`.
+        assert_eq!(store.consume(e, None), AckConsume::Spent);
         assert_eq!(store.consume_count(), 0, "nothing was handed out");
-        assert_eq!(store.crossed_terminal_rejection_count(), 2);
+        assert_eq!(
+            store.crossed_terminal_rejection_count(),
+            1,
+            "the entitled consumer's"
+        );
+        assert_eq!(store.spent_probe_count(), 1);
         assert_eq!(store.release_count(), 1);
+    }
+
+    /// POST-U9-STABILIZATION §3A — **the intermittent quiescent-seal failure, at the store.**
+    ///
+    /// Live RISC-V (1 run in 6 on the base tree): a client's NR 6 probed endpoint 10 while its
+    /// server was still handling the previous request, so the endpoint's lease was CONSUMED
+    /// and not yet re-published. The route correctly took the buffered lane
+    /// (`IPCCALL_QUEUED_SPLIT_OK tid=3 endpoint=10`), but the probe was counted as a
+    /// `duplicate_consume`, `fuses_clear` went to 0 and `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL`
+    /// read `nr6_ok=0` — with every bijection, no-orphan and census check exact.
+    ///
+    /// On the base tree this test fails at the first probe assertion (`AlreadyConsumed`).
+    #[test]
+    fn a_probe_of_a_spent_lease_is_not_a_fuse() {
+        use crate::kernel::direct_ipc_counters::{DirectPathCounters, quiescent_verdict};
+        let (e, waiter) = (ep(10, 1), w(3, 3));
+        let store = store_with_pair(e, waiter);
+        // The first request is delivered directly: the lease is consumed.
+        assert!(store.consume(e, None).ok().is_some());
+        // A second client probes before the server has re-published.
+        assert_eq!(
+            store.consume(e, None),
+            AckConsume::Spent,
+            "between requests"
+        );
+        assert_eq!(store.duplicate_consume_rejection_count(), 0);
+        assert_eq!(store.spent_probe_count(), 1);
+        // The server re-blocks: its new lease is claimable exactly once.
+        let r = store.reserve(e, waiter).expect("re-reserve the spent slot");
+        store
+            .commit(
+                r,
+                AckFields {
+                    endpoint: e,
+                    waiter,
+                    payload_user_ptr: 0x9000,
+                    payload_user_len: 64,
+                    meta_user_ptr: 0x9100,
+                    meta_user_len: 40,
+                },
+            )
+            .expect("commit");
+        assert!(
+            store.consume(e, None).ok().is_some(),
+            "the new lease is delivered"
+        );
+        let counters = DirectPathCounters::new();
+        assert!(
+            quiescent_verdict(&counters, &store).fuses_clear,
+            "a between-requests probe must not trip a fuse"
+        );
+    }
+
+    /// And the corrected checker still REJECTS what the fuses exist for: an entitled consumer
+    /// finding its own lease already consumed is a genuine second resolution of one lease.
+    #[test]
+    fn an_entitled_second_consume_is_still_a_fuse() {
+        use crate::kernel::direct_ipc_counters::{DirectPathCounters, quiescent_verdict};
+        let (e, waiter) = (ep(10, 1), w(3, 3));
+        let store = store_with_pair(e, waiter);
+        assert!(store.consume(e, Some(waiter)).ok().is_some());
+        assert_eq!(
+            store.consume(e, Some(waiter)),
+            AckConsume::AlreadyConsumed,
+            "the entitled duplicate is refused"
+        );
+        assert_eq!(store.duplicate_consume_rejection_count(), 1);
+        assert_eq!(store.spent_probe_count(), 0, "and not reclassified");
+        let counters = DirectPathCounters::new();
+        assert!(
+            !quiescent_verdict(&counters, &store).fuses_clear,
+            "the quiescent verdict still fails on a genuine duplicate"
+        );
     }
 
     /// Whichever edge wins, exactly one of them mutates — never both, never neither.
@@ -109748,7 +109828,11 @@ mod stage199d_ack_lease_lifecycle {
         let store = ipccall_direct_ack::store();
         assert_eq!(store.release_count(), 1);
         assert_eq!(store.consume_count(), 0);
-        assert_eq!(store.crossed_terminal_rejection_count(), 1);
+        // POST-U9-STABILIZATION §3A: the production claim is an endpoint-keyed PROBE, so a
+        // released lease answers `Spent` — refused, counted as a probe, and not a crossed
+        // terminal, since no lease was resolved twice.
+        assert_eq!(store.crossed_terminal_rejection_count(), 0);
+        assert_eq!(store.spent_probe_count(), 1);
         assert_eq!(store.live_pair_count(), 0);
         teardown();
     }
@@ -120285,6 +120369,37 @@ mod stage199d_wa1_gate {
             ),
             "the pre-existing quiescent seal is untouched"
         );
+        // POST-U9-STABILIZATION §2: the disabled seal's applicability follows the production
+        // predicate through ONE verdict, and its absence in enabled mode is marked, not silent.
+        assert!(
+            COUNTERS.contains(
+                "match disabled_seal_verdict(production_enabled, ordinary_nr6, ordinary_nr7) {"
+            ) && COUNTERS
+                .contains("IPC_DIRECT_PRODUCTION_DISABLED_SEAL_SKIPPED reason=production_enabled"),
+            "the disabled seal is emitted only where it applies"
+        );
+    }
+
+    /// POST-U9-STABILIZATION §2 — the disabled seal's verdict, behaviorally.
+    ///
+    /// On the defective base the seal's verdict was `!production_enabled && nr6 == 0 && nr7 == 0`
+    /// evaluated unconditionally, so a supported enabled-mode boot read `fail`. The corrected
+    /// checker must still REJECT the outcome the seal exists for: the production default
+    /// disabled, and an ordinary transaction completed directly anyway.
+    #[test]
+    fn the_disabled_seal_applies_only_in_disabled_mode_and_still_rejects_a_leak() {
+        use crate::kernel::direct_ipc_counters::{DisabledSealVerdict as V, disabled_seal_verdict};
+        // Enabled: not this seal's question, whatever the traffic.
+        assert_eq!(disabled_seal_verdict(true, 0, 0), V::NotApplicable);
+        assert_eq!(disabled_seal_verdict(true, 54, 53), V::NotApplicable);
+        // Disabled and clean.
+        assert_eq!(disabled_seal_verdict(false, 0, 0), V::Clean);
+        // Disabled, and an ordinary direct completion in EITHER direction is a violation.
+        assert_eq!(disabled_seal_verdict(false, 1, 0), V::Violated);
+        assert_eq!(disabled_seal_verdict(false, 0, 1), V::Violated);
+        assert_eq!(disabled_seal_verdict(false, 54, 53), V::Violated);
+        // Every supported port is in enabled mode, which is why the live boots skip it.
+        assert!(crate::kernel::boot::ipccall_direct_production_enabled());
     }
 
     // ── Stale-prose guards (WA1-GATE-DOC-SEAL) ──────────────────────────────────────────────
