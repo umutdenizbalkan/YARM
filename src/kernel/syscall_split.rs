@@ -2413,6 +2413,63 @@ fn try_split_ipc_send_into_frame(
     try_split_ipc_send_recognized(shared, cpu, frame).into_dispatch()
 }
 
+/// U9-TERMINAL-FINAL §5b — WHICH enqueue class a message belongs to, decided exactly as the
+/// broad enqueue boundary decides it.
+///
+/// The broad path spreads this over two functions: `ipc_try_send_enqueue_boundary_split_plain`
+/// screens for PLAIN and hands everything else to
+/// `ipc_try_send_enqueue_boundary_split_ordinary_cap`, which screens for ORDINARY and hands
+/// everything else to the unchanged Stage 4E enqueue with no class markers. Both screens are
+/// reproduced here, predicate for predicate, because the split route performs ONE enqueue and
+/// therefore needs the answer before it, not a second pair of wrappers around it.
+///
+/// The `Neither` arm is not a leftover: reply-cap, shared-region and Reply-object transfers are
+/// deliberately unretired by either boundary, and a class marker on them would claim a
+/// retirement that was never made.
+#[cfg(not(feature = "hosted-dev"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitEnqueueClass {
+    /// No cap-transfer flag, no reply-cap flag, no transferred cap — the Stage 193E slice.
+    Plain,
+    /// A cap-transfer flag, NOT a reply-cap flag, exactly one transferred cap, NOT a
+    /// shared-region opcode, and the transferred OBJECT is not a `Reply` — the Stage 193F slice.
+    OrdinaryCap,
+    /// Reply-cap / shared-region / Reply-object: enqueued, but retired by neither class.
+    Neither,
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+fn split_enqueue_retirement_class(
+    shared: &SharedKernel,
+    msg: &crate::kernel::ipc::Message,
+) -> SplitEnqueueClass {
+    use crate::kernel::ipc::Message;
+    let is_reply_flag = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
+    let is_transfer =
+        (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0;
+    let handle = msg.transferred_cap();
+    // The PLAIN screen, from `ipc_try_send_enqueue_boundary_split_plain`.
+    if !is_transfer && !is_reply_flag && handle.is_none() {
+        return SplitEnqueueClass::Plain;
+    }
+    // The ORDINARY screen, from `ipc_try_send_enqueue_boundary_split_ordinary_cap`. The
+    // Reply-object test composes the EXISTING rank-3 split read rather than reproducing it, so
+    // the generation guard is the broad path's own.
+    let is_shared = msg.opcode == crate::kernel::syscall::OPCODE_SHARED_MEM;
+    let is_reply_object = match handle {
+        Some(h) => matches!(
+            shared.peek_transfer_envelope_source_object_split(h.0),
+            Some(crate::kernel::capabilities::CapObject::Reply { .. })
+        ),
+        None => false,
+    };
+    if is_transfer && !is_reply_flag && !is_shared && handle.is_some() && !is_reply_object {
+        SplitEnqueueClass::OrdinaryCap
+    } else {
+        SplitEnqueueClass::Neither
+    }
+}
+
 /// U9-SEND-FINAL §1 — a RECOGNIZED NR 1, settled pre-lock in every reachable outcome.
 ///
 /// The two admission escapes this used to answer `NotHandled` from are now settled with the
@@ -2915,16 +2972,55 @@ fn try_split_ipc_send_recognized(
     // reads this family. The wrapper is not called — the directive names the authoritative
     // unconditional enqueue as the final enqueue policy, and the wrapper wraps the conservative
     // Stage-4E screen — so the markers come from the route, unchanged in name and meaning.
-    crate::yarm_log!(
-        "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN endpoint={} len={}",
-        endpoint_idx,
-        msg.as_slice().len()
-    );
-    // Phase A: the payload/meta are snapshotted by value — no user copy, no materialization.
-    crate::yarm_log!(
-        "IPC_SEND_ENQUEUE_BOUNDARY_SNAPSHOT_OK endpoint={}",
-        endpoint_idx
-    );
+    //
+    // U9-TERMINAL-FINAL §5b — WHICH family, though, is a question this site used to skip.
+    //
+    // It emitted the PLAIN family for every successful enqueue, cap-carrying or not, and
+    // retired the plain class with it. The broad boundary it reproduces does not:
+    // `ipc_try_send_enqueue_boundary_split_plain` screens the message first and hands a
+    // cap-carrying one to `..._ordinary_cap`, which emits a DIFFERENT marker family
+    // (`IPC_SEND_CAP_ENQUEUE_BOUNDARY_*`) and retires a different class.
+    //
+    // That was already wrong before this pass — a cap-carrying enqueue reported itself as the
+    // plain class — and §5 is what made it consequential. The plain class's retirement marker
+    // had been relocated onto this route; the ordinary-cap ENQUEUE class's had not, so its only
+    // producer stayed behind the broad `handle_ipc_send`. Deleting the terminal acquisitions
+    // left that producer with no caller, and the linker stripped it: the marker is present in
+    // the base kernel binary and absent after. Its class is the last one whose retirement was
+    // never moved to the owner that performs the operation.
+    //
+    // The screen below is the broad boundary's own, predicate for predicate, and it composes
+    // the existing rank-3 `peek_transfer_envelope_source_object_split` for the Reply-object
+    // test rather than reproducing that read.
+    let enqueue_class = split_enqueue_retirement_class(shared, &msg);
+    match enqueue_class {
+        SplitEnqueueClass::OrdinaryCap => {
+            crate::yarm_log!(
+                "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_BEGIN endpoint={} len={}",
+                endpoint_idx,
+                msg.as_slice().len()
+            );
+            // Phase A: the payload/meta + the numeric envelope handle are snapshotted by value
+            // — no user copy, no cap materialization.
+            crate::yarm_log!(
+                "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SNAPSHOT_OK endpoint={}",
+                endpoint_idx
+            );
+        }
+        SplitEnqueueClass::Plain | SplitEnqueueClass::Neither => {
+            crate::yarm_log!(
+                "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN endpoint={} len={}",
+                endpoint_idx,
+                msg.as_slice().len()
+            );
+            // Phase A: the payload/meta are snapshotted by value — no user copy, no
+            // materialization.
+            crate::yarm_log!(
+                "IPC_SEND_ENQUEUE_BOUNDARY_SNAPSHOT_OK endpoint={}",
+                endpoint_idx
+            );
+        }
+    }
     match shared.ipc_endpoint_enqueue_authoritative_split(endpoint_idx, msg) {
         Err(_) => {
             settle_ipc_send_envelope(
@@ -2944,15 +3040,55 @@ fn try_split_ipc_send_recognized(
             );
             // Sender state matches legacy: a send that enqueues does NOT block the sender and
             // is NOT published as a sender-waiter — it returns Ok and continues.
-            crate::yarm_log!(
-                "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK endpoint={} sender_blocked=0",
-                endpoint_idx
-            );
-            crate::yarm_log!(
-                "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok endpoint={}",
-                endpoint_idx
-            );
-            crate::kernel::boot::maybe_log_ipc_send_plain_enqueue_retired();
+            //
+            // U9-TERMINAL-FINAL §5b: per class, exactly as the broad boundary emits it. The
+            // ordinary-cap arm additionally attests the TRANSFER state, because that is the one
+            // fact its class has and the plain class does not: the envelope stays in the
+            // envelope table and no cap is materialized at enqueue — the receiver's later
+            // recv-v2 consumes it and mints a fresh receiver-local cap.
+            match enqueue_class {
+                SplitEnqueueClass::OrdinaryCap => {
+                    crate::yarm_log!(
+                        "IPC_SEND_CAP_ENQUEUE_BOUNDARY_TRANSFER_STATE_OK endpoint={} \
+                         envelope=preserved",
+                        endpoint_idx
+                    );
+                    crate::yarm_log!(
+                        "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SENDER_STATE_OK endpoint={} \
+                         sender_blocked=0",
+                        endpoint_idx
+                    );
+                    crate::yarm_log!(
+                        "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok endpoint={}",
+                        endpoint_idx
+                    );
+                    crate::kernel::boot::maybe_log_ipc_send_ordinary_cap_enqueue_retired();
+                }
+                SplitEnqueueClass::Plain => {
+                    crate::yarm_log!(
+                        "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK endpoint={} sender_blocked=0",
+                        endpoint_idx
+                    );
+                    crate::yarm_log!(
+                        "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok endpoint={}",
+                        endpoint_idx
+                    );
+                    crate::kernel::boot::maybe_log_ipc_send_plain_enqueue_retired();
+                }
+                // Reply-cap, shared-region and Reply-object transfers are NOT retired by either
+                // boundary — the broad path hands them to the unchanged Stage 4E enqueue with no
+                // class markers at all. The enqueue still happened; no class claims it.
+                SplitEnqueueClass::Neither => {
+                    crate::yarm_log!(
+                        "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK endpoint={} sender_blocked=0",
+                        endpoint_idx
+                    );
+                    crate::yarm_log!(
+                        "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok endpoint={}",
+                        endpoint_idx
+                    );
+                }
+            }
             // Wake any legacy waiter through the one shared owner, then finish.
             let _ = shared.wake_waiter_for_endpoint_split(cpu, endpoint_idx);
             complete_ok(frame);

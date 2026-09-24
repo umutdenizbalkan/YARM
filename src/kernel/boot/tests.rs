@@ -190042,3 +190042,181 @@ mod u9terminalfinal_mutation {
         );
     }
 }
+
+/// U9-TERMINAL-FINAL §5b — **the enqueue class, and the last retirement marker that had no
+/// owner on the path performing the operation.**
+///
+/// §5 deleted the terminal acquisitions, which left `KernelState::handle_trap` with no
+/// production caller and let the linker strip the whole broad syscall dispatcher. That was the
+/// intended end state for every class whose retirement marker had already been relocated onto
+/// its split owner — which was all of them but one.
+/// `maybe_log_ipc_send_ordinary_cap_enqueue_retired` still had exactly one caller, the broad
+/// enqueue boundary, so `class=IpcSendOrdinaryCapEnqueue` is present in the base kernel binary
+/// and absent after the deletion.
+///
+/// The underlying defect predates §5 and is what made the relocation easy to miss: the split
+/// route emitted the PLAIN family for EVERY successful enqueue, cap-carrying or not, so a
+/// cap-carrying enqueue reported itself as the plain class and the ordinary-cap class simply
+/// had no producer on the route that performs it.
+#[cfg(test)]
+mod u9terminalfinal_enqueue_class {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+
+    fn fn_body<'a>(src: &'a str, head: &str) -> &'a str {
+        let at = src.split(head).nth(1).unwrap_or_else(|| panic!("{head}"));
+        let end = at.find("\n}\n").unwrap_or(at.len());
+        &at[..end]
+    }
+
+    /// Every retirement class emitted at an enqueue has a producer on the route that performs
+    /// the enqueue — not only on the broad boundary, which no production trap now reaches.
+    #[test]
+    fn both_enqueue_classes_are_retired_by_the_route_that_enqueues() {
+        for emitter in [
+            "maybe_log_ipc_send_plain_enqueue_retired()",
+            "maybe_log_ipc_send_ordinary_cap_enqueue_retired()",
+        ] {
+            assert!(
+                SPLIT.contains(emitter),
+                "the split enqueue arm must retire its class: `{emitter}` — the broad boundary \
+                 is unreachable, so a marker emitted only there is emitted nowhere"
+            );
+        }
+        // Exactly once each, on the one arm that performs the enqueue.
+        for emitter in [
+            "maybe_log_ipc_send_plain_enqueue_retired()",
+            "maybe_log_ipc_send_ordinary_cap_enqueue_retired()",
+        ] {
+            assert_eq!(
+                SPLIT.matches(emitter).count(),
+                1,
+                "one producer per class on the route: `{emitter}`"
+            );
+        }
+        // The broad boundary keeps its own emissions — it is not deleted, only unreachable from
+        // a trap, and the raw/test entry points still drive it.
+        assert!(
+            IPC_STATE.contains("maybe_log_ipc_send_ordinary_cap_enqueue_retired();")
+                && IPC_STATE.contains("maybe_log_ipc_send_plain_enqueue_retired();"),
+            "the broad boundary is not rewritten by this repair"
+        );
+        assert!(
+            MOD_SRC.contains("fn maybe_log_ipc_send_ordinary_cap_enqueue_retired()"),
+            "and the one-shot emitter itself is unchanged"
+        );
+    }
+
+    /// The split classifier is the broad boundary's own screen, term for term.
+    ///
+    /// A second, drifting copy of a class predicate is the failure this tree keeps retiring, so
+    /// the terms are compared rather than trusted: the PLAIN screen from
+    /// `ipc_try_send_enqueue_boundary_split_plain` and the ORDINARY screen from
+    /// `ipc_try_send_enqueue_boundary_split_ordinary_cap`.
+    #[test]
+    fn the_split_classifier_carries_every_term_the_broad_screens_carry() {
+        let split = fn_body(SPLIT, "fn split_enqueue_retirement_class(");
+        let broad_plain = fn_body(IPC_STATE, "fn ipc_try_send_enqueue_boundary_split_plain(");
+        let broad_ordinary = fn_body(
+            IPC_STATE,
+            "fn ipc_try_send_enqueue_boundary_split_ordinary_cap(",
+        );
+
+        for term in [
+            "Message::FLAG_REPLY_CAP",
+            "Message::FLAG_CAP_TRANSFER",
+            "Message::FLAG_CAP_TRANSFER_PLAIN",
+            "msg.transferred_cap()",
+        ] {
+            assert!(
+                split.contains(term),
+                "the split classifier must carry `{term}`"
+            );
+            assert!(
+                broad_plain.contains(term) || broad_ordinary.contains(term),
+                "…and it must be a term one of the broad screens actually uses: `{term}`"
+            );
+        }
+        // The two terms that belong only to the ORDINARY screen.
+        for term in ["OPCODE_SHARED_MEM", "CapObject::Reply"] {
+            assert!(
+                split.contains(term) && broad_ordinary.contains(term),
+                "the ordinary screen's `{term}` must be reproduced, not dropped"
+            );
+        }
+        // The Reply-object test COMPOSES the existing rank-3 split read rather than opening a
+        // second envelope reader.
+        assert!(
+            split.contains("peek_transfer_envelope_source_object_split("),
+            "the Reply-object test must compose the existing split read"
+        );
+        assert!(
+            !split.contains("with_ipc_split_mut") && !split.contains("transfer_envelopes["),
+            "and must not reproduce the envelope read or its generation guard"
+        );
+    }
+
+    /// The three classes stay distinct at the emission site, and `Neither` retires nothing.
+    ///
+    /// Reply-cap, shared-region and Reply-object transfers are deliberately unretired by either
+    /// boundary — the broad path hands them to the unchanged Stage 4E enqueue with no class
+    /// markers — so a marker on them would claim a retirement that was never made.
+    #[test]
+    fn the_unretired_class_claims_no_retirement() {
+        let route = fn_body(SPLIT, "fn try_split_ipc_send_recognized(");
+        // The LAST occurrence: the name also appears in the prologue's combined
+        // `Plain | Neither` arm, whose body is the BEGIN/SNAPSHOT pair and is indented one
+        // level less — anchoring on the first would slice past this arm's close and read the
+        // retirement arms that follow it.
+        let neither = route
+            .rsplit("SplitEnqueueClass::Neither => {")
+            .next()
+            .and_then(|s| s.split("\n                }").next())
+            .expect("the Neither arm at the emission site");
+        assert!(
+            !neither.contains("maybe_log_ipc_send"),
+            "the unretired class must emit no retirement marker"
+        );
+        assert!(
+            !neither.contains("CAP_ENQUEUE_BOUNDARY"),
+            "…and must not borrow the ordinary-cap family's markers either"
+        );
+        // It still attests that the enqueue happened, so the class is silent, not the enqueue.
+        assert!(
+            neither.contains("IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok"),
+            "the enqueue itself is still reported"
+        );
+        // And the three arms are genuinely three.
+        for arm in [
+            "SplitEnqueueClass::OrdinaryCap => {",
+            "SplitEnqueueClass::Plain => {",
+            "SplitEnqueueClass::Neither => {",
+        ] {
+            assert!(route.contains(arm), "the emission site must name `{arm}`");
+        }
+    }
+
+    /// The ordinary-cap arm carries the one fact its class has and the plain class does not.
+    #[test]
+    fn the_ordinary_cap_arm_attests_the_preserved_envelope() {
+        let route = fn_body(SPLIT, "fn try_split_ipc_send_recognized(");
+        for marker in [
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_TRANSFER_STATE_OK",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SENDER_STATE_OK",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_DONE",
+        ] {
+            assert!(
+                route.contains(marker) && IPC_STATE.contains(marker),
+                "the route must emit the broad boundary's own marker `{marker}`, not a new one"
+            );
+        }
+        // `envelope=preserved` is the transfer-state claim: nothing is materialized at enqueue.
+        assert!(
+            route.contains("envelope=preserved"),
+            "the transfer-state attestation must say what it attests"
+        );
+    }
+}
