@@ -22207,3 +22207,121 @@ otherwise.
 class=IpcSendOrdinaryCap` cell (U9-TERMINAL-FINAL §5b); the RISC-V foundation-oracle user-return
 failure (§5c, corrected above); the `server_dies_runner_scope` carve-out; the
 `switch_owned_elsewhere` residual (§2 of this section).
+
+---
+
+# U9-CLOSURE-ACCEPTANCE — the last hand-off, the relocated oracle, and closure
+
+Base `f403a8d6`. Code commit `456d067e`; every live result below is from fresh artifacts built
+from it. A run is graded by its `[fail]`/`[err]` checks as well as its exit status, with
+`QEMU_SMOKE_STRICT=1` set on every smoke.
+
+## Acceptance result 1 — `switch_owned_elsewhere`: UNREACHABLE, proof pinned, claim corrected
+
+**Its consumers.** The arm makes the declined Yield's caller `Runnable`, leaves it current and
+unqueued, and answers `QueueAdvanceCommitted`. U9-TERMINAL-FINAL said the incumbent's drain
+"performs the one dispatch". That is false. Every Yield-colliding drain (Yield, FutexWait, and the
+RISC-V 196D foundation drain) first checks that `current` is cleared. If it is not, the drain clears
+its cell and dispatches nothing: `YIELD_DISPATCH_DEFERRED reason=state_changed` and its siblings.
+The switch-plan drain switches away from whoever was current when the plan was published. So
+reaching the arm leaves a `Runnable` task in the current slot that nothing will ever settle.
+`u9closure_switch_owned_elsewhere::the_incumbent_drain_does_not_switch_for_this_branch` runs the
+production settlement and then the Yield drain's own consumer decision, and asserts that final
+state: status `Runnable`, placement `Current`, the continuation not captured, the cell consumed,
+and the queued task never dispatched.
+
+**Its producers.** The arm is reachable only if a colliding cell is pending when a Yield trap's
+split route runs. One route runs per trap, and the Yield route reads the cells before it arms
+anything, so such a cell would have to be left over from an earlier trap:
+
+| cell | production producer | consumed |
+|---|---|---|
+| Yield | `SharedYieldOwners` (NR 0, preempting tick) | the same trap's Yield drain, every branch clears |
+| FutexWait | the split FutexWait routes; NR 16's exit owner | the same trap's FutexWait drain, every branch clears |
+| RISC-V 196D foundation | `KernelState::yield_current` only | unreachable: `&mut KernelState`, no broad acquisition exists |
+| Yield / FutexWait, broad | `BroadYieldOwners`, `futex_wait_current` | unreachable, same reason |
+| switch-plan stash | `maybe_switch_kernel_context` (broad, unreachable); `queue_advance_commit_split` (no production caller); **the D6 hook** (x86_64, default-off, single-CPU) | `drain_switch_plan_stash`, end of the same trap |
+
+**The one leak, closed.** The D6 hook must publish while the trap-path window is open, which is
+before the post-work drain. On all three live D6 boots it fires on exactly such a trap: tid 1, with
+post-work pending. The blocking send's `ImmediateReturn` then returned before
+`drain_switch_plan_stash`, so a plan published there outlived its trap, and the next Yield on that
+CPU would reach the arm. With a plan reserved, `ImmediateReturn` now falls through to the existing
+stash drain (`U6_BLOCKING_SEND_IMMEDIATE_RETURN_SWITCH_OWNED … settlement=switch_plan_drain`). No
+deferral is armed on that path, so every other drain is a no-op, and the frame already carries its
+error. The live boots did not produce this shape (the marker count is 0 on every run), so the
+closure rests on the source proof, not on a live arrival.
+
+`every_colliding_cell_producer_is_accounted_for` pins the table: every producer site in production
+source, by file and enclosing function. It requires the broad producers to stay `&mut self`,
+`queue_advance_commit_split` to have no caller, and the `ImmediateReturn` early return to be
+conditional on no plan being reserved. It fails when that fix is reverted (checked). The in-code
+comment on the arm now carries the proof in place of the claim.
+
+## Acceptance result 2 — the foundation-oracle relocation: a REGRESSION, found and repaired
+
+| tree | built | `QEMU_SMOKE_STRICT=1` | oracle chain |
+|---|---|---|---|
+| `e44c9b7b` (the real base) | fresh | **exit 0, 0 fail** | `PUBLISH_OK tid=3 → DRAIN_OK tid=3 → USER_RETURN_OK tid=3 → DONE result=ok`, on PM's NR 8 in the broad fall-through |
+| `f403a8d6` | fresh | **exit 1, 3 checks failed** | `PUBLISH_OK tid=0 → DONE result=task_switched current=None` |
+| `456d067e` (this pass) | fresh, 3 runs | **exit 0, 0 fail**, every run | `PUBLISH_OK tid=2 → DRAIN_OK tid=2 → USER_RETURN_OK tid=2 → DONE result=ok` |
+
+**First divergence.** At `e44c9b7b` the publish sat inside the broad `with_cpu` closure, which ran
+only for a syscall trap that no split route had committed. The oracle's one-shot therefore always
+fired on a trap that returned to its caller. U9-TERMINAL-FINAL §3 moved the publish below the split
+dispatch unconditionally, and §3 also made NR 8 a split class. The first trap to reach the moved
+publish became an NR 5 blocking receive that had already committed a queue advance and cleared
+`current`. It published `unwrap_or(0)` of an empty slot, a tid that never entered, and the drain
+reported `task_switched`. U9-TERMINAL-SETTLEMENT called this pre-existing on the strength of a
+baseline taken after the relocation; that finding is withdrawn above.
+
+**Repair, at the placement.** The entering identity is captured before the split dispatch. It is
+published only on the two dispositions that return to that task: a split `Complete(_)`, which
+publishes and drains before `sret`, and the non-committed fall-through. A committed trap publishes
+nothing and the one-shot stays armed, exactly as those traps never reached the closure. An empty
+slot publishes nothing at all. The contract (publish → drain → same-task return), the token, the
++1 bias and every marker are unchanged, and `task_switched` is still a failure.
+`the_riscv_foundation_oracle_publishes_only_for_a_returning_trap` replaces the guard that pinned
+the old site, and fails against the unrepaired bridge (checked).
+
+What qualifies the moved hook is the strict profile above, run three times on fresh artifacts.
+
+## Qualification on frozen artifacts (`456d067e`)
+
+| run | exit | checks | notes |
+|---|---|---|---|
+| x86_64 core, knob-off | 0 | 51 ok / 0 fail / 0 err | |
+| x86_64 core, `D6_SWITCH_PROOF=1` | 0 | 57 ok / 0 fail | `D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE` |
+| x86_64 core, `D6_SWITCH_A=1` | 0 | 55 ok / 0 fail | `D6_SWITCH_A_DONE` |
+| x86_64 core, both knobs | 0 | 57 ok / 0 fail | cleanup done |
+| AArch64 core | 0 | 21 ok / 0 fail | |
+| RISC-V core | 0 | 0 fail | |
+| RISC-V `POST_LOCK_FOUNDATION_ORACLE=1` ×3 | 0 | 0 fail, each | `DONE result=ok` each |
+| x86_64 AP saved-return / generic-return / recv-v2-block | 0 | seal `result=ok` each | |
+
+`TRAP_UNOWNED`, `unowned_entering_frame`, `DISPATCH_TORN_FATAL` and `switch_owned_elsewhere` are
+absent from every run.
+
+Two kernel-emitted lines that no core smoke grades read `result=fail`:
+`IPC_DIRECT_PRODUCTION_DISABLED_SEAL` on every port, and `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL`
+on some RISC-V boots, with `nr6_ok` varying run to run. Both appear with identical values on the
+fresh `e44c9b7b` and `f403a8d6` builds, so this pass neither caused nor changed them. They belong
+to the IPC-direct witnesses, which grade them, and they are outside this package.
+
+* **Hosted:** 5851 passed, 0 failed, 2 ignored.
+* **Census guard:** 9/9. `with_cpu` 0, `with_broad` 0; three wrapper bodies, reported separately.
+* **Builds:** x86_64-none, aarch64-none and riscv64 are clean; this pass introduces no warning.
+* **Integration scopes:** 16 of 16 run. Fifteen are green. `server_dies_runner_scope` is at
+  exactly 8 passed / 2 failed, the established pair.
+
+**Untouched, as directed:** the ordinary-cap seal's `arch=x86_64 class=IpcSendOrdinaryCap` cell
+and the `server_dies_runner_scope` carve-out.
+
+## U9 — the broad-lock-removal objective is CLOSED
+
+No production path acquires the broad `SpinLock<KernelState>`. `with_cpu` 0 and `with_broad` 0;
+the three raw `state.lock()` sites are the wrapper bodies themselves.
+`no_production_broad_acquisition_exists_anywhere` states that as an absolute, not a delta. The
+last settlement debts the deletion exposed — the declined Yield's frame authority
+(U9-TERMINAL-SETTLEMENT), the switch-plan hand-off and the relocated oracle (this section) — are
+discharged. No further unlock package follows from this programme.
