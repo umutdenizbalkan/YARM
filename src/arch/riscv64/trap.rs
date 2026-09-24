@@ -1665,6 +1665,40 @@ pub fn handle_riscv_trap_entry_shared(
         && crate::kernel::boot::riscv_post_lock_foundation_oracle_enabled()
         && !RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG.load(Ordering::Acquire);
 
+    // ── U9-TERMINAL-FINAL §3 — THE FOUNDATION-ORACLE PUBLISH, on its own prerequisites ───────
+    //
+    // It used to sit INSIDE the `with_cpu` closure below, which made a default-off diagnostic a
+    // reason for the terminal acquisition to exist: deleting the acquisition would have deleted
+    // the publish with it, and the drain further down would have found an empty token on every
+    // boot with the knob armed.
+    //
+    // Nothing about the token changes. The prerequisites are the ones it always had and they are
+    // all decidable here: a SYSCALL trap (`is_syscall`), the knob armed, the one-shot not yet
+    // fired, a valid CPU index, and a post-lock drain downstream — which is this same function,
+    // unconditionally, a few hundred lines below.
+    //
+    // The IDENTITY is preserved exactly, including the +1 bias that makes 0 mean "nothing
+    // published". The `current_tid` read is the same read: the closure's
+    // `with_cpu(cpu, |k| k.current_tid())` set `current_cpu = cpu` and resolved
+    // `scheduler.current_tid_on(current_cpu)` under the scheduler lock, and
+    // `current_tid_split_read(cpu)` resolves `scheduler.current_tid_on(cpu)` under that same
+    // rank-1 lock — the drain's own comment already says so, because the drain has read it this
+    // way since 196D.
+    //
+    // It publishes BEFORE the handler rather than during it, which is what the drain's
+    // `current_after` comparison has always assumed: the token names the task that ENTERED, and
+    // the comparison asks whether that task is still current once the trap's work is done.
+    if oracle_arm && cpu_idx < MAX_CPUS {
+        let tid = shared.current_tid_split_read(cpu).unwrap_or(0);
+        RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]
+            .store(tid.wrapping_add(1), Ordering::Release);
+        crate::yarm_log!(
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu={} tid={}",
+            cpu.0,
+            tid
+        );
+    }
+
     // U9-QA §2: the broad dispatcher is entered ONLY when nothing was published. After a
     // committed publication the caller is already `Blocked(Futex)` and current on no CPU, so the
     // canonical handler would re-execute FutexWait against it and `dispatch_next_task` would
@@ -1702,21 +1736,9 @@ pub fn handle_riscv_trap_entry_shared(
         );
         shared
             .with_cpu(cpu, |kernel| {
-                // Foundation oracle PUBLISH — during the broad-lock phase, stash a
-                // one-shot post-work token (the requester tid, +1 biased). This is a
-                // pure atomic write: it mutates NO scheduler / capability / user / task
-                // state and copies no user data. It only records "a post-lock drain is
-                // owed for this tid".
-                if oracle_arm && cpu_idx < MAX_CPUS {
-                    let tid = kernel.current_tid().unwrap_or(0);
-                    RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]
-                        .store(tid.wrapping_add(1), Ordering::Release);
-                    crate::yarm_log!(
-                        "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu={} tid={}",
-                        cpu.0,
-                        tid
-                    );
-                }
+                // U9-TERMINAL-FINAL §3 — the foundation-oracle publish that used to be HERE has
+                // moved above, onto its own prerequisites. It never needed the broad borrow: it
+                // is one atomic store of a tid the scheduler domain already answers off-lock.
                 // Reborrow so `frame` stays available for the Stage 196D post-lock switch drain
                 // (which restores the INCOMING task's frame after the broad guard drops).
                 handle_trap_entry_with_fault_bookkeeping_mode(

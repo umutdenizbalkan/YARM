@@ -320,7 +320,14 @@ pub(crate) enum YieldDeclineSettlement {
     TaskMissing,
     /// The caller was preempted and the CPU now owes a queue advance — the in-lock dispatch on
     /// the broad path, the post-lock drain on the split one.
-    QueueAdvance { outgoing: u64 },
+    ///
+    /// `applied` is carried because the split path has one step left that can fail (the
+    /// re-enqueue), and undoing this transition needs the named inverse rather than a guess about
+    /// what was written. The broad path ignores it: its in-lock dispatch owns its own rollback.
+    QueueAdvance {
+        outgoing: u64,
+        applied: PreemptApplied,
+    },
     /// There was no caller to yield. `yield_current` still reaches its dispatch with
     /// `outgoing_tid == None`; nothing was preempted because there was nothing to preempt.
     NoCaller,
@@ -358,10 +365,13 @@ pub(crate) fn settle_yield_decline<O: YieldOwners>(
     let Some(tid) = outgoing_tid else {
         return YieldDeclineSettlement::NoCaller;
     };
-    if owners.preempt_outgoing(tid).is_none() {
+    let Some(applied) = owners.preempt_outgoing(tid) else {
         return YieldDeclineSettlement::TaskMissing;
+    };
+    YieldDeclineSettlement::QueueAdvance {
+        outgoing: tid,
+        applied,
     }
-    YieldDeclineSettlement::QueueAdvance { outgoing: tid }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -505,7 +515,7 @@ impl YieldOwners for BroadYieldOwners<'_> {
 /// independently, so only a pending Yield collides. RISC-V drains all three from one tail, so a
 /// pending FutexWait or 196D foundation deferral collides too. This reproduces exactly what the
 /// delivered in-lock blocks check — it is not a new rule.
-fn colliding_deferral_pending_for(cpu_idx: usize) -> bool {
+pub(crate) fn colliding_deferral_pending_for(cpu_idx: usize) -> bool {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return true;
     }

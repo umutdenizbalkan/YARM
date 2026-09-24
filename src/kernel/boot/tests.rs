@@ -152245,10 +152245,22 @@ mod u9pagefault2_closure {
         for (marker, occurrence, expected, name) in [
             // U9-PAGEFAULT3 §2: each route lost ONE — the classifier refusal, now settled by
             // cause instead of handed to the broad dispatcher.
+            //
+            // U9-TERMINAL-FINAL §3: the TERMINAL route lost its remaining FOUR, and it had to.
+            // All four were structural — an unsupported port, an absent fault or frame, a CPU
+            // out of range, and a class that reached the end of the route order — and all four
+            // are unreachable on a supported build. That made `NotHandled` harmless while a
+            // terminal broad acquisition existed to receive it; with the acquisition removed it
+            // names nothing, so each now fails closed through the route's own settlement owners
+            // or the canonical `MissingTrapFrame`.
+            //
+            // COW and demand keep theirs: those are IN-FAMILY continuations. `NotHandled` from
+            // either means "the next route in the order takes this fault", and the terminal route
+            // is that next route — which is exactly why it is the one that had to stop.
             (
                 "fn try_split_terminal_page_fault_into_frame(",
                 1usize,
-                4usize,
+                0usize,
                 "terminal route",
             ),
             ("fn try_split_cow_page_fault_into_frame(", 1, 4, "COW route"),
@@ -152301,9 +152313,13 @@ mod u9pagefault2_closure {
             .split("PageFaultClass::DemandCandidate")
             .nth(1)
             .expect("the raced arm's class test");
+        // U9-TERMINAL-FINAL §3: the arm used to END at the non-recovery `return D::NotHandled`.
+        // That fall-through is gone — a class with no route is a routing-table break, settled
+        // through the same fatal owner the route's other unnameable victims take — so the arm is
+        // sliced at its replacement instead.
         let arm_end = raced
-            .find("return D::NotHandled")
-            .expect("the arm ends at the non-recovery fall-through");
+            .find("class_has_no_route")
+            .expect("the arm ends at the settled non-recovery case");
         let arm = &raced[..arm_end];
         assert!(
             arm.contains("settle_via_entering_frame(")
@@ -152313,6 +152329,11 @@ mod u9pagefault2_closure {
         assert!(
             !arm.contains("D::Complete(Ok(()))"),
             "and never through an inline return that checks nothing"
+        );
+        // And the non-recovery case beyond it is settled, not declined.
+        assert!(
+            raced[arm_end..].contains("settle_fault_kernel_fatal("),
+            "a class that reaches the end of the route order must fail closed"
         );
     }
 
@@ -170065,15 +170086,24 @@ mod u9residual1_yield_family {
         // increment therefore also no longer runs. What must stay true is per-arm exactness, which
         // is what the pairing below checks: an increment, then ITS OWN commit, with no decline in
         // between and no second increment sharing the arm.
+        //
+        // U9-TERMINAL-FINAL §2 re-derivation: NR 0 now has TWO committing arms, for the reason
+        // this claim has always tracked — a declined split yield used to be counted by the broad
+        // `yield_current` that then ran, and that function no longer runs for it. The declined
+        // path commits its own queue advance through the established Yield drain, so it owes the
+        // increment exactly as the deferred path does, and pays it in its own arm.
+        //
+        // The unit is still the ARM and the claim is still exactness: every increment sits inside
+        // a committing arm, ahead of that arm's commit, with no decline between them.
         let sites: alloc::vec::Vec<usize> = SPLIT
             .match_indices("shared.count_yield_split_mut();")
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
             sites.len(),
-            3,
-            "exactly the three committing arms count: NR 0, the preempting timer, and the \
-             idle-boundary timer advance"
+            4,
+            "exactly the four committing arms count: NR 0 deferred, NR 0 declined-then-advanced, \
+             the preempting timer, and the idle-boundary timer advance"
         );
         for (route, marker, arms) in [
             (
@@ -170081,6 +170111,7 @@ mod u9residual1_yield_family {
                 "D::QueueAdvanceCommitted",
                 1,
             ),
+            ("fn settle_declined_yield(", "D::QueueAdvanceCommitted", 1),
             // U9-TIMER-FINAL re-derivation: the recognized timer body is its own function now,
             // and the counting arms went with it. `try_split_timer_into_frame` is the family
             // filter and counts nothing at all.
@@ -170090,11 +170121,15 @@ mod u9residual1_yield_family {
                 2,
             ),
         ] {
+            // U9-TERMINAL-FINAL §2: bound each body at the NEXT top-level item rather than at a
+            // named neighbour. `settle_declined_yield` now sits between the production Yield
+            // route and its hosted twin, so a window that ran to the twin swallowed two arms and
+            // reported them as one route's.
             let at = SPLIT.find(route).expect("the route");
             let end = SPLIT[at..]
-                .find("\n#[cfg(not(feature = \"hosted-dev\"))]\nfn try_split_timer_into_frame(")
-                .or_else(|| SPLIT[at..].find("\n#[cfg(feature = \"hosted-dev\")]"))
-                .map(|r| at + r)
+                .match_indices("\n}\n")
+                .next()
+                .map(|(r, _)| at + r + 3)
                 .unwrap_or(SPLIT.len());
             let body = &SPLIT[at..end];
             assert_eq!(
@@ -170105,7 +170140,9 @@ mod u9residual1_yield_family {
             let count = body
                 .find("shared.count_yield_split_mut();")
                 .expect("the increment");
-            let commit = body.find(marker).expect("the commit");
+            let commit = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("`{route}`: no `{marker}` in its body"));
             assert!(
                 count < commit,
                 "`{route}`: the increment belongs to the committing arm, ahead of `{marker}`"
@@ -170226,9 +170263,10 @@ mod u9residual1_yield_family {
         // produced a fallback marker. The kernel-internal callers reach it routinely (measured: 35
         // a boot on RISC-V), and logging them would be ~35 lines of new output that reads like a
         // failure.
+        // U9-TERMINAL-FINAL §2: the arm moved into the shared policy with the rest of the
+        // post-decline handling. The silence is unchanged and is asserted where it now lives.
         assert!(
-            EXEC_STATE
-                .contains("Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {}"),
+            YIELD_TXN.contains("YieldDecline::NoCurrent => {}"),
             "a yield with no current task must stay silent, as it always was"
         );
         // The split route's decline uses its OWN marker, so it cannot double-count the in-lock
@@ -170282,8 +170320,13 @@ mod u9residual1_yield_family {
             .nth(1)
             .expect("the arch-correct number reader");
         let helper = &helper[..helper.find("\n}").expect("its end")];
+        // U9-TERMINAL-FINAL §3: the helper gained a hosted twin, because the non-switching
+        // dispatcher now reads it too and that function is not `cfg`-gated. The AArch64 arm is
+        // unchanged in what it reads; only its predicate is narrowed to the freestanding build,
+        // where `user_gpr` and the AArch64 ABI module exist.
         assert!(
-            helper.contains("#[cfg(target_arch = \"aarch64\")]")
+            helper
+                .contains("#[cfg(all(target_arch = \"aarch64\", not(feature = \"hosted-dev\")))]")
                 && helper.contains("frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8)"),
             "on AArch64 the trapped number must come from the raw x8"
         );
@@ -170559,20 +170602,55 @@ mod u9yield2_family_edge {
 
     // ── §2: which decline arms a userspace NR 0 can reach ───────────────────────────────────
 
-    /// **The honest statement about NR 0.** Every decline answers `NotHandled`, and `NotHandled`
-    /// enters the terminal broad dispatcher. This guard exists so no future reading of
-    /// U9-RESIDUAL1 §5's marker table can be mistaken for source totality.
+    /// **The honest statement about NR 0, INVERTED — because the residual it named is closed.**
+    ///
+    /// This guard existed so no future reading of U9-RESIDUAL1 §5's marker table could be
+    /// mistaken for source totality: every decline answered `NotHandled`, and `NotHandled` was a
+    /// terminal broad acquisition. U9-TERMINAL-FINAL §2 removed that, so the guard now pins the
+    /// opposite property — and it is the stronger one, because "the route declines visibly" was
+    /// only ever a statement that the escape had not been hidden.
+    ///
+    /// The one `NotHandled` left is the FAMILY FILTER: "this trap is not a Yield". That is not a
+    /// fall-through — it is how a dispatcher that tries routes in order says a route does not
+    /// apply — and it is asserted to be the only one.
     #[test]
     fn every_yield_decline_still_falls_back_to_the_terminal_dispatcher() {
-        let route = code(body_of(SPLIT, "fn try_split_yield_into_frame", 2600));
+        // The window covers the whole production route, which grew when its CPU-bound admission
+        // and its decline arm became settlements instead of declines.
+        let route = code(body_of(SPLIT, "fn try_split_yield_into_frame", 5200));
         assert!(
-            route.contains("Err(decline) => {") && route.contains("D::NotHandled"),
-            "the split Yield route's decline arm must be visible as a fallback, not hidden"
+            route.contains("Err(decline) => {")
+                && route
+                    .contains("settle_declined_yield(shared, &mut owners, cpu, frame, decline)"),
+            "the decline arm must SETTLE, not decline"
         );
+        assert_eq!(
+            route.matches("D::NotHandled").count(),
+            1,
+            "exactly one `NotHandled` remains, and it is the family filter"
+        );
+        let filter = route
+            .find("if trapped_syscall_nr(frame) != crate::kernel::syscall::SYSCALL_YIELD_NR {")
+            .expect("the family filter");
+        let only = route.find("D::NotHandled").expect("the one NotHandled");
         assert!(
-            YIELD_TXN.contains("U9-YIELD2 §1 — NR 0 is NOT closed"),
-            "the module that owns the policy must carry the honest statement"
+            filter < only && only - filter < 400,
+            "the surviving `NotHandled` must belong to the family filter, not to a decline"
         );
+        // And the settlement itself cannot answer `NotHandled` at all.
+        let settlement = code(body_of(SPLIT, "fn settle_declined_yield(", 7000));
+        assert_eq!(
+            settlement.matches("NotHandled").count(),
+            0,
+            "no declined yield may reach a broad dispatcher"
+        );
+        // Every arm of the shared policy is covered by the settlement.
+        for arm in ["S::TaskMissing", "S::NoCaller", "S::QueueAdvance {"] {
+            assert!(
+                settlement.contains(arm),
+                "the settlement must cover `{arm}`"
+            );
+        }
     }
 
     /// **`NoTrapDrainer` is unreachable for a userspace NR 0**: both bridges open the
@@ -174793,14 +174871,26 @@ mod u9pf1_not_running {
         );
 
         // (5) Base's answer, and what both ISRs do with it — the behaviour this route restores.
-        let broad = EXEC_STATE
-            .split("Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {")
+        //
+        // U9-TERMINAL-FINAL §2: the arm moved. `yield_current`'s inline decline handling and the
+        // transition it owed are now ONE shared policy, `settle_yield_decline`, so the split NR 0
+        // could stop answering `NotHandled` without the two routes drifting. The ANSWER is
+        // unchanged and is asserted where it now lives.
+        const YIELD_TXN_SRC: &str = include_str!("../syscall/yield_txn.rs");
+        let arm = YIELD_TXN_SRC
+            .split("YieldDecline::NotRunning => {")
             .nth(1)
-            .and_then(|s| s.split("\n                }").next())
-            .expect("the broad NotRunning arm");
+            .and_then(|s| s.split("\n        }").next())
+            .expect("the shared NotRunning arm");
         assert!(
-            broad.contains("return Err(KernelError::TaskMissing);"),
-            "the broad path answers this refusal with an error, for every status"
+            arm.contains("return YieldDeclineSettlement::TaskMissing;"),
+            "the policy answers this refusal with TaskMissing, for every status"
+        );
+        assert!(
+            EXEC_STATE.contains(
+                "YieldDeclineSettlement::TaskMissing => {\n                            return Err(KernelError::TaskMissing);"
+            ),
+            "and the broad adapter still turns it into the same error it always did"
         );
         assert!(
             X86_IDT.contains("halt_forever();"),
@@ -188779,20 +188869,49 @@ mod u9d6final_residual {
         }
     }
 
-    /// **A side effect still attached only to the fall-through.** The RISC-V foundation oracle
-    /// publishes its one-shot token from INSIDE the broad closure, so deleting that acquisition
-    /// would delete the publish with it. Default-off and one-shot, but it is a side effect §5
-    /// requires named rather than discovered later.
+    /// **The side effect that WAS attached only to the fall-through, and no longer is.**
+    ///
+    /// The RISC-V foundation oracle published its one-shot token from INSIDE the broad closure,
+    /// so deleting that acquisition would have deleted the publish with it and left the drain
+    /// finding an empty token on every armed boot. U9-TERMINAL-FINAL §3 moved it onto its own
+    /// prerequisites — a syscall trap, the knob armed, the one-shot unfired, a valid CPU — with
+    /// the token identity, the +1 bias and the consumer unchanged.
     #[test]
     fn the_riscv_foundation_oracle_publish_is_inside_the_acquisition() {
-        let arm = RV_TRAP
-            .split(".with_cpu(cpu, |kernel| {")
-            .nth(1)
+        let publish = RV_TRAP
+            .find("RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK")
+            .expect("the oracle publish");
+        let acquisition = RV_TRAP
+            .find(".with_cpu(cpu, |kernel| {")
             .expect("the RISC-V terminal acquisition");
         assert!(
-            arm.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK"),
-            "the oracle publish is a fall-through-only side effect and must be relocated before \
-             the acquisition can go"
+            publish < acquisition,
+            "the oracle publish must run BEFORE the acquisition, not inside it"
+        );
+        // It reads the caller through the split seam the DRAIN already uses, not through the
+        // broad borrow — which is what makes it independent of the acquisition rather than merely
+        // relocated ahead of it.
+        let block = &RV_TRAP[..acquisition];
+        assert!(
+            block.contains("shared.current_tid_split_read(cpu).unwrap_or(0)")
+                && block.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]"),
+            "the publish must compose the off-lock scheduler read and the same token store"
+        );
+        // And nothing of the oracle is left inside the CLOSURE — bounded at the closure's own
+        // end, because the DRAIN below it legitimately consumes the token and would otherwise be
+        // mistaken for a publication that never moved.
+        let rest = &RV_TRAP[acquisition..];
+        let closure_end = rest
+            .find(".map_err(|err| TrapHandleError::Syscall(err.into()))")
+            .expect("the acquisition's end");
+        assert!(
+            !rest[..closure_end].contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN"),
+            "no part of the oracle publication may remain in the acquisition"
+        );
+        // The consumer is unchanged and still downstream of it.
+        assert!(
+            rest[closure_end..].contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx].swap("),
+            "the drain must still take the token it was always given"
         );
     }
 }

@@ -2527,50 +2527,34 @@ impl KernelState {
                     // task, or the re-enqueued caller itself — so no idle outcome).
                     return Ok(());
                 }
-                Err(crate::kernel::syscall::yield_txn::YieldDecline::NotRunning) => {
-                    // Stage 199D-WA3A's exact `Running → Runnable` refused. The delivered code
-                    // reached the identical refusal, through the identical owner, and answered
-                    // `TaskMissing`; so does this. The in-lock fallback below is NOT run — it
-                    // requires the caller to be `Runnable`, which is precisely what failed.
-                    crate::kernel::syscall::yield_txn::log_yield_declined(
-                        cpu,
-                        outgoing_tid.unwrap_or(0),
-                        crate::kernel::syscall::yield_txn::YieldDecline::NotRunning,
-                    );
-                    return Err(KernelError::TaskMissing);
-                }
-                // `NoCurrent` is deliberately silent. The delivered per-architecture blocks were
-                // each wrapped in `if let Some(out_tid) = outgoing_tid`, so a yield with no current
-                // task never reached their fallback markers at all — it is not a declined deferral,
-                // it is a yield with nothing to yield. The kernel-internal callers
-                // (`apply_cross_cpu_work`, the TLB-shootdown wait, `task_core_state`,
-                // `fault_state`) reach it routinely, and logging them would add ~35 lines a boot of
-                // new output that reads like a failure and that the delivered vocabulary never had.
-                Err(crate::kernel::syscall::yield_txn::YieldDecline::NoCurrent) => {}
+                // U9-TERMINAL-FINAL §2 — the decline logging AND the transition the declined
+                // path owes are now ONE shared policy, `settle_yield_decline`, driven by the same
+                // two adapters `run_yield_transaction` is. Nothing about the decision changed:
+                // `NotRunning` still logs and answers `TaskMissing` without running the in-lock
+                // fallback (which requires `Runnable`, precisely what failed), `NoCurrent` is
+                // still silent, every other decline still logs its in-lock fallback reason and
+                // then applies `Running → Runnable` through the same owner.
+                //
+                // Extracting it is what lets the SPLIT NR 0 stop answering `NotHandled` for a
+                // decline — the last switching residual reaching a terminal acquisition — without
+                // the two routes coming to disagree about what a declined yield does.
                 Err(decline) => {
-                    crate::kernel::syscall::yield_txn::log_yield_declined(
+                    match crate::kernel::syscall::yield_txn::settle_yield_decline(
+                        &mut owners,
                         cpu,
-                        outgoing_tid.unwrap_or(0),
+                        outgoing_tid,
                         decline,
-                    );
+                    ) {
+                        crate::kernel::syscall::yield_txn::YieldDeclineSettlement::TaskMissing => {
+                            return Err(KernelError::TaskMissing);
+                        }
+                        // Fall through to the in-lock dispatch below, exactly as before.
+                        crate::kernel::syscall::yield_txn::YieldDeclineSettlement::QueueAdvance {
+                            ..
+                        }
+                        | crate::kernel::syscall::yield_txn::YieldDeclineSettlement::NoCaller => {}
+                    }
                 }
-            }
-        }
-
-        // U9-RESIDUAL1 §3 — the transition the DECLINED path still owes.
-        //
-        // The transaction owns `Running → Runnable` because it is policy, not acquisition. Every
-        // decline above happens before that write (the one step that can fail after it rolls it
-        // back), so the caller is still `Running` here — and both the 196D foundation block and the
-        // in-lock dispatch below require it `Runnable`, exactly as they always have. This applies
-        // the same transition through the same owner, with the same idle-only twin and the same
-        // `TaskMissing` on refusal.
-        if let Some(tid) = outgoing_tid {
-            let applied = self.with_tcbs_mut(|tcbs| {
-                crate::kernel::syscall::yield_txn::apply_preempt_outgoing_locked(tcbs, tid)
-            });
-            if applied.is_none() {
-                return Err(KernelError::TaskMissing);
             }
         }
 

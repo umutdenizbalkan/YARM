@@ -1142,6 +1142,27 @@ pub fn handle_trap_entry_shared(
     // Naming them here keeps that a deliberate no-op rather than a warning.
     #[cfg(target_arch = "riscv64")]
     let _ = (idle_boundary_authenticated, timer_idle_queue_advance);
+    // U9-TERMINAL-FINAL §3 — A SYSCALL TRAP WITH NO FRAME is settled here, not by absence.
+    //
+    // The split dispatcher reads its NR and every argument from the frame, so with no frame
+    // there is nothing to dispatch. The `if let` below simply skipped it, and the trap fell
+    // through to the terminal broad acquisition — which has no frame either, and answers
+    // `TrapHandleError::MissingTrapFrame` from `KernelState::handle_trap_event`.
+    //
+    // The verdict is knowable here, with no lock, from the same `Option` the `if let` inspects,
+    // so it is given here and it is the same error. This is a defensive arm on every supported
+    // port — all three ISRs pass a frame for a syscall — but "the acquisition never sees it" is
+    // not an argument once the acquisition is gone.
+    if !post_work_committed
+        && matches!(decode_trap_context(context), TrapEvent::Syscall)
+        && frame.is_none()
+    {
+        crate::yarm_log!(
+            "SYSCALL_SPLIT_NO_FRAME cpu={} settlement=missing_trap_frame broad_lock=0",
+            cpu.0
+        );
+        return Err(TrapHandleError::MissingTrapFrame);
+    }
     if !post_work_committed && matches!(decode_trap_context(context), TrapEvent::Syscall) {
         if let Some(frame) = frame.as_deref_mut() {
             // Stage 160C: import the decoded syscall ABI into the frame BEFORE the
