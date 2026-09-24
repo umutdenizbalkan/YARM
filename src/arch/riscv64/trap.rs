@@ -834,6 +834,81 @@ static RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG: core::sync::atomic::AtomicBo
 static RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN: [core::sync::atomic::AtomicU64; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
 
+/// U9-CLOSURE-ACCEPTANCE §2 — publish the foundation-oracle token for the task that ENTERED.
+///
+/// `entering` is the identity captured before the split dispatch. `None` — the oracle is not
+/// armed, or the slot was empty — publishes nothing: a token is never fabricated from an empty
+/// slot, which is exactly what the unconditional publish below the dispatch did.
+fn riscv_foundation_oracle_publish(cpu: CpuId, entering: Option<u64>) {
+    use core::sync::atomic::Ordering;
+    let cpu_idx = cpu.0 as usize;
+    let Some(tid) = entering else { return };
+    if cpu_idx >= MAX_CPUS {
+        return;
+    }
+    RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx].store(tid.wrapping_add(1), Ordering::Release);
+    crate::yarm_log!(
+        "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu={} tid={}",
+        cpu.0,
+        tid
+    );
+}
+
+/// The foundation-oracle drain: consume the token and ask whether the task it names is still
+/// this CPU's current once the trap's work is done. Reads the rank-1 current slot only; mutates
+/// nothing but the token and the one-shot flag. An empty token is not a result.
+fn riscv_foundation_oracle_drain(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
+    use core::sync::atomic::Ordering;
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx >= MAX_CPUS {
+        return;
+    }
+    let token = RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx].swap(0, Ordering::AcqRel);
+    if token != 0 {
+        let published_tid = token.wrapping_sub(1);
+        let current_after = shared.current_tid_split_read(cpu);
+        crate::yarm_log!(
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_LOCK_DROPPED_OK cpu={}",
+            cpu.0
+        );
+        crate::yarm_log!(
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_DRAIN_OK cpu={} tid={}",
+            cpu.0,
+            published_tid
+        );
+        // Same-task return: the oracle syscall neither blocks nor switches, so
+        // the trap will `sret` back to the publishing task (current == token).
+        if current_after == Some(published_tid) {
+            crate::yarm_log!(
+                "RISCV_POST_LOCK_FOUNDATION_ORACLE_USER_RETURN_OK tid={}",
+                published_tid
+            );
+            crate::yarm_log!("RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=ok");
+        } else {
+            crate::yarm_log!(
+                "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=task_switched current={:?}",
+                current_after
+            );
+        }
+        RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG.store(true, Ordering::Release);
+    }
+}
+
+/// A split route answered `Complete(_)`: the trap returns to the task that entered, which is the
+/// population the oracle was built to observe. The route's own work — the "handler" — is already
+/// done, so this is the publish and its drain, in that order, on this trap.
+fn riscv_foundation_oracle_returning_trap(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    entering: Option<u64>,
+) {
+    if entering.is_none() {
+        return;
+    }
+    riscv_foundation_oracle_publish(cpu, entering);
+    riscv_foundation_oracle_drain(shared, cpu);
+}
+
 /// Stage 196A: the RISC-V shared trap-entry wrapper — the contract-equivalent
 /// of the x86_64/AArch64 `handle_trap_entry_shared`, but purpose-built for the
 /// RISC-V trap bridge and enabling **zero** retirement classes.
@@ -1424,6 +1499,35 @@ pub fn handle_riscv_trap_entry_shared(
             // returns.
             || nr == crate::kernel::syscall::SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR
             || is_ipc_direct);
+
+    // ── U9-CLOSURE-ACCEPTANCE §2 — the foundation oracle's arming, and the task that ENTERED ──
+    //
+    // The oracle's contract is publish → post-lock drain → return to the SAME task. Until
+    // U9-TERMINAL-FINAL §3 the publish sat inside the broad `with_cpu` closure, which only ran for
+    // a syscall trap that NO split route had committed — the non-committed fall-through — so the
+    // one-shot always fired on a trap that returned to its caller (PM's NR 8 on the delivered
+    // workload: `PUBLISH_OK tid=3 → DRAIN_OK tid=3 → USER_RETURN_OK tid=3`, strict green at
+    // `e44c9b7b`).
+    //
+    // §3 moved the publish below the split dispatch without carrying that prerequisite with it.
+    // With NR 8 now served pre-lock, the first trap to reach the publish was an NR 5 blocking
+    // receive that had ALREADY committed a queue advance and cleared `current`, so it published
+    // `unwrap_or(0)` of an empty slot and the drain reported `task_switched`.
+    //
+    // So the identity is captured HERE, before any route can change it, and published only on
+    // the two dispositions that return to the task that entered: a split route's `Complete(_)`
+    // and the non-committed fall-through. A committed disposition does not publish; the one-shot
+    // stays armed for the next syscall, exactly as it did when those traps never reached the
+    // closure. An empty slot publishes nothing — a token is never fabricated.
+    let oracle_arm = is_syscall
+        && crate::kernel::boot::riscv_post_lock_foundation_oracle_enabled()
+        && !RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG.load(Ordering::Acquire);
+    let oracle_entering = if oracle_arm && cpu_idx < MAX_CPUS {
+        shared.current_tid_split_read(cpu)
+    } else {
+        None
+    };
+
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
         // flooding). NR6/NR7 emit their arch-tagged retirement markers from the drain (kernel), not
@@ -1649,6 +1753,7 @@ pub fn handle_riscv_trap_entry_shared(
                         );
                         crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr={} result=ok", nr);
                     }
+                    riscv_foundation_oracle_returning_trap(shared, cpu, oracle_entering);
                     return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                 }
                 Err(TrapHandleError::Syscall(e)) => {
@@ -1665,6 +1770,7 @@ pub fn handle_riscv_trap_entry_shared(
                         );
                         crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr={} result=handled_err", nr);
                     }
+                    riscv_foundation_oracle_returning_trap(shared, cpu, oracle_entering);
                     return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                 }
                 // A genuine kernel-side failure (e.g. MissingTrapFrame) — propagate.
@@ -1715,11 +1821,6 @@ pub fn handle_riscv_trap_entry_shared(
         crate::yarm_log!("RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET cpu={}", cpu.0);
     }
 
-    // Foundation-oracle arming decision (default-off, one-shot, syscalls only).
-    let oracle_arm = is_syscall
-        && crate::kernel::boot::riscv_post_lock_foundation_oracle_enabled()
-        && !RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG.load(Ordering::Acquire);
-
     // ── U9-TERMINAL-FINAL §3 — THE FOUNDATION-ORACLE PUBLISH, on its own prerequisites ───────
     //
     // It used to sit INSIDE the `with_cpu` closure below, which made a default-off diagnostic a
@@ -1743,15 +1844,18 @@ pub fn handle_riscv_trap_entry_shared(
     // It publishes BEFORE the handler rather than during it, which is what the drain's
     // `current_after` comparison has always assumed: the token names the task that ENTERED, and
     // the comparison asks whether that task is still current once the trap's work is done.
-    if oracle_arm && cpu_idx < MAX_CPUS {
-        let tid = shared.current_tid_split_read(cpu).unwrap_or(0);
-        RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]
-            .store(tid.wrapping_add(1), Ordering::Release);
-        crate::yarm_log!(
-            "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu={} tid={}",
-            cpu.0,
-            tid
-        );
+    //
+    // U9-CLOSURE-ACCEPTANCE §2: and ONLY on the non-committed fall-through — the population the
+    // closure it came from ever ran for — with the identity captured before the split dispatch.
+    // See `oracle_entering` above for why the unconditional form published an empty slot.
+    let non_committed_fall_through = !(queue_advance_committed
+        || post_work_committed
+        || cow_recovered
+        || demand_recovered
+        || irq_handled
+        || unknown_handled);
+    if non_committed_fall_through {
+        riscv_foundation_oracle_publish(cpu, oracle_entering);
     }
 
     // U9-QA §2: the broad dispatcher is entered ONLY when nothing was published. After a
@@ -1954,36 +2058,8 @@ pub fn handle_riscv_trap_entry_shared(
     // boundary and serializes on the scheduler domain. `None` stays `None` — an offline or
     // unknown CPU yields `None` exactly as the old `.ok().flatten()` did, and there is
     // deliberately NO broad-lock fallback if the read declines.
-    if oracle_arm && cpu_idx < MAX_CPUS {
-        let token = RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx].swap(0, Ordering::AcqRel);
-        if token != 0 {
-            let published_tid = token.wrapping_sub(1);
-            let current_after = shared.current_tid_split_read(cpu);
-            crate::yarm_log!(
-                "RISCV_POST_LOCK_FOUNDATION_ORACLE_LOCK_DROPPED_OK cpu={}",
-                cpu.0
-            );
-            crate::yarm_log!(
-                "RISCV_POST_LOCK_FOUNDATION_ORACLE_DRAIN_OK cpu={} tid={}",
-                cpu.0,
-                published_tid
-            );
-            // Same-task return: the oracle syscall neither blocks nor switches, so
-            // the trap will `sret` back to the publishing task (current == token).
-            if current_after == Some(published_tid) {
-                crate::yarm_log!(
-                    "RISCV_POST_LOCK_FOUNDATION_ORACLE_USER_RETURN_OK tid={}",
-                    published_tid
-                );
-                crate::yarm_log!("RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=ok");
-            } else {
-                crate::yarm_log!(
-                    "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=task_switched current={:?}",
-                    current_after
-                );
-            }
-            RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG.store(true, Ordering::Release);
-        }
+    if oracle_arm {
+        riscv_foundation_oracle_drain(shared, cpu);
     }
 
     // ── U9-TIMER2 §2: the IDLE-BOUNDARY TIMER queue-advance drain ──────────────────────

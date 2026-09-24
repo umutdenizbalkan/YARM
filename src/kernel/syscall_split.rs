@@ -10286,10 +10286,43 @@ fn settle_declined_yield<O: crate::kernel::syscall::yield_txn::YieldOwners>(
             debug_assert_eq!(outgoing, entering.tid);
             // ── The caller is now `Runnable` and this CPU owes a dispatch. ──────────────────
             //
-            // HONOUR AN EXISTING OWNER FIRST. A colliding deferral — or a published switch plan —
-            // means some other route already owns this trap's switch and its drain performs the
-            // one dispatch. Reserving over it, clearing it, or selecting a second incoming task
-            // would each give one trap two switches.
+            // HONOUR AN EXISTING OWNER FIRST. Reserving over a colliding deferral, clearing it, or
+            // selecting a second incoming task would each give one trap two switches.
+            //
+            // U9-CLOSURE-ACCEPTANCE §1 — this arm is UNREACHABLE by construction, and it does
+            // NOT necessarily switch. U9-TERMINAL-FINAL said the incumbent's drain "performs the
+            // one dispatch"; the consumers say otherwise. Every Yield-colliding drain requires
+            // `current` cleared before it dispatches (`yield_reverify_ready` and its FutexWait /
+            // foundation siblings) and otherwise clears its cell WITHOUT dispatching, while this
+            // arm leaves the caller current. The switch-plan drain switches to the plan's
+            // incoming task, whose outgoing is whoever was current when the plan was published.
+            // So reaching this arm leaves the caller `Runnable`, current and unqueued, with no
+            // one owing it anything — see `u9closure_switch_owned_elsewhere`, which runs the
+            // Yield drain's consumer decision against exactly that state.
+            //
+            // It cannot be reached, because a colliding cell is never pending when a Yield
+            // trap's split route runs:
+            //
+            // * one syscall route runs per trap, and the Yield route reads the cells before it
+            //   arms anything, so the cell would have to be left by an EARLIER trap;
+            // * every queue-advancing cell (Yield, FutexWait, and on RISC-V the 196D foundation
+            //   cell) is armed by the one route of its trap and read by that trap's drain AFTER
+            //   the split dispatch, and every branch of that drain clears it — resume, refusal
+            //   to idle, and `current`-not-cleared alike. The only exits between arming and
+            //   draining are a `Complete(_)`, which the arming routes never answer while holding
+            //   a cell, and the fatal paths, which do not return to any trap;
+            // * the 196D foundation cell's only producer is `KernelState::yield_current`, which
+            //   no production path can reach — there is no broad acquisition left to call it
+            //   under;
+            // * the switch-plan stash's only producer is the default-off, x86_64, single-CPU D6
+            //   hook. It refuses while any queue-advancing cell is reserved, every
+            //   `*_try_defer` refuses while a plan is stashed, and `drain_switch_plan_stash` at
+            //   the end of the same trap consumes it. The one exit that skipped that drain —
+            //   the blocking send's `ImmediateReturn` — now falls through to it when a plan is
+            //   reserved.
+            //
+            // All of this is per-CPU state touched only by its own CPU, with interrupts masked
+            // for the whole trap.
             if owners.colliding_deferral_pending(cpu) {
                 frame.set_ok(0, 0, 0);
                 crate::yarm_log!(

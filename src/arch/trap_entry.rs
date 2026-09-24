@@ -1837,7 +1837,29 @@ pub fn handle_trap_entry_shared(
                 cpu.0,
                 error
             );
-            return Ok(());
+            // U9-CLOSURE-ACCEPTANCE §1 — unless this trap's switch is already OWNED.
+            //
+            // The D6 hook publishes its plan ABOVE this drain (it must: publishing is legal only
+            // while the trap-path window is open). On the live D6 boots it fires on exactly this
+            // kind of trap — tid 1 with post-work pending. Returning here skipped
+            // `drain_switch_plan_stash` at the end of this function, so the plan outlived the
+            // trap that published it, and the NEXT trap on this CPU found a switch owner that
+            // belonged to nobody: a Yield there reads it as a colliding deferral and settles
+            // `switch_owned_elsewhere`, leaving its caller `Runnable`, current and unqueued.
+            //
+            // With a plan reserved, the trap is finished by the owner it already has. Nothing
+            // else below is owed — the refused commit armed no deferral, so every D2 / FutexWait
+            // / Yield drain is a no-op — and the frame already carries the canonical error, which
+            // is exactly what a `NoCallerAction` trap looks like when it reaches the stash drain.
+            if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+                || !crate::kernel::boot::switch_plan_stash_is_reserved(cpu_idx)
+            {
+                return Ok(());
+            }
+            crate::yarm_log!(
+                "U6_BLOCKING_SEND_IMMEDIATE_RETURN_SWITCH_OWNED cpu={} settlement=switch_plan_drain",
+                cpu.0
+            );
         }
         DispatchPostWorkDisposition::SenderCommittedBlocked { tid } => {
             // The sender is parked and this CPU has no current task. Fall through WITHOUT

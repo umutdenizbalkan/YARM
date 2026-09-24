@@ -76891,8 +76891,10 @@ mod stage196a_riscv_shared_trap_foundation {
         // lock — its source position does, and the current task is read through the
         // authoritative rank-1 scheduler seam. Assert on the drain body itself, so a future
         // edit cannot quietly reintroduce a broad acquisition here.
+        // U9-CLOSURE-ACCEPTANCE §2: the drain body is one function now, called from the
+        // post-lock position AND from the split `Complete(_)` arms, so the body is read there.
         let drain = RISCV_TRAP_SRC
-            .split("// Foundation-oracle DRAIN")
+            .split("fn riscv_foundation_oracle_drain(")
             .nth(1)
             .and_then(|s| {
                 s.split("RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG")
@@ -189589,53 +189591,95 @@ mod u9d6final_residual {
         }
     }
 
-    /// **The side effect that WAS attached only to the fall-through, and no longer is.**
+    /// **The side effect that WAS attached only to the fall-through, and where it lives now.**
     ///
-    /// The RISC-V foundation oracle published its one-shot token from INSIDE the broad closure,
-    /// so deleting that acquisition would have deleted the publish with it and left the drain
-    /// finding an empty token on every armed boot. U9-TERMINAL-FINAL §3 moved it onto its own
-    /// prerequisites — a syscall trap, the knob armed, the one-shot unfired, a valid CPU — with
-    /// the token identity, the +1 bias and the consumer unchanged.
+    /// The RISC-V foundation oracle published its one-shot token from INSIDE the broad closure.
+    /// U9-TERMINAL-FINAL §3 moved it out so that §5 could delete the acquisition without deleting
+    /// the publish — but moved it below the split dispatch UNCONDITIONALLY, which dropped the one
+    /// prerequisite the closure had enforced by construction: it ran only for a trap no split
+    /// route had committed. The first trap to reach the moved publish was then an NR 5 blocking
+    /// receive that had already cleared `current`, and the one-shot published `unwrap_or(0)` of
+    /// an empty slot and reported `task_switched` (strict red on every boot of that tree, strict
+    /// green at `e44c9b7b`).
+    ///
+    /// U9-CLOSURE-ACCEPTANCE §2 re-derivation: the identity is captured before the split
+    /// dispatch, and published only on the two dispositions that return to the task that
+    /// entered — a split `Complete(_)` and the non-committed fall-through.
     #[test]
-    fn the_riscv_foundation_oracle_publish_is_inside_the_acquisition() {
-        let publish = RV_TRAP
-            .find("RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK")
-            .expect("the oracle publish");
-        // U9-TERMINAL-FINAL §5: the acquisition this guard measured against is deleted, which
-        // is the outcome the relocation was a PREREQUISITE for — §3 moved the publish out
-        // precisely so that §5 could delete the acquisition without deleting the publish. The
-        // position is now the per-class settlement that stands in the same `else`.
-        let acquisition = RV_TRAP
+    fn the_riscv_foundation_oracle_publishes_only_for_a_returning_trap() {
+        let code: alloc::string::String = RV_TRAP
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let capture = code
+            .find("let oracle_entering = if oracle_arm && cpu_idx < MAX_CPUS {")
+            .expect("the entering identity is captured");
+        let dispatch = code
+            .find("crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)")
+            .expect("the split dispatch");
+        assert!(
+            capture < dispatch,
+            "captured BEFORE any route can change it"
+        );
+        assert!(
+            code[capture..dispatch].contains("shared.current_tid_split_read(cpu)")
+                && !code.contains("current_tid_split_read(cpu).unwrap_or(0)"),
+            "read through the split seam, and an empty slot is never turned into tid 0"
+        );
+        // The token store lives in exactly one publisher, which refuses an absent identity.
+        let publisher = code
+            .split("fn riscv_foundation_oracle_publish(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the publisher");
+        assert!(
+            publisher.contains("let Some(tid) = entering else")
+                && publisher.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]")
+                && publisher.contains("PUBLISH_OK"),
+            "one publisher, and it publishes only a real entering task"
+        );
+        assert_eq!(
+            code.matches("RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK")
+                .count(),
+            1,
+            "no second publish site"
+        );
+        // Its call sites: the two `Complete(_)` arms, and the fall-through gated on nothing
+        // having been committed.
+        assert_eq!(
+            code.matches("riscv_foundation_oracle_returning_trap(shared, cpu, oracle_entering);")
+                .count(),
+            2,
+            "both split `Complete(_)` arms publish and drain before returning to the caller"
+        );
+        let gated = code
+            .split("let non_committed_fall_through = !(queue_advance_committed")
+            .nth(1)
+            .expect("the fall-through gate");
+        let gate_end = gated
+            .find("riscv_foundation_oracle_publish(cpu, oracle_entering);")
+            .expect("the gated publish");
+        assert!(
+            gated[..gate_end].contains("post_work_committed")
+                && gated[..gate_end].contains("if non_committed_fall_through {"),
+            "the fall-through publish is conditional on no route having committed"
+        );
+        // And nothing of the oracle remains in the terminal arm; the drain is still downstream.
+        let terminal = code
             .find("settle_unowned_trap_at_riscv_bridge(shared, cpu, context, frame)")
             .expect("the RISC-V terminal settlement point");
-        assert!(
-            publish < acquisition,
-            "the oracle publish must run BEFORE the terminal point, not at it"
-        );
-        // It reads the caller through the split seam the DRAIN already uses, not through the
-        // broad borrow — which is what makes it independent of the acquisition rather than merely
-        // relocated ahead of it.
-        let block = &RV_TRAP[..acquisition];
-        assert!(
-            block.contains("shared.current_tid_split_read(cpu).unwrap_or(0)")
-                && block.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]"),
-            "the publish must compose the off-lock scheduler read and the same token store"
-        );
-        // And nothing of the oracle is left inside the CLOSURE — bounded at the closure's own
-        // end, because the DRAIN below it legitimately consumes the token and would otherwise be
-        // mistaken for a publication that never moved.
-        let rest = &RV_TRAP[acquisition..];
-        let closure_end = rest
+        let rest = &code[terminal..];
+        let arm_end = rest
             .find("if log_structural {")
-            .expect("the end of the terminal settlement's `else` arm");
+            .expect("the end of the terminal arm");
         assert!(
-            !rest[..closure_end].contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN"),
-            "no part of the oracle publication may remain in the terminal arm"
+            !rest[..arm_end].contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN"),
+            "no part of the oracle publication may be in the terminal arm"
         );
-        // The consumer is unchanged and still downstream of it.
         assert!(
-            rest[closure_end..].contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx].swap("),
-            "the drain must still take the token it was always given"
+            rest[arm_end..].contains("riscv_foundation_oracle_drain(shared, cpu);"),
+            "the post-lock drain still takes the token"
         );
     }
 }
@@ -190958,5 +191002,345 @@ mod u9terminal_settlement_yield {
         ] {
             assert!(RV_TRAP.contains(needle), "riscv64 bridge: `{needle}`");
         }
+    }
+}
+
+/// U9-CLOSURE-ACCEPTANCE §1 — **`switch_owned_elsewhere`, derived through its consumers.**
+///
+/// The branch settles a declined NR 0 whose CPU already has a colliding deferral pending: it
+/// makes the caller `Runnable` and answers `QueueAdvanceCommitted`, trusting the incumbent. The
+/// behavioral case below runs the production settlement and then the Yield drain's own consumer
+/// decision against the state it leaves, which is what corrects the claim that the branch
+/// "necessarily switches". The inventory case pins the construction proof that the branch cannot
+/// be reached: every producer of every colliding cell, by file and by enclosing function.
+mod u9closure_switch_owned_elsewhere {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::scheduler::{CpuId, TaskPlacement as P};
+    use crate::kernel::syscall::yield_txn::SharedYieldOwners;
+    use crate::kernel::syscall_split::{SplitDispatchDisposition as D, split_yield_settle};
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    const CPU: CpuId = CpuId(0);
+    const E: u64 = 1;
+    /// The identity a leaked incumbent cell carries — not the caller.
+    const LEAKED: u64 = 7;
+
+    fn set_status(k: &SharedKernel, tid: u64, status: TaskStatus) {
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .expect("the task exists")
+                    .status = status;
+            })
+        });
+    }
+    fn placement(k: &SharedKernel, tid: u64) -> P {
+        k.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler).placement_of(ThreadId(tid))
+        })
+    }
+
+    /// **The branch does not switch.** A Yield cell left pending by some earlier trap is the
+    /// "incumbent". The production settlement preempts the caller and hands the trap to that
+    /// incumbent; the Yield drain then asks its re-verification question — is `current`
+    /// cleared? — gets `false`, because this branch never clears it, and clears its cell without
+    /// dispatching (`YIELD_DISPATCH_DEFERRED reason=state_changed` on all three ports).
+    ///
+    /// The end state is what this test pins: E `Runnable`, still current, on no queue; the cell
+    /// empty; the queued task never dispatched; nothing captured and nothing owed to anyone. That
+    /// is why the branch must be UNREACHABLE rather than trusted, and the inventory case below is
+    /// the proof that it is.
+    #[test]
+    fn the_incumbent_drain_does_not_switch_for_this_branch() {
+        crate::kernel::boot::yield_dispatch_clear(CPU.0 as usize);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(E).expect("task E");
+            let (asid, _map) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(E, asid).expect("bind");
+            s.block_current_cpu().expect("task 0 was current");
+            s.enqueue_on_cpu(CPU, E).expect("enqueue E");
+            assert_eq!(s.dispatch_next_on_cpu(CPU), Some(E));
+            s.enqueue_on_cpu(CPU, 0).expect("task 0 waits");
+        });
+        set_status(&k, E, TaskStatus::Running);
+        set_status(&k, 0, TaskStatus::Runnable);
+        let context_before = k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == E)
+                    .map(|t| t.user_context.instruction_ptr.0)
+            })
+        });
+
+        // The incumbent: a Yield cell this trap did not arm.
+        assert!(crate::kernel::boot::yield_dispatch_try_defer(
+            CPU.0 as usize,
+            LEAKED
+        ));
+        let entering = k.current_entering_incarnation_split_read(CPU);
+        let mut frame = TrapFrame::new(crate::kernel::syscall::SYSCALL_YIELD_NR, [0; 6]);
+        frame.saved_pc = 0x4000_2000;
+        let d = split_yield_settle(
+            &k,
+            &mut SharedYieldOwners { shared: &k },
+            CPU,
+            &mut frame,
+            entering,
+        );
+        assert!(
+            matches!(d, D::QueueAdvanceCommitted),
+            "fixture: the branch under test answered {d:?}"
+        );
+
+        // THE CONSUMER. The Yield drain on every port: re-verify, and without a cleared
+        // `current` clear the cell and dispatch nothing.
+        assert!(
+            crate::kernel::boot::yield_dispatch_is_deferred(CPU.0 as usize),
+            "the incumbent cell is what the drain consumes"
+        );
+        assert_eq!(
+            crate::kernel::boot::yield_dispatch_outgoing(CPU.0 as usize),
+            Some(LEAKED),
+            "and it names the incumbent, not the caller"
+        );
+        let reverify = k.yield_reverify_ready(CPU);
+        assert!(
+            !reverify,
+            "the branch leaves the caller current, so the drain's re-verification refuses"
+        );
+        crate::kernel::boot::yield_dispatch_clear(CPU.0 as usize);
+
+        // FINAL STATE — status, placement, continuation, cell.
+        assert_eq!(
+            k.with(|s| s.task_status(E)),
+            Some(TaskStatus::Runnable),
+            "status: preempted"
+        );
+        assert_eq!(
+            placement(&k, E),
+            P::Current(CPU),
+            "placement: still current, on no run queue"
+        );
+        assert_eq!(
+            placement(&k, 0),
+            P::Queued(CPU),
+            "no incoming was dispatched"
+        );
+        let context_after = k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == E)
+                    .map(|t| t.user_context.instruction_ptr.0)
+            })
+        });
+        assert_eq!(
+            context_after, context_before,
+            "continuation: nothing owes E a resume from this trap's frame"
+        );
+        assert!(
+            !crate::kernel::boot::yield_dispatch_is_deferred(CPU.0 as usize),
+            "cell: consumed"
+        );
+    }
+
+    /// The construction proof's premises, pinned as an inventory.
+    ///
+    /// `switch_owned_elsewhere` is reachable only if a colliding cell is pending when a Yield
+    /// trap's split route runs. The cells are the Yield and FutexWait deferrals, the RISC-V 196D
+    /// foundation deferral and the switch-plan stash. Each producer below is either (a) a split
+    /// route or owner whose trap drains the cell on every branch, (b) a `KernelState` method —
+    /// reachable only under a broad acquisition, of which the census proves none exists — or
+    /// (c) the default-off D6 publisher, whose trap now drains its plan on every exit. A new
+    /// producer anywhere fails this test and must bring its own argument.
+    #[test]
+    fn every_colliding_cell_producer_is_accounted_for() {
+        fn visit(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+            for entry in std::fs::read_dir(root).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    visit(&path, f);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let src = std::fs::read_to_string(&path).expect("read file");
+                    f(&path, &src);
+                }
+            }
+        }
+        /// Production text only: every top-level `#[cfg(test)] mod tests { … }` removed — not
+        /// just cut at, because `exec_state.rs` has production items AFTER its test module —
+        /// and comment lines dropped. Line numbers are the file's own.
+        fn production(src: &str) -> alloc::vec::Vec<(usize, alloc::string::String)> {
+            let mut in_test = false;
+            let mut out = alloc::vec::Vec::new();
+            let lines: alloc::vec::Vec<&str> = src.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                if !in_test && *l == "mod tests {" && i > 0 && lines[i - 1] == "#[cfg(test)]" {
+                    in_test = true;
+                    continue;
+                }
+                if in_test {
+                    if *l == "}" {
+                        in_test = false;
+                    }
+                    continue;
+                }
+                if !l.trim_start().starts_with("//") {
+                    out.push((i, alloc::string::String::from(*l)));
+                }
+            }
+            out
+        }
+        /// The nearest enclosing `fn` signature above line `at`.
+        fn enclosing_fn(lines: &[&str], at: usize) -> alloc::string::String {
+            lines[..=at]
+                .iter()
+                .rev()
+                .find(|l| l.trim_start().contains("fn ") && l.contains('('))
+                .map(|l| alloc::string::String::from(l.trim()))
+                .unwrap_or_default()
+        }
+
+        const PRODUCERS: &[&str] = &[
+            "yield_dispatch_try_defer(",
+            "futex_wait_dispatch_try_defer(",
+            "riscv_queue_switch_foundation_try_defer(",
+            "DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(",
+        ];
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut found: alloc::vec::Vec<(alloc::string::String, &str, alloc::string::String)> =
+            alloc::vec::Vec::new();
+        visit(&root.join("src"), &mut |path, src| {
+            if path.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+                return;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            let all: alloc::vec::Vec<&str> = src.lines().collect();
+            for (i, line) in production(src) {
+                for p in PRODUCERS {
+                    if line.contains(p) && !line.contains("fn ") {
+                        found.push((rel.clone(), p, enclosing_fn(&all, i)));
+                    }
+                }
+            }
+        });
+        let mut summary: alloc::vec::Vec<alloc::string::String> = found
+            .iter()
+            .map(|(f, p, func)| {
+                let name = func
+                    .split("fn ")
+                    .nth(1)
+                    .and_then(|s| s.split(['(', '<']).next())
+                    .unwrap_or("?");
+                alloc::format!("{f} {p} {name}")
+            })
+            .collect();
+        summary.sort();
+        let expected = [
+            // (b) broad-only: `&mut KernelState` methods.
+            "src/kernel/boot/exec_state.rs DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store( maybe_switch_kernel_context",
+            // A `SharedKernel` transaction with NO production caller — asserted below.
+            "src/kernel/boot/exec_state.rs DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store( queue_advance_commit_split",
+            "src/kernel/boot/exec_state.rs futex_wait_dispatch_try_defer( futex_wait_current",
+            "src/kernel/boot/exec_state.rs futex_wait_dispatch_try_defer( futex_wait_current",
+            "src/kernel/boot/exec_state.rs futex_wait_dispatch_try_defer( futex_wait_current",
+            "src/kernel/boot/exec_state.rs riscv_queue_switch_foundation_try_defer( yield_current",
+            // (a) split owners, drained in their own trap — NR 16's exit owner and
+            // `SharedYieldOwners` (NR 0 and the preempting tick) — and, in the same file,
+            // `BroadYieldOwners`, which is (b): only `KernelState::yield_current` drives it.
+            "src/kernel/syscall/exit_txn.rs futex_wait_dispatch_try_defer( reserve_queue_advance",
+            "src/kernel/syscall/yield_txn.rs yield_dispatch_try_defer( reserve_yield_deferral",
+            "src/kernel/syscall/yield_txn.rs yield_dispatch_try_defer( reserve_yield_deferral",
+            // (c) the default-off D6 publisher.
+            "src/runtime.rs DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store( d6_publish_switch_plan_split",
+        ];
+        let split_futex: alloc::vec::Vec<&alloc::string::String> = summary
+            .iter()
+            .filter(|s| s.starts_with("src/kernel/syscall_split.rs futex_wait_dispatch_try_defer("))
+            .collect();
+        assert_eq!(
+            split_futex.len(),
+            2,
+            "the split FutexWait routes arm the FutexWait cell twice: {split_futex:?}"
+        );
+        let rest: alloc::vec::Vec<&str> = summary
+            .iter()
+            .filter(|s| !s.starts_with("src/kernel/syscall_split.rs "))
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            rest, expected,
+            "a colliding-cell producer appeared or moved; re-derive switch_owned_elsewhere"
+        );
+
+        // (b) is sound only because those methods are `&mut KernelState`.
+        const EXEC: &str = include_str!("exec_state.rs");
+        for f in [
+            "fn maybe_switch_kernel_context(",
+            "fn futex_wait_current(",
+            "fn yield_current(",
+        ] {
+            let at = EXEC.find(f).unwrap_or_else(|| panic!("{f}"));
+            assert!(
+                EXEC[at..at + 200].contains("&mut self"),
+                "`{f}` must stay a broad `&mut KernelState` method for the proof to hold"
+            );
+        }
+        // And the one `&self` stash producer has no production caller.
+        let mut callers = 0usize;
+        visit(&root.join("src"), &mut |path, src| {
+            if path.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+                return;
+            }
+            for (_, line) in production(src) {
+                if line.contains("queue_advance_commit_split(") && !line.contains("fn ") {
+                    callers += 1;
+                }
+            }
+        });
+        assert_eq!(
+            callers, 0,
+            "`queue_advance_commit_split` has no production caller"
+        );
+
+        // (c): the one early exit between the D6 publish and `drain_switch_plan_stash` now
+        // falls through to the drain when a plan is reserved.
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        let arm = TRAP_ENTRY
+            .split("DispatchPostWorkDisposition::ImmediateReturn { error } => {")
+            .nth(1)
+            .and_then(|s| {
+                s.split("DispatchPostWorkDisposition::SenderCommittedBlocked")
+                    .next()
+            })
+            .expect("the ImmediateReturn arm");
+        let code: alloc::string::String = arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        let guard = code
+            .find("switch_plan_stash_is_reserved(cpu_idx)")
+            .expect("the arm asks whether a plan owns this trap's switch");
+        let ret = code.find("return Ok(());").expect("the early return");
+        assert!(
+            guard < ret && code[guard..ret].contains('{'),
+            "the early return is conditional on NO plan being reserved"
+        );
+        assert_eq!(
+            code.matches("return ").count(),
+            1,
+            "and it is the arm's only exit"
+        );
     }
 }
