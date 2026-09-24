@@ -333,27 +333,46 @@ pub(crate) enum YieldDeclineSettlement {
     NoCaller,
 }
 
-/// THE post-decline policy, over the same owners the transaction uses.
-pub(crate) fn settle_yield_decline<O: YieldOwners>(
+/// U9-TERMINAL-SETTLEMENT — the post-decline policy for a yield that HAS a caller.
+///
+/// A strictly smaller set than [`YieldDeclineSettlement`], and the difference is the point:
+/// there is no `NoCaller`. That variant is the kernel-internal "yield with nothing to yield" —
+/// `yield_current` called from kernel code on a CPU with no current task, which then simply
+/// reaches its dispatch. A USERSPACE `NR 0` is never that: a task trapped, so a task owns the
+/// frame, and the split route captures that task's incarnation before the transaction runs.
+///
+/// Giving the caller-bearing policy its own return type is what makes the distinction a fact of
+/// construction rather than of care. The split route calls only this function, so the
+/// kernel-internal answer cannot reach a userspace frame by any path — there is no value in this
+/// type that means it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallerDeclineSettlement {
+    /// `NotRunning`, or a `Running -> Runnable` the scheduler refused.
+    TaskMissing,
+    /// The caller was preempted and the CPU now owes a queue advance.
+    QueueAdvance {
+        outgoing: u64,
+        applied: PreemptApplied,
+    },
+}
+
+/// The caller-bearing half of the post-decline policy. Every line is `yield_current`'s.
+pub(crate) fn settle_caller_yield_decline<O: YieldOwners>(
     owners: &mut O,
     cpu: CpuId,
-    outgoing_tid: Option<u64>,
+    tid: u64,
     decline: YieldDecline,
-) -> YieldDeclineSettlement {
+) -> CallerDeclineSettlement {
     match decline {
         // Stage 199D-WA3A's exact `Running → Runnable` refused. The in-lock fallback is NOT run —
         // it requires the caller to be `Runnable`, which is precisely what failed.
         YieldDecline::NotRunning => {
-            log_yield_declined(cpu, outgoing_tid.unwrap_or(0), YieldDecline::NotRunning);
-            return YieldDeclineSettlement::TaskMissing;
+            log_yield_declined(cpu, tid, YieldDecline::NotRunning);
+            return CallerDeclineSettlement::TaskMissing;
         }
-        // `NoCurrent` is deliberately silent. The delivered per-architecture blocks were each
-        // wrapped in `if let Some(out_tid) = outgoing_tid`, so a yield with no current task never
-        // reached their fallback markers at all — it is not a declined deferral, it is a yield
-        // with nothing to yield. The kernel-internal callers reach it routinely, and logging them
-        // would add ~35 lines a boot of output that reads like a failure.
+        // `NoCurrent` is deliberately silent; see [`settle_yield_decline`].
         YieldDecline::NoCurrent => {}
-        other => log_yield_declined(cpu, outgoing_tid.unwrap_or(0), other),
+        other => log_yield_declined(cpu, tid, other),
     }
 
     // The transition the DECLINED path still owes.
@@ -362,15 +381,50 @@ pub(crate) fn settle_yield_decline<O: YieldOwners>(
     // decline happens before that write (the one step that can fail after it rolls it back), so
     // the caller is still `Running` here — and both the RISC-V foundation block and the in-lock
     // dispatch require it `Runnable`, exactly as they always have.
-    let Some(tid) = outgoing_tid else {
-        return YieldDeclineSettlement::NoCaller;
-    };
-    let Some(applied) = owners.preempt_outgoing(tid) else {
-        return YieldDeclineSettlement::TaskMissing;
-    };
-    YieldDeclineSettlement::QueueAdvance {
-        outgoing: tid,
-        applied,
+    match owners.preempt_outgoing(tid) {
+        Some(applied) => CallerDeclineSettlement::QueueAdvance {
+            outgoing: tid,
+            applied,
+        },
+        None => CallerDeclineSettlement::TaskMissing,
+    }
+}
+
+/// THE post-decline policy, over the same owners the transaction uses.
+///
+/// The broad `yield_current` drives it, and it is the only caller that can supply `None`: a
+/// kernel-internal yield on a CPU with no current task. A caller-bearing yield is delegated to
+/// [`settle_caller_yield_decline`], so both routes still run one policy.
+pub(crate) fn settle_yield_decline<O: YieldOwners>(
+    owners: &mut O,
+    cpu: CpuId,
+    outgoing_tid: Option<u64>,
+    decline: YieldDecline,
+) -> YieldDeclineSettlement {
+    if let Some(tid) = outgoing_tid {
+        return match settle_caller_yield_decline(owners, cpu, tid, decline) {
+            CallerDeclineSettlement::TaskMissing => YieldDeclineSettlement::TaskMissing,
+            CallerDeclineSettlement::QueueAdvance { outgoing, applied } => {
+                YieldDeclineSettlement::QueueAdvance { outgoing, applied }
+            }
+        };
+    }
+    match decline {
+        // Unchanged: `NotRunning` answers `TaskMissing` before the caller is consulted at all.
+        YieldDecline::NotRunning => {
+            log_yield_declined(cpu, 0, YieldDecline::NotRunning);
+            YieldDeclineSettlement::TaskMissing
+        }
+        // `NoCurrent` is deliberately silent. The delivered per-architecture blocks were each
+        // wrapped in `if let Some(out_tid) = outgoing_tid`, so a yield with no current task never
+        // reached their fallback markers at all — it is not a declined deferral, it is a yield
+        // with nothing to yield. The kernel-internal callers reach it routinely, and logging them
+        // would add ~35 lines a boot of output that reads like a failure.
+        YieldDecline::NoCurrent => YieldDeclineSettlement::NoCaller,
+        other => {
+            log_yield_declined(cpu, 0, other);
+            YieldDeclineSettlement::NoCaller
+        }
     }
 }
 
@@ -382,10 +436,11 @@ pub(crate) fn settle_yield_decline<O: YieldOwners>(
 /// The SPLIT owner. Each method takes exactly the one domain lock its answer needs, with the broad
 /// `SpinLock<KernelState>` already released.
 ///
-/// Constructed only by `syscall_split::try_split_yield_into_frame`, which is stubbed out under
-/// `hosted-dev` — the hosted suite exercises the BROAD adapter and the transaction directly, and
-/// the split route is proven live. The allow is scoped to that build, so a dead construction in a
-/// production build would still be reported.
+/// Constructed in production only by `syscall_split::try_split_yield_into_frame`, which is stubbed
+/// out under `hosted-dev`. U9-TERMINAL-SETTLEMENT: the hosted suite now also constructs it, to
+/// drive `syscall_split::split_yield_settle` — the production settlement — against real scheduler
+/// and task state. The allow is scoped to the hosted build, so a dead construction in a production
+/// build would still be reported.
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 pub(crate) struct SharedYieldOwners<'a> {
     pub(crate) shared: &'a crate::runtime::SharedKernel,

@@ -15145,6 +15145,105 @@ impl SharedKernel {
         })
     }
 
+    /// U9-TERMINAL-SETTLEMENT — the exact incarnation's STATUS, or `None` when the TCB no longer
+    /// describes `{tid, asid}`.
+    ///
+    /// [`Self::task_incarnation_is_resumable_split_read`] answers a yes/no that admits
+    /// `Runnable | Running` together, which is the right question for "may this frame be
+    /// resumed" and the wrong one for "may this task be published". A `Running` task placed
+    /// nowhere must not be enqueued — dispatch would then try `Runnable → Running` on it — so a
+    /// settlement that is about to publish needs the status itself. Same acquisition, same
+    /// identity rule (`Asid(0)` for a kernel task), nothing written.
+    pub(crate) fn task_incarnation_status_split_read(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Option<crate::kernel::task::TaskStatus> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .filter(|t| t.asid.unwrap_or(crate::kernel::vm::Asid(0)) == asid)
+                .map(|t| t.status)
+        })
+    }
+
+    /// U9-TERMINAL-SETTLEMENT — the incarnation a trap ENTERED from, captured while it is still
+    /// this CPU's current.
+    ///
+    /// `{tid, priority}` come from ONE rank-1 observation ([`Self::current_placement_split_read`]),
+    /// so the pair describes a state the scheduler was actually in. The ASID is read immediately
+    /// after, with the task still current on this CPU — the one interval in which its TCB cannot
+    /// be reclaimed and re-issued — so what later settlements authenticate against is the
+    /// incarnation that trapped, never whatever answers to the number afterwards. It is the same
+    /// argument `futex_wait_park_exact_split` and `recv_block_phase_a_split` make for reading the
+    /// ASID before their clear.
+    ///
+    /// `None` means this CPU's slot named no task when the capture ran.
+    pub(crate) fn current_entering_incarnation_split_read(
+        &self,
+        cpu: CpuId,
+    ) -> Option<crate::kernel::recv_waiter_split::RecvEnteringIncarnation> {
+        let (tid, priority) = self.current_placement_split_read(cpu)?;
+        let asid = crate::kernel::vm::Asid(self.task_asid_for_tid_split_read(tid) as u16);
+        Some(crate::kernel::recv_waiter_split::RecvEnteringIncarnation {
+            tid,
+            asid,
+            priority,
+        })
+    }
+
+    /// U9-TERMINAL-SETTLEMENT — where a DISOWNED entering incarnation actually is, for a settlement
+    /// that has already decided it will not return through the frame.
+    ///
+    /// The receive family's [`Self::recv_unwind_placement_outcome_split`] answers this for ITS
+    /// callers, and it may assume two things they have already done: Phase A cleared this CPU's
+    /// slot, and the TCB was written `Runnable`. A declined `Yield` has done neither, so reusing
+    /// that classifier would misfile two shapes — this CPU still holding the task would read as
+    /// `RunningElsewhere`, and a `Running` task placed nowhere as `Unpublished`, which the bridge
+    /// would then enqueue.
+    ///
+    /// So this composes the same two owners the receive classifier composes — the exact
+    /// incarnation's status (rank 2) and `SmpScheduler::placement_of` (rank 1), taken in that
+    /// order and never nested — and names those two shapes [`RecvUnwindOutcome::TableDisagree`].
+    /// Every other outcome means exactly what it means to the receive family, so the bridges'
+    /// existing capture / publish / landing rules apply to it unchanged.
+    ///
+    /// [`RecvUnwindOutcome::TableDisagree`]: crate::kernel::recv_waiter_split::RecvUnwindOutcome::TableDisagree
+    pub(crate) fn yield_forfeited_placement_split_read(
+        &self,
+        cpu: CpuId,
+        entering: crate::kernel::recv_waiter_split::RecvEnteringIncarnation,
+    ) -> crate::kernel::recv_waiter_split::RecvUnwindOutcome {
+        use crate::kernel::recv_waiter_split::RecvUnwindOutcome as U;
+        use crate::kernel::scheduler::TaskPlacement;
+        use crate::kernel::task::TaskStatus;
+        let status = self.task_incarnation_status_split_read(entering.tid, entering.asid);
+        let running = match status {
+            Some(TaskStatus::Running) => true,
+            Some(TaskStatus::Runnable) => false,
+            // Blocked, Faulted, Exited, Dead, Reserved — or a replacement incarnation. Another
+            // owner holds it; nothing may be claimed or published.
+            _ => return U::IncarnationMoved,
+        };
+        let placement = self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler).placement_of(crate::kernel::ipc::ThreadId(entering.tid))
+        });
+        match placement {
+            // This CPU still holds it, alone or doubly placed, and the frame has been disowned.
+            TaskPlacement::Current(on) | TaskPlacement::CurrentAndQueued(on) if on == cpu => {
+                U::TableDisagree
+            }
+            // Two placements elsewhere is the same disagreement on another CPU.
+            TaskPlacement::CurrentAndQueued(_) => U::TableDisagree,
+            TaskPlacement::Current(on) => U::RunningElsewhere(on),
+            // A `Running` task that nothing is executing.
+            TaskPlacement::Queued(_) | TaskPlacement::Nowhere if running => U::TableDisagree,
+            TaskPlacement::Queued(on) => U::QueuedRunnable(on),
+            TaskPlacement::Nowhere => U::Unpublished,
+        }
+    }
+
     /// U9-RECV-BLOCK2b §2 — this CPU's `current` placement as ONE rank-1 observation.
     ///
     /// `Restored` is a claim about a placement, and a placement is a pair: which task the slot

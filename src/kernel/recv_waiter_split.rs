@@ -200,6 +200,24 @@ pub enum RecvUnwindOutcome {
     /// receive. Another owner took the incarnation over and **nothing was written**. The caller
     /// must not resume through the entering frame.
     IncarnationMoved,
+    /// U9-TERMINAL-SETTLEMENT — the task table and the scheduler describe states that cannot both
+    /// be true, so no settlement can reconcile them from here.
+    ///
+    /// The receive family never produces it: its Phase A has already cleared this CPU's slot and
+    /// written `Runnable` before any unwind reads the post-state, so the two shapes this names are
+    /// unconstructible on its path. A declined `Yield` settles with neither step behind it, and
+    /// can observe both:
+    ///
+    /// * the incarnation still occupies **this** CPU's current slot (alone, or also queued)
+    ///   while the frame-authority owner has disowned the frame or a rollback was refused — this
+    ///   CPU is "running" a task it may not resume;
+    /// * the incarnation is `Running` yet queued or placed nowhere — a running task that nothing
+    ///   is executing.
+    ///
+    /// Every predicate is `false` for it, so both bridges' existing landing rule — idle only when a
+    /// dispatcher owns the task or this trap published it — refuses to idle and takes the
+    /// established `DISPATCH_TORN_FATAL` terminal, which is what the state is.
+    TableDisagree,
 }
 
 impl RecvUnwindOutcome {
@@ -246,6 +264,7 @@ impl RecvUnwindOutcome {
             Self::RunningElsewhere(_) => "running_elsewhere",
             Self::Unpublished => "unpublished",
             Self::IncarnationMoved => "incarnation_moved",
+            Self::TableDisagree => "table_disagree",
         }
     }
 }

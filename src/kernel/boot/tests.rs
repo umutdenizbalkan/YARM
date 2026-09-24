@@ -170175,9 +170175,35 @@ mod u9residual1_yield_family {
             EXEC_STATE.contains("yield_txn::settle_yield_decline("),
             "the broad adapter must reach it"
         );
+        // U9-TERMINAL-SETTLEMENT: the split route reaches the CALLER-BEARING half — the policy
+        // with no `NoCaller` in its type — passing the incarnation it captured before the
+        // transaction rather than a re-read of `current`. The `Option` wrapper the broad route
+        // calls delegates to that same half for every caller it has, so there is still one body.
+        assert_eq!(
+            YIELD_TXN
+                .matches("pub(crate) fn settle_caller_yield_decline<O: YieldOwners>(")
+                .count(),
+            1,
+            "one caller-bearing body"
+        );
         assert!(
-            SPLIT.contains("yield_txn::settle_yield_decline(owners, cpu, outgoing_tid, decline)"),
-            "and so must the split one"
+            YIELD_TXN
+                .split("pub(crate) fn settle_yield_decline<O: YieldOwners>(")
+                .nth(1)
+                .is_some_and(
+                    |b| b.contains("settle_caller_yield_decline(owners, cpu, tid, decline)")
+                ),
+            "the broad wrapper must delegate to it"
+        );
+        assert!(
+            SPLIT.contains(
+                "yield_txn::settle_caller_yield_decline(owners, cpu, entering.tid, decline)"
+            ),
+            "and the split route must reach it with the CAPTURED caller"
+        );
+        assert!(
+            !SPLIT.contains("yield_txn::settle_yield_decline("),
+            "the split route must not reach the wrapper whose `None` means a kernel-internal yield"
         );
         // Neither route may keep its own copy of the decline vocabulary.
         assert_eq!(
@@ -170370,26 +170396,66 @@ mod u9residual1_yield_family {
     /// requires.
     #[test]
     fn the_split_route_falls_back_only_before_it_commits() {
-        let route = SPLIT
-            .split("fn try_split_yield_into_frame(\n    shared: &SharedKernel,")
-            .nth(1)
-            .expect("the split Yield route");
-        let route = &route[..route
-            .find("\n#[cfg(feature = \"hosted-dev\")]")
-            .expect("its end")];
+        // U9-TERMINAL-SETTLEMENT re-derivation — and a correction.
+        //
+        // This asserted `route[decline..].contains("D::NotHandled")`: "a decline must [fall back],
+        // because every decline is pre-mutation". U9-TERMINAL-FINAL §2 made the decline arm
+        // SETTLE, so the claim had been false for a whole package — and the guard still passed,
+        // because the only `D::NotHandled` left in that window was inside a DOC COMMENT ("`D::
+        // NotHandled` was never a neutral answer for it"). It is asserted on code lines now, and
+        // it asserts what is true: the family filter is the only `NotHandled` NR 0 can produce.
+        fn code(src: &str) -> alloc::string::String {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with("///")
+                })
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n")
+        }
+        let body_of = |head: &str| {
+            let at = SPLIT.find(head).unwrap_or_else(|| panic!("{head}"));
+            let end = SPLIT[at..].find("\n}\n").map(|r| at + r).expect("its end");
+            code(&SPLIT[at..end])
+        };
+        let entry = body_of("fn try_split_yield_into_frame(\n    shared: &SharedKernel,");
+        assert_eq!(
+            entry.matches("D::NotHandled").count(),
+            1,
+            "the entry's one `NotHandled` is the family filter"
+        );
+        assert!(
+            entry.find("D::NotHandled").unwrap()
+                < entry
+                    .find("current_entering_incarnation_split_read")
+                    .unwrap(),
+            "and it answers before anything is captured or decided"
+        );
+        let route = body_of("pub(crate) fn split_yield_settle<");
         let commit = route.find("Ok(outcome) => {").expect("the commit arm");
         let decline = route.find("Err(decline) => {").expect("the decline arm");
         assert!(commit < decline);
         let commit_arm = &route[commit..decline];
         assert!(
-            commit_arm.contains("D::QueueAdvanceCommitted")
-                && !commit_arm.contains("D::NotHandled"),
+            commit_arm.contains("D::QueueAdvanceCommitted") && !commit_arm.contains("NotHandled"),
             "a committed yield must never hand back to the broad path"
         );
-        assert!(
-            route[decline..].contains("D::NotHandled"),
-            "and a decline must, because every decline is pre-mutation"
-        );
+        for (name, body) in [
+            ("split_yield_settle", route.as_str()),
+            (
+                "settle_declined_yield",
+                body_of("fn settle_declined_yield<").as_str(),
+            ),
+            (
+                "settle_yield_through_entering_frame",
+                body_of("fn settle_yield_through_entering_frame<").as_str(),
+            ),
+        ] {
+            assert!(
+                !body.contains("NotHandled"),
+                "`{name}` must settle a recognized NR 0, never decline it"
+            );
+        }
         // The result lands in the outgoing frame before the switch, exactly as `handle_yield` does.
         assert!(
             commit_arm.contains("frame.set_ok(0, 0, 0);"),
@@ -170456,23 +170522,72 @@ mod u9residual1_yield_family {
         //
         // The unit is still the ARM and the claim is still exactness: every increment sits inside
         // a committing arm, ahead of that arm's commit, with no decline between them.
+        //
+        // U9-TERMINAL-SETTLEMENT re-derivation: the unit is the PATH, and that is what the NR 0
+        // half of this claim has actually been since U9-TERMINAL-FINAL §2. The broad increment is
+        // unconditional — it counts every NR 0 before knowing how it will end — so the declined
+        // settlement already paid it at its top for its non-committing `task_missing` arm too.
+        // The new unowned-frame arm owes it for the same reason. What must hold is that every
+        // path through a recognized NR 0 counts EXACTLY ONCE:
+        //
+        //   split_yield_settle ─┬─ no entering incarnation ── count, fatal channel
+        //                       ├─ committed ─────────────── count, QueueAdvanceCommitted
+        //                       └─ declined ──> settle_declined_yield: count once at its top
+        //
+        // The architecture entry above them counts nothing; it only captures and delegates.
         let sites: alloc::vec::Vec<usize> = SPLIT
             .match_indices("shared.count_yield_split_mut();")
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
             sites.len(),
-            4,
-            "exactly the four committing arms count: NR 0 deferred, NR 0 declined-then-advanced, \
-             the preempting timer, and the idle-boundary timer advance"
+            5,
+            "exactly five increments: NR 0's three paths (unowned, committed, declined) and the \
+             timer's two committing arms"
         );
+        {
+            let at = SPLIT
+                .find("fn try_split_yield_into_frame(")
+                .expect("the NR 0 entry");
+            let end = SPLIT[at..].find("\n}\n").map(|r| at + r).expect("its end");
+            assert!(
+                !SPLIT[at..end].contains("count_yield_split_mut"),
+                "the architecture entry captures and delegates; it counts nothing"
+            );
+            let body = {
+                let at = SPLIT
+                    .find("pub(crate) fn split_yield_settle<")
+                    .expect("the settlement");
+                let end = SPLIT[at..].find("\n}\n").map(|r| at + r).expect("its end");
+                &SPLIT[at..end]
+            };
+            let unowned = body
+                .find("return D::Complete(Err(TrapHandleError::UnownedEnteringFrame));")
+                .expect("the unowned arm");
+            let committed = body
+                .find("D::QueueAdvanceCommitted")
+                .expect("the committed arm");
+            let declined = body
+                .find("settle_declined_yield(shared, owners, cpu, frame, entering, decline)")
+                .expect("the declined arm");
+            let counts: alloc::vec::Vec<usize> = body
+                .match_indices("shared.count_yield_split_mut();")
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(counts.len(), 2, "one per non-delegating path");
+            assert!(
+                counts[0] < unowned && unowned < counts[1] && counts[1] < committed,
+                "each increment precedes its own path's disposition"
+            );
+            assert!(
+                !body[counts[1] + "shared.count_yield_split_mut();".len()..declined]
+                    .contains("count_yield_split_mut")
+                    && committed < declined,
+                "and the delegating arm counts nothing here — its callee counts once"
+            );
+        }
         for (route, marker, arms) in [
-            (
-                "fn try_split_yield_into_frame",
-                "D::QueueAdvanceCommitted",
-                1,
-            ),
-            ("fn settle_declined_yield(", "D::QueueAdvanceCommitted", 1),
+            ("fn settle_declined_yield<", "D::QueueAdvanceCommitted", 1),
             // U9-TIMER-FINAL re-derivation: the recognized timer body is its own function now,
             // and the counting arms went with it. `try_split_timer_into_frame` is the family
             // filter and counts nothing at all.
@@ -170978,12 +171093,16 @@ mod u9yield2_family_edge {
     fn every_yield_decline_still_falls_back_to_the_terminal_dispatcher() {
         // The window covers the whole production route, which grew when its CPU-bound admission
         // and its decline arm became settlements instead of declines.
-        let route = code(body_of(SPLIT, "fn try_split_yield_into_frame", 5200));
+        // U9-TERMINAL-SETTLEMENT: the route is now an architecture ENTRY that captures the
+        // entering incarnation and delegates, plus `split_yield_settle`, which holds the
+        // transaction and its decline arm. The window spans both.
+        let route = code(body_of(SPLIT, "fn try_split_yield_into_frame", 9000));
         assert!(
             route.contains("Err(decline) => {")
-                && route
-                    .contains("settle_declined_yield(shared, &mut owners, cpu, frame, decline)"),
-            "the decline arm must SETTLE, not decline"
+                && route.contains(
+                    "settle_declined_yield(shared, owners, cpu, frame, entering, decline)"
+                ),
+            "the decline arm must SETTLE, not decline — and with the captured incarnation"
         );
         assert_eq!(
             route.matches("D::NotHandled").count(),
@@ -170999,19 +171118,26 @@ mod u9yield2_family_edge {
             "the surviving `NotHandled` must belong to the family filter, not to a decline"
         );
         // And the settlement itself cannot answer `NotHandled` at all.
-        let settlement = code(body_of(SPLIT, "fn settle_declined_yield(", 7000));
+        let settlement = code(body_of(SPLIT, "fn settle_declined_yield<", 7000));
         assert_eq!(
             settlement.matches("NotHandled").count(),
             0,
             "no declined yield may reach a broad dispatcher"
         );
-        // Every arm of the shared policy is covered by the settlement.
-        for arm in ["S::TaskMissing", "S::NoCaller", "S::QueueAdvance {"] {
+        // Every arm of the CALLER-BEARING policy is covered — and there is no `NoCaller` to cover:
+        // U9-TERMINAL-SETTLEMENT removed it from the type the split route receives, because a
+        // userspace NR 0 always has a caller and the kernel-internal answer must not reach its
+        // frame. That is asserted as an absence, not skipped.
+        for arm in ["S::TaskMissing", "S::QueueAdvance {"] {
             assert!(
                 settlement.contains(arm),
                 "the settlement must cover `{arm}`"
             );
         }
+        assert!(
+            !settlement.contains("NoCaller"),
+            "the kernel-internal `NoCaller` answer must be unreachable from the userspace route"
+        );
     }
 
     /// **`NoTrapDrainer` is unreachable for a userspace NR 0**: both bridges open the
@@ -175246,15 +175372,31 @@ mod u9pf1_not_running {
         // could stop answering `NotHandled` without the two routes drifting. The ANSWER is
         // unchanged and is asserted where it now lives.
         const YIELD_TXN_SRC: &str = include_str!("../syscall/yield_txn.rs");
-        let arm = YIELD_TXN_SRC
-            .split("YieldDecline::NotRunning => {")
-            .nth(1)
-            .and_then(|s| s.split("\n        }").next())
-            .expect("the shared NotRunning arm");
-        assert!(
-            arm.contains("return YieldDeclineSettlement::TaskMissing;"),
-            "the policy answers this refusal with TaskMissing, for every status"
-        );
+        // U9-TERMINAL-SETTLEMENT: the policy is now two functions — the caller-bearing half the
+        // split route calls, and the `Option` wrapper `yield_current` calls, which delegates to it
+        // for every caller it has. `NotRunning` is answered `TaskMissing` in BOTH, so the answer
+        // is asserted in both rather than in whichever one happens to come first in the file.
+        for (policy, answer) in [
+            (
+                "pub(crate) fn settle_caller_yield_decline<",
+                "return CallerDeclineSettlement::TaskMissing;",
+            ),
+            (
+                "pub(crate) fn settle_yield_decline<",
+                "YieldDeclineSettlement::TaskMissing",
+            ),
+        ] {
+            let arm = YIELD_TXN_SRC
+                .split(policy)
+                .nth(1)
+                .and_then(|s| s.split("YieldDecline::NotRunning => {").nth(1))
+                .and_then(|s| s.split("\n        }").next())
+                .unwrap_or_else(|| panic!("the NotRunning arm of `{policy}`"));
+            assert!(
+                arm.contains(answer),
+                "`{policy}` answers this refusal with TaskMissing, for every status"
+            );
+        }
         assert!(
             EXEC_STATE.contains(
                 "YieldDeclineSettlement::TaskMissing => {\n                            return Err(KernelError::TaskMissing);"
@@ -189904,57 +190046,21 @@ mod u9terminalfinal_mutation {
         );
     }
 
-    // ── B. UNSAFE FRAME RETURN ───────────────────────────────────────────────────────────────
+    // ── B. UNSAFE FRAME RETURN — REMOVED as a lexical guard ─────────────────────────────────
     //
-    // A settlement that writes a result into the ENTERING frame, or encodes an error that
-    // returns through it, without first establishing that the frame is still the entering
-    // task's to return through. §2 required this of every one of NR 0's decline settlements.
-
-    fn authenticates_before_returning_through_the_frame(body: &str) -> bool {
-        let Some(auth) = body.find("entering_frame_authority_split_read(") else {
-            return false;
-        };
-        // Every write into the entering frame, and every encoded error, must come after the
-        // authority is established.
-        let writes = body
-            .match_indices("frame.set_ok(")
-            .chain(body.match_indices("TrapHandleError::Syscall("))
-            .map(|(at, _)| at);
-        writes.into_iter().all(|at| at > auth)
-    }
-
-    /// Mirrors the U9-D6-FINAL §1 / U9-TERMINAL-FINAL §2 frame-authority guards.
-    #[test]
-    fn the_frame_authority_scanner_fails_when_the_authority_is_dropped() {
-        let settle = body_of(SPLIT, "fn settle_declined_yield(");
-        assert!(
-            authenticates_before_returning_through_the_frame(&settle),
-            "the real settlement must establish frame authority before returning through it"
-        );
-
-        // THE MUTATION: the authority read is dropped. The settlement still compiles in shape,
-        // still answers the canonical error, and still writes the canonical lanes — it simply
-        // returns through a frame it has not proven is still the caller's. That is the failure
-        // mode §2 names: "a returned error still needs authority to return through the entering
-        // frame."
-        let mutated = settle.replace("entering_frame_authority_split_read(", "no_authority_read(");
-        assert_ne!(mutated, settle, "the mutation must actually apply");
-        assert!(
-            !authenticates_before_returning_through_the_frame(&mutated),
-            "the scanner must FAIL when the authority read is removed"
-        );
-
-        // The second half of the same property: authority must precede the FIRST write, not
-        // merely appear somewhere. Moving it after them is the subtler regression.
-        let first_write = settle.find("frame.set_ok(").expect("a frame write");
-        let auth = settle
-            .find("entering_frame_authority_split_read(")
-            .expect("the authority read");
-        assert!(
-            auth < first_write,
-            "and it must precede the first write, not merely exist"
-        );
-    }
+    // U9-TERMINAL-SETTLEMENT: this section used to pin frame authority by TEXT — the authority
+    // read had to appear before the first `frame.set_ok(` in `settle_declined_yield`. It could not
+    // fail on the regression it existed for. Replace the invocation with `let owns = false;`, or
+    // compute the verdict and never branch on it (which is what the settlement actually did: its
+    // `TaskMissing` arm computed `owns` and only logged it), and the closure DEFINITION still sat
+    // above the return, so the scanner still passed.
+    //
+    // Frame authority is now pinned BEHAVIOURALLY, in `u9terminal_settlement_yield`: each
+    // forfeited-frame case builds the state through production owners, runs the production
+    // settlement, and requires a non-returning disposition. Ignoring the verdict turns that
+    // disposition into `Complete(_)`, which fails the case — see
+    // `ignoring_the_verdict_would_return_through_a_forfeited_frame` for the property stated
+    // directly.
 
     // ── C. A REINTRODUCED BROAD ACQUISITION ──────────────────────────────────────────────────
 
@@ -190218,5 +190324,639 @@ mod u9terminalfinal_enqueue_class {
             route.contains("envelope=preserved"),
             "the transfer-state attestation must say what it attests"
         );
+    }
+}
+
+/// U9-TERMINAL-SETTLEMENT §3 — **the declined NR 0 settlement, at its executable boundary.**
+///
+/// Every case drives `syscall_split::split_yield_settle` — the production settlement, the body
+/// the architecture entry calls — with the production `SharedYieldOwners` over a real
+/// `SharedKernel`. Where an interleaving has to be forced, an interposing owner changes the state
+/// through the kernel's own owners at the named step and then DELEGATES to the production
+/// method, or refuses exactly as the production primitive refuses.
+///
+/// The disposition is then run through [`bridge`], which performs the shared bridge's
+/// `BlockUnsettled` steps with the production owners — the capture
+/// (`split_return_commit_context_split`) and the publication (`enqueue_task_split`) — and applies
+/// its landing rule, so each case asserts what the CPU does next: RETURN through the entering
+/// frame, SWITCH through the Yield drain, IDLE on a settled task, or take the TORN terminal.
+/// Scheduler and TCB post-state are asserted alongside.
+mod u9terminal_settlement_yield {
+    use crate::kernel::boot::{Bootstrap, TrapHandleError};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::recv_waiter_split::{RecvEnteringIncarnation, RecvUnwindOutcome as O};
+    use crate::kernel::scheduler::{CpuId, TaskPlacement as P};
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::yield_txn::{
+        PreemptApplied, SharedYieldOwners, YieldDecline, YieldOwners,
+    };
+    use crate::kernel::syscall_split::{SplitDispatchDisposition as D, split_yield_settle};
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    const CPU: CpuId = CpuId(0);
+    /// The entering task. Not tid 0: that is `IDLE_TID`, whose preempt is the idle no-op twin and
+    /// whose capture the bridge refuses, so it cannot exercise an ordinary incarnation.
+    const E: u64 = 1;
+    /// A recognizable pre-trap value in the frame's result lanes.
+    const UNTOUCHED: usize = 0xDEAD;
+
+    /// What the trap does next, as the bridge decides it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Cpu {
+        /// The bridge finalizes and resumes the entering frame with this error lane.
+        Returns { error: usize },
+        /// The Yield drain switches away from the entering frame.
+        Switches,
+        /// A `BlockUnsettled` landing is licensed: the task is settled somewhere a dispatcher
+        /// will take it. `published` says whether THIS bridge published it.
+        Idles { published: bool },
+        /// `BlockUnsettled` with no licensed landing: `DISPATCH_TORN_FATAL`.
+        TornFatal,
+        /// Any non-`Syscall` error: the syscall path's fatal channel.
+        Fatal,
+        /// `NotHandled` — never an answer for a recognized NR 0.
+        FallsBack,
+    }
+
+    fn set_status(k: &SharedKernel, tid: u64, status: TaskStatus) {
+        k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .expect("the task exists")
+                    .status = status;
+            })
+        });
+    }
+    fn status(k: &SharedKernel, tid: u64) -> Option<TaskStatus> {
+        k.with(|s| s.task_status(tid))
+    }
+    fn placement(k: &SharedKernel, tid: u64) -> P {
+        k.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler).placement_of(ThreadId(tid))
+        })
+    }
+    fn yield_calls(k: &SharedKernel) -> u64 {
+        k.with(|s| s.ipc_path_telemetry().scheduler_yield_calls)
+    }
+    fn reservation() -> Option<u64> {
+        crate::kernel::boot::yield_dispatch_is_deferred(CPU.0 as usize)
+            .then(|| crate::kernel::boot::yield_dispatch_outgoing(CPU.0 as usize))
+            .flatten()
+    }
+    fn reset_globals() {
+        crate::kernel::boot::yield_dispatch_clear(CPU.0 as usize);
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[CPU.0 as usize]
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `E` is CPU 0's current and `Running` in its own address space; task 0 waits on the queue,
+    /// so a queue advance has somewhere to go. Built through the scheduler's own owners.
+    fn fixture() -> (SharedKernel, Asid) {
+        reset_globals();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            s.register_task(E).expect("task E");
+            let (asid, _map) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(E, asid).expect("bind");
+            s.block_current_cpu().expect("task 0 was current");
+            s.enqueue_on_cpu(CPU, E).expect("enqueue E");
+            assert_eq!(s.dispatch_next_on_cpu(CPU), Some(E), "E wins the CPU");
+            s.enqueue_on_cpu(CPU, 0).expect("task 0 waits");
+            asid
+        });
+        set_status(&k, E, TaskStatus::Running);
+        set_status(&k, 0, TaskStatus::Runnable);
+        assert_eq!(placement(&k, E), P::Current(CPU), "fixture: E is current");
+        assert_eq!(placement(&k, 0), P::Queued(CPU), "fixture: 0 is queued");
+        (k, asid)
+    }
+
+    /// The entering incarnation, captured the way the architecture entry captures it.
+    fn capture(k: &SharedKernel) -> RecvEnteringIncarnation {
+        let entering = k
+            .current_entering_incarnation_split_read(CPU)
+            .expect("E is current, so an incarnation is captured");
+        assert_eq!(entering.tid, E);
+        entering
+    }
+
+    fn fresh_frame() -> TrapFrame {
+        let mut frame = TrapFrame::new(crate::kernel::syscall::SYSCALL_YIELD_NR, [0; 6]);
+        frame.ret0 = UNTOUCHED;
+        frame.saved_pc = 0x4000_1000;
+        frame.saved_sp = 0x7fff_0000;
+        frame
+    }
+
+    /// The bridge's reaction to a disposition. The `BlockUnsettled` steps run the production
+    /// capture and publication owners in the bridge's order, then apply its landing rule — both
+    /// ports' variants of it, which must agree on every case here.
+    fn bridge(k: &SharedKernel, frame: &mut TrapFrame, d: &D) -> Cpu {
+        match d {
+            D::NotHandled => Cpu::FallsBack,
+            D::Complete(Ok(())) => Cpu::Returns { error: frame.error },
+            D::Complete(Err(TrapHandleError::Syscall(e))) => {
+                frame.set_err(e.code());
+                Cpu::Returns { error: e.code() }
+            }
+            D::Complete(Err(_)) => Cpu::Fatal,
+            D::QueueAdvanceCommitted => Cpu::Switches,
+            D::BlockUnsettled(u) => {
+                let identity = crate::runtime::SplitReturnIdentity {
+                    tid: u.entering.tid,
+                    asid: u.entering.asid,
+                };
+                let captured = u.outcome.may_capture_continuation()
+                    && k.split_return_commit_context_split(identity, frame.capture_user_context());
+                let published = captured && k.enqueue_task_split(CPU, u.entering.tid).is_ok();
+                let slot = k.current_tid_split_read(CPU);
+                let shared_clear = slot.is_none_or(|t| t == u.entering.tid);
+                let riscv_clear = matches!(slot, None | Some(0)) || slot == Some(u.entering.tid);
+                let settled =
+                    |clear: bool| (u.outcome.dispatcher_already_owns_task() || published) && clear;
+                assert_eq!(
+                    settled(shared_clear),
+                    settled(riscv_clear),
+                    "both ports' landing rules agree on this state"
+                );
+                if settled(shared_clear) {
+                    Cpu::Idles { published }
+                } else {
+                    Cpu::TornFatal
+                }
+            }
+            other => panic!("NR 0 never produces {other:?}"),
+        }
+    }
+
+    /// Runs the production settlement for a captured incarnation, and the bridge after it.
+    fn settle<Ow: YieldOwners>(
+        k: &SharedKernel,
+        owners: &mut Ow,
+        entering: Option<RecvEnteringIncarnation>,
+        frame: &mut TrapFrame,
+    ) -> (D, Cpu) {
+        let before = yield_calls(k);
+        let d = split_yield_settle(k, owners, CPU, frame, entering);
+        assert_eq!(
+            yield_calls(k),
+            before + 1,
+            "every recognized NR 0 is counted exactly once, whatever its settlement"
+        );
+        let cpu = bridge(k, frame, &d);
+        (d, cpu)
+    }
+
+    fn outcome_of(d: D) -> O {
+        match d {
+            D::BlockUnsettled(u) => u.outcome,
+            other => panic!("expected the non-returning settlement, got {other:?}"),
+        }
+    }
+
+    /// The production owners, with named interleavings. Every method delegates unless its knob
+    /// says otherwise, and a refusal is the refusal the production primitive makes.
+    struct Interpose<'a> {
+        inner: SharedYieldOwners<'a>,
+        /// `reserve_yield_deferral` loses its CAS (another route armed the cell first).
+        refuse_reserve: bool,
+        /// Runs just before `reenqueue_and_clear_current` delegates.
+        before_reenqueue: Option<fn(&SharedKernel)>,
+        /// The re-enqueue's own enqueue fails: the primitive restores `current` and answers
+        /// `None`, so the state is exactly as it was. Not delegated.
+        refuse_reenqueue: bool,
+        /// Runs just before `rollback_preempt_outgoing` delegates.
+        before_rollback: Option<fn(&SharedKernel)>,
+        /// The rollback reports refusal without writing.
+        refuse_rollback: bool,
+        rollbacks: usize,
+    }
+
+    impl<'a> Interpose<'a> {
+        fn new(k: &'a SharedKernel) -> Self {
+            Self {
+                inner: SharedYieldOwners { shared: k },
+                refuse_reserve: false,
+                before_reenqueue: None,
+                refuse_reenqueue: false,
+                before_rollback: None,
+                refuse_rollback: false,
+                rollbacks: 0,
+            }
+        }
+    }
+
+    impl YieldOwners for Interpose<'_> {
+        fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
+            self.inner.current_tid_on_cpu(cpu)
+        }
+        fn is_bootstrap_cpu(&self, cpu: CpuId) -> bool {
+            self.inner.is_bootstrap_cpu(cpu)
+        }
+        fn colliding_deferral_pending(&self, cpu: CpuId) -> bool {
+            self.inner.colliding_deferral_pending(cpu)
+        }
+        fn queue_advance_admission(
+            &self,
+            cpu: CpuId,
+        ) -> Result<(), crate::kernel::boot::TerminalAdmissionRefusal> {
+            self.inner.queue_advance_admission(cpu)
+        }
+        fn reserve_yield_deferral(&mut self, cpu: CpuId, outgoing: u64) -> bool {
+            !self.refuse_reserve && self.inner.reserve_yield_deferral(cpu, outgoing)
+        }
+        fn release_yield_deferral(&mut self, cpu: CpuId) {
+            self.inner.release_yield_deferral(cpu)
+        }
+        fn preempt_outgoing(&mut self, tid: u64) -> Option<PreemptApplied> {
+            self.inner.preempt_outgoing(tid)
+        }
+        fn rollback_preempt_outgoing(&mut self, tid: u64, applied: PreemptApplied) -> bool {
+            self.rollbacks += 1;
+            if let Some(f) = self.before_rollback {
+                f(self.inner.shared);
+            }
+            !self.refuse_rollback && self.inner.rollback_preempt_outgoing(tid, applied)
+        }
+        fn reenqueue_and_clear_current(&mut self, cpu: CpuId) -> Option<u64> {
+            if let Some(f) = self.before_reenqueue {
+                f(self.inner.shared);
+            }
+            if self.refuse_reenqueue {
+                return None;
+            }
+            self.inner.reenqueue_and_clear_current(cpu)
+        }
+    }
+
+    // ── The switching baseline ──────────────────────────────────────────────────────────────
+
+    /// A declined yield whose caller still owns everything advances the queue: the Yield drain
+    /// switches away and the entering frame is never returned through. The decline is the
+    /// hosted build's own — no trap drainer is registered, so admission refuses.
+    #[test]
+    fn a_declined_yield_advances_the_queue_and_switches() {
+        let (k, _asid) = fixture();
+        let entering = capture(&k);
+        let mut frame = fresh_frame();
+        let (_, cpu) = settle(
+            &k,
+            &mut SharedYieldOwners { shared: &k },
+            Some(entering),
+            &mut frame,
+        );
+        assert_eq!(cpu, Cpu::Switches);
+        assert_eq!(status(&k, E), Some(TaskStatus::Runnable));
+        assert_eq!(placement(&k, E), P::Queued(CPU), "E waits its turn");
+        assert_eq!(
+            k.current_tid_split_read(CPU),
+            None,
+            "the drain owns the slot"
+        );
+        assert_eq!(reservation(), Some(E), "the drain's deferral names E");
+        assert_eq!((frame.error, frame.ret0), (0, 0), "NR 0 answered ok");
+        reset_globals();
+    }
+
+    // ── Owned frames: the return is licensed ────────────────────────────────────────────────
+
+    /// `task_missing` through a frame E still owns: the errno returns through it and nothing
+    /// moves. E is `Runnable` yet current, so the owed `Running → Runnable` refuses.
+    #[test]
+    fn task_missing_through_an_owned_frame_returns_its_errno() {
+        let (k, _asid) = fixture();
+        let entering = capture(&k);
+        set_status(&k, E, TaskStatus::Runnable);
+        let mut frame = fresh_frame();
+        let (d, cpu) = settle(
+            &k,
+            &mut SharedYieldOwners { shared: &k },
+            Some(entering),
+            &mut frame,
+        );
+        let errno = SyscallError::from(crate::kernel::boot::KernelError::TaskMissing).code();
+        assert!(
+            matches!(
+                d,
+                D::Complete(Err(TrapHandleError::Syscall(e)))
+                    if e == SyscallError::from(crate::kernel::boot::KernelError::TaskMissing)
+            ),
+            "{d:?}"
+        );
+        assert_eq!(cpu, Cpu::Returns { error: errno });
+        assert_eq!(placement(&k, E), P::Current(CPU), "E keeps the CPU");
+        assert_eq!(status(&k, E), Some(TaskStatus::Runnable), "nothing written");
+        assert_eq!(reservation(), None);
+    }
+
+    /// `reenqueue_refused` where the enqueue itself failed: the primitive restored `current`,
+    /// E owns its frame, so the preempt is rolled back and the canonical `Ok` returns.
+    #[test]
+    fn a_refused_reenqueue_with_the_frame_owned_rolls_back_and_returns() {
+        let (k, _asid) = fixture();
+        let entering = capture(&k);
+        let mut owners = Interpose::new(&k);
+        owners.refuse_reenqueue = true;
+        let mut frame = fresh_frame();
+        let (d, cpu) = settle(&k, &mut owners, Some(entering), &mut frame);
+        assert!(matches!(d, D::Complete(Ok(()))), "{d:?}");
+        assert_eq!(cpu, Cpu::Returns { error: 0 });
+        assert_eq!(owners.rollbacks, 1, "the owed transition was undone");
+        assert_eq!(
+            status(&k, E),
+            Some(TaskStatus::Running),
+            "E resumes Running"
+        );
+        assert_eq!(placement(&k, E), P::Current(CPU));
+        assert_eq!(reservation(), None, "the reservation was released");
+        assert_eq!(frame.ret0, 0, "the frame carries NR 0's answer");
+    }
+
+    /// `reservation_unavailable` with the frame owned: rolled back, and `TaskMissing` returns.
+    #[test]
+    fn an_unavailable_reservation_with_the_frame_owned_rolls_back_and_returns() {
+        let (k, _asid) = fixture();
+        let entering = capture(&k);
+        let mut owners = Interpose::new(&k);
+        owners.refuse_reserve = true;
+        let mut frame = fresh_frame();
+        let (_, cpu) = settle(&k, &mut owners, Some(entering), &mut frame);
+        let errno = SyscallError::from(crate::kernel::boot::KernelError::TaskMissing).code();
+        assert_eq!(cpu, Cpu::Returns { error: errno });
+        assert_eq!(owners.rollbacks, 1);
+        assert_eq!(status(&k, E), Some(TaskStatus::Running));
+        assert_eq!(placement(&k, E), P::Current(CPU));
+        assert_eq!(reservation(), None);
+    }
+
+    // ── Forfeited frames: the return does not happen ───────────────────────────────────────
+
+    /// **The verdict, stated directly.** The re-enqueue refuses because the slot is ALREADY
+    /// empty — the primitive's other refusal, which restores nothing. E has been preempted to
+    /// `Runnable` and is placed nowhere, so the frame is forfeited.
+    ///
+    /// Ignoring the verdict here returns through the frame: the settlement rolls E back to
+    /// `Running` and answers `Complete(Ok)`, and the CPU resumes a task that is `Running`, in no
+    /// current slot and on no queue — the exact shape `dispatch_torn_fatal` exists for,
+    /// manufactured by the settlement itself. This case fails on that mutation, as do the three
+    /// that follow it.
+    #[test]
+    fn ignoring_the_verdict_would_return_through_a_forfeited_frame() {
+        let (k, _asid) = fixture();
+        let entering = capture(&k);
+        let mut owners = Interpose::new(&k);
+        owners.before_reenqueue = Some(|k: &SharedKernel| {
+            k.with(|s| s.block_current_cpu()).expect("E was current");
+        });
+        let mut frame = fresh_frame();
+        let (d, cpu) = settle(&k, &mut owners, Some(entering), &mut frame);
+        assert!(
+            !matches!(d, D::Complete(_)),
+            "a forfeited frame must not be returned through; got {d:?}"
+        );
+        assert_eq!(outcome_of(d), O::Unpublished);
+        assert_eq!(
+            owners.rollbacks, 0,
+            "nothing is rolled back on a forfeited frame"
+        );
+        // The bridge captured the completed NR 0 into E and published it; the CPU idles.
+        assert_eq!(cpu, Cpu::Idles { published: true });
+        assert_eq!(status(&k, E), Some(TaskStatus::Runnable));
+        assert_eq!(placement(&k, E), P::Queued(CPU), "E is dispatchable again");
+        assert_eq!(
+            reservation(),
+            None,
+            "no drain will consume it, so it was released"
+        );
+        let saved_pc = k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == E)
+                    .map(|t| t.user_context.instruction_ptr.0)
+            })
+        });
+        assert_eq!(
+            saved_pc,
+            Some(0x4000_1000),
+            "the continuation E will resume from is this trap's frame"
+        );
+    }
+
+    /// `task_missing` through a frame E no longer owns because a dispatch put it back on the
+    /// queue: a dispatcher already owns E, so the CPU idles and nothing is captured over E's
+    /// dispatchable context. The interleaving sits between the capture and the transaction.
+    #[test]
+    fn task_missing_through_a_queued_frame_idles_without_touching_it() {
+        let (k, _asid) = fixture();
+        let entering = capture(&k);
+        k.with(|s| {
+            s.block_current_cpu().expect("E was current");
+            s.enqueue_on_cpu(CPU, E).expect("E queued");
+        });
+        set_status(&k, E, TaskStatus::Runnable);
+        let mut frame = fresh_frame();
+        let (d, cpu) = settle(
+            &k,
+            &mut SharedYieldOwners { shared: &k },
+            Some(entering),
+            &mut frame,
+        );
+        assert_eq!(outcome_of(d), O::QueuedRunnable(CPU));
+        assert_eq!(cpu, Cpu::Idles { published: false });
+        assert_eq!(
+            placement(&k, E),
+            P::Queued(CPU),
+            "left exactly where it was"
+        );
+        assert_eq!(status(&k, E), Some(TaskStatus::Runnable));
+        assert_ne!(
+            frame.error, 0,
+            "the unreturned frame still carries the errno"
+        );
+    }
+
+    /// A REPLACEMENT incarnation — same tid, a different address space — occupies the slot. The
+    /// captured ASID is the one authenticated, so the frame is forfeited; re-reading the ASID
+    /// from the replacement would have authenticated it.
+    #[test]
+    fn a_replacement_incarnation_is_not_authenticated_by_its_own_asid() {
+        let (k, old_asid) = fixture();
+        let entering = capture(&k);
+        assert_eq!(entering.asid, old_asid);
+        let new_asid = k.with(|s| {
+            let (asid, _map) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(E, asid).expect("rebind");
+            asid
+        });
+        set_status(&k, E, TaskStatus::Runnable);
+        assert_eq!(
+            k.entering_frame_authority_split_read(CPU, E, new_asid),
+            crate::kernel::task_transition::EnteringFrameAuthority::OwnsEnteringFrame,
+            "a fresh ASID read WOULD authenticate the replacement"
+        );
+        let mut frame = fresh_frame();
+        let (d, cpu) = settle(
+            &k,
+            &mut SharedYieldOwners { shared: &k },
+            Some(entering),
+            &mut frame,
+        );
+        assert_eq!(outcome_of(d), O::IncarnationMoved);
+        assert_eq!(
+            cpu,
+            Cpu::TornFatal,
+            "nothing may run the replacement from this frame"
+        );
+        let saved_pc = k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == E)
+                    .map(|t| t.user_context.instruction_ptr.0)
+            })
+        });
+        assert_ne!(
+            saved_pc,
+            Some(0x4000_1000),
+            "the old frame was never captured into the replacement"
+        );
+    }
+
+    /// E is `Blocked` yet this CPU's current: the owed transition refuses (`task_missing`) and
+    /// the frame is not resumable. The table and scheduler disagree; the bridge's terminal.
+    #[test]
+    fn a_blocked_current_is_forfeited_and_torn() {
+        let (k, _asid) = fixture();
+        let entering = capture(&k);
+        set_status(&k, E, TaskStatus::Blocked(WaitReason::Poll));
+        let mut frame = fresh_frame();
+        let (d, cpu) = settle(
+            &k,
+            &mut SharedYieldOwners { shared: &k },
+            Some(entering),
+            &mut frame,
+        );
+        assert_eq!(outcome_of(d), O::IncarnationMoved);
+        assert_eq!(cpu, Cpu::TornFatal);
+        assert_eq!(placement(&k, E), P::Current(CPU));
+    }
+
+    // ── Rollback refusal: the return does not happen ──────────────────────────────────────
+
+    /// The frame is owned, but the rollback is refused and wrote nothing. E is `Runnable` in
+    /// this CPU's slot: the table and the scheduler disagree, so the trap does not resume it.
+    #[test]
+    fn a_refused_rollback_does_not_return_through_the_frame() {
+        let (k, _asid) = fixture();
+        let entering = capture(&k);
+        let mut owners = Interpose::new(&k);
+        owners.refuse_reenqueue = true;
+        owners.refuse_rollback = true;
+        let mut frame = fresh_frame();
+        let (d, cpu) = settle(&k, &mut owners, Some(entering), &mut frame);
+        assert_eq!(owners.rollbacks, 1);
+        assert_eq!(outcome_of(d), O::TableDisagree);
+        assert_eq!(cpu, Cpu::TornFatal);
+        assert_eq!(status(&k, E), Some(TaskStatus::Runnable));
+        assert_eq!(
+            reservation(),
+            None,
+            "released even though the trap does not return"
+        );
+    }
+
+    /// The rollback is refused by the production primitive itself, because another owner wrote
+    /// E's status between the authority read and the rollback.
+    #[test]
+    fn a_rollback_refused_by_a_real_status_change_does_not_return() {
+        let (k, _asid) = fixture();
+        let entering = capture(&k);
+        let mut owners = Interpose::new(&k);
+        owners.refuse_reserve = true;
+        owners.before_rollback = Some(|k: &SharedKernel| {
+            set_status(k, E, TaskStatus::Blocked(WaitReason::Poll));
+        });
+        let mut frame = fresh_frame();
+        let (d, cpu) = settle(&k, &mut owners, Some(entering), &mut frame);
+        assert_eq!(owners.rollbacks, 1);
+        assert_eq!(outcome_of(d), O::IncarnationMoved);
+        assert_eq!(cpu, Cpu::TornFatal);
+        assert_eq!(status(&k, E), Some(TaskStatus::Blocked(WaitReason::Poll)));
+    }
+
+    // ── No caller ───────────────────────────────────────────────────────────────────────────
+
+    /// A userspace NR 0 on a CPU whose slot names no task: the capture is `None`, and the
+    /// settlement takes the fatal channel — it neither answers the frame nor touches the queue.
+    ///
+    /// The KERNEL-INTERNAL yield with nothing to yield is a different thing, and keeps its own
+    /// answer: the broad policy still settles it as `NoCaller`.
+    #[test]
+    fn a_missing_caller_takes_the_fatal_channel_not_the_kernel_internal_answer() {
+        let (k, _asid) = fixture();
+        k.with(|s| s.block_current_cpu()).expect("E was current");
+        assert_eq!(k.current_entering_incarnation_split_read(CPU), None);
+        let mut frame = fresh_frame();
+        let (d, cpu) = settle(&k, &mut SharedYieldOwners { shared: &k }, None, &mut frame);
+        assert!(
+            matches!(d, D::Complete(Err(TrapHandleError::UnownedEnteringFrame))),
+            "{d:?}"
+        );
+        assert_eq!(cpu, Cpu::Fatal);
+        assert_eq!(
+            (frame.ret0, frame.error),
+            (UNTOUCHED, 0),
+            "the frame was not answered"
+        );
+        assert_eq!(
+            placement(&k, 0),
+            P::Queued(CPU),
+            "the queue was not advanced"
+        );
+        assert_eq!(reservation(), None);
+
+        let internal = k.with(|s| {
+            let mut broad = crate::kernel::syscall::yield_txn::BroadYieldOwners { kernel: s };
+            crate::kernel::syscall::yield_txn::settle_yield_decline(
+                &mut broad,
+                CPU,
+                None,
+                YieldDecline::NoCurrent,
+            )
+        });
+        assert_eq!(
+            internal,
+            crate::kernel::syscall::yield_txn::YieldDeclineSettlement::NoCaller
+        );
+    }
+
+    /// The model above is the bridges' rule, not an invention of this module.
+    #[test]
+    fn the_bridge_model_is_the_bridges_rule() {
+        for needle in [
+            "let captured = if outcome.may_capture_continuation() {",
+            ".enqueue_task_split(cpu, entering_incarnation.tid)",
+            "let slot_clear = slot.is_none_or(|t| t == entering_incarnation.tid);",
+            "let settled = (outcome.dispatcher_already_owns_task() || published) && slot_clear;",
+        ] {
+            assert!(TRAP_ENTRY.contains(needle), "shared bridge: `{needle}`");
+        }
+        for needle in [
+            "let captured = outcome.may_capture_continuation()",
+            "let published = captured && shared.enqueue_task_split(cpu, entering.tid).is_ok();",
+            "let slot_clear = matches!(slot, None | Some(0)) || slot == Some(entering.tid);",
+            "if !(outcome.dispatcher_already_owns_task() || published) || !slot_clear {",
+        ] {
+            assert!(RV_TRAP.contains(needle), "riscv64 bridge: `{needle}`");
+        }
     }
 }

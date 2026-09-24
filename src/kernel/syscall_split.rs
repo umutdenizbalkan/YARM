@@ -10070,6 +10070,444 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
     }
 }
 
+// U9-TERMINAL-SETTLEMENT: the NR 0 route and its settlement live ABOVE the test module. They
+// used to follow it, and every corpus-scanning guard that stops at `#[cfg(test)] mod tests`
+// silently exempted them — which is how a settlement that returned through an unauthenticated
+// frame passed guards written to catch exactly that.
+/// U9-RESIDUAL1 §3 — the syscall number this trap ACTUALLY carries, per architecture.
+///
+/// x86_64 and RISC-V decode the number into the frame at entry, so `frame.syscall_num()` is
+/// authoritative there. AArch64 does not: `pre_split_import_syscall_abi` imports the decoded ABI
+/// only for an allowlisted number, and an unlisted syscall leaves the frame reading `nr = 0`.
+///
+/// For every other split class that is harmless — their numbers are non-zero, so an unimported
+/// frame simply declines. **NR 0 is different**: 0 is Yield's own number, so on AArch64
+/// `frame.syscall_num() == 0` is true for a Yield *and* for every unlisted syscall, and a route
+/// gated on it alone would fire for `VmMap`, `IpcCall`, `IpcReply` and the rest.
+///
+/// So this reads the raw `x8` on AArch64 — the same register `pre_split_import_syscall_abi` peeks
+/// to make its own decision, and the authoritative source of the trapped number before any import.
+fn trapped_syscall_nr(frame: &TrapFrame) -> usize {
+    #[cfg(all(target_arch = "aarch64", not(feature = "hosted-dev")))]
+    {
+        frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8)
+    }
+    #[cfg(not(all(target_arch = "aarch64", not(feature = "hosted-dev"))))]
+    {
+        frame.syscall_num()
+    }
+}
+
+/// U9-RESIDUAL1 §3 — service `Yield` (NR 0) off the broad lock, on all three architectures.
+///
+/// # What this adds, and what it does not
+///
+/// It adds no policy. The decision is `yield_txn::run_yield_transaction`, the same one
+/// `KernelState::yield_current` drives through `BroadYieldOwners`; this route drives it through
+/// `SharedYieldOwners`, whose methods take one domain lock each with the broad
+/// `SpinLock<KernelState>` released. Every gate, every ordering and every marker is that
+/// transaction's.
+///
+/// # U9-TERMINAL-SETTLEMENT — the entering incarnation is captured FIRST
+///
+/// Before the transaction can change anything, and while the caller is still this CPU's current,
+/// the route captures `{tid, asid, priority}` through
+/// [`SharedKernel::current_entering_incarnation_split_read`]. Every settlement below that could
+/// return through the entering frame authenticates THAT incarnation. The predecessor re-read
+/// `current` after the transaction and read the ASID afresh at authentication time, so a
+/// replacement incarnation could have supplied the very identity it was authenticated against.
+///
+/// The CPU bound and the family filter run first because the capture indexes per-CPU state.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_yield_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    use SplitDispatchDisposition as D;
+
+    if trapped_syscall_nr(frame) != crate::kernel::syscall::SYSCALL_YIELD_NR {
+        // The FAMILY FILTER, and the only `NotHandled` NR 0 can still produce. It says "this trap
+        // is not a Yield", never "this Yield is someone else's problem".
+        return D::NotHandled;
+    }
+    if (cpu.0 as usize) >= crate::kernel::scheduler::MAX_CPUS {
+        // U9-TERMINAL-FINAL §2 — the invalid-CPU admission, SETTLED rather than declined.
+        //
+        // It is the same condition `terminal_route_admission_authority_bound` answers
+        // `CpuOutOfRange` for, raised here first so the per-CPU arrays below are never indexed
+        // with it. `yield_current` would have reached `TaskMissing` for it too, through
+        // `on_preempt_current_cpu_selection` on a CPU the scheduler does not have.
+        crate::yarm_log!(
+            "YIELD_SPLIT_REFUSED cpu={} reason=cpu_out_of_range settlement=task_missing \
+             broad_lock=0",
+            cpu.0
+        );
+        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(
+            crate::kernel::boot::KernelError::TaskMissing,
+        ))));
+    }
+    let entering = shared.current_entering_incarnation_split_read(cpu);
+    let mut owners = crate::kernel::syscall::yield_txn::SharedYieldOwners { shared };
+    split_yield_settle(shared, &mut owners, cpu, frame, entering)
+}
+
+/// U9-TERMINAL-SETTLEMENT — a RECOGNIZED userspace `NR 0`, from its captured entering incarnation
+/// to the disposition its bridge performs.
+///
+/// Generic over the owners so the hosted suite drives THIS body — the production settlement —
+/// with the production `SharedYieldOwners`, interposing only where an interleaving has to be
+/// forced. The architecture entry above is the only thing it does not contain.
+///
+/// # No entering incarnation
+///
+/// A user-mode syscall trapped on a CPU whose scheduler slot names no task. No incarnation owns
+/// the frame, so returning through it would resume user code the scheduler does not know is
+/// running; and there is nothing to capture into and nothing to publish. This is not the
+/// kernel-internal "yield with nothing to yield" — that is `yield_current` called from kernel code,
+/// which keeps its own `NoCaller` settlement and never reaches this route. It is a disagreement
+/// between the hardware and the scheduler, settled on the syscall path's fatal channel.
+///
+/// The construction argument that it does not arise: the trap is taken with interrupts masked, a
+/// CPU enters user mode only after its dispatch installs `current` on that CPU, and every
+/// primitive that clears a slot (`block_current_on`, `block_current_exact_on`,
+/// `preempt_reenqueue_only_on`, `dispatch_next*_on`) is invoked with the calling CPU's own index.
+/// The settlement does not rest on that argument — it fails closed either way — and it is stated
+/// here so a boot that ever reports `settlement=unowned_entering_frame` is read as the defect it
+/// is.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+pub(crate) fn split_yield_settle<O: crate::kernel::syscall::yield_txn::YieldOwners>(
+    shared: &SharedKernel,
+    owners: &mut O,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    entering: Option<crate::kernel::recv_waiter_split::RecvEnteringIncarnation>,
+) -> SplitDispatchDisposition {
+    use crate::kernel::syscall::yield_txn;
+    use SplitDispatchDisposition as D;
+
+    let Some(entering) = entering else {
+        // One telemetry increment per NR 0, as on every other arm.
+        shared.count_yield_split_mut();
+        crate::yarm_log!(
+            "YIELD_SPLIT_SETTLED cpu={} settlement=unowned_entering_frame authority=none \
+             broad_lock=0",
+            cpu.0
+        );
+        return D::Complete(Err(TrapHandleError::UnownedEnteringFrame));
+    };
+    match yield_txn::run_yield_transaction(owners, cpu) {
+        Ok(outcome) => {
+            debug_assert_eq!(
+                outcome.outgoing, entering.tid,
+                "nothing between the capture and the transaction can change this CPU's current"
+            );
+            // The publish-side vocabulary, in this architecture's exact delivered strings. The
+            // broad path never runs for a committed yield, so this is emitted once per NR 0 just
+            // as it always was.
+            yield_txn::log_yield_deferred(cpu, outcome.outgoing);
+            // Telemetry: the broad path's entry increment is not reached on this route, so the
+            // count is owed here. Exactly one per yield, either way.
+            shared.count_yield_split_mut();
+            crate::yarm_log!(
+                "YIELD_SPLIT_COMMITTED cpu={} tid={}",
+                cpu.0,
+                outcome.outgoing
+            );
+            // (7) The syscall's own result, into the OUTGOING frame, before the switch — the same
+            // `frame.set_ok(0, 0, 0)` `handle_yield` performs, at the same point relative to the
+            // deferral.
+            frame.set_ok(0, 0, 0);
+            D::QueueAdvanceCommitted
+        }
+        Err(decline) => {
+            // A DISTINCT marker from the settlement that follows: this names the split attempt.
+            crate::yarm_log!(
+                "YIELD_SPLIT_REFUSED cpu={} reason={}",
+                cpu.0,
+                yield_txn::legacy_reason(decline)
+            );
+            settle_declined_yield(shared, owners, cpu, frame, entering, decline)
+        }
+    }
+}
+
+/// U9-TERMINAL-FINAL §2 / U9-TERMINAL-SETTLEMENT — **NR 0's declined path, off the broad lock.**
+///
+/// A decline does not end the syscall: `yield_current` continues, logs, applies the
+/// `Running → Runnable` the decline still owes, and then advances the queue. The decision is
+/// `yield_txn::settle_caller_yield_decline` — the caller-bearing half of the policy
+/// `yield_current` drives — so the broad and split NR 0 cannot disagree about what a declined
+/// yield does. What is local is the mechanism: the split route dispatches only through a
+/// post-lock drain reached by holding a deferral, and returns only through a frame it has
+/// authenticated.
+///
+/// # Which arms return through the entering frame
+///
+/// Three: `task_missing`, `reservation_unavailable` and `reenqueue_refused`. None of them decides
+/// that for itself. Each hands its canonical answer and what it would have to UNDO to
+/// [`settle_yield_through_entering_frame`], and the frame-authority owner decides whether the
+/// return happens at all. The two queue-advancing arms never return through the frame — the
+/// drain switches away from it.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+fn settle_declined_yield<O: crate::kernel::syscall::yield_txn::YieldOwners>(
+    shared: &SharedKernel,
+    owners: &mut O,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    entering: crate::kernel::recv_waiter_split::RecvEnteringIncarnation,
+    decline: crate::kernel::syscall::yield_txn::YieldDecline,
+) -> SplitDispatchDisposition {
+    use crate::kernel::syscall::yield_txn::{self, CallerDeclineSettlement as S};
+    use SplitDispatchDisposition as D;
+
+    // THE TELEMETRY, once, before anything is decided — which is exactly where
+    // `KernelState::yield_current` puts it. One increment per NR 0, on either route and in
+    // either arm.
+    shared.count_yield_split_mut();
+
+    // The CAPTURED caller, not a re-read of `current`: whatever this CPU's slot says now, the
+    // task that trapped is the one whose yield this is.
+    match yield_txn::settle_caller_yield_decline(owners, cpu, entering.tid, decline) {
+        S::TaskMissing => settle_yield_through_entering_frame(
+            shared,
+            owners,
+            cpu,
+            frame,
+            entering,
+            Err(SyscallError::from(
+                crate::kernel::boot::KernelError::TaskMissing,
+            )),
+            YieldReturnUndo::NOTHING,
+            decline,
+            "task_missing",
+        ),
+        S::QueueAdvance { outgoing, applied } => {
+            debug_assert_eq!(outgoing, entering.tid);
+            // ── The caller is now `Runnable` and this CPU owes a dispatch. ──────────────────
+            //
+            // HONOUR AN EXISTING OWNER FIRST. A colliding deferral — or a published switch plan —
+            // means some other route already owns this trap's switch and its drain performs the
+            // one dispatch. Reserving over it, clearing it, or selecting a second incoming task
+            // would each give one trap two switches.
+            if owners.colliding_deferral_pending(cpu) {
+                frame.set_ok(0, 0, 0);
+                crate::yarm_log!(
+                    "YIELD_SPLIT_DECLINE_SETTLED cpu={} tid={} reason={} \
+                     settlement=switch_owned_elsewhere broad_lock=0",
+                    cpu.0,
+                    outgoing,
+                    yield_txn::legacy_reason(decline)
+                );
+                return D::QueueAdvanceCommitted;
+            }
+
+            // Otherwise take the deferral and let the ESTABLISHED Yield drain dispatch — the same
+            // drain the committed path uses. This is not a second dispatch channel.
+            if !owners.reserve_yield_deferral(cpu, outgoing) {
+                // The only thing that fails this CAS is an armed Yield cell, which the collision
+                // check above already tested. The transition was applied and must be undone if —
+                // and only if — the trap is going to resume the caller's frame.
+                return settle_yield_through_entering_frame(
+                    shared,
+                    owners,
+                    cpu,
+                    frame,
+                    entering,
+                    Err(SyscallError::from(
+                        crate::kernel::boot::KernelError::TaskMissing,
+                    )),
+                    YieldReturnUndo {
+                        preempt: Some(applied),
+                        reservation_held: false,
+                    },
+                    decline,
+                    "reservation_unavailable",
+                );
+            }
+
+            // rank 1 — re-enqueue at the priority tail and clear `current`, as ONE scheduler
+            // operation. It refuses in two different states, and the difference matters: when
+            // the enqueue itself fails the primitive restores `current`, but when the slot was
+            // already empty there is nothing for it to restore. The authority read below is what
+            // tells them apart, rather than an assumption about which one happened.
+            let Some(reenqueued) = owners.reenqueue_and_clear_current(cpu) else {
+                return settle_yield_through_entering_frame(
+                    shared,
+                    owners,
+                    cpu,
+                    frame,
+                    entering,
+                    // The canonical "nothing else to run" outcome, if the caller resumes.
+                    Ok(()),
+                    YieldReturnUndo {
+                        preempt: Some(applied),
+                        reservation_held: true,
+                    },
+                    decline,
+                    "reenqueue_refused",
+                );
+            };
+            debug_assert_eq!(
+                reenqueued, outgoing,
+                "the scheduler must re-enqueue the exact task this settlement preempted"
+            );
+
+            // The publish-side vocabulary, in the committed path's exact shape. The telemetry is
+            // NOT repeated: it was paid once at the top of this settlement, for every arm.
+            yield_txn::log_yield_deferred(cpu, outgoing);
+            // The syscall's own result, into the OUTGOING frame, before the switch.
+            frame.set_ok(0, 0, 0);
+            crate::yarm_log!(
+                "YIELD_SPLIT_DECLINE_SETTLED cpu={} tid={} reason={} settlement=queue_advance \
+                 broad_lock=0",
+                cpu.0,
+                outgoing,
+                yield_txn::legacy_reason(decline)
+            );
+            D::QueueAdvanceCommitted
+        }
+    }
+}
+
+/// U9-TERMINAL-SETTLEMENT — what an arm must UNDO before it may resume the caller's frame.
+///
+/// Carried rather than performed by the arm, because whether the undo is right at all depends on
+/// the authority verdict. On the path that resumes the frame, the pre-transaction state has to be
+/// put back exactly — the transition by its named inverse, then the reservation, in the
+/// transaction's own order. On the path that does NOT, rolling `Runnable` back to `Running` would
+/// manufacture a running task that this CPU is not going to run.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+struct YieldReturnUndo {
+    preempt: Option<crate::kernel::syscall::yield_txn::PreemptApplied>,
+    reservation_held: bool,
+}
+
+impl YieldReturnUndo {
+    const NOTHING: Self = Self {
+        preempt: None,
+        reservation_held: false,
+    };
+}
+
+/// U9-TERMINAL-SETTLEMENT — **the only way a declined NR 0 returns through its entering frame.**
+///
+/// `Complete(Err(Syscall(_)))` is not a refusal to return. Both bridges encode it into the live
+/// frame and resume it — `set_err`, finalize, `iret`/`eret`/`sret` — exactly as they do for
+/// `Complete(Ok(()))`. So an arm that has lost the frame cannot "fail" its way out by answering an
+/// error; the verdict has to change which disposition is returned.
+///
+/// # The verdict decides
+///
+/// [`SharedKernel::entering_frame_authority_split_read`] is asked about the incarnation captured
+/// BEFORE the transaction:
+///
+/// * **`OwnsEnteringFrame`** — undo what the arm owes, in the transaction's order. If the rollback
+///   is refused, the task table now says something this transaction did not write, so the frame
+///   is no longer provably the caller's and the return does not happen. Otherwise the arm's
+///   canonical answer returns through the frame.
+/// * **`Forfeited(_)`** — nothing is rolled back (see [`YieldReturnUndo`]); a held reservation is
+///   released, because no drain will consume it.
+///
+/// # When the return does not happen
+///
+/// The arm's answer is written into the frame first, so whatever continuation the bridge
+/// preserves is a COMPLETED `NR 0`, exactly as the receive family's settlement writes its answer
+/// before reporting. Then the disowned incarnation is located from its actual status and
+/// placement ([`SharedKernel::yield_forfeited_placement_split_read`]), and the trap is handed to
+/// `BlockUnsettled` — the non-returning settlement the receive family established and NR 9
+/// already shares. Its bridges capture and publish an `Unpublished` task, idle when a dispatcher
+/// already owns it, and otherwise take `DISPATCH_TORN_FATAL`. No new switch channel, no broad
+/// fallback, and no fatal for a task that is merely somewhere else.
+#[cfg_attr(feature = "hosted-dev", allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn settle_yield_through_entering_frame<O: crate::kernel::syscall::yield_txn::YieldOwners>(
+    shared: &SharedKernel,
+    owners: &mut O,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    entering: crate::kernel::recv_waiter_split::RecvEnteringIncarnation,
+    answer: Result<(), SyscallError>,
+    undo: YieldReturnUndo,
+    decline: crate::kernel::syscall::yield_txn::YieldDecline,
+    arm: &'static str,
+) -> SplitDispatchDisposition {
+    use crate::kernel::syscall::yield_txn;
+    use crate::kernel::task_transition::EnteringFrameAuthority as A;
+    use SplitDispatchDisposition as D;
+
+    let authority = shared.entering_frame_authority_split_read(cpu, entering.tid, entering.asid);
+    let why_not_returning = match authority {
+        A::OwnsEnteringFrame => {
+            // Undo (transition, then reservation) — the reservation must outlive the rollback,
+            // or another route could take it and observe a caller that is briefly `Runnable` and
+            // current at once.
+            let rolled_back = match undo.preempt {
+                Some(applied) => owners.rollback_preempt_outgoing(entering.tid, applied),
+                None => true,
+            };
+            if undo.reservation_held {
+                owners.release_yield_deferral(cpu);
+            }
+            if rolled_back {
+                crate::yarm_log!(
+                    "YIELD_SPLIT_DECLINE_SETTLED cpu={} tid={} asid={} reason={} settlement={} \
+                     authority=owns_entering_frame result={} broad_lock=0",
+                    cpu.0,
+                    entering.tid,
+                    entering.asid.0,
+                    yield_txn::legacy_reason(decline),
+                    arm,
+                    if answer.is_ok() { "ok" } else { "task_missing" }
+                );
+                return match answer {
+                    Ok(()) => {
+                        frame.set_ok(0, 0, 0);
+                        D::Complete(Ok(()))
+                    }
+                    Err(err) => D::Complete(Err(TrapHandleError::Syscall(err))),
+                };
+            }
+            "rollback_refused"
+        }
+        A::Forfeited(forfeit) => {
+            if undo.reservation_held {
+                owners.release_yield_deferral(cpu);
+            }
+            forfeit.marker()
+        }
+    };
+
+    // The frame will not be returned through. Complete the syscall's answer in it first.
+    match answer {
+        Ok(()) => frame.set_ok(0, 0, 0),
+        Err(err) => frame.set_err(err.code()),
+    }
+    let outcome = shared.yield_forfeited_placement_split_read(cpu, entering);
+    crate::yarm_log!(
+        "YIELD_SPLIT_DECLINE_SETTLED cpu={} tid={} asid={} reason={} settlement={} \
+         authority={} returns=0 outcome={} broad_lock=0",
+        cpu.0,
+        entering.tid,
+        entering.asid.0,
+        yield_txn::legacy_reason(decline),
+        arm,
+        why_not_returning,
+        outcome.slug()
+    );
+    D::BlockUnsettled(SplitBlockUnsettled { entering, outcome })
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_yield_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11283,295 +11721,4 @@ mod tests {
             "Stage 42+43 adds RecvSharedV3 (NR 30); stage32b invariant updated"
         );
     }
-}
-
-/// U9-RESIDUAL1 §3 — the syscall number this trap ACTUALLY carries, per architecture.
-///
-/// x86_64 and RISC-V decode the number into the frame at entry, so `frame.syscall_num()` is
-/// authoritative there. AArch64 does not: `pre_split_import_syscall_abi` imports the decoded ABI
-/// only for an allowlisted number, and an unlisted syscall leaves the frame reading `nr = 0`.
-///
-/// For every other split class that is harmless — their numbers are non-zero, so an unimported
-/// frame simply declines. **NR 0 is different**: 0 is Yield's own number, so on AArch64
-/// `frame.syscall_num() == 0` is true for a Yield *and* for every unlisted syscall, and a route
-/// gated on it alone would fire for `VmMap`, `IpcCall`, `IpcReply` and the rest.
-///
-/// So this reads the raw `x8` on AArch64 — the same register `pre_split_import_syscall_abi` peeks
-/// to make its own decision, and the authoritative source of the trapped number before any import.
-fn trapped_syscall_nr(frame: &TrapFrame) -> usize {
-    #[cfg(all(target_arch = "aarch64", not(feature = "hosted-dev")))]
-    {
-        frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8)
-    }
-    #[cfg(not(all(target_arch = "aarch64", not(feature = "hosted-dev"))))]
-    {
-        frame.syscall_num()
-    }
-}
-
-/// U9-RESIDUAL1 §3 — service `Yield` (NR 0) off the broad lock, on all three architectures.
-///
-/// # What this adds, and what it does not
-///
-/// It adds no policy. The decision is `yield_txn::run_yield_transaction`, the same one
-/// `KernelState::yield_current` drives through `BroadYieldOwners`; this route drives it through
-/// `SharedYieldOwners`, whose methods take one domain lock each with the broad
-/// `SpinLock<KernelState>` released. Every gate, every ordering and every marker is that
-/// transaction's.
-///
-/// # Why declining is always safe here
-///
-/// Every `YieldDecline` is pre-mutation — the one step that can fail after a write rolls that write
-/// back through the named inverse — so `NotHandled` hands a byte-for-byte unchanged world to the
-/// broad path, which then runs the identical decision through the identical owners and produces the
-/// identical outcome. This is a fallback BEFORE consumption, never after: past the commit the
-/// caller is queued exactly once, `current` is empty, and the deferral is published.
-///
-/// # The two things this route owns
-///
-/// The telemetry increment (the broad path counts on entry; this route counts only what it commits,
-/// so a decline is counted exactly once by the broad path that then runs) and the syscall's own
-/// result, written into the outgoing frame before the drain switches away from it.
-#[cfg(not(feature = "hosted-dev"))]
-fn try_split_yield_into_frame(
-    shared: &SharedKernel,
-    cpu: CpuId,
-    frame: &mut TrapFrame,
-) -> SplitDispatchDisposition {
-    use crate::kernel::syscall::yield_txn;
-    use SplitDispatchDisposition as D;
-
-    if trapped_syscall_nr(frame) != crate::kernel::syscall::SYSCALL_YIELD_NR {
-        // The FAMILY FILTER, and the only `NotHandled` NR 0 can still produce. It says "this trap
-        // is not a Yield", never "this Yield is someone else's problem".
-        return D::NotHandled;
-    }
-    if (cpu.0 as usize) >= crate::kernel::scheduler::MAX_CPUS {
-        // U9-TERMINAL-FINAL §2 — the invalid-CPU admission, SETTLED rather than declined.
-        //
-        // It is the same condition `terminal_route_admission_authority_bound` answers
-        // `CpuOutOfRange` for, raised here first so the per-CPU arrays below are never indexed
-        // with it. There is no CPU to advance a queue on and no drain to consume a deferral, so
-        // handing it to the broad dispatcher only moved the identical verdict under the whole
-        // kernel — and `yield_current` would have reached `TaskMissing` for it too, through
-        // `on_preempt_current_cpu_selection` on a CPU the scheduler does not have.
-        crate::yarm_log!(
-            "YIELD_SPLIT_REFUSED cpu={} reason=cpu_out_of_range settlement=task_missing \
-             broad_lock=0",
-            cpu.0
-        );
-        return D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(
-            crate::kernel::boot::KernelError::TaskMissing,
-        ))));
-    }
-    let mut owners = yield_txn::SharedYieldOwners { shared };
-    match yield_txn::run_yield_transaction(&mut owners, cpu) {
-        Ok(outcome) => {
-            // The publish-side vocabulary, in this architecture's exact delivered strings. The
-            // broad path never runs for a committed yield, so this is emitted once per NR 0 just
-            // as it always was.
-            yield_txn::log_yield_deferred(cpu, outcome.outgoing);
-            // Telemetry: the broad path's entry increment is not reached on this route, so the
-            // count is owed here. Exactly one per yield, either way.
-            shared.count_yield_split_mut();
-            crate::yarm_log!(
-                "YIELD_SPLIT_COMMITTED cpu={} tid={}",
-                cpu.0,
-                outcome.outgoing
-            );
-            // (7) The syscall's own result, into the OUTGOING frame, before the switch — the same
-            // `frame.set_ok(0, 0, 0)` `handle_yield` performs, at the same point relative to the
-            // deferral.
-            frame.set_ok(0, 0, 0);
-            D::QueueAdvanceCommitted
-        }
-        Err(decline) => {
-            // A DISTINCT marker from the in-lock fallback's: this names the split attempt, which
-            // is a different event from the settlement that follows it.
-            crate::yarm_log!(
-                "YIELD_SPLIT_REFUSED cpu={} reason={}",
-                cpu.0,
-                yield_txn::legacy_reason(decline)
-            );
-            settle_declined_yield(shared, &mut owners, cpu, frame, decline)
-        }
-    }
-}
-
-/// U9-TERMINAL-FINAL §2 — **NR 0's declined path, off the broad lock.**
-///
-/// This is the last switching residual that reached a terminal acquisition, and `D::NotHandled`
-/// was never a neutral answer for it. A decline does not end the syscall: `yield_current`
-/// continues, logs, applies the `Running → Runnable` the decline still owes, and then advances
-/// the queue. Handing all of that to the broad dispatcher also handed it a DIFFERENT outgoing
-/// task — the broad path re-derives `outgoing` from whoever is current by the time it acquires,
-/// which need not be the task that trapped.
-///
-/// The decision is not restated here. `yield_txn::settle_yield_decline` is the same shared policy
-/// `yield_current` now drives, through the same two adapters `run_yield_transaction` uses, so the
-/// broad NR 0 and the split NR 0 cannot disagree about what a declined yield does. What is local
-/// is the *mechanism*: the broad path finishes with an in-lock dispatch, and a split route has
-/// exactly one way to dispatch — a post-lock drain, reached by holding a deferral.
-#[cfg(not(feature = "hosted-dev"))]
-fn settle_declined_yield(
-    shared: &SharedKernel,
-    owners: &mut crate::kernel::syscall::yield_txn::SharedYieldOwners<'_>,
-    cpu: CpuId,
-    frame: &mut TrapFrame,
-    decline: crate::kernel::syscall::yield_txn::YieldDecline,
-) -> SplitDispatchDisposition {
-    use crate::kernel::syscall::yield_txn::{self, YieldDeclineSettlement as S, YieldOwners};
-    use SplitDispatchDisposition as D;
-
-    // THE TELEMETRY, once, before anything is decided — which is exactly where
-    // `KernelState::yield_current` puts it.
-    //
-    // The committed path above counts only what it commits, and could, because a declined split
-    // yield was then counted by the broad `yield_current` that ran for it. That function no
-    // longer runs for a declined NR 0, so the count is owed HERE, and it is owed for every
-    // settlement and not only the advancing one: the broad increment is unconditional and
-    // precedes the transaction, so a yield that ends in `TaskMissing` was counted too.
-    //
-    // One increment per NR 0, on either route and in either arm.
-    shared.count_yield_split_mut();
-
-    // The SAME read the transaction made, through the same owner.
-    let outgoing_tid = owners.current_tid_on_cpu(cpu);
-    let settlement = yield_txn::settle_yield_decline(owners, cpu, outgoing_tid, decline);
-
-    // `TaskMissing` and `NoCaller` both return through the ENTERING FRAME, so both have to
-    // establish that the frame is still this task's to return through. A refused
-    // `Running → Runnable` says something about the scheduler's belief, and "this route mutated
-    // nothing" has never been an argument about that.
-    let authenticate = |tid: u64| -> bool {
-        let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
-        matches!(
-            shared.entering_frame_authority_split_read(cpu, tid, asid),
-            crate::kernel::task_transition::EnteringFrameAuthority::OwnsEnteringFrame
-        )
-    };
-
-    match settlement {
-        S::TaskMissing => {
-            // `yield_current` answers `KernelError::TaskMissing`, and `handle_yield` maps it into
-            // this syscall's error lane. The error still returns through the entering frame, so
-            // the authority is asked before it is encoded.
-            let owns = outgoing_tid.is_some_and(authenticate);
-            crate::yarm_log!(
-                "YIELD_SPLIT_DECLINE_SETTLED cpu={} tid={} reason={} settlement=task_missing \
-                 owns_entering_frame={} broad_lock=0",
-                cpu.0,
-                outgoing_tid.unwrap_or(u64::MAX),
-                yield_txn::legacy_reason(decline),
-                u8::from(owns)
-            );
-            D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(
-                crate::kernel::boot::KernelError::TaskMissing,
-            ))))
-        }
-        S::NoCaller => {
-            // A yield with nothing to yield. Nothing was preempted because there was nothing to
-            // preempt, and no frame belongs to a caller that does not exist — so there is no
-            // result to encode and no switch to make. The trap returns as it entered.
-            crate::yarm_log!(
-                "YIELD_SPLIT_DECLINE_SETTLED cpu={} reason={} settlement=no_caller broad_lock=0",
-                cpu.0,
-                yield_txn::legacy_reason(decline)
-            );
-            D::Complete(Ok(()))
-        }
-        S::QueueAdvance { outgoing, applied } => {
-            // ── The caller is now `Runnable` and this CPU owes a dispatch. ──────────────────
-            //
-            // HONOUR AN EXISTING OWNER FIRST. A colliding deferral — or a published switch plan —
-            // means some other route already owns this trap's switch and its drain performs the
-            // one dispatch. Reserving over it, clearing it, or selecting a second incoming task
-            // would each give one trap two switches. The debt is settled by letting the incumbent
-            // pay it; the caller is already `Runnable`, so the incumbent's drain will find it.
-            if owners.colliding_deferral_pending(cpu) {
-                frame.set_ok(0, 0, 0);
-                crate::yarm_log!(
-                    "YIELD_SPLIT_DECLINE_SETTLED cpu={} tid={} reason={} \
-                     settlement=switch_owned_elsewhere broad_lock=0",
-                    cpu.0,
-                    outgoing,
-                    yield_txn::legacy_reason(decline)
-                );
-                return D::QueueAdvanceCommitted;
-            }
-
-            // Otherwise take the deferral and let the ESTABLISHED Yield drain dispatch — the same
-            // drain the committed path uses. This is not a second dispatch channel.
-            if !owners.reserve_yield_deferral(cpu, outgoing) {
-                // Unreachable: the only thing that fails this CAS is an armed Yield cell, which
-                // the collision check above already tested. It is settled rather than deleted
-                // because a route must be correct read on its own — and it fails CLOSED, after
-                // undoing the transition with its named inverse.
-                let rolled_back = owners.rollback_preempt_outgoing(outgoing, applied);
-                crate::yarm_log!(
-                    "YIELD_SPLIT_DECLINE_SETTLED cpu={} tid={} reason={} \
-                     settlement=reservation_unavailable rolled_back={} broad_lock=0",
-                    cpu.0,
-                    outgoing,
-                    yield_txn::legacy_reason(decline),
-                    u8::from(rolled_back)
-                );
-                return D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(
-                    crate::kernel::boot::KernelError::TaskMissing,
-                ))));
-            }
-
-            // rank 1 — re-enqueue at the priority tail and clear `current`, as ONE scheduler
-            // operation. The only step that can fail after something was written, and its failure
-            // is exactly reversible.
-            let Some(reenqueued) = owners.reenqueue_and_clear_current(cpu) else {
-                // Undo in the transaction's own order: the transition, then the reservation. The
-                // reservation must outlive the rollback, or another route could take it and
-                // observe a caller that is briefly `Runnable` and current at once.
-                let rolled_back = owners.rollback_preempt_outgoing(outgoing, applied);
-                owners.release_yield_deferral(cpu);
-                // The caller is `Running` and current again, exactly as it entered, so it resumes
-                // through its own frame with the syscall's own success result. That is the
-                // canonical "nothing else to run" outcome, reached without a switch.
-                frame.set_ok(0, 0, 0);
-                crate::yarm_log!(
-                    "YIELD_SPLIT_DECLINE_SETTLED cpu={} tid={} reason={} \
-                     settlement=resume_caller rolled_back={} broad_lock=0",
-                    cpu.0,
-                    outgoing,
-                    yield_txn::legacy_reason(decline),
-                    u8::from(rolled_back)
-                );
-                return D::Complete(Ok(()));
-            };
-            debug_assert_eq!(
-                reenqueued, outgoing,
-                "the scheduler must re-enqueue the exact task this settlement preempted"
-            );
-
-            // The publish-side vocabulary, in the committed path's exact shape — emitted here
-            // because the broad path no longer runs for this yield. The telemetry is NOT repeated:
-            // it was paid once at the top of this settlement, for every arm.
-            yield_txn::log_yield_deferred(cpu, outgoing);
-            // The syscall's own result, into the OUTGOING frame, before the switch.
-            frame.set_ok(0, 0, 0);
-            crate::yarm_log!(
-                "YIELD_SPLIT_DECLINE_SETTLED cpu={} tid={} reason={} settlement=queue_advance \
-                 broad_lock=0",
-                cpu.0,
-                outgoing,
-                yield_txn::legacy_reason(decline)
-            );
-            D::QueueAdvanceCommitted
-        }
-    }
-}
-
-#[cfg(feature = "hosted-dev")]
-fn try_split_yield_into_frame(
-    _shared: &SharedKernel,
-    _cpu: CpuId,
-    _frame: &mut TrapFrame,
-) -> SplitDispatchDisposition {
-    SplitDispatchDisposition::NotHandled
 }

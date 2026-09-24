@@ -31,6 +31,16 @@ pub enum KernelError {
 pub enum TrapHandleError {
     MissingTrapFrame,
     Syscall(SyscallError),
+    /// U9-TERMINAL-SETTLEMENT — a user-mode syscall trapped on a CPU whose scheduler slot named
+    /// NO task, so no incarnation owns the frame the trap would return through.
+    ///
+    /// It is a distinct variant rather than a `Syscall(_)` error because the two travel on
+    /// different channels. Every architecture bridge encodes `Syscall(e)` into the entering frame
+    /// and RESUMES it — which is exactly the thing that must not happen to a frame nobody owns —
+    /// while any other variant takes the bridge's fatal path. Borrowing `MissingTrapFrame` would
+    /// have reached the same path under a name that says something false: there IS a frame; what
+    /// is missing is its owner.
+    UnownedEnteringFrame,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
