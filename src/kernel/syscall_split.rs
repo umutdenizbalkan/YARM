@@ -152,6 +152,114 @@ pub(crate) fn classify_split_eligible(
 /// per-domain split helpers; returns `None` to signal the caller to fall back to
 /// the unchanged global-lock dispatch path. This function itself never blocks,
 /// yields, schedules, or copies user memory.
+/// U9-TERMINAL-FINAL §1 — **who is calling, as a TYPED FACT rather than an `Option`.**
+///
+/// Nine split routes resolved the caller with `shared.current_tid_authoritative(cpu)?`. The `?`
+/// is the whole problem: `None` left the route silently, through the function's `Option` return,
+/// and became a terminal broad acquisition. It is invisible at the call site — no `None` token
+/// appears on the line — which is why this class of escape survived three closure passes.
+///
+/// # Why this is a shared RESOLVER and not a shared ERROR
+///
+/// The obvious repair is a prologue: "no current task ⇒ `Internal`, for every route". It is
+/// wrong, and the canonical handlers say so:
+///
+/// | NR | canonical resolution | position | answer when absent |
+/// |----|----------------------|----------|--------------------|
+/// | 8, 11, 12, 28, 29, 31 | `helpers::current_tid(kernel)?` | before argument validation | `SyscallError::Internal` |
+/// | 10 | `validate_current_user_futex_word` -> `current_tid().ok_or(TaskMissing)` | AFTER `max_wake` conversion and the range check | `KernelError::TaskMissing` |
+/// | 15 | `kernel.current_tid().unwrap_or(0)` | trace only | **no error at all** — the syscall proceeds |
+///
+/// A universal `Internal` would give NR 10 the wrong error, and would turn NR 15 — which
+/// tolerates an absent caller by design, because its `tid` is only a log field — into a failure.
+/// It would also move the check ahead of NR 10's `max_wake` conversion, changing WHICH validation
+/// wins for a call that is invalid twice over.
+///
+/// So the resolver is shared and the settlement is not. Each route matches this fact and names
+/// the answer its own canonical handler gives, at the point that handler asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitCaller {
+    /// The scheduler authoritatively names this CPU's current task.
+    Running(u64),
+    /// It does not. Every route settles this itself; there is no shared answer.
+    NoCurrentTask,
+}
+
+/// U9-TERMINAL-FINAL §1 — **the family re-check, settled rather than escaped.**
+///
+/// Five whitelist routes opened with
+///
+/// ```text
+///     let syscall = Syscall::decode(frame.syscall_num()).ok()?;
+///     if !matches!(syscall, Syscall::X) { return None; }
+/// ```
+///
+/// Both lines are invisible escapes: the `.ok()?` carries no `None` token at all, and the
+/// mismatch arm reads as an ordinary guard. Neither can fire — the non-switching dispatcher has
+/// already decoded the number and matched it against this exact variant before it calls the
+/// route — but "cannot fire" is a property a reader has to re-derive, and an `Option` return
+/// keeps the door open for the next edit.
+///
+/// So the re-check stays (a route must be correct read on its own) and its answer changes: a
+/// frame whose NR does not match the route it was handed to is a dispatcher/route disagreement,
+/// which is an invariant break and answers `Internal`. It is never a reason to re-run an
+/// already-classified syscall under the whole kernel.
+fn split_family_recheck(
+    frame: &TrapFrame,
+    expected: Syscall,
+    cpu: CpuId,
+) -> Option<Result<(), TrapHandleError>> {
+    let raw = frame.syscall_num();
+    if matches!(Syscall::decode(raw), Ok(got) if got == expected) {
+        return None;
+    }
+    crate::yarm_log!(
+        "SYSCALL_SPLIT_FAMILY_MISMATCH cpu={} nr={} expected={} settlement=internal broad_lock=0",
+        cpu.0,
+        raw,
+        expected.number()
+    );
+    Some(Err(TrapHandleError::Syscall(
+        crate::kernel::syscall::SyscallError::Internal,
+    )))
+}
+
+/// The ONE authoritative read, shared by every route that needs the caller's identity.
+pub(crate) fn split_caller(shared: &SharedKernel, cpu: CpuId) -> SplitCaller {
+    match shared.current_tid_authoritative(cpu) {
+        Some(tid) => SplitCaller::Running(tid),
+        None => SplitCaller::NoCurrentTask,
+    }
+}
+
+impl SplitCaller {
+    /// The settlement used by the six routes whose canonical handler resolves the caller with
+    /// `helpers::current_tid`, which is `current_tid().ok_or(SyscallError::Internal)`.
+    ///
+    /// It is a `Some(Err(..))`, never a `None`: the answer is knowable with no lock at all, and
+    /// handing it to the broad dispatcher would make it re-derive the identical verdict under
+    /// the whole kernel.
+    fn or_internal(
+        self,
+        nr: usize,
+        cpu: CpuId,
+    ) -> Result<u64, Option<Result<(), TrapHandleError>>> {
+        match self {
+            Self::Running(tid) => Ok(tid),
+            Self::NoCurrentTask => {
+                crate::yarm_log!(
+                    "SYSCALL_SPLIT_NO_CURRENT nr={} cpu={} settlement=internal broad_lock=0",
+                    nr,
+                    cpu.0
+                );
+                Err(Some(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                ))))
+            }
+        }
+    }
+}
+
 pub(crate) fn try_split_dispatch(
     shared: &SharedKernel,
     syscall: Syscall,
@@ -5197,6 +5305,18 @@ fn try_split_dispatch_nonswitching_into_frame(
         )));
     }
     // Default-deny by syscall number first (cheap, no lock).
+    //
+    // U9-TERMINAL-FINAL §1 — an UNDECODABLE number is answered here, exactly as a RETIRED one is
+    // directly above, and for the same reason: the answer is on a fixed table and needs no lock.
+    //
+    // It used to `return None`. The broad dispatcher then ran `Syscall::decode` a SECOND time,
+    // inside `handle_syscall`, and its `?` produced `SyscallError::InvalidNumber` — the identical
+    // value returned here. So the only thing the acquisition contributed was the acquisition.
+    //
+    // The two arms are deliberately NOT merged. `retired_syscall_number` names WHY a number that
+    // was once real is refused, and that reason is in its marker; an unassigned number has no
+    // such history and gets its own marker. Collapsing them would lose the distinction a live log
+    // needs to tell "the caller is stale" from "the caller is wrong".
     let Ok(syscall) = Syscall::decode(raw_nr) else {
         if probe {
             crate::yarm_log!(
@@ -5204,7 +5324,14 @@ fn try_split_dispatch_nonswitching_into_frame(
                 raw_nr
             );
         }
-        return None;
+        crate::yarm_log!(
+            "SYSCALL_UNDECODABLE_REFUSED nr={} cpu={} settlement=invalid_number broad_lock=0",
+            raw_nr,
+            cpu.0
+        );
+        return Some(Err(TrapHandleError::Syscall(
+            crate::kernel::syscall::SyscallError::InvalidNumber,
+        )));
     };
     // Stage 199D: IpcCall (NR 6) + IpcReply (NR 7) are not in the static NR-only whitelist,
     // but they ARE admitted to the direct request/reply gates below.
@@ -5391,7 +5518,25 @@ fn try_split_dispatch_nonswitching_into_frame(
     // current-task snapshot (no dispatch/yield/switch); the domain mutation below
     // still runs lock-free via the split-mut helper. If unavailable, fall back so
     // the global-lock path produces the canonical `Internal` error.
-    let requester_tid = shared.current_tid_authoritative(cpu)?;
+    // U9-TERMINAL-FINAL §1 — NR 8, in the canonical handler's ORDER.
+    //
+    // `cap::handle_control_plane_set_cnode_slots` resolves the caller FIRST (`current_tid`, i.e.
+    // `Internal` when absent) and validates the arguments SECOND. Both halves used to leave this
+    // route as a `None`: the caller take through `?`, and the argument refusal through
+    // `classify_split_eligible`'s own `None` propagated by the `?` two lines below.
+    //
+    // The second one is the producer with the only LIVE arrival this programme has measured — a
+    // RISC-V core-smoke boot entered the terminal acquisition exactly once, as
+    // `TERMINAL_BROAD_DISPATCH_ENTER cpu=0 event=Syscall nr=8`, for a call with `target_pid == 0`
+    // or `slots == 0`.
+    //
+    // The order is preserved deliberately. A call that is invalid twice over — no current task
+    // AND a zero argument — answers `Internal`, because that is the validation the canonical
+    // handler reaches first.
+    let requester_tid = match split_caller(shared, cpu).or_internal(raw_nr, cpu) {
+        Ok(tid) => tid,
+        Err(settlement) => return settlement,
+    };
 
     // Decode args identically to `handle_control_plane_set_cnode_slots`.
     let mut args = [0u64; 6];
@@ -5399,17 +5544,51 @@ fn try_split_dispatch_nonswitching_into_frame(
         *slot = frame.arg(i) as u64;
     }
 
-    let result = try_split_dispatch(shared, syscall, requester_tid, args)?;
-    match result {
-        Ok(()) => {
+    // The canonical argument gate, read from the same lanes and answered with the same error.
+    // `classify_split_eligible` still holds the predicate — one definition — but its `None` no
+    // longer escapes: it is TESTED here and settled, so the `?` below can only ever see the
+    // family-recognition `None`, never a refusal.
+    let target_pid = frame.arg(SYSCALL_ARG_CAP) as u64;
+    let slot_capacity = frame.arg(SYSCALL_ARG_PTR);
+    if target_pid == 0 || slot_capacity == 0 {
+        crate::yarm_log!(
+            "CONTROL_PLANE_SPLIT_INVALID_ARGS cpu={} tid={} target_pid={} slots={} \
+             settlement=invalid_args broad_lock=0",
+            cpu.0,
+            requester_tid,
+            target_pid,
+            slot_capacity
+        );
+        return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    }
+
+    // U9-TERMINAL-FINAL §1 — the family-recognition `None` is SETTLED, not propagated.
+    //
+    // The `?` that used to stand here made "this is not a family I recognize" and "this
+    // recognized request failed" leave the route through the same door. Recognition already
+    // happened — `syscall` is NR 8, every other whitelisted class returned above, and the
+    // argument gate passed — so a `None` here is not a fall-through, it is the dispatcher and
+    // the classifier disagreeing about what NR 8 is. That is a kernel invariant break, and it
+    // answers `Internal` rather than re-running an already-validated request under the whole
+    // kernel with the caller's identity re-derived from whoever is current by then.
+    match try_split_dispatch(shared, syscall, requester_tid, args) {
+        Some(Ok(())) => {
             // Mirror the global-lock handler's exact success encoding:
             //   frame.set_ok(slot_capacity, target_pid as usize, 0)
-            let target_pid = frame.arg(SYSCALL_ARG_CAP);
-            let slots = frame.arg(SYSCALL_ARG_PTR);
-            frame.set_ok(slots, target_pid, 0);
+            frame.set_ok(slot_capacity, target_pid as usize, 0);
             Some(Ok(()))
         }
-        Err(err) => Some(Err(TrapHandleError::Syscall(SyscallError::from(err)))),
+        Some(Err(err)) => Some(Err(TrapHandleError::Syscall(SyscallError::from(err)))),
+        None => {
+            crate::yarm_log!(
+                "CONTROL_PLANE_SPLIT_UNRECOGNIZED cpu={} tid={} nr={} settlement=internal \
+                 broad_lock=0",
+                cpu.0,
+                requester_tid,
+                raw_nr
+            );
+            Some(Err(TrapHandleError::Syscall(SyscallError::Internal)))
+        }
     }
 }
 
@@ -5450,9 +5629,26 @@ fn try_split_debug_log_into_frame(
     // canonical ordinary-cap attestations (~138 bytes) log untruncated on the split path.
     let len = (raw_len as usize).min(crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES);
 
-    // Authoritative requester TID (binds current_cpu; same task the global handler
-    // sees). Unavailable → fall back to the global-lock path.
-    let tid = shared.current_tid_authoritative(cpu)?;
+    // U9-TERMINAL-FINAL §1 — NR 15 TOLERATES an absent caller, and that is canonical.
+    //
+    // `debug::handle_debug_log` reads `kernel.current_tid().unwrap_or(0)` and uses the value for
+    // ONE thing: a trace field. It never refuses on it. So the split route's `?` here was not
+    // "the broad handler will produce the canonical error" — the broad handler produces no error
+    // at all, it logs the message with `tid=0` and returns success. Falling through changed
+    // nothing about the outcome and cost a terminal acquisition.
+    //
+    // This is exactly why the caller fact is shared and the SETTLEMENT is not: giving NR 15 the
+    // six-route `Internal` prologue would invent a failure the canonical handler does not have.
+    //
+    // `tid` is still used below to pick the address space for the user copy. With no current
+    // task there is no address space either, and `task_asid_for_tid_split_read(0)` answers the
+    // reserved ASID 0, which `copy_from_user_asid_split_read` refuses — landing on the same
+    // `InvalidArgs` arm an unreadable buffer already takes. That is the broad behaviour too: its
+    // `copy_from_user` is given `tid`'s ASID and fails identically.
+    let tid = match split_caller(shared, cpu) {
+        SplitCaller::Running(tid) => tid,
+        SplitCaller::NoCurrentTask => 0,
+    };
 
     if user_ptr == 0 || len == 0 {
         // Same short-circuit as the global handler: OK, no log.
@@ -5607,29 +5803,98 @@ fn try_split_futex_wake_into_frame(
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR as NR;
     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_PTR};
     // FutexWake ABI: arg(CAP) = futex addr, arg(PTR) = max_wake.
     let addr = frame.arg(SYSCALL_ARG_CAP);
-    // Non-`u32` max_wake → the global handler returns InvalidArgs; fall back.
-    let max_wake = u32::try_from(frame.arg(SYSCALL_ARG_PTR) as u64).ok()?;
 
-    let tid = shared.current_tid_authoritative(cpu)?;
-
-    // Validate the futex word exactly like `validate_current_user_futex_word`. On ANY
-    // validation miss, fall back so the global-lock path produces the canonical error.
-    if addr == 0 {
-        return None; // legacy: WrongObject
+    // ── U9-TERMINAL-FINAL §1 — NR 10, every miss SETTLED, in the canonical order ──────────────
+    //
+    // Five escapes lived in this prologue, and each of them handed a fully decided verdict to the
+    // terminal acquisition so it could decide it again. Two were invisible: the `max_wake`
+    // conversion and the `checked_add` overflow reached the bridge through `?` on an `Option`,
+    // with no `None` token on the line.
+    //
+    // The canonical chain is `sched::handle_futex_wake` -> `KernelState::futex_wake` ->
+    // `validate_current_user_futex_word`:
+    //
+    //   1. `u32::try_from(max_wake)`      -> `SyscallError::InvalidArgs`
+    //   2. `futex_word_range_check(addr)` -> `WrongObject` (addr == 0) | `UserMemoryFault`
+    //                                        (overflow OR kernel space) — ONE shared policy
+    //   3. `current_tid()`                -> `KernelError::TaskMissing`   <- NOT `Internal`
+    //   4. `task_asid(tid)`               -> `KernelError::UserMemoryFault`
+    //   5. `copy_from_user(..)`           -> `KernelError::UserMemoryFault`
+    //
+    // Step 2 is now the SHARED `futex_word_range_check` rather than a hand-written transcription
+    // of it. The transcription had already drifted: it turned an address whose `+3` overflows
+    // `usize` into a fall-through, where the shared policy answers `UserMemoryFault`.
+    //
+    // The order matters and is preserved. A call with a non-`u32` `max_wake` AND `addr == 0`
+    // answers `InvalidArgs`, because the conversion is what the canonical handler reaches first —
+    // and note that the caller is resolved at step 3, AFTER both argument checks, which is why
+    // NR 10 must not share the `Internal` prologue the six `helpers::current_tid` routes use.
+    let Ok(max_wake) = u32::try_from(frame.arg(SYSCALL_ARG_PTR) as u64) else {
+        crate::yarm_log!(
+            "FUTEX_WAKE_SPLIT_REFUSED cpu={} addr=0x{:x} reason=max_wake_not_u32 \
+             settlement=invalid_args broad_lock=0",
+            cpu.0,
+            addr
+        );
+        return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+    };
+    if let Err(err) = crate::kernel::syscall::sched::futex_word_range_check(addr) {
+        crate::yarm_log!(
+            "FUTEX_WAKE_SPLIT_REFUSED cpu={} addr=0x{:x} reason=range_check err={:?} \
+             broad_lock=0",
+            cpu.0,
+            addr,
+            err
+        );
+        return Some(Err(TrapHandleError::Syscall(SyscallError::from(err))));
     }
-    let end = addr.checked_add(core::mem::size_of::<u32>() - 1)?;
-    if end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE {
-        return None; // legacy: UserMemoryFault
-    }
+    let tid = match split_caller(shared, cpu) {
+        SplitCaller::Running(tid) => tid,
+        // The canonical answer for THIS family, from `validate_current_user_futex_word`.
+        SplitCaller::NoCurrentTask => {
+            crate::yarm_log!(
+                "SYSCALL_SPLIT_NO_CURRENT nr={} cpu={} settlement=task_missing broad_lock=0",
+                NR,
+                cpu.0
+            );
+            return Some(Err(TrapHandleError::Syscall(SyscallError::from(
+                crate::kernel::boot::KernelError::TaskMissing,
+            ))));
+        }
+    };
     let asid = shared.task_asid_for_tid_split_read(tid);
+    if asid == 0 {
+        // `task_asid(tid).ok_or(KernelError::UserMemoryFault)` — the split reader reports an
+        // absent address space as the reserved ASID 0, which its own copy helper refuses anyway.
+        crate::yarm_log!(
+            "FUTEX_WAKE_SPLIT_REFUSED cpu={} tid={} addr=0x{:x} reason=no_user_asid \
+             settlement=user_memory_fault broad_lock=0",
+            cpu.0,
+            tid,
+            addr
+        );
+        return Some(Err(TrapHandleError::Syscall(SyscallError::from(
+            crate::kernel::boot::KernelError::UserMemoryFault,
+        ))));
+    }
     if shared
         .copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())
         .is_none()
     {
-        return None; // legacy: UserMemoryFault
+        crate::yarm_log!(
+            "FUTEX_WAKE_SPLIT_REFUSED cpu={} tid={} addr=0x{:x} reason=user_copy \
+             settlement=user_memory_fault broad_lock=0",
+            cpu.0,
+            tid,
+            addr
+        );
+        return Some(Err(TrapHandleError::Syscall(SyscallError::from(
+            crate::kernel::boot::KernelError::UserMemoryFault,
+        ))));
     }
 
     // Validation passed — wake off the global lock.
@@ -8300,9 +8565,9 @@ pub(crate) fn try_split_vm_map_into_frame(
     frame: &mut TrapFrame,
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::syscall::vm_txn::{MapTarget, run_vm_map_transaction};
-    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
-    if !matches!(syscall, Syscall::VmMap) {
-        return None;
+    // U9-TERMINAL-FINAL §1 — the family re-check, settled. See `split_family_recheck`.
+    if let Some(mismatch) = split_family_recheck(frame, Syscall::VmMap, cpu) {
+        return Some(mismatch);
     }
     let tid = match split_vm_caller_tid(shared, cpu) {
         Ok(tid) => tid,
@@ -8333,9 +8598,9 @@ pub(crate) fn try_split_vm_anon_map_into_frame(
     frame: &mut TrapFrame,
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::syscall::vm_txn::{MapTarget, run_vm_map_transaction};
-    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
-    if !matches!(syscall, Syscall::VmAnonMap) {
-        return None;
+    // U9-TERMINAL-FINAL §1 — the family re-check, settled. See `split_family_recheck`.
+    if let Some(mismatch) = split_family_recheck(frame, Syscall::VmAnonMap, cpu) {
+        return Some(mismatch);
     }
     let tid = match split_vm_caller_tid(shared, cpu) {
         Ok(tid) => tid,
@@ -8374,9 +8639,9 @@ pub(crate) fn try_split_vm_brk_into_frame(
     frame: &mut TrapFrame,
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::syscall::vm_txn::run_vm_brk_transaction;
-    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
-    if !matches!(syscall, Syscall::VmBrk) {
-        return None;
+    // U9-TERMINAL-FINAL §1 — the family re-check, settled. See `split_family_recheck`.
+    if let Some(mismatch) = split_family_recheck(frame, Syscall::VmBrk, cpu) {
+        return Some(mismatch);
     }
     let tid = match split_vm_caller_tid(shared, cpu) {
         Ok(tid) => tid,
@@ -8412,9 +8677,9 @@ fn try_split_recv_shared_v3_into_frame(
     use crate::kernel::syscall::SyscallError;
     use crate::kernel::syscall::recv_v3_txn::{V3Delivery, run_recv_v3_transaction};
 
-    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
-    if !matches!(syscall, Syscall::RecvSharedV3) {
-        return None;
+    // U9-TERMINAL-FINAL §1 — the family re-check, settled. See `split_family_recheck`.
+    if let Some(mismatch) = split_family_recheck(frame, Syscall::RecvSharedV3, cpu) {
+        return Some(mismatch);
     }
     let tid = match split_vm_caller_tid(shared, cpu) {
         Ok(tid) => tid,
@@ -8507,9 +8772,9 @@ fn try_split_transfer_release_into_frame(
     frame: &mut TrapFrame,
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::syscall::xfer_txn::run_transfer_release_transaction;
-    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
-    if !matches!(syscall, Syscall::TransferRelease) {
-        return None;
+    // U9-TERMINAL-FINAL §1 — the family re-check, settled. See `split_family_recheck`.
+    if let Some(mismatch) = split_family_recheck(frame, Syscall::TransferRelease, cpu) {
+        return Some(mismatch);
     }
     let tid = match split_vm_caller_tid(shared, cpu) {
         Ok(tid) => tid,
@@ -8554,11 +8819,40 @@ fn try_split_spawn_thread_into_frame(
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SyscallError};
 
-    // ── Pre-mutation. Both refusals here are reads and may still fall back. ──
-    let parent_tid = shared.current_tid_authoritative(cpu)?;
-    // A thread joins its parent's EXISTING process CNode; registration only ever ensures it.
-    // If it is somehow absent the broad handler must create it, so decline before mutating.
-    shared.task_cnode_split(parent_tid)?;
+    // ── Pre-mutation. Nothing below has touched anything until the transaction. ──
+    //
+    // U9-TERMINAL-FINAL §1 — both takes are gone, and for DIFFERENT reasons.
+    //
+    // The caller take is settled: `process::handle_spawn_thread` opens with
+    // `current_tid(kernel)?`, so `Internal` is the canonical answer.
+    let parent_tid = match split_caller(shared, cpu)
+        .or_internal(crate::kernel::syscall::SYSCALL_SPAWN_THREAD_NR, cpu)
+    {
+        Ok(tid) => tid,
+        Err(settlement) => return settlement,
+    };
+    // The CNode take is REPLACED BY THE CREATION IT WAS STANDING IN FOR.
+    //
+    // It read "a thread joins its parent's EXISTING process CNode; if it is somehow absent the
+    // broad handler must create it, so decline before mutating" — a correct observation with the
+    // wrong conclusion. The broad path does not refuse an absent CNode, it creates one, so
+    // declining here did not reproduce its behaviour, it replaced a completed spawn with a
+    // detour. `ensure_process_cnode_split` composes that creation through the same shared
+    // rank-4 bodies the broad registration uses, and is a no-op in the ordinary case where the
+    // parent already has its CNode.
+    //
+    // It runs BEFORE the transaction because that is where the broad registration does it, and
+    // because its own failures (`CapabilityFull`, `TaskTableFull`) must be raised while nothing
+    // has been mutated. A failure here is the error the broad path would have produced.
+    if let Err(err) = shared.ensure_process_cnode_split(parent_tid) {
+        crate::yarm_log!(
+            "SPAWN_THREAD_SPLIT_CNODE_UNAVAILABLE cpu={} parent_tid={} err={:?} broad_lock=0",
+            cpu.0,
+            parent_tid,
+            err
+        );
+        return Some(Err(TrapHandleError::Syscall(SyscallError::from(err))));
+    }
 
     let tls_base = frame.arg(SYSCALL_ARG_CAP);
     let user_stack_top = frame.arg(SYSCALL_ARG_PTR);
@@ -8610,8 +8904,18 @@ fn try_split_create_initramfs_mo_into_frame(
         Some(Err(TrapHandleError::Syscall(e)))
     };
 
-    // ── Pre-mutation. Every refusal here may still fall back; none has touched anything. ──
-    let tid = shared.current_tid_authoritative(cpu)?;
+    // ── Pre-mutation. Every refusal here has touched nothing. ──
+    //
+    // U9-TERMINAL-FINAL §1 — the caller take is SETTLED. `initramfs::handle_create_initramfs_
+    // file_slice_mo` opens with `current_tid(kernel)?` (`Internal`) and only then applies its
+    // `SystemServer` gate, so the order here matches: identity first, authorization second.
+    let tid = match split_caller(shared, cpu).or_internal(
+        crate::kernel::syscall::SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR,
+        cpu,
+    ) {
+        Ok(tid) => tid,
+        Err(settlement) => return settlement,
+    };
     // Access gate: SystemServer only, exactly as the broad handler gates it.
     if shared.task_class_split_read(tid) != Some(TaskClass::SystemServer) {
         crate::yarm_log!(
@@ -8747,17 +9051,28 @@ fn try_split_spawn_from_mo_into_frame(
 /// U9-SPAWN-IC1's rule: the caller identity is established up front and passed explicitly, never
 /// re-read from an ambient current-task lookup partway through a transaction whose locks are
 /// released between phases.
-fn spawn_owners_for(
+/// U9-TERMINAL-FINAL §1 — the spawn owners, built from a caller that is ALREADY RESOLVED.
+///
+/// It used to resolve the caller itself, with `?`, and hand a `None` to its three callers — each
+/// of which propagated it out through their own `Option` return and into the terminal broad
+/// acquisition. Taking the tid as an argument moves that decision to the routes, where each one
+/// can name the answer its own canonical handler gives, and makes the escape unrepresentable
+/// here rather than merely absent.
+///
+/// `spawner_tid` is `Some(tid)` by construction, which is what lets the callers stop taking
+/// `owners.spawner_tid?` — a second invisible escape that could never actually fire, but that a
+/// reader had to prove unreachable every time.
+fn spawn_owners_for_caller(
     shared: &SharedKernel,
     cpu: CpuId,
-) -> Option<crate::kernel::syscall::spawn_txn::SharedSpawnOwners<'_>> {
-    let tid = shared.current_tid_authoritative(cpu)?;
-    Some(crate::kernel::syscall::spawn_txn::SharedSpawnOwners {
+    tid: u64,
+) -> crate::kernel::syscall::spawn_txn::SharedSpawnOwners<'_> {
+    crate::kernel::syscall::spawn_txn::SharedSpawnOwners {
         shared,
         spawner_tid: Some(tid),
         spawner_cnode: shared.task_cnode_split(tid),
         cpu,
-    })
+    }
 }
 
 /// U9-FORK1 §4 — NR 12 `Fork`, before the terminal acquisition.
@@ -8933,9 +9248,19 @@ fn try_split_reap_faulted_task_into_frame(
         Some(Err(TrapHandleError::Syscall(e)))
     };
 
-    // PRE-MUTATION, and the ONLY case this route declines: with no resolvable caller there is no
-    // authorization to check, so the broad handler re-derives the identical answer.
-    let caller = shared.current_tid_authoritative(cpu)?;
+    // U9-TERMINAL-FINAL §1 — PRE-MUTATION, and now SETTLED rather than declined.
+    //
+    // It used to say "the broad handler re-derives the identical answer", which was true and
+    // still an escape: `process::handle_reap_faulted_task` opens with `current_tid(kernel)?`,
+    // i.e. `SyscallError::Internal`, so the acquisition existed only to reach a verdict already
+    // known here. Worse, "identical" was not guaranteed — the broad path re-derives the caller
+    // from whoever is current by the time it acquires, which need not be the task that trapped.
+    let caller = match split_caller(shared, cpu)
+        .or_internal(crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR, cpu)
+    {
+        Ok(tid) => tid,
+        Err(settlement) => return settlement,
+    };
     let target = frame.arg(0) as u64;
     // U9-REAP1 §6: the split half of the edge measurement. Emitted per invocation, not latched —
     // §6 asserts that this count equals the successful-reap count, which a one-shot marker could
@@ -9005,12 +9330,15 @@ fn try_split_fork_into_frame(
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) -> Option<Result<(), TrapHandleError>> {
-    // PRE-MUTATION refusal: no resolvable caller means no fork. Declining here returns `None` and
-    // the broad handler re-derives the same answer.
-    let Some(parent_tid) = shared.current_tid_authoritative(cpu) else {
-        return None;
-    };
-    let mut owners = spawn_owners_for(shared, cpu)?;
+    // U9-TERMINAL-FINAL §1 — PRE-MUTATION, and SETTLED. `process::handle_fork` opens with
+    // `current_tid(kernel)?`, so `Internal` is the canonical answer and the broad handler adds
+    // nothing but an acquisition — and re-derives the caller from whoever is current by then.
+    let parent_tid =
+        match split_caller(shared, cpu).or_internal(crate::kernel::syscall::SYSCALL_FORK_NR, cpu) {
+            Ok(tid) => tid,
+            Err(settlement) => return settlement,
+        };
+    let mut owners = spawn_owners_for_caller(shared, cpu, parent_tid);
     let parent_context = frame.capture_user_context();
     match crate::kernel::syscall::fork_txn::fork_process_cow(
         &mut owners,
@@ -9098,8 +9426,17 @@ fn try_split_spawn_process_into_frame(
     };
 
     // ── Pre-mutation. Nothing below has touched anything until the transaction. ───────
-    let mut owners = spawn_owners_for(shared, cpu)?;
-    let tid = owners.spawner_tid?;
+    //
+    // U9-TERMINAL-FINAL §1 — both takes are settled. `process::handle_spawn_process` resolves the
+    // caller through the shared spawn owners exactly as this does, and answers `Internal` when
+    // there is none.
+    let tid = match split_caller(shared, cpu)
+        .or_internal(crate::kernel::syscall::SYSCALL_SPAWN_PROCESS_NR, cpu)
+    {
+        Ok(tid) => tid,
+        Err(settlement) => return settlement,
+    };
+    let mut owners = spawn_owners_for_caller(shared, cpu, tid);
 
     let image_id = frame.arg(0) as u64;
     let parent_pid = frame.arg(1) as u64;
@@ -9211,8 +9548,17 @@ fn try_split_spawn_from_mo_into_frame(
         Some(Err(TrapHandleError::Syscall(e)))
     };
 
-    let mut owners = spawn_owners_for(shared, cpu)?;
-    let caller_tid = owners.spawner_tid?;
+    // U9-TERMINAL-FINAL §1 — identity FIRST, authorization second, exactly as
+    // `process::handle_spawn_from_memory_object` orders them: `current_tid(kernel)?` (`Internal`)
+    // and only then the `!= PM_BOOTSTRAP_TID` gate (`MissingRight`).
+    let caller_tid = match split_caller(shared, cpu).or_internal(
+        crate::kernel::syscall::SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR,
+        cpu,
+    ) {
+        Ok(tid) => tid,
+        Err(settlement) => return settlement,
+    };
+    let mut owners = spawn_owners_for_caller(shared, cpu, caller_tid);
     // Access gate: PM only, exactly as the broad handler gates it.
     if caller_tid != crate::kernel::syscall::PM_BOOTSTRAP_TID {
         crate::yarm_log!("SPAWN_FROM_MO_DENIED tid={} reason=not_pm", caller_tid);

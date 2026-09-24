@@ -158079,6 +158079,18 @@ mod u9mo2_nr28_terminal_edges {
                 "no fallback may escape after the mutation: found `{escape}`"
             );
         }
+        // U9-TERMINAL-FINAL §1 — and none escapes BEFORE it either. The caller take was the last
+        // one; `initramfs::handle_create_initramfs_file_slice_mo` opens with
+        // `current_tid(kernel)?`, so an unresolvable caller answers `Internal` here.
+        assert!(
+            !body[..mutation].contains("shared.current_tid_authoritative(cpu)?"),
+            "the pre-mutation caller take must be settled, not declined"
+        );
+        assert!(
+            body[..mutation].contains("split_caller(shared, cpu)")
+                && body[..mutation].contains("or_internal("),
+            "through the shared caller fact and the canonical `Internal`"
+        );
         // Both post-mutation arms are terminal and typed.
         assert!(
             tail.contains("frame.set_ok(0, cap_id.0 as usize, file_len);")
@@ -158092,11 +158104,17 @@ mod u9mo2_nr28_terminal_edges {
             tail.contains("result=compensated"),
             "the post-mutation failure arm must record its compensation"
         );
-        // The pre-mutation half is where fallback lives, and it is still allowed there — this is
-        // what makes the assertion above a BOUNDARY and not a blanket ban.
+        // U9-TERMINAL-FINAL §1 — the pre-mutation half USED to be where fallback lived, and this
+        // assertion is what kept that a boundary rather than a blanket ban. There is no fallback
+        // left on either side of the line: the caller take was the last one, and
+        // `initramfs::handle_create_initramfs_file_slice_mo` opens with `current_tid(kernel)?`,
+        // so the canonical answer is `Internal` and the acquisition bought nothing.
+        //
+        // The boundary itself still matters and is still asserted — above, by the escape scan on
+        // the tail. What changes is which side of it may decline: now neither.
         assert!(
-            body[..mutation].contains("shared.current_tid_authoritative(cpu)?"),
-            "the pre-mutation half may still decline to the broad handler"
+            !body[..mutation].contains("shared.current_tid_authoritative(cpu)?"),
+            "the pre-mutation caller take must be settled, not declined"
         );
     }
 
@@ -158817,12 +158835,31 @@ mod u9spawn1_nr11_terminal_edges {
                 && tail.contains("SyscallError::from(err)"),
             "success returns the child TID; failure returns the exact typed error"
         );
-        // The pre-mutation half may still decline — that is what makes this a boundary.
+        // U9-TERMINAL-FINAL §1 — the pre-mutation half no longer declines at all, and the two
+        // takes it used to make were settled for DIFFERENT reasons.
+        //
+        // The caller take is a settlement: `process::handle_spawn_thread` opens with
+        // `current_tid(kernel)?`, so `Internal` is the canonical answer.
+        //
+        // The CNode take was REPLACED BY A CREATION. Its comment said "if it is somehow absent
+        // the broad handler must create it, so decline before mutating" — a correct reading of
+        // the broad path with the wrong conclusion. `register_task_with_class_and_cnode_slots_in_
+        // process` does not refuse an absent CNode, it provisions one, so declining substituted a
+        // failure for a spawn the broad path completes. `ensure_process_cnode_split` composes
+        // that same provisioning through the same shared rank-4 bodies.
+        let pre = &body[..mutation];
         assert!(
-            body[..mutation].contains("shared.current_tid_authoritative(cpu)?")
-                && body[..mutation].contains("shared.task_cnode_split(parent_tid)?"),
-            "the pre-mutation half declines on an unavailable requester or an absent process \
-             CNode, both of which are READS"
+            !pre.contains("shared.current_tid_authoritative(cpu)?")
+                && !pre.contains("shared.task_cnode_split(parent_tid)?"),
+            "neither pre-mutation take may decline to the broad route any more"
+        );
+        assert!(
+            pre.contains("split_caller(shared, cpu)") && pre.contains("or_internal("),
+            "the caller is resolved through the shared fact and settled with `Internal`"
+        );
+        assert!(
+            pre.contains("shared.ensure_process_cnode_split(parent_tid)"),
+            "and the CNode is PROVISIONED, not refused"
         );
     }
 
@@ -159614,10 +159651,28 @@ mod u9spawn1_sp3_spawn_ledger {
     fn the_process_cnode_association_has_one_policy_and_two_acquisitions() {
         const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
         const CNODE_SRC: &str = include_str!("cnode_state.rs");
+        // U9-TERMINAL-FINAL §1 — the check is about CALLS, not about the word appearing.
+        //
+        // `ensure_process_cnode_split` quotes the broad registration's four steps in its doc
+        // comment so a reader can see what it is reproducing, and the previous form of this
+        // assertion matched that prose. What it means to protect is that no off-lock path takes
+        // the BROAD `&mut KernelState` entry — which would be a second acquisition — and that
+        // remains true: the split provisioning composes `ensure_cnode_space_locked`, the shared
+        // rank-4 body the broad entry itself delegates to.
+        let runtime_code = RUNTIME_SRC
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
         assert!(
-            !RUNTIME_SRC.contains("ensure_cnode_space_with_slots"),
-            "ensure_cnode_space_with_slots gained an off-lock caller — re-derive the NR 23 \
+            !runtime_code.contains("ensure_cnode_space_with_slots("),
+            "ensure_cnode_space_with_slots gained an off-lock CALLER — re-derive the NR 23 \
              phase table before trusting this note"
+        );
+        assert!(
+            runtime_code.contains("KernelState::ensure_cnode_space_locked(capability,"),
+            "the off-lock provisioning must reach the SHARED rank-4 body instead"
         );
         // Exactly one body states the association rule...
         assert_eq!(
@@ -159636,23 +159691,55 @@ mod u9spawn1_sp3_spawn_ledger {
             RUNTIME_SRC.contains("cnode_state::set_process_cnode_for_pid_locked("),
             "the split entry must delegate to the SAME rank-4 body, not a transcription"
         );
-        // And the NR 11 route still declines rather than creating one, which is what keeps it
-        // sound while NR 23 waits.
+        // U9-TERMINAL-FINAL §1 — THE NR 11 HALF IS RE-DERIVED, and the note above it was the
+        // thing that had gone stale.
+        //
+        // It read: "a thread joins its parent's EXISTING CNode, and its pre-mutation gate
+        // declines outright when that CNode is absent rather than creating one". The first half
+        // is true; the second described the SPLIT route only, and treated it as sound because
+        // "the broad handler must create it". But declining did not reproduce the broad
+        // behaviour — `register_task_with_class_and_cnode_slots_in_process` provisions the CNode
+        // (`process_cnode_for_pid(pid).unwrap_or(CNodeId(pid))`, then ensure, then set) — so the
+        // split route answered a spawn the broad path COMPLETES with a detour to the terminal
+        // acquisition.
+        //
+        // The blocker this test tracks is therefore fully discharged in the same direction it was
+        // already moving: the association policy is one rank-4 body, and NR 11's split route now
+        // reaches the provisioning through it instead of refusing. What is pinned is the
+        // ORDERING that made the old gate sound and still makes the creation sound — it happens
+        // before the first mutation, so its own failures are raised with nothing to undo.
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
         let route = SPLIT_SRC
             .split("fn try_split_spawn_thread_into_frame(")
             .nth(1)
             .expect("the NR 11 route");
-        let gate = route
-            .find("task_cnode_split(parent_tid)?")
-            .expect("the CNode gate");
+        assert!(
+            !route.contains("task_cnode_split(parent_tid)?"),
+            "the NR 11 route must not decline on an absent process CNode"
+        );
+        let ensure = route
+            .find("shared.ensure_process_cnode_split(parent_tid)")
+            .expect("the CNode provisioning");
         let mutation = route
             .find("try_spawn_thread_split(")
             .expect("the first mutation");
         assert!(
-            gate < mutation,
-            "the NR 11 route must decline on an absent process CNode BEFORE it mutates anything"
+            ensure < mutation,
+            "the NR 11 route must PROVISION the process CNode before it mutates anything, so a \
+             provisioning failure has nothing to undo"
         );
+        // And the provisioning composes the shared bodies rather than transcribing them.
+        for owner in [
+            "ensure_cnode_space_locked(capability, cnode, bounded, max_total)",
+            "cnode_state::set_process_cnode_for_pid_locked(",
+            "requested_cnode_slot_capacity_for_class(class, limits, None)",
+        ] {
+            assert!(
+                RUNTIME_SRC.contains(owner),
+                "the off-lock provisioning must compose `{owner}`, the same body the broad \
+                 registration reaches"
+            );
+        }
     }
 
     /// Every image-loading spawn syscall delegates; none keeps a second, uncompensated copy of
@@ -163633,9 +163720,20 @@ mod u9fork1_cow_fork_transaction {
             0,
             "no path after the transaction may decline to the broad route"
         );
+        // U9-TERMINAL-FINAL §1 — the pre-mutation refusal is now a SETTLEMENT, not a decline.
+        // `process::handle_fork` opens with `current_tid(kernel)?`, so an unresolvable caller
+        // answers `Internal` here rather than costing a terminal acquisition to reach the same
+        // verdict — and reaching it later would re-derive the caller from whoever is current by
+        // then, which need not be the task that trapped.
         assert!(
-            route[..txn_at].contains("return None"),
-            "the pre-mutation refusal must decline to the broad route"
+            !route[..txn_at].contains("return None"),
+            "the pre-mutation refusal must no longer decline to the broad route"
+        );
+        assert!(
+            route[..txn_at].contains("split_caller(shared, cpu)")
+                && route[..txn_at].contains("or_internal("),
+            "it must resolve the caller through the shared fact and settle with the canonical \
+             `Internal`"
         );
     }
 
@@ -165108,10 +165206,17 @@ mod u9reap1_reap_transaction {
             0,
             "the route must not decline explicitly"
         );
-        // Its single decline is the `?` on the caller lookup, which is strictly pre-mutation.
+        // U9-TERMINAL-FINAL §1 — and its last implicit one is gone too. The `?` on the caller
+        // lookup was an escape with no `None` token on the line: it left the route through the
+        // `Option` return and became a terminal broad acquisition, to reach the `Internal` that
+        // `process::handle_reap_faulted_task`'s own `current_tid(kernel)?` produces.
         assert!(
-            body.contains("let caller = shared.current_tid_authoritative(cpu)?;"),
-            "the one decline must be the pre-mutation caller lookup"
+            !body.contains("let caller = shared.current_tid_authoritative(cpu)?;"),
+            "the caller lookup must not decline"
+        );
+        assert!(
+            body.contains("split_caller(shared, cpu)") && body.contains("or_internal("),
+            "it resolves through the shared caller fact and settles with the canonical `Internal`"
         );
         // Every gate the broad handler applies is applied here, in the same order, before the
         // transaction.
@@ -177297,25 +177402,34 @@ mod u9vment1_reachability_matrix {
                 &std::format!("pub(crate) fn {route}("),
                 "\n}\n",
             ));
-            // The NR gate itself is the ONLY place a `None` may be produced: an undecodable
-            // number and a different syscall. Everything after it is `Some(..)`.
-            let gate_end = body
-                .find("return None;")
-                .expect("the NR gate declines a different syscall")
-                + "return None;".len();
-            let after_gate = &body[gate_end..];
+            // U9-TERMINAL-FINAL §1 — the NR gate no longer produces a `None` EITHER, so the
+            // route has no fall-through at all.
+            //
+            // Its two lines were `Syscall::decode(..).ok()?` and `if !matches!(syscall, X) {
+            // return None; }`. Both are unreachable — the dispatcher decoded the number and
+            // matched this exact variant before calling — but both were escapes a future edit
+            // could reach, and the `.ok()?` carried no `None` token at all. `split_family_recheck`
+            // keeps the check (a route must read correctly on its own) and changes its answer: a
+            // dispatcher/route disagreement about the NR is an invariant break and settles
+            // `Internal`, never a reason to re-run an already-classified syscall under the whole
+            // kernel.
+            let gate = "if let Some(mismatch) = split_family_recheck(frame,";
+            let gate_at = body
+                .find(gate)
+                .expect("the NR gate must settle a mismatch rather than decline it");
+            let after_gate = &body[gate_at + gate.len()..];
             assert_eq!(
-                after_gate.matches("None").count(),
+                body.matches("None").count(),
                 0,
-                "{label}: `{route}` must never answer `None` after recognizing its NR — a family \
-                 with a reachable broad fallback is not closed, and after a frame is taken or a \
-                 page installed a `None` would hand a partially executed transaction to a \
-                 dispatcher that knows nothing about it"
+                "{label}: `{route}` must never answer `None` ANYWHERE — a family with a reachable \
+                 broad fallback is not closed, and after a frame is taken or a page installed a \
+                 `None` would hand a partially executed transaction to a dispatcher that knows \
+                 nothing about it"
             );
             assert_eq!(
                 body.matches(".ok()?").count(),
-                1,
-                "{label}: the only `?` is the decode in the NR gate"
+                0,
+                "{label}: the NR-gate decode `?` was an invisible escape and is gone"
             );
             // Errors go back as errors, not as declines.
             assert!(
@@ -188508,87 +188622,147 @@ mod u9d6final_residual {
         );
     }
 
-    /// **NR 8 — the argument-validation refusal, and the ONE producer with a live arrival.**
+    /// **NR 8 — the argument-validation refusal, and the ONE producer that had a live arrival.**
     ///
-    /// `classify_split_eligible` refuses `target_pid == 0 || slots == 0` with `None`, which `?`
-    /// propagates out of `try_split_dispatch` and then out of the non-switching dispatcher. A
-    /// RISC-V core-smoke boot took it exactly once (`TERMINAL_BROAD_DISPATCH_ENTER cpu=0
-    /// event=Syscall nr=8`). Owner-in-waiting: the canonical argument error, answered pre-lock
-    /// beside the retired-NR arm that already does this for a different refusal.
+    /// U9-TERMINAL-FINAL §1 CLOSED it. `cap::handle_control_plane_set_cnode_slots` resolves the
+    /// caller first (`current_tid`, i.e. `Internal`) and validates second (`target_pid == 0 ||
+    /// slot_capacity == 0`, i.e. `InvalidArgs`), and the route now does both in that order and
+    /// settles each — so the RISC-V boot that produced `TERMINAL_BROAD_DISPATCH_ENTER cpu=0
+    /// event=Syscall nr=8` would now answer `InvalidArgs` with no acquisition at all.
+    ///
+    /// The ORDER is pinned, not just the presence: a call that is invalid twice over — no
+    /// current task AND a zero argument — must answer `Internal`, because that is the validation
+    /// the canonical handler reaches first.
     #[test]
-    fn residual_nr8_argument_refusal_falls_through_by_construction() {
-        let c = code(SPLIT);
-        let classify = c
-            .split("fn classify_split_eligible(")
-            .nth(1)
-            .expect("the eligibility classifier");
-        assert!(
-            classify.contains("if target_pid == 0 || slots == 0 {"),
-            "the NR 8 argument refusal is the live residual; its shape is pinned here"
-        );
-        let dispatcher = c
-            .split("fn try_split_dispatch_nonswitching_into_frame(")
-            .nth(1)
-            .expect("the non-switching dispatcher");
-        assert!(
-            dispatcher.contains("try_split_dispatch(shared, syscall, requester_tid, args)?"),
-            "and it reaches the bridge through this `?`, which is why a `None` here is a broad \
-             entry rather than an error"
-        );
-    }
-
-    /// **The undecodable NR.** A number that is neither decodable nor retired leaves the
-    /// dispatcher as `None`. Owner-in-waiting: `SyscallError::InvalidNumber`, which is exactly
-    /// what the adjacent retired-NR arm already returns for its own case.
-    #[test]
-    fn residual_undecodable_nr_falls_through_while_the_retired_one_does_not() {
+    fn nr8_argument_refusal_is_settled_in_the_canonical_order() {
         let c = code(SPLIT);
         let dispatcher = c
             .split("fn try_split_dispatch_nonswitching_into_frame(")
             .nth(1)
             .expect("the non-switching dispatcher");
+        let caller_at = dispatcher
+            .find("split_caller(shared, cpu).or_internal(raw_nr, cpu)")
+            .expect("the caller resolution");
+        let args_at = dispatcher
+            .find("if target_pid == 0 || slot_capacity == 0 {")
+            .expect("the argument gate");
         assert!(
-            dispatcher.contains(
-                "if let Some(reason) = crate::kernel::syscall::retired_syscall_number(raw_nr) {"
-            ),
-            "a RETIRED number is answered pre-lock"
+            caller_at < args_at,
+            "identity first, arguments second — the canonical order"
         );
         assert!(
-            dispatcher.contains("let Ok(syscall) = Syscall::decode(raw_nr) else {"),
-            "an UNDECODABLE one is not — it is the residual this names"
+            dispatcher[args_at..].contains("SyscallError::InvalidArgs"),
+            "and the argument refusal answers the canonical error"
+        );
+        assert!(
+            !dispatcher.contains("let requester_tid = shared.current_tid_authoritative(cpu)?;"),
+            "the caller take must no longer escape"
         );
     }
 
-    /// **`current_tid_authoritative` is the most widely shared producer.** Seven whitelisted
-    /// routes take it with `?`, so "this CPU has no authoritative current task" is a broad entry
-    /// on all of them. Owner-in-waiting: ONE settlement for that condition, composed by each
-    /// route, rather than seven independent fall-throughs.
+    /// **The undecodable NR is answered pre-lock**, beside the retired-number arm that already
+    /// did this for its own case — and the two stay separate, because "the caller is stale" and
+    /// "the caller is wrong" are different things a live log needs to tell apart.
     #[test]
-    fn residual_no_authoritative_current_is_shared_by_several_routes() {
+    fn an_undecodable_nr_is_settled_beside_the_retired_one() {
         let c = code(SPLIT);
-        let takes = c.matches("shared.current_tid_authoritative(cpu)?").count();
+        let dispatcher = c
+            .split("fn try_split_dispatch_nonswitching_into_frame(")
+            .nth(1)
+            .expect("the non-switching dispatcher");
         assert!(
-            takes >= 5,
-            "the shared residual is real and widespread (found {takes} `?` takes); if this \
-             drops to zero the condition has been given an owner and the list shrinks"
+            dispatcher.contains("SYSCALL_RETIRED_REFUSED")
+                && dispatcher.contains("SYSCALL_UNDECODABLE_REFUSED"),
+            "both refusals are named, and separately"
+        );
+        let undecodable = dispatcher
+            .find("let Ok(syscall) = Syscall::decode(raw_nr) else {")
+            .expect("the decode gate");
+        let tail = &dispatcher[undecodable..];
+        let settle = tail
+            .find("SyscallError::InvalidNumber")
+            .expect("the canonical answer");
+        let ret = tail.find("return None;").unwrap_or(usize::MAX);
+        assert!(
+            settle < ret,
+            "the decode gate must settle `InvalidNumber` rather than decline"
         );
     }
 
-    /// **NR 10 — three named legacy fall-throughs.** `try_split_futex_wake_into_frame` declines
-    /// to the broad path on every validation miss, and says so in its own comments. Owner-in-
-    /// waiting: the canonical `WrongObject` / `UserMemoryFault` answers, pre-lock.
+    /// **`current_tid_authoritative` is no longer taken with `?` by any route.**
+    ///
+    /// It was the most widely shared escape, and the most invisible: nine routes wrote
+    /// `shared.current_tid_authoritative(cpu)?` with no `None` token on the line. The resolver is
+    /// shared now and the SETTLEMENT is not — six routes answer `Internal` (`helpers::current_tid`),
+    /// NR 10 answers `TaskMissing` (`validate_current_user_futex_word`), and NR 15 answers
+    /// nothing at all, because `debug::handle_debug_log` reads `unwrap_or(0)` and proceeds.
     #[test]
-    fn residual_nr10_futex_wake_validation_misses_are_named_fall_throughs() {
+    fn no_route_takes_the_caller_with_a_question_mark() {
+        let c = code(SPLIT);
+        assert_eq!(
+            c.matches("shared.current_tid_authoritative(cpu)?").count(),
+            0,
+            "every caller take must go through `split_caller` and be settled"
+        );
+        assert!(
+            c.contains("pub(crate) enum SplitCaller {")
+                && c.contains("Running(u64),")
+                && c.contains("NoCurrentTask,"),
+            "the shared fact is a type, not an Option"
+        );
+        // The three distinct settlements, each named where its canonical handler puts it.
+        assert!(
+            c.contains("settlement=internal broad_lock=0"),
+            "the six `helpers::current_tid` routes answer `Internal`"
+        );
+        assert!(
+            c.contains("settlement=task_missing broad_lock=0"),
+            "NR 10 answers `TaskMissing`, not `Internal`"
+        );
+        assert!(
+            c.contains("SplitCaller::NoCurrentTask => 0,"),
+            "NR 15 tolerates an absent caller, exactly as its canonical handler does"
+        );
+    }
+
+    /// **NR 10's five escapes are settled, and the range policy is now SHARED rather than
+    /// transcribed.**
+    ///
+    /// The transcription had already drifted: it turned an address whose `+3` overflows `usize`
+    /// into a fall-through, where `futex_word_range_check` — the one policy the broad path uses —
+    /// answers `UserMemoryFault`.
+    #[test]
+    fn nr10_validation_misses_are_settled_through_the_shared_range_policy() {
         let route = SPLIT
             .split("fn try_split_futex_wake_into_frame(")
             .nth(1)
             .expect("the futex-wake route");
         let body = route.split("\n}\n").next().unwrap_or(route);
         assert_eq!(
-            body.matches("return None; // legacy:").count(),
-            3,
-            "three validation misses fall through, each naming the legacy error it wants the \
-             broad path to produce"
+            body.matches("return None").count(),
+            0,
+            "no validation miss may fall through"
+        );
+        assert!(
+            body.contains("sched::futex_word_range_check(addr)"),
+            "the range check must be the SHARED policy, not a second copy of it"
+        );
+        assert!(
+            !body.contains("addr.checked_add(core::mem::size_of::<u32>() - 1)?"),
+            "the transcribed overflow check — which fell through where the shared policy answers \
+             UserMemoryFault — must be gone"
+        );
+        // The canonical order: conversion, range, caller, asid, copy.
+        let conv = body
+            .find("u32::try_from(")
+            .expect("the max_wake conversion");
+        let range = body
+            .find("futex_word_range_check(")
+            .expect("the range check");
+        let caller = body.find("split_caller(shared, cpu)").expect("the caller");
+        assert!(
+            conv < range && range < caller,
+            "a call invalid twice over answers the validation the canonical handler reaches first"
         );
     }
 

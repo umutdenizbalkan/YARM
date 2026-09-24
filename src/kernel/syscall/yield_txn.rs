@@ -290,6 +290,80 @@ pub(crate) fn run_yield_transaction<O: YieldOwners>(
     Ok(YieldOutcome { outgoing })
 }
 
+/// U9-TERMINAL-FINAL §2 — **what the canonical path still owes AFTER a decline.**
+///
+/// `run_yield_transaction` decides whether the yield can be DEFERRED. A decline does not end the
+/// syscall — `KernelState::yield_current` continues, and what it does next is as much NR 0's
+/// behaviour as the deferral is:
+///
+/// ```text
+///   Err(NotRunning)  -> log, and answer TaskMissing. Steps below are NOT run.
+///   Err(NoCurrent)   -> silent (there is nothing to yield), then continue.
+///   Err(other)       -> log the in-lock fallback reason, then continue.
+///                       apply `Running -> Runnable` (the transition the decline still owes)
+///                       -> refused: TaskMissing
+///                       -> applied: advance this CPU's queue
+/// ```
+///
+/// The split route used to answer `NotHandled` for every decline and let the broad dispatcher
+/// re-run all of it. That was the last switching residual reaching a terminal acquisition, and it
+/// was not a cheap one: the broad path re-derives `outgoing` from whoever is current by the time
+/// it acquires, which need not be the task that trapped.
+///
+/// This is therefore the SAME extraction `run_yield_transaction` itself is: one policy, driven by
+/// two adapters, so the broad NR 0 and the split NR 0 cannot come to disagree about what a
+/// declined yield does. Nothing here is new behaviour — every line is `yield_current`'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum YieldDeclineSettlement {
+    /// `NotRunning`, or a `Running -> Runnable` the scheduler refused. `yield_current` answers
+    /// `KernelError::TaskMissing`, which `handle_yield` maps to this syscall's error.
+    TaskMissing,
+    /// The caller was preempted and the CPU now owes a queue advance — the in-lock dispatch on
+    /// the broad path, the post-lock drain on the split one.
+    QueueAdvance { outgoing: u64 },
+    /// There was no caller to yield. `yield_current` still reaches its dispatch with
+    /// `outgoing_tid == None`; nothing was preempted because there was nothing to preempt.
+    NoCaller,
+}
+
+/// THE post-decline policy, over the same owners the transaction uses.
+pub(crate) fn settle_yield_decline<O: YieldOwners>(
+    owners: &mut O,
+    cpu: CpuId,
+    outgoing_tid: Option<u64>,
+    decline: YieldDecline,
+) -> YieldDeclineSettlement {
+    match decline {
+        // Stage 199D-WA3A's exact `Running → Runnable` refused. The in-lock fallback is NOT run —
+        // it requires the caller to be `Runnable`, which is precisely what failed.
+        YieldDecline::NotRunning => {
+            log_yield_declined(cpu, outgoing_tid.unwrap_or(0), YieldDecline::NotRunning);
+            return YieldDeclineSettlement::TaskMissing;
+        }
+        // `NoCurrent` is deliberately silent. The delivered per-architecture blocks were each
+        // wrapped in `if let Some(out_tid) = outgoing_tid`, so a yield with no current task never
+        // reached their fallback markers at all — it is not a declined deferral, it is a yield
+        // with nothing to yield. The kernel-internal callers reach it routinely, and logging them
+        // would add ~35 lines a boot of output that reads like a failure.
+        YieldDecline::NoCurrent => {}
+        other => log_yield_declined(cpu, outgoing_tid.unwrap_or(0), other),
+    }
+
+    // The transition the DECLINED path still owes.
+    //
+    // The transaction owns `Running → Runnable` because it is policy, not acquisition. Every
+    // decline happens before that write (the one step that can fail after it rolls it back), so
+    // the caller is still `Running` here — and both the RISC-V foundation block and the in-lock
+    // dispatch require it `Runnable`, exactly as they always have.
+    let Some(tid) = outgoing_tid else {
+        return YieldDeclineSettlement::NoCaller;
+    };
+    if owners.preempt_outgoing(tid).is_none() {
+        return YieldDeclineSettlement::TaskMissing;
+    }
+    YieldDeclineSettlement::QueueAdvance { outgoing: tid }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 // The two adapters. Neither contains policy: each is a set of acquisitions around the state the
 // transaction above decides over, so the broad NR 0 and the split NR 0 run the SAME decision.

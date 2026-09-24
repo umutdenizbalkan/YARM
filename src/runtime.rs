@@ -9712,6 +9712,72 @@ impl SharedKernel {
         })
     }
 
+    /// U9-TERMINAL-FINAL §1 — **ENSURE the caller's process CNode exists, off the broad lock.**
+    ///
+    /// `try_split_spawn_thread_into_frame` used to take `task_cnode_split(parent_tid)?` and
+    /// decline, with the comment "if it is somehow absent the broad handler must create it, so
+    /// decline before mutating". The observation was right and the conclusion was the escape: the
+    /// broad path does not refuse an absent CNode, it CREATES one. `register_task_with_class_and_
+    /// cnode_slots_in_process` opens with
+    ///
+    /// ```text
+    ///     let cnode = self.process_cnode_for_pid(pid).unwrap_or(CNodeId(pid));
+    ///     let slots = Self::requested_cnode_slot_capacity_for_class(class, limits, None)?;
+    ///     self.ensure_cnode_space_with_slots(cnode, slots)?;
+    ///     self.set_process_cnode_for_pid(pid, cnode)?;
+    /// ```
+    ///
+    /// and the split spawn-thread transaction performs only the rank-2 half of that registration,
+    /// which is why the pre-check existed at all. Substituting a refusal for a creation would
+    /// have changed the syscall's meaning — a thread spawn that the broad path completes would
+    /// start failing — so this composes the same four steps through the same shared bodies at
+    /// the same rank, and the route calls it instead of declining.
+    ///
+    /// Rank discipline: rank 2 is taken and RELEASED (the pid and class are `Copy`), then rank 4.
+    /// Never nested, and ascending, which is the order the broad entry takes them in too.
+    ///
+    /// Idempotent by construction: `ensure_cnode_space_locked` treats an already-provisioned
+    /// space as success and `set_process_cnode_for_pid_locked` is update-or-insert, so the
+    /// overwhelmingly common case — the parent already has its CNode — writes nothing.
+    pub(crate) fn ensure_process_cnode_split(
+        &self,
+        tid: u64,
+    ) -> Result<crate::kernel::capabilities::CNodeId, KernelError> {
+        use crate::kernel::boot::KernelState;
+        use crate::kernel::capabilities::CNodeId;
+
+        // rank 2, released before rank 4 is taken.
+        let pid = self
+            .with_task_tcbs_split_mut(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid)
+                    .map(|tcb| tcb.thread_group_id.0)
+            })
+            .ok_or(KernelError::TaskMissing)?;
+        let class = self
+            .task_class_split_read(tid)
+            .ok_or(KernelError::TaskMissing)?;
+
+        // Pure: the same capacity policy the broad registration applies, from the same limits.
+        let limits = self.runtime_capacity_config_split_read();
+        let slots = KernelState::requested_cnode_slot_capacity_for_class(class, limits, None)?;
+        let bounded = KernelState::normalize_requested_cnode_slots(slots, limits)?;
+        let max_total = limits.max_total_cnode_slots;
+
+        // rank 4.
+        self.with_capability_state_split_mut(|capability| {
+            let cnode =
+                crate::kernel::boot::provisional_cap::process_cnode_for_pid_locked(capability, pid)
+                    .unwrap_or(CNodeId(pid));
+            KernelState::ensure_cnode_space_locked(capability, cnode, bounded, max_total)?;
+            crate::kernel::boot::cnode_state::set_process_cnode_for_pid_locked(
+                capability, pid, cnode,
+            )?;
+            Ok(cnode)
+        })
+    }
+
     /// U9-C — rank-4 capability resolution for an exact task, the split twin of
     /// `KernelState::resolve_capability_for_task`. Composes the two seams above in
     /// ascending order.
