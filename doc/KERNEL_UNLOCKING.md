@@ -21912,3 +21912,102 @@ manufacture closure. `neither_bridge_regrew_a_replacement_for_the_deleted_acquis
 four by name, and `no_production_broad_acquisition_exists_anywhere` states the absolute rather
 than a delta — the census is a per-file expectation and cannot see an acquisition appearing in a
 file that was never on the list.
+
+## §5b — the last retirement class with no owner on the route that performs it
+
+Deleting both acquisitions leaves `KernelState::handle_trap` with **no production caller**, so the
+linker strips the whole broad syscall dispatcher. That is the intended end state for every class
+whose retirement marker had already been relocated onto its split owner — which was all of them
+but one.
+
+`maybe_log_ipc_send_ordinary_cap_enqueue_retired` still had exactly one caller, the broad enqueue
+boundary. **Measured**, not inferred: `class=IpcSendOrdinaryCapEnqueue` is present in the base
+kernel binary (`kernel_boot`) and absent after the deletion, which failed the artifact integrity
+gate on all three ports.
+
+### The defect underneath, which predates §5
+
+The split route emitted the PLAIN marker family for EVERY successful enqueue, cap-carrying or
+not, and retired the plain class with it. The broad boundary it reproduces does not:
+`ipc_try_send_enqueue_boundary_split_plain` screens the message and hands a cap-carrying one to
+`..._ordinary_cap`, which emits a different family and retires a different class. So a
+cap-carrying enqueue reported itself as the plain class, and the ordinary-cap class had no
+producer on the route that performs the operation. §5 is what made that consequential.
+
+`split_enqueue_retirement_class` reproduces both broad screens term for term, and composes the
+existing rank-3 `peek_transfer_envelope_source_object_split` for the Reply-object test rather than
+opening a second envelope reader. The emission site names three classes: `OrdinaryCap` (which
+additionally attests `envelope=preserved` — the one fact its class has and the plain class does
+not), `Plain`, and `Neither`. Reply-cap, shared-region and Reply-object transfers are
+deliberately unretired by either boundary, so they claim no class here either; the enqueue is
+still reported, only the class is silent.
+
+### Ground truth for the ordinary-cap seal, measured on both trees
+
+`scripts/qemu-second-cohort-ordinary-cap-seal.sh` is a live gate with no source-guard substitute:
+6 cells, 3 arches × 2 classes. Run against fresh artifacts on both trees:
+
+| tree | result | missing cell |
+|---|---|---|
+| base `e44c9b7b` | `live_cells=5 result=fail` | `arch=x86_64 class=IpcSendOrdinaryCap` |
+| this pass | `live_cells=5 result=fail` | `arch=x86_64 class=IpcSendOrdinaryCap` |
+
+**The seal is already red at base**, and the missing cell is the blocked-receiver DELIVERY class,
+not the enqueue class. It is pre-existing, out of scope here, and is NOT claimed fixed.
+
+Per-cell, this pass is greater than or equal to base everywhere, and strictly better in two
+places — the x86_64 `capenqueue` boot logged `[err] send-cap-enqueue oracle marker absent` at
+base and `[ok] marker present` here, and the RISC-V `capdirect` boot gained its enqueue marker
+too:
+
+| profile | base (enqueue / cap) | this pass |
+|---|---|---|
+| `x86_64_capdirect` | 0 / 0 | 0 / 0 |
+| `x86_64_capenqueue` | **absent** / 1 | **present** / 1 |
+| `aarch64_capdirect` | 0 / 1 | 0 / 1 |
+| `aarch64_capenqueue` | 1 / 0 | 1 / 0 |
+| `riscv64_capdirect` | 0 / 1 | **1** / 1 |
+| `riscv64_capenqueue` | 1 / 1 | 1 / 1 |
+
+### What this says about the closure
+
+At base, those cap-carrying sends reached the broad enqueue boundary — so the terminal
+acquisition WAS being entered on the seal's armed boots, which the core smokes never exercised.
+That is a second measured arrival beyond the RISC-V `nr=8` one, found only because §5 removed the
+acquisition and something downstream stopped being reachable. The U9-D6-FINAL §7 position — that
+zero arrivals on an unarmed workload discharge nothing — was right for a reason broader than the
+one case it named.
+
+## §5c — the live matrix
+
+Every run below is against FRESH artifacts built from this tree, with the artifact integrity
+gate satisfied on all three ports (it was failing before §5b, for the reason §5b records).
+
+| gate | result | terminal-acquisition gate |
+|---|---|---|
+| x86_64 core smoke, knob-off | `EXIT=0` | `[ok]` — 0 `TRAP_UNOWNED` |
+| x86_64 core smoke, `D6_SWITCH_PROOF=1` | `EXIT=0`, `D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE` | `[ok]` |
+| x86_64 core smoke, `D6_SWITCH_A=1` | `EXIT=0`, `D6_SWITCH_A_DONE` | `[ok]` |
+| x86_64 core smoke, both knobs | `EXIT=0`, cleanup done | `[ok]` |
+| AArch64 core smoke | `EXIT=0` | `[ok]` — 0 `TRAP_UNOWNED` |
+| RISC-V core smoke | `EXIT=0`, `PM_NR8_SELF_PROBE_OK` | `[ok]`, plus `NR 8 serviced with no terminal acquisition` |
+| RISC-V `POST_LOCK_FOUNDATION_ORACLE=1` | `EXIT=0` | `[ok]` |
+
+The RISC-V foundation-oracle profile is the one that proves §3's relocation rather than asserting
+it. With the acquisition the publish used to live inside now deleted, the armed boot still logs
+the full chain in order — `PUBLISH_OK cpu=0 tid=0` → `LOCK_DROPPED_OK cpu=0` → `DRAIN_OK cpu=0
+tid=0` — so the token is published on its own prerequisites and the drain finds the token it was
+always given.
+
+**Hosted:** 5838 passed, 0 failed, 2 ignored.
+**Census guard:** 9/9 (7 existing + 2 new ratchets).
+**Builds:** x86_64-none, aarch64-none, riscv64 — all clean.
+
+**Integration scopes: 16 of 16 run.** Fifteen green;
+`server_dies_runner_scope` is the established carve-out at exactly **8 passed / 2 failed**, the
+two being `required_chain_is_scoped_to_the_witnessed_transaction` and
+`required_marker_chain_is_ordered_and_complete` — the same two, by name, as the recorded
+carve-out.
+
+**Not closed by this pass, and not claimed:** the ordinary-cap seal's
+`arch=x86_64 class=IpcSendOrdinaryCap` cell, red at base and red here (§5b).
