@@ -43986,11 +43986,16 @@ mod stage160_aarch64_split_recv_routing {
                 "the split recv entry must hold no broad acquisition ({broad})"
             );
         }
-        // The global-lock trap dispatch remains the CPU-binding reference for every class the
-        // split path still declines; U9-C does not touch it.
+        // U9-TERMINAL-FINAL §5: this used to read "the global-lock trap dispatch remains the
+        // CPU-binding reference for every class the split path still declines", and it named
+        // `.with_cpu(cpu, |kernel|` as that reference. There is no longer a class the split
+        // path declines AND a broad dispatcher behind it: the dispatcher is deleted, and a
+        // declined class is settled per event class instead. The claim this guard owns — that
+        // the split recv entry binds its own CPU and does not lean on someone else's binding —
+        // is the assertion above, and it is now the whole of it.
         assert!(
-            TRAP_ENTRY_SRC.contains(".with_cpu(cpu, |kernel|"),
-            "the terminal dispatcher remains the with_cpu reference"
+            TRAP_ENTRY_SRC.contains("Ok(settle_unowned_trap("),
+            "the terminal point is the per-class settlement, not a broad dispatcher"
         );
     }
 
@@ -56048,10 +56053,13 @@ mod stage169_d2_send_genuine {
         // of its call sites inside `handle_trap`'s BROAD arms, so it ran only on traps the split
         // routes declined. §3 then drove the same one-shot body from `run_scheduler_loop`, so the
         // acquisition is gone and the file is back to its single terminal dispatcher.
+        // U9-TERMINAL-FINAL §5: 1 -> 0. The canonical terminal broad dispatcher is deleted;
+        // every supported trap outcome is settled by a pre-lock owner and an unsettled trap is
+        // answered per event class. `trap_entry.rs` holds NO broad acquisition of any kind.
         assert_eq!(
             src.matches(".with_cpu(").count(),
-            1,
-            "trap_entry.rs retains exactly one broad acquisition — the terminal dispatcher"
+            0,
+            "trap_entry.rs retains no broad acquisition at all"
         );
         assert!(
             src.contains("FUTEX_WAIT_DISPATCH_COUNT"),
@@ -62379,10 +62387,22 @@ mod stage190a_ap_sched_loop {
             .split_whitespace()
             .collect::<alloc::vec::Vec<_>>()
             .join(" ");
+        // U9-TERMINAL-FINAL §5 — this guard is INVERTED, and the inversion is the point it
+        // was written to make.
+        //
+        // Stage 190A wrote it to stop the AP scheduler loop from claiming the global lock was
+        // retired while the authoritative Phase-2 trap dispatch still took it on every AP
+        // syscall. That dispatch is now deleted, so the over-claim it guarded against has
+        // become the truth — and the guard must say so rather than keep asserting a callsite
+        // that no longer exists. What it still owns is the LOCATION of the claim: the retirement
+        // belongs to the trap bridge, not to `smp.rs`, whose own drain is asserted above.
         assert!(
-            flat.contains("shared .with_cpu(cpu, |kernel| {"),
-            "the global lock is NOT retired: the authoritative Phase-2 trap dispatch still \
-             takes it, and every AP syscall runs through that closure"
+            !flat.contains("shared .with_cpu(cpu, |kernel| {"),
+            "the authoritative Phase-2 trap dispatch no longer takes the global lock"
+        );
+        assert!(
+            flat.contains("Ok(settle_unowned_trap( cpu, decode_trap_context(context), frame.as_deref_mut(), ))"),
+            "and what stands in its place is the per-class settlement, not a removed branch"
         );
         assert!(
             SMP_SRC.contains("shared.block_current_on_cpu_split(cpu)"),
@@ -75252,21 +75272,45 @@ mod stage195a_aarch64_debuglog_live {
             body.contains("SYSCALL_RECV_SHARED_V3_NR"),
             "AArch64 imports NR 30 — it has a TOTAL pre-lock route"
         );
-        // The SELECTIVITY claim this case owns is what matters, and it is asserted directly
-        // rather than through a stand-in that keeps being converted: the import is a whitelist,
-        // not "every syscall". `IpcRecv` (NR 2) is the standing example — its user-ASID cohort
-        // still has no pre-lock route.
+        // U9-TERMINAL-FINAL §3: NR 8 IS now imported, for exactly the reason this guard was
+        // written to withhold it. The withheld text read "its split route decides eligibility
+        // from ARGUMENTS, so importing the ABI would not help it" — true only while the route
+        // ANSWERED NOTHING for an argument it rejected. §1 made that route TOTAL: an invalid
+        // `target_pid` or slot count now settles `InvalidArguments` PRE-LOCK instead of falling
+        // through, so the import is once again the single enabling lever, exactly as it was for
+        // NR 9, NR 0, NR 3/13/14, NR 4 and NR 30. The stand-in moves; the claim does not.
         assert!(
-            !body.contains("SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR"),
-            "the import must stay a whitelist: NR 8 is not on it — its split route decides \
-             eligibility from ARGUMENTS, so importing the ABI would not help it"
+            body.contains("SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR"),
+            "AArch64 imports NR 8 — §1 made its pre-lock route TOTAL, so the import is the one \
+             lever that decides whether the dispatcher sees it at all"
         );
+        // With NR 8 listed, every ASSIGNED syscall number is on this list, so the selectivity
+        // claim can no longer be carried by naming a live class that is missing. It is carried by
+        // the two terms that remain genuinely selective, and both are asserted directly.
+        //
+        // (1) NR 6 and NR 7 are admitted ONLY under the canonical direct-admission predicate —
+        // the same one the split dispatcher itself uses — never unconditionally. With the gate
+        // off (the AArch64 production default) their frames keep `nr = 0` and are declined.
+        assert!(
+            body.contains("&& crate::kernel::boot::ipccall_direct_admission_enabled())"),
+            "NR 6/NR 7 must stay behind the canonical direct-admission predicate rather than \
+             becoming unconditional imports"
+        );
+        // (2) The list is a set of NAMED constants, one per assigned number. `SYSCALL_COUNT` is
+        // 32 while only 22 numbers are assigned, so a retired or unassigned number matches no
+        // term, keeps `nr = 0`, and is declined — which is the property §3 actually needs here.
+        // A numeric literal, a range test or a catch-all would end that; the count is what
+        // rejects one.
         let imported = body
             .matches("raw_nr == crate::kernel::syscall::SYSCALL_")
             .count();
         assert!(
             imported < crate::kernel::syscall::SYSCALL_COUNT,
             "the import list must remain strictly smaller than the syscall table"
+        );
+        assert!(
+            !body.contains("raw_nr >= ") && !body.contains("raw_nr < "),
+            "the import must stay a per-number whitelist: no range admission"
         );
         // NR 0 is the one entry for which the whitelist alone is not sufficient, because an
         // UNLISTED syscall leaves the frame reading `nr = 0` — which is Yield's own number. The
@@ -76686,13 +76730,49 @@ mod stage196a_riscv_shared_trap_foundation {
         );
     }
 
-    // The canonical RISC-V handler runs UNCHANGED inside the bounded with_cpu broad-lock phase.
+    // U9-TERMINAL-FINAL §5: this used to read "the canonical RISC-V handler runs UNCHANGED
+    // inside the bounded `with_cpu` broad-lock phase", and it is INVERTED rather than deleted.
+    //
+    // The claim it owned was never "a broad phase exists" — Stage 196A wrote it to pin that no
+    // raw `&'static mut KernelState` escaped the wrapper, which the guard above it still checks
+    // directly. What made `with_cpu` the right stand-in was that the acquisition was the ONE
+    // place the wrapper reached kernel state broadly. §5 deletes that place, so the stand-in
+    // moves to its strongest form: the wrapper reaches the broad lock NOWHERE, by any spelling.
     #[test]
-    fn canonical_handler_runs_inside_bounded_with_cpu() {
+    fn the_wrapper_holds_no_broad_borrow_at_all() {
+        // CODE lines only. The file still DISCUSSES `with_cpu` at length — every retirement
+        // this port has shipped is recorded in a comment that names what it retired — and a
+        // scan that counted those would be measuring the history, not the tree.
+        let code: alloc::string::String = RISCV_TRAP_SRC
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for spelling in [".with_cpu(", ".with(|kernel|", ".state.lock()"] {
+            assert!(
+                !code.contains(spelling),
+                "the RISC-V wrapper must hold no broad borrow: found `{spelling}`"
+            );
+        }
+        // What stands where the acquisition stood is the PER-CLASS settlement, composed from
+        // the shared policy — not a local reimplementation and not a blanket error.
         assert!(
-            RISCV_TRAP_SRC.contains(".with_cpu(cpu, |kernel| {")
-                && RISCV_TRAP_SRC.contains("handle_trap_entry_with_fault_bookkeeping_mode("),
-            "wrapper must run the canonical handler inside a bounded with_cpu callback"
+            RISCV_TRAP_SRC
+                .contains("settle_unowned_trap_at_riscv_bridge(shared, cpu, context, frame)")
+                && RISCV_TRAP_SRC.contains(
+                    "crate::arch::trap_entry::settle_unowned_trap(cpu, event, Some(frame))"
+                ),
+            "the terminal point must be the shared per-class settlement, driven from here"
+        );
+        // The canonical handler still EXISTS and is still called with a bookkeeping mode — by
+        // the raw/test entry points, which is the only caller it has left. Deleting the
+        // acquisition must not have deleted the handler.
+        assert!(
+            RISCV_TRAP_SRC.contains("fn handle_trap_entry_with_fault_bookkeeping_mode("),
+            "the canonical handler stays; only the bridge's broad call into it is gone"
         );
     }
 
@@ -76707,9 +76787,14 @@ mod stage196a_riscv_shared_trap_foundation {
         let establish = RISCV_TRAP_SRC
             .find("TrapPathWindow::establish(cpu)")
             .expect("the wrapper must establish the window");
+        // U9-TERMINAL-FINAL §5: the position this guard measures against is the END of the
+        // trap's owned work — where the last owner has had its chance and the bridge must
+        // settle whatever is left. That position was `.with_cpu(cpu, |kernel| {` only because
+        // the acquisition happened to sit there. The acquisition is deleted; the position is
+        // not, and it is now the per-class settlement at the same point in the same `else`.
         let broad = RISCV_TRAP_SRC
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the broad phase");
+            .find("settle_unowned_trap_at_riscv_bridge(shared, cpu, context, frame)")
+            .expect("the terminal settlement point");
         // U9-IRQ-UNKNOWN1 §3 re-derivation. The ORDINARY settlement still follows the broad
         // phase, and that is what this guard has always been about. What changed is that a
         // settle may now also appear BEFORE the broad phase — but only as half of a diverging
@@ -77073,9 +77158,13 @@ mod stage196b_riscv_debuglog_split {
             .expect("gate");
         // U9-QA §2 moved the flag write into `TrapPathWindow`, so the broad-lock phase is located
         // by the acquisition itself — which is what the claim was always about.
+        // U9-TERMINAL-FINAL §5: that acquisition is deleted, so the same position is located by
+        // the per-class settlement that replaced it. The claim is unchanged and is, if anything,
+        // stronger now: a handled DebugLog returns before the point where an UNSETTLED trap
+        // would be answered, which is the last thing on this bridge that is not a route.
         let active_set = RISCV_TRAP_SRC
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the broad-lock phase");
+            .find("settle_unowned_trap_at_riscv_bridge(shared, cpu, context, frame)")
+            .expect("the terminal settlement point");
         assert!(
             gate < active_set,
             "the NR-15 split gate must run BEFORE the broad-lock phase (early return skips it)"
@@ -77420,10 +77509,38 @@ mod stage196d_riscv_queue_switch_foundation {
                 && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_LOCK_DROPPED_OK cpu={}"),
             "the drain must reverify readiness (proving the broad guard dropped) then LOCK_DROPPED_OK"
         );
-        // The real arch restore is a FRESH bounded re-acquire.
+        // U9-TERMINAL-FINAL §5 — this assertion was STALE, and the deletion is what exposed it.
+        //
+        // It read "the SATP/frame restore must run in a fresh bounded `with_cpu` re-acquire",
+        // and it passed by finding `.with_cpu(cpu, |kernel| {` ANYWHERE in the file. U3/203C had
+        // already retired this drain's re-acquire onto the exact-token rank-2 transaction
+        // (`direct_dispatch_activate_asid_split`, which performs the real RISC-V map/root/
+        // `write_satp` + `sfence.vma`), so the only `with_cpu` left in the file was the TERMINAL
+        // ACQUISITION — an unrelated site several hundred lines away. The guard has been
+        // asserting a property of the wrong code ever since, and would have kept passing after
+        // this drain lost its lock entirely.
+        //
+        // Re-derived against what the drain actually does: the restore is the split exact-token
+        // transaction, and the drain holds no broad borrow of any kind.
+        let drain = RISCV_TRAP_SRC
+            .split("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN cpu={}")
+            .nth(1)
+            .and_then(|s| s.split("RISCV_POST_LOCK_DRAIN_END").next())
+            .unwrap_or_else(|| {
+                RISCV_TRAP_SRC
+                    .split("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN cpu={}")
+                    .nth(1)
+                    .expect("the queue-switch drain")
+            });
         assert!(
-            RISCV_TRAP_SRC.contains(".with_cpu(cpu, |kernel| {"),
-            "the SATP/frame restore must run in a fresh bounded with_cpu re-acquire"
+            !drain.contains(".with_cpu(") && !drain.contains(".state.lock()"),
+            "the queue-switch foundation drain must hold no broad borrow — its restore is the \
+             exact-token rank-2 transaction U3/203C moved it onto"
+        );
+        assert!(
+            drain.contains("direct_dispatch_activate_asid_split")
+                || drain.contains("direct_dispatch_resume_incoming"),
+            "and the SATP activation must go through that same split owner"
         );
     }
 
@@ -101818,18 +101935,27 @@ mod stage200d0b3_x86_exit_corrected {
             .split("pub fn handle_trap_entry_shared")
             .nth(1)
             .expect("shared entry");
+        // U9-TERMINAL-FINAL §5: the position is the same; the acquisition that used to mark
+        // it is deleted. The end of the bridge's owned work is now the per-class settlement.
+        // U9-TERMINAL-FINAL §5: the shared bridge no longer CALLS the arch handler at all —
+        // the acquisition that did is deleted — so "the consumer runs between lock acquire and
+        // release" no longer has an acquire to sit after. The consumer's own position is what
+        // this case owns, and it is asserted directly against the boundary: it runs before it,
+        // which is precisely why the two attestations below must not come from the consumer.
         let with_cpu = entry
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("lock acquire");
-        let inner_call = entry
-            .find("handle_trap_entry_with_fault_bookkeeping_mode(")
-            .expect("arch handler call");
+            .find("Ok(settle_unowned_trap(")
+            .expect("the terminal settlement point");
         let released = entry
-            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .find("// THE BROAD-LOCK RELEASE BOUNDARY")
             .expect("release boundary");
         assert!(
-            with_cpu < inner_call && inner_call < released,
-            "the arch handler — and therefore the consumer — runs between lock acquire and release"
+            with_cpu < released,
+            "the terminal settlement precedes the release boundary"
+        );
+        assert!(
+            !entry.contains("handle_trap_entry_with_fault_bookkeeping_mode("),
+            "and the shared bridge calls no arch handler under a broad borrow, because it \
+             takes no broad borrow"
         );
         // The consumer itself must NOT claim the lock was released or that drains ran.
         let cb = consumer_block();
@@ -101871,8 +101997,11 @@ mod stage200d0b3_x86_exit_corrected {
             .split("pub fn handle_trap_entry_shared")
             .nth(1)
             .expect("shared entry");
+        // U9-TERMINAL-FINAL §5: the boundary comment no longer says "`with_cpu` has returned",
+        // because nothing acquires it above. The boundary itself is unchanged and is now
+        // unconditional, which is strictly stronger than what this guard asserted.
         let released_boundary = entry
-            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .find("// THE BROAD-LOCK RELEASE BOUNDARY")
             .expect("release boundary");
         let release_marker = entry
             .find("EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64")
@@ -102463,7 +102592,7 @@ mod stage200d0b3_x86_exit_corrected {
             .nth(1)
             .expect("shared entry");
         let released = entry
-            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .find("// THE BROAD-LOCK RELEASE BOUNDARY")
             .expect("release boundary");
         let death_drain = entry
             .find("shared.drain_server_death_post_work(cpu)")
@@ -102723,12 +102852,16 @@ mod stage200d0c1_aarch64_exit_prep {
             .split("pub fn handle_trap_entry_shared")
             .nth(1)
             .expect("shared entry");
-        // `with_cpu` is where the broad SpinLock<KernelState> is taken and dropped.
+        // U9-TERMINAL-FINAL §5: `with_cpu` WAS where the broad `SpinLock<KernelState>` was
+        // taken and dropped. It is deleted. Both coordinates this guard needs still exist —
+        // the end of the bridge's owned work, and the boundary comment after it — so the
+        // ordering claim is measured against those, and it now holds unconditionally rather
+        // than only for traps that reached an acquisition.
         let with_cpu = entry
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("in-lock phase");
+            .find("Ok(settle_unowned_trap(")
+            .expect("the terminal settlement point");
         let released = entry
-            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .find("// THE BROAD-LOCK RELEASE BOUNDARY")
             .expect("release comment marks the boundary");
         let consumer = entry
             .find("take_post_lock_trap_disposition(")
@@ -102747,7 +102880,12 @@ mod stage200d0c1_aarch64_exit_prep {
         // theirs explicitly rather than relying on position alone.
         let cb = consumer_block();
         assert!(cb.contains(
-            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} broad_lock=0 holder=with_cpu"
+            // U9-TERMINAL-FINAL §5: `holder=with_cpu` named the guard this marker outlived.
+            // There is no such guard any more — the terminal acquisition is deleted — so a
+            // field naming one would be exactly the false claim Stage 200D-0B3 removed the x86
+            // markers for. It reads `holder=none`; `broad_lock=0` is unchanged and is now
+            // unconditionally true rather than true only after an acquisition returned.
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} broad_lock=0 holder=none"
         ));
         // Every marker the post-lock consumer emits says broad_lock=0, and none claims =1.
         for m in [
@@ -103538,11 +103676,12 @@ mod stage200d0c1_aarch64_exit_prep {
         // acquisition; the assertion below pins that the file holds those two and nothing else.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            1,
-            "trap_entry.rs is at 1 with_cpu callsite: this retirement took it 4 -> 3, the U3 \
+            0,
+            "trap_entry.rs is at 0 with_cpu callsites: this retirement took it 4 -> 3, the U3 \
              AArch64 FutexWait no-incoming idle retirement took it 3 -> 2, U9-D3 §7 retired the \
-             D6 functional broad tail to take it 2 -> 1, and U9-RECV-BLOCK2 §3 returned it to 1 \
-             after §6 had briefly taken it to 2"
+             D6 functional broad tail to take it 2 -> 1, U9-RECV-BLOCK2 §3 returned it to 1 \
+             after §6 had briefly taken it to 2, and U9-TERMINAL-FINAL §5 deleted the terminal \
+             broad dispatcher itself"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
     }
@@ -104080,9 +104219,11 @@ mod stage200d0d1_riscv_exit_prep {
     #[test]
     fn r03_consumer_after_broad_lock_release() {
         let w = wrapper();
+        // U9-TERMINAL-FINAL §5: the RISC-V terminal acquisition is deleted, so the same
+        // position is named by the per-class settlement that replaced it, in the same `else`.
         let with_cpu = w
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("Phase 2 lock acquire");
+            .find("settle_unowned_trap_at_riscv_bridge(")
+            .expect("the terminal settlement point");
         let phase3 = w
             .find("// ── Phase 3: post-lock drain (broad guard released) ──")
             .expect("Phase 3 boundary");
@@ -104097,7 +104238,9 @@ mod stage200d0d1_riscv_exit_prep {
         assert!(RUNTIME.contains("let mut guard = self.state.lock();"));
         // The marker states the condition and names the holder.
         assert!(consumer_block().contains(
-            "EXIT_TASK_BROAD_LOCK_RELEASED arch=riscv64 tid={} asid={} cpu={} broad_lock=0 holder=with_cpu"
+            // U9-TERMINAL-FINAL §5: see the AArch64 sibling — `holder=with_cpu` named a guard
+            // that no longer exists, so the field reads `holder=none`.
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=riscv64 tid={} asid={} cpu={} broad_lock=0 holder=none"
         ));
     }
 
@@ -104960,15 +105103,23 @@ mod stage200d0d1_riscv_exit_prep {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
+        // U9-TERMINAL-FINAL §5: 1 -> 0. The last survivor — the canonical broad trap phase —
+        // is deleted, so this port holds NO broad acquisition at all.
         assert_eq!(
             code_only.matches(".with_cpu(").count(),
-            1,
-            "exactly one broad acquisition remains in riscv64/trap.rs"
+            0,
+            "no broad acquisition remains in riscv64/trap.rs"
         );
-        // 1. The canonical broad trap phase — the sole survivor.
+        // 1. The canonical handler is not DELETED with the acquisition; it keeps its raw/test
+        // entry points. What is gone is the bridge's broad call into it, replaced by the
+        // per-class settlement.
         assert!(
-            code_only.contains("handle_trap_entry_with_fault_bookkeeping_mode("),
-            "the canonical in-lock trap phase must remain"
+            code_only.contains("fn handle_trap_entry_with_fault_bookkeeping_mode("),
+            "the canonical handler definition must remain for its raw/test callers"
+        );
+        assert!(
+            code_only.contains("settle_unowned_trap_at_riscv_bridge(shared, cpu, context, frame)"),
+            "and the terminal point is now the per-class settlement"
         );
         // 2. The terminal-idle predicate is RETIRED, not deleted: its decision still runs, now
         // through the coherent rank-1 snapshot instead of a broad re-entry.
@@ -115338,9 +115489,11 @@ mod stage199d_riscv_production_readiness_audit {
             .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
             .expect("the handled early return")
             + split_at;
+        // U9-TERMINAL-FINAL §5: the RISC-V terminal acquisition is deleted, so the same
+        // position is named by the per-class settlement that replaced it, in the same `else`.
         let phase2 = body
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the phase-2 broad-lock acquisition");
+            .find("settle_unowned_trap_at_riscv_bridge(")
+            .expect("the terminal settlement point");
         assert!(
             first_return < phase2,
             "the handled split path must return BEFORE the broad-lock phase is entered"
@@ -116044,9 +116197,11 @@ mod stage199d_riscv_narrow_trap_snapshots {
         let handled = wrapper
             .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
             .expect("the handled early return");
+        // U9-TERMINAL-FINAL §5: the RISC-V terminal acquisition is deleted, so the same
+        // position is named by the per-class settlement that replaced it, in the same `else`.
         let phase2 = wrapper
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the broad-lock phase");
+            .find("settle_unowned_trap_at_riscv_bridge(")
+            .expect("the terminal settlement point");
         assert!(
             handled < phase2,
             "the handled split path must return before the broad-lock phase"
@@ -116514,6 +116669,13 @@ mod stage199d_riscv_canonical_admission {
             "SYSCALL_TRANSFER_RELEASE_NR",
             // U9-XFER2 §3: NR 30 `RecvSharedV3`, the second half of the residual.
             "SYSCALL_RECV_SHARED_V3_NR",
+            // U9-TERMINAL-FINAL §3: NR 8 `ControlPlaneSetCnodeSlots`, the last assigned number
+            // this port excluded. Its absence was never a decline either — and unlike every
+            // class above it, the exclusion was MEASURED rather than reasoned: the base tree's
+            // RISC-V smoke logged `TERMINAL_BROAD_DISPATCH_ENTER cpu=0 event=Syscall nr=8` from
+            // PM's Stage 29A boot self-probe on every run. That live arrival is what proved this
+            // list, not the route, was the lever.
+            "SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR",
             "is_ipc_direct",
         ] {
             assert!(
@@ -116521,20 +116683,20 @@ mod stage199d_riscv_canonical_admission {
                 "the whitelist must still admit `{nr}`"
             );
         }
-        // Nothing else was added to the whitelist. U9-RECV-FINAL §1 widens the count by exactly
-        // one — NR 2, the last recognized IPC syscall this port still excluded — and the count is
-        // what stops a nineteenth arriving without its own justification.
+        // Nothing else was added to the whitelist. U9-TERMINAL-FINAL §3 widens the count by
+        // exactly one — NR 8, the last assigned number this port still excluded — and the count
+        // is what stops a twenty-first arriving without its own justification.
         assert_eq!(
             whitelist.matches("nr == crate::kernel::syscall::").count(),
-            19,
-            "exactly nineteen literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
+            20,
+            "exactly twenty literal NRs plus the gated direct-IPC term: DebugLog, FutexWake, \
              FutexWait, IpcRecvTimeout, (U9-RECV-FINAL §1) IpcRecv, IpcSend, \
              (U9-MO2 §4) CreateInitramfsFileSliceMo, \
              (U9-SPAWN1 SP-2) SpawnThread, (U9-SPAWN-TXN3 §4) SpawnProcess + \
              SpawnFromMemoryObject, (U9-FORK1 §4) Fork, (U9-REAP1 §4) ReapFaultedTask, \
              (U9-EXIT1 §5) ExitCurrentTask, (U9-RESIDUAL1 §3) Yield and (U9-VM-ENTRY1) \
-             VmMap + VmAnonMap + VmBrk and (U9-XFER1 §3) TransferRelease \
-             plus (U9-XFER2 §3) RecvSharedV3"
+             VmMap + VmAnonMap + VmBrk and (U9-XFER1 §3) TransferRelease, \
+             (U9-XFER2 §3) RecvSharedV3 plus (U9-TERMINAL-FINAL §3) ControlPlaneSetCnodeSlots"
         );
         // U9-RECV-FINAL §1: NR 2 admission on RISC-V WAS a separate class with its own witness,
         // and this package is the one that supplies it. The term is inverted rather than
@@ -116577,9 +116739,11 @@ mod stage199d_riscv_canonical_admission {
         let handled = w
             .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
             .expect("handled return");
+        // U9-TERMINAL-FINAL §5: the RISC-V terminal acquisition is deleted, so the same
+        // position is named by the per-class settlement that replaced it, in the same `else`.
         let phase2 = w
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("broad-lock phase");
+            .find("settle_unowned_trap_at_riscv_bridge(")
+            .expect("the terminal settlement point");
         assert!(
             handled < phase2,
             "handled path returns before the broad lock"
@@ -127850,10 +128014,13 @@ mod u3_d6_first_resume_bind_transaction {
         // of its call sites inside `handle_trap`'s BROAD arms, so it ran only on traps the split
         // routes declined. It is not the terminal dispatcher and it is not a receive-family
         // acquisition; the assertion below pins that the file holds those two and nothing else.
+        // U9-TERMINAL-FINAL §5: 1 -> 0. The terminal dispatcher is deleted. The claim this
+        // guard owns — that THIS cohort's retirement relocated nothing into `trap_entry.rs` —
+        // is unchanged and is now expressed as an absolute.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            1,
-            "trap_entry.rs holds one acquisition — the terminal dispatcher"
+            0,
+            "trap_entry.rs holds no acquisition at all"
         );
         assert!(
             !code.contains("fn post_switch_restore_broad_tail("),
@@ -130116,17 +130283,18 @@ mod u3_riscv_terminal_idle_snapshot {
             !code.contains("runnable_count_on_cpu"),
             "the terminal-idle predicate must no longer be evaluated under a broad re-entry"
         );
-        // EXACTLY one production `with_cpu` remains in the file.
+        // U9-TERMINAL-FINAL §5: NO production `with_cpu` remains in the file. The survivor
+        // this guard used to identify — the canonical broad Phase-2 trap handler — is the one
+        // §5 deleted, so "the target acquisition is gone" is now true of every acquisition in
+        // the file, and the guard says exactly that rather than pointing at a survivor.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            1,
-            "riscv64/trap.rs must retain exactly one production acquisition"
+            0,
+            "riscv64/trap.rs must retain no production acquisition"
         );
-        // …and it is the canonical broad Phase-2 trap handler, untouched.
-        let remaining = code.split(".with_cpu(").nth(1).expect("the survivor");
         assert!(
-            remaining.contains("handle_trap_entry_with_fault_bookkeeping_mode("),
-            "the survivor must be the canonical broad Phase-2 trap handler"
+            code.contains("settle_unowned_trap_at_riscv_bridge(shared, cpu, context, frame)"),
+            "and the terminal point is the per-class settlement that replaced it"
         );
         // The split transaction is used at the exact terminal-idle site.
         assert!(
@@ -130840,10 +131008,15 @@ mod u3_ordinary_cap_sender_wake {
             code.contains("RecvQueuedSplitPhaseA::"),
             "the Phase-A queued-receive path is untouched"
         );
-        // The single canonical RISC-V broad trap phase.
+        // U9-TERMINAL-FINAL §5: the RISC-V canonical broad trap phase was listed here as an
+        // out-of-scope acquisition that must REMAIN — out of scope for the ordinary-cap sender
+        // wake, which is what this module is about. §5 is the pass that was in scope for it,
+        // and it is deleted. What this guard still owns is that the sender-wake retirement did
+        // not touch that port: its canonical handler and its raw callers are intact, and the
+        // only thing that changed there is the bridge's broad call into it.
         let rv = code_of(RISCV_TRAP);
-        assert_eq!(rv.matches(".with_cpu(").count(), 1);
-        assert!(rv.contains("handle_trap_entry_with_fault_bookkeeping_mode("));
+        assert_eq!(rv.matches(".with_cpu(").count(), 0);
+        assert!(rv.contains("fn handle_trap_entry_with_fault_bookkeeping_mode("));
     }
 
     #[test]
@@ -144447,7 +144620,9 @@ mod u9_production_post_switch_restore {
         // of its call sites inside `handle_trap`'s BROAD arms, so it ran only on traps the split
         // routes declined. It is not the terminal dispatcher and it is not a receive-family
         // acquisition; the assertion below pins that the file holds those two and nothing else.
-        assert_eq!(code.matches(".with_cpu(").count(), 1);
+        // U9-TERMINAL-FINAL §5: 1 -> 0. The census does not merely "fall to the terminal
+        // dispatcher" any more; the terminal dispatcher is itself retired, so it falls to zero.
+        assert_eq!(code.matches(".with_cpu(").count(), 0);
         assert_eq!(
             code.matches("fn drive_pending_x86_smp_unlock_audit(")
                 .count(),
@@ -144467,23 +144642,28 @@ mod u9_production_post_switch_restore {
             .split_whitespace()
             .collect::<alloc::vec::Vec<_>>()
             .join(" ");
+        // U9-TERMINAL-FINAL §5: there is no survivor. The gate this guard cares about is NOT
+        // deleted with the acquisition, though — it is the same six-flag disposition gate, now
+        // choosing between "a route settled this trap" and "settle it per event class", and
+        // the property it owned is unchanged: the gate is the DISPOSITION, never an inspection
+        // of any stash.
         assert!(
-            flat.contains("shared .with_cpu(cpu, |kernel| {"),
-            "the survivor is the canonical broad Phase-2 trap dispatch, unchanged"
+            !flat.contains("shared .with_cpu(cpu, |kernel| {"),
+            "the canonical broad Phase-2 trap dispatch is retired"
         );
         assert!(
             code.contains("if queue_advance_committed {"),
-            "and it is entered only when no publication has committed"
+            "the disposition gate remains, and still leads with the publication flag"
         );
         let gate = code
             .find("if queue_advance_committed {")
-            .expect("the broad-dispatch gate");
+            .expect("the disposition gate");
         let call = code
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the broad dispatch");
+            .find("Ok(settle_unowned_trap(")
+            .expect("the terminal settlement");
         assert!(
             gate < call,
-            "the gate must precede the acquisition it guards"
+            "the gate must precede the settlement it guards"
         );
         assert!(
             !code[gate..call].contains("DISPATCH_SWITCH_PLAN_STASH"),
@@ -144770,7 +144950,11 @@ mod u9d3_d6_cleanup_split {
     /// only the terminal broad dispatcher, and nothing gained a broad acquisition to compensate.
     #[test]
     fn u9d3_the_cleanup_retirement_relocates_no_acquisition() {
-        assert_eq!(code_of(TRAP_ENTRY).matches(".with_cpu(").count(), 1);
+        // U9-TERMINAL-FINAL §5: 1 -> 0. This guard's claim is about RELOCATION — that the
+        // cleanup's retirement did not push an acquisition into a neighbouring file — and the
+        // three neighbours below are what carry it. The `trap_entry.rs` figure is the anchor,
+        // and it is now zero.
+        assert_eq!(code_of(TRAP_ENTRY).matches(".with_cpu(").count(), 0);
         for (name, src) in [
             ("thread_state.rs", THREAD_STATE),
             ("exec_state.rs", EXEC_STATE),
@@ -146737,10 +146921,12 @@ mod u9qa_split_dispatch_disposition {
         let gate = code
             .find("if queue_advance_committed {")
             .expect("the broad-dispatch gate");
+        // U9-TERMINAL-FINAL §5: the gate is unchanged and still decides on the DISPOSITION
+        // alone; what it guards is the per-class settlement that replaced the acquisition.
         let call = code
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the broad dispatch");
-        assert!(gate < call, "the gate must precede the acquisition");
+            .find("Ok(settle_unowned_trap(")
+            .expect("the terminal settlement point");
+        assert!(gate < call, "the gate must precede the settlement");
         let between = &code[gate..call];
         assert!(
             !between.contains("DISPATCH_SWITCH_PLAN_STASH") && !between.contains("has_plan()"),
@@ -147041,10 +147227,12 @@ mod u9qa_split_dispatch_disposition {
                  || demand_recovered || irq_handled || unknown_handled {",
             )
             .expect("the broad-dispatch gate");
+        // U9-TERMINAL-FINAL §5: the gate now guards the per-class settlement rather than an
+        // acquisition; the set of terms and the ordering claim are unchanged.
         let call = riscv_flat
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the broad dispatch");
-        assert!(gate_at < call, "the gate must precede the acquisition");
+            .find("settle_unowned_trap_at_riscv_bridge(shared, cpu, context, frame)")
+            .expect("the terminal settlement point");
+        assert!(gate_at < call, "the gate must precede the settlement");
         assert!(
             !riscv_flat[gate_at..call].contains("DISPATCH_SWITCH_PLAN_STASH"),
             "a stale or unrelated stash must not alter RISC-V dispatch control flow"
@@ -148802,12 +148990,23 @@ mod u9tm_proof_gate {
             // owner handled this trap" join, extended to the owner that now handles interrupts
             // off the broad lock. The cell must be in the chain or a delivery error would be
             // silently downgraded to `Ok(())` at the tail.
+            // U9-TERMINAL-FINAL §5: the RISC-V join lost its outer `Ok(…)`, which was not
+            // decoration — it made that bridge's `inner_result` two levels deep while the `?`
+            // below consumed only one, so every value joined here was silently discarded on
+            // this port. Collapsing it to one level is what makes the claim below true rather
+            // than merely written down. The shared bridge keeps its `Ok(`, because there the
+            // outer level IS consumed, by its own `let inner_result = inner_result?;`.
+            let (head, tail) = if name == "riscv" {
+                ("irq_result", ".unwrap_or(Ok(()))")
+            } else {
+                ("Ok(irq_result", ".unwrap_or(Ok(())))")
+            };
             assert!(
-                src.contains("Ok(irq_result")
+                src.contains(head)
                     && src.contains(".or(terminal_result)")
                     && src.contains(".or(demand_result)")
                     && src.contains(".or(cow_result)")
-                    && src.contains(".unwrap_or(Ok(())))"),
+                    && src.contains(tail),
                 "{name} bridge: the recovered result must be the route's, not a fabricated Ok"
             );
             // Exactly one place per bridge may carry the IRQ route's result, and it is the same
@@ -148840,10 +149039,14 @@ mod u9tm_proof_gate {
                 "{name} bridge: exactly one place may declare a DEMAND recovery committed"
             );
             let gate = src.find(arms).expect("the gate");
-            let call = src
-                .find(".with_cpu(cpu, |kernel| {")
-                .expect("the broad acquisition");
-            assert!(gate < call, "{name}: the gate must precede the acquisition");
+            // U9-TERMINAL-FINAL §5: the gate guards the per-class settlement now, not an
+            // acquisition. Searched from the gate forward, because `settle_unowned_trap` is
+            // DEFINED above `handle_trap_entry_shared` in the shared bridge.
+            let call = src[gate..]
+                .find("settle_unowned_trap")
+                .map(|at| at + gate)
+                .expect("the terminal settlement point");
+            assert!(gate < call, "{name}: the gate must precede the settlement");
             assert!(
                 !src[gate..call].contains("DISPATCH_SWITCH_PLAN_STASH"),
                 "{name}: a stash must never decide dispatch control flow"
@@ -152437,8 +152640,20 @@ mod u9pagefault2_closure {
             // still be in the chain — but the chain must now START at `irq_result`, because the
             // IRQ route settles before the fault decode runs and its `Complete(Err(..))` would
             // otherwise be dropped on the floor exactly as the terminal route's once was.
+            // U9-TERMINAL-FINAL §5: the RISC-V bridge's join lost its outer `Ok(…)` wrapper.
+            // That wrapper was not decoration — it made `inner_result` two levels deep, and the
+            // single `?` below it consumed only the outer one, so EVERY value joined here was
+            // silently discarded on that port. Collapsing it to one level is what makes this
+            // guard's claim ("all four must reach the handler's inner result") true rather than
+            // merely written down. The shared bridge keeps its `Ok(`, because there the outer
+            // level is consumed by its own `let inner_result = inner_result?;`.
+            let join_head = if name == "riscv" {
+                "irq_result"
+            } else {
+                "Ok(irq_result"
+            };
             assert!(
-                src.contains("Ok(irq_result")
+                src.contains(join_head)
                     && src.contains(".or(terminal_result)")
                     && src.contains(".or(demand_result)")
                     && src.contains(".or(cow_result)"),
@@ -169661,9 +169876,11 @@ mod u9residual1_yield_family {
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::syscall::yield_txn::{
-        YieldDecline, YieldOwners, run_yield_transaction, yield_deferral_arch_gate,
+        YieldDecline, YieldDeclineSettlement, YieldOwners, run_yield_transaction,
+        settle_yield_decline, yield_deferral_arch_gate,
     };
-    use crate::kernel::task::{TaskStatus, ThreadControlBlock};
+    use crate::kernel::task::{TaskStatus, ThreadControlBlock, WaitReason};
+    use crate::kernel::vm::VirtAddr;
 
     const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
     const SPLIT: &str = include_str!("../syscall_split.rs");
@@ -169829,6 +170046,150 @@ mod u9residual1_yield_family {
             ],
             Some(CALLER),
         )
+    }
+
+    // ══ U9-TERMINAL-FINAL §2 — the POST-DECLINE policy, over the same harness ═══════════════
+    //
+    // `settle_yield_decline` is what a declined yield does next, and until this package that was
+    // `yield_current`'s inline tail. These cases drive it directly, through the same
+    // `YieldOwners` the transaction uses, so each decline's settlement is exercised rather than
+    // read.
+
+    /// **`NotRunning` answers `TaskMissing` and runs nothing else.** The in-lock fallback needs
+    /// the caller `Runnable`, which is precisely what failed, so the transition is NOT applied.
+    #[test]
+    fn u9tf_not_running_answers_task_missing_without_applying_the_transition() {
+        let mut h = two_task_world();
+        let before = h.snapshot();
+        let settled = settle_yield_decline(&mut h, CPU, Some(CALLER), YieldDecline::NotRunning);
+        assert_eq!(settled, YieldDeclineSettlement::TaskMissing);
+        assert_eq!(
+            h.count("preempt"),
+            0,
+            "the transition must not be applied for a refusal that IS the transition"
+        );
+        assert_eq!(h.snapshot(), before, "and nothing else may change");
+    }
+
+    /// **`NoCurrent` is silent and reaches the dispatch with nothing preempted.** It is not a
+    /// declined deferral, it is a yield with nothing to yield.
+    #[test]
+    fn u9tf_no_current_settles_as_no_caller_and_stays_silent() {
+        let mut h = Harness::new(&[tcb(OTHER, TaskStatus::Runnable)], None);
+        let settled = settle_yield_decline(&mut h, CPU, None, YieldDecline::NoCurrent);
+        assert_eq!(settled, YieldDeclineSettlement::NoCaller);
+        assert_eq!(h.count("preempt"), 0, "there was nothing to preempt");
+    }
+
+    /// **Every OTHER decline applies the `Running → Runnable` it owes and asks for a queue
+    /// advance**, carrying the exact `PreemptApplied` token its inverse would need.
+    #[test]
+    fn u9tf_every_other_decline_applies_the_transition_and_owes_an_advance() {
+        for decline in [
+            YieldDecline::ArchGateOff,
+            YieldDecline::DeferralHeld,
+            YieldDecline::ReenqueueRefused,
+            YieldDecline::RouteNotAdmitted(
+                crate::kernel::boot::TerminalAdmissionRefusal::NoTrapDrainer,
+            ),
+        ] {
+            let mut h = two_task_world();
+            let settled = settle_yield_decline(&mut h, CPU, Some(CALLER), decline);
+            assert_eq!(
+                settled,
+                YieldDeclineSettlement::QueueAdvance {
+                    outgoing: CALLER,
+                    applied: crate::kernel::syscall::yield_txn::PreemptApplied::Ordinary,
+                },
+                "{decline:?}: the declined path still owes the transition and the advance"
+            );
+            assert_eq!(
+                h.status_of(CALLER),
+                Some(TaskStatus::Runnable),
+                "{decline:?}: and the transition is APPLIED, through the same owner"
+            );
+            assert_eq!(h.count("preempt"), 1, "{decline:?}: exactly once");
+            assert_eq!(
+                h.current_of(0),
+                Some(CALLER),
+                "{decline:?}: the settlement does not re-enqueue — that is the advance's job"
+            );
+        }
+    }
+
+    /// **A refused `Running → Runnable` on a decline is `TaskMissing` too.** `yield_current`
+    /// answers that refusal with the same error whichever step produced it.
+    #[test]
+    fn u9tf_a_refused_transition_on_the_declined_path_is_task_missing() {
+        // A caller the transition owner will not accept: it is already `Blocked`.
+        let mut h = Harness::new(
+            &[
+                tcb(
+                    CALLER,
+                    TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x1000))),
+                ),
+                tcb(OTHER, TaskStatus::Runnable),
+            ],
+            Some(CALLER),
+        );
+        let settled = settle_yield_decline(&mut h, CPU, Some(CALLER), YieldDecline::DeferralHeld);
+        assert_eq!(settled, YieldDeclineSettlement::TaskMissing);
+        assert_eq!(h.count("preempt"), 1, "it was attempted");
+        assert_eq!(
+            h.status_of(CALLER),
+            Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x1000)))),
+            "and refused without writing anything"
+        );
+    }
+
+    /// **The IDLE twin is carried, not flattened.** A `Runnable → Runnable` on the idle task
+    /// writes nothing, so its inverse must undo nothing — which is why the settlement returns the
+    /// token rather than a bool.
+    #[test]
+    fn u9tf_the_idle_twin_is_carried_so_its_inverse_undoes_nothing() {
+        use crate::kernel::task_transition::IDLE_TID;
+        let mut h = Harness::new(&[tcb(IDLE_TID, TaskStatus::Runnable)], Some(IDLE_TID));
+        let settled = settle_yield_decline(&mut h, CPU, Some(IDLE_TID), YieldDecline::ArchGateOff);
+        assert_eq!(
+            settled,
+            YieldDeclineSettlement::QueueAdvance {
+                outgoing: IDLE_TID,
+                applied: crate::kernel::syscall::yield_txn::PreemptApplied::IdleNoop,
+            },
+            "the idle-only transition reports that it wrote nothing"
+        );
+    }
+
+    /// **The policy is ONE body with two adapters** — the property the extraction exists for.
+    /// Both NR 0 routes reach it, and neither restates it.
+    #[test]
+    fn u9tf_both_yield_routes_reach_the_one_post_decline_policy() {
+        assert_eq!(
+            YIELD_TXN
+                .matches("pub(crate) fn settle_yield_decline<O: YieldOwners>(")
+                .count(),
+            1,
+            "one body"
+        );
+        assert!(
+            EXEC_STATE.contains("yield_txn::settle_yield_decline("),
+            "the broad adapter must reach it"
+        );
+        assert!(
+            SPLIT.contains("yield_txn::settle_yield_decline(owners, cpu, outgoing_tid, decline)"),
+            "and so must the split one"
+        );
+        // Neither route may keep its own copy of the decline vocabulary.
+        assert_eq!(
+            EXEC_STATE.matches("log_yield_declined(").count(),
+            0,
+            "the broad route must not log declines itself any more"
+        );
+        assert_eq!(
+            SPLIT.matches("yield_txn::log_yield_declined(").count(),
+            0,
+            "nor the split one"
+        );
     }
 
     // ── the committed path ───────────────────────────────────────────────────────────────────
@@ -173729,12 +174090,20 @@ mod u9timer1_preempting_timer {
             let gate = src
                 .find("if queue_advance_committed")
                 .unwrap_or_else(|| panic!("{name} bridge: the broad-dispatch gate"));
-            let call = src
-                .find(".with_cpu(cpu, |kernel| {")
-                .unwrap_or_else(|| panic!("{name} bridge: the broad acquisition"));
+            // U9-TERMINAL-FINAL §5: the gate is unchanged; what it guards is no longer an
+            // acquisition but the per-class settlement that replaced it. The ordering claim —
+            // every route reports its own outcome BEFORE the bridge decides there is nothing
+            // left to settle — is exactly what it always was.
+            // Anchor on the CALL, not on the definition: `settle_unowned_trap` is DEFINED in
+            // `trap_entry.rs`, above `handle_trap_entry_shared`, so a bare name search would
+            // find the definition and read the ordering backwards.
+            let call = src[gate..]
+                .find("settle_unowned_trap")
+                .map(|at| at + gate)
+                .unwrap_or_else(|| panic!("{name} bridge: the terminal settlement point"));
             assert!(
                 gate < call,
-                "{name} bridge: the gate must precede the acquisition"
+                "{name} bridge: the gate must precede the settlement"
             );
         }
     }
@@ -184471,12 +184840,16 @@ mod u9timer5_idle_boundary {
             timeouts < drain,
             "the timeout pipeline publishes the wakes this drain is meant to see"
         );
+        // U9-TERMINAL-FINAL §5: there is no broad guard to release — the terminal acquisition
+        // is deleted — so the coordinate is the per-class settlement that stands at the same
+        // point. The claim becomes unconditional: the drain re-acquires the rank-1 seam with
+        // nothing held, on every trap rather than only on the ones that skipped an acquisition.
         let broad = code
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the broad acquisition");
+            .find("settle_unowned_trap")
+            .expect("the terminal settlement point");
         assert!(
             broad < drain,
-            "and the broad guard is released before the drain re-acquires the rank-1 seam"
+            "and the terminal settlement precedes the drain's rank-1 re-acquisition"
         );
     }
 
@@ -184933,13 +185306,16 @@ mod u9pf1_fault_origin {
             cow < terminal,
             "COW first, then terminal — the same order the broad arm and the shared bridge use"
         );
-        // The broad acquisition comes after both.
+        // U9-TERMINAL-FINAL §5: the terminal point comes after both. It is no longer an
+        // acquisition to avoid — it is the per-class settlement — but the ordering claim is the
+        // same one and is what makes the routes able to settle the fault themselves.
         let broad = bridge
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the broad acquisition");
+            .find("settle_unowned_trap_at_riscv_bridge(")
+            .expect("the terminal settlement point");
         assert!(
             terminal < broad,
-            "both routes must be consulted BEFORE the broad acquisition, or they cannot avoid it"
+            "both routes must be consulted BEFORE the terminal settlement, or they cannot \
+             settle the fault themselves"
         );
         // The terminal route is given the frame, which it needs for the outgoing capture and the
         // faulting PC in its markers.
@@ -188667,6 +189043,177 @@ mod u9d6final_switch_ownership {
     }
 }
 
+/// U9-TERMINAL-FINAL §3 — **EVERY CLASS THE SHARED DISPATCHER SERVICES MUST BE ADMITTED BY
+/// EVERY PORT'S INGRESS.**
+///
+/// This module exists because of the one arrival this programme actually measured, and because
+/// of what that arrival turned out to be.
+///
+/// `TERMINAL_BROAD_DISPATCH_ENTER cpu=0 event=Syscall nr=8` was read first as NR 8's argument
+/// refusal — a plausible reading, since that refusal WAS an escape and §1 closed it. It was
+/// wrong. The arrival was NR 8 missing from the RISC-V `split_eligible` whitelist entirely: the
+/// shared dispatcher was never called for it on that port, so every NR 8, valid or not, went to
+/// the terminal broad dispatcher while x86_64 served the same trap pre-lock. AArch64 had the
+/// same omission in `pre_split_import_syscall_abi`, and reported ZERO terminal entries only
+/// because that boot issues no NR 8 — a workload zero.
+///
+/// A route being total proves nothing if its port never calls it. Three ingress mechanisms have
+/// to agree with one routing table, and they are in three different files:
+///
+/// * **x86_64** — no ingress gate; `frame.syscall_num()` is the trapped number.
+/// * **AArch64** — `pre_split_import_syscall_abi`'s allowlist. An unlisted NR keeps `nr = 0` in
+///   the frame, so the dispatcher never sees the real number.
+/// * **RISC-V** — `split_eligible`. An unlisted NR never reaches the shared dispatcher at all.
+///
+/// So the check is mechanical and total: take the routing table from source, and require every
+/// class on it to appear in both gates.
+mod u9terminalfinal_ingress {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const RV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    /// Every class the shared dispatcher can service, with the NR constant each ingress names it
+    /// by. Derived below from the routing table rather than trusted as a literal.
+    const SERVICED: &[(&str, &str)] = &[
+        // The seven SWITCHING classes, consulted by `try_split_dispatch_into_frame` in order.
+        ("NR 0 Yield", "SYSCALL_YIELD_NR"),
+        ("NR 1 IpcSend", "SYSCALL_IPC_SEND_NR"),
+        ("NR 2 IpcRecv", "SYSCALL_IPC_RECV_NR"),
+        ("NR 5 IpcRecvTimeout", "SYSCALL_IPC_RECV_TIMEOUT_NR"),
+        ("NR 9 FutexWait", "SYSCALL_FUTEX_WAIT_NR"),
+        ("NR 16 ExitCurrentTask", "SYSCALL_EXIT_CURRENT_TASK_NR"),
+        // The NR-only whitelist.
+        ("NR 3 VmMap", "SYSCALL_VM_MAP_NR"),
+        ("NR 4 TransferRelease", "SYSCALL_TRANSFER_RELEASE_NR"),
+        (
+            "NR 8 ControlPlaneSetCnodeSlots",
+            "SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR",
+        ),
+        ("NR 10 FutexWake", "SYSCALL_FUTEX_WAKE_NR"),
+        ("NR 11 SpawnThread", "SYSCALL_SPAWN_THREAD_NR"),
+        ("NR 12 Fork", "SYSCALL_FORK_NR"),
+        ("NR 13 VmAnonMap", "SYSCALL_VM_ANON_MAP_NR"),
+        ("NR 14 VmBrk", "SYSCALL_VM_BRK_NR"),
+        ("NR 15 DebugLog", "SYSCALL_DEBUG_LOG_NR"),
+        ("NR 23 SpawnProcess", "SYSCALL_SPAWN_PROCESS_NR"),
+        (
+            "NR 28 CreateInitramfsFileSliceMo",
+            "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
+        ),
+        (
+            "NR 29 SpawnFromMemoryObject",
+            "SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR",
+        ),
+        ("NR 30 RecvSharedV3", "SYSCALL_RECV_SHARED_V3_NR"),
+        ("NR 31 ReapFaultedTask", "SYSCALL_REAP_FAULTED_TASK_NR"),
+    ];
+
+    /// The AArch64 allowlist admits every serviced class. NR 6 and NR 7 are deliberately absent
+    /// from `SERVICED`: they are admitted there through `ipccall_direct_admission_enabled()`, the
+    /// same predicate the dispatcher itself uses, so they have their own row in that gate.
+    #[test]
+    fn the_aarch64_import_allowlist_admits_every_serviced_class() {
+        for (label, nr_const) in SERVICED {
+            assert!(
+                TRAP_ENTRY.contains(&alloc::format!(
+                    "raw_nr == crate::kernel::syscall::{nr_const}"
+                )),
+                "{label} is serviced by the shared dispatcher but is NOT on the AArch64 import \
+                 allowlist — an unlisted NR keeps `nr = 0` in the frame, so the dispatcher never \
+                 sees it and the class keeps a terminal broad edge on this port"
+            );
+        }
+        // And NR 6/NR 7 are admitted through the canonical predicate rather than omitted.
+        assert!(
+            TRAP_ENTRY.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "NR 6 and NR 7 must be admitted through the dispatcher's own admission predicate"
+        );
+    }
+
+    /// The RISC-V eligibility whitelist admits every serviced class.
+    #[test]
+    fn the_riscv_split_eligibility_admits_every_serviced_class() {
+        let gate = RV_TRAP
+            .split("let split_eligible = is_syscall")
+            .nth(1)
+            .expect("the RISC-V eligibility gate")
+            .split("|| is_ipc_direct);")
+            .next()
+            .expect("its end");
+        for (label, nr_const) in SERVICED {
+            assert!(
+                gate.contains(&alloc::format!("nr == crate::kernel::syscall::{nr_const}")),
+                "{label} is serviced by the shared dispatcher but is NOT on the RISC-V \
+                 eligibility whitelist — the shared seam is never called for it, so the class \
+                 keeps a terminal broad edge on this port no matter what its route admits"
+            );
+        }
+        assert!(
+            RV_TRAP.contains("is_ipc_direct"),
+            "NR 6 and NR 7 must be admitted through their own term"
+        );
+    }
+
+    /// The routing table `SERVICED` is derived, not asserted: every NR-only whitelist entry and
+    /// every switching route in the dispatcher must have a row here, so adding a class to the
+    /// kernel without admitting it on both ports fails THIS test rather than going unnoticed
+    /// until a workload happens to issue it.
+    #[test]
+    fn the_serviced_table_covers_the_whole_routing_table() {
+        // (a) every `Syscall::X => Some(syscall)` on the NR-only whitelist.
+        let classifier = SPLIT
+            .split("fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the NR-only classifier");
+        let admitted: alloc::vec::Vec<&str> = classifier
+            .match_indices("=> Some(syscall)")
+            .filter_map(|(at, _)| {
+                classifier[..at]
+                    .rsplit("Syscall::")
+                    .next()
+                    .map(|v| v.trim().trim_end_matches(" "))
+            })
+            .collect();
+        assert!(
+            admitted.len() >= 14,
+            "the whitelist should still carry its fourteen classes, found {}",
+            admitted.len()
+        );
+        // (b) and the seven switching routes the dispatcher consults.
+        let dispatcher = SPLIT
+            .split("pub(crate) fn try_split_dispatch_into_frame(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the switching dispatcher");
+        for route in [
+            "try_split_futex_wait_into_frame",
+            "try_split_ipc_recv_family_into_frame",
+            "try_split_ipc_send_into_frame",
+            "try_split_exit_current_task",
+            "try_split_yield_into_frame",
+            "try_split_ipccall_into_frame",
+        ] {
+            assert!(
+                dispatcher.contains(route),
+                "the dispatcher must still consult `{route}`; if a switching route is added or \
+                 removed, `SERVICED` needs the matching row"
+            );
+        }
+        // (c) the table names every serviced class exactly once.
+        let mut seen: alloc::vec::Vec<&str> = SERVICED.iter().map(|(_, c)| *c).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "no class may appear twice");
+        assert_eq!(
+            seen.len(),
+            20,
+            "twenty classes are serviced unconditionally"
+        );
+    }
+}
+
 /// U9-D6-FINAL §5 — **THE TERMINAL-ACQUISITION RESIDUAL, pinned from source.**
 ///
 /// §5 asks whether the two terminal `with_cpu` acquisitions can be removed. They cannot, and the
@@ -188861,10 +189408,41 @@ mod u9d6final_residual {
     /// would rest on absence of evidence.
     #[test]
     fn both_bridges_announce_a_terminal_broad_entry() {
-        for (name, src) in [("shared", TRAP), ("riscv64", RV_TRAP)] {
+        // U9-TERMINAL-FINAL §5 — this guard's SUBJECT is gone, and that is the whole result.
+        //
+        // U9-D6-FINAL §5 added `TERMINAL_BROAD_DISPATCH_ENTER` to both bridges for one purpose:
+        // a boot could not otherwise say whether the terminal acquisition was entered at all,
+        // and the inventory it produced refused to delete the acquisitions on a workload zero.
+        // It earned its keep immediately — the RISC-V smoke logged
+        // `TERMINAL_BROAD_DISPATCH_ENTER cpu=0 event=Syscall nr=8` on every run, which is how
+        // NR 8's missing ingress was found.
+        //
+        // With the acquisitions deleted there is nothing for it to count, and leaving a marker
+        // that can never fire is the stale second owner this tree keeps retiring. So it is
+        // DELETED, and the guard is inverted to pin that: a marker announcing entry into a
+        // broad dispatcher must not reappear without a broad dispatcher to announce.
+        for (name, raw) in [("shared", TRAP), ("riscv64", RV_TRAP)] {
+            // CODE lines only: the RISC-V ingress whitelist RECORDS the measured arrival
+            // (`TERMINAL_BROAD_DISPATCH_ENTER cpu=0 event=Syscall nr=8`) in the comment that
+            // justifies admitting NR 8, and that record is the evidence for the deletion — it
+            // must survive it.
+            let src: alloc::string::String = raw
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with("///")
+                })
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            let src: &str = &src;
             assert!(
-                src.contains("TERMINAL_BROAD_DISPATCH_ENTER cpu={} event={:?} nr={}"),
-                "{name}: the fall-through census marker must be present"
+                !src.contains("TERMINAL_BROAD_DISPATCH_ENTER"),
+                "{name}: the fall-through census marker must be gone with the acquisition"
+            );
+            // What the bridge announces at that point now is the SETTLEMENT, per event class.
+            assert!(
+                src.contains("TRAP_UNOWNED cpu=") || src.contains("settle_unowned_trap"),
+                "{name}: and the terminal point must announce its per-class settlement"
             );
         }
     }
@@ -188881,12 +189459,16 @@ mod u9d6final_residual {
         let publish = RV_TRAP
             .find("RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK")
             .expect("the oracle publish");
+        // U9-TERMINAL-FINAL §5: the acquisition this guard measured against is deleted, which
+        // is the outcome the relocation was a PREREQUISITE for — §3 moved the publish out
+        // precisely so that §5 could delete the acquisition without deleting the publish. The
+        // position is now the per-class settlement that stands in the same `else`.
         let acquisition = RV_TRAP
-            .find(".with_cpu(cpu, |kernel| {")
-            .expect("the RISC-V terminal acquisition");
+            .find("settle_unowned_trap_at_riscv_bridge(shared, cpu, context, frame)")
+            .expect("the RISC-V terminal settlement point");
         assert!(
             publish < acquisition,
-            "the oracle publish must run BEFORE the acquisition, not inside it"
+            "the oracle publish must run BEFORE the terminal point, not at it"
         );
         // It reads the caller through the split seam the DRAIN already uses, not through the
         // broad borrow — which is what makes it independent of the acquisition rather than merely
@@ -188902,11 +189484,11 @@ mod u9d6final_residual {
         // mistaken for a publication that never moved.
         let rest = &RV_TRAP[acquisition..];
         let closure_end = rest
-            .find(".map_err(|err| TrapHandleError::Syscall(err.into()))")
-            .expect("the acquisition's end");
+            .find("if log_structural {")
+            .expect("the end of the terminal settlement's `else` arm");
         assert!(
             !rest[..closure_end].contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN"),
-            "no part of the oracle publication may remain in the acquisition"
+            "no part of the oracle publication may remain in the terminal arm"
         );
         // The consumer is unchanged and still downstream of it.
         assert!(
@@ -188951,8 +189533,13 @@ mod u9d6final_closure {
             .find("maybe_run_d6_controlled_switch_proof_split(")
             .expect("the pre-lock hook");
         // The `let inner_result = <if/else>;` binding ends here; both arms are behind us.
+        // U9-TERMINAL-FINAL §5: the binding's `else` arm used to end with the acquisition's
+        // `.map_err(…)`. It now ends with the per-class settlement, so the same coordinate is
+        // named by that instead. The claim is unchanged — and §5 is exactly the deletion this
+        // guard was written in anticipation of, so it is the case that proves the hook was
+        // moved far enough.
         let arms_closed = TRAP
-            .find(".map_err(|err| TrapHandleError::Syscall(err.into()))\n        };")
+            .find("frame.as_deref_mut(),\n            ))\n        };")
             .expect("the end of the disposition binding");
         assert!(
             arms_closed < hook,

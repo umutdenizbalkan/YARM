@@ -42,7 +42,13 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // under that single guard, so the predicate can no longer tear between two separately
     // locked reads. **This file is now fully drained of reacquisitions**: its ONE remaining
     // production `with_cpu` is the canonical broad Phase-2 trap handler itself.
-    ("src/arch/riscv64/trap.rs", 1),
+    // U9-TERMINAL-FINAL §5: 1 -> 0. That last one — the canonical broad Phase-2 trap handler —
+    // is DELETED. Every supported trap outcome on this port is settled by a pre-lock owner, and
+    // a trap that reaches the end of the bridge with none set is settled per event class by
+    // `arch::trap_entry::settle_unowned_trap`, driven here through
+    // `settle_unowned_trap_at_riscv_bridge`, which composes `bind_current_cpu_split` for the
+    // CPU admission the deleted `with_cpu` performed on entry.
+    // **`src/arch/riscv64/trap.rs` now has NO production broad acquisition of any kind.**
     // Stage 199D: 12 -> 11. The AArch64 handled-split return path no longer reacquires the
     // broad lock to finalize a syscall; it uses two bounded rank-2 task-domain transactions
     // (exact-incarnation TLS take, exact-incarnation context commit) instead.
@@ -107,7 +113,14 @@ const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     // immediately after `dispatch_ready_task()`, where `&mut KernelState` is already owned by the
     // boot loop: every gate the audit applies holds there (APs released, graduated proof
     // completed, a real user task current) and no lock is taken to reach it.
-    ("src/arch/trap_entry.rs", 1),
+    //
+    // U9-TERMINAL-FINAL §5: 1 -> 0. That last one — the canonical broad Phase-2 trap handler
+    // shared by x86_64 and AArch64 — is DELETED. Every supported trap outcome is settled by a
+    // pre-lock owner, and a trap that reaches the end of the bridge with none of the six
+    // settlement flags set is settled PER EVENT CLASS by `settle_unowned_trap`, whose `Syscall`
+    // arm reproduces the broad arm on both axes: `InvalidNumber` written into the caller frame
+    // and `Ok(())`, so the errno returns to userspace rather than halting the kernel.
+    // **`src/arch/trap_entry.rs` now has NO production broad acquisition of any kind.**
     // U3 (203C): 4 -> 3. The AP saved-resume placement's `with_cpu(cpu, |k| { enqueue; dispatch })`
     // became one authoritative rank-1 -> rank-2 transaction,
     // `SharedKernel::enqueue_then_dispatch_on_cpu_split`: rank 1 acquired once, CPU validated with
@@ -259,7 +272,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 2; // U9-RECV-BLOCK2 §3: 3 -> 2 (the SMP-unlock audit driver moved to the boot ownership point, which already owns `&mut KernelState`). U9-RECV-BLOCK1 §6: 2 -> 3. U9-D3 §7: 3 -> 2 (the D6 functional broad tail retired; only the two terminal dispatchers remain). U9-D3 §6: 6 -> 3 (all three ordinary rollback fallbacks retired). U9-C: 7 -> 6 (recv Phase-A retired). U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 -> 8 -> 7 (… the x86_64 BSP saved-resume preempt-and-prefer reacquisition, then the x86_64 ED-2 next-task placement)
+const AUDITED_WITH_CPU_TOTAL: usize = 0; // U9-TERMINAL-FINAL §5: 2 -> 0 (both terminal broad trap dispatchers deleted; ZERO production `with_cpu` callsites remain). U9-RECV-BLOCK2 §3: 3 -> 2 (the SMP-unlock audit driver moved to the boot ownership point, which already owns `&mut KernelState`). U9-RECV-BLOCK1 §6: 2 -> 3. U9-D3 §7: 3 -> 2 (the D6 functional broad tail retired; only the two terminal dispatchers remain). U9-D3 §6: 6 -> 3 (all three ordinary rollback fallbacks retired). U9-C: 7 -> 6 (recv Phase-A retired). U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 -> 8 -> 7 (… the x86_64 BSP saved-resume preempt-and-prefer reacquisition, then the x86_64 ED-2 next-task placement)
 const AUDITED_WITH_BROAD_TOTAL: usize = 0; // U3: 6 -> 2 -> 1 -> 0 (runtime.rs fully drained, then both x86 SMP saved-resume reads retired). ZERO production broad `SharedKernel::with` callsites remain.
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -271,7 +284,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 0; // U2: 3 -> 0 (test-only helpers left the production census)
 const CLASS_OBSOLETE: usize = 0; // U1: 2 -> 0 (both obsolete acquisitions deleted)
-const CLASS_RUNTIME_REQUIRED: usize = 2; // U9-D3 §7: 3 -> 2 (the D6 functional broad tail retired). U9-D3 §6: 6 -> 3 (all three ordinary rollback fallbacks retired). U9-C: 7 -> 6 (recv Phase-A retired). U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 -> 10 -> 8 -> 7 (thirty-seven retired onto their seams)
+const CLASS_RUNTIME_REQUIRED: usize = 0; // U9-TERMINAL-FINAL §5: 2 -> 0 (both terminal broad trap dispatchers deleted). U9-D3 §7: 3 -> 2 (the D6 functional broad tail retired). U9-D3 §6: 6 -> 3 (all three ordinary rollback fallbacks retired). U9-C: 7 -> 6 (recv Phase-A retired). U3: 44 -> 39 -> 37 -> 36 -> 34 -> 32 -> 28 -> 25 -> 24 -> 23 -> 22 -> 21 -> 18 -> 17 -> 15 -> 14 -> 13 -> 12 -> 11 -> 10 -> 8 -> 7 (thirty-seven retired onto their seams)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -532,5 +545,120 @@ fn stage199d_blocker3_added_no_broad_lock_acquisition_site() {
     assert!(
         !drain.contains("with_cpu(") && !drain.contains("shared.with("),
         "the post-lock direct dispatch drain must acquire no broad lock"
+    );
+}
+
+/// U9-TERMINAL-FINAL §5 — **the ratchet.** The census above is a per-file expectation, so it
+/// catches a drift in a file it already lists. This catches the case the census cannot: a
+/// production broad acquisition appearing in a file that was never on the list.
+///
+/// It is stated as an absolute rather than as a delta because the absolute is now available and
+/// a delta would not be: with the two terminal dispatchers deleted, the correct number of
+/// production acquisitions of the broad `SpinLock<KernelState>` — in any form, in any file — is
+/// ZERO. Any nonzero measurement is a regression, and the failure names the files.
+///
+/// The three raw `self.state.lock()` sites are deliberately NOT included, and are reported
+/// separately by [`raw_state_lock_sites_match_the_census`]. They are the BODIES of
+/// `SharedKernel::lock` / `with` / `with_cpu` — the wrapper definitions every callsite goes
+/// through. Deleting the last callsite does not delete the wrappers, and counting their bodies
+/// as acquisitions would make the figure above un-reachable by construction.
+#[test]
+fn no_production_broad_acquisition_exists_anywhere() {
+    let with_cpu = census(with_cpu_line);
+    let with_broad = census(with_broad_line);
+
+    assert!(
+        with_cpu.is_empty(),
+        "a production `SharedKernel::with_cpu` callsite was reintroduced: {with_cpu:?}. \
+         U9-TERMINAL-FINAL §5 took this to zero by settling every supported trap outcome \
+         pre-lock; a new acquisition must be justified and re-classified in \
+         doc/KERNEL_UNLOCK_AUDIT.md §1.4a, not added silently"
+    );
+
+    // `with_broad` was already zero before this pass, and its one match is the documented
+    // `thread_local!` false positive, which is not an acquisition.
+    let real_broad: usize = with_broad.values().sum::<usize>() - THREAD_LOCAL_FALSE_POSITIVES;
+    assert_eq!(
+        real_broad, 0,
+        "a production broad `SharedKernel::with` callsite was reintroduced: {with_broad:?}"
+    );
+
+    // Stated on the totals as well, so a census entry edited to match a reintroduced callsite
+    // still fails here.
+    assert_eq!(
+        AUDITED_ACQUISITION_TOTAL, 0,
+        "the audited acquisition total must stay at zero"
+    );
+}
+
+/// U9-TERMINAL-FINAL §5 — the two bridges must not grow a *replacement* for the acquisition
+/// they lost, which is the shape a closure this large is most likely to regress into.
+///
+/// Three distinct evasions are rejected by name, because each would satisfy the census above
+/// while undoing what the census measures:
+///
+///  * a **raw lock** taken directly on `SharedKernel::state`, bypassing the wrappers the census
+///    counts;
+///  * a **hidden wrapper** — a local helper that performs the acquisition on the bridge's
+///    behalf, which is how a deleted `with_cpu` comes back under another name;
+///  * the settlement being replaced by a **blanket** error for every class at once, which is
+///    what makes a trap outcome undiagnosable and is forbidden by §5 in the same sentence as
+///    the deletion.
+#[test]
+fn neither_bridge_regrew_a_replacement_for_the_deleted_acquisition() {
+    for file in ["src/arch/trap_entry.rs", "src/arch/riscv64/trap.rs"] {
+        let src = fs::read_to_string(repo_root().join(file)).expect(file);
+        let code: String = src
+            .lines()
+            .take(test_module_cutoff(&src.lines().collect::<Vec<_>>()))
+            .filter(|line| !is_comment(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains(".state.lock()"),
+            "{file} must not take the broad lock directly — that is the same acquisition \
+             under a different spelling, and it would not be counted by the census"
+        );
+        for hidden in ["with_cpu(", "shared.with(", "kernel.with("] {
+            assert!(
+                !code.contains(hidden),
+                "{file} must not reach the broad lock through `{hidden}` — the terminal \
+                 acquisition is deleted, not renamed"
+            );
+        }
+    }
+
+    // The settlement is PER CLASS. All five arms present means no class was collapsed into a
+    // shared catch-all to manufacture the closure.
+    let shared =
+        fs::read_to_string(repo_root().join("src/arch/trap_entry.rs")).expect("trap_entry.rs");
+    let settle = shared
+        .split("pub(crate) fn settle_unowned_trap(")
+        .nth(1)
+        .and_then(|s| s.split("\n}\n").next())
+        .expect("settle_unowned_trap");
+    for arm in [
+        "TrapEvent::Syscall",
+        "TrapEvent::PageFault(_)",
+        "TrapEvent::TimerInterrupt",
+        "TrapEvent::ExternalInterrupt(_)",
+        "TrapEvent::Unknown { .. }",
+    ] {
+        assert!(
+            settle.contains(arm),
+            "the unowned-trap settlement must keep a named arm for `{arm}` — a single error \
+             for all five is the catch-all §5 forbids"
+        );
+    }
+    // The `Syscall` arm settles on the USERSPACE channel. This is the half that is easiest to
+    // lose: `KernelState::handle_trap` wrote `dispatch_syscall`'s error into the frame and
+    // returned `Ok(())`, because every arch entry point treats `Err(TrapHandleError)` as a
+    // fatal kernel halt. A settlement that returns the errno on the `Err` channel would have
+    // the right VALUE and the wrong OUTCOME.
+    assert!(
+        settle.contains("frame.set_err(SyscallError::InvalidNumber.code())")
+            && settle.contains("return Ok(());"),
+        "the unowned `Syscall` settlement must write `InvalidNumber` into the caller's frame \
+         and return `Ok(())`, exactly as the deleted broad arm did — not halt the kernel"
     );
 }

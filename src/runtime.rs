@@ -19509,10 +19509,13 @@ mod tests {
         // §3 returned it to 1 by driving that same one-shot body from `run_scheduler_loop`, which
         // already owns `&mut KernelState`.
         let code = u3_code_lines(TRAP_ENTRY);
+        // U9-TERMINAL-FINAL §5 took it to ZERO: the canonical broad Phase-2 trap dispatch is
+        // deleted, every supported trap outcome being settled by a pre-lock owner.
         assert_eq!(
             code.matches(".with_cpu(").count(),
-            1,
-            "trap_entry.rs drops from 3 to 2 with this retirement, then to 1 with U9-D3 §7"
+            0,
+            "trap_entry.rs drops from 3 to 2 with this retirement, to 1 with U9-D3 §7, and to \
+             0 with U9-TERMINAL-FINAL §5"
         );
         assert_eq!(code.matches(".with(|").count(), 0);
         // U9-QA §2 made the one acquisition CONDITIONAL — a pre-lock route that published a
@@ -19522,9 +19525,16 @@ mod tests {
             .split_whitespace()
             .collect::<alloc::vec::Vec<_>>()
             .join(" ");
+        // U9-TERMINAL-FINAL §5: the acquisition U9-QA §2 made CONDITIONAL is now deleted
+        // outright. The gate it sat behind is not — it still decides, on the disposition alone,
+        // between "a route settled this trap" and "settle it per event class".
         assert!(
-            flat.contains("shared .with_cpu(cpu, |kernel| {"),
-            "the canonical broad Phase-2 trap dispatch is present and unchanged"
+            !flat.contains("shared .with_cpu(cpu, |kernel| {"),
+            "the canonical broad Phase-2 trap dispatch is retired"
+        );
+        assert!(
+            code.contains("settle_unowned_trap("),
+            "and the per-class settlement stands where it stood"
         );
         // U9 (canonical 203C) moved the production restore out of the second acquisition; U9-D3
         // §7 then lifted the D3 fence and retired the acquisition itself. The CLEANUP is what this

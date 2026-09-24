@@ -127,10 +127,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **2** |
+| `SharedKernel::with_cpu` | **0** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **0** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **2** |
+| **Total broad-lock acquisition sites** | **0** |
 
 > **U9-D3 — DELIVERED; U9 REMAINS OPEN.** The D3 fence of `AI_AGENT_RULES` §14.4 is discharged:
 > vector `0xF1` is the SOLE target-side invalidation and generation-matched ACK producer and earns
@@ -317,7 +317,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **0** |
 | obsolete | **0** |
-| runtime-required | **2** |
+| runtime-required | **0** |
 | undocumented | **0** |
 
 #### test-only (0)
@@ -359,9 +359,22 @@ Per-file subtotals, matching source and guard exactly:
 
 | File | `with_cpu` | Broad `with` |
 |------|-----------|--------------|
-| `src/arch/trap_entry.rs` | 1 | 0 |
-| `src/arch/riscv64/trap.rs` | 1 | 0 |
-| **Total** | **2** | **0** |
+| **Total** | **0** | **0** |
+
+**U9-TERMINAL-FINAL §5 — the table is empty.** `src/arch/trap_entry.rs` and
+`src/arch/riscv64/trap.rs` each held exactly one acquisition, the canonical broad Phase-2 trap
+dispatcher for its ports. Both are DELETED. Every supported trap outcome is now settled by a
+pre-lock owner, and a trap that reaches the end of either bridge with none of the six settlement
+flags set is settled PER EVENT CLASS by `arch::trap_entry::settle_unowned_trap` — one policy,
+two drivers. Its `Syscall` arm reproduces the broad arm on BOTH axes, value and channel:
+`dispatch_syscall`'s `InvalidNumber` written into the caller's own frame, and `Ok(())`, so the
+errno returns to userspace exactly as `KernelState::handle_trap` returned it rather than
+halting the kernel. The RISC-V driver additionally composes the existing rank-1
+`bind_current_cpu_split`, because `with_cpu` was `lock` + `set_current_cpu(cpu)?` + body and
+that admission was never about the lock.
+
+**There is no production acquisition of the broad `SpinLock<KernelState>` left in the tree, in
+any form.**
 
 `src/runtime.rs` is absent from this table because U9-D3 §6 retired its last three — the
 ordinary `rollback_materialized_recv_cap` fallbacks — so it now holds **zero** broad

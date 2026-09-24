@@ -1998,9 +1998,9 @@ function holds no broad acquisition today. Earlier "U8 is next" pointers are rem
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **2** |
+| Production `SharedKernel::with_cpu` callsites | **0** |
 | Production broad `SharedKernel::with` callsites | **0** |
-| **Total production broad-lock acquisition sites** | **2** |
+| **Total production broad-lock acquisition sites** | **0** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **Direct NR6/NR7:** x86_64 (live) + AArch64 (structural, proof-gated) via `offlock_authoritative_dispatch_enabled()`; RISC-V not admitted. **Blocking IpcRecv / IpcSend (U4):** queue-advancing dispatch is authoritative outside the broad lock on **all three** architectures via the canonical `queue_advancing_dispatch_enabled()`. `d6_genuine_enabled()` itself remains compile-time x86_64-only — U4 widened the queue-ADVANCING question only, never the queue-neutral D6 slice. |
@@ -3883,8 +3883,15 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` has **2** production acquisition sites (§0) — the two
-   terminal broad dispatchers, out of scope for every unlocking pass.
+   The broad `SpinLock<KernelState>` has **0** production acquisition sites (§0).
+   U9-TERMINAL-FINAL §5 removed the last two — the terminal broad dispatchers at
+   `arch/trap_entry.rs` and `arch/riscv64/trap.rs` — on a MEASURED closure, not on workload
+   zeros: the base tree's RISC-V smoke logged a live `TERMINAL_BROAD_DISPATCH_ENTER cpu=0
+   event=Syscall nr=8` arrival, §1 made NR 8's pre-lock route total, §3 admitted NR 8 to both
+   port ingress gates, and the same boot then measured zero arrivals with the probe still
+   succeeding. A trap that reaches the end of either bridge unsettled is answered per event
+   class by `settle_unowned_trap`, whose `Syscall` arm reproduces the broad arm's value AND
+   its channel (`InvalidNumber` into the caller's frame, `Ok(())` to userspace).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there

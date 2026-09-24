@@ -10863,6 +10863,162 @@ mod tests {
         );
     }
 
+    // ══ U9-TERMINAL-FINAL §5 — THE SETTLEMENT THAT REPLACED THE TERMINAL ACQUISITION ═══════
+    //
+    // These are behavior cases, not source guards. The deletion's whole risk is that the
+    // replacement answers with the right VALUE on the wrong CHANNEL, and no `grep` of either
+    // bridge can see the difference between an errno that reaches userspace and one that halts
+    // the kernel.
+
+    /// The reachable arm, against its production owner.
+    ///
+    /// `split_eligible` on RISC-V is a whitelist of ASSIGNED numbers, so a retired or unassigned
+    /// number never consults the split dispatcher there and lands on the settlement. This is
+    /// what the broad arm did with the same frame, and both halves of the answer must match:
+    /// `InvalidNumber` in the caller's own error lane, and `Ok(())` — return to userspace, NOT
+    /// the fatal `Err` channel every arch entry point halts on.
+    #[test]
+    fn u9tf_an_unowned_syscall_settles_exactly_as_the_broad_arm_did() {
+        // 20 is inside `SYSCALL_COUNT` (32) and is not an assigned number.
+        const UNASSIGNED_NR: usize = 20;
+        assert!(UNASSIGNED_NR < crate::kernel::syscall::SYSCALL_COUNT);
+
+        // The production owner, over this frame.
+        let (kernel, _r, _t) = shared_with_control_plane_requester();
+        let mut broad_frame = TrapFrame::new(UNASSIGNED_NR, [0; 6]);
+        let broad = kernel.with(|state| {
+            state.handle_trap(crate::kernel::trap::Trap::Syscall, Some(&mut broad_frame))
+        });
+        assert!(
+            broad.is_ok(),
+            "the broad arm returned Ok for an unrecognized number — it encoded the errno into              the frame rather than halting the kernel"
+        );
+        let broad_code = broad_frame.error_code();
+        assert_eq!(
+            broad_code,
+            Some(SyscallError::InvalidNumber.code()),
+            "and the errno it encoded is InvalidNumber"
+        );
+
+        // The settlement, over an identical frame.
+        let mut settled_frame = TrapFrame::new(UNASSIGNED_NR, [0; 6]);
+        let settled = crate::arch::trap_entry::settle_unowned_trap(
+            CPU0,
+            crate::arch::trap::TrapEvent::Syscall,
+            Some(&mut settled_frame),
+        );
+        assert!(
+            settled.is_ok(),
+            "the settlement must return on the USERSPACE channel, exactly as the broad arm              did; an Err here would convert a userspace errno into a fatal kernel halt"
+        );
+        assert_eq!(
+            settled_frame.error_code(),
+            broad_code,
+            "and it must write the same errno into the same lane"
+        );
+    }
+
+    /// The four remaining classes, each keeping its own answer.
+    ///
+    /// A single error for all five would satisfy any count of "the acquisition is gone" while
+    /// making every routing break undiagnosable — the catch-all §5 forbids in the same sentence
+    /// as the deletion. `PageFault` carries `fault_current_task_for_fault`'s `TaskMissing`; the
+    /// three asynchronous classes answer `Internal`, because the broad arm's `Ok(())` for them
+    /// was EARNED by the tick, the routing and the EOI it had just performed, and a settlement
+    /// that cannot perform those must not claim them.
+    #[test]
+    fn u9tf_the_other_four_classes_keep_distinct_fatal_answers() {
+        use crate::arch::trap::{FaultAccess, FaultInfo, TrapEvent};
+        let fault = TrapEvent::PageFault(FaultInfo::user(
+            crate::kernel::vm::VirtAddr(0x1000),
+            FaultAccess::Read,
+        ));
+        let task_missing = SyscallError::from(crate::kernel::boot::KernelError::TaskMissing);
+        for (event, expected, label) in [
+            (fault, task_missing, "page fault"),
+            (TrapEvent::TimerInterrupt, SyscallError::Internal, "timer"),
+            (
+                TrapEvent::ExternalInterrupt(3),
+                SyscallError::Internal,
+                "external interrupt",
+            ),
+            (
+                TrapEvent::Unknown { arch_code: 0xC },
+                SyscallError::Internal,
+                "unknown",
+            ),
+        ] {
+            let mut frame = TrapFrame::new(0, [0; 6]);
+            let settled =
+                crate::arch::trap_entry::settle_unowned_trap(CPU0, event, Some(&mut frame));
+            assert_eq!(
+                settled,
+                Err(TrapHandleError::Syscall(expected)),
+                "{label}: an unsettled asynchronous class is a routing break, and it must say \
+                 which one"
+            );
+            assert_eq!(
+                frame.error_code(),
+                None,
+                "{label}: only the Syscall class writes a userspace error lane"
+            );
+        }
+        // U9-TERMINAL-FINAL §5 — where the per-class distinction actually LIVES, corrected by
+        // this case rather than assumed by it.
+        //
+        // The first draft of this assertion required `TaskMissing` to differ from `Internal`.
+        // It does not: `SyscallError::from(KernelError::TaskMissing)` IS `Internal`, and that
+        // conversion is the CANONICAL one — `handle_trap_event`'s PageFault arm applies exactly
+        // it. So the settlement reproduces the broad arm precisely, and four of the five classes
+        // necessarily share one error value because the production path collapses them there.
+        assert_eq!(
+            task_missing,
+            SyscallError::Internal,
+            "this is the canonical conversion, not a choice made here"
+        );
+        // The distinction §5 requires — naming WHICH owner failed to settle its own class — is
+        // therefore carried by the marker's `reason`, which is per class and is the only place
+        // it can be carried. A genuine catch-all would emit ONE reason for all five; this emits
+        // five, and the `Syscall` class additionally settles on a different CHANNEL entirely.
+        const SRC: &str = include_str!("../arch/trap_entry.rs");
+        let settle = SRC
+            .split("pub(crate) fn settle_unowned_trap(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the settlement");
+        let reasons = [
+            "syscall_unrecognized",
+            "page_fault_unclaimed",
+            "timer_unsettled",
+            "interrupt_unsettled",
+            "unknown_unsettled",
+        ];
+        for reason in reasons {
+            assert_eq!(
+                settle.matches(reason).count(),
+                1,
+                "each class must name itself exactly once: `{reason}`"
+            );
+        }
+    }
+
+    /// A syscall that reaches the settlement with NO frame cannot silently skip the encode.
+    ///
+    /// The bridge settles this case `MissingTrapFrame` before the dispatcher runs, so this arm
+    /// is unreachable; it answers with that same owner's error rather than pretending the
+    /// syscall was serviced.
+    #[test]
+    fn u9tf_an_unowned_syscall_without_a_frame_answers_missing_trap_frame() {
+        assert_eq!(
+            crate::arch::trap_entry::settle_unowned_trap(
+                CPU0,
+                crate::arch::trap::TrapEvent::Syscall,
+                None,
+            ),
+            Err(TrapHandleError::MissingTrapFrame)
+        );
+    }
+
     #[test]
     fn stage29_split_dispatch_fallback_path_unchanged() {
         // A None return from the seam means the global-lock handler still runs.

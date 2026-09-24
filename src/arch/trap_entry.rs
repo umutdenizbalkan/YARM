@@ -338,6 +338,119 @@ fn post_switch_d6_cleanup_split(
 /// Nothing about the apply changed. It still takes the plan, performs the arch switch with no
 /// lock held, runs the U9/203C off-lock incoming restore on x86_64 and AArch64, and runs the
 /// U9-D3 §7 split D6 cleanup when a proof/D6-SWITCH-A run has just completed.
+/// U9-TERMINAL-FINAL §5 — **the per-class settlement that replaced the terminal acquisition.**
+///
+/// Reaching this means a trap arrived at the end of a bridge with no owner having settled it.
+/// Every event class has one (see the table at each call site), so each arm is unreachable — but
+/// they are written out per class rather than collapsed into one error, because "a trap was
+/// unhandled" is not a diagnosable fact. Which OWNER failed to settle its own class is.
+///
+/// It has TWO drivers, exactly as `drain_dispatch_post_work` does: this bridge (x86_64 +
+/// AArch64) and `arch::riscv64::trap`. The two bridges reach it through different route sets,
+/// but the ANSWER per class is a property of the class, not of the port — each is the answer the
+/// broad dispatcher itself produced for that state — so there is one implementation and the
+/// per-port reasoning lives at the two call sites where the routes are.
+///
+/// # Each answer is read off the broad dispatcher, including its CHANNEL
+///
+/// The error VALUE is only half of a canonical outcome. The other half is whether the outcome
+/// returns to userspace or halts the kernel, and the two halves are decided in different places:
+/// `KernelState::handle_trap`'s `Trap::Syscall` arm does
+///
+/// ```text
+/// if let Err(e) = dispatch_syscall(self, trapframe) { trapframe.set_err(e.code()); }
+/// ... Ok(())
+/// ```
+///
+/// with its own comment recording why — "all three arch entry points treat
+/// `Err(TrapHandleError)` as a fatal kernel halt; normal `SyscallError` values must be returned
+/// to userspace as x0/error_code". So a settlement that answers an unrecognized syscall with
+/// `Err(Syscall(InvalidNumber))` has NOT reproduced the broad arm: it has converted a userspace
+/// errno into a kernel halt. This function therefore settles per class on BOTH axes:
+///
+/// | class | what the broad arm did | settled here as |
+/// |---|---|---|
+/// | `Syscall` | `dispatch_syscall` answered `InvalidNumber` for an unrecognized number; the arm wrote it into the frame and returned `Ok(())` | `frame.set_err(InvalidNumber)` + `Ok(())` — **returns to userspace** |
+/// | `PageFault` | `fault_current_task_for_fault` could not name a victim and answered `TaskMissing`, which the arm propagated | `Err(Syscall(TaskMissing))` — fatal, as canonically |
+/// | `TimerInterrupt` | ticked the scheduler, then `Ok(())` | `Err(Syscall(Internal))` — see below |
+/// | `ExternalInterrupt` | routed the line, EOI'd it, then `Ok(())` | `Err(Syscall(Internal))` — see below |
+/// | `Unknown` | fatal, unchanged since Stage 174 | `Err(Syscall(Internal))` |
+///
+/// # Where the per-class distinction actually lives
+///
+/// Four of those five rows carry the SAME error value, and that is not a catch-all creeping
+/// back in — it is the canonical conversion: `SyscallError::from(KernelError::TaskMissing)` IS
+/// `Internal`, and `handle_trap_event`'s PageFault arm applies exactly that conversion. The
+/// value cannot distinguish them because the production path does not distinguish them there.
+///
+/// So the fact §5 asks for — WHICH owner failed to settle its own class — is carried by the
+/// marker's `reason`, which is the one place it can be. A genuine catch-all would emit one
+/// reason for every class; this emits five, one per class, and the `Syscall` class settles on
+/// a different CHANNEL as well. `u9tf_the_other_four_classes_keep_distinct_fatal_answers`
+/// pins both halves, and it pins the conversion itself so a future change to `SyscallError`
+/// cannot quietly make this text wrong again.
+///
+/// The three asynchronous classes are the ones where `Ok(())` would be a LIE rather than a
+/// reproduction. The broad arm's `Ok(())` was earned by work it had just performed — the tick,
+/// the routing, the EOI. Reaching here means that work did not happen, and this function cannot
+/// perform it: an EOI issued from here would be a SECOND one if the owner did run, and the tick
+/// belongs to the scheduler domain. Returning `Ok(())` would resume a CPU whose interrupt
+/// controller was never acknowledged, with no marker any smoke could see. A routing break is
+/// fatal on this kernel, and that is what `Internal` says.
+///
+/// The `Syscall` arm is the only one of the five that is reachable in principle rather than
+/// merely by construction: `arch::riscv64::trap`'s `split_eligible` is a whitelist of ASSIGNED
+/// numbers, so a retired or unassigned number never consults the dispatcher there at all, and
+/// arrives here. It gets exactly the answer it got from the broad arm.
+pub(crate) fn settle_unowned_trap(
+    cpu: CpuId,
+    event: TrapEvent,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    use crate::kernel::syscall::SyscallError;
+    // The `Syscall` arm settles on the USERSPACE channel, so it is separate rather than an entry
+    // in the error table below. Collapsing the two would be the catch-all §5 forbids: it is
+    // precisely the distinction between "userspace asked for something that does not exist" and
+    // "the kernel failed to route a trap".
+    if matches!(event, TrapEvent::Syscall) {
+        // A syscall with no frame was settled `MissingTrapFrame` before the dispatcher ran (§3),
+        // so this cannot be `None` here; it is answered with the same error that owner uses
+        // rather than silently skipping the encode.
+        let Some(frame) = frame else {
+            crate::yarm_log!(
+                "TRAP_UNOWNED cpu={} event=Syscall reason=syscall_no_frame broad_lock=0",
+                cpu.0
+            );
+            return Err(TrapHandleError::MissingTrapFrame);
+        };
+        frame.set_err(SyscallError::InvalidNumber.code());
+        crate::yarm_log!(
+            "TRAP_UNOWNED cpu={} event=Syscall reason=syscall_unrecognized code={} broad_lock=0",
+            cpu.0,
+            SyscallError::InvalidNumber.code()
+        );
+        return Ok(());
+    }
+    let (reason, err) = match event {
+        TrapEvent::PageFault(_) => (
+            "page_fault_unclaimed",
+            SyscallError::from(crate::kernel::boot::KernelError::TaskMissing),
+        ),
+        TrapEvent::TimerInterrupt => ("timer_unsettled", SyscallError::Internal),
+        TrapEvent::ExternalInterrupt(_) => ("interrupt_unsettled", SyscallError::Internal),
+        TrapEvent::Unknown { .. } => ("unknown_unsettled", SyscallError::Internal),
+        // Settled above, on the userspace channel.
+        TrapEvent::Syscall => unreachable!("the Syscall class returns above"),
+    };
+    crate::yarm_log!(
+        "TRAP_UNOWNED cpu={} event={:?} reason={} broad_lock=0",
+        cpu.0,
+        event.trap(),
+        reason
+    );
+    Err(TrapHandleError::Syscall(err))
+}
+
 /// U9-D6-FINAL §1 — **what to do with a plan whose incarnations no longer authenticate.**
 ///
 /// Discarding a plan is a control decision with two distinct ways to be wrong, and neither is
@@ -1507,38 +1620,54 @@ pub fn handle_trap_entry_shared(
             }
         }
     }
-    // Stage 3B-E: SharedKernel trap paths pre-record only diagnostic page-fault
-    // bookkeeping under fault_state_lock before taking the global SharedKernel
-    // lock. All real trap behavior still runs in shared.with_cpu below; raw
-    // paths keep recording inside KernelState::handle_trap_event.
-    let fault_bookkeeping_mode = if let TrapEvent::PageFault(fault) = decode_trap_context(context) {
+    // Stage 3B-E: SharedKernel trap paths pre-record diagnostic page-fault bookkeeping under
+    // `fault_state_lock`. The two recordings are the POINT of this block and they stay: the
+    // terminal PageFault route and `KernelState::last_fault` consumers below both read what they
+    // write, and nothing else on this bridge records a fault.
+    //
+    // U9-TERMINAL-FINAL §5: what is gone is the `FaultBookkeepingMode` the block used to
+    // PRODUCE. That value existed for one consumer — the terminal `with_cpu` closure, which
+    // passed it to `handle_trap_entry_with_fault_bookkeeping_mode` so the canonical handler
+    // would not record the same fault a second time. With the acquisition deleted the handler
+    // is no longer called from here, so the mode has no reader; computing one and discarding it
+    // would be exactly the stale second owner this file keeps retiring. The raw/test entry
+    // points that still call that handler pass their own mode, unchanged.
+    if let TrapEvent::PageFault(fault) = decode_trap_context(context) {
         shared.record_fault_split_mut(fault);
         if let Some(frame) = frame.as_deref() {
             shared.record_fault_frame_snapshot_split_mut(frame);
         }
-        FaultBookkeepingMode::AlreadyRecordedBySharedSeam
-    } else {
-        FaultBookkeepingMode::RecordInHandleTrapEvent
-    };
+    }
 
-    // Stage 117 / U9-QA §2: the broad dispatcher is entered ONLY after a `NotHandled`
-    // disposition — i.e. only when nothing has been mutated and the trap still needs handling.
+    // ══ U9-TERMINAL-FINAL §5 — THE TERMINAL BROAD ACQUISITION IS GONE ═══════════════════════
     //
-    // After `QueueAdvanceCommitted` it must be skipped, and not as an optimisation: the caller
-    // is already `Blocked(Futex)` and current on no CPU, so `handle_trap` would re-execute
-    // FutexWait against a task that has already blocked, and `dispatch_next_task` would advance
-    // the queue a second time for one publication. Skipping is what makes "the queue-advance
-    // drain runs exactly once" true.
+    // What stood here was `if <six flags> { … } else { shared.with_cpu(cpu, …) }` — the last
+    // broad `&mut KernelState` acquisition on this bridge, entered by any trap that no split
+    // route had settled.
     //
-    // Note this is decided by the DISPOSITION, never by inspecting the switch-plan stash. A
-    // stale or unrelated stash must not be able to alter dispatch control flow.
+    // # Why there is nothing left for it to receive
     //
-    // Stage 117: pass `frame.as_deref_mut()` (reborrow) so that `frame` remains
-    // available after `with_cpu` returns for the stash drain below.
-    // The `Ok(Ok(()))` shape mirrors the broad call exactly: the outer `Result` is the lock
-    // acquisition, the inner one the arch handler's own result. Skipping the acquisition yields
-    // a successful acquisition of nothing and a successful handler, so both `?` sites below stay
-    // untouched.
+    // Each event class is settled by an owner above, and the settlement is a property of the
+    // ROUTE, not of the workload:
+    //
+    // | class | owner | why it cannot arrive here unsettled |
+    // |---|---|---|
+    // | `Syscall` | `try_split_dispatch_into_frame` | `Complete(_)` **returns from this function** at the disposition match; the other dispositions set a flag. Its own tail answers `InvalidNumber` rather than `NotHandled`, and a syscall with no frame was settled `MissingTrapFrame` before the dispatcher ran. |
+    // | `ExternalInterrupt` | `settle_external_interrupt_at_bridge` | the decoded event carries the line, so the route's only decline (`irq: None`) is unconstructible here; the hosted decline is hosted-only. |
+    // | `Unknown` | `try_split_unknown_trap_dispatch` | answers `Complete` always — strict builds diverge, hosted builds settle. |
+    // | `PageFault` | COW → demand → TERMINAL | the first two continue IN-FAMILY by design; the terminal route is last and total, including its four structural arms. |
+    // | `TimerInterrupt` | `try_split_timer_dispatch` | every `TimerSettlement` maps to a flag-setting disposition; its only `NotHandled` is "this event is not a timer". |
+    //
+    // # Why this is not a blanket catch-all
+    //
+    // The flags are not deleted and the six reasons are not collapsed. Reaching the end of this
+    // section with no flag set is still a distinguishable state, and it is settled PER EVENT
+    // CLASS, naming which owner failed to settle its own class — because "some trap was
+    // unhandled" is not a diagnosable fact, and a single error for all five would be exactly the
+    // catch-all this closure is not allowed to be.
+    //
+    // Each arm is unreachable by the table above. They exist because that table spans five
+    // files, and a guard about a door that does not exist proves nothing.
     let inner_result: Result<Result<(), TrapHandleError>, TrapHandleError> =
         if queue_advance_committed
             || post_work_committed
@@ -1567,15 +1696,15 @@ pub fn handle_trap_entry_shared(
                     // Set by the timer route (a tick that changed no scheduler state) or, since
                     // 199G-C4 §2, by the NR 1 route (a delivery or a blocking publication the
                     // drain below owes). Both mean the same thing here: this trap's work is
-                    // done and the broad dispatcher has nothing to do.
+                    // done and there is nothing else to do.
                     "post_work_committed"
                 } else {
                     "cow_recovered"
                 }
             );
-            // U9-COW1: a recovered COW fault carries the SAME result the broad arm would have
-            // returned — `Ok(())` on success, the rolled-back failure's error otherwise — so the
-            // two `?` sites below behave identically whichever owner handled the fault.
+            // U9-COW1: a recovered COW fault carries the SAME result the broad arm used to return —
+            // `Ok(())` on success, the rolled-back failure's error otherwise — so the two `?` sites
+            // below behave identically whichever owner handled the fault.
             // U9-PAGEFAULT2 §3: the terminal route joins the other two. At most ONE of the three
             // can be set — each is written by a route the other two are gated out of by
             // `cow_recovered` / `demand_recovered`, and the terminal route runs only when
@@ -1588,37 +1717,11 @@ pub fn handle_trap_entry_shared(
                 .or(cow_result)
                 .unwrap_or(Ok(())))
         } else {
-            // U9-D6-FINAL §5 — THE FALL-THROUGH CENSUS MARKER.
-            //
-            // The reachability question this directive asks is "does anything still reach the
-            // terminal acquisition", and until now a live boot could not answer it: the arm was
-            // silent, so a run that entered it a hundred times and one that never entered it
-            // looked identical. It names, per trap, that the acquisition was actually entered,
-            // with the decoded event and the syscall number, so a live run can be cross-checked
-            // against the source-derived residual table rather than trusted on its own.
-            //
-            // It stays until the arm itself goes: a marker that is absent because the arm is
-            // unreachable is evidence, and one that is absent because nobody looked is not.
-            crate::yarm_log!(
-                "TERMINAL_BROAD_DISPATCH_ENTER cpu={} event={:?} nr={}",
-                cpu.0,
-                decode_trap_context(context).trap(),
-                frame
-                    .as_deref()
-                    .map(|f| f.syscall_num())
-                    .unwrap_or(usize::MAX)
-            );
-            shared
-                .with_cpu(cpu, |kernel| {
-                    handle_trap_entry_with_fault_bookkeeping_mode(
-                        kernel,
-                        cpu,
-                        context,
-                        frame.as_deref_mut(),
-                        fault_bookkeeping_mode,
-                    )
-                })
-                .map_err(|err| TrapHandleError::Syscall(err.into()))
+            Ok(settle_unowned_trap(
+                cpu,
+                decode_trap_context(context),
+                frame.as_deref_mut(),
+            ))
         };
 
     // ── U9-D6-FINAL §2/§3 (C2) — THE D6 SWITCH PROOF, at a point chosen from its PREREQUISITES ──
@@ -1683,8 +1786,14 @@ pub fn handle_trap_entry_shared(
     trap_path.settle();
 
     let inner_result = inner_result?;
-    // `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.
-    // `inner_result: Result<(), TrapHandleError>` from the arch handler.
+    // U9-TERMINAL-FINAL §5: this used to read "`with_cpu` has returned; the outer
+    // `SpinLock<KernelState>` guard is dropped." There is no longer a guard to drop — the
+    // terminal acquisition above is deleted — so the boundary this comment marks is now
+    // unconditional rather than conditional on an acquisition having ended. Everything from
+    // here on has always run with no broad lock held; what changed is that everything BEFORE
+    // it does too.
+    // THE BROAD-LOCK RELEASE BOUNDARY — nothing above holds the broad lock either.
+    // `inner_result: Result<(), TrapHandleError>` from whichever owner settled this trap.
 
     // Stage 200D-0B3: the x86_64 broad-lock-release attestation, emitted HERE — the first
     // statement after `with_cpu` returned — and nowhere else. Stage 200D-0B1 emitted this from
@@ -1698,7 +1807,7 @@ pub fn handle_trap_entry_shared(
         crate::kernel::boot::EXIT_ATTEST_LOCK_RELEASED,
     ) {
         crate::yarm_log!(
-            "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64 tid={} asid={} cpu={} broad_lock=0 holder=with_cpu result=ok",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64 tid={} asid={} cpu={} broad_lock=0 holder=none result=ok",
             exit_tid,
             exit_asid.0,
             cpu.0
@@ -3298,7 +3407,7 @@ pub fn handle_trap_entry_shared(
         crate::kernel::boot::take_post_lock_trap_disposition(cpu_idx)
     {
         crate::yarm_log!(
-            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} broad_lock=0 holder=with_cpu result=ok",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} broad_lock=0 holder=none result=ok",
             cpu.0
         );
         crate::yarm_log!(
@@ -3688,6 +3797,20 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // U9-XFER2 §3: NR 30 `RecvSharedV3` joins them. It takes two arguments (the request
         // record pointer and its length), both within the set the ABI import already carries.
         || raw_nr == crate::kernel::syscall::SYSCALL_RECV_SHARED_V3_NR
+        // U9-TERMINAL-FINAL §3: ControlPlaneSetCnodeSlots (NR 8) — the last class missing from
+        // this list, for the same reason it was missing from the RISC-V eligibility whitelist.
+        // Without the import `nr` stays 0, the split dispatcher declines, and NR 8 keeps its
+        // terminal broad edge on this architecture no matter what its route admits.
+        //
+        // This boot's AArch64 smoke reported ZERO terminal entries, which proves only that it
+        // issues no NR 8 — a workload zero, not a closure. The RISC-V smoke issues one and
+        // measured the arrival.
+        //
+        // The class needs nothing from AArch64 it does not have: its route neither blocks,
+        // switches nor defers, and it returns its two result lanes in the caller's own frame
+        // exactly as DebugLog does. Its two arguments (target pid, slot capacity) are the first
+        // two the ABI import already carries.
+        || raw_nr == crate::kernel::syscall::SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
         // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply

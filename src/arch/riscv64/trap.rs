@@ -860,6 +860,43 @@ static RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN: [core::sync::atomic::AtomicU64; 
 /// The bridge performs the RISC-V-specific frame write-back + SATP activation +
 /// `sret` AFTER this returns; this wrapper does not touch the trap frame's
 /// register lanes beyond what the canonical handler already does.
+/// U9-TERMINAL-FINAL §5 — the RISC-V driver of the shared per-class settlement.
+///
+/// The policy is `arch::trap_entry::settle_unowned_trap`, which is where the canonical answer
+/// for each event class — value AND channel — is derived. This function exists because the
+/// deleted `with_cpu` did TWO things, and only one of them was the broad borrow. Both are
+/// preserved here explicitly rather than lost with it:
+///
+///  * **the CPU admission and binding.** `with_cpu(cpu, f)` is `lock` + `set_current_cpu(cpu)?`
+///    + `f`, and `set_current_cpu` is `validate_online_cpu` + `sched.current_cpu = cpu`. An
+///    offline or out-of-range index refused the whole phase, the closure never ran, and this
+///    bridge propagated the `KernelError` as a fatal `TrapHandleError::Syscall`. That refusal
+///    was never about the lock, and `SharedKernel::bind_current_cpu_split` is the existing
+///    rank-1 owner of exactly those two steps — introduced by U3/203C for precisely this
+///    substitution and already architecture-neutral. It is composed, not reimplemented, and it
+///    is checked BEFORE the settlement so an invalid CPU still refuses first.
+///  * **the frame.** The broad arm passed `Some(&mut *frame)` so the canonical handler could
+///    write the caller's return lanes; the `Syscall` settlement needs it for that same reason.
+fn settle_unowned_trap_at_riscv_bridge(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    context: Riscv64TrapContext,
+    frame: &mut TrapFrame,
+) -> Result<(), TrapHandleError> {
+    let event = decode_trap_context(context);
+    if let Err(err) = shared.bind_current_cpu_split(cpu) {
+        crate::yarm_log!(
+            "TRAP_UNOWNED cpu={} event={:?} reason=cpu_not_admitted broad_lock=0",
+            cpu.0,
+            event.trap()
+        );
+        // The SAME conversion the deleted `.map_err(|err| TrapHandleError::Syscall(err.into()))`
+        // applied to `with_cpu`'s refusal, so the fatal class is unchanged.
+        return Err(TrapHandleError::Syscall(err.into()));
+    }
+    crate::arch::trap_entry::settle_unowned_trap(cpu, event, Some(frame))
+}
+
 pub fn handle_riscv_trap_entry_shared(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
@@ -1368,6 +1405,24 @@ pub fn handle_riscv_trap_entry_shared(
             // the receiver — it may wake a blocked SENDER, but the caller itself returns
             // normally — so it finalizes through the same same-task ecall writeback.
             || nr == crate::kernel::syscall::SYSCALL_RECV_SHARED_V3_NR
+            // U9-TERMINAL-FINAL §3: ControlPlaneSetCnodeSlots (NR 8) — the LAST class missing
+            // from this list, and the one that produced the only measured terminal-acquisition
+            // arrival in the whole programme (`TERMINAL_BROAD_DISPATCH_ENTER cpu=0
+            // event=Syscall nr=8`, RISC-V core smoke).
+            //
+            // The arrival was NOT the argument refusal U9-TERMINAL-FINAL §1 settled. It was this
+            // omission: with NR 8 absent from this whitelist the shared dispatcher was never
+            // called for it on this port, so every NR 8 — valid or not — went to the terminal
+            // broad dispatcher while x86_64 served the same trap pre-lock. That is the same
+            // shape U9-RECV-FINAL §1 found for NR 2 and U9-MO2 §4 for NR 28.
+            //
+            // Nothing about the class needs anything this port lacks. NR 8 is the ORIGINAL split
+            // class (Stage 28) and it is the simplest one on the list: a pure rank-4 capability
+            // resize that neither blocks, switches, defers nor reads user memory. It finalizes
+            // through the same same-task ecall writeback DebugLog uses (sepc+4 once, sstatus
+            // preserved, a0/a1 from `set_ok`), and the caller is still current when the trap
+            // returns.
+            || nr == crate::kernel::syscall::SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR
             || is_ipc_direct);
     if split_eligible {
         // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
@@ -1704,7 +1759,21 @@ pub fn handle_riscv_trap_entry_shared(
     // canonical handler would re-execute FutexWait against it and `dispatch_next_task` would
     // advance the queue a second time for one publication. The gate is the DISPOSITION, never an
     // inspection of any stash.
-    let inner_result = if queue_advance_committed
+    //
+    // U9-TERMINAL-FINAL §5 — this used to be `Result<Result<(), TrapHandleError>, _>`, because
+    // the `else` arm was `with_cpu(…).map_err(…)`: the OUTER channel carried `with_cpu`'s own
+    // admission refusal and the INNER one carried the canonical handler's result. The `?` below
+    // consumes one level, so the inner result — the handler's, and every split route's on the
+    // other arm — was DISCARDED, in flat contradiction of both comments that sit on it ("the
+    // rolled-back failure's error otherwise — so every `?` site below behaves identically", and
+    // "an Err here takes the fatal `RISCV_TRAP_HANDLE_FAILED` bridge path").
+    //
+    // That is the invisible-escape shape §4 asks to be followed through callers rather than
+    // counted: no `None` and no discarded value is written anywhere on the line. It could not
+    // survive this section, because with the acquisition gone the inner channel is the ONLY
+    // channel the settlement has — leaving it would have been manufacturing closure rather than
+    // earning it. It is now ONE level, so the `?` propagates what the comments always claimed.
+    let inner_result: Result<(), TrapHandleError> = if queue_advance_committed
         || post_work_committed
         || cow_recovered
         || demand_recovered
@@ -1718,38 +1787,39 @@ pub fn handle_riscv_trap_entry_shared(
         // can be set — each route is gated out by the flags the earlier ones raise — so the
         // order expresses a precedence that cannot arise, and the value is simply whichever
         // route handled the fault.
-        Ok(irq_result
+        irq_result
             .or(unknown_result)
             .or(terminal_result)
             .or(demand_result)
             .or(cow_result)
-            .unwrap_or(Ok(())))
+            .unwrap_or(Ok(()))
     } else {
-        // U9-D6-FINAL §5 — the fall-through census marker, the RISC-V twin of the shared
-        // bridge's. Same reason: without it a boot cannot say whether this acquisition was
-        // entered at all.
-        crate::yarm_log!(
-            "TERMINAL_BROAD_DISPATCH_ENTER cpu={} event={:?} nr={}",
-            cpu.0,
-            decode_trap_context(context).trap(),
-            frame.syscall_num()
-        );
-        shared
-            .with_cpu(cpu, |kernel| {
-                // U9-TERMINAL-FINAL §3 — the foundation-oracle publish that used to be HERE has
-                // moved above, onto its own prerequisites. It never needed the broad borrow: it
-                // is one atomic store of a tid the scheduler domain already answers off-lock.
-                // Reborrow so `frame` stays available for the Stage 196D post-lock switch drain
-                // (which restores the INCOMING task's frame after the broad guard drops).
-                handle_trap_entry_with_fault_bookkeeping_mode(
-                    kernel,
-                    cpu,
-                    context,
-                    Some(&mut *frame),
-                    FaultBookkeepingMode::RecordInHandleTrapEvent,
-                )
-            })
-            .map_err(|err| TrapHandleError::Syscall(err.into()))
+        // ══ U9-TERMINAL-FINAL §5 — THE RISC-V TERMINAL BROAD ACQUISITION IS GONE ═══════════
+        //
+        // What stood here was `shared.with_cpu(cpu, |kernel| handle_trap_entry_…)` — the last
+        // broad `&mut KernelState` acquisition on this port, entered by any trap no split route
+        // had settled. It is replaced by the SAME per-class settlement the shared x86_64 +
+        // AArch64 bridge uses (`arch::trap_entry::settle_unowned_trap`): one policy, two
+        // drivers, exactly as `drain_dispatch_post_work` has had since U6 §4.
+        //
+        // # Why there is nothing left for it to receive, ON THIS PORT
+        //
+        // The route set differs from the shared bridge's, so the reasoning is re-derived here
+        // rather than inherited:
+        //
+        // | class | owner | why it cannot arrive here unsettled |
+        // |---|---|---|
+        // | `Syscall`, eligible NR | `try_split_dispatch_into_frame` under `split_eligible` | `Complete(_)` **returns from this function** above — `Ok` and a `SyscallError` both `sret` to the caller with its lanes written; a genuine kernel failure propagates. The route's own tail answers `InvalidNumber` rather than `NotHandled`. |
+        // | `Syscall`, INELIGIBLE NR | this settlement | the one arm that is reachable in principle. `split_eligible` is a whitelist of the 20 assigned numbers plus the direct-IPC pair, so a RETIRED or UNASSIGNED number never consults the dispatcher at all and lands here — where it gets the canonical `InvalidNumber` written into its own frame and returns to userspace, precisely as the broad arm's `dispatch_syscall` + `set_err` did. |
+        // | `PageFault` | COW → demand → TERMINAL | the first two continue in-family by design; the terminal route is last and total, including its four structural arms. |
+        // | `TimerInterrupt` | `try_split_timer_dispatch` | every `TimerSettlement` maps to a flag-setting disposition; its only `NotHandled` is "this event is not a timer". |
+        // | `ExternalInterrupt` | the U9-IRQ-FINAL §1 entry-boundary claim | this port claims the line ONCE at entry and settles it there; the decoded event carries the line, so the route's only decline is unconstructible here. |
+        // | `Unknown` | `try_split_unknown_trap_dispatch` | answers `Complete` always — strict builds diverge, hosted builds settle. |
+        //
+        // The six flags are not deleted and their reasons are not collapsed: reaching this point
+        // with none set is still a distinguishable state, settled PER CLASS so the marker names
+        // which owner failed to settle its own class.
+        settle_unowned_trap_at_riscv_bridge(shared, cpu, context, frame)
     };
 
     if log_structural {
@@ -2779,7 +2849,7 @@ pub fn handle_riscv_trap_entry_shared(
         crate::kernel::boot::take_post_lock_trap_disposition(cpu_idx)
     {
         crate::yarm_log!(
-            "EXIT_TASK_BROAD_LOCK_RELEASED arch=riscv64 tid={} asid={} cpu={} broad_lock=0 holder=with_cpu result=ok",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=riscv64 tid={} asid={} cpu={} broad_lock=0 holder=none result=ok",
             tid,
             asid.0,
             cpu.0

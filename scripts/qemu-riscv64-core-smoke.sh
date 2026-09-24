@@ -1281,6 +1281,60 @@ fi
 echo "[ok] U9-PF1-TERM: RISC-V terminal PageFault route witness chain complete"
 fi
 
+
+# ── U9-TERMINAL-FINAL §4/§5 — THE TERMINAL-ACQUISITION GATE ───────────────────────────────────
+#
+# U9-TERMINAL-FINAL §5 re-derivation. This gate used to count `TERMINAL_BROAD_DISPATCH_ENTER`,
+# emitted once per trap that entered a terminal broad `with_cpu`. Both acquisitions are now
+# DELETED, so that marker is gone too — and a gate watching for a marker nothing can emit is
+# vacuous, which is the opposite of what this gate is for.
+#
+# It watches `TRAP_UNOWNED` instead: the per-class settlement that replaced the acquisitions
+# emits it, once, for any trap that reaches the end of a bridge with no owner having settled it.
+# That is the same question the old gate asked — did a trap actually get there? — against the
+# structure that exists now. The source derivation says no class can; this says none did.
+#
+# It is a HARD gate. The one arm reachable in principle is a syscall whose number is retired or
+# unassigned, which settles `InvalidNumber` to userspace and is a supported outcome, not a
+# failure — but no workload in this tree issues one, so an occurrence means something changed
+# and is worth stopping for.
+#
+# It is a permanent gate rather than a one-off measurement because the failure it catches is the
+# one this programme actually hit — a class missing from a PORT'S INGRESS list, which every
+# source guard about the route passed while the port sent the trap to the broad dispatcher
+# anyway. A boot that issues that class is the only thing that notices.
+terminal_entries=$(rg -a -c -F "TRAP_UNOWNED" "$LOGFILE" 2>/dev/null || echo 0)
+terminal_entries=${terminal_entries:-0}
+if (( terminal_entries > 0 )); then
+  echo "[error] TERMINAL-ACQUISITION: ${terminal_entries} trap(s) reached the bridge unsettled"
+  rg -a -o -F -e "TRAP_UNOWNED" -A 0 "$LOGFILE" 2>/dev/null | head -5 || true
+  rg -a -o "TRAP_UNOWNED cpu=[0-9]+ event=[A-Za-z]+ reason=[a-z_]+" "$LOGFILE" 2>/dev/null | sort | uniq -c | head -10 || true
+  TERMINAL_ACQUISITION_FAIL=1
+else
+  echo "[ok] TERMINAL-ACQUISITION: no broad acquisition exists and no trap reached the bridge unsettled"
+  TERMINAL_ACQUISITION_FAIL=0
+fi
+
+if [[ "$TERMINAL_ACQUISITION_FAIL" == "1" ]]; then
+  failures=$((failures + 1))
+fi
+
+# U9-TERMINAL-FINAL §4 — the NR 8 witness, and it is DETERMINISTIC.
+#
+# PM issues exactly one `control_plane_set_cnode_slots` during its boot (the Stage 29A self
+# probe), on every boot, on every port. On RISC-V that trap produced the ONE measured terminal
+# acquisition in this programme — not because NR 8's route declined, but because NR 8 was absent
+# from this port's `split_eligible` whitelist, so the shared dispatcher was never called for it.
+#
+# Requiring the probe's SUCCESS alongside the zero above is what makes this a closure rather than
+# a silence: the class still does its work, and it now does it pre-lock.
+if ! rg -a -q -F "PM_NR8_SELF_PROBE_OK" "$LOGFILE" 2>/dev/null; then
+  echo "[fail] U9-TERMINAL-FINAL: PM's NR 8 self-probe did not succeed"
+  failures=$((failures + 1))
+else
+  echo "[ok] U9-TERMINAL-FINAL: NR 8 serviced with no terminal acquisition"
+fi
+
 if (( failures > 0 )); then
   echo "[fail] qemu-riscv64-core-smoke: ${failures} check(s) failed (qemu_status=${QEMU_STATUS})"
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1

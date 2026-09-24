@@ -7643,12 +7643,20 @@ mod tests {
             ),
             "trap bridge must call the shared trap-entry wrapper"
         );
-        // The wrapper itself must run the canonical handler inside `with_cpu`.
+        // U9-TERMINAL-FINAL §5: the wrapper no longer runs the canonical handler inside a
+        // bounded `with_cpu` — there is no broad phase on this bridge at all. The claim this
+        // assertion owns is that the bridge does not grow a PRIVATE trap path: the canonical
+        // handler is still defined here for its raw/test callers, and what the wrapper reaches
+        // at the end of its owned work is the SHARED per-class settlement, not a RISC-V-only
+        // policy invented on the way out.
         let wrapper_src = include_str!("../arch/riscv64/trap.rs");
         assert!(
-            wrapper_src.contains("handle_trap_entry_with_fault_bookkeeping_mode(")
-                && wrapper_src.contains(".with_cpu(cpu, |kernel| {"),
-            "shared wrapper must run the canonical handler inside a bounded with_cpu"
+            wrapper_src.contains("fn handle_trap_entry_with_fault_bookkeeping_mode(")
+                && wrapper_src.contains(
+                    "crate::arch::trap_entry::settle_unowned_trap(cpu, event, Some(frame))"
+                ),
+            "the shared wrapper must settle through the shared per-class policy, and keep the \
+             canonical handler for its raw callers"
         );
         // syscall ABI mapping: a7 -> syscall_num, a0..a5 -> args.
         assert!(
