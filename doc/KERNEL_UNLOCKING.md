@@ -22013,6 +22013,17 @@ the full chain in order — `PUBLISH_OK cpu=0 tid=0` → `LOCK_DROPPED_OK cpu=0`
 tid=0` — so the token is published on its own prerequisites and the drain finds the token it was
 always given.
 
+> **Corrected by U9-TERMINAL-SETTLEMENT.** The oracle row above is wrong. `EXIT=0` is not a pass
+> for this script: `qemu-riscv64-core-smoke.sh` exits 0 on failed checks unless
+> `QEMU_SMOKE_STRICT=1`. The run behind this table (tree `859d6438`, whose code is identical to
+> `7e9b5274`) logged `RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=task_switched current=None`
+> and then three `[fail]` checks: `USER_RETURN_OK` missing, `DONE result=ok` missing, and
+> "returned to a different task". The oracle fires on an NR 5 blocking receive that commits a
+> queue advance and switches to task 3, so the task that entered the trap does not resume on it.
+> The publish → lock-drop → drain chain quoted above does hold; the oracle's user-return half does
+> not. This is a pre-existing failure, reproduced unchanged by U9-TERMINAL-SETTLEMENT, and it is
+> not claimed fixed.
+
 **Hosted:** 5838 passed, 0 failed, 2 ignored.
 **Census guard:** 9/9 (7 existing + 2 new ratchets).
 **Builds:** x86_64-none, aarch64-none, riscv64 — all clean.
@@ -22148,3 +22159,40 @@ passing vacuously: `the_split_route_falls_back_only_before_it_commits` matched a
 containing `D::NotHandled`, and now reads code lines. More broadly, the whole Yield block sat
 below `syscall_split.rs`'s `#[cfg(test)] mod tests`, so every corpus guard that stops at that
 marker exempted it. The block now sits above the test module.
+
+## §4 — qualification, on frozen artifacts
+
+All artifacts were built fresh from `44e51618`, the code commit of this pass, with
+`--features pagefault1-demand-witness`, on all three ports. A run passes only when it has **zero
+`[fail]` checks**. Exit status alone is not enough, because the RISC-V core smoke exits 0 on
+failed checks unless `QEMU_SMOKE_STRICT=1`.
+
+| run | checks | `TRAP_UNOWNED` | `unowned_entering_frame` | `DISPATCH_TORN_FATAL` | notes |
+|---|---|---|---|---|---|
+| x86_64 core, knob-off | 50 ok / 0 fail | 0 | 0 | 0 | 71 Yield drains |
+| x86_64 core, `D6_SWITCH_PROOF=1` | 56 ok / 0 fail | 0 | 0 | 0 | `D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE` |
+| x86_64 core, `D6_SWITCH_A=1` | 54 ok / 0 fail | 0 | 0 | 0 | `D6_SWITCH_A_DONE` |
+| x86_64 core, both knobs | 56 ok / 0 fail | 0 | 0 | 0 | cleanup done |
+| AArch64 core | 21 ok / 0 fail | 0 | 0 | 0 | — |
+| RISC-V core | 0 fail | 0 | 0 | 0 | 26 committed Yield deferrals, each drained; `NR 8 serviced with no terminal acquisition` |
+| RISC-V `POST_LOCK_FOUNDATION_ORACLE=1` | **3 fail** | 0 | 0 | 0 | the pre-existing failure recorded under §5c; reproduced unchanged, three runs |
+| x86_64 AP saved-return witness | `result=ok` | — | — | — | fresh entry → Yield → saved continuation |
+| x86_64 AP generic-return witness | `result=ok` | — | — | — | — |
+| x86_64 AP recv-v2 block witness | `result=ok` | — | — | — | — |
+
+No live boot reached a declined Yield (`YIELD_SPLIT_DECLINE_SETTLED` 0 on every run), so the
+declined settlement's live population is empty. What the boots do show is that the committed NR 0
+path this pass also routes through `split_yield_settle` still switches on every port. The declined
+arms are covered by §3's behavioral cases, not by live evidence, and this record does not claim
+otherwise.
+
+* **Hosted:** 5849 passed, 0 failed, 2 ignored.
+* **Census guard:** 9/9. `with_cpu` 0, `with_broad` 0; three wrapper bodies, reported separately.
+* **Builds:** x86_64-none, aarch64-none and riscv64 are clean, with no new warnings.
+* **Integration scopes:** 16 of 16 run. Fifteen are green. `server_dies_runner_scope` is at
+  exactly 8 passed / 2 failed, the same two named cases as the recorded carve-out.
+
+**Not closed by this pass, and not claimed:** the ordinary-cap seal's `arch=x86_64
+class=IpcSendOrdinaryCap` cell (U9-TERMINAL-FINAL §5b); the RISC-V foundation-oracle user-return
+failure (§5c, corrected above); the `server_dies_runner_scope` carve-out; the
+`switch_owned_elsewhere` residual (§2 of this section).
