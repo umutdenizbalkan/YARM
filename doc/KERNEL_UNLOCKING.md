@@ -21775,13 +21775,23 @@ which reuses the existing dispatch, rollback, frame-authority and deferral owner
 is `TaskMissing`; `NoCurrent` with no caller returns as the trap entered; everything else takes
 the queue-advance path.
 
+> **Corrected by U9-TERMINAL-SETTLEMENT.** The paragraph above, and the second bullet below, were
+> false as delivered at `7e9b5274`. There were four frame-returning outcomes, not two, and none
+> of them made its return depend on authority. `task_missing` computed the verdict and only
+> logged it. `NoCaller` answered `Complete(Ok)` through a frame no task owned. The
+> reservation-unavailable and reenqueue-refused arms returned success whether or not their
+> rollback happened. The verdict was also read against an ASID fetched after the transaction
+> rather than the one the trap entered with. See the U9-TERMINAL-SETTLEMENT section below for
+> the settlement as it now is.
+
 The constraints §2 named are each visible in the code:
 
 * **An occupied cell names an owner.** `colliding_deferral_pending` settles
   `QueueAdvanceCommitted` with `settlement=switch_owned_elsewhere` — the incumbent's drain pays
   the debt — rather than reserving over it, clearing it, or selecting twice.
-* **A returned error still needs authority.** Both frame-returning arms consult
-  `entering_frame_authority_split_read` before encoding anything.
+* ~~**A returned error still needs authority.** Both frame-returning arms consult
+  `entering_frame_authority_split_read` before encoding anything.~~ *Not true as delivered: see
+  the correction above.*
 * **Yield telemetry exactly once.** `count_yield_split_mut` is paid at the top, for every
   settlement, because the broad `yield_current` that used to count a declined yield no longer runs.
 
@@ -21812,6 +21822,10 @@ it to fail: a renewed implicit `Option::?` escape (with a negative control showi
 count is blind to it), a dropped frame-authority read, a reintroduced broad acquisition, and a
 blanket settlement — twice, once collapsing the five reasons and once moving the `Syscall` errno
 onto the fatal channel.
+
+*(U9-TERMINAL-SETTLEMENT: the "dropped frame-authority read" test was lexical. It only checked
+that the authority closure was defined before the return, so it still passed when the call became
+`let owns = false`. It has been removed and replaced by behavioral cases; see below.)*
 
 **A stale guard the deletion exposed.** `drain_is_post_lock_after_broad_guard_drops` asserted the
 queue-switch drain used "a fresh bounded `with_cpu` re-acquire" by finding that text ANYWHERE in
@@ -22011,3 +22025,126 @@ carve-out.
 
 **Not closed by this pass, and not claimed:** the ordinary-cap seal's
 `arch=x86_64 class=IpcSendOrdinaryCap` cell, red at base and red here (§5b).
+
+---
+
+# U9-TERMINAL-SETTLEMENT — the declined Yield settlement, made to depend on authority
+
+Acquisition removal and settlement correctness are reported separately, because they are
+separate claims.
+
+**Acquisition removal: unchanged, and still complete.** `with_cpu` 0, `with_broad` 0. The three
+raw `self.state.lock()` sites are the BODIES of the `SharedKernel::lock` / `with` / `with_cpu`
+wrappers and are reported separately, as before. `tests/broad_lock_census_guard.rs` 9/9. This
+pass adds no acquisition, no broad fallback, no second scheduler and no switch channel.
+
+**Settlement correctness: this pass.** U9-TERMINAL-FINAL §2 claimed that "both frame-returning
+arms" of the declined NR 0 consulted frame authority. That claim is corrected in place above.
+
+## §1 — the return channel, traced
+
+Both bridges handle a split disposition the same way (`arch/trap_entry.rs` for x86_64 and
+AArch64, `arch/riscv64/trap.rs` for RISC-V). `Complete(Ok)` finalizes and resumes the entering
+frame. `Complete(Err(Syscall(e)))` does `set_err(e)`, finalizes and **resumes the entering frame
+too**. So an errno is not a refusal to return; only `Complete(Err(other))` reaches the fatal path.
+Under that rule, the delivered settlement had four unsafe returns:
+
+| arm | what it did | why that was unsafe |
+|---|---|---|
+| `task_missing` | computed `owns`, logged it, returned `Complete(Err(TaskMissing))` either way | resumed a frame the verdict had disowned |
+| `NoCaller` | `Complete(Ok)` | resumed a frame no scheduler slot names |
+| `reservation_unavailable` | rolled back, ignored `rolled_back`, returned | resumed a caller left `Runnable` |
+| `reenqueue_refused` | rolled back, ignored `rolled_back`, returned `Ok` | the primitive also refuses when the slot is ALREADY empty. There it restores nothing, so the rollback made a `Running` task that no slot or queue holds |
+
+A fifth problem sat under all of them. `authenticate` read the ASID fresh, after the transaction.
+A replacement incarnation could therefore supply the identity it was then authenticated against.
+
+## §2 — authority determines settlement
+
+* **The entering incarnation is captured first.** `try_split_yield_into_frame` reads
+  `{tid, asid, priority}` through `current_entering_incarnation_split_read` before
+  `run_yield_transaction` can change anything. Every later decision is about that incarnation.
+  The declined path preempts `entering.tid`, not a re-read `current`.
+* **One path returns through the frame: `settle_yield_through_entering_frame`.** Each of the three
+  arms that could return hands it its canonical answer and what it would have to undo. It asks
+  `entering_frame_authority_split_read(cpu, entering.tid, entering.asid)`:
+  * `OwnsEnteringFrame`: undo the preempt, then release the reservation, in the transaction's
+    order. If the rollback is **refused**, the trap does not return. Otherwise the answer returns
+    through the frame.
+  * `Forfeited(_)`: nothing is rolled back, because rolling a forfeited task back to `Running`
+    would itself create the torn state. A held reservation is released.
+* **What a non-returning outcome does.** The answer is written into the frame first, so any
+  continuation the bridge preserves is a COMPLETED NR 0. `yield_forfeited_placement_split_read`
+  then locates the incarnation from its actual status and placement, and the trap takes the
+  established `BlockUnsettled` settlement: capture and publish an `Unpublished` task, idle when a
+  dispatcher already owns it, `DISPATCH_TORN_FATAL` otherwise. NR 9 already shares this
+  settlement. `RecvUnwindOutcome::TableDisagree` is new. It names the two shapes only a Yield can
+  observe: the incarnation still in this CPU's slot while disowned or un-rolled-back, and a
+  `Running` task that is queued or placed nowhere. Every predicate is false for it, so both
+  bridges' existing landing rule takes the torn terminal. A task that is merely somewhere else
+  (queued, running on another CPU) is settled, never made fatal.
+* **Kernel-internal versus userspace "no caller".** `yield_current` called from kernel code with
+  nothing current keeps its `NoCaller` settlement in the broad policy. A userspace NR 0 is never
+  that case: a task trapped. The split route calls only `settle_caller_yield_decline`, whose
+  return type has no `NoCaller`, so the kernel-internal answer cannot reach a user frame by
+  construction. A userspace NR 0 whose capture finds no task takes
+  `TrapHandleError::UnownedEnteringFrame` on the fatal channel. The construction proof that this
+  does not arise is in `split_yield_settle`'s documentation: the trap runs with interrupts masked,
+  a CPU enters user mode only after its dispatch installs `current`, and every slot-clearing
+  primitive is invoked with the calling CPU's own index. The settlement does not rely on that
+  proof; it fails closed either way.
+
+**Remaining residual, not a frame return:** `switch_owned_elsewhere` (a colliding deferral already
+pending) still sets `ok` and answers `QueueAdvanceCommitted` with the caller `Runnable`, current
+and unqueued. That arm was specified by U9-TERMINAL-FINAL and is reachable only if an earlier trap
+leaked a deferral. It switches rather than returning, so it is out of this package, and it is
+recorded here so it is not mistaken for settled.
+
+**Attribution limit shared with NR 9:** the `BlockUnsettled` bridge markers and the torn-fatal
+reason read `ipc_recv_unsettled`. The Yield route logs its own `YIELD_SPLIT_DECLINE_SETTLED …
+returns=0 outcome=…` first, so a log still says which route produced the state.
+
+## §3 — the executable boundary
+
+`u9terminal_settlement_yield` (12 cases) drives the production `split_yield_settle` with the
+production `SharedYieldOwners` over a real `SharedKernel`. Where an interleaving has to be
+forced, an interposing owner changes state through the kernel's own owners at the named step and
+then delegates, or refuses exactly as the production primitive does. Each disposition then runs
+through the bridges' `BlockUnsettled` steps, using the production capture
+(`split_return_commit_context_split`) and publication (`enqueue_task_split`). Both ports'
+landing rules are applied and required to agree. Every case asserts return / switch / idle / torn
+together with TCB status, scheduler placement, the reservation cell, the frame lanes and exactly
+one yield count.
+
+| case | disposition → CPU | post-state |
+|---|---|---|
+| decline, caller owns everything | `QueueAdvanceCommitted` → switches | E `Runnable`, queued; slot empty; deferral names E |
+| `task_missing`, frame owned | `Complete(Err(TaskMissing))` → returns errno | nothing moved |
+| `reenqueue_refused`, enqueue failed | rolled back → returns `Ok` | E `Running`, current; reservation released |
+| `reservation_unavailable`, frame owned | rolled back → returns errno | E `Running`, current |
+| `reenqueue_refused`, slot already empty | `Unpublished` → captured, published, idles | E `Runnable`, queued; its saved PC is this trap's; no rollback |
+| `task_missing`, E re-queued | `QueuedRunnable` → idles, nothing captured | E untouched on its queue |
+| replacement incarnation (new ASID) | `IncarnationMoved` → torn | old frame never captured into the replacement |
+| `Blocked` current | `IncarnationMoved` → torn | — |
+| rollback refused (no write) | `TableDisagree` → torn | E `Runnable` in slot; reservation released |
+| rollback refused by a real status change | `IncarnationMoved` → torn | E `Blocked` |
+| no entering incarnation | `Complete(Err(UnownedEnteringFrame))` → fatal | frame unanswered; queue not advanced; broad `NoCaller` unchanged |
+
+**The lexical guard is gone.** `u9terminalfinal_mutation` §B checked that the authority closure
+was defined before the first `set_ok`, so it passed when the call became `let owns = false`. It
+has been replaced by the cases above. Each production mutation below was applied to
+`syscall_split.rs`, the module was run, and the change was reverted:
+
+| mutation | failing cases |
+|---|---|
+| verdict ignored (`authority = OwnsEnteringFrame`) | 4, including `ignoring_the_verdict_would_return_through_a_forfeited_frame` |
+| verdict forced to forfeit (the `let owns = false` shape) | 5, all owned-frame and rollback cases |
+| `rolled_back` ignored | 2, both rollback-refusal cases |
+| authenticated against a fresh ASID | 1, the replacement-incarnation case |
+| no caller answered `Complete(Ok)` | 1, the missing-caller case |
+
+Five source guards were re-derived because the structure they described changed. One had been
+passing vacuously: `the_split_route_falls_back_only_before_it_commits` matched a DOC COMMENT
+containing `D::NotHandled`, and now reads code lines. More broadly, the whole Yield block sat
+below `syscall_split.rs`'s `#[cfg(test)] mod tests`, so every corpus guard that stops at that
+marker exempted it. The block now sits above the test module.
