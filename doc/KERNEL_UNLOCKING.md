@@ -21788,7 +21788,10 @@ The constraints §2 named are each visible in the code:
 
 * **An occupied cell names an owner.** `colliding_deferral_pending` settles
   `QueueAdvanceCommitted` with `settlement=switch_owned_elsewhere` — the incumbent's drain pays
-  the debt — rather than reserving over it, clearing it, or selecting twice.
+  the debt — rather than reserving over it, clearing it, or selecting twice. *(Corrected by
+  U9-CLOSURE-ACCEPTANCE §1: no incumbent drain pays this debt. Every Yield-colliding drain
+  requires `current` cleared and otherwise clears its cell without dispatching, and this arm leaves
+  the caller current. The arm is sound only because it is unreachable; see that section.)*
 * ~~**A returned error still needs authority.** Both frame-returning arms consult
   `entering_frame_authority_split_read` before encoding anything.~~ *Not true as delivered: see
   the correction above.*
@@ -22023,6 +22026,12 @@ always given.
 > The publish → lock-drop → drain chain quoted above does hold; the oracle's user-return half does
 > not. This is a pre-existing failure, reproduced unchanged by U9-TERMINAL-SETTLEMENT, and it is
 > not claimed fixed.
+>
+> **Corrected again by U9-CLOSURE-ACCEPTANCE §2.** "Pre-existing" was measured against a baseline
+> taken after the relocation, which cannot tell whether the relocation caused it. Against the real
+> base, `e44c9b7b` built fresh and run with `QEMU_SMOKE_STRICT=1`, the profile is green: the oracle
+> fired on PM's NR 8 inside the non-committed fall-through and returned to it. The relocation is
+> the first divergence, and it is repaired there.
 
 **Hosted:** 5838 passed, 0 failed, 2 ignored.
 **Census guard:** 9/9 (7 existing + 2 new ratchets).
@@ -22109,7 +22118,9 @@ A replacement incarnation could therefore supply the identity it was then authen
 pending) still sets `ok` and answers `QueueAdvanceCommitted` with the caller `Runnable`, current
 and unqueued. That arm was specified by U9-TERMINAL-FINAL and is reachable only if an earlier trap
 leaked a deferral. It switches rather than returning, so it is out of this package, and it is
-recorded here so it is not mistaken for settled.
+recorded here so it is not mistaken for settled. *(Corrected by U9-CLOSURE-ACCEPTANCE §1: it does
+not switch. The incumbent's drain refuses on the still-occupied `current` slot. A leak path did
+exist — the D6 plan past a blocking send's `ImmediateReturn` — and it is closed there.)*
 
 **Attribution limit shared with NR 9:** the `BlockUnsettled` bridge markers and the torn-fatal
 reason read `ipc_recv_unsettled`. The Yield route logs its own `YIELD_SPLIT_DECLINE_SETTLED …
