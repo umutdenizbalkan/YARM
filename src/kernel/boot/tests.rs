@@ -191824,3 +191824,72 @@ mod qb1_timer_contract_checker {
         );
     }
 }
+
+/// QEMU-BASELINE1 §4 — the two defects the first live AArch64 and RISC-V ServerDies runs found
+/// once their runners booted the initramfs, pinned where they were repaired.
+mod qb1_server_dies_ports {
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const INIT: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    /// A woken reply timeout is the ServerDies inversion only on the scenario's own call. The
+    /// supervisor's unrelated timed call legitimately expires in early RISC-V boot, before the
+    /// scenario exists, and must not be reported as `TIMEOUT_WON`.
+    #[test]
+    fn timeout_won_is_scoped_to_the_oracle_reply_endpoint() {
+        let site = RUNTIME
+            .split("\"IPC_SERVER_DEATH_TIMEOUT_WON outcome={:?}")
+            .next()
+            .and_then(|pre| {
+                pre.rsplit("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]")
+                    .next()
+            })
+            .expect("the emission guard");
+        assert!(site.contains("IPC_REPLY_TIMEOUT_MODE_SERVER_DIES"));
+        assert!(site.contains("ReplyTimeoutOutcome::Woken"));
+        let flat: alloc::string::String = site.split_whitespace().collect();
+        assert!(
+            flat.contains(
+                "ipc_reply_timeout_oracle_reply_endpoint_is(work.handle.identity().terminal_identity.reply_endpoint_index,"
+            ),
+            "the literal fires only for a deadline on the oracle's reply endpoint"
+        );
+    }
+
+    /// Every port's driver gives ServerDies its own verdict. Without the branch the AArch64 and
+    /// RISC-V drivers fell into the reply-wins tail after a correct ServerDies completion, and
+    /// the survivor/health/quiescence attestations were never emitted.
+    #[test]
+    fn every_port_driver_emits_the_server_dies_verdict() {
+        for driver in [
+            "fn run_x86_ipc_reply_timeout_oracle(",
+            "fn run_aarch64_ipc_reply_timeout_oracle(",
+            "fn run_riscv_ipc_reply_timeout_oracle(",
+        ] {
+            let body = INIT
+                .split(driver)
+                .nth(1)
+                .and_then(|b| b.split("\nfn ").next())
+                .expect(driver);
+            let dies = body
+                .find("} else if oracle::is_server_dies() {")
+                .unwrap_or_else(|| panic!("{driver} has no ServerDies branch"));
+            let verdict = body
+                .find("oracle::server_dies_final_attestations(&out);")
+                .unwrap_or_else(|| panic!("{driver} never attests"));
+            let beats = body
+                .find("_IPC_REPLY_BEATS_TIMEOUT_DONE")
+                .unwrap_or_else(|| panic!("{driver} lost its reply-wins verdict"));
+            assert!(
+                dies < verdict && verdict < beats,
+                "{driver}: ServerDies is decided first"
+            );
+        }
+        assert!(
+            INIT.contains("\"IPC_SERVER_DEATH_SYSTEM_HEALTH_OK arch={} survivor=init")
+                && !INIT.contains("IPC_SERVER_DEATH_SYSTEM_HEALTH_OK arch=x86_64"),
+            "the health attestation names the port it ran on"
+        );
+    }
+}

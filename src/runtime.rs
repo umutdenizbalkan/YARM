@@ -15702,10 +15702,23 @@ impl SharedKernel {
             // completion that actually woke the caller means it reached the terminal cell
             // before PeerDeath — the exact inversion this literal names. Emitted from the real
             // completion outcome, never inferred from a missing marker.
+            //
+            // QEMU-BASELINE1 §4 — SCOPED to the scenario's call, i.e. to a deadline on the
+            // oracle's own reply endpoint. It used to fire for EVERY woken reply timeout while the
+            // mode was armed, so on RISC-V — whose faster tick lets the supervisor's unrelated,
+            // legitimate timed call expire during early boot, long before the scenario starts —
+            // it named an inversion that never happened. The same scoping 199D-SD3 applied to the
+            // exit markers; a timeout that does beat PeerDeath on the scenario's call still fires.
             #[cfg(feature = "ipc-reply-timeout-oracle-core")]
             if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
                 == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
                 && matches!(outcome, crate::runtime::ReplyTimeoutOutcome::Woken)
+                && crate::kernel::boot::ipc_reply_timeout_oracle_reply_endpoint_is(
+                    work.handle
+                        .identity()
+                        .terminal_identity
+                        .reply_endpoint_index,
+                )
             {
                 crate::yarm_log!(
                     "IPC_SERVER_DEATH_TIMEOUT_WON outcome={:?} terminal=Timeout expected=PeerDeath result=fail",
