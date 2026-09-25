@@ -22429,3 +22429,117 @@ without a free slot, a larger or dynamic run table, or a smaller init footprint 
 * `IPC_SERVER_DEATH_BROAD_LOCK_RELEASED … holder=with_cpu`: no `with_cpu` exists any more. The
   runner matches only the marker prefix, so nothing grades the stale field.
 * The AArch64 and RISC-V server-death runners boot with no initramfs (§1).
+
+---
+
+# QEMU-BASELINE1 — make the remaining failure checks meaningful and green
+
+Reference (unchanged, the comparison baseline): `14b6128653ed9a833a33a9650b9fa0056a931ea2`, tree
+`37e8f5a0306a9680b9f318ad80b97929e588bfbc`. QEMU 8.2.2 on all three ports.
+
+## 1 — reproduction on the reference, first causal failure per cell
+
+Artifacts: x86_64 initramfs `285659b70a8241fc`, `kernel_boot.elf` `0d94099de62c52ec`; AArch64
+initramfs `fe35a32de5747ff6`, `yarm-aarch64.bin` `925f43bdfb76b569`; RISC-V initramfs
+`ef699bfd28d2f034`, `yarm-riscv64.bin` `d0e184a6da8a49b3` (sha256 prefixes).
+
+| cell | exit | failed checks | first causal failure |
+|---|---|---|---|
+| x86_64 strict core, off/proof/switch-A/both | 1 ×4 | 0 `[fail]`, 1 `[error]` | `need at least two scheduler tick markers (got 1)`; 71–73 serviced idle advances, 1 TICK_OK, 0 preempts |
+| x86_64 ordinary-cap capdirect | 1 | retire=0 attest=0 | `VM_COW_SPLIT_FAILED_CLOSED tid=1 va=0x7fffffbff000 reason=remap err=Vm(Full)` |
+| AArch64 / RISC-V server-death | 1 / 1 | `RUN_B expected exactly one captured reverse link, saw 0` | `BOOT_FATAL_INITRAMFS_MISSING` — no initramfs was ever passed |
+
+## 2 — mapping capacity (COW replacement) and page-table capacity
+
+**Confirmed cause, two owners.** (a) *Run bookkeeping.* Init's table held 128 runs at the failure,
+121 of them single-page runs over its 121-page image, 120 of whose adjacent pairs were contiguous in
+virtual AND physical address with equal flags. The ELF loader maps every page with staging flags
+(which coalesce) and then remaps each with its final flags; `map_page`'s replacement path split the
+containing run around the page and never re-coalesced, so the image ended as one run per page. It
+could also commit the left split and then refuse the right one — a partial mutation behind a failed
+call. (b) *Page tables.* With (a) repaired the COW commits and the cell's fork then fails
+`PT_ALLOC_PAGE_FAIL reason=alloc_pt_frame used_pages=98`: the 256-page PT pool serves both page
+tables and the slab heap, the heap held ~158 pages at userspace entry, and a measured walk showed
+every live address space already at its minimum (7–8 tables). The pool could back ~12 address
+spaces against the frozen `MAX_ADDRESS_SPACES = 32`; the cell needs 13 at once.
+
+**Repair.** (a) `AddressSpace::replace_page_in_run` decides the post-replacement shape from pure
+reads — identical replacement: nothing; else `[left][page][right]` merged with equal-flag contiguous
+neighbours — checks the net entries against `MAX_MAPPINGS` before touching anything, and commits
+bookkeeping only after the break-before-make install succeeds. `MAX_MAPPINGS` unchanged; memory cost
+zero. The fork inverse now restores the exact recorded range (`restore_page_range_flags_in_place`)
+instead of whatever run starts at the head, which could widen or miss pages once runs change shape.
+(b) The PT pool is the heap's unchanged 256 pages plus a table reserve of
+`MAX_ADDRESS_SPACES × PT_TABLES_PER_ADDRESS_SPACE` (8, the measured standard layout), and the heap is
+held to its 256-page share by a budget checked under the pool lock (`CapacityExceeded`). Cost: 1 MiB
+of physical memory moved from the main pool per port. The heap budget is not raised.
+
+**Negative tests.** Four of six VM tests fail on the reference owner (staged→final remap, identical
+remap, middle replacement without room — a half-split table — and range-exact rollback); the COW
+transaction test at the table boundary fails on the reference with the run left `[1][3]` after a
+refused fault. `pt_reserve_backs_every_standard_address_space` measures 8 tables per space through
+the real x86_64 walker; `a_heap_allocation_past_its_share_is_refused_without_allocating` shows the
+budget refusal leaves nothing taken.
+
+**Live.** Capdirect: `IPCSEND_ORDINARY_CAP_BLOCKED_RECEIVER_ORACLE_DONE arch=x86_64 result=ok
+payload_len=8 receiver_resumes=1 fresh_cap=1 object_identity_ok=1` and `IPCSEND_ORDINARY_CAP_RIGHTS_OK`
+(fork `wp_runs=2`, was 86). Seal: `SECOND_COHORT_ORDINARY_CAP_SEAL arches=3 classes=2 live_cells=6
+result=ok`.
+
+**Limitations.** An exited-but-unreaped task keeps its page tables until reaped (only faulted tasks
+are reaped by PM); the reserve covers this boot, not arbitrary zombie accumulation.
+
+## 3 — the timer contract, measured
+
+**What the check was for.** "timer IRQ + EOI + scheduler tick progression": delivery,
+acknowledge/re-arm, tick advance across interrupts, and a task the interrupt lands on continuing
+with its context. Never preemption — at the shipped quantum none occurs. U9-TM mapped it to
+`TIMER_SPLIT_TICK_OK` alone, which is emitted only for an interrupt that lands on a running task;
+nearly every interrupt of an ordinary boot lands in the idle halt (`IDLE_ADVANCE`), so the count was
+incidental.
+
+**Repair.** The checker counts every serviced split settlement (tick-ok, idle-advance, preempt),
+requires `rearm=1` on each and tick progression, and REQUIRES a controlled workload:
+`timer-contract-witness` (default-off, isolated like `pagefault1-demand-witness`) makes the
+supervisor spin in userspace for 2^33 TSC cycles (~5 of the ~0.8 s LAPIC deadlines; the whole active
+boot is shorter than one) with r12–r15 sentinels live, then seals. At least two re-armed, strictly
+increasing ticks must be attributed to that task by the kernel's own `TIMER_SPLIT_TICK_OK …
+current=<tid>` between its BEGIN and SEAL, and the seal must report the register file intact. A
+first cut stopped on observed TSC gaps; under TCG host noise is the same size as an interrupt (116
+"gaps" in one run), so the gap count is reported only. Also fixed: `printf | rg -q` under pipefail
+reported present markers as missing.
+
+**Negative controls (live, not committed).** N1 re-arm removed: `need at least two serviced timer
+interrupts (got 1)`, witness `attributed=1` → fail. N2 `r12 ^= 1` on the non-switching user-mode
+timer return (the shared-kernel epilogue; a first attempt in the raw fallback path was never reached
+and correctly did not fail): seal `mask=0xe context_ok=0` → fail. N3 build without the witness:
+`timer contract witness absent` → fail.
+
+**Live.** Ordinary, D6 proof, D6 switch-A and combined: exit 0, 74 serviced interrupts all re-armed,
+`attributed=5 nonmonotonic=0 unarmed=0 seal_ok=1`.
+
+**Limitations.** The witness is x86_64-only (the only strict check that graded this); it costs ~4 s
+of boot time where enabled.
+
+## 4 — the AArch64 and RISC-V server-death runners
+
+**Confirmed cause.** Both booted the bare `target/` ELF with no initramfs; AArch64 additionally got
+no DTB from an ELF load. Once they booted, the live runs found three more, each narrow: (i) the
+AArch64/RISC-V reply-timeout drivers had no ServerDies branch (x86_64 gained it when its runner went
+live), so a correct ServerDies completion fell into the reply-wins tail and the survivor/health/
+quiescence attestations were never emitted; (ii) the RISC-V log contains non-text bytes, so
+`grep -m1` printed "Binary file … matches" and the identity join failed on correct anchors;
+(iii) `IPC_SERVER_DEATH_TIMEOUT_WON` fired for every woken reply timeout while the mode was armed —
+on RISC-V the supervisor's unrelated timed call legitimately expires at tick 6, long before the
+scenario — and is now scoped to deadlines on the oracle's reply endpoint.
+
+**Repair.** A shared `serverdies_stage_raw_image`: the port's artifact script, the kernel rebuilt
+oracle-on after it, objcopy to the published raw image, the oracle literal verified in the booted
+image, the matching initramfs. Boots mirror the core profile (AArch64 1024M; RISC-V OpenSBI,
+`console=ttyS0 rdinit=/init`), one CPU, `-no-reboot -no-shutdown`. Grading unchanged except `-a`.
+
+**Live.** `STAGE_200D2B1C_AARCH64_SERVER_DIES_SEAL … live_cells=1 caller_wakes=1
+peer_death_winners=1 exit_returns=0 feature_off_oracle_literals=0 result=ok` (server {10008,1},
+caller {1,1}, record {0,18}); RISC-V the same (record {1,17}). `server_dies_runner_scope` 10/10.
+
+**Limitations.** One CPU; the AP cross-CPU reply/shootdown defect is out of scope.
