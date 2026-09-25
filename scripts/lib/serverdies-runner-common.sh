@@ -204,6 +204,37 @@ IPC_SERVER_DEATH_OK
 PROD
 }
 
+# ── raw-image staging (QEMU-BASELINE1 §4) ─────────────────────────────────────────────
+# The AArch64 and RISC-V ports boot a raw binary objcopy'd from the kernel ELF, exactly as their
+# artifact scripts publish it: QEMU hands a raw AArch64 image the DTB that locates the initrd,
+# which an ELF load does not. `serverdies_stage_raw_image <arch> <boot_image> <initrd>` stages
+# the artifacts through the port's own artifact script, rebuilds the kernel ORACLE-ON after it
+# (that script rebuilds it feature-off into the same path), converts it the same way, and
+# refuses an image that does not carry the oracle — so a silent fall back to the feature-off
+# image, or to a stale binary, cannot pass as a live cell.
+serverdies_stage_raw_image() {
+  local arch=$1 image=$2 initrd=$3 syms
+  ./scripts/build-qemu-${arch}-artifacts.sh >"$LOGDIR/stage.log" 2>&1 || return 1
+  cargo +nightly build -Z build-std="$BUILD_STD" -Z json-target-spec \
+    --target "$KTARGET" --profile "$KPROFILE" --no-default-features \
+    --features "$FEATURE" -p yarm --bin kernel_boot >>"$LOGDIR/stage.log" 2>&1 || return 1
+  [[ -f "$KELF" ]] || { echo "[serverdies] missing feature-on kernel: $KELF"; return 1; }
+  rm -f "$image"
+  if command -v llvm-objcopy >/dev/null 2>&1; then
+    llvm-objcopy -O binary "$KELF" "$image" || return 1
+  elif command -v rust-objcopy >/dev/null 2>&1; then
+    rust-objcopy -O binary "$KELF" "$image" || return 1
+  else
+    echo "[serverdies] no objcopy available to produce $image"; return 1
+  fi
+  [[ -s "$initrd" ]] || { echo "[serverdies] missing initramfs: $initrd"; return 1; }
+  # Materialized, not piped into `grep -q`: see the x86_64 runner for the pipefail inversion.
+  syms=$(strings -a "$image")
+  grep -qF "IPC_REPLY_TIMEOUT_COLLECTOR_GATE" <<<"$syms" \
+    || { echo "[serverdies] staged image is not oracle-on: $image"; return 1; }
+  note "staged image=$image initrd=$initrd sha256=$(sha256sum "$image" | cut -c1-16) initrd_sha256=$(sha256sum "$initrd" | cut -c1-16)"
+}
+
 # ── RUN_A: feature-off binary audit ────────────────────────────────────────────────────
 serverdies_run_a_feature_off_audit() {
   note "RUN_A feature-off binary audit"
