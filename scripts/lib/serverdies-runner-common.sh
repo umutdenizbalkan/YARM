@@ -106,14 +106,18 @@ serverdies_field() {
 # Both anchor lines must be unique — more than one captured link or more than one published
 # completion in a single boot is itself a defect, not something to pick a winner from — and
 # the completion must name the SAME reply record the captured link did.
+#
+# QEMU-BASELINE1 §4: every grep of the boot log is `-a`. The RISC-V log carries non-text bytes, so
+# GNU grep classifies it as binary, and then `grep -m1` prints "Binary file ... matches" instead of
+# the line — `-c` still counted 1, and the identity parse failed on a correct transaction.
 serverdies_resolve_identity() {
   local log=$1 captured committed n f
-  n=$(grep -c -F "IPC_SERVER_DEATH_LINK_CAPTURED " "$log" || true)
+  n=$(grep -a -c -F "IPC_SERVER_DEATH_LINK_CAPTURED " "$log" || true)
   [[ "$n" == "1" ]] || { die "RUN_B expected exactly one captured reverse link, saw $n"; return 1; }
-  n=$(grep -c -F "IPC_SERVER_DEATH_COMPLETION_COMMITTED " "$log" || true)
+  n=$(grep -a -c -F "IPC_SERVER_DEATH_COMPLETION_COMMITTED " "$log" || true)
   [[ "$n" == "1" ]] || { die "RUN_B expected exactly one committed completion, saw $n"; return 1; }
-  captured=$(grep -m1 -F "IPC_SERVER_DEATH_LINK_CAPTURED " "$log")
-  committed=$(grep -m1 -F "IPC_SERVER_DEATH_COMPLETION_COMMITTED " "$log")
+  captured=$(grep -a -m1 -F "IPC_SERVER_DEATH_LINK_CAPTURED " "$log")
+  committed=$(grep -a -m1 -F "IPC_SERVER_DEATH_COMPLETION_COMMITTED " "$log")
   SD_SERVER_TID=$(serverdies_field "$captured" server_tid)
   SD_SERVER_ASID=$(serverdies_field "$captured" server_asid)
   SD_RECORD_INDEX=$(serverdies_field "$captured" record_index)
@@ -286,7 +290,7 @@ serverdies_run_b_live_cell() {
 
   # Single-boot witnesses: the log must be from THIS boot, not an accumulation.
   local banners
-  banners=$(grep -c "YARM_BOOT_OK" "$log" || true)
+  banners=$(grep -a -c "YARM_BOOT_OK" "$log" || true)
   [[ "$banners" == "1" ]] || die "RUN_B expected exactly one boot banner, saw $banners"
 
   # 199D-SD3 (§4): resolve the witnessed transaction before grading anything against it.
@@ -299,7 +303,7 @@ serverdies_run_b_live_cell() {
   local prev=0 line idx
   while read -r line; do
     [[ -z "$line" ]] && continue
-    idx=$(grep -n -m1 -F "$line" "$log" | cut -d: -f1 || true)
+    idx=$(grep -a -n -m1 -F "$line" "$log" | cut -d: -f1 || true)
     if [[ -z "$idx" ]]; then die "RUN_B required marker missing: $line"; continue; fi
     if (( idx < prev )); then die "RUN_B marker out of order: $line"; fi
     prev=$idx
@@ -315,7 +319,7 @@ serverdies_run_b_live_cell() {
   for line in \
     "IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid=${SD_SERVER_TID} server_asid=${SD_SERVER_ASID}" \
     "EXIT_TASK_CLAIM_RETIRED tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID}"; do
-    dup=$(grep -c -F "$line" "$log" || true)
+    dup=$(grep -a -c -F "$line" "$log" || true)
     [[ "$dup" == "1" ]] || die "RUN_B scoped marker seen $dup times (expected 1): $line"
   done
 
@@ -326,10 +330,10 @@ serverdies_run_b_live_cell() {
   # rather than left implied — the broad edge counted zero, and the retired claim states that this
   # exit actually owed and handed off a server-death completion.
   local broad_edges retired
-  broad_edges=$(grep -c -F "EXIT_TASK_BROAD_ENTER" "$log" || true)
+  broad_edges=$(grep -a -c -F "EXIT_TASK_BROAD_ENTER" "$log" || true)
   [[ "$broad_edges" == "0" ]] \
     || die "RUN_B the dying server's NR 16 still reached the terminal broad dispatcher ($broad_edges)"
-  retired=$(grep -m1 -F "EXIT_TASK_CLAIM_RETIRED tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID} " "$log" || true)
+  retired=$(grep -a -m1 -F "EXIT_TASK_CLAIM_RETIRED tid=${SD_SERVER_TID} asid=${SD_SERVER_ASID} " "$log" || true)
   [[ -n "$retired" ]] || die "RUN_B no retired exit claim for the witnessed server"
   case "$retired" in
     *"server_death=1"*) ;;
@@ -339,13 +343,13 @@ serverdies_run_b_live_cell() {
   # Forbidden markers.
   while read -r line; do
     [[ -z "$line" ]] && continue
-    grep -qF "$line" "$log" && die "RUN_B forbidden marker present: $line"
+    grep -a -qF "$line" "$log" && die "RUN_B forbidden marker present: $line"
   done < <(serverdies_forbidden_markers)
 
   # Exactly one caller wake, one terminal winner.
   local wakes winners
-  wakes=$(grep -c "IPC_SERVER_DEATH_CALLER_ENQUEUED" "$log" || true)
-  winners=$(grep -c "IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won" "$log" || true)
+  wakes=$(grep -a -c "IPC_SERVER_DEATH_CALLER_ENQUEUED" "$log" || true)
+  winners=$(grep -a -c "IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won" "$log" || true)
   [[ "$wakes" == "1" ]] || die "RUN_B expected exactly one caller enqueue, saw $wakes"
   [[ "$winners" == "1" ]] || die "RUN_B expected exactly one PeerDeath winner, saw $winners"
   note "RUN_B caller_wakes=$wakes peer_death_winners=$winners"

@@ -247,7 +247,7 @@ fn required_chain_is_scoped_to_the_witnessed_transaction() {
     // so counting zero is meaningful), and the retired claim attests the server-death handoff.
     assert!(
         SYSCALL.contains("\"EXIT_TASK_BROAD_ENTER tid={} asid={} result=ok\"")
-            && COMMON.contains("broad_edges=$(grep -c -F \"EXIT_TASK_BROAD_ENTER\" \"$log\"")
+            && COMMON.contains("broad_edges=$(grep -a -c -F \"EXIT_TASK_BROAD_ENTER\" \"$log\"")
             && COMMON.contains("[[ \"$broad_edges\" == \"0\" ]]"),
         "the dying server's NR 16 must be shown never to reach the broad dispatcher"
     );
