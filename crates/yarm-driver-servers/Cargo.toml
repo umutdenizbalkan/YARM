@@ -43,6 +43,7 @@ futex-wait-nonblock-probe = []
 # carry none of its literals and are byte-identical to a build without it, so every other slot-5
 # profile keeps the headroom it had.
 timer5-idle-return-witness = []
+riscv-uart-irq-witness = []
 recv-queue1-ordinary-grant = []
 # Stage 200D-0D1: the RISC-V sibling, an UNUSED pass-through for the same reason — one
 # BOOTSTRAP_FEATURE_ARGS is applied to every server package. No oracle code compiles here.

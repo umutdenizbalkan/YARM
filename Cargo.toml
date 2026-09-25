@@ -128,6 +128,13 @@ futex-wait-nonblock-probe = []
 # carry none of its literals and are byte-identical to a build without it, so every other slot-5
 # profile keeps the headroom it had.
 timer5-idle-return-witness = []
+# QEMU-IRQ1: the first real external-interrupt witness — RISC-V UART0 -> PLIC -> YARM on QEMU
+# virt. Compiles the kernel-only device window install, the idle-origin supervisor-external
+# admission, the UART setup/drain fixture, the provisioning of init's notification + ring page, the
+# NR 5 non-blocking notification-receive arm, and init's receiver cell. A build without it maps no
+# device, enables no source, admits no S-mode external interrupt and keeps NR 5 endpoint-only.
+# Accepted and inert outside the kernel and yarm-control-plane-servers.
+riscv-uart-irq-witness = []
 # U9-RECV-QUEUE1 §3: the queued shared-region grant taken by the ORDINARY receive syscalls
 # (NR 2 and NR 5) rather than by NR 30. A cargo feature and not only a runtime selector, for the
 # same reason the send-fault cell is one: init's address space runs at `MAX_MAPPINGS` and its

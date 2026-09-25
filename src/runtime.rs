@@ -10158,6 +10158,18 @@ impl SharedKernel {
         let snapshot = match self.resolve_endpoint_recv_cap_split_read(requester_tid, recv_cap) {
             Ok(snapshot) => snapshot,
             Err(e) => {
+                // QEMU-IRQ1 §3 — witness builds only: a NON-BLOCKING probe on a notification the
+                // caller may receive from. Every other shape keeps the endpoint-only answer.
+                #[cfg(feature = "riscv-uart-irq-witness")]
+                if matches!(e, crate::kernel::boot::KernelError::WrongObject) && timeout_ticks == 0
+                {
+                    if let Some(answer) =
+                        self.witness_notification_probe_into_frame(cpu, frame, requester_tid)
+                    {
+                        consume_preread_deadline(cpu);
+                        return I::Answered(answer);
+                    }
+                }
                 consume_preread_deadline(cpu);
                 return I::Answered(Err(TrapHandleError::Syscall(
                     crate::kernel::syscall::SyscallError::from(e),
@@ -10303,6 +10315,130 @@ impl SharedKernel {
                 I::Answered(self.complete_recv_boundary_shared_region(cpu, frame, &pending))
             }
         }
+    }
+
+    /// QEMU-IRQ1 §3 — the witness build's NON-BLOCKING NR 5 on a NOTIFICATION capability.
+    ///
+    /// # Why this exists, and why only here
+    ///
+    /// Userspace has had no way to receive from a notification: the canonical receive handlers
+    /// validate the capability with `validate_endpoint_right`, which answers `WrongObject` for
+    /// anything but an endpoint, and the split resolver mirrors that. The kernel-side notification
+    /// receive (`NotificationObject::recv`) and the IRQ route that signals it both exist; only the
+    /// door between them and a user receiver did not. The witness needs a receiver-observable
+    /// completion through that existing object, so it opens the smallest door there is — a
+    /// non-blocking take, for a user receiver with a recv-v2 metadata target, compiled only with
+    /// `riscv-uart-irq-witness`. Without the feature NR 5 is byte-identical and endpoint-only; the
+    /// ABI of an ordinary build does not change.
+    ///
+    /// # What it reuses
+    ///
+    /// The take is `NotificationObject::recv` under the IPC domain with the capability's
+    /// generation re-checked in the same acquisition. The answer is written by the SAME user-copy
+    /// completion the endpoint probe uses (`complete_recv_boundary_user_copy` over a
+    /// `user_memory_v2_plan`), and an empty notification is answered with the SAME empty-probe
+    /// encoding (`WouldBlock` in the error lane, no-transfer sentinel in the cap lane).
+    ///
+    /// Returns `None` when the capability is not a notification at all, so the caller answers the
+    /// endpoint resolver's own `WrongObject` exactly as before.
+    #[cfg(feature = "riscv-uart-irq-witness")]
+    fn witness_notification_probe_into_frame(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        requester_tid: u64,
+    ) -> Option<Result<(), TrapHandleError>> {
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::recv_core::{RecvMetaTarget, RecvRequest};
+        use crate::kernel::syscall::{
+            IPC_RECV_META_V2_ENCODED_LEN, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD1,
+            SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP, SyscallError,
+        };
+        let recv_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+        let state = self.state.data_ptr();
+        let pid = unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }?;
+        let object = match unsafe {
+            KernelState::resolve_notification_recv_cap_in_pid_from_raw(
+                state as *const _,
+                pid,
+                recv_cap,
+            )
+        } {
+            Ok(object) => object,
+            Err(crate::kernel::boot::KernelError::WrongObject) => return None,
+            Err(e) => {
+                return Some(Err(TrapHandleError::Syscall(SyscallError::from(e))));
+            }
+        };
+        let CapObject::Notification { index, generation } = object else {
+            return None;
+        };
+        // The narrow shape: a USER receiver that asked for recv-v2 metadata. Anything else is not
+        // served, and gets the endpoint-only answer it always got.
+        let asid = self.task_asid_option_split_read(requester_tid)?;
+        let meta_ptr = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1);
+        let meta_len = frame.arg(SYSCALL_ARG_TRANSFER_CAP);
+        if meta_ptr == 0 || meta_len < IPC_RECV_META_V2_ENCODED_LEN {
+            return None;
+        }
+        let mut request = RecvRequest::from_ipc_recv_timeout(
+            requester_tid,
+            recv_cap,
+            frame.arg(SYSCALL_ARG_PTR),
+            frame.arg(SYSCALL_ARG_LEN),
+            0,
+            None,
+            false,
+        );
+        request.meta_target = RecvMetaTarget::V2 {
+            ptr: meta_ptr,
+            len: meta_len,
+        };
+        // Rank 3, ONE acquisition: the object must still be the one the capability names.
+        let taken = self.with_ipc_split_mut(|ipc| {
+            if ipc.notification_generations.get(index).copied() != Some(generation) {
+                return Err(crate::kernel::boot::KernelError::StaleCapability);
+            }
+            match ipc.notifications.get_mut(index).and_then(|n| n.as_mut()) {
+                Some(notification) => Ok(notification.recv()),
+                None => Err(crate::kernel::boot::KernelError::WrongObject),
+            }
+        });
+        let msg = match taken {
+            Err(e) => return Some(Err(TrapHandleError::Syscall(SyscallError::from(e)))),
+            Ok(None) => {
+                frame.set_err(SyscallError::WouldBlock.code());
+                if crate::kernel::syscall::recv_boundary_encode_transfer_cap_ret(frame, None)
+                    .is_err()
+                {
+                    return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+                }
+                return Some(Ok(()));
+            }
+            Ok(Some(msg)) => msg,
+        };
+        crate::yarm_log!(
+            "IRQ1_NOTIFICATION_PROBE_DELIVERED tid={} notification={} generation={} label={}",
+            requester_tid,
+            index,
+            generation,
+            msg.opcode
+        );
+        if crate::kernel::syscall::recv_boundary_encode_transfer_cap_ret(frame, None).is_err() {
+            return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+        }
+        let writeback =
+            crate::kernel::recv_core::user_memory_v2_plan(&request, msg.sender_tid.0 as usize);
+        let pending = crate::kernel::recv_core::RecvBoundaryUserCopySnapshot {
+            asid: Some(asid),
+            receiver_tid: requester_tid,
+            msg,
+            writeback,
+            materialized_cap: None,
+            is_reply_cap: false,
+            reply_record: None,
+        };
+        Some(self.complete_recv_boundary_user_copy(cpu, frame, &pending))
     }
 
     pub fn try_split_ipc_recv_queued_plain_into_frame(

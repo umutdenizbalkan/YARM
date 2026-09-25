@@ -12,6 +12,8 @@ pub mod sbi;
 pub mod syscall_abi;
 pub mod timer;
 pub mod trap;
+#[cfg(all(feature = "riscv-uart-irq-witness", not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub mod uart_irq_witness;
 pub mod user_status;
 pub mod vm_layout;
 

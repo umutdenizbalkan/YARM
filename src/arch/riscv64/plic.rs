@@ -105,18 +105,28 @@ pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
     // module-local atomics only; no MMIO is performed.
     irq::configure_plic_from_platform_layout();
 
+    // QEMU-IRQ1 §2 — MAPPINGS FIRST. With the witness compiled in, the kernel-only device window
+    // is built here, before any readiness is derived and before any controller register is
+    // written, and every existing root is pointed at it. Without the feature nothing is mapped,
+    // and the readiness below reports that from the page tables themselves.
+    #[cfg(all(feature = "riscv-uart-irq-witness", not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    super::uart_irq_witness::install_device_window_at_safe_point();
+
     // U9-IRQ-FINAL §1 — report, on the real boot, what the claim owner would answer.
     //
     // This is a pure DERIVATION: it reads no MMIO. It records whether the claim/complete
     // register for this context is reachable under the address space a trap would be taken in,
     // which is the fact the claim path refuses on. Emitting it here is what turns "no claim can
     // be read on this platform" from a comment into a measured line on every RISC-V boot.
+    //
+    // QEMU-IRQ1 §2 — the answer now comes from WALKING the active translation (`satp` → root →
+    // L1 → L0 leaf) with the same rule the claim owner applies, not from a static range test.
     let claim_addr = base
         + PLIC_CONTEXT_BASE_OFFSET
         + (context * PLIC_CONTEXT_STRIDE)
         + PLIC_CLAIM_COMPLETE_REGISTER_OFFSET;
     let claim_reachable =
-        addr_range_covered_by_kernel_shared_mapping(claim_addr, core::mem::size_of::<u32>());
+        mmio_va_under_active_satp(claim_addr, core::mem::size_of::<u32>()).is_some();
     emit_marker(format_args!(
         "RISCV_EXTIRQ_CLAIM_READINESS context={} addr=0x{:x} configured=1 reachable={} reason={}",
         context,
@@ -129,25 +139,46 @@ pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
         }
     ));
 
-    let threshold_addr = base + PLIC_CONTEXT_BASE_OFFSET + (context * PLIC_CONTEXT_STRIDE);
-    if addr_range_covered_by_kernel_shared_mapping(threshold_addr, core::mem::size_of::<u32>()) {
-        write_plic_threshold(base, context, 0u32);
+    let threshold_pa = base + PLIC_CONTEXT_BASE_OFFSET + (context * PLIC_CONTEXT_STRIDE);
+    let threshold_ready = match mmio_va_under_active_satp(threshold_pa, core::mem::size_of::<u32>())
+    {
+        Some(threshold_addr) => {
+            write_plic_threshold(threshold_addr, 0u32);
+            emit_marker(format_args!(
+                "RISCV_PLIC_THRESHOLD_SET context={} value={}",
+                context, 0u32
+            ));
+            emit_marker(format_args!("RISCV_PLIC_INIT_DONE"));
+            true
+        }
+        None => {
+            // `init_plic_after_idle_safe_point` only ever runs from the idle-trap path, under a
+            // user root. Unless the device window was installed above, that root maps nothing
+            // but the kernel-shared gigapage (RAM only), so the threshold write would fault; skip
+            // it and report the exact reason instead of crashing.
+            emit_marker(format_args!(
+                "RISCV_PLIC_DEFERRED reason={}",
+                DEFER_REASON_MMIO_UNMAPPED
+            ));
+            false
+        }
+    };
+
+    // QEMU-IRQ1 §2 — with the witness compiled in, the one DTB-identified source is handed to
+    // the witness owner, which re-derives every precondition (mappings, claim readiness, a bound
+    // route) and only then configures the controller, enables the source and admits the CPU
+    // interrupt, in that order. It reports its own enable or its own deferral.
+    #[cfg(all(feature = "riscv-uart-irq-witness", not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    {
         emit_marker(format_args!(
-            "RISCV_PLIC_THRESHOLD_SET context={} value={}",
-            context, 0u32
+            "RISCV_EXTIRQ_SELECT source={} reason=uart0_witness_feature",
+            QEMU_VIRT_UART0_SOURCE_ID
         ));
-        emit_marker(format_args!("RISCV_PLIC_INIT_DONE"));
-    } else {
-        // `init_plic_after_idle_safe_point` only ever runs from the
-        // idle-trap path, by which point the active `satp` maps nothing
-        // but the kernel-shared gigapage (RAM only). The PLIC's physical
-        // MMIO window is never covered by that mapping, so the threshold
-        // write would fault; skip it and report the exact reason instead
-        // of crashing.
-        emit_marker(format_args!(
-            "RISCV_PLIC_DEFERRED reason={}",
-            DEFER_REASON_MMIO_UNMAPPED
-        ));
+        let _ = threshold_ready;
+        return super::uart_irq_witness::enable_source_after_plic_ready(
+            claim_reachable,
+            QEMU_VIRT_UART0_SOURCE_ID,
+        );
     }
 
     // External-IRQ enable is deferred: we emit the explicit select +
@@ -155,15 +186,19 @@ pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
     // we considered and the exact reason it was not enabled. The
     // claim/complete path in `super::irq` is wired but no source is
     // enabled, so no IRQ can be claimed without an explicit follow-up.
-    emit_marker(format_args!(
-        "RISCV_EXTIRQ_SELECT source={} reason=uart0_is_safe_candidate_but_handler_not_ready",
-        QEMU_VIRT_UART0_SOURCE_ID
-    ));
-    emit_marker(format_args!(
-        "RISCV_EXTIRQ_DEFERRED reason={}",
-        DEFER_REASON_NO_SAFE_SOURCE
-    ));
-    Some(DEFER_REASON_NO_SAFE_SOURCE)
+    #[cfg(not(all(feature = "riscv-uart-irq-witness", not(feature = "hosted-dev"), target_arch = "riscv64")))]
+    {
+        let _ = threshold_ready;
+        emit_marker(format_args!(
+            "RISCV_EXTIRQ_SELECT source={} reason=uart0_is_safe_candidate_but_handler_not_ready",
+            QEMU_VIRT_UART0_SOURCE_ID
+        ));
+        emit_marker(format_args!(
+            "RISCV_EXTIRQ_DEFERRED reason={}",
+            DEFER_REASON_NO_SAFE_SOURCE
+        ));
+        Some(DEFER_REASON_NO_SAFE_SOURCE)
+    }
 }
 
 /// Returns `(plic_base, source_tag)`. Prefers the DTB-discovered base
@@ -178,23 +213,63 @@ fn resolve_plic_base() -> (usize, &'static str) {
     (platform_layout::PLIC_MMIO_BASE, "qemu_virt_fallback")
 }
 
-/// U9-IRQ-FINAL §1 — the same reachability question the PLIC claim must ask.
+/// U9-IRQ-FINAL §1 / QEMU-IRQ1 §2 — the reachability question the PLIC claim must ask, and the
+/// address it may then use.
 ///
 /// The claim/complete register is read in S-mode under whatever address space was active when
-/// the trap was taken. That is a user ASID, whose only kernel mapping is the shared gigapage at
-/// `RISCV_KERNEL_SHARED_BASE`; the PLIC window sits below RAM and is never covered by it. An
-/// unreachable claim register is therefore the ORDINARY state on this platform, and naming it is
-/// what lets the claim refuse instead of faulting into `trap_from_s_mode`.
+/// the trap was taken: a user root, or — at the idle `wfi` — the last root installed. The answer
+/// is `Some(va)` only when WALKING that translation reaches a kernel-only, read/write leaf for
+/// exactly this register's page, through the device window every root carries once it has been
+/// installed (`page_table::install_device_window`). Before that, and on every build without the
+/// witness, the walk ends at an empty root slot and the answer is `None`.
 ///
-/// Returns true if the inclusive byte range `[addr, addr+len)` falls
-/// entirely within the single kernel-shared gigapage that
-/// `map_kernel_shared_into_asid` installs into every user ASID's page
-/// table. A PLIC MMIO write is only safe to perform under the active
-/// `satp` if its physical address is covered by that mapping.
-pub fn mmio_range_reachable_under_active_satp(addr: usize, len: usize) -> bool {
-    addr_range_covered_by_kernel_shared_mapping(addr, len)
+/// The device is never touched to find out whether it can be touched.
+pub fn mmio_va_under_active_satp(addr: usize, len: usize) -> Option<usize> {
+    super::page_table::device_pa_reachable_under_active_satp(addr as u64, len as u64)
+        .map(|va| va as usize)
 }
 
+/// `true` iff [`mmio_va_under_active_satp`] would hand back an address.
+pub fn mmio_range_reachable_under_active_satp(addr: usize, len: usize) -> bool {
+    mmio_va_under_active_satp(addr, len).is_some()
+}
+
+/// Supervisor external interrupt cause code (`scause` low bits, with the interrupt bit set).
+pub const IRQ_SUPERVISOR_EXTERNAL_CODE: usize = 9;
+
+/// QEMU-IRQ1 §2 — the SECOND S-mode trap the bridge may admit, and only with the witness compiled
+/// in: a supervisor EXTERNAL interrupt taken at the audited kernel-idle boundary.
+///
+/// The conditions mirror the timer's own admission and add one:
+/// * `scause` carries the interrupt bit and names the supervisor external interrupt — so no
+///   exception (a supervisor page fault is scause 12/13/15 with the interrupt bit clear) can ever
+///   satisfy it;
+/// * `SPP` says Supervisor;
+/// * the idle-boundary latch is armed — the only S-mode code interruptible with `SIE` set is the
+///   idle `wfi` loop, and the latch is what makes that a checked precondition;
+/// * a source has actually been enabled by the witness owner. With none enabled, the controller
+///   has no legitimate producer for this context and the trap stays fail-closed.
+pub fn is_accepted_s_mode_external_trap(
+    scause: usize,
+    sstatus: usize,
+    boundary_armed: bool,
+    source_enabled: bool,
+) -> bool {
+    const INTERRUPT_BIT: usize = 1usize << (usize::BITS - 1);
+    const SPP_BIT: usize = 1usize << 8;
+    let is_interrupt = (scause & INTERRUPT_BIT) != 0;
+    let code = scause & !INTERRUPT_BIT;
+    let from_supervisor = (sstatus & SPP_BIT) != 0;
+    is_interrupt
+        && code == IRQ_SUPERVISOR_EXTERNAL_CODE
+        && from_supervisor
+        && boundary_armed
+        && source_enabled
+}
+
+/// The static answer the readiness rule used to be: whether `[addr, addr+len)` falls within the
+/// RAM gigapage. Kept for the pinned platform facts below — it is no longer a readiness rule.
+#[cfg(test)]
 fn addr_range_covered_by_kernel_shared_mapping(addr: usize, len: usize) -> bool {
     let start = addr as u64;
     let end = start.saturating_add(len as u64);
@@ -202,22 +277,18 @@ fn addr_range_covered_by_kernel_shared_mapping(addr: usize, len: usize) -> bool 
         && end <= super::page_table::RISCV_KERNEL_SHARED_END
 }
 
-/// Writes the PLIC S-mode threshold register for `context`. Threshold
-/// `value=0` accepts every priority level >= 1 (the QEMU virt default
-/// is `value=0`; we set it explicitly so the boot ordering is
-/// deterministic). Callers must first confirm the target address is
-/// covered by the active mapping via
-/// `addr_range_covered_by_kernel_shared_mapping`.
+/// Writes the PLIC S-mode threshold register at `threshold_addr`, the device-window address the
+/// readiness walk returned for it. Threshold `value=0` accepts every priority level >= 1 (the
+/// QEMU virt default is `value=0`; we set it explicitly so the boot ordering is deterministic).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn write_plic_threshold(base: usize, context: usize, value: u32) {
-    let threshold_addr = base + PLIC_CONTEXT_BASE_OFFSET + (context * PLIC_CONTEXT_STRIDE);
+fn write_plic_threshold(threshold_addr: usize, value: u32) {
     unsafe {
         core::ptr::write_volatile(threshold_addr as *mut u32, value);
     }
 }
 
 #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
-fn write_plic_threshold(_base: usize, _context: usize, _value: u32) {}
+fn write_plic_threshold(_threshold_addr: usize, _value: u32) {}
 
 pub fn init_fired() -> bool {
     PLIC_INIT_FIRED.load(Ordering::Relaxed)
@@ -311,6 +382,37 @@ mod tests {
             platform_layout::PLIC_MMIO_BASE,
             4
         ));
+    }
+
+    /// QEMU-IRQ1 §2 — the idle-origin external admission is narrow: every one of its five
+    /// conditions is required, and no exception can satisfy it whatever SPP or the latches say.
+    #[test]
+    fn idle_origin_external_admission_requires_all_five_conditions() {
+        const INT: usize = 1usize << 63;
+        const SPP: usize = 1 << 8;
+        assert!(is_accepted_s_mode_external_trap(INT | 9, SPP, true, true));
+        assert!(!is_accepted_s_mode_external_trap(9, SPP, true, true), "not an interrupt");
+        assert!(!is_accepted_s_mode_external_trap(INT | 5, SPP, true, true), "timer, not external");
+        assert!(!is_accepted_s_mode_external_trap(INT | 1, SPP, true, true), "software interrupt");
+        assert!(!is_accepted_s_mode_external_trap(INT | 9, 0, true, true), "taken from U-mode");
+        assert!(!is_accepted_s_mode_external_trap(INT | 9, SPP, false, true), "boundary not armed");
+        assert!(!is_accepted_s_mode_external_trap(INT | 9, SPP, true, false), "no source enabled");
+        for fault in [12usize, 13, 15, 2, 5, 7, 8, 9] {
+            assert!(
+                !is_accepted_s_mode_external_trap(fault, SPP, true, true),
+                "exception {fault} must never be admitted from S-mode"
+            );
+        }
+    }
+
+    /// QEMU-IRQ1 §2 — readiness comes from the page tables: off target there is no live
+    /// translation to walk, so the claim register is never reported reachable, and the PLIC
+    /// window is still outside the RAM gigapage.
+    #[test]
+    fn readiness_is_not_a_flag_off_target() {
+        let claim = platform_layout::PLIC_MMIO_BASE + PLIC_CONTEXT_BASE_OFFSET + PLIC_CONTEXT_STRIDE + 4;
+        assert_eq!(mmio_va_under_active_satp(claim, 4), None);
+        assert!(!mmio_range_reachable_under_active_satp(claim, 4));
     }
 
     #[test]

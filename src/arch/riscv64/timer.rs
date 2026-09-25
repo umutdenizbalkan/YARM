@@ -328,29 +328,62 @@ fn arm_periodic_timer_for_user_delivery() -> Option<&'static str> {
 ///
 /// `arm_timer_at_boot_safe_point` arms the timer once, at boot, and enables U-origin delivery
 /// only. Every arrival here comes from a trap handler, where hardware has cleared `sstatus.SIE` —
-/// so without this the idle `wfi` would loop with interrupts masked and the pending timer would
-/// never be taken. That is exactly why the timer previously stopped as soon as anything was
+/// so without an unmask the idle `wfi` would loop with interrupts masked and the pending timer
+/// would never be taken. That is exactly why the timer previously stopped as soon as anything was
 /// dispatched out of idle.
 ///
-/// This does NOT widen where interrupts are enabled: it is the same single audited boundary, whose
-/// invariant is that the only S-mode code interruptible with `SIE` set is `riscv_trap_halt`'s `wfi`
-/// loop. It is a strict no-op until the boot arm has actually enabled `sie.STIE`.
+/// The invariant this boundary exists for: the only S-mode code interruptible with `SIE` set is
+/// the idle `wfi` loop, which keeps nothing live across the `wfi`, so an accepted S-mode trap may
+/// run on the trap stack from its top and overlay every frame beneath it.
+///
+/// QEMU-IRQ1 §2 — that invariant used to be stated here and not held. This function set `SIE`
+/// itself, and then returned: through its own epilogue, back into the trap bridge's frame, into
+/// `riscv_trap_halt`'s prologue and its marker print — all stack-using code, all interruptible,
+/// all sitting in frames a nested S-mode trap starting at the trap-stack top overwrites. The UART
+/// witness hit it on its fifth item (an idle-origin interrupt taken at `sepc` inside that window,
+/// then a return through a clobbered frame to a garbage PC); the timer was exposed to the same
+/// window at a lower rate. So this function now only REQUESTS the unmask, as its last step, and
+/// the one program point that sets `SIE` is [`halt_wait_loop`]'s asm `wfi` loop, which uses no
+/// stack at all.
+///
+/// Order is load-bearing and unchanged: point `sscratch` at the true trap-stack top (the vector's
+/// first act is `csrrw sp, sscratch, sp`, so this decides where an S-mode frame lands), THEN arm
+/// the latch so the bridge can check the origin rather than assume it, and only THEN request the
+/// unmask. It is a strict no-op until the boot arm has actually enabled `sie.STIE`.
 pub fn reestablish_idle_boundary() {
     if !stie_enabled() {
         return;
     }
-    // Canonical 199E: this boundary now OWNS the S-origin admission contract end to end. The
-    // boot arm deliberately does not touch either of these — it enables U-origin delivery only —
-    // so the latch and `sstatus.SIE` are established here, together, on every arrival.
-    //
-    // Order is load-bearing and unchanged: point `sscratch` at the true trap-stack top (the
-    // vector's first act is `csrrw sp, sscratch, sp`, so this decides where an S-mode frame
-    // lands), THEN arm the latch so the bridge can check the origin rather than assume it, and
-    // only THEN unmask. Both writes are idempotent, so repeated arrivals cost nothing.
     set_sscratch_to_trap_stack_top();
     arm_s_mode_timer_boundary();
-    set_sstatus_sie();
-    mark_sie_enabled();
+    request_idle_unmask();
+}
+
+/// Set by [`reestablish_idle_boundary`] as its last step and consumed by [`halt_wait_loop`], the
+/// next thing the idle arrival executes. A fatal halt never follows a request, so it waits masked.
+static IDLE_UNMASK_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn request_idle_unmask() {
+    IDLE_UNMASK_REQUESTED.store(true, Ordering::Release);
+}
+
+/// The halt primitive's wait, entered by `riscv_trap_halt` once its marker is written.
+///
+/// An idle arrival that requested the unmask waits with `SIE` set by [`set_sstatus_sie_in_wfi_loop`];
+/// every other halt (a fatal one) waits masked, exactly as before.
+pub fn halt_wait_loop() -> ! {
+    if IDLE_UNMASK_REQUESTED.swap(false, Ordering::AcqRel) {
+        mark_sie_enabled();
+        set_sstatus_sie_in_wfi_loop();
+    }
+    loop {
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        }
+        #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+        core::hint::spin_loop();
+    }
 }
 
 /// Returns true iff the current hart is the OpenSBI-released boot hart.
@@ -463,19 +496,32 @@ fn set_sie_stie() {
     }
 }
 
-/// Sets the supervisor interrupt enable bit (`sstatus.SIE`, bit 1).
-/// Must be set AFTER `sie.STIE` and after the trap vector and kernel
-/// state pointer are installed.
-fn set_sstatus_sie() {
+/// THE ONE program point that sets the supervisor interrupt enable bit (`sstatus.SIE`, bit 1).
+///
+/// It is the idle wait itself: `SIE` is set and `wfi` executed in one asm sequence that jumps back
+/// to itself and touches no stack, so there is no instruction at which an accepted S-mode trap
+/// could interrupt a frame it will then overwrite. A trap taken here returns (S-mode return path)
+/// straight back into this loop with `SIE` restored from `SPIE`; a trap that dispatches a task
+/// leaves the loop for good.
+///
+/// Must run AFTER `sie.STIE`, the trap vector, the kernel state pointer, `sscratch` and the
+/// boundary latch — which is why only [`halt_wait_loop`] calls it, and only on a request from
+/// [`reestablish_idle_boundary`].
+fn set_sstatus_sie_in_wfi_loop() -> ! {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-    {
-        unsafe {
-            core::arch::asm!(
-                "csrrs zero, sstatus, {0}",
-                in(reg) 1usize << 1,
-                options(nostack, nomem, preserves_flags)
-            );
-        }
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "csrrs zero, sstatus, {sie}",
+            "wfi",
+            "j 2b",
+            sie = in(reg) 1usize << 1,
+            options(noreturn, nomem, nostack)
+        );
+    }
+    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+    loop {
+        core::hint::spin_loop();
     }
 }
 
@@ -630,11 +676,14 @@ mod tests {
             .find("set_sscratch_to_trap_stack_top();")
             .expect("sscratch");
         let latch = body.find("arm_s_mode_timer_boundary();").expect("latch");
-        let sie = body.find("set_sstatus_sie();").expect("sie");
+        let sie = body.find("request_idle_unmask();").expect("the unmask request");
         assert!(
             scratch < latch && latch < sie,
             "order must be sscratch -> latch -> unmask"
         );
+        // QEMU-IRQ1 §2 — the boundary REQUESTS the unmask; it never sets SIE and then returns
+        // through stack-using code.
+        assert!(!body.contains("set_sstatus_sie"), "the boundary itself must not unmask");
         assert!(
             body.contains("if !stie_enabled() {"),
             "a boundary arrival before the boot arm must be a no-op"

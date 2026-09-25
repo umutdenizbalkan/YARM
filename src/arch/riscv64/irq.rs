@@ -144,7 +144,13 @@ pub fn external_irq_eoi(irq_line: u16) {
     let base = PLIC_MMIO_BASE.load(Ordering::Relaxed);
     let context_index = PLIC_CONTEXT_INDEX.load(Ordering::Relaxed);
     let complete_addr = plic_claim_complete_addr(base, context_index);
-    plic_write_complete(complete_addr, irq_line);
+    // QEMU-IRQ1 §2 — the controller is reached through the kernel-only device window, never at
+    // its physical address, which no root maps. No window, no write: storing to the physical
+    // address is exactly the supervisor store fault this refusal exists to avoid.
+    let Some(va) = super::page_table::device_window_va(complete_addr as u64) else {
+        return;
+    };
+    plic_write_complete(va as usize, irq_line);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "riscv64")))]
@@ -201,17 +207,39 @@ pub(crate) fn configured_context() -> Option<PlicContext> {
 }
 
 /// THE destructive claim read. One caller, in the policy owner.
+///
+/// QEMU-IRQ1 §2 — `va` is the device-window address the policy owner's readiness walk returned
+/// for this context's claim register under the ACTIVE translation. It is never the physical
+/// address, which no root maps.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-pub(crate) fn read_claim_register(context: PlicContext) -> u32 {
-    unsafe { core::ptr::read_volatile(claim_complete_register(context) as *const u32) }
+pub(crate) fn read_claim_register_at(va: usize) -> u32 {
+    unsafe { core::ptr::read_volatile(va as *const u32) }
 }
 
 /// THE completion write. One caller, in the policy owner.
+///
+/// QEMU-IRQ1 §2 — written through the device window, at the address the window's layout gives
+/// the claim register. This is a translation, not a second readiness test: the claim this
+/// completion answers was read through the same window page a moment ago, and the window is never
+/// torn down. A missing translation therefore means no claim could have been read, and the write
+/// is refused with a marker rather than aimed at the unmapped physical address.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub(crate) fn write_claim_completion(context: PlicContext, source: u32) {
+    let pa = claim_complete_register(context);
+    let Some(va) = super::page_table::device_window_va(pa as u64) else {
+        crate::yarm_log!(
+            "IRQFINAL_RISCV_COMPLETION_UNTRANSLATABLE source={} context={} pa=0x{:x} written=0",
+            source,
+            context.context_index,
+            pa
+        );
+        return;
+    };
     unsafe {
-        write_volatile(claim_complete_register(context) as *mut u32, source);
+        write_volatile(va as *mut u32, source);
     }
+    #[cfg(feature = "riscv-uart-irq-witness")]
+    super::uart_irq_witness::note_completion_written(source, context.context_index);
 }
 
 /// 199E-R1 — the SINGLE RISC-V timer re-arm point.

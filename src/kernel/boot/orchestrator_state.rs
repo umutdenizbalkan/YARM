@@ -2611,6 +2611,44 @@ impl KernelState {
         Ok((capability_obj.object, capability_obj.rights()))
     }
 
+    /// QEMU-IRQ1 §3 — NOTIFICATION sibling of `resolve_endpoint_recv_cap_in_pid_from_raw`, same
+    /// rank (4, `capability_state_lock` only) and same error mapping, for the witness build's
+    /// NR 5 non-blocking notification arm. Requires a `Notification` object carrying RECEIVE.
+    ///
+    /// # Safety
+    /// As `resolve_endpoint_recv_cap_in_pid_from_raw`.
+    #[cfg(feature = "riscv-uart-irq-witness")]
+    pub(crate) unsafe fn resolve_notification_recv_cap_in_pid_from_raw(
+        state: *const KernelState,
+        requester_pid: u64,
+        cap: CapId,
+    ) -> Result<CapObject, KernelError> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };
+        let _guard = lock_ref.lock();
+        let capability: &CapabilitySubsystem =
+            unsafe { &*core::ptr::addr_of!((*state).capability) };
+        let cnode = kernel_ref(&capability.process_cnodes)
+            .iter()
+            .flatten()
+            .find(|record| record.pid == requester_pid)
+            .map(|record| record.cnode)
+            .ok_or(KernelError::InvalidCapability)?;
+        let capability_obj = capability
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .find(|space| space.id == cnode)
+            .and_then(|space| kernel_ref(&space.cspace).get(cap))
+            .ok_or(KernelError::InvalidCapability)?;
+        if !matches!(capability_obj.object, CapObject::Notification { .. }) {
+            return Err(KernelError::WrongObject);
+        }
+        if !capability_obj.has_right(CapRights::RECEIVE) {
+            return Err(KernelError::MissingRight);
+        }
+        Ok(capability_obj.object)
+    }
+
     /// Stage 199A2B2D: SEND-side sibling of `resolve_endpoint_recv_cap_in_pid_from_raw`
     /// (rank 4, `capability_state_lock` only). Resolves `cap` in `requester_pid`'s
     /// cnode, requires a live `Endpoint` carrying `CapRights::SEND`, and returns the

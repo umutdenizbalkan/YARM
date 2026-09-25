@@ -506,6 +506,19 @@ fn settle_riscv_external_claim(
                 source,
                 context.context_index
             );
+            // QEMU-IRQ1 §3 — the witness fixture drains the device for THIS claim's source, before
+            // delivery and before the completion below, so a level-triggered line has dropped by
+            // the time the controller is told the claim is done. It reads nothing about the claim
+            // but its identity, and it neither delivers nor completes.
+            #[cfg(all(
+                feature = "riscv-uart-irq-witness",
+                not(feature = "hosted-dev"),
+                target_arch = "riscv64"
+            ))]
+            crate::arch::riscv64::uart_irq_witness::drain_before_delivery(
+                source,
+                context.context_index,
+            );
             let completion = crate::arch::hal_adapters::InterruptCompletion::PlicClaim {
                 source,
                 base: context.base,

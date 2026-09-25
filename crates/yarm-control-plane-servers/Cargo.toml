@@ -59,6 +59,7 @@ futex-wait-nonblock-probe = []
 # carry none of its literals and are byte-identical to a build without it, so every other slot-5
 # profile keeps the headroom it had.
 timer5-idle-return-witness = []
+riscv-uart-irq-witness = []
 recv-queue1-ordinary-grant = []
 
 [dependencies]

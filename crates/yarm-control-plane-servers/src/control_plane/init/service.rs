@@ -2124,6 +2124,15 @@ pub(super) mod timer5_idle_return_witness {
     }
 }
 
+/// QEMU-IRQ1 §3/§4 — the RISC-V UART external-interrupt witness receiver (selector 30).
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "riscv-uart-irq-witness",
+    target_arch = "riscv64"
+))]
+#[path = "uart_irq_witness.rs"]
+pub(super) mod uart_irq_witness;
+
 #[cfg(not(feature = "hosted-dev"))]
 pub(super) mod xfer2_grant_witness {
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -6492,6 +6501,16 @@ pub fn run() {
     #[cfg(not(feature = "hosted-dev"))]
     if xfer2_grant_witness::armed(ctx.supervisor_control_recv_ep) {
         xfer2_grant_witness::run_once();
+    }
+    // QEMU-IRQ1 §3: the RISC-V UART external-interrupt witness, selector 30. Mutually exclusive
+    // with every other slot-5 cell; compiled only with `riscv-uart-irq-witness`.
+    #[cfg(all(
+        not(feature = "hosted-dev"),
+        feature = "riscv-uart-irq-witness",
+        target_arch = "riscv64"
+    ))]
+    if uart_irq_witness::armed(ctx.supervisor_control_recv_ep) {
+        uart_irq_witness::run_once();
     }
     // U9-TIMER5 §3: the IDLE-BOUNDARY RETURN witness, selector 16. Mutually exclusive with every
     // other slot-5 cell, architecture-neutral, and default-off. ONE task: the shape needs the CPU

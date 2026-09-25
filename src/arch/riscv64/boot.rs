@@ -235,11 +235,22 @@ pub(crate) fn early_sbi_marker(args: core::fmt::Arguments<'_>) {
     };
     let _ = line.write_fmt(args);
     let text = core::str::from_utf8(&line.buf[..line.len]).unwrap_or("RISCV_EARLY_MARKER_UTF8_ERR");
+    // QEMU-IRQ1 §2 — the line lock is held with this hart's S-mode interrupts MASKED.
+    //
+    // The kernel-idle boundary enables `sstatus.SIE` before `riscv_trap_halt` prints its own
+    // marker, so that print is interruptible. An accepted S-mode interrupt (the idle timer, or the
+    // witness build's idle-origin external interrupt) landing while this lock is held would reach
+    // the handler's own marker and spin on the lock forever — a live hang the UART witness
+    // produced on its first idle-origin item, and one the timer was exposed to by the same window.
+    // Masking across the hold makes the print atomic with respect to this hart's interrupts; a
+    // pending interrupt is taken as soon as the previous `SIE` is restored.
+    let irq_state = crate::arch::riscv64::irq::irq_save();
     // Take the per-line UART lock so concurrent emitters from the boot hart
     // and HSM-started secondaries cannot interleave bytes mid-line.
     early_marker_lock_acquire();
     crate::arch::riscv64::console::write_line(text);
     early_marker_lock_release();
+    crate::arch::riscv64::irq::irq_restore(irq_state);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -679,7 +690,7 @@ pub(crate) fn install_riscv_trap_shared_kernel(shared: &'static crate::runtime::
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn trap_shared_kernel_riscv() -> Option<&'static crate::runtime::SharedKernel> {
+pub(crate) fn trap_shared_kernel_riscv() -> Option<&'static crate::runtime::SharedKernel> {
     let ptr = RISCV_TRAP_SHARED_KERNEL_PTR.load(core::sync::atomic::Ordering::SeqCst);
     if ptr.is_null() {
         None
@@ -896,6 +907,22 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         ) {
             return riscv_s_mode_timer_trap(shared, cpu, frame, sepc, sstatus);
         }
+        // ── QEMU-IRQ1 §2: the SECOND accepted S-mode trap, witness builds only ──────────────
+        //
+        // A supervisor EXTERNAL interrupt taken at the same audited kernel-idle boundary, and only
+        // once the witness owner has enabled a source. The predicate requires the interrupt bit,
+        // so no supervisor exception can ever pass it; it requires SPP = Supervisor and the armed
+        // idle latch, exactly as the timer's does. Everything else still falls through to the
+        // fail-closed halt below.
+        #[cfg(feature = "riscv-uart-irq-witness")]
+        if crate::arch::riscv64::plic::is_accepted_s_mode_external_trap(
+            scause,
+            sstatus,
+            crate::arch::riscv64::timer::s_mode_timer_boundary_armed(),
+            crate::arch::riscv64::uart_irq_witness::external_admission_armed(),
+        ) {
+            riscv_s_mode_external_trap(shared, cpu, frame, sepc);
+        }
         // The trap was taken from S-mode — kernel fault. We have no fallback
         // path; report and halt with the named step so the user sees the
         // exact failure point rather than a silent loop.
@@ -992,6 +1019,10 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             entering_tid,
             claim.marker()
         );
+        #[cfg(feature = "riscv-uart-irq-witness")]
+        if claim.in_flight().is_some() {
+            crate::arch::riscv64::uart_irq_witness::note_claim_origin(false, sepc, entering_tid);
+        }
         Some(claim)
     } else {
         None
@@ -1760,9 +1791,86 @@ fn riscv_s_mode_timer_trap(
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn riscv_trap_halt(reason: &'static str) -> ! {
     early_marker!("RISCV_TRAP_HALTED reason={}", reason);
-    loop {
-        unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+    // QEMU-IRQ1 §2 — the marker above is written with `SIE` still clear. Only an idle arrival that
+    // re-established the boundary a moment ago waits with `SIE` set, and it is set inside the
+    // stack-free `wfi` loop itself; every other halt waits masked, as before.
+    crate::arch::riscv64::timer::halt_wait_loop()
+}
+
+/// QEMU-IRQ1 §2 — the idle-origin supervisor EXTERNAL interrupt, witness builds only.
+///
+/// Entered only from the bridge's S-mode screen, with
+/// [`crate::arch::riscv64::plic::is_accepted_s_mode_external_trap`] already satisfied: the hart
+/// was parked in `riscv_trap_halt`'s `wfi` loop, which keeps nothing live across the `wfi`, so the
+/// frame this handler overlays on the trap stack is already dead — the same argument the timer
+/// fast path rests on.
+///
+/// This is this origin's ENTRY OWNER, so the claim is read here, once, and carried. It then goes
+/// through `handle_riscv_trap_entry_shared` — the same wrapper, and so the same settlement
+/// (`settle_riscv_external_claim` → route → notification → completion), as a U-origin interrupt.
+///
+/// An external interrupt only ENQUEUES: the route never dispatches and publishes no placement.
+/// So the only outcome is "still idle", and the hart returns to its `wfi` with `SPP` and `SPIE`
+/// restored from the frame. A task the delivery made runnable is dispatched by the next idle
+/// tick's queue advance — progress is bounded by one tick, not stranded. A resumable current
+/// task here would mean the boundary was not idle, and is refused fail-closed rather than
+/// resumed through a context this path did not authenticate.
+#[cfg(all(
+    feature = "riscv-uart-irq-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "riscv64"
+))]
+fn riscv_s_mode_external_trap(
+    shared: &'static crate::runtime::SharedKernel,
+    cpu: crate::kernel::scheduler::CpuId,
+    frame: &mut RiscvTrapFrame,
+    sepc: usize,
+) -> ! {
+    use crate::arch::riscv64::trap::{RiscvTrapEntryOutcome, handle_riscv_trap_entry_shared};
+
+    // THE claim for this origin, read once, here.
+    let claim = crate::arch::external_irq_claim::claim_external_interrupt_once();
+    early_marker!(
+        "RISCV_EXTIRQ_CLAIM_READ tid=0 outcome={} claims=1 origin=idle",
+        claim.marker()
+    );
+    if claim.in_flight().is_some() {
+        crate::arch::riscv64::uart_irq_witness::note_claim_origin(true, sepc, 0);
+    }
+    let mut tframe = crate::kernel::trapframe::TrapFrame::zeroed();
+    tframe.set_saved_pc(sepc);
+    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {
+        scause: frame.scause as usize,
+        stval: frame.stval as usize,
+        external_claim: Some(claim),
+    };
+    let outcome = handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe);
+    let resume_tid = shared.current_tid_split_read(cpu).unwrap_or(0);
+    match outcome {
+        Err(err) => {
+            early_marker!(
+                "RISCV_TRAP_HANDLE_FAILED reason=s_mode_extirq_handle_err err={:?}",
+                err
+            );
+            riscv_trap_halt("s_mode_extirq_handle_err");
+        }
+        Ok(RiscvTrapEntryOutcome::ReturnToCurrent) | Ok(RiscvTrapEntryOutcome::ReturnToIncoming)
+            if resume_tid != 0 =>
+        {
+            early_marker!(
+                "RISCV_S_MODE_EXTIRQ_UNEXPECTED_RESUME resume_tid={} reason=idle_boundary_not_idle",
+                resume_tid
+            );
+            riscv_trap_halt("s_mode_extirq_unexpected_resume");
+        }
+        Ok(_) => {
+            early_marker!("RISCV_S_MODE_EXTIRQ_RESUME_IDLE sepc=0x{:x}", sepc);
+            unsafe {
+                yarm_riscv64_s_mode_timer_return(
+                    frame as *const RiscvTrapFrame,
+                    riscv_trap_stack_top(),
+                )
+            }
         }
     }
 }
@@ -2450,6 +2558,38 @@ pub fn bootstrap_first_user_task(
     // and the init server decodes it through the inverse of that same helper. This oracle needs
     // no capabilities, so it takes slot 5 only, and is mutually exclusive with every slot-5
     // oracle above (guarded by `init_args[5] == 0`).
+    // QEMU-IRQ1 §3: the UART external-interrupt witness. Compile-time gated only — a build with
+    // the feature is the witness build — and mutually exclusive with every slot-5/13/14 cell above
+    // (it stands down unless all three are still zero). The line is read from the executed
+    // machine's DTB (`serial@` → `interrupts`), never assumed; with no DTB node nothing is bound.
+    #[cfg(feature = "riscv-uart-irq-witness")]
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
+        let dtb_line = captured_dtb()
+            .and_then(|dtb| crate::arch::fdt::find_node_interrupt_by_name_prefix(dtb, b"serial@"))
+            .and_then(|irq| u16::try_from(irq).ok());
+        match dtb_line {
+            Some(line) => {
+                if let Some(p) = crate::kernel::boot::provision_init_uart_irq_witness(
+                    kernel,
+                    RING3_INIT_SERVER_TID,
+                    init_asid,
+                    line,
+                ) {
+                    init_args[5] = crate::kernel::boot::UART_IRQ_WITNESS_SELECTOR;
+                    init_args[13] = p.notification_recv_cap as u64;
+                    init_args[14] = p.park_endpoint_cap as u64;
+                    crate::yarm_log!(
+                        "IRQ1_WITNESS_SLOTS slot5={} slot13={} slot14={} notification={}",
+                        init_args[5],
+                        init_args[13],
+                        init_args[14],
+                        p.notification_idx
+                    );
+                }
+            }
+            None => crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=dtb_uart_line"),
+        }
+    }
     #[cfg(feature = "riscv-exit-current-task-oracle")]
     if crate::kernel::boot::riscv_exit_oracle_enabled() && init_args[5] == 0 {
         init_args[5] = crate::kernel::boot::riscv_exit_current_task_selector();

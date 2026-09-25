@@ -357,6 +357,83 @@ pub fn find_node_reg_by_name_prefix(bytes: &[u8], prefix: &[u8]) -> Option<(u64,
     None
 }
 
+/// QEMU-IRQ1 §1 — the raw bytes of property `prop` on the first node whose name begins with
+/// `prefix`, walking nested children exactly as [`find_node_reg_by_name_prefix`] does. `None` for a
+/// structurally invalid FDT, an absent node, or a node without that property.
+pub fn find_node_prop_by_name_prefix<'a>(
+    bytes: &'a [u8],
+    prefix: &[u8],
+    prop: &[u8],
+) -> Option<&'a [u8]> {
+    if read_be_u32(bytes, 0)? != FDT_MAGIC {
+        return None;
+    }
+    let total_size = read_be_u32(bytes, 4)? as usize;
+    let off_dt_struct = read_be_u32(bytes, 8)? as usize;
+    let off_dt_strings = read_be_u32(bytes, 12)? as usize;
+    let size_dt_strings = read_be_u32(bytes, 32)? as usize;
+    let size_dt_struct = read_be_u32(bytes, 36)? as usize;
+    if total_size > bytes.len()
+        || off_dt_struct.checked_add(size_dt_struct)? > total_size
+        || off_dt_strings.checked_add(size_dt_strings)? > total_size
+    {
+        return None;
+    }
+    let struct_block = &bytes[off_dt_struct..off_dt_struct + size_dt_struct];
+    let strings = &bytes[off_dt_strings..off_dt_strings + size_dt_strings];
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut in_target_depth: Option<usize> = None;
+
+    while cursor + 4 <= struct_block.len() {
+        let token = read_be_u32(struct_block, cursor)?;
+        cursor += 4;
+        match token {
+            FDT_BEGIN_NODE => {
+                let (name, next) = read_cstr(struct_block, cursor)?;
+                cursor = align_up_4(next)?;
+                depth = depth.checked_add(1)?;
+                if in_target_depth.is_none() && name.starts_with(prefix) {
+                    in_target_depth = Some(depth);
+                }
+            }
+            FDT_END_NODE => {
+                if in_target_depth == Some(depth) {
+                    // The first matching node has no such property; later namesakes are not
+                    // consulted, so the answer names one node rather than a merge.
+                    return None;
+                }
+                depth = depth.checked_sub(1)?;
+            }
+            FDT_PROP => {
+                let prop_len = read_be_u32(struct_block, cursor)? as usize;
+                let name_off = read_be_u32(struct_block, cursor + 4)? as usize;
+                cursor = cursor.checked_add(8)?;
+                let prop_end = cursor.checked_add(prop_len)?;
+                if prop_end > struct_block.len() {
+                    return None;
+                }
+                let prop_data = &struct_block[cursor..prop_end];
+                cursor = align_up_4(prop_end)?;
+                if in_target_depth == Some(depth) && read_cstr(strings, name_off)?.0 == prop {
+                    return Some(prop_data);
+                }
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// QEMU-IRQ1 §1 — the first cell of the `interrupts` property of the first node whose name begins
+/// with `prefix`: the controller-local interrupt identifier for a one-cell PLIC specifier.
+pub fn find_node_interrupt_by_name_prefix(bytes: &[u8], prefix: &[u8]) -> Option<u32> {
+    let data = find_node_prop_by_name_prefix(bytes, prefix, b"interrupts")?;
+    read_be_u32(data, 0)
+}
+
 /// Returns the `/chosen` `linux,initrd-start` / `linux,initrd-end` pair as
 /// `(start, end)` physical addresses, if present. Each value may be encoded as
 /// a 4-byte or 8-byte big-endian integer (QEMU uses either depending on
@@ -929,5 +1006,24 @@ mod tests {
     fn find_node_reg_by_name_prefix_returns_none_for_absent_node() {
         let dtb = make_dtb_with_plic(0x0C00_0000, 0x0040_0000);
         assert_eq!(find_node_reg_by_name_prefix(&dtb, b"clint@"), None);
+    }
+
+    /// QEMU-IRQ1 §1 — the executed machine's own DTB (QEMU 8.2 `virt`, `-smp 1`) names UART0 at
+    /// `0x1000_0000` with PLIC interrupt 10, and the PLIC at `0x0C00_0000`. Read, not assumed.
+    #[test]
+    fn real_qemu_virt_dtb_names_uart0_irq_and_plic() {
+        let dtb = include_bytes!("../../tests/fixtures/riscv64_qemu_virt_smp1.dtb").as_slice();
+        assert_eq!(
+            find_node_reg_by_name_prefix(dtb, b"serial@"),
+            Some((0x1000_0000, 0x100))
+        );
+        assert_eq!(find_node_interrupt_by_name_prefix(dtb, b"serial@"), Some(10));
+        assert_eq!(
+            find_node_reg_by_name_prefix(dtb, b"plic@").map(|(b, _)| b),
+            Some(0x0C00_0000)
+        );
+        assert_eq!(find_node_interrupt_by_name_prefix(dtb, b"nosuchnode@"), None);
+        // `interrupt-controller` is a flag property on the PLIC; `interrupts` is not present.
+        assert_eq!(find_node_interrupt_by_name_prefix(dtb, b"plic@"), None);
     }
 }

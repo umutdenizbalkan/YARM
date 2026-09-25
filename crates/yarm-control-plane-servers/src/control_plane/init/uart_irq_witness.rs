@@ -1,0 +1,459 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+
+//! QEMU-IRQ1 §3/§4 — init's RECEIVER for the RISC-V UART external-interrupt witness.
+//!
+//! Slot-5 selector 30; compiled only with `riscv-uart-irq-witness` on RISC-V. The kernel hands it
+//! a RECEIVE cap on the notification the UART route targets (slot 13), a private park endpoint
+//! (slot 14), and a USER read-only ring page at [`RING_VA`] into which the kernel fixture copies
+//! the bytes it drained.
+//!
+//! One item outstanding at a time, sequence-numbered. For item `seq` the receiver announces
+//! `IRQ1_UART_READY seq=… mode=…`, and the host injects exactly one byte, `0x40 + seq`, into the
+//! UART's dedicated serial backend only after reading that line. Odd items wait with the hart
+//! IDLE (the receiver parks on a deadline, nothing else is runnable); even items wait with the
+//! receiver SPINNING in U-mode with six sentinel registers live, so the interrupt lands on user
+//! code whose register file must come back intact.
+//!
+//! What is checked, per item, from the receiver's side of the interface:
+//! * a notification is received through NR 5 (the existing object, through the existing receive
+//!   syscall), and its label is the line the kernel bound — identity from the claim, not assumed;
+//! * exactly one: an immediate second probe is empty;
+//! * the DATA sequence separately: the ring's byte count is exactly `seq` and byte `seq-1` is
+//!   `0x40 + seq`.
+//!
+//! After the last item the kernel has turned the source off. The receiver then announces
+//! `IRQ1_UART_POSTDISABLE_READY`, the host injects one more byte, and the receiver parks through
+//! `POST_ROUNDS` further deadlines — each must time out (the timer still runs), and neither a
+//! notification nor a new ring byte may appear (the source really is off). Last, two isolation
+//! probes: a disposable child loads from the claim register's window address and must fault, and
+//! an anonymous mapping over the window must be refused.
+
+use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+pub(super) static RESULT: AtomicU32 = AtomicU32::new(0);
+
+pub(super) const SELECTOR: u32 = 30;
+/// Must equal the kernel's `UART_IRQ_WITNESS_RING_VA` (pinned by a hosted test).
+pub(super) const RING_VA: usize = 0x2800_0000;
+const ITEMS: u32 = 8;
+const BYTE_BASE: u8 = 0x40;
+/// Park deadline for IDLE items, in scheduler ticks. Long enough that the hart is genuinely idle
+/// when the byte arrives, short enough to bound the wait for the next probe.
+const IDLE_PARK_TICKS: u64 = 20;
+/// Upper bound on waiting for one item — about 60 s of parks, or 60 000 spin/probe rounds.
+const MAX_IDLE_ROUNDS: u32 = 300;
+const MAX_USER_ROUNDS: u32 = 60_000;
+const SPIN_ITERS: u64 = 20_000;
+const POST_ROUNDS: u32 = 10;
+const POST_PARK_TICKS: u64 = 5;
+
+// Ring word indices (kernel `uart_irq_witness::RING_WORD_*`).
+const W_MAGIC: usize = 0;
+const W_ARMED: usize = 1;
+const W_DISABLED: usize = 2;
+const W_BYTES: usize = 3;
+const W_CLAIMS: usize = 4;
+const W_COMPLETIONS: usize = 5;
+const W_IDLE: usize = 6;
+const W_USER: usize = 7;
+const W_EMPTY: usize = 8;
+const W_LINE: usize = 9;
+const RING_MAGIC: u32 = 0x4952_5131;
+const RING_BYTES_OFFSET: usize = 256;
+
+/// The kernel-only device window's first page (`page_table::DEVICE_WINDOW_BASE`), and the window
+/// address of the PLIC S-context claim register (window slot 2, offset 4).
+const DEVICE_WINDOW_BASE: usize = 0x3F_C000_0000;
+const WINDOW_CLAIM_VA: usize = DEVICE_WINDOW_BASE + 2 * 4096 + 4;
+
+const NR_IPC_RECV_TIMEOUT: usize = 5;
+const ERR_WOULD_BLOCK: usize = 7;
+const ERR_TIMED_OUT: usize = 9;
+
+pub(super) fn armed(slot5: Option<u32>) -> bool {
+    matches!(slot5, Some(SELECTOR))
+}
+
+fn ring_word(i: usize) -> u32 {
+    // SAFETY: the kernel mapped RING_VA USER read-only for this task before it ran.
+    unsafe { core::ptr::read_volatile((RING_VA as *const u32).add(i)) }
+}
+
+fn ring_byte(i: usize) -> u8 {
+    // SAFETY: as `ring_word`; the byte log lives inside the same page.
+    unsafe { core::ptr::read_volatile((RING_VA as *const u8).add(RING_BYTES_OFFSET + i)) }
+}
+
+#[repr(C)]
+struct MetaV2 {
+    status: u64,
+    opcode: u16,
+    flags: u16,
+    payload_len: u32,
+    cap_id: u64,
+    recv_meta_flags: u64,
+    sender_tid: u64,
+}
+
+enum Recv {
+    Message { label: u16, payload_len: u32 },
+    Empty,
+    TimedOut,
+    Error,
+}
+
+/// One NR 5 with a recv-v2 metadata target, issued directly so a polling loop does not emit a log
+/// line per probe. `timeout == 0` is the non-blocking probe.
+fn recv_timeout(cap: u32, timeout: u64) -> Recv {
+    let mut payload = [0u8; 64];
+    let mut meta = MetaV2 {
+        status: u64::MAX,
+        opcode: 0,
+        flags: 0,
+        payload_len: 0,
+        cap_id: u64::MAX,
+        recv_meta_flags: 0,
+        sender_tid: 0,
+    };
+    let mut a0 = cap as usize;
+    let mut a1 = payload.as_mut_ptr() as usize;
+    let mut a2 = payload.len();
+    let mut a3 = timeout as usize;
+    let mut a4 = (&mut meta as *mut MetaV2) as usize;
+    let mut a5 = core::mem::size_of::<MetaV2>();
+    // SAFETY: the kernel's RISC-V syscall ABI (a7 = number, a0..a5 = arguments); every argument
+    // register is declared clobbered because the kernel may write any of them.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") a0,
+            inlateout("a1") a1,
+            inlateout("a2") a2,
+            inlateout("a3") a3,
+            inlateout("a4") a4,
+            inlateout("a5") a5,
+            in("a7") NR_IPC_RECV_TIMEOUT,
+            options(nostack),
+        );
+    }
+    let _ = (a1, a2, a3, a4, a5);
+    // SAFETY: the kernel wrote `meta` through the pointer handed to it.
+    let status = unsafe { core::ptr::read_volatile(&meta.status) };
+    if status != u64::MAX {
+        return Recv::Message {
+            label: meta.opcode,
+            payload_len: meta.payload_len,
+        };
+    }
+    match a0 {
+        ERR_WOULD_BLOCK => Recv::Empty,
+        ERR_TIMED_OUT => Recv::TimedOut,
+        _ => Recv::Error,
+    }
+}
+
+/// Spin in U-mode with six sentinel registers live across the whole loop. Returns the mask of
+/// registers whose value did NOT survive — `0` means the register file came back intact from every
+/// interrupt that landed inside the loop.
+#[inline(never)]
+fn spin_checking_registers(iters: u64, seed: u64) -> u32 {
+    let s = [
+        seed,
+        seed ^ 0x1111_1111,
+        seed ^ 0x2222_2222,
+        seed ^ 0x3333_3333,
+        seed ^ 0x4444_4444,
+        seed ^ 0x5555_5555,
+    ];
+    let (mut r0, mut r1, mut r2, mut r3, mut r4, mut r5) = (s[0], s[1], s[2], s[3], s[4], s[5]);
+    // SAFETY: a pure register loop; no memory is touched.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 2b",
+            n = inout(reg) iters => _,
+            inout("t3") r0,
+            inout("t4") r1,
+            inout("t5") r2,
+            inout("t6") r3,
+            inout("a6") r4,
+            inout("a7") r5,
+            options(nomem, nostack),
+        );
+    }
+    let got = [r0, r1, r2, r3, r4, r5];
+    let mut mask = 0u32;
+    for (i, (g, want)) in got.iter().zip(s.iter()).enumerate() {
+        if g != want {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
+static ISO_CHILD_STARTED: AtomicU32 = AtomicU32::new(0);
+static ISO_CHILD_READ_RETURNED: AtomicU32 = AtomicU32::new(0);
+static mut ISO_CHILD_STACK: [u8; 1024] = [0u8; 1024];
+static mut ISO_CHILD_TLS: [u8; 256] = [0u8; 256];
+
+/// The disposable isolation probe: a U-mode LOAD from the claim register's window address. The
+/// leaf carries no USER bit, so the load must fault before the device is touched — a successful
+/// load would have been a claim read performed by userspace. Never returns: the fault terminates
+/// this thread, and nothing else.
+extern "C" fn isolation_child_body() -> ! {
+    ISO_CHILD_STARTED.store(1, Relaxed);
+    // SAFETY: deliberately touching a kernel-only mapping; the fault is the expected outcome.
+    let v = unsafe { core::ptr::read_volatile(WINDOW_CLAIM_VA as *const u32) };
+    ISO_CHILD_READ_RETURNED.store(1 | (v << 1), Relaxed);
+    loop {
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
+}
+
+/// Isolation, from userspace's side: (1) a U-mode load from the window faults in a disposable
+/// child; (2) the window cannot be claimed by a user mapping (`VmAnonMap` over it is refused).
+fn isolation_probes(park: u32) -> (u32, u32, bool) {
+    // SAFETY: an anonymous-map request the kernel must refuse; nothing is mapped on refusal.
+    let anon = unsafe { yarm_user_rt::syscall::vm_anon_map(DEVICE_WINDOW_BASE, 4096, 1) };
+    let anon_refused = anon.is_err();
+    let stack_top = (core::ptr::addr_of_mut!(ISO_CHILD_STACK) as usize + 1024) & !0xF;
+    let tls_base = core::ptr::addr_of_mut!(ISO_CHILD_TLS) as usize;
+    // SAFETY: a valid `extern "C" fn() -> !`; the static stack and TLS outlive the thread.
+    let child = unsafe {
+        yarm_user_rt::syscall::spawn_thread(
+            tls_base,
+            stack_top,
+            isolation_child_body as *const () as usize,
+        )
+    };
+    let child_tid = child.map(|t| t as u32).unwrap_or(0);
+    // Park so the scheduler runs the child and it takes its fault.
+    let mut rounds = 0;
+    while ISO_CHILD_STARTED.load(Relaxed) == 0 && rounds < 50 {
+        let _ = recv_timeout(park, 2);
+        rounds += 1;
+    }
+    for _ in 0..5 {
+        let _ = recv_timeout(park, 2);
+    }
+    (child_tid, ISO_CHILD_READ_RETURNED.load(Relaxed), anon_refused)
+}
+
+pub(super) fn run_once() {
+    let notif = yarm_user_rt::runtime::startup_arg_slot(
+        yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_0,
+    )
+    .unwrap_or(0) as u32;
+    let park = yarm_user_rt::runtime::startup_arg_slot(
+        yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_1,
+    )
+    .unwrap_or(0) as u32;
+    if notif == 0 || park == 0 || ring_word(W_MAGIC) != RING_MAGIC {
+        yarm_user_rt::user_log!(
+            "IRQ1_UART_WITNESS step=provision result=missing notif={} park={}",
+            notif,
+            park
+        );
+        RESULT.store(0xF0, Relaxed);
+        return;
+    }
+    yarm_user_rt::user_log!(
+        "IRQ1_UART_WITNESS_BEGIN items={} notif_cap={} park_cap={} ring_va=0x{:x} spin_fn=0x{:x}",
+        ITEMS,
+        notif,
+        park,
+        RING_VA,
+        spin_checking_registers as *const () as usize
+    );
+
+    // Wait for the kernel to enable the source. The enable happens at the first idle safe point,
+    // so parking is also what gets it there.
+    let mut arm_rounds = 0u32;
+    while ring_word(W_ARMED) == 0 {
+        let _ = recv_timeout(park, 2);
+        arm_rounds += 1;
+        if arm_rounds > MAX_IDLE_ROUNDS {
+            yarm_user_rt::user_log!("IRQ1_UART_WITNESS step=arm result=timeout");
+            RESULT.store(0xF1, Relaxed);
+            return;
+        }
+    }
+    // The line the kernel bound (read from the DTB), as the kernel published it: every label must
+    // name it.
+    let bound_line = ring_word(W_LINE) as u16;
+    yarm_user_rt::user_log!(
+        "IRQ1_UART_ARMED rounds={} expect_label={}",
+        arm_rounds,
+        bound_line
+    );
+
+    let (mut received, mut exact_once, mut label_ok, mut data_ok) = (0u32, 0u32, 0u32, 0u32);
+    let (mut idle_items, mut user_items, mut regs_bad, mut dup, mut errors) =
+        (0u32, 0u32, 0u32, 0u32, 0u32);
+    for seq in 1..=ITEMS {
+        let idle = seq % 2 == 1;
+        let expect = BYTE_BASE + seq as u8;
+        yarm_user_rt::user_log!(
+            "IRQ1_UART_READY seq={} mode={} expect=0x{:02x}",
+            seq,
+            if idle { "idle" } else { "user" },
+            expect
+        );
+        let mut rounds = 0u32;
+        let mut bad_mask = 0u32;
+        let got = loop {
+            rounds += 1;
+            if idle {
+                if rounds > MAX_IDLE_ROUNDS {
+                    break None;
+                }
+                match recv_timeout(park, IDLE_PARK_TICKS) {
+                    Recv::Message { .. } => dup += 1,
+                    Recv::Error => errors += 1,
+                    Recv::TimedOut | Recv::Empty => {}
+                }
+            } else {
+                if rounds > MAX_USER_ROUNDS {
+                    break None;
+                }
+                let seed = 0x5EED_0000_0000u64 | ((seq as u64) << 16) | rounds as u64;
+                bad_mask |= spin_checking_registers(SPIN_ITERS, seed);
+            }
+            match recv_timeout(notif, 0) {
+                Recv::Message { label, payload_len } => break Some((label, payload_len)),
+                Recv::Error => errors += 1,
+                Recv::Empty | Recv::TimedOut => {}
+            }
+        };
+        let Some((label, payload_len)) = got else {
+            yarm_user_rt::user_log!(
+                "IRQ1_UART_RECV seq={} result=timeout rounds={} bytes={} claims={} completions={}",
+                seq,
+                rounds,
+                ring_word(W_BYTES),
+                ring_word(W_CLAIMS),
+                ring_word(W_COMPLETIONS)
+            );
+            break;
+        };
+        received += 1;
+        // Exactly one notification for this item: an immediate second probe must be empty.
+        let once = matches!(recv_timeout(notif, 0), Recv::Empty);
+        if once {
+            exact_once += 1;
+        } else {
+            dup += 1;
+        }
+        if label == bound_line {
+            label_ok += 1;
+        }
+        let bytes = ring_word(W_BYTES);
+        let byte = ring_byte(seq as usize - 1);
+        let data = bytes == seq && byte == expect;
+        if data {
+            data_ok += 1;
+        }
+        if idle {
+            idle_items += 1;
+        } else {
+            user_items += 1;
+            if bad_mask != 0 {
+                regs_bad += 1;
+            }
+        }
+        yarm_user_rt::user_log!(
+            "IRQ1_UART_RECV seq={} mode={} label={} payload_len={} once={} byte=0x{:02x} bytes={} data_ok={} rounds={} regs_mask=0x{:x} claims={} completions={}",
+            seq,
+            if idle { "idle" } else { "user" },
+            label,
+            payload_len,
+            once as u8,
+            byte,
+            bytes,
+            data as u8,
+            rounds,
+            bad_mask,
+            ring_word(W_CLAIMS),
+            ring_word(W_COMPLETIONS)
+        );
+    }
+
+    // ── After the source is off: timer and service progress, and silence ──────────────────────
+    let disabled = ring_word(W_DISABLED);
+    let (bytes_before, claims_before) = (ring_word(W_BYTES), ring_word(W_CLAIMS));
+    yarm_user_rt::user_log!(
+        "IRQ1_UART_POSTDISABLE_READY disabled={} bytes={} claims={}",
+        disabled,
+        bytes_before,
+        claims_before
+    );
+    let (mut post_timeouts, mut post_notifications) = (0u32, 0u32);
+    for _ in 0..POST_ROUNDS {
+        if matches!(recv_timeout(park, POST_PARK_TICKS), Recv::TimedOut) {
+            post_timeouts += 1;
+        }
+        if matches!(recv_timeout(notif, 0), Recv::Message { .. }) {
+            post_notifications += 1;
+        }
+    }
+    let post_quiet = post_notifications == 0
+        && ring_word(W_BYTES) == bytes_before
+        && ring_word(W_CLAIMS) == claims_before;
+    let claims = ring_word(W_CLAIMS);
+    let completions = ring_word(W_COMPLETIONS);
+
+    let (iso_child, iso_returned, anon_refused) = isolation_probes(park);
+    let isolated = iso_child != 0 && iso_returned == 0 && anon_refused;
+    yarm_user_rt::user_log!(
+        "IRQ1_UART_ISOLATION child_tid={} window_va=0x{:x} load_returned={} anon_map_over_window_refused={} result={}",
+        iso_child,
+        WINDOW_CLAIM_VA,
+        iso_returned,
+        anon_refused as u8,
+        if isolated { "ok" } else { "fail" }
+    );
+
+    let all = received == ITEMS
+        && exact_once == ITEMS
+        && label_ok == ITEMS
+        && data_ok == ITEMS
+        && regs_bad == 0
+        && dup == 0
+        && errors == 0
+        && claims == completions
+        && disabled == 1
+        && post_timeouts == POST_ROUNDS
+        && post_quiet
+        && isolated;
+    RESULT.store(u32::from(all), Relaxed);
+    yarm_user_rt::user_log!(
+        "IRQ1_UART_WITNESS_COUNTS claims={} completions={} empty_drains={} idle_origin={} user_origin={} disabled={} post_rounds={} post_timeouts={} post_notifications={} post_quiet={}",
+        claims,
+        completions,
+        ring_word(W_EMPTY),
+        ring_word(W_IDLE),
+        ring_word(W_USER),
+        disabled,
+        POST_ROUNDS,
+        post_timeouts,
+        post_notifications,
+        post_quiet as u8
+    );
+    yarm_user_rt::user_log!(
+        "IRQ1_UART_WITNESS items={} received={} exact_once={} label_ok={} data_ok={} idle_items={} user_items={} regs_bad={} dup={} errors={} isolated={} result={}",
+        ITEMS,
+        received,
+        exact_once,
+        label_ok,
+        data_ok,
+        idle_items,
+        user_items,
+        regs_bad,
+        dup,
+        errors,
+        isolated as u8,
+        if all { "ok" } else { "fail" }
+    );
+}

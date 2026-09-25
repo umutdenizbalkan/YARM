@@ -8240,6 +8240,158 @@ pub fn timer5_idle_return_witness_enabled() -> bool {
     TIMER5_IDLE_RETURN_WITNESS_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// QEMU-IRQ1 §3 — init's slot-5 selector for the RISC-V UART external-interrupt witness.
+///
+/// 30 is claimed by no other slot-5 constant, encoder run or arm on any port (in use: 1–16 and
+/// 20–25, the last three being the terminal-fault oracle's). The cell is compiled only with
+/// `riscv-uart-irq-witness`, so a build without it carries neither the selector nor the receiver.
+#[cfg(feature = "riscv-uart-irq-witness")]
+pub const UART_IRQ_WITNESS_SELECTOR: u64 = 30;
+
+/// QEMU-IRQ1 §3 — where init finds the witness ring page, mapped USER read-only. Inside the
+/// image↔heap gap RISC-V init leaves free (image below `0x0400_0000`, the oracle window at
+/// `0x2000_0000..+8 KiB`, `brk` from `0x4000_0000`). Pinned against the receiver's own constant by
+/// a hosted test.
+#[cfg(feature = "riscv-uart-irq-witness")]
+pub const UART_IRQ_WITNESS_RING_VA: u64 = 0x2800_0000;
+
+/// QEMU-IRQ1 §3 — what the witness provisioning handed init.
+#[cfg(feature = "riscv-uart-irq-witness")]
+#[derive(Clone, Copy, Debug)]
+pub struct UartIrqWitnessProvision {
+    /// RECEIVE on the notification the IRQ route targets.
+    pub notification_recv_cap: u32,
+    /// SEND|RECEIVE on a private endpoint nobody sends to — the receiver parks on it with a
+    /// deadline so the hart can reach its idle boundary between items.
+    pub park_endpoint_cap: u32,
+    pub notification_idx: usize,
+    /// Physical address of the ring page, for the kernel-side fixture.
+    pub ring_pa: u64,
+}
+
+/// QEMU-IRQ1 §3 — provision init for the witness, through the EXISTING owners only.
+///
+/// 1. a notification object (`create_notification`), whose SIGNAL root cap is what
+/// 2. `bind_irq_notification` — the existing, and until now uncalled, route owner — binds to the
+///    DTB-derived UART line, so `irq_routes[line]` is set by the same code any future driver
+///    binding will use;
+/// 3. init receives a RECEIVE cap on that notification (`mint_capability_in_cnode`);
+/// 4. a private park endpoint (`create_endpoint`), SEND|RECEIVE into init;
+/// 5. one anonymous page (`alloc_anonymous_memory_object_with_len`), zeroed through the direct
+///    map and mapped USER read-only into init's address space (`map_user_page_in_asid_raw`) at
+///    [`UART_IRQ_WITNESS_RING_VA`]. The kernel fixture writes the drained bytes there; init can
+///    read them and cannot write them.
+///
+/// Any failure provisions nothing further, logs the failing step and returns `None`; init's slot 5
+/// then stays zero and the cell does not run.
+#[cfg(all(
+    feature = "riscv-uart-irq-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "riscv64"
+))]
+pub fn provision_init_uart_irq_witness(
+    kernel: &mut KernelState,
+    init_tid: u64,
+    init_asid: crate::kernel::vm::Asid,
+    irq_line: u16,
+) -> Option<UartIrqWitnessProvision> {
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    let init_cnode = kernel.task_cnode(init_tid)?;
+    let (notification_idx, signal_root, recv_root) = match kernel.create_notification(8) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=create_notification err={:?}", e);
+            return None;
+        }
+    };
+    if let Err(e) = kernel.bind_irq_notification(irq_line, signal_root) {
+        crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=bind_irq err={:?}", e);
+        return None;
+    }
+    let notification_object = kernel.current_task_capability(recv_root)?.object;
+    debug_assert!(matches!(notification_object, CapObject::Notification { .. }));
+    let notification_recv_cap = match kernel.mint_capability_in_cnode(
+        init_cnode,
+        Capability::new(notification_object, CapRights::RECEIVE),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=mint_notification err={:?}", e);
+            return None;
+        }
+    };
+    let (_park_idx, _park_send, park_recv_root) = kernel.create_endpoint(1).ok()?;
+    let park_object = kernel.current_task_capability(park_recv_root)?.object;
+    let park_endpoint_cap = match kernel.mint_capability_in_cnode(
+        init_cnode,
+        Capability::new(park_object, CapRights::SEND | CapRights::RECEIVE),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=mint_park err={:?}", e);
+            return None;
+        }
+    };
+    let page = crate::kernel::vm::PAGE_SIZE;
+    let (_obj_id, mem_root) = match kernel.alloc_anonymous_memory_object_with_len(page) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=alloc_ring err={:?}", e);
+            return None;
+        }
+    };
+    let mem_object = kernel.current_task_capability(mem_root)?.object;
+    let Some(ring_pa) = kernel
+        .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, mem_object))
+        .map(|p| p.0)
+    else {
+        crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=ring_phys");
+        return None;
+    };
+    for off in 0..page {
+        let Some(ptr) = KernelState::phys_to_direct_map_ptr(ring_pa + off as u64) else {
+            crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=ring_zero off={}", off);
+            return None;
+        };
+        unsafe { core::ptr::write_volatile(ptr, 0u8) };
+    }
+    let ring_flags = crate::kernel::vm::PageFlags {
+        read: true,
+        write: false,
+        execute: false,
+        user: true,
+        cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+    };
+    if let Err(e) = kernel.map_user_page_in_asid_raw(
+        init_asid,
+        crate::kernel::vm::VirtAddr(UART_IRQ_WITNESS_RING_VA),
+        crate::kernel::vm::Mapping {
+            phys: crate::kernel::vm::PhysAddr(ring_pa),
+            flags: ring_flags,
+        },
+    ) {
+        crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=map_ring err={:?}", e);
+        return None;
+    }
+    crate::arch::riscv64::uart_irq_witness::set_ring_page(ring_pa, irq_line);
+    crate::yarm_log!(
+        "IRQ1_WITNESS_PROVISION_OK init_tid={} irq_line={} notification={} notif_recv_cap={} park_cap={} ring_va=0x{:x} ring_pa=0x{:x} ring_user_write=0",
+        init_tid,
+        irq_line,
+        notification_idx,
+        notification_recv_cap.0,
+        park_endpoint_cap.0,
+        UART_IRQ_WITNESS_RING_VA,
+        ring_pa
+    );
+    Some(UartIrqWitnessProvision {
+        notification_recv_cap: notification_recv_cap.0 as u32,
+        park_endpoint_cap: park_endpoint_cap.0 as u32,
+        notification_idx,
+        ring_pa,
+    })
+}
+
 /// U9-RECV-FINAL §1 — how many RECOGNIZED receives reached the terminal broad acquisition.
 ///
 /// The receive family is not closed by this package, and this is what keeps that statement
