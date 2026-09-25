@@ -245,11 +245,34 @@ impl Bootstrap {
         (out, out_len)
     }
 
-    /// Number of physical pages reserved exclusively for page-table frames.
-    /// These pages form the PT_FRAME_ALLOCATOR's pool; the rest of sanitized
-    /// memory goes to the main KernelState frame allocator.  The two pools
-    /// are strictly disjoint — no physical page can appear in both.
-    const PT_POOL_PAGES: usize = 256; // 1 MiB — enough for all page-table nodes
+    /// Number of physical pages in the PT pool. These pages form the PT_FRAME_ALLOCATOR's
+    /// pool; the rest of sanitized memory goes to the main KernelState frame allocator. The two
+    /// pools are strictly disjoint — no physical page can appear in both.
+    ///
+    /// QEMU-BASELINE1 §2: the pool serves page-table nodes AND the kernel slab heap, and it used
+    /// to be the heap's 256 pages alone, so page tables got only what the heap left. It is now
+    /// the heap's unchanged share plus a reserve derived from the address-space ceiling; the
+    /// heap is held to its share by `frame_allocator::set_pt_pool_heap_budget`.
+    pub(crate) const PT_POOL_PAGES: usize =
+        Self::PT_POOL_HEAP_PAGES + Self::PT_POOL_TABLE_RESERVE_PAGES;
+
+    /// The kernel heap's share of the PT pool: 1 MiB, the entire pool before the table reserve
+    /// existed. Not an increase — the heap may hold exactly what it could before.
+    pub(crate) const PT_POOL_HEAP_PAGES: usize = 256;
+
+    /// Page-table frames one address space with the standard user layout needs: the root, plus
+    /// one upper and one middle table for each of the low half (ELF image at `0x400000`, shared
+    /// regions at `0x2000_0000`) and the top of the user half (the stack below
+    /// `0x7fff_ffff_f000`), plus a leaf table for each of the image, the shared region and the
+    /// stack — 1 + 2 + 2 + 3 = 8 on the 4-level ports (x86_64 measured 7–8 per space in the
+    /// QEMU boot), fewer on Sv39. `pt_reserve_backs_every_standard_address_space` measures it.
+    pub(crate) const PT_TABLES_PER_ADDRESS_SPACE: usize = 8;
+
+    /// Frames only page tables can use: enough for every address space the kernel admits
+    /// (`MAX_ADDRESS_SPACES`, frozen) to hold the standard layout at once, whatever the heap
+    /// holds.
+    pub(crate) const PT_POOL_TABLE_RESERVE_PAGES: usize =
+        crate::kernel::vm::MAX_ADDRESS_SPACES * Self::PT_TABLES_PER_ADDRESS_SPACE;
 
     /// Split `regions` (already sanitized, reserved ranges removed) into two
     /// disjoint sub-pools sorted by physical address:
@@ -565,6 +588,14 @@ impl Bootstrap {
 
         crate::arch::boot_entry::bootstrap_step("pt_frame_allocator");
         init_pt_frame_allocator(pt_slice).map_err(|_| KernelError::MemoryObjectFull)?;
+        crate::kernel::frame_allocator::set_pt_pool_heap_budget(Self::PT_POOL_HEAP_PAGES);
+        crate::yarm_log!(
+            "PT_POOL_SPLIT heap_budget_pages={} table_reserve_pages={} tables_per_space={} max_address_spaces={}",
+            Self::PT_POOL_HEAP_PAGES,
+            Self::PT_POOL_TABLE_RESERVE_PAGES,
+            Self::PT_TABLES_PER_ADDRESS_SPACE,
+            crate::kernel::vm::MAX_ADDRESS_SPACES
+        );
         crate::arch::boot_entry::bootstrap_step("frame_allocator");
         frame_allocator
             .init_from_memory_map(main_slice)

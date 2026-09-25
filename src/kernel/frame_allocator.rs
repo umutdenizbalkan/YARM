@@ -1170,6 +1170,84 @@ pub fn alloc_pt_frame() -> Result<u64, FrameAllocError> {
     Ok(pa)
 }
 
+/// QEMU-BASELINE1 §2 — **the kernel heap's share of the PT pool.**
+///
+/// The PT pool backs two consumers: page-table nodes (`alloc_pt_frame`, from the three
+/// `page_table` modules) and the kernel slab heap (`global_allocator`). Until this change the
+/// heap could take the whole pool, so the page-table capacity left for user address spaces was
+/// whatever the heap happened not to use — on the x86_64 QEMU boot about 12 address spaces'
+/// worth, against a declared `MAX_ADDRESS_SPACES` of 32, and the ordinary-cap cell's fork was
+/// refused `OutOfMemory` for its first page table.
+///
+/// Bootstrap now grows the pool by a page-table reserve and records here how much of it the
+/// heap may hold: exactly the pool size the heap had before. The heap's budget is therefore
+/// unchanged, and the reserve can only ever hold page tables. Page-table nodes stay unbudgeted:
+/// they may use any free frame, as before. `usize::MAX` means no budget has been set (a pool
+/// initialised outside the bootstrap split), which keeps the old behaviour.
+///
+/// Both statics are written only under the `PT_FRAME_ALLOCATOR` lock, which every heap
+/// allocation and free takes, so the admission check and the allocation are one step.
+static PT_POOL_HEAP_BUDGET_PAGES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+static PT_POOL_HEAP_HELD_PAGES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Record the heap's share of the PT pool. Called once, by the bootstrap pool split.
+pub fn set_pt_pool_heap_budget(pages: usize) {
+    let _guard = PT_FRAME_ALLOCATOR.lock();
+    PT_POOL_HEAP_BUDGET_PAGES.store(pages, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pages of the PT pool the kernel heap currently holds.
+pub fn pt_pool_heap_held_pages() -> usize {
+    PT_POOL_HEAP_HELD_PAGES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the heap, holding `held` pages, may take `pages` more under `budget`.
+pub const fn pt_pool_heap_admits(held: usize, pages: usize, budget: usize) -> bool {
+    match held.checked_add(pages) {
+        Some(total) => total <= budget,
+        None => false,
+    }
+}
+
+/// Allocate `pages` physically contiguous PT-pool frames for the kernel heap, within its
+/// budget. Refused with `CapacityExceeded`, having allocated nothing, when the heap would
+/// exceed its share; `OutOfMemory` when the pool itself has no such run.
+pub fn alloc_heap_frames(pages: usize) -> Result<u64, FrameAllocError> {
+    use core::sync::atomic::Ordering::Relaxed;
+    if pages == 0 {
+        return Err(FrameAllocError::InvalidMemoryMap);
+    }
+    ensure_pt_allocator_initialized()?;
+    let mut guard = PT_FRAME_ALLOCATOR.lock();
+    let held = PT_POOL_HEAP_HELD_PAGES.load(Relaxed);
+    if !pt_pool_heap_admits(held, pages, PT_POOL_HEAP_BUDGET_PAGES.load(Relaxed)) {
+        return Err(FrameAllocError::CapacityExceeded);
+    }
+    let pa = if pages == 1 {
+        guard.alloc_frame()?
+    } else {
+        guard.alloc_contiguous(pages)?
+    };
+    PT_POOL_HEAP_HELD_PAGES.store(held + pages, Relaxed);
+    Ok(pa)
+}
+
+/// Return `pages` heap frames starting at `base_phys` to the PT pool.
+pub fn free_heap_frames(base_phys: u64, pages: usize) -> Result<(), FrameAllocError> {
+    use core::sync::atomic::Ordering::Relaxed;
+    if pages == 0 {
+        return Err(FrameAllocError::InvalidMemoryMap);
+    }
+    ensure_pt_allocator_initialized()?;
+    let mut guard = PT_FRAME_ALLOCATOR.lock();
+    guard.free_contiguous(base_phys, pages)?;
+    let held = PT_POOL_HEAP_HELD_PAGES.load(Relaxed);
+    PT_POOL_HEAP_HELD_PAGES.store(held.saturating_sub(pages), Relaxed);
+    Ok(())
+}
+
 pub fn alloc_pt_contiguous_frames(pages: usize) -> Result<u64, FrameAllocError> {
     if pages == 0 {
         return Err(FrameAllocError::InvalidMemoryMap);

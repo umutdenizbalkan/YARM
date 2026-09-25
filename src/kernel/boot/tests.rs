@@ -163886,8 +163886,10 @@ mod u9fork1_cow_fork_transaction {
         let child = inverse
             .find("destroy_unresident_address_space_locked(")
             .expect("child teardown");
+        // QEMU-BASELINE1 §2: the restore is range-exact (`restore_page_range_flags_in_place`), not
+        // whatever run now starts at the recorded head.
         let parent = inverse
-            .find("restore_run_head_flags_in_place(")
+            .find("restore_page_range_flags_in_place(")
             .expect("parent restore");
         assert!(child < parent, "the child goes before the parent restore");
         assert!(
@@ -177283,26 +177285,41 @@ mod u9vment1_ownership_cases {
 
     #[test]
     fn replacement_failure_leaves_the_mapping_shadow_byte_identical() {
-        // The bookkeeping half: a replacement inside a multi-page run right-splits the run before
-        // it breaks. A refusal must undo that split too, or `len` and the entry shape drift on a
-        // path that changed nothing the caller can see.
+        // The bookkeeping half. QEMU-BASELINE1 §2 moved replacement into `replace_page_in_run`,
+        // which decides the post-replacement shape and checks its capacity from pure reads, and
+        // commits the bookkeeping only AFTER the hardware install succeeded. So a refusal has no
+        // split to undo: it must put the predecessor back and return before any entry changes,
+        // or `len` and the entry shape drift on a path that changed nothing the caller can see.
         const VM_SRC: &str = include_str!("../vm.rs");
-        let body = VM_SRC
-            .split("if let Err(e) = arch_map_page(self.asid, virt, mapping) {")
+        let owner = VM_SRC
+            .split("    fn replace_page_in_run(")
             .nth(1)
-            .expect("the replacement failure path")
-            .split(
-                "\n                self.entries[i].as_mut().expect(\"entry\").mapping = mapping;",
-            )
+            .expect("the replacement owner")
+            .split("\n    fn run_pieces(")
+            .next()
+            .expect("owner body");
+        let (pre, body) = owner
+            .split_once("if let Err(e) = arch_map_page(self.asid, virt, mapping) {")
+            .expect("the replacement failure path");
+        let body = body
+            .split("// Commit the bookkeeping in the shape decided above.")
             .next()
             .expect("body");
         assert!(
-            body.contains("if arch_map_page(self.asid, virt, old).is_ok() {"),
-            "the predecessor must be put back, not merely deleted from the shadow"
+            body.contains("if arch_map_page(self.asid, virt, old).is_ok() {\n                return Err(e);\n            }"),
+            "the predecessor must be put back, and the refusal returns with the shadow untouched"
         );
         assert!(
-            body.contains("if split_tail {") && body.contains(".pages = original_pages;"),
-            "and the bookkeeping split must be undone so the shadow is byte-identical"
+            !pre.contains("splice_entries")
+                && !pre.contains(".as_mut()")
+                && !pre.contains("] = ")
+                && !pre.contains("self.len +=")
+                && !pre.contains("self.len -="),
+            "no bookkeeping may change before the install has succeeded"
+        );
+        assert!(
+            pre.find("return Err(VmError::Full);") < pre.find("arch_unmap_page(self.asid, virt);"),
+            "capacity is refused before break-before-make touches the hardware"
         );
         assert!(
             !body.contains("panic!") && !body.contains("unwrap()"),
@@ -191457,5 +191474,262 @@ mod u9closure_switch_owned_elsewhere {
             1,
             "and it is the arm's only exit"
         );
+    }
+}
+
+/// QEMU-BASELINE1 §2 — **copy-on-write recovery at the mapping-table boundary.**
+///
+/// The x86_64 ordinary-cap cell died when a COW write landed in the MIDDLE of a write-protected
+/// run in a nearly full table: the private copy needs the run split three ways (+2 entries).
+/// The freestanding split owner (`SharedKernel::cow_recover_private_copy_split`, compiled out of
+/// hosted builds) and the broad `try_handle_cow_fault` driven here both commit through the same
+/// `AddressSpace::map_page` replacement, so this pins that owner's contract at the transaction
+/// level: with one free entry the fault fails closed with nothing half-done — the table
+/// identical, the old frame's refcount untouched, the COW mark still set, and the freshly
+/// allocated frame given back. With one more entry it commits: the page maps a private writable
+/// frame, its neighbours keep theirs, and the old frame survives because the child maps it.
+mod qb1_cow_capacity_boundary {
+    use crate::kernel::boot::{Bootstrap, KernelError, KernelState, UserImageSpec};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::task::TaskClass;
+    use crate::kernel::vm::{
+        Asid, MAX_MAPPINGS, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr, VmError,
+    };
+
+    const BASE: u64 = 0x10_0000;
+    const PG: u64 = PAGE_SIZE as u64;
+
+    fn runs(s: &KernelState, asid: Asid) -> alloc::vec::Vec<(u64, u64, usize, bool)> {
+        s.with_user_spaces(|spaces| {
+            let a = spaces.get(asid).expect("space");
+            (0..a.mappings())
+                .map(|i| {
+                    let (v, m, n) = a.run_at(i).expect("run");
+                    (v.0, m.phys.0, n, m.flags.write)
+                })
+                .collect()
+        })
+    }
+
+    fn live_objects(s: &KernelState) -> usize {
+        s.memory.memory_objects.iter().flatten().count()
+    }
+
+    #[test]
+    fn a_mid_run_cow_split_fails_closed_at_capacity_and_commits_with_room() {
+        let mut s = Bootstrap::init().expect("init");
+        let (parent, _) = s.create_user_address_space().expect("asid");
+        // The task runs in a helper space so its image pages do not share the table under test.
+        let (task_space, _) = s.create_user_address_space().expect("task asid");
+        s.reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
+            tid: 67,
+            entry: 0x6000,
+            asid: Some(task_space),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        })
+        .expect("task");
+        s.yield_current_to(ThreadId(67)).expect("switch to 67");
+        let mut ids = alloc::vec::Vec::new();
+        for p in 0..4u64 {
+            let (id, cap) = s.alloc_anonymous_memory_object().expect("mo");
+            s.map_user_page_in_asid_with_caps(
+                parent,
+                cap,
+                VirtAddr(BASE + p * PG),
+                PageFlags::USER_RW,
+            )
+            .expect("map");
+            ids.push(id);
+        }
+        let child = s.clone_user_address_space_cow(parent).expect("fork");
+        let page = VirtAddr(BASE + PG);
+        let before_fill = runs(&s, parent);
+        assert_eq!(
+            before_fill.len(),
+            1,
+            "fixture: four consecutive frames form ONE write-protected run: {before_fill:?}"
+        );
+        assert!(!before_fill[0].3, "fixture: the fork write-protected it");
+
+        // Exactly one free entry, from runs that can never coalesce.
+        s.with_user_spaces_mut(|spaces| {
+            let a = spaces.get_mut(parent).expect("space");
+            let mut n = 0u64;
+            while a.mappings() < MAX_MAPPINGS - 1 {
+                a.map_page(
+                    VirtAddr(0x4000_0000 + n * 2 * PG),
+                    Mapping {
+                        phys: PhysAddr(0x9000_0000 + n * 7 * PG),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("filler");
+                n += 1;
+            }
+        });
+        let old_slot = s.memory_object_slot_by_id(ids[1]).expect("slot");
+        let old_refs = s.memory.memory_objects[old_slot].expect("mo").map_refcount;
+        let (table, objects) = (runs(&s, parent), live_objects(&s));
+
+        // ── At capacity: refused, and nothing is left half-done. ──
+        assert_eq!(
+            s.try_handle_cow_fault(parent, page),
+            Err(KernelError::Vm(VmError::Full))
+        );
+        assert_eq!(runs(&s, parent), table, "the table is identical");
+        assert_eq!(
+            live_objects(&s),
+            objects,
+            "the private frame was given back"
+        );
+        assert_eq!(
+            s.memory.memory_objects[old_slot].expect("mo").map_refcount,
+            old_refs,
+            "the old frame's refcount is untouched"
+        );
+        assert!(s.is_cow_page(parent, page), "still COW-marked");
+
+        // ── With room: committed, exactly one page moved. ──
+        s.with_user_spaces_mut(|spaces| {
+            spaces
+                .get_mut(parent)
+                .expect("space")
+                .unmap_page(VirtAddr(0x4000_0000))
+                .expect("free one entry");
+        });
+        assert_eq!(s.try_handle_cow_fault(parent, page), Ok(true));
+        let after = runs(&s, parent);
+        let old_phys = table[0].1 + PG;
+        assert_eq!(
+            after[0],
+            (BASE, table[0].1, 1, false),
+            "left neighbour untouched"
+        );
+        assert_eq!(after[1].0, BASE + PG);
+        assert_eq!(after[1].2, 1);
+        assert!(after[1].3, "the private copy is writable");
+        assert_ne!(
+            after[1].1, old_phys,
+            "the private copy is a different frame"
+        );
+        assert_eq!(
+            after[2],
+            (BASE + 2 * PG, table[0].1 + 2 * PG, 2, false),
+            "right neighbours untouched"
+        );
+        assert!(!s.is_cow_page(parent, page), "mark cleared");
+        // The child still maps the old frame, so it is not reused.
+        let child_view =
+            s.with_user_spaces(|spaces| spaces.get(child).and_then(|a| a.resolve(page)));
+        assert_eq!(child_view.map(|m| m.phys.0), Some(old_phys));
+        assert!(
+            s.memory.memory_objects[old_slot].is_some(),
+            "the old frame is not reclaimed while the child maps it"
+        );
+    }
+}
+
+/// QEMU-BASELINE1 §2 — **page-table capacity for every admitted address space.**
+///
+/// The PT pool backs both page tables and the kernel slab heap, and it used to be 256 pages with
+/// no share reserved for either. On the x86_64 QEMU boot the heap held ~158 of them by the time
+/// userspace ran, which left page tables for about 12 address spaces against a declared
+/// `MAX_ADDRESS_SPACES` of 32: the ordinary-cap cell's fork (the 13th live space) was refused
+/// `OutOfMemory` for its first page table. The pool is now the heap's unchanged share plus a
+/// reserve only page tables can use, derived from the ceiling and from what a standard address
+/// space actually needs — measured here through the real page-table walker, not assumed.
+mod qb1_pt_pool_reserve {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::frame_allocator::{FrameAllocError, pt_pool_heap_admits};
+    use crate::kernel::vm::{MAX_ADDRESS_SPACES, PageFlags, VirtAddr};
+
+    /// The standard user layout of the live boot: ELF image, shared region, stack.
+    const STANDARD_LAYOUT: [u64; 3] = [0x40_0000, 0x2000_0000, 0x7fff_ffbf_f000];
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pt_reserve_backs_every_standard_address_space() {
+        let mut s = Bootstrap::init().expect("init");
+        let (asid, _) = s.create_user_address_space().expect("asid");
+        for va in STANDARD_LAYOUT {
+            let (_, cap) = s.alloc_anonymous_memory_object().expect("mo");
+            s.map_user_page_in_asid_with_caps(asid, cap, VirtAddr(va), PageFlags::USER_RW)
+                .expect("map");
+        }
+        let per_space =
+            crate::arch::selected_isa::page_table::user_table_frames(asid).expect("root");
+        assert_eq!(
+            per_space, 8,
+            "root + 2 upper + 2 middle + 3 leaf tables for the standard layout"
+        );
+        assert!(
+            per_space <= Bootstrap::PT_TABLES_PER_ADDRESS_SPACE,
+            "the per-space bound covers the measured layout"
+        );
+        assert!(
+            Bootstrap::PT_POOL_TABLE_RESERVE_PAGES >= MAX_ADDRESS_SPACES * per_space,
+            "the reserve backs every admitted address space at once, whatever the heap holds"
+        );
+        assert_eq!(
+            Bootstrap::PT_POOL_PAGES,
+            Bootstrap::PT_POOL_HEAP_PAGES + Bootstrap::PT_POOL_TABLE_RESERVE_PAGES
+        );
+    }
+
+    #[test]
+    fn the_heap_share_is_not_raised() {
+        assert_eq!(
+            Bootstrap::PT_POOL_HEAP_PAGES,
+            256,
+            "the heap may hold exactly the 1 MiB it could before (AI_AGENT_RULES §6)"
+        );
+    }
+
+    #[test]
+    fn heap_admission_is_exact_at_the_budget() {
+        assert!(pt_pool_heap_admits(0, 256, 256));
+        assert!(pt_pool_heap_admits(255, 1, 256));
+        assert!(!pt_pool_heap_admits(256, 1, 256));
+        assert!(
+            !pt_pool_heap_admits(250, 7, 256),
+            "a large run past the share"
+        );
+        assert!(
+            !pt_pool_heap_admits(usize::MAX, 1, usize::MAX),
+            "no overflow wrap"
+        );
+        assert!(
+            pt_pool_heap_admits(1 << 20, 1, usize::MAX),
+            "unset budget: unbounded"
+        );
+    }
+
+    /// The heap wrappers refuse past the share with nothing allocated, and a free restores the
+    /// headroom. Runs against the process-global PT pool, which hosted builds use only for page
+    /// tables, so no other test's heap accounting is disturbed; the budget is put back after.
+    #[test]
+    fn a_heap_allocation_past_its_share_is_refused_without_allocating() {
+        use crate::kernel::frame_allocator::{
+            alloc_heap_frames, free_heap_frames, pt_pool_heap_held_pages, set_pt_pool_heap_budget,
+        };
+        let held = pt_pool_heap_held_pages();
+        set_pt_pool_heap_budget(held + 3);
+        let run = alloc_heap_frames(2).expect("within the share");
+        let one = alloc_heap_frames(1).expect("exactly at the share");
+        assert_eq!(pt_pool_heap_held_pages(), held + 3);
+        assert_eq!(
+            alloc_heap_frames(1),
+            Err(FrameAllocError::CapacityExceeded),
+            "past the share"
+        );
+        assert_eq!(pt_pool_heap_held_pages(), held + 3, "nothing was taken");
+        free_heap_frames(one, 1).expect("free");
+        let again = alloc_heap_frames(1).expect("a free restores the headroom");
+        free_heap_frames(again, 1).expect("free");
+        free_heap_frames(run, 2).expect("free");
+        assert_eq!(pt_pool_heap_held_pages(), held);
+        set_pt_pool_heap_budget(usize::MAX);
     }
 }

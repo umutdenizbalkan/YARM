@@ -467,8 +467,18 @@ pub(crate) fn rollback_cow_clone_locked(
     // ── 2. The parent, in reverse order.
     let page_sz = PAGE_SIZE as u64;
     for run in token.wp.iter().rev() {
-        if let Some(aspace) = vm.get_mut(token.parent_asid) {
-            aspace.restore_run_head_flags_in_place(run.virt, run.original);
+        // QEMU-BASELINE1 §2 — restore EXACTLY the pages this fork write-protected. The table may
+        // have changed shape since the clone released the VM lock, so the run that now starts at
+        // `run.virt` is not a witness of the range; see `restore_page_range_flags_in_place`.
+        if let Some(aspace) = vm.get_mut(token.parent_asid)
+            && !aspace.restore_page_range_flags_in_place(run.virt, run.pages, run.original)
+        {
+            crate::yarm_log!(
+                "VM_COW_FORK_ROLLBACK_RESTORE_INCOMPLETE asid={} va=0x{:x} pages={}",
+                token.parent_asid.0,
+                run.virt.0,
+                run.pages
+            );
         }
         for p in 0..run.pages {
             KernelState::clear_cow_page_locked(

@@ -352,48 +352,6 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    fn isolate_page_entry_at(&mut self, idx: usize, virt: VirtAddr) -> Result<usize, VmError> {
-        let entry = self.entries[idx].expect("entry");
-        let page_offset = ((virt.0 - entry.virt.0) / PAGE_SIZE as u64) as usize;
-        // This condition is unreachable via the only call site (map_page), which
-        // only arrives here after find_entry_containing guarantees containment.
-        // Return InvalidAddress (not PrivilegeViolation) to avoid misclassifying
-        // an internal invariant violation as a user privilege check failure.
-        debug_assert!(
-            page_offset < entry.pages,
-            "isolate_page_entry_at: page_offset {page_offset} out of bounds (entry.pages={})",
-            entry.pages
-        );
-        if page_offset >= entry.pages {
-            return Err(VmError::InvalidAddress);
-        }
-        if page_offset == 0 {
-            return Ok(idx);
-        }
-        if self.len >= MAX_MAPPINGS {
-            return Err(VmError::Full);
-        }
-        for shift_idx in (idx + 1..self.len).rev() {
-            self.entries[shift_idx + 1] = self.entries[shift_idx];
-        }
-        let left_pages = page_offset;
-        let right_pages = entry.pages - page_offset;
-        self.entries[idx] = Some(Entry {
-            virt: entry.virt,
-            mapping: entry.mapping,
-            pages: left_pages,
-        });
-        self.entries[idx + 1] = Some(Entry {
-            virt,
-            mapping: Mapping {
-                phys: PhysAddr(entry.mapping.phys.0 + (page_offset as u64 * PAGE_SIZE as u64)),
-                flags: entry.mapping.flags,
-            },
-            pages: right_pages,
-        });
-        self.len += 1;
-        Ok(idx + 1)
-    }
     fn find_entry_index(&self, virt: VirtAddr) -> Result<usize, usize> {
         let mut lo = 0usize;
         let mut hi = self.len;
@@ -550,172 +508,264 @@ impl AddressSpace {
             );
         }
 
-        let exact_idx = match self.find_entry_index(virt) {
-            Ok(i) => Some(i),
-            Err(_) => None,
-        };
-        let containing_idx = self.find_entry_containing(virt);
-        let effective_exact_idx = match (exact_idx, containing_idx) {
-            (some @ Some(_), _) => some,
-            (None, Some(idx)) => Some(self.isolate_page_entry_at(idx, virt)?),
-            (None, None) => None,
-        };
-        match effective_exact_idx {
-            Some(i) => {
-                let old = self.entries[i].as_ref().expect("entry").mapping;
-                let original_pages = self.entries[i].as_ref().expect("entry").pages;
-                // Bug 1 fix: right-split so the tail of a multi-page run keeps its
-                // own tracking entry — overwriting entry.mapping here would corrupt it.
-                let mut split_tail = false;
-                if original_pages > 1 {
-                    if self.len >= MAX_MAPPINGS {
-                        return Err(VmError::Full);
-                    }
-                    let tail_pages = original_pages - 1;
-                    let tail_virt = VirtAddr(virt.0 + PAGE_SIZE as u64);
-                    let tail_phys = PhysAddr(old.phys.0 + PAGE_SIZE as u64);
-                    for shift_idx in (i + 1..self.len).rev() {
-                        self.entries[shift_idx + 1] = self.entries[shift_idx];
-                    }
-                    self.entries[i + 1] = Some(Entry {
-                        virt: tail_virt,
-                        mapping: Mapping {
-                            phys: tail_phys,
-                            flags: old.flags,
-                        },
-                        pages: tail_pages,
-                    });
-                    self.entries[i].as_mut().expect("entry").pages = 1;
-                    self.len += 1;
-                    split_tail = true;
+        // QEMU-BASELINE1 §2 — a page that already lies inside a run is a REPLACEMENT, and it goes
+        // through the one owner that keeps runs maximal. See `replace_page_in_run`.
+        if let Some(idx) = self.find_entry_containing(virt) {
+            return self.replace_page_in_run(idx, virt, mapping);
+        }
+        let i = self.find_entry_index(virt).err().expect("insert idx");
+        // U9-IPC-RESIDUAL1 §5 — the capacity refusal applies to the INSERT, not to every
+        // new page.
+        //
+        // Both merge paths below `return` without growing `self.len` (the prev+next case
+        // even shrinks it), so a page that extends an adjacent run consumes no
+        // bookkeeping entry and a full table is no reason to refuse it. Checking `len`
+        // first refused exactly those pages: a live x86_64 boot mapped
+        // `va=0x40000000` into the last free entry and then refused the physically and
+        // virtually adjacent `va=0x40001000` — which would have merged into the run just
+        // created — with `VM_FULL`, failing the shared-region transaction with
+        // `MapFault`.
+        //
+        // The predicates are pure reads of `entries[i-1]` / `entries[i]`, so hoisting
+        // them changes nothing about what they decide. The refusal stays BEFORE
+        // `arch_map_page`, preserving the Bug-3 property that hardware and the software
+        // shadow never diverge on a rejected mapping.
+        let prev_merge = i > 0
+            && self.entries[i - 1].is_some_and(|prev| {
+                Self::run_precedes_page(&prev, virt, mapping.phys, mapping.flags)
+            });
+        let next_merge = i < self.len
+            && self.entries[i].is_some_and(|next| {
+                Self::page_precedes_run(virt, mapping.phys, mapping.flags, &next)
+            });
+        if !prev_merge && !next_merge && self.len >= MAX_MAPPINGS {
+            crate::yarm_log!(
+                "VM_FULL reason=mapping_bookkeeping_full asid={:?} len={} max_mappings={} va=0x{:x}",
+                self.asid.map(|v| v.0),
+                self.len,
+                MAX_MAPPINGS,
+                virt.0
+            );
+            return Err(VmError::Full);
+        }
+        arch_map_page(self.asid, virt, mapping)?;
+        if prev_merge {
+            // Bug 6 fix: also check if the new page bridges into the next
+            // run so all three entries can be collapsed into one.
+            let next_also_merges = next_merge;
+            if next_also_merges {
+                let next_pages = self.entries[i].expect("next").pages;
+                self.entries[i - 1].as_mut().expect("prev").pages += 1 + next_pages;
+                for shift_idx in i..self.len.saturating_sub(1) {
+                    self.entries[shift_idx] = self.entries[shift_idx + 1];
                 }
-                // Bug 5 fix: BBM — unmap before remap for AArch64 compliance;
-                // also forces a TLB shootdown on x86_64 and RISC-V.
-                arch_unmap_page(self.asid, virt);
-                if let Err(e) = arch_map_page(self.asid, virt, mapping) {
-                    // U9-VM-ENTRY1-L §2: a REPLACEMENT that fails must leave the address space
-                    // exactly as it found it.
-                    //
-                    // Break-before-make has already removed the predecessor from hardware. This
-                    // used to return `Err` with the software entry deleted to match — which is
-                    // internally consistent but silently destroys a mapping the caller neither
-                    // asked to remove nor was told had been removed, and which no caller-side
-                    // journal can compensate because the caller never saw it.
-                    //
-                    // Putting the predecessor back is GUARANTEED, not attempted: on all three
-                    // ports `page_table::unmap_page` clears only the leaf entry and never frees
-                    // an intermediate table, so the walk to this VA's leaf still exists and
-                    // re-mapping the SAME virtual address allocates nothing. It therefore cannot
-                    // fail for the reason the install just did.
-                    if arch_map_page(self.asid, virt, old).is_ok() {
-                        if split_tail {
-                            // Undo the bookkeeping split too, so `len` and the entry shape are
-                            // byte-for-byte what they were on entry.
-                            for shift_idx in i + 1..self.len.saturating_sub(1) {
-                                self.entries[shift_idx] = self.entries[shift_idx + 1];
-                            }
-                            self.entries[self.len - 1] = None;
-                            self.len -= 1;
-                            self.entries[i].as_mut().expect("entry").pages = original_pages;
-                        }
-                        return Err(e);
-                    }
-                    // Unreachable by the argument above: the leaf table is still installed and
-                    // this re-map touches nothing else. If it ever were reached, the only safe
-                    // choice is to keep hardware and the software shadow consistent — never to
-                    // claim a mapping that is not there — and to say so loudly rather than
-                    // panicking in a syscall path.
-                    crate::yarm_log!(
-                        "VM_MAP_REPLACE_RESTORE_FAILED asid={} va=0x{:x} lost_pa=0x{:x}",
-                        self.asid.map(|a| a.0).unwrap_or(0),
-                        virt.0,
-                        old.phys.0
-                    );
-                    for shift_idx in i..self.len.saturating_sub(1) {
-                        self.entries[shift_idx] = self.entries[shift_idx + 1];
-                    }
-                    self.entries[self.len - 1] = None;
-                    self.len -= 1;
-                    return Err(e);
-                }
-                self.entries[i].as_mut().expect("entry").mapping = mapping;
-                Ok(Some(old))
+                self.entries[self.len - 1] = None;
+                self.len -= 1;
+            } else {
+                self.entries[i - 1].as_mut().expect("prev").pages += 1;
             }
-            None => {
-                let i = self.find_entry_index(virt).err().expect("insert idx");
-                // U9-IPC-RESIDUAL1 §5 — the capacity refusal applies to the INSERT, not to every
-                // new page.
-                //
-                // Both merge paths below `return` without growing `self.len` (the prev+next case
-                // even shrinks it), so a page that extends an adjacent run consumes no
-                // bookkeeping entry and a full table is no reason to refuse it. Checking `len`
-                // first refused exactly those pages: a live x86_64 boot mapped
-                // `va=0x40000000` into the last free entry and then refused the physically and
-                // virtually adjacent `va=0x40001000` — which would have merged into the run just
-                // created — with `VM_FULL`, failing the shared-region transaction with
-                // `MapFault`.
-                //
-                // The predicates are pure reads of `entries[i-1]` / `entries[i]`, so hoisting
-                // them changes nothing about what they decide. The refusal stays BEFORE
-                // `arch_map_page`, preserving the Bug-3 property that hardware and the software
-                // shadow never diverge on a rejected mapping.
-                let prev_merge = i > 0
-                    && self.entries[i - 1].is_some_and(|prev| {
-                        Self::run_precedes_page(&prev, virt, mapping.phys, mapping.flags)
-                    });
-                let next_merge = i < self.len
-                    && self.entries[i].is_some_and(|next| {
-                        Self::page_precedes_run(virt, mapping.phys, mapping.flags, &next)
-                    });
-                if !prev_merge && !next_merge && self.len >= MAX_MAPPINGS {
-                    crate::yarm_log!(
-                        "VM_FULL reason=mapping_bookkeeping_full asid={:?} len={} max_mappings={} va=0x{:x}",
-                        self.asid.map(|v| v.0),
-                        self.len,
-                        MAX_MAPPINGS,
-                        virt.0
-                    );
-                    return Err(VmError::Full);
-                }
-                arch_map_page(self.asid, virt, mapping)?;
-                if prev_merge {
-                    // Bug 6 fix: also check if the new page bridges into the next
-                    // run so all three entries can be collapsed into one.
-                    let next_also_merges = next_merge;
-                    if next_also_merges {
-                        let next_pages = self.entries[i].expect("next").pages;
-                        self.entries[i - 1].as_mut().expect("prev").pages += 1 + next_pages;
-                        for shift_idx in i..self.len.saturating_sub(1) {
-                            self.entries[shift_idx] = self.entries[shift_idx + 1];
-                        }
-                        self.entries[self.len - 1] = None;
-                        self.len -= 1;
-                    } else {
-                        self.entries[i - 1].as_mut().expect("prev").pages += 1;
-                    }
-                    return Ok(None);
-                }
+            return Ok(None);
+        }
 
-                if next_merge {
-                    let next = self.entries[i].as_mut().expect("next");
-                    next.virt = virt;
-                    next.mapping = mapping;
-                    next.pages += 1;
-                    return Ok(None);
-                }
+        if next_merge {
+            let next = self.entries[i].as_mut().expect("next");
+            next.virt = virt;
+            next.mapping = mapping;
+            next.pages += 1;
+            return Ok(None);
+        }
 
-                for shift_idx in (i..self.len).rev() {
-                    self.entries[shift_idx + 1] = self.entries[shift_idx];
-                }
-                self.entries[i] = Some(Entry {
-                    virt,
-                    mapping,
-                    pages: 1,
-                });
-                self.len += 1;
-                Ok(None)
+        for shift_idx in (i..self.len).rev() {
+            self.entries[shift_idx + 1] = self.entries[shift_idx];
+        }
+        self.entries[i] = Some(Entry {
+            virt,
+            mapping,
+            pages: 1,
+        });
+        self.len += 1;
+        Ok(None)
+    }
+
+    /// QEMU-BASELINE1 §2 — **replace one page inside an existing run, keeping runs maximal.**
+    ///
+    /// This is the replacement half of [`Self::map_page`]. It used to split the containing run
+    /// around the page (a left split, then a right split) and never re-coalesce, so a
+    /// caller that remaps pages one at a time left one run per page even where the neighbours
+    /// ended up contiguous in virtual AND physical address with identical flags. The ELF loader
+    /// is exactly such a caller — it maps an image with staging permissions, which coalesce into
+    /// one run, then remaps every page with its segment's final permissions — and it left init's
+    /// 121-page image as 121 single-page runs. Init then sat at `MAX_MAPPINGS` (128/128) for a
+    /// reason that was pure representation, and the first copy-on-write split after its fork
+    /// failed `Vm(Full)`.
+    ///
+    /// The shape AFTER the replacement is decided first, from pure reads:
+    ///
+    /// * an **identical** replacement (same physical frame, same flags) changes nothing and
+    ///   needs nothing — no split, no hardware write, no capacity;
+    /// * otherwise the run becomes `[left?][page][right?]`, and the page coalesces with the
+    ///   PREVIOUS run when it sits at the start of its run and continues that run in both address
+    ///   spaces with equal flags, and likewise with the NEXT run at the end.
+    ///
+    /// The net number of entries that shape needs is checked against `MAX_MAPPINGS` BEFORE any
+    /// state is touched, so a genuinely full table is refused `Full` with the software shadow
+    /// and the hardware exactly as they were. The previous code could commit the left split and
+    /// then refuse the right one, leaving a half-split table behind a failed call.
+    fn replace_page_in_run(
+        &mut self,
+        idx: usize,
+        virt: VirtAddr,
+        mapping: Mapping,
+    ) -> Result<Option<Mapping>, VmError> {
+        let page = PAGE_SIZE as u64;
+        let run = self.entries[idx].expect("entry after find_entry_containing");
+        let offset = ((virt.0 - run.virt.0) / page) as usize;
+        let old = Mapping {
+            phys: PhysAddr(run.mapping.phys.0 + offset as u64 * page),
+            flags: run.mapping.flags,
+        };
+        if old == mapping {
+            return Ok(Some(old));
+        }
+        let left_pages = offset;
+        let right_pages = run.pages - offset - 1;
+        let merge_prev = left_pages == 0
+            && idx > 0
+            && self.entries[idx - 1].is_some_and(|prev| {
+                Self::run_precedes_page(&prev, virt, mapping.phys, mapping.flags)
+            });
+        let merge_next = right_pages == 0
+            && idx + 1 < self.len
+            && self.entries[idx + 1].is_some_and(|next| {
+                Self::page_precedes_run(virt, mapping.phys, mapping.flags, &next)
+            });
+        // Entries the replaced run occupies afterwards, against the one it occupies now.
+        let after = usize::from(left_pages > 0) + usize::from(right_pages > 0) + 1;
+        let merged = usize::from(merge_prev) + usize::from(merge_next);
+        let growth = after.saturating_sub(1 + merged);
+        if self.len + growth > MAX_MAPPINGS {
+            crate::yarm_log!(
+                "VM_FULL reason=replacement_split asid={:?} len={} need={} max_mappings={} va=0x{:x}",
+                self.asid.map(|v| v.0),
+                self.len,
+                growth,
+                MAX_MAPPINGS,
+                virt.0
+            );
+            return Err(VmError::Full);
+        }
+
+        // Break-before-make, exactly as before.
+        arch_unmap_page(self.asid, virt);
+        if let Err(e) = arch_map_page(self.asid, virt, mapping) {
+            // U9-VM-ENTRY1-L §2: a REPLACEMENT that fails must leave the address space exactly
+            // as it found it. Re-mapping the SAME virtual address allocates nothing — every
+            // port's `unmap_page` clears only the leaf — so putting the predecessor back cannot
+            // fail for the reason the install just did, and no bookkeeping has changed yet.
+            if arch_map_page(self.asid, virt, old).is_ok() {
+                return Err(e);
+            }
+            // Unreachable by that argument. If it were reached, keep the shadow honest: the page
+            // is not mapped, so it is removed, and the run around it stays. The capacity check
+            // above already covers the one extra entry a middle removal needs.
+            crate::yarm_log!(
+                "VM_MAP_REPLACE_RESTORE_FAILED asid={} va=0x{:x} lost_pa=0x{:x}",
+                self.asid.map(|a| a.0).unwrap_or(0),
+                virt.0,
+                old.phys.0
+            );
+            let (pieces, n) = Self::run_pieces(&run, offset, None);
+            self.splice_entries(idx, idx + 1, &pieces[..n]);
+            return Err(e);
+        }
+
+        // Commit the bookkeeping in the shape decided above.
+        let (mut pieces, mut n) = Self::run_pieces(&run, offset, Some(mapping));
+        let mut start = idx;
+        let mut end = idx + 1;
+        if merge_prev {
+            // The page is `pieces[0]`; fold it into the previous run.
+            let mut prev = self.entries[idx - 1].expect("prev");
+            prev.pages += 1;
+            pieces.copy_within(1..n, 0);
+            n -= 1;
+            // `pieces` now starts after the page; put the grown previous run in front.
+            pieces.copy_within(0..n, 1);
+            pieces[0] = prev;
+            n += 1;
+            start = idx - 1;
+        }
+        if merge_next {
+            // The page is the LAST piece; fold the next run into it.
+            let next = self.entries[idx + 1].expect("next");
+            pieces[n - 1].pages += next.pages;
+            end = idx + 2;
+        }
+        self.splice_entries(start, end, &pieces[..n]);
+        Ok(Some(old))
+    }
+
+    /// `run` with the page at `offset` replaced by `page` (or removed, for `None`), as at most
+    /// three contiguous entries.
+    fn run_pieces(run: &Entry, offset: usize, page: Option<Mapping>) -> ([Entry; 3], usize) {
+        let pg = PAGE_SIZE as u64;
+        let virt = VirtAddr(run.virt.0 + offset as u64 * pg);
+        let mut out = [*run; 3];
+        let mut n = 0;
+        if offset > 0 {
+            out[n] = Entry {
+                virt: run.virt,
+                mapping: run.mapping,
+                pages: offset,
+            };
+            n += 1;
+        }
+        if let Some(mapping) = page {
+            out[n] = Entry {
+                virt,
+                mapping,
+                pages: 1,
+            };
+            n += 1;
+        }
+        let right_pages = run.pages - offset - 1;
+        if right_pages > 0 {
+            out[n] = Entry {
+                virt: VirtAddr(virt.0 + pg),
+                mapping: Mapping {
+                    phys: PhysAddr(run.mapping.phys.0 + (offset as u64 + 1) * pg),
+                    flags: run.mapping.flags,
+                },
+                pages: right_pages,
+            };
+            n += 1;
+        }
+        (out, n)
+    }
+
+    /// Replace `entries[start..end]` with `with`, keeping the table dense and sorted. The caller
+    /// has already checked that the result fits.
+    fn splice_entries(&mut self, start: usize, end: usize, with: &[Entry]) {
+        let removed = end - start;
+        let added = with.len();
+        if added > removed {
+            let grow = added - removed;
+            for i in (end..self.len).rev() {
+                self.entries[i + grow] = self.entries[i];
+            }
+        } else if added < removed {
+            let shrink = removed - added;
+            for i in end..self.len {
+                self.entries[i - shrink] = self.entries[i];
+            }
+            for i in self.len - shrink..self.len {
+                self.entries[i] = None;
             }
         }
+        for (k, entry) in with.iter().enumerate() {
+            self.entries[start + k] = Some(*entry);
+        }
+        self.len = self.len + added - removed;
     }
 
     fn mapping_is_allowed(&self, virt: VirtAddr, flags: PageFlags) -> bool {
@@ -896,6 +946,55 @@ impl AddressSpace {
             let _ = arch_map_page(self.asid, pv, Mapping { phys: pp, flags });
         }
         self.entries[idx].as_mut().expect("entry").mapping.flags = flags;
+    }
+
+    /// QEMU-BASELINE1 §2 — restore EXACTLY `[virt, virt + pages)` to `flags`, whatever shape
+    /// the runs covering it have now.
+    ///
+    /// The fork rollback used [`Self::restore_run_head_flags_in_place`], which restores whatever
+    /// entry now STARTS at the recorded head, over its whole length. That was already unsafe
+    /// when the parent's table changed between the write-protect and the rollback: an adjacent
+    /// read-only page inserted by `map_page`'s merge path grew the write-protected run, and the
+    /// rollback then granted write on it; a split left the tail read-only. With replacements
+    /// now coalescing too, the shape is an even weaker witness of the range. So the range is
+    /// the unit: when one run still covers exactly it, that run is restored in place; otherwise
+    /// each page is restored individually through [`Self::map_page`], which splits and
+    /// coalesces as needed. Returns `false` if any page could not be restored.
+    pub fn restore_page_range_flags_in_place(
+        &mut self,
+        virt: VirtAddr,
+        pages: usize,
+        flags: PageFlags,
+    ) -> bool {
+        if let Ok(idx) = self.find_entry_index(virt)
+            && self.entries[idx].is_some_and(|e| e.pages == pages)
+        {
+            self.restore_run_head_flags_in_place(virt, flags);
+            return true;
+        }
+        let mut all = true;
+        for p in 0..pages {
+            let pv = VirtAddr(virt.0 + p as u64 * PAGE_SIZE as u64);
+            match self.resolve(pv) {
+                Some(m) if m.flags == flags => {}
+                Some(m) => {
+                    if self
+                        .map_page(
+                            pv,
+                            Mapping {
+                                phys: m.phys,
+                                flags,
+                            },
+                        )
+                        .is_err()
+                    {
+                        all = false;
+                    }
+                }
+                None => all = false,
+            }
+        }
+        all
     }
 
     /// True if `phys` falls within ANY mapped run, i.e. in
@@ -2457,5 +2556,276 @@ mod tests {
             let a = mgr.create_user_space().expect("asid");
             assert_ne!(a, Asid(0), "ASID 0 is reserved and must never be allocated");
         }
+    }
+
+    // ── QEMU-BASELINE1 §2 — replacement keeps runs maximal, and fails without partial mutation ──
+
+    const QB_RO: PageFlags = PageFlags {
+        read: true,
+        write: false,
+        execute: false,
+        user: true,
+        cache_policy: CachePolicy::WriteBack,
+    };
+
+    fn qb_runs(a: &AddressSpace) -> alloc::vec::Vec<(u64, u64, usize, PageFlags)> {
+        (0..a.mappings())
+            .map(|i| {
+                let (v, m, n) = a.run_at(i).expect("run");
+                (v.0, m.phys.0, n, m.flags)
+            })
+            .collect()
+    }
+
+    /// Fill `a` with `n` single-page runs that can never coalesce (physically scattered), well
+    /// away from `0x10_0000`.
+    fn qb_fill_singletons(a: &mut AddressSpace, n: usize) {
+        for k in 0..n as u64 {
+            let virt = VirtAddr(0x4000_0000 + k * 2 * PAGE_SIZE as u64);
+            let phys = PhysAddr(0x9000_0000 + k * 7 * PAGE_SIZE as u64);
+            a.map_page(
+                virt,
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("singleton");
+        }
+    }
+
+    /// The ELF loader's shape, exactly: map an image with staging permissions (one run), then
+    /// remap every page with its segment's final permissions. On the unrepaired owner this left
+    /// one run per page — init's 121-page image became 121 runs and pinned it at MAX_MAPPINGS.
+    #[test]
+    fn staged_then_final_remap_keeps_one_run_per_segment() {
+        let mut a = AddressSpace::new_user();
+        let (base, phys) = (0x40_0000u64, 0x1010_0000u64);
+        for p in 0..12u64 {
+            a.map_page(
+                VirtAddr(base + p * PAGE_SIZE as u64),
+                Mapping {
+                    phys: PhysAddr(phys + p * PAGE_SIZE as u64),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("stage");
+        }
+        assert_eq!(a.mappings(), 1, "staging coalesces");
+        // Final permissions: text RX, rodata RO, data RW — per page, in order.
+        let final_flags = |p: u64| match p {
+            0..=4 => PageFlags::USER_RX,
+            5..=7 => QB_RO,
+            _ => PageFlags::USER_RW,
+        };
+        for p in 0..12u64 {
+            let r = a.map_page(
+                VirtAddr(base + p * PAGE_SIZE as u64),
+                Mapping {
+                    phys: PhysAddr(phys + p * PAGE_SIZE as u64),
+                    flags: final_flags(p),
+                },
+            );
+            assert!(r.is_ok(), "final remap of page {p}");
+        }
+        assert_eq!(
+            qb_runs(&a),
+            alloc::vec![
+                (base, phys, 5, PageFlags::USER_RX),
+                (base + 5 * 4096, phys + 5 * 4096, 3, QB_RO),
+                (base + 8 * 4096, phys + 8 * 4096, 4, PageFlags::USER_RW),
+            ],
+            "one run per final-permission segment, not one per page"
+        );
+        for p in 0..12u64 {
+            let m = a.resolve(VirtAddr(base + p * 4096)).expect("mapped");
+            assert_eq!((m.phys.0, m.flags), (phys + p * 4096, final_flags(p)));
+        }
+    }
+
+    /// An identical remap inside a run is a no-op and needs no free entry, even at capacity.
+    #[test]
+    fn identical_remap_inside_a_run_needs_no_capacity() {
+        let mut a = AddressSpace::new_user();
+        for p in 0..4u64 {
+            a.map_page(
+                VirtAddr(0x10_0000 + p * 4096),
+                Mapping {
+                    phys: PhysAddr(0x20_0000 + p * 4096),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("run");
+        }
+        qb_fill_singletons(&mut a, MAX_MAPPINGS - 1);
+        assert_eq!(a.mappings(), MAX_MAPPINGS);
+        let before = qb_runs(&a);
+        let r = a.map_page(
+            VirtAddr(0x10_2000),
+            Mapping {
+                phys: PhysAddr(0x20_2000),
+                flags: PageFlags::USER_RW,
+            },
+        );
+        assert_eq!(
+            r,
+            Ok(Some(Mapping {
+                phys: PhysAddr(0x20_2000),
+                flags: PageFlags::USER_RW
+            }))
+        );
+        assert_eq!(qb_runs(&a), before, "nothing changed");
+    }
+
+    /// THE CAPACITY BOUNDARY. A copy-on-write style replacement in the MIDDLE of a run needs two
+    /// more entries. With one free it must be refused `Full` and leave the table byte-identical;
+    /// the unrepaired owner committed the left split and then refused the right one.
+    #[test]
+    fn middle_replacement_without_room_is_refused_without_partial_mutation() {
+        let mut a = AddressSpace::new_user();
+        for p in 0..4u64 {
+            a.map_page(
+                VirtAddr(0x10_0000 + p * 4096),
+                Mapping {
+                    phys: PhysAddr(0x20_0000 + p * 4096),
+                    flags: QB_RO,
+                },
+            )
+            .expect("run");
+        }
+        qb_fill_singletons(&mut a, MAX_MAPPINGS - 2);
+        assert_eq!(a.mappings(), MAX_MAPPINGS - 1, "exactly one free entry");
+        let before = qb_runs(&a);
+        let private = Mapping {
+            phys: PhysAddr(0x7700_0000),
+            flags: PageFlags::USER_RW,
+        };
+        assert_eq!(a.map_page(VirtAddr(0x10_1000), private), Err(VmError::Full));
+        assert_eq!(qb_runs(&a), before, "no partial split survives a refusal");
+        assert_eq!(
+            a.resolve(VirtAddr(0x10_1000)),
+            Some(Mapping {
+                phys: PhysAddr(0x20_1000),
+                flags: QB_RO
+            }),
+            "the old frame is still what the page maps"
+        );
+    }
+
+    /// With exactly the two entries it needs, the same replacement succeeds and splits the run
+    /// into `[left][page][right]` with every other page's frame and flags untouched.
+    #[test]
+    fn middle_replacement_with_exact_room_splits_into_three() {
+        let mut a = AddressSpace::new_user();
+        for p in 0..4u64 {
+            a.map_page(
+                VirtAddr(0x10_0000 + p * 4096),
+                Mapping {
+                    phys: PhysAddr(0x20_0000 + p * 4096),
+                    flags: QB_RO,
+                },
+            )
+            .expect("run");
+        }
+        qb_fill_singletons(&mut a, MAX_MAPPINGS - 3);
+        assert_eq!(a.mappings(), MAX_MAPPINGS - 2);
+        let private = Mapping {
+            phys: PhysAddr(0x7700_0000),
+            flags: PageFlags::USER_RW,
+        };
+        assert_eq!(
+            a.map_page(VirtAddr(0x10_1000), private),
+            Ok(Some(Mapping {
+                phys: PhysAddr(0x20_1000),
+                flags: QB_RO
+            }))
+        );
+        assert_eq!(a.mappings(), MAX_MAPPINGS);
+        let runs = qb_runs(&a);
+        assert_eq!(runs[0], (0x10_0000, 0x20_0000, 1, QB_RO));
+        assert_eq!(runs[1], (0x10_1000, 0x7700_0000, 1, PageFlags::USER_RW));
+        assert_eq!(runs[2], (0x10_2000, 0x20_2000, 2, QB_RO));
+    }
+
+    /// GENUINE EXHAUSTION: a table of 128 runs that cannot coalesce still refuses a replacement
+    /// that needs a new entry, and still accepts one that does not.
+    #[test]
+    fn a_genuinely_full_table_refuses_only_replacements_that_need_room() {
+        let mut a = AddressSpace::new_user();
+        qb_fill_singletons(&mut a, MAX_MAPPINGS);
+        let before = qb_runs(&a);
+        // A single-page run replaced with a scattered frame: shape unchanged, no room needed.
+        let v0 = VirtAddr(0x4000_0000);
+        assert!(
+            a.map_page(
+                v0,
+                Mapping {
+                    phys: PhysAddr(0x6600_0000),
+                    flags: QB_RO
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(a.mappings(), MAX_MAPPINGS);
+        // A fresh page that extends nothing needs an entry and is refused.
+        assert_eq!(
+            a.map_page(
+                VirtAddr(0x5000_0000),
+                Mapping {
+                    phys: PhysAddr(0x6800_0000),
+                    flags: QB_RO
+                }
+            ),
+            Err(VmError::Full)
+        );
+        assert_eq!(qb_runs(&a)[1..], before[1..], "nothing else moved");
+    }
+
+    /// Fork rollback restores EXACTLY the write-protected range. On the unrepaired owner a
+    /// read-only page inserted next to a write-protected run was merged into it, and restoring
+    /// "the run at the head" then granted WRITE on that page too.
+    #[test]
+    fn rollback_restore_is_range_exact_even_after_the_run_grew() {
+        let mut a = AddressSpace::new_user();
+        for p in 0..4u64 {
+            a.map_page(
+                VirtAddr(0x10_0000 + p * 4096),
+                Mapping {
+                    phys: PhysAddr(0x20_0000 + p * 4096),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("run");
+        }
+        let original = a
+            .write_protect_run_head_in_place(VirtAddr(0x10_0000))
+            .expect("wp");
+        assert!(original.write);
+        // Between the fork's two acquisitions, a read-only neighbour lands: it coalesces.
+        a.map_page(
+            VirtAddr(0x10_4000),
+            Mapping {
+                phys: PhysAddr(0x20_4000),
+                flags: PageFlags {
+                    write: false,
+                    ..PageFlags::USER_RW
+                },
+            },
+        )
+        .expect("neighbour");
+        assert!(a.restore_page_range_flags_in_place(VirtAddr(0x10_0000), 4, original));
+        for p in 0..4u64 {
+            assert!(
+                a.resolve(VirtAddr(0x10_0000 + p * 4096))
+                    .expect("mapped")
+                    .flags
+                    .write,
+                "write-protected page {p} is writable again"
+            );
+        }
+        assert!(
+            !a.resolve(VirtAddr(0x10_4000)).expect("mapped").flags.write,
+            "the neighbour that was never write-protected stays read-only"
+        );
     }
 }

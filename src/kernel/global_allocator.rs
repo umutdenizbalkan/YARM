@@ -9,9 +9,7 @@ mod non_hosted {
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     use crate::arch::platform_layout;
-    use crate::kernel::frame_allocator::{
-        alloc_pt_contiguous_frames, alloc_pt_frame, free_pt_contiguous_frames, free_pt_frame,
-    };
+    use crate::kernel::frame_allocator::{alloc_heap_frames, free_heap_frames};
     use crate::kernel::lock::SpinLockIrq;
     use crate::kernel::vm::PAGE_SIZE;
 
@@ -57,7 +55,7 @@ mod non_hosted {
     //   and all metadata mutations for pages belonging to the class (free-list, bitmap, used count,
     //   unlink/reclaim decisions).
     // - The slab class lock must not be held while calling the frame allocator. Small-allocation
-    //   slow paths drop the class lock before alloc_pt_frame/free_pt_frame, then reacquire and
+    //   slow paths drop the class lock before alloc_heap_frames/free_heap_frames, then reacquire and
     //   rescan before linking a new page. This preserves lock layering: slab class locks sit above
     //   raw frame allocation and never nest around it.
     // - Large allocation path uses a separate lock to serialize large-header lifecycle operations.
@@ -511,14 +509,14 @@ mod non_hosted {
             }
 
             // Slow path: never hold the slab class lock while asking the frame allocator for a
-            // page. alloc_pt_frame() takes the frame-allocator lock, and keeping the class lock
+            // page. alloc_heap_frames() takes the frame-allocator lock, and keeping the class lock
             // across that call would invert allocator lock layering on future multicore paths.
-            let Ok(new_phys) = alloc_pt_frame() else {
+            let Ok(new_phys) = alloc_heap_frames(1) else {
                 return null_mut();
             };
             let page_ptr = Self::phys_to_ptr(new_phys);
             if page_ptr.is_null() {
-                let _ = free_pt_frame(new_phys);
+                let _ = free_heap_frames(new_phys, 1);
                 return null_mut();
             }
 
@@ -539,7 +537,7 @@ mod non_hosted {
             };
 
             if free_new_page {
-                let _ = free_pt_frame(new_phys);
+                let _ = free_heap_frames(new_phys, 1);
             }
             allocated
         }
@@ -558,18 +556,18 @@ mod non_hosted {
             // The extra header-overhead in payload_pages is conservative; it guarantees the
             // caller's layout.size() bytes fit entirely within pages 1..N.
             //
-            // Invariant: alloc_pt_contiguous_frames returns physically and virtually
+            // Invariant: alloc_heap_frames returns physically and virtually
             // contiguous pages (the frame allocator maintains this), so base_ptr+PAGE_SIZE
             // is a valid mapped pointer and the returned slice covers exactly pages 1..N.
             let payload_plus_header = layout.size().saturating_add(size_of::<LargeAllocHeader>());
             let payload_pages = payload_plus_header.div_ceil(PAGE_SIZE).max(1);
             let total_pages = payload_pages.saturating_add(1);
-            let Ok(base_phys) = alloc_pt_contiguous_frames(total_pages) else {
+            let Ok(base_phys) = alloc_heap_frames(total_pages) else {
                 return null_mut();
             };
             let base_ptr = Self::phys_to_ptr(base_phys);
             if base_ptr.is_null() {
-                let _ = free_pt_contiguous_frames(base_phys, total_pages);
+                let _ = free_heap_frames(base_phys, total_pages);
                 return null_mut();
             }
             let header = LargeAllocHeader {
@@ -628,7 +626,7 @@ mod non_hosted {
                             }
                         };
                         if let Some(phys) = reclaim_phys {
-                            let _ = free_pt_frame(phys);
+                            let _ = free_heap_frames(phys, 1);
                         }
                         return;
                     }
@@ -672,7 +670,7 @@ mod non_hosted {
                 return;
             }
             let base_phys = Self::ptr_to_phys(header_ptr as *const u8);
-            let _ = free_pt_contiguous_frames(base_phys, pages);
+            let _ = free_heap_frames(base_phys, pages);
         }
     }
 

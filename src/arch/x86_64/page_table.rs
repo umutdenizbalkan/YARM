@@ -666,6 +666,28 @@ pub fn ensure_asid_root(asid: Asid) -> Result<(), PageTableError> {
     Ok(())
 }
 
+/// QEMU-BASELINE1 §2 — the page-table frames `asid`'s USER half holds (its root included), or
+/// `None` if it has no root. Walks the same hierarchy `remove_asid` frees; the kernel half is
+/// shared and not counted. The PT-pool reserve is derived from this.
+#[cfg(any(test, feature = "hosted-dev"))]
+pub fn user_table_frames(asid: Asid) -> Option<usize> {
+    let state = PAGE_TABLE_STATE.lock();
+    let root = state.asid_root_phys(asid)?;
+    let child = |table: u64, i: usize| {
+        read_table_entry(&state, table, i)
+            .filter(|e| e.is_present() && state.page_index_from_phys(e.addr()).is_some())
+            .map(|e| e.addr())
+    };
+    let mut frames = 1usize;
+    for l3 in (0..pml4_index(vm_layout::KERNEL_SPACE_BASE)).filter_map(|i| child(root, i)) {
+        frames += 1;
+        for l2 in (0..ENTRIES_PER_TABLE).filter_map(|i| child(l3, i)) {
+            frames += 1 + (0..ENTRIES_PER_TABLE).filter_map(|i| child(l2, i)).count();
+        }
+    }
+    Some(frames)
+}
+
 pub fn remove_asid_root(asid: Asid) {
     let mut state = PAGE_TABLE_STATE.lock();
     state.remove_asid(asid);
