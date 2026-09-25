@@ -4140,6 +4140,21 @@ mod ipc_reply_timeout_oracle {
     /// (`doc/KERNEL_TEST_RULES.md` Rule L2). 64 round trips after the death is progress.
     const SERVER_DIES_SURVIVOR_YIELDS: u64 = 64;
 
+    /// The port the health attestation names. QEMU-BASELINE1 §4: it read `x86_64` on every port
+    /// because only x86_64 ever reached it.
+    #[cfg(target_arch = "x86_64")]
+    const SERVER_DIES_ARCH: &str = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    const SERVER_DIES_ARCH: &str = "aarch64";
+    #[cfg(target_arch = "riscv64")]
+    const SERVER_DIES_ARCH: &str = "riscv64";
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
+    const SERVER_DIES_ARCH: &str = "unknown";
+
     /// The ServerDies scenario's own final attestations, emitted by the SURVIVING caller
     /// after it has validated `ServerDied`.
     ///
@@ -4175,7 +4190,8 @@ mod ipc_reply_timeout_oracle {
             out.continuations
         );
         yarm_user_rt::user_log!(
-            "IPC_SERVER_DEATH_SYSTEM_HEALTH_OK arch=x86_64 survivor=init death_result=ServerDied code={} result=ok",
+            "IPC_SERVER_DEATH_SYSTEM_HEALTH_OK arch={} survivor=init death_result=ServerDied code={} result=ok",
+            SERVER_DIES_ARCH,
             out.server_died_code
         );
         // The kernel observes this marker and answers with the quiescent link balance; see
@@ -4554,6 +4570,12 @@ fn run_aarch64_ipc_reply_timeout_oracle(init_tid: u64) {
                 out.late_reply_rejected
             );
         }
+    } else if oracle::is_server_dies() {
+        // QEMU-BASELINE1 §4 — the ServerDies verdict, and ONLY it: the branch the x86_64 driver
+        // gained when its runner first went live. Without it the scenario fell into the reply-wins
+        // tail below and reported `reply_ok=0 result=fail` after the ServerDies path had completed
+        // correctly, and the survivor/health/quiescence attestations were never emitted.
+        oracle::server_dies_final_attestations(&out);
     } else if out.reply_ok
         && out.continuations == 1
         && out.server_replied_ok == 1
@@ -4755,6 +4777,12 @@ fn run_riscv_ipc_reply_timeout_oracle(init_tid: u64) {
                 out.late_reply_rejected
             );
         }
+    } else if oracle::is_server_dies() {
+        // QEMU-BASELINE1 §4 — the ServerDies verdict, and ONLY it: the branch the x86_64 driver
+        // gained when its runner first went live. Without it the scenario fell into the reply-wins
+        // tail below and reported `reply_ok=0 result=fail` after the ServerDies path had completed
+        // correctly, and the survivor/health/quiescence attestations were never emitted.
+        oracle::server_dies_final_attestations(&out);
     } else if out.reply_ok
         && out.continuations == 1
         && out.server_replied_ok == 1
