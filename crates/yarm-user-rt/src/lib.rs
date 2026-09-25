@@ -9,6 +9,9 @@ pub mod recv_v3_draft;
 // issuer anywhere in the system before this mission.
 #[cfg(feature = "pagefault1-demand-witness")]
 pub mod pagefault1_demand_witness;
+// QEMU-BASELINE1 §3 — the controlled workload for the strict timer contract.
+#[cfg(feature = "timer-contract-witness")]
+pub mod timer_contract_witness;
 pub mod vm_entry_witness;
 
 #[macro_export]
@@ -1308,6 +1311,26 @@ pub mod syscall {
         let (read_back, mask) =
             unsafe { crate::arch::touch_checking_callee_saved(addr, value, sentinel) };
         (read_back, mask, crate::arch::CALLEE_SAVED_CHECKED)
+    }
+
+    /// QEMU-BASELINE1 §3 — stay in userspace, reading the TSC, for `budget_cycles`, carrying
+    /// callee-saved sentinels across the whole loop so every timer interrupt that lands in it
+    /// returns into a checked register file. Returns `(gaps, elapsed_cycles, preserved_mask,
+    /// checked)`, where `gaps` counts TSC jumps of at least `gap_cycles`; `None` on a port with
+    /// no implementation.
+    ///
+    /// # Safety
+    ///
+    /// Touches no memory. Safe to call from any task; it only spends that task's time.
+    #[cfg(feature = "timer-contract-witness")]
+    pub unsafe fn spin_checking_callee_saved(
+        budget_cycles: u64,
+        gap_cycles: u64,
+        sentinel: u64,
+    ) -> Option<(u64, u64, u32, u32)> {
+        // SAFETY: forwarded; the loop touches no memory.
+        unsafe { crate::arch::spin_checking_callee_saved(budget_cycles, gap_cycles, sentinel) }
+            .map(|(gaps, elapsed, mask)| (gaps, elapsed, mask, crate::arch::CALLEE_SAVED_CHECKED))
     }
 
     #[inline]

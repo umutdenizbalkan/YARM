@@ -17,8 +17,20 @@ pub(crate) struct SyscallReturn {
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
+#[cfg(all(target_arch = "x86_64", feature = "timer-contract-witness"))]
+pub(crate) use x86_64::spin_checking_callee_saved;
 #[cfg(all(target_arch = "x86_64", feature = "pagefault1-demand-witness"))]
 pub(crate) use x86_64::touch_checking_callee_saved;
+/// QEMU-BASELINE1 §3 — only the x86_64 strict smoke grades the timer contract; elsewhere the
+/// witness reports itself unsupported rather than pretending.
+#[cfg(all(not(target_arch = "x86_64"), feature = "timer-contract-witness"))]
+pub(crate) unsafe fn spin_checking_callee_saved(
+    _budget_cycles: u64,
+    _gap_cycles: u64,
+    _sentinel: u64,
+) -> Option<(u64, u64, u32)> {
+    None
+}
 #[cfg(target_arch = "x86_64")]
 pub(crate) use x86_64::{CALLEE_SAVED_CHECKED, raw_syscall, raw_syscall_checking_callee_saved};
 

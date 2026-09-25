@@ -231,3 +231,76 @@ pub(crate) unsafe fn touch_checking_callee_saved(
     }
     (read_back, mask)
 }
+
+/// QEMU-BASELINE1 §3 — spin in userspace for `budget_cycles` of TSC with `r12`–`r15` holding
+/// distinct sentinels for the whole loop, counting TSC jumps of at least `gap_cycles`.
+///
+/// Returns `(gaps, elapsed_cycles, preserved_mask)`. Every interrupt that lands inside the loop
+/// returns into it, so a resumed task with a clobbered or shuffled register file shows up in the
+/// mask. `rbx` is not among them for the same reason as in `touch_checking_callee_saved`.
+#[cfg(feature = "timer-contract-witness")]
+pub(crate) unsafe fn spin_checking_callee_saved(
+    budget_cycles: u64,
+    gap_cycles: u64,
+    sentinel: u64,
+) -> Option<(u64, u64, u32)> {
+    let s = sentinel as usize;
+    let (mut c0, mut c1, mut c2, mut c3) =
+        (s, s.wrapping_add(1), s.wrapping_add(2), s.wrapping_add(3));
+    let gaps: u64;
+    let elapsed: u64;
+    // SAFETY: reads the TSC and compares registers; no memory is touched and no stack is used.
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            "shl rdx, 32",
+            "or rax, rdx",
+            "mov {start}, rax",
+            "mov {prev}, rax",
+            "xor {gaps:e}, {gaps:e}",
+            "2:",
+            "pause",
+            "rdtsc",
+            "shl rdx, 32",
+            "or rax, rdx",
+            "mov {d}, rax",
+            "sub {d}, {prev}",
+            "mov {prev}, rax",
+            "cmp {d}, {gap}",
+            "jb 3f",
+            "inc {gaps}",
+            "3:",
+            "mov {d}, rax",
+            "sub {d}, {start}",
+            "cmp {d}, {budget}",
+            "jb 2b",
+            start = out(reg) _,
+            prev = out(reg) _,
+            gaps = out(reg) gaps,
+            d = out(reg) elapsed,
+            gap = in(reg) gap_cycles,
+            budget = in(reg) budget_cycles,
+            out("rax") _,
+            out("rdx") _,
+            inlateout("r12") c0,
+            inlateout("r13") c1,
+            inlateout("r14") c2,
+            inlateout("r15") c3,
+            options(nomem, nostack),
+        );
+    }
+    let mut mask = 0u32;
+    if c0 == s {
+        mask |= 1;
+    }
+    if c1 == s.wrapping_add(1) {
+        mask |= 2;
+    }
+    if c2 == s.wrapping_add(2) {
+        mask |= 4;
+    }
+    if c3 == s.wrapping_add(3) {
+        mask |= 8;
+    }
+    Some((gaps, elapsed, mask))
+}

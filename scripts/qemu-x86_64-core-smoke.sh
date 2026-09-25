@@ -658,14 +658,35 @@ fi
 if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
   strict_fail=0
 
-  # U9-TM §2: with the proof knobs off, TimerInterrupt is serviced by the pre-lock split route,
-  # which claims, ticks and re-arms itself — so the three BROAD-arm markers legitimately do not
-  # appear. The progression claim is unchanged and is now attested by `TIMER_SPLIT_TICK_OK
-  # cpu=N tick=T preempt=0 rearm=1`, which carries the same tick field. Accept EITHER attestation;
-  # requiring neither would delete the check rather than re-derive it.
-  if log_has_pattern "TIMER_SPLIT_TICK_OK"; then
-    :
-  else
+  # QEMU-BASELINE1 §3 — the timer contract, measured directly.
+  #
+  # What this check exists to establish is "timer IRQ + EOI + scheduler tick progression": the
+  # local timer interrupt is delivered, acknowledged and re-armed, the scheduler tick advances
+  # across successive interrupts, and a task the interrupt lands on continues with its own
+  # context. It never required a preemption (none occurs at the shipped quantum).
+  #
+  # U9-TM §2 counted only `TIMER_SPLIT_TICK_OK`, which the split route emits for an interrupt
+  # that lands on a RUNNING task. On an ordinary boot nearly every interrupt lands in the idle
+  # halt and settles as `TIMER_SPLIT_IDLE_ADVANCE_COMMITTED` instead, so the count was whatever
+  # the scheduling happened to produce. It is replaced by two measurements:
+  #
+  #   (a) SERVICED interrupts: every split settlement (tick-ok, idle-advance, preempt) ticks,
+  #       acknowledges and re-arms, and says so (`rearm=1`); at least two, tick progressing.
+  #       The broad arm's own markers are still accepted where that arm runs.
+  #   (b) USER-ORIGIN interrupts under a CONTROLLED workload: the `timer-contract-witness`
+  #       feature makes the supervisor spin in userspace, sentinels held in callee-saved
+  #       registers, until the timer has interrupted it. At least two serviced ticks must be
+  #       attributed to that task (`current=<its tid>`) between its BEGIN and its SEAL, with the
+  #       tick strictly increasing, and the SEAL must report its register file intact.
+  #
+  # A build without the witness cannot provide (b) and fails here by name; nothing is inferred
+  # from incidental traffic.
+  norm_log=$(tr '\r' '\n' <"$LOGFILE")
+  split_serviced_re="TIMER_SPLIT_(TICK_OK|IDLE_ADVANCE_COMMITTED|PREEMPT_COMMITTED) cpu=[0-9]+ tick=[0-9]+"
+
+  # Here-strings, not `printf | rg -q`: under pipefail an early-exiting `rg -q` SIGPIPEs the
+  # writer and the pipeline reports failure for a match.
+  if ! rg -a -q "$split_serviced_re" <<<"$norm_log"; then
     for required_timer in "YARM_TIMER_IRQ_DELIVERED" "YARM_TIMER_EOI_DONE" "YARM_SCHED_TICK"; do
       if ! log_has_pattern "$required_timer"; then
         echo "[warn] strict smoke: missing timer/scheduler marker: $required_timer"
@@ -674,17 +695,66 @@ if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
     done
   fi
 
-  tick_lines=$(tr '\r' '\n' <"$LOGFILE" | rg -a -o "(YARM_SCHED_TICK|TIMER_SPLIT_TICK_OK) cpu=[0-9]+ tick=[0-9]+" || true)
-  tick_count=$(printf '%s\n' "$tick_lines" | rg -c "(YARM_SCHED_TICK|TIMER_SPLIT_TICK_OK)" 2>/dev/null || echo 0)
+  not_rearmed=$(rg -a "$split_serviced_re" <<<"$norm_log" | rg -a -v -c "rearm=1" || true)
+  if [[ "${not_rearmed:-0}" -gt 0 ]]; then
+    echo "[warn] strict smoke: ${not_rearmed} serviced timer interrupt(s) not re-armed"
+    strict_fail=1
+  fi
+
+  tick_lines=$(rg -a -o "(YARM_SCHED_TICK|TIMER_SPLIT_TICK_OK|TIMER_SPLIT_IDLE_ADVANCE_COMMITTED|TIMER_SPLIT_PREEMPT_COMMITTED) cpu=[0-9]+ tick=[0-9]+" <<<"$norm_log" || true)
+  tick_count=$(printf '%s\n' "$tick_lines" | rg -c "tick=" 2>/dev/null || echo 0)
   first_tick=$(printf '%s\n' "$tick_lines" | head -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
   last_tick=$(printf '%s\n' "$tick_lines" | tail -n1 | awk -F'tick=' '{print $2}' | awk '{print $1}')
-
   if [[ -z "$first_tick" || -z "$last_tick" || "$tick_count" -lt 2 ]]; then
-    echo "[warn] strict smoke: need at least two scheduler tick markers (got ${tick_count:-0})"
+    echo "[warn] strict smoke: need at least two serviced timer interrupts (got ${tick_count:-0})"
     strict_fail=1
   elif (( last_tick <= first_tick )); then
     echo "[warn] strict smoke: scheduler tick did not progress (first=$first_tick last=$last_tick)"
     strict_fail=1
+  else
+    echo "[ok] strict smoke: ${tick_count} serviced timer interrupts, all re-armed, tick ${first_tick} -> ${last_tick}"
+  fi
+
+  witness=$(awk '
+    function field(line, key,    v) {
+      if (match(line, key "=[0-9]+")) { v = substr(line, RSTART + length(key) + 1, RLENGTH - length(key) - 1); return v }
+      return ""
+    }
+    !began && /USER_LOG tid=[0-9]+ msg=TIMER_CONTRACT_WITNESS_BEGIN/ { wt = field($0, "tid"); began = 1; next }
+    began && !sealed && /USER_LOG tid=[0-9]+ msg=TIMER_CONTRACT_WITNESS_SEAL/ {
+      if (field($0, "tid") == wt) { sealed = 1; seal = $0 }
+      next
+    }
+    began && !sealed && (/TIMER_SPLIT_TICK_OK / && field($0, "current") == wt || /TIMER_SPLIT_PREEMPT_COMMITTED / && field($0, "outgoing") == wt) {
+      if ($0 !~ /rearm=1/) { unarmed++ }
+      t = field($0, "tick") + 0
+      if (n > 0 && t <= last) { nonmono++ }
+      last = t; n++
+    }
+    END {
+      ok = (seal ~ /context_ok=1/ && seal ~ /result=ok/) ? 1 : 0
+      printf "began=%d tid=%s sealed=%d attributed=%d nonmonotonic=%d unarmed=%d seal_ok=%d\n", began, wt, sealed, n, nonmono + 0, unarmed + 0, ok
+    }' <<<"$norm_log")
+  w_began=$(printf '%s' "$witness" | awk -F'began=' '{print $2}' | awk '{print $1}')
+  w_sealed=$(printf '%s' "$witness" | awk -F'sealed=' '{print $2}' | awk '{print $1}')
+  w_attr=$(printf '%s' "$witness" | awk -F'attributed=' '{print $2}' | awk '{print $1}')
+  w_nonmono=$(printf '%s' "$witness" | awk -F'nonmonotonic=' '{print $2}' | awk '{print $1}')
+  w_unarmed=$(printf '%s' "$witness" | awk -F'unarmed=' '{print $2}' | awk '{print $1}')
+  w_seal_ok=$(printf '%s' "$witness" | awk -F'seal_ok=' '{print $2}' | awk '{print $1}')
+  if [[ "$w_began" != "1" ]]; then
+    echo "[warn] strict smoke: timer contract witness absent (build with --features timer-contract-witness)"
+    strict_fail=1
+  elif [[ "$w_sealed" != "1" ]]; then
+    echo "[warn] strict smoke: timer contract witness never sealed — the interrupted task did not continue (${witness})"
+    strict_fail=1
+  elif [[ "$w_seal_ok" != "1" ]]; then
+    echo "[warn] strict smoke: timer contract witness seal failed — register file not intact or budget not spent (${witness})"
+    strict_fail=1
+  elif [[ "${w_attr:-0}" -lt 2 || "${w_nonmono:-1}" -ne 0 || "${w_unarmed:-1}" -ne 0 ]]; then
+    echo "[warn] strict smoke: need at least two re-armed, progressing ticks attributed to the witness task (${witness})"
+    strict_fail=1
+  else
+    echo "[ok] strict smoke: timer contract witness ${witness}"
   fi
 
   if [[ "$strict_fail" -eq 1 ]]; then

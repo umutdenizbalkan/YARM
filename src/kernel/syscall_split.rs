@@ -5001,10 +5001,14 @@ fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement
             );
             return TimerSettlement::IdleQueueAdvance;
         }
+        // QEMU-BASELINE1 §3: `current=` names the task this interrupt landed on — the entering
+        // incarnation captured at (0b) — so the strict smoke can attribute serviced ticks to the
+        // workload it deliberately ran rather than counting whatever happened to be running.
         crate::yarm_log!(
-            "TIMER_SPLIT_TICK_OK cpu={} tick={} preempt=0 rearm=1",
+            "TIMER_SPLIT_TICK_OK cpu={} tick={} preempt=0 rearm=1 current={}",
             cpu.0,
-            tick
+            tick,
+            entering_tid
         );
         return TimerSettlement::ContinueCurrent;
     }

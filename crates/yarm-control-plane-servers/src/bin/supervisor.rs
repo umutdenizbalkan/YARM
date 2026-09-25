@@ -40,6 +40,11 @@ pub extern "C" fn yarm_user_entry() -> ! {
     // grows only THIS task's brk window and touches only inside it.
     #[cfg(feature = "pagefault1-demand-witness")]
     yarm_user_rt::pagefault1_demand_witness::run_once();
+    // QEMU-BASELINE1 §3 — the timer contract's controlled workload. Also FIRST, for the same
+    // reason: nothing of the supervisor's own is in flight while it spins, so every tick it is
+    // interrupted by is attributable to it alone.
+    #[cfg(feature = "timer-contract-witness")]
+    yarm_user_rt::timer_contract_witness::run_once();
     yarm_user_rt::user_log!("SUP_BEFORE_RUN");
     run();
     let ctx = yarm_user_rt::runtime::startup_context();

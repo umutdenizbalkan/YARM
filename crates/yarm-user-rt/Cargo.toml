@@ -14,3 +14,6 @@ hosted-dev = []
 # U9-PAGEFAULT1 §3: gates the demand page-fault witness module. Default-off — it takes real page
 # faults, so it must not sit in the path of every profile that links this crate.
 pagefault1-demand-witness = []
+# QEMU-BASELINE1 §3: gates the timer-contract witness, a bounded userspace spin the timer must
+# interrupt. Default-off — it spends seconds of the calling task's time.
+timer-contract-witness = []

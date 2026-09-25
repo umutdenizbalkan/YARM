@@ -191733,3 +191733,94 @@ mod qb1_pt_pool_reserve {
         set_pt_pool_heap_budget(usize::MAX);
     }
 }
+
+/// QEMU-BASELINE1 §3 — **the strict x86_64 timer check measures the contract, not a count of
+/// whatever happened to be running.**
+///
+/// The check exists for "timer IRQ + EOI + scheduler tick progression". It counted only
+/// `TIMER_SPLIT_TICK_OK`, which the split route emits for an interrupt that lands on a running
+/// task, while nearly every interrupt of an ordinary boot lands in the idle halt — so it saw one
+/// tick and failed in every mode. These pins keep the replacement honest: every serviced
+/// settlement counts and must be re-armed, the controlled workload is REQUIRED (a build without
+/// it fails by name), ticks are attributed to that task by the kernel's own `current=` field, and
+/// neither threshold is lowered. The live negative controls (re-arm removed; `r12` corrupted on
+/// the continue path) are recorded in `doc/KERNEL_UNLOCKING.md`.
+mod qb1_timer_contract_checker {
+    const SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const WITNESS: &str =
+        include_str!("../../../crates/yarm-user-rt/src/timer_contract_witness.rs");
+
+    fn strict_section() -> &'static str {
+        SMOKE
+            .split("# QEMU-BASELINE1 §3 — the timer contract, measured directly.")
+            .nth(1)
+            .expect("the strict timer section")
+            .split("# Optional FAT userspace mount/config smoke markers.")
+            .next()
+            .expect("section end")
+    }
+
+    #[test]
+    fn every_serviced_settlement_counts_and_must_be_rearmed() {
+        let s = strict_section();
+        assert!(s.contains(
+            "split_serviced_re=\"TIMER_SPLIT_(TICK_OK|IDLE_ADVANCE_COMMITTED|PREEMPT_COMMITTED) cpu=[0-9]+ tick=[0-9]+\""
+        ));
+        assert!(
+            s.contains("rg -a -v -c \"rearm=1\""),
+            "an unarmed settlement fails"
+        );
+        assert!(
+            s.contains("\"$tick_count\" -lt 2"),
+            "the two-interrupt floor is kept"
+        );
+        assert!(
+            s.contains("(( last_tick <= first_tick ))"),
+            "and so is progression"
+        );
+    }
+
+    #[test]
+    fn the_controlled_workload_is_required_and_attributed_by_the_kernel() {
+        let s = strict_section();
+        let absent = s
+            .split("timer contract witness absent")
+            .nth(1)
+            .expect("an absent witness is named");
+        assert!(
+            absent
+                .trim_start()
+                .starts_with("(build with --features timer-contract-witness)\"\n    strict_fail=1"),
+            "a build without the witness fails the strict check rather than passing on idle traffic"
+        );
+        assert!(
+            s.contains("field($0, \"current\") == wt"),
+            "ticks attributed to the witness TID"
+        );
+        assert!(
+            s.contains("\"${w_attr:-0}\" -lt 2"),
+            "at least two attributed ticks"
+        );
+        assert!(
+            s.contains("seal ~ /context_ok=1/"),
+            "the resumed register file is graded"
+        );
+        assert!(
+            SPLIT.contains("\"TIMER_SPLIT_TICK_OK cpu={} tick={} preempt=0 rearm=1 current={}\""),
+            "the kernel names the task each serviced tick landed on"
+        );
+    }
+
+    /// The workload bounds itself by a budget, never by the gap heuristic — a TCG host hiccup is
+    /// the same size as an interrupt, so the gap count is reported and nothing else.
+    #[test]
+    fn the_witness_is_bounded_by_budget_not_by_heuristic() {
+        assert!(WITNESS.contains("const BUDGET_CYCLES: u64 = 1 << 33;"));
+        assert!(WITNESS.contains("elapsed >= BUDGET_CYCLES"));
+        assert!(
+            !WITNESS.contains("TARGET_GAPS"),
+            "no gap-count stop condition"
+        );
+    }
+}
