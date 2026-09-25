@@ -22543,3 +22543,33 @@ peer_death_winners=1 exit_returns=0 feature_off_oracle_literals=0 result=ok` (se
 caller {1,1}, record {0,18}); RISC-V the same (record {1,17}). `server_dies_runner_scope` 10/10.
 
 **Limitations.** One CPU; the AP cross-CPU reply/shootdown defect is out of scope.
+
+## 5 — qualification findings (first frozen pass, `b8ccad40`)
+
+The first frozen pass was not accepted; three findings, each investigated against the reference
+under the same configuration rather than rerolled:
+
+* **AArch64 ServerDies, one run in three: a pre-existing production defect, repaired.** The
+  scenario's own reply deadline won before the server ran (`IPC_SERVER_DEATH_TIMEOUT_WON`, now
+  correctly scoped): the caller was parked with `deadline=20` armed at tick 21. The shared trap
+  bridge staged the per-CPU recv-timeout deadline AFTER the split dispatch, so every timed receive
+  the split route parked used the deadline the previous timed-receive trap had staged (in the log,
+  each `blocking=Deadline(N)` precedes that trap's own `YARM_LOCK_SPLIT_RECV_TIMEOUT` staging).
+  Identical on the reference; RISC-V stages nothing and computes from the current tick. The
+  staging now precedes the split dispatch, as both consumers' contracts already stated;
+  `qb1_recv_deadline_staging` pins the order.
+* **`VM_COW=1` strict: a checker count, repaired.** `BEGIN=6 DONE=6 HANDLED=12`. Each split-route
+  COW recovery emits the bare `PAGE_FAULT_HANDLED_COW` and, since U9-PAGEFAULT3 §3, an
+  authenticated settlement under the same prefix; the gate counted both. On the reference the
+  first COW fault fails `Vm(Full)` and the strict run stops at the service-entry check, so no
+  split-route COW recovery ever reached this gate before §2. It now counts the bare line (once
+  per recovery on every route); `qb1_vm_cow_handled_count` pins it.
+* **Hosted suite, 1 of 5,870: pre-existing intermittent race, not repaired (out of scope).**
+  `stage199d_multi_pair_races::g_release_never_retires_a_recycled_pair` — "the fresh lease survived
+  the stale release". In isolation it fails 2/1000 on the reference and 1/1000 on the frozen tree
+  with the same assertion; `DirectAckStore` is untouched by this package.
+
+Unchanged from the first pass and green there: the 12 strict timer runs, the three strict
+ordinary-cap cell runs, the six-cell seal, AArch64/RISC-V core, RISC-V ServerDies ×3, x86_64
+ServerDies, and the five previously green AP profiles. `ap-cross-cpu-reply` fails
+`timeout_before_completion` — the known out-of-scope AP defect.

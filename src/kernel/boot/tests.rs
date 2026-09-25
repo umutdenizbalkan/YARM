@@ -191929,3 +191929,24 @@ mod qb1_recv_deadline_staging {
         );
     }
 }
+
+/// QEMU-BASELINE1 §5 — the VM-COW gate counts ONE handled report per recovery. The split route
+/// emits the bare `PAGE_FAULT_HANDLED_COW` line and, since U9-PAGEFAULT3 §3, an authenticated
+/// settlement line under the same prefix; a prefix count doubled every recovery.
+mod qb1_vm_cow_handled_count {
+    const SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+
+    #[test]
+    fn the_gate_counts_the_bare_marker_the_split_route_emits_once() {
+        assert!(SMOKE.contains(
+            "vm_cow_handled=\"$(tr '\\r' '\\n' <\"$LOGFILE\" | rg -a -c '^PAGE_FAULT_HANDLED_COW[[:space:]]*$' || true)\""
+        ));
+        assert!(
+            !SMOKE.contains("vm_cow_handled=\"$(log_count_pattern 'PAGE_FAULT_HANDLED_COW')\"")
+        );
+        // Why the bare line: each split-route recovery emits it once, alongside the settlement.
+        assert!(SPLIT.contains("crate::yarm_log!(\"PAGE_FAULT_HANDLED_COW\");"));
+        assert!(SPLIT.contains("settle_via_entering_frame(shared, cpu, entering, \"PAGE_FAULT_HANDLED_COW\", \"recovered\")"));
+    }
+}

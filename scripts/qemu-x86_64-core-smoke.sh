@@ -1394,7 +1394,14 @@ if [[ "$VM_COW" == "1" ]]; then
   vm_cow_forks="$(log_count_pattern 'VM_COW_FORK_BEGIN')"
   vm_cow_faults="$(log_count_pattern 'VM_COW_FAULT_BEGIN')"
   vm_cow_dones="$(log_count_pattern 'VM_COW_DONE')"
-  vm_cow_handled="$(log_count_pattern 'PAGE_FAULT_HANDLED_COW')"
+  # QEMU-BASELINE1 §5 — ONE handled report per recovery. Every route emits the bare
+  # `PAGE_FAULT_HANDLED_COW` line exactly once; U9-PAGEFAULT3 §3 added the split route's
+  # authenticated settlement, `PAGE_FAULT_HANDLED_COW cpu=… settlement=retry_instruction`, under
+  # the same prefix, so a word-boundary count reported every split-route recovery twice
+  # (BEGIN=6 DONE=6 HANDLED=12). It went unseen because no split-route COW recovery completed on
+  # this profile until init's mapping table stopped fragmenting. The bare line is the one to count.
+  vm_cow_handled="$(tr '\r' '\n' <"$LOGFILE" | rg -a -c '^PAGE_FAULT_HANDLED_COW[[:space:]]*$' || true)"
+  vm_cow_handled="${vm_cow_handled:-0}"
   # Counted on VM_COW_DONE specifically: `path=private_copy` also appears on the proof-gated
   # PF_PROOF_COW_HANDLE_OK line, so a bare substring count double-reports every recovery. The
   # gate outcome is the same either way; the NUMBER has to be right because the split-route
