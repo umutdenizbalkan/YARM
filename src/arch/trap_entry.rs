@@ -1255,6 +1255,40 @@ pub fn handle_trap_entry_shared(
     // Naming them here keeps that a deliberate no-op rather than a warning.
     #[cfg(target_arch = "riscv64")]
     let _ = (idle_boundary_authenticated, timer_idle_queue_advance);
+    // Stage L4A: architecture-neutral recv-timeout split-read staging for trap
+    // paths that enter through SharedKernel-owned dispatch.
+    //
+    // We pre-read scheduler tick under the scheduler lock and stage a per-CPU deadline slot
+    // consumed by the NR 5 owners. Non-shared/raw trap paths are unchanged.
+    //
+    // QEMU-BASELINE1 §4 — BEFORE the split dispatch, as its consumers state
+    // (`take_preread_recv_timeout_deadline_split`: "stores it per CPU BEFORE any dispatch runs";
+    // the recv route's `consume_preread_deadline`: "the deadline belongs to the TRAP"). It used to
+    // run AFTER the split dispatch, which the timed-receive route falls through to, so the route
+    // parked each timed receive on the deadline the PREVIOUS timed-receive trap had staged, and
+    // left its own for the next one. A deadline inherited from a trap that staged `now + 1`
+    // several ticks earlier is already due: on AArch64 the ServerDies caller was parked with
+    // `deadline=20` at tick 21, and its reply timeout won before the server ran. The store (not a
+    // swap) also overwrites anything a previous trap left behind. Gated exactly like the dispatch
+    // it serves, so a trap that is not dispatched stages nothing.
+    if !post_work_committed
+        && let Some((syscall_nr, timeout_ticks, arch_name)) =
+            shared_recv_timeout_staging_info(context, frame.as_deref())
+    {
+        if syscall_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR && timeout_ticks != 0 {
+            crate::yarm_log!(
+                "YARM_LOCK_SPLIT_RECV_TIMEOUT path=shared_bridge arch={}",
+                arch_name
+            );
+            let now = shared.scheduler_tick_now_split_read();
+            let deadline = now.wrapping_add(timeout_ticks);
+            let cpu_idx = cpu.0 as usize;
+            if cpu_idx < crate::kernel::scheduler::MAX_CPUS && deadline != 0 {
+                crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
+                    .store(deadline, core::sync::atomic::Ordering::Release);
+            }
+        }
+    }
     // U9-TERMINAL-FINAL §3 — A SYSCALL TRAP WITH NO FRAME is settled here, not by absence.
     //
     // The split dispatcher reads its NR and every argument from the frame, so with no frame
@@ -1597,29 +1631,8 @@ pub fn handle_trap_entry_shared(
         }
     }
 
-    // Stage L4A: architecture-neutral recv-timeout split-read staging for trap
-    // paths that enter through SharedKernel-owned dispatch.
-    //
-    // We pre-read scheduler tick under the scheduler lock before taking the
-    // global SharedKernel lock and stage a per-CPU deadline slot consumed by
-    // handle_ipc_recv_timeout. Non-shared/raw trap paths are unchanged.
-    if let Some((syscall_nr, timeout_ticks, arch_name)) =
-        shared_recv_timeout_staging_info(context, frame.as_deref())
-    {
-        if syscall_nr == crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR && timeout_ticks != 0 {
-            crate::yarm_log!(
-                "YARM_LOCK_SPLIT_RECV_TIMEOUT path=shared_bridge arch={}",
-                arch_name
-            );
-            let now = shared.scheduler_tick_now_split_read();
-            let deadline = now.wrapping_add(timeout_ticks);
-            let cpu_idx = cpu.0 as usize;
-            if cpu_idx < crate::kernel::scheduler::MAX_CPUS && deadline != 0 {
-                crate::kernel::scheduler::SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]
-                    .store(deadline, core::sync::atomic::Ordering::Release);
-            }
-        }
-    }
+    // Stage L4A's recv-timeout deadline staging used to sit HERE, after the split dispatch; it now
+    // runs before it (see "QEMU-BASELINE1 §4" above), which is where its consumers require it.
     // Stage 3B-E: SharedKernel trap paths pre-record diagnostic page-fault bookkeeping under
     // `fault_state_lock`. The two recordings are the POINT of this block and they stay: the
     // terminal PageFault route and `KernelState::last_fault` consumers below both read what they

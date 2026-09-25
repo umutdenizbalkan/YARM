@@ -191893,3 +191893,39 @@ mod qb1_server_dies_ports {
         );
     }
 }
+
+/// QEMU-BASELINE1 §4 — **a timed receive parks on its OWN deadline.**
+///
+/// The shared trap bridge staged the per-CPU recv-timeout deadline AFTER the split dispatch, which
+/// the timed-receive route falls through to, so every timed receive the split route parked used
+/// the deadline the previous timed-receive trap had left. On AArch64 that parked the ServerDies
+/// caller on an already-due deadline one run in three (`deadline=20` armed at tick 21).
+mod qb1_recv_deadline_staging {
+    const BRIDGE: &str = include_str!("../../arch/trap_entry.rs");
+
+    #[test]
+    fn the_deadline_is_staged_before_the_split_dispatch_and_only_there() {
+        let body = BRIDGE
+            .split("pub fn handle_trap_entry_shared(")
+            .nth(1)
+            .expect("the shared bridge");
+        let stage = body
+            .find("SPLIT_RECV_TIMEOUT_DEADLINE[cpu_idx]")
+            .expect("the staging store");
+        let dispatch = body
+            .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+            .expect("the split dispatch");
+        assert!(stage < dispatch, "staged before any dispatch runs");
+        assert_eq!(
+            body.matches(".store(deadline, core::sync::atomic::Ordering::Release)")
+                .count(),
+            1,
+            "and nowhere after it, where it would be inherited by the next trap"
+        );
+        let gate = &body[..stage];
+        assert!(
+            gate.contains("if !post_work_committed\n        && let Some((syscall_nr, timeout_ticks, arch_name)) ="),
+            "gated like the dispatch it serves"
+        );
+    }
+}
