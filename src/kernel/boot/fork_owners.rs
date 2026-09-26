@@ -43,6 +43,7 @@ impl KernelState {
                 user_entry: tcb.user_entry,
                 user_stack_top: tcb.user_stack_top,
                 user_context: tcb.user_context,
+                user_fpu: tcb.user_fpu,
                 // Filled in below, from the memory domain.
                 brk_bounds: None,
             })
@@ -154,6 +155,7 @@ impl KernelState {
             tcb.user_entry = publication.user_entry;
             tcb.user_stack_top = publication.user_stack_top;
             tcb.user_context = publication.user_context;
+            tcb.user_fpu = publication.user_fpu;
 
             // ── 3. Commit. Step 1 proved every condition this re-checks.
             crate::kernel::spawn_reservation::commit_live_spawn(tcbs, reservation)

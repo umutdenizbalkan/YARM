@@ -24,6 +24,10 @@ pub struct TrapFrame {
     /// 32 lanes covers x86_64 (RAX..R15), AArch64 (X0..X30 plus SP lane),
     /// and RISC-V integer register snapshots.
     pub user_gprs: [usize; 32],
+    /// QEMU-CONTEXT1 §2 — the user status word at entry: x86_64 RFLAGS, AArch64 SPSR (its NZCV is
+    /// what a return hands back). Captured with the GPRs, applied with the GPRs, sanitized by the
+    /// architecture's return (`user_fpu::sanitize_user_*`). Unused on RISC-V.
+    pub user_status: usize,
 }
 
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
@@ -54,6 +58,7 @@ impl TrapFrame {
             saved_pc: 0,
             saved_sp: 0,
             user_gprs: [0; 32],
+            user_status: 0,
         }
     }
 
@@ -143,6 +148,7 @@ impl TrapFrame {
             instruction_ptr: VirtAddr(self.saved_pc as u64),
             stack_ptr: VirtAddr(self.saved_sp as u64),
             user_gprs: self.user_gprs,
+            user_status: self.user_status,
             arg0: self.args[0],
             arg1: self.args[1],
             arg2: self.args[2],
@@ -156,6 +162,7 @@ impl TrapFrame {
         self.saved_pc = context.instruction_ptr.0 as usize;
         self.saved_sp = context.stack_ptr.0 as usize;
         self.user_gprs = context.user_gprs;
+        self.user_status = context.user_status;
         self.args[0] = context.arg0;
         self.args[1] = context.arg1;
         self.args[2] = context.arg2;
@@ -220,6 +227,7 @@ mod tests {
             instruction_ptr: VirtAddr(0x5000),
             stack_ptr: VirtAddr(0x9000),
             user_gprs: [0; 32],
+            user_status: 0,
             arg0: 7,
             arg1: 8,
             arg2: 10,

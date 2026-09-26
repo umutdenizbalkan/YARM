@@ -6915,6 +6915,7 @@ fn fork_child_preserves_parent_registers_except_arg0() {
         instruction_ptr: VirtAddr(0x8123),
         stack_ptr: VirtAddr(0x8FFF_0000),
         user_gprs: parent_gprs,
+        user_status: 0,
         arg0: 0xAAAA,
         arg1: 0x1111,
         arg2: 0x2222,
@@ -8846,6 +8847,7 @@ fn trap_frame_resume_and_tls_request_are_consumed_for_current_thread() {
             instruction_ptr: VirtAddr(0x9000),
             stack_ptr: VirtAddr(0x9900_0000),
             user_gprs: [0; 32],
+            user_status: 0,
             arg0: 33,
             arg1: 44,
             arg2: 0,
@@ -90718,20 +90720,25 @@ mod stage199a2d2b_guards {
 /// Stage 199A2D2C2 — saved-continuation / canonical-frame invariant guards.
 #[cfg(test)]
 mod stage199a2d2c2_guards {
-    // (8.2) The x86 user-return path EXPLICITLY normalizes user RFLAGS to 0x202 — the canonical
-    // invariant that justifies `SavedUserReturnFrame::rflags = USER_RFLAGS`. Source-guarded so the
-    // fixed value is never a silent substitution: it mirrors the canonical BSP return policy.
+    // (8.2) The x86 user-return path EXPLICITLY normalizes user RFLAGS — never a silent
+    // substitution. QEMU-CONTEXT1 §2 changed WHAT it normalizes to: the resuming continuation's
+    // own saved status word, sanitized (arithmetic flags/DF/AC/ID kept, IF forced, nothing
+    // privileged), instead of a manufactured 0x202. A continuation that never ran still gets
+    // exactly 0x202, which is the value the (unwired) AP `SavedUserReturnFrame` model carries.
     #[test]
     fn user_rflags_normalization_is_canonical() {
         let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
         assert!(
-            dt.contains("frame.rflags = 0x202;"),
-            "the canonical user-return path normalizes RFLAGS to 0x202"
+            dt.contains(
+                "frame.rflags = crate::kernel::user_fpu::sanitize_user_rflags(trap_frame.user_status as u64);"
+            ),
+            "the canonical user-return path normalizes the resuming task's own RFLAGS"
         );
+        assert!(!dt.contains("frame.rflags = 0x202;"));
         assert_eq!(
             crate::arch::x86_64::ap_sched::USER_RFLAGS,
-            0x202,
-            "the saved-frame RFLAGS matches the canonical normalization"
+            crate::kernel::user_fpu::sanitize_user_rflags(0),
+            "the fresh-continuation value is the canonical normalization of an empty status"
         );
     }
 
@@ -90844,7 +90851,7 @@ mod stage199a2d2c2a_guards {
              prove nothing about this one"
         );
         assert!(
-            smp.contains("resume_user_mode_iret(&frame)"),
+            smp.contains("resume_user_mode_iret(&frame, &fpu)"),
             "returns via the saved-frame asm"
         );
         assert!(
@@ -91463,7 +91470,7 @@ mod stage199a2d2c2b2_guards {
     // (15) The SAVED path (yarm_x86_resume_ring3), not a fresh entry, reaches the continuation.
     #[test]
     fn saved_path_reaches_continuation() {
-        assert!(SMP.contains("resume_user_mode_iret(&frame)"));
+        assert!(SMP.contains("resume_user_mode_iret(&frame, &fpu)"));
         assert!(SMP.contains("AP_DISPATCH_COUNT[idx].load(Ordering::Acquire) >= 1"));
     }
 
@@ -91892,7 +91899,7 @@ mod stage199a2d2c2c_reply_guards {
         assert!(body.contains("on_preempt_prefer_on_cpu_split(cpu, client_tid)"));
         assert!(body.contains("ap_saved_resume_context_split(client_tid)"));
         assert!(body.contains("clear_trap_dispatch_depth(cpu)"));
-        assert!(body.contains("resume_user_mode_iret(&frame)"));
+        assert!(body.contains("resume_user_mode_iret(&frame, &fpu)"));
         // Invoked from the trap-return path, not the 0xF1 handler.
         assert!(DT.contains("c2c_bsp_saved_frame_resume(shared, cpu)"));
     }
@@ -92042,7 +92049,7 @@ mod stage199a2d3_freeze_guards {
             "depth must be cleared exactly once on the diverging path"
         );
         let clear_pos = body.find("clear_trap_dispatch_depth(cpu)").unwrap();
-        let iret_pos = body.find("resume_user_mode_iret(&frame)").unwrap();
+        let iret_pos = body.find("resume_user_mode_iret(&frame, &fpu)").unwrap();
         assert!(
             clear_pos < iret_pos,
             "depth clear must precede the diverging iretq"
@@ -92086,7 +92093,7 @@ mod stage199a2d3_freeze_guards {
             .unwrap();
         let fs = body.find("IA32_FS_BASE").unwrap();
         let cr3 = body.find("mov cr3, {}").unwrap();
-        let iret = body.find("resume_user_mode_iret(&frame)").unwrap();
+        let iret = body.find("resume_user_mode_iret(&frame, &fpu)").unwrap();
         assert!(select < publish, "select before publishing current");
         assert!(publish < fs, "publish current before loading FS");
         assert!(fs < cr3, "FS + CR3 loaded before diverging");
@@ -102193,10 +102200,11 @@ mod stage200d0b3_x86_exit_corrected {
         // calls and which lives in the vector epilogue.
         assert!(!b.contains("flush_trap_context_to_iret_frame"));
         assert!(!b.contains("write_task_gprs_to_saved_regs"));
-        // QEMU-IRQ3: the commit also carries whether this is a same-task asynchronous return.
-        assert!(DESC_SRC.contains(
-            "flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame, same_task_async_return)"
-        ));
+        // QEMU-CONTEXT1 §2: the commit installs the resuming continuation's own saved flags, so
+        // it needs nothing beyond the frame and the trap frame (IRQ3's same-task flag is gone).
+        assert!(
+            DESC_SRC.contains("flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame)")
+        );
     }
 
     // ── WouldBlock preservation (16–17) ─────────────────────────────────────────────
@@ -102617,9 +102625,7 @@ mod stage200d0b3_x86_exit_corrected {
             .nth(1)
             .expect("shared dispatch call");
         let commit = stub
-            .find(
-                "flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame, same_task_async_return)",
-            )
+            .find("flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame)")
             .expect("the real iret-frame commit");
         let attest = stub
             .find("maybe_attest_exit_common_epilogue(cpu, \"replacement\")")
@@ -122754,11 +122760,14 @@ mod stage199d_wa2b_wake_owner_census {
         // U9-EXIT1 §4 RETIRED this fingerprint along with the write it pinned: the joiner wake is
         // now `exit_claim::wake_joiners_for_locked`'s, fingerprinted there.
         // U9-FORK1 §4 RETIRED this fingerprint along with the write it pinned.
+        // QEMU-CONTEXT1 §2 re-derived this row: the literal gained the `user_fpu` DATA field
+        // (a fresh TCB's FP/SIMD home is the architectural initial state). The status write is
+        // unchanged — still the one fresh-constructor `Runnable` — so the verdict stands.
         (
             "src/kernel/task.rs",
             "new",
             "status:",
-            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, first_resume_consumed: false, blocked_send_generation: 0, pending_syscall_completion: None, async_preempted: None, async_preempt_generation: 0, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
+            "TaskStatus::Runnable, asid, tls_ptr: None, user_entry: None, user_stack_top: None, user_context: UserRegisterContext::default(), user_fpu: crate::kernel::user_fpu::UserFpuState::initial(), detach_state: ThreadDetachState::Joinable, fault_policy_override: None, restart: RestartState::default(), kernel_context: KernelExecutionContext::default(), cpu_affinity: None, ipc_timeout_deadline: None, ipc_timeout_fired: false, blocked_recv_state: None, reply_timeout_token: None, reply_timeout_clock: crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick, server_reply_link: None, blocked_recv_generation: 0, first_resume_consumed: false, blocked_send_generation: 0, pending_syscall_completion: None, async_preempted: None, async_preempt_generation: 0, spawn_reservation: None, } } /// Stage 199D-WA3B: a NON-LIVE spawn reservation. /// /// Deliberately a separate constructor from [`Self::new`]: ordinary registration must not /// silently acquire spawn-reservation semantics, and a reservation must not silently be an /// ordinary live task. The only difference is the status and the reservation record — every /// other field is the same default, so the pre-spawn provisioning bootstrap needs /// (CNode/process association, class, kernel stack and kernel context) works unchanged. pub fn reserved(tid: ThreadId, reservation: SpawnReservation) -> Self { let mut tcb = Self::new(tid, None)",
             "thread_group_id: ThreadGroupId(tid.0),",
             "asid,",
         ),
@@ -126681,7 +126690,7 @@ mod u3_ap_saved_context_snapshot {
         let wrmsr = body.find("wrmsr").expect("FS restoration");
         let frame = body.find("ApSavedResumeFrame").expect("frame construction");
         let diverge = body
-            .find("resume_user_mode_iret(&frame)")
+            .find("resume_user_mode_iret(&frame, &fpu)")
             .expect("divergence");
         assert!(
             snapshot < validate
@@ -127255,7 +127264,7 @@ mod u3_ap_enqueue_dispatch_transaction {
             "X86_AP_SAVED_FRAME_COMMITTED",
             "wrmsr",
             "ApSavedResumeFrame",
-            "resume_user_mode_iret(&frame)",
+            "resume_user_mode_iret(&frame, &fpu)",
         ] {
             assert!(
                 tail.contains(step),
@@ -140593,7 +140602,7 @@ mod u3_bsp_saved_resume_retirement {
         let frame = body.find("ApSavedResumeFrame").expect("frame");
         let cr3 = body.find("mov cr3, {}").expect("CR3 load");
         let iret = body
-            .find("resume_user_mode_iret(&frame)")
+            .find("resume_user_mode_iret(&frame, &fpu)")
             .expect("divergence");
         for (a, b, what) in [
             (gate_reply, gate_client, "reply gate before client gate"),
@@ -140648,7 +140657,7 @@ mod u3_bsp_saved_resume_retirement {
             "X86_BSP_SAVED_DISPATCH_OK",
             "configure_syscall_msrs_for_self()",
             "ApSavedResumeFrame",
-            "resume_user_mode_iret(&frame)",
+            "resume_user_mode_iret(&frame, &fpu)",
         ] {
             assert!(tail.contains(step), "`{step}` still runs, guard-free");
         }
@@ -164395,6 +164404,7 @@ mod u9a64cow2_argument_mirror {
             instruction_ptr: VirtAddr(0x409160),
             stack_ptr: VirtAddr(0x3fbff8a0),
             user_gprs,
+            user_status: 0,
             arg0: 0,
             arg1: 0,
             arg2: 0,
@@ -164427,6 +164437,7 @@ mod u9a64cow2_argument_mirror {
             instruction_ptr: VirtAddr(0x400000),
             stack_ptr: VirtAddr(0x7000),
             user_gprs: [0; 32],
+            user_status: 0,
             arg0: 41,
             arg1: 42,
             arg2: 43,
@@ -185305,7 +185316,10 @@ mod u9timer5_idle_boundary {
             "frame.rsp = user_sp as u64;",
             "frame.cs = USER_CODE_SELECTOR as u64;",
             "frame.ss = USER_DATA_SELECTOR as u64;",
-            "frame.rflags = 0x202;",
+            // QEMU-CONTEXT1 §2: the resumed task's own sanitized flags (IF forced, nothing
+            // privileged) rather than a manufactured 0x202.
+            "frame.rflags =",
+            "crate::kernel::user_fpu::sanitize_user_rflags(trap_frame.user_status as u64);",
         ] {
             assert!(
                 flush.contains(field),
@@ -185346,9 +185360,26 @@ mod u9timer5_idle_boundary {
             .find("idle_boundary::take_user_return(cpu.0 as usize)")
             .expect("the debt take");
         let spsr = wb
-            .find("frame.spsr_el1 = SPSR_EL0T_IRQ_UNMASKED;")
+            .find("frame.spsr_el1 = SPSR_EL0T_IRQ_UNMASKED")
             .expect("the privilege transition");
-        assert!(take < spsr, "the SPSR is rewritten only under a taken debt");
+        assert!(
+            take < spsr,
+            "the privilege transition happens only under a taken debt"
+        );
+        // QEMU-CONTEXT1 §2: an EL0t return (and the converted one) carries the resumed task's own
+        // NZCV and nothing else. The ordinary rewrite is confined to frames that ALREADY name
+        // EL0t, so it can never change the privilege level; only the debt can.
+        let el0t = wb
+            .find("if frame.spsr_el1 & 0x1F == 0 {")
+            .expect("the EL0t-only NZCV install");
+        assert!(el0t < take);
+        assert_eq!(
+            wb.matches(
+                "crate::kernel::user_fpu::sanitize_user_spsr(trap_frame.user_status as u64)"
+            )
+            .count(),
+            2
+        );
         assert!(
             wb.contains("const SPSR_EL0T_IRQ_UNMASKED: u64 = 0;"),
             "EL0t with DAIF clear — the same value the first-entry path installs with \
@@ -192139,5 +192170,195 @@ mod qb1_vm_cow_handled_count {
         // Why the bare line: each split-route recovery emits it once, alongside the settlement.
         assert!(SPLIT.contains("crate::yarm_log!(\"PAGE_FAULT_HANDLED_COW\");"));
         assert!(SPLIT.contains("settle_via_entering_frame(shared, cpu, entering, \"PAGE_FAULT_HANDLED_COW\", \"recovered\")"));
+    }
+}
+
+/// QEMU-CONTEXT1 §4 — the ownership rules of a task's FP/SIMD home, exercised through the owners
+/// production uses: every creation path starts from the architectural initial state (never another
+/// task's bytes), fork copies the parent's home by value on BOTH fork routes, a failed spawn
+/// replays the reservation's home, a cleared slot's next occupant is fresh, and the trap-path
+/// commit/load accessors touch exactly the task they name.
+mod qemu_context1_user_fpu_ownership {
+    use super::*;
+    use crate::kernel::user_fpu::UserFpuState;
+    use crate::runtime::SharedKernel;
+
+    fn dirty(seed: u8) -> UserFpuState {
+        let mut s = UserFpuState::initial();
+        for (i, b) in s.bytes_mut().iter_mut().enumerate() {
+            *b = seed ^ (i as u8).wrapping_mul(0x3B);
+        }
+        s
+    }
+
+    fn home(state: &KernelState, tid: u64) -> Option<UserFpuState> {
+        state.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.user_fpu)
+        })
+    }
+
+    fn set_home(state: &mut KernelState, tid: u64, s: UserFpuState) {
+        state.with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .expect("tcb")
+                .user_fpu = s;
+        });
+    }
+
+    fn slot_of(state: &KernelState, tid: u64) -> Option<usize> {
+        state.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .position(|t| t.as_ref().is_some_and(|t| t.tid.0 == tid))
+        })
+    }
+
+    fn app(tid: u64, entry: usize, asid: crate::kernel::vm::Asid) -> UserImageSpec {
+        UserImageSpec {
+            tid,
+            entry,
+            asid: Some(asid),
+            class: TaskClass::App,
+            startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+            ..Default::default()
+        }
+    }
+
+    fn spawned(tid: u64) -> KernelState {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state
+            .reserve_and_spawn_user_task_from_image_for_test(app(tid, 0x8000, asid))
+            .expect("spawn");
+        state
+    }
+
+    #[test]
+    fn a_spawned_image_starts_from_the_initial_state_not_the_reservations_residue() {
+        let mut state = Bootstrap::init().expect("init");
+        let token = state
+            .reserve_task_for_spawn_with_class(61, TaskClass::App)
+            .expect("reserve");
+        // Whatever the reserved TCB holds, the published image starts from the reset state.
+        set_home(&mut state, 61, dirty(0x61));
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state
+            .spawn_user_task_from_image(token, app(61, 0x8000, asid))
+            .expect("spawn");
+        assert_eq!(home(&state, 61), Some(UserFpuState::initial()));
+    }
+
+    #[test]
+    fn a_new_thread_starts_from_its_own_initial_state_not_its_leaders() {
+        let mut state = spawned(62);
+        set_home(&mut state, 62, dirty(0x62));
+        let tls = 0xABCD_0000usize;
+        let thread = state
+            .spawn_user_thread(62, tls, 0x8800_0000, 0x8010)
+            .expect("thread");
+        assert_eq!(
+            home(&state, thread),
+            Some(UserFpuState::initial_for_thread(tls as u64))
+        );
+        assert_eq!(
+            home(&state, 62),
+            Some(dirty(0x62)),
+            "the leader is untouched"
+        );
+    }
+
+    #[test]
+    fn a_fork_child_inherits_the_parents_home_by_value_on_the_broad_route() {
+        let mut state = spawned(63);
+        set_home(&mut state, 63, dirty(0x63));
+        let child = state.fork_user_process_cow(63, None).expect("fork");
+        assert_eq!(home(&state, child), Some(dirty(0x63)));
+        // By value: the parent's next commit does not reach the child.
+        set_home(&mut state, 63, dirty(0x36));
+        assert_eq!(home(&state, child), Some(dirty(0x63)));
+    }
+
+    #[test]
+    fn a_fork_child_inherits_the_parents_home_by_value_on_the_split_route() {
+        let mut state = spawned(64);
+        set_home(&mut state, 64, dirty(0x64));
+        let k = SharedKernel::new(state);
+        let cpu = k.current_cpu_split_read();
+        let mut owners = crate::kernel::syscall::spawn_txn::SharedSpawnOwners {
+            shared: &k,
+            spawner_tid: Some(64),
+            spawner_cnode: k.task_cnode_split(64),
+            cpu,
+        };
+        let child = crate::kernel::syscall::fork_txn::fork_process_cow(&mut owners, 64, None)
+            .expect("split fork");
+        assert_eq!(k.load_user_fpu_split(child), Some(dirty(0x64)));
+        assert_eq!(k.load_user_fpu_split(64), Some(dirty(0x64)));
+    }
+
+    #[test]
+    fn a_failed_spawn_replays_the_reservations_home() {
+        use crate::kernel::spawn_reservation as sr;
+        let mut state = Bootstrap::init().expect("init");
+        let token = state
+            .reserve_task_for_spawn_with_class(65, TaskClass::App)
+            .expect("reserve");
+        let before = home(&state, 65).expect("home");
+        let baseline = state
+            .with_tcbs_mut(|tcbs| sr::claim_for_spawn(tcbs, &token))
+            .expect("claim");
+        set_home(&mut state, 65, dirty(0x65));
+        state
+            .with_tcbs_mut(|tcbs| sr::restore_after_failed_spawn(tcbs, &token, baseline))
+            .expect("restore");
+        assert_eq!(home(&state, 65), Some(before));
+    }
+
+    #[test]
+    fn a_cleared_slots_next_occupant_starts_fresh() {
+        let mut state = Bootstrap::init().expect("init");
+        let token = state
+            .reserve_task_for_spawn_with_class(66, TaskClass::App)
+            .expect("reserve");
+        let slot = slot_of(&state, 66).expect("slot");
+        set_home(&mut state, 66, dirty(0x66));
+        state.cancel_spawn_reservation(token).expect("cancel");
+        assert_eq!(slot_of(&state, 66), None);
+        state
+            .reserve_task_for_spawn_with_class(67, TaskClass::App)
+            .expect("reserve again");
+        assert_eq!(slot_of(&state, 67), Some(slot), "the same slot is reused");
+        assert_eq!(home(&state, 67), Some(UserFpuState::initial()));
+    }
+
+    #[test]
+    fn commit_and_load_touch_exactly_the_named_task() {
+        let mut state = spawned(68);
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state
+            .reserve_and_spawn_user_task_from_image_for_test(app(69, 0x9000, asid))
+            .expect("spawn");
+        let k = SharedKernel::new(state);
+        assert!(k.commit_user_fpu_split(68, &dirty(0x68)));
+        assert_eq!(k.load_user_fpu_split(68), Some(dirty(0x68)));
+        assert_eq!(
+            k.load_user_fpu_split(69),
+            Some(UserFpuState::initial()),
+            "a commit never reaches another task's home"
+        );
+        // An absent task is refused on both sides: nothing is stored, nothing is invented.
+        assert!(!k.commit_user_fpu_split(4242, &dirty(0x42)));
+        assert_eq!(k.load_user_fpu_split(4242), None);
+    }
+
+    #[test]
+    fn a_fresh_tcb_carries_the_initial_home() {
+        let tcb =
+            crate::kernel::task::ThreadControlBlock::new(crate::kernel::ipc::ThreadId(70), None);
+        assert_eq!(tcb.user_fpu, UserFpuState::initial());
     }
 }

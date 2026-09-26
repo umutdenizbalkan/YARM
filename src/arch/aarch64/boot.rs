@@ -4875,6 +4875,42 @@ yarm_aarch64_enter_user_mode_eret:
     mov x1, x20
     bl yarm_aarch64_before_eret_marker
     bl yarm_aarch64_user_entry_marker_before_eret
+    // QEMU-CONTEXT1 §2: a first entry starts from the architectural initial FP/SIMD state —
+    // every vector register zero, FPCR/FPSR zero — installed after the last `bl`.
+    movi v0.2d, #0
+    movi v1.2d, #0
+    movi v2.2d, #0
+    movi v3.2d, #0
+    movi v4.2d, #0
+    movi v5.2d, #0
+    movi v6.2d, #0
+    movi v7.2d, #0
+    movi v8.2d, #0
+    movi v9.2d, #0
+    movi v10.2d, #0
+    movi v11.2d, #0
+    movi v12.2d, #0
+    movi v13.2d, #0
+    movi v14.2d, #0
+    movi v15.2d, #0
+    movi v16.2d, #0
+    movi v17.2d, #0
+    movi v18.2d, #0
+    movi v19.2d, #0
+    movi v20.2d, #0
+    movi v21.2d, #0
+    movi v22.2d, #0
+    movi v23.2d, #0
+    movi v24.2d, #0
+    movi v25.2d, #0
+    movi v26.2d, #0
+    movi v27.2d, #0
+    movi v28.2d, #0
+    movi v29.2d, #0
+    movi v30.2d, #0
+    movi v31.2d, #0
+    msr fpcr, xzr
+    msr fpsr, xzr
     isb
     mov x0, x21
     mov x1, x22
@@ -5011,7 +5047,7 @@ yarm_aarch64_vector_table_el1:
     .global yarm_aarch64_vector_dispatch
     .type yarm_aarch64_vector_dispatch,%function
 yarm_aarch64_vector_dispatch:
-    // Per-task EL1 stack frame layout (800 bytes total):
+    // Per-task EL1 stack frame layout (832 bytes total):
     //   0x000..0x0F7 : x0..x30 (31 x 8 bytes)
     //   0x0F8        : SP_EL0
     //   0x100        : ELR_EL1
@@ -5019,7 +5055,11 @@ yarm_aarch64_vector_dispatch:
     //   0x110        : ESR_EL1
     //   0x118        : FAR_EL1
     //   0x120..0x31F : q0..q31 (32 x 16 bytes)
-    sub sp, sp, #800
+    //   0x320        : FPCR        | QEMU-CONTEXT1: 0x120..0x33F is byte-for-byte a
+    //   0x328        : FPSR        | `user_fpu::UserFpuState`, so the trap commits it to the
+    //   0x330        : TPIDR_EL0   | interrupted task's home and loads the resuming task's home
+    //   0x338        : (pad)       | into it without any reshaping.
+    sub sp, sp, #832
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
@@ -5046,15 +5086,11 @@ yarm_aarch64_vector_dispatch:
     // x19 is callee-saved (AAPCS64), and the frame slot above already holds its incoming value,
     // so the exit path still restores the interrupted context exactly.
     mov x19, x0
-    ldr x9, [sp, #800]
+    ldr x9, [sp, #832]
     str x9, [sp, #0]
     mrs x9, sp_el0
     str x9, [sp, #248]
     mrs x9, elr_el1
-    mov x10, x9
-    mov x0, x10
-    bl yarm_aarch64_vector_elr_marker
-    mov x9, x10
     str x9, [sp, #256]
     mrs x9, spsr_el1
     str x9, [sp, #264]
@@ -5062,6 +5098,9 @@ yarm_aarch64_vector_dispatch:
     str x9, [sp, #272]
     mrs x9, far_el1
     str x9, [sp, #280]
+    // QEMU-CONTEXT1 §2: the whole FP/SIMD file and the user-writable FP/TLS control state are
+    // captured HERE, before the first `bl` — any compiled code, the markers included, may use
+    // q0..q31 and would otherwise destroy the interrupted state before it was saved.
     stp q0, q1, [sp, #288]
     stp q2, q3, [sp, #320]
     stp q4, q5, [sp, #352]
@@ -5078,11 +5117,42 @@ yarm_aarch64_vector_dispatch:
     stp q26, q27, [sp, #704]
     stp q28, q29, [sp, #736]
     stp q30, q31, [sp, #768]
+    mrs x9, fpcr
+    str x9, [sp, #800]
+    mrs x9, fpsr
+    str x9, [sp, #808]
+    mrs x9, tpidr_el0
+    str x9, [sp, #816]
+    // The kernel's own FP control environment: round to nearest, no flush-to-zero, no traps.
+    msr fpcr, xzr
+    ldr x0, [sp, #256]
+    bl yarm_aarch64_vector_elr_marker
     bl yarm_aarch64_vector_first_marker
     msr daifset, #0xf
     mov x0, x19
     mov x1, sp
     bl yarm_aarch64_vector_entry
+    // Set all system registers before any debug marker calls.
+    ldr x9, [sp, #248]
+    msr sp_el0, x9
+    ldr x9, [sp, #256]
+    msr elr_el1, x9
+    ldr x9, [sp, #264]
+    msr spsr_el1, x9
+    // All debug marker calls happen here, before any user GPR is restored.
+    // Every bl clobbers x0..x18 and x30 (caller-saved per AAPCS), but the
+    // vector frame memory at [sp+0..sp+831] is not touched by callees since
+    // they allocate their own frames below sp.
+    ldr x0, [sp, #256]
+    bl yarm_aarch64_return_to_user_elr_marker
+    mrs x0, elr_el1
+    bl yarm_aarch64_write_return_elr_marker
+    mrs x0, elr_el1
+    bl yarm_aarch64_final_elr_reg_marker
+    ldr x0, [sp, #0]
+    bl yarm_aarch64_return_to_user_x0_marker
+    // QEMU-CONTEXT1 §2: FP/SIMD and FP/TLS control state are restored only now, after the last
+    // `bl` — nothing compiled runs between this and the `eret`.
     ldp q0, q1, [sp, #288]
     ldp q2, q3, [sp, #320]
     ldp q4, q5, [sp, #352]
@@ -5099,25 +5169,12 @@ yarm_aarch64_vector_dispatch:
     ldp q26, q27, [sp, #704]
     ldp q28, q29, [sp, #736]
     ldp q30, q31, [sp, #768]
-    // Set all system registers before any debug marker calls.
-    ldr x9, [sp, #248]
-    msr sp_el0, x9
-    ldr x9, [sp, #256]
-    msr elr_el1, x9
-    ldr x9, [sp, #264]
-    msr spsr_el1, x9
-    // All debug marker calls happen here, before any user GPR is restored.
-    // Every bl clobbers x0..x18 and x30 (caller-saved per AAPCS), but the
-    // vector frame memory at [sp+0..sp+247] is not touched by callees since
-    // they allocate their own frames below sp.
-    ldr x0, [sp, #256]
-    bl yarm_aarch64_return_to_user_elr_marker
-    mrs x0, elr_el1
-    bl yarm_aarch64_write_return_elr_marker
-    mrs x0, elr_el1
-    bl yarm_aarch64_final_elr_reg_marker
-    ldr x0, [sp, #0]
-    bl yarm_aarch64_return_to_user_x0_marker
+    ldr x9, [sp, #800]
+    msr fpcr, x9
+    ldr x9, [sp, #808]
+    msr fpsr, x9
+    ldr x9, [sp, #816]
+    msr tpidr_el0, x9
     // Restore user GPRs.  No function calls after this point.
     ldr x30, [sp, #240]
     ldp x28, x29, [sp, #224]
@@ -5135,7 +5192,7 @@ yarm_aarch64_vector_dispatch:
     ldp x4, x5, [sp, #32]
     ldp x2, x3, [sp, #16]
     ldp x0, x1, [sp, #0]
-    add sp, sp, #816
+    add sp, sp, #848
     eret
     "#
 );
@@ -6951,10 +7008,34 @@ struct Aarch64VectorFrame {
     esr_el1: u64,
     far_el1: u64,
     neon: [[u8; 16]; 32],
+    fpcr: u64,
+    fpsr: u64,
+    tpidr_el0: u64,
+    _pad: u64,
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-const _: () = assert!(core::mem::size_of::<Aarch64VectorFrame>() == 800);
+const _: () = assert!(core::mem::size_of::<Aarch64VectorFrame>() == 832);
+// QEMU-CONTEXT1 §2: the frame's FP region IS a `UserFpuState` (q0..q31, FPCR, FPSR, TPIDR_EL0).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, neon) == 288);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64VectorFrame, fpcr) - 288
+        == crate::kernel::user_fpu::A64_FPCR_OFFSET
+);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64VectorFrame, fpsr) - 288
+        == crate::kernel::user_fpu::A64_FPSR_OFFSET
+);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(
+    core::mem::offset_of!(Aarch64VectorFrame, tpidr_el0) - 288
+        == crate::kernel::user_fpu::A64_TPIDR_OFFSET
+);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const _: () = assert!(832 - 288 == crate::kernel::user_fpu::USER_FPU_BYTES);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, sp_el0) == 248);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -6965,6 +7046,58 @@ const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, spsr_el1) == 264
 const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, esr_el1) == 272);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const _: () = assert!(core::mem::offset_of!(Aarch64VectorFrame, far_el1) == 280);
+
+/// QEMU-CONTEXT1 §2 — the frame's FP region, which has `UserFpuState`'s exact layout.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn frame_fpu_region(frame: &mut Aarch64VectorFrame) -> *mut u8 {
+    core::ptr::addr_of_mut!(frame.neon).cast::<u8>()
+}
+
+/// QEMU-CONTEXT1 §2 — commit the EL0 exception's captured FP/SIMD state to the running task.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn user_fpu_commit_on_entry(frame: &mut Aarch64VectorFrame, cpu: crate::kernel::scheduler::CpuId) {
+    let Some(shared) = trap_shared_kernel() else {
+        return;
+    };
+    let Some(tid) = shared.current_tid_authoritative(cpu).filter(|&t| t != 0) else {
+        return;
+    };
+    // SAFETY: the frame's 544-byte FP region (asserted layout).
+    let state =
+        unsafe { crate::kernel::user_fpu::UserFpuState::read_from(frame_fpu_region(frame)) };
+    if !shared.commit_user_fpu_split(tid, &state) {
+        crate::yarm_log!(
+            "AARCH64_USER_FPU_COMMIT_REFUSED cpu={} tid={} reason=no_tcb",
+            cpu.0,
+            tid
+        );
+    }
+}
+
+/// QEMU-CONTEXT1 §2 — load the resuming task's home into the frame the epilogue restores from.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn user_fpu_load_for_return(frame: &mut Aarch64VectorFrame, cpu: crate::kernel::scheduler::CpuId) {
+    let Some(shared) = trap_shared_kernel() else {
+        return;
+    };
+    let resuming = shared.current_tid_authoritative(cpu).filter(|&t| t != 0);
+    let region = frame_fpu_region(frame);
+    match resuming.and_then(|tid| shared.load_user_fpu_split(tid)) {
+        // SAFETY: the frame's FP region, as above.
+        Some(state) => unsafe { state.write_to(region) },
+        None => {
+            // An EL0 return with no resumable owner cannot legitimately happen; never let the
+            // frame's previous contents (another context's state) reach EL0.
+            crate::yarm_log!(
+                "AARCH64_USER_FPU_LOAD_REFUSED cpu={} tid={} reason=no_home",
+                cpu.0,
+                resuming.unwrap_or(0)
+            );
+            // SAFETY: as above.
+            unsafe { crate::kernel::user_fpu::UserFpuState::initial().write_to(region) };
+        }
+    }
+}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn write_trapframe_back_to_vector_frame(
@@ -6977,6 +7110,12 @@ fn write_trapframe_back_to_vector_frame(
     }
     frame.sp_el0 = trap_frame.saved_sp() as u64;
     frame.elr_el1 = trap_frame.saved_pc() as u64;
+    // QEMU-CONTEXT1 §2: an EL0 return hands back the RESUMING continuation's NZCV — the value
+    // captured at this entry for a same-task return, the one saved when a switched-in task last
+    // left EL0 otherwise — with EL0t and interrupts unmasked, and no other SPSR bit.
+    if frame.spsr_el1 & 0x1F == 0 {
+        frame.spsr_el1 = crate::kernel::user_fpu::sanitize_user_spsr(trap_frame.user_status as u64);
+    }
     // U9-TIMER5 §2 — THE IDLE-BOUNDARY PRIVILEGE TRANSITION, and the one field the ordinary
     // write-back has never had to touch.
     //
@@ -6999,7 +7138,7 @@ fn write_trapframe_back_to_vector_frame(
     // what a task interrupted in EL0 carries anyway. That is the user interrupt state a resumed
     // task is owed; the EL1 mask this trap ran under does not follow it to EL0.
     //
-    // `SP_EL1` is untouched and needs no repair: the epilogue's `add sp, sp, #816` unwinds this
+    // `SP_EL1` is untouched and needs no repair: the epilogue's `add sp, sp, #848` unwinds this
     // vector frame exactly, leaving the anchored depth the park loop established.
     if crate::kernel::idle_boundary::take_user_return(cpu.0 as usize) {
         const SPSR_EL0T_IRQ_UNMASKED: u64 = 0;
@@ -7016,7 +7155,9 @@ fn write_trapframe_back_to_vector_frame(
             );
             return;
         }
-        frame.spsr_el1 = SPSR_EL0T_IRQ_UNMASKED;
+        // QEMU-CONTEXT1 §2: EL0t, interrupts unmasked, and the resumed task's own NZCV.
+        frame.spsr_el1 = SPSR_EL0T_IRQ_UNMASKED
+            | crate::kernel::user_fpu::sanitize_user_spsr(trap_frame.user_status as u64);
         crate::yarm_log!(
             "AARCH64_IDLE_BOUNDARY_USER_RETURN cpu={} elr=0x{:x} sp_el0=0x{:x} spsr=0x{:x} result=ok",
             cpu.0,
@@ -7117,6 +7258,14 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     };
     let trap_cpu =
         crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
+    // QEMU-CONTEXT1 §2 — COMMIT. Kinds 9..=16 are lower-EL (EL0) exceptions: the asm prologue
+    // captured the interrupted task's q0..q31, FPCR, FPSR and TPIDR_EL0 into this frame before
+    // any compiled code ran; before anything can block, switch or diverge into idle, that state
+    // becomes the task's home. An EL1-origin frame holds the interrupted KERNEL context and is
+    // restored verbatim unless this exception returns to EL0.
+    if (9..=16).contains(&kind) {
+        user_fpu_commit_on_entry(frame, trap_cpu);
+    }
     // QEMU-CONTEXT1 §3: vector kinds 9..=16 are lower-EL (EL0) exceptions.
     #[cfg(feature = "context1-witness")]
     let entered_from_user = (9..=16).contains(&kind);
@@ -7167,6 +7316,8 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         for idx in 0..31 {
             trap_frame.set_user_gpr(idx, frame.gprs[idx] as usize);
         }
+        // QEMU-CONTEXT1 §2: the interrupted SPSR, whose NZCV is the task's user status word.
+        trap_frame.user_status = frame.spsr_el1 as usize;
         let context = crate::arch::aarch64::trap::Aarch64TrapContext {
             esr_el1: frame.esr_el1 as u32,
             far_el1: frame.far_el1,
@@ -7238,6 +7389,8 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         for idx in 0..31 {
             trap_frame.set_user_gpr(idx, frame.gprs[idx] as usize);
         }
+        // QEMU-CONTEXT1 §2: the interrupted SPSR, whose NZCV is the task's user status word.
+        trap_frame.user_status = frame.spsr_el1 as usize;
         let context = crate::arch::aarch64::trap::Aarch64TrapContext {
             esr_el1: frame.esr_el1 as u32,
             far_el1: frame.far_el1,
@@ -7294,6 +7447,13 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         frame.elr_el1,
         crate::arch::aarch64::trap::idle_take_point(),
     );
+    // QEMU-CONTEXT1 §2 — LOAD. If this exception now returns to EL0t, the epilogue's final
+    // restore must install the RESUMING task's home: the interrupted task's own state for a
+    // same-task return, the switched-in task's for a switch, the selected task's for an
+    // idle-boundary conversion.
+    if frame.spsr_el1 & 0x1F == 0 {
+        user_fpu_load_for_return(frame, trap_cpu);
+    }
     match kind {
         1 => crate::arch::aarch64::console::write_line(
             "YARM_AARCH64_EXCEPTION_KIND sync_current_sp0",

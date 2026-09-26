@@ -937,6 +937,9 @@ pub(crate) struct ApSavedResumeContext {
     pub(crate) rsp: u64,
     /// The 15 saved user GPRs (rax..r15), in the existing order.
     pub(crate) gprs: [u64; 15],
+    /// QEMU-CONTEXT1 §2 — the saved user RFLAGS (`UserRegisterContext::user_status`), which the
+    /// resume sanitizes instead of manufacturing `0x202`.
+    pub(crate) user_status: u64,
     /// The task's saved TLS base for `IA32_FS_BASE`; a task with no TLS resumes with 0.
     pub(crate) fs_base: u64,
     /// `status is Runnable | Running` AND the saved frame is complete (`rip != 0 && rsp != 0`).
@@ -3766,6 +3769,7 @@ impl SharedKernel {
                 user_entry: tcb.user_entry,
                 user_stack_top: tcb.user_stack_top,
                 user_context: tcb.user_context,
+                user_fpu: tcb.user_fpu,
                 brk_bounds: None,
             })
         })?;
@@ -3972,6 +3976,9 @@ impl SharedKernel {
             tcb.user_entry = publication.user_entry;
             tcb.user_stack_top = publication.user_stack_top;
             tcb.user_context = publication.user_context;
+            // QEMU-CONTEXT1 §2: the child's FP/SIMD home is the parent's, committed by the fork
+            // syscall's own entry.
+            tcb.user_fpu = publication.user_fpu;
             crate::kernel::spawn_reservation::commit_live_spawn(tcbs, reservation)
         })?;
         // rank 6, after rank 2 released: the child's brk bounds.
@@ -5980,6 +5987,39 @@ impl SharedKernel {
         })
     }
 
+    /// QEMU-CONTEXT1 §2 — COMMIT: store the live user FP/SIMD state a trap captured from task
+    /// `tid` into that task's home. One rank-2 acquisition; `false` (nothing written) when no TCB
+    /// holds `tid`, so a state can never be stored into another task's home.
+    pub(crate) fn commit_user_fpu_split(
+        &self,
+        tid: u64,
+        state: &crate::kernel::user_fpu::UserFpuState,
+    ) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                Some(tcb) => {
+                    tcb.user_fpu = *state;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// QEMU-CONTEXT1 §2 — LOAD: the home of task `tid`, which a return to user mode restores.
+    /// `None` when no TCB holds `tid`.
+    pub(crate) fn load_user_fpu_split(
+        &self,
+        tid: u64,
+    ) -> Option<crate::kernel::user_fpu::UserFpuState> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.user_fpu)
+        })
+    }
+
     /// U3 (canonical 203C) — the authoritative saved-context snapshot for an x86_64 AP
     /// saved-frame resume, taken through the rank-2 task seam only.
     ///
@@ -6048,6 +6088,7 @@ impl SharedKernel {
             rip,
             rsp,
             gprs,
+            user_status: context.user_status as u64,
             fs_base,
             runnable_saved: runnable && has_saved,
         })
@@ -19946,8 +19987,15 @@ mod tests {
         );
         assert_eq!(
             code.matches("current_tid_authoritative(cpu)").count(),
+            4,
+            "both identity snapshots, and QEMU-CONTEXT1's two FP-home owners (commit on entry, \
+             load for return), use the authoritative binding helper"
+        );
+        assert_eq!(
+            code.matches("shared.current_tid_authoritative(cpu).filter(|&t| t != 0)")
+                .count(),
             2,
-            "both identity snapshots use the authoritative binding helper"
+            "the FP-home owners are the only additional readers"
         );
         assert!(
             !code.contains("current_tid_split_read"),

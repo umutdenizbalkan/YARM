@@ -255,25 +255,21 @@ fn no_new_access_path_reaches_userspace() {
     assert!(GRADER.contains("tss_io_map_base=104 tss_size=104 io_bitmap=false"));
 }
 
-/// Interrupt-return contracts this package changed: owner revalidation only for ring-3 frames, and
-/// a same-task asynchronous return keeps the interrupted flags.
+/// Interrupt-return contracts this package changed: owner revalidation only for ring-3 frames.
+/// QEMU-CONTEXT1 §2 then generalised IRQ3's same-task-only flag rule: EVERY ring-3 return installs
+/// the resuming continuation's own sanitized user status, so the IRQ3 predicate and helper are gone.
 #[test]
 fn return_contracts_are_ring3_only_revalidation_and_preserved_flags() {
     assert!(X86_DT.contains(
         "if matches!(exiting_tid, None | Some(0))\n            && owner_revalidation_admissible(entering_cs)"
     ));
-    assert!(
-        X86_DT
-            .contains("let same_task_async_return = !switched && vector as usize != VEC_SYSCALL;")
-    );
-    assert!(
-        X86_DT
-            .contains("frame.rflags = ring3_return_rflags(frame.rflags, same_task_async_return);")
-    );
-    assert!(X86_DT.contains("fn owner_revalidation_is_admissible_only_for_ring3_frames()"));
+    assert!(X86_DT.contains("let switched = task_switched || revalidated_owner.is_some();"));
     assert!(X86_DT.contains(
-        "fn ring3_return_rflags_keeps_interrupted_flags_only_for_same_task_async_returns()"
+        "frame.rflags = crate::kernel::user_fpu::sanitize_user_rflags(trap_frame.user_status as u64);"
     ));
+    assert!(!code(X86_DT).contains("same_task_async_return"));
+    assert!(!code(X86_DT).contains("ring3_return_rflags"));
+    assert!(X86_DT.contains("fn owner_revalidation_is_admissible_only_for_ring3_frames()"));
     // The idle loop halts with the one-instruction `sti` shadow, and idle-origin traps never
     // return into it.
     let park = body_after(

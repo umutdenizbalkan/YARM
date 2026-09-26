@@ -856,6 +856,9 @@ unsafe fn build_trap_frame_from_saved_regs(
     if (frame_header.cs & 0x3) == 0x3 {
         let frame = unsafe { &*frame };
         trap.set_saved_sp(frame.rsp as usize);
+        // QEMU-CONTEXT1 §2: the interrupted user RFLAGS (the LSTAR path's synthetic frame holds
+        // the R11 SYSCALL saved), carried with the GPRs through capture/apply.
+        trap.user_status = frame.rflags as usize;
     }
     if vector as usize == VEC_SYSCALL {
         trap.set_syscall_num(regs.rax as usize);
@@ -1027,21 +1030,17 @@ fn dispatch_trap_from_stub_for_test(
 /// Only user-mode return frames (CS DPL=3) are updated; kernel-mode frames
 /// (timer/NMI in ring 0) are left untouched.
 ///
-/// RFLAGS on a ring-3 return is decided by [`ring3_return_rflags`]:
-///   - A syscall, a task switch, or a first entry: reset to 0x202 (IF=1, DF=0, all other flags
-///     clear). RFLAGS is caller-clobbered across the syscall boundary, and the task context holds
-///     no RFLAGS to restore for a task that was switched in.
-///   - QEMU-IRQ3 §2: an interrupt or exception that returns to the SAME task it interrupted keeps
-///     the hardware frame's RFLAGS. An asynchronous interrupt lands between arbitrary
-///     instructions — between a `cmp` and its `jcc`, or inside a `dec`/`jnz` loop — so resetting
-///     the arithmetic flags there changes the interrupted program's control flow. The earlier
-///     claim that "losing the exact flag state is acceptable" after a timer interrupt was wrong
-///     for exactly that reason.
+/// RFLAGS on a ring-3 return (QEMU-CONTEXT1 §2) is the resuming continuation's own saved user
+/// status word, sanitized by `user_fpu::sanitize_user_rflags`: the arithmetic flags, DF, AC and ID
+/// the task last ran with — whether it is the task this trap interrupted (the value captured at
+/// this entry) or a task switched in (the value captured when it last left ring 3) — with IF set
+/// and nothing privileged. A continuation that never ran carries `0`, which sanitizes to exactly
+/// the first-entry `0x202`. This replaces QEMU-IRQ3's same-task-only rule: a switched-in task no
+/// longer receives a manufactured `0x202` in place of the flags it was interrupted with.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe fn flush_trap_context_to_iret_frame(
     interrupt_frame: *mut X86InterruptStackFrame,
     trap_frame: &crate::kernel::trapframe::TrapFrame,
-    same_task_async_return: bool,
 ) {
     if interrupt_frame.is_null() {
         return;
@@ -1072,10 +1071,9 @@ unsafe fn flush_trap_context_to_iret_frame(
     // released by the return, and the next entry from ring 3 comes in on the TSS `RSP0` — which
     // is why no frame accumulates on this port.
     //
-    // `RFLAGS = 0x202` is the same value the ring-3 path resets to and the same one
-    // `enter_user_mode_iret` builds at first entry: `IF` set, everything else clear. That is the
-    // user interrupt state a resumed task is owed — the boot-time mask this CPU may have been
-    // holding does not follow it into ring 3.
+    // RFLAGS is the resumed task's own saved user status, sanitized exactly as on the ring-3 path
+    // (QEMU-CONTEXT1 §2): `IF` set, its arithmetic flags/DF as it last ran with them, nothing
+    // privileged. The boot-time mask this CPU may have been holding does not follow it into ring 3.
     if (frame.cs & 0x3) != 0x3 {
         let cpu = current_cpu_id();
         if !crate::kernel::idle_boundary::take_user_return(cpu.0 as usize) {
@@ -1099,7 +1097,7 @@ unsafe fn flush_trap_context_to_iret_frame(
         frame.rsp = user_sp as u64;
         frame.cs = USER_CODE_SELECTOR as u64;
         frame.ss = USER_DATA_SELECTOR as u64;
-        frame.rflags = 0x202;
+        frame.rflags = crate::kernel::user_fpu::sanitize_user_rflags(trap_frame.user_status as u64);
         crate::yarm_log!(
             "X86_IDLE_BOUNDARY_USER_RETURN cpu={} rip=0x{:x} rsp=0x{:x} cs=0x{:x} ss=0x{:x} rflags=0x{:x} result=ok",
             cpu.0,
@@ -1122,29 +1120,14 @@ unsafe fn flush_trap_context_to_iret_frame(
     if new_sp != 0 {
         frame.rsp = new_sp as u64;
     }
-    frame.rflags = ring3_return_rflags(frame.rflags, same_task_async_return);
+    frame.rflags = crate::kernel::user_fpu::sanitize_user_rflags(trap_frame.user_status as u64);
 }
 
-/// QEMU-IRQ3 §2 — the RFLAGS a ring-3 return carries. `same_task_async_return` is true when the
-/// trap was not a syscall and returns to the very task it interrupted: the interrupted flags are
-/// kept, with `IF` guaranteed set (a ring-3 context always ran with it). Otherwise the clean
-/// `0x202` a syscall return or a switched-in task receives.
 /// QEMU-IRQ3 §2 — may the idle-owner revalidation choose a replacement for this trap? Only when
 /// the entering frame is ring 3 (the LSTAR path's synthetic frame carries `CS = 0x23` too).
 #[cfg_attr(all(feature = "hosted-dev", not(test)), allow(dead_code))]
 pub(crate) const fn owner_revalidation_admissible(entering_cs: u64) -> bool {
     entering_cs & 0x3 == 0x3
-}
-
-#[cfg_attr(all(feature = "hosted-dev", not(test)), allow(dead_code))]
-pub(crate) const fn ring3_return_rflags(hardware_rflags: u64, same_task_async_return: bool) -> u64 {
-    const RFLAGS_IF: u64 = 1 << 9;
-    const RFLAGS_CLEAN: u64 = 0x202;
-    if same_task_async_return {
-        hardware_rflags | RFLAGS_IF
-    } else {
-        RFLAGS_CLEAN
-    }
 }
 
 #[cfg(all(test, feature = "hosted-dev", target_arch = "x86_64"))]
@@ -1154,6 +1137,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     _error_code: u64,
     _regs: *mut X86SavedRegs,
     _interrupt_frame: *mut X86InterruptStackFrame,
+    _fpu_area: *mut u8,
 ) {
 }
 
@@ -1337,18 +1321,79 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     error_code: u64,
     regs: *mut X86SavedRegs,
     interrupt_frame: *mut X86InterruptStackFrame,
+    fpu_area: *mut u8,
 ) {
     // SAFETY: both entry stubs pass the hardware (or synthetic LSTAR) frame they built.
-    #[cfg(feature = "context1-witness")]
     let entered_from_user = unsafe { (*interrupt_frame).cs } & 0x3 == 0x3;
     #[cfg(feature = "context1-witness")]
     if entered_from_user {
         crate::arch::x86_64::context_witness::check_kernel_env();
     }
+    // QEMU-CONTEXT1 §2 — COMMIT. The stub captured the interrupted task's x87/SSE state into
+    // `fpu_area`; before anything can block, switch or diverge into idle, it becomes that task's
+    // home. A kernel-origin trap commits nothing: its area is the interrupted KERNEL context,
+    // which the stub restores verbatim unless this trap returns to ring 3.
+    if entered_from_user {
+        user_fpu_commit_on_entry(fpu_area);
+    }
     x86_trap_dispatch_body(vector, error_code, regs, interrupt_frame);
+    // QEMU-CONTEXT1 §2 — LOAD. Whatever the trap decided, if the frame now returns to ring 3 the
+    // stub's final FXRSTOR64 must install the RESUMING task's home — the interrupted task's own
+    // state for a same-task return, the switched-in task's for a switch, the selected task's for
+    // an idle-boundary conversion.
+    // SAFETY: as above; the frame may have been rewritten but not moved.
+    if unsafe { (*interrupt_frame).cs } & 0x3 == 0x3 {
+        user_fpu_load_for_return(fpu_area);
+    }
     #[cfg(feature = "context1-clobber")]
     if entered_from_user {
         crate::arch::x86_64::context_witness::clobber_user_visible_state();
+    }
+}
+
+/// QEMU-CONTEXT1 §2 — commit the trap's captured user x87/SSE state to the running task's home.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn user_fpu_commit_on_entry(fpu_area: *mut u8) {
+    let Some(shared) = trap_shared_kernel() else {
+        return;
+    };
+    let cpu = current_cpu_id();
+    let Some(tid) = shared.current_tid_authoritative(cpu).filter(|&t| t != 0) else {
+        return;
+    };
+    // SAFETY: the stub's 512-byte, 16-byte aligned area, live for the whole dispatch.
+    let state = unsafe { crate::kernel::user_fpu::UserFpuState::read_from(fpu_area) };
+    if !shared.commit_user_fpu_split(tid, &state) {
+        crate::yarm_log!(
+            "X86_USER_FPU_COMMIT_REFUSED cpu={} tid={} reason=no_tcb",
+            cpu.0,
+            tid
+        );
+    }
+}
+
+/// QEMU-CONTEXT1 §2 — load the resuming task's home into the area the stub restores from.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn user_fpu_load_for_return(fpu_area: *mut u8) {
+    let Some(shared) = trap_shared_kernel() else {
+        return;
+    };
+    let cpu = current_cpu_id();
+    let resuming = shared.current_tid_authoritative(cpu).filter(|&t| t != 0);
+    match resuming.and_then(|tid| shared.load_user_fpu_split(tid)) {
+        // SAFETY: the stub's area, as above.
+        Some(state) => unsafe { state.write_to(fpu_area) },
+        None => {
+            // A ring-3 return with no resumable owner cannot legitimately happen; never let the
+            // area's previous contents (another context's state) reach ring 3.
+            crate::yarm_log!(
+                "X86_USER_FPU_LOAD_REFUSED cpu={} tid={} reason=no_home",
+                cpu.0,
+                resuming.unwrap_or(0)
+            );
+            // SAFETY: as above.
+            unsafe { crate::kernel::user_fpu::UserFpuState::initial().write_to(fpu_area) };
+        }
     }
 }
 
@@ -1668,10 +1713,7 @@ fn x86_trap_dispatch_body(
         } else if vector as usize == VEC_SYSCALL {
             write_trap_returns_to_saved_regs(regs, &trap_frame);
         }
-        let same_task_async_return = !switched && vector as usize != VEC_SYSCALL;
-        unsafe {
-            flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame, same_task_async_return)
-        };
+        unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
         TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
         // Stage 200D-0B3: the common-epilogue ownership attestation, emitted from the epilogue
         // that actually owns the cleanup rather than from inside the broad lock (where Stage
@@ -1739,12 +1781,15 @@ fn x86_trap_dispatch_body(
     } else if vector as usize == VEC_SYSCALL {
         write_trap_returns_to_saved_regs(regs, &trap_frame);
     }
-    let same_task_async_return = !task_switched && vector as usize != VEC_SYSCALL;
-    unsafe {
-        flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame, same_task_async_return)
-    };
+    unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
     TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
 }
+
+/// QEMU-CONTEXT1 §2 — the MXCSR every kernel entry installs after capturing the user's: all
+/// exceptions masked, round to nearest, no FZ/DAZ.
+#[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+static YARM_X86_KERNEL_MXCSR: u32 = crate::kernel::user_fpu::X86_MXCSR_INIT;
 
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 core::arch::global_asm!(
@@ -1791,7 +1836,19 @@ yarm_x86_common_trap_entry:
     lea rcx, [rsp + 17 * 8]
     mov r12, rsp
     and rsp, -16
+    // QEMU-CONTEXT1 §2: capture the interrupted x87/SSE state before ANY kernel instruction can
+    // touch it, into this trap's own 512-byte scratch area, then give the kernel its own control
+    // environment: x87 reset (FCW 0x037F), MXCSR 0x1F80, DF clear. The area's address is the
+    // dispatcher's fifth argument; the matching FXRSTOR64 below is the last FP operation before
+    // the return, after every kernel instruction.
+    sub rsp, 512
+    fxsave64 [rsp]
+    fninit
+    ldmxcsr [rip + YARM_X86_KERNEL_MXCSR]
+    cld
+    mov r8, rsp
     call yarm_x86_dispatch_trap_from_stub
+    fxrstor64 [rsp]
     mov rsp, r12
 
     pop r15
@@ -1974,7 +2031,16 @@ yarm_x86_lstar_entry:
     lea rcx, [rsp + 120]
     mov r12, rsp
     and rsp, -16
+    // QEMU-CONTEXT1 §2: as the common entry — capture x87/SSE first, then the kernel's own
+    // control environment; restore after the dispatcher returns.
+    sub rsp, 512
+    fxsave64 [rsp]
+    fninit
+    ldmxcsr [rip + YARM_X86_KERNEL_MXCSR]
+    cld
+    mov r8, rsp
     call yarm_x86_dispatch_trap_from_stub
+    fxrstor64 [rsp]
     mov rsp, r12
 
     // Step 7 — restore all user GPRs and return via IRETQ.
@@ -2000,7 +2066,7 @@ yarm_x86_lstar_entry:
     // RSP now points at the 5-word IRETQ frame (step 3, updated in step 6):
     //   [RSP+ 0] user RIP   ← patched by flush_trap_context_to_iret_frame
     //   [RSP+ 8] user CS    = 0x23 (ring-3)
-    //   [RSP+16] user RFLAGS = 0x202 (IF=1)
+    //   [RSP+16] user RFLAGS  ← the resuming task's sanitized saved flags (QEMU-CONTEXT1)
     //   [RSP+24] user RSP   ← patched by flush_trap_context_to_iret_frame
     //   [RSP+32] user SS    = 0x1b (ring-3)
     iretq
@@ -2891,8 +2957,17 @@ unsafe extern "C" {
         arg4: u64,
         arg5: u64,
     ) -> !;
-    fn yarm_x86_resume_ring3(frame: *const ApSavedResumeFrame) -> !;
+    fn yarm_x86_resume_ring3(
+        frame: *const ApSavedResumeFrame,
+        fpu: *const crate::kernel::user_fpu::UserFpuState,
+    ) -> !;
 }
+
+/// QEMU-CONTEXT1 §2 — the architectural initial x87/SSE state a FIRST ring-3 entry installs.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+static YARM_X86_INITIAL_FXSAVE: crate::kernel::user_fpu::UserFpuState =
+    crate::kernel::user_fpu::UserFpuState::initial();
 
 /// Stage 199A2D2C2A: the owned, `repr(C)` saved-frame the `yarm_x86_resume_ring3` asm consumes. The
 /// GPR lanes are in `user_gprs` order (rax..r15); `rip/rsp/rflags/cs/ss` are the canonical iret
@@ -2927,8 +3002,11 @@ const _: () = {
 /// `frame` must be a fully-committed saved frame for the task whose CR3 is active, with a valid
 /// user RIP/RSP; all per-CPU state must be installed for this CPU/task.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-pub(crate) unsafe fn resume_user_mode_iret(frame: &ApSavedResumeFrame) -> ! {
-    unsafe { yarm_x86_resume_ring3(frame as *const ApSavedResumeFrame) }
+pub(crate) unsafe fn resume_user_mode_iret(
+    frame: &ApSavedResumeFrame,
+    fpu: &crate::kernel::user_fpu::UserFpuState,
+) -> ! {
+    unsafe { yarm_x86_resume_ring3(frame as *const ApSavedResumeFrame, fpu) }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -2952,6 +3030,8 @@ core::arch::global_asm!(
     .global yarm_x86_enter_ring3
     .type yarm_x86_enter_ring3, @function
 yarm_x86_enter_ring3:
+    // QEMU-CONTEXT1 §2: a first entry starts from the architectural initial x87/SSE state.
+    fxrstor64 [rip + YARM_X86_INITIAL_FXSAVE]
     mov r10, rdi
     mov r11, rsi
     mov rdi, rdx
@@ -2987,6 +3067,8 @@ core::arch::global_asm!(
     .global yarm_x86_resume_ring3
     .type yarm_x86_resume_ring3, @function
 yarm_x86_resume_ring3:
+    // QEMU-CONTEXT1 §2: the resumed task's own x87/SSE home (rsi), after the last Rust call.
+    fxrstor64 [rsi]
     mov ax, 0x1b
     mov ds, ax
     mov es, ax
@@ -3034,8 +3116,6 @@ pub fn enter_user_mode_iret(
 
 #[cfg(test)]
 mod tests {
-    /// QEMU-IRQ3 §2 — a same-task interrupt return keeps the interrupted flags (CF, ZF, …, with
-    /// IF set); a syscall return or a switched-in task gets the clean 0x202.
     /// QEMU-IRQ3 §2 — a kernel-origin (idle `hlt`) frame is never handed a replacement.
     #[test]
     fn owner_revalidation_is_admissible_only_for_ring3_frames() {
@@ -3043,16 +3123,6 @@ mod tests {
         assert!(super::owner_revalidation_admissible(0x1b | 0x3));
         assert!(!super::owner_revalidation_admissible(0x08));
         assert!(!super::owner_revalidation_admissible(0x10));
-    }
-
-    #[test]
-    fn ring3_return_rflags_keeps_interrupted_flags_only_for_same_task_async_returns() {
-        // CF | ZF | IF | reserved bit 1, as a `cmp` just before an interrupt could leave them.
-        let interrupted = 0x0000_0243;
-        assert_eq!(super::ring3_return_rflags(interrupted, true), interrupted);
-        // IF is guaranteed even if a frame somehow lacked it.
-        assert_eq!(super::ring3_return_rflags(0x0000_0043, true), 0x0000_0243);
-        assert_eq!(super::ring3_return_rflags(interrupted, false), 0x202);
     }
 
     use super::*;

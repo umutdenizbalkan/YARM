@@ -43,6 +43,8 @@ pub mod time;
 pub mod topology;
 pub mod trap;
 pub mod trapframe;
+/// QEMU-CONTEXT1 §2 — per-task user FP/SIMD and control-state homes, and their pure rules.
+pub mod user_fpu;
 pub mod vm;
 
 pub use boot::{Bootstrap, KernelState};

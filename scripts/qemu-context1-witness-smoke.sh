@@ -21,12 +21,14 @@
 # appears (plus a short tail) or at the bound. This script grades; it never retries.
 #
 # Graded, each separately, for every window:
-#   * STATE: the witness's own full-image comparison (mask=0x0, flags_bad=0);
+#   * STATE: the witness's own full-image comparison (mask=0x0, flags_bad=0, gpr_bad=0x0);
 #   * IDENTITY / TRANSITIONS, from the kernel's CTX1_TRAP lines inside the window:
 #       fresh   — A blocked and C (a new thread) was entered;
 #       block   — A blocked (in=A out=0), the CPU idled, and an idle-origin trap resumed A;
-#       preempt — a trap switched A -> B (in=A out=B) and a later one returned to A, with B's
-#                 own "B ran" store observed by A (b_ran=1);
+#       preempt — a timer tick switched A -> B (in=A out=B), and the first return from B to A
+#                 took the route the round's mode names — a timer tick (spin) or B's blocking
+#                 syscall (block) — with B's own "B ran" store observed by A (b_ran=1) and A's
+#                 six syscall-lane GPR sentinels intact (gpr_bad=0x0); both routes required;
 #       same    — at least one timer tick interrupted A in user mode and returned to A;
 #   * B's own windows all intact; the kernel ran under its own FP environment on every user
 #     entry (CTX1_KERNEL_ENV_BAD absent); nothing fatal.
@@ -137,15 +139,26 @@ for r, i, j, R in windows('block'):
     if R.get('result') != 'ok': fail(f"block round {r}: {R}")
     if not (blk and idle and res): fail(f"block round {r}: block={len(blk)} idle={idle} idle_resume={len(res)}")
     counts['block'] = counts.get('block', 0) + bool(good)
-# preempt
+# preempt: A -> B on a timer tick, then the FIRST return to A comes from B by the route the
+# round's mode names: a timer tick (spin) or B's blocking syscall (block).
+routes = {}
 for r, i, j, R in windows('preempt'):
     tr = [(k, t) for k, t in traps if i < k < j]
-    out_ab = [k for k, t in tr if t['in'] == A and t['out'] == B]
-    back = [k for k, t in tr if t['out'] == A and t['in'] != A]
-    good = R.get('result') == 'ok' and R.get('b_ran') == '1' and out_ab and back and min(out_ab) < max(back)
+    out_ab = [k for k, t in tr if t['in'] == A and t['out'] == B and t['timer'] == '1']
+    back = [(k, t) for k, t in tr if out_ab and k > min(out_ab) and t['out'] == A and t['in'] == B]
+    route = None
+    if back:
+        route = 'timer' if back[0][1]['timer'] == '1' else 'syscall'
+    want = {'spin': 'timer', 'block': 'syscall'}.get(R.get('mode'))
+    routes[r] = f"{R.get('mode')}:{route}"
+    good = (R.get('result') == 'ok' and R.get('b_ran') == '1' and R.get('gpr_bad') == '0x0'
+            and out_ab and back and route == want)
     if R.get('result') != 'ok': fail(f"preempt round {r}: {R}")
     if not (out_ab and back): fail(f"preempt round {r}: A->B switches={len(out_ab)} returns-to-A={len(back)}")
+    elif route != want: fail(f"preempt round {r}: mode={R.get('mode')} returned to A by {route}, want {want}")
     counts['preempt'] = counts.get('preempt', 0) + bool(good)
+modes = [v.split(':')[0] for v in routes.values()]
+if 'spin' not in modes or 'block' not in modes: fail(f"preempt: both return routes required, got {routes}")
 pb = [l for l in lines if 'CTX1_RESULT cell=preempt_b ' in l]
 if len(pb) != 1 or 'result=ok' not in pb[0]: fail(f"B's own windows: {pb[-1].strip()[-140:] if pb else 'missing'}")
 # same
@@ -167,7 +180,7 @@ for bad in ('panicked at', 'KERNEL PANIC', 'x86 trap dispatch failed', 'YARM_AAR
     n = sum(bad in l for l in lines)
     if n: fail(f"{bad} x{n}")
 first = [l.strip()[-200:] for l in lines if 'CTX1_RESULT' in l and 'result=fail' in l][:1]
-print(f"[context1-witness] tids A={A} B={B} C={C}; windows {counts}; first failing result: {first[0] if first else 'none'}")
+print(f"[context1-witness] tids A={A} B={B} C={C}; windows {counts}; preempt routes {routes}; first failing result: {first[0] if first else 'none'}")
 seal = 'ok' if not fails else 'fail'
 print(f"CONTEXT1_WITNESS_SEAL arch={arch} a={A} b={B} c={C} fresh={counts.get('fresh',0)} block={counts.get('block',0)} preempt={counts.get('preempt',0)} same={counts.get('same',0)} env_bad={envbad} result={seal}")
 sys.exit(0 if seal == 'ok' else 1)

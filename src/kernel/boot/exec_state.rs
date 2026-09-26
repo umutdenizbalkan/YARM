@@ -3721,10 +3721,13 @@ pub(crate) fn publish_spawned_image_locked(
     tcb.asid = Some(publication.asid);
     tcb.user_entry = Some(VirtAddr(publication.entry as u64));
     tcb.user_stack_top = Some(publication.stack_top);
+    // QEMU-CONTEXT1 §2: a new image starts from the architectural initial FP/SIMD state.
+    tcb.user_fpu = crate::kernel::user_fpu::UserFpuState::initial();
     tcb.user_context = UserRegisterContext {
         instruction_ptr: VirtAddr(publication.entry as u64),
         stack_ptr: VirtAddr(publication.startup_stack_ptr as u64),
         user_gprs: [0; 32],
+        user_status: 0,
         // Startup entry ABI args:
         //   arg0 => task_id / tid
         //   arg1 => process-manager request-send cap

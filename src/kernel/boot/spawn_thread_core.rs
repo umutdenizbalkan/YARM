@@ -291,10 +291,14 @@ pub(crate) fn initialize_thread_incarnation_locked(
     tcb.tls_ptr = Some(VirtAddr(args.tls_base as u64));
     tcb.user_entry = Some(VirtAddr(args.user_entry as u64));
     tcb.user_stack_top = Some(VirtAddr(args.user_stack_top as u64));
+    // QEMU-CONTEXT1 §2: a new thread starts from the architectural initial FP/SIMD state and its
+    // own TLS base, never from whatever this TCB (or a predecessor in its slot) held.
+    tcb.user_fpu = crate::kernel::user_fpu::UserFpuState::initial_for_thread(args.tls_base as u64);
     tcb.user_context = UserRegisterContext {
         instruction_ptr: VirtAddr(args.user_entry as u64),
         stack_ptr: VirtAddr(args.user_stack_top as u64),
         user_gprs: [0; 32],
+        user_status: 0,
         arg0: 0,
         arg1: 0,
         arg2: 0,

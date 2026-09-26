@@ -2599,6 +2599,7 @@ pub(crate) fn c2c_bsp_saved_frame_resume(shared: &crate::runtime::SharedKernel, 
         rip,
         rsp,
         gprs,
+        user_status,
         fs_base,
         runnable_saved,
     } = match shared.ap_saved_resume_context_split(client_tid) {
@@ -2657,7 +2658,8 @@ pub(crate) fn c2c_bsp_saved_frame_resume(shared: &crate::runtime::SharedKernel, 
         gprs,
         rip,
         rsp,
-        rflags: 0x202,
+        // QEMU-CONTEXT1 §2: the task's own saved flags, sanitized — never a manufactured 0x202.
+        rflags: crate::kernel::user_fpu::sanitize_user_rflags(user_status),
         cs: 0x23,
         ss: 0x1b,
     };
@@ -2665,9 +2667,14 @@ pub(crate) fn c2c_bsp_saved_frame_resume(shared: &crate::runtime::SharedKernel, 
     // return points, so clear the nested-trap guard first (else the resumed client's next trap on CPU 0
     // trips the fatal nested-trap check).
     super::descriptor_tables::clear_trap_dispatch_depth(cpu);
+    // QEMU-CONTEXT1 §2: the client's own x87/SSE home, restored by the resume after the last
+    // Rust instruction; a missing home installs the initial state, never this CPU's leftovers.
+    let fpu = shared
+        .load_user_fpu_split(client_tid)
+        .unwrap_or_else(crate::kernel::user_fpu::UserFpuState::initial);
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
-        super::descriptor_tables::resume_user_mode_iret(&frame);
+        super::descriptor_tables::resume_user_mode_iret(&frame, &fpu);
     }
 }
 
@@ -2769,6 +2776,7 @@ fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
         rip,
         rsp,
         gprs,
+        user_status,
         fs_base,
         runnable_saved,
     } = saved;
@@ -2821,13 +2829,18 @@ fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
         gprs,
         rip,
         rsp,
-        rflags: 0x202,
+        // QEMU-CONTEXT1 §2: the task's own saved flags, sanitized — never a manufactured 0x202.
+        rflags: crate::kernel::user_fpu::sanitize_user_rflags(user_status),
         cs: 0x23,
         ss: 0x1b,
     };
+    // QEMU-CONTEXT1 §2: the resumed task's own x87/SSE home (see the BSP resume above).
+    let fpu = shared
+        .load_user_fpu_split(tid)
+        .unwrap_or_else(crate::kernel::user_fpu::UserFpuState::initial);
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
-        super::descriptor_tables::resume_user_mode_iret(&frame);
+        super::descriptor_tables::resume_user_mode_iret(&frame, &fpu);
     }
 }
 

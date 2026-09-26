@@ -363,6 +363,7 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
         .direct_dispatch_restore_context_split(token)
         .ok_or(ResumeRefusal::Context)?;
     frame.apply_user_context(context);
+    let mut completion_encoded = false;
     frame.set_user_gpr(
         crate::arch::aarch64::syscall_abi::REG_X18_TLS,
         tls.unwrap_or(0),
@@ -391,6 +392,7 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
     // argument/startup mirror untouched.
     if let Some(done) = shared.direct_dispatch_take_completion_split(token) {
         encode_blocked_completion_result(frame, done.result);
+        completion_encoded = true;
         crate::yarm_log!(
             "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid={} class={:?} result={} blocked_generation={} elr=0x{:016x} result=ok",
             incoming,
@@ -413,6 +415,7 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
     // saved frame still carries for a message the receiver already took.
     if let Some(done) = shared.direct_dispatch_take_send_completion_split(token) {
         encode_blocked_completion_result(frame, done.result);
+        completion_encoded = true;
         crate::yarm_log!(
             "AARCH64_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} elr=0x{:016x} result=ok",
             incoming,
@@ -422,13 +425,22 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
             frame.saved_pc() as u64
         );
     }
-    use crate::arch::aarch64::syscall_abi::{REG_X0, REG_X1, REG_X2, REG_X3, REG_X4, REG_X5};
-    frame.set_user_gpr(REG_X0, frame.arg(0));
-    frame.set_user_gpr(REG_X1, frame.arg(1));
-    frame.set_user_gpr(REG_X2, frame.arg(2));
-    frame.set_user_gpr(REG_X3, frame.arg(3));
-    frame.set_user_gpr(REG_X4, frame.arg(4));
-    frame.set_user_gpr(REG_X5, frame.arg(5));
+    // QEMU-CONTEXT1 §2 — the argument mirror runs under exactly the condition the in-lock owner
+    // (`apply_restored_thread_state`) already uses: a first resume or a just-encoded completion.
+    // It used to run unconditionally here, and this post-lock core is also how a task that was
+    // PREEMPTED in EL0 comes back when another task blocks: its saved argument lanes are the
+    // previous syscall's (`publish_async_preempt_snapshot` preserves them on purpose), so the
+    // mirror wrote that stale syscall state over six live registers. Measured on the unmodified
+    // base with a two-tick quantum: the process manager's spawn result read back as tid 0.
+    if context.argument_lanes_are_authoritative(completion_encoded) {
+        use crate::arch::aarch64::syscall_abi::{REG_X0, REG_X1, REG_X2, REG_X3, REG_X4, REG_X5};
+        frame.set_user_gpr(REG_X0, frame.arg(0));
+        frame.set_user_gpr(REG_X1, frame.arg(1));
+        frame.set_user_gpr(REG_X2, frame.arg(2));
+        frame.set_user_gpr(REG_X3, frame.arg(3));
+        frame.set_user_gpr(REG_X4, frame.arg(4));
+        frame.set_user_gpr(REG_X5, frame.arg(5));
+    }
     let _ = incoming;
     Ok(asid)
 }

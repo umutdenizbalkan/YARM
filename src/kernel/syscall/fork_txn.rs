@@ -88,6 +88,9 @@ pub(crate) struct ForkParentFacts {
     /// trap frame; a syscall route must pass its frame's own capture instead. See
     /// [`fork_process_cow`]'s `parent_context`.
     pub(crate) user_context: UserRegisterContext,
+    /// QEMU-CONTEXT1 §2 — the parent's FP/SIMD home. The fork syscall's own entry committed the
+    /// parent's live state there before this snapshot, so it IS the parent's state at the fork.
+    pub(crate) user_fpu: crate::kernel::user_fpu::UserFpuState,
     pub(crate) brk_bounds: Option<(usize, usize)>,
 }
 
@@ -104,6 +107,8 @@ pub(crate) struct ForkChildPublication {
     /// [`fork_child_context`]. Installed verbatim, so the child resumes at the instruction after
     /// the syscall with the parent's stack, TLS and general registers.
     pub(crate) user_context: UserRegisterContext,
+    /// QEMU-CONTEXT1 §2 — a copy of the parent's FP/SIMD home: fork preserves all user state.
+    pub(crate) user_fpu: crate::kernel::user_fpu::UserFpuState,
     pub(crate) brk_bounds: Option<(usize, usize)>,
 }
 
@@ -338,6 +343,7 @@ pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(
         user_entry: parent.user_entry,
         user_stack_top: parent.user_stack_top,
         user_context: fork_child_context(&parent_context.unwrap_or(parent.user_context)),
+        user_fpu: parent.user_fpu,
         brk_bounds: parent.brk_bounds,
     };
     if let Err(refusal) = owners.publish_forked_child(&reservation, &publication) {

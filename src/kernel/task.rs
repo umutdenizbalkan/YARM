@@ -176,6 +176,9 @@ pub struct UserRegisterContext {
     pub instruction_ptr: VirtAddr,
     pub stack_ptr: VirtAddr,
     pub user_gprs: [usize; 32],
+    /// QEMU-CONTEXT1 §2 — the saved user status word (x86_64 RFLAGS / AArch64 SPSR), `0` for a
+    /// continuation that never ran. See `TrapFrame::user_status`.
+    pub user_status: usize,
     pub arg0: usize,
     pub arg1: usize,
     pub arg2: usize,
@@ -190,6 +193,7 @@ impl Default for UserRegisterContext {
             instruction_ptr: VirtAddr(0),
             stack_ptr: VirtAddr(0),
             user_gprs: [0; 32],
+            user_status: 0,
             arg0: 0,
             arg1: 0,
             arg2: 0,
@@ -356,6 +360,9 @@ pub struct ThreadControlBlock {
     pub user_entry: Option<VirtAddr>,
     pub user_stack_top: Option<VirtAddr>,
     pub user_context: UserRegisterContext,
+    /// QEMU-CONTEXT1 §2 — this task's user FP/SIMD and control state whenever it is not running
+    /// (see `kernel::user_fpu` for the capture/commit/load/restore contract and ownership rules).
+    pub user_fpu: crate::kernel::user_fpu::UserFpuState,
     pub detach_state: ThreadDetachState,
     /// `None` means fallback to kernel/class policy in `KernelState`.
     pub fault_policy_override: Option<FaultPolicy>,
@@ -1059,6 +1066,7 @@ impl ThreadControlBlock {
             user_entry: None,
             user_stack_top: None,
             user_context: UserRegisterContext::default(),
+            user_fpu: crate::kernel::user_fpu::UserFpuState::initial(),
             detach_state: ThreadDetachState::Joinable,
             fault_policy_override: None,
             restart: RestartState::default(),
@@ -1135,6 +1143,7 @@ mod tests {
             instruction_ptr: VirtAddr(0x4000),
             stack_ptr: VirtAddr(0x8000),
             user_gprs: [0; 32],
+            user_status: 0,
             arg0: 1,
             arg1: 2,
             arg2: 3,

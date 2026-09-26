@@ -24,7 +24,11 @@
 //! 3. **preempt** — thread B runs its own distinct pattern and control settings in a loop and
 //!    clears A's `ran_not` word. A loads its pattern and spins, flag-neutrally, until it observes
 //!    `ran_not == 0`: on one CPU that is only possible if A was descheduled and B executed between
-//!    A's capture and A's restoration. Asserted: everything, including flags.
+//!    A's capture and A's restoration. Asserted: everything, including flags, and the six GPRs
+//!    that are the syscall argument/result lanes (x0..x5; rdi rsi rdx r10 r8 r9), which A holds
+//!    live sentinels in across the window. The round's mode chooses how A comes back: `spin`
+//!    rounds keep B spinning, so only a timer tick can return to A; `block` rounds make B block
+//!    right after its first short window, so A resumes through B's blocking SYSCALL return.
 //! 4. **same** — B has exited; A spins for several quanta (sized from cell 3) under timer
 //!    interrupts that return to A. Asserted: everything, including flags; one round with DF set.
 //!
@@ -46,6 +50,21 @@ const FRESH_PARK_TICKS: u64 = 4;
 /// Upper bound on one preemption window's wait for B, in loop iterations.
 const PREEMPT_BOUND: u64 = 4_000_000_000;
 const B_ITERS: u64 = 3_000_000;
+/// B's window in a `block` round: short, so B blocks before a tick can intervene.
+const B_SHORT_ITERS: u64 = 4_096;
+/// Per-round B behaviour: 0 = spin (A returns on a timer tick), 1 = block after one short window
+/// (A returns through B's blocking syscall).
+static B_MODE: AtomicU32 = AtomicU32::new(0);
+static B_PARK: AtomicU32 = AtomicU32::new(0);
+/// A's six live GPR sentinels across a preemption window.
+const GPR_SENTINELS: [usize; 6] = [
+    0x5A5A_0000_0000_0001,
+    0x5A5A_0000_0000_0102,
+    0x5A5A_0000_0000_0203,
+    0x5A5A_0000_0000_0304,
+    0x5A5A_0000_0000_0405,
+    0x5A5A_0000_0000_0506,
+];
 const STACK_BYTES: usize = 16 * 1024;
 
 #[repr(C, align(16))]
@@ -146,6 +165,7 @@ mod arch {
         out: &mut State,
         flags: u64,
         bound: u64,
+        gprs: &mut [usize; 6],
     ) -> (u64, u64) {
         let mut env = ZERO;
         let flags_out: u64;
@@ -166,6 +186,8 @@ mod arch {
                 "3:",
                 "pushfq",
                 "pop {fout}",
+                // The Rust ABI requires DF clear at every call boundary; the pattern may set it.
+                "cld",
                 "fxsave64 [{out}]",
                 "fxrstor64 [{env}]",
                 env = in(reg) &mut env,
@@ -175,6 +197,12 @@ mod arch {
                 ran = in(reg) RAN_NOT.as_ptr(),
                 n = inout(reg) bound => left,
                 fout = out(reg) flags_out,
+                inout("rdi") gprs[0],
+                inout("rsi") gprs[1],
+                inout("rdx") gprs[2],
+                inout("r10") gprs[3],
+                inout("r8") gprs[4],
+                inout("r9") gprs[5],
                 out("rcx") _,
                 out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
                 out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
@@ -220,6 +248,8 @@ mod arch {
                 "loop 2b",
                 "pushfq",
                 "pop {fout}",
+                // The Rust ABI requires DF clear at every call boundary; the pattern may set it.
+                "cld",
                 "fxsave64 [{out}]",
                 "fxrstor64 [{env}]",
                 env = in(reg) &mut env,
@@ -479,7 +509,12 @@ mod arch {
 
     /// Spin until B has run (`RAN_NOT == 0`) or `bound` iterations pass; NZCV-neutral (`ldr`,
     /// `cbz`, `sub`, `b` only). Returns iterations left.
-    pub unsafe fn spin_until_other_ran(pat: &State, out: &mut State, bound: u64) -> u64 {
+    pub unsafe fn spin_until_other_ran(
+        pat: &State,
+        out: &mut State,
+        bound: u64,
+        gprs: &mut [usize; 6],
+    ) -> u64 {
         let left: u64;
         unsafe {
             core::arch::asm!(
@@ -500,6 +535,12 @@ mod arch {
                 n = inout(reg) bound => left,
                 t = out(reg) _,
                 e0 = out(reg) _, e1 = out(reg) _, e2 = out(reg) _,
+                inout("x0") gprs[0],
+                inout("x1") gprs[1],
+                inout("x2") gprs[2],
+                inout("x3") gprs[3],
+                inout("x4") gprs[4],
+                inout("x5") gprs[5],
                 out("v0") _, out("v1") _, out("v2") _, out("v3") _,
                 out("v4") _, out("v5") _, out("v6") _, out("v7") _,
                 out("v8") _, out("v9") _, out("v10") _, out("v11") _,
@@ -717,16 +758,18 @@ extern "C" fn b_body() -> ! {
     let pat = arch::b_pattern();
     let mut out = arch::ZERO;
     while B_STOP.load(SeqCst) == 0 {
+        let block = B_MODE.load(SeqCst) == 1;
+        let iters = if block { B_SHORT_ITERS } else { B_ITERS };
         #[cfg(target_arch = "x86_64")]
         let (mask, flags_bad) = {
             // SAFETY: a self-contained register window; see `arch::spin_fixed`.
-            let f = unsafe { arch::spin_fixed(&pat, &mut out, arch::B_FLAGS, B_ITERS, true) };
+            let f = unsafe { arch::spin_fixed(&pat, &mut out, arch::B_FLAGS, iters, true) };
             (arch::diff(&pat, &out), arch::flags_diff(arch::B_FLAGS, f))
         };
         #[cfg(target_arch = "aarch64")]
         let (mask, flags_bad) = {
             // SAFETY: a self-contained register window; see `arch::spin_fixed`.
-            unsafe { arch::spin_fixed(&pat, &mut out, B_ITERS, true) };
+            unsafe { arch::spin_fixed(&pat, &mut out, iters, true) };
             (arch::diff_with(&pat, &out, true), false)
         };
         B_WINDOWS.fetch_add(1, SeqCst);
@@ -734,6 +777,10 @@ extern "C" fn b_body() -> ! {
             if B_BAD.fetch_add(1, SeqCst) == 0 {
                 B_FIRST_BAD.store(mask | ((flags_bad as u64) << 63), SeqCst);
             }
+        }
+        if block {
+            // Hand the CPU back through a blocking syscall: A resumes on B's syscall return.
+            recv_park(B_PARK.load(SeqCst), 1);
         }
     }
     B_DONE.store(1, SeqCst);
@@ -845,6 +892,8 @@ pub(super) fn run_once() {
     // ── 3. preempt ────────────────────────────────────────────────────────────────────────────
     B_STOP.store(0, SeqCst);
     B_DONE.store(0, SeqCst);
+    B_PARK.store(park, SeqCst);
+    B_MODE.store(1, SeqCst);
     let b_tid = spawn(
         arch::yarm_ctx1_b_entry,
         core::ptr::addr_of_mut!(B_STACK),
@@ -854,25 +903,32 @@ pub(super) fn run_once() {
     for round in 0..ROUNDS {
         let pat = arch::a_pattern();
         let mut out = arch::ZERO;
+        let mut gprs = GPR_SENTINELS;
+        // Rounds 0 and 2 return A through B's blocking syscall, round 1 on a timer tick.
+        let mode = if round == 1 { 0 } else { 1 };
+        B_MODE.store(mode, SeqCst);
         RAN_NOT.store(1, SeqCst);
         let b0 = B_WINDOWS.load(SeqCst);
         yarm_user_rt::user_log!(
-            "CTX1_WINDOW cell=preempt round={} tid={} b_tid={} begin",
+            "CTX1_WINDOW cell=preempt round={} tid={} b_tid={} mode={} begin",
             round,
             a_tid,
-            b_tid
+            b_tid,
+            if mode == 1 { "block" } else { "spin" }
         );
         #[cfg(target_arch = "x86_64")]
         let (left, flags_bad) = {
             // SAFETY: a self-contained register window; see `arch::spin_until_other_ran`.
-            let (f, left) =
-                unsafe { arch::spin_until_other_ran(&pat, &mut out, arch::A_FLAGS, PREEMPT_BOUND) };
+            let (f, left) = unsafe {
+                arch::spin_until_other_ran(&pat, &mut out, arch::A_FLAGS, PREEMPT_BOUND, &mut gprs)
+            };
             (left, arch::flags_diff(arch::A_FLAGS, f))
         };
         #[cfg(target_arch = "aarch64")]
         let (left, flags_bad) = {
             // SAFETY: a self-contained register window; see `arch::spin_until_other_ran`.
-            let left = unsafe { arch::spin_until_other_ran(&pat, &mut out, PREEMPT_BOUND) };
+            let left =
+                unsafe { arch::spin_until_other_ran(&pat, &mut out, PREEMPT_BOUND, &mut gprs) };
             (left, false)
         };
         #[cfg(target_arch = "x86_64")]
@@ -881,22 +937,33 @@ pub(super) fn run_once() {
         let mask = arch::diff_with(&pat, &out, true);
         let b_ran = RAN_NOT.load(SeqCst) == 0;
         let used = PREEMPT_BOUND - left;
-        quantum_iters = quantum_iters.max(used);
-        let ok = b_ran && mask == 0 && !flags_bad;
+        if mode == 0 {
+            quantum_iters = quantum_iters.max(used);
+        }
+        let mut gpr_bad = 0u32;
+        for (i, (&want, &got)) in GPR_SENTINELS.iter().zip(gprs.iter()).enumerate() {
+            if want != got {
+                gpr_bad |= 1 << i;
+            }
+        }
+        let ok = b_ran && mask == 0 && !flags_bad && gpr_bad == 0;
         failures += u32::from(!ok);
         yarm_user_rt::user_log!(
-            "CTX1_RESULT cell=preempt round={} tid={} b_tid={} b_ran={} b_windows={} iters={} mask=0x{:x} flags_bad={} result={}",
+            "CTX1_RESULT cell=preempt round={} tid={} b_tid={} mode={} b_ran={} b_windows={} iters={} mask=0x{:x} flags_bad={} gpr_bad=0x{:x} result={}",
             round,
             a_tid,
             b_tid,
+            if mode == 1 { "block" } else { "spin" },
             b_ran as u8,
             B_WINDOWS.load(SeqCst) - b0,
             used,
             mask,
             flags_bad as u8,
+            gpr_bad,
             if ok { "ok" } else { "fail" }
         );
     }
+    B_MODE.store(0, SeqCst);
     B_STOP.store(1, SeqCst);
     let mut waited = 0;
     while B_DONE.load(SeqCst) == 0 && waited < 400 {

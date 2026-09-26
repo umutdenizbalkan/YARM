@@ -69,6 +69,8 @@ pub(crate) struct SpawnBaseline {
     user_entry: Option<VirtAddr>,
     user_stack_top: Option<VirtAddr>,
     user_context: UserRegisterContext,
+    /// QEMU-CONTEXT1 §2 — the reservation's FP/SIMD home, restored with everything else.
+    user_fpu: crate::kernel::user_fpu::UserFpuState,
     tls_ptr: Option<VirtAddr>,
     cpu_affinity: Option<CpuId>,
 }
@@ -82,6 +84,7 @@ impl SpawnBaseline {
             user_entry: tcb.user_entry,
             user_stack_top: tcb.user_stack_top,
             user_context: tcb.user_context,
+            user_fpu: tcb.user_fpu,
             tls_ptr: tcb.tls_ptr,
             cpu_affinity: tcb.cpu_affinity,
         }
@@ -94,6 +97,7 @@ impl SpawnBaseline {
         tcb.user_entry = self.user_entry;
         tcb.user_stack_top = self.user_stack_top;
         tcb.user_context = self.user_context;
+        tcb.user_fpu = self.user_fpu;
         tcb.tls_ptr = self.tls_ptr;
         tcb.cpu_affinity = self.cpu_affinity;
     }
