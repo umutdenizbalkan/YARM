@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! QEMU-IRQ1 §3/§4 — init's RECEIVER for the RISC-V UART external-interrupt witness, and since
-//! QEMU-IRQ2 also for the AArch64 PL011 witness: ONE receiver, whose only per-port parts are the
-//! syscall instruction, the register-checked spin and the isolation probe addresses.
+//! QEMU-IRQ1 §3/§4 — init's RECEIVER for the RISC-V UART external-interrupt witness, since
+//! QEMU-IRQ2 also for the AArch64 PL011 witness, and since QEMU-IRQ3 for the x86_64 16550 witness:
+//! ONE receiver, whose only per-port parts are the syscall instruction, the register-checked spin
+//! and the isolation probe addresses.
 //!
-//! Slot-5 selector 30; compiled only with `riscv-uart-irq-witness` on RISC-V or
-//! `aarch64-pl011-irq-witness` on AArch64. The markers keep their IRQ1 names on both ports — they
+//! Slot-5 selector 30; compiled only with `riscv-uart-irq-witness` on RISC-V,
+//! `aarch64-pl011-irq-witness` on AArch64 or `x86_64-uart-irq-witness` on x86_64. The markers keep their IRQ1 names on both ports — they
 //! are this receiver's protocol with the host driver, not a claim about the port. The kernel hands it
 //! a RECEIVE cap on the notification the UART route targets (slot 13), a private park endpoint
 //! (slot 14), and a USER read-only ring page at [`RING_VA`] into which the kernel fixture copies
@@ -88,6 +89,15 @@ const PL011_BASE_VA: usize = 0x0900_0000;
 const ISOLATION_LOAD_VA: usize = PL011_BASE_VA + 0x18;
 #[cfg(target_arch = "aarch64")]
 const ISOLATION_MAP_VA: usize = PL011_BASE_VA;
+/// QEMU-IRQ3 — x86_64: the I/O APIC register window the witness programs, reached by the kernel
+/// through its uncached higher-half alias (`platform_layout::IOAPIC_MMIO_BASE`). A user load from
+/// it must fault; a user mapping cannot be placed there (it is not a user address). COM1 itself is
+/// a PORT, and a ring-3 `in` would raise #GP — which this kernel treats as fatal — so the port side
+/// of isolation is shown from live TSS/IOPL state by the kernel fixture instead.
+#[cfg(target_arch = "x86_64")]
+const ISOLATION_LOAD_VA: usize = 0xFFFF_FFFF_FEC0_0000;
+#[cfg(target_arch = "x86_64")]
+const ISOLATION_MAP_VA: usize = 0xFFFF_FFFF_FEC0_0000;
 
 const NR_IPC_RECV_TIMEOUT: usize = 5;
 const ERR_WOULD_BLOCK: usize = 7;
@@ -191,6 +201,29 @@ fn recv_timeout(cap: u32, timeout: u64) -> Recv {
             options(nostack),
         );
     }
+    // SAFETY: the kernel's x86_64 SYSCALL ABI (rax = number; rdi, rsi, rdx, r10, r8, r9 =
+    // arguments; rax/r8/rdx/rcx return, rcx carrying the error; SYSCALL itself clobbers rcx/r11).
+    // `clobber_abi("C")` also declares every XMM register clobbered: the x86_64 kernel is built
+    // with SSE and its entries save GPRs only, so no user XMM value survives a kernel entry
+    // (QEMU-IRQ3; measured, not relied on).
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let err: usize;
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") NR_IPC_RECV_TIMEOUT => _,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
+            in("r9") a5,
+            lateout("rcx") err,
+            clobber_abi("C"),
+            options(nostack),
+        );
+        a0 = err;
+    }
     let _ = (a1, a2, a3, a4, a5);
     // SAFETY: the kernel wrote `meta` through the pointer handed to it.
     let status = unsafe { core::ptr::read_volatile(&meta.status) };
@@ -282,6 +315,60 @@ fn park_measuring_simd(cap: u32, timeout: u64, seed: u64) -> (Recv, u32) {
     (outcome, mask)
 }
 
+/// QEMU-IRQ3 — the x86_64 idle item's park with two XMM sentinels (`xmm8`, `xmm9`) carried across
+/// the blocking receive in the same asm block. Observational, like the AArch64 measurement: bits
+/// 0..1 set for sentinels that did not come back.
+#[cfg(target_arch = "x86_64")]
+fn park_measuring_simd(cap: u32, timeout: u64, seed: u64) -> (Recv, u32) {
+    let mut payload = [0u8; 64];
+    let mut meta = MetaV2 {
+        status: u64::MAX,
+        opcode: 0,
+        flags: 0,
+        payload_len: 0,
+        cap_id: u64::MAX,
+        recv_meta_flags: 0,
+        sender_tid: 0,
+    };
+    let vs = [seed ^ 0x51D0_0001, seed ^ 0x51D0_0002];
+    let (mut v0, mut v1) = (vs[0], vs[1]);
+    let err: usize;
+    // SAFETY: NR 5 as in `recv_timeout`, with xmm8/xmm9 carried in and read back out.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") NR_IPC_RECV_TIMEOUT => _,
+            in("rdi") cap as usize,
+            in("rsi") payload.as_mut_ptr() as usize,
+            in("rdx") payload.len(),
+            in("r10") timeout as usize,
+            in("r8") (&mut meta as *mut MetaV2) as usize,
+            in("r9") core::mem::size_of::<MetaV2>(),
+            lateout("rcx") err,
+            inout("xmm8") v0,
+            inout("xmm9") v1,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    let mask = u32::from(v0 != vs[0]) | (u32::from(v1 != vs[1]) << 1);
+    // SAFETY: the kernel wrote `meta` through the pointer handed to it.
+    let status = unsafe { core::ptr::read_volatile(&meta.status) };
+    let outcome = if status != u64::MAX {
+        Recv::Message {
+            label: meta.opcode,
+            payload_len: meta.payload_len,
+        }
+    } else {
+        match err {
+            ERR_WOULD_BLOCK => Recv::Empty,
+            ERR_TIMED_OUT => Recv::TimedOut,
+            _ => Recv::Error,
+        }
+    };
+    (outcome, mask)
+}
+
 /// Spin in U-mode with six sentinel registers live across the whole loop. Returns the mask of
 /// registers whose value did NOT survive — `0` means the register file came back intact from every
 /// interrupt that landed inside the loop.
@@ -347,6 +434,37 @@ fn spin_checking_registers(iters: u64, seed: u64) -> u32 {
             options(nomem, nostack),
         );
     }
+    // QEMU-IRQ3 — x86_64: six GPR sentinels (r12..r15, r9, r10), the carry flag (set by `stc`
+    // before the loop; `dec` leaves CF alone, so it must still be set after — bit 6), and two XMM
+    // sentinels (xmm8, xmm9) that are OBSERVATIONAL only (bits 16..17): the x86_64 kernel does not
+    // preserve user XMM state across any entry.
+    #[cfg(target_arch = "x86_64")]
+    let xs = [seed ^ 0x51D0_0006, seed ^ 0x51D0_0007];
+    #[cfg(target_arch = "x86_64")]
+    let (mut x0, mut x1) = (xs[0], xs[1]);
+    #[cfg(target_arch = "x86_64")]
+    let cf: u64;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "stc",
+            "2:",
+            "dec {n}",
+            "jnz 2b",
+            "setc {cf:l}",
+            n = inout(reg) iters => _,
+            cf = out(reg) cf,
+            inout("r12") r0,
+            inout("r13") r1,
+            inout("r14") r2,
+            inout("r15") r3,
+            inout("r9") r4,
+            inout("r10") r5,
+            inout("xmm8") x0,
+            inout("xmm9") x1,
+            options(nomem, nostack),
+        );
+    }
     let got = [r0, r1, r2, r3, r4, r5];
     let mut mask = 0u32;
     for (i, (g, want)) in got.iter().zip(s.iter()).enumerate() {
@@ -361,6 +479,13 @@ fn spin_checking_registers(iters: u64, seed: u64) -> u32 {
                 mask |= 1 << (6 + i);
             }
         }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if cf & 0xff != 1 {
+            mask |= 1 << 6;
+        }
+        mask |= (u32::from(x0 != xs[0]) << 16) | (u32::from(x1 != xs[1]) << 17);
     }
     mask
 }
@@ -478,6 +603,48 @@ fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
             options(nostack),
         );
     }
+    // SAFETY: `DebugLog` (rax = 15, rdi/rsi = the line) through SYSCALL, then the same checked loop
+    // as `spin_checking_registers`: r12..r15/r9/r10 GPR sentinels, CF set by `stc` AFTER the
+    // syscall (whose return resets RFLAGS) and required still set after the loop, xmm8/xmm9
+    // observational. SYSCALL clobbers rcx/r11; the kernel writes rax/r8/rdx/rcx. Every allocatable
+    // GPR is named here, so the count is an immediate (`SPIN_ITERS`, the only value ever passed).
+    #[cfg(target_arch = "x86_64")]
+    let _ = iters;
+    #[cfg(target_arch = "x86_64")]
+    let xs = [seed ^ 0x51D0_0006, seed ^ 0x51D0_0007];
+    #[cfg(target_arch = "x86_64")]
+    let (mut x0, mut x1) = (xs[0], xs[1]);
+    #[cfg(target_arch = "x86_64")]
+    let cf: u64;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            "mov rcx, {n}",
+            "stc",
+            "2:",
+            "dec rcx",
+            "jnz 2b",
+            "setc al",
+            n = const SPIN_ITERS,
+            inlateout("rax") NR_DEBUG_LOG => cf,
+            in("rdi") line.buf.as_ptr() as usize,
+            in("rsi") line.len,
+            lateout("rdx") _,
+            lateout("rcx") _,
+            lateout("r8") _,
+            lateout("r11") _,
+            inout("r12") r0,
+            inout("r13") r1,
+            inout("r14") r2,
+            inout("r15") r3,
+            inout("r9") r4,
+            inout("r10") r5,
+            inout("xmm8") x0,
+            inout("xmm9") x1,
+            options(nostack),
+        );
+    }
     let got = [r0, r1, r2, r3, r4, r5];
     let mut mask = 0u32;
     for (i, (g, want)) in got.iter().zip(s.iter()).enumerate() {
@@ -492,6 +659,13 @@ fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
                 mask |= 1 << (6 + i);
             }
         }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if cf & 0xff != 1 {
+            mask |= 1 << 6;
+        }
+        mask |= (u32::from(x0 != xs[0]) << 16) | (u32::from(x1 != xs[1]) << 17);
     }
     mask
 }
@@ -625,14 +799,14 @@ pub(super) fn run_once() {
                 if rounds > MAX_IDLE_ROUNDS {
                     break None;
                 }
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
                 let parked = {
                     let seed = 0x5EED_0000_0000u64 | ((seq as u64) << 16) | rounds as u64;
                     let (r, m) = park_measuring_simd(park, IDLE_PARK_TICKS, seed);
                     idle_simd_mask |= m;
                     r
                 };
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 let parked = recv_timeout(park, IDLE_PARK_TICKS);
                 match parked {
                     Recv::Message { .. } => dup += 1,
@@ -684,7 +858,9 @@ pub(super) fn run_once() {
             idle_items += 1;
         } else {
             user_items += 1;
-            if bad_mask != 0 {
+            // Bits 0..15 are graded (GPRs, flags, and AArch64's saved-and-restored SIMD); bits 16+
+            // are x86_64's observational XMM sentinels, reported separately below.
+            if bad_mask & 0xffff != 0 {
                 regs_bad += 1;
             }
         }
@@ -699,9 +875,19 @@ pub(super) fn run_once() {
             bytes,
             data as u8,
             rounds,
-            bad_mask,
+            bad_mask & 0xffff,
             ring_word(W_CLAIMS),
             ring_word(W_COMPLETIONS),
+            idle_simd_mask
+        );
+        // QEMU-IRQ3: the x86_64 XMM sentinels, on a line of their own (the RECV line is at the
+        // user-log length limit). Observational, never graded by the receiver.
+        #[cfg(target_arch = "x86_64")]
+        yarm_user_rt::user_log!(
+            "IRQ1_UART_SIMD seq={} mode={} user_simd_mask=0x{:x} idle_resume_simd_mask=0x{:x}",
+            seq,
+            if idle { "idle" } else { "user" },
+            bad_mask >> 16,
             idle_simd_mask
         );
     }

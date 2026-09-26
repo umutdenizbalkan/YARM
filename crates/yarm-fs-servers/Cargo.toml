@@ -45,6 +45,7 @@ futex-wait-nonblock-probe = []
 timer5-idle-return-witness = []
 riscv-uart-irq-witness = []
 aarch64-pl011-irq-witness = []
+x86_64-uart-irq-witness = []
 recv-queue1-ordinary-grant = []
 # Stage 200D-0D1: the RISC-V sibling, an UNUSED pass-through for the same reason — one
 # BOOTSTRAP_FEATURE_ARGS is applied to every server package. No oracle code compiles here.

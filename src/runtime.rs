@@ -10162,7 +10162,8 @@ impl SharedKernel {
                 // caller may receive from. Every other shape keeps the endpoint-only answer.
                 #[cfg(any(
                     feature = "riscv-uart-irq-witness",
-                    feature = "aarch64-pl011-irq-witness"
+                    feature = "aarch64-pl011-irq-witness",
+                    feature = "x86_64-uart-irq-witness"
                 ))]
                 if matches!(e, crate::kernel::boot::KernelError::WrongObject) && timeout_ticks == 0
                 {
@@ -10346,7 +10347,8 @@ impl SharedKernel {
     /// endpoint resolver's own `WrongObject` exactly as before.
     #[cfg(any(
         feature = "riscv-uart-irq-witness",
-        feature = "aarch64-pl011-irq-witness"
+        feature = "aarch64-pl011-irq-witness",
+        feature = "x86_64-uart-irq-witness"
     ))]
     fn witness_notification_probe_into_frame(
         &self,

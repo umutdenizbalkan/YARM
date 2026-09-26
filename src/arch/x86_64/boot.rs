@@ -1139,6 +1139,36 @@ pub fn bootstrap_first_user_task(
             init_args[5]
         );
     }
+    // QEMU-IRQ3 §3: the COM1 external-interrupt witness. Compile-time gated only, and mutually
+    // exclusive with every slot-5/13/14 cell above. The route is bound to the line the production
+    // decoder will report — the GSI the executed machine's MADT gives COM1's ISA IRQ, delivered at
+    // vector 0x20 + GSI — never to an assumed constant; with no MADT nothing is bound.
+    #[cfg(feature = "x86_64-uart-irq-witness")]
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
+        match crate::arch::x86_64::uart_irq_witness::derive_route() {
+            Some(line) => {
+                if let Some(p) = crate::kernel::boot::provision_init_uart_irq_witness(
+                    kernel,
+                    RING3_INIT_SERVER_TID,
+                    init_asid,
+                    line,
+                ) {
+                    init_args[5] = crate::kernel::boot::UART_IRQ_WITNESS_SELECTOR;
+                    init_args[13] = p.notification_recv_cap as u64;
+                    init_args[14] = p.park_endpoint_cap as u64;
+                    crate::yarm_log!(
+                        "IRQ3_WITNESS_SLOTS slot5={} slot13={} slot14={} notification={} line={}",
+                        init_args[5],
+                        init_args[13],
+                        init_args[14],
+                        p.notification_idx,
+                        line
+                    );
+                }
+            }
+            None => crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=madt_route"),
+        }
+    }
     // U9-PAGEFAULT1 §2 — the x86_64 TERMINAL-FAULT oracle slot-5 write.
     //
     // The same scenario, selector and knob AArch64 has used since 199E-A64CALL: init takes one
@@ -1446,6 +1476,11 @@ fn capture_pvh_command_line(start_info_ptr: usize) {
         return;
     }
     let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    // QEMU-IRQ3 §1: the witness reads the MADT through the RSDP the PVH boot protocol hands over.
+    #[cfg(feature = "x86_64-uart-irq-witness")]
+    if start_info._magic == PVH_MAGIC {
+        crate::arch::x86_64::uart_irq_witness::capture_rsdp(start_info._rsdp_paddr);
+    }
     let physical = start_info.cmdline_paddr;
     let read_len = BOOT_COMMAND_LINE_MAX_BYTES + 1;
     let direct_map_limit = crate::arch::platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES;

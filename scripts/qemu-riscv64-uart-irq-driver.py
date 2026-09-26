@@ -36,7 +36,12 @@ wake on their own deadlines, and a byte injected on a stale "entered idle" can a
 is resuming one of them. After a tick that found nothing to run, the CPU is idle for the whole
 next period.
 
-Usage: qemu-riscv64-uart-irq-driver.py [--arch riscv64|aarch64] --kernel K --initrd I --log L
+x86_64 (`--arch x86_64`): QEMU `q35`, `qemu64`, 512M, `-smp 1`, PVH direct boot — the x86_64 core
+smoke's machine — whose first serial port (COM1, the 16550 at I/O 0x3F8) is the socket. The idle
+acknowledgement is the same settled idle tick as AArch64's; the disabled marker is
+`IRQ3_UART_SOURCE_DISABLED`.
+
+Usage: qemu-riscv64-uart-irq-driver.py [--arch riscv64|aarch64|x86_64] --kernel K --initrd I --log L
        [--timeout S] [--no-inject]
 """
 
@@ -54,6 +59,7 @@ READY_RE = re.compile(rb"IRQ1_UART_READY seq=(\d+) mode=(idle|user) expect=0x([0
 IDLE_RE = re.compile(rb"RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io|RISCV_S_MODE_TIMER_RESUME_IDLE")
 IDLE_RE_AARCH64 = re.compile(rb"TIMER_IDLE_ADVANCE_SETTLED cpu=0 incoming=none reason=idle settlement=kernel_idle")
 DISABLED_RE_AARCH64 = re.compile(rb"IRQ2_PL011_SOURCE_DISABLED ")
+DISABLED_RE_X86_64 = re.compile(rb"IRQ3_UART_SOURCE_DISABLED ")
 DONE_RE = re.compile(rb"IRQ1_UART_WITNESS items=")
 DISABLED_RE = re.compile(rb"IRQ1_UART_SOURCE_DISABLED ")
 POST_RE = re.compile(rb"IRQ1_UART_POSTDISABLE_READY")
@@ -63,7 +69,7 @@ POST_BYTE = ord("Z")
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=["riscv64", "aarch64"], default="riscv64")
+    ap.add_argument("--arch", choices=["riscv64", "aarch64", "x86_64"], default="riscv64")
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--initrd", required=True)
     ap.add_argument("--log", required=True)
@@ -90,6 +96,12 @@ def main() -> int:
                "-kernel", args.kernel, "-initrd", args.initrd]
         if args.cmdline:
             cmd += ["-append", args.cmdline]
+    elif args.arch == "x86_64":
+        idle_re, disabled_re = IDLE_RE_AARCH64, DISABLED_RE_X86_64
+        cmd = [args.qemu or "qemu-system-x86_64", "-machine", "q35", "-cpu", "qemu64",
+               "-m", "512M", "-smp", "1", *serial,
+               "-kernel", args.kernel, "-initrd", args.initrd,
+               "-append", args.cmdline or "console=ttyS0 rdinit=/init"]
     else:
         idle_re, disabled_re = IDLE_RE, DISABLED_RE
         cmd = [args.qemu or "qemu-system-riscv64", "-machine", "virt", "-cpu", "rv64",

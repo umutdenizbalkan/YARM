@@ -2619,7 +2619,8 @@ impl KernelState {
     /// As `resolve_endpoint_recv_cap_in_pid_from_raw`.
     #[cfg(any(
         feature = "riscv-uart-irq-witness",
-        feature = "aarch64-pl011-irq-witness"
+        feature = "aarch64-pl011-irq-witness",
+        feature = "x86_64-uart-irq-witness"
     ))]
     pub(crate) unsafe fn resolve_notification_recv_cap_in_pid_from_raw(
         state: *const KernelState,

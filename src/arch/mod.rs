@@ -5,6 +5,10 @@
 pub mod aarch64;
 #[cfg(any(test, target_arch = "aarch64"))]
 pub mod aarch64_boot_policy;
+/// QEMU-IRQ3 §1 — the MADT facts one ISA interrupt needs (ISA IRQ -> GSI with overrides, GSI ->
+/// I/O APIC), arch-neutral so the hosted suite executes the rule the x86_64 witness applies.
+#[cfg_attr(not(feature = "x86_64-uart-irq-witness"), allow(dead_code))]
+pub mod acpi_madt_rule;
 pub mod boot_entry;
 pub mod cpu_mapping;
 /// QEMU-IRQ1 §2 — the device-window readiness rule and the idle-origin external admission rule,

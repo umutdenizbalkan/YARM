@@ -8249,7 +8249,8 @@ pub fn timer5_idle_return_witness_enabled() -> bool {
 /// (`aarch64-pl011-irq-witness`); the two features are never built together.
 #[cfg(any(
     feature = "riscv-uart-irq-witness",
-    feature = "aarch64-pl011-irq-witness"
+    feature = "aarch64-pl011-irq-witness",
+    feature = "x86_64-uart-irq-witness"
 ))]
 pub const UART_IRQ_WITNESS_SELECTOR: u64 = 30;
 
@@ -8259,14 +8260,16 @@ pub const UART_IRQ_WITNESS_SELECTOR: u64 = 30;
 /// a hosted test.
 #[cfg(any(
     feature = "riscv-uart-irq-witness",
-    feature = "aarch64-pl011-irq-witness"
+    feature = "aarch64-pl011-irq-witness",
+    feature = "x86_64-uart-irq-witness"
 ))]
 pub const UART_IRQ_WITNESS_RING_VA: u64 = 0x2800_0000;
 
 /// QEMU-IRQ1 §3 — what the witness provisioning handed init.
 #[cfg(any(
     feature = "riscv-uart-irq-witness",
-    feature = "aarch64-pl011-irq-witness"
+    feature = "aarch64-pl011-irq-witness",
+    feature = "x86_64-uart-irq-witness"
 ))]
 #[derive(Clone, Copy, Debug)]
 pub struct UartIrqWitnessProvision {
@@ -8299,7 +8302,8 @@ pub struct UartIrqWitnessProvision {
     not(feature = "hosted-dev"),
     any(
         all(feature = "riscv-uart-irq-witness", target_arch = "riscv64"),
-        all(feature = "aarch64-pl011-irq-witness", target_arch = "aarch64")
+        all(feature = "aarch64-pl011-irq-witness", target_arch = "aarch64"),
+        all(feature = "x86_64-uart-irq-witness", target_arch = "x86_64")
     )
 ))]
 pub fn provision_init_uart_irq_witness(
@@ -8399,6 +8403,8 @@ pub fn provision_init_uart_irq_witness(
     crate::arch::riscv64::uart_irq_witness::set_ring_page(ring_pa, irq_line);
     #[cfg(target_arch = "aarch64")]
     crate::arch::aarch64::pl011_irq_witness::set_ring_page(ring_pa, irq_line);
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::uart_irq_witness::set_ring_page(ring_pa, irq_line);
     crate::yarm_log!(
         "IRQ1_WITNESS_PROVISION_OK init_tid={} irq_line={} notification={} notif_recv_cap={} park_cap={} ring_va=0x{:x} ring_pa=0x{:x} ring_user_write=0",
         init_tid,

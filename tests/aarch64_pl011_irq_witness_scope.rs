@@ -354,7 +354,8 @@ fn the_receiver_does_not_depend_on_simd_across_a_blocking_receive() {
 /// The host driver owns the PL011's only backend and paces by acknowledgement.
 #[test]
 fn the_driver_uses_a_dedicated_backend_and_acknowledgements() {
-    assert!(DRIVER.contains("choices=[\"riscv64\", \"aarch64\"]"));
+    // QEMU-IRQ3 added x86_64 to the same driver.
+    assert!(DRIVER.contains("choices=[\"riscv64\", \"aarch64\", \"x86_64\"]"));
     assert!(DRIVER.contains("\"-cpu\", \"cortex-a72\""));
     assert!(DRIVER.contains("\"-m\", \"1024M\", \"-smp\", \"1\""));
     assert!(DRIVER.contains("socket,id=uart0,path={sock_path},server=on,wait=on"));

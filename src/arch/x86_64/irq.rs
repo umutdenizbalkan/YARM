@@ -206,6 +206,34 @@ fn lapic_program_timer_deadline(base: usize, ticks_from_now: u64) {
     lapic_write_u32(base, LAPIC_TIMER_INITIAL_COUNT_OFFSET, count);
 }
 
+/// QEMU-IRQ3 §2 — `true` once the LAPIC base is recorded and the APIC software-enabled.
+#[cfg(all(
+    feature = "x86_64-uart-irq-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64"
+))]
+pub fn lapic_configured() -> bool {
+    LAPIC_CONFIGURED.load(Ordering::Relaxed)
+}
+
+/// QEMU-IRQ3 §4 — how many EOIs this owner has written. Observation only: the witness fixture
+/// reads it on both sides of one dispatch to show that dispatch wrote exactly one.
+#[cfg(all(
+    feature = "x86_64-uart-irq-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64"
+))]
+static LAPIC_EOI_WRITES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(
+    feature = "x86_64-uart-irq-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64"
+))]
+pub fn lapic_eoi_writes() -> u32 {
+    LAPIC_EOI_WRITES.load(Ordering::Acquire)
+}
+
 pub fn acknowledge_interrupt(_irq_line: u16) {
     #[cfg(any(test, not(feature = "hosted-dev")))]
     {
@@ -213,6 +241,12 @@ pub fn acknowledge_interrupt(_irq_line: u16) {
             return;
         }
         lapic_write_eoi(LAPIC_MMIO_BASE.load(Ordering::Relaxed));
+        #[cfg(all(
+            feature = "x86_64-uart-irq-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "x86_64"
+        ))]
+        LAPIC_EOI_WRITES.fetch_add(1, Ordering::AcqRel);
     }
 }
 

@@ -141,6 +141,12 @@ riscv-uart-irq-witness = []
 # non-blocking notification arm IRQ1 uses, and init's receiver cell. A build without it enables no
 # SPI, touches no UART interrupt register and keeps NR 5 endpoint-only.
 aarch64-pl011-irq-witness = []
+# QEMU-IRQ3: the x86_64 external-device interrupt witness — COM1 RX -> I/O APIC -> LAPIC -> YARM on
+# QEMU q35, one CPU. Compiles the UART setup/drain fixture (MADT read from the PVH RSDP, I/O APIC
+# redirection for the one source), its hooks on the trap entry, the provisioning of init's
+# notification + ring page, the shared witness-only NR 5 notification arm, and init's receiver cell.
+# A build without it programs no I/O APIC entry and keeps NR 5 endpoint-only.
+x86_64-uart-irq-witness = []
 # U9-RECV-QUEUE1 §3: the queued shared-region grant taken by the ORDINARY receive syscalls
 # (NR 2 and NR 5) rather than by NR 30. A cargo feature and not only a runtime selector, for the
 # same reason the send-fault cell is one: init's address space runs at `MAX_MAPPINGS` and its

@@ -16,6 +16,14 @@ pub(crate) mod smp_trampoline;
 pub mod syscall_abi;
 pub mod tlb_shootdown;
 pub mod trap;
+/// QEMU-IRQ3 — the COM1 / I/O APIC external-interrupt witness fixture. Compiled only with
+/// `x86_64-uart-irq-witness`; no default or production profile carries it.
+#[cfg(all(
+    feature = "x86_64-uart-irq-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64"
+))]
+pub mod uart_irq_witness;
 pub mod vm_layout;
 
 pub mod topology;

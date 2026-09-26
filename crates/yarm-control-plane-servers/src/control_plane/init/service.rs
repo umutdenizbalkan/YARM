@@ -2125,12 +2125,13 @@ pub(super) mod timer5_idle_return_witness {
 }
 
 /// QEMU-IRQ1 §3/§4 — the RISC-V UART external-interrupt witness receiver (selector 30), shared
-/// since QEMU-IRQ2 with the AArch64 PL011 witness.
+/// since QEMU-IRQ2 with the AArch64 PL011 witness and since QEMU-IRQ3 with the x86_64 16550 one.
 #[cfg(all(
     not(feature = "hosted-dev"),
     any(
         all(feature = "riscv-uart-irq-witness", target_arch = "riscv64"),
-        all(feature = "aarch64-pl011-irq-witness", target_arch = "aarch64")
+        all(feature = "aarch64-pl011-irq-witness", target_arch = "aarch64"),
+        all(feature = "x86_64-uart-irq-witness", target_arch = "x86_64")
     )
 ))]
 #[path = "uart_irq_witness.rs"]
@@ -6507,12 +6508,14 @@ pub fn run() {
     }
     // QEMU-IRQ1 §3: the RISC-V UART external-interrupt witness, selector 30. Mutually exclusive
     // with every other slot-5 cell; compiled only with `riscv-uart-irq-witness`. QEMU-IRQ2: the
-    // same cell serves the AArch64 PL011 witness under `aarch64-pl011-irq-witness`.
+    // same cell serves the AArch64 PL011 witness under `aarch64-pl011-irq-witness`, and QEMU-IRQ3
+    // the x86_64 16550 witness under `x86_64-uart-irq-witness`.
     #[cfg(all(
         not(feature = "hosted-dev"),
         any(
             all(feature = "riscv-uart-irq-witness", target_arch = "riscv64"),
-            all(feature = "aarch64-pl011-irq-witness", target_arch = "aarch64")
+            all(feature = "aarch64-pl011-irq-witness", target_arch = "aarch64"),
+            all(feature = "x86_64-uart-irq-witness", target_arch = "x86_64")
         )
     ))]
     if uart_irq_witness::armed(ctx.supervisor_control_recv_ep) {

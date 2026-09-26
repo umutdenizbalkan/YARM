@@ -122,6 +122,20 @@ impl X86TaskStateSegment {
     }
 }
 
+/// QEMU-IRQ3 §2 — the live I/O-permission facts of the boot TSS: its I/O-map base and its size.
+/// A base at or past the TSS limit means there is no I/O permission bitmap, so a ring-3 `in`/`out`
+/// with IOPL 0 faults (#GP) for every port.
+#[cfg(all(
+    feature = "x86_64-uart-irq-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64"
+))]
+pub(crate) fn boot_tss_io_map_facts() -> (u16, usize) {
+    // SAFETY: a plain read of a boot-initialised static; nothing writes `io_map_base` after boot.
+    let base = unsafe { core::ptr::addr_of!(BOOT_TSS.io_map_base).read_unaligned() };
+    (base, core::mem::size_of::<X86TaskStateSegment>())
+}
+
 static DESCRIPTOR_SCAFFOLD_READY: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -578,7 +592,7 @@ fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelSta
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
+pub(crate) fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
     let ptr = TRAP_SHARED_KERNEL_PTR.load(Ordering::SeqCst);
     if ptr.is_null() {
         None
@@ -1013,18 +1027,21 @@ fn dispatch_trap_from_stub_for_test(
 /// Only user-mode return frames (CS DPL=3) are updated; kernel-mode frames
 /// (timer/NMI in ring 0) are left untouched.
 ///
-/// RFLAGS is always reset to 0x202 (IF=1, DF=0, all other flags clear).  This
-/// is safe because:
-///   - First task entry: 0x202 is the correct initial value.
-///   - Re-entry after a blocking syscall: RFLAGS is caller-clobbered across
-///     the syscall boundary per the x86-64 ABI, so resetting it is correct.
-///   - Re-entry after a timer preemption: losing the exact flag state is
-///     acceptable; DF=0 at function calls/returns is the only ABI requirement
-///     that matters, and 0x202 satisfies it.
+/// RFLAGS on a ring-3 return is decided by [`ring3_return_rflags`]:
+///   - A syscall, a task switch, or a first entry: reset to 0x202 (IF=1, DF=0, all other flags
+///     clear). RFLAGS is caller-clobbered across the syscall boundary, and the task context holds
+///     no RFLAGS to restore for a task that was switched in.
+///   - QEMU-IRQ3 §2: an interrupt or exception that returns to the SAME task it interrupted keeps
+///     the hardware frame's RFLAGS. An asynchronous interrupt lands between arbitrary
+///     instructions — between a `cmp` and its `jcc`, or inside a `dec`/`jnz` loop — so resetting
+///     the arithmetic flags there changes the interrupted program's control flow. The earlier
+///     claim that "losing the exact flag state is acceptable" after a timer interrupt was wrong
+///     for exactly that reason.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe fn flush_trap_context_to_iret_frame(
     interrupt_frame: *mut X86InterruptStackFrame,
     trap_frame: &crate::kernel::trapframe::TrapFrame,
+    same_task_async_return: bool,
 ) {
     if interrupt_frame.is_null() {
         return;
@@ -1105,8 +1122,29 @@ unsafe fn flush_trap_context_to_iret_frame(
     if new_sp != 0 {
         frame.rsp = new_sp as u64;
     }
-    // Reset RFLAGS to a clean state: IF=1, all other flags clear.
-    frame.rflags = 0x202;
+    frame.rflags = ring3_return_rflags(frame.rflags, same_task_async_return);
+}
+
+/// QEMU-IRQ3 §2 — the RFLAGS a ring-3 return carries. `same_task_async_return` is true when the
+/// trap was not a syscall and returns to the very task it interrupted: the interrupted flags are
+/// kept, with `IF` guaranteed set (a ring-3 context always ran with it). Otherwise the clean
+/// `0x202` a syscall return or a switched-in task receives.
+/// QEMU-IRQ3 §2 — may the idle-owner revalidation choose a replacement for this trap? Only when
+/// the entering frame is ring 3 (the LSTAR path's synthetic frame carries `CS = 0x23` too).
+#[cfg_attr(all(feature = "hosted-dev", not(test)), allow(dead_code))]
+pub(crate) const fn owner_revalidation_admissible(entering_cs: u64) -> bool {
+    entering_cs & 0x3 == 0x3
+}
+
+#[cfg_attr(all(feature = "hosted-dev", not(test)), allow(dead_code))]
+pub(crate) const fn ring3_return_rflags(hardware_rflags: u64, same_task_async_return: bool) -> u64 {
+    const RFLAGS_IF: u64 = 1 << 9;
+    const RFLAGS_CLEAN: u64 = 0x202;
+    if same_task_async_return {
+        hardware_rflags | RFLAGS_IF
+    } else {
+        RFLAGS_CLEAN
+    }
 }
 
 #[cfg(all(test, feature = "hosted-dev", target_arch = "x86_64"))]
@@ -1377,6 +1415,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64");
         }
         let fault_rip = frame.rip;
+        let entering_cs = frame.cs;
         // Stage 4T+6R history, and why THIS is not a repeat of it: Stage 4T+6 converted
         // both snapshots to `current_tid_split_read(cpu)`, which has equivalent
         // return-value semantics but does NOT bind `scheduler_state.current_cpu` — and
@@ -1402,6 +1441,13 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         }
         let mut trap_frame =
             unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
+        // QEMU-IRQ3 §2: the witness fixture's hook before delivery — record the origin from the
+        // hardware frame and drain COM1 so the device cause is withdrawn before the production
+        // bridge delivers and writes the one LAPIC EOI. It never claims, delivers or completes.
+        #[cfg(feature = "x86_64-uart-irq-witness")]
+        crate::arch::x86_64::uart_irq_witness::note_entry_and_drain(
+            vector, frame.cs, frame.rip, cpu,
+        );
         if let Err(err) = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
             shared,
             cpu,
@@ -1423,6 +1469,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
             halt_forever();
         }
+        // QEMU-IRQ3 §2: after the bridge returned — the one EOI is written — read the controller
+        // state back and count the completion. Before any idle divergence below.
+        #[cfg(feature = "x86_64-uart-irq-witness")]
+        crate::arch::x86_64::uart_irq_witness::note_after_dispatch(vector);
         // U9-D3 §4: the USER-ORIGIN TLB shootdown cell, driven from the x86 post-lock epilogue.
         // `dispatch_trap_entry_with_shared_kernel` has returned, so the broad lock is RELEASED —
         // which this cell requires, because it polls CPU 1 for the ring-3 residency edge and that
@@ -1472,7 +1522,17 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // decision here, with the broad guard dropped and every drain complete, but BEFORE any
         // frame is committed. Only an `idle` owner is revalidated: a prepared replacement was
         // chosen from live state and the drains cannot invalidate it, so it is never displaced.
-        let revalidation = if matches!(exiting_tid, None | Some(0)) {
+        //
+        // QEMU-IRQ3 §2: only a trap that entered from RING 3 may have its idle owner revalidated
+        // into a replacement. A kernel-origin frame — an interrupt taken in the idle `hlt` — has no
+        // user continuation, and `flush_trap_context_to_iret_frame` converts a ring-0 frame only
+        // against the timer route's idle-boundary debt; a replacement chosen here would be written
+        // into the saved registers of a frame that `iretq`s back to the halt loop, with the task
+        // marked Running. Declining leaves any woken task queued: the next tick at the
+        // authenticated boundary selects it through the owner that CAN convert the frame.
+        let revalidation = if matches!(exiting_tid, None | Some(0))
+            && owner_revalidation_admissible(entering_cs)
+        {
             #[cfg(not(feature = "hosted-dev"))]
             {
                 shared.revalidate_idle_owner_after_drains(cpu, &mut trap_frame)
@@ -1559,12 +1619,16 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         }
         // A revalidated owner is a genuine task switch: its GPRs must reach the saved regs the
         // epilogue flushes, exactly as a normally-prepared replacement's would.
-        if task_switched || revalidated_owner.is_some() {
+        let switched = task_switched || revalidated_owner.is_some();
+        if switched {
             write_task_gprs_to_saved_regs(regs, &trap_frame);
         } else if vector as usize == VEC_SYSCALL {
             write_trap_returns_to_saved_regs(regs, &trap_frame);
         }
-        unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
+        let same_task_async_return = !switched && vector as usize != VEC_SYSCALL;
+        unsafe {
+            flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame, same_task_async_return)
+        };
         TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
         // Stage 200D-0B3: the common-epilogue ownership attestation, emitted from the epilogue
         // that actually owns the cleanup rather than from inside the broad lock (where Stage
@@ -1632,7 +1696,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     } else if vector as usize == VEC_SYSCALL {
         write_trap_returns_to_saved_regs(regs, &trap_frame);
     }
-    unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
+    let same_task_async_return = !task_switched && vector as usize != VEC_SYSCALL;
+    unsafe {
+        flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame, same_task_async_return)
+    };
     TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
 }
 
@@ -2924,6 +2991,27 @@ pub fn enter_user_mode_iret(
 
 #[cfg(test)]
 mod tests {
+    /// QEMU-IRQ3 §2 — a same-task interrupt return keeps the interrupted flags (CF, ZF, …, with
+    /// IF set); a syscall return or a switched-in task gets the clean 0x202.
+    /// QEMU-IRQ3 §2 — a kernel-origin (idle `hlt`) frame is never handed a replacement.
+    #[test]
+    fn owner_revalidation_is_admissible_only_for_ring3_frames() {
+        assert!(super::owner_revalidation_admissible(0x23));
+        assert!(super::owner_revalidation_admissible(0x1b | 0x3));
+        assert!(!super::owner_revalidation_admissible(0x08));
+        assert!(!super::owner_revalidation_admissible(0x10));
+    }
+
+    #[test]
+    fn ring3_return_rflags_keeps_interrupted_flags_only_for_same_task_async_returns() {
+        // CF | ZF | IF | reserved bit 1, as a `cmp` just before an interrupt could leave them.
+        let interrupted = 0x0000_0243;
+        assert_eq!(super::ring3_return_rflags(interrupted, true), interrupted);
+        // IF is guaranteed even if a frame somehow lacked it.
+        assert_eq!(super::ring3_return_rflags(0x0000_0043, true), 0x0000_0243);
+        assert_eq!(super::ring3_return_rflags(interrupted, false), 0x202);
+    }
+
     use super::*;
 
     #[test]

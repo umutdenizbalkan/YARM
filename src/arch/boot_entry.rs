@@ -99,6 +99,11 @@ pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
             crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
         );
         crate::yarm_log!("X86_BOOTSTRAP_TIMER_STARTED");
+        // QEMU-IRQ3 §2: the COM1 witness source is admitted here — after the shared trap state,
+        // the LAPIC and the tick are in place and after `bootstrap_first_user_task` bound its
+        // route; the I/O APIC entry is unmasked last.
+        #[cfg(feature = "x86_64-uart-irq-witness")]
+        let _ = crate::arch::x86_64::uart_irq_witness::enable_source();
     }
     // Canonical 199E — the AArch64 default production scheduler tick.
     //
