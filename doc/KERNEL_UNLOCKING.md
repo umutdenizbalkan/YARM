@@ -22843,3 +22843,105 @@ Negative controls (live mutations, not committed, each reverted):
   token and PXN tests) do not run in the hosted suite; `tests/aarch64_pl011_irq_witness_scope.rs`
   guards the source, and the live grader reads the token, the deactivation and the leaf bits.
 * No general UART driver; the fixture disables after a fixed count. x86_64 is unchanged.
+
+# QEMU-IRQ3 — x86_64 external-device interrupt: COM1 RX → I/O APIC → LAPIC → YARM, one CPU
+
+Base: `92159c05c7c31e3a3538c6fa2ccb8a3d0dbc7462`, tree `acf54343d98f59ebe8140633371a78519853fcc2`.
+QEMU 8.2.2, `-machine q35 -cpu qemu64 -m 512M -smp 1`, PVH direct boot of `kernel_boot.elf` with
+`initramfs-core.cpio` and `console=ttyS0 rdinit=/init` — the x86_64 core smoke's machine. LAPIC
+timer ticks, software interrupts and NMIs are not witness traffic; nothing here is SMP, IPI, a
+driver framework, an interrupt-controller framework, or an FP/context-switch redesign.
+
+## 1 — the executed route, derived
+
+| fact | value | source |
+|---|---|---|
+| device | `isa-serial` index 0 (COM1, 16550), I/O `0x3F8`, **ISA IRQ 4** | QEMU `info qtree` on the executed machine |
+| firmware table | PVH `start_info.rsdp_paddr` → XSDT/RSDT → MADT (120 bytes, checksum verified) — read live, not assumed | fixture, `acpi_madt_rule` |
+| overrides | five ISOs: IRQ0→GSI2 (conforming); IRQ5, 9, 10, 11 → same GSI, active-high **level**. **None for IRQ4** | live MADT |
+| GSI / trigger | ISA default: **GSI 4, active-high, edge** | `acpi_madt_rule::isa_route` |
+| controller | I/O APIC id 0 at `0xFEC0_0000`, GSI base 0, 24 pins, all masked at reset; pin 4 | MADT type 1 + `IOAPICVER` |
+| competing route | 8259 pair remapped to `0x20/0x28` and fully masked by boot (`IMR 0xff/0xff`); IRQ4's 8259 input stays masked — only the I/O APIC route is opened | `IRQ3_UART_PORT_ACCESS` |
+| LAPIC | xAPIC at the uncached higher-half alias `0xFFFF_FFFF_FEE0_0000`; SVR `0x1FF`; timer LVT vector **`0x20`**; spurious `0xFF`; BSP APIC ID 0 | existing bring-up |
+| vector ↔ line | `decode_trap_context`: `0x20` is the timer, `0x21..=0x5F` → `ExternalInterrupt(vector − 0x20)`. So line L is reachable only at vector `0x20 + L`; the route is **line 4 at vector `0x24`**, redirection entry fixed / physical / edge / high → APIC 0 | decoder + choice |
+| IDT | every vector → `yarm_x86_isr_N` → `yarm_x86_common_trap_entry` (interrupt gate, IF cleared on entry; IST only for NMI/#DF/#PF) | existing |
+| completion | `settle_external_interrupt_at_bridge` (`ArchSingleStep`) → `acknowledge_interrupt` = **one LAPIC EOI**. The source is an edge on an ISA pin, so the I/O APIC owes no EOI of its own; Remote-IRR never latches | existing owner |
+| device ack | RBR read until `LSR.DR` clears withdraws the RX cause | 16550 |
+
+Entry and return: a ring-3 interrupt arrives on the TSS `RSP0` stack with a CS `0x23` frame; the
+shared path dispatches, and the same task returns through `flush_trap_context_to_iret_frame` →
+`iretq`. An idle interrupt is taken in `x86_idle_park_loop`'s `sti; hlt` (the `sti` shadow opens
+interrupts only at the `hlt`) with a CS `0x08` frame; with nothing to resume the shared path
+DIVERGES into `idle_halt_loop` (re-base to the park anchor, re-park), so it never `iretq`s into the
+halted loop and no Rust frame of the loop runs interruptible after a take. The timer route's
+idle-boundary debt is the only owner that converts a ring-0 frame into a ring-3 return.
+
+## 2 — access, admission, completion, and two return defects
+
+* **No new access path.** The fixture reaches the I/O APIC and LAPIC only through the existing
+  supervisor, uncached (PCD) higher-half aliases, and COM1 only through ring-0 port I/O. Measured
+  in the live CR3: both pages present, PCD, `U` clear at every level (leaves `0xfec00093`,
+  `0xfee000f3`), at the enable and again at every claim. The boot TSS has `io_map_base = 104 =
+  sizeof(TSS)` — no I/O bitmap — and IOPL is 0, so every ring-3 port access faults.
+* **Ordered admission** (from `start_bsp_periodic_timer`, after the tick is armed): x86_64 boot has
+  already opened interrupts, so the whole sequence runs with IF cleared and the CPU's admission is
+  restored only after it — handler/access readiness (LAPIC configured, shared trap state
+  installed, both controller pages checked, the 8259 input masked, pin within `IOAPICVER`) → route
+  bound (by `bootstrap_first_user_task`, before the timer) → redirection entry written MASKED with
+  destination APIC 0, read back → UART `IER = 0`, stale RX drained, `IIR/LSR/MSR` read, `OUT2` →
+  `IER = ERBFI` → redirection entry unmasked, read back → IF restored
+  (`IRQ3_UART_CPU_ADMISSION if_restored=1 after=source_enabled`).
+* **Device first, before any output.** The console is this same UART. QEMU's I/O APIC delivers an
+  edge-triggered pin on every ASSERTION call, and its 16550 re-asserts the line on every status
+  update — a transmit included — while an RX cause is pending. The first development boot
+  logged before draining and so queued a second delivery of `0x24` behind every claim (15 claims
+  for 8 bytes, 7 empty drains, `once=0` for every item). The fixture now reads RBR before
+  writing anything, and records `self_irr` (the vector not re-pending) after the drain. A real
+  ISA line that stays high makes no second edge; the order is the one this device requires.
+* **One EOI, one owner.** `acknowledge_interrupt` gained a feature-gated write counter (after its
+  one EOI write, observation only); the fixture reads it on both sides of the dispatch — interrupts
+  are off throughout — and every claim shows `eoi_writes=1`, the LAPIC in-service bit then clear,
+  Remote-IRR and delivery-pending clear. The fixture writes no EOI and binds no route.
+* **Idle-origin revalidation — a latent defect found and repaired.** After the post-lock drains,
+  `revalidate_idle_owner_after_drains` could select a task woken by the interrupt even when the
+  trap entered from ring 0 (the idle `hlt`). The replacement's GPRs would then be written into the
+  saved registers of a CS `0x08` frame that `iretq`s back into the halt loop, with the task marked
+  Running — a task the architectural return cannot resume. 0 hits at base (nothing woke a task
+  from an idle-origin interrupt yet), but a device interrupt is exactly what would. Revalidation is
+  now admitted only for a ring-3 entering frame (`owner_revalidation_admissible`, hosted-tested);
+  a task woken from idle stays queued for the next tick at the authenticated boundary.
+* **Interrupted flags — a defect found and repaired.** Every ring-3 return reset RFLAGS to `0x202`,
+  so an asynchronous interrupt that returned to the SAME task erased the interrupted
+  instruction stream's CF/ZF/SF/OF/DF. The witness's checked spin sets CF before its loop and
+  requires it after (`dec` does not touch CF); a same-task asynchronous return now restores the
+  hardware-saved flags with IF forced on (`ring3_return_rflags`, hosted-tested). Syscall returns
+  and task switches keep `0x202`. The restored value is the one the user stream itself had — IOPL
+  and IF are not user-settable at CPL 3 — so this grants nothing a task could not already do.
+
+## 3 — producer, receiver, and what is shared
+
+* **Producer**: `scripts/qemu-riscv64-uart-irq-driver.py --arch x86_64` — the same driver; COM1's
+  only backend is a UNIX socket (`wait=on`, `-monitor none`, no multiplexing). It injects `0x40+seq`
+  only after `IRQ1_UART_READY seq=…`, and for idle items only after
+  `TIMER_IDLE_ADVANCE_SETTLED … settlement=kernel_idle`. One item outstanding; no sleeps pace it.
+* **Receiver**: IRQ1's selector-30 cell, now compiled for all three ports. x86_64 parts: SYSCALL
+  (`rax` number; `rdi, rsi, rdx, r10, r8, r9`; error in `rcx`), the checked spin (GPR sentinels
+  `r12..r15, r9, r10`; CF set by `stc` and required after; the READY `syscall` inside the checked
+  block, so the injected interrupt lands on it), and the isolation address (the I/O APIC window).
+* **What SIMD was tested — observed, not guaranteed.** The x86_64 kernel is built with SSE and its
+  trap/syscall entries save GPRs only; there is no user XMM save/restore. `xmm8`/`xmm9` sentinels
+  are carried through the checked spin and across each idle park and reported on a separate
+  `IRQ1_UART_SIMD` line, never graded; the receiver declares every XMM register clobbered across
+  its syscalls so no compiler-held value depends on them. They were observed intact in every
+  qualified item — the paths exercised happen not to touch those registers — which is not a
+  preservation contract. No FP enablement or save/restore was added.
+* **Witness-only receive adapter — unchanged, still one implementation.** The NR 5 `timeout == 0`
+  notification probe now also compiles under `x86_64-uart-irq-witness`; its body is untouched and
+  the ordinary NR 2/NR 5 ABI is not widened. Production notification receive, blocking waiter wake
+  and teardown are NOT qualified.
+* **Fixture**: `src/arch/x86_64/uart_irq_witness.rs`, feature-gated. It derives the route, programs
+  the one redirection entry, drains COM1 for a claim the production entry already took, observes
+  completion, and disables the source after the 8th data-bearing completion (`IER = 0` first, then
+  the redirection entry masked). Pending timer + device: on data items 3 (idle) and 4 (user) it
+  holds the claim, interrupts off and before the EOI, until the LAPIC IRR shows the timer vector
+  pending; both then complete, the timer after the device's EOI.
