@@ -388,8 +388,10 @@ pub fn drain_before_delivery(source: u32, context_index: usize) {
     let claim = CLAIMS.fetch_add(1, Ordering::AcqRel) + 1;
     ring_store(RING_WORD_CLAIMS, claim);
     let uart_pa = UART_PA.load(Ordering::Acquire);
-    let (Some(rbr_va), Some(lsr_va)) = (mmio_va(uart_pa + UART_RBR, 1), mmio_va(uart_pa + UART_LSR, 1))
-    else {
+    let (Some(rbr_va), Some(lsr_va)) = (
+        mmio_va(uart_pa + UART_RBR, 1),
+        mmio_va(uart_pa + UART_LSR, 1),
+    ) else {
         marker(format_args!(
             "IRQ1_UART_DRAIN claim={} source={} bytes=0 reason=uart_unreachable",
             claim, source

@@ -193,6 +193,88 @@ fn spin_checking_registers(iters: u64, seed: u64) -> u32 {
     mask
 }
 
+const NR_DEBUG_LOG: usize = 15;
+
+struct LineBuf {
+    buf: [u8; 96],
+    len: usize,
+}
+
+impl core::fmt::Write for LineBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// Announce a USER item and wait for it with the SAME six sentinel registers live across both.
+///
+/// The host injects the moment it reads the READY line, which it can only read once this task's
+/// `DebugLog` has put it on the wire, so the interrupt is typically already pending when that
+/// syscall returns and is taken on the very next U-mode instruction. Issuing the READY `ecall`
+/// from inside the sentinel block puts that instruction — and the spin after it — under the
+/// register check, instead of in the log formatter. Returns the mask of registers that did not
+/// survive the syscall, the interrupt(s) and the spin.
+#[inline(never)]
+fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
+    let mut line = LineBuf {
+        buf: [0u8; 96],
+        len: 0,
+    };
+    let _ = core::fmt::write(
+        &mut line,
+        format_args!(
+            "IRQ1_UART_READY seq={} mode=user expect=0x{:02x}",
+            seq, expect
+        ),
+    );
+    let s = [
+        seed,
+        seed ^ 0x1111_1111,
+        seed ^ 0x2222_2222,
+        seed ^ 0x3333_3333,
+        seed ^ 0x4444_4444,
+        seed ^ 0x5555_5555,
+    ];
+    let (mut r0, mut r1, mut r2, mut r3, mut r4, mut r5) = (s[0], s[1], s[2], s[3], s[4], s[5]);
+    // SAFETY: `DebugLog` (a7 = 15, a0/a1 = the line) followed by a pure register loop. Every
+    // argument register is declared clobbered; the sentinels sit in registers the syscall ABI
+    // does not use.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            "2:",
+            "addi s4, s4, -1",
+            "bnez s4, 2b",
+            inlateout("a0") line.buf.as_ptr() as usize => _,
+            inlateout("a1") line.len => _,
+            inlateout("a2") 0usize => _,
+            inlateout("a3") 0usize => _,
+            inlateout("a4") 0usize => _,
+            inlateout("a5") 0usize => _,
+            in("a7") NR_DEBUG_LOG,
+            inout("s4") iters => _,
+            inout("t3") r0,
+            inout("t4") r1,
+            inout("t5") r2,
+            inout("t6") r3,
+            inout("s2") r4,
+            inout("s3") r5,
+            options(nostack),
+        );
+    }
+    let got = [r0, r1, r2, r3, r4, r5];
+    let mut mask = 0u32;
+    for (i, (g, want)) in got.iter().zip(s.iter()).enumerate() {
+        if g != want {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
 static ISO_CHILD_STARTED: AtomicU32 = AtomicU32::new(0);
 static ISO_CHILD_READ_RETURNED: AtomicU32 = AtomicU32::new(0);
 static mut ISO_CHILD_STACK: [u8; 1024] = [0u8; 1024];
@@ -238,7 +320,11 @@ fn isolation_probes(park: u32) -> (u32, u32, bool) {
     for _ in 0..5 {
         let _ = recv_timeout(park, 2);
     }
-    (child_tid, ISO_CHILD_READ_RETURNED.load(Relaxed), anon_refused)
+    (
+        child_tid,
+        ISO_CHILD_READ_RETURNED.load(Relaxed),
+        anon_refused,
+    )
 }
 
 pub(super) fn run_once() {
@@ -295,14 +381,19 @@ pub(super) fn run_once() {
     for seq in 1..=ITEMS {
         let idle = seq % 2 == 1;
         let expect = BYTE_BASE + seq as u8;
-        yarm_user_rt::user_log!(
-            "IRQ1_UART_READY seq={} mode={} expect=0x{:02x}",
-            seq,
-            if idle { "idle" } else { "user" },
-            expect
-        );
         let mut rounds = 0u32;
         let mut bad_mask = 0u32;
+        if idle {
+            yarm_user_rt::user_log!(
+                "IRQ1_UART_READY seq={} mode=idle expect=0x{:02x}",
+                seq,
+                expect
+            );
+        } else {
+            // Round 1 of a USER item: announce and spin under one register check.
+            let seed = 0x5EED_0000_0000u64 | ((seq as u64) << 16);
+            bad_mask |= announce_ready_and_spin(seq, expect, SPIN_ITERS, seed);
+        }
         let got = loop {
             rounds += 1;
             if idle {

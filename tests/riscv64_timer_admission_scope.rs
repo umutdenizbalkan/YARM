@@ -151,10 +151,18 @@ fn live_enable_sequence_orders_deadline_stie_then_sie() {
         .find("set_sscratch_to_trap_stack_top();")
         .expect("sscratch");
     let latch = idle.find("arm_s_mode_timer_boundary();").expect("latch");
-    let sie = idle.find("set_sstatus_sie();").expect("sie");
+    // QEMU-IRQ1 §2 — the boundary REQUESTS the unmask last; SIE itself is set only inside the
+    // stack-free idle `wfi` loop (`set_sstatus_sie_in_wfi_loop`), never before stack-using code.
+    let sie = idle
+        .find("request_idle_unmask();")
+        .expect("the unmask request");
     assert!(
         scratch < latch && latch < sie,
         "the S-origin boundary order must be sscratch -> latch -> unmask"
+    );
+    assert!(
+        !idle.contains("set_sstatus_sie"),
+        "the boundary itself must not set SIE"
     );
 }
 
@@ -163,7 +171,7 @@ fn live_enable_sequence_orders_deadline_stie_then_sie() {
 fn csr_set_helpers_stay_confined_to_two_call_sites() {
     let csr_calls: Vec<_> = TIMER
         .match_indices("set_sie_stie();")
-        .chain(TIMER.match_indices("set_sstatus_sie();"))
+        .chain(TIMER.match_indices("set_sstatus_sie_in_wfi_loop();"))
         .filter(|(pos, _)| {
             // Ignore mentions inside the module's own test block.
             TIMER[..*pos].rfind("#[cfg(test)]").is_none()
@@ -184,14 +192,26 @@ fn csr_set_helpers_stay_confined_to_two_call_sites() {
     };
     let arm = span("fn arm_periodic_timer_for_user_delivery()");
     let idle = span("pub fn reestablish_idle_boundary()");
+    // QEMU-IRQ1 §2 — the SIE half now lives in the idle WAIT, reached only on the idle boundary's
+    // one-shot request; the boundary itself sets no CSR.
+    let wait = span("pub fn halt_wait_loop()");
+    assert_eq!(
+        TIMER.matches("set_sstatus_sie_in_wfi_loop();").count(),
+        1,
+        "exactly one call reaches the unmasking wait"
+    );
     for (pos, _) in &csr_calls {
         let in_arm = *pos > arm.0 && *pos < arm.1;
-        let in_idle = *pos > idle.0 && *pos < idle.1;
+        let in_wait = *pos > wait.0 && *pos < wait.1;
         assert!(
-            in_arm || in_idle,
-            "a CSR-set helper is called outside the boot arm and the audited idle boundary"
+            in_arm || in_wait,
+            "a CSR-set helper is called outside the boot arm and the audited idle wait"
         );
     }
+    assert!(
+        TIMER[wait.0..wait.1].contains("IDLE_UNMASK_REQUESTED.swap(false"),
+        "the wait unmasks only on the idle boundary's request"
+    );
     let idle_body = &TIMER[idle.0..idle.1];
     assert!(
         idle_body.contains("if !stie_enabled() {"),

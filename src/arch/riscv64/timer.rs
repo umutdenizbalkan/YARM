@@ -676,14 +676,19 @@ mod tests {
             .find("set_sscratch_to_trap_stack_top();")
             .expect("sscratch");
         let latch = body.find("arm_s_mode_timer_boundary();").expect("latch");
-        let sie = body.find("request_idle_unmask();").expect("the unmask request");
+        let sie = body
+            .find("request_idle_unmask();")
+            .expect("the unmask request");
         assert!(
             scratch < latch && latch < sie,
             "order must be sscratch -> latch -> unmask"
         );
         // QEMU-IRQ1 §2 — the boundary REQUESTS the unmask; it never sets SIE and then returns
         // through stack-using code.
-        assert!(!body.contains("set_sstatus_sie"), "the boundary itself must not unmask");
+        assert!(
+            !body.contains("set_sstatus_sie"),
+            "the boundary itself must not unmask"
+        );
         assert!(
             body.contains("if !stie_enabled() {"),
             "a boundary arrival before the boot arm must be a no-op"

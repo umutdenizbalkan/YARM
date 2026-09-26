@@ -490,83 +490,43 @@ pub fn device_window_installed() -> bool {
     DEVICE_WINDOW_L1.load(Ordering::Acquire) != 0
 }
 
+/// The recorded window layout: the physical page at each slot, `0` for an unused slot.
+fn device_window_layout() -> [u64; DEVICE_WINDOW_MAX_PAGES] {
+    let count = DEVICE_WINDOW_PAGE_COUNT
+        .load(Ordering::Acquire)
+        .min(DEVICE_WINDOW_MAX_PAGES);
+    let mut pages = [0u64; DEVICE_WINDOW_MAX_PAGES];
+    for (slot, page) in pages.iter_mut().enumerate().take(count) {
+        *page = DEVICE_WINDOW_PAGES[slot].load(Ordering::Acquire);
+    }
+    pages
+}
+
 /// The window VA that WOULD name `pa`, from the recorded page list alone.
 ///
 /// This is a layout translation, not a readiness answer: it says where the window puts `pa`,
 /// never whether the active root actually maps it. Readiness is
 /// [`device_pa_reachable_under_satp`].
 pub fn device_window_va(pa: u64) -> Option<u64> {
-    let page = pa & PAGE_MASK;
-    let count = DEVICE_WINDOW_PAGE_COUNT.load(Ordering::Acquire);
-    (0..count.min(DEVICE_WINDOW_MAX_PAGES))
-        .find(|&slot| DEVICE_WINDOW_PAGES[slot].load(Ordering::Acquire) == page)
-        .map(|slot| DEVICE_WINDOW_BASE + (slot as u64) * PAGE_SIZE_U64 + (pa - page))
+    crate::arch::device_window_rule::window_va_for(&device_window_layout(), DEVICE_WINDOW_BASE, pa)
 }
 
-/// Walk an Sv39 translation for `va` the way the MMU would, reading each table through `read`.
-///
-/// Returns the LEAF PTE when the walk ends in a 4 KiB leaf. Returns `None` for a non-Sv39 `satp`
-/// (bare mode translates nothing), an invalid entry, a reserved W-without-R encoding, a superpage,
-/// or a table `read` refuses to dereference. Pure, so the readiness rule is testable off target.
-pub fn walk_sv39_leaf(
-    satp: u64,
-    va: u64,
-    read: impl Fn(u64, usize) -> Option<u64>,
-) -> Option<PageTableEntry> {
-    const SATP_MODE_SV39: u64 = 8;
-    if satp >> 60 != SATP_MODE_SV39 {
-        return None;
-    }
-    let mut table = (satp & ((1u64 << 44) - 1)) << PAGE_SHIFT;
-    for shift in [30u64, 21, 12] {
-        let pte = PageTableEntry(read(table, level_index(va, shift))?);
-        if !pte.is_present() {
-            return None;
-        }
-        let rwx = pte.0 & (PageTableEntry::READ | PageTableEntry::WRITE | PageTableEntry::EXECUTE);
-        if rwx == PageTableEntry::WRITE || rwx == PageTableEntry::WRITE | PageTableEntry::EXECUTE {
-            return None;
-        }
-        if rwx != 0 {
-            return (shift == 12).then_some(pte);
-        }
-        if shift == 12 {
-            return None;
-        }
-        table = pte.addr();
-    }
-    None
-}
-
-/// **The readiness rule.** The window VA for `[pa, pa + len)` iff the translation rooted at
-/// `satp` really maps it: a 4 KiB leaf that is VALID, READ and WRITE, carries neither USER nor
-/// EXECUTE, and names exactly `pa`'s page. The range must lie within one page.
-///
-/// Every fact is read from the page tables the hardware would walk; the recorded page list only
-/// says WHICH virtual address to walk. So an uninstalled window, a root that never received it,
-/// or bare translation all answer `None` — and none of them is ever answered by touching the
-/// device.
+/// **The readiness rule** (`crate::arch::device_window_rule::device_pa_reachable`) over the
+/// recorded window layout, for the translation rooted at `satp`.
 pub fn device_pa_reachable_under_satp(
     satp: u64,
     pa: u64,
     len: u64,
     read: impl Fn(u64, usize) -> Option<u64>,
 ) -> Option<u64> {
-    if len == 0 {
-        return None;
-    }
-    let page = pa & PAGE_MASK;
-    if (pa + len - 1) & PAGE_MASK != page {
-        return None;
-    }
-    let va = device_window_va(pa)?;
-    let leaf = walk_sv39_leaf(satp, va, read)?;
-    let want = PageTableEntry::VALID | PageTableEntry::READ | PageTableEntry::WRITE;
-    let forbidden = PageTableEntry::USER | PageTableEntry::EXECUTE;
-    if leaf.0 & want != want || leaf.0 & forbidden != 0 || leaf.addr() != page {
-        return None;
-    }
-    Some(va)
+    crate::arch::device_window_rule::device_pa_reachable(
+        satp,
+        &device_window_layout(),
+        DEVICE_WINDOW_BASE,
+        pa,
+        len,
+        read,
+    )
 }
 
 /// [`device_pa_reachable_under_satp`] against the LIVE `satp` of this hart, reading each table

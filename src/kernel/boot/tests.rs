@@ -136681,20 +136681,41 @@ mod riscv64_s_mode_timer_bridge {
         let armed = idle
             .find("arm_s_mode_timer_boundary()")
             .expect("the boundary arm");
-        let sie = idle.find("set_sstatus_sie()").expect("SIE");
+        // QEMU-IRQ1 §2 — the boundary REQUESTS the unmask as its last step; it never sets SIE and
+        // then returns through stack-using code (the window the UART witness measured).
+        let sie = idle
+            .find("request_idle_unmask()")
+            .expect("the unmask request");
         assert!(
             sscratch < armed && armed < sie,
-            "sscratch, then the boundary latch, then SIE last"
+            "sscratch, then the boundary latch, then the unmask last"
         );
-        assert_eq!(
-            idle.matches("set_sstatus_sie()").count(),
-            1,
-            "there is exactly one place that enables interrupts"
+        assert!(
+            !idle.contains("set_sstatus_sie"),
+            "the boundary itself must not set SIE"
         );
+        // The ONE place SIE is set is the stack-free idle wait: CSR set and `wfi` in one asm loop.
         assert_eq!(
-            RV_TIMER_SRC.matches("fn set_sstatus_sie()").count(),
+            RV_TIMER_SRC
+                .matches("fn set_sstatus_sie_in_wfi_loop() -> ! {")
+                .count(),
             1,
-            "and exactly one definition of it"
+            "exactly one definition of the unmasking wait"
+        );
+        let wait = RV_TIMER_SRC
+            .split("fn set_sstatus_sie_in_wfi_loop() -> ! {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("its body");
+        let csr = wait
+            .find("\"csrrs zero, sstatus, {sie}\"")
+            .expect("the SIE set");
+        let wfi = wait.find("\"wfi\"").expect("the wfi");
+        assert!(
+            csr < wfi
+                && wait.contains("\"j 2b\"")
+                && wait.contains("options(noreturn, nomem, nostack)"),
+            "SIE is set in the same stack-free asm loop as the wfi, and the loop never returns"
         );
     }
 
@@ -143970,8 +143991,39 @@ mod u9f_split_capability_revocation {
                 || code.contains("pub(crate) fn create_notification(");
             let defines_bind = code.contains("pub fn bind_irq_notification(")
                 || code.contains("pub(crate) fn bind_irq_notification(");
-            let c = code.matches("create_notification(").count() - usize::from(defines_create);
-            let b = code.matches("bind_irq_notification(").count() - usize::from(defines_bind);
+            // QEMU-IRQ1 §3 — the ONE bounded exception: the UART witness provisioning, which is
+            // compiled only with `riscv-uart-irq-witness` (not a default feature, not a production
+            // profile). Its calls are excluded from the census below, and it is pinned to stay
+            // feature-gated and teardown-free, so no ungated production caller can hide behind it.
+            let (witness_create, witness_bind) = match code
+                .split_once("pub fn provision_init_uart_irq_witness(")
+            {
+                Some((before, rest)) => {
+                    let attr = before.rsplit("#[cfg(all(").next().unwrap_or("");
+                    assert!(
+                        attr.contains("feature = \"riscv-uart-irq-witness\""),
+                        "the witness provisioning must stay feature-gated.{ADMISSION}"
+                    );
+                    let body = rest.split("\n}\n").next().unwrap_or(rest);
+                    assert!(
+                        !body.contains("destroy_notification")
+                            && !body.contains("revoke")
+                            && !body.contains("unbind"),
+                        "the witness provisioning must not reach Notification teardown.{ADMISSION}"
+                    );
+                    (
+                        body.matches("create_notification(").count(),
+                        body.matches("bind_irq_notification(").count(),
+                    )
+                }
+                None => (0, 0),
+            };
+            let c = code.matches("create_notification(").count()
+                - usize::from(defines_create)
+                - witness_create;
+            let b = code.matches("bind_irq_notification(").count()
+                - usize::from(defines_bind)
+                - witness_bind;
             create_callers += c;
             bind_callers += b;
             if rel.starts_with("src/kernel/syscall") {
@@ -169144,20 +169196,37 @@ mod u9exit4_post_clear_totality {
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("the production half of the timer module");
+        // QEMU-IRQ1 §2 — exactly one program point sets sstatus.SIE: the stack-free idle wait,
+        // reached only from `halt_wait_loop` on a request the idle boundary makes.
         assert_eq!(
             code_lines(production)
-                .filter(|line| line.contains("set_sstatus_sie();"))
+                .filter(|line| line.contains("csrrs zero, sstatus"))
                 .count(),
             1,
             "exactly one program point may set sstatus.SIE"
+        );
+        assert_eq!(
+            code_lines(production)
+                .filter(|line| line.contains("set_sstatus_sie_in_wfi_loop();"))
+                .count(),
+            1,
+            "and exactly one caller reaches it"
+        );
+        let wait = RISCV_TIMER
+            .split("pub fn halt_wait_loop() -> ! {")
+            .nth(1)
+            .expect("the halt wait");
+        assert!(
+            wait[..wait.find("\n}").expect("its end")].contains("IDLE_UNMASK_REQUESTED.swap(false"),
+            "it is the idle wait, consuming the idle boundary's one-shot request"
         );
         let boundary = RISCV_TIMER
             .split("pub fn reestablish_idle_boundary() {")
             .nth(1)
             .expect("the idle boundary");
         assert!(
-            boundary[..boundary.find("\n}").expect("its end")].contains("set_sstatus_sie();"),
-            "and it is the idle boundary, not the trap path"
+            boundary[..boundary.find("\n}").expect("its end")].contains("request_idle_unmask();"),
+            "and the request comes from the idle boundary, not the trap path"
         );
         for line in code_lines(RISCV_TRAP) {
             assert!(
@@ -187329,12 +187398,41 @@ mod u9irqfinal_claim {
     fn the_claim_is_read_only_at_the_entry_owner() {
         const RISCV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
         const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+        // QEMU-IRQ1 §2 — TWO claim sites, one per ENTRY OWNER, and the two owners are disjoint by
+        // privilege origin: the bridge claims for a U-origin trap (past the S-mode screen), and
+        // the witness build's idle-origin entry claims for the one S-origin external interrupt
+        // the screen admits. No trap reaches both, so each trap still reads the claim once.
         assert_eq!(
             RISCV_BOOT
                 .matches("claim_external_interrupt_once()")
                 .count(),
+            2,
+            "exactly one claim site per entry owner"
+        );
+        let idle_owner = RISCV_BOOT
+            .split("fn riscv_s_mode_external_trap(")
+            .nth(1)
+            .expect("the idle-origin entry owner")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert_eq!(
+            idle_owner
+                .matches("claim_external_interrupt_once()")
+                .count(),
             1,
-            "exactly one claim site, in the trap entry owner"
+            "the idle-origin entry owner reads the claim once"
+        );
+        let idle_decl = RISCV_BOOT
+            .split("fn riscv_s_mode_external_trap(")
+            .next()
+            .expect("text before the idle owner");
+        assert!(
+            idle_decl
+                .rsplit("#[cfg(all(")
+                .next()
+                .is_some_and(|attr| attr.contains("feature = \"riscv-uart-irq-witness\"")),
+            "the idle-origin claim site exists only in the witness build"
         );
         assert_eq!(
             RISCV_TRAP.matches("claim_external_interrupt_once").count(),
@@ -187650,9 +187748,23 @@ mod u9irq1_acknowledgement {
         assert!(
             RISCV_IRQ
                 .contains("pub(crate) fn claim_complete_register(context: PlicContext) -> usize {")
-                && RISCV_IRQ.contains("pub(crate) fn read_claim_register(")
+                && RISCV_IRQ.contains("pub(crate) fn read_claim_register_at(")
                 && RISCV_IRQ.contains("pub(crate) fn write_claim_completion("),
             "RISC-V's claim and completion must address the controller through one helper"
+        );
+        // QEMU-IRQ1 §2 — the completion reaches the register through the device window's LAYOUT
+        // (`device_window_va`), never through a second readiness walk and never at the physical
+        // address no root maps.
+        let complete_write = RISCV_IRQ
+            .split("pub(crate) fn write_claim_completion(")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the completion write");
+        assert!(
+            complete_write.contains("device_window_va(")
+                && !complete_write.contains("device_pa_reachable_under")
+                && !complete_write.contains("write_volatile(claim_complete_register("),
+            "the completion is written through the window layout, not a second walk"
         );
         let hw_claim = CLAIM
             .split("fn hardware_claim_once() -> PlicClaim {")
@@ -187660,9 +187772,11 @@ mod u9irq1_acknowledgement {
             .and_then(|s| s.split("\n}").next())
             .expect("the hardware claim");
         assert!(
-            hw_claim.contains("mmio_range_reachable_under_active_satp(")
-                && hw_claim.contains("PlicUnavailableReason::MmioUnreachable"),
-            "the claim must test reachability under the ENTERING address space before reading"
+            hw_claim.contains("mmio_va_under_active_satp(")
+                && hw_claim.contains("PlicUnavailableReason::MmioUnreachable")
+                && hw_claim.contains("read_claim_register_at(va)"),
+            "the claim must walk the ENTERING address space before reading, and read at the \
+             address that walk returned"
         );
         // And the completion deliberately does NOT re-test it: a check that could refuse the
         // completion half is how a claim gets leaked.
@@ -187672,7 +187786,8 @@ mod u9irq1_acknowledgement {
             .and_then(|s| s.split("\n}\n").next())
             .expect("the completion owner");
         assert!(
-            !completion.contains("mmio_range_reachable_under_active_satp("),
+            !completion.contains("mmio_range_reachable_under_active_satp(")
+                && !completion.contains("mmio_va_under_active_satp("),
             "the claim/complete pair must not be separable by a second reachability test"
         );
     }
@@ -187752,17 +187867,20 @@ mod u9irq1_acknowledgement {
     #[test]
     fn no_second_claim_and_no_second_completion() {
         const RISCV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+        // QEMU-IRQ1 §2 — one claim read per ENTRY OWNER (U-origin bridge; the witness build's
+        // idle-origin entry), disjoint by origin; `the_claim_is_read_only_at_the_entry_owner`
+        // pins which is which.
         assert_eq!(
             RISCV_BOOT
                 .matches("claim_external_interrupt_once()")
                 .count(),
-            1,
-            "one claim read in the whole port"
+            2,
+            "one claim read per entry owner in the whole port"
         );
         assert_eq!(
-            CLAIM.matches("read_claim_register(context)").count(),
+            CLAIM.matches("read_claim_register_at(va)").count(),
             1,
-            "and one register read behind it"
+            "and one register read behind it, at the address the readiness walk returned"
         );
         assert_eq!(
             CLAIM

@@ -8300,7 +8300,10 @@ pub fn provision_init_uart_irq_witness(
     let (notification_idx, signal_root, recv_root) = match kernel.create_notification(8) {
         Ok(t) => t,
         Err(e) => {
-            crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=create_notification err={:?}", e);
+            crate::yarm_log!(
+                "IRQ1_WITNESS_PROVISION_FAIL step=create_notification err={:?}",
+                e
+            );
             return None;
         }
     };
@@ -8309,14 +8312,20 @@ pub fn provision_init_uart_irq_witness(
         return None;
     }
     let notification_object = kernel.current_task_capability(recv_root)?.object;
-    debug_assert!(matches!(notification_object, CapObject::Notification { .. }));
+    debug_assert!(matches!(
+        notification_object,
+        CapObject::Notification { .. }
+    ));
     let notification_recv_cap = match kernel.mint_capability_in_cnode(
         init_cnode,
         Capability::new(notification_object, CapRights::RECEIVE),
     ) {
         Ok(c) => c,
         Err(e) => {
-            crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=mint_notification err={:?}", e);
+            crate::yarm_log!(
+                "IRQ1_WITNESS_PROVISION_FAIL step=mint_notification err={:?}",
+                e
+            );
             return None;
         }
     };

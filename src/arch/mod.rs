@@ -7,6 +7,9 @@ pub mod aarch64;
 pub mod aarch64_boot_policy;
 pub mod boot_entry;
 pub mod cpu_mapping;
+/// QEMU-IRQ1 §2 — the device-window readiness rule and the idle-origin external admission rule,
+/// arch-neutral so the hosted suite executes the rule the RISC-V port executes.
+pub mod device_window_rule;
 /// U9-IRQ-FINAL §1/§2 — the external-interrupt claim policy, arch-neutral on purpose so it can
 /// be exercised against a controller model on any host. Only the MMIO accesses it delegates to
 /// are target-specific.

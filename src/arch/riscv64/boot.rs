@@ -1854,7 +1854,8 @@ fn riscv_s_mode_external_trap(
             );
             riscv_trap_halt("s_mode_extirq_handle_err");
         }
-        Ok(RiscvTrapEntryOutcome::ReturnToCurrent) | Ok(RiscvTrapEntryOutcome::ReturnToIncoming)
+        Ok(RiscvTrapEntryOutcome::ReturnToCurrent)
+        | Ok(RiscvTrapEntryOutcome::ReturnToIncoming)
             if resume_tid != 0 =>
         {
             early_marker!(

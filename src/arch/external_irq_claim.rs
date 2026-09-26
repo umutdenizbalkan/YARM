@@ -232,10 +232,9 @@ fn hardware_claim_once() -> PlicClaim {
     let addr = irq::claim_complete_register(context);
     // QEMU-IRQ1 §2 — readiness is a walk of the ACTIVE translation, and it yields the address to
     // read. The register itself is never touched to find out whether it can be touched.
-    let Some(va) = crate::arch::riscv64::plic::mmio_va_under_active_satp(
-        addr,
-        core::mem::size_of::<u32>(),
-    ) else {
+    let Some(va) =
+        crate::arch::riscv64::plic::mmio_va_under_active_satp(addr, core::mem::size_of::<u32>())
+    else {
         return PlicClaim::Unavailable {
             reason: PlicUnavailableReason::MmioUnreachable,
         };

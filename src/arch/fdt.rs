@@ -360,6 +360,7 @@ pub fn find_node_reg_by_name_prefix(bytes: &[u8], prefix: &[u8]) -> Option<(u64,
 /// QEMU-IRQ1 §1 — the raw bytes of property `prop` on the first node whose name begins with
 /// `prefix`, walking nested children exactly as [`find_node_reg_by_name_prefix`] does. `None` for a
 /// structurally invalid FDT, an absent node, or a node without that property.
+#[cfg_attr(not(feature = "riscv-uart-irq-witness"), allow(dead_code))]
 pub fn find_node_prop_by_name_prefix<'a>(
     bytes: &'a [u8],
     prefix: &[u8],
@@ -429,6 +430,7 @@ pub fn find_node_prop_by_name_prefix<'a>(
 
 /// QEMU-IRQ1 §1 — the first cell of the `interrupts` property of the first node whose name begins
 /// with `prefix`: the controller-local interrupt identifier for a one-cell PLIC specifier.
+#[cfg_attr(not(feature = "riscv-uart-irq-witness"), allow(dead_code))]
 pub fn find_node_interrupt_by_name_prefix(bytes: &[u8], prefix: &[u8]) -> Option<u32> {
     let data = find_node_prop_by_name_prefix(bytes, prefix, b"interrupts")?;
     read_be_u32(data, 0)
@@ -1017,12 +1019,18 @@ mod tests {
             find_node_reg_by_name_prefix(dtb, b"serial@"),
             Some((0x1000_0000, 0x100))
         );
-        assert_eq!(find_node_interrupt_by_name_prefix(dtb, b"serial@"), Some(10));
+        assert_eq!(
+            find_node_interrupt_by_name_prefix(dtb, b"serial@"),
+            Some(10)
+        );
         assert_eq!(
             find_node_reg_by_name_prefix(dtb, b"plic@").map(|(b, _)| b),
             Some(0x0C00_0000)
         );
-        assert_eq!(find_node_interrupt_by_name_prefix(dtb, b"nosuchnode@"), None);
+        assert_eq!(
+            find_node_interrupt_by_name_prefix(dtb, b"nosuchnode@"),
+            None
+        );
         // `interrupt-controller` is a flag property on the PLIC; `interrupts` is not present.
         assert_eq!(find_node_interrupt_by_name_prefix(dtb, b"plic@"), None);
     }

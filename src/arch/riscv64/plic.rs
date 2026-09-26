@@ -109,7 +109,11 @@ pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
     // is built here, before any readiness is derived and before any controller register is
     // written, and every existing root is pointed at it. Without the feature nothing is mapped,
     // and the readiness below reports that from the page tables themselves.
-    #[cfg(all(feature = "riscv-uart-irq-witness", not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    #[cfg(all(
+        feature = "riscv-uart-irq-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "riscv64"
+    ))]
     super::uart_irq_witness::install_device_window_at_safe_point();
 
     // U9-IRQ-FINAL §1 — report, on the real boot, what the claim owner would answer.
@@ -168,7 +172,11 @@ pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
     // the witness owner, which re-derives every precondition (mappings, claim readiness, a bound
     // route) and only then configures the controller, enables the source and admits the CPU
     // interrupt, in that order. It reports its own enable or its own deferral.
-    #[cfg(all(feature = "riscv-uart-irq-witness", not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    #[cfg(all(
+        feature = "riscv-uart-irq-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "riscv64"
+    ))]
     {
         emit_marker(format_args!(
             "RISCV_EXTIRQ_SELECT source={} reason=uart0_witness_feature",
@@ -186,7 +194,11 @@ pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
     // we considered and the exact reason it was not enabled. The
     // claim/complete path in `super::irq` is wired but no source is
     // enabled, so no IRQ can be claimed without an explicit follow-up.
-    #[cfg(not(all(feature = "riscv-uart-irq-witness", not(feature = "hosted-dev"), target_arch = "riscv64")))]
+    #[cfg(not(all(
+        feature = "riscv-uart-irq-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "riscv64"
+    )))]
     {
         let _ = threshold_ready;
         emit_marker(format_args!(
@@ -234,37 +246,21 @@ pub fn mmio_range_reachable_under_active_satp(addr: usize, len: usize) -> bool {
     mmio_va_under_active_satp(addr, len).is_some()
 }
 
-/// Supervisor external interrupt cause code (`scause` low bits, with the interrupt bit set).
-pub const IRQ_SUPERVISOR_EXTERNAL_CODE: usize = 9;
-
 /// QEMU-IRQ1 §2 — the SECOND S-mode trap the bridge may admit, and only with the witness compiled
-/// in: a supervisor EXTERNAL interrupt taken at the audited kernel-idle boundary.
-///
-/// The conditions mirror the timer's own admission and add one:
-/// * `scause` carries the interrupt bit and names the supervisor external interrupt — so no
-///   exception (a supervisor page fault is scause 12/13/15 with the interrupt bit clear) can ever
-///   satisfy it;
-/// * `SPP` says Supervisor;
-/// * the idle-boundary latch is armed — the only S-mode code interruptible with `SIE` set is the
-///   idle `wfi` loop, and the latch is what makes that a checked precondition;
-/// * a source has actually been enabled by the witness owner. With none enabled, the controller
-///   has no legitimate producer for this context and the trap stays fail-closed.
+/// in. The rule itself lives in `crate::arch::device_window_rule`, arch-neutral so the hosted suite
+/// executes it; this is the port's name for it.
 pub fn is_accepted_s_mode_external_trap(
     scause: usize,
     sstatus: usize,
     boundary_armed: bool,
     source_enabled: bool,
 ) -> bool {
-    const INTERRUPT_BIT: usize = 1usize << (usize::BITS - 1);
-    const SPP_BIT: usize = 1usize << 8;
-    let is_interrupt = (scause & INTERRUPT_BIT) != 0;
-    let code = scause & !INTERRUPT_BIT;
-    let from_supervisor = (sstatus & SPP_BIT) != 0;
-    is_interrupt
-        && code == IRQ_SUPERVISOR_EXTERNAL_CODE
-        && from_supervisor
-        && boundary_armed
-        && source_enabled
+    crate::arch::device_window_rule::is_accepted_s_mode_external_trap(
+        scause,
+        sstatus,
+        boundary_armed,
+        source_enabled,
+    )
 }
 
 /// The static answer the readiness rule used to be: whether `[addr, addr+len)` falls within the
@@ -384,33 +380,13 @@ mod tests {
         ));
     }
 
-    /// QEMU-IRQ1 §2 — the idle-origin external admission is narrow: every one of its five
-    /// conditions is required, and no exception can satisfy it whatever SPP or the latches say.
-    #[test]
-    fn idle_origin_external_admission_requires_all_five_conditions() {
-        const INT: usize = 1usize << 63;
-        const SPP: usize = 1 << 8;
-        assert!(is_accepted_s_mode_external_trap(INT | 9, SPP, true, true));
-        assert!(!is_accepted_s_mode_external_trap(9, SPP, true, true), "not an interrupt");
-        assert!(!is_accepted_s_mode_external_trap(INT | 5, SPP, true, true), "timer, not external");
-        assert!(!is_accepted_s_mode_external_trap(INT | 1, SPP, true, true), "software interrupt");
-        assert!(!is_accepted_s_mode_external_trap(INT | 9, 0, true, true), "taken from U-mode");
-        assert!(!is_accepted_s_mode_external_trap(INT | 9, SPP, false, true), "boundary not armed");
-        assert!(!is_accepted_s_mode_external_trap(INT | 9, SPP, true, false), "no source enabled");
-        for fault in [12usize, 13, 15, 2, 5, 7, 8, 9] {
-            assert!(
-                !is_accepted_s_mode_external_trap(fault, SPP, true, true),
-                "exception {fault} must never be admitted from S-mode"
-            );
-        }
-    }
-
     /// QEMU-IRQ1 §2 — readiness comes from the page tables: off target there is no live
     /// translation to walk, so the claim register is never reported reachable, and the PLIC
     /// window is still outside the RAM gigapage.
     #[test]
     fn readiness_is_not_a_flag_off_target() {
-        let claim = platform_layout::PLIC_MMIO_BASE + PLIC_CONTEXT_BASE_OFFSET + PLIC_CONTEXT_STRIDE + 4;
+        let claim =
+            platform_layout::PLIC_MMIO_BASE + PLIC_CONTEXT_BASE_OFFSET + PLIC_CONTEXT_STRIDE + 4;
         assert_eq!(mmio_va_under_active_satp(claim, 4), None);
         assert!(!mmio_range_reachable_under_active_satp(claim, 4));
     }
