@@ -22696,3 +22696,137 @@ the `external_irq_claim` controller model keeps its claim/completion accounting.
   hosted-proven only — the witness never destroys or revokes its notification.
 * The fixture disables after a fixed item count; there is no general UART driver.
 * RISC-V only; x86_64 and AArch64 external interrupts are unchanged.
+
+# QEMU-IRQ2 — AArch64 external-device interrupt: PL011 RX → GICv2 SPI → YARM, one CPU
+
+Base: `bfa7d33d83f5144cb1243db61be2f0ed1e2de055`, tree `5686c9105e980dd4d9b50e8c4b59e131ea8e42a1`.
+QEMU 8.2.2, `-machine virt -cpu cortex-a72 -m 1024M -smp 1` — the AArch64 core smoke's machine at
+one CPU. The existing GICv2 configuration is kept; nothing here is GICv3, SMP, IPI or a driver
+framework, and generic-timer traffic is not counted as witness traffic.
+
+## 1 — the executed path, derived
+
+From the DTB the executed machine generated (`dumpdtb`, trimmed to its header's used size:
+`tests/fixtures/aarch64_qemu_virt_smp1.dtb`):
+
+| fact | value | source |
+|---|---|---|
+| PL011 | `0x0900_0000` (`0x1000`), `interrupts = <0 1 4>`, clock `apb_pclk` fixed 24 MHz | `/pl011@9000000` |
+| identity | type 0 = **SPI**, number 1, trigger 4 = level-high → **GIC INTID 33** (SPI n = 32 + n) — the route is bound to 33, never to 1 | `arm,gic` 3-cell specifier |
+| GIC | `arm,cortex-a15-gic` (GICv2): distributor `0x0800_0000`, CPU interface `0x0801_0000`; root `interrupt-parent` | `/intc@8000000` |
+| timer | PPI 14 → INTID 30 (the existing, unchanged tick) | `/timer` |
+| controller state | no security extensions at NS EL1: every INTID group 0, signalled as IRQ (`GICC_CTLR` EnableGrp0, FIQEn 0), `EOImode` 0 → one `GICC_EOIR` write is priority drop AND deactivation; `PMR = 0xff` | existing bring-up |
+| UART state | the QEMU boot path never programs the PL011: `UARTCR = 0x300` (TXE\|RXE, **UARTEN clear**), `UARTIMSC = 0` | measured |
+
+Translation: `TTBR1_EL1` is zero; the kernel runs on the active `TTBR0` root. Every root created by
+`ensure_asid` carries identity, privileged Device-nGnRE leaves for the PL011, GICD and GICC pages
+(`ensure_reserved_device_mappings`), and `map_page` refuses user mappings over them. The bootstrap
+root that is still live at the end of bootstrap maps the device gigabyte as a level-2 block.
+
+Owners, unchanged: `yarm_aarch64_vector_entry` claims (`GICC_IAR`) before any handler runs; a
+special INTID returns without an EOI; INTID 30 is the timer; any other INTID becomes
+`TrapEvent::ExternalInterrupt` → `settle_external_interrupt_at_bridge` (`ArchSingleStep`, whose
+AArch64 `acknowledge_interrupt` is inert) → `deliver_external_irq_split` → `irq_routes` →
+`NotificationObject::send_irq`; the vector TAIL writes the one completion. Origins: vector kind 10
+(`irq_lower_a64`) is EL0; kind 6 (`irq_current_spx`) is EL1h — the idle park loop, or the boot
+window between the timer's unmask and the first return to EL0. Kernel faults are screened by the
+`ESR` `_CUR` classes, which this package does not touch.
+
+## 2 — access, admission, completion, and the idle boundary
+
+* **Acknowledge token.** `claim_interrupt` returned `IAR & 0x3ff`, and `complete_interrupt`
+  wrote that back — so for an SGI the CPUID bits [12:10] were dropped. The claim is now a
+  `GicAck` carrying the raw `IAR` value to the single `EOIR` write; dispatch sees only its INTID.
+  For an SPI the two are equal (INTID 33, token `0x21`), so live traffic is unchanged.
+* **No new mapping.** The PL011 and GIC leaves every root already carries are reused. They gain
+  **PXN** (`device_leaf_flags`): `leaf_flags_from_page_flags` sets only UXN for a kernel page, which
+  left the UART and the GIC CPU interface privileged-executable and so open to speculative
+  instruction fetch.
+* **Readiness from the live translation, never from the device.** The fixture asks the MMU:
+  `AT S1E1R` (must succeed with `PAR_EL1.ATTR = 0x04`, Device-nGnRE, at the same address) and
+  `AT S1E0R` (must fault), and walks the live `TTBR0` root for the final descriptor. The enable
+  checks the regime it runs on; every claim re-checks the regime IT was taken under — all three
+  pages kernel-only, Device, UXN and PXN, the PL011 through a level-3 leaf — and the drain touches
+  the UART only after `AT` says it may.
+* **Ordered admission.** In `start_bsp_periodic_timer`, after vectors, shared trap state, GIC and
+  `CNTP` are confirmed and before its `DAIF.I` unmask (still last): readiness → handler ready →
+  route bound (by `bootstrap_first_user_task`, through `bind_irq_notification`) → group 0 checked,
+  priority `0x80`, target CPU0, level trigger, each read back → `UARTIMSC = 0`, receiver on
+  (`UARTEN|RXE`, TXE and the console's line settings preserved), stale FIFO drained, `UARTICR`,
+  `GICD_ICPENDR` → `UARTIMSC = RXIM` → `GICD_ISENABLER`.
+* **Drain before completion.** The PL011 RX interrupt is a level held while the FIFO has data;
+  the fixture empties it before delivery, so the tail's `EOIR` deactivates a deasserted source.
+  After each `EOIR` the fixture reads `GICD_ISACTIVER`/`ISPENDR` and `GICC_RPR` back.
+* **Idle boundary — a defect found and repaired.** The halt was `msr daifclr, #3; wfi` inline in
+  `aarch64_idle_park_loop`. An interrupt returning there restores an `SPSR` with `I` clear, so the
+  loop's Rust code (`park()`, its log line) then ran UNMASKED on the idle stack — an interruptible
+  stack window at the boundary — and an interrupt pending when `daifclr` landed was taken with
+  `ELR` on the `wfi`, which then waited unmasked with the park authorization already spent.
+  Measured: one of four PL011 idle claims arrived `parked=0`, `ELR` on the `wfi`. The halt is now
+  `yarm_aarch64_idle_wfi_window`, a sized, stack-free leaf — `wfi` (masked; it still wakes), `msr
+  daifclr, #3` (the one point an interrupt is taken, `ELR` = the next instruction), `msr daifset,
+  #3`, `ret`. Every wait is masked, and every idle interrupt is taken right after a fresh `park()`.
+  The timer's idle path is otherwise unchanged; the U9-TIMER5 guards were re-derived for the new
+  spelling (unmask follows the wait; re-mask follows the take).
+
+## 3 — producer, receiver, and what is shared with IRQ1
+
+* **Producer**: `scripts/qemu-riscv64-uart-irq-driver.py --arch aarch64` — the same driver, the
+  PL011's only backend a UNIX socket (`wait=on`, `-monitor none`, no multiplexing). It injects
+  `0x40+seq` only after `IRQ1_UART_READY seq=…`, and for idle items only after
+  `SCHED_ENTER_IDLE_HLT`. One item outstanding; no sleeps pace injection.
+* **Receiver**: IRQ1's selector-30 cell, now compiled for either port. Its per-port parts are the
+  syscall instruction, the register-checked spin (AArch64: `x9..x14` and `d0, d1, d16, d17`
+  sentinels, the READY `svc` inside the checked block) and the isolation addresses (PL011 flag
+  register `0x0900_0018`; anonymous map over `0x0900_0000`). Markers keep their IRQ1 names — they
+  are the receiver's protocol with the driver.
+* **Witness-only receive adapter — unchanged, one implementation.** NR 5 with `timeout == 0` on a
+  notification capability, user receiver, recv-v2 metadata; compiled only with
+  `riscv-uart-irq-witness` or `aarch64-pl011-irq-witness`. The ordinary NR 2/NR 5 ABI is not
+  widened and production notification receive is NOT qualified.
+* **Provisioning**: the same `provision_init_uart_irq_witness`, bound to the DTB-derived INTID.
+* **Fixture**: `src/arch/aarch64/pl011_irq_witness.rs`, feature-gated; it claims, delivers and
+  completes nothing. It disables the source after the 8th data-bearing completion (`UARTIMSC = 0`
+  first, then `GICD_ICENABLER`).
+
+## 4 — evidence
+
+Live (`scripts/qemu-aarch64-pl011-irq-witness-smoke.sh`, development boots): 8 items, 4 idle and 4
+user; per claim, in order, entry → one-byte drain leaving `FR.RXFE = 1` and `MIS = 0` → production
+delivery (`line=33 outcome=delivered`) → `EOIR` with token `0x21`, after which the distributor
+reports INTID 33 neither active nor pending and `RPR = 0xff`; 8 notification probes, each item
+received once with label 33 and the exact byte. Idle entries: `irq_current_spx`, `SPSR = EL1h`,
+`parked=1`, `ELR` = the window leaf's take point. User entries: `irq_lower_a64`, `tid=1`, all four
+inside the register-checked block with every GPR and SIMD sentinel intact. After the disable: no
+entry, no claim, the post-disable byte stays in the FIFO, 10/10 timed parks, the timer and init
+continue. Isolation: the enable-time `AT` results and every claim's regime facts, plus a child's
+EL0 load from `0x0900_0018` taking `PAGE_FAULT_UNHANDLED addr=0x9000018 access=Read`, and the
+anonymous map over the PL011 page refused.
+
+Negative controls (live mutations, not committed, each reverted):
+
+| control | result |
+|---|---|
+| source disabled at the distributor after the enable | byte injected after READY+idle; 0 claims; the timer runs on; item 1 never received |
+| delivery given the wrong identity (claimed 33 presented to the bridge as 34) | drain and `EOIR` still balanced and deactivated; `line=34 outcome=no_route`; no notification |
+| completion withheld for INTID 33 | item 1 delivered; the distributor then reports 33 ACTIVE (`RPR = 0x80`); item 2's byte produces no claim; the timer runs on |
+
+## Remaining limits, and one pre-existing defect it exposed
+
+* **AArch64 has no per-task FP/SIMD state (pre-existing, not repaired).** The trap frame carries
+  the GPRs only; `q0..q31` live in the vector frame of whichever exception is returning. A task
+  resumed on another context's frame — any cross-task resume, including the U9-TIMER5 idle-boundary
+  user return — gets that context's SIMD registers. The witness first failed on exactly this: the
+  compiler kept the recv-v2 metadata template in `q0/q1` across a blocking receive, and after each
+  idle resume the next probes read corrupted metadata. The receiver now declares SIMD clobbered
+  across its blocking receives, and MEASURES the loss instead of hiding it: every idle item reports
+  `idle_resume_simd_mask=0x3` (`d0`, `d1` lost; `d16`, `d17`, which the kernel happens not to use,
+  survive). Interrupts taken from EL0 preserve all SIMD sentinels — the vector frame is the task's
+  own there.
+* One CPU; no SMP interrupt qualification, no AP delivery, no IPI. GICv2 only.
+* The receive door is the witness-build, non-blocking probe; the blocking notification receive,
+  the live waiter-wake arm and notification teardown remain untested live.
+* The `aarch64` module is not compiled on an x86_64 host, so its unit tests (including the new
+  token and PXN tests) do not run in the hosted suite; `tests/aarch64_pl011_irq_witness_scope.rs`
+  guards the source, and the live grader reads the token, the deactivation and the leaf bits.
+* No general UART driver; the fixture disables after a fixed count. x86_64 is unchanged.
