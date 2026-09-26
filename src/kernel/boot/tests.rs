@@ -102193,8 +102193,9 @@ mod stage200d0b3_x86_exit_corrected {
         // calls and which lives in the vector epilogue.
         assert!(!b.contains("flush_trap_context_to_iret_frame"));
         assert!(!b.contains("write_task_gprs_to_saved_regs"));
+        // QEMU-IRQ3: the commit also carries whether this is a same-task asynchronous return.
         assert!(DESC_SRC.contains(
-            "unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };"
+            "flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame, same_task_async_return)"
         ));
     }
 
@@ -102616,7 +102617,9 @@ mod stage200d0b3_x86_exit_corrected {
             .nth(1)
             .expect("shared dispatch call");
         let commit = stub
-            .find("unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };")
+            .find(
+                "flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame, same_task_async_return)",
+            )
             .expect("the real iret-frame commit");
         let attest = stub
             .find("maybe_attest_exit_common_epilogue(cpu, \"replacement\")")
@@ -108524,8 +108527,11 @@ mod stage200d2b1d5a_owner_revalidation {
     /// owner being idle.
     #[test]
     fn g04_prepared_replacement_owner_is_preserved() {
+        // QEMU-IRQ3: the gate additionally admits only a ring-3 entering frame.
         let gate = DESC_SRC
-            .split("let revalidation = if matches!(exiting_tid, None | Some(0)) {")
+            .split(
+                "let revalidation = if matches!(exiting_tid, None | Some(0))\n            && owner_revalidation_admissible(entering_cs)\n        {",
+            )
             .nth(1)
             .expect("the revalidation gate must exist");
         let gate = gate
@@ -108576,12 +108582,16 @@ mod stage200d2b1d5a_owner_revalidation {
     /// flushed, depth is cleared once, and the attestation names `replacement`.
     #[test]
     fn g06_revalidated_owner_joins_the_replacement_path() {
+        // QEMU-IRQ3 names the disjunction (`switched`) because the same value also decides
+        // whether the return keeps the interrupted RFLAGS.
         assert!(
-            DESC_SRC.contains("if task_switched || revalidated_owner.is_some() {"),
+            DESC_SRC.contains(
+                "let switched = task_switched || revalidated_owner.is_some();\n        if switched {"
+            ),
             "a revalidated owner must have its GPRs written like any task switch"
         );
         let after = DESC_SRC
-            .split("if task_switched || revalidated_owner.is_some() {")
+            .split("let switched = task_switched || revalidated_owner.is_some();\n        if switched {")
             .nth(1)
             .expect("replacement path");
         let flush = after
