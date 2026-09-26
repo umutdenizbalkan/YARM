@@ -62,16 +62,21 @@ macro_rules! trap_trace { ($($arg:tt)*) => { aarch64_trap_trace(format_args!($($
 /// interrupt is pending across it and is taken the instant `daifclr` lands, and the periodic
 /// timer re-arms every tick regardless, so the boundary is re-examined each quantum.
 ///
-/// # QEMU-IRQ2 §2 — the unmasked window is three instructions and uses no stack
+/// # QEMU-IRQ2 §2 — wait masked, take at one instruction, re-mask; no stack
 ///
 /// An interrupt that returns here restores the `SPSR_EL1` it was taken with, whose `I` bit is
-/// clear. With a bare `daifclr; wfi` the loop's own Rust code — `park()` and its log line — then
-/// ran UNMASKED on this stack until the next `daifclr`, so a second interrupt could land in the
-/// middle of a stack-using function at the boundary. The unmask therefore lives in
-/// [`yarm_aarch64_idle_wfi_window`], a leaf that clears the mask, waits, and sets the mask again
-/// before returning. Every interrupt at the boundary is taken with `ELR_EL1` inside that leaf —
-/// on its `wfi` (pending when the mask cleared) or its `daifset` (woken by it) — and none can be
-/// taken in `park()`.
+/// clear. With a bare `daifclr; wfi` two things followed from that. The loop's own Rust code —
+/// `park()` and its log line — ran UNMASKED on this stack until the next `daifclr`, so a second
+/// interrupt could land in the middle of a stack-using function at the boundary. And an interrupt
+/// already pending when `daifclr` landed was taken with `ELR_EL1` on the `wfi`, so the return
+/// executed that `wfi` UNMASKED with the park authorization already spent: the next interrupt was
+/// taken at the boundary but unauthenticated (measured: one of four PL011 idle claims).
+///
+/// So the halt is [`yarm_aarch64_idle_wfi_window`], a stack-free leaf: `wfi` with the mask SET
+/// (it still wakes on a pending interrupt; it just does not take it), then `daifclr` — where the
+/// interrupt that woke it is taken, with `ELR_EL1` on the following `daifset` — then `daifset`,
+/// `ret`. Every wait is masked, every interrupt at the boundary is taken at that one point right
+/// after a fresh `park()`, and none can be taken in Rust code.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 extern "C" fn aarch64_idle_park_loop(cpu: usize) -> ! {
     loop {
@@ -100,9 +105,10 @@ extern "C" fn aarch64_idle_park_loop(cpu: usize) -> ! {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 unsafe extern "C" {
-    /// The idle boundary's only unmasked instructions: `daifclr #3; wfi; daifset #3; ret`. A leaf
-    /// with no stack use, so an interrupt taken inside it interrupts no Rust frame. Sized, so the
-    /// witness grader can place `ELR_EL1` inside it from the symbol table.
+    /// The idle boundary's halt: `wfi; daifclr #3; daifset #3; ret` — wait masked, take the waking
+    /// interrupt at exactly one point, re-mask. A leaf with no stack use, so an interrupt taken
+    /// inside it interrupts no Rust frame. Sized, so the witness grader can place `ELR_EL1` from
+    /// the symbol table.
     fn yarm_aarch64_idle_wfi_window();
 }
 
@@ -114,8 +120,8 @@ core::arch::global_asm!(
     .type yarm_aarch64_idle_wfi_window,%function
     .balign 16
 yarm_aarch64_idle_wfi_window:
-    msr daifclr, #0x3
     wfi
+    msr daifclr, #0x3
     msr daifset, #0x3
     ret
     .size yarm_aarch64_idle_wfi_window, . - yarm_aarch64_idle_wfi_window

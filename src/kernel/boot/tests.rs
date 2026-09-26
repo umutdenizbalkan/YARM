@@ -103093,10 +103093,19 @@ mod stage200d0c1_aarch64_exit_prep {
         // count changed spelling. The property is unchanged and is asserted against the new one:
         // there is still exactly ONE `wfi` in this module, so there is still exactly one idle
         // primitive and no second idle policy.
+        //
+        // QEMU-IRQ2 §2 re-derivation: the `wfi` now lives in `yarm_aarch64_idle_wfi_window`, the
+        // stack-free leaf the park loop calls, as a `global_asm!` line rather than a quoted
+        // inline-asm string. Same property, new spelling: one `wfi` instruction in the module,
+        // and no inline one beside it.
         assert_eq!(
-            A64_TRAP_SRC.matches("\"wfi\"").count(),
+            A64_TRAP_SRC.matches("\n    wfi\n").count(),
             1,
             "exactly one wfi idle primitive exists in the AArch64 trap module"
+        );
+        assert!(
+            !A64_TRAP_SRC.contains("\"wfi\""),
+            "and no inline-asm wfi beside it"
         );
         // The in-lock idle divergence is skipped for the exit case, so the consumer is
         // reachable at all when there is no replacement.
@@ -136246,9 +136255,21 @@ mod aarch64_gic_device_mapping {
                 && helper.contains("level_index(va, 12)"),
             "it walks to an L3 leaf — a 4 KiB page, not a block descriptor"
         );
+        // QEMU-IRQ2 §2: the leaf flags live in `device_leaf_flags`, which adds PXN to the
+        // Device-nGnRE / privileged / UXN leaf `PageFlags::DEVICE_RW` yields.
         assert!(
-            helper.contains("PageFlags::DEVICE_RW"),
-            "Device-nGnRE, privileged, execute-never"
+            helper.contains("device_leaf_flags()"),
+            "the helper writes the one device leaf"
+        );
+        let flags = PT_SRC
+            .split("fn device_leaf_flags() -> u64 {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the device leaf flags");
+        assert!(
+            flags.contains("PageFlags::DEVICE_RW")
+                && flags.contains("PageTableEntry::PRIV_NO_EXECUTE"),
+            "Device-nGnRE, privileged, execute-never at EL0 and EL1"
         );
         assert!(
             helper.contains("pa == 0 || !pa.is_multiple_of(PAGE_SIZE_U64)"),
@@ -169160,10 +169181,32 @@ mod u9exit4_post_clear_totality {
             .into_iter()
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
+        // QEMU-IRQ2 §2 re-derivation: the unmask moved out of the loop's Rust body into the
+        // stack-free leaf `yarm_aarch64_idle_wfi_window`, which waits MASKED, opens the mask for
+        // exactly one instruction to take whatever woke it, and masks again before it returns, so
+        // no interrupt can land in `park()` or its log line and none is taken with the park
+        // authorization already spent. The loop calls it exactly once per turn; the leaf holds the
+        // module's only `daifclr`.
         assert_eq!(
-            park_code.matches("daifclr").count(),
+            park_code.matches("yarm_aarch64_idle_wfi_window();").count(),
             1,
-            "the idle primitive unmasks exactly once, immediately before its wfi"
+            "the idle primitive enters the unmasked window exactly once per turn"
+        );
+        assert!(!park_code.contains("daifclr"), "and never unmasks in Rust");
+        let window = AARCH64_TRAP
+            .split_once("yarm_aarch64_idle_wfi_window:\n")
+            .and_then(|(_, r)| r.split_once(".size yarm_aarch64_idle_wfi_window"))
+            .map(|(b, _)| b)
+            .expect("the unmasked window leaf");
+        let insns: alloc::vec::Vec<&str> = window
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            insns,
+            ["wfi", "msr daifclr, #0x3", "msr daifset, #0x3", "ret"],
+            "wait masked, take, re-mask, return — no stack, no call, nothing else"
         );
         let module_code = code_lines(AARCH64_TRAP)
             .into_iter()
@@ -169179,7 +169222,9 @@ mod u9exit4_post_clear_totality {
         let park_at = park_code
             .find("idle_boundary::park(cpu, sp)")
             .expect("the boundary publication");
-        let unmask_at = park_code.find("daifclr").expect("the unmask");
+        let unmask_at = park_code
+            .find("yarm_aarch64_idle_wfi_window();")
+            .expect("the unmask");
         assert!(
             park_at < unmask_at,
             "the boundary is published before interrupts are opened"
@@ -173306,18 +173351,35 @@ mod u9dispatchcpu3_recovery_chain {
             .split_once("extern \"C\" fn aarch64_idle_park_loop(cpu: usize) -> ! {")
             .map(|(_, r)| r.split_once("\n}").map(|(b, _)| b).unwrap_or(r))
             .expect("the AArch64 idle primitive");
+        // QEMU-IRQ2 §2 re-derivation: the loop halts through the stack-free leaf
+        // `yarm_aarch64_idle_wfi_window`. "Wake-capable" keeps its teeth: the landing must OPEN
+        // the mask, or a pending interrupt wakes the `wfi` but is never taken and the halt is
+        // terminal. The unmask now FOLLOWS the wait — `wfi` wakes on a pending interrupt whatever
+        // `DAIF` says, and the interrupt is then taken at the one-instruction window before the
+        // re-mask — so no wait ever runs unmasked with the park authorization spent, and no
+        // interrupt lands in the loop's stack-using Rust code.
         assert!(
-            idle.contains("wfi"),
-            "AArch64 idles on `wfi`, which wakes on an unmasked pending interrupt"
+            idle.contains("yarm_aarch64_idle_wfi_window();"),
+            "the AArch64 idle loop halts through the unmasked-window leaf"
         );
-        assert!(
-            idle.contains("msr daifclr"),
-            "and it must OPEN interrupts on the way in — a masked `wfi` wakes but never traps, \
-             which is what made this landing terminal before U9-TIMER5"
+        let window = A64
+            .split_once("yarm_aarch64_idle_wfi_window:\n")
+            .and_then(|(_, r)| r.split_once(".size yarm_aarch64_idle_wfi_window"))
+            .map(|(b, _)| b)
+            .expect("the unmasked window leaf");
+        let wait = window
+            .find("wfi")
+            .expect("AArch64 idles on `wfi`, which wakes on a pending interrupt even when masked");
+        let unmask = window.find("msr daifclr").expect(
+            "it must OPEN interrupts after the wake — a masked `wfi` wakes but never traps, \
+             which is what made this landing terminal before U9-TIMER5",
         );
+        let remask = window
+            .find("msr daifset")
+            .expect("and re-masks before returning");
         assert!(
-            !idle.contains("msr daifset") && !idle.contains("DAIFSet"),
-            "and it must NOT mask interrupts on the way in — that would make the halt terminal"
+            wait < unmask && unmask < remask,
+            "wait, then take, then re-mask"
         );
         assert!(
             A64.contains("fn idle_no_eret_loop() -> ! {"),
@@ -185312,7 +185374,8 @@ mod u9timer5_idle_boundary {
                 "aarch64",
                 A64_TRAP_SRC,
                 "extern \"C\" fn aarch64_idle_park_loop(cpu: usize) -> ! {",
-                "\"wfi\"",
+                // QEMU-IRQ2 §2: the halt is the stack-free unmasked-window leaf.
+                "yarm_aarch64_idle_wfi_window();",
             ),
         ] {
             let body = src

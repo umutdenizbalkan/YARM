@@ -183,6 +183,80 @@ fn page_access(pa: usize) -> PageAccess {
     }
 }
 
+/// The live final descriptor for `va` and its level, read by walking the ACTIVE `TTBR0_EL1` root
+/// (L1 → L2 → L3, the 39-bit, three-level layout this port builds). A level-1 or level-2 BLOCK
+/// ends the walk early — that is how the bootstrap root maps its device gigabyte. Page-table pages
+/// are identity-mapped RAM, so the walk reads memory the kernel owns; the device itself is never
+/// touched. `None` when a level holds no valid descriptor.
+fn live_leaf(va: usize) -> Option<(u8, u64)> {
+    let ttbr0: u64;
+    // SAFETY: reading a system register.
+    unsafe {
+        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags));
+    }
+    let mut table = ttbr0 & 0x0000_ffff_ffff_f000;
+    for (level, shift) in [(1u8, 30u32), (2, 21), (3, 12)] {
+        let index = (va >> shift) & 0x1ff;
+        // SAFETY: `table` is a page-table page this kernel built, identity-mapped.
+        let desc = unsafe { core::ptr::read_volatile((table as *const u64).add(index)) };
+        match (level, desc & 0b11) {
+            (3, 0b11) => return Some((3, desc)),
+            (1 | 2, 0b01) => return Some((level, desc)),
+            (1 | 2, 0b11) => table = desc & 0x0000_ffff_ffff_f000,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The facts one device page has under the live translation, packed for a log line: the `AT`
+/// answers, and the final descriptor's level, EL0 permission (AP[1]), UXN, PXN and AttrIdx.
+#[derive(Clone, Copy)]
+struct LiveFacts {
+    access: PageAccess,
+    level: u8,
+    desc: u64,
+    ap_el0: u64,
+    uxn: u64,
+    pxn: u64,
+    attr_idx: u64,
+}
+
+fn live_facts(pa: usize) -> LiveFacts {
+    let access = page_access(pa);
+    let (level, desc) = live_leaf(pa).unwrap_or((0, 0));
+    LiveFacts {
+        access,
+        level,
+        desc,
+        ap_el0: (desc >> 6) & 1,
+        uxn: (desc >> 54) & 1,
+        pxn: (desc >> 53) & 1,
+        attr_idx: (desc >> 2) & 0b111,
+    }
+}
+
+impl LiveFacts {
+    /// Kernel-only Device-nGnRE, execute-never at both levels.
+    fn kernel_only_device_xn(&self) -> bool {
+        self.access.kernel_device
+            && self.access.user_denied
+            && self.ap_el0 == 0
+            && self.uxn == 1
+            && self.pxn == 1
+            && self.attr_idx == 3
+    }
+}
+
+fn ttbr0_asid() -> u64 {
+    let ttbr0: u64;
+    // SAFETY: reading a system register.
+    unsafe {
+        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags));
+    }
+    ttbr0 >> 48
+}
+
 /// `true` iff the kernel may touch this device register now — the page resolves, under the
 /// translation this code is running on, to a Device-nGnRE kernel mapping of that very address.
 fn reachable(pa: usize) -> bool {
@@ -307,20 +381,33 @@ pub fn enable_source_before_unmask() -> bool {
 
     // ── 1. Mappings and handler readiness, from the live translation ──────────────────────────
     let pages = [("uart", uart), ("gicd", dist), ("gicc", cpu_if)];
+    //
+    // This runs on whatever root is live at the end of bootstrap, which is not the regime any
+    // witness interrupt is taken under — those arrive on a user root (EL0 origin) or on the root
+    // the idle loop last left active. So the enable requires only what it itself needs (EL1 reaches
+    // the page as Device, EL0 does not) and RECORDS the descriptor; every claim then re-derives
+    // the full kernel-only / Device / execute-never facts for the regime it was taken under.
     for (name, pa) in pages {
-        let a = page_access(pa);
+        let f = live_facts(pa);
         crate::yarm_log!(
-            "IRQ2_PL011_MMIO_ACCESS page={} pa=0x{:x} el1_device={} el0_denied={} par_el1=0x{:x}",
+            "IRQ2_PL011_MMIO_ACCESS page={} pa=0x{:x} asid={} el1_device={} el0_denied={} par_el1=0x{:x} level={} desc=0x{:x} ap_el0={} uxn={} pxn={} attr_idx={}",
             name,
             pa,
-            a.kernel_device as u8,
-            a.user_denied as u8,
-            a.par_el1
+            ttbr0_asid(),
+            f.access.kernel_device as u8,
+            f.access.user_denied as u8,
+            f.access.par_el1,
+            f.level,
+            f.desc,
+            f.ap_el0,
+            f.uxn,
+            f.pxn,
+            f.attr_idx
         );
-        if !a.kernel_device {
+        if !f.access.kernel_device {
             return deferred("mmio_not_kernel_device_under_active_ttbr0");
         }
-        if !a.user_denied {
+        if !f.access.user_denied || f.ap_el0 != 0 {
             return deferred("mmio_reachable_from_el0");
         }
     }
@@ -468,8 +555,16 @@ pub fn note_claim_and_drain(
     let tid = super::boot::trap_shared_kernel()
         .and_then(|s| s.current_tid_split_read(cpu))
         .unwrap_or(0);
+    // The regime THIS trap runs under: every page the claim, the drain and the completion touch
+    // must be kernel-only Device-nGnRE and execute-never at both levels, read from the live root.
+    let (dist_pa, cpu_if_pa) = super::page_table::gic_mmio_bases();
+    let uart_pa = UART_PA.load(Ordering::Acquire);
+    let regime_ok = [uart_pa, dist_pa as usize, cpu_if_pa as usize]
+        .iter()
+        .all(|&pa| live_facts(pa).kernel_only_device_xn());
+    let uf = live_facts(uart_pa);
     crate::yarm_log!(
-        "IRQ2_PL011_IRQ_ENTRY origin={} n={} claim={} intid={} kind={} spsr=0x{:x} elr=0x{:x} parked={} tid={}",
+        "IRQ2_PL011_IRQ_ENTRY origin={} n={} claim={} intid={} kind={} spsr=0x{:x} elr=0x{:x} parked={} tid={} asid={} regime_ok={} uart_level={} uart_desc=0x{:x}",
         origin,
         n,
         claim,
@@ -478,7 +573,11 @@ pub fn note_claim_and_drain(
         spsr_el1,
         elr_el1,
         parked as u8,
-        tid
+        tid,
+        ttbr0_asid(),
+        regime_ok as u8,
+        uf.level,
+        uf.desc
     );
 
     // ── Drain: the level drops only when the FIFO is empty ────────────────────────────────────
