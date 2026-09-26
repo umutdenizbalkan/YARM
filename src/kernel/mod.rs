@@ -5,6 +5,9 @@ pub mod boot;
 pub(crate) mod boot_command_line;
 pub mod cap_transfer_split;
 pub mod capabilities;
+/// QEMU-CONTEXT1 §3 — the kernel half of the user execution-state witness (markers only).
+#[cfg(any(test, feature = "context1-witness"))]
+pub mod context_witness;
 pub mod deadline_token;
 pub mod direct_ack_census;
 pub mod direct_ack_store;

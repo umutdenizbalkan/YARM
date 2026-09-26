@@ -62,6 +62,8 @@ timer5-idle-return-witness = []
 riscv-uart-irq-witness = []
 aarch64-pl011-irq-witness = []
 x86_64-uart-irq-witness = []
+context1-witness = []
+context1-clobber = ["context1-witness"]
 recv-queue1-ordinary-grant = []
 
 [dependencies]

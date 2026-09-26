@@ -147,6 +147,15 @@ aarch64-pl011-irq-witness = []
 # notification + ring page, the shared witness-only NR 5 notification arm, and init's receiver cell.
 # A build without it programs no I/O APIC entry and keeps NR 5 endpoint-only.
 x86_64-uart-irq-witness = []
+# QEMU-CONTEXT1: the user execution-state witness — init's cell (selector 31) with two real user
+# threads and a fresh thread, the provisioning of its park endpoint, and the kernel's per-trap
+# CTX1_TRAP identity markers. A build without it logs nothing and provisions nothing.
+context1-witness = []
+# QEMU-CONTEXT1: the witness's kernel clobber hook — after every ring-3/EL0-origin trap has been
+# dispatched, overwrite the user-visible FP/SIMD, control/status, flags and (AArch64) TPIDR_EL0
+# registers with junk, so a state the kernel failed to capture or restore cannot survive by luck.
+# It saves and restores nothing itself. Implies `context1-witness`.
+context1-clobber = ["context1-witness"]
 # U9-RECV-QUEUE1 §3: the queued shared-region grant taken by the ORDINARY receive syscalls
 # (NR 2 and NR 5) rather than by NR 30. A cargo feature and not only a runtime selector, for the
 # same reason the send-fault cell is one: init's address space runs at `MAX_MAPPINGS` and its

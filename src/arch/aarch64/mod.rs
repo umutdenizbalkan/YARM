@@ -4,6 +4,14 @@
 pub mod boot;
 pub mod console;
 pub mod context_switch;
+/// QEMU-CONTEXT1 §3 — the execution-state witness's kernel hooks. Compiled only with
+/// `context1-witness`; no default or production profile carries it.
+#[cfg(all(
+    feature = "context1-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64"
+))]
+pub mod context_witness;
 pub mod dtb;
 pub mod irq;
 pub mod page_table;

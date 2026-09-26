@@ -8423,6 +8423,48 @@ pub fn provision_init_uart_irq_witness(
     })
 }
 
+/// QEMU-CONTEXT1 §3 — the slot-5 selector of init's user execution-state witness cell.
+#[cfg(feature = "context1-witness")]
+pub const CONTEXT1_WITNESS_SELECTOR: u64 = 31;
+
+/// QEMU-CONTEXT1 §3 — provision init's context witness: ONE private endpoint, minted SEND|RECEIVE
+/// into init's CNode, on which the witness threads park with a deadline so the CPU genuinely
+/// idles between their blocks and resumes. Nobody ever sends to it; nothing else is provisioned.
+/// Returns the endpoint's capability id in init's CNode, or `None` (logged) on any failure.
+#[cfg(all(not(feature = "hosted-dev"), feature = "context1-witness"))]
+pub fn provision_init_context_witness(kernel: &mut KernelState, init_tid: u64) -> Option<u32> {
+    use crate::kernel::capabilities::{CapRights, Capability};
+    let init_cnode = kernel.task_cnode(init_tid)?;
+    let (_park_idx, _park_send, park_recv_root) = match kernel.create_endpoint(1) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!(
+                "CTX1_WITNESS_PROVISION_FAIL step=create_endpoint err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    let park_object = kernel.current_task_capability(park_recv_root)?.object;
+    match kernel.mint_capability_in_cnode(
+        init_cnode,
+        Capability::new(park_object, CapRights::SEND | CapRights::RECEIVE),
+    ) {
+        Ok(c) => {
+            crate::yarm_log!(
+                "CTX1_WITNESS_PROVISION_OK init_tid={} park_cap={}",
+                init_tid,
+                c.0
+            );
+            Some(c.0 as u32)
+        }
+        Err(e) => {
+            crate::yarm_log!("CTX1_WITNESS_PROVISION_FAIL step=mint_park err={:?}", e);
+            None
+        }
+    }
+}
+
 /// U9-RECV-FINAL §1 — how many RECOGNIZED receives reached the terminal broad acquisition.
 ///
 /// The receive family is not closed by this package, and this is what keeps that statement

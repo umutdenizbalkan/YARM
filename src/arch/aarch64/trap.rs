@@ -149,6 +149,15 @@ yarm_aarch64_idle_wfi_take:
 #[inline(always)]
 fn idle_no_eret_loop() -> ! {
     crate::yarm_log!("SCHED_ENTER_IDLE_HLT");
+    // QEMU-CONTEXT1 §3: this trap never returns to the task it interrupted; record the block.
+    #[cfg(all(
+        feature = "context1-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "aarch64"
+    ))]
+    crate::arch::aarch64::context_witness::note_idle_divergence(
+        (crate::arch::aarch64::read_mpidr_el1() & 0xff) as usize,
+    );
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     {
         let cpu = (crate::arch::aarch64::read_mpidr_el1() & 0xff) as usize;

@@ -1338,6 +1338,29 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     regs: *mut X86SavedRegs,
     interrupt_frame: *mut X86InterruptStackFrame,
 ) {
+    // SAFETY: both entry stubs pass the hardware (or synthetic LSTAR) frame they built.
+    #[cfg(feature = "context1-witness")]
+    let entered_from_user = unsafe { (*interrupt_frame).cs } & 0x3 == 0x3;
+    #[cfg(feature = "context1-witness")]
+    if entered_from_user {
+        crate::arch::x86_64::context_witness::check_kernel_env();
+    }
+    x86_trap_dispatch_body(vector, error_code, regs, interrupt_frame);
+    #[cfg(feature = "context1-clobber")]
+    if entered_from_user {
+        crate::arch::x86_64::context_witness::clobber_user_visible_state();
+    }
+}
+
+/// The trap dispatch proper, below the entry wrapper that owns the protected interval's edges.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[inline(never)]
+fn x86_trap_dispatch_body(
+    vector: u64,
+    error_code: u64,
+    regs: *mut X86SavedRegs,
+    interrupt_frame: *mut X86InterruptStackFrame,
+) {
     // Stage 30 / Review C1: in debug builds, assert no boot raw-borrow window is
     // live. A timer/trap reaching with_cpu during that window would alias the boot
     // &mut KernelState (UB). Compiles to nothing in release; zero ISR overhead.
@@ -1416,6 +1439,15 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         }
         let fault_rip = frame.rip;
         let entering_cs = frame.cs;
+        // QEMU-CONTEXT1 §3: the origin, read before dispatch can consume the parked flag.
+        #[cfg(feature = "context1-witness")]
+        let ctx1_origin = if entering_cs & 0x3 == 0x3 {
+            crate::kernel::context_witness::TrapOrigin::User
+        } else if crate::kernel::idle_boundary::is_parked(cpu.0 as usize) {
+            crate::kernel::context_witness::TrapOrigin::Idle
+        } else {
+            crate::kernel::context_witness::TrapOrigin::Kernel
+        };
         // Stage 4T+6R history, and why THIS is not a repeat of it: Stage 4T+6 converted
         // both snapshots to `current_tid_split_read(cpu)`, which has equivalent
         // return-value semantics but does NOT bind `scheduler_state.current_cpu` — and
@@ -1508,6 +1540,17 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // this is not the Stage 4T+6 substitution.
         let exiting_tid: Option<u64> = shared.current_tid_authoritative(cpu);
         let task_switched = entering_tid != exiting_tid;
+        // QEMU-CONTEXT1 §3: the witness's identity marker — which task this trap interrupted and
+        // which task it returns to, from which origin. Observes; decides nothing.
+        #[cfg(feature = "context1-witness")]
+        crate::kernel::context_witness::note_trap(
+            cpu.0 as usize,
+            vector,
+            vector as usize == VEC_TIMER,
+            ctx1_origin,
+            entering_tid,
+            exiting_tid,
+        );
         // Stage 199A2D2C2C: on CPU 0 (BSP), drive the reverse-direction saved-frame resume of the
         // remotely-woken oracle client on EVERY trap return (not only the idle transition), because in
         // SMP=2 the passive scheduler (single-CPU D6 seam) never re-selects a caller enqueued on CPU 0's

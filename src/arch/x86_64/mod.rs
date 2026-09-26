@@ -26,4 +26,8 @@ pub mod trap;
 pub mod uart_irq_witness;
 pub mod vm_layout;
 
+/// QEMU-CONTEXT1 §3 — the execution-state witness's kernel hooks. Built only with
+/// `context1-witness`; no default or production profile carries it.
+#[cfg(all(feature = "context1-witness", not(feature = "hosted-dev")))]
+pub mod context_witness;
 pub mod topology;

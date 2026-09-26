@@ -1169,6 +1169,22 @@ pub fn bootstrap_first_user_task(
             None => crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=madt_route"),
         }
     }
+    // QEMU-CONTEXT1 §3: the user execution-state witness. Compile-time gated only, and mutually
+    // exclusive with every slot-5/13/14 cell above (it stands down unless all three are zero).
+    #[cfg(feature = "context1-witness")]
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
+        if let Some(park) =
+            crate::kernel::boot::provision_init_context_witness(kernel, RING3_INIT_SERVER_TID)
+        {
+            init_args[5] = crate::kernel::boot::CONTEXT1_WITNESS_SELECTOR;
+            init_args[14] = park as u64;
+            crate::yarm_log!(
+                "CTX1_WITNESS_SLOTS slot5={} slot14={}",
+                init_args[5],
+                init_args[14]
+            );
+        }
+    }
     // U9-PAGEFAULT1 §2 — the x86_64 TERMINAL-FAULT oracle slot-5 write.
     //
     // The same scenario, selector and knob AArch64 has used since 199E-A64CALL: init takes one

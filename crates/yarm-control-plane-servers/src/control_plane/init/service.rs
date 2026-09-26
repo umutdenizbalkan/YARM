@@ -2137,6 +2137,16 @@ pub(super) mod timer5_idle_return_witness {
 #[path = "uart_irq_witness.rs"]
 pub(super) mod uart_irq_witness;
 
+/// QEMU-CONTEXT1 §3 — the user execution-state witness (selector 31): two real user threads plus a
+/// fresh one, full FP/SIMD, control/status and flags images checked inside single asm blocks.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    feature = "context1-witness",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[path = "context_witness.rs"]
+pub(super) mod context_witness;
+
 #[cfg(not(feature = "hosted-dev"))]
 pub(super) mod xfer2_grant_witness {
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -6520,6 +6530,16 @@ pub fn run() {
     ))]
     if uart_irq_witness::armed(ctx.supervisor_control_recv_ep) {
         uart_irq_witness::run_once();
+    }
+    // QEMU-CONTEXT1 §3: the user execution-state witness, selector 31. Mutually exclusive with
+    // every other slot-5 cell; compiled only with `context1-witness` on x86_64 or AArch64.
+    #[cfg(all(
+        not(feature = "hosted-dev"),
+        feature = "context1-witness",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if context_witness::armed(ctx.supervisor_control_recv_ep) {
+        context_witness::run_once();
     }
     // U9-TIMER5 §3: the IDLE-BOUNDARY RETURN witness, selector 16. Mutually exclusive with every
     // other slot-5 cell, architecture-neutral, and default-off. ONE task: the shape needs the CPU

@@ -7117,6 +7117,26 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     };
     let trap_cpu =
         crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
+    // QEMU-CONTEXT1 §3: vector kinds 9..=16 are lower-EL (EL0) exceptions.
+    #[cfg(feature = "context1-witness")]
+    let entered_from_user = (9..=16).contains(&kind);
+    #[cfg(feature = "context1-witness")]
+    let ctx1_entering = if entered_from_user {
+        crate::arch::aarch64::context_witness::check_kernel_env();
+        trap_shared_kernel().and_then(|s| s.current_tid_split_read(trap_cpu))
+    } else {
+        None
+    };
+    #[cfg(feature = "context1-witness")]
+    crate::arch::aarch64::context_witness::note_entering(trap_cpu.0 as usize, ctx1_entering);
+    #[cfg(feature = "context1-witness")]
+    let ctx1_origin = if entered_from_user {
+        crate::kernel::context_witness::TrapOrigin::User
+    } else if crate::kernel::idle_boundary::is_parked(trap_cpu.0 as usize) {
+        crate::kernel::context_witness::TrapOrigin::Idle
+    } else {
+        crate::kernel::context_witness::TrapOrigin::Kernel
+    };
     // QEMU-IRQ2 §2: the witness fixture's only hook before delivery. It records where the claim
     // was taken from (the vector kind and, for EL1, whether this CPU was parked at the
     // authenticated idle boundary) and drains the PL011 so the level source drops BEFORE the
@@ -7162,6 +7182,20 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         .is_ok()
         {
             write_trapframe_back_to_vector_frame(frame, &trap_frame, trap_cpu);
+            // QEMU-CONTEXT1 §3: the identity marker — which task this exception interrupted and
+            // which task the vector tail returns to. Observes; decides nothing.
+            #[cfg(feature = "context1-witness")]
+            {
+                crate::arch::aarch64::context_witness::note_entering(trap_cpu.0 as usize, None);
+                crate::kernel::context_witness::note_trap(
+                    trap_cpu.0 as usize,
+                    claimed_intid.map(u64::from).unwrap_or(0x1000 | kind),
+                    is_timer_irq,
+                    ctx1_origin,
+                    ctx1_entering,
+                    shared.current_tid_split_read(trap_cpu),
+                );
+            }
             if AARCH64_TRAP_TRACE {
                 let log_tid = shared.current_tid_split_read(trap_cpu).unwrap_or(0);
                 boot_trace!(
@@ -7245,6 +7279,12 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         crate::arch::aarch64::irq::complete_interrupt(ack);
         #[cfg(feature = "aarch64-pl011-irq-witness")]
         crate::arch::aarch64::pl011_irq_witness::note_completion_written(ack);
+    }
+    // QEMU-CONTEXT1 §3: the witness's interference — the protected interval ends at the vector
+    // tail, so user-visible FP/SIMD and control state is overwritten here, after every kernel use.
+    #[cfg(feature = "context1-clobber")]
+    if entered_from_user {
+        crate::arch::aarch64::context_witness::clobber_user_visible_state();
     }
     // QEMU-IRQ2 §2: a return to the idle leaf's take point goes back MASKED, so a second
     // interrupt that was pending alongside this one is taken only after the loop re-parks — never
@@ -8096,6 +8136,22 @@ pub fn bootstrap_first_user_task(
                 }
             }
             None => crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=dtb_pl011_intid"),
+        }
+    }
+    // QEMU-CONTEXT1 §3: the user execution-state witness. Compile-time gated only, and mutually
+    // exclusive with every slot-5/13/14 cell above (it stands down unless all three are zero).
+    #[cfg(feature = "context1-witness")]
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
+        if let Some(park) =
+            crate::kernel::boot::provision_init_context_witness(kernel, RING3_INIT_SERVER_TID)
+        {
+            init_args[5] = crate::kernel::boot::CONTEXT1_WITNESS_SELECTOR;
+            init_args[14] = park as u64;
+            crate::yarm_log!(
+                "CTX1_WITNESS_SLOTS slot5={} slot14={}",
+                init_args[5],
+                init_args[14]
+            );
         }
     }
     // Stage 195C: default-off AArch64 FutexWake live oracle. Slot 5
