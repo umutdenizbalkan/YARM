@@ -23022,3 +23022,203 @@ causal reason):
 * Named and unchanged, outside this package: the x86_64 AP cross-CPU reply/shootdown failure, the
   ack-lease race, the RISC-V reply-timeout retirement-checker failure, and the AArch64 missing
   per-task FP/SIMD state.
+
+# QEMU-CONTEXT1 — user execution state across traps and task switches (x86_64, AArch64)
+
+Base: `f74d9295cd7f36a0b9adf9b26534fde354110aeb` (QEMU-IRQ3), tree
+`344e2734b9aa3b47494dec5a27c7df887b45c832`. U9 stays CLOSED (production `with_cpu=0`,
+`with_broad=0`). One CPU throughout; nothing here is SMP bring-up, IPI, lazy FP, AVX/SVE, or a
+general exception or notification-receive change. RISC-V is verified, not changed.
+
+## 1 — the contract, derived
+
+**What user code can hold, per port.**
+
+| port | user-visible non-GPR state | enabled by | at base |
+|---|---|---|---|
+| x86_64 | x87 (FCW, FSW, FTW, FOP/FIP/FDP, ST0..7 at 80 bits), MXCSR, XMM0..15 at 128 bits — the whole FXSAVE image; RFLAGS' CF PF AF ZF SF OF, DF, AC, ID | CR4 `|= 0x620` (PAE, OSFXSR, OSXMMEXCPT) plus SMEP/SMAP; OSXSAVE never set, so no AVX state exists | entries saved GPRs only; the kernel (built with SSE) ran under the user's MXCSR/FCW; every ring-3 return except IRQ3's same-task async case manufactured RFLAGS `0x202` |
+| AArch64 | q0..q31 at 128 bits, FPCR, FPSR, NZCV, TPIDR_EL0 | CPACR_EL1.FPEN = 0b11 at boot (`boot.rs`); no SVE | the vector frame (816 bytes) held x0..x30, SP_EL0, ELR, SPSR, ESR, FAR — no FP/SIMD, no FPCR/FPSR/TPIDR_EL0; the kernel ran under the user's FPCR |
+| RISC-V | none: userspace is soft-float (`lp64`, no F/D/V) and every U-mode return forces `sstatus.FS = VS = Off` (199E-R1F), so an FP/vector instruction traps and fails closed | — | unchanged, verified below |
+
+**Compiler overwrite windows.** Every instruction between the hardware entry and the first `call`/`bl`
+into compiled code, and between the last one and `iretq`/`sysretq`/`eret`, is hand-written
+assembly; everything in between is compiled Rust that may use any XMM/q register and any flag. So
+capture must sit before the first call and restore after the last, in the stub itself. The
+x86_64 kernel's use of XMM on the block path is exactly what destroyed xmm0..3 at base.
+
+**Entry/exit paths walked** (the same list the fix covers):
+
+* x86_64 — `yarm_x86_common_trap_entry` (all IDT vectors: timer, device IRQ, exceptions, from ring 3
+  or ring 0/idle) and `yarm_x86_lstar_entry` (SYSCALL, returns by `iretq`); both call
+  `yarm_x86_dispatch_trap_from_stub`. Divergent exits: `idle_halt_loop` (no return; the next
+  idle-origin trap converts its ring-0 frame through the idle-boundary debt), the D6/AP saved-frame
+  resumes in `smp.rs` (`resume_user_mode_iret` → `yarm_x86_resume_ring3`), and first entry
+  (`yarm_x86_enter_ring3`).
+* AArch64 — `yarm_aarch64_vector_dispatch` (all 16 vectors; kinds 9..=16 are EL0-origin) →
+  `yarm_aarch64_vector_entry`; the idle park loop's EL1 IRQs and the idle-boundary SPSR
+  conversion; `idle_no_eret_loop` divergence; first entry (`yarm_aarch64_enter_user_mode_eret`).
+  The post-lock resume core (`direct_dispatch_resume_incoming_core`) is how a task resumes when
+  another task blocks.
+
+**The existing `ArchSwitchContext.fxsave` area** belongs to the kernel stack-switch
+(`switch_frames`) — kernel-thread context, never a user task's state; nothing ever captured user
+state into it. It is left as it was; the user home is separate.
+
+**Syscall clobbers versus asynchronous interruption.** The user-rt syscall wrappers
+(`crates/yarm-user-rt/src/arch/{x86_64,aarch64}.rs`) declare only GPR operands and clobbers
+(x86: `rax rdi rsi rdx r10 r8 r9` in/out, `rcx r11` clobbered; AArch64: `x0..x5` in/out, `x8`),
+and neither declares `preserves_flags` — so flags are a syscall clobber, but no XMM/q register is.
+Compiled user code may keep live values in vector registers across any syscall, which the base
+destroyed (xmm0..3 / q0..3 on the block path). A syscall therefore owes FP/SIMD and control
+preservation exactly as an interrupt does; only the named GPRs and the flags are its to change,
+and an asynchronous interruption owes everything, flags included. A task can be switched out on
+either. The one policy is eager and uniform: capture on every user entry, restore on every user
+return. The witness's `block` cell holds the syscall case to that; its flag assertions are made
+only across interrupts, never across its own `syscall`/`svc`.
+
+## 2 — the policy, one per port
+
+* **Home.** `kernel::user_fpu::UserFpuState` — the FXSAVE64 image (512 bytes) on x86_64; q0..q31,
+  FPCR, FPSR, TPIDR_EL0 (544 bytes) on AArch64 — is a field of the TCB: per task, no global
+  last-owner, no allocation.
+* **Capture** (asm, before the first call): x86 stubs `sub rsp, 512; fxsave64 [rsp]` on the trap's
+  own stack, then the kernel's environment `fninit; ldmxcsr 0x1F80; cld`. AArch64 stores q0..q31,
+  FPCR, FPSR, TPIDR_EL0 into the vector frame (now 832 bytes; the region is byte-for-byte a
+  `UserFpuState`) and sets `FPCR = 0`. Scratch is per trap, so it is per CPU and nests.
+* **Commit** (Rust, first thing): a user-origin entry copies the capture into the entering task's
+  home (`commit_user_fpu_split`, rank 2), before anything can block, switch or idle. A
+  kernel-origin entry commits nothing — its scratch is the interrupted kernel context.
+* **Load** (Rust, last thing): if the frame now returns to ring 3 / EL0t, the resuming task's home
+  (`current_tid_authoritative`, `load_user_fpu_split`) is written over the scratch; a missing home
+  writes the initial state, never residue. The saved-frame resumes load it and pass it to
+  `yarm_x86_resume_ring3`, which `fxrstor64`s first.
+* **Restore** (asm, after the last call): `fxrstor64 [rsp]` / `ldp q…; msr fpcr/fpsr/tpidr_el0`.
+* **Flags** ride in the continuation: `TrapFrame`/`UserRegisterContext::user_status` (RFLAGS /
+  SPSR), captured and applied by the same owners as the GPRs. Ring-3 returns install
+  `sanitize_user_rflags(saved) = (saved & CF|PF|AF|ZF|SF|OF|DF|AC|ID) | 0x202` — IF forced, no
+  TF/IOPL/NT/RF/VM/VIF/VIP; EL0 returns install `sanitize_user_spsr(saved) = saved & NZCV` with
+  EL0t and DAIF clear. A never-run continuation (`0`) gets exactly `0x202` / `0`. This replaces
+  IRQ3's same-task-only `ring3_return_rflags`.
+* **Initial state and ownership rules.** A fresh TCB is the architectural reset state (x86: FCW
+  `0x037F`, MXCSR `0x1F80`, rest zero; AArch64: all zero). A new thread: the same, with
+  TPIDR_EL0 = its TLS base. A spawned image: reset. Fork: the child's home is a by-value copy of the
+  parent's (both publication owners — `fork_owners` and `publish_forked_child_split`, the latter
+  found missing and fixed during this work). A failed spawn replays the reservation's home with the
+  rest of its baseline. A cleared slot's next occupant is constructed fresh. First entry installs
+  the initial state in asm after its last call.
+* **A GPR defect on the same path, repaired.** `direct_dispatch_resume_incoming_core` (AArch64
+  post-lock resume) mirrored `arg0..arg5` over x0..x5 unconditionally. For a task that was
+  preempted in EL0 those lanes are the previous syscall's (`publish_async_preempt_snapshot`
+  preserves them), so resuming it through another task's blocking syscall overwrote six live
+  registers. It now uses the in-lock owner's predicate (`argument_lanes_are_authoritative`: first
+  resume or just-encoded completion). x86_64 rebuilds the whole GPR file from the snapshot on a
+  switched return and had no such mirror.
+
+## 3 — the witness
+
+`context1-witness` (+ `context1-clobber`), default off, init selector 31, no new syscall: init (A)
+and two threads it spawns (B, C) through NR 11, deadline receives (NR 5) on a private park
+endpoint, `ExitCurrentTask`. Every comparison is of a full image loaded and captured inside one
+asm block (x86: the FXSAVE image and CF/PF/AF/ZF/SF/OF/DF; AArch64: q0..q31, FPCR, FPSR, NZCV,
+TPIDR_EL0). Flag-neutral loops only (`mov/lea/jrcxz/jmp/loop`; `ldr/cbz/sub/cbnz/str`). The kernel
+logs `CTX1_TRAP cpu vec timer origin in out` for every switching or timer trap and
+`CTX1_KERNEL_ENV_BAD` if a user entry finds the kernel's FP environment wrong after capture.
+`context1-clobber` overwrites every user-visible FP/SIMD/control register (and NZCV/TPIDR on
+AArch64) at the end of every user-origin trap, inside the protected interval; it neither saves
+nor restores.
+
+Cells: **fresh** (C's first instructions capture its state while A carries junk into a block);
+**block** ×3 (pattern → blocking receive with nothing runnable → genuine idle → resume);
+**preempt** ×3 (A spins until B's store proves B ran between A's capture and restore; mode `block`
+makes B hand the CPU back through its own blocking syscall, mode `spin` only by a timer tick; A
+holds live sentinels in the six syscall-lane GPRs); **preempt_b** (B's own windows); **same** ×3
+(timer ticks returning to A; one round with DF/alternate FPCR+NZCV). The grader
+(`scripts/qemu-context1-witness-smoke.sh`, `-smp 1`, `yarm.sched_quantum_ticks=2`) requires each
+window's state comparison AND its kernel-logged identities: fresh — A left and C entered; block —
+`in=A out=0`, `SCHED_ENTER_IDLE_HLT`, an idle-origin trap with `out=A`; preempt — a timer
+`in=A out=B` and a first return `in=B out=A` by the route the mode names; same — a user-origin
+timer tick `in=A out=A`; `CTX1_KERNEL_ENV_BAD` absent; nothing fatal.
+
+**RISC-V, verified — no change.** The policy is 199E-R1F's and holds on the base-tree artifacts:
+all 13 user ELFs in `initramfs-core` carry `Flags: 0x1, RVC, soft-float ABI`; disassembled with the
+F, D and V decoders enabled they contain **0** floating-point or vector instructions, and so does
+the kernel ELF (built `lp64d` for its ABI, but 0 F/D/V instructions); every U-mode return goes
+through `user_status::sanitize_user_sstatus` (`riscv64/boot.rs`, both the ordinary return and the idle conversion) (FS and VS forced Off, hosted-tested there),
+so an FP/vector instruction in user mode raises illegal-instruction and fails closed. There is no
+user FP state to own; `user_fpu::USER_FPU_BYTES` is 0 on RISC-V, and its trap frame is unchanged.
+The integer continuation (async-preempt snapshot, a0/a1 result lanes) was already exact
+(199E-R1D) and is not touched.
+
+**Supersedes** QEMU-IRQ3's two named limits above ("User XMM state is not preserved across any
+x86_64 kernel entry"; "Cross-task RFLAGS") and the "AArch64 missing per-task FP/SIMD state" named
+there.
+
+## 4 — evidence
+
+**Base, first lost state** (witness on the unmodified base):
+
+| run | first lost state, in witness order | further |
+|---|---|---|
+| x86_64, witness only | **fresh**: C's first image `mask=0xffff01d` — FCW, FTW, MXCSR, ST0 and every XMM not the initial state (residue of whatever ran before) | **block** ×3: `mask=0xf000` — XMM0..3 destroyed by the kernel's own SSE use on the block/idle path; **preempt**: `mask=0xffff019`, `flags_bad=1` — A came back with B's image and a manufactured `RFLAGS 0x202`; B's own windows `bad=6`; `CTX1_KERNEL_ENV_BAD` on every user entry (the kernel ran under the user's MXCSR/FCW, e.g. `a=0x3f80 b=0xb7f`); the DF=1 `same` round then took a fatal kernel page fault (`!F v=0xe`) — compiled kernel code ran with DF set |
+| x86_64, + clobber | the same cells, with every XMM lost (`mask=0xffffffd`) | kernel page fault in the DF round |
+| AArch64, witness only, no preemption (`quantum=10^8`) | **fresh**: `mask=0xfffffffff`, `flags=0xf0000000` — C starts with another context's q0..q31/FPCR/FPSR/TPIDR and NZCV | **block** ×3: `mask=0xf` — q0..q3 lost across block → idle → resume; `CTX1_KERNEL_ENV_BAD a=0x3c00000` ×8 (kernel under the user's FPCR: FZ/rounding); preempt could not run (no ticks) |
+| AArch64, witness only, `quantum=2` | never reached the witness: the process manager's `spawn` result came back as **tid 0** (`PM_LIFECYCLE_RECORD image_id=5 tid=0`) after PM was preempted in EL0 and resumed through devfs's blocking receive — the argument-mirror defect (§2), which corrupted x0..x5, not FP state. init's devfs spawn decoded `zero_pid` and init parked | — |
+| AArch64, + clobber | `CTX1_KERNEL_ENV_BAD a=0x3c00000` and a stall before the witness began | — |
+
+**Candidate**: both ports, strict (`-smp 1`, quantum 2, clobber on), development builds before the freeze:
+`CONTEXT1_WITNESS_SEAL fresh=1 block=3 preempt=3 same=3 env_bad=0 result=ok` with preempt routes
+`block:syscall, spin:timer, block:syscall` on x86_64 and on AArch64. The frozen-tree runs are in the
+delivery report.
+
+**Negative controls** (live mutations of the candidate, never committed, each reverted and the tree
+verified clean):
+
+| control | port | failing assertion (first) | other cells |
+|---|---|---|---|
+| omit the entry commit | x86_64 | block r0 `mask=0xffff01d` | preempt 0/3, same 0/3; fresh passes (a new thread never needed a commit) |
+| omit the entry commit | AArch64 | block r0 `mask=0xbffffffff` | preempt 0/3, same 0/3; fresh passes |
+| omit the return load (the area keeps the entering context) | x86_64 | fresh `mask=0xffff01d` | block 0/3, preempt 0/3; same 3/3 (a same-task return carries its own capture) |
+| omit the return load | AArch64 | fresh `mask=0xbffffffff` | block 0/3, preempt 0/3; same 3/3 |
+| flip one bit in the upper half of XMM0 on load | x86_64 | fresh `mask=0x1000` (XMM0 only) | every cell reports XMM0 |
+| flip one bit in the upper half of q0 on load | AArch64 | fresh `mask=0x1` (q0 only) | every cell reports q0 |
+| ring-3 returns install `0x202` instead of the saved flags | x86_64 | preempt r0 `flags_bad=1`, `mask=0x0` | preempt 0/3, same 0/3; fresh/block pass (syscalls may clobber flags) |
+| EL0 returns install NZCV `0` instead of the saved NZCV | AArch64 | preempt r0 `mask=0x400000000` (NZCV only) | preempt 0/3, same 0/3; fresh/block pass |
+| a new thread takes its group leader's home instead of the initial state | x86_64 | fresh `mask=0x1000` | nothing else |
+| a new thread takes its group leader's home | AArch64 | fresh `mask=0x800000000` (TPIDR_EL0: the leader's, not C's TLS) | nothing else |
+| the post-lock argument mirror re-opened, for the witness's continuation only (x0 = A's first sentinel) | AArch64 | preempt r0 `gpr_bad=0x3f` (all six lanes), `mask=0x0` | all three preempt rounds — block AND spin: the timer preemption's post-lock drain resumes through the same core, so the defect was route-independent; B's own windows intact. The untargeted revert is the base: the boot never reaches the witness |
+
+Every mutation built and booted, the witness summary appeared (no hang), and the grader failed on
+the state assertion named — never on an unrelated marker. Each was reverted and the tree verified
+clean before the next.
+
+Hosted: `qemu_context1_user_fpu_ownership` (8 tests: spawned image resets a dirty reservation,
+thread starts from its own initial/TLS state, fork copies by value on the broad AND the split route,
+failed-spawn replay, same-slot reuse starts fresh, commit/load touch exactly the named task and
+refuse an absent one, fresh TCB); `user_fpu` (5: reset state, thread TLS, scratch round trip,
+RFLAGS and SPSR sanitization). Source: `tests/qemu_context1_scope.rs` (11 guards: features default
+off; each x86 stub captures before its only call and restores after; commit before dispatch and
+load after on both ports; clobber gated and save-free; first entry and saved-frame resumes install
+a home; every ring-3/EL0 return installs the resuming task's sanitized flags; AArch64 frame
+save/restore placement; the post-lock mirror gate; every home writer; the witness and grader).
+Re-derived existing guards (assertions otherwise unchanged): IRQ3's return contract (now asserts
+the general rule and the absence of the same-task helper), p14/p30 flush spelling, eight
+saved-frame resume guards (`resume_user_mode_iret(&frame, &fpu)`), the canonical-RFLAGS guard, the
+two U9-TIMER5 idle-boundary conversion guards, the Stage 4T+6 identity-read guard (the two FP
+owners are the only additional authoritative readers), and census row `task.rs::new` (the literal
+gained a data field; the status verdict is unchanged). The thread-initialisation home write was
+placed before the context literal so census site 20's neighbourhood did not move.
+
+
+## Unsupported or disabled state, and limits
+
+* No AVX/AVX-512 (CR4.OSXSAVE clear), no SVE/SME, no RISC-V F/D/V: none of it is enabled for user
+  code, so none is saved. Enabling any of them requires extending the home first.
+* Eager, not lazy: every user entry pays one FXSAVE64/FXRSTOR64 (x86) or 32 q-pair stores/loads
+  (AArch64). No attempt was made to skip it for syscalls.
+* x86_64 `ap_sched::SavedUserReturnFrame` (dead code, no production caller) still models RFLAGS as
+  the constant `0x202`; it now equals `sanitize_user_rflags(0)` and is pinned as such.
+* TPIDR_EL0 is now per task. It was previously whatever the last task left (the AArch64 port keeps
+  its TLS in x18); a new thread's TPIDR_EL0 is its TLS base, a fork child inherits the parent's.
+* One CPU. The AP saved-frame resumes load the home but are not exercised live by this witness.
+* Named and unchanged: the x86_64 AP cross-CPU reply/shootdown failure, the ack-lease race, the
+  RISC-V reply-timeout retirement-checker failure and serial log loss.
