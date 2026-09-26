@@ -94,10 +94,22 @@ fn every_witness_entry_point_is_feature_gated() {
     assert!(attr_before(X86_DT, "pub(crate) fn boot_tss_io_map_facts()").contains(GATE));
     for (name, src, call) in [
         ("rsdp capture", X86_BOOT, "uart_irq_witness::capture_rsdp("),
-        ("route + provisioning", X86_BOOT, "uart_irq_witness::derive_route()"),
+        (
+            "route + provisioning",
+            X86_BOOT,
+            "uart_irq_witness::derive_route()",
+        ),
         ("enable", BOOT_ENTRY, "uart_irq_witness::enable_source()"),
-        ("entry hook", X86_DT, "uart_irq_witness::note_entry_and_drain("),
-        ("completion hook", X86_DT, "uart_irq_witness::note_after_dispatch(vector)"),
+        (
+            "entry hook",
+            X86_DT,
+            "uart_irq_witness::note_entry_and_drain(",
+        ),
+        (
+            "completion hook",
+            X86_DT,
+            "uart_irq_witness::note_after_dispatch(vector)",
+        ),
     ] {
         let at = pos(src, call);
         let window = &src[at.saturating_sub(400)..at];
@@ -209,7 +221,10 @@ fn drain_before_output_and_device_first_disable() {
     let entry = body_after(WITNESS, "pub fn note_entry_and_drain(");
     let drain = pos(entry, "inb(COM1 + UART_RBR)");
     let first_log = pos(entry, "crate::yarm_log!(");
-    assert!(drain < first_log, "the RX cause must be withdrawn before the first log line");
+    assert!(
+        drain < first_log,
+        "the RX cause must be withdrawn before the first log line"
+    );
     assert!(entry.contains("self_irr_after_drain"));
     let disable = body_after(WITNESS, "fn disable_source() {");
     assert!(pos(disable, "outb(COM1 + UART_IER, 0);") < pos(disable, "REDIR_MASKED"));
@@ -225,7 +240,13 @@ fn drain_before_output_and_device_first_disable() {
 #[test]
 fn no_new_access_path_reaches_userspace() {
     let c = code(WITNESS);
-    for forbidden in ["map_page(", "map_mmio", "install_device", "io_map_base =", "iopl"] {
+    for forbidden in [
+        "map_page(",
+        "map_mmio",
+        "install_device",
+        "io_map_base =",
+        "iopl",
+    ] {
         assert!(!c.contains(forbidden), "fixture contains {forbidden}");
     }
     assert!(c.contains("platform_layout::IOAPIC_MMIO_BASE"));
@@ -241,15 +262,24 @@ fn return_contracts_are_ring3_only_revalidation_and_preserved_flags() {
     assert!(X86_DT.contains(
         "if matches!(exiting_tid, None | Some(0))\n            && owner_revalidation_admissible(entering_cs)"
     ));
-    assert!(X86_DT.contains("let same_task_async_return = !switched && vector as usize != VEC_SYSCALL;"));
-    assert!(X86_DT.contains("frame.rflags = ring3_return_rflags(frame.rflags, same_task_async_return);"));
+    assert!(
+        X86_DT
+            .contains("let same_task_async_return = !switched && vector as usize != VEC_SYSCALL;")
+    );
+    assert!(
+        X86_DT
+            .contains("frame.rflags = ring3_return_rflags(frame.rflags, same_task_async_return);")
+    );
     assert!(X86_DT.contains("fn owner_revalidation_is_admissible_only_for_ring3_frames()"));
     assert!(X86_DT.contains(
         "fn ring3_return_rflags_keeps_interrupted_flags_only_for_same_task_async_returns()"
     ));
     // The idle loop halts with the one-instruction `sti` shadow, and idle-origin traps never
     // return into it.
-    let park = body_after(X86_DT, "extern \"C\" fn x86_idle_park_loop(cpu: usize) -> ! {");
+    let park = body_after(
+        X86_DT,
+        "extern \"C\" fn x86_idle_park_loop(cpu: usize) -> ! {",
+    );
     assert!(park.contains("core::arch::asm!(\"sti\", \"hlt\""));
     assert!(pos(park, "idle_boundary::park(cpu, rsp)") < pos(park, "\"sti\", \"hlt\""));
 }
@@ -278,16 +308,20 @@ fn kernel_and_receiver_agree_on_selector_ring_and_words() {
     assert!(WITNESS.contains("pub const RING_MAGIC: u32 = 0x4952_5131;"));
     assert!(WITNESS.contains("pub const RING_BYTES_OFFSET: usize = 256;"));
     assert!(RECEIVER.contains("const ISOLATION_LOAD_VA: usize = 0xFFFF_FFFF_FEC0_0000;"));
-    assert!(attr_before(SERVICE, "pub(super) mod uart_irq_witness;").contains(
-        "all(feature = \"x86_64-uart-irq-witness\", target_arch = \"x86_64\")"
-    ));
+    assert!(
+        attr_before(SERVICE, "pub(super) mod uart_irq_witness;")
+            .contains("all(feature = \"x86_64-uart-irq-witness\", target_arch = \"x86_64\")")
+    );
 }
 
 /// The receiver checks GPRs and the carry flag across ring-3 interrupts; XMM is observational
 /// only, reported on its own line, and never graded.
 #[test]
 fn the_receiver_grades_gprs_and_flags_and_only_observes_xmm() {
-    let spin = body_after(RECEIVER, "fn spin_checking_registers(iters: u64, seed: u64) -> u32 {");
+    let spin = body_after(
+        RECEIVER,
+        "fn spin_checking_registers(iters: u64, seed: u64) -> u32 {",
+    );
     let x86 = spin
         .split_once("#[cfg(target_arch = \"x86_64\")]\n    unsafe {")
         .map(|(_, r)| r)
@@ -298,7 +332,10 @@ fn the_receiver_grades_gprs_and_flags_and_only_observes_xmm() {
     assert!(x86.contains("\"stc\"") && x86.contains("\"setc {cf:l}\""));
     assert!(RECEIVER.contains("if bad_mask & 0xffff != 0 {"));
     assert!(RECEIVER.contains("IRQ1_UART_SIMD seq={} mode={} user_simd_mask=0x{:x}"));
-    let recv = body_after(RECEIVER, "fn recv_timeout(cap: u32, timeout: u64) -> Recv {");
+    let recv = body_after(
+        RECEIVER,
+        "fn recv_timeout(cap: u32, timeout: u64) -> Recv {",
+    );
     let x86_recv = recv
         .split_once("#[cfg(target_arch = \"x86_64\")]")
         .map(|(_, r)| r)

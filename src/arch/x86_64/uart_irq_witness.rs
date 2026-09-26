@@ -582,7 +582,10 @@ pub fn note_entry_and_drain(vector: u64, cs: u64, rip: u64, cpu: crate::kernel::
     if witness == 0 || vector != witness || !SOURCE_ENABLED.load(Ordering::Acquire) {
         return;
     }
-    EOI_AT_ENTRY.store(crate::arch::x86_64::irq::lapic_eoi_writes(), Ordering::Release);
+    EOI_AT_ENTRY.store(
+        crate::arch::x86_64::irq::lapic_eoi_writes(),
+        Ordering::Release,
+    );
     let claim = CLAIMS.fetch_add(1, Ordering::AcqRel) + 1;
     ring_store(RING_WORD_CLAIMS, claim);
     let parked = crate::kernel::idle_boundary::is_parked(cpu.0 as usize);

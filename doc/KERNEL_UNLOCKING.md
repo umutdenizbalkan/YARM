@@ -22945,3 +22945,80 @@ idle-boundary debt is the only owner that converts a ring-0 frame into a ring-3 
   the redirection entry masked). Pending timer + device: on data items 3 (idle) and 4 (user) it
   holds the claim, interrupts off and before the EOI, until the LAPIC IRR shows the timer vector
   pending; both then complete, the timer after the device's EOI.
+
+## 4 — evidence
+
+Live (`scripts/qemu-x86_64-uart-irq-witness-smoke.sh`, development boots; hosted and source
+evidence is listed separately below). Graded separately:
+
+* **Route**: MADT read (I/O APIC 0 at `0xfec00000`, base 0, five overrides, none for IRQ 4) → GSI 4
+  edge/high → pin 4 → vector `0x24` → line 4; redirection `0x24` / destination APIC 0 read back;
+  the 8259 input masked; `cpu_if=0` throughout the enable; route bound → tick armed → access →
+  device → source → CPU admission, in that order in the log.
+* **Controller accounting** (interrupts counted separately from bytes): 8 claims at vector `0x24`,
+  each with the LAPIC in-service bit set at entry; per claim, in order, entry → drain → production
+  delivery (`IRQ1_SPLIT_DELIVERY cpu=0 line=4 outcome=delivered`) → completion with
+  `eoi_writes=1`, `lapic_isr_after=0`, Remote-IRR 0, delivery-pending 0. 0 empty drains, 0
+  `no_route`, `self_irr=0` after every drain.
+* **Data**: 8 bytes drained, one per claim, in order `0x41..0x48` (`iir 0x04 → 0x01`, `LSR.DR` clear
+  after); 8 notification probes; the receiver took each item exactly once with label 4 and the
+  exact byte at the exact ring index.
+* **Timer and device together**: on data item 3 (idle origin) and item 4 (user origin) the timer
+  vector was pending in the LAPIC IRR while `0x24` was in service; both completed, and the timer's
+  own path ran afterwards.
+* **Origins**: 4 idle claims — CS `0x08`, `parked=1`, `tid=0`, RIP the instruction after an idle
+  `sti; hlt` (the compiler emits two copies of the loop's halt; every `hlt` in the function directly
+  follows a `sti`), each followed by `SCHED_ENTER_IDLE_HLT` (re-park through the idle path, never
+  an `iretq` into the loop), then progress: the receiver's park expires and it runs the next
+  item. 4 user claims — CS `0x23`, `tid=1`, all four RIPs inside `announce_ready_and_spin`, with
+  every GPR sentinel (`r12..r15, r9, r10`) and CF intact. `EXIT_TASK_OWNER_REVALIDATED` 0.
+* **After the disable** (`IER = 0`, redirection masked, after 8 clean completions): the injected
+  `Z` produces no entry, no delivery, no ring byte; 10/10 timed parks expire; timer ticks and
+  init's own progress continue. No storm.
+* **Isolation**: ring-3 load from `0xFFFF_FFFF_FEC0_0000` → `PAGE_FAULT_UNHANDLED
+  addr=0xfffffffffec00000 access=Read` in a disposable child; anonymous map over it refused; the
+  TSS/IOPL facts above for ports.
+
+Hosted / source evidence (not live): `acpi_madt_rule` (4 tests: q35-shaped MADT, override wins,
+I/O APIC by GSI base, malformed tables answer nothing); `owner_revalidation_admissible` and
+`ring3_return_rflags` (hosted tests in `descriptor_tables`); `tests/x86_64_uart_irq_witness_scope.rs`
+(11 source guards: gating, fixture owns no EOI/delivery/route write, derived route, enable order
+with IF cleared, drain-before-output, no new access path, return contracts, shared ring/selector,
+GPR/flag grading with XMM observational, driver backend). Four existing x86 return-path source
+guards (`stage200d0b3` p14/p30, `stage200d2b1d5a` g04/g06) were re-derived for the new spelling
+with their assertions otherwise unchanged; the AArch64 driver guard now names the third `--arch`.
+
+Negative controls (live mutations, not committed, each reverted; each fails the checker for its
+causal reason):
+
+| control | result |
+|---|---|
+| source masked at the I/O APIC after the enable | byte injected after READY+idle; 0 entries, 0 deliveries; the timer runs on (108 ticks); item 1 never received |
+| wrong delivery identity (redirection vector `0x25`) | decoded as line 5: `line=5 outcome=no_route`, nothing delivered to line 4, the fixture sees no claim; the RX cause is never serviced and re-asserts on every console write, so the source storms (49 127 no-route deliveries) and starves the timer — the failure the drain-first order and the disable exist to prevent |
+| required LAPIC EOI withheld for line 4 | item 1 claimed, drained, delivered; completion reports `eoi_writes=0 lapic_isr_after=1`; `0x24` stays in service and blocks the same-priority-class timer (`0x20`) — 1 tick, the receiver never resumes |
+| (repair control) interrupted RFLAGS reset to `0x202` | every item delivered, but 3 of 4 user items report `regs_mask=0x40` (CF lost) and the receiver fails `regs_bad=3` |
+
+## Remaining limits, and what stays named outside this package
+
+* **User XMM state is not preserved across any x86_64 kernel entry (pre-existing, not repaired).**
+  The kernel is built with SSE and uses XMM registers; trap, interrupt and syscall entries save
+  GPRs only. The witness's `xmm8/xmm9` sentinels came back intact on the paths it exercised, which
+  is an observation about those paths, not a contract. Adding XMM save/restore is FP/context work
+  and out of scope.
+* **Cross-task RFLAGS (pre-existing, named).** The task context (`TrapFrame` /
+  `UserRegisterContext`) carries no RFLAGS, so a task resumed after a switch still gets `0x202`.
+  This package restores the interrupted flags only for a SAME-task asynchronous return.
+* **Port isolation is shown from live state, not probed.** A ring-3 `in`/`out` raises #GP, which
+  decodes as `Unknown` and is fatal under strict unknown-trap handling, so the witness does not
+  execute one; the TSS (`io_map_base = 104 = sizeof(TSS)`, no bitmap) and IOPL 0 are read live.
+  The MMIO side IS probed: a ring-3 load from the I/O APIC window faults, and an anonymous mapping
+  over it is refused.
+* One CPU; no SMP interrupt routing, no AP delivery, no IPI. xAPIC, one I/O APIC pin, one source.
+* The receive door is the witness-build, non-blocking probe; blocking notification receive, the
+  live waiter-wake arm and notification teardown remain untested live.
+* No general UART or interrupt-controller driver: the fixture derives and programs one pin and
+  disables after a fixed count. The MADT reader answers two questions (ISA override, owning
+  I/O APIC) and nothing else.
+* Named and unchanged, outside this package: the x86_64 AP cross-CPU reply/shootdown failure, the
+  ack-lease race, the RISC-V reply-timeout retirement-checker failure, and the AArch64 missing
+  per-task FP/SIMD state.
