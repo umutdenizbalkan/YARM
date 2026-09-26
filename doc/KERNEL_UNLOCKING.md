@@ -22573,3 +22573,126 @@ Unchanged from the first pass and green there: the 12 strict timer runs, the thr
 ordinary-cap cell runs, the six-cell seal, AArch64/RISC-V core, RISC-V ServerDies ×3, x86_64
 ServerDies, and the five previously green AP profiles. `ap-cross-cpu-reply` fails
 `timeout_before_completion` — the known out-of-scope AP defect.
+
+# QEMU-IRQ1 — first real external-interrupt witness: RISC-V UART0 → PLIC → YARM
+
+Base: `1cfeb889aef2b8fec6502e8e47aa4a81f01c4efa`, tree `5ef06333f246461095e0a6d0a1660843dcdcb99f`.
+QEMU 8.2.2, `-machine virt -cpu rv64 -m 512M -smp 1 -bios default` (OpenSBI). One hart: nothing
+here qualifies SMP interrupt delivery.
+
+## 1 — the executed path, derived
+
+From the DTB the executed machine generated (`dumpdtb`; `tests/fixtures/riscv64_qemu_virt_smp1.dtb`
+agrees on these nodes):
+
+| fact | value | source |
+|---|---|---|
+| UART0 | ns16550a at `0x1000_0000` (`0x100`), `interrupts = 10`, parent = PLIC | `/soc/serial@10000000` |
+| PLIC | `0x0C00_0000` (`0x60_0000`), `riscv,ndev = 95` | `/soc/plic@c000000` |
+| contexts | `interrupts-extended = <cpu0 11, cpu0 9>` → context 0 = M-external, **context 1 = S-external** | same |
+| registers touched | priority[10] `0x0C00_0028`, ctx-1 enable word `0x0C00_2080` bit 10, ctx-1 threshold `0x0C20_1000`, ctx-1 claim/complete `0x0C20_1004`, UART RBR/IER/LSR `+0/+1/+5` | sifive,plic-1.0.0 layout |
+| memory type | ISA string has no `svpbmt`: device attributes come from the platform PMA; no PBMT bits are set | cpu node |
+
+The IRQ is 10, not 1, and it is read from the DTB at run time (`find_node_interrupt_by_name_prefix`),
+never copied. Identity is never taken from `stval`.
+
+What stood in the way, each measured on the base:
+
+* **No mapping.** The kernel runs under the user root `satp`; the only kernel mapping every root
+  carried was the RAM gigapage (root slot 2). The PLIC and UART sit below RAM, so the claim
+  register was unreachable in every address space a trap can be taken in — and the readiness
+  answer was a static range test that could never change.
+* **No S-origin admission.** Only the idle timer was admitted from S-mode; an external interrupt
+  at the idle `wfi` would halt `trap_from_s_mode`.
+* **No enable, no binding.** `sie.SEIE`, PLIC priority and enable were never written;
+  `bind_irq_notification` had no caller, so `irq_routes` was empty.
+* **No receiver interface.** Both NR 2/NR 5 routes — the split one and the canonical handler it
+  mirrors (`validate_endpoint_right`) — answer `WrongObject` for a notification capability. No
+  userspace can receive from a notification on any production build.
+
+Owners: claim — the trap entry owner (bridge for U-origin; §2 adds the idle entry); settlement —
+`settle_riscv_external_claim` → `settle_external_interrupt_at_bridge` → `deliver_external_irq_split`
+(`irq_routes` → `NotificationObject::send_irq` → exact waiter wake) → the one completion owner.
+
+## 2 — mappings, readiness, admission, and a defect in the idle boundary
+
+* **Device window** (`page_table::install_device_window`): root slot 255 (`0x3F_C000_0000`, above
+  every user-mappable address), one L1 + one L0 shared by every root and tracked by none — so
+  `remove_asid_root` can never free it — leaves `V|R|W|A|D|G`, no `U`, no `X`. Installed at the
+  idle safe point into every existing root, and into every later root by `ensure_asid`, the one
+  place roots are born. Pages: priority, context-1 enable, context-1 threshold/claim, UART.
+* **Readiness is a walk** (`arch::device_window_rule::device_pa_reachable`, arch-neutral so the
+  hosted suite executes it): `satp` → root → L1 → a 4 KiB leaf that is `V|R|W`, not `U`, not `X`,
+  naming exactly the page. The claim reads at the address the walk returned; the completion writes
+  through the window layout (no second walk). No window → `MmioUnreachable`, from the tables, and
+  the register is never touched to find out.
+* **Idle-origin admission** (witness builds only): interrupt bit, cause 9, `SPP = S`, idle latch
+  armed, a source enabled. `riscv_s_mode_external_trap` is that origin's entry owner — one claim,
+  carried through `handle_riscv_trap_entry_shared`, return to the `wfi`. The screen still halts
+  every other S-mode trap; no exception can pass either predicate.
+* **Defect found and repaired — the idle boundary was not what it claimed.** The contract was
+  "the only S-mode code interruptible with `SIE` set is the idle `wfi`". `reestablish_idle_boundary`
+  set `SIE` and then *returned* — through its epilogue, the bridge's frame, `riscv_trap_halt`'s
+  prologue and its marker print. An accepted S-mode trap runs on the trap stack from its top and
+  overwrites those frames. The witness hit it twice: a hang (the interrupt landed while
+  `riscv_trap_halt`'s marker held `EARLY_MARKER_LOCK`; the handler's own marker spun forever) and,
+  on item 5, an idle interrupt taken at `sepc=0x8026ae9e` — outside the `wfi` — whose return
+  jumped to a garbage PC (`scause=2 sepc=0x85b6380a`). The timer was exposed to the same window at
+  a lower rate. Repair: the boundary now only *requests* the unmask; the single point that sets
+  `SIE` is `set_sstatus_sie_in_wfi_loop`, a stack-free `csrrs; wfi; j` asm loop entered from
+  `halt_wait_loop`; and `early_sbi_marker` masks S-mode interrupts across its line lock. Every
+  idle-origin interrupt since lands inside `halt_wait_loop`.
+
+Init order: window → readiness walk (every register) → route bound (existing owner) → threshold,
+priority → drain stale RX, PLIC enable bit, `IER.ERBFI` → `sie.SEIE`.
+
+## 3 — producer and consumer
+
+* **Producer**: `scripts/qemu-riscv64-uart-irq-driver.py` owns UART0's only backend — a UNIX
+  socket chardev, `wait=on`, `-monitor none`, no multiplexing. It injects `0x40+seq` only after
+  `IRQ1_UART_READY seq=…`, and for idle items only after the kernel reports the hart idle. One
+  item outstanding.
+* **Consumer**: init's selector-30 cell (`init/uart_irq_witness.rs`). Provisioning uses the existing
+  owners — `create_notification`, `bind_irq_notification` (DTB line), a RECEIVE cap into init, a
+  private park endpoint, and one page mapped USER read-only as the byte ring.
+* **Receive interface**: witness builds only, NR 5 with `timeout == 0` on a notification cap for a
+  user receiver with recv-v2 metadata takes `NotificationObject::recv` and answers through the
+  endpoint probe's own user-copy completion. Without the feature NR 5 is byte-identical and
+  endpoint-only (no ABI change). The receiver never parks on the notification, so the
+  delivery owner's waiter-wake arm is not exercised live.
+* **Drain**: `settle_riscv_external_claim` drains `LSR.DR`/`RBR` for the claim's own source
+  before delivery and completion, so the level drops before the gateway is re-armed. After the 8th
+  data-bearing completion the fixture disables the source (`IER = 0`, enable bit cleared).
+
+## 4 — evidence
+
+Live (`scripts/qemu-riscv64-uart-irq-witness-smoke.sh`, development boot): 8 items, 4 idle-origin
+and 4 user-origin; claims = completions = one-byte drains = deliveries = notification probes = 8;
+0 NoPending, 0 Unavailable, 0 foreign; each item received once with label 10 and the exact byte;
+all idle `sepc` inside `halt_wait_loop`; 3 of 4 user `sepc` inside the register-checked block
+(READY `ecall` + spin with six live sentinels), `regs_bad=0`; after the disable 0 entries, 0
+claims, the post-disable byte stays undelivered, 10/10 timed parks, 1320 tick lines and 80
+supervisor loop ticks. Isolation: a child's U-mode load from the claim register's window VA takes
+`PAGE_FAULT_UNHANDLED addr=0x3fc0002004 access=Read`; `VmAnonMap` over the window is refused.
+
+Negative controls (live mutations, not committed, each reverted):
+
+| control | result |
+|---|---|
+| PLIC enable bit never set | `enable_word=0x0`; byte injected, 0 interrupts; item 1 times out |
+| delivery given the wrong identity (claimed 10 presented as 11) | `outcome=no_route` for line 11; no notification; the real claim still completed once; item 1 times out |
+| completion withheld | item 1 delivered end to end; item 2's byte produces no second claim; item 2 times out |
+
+Model/hosted (labelled as such): `device_window_rule` tests fabricate page tables and show the
+readiness rule refuses no-window, bare, `U`, `X`, read-only, wrong-page, unnamed, page-crossing
+and superpage shapes; the admission rule refuses every exception and every missing condition;
+the `external_irq_claim` controller model keeps its claim/completion accounting.
+
+## Remaining limits
+
+* One hart; no SMP interrupt qualification, no AP delivery, no IPI.
+* The receive door is a witness-build, non-blocking probe. A blocking notification receive (and so
+  the live waiter-wake arm) has no production route; the notification teardown path remains
+  hosted-proven only — the witness never destroys or revokes its notification.
+* The fixture disables after a fixed item count; there is no general UART driver.
+* RISC-V only; x86_64 and AArch64 external interrupts are unchanged.

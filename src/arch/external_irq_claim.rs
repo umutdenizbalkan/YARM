@@ -50,10 +50,12 @@ pub enum PlicUnavailableReason {
     /// The claim/complete register is not mapped under the address space that was active when
     /// the trap was taken, so reading it would raise a supervisor load fault.
     ///
-    /// On QEMU virt this is the ordinary state, not an error: the PLIC window (`0x0C00_0000`)
-    /// sits below RAM, and the only kernel mapping every user ASID carries is the shared
-    /// gigapage at `0x8000_0000`. Naming it is what lets the claim refuse instead of faulting
-    /// into `riscv_trap_halt("trap_from_s_mode")`.
+    /// On QEMU virt this is the ordinary state of a build without the UART witness, not an error:
+    /// the PLIC window (`0x0C00_0000`) sits below RAM, and nothing installs the kernel-only device
+    /// window (`page_table::install_device_window`) that would map it. QEMU-IRQ1: the answer is
+    /// derived by walking the active translation, so it becomes "reachable" exactly when that
+    /// window is really present. Naming it is what lets the claim refuse instead of faulting into
+    /// `riscv_trap_halt("trap_from_s_mode")`.
     MmioUnreachable,
 }
 
