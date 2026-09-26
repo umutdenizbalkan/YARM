@@ -74,9 +74,16 @@ macro_rules! trap_trace { ($($arg:tt)*) => { aarch64_trap_trace(format_args!($($
 ///
 /// So the halt is [`yarm_aarch64_idle_wfi_window`], a stack-free leaf: `wfi` with the mask SET
 /// (it still wakes on a pending interrupt; it just does not take it), then `daifclr` — where the
-/// interrupt that woke it is taken, with `ELR_EL1` on the following `daifset` — then `daifset`,
-/// `ret`. Every wait is masked, every interrupt at the boundary is taken at that one point right
-/// after a fresh `park()`, and none can be taken in Rust code.
+/// interrupt that woke it is taken, with `ELR_EL1` on the following `daifset` (the
+/// `yarm_aarch64_idle_wfi_take` label) — then `daifset`, `ret`. Every wait is masked, and none can
+/// be taken in Rust code.
+///
+/// One case remains, and it is closed at the other end. When two interrupts are pending as the
+/// mask opens — measured: the timer and the PL011, the timer taken first by priority — the first
+/// spends the park authorization and returns to the take point with `I` clear, and the second is
+/// taken on that very instruction, unauthenticated. So the vector tail returns to the take point
+/// MASKED (`kernel::idle_boundary::aarch64_take_point_return_spsr`): the leaf re-masks and returns, the loop re-parks, and
+/// the second interrupt is taken at the next opening, authenticated.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 extern "C" fn aarch64_idle_park_loop(cpu: usize) -> ! {
     loop {
@@ -103,6 +110,15 @@ extern "C" fn aarch64_idle_park_loop(cpu: usize) -> ! {
     }
 }
 
+/// The idle leaf's take point, as an address.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub fn idle_take_point() -> u64 {
+    unsafe extern "C" {
+        static yarm_aarch64_idle_wfi_take: u8;
+    }
+    (&raw const yarm_aarch64_idle_wfi_take) as u64
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 unsafe extern "C" {
     /// The idle boundary's halt: `wfi; daifclr #3; daifset #3; ret` — wait masked, take the waking
@@ -122,6 +138,8 @@ core::arch::global_asm!(
 yarm_aarch64_idle_wfi_window:
     wfi
     msr daifclr, #0x3
+    .global yarm_aarch64_idle_wfi_take
+yarm_aarch64_idle_wfi_take:
     msr daifset, #0x3
     ret
     .size yarm_aarch64_idle_wfi_window, . - yarm_aarch64_idle_wfi_window

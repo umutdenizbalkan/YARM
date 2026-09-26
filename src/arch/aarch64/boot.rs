@@ -7246,6 +7246,14 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         #[cfg(feature = "aarch64-pl011-irq-witness")]
         crate::arch::aarch64::pl011_irq_witness::note_completion_written(ack);
     }
+    // QEMU-IRQ2 §2: a return to the idle leaf's take point goes back MASKED, so a second
+    // interrupt that was pending alongside this one is taken only after the loop re-parks — never
+    // on the take point with the park authorization this trap already spent.
+    frame.spsr_el1 = crate::kernel::idle_boundary::aarch64_take_point_return_spsr(
+        frame.spsr_el1,
+        frame.elr_el1,
+        crate::arch::aarch64::trap::idle_take_point(),
+    );
     match kind {
         1 => crate::arch::aarch64::console::write_line(
             "YARM_AARCH64_EXCEPTION_KIND sync_current_sp0",

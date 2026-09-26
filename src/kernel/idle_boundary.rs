@@ -237,3 +237,58 @@ pub fn reset_for_test(cpu: usize) {
     USER_RETURN_COUNT[cpu].store(0, Ordering::Relaxed);
     PARK_SP_LOW[cpu].store(u64::MAX, Ordering::Release);
 }
+
+/// QEMU-IRQ2 §2 — the `SPSR_EL1` an AArch64 exception must return with, given where it returns.
+///
+/// The AArch64 idle leaf waits masked and opens the mask for one instruction; the interrupt that
+/// woke it is taken with `ELR_EL1` on the instruction after the unmask — the TAKE POINT. When two
+/// interrupts are pending as the mask opens, the first spends this CPU's park authorization, and
+/// a return to the take point with `I` clear would take the second on that same instruction,
+/// unauthenticated. So a return to the take point in EL1h keeps everything except the `I` and
+/// `F` masks, which are set: the leaf re-masks and returns, the loop re-parks, and the second
+/// interrupt is taken at the next opening, authenticated.
+///
+/// Every other return is untouched: EL0 (including a frame the idle-boundary user return already
+/// converted to EL0t), EL1 at any other address, and a zero take point (none installed).
+pub fn aarch64_take_point_return_spsr(spsr_el1: u64, elr_el1: u64, take_point: u64) -> u64 {
+    const SPSR_M_MASK: u64 = 0xf;
+    const SPSR_M_EL1H: u64 = 0b0101;
+    const SPSR_I: u64 = 1 << 7;
+    const SPSR_F: u64 = 1 << 6;
+    if take_point != 0 && elr_el1 == take_point && spsr_el1 & SPSR_M_MASK == SPSR_M_EL1H {
+        spsr_el1 | SPSR_I | SPSR_F
+    } else {
+        spsr_el1
+    }
+}
+
+#[cfg(test)]
+mod take_point_tests {
+    use super::aarch64_take_point_return_spsr as rule;
+
+    const TAKE: u64 = 0x4013_79f8;
+
+    /// The measured case: EL1h at the take point, `I` and `F` clear (`0x2000_0305`) — returns
+    /// masked, every other bit kept.
+    #[test]
+    fn a_return_to_the_take_point_in_el1h_is_masked() {
+        assert_eq!(rule(0x2000_0305, TAKE, TAKE), 0x2000_03c5);
+        assert_eq!(rule(0x8000_0305, TAKE, TAKE), 0x8000_03c5);
+        // Already masked stays masked.
+        assert_eq!(rule(0x3c5, TAKE, TAKE), 0x3c5);
+    }
+
+    #[test]
+    fn every_other_return_is_untouched() {
+        // EL0t, including the idle-boundary user return's converted frame (SPSR 0).
+        assert_eq!(rule(0x0, TAKE, TAKE), 0x0);
+        assert_eq!(rule(0x6000_0000, TAKE, TAKE), 0x6000_0000);
+        // EL1h anywhere else — the boot window, the wait itself.
+        assert_eq!(rule(0x305, TAKE - 4, TAKE), 0x305);
+        assert_eq!(rule(0x305, TAKE + 4, TAKE), 0x305);
+        // EL1t (SP_EL0) at the take point is not the idle leaf's state.
+        assert_eq!(rule(0x304, TAKE, TAKE), 0x304);
+        // No take point installed.
+        assert_eq!(rule(0x305, 0, 0), 0x305);
+    }
+}

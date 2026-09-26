@@ -169201,7 +169201,7 @@ mod u9exit4_post_clear_totality {
         let insns: alloc::vec::Vec<&str> = window
             .lines()
             .map(str::trim)
-            .filter(|l| !l.is_empty())
+            .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
             .collect();
         assert_eq!(
             insns,

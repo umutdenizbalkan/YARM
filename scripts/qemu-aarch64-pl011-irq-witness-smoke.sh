@@ -13,7 +13,8 @@
 # One boot built with `aarch64-pl011-irq-witness`. The host driver
 # (scripts/qemu-riscv64-uart-irq-driver.py --arch aarch64) owns the PL011's only serial backend —
 # a UNIX socket, no monitor, no multiplexing — and injects one byte per item only after the
-# guest's READY line (and, for idle items, after the kernel reports it is entering its idle loop).
+# guest's READY line (and, for idle items, after a timer tick has settled back to the idle loop with
+# nothing runnable).
 # This script grades what the boot log shows; it never retries.
 #
 # Graded, each separately:

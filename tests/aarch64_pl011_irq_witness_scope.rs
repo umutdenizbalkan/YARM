@@ -275,7 +275,7 @@ fn the_idle_halt_is_a_masked_wait_then_a_one_instruction_take() {
     let insns: Vec<&str> = leaf
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
         .collect();
     assert_eq!(
         insns,
@@ -292,6 +292,14 @@ fn the_idle_halt_is_a_masked_wait_then_a_one_instruction_take() {
     assert!(!code(park_loop).contains("daifclr"));
     // The grader places idle ELR at the take point.
     assert!(GRADER.contains("(( pc == ws + 8 ))"));
+    // The take point is labelled, and the vector tail returns to it MASKED — after the one
+    // completion, through the arch-neutral rule the hosted suite executes.
+    assert!(leaf.contains("yarm_aarch64_idle_wfi_take:\n    msr daifset, #0x3"));
+    let entry = body_after(A64_BOOT, "extern \"C\" fn yarm_aarch64_vector_entry(");
+    let complete = pos(entry, "irq::complete_interrupt(ack);");
+    let masked = pos(entry, "idle_boundary::aarch64_take_point_return_spsr(");
+    assert!(complete < masked);
+    assert!(entry.contains("crate::arch::aarch64::trap::idle_take_point()"));
 }
 
 /// One receiver, one ring layout, one selector for both ports.
@@ -350,7 +358,9 @@ fn the_driver_uses_a_dedicated_backend_and_acknowledgements() {
     assert!(DRIVER.contains("\"-cpu\", \"cortex-a72\""));
     assert!(DRIVER.contains("\"-m\", \"1024M\", \"-smp\", \"1\""));
     assert!(DRIVER.contains("socket,id=uart0,path={sock_path},server=on,wait=on"));
-    assert!(DRIVER.contains("IDLE_RE_AARCH64 = re.compile(rb\"SCHED_ENTER_IDLE_HLT\")"));
+    assert!(DRIVER.contains(
+        "IDLE_RE_AARCH64 = re.compile(rb\"TIMER_IDLE_ADVANCE_SETTLED cpu=0 incoming=none reason=idle settlement=kernel_idle\")"
+    ));
     assert!(!DRIVER.contains("mux=on") && !DRIVER.contains("-nographic"));
     assert!(!DRIVER.contains("time.sleep(0.5") && !DRIVER.contains("time.sleep(1"));
 }

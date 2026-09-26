@@ -22765,16 +22765,29 @@ window between the timer's unmask and the first return to EL0. Kernel faults are
   Measured: one of four PL011 idle claims arrived `parked=0`, `ELR` on the `wfi`. The halt is now
   `yarm_aarch64_idle_wfi_window`, a sized, stack-free leaf — `wfi` (masked; it still wakes), `msr
   daifclr, #3` (the one point an interrupt is taken, `ELR` = the next instruction), `msr daifset,
-  #3`, `ret`. Every wait is masked, and every idle interrupt is taken right after a fresh `park()`.
-  The timer's idle path is otherwise unchanged; the U9-TIMER5 guards were re-derived for the new
-  spelling (unmask follows the wait; re-mask follows the take).
+  #3`, `ret`. Every wait is masked.
+* **The last hole, found by qualification.** The first frozen tree failed one of three strict
+  boots: at the first idle park the timer (priority `0x00`) and the PL011 (`0x80`) were both
+  pending as the mask opened; the timer was taken first, spent the park authorization
+  (`TIMER_IDLE_ADVANCE_DRAIN_BEGIN authenticated=1`), and returned to the take point with `I`
+  clear — so the PL011 was taken on that same instruction with `parked=0`. The take point is now
+  labelled (`yarm_aarch64_idle_wfi_take`), and the vector tail returns there MASKED
+  (`idle_boundary::aarch64_take_point_return_spsr`, arch-neutral and hosted-tested: EL1h at the
+  take point gains `I|F`, every other return — EL0, EL0t-converted, EL1 elsewhere — is
+  untouched). The leaf re-masks and returns, the loop re-parks, and the second interrupt is taken
+  at the next opening, authenticated. The timer's idle path is otherwise unchanged; the U9-TIMER5
+  guards were re-derived for the new spelling (unmask follows the wait; re-mask follows the take).
 
 ## 3 — producer, receiver, and what is shared with IRQ1
 
 * **Producer**: `scripts/qemu-riscv64-uart-irq-driver.py --arch aarch64` — the same driver, the
   PL011's only backend a UNIX socket (`wait=on`, `-monitor none`, no multiplexing). It injects
-  `0x40+seq` only after `IRQ1_UART_READY seq=…`, and for idle items only after
-  `SCHED_ENTER_IDLE_HLT`. One item outstanding; no sleeps pace injection.
+  `0x40+seq` only after `IRQ1_UART_READY seq=…`, and for idle items only after a timer tick has
+  settled back to the idle loop with nothing runnable (`TIMER_IDLE_ADVANCE_SETTLED … settlement=
+  kernel_idle`). Pacing on the idle ENTRY line was measured to be stale: another task's own
+  deadline was resumed by the tick in flight when the byte arrived, and the interrupt was taken
+  from that task's EL0 (correctly delivered, but not at the idle boundary). One item outstanding;
+  no sleeps pace injection.
 * **Receiver**: IRQ1's selector-30 cell, now compiled for either port. Its per-port parts are the
   syscall instruction, the register-checked spin (AArch64: `x9..x14` and `d0, d1, d16, d17`
   sentinels, the READY `svc` inside the checked block) and the isolation addresses (PL011 flag

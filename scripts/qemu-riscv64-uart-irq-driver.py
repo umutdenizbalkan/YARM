@@ -29,8 +29,12 @@ Exit status: 0 when the witness's final line was seen, 2 on timeout, 3 if QEMU e
 driver does not grade; the smoke script does.
 
 AArch64 (`--arch aarch64`): QEMU `virt`, `cortex-a72`, 1024M, `-smp 1` — the core smoke's machine
-at one CPU — whose only serial port is the PL011 at 0x0900_0000. The idle acknowledgement is
-`SCHED_ENTER_IDLE_HLT`, which the kernel prints on its way into the parked `wfi` loop.
+at one CPU — whose only serial port is the PL011 at 0x0900_0000. The idle acknowledgement is a
+timer tick that has just settled back to the idle loop with nothing runnable
+(`TIMER_IDLE_ADVANCE_SETTLED ... settlement=kernel_idle`), not the idle ENTRY line: other tasks
+wake on their own deadlines, and a byte injected on a stale "entered idle" can arrive while a tick
+is resuming one of them. After a tick that found nothing to run, the CPU is idle for the whole
+next period.
 
 Usage: qemu-riscv64-uart-irq-driver.py [--arch riscv64|aarch64] --kernel K --initrd I --log L
        [--timeout S] [--no-inject]
@@ -48,7 +52,7 @@ import time
 
 READY_RE = re.compile(rb"IRQ1_UART_READY seq=(\d+) mode=(idle|user) expect=0x([0-9a-f]{2})")
 IDLE_RE = re.compile(rb"RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io|RISCV_S_MODE_TIMER_RESUME_IDLE")
-IDLE_RE_AARCH64 = re.compile(rb"SCHED_ENTER_IDLE_HLT")
+IDLE_RE_AARCH64 = re.compile(rb"TIMER_IDLE_ADVANCE_SETTLED cpu=0 incoming=none reason=idle settlement=kernel_idle")
 DISABLED_RE_AARCH64 = re.compile(rb"IRQ2_PL011_SOURCE_DISABLED ")
 DONE_RE = re.compile(rb"IRQ1_UART_WITNESS items=")
 DISABLED_RE = re.compile(rb"IRQ1_UART_SOURCE_DISABLED ")
