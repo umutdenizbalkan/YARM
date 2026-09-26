@@ -7,6 +7,14 @@ pub mod context_switch;
 pub mod dtb;
 pub mod irq;
 pub mod page_table;
+/// QEMU-IRQ2 — the PL011 external-interrupt witness fixture. Compiled only with
+/// `aarch64-pl011-irq-witness`; no default or production profile carries it.
+#[cfg(all(
+    feature = "aarch64-pl011-irq-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64"
+))]
+pub mod pl011_irq_witness;
 pub mod platform_layout;
 pub mod syscall_abi;
 pub mod trap;

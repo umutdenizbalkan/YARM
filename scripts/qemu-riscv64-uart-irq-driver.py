@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Umut Deniz Balkan
-"""QEMU-IRQ1 host driver: the PRODUCER for the RISC-V UART external-interrupt witness.
+"""QEMU-IRQ1 host driver: the PRODUCER for the RISC-V UART external-interrupt witness, and since
+QEMU-IRQ2 (`--arch aarch64`) for the AArch64 PL011 witness. The receiver protocol is the same on
+both ports; only the QEMU machine line and the kernel's idle acknowledgement differ.
 
 Runs one QEMU `virt` boot whose only serial port (UART0, the ns16550a at 0x1000_0000) is a
 dedicated UNIX-socket chardev. There is no monitor (`-monitor none`) and no console multiplexing:
@@ -26,7 +28,12 @@ the byte stream where it happened.
 Exit status: 0 when the witness's final line was seen, 2 on timeout, 3 if QEMU exited first. The
 driver does not grade; the smoke script does.
 
-Usage: qemu-riscv64-uart-irq-driver.py --kernel K --initrd I --log L [--timeout S] [--no-inject]
+AArch64 (`--arch aarch64`): QEMU `virt`, `cortex-a72`, 1024M, `-smp 1` — the core smoke's machine
+at one CPU — whose only serial port is the PL011 at 0x0900_0000. The idle acknowledgement is
+`SCHED_ENTER_IDLE_HLT`, which the kernel prints on its way into the parked `wfi` loop.
+
+Usage: qemu-riscv64-uart-irq-driver.py [--arch riscv64|aarch64] --kernel K --initrd I --log L
+       [--timeout S] [--no-inject]
 """
 
 import argparse
@@ -41,6 +48,8 @@ import time
 
 READY_RE = re.compile(rb"IRQ1_UART_READY seq=(\d+) mode=(idle|user) expect=0x([0-9a-f]{2})")
 IDLE_RE = re.compile(rb"RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io|RISCV_S_MODE_TIMER_RESUME_IDLE")
+IDLE_RE_AARCH64 = re.compile(rb"SCHED_ENTER_IDLE_HLT")
+DISABLED_RE_AARCH64 = re.compile(rb"IRQ2_PL011_SOURCE_DISABLED ")
 DONE_RE = re.compile(rb"IRQ1_UART_WITNESS items=")
 DISABLED_RE = re.compile(rb"IRQ1_UART_SOURCE_DISABLED ")
 POST_RE = re.compile(rb"IRQ1_UART_POSTDISABLE_READY")
@@ -50,28 +59,39 @@ POST_BYTE = ord("Z")
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--arch", choices=["riscv64", "aarch64"], default="riscv64")
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--initrd", required=True)
     ap.add_argument("--log", required=True)
     ap.add_argument("--timeout", type=float, default=240.0)
     ap.add_argument("--tail", type=float, default=15.0,
                     help="seconds to keep capturing after the witness's final line")
-    ap.add_argument("--cmdline", default="console=ttyS0 rdinit=/init")
-    ap.add_argument("--qemu", default="qemu-system-riscv64")
+    ap.add_argument("--cmdline", default=None)
+    ap.add_argument("--qemu", default=None)
     ap.add_argument("--no-inject", action="store_true",
                     help="negative control: answer no READY (the producer is withheld)")
     args = ap.parse_args()
 
     sockdir = tempfile.mkdtemp(prefix="yarm-irq1-")
     sock_path = os.path.join(sockdir, "uart0.sock")
-    cmd = [
-        args.qemu, "-machine", "virt", "-cpu", "rv64", "-m", "512M", "-smp", "1",
+    serial = [
         "-display", "none", "-monitor", "none", "-no-reboot",
         "-chardev", f"socket,id=uart0,path={sock_path},server=on,wait=on",
         "-serial", "chardev:uart0",
-        "-bios", "default", "-kernel", args.kernel, "-initrd", args.initrd,
-        "-append", args.cmdline,
     ]
+    if args.arch == "aarch64":
+        idle_re, disabled_re = IDLE_RE_AARCH64, DISABLED_RE_AARCH64
+        cmd = [args.qemu or "qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72",
+               "-m", "1024M", "-smp", "1", *serial,
+               "-kernel", args.kernel, "-initrd", args.initrd]
+        if args.cmdline:
+            cmd += ["-append", args.cmdline]
+    else:
+        idle_re, disabled_re = IDLE_RE, DISABLED_RE
+        cmd = [args.qemu or "qemu-system-riscv64", "-machine", "virt", "-cpu", "rv64",
+               "-m", "512M", "-smp", "1", *serial,
+               "-bios", "default", "-kernel", args.kernel, "-initrd", args.initrd,
+               "-append", args.cmdline or "console=ttyS0 rdinit=/init"]
     log = open(args.log, "wb")
     log.write(("#HOST_QEMU " + " ".join(cmd) + "\n").encode())
     qemu = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -154,12 +174,12 @@ def main() -> int:
                 else:
                     pending_idle = (seq, byte)
                 continue
-            if pending_idle is not None and IDLE_RE.search(line):
+            if pending_idle is not None and idle_re.search(line):
                 seq, byte = pending_idle
                 pending_idle = None
                 inject(byte, f"seq={seq} mode=idle ack=ready+idle")
                 continue
-            if DISABLED_RE.search(line):
+            if disabled_re.search(line):
                 disabled_seen = True
             if POST_RE.search(line) and not post_injected and not args.no_inject:
                 if disabled_seen:

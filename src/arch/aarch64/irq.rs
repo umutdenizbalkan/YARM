@@ -91,8 +91,8 @@ pub fn try_configure_gic_from_description(description: &[u8]) -> bool {
 
 #[cfg(any(test, target_arch = "aarch64"))]
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-fn gic_write_eoir(base: usize, irq_line: u16) {
-    gic_write_u32(base, GICC_EOIR_OFFSET, irq_line as u32);
+fn gic_write_eoir(base: usize, token: u32) {
+    gic_write_u32(base, GICC_EOIR_OFFSET, token);
 }
 
 #[cfg(any(test, target_arch = "aarch64"))]
@@ -247,19 +247,53 @@ pub fn enable_bsp_arch_timer_ppi() -> bool {
 ///
 /// `None` means no controller is configured, in which case nothing was claimed and nothing may
 /// be completed.
+///
+/// QEMU-IRQ2 §2: the claim is the WHOLE acknowledge token, not just its INTID. GICv2's
+/// `GICC_EOIR` must be written with the value `GICC_IAR` returned — for an SGI that includes the
+/// requesting CPU in bits [12:10] — so the token travels from this read to [`complete_interrupt`]
+/// unchanged, and only dispatch looks at the INTID.
 #[cfg(any(test, target_arch = "aarch64"))]
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-pub fn claim_interrupt() -> Option<u16> {
+pub fn claim_interrupt() -> Option<GicAck> {
     if !GIC_CONFIGURED.load(Ordering::Relaxed) {
         return None;
     }
-    let iar = gic_read_iar(GIC_CPU_IF_BASE.load(Ordering::Relaxed));
-    Some((iar & GIC_INTID_MASK) as u16)
+    Some(GicAck(gic_read_iar(
+        GIC_CPU_IF_BASE.load(Ordering::Relaxed),
+    )))
 }
 
 #[cfg(all(not(test), not(target_arch = "aarch64")))]
-pub fn claim_interrupt() -> Option<u16> {
+pub fn claim_interrupt() -> Option<GicAck> {
     None
+}
+
+/// `true` once a claim can be taken: a CPU-interface base is recorded and the interface enabled.
+#[cfg(any(test, target_arch = "aarch64"))]
+#[cfg_attr(not(feature = "aarch64-pl011-irq-witness"), allow(dead_code))]
+pub fn controller_configured() -> bool {
+    GIC_CONFIGURED.load(Ordering::Relaxed)
+}
+
+/// One GICv2 acknowledgement: the raw `GICC_IAR` value a claim returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GicAck(u32);
+
+impl GicAck {
+    /// The token exactly as `GICC_IAR` returned it — what `GICC_EOIR` is owed.
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// The interrupt identity, bits [9:0]. Special INTIDs (1020..=1023) included.
+    pub fn intid(self) -> u16 {
+        (self.0 & 0x3ff) as u16
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(raw: u32) -> Self {
+        Self(raw)
+    }
 }
 
 /// `true` for the GICv2 special INTIDs (1020..=1023). A claim that yields one of these must not
@@ -276,20 +310,22 @@ pub fn intid_is_special(intid: u16) -> bool {
     }
 }
 
-/// Completes a previously claimed INTID by writing `GICC_EOIR`. Exactly one completion per
-/// claim, and only after the interrupt's source has been deasserted.
+/// Completes a previously claimed interrupt by writing its acknowledge token back to
+/// `GICC_EOIR`. Exactly one completion per claim, and only after the interrupt's source has been
+/// deasserted. With `GICC_CTLR.EOImode == 0` (never set on this port) the write is both the
+/// priority drop and the deactivation.
 #[cfg(any(test, target_arch = "aarch64"))]
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
-pub fn complete_interrupt(intid: u16) {
-    if !GIC_CONFIGURED.load(Ordering::Relaxed) || intid_is_special(intid) {
+pub fn complete_interrupt(ack: GicAck) {
+    if !GIC_CONFIGURED.load(Ordering::Relaxed) || intid_is_special(ack.intid()) {
         return;
     }
-    gic_write_eoir(GIC_CPU_IF_BASE.load(Ordering::Relaxed), intid);
+    gic_write_eoir(GIC_CPU_IF_BASE.load(Ordering::Relaxed), ack.raw());
 }
 
 #[cfg(all(not(test), not(target_arch = "aarch64")))]
-pub fn complete_interrupt(intid: u16) {
-    let _ = intid;
+pub fn complete_interrupt(ack: GicAck) {
+    let _ = ack;
 }
 
 #[derive(Clone, Copy)]
@@ -347,7 +383,7 @@ pub fn external_irq_eoi(irq_line: u16) {
     if !GIC_CONFIGURED.load(Ordering::Relaxed) {
         return;
     }
-    gic_write_eoir(GIC_CPU_IF_BASE.load(Ordering::Relaxed), irq_line);
+    gic_write_eoir(GIC_CPU_IF_BASE.load(Ordering::Relaxed), irq_line as u32);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "aarch64")))]
@@ -568,7 +604,7 @@ mod tests {
         regs[GICC_IAR_OFFSET / WORD] = ARCH_TIMER_PPI_INTID as u32;
 
         let claimed = claim_interrupt().expect("a configured controller claims");
-        assert_eq!(claimed, ARCH_TIMER_PPI_INTID);
+        assert_eq!(claimed.intid(), ARCH_TIMER_PPI_INTID);
         assert_eq!(
             regs[GICC_EOIR_OFFSET / WORD],
             0,
@@ -583,6 +619,33 @@ mod tests {
         );
     }
 
+    /// QEMU-IRQ2 §2 — the completion writes back the WHOLE acknowledge token. For an SGI the
+    /// requesting CPU sits in bits [12:10]; dropping it would complete a different interrupt
+    /// instance than the one claimed. Dispatch still sees only the INTID.
+    #[test]
+    fn completion_writes_back_the_whole_acknowledge_token() {
+        let mut regs = [0u32; 64];
+        let base = regs.as_mut_ptr() as usize;
+        GIC_CPU_IF_BASE.store(base, Ordering::Relaxed);
+        GIC_CONFIGURED.store(true, Ordering::Relaxed);
+        let sgi_from_cpu3 = (3u32 << 10) | 5;
+        regs[GICC_IAR_OFFSET / WORD] = sgi_from_cpu3;
+
+        let claimed = claim_interrupt().expect("a configured controller claims");
+        assert_eq!(claimed.intid(), 5);
+        assert_eq!(claimed.raw(), sgi_from_cpu3);
+        complete_interrupt(claimed);
+        assert_eq!(regs[GICC_EOIR_OFFSET / WORD], sgi_from_cpu3);
+
+        // An SPI's token is its INTID: the PL011's INTID 33 round-trips unchanged.
+        let spi = GicAck::from_raw_for_test(33);
+        assert_eq!((spi.intid(), spi.raw()), (33, 33));
+        // A spurious token completes nothing even with stray upper bits.
+        regs[GICC_EOIR_OFFSET / WORD] = 0;
+        complete_interrupt(GicAck::from_raw_for_test((1 << 10) | 1023));
+        assert_eq!(regs[GICC_EOIR_OFFSET / WORD], 0);
+    }
+
     /// A spurious claim completes nothing.
     #[test]
     fn spurious_intids_are_never_completed() {
@@ -593,8 +656,8 @@ mod tests {
         regs[GICC_IAR_OFFSET / WORD] = 1023;
 
         let claimed = claim_interrupt().expect("a configured controller claims");
-        assert_eq!(claimed, 1023);
-        assert!(intid_is_special(claimed));
+        assert_eq!(claimed.intid(), 1023);
+        assert!(intid_is_special(claimed.intid()));
         for intid in [1020u16, 1021, 1022, 1023] {
             assert!(intid_is_special(intid));
         }

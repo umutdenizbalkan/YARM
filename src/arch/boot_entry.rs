@@ -144,6 +144,11 @@ pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
                     cpu.0
                 );
             } else {
+                // QEMU-IRQ2 §2: the PL011 witness source is admitted HERE — after the vectors,
+                // the shared trap state and the GIC are confirmed and after `bootstrap_first_user_task`
+                // bound its route, and before the PE-level unmask below, which stays last.
+                #[cfg(feature = "aarch64-pl011-irq-witness")]
+                let _ = crate::arch::aarch64::pl011_irq_witness::enable_source_before_unmask();
                 // Everything the first IRQ will need is confirmed present. Only now.
                 crate::arch::aarch64::irq::enable_interrupts_for_boot();
                 crate::yarm_log!(

@@ -10160,7 +10160,10 @@ impl SharedKernel {
             Err(e) => {
                 // QEMU-IRQ1 §3 — witness builds only: a NON-BLOCKING probe on a notification the
                 // caller may receive from. Every other shape keeps the endpoint-only answer.
-                #[cfg(feature = "riscv-uart-irq-witness")]
+                #[cfg(any(
+                    feature = "riscv-uart-irq-witness",
+                    feature = "aarch64-pl011-irq-witness"
+                ))]
                 if matches!(e, crate::kernel::boot::KernelError::WrongObject) && timeout_ticks == 0
                 {
                     if let Some(answer) =
@@ -10341,7 +10344,10 @@ impl SharedKernel {
     ///
     /// Returns `None` when the capability is not a notification at all, so the caller answers the
     /// endpoint resolver's own `WrongObject` exactly as before.
-    #[cfg(feature = "riscv-uart-irq-witness")]
+    #[cfg(any(
+        feature = "riscv-uart-irq-witness",
+        feature = "aarch64-pl011-irq-witness"
+    ))]
     fn witness_notification_probe_into_frame(
         &self,
         cpu: CpuId,

@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! QEMU-IRQ1 §3/§4 — init's RECEIVER for the RISC-V UART external-interrupt witness.
+//! QEMU-IRQ1 §3/§4 — init's RECEIVER for the RISC-V UART external-interrupt witness, and since
+//! QEMU-IRQ2 also for the AArch64 PL011 witness: ONE receiver, whose only per-port parts are the
+//! syscall instruction, the register-checked spin and the isolation probe addresses.
 //!
-//! Slot-5 selector 30; compiled only with `riscv-uart-irq-witness` on RISC-V. The kernel hands it
+//! Slot-5 selector 30; compiled only with `riscv-uart-irq-witness` on RISC-V or
+//! `aarch64-pl011-irq-witness` on AArch64. The markers keep their IRQ1 names on both ports — they
+//! are this receiver's protocol with the host driver, not a claim about the port. The kernel hands it
 //! a RECEIVE cap on the notification the UART route targets (slot 13), a private park endpoint
 //! (slot 14), and a USER read-only ring page at [`RING_VA`] into which the kernel fixture copies
 //! the bytes it drained.
@@ -64,8 +68,26 @@ const RING_BYTES_OFFSET: usize = 256;
 
 /// The kernel-only device window's first page (`page_table::DEVICE_WINDOW_BASE`), and the window
 /// address of the PLIC S-context claim register (window slot 2, offset 4).
+#[cfg(target_arch = "riscv64")]
 const DEVICE_WINDOW_BASE: usize = 0x3F_C000_0000;
+#[cfg(target_arch = "riscv64")]
 const WINDOW_CLAIM_VA: usize = DEVICE_WINDOW_BASE + 2 * 4096 + 4;
+/// RISC-V isolation probes: a load from the claim register's window address, and an anonymous
+/// mapping over the window.
+#[cfg(target_arch = "riscv64")]
+const ISOLATION_LOAD_VA: usize = WINDOW_CLAIM_VA;
+#[cfg(target_arch = "riscv64")]
+const ISOLATION_MAP_VA: usize = DEVICE_WINDOW_BASE;
+/// QEMU-IRQ2 — AArch64 maps no new window: the PL011 and GIC pages are the reserved privileged
+/// Device leaves every root already carries (identity, VA = PA). The probes are a load from the
+/// PL011's read-only flag register (a successful read would change no device state) and an
+/// anonymous mapping over the PL011 page.
+#[cfg(target_arch = "aarch64")]
+const PL011_BASE_VA: usize = 0x0900_0000;
+#[cfg(target_arch = "aarch64")]
+const ISOLATION_LOAD_VA: usize = PL011_BASE_VA + 0x18;
+#[cfg(target_arch = "aarch64")]
+const ISOLATION_MAP_VA: usize = PL011_BASE_VA;
 
 const NR_IPC_RECV_TIMEOUT: usize = 5;
 const ERR_WOULD_BLOCK: usize = 7;
@@ -124,6 +146,7 @@ fn recv_timeout(cap: u32, timeout: u64) -> Recv {
     let mut a5 = core::mem::size_of::<MetaV2>();
     // SAFETY: the kernel's RISC-V syscall ABI (a7 = number, a0..a5 = arguments); every argument
     // register is declared clobbered because the kernel may write any of them.
+    #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -134,6 +157,37 @@ fn recv_timeout(cap: u32, timeout: u64) -> Recv {
             inlateout("a4") a4,
             inlateout("a5") a5,
             in("a7") NR_IPC_RECV_TIMEOUT,
+            options(nostack),
+        );
+    }
+    // SAFETY: the kernel's AArch64 syscall ABI (x8 = number, x0..x5 = arguments), clobbers as
+    // above.
+    //
+    // QEMU-IRQ2 — every SIMD register is declared clobbered as well. AArch64 YARM keeps no per-task
+    // FP/SIMD state: a receive that BLOCKS is resumed with whatever `q0..q31` the resuming vector
+    // frame holds — for the idle-boundary return, the kernel's idle context. The receiver must
+    // not park a live value there across a blocking receive, and this is what stops the compiler
+    // from doing so. (The loss itself is measured, not hidden: see `park_measuring_simd`.)
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            inlateout("x0") a0,
+            inlateout("x1") a1,
+            inlateout("x2") a2,
+            inlateout("x3") a3,
+            inlateout("x4") a4,
+            inlateout("x5") a5,
+            in("x8") NR_IPC_RECV_TIMEOUT,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            clobber_abi("C"),
             options(nostack),
         );
     }
@@ -153,6 +207,81 @@ fn recv_timeout(cap: u32, timeout: u64) -> Recv {
     }
 }
 
+/// QEMU-IRQ2 — the idle item's park, with four SIMD sentinels (`d0`, `d1`, `d16`, `d17`) carried
+/// across the blocking receive in the SAME asm block. Returns the park's outcome and the mask of
+/// sentinels that did NOT come back (bits 0..3 in that order). This is a MEASUREMENT of the resume path,
+/// not of the interrupt path: the interrupt lands on the kernel's idle loop, and the receiver
+/// resumes later through the timer's idle-boundary user return.
+#[cfg(target_arch = "aarch64")]
+fn park_measuring_simd(cap: u32, timeout: u64, seed: u64) -> (Recv, u32) {
+    let mut payload = [0u8; 64];
+    let mut meta = MetaV2 {
+        status: u64::MAX,
+        opcode: 0,
+        flags: 0,
+        payload_len: 0,
+        cap_id: u64::MAX,
+        recv_meta_flags: 0,
+        sender_tid: 0,
+    };
+    let mut a0 = cap as usize;
+    let vs = [
+        seed ^ 0x51D0_0001,
+        seed ^ 0x51D0_0002,
+        seed ^ 0x51D0_0003,
+        seed ^ 0x51D0_0004,
+    ];
+    let (mut v0, mut v1, mut v2, mut v3) = (vs[0], vs[1], vs[2], vs[3]);
+    // SAFETY: NR 5 as in `recv_timeout`, with d0/d1/d16/d17 carried in and read back out.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            inlateout("x0") a0,
+            inlateout("x1") payload.as_mut_ptr() as usize => _,
+            inlateout("x2") payload.len() => _,
+            inlateout("x3") timeout as usize => _,
+            inlateout("x4") (&mut meta as *mut MetaV2) as usize => _,
+            inlateout("x5") core::mem::size_of::<MetaV2>() => _,
+            in("x8") NR_IPC_RECV_TIMEOUT,
+            inout("v0") v0,
+            inout("v1") v1,
+            inout("v16") v2,
+            inout("v17") v3,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            clobber_abi("C"),
+            options(nostack),
+        );
+    }
+    let mut mask = 0u32;
+    for (i, (g, want)) in [v0, v1, v2, v3].iter().zip(vs.iter()).enumerate() {
+        if g != want {
+            mask |= 1 << i;
+        }
+    }
+    // SAFETY: the kernel wrote `meta` through the pointer handed to it.
+    let status = unsafe { core::ptr::read_volatile(&meta.status) };
+    let outcome = if status != u64::MAX {
+        Recv::Message {
+            label: meta.opcode,
+            payload_len: meta.payload_len,
+        }
+    } else {
+        match a0 {
+            ERR_WOULD_BLOCK => Recv::Empty,
+            ERR_TIMED_OUT => Recv::TimedOut,
+            _ => Recv::Error,
+        }
+    };
+    (outcome, mask)
+}
+
 /// Spin in U-mode with six sentinel registers live across the whole loop. Returns the mask of
 /// registers whose value did NOT survive — `0` means the register file came back intact from every
 /// interrupt that landed inside the loop.
@@ -168,6 +297,7 @@ fn spin_checking_registers(iters: u64, seed: u64) -> u32 {
     ];
     let (mut r0, mut r1, mut r2, mut r3, mut r4, mut r5) = (s[0], s[1], s[2], s[3], s[4], s[5]);
     // SAFETY: a pure register loop; no memory is touched.
+    #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!(
             "2:",
@@ -183,11 +313,53 @@ fn spin_checking_registers(iters: u64, seed: u64) -> u32 {
             options(nomem, nostack),
         );
     }
+    // SAFETY: as above. x9..x14 are AAPCS64 temporaries; x18 (TLS), x19 (LLVM base pointer),
+    // x29 and x30 are not the instrument's to use.
+    // QEMU-IRQ2: four SIMD sentinels as well (d0, d1, d16, d17; mask bits 6..9). An interrupt
+    // taken from EL0 saves and restores q0..q31 in its vector frame, and the kernel's own copy
+    // routines use q0/q1, so these must survive every interrupt in the loop.
+    #[cfg(target_arch = "aarch64")]
+    let vs = [
+        seed ^ 0x51D0_0006,
+        seed ^ 0x51D0_0007,
+        seed ^ 0x51D0_0008,
+        seed ^ 0x51D0_0009,
+    ];
+    #[cfg(target_arch = "aarch64")]
+    let (mut v0, mut v1, mut v2, mut v3) = (vs[0], vs[1], vs[2], vs[3]);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "subs {n}, {n}, #1",
+            "b.ne 2b",
+            n = inout(reg) iters => _,
+            inout("x9") r0,
+            inout("x10") r1,
+            inout("x11") r2,
+            inout("x12") r3,
+            inout("x13") r4,
+            inout("x14") r5,
+            inout("v0") v0,
+            inout("v1") v1,
+            inout("v16") v2,
+            inout("v17") v3,
+            options(nomem, nostack),
+        );
+    }
     let got = [r0, r1, r2, r3, r4, r5];
     let mut mask = 0u32;
     for (i, (g, want)) in got.iter().zip(s.iter()).enumerate() {
         if g != want {
             mask |= 1 << i;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        for (i, (g, want)) in [v0, v1, v2, v3].iter().zip(vs.iter()).enumerate() {
+            if g != want {
+                mask |= 1 << (6 + i);
+            }
         }
     }
     mask
@@ -242,6 +414,7 @@ fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
     // SAFETY: `DebugLog` (a7 = 15, a0/a1 = the line) followed by a pure register loop. Every
     // argument register is declared clobbered; the sentinels sit in registers the syscall ABI
     // does not use.
+    #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!(
             "ecall",
@@ -265,11 +438,59 @@ fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
             options(nostack),
         );
     }
+    // SAFETY: `DebugLog` (x8 = 15, x0/x1 = the line) followed by a pure register loop; the
+    // sentinels sit in x9..x14, d0/d1/d16/d17 and the count in x15, none of which the syscall ABI
+    // uses.
+    #[cfg(target_arch = "aarch64")]
+    let vs = [
+        seed ^ 0x51D0_0006,
+        seed ^ 0x51D0_0007,
+        seed ^ 0x51D0_0008,
+        seed ^ 0x51D0_0009,
+    ];
+    #[cfg(target_arch = "aarch64")]
+    let (mut v0, mut v1, mut v2, mut v3) = (vs[0], vs[1], vs[2], vs[3]);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            "2:",
+            "subs x15, x15, #1",
+            "b.ne 2b",
+            inlateout("x0") line.buf.as_ptr() as usize => _,
+            inlateout("x1") line.len => _,
+            inlateout("x2") 0usize => _,
+            inlateout("x3") 0usize => _,
+            inlateout("x4") 0usize => _,
+            inlateout("x5") 0usize => _,
+            in("x8") NR_DEBUG_LOG,
+            inout("x15") iters => _,
+            inout("x9") r0,
+            inout("x10") r1,
+            inout("x11") r2,
+            inout("x12") r3,
+            inout("x13") r4,
+            inout("x14") r5,
+            inout("v0") v0,
+            inout("v1") v1,
+            inout("v16") v2,
+            inout("v17") v3,
+            options(nostack),
+        );
+    }
     let got = [r0, r1, r2, r3, r4, r5];
     let mut mask = 0u32;
     for (i, (g, want)) in got.iter().zip(s.iter()).enumerate() {
         if g != want {
             mask |= 1 << i;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        for (i, (g, want)) in [v0, v1, v2, v3].iter().zip(vs.iter()).enumerate() {
+            if g != want {
+                mask |= 1 << (6 + i);
+            }
         }
     }
     mask
@@ -280,14 +501,14 @@ static ISO_CHILD_READ_RETURNED: AtomicU32 = AtomicU32::new(0);
 static mut ISO_CHILD_STACK: [u8; 1024] = [0u8; 1024];
 static mut ISO_CHILD_TLS: [u8; 256] = [0u8; 256];
 
-/// The disposable isolation probe: a U-mode LOAD from the claim register's window address. The
-/// leaf carries no USER bit, so the load must fault before the device is touched — a successful
-/// load would have been a claim read performed by userspace. Never returns: the fault terminates
+/// The disposable isolation probe: a user-mode LOAD from a kernel-only device address (RISC-V: the
+/// claim register's window address; AArch64: the PL011 flag register). The leaf carries no USER
+/// bit, so the load must fault before the device is touched. Never returns: the fault terminates
 /// this thread, and nothing else.
 extern "C" fn isolation_child_body() -> ! {
     ISO_CHILD_STARTED.store(1, Relaxed);
     // SAFETY: deliberately touching a kernel-only mapping; the fault is the expected outcome.
-    let v = unsafe { core::ptr::read_volatile(WINDOW_CLAIM_VA as *const u32) };
+    let v = unsafe { core::ptr::read_volatile(ISOLATION_LOAD_VA as *const u32) };
     ISO_CHILD_READ_RETURNED.store(1 | (v << 1), Relaxed);
     loop {
         let _ = yarm_user_rt::syscall::yield_now();
@@ -298,7 +519,7 @@ extern "C" fn isolation_child_body() -> ! {
 /// child; (2) the window cannot be claimed by a user mapping (`VmAnonMap` over it is refused).
 fn isolation_probes(park: u32) -> (u32, u32, bool) {
     // SAFETY: an anonymous-map request the kernel must refuse; nothing is mapped on refusal.
-    let anon = unsafe { yarm_user_rt::syscall::vm_anon_map(DEVICE_WINDOW_BASE, 4096, 1) };
+    let anon = unsafe { yarm_user_rt::syscall::vm_anon_map(ISOLATION_MAP_VA, 4096, 1) };
     let anon_refused = anon.is_err();
     let stack_top = (core::ptr::addr_of_mut!(ISO_CHILD_STACK) as usize + 1024) & !0xF;
     let tls_base = core::ptr::addr_of_mut!(ISO_CHILD_TLS) as usize;
@@ -383,6 +604,10 @@ pub(super) fn run_once() {
         let expect = BYTE_BASE + seq as u8;
         let mut rounds = 0u32;
         let mut bad_mask = 0u32;
+        // QEMU-IRQ2: SIMD sentinels carried across an idle item's park (AArch64 only; always 0
+        // elsewhere). Observational — it names the resume path's FP/SIMD loss, it is not graded.
+        #[allow(unused_mut)]
+        let mut idle_simd_mask = 0u32;
         if idle {
             yarm_user_rt::user_log!(
                 "IRQ1_UART_READY seq={} mode=idle expect=0x{:02x}",
@@ -400,7 +625,16 @@ pub(super) fn run_once() {
                 if rounds > MAX_IDLE_ROUNDS {
                     break None;
                 }
-                match recv_timeout(park, IDLE_PARK_TICKS) {
+                #[cfg(target_arch = "aarch64")]
+                let parked = {
+                    let seed = 0x5EED_0000_0000u64 | ((seq as u64) << 16) | rounds as u64;
+                    let (r, m) = park_measuring_simd(park, IDLE_PARK_TICKS, seed);
+                    idle_simd_mask |= m;
+                    r
+                };
+                #[cfg(not(target_arch = "aarch64"))]
+                let parked = recv_timeout(park, IDLE_PARK_TICKS);
+                match parked {
                     Recv::Message { .. } => dup += 1,
                     Recv::Error => errors += 1,
                     Recv::TimedOut | Recv::Empty => {}
@@ -455,7 +689,7 @@ pub(super) fn run_once() {
             }
         }
         yarm_user_rt::user_log!(
-            "IRQ1_UART_RECV seq={} mode={} label={} payload_len={} once={} byte=0x{:02x} bytes={} data_ok={} rounds={} regs_mask=0x{:x} claims={} completions={}",
+            "IRQ1_UART_RECV seq={} mode={} label={} payload_len={} once={} byte=0x{:02x} bytes={} data_ok={} rounds={} regs_mask=0x{:x} claims={} completions={} idle_resume_simd_mask=0x{:x}",
             seq,
             if idle { "idle" } else { "user" },
             label,
@@ -467,7 +701,8 @@ pub(super) fn run_once() {
             rounds,
             bad_mask,
             ring_word(W_CLAIMS),
-            ring_word(W_COMPLETIONS)
+            ring_word(W_COMPLETIONS),
+            idle_simd_mask
         );
     }
 
@@ -500,7 +735,7 @@ pub(super) fn run_once() {
     yarm_user_rt::user_log!(
         "IRQ1_UART_ISOLATION child_tid={} window_va=0x{:x} load_returned={} anon_map_over_window_refused={} result={}",
         iso_child,
-        WINDOW_CLAIM_VA,
+        ISOLATION_LOAD_VA,
         iso_returned,
         anon_refused as u8,
         if isolated { "ok" } else { "fail" }

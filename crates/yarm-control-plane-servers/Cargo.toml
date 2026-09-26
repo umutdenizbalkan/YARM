@@ -60,6 +60,7 @@ futex-wait-nonblock-probe = []
 # profile keeps the headroom it had.
 timer5-idle-return-witness = []
 riscv-uart-irq-witness = []
+aarch64-pl011-irq-witness = []
 recv-queue1-ordinary-grant = []
 
 [dependencies]

@@ -370,8 +370,20 @@ fn ensure_early_device_mapping(
         state,
         l3_idx,
         l3,
-        PageTableEntry::with_addr_and_flags(pa, leaf_flags_from_page_flags(PageFlags::DEVICE_RW)),
+        PageTableEntry::with_addr_and_flags(pa, device_leaf_flags()),
     )
+}
+
+/// The leaf every reserved device page carries: Device-nGnRE, read/write, no USER bit, and
+/// execute-never at BOTH levels.
+///
+/// QEMU-IRQ2 §2: `leaf_flags_from_page_flags` sets only UXN for a kernel page (PXN is reserved
+/// for user pages there), which left these MMIO leaves privileged-EXECUTABLE. Nothing branches
+/// into them, but the architecture permits speculative instruction fetch from any Device region
+/// not marked execute-never for every level, and a fetch from the UART or the GIC CPU interface
+/// is not something a kernel may leave possible. PXN closes it for exactly these pages.
+fn device_leaf_flags() -> u64 {
+    leaf_flags_from_page_flags(PageFlags::DEVICE_RW) | PageTableEntry::PRIV_NO_EXECUTE
 }
 
 /// Establish every privileged device leaf a fresh root must carry: the early UART, and — when the
@@ -835,22 +847,29 @@ mod gic_device_mapping_tests {
         }
     }
 
-    /// Both GIC leaves are Device-nGnRE, execute-never and privileged (non-user).
+    /// The GIC leaves and the PL011 leaf are Device-nGnRE, execute-never at both levels and
+    /// privileged (non-user). QEMU-IRQ2 §2 added the UART page and the PXN requirement.
     #[test]
     fn gic_leaves_are_device_xn_and_privileged() {
         publish_gic_mmio_bases(QEMU_GICD_PA, QEMU_GICC_PA);
         let mut state = PageTableState::new();
         let root = fresh_root(&mut state);
         let device_attr = cache_policy_bits(CachePolicy::Device);
-        for va in [QEMU_GICD_PA, QEMU_GICC_PA] {
+        for va in [QEMU_GICD_PA, QEMU_GICC_PA, EARLY_UART_MMIO_VA] {
             let leaf = leaf_for(&mut state, root, va).expect("leaf");
             assert_eq!(
                 leaf.0 & device_attr,
                 device_attr,
                 "Device-nGnRE memory type (MAIR AttrIdx 3)"
             );
-            assert_ne!(leaf.0 & PageTableEntry::NO_EXECUTE, 0, "execute-never");
+            assert_ne!(leaf.0 & PageTableEntry::NO_EXECUTE, 0, "EL0 execute-never");
+            assert_ne!(
+                leaf.0 & PageTableEntry::PRIV_NO_EXECUTE,
+                0,
+                "EL1 execute-never"
+            );
             assert_eq!(leaf.0 & PageTableEntry::USER, 0, "privileged, not user");
+            assert_eq!(leaf.0 & PageTableEntry::READ_ONLY, 0, "kernel read/write");
             assert_ne!(leaf.0 & PageTableEntry::VALID, 0, "present");
         }
     }

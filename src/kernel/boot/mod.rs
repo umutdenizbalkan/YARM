@@ -8245,18 +8245,29 @@ pub fn timer5_idle_return_witness_enabled() -> bool {
 /// 30 is claimed by no other slot-5 constant, encoder run or arm on any port (in use: 1–16 and
 /// 20–25, the last three being the terminal-fault oracle's). The cell is compiled only with
 /// `riscv-uart-irq-witness`, so a build without it carries neither the selector nor the receiver.
-#[cfg(feature = "riscv-uart-irq-witness")]
+/// QEMU-IRQ2 reuses the same selector, ring VA and provisioning for the AArch64 PL011 witness
+/// (`aarch64-pl011-irq-witness`); the two features are never built together.
+#[cfg(any(
+    feature = "riscv-uart-irq-witness",
+    feature = "aarch64-pl011-irq-witness"
+))]
 pub const UART_IRQ_WITNESS_SELECTOR: u64 = 30;
 
 /// QEMU-IRQ1 §3 — where init finds the witness ring page, mapped USER read-only. Inside the
 /// image↔heap gap RISC-V init leaves free (image below `0x0400_0000`, the oracle window at
 /// `0x2000_0000..+8 KiB`, `brk` from `0x4000_0000`). Pinned against the receiver's own constant by
 /// a hosted test.
-#[cfg(feature = "riscv-uart-irq-witness")]
+#[cfg(any(
+    feature = "riscv-uart-irq-witness",
+    feature = "aarch64-pl011-irq-witness"
+))]
 pub const UART_IRQ_WITNESS_RING_VA: u64 = 0x2800_0000;
 
 /// QEMU-IRQ1 §3 — what the witness provisioning handed init.
-#[cfg(feature = "riscv-uart-irq-witness")]
+#[cfg(any(
+    feature = "riscv-uart-irq-witness",
+    feature = "aarch64-pl011-irq-witness"
+))]
 #[derive(Clone, Copy, Debug)]
 pub struct UartIrqWitnessProvision {
     /// RECEIVE on the notification the IRQ route targets.
@@ -8285,9 +8296,11 @@ pub struct UartIrqWitnessProvision {
 /// Any failure provisions nothing further, logs the failing step and returns `None`; init's slot 5
 /// then stays zero and the cell does not run.
 #[cfg(all(
-    feature = "riscv-uart-irq-witness",
     not(feature = "hosted-dev"),
-    target_arch = "riscv64"
+    any(
+        all(feature = "riscv-uart-irq-witness", target_arch = "riscv64"),
+        all(feature = "aarch64-pl011-irq-witness", target_arch = "aarch64")
+    )
 ))]
 pub fn provision_init_uart_irq_witness(
     kernel: &mut KernelState,
@@ -8382,7 +8395,10 @@ pub fn provision_init_uart_irq_witness(
         crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=map_ring err={:?}", e);
         return None;
     }
+    #[cfg(target_arch = "riscv64")]
     crate::arch::riscv64::uart_irq_witness::set_ring_page(ring_pa, irq_line);
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::pl011_irq_witness::set_ring_page(ring_pa, irq_line);
     crate::yarm_log!(
         "IRQ1_WITNESS_PROVISION_OK init_tid={} irq_line={} notification={} notif_recv_cap={} park_cap={} ring_va=0x{:x} ring_pa=0x{:x} ring_user_write=0",
         init_tid,

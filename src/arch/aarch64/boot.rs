@@ -6899,7 +6899,7 @@ fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelSta
 }
 
 #[allow(dead_code)]
-fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
+pub(crate) fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
     let ptr = TRAP_SHARED_KERNEL_PTR.load(core::sync::atomic::Ordering::SeqCst);
     if ptr.is_null() {
         None
@@ -7087,14 +7087,20 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     //
     // The claim is also what tells us WHICH interrupt this is. Treating every IRQ exception as
     // the timer would tick on an unrelated INTID; only INTID 30 ticks and re-arms.
-    let claimed_intid = if is_irq_kind {
+    //
+    // QEMU-IRQ2 §2: the claim is the whole acknowledge token (`GicAck`), carried unchanged to the
+    // one completion below; everything between sees only its INTID.
+    let claimed = if is_irq_kind {
         crate::arch::aarch64::irq::claim_interrupt()
     } else {
         None
     };
+    let claimed_intid = claimed.map(crate::arch::aarch64::irq::GicAck::intid);
     // GICv2 special INTIDs (1020..=1023) mean "nothing to service": no tick, no re-arm, and no
     // completion — writing EOIR for them is not permitted.
     if claimed_intid.is_some_and(crate::arch::aarch64::irq::intid_is_special) {
+        #[cfg(feature = "aarch64-pl011-irq-witness")]
+        crate::arch::aarch64::pl011_irq_witness::note_special_claim(claimed, kind);
         return;
     }
     let is_timer_irq = match claimed_intid {
@@ -7111,6 +7117,20 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     };
     let trap_cpu =
         crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
+    // QEMU-IRQ2 §2: the witness fixture's only hook before delivery. It records where the claim
+    // was taken from (the vector kind and, for EL1, whether this CPU was parked at the
+    // authenticated idle boundary) and drains the PL011 so the level source drops BEFORE the
+    // production route delivers and BEFORE the tail completes. It never claims or completes.
+    #[cfg(feature = "aarch64-pl011-irq-witness")]
+    if let Some(intid) = external_irq_line {
+        crate::arch::aarch64::pl011_irq_witness::note_claim_and_drain(
+            intid,
+            kind,
+            frame.spsr_el1,
+            frame.elr_el1,
+            trap_cpu,
+        );
+    }
     if let Some(shared) = trap_shared_kernel() {
         if AARCH64_LOCK_SPLIT_TRACE {
             crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry");
@@ -7221,8 +7241,10 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     // Exactly one completion per claim, and only now: for the timer the handler has already
     // reprogrammed `CNTP_TVAL_EL0`, so the level source is deasserted and the distributor will
     // not immediately re-present it.
-    if let Some(intid) = claimed_intid {
-        crate::arch::aarch64::irq::complete_interrupt(intid);
+    if let Some(ack) = claimed {
+        crate::arch::aarch64::irq::complete_interrupt(ack);
+        #[cfg(feature = "aarch64-pl011-irq-witness")]
+        crate::arch::aarch64::pl011_irq_witness::note_completion_written(ack);
     }
     match kind {
         1 => crate::arch::aarch64::console::write_line(
@@ -8037,6 +8059,37 @@ pub fn bootstrap_first_user_task(
             );
         }
     }
+    // QEMU-IRQ2 §3: the PL011 external-interrupt witness. Compile-time gated only — a build with
+    // the feature is the witness build — and mutually exclusive with every slot-5/13/14 cell above
+    // (it stands down unless all three are still zero). The route is bound to the GIC INTID the
+    // executed machine's DTB names (`pl011@` → `<0 1 4>` → 33), never to the SPI number and never
+    // to an assumed constant; with no DTB node nothing is bound.
+    #[cfg(feature = "aarch64-pl011-irq-witness")]
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
+        match crate::arch::aarch64::pl011_irq_witness::witness_intid() {
+            Some(intid) => {
+                if let Some(p) = crate::kernel::boot::provision_init_uart_irq_witness(
+                    kernel,
+                    RING3_INIT_SERVER_TID,
+                    init_asid,
+                    intid,
+                ) {
+                    init_args[5] = crate::kernel::boot::UART_IRQ_WITNESS_SELECTOR;
+                    init_args[13] = p.notification_recv_cap as u64;
+                    init_args[14] = p.park_endpoint_cap as u64;
+                    crate::yarm_log!(
+                        "IRQ2_WITNESS_SLOTS slot5={} slot13={} slot14={} notification={} intid={}",
+                        init_args[5],
+                        init_args[13],
+                        init_args[14],
+                        p.notification_idx,
+                        intid
+                    );
+                }
+            }
+            None => crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=dtb_pl011_intid"),
+        }
+    }
     // Stage 195C: default-off AArch64 FutexWake live oracle. Slot 5
     // (supervisor_control_recv_ep) is unused by init, so under
     // `yarm.aarch64_futex_wake_oracle=1` we reuse it as a sentinel (=1) that tells init to
@@ -8618,6 +8671,10 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     halt_stage1();
                 }
             }
+            // QEMU-IRQ2 §1: the witness reads the PL011's base and GIC specifier from THIS DTB,
+            // the executed machine's, while it is still in hand.
+            #[cfg(feature = "aarch64-pl011-irq-witness")]
+            crate::arch::aarch64::pl011_irq_witness::capture_from_dtb(dtb);
             if let Some(parsed) = crate::arch::aarch64::dtb::parse_boot_dtb(dtb) {
                 crate::yarm_log!(
                     "YARM_AARCH64_DTB memory_start=0x{:x} memory_len=0x{:x} initrd_start=0x{:x} initrd_end=0x{:x} gic_cpu_if_base=0x{:x} gic_dist_base=0x{:x}",

@@ -61,6 +61,17 @@ macro_rules! trap_trace { ($($arg:tt)*) => { aarch64_trap_trace(format_args!($($
 /// A wake is not lost in the window between the run-queue observation and the halt. The
 /// interrupt is pending across it and is taken the instant `daifclr` lands, and the periodic
 /// timer re-arms every tick regardless, so the boundary is re-examined each quantum.
+///
+/// # QEMU-IRQ2 §2 — the unmasked window is three instructions and uses no stack
+///
+/// An interrupt that returns here restores the `SPSR_EL1` it was taken with, whose `I` bit is
+/// clear. With a bare `daifclr; wfi` the loop's own Rust code — `park()` and its log line — then
+/// ran UNMASKED on this stack until the next `daifclr`, so a second interrupt could land in the
+/// middle of a stack-using function at the boundary. The unmask therefore lives in
+/// [`yarm_aarch64_idle_wfi_window`], a leaf that clears the mask, waits, and sets the mask again
+/// before returning. Every interrupt at the boundary is taken with `ELR_EL1` inside that leaf —
+/// on its `wfi` (pending when the mask cleared) or its `daifset` (woken by it) — and none can be
+/// taken in `park()`.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 extern "C" fn aarch64_idle_park_loop(cpu: usize) -> ! {
     loop {
@@ -82,10 +93,34 @@ extern "C" fn aarch64_idle_park_loop(cpu: usize) -> ! {
             );
         }
         unsafe {
-            core::arch::asm!("msr daifclr, #0x3", "wfi", options(nomem, nostack));
+            yarm_aarch64_idle_wfi_window();
         }
     }
 }
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+unsafe extern "C" {
+    /// The idle boundary's only unmasked instructions: `daifclr #3; wfi; daifset #3; ret`. A leaf
+    /// with no stack use, so an interrupt taken inside it interrupts no Rust frame. Sized, so the
+    /// witness grader can place `ELR_EL1` inside it from the symbol table.
+    fn yarm_aarch64_idle_wfi_window();
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+core::arch::global_asm!(
+    r#"
+    .section .text.yarm_aarch64_idle_wfi_window,"ax",@progbits
+    .global yarm_aarch64_idle_wfi_window
+    .type yarm_aarch64_idle_wfi_window,%function
+    .balign 16
+yarm_aarch64_idle_wfi_window:
+    msr daifclr, #0x3
+    wfi
+    msr daifset, #0x3
+    ret
+    .size yarm_aarch64_idle_wfi_window, . - yarm_aarch64_idle_wfi_window
+    "#
+);
 
 #[inline(always)]
 fn idle_no_eret_loop() -> ! {

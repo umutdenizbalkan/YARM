@@ -135,6 +135,12 @@ timer5-idle-return-witness = []
 # device, enables no source, admits no S-mode external interrupt and keeps NR 5 endpoint-only.
 # Accepted and inert outside the kernel and yarm-control-plane-servers.
 riscv-uart-irq-witness = []
+# QEMU-IRQ2: the AArch64 external-device interrupt witness — PL011 SPI 1 (GIC INTID 33) -> GICv2
+# -> YARM on QEMU virt, one CPU. Compiles the PL011 setup/drain fixture and its three hooks on the
+# vector entry, the provisioning of init's notification + ring page, the same witness-only NR 5
+# non-blocking notification arm IRQ1 uses, and init's receiver cell. A build without it enables no
+# SPI, touches no UART interrupt register and keeps NR 5 endpoint-only.
+aarch64-pl011-irq-witness = []
 # U9-RECV-QUEUE1 §3: the queued shared-region grant taken by the ORDINARY receive syscalls
 # (NR 2 and NR 5) rather than by NR 30. A cargo feature and not only a runtime selector, for the
 # same reason the send-fault cell is one: init's address space runs at `MAX_MAPPINGS` and its

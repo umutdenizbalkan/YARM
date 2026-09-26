@@ -360,7 +360,13 @@ pub fn find_node_reg_by_name_prefix(bytes: &[u8], prefix: &[u8]) -> Option<(u64,
 /// QEMU-IRQ1 §1 — the raw bytes of property `prop` on the first node whose name begins with
 /// `prefix`, walking nested children exactly as [`find_node_reg_by_name_prefix`] does. `None` for a
 /// structurally invalid FDT, an absent node, or a node without that property.
-#[cfg_attr(not(feature = "riscv-uart-irq-witness"), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        feature = "riscv-uart-irq-witness",
+        feature = "aarch64-pl011-irq-witness"
+    )),
+    allow(dead_code)
+)]
 pub fn find_node_prop_by_name_prefix<'a>(
     bytes: &'a [u8],
     prefix: &[u8],
@@ -434,6 +440,63 @@ pub fn find_node_prop_by_name_prefix<'a>(
 pub fn find_node_interrupt_by_name_prefix(bytes: &[u8], prefix: &[u8]) -> Option<u32> {
     let data = find_node_prop_by_name_prefix(bytes, prefix, b"interrupts")?;
     read_be_u32(data, 0)
+}
+
+/// QEMU-IRQ2 §1 — one interrupt named by an `arm,gic` three-cell specifier, translated to the
+/// identity the controller actually reports.
+///
+/// A device tree does NOT name the GIC INTID. The first cell is the interrupt TYPE (0 = SPI,
+/// 1 = PPI), the second is the number WITHIN that type, and the third carries the trigger in bits
+/// [3:0]. The INTID `GICC_IAR` returns is `32 + n` for an SPI and `16 + n` for a PPI, so the
+/// PL011's `<0 1 4>` is INTID 33, not 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GicDtInterrupt {
+    pub intid: u16,
+    /// `IRQ_TYPE_LEVEL_HIGH` (4) or `IRQ_TYPE_LEVEL_LOW` (8).
+    pub level_triggered: bool,
+    /// The raw trigger nibble, for the record.
+    pub trigger: u32,
+}
+
+/// Translate an `arm,gic` specifier. `None` for a type other than SPI/PPI, a number outside that
+/// type's range, or a trigger nibble that names no single trigger.
+#[cfg_attr(not(feature = "aarch64-pl011-irq-witness"), allow(dead_code))]
+pub fn gic_interrupt_from_specifier(kind: u32, number: u32, flags: u32) -> Option<GicDtInterrupt> {
+    let intid = match kind {
+        0 if number < 988 => 32 + number,
+        1 if number < 16 => 16 + number,
+        _ => return None,
+    };
+    let trigger = flags & 0xf;
+    let level_triggered = match trigger {
+        1 | 2 => false,
+        4 | 8 => true,
+        _ => return None,
+    };
+    Some(GicDtInterrupt {
+        intid: intid as u16,
+        level_triggered,
+        trigger,
+    })
+}
+
+/// QEMU-IRQ2 §1 — the first `interrupts` specifier of the first node whose name begins with
+/// `prefix`, read as an `arm,gic` three-cell specifier (the only `#interrupt-cells` the AArch64
+/// `virt` GIC declares). A property shorter than three cells is refused, never guessed at.
+#[cfg_attr(not(feature = "aarch64-pl011-irq-witness"), allow(dead_code))]
+pub fn find_node_gic_interrupt_by_name_prefix(
+    bytes: &[u8],
+    prefix: &[u8],
+) -> Option<GicDtInterrupt> {
+    let data = find_node_prop_by_name_prefix(bytes, prefix, b"interrupts")?;
+    if data.len() < 12 {
+        return None;
+    }
+    gic_interrupt_from_specifier(
+        read_be_u32(data, 0)?,
+        read_be_u32(data, 4)?,
+        read_be_u32(data, 8)?,
+    )
 }
 
 /// Returns the `/chosen` `linux,initrd-start` / `linux,initrd-end` pair as
@@ -1033,5 +1096,83 @@ mod tests {
         );
         // `interrupt-controller` is a flag property on the PLIC; `interrupts` is not present.
         assert_eq!(find_node_interrupt_by_name_prefix(dtb, b"plic@"), None);
+    }
+
+    /// QEMU-IRQ2 §1 — the executed AArch64 machine's own DTB (QEMU 8.2 `virt`, `cortex-a72`,
+    /// `-m 1024M`, `-smp 1`; dumped with `dumpdtb` and trimmed to the header's used size) names
+    /// the PL011 at `0x0900_0000` with specifier `<0 1 4>` — SPI 1, level-high — which is GIC
+    /// INTID 33, and a GICv2 whose distributor and CPU interface are `0x0800_0000` and
+    /// `0x0801_0000`. Read, not assumed; and the SPI number is NOT the INTID.
+    #[test]
+    fn real_aarch64_qemu_virt_dtb_names_pl011_spi_and_gicv2() {
+        let dtb = include_bytes!("../../tests/fixtures/aarch64_qemu_virt_smp1.dtb").as_slice();
+        assert_eq!(
+            find_node_reg_by_name_prefix(dtb, b"pl011@"),
+            Some((0x0900_0000, 0x1000))
+        );
+        let raw = find_node_prop_by_name_prefix(dtb, b"pl011@", b"interrupts").expect("cells");
+        assert_eq!(raw, &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 4]);
+        assert_eq!(
+            find_node_gic_interrupt_by_name_prefix(dtb, b"pl011@"),
+            Some(GicDtInterrupt {
+                intid: 33,
+                level_triggered: true,
+                trigger: 4
+            })
+        );
+        assert_eq!(
+            find_node_reg_by_name_prefix(dtb, b"intc@").map(|(b, _)| b),
+            Some(0x0800_0000)
+        );
+        assert_eq!(
+            find_node_prop_by_name_prefix(dtb, b"intc@", b"#interrupt-cells"),
+            Some(&[0u8, 0, 0, 3][..])
+        );
+        // The first timer specifier is `<1 13 0x104>` — a PPI, so 16 + 13.
+        assert_eq!(
+            find_node_gic_interrupt_by_name_prefix(dtb, b"timer").map(|i| i.intid),
+            Some(29)
+        );
+    }
+
+    /// QEMU-IRQ2 §1 — the specifier rule on its own: SPI n is INTID 32+n, PPI n is 16+n, and
+    /// anything else is refused rather than guessed.
+    #[test]
+    fn gic_specifier_translation_is_exact() {
+        let spi = gic_interrupt_from_specifier(0, 1, 4).expect("spi");
+        assert_eq!((spi.intid, spi.level_triggered), (33, true));
+        assert_eq!(
+            gic_interrupt_from_specifier(1, 14, 0x104).map(|i| i.intid),
+            Some(30)
+        );
+        assert_eq!(
+            gic_interrupt_from_specifier(0, 1, 1).map(|i| i.level_triggered),
+            Some(false)
+        );
+        assert_eq!(
+            gic_interrupt_from_specifier(0, 987, 4).map(|i| i.intid),
+            Some(1019)
+        );
+        assert_eq!(
+            gic_interrupt_from_specifier(0, 988, 4),
+            None,
+            "past the SPI range"
+        );
+        assert_eq!(
+            gic_interrupt_from_specifier(1, 16, 4),
+            None,
+            "past the PPI range"
+        );
+        assert_eq!(gic_interrupt_from_specifier(2, 1, 4), None, "unknown type");
+        assert_eq!(
+            gic_interrupt_from_specifier(0, 1, 0),
+            None,
+            "no trigger named"
+        );
+        assert_eq!(
+            gic_interrupt_from_specifier(0, 1, 3),
+            None,
+            "two triggers named"
+        );
     }
 }
