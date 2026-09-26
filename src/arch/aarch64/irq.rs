@@ -287,7 +287,7 @@ impl GicAck {
 
     /// The interrupt identity, bits [9:0]. Special INTIDs (1020..=1023) included.
     pub fn intid(self) -> u16 {
-        (self.0 & 0x3ff) as u16
+        (self.0 & GIC_INTID_MASK) as u16
     }
 
     #[cfg(test)]
