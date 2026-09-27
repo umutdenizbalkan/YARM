@@ -68,9 +68,9 @@ QEMU_ARGV=(
 # interruptible idle, CPU 0 free for the rest of the system). The script terminates QEMU only then.
 QEMU_TERMINAL_MARKERS=(
   "X86_SMP_REPLY_PROGRESS_SUMMARY"
-  "X86_AP_DUPLICATE_REPLY_REFUSED_OBSERVED cpu=1 err=InvalidCapability result=ok"
-  "IPC_RECV_BLOCK_SPLIT_DONE cpu=1 tid=20205 endpoint=6 wait_gen=2 result=blocked"
-  "IPC_RECV_BLOCK_SPLIT_DONE cpu=0 tid=21205 endpoint=7 wait_gen=2 result=blocked"
+  "X86_SMP_REPLY_USER_ECHO X86_AP_DUPLICATE_REPLY_REFUSED_OBSERVED cpu=1 err=InvalidCapability result=ok"
+  "X86_SMP_ORACLE_BLOCKED cpu=1 tid=20205 endpoint=6 wait_gen=2"
+  "X86_SMP_ORACLE_BLOCKED cpu=0 tid=21205 endpoint=7 wait_gen=2"
 )
 FATAL_RE="KERNEL PANIC|RUST PANIC|panicked at|DOUBLE FAULT|Unhandled|BOOTSTRAP_ERROR|IPCCALL_DIRECT_ACK_OVERWRITE_FUSE|IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE|X86_BSP_REPLY_VALIDATE_FAIL|X86_AP_RECV_V2_VALIDATE_FAIL|X86_AP_RECV_V2_USER_READ_FAULT|X86_TLB_SHOOTDOWN_FAIL|X86_USER_FPU_HOME_UNAUTHENTICATED|X86_AP_SAVED_RESUME_REFUSED|X86_AP_REPLY_SEND_FAIL|X86_AP_DUPLICATE_REPLY_NOT_REFUSED|RECV_AGAIN_RETURNED|X86_BSP_CLIENT_PROGRESS cpu=0 result=fail"
 
@@ -94,17 +94,19 @@ have()  { rg -a -q -F "$1" "$NORM"; }
 [[ "$(count "X86_AP_RECV_V2_USER_VALIDATED cpu=1")" == "1" ]] || die "server user-validated != 1"
 
 # ── Reverse (reply) direction, graded from the PRODUCTION owners (QEMU-SMP1 §4). ────────────
-# Identities come from the provisioning markers, never assumed.
+# Identities come from the provisioning markers, never assumed. The SMP1 user markers are graded
+# through their synchronous kernel echoes (`X86_SMP_REPLY_USER_ECHO`); a `USER_LOG` line can be
+# dropped by the shared printk ring while both CPUs log.
 SERVER_TID="$(rg -a -o -r '$1' 'X86_AP_RECV_V2_SERVER_PROVISIONED base_tid=([0-9]+)' "$NORM" | head -1)"
 SERVER_EP="$(rg -a -o -r '$1' 'X86_AP_RECV_V2_SERVER_PROVISIONED .* endpoint_index=([0-9]+)' "$NORM" | head -1)"
 CLIENT_TID="$(rg -a -o -r '$1' 'X86_BSP_NR6_CLIENT_PROVISIONED client_tid=([0-9]+)' "$NORM" | head -1)"
 [[ "$SERVER_TID" == "20205" && "$SERVER_EP" == "6" && "$CLIENT_TID" == "21205" ]] \
   || die "provisioned identities (server=$SERVER_TID ep=$SERVER_EP client=$CLIENT_TID) differ from the terminal markers"
 line_of() { rg -a -n -F "$1" "$NORM" | head -1 | cut -d: -f1; }
-# 1. The caller blocks on its reply endpoint through the split receive owner, and the reply record is
-#    armed for exactly this caller/replier pair. (The oracle-only CALLER_BLOCKED marker is emitted
+# 1. The caller blocks on its reply endpoint through the split receive owner (its synchronous
+#    echo, X86_SMP_ORACLE_BLOCKED), and the reply record is armed for exactly this caller/replier pair. (The oracle-only CALLER_BLOCKED marker is emitted
 #    by a broad-route helper the split route never calls; it is no longer graded.)
-BLOCK1="$(rg -a -o -r '$1' "IPC_RECV_BLOCK_SPLIT_DONE cpu=0 tid=${CLIENT_TID} endpoint=([0-9]+) wait_gen=1 result=blocked" "$NORM" | head -1)"
+BLOCK1="$(rg -a -o -r '$1' "X86_SMP_ORACLE_BLOCKED cpu=0 tid=${CLIENT_TID} endpoint=([0-9]+) wait_gen=1\b" "$NORM" | head -1)"
 [[ -n "$BLOCK1" ]] || die "caller did not block on cpu 0 (wait_gen=1)"
 ARMED="$(rg -a -c "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${CLIENT_TID} .* replier_tid=${SERVER_TID} " "$NORM" || echo 0)"
 [[ "$ARMED" == "1" ]] || die "reply record armed for caller/replier != 1 ($ARMED)"
@@ -116,7 +118,7 @@ GEN="$(rg -a -o -r '$1' "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${CLIENT_TID}
 #    refusal in ring 3 (the old one-shot marker sat behind a check the fast-revoked cap never
 #    reaches; the refusal is the capability owner's).
 [[ "$(count "IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=18446744073709551615 record_generation=18446744073709551615 replier_tid=${SERVER_TID} reason=reply_cap err=InvalidCapability reply_copies=0 caller_wakes=0")" == "1" ]] || die "duplicate pre-lock refusal != 1"
-[[ "$(count "X86_AP_DUPLICATE_REPLY_REFUSED_OBSERVED cpu=1 err=InvalidCapability result=ok")" == "1" ]] || die "server did not observe the refusal once"
+[[ "$(count "X86_SMP_REPLY_USER_ECHO X86_AP_DUPLICATE_REPLY_REFUSED_OBSERVED cpu=1 err=InvalidCapability result=ok")" == "1" ]] || die "server did not observe the refusal once"
 # 4. One logical wake to CPU 0, and exactly one 0xF1 ARRIVAL there — counted by the pure-asm stub
 #    itself into CPU 0's per-CPU record (a hardware arrival may coalesce but can never duplicate).
 [[ "$(count "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0")" == "1" ]] || die "reverse IPI sent != 1"
@@ -131,20 +133,20 @@ field() { sed -n "s/.* $1=\([0-9]*\).*/\1/p" <<<"$SUMMARY"; }
 #    continuation runs; nothing else resumes it (the oracle BSP resume is retired).
 [[ "$(count "X86_BSP_SAVED_DISPATCH_OK")" == "0" ]] || die "retired oracle BSP resume ran"
 CLAIM_AT="$(line_of "IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=0 record_generation=${GEN} replier_tid=${SERVER_TID} ")"
-CONT_AT="$(line_of "msg=X86_BSP_RECV_V2_CONTINUED cpu=0")"
+CONT_AT="$(line_of "X86_SMP_REPLY_USER_ECHO X86_BSP_RECV_V2_CONTINUED cpu=0")"
 SELECT_AT="$(rg -a -n -e "DEQUEUE_OK cpu=0 (tid|incoming)=${CLIENT_TID}\b" "$NORM" | cut -d: -f1 | awk -v a="${CLAIM_AT:-0}" -v b="${CONT_AT:-0}" '$1>a && $1<b' | head -1)"
 [[ -n "$CLAIM_AT" && -n "$CONT_AT" && -n "$SELECT_AT" ]] || die "no production selection of the caller on cpu 0 between the claim and its continuation"
 rg -a -q -e "DEQUEUE_OK cpu=1 (tid|incoming)=${CLIENT_TID}\b" "$NORM" && die "caller selected on the wrong CPU"
 # 6. The exact continuation returns to ring 3 ONCE, validates the reply, and makes further
 #    progress (a Yield round trip), then both tasks block again — no park, no spin.
-[[ "$(count "X86_BSP_RECV_V2_CONTINUED cpu=0")" == "1" ]] || die "reply recv-v2 continued != 1"
+[[ "$(count "X86_SMP_REPLY_USER_ECHO X86_BSP_RECV_V2_CONTINUED cpu=0")" == "1" ]] || die "reply recv-v2 continued != 1"
 [[ "$(count "X86_BSP_REPLY_USER_VALIDATED cpu=0")" == "1" ]] || die "reply user-validated != 1"
 [[ "$(count "IPCREPLY_DIRECT_SMP_REPLY_OK sender_cpu=1 receiver_cpu=0 cross_cpu=1")" == "1" ]] || die "reply-ok != 1"
-[[ "$(count "X86_BSP_CLIENT_PROGRESS cpu=0 step=post_reply_yield result=ok")" == "1" ]] || die "client further progress != 1"
-PROG_AT="$(line_of "msg=X86_BSP_CLIENT_PROGRESS cpu=0 step=post_reply_yield")"
+[[ "$(count "X86_SMP_REPLY_USER_ECHO X86_BSP_CLIENT_PROGRESS cpu=0 step=post_reply_yield result=ok")" == "1" ]] || die "client further progress != 1"
+PROG_AT="$(line_of "X86_SMP_REPLY_USER_ECHO X86_BSP_CLIENT_PROGRESS cpu=0 step=post_reply_yield")"
 (( CONT_AT < PROG_AT )) || die "progress precedes the continuation"
-[[ "$(count "IPC_RECV_BLOCK_SPLIT_DONE cpu=1 tid=${SERVER_TID} endpoint=${SERVER_EP} wait_gen=2 result=blocked")" == "1" ]] || die "server did not block again on cpu 1"
-[[ "$(count "IPC_RECV_BLOCK_SPLIT_DONE cpu=0 tid=${CLIENT_TID} endpoint=${BLOCK1} wait_gen=2 result=blocked")" == "1" ]] || die "client did not block again on cpu 0"
+[[ "$(rg -a -c "X86_SMP_ORACLE_BLOCKED cpu=1 tid=${SERVER_TID} endpoint=${SERVER_EP} wait_gen=2$" "$NORM" || echo 0)" == "1" ]] || die "server did not block again on cpu 1"
+[[ "$(rg -a -c "X86_SMP_ORACLE_BLOCKED cpu=0 tid=${CLIENT_TID} endpoint=${BLOCK1} wait_gen=2$" "$NORM" || echo 0)" == "1" ]] || die "client did not block again on cpu 0"
 # 7. No CPU was parked by the profile, no shootdown timed out, no home was unauthenticated.
 [[ "$(count "X86_TLB_SHOOTDOWN_FAIL")" == "0" ]] || die "TLB shootdown failure"
 [[ "$(count "X86_USER_FPU_COMMIT_REFUSED")" == "0" ]] || die "FP home commit refused"

@@ -1658,11 +1658,19 @@ impl KernelState {
         let first_build = self.task_status(base_tid).is_none();
         let user_stack_top = PROBE_STACK_VA + (PAGE_SIZE as u64) - 16;
 
+        // QEMU-SMP1 §3: the server address space's root MAP cap, which the witness grants to the
+        // client for its NR 3. Read only by that build.
+        #[cfg_attr(
+            not(all(feature = "x86-smp1-witness", target_arch = "x86_64")),
+            allow(unused_assignments, unused_variables)
+        )]
+        let mut server_as_root: Option<crate::kernel::capabilities::CapId> = None;
         // Idempotent: reuse an already-built per-AP workload ASID.
         let asid = if let Some(existing) = self.task_asid(base_tid) {
             existing
         } else {
-            let (asid, _cap) = self.create_user_address_space()?;
+            let (asid, as_cap) = self.create_user_address_space()?;
+            server_as_root = Some(as_cap);
             // Code page: user + read + write (copy_to_user staging) + execute.
             let code_flags = PageFlags {
                 read: true,
@@ -1907,7 +1915,11 @@ impl KernelState {
                     );
                 }
                 // Client ASID + pages.
-                let (client_asid, _cap) = self.create_user_address_space()?;
+                #[cfg_attr(
+                    not(all(feature = "x86-smp1-witness", target_arch = "x86_64")),
+                    allow(unused_variables)
+                )]
+                let (client_asid, client_as_root) = self.create_user_address_space()?;
                 let ccode = self.alloc_user_data_frame()?;
                 self.map_user_page_in_asid_raw(
                     client_asid,
@@ -2018,7 +2030,22 @@ impl KernelState {
                 // Stage 199A2D2C2C: the reply path uses the recv-v2-capable client stub (SEND @10, reply
                 // RECEIVE cap in BOTH the NR6 arg5 slot @26 and the recv-v2 arg0 slot @83). The request
                 // path keeps the park-after-SEND stub (SEND @10, reply RECEIVE cap @26 only).
-                if reply_flow {
+                // QEMU-SMP1 §3: with the witness armed, both tasks run the witness programs.
+                #[cfg(all(feature = "x86-smp1-witness", target_arch = "x86_64"))]
+                let smp1 = reply_flow && crate::arch::x86_64::smp1_witness::enabled();
+                #[cfg(not(all(feature = "x86-smp1-witness", target_arch = "x86_64")))]
+                let smp1 = false;
+                if smp1 {
+                    #[cfg(all(feature = "x86-smp1-witness", target_arch = "x86_64"))]
+                    self.provision_smp1_witness(
+                        source_tid,
+                        (base_tid, asid, server_as_root, recv_cap_u32),
+                        (client_tid, client_asid, client_as_root),
+                        send_u32,
+                        reply_u32,
+                    )?;
+                    crate::kernel::boot::set_x86_c2c_client_tid(client_tid);
+                } else if reply_flow {
                     let mut cstub = CLIENT_STUB_C2C;
                     cstub[CLIENT_C2C_SEND_CAP_PATCH_OFFSET..CLIENT_C2C_SEND_CAP_PATCH_OFFSET + 4]
                         .copy_from_slice(&send_u32.to_le_bytes());
@@ -2080,6 +2107,98 @@ impl KernelState {
             user_stack_top
         );
         Ok((cr3, PROBE_CODE_VA, user_stack_top))
+    }
+
+    /// QEMU-SMP1 §3 — provision the two-CPU IPI / TLB witness on top of the reply profile's two
+    /// tasks (their address spaces, endpoints, caps and home CPUs are the profile's own).
+    ///
+    /// Setup only: a cap to the OTHER task's address space for each task's NR 3; the programs
+    /// (`smp1_witness.S`) with every cap patched in; per task a pattern page holding its distinct
+    /// FXSAVE image; ONE frame shared by both address spaces as the mailbox; and per task the
+    /// residency probe R (first frame, holding `OLD_R`) plus a kernel alias of its second frame
+    /// (holding `NEW_R`). Nothing here maps W — each task creates its own through NR 13, so the
+    /// page the other task displaces is an ordinary object-backed mapping of the VM owner.
+    #[cfg(all(
+        feature = "x86-smp1-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "x86_64"
+    ))]
+    fn provision_smp1_witness(
+        &mut self,
+        source_tid: u64,
+        server: (u64, Asid, Option<crate::kernel::capabilities::CapId>, u32),
+        client: (u64, Asid, crate::kernel::capabilities::CapId),
+        send_cap: u32,
+        reply_cap: u32,
+    ) -> Result<(), KernelError> {
+        use crate::arch::x86_64::smp1_witness as w;
+        let (server_tid, server_asid, server_as_root, server_recv_cap) = server;
+        let (client_tid, client_asid, client_as_root) = client;
+        let server_as_root = server_as_root.ok_or(KernelError::TaskMissing)?;
+        let map_rights = CapRights::MAP | CapRights::READ | CapRights::WRITE;
+        let client_holds_server_as = self.grant_capability_task_to_task_with_rights(
+            source_tid,
+            server_as_root,
+            client_tid,
+            map_rights,
+        )?;
+        let server_holds_client_as = self.grant_capability_task_to_task_with_rights(
+            source_tid,
+            client_as_root,
+            server_tid,
+            map_rights,
+        )?;
+        let as_u32 = |c: crate::kernel::capabilities::CapId| {
+            u32::try_from(c.0).map_err(|_| KernelError::CapabilityFull)
+        };
+        let server_image = w::server_image(server_recv_cap, as_u32(server_holds_client_as)?);
+        let client_image = w::client_image(send_cap, reply_cap, as_u32(client_holds_server_as)?);
+        self.copy_to_user(server_asid, VirtAddr(0x2000_0000), &server_image)?;
+        self.copy_to_user(client_asid, VirtAddr(0x2000_0000), &client_image)?;
+        let mbx = self.alloc_user_data_frame()?;
+        let mut r_new = [0u64; 2];
+        for (i, (asid, seed, fcw, mxcsr)) in [
+            (server_asid, w::SERVER_SEED, w::SERVER_FCW, w::SERVER_MXCSR),
+            (client_asid, w::CLIENT_SEED, w::CLIENT_FCW, w::CLIENT_MXCSR),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pat = self.alloc_user_data_frame()?;
+            let r_old = self.alloc_user_data_frame()?;
+            r_new[i] = self.alloc_user_data_frame()?;
+            for (va, phys) in [
+                (w::PAT_VA, pat),
+                (w::MBX_VA, mbx),
+                (w::R_VA, r_old),
+                (w::R_ALT_VA, r_new[i]),
+            ] {
+                self.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr(va),
+                    Mapping {
+                        phys: PhysAddr(phys),
+                        flags: PageFlags::USER_RW,
+                    },
+                )?;
+            }
+            self.copy_to_user(asid, VirtAddr(w::PAT_VA), &w::fp_pattern(seed, fcw, mxcsr))?;
+            self.copy_to_user(asid, VirtAddr(w::R_VA), &w::OLD_R.to_le_bytes())?;
+            self.copy_to_user(asid, VirtAddr(w::R_ALT_VA), &w::NEW_R.to_le_bytes())?;
+        }
+        self.copy_to_user(server_asid, VirtAddr(w::MBX_VA), &[0u8; 0x100])?;
+        w::record_targets(server_asid.0, r_new[0], client_asid.0, r_new[1]);
+        crate::yarm_log!(
+            "SMP1_WITNESS_PROVISIONED server_tid={} server_asid={} client_tid={} client_asid={} mbx_phys=0x{:x} server_image={} client_image={}",
+            server_tid,
+            server_asid.0,
+            client_tid,
+            client_asid.0,
+            mbx,
+            server_image.len(),
+            client_image.len()
+        );
+        Ok(())
     }
 
     /// Stage 199A2D2C2B1: true iff `tid` carries a COMMITTED saved userspace continuation

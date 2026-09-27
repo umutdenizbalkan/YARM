@@ -76,6 +76,11 @@ riscv-ipccall-direct-oracle = ["ipccall-direct-oracle"]
 # runtime selector `yarm.x86_64_ipccall_direct_smp_oracle=1`. Depends on the umbrella so the shared
 # direct-transaction logic + class literals compile.
 x86-ipccall-direct-smp-oracle = ["ipccall-direct-oracle"]
+# QEMU-SMP1 §3: the two-CPU IPI / TLB witness on the cross-CPU reply profile — two kernel-built
+# tasks with distinct context patterns that replace W in each other's address space through NR 3
+# while the other is resident in ring 3, a residency probe, and the VM owner's witness markers.
+# Armed only by `yarm.x86_64_smp1_witness=1`. Implies the SMP oracle it runs on.
+x86-smp1-witness = ["x86-ipccall-direct-smp-oracle"]
 
 # Stage 200C2B core: the ARCH-NEUTRAL reply-timeout retirement machinery (the reversible NR7
 # reply-win reserve/commit/rollback, the `ClaimedByReply` deadline lease, the NARROW off-lock

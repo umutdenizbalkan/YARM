@@ -4648,6 +4648,9 @@ fn try_split_blocking_ipc_recv_into_frame(
         endpoint_idx,
         wait_generation
     );
+    // QEMU-SMP1: the cross-CPU oracle profiles grade their tasks' blocks; echo them
+    // synchronously so a ring overflow cannot hide one. Default-off with the reply sub-selector.
+    crate::kernel::boot::maybe_echo_smp_oracle_block(cpu.0, tid, endpoint_idx, wait_generation);
     BlockingLaneOutcome::Settled(D::QueueAdvanceCommitted)
 }
 
@@ -5958,6 +5961,13 @@ fn try_split_debug_log_into_frame(
             crate::kernel::boot::maybe_emit_ipcreply_direct_smp_reply_ok(msg);
             // QEMU-SMP1 §4: the reply profile's state-derived progress summary.
             crate::kernel::boot::maybe_emit_smp1_reply_progress_summary(msg);
+            // QEMU-SMP1 §3: the witness's arm probe and its state-derived summary.
+            #[cfg(all(
+                feature = "x86-smp1-witness",
+                not(feature = "hosted-dev"),
+                target_arch = "x86_64"
+            ))]
+            crate::arch::x86_64::smp1_witness::observe_user_marker(msg);
             // Stage 200C2C2C-R2B: same causal reply-wins gate release on the off-lock DebugLog
             // path, so the seam the oracle actually takes is never the one that misses it.
             crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg);

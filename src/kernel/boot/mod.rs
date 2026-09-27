@@ -4537,8 +4537,22 @@ pub(crate) fn maybe_emit_ipcreply_direct_smp_reply_ok(_msg: &str) {}
 pub(crate) fn maybe_emit_smp1_reply_progress_summary(msg: &str) {
     use core::sync::atomic::{AtomicBool, Ordering};
     static EMITTED: AtomicBool = AtomicBool::new(false);
-    if !x86_ipccall_direct_smp_reply_enabled()
-        || !msg.starts_with("X86_BSP_CLIENT_PROGRESS cpu=0 step=post_reply_yield result=ok")
+    if !x86_ipccall_direct_smp_reply_enabled() {
+        return;
+    }
+    // The client's continuation marker and the profile's two SMP1 user markers are echoed
+    // synchronously: the shared printk ring can drop a pushed `USER_LOG` line while both CPUs
+    // log, and the grader grades these echoes.
+    if msg.starts_with("X86_AP_DUPLICATE_REPLY_REFUSED_OBSERVED")
+        || msg.starts_with("X86_BSP_CLIENT_PROGRESS")
+        || msg.starts_with("X86_BSP_RECV_V2_CONTINUED")
+    {
+        crate::kernel::printk::printk_emit_sync(format_args!(
+            "X86_SMP_REPLY_USER_ECHO {}",
+            msg.trim_end()
+        ));
+    }
+    if !msg.starts_with("X86_BSP_CLIENT_PROGRESS cpu=0 step=post_reply_yield result=ok")
         || EMITTED.swap(true, Ordering::AcqRel)
     {
         return;
@@ -4547,27 +4561,41 @@ pub(crate) fn maybe_emit_smp1_reply_progress_summary(msg: &str) {
     use crate::kernel::scheduler::CpuId;
     let (w0, k0, u0) = percpu::remote_wake_arrivals(CpuId(0));
     let (w1, k1, u1) = percpu::remote_wake_arrivals(CpuId(1));
-    // Two lines: one log record is bounded (192 bytes).
-    crate::yarm_log!(
+    // Two lines: one log record is bounded (192 bytes). Both synchronous: the shared printk ring
+    // can drop a pushed line while both CPUs log.
+    crate::kernel::printk::printk_emit_sync(format_args!(
         "X86_SMP_REPLY_PROGRESS_WAKES cpu0_wake_arrivals={} cpu0_kernel_origin={} cpu0_user_origin={} cpu1_wake_arrivals={} cpu1_kernel_origin={} cpu1_user_origin={}",
-        w0,
-        k0,
-        u0,
-        w1,
-        k1,
-        u1
-    );
-    crate::yarm_log!(
+        w0, k0, u0, w1, k1, u1
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
         "X86_SMP_REPLY_PROGRESS_SUMMARY cpu1_tlb_req_gen={} cpu1_tlb_ack_gen={} reply_delivered={} client_tid={} result=ok",
         percpu::tlb_req_gen(CpuId(1)),
         percpu::tlb_ack_gen(CpuId(1)),
         ipcreply_direct_smp_reply_delivered_count(),
         x86_c2c_client_tid()
-    );
+    ));
 }
 
 #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 pub(crate) fn maybe_emit_smp1_reply_progress_summary(_msg: &str) {}
+
+/// QEMU-SMP1 — a synchronous echo of a split receive block, for the cross-CPU oracle profiles
+/// only (the reply sub-selector, default-off). Their graders use it to require that both tasks
+/// blocked again; the ring-buffered `IPC_RECV_BLOCK_SPLIT_DONE` line can be dropped while both
+/// CPUs log.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn maybe_echo_smp_oracle_block(cpu: u8, tid: u64, endpoint: usize, wait_gen: u64) {
+    if !x86_ipccall_direct_smp_reply_enabled() {
+        return;
+    }
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "X86_SMP_ORACLE_BLOCKED cpu={} tid={} endpoint={} wait_gen={}",
+        cpu, tid, endpoint, wait_gen
+    ));
+}
+
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+pub(crate) fn maybe_echo_smp_oracle_block(_cpu: u8, _tid: u64, _endpoint: usize, _wait_gen: u64) {}
 
 /// Stage 199A2D2C2C: the CPU-0 oracle client's TID, recorded at provisioning. 0 = unset.
 /// QEMU-SMP1 §4: read only by the reply profile's progress summary, which names the task the

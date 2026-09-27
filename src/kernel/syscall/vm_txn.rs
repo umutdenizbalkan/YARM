@@ -731,7 +731,44 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
         let Some(old) = records[index].replaced else {
             continue;
         };
-        if owners.complete_shootdown(asid, records[index].virt) {
+        #[cfg(all(
+            feature = "x86-smp1-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "x86_64"
+        ))]
+        let smp1_watch = crate::arch::x86_64::smp1_witness::watches(records[index].virt.0);
+        #[cfg(all(
+            feature = "x86-smp1-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "x86_64"
+        ))]
+        if smp1_watch {
+            // QEMU-SMP1 §3: the displaced backing, still pinned, before the shootdown starts.
+            crate::kernel::printk::printk_emit_sync(format_args!(
+                "SMP1_VM_DISPLACED asid={} va=0x{:x} old_phys=0x{:x} pinned={} requester_cpu={}",
+                asid.0,
+                records[index].virt.0,
+                old.phys.0,
+                u8::from(records[index].displaced_pinned.is_some()),
+                crate::arch::x86_64::smp1_witness::this_cpu().0
+            ));
+        }
+        let acknowledged = owners.complete_shootdown(asid, records[index].virt);
+        #[cfg(all(
+            feature = "x86-smp1-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "x86_64"
+        ))]
+        if smp1_watch {
+            crate::kernel::printk::printk_emit_sync(format_args!(
+                "SMP1_VM_SHOOTDOWN_COMPLETE asid={} va=0x{:x} acked={} {}",
+                asid.0,
+                records[index].virt.0,
+                u8::from(acknowledged),
+                crate::arch::x86_64::smp1_witness::target_mailbox()
+            ));
+        }
+        if acknowledged {
             // ONE rank-6 operation: release this transaction's hold and reclaim that exact
             // object, named by identity. Reached only once the translation is provably gone, so
             // it is the single point at which the displaced backing becomes reusable — and
@@ -740,6 +777,17 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             // whatever replaced the object it pinned.
             if let Some(object_id) = records[index].displaced_pinned.take() {
                 owners.settle_displaced_hold(object_id, old.phys);
+                #[cfg(all(
+                    feature = "x86-smp1-witness",
+                    not(feature = "hosted-dev"),
+                    target_arch = "x86_64"
+                ))]
+                if smp1_watch {
+                    crate::kernel::printk::printk_emit_sync(format_args!(
+                        "SMP1_VM_DISPLACED_SETTLED asid={} va=0x{:x} old_phys=0x{:x}",
+                        asid.0, records[index].virt.0, old.phys.0
+                    ));
+                }
             }
         }
         // No acknowledgement: the pin stays, and with it the guarantee that no other reclaimer
