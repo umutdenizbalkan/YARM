@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Umut Deniz Balkan */
 /*
- * QEMU-SMP1 §3 — the two-CPU IPI / TLB witness user programs (x86_64).
+ * QEMU-SMP1 §3/§5 — the two-CPU IPI / TLB witness user programs (x86_64).
  *
  * Two kernel-built oracle tasks, copied to 0x2000_0000 in their own address spaces:
  *   server — CPU 1 (the AP), address space A;
@@ -11,28 +11,32 @@
  * RIP-relative inside the program itself.
  *
  * User VAs (both address spaces):
- *   0x2002_0000  marker page (the reply-profile strings; unused here)
  *   0x2003_0000  recv-v2 payload        0x2004_0000  recv-v2 metadata
- *   0x2005_0000  server reply source    0x2006_0000  FXSAVE pattern image (+0x400 capture area)
+ *   0x2005_0000  server reply source
+ *   0x2006_0000  PAT: the task's FXSAVE pattern image; +0x300 per-round scratch; +0x400 capture
  *   0x2007_0000  MBX, ONE frame shared by both address spaces
  *   0x2008_0000  W, created by each task through NR 13, replaced by the OTHER task through NR 3
- *   0x2009_0000  R, the residency probe (kernel-mapped; the kernel re-points it WITHOUT any
- *                invalidation when the requester arms a round, so a target still reading the
- *                old R after the ACK has provably not reloaded CR3 in between)
+ *   0x2009_0000  R, the residency probe. On every arm the kernel re-points it at a frame it has
+ *                never mapped there before, WITHOUT invalidating the target, so a target that
+ *                still reads the value it primed has provably not reloaded CR3 in between.
  *
- * MBX words: +0x00 client_round  +0x08 server_primed  +0x10 client_done
- *            +0x20 client_primed +0x28 server_done
- *            +0x40 server_early  +0x48 client_early   (W seen replaced before the done word)
- *            +0x60 server_brackets +0x68 client_brackets (resident-loop check count)
+ * Phases:
+ *   1. wakes — the IPC round trip (client NR6 -> blocked server, server NR7 -> blocked client);
+ *      each side checks rbx rbp r12..r15 and its FXSAVE pattern after it resumes.
+ *   2. serial rounds r = 1..SMP1_SERIAL_ROUNDS — odd r: the client replaces the server's W while
+ *      the server is RESIDENT in ring 3; even r: the mirror. The resident target checks ten
+ *      GPRs, RFLAGS (CF PF AF ZF SF OF DF) and its FXSAVE image around a flag-neutral dwell.
+ *   3. mutual rounds m = 1..SMP1_MUTUAL_ROUNDS — both tasks cross a barrier and replace each
+ *      other's W at the same time, so each CPU waits for the other's ACK while the other is in
+ *      the kernel doing the same.
  *
- * Context patterns. Across a blocking syscall: rbx rbp r12 r13 r14 r15 and the FXSAVE image
- * (FCW, MXCSR, XMM0..15). While resident: additionally rdi r8 r9 r10 and RFLAGS
- * (CF PF AF ZF SF OF DF). The two tasks use distinct values for every one of them.
+ * MBX words: serial  +0x00 started  +0x08 primed  +0x10 done  +0x18 observed   (round numbers)
+ *            mutual  +0x20/+0x28 ready (server/client)  +0x30/+0x38 nr3 returned
+ *                    +0x40/+0x48 own W checked
  */
     .intel_syntax noprefix
     .pushsection .text.yarm_smp1_witness, "ax", @progbits
 
-    .set SMP1_BASE, 0x20000000
     .set SMP1_PAYLOAD, 0x20030000
     .set SMP1_META, 0x20040000
     .set SMP1_REPLY_SRC, 0x20050000
@@ -40,14 +44,15 @@
     .set SMP1_MBX, 0x20070000
     .set SMP1_W, 0x20080000
     .set SMP1_R, 0x20090000
-    .set SMP1_OLD_R, 0x5151515151515151
     .set SMP1_FLAG_MASK, 0xCD5
+    .set SMP1_SERIAL_ROUNDS, 8
+    .set SMP1_MUTUAL_ROUNDS, 4
 
-    /* DebugLog of one of this program's own strings (RIP-relative, so position-independent). */
-    .macro SMP1_LOG start, msg, msgend
+    /* DebugLog of one of this program's own strings (RIP-relative). */
+    .macro SMP1_LOG msg
     mov eax, 15
     lea rdi, [rip + \msg]
-    lea rsi, [rip + \msgend]
+    lea rsi, [rip + \msg\()_end]
     sub rsi, rdi
     syscall
     .endm
@@ -191,6 +196,191 @@
     ret
     .endm
 
+    /* Spin in ring 3 until MBX[off] >= rbx. */
+    .macro SMP1_WAIT_AT_LEAST off
+    mov esi, SMP1_MBX
+1:  mov rax, qword ptr [rsi + \off]
+    cmp rax, rbx
+    jae 2f
+    pause
+    jmp 1b
+2:
+    .endm
+
+    /*
+     * The round driver. rbx carries the round number between syscalls (the kernel preserves it).
+     *   pfx     label prefix          p/flags/old   this task's patterns and W sentinel
+     *   parity  1 = target in odd serial rounds, 0 = in even ones
+     *   capA/capB  NR 3 patch labels (serial / mutual) for the OTHER task's address space
+     *   rdy/ordy, nr3/onr3, chk/ochk   this task's / the other task's mutual MBX words
+     */
+    .macro SMP1_ROUNDS pfx, p, flags, old, parity, fpcheck, capA, capB, rdy, ordy, nr3, onr3, chk, ochk
+\pfx\()_round:
+    mov esi, SMP1_MBX
+    mov rbx, qword ptr [rsi + 0x18]
+    inc rbx
+    cmp rbx, SMP1_SERIAL_ROUNDS
+    ja \pfx\()_mutual
+    mov eax, ebx
+    and eax, 1
+    cmp eax, \parity
+    je \pfx\()_target
+
+    /* ── requester of round rbx ── */
+    SMP1_WAIT_AT_LEAST 0x08
+    mov qword ptr [rsi + 0x00], rbx
+    SMP1_LOG \pfx\()_m_arm
+    SMP1_REPLACE_W \capA
+    test ecx, ecx
+    jnz \pfx\()_vmmap_fail
+    mov esi, SMP1_MBX
+    mov qword ptr [rsi + 0x10], rbx
+    SMP1_LOG \pfx\()_m_req_done
+    SMP1_WAIT_AT_LEAST 0x18
+    jmp \pfx\()_round
+
+    /* ── resident target of round rbx ── */
+\pfx\()_target:
+    /* This round's sentinel, written and read through the current translation (priming W). */
+    mov esi, SMP1_W
+    movabs rax, \old
+    xor rax, rbx
+    mov qword ptr [rsi], rax
+    mov rcx, qword ptr [rsi]
+    mov edi, SMP1_PAT
+    mov qword ptr [rdi + 0x300], rcx
+    mov qword ptr [rdi + 0x308], rbx
+    /* Prime R and remember the value this CPU's translation yields. */
+    mov esi, SMP1_R
+    mov rax, qword ptr [rsi]
+    mov qword ptr [rdi + 0x310], rax
+    mov esi, SMP1_MBX
+    mov qword ptr [rsi + 0x08], rbx
+    SMP1_SET_RESIDENT \p, \flags
+\pfx\()_tloop:
+    SMP1_DWELL
+    pushfq
+    pop rdx
+    SMP1_CHECK_RESIDENT \p, \flags, \fpcheck, \pfx\()_resident_fail
+    mov r11d, SMP1_PAT
+    mov rcx, qword ptr [r11 + 0x308]
+    mov esi, SMP1_MBX
+    mov rax, qword ptr [rsi + 0x10]
+    cmp rax, rcx
+    je \pfx\()_tobserve
+    /* Keep using W through whatever translation this CPU holds. */
+    mov esi, SMP1_W
+    mov rax, qword ptr [rsi]
+    cmp rax, qword ptr [r11 + 0x300]
+    je \pfx\()_tnext
+    test rax, rax
+    jnz \pfx\()_unexpected
+\pfx\()_tnext:
+    push rdx
+    popfq
+    jmp \pfx\()_tloop
+\pfx\()_tobserve:
+    mov esi, SMP1_W
+    mov r11, qword ptr [rsi]
+    mov esi, SMP1_R
+    mov rsi, qword ptr [rsi]
+    push rdx
+    popfq
+    pushfq
+    pop rdx
+    push rsi
+    push r11
+    SMP1_CHECK_RESIDENT \p, \flags, \fpcheck, \pfx\()_resident_fail
+    pop r11
+    pop rsi
+    cld
+    mov eax, SMP1_PAT
+    cmp rsi, qword ptr [rax + 0x310]
+    jne \pfx\()_residency_lost
+    test r11, r11
+    jz \pfx\()_tok
+    cmp r11, qword ptr [rax + 0x300]
+    je \pfx\()_stale
+    jmp \pfx\()_unexpected
+\pfx\()_tok:
+    SMP1_LOG \pfx\()_m_target_ok
+    mov eax, SMP1_PAT
+    mov rbx, qword ptr [rax + 0x308]
+    mov esi, SMP1_MBX
+    mov qword ptr [rsi + 0x18], rbx
+    jmp \pfx\()_round
+
+    /* ── mutual rounds ── */
+\pfx\()_mutual:
+    xor ebx, ebx
+\pfx\()_mloop:
+    inc ebx
+    cmp ebx, SMP1_MUTUAL_ROUNDS
+    ja \pfx\()_fin
+    /* Prime this CPU's translation of W with this round's sentinel. */
+    mov esi, SMP1_W
+    movabs rax, \old
+    mov rcx, rbx
+    shl rcx, 8
+    xor rax, rcx
+    mov qword ptr [rsi], rax
+    mov rcx, qword ptr [rsi]
+    mov edi, SMP1_PAT
+    mov qword ptr [rdi + 0x300], rcx
+    /* Barrier, then both replace each other's W at once. */
+    mov esi, SMP1_MBX
+    mov qword ptr [rsi + \rdy], rbx
+    SMP1_WAIT_AT_LEAST \ordy
+    SMP1_REPLACE_W \capB
+    test ecx, ecx
+    jnz \pfx\()_vmmap_fail
+    mov esi, SMP1_MBX
+    mov qword ptr [rsi + \nr3], rbx
+    /* The other NR 3 returned only after THIS CPU acknowledged its request. */
+    SMP1_WAIT_AT_LEAST \onr3
+    mov esi, SMP1_W
+    mov rax, qword ptr [rsi]
+    test rax, rax
+    jz \pfx\()_mok
+    mov edi, SMP1_PAT
+    cmp rax, qword ptr [rdi + 0x300]
+    je \pfx\()_mstale
+    jmp \pfx\()_unexpected
+\pfx\()_mok:
+    SMP1_LOG \pfx\()_m_mutual_ok
+    mov esi, SMP1_MBX
+    mov qword ptr [rsi + \chk], rbx
+    SMP1_WAIT_AT_LEAST \ochk
+    jmp \pfx\()_mloop
+\pfx\()_mstale:
+    SMP1_LOG \pfx\()_m_mutual_stale
+    jmp \pfx\()_park
+\pfx\()_residency_lost:
+    SMP1_LOG \pfx\()_m_lost
+    jmp \pfx\()_park
+\pfx\()_stale:
+    SMP1_LOG \pfx\()_m_stale
+    jmp \pfx\()_park
+\pfx\()_resident_fail:
+    cld
+    SMP1_LOG \pfx\()_m_resident_fail
+    jmp \pfx\()_park
+\pfx\()_unexpected:
+    cld
+    SMP1_LOG \pfx\()_m_unexpected
+    jmp \pfx\()_park
+\pfx\()_vmmap_fail:
+    SMP1_LOG \pfx\()_m_vmmap_fail
+\pfx\()_park:
+    pause
+    jmp \pfx\()_park
+    .endm
+
+    .macro SMP1_STR name, text
+\name: .ascii "\text\n"
+\name\()_end:
+    .endm
+
 /* ══════════════════════════════ server: CPU 1, address space A ══════════════════════════ */
     .set SRV_P, 0xA1A1000000000000
     .set SRV_FLAGS, 0xA87
@@ -200,7 +390,7 @@
     .global yarm_smp1_server_start
 yarm_smp1_server_start:
     SMP1_MAKE_W SRV_OLD_W, smp1s_setup_fail
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_entered, smp1s_m_entered_end
+    SMP1_LOG smp1s_m_entered
     /* The context that must survive the block and the AP saved-frame resume. */
     mov eax, SMP1_PAT
     fxrstor64 [rax]
@@ -211,7 +401,7 @@ yarm_smp1_server_start:
     call smp1s_fpcheck
     test eax, eax
     jnz smp1s_resume_ctx_fail
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_resume_ok, smp1s_m_resume_ok_end
+    SMP1_LOG smp1s_m_resume_ok
     /* Reply with the receiver-local Reply cap the metadata carries (CPU 1 -> CPU 0 wake). */
     mov r13d, SMP1_META + 0x10
     mov r13d, dword ptr [r13]
@@ -238,172 +428,44 @@ smp1s_reply_retry:
     jne 1b
     jmp smp1s_reply_retry
 smp1s_replied:
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_replied, smp1s_m_replied_end
-
-    /* ── T01: resident TARGET while the client (CPU 0) replaces W in address space A. ── */
-    SMP1_SET_RESIDENT SRV_P, SRV_FLAGS
-smp1s_t01_loop:
-    SMP1_DWELL
-    pushfq
-    pop rdx
-    SMP1_CHECK_RESIDENT SRV_P, SRV_FLAGS, smp1s_fpcheck, smp1s_resident_fail
-    mov esi, SMP1_MBX
-    add qword ptr [rsi + 0x60], 1
-    mov rax, qword ptr [rsi + 0x00]
-    cmp rax, 1
-    jne smp1s_t01_next
-    mov rax, qword ptr [rsi + 0x08]
-    cmp rax, 1
-    je smp1s_t01_primed
-    /* Prime: use the OLD translations of W and R. */
-    mov esi, SMP1_W
-    mov rax, qword ptr [rsi]
-    movabs rcx, SRV_OLD_W
-    cmp rax, rcx
-    jne smp1s_prime_fail
-    mov esi, SMP1_R
-    mov rax, qword ptr [rsi]
-    movabs rcx, SMP1_OLD_R
-    cmp rax, rcx
-    jne smp1s_prime_fail
-    mov esi, SMP1_MBX
-    mov qword ptr [rsi + 0x08], 1
-    jmp smp1s_t01_next
-smp1s_t01_primed:
-    mov rax, qword ptr [rsi + 0x10]
-    cmp rax, 1
-    je smp1s_t01_observe
-    /* Keep reading W through whatever translation this CPU holds. */
-    mov esi, SMP1_W
-    mov rax, qword ptr [rsi]
-    movabs rcx, SRV_OLD_W
-    cmp rax, rcx
-    je smp1s_t01_next
-    test rax, rax
-    jnz smp1s_unexpected
-    mov esi, SMP1_MBX
-    mov qword ptr [rsi + 0x40], 1
-smp1s_t01_next:
-    push rdx
-    popfq
-    jmp smp1s_t01_loop
-smp1s_t01_observe:
-    mov esi, SMP1_W
-    mov r11, qword ptr [rsi]
-    mov esi, SMP1_R
-    mov rsi, qword ptr [rsi]
-    push rdx
-    popfq
-    /* One more complete check, then leave resident mode. */
-    pushfq
-    pop rdx
-    push rsi
-    push r11
-    SMP1_CHECK_RESIDENT SRV_P, SRV_FLAGS, smp1s_fpcheck, smp1s_resident_fail
-    pop r11
-    pop rsi
-    movabs rax, SMP1_OLD_R
-    cmp rsi, rax
-    jne smp1s_t01_residency_lost
-    test r11, r11
-    jz smp1s_t01_ok
-    movabs rax, SRV_OLD_W
-    cmp r11, rax
-    je smp1s_t01_stale
-    jmp smp1s_unexpected
-smp1s_t01_ok:
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_t01_ok, smp1s_m_t01_ok_end
-    jmp smp1s_t10
-smp1s_t01_residency_lost:
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_t01_lost, smp1s_m_t01_lost_end
-    jmp smp1s_t10
-smp1s_t01_stale:
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_t01_stale, smp1s_m_t01_stale_end
-    jmp smp1s_park
-
-    /* ── T10: REQUESTER — replace W in address space B while the client is resident on CPU 0. ── */
-smp1s_t10:
-    mov esi, SMP1_MBX
-1:  mov rax, qword ptr [rsi + 0x20]
-    cmp rax, 1
-    je 2f
-    pause
-    jmp 1b
-2:
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_arm, smp1s_m_arm_end
-    SMP1_REPLACE_W yarm_smp1_server_client_as_cap
-    test ecx, ecx
-    jnz smp1s_vmmap_fail
-    mov esi, SMP1_MBX
-    mov qword ptr [rsi + 0x28], 1
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_t10_done, smp1s_m_t10_done_end
+    SMP1_LOG smp1s_m_replied
+    SMP1_ROUNDS smp1s, SRV_P, SRV_FLAGS, SRV_OLD_W, 1, smp1s_fpcheck, yarm_smp1_server_client_as_cap, yarm_smp1_server_client_as_cap_m, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48
 smp1s_fin:
+    SMP1_LOG smp1s_m_rounds_done
+smp1s_block:
     SMP1_RECV_V2 yarm_smp1_server_recv_cap_2
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_again, smp1s_m_again_end
-    jmp smp1s_fin
-
+    SMP1_LOG smp1s_m_again
+    jmp smp1s_block
 smp1s_setup_fail:
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_setup_fail, smp1s_m_setup_fail_end
+    SMP1_LOG smp1s_m_setup_fail
     jmp smp1s_park
 smp1s_resume_ctx_fail:
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_resume_fail, smp1s_m_resume_fail_end
+    SMP1_LOG smp1s_m_resume_fail
     jmp smp1s_park
 smp1s_reply_fail:
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_reply_fail, smp1s_m_reply_fail_end
+    SMP1_LOG smp1s_m_reply_fail
     jmp smp1s_park
-smp1s_resident_fail:
-    cld
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_resident_fail, smp1s_m_resident_fail_end
-    jmp smp1s_park
-smp1s_prime_fail:
-    cld
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_prime_fail, smp1s_m_prime_fail_end
-    jmp smp1s_park
-smp1s_unexpected:
-    cld
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_unexpected, smp1s_m_unexpected_end
-    jmp smp1s_park
-smp1s_vmmap_fail:
-    SMP1_LOG yarm_smp1_server_start, smp1s_m_vmmap_fail, smp1s_m_vmmap_fail_end
-smp1s_park:
-    pause
-    jmp smp1s_park
-
 smp1s_fpcheck:
     SMP1_FPCHECK_BODY
 
-smp1s_m_entered: .ascii "SMP1_SERVER_ENTERED cpu=1 result=ok\n"
-smp1s_m_entered_end:
-smp1s_m_resume_ok: .ascii "SMP1_SERVER_RESUME_CONTEXT_OK cpu=1 path=ap_saved_frame gprs=6 fxsave=1 result=ok\n"
-smp1s_m_resume_ok_end:
-smp1s_m_resume_fail: .ascii "SMP1_SERVER_RESUME_CONTEXT_FAIL cpu=1 result=fail\n"
-smp1s_m_resume_fail_end:
-smp1s_m_replied: .ascii "SMP1_SERVER_REPLIED cpu=1 result=ok\n"
-smp1s_m_replied_end:
-smp1s_m_t01_ok: .ascii "SMP1_T01_TARGET_OBSERVED cpu=1 w=replaced r=stale context=ok result=ok\n"
-smp1s_m_t01_ok_end:
-smp1s_m_t01_lost: .ascii "SMP1_T01_TARGET_RESIDENCY_LOST cpu=1 w=any r=reloaded result=inconclusive\n"
-smp1s_m_t01_lost_end:
-smp1s_m_t01_stale: .ascii "SMP1_T01_TARGET_STALE_AFTER_ACK cpu=1 w=old r=stale result=fail\n"
-smp1s_m_t01_stale_end:
-smp1s_m_arm: .ascii "SMP1_ARM_R target=client\n"
-smp1s_m_arm_end:
-smp1s_m_t10_done: .ascii "SMP1_T10_REQUESTER_DONE cpu=1 vm_map=ok result=ok\n"
-smp1s_m_t10_done_end:
-smp1s_m_again: .ascii "SMP1_SERVER_RECV_AGAIN_RETURNED cpu=1 result=unexpected\n"
-smp1s_m_again_end:
-smp1s_m_setup_fail: .ascii "SMP1_SERVER_SETUP_FAIL cpu=1 result=fail\n"
-smp1s_m_setup_fail_end:
-smp1s_m_reply_fail: .ascii "SMP1_SERVER_REPLY_FAIL cpu=1 result=fail\n"
-smp1s_m_reply_fail_end:
-smp1s_m_resident_fail: .ascii "SMP1_SERVER_RESIDENT_CONTEXT_FAIL cpu=1 result=fail\n"
-smp1s_m_resident_fail_end:
-smp1s_m_prime_fail: .ascii "SMP1_SERVER_PRIME_FAIL cpu=1 result=fail\n"
-smp1s_m_prime_fail_end:
-smp1s_m_unexpected: .ascii "SMP1_SERVER_UNEXPECTED_W cpu=1 result=fail\n"
-smp1s_m_unexpected_end:
-smp1s_m_vmmap_fail: .ascii "SMP1_SERVER_VM_MAP_FAIL cpu=1 result=fail\n"
-smp1s_m_vmmap_fail_end:
+    SMP1_STR smp1s_m_entered, "SMP1_SERVER_ENTERED cpu=1 result=ok"
+    SMP1_STR smp1s_m_resume_ok, "SMP1_SERVER_RESUME_CONTEXT_OK cpu=1 path=ap_saved_frame gprs=6 fxsave=1 result=ok"
+    SMP1_STR smp1s_m_resume_fail, "SMP1_SERVER_RESUME_CONTEXT_FAIL cpu=1 result=fail"
+    SMP1_STR smp1s_m_replied, "SMP1_SERVER_REPLIED cpu=1 result=ok"
+    SMP1_STR smp1s_m_arm, "SMP1_ARM_R target=client"
+    SMP1_STR smp1s_m_req_done, "SMP1_REQUESTER_DONE cpu=1 vm_map=ok result=ok"
+    SMP1_STR smp1s_m_target_ok, "SMP1_TARGET_OBSERVED cpu=1 w=replaced r=stale context=ok result=ok"
+    SMP1_STR smp1s_m_lost, "SMP1_TARGET_RESIDENCY_LOST cpu=1 r=reloaded result=fail"
+    SMP1_STR smp1s_m_stale, "SMP1_TARGET_STALE_AFTER_ACK cpu=1 w=old r=stale result=fail"
+    SMP1_STR smp1s_m_mutual_ok, "SMP1_MUTUAL_OBSERVED cpu=1 w=replaced result=ok"
+    SMP1_STR smp1s_m_mutual_stale, "SMP1_MUTUAL_STALE_AFTER_ACK cpu=1 w=old result=fail"
+    SMP1_STR smp1s_m_rounds_done, "SMP1_ROUNDS_DONE cpu=1 result=ok"
+    SMP1_STR smp1s_m_again, "SMP1_SERVER_RECV_AGAIN_RETURNED cpu=1 result=fail"
+    SMP1_STR smp1s_m_setup_fail, "SMP1_SERVER_SETUP_FAIL cpu=1 result=fail"
+    SMP1_STR smp1s_m_reply_fail, "SMP1_SERVER_REPLY_FAIL cpu=1 result=fail"
+    SMP1_STR smp1s_m_resident_fail, "SMP1_SERVER_RESIDENT_CONTEXT_FAIL cpu=1 result=fail"
+    SMP1_STR smp1s_m_unexpected, "SMP1_SERVER_UNEXPECTED_W cpu=1 result=fail"
+    SMP1_STR smp1s_m_vmmap_fail, "SMP1_SERVER_VM_MAP_FAIL cpu=1 result=fail"
     .balign 16
     .global yarm_smp1_server_end
 yarm_smp1_server_end:
@@ -417,7 +479,7 @@ yarm_smp1_server_end:
     .global yarm_smp1_client_start
 yarm_smp1_client_start:
     SMP1_MAKE_W CLI_OLD_W, smp1c_setup_fail
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_entered, smp1c_m_entered_end
+    SMP1_LOG smp1c_m_entered
     /* NR6 to the server (CPU 0 -> CPU 1 wake, CPU 1 idle), bounded WouldBlock retry. */
     xor ebx, ebx
 smp1c_nr6_retry:
@@ -456,165 +518,43 @@ smp1c_sent:
     movabs rcx, 0x214b4f2d594c5052
     cmp rax, rcx
     jne smp1c_resume_ctx_fail
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_resume_ok, smp1c_m_resume_ok_end
-
-    /* ── T01: REQUESTER — replace W in address space A while the server is resident on CPU 1. ── */
-    mov esi, SMP1_MBX
-    mov qword ptr [rsi + 0x00], 1
-1:  mov rax, qword ptr [rsi + 0x08]
-    cmp rax, 1
-    je 2f
-    pause
-    jmp 1b
-2:
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_arm, smp1c_m_arm_end
-    SMP1_REPLACE_W yarm_smp1_client_server_as_cap
-    test ecx, ecx
-    jnz smp1c_vmmap_fail
-    mov esi, SMP1_MBX
-    mov qword ptr [rsi + 0x10], 1
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_t01_done, smp1c_m_t01_done_end
-
-    /* ── T10: resident TARGET while the server (CPU 1) replaces W in address space B. ── */
-    SMP1_SET_RESIDENT CLI_P, CLI_FLAGS
-smp1c_t10_loop:
-    SMP1_DWELL
-    pushfq
-    pop rdx
-    SMP1_CHECK_RESIDENT CLI_P, CLI_FLAGS, smp1c_fpcheck, smp1c_resident_fail
-    mov esi, SMP1_MBX
-    add qword ptr [rsi + 0x68], 1
-    mov rax, qword ptr [rsi + 0x20]
-    cmp rax, 1
-    je smp1c_t10_primed
-    mov esi, SMP1_W
-    mov rax, qword ptr [rsi]
-    movabs rcx, CLI_OLD_W
-    cmp rax, rcx
-    jne smp1c_prime_fail
-    mov esi, SMP1_R
-    mov rax, qword ptr [rsi]
-    movabs rcx, SMP1_OLD_R
-    cmp rax, rcx
-    jne smp1c_prime_fail
-    mov esi, SMP1_MBX
-    mov qword ptr [rsi + 0x20], 1
-    jmp smp1c_t10_next
-smp1c_t10_primed:
-    mov rax, qword ptr [rsi + 0x28]
-    cmp rax, 1
-    je smp1c_t10_observe
-    mov esi, SMP1_W
-    mov rax, qword ptr [rsi]
-    movabs rcx, CLI_OLD_W
-    cmp rax, rcx
-    je smp1c_t10_next
-    test rax, rax
-    jnz smp1c_unexpected
-    mov esi, SMP1_MBX
-    mov qword ptr [rsi + 0x48], 1
-smp1c_t10_next:
-    push rdx
-    popfq
-    jmp smp1c_t10_loop
-smp1c_t10_observe:
-    mov esi, SMP1_W
-    mov r11, qword ptr [rsi]
-    mov esi, SMP1_R
-    mov rsi, qword ptr [rsi]
-    push rdx
-    popfq
-    pushfq
-    pop rdx
-    push rsi
-    push r11
-    SMP1_CHECK_RESIDENT CLI_P, CLI_FLAGS, smp1c_fpcheck, smp1c_resident_fail
-    pop r11
-    pop rsi
-    cld
-    movabs rax, SMP1_OLD_R
-    cmp rsi, rax
-    jne smp1c_t10_residency_lost
-    test r11, r11
-    jz smp1c_t10_ok
-    movabs rax, CLI_OLD_W
-    cmp r11, rax
-    je smp1c_t10_stale
-    jmp smp1c_unexpected
-smp1c_t10_ok:
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_t10_ok, smp1c_m_t10_ok_end
-    jmp smp1c_fin
-smp1c_t10_residency_lost:
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_t10_lost, smp1c_m_t10_lost_end
-    jmp smp1c_fin
-smp1c_t10_stale:
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_t10_stale, smp1c_m_t10_stale_end
-    jmp smp1c_park
+    SMP1_LOG smp1c_m_resume_ok
+    SMP1_ROUNDS smp1c, CLI_P, CLI_FLAGS, CLI_OLD_W, 0, smp1c_fpcheck, yarm_smp1_client_server_as_cap, yarm_smp1_client_server_as_cap_m, 0x28, 0x20, 0x38, 0x30, 0x48, 0x40
 smp1c_fin:
+    SMP1_LOG smp1c_m_rounds_done
+smp1c_block:
     SMP1_RECV_V2 yarm_smp1_client_reply_cap_2
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_again, smp1c_m_again_end
-    jmp smp1c_fin
-
+    SMP1_LOG smp1c_m_again
+    jmp smp1c_block
 smp1c_setup_fail:
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_setup_fail, smp1c_m_setup_fail_end
+    SMP1_LOG smp1c_m_setup_fail
     jmp smp1c_park
 smp1c_nr6_fail:
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_nr6_fail, smp1c_m_nr6_fail_end
+    SMP1_LOG smp1c_m_nr6_fail
     jmp smp1c_park
 smp1c_resume_ctx_fail:
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_resume_fail, smp1c_m_resume_fail_end
+    SMP1_LOG smp1c_m_resume_fail
     jmp smp1c_park
-smp1c_resident_fail:
-    cld
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_resident_fail, smp1c_m_resident_fail_end
-    jmp smp1c_park
-smp1c_prime_fail:
-    cld
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_prime_fail, smp1c_m_prime_fail_end
-    jmp smp1c_park
-smp1c_unexpected:
-    cld
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_unexpected, smp1c_m_unexpected_end
-    jmp smp1c_park
-smp1c_vmmap_fail:
-    SMP1_LOG yarm_smp1_client_start, smp1c_m_vmmap_fail, smp1c_m_vmmap_fail_end
-smp1c_park:
-    pause
-    jmp smp1c_park
-
 smp1c_fpcheck:
     SMP1_FPCHECK_BODY
 
-smp1c_m_entered: .ascii "SMP1_CLIENT_ENTERED cpu=0 result=ok\n"
-smp1c_m_entered_end:
-smp1c_m_resume_ok: .ascii "SMP1_CLIENT_RESUME_CONTEXT_OK cpu=0 path=production_selection gprs=6 fxsave=1 reply=ok result=ok\n"
-smp1c_m_resume_ok_end:
-smp1c_m_resume_fail: .ascii "SMP1_CLIENT_RESUME_CONTEXT_FAIL cpu=0 result=fail\n"
-smp1c_m_resume_fail_end:
-smp1c_m_arm: .ascii "SMP1_ARM_R target=server\n"
-smp1c_m_arm_end:
-smp1c_m_t01_done: .ascii "SMP1_T01_REQUESTER_DONE cpu=0 vm_map=ok result=ok\n"
-smp1c_m_t01_done_end:
-smp1c_m_t10_ok: .ascii "SMP1_T10_TARGET_OBSERVED cpu=0 w=replaced r=stale context=ok result=ok\n"
-smp1c_m_t10_ok_end:
-smp1c_m_t10_lost: .ascii "SMP1_T10_TARGET_RESIDENCY_LOST cpu=0 w=any r=reloaded result=inconclusive\n"
-smp1c_m_t10_lost_end:
-smp1c_m_t10_stale: .ascii "SMP1_T10_TARGET_STALE_AFTER_ACK cpu=0 w=old r=stale result=fail\n"
-smp1c_m_t10_stale_end:
-smp1c_m_again: .ascii "SMP1_CLIENT_RECV_AGAIN_RETURNED cpu=0 result=unexpected\n"
-smp1c_m_again_end:
-smp1c_m_setup_fail: .ascii "SMP1_CLIENT_SETUP_FAIL cpu=0 result=fail\n"
-smp1c_m_setup_fail_end:
-smp1c_m_nr6_fail: .ascii "SMP1_CLIENT_NR6_FAIL cpu=0 result=fail\n"
-smp1c_m_nr6_fail_end:
-smp1c_m_resident_fail: .ascii "SMP1_CLIENT_RESIDENT_CONTEXT_FAIL cpu=0 result=fail\n"
-smp1c_m_resident_fail_end:
-smp1c_m_prime_fail: .ascii "SMP1_CLIENT_PRIME_FAIL cpu=0 result=fail\n"
-smp1c_m_prime_fail_end:
-smp1c_m_unexpected: .ascii "SMP1_CLIENT_UNEXPECTED_W cpu=0 result=fail\n"
-smp1c_m_unexpected_end:
-smp1c_m_vmmap_fail: .ascii "SMP1_CLIENT_VM_MAP_FAIL cpu=0 result=fail\n"
-smp1c_m_vmmap_fail_end:
+    SMP1_STR smp1c_m_entered, "SMP1_CLIENT_ENTERED cpu=0 result=ok"
+    SMP1_STR smp1c_m_resume_ok, "SMP1_CLIENT_RESUME_CONTEXT_OK cpu=0 path=production_selection gprs=6 fxsave=1 reply=ok result=ok"
+    SMP1_STR smp1c_m_resume_fail, "SMP1_CLIENT_RESUME_CONTEXT_FAIL cpu=0 result=fail"
+    SMP1_STR smp1c_m_arm, "SMP1_ARM_R target=server"
+    SMP1_STR smp1c_m_req_done, "SMP1_REQUESTER_DONE cpu=0 vm_map=ok result=ok"
+    SMP1_STR smp1c_m_target_ok, "SMP1_TARGET_OBSERVED cpu=0 w=replaced r=stale context=ok result=ok"
+    SMP1_STR smp1c_m_lost, "SMP1_TARGET_RESIDENCY_LOST cpu=0 r=reloaded result=fail"
+    SMP1_STR smp1c_m_stale, "SMP1_TARGET_STALE_AFTER_ACK cpu=0 w=old r=stale result=fail"
+    SMP1_STR smp1c_m_mutual_ok, "SMP1_MUTUAL_OBSERVED cpu=0 w=replaced result=ok"
+    SMP1_STR smp1c_m_mutual_stale, "SMP1_MUTUAL_STALE_AFTER_ACK cpu=0 w=old result=fail"
+    SMP1_STR smp1c_m_rounds_done, "SMP1_ROUNDS_DONE cpu=0 result=ok"
+    SMP1_STR smp1c_m_again, "SMP1_CLIENT_RECV_AGAIN_RETURNED cpu=0 result=fail"
+    SMP1_STR smp1c_m_setup_fail, "SMP1_CLIENT_SETUP_FAIL cpu=0 result=fail"
+    SMP1_STR smp1c_m_nr6_fail, "SMP1_CLIENT_NR6_FAIL cpu=0 result=fail"
+    SMP1_STR smp1c_m_resident_fail, "SMP1_CLIENT_RESIDENT_CONTEXT_FAIL cpu=0 result=fail"
+    SMP1_STR smp1c_m_unexpected, "SMP1_CLIENT_UNEXPECTED_W cpu=0 result=fail"
+    SMP1_STR smp1c_m_vmmap_fail, "SMP1_CLIENT_VM_MAP_FAIL cpu=0 result=fail"
     .balign 16
     .global yarm_smp1_client_end
 yarm_smp1_client_end:
@@ -622,7 +562,9 @@ yarm_smp1_client_end:
     .global yarm_smp1_server_recv_cap_1
     .global yarm_smp1_server_recv_cap_2
     .global yarm_smp1_server_client_as_cap
+    .global yarm_smp1_server_client_as_cap_m
     .global yarm_smp1_client_reply_cap_1
     .global yarm_smp1_client_reply_cap_2
     .global yarm_smp1_client_server_as_cap
+    .global yarm_smp1_client_server_as_cap_m
     .popsection

@@ -2115,8 +2115,9 @@ impl KernelState {
     /// Setup only: a cap to the OTHER task's address space for each task's NR 3; the programs
     /// (`smp1_witness.S`) with every cap patched in; per task a pattern page holding its distinct
     /// FXSAVE image; ONE frame shared by both address spaces as the mailbox; and per task the
-    /// residency probe R (first frame, holding `OLD_R`) plus a kernel alias of its second frame
-    /// (holding `NEW_R`). Nothing here maps W — each task creates its own through NR 13, so the
+    /// residency probe R (first frame, holding `OLD_R`) plus one fresh frame per round the task
+    /// is a target, each holding a distinct value and reached only through a kernel alias until
+    /// the arm hook re-points R at it. Nothing here maps W — each task creates its own through NR 13, so the
     /// page the other task displaces is an ordinary object-backed mapping of the VM owner.
     #[cfg(all(
         feature = "x86-smp1-witness",
@@ -2156,7 +2157,7 @@ impl KernelState {
         self.copy_to_user(server_asid, VirtAddr(0x2000_0000), &server_image)?;
         self.copy_to_user(client_asid, VirtAddr(0x2000_0000), &client_image)?;
         let mbx = self.alloc_user_data_frame()?;
-        let mut r_new = [0u64; 2];
+        let mut r_frames = [[0u64; w::TARGET_ROUNDS]; 2];
         for (i, (asid, seed, fcw, mxcsr)) in [
             (server_asid, w::SERVER_SEED, w::SERVER_FCW, w::SERVER_MXCSR),
             (client_asid, w::CLIENT_SEED, w::CLIENT_FCW, w::CLIENT_MXCSR),
@@ -2166,13 +2167,7 @@ impl KernelState {
         {
             let pat = self.alloc_user_data_frame()?;
             let r_old = self.alloc_user_data_frame()?;
-            r_new[i] = self.alloc_user_data_frame()?;
-            for (va, phys) in [
-                (w::PAT_VA, pat),
-                (w::MBX_VA, mbx),
-                (w::R_VA, r_old),
-                (w::R_ALT_VA, r_new[i]),
-            ] {
+            for (va, phys) in [(w::PAT_VA, pat), (w::MBX_VA, mbx), (w::R_VA, r_old)] {
                 self.map_user_page_in_asid_raw(
                     asid,
                     VirtAddr(va),
@@ -2184,10 +2179,24 @@ impl KernelState {
             }
             self.copy_to_user(asid, VirtAddr(w::PAT_VA), &w::fp_pattern(seed, fcw, mxcsr))?;
             self.copy_to_user(asid, VirtAddr(w::R_VA), &w::OLD_R.to_le_bytes())?;
-            self.copy_to_user(asid, VirtAddr(w::R_ALT_VA), &w::NEW_R.to_le_bytes())?;
+            // One fresh frame per round this task is a target, each with its own value.
+            for (k, slot) in r_frames[i].iter_mut().enumerate() {
+                let frame = self.alloc_user_data_frame()?;
+                let alias = VirtAddr(w::R_ALT_VA + (k as u64) * PAGE_SIZE as u64);
+                self.map_user_page_in_asid_raw(
+                    asid,
+                    alias,
+                    Mapping {
+                        phys: PhysAddr(frame),
+                        flags: PageFlags::USER_RW,
+                    },
+                )?;
+                self.copy_to_user(asid, alias, &(w::NEW_R + k as u64 + 1).to_le_bytes())?;
+                *slot = frame;
+            }
         }
         self.copy_to_user(server_asid, VirtAddr(w::MBX_VA), &[0u8; 0x100])?;
-        w::record_targets(server_asid.0, r_new[0], client_asid.0, r_new[1]);
+        w::record_targets(server_asid.0, r_frames[0], client_asid.0, r_frames[1]);
         crate::yarm_log!(
             "SMP1_WITNESS_PROVISIONED server_tid={} server_asid={} client_tid={} client_asid={} mbx_phys=0x{:x} server_image={} client_image={}",
             server_tid,

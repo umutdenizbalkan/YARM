@@ -462,6 +462,48 @@ pub fn tlb_request_shootdown(cpu: CpuId, va: u64) -> u32 {
     }
 }
 
+/// QEMU-SMP1 §5 — `cpu` services its OWN TLB mailbox from inside an ACK wait.
+///
+/// A requester waits for its target's ACK with interrupts masked (every kernel entry runs with
+/// IF=0) and no domain lock held. When the target is itself in the kernel waiting for an ACK
+/// from THIS CPU — two CPUs replacing mappings in each other's address spaces at the same time —
+/// neither can take the other's 0xF1, and before this each wait ran to its 20M-poll timeout
+/// (live: one of the two shootdowns of every mutual round timed out and its displaced frame
+/// stayed pinned for good). The wait now performs for its own mailbox exactly what the stub
+/// does, in the stub's order: request generation first, then the VA; the invalidation (VA 0:
+/// full non-global flush by CR3 reload); the origin (`kernel` — the request was taken in ring 0);
+/// the ACK last. It must run ON `cpu` with interrupts masked, so it cannot interleave with this
+/// CPU's own stub; when that stub later takes the still-pending 0xF1 it finds `req == ack` and
+/// only EOIs. The ACK is still produced only by the target CPU itself. Returns the generation it
+/// acknowledged, or `None` when nothing was pending.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn service_own_tlb_request(cpu: CpuId) -> Option<u32> {
+    use core::sync::atomic::{Ordering, compiler_fence};
+    let base = record_base(cpu) as *mut PerCpuRecord;
+    // SAFETY: `cpu`'s own record; field-granular volatile accesses, as the stub makes.
+    unsafe {
+        let generation = core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_req_gen));
+        compiler_fence(Ordering::SeqCst);
+        let va = core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_req_va));
+        if generation == core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_ack_gen)) {
+            return None;
+        }
+        if va == 0 {
+            core::arch::asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack));
+        } else {
+            core::arch::asm!("invlpg [{va}]", va = in(reg) va, options(nostack));
+        }
+        compiler_fence(Ordering::SeqCst);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*base).tlb_ack_origin),
+            TLB_ACK_ORIGIN_KERNEL,
+        );
+        compiler_fence(Ordering::SeqCst);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*base).tlb_ack_gen), generation);
+        Some(generation)
+    }
+}
+
 /// Stage 183.6: BSP reads the AP's TLB shootdown ACK generation for `cpu`.
 pub fn tlb_ack_gen(cpu: CpuId) -> u32 {
     let base = record_base(cpu) as *const PerCpuRecord;

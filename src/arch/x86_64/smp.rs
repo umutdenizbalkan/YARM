@@ -1647,6 +1647,7 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
         return 0;
     }
     let mut acked = 0usize;
+    let me = super::descriptor_tables::current_cpu_id();
     for raw in 0..crate::arch::platform_constants::MAX_CPUS {
         if targets & (1u64 << raw) == 0 {
             continue;
@@ -1671,6 +1672,12 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
             if super::percpu::tlb_ack_gen(cpu) == want {
                 got = true;
                 break;
+            }
+            // QEMU-SMP1 §5: the target may be waiting for THIS CPU's ACK with interrupts masked,
+            // exactly as this CPU is waiting for its. Answer our own mailbox while we wait, so
+            // two CPUs replacing each other's mappings at once both make progress.
+            if let Some(generation) = super::percpu::service_own_tlb_request(me) {
+                note_tlb_serviced_in_wait(me, generation, cpu, want);
             }
             cpu_relax();
         }
@@ -1715,6 +1722,30 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
         }
     }
     acked
+}
+
+/// QEMU-SMP1 §5: per CPU, how many of its OWN TLB requests it acknowledged from inside an ACK
+/// wait of its own (see `percpu::service_own_tlb_request`).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static TLB_SERVICED_IN_WAIT: [core::sync::atomic::AtomicU32;
+    crate::arch::platform_constants::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; crate::arch::platform_constants::MAX_CPUS];
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn note_tlb_serviced_in_wait(me: CpuId, generation: u32, waiting_for: CpuId, want: u32) {
+    let idx = (me.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    let n = TLB_SERVICED_IN_WAIT[idx].fetch_add(1, Ordering::AcqRel) + 1;
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "X86_TLB_OWN_REQUEST_SERVICED_IN_WAIT cpu={} gen={} waiting_for_cpu={} want_gen={} count={}",
+        me.0, generation, waiting_for.0, want, n
+    ));
+}
+
+/// QEMU-SMP1 §5: the count behind `note_tlb_serviced_in_wait`.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn tlb_serviced_in_wait(cpu: CpuId) -> u32 {
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    TLB_SERVICED_IN_WAIT[idx].load(Ordering::Acquire)
 }
 
 /// The online, wake-only APs (Stage 183.5) — the set that must acknowledge a TLB
