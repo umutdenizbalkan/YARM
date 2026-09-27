@@ -100,6 +100,11 @@ pub const AP_SYSCALL_REENTRY_OK_OFFSET: usize = 168;
 /// policy: nothing reads it to make a decision, and it exists so the D3 proof can state which
 /// privilege level actually acknowledged, instead of assuming.
 pub const TLB_ACK_ORIGIN_OFFSET: usize = 172;
+/// QEMU-SMP1 §3: remote-wake (0xF1) arrivals that interrupted CPL 0 (idle/kernel), counted by the
+/// target's own handler via `gs:[176]`. State-derived: a hardware arrival, not a logical request.
+pub const WAKE_ORIGIN_KERNEL_COUNT_OFFSET: usize = 176;
+/// QEMU-SMP1 §3: remote-wake (0xF1) arrivals that interrupted CPL 3, via `gs:[180]`.
+pub const WAKE_ORIGIN_USER_COUNT_OFFSET: usize = 180;
 /// No ACK has been recorded for the current request generation.
 pub const TLB_ACK_ORIGIN_NONE: u32 = 0;
 /// The 0xF1 that produced the ACK interrupted CPL0 (kernel idle / kernel code).
@@ -145,8 +150,10 @@ pub const TLB_ACK_ORIGIN_USER: u32 = 2;
 /// - `164`: ap_dispatch_stage   u32 (Stage 189C6: AP: live-dispatch progress)
 /// - `168`: ap_syscall_reentry_ok u32 (Stage 189C6: LSTAR probe: 1 = AP re-entry)
 /// - `172`: tlb_ack_origin  u32 (U9-D3, AP via gs:: 0 none / 1 kernel / 2 user)
+/// - `176`: wake_origin_kernel_count u32 (QEMU-SMP1: 0xF1 arrivals from CPL 0, via gs:)
+/// - `180`: wake_origin_user_count   u32 (QEMU-SMP1: 0xF1 arrivals from CPL 3, via gs:)
 ///
-/// Explicit-field bytes = 176; struct stride = 192 (64-byte aligned).
+/// Explicit-field bytes = 184; struct stride = 192 (64-byte aligned).
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct PerCpuRecord {
@@ -184,6 +191,8 @@ pub struct PerCpuRecord {
     pub ap_dispatch_stage: u32,
     pub ap_syscall_reentry_ok: u32,
     pub tlb_ack_origin: u32,
+    pub wake_origin_kernel_count: u32,
+    pub wake_origin_user_count: u32,
 }
 
 impl PerCpuRecord {
@@ -225,6 +234,8 @@ impl PerCpuRecord {
             ap_dispatch_stage: 0,
             ap_syscall_reentry_ok: 0,
             tlb_ack_origin: 0,
+            wake_origin_kernel_count: 0,
+            wake_origin_user_count: 0,
         }
     }
 }
@@ -254,6 +265,14 @@ const _: () = {
         core::mem::offset_of!(PerCpuRecord, ap_syscall_reentry_ok) == AP_SYSCALL_REENTRY_OK_OFFSET
     );
     assert!(core::mem::offset_of!(PerCpuRecord, tlb_ack_origin) == TLB_ACK_ORIGIN_OFFSET);
+    assert!(
+        core::mem::offset_of!(PerCpuRecord, wake_origin_kernel_count)
+            == WAKE_ORIGIN_KERNEL_COUNT_OFFSET
+    );
+    assert!(
+        core::mem::offset_of!(PerCpuRecord, wake_origin_user_count)
+            == WAKE_ORIGIN_USER_COUNT_OFFSET
+    );
     assert!(core::mem::size_of::<PerCpuRecord>() == 192);
 };
 
@@ -319,6 +338,8 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             ap_dispatch_stage: 0,
             ap_syscall_reentry_ok: 0,
             tlb_ack_origin: 0,
+            wake_origin_kernel_count: 0,
+            wake_origin_user_count: 0,
         };
         core::ptr::write_volatile(base, record);
     }
@@ -445,6 +466,25 @@ pub fn tlb_request_shootdown(cpu: CpuId, va: u64) -> u32 {
 pub fn tlb_ack_gen(cpu: CpuId) -> u32 {
     let base = record_base(cpu) as *const PerCpuRecord;
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_ack_gen)) }
+}
+
+/// QEMU-SMP1 §3: the last TLB request generation published into `cpu`'s mailbox.
+pub fn tlb_req_gen(cpu: CpuId) -> u32 {
+    let base = record_base(cpu) as *const PerCpuRecord;
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_req_gen)) }
+}
+
+/// QEMU-SMP1 §3: hardware 0xF1 arrivals on `cpu`, as counted by its own handler — total, and split
+/// by the privilege level each one interrupted. Read-only observation of target-owned counters.
+pub fn remote_wake_arrivals(cpu: CpuId) -> (u32, u32, u32) {
+    let base = record_base(cpu) as *const PerCpuRecord;
+    unsafe {
+        (
+            core::ptr::read_volatile(core::ptr::addr_of!((*base).remote_wake_count)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*base).wake_origin_kernel_count)),
+            core::ptr::read_volatile(core::ptr::addr_of!((*base).wake_origin_user_count)),
+        )
+    }
 }
 
 /// U9-D3: BSP reads the privilege level the acknowledging 0xF1 interrupted.

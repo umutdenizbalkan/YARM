@@ -7053,50 +7053,109 @@ fn frame_fpu_region(frame: &mut Aarch64VectorFrame) -> *mut u8 {
     core::ptr::addr_of_mut!(frame.neon).cast::<u8>()
 }
 
-/// QEMU-CONTEXT1 §2 — commit the EL0 exception's captured FP/SIMD state to the running task.
+/// QEMU-SMP1 §2 — what the EL0 entry committed, and the continuation it entered on.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-fn user_fpu_commit_on_entry(frame: &mut Aarch64VectorFrame, cpu: crate::kernel::scheduler::CpuId) {
-    let Some(shared) = trap_shared_kernel() else {
-        return;
+struct UserFpuEntry {
+    committed: Option<Result<crate::runtime::FpuHomeOwner, crate::runtime::FpuHomeRefusal>>,
+    elr: u64,
+    sp_el0: u64,
+    ttbr0: u64,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn read_ttbr0_raw() -> u64 {
+    let v: u64;
+    // SAFETY: reading TTBR0_EL1 has no side effect.
+    unsafe {
+        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) v, options(nomem, nostack, preserves_flags))
     };
-    let Some(tid) = shared.current_tid_authoritative(cpu).filter(|&t| t != 0) else {
-        return;
+    v
+}
+
+/// QEMU-CONTEXT1 §2 / QEMU-SMP1 §2 — commit the EL0 exception's captured FP/SIMD state to the
+/// home of the exact incarnation this CPU is running; authentication and write are one
+/// transaction (`commit_user_fpu_current_split`), and a refusal writes nothing.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn user_fpu_commit_on_entry(
+    frame: &mut Aarch64VectorFrame,
+    cpu: crate::kernel::scheduler::CpuId,
+) -> UserFpuEntry {
+    let mut entry = UserFpuEntry {
+        committed: None,
+        elr: frame.elr_el1,
+        sp_el0: frame.sp_el0,
+        ttbr0: read_ttbr0_raw(),
+    };
+    let Some(shared) = trap_shared_kernel() else {
+        return entry;
     };
     // SAFETY: the frame's 544-byte FP region (asserted layout).
     let state =
         unsafe { crate::kernel::user_fpu::UserFpuState::read_from(frame_fpu_region(frame)) };
-    if !shared.commit_user_fpu_split(tid, &state) {
+    let committed = shared.commit_user_fpu_current_split(cpu, &state);
+    if let Err(refusal) = committed {
         crate::yarm_log!(
-            "AARCH64_USER_FPU_COMMIT_REFUSED cpu={} tid={} reason=no_tcb",
+            "AARCH64_USER_FPU_COMMIT_REFUSED cpu={} tid={} reason={}",
             cpu.0,
-            tid
+            refusal.tid(),
+            refusal.reason()
         );
     }
+    entry.committed = Some(committed);
+    entry
 }
 
-/// QEMU-CONTEXT1 §2 — load the resuming task's home into the frame the epilogue restores from.
+/// QEMU-CONTEXT1 §2 / QEMU-SMP1 §2 — load the resuming incarnation's home into the frame the
+/// epilogue restores from. Same settlement as the x86_64 bridge: an unauthenticated home is
+/// left as captured only for a return to the very continuation the exception entered on whose
+/// own commit was also refused (the frame still holds its live state); any other EL0 return
+/// with an unauthenticated home is fatal with the reason named — never a reset image for an
+/// existing continuation, never another context's bytes.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-fn user_fpu_load_for_return(frame: &mut Aarch64VectorFrame, cpu: crate::kernel::scheduler::CpuId) {
+fn user_fpu_load_for_return(
+    frame: &mut Aarch64VectorFrame,
+    cpu: crate::kernel::scheduler::CpuId,
+    entry: Option<&UserFpuEntry>,
+) {
     let Some(shared) = trap_shared_kernel() else {
         return;
     };
-    let resuming = shared.current_tid_authoritative(cpu).filter(|&t| t != 0);
     let region = frame_fpu_region(frame);
-    match resuming.and_then(|tid| shared.load_user_fpu_split(tid)) {
-        // SAFETY: the frame's FP region, as above.
-        Some(state) => unsafe { state.write_to(region) },
-        None => {
-            // An EL0 return with no resumable owner cannot legitimately happen; never let the
-            // frame's previous contents (another context's state) reach EL0.
-            crate::yarm_log!(
-                "AARCH64_USER_FPU_LOAD_REFUSED cpu={} tid={} reason=no_home",
-                cpu.0,
-                resuming.unwrap_or(0)
-            );
-            // SAFETY: as above.
-            unsafe { crate::kernel::user_fpu::UserFpuState::initial().write_to(region) };
+    let refusal = match shared.load_user_fpu_current_split(cpu) {
+        Ok((_owner, state)) => {
+            // SAFETY: the frame's FP region, as above.
+            unsafe { state.write_to(region) };
+            return;
         }
+        Err(refusal) => refusal,
+    };
+    let unswitched_unauthenticated = entry.is_some_and(|e| {
+        matches!(e.committed, Some(Err(_)))
+            && e.elr == frame.elr_el1
+            && e.sp_el0 == frame.sp_el0
+            && e.ttbr0 == read_ttbr0_raw()
+    });
+    if unswitched_unauthenticated {
+        crate::yarm_log!(
+            "AARCH64_USER_FPU_HOME_UNAUTHENTICATED cpu={} tid={} reason={} action=kept_captured",
+            cpu.0,
+            refusal.tid(),
+            refusal.reason()
+        );
+        return;
     }
+    crate::yarm_log!(
+        "AARCH64_USER_FPU_HOME_UNAUTHENTICATED cpu={} tid={} reason={} action=fatal",
+        cpu.0,
+        refusal.tid(),
+        refusal.reason()
+    );
+    crate::pr_err!(
+        "aarch64 EL0 return with an unauthenticated FP/SIMD home: cpu={} reason={}",
+        cpu.0,
+        refusal.reason()
+    );
+    halt_stage1();
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -7263,9 +7322,11 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     // any compiled code ran; before anything can block, switch or diverge into idle, that state
     // becomes the task's home. An EL1-origin frame holds the interrupted KERNEL context and is
     // restored verbatim unless this exception returns to EL0.
-    if (9..=16).contains(&kind) {
-        user_fpu_commit_on_entry(frame, trap_cpu);
-    }
+    let fpu_entry = if (9..=16).contains(&kind) {
+        Some(user_fpu_commit_on_entry(frame, trap_cpu))
+    } else {
+        None
+    };
     // QEMU-CONTEXT1 §3: vector kinds 9..=16 are lower-EL (EL0) exceptions.
     #[cfg(feature = "context1-witness")]
     let entered_from_user = (9..=16).contains(&kind);
@@ -7452,7 +7513,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     // same-task return, the switched-in task's for a switch, the selected task's for an
     // idle-boundary conversion.
     if frame.spsr_el1 & 0x1F == 0 {
-        user_fpu_load_for_return(frame, trap_cpu);
+        user_fpu_load_for_return(frame, trap_cpu, fpu_entry.as_ref());
     }
     match kind {
         1 => crate::arch::aarch64::console::write_line(

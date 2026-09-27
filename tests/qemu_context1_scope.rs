@@ -136,12 +136,15 @@ fn x86_commit_precedes_and_load_follows_the_dispatch() {
         X86_DT,
         "#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]\n#[unsafe(no_mangle)]\nextern \"C\" fn yarm_x86_dispatch_trap_from_stub(",
     ));
-    let commit = pos(&w, "user_fpu_commit_on_entry(fpu_area);");
+    let commit = pos(&w, "user_fpu_commit_on_entry(fpu_area)");
     let body = pos(
         &w,
         "x86_trap_dispatch_body(vector, error_code, regs, interrupt_frame);",
     );
-    let load = pos(&w, "user_fpu_load_for_return(fpu_area);");
+    let load = pos(
+        &w,
+        "user_fpu_load_for_return(fpu_area, entered, unswitched);",
+    );
     assert!(commit < body && body < load);
     let clobber = pos(&w, "clobber_user_visible_state();");
     assert!(load < clobber);
@@ -164,18 +167,20 @@ fn x86_first_entry_and_saved_frame_resumes_install_a_home() {
             .trim_start()
             .starts_with("fxrstor64 [rsi]")
     );
+    // QEMU-SMP1 §2 re-derivation: the oracle-only BSP resume is retired, and the one remaining
+    // saved-frame resume installs the home read in its authenticated snapshot — never an
+    // initial image substituted for a home it could not find.
+    assert!(!X86_SMP.contains("UserFpuState::initial"));
+    assert!(!X86_SMP.contains("load_user_fpu_split"));
     assert_eq!(
-        X86_SMP
-            .matches(".unwrap_or_else(crate::kernel::user_fpu::UserFpuState::initial);")
-            .count(),
-        2
+        X86_SMP.matches("let fpu = authenticated.user_fpu;").count(),
+        1
     );
-    assert_eq!(X86_SMP.matches(".load_user_fpu_split(").count(), 2);
     assert_eq!(
         X86_SMP
             .matches("resume_user_mode_iret(&frame, &fpu)")
             .count(),
-        2
+        1
     );
 }
 
@@ -198,7 +203,7 @@ fn x86_ring3_returns_install_the_resuming_tasks_flags() {
         X86_SMP
             .matches("rflags: crate::kernel::user_fpu::sanitize_user_rflags(user_status),")
             .count(),
-        2
+        1
     );
     assert!(X86_DT.contains("trap.user_status = frame.rflags as usize;"));
 }
@@ -245,10 +250,13 @@ fn aarch64_commit_precedes_and_load_follows_the_dispatch() {
         A64_BOOT,
         "extern \"C\" fn yarm_aarch64_vector_entry(",
     ));
-    let commit = pos(&e, "user_fpu_commit_on_entry(frame, trap_cpu);");
+    let commit = pos(&e, "user_fpu_commit_on_entry(frame, trap_cpu)");
     let dispatch = pos(&e, "dispatch_trap_entry_with_shared_kernel(");
     let take = pos(&e, "aarch64_take_point_return_spsr(");
-    let load = pos(&e, "user_fpu_load_for_return(frame, trap_cpu);");
+    let load = pos(
+        &e,
+        "user_fpu_load_for_return(frame, trap_cpu, fpu_entry.as_ref());",
+    );
     assert!(commit < dispatch && dispatch < take && take < load);
     let clobber = pos(&e, "clobber_user_visible_state();");
     assert!(dispatch < clobber && clobber < load);

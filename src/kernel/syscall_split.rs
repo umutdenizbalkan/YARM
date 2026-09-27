@@ -5956,6 +5956,8 @@ fn try_split_debug_log_into_frame(
             // Stage 199A2D2C2C: terminal cross-CPU reply-OK marker, gated on observing the resumed
             // CPU-0 client's X86_BSP_REPLY_USER_VALIDATED marker here (the off-lock DebugLog path).
             crate::kernel::boot::maybe_emit_ipcreply_direct_smp_reply_ok(msg);
+            // QEMU-SMP1 §4: the reply profile's state-derived progress summary.
+            crate::kernel::boot::maybe_emit_smp1_reply_progress_summary(msg);
             // Stage 200C2C2C-R2B: same causal reply-wins gate release on the off-lock DebugLog
             // path, so the seam the oracle actually takes is never the one that misses it.
             crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg);

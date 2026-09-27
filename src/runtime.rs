@@ -910,8 +910,9 @@ pub(crate) enum PostSwitchRestoreOutcome<T> {
     Facts(T),
 }
 
-/// The coherent rank-2 saved-context snapshot taken by
-/// [`SharedKernel::ap_saved_resume_context_split`].
+/// The coherent saved-context snapshot taken by
+/// [`SharedKernel::ap_saved_resume_current_split`] (QEMU-SMP1 §2: under the authentication of
+/// the incarnation current on the resuming CPU; before it, a numeric-TID rank-2 snapshot).
 ///
 /// Named fields rather than the legacy positional seven-element tuple, so no consumer can
 /// silently transpose `rip`/`rsp`, or read `fs_base` where `cr3` was meant. Every task-owned
@@ -945,6 +946,79 @@ pub(crate) struct ApSavedResumeContext {
     /// `status is Runnable | Running` AND the saved frame is complete (`rip != 0 && rsp != 0`).
     /// A resume must never proceed from a partial or uncommitted continuation.
     pub(crate) runnable_saved: bool,
+}
+
+/// QEMU-SMP1 §2 — the exact incarnation whose FP/SIMD home a capture or restore addressed.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FpuHomeOwner {
+    pub(crate) tid: u64,
+    pub(crate) asid: crate::kernel::vm::Asid,
+}
+
+/// QEMU-SMP1 §2 — why an FP/SIMD home could not be authenticated. Every variant means nothing
+/// was read from or written to any home.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FpuHomeRefusal {
+    InvalidCpu,
+    NoCurrent,
+    /// Another online CPU names the same TID as its current task.
+    CurrentElsewhere {
+        tid: u64,
+    },
+    NoTcb {
+        tid: u64,
+    },
+    NoAddressSpace {
+        tid: u64,
+    },
+    NotResumable {
+        tid: u64,
+    },
+    /// The incarnation current on the CPU is not the one the caller selected.
+    CurrentMismatch {
+        tid: u64,
+        expected: u64,
+    },
+}
+
+impl FpuHomeRefusal {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::InvalidCpu => "invalid_cpu",
+            Self::NoCurrent => "no_current",
+            Self::CurrentElsewhere { .. } => "current_elsewhere",
+            Self::NoTcb { .. } => "no_tcb",
+            Self::NoAddressSpace { .. } => "no_address_space",
+            Self::NotResumable { .. } => "not_resumable",
+            Self::CurrentMismatch { .. } => "current_mismatch",
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn tid(self) -> u64 {
+        match self {
+            Self::InvalidCpu | Self::NoCurrent => 0,
+            Self::CurrentElsewhere { tid }
+            | Self::NoTcb { tid }
+            | Self::NoAddressSpace { tid }
+            | Self::NotResumable { tid }
+            | Self::CurrentMismatch { tid, .. } => tid,
+        }
+    }
+}
+
+/// QEMU-SMP1 §2 — an AP saved-frame resume whose context and FP/SIMD home were read under one
+/// authentication of the incarnation current on the resuming CPU.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApAuthenticatedResume {
+    pub(crate) owner: FpuHomeOwner,
+    pub(crate) context: ApSavedResumeContext,
+    pub(crate) user_fpu: crate::kernel::user_fpu::UserFpuState,
 }
 
 /// U3 (canonical 203C) — what an enqueue REFUSAL licenses, for
@@ -5987,110 +6061,129 @@ impl SharedKernel {
         })
     }
 
-    /// QEMU-CONTEXT1 §2 — COMMIT: store the live user FP/SIMD state a trap captured from task
-    /// `tid` into that task's home. One rank-2 acquisition; `false` (nothing written) when no TCB
-    /// holds `tid`, so a state can never be stored into another task's home.
-    pub(crate) fn commit_user_fpu_split(
+    /// QEMU-SMP1 §2 — the ONE authentication both FP/SIMD-home accessors below share.
+    ///
+    /// The CONTEXT1 bridges read `current` in one acquisition and then located the home by a
+    /// numeric TID in another, so a reuse of that TID, a different CPU's selection or a status
+    /// change between the two reads could land a capture in, or restore one from, a home that is
+    /// not the continuation this CPU is running. Here both observations are one: rank 1 is held
+    /// for `current` on `cpu` and for the proof that no OTHER online CPU names the same TID, and
+    /// rank 2 is NESTED inside it (the ascending order `post_lock_exit_validation_split` uses) to
+    /// resolve the exact incarnation `{tid, asid}` with the resumable status the existing
+    /// incarnation owner admits (`Runnable | Running`). `f` then reads or writes the home of THAT
+    /// TCB inside the same rank-2 guard, so the validation protects the access itself.
+    ///
+    /// No parallel identity: `{tid, asid}` is the incarnation every existing return authority
+    /// (`MarkedIncarnation`, `SplitReturnIdentity`, `ReceiverWaiterIdentity`) already carries.
+    fn with_current_fpu_home_split<R>(
         &self,
-        tid: u64,
-        state: &crate::kernel::user_fpu::UserFpuState,
-    ) -> bool {
-        self.with_task_tcbs_split_mut(|tcbs| {
-            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
-                Some(tcb) => {
-                    tcb.user_fpu = *state;
-                    true
-                }
-                None => false,
+        cpu: CpuId,
+        f: impl FnOnce(&mut crate::kernel::task::ThreadControlBlock) -> R,
+    ) -> Result<(FpuHomeOwner, R), FpuHomeRefusal> {
+        use crate::kernel::task::TaskStatus;
+        self.with_scheduler_split_mut(|sched| {
+            let scheduler = kernel_ref(&sched.scheduler);
+            if scheduler.validate_online_cpu(cpu).is_err() {
+                return Err(FpuHomeRefusal::InvalidCpu);
             }
+            let tid = match scheduler.current_tid_on(cpu) {
+                Some(t) if t.0 != 0 => t.0,
+                _ => return Err(FpuHomeRefusal::NoCurrent),
+            };
+            let elsewhere = (0..crate::kernel::scheduler::MAX_CPUS)
+                .filter(|&i| i != cpu.0 as usize)
+                .any(|i| scheduler.current_tid_on(CpuId(i as u8)).map(|t| t.0) == Some(tid));
+            if elsewhere {
+                return Err(FpuHomeRefusal::CurrentElsewhere { tid });
+            }
+            // Rank 2 nested with the rank-1 guard still held: `current` cannot change under it.
+            self.with_task_tcbs_split_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .ok_or(FpuHomeRefusal::NoTcb { tid })?;
+                let asid = tcb.asid.ok_or(FpuHomeRefusal::NoAddressSpace { tid })?;
+                if !matches!(tcb.status, TaskStatus::Runnable | TaskStatus::Running) {
+                    return Err(FpuHomeRefusal::NotResumable { tid });
+                }
+                Ok((FpuHomeOwner { tid, asid }, f(tcb)))
+            })
         })
     }
 
-    /// QEMU-CONTEXT1 §2 — LOAD: the home of task `tid`, which a return to user mode restores.
-    /// `None` when no TCB holds `tid`.
-    pub(crate) fn load_user_fpu_split(
+    /// QEMU-SMP1 §2 — COMMIT a trap's captured user FP/SIMD state into the home of the exact
+    /// incarnation `cpu` is running (see [`Self::with_current_fpu_home_split`]). On refusal
+    /// nothing is written anywhere.
+    pub(crate) fn commit_user_fpu_current_split(
         &self,
-        tid: u64,
-    ) -> Option<crate::kernel::user_fpu::UserFpuState> {
-        self.with_task_tcbs_split_mut(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .find(|t| t.tid.0 == tid)
-                .map(|t| t.user_fpu)
-        })
+        cpu: CpuId,
+        state: &crate::kernel::user_fpu::UserFpuState,
+    ) -> Result<FpuHomeOwner, FpuHomeRefusal> {
+        self.with_current_fpu_home_split(cpu, |tcb| tcb.user_fpu = *state)
+            .map(|(owner, ())| owner)
     }
 
-    /// U3 (canonical 203C) — the authoritative saved-context snapshot for an x86_64 AP
-    /// saved-frame resume, taken through the rank-2 task seam only.
+    /// QEMU-SMP1 §2 — LOAD the home a return to user mode on `cpu` must install: that of the
+    /// exact incarnation now current there, together with that incarnation.
+    pub(crate) fn load_user_fpu_current_split(
+        &self,
+        cpu: CpuId,
+    ) -> Result<(FpuHomeOwner, crate::kernel::user_fpu::UserFpuState), FpuHomeRefusal> {
+        self.with_current_fpu_home_split(cpu, |tcb| tcb.user_fpu)
+    }
+
+    /// QEMU-SMP1 §2 — the x86_64 AP saved-frame resume's snapshot, authenticated against the
+    /// selection that just made `tid` current on `cpu`.
     ///
-    /// Replaces the broad `shared.with(|k| k.ap_saved_resume_context(tid))` re-acquire that
-    /// `ap_saved_frame_resume` used to take. The legacy `KernelState` body answered the same
-    /// question across FOUR separate reads — `task_asid`, then `cr3_for_asid`, then
-    /// `task_status`, then `with_tcbs` for the context — each of which re-entered the task
-    /// domain on its own. Under the broad lock that was safe but incoherent by construction:
-    /// nothing in its shape says the ASID, the status and the register context belong to the
-    /// same incarnation. This transaction takes all of them in ONE rank-2 acquisition, so a
-    /// resume can never mix one incarnation's ASID with another's saved frame.
-    ///
-    /// Lock ordering, and why CR3 resolution is deliberately outside:
-    ///
-    /// 1. rank 2 (task) is acquired exactly once and every task-owned field — ASID, status,
-    ///    the full `UserRegisterContext`, and the TLS pointer — is copied by value;
-    /// 2. rank 2 is released completely when the seam closure returns;
-    /// 3. only then is `asid` resolved to a page-table root through
-    ///    `x86_64::page_table::cr3_for_asid`, which takes `PAGE_TABLE_STATE` — an INDEPENDENT,
-    ///    unranked lock. Holding the task lock across it would couple two lock orders that the
-    ///    rank system says nothing about, so it is not held.
-    ///
-    /// The refusal set is byte-for-byte the legacy body's: an absent TCB, a TCB with no ASID,
-    /// and an ASID with no page-table root each return `None`. `runnable_saved` is likewise
-    /// unchanged — `Runnable | Running` AND a complete (`rip != 0 && rsp != 0`) saved frame;
-    /// `Blocked`, `Faulted`, `Exited`, `Dead` and `Reserved` are all rejected. TLS absent maps
-    /// to `fs_base = 0`.
-    ///
-    /// Identity contract — deliberately NOT strengthened: like the legacy body, this locates
-    /// the task by numeric TID and reports the ASID it finds bound to that TID in the same
-    /// snapshot. The callers do not hold a generation-bearing or exact-incarnation token, so
-    /// this claims no exact-incarnation authority they could not honour.
-    ///
-    /// Read-only in both domains: no dispatch, no enqueue, no status write, no context
-    /// consumption.
+    /// It replaces the U3 numeric-TID snapshot (`ap_saved_resume_context_split`, deleted): that
+    /// located a TID, and the resume then read the FP home by the same number in a second
+    /// acquisition and fell back to the initial image when it was absent — so an existing
+    /// continuation whose home could not be found resumed with a reset image. This takes the register context, TLS, status AND the FP/SIMD home under the
+    /// one authentication above, and refuses unless the incarnation current on `cpu` is `tid`.
+    /// CR3 is resolved after every domain lock is released, exactly as in the TID snapshot.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn ap_saved_resume_context_split(&self, tid: u64) -> Option<ApSavedResumeContext> {
-        // Phase 1 — ONE rank-2 acquisition. Everything task-owned is copied out by value, so
-        // nothing below observes the TCB array after the guard drops.
-        let (asid, context, runnable, fs_base) = self.with_task_tcbs_split_mut(|tcbs| {
-            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == tid)?;
-            let asid = tcb.asid?;
-            let runnable = matches!(
-                tcb.status,
-                crate::kernel::task::TaskStatus::Runnable
-                    | crate::kernel::task::TaskStatus::Running
-            );
-            // Stage 199A2D2C2B: FS base comes from the SELECTED TASK's saved TLS state, never a
-            // hardcoded constant; a task with no TLS resumes with FS.base = 0.
-            let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);
-            Some((asid, tcb.user_context, runnable, fs_base))
-        })?;
-        // Phase 2 — rank 2 is released. `PAGE_TABLE_STATE` is an independent, unranked lock and
-        // must not be taken while the task lock is held.
-        let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;
+    pub(crate) fn ap_saved_resume_current_split(
+        &self,
+        cpu: CpuId,
+        tid: u64,
+    ) -> Result<ApAuthenticatedResume, FpuHomeRefusal> {
+        let (owner, (context, fs_base, user_fpu)) =
+            self.with_current_fpu_home_split(cpu, |tcb| {
+                (
+                    tcb.user_context,
+                    tcb.tls_ptr.map(|v| v.0).unwrap_or(0),
+                    tcb.user_fpu,
+                )
+            })?;
+        if owner.tid != tid {
+            return Err(FpuHomeRefusal::CurrentMismatch {
+                tid: owner.tid,
+                expected: tid,
+            });
+        }
+        let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(owner.asid)
+            .ok_or(FpuHomeRefusal::NoAddressSpace { tid })?;
         let mut gprs = [0u64; 15];
         for (i, g) in gprs.iter_mut().enumerate() {
             *g = context.user_gprs[i] as u64;
         }
         let rip = context.instruction_ptr.0;
         let rsp = context.stack_ptr.0;
-        let has_saved = rip != 0 && rsp != 0;
-        Some(ApSavedResumeContext {
-            asid: asid.0,
-            cr3,
-            rip,
-            rsp,
-            gprs,
-            user_status: context.user_status as u64,
-            fs_base,
-            runnable_saved: runnable && has_saved,
+        Ok(ApAuthenticatedResume {
+            owner,
+            context: ApSavedResumeContext {
+                asid: owner.asid.0,
+                cr3,
+                rip,
+                rsp,
+                gprs,
+                user_status: context.user_status as u64,
+                fs_base,
+                // The authentication already admitted `Runnable | Running`.
+                runnable_saved: rip != 0 && rsp != 0,
+            },
+            user_fpu,
         })
     }
 
@@ -19987,15 +20080,20 @@ mod tests {
         );
         assert_eq!(
             code.matches("current_tid_authoritative(cpu)").count(),
-            4,
-            "both identity snapshots, and QEMU-CONTEXT1's two FP-home owners (commit on entry, \
-             load for return), use the authoritative binding helper"
+            2,
+            "both identity snapshots use the authoritative binding helper; QEMU-SMP1 §2 moved \
+             the FP-home owners off a separate `current` read onto transactions that \
+             authenticate `current` and access the home under one acquisition"
         );
         assert_eq!(
-            code.matches("shared.current_tid_authoritative(cpu).filter(|&t| t != 0)")
+            code.matches("shared.commit_user_fpu_current_split(cpu, &state)")
                 .count(),
-            2,
-            "the FP-home owners are the only additional readers"
+            1
+        );
+        assert_eq!(
+            code.matches("shared.load_user_fpu_current_split(cpu)")
+                .count(),
+            1
         );
         assert!(
             !code.contains("current_tid_split_read"),

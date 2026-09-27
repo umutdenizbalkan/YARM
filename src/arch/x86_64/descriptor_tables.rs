@@ -273,15 +273,6 @@ struct X86InterruptStackFrameHeader {
 static TRAP_DISPATCH_DEPTH: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; crate::arch::platform_constants::MAX_CPUS];
 
-/// Stage 199A2D2C2C: clear a CPU's trap-dispatch nested-guard depth. Called immediately before the BSP
-/// saved-frame resume `iretq`s out of the trap handler (abandoning this kernel-stack frame WITHOUT
-/// reaching the normal depth-reset return points), so the resumed client's NEXT trap starts at depth 0
-/// rather than tripping the nested-trap fatal guard.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-pub(crate) fn clear_trap_dispatch_depth(cpu: crate::kernel::scheduler::CpuId) {
-    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
-    TRAP_DISPATCH_DEPTH[idx].store(0, Ordering::Release);
-}
 /// Stage 200D-0B3: attest common-epilogue ownership for an accepted `ExitCurrentTask`.
 ///
 /// Called from the trap epilogue immediately after the SINGLE `TRAP_DISPATCH_DEPTH` clear that
@@ -1333,9 +1324,15 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     // `fpu_area`; before anything can block, switch or diverge into idle, it becomes that task's
     // home. A kernel-origin trap commits nothing: its area is the interrupted KERNEL context,
     // which the stub restores verbatim unless this trap returns to ring 3.
-    if entered_from_user {
-        user_fpu_commit_on_entry(fpu_area);
-    }
+    let entered = if entered_from_user {
+        user_fpu_commit_on_entry(fpu_area)
+    } else {
+        None
+    };
+    // QEMU-SMP1 §2: the continuation this trap entered on, to recognise an unswitched return.
+    // SAFETY: as above.
+    let entry_point = unsafe { ((*interrupt_frame).rip, (*interrupt_frame).rsp) };
+    let entry_cr3 = read_cr3_raw();
     x86_trap_dispatch_body(vector, error_code, regs, interrupt_frame);
     // QEMU-CONTEXT1 §2 — LOAD. Whatever the trap decided, if the frame now returns to ring 3 the
     // stub's final FXRSTOR64 must install the RESUMING task's home — the interrupted task's own
@@ -1343,7 +1340,11 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     // an idle-boundary conversion.
     // SAFETY: as above; the frame may have been rewritten but not moved.
     if unsafe { (*interrupt_frame).cs } & 0x3 == 0x3 {
-        user_fpu_load_for_return(fpu_area);
+        // SAFETY: as above.
+        let unswitched = entered_from_user
+            && unsafe { ((*interrupt_frame).rip, (*interrupt_frame).rsp) } == entry_point
+            && read_cr3_raw() == entry_cr3;
+        user_fpu_load_for_return(fpu_area, entered, unswitched);
     }
     #[cfg(feature = "context1-clobber")]
     if entered_from_user {
@@ -1351,50 +1352,90 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     }
 }
 
-/// QEMU-CONTEXT1 §2 — commit the trap's captured user x87/SSE state to the running task's home.
+/// QEMU-CONTEXT1 §2 / QEMU-SMP1 §2 — commit the trap's captured user x87/SSE state to the home of
+/// the exact incarnation this CPU is running. The authentication and the write are one
+/// transaction (`commit_user_fpu_current_split`); a refusal writes nothing and leaves the capture
+/// in the stub's area. Returns the settlement for the return side.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn user_fpu_commit_on_entry(fpu_area: *mut u8) {
-    let Some(shared) = trap_shared_kernel() else {
-        return;
-    };
+fn user_fpu_commit_on_entry(
+    fpu_area: *mut u8,
+) -> Option<Result<crate::runtime::FpuHomeOwner, crate::runtime::FpuHomeRefusal>> {
+    let shared = trap_shared_kernel()?;
     let cpu = current_cpu_id();
-    let Some(tid) = shared.current_tid_authoritative(cpu).filter(|&t| t != 0) else {
-        return;
-    };
     // SAFETY: the stub's 512-byte, 16-byte aligned area, live for the whole dispatch.
     let state = unsafe { crate::kernel::user_fpu::UserFpuState::read_from(fpu_area) };
-    if !shared.commit_user_fpu_split(tid, &state) {
+    let committed = shared.commit_user_fpu_current_split(cpu, &state);
+    if let Err(refusal) = committed {
         crate::yarm_log!(
-            "X86_USER_FPU_COMMIT_REFUSED cpu={} tid={} reason=no_tcb",
+            "X86_USER_FPU_COMMIT_REFUSED cpu={} tid={} reason={}",
             cpu.0,
-            tid
+            refusal.tid(),
+            refusal.reason()
         );
     }
+    Some(committed)
 }
 
-/// QEMU-CONTEXT1 §2 — load the resuming task's home into the area the stub restores from.
+/// QEMU-CONTEXT1 §2 / QEMU-SMP1 §2 — load the resuming incarnation's home into the area the
+/// stub restores from.
+///
+/// Settlement when the resuming home cannot be authenticated:
+/// * the trap returns to the very continuation it entered on (same RIP/RSP/CR3) AND its own
+///   commit was refused too — the area still holds that continuation's live hardware state,
+///   captured by the stub, so it is left exactly as captured (never a reset image, never another
+///   context's bytes);
+/// * any other ring-3 return — a switched return, or an entry that authenticated and a return
+///   that no longer does — would resume a continuation whose home is unknown. That is fatal
+///   through the existing trap fatal path, with the reason named.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn user_fpu_load_for_return(fpu_area: *mut u8) {
+fn user_fpu_load_for_return(
+    fpu_area: *mut u8,
+    entered: Option<Result<crate::runtime::FpuHomeOwner, crate::runtime::FpuHomeRefusal>>,
+    unswitched: bool,
+) {
     let Some(shared) = trap_shared_kernel() else {
         return;
     };
     let cpu = current_cpu_id();
-    let resuming = shared.current_tid_authoritative(cpu).filter(|&t| t != 0);
-    match resuming.and_then(|tid| shared.load_user_fpu_split(tid)) {
+    let refusal = match shared.load_user_fpu_current_split(cpu) {
         // SAFETY: the stub's area, as above.
-        Some(state) => unsafe { state.write_to(fpu_area) },
-        None => {
-            // A ring-3 return with no resumable owner cannot legitimately happen; never let the
-            // area's previous contents (another context's state) reach ring 3.
-            crate::yarm_log!(
-                "X86_USER_FPU_LOAD_REFUSED cpu={} tid={} reason=no_home",
-                cpu.0,
-                resuming.unwrap_or(0)
-            );
-            // SAFETY: as above.
-            unsafe { crate::kernel::user_fpu::UserFpuState::initial().write_to(fpu_area) };
+        Ok((_owner, state)) => {
+            unsafe { state.write_to(fpu_area) };
+            return;
         }
+        Err(refusal) => refusal,
+    };
+    if unswitched && matches!(entered, Some(Err(_))) {
+        crate::yarm_log!(
+            "X86_USER_FPU_HOME_UNAUTHENTICATED cpu={} tid={} reason={} action=kept_captured",
+            cpu.0,
+            refusal.tid(),
+            refusal.reason()
+        );
+        return;
     }
+    crate::yarm_log!(
+        "X86_USER_FPU_HOME_UNAUTHENTICATED cpu={} tid={} reason={} action=fatal",
+        cpu.0,
+        refusal.tid(),
+        refusal.reason()
+    );
+    crate::pr_err!(
+        "x86 ring-3 return with an unauthenticated FP/SIMD home: cpu={} reason={}",
+        cpu.0,
+        refusal.reason()
+    );
+    halt_forever();
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn read_cr3_raw() -> u64 {
+    let v: u64;
+    // SAFETY: reading CR3 has no side effect.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags))
+    };
+    v
 }
 
 /// The trap dispatch proper, below the entry wrapper that owns the protected interval's edges.
@@ -1438,22 +1479,12 @@ fn x86_trap_dispatch_body(
     };
     let cpu = current_cpu_id();
 
-    // Stage 199A2D2C2C: the reverse-direction reschedule IPI (vector 0xF1) delivered to CPU 0 (BSP).
-    // Handle it INLINE without running the scheduler (no dispatch in the handler): LAPIC EOI, record
-    // the BSP reschedule-pending flag, emit the one-shot RECEIVED marker, and iretq back. The woken
-    // recv-v2 caller is dispatched by CPU 0's NORMAL timer-driven scheduler on a later tick — this
-    // handler never dispatches. The AP uses a separate pure-asm 0xF1 stub (prepare_ap_idt), so only
-    // the BSP reaches this Rust dispatch for 0xF1.
-    #[cfg(not(feature = "hosted-dev"))]
-    if vector as usize == AP_REMOTE_WAKE_VECTOR as usize
-        && cpu.0 == 0
-        && crate::kernel::boot::x86_ipccall_direct_smp_reply_enabled()
-    {
-        crate::arch::x86_64::irq::acknowledge_interrupt(0);
-        crate::arch::x86_64::smp::c2c_bsp_handle_reschedule_ipi();
-        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
-        return;
-    }
+    // QEMU-SMP1 §1: vector 0xF1 never reaches this compiled dispatch on ANY CPU. The BSP gate, like
+    // every AP gate, is the pure-asm remote-wake stub (`populate_boot_idt_from_stubs`), which owns
+    // the target side of both logical requests that ride it — the wake doorbell and the
+    // generation-matched TLB invalidation + ACK — and EOIs once. The Stage 199A2D2C2C compiled BSP
+    // branch that used to live here (EOI + an informational pending flag, reply oracle only) is
+    // retired with the oracle-only BSP resume it fed.
 
     // Stage 133: pre-lock one-shot #PF diagnostic — fires before any KernelState
     // lock is acquired, giving access to raw trap-stub register values.
@@ -1596,15 +1627,14 @@ fn x86_trap_dispatch_body(
             entering_tid,
             exiting_tid,
         );
-        // Stage 199A2D2C2C: on CPU 0 (BSP), drive the reverse-direction saved-frame resume of the
-        // remotely-woken oracle client on EVERY trap return (not only the idle transition), because in
-        // SMP=2 the passive scheduler (single-CPU D6 seam) never re-selects a caller enqueued on CPU 0's
-        // run queue while CPU 0 keeps dispatching init. It explicitly pulls + resumes the client via the
-        // canonical saved-frame iretq (diverges into ring 3 on success), clearing the nested-trap guard
-        // first. This is NOT the 0xF1 handler — dispatch happens on the trap-return path, never in the
-        // interrupt handler. A strict no-op off the reply path / before the reply is delivered / once done.
-        #[cfg(not(feature = "hosted-dev"))]
-        crate::arch::x86_64::smp::c2c_bsp_saved_frame_resume(shared, cpu);
+        // QEMU-SMP1 §4: a remotely-woken task on CPU 0 is selected by the production owners — the
+        // timer route's idle advance at the authenticated idle boundary, or the ordinary dispatch
+        // when the running task blocks or yields. The Stage 199A2D2C2C oracle-only BSP resume that
+        // used to run here on every trap return was a SECOND selection owner for the same
+        // continuation (measured on the base: the idle advance selected and armed the client, then
+        // this path re-preferred it and diverged with its own `iretq` in the same trap); its
+        // premise, that the passive scheduler never re-selects such a task, stopped being true when
+        // U9-TIMER5 gave the idle boundary a user return. It is retired.
         // Stage 200D-2B1D5A: the restore owner was prepared IN-LOCK, before the post-lock
         // drains ran — and the drains are exactly where wakes are published. Re-validate the
         // decision here, with the broad guard dropped and every drain complete, but BEFORE any
@@ -2652,6 +2682,15 @@ yarm_ap_remote_wake_stub:
     and eax, 3
     shr eax, 1
     inc eax
+    // (3b) QEMU-SMP1: count this hardware arrival by the privilege level it interrupted. Flags
+    //      are free here: the interrupted RFLAGS is restored by `iretq`.
+    cmp eax, 2
+    je 94f
+    add dword ptr gs:[{wake_kernel_off}], 1
+    jmp 95f
+94:
+    add dword ptr gs:[{wake_user_off}], 1
+95:
     // (4) coherent request read: generation FIRST, then VA — the mirror of the
     //     BSP's publication order (VA written, then gen bumped).
     mov ecx, dword ptr gs:[{tlb_req_gen_off}]
@@ -2715,6 +2754,8 @@ yarm_ap_page_fault_stub:
     tlb_ack_gen_off = const super::percpu::TLB_ACK_GEN_OFFSET,
     tlb_req_va_off = const super::percpu::TLB_REQ_VA_OFFSET,
     tlb_ack_origin_off = const super::percpu::TLB_ACK_ORIGIN_OFFSET,
+    wake_kernel_off = const super::percpu::WAKE_ORIGIN_KERNEL_COUNT_OFFSET,
+    wake_user_off = const super::percpu::WAKE_ORIGIN_USER_COUNT_OFFSET,
 );
 
 #[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -2910,6 +2951,24 @@ unsafe fn populate_boot_idt_from_stubs() {
             );
         }
         i += 1;
+    }
+    // QEMU-SMP1 §1 — the BSP takes the remote-wake vector through the SAME pure-asm handler as
+    // every AP: wake accounting, the generation-matched TLB invalidation + ACK for this CPU's own
+    // mailbox, one EOI, `iretq` to the exact interrupted context. It touches no FP state, takes no
+    // lock and dispatches nothing. Before this the BSP decoded 0xF1 as `Unknown` (fatal) unless an
+    // oracle selector was armed, and even then never serviced a TLB request — so a shootdown an AP
+    // requested against a BSP-resident address space could never be acknowledged.
+    #[cfg(not(test))]
+    unsafe {
+        core::ptr::write(
+            idt_ptr.add(AP_REMOTE_WAKE_VECTOR as usize),
+            X86IdtEntry::new_interrupt(
+                core::ptr::addr_of!(yarm_ap_remote_wake_stub) as u64,
+                KERNEL_CODE_SELECTOR,
+                0,
+                0,
+            ),
+        );
     }
 }
 

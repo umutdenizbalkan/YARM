@@ -4527,9 +4527,51 @@ pub(crate) fn maybe_emit_ipcreply_direct_smp_reply_ok(msg: &str) {
 #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 pub(crate) fn maybe_emit_ipcreply_direct_smp_reply_ok(_msg: &str) {}
 
-/// Stage 199A2D2C2C: the CPU-0 oracle client's TID, recorded at provisioning so the BSP dispatch hook
-/// (`maybe_emit_bsp_saved_dispatch_ok`) can recognise the client's saved-frame resume without a
-/// hardcoded probe TID. 0 = unset.
+/// QEMU-SMP1 §4 — the reply profile's progress summary, emitted ONCE when the resumed CPU-0 client
+/// reports that it made further progress after its reply (`X86_BSP_CLIENT_PROGRESS … result=ok`,
+/// its user marker observed here on the DebugLog path). Every number is read from the state its
+/// owner keeps — the 0xF1 stub's own per-CPU arrival counters (split by the privilege level each
+/// arrival interrupted), the TLB mailbox generations, and the committed-reply count — never from
+/// serial output. Read-only.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn maybe_emit_smp1_reply_progress_summary(msg: &str) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    if !x86_ipccall_direct_smp_reply_enabled()
+        || !msg.starts_with("X86_BSP_CLIENT_PROGRESS cpu=0 step=post_reply_yield result=ok")
+        || EMITTED.swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    use crate::arch::x86_64::percpu;
+    use crate::kernel::scheduler::CpuId;
+    let (w0, k0, u0) = percpu::remote_wake_arrivals(CpuId(0));
+    let (w1, k1, u1) = percpu::remote_wake_arrivals(CpuId(1));
+    // Two lines: one log record is bounded (192 bytes).
+    crate::yarm_log!(
+        "X86_SMP_REPLY_PROGRESS_WAKES cpu0_wake_arrivals={} cpu0_kernel_origin={} cpu0_user_origin={} cpu1_wake_arrivals={} cpu1_kernel_origin={} cpu1_user_origin={}",
+        w0,
+        k0,
+        u0,
+        w1,
+        k1,
+        u1
+    );
+    crate::yarm_log!(
+        "X86_SMP_REPLY_PROGRESS_SUMMARY cpu1_tlb_req_gen={} cpu1_tlb_ack_gen={} reply_delivered={} client_tid={} result=ok",
+        percpu::tlb_req_gen(CpuId(1)),
+        percpu::tlb_ack_gen(CpuId(1)),
+        ipcreply_direct_smp_reply_delivered_count(),
+        x86_c2c_client_tid()
+    );
+}
+
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+pub(crate) fn maybe_emit_smp1_reply_progress_summary(_msg: &str) {}
+
+/// Stage 199A2D2C2C: the CPU-0 oracle client's TID, recorded at provisioning. 0 = unset.
+/// QEMU-SMP1 §4: read only by the reply profile's progress summary, which names the task the
+/// production scheduler must have selected on CPU 0.
 pub(crate) static X86_C2C_CLIENT_TID: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
