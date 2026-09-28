@@ -176,8 +176,21 @@ impl SharedKernel {
             {
                 let enqueueing_cpu = executing_cpu;
                 if success.wake_target_cpu != enqueueing_cpu {
+                    // QEMU-SMP1-ACCEPTANCE §4: the committed remote delivery and, after the ICR
+                    // write, the wake request — recorded (observation only) into the request
+                    // oracle's transaction record. The helpers decide nothing.
+                    crate::kernel::boot::record_smp_request_delivery(
+                        work,
+                        enqueueing_cpu,
+                        success.wake_target_cpu,
+                    );
                     crate::kernel::boot::ipccall_direct_smp_request_note_delivered();
                     crate::arch::x86_64::smp::send_reschedule_ipi_to(
+                        enqueueing_cpu,
+                        success.wake_target_cpu,
+                    );
+                    crate::kernel::boot::record_smp_request_ipi_sent(
+                        work,
                         enqueueing_cpu,
                         success.wake_target_cpu,
                     );

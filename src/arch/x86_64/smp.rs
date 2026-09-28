@@ -2398,6 +2398,11 @@ pub extern "C" fn yarm_x86_ap_user_dispatch_entry() {
         && AP_DISPATCH_COUNT[idx].load(Ordering::Acquire) >= 1
     {
         super::ap_sched::set_reschedule_pending(cpu);
+        // QEMU-SMP1-ACCEPTANCE §4: the target CPU's kernel took the IPI-driven wake.
+        crate::kernel::boot::smp_request_txn::record(
+            crate::kernel::boot::smp_request_txn::Step::IpiObserved,
+            [u64::from(cpu.0), 0, 0, 0, 0, 0],
+        );
         let n = C2B2_RESCHEDULE_IPI_RECEIVED.fetch_add(1, Ordering::AcqRel) + 1;
         if n == 1 {
             crate::kernel::printk::printk_emit_sync(format_args!(
@@ -2667,6 +2672,20 @@ fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
         "X86_AP_SAVED_DISPATCH_OK cpu={} mode=saved scheduler_selected=1 continuations=1 tid={} result=ok",
         cpu.0, tid
     ));
+    // QEMU-SMP1-ACCEPTANCE §4: the authenticated saved-frame resume of the exact incarnation.
+    if crate::kernel::boot::x86_ipccall_direct_smp_request_enabled() {
+        crate::kernel::boot::smp_request_txn::record(
+            crate::kernel::boot::smp_request_txn::Step::Resumed,
+            [
+                u64::from(cpu.0),
+                authenticated.owner.tid,
+                u64::from(authenticated.owner.asid.0),
+                0,
+                0,
+                0,
+            ],
+        );
+    }
     // Install per-CPU state for the selected task (mirrors the fresh-entry install).
     super::descriptor_tables::configure_syscall_msrs_for_self();
     super::percpu::set_syscall_kernel_rsp0(cpu, kernel_rsp0);

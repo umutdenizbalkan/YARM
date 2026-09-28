@@ -5956,6 +5956,8 @@ fn try_split_debug_log_into_frame(
             // Stage 199A2D2C2B2: terminal cross-CPU request-OK marker, gated on observing the resumed
             // CPU-1 server's X86_AP_RECV_V2_CONTINUED marker here (the off-lock DebugLog path).
             crate::kernel::boot::maybe_emit_ipccall_direct_smp_request_ok(msg);
+            // QEMU-SMP1-ACCEPTANCE §4: the request oracle's transaction record.
+            crate::kernel::boot::observe_smp_request_user_marker(msg, tid);
             // Stage 199A2D2C2C: terminal cross-CPU reply-OK marker, gated on observing the resumed
             // CPU-0 client's X86_BSP_REPLY_USER_VALIDATED marker here (the off-lock DebugLog path).
             crate::kernel::boot::maybe_emit_ipcreply_direct_smp_reply_ok(msg);

@@ -6,6 +6,7 @@ mod cap_memory_mint_split;
 mod cap_transfer_delegation_split;
 mod cap_transfer_materialize_split;
 mod capability_lifecycle_state;
+pub(crate) mod smp_request_txn;
 /// U9-XFER2 §2 — NR 4's revoke reservation and its commit outcome cross the module boundary,
 /// because the transaction carries the reservation from phase V into phase R.
 pub(crate) use capability_lifecycle_state::{SplitRevokeCommitOutcome, SplitRevokeReservation};
@@ -4430,6 +4431,70 @@ pub(crate) fn maybe_emit_ipccall_direct_smp_request_ok(msg: &str) {
 #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 pub(crate) fn maybe_emit_ipccall_direct_smp_request_ok(_msg: &str) {}
 
+/// QEMU-SMP1-ACCEPTANCE §4 — the resumed server's userspace markers, recorded into the request
+/// oracle's transaction record with the logging task's own TID and the executing CPU. Gated on the
+/// request sub-selector; a no-op everywhere else.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn observe_smp_request_user_marker(msg: &str, tid: u64) {
+    if !x86_ipccall_direct_smp_request_enabled() {
+        return;
+    }
+    let cpu = crate::arch::x86_64::descriptor_tables::current_cpu_id().0;
+    smp_request_txn::observe_user_marker(msg, tid, cpu);
+}
+
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+pub(crate) fn observe_smp_request_user_marker(_msg: &str, _tid: u64) {}
+
+/// QEMU-SMP1-ACCEPTANCE §4 — record a committed REMOTE request delivery: the exact server
+/// incarnation, endpoint and acknowledgement the accepted transaction consumed, the requester, and
+/// the CPUs. Observation only, gated on the request sub-selector here so the drain's wake decision
+/// never consults it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn record_smp_request_delivery(
+    work: &crate::kernel::ipccall_direct_txn::DirectRequestPostWork,
+    sender: crate::kernel::scheduler::CpuId,
+    target: crate::kernel::scheduler::CpuId,
+) {
+    if !x86_ipccall_direct_smp_request_enabled() {
+        return;
+    }
+    smp_request_txn::record(
+        smp_request_txn::Step::Delivered,
+        [
+            work.ack.server.tid.0,
+            u64::from(work.ack.server.asid.0),
+            smp_request_txn::endpoint_word(work.ack.endpoint_index, work.ack.endpoint_generation),
+            work.ack_seq,
+            work.snapshot.caller.tid.0,
+            smp_request_txn::cpu_pair(sender.0, target.0),
+        ],
+    );
+}
+
+/// QEMU-SMP1-ACCEPTANCE §4 — record the remote-wake request for that delivery, after the ICR write.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn record_smp_request_ipi_sent(
+    work: &crate::kernel::ipccall_direct_txn::DirectRequestPostWork,
+    sender: crate::kernel::scheduler::CpuId,
+    target: crate::kernel::scheduler::CpuId,
+) {
+    if !x86_ipccall_direct_smp_request_enabled() {
+        return;
+    }
+    smp_request_txn::record(
+        smp_request_txn::Step::IpiSent,
+        [
+            smp_request_txn::cpu_pair(sender.0, target.0),
+            work.ack.server.tid.0,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+}
+
 /// Stage 199A2D2C2C: default-off sub-selector of the SMP oracle
 /// (`yarm.x86_64_ipccall_direct_smp_reply=1`). When set it IMPLIES the request sub-selector (the whole
 /// forward direction) AND additionally drives the REVERSE (NR7 reply) direction: after the CPU-0
@@ -7535,6 +7600,21 @@ pub(crate) fn emit_ipccall_direct_smp_server_blocked_with(
         && ack_seq != 0;
     if !(saved_frame && absent_from_runqueue && home_cpu_1 && waiter_exact && ack_published) {
         return;
+    }
+    // QEMU-SMP1-ACCEPTANCE §4: the committed block, recorded with the identities just re-verified,
+    // independently of whether the marker line below survives the printk ring.
+    if x86_ipccall_direct_smp_request_enabled() {
+        smp_request_txn::record(
+            smp_request_txn::Step::Blocked,
+            [
+                receiver_tid,
+                u64::from(asid.0),
+                smp_request_txn::endpoint_word(endpoint_index, endpoint_generation),
+                ack_seq,
+                0,
+                0,
+            ],
+        );
     }
     if EMITTED.swap(true, Ordering::AcqRel) {
         return;

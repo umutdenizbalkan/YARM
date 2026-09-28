@@ -91585,6 +91585,7 @@ mod stage199a2d2c2b3_guards {
     const SPLIT: &str = include_str!("../syscall_split.rs");
     const USER_SMOKE: &str =
         include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-user-consume-smoke.sh");
+    const TXN_RECORD: &str = include_str!("smp_request_txn.rs");
 
     // (1) The AP saved resume loads the SELECTED SERVER's CR3 (from the rank-2
     // ap_saved_resume_context_split snapshot), not the BSP/current CR3.
@@ -91723,7 +91724,11 @@ mod stage199a2d2c2b3_guards {
     // X86_AP_RECV_V2_USER_VALIDATED and no post-resume fault, not a kernel-only check).
     #[test]
     fn ring3_validation_marker_dominates_seal() {
-        assert!(USER_SMOKE.contains("X86_AP_RECV_V2_USER_VALIDATED cpu=1"));
+        // QEMU-SMP1-ACCEPTANCE §4: the seal is graded from the transaction record, whose LAST step
+        // (`validated`) only the server's userspace VALIDATED marker records, on the executing CPU.
+        assert!(USER_SMOKE.contains("'validated'"));
+        assert!(USER_SMOKE.contains("need(f['validated'][0:2] == [srv, target]"));
+        assert!(TXN_RECORD.contains("msg.starts_with(\"X86_AP_RECV_V2_USER_VALIDATED\")"));
         assert!(USER_SMOKE.contains("X86_AP_RECV_V2_USER_READ_FAULT")); // as a zero-count hard stop
         assert!(USER_SMOKE.contains("ring-3 user-read fault after resume"));
         assert!(USER_SMOKE.contains("STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_USER_SEAL"));
