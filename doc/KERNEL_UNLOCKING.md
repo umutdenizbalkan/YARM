@@ -23222,3 +23222,217 @@ placed before the context literal so census site 20's neighbourhood did not move
 * One CPU. The AP saved-frame resumes load the home but are not exercised live by this witness.
 * Named and unchanged: the x86_64 AP cross-CPU reply/shootdown failure, the ack-lease race, the
   RISC-V reply-timeout retirement-checker failure and serial log loss.
+
+# QEMU-SMP1 — x86_64 cross-CPU interrupts, TLB acknowledgement and reply progress
+
+Base: `569eba67854fd5d8cac69ab25a2692d6105250cb` (QEMU-CONTEXT1), tree
+`9295504f56966d68eb49ed1eb87905bedd0b7ee0`. U9 stays CLOSED (production `with_cpu=0`,
+`with_broad=0`). x86_64 on QEMU q35 with two CPUs. Not in scope and not started: another port's SMP
+bring-up, task migration, AP timers, a second scheduler, device drivers, production notification
+receive, the ack-lease race.
+
+## 1 — `ap-cross-cpu-reply` on the base, derived
+
+`scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh` timed out (300 s ceiling). Obligations in chain
+order, from the base boot log:
+
+| # | obligation | base | cause |
+|---|---|---|---|
+| 1 | server blocks on CPU 1 (recv-v2, saved frame, ack) | ok | — |
+| 2 | client NR6 on CPU 0; CPU0→CPU1 wake; AP saved-frame resume; ring-3 validation | ok | — |
+| 3 | caller blocks on its reply endpoint | **first missing** (grader) | the caller DID block, through the split receive owner (`IPC_RECV_BLOCK_SPLIT_DONE cpu=0 … wait_gen=1`, `IPC_REPLY_TERMINAL_ARMED_SPLIT … record_generation=17 replier_tid=20205`); the graded marker is emitted only by a broad-route helper the split route never calls. Checker drift. |
+| 4 | NR7 settles once; caller enqueued on CPU 0; CPU1→CPU0 wake | ok | — |
+| 5 | duplicate NR7 refused | **missing** (grader) | refused BEFORE the oracle's consumed-barrier check: the first reply fast-revoked the receiver-local Reply cap, so the duplicate fails capability resolution (`IPCREPLY_DIRECT_REFUSED_PRE_LOCK … reason=reply_cap err=InvalidCapability reply_copies=0 caller_wakes=0`). The graded marker — one of the three TERMINAL markers — was unreachable. Checker drift. |
+| 6 | CPU 1 after the reply | **parked, IF=0** | the server stub ended in two `0xA9C6` probe syscalls: the first returns (and publishes U9-D3's ring-3 residency edge), the second is the probe's PERMANENT ring-0 park with IF masked by FMASK. |
+| 7 | the BSP | **8 × 20 M-poll stalls** | U9-D3's user-origin proof, run on every BSP trap return, latched on that edge and shot at CPU 1 eight times (`X86_TLB_SHOOTDOWN_FAIL reason=ack_timeout cpu=1 want_gen=3..10 got_gen=2`, then `user_origin_unproven`). The "TLB ACK storm" is real but its cause is a proof aimed at a CPU the profile had parked, not a broken ACK path: the same CPU acknowledged the boot-time kernel-origin generations 1–2. |
+| 8 | client selected on CPU 0 and resumed | ok, **twice-owned** | the production idle advance selected and armed the caller (`TIMER_IDLE_ADVANCE_DEQUEUE_OK cpu=0 incoming=21205 … USER_RETURN_ARMED`), then in the SAME trap return the oracle-only `c2c_bsp_saved_frame_resume` re-preferred it and diverged with its own `iretq`. Its premise ("the passive scheduler never re-selects it") has been false since U9-TIMER5. |
+| 9 | client validates the reply in ring 3 | ok | — |
+| 10 | further progress | none | the client stub also ended in `0xA9C6` ×2 — on the BSP. |
+
+The same three failures appear in the QEMU-IRQ3-era run of this profile.
+
+**Topology, vectors, masks.** CPU index = APIC ID on the qualified machine
+(`X86_AP_PERCPU_RECORD_READY cpu=1 apic_id=1`); `write_icr(cpu.0, …)` assumes it everywhere.
+Every kernel entry runs with IF=0 (interrupt gates; FMASK clears IF on SYSCALL). The AP IDT has
+pure-asm stubs (catch-all park, 0xF0 smoke, 0xF1 `yarm_ap_remote_wake_stub`, #PF diagnostic).
+At base the BSP's 0xF1 went through the compiled common trap entry, where it was `Unknown`
+(fatal) unless the reply oracle knob was set, and even then only EOI'd and set a flag: **the BSP
+never serviced a TLB request.**
+
+**Requests, work, acknowledgement.** A wake's logical request is the committed enqueue on
+another CPU; the IPI is sent after that transaction returns, with no domain lock held, and all
+selection is deferred (the AP's managed idle loop → `ap_saved_frame_resume`; the BSP's next tick →
+idle advance). Hardware arrivals may coalesce. A TLB request is the target's mailbox generation:
+the requester writes the VA, then bumps `tlb_req_gen`, sends 0xF1 and polls `tlb_ack_gen == want`
+(read-only) for `AP_READY_POLL_ITERS`; the target's stub reads generation then VA, invalidates,
+records the interrupted privilege level, then publishes the ACK. With two CPUs a target has only
+one possible requester, so the single-outstanding-request rule holds by topology; it does not at
+three or more CPUs (two requesters could overwrite one mailbox) — out of scope. Target set:
+`live_cpu_bitmap_for_asid_split(asid) & !requester` — online, not wake-only, current task holds
+the ASID. The VM owner installs with the displaced object PINNED, releases every lock, completes
+the shootdown, and only on `true` settles (unpins, reclaims by identity); on `false` the pin stays.
+
+## 2 — context identity at the SMP boundary
+
+The FP/SIMD home accessors took a numeric TID read in a separate acquisition from `current`, and
+the saved-frame resumes substituted the initial image for a home they could not find. Replaced by
+ONE authentication, `SharedKernel::with_current_fpu_home_split(cpu, f)`: rank 1 held for the
+incarnation current on `cpu` and for the proof that no other online CPU names the same TID; rank 2
+nested (the ascending order `post_lock_exit_validation_split` uses) to resolve `{tid, asid}` with
+a resumable status (`Runnable | Running`, the incarnation owner's rule); `f` reads or writes the
+home of exactly that TCB inside the same guard. Built on it: `commit_user_fpu_current_split`,
+`load_user_fpu_current_split` (both ports' trap bridges) and `ap_saved_resume_current_split` (the
+x86 AP resume: register context, TLS and FP home in one authentication; CR3 resolved after every
+guard is released). The numeric-TID accessors and snapshot are deleted. No parallel identity:
+`{tid, asid}` is the incarnation every existing return authority carries.
+
+Settlement when a home cannot be authenticated (`FpuHomeRefusal`: invalid CPU, no current,
+current elsewhere, no TCB, no ASID, not resumable, current mismatch):
+
+* **commit** — nothing written anywhere; the capture stays in the stub's area; reported.
+* **ring-3/EL0 return to the unswitched entering continuation** (same RIP/RSP/CR3 on x86, same
+  ELR/SP_EL0/TTBR0 on AArch64) whose own commit was also refused — the area still holds that
+  continuation's live hardware state, so it is left as captured (`…HOME_UNAUTHENTICATED …
+  action=kept_captured`).
+* **any other return** — resuming would give an existing continuation a reset or foreign image:
+  fatal with the reason named (`action=fatal`). A fresh task is unaffected: its home IS the
+  initial state, read like any other.
+* **AP saved-frame resume** — declines (its existing contract), `X86_AP_SAVED_RESUME_REFUSED`.
+
+CONTEXT1's capture-before-first-call and restore-after-last-call placement is unchanged. The 0xF1
+stub touches no FP state and needs no FP policy.
+
+## 3 — real IPI delivery and remote invalidation
+
+**The BSP takes 0xF1 through the same pure-asm stub as every AP** (`populate_boot_idt_from_stubs`;
+the compiled BSP branch is removed). The stub now also counts each hardware arrival by the
+privilege level it interrupted (`remote_wake_arrivals`: total, kernel, user).
+
+**The witness** (`x86-smp1-witness`, armed by `yarm.x86_64_smp1_witness=1` on the reply profile,
+default off, no syscall added): the reply profile's two tasks run `src/arch/x86_64/smp1_witness.S`
+instead of the oracle stubs — server on CPU 1 (address space A), client on CPU 0 (B), distinct
+patterns in every checked register. Setup only: a cap to the other task's address space for each,
+a pattern page (FXSAVE image), ONE mailbox frame mapped in both, and the residency probe R. Each
+task creates its own W with NR 13, so what the other task displaces with NR 3 is an ordinary
+object-backed mapping of the VM owner. Phases:
+
+1. **wakes** — client NR6 wakes the BLOCKED server (CPU 0 → idle CPU 1; AP saved-frame resume);
+   server NR7 wakes the blocked client (CPU 1 → CPU 0; production selection). Each checks
+   rbx rbp r12..r15 and its FXSAVE image (FCW, MXCSR, XMM0..15) after resuming.
+2. **resident rounds** ×8, alternating direction — the requester replaces the target's W through
+   NR 3 while the target is RESIDENT in ring 3, checking ten GPRs, RFLAGS (CF PF AF ZF SF OF, and
+   DF in the client's pattern) and its FXSAVE image around a flag-neutral dwell; CPU 0's timer
+   keeps ticking.
+3. **mutual rounds** ×4 — §5.
+
+**Residency.** On every arm the kernel re-points the target's R at a frame never mapped there
+before, through `page_table::map_page`, which invalidates only on the CPU running it (the
+requester's). The target primes R before the round and compares after: the same value means its
+CPU never reloaded CR3 in between, so the new W can only have come from the targeted `invlpg`.
+
+**Evidence recorded by the owners** (all synchronous — the shared printk ring drops pushed lines
+while both CPUs log, which is how a first summary vanished): the arm and re-point
+(`SMP1_WITNESS_R_REPOINTED … invalidated_on_cpu=<requester>`); the VM owner's pinned displacement
+(`SMP1_VM_DISPLACED … pinned=1`); shootdown completion with the target's mailbox
+(`SMP1_VM_SHOOTDOWN_COMPLETE … acked=1 target_req_gen=g target_ack_gen=g target_origin=user`);
+the settle of exactly the displaced frame, after it (`SMP1_VM_DISPLACED_SETTLED … old_phys=`); the
+target's verdict (`SMP1_TARGET_OBSERVED … w=replaced r=stale context=ok`); the per-CPU arrival
+counters and mailbox generations (`SMP1_WITNESS_CPU`). The grader
+(`scripts/qemu-x86_64-smp1-witness-smoke.sh`) checks each round in order, pairs every settle with
+its own displacement, and requires both tasks to block again at the end.
+
+## 4 — `ap-cross-cpu-reply`, repaired through its owners
+
+* **The second selection owner is retired**: `c2c_bsp_saved_frame_resume`, its pending flag, the
+  BSP handler and the trap-depth helper only it used. The caller is selected and resumed by the
+  production owners alone.
+* **Both oracle stubs are reassembled from source**; every byte before the NR7 retry is unchanged
+  except jump displacements. Neither issues `0xA9C6` any more. The server checks the duplicate's
+  refusal in ring 3 (`RCX == 3`, `InvalidCapability`) and blocks again in recv-v2, so CPU 1 stays
+  interruptible; the client makes a Yield round trip from its resumed continuation and blocks
+  again. Failure paths emit named markers instead of taking the park.
+* **The grader is rebuilt on the production owners**: the caller's split block and armed record;
+  one claim for that record generation; one pre-lock duplicate refusal with no copy and no wake,
+  observed by the server; one CPU1→CPU0 wake request and exactly one 0xF1 arrival on CPU 0; the
+  production selection between the claim and the continuation (the retired resume must not run);
+  the continuation once, the further progress, both tasks blocked again; no TLB failure, no
+  refused or unauthenticated home. Its SMP1 user markers and the tasks' blocks are graded through
+  synchronous kernel echoes (`X86_SMP_REPLY_USER_ECHO`, `X86_SMP_ORACLE_BLOCKED`).
+
+## 5 — bounded contention and negative controls
+
+**A demonstrated stall, fixed.** Each requester waits for its target's ACK with IF=0 and no lock
+held. When the target is itself in the kernel waiting for THIS CPU — both replacing mappings in
+each other's address spaces — neither 0xF1 can be taken. Live, before the fix: one shootdown of
+EVERY mutual round ran to its 20 M-poll timeout (`X86_TLB_SHOOTDOWN_FAIL reason=ack_timeout`,
+`SMP1_VM_SHOOTDOWN_COMPLETE … acked=0`) and its displaced frame stayed pinned for good.
+`smp_tlb_shootdown_cpus` now services this CPU's own mailbox inside the wait
+(`percpu::service_own_tlb_request`), exactly as the stub would: generation, then VA; invalidation
+(VA 0: CR3 reload); origin `kernel`; ACK last. The ACK is still produced only by the target CPU
+itself; when its stub later takes the still-pending 0xF1 it finds `req == ack` and only EOIs. Each
+such answer is reported (`X86_TLB_OWN_REQUEST_SERVICED_IN_WAIT`) and counted.
+
+No interrupt handler takes a lock: the 0xF1 stub touches only its own per-CPU record and the
+LAPIC. Selection after a wake is deferred to the scheduler owners, after every transaction lock is
+released.
+
+**Contention, live** (development runs of the final code; the frozen-tree runs are in the delivery
+report): 8 resident rounds and 4 mutual rounds, 16 shootdowns, every one `acked=1` with
+`target_ack_gen == target_req_gen`; resident rounds ACKed from ring 3 on both CPUs; mutual rounds
+answered in ring 0 by the target's own wait (5 such answers in one run, split 3/2 across the two
+CPUs); every displaced frame settled exactly once, after its ACK, before the next displacement of
+the same page; both CPUs made progress to the end; both tasks blocked again. Hardware arrivals and logical
+requests are counted separately and are not equal: a request answered inside a wait still has
+its IPI delivered later, which finds `req == ack` and only EOIs (an arrival with no request of its
+own), and pending IPIs to one CPU may coalesce (one arrival for two requests). The grader
+therefore requires only that each CPU's arrivals split exactly into kernel- and user-origin
+counts, that at least one arrival per resident round interrupted ring 3, and that no request is
+outstanding (`tlb_req_gen == tlb_ack_gen`) — never an arrival count as proof.
+
+**Negative controls** (live mutations of the candidate, each built, booted, graded by the witness
+grader, reverted, and the tree verified clean):
+
+| control | first causal failure | owner evidence |
+|---|---|---|
+| suppress the IPI for the witness page (`write_icr` skipped) | first resident round: `X86_TLB_SHOOTDOWN_FAIL reason=ack_timeout cpu=1 want_gen=3 got_gen=2` | `SMP1_VM_SHOOTDOWN_COMPLETE … acked=0 … target_origin=none`; that displaced frame never settled; the resident target then read the OLD W (`SMP1_TARGET_STALE_AFTER_ACK`) |
+| stale ACK: the target's stub publishes `want - 1`, witness page only | first resident round: `ack_timeout want_gen=3 got_gen=2`; 12 timeouts in all | every such shootdown `acked=0`; neither displaced frame was ever settled — a stale ACK neither satisfies the request nor permits reclaim. (Unscoped, the same mutation already fails the boot-time kernel-origin proofs, gens 1–2.) |
+| omit the invalidation (stub ACKs without `invlpg`) | first resident round: `SMP1_TARGET_STALE_AFTER_ACK cpu=1 w=old r=stale` | the ACK arrived and the frame settled, but the resident target — R still stale, so no CR3 reload rescued it — kept the old translation |
+| skip the restore (AP resume installs the initial image) | `SMP1_SERVER_RESUME_CONTEXT_FAIL cpu=1` at the server's first AP saved-frame resume | the chain stops there |
+| restore another task's context (the client's ring-3 return installs the home of the task on CPU 1) | `SMP1_CLIENT_RESUME_CONTEXT_FAIL cpu=0` at the client's first return after production selection | the chain stops there |
+
+**Hosted and source.** `qemu_context1_user_fpu_ownership` gained the SMP1 identity cases:
+commit/load address only the incarnation current on the named CPU; each CPU resolves the task it
+runs; the AP snapshot refuses a TID another CPU runs (`CurrentMismatch`) and an invalid CPU; a
+status change, a cleared slot and a same-number reuse with a new ASID are each refused or
+resolved as a distinct owner — never the old home, never a reset image. `u3_ap_saved_context_snapshot`
+runs its data-equivalence cases through the authenticated snapshot, with non-resumable statuses
+now refused. `tests/qemu_smp1_scope.rs` (6 guards) pins the BSP gate, the stub's counters and ACK
+order, the own-mailbox answer's order inside the wait, the single authenticated FP path on both
+ports, the retired oracle resume and probe parks, and the witness's gating and observe-only shape.
+Re-derived existing guards (Stage 199A2D2C2B/B2/B3/C, 199A2D3 freeze, 199D NR7, 200C, U3
+snapshot/cohort/ED-2/BC/BSP-retirement, the U3 descriptor-snapshot guard, and four CONTEXT1
+scope guards): each now asserts the retirement or the authenticated path in place of what it
+used to pin.
+
+## Unsupported, untested, and limits
+
+* x86_64 only, two CPUs. At three or more CPUs a target has more than one possible requester and
+  the single-slot mailbox can be overwritten; four-CPU scaling is subsequent work.
+* Production APs remain wake-only; user tasks run on an AP only under the oracle knobs
+  (`yarm.ap_user_dispatch=1`), and no AP timer exists. The own-mailbox answer is on the production
+  shootdown path, but in production only one CPU dispatches user tasks, so it is exercised only
+  under those knobs.
+* Wake IPIs carry no generation: the logical request is the committed enqueue; arrivals are
+  counted, not matched.
+* The residency probe is a witness mapping re-pointed through `page_table::map_page` without the
+  VM owner's bookkeeping; it exists only in the witness build.
+* The witness's replacement backing is the VM owner's zero-filled anonymous frame; the distinct
+  sentinel is the OLD value (`OLD_W ^ round`), not a sentinel written into the new frame.
+* The printk ring drops lines under two-CPU logging; graded lines in these two profiles are
+  synchronous, other profiles are unchanged.
+* The oracle's consumed-barrier branch for a duplicate NR7 (`IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED`)
+  is unreachable while the first reply fast-revokes the cap; it is left in place, ungraded.
+* Supersedes, from QEMU-CONTEXT1's limits: "the x86_64 AP cross-CPU reply/shootdown failure" and
+  "the AP saved-frame resumes load the home but are not exercised live". Still named and
+  unchanged: the ack-lease race, the RISC-V reply-timeout retirement-checker failure, and the
+  x86_64 `TERMINAL_FAULT_ORACLE` core cell (both failing at this base).
