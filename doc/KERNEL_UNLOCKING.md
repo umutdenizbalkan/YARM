@@ -23630,3 +23630,159 @@ selection that is removed, names another task, runs on CPU 1, precedes the claim
 all fail. Still graded from asynchronous ring lines, and therefore still exposed to the same loss:
 the provisioning lines, the armed reply record, the reply claim, the pre-lock duplicate refusal,
 `IPCREPLY_DIRECT_SMP_REPLY_OK`, the selection markers themselves and the user DebugLog lines.
+
+# QEMU-SMP2 — AArch64 two-CPU interrupts, remote invalidation and context preservation
+
+Base: `dee93b13` (QEMU-SMP1-SEAL), tree `56358d3c`. U9 stays CLOSED (production `with_cpu=0`,
+`with_broad=0`; no broad acquisition added). AArch64 on QEMU virt / cortex-a72 with two CPUs and the
+existing GICv2. Everything new is default-off behind `yarm.ap_user_dispatch=1`; the witness is
+additionally compile-gated (`aarch64-smp2-witness`). Not in scope and not started: GICv3, more
+CPUs, an AP timer, task migration, new drivers, general logging repairs, real hardware.
+
+## 1 — the base, derived
+
+| fact | base |
+|---|---|
+| AP bring-up | PSCI `CPU_ON` (HVC) returns 0; the AP sets SP only — no MMU, no `CPACR_EL1`, no GIC CPU interface, DAIF masked — prints `YARM_AARCH64_SMP_SECONDARY cpu=1` and waits forever for `trap_kernel_state_mut()`, which is null under the shared-kernel boot. |
+| scheduler view | CPU 1 online, wake-only, current = the idle placeholder (tid 0). |
+| GIC | GICv2, `GICD_TYPER=0x28` (2 CPU interfaces); in use: INTID 30 (timer, prio 0x00), 33 (PL011 witness, 0x80). |
+| remote wake | only the NR6/NR7 direct drains compare the committed wake target with the executing CPU; x86 sends 0xF1, AArch64 sent nothing. |
+| translation | every runtime invalidation is `dsb ishst; tlbi vaae1is/aside1is/vmalle1is; dsb ish; isb` — an inner-shareable broadcast executed by the requester. `complete_unmap_shootdown_from_split` answers `true` with no IPI. |
+
+**Identity.** The scheduler's CPU is MPIDR_EL1.Aff0 (the vector entry's `trap_cpu`). The GIC
+interface number is NOT assumed equal to it: `GICD_ITARGETSR0` is banked and reads back the reading
+CPU's own interface bit, so each CPU derives and publishes its own (`arch::gicv2_sgi::TargetTable`,
+lane 0 must hold exactly one bit). Measured: CPU 0 → `0x01`, CPU 1 → `0x02`.
+
+**SGI lifecycle.** Send: `GICD_SGIR = mask << 16 | INTID`, TargetListFilter 0, after `dsb ishst`
+(the enqueue it announces is Normal memory, the write Device-nGnRE). Claim: the vector entry's one
+`GICC_IAR` read (the whole token, IRQ2's `GicAck`; `[12:10]` names the source interface).
+Completion: the vector tail's one `GICC_EOIR` write with that token. SGIs are edge and stay pending
+at the distributor until taken, so a masked CPU loses none; two sends from one source pending
+together merge into one arrival. The reschedule SGI is INTID 1, priority 0x40 (below the timer's
+0x00, above the PL011's 0x80).
+
+**Translation chain.** An NR 3 replacement: VM phase I (`install_and_account`, displaced object
+PINNED) → `AddressSpace::replace_page_in_run` → `arch_unmap_page` (empty leaf, then the broadcast
+`tlbi vaae1is` and the `dsb ish` that completes it on every PE of the inner-shareable domain) →
+`arch_map_page` (new leaf, broadcast again) → phase W `complete_shootdown` (`true`) → phase S
+`settle_displaced_hold` (unpin + reclaim by identity). No remote CPU runs any code for it and no
+SGI plays a part; the requester's completed `dsb ish` IS the acknowledgement, and there is no
+acknowledgement object that could be stale. Masked waits cannot deadlock it: nothing waits for a
+remote CPU to take an interrupt. The two requesters of a mutual round serialize only on the
+page-table lock, which no holder keeps across a wait.
+
+**A suspected violation, checked.** `page_table::map_page` does overwrite a present leaf without
+break-before-make, which would be CONSTRAINED UNPREDICTABLE with a resident remote CPU — but no
+present-leaf OUTPUT-ADDRESS change reaches it: `replace_page_in_run` unmaps first, and the only
+present-leaf overwrites through it are same-PA permission changes (fork's write-protect and its
+rollback), which the architecture exempts. So `map_page` is unchanged.
+
+## 2 — AP dispatch and the reschedule SGI (production wiring)
+
+* **AP** (`arch::aarch64::smp::ap_dispatch_main`): translation on with the BSP's bootstrap
+  MAIR/TCR/root (`boot::bootstrap_mmu_registers`, factored out of the BSP's own setup); wait for
+  the BSP's boot `&mut KernelState` window to END (`note_bsp_boot_borrow_ended`, set immediately
+  before the BSP's first EL0 entry — the release flag alone is set inside that window); bring up
+  and verify this CPU's banked GIC state, publish its interface bit last; one scheduler transition
+  (`SmpScheduler::admit_pinned_dispatch`: wake-only → dispatching, placeholder cleared, the CPU
+  excluded from BALANCED placement so only tasks pinned to it land there); then the same
+  authenticated idle park the BSP uses (`trap::enter_ap_idle` → `idle_no_eret_loop`). The AP
+  entry also enables FP (`CPACR_EL1`) and gets a 128 KiB stack on QEMU. Any refusal leaves it
+  wake-only and masked.
+* **BSP**: its own SGI bring-up in `start_bsp_periodic_timer`, before the PE unmask.
+* **Send** (`smp::send_reschedule_sgi`): only from the NR6/NR7 drains, after the transaction
+  returned `Ok` and only when the committed wake target is another CPU — the same decision x86
+  takes. A target that never published its bit is refused and nothing is written.
+* **Bridge**: a claimed INTID 1 is settled before the device route. At the authenticated idle
+  boundary it owes the SAME idle queue advance the timer's queued-work settlement owes, discharged
+  by the same drain (re-verify, select-and-mark, exact-token resume, debt to the tail) under an
+  `SGI_IDLE_ADVANCE_*` marker family (the `TIMER_IDLE_ADVANCE_*` lines are byte-identical);
+  anywhere else it returns to what it interrupted.
+* **Repair — per-CPU vector ELR.** `LAST_VECTOR_RAW_ELR`, the resume PC of every handled split
+  syscall, was one process-global slot. With two dispatchers CPU 1 finished S's NR 7 by reading
+  the ELR of the SGI CPU 0 had just taken at its idle take point and returned S to EL0 at a kernel
+  address (`AARCH64_SPLIT_SVC_ADVANCE_DONE pc=0x4012fea8`, then an EL0 system-instruction trap on
+  CPU 1). It is now one slot per CPU, indexed by the same MPIDR identity.
+
+Default boots are unchanged: without the knob the AP takes its old path and no SGI state is
+touched.
+
+## 3–4 — the witness
+
+Four kernel-built tasks (`arch::aarch64::smp2_witness`, programs in `smp2_witness.S`): S on CPU 1
+and C on CPU 0 (context-checked), helpers H1 (CPU 1) and H0 (CPU 0). CPU 1's two are placed by the
+admitted AP itself and started by one self-targeted SGI (TargetListFilter `0b10`) — it has no timer,
+and nothing else could wake it. The programs drive production owners only:
+
+| phase | what is exercised |
+|---|---|
+| P1 ×4 | C NR6 → blocked S (CPU 1 parked), S NR7 → blocked C (CPU 0 parked); each resume context-checked across the block and the idle → dispatch → resume path |
+| P2 | C NR6 → H1 while S spins in register-checked window A on CPU 1 (SGI taken from EL0); mirror with window B on CPU 0 |
+| P3 ×4 | serial remote invalidation: the target primes W and the residency probe R, then spins resident in a checked window; the requester arms R, replaces W with NR 3 |
+| P4 ×4 | mutual: both replace each other's W at once |
+
+Checked context: x0–x15, x19–x30, SP, q0–q31, FPCR, FPSR, NZCV and TPIDR_EL0 against a per-task
+pattern (x0–x5 and x8 are lanes across an `svc`; x16/x17 are the window's own loop instrument; x18
+belongs to the kernel on every EL0 return). A reset image, another task's home or one flipped bit
+fails the check and names the mismatching registers.
+
+The residency probe: on `ARM_R` the kernel re-points the target's R at a frame never mapped there
+before by writing the leaf WITHOUT any invalidation. A target that still reads its primed value
+kept its translations across the round, so its new view of W can only be the requester's targeted
+invalidation (QEMU flushes a vCPU's TLB on an ASID change, so a switch away would show).
+
+**Evidence.** `kernel::boot::smp2_record`: each owner appends one record at its commit point — send
+(before the `GICD_SGIR` write), arrival (claim, origin, `ELR_EL1`, window, interrupted task),
+completion (after `GICC_EOIR`), idle dispatch (task and trigger), invalidation begin/completion
+(asid, va, old PA, generation), displacement, shootdown answer, settlement, every user step, the
+probe re-point. One `fetch_add` claims a slot and a `Release` store publishes it, so the claim order
+respects every happens-before edge; the record is sealed only after both tasks finished and every
+claimed slot is published, and dumped synchronously, twice, with a per-line checksum (another CPU's
+raw UART markers can land mid-line — measured once). Only causal edges are graded: every "before"
+is one the sender records before the action the receiver can observe. The pure verifier
+(`smp2_record::verify`) runs at the dump; `scripts/qemu-aarch64-smp2-witness-smoke.sh` re-derives
+every edge from the raw records and additionally requires the kernel's counts to agree.
+
+**Parked targets and the timer.** CPU 0 has the periodic tick; its idle advance may resume a woken
+task in the instant before the SGI is taken (measured once: tick 92 committed its idle advance with
+nothing runnable, S's NR 7 then enqueued C, the same drain resumed C, and the SGI arrived in C's EL0
+and returned to it). That is production behaving correctly. It is recorded (idle dispatch with its
+trigger) and accepted only when the timer's advance resumed exactly the woken task and the SGI then
+arrived in that task; every CPU 1 wake must be SGI-driven and CPU 0 must show at least 2 of 4.
+
+## 5 — tests and controls
+
+Hosted: `gicv2_sgi` (identity derivation, SGIR encoding, refusals), scheduler admission (one
+transition, balanced placement never picks a pinned-only CPU, every other state refused unchanged),
+`smp2_record` (stale acknowledgement refused not skipped, other mapping/CPU/earlier completion not
+credited, duplicate acknowledgement, concurrent requests from both CPUs, SGI population incl.
+suppressed/undelivered/uncompleted/wrong-token/merged, parked-wake routes and every substitution,
+step codes, sealing); `tests/qemu_smp2_scope.rs` (6 source guards).
+
+Negative controls (source mutation, fresh build, reverted before boot; `ctl/` logs kept):
+
+| control | mutation | outcome |
+|---|---|---|
+| suppress transmission | `send_reschedule_sgi` records the send but skips the `GICD_SGIR` write | never seals: the last step is `C_P1_CALL`; S is never dispatched (CPU 1 has no other wake source) |
+| omit completion | the vector tail skips `GICC_EOIR` for INTID 1 | never seals: the AP's start-up kick stays active, CPU 1's running priority stays at the SGI's, C's wake can never be taken |
+| omit both invalidations of W | no `tlbi` for W in `unmap_page` nor in the following `map_page` | `S_FAIL_STALE_AFTER_INVALIDATION round=1`: the resident target still reads the old sentinel after its requester's NR 3 returned |
+| omit the break's invalidation only | no `tlbi` for W in `unmap_page` | TLB rounds pass. **Ineffective, and why:** the replacement's `map_page` broadcasts a second `tlbi` for the same VA before phase W, so the target's translation is gone either way; the break's own `tlbi` is the one break-before-make requires between the two writes, and QEMU does not model the TLB conflict it prevents. The responsible operation is controlled by the row above. |
+| withhold the acknowledgement | drop the `dsb ish` after the `tlbi` | passes. **Ineffective under QEMU, and why:** TCG performs a broadcast TLBI as a synchronised cross-vCPU flush completed before the issuing vCPU continues, so nothing observable depends on the barrier; architecturally the `dsb ish` is what makes the completion — the acknowledgement — hold. Controlled through the invalidation itself (above). |
+| substitute the acknowledgement | the completion record carries the next request's generation | every TLB round refused: "first completion for this mapping is not this request's generation"; the kernel verifier likewise |
+| corrupt the returning context | flip x21 on every EL0 return from a trap that claimed the SGI | `S_FAIL_P1_CONTEXT round=1 aux=0x200000` — the check names bit 21 |
+
+Premature reclaim is not a separate control: settlement is phase S, after phase I's completed invalidation,
+by construction of the one VM owner; the grader and the kernel verifier both refuse a settlement that is not
+preceded by the exact request's completion (`settled_before_acknowledgement`).
+
+**Gates.** Hosted suite single-threaded (5937 passed), every integration target including the broad-lock
+census scanner (no production `with`/`with_cpu` site added: U9 production `with_cpu=0`, `with_broad=0`;
+wrapper bodies unchanged), `cargo fmt --check`, and freestanding x86_64 / AArch64 / RISC-V builds whose warning
+classes equal a fresh `dee93b13` build (218 / 245 / 228). Live gates and the three strict witness boots are in
+the delivery report.
+
+**Limits.** QEMU TCG only; two CPUs; GICv2 only; CPU 1 has no timer, so a task on it runs until it blocks or
+yields; placement on the AP is by explicit pin only (balanced placement never chooses it); the witness's TIDs
+(9200–9203) are static; `x16`/`x17` are the window instrument and not checked; the residency probe relies on
+QEMU flushing a vCPU's TLB on an ASID change; the dump shares the console with lock-free raw markers.
