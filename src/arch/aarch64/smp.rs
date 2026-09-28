@@ -135,9 +135,15 @@ pub fn send_reschedule_sgi(sender: CpuId, target: CpuId) -> Result<u32, SgiRefus
     // before the controller write can raise the interrupt the target will dispatch on.
     // SAFETY: a data synchronization barrier.
     unsafe { core::arch::asm!("dsb ishst", options(nostack, preserves_flags)) };
-    write32(dist, GICD_SGIR, sgir);
+    // QEMU-SMP2 §5: recorded BEFORE the controller write, so the target's arrival record can
+    // never precede it — the one causal edge the grader holds this send to.
     #[cfg(feature = "aarch64-smp2-witness")]
-    crate::kernel::boot::smp2_record::sgi_sent(sender, target, sgir);
+    crate::kernel::boot::smp2_record::push(
+        crate::kernel::boot::smp2_record::Kind::SgiSent,
+        sender.0,
+        [u64::from(target.0), u64::from(sgir), 0, 0, 0],
+    );
+    write32(dist, GICD_SGIR, sgir);
     if let Some(n) = SENT.get(sender.0 as usize) {
         n.fetch_add(1, Ordering::AcqRel);
     }
@@ -171,9 +177,49 @@ pub fn note_sgi_arrival(cpu: CpuId, raw_token: u32, origin: ArrivalOrigin, elr: 
         .cpu_of_interface(sgi_source_interface(raw_token))
         .map_or(u64::MAX, |c| c as u64);
     #[cfg(feature = "aarch64-smp2-witness")]
-    crate::kernel::boot::smp2_record::sgi_arrived(cpu, raw_token, source_cpu, origin, elr);
+    crate::arch::aarch64::smp2_witness::note_arrival(
+        cpu,
+        raw_token,
+        source_cpu,
+        match origin {
+            ArrivalOrigin::User => crate::kernel::boot::smp2_record::ORIGIN_USER,
+            ArrivalOrigin::IdleBoundary => crate::kernel::boot::smp2_record::ORIGIN_IDLE,
+            ArrivalOrigin::Kernel => crate::kernel::boot::smp2_record::ORIGIN_KERNEL,
+        },
+        elr,
+    );
     #[cfg(not(feature = "aarch64-smp2-witness"))]
     let _ = (source_cpu, elr);
+}
+
+/// Raise the reschedule SGI on THIS CPU only (`GICD_SGIR` TargetListFilter `0b10`).
+///
+/// For the one case no remote CPU can cover: tasks placed on an AP from the AP itself, outside a
+/// trap, while it has no timer. The claim, completion and dispatch that follow are the same
+/// production owners a remote wake reaches. Refused (writing nothing) before this CPU published
+/// its own interface.
+#[cfg_attr(not(feature = "aarch64-smp2-witness"), allow(dead_code))]
+pub fn kick_self(cpu: CpuId) -> bool {
+    if TARGETS.mask_of(cpu.0 as usize) == 0 {
+        return false;
+    }
+    let Some((dist, _)) = gic_bases() else {
+        return false;
+    };
+    let sgir = (0b10u32 << 24) | u32::from(RESCHEDULE_SGI_INTID);
+    // SAFETY: a data synchronization barrier.
+    unsafe { core::arch::asm!("dsb ishst", options(nostack, preserves_flags)) };
+    #[cfg(feature = "aarch64-smp2-witness")]
+    crate::kernel::boot::smp2_record::push(
+        crate::kernel::boot::smp2_record::Kind::SgiSent,
+        cpu.0,
+        [u64::from(cpu.0), u64::from(sgir), 1, 0, 0],
+    );
+    write32(dist, GICD_SGIR, sgir);
+    if let Some(n) = SENT.get(cpu.0 as usize) {
+        n.fetch_add(1, Ordering::AcqRel);
+    }
+    true
 }
 
 /// `(total, from_el0, at_idle_boundary, in_other_kernel_code, sent)` for `cpu`.
@@ -306,6 +352,6 @@ pub fn ap_dispatch_main(cpu: CpuId) -> ! {
         park_unadmitted(cpu, "scheduler_refused");
     }
     #[cfg(feature = "aarch64-smp2-witness")]
-    crate::kernel::boot::smp2_witness::ap_admitted(shared, cpu);
+    crate::arch::aarch64::smp2_witness::ap_admitted(shared, cpu);
     crate::arch::aarch64::trap::enter_ap_idle(cpu)
 }

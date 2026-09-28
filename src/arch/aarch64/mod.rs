@@ -28,6 +28,14 @@ pub mod platform_layout;
 /// `yarm.ap_user_dispatch=1`).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 pub mod smp;
+/// QEMU-SMP2 — the two-CPU witness's programs, provisioning and dump. Compiled only with
+/// `aarch64-smp2-witness`; no default or production profile carries it.
+#[cfg(all(
+    feature = "aarch64-smp2-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64"
+))]
+pub mod smp2_witness;
 pub mod syscall_abi;
 pub mod trap;
 pub mod vm_layout;

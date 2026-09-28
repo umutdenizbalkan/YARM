@@ -6870,13 +6870,27 @@ extern "C" fn yarm_aarch64_vector_first_marker() {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_vector_elr_marker(elr: u64) {
-    LAST_VECTOR_RAW_ELR.store(elr, Ordering::Relaxed);
+    if let Some(slot) = LAST_VECTOR_RAW_ELR.get(vector_cpu_index()) {
+        slot.store(elr, Ordering::Relaxed);
+    }
     boot_trace!("YARM_AARCH64_VECTOR_ELR_RAW elr=0x{:016x}", elr);
 }
 
+/// THIS CPU's index for the per-CPU vector slots: MPIDR_EL1 Aff0, the same identity the vector
+/// entry derives `trap_cpu` from.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn vector_cpu_index() -> usize {
+    (crate::arch::aarch64::read_mpidr_el1() & 0xff) as usize
+}
+
+/// The raw `ELR_EL1` of the exception THIS CPU is handling — the resume PC every handled-syscall
+/// return uses. Per CPU: exceptions on this port do not nest, so a CPU's slot is written once per
+/// entry and read only by that same entry.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 pub(crate) fn last_vector_raw_elr() -> u64 {
-    LAST_VECTOR_RAW_ELR.load(Ordering::Relaxed)
+    LAST_VECTOR_RAW_ELR
+        .get(vector_cpu_index())
+        .map_or(0, |slot| slot.load(Ordering::Relaxed))
 }
 
 #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
@@ -6937,7 +6951,13 @@ const AARCH64_LOCK_SPLIT_TRACE: bool = false;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static SECONDARY_JOINED_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-static LAST_VECTOR_RAW_ELR: AtomicU64 = AtomicU64::new(0);
+// QEMU-SMP2 §2 — PER CPU. It was one process-global slot, harmless while one CPU dispatched user
+// tasks and wrong the moment two did: CPU 1 finishing a handled NR 7 read the ELR of the SGI CPU 0
+// had just taken at its idle take point, and resumed its user task at a kernel address (measured:
+// `AARCH64_SPLIT_SVC_ADVANCE_DONE pc=0x4012fea8` for a task running at 0x2000_02xx, then an EL0
+// system-instruction trap on CPU 1).
+static LAST_VECTOR_RAW_ELR: [AtomicU64; crate::arch::platform_constants::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::arch::platform_constants::MAX_CPUS];
 // One-shot: emitted once on the first AArch64 trap that takes the shared path.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static STAGE2N_FIRST_TRAP_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -7496,7 +7516,11 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         // QEMU-SMP2 §5: the reschedule SGI's completion, recorded after the one EOIR write.
         #[cfg(feature = "aarch64-smp2-witness")]
         if ack.intid() == crate::arch::gicv2_sgi::RESCHEDULE_SGI_INTID {
-            crate::kernel::boot::smp2_record::sgi_completed(trap_cpu, ack.raw());
+            crate::kernel::boot::smp2_record::push(
+                crate::kernel::boot::smp2_record::Kind::SgiCompleted,
+                trap_cpu.0,
+                [u64::from(ack.raw()), 0, 0, 0, 0],
+            );
         }
     }
     // QEMU-CONTEXT1 §3: the witness's interference — the protected interval ends at the vector
@@ -8362,6 +8386,14 @@ pub fn bootstrap_first_user_task(
                 }
             }
             None => crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=dtb_pl011_intid"),
+        }
+    }
+    // QEMU-SMP2: the two-CPU witness's four kernel-built tasks. Compile-time gated, and armed
+    // only with the AP dispatch knob; init itself is untouched.
+    #[cfg(feature = "aarch64-smp2-witness")]
+    if crate::arch::aarch64::smp::requested() {
+        if let Err(e) = crate::arch::aarch64::smp2_witness::provision(kernel) {
+            crate::yarm_log!("SMP2_WITNESS_PROVISION_FAIL err={:?} result=fail", e);
         }
     }
     // QEMU-CONTEXT1 §3: the user execution-state witness. Compile-time gated only, and mutually

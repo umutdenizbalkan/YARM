@@ -653,6 +653,49 @@ pub fn map_page(
     Ok(prev.is_present().then_some(prev))
 }
 
+/// Make a leaf written without an invalidation visible to every table walker.
+#[cfg(all(feature = "aarch64-smp2-witness", not(feature = "hosted-dev")))]
+fn publish_table_write() {
+    // SAFETY: barriers only.
+    unsafe {
+        core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+    }
+}
+
+/// QEMU-SMP2 — the witness's residency probe: re-point one leaf with NO invalidation of any
+/// kind, so a CPU that still holds the old translation keeps reading the old frame. Never used
+/// outside the witness; nothing else may write a present leaf without breaking it first.
+#[cfg(all(feature = "aarch64-smp2-witness", not(feature = "hosted-dev")))]
+pub fn witness_repoint_without_invalidation(
+    asid: Asid,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PageFlags,
+) -> bool {
+    let mut state = PAGE_TABLE_STATE.lock();
+    let Some(root) = state.root_for_asid(asid) else {
+        return false;
+    };
+    let mut table = root;
+    for level in [level_index(virt.0, 30), level_index(virt.0, 21)] {
+        let Some(idx) = state.page_index_from_phys(table) else {
+            return false;
+        };
+        match read_table_entry(&mut state, idx, level) {
+            Ok(e) if e.is_present() => table = e.addr(),
+            _ => return false,
+        }
+    }
+    let Some(leaf_idx) = state.page_index_from_phys(table) else {
+        return false;
+    };
+    let next = PageTableEntry::with_addr_and_flags(phys.0, leaf_flags_from_page_flags(flags));
+    let ok = write_table_entry(&mut state, leaf_idx, level_index(virt.0, 12), next).is_ok();
+    drop(state);
+    publish_table_write();
+    ok
+}
+
 pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     let mut state = PAGE_TABLE_STATE.lock();
     let mut table_phys = state.root_for_asid(asid)?;
@@ -678,7 +721,43 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
     }
     write_table_entry(&mut state, leaf_idx, levels[2], PageTableEntry::empty()).ok()?;
     drop(state);
+    // QEMU-SMP2 §3: the break of a replacement (`AddressSpace::replace_page_in_run` unmaps
+    // before it maps) and its broadcast invalidation, recorded as one request for the witness's
+    // page only. The completed `dsb ish` inside `invalidate_page` is the acknowledgement.
+    #[cfg(all(
+        feature = "aarch64-smp2-witness",
+        not(feature = "hosted-dev"),
+        not(test)
+    ))]
+    let witness = crate::arch::aarch64::smp2_witness::watches(virt.0).then(|| {
+        let f = [
+            u64::from(asid.0),
+            virt.0,
+            old.addr(),
+            0,
+            crate::kernel::boot::smp2_record::next_generation(),
+        ];
+        let cpu = (crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8;
+        crate::kernel::boot::smp2_record::push(
+            crate::kernel::boot::smp2_record::Kind::InvalBegin,
+            cpu,
+            f,
+        );
+        (cpu, f)
+    });
     invalidate_page(virt);
+    #[cfg(all(
+        feature = "aarch64-smp2-witness",
+        not(feature = "hosted-dev"),
+        not(test)
+    ))]
+    if let Some((cpu, f)) = witness {
+        crate::kernel::boot::smp2_record::push(
+            crate::kernel::boot::smp2_record::Kind::InvalDone,
+            cpu,
+            f,
+        );
+    }
     Some(old)
 }
 

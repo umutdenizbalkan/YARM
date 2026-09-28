@@ -753,7 +753,50 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
                 crate::arch::x86_64::smp1_witness::this_cpu().0
             ));
         }
+        // QEMU-SMP2 §3: the displaced backing, still pinned, before its shootdown owner answers.
+        #[cfg(all(
+            feature = "aarch64-smp2-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "aarch64"
+        ))]
+        let smp2_watch = crate::arch::aarch64::smp2_witness::watches(records[index].virt.0);
+        #[cfg(all(
+            feature = "aarch64-smp2-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "aarch64"
+        ))]
+        let smp2_cpu = (crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8;
+        #[cfg(all(
+            feature = "aarch64-smp2-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "aarch64"
+        ))]
+        if smp2_watch {
+            crate::kernel::boot::smp2_record::push(
+                crate::kernel::boot::smp2_record::Kind::VmDisplaced,
+                smp2_cpu,
+                [u64::from(asid.0), records[index].virt.0, old.phys.0, 0, 0],
+            );
+        }
         let acknowledged = owners.complete_shootdown(asid, records[index].virt);
+        #[cfg(all(
+            feature = "aarch64-smp2-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "aarch64"
+        ))]
+        if smp2_watch {
+            crate::kernel::boot::smp2_record::push(
+                crate::kernel::boot::smp2_record::Kind::VmShootdown,
+                smp2_cpu,
+                [
+                    u64::from(asid.0),
+                    records[index].virt.0,
+                    u64::from(acknowledged),
+                    0,
+                    0,
+                ],
+            );
+        }
         #[cfg(all(
             feature = "x86-smp1-witness",
             not(feature = "hosted-dev"),
@@ -777,6 +820,18 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             // whatever replaced the object it pinned.
             if let Some(object_id) = records[index].displaced_pinned.take() {
                 owners.settle_displaced_hold(object_id, old.phys);
+                #[cfg(all(
+                    feature = "aarch64-smp2-witness",
+                    not(feature = "hosted-dev"),
+                    target_arch = "aarch64"
+                ))]
+                if smp2_watch {
+                    crate::kernel::boot::smp2_record::push(
+                        crate::kernel::boot::smp2_record::Kind::VmSettled,
+                        smp2_cpu,
+                        [u64::from(asid.0), records[index].virt.0, old.phys.0, 0, 0],
+                    );
+                }
                 #[cfg(all(
                     feature = "x86-smp1-witness",
                     not(feature = "hosted-dev"),

@@ -6,6 +6,9 @@ mod cap_memory_mint_split;
 mod cap_transfer_delegation_split;
 mod cap_transfer_materialize_split;
 mod capability_lifecycle_state;
+/// QEMU-SMP2 — the AArch64 two-CPU witness's bounded transaction record and its pure verifier.
+#[cfg(any(test, feature = "aarch64-smp2-witness"))]
+pub mod smp2_record;
 pub(crate) mod smp_request_txn;
 /// U9-XFER2 §2 — NR 4's revoke reservation and its commit outcome cross the module boundary,
 /// because the transaction carries the reservation from phase V into phase R.

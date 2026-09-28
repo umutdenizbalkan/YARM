@@ -5970,6 +5970,20 @@ fn try_split_debug_log_into_frame(
                 target_arch = "x86_64"
             ))]
             crate::arch::x86_64::smp1_witness::observe_user_marker(msg);
+            // QEMU-SMP2: the AArch64 witness's step record, arm probe and sealed dump.
+            #[cfg(all(
+                feature = "aarch64-smp2-witness",
+                not(feature = "hosted-dev"),
+                target_arch = "aarch64"
+            ))]
+            crate::arch::aarch64::smp2_witness::observe_user_marker(
+                cpu,
+                tid,
+                asid,
+                msg,
+                frame.arg(2) as u64,
+                frame.arg(3) as u64,
+            );
             // Stage 200C2C2C-R2B: same causal reply-wins gate release on the off-lock DebugLog
             // path, so the seam the oracle actually takes is never the one that misses it.
             crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg);
