@@ -981,6 +981,14 @@ pub(crate) enum FpuHomeRefusal {
         tid: u64,
         expected: u64,
     },
+    /// QEMU-SMP1-ACCEPTANCE §1 — the TID the continuation's owner named is current, but its TCB
+    /// is now a different incarnation (another address space): the numeric TID was reused.
+    IncarnationReplaced {
+        tid: u64,
+    },
+    /// QEMU-SMP1-ACCEPTANCE §1 — the continuation being returned to carries no owner: no entry
+    /// authenticated it and no restore applied it, so nothing authorizes any FP/SIMD image for it.
+    UnownedContinuation,
 }
 
 impl FpuHomeRefusal {
@@ -994,18 +1002,21 @@ impl FpuHomeRefusal {
             Self::NoAddressSpace { .. } => "no_address_space",
             Self::NotResumable { .. } => "not_resumable",
             Self::CurrentMismatch { .. } => "current_mismatch",
+            Self::IncarnationReplaced { .. } => "incarnation_replaced",
+            Self::UnownedContinuation => "unowned_continuation",
         }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn tid(self) -> u64 {
         match self {
-            Self::InvalidCpu | Self::NoCurrent => 0,
+            Self::InvalidCpu | Self::NoCurrent | Self::UnownedContinuation => 0,
             Self::CurrentElsewhere { tid }
             | Self::NoTcb { tid }
             | Self::NoAddressSpace { tid }
             | Self::NotResumable { tid }
-            | Self::CurrentMismatch { tid, .. } => tid,
+            | Self::CurrentMismatch { tid, .. }
+            | Self::IncarnationReplaced { tid } => tid,
         }
     }
 }
@@ -1019,6 +1030,37 @@ pub(crate) struct ApAuthenticatedResume {
     pub(crate) owner: FpuHomeOwner,
     pub(crate) context: ApSavedResumeContext,
     pub(crate) user_fpu: crate::kernel::user_fpu::UserFpuState,
+}
+
+/// QEMU-SMP1-ACCEPTANCE §1 — which incarnation an FP/SIMD-home access is FOR, checked inside the
+/// authentication, before the home is read or written.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FpuHomeExpectation {
+    /// Whatever incarnation is current: the entry commit, whose owner IS the task the scheduler
+    /// names current on the trapping CPU (only that CPU moves its own `current`).
+    Current,
+    /// A selection the caller made by TID (the AP saved-frame resume).
+    Tid(u64),
+    /// The exact incarnation whose continuation is being returned to.
+    Owner(FpuHomeOwner),
+}
+
+/// QEMU-SMP1-ACCEPTANCE §1 — the one settlement both architectures' ring-3/EL0 returns apply to
+/// the FP/SIMD image they restore. There is no third outcome: no captured image kept on register
+/// or root equality, and no invented reset image.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserFpuReturn {
+    /// Restore `state`, the home of `owner`, which is the exact incarnation the prepared
+    /// continuation belongs to AND the one the scheduler names current on this CPU.
+    Install {
+        owner: FpuHomeOwner,
+        state: crate::kernel::user_fpu::UserFpuState,
+    },
+    /// Nothing authorizes an image for this continuation. The bridge takes its existing fatal
+    /// path with the reason named; nothing was read from or written to any home.
+    Refuse(FpuHomeRefusal),
 }
 
 /// U3 (canonical 203C) — what an enqueue REFUSAL licenses, for
@@ -6078,6 +6120,7 @@ impl SharedKernel {
     fn with_current_fpu_home_split<R>(
         &self,
         cpu: CpuId,
+        expect: FpuHomeExpectation,
         f: impl FnOnce(&mut crate::kernel::task::ThreadControlBlock) -> R,
     ) -> Result<(FpuHomeOwner, R), FpuHomeRefusal> {
         use crate::kernel::task::TaskStatus;
@@ -6096,6 +6139,19 @@ impl SharedKernel {
             if elsewhere {
                 return Err(FpuHomeRefusal::CurrentElsewhere { tid });
             }
+            // QEMU-SMP1-ACCEPTANCE §1: the selection the access is FOR must be the one current
+            // here, checked before rank 2 is even taken.
+            let expected_tid = match expect {
+                FpuHomeExpectation::Current => tid,
+                FpuHomeExpectation::Tid(t) => t,
+                FpuHomeExpectation::Owner(o) => o.tid,
+            };
+            if expected_tid != tid {
+                return Err(FpuHomeRefusal::CurrentMismatch {
+                    tid,
+                    expected: expected_tid,
+                });
+            }
             // Rank 2 nested with the rank-1 guard still held: `current` cannot change under it.
             self.with_task_tcbs_split_mut(|tcbs| {
                 let tcb = tcbs
@@ -6106,6 +6162,13 @@ impl SharedKernel {
                 let asid = tcb.asid.ok_or(FpuHomeRefusal::NoAddressSpace { tid })?;
                 if !matches!(tcb.status, TaskStatus::Runnable | TaskStatus::Running) {
                     return Err(FpuHomeRefusal::NotResumable { tid });
+                }
+                // QEMU-SMP1-ACCEPTANCE §1: a TID match is not an incarnation match. The owner a
+                // continuation was prepared for must be THIS TCB, not a later occupant of its TID.
+                if let FpuHomeExpectation::Owner(o) = expect
+                    && o.asid != asid
+                {
+                    return Err(FpuHomeRefusal::IncarnationReplaced { tid });
                 }
                 Ok((FpuHomeOwner { tid, asid }, f(tcb)))
             })
@@ -6120,17 +6183,37 @@ impl SharedKernel {
         cpu: CpuId,
         state: &crate::kernel::user_fpu::UserFpuState,
     ) -> Result<FpuHomeOwner, FpuHomeRefusal> {
-        self.with_current_fpu_home_split(cpu, |tcb| tcb.user_fpu = *state)
-            .map(|(owner, ())| owner)
+        self.with_current_fpu_home_split(cpu, FpuHomeExpectation::Current, |tcb| {
+            tcb.user_fpu = *state
+        })
+        .map(|(owner, ())| owner)
     }
 
-    /// QEMU-SMP1 §2 — LOAD the home a return to user mode on `cpu` must install: that of the
-    /// exact incarnation now current there, together with that incarnation.
-    pub(crate) fn load_user_fpu_current_split(
+    /// QEMU-SMP1-ACCEPTANCE §1 — THE return settlement for the FP/SIMD image a ring-3/EL0 return
+    /// on `cpu` restores, for the continuation the frame holds.
+    ///
+    /// `prepared` is the frame's [`TrapFrame::resume_owner`](crate::kernel::trapframe::TrapFrame):
+    /// the incarnation named by whichever owner put the continuation there — the entry that
+    /// authenticated the interrupted task, or the restore that applied a selected task's saved
+    /// context. The home is read only when that EXACT incarnation is also the one the scheduler
+    /// names current on `cpu`, unique across CPUs and resumable, all under one rank-1/rank-2
+    /// authentication. Anything else refuses and reads nothing: an unowned continuation (an
+    /// entry nobody authenticated), a different task current (the pairing the SMP1 load could
+    /// make by re-discovering `current`), or a reused TID. Equal PC/SP/root is never consulted.
+    pub(crate) fn settle_user_fpu_return_split(
         &self,
         cpu: CpuId,
-    ) -> Result<(FpuHomeOwner, crate::kernel::user_fpu::UserFpuState), FpuHomeRefusal> {
-        self.with_current_fpu_home_split(cpu, |tcb| tcb.user_fpu)
+        prepared: Option<FpuHomeOwner>,
+    ) -> UserFpuReturn {
+        let Some(owner) = prepared else {
+            return UserFpuReturn::Refuse(FpuHomeRefusal::UnownedContinuation);
+        };
+        match self
+            .with_current_fpu_home_split(cpu, FpuHomeExpectation::Owner(owner), |tcb| tcb.user_fpu)
+        {
+            Ok((owner, state)) => UserFpuReturn::Install { owner, state },
+            Err(refusal) => UserFpuReturn::Refuse(refusal),
+        }
     }
 
     /// QEMU-SMP1 §2 — the x86_64 AP saved-frame resume's snapshot, authenticated against the
@@ -6149,19 +6232,13 @@ impl SharedKernel {
         tid: u64,
     ) -> Result<ApAuthenticatedResume, FpuHomeRefusal> {
         let (owner, (context, fs_base, user_fpu)) =
-            self.with_current_fpu_home_split(cpu, |tcb| {
+            self.with_current_fpu_home_split(cpu, FpuHomeExpectation::Tid(tid), |tcb| {
                 (
                     tcb.user_context,
                     tcb.tls_ptr.map(|v| v.0).unwrap_or(0),
                     tcb.user_fpu,
                 )
             })?;
-        if owner.tid != tid {
-            return Err(FpuHomeRefusal::CurrentMismatch {
-                tid: owner.tid,
-                expected: tid,
-            });
-        }
         let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(owner.asid)
             .ok_or(FpuHomeRefusal::NoAddressSpace { tid })?;
         let mut gprs = [0u64; 15];
@@ -20090,8 +20167,10 @@ mod tests {
                 .count(),
             1
         );
+        // QEMU-SMP1-ACCEPTANCE §1: the return loads through the ONE settlement, against the
+        // owner the frame's continuation carries — never a second discovery of `current`.
         assert_eq!(
-            code.matches("shared.load_user_fpu_current_split(cpu)")
+            code.matches("shared.settle_user_fpu_return_split(cpu, resume_owner)")
                 .count(),
             1
         );

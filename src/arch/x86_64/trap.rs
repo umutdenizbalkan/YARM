@@ -386,6 +386,12 @@ pub(crate) fn x86_post_lock_resume_marked_incoming(
         .direct_dispatch_restore_context_split(token)
         .ok_or(X86ResumeRefusal::Context)?;
     frame.apply_user_context(context);
+    // QEMU-SMP1-ACCEPTANCE §1: the continuation just applied is the marked incarnation's — the
+    // token is the selection itself, and its ASID is the one activated above.
+    frame.bind_resume_owner(crate::runtime::FpuHomeOwner {
+        tid: incoming,
+        asid,
+    });
     // The apply itself is convention-neutral: `apply_user_context` installs the continuation, and
     // the vector epilogue's `write_task_gprs_to_saved_regs` selects the System V startup-argument
     // delivery or the verbatim GPR restore from the SAME predicate this classification used. The
@@ -474,6 +480,12 @@ pub(crate) fn x86_apply_owner_revalidation_restore(
     frame: &mut TrapFrame,
 ) {
     frame.apply_user_context(snapshot.context);
+    // QEMU-SMP1-ACCEPTANCE §1: the revalidated owner's continuation, named by the incarnation the
+    // snapshot was taken from. A task with no ASID gets no owner, and no return can load an
+    // image for it.
+    if let Some(asid) = snapshot.asid {
+        frame.bind_resume_owner(crate::runtime::FpuHomeOwner { tid, asid });
+    }
     let tls = snapshot.tls.unwrap_or(0);
     restore_fs_base_if_needed(tls);
     let idx = cpu.0 as usize;

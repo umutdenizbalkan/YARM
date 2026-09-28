@@ -363,6 +363,12 @@ pub(crate) fn direct_dispatch_resume_incoming_core(
         .direct_dispatch_restore_context_split(token)
         .ok_or(ResumeRefusal::Context)?;
     frame.apply_user_context(context);
+    // QEMU-SMP1-ACCEPTANCE §1: the marked incarnation's continuation, with the ASID the
+    // activation above installed (verified against the token's incarnation there).
+    frame.bind_resume_owner(crate::runtime::FpuHomeOwner {
+        tid: incoming,
+        asid: crate::kernel::vm::Asid(asid),
+    });
     let mut completion_encoded = false;
     frame.set_user_gpr(
         crate::arch::aarch64::syscall_abi::REG_X18_TLS,
@@ -556,6 +562,8 @@ pub(crate) fn restore_arch_thread_state(
         cpu,
         &crate::kernel::task::ThreadRestoreFacts {
             tid: current_tid,
+            // Under the broad guard `current` and its TCB are one observation.
+            asid: kernel.task_asid(current_tid),
             context,
             tls,
             send_completion,
@@ -588,6 +596,14 @@ pub(crate) fn apply_restored_thread_state(
     let current_tid = facts.tid;
     let tls = facts.tls;
     frame.apply_user_context(facts.context);
+    // QEMU-SMP1-ACCEPTANCE §1: the continuation just applied is the incarnation the facts were
+    // taken from; an ASID-less task gets no owner and no FP/SIMD image.
+    if let Some(asid) = facts.asid {
+        frame.bind_resume_owner(crate::runtime::FpuHomeOwner {
+            tid: current_tid,
+            asid,
+        });
+    }
     frame.set_user_gpr(
         crate::arch::aarch64::syscall_abi::REG_X18_TLS,
         tls.unwrap_or(0),

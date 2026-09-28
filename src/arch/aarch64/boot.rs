@@ -7053,42 +7053,17 @@ fn frame_fpu_region(frame: &mut Aarch64VectorFrame) -> *mut u8 {
     core::ptr::addr_of_mut!(frame.neon).cast::<u8>()
 }
 
-/// QEMU-SMP1 §2 — what the EL0 entry committed, and the continuation it entered on.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-struct UserFpuEntry {
-    committed: Option<Result<crate::runtime::FpuHomeOwner, crate::runtime::FpuHomeRefusal>>,
-    elr: u64,
-    sp_el0: u64,
-    ttbr0: u64,
-}
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-fn read_ttbr0_raw() -> u64 {
-    let v: u64;
-    // SAFETY: reading TTBR0_EL1 has no side effect.
-    unsafe {
-        core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) v, options(nomem, nostack, preserves_flags))
-    };
-    v
-}
-
 /// QEMU-CONTEXT1 §2 / QEMU-SMP1 §2 — commit the EL0 exception's captured FP/SIMD state to the
 /// home of the exact incarnation this CPU is running; authentication and write are one
-/// transaction (`commit_user_fpu_current_split`), and a refusal writes nothing.
+/// transaction (`commit_user_fpu_current_split`), and a refusal writes nothing. The committed
+/// owner is the owner of the entering continuation; a refused commit leaves it with no owner, so
+/// no return can hand it an FP/SIMD image (QEMU-SMP1-ACCEPTANCE §1).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn user_fpu_commit_on_entry(
     frame: &mut Aarch64VectorFrame,
     cpu: crate::kernel::scheduler::CpuId,
-) -> UserFpuEntry {
-    let mut entry = UserFpuEntry {
-        committed: None,
-        elr: frame.elr_el1,
-        sp_el0: frame.sp_el0,
-        ttbr0: read_ttbr0_raw(),
-    };
-    let Some(shared) = trap_shared_kernel() else {
-        return entry;
-    };
+) -> Option<crate::runtime::FpuHomeOwner> {
+    let shared = trap_shared_kernel()?;
     // SAFETY: the frame's 544-byte FP region (asserted layout).
     let state =
         unsafe { crate::kernel::user_fpu::UserFpuState::read_from(frame_fpu_region(frame)) };
@@ -7101,49 +7076,32 @@ fn user_fpu_commit_on_entry(
             refusal.reason()
         );
     }
-    entry.committed = Some(committed);
-    entry
+    committed.ok()
 }
 
-/// QEMU-CONTEXT1 §2 / QEMU-SMP1 §2 — load the resuming incarnation's home into the frame the
-/// epilogue restores from. Same settlement as the x86_64 bridge: an unauthenticated home is
-/// left as captured only for a return to the very continuation the exception entered on whose
-/// own commit was also refused (the frame still holds its live state); any other EL0 return
-/// with an unauthenticated home is fatal with the reason named — never a reset image for an
-/// existing continuation, never another context's bytes.
+/// QEMU-CONTEXT1 §2 / QEMU-SMP1-ACCEPTANCE §1 — install the home of the incarnation the returning
+/// continuation belongs to into the frame the epilogue restores from, through the settlement the
+/// x86_64 bridge applies too (`settle_user_fpu_return_split`). A refusal is fatal with the reason
+/// named: the captured image is never kept on the strength of equal ELR/SP_EL0/TTBR0 and no reset
+/// image is invented for an existing continuation.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn user_fpu_load_for_return(
     frame: &mut Aarch64VectorFrame,
     cpu: crate::kernel::scheduler::CpuId,
-    entry: Option<&UserFpuEntry>,
+    resume_owner: Option<crate::runtime::FpuHomeOwner>,
 ) {
     let Some(shared) = trap_shared_kernel() else {
         return;
     };
     let region = frame_fpu_region(frame);
-    let refusal = match shared.load_user_fpu_current_split(cpu) {
-        Ok((_owner, state)) => {
+    let refusal = match shared.settle_user_fpu_return_split(cpu, resume_owner) {
+        crate::runtime::UserFpuReturn::Install { state, .. } => {
             // SAFETY: the frame's FP region, as above.
             unsafe { state.write_to(region) };
             return;
         }
-        Err(refusal) => refusal,
+        crate::runtime::UserFpuReturn::Refuse(refusal) => refusal,
     };
-    let unswitched_unauthenticated = entry.is_some_and(|e| {
-        matches!(e.committed, Some(Err(_)))
-            && e.elr == frame.elr_el1
-            && e.sp_el0 == frame.sp_el0
-            && e.ttbr0 == read_ttbr0_raw()
-    });
-    if unswitched_unauthenticated {
-        crate::yarm_log!(
-            "AARCH64_USER_FPU_HOME_UNAUTHENTICATED cpu={} tid={} reason={} action=kept_captured",
-            cpu.0,
-            refusal.tid(),
-            refusal.reason()
-        );
-        return;
-    }
     crate::yarm_log!(
         "AARCH64_USER_FPU_HOME_UNAUTHENTICATED cpu={} tid={} reason={} action=fatal",
         cpu.0,
@@ -7322,11 +7280,14 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     // any compiled code ran; before anything can block, switch or diverge into idle, that state
     // becomes the task's home. An EL1-origin frame holds the interrupted KERNEL context and is
     // restored verbatim unless this exception returns to EL0.
-    let fpu_entry = if (9..=16).contains(&kind) {
-        Some(user_fpu_commit_on_entry(frame, trap_cpu))
+    let entry_owner = if (9..=16).contains(&kind) {
+        user_fpu_commit_on_entry(frame, trap_cpu)
     } else {
         None
     };
+    // QEMU-SMP1-ACCEPTANCE §1: the owner of the continuation the frame holds when the dispatch is
+    // done — the entry's committed owner unless a restore replaced the continuation.
+    let mut resume_owner = entry_owner;
     // QEMU-CONTEXT1 §3: vector kinds 9..=16 are lower-EL (EL0) exceptions.
     #[cfg(feature = "context1-witness")]
     let entered_from_user = (9..=16).contains(&kind);
@@ -7379,6 +7340,9 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         }
         // QEMU-CONTEXT1 §2: the interrupted SPSR, whose NZCV is the task's user status word.
         trap_frame.user_status = frame.spsr_el1 as usize;
+        if let Some(owner) = entry_owner {
+            trap_frame.bind_resume_owner(owner);
+        }
         let context = crate::arch::aarch64::trap::Aarch64TrapContext {
             esr_el1: frame.esr_el1 as u32,
             far_el1: frame.far_el1,
@@ -7394,6 +7358,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         .is_ok()
         {
             write_trapframe_back_to_vector_frame(frame, &trap_frame, trap_cpu);
+            resume_owner = trap_frame.resume_owner();
             // QEMU-CONTEXT1 §3: the identity marker — which task this exception interrupted and
             // which task the vector tail returns to. Observes; decides nothing.
             #[cfg(feature = "context1-witness")]
@@ -7513,7 +7478,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     // same-task return, the switched-in task's for a switch, the selected task's for an
     // idle-boundary conversion.
     if frame.spsr_el1 & 0x1F == 0 {
-        user_fpu_load_for_return(frame, trap_cpu, fpu_entry.as_ref());
+        user_fpu_load_for_return(frame, trap_cpu, resume_owner);
     }
     match kind {
         1 => crate::arch::aarch64::console::write_line(

@@ -137,14 +137,13 @@ fn x86_commit_precedes_and_load_follows_the_dispatch() {
         "#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]\n#[unsafe(no_mangle)]\nextern \"C\" fn yarm_x86_dispatch_trap_from_stub(",
     ));
     let commit = pos(&w, "user_fpu_commit_on_entry(fpu_area)");
+    // QEMU-SMP1-ACCEPTANCE §1: the committed owner travels into the dispatch on the trap frame,
+    // and the load settles against the owner the frame holds when the dispatch returns.
     let body = pos(
         &w,
-        "x86_trap_dispatch_body(vector, error_code, regs, interrupt_frame);",
+        "x86_trap_dispatch_body(vector, error_code, regs, interrupt_frame, entry_owner);",
     );
-    let load = pos(
-        &w,
-        "user_fpu_load_for_return(fpu_area, entered, unswitched);",
-    );
+    let load = pos(&w, "user_fpu_load_for_return(fpu_area, resume_owner);");
     assert!(commit < body && body < load);
     let clobber = pos(&w, "clobber_user_visible_state();");
     assert!(load < clobber);
@@ -251,13 +250,18 @@ fn aarch64_commit_precedes_and_load_follows_the_dispatch() {
         "extern \"C\" fn yarm_aarch64_vector_entry(",
     ));
     let commit = pos(&e, "user_fpu_commit_on_entry(frame, trap_cpu)");
+    let bind = pos(&e, "trap_frame.bind_resume_owner(owner);");
     let dispatch = pos(&e, "dispatch_trap_entry_with_shared_kernel(");
+    let back = pos(&e, "resume_owner = trap_frame.resume_owner();");
     let take = pos(&e, "aarch64_take_point_return_spsr(");
     let load = pos(
         &e,
-        "user_fpu_load_for_return(frame, trap_cpu, fpu_entry.as_ref());",
+        "user_fpu_load_for_return(frame, trap_cpu, resume_owner);",
     );
-    assert!(commit < dispatch && dispatch < take && take < load);
+    // QEMU-SMP1-ACCEPTANCE §1: entry owner bound before the dispatch, the frame's owner read back
+    // after it, and the load settles against that owner.
+    assert!(commit < bind && bind < dispatch && dispatch < back);
+    assert!(back < take && take < load);
     let clobber = pos(&e, "clobber_user_visible_state();");
     assert!(dispatch < clobber && clobber < load);
     let c = code(fn_body(A64_WITNESS, "pub fn clobber_user_visible_state()"));

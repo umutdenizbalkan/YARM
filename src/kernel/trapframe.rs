@@ -28,6 +28,13 @@ pub struct TrapFrame {
     /// what a return hands back). Captured with the GPRs, applied with the GPRs, sanitized by the
     /// architecture's return (`user_fpu::sanitize_user_*`). Unused on RISC-V.
     pub user_status: usize,
+    /// QEMU-SMP1-ACCEPTANCE §1 — the exact incarnation `{tid, asid}` whose continuation this frame
+    /// holds, as the owner that PUT it there named it: the entry that authenticated the
+    /// interrupted task, or the restore that applied a task's saved context. Replacing the
+    /// continuation ([`Self::apply_user_context`]) clears it, so a frame can only carry the owner
+    /// of the continuation it actually holds. The return path restores the FP/SIMD home of this
+    /// incarnation and of no other; `None` means nothing authorizes one.
+    pub(crate) resume_owner: Option<crate::runtime::FpuHomeOwner>,
 }
 
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
@@ -59,6 +66,7 @@ impl TrapFrame {
             saved_sp: 0,
             user_gprs: [0; 32],
             user_status: 0,
+            resume_owner: None,
         }
     }
 
@@ -158,7 +166,11 @@ impl TrapFrame {
         }
     }
 
+    /// Replace the continuation with `context`. The previous continuation's owner no longer
+    /// describes this frame, so it is cleared; the restore that applied `context` names the new
+    /// owner with [`Self::bind_resume_owner`].
     pub fn apply_user_context(&mut self, context: UserRegisterContext) {
+        self.resume_owner = None;
         self.saved_pc = context.instruction_ptr.0 as usize;
         self.saved_sp = context.stack_ptr.0 as usize;
         self.user_gprs = context.user_gprs;
@@ -169,6 +181,18 @@ impl TrapFrame {
         self.args[3] = context.arg3;
         self.args[4] = context.arg4;
         self.args[5] = context.arg5;
+    }
+
+    /// QEMU-SMP1-ACCEPTANCE §1 — name the incarnation whose continuation this frame now holds.
+    /// Called only by an owner that has just put that continuation here from that incarnation.
+    pub(crate) fn bind_resume_owner(&mut self, owner: crate::runtime::FpuHomeOwner) {
+        self.resume_owner = Some(owner);
+    }
+
+    /// QEMU-SMP1-ACCEPTANCE §1 — the incarnation this frame's continuation belongs to, if any
+    /// owner named one.
+    pub(crate) const fn resume_owner(&self) -> Option<crate::runtime::FpuHomeOwner> {
+        self.resume_owner
     }
 
     pub const fn error_code(&self) -> Option<usize> {

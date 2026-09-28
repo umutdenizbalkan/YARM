@@ -130,6 +130,7 @@ fn fp_homes_are_authenticated_against_the_current_incarnation() {
     assert!(!RUNTIME.contains("fn commit_user_fpu_split("));
     assert!(!RUNTIME.contains("fn load_user_fpu_split("));
     assert!(!RUNTIME.contains("fn ap_saved_resume_context_split("));
+    assert!(!RUNTIME.contains("fn load_user_fpu_current_split("));
     for (src, port) in [(X86_DT, "x86_64"), (A64_BOOT, "aarch64")] {
         let c = code(src);
         assert_eq!(
@@ -137,13 +138,16 @@ fn fp_homes_are_authenticated_against_the_current_incarnation() {
             1,
             "{port}"
         );
+        // QEMU-SMP1-ACCEPTANCE §1: one settlement against the continuation's owner; the
+        // register/root-equality `kept_captured` settlement is gone, a refusal is fatal.
         assert_eq!(
-            c.matches(".load_user_fpu_current_split(").count(),
+            c.matches(".settle_user_fpu_return_split(cpu, resume_owner)")
+                .count(),
             1,
             "{port}"
         );
         assert!(
-            c.contains("action=kept_captured") && c.contains("action=fatal"),
+            !c.contains("action=kept_captured") && c.contains("action=fatal"),
             "{port}"
         );
     }

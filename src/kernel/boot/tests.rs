@@ -55765,6 +55765,11 @@ mod stage169_d2_send_genuine {
         );
         let mut expected = u3_frame();
         expected.apply_user_context(saved);
+        // QEMU-SMP1-ACCEPTANCE §1: and the frame names the marked incarnation as its owner.
+        expected.bind_resume_owner(crate::runtime::FpuHomeOwner {
+            tid: U3_INCOMING,
+            asid,
+        });
         assert_eq!(
             frame, expected,
             "the incoming task's exact saved context reaches the frame"
@@ -91613,7 +91618,12 @@ mod stage199a2d2c2b3_guards {
         assert!(
             RUNTIME.contains("let asid = tcb.asid.ok_or(FpuHomeRefusal::NoAddressSpace { tid })?;")
         );
-        assert!(RUNTIME.contains("if owner.tid != tid {"));
+        // QEMU-SMP1-ACCEPTANCE §1: the selected-TID check moved INSIDE the authentication, before
+        // rank 2 is taken and before anything is read, rather than after the read.
+        assert!(RUNTIME.contains(
+            "self.with_current_fpu_home_split(cpu, FpuHomeExpectation::Tid(tid), |tcb| {"
+        ));
+        assert!(RUNTIME.contains("if expected_tid != tid {"));
         assert!(SMP.contains("Some(t) if t == expected => t,"));
     }
 
@@ -192321,8 +192331,13 @@ mod qemu_context1_user_fpu_ownership {
             .commit_user_fpu_current_split(cpu, &dirty(0x68))
             .expect("the current incarnation commits");
         assert_eq!(owner.tid, 68);
-        let (loaded_owner, loaded) = k.load_user_fpu_current_split(cpu).expect("load");
-        assert_eq!((loaded_owner, loaded), (owner, dirty(0x68)));
+        assert_eq!(
+            k.settle_user_fpu_return_split(cpu, Some(owner)),
+            crate::runtime::UserFpuReturn::Install {
+                owner,
+                state: dirty(0x68)
+            }
+        );
         assert_eq!(
             k.with(|s| home(s, 69)),
             Some(UserFpuState::initial()),
@@ -192361,12 +192376,18 @@ mod qemu_context1_user_fpu_ownership {
             "distinct address spaces, distinct incarnations"
         );
         assert_eq!(
-            k.load_user_fpu_current_split(CpuId(0)).expect("l0").1,
-            dirty(0x71)
+            k.settle_user_fpu_return_split(CpuId(0), Some(o71)),
+            crate::runtime::UserFpuReturn::Install {
+                owner: o71,
+                state: dirty(0x71)
+            }
         );
         assert_eq!(
-            k.load_user_fpu_current_split(CpuId(1)).expect("l1").1,
-            dirty(0x72)
+            k.settle_user_fpu_return_split(CpuId(1), Some(o72)),
+            crate::runtime::UserFpuReturn::Install {
+                owner: o72,
+                state: dirty(0x72)
+            }
         );
         // Wrong-CPU selection: the AP resume snapshot refuses a TID another CPU runs.
         assert_eq!(
@@ -192404,15 +192425,15 @@ mod qemu_context1_user_fpu_ownership {
             })
         });
         assert_eq!(
-            k.load_user_fpu_current_split(cpu),
-            Err(FpuHomeRefusal::NotResumable { tid: 73 })
+            k.settle_user_fpu_return_split(cpu, Some(first)),
+            crate::runtime::UserFpuReturn::Refuse(FpuHomeRefusal::NotResumable { tid: 73 })
         );
         // … or its slot is cleared outright: refused, never a reset image.
         let slot = k.with(|s| slot_of(s, 73)).expect("slot");
         k.with(|s| s.with_tcbs_mut(|tcbs| tcbs[slot] = None));
         assert_eq!(
-            k.load_user_fpu_current_split(cpu),
-            Err(FpuHomeRefusal::NoTcb { tid: 73 })
+            k.settle_user_fpu_return_split(cpu, Some(first)),
+            crate::runtime::UserFpuReturn::Refuse(FpuHomeRefusal::NoTcb { tid: 73 })
         );
         assert_eq!(
             k.ap_saved_resume_current_split(cpu, 73),
@@ -192432,10 +192453,29 @@ mod qemu_context1_user_fpu_ownership {
                 tcbs[slot] = Some(tcb);
             })
         });
-        let (owner, fresh) = k.load_user_fpu_current_split(cpu).expect("new incarnation");
-        assert_eq!(owner.tid, 73);
-        assert_ne!(owner, first, "the ASID distinguishes the incarnations");
-        assert_eq!(fresh, UserFpuState::initial());
+        // QEMU-SMP1-ACCEPTANCE §2: the OLD incarnation's prepared continuation is refused — the
+        // replacement's fresh home is never paired with it …
+        assert_eq!(
+            k.settle_user_fpu_return_split(cpu, Some(first)),
+            crate::runtime::UserFpuReturn::Refuse(FpuHomeRefusal::IncarnationReplaced { tid: 73 })
+        );
+        // … while a continuation prepared FOR the new incarnation receives that incarnation's own
+        // (fresh) home.
+        let replacement = crate::runtime::FpuHomeOwner {
+            tid: 73,
+            asid: next_asid,
+        };
+        assert_ne!(
+            replacement, first,
+            "the ASID distinguishes the incarnations"
+        );
+        assert_eq!(
+            k.settle_user_fpu_return_split(cpu, Some(replacement)),
+            crate::runtime::UserFpuReturn::Install {
+                owner: replacement,
+                state: UserFpuState::initial()
+            }
+        );
     }
 
     #[test]
@@ -192443,5 +192483,467 @@ mod qemu_context1_user_fpu_ownership {
         let tcb =
             crate::kernel::task::ThreadControlBlock::new(crate::kernel::ipc::ThreadId(70), None);
         assert_eq!(tcb.user_fpu, UserFpuState::initial());
+    }
+
+    // ── QEMU-SMP1-ACCEPTANCE §2 — the return decision, end to end through production owners ──
+    //
+    // Every case drives the SAME calls the bridges make, in the bridges' order: the entry commit
+    // (`commit_user_fpu_current_split`) whose owner the bridge binds onto the trap frame; the
+    // scheduler's own block / enqueue / queue-advance selection and the production restores that
+    // put a continuation into the frame (`x86_post_lock_resume_marked_incoming` on the split
+    // route, `resume_current_thread_with_frame` on the broad route); and the return settlement
+    // (`settle_user_fpu_return_split`) with the owner the frame then carries. Each asserts which
+    // continuation and which image are paired, whether the return is authorized, and the
+    // scheduler/task post-state.
+
+    use crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::{FpuHomeOwner, FpuHomeRefusal, UserFpuReturn};
+
+    const ACC_A: u64 = 81;
+    const ACC_B: u64 = 82;
+    const CPU0: CpuId = CpuId(0);
+
+    /// A and B, each a spawned task in its own address space; neither is current yet.
+    fn acc_fixture() -> SharedKernel {
+        crate::arch::hal::reset_all_active_address_spaces();
+        let mut state = spawned(ACC_A);
+        let (b_asid, _) = state.create_user_address_space().expect("asid b");
+        state
+            .reserve_and_spawn_user_task_from_image_for_test(app(ACC_B, 0x9000, b_asid))
+            .expect("spawn b");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        SharedKernel::new(state)
+    }
+
+    fn owner_of(k: &SharedKernel, tid: u64) -> FpuHomeOwner {
+        FpuHomeOwner {
+            tid,
+            asid: k.with(|s| s.task_asid(tid)).expect("asid"),
+        }
+    }
+
+    /// The interrupted continuation's frame, with a recognisable PC/SP.
+    fn acc_frame(pc: usize, sp: usize) -> TrapFrame {
+        let mut f = TrapFrame::new(15, [1, 2, 3, 4, 5, 6]);
+        f.set_saved_pc(pc);
+        f.set_saved_sp(sp);
+        f
+    }
+
+    /// The bridges' entry: commit the capture to the incarnation current on `cpu` and, when that
+    /// is authenticated, bind it as the owner of the entering continuation.
+    fn acc_enter(
+        k: &SharedKernel,
+        cpu: CpuId,
+        capture: &UserFpuState,
+        frame: &mut TrapFrame,
+    ) -> Result<FpuHomeOwner, FpuHomeRefusal> {
+        let committed = k.commit_user_fpu_current_split(cpu, capture);
+        if let Ok(owner) = committed {
+            frame.bind_resume_owner(owner);
+        }
+        committed
+    }
+
+    /// The scheduler's switch: the current task leaves the CPU through the production block,
+    /// `incoming` is the only queued candidate, and the queue-advance selection marks it and
+    /// mints the exact token the post-lock restore consumes.
+    fn acc_switch_to(
+        k: &SharedKernel,
+        cpu: CpuId,
+        incoming: u64,
+    ) -> crate::runtime::DispatchMarkToken {
+        k.with(|s| {
+            let _ = s.block_current_on_cpu(cpu);
+            let queued: Vec<u64> =
+                s.with_tcbs(|tcbs| tcbs.iter().flatten().map(|t| t.tid.0).collect());
+            for other in queued {
+                for c in 0..crate::kernel::scheduler::MAX_CPUS {
+                    let _ = s.withdraw_queued_tid_on(CpuId(c as u8), other);
+                }
+            }
+            s.enqueue_on_cpu(cpu, incoming).expect("enqueue");
+        });
+        let dispatch =
+            k.futex_wait_dispatch_step_mut(crate::runtime::DispatchAuthority::live_for_test(cpu));
+        assert_eq!(dispatch.tid().map(|t| t.0), Some(incoming));
+        k.d6_genuine_mark_running_via_task_seam(dispatch)
+            .token()
+            .expect("a genuine selection mints a token")
+    }
+
+    fn status(k: &SharedKernel, tid: u64) -> Option<TaskStatus> {
+        k.with(|s| s.task_status(tid))
+    }
+
+    /// Valid same-task return: the entering continuation's own committed image, and nothing else.
+    #[test]
+    fn acc_same_task_return_installs_the_entering_incarnations_own_capture() {
+        let k = acc_fixture();
+        k.with(|s| run_on(s, CPU0, ACC_A));
+        let mut frame = acc_frame(0x8123, 0x7F00);
+        let a = acc_enter(&k, CPU0, &dirty(0xA1), &mut frame).expect("entry authenticates A");
+        assert_eq!(frame.resume_owner(), Some(a));
+        // A syscall return keeps the continuation: the frame still names A.
+        frame.set_ok(7, 0, 0);
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, frame.resume_owner()),
+            UserFpuReturn::Install {
+                owner: a,
+                state: dirty(0xA1)
+            }
+        );
+        assert_eq!(frame.saved_pc(), 0x8123, "the entering continuation");
+        assert_eq!(k.current_tid_split_read(CPU0), Some(ACC_A));
+        // The broad dispatch `run_on` drives leaves the TCB `Runnable`: resumable, still A.
+        assert_eq!(status(&k, ACC_A), Some(TaskStatus::Runnable));
+        assert_eq!(
+            k.with(|s| home(s, ACC_B)),
+            Some(UserFpuState::initial()),
+            "B is untouched"
+        );
+    }
+
+    /// Valid switch: the selected incoming owner's continuation AND image, authenticated against
+    /// that owner — not against the task that entered.
+    #[test]
+    fn acc_switch_pairs_the_incoming_continuation_with_the_incoming_home() {
+        let k = acc_fixture();
+        k.with(|s| {
+            run_on(s, CPU0, ACC_B);
+            set_home(s, ACC_B, dirty(0xB2));
+        });
+        // B must have left a resumable continuation of its own (a prior entry did this).
+        let b = owner_of(&k, ACC_B);
+        let mut b_saved = acc_frame(0x9444, 0x6E00).capture_user_context();
+        b_saved.user_gprs[3] = 0xB0B;
+        assert!(k.split_return_commit_context_split(
+            crate::runtime::SplitReturnIdentity {
+                tid: b.tid,
+                asid: b.asid
+            },
+            b_saved
+        ));
+        let _ = acc_switch_to(&k, CPU0, ACC_A);
+        let mut frame = acc_frame(0x8123, 0x7F00);
+        let a = acc_enter(&k, CPU0, &dirty(0xA1), &mut frame).expect("A enters");
+        let token = acc_switch_to(&k, CPU0, ACC_B);
+        assert_eq!(
+            x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame)),
+            Ok(())
+        );
+        assert_eq!(
+            frame.resume_owner(),
+            Some(b),
+            "the restore names the incoming owner"
+        );
+        assert_eq!(
+            (frame.saved_pc(), frame.user_gpr(3)),
+            (0x9444, 0xB0B),
+            "the continuation is B's"
+        );
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, frame.resume_owner()),
+            UserFpuReturn::Install {
+                owner: b,
+                state: dirty(0xB2)
+            }
+        );
+        assert_eq!(k.current_tid_split_read(CPU0), Some(ACC_B));
+        assert_eq!(
+            status(&k, ACC_B),
+            Some(TaskStatus::Running),
+            "the marked selection"
+        );
+        assert!(
+            (0..crate::kernel::scheduler::MAX_CPUS)
+                .all(|c| k.current_tid_split_read(CpuId(c as u8)) != Some(ACC_A)),
+            "A left the CPU"
+        );
+        assert_eq!(
+            k.with(|s| home(s, ACC_A)),
+            Some(dirty(0xA1)),
+            "A's capture stays A's"
+        );
+        assert_ne!(a, b);
+    }
+
+    /// Replacement between preparing the continuation and loading its image: the prepared
+    /// continuation is refused (nothing read, nothing written), and only a continuation prepared
+    /// FOR the replacement receives the replacement's home.
+    #[test]
+    fn acc_a_replacement_between_prepare_and_load_is_refused_and_untouched() {
+        let k = acc_fixture();
+        k.with(|s| run_on(s, CPU0, ACC_A));
+        let mut frame = acc_frame(0x8123, 0x7F00);
+        let _ = acc_enter(&k, CPU0, &dirty(0xA1), &mut frame).expect("A enters");
+        let token = acc_switch_to(&k, CPU0, ACC_B);
+        assert_eq!(
+            x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame)),
+            Ok(())
+        );
+        let prepared = frame.resume_owner().expect("prepared for B");
+        // The numeric TID is reused by a new incarnation (new address space, its own home) while
+        // the scheduler still names it current.
+        let (fresh, _) = k.with(|s| s.create_user_address_space()).expect("asid");
+        k.with(|s| {
+            s.bind_task_asid(ACC_B, fresh).expect("rebind");
+            set_home(s, ACC_B, dirty(0x5E));
+        });
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, Some(prepared)),
+            UserFpuReturn::Refuse(FpuHomeRefusal::IncarnationReplaced { tid: ACC_B })
+        );
+        assert_eq!(
+            k.with(|s| home(s, ACC_B)),
+            Some(dirty(0x5E)),
+            "a stale settlement never writes the replacement's home"
+        );
+        assert_eq!(k.current_tid_split_read(CPU0), Some(ACC_B));
+        // The broad restore prepares a continuation for the incarnation it finds, and names it.
+        let mut next = acc_frame(0, 0);
+        k.with(|s| s.resume_current_thread_with_frame(&mut next))
+            .expect("broad restore");
+        let replacement = FpuHomeOwner {
+            tid: ACC_B,
+            asid: fresh,
+        };
+        assert_eq!(next.resume_owner(), Some(replacement));
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, next.resume_owner()),
+            UserFpuReturn::Install {
+                owner: replacement,
+                state: dirty(0x5E)
+            }
+        );
+    }
+
+    /// Equal PC/SP/root with different ownership: A's thread shares A's address space and its
+    /// continuation has A's exact PC and SP. Register and root equality authorize nothing — the
+    /// image follows the scheduler's owner.
+    #[test]
+    fn acc_equal_pc_sp_and_root_do_not_make_a_different_task_the_owner() {
+        let k = acc_fixture();
+        let t = k
+            .with(|s| s.spawn_user_thread(ACC_A, 0xABC0_0000, 0x7F00, 0x8123))
+            .expect("thread");
+        let a = owner_of(&k, ACC_A);
+        let thread = owner_of(&k, t);
+        assert_eq!(a.asid, thread.asid, "one address space, two tasks");
+        let thread_ctx = k.with(|s| s.thread_user_context(t)).expect("ctx");
+        k.with(|s| {
+            run_on(s, CPU0, ACC_A);
+            set_home(s, t, dirty(0x7D));
+        });
+        // A enters at exactly the thread's PC/SP.
+        let mut frame = acc_frame(
+            thread_ctx.instruction_ptr.0 as usize,
+            thread_ctx.stack_ptr.0 as usize,
+        );
+        let _ = acc_enter(&k, CPU0, &dirty(0xA1), &mut frame).expect("A enters");
+        // (1) The scheduler switches to the thread: same PC, SP and root, different owner.
+        let token = acc_switch_to(&k, CPU0, t);
+        assert_eq!(
+            x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame)),
+            Ok(())
+        );
+        assert_eq!(
+            (frame.saved_pc(), frame.saved_sp()),
+            (
+                thread_ctx.instruction_ptr.0 as usize,
+                thread_ctx.stack_ptr.0 as usize
+            )
+        );
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, frame.resume_owner()),
+            UserFpuReturn::Install {
+                owner: thread,
+                state: dirty(0x7D)
+            },
+            "the thread's own image, never A's capture"
+        );
+        // (2) A continuation still owned by A while the thread is current: refused, even though
+        // the address space and registers match.
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, Some(a)),
+            UserFpuReturn::Refuse(FpuHomeRefusal::CurrentMismatch {
+                tid: t,
+                expected: ACC_A
+            })
+        );
+        assert_eq!(k.with(|s| home(s, ACC_A)), Some(dirty(0xA1)));
+        assert_eq!(k.current_tid_split_read(CPU0), Some(t));
+    }
+
+    /// Wrong CPU / wrong current: a continuation owned by A is refused on a CPU that does not run
+    /// A — whether another task runs there or nothing does.
+    #[test]
+    fn acc_a_continuation_is_refused_on_a_cpu_that_does_not_run_its_owner() {
+        let k = acc_fixture();
+        k.with(|s| {
+            run_on(s, CpuId(1), ACC_A);
+        });
+        let mut frame = acc_frame(0x8123, 0x7F00);
+        let a = acc_enter(&k, CpuId(1), &dirty(0xA1), &mut frame).expect("A enters on CPU 1");
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, frame.resume_owner()),
+            UserFpuReturn::Refuse(FpuHomeRefusal::NoCurrent)
+        );
+        let token = acc_switch_to(&k, CPU0, ACC_B);
+        let _ = token;
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, Some(a)),
+            UserFpuReturn::Refuse(FpuHomeRefusal::CurrentMismatch {
+                tid: ACC_B,
+                expected: ACC_A
+            })
+        );
+        // On its own CPU the same continuation is authorized.
+        assert_eq!(
+            k.settle_user_fpu_return_split(CpuId(1), Some(a)),
+            UserFpuReturn::Install {
+                owner: a,
+                state: dirty(0xA1)
+            }
+        );
+        assert_eq!(k.current_tid_split_read(CpuId(1)), Some(ACC_A));
+    }
+
+    /// A failed entry commit leaves the entering continuation UNOWNED: nothing is written, and a
+    /// return to it is refused even though PC, SP and the address space are exactly as entered —
+    /// the capture is not kept on that strength and no reset image is invented.
+    #[test]
+    fn acc_a_refused_entry_leaves_the_continuation_unowned_and_refused() {
+        let k = acc_fixture();
+        k.with(|s| {
+            run_on(s, CPU0, ACC_A);
+            set_home(s, ACC_A, dirty(0x0A));
+            // The entry finds `current`'s TCB not resumable.
+            s.set_task_status_for_test(ACC_A, TaskStatus::Faulted);
+        });
+        let mut frame = acc_frame(0x8123, 0x7F00);
+        assert_eq!(
+            acc_enter(&k, CPU0, &dirty(0xA1), &mut frame),
+            Err(FpuHomeRefusal::NotResumable { tid: ACC_A })
+        );
+        assert_eq!(frame.resume_owner(), None);
+        assert_eq!(
+            k.with(|s| home(s, ACC_A)),
+            Some(dirty(0x0A)),
+            "nothing written"
+        );
+        // Even if the task became resumable again before the return, the unowned continuation
+        // is not authorized.
+        k.with(|s| s.set_task_status_for_test(ACC_A, TaskStatus::Running));
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, frame.resume_owner()),
+            UserFpuReturn::Refuse(FpuHomeRefusal::UnownedContinuation)
+        );
+    }
+
+    /// A failed return load: the owner is named, but at return its TCB is no longer resumable or
+    /// is gone. Refused; never the initial image.
+    #[test]
+    fn acc_a_failed_return_load_refuses_and_never_invents_a_reset_image() {
+        let k = acc_fixture();
+        k.with(|s| run_on(s, CPU0, ACC_A));
+        let mut frame = acc_frame(0x8123, 0x7F00);
+        let a = acc_enter(&k, CPU0, &dirty(0xA1), &mut frame).expect("A enters");
+        k.with(|s| s.set_task_status_for_test(ACC_A, TaskStatus::Faulted));
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, Some(a)),
+            UserFpuReturn::Refuse(FpuHomeRefusal::NotResumable { tid: ACC_A })
+        );
+        let slot = k.with(|s| slot_of(s, ACC_A)).expect("slot");
+        k.with(|s| s.with_tcbs_mut(|tcbs| tcbs[slot] = None));
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, Some(a)),
+            UserFpuReturn::Refuse(FpuHomeRefusal::NoTcb { tid: ACC_A })
+        );
+    }
+
+    /// A genuinely fresh continuation — a spawned task's first resume — receives its initial
+    /// image through the same authenticated path.
+    #[test]
+    fn acc_a_fresh_continuation_receives_its_initial_image() {
+        let k = acc_fixture();
+        k.with(|s| run_on(s, CPU0, ACC_A));
+        let mut frame = acc_frame(0x8123, 0x7F00);
+        let _ = acc_enter(&k, CPU0, &dirty(0xA1), &mut frame).expect("A enters");
+        let token = acc_switch_to(&k, CPU0, ACC_B);
+        assert_eq!(
+            x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame)),
+            Ok(())
+        );
+        assert_eq!(frame.saved_pc(), 0x9000, "B's entry point");
+        let b = owner_of(&k, ACC_B);
+        assert_eq!(
+            k.settle_user_fpu_return_split(CPU0, frame.resume_owner()),
+            UserFpuReturn::Install {
+                owner: b,
+                state: UserFpuState::initial()
+            }
+        );
+        assert_eq!(k.current_tid_split_read(CPU0), Some(ACC_B));
+    }
+
+    /// Replacing the continuation replaces its owner: a frame never keeps the previous owner.
+    #[test]
+    fn acc_applying_a_context_clears_the_previous_owner() {
+        let k = acc_fixture();
+        let mut frame = acc_frame(0x8123, 0x7F00);
+        frame.bind_resume_owner(owner_of(&k, ACC_A));
+        let ctx = k.with(|s| s.thread_user_context(ACC_B)).expect("ctx");
+        frame.apply_user_context(ctx);
+        assert_eq!(frame.resume_owner(), None);
+    }
+
+    /// The AArch64 restore facts carry the ASID of the TCB their context was read from.
+    #[test]
+    fn acc_restore_facts_name_the_incarnation_they_were_taken_from() {
+        let k = acc_fixture();
+        let b = owner_of(&k, ACC_B);
+        let facts = k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let mut pending = [None; 4];
+                crate::kernel::task::take_thread_restore_facts(tcbs, &mut pending, ACC_B, None)
+            })
+        });
+        assert_eq!(facts.map(|f| (f.tid, f.asid)), Some((b.tid, Some(b.asid))));
+        let stale = k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let mut pending = [None; 4];
+                crate::kernel::task::take_thread_restore_facts(
+                    tcbs,
+                    &mut pending,
+                    ACC_B,
+                    Some(crate::kernel::vm::Asid(b.asid.0.wrapping_add(7))),
+                )
+            })
+        });
+        assert_eq!(stale, None, "another incarnation's facts are not taken");
+    }
+
+    /// Lifecycle exclusion (proven-unreachable interval): an incarnation that is current cannot
+    /// be reaped, and its TID cannot be reserved for a spawn, so the entering continuation's
+    /// owner is stable for the whole trap.
+    #[test]
+    fn acc_a_current_incarnation_cannot_be_reaped_or_respawned() {
+        let k = acc_fixture();
+        k.with(|s| run_on(s, CPU0, ACC_A));
+        let a = owner_of(&k, ACC_A);
+        assert!(
+            k.with(|s| s.reap_faulted_task_noalloc_cleanup(ACC_A))
+                .is_err()
+        );
+        assert!(
+            k.with(|s| s.reserve_task_for_spawn_with_class(ACC_A, TaskClass::App))
+                .is_err()
+        );
+        assert_eq!(owner_of(&k, ACC_A), a);
+        assert_eq!(status(&k, ACC_A), Some(TaskStatus::Runnable));
+        assert_eq!(k.current_tid_split_read(CPU0), Some(ACC_A));
     }
 }

@@ -1324,27 +1324,25 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     // `fpu_area`; before anything can block, switch or diverge into idle, it becomes that task's
     // home. A kernel-origin trap commits nothing: its area is the interrupted KERNEL context,
     // which the stub restores verbatim unless this trap returns to ring 3.
-    let entered = if entered_from_user {
-        user_fpu_commit_on_entry(fpu_area)
+    // QEMU-SMP1-ACCEPTANCE §1: the committed owner is the owner of the continuation this trap
+    // entered on; the dispatch body carries it on the trap frame and hands back whichever owner
+    // the frame holds when it returns.
+    let entry_owner = if entered_from_user {
+        user_fpu_commit_on_entry(fpu_area).and_then(Result::ok)
     } else {
         None
     };
-    // QEMU-SMP1 §2: the continuation this trap entered on, to recognise an unswitched return.
-    // SAFETY: as above.
-    let entry_point = unsafe { ((*interrupt_frame).rip, (*interrupt_frame).rsp) };
-    let entry_cr3 = read_cr3_raw();
-    x86_trap_dispatch_body(vector, error_code, regs, interrupt_frame);
+    let resume_owner =
+        x86_trap_dispatch_body(vector, error_code, regs, interrupt_frame, entry_owner);
     // QEMU-CONTEXT1 §2 — LOAD. Whatever the trap decided, if the frame now returns to ring 3 the
-    // stub's final FXRSTOR64 must install the RESUMING task's home — the interrupted task's own
-    // state for a same-task return, the switched-in task's for a switch, the selected task's for
-    // an idle-boundary conversion.
+    // stub's final FXRSTOR64 must install the RESUMING continuation's home — the interrupted
+    // task's own state for a same-task return, the switched-in task's for a switch, the selected
+    // task's for an idle-boundary conversion. QEMU-SMP1-ACCEPTANCE §1: "resuming" is the owner
+    // the frame's continuation carries, authenticated against the scheduler, never a second
+    // discovery of `current`.
     // SAFETY: as above; the frame may have been rewritten but not moved.
     if unsafe { (*interrupt_frame).cs } & 0x3 == 0x3 {
-        // SAFETY: as above.
-        let unswitched = entered_from_user
-            && unsafe { ((*interrupt_frame).rip, (*interrupt_frame).rsp) } == entry_point
-            && read_cr3_raw() == entry_cr3;
-        user_fpu_load_for_return(fpu_area, entered, unswitched);
+        user_fpu_load_for_return(fpu_area, resume_owner);
     }
     #[cfg(feature = "context1-clobber")]
     if entered_from_user {
@@ -1354,8 +1352,9 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
 
 /// QEMU-CONTEXT1 §2 / QEMU-SMP1 §2 — commit the trap's captured user x87/SSE state to the home of
 /// the exact incarnation this CPU is running. The authentication and the write are one
-/// transaction (`commit_user_fpu_current_split`); a refusal writes nothing and leaves the capture
-/// in the stub's area. Returns the settlement for the return side.
+/// transaction (`commit_user_fpu_current_split`); a refusal writes nothing. The committed owner is
+/// the owner of the entering continuation; a refused commit leaves that continuation with no
+/// owner, so no return can hand it an FP/SIMD image (QEMU-SMP1-ACCEPTANCE §1).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn user_fpu_commit_on_entry(
     fpu_area: *mut u8,
@@ -1376,44 +1375,28 @@ fn user_fpu_commit_on_entry(
     Some(committed)
 }
 
-/// QEMU-CONTEXT1 §2 / QEMU-SMP1 §2 — load the resuming incarnation's home into the area the
-/// stub restores from.
+/// QEMU-CONTEXT1 §2 / QEMU-SMP1-ACCEPTANCE §1 — install the home of the incarnation the returning
+/// continuation belongs to into the area the stub restores from, through the one shared settlement
+/// (`settle_user_fpu_return_split`).
 ///
-/// Settlement when the resuming home cannot be authenticated:
-/// * the trap returns to the very continuation it entered on (same RIP/RSP/CR3) AND its own
-///   commit was refused too — the area still holds that continuation's live hardware state,
-///   captured by the stub, so it is left exactly as captured (never a reset image, never another
-///   context's bytes);
-/// * any other ring-3 return — a switched return, or an entry that authenticated and a return
-///   that no longer does — would resume a continuation whose home is unknown. That is fatal
-///   through the existing trap fatal path, with the reason named.
+/// A refusal means nothing authorizes an image for this continuation: its owner is unknown (an
+/// entry nobody authenticated), or it is not the incarnation current on this CPU. The captured
+/// image is never kept on the strength of equal RIP/RSP/CR3 and no reset image is invented; the
+/// return is fatal through the existing trap fatal path, with the reason named.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn user_fpu_load_for_return(
-    fpu_area: *mut u8,
-    entered: Option<Result<crate::runtime::FpuHomeOwner, crate::runtime::FpuHomeRefusal>>,
-    unswitched: bool,
-) {
+fn user_fpu_load_for_return(fpu_area: *mut u8, resume_owner: Option<crate::runtime::FpuHomeOwner>) {
     let Some(shared) = trap_shared_kernel() else {
         return;
     };
     let cpu = current_cpu_id();
-    let refusal = match shared.load_user_fpu_current_split(cpu) {
-        // SAFETY: the stub's area, as above.
-        Ok((_owner, state)) => {
+    let refusal = match shared.settle_user_fpu_return_split(cpu, resume_owner) {
+        crate::runtime::UserFpuReturn::Install { state, .. } => {
+            // SAFETY: the stub's area, as above.
             unsafe { state.write_to(fpu_area) };
             return;
         }
-        Err(refusal) => refusal,
+        crate::runtime::UserFpuReturn::Refuse(refusal) => refusal,
     };
-    if unswitched && matches!(entered, Some(Err(_))) {
-        crate::yarm_log!(
-            "X86_USER_FPU_HOME_UNAUTHENTICATED cpu={} tid={} reason={} action=kept_captured",
-            cpu.0,
-            refusal.tid(),
-            refusal.reason()
-        );
-        return;
-    }
     crate::yarm_log!(
         "X86_USER_FPU_HOME_UNAUTHENTICATED cpu={} tid={} reason={} action=fatal",
         cpu.0,
@@ -1428,16 +1411,6 @@ fn user_fpu_load_for_return(
     halt_forever();
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn read_cr3_raw() -> u64 {
-    let v: u64;
-    // SAFETY: reading CR3 has no side effect.
-    unsafe {
-        core::arch::asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags))
-    };
-    v
-}
-
 /// The trap dispatch proper, below the entry wrapper that owns the protected interval's edges.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[inline(never)]
@@ -1446,7 +1419,8 @@ fn x86_trap_dispatch_body(
     error_code: u64,
     regs: *mut X86SavedRegs,
     interrupt_frame: *mut X86InterruptStackFrame,
-) {
+    entry_owner: Option<crate::runtime::FpuHomeOwner>,
+) -> Option<crate::runtime::FpuHomeOwner> {
     // Stage 30 / Review C1: in debug builds, assert no boot raw-borrow window is
     // live. A timer/trap reaching with_cpu during that window would alias the boot
     // &mut KernelState (UB). Compiles to nothing in release; zero ISR overhead.
@@ -1549,6 +1523,12 @@ fn x86_trap_dispatch_body(
         }
         let mut trap_frame =
             unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
+        // QEMU-SMP1-ACCEPTANCE §1: the frame holds the interrupted continuation, whose owner is
+        // the incarnation the entry commit authenticated (none for a kernel-origin frame or a
+        // refused commit). A restore that replaces the continuation replaces the owner with it.
+        if let Some(owner) = entry_owner {
+            trap_frame.bind_resume_owner(owner);
+        }
         // QEMU-IRQ3 §2: the witness fixture's hook before delivery — record the origin from the
         // hardware frame and drain COM1 so the device cause is withdrawn before the production
         // bridge delivers and writes the one LAPIC EOI. It never claims, delivers or completes.
@@ -1758,7 +1738,7 @@ fn x86_trap_dispatch_body(
         // to `drained` means an attestation was skipped, which is reported as an error rather
         // than papered over with a reassuring marker.
         maybe_attest_exit_common_epilogue(cpu, "replacement");
-        return;
+        return trap_frame.resume_owner();
     }
 
     // Fallback: raw KernelState path (pre-Stage2N or no shared kernel installed).
@@ -1774,7 +1754,7 @@ fn x86_trap_dispatch_body(
             halt_forever();
         }
         TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
-        return;
+        return None;
     };
     let fault_rip = frame.rip;
     let entering_tid = kernel.current_tid();
@@ -1813,6 +1793,8 @@ fn x86_trap_dispatch_body(
     }
     unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
     TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
+    // No shared kernel: neither the entry commit nor the return settlement runs on this path.
+    trap_frame.resume_owner()
 }
 
 /// QEMU-CONTEXT1 §2 — the MXCSR every kernel entry installs after capturing the user's: all

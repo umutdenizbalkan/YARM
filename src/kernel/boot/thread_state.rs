@@ -2578,6 +2578,11 @@ impl KernelState {
             .thread_user_context(tid)
             .ok_or(KernelError::TaskMissing)?;
         frame.apply_user_context(context);
+        // QEMU-SMP1-ACCEPTANCE §1: under the broad guard `current` and its TCB are one
+        // observation, so the incarnation whose context was applied is `{tid, its asid}`.
+        if let Some(asid) = self.task_asid(tid) {
+            frame.bind_resume_owner(crate::runtime::FpuHomeOwner { tid, asid });
+        }
         Ok(())
     }
 

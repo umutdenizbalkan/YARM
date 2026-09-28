@@ -935,6 +935,9 @@ pub(crate) fn take_blocked_syscall_completion_for(
 pub(crate) struct ThreadRestoreFacts {
     /// The exact incarnation these facts belong to.
     pub(crate) tid: u64,
+    /// QEMU-SMP1-ACCEPTANCE §1 — the address space of the TCB `context` was read from, in the
+    /// same acquisition: with `tid`, the owner of the continuation these facts restore.
+    pub(crate) asid: Option<Asid>,
     /// The saved user register context to apply to the frame.
     pub(crate) context: UserRegisterContext,
     /// The TLS base to place in the TLS lane, `None` when no restore was pending.
@@ -969,6 +972,12 @@ pub(crate) fn take_thread_restore_facts(
     expect_asid: Option<Asid>,
 ) -> Option<ThreadRestoreFacts> {
     let (context, tls) = read_user_context_and_take_tls(tcbs, tls_pending, tid, expect_asid)?;
+    // The TCB the context came from, resolved by the same predicate under the same guard.
+    let asid = tcbs
+        .iter()
+        .flatten()
+        .find(|t| t.tid.0 == tid && expect_asid.is_none_or(|a| t.asid == Some(a)))
+        .and_then(|t| t.asid);
     let send_completion =
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcSend);
     #[cfg(any(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
@@ -976,6 +985,7 @@ pub(crate) fn take_thread_restore_facts(
         take_blocked_syscall_completion_for(tcbs, tid, expect_asid, BlockedSyscallClass::IpcRecv);
     Some(ThreadRestoreFacts {
         tid,
+        asid,
         context,
         tls,
         send_completion,
