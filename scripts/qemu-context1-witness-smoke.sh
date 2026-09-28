@@ -21,15 +21,22 @@
 # appears (plus a short tail) or at the bound. This script grades; it never retries.
 #
 # Graded, each separately, for every window:
-#   * STATE: the witness's own full-image comparison (mask=0x0, flags_bad=0, gpr_bad=0x0);
-#   * IDENTITY / TRANSITIONS, from the kernel's CTX1_TRAP lines inside the window:
+#   * STATE: the witness's own full-image comparison (mask=0x0, flags_bad=0, gpr_bad=0x0) — for
+#     EVERY window, including every attempt;
+#   * IDENTITY / TRANSITIONS, from the kernel's CTX1_TRAP lines inside the window, by exact TID
+#     (QEMU-SMP1-ACCEPTANCE §3: other tasks may run between the events and are never credited;
+#     nothing requires adjacent selections):
 #       fresh   — A blocked and C (a new thread) was entered;
-#       block   — A blocked (in=A out=0), the CPU idled, and an idle-origin trap resumed A;
-#       preempt — a timer tick switched A -> B (in=A out=B), and the first return from B to A
-#                 took the route the round's mode names — a timer tick (spin) or B's blocking
-#                 syscall (block) — with B's own "B ran" store observed by A (b_ran=1) and A's
-#                 six syscall-lane GPR sentinels intact (gpr_bad=0x0); both routes required;
-#       same    — at least one timer tick interrupted A in user mode and returned to A;
+#       block   — A blocked by its own syscall, the CPU idled, and an idle-origin trap resumed A
+#                 (6 attempts, 3 must carry this evidence);
+#       preempt — in order: a timer tick preempted A (pattern live, the round's generation
+#                 published inside A's window), B was entered, B left the CPU — its last exit
+#                 before A's resume by the route the round's mode names, a timer tick (spin) or
+#                 B's blocking syscall (block) — and A was resumed; A observed B's stamp of THIS
+#                 round's generation (b_seen == gen) and its six syscall-lane GPR sentinels intact;
+#                 all 3 rounds, both routes required;
+#       same    — at least one timer tick interrupted A in user mode and returned to A
+#                 (6 attempts, 3 must carry this evidence, at least one an alternate-state one);
 #   * B's own windows all intact; the kernel ran under its own FP environment on every user
 #     entry (CTX1_KERNEL_ENV_BAD absent); nothing fatal.
 set -uo pipefail
@@ -129,50 +136,89 @@ for r, i, j, R in windows('fresh'):
     if R.get('result') != 'ok': fail(f"fresh: {R}")
     if not (entered_c and a_left): fail(f"fresh: no A-block then C-entry in window (A left={a_left} C entered={entered_c})")
     counts['fresh'] = counts.get('fresh', 0) + (R.get('result') == 'ok' and entered_c and a_left)
-# block
-for r, i, j, R in windows('block'):
-    tr = traps_in(i, j)
-    blk = [k for k, t in traps if i < k < j and t['in'] == A and t['out'] == '0']
-    idle = any('SCHED_ENTER_IDLE_HLT' in lines[k] for k in range(i, j))
+# QEMU-SMP1-ACCEPTANCE §3 — scheduling evidence by EXACT task identity. Other tasks (the
+# supervisor's deadline polling, for one) may run between the events a round needs; they are
+# never credited as the interference, and nothing requires adjacent selections.
+notes = []
+def note(msg): notes.append(msg); print(f"[context1-witness] {msg}")
+# block — per attempt: A blocked by its own syscall, the CPU idled, and an idle-origin trap resumed
+# A. Every attempt's STATE must pass; ROUNDS attempts must carry the complete evidence.
+block_windows = windows('block')
+for r, i, j, R in block_windows:
+    blk = [k for k, t in traps if i < k < j and t['in'] == A and t['timer'] == '0' and t['out'] != A]
     res = [k for k, t in traps if i < k < j and t['origin'] == 'idle' and t['out'] == A]
-    good = R.get('result') == 'ok' and blk and idle and res and min(blk) < max(res)
+    # The idle entry is logged inside the blocking trap's dispatch, BEFORE that trap's CTX1_TRAP.
+    idle = any('SCHED_ENTER_IDLE_HLT' in lines[k] for k in range(i, j))
     if R.get('result') != 'ok': fail(f"block round {r}: {R}")
-    if not (blk and idle and res): fail(f"block round {r}: block={len(blk)} idle={idle} idle_resume={len(res)}")
+    good = R.get('result') == 'ok' and blk and idle and res and min(blk) < max(res)
+    if not good and R.get('result') == 'ok':
+        others = sorted({t['in'] for k, t in traps if i < k < j and t['out'] == A and t['in'] not in (A, '0')})
+        note(f"block round {r}: not evidenced (block={len(blk)} idle={idle} idle_resume={len(res)} resumed_by={others})")
     counts['block'] = counts.get('block', 0) + bool(good)
-# preempt: A -> B on a timer tick, then the FIRST return to A comes from B by the route the
-# round's mode names: a timer tick (spin) or B's blocking syscall (block).
+# preempt — per round, in order and by exact identity: A (pattern live, this round's generation
+# published inside the window) is preempted by a timer tick; B is entered; B leaves the CPU; A is
+# resumed; and A observed B's stamp of THIS round's generation. B's last exit before A's resume
+# takes the route the round's mode names — a timer tick (spin) or B's blocking syscall (block).
 routes = {}
 for r, i, j, R in windows('preempt'):
+    W = kv(lines[i][lines[i].index('CTX1_WINDOW'):])
     tr = [(k, t) for k, t in traps if i < k < j]
-    out_ab = [k for k, t in tr if t['in'] == A and t['out'] == B and t['timer'] == '1']
-    back = [(k, t) for k, t in tr if out_ab and k > min(out_ab) and t['out'] == A and t['in'] == B]
-    route = None
-    if back:
-        route = 'timer' if back[0][1]['timer'] == '1' else 'syscall'
+    seq, away, entered, last_exit = None, False, False, None
+    for k, t in tr:
+        if not away:
+            if t['in'] == A and t['timer'] == '1' and t['origin'] == 'user' and t['out'] != A:
+                # The preempting trap may itself enter B.
+                away, entered, last_exit = True, t['out'] == B, None
+            continue
+        if entered and t['in'] == B and t['out'] != B:
+            last_exit = 'timer' if t['timer'] == '1' else 'syscall'
+        if t['out'] == B:
+            entered = True
+        if t['out'] == A:
+            if entered and last_exit:
+                seq = last_exit
+                break
+            away = False
     want = {'spin': 'timer', 'block': 'syscall'}.get(R.get('mode'))
-    routes[r] = f"{R.get('mode')}:{route}"
-    good = (R.get('result') == 'ok' and R.get('b_ran') == '1' and R.get('gpr_bad') == '0x0'
-            and out_ab and back and route == want)
+    routes[r] = f"{R.get('mode')}:{seq}"
+    gen_ok = W.get('gen') is not None and R.get('gen') == W.get('gen') and R.get('seen') == W.get('gen')
+    good = (R.get('result') == 'ok' and R.get('b_ran') == '1' and gen_ok and R.get('gpr_bad') == '0x0'
+            and seq == want)
     if R.get('result') != 'ok': fail(f"preempt round {r}: {R}")
-    if not (out_ab and back): fail(f"preempt round {r}: A->B switches={len(out_ab)} returns-to-A={len(back)}")
-    elif route != want: fail(f"preempt round {r}: mode={R.get('mode')} returned to A by {route}, want {want}")
+    if not gen_ok: fail(f"preempt round {r}: B's stamp does not name this round's generation (window gen={W.get('gen')} result gen={R.get('gen')} seen={R.get('seen')})")
+    if seq is None: fail(f"preempt round {r}: no timer preemption of A followed by B entered, B out and A resumed")
+    elif seq != want: fail(f"preempt round {r}: mode={R.get('mode')} B left by {seq}, want {want}")
     counts['preempt'] = counts.get('preempt', 0) + bool(good)
 modes = [v.split(':')[0] for v in routes.values()]
 if 'spin' not in modes or 'block' not in modes: fail(f"preempt: both return routes required, got {routes}")
 pb = [l for l in lines if 'CTX1_RESULT cell=preempt_b ' in l]
 if len(pb) != 1 or 'result=ok' not in pb[0]: fail(f"B's own windows: {pb[-1].strip()[-140:] if pb else 'missing'}")
-# same
-for r, i, j, R in windows('same'):
+# same — per attempt: at least one timer tick interrupted A in user mode and returned to A. Every
+# attempt's STATE must pass; ROUNDS attempts, at least one of them an alternate-state attempt,
+# must carry the evidence.
+same_alt = 0
+same_windows = windows('same')
+for r, i, j, R in same_windows:
+    W = kv(lines[i][lines[i].index('CTX1_WINDOW'):])
     tr = traps_in(i, j)
     ticks = [t for t in tr if t['timer'] == '1' and t['origin'] == 'user' and t['in'] == A and t['out'] == A]
     good = R.get('result') == 'ok' and len(ticks) >= 1
     if R.get('result') != 'ok': fail(f"same round {r}: {R}")
-    if not ticks: fail(f"same round {r}: no same-task user-origin timer tick inside the window")
+    if not good and R.get('result') == 'ok':
+        away = sorted({t['out'] for t in tr if t['in'] == A and t['out'] != A})
+        note(f"same round {r}: not evidenced (no same-task tick; A's ticks went to {away})")
     counts['same'] = counts.get('same', 0) + bool(good)
+    same_alt += bool(good) and W.get('alt') == '1'
 
+ATTEMPTS = 6
+if len(block_windows) != ATTEMPTS: fail(f"block: {len(block_windows)}/{ATTEMPTS} attempts completed")
+if len(same_windows) != ATTEMPTS: fail(f"same: {len(same_windows)}/{ATTEMPTS} attempts completed")
 need = {'fresh': 1, 'block': 3, 'preempt': 3, 'same': 3}
+exact = {'fresh', 'preempt'}
 for k, v in need.items():
-    if counts.get(k, 0) != v: fail(f"{k}: {counts.get(k,0)}/{v} windows fully evidenced")
+    got = counts.get(k, 0)
+    if (got != v) if k in exact else (got < v): fail(f"{k}: {got}/{v} windows fully evidenced")
+if same_alt < 1: fail("same: no fully evidenced alternate-state attempt")
 envbad = sum('CTX1_KERNEL_ENV_BAD' in l for l in lines)
 if envbad: fail(f"kernel ran under a user FP environment ({envbad} logged violations)")
 for bad in ('panicked at', 'KERNEL PANIC', 'x86 trap dispatch failed', 'YARM_AARCH64_TRAP_HANDLE failed',
@@ -180,8 +226,8 @@ for bad in ('panicked at', 'KERNEL PANIC', 'x86 trap dispatch failed', 'YARM_AAR
     n = sum(bad in l for l in lines)
     if n: fail(f"{bad} x{n}")
 first = [l.strip()[-200:] for l in lines if 'CTX1_RESULT' in l and 'result=fail' in l][:1]
-print(f"[context1-witness] tids A={A} B={B} C={C}; windows {counts}; preempt routes {routes}; first failing result: {first[0] if first else 'none'}")
+print(f"[context1-witness] tids A={A} B={B} C={C}; windows {counts}; preempt routes {routes}; unevidenced attempts {len(notes)}; first failing result: {first[0] if first else 'none'}")
 seal = 'ok' if not fails else 'fail'
-print(f"CONTEXT1_WITNESS_SEAL arch={arch} a={A} b={B} c={C} fresh={counts.get('fresh',0)} block={counts.get('block',0)} preempt={counts.get('preempt',0)} same={counts.get('same',0)} env_bad={envbad} result={seal}")
+print(f"CONTEXT1_WITNESS_SEAL arch={arch} a={A} b={B} c={C} fresh={counts.get('fresh',0)} block={counts.get('block',0)}/{len(block_windows)} preempt={counts.get('preempt',0)} same={counts.get('same',0)}/{len(same_windows)} same_alt={same_alt} env_bad={envbad} result={seal}")
 sys.exit(0 if seal == 'ok' else 1)
 PY

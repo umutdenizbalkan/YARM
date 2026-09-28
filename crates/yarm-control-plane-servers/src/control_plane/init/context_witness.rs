@@ -21,10 +21,15 @@
 //! 2. **block** — A loads its pattern, blocks on a deadline receive with nothing else runnable
 //!    (a genuine idle interval), is resumed, and captures. Asserted: FP/SIMD, control/status,
 //!    TPIDR_EL0. NOT asserted: flags and GPRs the syscall ABI clobbers.
-//! 3. **preempt** — thread B runs its own distinct pattern and control settings in a loop and
-//!    clears A's `ran_not` word. A loads its pattern and spins, flag-neutrally, until it observes
-//!    `ran_not == 0`: on one CPU that is only possible if A was descheduled and B executed between
-//!    A's capture and A's restoration. Asserted: everything, including flags, and the six GPRs
+//! 3. **preempt** — thread B runs its own distinct pattern and control settings in a loop and,
+//!    inside that patterned window, copies the round generation A last published into a word only
+//!    B writes (as its complement, so no flag-setting instruction is needed on either side).
+//!    QEMU-SMP1-ACCEPTANCE §3: A loads its pattern and only THEN publishes this round's
+//!    generation, inside the same register window, and spins, flag-neutrally, until B's word
+//!    names exactly that generation: on one CPU that is only possible if A was descheduled with
+//!    its pattern live and B executed with its own pattern live before A was restored. A stale
+//!    stamp from an earlier round, or a stamp written before A's pattern was in place, names a
+//!    different generation and is never credited. Asserted: everything, including flags, and the six GPRs
 //!    that are the syscall argument/result lanes (x0..x5; rdi rsi rdx r10 r8 r9), which A holds
 //!    live sentinels in across the window. The round's mode chooses how A comes back: `spin`
 //!    rounds keep B spinning, so only a timer tick can return to A; `block` rounds make B block
@@ -45,6 +50,12 @@ pub(super) fn armed(slot5: Option<u32>) -> bool {
 
 const NR_IPC_RECV_TIMEOUT: usize = 5;
 const ROUNDS: u32 = 3;
+/// QEMU-SMP1-ACCEPTANCE §3 — bounded attempts for the cells whose scheduling evidence another
+/// runnable task can legitimately pre-empt (the supervisor's deadline polling): a block round can
+/// be resumed by another task's switch instead of from idle, and a same round's ticks can all go
+/// to that task. Every attempt's STATE is asserted; the grader requires `ROUNDS` attempts with
+/// complete scheduling evidence among them.
+const EVIDENCE_ATTEMPTS: u32 = 6;
 const BLOCK_TICKS: u64 = 6;
 const FRESH_PARK_TICKS: u64 = 4;
 /// Upper bound on one preemption window's wait for B, in loop iterations.
@@ -74,8 +85,31 @@ static mut C_STACK: Stack = Stack([0; STACK_BYTES]);
 static mut B_TLS: [u8; 256] = [0; 256];
 static mut C_TLS: [u8; 256] = [0; 256];
 
-/// A's "B has not run yet" word: A sets it to 1, B stores 0 on every loop iteration.
-static RAN_NOT: AtomicU64 = AtomicU64::new(1);
+/// QEMU-SMP1-ACCEPTANCE §3 — the preemption rounds' generation words, adjacent so one base
+/// register reaches all of them:
+/// * `[0]` the generation A published for the current round (written by A only, inside its
+///   patterned window);
+/// * `[1]` the complement of the generation B last observed (written by B only, inside its
+///   patterned window);
+/// * `[2]` scratch the x86_64 window loads its entry RFLAGS from (A only), keeping the window's
+///   register budget unchanged.
+static GEN_WORDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// The tag every preemption generation carries, so a cleared or foreign word never matches.
+const GEN_TAG: u64 = 0xC7A1_0000_0000_0000;
+/// The generation of preemption round `round`: nonzero and distinct per round.
+const fn round_generation(round: u32) -> u64 {
+    GEN_TAG | (round as u64 + 1)
+}
+/// Scratch words the non-stamping windows copy through instead of `GEN_WORDS`.
+static SCRATCH_WORDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn gen_words() -> *mut u64 {
+    GEN_WORDS[0].as_ptr()
+}
+
+fn scratch_words() -> *mut u64 {
+    SCRATCH_WORDS[0].as_ptr()
+}
 static B_STOP: AtomicU32 = AtomicU32::new(0);
 static B_DONE: AtomicU32 = AtomicU32::new(0);
 static B_WINDOWS: AtomicU32 = AtomicU32::new(0);
@@ -157,27 +191,33 @@ mod arch {
         m
     }
 
-    /// Load `pat` and `flags`, spin until B has run (`RAN_NOT == 0`) or `bound` iterations pass,
-    /// capture into `out`. Returns `(flags_out, iterations_left)`. Flag-neutral throughout:
-    /// `mov`, `lea`, `jrcxz`, `jmp` only.
+    /// Load `pat` and `flags`, publish `generation` (QEMU-SMP1-ACCEPTANCE §3: only once the
+    /// pattern is live), spin until B's word names exactly that generation or `bound` iterations
+    /// pass, capture into `out`. Returns `(flags_out, iterations_left)`. Flag-neutral throughout:
+    /// `mov`, `lea`, `jrcxz`, `jmp` only — B stores `!generation`, so `seen + generation + 1`
+    /// is zero exactly when B saw this round's generation.
     pub unsafe fn spin_until_other_ran(
         pat: &State,
         out: &mut State,
         flags: u64,
+        generation: u64,
         bound: u64,
         gprs: &mut [usize; 6],
     ) -> (u64, u64) {
         let mut env = ZERO;
         let flags_out: u64;
         let left: u64;
+        GEN_WORDS[2].store(flags | RFLAGS_BIT1, SeqCst);
         unsafe {
             core::arch::asm!(
                 "fxsave64 [{env}]",
                 "fxrstor64 [{pat}]",
-                "push {fin}",
+                "push qword ptr [{w} + 16]",
                 "popfq",
+                "mov qword ptr [{w}], {g}",
                 "2:",
-                "mov rcx, qword ptr [{ran}]",
+                "mov rcx, qword ptr [{w} + 8]",
+                "lea rcx, [rcx + {g} + 1]",
                 "jrcxz 3f",
                 "mov rcx, {n}",
                 "jrcxz 3f",
@@ -193,10 +233,10 @@ mod arch {
                 env = in(reg) &mut env,
                 pat = in(reg) pat,
                 out = in(reg) out,
-                fin = in(reg) flags | RFLAGS_BIT1,
-                ran = in(reg) RAN_NOT.as_ptr(),
+                w = in(reg) gen_words(),
+                g = in(reg) generation,
                 n = inout(reg) bound => left,
-                fout = out(reg) flags_out,
+                fout = lateout(reg) flags_out,
                 inout("rdi") gprs[0],
                 inout("rsi") gprs[1],
                 inout("rdx") gprs[2],
@@ -215,28 +255,19 @@ mod arch {
         (flags_out, left)
     }
 
-    /// Load `pat` and `flags`, spin exactly `iters` iterations (`loop` touches no flag), storing 0
-    /// to `RAN_NOT` each time when `clear_ran` is set, capture into `out`. Returns `flags_out`.
+    /// Load `pat` and `flags`, spin exactly `iters` iterations (`loop` and `not` touch no flag),
+    /// each time copying the complement of the published generation into B's word when `stamp`
+    /// is set (QEMU-SMP1-ACCEPTANCE §3), capture into `out`. Returns `flags_out`.
     pub unsafe fn spin_fixed(
         pat: &State,
         out: &mut State,
         flags: u64,
         iters: u64,
-        clear_ran: bool,
+        stamp: bool,
     ) -> u64 {
         let mut env = ZERO;
         let flags_out: u64;
-        let target: *mut u64 = if clear_ran {
-            RAN_NOT.as_ptr()
-        } else {
-            core::ptr::null_mut()
-        };
-        let mut scratch: u64 = 0;
-        let store_to = if target.is_null() {
-            &mut scratch as *mut u64
-        } else {
-            target
-        };
+        let words = if stamp { gen_words() } else { scratch_words() };
         unsafe {
             core::arch::asm!(
                 "fxsave64 [{env}]",
@@ -244,7 +275,9 @@ mod arch {
                 "push {fin}",
                 "popfq",
                 "2:",
-                "mov qword ptr [{st}], 0",
+                "mov rax, qword ptr [{w}]",
+                "not rax",
+                "mov qword ptr [{w} + 8], rax",
                 "loop 2b",
                 "pushfq",
                 "pop {fout}",
@@ -256,9 +289,10 @@ mod arch {
                 pat = in(reg) pat,
                 out = in(reg) out,
                 fin = in(reg) flags | RFLAGS_BIT1,
-                st = in(reg) store_to,
+                w = in(reg) words,
                 fout = out(reg) flags_out,
                 inout("rcx") iters.max(1) => _,
+                out("rax") _,
                 out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
                 out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
                 out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
@@ -507,11 +541,13 @@ mod arch {
         };
     }
 
-    /// Spin until B has run (`RAN_NOT == 0`) or `bound` iterations pass; NZCV-neutral (`ldr`,
-    /// `cbz`, `sub`, `b` only). Returns iterations left.
+    /// Publish `generation` once the pattern is live (QEMU-SMP1-ACCEPTANCE §3) and spin until
+    /// B's word names exactly that generation or `bound` iterations pass; NZCV-neutral (`str`,
+    /// `ldr`, `mvn`, `eor`, `cbz`, `sub`, `b` only). Returns iterations left.
     pub unsafe fn spin_until_other_ran(
         pat: &State,
         out: &mut State,
+        generation: u64,
         bound: u64,
         gprs: &mut [usize; 6],
     ) -> u64 {
@@ -520,8 +556,11 @@ mod arch {
             core::arch::asm!(
                 save_env!(),
                 load_state!(),
+                "str {g}, [{w}]",
                 "2:",
-                "ldr {t}, [{ran}]",
+                "ldr {t}, [{w}, #8]",
+                "mvn {t}, {t}",
+                "eor {t}, {t}, {g}",
                 "cbz {t}, 3f",
                 "cbz {n}, 3f",
                 "sub {n}, {n}, #1",
@@ -531,7 +570,8 @@ mod arch {
                 restore_env!(),
                 pat = in(reg) pat,
                 out = in(reg) out,
-                ran = in(reg) RAN_NOT.as_ptr(),
+                w = in(reg) gen_words(),
+                g = in(reg) generation,
                 n = inout(reg) bound => left,
                 t = out(reg) _,
                 e0 = out(reg) _, e1 = out(reg) _, e2 = out(reg) _,
@@ -555,28 +595,25 @@ mod arch {
         left
     }
 
-    /// Spin exactly `iters` iterations (NZCV-neutral), storing 0 to `RAN_NOT` each time when
-    /// `clear_ran` is set.
-    pub unsafe fn spin_fixed(pat: &State, out: &mut State, iters: u64, clear_ran: bool) {
-        let mut scratch: u64 = 0;
-        let st: *mut u64 = if clear_ran {
-            RAN_NOT.as_ptr()
-        } else {
-            &mut scratch
-        };
+    /// Spin exactly `iters` iterations (NZCV-neutral), copying the complement of the published
+    /// generation into B's word each time when `stamp` is set (QEMU-SMP1-ACCEPTANCE §3).
+    pub unsafe fn spin_fixed(pat: &State, out: &mut State, iters: u64, stamp: bool) {
+        let w = if stamp { gen_words() } else { scratch_words() };
         unsafe {
             core::arch::asm!(
                 save_env!(),
                 load_state!(),
                 "2:",
-                "str xzr, [{st}]",
+                "ldr {t}, [{w}]",
+                "mvn {t}, {t}",
+                "str {t}, [{w}, #8]",
                 "sub {n}, {n}, #1",
                 "cbnz {n}, 2b",
                 store_state!(),
                 restore_env!(),
                 pat = in(reg) pat,
                 out = in(reg) out,
-                st = in(reg) st,
+                w = in(reg) w,
                 n = inout(reg) iters.max(1) => _,
                 t = out(reg) _,
                 e0 = out(reg) _, e1 = out(reg) _, e2 = out(reg) _,
@@ -870,7 +907,7 @@ pub(super) fn run_once() {
     );
 
     // ── 2. block ──────────────────────────────────────────────────────────────────────────────
-    for round in 0..ROUNDS {
+    for round in 0..EVIDENCE_ATTEMPTS {
         let pat = arch::a_block_pattern();
         let mut out = arch::ZERO;
         yarm_user_rt::user_log!("CTX1_WINDOW cell=block round={} tid={} begin", round, a_tid);
@@ -907,35 +944,46 @@ pub(super) fn run_once() {
         // Rounds 0 and 2 return A through B's blocking syscall, round 1 on a timer tick.
         let mode = if round == 1 { 0 } else { 1 };
         B_MODE.store(mode, SeqCst);
-        RAN_NOT.store(1, SeqCst);
+        let generation = round_generation(round);
         let b0 = B_WINDOWS.load(SeqCst);
         yarm_user_rt::user_log!(
-            "CTX1_WINDOW cell=preempt round={} tid={} b_tid={} mode={} begin",
+            "CTX1_WINDOW cell=preempt round={} tid={} b_tid={} mode={} gen={} begin",
             round,
             a_tid,
             b_tid,
-            if mode == 1 { "block" } else { "spin" }
+            if mode == 1 { "block" } else { "spin" },
+            generation ^ GEN_TAG
         );
         #[cfg(target_arch = "x86_64")]
         let (left, flags_bad) = {
             // SAFETY: a self-contained register window; see `arch::spin_until_other_ran`.
             let (f, left) = unsafe {
-                arch::spin_until_other_ran(&pat, &mut out, arch::A_FLAGS, PREEMPT_BOUND, &mut gprs)
+                arch::spin_until_other_ran(
+                    &pat,
+                    &mut out,
+                    arch::A_FLAGS,
+                    generation,
+                    PREEMPT_BOUND,
+                    &mut gprs,
+                )
             };
             (left, arch::flags_diff(arch::A_FLAGS, f))
         };
         #[cfg(target_arch = "aarch64")]
         let (left, flags_bad) = {
             // SAFETY: a self-contained register window; see `arch::spin_until_other_ran`.
-            let left =
-                unsafe { arch::spin_until_other_ran(&pat, &mut out, PREEMPT_BOUND, &mut gprs) };
+            let left = unsafe {
+                arch::spin_until_other_ran(&pat, &mut out, generation, PREEMPT_BOUND, &mut gprs)
+            };
             (left, false)
         };
         #[cfg(target_arch = "x86_64")]
         let mask = arch::diff(&pat, &out);
         #[cfg(target_arch = "aarch64")]
         let mask = arch::diff_with(&pat, &out, true);
-        let b_ran = RAN_NOT.load(SeqCst) == 0;
+        // The generation B last stamped, un-complemented. Only this round's value is credited.
+        let b_seen = !GEN_WORDS[1].load(SeqCst);
+        let b_ran = b_seen == generation;
         let used = PREEMPT_BOUND - left;
         if mode == 0 {
             quantum_iters = quantum_iters.max(used);
@@ -949,11 +997,15 @@ pub(super) fn run_once() {
         let ok = b_ran && mask == 0 && !flags_bad && gpr_bad == 0;
         failures += u32::from(!ok);
         yarm_user_rt::user_log!(
-            "CTX1_RESULT cell=preempt round={} tid={} b_tid={} mode={} b_ran={} b_windows={} iters={} mask=0x{:x} flags_bad={} gpr_bad=0x{:x} result={}",
+            // Generations are logged tag-stripped (`seen` is whatever B's word held, tag-stripped),
+            // keeping the line inside the DebugLog budget.
+            "CTX1_RESULT cell=preempt round={} tid={} b_tid={} mode={} gen={} seen={} b_ran={} b_windows={} iters={} mask=0x{:x} flags_bad={} gpr_bad=0x{:x} result={}",
             round,
             a_tid,
             b_tid,
             if mode == 1 { "block" } else { "spin" },
+            generation ^ GEN_TAG,
+            b_seen ^ GEN_TAG,
             b_ran as u8,
             B_WINDOWS.load(SeqCst) - b0,
             used,
@@ -989,25 +1041,29 @@ pub(super) fn run_once() {
     let same_iters = quantum_iters
         .saturating_mul(4)
         .clamp(1 << 20, PREEMPT_BOUND);
-    for round in 0..ROUNDS {
+    for round in 0..EVIDENCE_ATTEMPTS {
         let mut out = arch::ZERO;
+        // Every third attempt carries the alternate state (x86_64: DF set; AArch64: the
+        // alternate pattern), so it too gets more than one chance at complete evidence.
+        let alt = round % ROUNDS == ROUNDS - 1;
         #[cfg(target_arch = "x86_64")]
-        let (pat, want_flags) = if round == ROUNDS - 1 {
+        let (pat, want_flags) = if alt {
             (arch::a_pattern(), arch::A_FLAGS_DF)
         } else {
             (arch::a_pattern(), arch::A_FLAGS)
         };
         #[cfg(target_arch = "aarch64")]
-        let pat = if round == ROUNDS - 1 {
+        let pat = if alt {
             arch::a_pattern_alt()
         } else {
             arch::a_pattern()
         };
         yarm_user_rt::user_log!(
-            "CTX1_WINDOW cell=same round={} tid={} iters={} begin",
+            "CTX1_WINDOW cell=same round={} tid={} iters={} alt={} begin",
             round,
             a_tid,
-            same_iters
+            same_iters,
+            alt as u8
         );
         #[cfg(target_arch = "x86_64")]
         let (mask, flags_bad) = {
