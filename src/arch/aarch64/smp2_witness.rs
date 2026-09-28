@@ -491,6 +491,35 @@ pub fn vm_op_begin(tid: u64, asid: Asid, addr: usize, len: usize) -> Option<VmOp
     Some(op)
 }
 
+static P1_PARK_MET: AtomicU64 = AtomicU64::new(0);
+static P1_PARK_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+/// Bound on the P1 parked wait; reached only if S never blocks, and then the round is graded as
+/// whatever actually happened.
+const P1_PARK_SPINS: u64 = 50_000_000;
+
+/// WITNESS SYNCHRONIZATION — labelled, not production behaviour. A P1 round is a call to a
+/// PARKED S, but S raises its mailbox flag before its `svc`, so C could call while S was still
+/// on its way into the receive: S then took the queued call without blocking and no wake — so no
+/// SGI — was owed (measured once, in a qualification boot: production behaving correctly, the
+/// round simply not the one P1 exists to exercise). C's `C_P1_CALL` step, the DebugLog it issues immediately
+/// before its NR 6, therefore waits here, bounded, until CPU 1 has no current task: S has blocked
+/// and CPU 1 parked (H1 is blocked throughout P1). This is the off-lock DebugLog path — no lock is
+/// held — and it waits only for CPU 1 to go idle, never for anything CPU 1 needs from CPU 0.
+fn wait_until_cpu1_parked() {
+    let Some(shared) = crate::arch::aarch64::boot::trap_shared_kernel() else {
+        P1_PARK_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+        return;
+    };
+    for _ in 0..P1_PARK_SPINS {
+        if shared.current_tid_split_read(CpuId(1)).unwrap_or(0) == 0 {
+            P1_PARK_MET.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    P1_PARK_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+}
+
 /// The round each mutual requester (S = 0, C = 1) has announced and not yet entered the VM owner.
 static MUT_ANNOUNCED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The last mutual round whose operation each requester has ENTERED.
@@ -614,6 +643,11 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u6
         );
         return;
     }
+    // C is about to call a PARKED S: see `wait_until_cpu1_parked`.
+    if step == "C_P1_CALL" {
+        wait_until_cpu1_parked();
+        return;
+    }
     // The mutual requester's announcement arms its next VM operation for the rendezvous.
     if step == "S_MUT_NR3" || step == "C_MUT_NR3" {
         MUT_ANNOUNCED[usize::from(step == "C_MUT_NR3")].store(round, Ordering::Release);
@@ -713,9 +747,11 @@ fn dump() {
         v.settled_after_ack
     ));
     lines.push(alloc::format!(
-        "SMP2_SYNC mutual_rendezvous_met={} mutual_rendezvous_timed_out={}",
+        "SMP2_SYNC mutual_rendezvous_met={} mutual_rendezvous_timed_out={} p1_parked_met={} p1_parked_timed_out={}",
         MUT_SYNC_MET.load(Ordering::Acquire),
-        MUT_SYNC_TIMED_OUT.load(Ordering::Acquire)
+        MUT_SYNC_TIMED_OUT.load(Ordering::Acquire),
+        P1_PARK_MET.load(Ordering::Acquire),
+        P1_PARK_TIMED_OUT.load(Ordering::Acquire)
     ));
     lines.push(alloc::format!(
         "SMP2_VERDICT result={} reason={} at={}",

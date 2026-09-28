@@ -23837,6 +23837,16 @@ has ENTERED too; it never waits for anything the other CPU needs from it. Nothin
 owner changes, and the owner itself carries no wait. The dump reports `SMP2_SYNC
 mutual_rendezvous_met / timed_out`; overlap is still graded only from the operations' own records.
 
+**A second witness race, found in qualification.** A P1 round is C's call to a PARKED S, but S
+raises its mailbox flag before its `svc`, so in one qualification boot of the third freeze C called
+while S was still on its way into its receive: S took the queued call without blocking, no wake —
+so no SGI — was owed, and the round could not be the parked-target wake it is graded as
+(`p1_server_resume_missing`). Production behaved correctly; the program's handoff did not pin the
+state the round needs. `smp2_witness::wait_until_cpu1_parked` — labelled witness synchronization
+on the off-lock DebugLog path of C's `C_P1_CALL` step, immediately before its NR 6 — waits,
+bounded, until CPU 1 has no current task. The latent race was in the QEMU-SMP2 program; the graded
+obligations are unchanged. `SMP2_SYNC` reports `p1_parked_met / timed_out`.
+
 **Overlap is not contention.** The two operations' intervals overlap; inside them the page-table
 writes serialize on the page-table lock, as they must. No lock-contention measurement exists, and
 none is claimed: `mutual_overlapped` says that both production operations were in flight together

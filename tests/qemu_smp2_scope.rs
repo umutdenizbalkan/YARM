@@ -416,6 +416,15 @@ fn the_vm_operation_is_recorded_by_its_owner_at_every_exit() {
         !code(VM_TXN).contains("mutual_rendezvous"),
         "the owner itself carries no wait"
     );
+    // The P1 handoff wait: C's call step waits, bounded, until CPU 1 has parked; labelled, and
+    // only a read of CPU 1's current task.
+    assert!(WITNESS_RS.contains("if step == \"C_P1_CALL\" {\n        wait_until_cpu1_parked();"));
+    let park = code(fn_body(WITNESS_RS, "fn wait_until_cpu1_parked("));
+    assert!(
+        park.contains("for _ in 0..P1_PARK_SPINS {")
+            && park.contains("current_tid_split_read(CpuId(1))")
+    );
+    assert!(!park.contains("lock") && !park.contains("with("));
     let end = code(fn_body(WITNESS_RS, "pub fn vm_op_end("));
     assert!(
         end.contains("Ok((addr, _)) => (0, *addr as u64),")
