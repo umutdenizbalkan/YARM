@@ -157,7 +157,7 @@ damaged = 0
 for l in lines:
     i, j = l.find("SMP2_"), l.rfind(" pass=")
     m = re.search(r" pass=([12]) crc=0x([0-9a-f]{8})$", l.rstrip())
-    if i < 0 or j < i or not m or not re.match(r"SMP2_(REC|ROLES|CPU|COUNTS|VERDICT) ", l[i:]):
+    if i < 0 or j < i or not m or not re.match(r"SMP2_(REC|ROLES|CPU|COUNTS|SYNC|VERDICT) ", l[i:]):
         if " pass=" in l and "crc=" in l: damaged += 1
         continue
     text = l[i:j]
@@ -408,6 +408,9 @@ summary = "records=%d damaged_lines=%d sgi_arrivals=%d p1_rounds=%d sgi_to_s=%d 
     len(recs), damaged, sgi_arrivals, parked_n, sgi_to_s, sgi_to_c, timer_first, busy, el0, tlb, mutual, overlapped, announced)
 print("[smp2-witness] " + summary)
 print("[smp2-witness] kernel: " + counts + " | " + verdict)
+# The labelled witness rendezvous at the VM owner's entry (smp2_witness::mutual_rendezvous):
+# reported, not graded — overlap is graded from the operations' own records above.
+print("[smp2-witness] " + dump.get("SMP2_SYNC", "SMP2_SYNC missing"))
 for f in fails: print("[smp2-witness][fail] " + f)
 ok = not fails and parked_n == 8 and el0 == 2 and tlb == 4 and mutual == 4 and overlapped == 4
 print("SMP2_WITNESS_SEAL %s result=%s" % (summary, "ok" if ok else "fail"))

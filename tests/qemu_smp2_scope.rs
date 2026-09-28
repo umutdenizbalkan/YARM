@@ -401,6 +401,21 @@ fn the_vm_operation_is_recorded_by_its_owner_at_every_exit() {
             && mac.contains("smp2_witness::vm_op_end($op, &result);")
     );
     assert!(pos(mac, "feature = \"aarch64-smp2-witness\"") < pos(mac, "vm_op_end("));
+    // The one synchronization the mutual rounds use is the witness's own, at the owner's entry
+    // (no domain lock held there, per the begin's position above): labelled, bounded, and
+    // waiting only for the other requester to ENTER.
+    let begin_fn = code(fn_body(WITNESS_RS, "pub fn vm_op_begin("));
+    assert!(pos(&begin_fn, "Kind::VmOpBegin") < pos(&begin_fn, "mutual_rendezvous(me, round);"));
+    assert!(
+        WITNESS_RS.contains("/// WITNESS SYNCHRONIZATION — labelled, not production behaviour.")
+    );
+    let sync = code(fn_body(WITNESS_RS, "fn mutual_rendezvous("));
+    assert!(sync.contains("for _ in 0..MUT_SYNC_SPINS {") && sync.contains("MUT_SYNC_TIMED_OUT"));
+    assert!(!sync.contains("lock") && !sync.contains("with("));
+    assert!(
+        !code(VM_TXN).contains("mutual_rendezvous"),
+        "the owner itself carries no wait"
+    );
     let end = code(fn_body(WITNESS_RS, "pub fn vm_op_end("));
     assert!(
         end.contains("Ok((addr, _)) => (0, *addr as u64),")

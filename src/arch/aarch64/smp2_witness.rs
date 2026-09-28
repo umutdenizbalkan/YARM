@@ -477,7 +477,50 @@ pub fn vm_op_begin(tid: u64, asid: Asid, addr: usize, len: usize) -> Option<VmOp
         this_cpu(),
         [op.asid, op.va, len as u64, op.generation, tid],
     );
+    let role = match tid {
+        S_TID => Some(0),
+        C_TID => Some(1),
+        _ => None,
+    };
+    if let Some(me) = role {
+        let round = MUT_ANNOUNCED[me].swap(0, Ordering::AcqRel);
+        if round != 0 {
+            mutual_rendezvous(me, round);
+        }
+    }
     Some(op)
+}
+
+/// The round each mutual requester (S = 0, C = 1) has announced and not yet entered the VM owner.
+static MUT_ANNOUNCED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// The last mutual round whose operation each requester has ENTERED.
+static MUT_ENTERED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static MUT_SYNC_MET: AtomicU64 = AtomicU64::new(0);
+static MUT_SYNC_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+/// Bound on the rendezvous wait. Reached only when the other requester never enters (the
+/// serialized-operation control); then this operation simply proceeds and the round is graded
+/// SERIALIZED.
+const MUT_SYNC_SPINS: u64 = 50_000_000;
+
+/// WITNESS SYNCHRONIZATION — labelled, not production behaviour. Measured without it, the two
+/// mutual operations overlapped in 15 of 16 rounds on their own and then serialized once in two
+/// of three qualification boots, so the interleaving the round exists to exercise is obtained here:
+/// the operation that entered the VM owner first waits, bounded, until the other requester's
+/// operation has ENTERED too. It runs at the owner's entry point, where no domain lock is held
+/// (before the journal, the frames, the capabilities and the install), and it waits only for the
+/// other CPU to enter — never for anything that CPU needs from this one — so it cannot deadlock.
+/// Nothing about either operation's work, locks or order inside the owner is changed.
+fn mutual_rendezvous(me: usize, round: u64) {
+    MUT_ENTERED[me].store(round, Ordering::Release);
+    let other = &MUT_ENTERED[1 - me];
+    for _ in 0..MUT_SYNC_SPINS {
+        if other.load(Ordering::Acquire) >= round {
+            MUT_SYNC_MET.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    MUT_SYNC_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
 }
 
 /// That transaction is returning `result` — exactly what its caller receives. Taken on the
@@ -569,6 +612,11 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u6
             cpu.0,
             [target_asid, index as u64 + 1, phys, round, u64::from(ok)],
         );
+        return;
+    }
+    // The mutual requester's announcement arms its next VM operation for the rendezvous.
+    if step == "S_MUT_NR3" || step == "C_MUT_NR3" {
+        MUT_ANNOUNCED[usize::from(step == "C_MUT_NR3")].store(round, Ordering::Release);
         return;
     }
     if step == "S_DONE" {
@@ -663,6 +711,11 @@ fn dump() {
         v.mutual_overlapped,
         v.mutual_announced,
         v.settled_after_ack
+    ));
+    lines.push(alloc::format!(
+        "SMP2_SYNC mutual_rendezvous_met={} mutual_rendezvous_timed_out={}",
+        MUT_SYNC_MET.load(Ordering::Acquire),
+        MUT_SYNC_TIMED_OUT.load(Ordering::Acquire)
     ));
     lines.push(alloc::format!(
         "SMP2_VERDICT result={} reason={} at={}",

@@ -23825,10 +23825,17 @@ completion; and both operations began before either completed. Every one of the 
 overlap. The delivered announcement criterion is still computed and reported as
 `mutual_announced` — never graded — so a control can show what it would have accepted.
 
-**Synchronization.** The only rendezvous is the programs' existing userspace mailbox wait before the
-announcements; it holds no kernel lock and nothing waits for another CPU inside the kernel. Measured
-before any freeze: 12 of 12 rounds overlapped in three boots without further help (for example S's
-operation seq 161..170 on CPU 1 and C's seq 162..174 on CPU 0).
+**Synchronization — labelled, and why it is there.** Without help the two operations overlapped in
+15 of 16 measured rounds and then serialized once each in two of the first freeze's three
+qualification boots (S's operation seq 198..204 completed before C's began at 205): the
+programs' userspace mailbox rendezvous before the announcements does not bound the skew between
+the two `svc`s. So the witness adds one rendezvous of its own, `smp2_witness::mutual_rendezvous`,
+called from `vm_op_begin` — at the owner's entry point, after the begin is recorded and before the
+journal, frames, capabilities or install, where no domain lock is held. A requester whose
+announcement armed it waits, bounded (`MUT_SYNC_SPINS`), until the other requester's operation
+has ENTERED too; it never waits for anything the other CPU needs from it. Nothing inside the
+owner changes, and the owner itself carries no wait. The dump reports `SMP2_SYNC
+mutual_rendezvous_met / timed_out`; overlap is still graded only from the operations' own records.
 
 **Overlap is not contention.** The two operations' intervals overlap; inside them the page-table
 writes serialize on the page-table lock, as they must. No lock-contention measurement exists, and
@@ -23836,7 +23843,8 @@ none is claimed: `mutual_overlapped` says that both production operations were i
 and both completed, nothing about whether either waited.
 
 **The decisive control** (`serialize_ops`): S waits, after BOTH announcements, until C's NR 3 has
-returned before issuing its own. The old criterion accepts that execution (`mutual_announced=4`);
+returned before issuing its own (C's operation then waits out the bounded rendezvous and
+proceeds alone). The old criterion accepts that execution (`mutual_announced=4`);
 the operation check rejects it (`mut_operations_serialized`, grader "did not overlap").
 Deterministically, `operations_serialized_after_both_announcements_are_not_overlap` builds exactly
 that record and checks both verdicts.
