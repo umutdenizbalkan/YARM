@@ -34,6 +34,9 @@
 //!
 //! Scope: only the x86_64 SMP request oracle's workload reaches the recording sites (each is gated
 //! by `x86_ipccall_direct_smp_request_enabled()`); no production decision reads this record.
+// Only the x86_64 request oracle records and reports; the other ports compile the shared owners'
+// call sites but never reach the report.
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 

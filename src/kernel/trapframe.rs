@@ -190,7 +190,11 @@ impl TrapFrame {
     }
 
     /// QEMU-SMP1-ACCEPTANCE §1 — the incarnation this frame's continuation belongs to, if any
-    /// owner named one.
+    /// owner named one. Read by the x86_64 and AArch64 FP/SIMD return settlements; RISC-V has none.
+    #[cfg_attr(
+        not(any(test, target_arch = "x86_64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     pub(crate) const fn resume_owner(&self) -> Option<crate::runtime::FpuHomeOwner> {
         self.resume_owner
     }
