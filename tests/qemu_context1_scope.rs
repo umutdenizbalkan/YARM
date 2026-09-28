@@ -353,7 +353,14 @@ fn the_witness_uses_existing_syscalls_and_the_grader_checks_identities() {
         assert!(w.contains(cell));
         assert!(GRADER.contains(cell.trim_start_matches("cell=")));
     }
-    assert!(GRADER.contains("t['in'] == A and t['out'] == B and t['timer'] == '1'"));
+    // QEMU-SMP1-ACCEPTANCE §3: the preemption is a user-origin timer tick OUT of A, B is credited
+    // by its exact TID wherever it is entered before A resumes, and B's exit route must match the
+    // round's mode — no adjacent A->B selection is required.
+    assert!(GRADER.contains(
+        "t['in'] == A and t['timer'] == '1' and t['origin'] == 'user' and t['out'] != A"
+    ));
+    assert!(GRADER.contains("if t['out'] == B:"));
+    assert!(!GRADER.contains("t['in'] == A and t['out'] == B and t['timer'] == '1'"));
     assert!(GRADER.contains("{'spin': 'timer', 'block': 'syscall'}"));
     assert!(GRADER.contains("SCHED_ENTER_IDLE_HLT"));
     assert!(GRADER.contains("CTX1_KERNEL_ENV_BAD"));
