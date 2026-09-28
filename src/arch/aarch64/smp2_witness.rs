@@ -599,13 +599,14 @@ fn dump() {
     }
     // Every dump line stays well inside `printk_emit_sync`'s 192-byte line, checksum included.
     lines.push(alloc::format!(
-        "SMP2_COUNTS records={} sgi_arrivals={} p1_parked={} p1_sgi_to_s={} p1_sgi_to_c={} p1_timer_first={} p2_el0={}",
+        "SMP2_COUNTS records={} sgi_arrivals={} p1_parked={} p1_sgi_to_s={} p1_sgi_to_c={} p1_timer_first={} p1_busy={} p2_el0={}",
         v.records,
         v.sgi_arrivals,
         v.p1_parked,
         v.p1_sgi_to_s,
         v.p1_sgi_to_c,
         v.p1_timer_first,
+        v.p1_busy,
         v.p2_el0
     ));
     lines.push(alloc::format!(

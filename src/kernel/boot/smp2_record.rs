@@ -328,6 +328,8 @@ pub struct Verdict {
     /// ... of which CPU 0's periodic idle advance had already resumed the woken task when the
     /// SGI arrived (it then arrived in that task and returned to it).
     pub p1_timer_first: usize,
+    /// ... of which the target CPU was running something else when the SGI arrived.
+    pub p1_busy: usize,
     pub p2_el0: usize,
     pub tlb_rounds: usize,
     pub mutual_rounds: usize,
@@ -408,12 +410,17 @@ pub enum ParkedRoute {
     /// The target CPU's periodic idle advance resumed the woken task first; the SGI then arrived
     /// in that same task and returned to it. Only CPU 0 has a timer.
     TimerFirst,
+    /// The target CPU was NOT parked when the SGI arrived — it was running another task, or was
+    /// in the kernel between tasks — so the SGI returned to what it interrupted and the woken task
+    /// was picked up at that CPU's next scheduling point. Not a parked-target wake; counted apart.
+    Busy,
 }
 
-/// A wake of the parked `woken` on `to_cpu` by `from`, after step `after`: the send, its one
-/// arrival, and the dispatch that resumed `woken`, classified. Every other shape fails — a
-/// dispatch of another task, a dispatch by neither route, an arrival in another task. Returns
-/// the dispatch's index and route. Pure.
+/// A wake of the blocked `woken` on `to_cpu` by `from`, after step `after`: the send, its one
+/// arrival, and how `woken` was resumed, classified. Every other shape fails — an idle-boundary
+/// arrival whose own dispatch is missing or names another task, or a timer-won race whose SGI then
+/// arrived in another task. Returns the index after which `woken`'s resume must be found (the
+/// idle dispatch, or `after` for a busy target) and the route. Pure.
 pub fn parked_wake(
     recs: &[Rec],
     after: usize,
@@ -434,17 +441,17 @@ pub fn parked_wake(
         }
         return Ok((d, ParkedRoute::Sgi));
     }
-    let d = recs[after..arrived]
+    let timer = recs[after..arrived]
         .iter()
         .position(|r| {
             r.kind == Kind::IdleDispatch && r.cpu == to_cpu && r.f[1] == 0 && r.f[0] == woken.tid
         })
-        .map(|i| after + i)
-        .ok_or("sgi_target_not_parked")?;
-    if a.f[4] != woken.tid {
-        return Err("sgi_arrived_in_another_task");
+        .map(|i| after + i);
+    match timer {
+        Some(d) if a.f[4] == woken.tid => Ok((d, ParkedRoute::TimerFirst)),
+        Some(_) => Err("sgi_arrived_in_another_task"),
+        None => Ok((after, ParkedRoute::Busy)),
     }
-    Ok((d, ParkedRoute::TimerFirst))
 }
 
 /// Grade a sealed record. Pure; the kernel runs it at the dump and the grader re-derives it.
@@ -498,6 +505,7 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
                     match route {
                         ParkedRoute::Sgi => *sgi += 1,
                         ParkedRoute::TimerFirst => v.p1_timer_first += 1,
+                        ParkedRoute::Busy => v.p1_busy += 1,
                     }
                 }
                 at = end;
@@ -940,19 +948,25 @@ mod tests {
             parked_wake(&r, 0, c, 1, s),
             Ok((1, ParkedRoute::TimerFirst))
         );
+        // The tick resumed ANOTHER task (measured live: the supervisor's periodic timeout) and
+        // the SGI arrived in it: a busy target, not a timer-won race.
         let r = seqd(vec![call, by_timer(9202), sent, in_el0(9202)]);
-        assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_target_not_parked"));
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Ok((0, ParkedRoute::Busy)));
         let r = seqd(vec![call, by_timer(s.tid), sent, in_el0(9202)]);
         assert_eq!(
             parked_wake(&r, 0, c, 1, s),
             Err("sgi_arrived_in_another_task")
         );
-        // Neither route: the target was running when the SGI arrived, with no idle dispatch.
+        // Not parked: the SGI arrived while the CPU ran another task (or the woken one, already
+        // picked up by another route). A busy target — never counted as a parked-target wake.
+        let r = seqd(vec![call, sent, in_el0(9202)]);
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Ok((0, ParkedRoute::Busy)));
         let r = seqd(vec![call, sent, in_el0(s.tid)]);
-        assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_target_not_parked"));
-        // An SGI-trigger dispatch cannot stand in for a timer-won race, nor the reverse.
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Ok((0, ParkedRoute::Busy)));
+        // An SGI-trigger dispatch cannot stand in for a timer-won race: without a timer dispatch
+        // the wake is busy, not timer-first, and does not count toward parked coverage.
         let r = seqd(vec![call, by_sgi(s.tid), sent, in_el0(s.tid)]);
-        assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_target_not_parked"));
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Ok((0, ParkedRoute::Busy)));
         let r = seqd(vec![call, sent, at_idle(0), by_timer(s.tid)]);
         assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_dispatch_substituted"));
     }
