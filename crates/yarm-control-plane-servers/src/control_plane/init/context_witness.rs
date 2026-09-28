@@ -1005,7 +1005,12 @@ pub(super) fn run_once() {
             b_tid,
             if mode == 1 { "block" } else { "spin" },
             generation ^ GEN_TAG,
-            b_seen ^ GEN_TAG,
+            // 0 = B's word carries no round's generation at all (rounds are numbered from 1).
+            if b_seen & !0xFFFF == GEN_TAG {
+                b_seen & 0xFFFF
+            } else {
+                0
+            },
             b_ran as u8,
             B_WINDOWS.load(SeqCst) - b0,
             used,
