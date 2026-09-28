@@ -94,7 +94,6 @@ count() { rg -a -c -F "$1" "$NORM" 2>/dev/null || echo 0; }
 have()  { rg -a -q -F "$1" "$NORM"; }
 
 # ── Forward (request) direction must still hold (the sealed B2/B3 round trip). ────────────────
-[[ "$(count "IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1")" == "1" ]] || die "server-blocked != 1"
 [[ "$(count "X86_BSP_NR6_REQUEST_SENT cpu=0")" == "1" ]] || die "client NR6 sent != 1"
 [[ "$(count "IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0 receiver_cpu=1 cross_cpu=1")" == "1" ]] || die "request-ok != 1"
 [[ "$(count "X86_AP_RECV_V2_USER_VALIDATED cpu=1")" == "1" ]] || die "server user-validated != 1"
@@ -108,6 +107,14 @@ SERVER_EP="$(rg -a -o -r '$1' 'X86_AP_RECV_V2_SERVER_PROVISIONED .* endpoint_ind
 CLIENT_TID="$(rg -a -o -r '$1' 'X86_BSP_NR6_CLIENT_PROVISIONED client_tid=([0-9]+)' "$NORM" | head -1)"
 [[ "$SERVER_TID" == "20205" && "$SERVER_EP" == "6" && "$CLIENT_TID" == "21205" ]] \
   || die "provisioned identities (server=$SERVER_TID ep=$SERVER_EP client=$CLIENT_TID) differ from the terminal markers"
+# 0. The server's committed block on CPU 1, from the request TRANSACTION RECORD (QEMU-SMP1-SEAL).
+#    The one-shot IPCCALL_DIRECT_SMP_SERVER_BLOCKED line goes through the asynchronous printk ring
+#    and can be lost while both CPUs log (lost live at 3107cc0a); the same marker body records the
+#    block, after its re-verification, and the record is reported synchronously once complete.
+[[ "$(rg -a -c 'X86_SMP_REQUEST_TXN_SEAL steps=7 recorded=7 duplicates=0 target_cpu=1 ' "$NORM" || echo 0)" == "1" ]] \
+  || die "request transaction record not sealed complete exactly once"
+[[ "$(rg -a -c "X86_SMP_REQUEST_TXN step=blocked seq=[1-9][0-9]* f0=${SERVER_TID} f1=[1-9][0-9]* " "$NORM" || echo 0)" == "1" ]] \
+  || die "server block on cpu 1 not recorded for server ${SERVER_TID}"
 line_of() { rg -a -n -F "$1" "$NORM" | head -1 | cut -d: -f1; }
 # 1. The caller blocks on its reply endpoint through the split receive owner (its synchronous
 #    echo, X86_SMP_ORACLE_BLOCKED), and the reply record is armed for exactly this caller/replier pair. (The oracle-only CALLER_BLOCKED marker is emitted
@@ -141,14 +148,17 @@ field() { sed -n "s/.* $1=\([0-9]*\).*/\1/p" <<<"$SUMMARY"; }
 #    0xF1 wake lands: an idle CPU's timer/yield drain dequeues the caller directly
 #    (`*_DEQUEUE_OK cpu=0 … =<caller>`); if a task whose receive deadline expires on the same
 #    tick is ahead of it, that task runs, blocks in its receive, and the blocking-receive drain
-#    selects the caller (`D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=<caller>`).
-#    Both go through the one queue-advance selection owner.
+#    selects the caller (`D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=<caller>`);
+#    if a task exits on CPU 0 when the wake lands, the exit owner's post-drain revalidation
+#    commits the caller as its replacement (`EXIT_TASK_OWNER_REVALIDATED … cpu=0 …
+#    committed=replacement next_tid=<caller>`, seen live at e14c914a). All three go through the
+#    one queue-advance selection owner.
 [[ "$(count "X86_BSP_SAVED_DISPATCH_OK")" == "0" ]] || die "retired oracle BSP resume ran"
 CLAIM_AT="$(line_of "IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=0 record_generation=${GEN} replier_tid=${SERVER_TID} ")"
 CONT_AT="$(line_of "X86_SMP_REPLY_USER_ECHO X86_BSP_RECV_V2_CONTINUED cpu=0")"
-SELECT_AT="$(rg -a -n -e "DEQUEUE_OK cpu=0 (tid|incoming)=${CLIENT_TID}\b" -e "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=${CLIENT_TID}\b" "$NORM" | cut -d: -f1 | awk -v a="${CLAIM_AT:-0}" -v b="${CONT_AT:-0}" '$1>a && $1<b' | head -1)"
+SELECT_AT="$(rg -a -n -e "DEQUEUE_OK cpu=0 (tid|incoming)=${CLIENT_TID}\b" -e "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=${CLIENT_TID}\b" -e "EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu=0 prepared=idle committed=replacement next_tid=${CLIENT_TID} " "$NORM" | cut -d: -f1 | awk -v a="${CLAIM_AT:-0}" -v b="${CONT_AT:-0}" '$1>a && $1<b' | head -1)"
 [[ -n "$CLAIM_AT" && -n "$CONT_AT" && -n "$SELECT_AT" ]] || die "no production selection of the caller on cpu 0 between the claim and its continuation"
-rg -a -q -e "DEQUEUE_OK cpu=1 (tid|incoming)=${CLIENT_TID}\b" -e "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=1 incoming=${CLIENT_TID}\b" "$NORM" && die "caller selected on the wrong CPU"
+rg -a -q -e "DEQUEUE_OK cpu=1 (tid|incoming)=${CLIENT_TID}\b" -e "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=1 incoming=${CLIENT_TID}\b" -e "EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu=1 .* next_tid=${CLIENT_TID} " "$NORM" && die "caller selected on the wrong CPU"
 # 6. The exact continuation returns to ring 3 ONCE, validates the reply, and makes further
 #    progress (a Yield round trip), then both tasks block again — no park, no spin.
 [[ "$(count "X86_SMP_REPLY_USER_ECHO X86_BSP_RECV_V2_CONTINUED cpu=0")" == "1" ]] || die "reply recv-v2 continued != 1"

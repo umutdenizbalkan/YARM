@@ -24,6 +24,7 @@ const BOOT_MOD: &str = include_str!("../src/kernel/boot/mod.rs");
 const DRAIN: &str = include_str!("../src/kernel/ipccall_direct_txn.rs");
 const X86_SMP: &str = include_str!("../src/arch/x86_64/smp.rs");
 const UC_SH: &str = include_str!("../scripts/qemu-x86_64-ap-cross-cpu-user-consume-smoke.sh");
+const REPLY_SH: &str = include_str!("../scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh");
 
 fn code(src: &str) -> String {
     src.lines()
@@ -217,4 +218,27 @@ fn the_request_transaction_is_recorded_at_its_owners() {
     ] {
         assert!(UC_SH.contains(grade), "{grade}");
     }
+}
+
+/// QEMU-SMP1-SEAL: the reply profile grades the server's block from the transaction record, not
+/// from the one-shot ring line, and accepts every production selection route of the caller —
+/// including the exit owner's post-drain replacement, in the exact text the kernel emits.
+#[test]
+fn the_reply_grader_reads_the_record_and_every_selection_route() {
+    assert!(!REPLY_SH.contains("count \"IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1\""));
+    for need in [
+        "X86_SMP_REQUEST_TXN_SEAL steps=7 recorded=7 duplicates=0 target_cpu=1 ",
+        "X86_SMP_REQUEST_TXN step=blocked seq=[1-9][0-9]* f0=${SERVER_TID} f1=[1-9][0-9]* ",
+        "EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu=0 prepared=idle committed=replacement next_tid=${CLIENT_TID} ",
+    ] {
+        assert!(REPLY_SH.contains(need), "{need}");
+    }
+    assert!(X86_DT.contains(
+        "\"EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu={} prepared=idle committed=replacement next_tid={} "
+    ));
+    assert!(
+        TXN.contains(
+            "\"X86_SMP_REQUEST_TXN_SEAL steps={} recorded={} duplicates={} target_cpu={} "
+        )
+    );
 }

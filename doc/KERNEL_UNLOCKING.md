@@ -23613,3 +23613,20 @@ second report). Mutations: removing readiness fails 8 cases including the late r
 the once-only latch fails 3 including both competing-attempt cases; counting duplicates as
 publications fails 2; naming the last publisher's CPU as target fails 2. The report line format
 and the grader are unchanged.
+
+**Reply-regression grader (added after the first qualification round).** The first frozen
+qualification of this correction (`3107cc0a`) recorded one red cross-CPU reply round: the one-shot
+`IPCCALL_DIRECT_SMP_SERVER_BLOCKED` line was lost in the asynchronous printk ring, although the
+transaction record held the committed block and sealed all seven steps. Fresh `e14c914a` artifacts
+failed a separate round because the caller had been selected by a third production route, the exit
+owner's post-drain revalidation (`EXIT_TASK_OWNER_REVALIDATED … cpu=0 … committed=replacement
+next_tid=<caller>`, selected through `owner_revalidation_select_split`, the same queue-advance
+owner), which the grader did not recognize. The reply grader now reads the server's block from the
+record (the block step names the provisioned server; the record sealed complete exactly once) and
+accepts the exit-owner route beside the idle-advance and blocking-receive routes, on CPU 0 between
+the claim and the continuation. Both recorded failed logs pass the corrected grader; removing,
+unrecording or substituting the block, a missing, incomplete or doubled seal, and an exit-owner
+selection that is removed, names another task, runs on CPU 1, precedes the claim or did not commit
+all fail. Still graded from asynchronous ring lines, and therefore still exposed to the same loss:
+the provisioning lines, the armed reply record, the reply claim, the pre-lock duplicate refusal,
+`IPCREPLY_DIRECT_SMP_REPLY_OK`, the selection markers themselves and the user DebugLog lines.
