@@ -26,7 +26,9 @@ fn census_fn() -> &'static str {
     &SMOKE[start..start + end]
 }
 
-/// Run the census over `log`; returns (failures, output).
+/// Run the census over `log` under the smoke's own shell options (`set -euo pipefail`, which a
+/// command in the census must survive on every log, including one with no matches at all);
+/// returns (failures, output).
 fn census(log: &str) -> (u32, String) {
     let dir = std::env::temp_dir().join(format!(
         "yarm-riscv-census-{}-{}",
@@ -37,7 +39,7 @@ fn census(log: &str) -> (u32, String) {
     let path = dir.join("boot.log");
     std::fs::write(&path, log).expect("fixture");
     let script = format!(
-        "{}\nfailures=0\nTERMINAL_FAULT_ORACLE=0\nriscv64_split_census \"$1\"\necho \"FAILURES=$failures\"\n",
+        "set -euo pipefail\n{}\nfailures=0\nTERMINAL_FAULT_ORACLE=0\nriscv64_split_census \"$1\"\necho \"FAILURES=$failures\"\n",
         census_fn()
     );
     let out = Command::new("bash")

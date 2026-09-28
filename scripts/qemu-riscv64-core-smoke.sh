@@ -877,7 +877,9 @@ riscv_split_nr0=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=0 " "$LOGFILE"
 riscv_split_nr0=${riscv_split_nr0:-0}
 riscv_yield_committed=$(rg -c "YIELD_SPLIT_COMMITTED cpu=" "$LOGFILE" 2>/dev/null || echo 0)
 riscv_yield_committed=${riscv_yield_committed:-0}
-riscv_split_nr0_unpaired=$(rg -a -o -N "YIELD_SPLIT_COMMITTED cpu=[0-9]+ tid=[0-9]+|YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=0 .*" "$LOGFILE" 2>/dev/null | awk '
+# `|| true`: a boot with no Yield has no matches, and rg's exit 1 must not fail the pipeline
+# under this script's `set -euo pipefail`.
+riscv_split_nr0_unpaired=$( { rg -a -o -N "YIELD_SPLIT_COMMITTED cpu=[0-9]+ tid=[0-9]+|YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=0 .*" "$LOGFILE" 2>/dev/null || true; } | awk '
   /^YIELD_SPLIT_COMMITTED/ {
     split($2, c, "="); split($3, t, "=")
     if (c[2] in pending) bad++
