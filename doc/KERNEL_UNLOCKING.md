@@ -23443,3 +23443,129 @@ used to pin.
   "the AP saved-frame resumes load the home but are not exercised live". Still named and
   unchanged: the ack-lease race, the RISC-V reply-timeout retirement-checker failure, and the
   x86_64 `TERMINAL_FAULT_ORACLE` core cell (both failing at this base).
+
+# QEMU-SMP1-ACCEPTANCE — FP restoration bound to the continuation; two witnesses made reliable
+
+Base: `5c95d6be1cd53828b3b63004c274ea700d64a3bc` (QEMU-SMP1), tree
+`ca0c147b3588d771325dbd31dfa57d67f7606510`. U9 stays CLOSED (production `with_cpu=0`,
+`with_broad=0`). SMP1's IPI/TLB and reply mechanisms are unchanged. Not in scope: another port's
+SMP bring-up, four CPUs, a printk rewrite.
+
+## 1 — the FP/SIMD home follows the continuation actually returned through
+
+**The chain at the base** (both ports; x86_64 `yarm_x86_dispatch_trap_from_stub`, AArch64
+`yarm_aarch64_vector_entry`): the stub saves the user FP image; a user-origin entry commits it
+into the home of the incarnation current on this CPU (`commit_user_fpu_current_split`, rank 1 then
+rank 2 nested, `{tid, asid}`, `Runnable | Running`); the trap frame is built from the entering
+registers; the dispatch may REPLACE that continuation through one of five restores (x86
+`x86_post_lock_resume_marked_incoming`, `x86_apply_owner_revalidation_restore`, the broad
+`apply_current_thread_to_frame`; AArch64 `direct_dispatch_resume_incoming_core`,
+`apply_restored_thread_state`); the address space is installed; then `load_user_fpu_current_split`
+re-discovered whoever was current and loaded THAT home. The loaded image and the continuation were
+therefore paired by two independent reads, and the owner the load authenticated was discarded.
+When the entry commit had been refused, the return kept the captured image if PC/SP/root equalled
+the entry's (`action=kept_captured`) — register and root equality used as return authority. The x86
+AP saved-frame resume was already paired by construction (`ap_saved_resume_current_split` reads
+context, TLS and home in one authentication).
+
+**Proven unreachable by existing owners** — the incarnation current on a CPU cannot be replaced
+while that CPU is inside a trap: `current(cpu)` is written only by that CPU's own dispatch; a
+current task's status changes only through its own trap (block, self-exit, `FaultRunningCurrent`);
+reap refuses `StillScheduled` and claims only `Faulted | Exited`; restart touches only `Faulted`;
+spawn consumes reservations or non-live slots only. Executed:
+`acc_a_current_incarnation_cannot_be_reaped_or_respawned`.
+
+**Repaired** — the pairing itself. `TrapFrame` carries `resume_owner: Option<{tid, asid}>`:
+`apply_user_context` clears it (a frame can only name the owner of the continuation it holds);
+each of the five restores binds the exact incarnation it applied, right after the apply (the
+AArch64 broad restore's `ThreadRestoreFacts` now carries the ASID read from the same TCB under the
+same predicate); the entry binds the owner its commit authenticated. Both bridges return through
+ONE settlement, `settle_user_fpu_return_split(cpu, frame.resume_owner())`: no owner →
+`UnownedContinuation`; otherwise the existing authentication with the new
+`FpuHomeExpectation::Owner` — current on `cpu` must be that TID (`CurrentMismatch`) and the TCB
+that ASID (`IncarnationReplaced`), both checked before the home is read. A refusal takes the
+bridge's existing fatal (`…HOME_UNAUTHENTICATED … action=fatal`); `kept_captured` is deleted, and
+no path substitutes the initial image — a fresh task's home IS its initial image and is read like
+any other. The AP snapshot uses `FpuHomeExpectation::Tid` in place of its post-read comparison.
+Nothing new is fatal on a reachable path: every refusal is a state the owners above exclude, and no
+refusal appeared in any live run of this package.
+
+**Deterministic cases** (`qemu_context1_user_fpu_ownership::acc_*`, production entry commit,
+scheduler selection, restores and settlement): same-task return; a switch pairs the incoming
+continuation with the incoming home; a replacement between prepare and load is refused and neither
+home is written; equal PC/SP/root with a different owner is refused; wrong CPU; a refused entry
+leaves the continuation unowned and refused; a failed return load never invents a reset image; a
+fresh continuation receives its initial image; apply clears the previous owner; restore facts name
+their incarnation. Mutations (applied, run, reverted): discarding the owner fails 4 cases;
+accepting address equality as ownership fails 2; reviving the reset fallback fails 5; keeping the
+image of an unowned continuation fails 1.
+
+## 2 — AArch64 CONTEXT1: preemption proved by identity and generation
+
+The SMP1 qualification's third AArch64 run (`ctx1-aarch64-3`: block 2/3, preempt 1/3, same 2/3)
+was reported as harmless; **that is withdrawn**. Its registers were intact (no state failure), but
+the grader required ADJACENT scheduler selections (A→B→A), and the supervisor (tid 2), whose
+lifecycle-query receive deadline fires in some boots and then polls with 1-tick receives, ran in
+between. The witness therefore did not prove what it claimed in that run, whether or not anything
+was preserved. Eight interleaved base/head comparison boots did not reproduce it; that is not
+reliability.
+
+**Protocol.** Each preempt round has a generation `GEN_TAG | (round + 1)`. A publishes it into a
+shared word INSIDE its patterned window, after the pattern is loaded, and polls a second word
+flag-neutrally (x86 `lea rcx,[rcx+g+1]; jrcxz`; AArch64 `mvn/eor/cbz`); B, inside its own
+patterned loop, stamps `!generation`. A's result reports `gen` and the generation B stamped
+(`seen`, 0 when no stamp of this round exists). The grader, by exact TID and in order, requires a
+timer tick that preempted A in user mode, B entered, B's last exit before A's resume by the route
+the round's mode names (a timer tick for spin, B's blocking syscall for block), A resumed, and
+`gen` (window) = `gen` (result) = `seen`. Any other task may run between those events and is never
+credited. Block and same cells run 6 attempts each; 3 must carry their transition evidence; every
+attempt's state is graded. Supervisor deadline and timeout semantics are unchanged.
+
+**Controls.** Live mutations: A never preempted — `preempt=0`, `seen=0`, `mask=0x0 gpr_bad=0x0`,
+fails; B never stamps — B ran (`b_windows=147`) with `mask=0x0`, `seen=0`, fails. Both fail with
+A's registers intact. Grader-only (edited logs): the preemption removed, B's identity replaced by
+the supervisor's, another round's generation — each fails.
+
+## 3 — AP cross-CPU user-consume graded from a transaction record
+
+The base grader counted one-shot lines, some written through the asynchronous printk ring, whose
+drain skips a slot another CPU is still writing. `IPCCALL_DIRECT_SMP_SERVER_BLOCKED` was lost in
+complete transactions at base and head alike (`uc-base-3/4`, `uc-head-2/5`, and the SMP1
+qualification run).
+
+`src/kernel/boot/smp_request_txn.rs` records each step once, at its production owner, after the
+owner's commit, with the identities that owner holds and a global sequence: `Blocked` (blocked-server
+marker body after its re-verification: server `{tid, asid}`, endpoint `{index, generation}`, ack
+seq), `Delivered` (the request drain after the accepted transaction: the same, plus requester and
+CPU pair), `IpiSent` (after the ICR write), `IpiObserved` (target's IPI-driven dispatch hook),
+`Resumed` (AP saved-frame resume after its authenticated snapshot: CPU, `{tid, asid}`),
+`Continued`/`Validated` (the resumed server's DebugLog markers, with the logging TID and CPU). A
+second record is counted as a duplicate, never an overwrite. When `Validated` is recorded the chain
+has settled and the record is printed SYNCHRONOUSLY, one line per step plus
+`X86_SMP_REQUEST_TXN_SEAL`, which also reads the 0xF1 stub's own per-CPU arrival counters. Every
+recording site is gated by the request oracle selector; the drain's wake decision is untouched.
+
+The grader requires one seal, 7 recorded steps, no duplicates; the causal chain
+blocked < delivered < ipi_observed < resumed < continued < validated and delivered < ipi_sent (the
+target may answer the IPI before the sender's post-ICR record); one server incarnation, endpoint
+and ack seq throughout; a distinct requester; a 0 → 1 wake taken on CPU 1; at least one hardware
+arrival on CPU 1.
+
+**Controls** (regrades of a live log): removing every old one-shot line (server-blocked, IPI
+received, continued, validated, saved dispatch) still passes; omitting blocked, ipi_observed,
+resumed, validated or the seal fails; no hardware arrival fails; another endpoint generation,
+ack seq, server, ASID or validating task fails; a wake on CPU 0 fails; a resume sequenced before the
+wake fails; a duplicate fails. Live: a kernel that never records `Resumed` fails. The historical
+logs (base and head) carry no record and fail the new grader; they remain as recorded, and
+regrading them is not qualification.
+
+## Limits
+
+* The FP binding covers the five context-applying restores and the entry; a future restore must
+  bind or its return is refused (fatal). Guarded in `tests/qemu_smp1_acceptance_scope.rs`.
+* The supervisor's deadline interference is tolerated, not removed: block/same attempts it
+  displaces are noted and not credited.
+* The transaction record exists only for the x86_64 request oracle; other SMP profiles keep their
+  synchronous echoes; the printk ring race is unchanged.
+* Still named and unchanged: the ack-lease race, the RISC-V reply-timeout retirement checker, the
+  x86_64 `TERMINAL_FAULT_ORACLE` core cell.
