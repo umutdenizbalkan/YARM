@@ -23355,7 +23355,14 @@ its own displacement, and requires both tasks to block again at the end.
   one claim for that record generation; one pre-lock duplicate refusal with no copy and no wake,
   observed by the server; one CPU1→CPU0 wake request and exactly one 0xF1 arrival on CPU 0; the
   production selection between the claim and the continuation (the retired resume must not run);
-  the continuation once, the further progress, both tasks blocked again; no TLB failure, no
+  that selection is made by whichever production drain holds CPU 0 when the wake lands — the
+  idle timer/yield drain dequeuing the caller directly, or, when a task whose receive deadline
+  expires on the same tick is ahead of it, the blocking-receive drain after that task blocks
+  (`D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=21205`); both use the one
+  queue-advance selection owner. The first qualification round's grader accepted only the
+  former; all three of its strict runs took the latter path and failed that one check, and each
+  passes unchanged when its recorded log is regraded (`REGRADE=1`) with the corrected check,
+  which still fails when the caller's selection is removed or moved to CPU 1. The continuation once, the further progress, both tasks blocked again; no TLB failure, no
   refused or unauthenticated home. Its SMP1 user markers and the tasks' blocks are graded through
   synchronous kernel echoes (`X86_SMP_REPLY_USER_ECHO`, `X86_SMP_ORACLE_BLOCKED`).
 

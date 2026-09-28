@@ -176,6 +176,7 @@ fn the_reply_profile_has_one_selection_owner_and_no_probe_park() {
     for required in [
         "[[ \"$(count \"X86_BSP_SAVED_DISPATCH_OK\")\" == \"0\" ]]",
         "no production selection of the caller on cpu 0 between the claim and its continuation",
+        "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=${CLIENT_TID}",
         "cpu0 0xF1 arrivals != 1",
         "server did not block again on cpu 1",
         "client did not block again on cpu 0",

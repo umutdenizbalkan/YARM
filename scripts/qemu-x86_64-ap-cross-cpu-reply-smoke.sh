@@ -21,6 +21,8 @@ KPROFILE=${KPROFILE:-x86-none}
 KELF=${KELF:-target/x86_64-yarm-none/${KPROFILE}/kernel_boot}
 BUILD_STD=${BUILD_STD:-core,alloc,compiler_builtins,panic_abort}
 LOGDIR=${LOGDIR:-/tmp/ap-cross-cpu-reply}
+# REGRADE=1 grades an existing "$LOGDIR/boot.log" without building or booting.
+REGRADE=${REGRADE:-}
 TIMEOUT_SECS=${TIMEOUT_SECS:-300}
 mkdir -p "$LOGDIR"
 BOOT_LOG="$LOGDIR/boot.log"
@@ -29,6 +31,7 @@ fail=0
 note() { echo "[reply] $*"; }
 die()  { echo "[reply][fail] $*"; fail=1; }
 
+if [[ -z "$REGRADE" ]]; then
 note "building base x86_64 artifacts"
 BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
   scripts/build-qemu-x86_64-artifacts.sh >"$LOGDIR/build.log" 2>&1 \
@@ -43,11 +46,13 @@ if (( ! fail )); then
 fi
 if (( ! fail )); then cp "$KELF" build-x86_64/kernel_boot.elf; fi
 if (( fail )); then echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=build"; exit 1; fi
+fi
 
 # ── Stage 199A2D3: DETERMINISTIC QEMU lifecycle — the SCRIPT owns termination. ────────────────
 # Launch fresh QEMU → monitor a fresh log → wait for ALL final bidirectional proof markers →
 # scan fatal each poll → terminate QEMU from the script → wait for exit → only then seal.
 source "$(dirname "$0")/lib/qemu-x86-deterministic.sh"
+if [[ -z "$REGRADE" ]]; then
 
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
   die "qemu-system-x86_64 not installed"
@@ -80,6 +85,7 @@ LIFECYCLE_RC=$?
 note "qemu lifecycle: ${QEMU_LIFECYCLE_RESULT} (rc=${LIFECYCLE_RC})"
 if (( LIFECYCLE_RC != 0 )); then
   echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=${QEMU_LIFECYCLE_RESULT}"; exit 1
+fi
 fi
 
 if [[ ! -s "$BOOT_LOG" ]]; then die "no boot log"; echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=no_boot_log"; exit 1; fi
@@ -130,13 +136,19 @@ field() { sed -n "s/.* $1=\([0-9]*\).*/\1/p" <<<"$SUMMARY"; }
 [[ "$(field client_tid)" == "$CLIENT_TID" ]] || die "summary client differs"
 [[ "$(field cpu1_tlb_req_gen)" == "$(field cpu1_tlb_ack_gen)" ]] || die "cpu1 TLB request outstanding (req != ack)"
 # 5. The PRODUCTION scheduler selects the caller on CPU 0 after the claim, and before its
-#    continuation runs; nothing else resumes it (the oracle BSP resume is retired).
+#    continuation runs; nothing else resumes it (the oracle BSP resume is retired). Which
+#    production drain makes that selection depends on what else is runnable on CPU 0 when the
+#    0xF1 wake lands: an idle CPU's timer/yield drain dequeues the caller directly
+#    (`*_DEQUEUE_OK cpu=0 … =<caller>`); if a task whose receive deadline expires on the same
+#    tick is ahead of it, that task runs, blocks in its receive, and the blocking-receive drain
+#    selects the caller (`D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=<caller>`).
+#    Both go through the one queue-advance selection owner.
 [[ "$(count "X86_BSP_SAVED_DISPATCH_OK")" == "0" ]] || die "retired oracle BSP resume ran"
 CLAIM_AT="$(line_of "IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=0 record_generation=${GEN} replier_tid=${SERVER_TID} ")"
 CONT_AT="$(line_of "X86_SMP_REPLY_USER_ECHO X86_BSP_RECV_V2_CONTINUED cpu=0")"
-SELECT_AT="$(rg -a -n -e "DEQUEUE_OK cpu=0 (tid|incoming)=${CLIENT_TID}\b" "$NORM" | cut -d: -f1 | awk -v a="${CLAIM_AT:-0}" -v b="${CONT_AT:-0}" '$1>a && $1<b' | head -1)"
+SELECT_AT="$(rg -a -n -e "DEQUEUE_OK cpu=0 (tid|incoming)=${CLIENT_TID}\b" -e "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=0 incoming=${CLIENT_TID}\b" "$NORM" | cut -d: -f1 | awk -v a="${CLAIM_AT:-0}" -v b="${CONT_AT:-0}" '$1>a && $1<b' | head -1)"
 [[ -n "$CLAIM_AT" && -n "$CONT_AT" && -n "$SELECT_AT" ]] || die "no production selection of the caller on cpu 0 between the claim and its continuation"
-rg -a -q -e "DEQUEUE_OK cpu=1 (tid|incoming)=${CLIENT_TID}\b" "$NORM" && die "caller selected on the wrong CPU"
+rg -a -q -e "DEQUEUE_OK cpu=1 (tid|incoming)=${CLIENT_TID}\b" -e "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu=1 incoming=${CLIENT_TID}\b" "$NORM" && die "caller selected on the wrong CPU"
 # 6. The exact continuation returns to ring 3 ONCE, validates the reply, and makes further
 #    progress (a Yield round trip), then both tasks block again — no park, no spin.
 [[ "$(count "X86_SMP_REPLY_USER_ECHO X86_BSP_RECV_V2_CONTINUED cpu=0")" == "1" ]] || die "reply recv-v2 continued != 1"
