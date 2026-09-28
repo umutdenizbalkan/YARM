@@ -41,10 +41,16 @@
 #     (asid, va, old PA, generation) whose completion carries the same identity; the displaced
 #     frame is pinned, its shootdown answered, and it is settled only after that completion; the
 #     target, still on CPU T with its probe unchanged, observes the new W after the completion.
-#   * MUTUAL PROGRESS (4 rounds): both requests and both completions per round, both observations;
-#     the rounds in which the two requests were in flight together are reported and must be >= 1.
+#   * MUTUAL PROGRESS (4 rounds): graded on the production VM operations. Each task's NR 3 must
+#     enter and complete in the VM owner (`vm_op_begin`/`vm_op_end`, same CPU, target asid, W and
+#     generation) returning Ok with W, with its own invalidation request and completion, its
+#     displaced page's acknowledged shootdown and its settlement inside it, and the OTHER task's
+#     observation after it. Every round must show both operations begun before either completed.
+#     The delivered announcement-based criterion is reported as `mutual_announced`, never graded.
 #   * CONTEXT: every context-checked step is present (a failed check reports a FAIL step instead).
 #   * NOTHING FATAL, no user failure step, no broad-entry or unrouted marker.
+#   * THE ARTIFACT'S INVALIDATION SEQUENCE (`scripts/check-aarch64-tlbi-sequence.sh`): every
+#     broadcast TLBI is `dsb ishst; tlbi; dsb ish; isb`, in the break and in the make.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -96,12 +102,20 @@ print("[smp2-witness] boot %s after %.1fs" % ("sealed" if seen else "TIMED OUT",
 PY
 fi
 
-python3 - "$BOOT_LOG" <<'PY'
+# The invalidation sequence of THIS artifact: every broadcast TLBI bracketed by `dsb ishst` and
+# `dsb ish; isb`, present in the break and the make. QEMU cannot distinguish a missing barrier.
+scripts/check-aarch64-tlbi-sequence.sh "$BUILD_DIR/yarm-aarch64.elf" > "$LOGDIR/tlbi-sequence.txt" 2>&1
+TLBI_STATUS=$?
+sed 's/^/[smp2-witness] /' "$LOGDIR/tlbi-sequence.txt"
+
+python3 - "$BOOT_LOG" "$TLBI_STATUS" <<'PY'
 import re, sys
 text = open(sys.argv[1], "rb").read().decode("utf-8", "replace").replace("\r", "\n")
 lines = text.split("\n")
 fails = []
 def fail(msg): fails.append(msg)
+if sys.argv[2] != "0":
+    fail("the built image's broadcast TLBI sequence is incomplete (tlbi-sequence.txt)")
 
 # ── BRING-UP ──
 ready = {}
@@ -322,21 +336,57 @@ for rnd in (1, 2, 3, 4):
     tlb += 1
 
 # ── MUTUAL PROGRESS ──
-mutual, overlapped = 0, 0
+# Graded on the production operations, not on the announcements: each task's NR 3 is the VM
+# owner's `vm_op_begin` .. `vm_op_end` (same CPU, target asid, W, generation), which must return
+# Ok with W, contain its own invalidation request and completion, its displaced page's shootdown
+# acknowledgement and settlement, and precede the OTHER task's observation. A round is credited
+# only when both operations began before either completed. The delivered announcement criterion
+# (both `*_MUT_NR3` steps before the first invalidation completion) is reported, never graded.
+def vm_op(start, cpu, asid, tid):
+    b = find(start, lambda r: r["kind"] == "vm_op_begin" and r["cpu"] == cpu and r["f"][0] == asid and r["f"][1] == W and r["f"][4] == tid)
+    if b is None: return None, "no production operation"
+    e = None
+    for i in range(b + 1, len(recs)):
+        r = recs[i]
+        if r["cpu"] != cpu: continue
+        if r["kind"] == "vm_op_begin" and e is None: return None, "operation seq %d never completed" % recs[b]["seq"]
+        if r["kind"] == "vm_op_end" and r["f"][:3] == [asid, W, recs[b]["f"][3]]:
+            if e is not None: return None, "operation seq %d completed twice" % recs[b]["seq"]
+            e = i
+    if e is None: return None, "operation seq %d never completed" % recs[b]["seq"]
+    if recs[e]["f"][3] != 0 or recs[e]["f"][4] != W:
+        return None, "operation seq %d returned outcome %d addr 0x%x" % (recs[b]["seq"], recs[e]["f"][3], recs[e]["f"][4])
+    return (b, e), None
+mutual, overlapped, announced = 0, 0, 0
 for m in (1, 2, 3, 4):
     sn, cn = user(0, S_TID, "S_MUT_NR3", m), user(0, C_TID, "C_MUT_NR3", m)
-    if sn is None or cn is None: fail("mutual %d: request steps missing" % m); continue
-    bs, ds, why1 = request(sn, 1, C_ASID)
-    bc, dc, why2 = request(cn, 0, S_ASID)
-    if why1 or why2: fail("mutual %d: %s / %s" % (m, why1, why2)); continue
-    why = retired(bs, ds) or retired(bc, dc)
-    if why: fail("mutual %d: %s" % (m, why)); continue
-    if user(0, S_TID, "S_MUT_OK", m) is None or user(0, C_TID, "C_MUT_OK", m) is None:
-        fail("mutual %d: observation missing" % m); continue
+    if sn is None or cn is None: fail("mutual %d: announcement steps missing" % m); continue
+    ops, whys = {}, []
+    for who, start, cpu, asid, tid in (("S", sn, 1, C_ASID, S_TID), ("C", cn, 0, S_ASID, C_TID)):
+        op, why = vm_op(start, cpu, asid, tid)
+        if why: whys.append("%s: %s" % (who, why)); continue
+        b, d, why = request(op[0], cpu, asid)
+        if why or not (op[0] < b < d < op[1]):
+            whys.append("%s: invalidation %s inside its operation" % (who, why or "not")); continue
+        why = retired(b, d)
+        disp = find(d, lambda r: r["kind"] == "vm_displaced" and r["cpu"] == cpu and r["f"][0] == asid and r["f"][1] == W)
+        st = find(d, lambda r: r["kind"] == "vm_settled" and r["cpu"] == cpu and r["f"][0] == asid and r["f"][1] == W)
+        if why or disp is None or st is None or not (disp < st < op[1]):
+            whys.append("%s: %s" % (who, why or "displacement/settlement not inside its operation")); continue
+        ops[who] = (op, d)
+    if whys: fail("mutual %d: %s" % (m, " / ".join(whys))); continue
+    so, co = user(0, S_TID, "S_MUT_OK", m), user(0, C_TID, "C_MUT_OK", m)
+    if so is None or co is None or so < ops["C"][0][1] or co < ops["S"][0][1]:
+        fail("mutual %d: an observation is missing or precedes the other operation's completion" % m); continue
     mutual += 1
-    overlapped += int(max(sn, cn) < min(ds, dc))
-if overlapped < 1:
-    fail("no mutual round had both requests in flight together")
+    (bs, es), (bc, ec) = ops["S"][0], ops["C"][0]
+    ov = max(bs, bc) < min(es, ec)
+    overlapped += int(ov)
+    announced += int(max(sn, cn) < min(ops["S"][1], ops["C"][1]))
+    print("[smp2-witness] mutual %d: S op seq %d..%d (cpu 1), C op seq %d..%d (cpu 0): %s" % (
+        m, recs[bs]["seq"], recs[es]["seq"], recs[bc]["seq"], recs[ec]["seq"], "OVERLAPPED" if ov else "SERIALIZED"))
+    if not ov:
+        fail("mutual %d: the two production operations did not overlap (one completed before the other began)" % m)
 
 # ── CONTEXT ──
 ctx_steps = {"S_P1_RESUMED": 4, "C_P1_RESUMED": 4, "S_WIN_A_OK": 1, "C_WIN_B_OK": 1, "S_OBSERVED": 2, "C_OBSERVED": 2}
@@ -345,7 +395,8 @@ for step, want in ctx_steps.items():
     if n != want: fail("context step %s seen %d time(s), want %d" % (step, n, want))
 
 # ── the kernel verifier must agree ──
-for want in ["p1_parked=8", "p2_el0=2", "tlb_rounds=4", "mutual_rounds=4", "settled_after_ack=12",
+for want in ["p1_parked=8", "p2_el0=2", "tlb_rounds=4", "mutual_rounds=%d" % mutual, "mutual_overlapped=%d" % overlapped,
+             "mutual_announced=%d" % announced, "settled_after_ack=12",
              "p1_sgi_to_s=%d" % sgi_to_s, "p1_sgi_to_c=%d" % sgi_to_c, "p1_timer_first=%d" % timer_first,
              "p1_busy=%d" % busy]:
     if want not in counts.split():
@@ -353,12 +404,12 @@ for want in ["p1_parked=8", "p2_el0=2", "tlb_rounds=4", "mutual_rounds=4", "sett
 if not verdict.startswith("SMP2_VERDICT result=ok "):
     fail("kernel verdict: %s" % verdict)
 
-summary = "records=%d damaged_lines=%d sgi_arrivals=%d p1_rounds=%d sgi_to_s=%d sgi_to_c=%d timer_first=%d busy=%d el0=%d tlb_rounds=%d mutual=%d mutual_overlapped=%d" % (
-    len(recs), damaged, sgi_arrivals, parked_n, sgi_to_s, sgi_to_c, timer_first, busy, el0, tlb, mutual, overlapped)
+summary = "records=%d damaged_lines=%d sgi_arrivals=%d p1_rounds=%d sgi_to_s=%d sgi_to_c=%d timer_first=%d busy=%d el0=%d tlb_rounds=%d mutual=%d mutual_overlapped=%d mutual_announced=%d" % (
+    len(recs), damaged, sgi_arrivals, parked_n, sgi_to_s, sgi_to_c, timer_first, busy, el0, tlb, mutual, overlapped, announced)
 print("[smp2-witness] " + summary)
 print("[smp2-witness] kernel: " + counts + " | " + verdict)
 for f in fails: print("[smp2-witness][fail] " + f)
-ok = not fails and parked_n == 8 and el0 == 2 and tlb == 4 and mutual == 4
+ok = not fails and parked_n == 8 and el0 == 2 and tlb == 4 and mutual == 4 and overlapped == 4
 print("SMP2_WITNESS_SEAL %s result=%s" % (summary, "ok" if ok else "fail"))
 sys.exit(0 if ok else 1)
 PY

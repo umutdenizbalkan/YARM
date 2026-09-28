@@ -512,6 +512,22 @@ fn release_settled_pins<O: VmMapOwners>(owners: &mut O, records: &mut [PageRecor
     }
 }
 
+/// QEMU-SMP2-ACCEPTANCE: hand a result back from `run_vm_map_transaction`, first recording that
+/// the witnessed operation completed with exactly that result. Without the witness feature it is
+/// the result, unchanged.
+macro_rules! vm_txn_exit {
+    ($op:ident, $result:expr) => {{
+        let result = $result;
+        #[cfg(all(
+            feature = "aarch64-smp2-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "aarch64"
+        ))]
+        crate::arch::aarch64::smp2_witness::vm_op_end($op, &result);
+        result
+    }};
+}
+
 /// THE anonymous-mapping transaction: NR 3 and NR 13, one policy, one request.
 ///
 /// | phase | acquisition | on failure |
@@ -545,6 +561,16 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
         addr: args.addr,
         len: args.map_len,
     });
+    // QEMU-SMP2-ACCEPTANCE: this request's lifetime, for the witness's page only — entered here,
+    // with its target resolved and no domain lock held; completed at every exit below with the
+    // result actually returned (`vm_txn_exit!`). Nothing in the transaction reads it.
+    #[cfg(all(
+        feature = "aarch64-smp2-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "aarch64"
+    ))]
+    let smp2_op =
+        crate::arch::aarch64::smp2_witness::vm_op_begin(tid, asid, args.addr, args.map_len);
 
     let cnode = owners.caller_cnode(tid);
     let pages = args.map_len / PAGE_SIZE;
@@ -577,7 +603,10 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             released: 0,
             retained: 0,
         });
-        return Err(SyscallError::from(KernelError::MemoryObjectFull));
+        return vm_txn_exit!(
+            smp2_op,
+            Err(SyscallError::from(KernelError::MemoryObjectFull))
+        );
     }
 
     // ── Phase R: every frame and its object, for the whole request, each PINNED as it is
@@ -619,7 +648,10 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
                         released: records.len(),
                         retained: 0,
                     });
-                    return Err(SyscallError::from(KernelError::MemoryObjectMissing));
+                    return vm_txn_exit!(
+                        smp2_op,
+                        Err(SyscallError::from(KernelError::MemoryObjectMissing))
+                    );
                 }
                 records.push(record);
             }
@@ -636,7 +668,7 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
                     released: records.len(),
                     retained: 0,
                 });
-                return Err(SyscallError::from(e));
+                return vm_txn_exit!(smp2_op, Err(SyscallError::from(e)));
             }
         }
     }
@@ -680,7 +712,7 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
                     released,
                     retained,
                 });
-                return Err(SyscallError::from(e));
+                return vm_txn_exit!(smp2_op, Err(SyscallError::from(e)));
             }
         }
     }
@@ -720,7 +752,7 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             released,
             retained: retained + unacknowledged,
         });
-        return Err(SyscallError::from(e));
+        return vm_txn_exit!(smp2_op, Err(SyscallError::from(e)));
     }
     owners.note(VmTxnEvent::Installed { count: pages });
 
@@ -856,7 +888,7 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             records[index].pinned = false;
         }
     }
-    Ok((args.addr, args.map_len))
+    vm_txn_exit!(smp2_op, Ok((args.addr, args.map_len)))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════

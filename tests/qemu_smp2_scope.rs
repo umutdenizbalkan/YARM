@@ -22,10 +22,14 @@ const BRIDGE: &str = include_str!("../src/arch/trap_entry.rs");
 const BOOT_ENTRY: &str = include_str!("../src/arch/boot_entry.rs");
 const DRAINS: &str = include_str!("../src/kernel/ipccall_direct_txn.rs");
 const PAGE_TABLE: &str = include_str!("../src/arch/aarch64/page_table.rs");
+const VM: &str = include_str!("../src/kernel/vm.rs");
+const VM_TXN: &str = include_str!("../src/kernel/syscall/vm_txn.rs");
+const TLBI_CHECK: &str = include_str!("../scripts/check-aarch64-tlbi-sequence.sh");
 const SCHED: &str = include_str!("../src/kernel/scheduler.rs");
 const WITNESS_RS: &str = include_str!("../src/arch/aarch64/smp2_witness.rs");
 const WITNESS_S: &str = include_str!("../src/arch/aarch64/smp2_witness.S");
 const WITNESS_SH: &str = include_str!("../scripts/qemu-aarch64-smp2-witness-smoke.sh");
+const A64_BOOT_AND_SMP: [&str; 2] = [BOOT, SMP];
 
 fn code(src: &str) -> String {
     src.lines()
@@ -247,4 +251,159 @@ fn the_witness_is_gated_and_observes() {
         "x18 belongs to the kernel on every EL0 return"
     );
     assert!(WITNESS_SH.contains("re-derives every graded edge from the raw sealed record"));
+}
+
+/// QEMU-SMP2-ACCEPTANCE §2 — the architecture's break-before-make and barrier obligations,
+/// derived through the production owners. A replacement (`AddressSpace::replace_page_in_run`)
+/// breaks first (`arch_unmap_page` → `page_table::unmap_page`: the empty leaf, the lock released,
+/// then an UNCONDITIONAL `invalidate_page`), and only then makes (`arch_map_page` →
+/// `page_table::map_page`: the new leaf, then `invalidate_page`). Every runtime invalidation is
+/// `dsb ishst; tlbi <op>is; dsb ish; isb`: the table write visible before the TLBI, the TLBI
+/// completed on every PE before anything that depends on it. QEMU does not distinguish a missing
+/// barrier, so this guard (and `scripts/check-aarch64-tlbi-sequence.sh` on the built image) is
+/// what rejects its omission.
+#[test]
+fn break_before_make_and_the_invalidation_barriers_are_in_order() {
+    let replace = code(fn_body(VM, "    fn replace_page_in_run("));
+    let unmap_at = pos(&replace, "arch_unmap_page(self.asid, virt);");
+    assert!(
+        unmap_at
+            < pos(
+                &replace,
+                "if let Err(e) = arch_map_page(self.asid, virt, mapping)"
+            )
+    );
+    let vm = code(VM);
+    let route = |head: &str, call: &str| {
+        let at = pos(&vm, head);
+        assert!(vm[at..at + 400].contains(call), "{head} routes to {call}");
+    };
+    route(
+        "fn arch_unmap_page(asid: Option<Asid>, virt: VirtAddr) {",
+        "page_table::unmap_page(asid, virt)",
+    );
+    route(
+        "fn arch_map_page(asid: Option<Asid>, virt: VirtAddr, mapping: Mapping)",
+        "page_table::map_page(asid, virt, mapping.phys, mapping.flags)",
+    );
+
+    let unmap = code(fn_body(
+        PAGE_TABLE,
+        "pub fn unmap_page(asid: Asid, virt: VirtAddr)",
+    ));
+    assert_eq!(unmap.matches("invalidate_page(").count(), 1);
+    let order = [
+        "write_table_entry(&mut state, leaf_idx, levels[2], PageTableEntry::empty())",
+        "drop(state);",
+        "\n    invalidate_page(virt);\n",
+        "Some(old)",
+    ];
+    let at: Vec<usize> = order.iter().map(|n| pos(&unmap, n)).collect();
+    assert!(
+        at.windows(2).all(|w| w[0] < w[1]),
+        "break, release, invalidate (unconditionally)"
+    );
+
+    let map = code(fn_body(PAGE_TABLE, "pub fn map_page("));
+    assert_eq!(map.matches("invalidate_page(").count(), 1);
+    assert!(
+        pos(&map, "leaf_flags_from_page_flags(flags)")
+            < pos(
+                &map,
+                "drop(state);\n    invalidate_page(virt);\n    Ok(prev.is_present()"
+            )
+    );
+
+    for (head, tlbi) in [
+        (
+            "pub fn invalidate_page(virt: VirtAddr) {",
+            "\"tlbi vaae1is, {operand}\",",
+        ),
+        (
+            "pub fn invalidate_asid(asid: Asid) {",
+            "\"tlbi aside1is, {operand}\",",
+        ),
+        ("pub fn flush_tlb_local_full() {", "\"tlbi vmalle1is\","),
+    ] {
+        let body = fn_body(PAGE_TABLE, head);
+        let want = format!(
+            "\"dsb ishst\",\n            {tlbi}\n            \"dsb ish\",\n            \"isb\","
+        );
+        assert!(
+            body.contains(&want),
+            "{head}: dsb ishst; tlbi; dsb ish; isb"
+        );
+    }
+    // Those three are the only broadcast invalidations: every other AArch64 TLBI is the local
+    // `tlbi vmalle1` of an MMU bring-up.
+    let broadcast = code(PAGE_TABLE)
+        .lines()
+        .filter(|l| l.trim_start().starts_with("\"tlbi "))
+        .count();
+    assert_eq!(broadcast, 3);
+    for src in A64_BOOT_AND_SMP {
+        for l in code(src).lines().filter(|l| l.contains("tlbi ")) {
+            assert!(
+                l.contains("tlbi vmalle1") && !l.contains("vmalle1is"),
+                "{l}"
+            );
+        }
+    }
+    for needle in [
+        "(\"dsb\", \"ishst\"), (\"tlbi\", args), (\"dsb\", \"ish\"), (\"isb\", \"\")",
+        "unmap_page",
+        "map_page",
+    ] {
+        assert!(TLBI_CHECK.contains(needle), "{needle}");
+    }
+    assert!(WITNESS_SH.contains("scripts/check-aarch64-tlbi-sequence.sh"));
+}
+
+/// QEMU-SMP2-ACCEPTANCE §1 — the mutual rounds are graded on the production VM operation, so the
+/// operation must be recorded by its owner: entered once its target is resolved (and before the
+/// journal, so no domain lock is held), and completed at EVERY exit after that with the result
+/// actually returned. The witness drives the ordinary NR 3; nothing in the transaction reads the
+/// record.
+#[test]
+fn the_vm_operation_is_recorded_by_its_owner_at_every_exit() {
+    let txn = code(fn_body(
+        VM_TXN,
+        "pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(",
+    ));
+    assert_eq!(txn.matches("smp2_witness::vm_op_begin(").count(), 1);
+    let begin = pos(&txn, "smp2_witness::vm_op_begin(");
+    assert!(pos(&txn, "resolve_map_target(") < begin && begin < pos(&txn, "try_reserve_exact"));
+    assert!(txn[..begin].ends_with(
+        "target_arch = \"aarch64\"\n    ))]\n    let smp2_op =\n        crate::arch::aarch64::"
+    ));
+    let after = &txn[begin..];
+    assert!(
+        !after.contains("return Err("),
+        "every exit after the begin records its completion"
+    );
+    assert!(!after.contains('?'), "no early exit after the begin");
+    assert_eq!(after.matches("return ").count(), 5, "the five error exits");
+    assert_eq!(after.matches("return vm_txn_exit!(").count(), 5);
+    assert_eq!(
+        after.matches("vm_txn_exit!(\n").count() + after.matches("vm_txn_exit!(smp2_op,").count(),
+        6
+    );
+    assert!(
+        after
+            .trim_end()
+            .ends_with("vm_txn_exit!(smp2_op, Ok((args.addr, args.map_len)))")
+    );
+    let exit = code(VM_TXN);
+    let mac = &exit[pos(&exit, "macro_rules! vm_txn_exit {")..];
+    let mac = &mac[..pos(mac, "\n}\n")];
+    assert!(
+        mac.contains("let result = $result;")
+            && mac.contains("smp2_witness::vm_op_end($op, &result);")
+    );
+    assert!(pos(mac, "feature = \"aarch64-smp2-witness\"") < pos(mac, "vm_op_end("));
+    let end = code(fn_body(WITNESS_RS, "pub fn vm_op_end("));
+    assert!(
+        end.contains("Ok((addr, _)) => (0, *addr as u64),")
+            && end.contains("Err(e) => (e.code() as u64, 0),")
+    );
 }

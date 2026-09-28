@@ -47,8 +47,10 @@ pub enum Kind {
     /// `cpu`'s idle advance resumed task `f[0]`; `f[1]` = 1 when a reschedule SGI drove it, 0
     /// when the periodic timer's idle advance did.
     IdleDispatch = 4,
-    /// `cpu` began replacing a present leaf: `f[0]` asid, `f[1]` va, `f[2]` old PA, `f[3]` new
-    /// PA, `f[4]` request generation. Recorded with the page-table lock held, before the break.
+    /// `cpu` broke a present leaf and is about to invalidate it: `f[0]` asid, `f[1]` va, `f[2]`
+    /// old PA, `f[3]` new PA (0: the break names none), `f[4]` request generation. Recorded after
+    /// the empty-leaf write and the page-table lock's release, immediately before the broadcast
+    /// `tlbi`.
     InvalBegin = 5,
     /// The broadcast invalidation for that exact request has completed (`dsb ish` returned),
     /// same fields. This is the acknowledgement: nothing else acknowledges an AArch64 TLBI.
@@ -64,6 +66,14 @@ pub enum Kind {
     /// The residency probe of asid `f[0]` was re-pointed at frame `f[1]` (PA `f[2]`) for round
     /// `f[3]`, WITHOUT any invalidation.
     RRepoint = 11,
+    /// The production VM mapping transaction on `cpu` entered with its target resolved: `f[0]`
+    /// target asid, `f[1]` va, `f[2]` length, `f[3]` operation generation, `f[4]` caller tid.
+    /// Recorded by the owner itself, with no domain lock held.
+    VmOpBegin = 12,
+    /// That transaction returned: `f[0]` asid, `f[1]` va, `f[2]` the generation of its
+    /// `VmOpBegin`, `f[3]` the outcome actually returned (0 = `Ok`, else the `SyscallError`
+    /// code), `f[4]` the address returned (0 on error). Recorded at every exit after the begin.
+    VmOpEnd = 13,
 }
 
 impl Kind {
@@ -80,6 +90,8 @@ impl Kind {
             9 => Kind::VmSettled,
             10 => Kind::User,
             11 => Kind::RRepoint,
+            12 => Kind::VmOpBegin,
+            13 => Kind::VmOpEnd,
             _ => return None,
         })
     }
@@ -97,6 +109,8 @@ impl Kind {
             Kind::VmSettled => "vm_settled",
             Kind::User => "user",
             Kind::RRepoint => "r_repoint",
+            Kind::VmOpBegin => "vm_op_begin",
+            Kind::VmOpEnd => "vm_op_end",
         }
     }
 }
@@ -190,6 +204,8 @@ fn code(name: &str) -> u64 {
 /// Parked-target rounds per direction, and the SGI-driven dispatches CPU 0 must show of them.
 pub const P1_ROUNDS: u64 = 4;
 pub const P1_MIN_SGI_TO_C: usize = 2;
+/// Mutual rounds; every one must show its two production operations in flight together.
+pub const MUT_ROUNDS: u64 = 4;
 
 /// The four witness tasks: `(tid, asid, home cpu)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,6 +270,55 @@ pub fn match_invalidation(recs: &[Rec], begin: usize) -> Result<usize, InvalRefu
         found = Some(i);
     }
     found.ok_or(InvalRefusal::Missing)
+}
+
+/// Why a production VM operation's begin is not a completed, successful operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmOpRefusal {
+    /// The index is not a `VmOpBegin`.
+    NotABegin,
+    /// No completion with this operation's identity, or the same CPU began another operation
+    /// first — a CPU runs one system call at a time, so this one never returned.
+    Incomplete,
+    /// More than one completion names this operation.
+    Duplicate,
+    /// It completed, but returned an error or another address: not a successful replacement.
+    Failed,
+}
+
+/// The completion of the production VM operation begun at `recs[begin]`: same CPU, same target
+/// address space, same mapping and the same generation, after it, returning `Ok` with the
+/// requested address. Pure.
+pub fn match_vm_op(recs: &[Rec], begin: usize) -> Result<usize, VmOpRefusal> {
+    let b = recs.get(begin).ok_or(VmOpRefusal::NotABegin)?;
+    if b.kind != Kind::VmOpBegin {
+        return Err(VmOpRefusal::NotABegin);
+    }
+    let mut found: Option<usize> = None;
+    for (i, r) in recs.iter().enumerate().skip(begin + 1) {
+        if r.cpu != b.cpu {
+            continue;
+        }
+        if r.kind == Kind::VmOpBegin && found.is_none() {
+            return Err(VmOpRefusal::Incomplete);
+        }
+        if r.kind == Kind::VmOpEnd && r.f[0] == b.f[0] && r.f[1] == b.f[1] && r.f[2] == b.f[3] {
+            if found.is_some() {
+                return Err(VmOpRefusal::Duplicate);
+            }
+            found = Some(i);
+        }
+    }
+    let end = found.ok_or(VmOpRefusal::Incomplete)?;
+    if recs[end].f[3] != 0 || recs[end].f[4] != b.f[1] {
+        return Err(VmOpRefusal::Failed);
+    }
+    Ok(end)
+}
+
+/// Whether two operations' intervals overlap: both began before either completed.
+pub fn ops_overlap(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0.max(b.0) < a.1.min(b.1)
 }
 
 /// Why the SGI population does not balance.
@@ -332,8 +397,15 @@ pub struct Verdict {
     pub p1_busy: usize,
     pub p2_el0: usize,
     pub tlb_rounds: usize,
+    /// Mutual rounds whose two production operations each completed successfully with their own
+    /// invalidation, displacement, settlement and observation inside or after them.
     pub mutual_rounds: usize,
+    /// ... of which both production operations entered before either completed.
     pub mutual_overlapped: usize,
+    /// DIAGNOSTIC ONLY, never graded: rounds the delivered QEMU-SMP2 criterion would have called
+    /// overlapped — both DebugLog announcements before the first invalidation completion. It
+    /// accepts two operations run one after the other once both have announced.
+    pub mutual_announced: usize,
     pub settled_after_ack: usize,
     pub failure: Option<&'static str>,
     pub failure_at: u32,
@@ -452,6 +524,85 @@ pub fn parked_wake(
         Some(_) => Err("sgi_arrived_in_another_task"),
         None => Ok((after, ParkedRoute::Busy)),
     }
+}
+
+/// What one fully verified mutual round showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MutualRound {
+    /// Both production operations entered before either completed.
+    pub overlapped: bool,
+    /// DIAGNOSTIC: the delivered announcement criterion held (both `*_MUT_NR3` steps before the
+    /// first invalidation completion). Never graded.
+    pub announced: bool,
+}
+
+/// Mutual round `m`: S's NR 3 on S's CPU replaces C's W while C's NR 3 on C's CPU replaces S's.
+/// Each is the production VM transaction's own begin .. completion (same CPU, target asid, W and
+/// generation), returning `Ok` with W, with its own invalidation request and completion, its
+/// displaced page's acknowledged shootdown and its settlement all inside it; each task's
+/// observation of its replaced W follows the OTHER operation's completion. Pure.
+pub fn mutual_round(recs: &[Rec], roles: &Roles, m: u64) -> Result<MutualRound, &'static str> {
+    let (s, c) = (roles.s, roles.c);
+    let sn = user(recs, 0, s, "S_MUT_NR3", Some(m)).ok_or("mut_request_missing")?;
+    let cn = user(recs, 0, c, "C_MUT_NR3", Some(m)).ok_or("mut_request_missing")?;
+    let mut ops = [(0usize, 0usize); 2];
+    let mut first_done = [0usize; 2];
+    for (slot, (req, target, from)) in [(s, c, sn), (c, s, cn)].into_iter().enumerate() {
+        let begin = find_from(recs, from, |x| {
+            x.kind == Kind::VmOpBegin
+                && x.cpu == req.cpu
+                && x.f[0] == target.asid
+                && x.f[1] == roles.w_va
+                && x.f[4] == req.tid
+        })
+        .ok_or("mut_operation_missing")?;
+        let end = match match_vm_op(recs, begin) {
+            Ok(e) => e,
+            Err(VmOpRefusal::Failed) => return Err("mut_operation_failed"),
+            Err(VmOpRefusal::Duplicate) => {
+                return Err("mut_operation_duplicate_completion");
+            }
+            Err(_) => return Err("mut_operation_incomplete"),
+        };
+        // Its own invalidation, completed, and its displaced page retired — all inside it.
+        let inval = find_from(recs, begin, |x| {
+            x.kind == Kind::InvalBegin
+                && x.cpu == req.cpu
+                && x.f[0] == target.asid
+                && x.f[1] == roles.w_va
+        })
+        .filter(|&i| i < end)
+        .ok_or("mut_invalidation_outside_operation")?;
+        let done = match_invalidation(recs, inval).map_err(|_| "mut_acknowledgement_invalid")?;
+        if done > end {
+            return Err("mut_invalidation_outside_operation");
+        }
+        let inside = |k: Kind, after: usize| {
+            find_from(recs, after, |x| {
+                x.kind == k && x.cpu == req.cpu && x.f[0] == target.asid && x.f[1] == roles.w_va
+            })
+            .filter(|&i| i < end)
+        };
+        let disp = inside(Kind::VmDisplaced, done).ok_or("mut_displacement_outside_operation")?;
+        let sd = inside(Kind::VmShootdown, disp).ok_or("mut_shootdown_outside_operation")?;
+        if recs[sd].f[2] != 1 {
+            return Err("mut_shootdown_not_acknowledged");
+        }
+        inside(Kind::VmSettled, sd).ok_or("mut_settlement_outside_operation")?;
+        ops[slot] = (begin, end);
+        first_done[slot] = done;
+    }
+    // Each task observes its own W replaced only after the OTHER operation returned.
+    let so = user(recs, 0, s, "S_MUT_OK", Some(m)).ok_or("mut_observation_missing")?;
+    let co = user(recs, 0, c, "C_MUT_OK", Some(m)).ok_or("mut_observation_missing")?;
+    if so < ops[1].1 || co < ops[0].1 {
+        return Err("mut_observed_before_operation_completed");
+    }
+    let announced = sn.max(cn) < first_done[0].min(first_done[1]);
+    Ok(MutualRound {
+        overlapped: ops_overlap(ops[0], ops[1]),
+        announced,
+    })
 }
 
 /// Grade a sealed record. Pure; the kernel runs it at the dump and the grader re-derives it.
@@ -596,32 +747,16 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
         }
     }
 
-    // P4 — mutual rounds.
-    for m in 1..=4u64 {
-        let round = (|| -> Result<bool, &'static str> {
-            let sn = user(recs, 0, s, "S_MUT_NR3", Some(m)).ok_or("mut_request_missing")?;
-            let cn = user(recs, 0, c, "C_MUT_NR3", Some(m)).ok_or("mut_request_missing")?;
-            let mut dones = [0usize; 2];
-            for (slot, (req, target)) in [(s, c), (c, s)].into_iter().enumerate() {
-                let from = if req.tid == s.tid { sn } else { cn };
-                let begin = find_from(recs, from, |x| {
-                    x.kind == Kind::InvalBegin
-                        && x.cpu == req.cpu
-                        && x.f[0] == target.asid
-                        && x.f[1] == roles.w_va
-                })
-                .ok_or("mut_invalidation_missing")?;
-                dones[slot] =
-                    match_invalidation(recs, begin).map_err(|_| "mut_acknowledgement_invalid")?;
-            }
-            user(recs, 0, s, "S_MUT_OK", Some(m)).ok_or("mut_observation_missing")?;
-            user(recs, 0, c, "C_MUT_OK", Some(m)).ok_or("mut_observation_missing")?;
-            Ok(sn.max(cn) < dones[0].min(dones[1]))
-        })();
-        match round {
-            Ok(overlap) => {
+    // P4 — mutual rounds, graded on the production operations themselves.
+    for m in 1..=MUT_ROUNDS {
+        match mutual_round(recs, roles, m) {
+            Ok(round) => {
                 v.mutual_rounds += 1;
-                v.mutual_overlapped += usize::from(overlap);
+                v.mutual_overlapped += usize::from(round.overlapped);
+                v.mutual_announced += usize::from(round.announced);
+                if !round.overlapped {
+                    v.fail("mut_operations_serialized", m as u32);
+                }
             }
             Err(why) => v.fail(why, m as u32),
         }
@@ -969,6 +1104,192 @@ mod tests {
         assert_eq!(parked_wake(&r, 0, c, 1, s), Ok((0, ParkedRoute::Busy)));
         let r = seqd(vec![call, sent, at_idle(0), by_timer(s.tid)]);
         assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_dispatch_substituted"));
+    }
+
+    type Ev = (Kind, u8, [u64; 5]);
+
+    fn mutual_roles() -> Roles {
+        Roles {
+            s: Role {
+                tid: 9200,
+                asid: 5,
+                cpu: 1,
+            },
+            c: Role {
+                tid: 9201,
+                asid: 6,
+                cpu: 0,
+            },
+            h1: Role {
+                tid: 9202,
+                asid: 7,
+                cpu: 1,
+            },
+            h0: Role {
+                tid: 9203,
+                asid: 8,
+                cpu: 0,
+            },
+            w_va: W,
+        }
+    }
+
+    fn step(role: Role, name: &str, round: u64) -> Ev {
+        (
+            Kind::User,
+            role.cpu,
+            [role.tid, role.asid, code(name), round, 0],
+        )
+    }
+
+    /// One production NR 3 by `req` replacing `target`'s W: its begin, and its body ending in the
+    /// completion (`outcome`, returned address).
+    fn op(req: Role, target: Role, generation: u64, outcome: u64, returned: u64) -> (Ev, Vec<Ev>) {
+        let old = 0x6000 + target.asid * 0x1000;
+        let begin = (
+            Kind::VmOpBegin,
+            req.cpu,
+            [target.asid, W, 0x1000, generation, req.tid],
+        );
+        let inval = [target.asid, W, old, 0, generation + 50];
+        let body = vec![
+            (Kind::InvalBegin, req.cpu, inval),
+            (Kind::InvalDone, req.cpu, inval),
+            (Kind::VmDisplaced, req.cpu, [target.asid, W, old, 0, 0]),
+            (Kind::VmShootdown, req.cpu, [target.asid, W, 1, 0, 0]),
+            (Kind::VmSettled, req.cpu, [target.asid, W, old, 0, 0]),
+            (
+                Kind::VmOpEnd,
+                req.cpu,
+                [target.asid, W, generation, outcome, returned],
+            ),
+        ];
+        (begin, body)
+    }
+
+    fn cat(parts: Vec<Vec<Ev>>) -> Vec<Rec> {
+        seqd(parts.into_iter().flatten().collect())
+    }
+
+    #[test]
+    fn a_mutual_round_is_credited_when_both_production_operations_are_in_flight_together() {
+        let r = mutual_roles();
+        let (sb, sbody) = op(r.s, r.c, 100, 0, W);
+        let (cb, cbody) = op(r.c, r.s, 101, 0, W);
+        let recs = cat(vec![
+            vec![step(r.s, "S_MUT_NR3", 1), step(r.c, "C_MUT_NR3", 1), sb, cb],
+            sbody,
+            cbody,
+            vec![step(r.s, "S_MUT_OK", 1), step(r.c, "C_MUT_OK", 1)],
+        ]);
+        assert_eq!(
+            mutual_round(&recs, &r, 1),
+            Ok(MutualRound {
+                overlapped: true,
+                announced: true
+            })
+        );
+    }
+
+    /// The decisive control: both announcements are emitted, then the two operations run one
+    /// after the other. The delivered criterion (announcements before the first completion)
+    /// accepts it; the operation check does not.
+    #[test]
+    fn operations_serialized_after_both_announcements_are_not_overlap() {
+        let r = mutual_roles();
+        let (sb, sbody) = op(r.s, r.c, 100, 0, W);
+        let (cb, cbody) = op(r.c, r.s, 101, 0, W);
+        let recs = cat(vec![
+            vec![step(r.s, "S_MUT_NR3", 1), step(r.c, "C_MUT_NR3", 1), cb],
+            cbody,
+            vec![sb],
+            sbody,
+            vec![step(r.s, "S_MUT_OK", 1), step(r.c, "C_MUT_OK", 1)],
+        ]);
+        assert_eq!(
+            mutual_round(&recs, &r, 1),
+            Ok(MutualRound {
+                overlapped: false,
+                announced: true
+            })
+        );
+        let v = verify(&recs, &r, false);
+        assert_eq!(
+            (v.mutual_rounds, v.mutual_overlapped, v.mutual_announced),
+            (1, 0, 1)
+        );
+        assert!(!v.ok());
+    }
+
+    #[test]
+    fn a_failed_incomplete_or_substituted_operation_is_never_a_mutual_round() {
+        let r = mutual_roles();
+        let round = |s_body: Vec<Ev>| {
+            let (sb, _) = op(r.s, r.c, 100, 0, W);
+            let (cb, cbody) = op(r.c, r.s, 101, 0, W);
+            let recs = cat(vec![
+                vec![step(r.s, "S_MUT_NR3", 1), step(r.c, "C_MUT_NR3", 1), sb, cb],
+                s_body,
+                cbody,
+                vec![step(r.s, "S_MUT_OK", 1), step(r.c, "C_MUT_OK", 1)],
+            ]);
+            mutual_round(&recs, &r, 1)
+        };
+        let good = op(r.s, r.c, 100, 0, W).1;
+        let with_end = |end: Ev| {
+            let mut b = good.clone();
+            *b.last_mut().expect("end") = end;
+            b
+        };
+        // Returned an error (InvalidArgs), or another address.
+        assert_eq!(
+            round(op(r.s, r.c, 100, 2, 0).1),
+            Err("mut_operation_failed")
+        );
+        assert_eq!(
+            round(op(r.s, r.c, 100, 0, W + 0x1000).1),
+            Err("mut_operation_failed")
+        );
+        // Never completed; completed with another operation's generation; completed on the
+        // other CPU; completed twice.
+        assert_eq!(round(good[..5].to_vec()), Err("mut_operation_incomplete"));
+        assert_eq!(
+            round(with_end((Kind::VmOpEnd, 1, [6, W, 99, 0, W]))),
+            Err("mut_operation_incomplete")
+        );
+        assert_eq!(
+            round(with_end((Kind::VmOpEnd, 0, [6, W, 100, 0, W]))),
+            Err("mut_operation_incomplete")
+        );
+        let mut twice = good.clone();
+        twice.push(*good.last().expect("end"));
+        assert_eq!(round(twice), Err("mut_operation_duplicate_completion"));
+        // Its invalidation is not inside it, or its shootdown was not acknowledged.
+        let mut late = good.clone();
+        let end = late.pop().expect("end");
+        late.insert(0, end);
+        assert_eq!(round(late), Err("mut_invalidation_outside_operation"));
+        let mut unacked = good.clone();
+        unacked[3].2[2] = 0;
+        assert_eq!(round(unacked), Err("mut_shootdown_not_acknowledged"));
+    }
+
+    #[test]
+    fn an_observation_before_the_other_operation_completed_is_refused() {
+        let r = mutual_roles();
+        let (sb, sbody) = op(r.s, r.c, 100, 0, W);
+        let (cb, cbody) = op(r.c, r.s, 101, 0, W);
+        let recs = cat(vec![
+            vec![step(r.s, "S_MUT_NR3", 1), step(r.c, "C_MUT_NR3", 1), sb, cb],
+            sbody,
+            vec![step(r.s, "S_MUT_OK", 1)],
+            cbody,
+            vec![step(r.c, "C_MUT_OK", 1)],
+        ]);
+        assert_eq!(
+            mutual_round(&recs, &r, 1),
+            Err("mut_observed_before_operation_completed")
+        );
     }
 
     #[test]

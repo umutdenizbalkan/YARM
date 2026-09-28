@@ -453,6 +453,53 @@ pub fn window_of(tid: u64, elr: u64) -> u64 {
     }
 }
 
+/// A witnessed production VM mapping transaction, as its owner's entry recorded it.
+#[derive(Clone, Copy, Debug)]
+pub struct VmOp {
+    asid: u64,
+    va: u64,
+    generation: u64,
+}
+
+/// `run_vm_map_transaction` entered with its target resolved (observation only; for the
+/// witness's page only). The generation names this one operation in its completion.
+pub fn vm_op_begin(tid: u64, asid: Asid, addr: usize, len: usize) -> Option<VmOp> {
+    if !watches(addr as u64) {
+        return None;
+    }
+    let op = VmOp {
+        asid: u64::from(asid.0),
+        va: addr as u64,
+        generation: rec::next_generation(),
+    };
+    rec::push(
+        Kind::VmOpBegin,
+        this_cpu(),
+        [op.asid, op.va, len as u64, op.generation, tid],
+    );
+    Some(op)
+}
+
+/// That transaction is returning `result` — exactly what its caller receives. Taken on the
+/// CPU it returns on, so a completion elsewhere would not match its begin.
+pub fn vm_op_end(
+    op: Option<VmOp>,
+    result: &Result<(usize, usize), crate::kernel::syscall::SyscallError>,
+) {
+    let Some(op) = op else {
+        return;
+    };
+    let (outcome, returned) = match result {
+        Ok((addr, _)) => (0, *addr as u64),
+        Err(e) => (e.code() as u64, 0),
+    };
+    rec::push(
+        Kind::VmOpEnd,
+        this_cpu(),
+        [op.asid, op.va, op.generation, outcome, returned],
+    );
+}
+
 /// The vector entry's claim returned the reschedule SGI (observation only).
 pub fn note_arrival(cpu: CpuId, raw: u32, source: u64, origin: u64, elr: u64) {
     if !enabled() {
@@ -610,10 +657,11 @@ fn dump() {
         v.p2_el0
     ));
     lines.push(alloc::format!(
-        "SMP2_COUNTS tlb_rounds={} mutual_rounds={} mutual_overlapped={} settled_after_ack={}",
+        "SMP2_COUNTS tlb_rounds={} mutual_rounds={} mutual_overlapped={} mutual_announced={} settled_after_ack={}",
         v.tlb_rounds,
         v.mutual_rounds,
         v.mutual_overlapped,
+        v.mutual_announced,
         v.settled_after_ack
     ));
     lines.push(alloc::format!(
