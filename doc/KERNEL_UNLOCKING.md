@@ -23540,8 +23540,9 @@ seq), `Delivered` (the request drain after the accepted transaction: the same, p
 CPU pair), `IpiSent` (after the ICR write), `IpiObserved` (target's IPI-driven dispatch hook),
 `Resumed` (AP saved-frame resume after its authenticated snapshot: CPU, `{tid, asid}`),
 `Continued`/`Validated` (the resumed server's DebugLog markers, with the logging TID and CPU). A
-second record is counted as a duplicate, never an overwrite. When `Validated` is recorded the chain
-has settled and the record is printed SYNCHRONOUSLY, one line per step plus
+second record is counted as a duplicate, never an overwrite. When all seven steps are published
+(QEMU-SMP1-SEAL below; this package first sealed at `Validated`) the record is printed
+SYNCHRONOUSLY, one line per step plus
 `X86_SMP_REQUEST_TXN_SEAL`, which also reads the 0xF1 stub's own per-CPU arrival counters. Every
 recording site is gated by the request oracle selector; the drain's wake decision is untouched.
 
@@ -23569,3 +23570,46 @@ regrading them is not qualification.
   synchronous echoes; the printk ring race is unchanged.
 * Still named and unchanged: the ack-lease race, the RISC-V reply-timeout retirement checker, the
   x86_64 `TERMINAL_FAULT_ORACLE` core cell.
+
+# QEMU-SMP1-SEAL — the transaction record is sealed at completion, not at one named step
+
+Base: `e14c914ae9189aacfd8ca765ede660cd4643af7c` (QEMU-SMP1-ACCEPTANCE), tree
+`6efb0afecf09ce0b9b5bdb5605264f0118e957ae`. A witness-record correction only: no FP, scheduler,
+IPC, IPI/TLB or printk change. U9 stays CLOSED.
+
+**The defect.** `Validated` claimed the one-time seal and reported, but it is not the last step in
+time: the sender records `IpiSent` after its ICR write returns, and the target may have taken the
+IPI, resumed and validated before that. CPU 1 then sealed a six-step record for good and CPU 0's
+late `IpiSent` was never reported — a complete transaction graded as a failure. Reproduced on the
+base by the hosted case `a_late_sender_record_is_not_sealed_over` through the production
+`record`/`observe_user_marker` path ("sealed while IpiSent was unpublished"); no live fault was
+manufactured.
+
+**The completion protocol** (`src/kernel/boot/smp_request_txn.rs`):
+
+1. publish — claim the slot (a repeat counts a duplicate and does nothing else), store the facts,
+   store the sequence, then count the step with one read-modify-write on `PUBLISHED`. A claimed
+   slot with unfinished facts is not counted.
+2. attempt — after every successful publication: ready iff `PUBLISHED == 7`. The publication
+   whose increment completes the count reads it back afterwards (coherence on one atomic), so a
+   final report can never be missed however the last two publications interleave; the increments
+   form one release chain, so the ready reader sees every record whole.
+3. claim — only a ready attempt swaps `SEALED`; two final publications that both find the record
+   complete cannot both report, and a permanently missing step never consumes the latch.
+4. report — synchronously, from the winner's snapshot. The seal's `target_cpu` is the wake target
+   the recorded delivery names, not the reporting CPU (the sender reports when `IpiSent` is last).
+   Nothing waits for the other CPU and nothing is printed before completion.
+
+Records stay immutable after publication; invalid facts are reported as recorded and the unchanged
+grader rejects them (identity, causal order, hardware arrival, duplicates).
+
+**Evidence.** Hosted, through the production publish/attempt/claim path: ordinary order (one
+report, at the seventh publication); `IpiSent` after `Validated` (none, then one complete);
+a permanently missing step (none, latch unclaimed, duplicates do not complete it); both
+interleavings of two final publications (exactly one report; the completing one always reports);
+the same race on real threads, 400 rounds; the sender publishing last (seal names the recorded
+target 1 or 3); substituted and duplicated facts (reported as first recorded, duplicate counted, no
+second report). Mutations: removing readiness fails 8 cases including the late record; removing
+the once-only latch fails 3 including both competing-attempt cases; counting duplicates as
+publications fails 2; naming the last publisher's CPU as target fails 2. The report line format
+and the grader are unchanged.

@@ -158,6 +158,23 @@ fn the_generation_is_published_inside_as_patterned_window() {
 fn the_request_transaction_is_recorded_at_its_owners() {
     assert!(TXN.contains("crate::kernel::printk::printk_emit_sync(format_args!("));
     assert!(!code(TXN).contains("yarm_log!"));
+    // QEMU-SMP1-SEAL: every successful publication attempts the report, and only there; no named
+    // step reports on its own. Readiness precedes the one-time claim.
+    let production = code(TXN.split("mod tests {").next().unwrap_or(TXN));
+    assert_eq!(
+        production.matches("attempt_seal()").count(),
+        2,
+        "definition + one call"
+    );
+    let rec = code(fn_body(TXN, "pub(crate) fn record("));
+    assert!(
+        pos(&rec, "if !publish(step, facts)") < pos(&rec, "if let Some(report) = attempt_seal()")
+    );
+    let observe = code(fn_body(TXN, "pub(crate) fn observe_user_marker("));
+    assert!(!observe.contains("emit") && !observe.contains("attempt_seal"));
+    let attempt = code(fn_body(TXN, "fn attempt_seal()"));
+    assert!(pos(&attempt, "PUBLISHED.load(") < pos(&attempt, "SEALED.swap("));
+    assert!(attempt.contains("steps[Step::Delivered as usize].1[5]"));
     for (src, needle) in [
         (BOOT_MOD, "smp_request_txn::Step::Blocked,"),
         (BOOT_MOD, "smp_request_txn::Step::Delivered,"),
