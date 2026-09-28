@@ -23720,7 +23720,7 @@ and nothing else could wake it. The programs drive production owners only:
 | P1 ×4 | C NR6 → blocked S (CPU 1 parked), S NR7 → blocked C (CPU 0 parked); each resume context-checked across the block and the idle → dispatch → resume path |
 | P2 | C NR6 → H1 while S spins in register-checked window A on CPU 1 (SGI taken from EL0); mirror with window B on CPU 0 |
 | P3 ×4 | serial remote invalidation: the target primes W and the residency probe R, then spins resident in a checked window; the requester arms R, replaces W with NR 3 |
-| P4 ×4 | mutual: both replace each other's W at once |
+| P4 ×4 | mutual: both replace each other's W; graded on the two production VM operations themselves (QEMU-SMP2-ACCEPTANCE §1) |
 
 Checked context: x0–x15, x19–x30, SP, q0–q31, FPCR, FPSR, NZCV and TPIDR_EL0 against a per-task
 pattern (x0–x5 and x8 are lanes across an `svc`; x16/x17 are the window's own loop instrument; x18
@@ -23760,16 +23760,18 @@ credited, duplicate acknowledgement, concurrent requests from both CPUs, SGI pop
 suppressed/undelivered/uncompleted/wrong-token/merged, parked-wake routes and every substitution,
 step codes, sealing); `tests/qemu_smp2_scope.rs` (6 source guards).
 
-Negative controls (source mutation, fresh build, reverted before boot; `ctl/` logs kept):
+Negative controls as first run (source mutation, fresh build, reverted before boot; `ctl/` logs kept). They ran on the pre-freeze
+tree `f5019036`, not on the delivered candidate, and three rows were misclassified; QEMU-SMP2-ACCEPTANCE §2 re-ran the affected
+controls from the final candidate and corrects the rows marked *(corrected)*:
 
 | control | mutation | outcome |
 |---|---|---|
 | suppress transmission | `send_reschedule_sgi` records the send but skips the `GICD_SGIR` write | never seals: the last step is `C_P1_CALL`; S is never dispatched (CPU 1 has no other wake source) |
 | omit completion | the vector tail skips `GICC_EOIR` for INTID 1 | never seals: the AP's start-up kick stays active, CPU 1's running priority stays at the SGI's, C's wake can never be taken |
 | omit both invalidations of W | no `tlbi` for W in `unmap_page` nor in the following `map_page` | `S_FAIL_STALE_AFTER_INVALIDATION round=1`: the resident target still reads the old sentinel after its requester's NR 3 returned |
-| omit the break's invalidation only | no `tlbi` for W in `unmap_page` | TLB rounds pass. **Ineffective, and why:** the replacement's `map_page` broadcasts a second `tlbi` for the same VA before phase W, so the target's translation is gone either way; the break's own `tlbi` is the one break-before-make requires between the two writes, and QEMU does not model the TLB conflict it prevents. The responsible operation is controlled by the row above. |
-| withhold the acknowledgement | drop the `dsb ish` after the `tlbi` | passes. **Ineffective under QEMU, and why:** TCG performs a broadcast TLBI as a synchronised cross-vCPU flush completed before the issuing vCPU continues, so nothing observable depends on the barrier; architecturally the `dsb ish` is what makes the completion — the acknowledgement — hold. Controlled through the invalidation itself (above). |
-| substitute the acknowledgement | the completion record carries the next request's generation | every TLB round refused: "first completion for this mapping is not this request's generation"; the kernel verifier likewise |
+| omit the break's invalidation only | no `tlbi` for W in `unmap_page` | TLB rounds pass: QEMU did not distinguish it. The make's own `tlbi` still retires the old translation before phase W, and QEMU does not model the conflicting-TLB state break-before-make exists to prevent. *(corrected)* No other control covers this obligation; its ordering is pinned by source and disassembly checks (ACCEPTANCE §2), not by a boot. |
+| drop the completion barrier | drop the `dsb ish` after the `tlbi` | passes: QEMU did not distinguish it (TCG completes a broadcast TLBI as a synchronised cross-vCPU flush before the issuing vCPU continues). *(corrected)* Removing the TLBI (above) shows dependence on the INVALIDATION, not on this barrier; nothing live demonstrates the barrier. It is architecturally required and is pinned by the source guard and the disassembly check (ACCEPTANCE §2). |
+| substitute the completion record's generation | the `InvalDone` record carries the next request's generation | every TLB round refused: "first completion for this mapping is not this request's generation"; the kernel verifier likewise. *(corrected)* This tests the VERIFIER's identity matching. It is not a production stale-acknowledgement rejection: with broadcast TLBI there is no software acknowledgement object for production to reject. |
 | corrupt the returning context | flip x21 on every EL0 return from a trap that claimed the SGI | `S_FAIL_P1_CONTEXT round=1 aux=0x200000` — the check names bit 21 |
 
 Premature reclaim is not a separate control: settlement is phase S, after phase I's completed invalidation,
@@ -23786,3 +23788,139 @@ the delivery report.
 yields; placement on the AP is by explicit pin only (balanced placement never chooses it); the witness's TIDs
 (9200–9203) are static; `x16`/`x17` are the window instrument and not checked; the residency probe relies on
 QEMU flushing a vCPU's TLB on an ASID change; the dump shares the console with lock-free raw markers.
+
+# QEMU-SMP2-ACCEPTANCE — production-operation overlap, final-candidate controls, RISC-V NR 0 census
+
+Base: `f782227a` (QEMU-SMP2), tree `c3b01fa4`. Three objectives only; the delivered SGI and context
+implementation is unchanged. U9 stays CLOSED (production `with_cpu=0`, `with_broad=0`). No AP timer,
+GICv3, further CPUs, general logging project or RISC-V SMP work.
+
+## 1 — mutual rounds graded on the production VM operations
+
+**The defect, confirmed in the delivered source.** `S_MUT_NR3` / `C_MUT_NR3` are DebugLog steps each
+task issues BEFORE its NR 3 (`smp2_witness.S`, mutual loop), and both the kernel verifier
+(`max(S_MUT_NR3, C_MUT_NR3) < min(first InvalDone)`) and the grader counted a round overlapped when both
+announcements preceded the first invalidation completion. Two tasks that announce and then run their
+NR 3s strictly one after the other satisfy that, and the grader asked for only one such round.
+
+**Recording at the owner.** `run_vm_map_transaction` — the one production VM mapping transaction —
+records its own lifetime for the witness's page only (default-off, `aarch64-smp2-witness`):
+
+* `VmOpBegin` once the target address space is resolved and the guard-page check passed, before the
+  journal — no domain lock is held there: `(target asid, va, len, operation generation, caller tid)`
+  on the executing CPU;
+* `VmOpEnd` at EVERY exit after that point (the five rollback returns and the commit, through
+  `vm_txn_exit!`): `(asid, va, the begin's generation, outcome actually returned — 0 or the
+  `SyscallError` code — and the address returned)`, on the CPU it returns on.
+
+Nothing in the transaction reads the record, and the witness still drives the ordinary NR 3.
+
+**What a credited round needs** (`smp2_record::mutual_round`, re-derived independently by the grader):
+each task's operation is found by CPU, target asid, W and tid after its announcement; it has exactly
+one completion with its own generation, on its own CPU, before that CPU begins anything else,
+returning `Ok` with W — a failed, incomplete, duplicated, substituted or migrated completion is never a
+round; its own invalidation request and completion, its displaced page's acknowledged shootdown and
+its settlement lie INSIDE it; each task's observation of its replaced W follows the OTHER operation's
+completion; and both operations began before either completed. Every one of the four rounds must
+overlap. The delivered announcement criterion is still computed and reported as
+`mutual_announced` — never graded — so a control can show what it would have accepted.
+
+**Synchronization.** The only rendezvous is the programs' existing userspace mailbox wait before the
+announcements; it holds no kernel lock and nothing waits for another CPU inside the kernel. Measured
+before any freeze: 12 of 12 rounds overlapped in three boots without further help (for example S's
+operation seq 161..170 on CPU 1 and C's seq 162..174 on CPU 0).
+
+**Overlap is not contention.** The two operations' intervals overlap; inside them the page-table
+writes serialize on the page-table lock, as they must. No lock-contention measurement exists, and
+none is claimed: `mutual_overlapped` says that both production operations were in flight together
+and both completed, nothing about whether either waited.
+
+**The decisive control** (`serialize_ops`): S waits, after BOTH announcements, until C's NR 3 has
+returned before issuing its own. The old criterion accepts that execution (`mutual_announced=4`);
+the operation check rejects it (`mut_operations_serialized`, grader "did not overlap").
+Deterministically, `operations_serialized_after_both_announcements_are_not_overlap` builds exactly
+that record and checks both verdicts.
+
+## 2 — controls from the final candidate, and what they do and do not show
+
+Every affected control is re-run from the frozen candidate in its own `git worktree` (mutation
+applied there, fresh build, boot, grade; the candidate's tree is verified unchanged): SGI
+transmission suppressed; SGI completion omitted; both invalidations of W omitted; the completion
+record's generation substituted; the returning context corrupted; the serialized operations. The
+results, logs and artifact identities are in the delivery report.
+
+Classification, corrected:
+
+* Removing the TLBI shows dependence on the INVALIDATION. It does not show dependence on the
+  completion barrier: with the `dsb ish` removed QEMU still passes, because TCG completes a broadcast
+  TLBI synchronously. QEMU did not distinguish the barrier-removal control, and no other mutation
+  covers it.
+* Substituting the generation in the evidence record tests the verifier's identity matching. With
+  broadcast TLBI there is no software acknowledgement object, so it is not a production stale-ACK
+  rejection test.
+
+**The architectural obligations, pinned instead of booted.** Derived through the production owners:
+`replace_page_in_run` breaks first (`arch_unmap_page` → `page_table::unmap_page`: empty leaf,
+page-table lock released, then an unconditional `invalidate_page`) and makes only afterwards
+(`arch_map_page` → `page_table::map_page`: new leaf, then `invalidate_page`); every runtime
+invalidation is `dsb ishst; tlbi <op>is; dsb ish; isb` — the table write visible to walkers before
+the TLBI, the TLBI complete on every PE before anything that depends on it. Checked by
+
+* `tests/qemu_smp2_scope.rs::break_before_make_and_the_invalidation_barriers_are_in_order` — the
+  order through `replace_page_in_run`, `unmap_page` and `map_page`, the exact four-instruction block in
+  `invalidate_page`, `invalidate_asid` and `flush_tlb_local_full`, and that those are the only
+  broadcast invalidations (the other AArch64 TLBIs are the local `tlbi vmalle1` of an MMU bring-up);
+* `scripts/check-aarch64-tlbi-sequence.sh` on the BUILT image — every broadcast `tlbi` is exactly
+  `dsb ishst; tlbi; dsb ish; isb`, and `unmap_page` and `map_page` each contain one. It runs on every
+  witness boot's artifact and rejects the barrier-removal control's artifact.
+
+The invalidation mechanism is not changed to make QEMU expose a failure.
+
+## 3 — the RISC-V core census counts NR 0
+
+**What QEMU-SMP2 reported, corrected.** Its RISC-V core gate failed "serviced a syscall outside the
+retired set", and repeated runs at `dee93b13` and `f782227a` "reproduced" it. Those runs booted
+whatever `build-riscv64/yarm-riscv64.bin` held: in both checkouts a raw
+`riscv64-ipc-reply-timeout-oracle` kernel a server-dies runner had staged there (1005128 bytes, not
+the 988736 its `artifact-manifest.txt` records, and that manifest names `e14c914a`). They were not
+built from the commits they were reported against, and the "does not always fail" pattern was
+whether that stale image's oracle lane ran within the window.
+
+**The failure, reproduced from fresh artifacts.** A fresh default build of `f782227a` never yields:
+eight strict core boots, 30 s and 60 s, `nr=0` count 0, all pass. The users of Yield are init's
+reply-timeout oracle lanes, which exist only in a `riscv64-ipc-reply-timeout-oracle` kernel: with
+`yarm.riscv_ipc_reply_timeout_oracle=timeout-wins` the oracle server yields until the client has
+timed out, then issues its late NR 7 (rejected), and the client yields until it sees that verdict
+(`init/service.rs`). Fresh base artifacts plus a fresh feature kernel, booted by the strict core
+smoke with that selector, fail three boots out of three with the total exactly the NR 0 count over
+the sum.
+
+**The authorized route, from source.** NR 0 has been a default-on retired class since Stage 196G;
+U9-RESIDUAL1 §3 put it on the committed queue-advance disposition. `split_yield_settle` commits the
+yield transaction (`YIELD_SPLIT_COMMITTED cpu=C tid=T`, `QueueAdvanceCommitted`), and the RISC-V
+bridge prints exactly one `YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=0 cpu=C
+result=queue_advance_committed outgoing=T captured=1`; a refused yield returns `Complete(Err)`,
+which prints no NR 0 line on this port. The `class=Yield` retirement markers cannot be used to count
+it — the timer's yields emit them too.
+
+**The correction — a checker repair, no kernel change.** The census (`riscv64_split_census` in the
+core smoke, a function so it can be executed on fixtures) adds NR 0 to the sum, keeps the equality with
+the total, and pins NR 0: every line is the committed disposition with its continuation captured,
+paired one-to-one on its CPU with the commit of the same tid — no commit without its dispatch, no
+dispatch without its commit, no excess. `tests/riscv_split_census.rs` runs that function on fixture
+logs: legitimate NR 0 traffic (one yield, two, none) passes; an unexpected NR still fails; a dispatch
+without a commit, a commit without a dispatch, an excess dispatch, another disposition, an
+uncaptured continuation, another task's dispatch and another CPU's commit each fail.
+
+**The positive witness.** `scripts/qemu-riscv64-late-reply-yield-smoke.sh` builds fresh, identified
+artifacts (servers, initramfs, and the feature kernel exactly as the retirement runner builds it),
+boots the strict core smoke once with `timeout-wins`, and requires the smoke's own pass, the
+server's rejected late reply, at least one NR 0, and the census's accounting of exactly that count.
+A boot that does not take the lane reports `result=not_reached`.
+
+## Limits
+
+QEMU TCG does not distinguish the completion barrier or break-before-make's break invalidation; those
+obligations rest on the source and disassembly checks. Overlap is measured, lock contention is not.
+The positive RISC-V NR 0 witness needs the `riscv64-ipc-reply-timeout-oracle` kernel: a default core
+boot issues no Yield, so it is a regression smoke for the NR 0 term, never its witness.

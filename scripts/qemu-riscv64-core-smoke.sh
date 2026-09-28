@@ -736,6 +736,11 @@ if (( QEMU_SMP >= 2 )); then
   fi
 fi
 
+# QEMU-SMP2-ACCEPTANCE §3: the retired-set census is one function, run once below on this boot's
+# log, so `tests/riscv_split_census.rs` can execute exactly this code on fixture logs. It reads
+# `$1` and `TERMINAL_FAULT_ORACLE`, and adds to the global `failures`.
+riscv64_split_census() {
+LOGFILE=$1
 # Stage 196C + U9-QA §2 + 199G-B §2 + U9-SPAWN-IC1 §5: the RISC-V split dispatcher may service
 # DebugLog (NR 15), FutexWake (NR 10), FutexWait (NR 9), IpcRecvTimeout (NR 5) and IpcSend (NR 1)
 # ONLY. NR 15 and NR 10 are NON-SWITCHING and return early; NR 9 and NR 5 are the SWITCHING
@@ -853,10 +858,52 @@ if (( riscv_split_nr2 == 0 )); then
   echo "[fail] RISC-V serviced no IpcRecv through the split dispatcher (nr2=0)"
   failures=$((failures + 1))
 fi
-if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 + riscv_split_nr2 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 )); then
-  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5} nr2=${riscv_split_nr2} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29})"
+# QEMU-SMP2-ACCEPTANCE §3: NR 0 (`Yield`) joins the sum — a CHECKER correction, not a retirement.
+# Yield has been a default-on retired class on this port since Stage 196G, and U9-RESIDUAL1 §3 put
+# it on the committed queue-advance disposition; the sum above was simply never widened. It only
+# shows when a user task actually yields. A default core boot does not; init's reply-timeout oracle
+# lanes do, and they exist only in a `riscv64-ipc-reply-timeout-oracle` kernel (in timeout-wins the
+# oracle server yields until the client timed out, and the client yields until the server's late
+# NR 7 was rejected). `scripts/qemu-riscv64-late-reply-yield-smoke.sh` is the positive witness; a
+# boot without NR 0 is a regression smoke for this term, not a witness.
+#
+# The one authorized NR 0 route is `split_yield_settle`: the yield transaction commits
+# (`YIELD_SPLIT_COMMITTED cpu=C tid=T`), and this bridge then prints exactly one
+#   YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=0 cpu=C result=queue_advance_committed outgoing=T captured=1
+# (a refused yield returns `Complete(Err)`, which prints no NR 0 line on this port). So every NR 0
+# line must be that disposition, with the continuation captured, paired one-to-one on its CPU with
+# the commit of the same tid — no commit without its dispatch, no dispatch without its commit.
+riscv_split_nr0=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=0 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr0=${riscv_split_nr0:-0}
+riscv_yield_committed=$(rg -c "YIELD_SPLIT_COMMITTED cpu=" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_yield_committed=${riscv_yield_committed:-0}
+riscv_split_nr0_unpaired=$(rg -a -o -N "YIELD_SPLIT_COMMITTED cpu=[0-9]+ tid=[0-9]+|YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=0 .*" "$LOGFILE" 2>/dev/null | awk '
+  /^YIELD_SPLIT_COMMITTED/ {
+    split($2, c, "="); split($3, t, "=")
+    if (c[2] in pending) bad++
+    pending[c[2]] = t[2]; next
+  }
+  {
+    cpu = ""; out = ""
+    if (match($0, / cpu=[0-9]+/)) cpu = substr($0, RSTART + 5, RLENGTH - 5)
+    if (match($0, / outgoing=[0-9]+/)) out = substr($0, RSTART + 10, RLENGTH - 10)
+    if (!(cpu in pending) || pending[cpu] != out || $0 !~ / result=queue_advance_committed / || $0 !~ / captured=1/) bad++
+    delete pending[cpu]
+  }
+  END { for (k in pending) bad++; print bad + 0 }')
+riscv_split_nr0_unpaired=${riscv_split_nr0_unpaired:-0}
+if (( riscv_split_nr0 != riscv_yield_committed || riscv_split_nr0_unpaired != 0 )); then
+  echo "[fail] RISC-V Yield split dispatch is not reconciled with its committed yield transactions (nr0=${riscv_split_nr0} committed=${riscv_yield_committed} unpaired_or_wrong_disposition=${riscv_split_nr0_unpaired})"
   failures=$((failures + 1))
 fi
+echo "[info] RISC-V NR 0 (Yield) split dispatches: ${riscv_split_nr0}, each paired with its committed yield"
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9 + riscv_split_nr5 + riscv_split_nr2 + riscv_split_nr1 + riscv_split_nr23 + riscv_split_nr29 + riscv_split_nr0 )); then
+  echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5} nr2=${riscv_split_nr2} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29} nr0=${riscv_split_nr0})"
+  failures=$((failures + 1))
+fi
+}
+# END riscv64_split_census
+riscv64_split_census "$LOGFILE"
 
 # Stage 196A (POST-LOCK DRAIN FOUNDATION): when armed, the one-shot oracle must
 # prove genuine drain ordering end-to-end (publish in-lock → lock dropped →
