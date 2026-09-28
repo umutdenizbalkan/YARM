@@ -1661,7 +1661,11 @@ impl KernelState {
         // QEMU-SMP1 §3: the server address space's root MAP cap, which the witness grants to the
         // client for its NR 3. Read only by that build.
         #[cfg_attr(
-            not(all(feature = "x86-smp1-witness", target_arch = "x86_64")),
+            not(all(
+                feature = "x86-smp1-witness",
+                not(feature = "hosted-dev"),
+                target_arch = "x86_64"
+            )),
             allow(unused_assignments, unused_variables)
         )]
         let mut server_as_root: Option<crate::kernel::capabilities::CapId> = None;
@@ -1670,7 +1674,17 @@ impl KernelState {
             existing
         } else {
             let (asid, as_cap) = self.create_user_address_space()?;
-            server_as_root = Some(as_cap);
+            #[cfg_attr(
+                not(all(
+                    feature = "x86-smp1-witness",
+                    not(feature = "hosted-dev"),
+                    target_arch = "x86_64"
+                )),
+                allow(unused_assignments)
+            )]
+            {
+                server_as_root = Some(as_cap);
+            }
             // Code page: user + read + write (copy_to_user staging) + execute.
             let code_flags = PageFlags {
                 read: true,
@@ -1916,7 +1930,11 @@ impl KernelState {
                 }
                 // Client ASID + pages.
                 #[cfg_attr(
-                    not(all(feature = "x86-smp1-witness", target_arch = "x86_64")),
+                    not(all(
+                        feature = "x86-smp1-witness",
+                        not(feature = "hosted-dev"),
+                        target_arch = "x86_64"
+                    )),
                     allow(unused_variables)
                 )]
                 let (client_asid, client_as_root) = self.create_user_address_space()?;
@@ -2031,12 +2049,24 @@ impl KernelState {
                 // RECEIVE cap in BOTH the NR6 arg5 slot @26 and the recv-v2 arg0 slot @83). The request
                 // path keeps the park-after-SEND stub (SEND @10, reply RECEIVE cap @26 only).
                 // QEMU-SMP1 §3: with the witness armed, both tasks run the witness programs.
-                #[cfg(all(feature = "x86-smp1-witness", target_arch = "x86_64"))]
+                #[cfg(all(
+                    feature = "x86-smp1-witness",
+                    not(feature = "hosted-dev"),
+                    target_arch = "x86_64"
+                ))]
                 let smp1 = reply_flow && crate::arch::x86_64::smp1_witness::enabled();
-                #[cfg(not(all(feature = "x86-smp1-witness", target_arch = "x86_64")))]
+                #[cfg(not(all(
+                    feature = "x86-smp1-witness",
+                    not(feature = "hosted-dev"),
+                    target_arch = "x86_64"
+                )))]
                 let smp1 = false;
                 if smp1 {
-                    #[cfg(all(feature = "x86-smp1-witness", target_arch = "x86_64"))]
+                    #[cfg(all(
+                        feature = "x86-smp1-witness",
+                        not(feature = "hosted-dev"),
+                        target_arch = "x86_64"
+                    ))]
                     self.provision_smp1_witness(
                         source_tid,
                         (base_tid, asid, server_as_root, recv_cap_u32),

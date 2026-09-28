@@ -90,19 +90,17 @@ fn patched(start: *const u8, end: *const u8, patches: &[(*const u8, u32)]) -> al
 /// address space for both of its NR 3 sites (serial and mutual rounds).
 #[cfg(not(feature = "hosted-dev"))]
 pub(crate) fn server_image(recv_cap: u32, client_as_cap: u32) -> alloc::vec::Vec<u8> {
-    // SAFETY: address-of only.
-    unsafe {
-        patched(
-            &raw const yarm_smp1_server_start,
-            &raw const yarm_smp1_server_end,
-            &[
-                (&raw const yarm_smp1_server_recv_cap_1, recv_cap),
-                (&raw const yarm_smp1_server_recv_cap_2, recv_cap),
-                (&raw const yarm_smp1_server_client_as_cap, client_as_cap),
-                (&raw const yarm_smp1_server_client_as_cap_m, client_as_cap),
-            ],
-        )
-    }
+    // Address-of an extern static is safe; `patched` reads only the program bytes.
+    patched(
+        &raw const yarm_smp1_server_start,
+        &raw const yarm_smp1_server_end,
+        &[
+            (&raw const yarm_smp1_server_recv_cap_1, recv_cap),
+            (&raw const yarm_smp1_server_recv_cap_2, recv_cap),
+            (&raw const yarm_smp1_server_client_as_cap, client_as_cap),
+            (&raw const yarm_smp1_server_client_as_cap_m, client_as_cap),
+        ],
+    )
 }
 
 /// The client program: the request SEND cap, its reply RECEIVE cap (NR6 arg5 and both receive
@@ -113,21 +111,19 @@ pub(crate) fn client_image(
     reply_cap: u32,
     server_as_cap: u32,
 ) -> alloc::vec::Vec<u8> {
-    // SAFETY: address-of only.
-    unsafe {
-        patched(
-            &raw const yarm_smp1_client_start,
-            &raw const yarm_smp1_client_end,
-            &[
-                (&raw const yarm_smp1_client_send_cap, send_cap),
-                (&raw const yarm_smp1_client_reply_cap_r9, reply_cap),
-                (&raw const yarm_smp1_client_reply_cap_1, reply_cap),
-                (&raw const yarm_smp1_client_reply_cap_2, reply_cap),
-                (&raw const yarm_smp1_client_server_as_cap, server_as_cap),
-                (&raw const yarm_smp1_client_server_as_cap_m, server_as_cap),
-            ],
-        )
-    }
+    // Address-of an extern static is safe; `patched` reads only the program bytes.
+    patched(
+        &raw const yarm_smp1_client_start,
+        &raw const yarm_smp1_client_end,
+        &[
+            (&raw const yarm_smp1_client_send_cap, send_cap),
+            (&raw const yarm_smp1_client_reply_cap_r9, reply_cap),
+            (&raw const yarm_smp1_client_reply_cap_1, reply_cap),
+            (&raw const yarm_smp1_client_reply_cap_2, reply_cap),
+            (&raw const yarm_smp1_client_server_as_cap, server_as_cap),
+            (&raw const yarm_smp1_client_server_as_cap_m, server_as_cap),
+        ],
+    )
 }
 
 /// A valid FXSAVE image: `fcw`, FSW 0, FTW empty, `mxcsr`, ST0..7 zero, and XMM0..15 filled

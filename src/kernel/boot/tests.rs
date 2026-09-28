@@ -61581,14 +61581,37 @@ mod stage183_ap_idle_admit {
             "the BSP driver must only READ the AP-owned ack (no fake/self-ack)"
         );
         // The percpu BSP-side request helper writes only req_va/req_gen, never ack.
+        //
+        // QEMU-SMP1 §5 re-derivation: exactly one Rust store to `tlb_ack_gen` exists, in
+        // `service_own_tlb_request`, and the shootdown driver calls it ONLY for its own CPU
+        // (`me`) — a target answering its own mailbox from inside its own ACK wait, never an
+        // initiator acknowledging on another CPU's behalf. The request helper still writes no ACK.
         const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+        let request = PERCPU_SRC
+            .split("pub fn tlb_request_shootdown(")
+            .nth(1)
+            .expect("request helper");
+        let request = &request[..request.find("\n}\n").expect("end")];
         assert!(
-            PERCPU_SRC.contains("fn tlb_request_shootdown(")
-                && !PERCPU_SRC.contains("fn tlb_ack_shootdown(")
-                && !PERCPU_SRC
-                    .contains("write_volatile(core::ptr::addr_of_mut!((*base).tlb_ack_gen)"),
+            !request.contains("(*base).tlb_ack_gen")
+                && !PERCPU_SRC.contains("fn tlb_ack_shootdown("),
             "no BSP-side helper may write an AP's tlb_ack_gen"
         );
+        assert_eq!(
+            PERCPU_SRC
+                .matches("write_volatile(core::ptr::addr_of_mut!((*base).tlb_ack_gen)")
+                .count(),
+            1,
+            "the one Rust ACK store is the target's own in-wait answer"
+        );
+        let own = PERCPU_SRC
+            .split("pub fn service_own_tlb_request(")
+            .nth(1)
+            .expect("own");
+        assert!(own[..own.find("\n}\n").unwrap()].contains("(*base).tlb_ack_gen), generation)"));
+        assert_eq!(SMP_SRC.matches("service_own_tlb_request(").count(), 1);
+        assert!(SMP_SRC.contains("super::percpu::service_own_tlb_request(me)"));
+        assert!(SMP_SRC.contains("let me = super::descriptor_tables::current_cpu_id();"));
         // The coordinator's only ack writer is the target-modeling method, and it
         // exposes no initiator-side ack writer.
         assert!(
@@ -91637,7 +91660,7 @@ mod stage199a2d2c2b3_guards {
     #[test]
     fn mappings_created_before_block() {
         let create = EXEC
-            .find("let (asid, _cap) = self.create_user_address_space()?;")
+            .find("let (asid, as_cap) = self.create_user_address_space()?;")
             .unwrap();
         let map_payload = EXEC.find("VirtAddr(RECV_V2_SERVER_PAYLOAD_VA)").unwrap();
         let register = EXEC

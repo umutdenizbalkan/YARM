@@ -34,7 +34,6 @@
  *            mutual  +0x20/+0x28 ready (server/client)  +0x30/+0x38 nr3 returned
  *                    +0x40/+0x48 own W checked
  */
-    .intel_syntax noprefix
     .pushsection .text.yarm_smp1_witness, "ax", @progbits
 
     .set SMP1_PAYLOAD, 0x20030000
