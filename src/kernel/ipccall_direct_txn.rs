@@ -128,7 +128,10 @@ impl SharedKernel {
         // The remote-wake decision below is x86_64-freestanding only; everywhere else the
         // explicit CPU is deliberately unused. Discarded here rather than renamed, so the
         // parameter keeps its contract name at every call site.
-        #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+        #[cfg(not(all(
+            not(feature = "hosted-dev"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         let _ = executing_cpu;
         let mut lease = AckLease::new_available();
         // The published ack was claimed at trap-entry publication; re-establish the
@@ -195,6 +198,16 @@ impl SharedKernel {
                         success.wake_target_cpu,
                     );
                 }
+            }
+            // QEMU-SMP2 §2: the AArch64 half of the same decision. The committed target decides;
+            // the GICv2 owner refuses (writing nothing) a target that never published its
+            // interface, so a wake-only AP outside `yarm.ap_user_dispatch=1` is never signalled.
+            #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+            if success.wake_target_cpu != executing_cpu {
+                let _ = crate::arch::aarch64::smp::send_reschedule_sgi(
+                    executing_cpu,
+                    success.wake_target_cpu,
+                );
             }
         }
         result
@@ -1180,7 +1193,10 @@ impl SharedKernel {
         work: &DirectReplyPostWork,
     ) -> Result<IpcReplyDirectSuccess, IpcReplyDirectError> {
         // See the NR6 twin: the reverse decision is x86_64-freestanding only.
-        #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+        #[cfg(not(all(
+            not(feature = "hosted-dev"),
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         let _ = executing_cpu;
         let mut lease = AckLease::new_available();
         let _ = lease.claim(work.ack_seq);
@@ -1223,6 +1239,16 @@ impl SharedKernel {
                         success.wake_target_cpu,
                     );
                 }
+            }
+            // QEMU-SMP2 §2: the AArch64 half of the same decision. The committed target decides;
+            // the GICv2 owner refuses (writing nothing) a target that never published its
+            // interface, so a wake-only AP outside `yarm.ap_user_dispatch=1` is never signalled.
+            #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+            if success.wake_target_cpu != executing_cpu {
+                let _ = crate::arch::aarch64::smp::send_reschedule_sgi(
+                    executing_cpu,
+                    success.wake_target_cpu,
+                );
             }
         }
         result

@@ -26,8 +26,17 @@ exc_stack_aarch64:
 exc_stack_aarch64_end:
     .align 16
 secondary_boot_stacks:
-    .skip 0x00100000
+    .skip 0x00800000
 secondary_boot_stacks_end:
+
+    /* QEMU-SMP2: the per-AP stack stride `yarm_aarch64_secondary_entry` reads. A dispatching AP
+     * takes the whole shared trap path on this stack (the BSP takes it on its 16 MiB boot
+     * stack), so 16 KiB is not enough: 64 slots x 128 KiB = the 8 MiB above. */
+    .section .rodata.yarm_ap_stack,"a",@progbits
+    .balign 8
+    .global yarm_aarch64_ap_stack_stride
+yarm_aarch64_ap_stack_stride:
+    .quad 0x20000
 
     .section .text.boot,"ax",@progbits
     .weak _start
@@ -158,6 +167,12 @@ exc_stack_aarch64_end:
 secondary_boot_stacks:
     .skip 0x00100000
 secondary_boot_stacks_end:
+
+    .section .rodata.yarm_ap_stack,"a",@progbits
+    .balign 8
+    .global yarm_aarch64_ap_stack_stride
+yarm_aarch64_ap_stack_stride:
+    .quad 0x4000
 
     .section .text.boot,"ax",@progbits
     .global _start
@@ -4822,11 +4837,17 @@ global_asm!(
     .global yarm_aarch64_secondary_entry
     .type yarm_aarch64_secondary_entry,%function
 yarm_aarch64_secondary_entry:
+    /* QEMU-SMP2: FP/SIMD enabled before any compiled code runs, as the BSP's entry does; the
+     * vector prologue saves q0..q31 on every exception. */
+    mov x1, #(3 << 20)
+    msr CPACR_EL1, x1
+    isb
     mrs x0, MPIDR_EL1
     and x0, x0, #0xff
     adrp x1, secondary_boot_stacks_end
     add x1, x1, :lo12:secondary_boot_stacks_end
-    mov x2, #0x4000
+    adrp x2, yarm_aarch64_ap_stack_stride
+    ldr x2, [x2, :lo12:yarm_aarch64_ap_stack_stride]
     mul x3, x0, x2
     sub sp, x1, x3
     bl yarm_aarch64_secondary_cpu_boot
@@ -7312,6 +7333,20 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     // was taken from (the vector kind and, for EL1, whether this CPU was parked at the
     // authenticated idle boundary) and drains the PL011 so the level source drops BEFORE the
     // production route delivers and BEFORE the tail completes. It never claims or completes.
+    // QEMU-SMP2 §2: count a claimed reschedule SGI by where it was taken. Observation only —
+    // the claim above and the one completion below are unchanged, and the bridge settles it.
+    if let Some(ack) = claimed
+        && ack.intid() == crate::arch::gicv2_sgi::RESCHEDULE_SGI_INTID
+    {
+        let origin = if (9..=16).contains(&kind) {
+            crate::arch::aarch64::smp::ArrivalOrigin::User
+        } else if crate::kernel::idle_boundary::is_parked(trap_cpu.0 as usize) {
+            crate::arch::aarch64::smp::ArrivalOrigin::IdleBoundary
+        } else {
+            crate::arch::aarch64::smp::ArrivalOrigin::Kernel
+        };
+        crate::arch::aarch64::smp::note_sgi_arrival(trap_cpu, ack.raw(), origin, frame.elr_el1);
+    }
     #[cfg(feature = "aarch64-pl011-irq-witness")]
     if let Some(intid) = external_irq_line {
         crate::arch::aarch64::pl011_irq_witness::note_claim_and_drain(
@@ -7458,6 +7493,11 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         crate::arch::aarch64::irq::complete_interrupt(ack);
         #[cfg(feature = "aarch64-pl011-irq-witness")]
         crate::arch::aarch64::pl011_irq_witness::note_completion_written(ack);
+        // QEMU-SMP2 §5: the reschedule SGI's completion, recorded after the one EOIR write.
+        #[cfg(feature = "aarch64-smp2-witness")]
+        if ack.intid() == crate::arch::gicv2_sgi::RESCHEDULE_SGI_INTID {
+            crate::kernel::boot::smp2_record::sgi_completed(trap_cpu, ack.raw());
+        }
     }
     // QEMU-CONTEXT1 §3: the witness's interference — the protected interval ends at the vector
     // tail, so user-visible FP/SIMD and control state is overwritten here, after every kernel use.
@@ -8540,6 +8580,9 @@ pub fn enter_dispatched_user_task_if_available(
                 context.arg5 as u64
             );
         }
+        // QEMU-SMP2 §2: the boot `&mut KernelState` window ends with this return to EL0; an AP
+        // admitted under `yarm.ap_user_dispatch=1` acquires nothing before it.
+        crate::arch::aarch64::smp::note_bsp_boot_borrow_ended();
         unsafe {
             unsafe extern "C" {
                 fn yarm_aarch64_enter_user_mode_eret(
@@ -8768,6 +8811,11 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
         let vector_base = (&yarm_aarch64_vector_table_el1 as *const u8) as u64;
         core::arch::asm!("msr VBAR_EL1, {0}", in(reg) vector_base, options(nomem, preserves_flags));
         core::arch::asm!("isb", options(nomem, preserves_flags));
+    }
+    // QEMU-SMP2 §2: under the default-off knob the AP becomes a pinned dispatcher; otherwise the
+    // wake-only path below is unchanged.
+    if crate::arch::aarch64::smp::requested() {
+        crate::arch::aarch64::smp::ap_dispatch_main(cpu);
     }
 
     let kernel = loop {
@@ -9192,6 +9240,28 @@ const fn align_up_u64(value: u64, align: u64) -> Option<u64> {
     }
 }
 
+/// The bootstrap translation regime: `MAIR_EL1`, `TCR_EL1` and the static root `setup_bootstrap_mmu`
+/// builds. QEMU-SMP2: an AP that dispatches brings its own MMU up on the SAME regime (the root is
+/// a static the BSP never frees), so both CPUs start from one definition.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub(crate) fn bootstrap_mmu_registers() -> (u64, u64, u64) {
+    // AttrIdx0 = normal WB/WA cacheable (0xff).
+    // AttrIdx1 = normal WT cacheable (0xbb).
+    // AttrIdx2 = normal non-cacheable (0x44).
+    // AttrIdx3 = device nGnRE (0x04).
+    let mair: u64 = 0xff | (0xbb << 8) | (0x44 << 16) | (0x04 << 24);
+    let tcr: u64 = 25u64
+        | (1 << 8)
+        | (1 << 10)
+        | (0b11 << 12)
+        | (25u64 << 16)
+        | (1u64 << 23)
+        | (0b10 << 30)
+        | (0b010 << 32);
+    let root = core::ptr::addr_of!(BOOT_L1_TABLE) as u64;
+    (mair, tcr, root)
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn setup_bootstrap_mmu() {
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB M0");
@@ -9245,19 +9315,7 @@ fn setup_bootstrap_mmu() {
             device_block(AARCH64_UART_MMIO_BASE),
         );
 
-        // AttrIdx0 = normal WB/WA cacheable (0xff).
-        // AttrIdx1 = normal WT cacheable (0xbb).
-        // AttrIdx2 = normal non-cacheable (0x44).
-        // AttrIdx3 = device nGnRE (0x04).
-        let mair: u64 = 0xff | (0xbb << 8) | (0x44 << 16) | (0x04 << 24);
-        let tcr: u64 = 25u64
-            | (1 << 8)
-            | (1 << 10)
-            | (0b11 << 12)
-            | (25u64 << 16)
-            | (1u64 << 23)
-            | (0b10 << 30)
-            | (0b010 << 32);
+        let (mair, tcr, _) = bootstrap_mmu_registers();
 
         core::arch::asm!("msr MAIR_EL1, {0}", in(reg) mair, options(nostack, preserves_flags));
         core::arch::asm!("msr TCR_EL1, {0}", in(reg) tcr, options(nostack, preserves_flags));

@@ -20,6 +20,10 @@ pub mod device_window_rule;
 pub mod external_irq_claim;
 #[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub(crate) mod fdt;
+/// QEMU-SMP2 — the GICv2 SGI decisions (identity lookup, `GICD_SGIR` encoding, token source),
+/// arch-neutral so the hosted suite executes what the AArch64 port writes to the controller.
+#[cfg(any(test, target_arch = "aarch64"))]
+pub mod gicv2_sgi;
 pub mod hal;
 pub mod hal_adapters;
 pub mod irq_description;

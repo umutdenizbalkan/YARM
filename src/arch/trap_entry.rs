@@ -955,6 +955,13 @@ pub fn handle_trap_entry_shared(
     // recovery happened for an interrupt that recovered nothing.
     let mut irq_handled = false;
     let mut irq_result: Option<Result<(), TrapHandleError>> = None;
+    // QEMU-SMP2 §2 — a reschedule SGI taken at the authenticated idle boundary. It owes the SAME
+    // idle queue advance the timer's queued-work settlement owes, and is discharged by the same
+    // drain below; only the trigger — and so the marker family the drain emits — differs.
+    #[cfg(target_arch = "aarch64")]
+    let mut sgi_idle_queue_advance = false;
+    #[cfg(not(target_arch = "aarch64"))]
+    let sgi_idle_queue_advance = false;
     // U9-IRQ-FINAL §3 — the Unknown route's own pair. Hosted now settles pre-lock instead of
     // reaching the broad arm for its `Ok(())`; production still diverges. It is not the IRQ
     // route's pair, because an unknown trap delivered nothing and completed nothing.
@@ -988,7 +995,32 @@ pub fn handle_trap_entry_shared(
     // tail; the correctly scoped seam is inert exactly where the architecture owns completion.
     if !irq_handled {
         let decoded = decode_trap_context(context);
-        if let TrapEvent::ExternalInterrupt(irq) = decoded {
+        // QEMU-SMP2 §2 — the reschedule SGI. The vector entry claimed it and the vector tail
+        // completes that same token; there is no device and no delivery policy behind it, so it
+        // is settled here and never reaches the device route. What it asks for is a dispatch: at
+        // the authenticated idle boundary with `current` clear, the idle queue-advance drain.
+        // Anywhere else the CPU simply returns to what it interrupted — the running task keeps
+        // running and the committed enqueue is picked up at its next scheduling point.
+        #[cfg(target_arch = "aarch64")]
+        if let TrapEvent::ExternalInterrupt(irq) = decoded
+            && irq == crate::arch::gicv2_sgi::RESCHEDULE_SGI_INTID
+        {
+            irq_handled = true;
+            irq_result = Some(Ok(()));
+            if idle_boundary_authenticated {
+                sgi_idle_queue_advance = true;
+                crate::yarm_log!(
+                    "SGI_RESCHEDULE_SETTLED cpu={} settlement=idle_advance_owed",
+                    cpu.0
+                );
+            } else {
+                crate::yarm_log!(
+                    "SGI_RESCHEDULE_SETTLED cpu={} settlement=return_to_interrupted",
+                    cpu.0
+                );
+            }
+        }
+        if !irq_handled && let TrapEvent::ExternalInterrupt(irq) = decoded {
             // The dispatch-and-acknowledge body is ONE owner, shared with the RISC-V bridge:
             // `Some` means this route settled the trap, `None` that the broad arm still owns the
             // interrupt and nothing was completed.
@@ -1254,7 +1286,11 @@ pub fn handle_trap_entry_shared(
     // no authentication. Both cells above are therefore written and never read on that build.
     // Naming them here keeps that a deliberate no-op rather than a warning.
     #[cfg(target_arch = "riscv64")]
-    let _ = (idle_boundary_authenticated, timer_idle_queue_advance);
+    let _ = (
+        idle_boundary_authenticated,
+        timer_idle_queue_advance,
+        sgi_idle_queue_advance,
+    );
     // Stage L4A: architecture-neutral recv-timeout split-read staging for trap
     // paths that enter through SharedKernel-owned dispatch.
     //
@@ -3251,31 +3287,54 @@ pub fn handle_trap_entry_shared(
     // flight; `apply_user_context` reinstalls its saved continuation verbatim, and the only writes
     // past it are the port's existing parked-completion consumers, which are identity-exact and
     // absent for a task that never blocked.
+    // QEMU-SMP2 §2 — the reschedule SGI's idle advance is discharged HERE, by this same drain:
+    // the same authentication, re-verify, selection, resume and debt. The two triggers are
+    // exclusive (one trap claims one interrupt), and `idle_advance_log!` gives each its own marker
+    // family, so a timer-driven advance still reads exactly as it did and an SGI-driven one never
+    // borrows the timer's name.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let sgi_trigger = sgi_idle_queue_advance && !timer_idle_queue_advance;
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let timer_idle_queue_advance = timer_idle_queue_advance || sgi_idle_queue_advance;
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    macro_rules! idle_advance_log {
+        ($timer:literal, $sgi:literal $(, $arg:expr)* $(,)?) => {
+            if sgi_trigger {
+                crate::yarm_log!($sgi $(, $arg)*)
+            } else {
+                crate::yarm_log!($timer $(, $arg)*)
+            }
+        };
+    }
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if timer_idle_queue_advance {
         if !idle_boundary_authenticated {
             // NOT the idle boundary: some other kernel window with `current` empty. The tick is
             // taken and nothing else is owed.
-            crate::yarm_log!(
+            idle_advance_log!(
                 "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=kernel_not_parked settlement=return_to_kernel",
+                "SGI_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=kernel_not_parked settlement=return_to_kernel",
                 cpu.0
             );
         } else {
-            crate::yarm_log!(
+            idle_advance_log!(
                 "TIMER_IDLE_ADVANCE_DRAIN_BEGIN cpu={} authenticated=1",
+                "SGI_IDLE_ADVANCE_DRAIN_BEGIN cpu={} authenticated=1",
                 cpu.0
             );
             let reverify_ok = shared.yield_reverify_ready(cpu);
-            crate::yarm_log!(
+            idle_advance_log!(
                 "TIMER_IDLE_ADVANCE_LOCK_DROPPED_OK cpu={} current_clear={}",
+                "SGI_IDLE_ADVANCE_LOCK_DROPPED_OK cpu={} current_clear={}",
                 cpu.0,
                 u8::from(reverify_ok)
             );
             if !reverify_ok {
                 // Something installed a current on this CPU inside this trap. Nothing is owed and
                 // nothing was mutated here; the established tail resumes whoever that is.
-                crate::yarm_log!(
+                idle_advance_log!(
                     "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
+                    "SGI_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
                     cpu.0
                 );
             } else {
@@ -3291,17 +3350,23 @@ pub fn handle_trap_entry_shared(
                 match acquired.token() {
                     Some(token) => {
                         let inc = token.tid();
-                        crate::yarm_log!(
+                        idle_advance_log!(
                             "TIMER_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
+                            "SGI_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
                             cpu.0,
                             inc
                         );
-                        crate::yarm_log!(
+                        idle_advance_log!(
                             "TIMER_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
+                            "SGI_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
                             cpu.0,
                             inc
                         );
-                        crate::yarm_log!("TIMER_IDLE_ADVANCE_RUNNING_OK incoming={}", inc);
+                        idle_advance_log!(
+                            "TIMER_IDLE_ADVANCE_RUNNING_OK incoming={}",
+                            "SGI_IDLE_ADVANCE_RUNNING_OK incoming={}",
+                            inc
+                        );
                         // A marked incoming task cannot be reported resumed without a real frame,
                         // so an absent frame takes the same refusal path as an identity refusal.
                         #[cfg(target_arch = "x86_64")]
@@ -3356,14 +3421,20 @@ pub fn handle_trap_entry_shared(
                         // hardware frame and the privilege transition, and it is the tail that
                         // takes this.
                         crate::kernel::idle_boundary::commit_user_return(cpu_idx);
-                        crate::yarm_log!("TIMER_IDLE_ADVANCE_FRAME_OK incoming={}", inc);
-                        crate::yarm_log!(
+                        idle_advance_log!(
+                            "TIMER_IDLE_ADVANCE_FRAME_OK incoming={}",
+                            "SGI_IDLE_ADVANCE_FRAME_OK incoming={}",
+                            inc
+                        );
+                        idle_advance_log!(
                             "TIMER_IDLE_ADVANCE_USER_RETURN_ARMED cpu={} incoming={}",
+                            "SGI_IDLE_ADVANCE_USER_RETURN_ARMED cpu={} incoming={}",
                             cpu.0,
                             inc
                         );
-                        crate::yarm_log!(
+                        idle_advance_log!(
                             "TIMER_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
+                            "SGI_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
                             cpu.0,
                             inc
                         );
@@ -3377,8 +3448,9 @@ pub fn handle_trap_entry_shared(
                         // dequeue was already undone exactly. The two authority refusals mutated
                         // nothing at all. No debt is committed, so the tail returns to the halt
                         // loop it interrupted, which re-parks and waits for the next tick.
-                        crate::yarm_log!(
+                        idle_advance_log!(
                             "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                            "SGI_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
                             cpu.0,
                             acquired.marker()
                         );

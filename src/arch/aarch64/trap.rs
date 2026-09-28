@@ -228,6 +228,20 @@ pub(crate) fn enter_post_lock_idle_after_exit(cpu: CpuId, exiting_tid: u64) -> !
     idle_no_eret_loop();
 }
 
+/// QEMU-SMP2 §2 — an admitted AP's first idle entry.
+///
+/// Not a second idle policy: the identical `idle_no_eret_loop()` primitive, so the AP's first
+/// park installs its own stack anchor and every later trap at its boundary is authenticated the
+/// same way the BSP's are. The AP holds no task and no lock here. Never returns.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn enter_ap_idle(cpu: CpuId) -> ! {
+    crate::yarm_log!(
+        "AARCH64_SMP2_AP_IDLE_ENTERED cpu={} primitive=idle_no_eret_loop result=ok",
+        cpu.0
+    );
+    idle_no_eret_loop();
+}
+
 /// Stage 199D (AARCH64 BLOCKER 3) — the idle outcome of the post-lock direct dispatch drain.
 ///
 /// Not a third idle policy: it delegates to the identical `idle_no_eret_loop()` primitive the

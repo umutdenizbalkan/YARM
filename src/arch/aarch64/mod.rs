@@ -24,6 +24,10 @@ pub mod page_table;
 ))]
 pub mod pl011_irq_witness;
 pub mod platform_layout;
+/// QEMU-SMP2 — AP interrupt/dispatch wiring on the existing GICv2 (default off:
+/// `yarm.ap_user_dispatch=1`).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub mod smp;
 pub mod syscall_abi;
 pub mod trap;
 pub mod vm_layout;

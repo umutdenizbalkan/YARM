@@ -3426,6 +3426,19 @@ impl SharedKernel {
         target_arch = "aarch64",
         target_arch = "riscv64"
     ))]
+    /// QEMU-SMP2 — admit the wake-only AP `cpu` to dispatch its explicitly placed tasks, in ONE
+    /// rank-1 scheduler acquisition (`SmpScheduler::admit_pinned_dispatch`). Called by the AP
+    /// itself once its translation regime, exception state and interrupt interface are up.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn admit_ap_pinned_dispatch_split(
+        &self,
+        cpu: CpuId,
+    ) -> Result<(), crate::kernel::scheduler::SchedulerError> {
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_mut(&mut sched.scheduler).admit_pinned_dispatch(cpu)
+        })
+    }
+
     pub(crate) fn yield_reverify_ready(&self, cpu: CpuId) -> bool {
         self.with_scheduler_split_mut(|sched| {
             // `cpu` is the trap CPU == the authoritative dispatch CPU under the

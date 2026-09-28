@@ -752,6 +752,11 @@ pub struct SmpScheduler {
     // 183.6+ clears the bit per CPU when its dispatch loop is wired. NOT a
     // fallback knob: no boot option touches it.
     wake_only: u64,
+    // QEMU-SMP2: CPUs admitted by `admit_pinned_dispatch`. They dispatch, and they accept the
+    // explicit (home-CPU) placements the enqueue planner makes, but `enqueue_balanced` never
+    // chooses them: nothing on such a CPU sends a remote wake except the owners that do, and it
+    // arms no timer, so an unpinned task placed there could strand.
+    balance_excluded: u64,
 }
 
 impl Default for SmpScheduler {
@@ -761,6 +766,7 @@ impl Default for SmpScheduler {
             topology: CpuTopology::from_present_bitmap(topology::default_present_cpu_bitmap()),
             next_balance_cpu: 0,
             wake_only: 0,
+            balance_excluded: 0,
         }
     }
 }
@@ -829,13 +835,49 @@ impl SmpScheduler {
         Ok(idle.tid)
     }
 
+    /// QEMU-SMP2 — admit a wake-only AP to dispatch the tasks explicitly placed on it.
+    ///
+    /// ONE mutation of the scheduler, so no observer sees a partial admission: the CPU leaves
+    /// the wake-only set (explicit enqueues are accepted and `dispatching` counts it), its
+    /// scheduler-owned idle placeholder (tid 0, installed by `install_ap_idle_current`) is
+    /// cleared so its idle boundary reads `current == None` exactly as the BSP's does, and it
+    /// joins `balance_excluded`, so balanced placement still never chooses it.
+    ///
+    /// Refused — changing nothing — unless the CPU is online, wake-only, running nothing but the
+    /// placeholder and holding no queued work: admission is a transition out of the wake-only
+    /// state, never a way to adopt a CPU in some other one.
+    pub fn admit_pinned_dispatch(&mut self, cpu: CpuId) -> Result<(), SchedulerError> {
+        let idx = self.check_online_cpu(cpu)?;
+        let bit = 1u64 << idx;
+        if self.wake_only & bit == 0 {
+            return Err(SchedulerError::CpuOffline);
+        }
+        match self.schedulers[idx].current_tid() {
+            None | Some(ThreadId(0)) => {}
+            Some(_) => return Err(SchedulerError::AlreadyQueued),
+        }
+        if self.schedulers[idx].runnable_count() != 0 {
+            return Err(SchedulerError::AlreadyQueued);
+        }
+        self.schedulers[idx].current = None;
+        self.wake_only &= !bit;
+        self.balance_excluded |= bit;
+        Ok(())
+    }
+
+    /// QEMU-SMP2: CPUs that dispatch only explicitly placed tasks.
+    pub fn balance_excluded_bitmap(&self) -> u64 {
+        self.balance_excluded
+    }
+
     fn least_loaded_online_cpu(&self, start: usize) -> Result<CpuId, SchedulerError> {
         let mut best: Option<(usize, CpuId)> = None;
         for offset in 0..MAX_CPUS {
             let idx = (start + offset) % MAX_CPUS;
             // Stage 183.5: wake-only CPUs are online but accept no task placement
             // (no dispatcher runs on them yet) — never balance onto them.
-            if self.wake_only & (1u64 << idx) != 0 {
+            // QEMU-SMP2: nor onto a CPU admitted for pinned dispatch only.
+            if (self.wake_only | self.balance_excluded) & (1u64 << idx) != 0 {
                 continue;
             }
             if self.topology.cpu_online(idx as u8) {
@@ -1591,6 +1633,98 @@ mod tests {
             "only the BSP dispatches user tasks"
         );
         assert_eq!(dispatching & 1, 1, "the sole dispatcher is the BSP (cpu 0)");
+    }
+
+    /// QEMU-SMP2: the wake-only AP exactly as `start_secondary_cpus` leaves it — marked
+    /// wake-only before bring-up, then given the tid-0 idle placeholder.
+    fn wake_only_ap() -> SmpScheduler {
+        let mut sched = SmpScheduler::default();
+        sched.set_present_cpu_bitmap(0b11);
+        sched.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
+        sched.bring_up_cpu(CpuId(1)).expect("cpu1 online");
+        sched
+            .install_ap_idle_current(CpuId(1))
+            .expect("idle current");
+        sched
+    }
+
+    #[test]
+    fn smp2_admission_is_one_transition_out_of_wake_only() {
+        let mut sched = wake_only_ap();
+        assert_eq!(
+            sched.enqueue_on(CpuId(1), ThreadId(7)),
+            Err(SchedulerError::WakeOnly),
+            "before admission an explicit placement is refused"
+        );
+        sched.admit_pinned_dispatch(CpuId(1)).expect("admitted");
+        assert!(!sched.cpu_wake_only(CpuId(1)));
+        assert_eq!(
+            sched.current_tid_on(CpuId(1)),
+            None,
+            "the idle placeholder is gone, so the idle boundary reads current == None"
+        );
+        assert_eq!(sched.balance_excluded_bitmap(), 0b10);
+        assert_eq!(
+            (sched.online_cpu_bitmap() & !sched.wake_only_bitmap()).count_ones(),
+            2,
+            "two CPUs dispatch"
+        );
+        sched
+            .enqueue_on(CpuId(1), ThreadId(7))
+            .expect("pinned placement accepted");
+        assert_eq!(sched.runnable_count_on(CpuId(1)), 1);
+    }
+
+    #[test]
+    fn smp2_balanced_placement_never_chooses_a_pinned_only_cpu() {
+        let mut sched = wake_only_ap();
+        sched.admit_pinned_dispatch(CpuId(1)).expect("admitted");
+        // Load the BSP so a least-loaded rule WOULD pick CPU 1 if it were eligible.
+        for t in 100..110 {
+            sched.enqueue_on(CpuId(0), ThreadId(t)).expect("bsp");
+        }
+        for t in 200..210 {
+            assert_eq!(
+                sched.enqueue_balanced(ThreadId(t), TaskPriority::Normal),
+                Ok(CpuId(0))
+            );
+        }
+        assert_eq!(sched.runnable_count_on(CpuId(1)), 0);
+    }
+
+    #[test]
+    fn smp2_admission_refuses_every_other_state_and_changes_nothing() {
+        // Not wake-only (the BSP).
+        let mut sched = wake_only_ap();
+        assert_eq!(
+            sched.admit_pinned_dispatch(CpuId(0)),
+            Err(SchedulerError::CpuOffline)
+        );
+        // Offline.
+        let mut offline = SmpScheduler::default();
+        assert!(offline.admit_pinned_dispatch(CpuId(1)).is_err());
+        // Already admitted: no longer wake-only.
+        sched.admit_pinned_dispatch(CpuId(1)).expect("first");
+        assert_eq!(
+            sched.admit_pinned_dispatch(CpuId(1)),
+            Err(SchedulerError::CpuOffline)
+        );
+        // A real task current on the AP.
+        let mut busy = SmpScheduler::default();
+        busy.set_present_cpu_bitmap(0b11);
+        busy.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
+        busy.bring_up_cpu(CpuId(1)).expect("online");
+        busy.schedulers[1].current = Some(ScheduledTask {
+            tid: ThreadId(42),
+            priority: TaskPriority::Normal,
+        });
+        assert_eq!(
+            busy.admit_pinned_dispatch(CpuId(1)),
+            Err(SchedulerError::AlreadyQueued)
+        );
+        assert!(busy.cpu_wake_only(CpuId(1)), "refusal changed nothing");
+        assert_eq!(busy.balance_excluded_bitmap(), 0);
+        assert_eq!(busy.current_tid_on(CpuId(1)), Some(ThreadId(42)));
     }
 
     #[test]

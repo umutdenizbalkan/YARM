@@ -154,6 +154,17 @@ pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
                 // bound its route, and before the PE-level unmask below, which stays last.
                 #[cfg(feature = "aarch64-pl011-irq-witness")]
                 let _ = crate::arch::aarch64::pl011_irq_witness::enable_source_before_unmask();
+                // QEMU-SMP2 §2: under the default-off knob the BSP's own banked SGI state and
+                // interface bit, published before the unmask for the same reason the PL011 is.
+                if crate::arch::aarch64::smp::requested()
+                    && let Err(reason) = crate::arch::aarch64::smp::bring_up_sgi_on_this_cpu(cpu)
+                {
+                    crate::yarm_log!(
+                        "AARCH64_SMP2_SGI_READY cpu={} result=fail reason={}",
+                        cpu.0,
+                        reason
+                    );
+                }
                 // Everything the first IRQ will need is confirmed present. Only now.
                 crate::arch::aarch64::irq::enable_interrupts_for_boot();
                 crate::yarm_log!(
