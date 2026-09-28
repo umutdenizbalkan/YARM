@@ -111970,35 +111970,56 @@ mod stage199d_aarch64_readiness_audit {
         // unused and is discarded there. That is the same conditional, not a new architecture
         // branch, and this guard pins it as such: four `target_arch` occurrences forming two
         // matched pairs, with the negated arms doing nothing but the discard.
+        //
+        // QEMU-SMP2 §2 — the AArch64 half of the SAME remote-wake decision joined them: each drain
+        // now has an x86_64 gate (the IPI) and an AArch64 gate (the reschedule SGI), and the one
+        // negation covers both ports. Still no branch in the transaction itself — only the two
+        // post-commit wake sends, and the discard where neither port applies.
         let txn = include_str!("../ipccall_direct_txn.rs");
         assert_eq!(
             txn.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
                 .count(),
             2,
-            "the only arch conditionals in the transaction are the two SMP oracle IPI sends"
+            "the x86_64 conditionals in the transaction are the two SMP IPI sends"
         );
         assert_eq!(
-            txn.matches(
-                "#[cfg(not(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\")))]"
-            )
-            .count(),
+            txn.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"aarch64\"))]")
+                .count(),
             2,
-            "each gate has exactly its own negation, for the unused-parameter discard"
+            "the AArch64 conditionals are the two reschedule-SGI sends"
         );
-        for negated in txn
-            .split("#[cfg(not(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\")))]")
-            .skip(1)
-        {
+        const NEGATION: &str = "#[cfg(not(all(\n            not(feature = \"hosted-dev\"),\n            any(target_arch = \"x86_64\", target_arch = \"aarch64\")\n        )))]";
+        assert_eq!(
+            txn.matches(NEGATION).count(),
+            2,
+            "each drain has exactly one negation of both ports, for the unused-parameter discard"
+        );
+        for negated in txn.split(NEGATION).skip(1) {
             let arm = negated.lines().nth(1).unwrap_or("").trim();
             assert_eq!(
                 arm, "let _ = executing_cpu;",
                 "a negated arm may only discard the unused explicit CPU, never branch behaviour"
             );
         }
+        for send in txn
+            .split("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"aarch64\"))]")
+            .skip(1)
+        {
+            let arm: alloc::string::String = send
+                .lines()
+                .take(6)
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                arm.contains("if success.wake_target_cpu != executing_cpu {")
+                    && arm.contains("crate::arch::aarch64::smp::send_reschedule_sgi("),
+                "an AArch64 arm is only the post-commit remote-wake send"
+            );
+        }
         assert_eq!(
             txn.matches("target_arch").count(),
-            4,
-            "and there are no others: two gates plus their two negations"
+            8,
+            "and there are no others: four gates plus two negations naming both ports"
         );
     }
 

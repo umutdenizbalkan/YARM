@@ -995,32 +995,7 @@ pub fn handle_trap_entry_shared(
     // tail; the correctly scoped seam is inert exactly where the architecture owns completion.
     if !irq_handled {
         let decoded = decode_trap_context(context);
-        // QEMU-SMP2 §2 — the reschedule SGI. The vector entry claimed it and the vector tail
-        // completes that same token; there is no device and no delivery policy behind it, so it
-        // is settled here and never reaches the device route. What it asks for is a dispatch: at
-        // the authenticated idle boundary with `current` clear, the idle queue-advance drain.
-        // Anywhere else the CPU simply returns to what it interrupted — the running task keeps
-        // running and the committed enqueue is picked up at its next scheduling point.
-        #[cfg(target_arch = "aarch64")]
-        if let TrapEvent::ExternalInterrupt(irq) = decoded
-            && irq == crate::arch::gicv2_sgi::RESCHEDULE_SGI_INTID
-        {
-            irq_handled = true;
-            irq_result = Some(Ok(()));
-            if idle_boundary_authenticated {
-                sgi_idle_queue_advance = true;
-                crate::yarm_log!(
-                    "SGI_RESCHEDULE_SETTLED cpu={} settlement=idle_advance_owed",
-                    cpu.0
-                );
-            } else {
-                crate::yarm_log!(
-                    "SGI_RESCHEDULE_SETTLED cpu={} settlement=return_to_interrupted",
-                    cpu.0
-                );
-            }
-        }
-        if !irq_handled && let TrapEvent::ExternalInterrupt(irq) = decoded {
+        if let TrapEvent::ExternalInterrupt(irq) = decoded {
             // The dispatch-and-acknowledge body is ONE owner, shared with the RISC-V bridge:
             // `Some` means this route settled the trap, `None` that the broad arm still owns the
             // interrupt and nothing was completed.
@@ -1031,12 +1006,40 @@ pub fn handle_trap_entry_shared(
             // owns the interrupt.
             let completion =
                 crate::arch::hal_adapters::InterruptCompletion::ArchSingleStep { line: irq };
-            if let Some(result) = crate::kernel::syscall_split::settle_external_interrupt_at_bridge(
-                shared,
-                cpu,
-                u32::from(irq),
-                completion,
-            ) {
+            // QEMU-SMP2 §2 — the reschedule SGI. The vector entry claimed it and the vector tail
+            // completes that same token; there is no device and no delivery policy behind it, so
+            // it is settled here and never reaches the device route. What it asks for is a
+            // dispatch: at the authenticated idle boundary, the idle queue-advance drain below.
+            // Anywhere else the CPU returns to what it interrupted — the running task keeps
+            // running and the committed enqueue is picked up at its next scheduling point.
+            #[cfg(target_arch = "aarch64")]
+            let sgi = irq == crate::arch::gicv2_sgi::RESCHEDULE_SGI_INTID;
+            #[cfg(not(target_arch = "aarch64"))]
+            let sgi = false;
+            let routed = if sgi {
+                #[cfg(target_arch = "aarch64")]
+                if idle_boundary_authenticated {
+                    sgi_idle_queue_advance = true;
+                    crate::yarm_log!(
+                        "SGI_RESCHEDULE_SETTLED cpu={} settlement=idle_advance_owed",
+                        cpu.0
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "SGI_RESCHEDULE_SETTLED cpu={} settlement=return_to_interrupted",
+                        cpu.0
+                    );
+                }
+                Some(Ok(()))
+            } else {
+                crate::kernel::syscall_split::settle_external_interrupt_at_bridge(
+                    shared,
+                    cpu,
+                    u32::from(irq),
+                    completion,
+                )
+            };
+            if let Some(result) = routed {
                 irq_handled = true;
                 irq_result = Some(result);
             }

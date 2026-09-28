@@ -239,8 +239,8 @@ fn build_task(
             .flatten()
             .find(|t| t.tid.0 == tid)
             .ok_or(KernelError::TaskMissing)?;
+        // Status is left as registration made it (`Runnable`): the witness adds no transition.
         tcb.asid = Some(asid);
-        tcb.status = crate::kernel::task::TaskStatus::Runnable;
         tcb.user_context.instruction_ptr = VirtAddr(CODE_VA);
         tcb.user_context.stack_ptr = VirtAddr(SP_TOP);
         Ok::<_, KernelError>(())

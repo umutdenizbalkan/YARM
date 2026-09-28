@@ -125,8 +125,8 @@ impl SharedKernel {
         executing_cpu: crate::kernel::scheduler::CpuId,
         work: &DirectRequestPostWork,
     ) -> Result<IpcCallDirectSuccess, IpcCallDirectError> {
-        // The remote-wake decision below is x86_64-freestanding only; everywhere else the
-        // explicit CPU is deliberately unused. Discarded here rather than renamed, so the
+        // The remote-wake decision below exists on freestanding x86_64 (IPI) and AArch64
+        // (reschedule SGI) only; everywhere else the explicit CPU is deliberately unused. Discarded here rather than renamed, so the
         // parameter keeps its contract name at every call site.
         #[cfg(not(all(
             not(feature = "hosted-dev"),
@@ -1192,7 +1192,7 @@ impl SharedKernel {
         executing_cpu: crate::kernel::scheduler::CpuId,
         work: &DirectReplyPostWork,
     ) -> Result<IpcReplyDirectSuccess, IpcReplyDirectError> {
-        // See the NR6 twin: the reverse decision is x86_64-freestanding only.
+        // See the NR6 twin: the reverse decision exists on freestanding x86_64 and AArch64 only.
         #[cfg(not(all(
             not(feature = "hosted-dev"),
             any(target_arch = "x86_64", target_arch = "aarch64")
