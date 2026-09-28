@@ -25,9 +25,12 @@
 #     interface in its IAR source field, and is completed exactly once with its full token before
 #     that CPU's next arrival; no send is left undelivered; every GICD_SGIR value encodes the
 #     target's derived interface.
-#   * PARKED TARGETS (4): C->S and S->C twice each: the call/reply step, the send, the arrival AT
-#     THE TARGET'S IDLE BOUNDARY, the SGI-driven idle advance resuming exactly the woken task, and
-#     that task's own context-checked resume step on the target CPU.
+#   * PARKED TARGETS (8): C->S and S->C four times each: the call/reply step, the send, the
+#     arrival, the idle advance resuming exactly the woken task, and that task's own
+#     context-checked resume step on the target CPU. The SGI must drive the dispatch at the
+#     target's idle boundary every time on CPU 1 (it has no timer) and at least twice on CPU 0,
+#     where the periodic tick's idle advance may legitimately win the race — accepted only when
+#     it resumed exactly the woken task and the SGI then arrived in that task.
 #   * EL0 TARGETS (2): C->H1 while S spins on CPU 1, S->H0 while C spins on CPU 0: the arrival is
 #     from EL0, in the resident task, with ELR inside its register-checked window, followed by that
 #     window's own passing check.
@@ -125,21 +128,52 @@ for bad in ["PANIC", "SMP2_USER_FAIL", "SMP2_WITNESS_PROVISION_FAIL", "AARCH64_S
         fail("%d line(s) with %s" % (n, bad))
 
 # ── the sealed record ──
+# Every dump line is printed twice with an FNV-1a checksum of its text; a line is taken only from
+# an intact copy (another CPU's raw UART markers can land mid-line), and a record whose copies
+# are both damaged is missing.
+def fnv1a(b):
+    h = 0x811c9dc5
+    for x in b:
+        h = ((h ^ x) * 0x01000193) & 0xffffffff
+    return h
+dump = {}
+damaged = 0
+for l in lines:
+    i, j = l.find("SMP2_"), l.rfind(" pass=")
+    m = re.search(r" pass=([12]) crc=0x([0-9a-f]{8})$", l.rstrip())
+    if i < 0 or j < i or not m or not re.match(r"SMP2_(REC|ROLES|CPU|COUNTS|VERDICT) ", l[i:]):
+        if " pass=" in l and "crc=" in l: damaged += 1
+        continue
+    text = l[i:j]
+    if fnv1a(text.encode()) != int(m.group(2), 16):
+        damaged += 1
+        continue
+    key = text.split(" ", 1)[0]
+    if key == "SMP2_REC":
+        key = "REC " + re.search(r"seq=(\d+)", text).group(1)
+    elif key in ("SMP2_COUNTS", "SMP2_CPU"):
+        key = key + " " + text.split(" ", 2)[1]
+    dump.setdefault(key, text)
 roles = None
-for l in lines:
-    m = re.search(r"SMP2_ROLES s_tid=(\d+) s_asid=(\d+) s_cpu=(\d+) c_tid=(\d+) c_asid=(\d+) c_cpu=(\d+) h1_tid=(\d+) h0_tid=(\d+) w_va=0x([0-9a-f]+)", l)
-    if m:
-        roles = dict(s=(int(m.group(1)), int(m.group(2)), int(m.group(3))),
-                     c=(int(m.group(4)), int(m.group(5)), int(m.group(6))),
-                     h1=int(m.group(7)), h0=int(m.group(8)), w=int(m.group(9), 16))
+m = re.search(r"SMP2_ROLES s_tid=(\d+) s_asid=(\d+) s_cpu=(\d+) c_tid=(\d+) c_asid=(\d+) c_cpu=(\d+) h1_tid=(\d+) h0_tid=(\d+) w_va=0x([0-9a-f]+)", dump.get("SMP2_ROLES", ""))
+if m:
+    roles = dict(s=(int(m.group(1)), int(m.group(2)), int(m.group(3))),
+                 c=(int(m.group(4)), int(m.group(5)), int(m.group(6))),
+                 h1=int(m.group(7)), h0=int(m.group(8)), w=int(m.group(9), 16))
+counts = " ".join(v for k, v in sorted(dump.items()) if k.startswith("SMP2_COUNTS"))
+verdict = dump.get("SMP2_VERDICT")
+nrec = re.search(r"records=(\d+)", counts)
 recs = []
-for l in lines:
-    m = re.search(r"SMP2_REC seq=(\d+) kind=(\w+) cpu=(\d+) f0=0x([0-9a-f]+) f1=0x([0-9a-f]+) f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+)(?: step=(\w+))?", l)
-    if m:
+if nrec:
+    for q in range(int(nrec.group(1))):
+        text = dump.get("REC %d" % q)
+        if text is None:
+            fail("record seq %d damaged in both dump copies or missing" % q)
+            continue
+        m = re.match(r"SMP2_REC seq=(\d+) kind=(\w+) cpu=(\d+) f0=0x([0-9a-f]+) f1=0x([0-9a-f]+) f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+)(?: step=(\w+))?$", text)
         recs.append(dict(seq=int(m.group(1)), kind=m.group(2), cpu=int(m.group(3)),
                          f=[int(m.group(i), 16) for i in range(4, 9)], step=m.group(9)))
-verdict = next((l for l in lines if "SMP2_VERDICT" in l), None)
-if roles is None or not recs or verdict is None:
+if roles is None or not recs or verdict is None or not nrec:
     fail("record not dumped (roles=%s records=%d verdict=%s)" % (roles is not None, len(recs), verdict is not None))
     print("\n".join("[smp2-witness][fail] " + f for f in fails)); print("SMP2_WITNESS_SEAL result=fail"); sys.exit(1)
 if [r["seq"] for r in recs] != list(range(len(recs))):
@@ -183,45 +217,64 @@ for j, s in enumerate(recs):
         fail("seq %d: GICD_SGIR 0x%x does not encode target cpu %d (want 0x%x)" % (s["seq"], s["f"][1], s["f"][0], want))
 sgi_arrivals = sum(r["kind"] == "sgi_arrived" for r in recs)
 
-def chain(after, src_cpu, dst_cpu, origin, window, resumed):
+def chain(after, src_cpu, dst_cpu, origin, window):
     s = find(after, lambda r: r["kind"] == "sgi_sent" and r["cpu"] == src_cpu and r["f"][0] == dst_cpu and r["f"][2] == 0)
     if s is None: return None, "no send %d->%d" % (src_cpu, dst_cpu)
     a = find(s + 1, lambda r: r["kind"] == "sgi_arrived" and r["cpu"] == dst_cpu and r["f"][1] == src_cpu)
     if a is None: return None, "no arrival %d->%d" % (src_cpu, dst_cpu)
-    if recs[a]["f"][2] & 0xff != origin: return None, "arrival seq %d origin %d, want %d" % (recs[a]["seq"], recs[a]["f"][2] & 0xff, origin)
+    if origin is not None and recs[a]["f"][2] & 0xff != origin: return None, "arrival seq %d origin %d, want %d" % (recs[a]["seq"], recs[a]["f"][2] & 0xff, origin)
     if window and recs[a]["f"][2] >> 8 != window: return None, "arrival seq %d ELR 0x%x outside window %d" % (recs[a]["seq"], recs[a]["f"][3], window)
-    if resumed is None: return a, None
-    d = find(a + 1, lambda r: r["cpu"] == dst_cpu and r["kind"] in ("sgi_dispatch", "sgi_arrived"))
-    if d is None or recs[d]["kind"] != "sgi_dispatch" or recs[d]["f"][0] != resumed:
-        return None, "arrival seq %d not followed by the SGI-driven dispatch of tid %d" % (recs[a]["seq"], resumed)
-    return d, None
+    return a, None
+
+def parked(after, src_cpu, dst_cpu, woken):
+    """(dispatch index, 'sgi'|'timer') or (None, why). A timer-won race counts only when CPU dst's
+    periodic idle advance resumed exactly the woken task and the SGI then arrived in that task."""
+    a, why = chain(after, src_cpu, dst_cpu, None, 0)
+    if why: return None, why
+    if recs[a]["f"][2] & 0xff == 1:
+        d = find(a + 1, lambda r: r["cpu"] == dst_cpu and r["kind"] in ("idle_dispatch", "sgi_arrived"))
+        if d is None or recs[d]["kind"] != "idle_dispatch" or recs[d]["f"][1] != 1 or recs[d]["f"][0] != woken:
+            return None, "idle-boundary arrival seq %d not followed by the SGI-driven dispatch of tid %d" % (recs[a]["seq"], woken)
+        return (d, "sgi"), None
+    ds = [i for i in range(after, a) if recs[i]["kind"] == "idle_dispatch" and recs[i]["cpu"] == dst_cpu
+          and recs[i]["f"][1] == 0 and recs[i]["f"][0] == woken]
+    if not ds: return None, "arrival seq %d not at the idle boundary and no timer idle dispatch of tid %d before it" % (recs[a]["seq"], woken)
+    if recs[a]["f"][4] != woken: return None, "arrival seq %d in tid %d, not the resumed tid %d" % (recs[a]["seq"], recs[a]["f"][4], woken)
+    return (ds[-1], "timer"), None
 
 # ── PARKED TARGETS ──
-parked, at = 0, 0
-for k in (1, 2):
+parked_n, sgi_to_s, sgi_to_c, timer_first, at = 0, 0, 0, 0, 0
+for k in (1, 2, 3, 4):
     c = user(at, C_TID, "C_P1_CALL", k)
     if c is None: fail("P1 round %d: C_P1_CALL missing" % k); break
-    d, why = chain(c, 0, 1, 1, 0, S_TID)
+    res, why = parked(c, 0, 1, S_TID)
     if why: fail("P1 round %d 0->1: %s" % (k, why)); break
+    (d, route) = res
+    sgi_to_s += route == "sgi"; timer_first += route == "timer"
     r = user(d, S_TID, "S_P1_RESUMED", k)
     if r is None or recs[r]["cpu"] != 1: fail("P1 round %d: S did not resume (context-checked) on cpu 1" % k); break
-    parked += 1
+    parked_n += 1
     rp = user(r, S_TID, "S_P1_REPLY", k)
-    d, why = chain(rp, 1, 0, 1, 0, C_TID) if rp is not None else (None, "S_P1_REPLY missing")
+    if rp is None: fail("P1 round %d: S_P1_REPLY missing" % k); break
+    res, why = parked(rp, 1, 0, C_TID)
     if why: fail("P1 round %d 1->0: %s" % (k, why)); break
+    (d, route) = res
+    sgi_to_c += route == "sgi"; timer_first += route == "timer"
     b = user(d, C_TID, "C_P1_RESUMED", k)
     if b is None or recs[b]["cpu"] != 0: fail("P1 round %d: C did not resume (context-checked) on cpu 0" % k); break
-    parked += 1; at = b
+    parked_n += 1; at = b
+if sgi_to_s != 4 or sgi_to_c < 2:
+    fail("SGI-driven parked dispatches: %d/4 to CPU 1 (no timer there: all must be), %d/4 to CPU 0 (>= 2 required)" % (sgi_to_s, sgi_to_c))
 
 # ── EL0 TARGETS ──
 el0 = 0
 c = user(at, C_TID, "C_P2A_CALL")
-a, why = chain(c, 0, 1, 0, 1, None) if c is not None else (None, "C_P2A_CALL missing")
+a, why = chain(c, 0, 1, 0, 1) if c is not None else (None, "C_P2A_CALL missing")
 if why: fail("P2A: %s" % why)
 elif recs[a]["f"][4] != S_TID or user(a, S_TID, "S_WIN_A_OK") is None: fail("P2A: arrival not in S, or S's window check missing after it")
 else: el0 += 1
 c = user(at, S_TID, "S_P2B_CALL")
-a, why = chain(c, 1, 0, 0, 2, None) if c is not None else (None, "S_P2B_CALL missing")
+a, why = chain(c, 1, 0, 0, 2) if c is not None else (None, "S_P2B_CALL missing")
 if why: fail("P2B: %s" % why)
 elif recs[a]["f"][4] != C_TID or user(a, C_TID, "C_WIN_B_OK") is None: fail("P2B: arrival not in C, or C's window check missing after it")
 else: el0 += 1
@@ -280,22 +333,25 @@ if overlapped < 1:
     fail("no mutual round had both requests in flight together")
 
 # ── CONTEXT ──
-ctx_steps = {"S_P1_RESUMED": 2, "C_P1_RESUMED": 2, "S_WIN_A_OK": 1, "C_WIN_B_OK": 1, "S_OBSERVED": 2, "C_OBSERVED": 2}
+ctx_steps = {"S_P1_RESUMED": 4, "C_P1_RESUMED": 4, "S_WIN_A_OK": 1, "C_WIN_B_OK": 1, "S_OBSERVED": 2, "C_OBSERVED": 2}
 for step, want in ctx_steps.items():
     n = sum(r["kind"] == "user" and r["step"] == step for r in recs)
     if n != want: fail("context step %s seen %d time(s), want %d" % (step, n, want))
 
 # ── the kernel verifier must agree ──
-exp = "p1_parked=4 p2_el0=2 tlb_rounds=4 mutual_rounds=4"
-if " result=ok " not in verdict + " " or exp not in verdict or "settled_after_ack=12" not in verdict:
-    fail("kernel verdict disagrees: %s" % verdict.strip())
+for want in ["p1_parked=8", "p2_el0=2", "tlb_rounds=4", "mutual_rounds=4", "settled_after_ack=12",
+             "p1_sgi_to_s=%d" % sgi_to_s, "p1_sgi_to_c=%d" % sgi_to_c, "p1_timer_first=%d" % timer_first]:
+    if want not in counts.split():
+        fail("kernel counts disagree on %s: %s" % (want, counts))
+if not verdict.startswith("SMP2_VERDICT result=ok "):
+    fail("kernel verdict: %s" % verdict)
 
-summary = "records=%d sgi_arrivals=%d parked=%d el0=%d tlb_rounds=%d mutual=%d mutual_overlapped=%d" % (
-    len(recs), sgi_arrivals, parked, el0, tlb, mutual, overlapped)
+summary = "records=%d damaged_lines=%d sgi_arrivals=%d parked=%d sgi_to_s=%d sgi_to_c=%d timer_first=%d el0=%d tlb_rounds=%d mutual=%d mutual_overlapped=%d" % (
+    len(recs), damaged, sgi_arrivals, parked_n, sgi_to_s, sgi_to_c, timer_first, el0, tlb, mutual, overlapped)
 print("[smp2-witness] " + summary)
-print("[smp2-witness] kernel: " + verdict.strip())
+print("[smp2-witness] kernel: " + counts + " | " + verdict)
 for f in fails: print("[smp2-witness][fail] " + f)
-ok = not fails and parked == 4 and el0 == 2 and tlb == 4 and mutual == 4
+ok = not fails and parked_n == 8 and el0 == 2 and tlb == 4 and mutual == 4
 print("SMP2_WITNESS_SEAL %s result=%s" % (summary, "ok" if ok else "fail"))
 sys.exit(0 if ok else 1)
 PY

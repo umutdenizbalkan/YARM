@@ -362,7 +362,7 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
     kernel.enqueue_task(C_TID)?;
     ENABLED.store(true, Ordering::Release);
     rec::arm();
-    crate::yarm_log!(
+    crate::kernel::printk::printk_emit_sync(format_args!(
         "SMP2_WITNESS_PROVISIONED s_tid={} s_asid={} c_tid={} c_asid={} h1_tid={} h1_asid={} h0_tid={} h0_asid={} mbx_phys=0x{:x} s_image={} c_image={} h_image={}",
         S_TID,
         s_asid.0,
@@ -376,7 +376,7 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
         s_image.len(),
         c_image.len(),
         h1_image.len()
-    );
+    ));
     Ok(())
 }
 
@@ -551,7 +551,9 @@ fn dump() {
     let mut recs: alloc::vec::Vec<rec::Rec> = alloc::vec::Vec::with_capacity(n);
     recs.extend(out.iter().take(n).flatten().copied());
     let roles = roles();
-    crate::kernel::printk::printk_emit_sync(format_args!(
+    let v = rec::verify(&recs, &roles, overflowed);
+    let mut lines: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::with_capacity(n + 6);
+    lines.push(alloc::format!(
         "SMP2_ROLES s_tid={} s_asid={} s_cpu={} c_tid={} c_asid={} c_cpu={} h1_tid={} h0_tid={} w_va=0x{:x} dump_cpu={}",
         roles.s.tid,
         roles.s.asid,
@@ -565,7 +567,7 @@ fn dump() {
         this_cpu()
     ));
     for r in &recs {
-        crate::kernel::printk::printk_emit_sync(format_args!(
+        lines.push(alloc::format!(
             "SMP2_REC seq={} kind={} cpu={} f0=0x{:x} f1=0x{:x} f2=0x{:x} f3=0x{:x} f4=0x{:x}{}{}",
             r.seq,
             r.kind.name(),
@@ -585,24 +587,58 @@ fn dump() {
     }
     for cpu in [CpuId(0), CpuId(1)] {
         let (total, el0, idle, kernel, sent) = crate::arch::aarch64::smp::sgi_counters(cpu);
-        crate::kernel::printk::printk_emit_sync(format_args!(
+        lines.push(alloc::format!(
             "SMP2_CPU cpu={} sgi_arrivals={} from_el0={} at_idle={} in_kernel={} sgi_sent={}",
-            cpu.0, total, el0, idle, kernel, sent
+            cpu.0,
+            total,
+            el0,
+            idle,
+            kernel,
+            sent
         ));
     }
-    let v = rec::verify(&recs, &roles, overflowed);
-    crate::kernel::printk::printk_emit_sync(format_args!(
-        "SMP2_VERDICT records={} sgi_arrivals={} p1_parked={} p2_el0={} tlb_rounds={} mutual_rounds={} mutual_overlapped={} settled_after_ack={} result={} reason={} at={}",
+    // Every dump line stays well inside `printk_emit_sync`'s 192-byte line, checksum included.
+    lines.push(alloc::format!(
+        "SMP2_COUNTS records={} sgi_arrivals={} p1_parked={} p1_sgi_to_s={} p1_sgi_to_c={} p1_timer_first={} p2_el0={}",
         v.records,
         v.sgi_arrivals,
         v.p1_parked,
-        v.p2_el0,
+        v.p1_sgi_to_s,
+        v.p1_sgi_to_c,
+        v.p1_timer_first,
+        v.p2_el0
+    ));
+    lines.push(alloc::format!(
+        "SMP2_COUNTS tlb_rounds={} mutual_rounds={} mutual_overlapped={} settled_after_ack={}",
         v.tlb_rounds,
         v.mutual_rounds,
         v.mutual_overlapped,
-        v.settled_after_ack,
+        v.settled_after_ack
+    ));
+    lines.push(alloc::format!(
+        "SMP2_VERDICT result={} reason={} at={}",
         if v.ok() { "ok" } else { "fail" },
         v.failure.unwrap_or("none"),
         v.failure_at
     ));
+    // Twice, each line with its own checksum. The console is shared with raw, lock-free UART
+    // markers another CPU may write mid-line (measured: one stray byte inside a record), so a
+    // grader takes each line from whichever copy is intact and fails when neither is.
+    for pass in 1..=2 {
+        for line in &lines {
+            crate::kernel::printk::printk_emit_sync(format_args!(
+                "{} pass={} crc=0x{:08x}",
+                line,
+                pass,
+                fnv1a(line.as_bytes())
+            ));
+        }
+    }
+}
+
+/// FNV-1a over a dump line's text (everything before ` pass=`).
+pub fn fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5u32, |h, &b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    })
 }

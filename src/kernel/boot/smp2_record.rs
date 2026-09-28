@@ -44,8 +44,9 @@ pub enum Kind {
     SgiArrived = 2,
     /// `cpu` wrote `GICC_EOIR` with token `f[0]`.
     SgiCompleted = 3,
-    /// `cpu`'s SGI-driven idle advance resumed task `f[0]`.
-    SgiDispatch = 4,
+    /// `cpu`'s idle advance resumed task `f[0]`; `f[1]` = 1 when a reschedule SGI drove it, 0
+    /// when the periodic timer's idle advance did.
+    IdleDispatch = 4,
     /// `cpu` began replacing a present leaf: `f[0]` asid, `f[1]` va, `f[2]` old PA, `f[3]` new
     /// PA, `f[4]` request generation. Recorded with the page-table lock held, before the break.
     InvalBegin = 5,
@@ -71,7 +72,7 @@ impl Kind {
             1 => Kind::SgiSent,
             2 => Kind::SgiArrived,
             3 => Kind::SgiCompleted,
-            4 => Kind::SgiDispatch,
+            4 => Kind::IdleDispatch,
             5 => Kind::InvalBegin,
             6 => Kind::InvalDone,
             7 => Kind::VmDisplaced,
@@ -88,7 +89,7 @@ impl Kind {
             Kind::SgiSent => "sgi_sent",
             Kind::SgiArrived => "sgi_arrived",
             Kind::SgiCompleted => "sgi_completed",
-            Kind::SgiDispatch => "sgi_dispatch",
+            Kind::IdleDispatch => "idle_dispatch",
             Kind::InvalBegin => "inval_begin",
             Kind::InvalDone => "inval_done",
             Kind::VmDisplaced => "vm_displaced",
@@ -185,6 +186,10 @@ fn code(name: &str) -> u64 {
 }
 
 // ─────────────────────────────── the pure verifier ───────────────────────────────
+
+/// Parked-target rounds per direction, and the SGI-driven dispatches CPU 0 must show of them.
+pub const P1_ROUNDS: u64 = 4;
+pub const P1_MIN_SGI_TO_C: usize = 2;
 
 /// The four witness tasks: `(tid, asid, home cpu)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,7 +320,14 @@ pub fn check_sgi_population(recs: &[Rec]) -> Result<usize, SgiRefusal> {
 pub struct Verdict {
     pub records: usize,
     pub sgi_arrivals: usize,
+    /// Parked-target wakes accounted for (every round, both directions).
     pub p1_parked: usize,
+    /// ... of which the SGI drove the dispatch at the target's idle boundary, per direction.
+    pub p1_sgi_to_s: usize,
+    pub p1_sgi_to_c: usize,
+    /// ... of which CPU 0's periodic idle advance had already resumed the woken task when the
+    /// SGI arrived (it then arrived in that task and returned to it).
+    pub p1_timer_first: usize,
     pub p2_el0: usize,
     pub tlb_rounds: usize,
     pub mutual_rounds: usize,
@@ -355,9 +367,8 @@ fn user(recs: &[Rec], from: usize, role: Role, step: &str, round: Option<u64>) -
     })
 }
 
-/// A wake from `from` to `to`, sent after `after`: the send, its arrival (origin as required),
-/// then — for a parked target — the SGI-driven dispatch of `resumed`. Returns the index of the
-/// last step.
+/// A wake from `from` to `to_cpu`, sent after `after`: the send and its arrival (origin as
+/// required, `u64::MAX` for any; window when named). Returns the arrival's index.
 fn wake_chain(
     recs: &[Rec],
     after: usize,
@@ -365,7 +376,6 @@ fn wake_chain(
     to_cpu: u8,
     origin: u64,
     window: u64,
-    resumed: Option<Role>,
 ) -> Result<usize, &'static str> {
     let sent = find_from(recs, after, |r| {
         r.kind == Kind::SgiSent && r.cpu == from.cpu && r.f[0] == u64::from(to_cpu) && r.f[2] == 0
@@ -376,7 +386,7 @@ fn wake_chain(
     })
     .ok_or("sgi_not_arrived")?;
     let a = recs[arrived];
-    if a.f[2] & 0xff != origin {
+    if origin != u64::MAX && a.f[2] & 0xff != origin {
         return Err(if origin == ORIGIN_IDLE {
             "sgi_target_not_parked"
         } else {
@@ -386,20 +396,55 @@ fn wake_chain(
     if window != WINDOW_NONE && (a.f[2] >> 8) != window {
         return Err("sgi_elr_outside_window");
     }
-    match resumed {
-        Some(role) => {
-            let d = find_from(recs, arrived + 1, |r| {
-                r.cpu == to_cpu && (r.kind == Kind::SgiDispatch || r.kind == Kind::SgiArrived)
-            })
-            .ok_or("sgi_dispatch_missing")?;
-            let dr = recs[d];
-            if dr.kind != Kind::SgiDispatch || dr.cpu != to_cpu || dr.f[0] != role.tid {
-                return Err("sgi_dispatch_substituted");
-            }
-            Ok(d)
+    Ok(arrived)
+}
+
+/// How a parked target was resumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParkedRoute {
+    /// The SGI was taken at the target's authenticated idle boundary and its idle advance
+    /// resumed exactly the woken task.
+    Sgi,
+    /// The target CPU's periodic idle advance resumed the woken task first; the SGI then arrived
+    /// in that same task and returned to it. Only CPU 0 has a timer.
+    TimerFirst,
+}
+
+/// A wake of the parked `woken` on `to_cpu` by `from`, after step `after`: the send, its one
+/// arrival, and the dispatch that resumed `woken`, classified. Every other shape fails — a
+/// dispatch of another task, a dispatch by neither route, an arrival in another task. Returns
+/// the dispatch's index and route. Pure.
+pub fn parked_wake(
+    recs: &[Rec],
+    after: usize,
+    from: Role,
+    to_cpu: u8,
+    woken: Role,
+) -> Result<(usize, ParkedRoute), &'static str> {
+    let arrived = wake_chain(recs, after, from, to_cpu, u64::MAX, WINDOW_NONE)?;
+    let a = recs[arrived];
+    if a.f[2] & 0xff == ORIGIN_IDLE {
+        let d = find_from(recs, arrived + 1, |r| {
+            r.cpu == to_cpu && (r.kind == Kind::IdleDispatch || r.kind == Kind::SgiArrived)
+        })
+        .ok_or("sgi_dispatch_missing")?;
+        let dr = recs[d];
+        if dr.kind != Kind::IdleDispatch || dr.f[1] != 1 || dr.f[0] != woken.tid {
+            return Err("sgi_dispatch_substituted");
         }
-        None => Ok(arrived),
+        return Ok((d, ParkedRoute::Sgi));
     }
+    let d = recs[after..arrived]
+        .iter()
+        .position(|r| {
+            r.kind == Kind::IdleDispatch && r.cpu == to_cpu && r.f[1] == 0 && r.f[0] == woken.tid
+        })
+        .map(|i| after + i)
+        .ok_or("sgi_target_not_parked")?;
+    if a.f[4] != woken.tid {
+        return Err("sgi_arrived_in_another_task");
+    }
+    Ok((d, ParkedRoute::TimerFirst))
 }
 
 /// Grade a sealed record. Pure; the kernel runs it at the dump and the grader re-derives it.
@@ -426,39 +471,50 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
     }
     let (s, c) = (roles.s, roles.c);
 
-    // P1 — parked targets, both directions, each round.
+    // P1 — parked targets, both directions, every round accounted for.
     let mut at = 0usize;
-    for k in 1..=2u64 {
-        let step = (|| -> Result<usize, &'static str> {
+    for k in 1..=P1_ROUNDS {
+        let step = (|| -> Result<(usize, ParkedRoute, ParkedRoute), &'static str> {
             let call = user(recs, at, c, "C_P1_CALL", Some(k)).ok_or("p1_call_missing")?;
-            let d = wake_chain(recs, call, c, s.cpu, ORIGIN_IDLE, WINDOW_NONE, Some(s))?;
+            let (d, to_s) = parked_wake(recs, call, c, s.cpu, s)?;
             let resumed =
                 user(recs, d, s, "S_P1_RESUMED", Some(k)).ok_or("p1_server_resume_missing")?;
             if recs[resumed].cpu != s.cpu {
                 return Err("p1_server_resumed_elsewhere");
             }
             let reply = user(recs, resumed, s, "S_P1_REPLY", Some(k)).ok_or("p1_reply_missing")?;
-            let d = wake_chain(recs, reply, s, c.cpu, ORIGIN_IDLE, WINDOW_NONE, Some(c))?;
+            let (d, to_c) = parked_wake(recs, reply, s, c.cpu, c)?;
             let back =
                 user(recs, d, c, "C_P1_RESUMED", Some(k)).ok_or("p1_client_resume_missing")?;
             if recs[back].cpu != c.cpu {
                 return Err("p1_client_resumed_elsewhere");
             }
-            Ok(back)
+            Ok((back, to_s, to_c))
         })();
         match step {
-            Ok(end) => {
+            Ok((end, to_s, to_c)) => {
                 v.p1_parked += 2;
+                for (route, sgi) in [(to_s, &mut v.p1_sgi_to_s), (to_c, &mut v.p1_sgi_to_c)] {
+                    match route {
+                        ParkedRoute::Sgi => *sgi += 1,
+                        ParkedRoute::TimerFirst => v.p1_timer_first += 1,
+                    }
+                }
                 at = end;
             }
-            Err(why) => v.fail(why, 0),
+            Err(why) => v.fail(why, k as u32),
         }
+    }
+    // CPU 1 has no timer: every wake of S must be the SGI's. On CPU 0 the timer may win a race it
+    // is entitled to win, but not the whole phase.
+    if v.p1_sgi_to_s < P1_ROUNDS as usize || v.p1_sgi_to_c < P1_MIN_SGI_TO_C {
+        v.fail("p1_too_few_sgi_driven_parked_dispatches", 0);
     }
 
     // P2 — EL0 targets inside the checked windows.
     let p2a = (|| -> Result<usize, &'static str> {
         let call = user(recs, at, c, "C_P2A_CALL", None).ok_or("p2a_call_missing")?;
-        let arr = wake_chain(recs, call, c, s.cpu, ORIGIN_USER, WINDOW_S_A, None)?;
+        let arr = wake_chain(recs, call, c, s.cpu, ORIGIN_USER, WINDOW_S_A)?;
         if recs[arr].f[4] != s.tid {
             return Err("p2a_arrival_not_in_server");
         }
@@ -473,7 +529,7 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
     }
     let p2b = (|| -> Result<usize, &'static str> {
         let call = user(recs, at, s, "S_P2B_CALL", None).ok_or("p2b_call_missing")?;
-        let arr = wake_chain(recs, call, s, c.cpu, ORIGIN_USER, WINDOW_C_B, None)?;
+        let arr = wake_chain(recs, call, s, c.cpu, ORIGIN_USER, WINDOW_C_B)?;
         if recs[arr].f[4] != c.tid {
             return Err("p2b_arrival_not_in_client");
         }
@@ -856,27 +912,49 @@ mod tests {
             asid: 6,
             cpu: 0,
         };
-        let base = |dispatched: u64| {
-            seqd(vec![
-                (Kind::User, 0, [c.tid, c.asid, code("C_P1_CALL"), 1, 0]),
-                (Kind::SgiSent, 0, [1, 0x20001, 0, 0, 0]),
-                (Kind::SgiArrived, 1, [0x401, 0, ORIGIN_IDLE, 0, 0]),
-                (Kind::SgiDispatch, 1, [dispatched, 0, 0, 0, 0]),
-            ])
+        let call = (Kind::User, 0, [c.tid, c.asid, code("C_P1_CALL"), 1, 0]);
+        let sent = (Kind::SgiSent, 0, [1, 0x20001, 0, 0, 0]);
+        let at_idle = |tid| (Kind::SgiArrived, 1, [0x401, 0, ORIGIN_IDLE, 0, tid]);
+        let in_el0 = |tid| {
+            (
+                Kind::SgiArrived,
+                1,
+                [0x401, 0, ORIGIN_USER, 0x2000_0000, tid],
+            )
         };
-        assert!(wake_chain(&base(s.tid), 0, c, 1, ORIGIN_IDLE, WINDOW_NONE, Some(s)).is_ok());
+        let by_sgi = |tid| (Kind::IdleDispatch, 1, [tid, 1, 0, 0, 0]);
+        let by_timer = |tid| (Kind::IdleDispatch, 1, [tid, 0, 0, 0, 0]);
+        // The SGI taken at the idle boundary resumes exactly the woken task.
+        let r = seqd(vec![call, sent, at_idle(0), by_sgi(s.tid)]);
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Ok((3, ParkedRoute::Sgi)));
         // Another task's continuation substituted for the woken one.
+        let r = seqd(vec![call, sent, at_idle(0), by_sgi(9202)]);
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_dispatch_substituted"));
+        // The SGI's own dispatch is missing: the next event on that CPU is another arrival.
+        let r = seqd(vec![call, sent, at_idle(0), sent, at_idle(0)]);
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_dispatch_substituted"));
+        // The timer's idle advance won the race: accepted only when it resumed the woken task
+        // and the SGI then arrived in that same task.
+        let r = seqd(vec![call, by_timer(s.tid), sent, in_el0(s.tid)]);
         assert_eq!(
-            wake_chain(&base(9202), 0, c, 1, ORIGIN_IDLE, WINDOW_NONE, Some(s)),
-            Err("sgi_dispatch_substituted")
+            parked_wake(&r, 0, c, 1, s),
+            Ok((1, ParkedRoute::TimerFirst))
         );
-        // Taken in the kernel rather than at the parked boundary.
-        let mut k = base(s.tid);
-        k[2].f[2] = ORIGIN_KERNEL;
+        let r = seqd(vec![call, by_timer(9202), sent, in_el0(9202)]);
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_target_not_parked"));
+        let r = seqd(vec![call, by_timer(s.tid), sent, in_el0(9202)]);
         assert_eq!(
-            wake_chain(&k, 0, c, 1, ORIGIN_IDLE, WINDOW_NONE, Some(s)),
-            Err("sgi_target_not_parked")
+            parked_wake(&r, 0, c, 1, s),
+            Err("sgi_arrived_in_another_task")
         );
+        // Neither route: the target was running when the SGI arrived, with no idle dispatch.
+        let r = seqd(vec![call, sent, in_el0(s.tid)]);
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_target_not_parked"));
+        // An SGI-trigger dispatch cannot stand in for a timer-won race, nor the reverse.
+        let r = seqd(vec![call, by_sgi(s.tid), sent, in_el0(s.tid)]);
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_target_not_parked"));
+        let r = seqd(vec![call, sent, at_idle(0), by_timer(s.tid)]);
+        assert_eq!(parked_wake(&r, 0, c, 1, s), Err("sgi_dispatch_substituted"));
     }
 
     #[test]

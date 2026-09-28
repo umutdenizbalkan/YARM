@@ -61,7 +61,7 @@
     .set WIN_MASK, 0xFFF8FFFF
     .set SYS_MASK, 0xFFF8FEC0
 
-    .set P1_ROUNDS, 2
+    .set P1_ROUNDS, 4
     .set TLB_ROUNDS, 4
     .set MUT_ROUNDS, 4
     .set PARK_TICKS, 60

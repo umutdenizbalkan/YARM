@@ -3438,16 +3438,14 @@ pub fn handle_trap_entry_shared(
                             cpu.0,
                             inc
                         );
-                        // QEMU-SMP2 §5: the SGI-driven dispatch, recorded once the resume and
-                        // its debt are committed.
+                        // QEMU-SMP2 §5: the idle dispatch and which trigger drove it, recorded
+                        // once the resume and its debt are committed.
                         #[cfg(all(feature = "aarch64-smp2-witness", target_arch = "aarch64"))]
-                        if sgi_trigger {
-                            crate::kernel::boot::smp2_record::push(
-                                crate::kernel::boot::smp2_record::Kind::SgiDispatch,
-                                cpu.0,
-                                [inc, 0, 0, 0, 0],
-                            );
-                        }
+                        crate::kernel::boot::smp2_record::push(
+                            crate::kernel::boot::smp2_record::Kind::IdleDispatch,
+                            cpu.0,
+                            [inc, u64::from(sgi_trigger), 0, 0, 0],
+                        );
                     }
                     None => {
                         // Every non-resuming outcome, each under its OWN reason. `Idle` means the
