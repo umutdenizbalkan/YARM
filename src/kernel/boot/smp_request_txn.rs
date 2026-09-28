@@ -10,7 +10,8 @@
 //!
 //! Here each step is recorded ONCE, at the production owner that commits it, with the exact
 //! identities that owner holds, and stamped with a global step sequence so the grader can check
-//! causal order:
+//! causal order (`IpiSent` is recorded once the ICR write has returned, which the target may have
+//! answered already: it follows `Delivered` but is not ordered against the target's steps):
 //!
 //! | step         | owner                                                   | identities            |
 //! |--------------|---------------------------------------------------------|-----------------------|

@@ -67,7 +67,8 @@ have()  { rg -a -q -F "$1" "$NORM"; }
 # hold and a global step sequence, and the chain is reported SYNCHRONOUSLY (`printk_emit_sync`) once
 # the resumed server's userspace validation is recorded. A line lost from the asynchronous printk
 # ring can therefore neither fail a complete transaction nor stand in for a missing step. Checked:
-#   * every step recorded exactly once (no duplicates), in causal order;
+#   * every step recorded exactly once (no duplicates), in causal order (the sender's post-ICR
+#     `ipi_sent` only after the delivery: the target may answer the IPI before it is recorded);
 #   * ONE server incarnation {tid, asid}, endpoint {index, generation} and acknowledgement seq from
 #     the committed block through the delivery, the saved-frame resume and the ring-3 validation;
 #   * a distinct requester, a CPU0 -> CPU1 remote wake, the IPI-driven wake taken on CPU 1, and at
@@ -94,7 +95,11 @@ for st in steps:
 if not bad:
     seq = {st: rec[st][0] for st in steps}
     f = {st: rec[st][1:7] for st in steps}
-    need(all(seq[a] < seq[b] for a, b in zip(steps, steps[1:])), f"causal order broken: {seq}")
+    # `ipi_sent` is recorded when the sender's ICR write has returned, which the target may
+    # already have answered: it follows the delivery it announces but is not ordered against the
+    # target's own steps. Every other link is a real happens-before.
+    chain = ['blocked', 'delivered', 'ipi_observed', 'resumed', 'continued', 'validated']
+    need(all(seq[a] < seq[b] for a, b in zip(chain, chain[1:])) and seq['delivered'] < seq['ipi_sent'], f"causal order broken: {seq}")
     need(all(rec[st][7] == 0 for st in steps), "a step was recorded more than once")
     srv, asid, ep, ack = f['blocked'][0:4]
     need(srv != 0 and ack != 0, "blocked step lacks an identity")
@@ -111,7 +116,7 @@ if not bad:
     need(S.get('target_cpu') == str(target) and int(S.get('target_arrivals', 0)) >= 1, f"no hardware 0xF1 arrival counted on cpu {target}: {S}")
 for b in bad: print(f"FAIL {b}")
 if not bad:
-    print(f"OK server_tid={srv} server_asid={asid} endpoint=0x{ep:x} ack_seq={ack} client_tid={client} cpu={sender}->{target} arrivals={S.get('target_arrivals')} order={'<'.join(str(seq[s]) for s in steps)}")
+    print(f"OK server_tid={srv} server_asid={asid} endpoint=0x{ep:x} ack_seq={ack} client_tid={client} cpu={sender}->{target} arrivals={S.get('target_arrivals')} order={'<'.join(str(seq[s]) for s in chain)} sent={seq['ipi_sent']}")
 PY
 )"
 while IFS= read -r line; do
