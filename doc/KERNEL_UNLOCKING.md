@@ -24255,7 +24255,7 @@ NATURAL, a held one as SYNCHRONIZED. W reports its own verdict by where it parks
 sealed (per-part FNV-1a, two passes). Pre-freeze boots of the checkpoint: AArch64 4/4 overtaken (2
 synchronized, 2 natural), every round `switch` to W under its own ASID; x86_64 4/4 (all
 synchronized), the same. No overtaken settlement occurred outside the witness in those boots; the
-qualification record counts them per boot.
+qualification of the frozen tree counts them per boot, in its delivery report.
 
 ## 5 — the pinned firmware
 
@@ -24296,3 +24296,6 @@ closed so no failed completion can authorize reclaim.
   revalidation, which is NOT exact-incarnation, is unchanged; after this package it no longer
   receives an overtaken deferral, but it remains the landing for other idle outcomes.
 * The witness's hold is a labelled synchronization point; everything around it is production.
+* The two reply-timeout retirement runners (`qemu-ipc-reply-timeout-{x86_64,aarch64}-retirement-smoke.sh`) fail on this package's base `8ed21c1c` exactly as on the candidate (fresh artifacts:
+  x86_64 lacks its `IPC_REPLY_BEATS_TIMEOUT_OK` literal; AArch64's reply-wins cell emits none of its
+  markers). They are pre-existing, outside this package, and not part of its qualification.
