@@ -43,6 +43,7 @@ struct Fixture {
 
 fn clear_cells() {
     crate::kernel::boot::futex_wait_dispatch_clear(0);
+    crate::kernel::boot::d2_recv_dispatch_clear(0);
     crate::kernel::boot::d2_send_dispatch_clear(0);
     crate::kernel::boot::yield_dispatch_clear(0);
 }
@@ -552,5 +553,71 @@ fn an_overtaken_sender_consumes_its_parked_completion_exactly_once() {
         crate::kernel::boot::d2_send_dispatch_try_defer(0, W),
         "the cell is not latched"
     );
+    clear_cells();
+}
+
+/// The receiver overtaken by a completion on CPU 1 — the production receive-timeout publication,
+/// which installs the x86_64 result lanes into the saved continuation (and parks the arch-neutral
+/// record AArch64 consumes). The settlement resumes the receiver by exact token, and the frame
+/// carries exactly the continuation the completion installed: RIP, RSP and the TimedOut lanes.
+#[test]
+fn an_overtaken_receiver_resumes_with_the_installed_completion() {
+    const TIMED_OUT: u64 = 9;
+    let fx = fixture();
+    fx.k.with(|s| {
+        s.set_task_status_for_test(
+            W,
+            TaskStatus::Blocked(WaitReason::EndpointReceive(
+                crate::kernel::capabilities::CapId(5),
+            )),
+        );
+        assert_eq!(s.block_current_cpu(), Some(W));
+    });
+    assert!(crate::kernel::boot::d2_recv_dispatch_try_defer(0, W));
+    fx.k.with(|s| {
+        s.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == W).expect("w");
+            crate::kernel::boot::ipc_state::publish_blocked_recv_timeout_result_with_identity(
+                tcb, TIMED_OUT, W, fx.w_asid,
+            );
+            tcb.status = TaskStatus::Runnable;
+        });
+        s.enqueue_task(W).expect("wake");
+    });
+    assert!(
+        !fx.k.d2_recv_reverify_blocked(W),
+        "the drain's re-verify fails"
+    );
+    crate::kernel::boot::d2_recv_dispatch_clear(0);
+
+    let token = match fx.k.settle_overtaken_deferral_split(
+        DispatchAuthority::live_for_test(CPU0),
+        Some(w_owner(&fx)),
+        "overtaken_test",
+        |k, a| k.d2_recv_dispatch_step_mut(a),
+    ) {
+        OvertakenSettlement::Switch(t) => t,
+        other => panic!("expected a switch, got {other:?}"),
+    };
+    assert_eq!(token.tid(), W);
+    let mut frame = owned_entry_frame(W, fx.w_asid);
+    assert_eq!(
+        crate::arch::x86_64::trap::x86_post_lock_resume_marked_incoming(
+            &fx.k,
+            token,
+            Some(&mut frame)
+        ),
+        Ok(())
+    );
+    assert_eq!(frame.saved_pc(), fx.w_saved.instruction_ptr.0 as usize);
+    assert_eq!(frame.saved_sp(), fx.w_saved.stack_ptr.0 as usize);
+    assert_eq!(frame.user_gpr(0), 0, "RAX = ret0");
+    assert_eq!(
+        frame.user_gpr(2),
+        TIMED_OUT as usize,
+        "RCX = the TimedOut error lane"
+    );
+    assert_eq!(frame.resume_owner(), Some(w_owner(&fx)));
+    assert!(queued(&fx.k, CPU0).is_empty());
     clear_cells();
 }

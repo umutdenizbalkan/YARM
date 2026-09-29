@@ -24151,14 +24151,148 @@ tree, features, firmware and image hashes per run — is the delivery report of 
 ## Limits
 
 * Completion of `remote_sfence_vma_asid` on return is OpenSBI v1.3's behaviour, not the SBI 1.0
-  contract; an error fails closed. Two harts, QEMU TCG, one firmware; no real hardware.
+  contract; an error fails closed. Since QEMU-SMP3-ACCEPTANCE §3 the claim is scoped to ONE pinned
+  artifact (`scripts/firmware/riscv64-opensbi.pin`), which every qualifying boot must prove it ran.
+  Two harts, QEMU TCG, one firmware; no real hardware.
 * QEMU cannot distinguish a missing ordering fence; `scripts/check-riscv64-smp3-sequence.sh` checks
   the built image (and the controls show deleting each required instruction fails it).
-* Live populations of the repairs, in the boots so far: the overtaken receive arm 1–3 per boot, the
-  terminal-idle arm once; the send and FutexWait arms and the reply-race arm none since their
-  repair (the reply race's producer is the recorded failure of `bb87653d`). Those are covered by
-  source guards and the shared owners they call, not by live evidence.
+* Live populations of the repairs on the qualified tree (`8ed21c1c`, its three witness boots — the
+  record QEMU-SMP3-ACCEPTANCE §4 corrects this bullet to): the terminal-idle overtaken arm
+  (`riscv_blocked_ipc_overtaken`) once in every boot, settled by `switch`; the overtaken receive arm
+  (`riscv_d2_recv_overtaken`) twice in boot 1 (`switch`, `kernel_idle`), once in boot 2
+  (`kernel_idle`) and once in boot 3 (`switch`); and the reply race's retry ONCE, in boot 1
+  (`IPCREPLY_DIRECT_CALLER_NOT_YET_BLOCKED tid=9302 record_index=1 record_generation=27`, refused
+  `WouldBlock`, retried, the boot sealed `ok`). The send and FutexWait overtaken arms did not occur
+  on that tree; they are covered by source guards and the shared owners they call, not by live
+  evidence.
 * No FP/vector state is enabled or preserved on RISC-V (soft-float contract, graded).
 * Four other oracle handshakes in `init/service.rs` (the three ports' FutexWake oracles and the
   direct-reply round-trip oracle) have the same wake-before-wait shape as the one repaired in §6.
   None is on a gate of this package, and they are not changed; the repair's idiom applies to each.
+
+# QEMU-SMP3-ACCEPTANCE — the shared bridge's overtaken deferrals, and the pinned RISC-V firmware
+
+Base: `8ed21c1c` (QEMU-SMP3, tree `3b2311db…`). U9 stays closed: production `with_cpu=0`,
+`with_broad=0`. This section corrects the SMP3 record (its Limits, above) and reports the four kinds
+of evidence apart: source reachability and settlement correctness, exercised live populations,
+firmware-dependent completion, and source/disassembly-only ordering. Contention is reported as
+measured, and not promoted (§6).
+
+## 1 — the branches, derived one by one
+
+Each blocking-class drain of the shared x86_64/AArch64 bridge re-verifies its class before the one
+owed queue advance. A failed re-verify cleared the cell and FELL THROUGH, and two comments justified
+it: the woken task "may resume through the entering frame".
+
+| drain | reserved by | clears `current`? | who changes the outgoing task before the drain | owed | the frame's continuation |
+|---|---|---|---|---|---|
+| D2 send (both) | the split blocking-send commit (`runtime.rs`, U6) | yes | a receiver on the other CPU takes the message: it parks an `IpcSend` completion and wakes the sender (`publish_blocking_send_completion_split`); or teardown | one queue advance | the sender's — now queued, current nowhere |
+| D2 receive (both) | the split blocking-receive commit (`syscall_split.rs`) | yes | a sender or a timeout/server-death completion on the other CPU (installs the x86_64 lanes, parks the arch-neutral record) | one queue advance | the receiver's — queued |
+| FutexWait (x86_64, AArch64) | `futex_wait_park_exact_split`, the exit and terminal-fault routes | yes | a FutexWake on the other CPU (`futex_wake_split_mut`: `Runnable`, enqueued on its pinned CPU) | one queue advance | the waiter's — queued |
+| Yield (x86_64, AArch64) | NR 0 / the preempting tick (`yield_txn`) | yes | nothing remote: `current` is moved only by its own CPU; `state_changed` here means an owner on THIS CPU installed one | nothing more | whatever that owner installed — must be proved |
+| terminal idle (D2 `Idle`, FutexWait/Yield no-incoming) | — | — | a late enqueue | the idle obligation | none: both ports' idle terminals never return through the frame, and a late enqueue is taken by the existing wake/idle-boundary contract |
+
+What the unmodified base did with the fall-through, reproduced through production owners on a fresh
+`8ed21c1c` worktree (`overtaken_tests`, the two `base_*` cases; only the test module added):
+
+* **AArch64** returned with the frame still owned by the queued waiter; the vector tail asks the
+  FP/SIMD return settlement for that owner, which refuses (`NoCurrent`) — and the tail halts the CPU.
+  Ordinary two-CPU contention ended in a fatal stop.
+* **x86_64** found `current == None` in its trap tail and ran the owner revalidation, which restores
+  a selected task's SAVED context. For an overtaken blocked SENDER that is not its continuation: the
+  send's result is the parked `IpcSend` completion, which only the exact-token resume consumes. The
+  sender resumed with its pre-block lanes and the completion stayed parked.
+
+## 2 — the settlement (one policy, per-port application)
+
+`SharedKernel::settle_overtaken_deferral_split` decides from what IS on the CPU, never from what the
+outgoing task became (`OvertakenSettlement`):
+
+* `current` names a task → it is returned to only if the frame's `resume_owner` authenticates against
+  it through the SAME authentication the ring-3/EL0 FP/SIMD returns use (current here, current
+  nowhere else, resumable, same address space): `ReturnToInstalled`; otherwise `Unauthenticated`.
+* `current` empty (or the idle sentinel) → the owed advance through the one existing acquire
+  (`queue_advance_acquire_incoming_split`, the class's own step): `Switch(token)`, `Idle{reason}`
+  under the acquire's own slug, or `Torn`.
+
+`settle_overtaken_at_bridge` applies it through owners that already exist: `Switch` through the
+exact-token resume the successful drains use (context, parked completion, frame owner; a refused
+resume rolls back exactly and diverges); `Idle` through each port's established terminal;
+`Unauthenticated`/`Torn` diverge. No broad acquisition, no new switch mechanism, no retry, no
+enqueue, no manufactured result. Each of the six branches clears its cell once, then settles.
+
+RISC-V's `settle_overtaken_deferral` (SMP3) is not changed: its installed-current arm returns without
+a frame-owner authentication because RISC-V frames carry no owner. That arm is unreachable by the
+same construction as the Yield row above (only the hart itself installs its `current`); it is a
+reported limit, not a qualified path.
+
+## 3 — deterministic coverage
+
+`src/kernel/boot/overtaken_tests/tests.rs`, all through production owners (the park, the wake, the
+publication, the acquire, the exact-token resume, the FP/SIMD authentication): remote wake after the
+blocking publication and before the drain (resumes W by exact token; frame PC, SP, all GPRs, status
+word and owner asserted, and the FP/SIMD settlement installs W's home); another task queued first
+(selected; W stays queued once); W queued on the other CPU (idle, frame untouched); no acceptable
+incoming (idle under `none_acceptable`, nothing dequeued); an installed continuation that
+authenticates (returned to, no second dispatch); the CONTROL — another task installed, no owner, or
+the same TID in another address space — refused with the exact refusal and nothing mutated; a
+replaced incarnation after the mark (resume refuses before the frame, rollback refuses, fatal); the
+overtaken sender (its `IpcSend` completion consumed exactly once, the result lane carries it, the
+cell not latched); the overtaken receiver (the installed completion's lanes). The AArch64 resume core
+is AArch64-only and is covered live. `tests/qemu_smp3_acceptance_scope.rs` pins that every
+`state_changed` branch settles, that the adapter applies every arm, that the policy authenticates
+before it returns, and that the witness is gated.
+
+## 4 — live evidence (synchronized, then natural)
+
+`aarch64-overtaken-witness` / `x86-overtaken-witness`, default-off, armed only with the port's
+two-CPU profile. W (CPU 0) issues a real FutexWait on a shared word each round and checks its result
+lane and callee-saved registers after it resumes; K (CPU 1) issues real FutexWakes until one wakes
+W. The ONE synchronization point is at the entry of CPU 0's FutexWait drain, after W's commit, with
+no lock held: it waits, bounded, until W is no longer `Blocked(Futex)` — which only K's wake can
+cause. The drain then runs unmodified. A round whose wake had already landed is recorded as
+NATURAL, a held one as SYNCHRONIZED. W reports its own verdict by where it parks next; the summary is
+sealed (per-part FNV-1a, two passes). Pre-freeze boots of the checkpoint: AArch64 4/4 overtaken (2
+synchronized, 2 natural), every round `switch` to W under its own ASID; x86_64 4/4 (all
+synchronized), the same. No overtaken settlement occurred outside the witness in those boots; the
+qualification record counts them per boot.
+
+## 5 — the pinned firmware
+
+`scripts/firmware/riscv64-opensbi.pin` names the one artifact the SMP3 completion claim is qualified
+against: QEMU's bundled OpenSBI (`qemu-system-data 1:8.2.2+ds-0ubuntu1.18`,
+`opensbi-riscv64-generic-fw_dynamic.bin`, sha256 `171a91cc…095d`), banner `OpenSBI v1.3`, runtime SBI
+1.0, and its own Base-extension answer `impl_id=1 impl_version=0x10003 spec=0x1000000`. The runner
+refuses a missing or different file, boots its own copy with an explicit `-bios`, and records path,
+provenance, installed package, hash, QEMU, kernel, initramfs, features and command line; the grader
+requires the recorded hash, the banner and the firmware's self-identification (witness-only
+`sbi::base_identity`) to match the pin. The RFENCE extension being present proves nothing about
+completion; completion-on-return is this implementation's behaviour, and an error still fails
+closed so no failed completion can authorize reclaim.
+
+## 6 — kinds of evidence, kept apart
+
+* **Source reachability and settlement correctness** — §1's derivation; §3's interleavings; the
+  scope guards. The installed-current arms (Yield on both ports; the D2/FutexWait arms if an owner
+  ever installed `current`) are covered deterministically only: no production owner on another CPU
+  writes this CPU's `current`, and this CPU runs the drain with interrupts masked.
+* **Exercised live populations** — §4's witness rounds (synchronized and natural, separately), the
+  naturally occurring settlements counted per qualification boot, and SMP3's corrected record above.
+* **Firmware-dependent completion** — §5; nothing else in this package depends on firmware.
+* **Source/disassembly-only ordering** — unchanged from SMP3 (`check-riscv64-smp3-sequence.sh`, with
+  its controls).
+* **Contention** — SMP3's mutual rounds are an OVERLAP claim (both operations entered before either
+  completed). Its seal's `contended` IS a measurement — contended spin-lock acquisitions inside the
+  mutual rounds' operation windows — and it read 0 in every qualifying boot. Zero observed contention
+  is exactly that: no contended path was exercised, so nothing here qualifies behaviour under
+  contention. This package measures none of its own.
+
+## Limits
+
+* One live class per port (FutexWait). D2 send/receive and Yield overtaken settlements are covered
+  deterministically and by source guards; a natural overtaken send or receive was not observed live
+  on x86_64 or AArch64.
+* The RISC-V installed-current arm is not frame-authenticated (above). The x86_64 trap tail's owner
+  revalidation, which is NOT exact-incarnation, is unchanged; after this package it no longer
+  receives an overtaken deferral, but it remains the landing for other idle outcomes.
+* The witness's hold is a labelled synchronization point; everything around it is production.
