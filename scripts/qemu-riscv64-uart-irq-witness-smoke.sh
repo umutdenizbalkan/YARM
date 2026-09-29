@@ -132,7 +132,11 @@ sym_range() { # elf symbol-substring -> "start end" (decimal)
 }
 in_idle_wait=0; in_spin=0
 if [[ -f "$KELF_COPY" ]]; then
-  read -r ws we < <(sym_range "$KELF_COPY" "timer::halt_wait_loop")
+  # QEMU-SMP3: the interruptible idle wait is `timer::idle_wait_loop` (it contains the stack-free
+  # SIE-set `wfi` loop); `halt_wait_loop` is now the masked fatal halt only and no idle arrival
+  # waits there — it is not even a separate symbol once inlined.
+  read -r ws we < <(sym_range "$KELF_COPY" "timer::idle_wait_loop")
+  (( we > ws )) || die "the idle wait symbol timer::idle_wait_loop is missing from the kernel ELF"
   while read -r pc; do
     (( pc >= ws && pc < we )) && in_idle_wait=$((in_idle_wait + 1))
   done < <(grep -a 'IRQ1_UART_IRQ_ENTRY origin=idle' "$NORM" | sed 's/.*sepc=0x\([0-9a-f]*\).*/\1/' | while read -r h; do echo $((16#$h)); done)

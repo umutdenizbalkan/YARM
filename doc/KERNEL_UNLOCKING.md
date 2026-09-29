@@ -24122,8 +24122,13 @@ compiles that function. It now names the field (`None`), a guard pins every init
 RISC-V, AArch64 and x86 witness/oracle profile was compile-checked before the second freeze. The fix
 touches only that feature-gated function, but it shifts the source-line locations the image embeds,
 so the SMP3 witness image is NOT the one the controls above ran against (`05e6a247`, image
-`88489969…`; now `46ddbf4c…`). The controls are therefore re-run from the final freeze, and — like
-qualification — reported with it rather than in this text.
+`88489969…`; now `46ddbf4c…`). The controls were therefore re-run from the third freeze, `4677d807`,
+and are reported with qualification rather than in this text. That freeze failed one gate too: the
+UART IRQ witness placed idle-origin `sepc` inside `timer::halt_wait_loop`, which this package made
+the masked fatal halt only (the interruptible idle wait is `timer::idle_wait_loop`, and the old
+symbol is not even emitted once inlined), so the window was empty and every idle entry "missed" it.
+Regraded against the idle wait, the same boot passes (4/4 idle entries inside it). The final freeze
+changes only that script and this text: its code and witness image are `4677d807`'s.
 
 **Qualification** is of the frozen commit that carries this text, run from a fresh isolated
 worktree: three consecutive strict two-hart witness boots, each a fresh build, then every gate
