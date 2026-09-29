@@ -2061,7 +2061,28 @@ impl KernelState {
                     target_arch = "x86_64"
                 )))]
                 let smp1 = false;
-                if smp1 {
+                // QEMU-SMP3-ACCEPTANCE §2: the overtaken-deferral witness takes the same two tasks.
+                #[cfg(all(
+                    feature = "x86-overtaken-witness",
+                    not(feature = "hosted-dev"),
+                    target_arch = "x86_64"
+                ))]
+                let ovt = reply_flow && crate::arch::x86_64::overtaken_witness::enabled();
+                #[cfg(not(all(
+                    feature = "x86-overtaken-witness",
+                    not(feature = "hosted-dev"),
+                    target_arch = "x86_64"
+                )))]
+                let ovt = false;
+                if ovt {
+                    #[cfg(all(
+                        feature = "x86-overtaken-witness",
+                        not(feature = "hosted-dev"),
+                        target_arch = "x86_64"
+                    ))]
+                    self.provision_overtaken_witness((base_tid, asid), (client_tid, client_asid))?;
+                    crate::kernel::boot::set_x86_c2c_client_tid(client_tid);
+                } else if smp1 {
                     #[cfg(all(
                         feature = "x86-smp1-witness",
                         not(feature = "hosted-dev"),
@@ -2237,6 +2258,42 @@ impl KernelState {
             server_image.len(),
             client_image.len()
         );
+        Ok(())
+    }
+
+    /// QEMU-SMP3-ACCEPTANCE §2 — provision the overtaken-deferral witness on the reply profile's
+    /// two tasks: the server (CPU 1) runs the waker K, the client (CPU 0) the waiter W, and ONE
+    /// frame is the mailbox in both address spaces. Setup only; the programs are in
+    /// `overtaken_witness.S` and everything they do is a real syscall.
+    #[cfg(all(
+        feature = "x86-overtaken-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "x86_64"
+    ))]
+    fn provision_overtaken_witness(
+        &mut self,
+        server: (u64, Asid),
+        client: (u64, Asid),
+    ) -> Result<(), KernelError> {
+        use crate::arch::x86_64::overtaken_witness as w;
+        use crate::kernel::overtaken_witness as ow;
+        let (server_tid, server_asid) = server;
+        let (client_tid, client_asid) = client;
+        self.copy_to_user(server_asid, VirtAddr(0x2000_0000), &w::k_image())?;
+        self.copy_to_user(client_asid, VirtAddr(0x2000_0000), &w::w_image())?;
+        let mbx = self.alloc_user_data_frame()?;
+        for asid in [server_asid, client_asid] {
+            self.map_user_page_in_asid_raw(
+                asid,
+                VirtAddr(ow::MBX_VA),
+                Mapping {
+                    phys: PhysAddr(mbx),
+                    flags: PageFlags::USER_RW,
+                },
+            )?;
+        }
+        self.copy_to_user(client_asid, VirtAddr(ow::MBX_VA), &[0u8; 0x100])?;
+        ow::arm(client_tid, client_asid.0, server_tid, server_asid.0);
         Ok(())
     }
 

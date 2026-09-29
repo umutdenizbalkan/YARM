@@ -536,6 +536,15 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::arch::x86_64::smp1_witness::set_enabled(enabled);
         crate::yarm_log!("YARM_X86_64_SMP1_WITNESS_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.x86_64_overtaken_witness {
+        #[cfg(all(
+            feature = "x86-overtaken-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "x86_64"
+        ))]
+        crate::arch::x86_64::overtaken_witness::set_enabled(enabled);
+        crate::yarm_log!("YARM_X86_64_OVERTAKEN_WITNESS_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.aarch64_ipccall_direct_oracle {
         // Stage 199A2C1: default-off AArch64 DIRECT IpcCall/IpcReply live round-trip oracle knob.
         // Provisions init startup slot 5 (=7) so init runs the SAME arch-neutral round trip AND arms
@@ -979,6 +988,10 @@ pub struct YarmBootOptions<'a> {
     /// build and the reply sub-selector, swaps the two cross-CPU oracle tasks for the IPI / TLB
     /// witness programs. Parsed everywhere; acted on only by that build.
     pub x86_64_smp1_witness: Option<bool>,
+    /// QEMU-SMP3-ACCEPTANCE §2: `yarm.x86_64_overtaken_witness=1` DEFAULT-OFF. With the
+    /// `x86-overtaken-witness` build and the reply sub-selector, swaps the two cross-CPU oracle tasks
+    /// for the overtaken-deferral witness programs. Parsed everywhere; acted on only by that build.
+    pub x86_64_overtaken_witness: Option<bool>,
     /// Stage 199A2C1: `yarm.aarch64_ipccall_direct_oracle=1` DEFAULT-OFF knob. Mirror of the x86_64
     /// knob on AArch64: provisions init startup slot 5 (=7) so init runs the SAME arch-neutral
     /// parent(client)/child(server) NR6 request + NR7 reply round trip, and arms the shared NR6/NR7
@@ -1334,6 +1347,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.x86_64_smp1_witness" {
             options.x86_64_smp1_witness = parse_bool_knob(value);
+        }
+        if key == b"yarm.x86_64_overtaken_witness" {
+            options.x86_64_overtaken_witness = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_ipccall_direct_oracle" {
             options.aarch64_ipccall_direct_oracle = parse_bool_knob(value);

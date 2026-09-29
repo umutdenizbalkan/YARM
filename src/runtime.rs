@@ -1202,6 +1202,51 @@ impl DispatchAcquire {
     }
 }
 
+/// QEMU-SMP3-ACCEPTANCE §1 — what a post-lock blocking-class drain owes when its class re-verify
+/// failed: between the in-lock commit and the drain, another owner changed the outgoing task.
+///
+/// The commit that armed the drain cleared this CPU's `current`, so the frame the bridge would
+/// return through still holds the OUTGOING task's continuation. That task being `Runnable` now
+/// authorizes nothing: a queued task, a task running on another CPU and a task installed as this
+/// CPU's `current` are three different states, and only the last may be resumed from this frame —
+/// and only if the frame's continuation IS that incarnation. Each outcome below names the state
+/// that was found and the one settlement it admits.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OvertakenSettlement {
+    /// An owner had already installed `current` here, and it is EXACTLY the incarnation whose
+    /// continuation the frame holds (unique across CPUs, resumable, same address space). Nothing
+    /// is owed; the ordinary tail returns to it.
+    ReturnToInstalled { owner: FpuHomeOwner },
+    /// `current` was empty, and the ONE queue advance selected and marked this exact incarnation
+    /// `Running`. The bridge resumes it through its exact-token transaction.
+    Switch(DispatchMarkToken),
+    /// `current` was empty and the advance produced nothing to resume; `reason` is the acquire's
+    /// own slug, so a refusal never wears idle's name. The idle obligation remains.
+    Idle { reason: &'static str },
+    /// `current` is installed but the frame's continuation does not authenticate against it —
+    /// no owner, another task, another incarnation. Returning would run the wrong continuation.
+    Unauthenticated(FpuHomeRefusal),
+    /// The scheduler and the task table disagree about who is running.
+    Torn { tid: u64 },
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl OvertakenSettlement {
+    /// A stable slug for markers.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::ReturnToInstalled { .. } => "return_to_installed",
+            Self::Switch(_) => "switch",
+            Self::Idle { .. } => "idle",
+            Self::Unauthenticated(_) => "unauthenticated",
+            Self::Torn { .. } => "torn",
+        }
+    }
+}
+
 impl DispatchMarkOutcome {
     /// Test/hosted-only: the token, when there is one. Production callers reach it through an
     /// exhaustive `match` on all five outcomes, never through an `Option` that silently folds
@@ -3446,6 +3491,55 @@ impl SharedKernel {
             let _ = sched.current_cpu;
             kernel_ref(&sched.scheduler).current_tid_on(cpu).is_none()
         })
+    }
+
+    /// QEMU-SMP3-ACCEPTANCE §1 — THE settlement for a blocking-class drain (D2 send, D2 receive,
+    /// FutexWait, Yield) whose class re-verify failed; see [`OvertakenSettlement`].
+    ///
+    /// It decides from what IS on this CPU, never from what the outgoing task became:
+    ///
+    /// 1. `current` names a task: some owner installed a continuation. It is admitted only through
+    ///    the one authentication the ring-3/EL0 returns already apply to the frame they return
+    ///    through ([`Self::with_current_fpu_home_split`] with the frame's `resume_owner`): current
+    ///    here, current nowhere else, resumable, and the same incarnation. Otherwise it refuses.
+    /// 2. `current` is empty (or the idle sentinel): the queue advance the commit armed is still
+    ///    owed, and it is discharged by the SAME acquire every drain uses — one selection, one
+    ///    exact mark — over the class's own step. It may select the overtaken task itself, if the
+    ///    wake queued it here.
+    ///
+    /// `current` on a CPU is moved only by that CPU, which is running this drain with interrupts
+    /// masked, so the observation in (1)/(2) holds until the bridge applies the settlement. No
+    /// broad acquisition, no retry, no enqueue and no syscall result is produced here.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn settle_overtaken_deferral_split(
+        &self,
+        authority: DispatchAuthority,
+        prepared: Option<FpuHomeOwner>,
+        site: &'static str,
+        step: impl Fn(&Self, DispatchAuthority) -> CpuDispatch,
+    ) -> OvertakenSettlement {
+        let cpu = authority.cpu();
+        if matches!(self.current_tid_split_read(cpu), Some(tid) if tid != 0) {
+            let Some(owner) = prepared else {
+                return OvertakenSettlement::Unauthenticated(FpuHomeRefusal::UnownedContinuation);
+            };
+            return match self.with_current_fpu_home_split(
+                cpu,
+                FpuHomeExpectation::Owner(owner),
+                |_| (),
+            ) {
+                Ok((owner, ())) => OvertakenSettlement::ReturnToInstalled { owner },
+                Err(refusal) => OvertakenSettlement::Unauthenticated(refusal),
+            };
+        }
+        match self.queue_advance_acquire_incoming_split(authority, site, step) {
+            DispatchAcquire::Resumable(token) => OvertakenSettlement::Switch(token),
+            DispatchAcquire::Torn { tid } => OvertakenSettlement::Torn { tid },
+            other => OvertakenSettlement::Idle {
+                reason: other.marker(),
+            },
+        }
     }
 
     /// Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): the authoritative queue-advancing

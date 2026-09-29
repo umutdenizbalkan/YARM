@@ -9879,3 +9879,7 @@ pub struct Bootstrap;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "overtaken_tests/tests.rs"]
+mod overtaken_tests;

@@ -2029,6 +2029,133 @@ pub fn handle_trap_entry_shared(
         );
     }
 
+    /// QEMU-SMP3-ACCEPTANCE §1 — the ONE application of [`crate::runtime::OvertakenSettlement`]
+    /// for every blocking-class drain on this bridge whose class re-verify failed.
+    ///
+    /// The shared policy decides from what is installed on this CPU; only the application is
+    /// architecture-specific, and each arm delegates to the owner that already exists for it:
+    ///
+    /// * `ReturnToInstalled` — the frame already holds the authenticated current continuation, so
+    ///   the ordinary tail returns to it (and applies its own FP/SIMD settlement to the same owner).
+    /// * `Switch` — the SAME exact-token resume the successful drains use
+    ///   (`d2_resume_marked_incoming`: the x86_64 core, or the AArch64 `_core`), which applies the
+    ///   marked incarnation's context, consumes its parked completion and binds the frame's owner.
+    ///   A refusal after the mark undoes the exact dequeue and diverges.
+    /// * `Idle` — the idle obligation, through each port's established terminal: x86_64 returns and
+    ///   the raw trap tail's `current == None` landing idles (after its owner revalidation), and
+    ///   AArch64 enters the post-lock idle terminal, which never `eret`s through this frame.
+    /// * `Unauthenticated` / `Torn` — genuinely contradictory: fail closed without returning.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn settle_overtaken_at_bridge(
+        shared: &crate::runtime::SharedKernel,
+        trap_path: &TrapPathWindow,
+        cpu: CpuId,
+        frame: Option<&mut TrapFrame>,
+        outgoing: Option<u64>,
+        site: &'static str,
+        step: impl Fn(
+            &crate::runtime::SharedKernel,
+            crate::runtime::DispatchAuthority,
+        ) -> crate::runtime::CpuDispatch,
+    ) {
+        use crate::runtime::OvertakenSettlement as S;
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x86_64"
+        } else {
+            "aarch64"
+        };
+        let prepared = frame.as_deref().and_then(TrapFrame::resume_owner);
+        let settlement =
+            shared.settle_overtaken_deferral_split(trap_path.authority(), prepared, site, step);
+        let outgoing = outgoing.unwrap_or(u64::MAX);
+        #[cfg(any(
+            feature = "aarch64-overtaken-witness",
+            feature = "x86-overtaken-witness"
+        ))]
+        {
+            let (incoming, asid) = match settlement {
+                S::Switch(token) => (token.tid(), token.expect_asid().map(|a| a.0).unwrap_or(0)),
+                S::ReturnToInstalled { owner } => (owner.tid, owner.asid.0),
+                _ => (u64::MAX, 0),
+            };
+            crate::kernel::overtaken_witness::note_settlement(
+                outgoing,
+                settlement.marker(),
+                incoming,
+                asid,
+            );
+        }
+        match settlement {
+            S::ReturnToInstalled { owner } => {
+                crate::yarm_log!(
+                    "OVERTAKEN_DEFERRAL_SETTLED arch={} site={} cpu={} outgoing={} incoming={} asid={} settlement=return_to_installed",
+                    arch,
+                    site,
+                    cpu.0,
+                    outgoing,
+                    owner.tid,
+                    owner.asid.0
+                );
+            }
+            S::Switch(token) => {
+                let inc = token.tid();
+                let asid = token.expect_asid().map(|a| a.0).unwrap_or(0);
+                if !d2_resume_marked_incoming(shared, token, frame) {
+                    let rolled_back = token
+                        .into_dequeued_authority()
+                        .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
+                    trap_path.retire();
+                    d2_resume_refused_fatal(cpu, inc, rolled_back);
+                }
+                crate::yarm_log!(
+                    "OVERTAKEN_DEFERRAL_SETTLED arch={} site={} cpu={} outgoing={} incoming={} asid={} settlement=switch",
+                    arch,
+                    site,
+                    cpu.0,
+                    outgoing,
+                    inc,
+                    asid
+                );
+            }
+            S::Idle { reason } => {
+                crate::yarm_log!(
+                    "OVERTAKEN_DEFERRAL_SETTLED arch={} site={} cpu={} outgoing={} incoming=none reason={} settlement=idle",
+                    arch,
+                    site,
+                    cpu.0,
+                    outgoing,
+                    reason
+                );
+                #[cfg(target_arch = "x86_64")]
+                crate::arch::x86_64::trap::settle_post_lock_terminal_idle(cpu, outgoing, site);
+                #[cfg(target_arch = "aarch64")]
+                {
+                    trap_path.retire();
+                    crate::arch::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(
+                        cpu, outgoing,
+                    );
+                }
+            }
+            S::Unauthenticated(refusal) => {
+                crate::yarm_log!(
+                    "OVERTAKEN_DEFERRAL_UNAUTHENTICATED arch={} site={} cpu={} outgoing={} tid={} reason={} action=fatal",
+                    arch,
+                    site,
+                    cpu.0,
+                    outgoing,
+                    refusal.tid(),
+                    refusal.reason()
+                );
+                trap_path.retire();
+                d2_resume_refused_fatal(cpu, refusal.tid(), false);
+            }
+            S::Torn { tid } => {
+                trap_path.retire();
+                dispatch_torn_fatal(cpu, tid, site);
+            }
+        }
+    }
+
     // Stage 169 (D2-GENUINE-SEND): drain the deferred blocking-SEND queue-
     // advancing dispatch OUTSIDE the global lock (mirrors the recv drain below).
     // U9-D6-FINAL (C1, gate 1 of 5) — THE D6-KNOB TERMS ARE REMOVED HERE.
@@ -2145,11 +2272,24 @@ pub fn handle_trap_entry_shared(
                 d2_settle_idle(cpu, outgoing);
             }
         } else {
+            // QEMU-SMP3-ACCEPTANCE §1: the sender is no longer `Blocked(EndpointSend)` — another
+            // CPU's receiver took its message (parking an `IpcSend` completion) and woke it, or it
+            // was torn down. The commit still cleared `current`, so the frame holds a parked
+            // continuation and the queue advance is still owed. Cleared exactly once, then settled.
             crate::yarm_log!(
                 "D2_SEND_GENUINE_FALLBACK reason=state_changed cpu={}",
                 cpu.0
             );
             crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
+            settle_overtaken_at_bridge(
+                shared,
+                &trap_path,
+                cpu,
+                frame.as_deref_mut(),
+                outgoing,
+                "d2_send_overtaken",
+                |k, a| k.d2_send_dispatch_step_mut(a),
+            );
         }
     }
     // U9-D6-FINAL (C1, gate 2 of 5) — THE D6-KNOB TERMS ARE REMOVED HERE.
@@ -2268,11 +2408,22 @@ pub fn handle_trap_entry_shared(
                 d2_settle_idle(cpu, outgoing);
             }
         } else {
+            // QEMU-SMP3-ACCEPTANCE §1: the receiver is no longer `Blocked(EndpointReceive)` — a
+            // sender or a timeout completed it first. Same debt as the send drain above.
             crate::yarm_log!(
                 "D2_RECV_GENUINE_FALLBACK reason=state_changed cpu={}",
                 cpu.0
             );
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+            settle_overtaken_at_bridge(
+                shared,
+                &trap_path,
+                cpu,
+                frame.as_deref_mut(),
+                outgoing,
+                "d2_recv_overtaken",
+                |k, a| k.d2_recv_dispatch_step_mut(a),
+            );
         }
     }
 
@@ -2521,6 +2672,10 @@ pub fn handle_trap_entry_shared(
     if futex_wait_was_deferred {
         crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_BEGIN cpu={}", cpu.0);
         let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+        // QEMU-SMP3-ACCEPTANCE §2: the default-off witness's one synchronization point — after the
+        // commit, before the re-verify, with no lock held.
+        #[cfg(feature = "x86-overtaken-witness")]
+        crate::kernel::overtaken_witness::hold_before_futex_drain(shared, cpu, outgoing);
         let reverify_ok = outgoing
             // U9-EXIT1 §3: a THIRD outgoing state joins the two this drain already admits, and
             // each is still verified exactly. A FutexWait caller is `Blocked(Futex)`; a terminally
@@ -2637,13 +2792,24 @@ pub fn handle_trap_entry_shared(
                 crate::kernel::boot::maybe_log_futex_wait_retired();
             }
         } else {
-            // A FutexWake (or in-lock fallback) already changed the waiter's state — do NOT
-            // dispatch it away; fall through so the trap returns to the re-runnable task.
+            // QEMU-SMP3-ACCEPTANCE §1: a FutexWake on another CPU already made the waiter
+            // `Runnable` and queued it. That authorizes no return through this frame: `current` is
+            // empty, and the queued task resumes only when a queue advance selects it. The advance
+            // is still owed.
             crate::yarm_log!(
                 "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=state_changed cpu={}",
                 cpu.0
             );
             crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            settle_overtaken_at_bridge(
+                shared,
+                &trap_path,
+                cpu,
+                frame.as_deref_mut(),
+                outgoing,
+                "futex_wait_overtaken",
+                |k, a| k.futex_wait_dispatch_step_mut(a),
+            );
         }
     }
 
@@ -2664,6 +2830,9 @@ pub fn handle_trap_entry_shared(
             && crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
         if futex_wait_was_deferred {
             let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+            // QEMU-SMP3-ACCEPTANCE §2: the default-off witness's one synchronization point.
+            #[cfg(feature = "aarch64-overtaken-witness")]
+            crate::kernel::overtaken_witness::hold_before_futex_drain(shared, cpu, outgoing);
             // U9-FT4: the drain admits TWO outgoing states and verifies each exactly — a
             // FutexWait caller is `Blocked(Futex)`, a terminally faulted task is `Faulted`. Both
             // mean the outgoing task is off the CPU and a queue advance is owed, so they share
@@ -2832,14 +3001,24 @@ pub fn handle_trap_entry_shared(
                     super::aarch64::trap::enter_post_lock_idle(cpu);
                 }
             } else {
-                // Split FutexWake flipped the outgoing task to Runnable before the drain ran —
-                // do NOT stale-dispatch it away; decline and clear (the trap returns to the
-                // now-re-runnable task). No duplicate enqueue, no lost waiter.
+                // QEMU-SMP3-ACCEPTANCE §1: a FutexWake on the other CPU made the waiter `Runnable`
+                // and queued it before this drain ran. The commit cleared `current`, so returning
+                // through this frame would resume a queued task (and the vector tail's FP/SIMD
+                // authentication would refuse it and halt). The queue advance is still owed.
                 crate::yarm_log!(
                     "AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed cpu={}",
                     cpu.0
                 );
                 crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                settle_overtaken_at_bridge(
+                    shared,
+                    &trap_path,
+                    cpu,
+                    frame.as_deref_mut(),
+                    outgoing,
+                    "aarch64_futex_wait_overtaken",
+                    |k, a| k.futex_wait_dispatch_step_mut(a),
+                );
             }
         }
     }
@@ -2949,12 +3128,23 @@ pub fn handle_trap_entry_shared(
                     super::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(cpu, outgoing);
                 }
             } else {
-                // An in-lock fallback already dispatched — do NOT double-dispatch.
+                // QEMU-SMP3-ACCEPTANCE §1: `current` is NOT clear, so some owner installed a
+                // continuation after the commit. Do not double-dispatch — but do not return to it
+                // on its say-so either: the frame must hold exactly that incarnation.
                 crate::yarm_log!(
                     "AARCH64_YIELD_DISPATCH_DEFERRED reason=state_changed cpu={}",
                     cpu.0
                 );
                 crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                settle_overtaken_at_bridge(
+                    shared,
+                    &trap_path,
+                    cpu,
+                    frame.as_deref_mut(),
+                    outgoing,
+                    "aarch64_yield_overtaken",
+                    |k, a| k.yield_dispatch_step_mut(a),
+                );
             }
         }
     }
@@ -3058,9 +3248,20 @@ pub fn handle_trap_entry_shared(
                 crate::kernel::boot::maybe_log_yield_retired();
             }
         } else {
-            // An in-lock fallback already dispatched — do NOT double-dispatch.
+            // QEMU-SMP3-ACCEPTANCE §1: `current` is NOT clear. Authenticate the installed
+            // continuation against the frame rather than returning to it on its say-so.
             crate::yarm_log!("YIELD_DISPATCH_DEFERRED reason=state_changed cpu={}", cpu.0);
+            let outgoing = crate::kernel::boot::yield_dispatch_outgoing(cpu_idx);
             crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+            settle_overtaken_at_bridge(
+                shared,
+                &trap_path,
+                cpu,
+                frame.as_deref_mut(),
+                outgoing,
+                "yield_overtaken",
+                |k, a| k.yield_dispatch_step_mut(a),
+            );
         }
     }
 

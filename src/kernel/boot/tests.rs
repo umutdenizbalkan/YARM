@@ -125247,13 +125247,22 @@ mod stage199d_wa3a_transition_barriers {
                 + src
                     .matches("\"ipc_recv_unsettled\",\n                    );")
                     .count();
+            // QEMU-SMP3-ACCEPTANCE §1 — a THIRD consumer shape: the overtaken-deferral settlement's
+            // acquire lives in the shared policy (`settle_overtaken_deferral_split`), which hands
+            // the torn outcome back typed; the bridge's ONE application routes it here.
+            let overtaken = src.matches("S::Torn { tid } =>").count();
             assert_eq!(
                 src.matches("dispatch_torn_fatal(").count() - recv_unsettled,
-                direct + delegating,
-                "{rel}: EVERY consumer of either shape must route a torn dispatch to the \
-                 divergent fatal"
+                direct + delegating + overtaken,
+                "{rel}: EVERY consumer of any shape must route a torn dispatch to the divergent \
+                 fatal"
             );
         }
+        let runtime = production_source("src/runtime.rs");
+        assert!(
+            runtime.contains("DispatchAcquire::Torn { tid } => OvertakenSettlement::Torn { tid },"),
+            "the overtaken settlement must hand a torn acquire back as its own typed outcome"
+        );
     }
 
     // ── WA3A-R2-SEAL F: the resume uses the token's exact identity ─────────────────────────
@@ -147437,10 +147446,20 @@ mod u9qa_split_dispatch_disposition {
         // that owns its own five-outcome match and was not migrated — its admission gate remains
         // until separately justified. Three sites, unchanged in number; what changed is that two
         // of them now settle through the one shared owner.
+        // QEMU-SMP3-ACCEPTANCE §1: the six overtaken-deferral settlements (D2 send, D2 receive,
+        // the two FutexWait drains and the two Yield drains) hand their class step to the shared
+        // policy, which owns the ONE acquire for that path; they are not drains of their own.
+        assert_eq!(
+            code.matches("settle_overtaken_at_bridge(").count(),
+            7,
+            "one adapter definition and exactly six overtaken settlements"
+        );
+        let overtaken_futex = 2;
+        let overtaken_yield = 2;
         assert_eq!(
             code.matches("|k, a| k.futex_wait_dispatch_step_mut(a),")
                 .count(),
-            2,
+            2 + overtaken_futex,
             "the two queue-advancing FutexWait drains must delegate through the shared acquire"
         );
         assert_eq!(
@@ -147454,7 +147473,9 @@ mod u9qa_split_dispatch_disposition {
                 .count(),
             code.matches("|k, a| k.futex_wait_dispatch_step_mut(a),")
                 .count()
-                + code.matches("|k, a| k.yield_dispatch_step_mut(a),").count(),
+                - overtaken_futex
+                + code.matches("|k, a| k.yield_dispatch_step_mut(a),").count()
+                - overtaken_yield,
             "every acquire is one of those two classes — no third drain was introduced"
         );
     }

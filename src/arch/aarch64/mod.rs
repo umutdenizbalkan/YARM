@@ -14,6 +14,14 @@ pub mod context_switch;
 pub mod context_witness;
 pub mod dtb;
 pub mod irq;
+/// QEMU-SMP3-ACCEPTANCE §2 — the overtaken-deferral witness's AArch64 provisioning. Built only with
+/// `aarch64-overtaken-witness`; no default or production profile carries it.
+#[cfg(all(
+    feature = "aarch64-overtaken-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64"
+))]
+pub mod overtaken_witness;
 pub mod page_table;
 /// QEMU-IRQ2 — the PL011 external-interrupt witness fixture. Compiled only with
 /// `aarch64-pl011-irq-witness`; no default or production profile carries it.

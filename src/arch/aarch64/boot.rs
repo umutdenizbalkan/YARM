@@ -8396,6 +8396,14 @@ pub fn bootstrap_first_user_task(
             crate::yarm_log!("SMP2_WITNESS_PROVISION_FAIL err={:?} result=fail", e);
         }
     }
+    // QEMU-SMP3-ACCEPTANCE §2: the overtaken-deferral witness's two kernel-built tasks. Compile-time
+    // gated and armed only with the AP dispatch knob, like the SMP2 witness.
+    #[cfg(feature = "aarch64-overtaken-witness")]
+    if crate::arch::aarch64::smp::requested() {
+        if let Err(e) = crate::arch::aarch64::overtaken_witness::provision(kernel) {
+            crate::yarm_log!("OVT_WITNESS_PROVISION_FAIL err={:?} result=fail", e);
+        }
+    }
     // QEMU-CONTEXT1 §3: the user execution-state witness. Compile-time gated only, and mutually
     // exclusive with every slot-5/13/14 cell above (it stands down unless all three are zero).
     #[cfg(feature = "context1-witness")]

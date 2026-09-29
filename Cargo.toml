@@ -89,6 +89,12 @@ aarch64-smp2-witness = []
 # to each hart, the bounded IPI / fence / context transaction record, and its synchronous dump.
 # Armed only together with `yarm.ap_user_dispatch=1` on a `-smp 2` boot.
 riscv64-smp3-witness = []
+# QEMU-SMP3-ACCEPTANCE: the overtaken-deferral witness — a FutexWait caller on CPU 0 whose drain is
+# held (bounded, no lock held) until the other CPU's production FutexWake has made it Runnable, so
+# the shared bridge's overtaken settlement runs live; one sealed summary. Armed only together with
+# the port's two-CPU user-dispatch profile. The x86_64 form runs on the SMP oracle profile.
+aarch64-overtaken-witness = []
+x86-overtaken-witness = ["x86-ipccall-direct-smp-oracle"]
 
 # Stage 200C2B core: the ARCH-NEUTRAL reply-timeout retirement machinery (the reversible NR7
 # reply-win reserve/commit/rollback, the `ClaimedByReply` deadline lease, the NARROW off-lock

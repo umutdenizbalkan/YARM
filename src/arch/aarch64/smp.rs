@@ -353,5 +353,7 @@ pub fn ap_dispatch_main(cpu: CpuId) -> ! {
     }
     #[cfg(feature = "aarch64-smp2-witness")]
     crate::arch::aarch64::smp2_witness::ap_admitted(shared, cpu);
+    #[cfg(feature = "aarch64-overtaken-witness")]
+    crate::arch::aarch64::overtaken_witness::ap_admitted(shared, cpu);
     crate::arch::aarch64::trap::enter_ap_idle(cpu)
 }

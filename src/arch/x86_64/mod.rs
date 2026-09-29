@@ -30,6 +30,10 @@ pub mod vm_layout;
 /// `context1-witness`; no default or production profile carries it.
 #[cfg(all(feature = "context1-witness", not(feature = "hosted-dev")))]
 pub mod context_witness;
+/// QEMU-SMP3-ACCEPTANCE §2 — the overtaken-deferral witness's x86_64 programs. Built only with
+/// `x86-overtaken-witness`.
+#[cfg(all(feature = "x86-overtaken-witness", not(feature = "hosted-dev")))]
+pub mod overtaken_witness;
 /// QEMU-SMP1 §3 — the two-CPU IPI / TLB witness. Built only with `x86-smp1-witness`.
 #[cfg(all(feature = "x86-smp1-witness", not(feature = "hosted-dev")))]
 pub mod smp1_witness;
