@@ -24120,8 +24120,10 @@ witness profile does not compile, because its feature-gated idle-origin external
 `Riscv64TrapContext` without the new `software_interrupt` field — no default, witness or core build
 compiles that function. It now names the field (`None`), a guard pins every initializer, and every
 RISC-V, AArch64 and x86 witness/oracle profile was compile-checked before the second freeze. The fix
-touches only that feature-gated function, so the SMP3 witness image the controls ran against is
-unchanged.
+touches only that feature-gated function, but it shifts the source-line locations the image embeds,
+so the SMP3 witness image is NOT the one the controls above ran against (`05e6a247`, image
+`88489969…`; now `46ddbf4c…`). The controls are therefore re-run from the final freeze, and — like
+qualification — reported with it rather than in this text.
 
 **Qualification** is of the frozen commit that carries this text, run from a fresh isolated
 worktree: three consecutive strict two-hart witness boots, each a fresh build, then every gate
