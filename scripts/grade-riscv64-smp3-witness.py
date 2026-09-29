@@ -28,6 +28,39 @@ sbi = next((l for l in lines if "Runtime SBI Version" in l), None)
 osbi = next((l for l in lines if re.search(r"OpenSBI v\d", l)), None)
 if not sbi or not osbi:
     fail("the OpenSBI banner (version, runtime SBI version) is missing")
+
+# QEMU-SMP3-ACCEPTANCE §3 — THE QUALIFIED FIRMWARE. The remote-fence completion claim holds for one
+# pinned implementation, so every boot must prove it ran exactly that one: the runner's recorded
+# artifact, the banner, and the firmware's own Base-extension answer. Any missing piece fails.
+pin_path = sys.argv[3] if len(sys.argv) > 3 else None
+ident_path = sys.argv[4] if len(sys.argv) > 4 else None
+if not pin_path or not ident_path:
+    fail("no firmware pin / artifact identity was given: the firmware is unqualified")
+else:
+    pin = dict(l.split("=", 1) for l in open(pin_path).read().splitlines() if "=" in l and not l.startswith("#"))
+    try:
+        ident = open(ident_path).read()
+    except OSError:
+        ident = ""
+    m = re.search(r"^firmware_sha256=([0-9a-f]{64})$", ident, re.M)
+    if not m:
+        fail("the run recorded no firmware identity")
+    elif m.group(1) != pin["sha256"]:
+        fail("the booted firmware %s is not the pinned %s" % (m.group(1), pin["sha256"]))
+    if osbi and pin["banner"] not in osbi:
+        fail("the banner names %r, not the pinned %r" % (osbi.strip(), pin["banner"]))
+    if sbi and not re.search(r"Runtime SBI Version\s*:\s*%s\b" % re.escape(pin["runtime_sbi"]), sbi):
+        fail("the runtime SBI version is not the pinned %s" % pin["runtime_sbi"])
+    ids = [re.search(r"SMP3_SBI_IDENTITY spec=0x([0-9a-f]+) impl_id=(\d+) impl_version=0x([0-9a-f]+)", l) for l in lines]
+    ids = [x for x in ids if x]
+    if len(ids) != 1:
+        fail("expected exactly one firmware self-identification, saw %d" % len(ids))
+    else:
+        spec, impl_id, impl_ver = int(ids[0].group(1), 16), int(ids[0].group(2)), int(ids[0].group(3), 16)
+        if (spec, impl_id, impl_ver) != (int(pin["spec"], 16), int(pin["impl_id"]), int(pin["impl_version"], 16)):
+            fail("the firmware identifies as spec=0x%x impl_id=%d impl_version=0x%x, not the pinned implementation" % (spec, impl_id, impl_ver))
+        else:
+            print("[smp3-witness] firmware pinned: sha256=%s impl_id=%d impl_version=0x%x spec=0x%x" % (pin["sha256"][:16], impl_id, impl_ver, spec))
 # Printed while only one hart writes the console (the secondary is parked, or not yet released),
 # so each must be present exactly once and intact.
 for pat, want in [

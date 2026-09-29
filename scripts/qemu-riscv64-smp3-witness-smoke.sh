@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # QEMU-SMP3 — the RISC-V two-hart IPI / remote-fence / context witness, on QEMU virt / rv64 /
-# 512M / -smp 2 with OpenSBI (`-bios default`) and `yarm.ap_user_dispatch=1`.
+# 512M / -smp 2 with the PINNED OpenSBI (`scripts/firmware/riscv64-opensbi.pin`, booted from this
+# run's own copy with an explicit `-bios`) and `yarm.ap_user_dispatch=1`.
 #
 # Usage: scripts/qemu-riscv64-smp3-witness-smoke.sh
 #   LOGDIR=...     where the build, the artifact identity and the boot log land
@@ -61,6 +62,12 @@ BUILD_DIR="$LOGDIR/build"
 BOOT_LOG="$LOGDIR/boot.log"
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
 KELF=target/riscv64gc-unknown-none-elf/release/kernel_boot
+# QEMU-SMP3-ACCEPTANCE §3: the qualified firmware is PINNED. `FIRMWARE` may name another file (the
+# negative controls do); the pin itself is never overridden, so anything else fails.
+PIN=scripts/firmware/riscv64-opensbi.pin
+pin() { sed -n "s/^$1=//p" "$PIN"; }
+FIRMWARE=${FIRMWARE:-$(pin path)}
+BOOT_FW="$BUILD_DIR/opensbi-fw_dynamic.bin"
 
 if [[ "${SKIP_BUILD:-0}" != "1" && "${REGRADE:-0}" != "1" ]]; then
   echo "[smp3-witness] building riscv64 artifacts, then the kernel with riscv64-smp3-witness, into $BUILD_DIR"
@@ -72,13 +79,22 @@ if [[ "${SKIP_BUILD:-0}" != "1" && "${REGRADE:-0}" != "1" ]]; then
     --target riscv64gc-unknown-none-elf --profile release \
     --no-default-features --features riscv64-smp3-witness -p yarm --bin kernel_boot \
     >"$LOGDIR/kbuild.log" 2>&1 || { echo "SMP3_WITNESS_SEAL result=fail reason=kernel_build"; exit 1; }
+  [[ -f "$FIRMWARE" ]] || { echo "SMP3_WITNESS_SEAL result=fail reason=firmware_missing path=$FIRMWARE"; exit 1; }
+  FW_SHA=$(sha256sum "$FIRMWARE" | cut -d' ' -f1)
+  [[ "$FW_SHA" == "$(pin sha256)" ]] \
+    || { echo "SMP3_WITNESS_SEAL result=fail reason=firmware_substituted sha256=$FW_SHA pinned=$(pin sha256)"; exit 1; }
+  cp "$FIRMWARE" "$BOOT_FW"
   cp "$KELF" "$BUILD_DIR/yarm-riscv64-smp3.elf"
   llvm-objcopy -O binary "$KELF" "$BUILD_DIR/yarm-riscv64-smp3.bin" \
     || { echo "SMP3_WITNESS_SEAL result=fail reason=objcopy"; exit 1; }
   {
     echo "tree=$(git rev-parse HEAD^{tree} 2>/dev/null) head=$(git rev-parse HEAD 2>/dev/null) dirty=$(git status --porcelain | wc -l) features=riscv64-smp3-witness"
-    echo "firmware=$($QEMU_BIN --version | head -n1) bios=default(opensbi)"
-    sha256sum "$BUILD_DIR/yarm-riscv64-smp3.bin" "$BUILD_DIR/yarm-riscv64-smp3.elf" "$BUILD_DIR/initramfs-core.cpio"
+    echo "qemu=$($QEMU_BIN --version | head -n1) machine=virt cpu=rv64 smp=2 cmdline=console=ttyS0 rdinit=/init yarm.ap_user_dispatch=1"
+    echo "firmware_path=$FIRMWARE"
+    echo "firmware_provenance=$(pin provenance) installed=$(dpkg-query -W -f='${Package} ${Version}' qemu-system-data 2>/dev/null)"
+    echo "firmware_sha256=$(sha256sum "$BOOT_FW" | cut -d' ' -f1)"
+    echo "firmware_pinned_banner=$(pin banner) runtime_sbi=$(pin runtime_sbi) impl_id=$(pin impl_id) impl_version=$(pin impl_version) spec=$(pin spec)"
+    sha256sum "$BUILD_DIR/yarm-riscv64-smp3.bin" "$BUILD_DIR/yarm-riscv64-smp3.elf" "$BUILD_DIR/initramfs-core.cpio" "$BOOT_FW"
   } >"$LOGDIR/artifact-identity.txt"
 fi
 
@@ -88,7 +104,7 @@ if [[ "${REGRADE:-0}" != "1" ]]; then
 import subprocess, sys, time, os, select
 qemu, build, log, budget = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
 args = [qemu, "-machine", "virt", "-cpu", "rv64", "-m", "512M", "-smp", "2",
-        "-nographic", "-monitor", "none", "-serial", "stdio", "-bios", "default",
+        "-nographic", "-monitor", "none", "-serial", "stdio", "-bios", os.path.join(build, "opensbi-fw_dynamic.bin"),
         "-no-reboot",
         "-kernel", os.path.join(build, "yarm-riscv64-smp3.bin"),
         "-initrd", os.path.join(build, "initramfs-core.cpio"),
@@ -122,4 +138,4 @@ scripts/check-riscv64-smp3-sequence.sh "$BUILD_DIR/yarm-riscv64-smp3.elf" > "$LO
 SEQ_STATUS=$?
 sed 's/^/[smp3-witness] /' "$LOGDIR/sequence.txt"
 
-python3 scripts/grade-riscv64-smp3-witness.py "$BOOT_LOG" "$SEQ_STATUS"
+python3 scripts/grade-riscv64-smp3-witness.py "$BOOT_LOG" "$SEQ_STATUS" "$PIN" "$LOGDIR/artifact-identity.txt"

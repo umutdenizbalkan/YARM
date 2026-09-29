@@ -101,6 +101,22 @@ pub fn probe_extension(extension: usize) -> Result<usize, SbiError> {
     }
 }
 
+/// QEMU-SMP3-ACCEPTANCE §3 — the firmware's own identity, from the Base extension (FIDs 0, 1, 2):
+/// `(spec_version, impl_id, impl_version)`. Witness-only: the remote-fence completion claim is
+/// qualified against ONE implementation, and the grader checks the firmware that answered is it.
+#[cfg(feature = "riscv64-smp3-witness")]
+pub fn base_identity() -> Result<(usize, usize, usize), SbiError> {
+    let mut out = [0usize; 3];
+    for (fid, slot) in out.iter_mut().enumerate() {
+        let ret = sbi_call(SBI_EXT_BASE, fid, [0; 6]);
+        if let Some(err) = SbiError::from_error_code(ret.error) {
+            return Err(err);
+        }
+        *slot = ret.value;
+    }
+    Ok((out[0], out[1], out[2]))
+}
+
 pub fn hsm_hart_start(hart_id: usize, start_addr: usize, opaque: usize) -> Result<(), SbiError> {
     let ret = sbi_call(
         SBI_EXT_HSM,

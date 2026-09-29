@@ -1,0 +1,19 @@
+# QEMU-SMP3-ACCEPTANCE §3 — the ONE firmware the RISC-V SMP3 witness is qualified against.
+#
+# The SMP3 remote-invalidation argument relies on `sbi_remote_sfence_vma_asid` having COMPLETED on
+# every target hart when it returns. SBI 1.0 does not promise that; the audited OpenSBI v1.3
+# implementation (`sbi_tlb` synchronous request/ack) does. The claim is scoped to exactly this
+# artifact: the RFENCE extension being present proves nothing about completion.
+#
+# The runner verifies the file against `sha256`, copies it into the run's isolated artifact
+# directory and boots THAT copy with an explicit `-bios`; the grader requires the recorded identity,
+# the boot banner and the firmware's own Base-extension answer (impl_id / impl_version / spec) to
+# match. A missing or substituted firmware fails qualification.
+path=/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+sha256=171a91cceeb419d5cf238008c77641a13c4783d2540fec9294b1ba969bfa095d
+provenance=package qemu-system-data 1:8.2.2+ds-0ubuntu1.18 (QEMU's bundled OpenSBI, generic platform, fw_dynamic)
+banner=OpenSBI v1.3
+runtime_sbi=1.0
+impl_id=1
+impl_version=0x10003
+spec=0x1000000

@@ -333,6 +333,18 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
     kernel.enqueue_task(C_TID)?;
     ENABLED.store(true, Ordering::Release);
     rec::arm();
+    // QEMU-SMP3-ACCEPTANCE §3: the firmware that will complete the remote fences, as it reports
+    // itself. The grader requires it to be the pinned implementation.
+    match crate::arch::riscv64::sbi::base_identity() {
+        Ok((spec, impl_id, impl_version)) => crate::kernel::printk::printk_emit_sync(format_args!(
+            "SMP3_SBI_IDENTITY spec=0x{:x} impl_id={} impl_version=0x{:x}",
+            spec, impl_id, impl_version
+        )),
+        Err(e) => crate::kernel::printk::printk_emit_sync(format_args!(
+            "SMP3_SBI_IDENTITY result=fail err={:?}",
+            e
+        )),
+    }
     crate::kernel::printk::printk_emit_sync(format_args!(
         "SMP3_WITNESS_PROVISIONED s_tid={} s_asid={} c_tid={} c_asid={} h1_tid={} h1_asid={} h0_tid={} h0_asid={} mbx_phys=0x{:x} s_image={} c_image={} h_image={}",
         S_TID,
