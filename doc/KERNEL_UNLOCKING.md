@@ -23942,3 +23942,197 @@ QEMU TCG does not distinguish the completion barrier or break-before-make's brea
 obligations rest on the source and disassembly checks. Overlap is measured, lock contention is not.
 The positive RISC-V NR 0 witness needs the `riscv64-ipc-reply-timeout-oracle` kernel: a default core
 boot issues no Yield, so it is a regression smoke for the NR 0 term, never its witness.
+
+# QEMU-SMP3 — RISC-V two-hart interrupts, remote invalidation and context preservation
+
+Base: `80085b6f` (QEMU-SMP2-ACCEPTANCE), tree `a99da317`. U9 stays CLOSED (production `with_cpu=0`,
+`with_broad=0`; no broad acquisition added). RISC-V on QEMU 8.2.2 virt / rv64 / 512 MiB with two
+harts and the existing OpenSBI v1.3 (`-bios default`, runtime SBI 1.0). Everything new is
+default-off behind `yarm.ap_user_dispatch=1`; the witness is additionally compile-gated
+(`riscv64-smp3-witness`). Not in scope and not started: more harts, task migration, new drivers,
+FP/vector enablement, general logging repairs, real hardware.
+
+## 1 — the firmware/kernel contract, derived
+
+| fact | base |
+|---|---|
+| harts | OpenSBI releases one boot hart (its id is not fixed); secondaries are started through HSM `hart_start` before the command line is read. Logical CPU 0 is the boot hart; a secondary claims the lowest free id ≥ 1. **A CPU index is not a hart id**: the only map is `RISCV64_SECONDARY_CPU_IDS[slot = hart]`, and every firmware call names harts through it. |
+| secondary state | kernel `satp` + `sfence.vma`, a 4 KiB trap stack, real `stvec`, `sie = 0`, `sstatus.SIE = 0`, `wfi` park; scheduler: online, wake-only. No way out of the park (a `wfi` with nothing enabled never completes). |
+| IPI | SBI IPI extension (`0x735049`, FID 0) `send_ipi(hart_mask, base)`. OpenSBI raises `mip.SSIP` on the target through the M-mode ACLINT MSWI; S-mode never touches the CLINT and clears `sip.SSIP` itself. There is no PLIC claim and no completion for it. |
+| remote fence | RFENCE extension (`0x52464E43`) FID 2 `remote_sfence_vma_asid(hmask, base, start, size, asid)`. SBI 1.0 promises only that the request was sent; OpenSBI v1.3's `tlb_sync` spins until every target processed it, and drains its own queue while spinning, so two harts fencing each other cannot deadlock and the targets do the work in M-mode whatever their S-mode masking. Completion-on-return is therefore an implementation property (a limit) and **every SBI error fails closed**. |
+| remote wake | only the NR6/NR7 direct drains compare the committed wake target with the executing CPU; x86 and AArch64 send, RISC-V sent nothing. |
+| translation | an NR 3 replacement unmaps (PTE clear + LOCAL `sfence.vma va`), maps (PTE write + LOCAL fence), then asks `complete_unmap_shootdown_from_split` for the remote targets (`online & !wake_only & running this asid`, minus the requester); its RISC-V arm answered `false` for any remote target, so the displaced frame stayed pinned. Every U-return writes `satp` and `sfence.vma x0, x0`. |
+
+**Baseline, executed** (fresh worktree at `80085b6f`, kernel `89fac89d…`): `-smp 2` strict core
+smoke passes with the knob off and on; both show `RISCV_SCHEDULER_SMP_ONLINE cpu=1 wake_only=1
+dispatchable=0`, secondary `sie=0x0`, and zero SSIP or IPI markers of any kind. The knob had no
+effect on RISC-V. "Hart online" with zero arrivals is not interrupt qualification.
+
+## 2 — secondary dispatch and the reschedule IPI (production wiring)
+
+* **Trap stacks and the idle boundary are per CPU.** CPU 1 gets a 2 MiB trap stack (the boot
+  hart's size; the deepest dispatch exceeds 256 KiB) and a 64 KiB boot stack; the trap CPU is
+  derived from the frame's address within the published trap-stack regions. The S-mode timer
+  boundary latch, the idle unmask request, `sscratch`'s canonical top and the idle wake source are
+  per CPU; `SIE` is set only inside the stack-free `wfi` loop, exactly as on the boot hart.
+* **Release.** The boot hart, at the END of its boot `&mut KernelState` window (immediately before
+  its first `sret` to user), releases each trap-ready secondary only under the knob: SSIE on
+  itself, `mark_ready(0)`, the release flag, a fence, one IPI per secondary. A parked secondary
+  (SSIE as its only wake source, `SIE` clear) leaves the park only through `take_park_release`.
+* **Admission** (`riscv_secondary_dispatch_main`): `sstatus.SUM`, the scheduler's ONE transition
+  (`admit_pinned_dispatch`, the owner AArch64 uses: wake-only → dispatching, placeholder cleared,
+  excluded from balanced placement), its idle wake source, `mark_ready` last, then the same
+  authenticated idle boundary. Any refusal leaves it wake-only and masked.
+* **Send** (`ipi::send_reschedule`, one owner): only from the NR6/NR7 drains, after the transaction
+  returned `Ok` and only when the committed target is another CPU. Refuses (sending nothing) a
+  target not ready or without a hart. **Publication before notification**: `fetch_or` of the
+  sender's bit into the target's mailbox, `fence rw, rw`, then the SBI call.
+* **Arrival** (`ipi::take_arrival`, one owner per trap): clear `sip.SSIP`, THEN swap the mailbox,
+  so a publication racing the swap leaves SSIP pending for the next arrival rather than being
+  lost. Empty arrivals and merged publications are counted, never taken as loss or duplication.
+  U-origin: taken at the bridge entry and carried as `software_interrupt`; the interrupted task
+  keeps running (`RISCV_IPI_SETTLED … settlement=return_to_interrupted`). Idle-origin: the S-mode
+  landing owes the SAME idle queue advance the timer's owes, discharged by the same drain under an
+  `IPI_IDLE_ADVANCE_*` marker family. The IPI route is settled before, and instead of, the
+  external-claim route: no PLIC claim, no EOI.
+
+## 3 — defects the second hart exposed, and their repairs
+
+Each was measured live, repaired through existing owners, and is pinned by a guard.
+
+1. **An overtaken blocking deferral returned into a stale frame.** C's blocking receive committed
+   on CPU 0 (current cleared, D2 deferral) while S's reply on CPU 1 woke C. CPU 0's drain found its
+   outgoing task no longer blocked (`D2_RECV_GENUINE_FALLBACK reason=state_changed`), cleared the
+   deferral and fell through to `ReturnToCurrent` with nothing current: the bridge `sret`-ed into
+   C's saved frame while the scheduler held C on the run queue (then `IPC_RECV_SPLIT_REFUSED
+   reason=no_current_task` forever). The twin on CPU 1: the drain found nothing runnable and
+   published idle provenance, then C's call made S runnable before the terminal-idle check, which
+   also fell through. `settle_overtaken_deferral` now discharges the owed queue advance in the D2
+   send, D2 receive and FutexWait `state_changed` arms and in the terminal-idle
+   `(provenance, not terminal)` arm — re-verify `current` is clear, select and mark through
+   `queue_advance_acquire_incoming_split`, resume through the exact-token transaction, else the
+   typed idle terminal; `ReturnToCurrent` only if a current really is installed.
+2. **A never-consumed receive record zeroed `a0..a3` of every later preemption** (pre-existing).
+   RISC-V and x86 install a receive's result at publication and never consume the `IpcRecv`
+   completion record; `classify_and_take_async_resume` refused ANY parked record as
+   `continuation_coexists` and resumed the task through the startup argument lane. The supervisor
+   (tid 2) hit it 5–10× in every base boot; the witness client hit it after its startup deadline
+   receive (`RISCV_STARTUP_ARGS tid=9301 … a0=0 a1=0 a2=0 a3=0`, then `C_FAIL_VM_MAP`). Only a class
+   the port's resume boundary consumes (`resume_boundary_consumes`: `IpcSend`; `IpcRecv` on AArch64
+   and the oracle build — exactly `take_thread_restore_facts`' takes) can compete with an async tag
+   now. Since the repair: 0 refusals in every boot.
+3. **A reply racing its caller's block was declared spent.** The caller arms its record's terminal,
+   then publishes its blocked acknowledgement; the helper on the other hart replied in between
+   (`IPC_REPLY_TERMINAL_ARMED_SPLIT`, `IPCREPLY_DIRECT_MODE_INDETERMINATE terminal=AvailableExact`,
+   then the caller's `IPC_RECV_BLOCK_REGISTER`) and was refused `WrongObject`. An open, unclaimed
+   terminal now answers the non-mutating `WouldBlock` the x86 cross-CPU reply path already gives the
+   same state; reserved or settled terminals keep `WrongObject`.
+
+Reported, not changed: (a) the shared x86/AArch64 bridge has the same `state_changed`
+fall-throughs (`trap_entry.rs` D2 send/receive, FutexWait, Yield); AArch64 under its SMP2 knob has
+two dispatching CPUs and is exposed to defect 1 — producer: the other CPU's committed wake; missing
+owner: the drain's settlement of the owed queue advance; smallest contract:
+`settle_overtaken_deferral`'s. (b) CPU 0's idle timer tick can expire a receive deadline and resume
+the idle `wfi` with that task queued; it is dispatched at the next trap (one tick later). (c) Under
+the knob an admitted secondary's NR 0 declines `ArchGateOff` (`not_bsp`) and is settled off-lock by
+the existing queue-advance arm — measured 4× per witness boot; the guard that called it unreachable
+is re-derived.
+
+## 4 — remote invalidation
+
+`ipi::remote_invalidate_page` is the one owner: the hart mask from the target CPU set (no hart →
+`NoHart`, nothing sent), `fence rw, rw` (the requester's PTE store visible before any target is
+asked), the RFENCE call for exactly that asid/page, the firmware's `Ok` or a typed refusal. The
+coordinator's RISC-V arm reports completion only on `Ok`; phase S settles (unpins and reclaims) the
+displaced frame only after that answer. No software shootdown exists beside it and no IPI of ours
+is involved.
+
+**Residency.** QEMU flushes a vCPU's whole TLB on any `sfence.vma` or `satp` write, and the kernel
+writes `satp` and fences on every U-return, so no AArch64-style re-point probe can distinguish the
+tested fence. What IS distinguishable is whether the target took a supervisor entry at all: each
+hart counts its supervisor entries (`note_supervisor_entry`, right after the trap CPU is derived),
+the target records the count at its PRE step (after its last kernel entry, before the round) and
+at its OBSERVED step. A round is CREDITED only if OBSERVED = PRE + 1 (the observing DebugLog
+itself): the target stayed resident in U-mode, took no interrupt, no context switch and no fence of
+its own, so its new view of W is the remote fence's. Other rounds are graded as interfered (CPU 0's
+tick), never credited; at least two credited rounds per direction are required.
+
+## 5 — the witness and context
+
+Four kernel-built tasks (`arch::riscv64::smp3_witness`, programs in `smp3_witness.S`, PC-relative,
+no `gp`): S (CPU 1) and C (CPU 0), context-checked; helpers H1 (CPU 1) and H0 (CPU 0). CPU 1's two
+are placed by the admitted secondary itself and started by one witness-only self-IPI (it has no
+timer). Production owners only:
+
+| phase | exercised |
+|---|---|
+| P1 ×8 | C NR6 → PARKED S; S NR7 → PARKED C; every resume context-checked. "Parked": the target hart in its idle wait with no current task and an empty run queue (a labelled wait at the waker's last DebugLog, bounded, no lock held). |
+| P2 ×4 | C NR6 → H1 while S spins in register-checked window A on CPU 1 (the IPI taken from U-mode, `sepc` inside the window); mirror with window B on CPU 0. An arrival that found another task resident is counted apart; ≥ 1 in-window arrival per direction; every window checked. |
+| P3 ×8 | serial remote invalidation, alternating direction, credited by residency |
+| P4 ×4 | mutual: each replaces the other's W through production NR 3; both operations entered (labelled rendezvous at the owner's entry, no lock held) before either completed |
+
+Checked context: x1, x3–x29 and SP against a per-task pattern; `t5`/`t6` are the window's own
+instrument; `a0–a5`, `a7` are the syscall lanes across an `ecall`. Soft-float: FS = VS = Off in
+every interrupted user frame (graded). Records (`kernel::boot::smp3_record`) are appended at the
+owners' commit points, sealed after both tasks finish, dumped twice with per-line checksums; the
+kernel verifier and the independent grader (`scripts/grade-riscv64-smp3-witness.py`) must agree.
+The witness build serializes console lines (the two harts' byte-wise SBI console writes otherwise
+interleave); default builds are unchanged. Outcomes graded apart, never credited: `Preceded` (the
+IPI's idle advance selected another runnable task first), `TimerFirst`, `Busy`, `Displaced`.
+
+## 6 — tests, controls, qualification
+
+**Tests.** 12 source guards (`tests/qemu_smp3_scope.rs`: publication before notification, clear
+before consume, the fence before the RFENCE call and fail-closed on every error, one production
+owner per operation, no CLINT/PLIC traffic on the IPI path, the knob, the overtaken-deferral arms,
+the coexistence classes, the reply-race arm, the witness gates, the image check). Hosted:
+`sbi`/`ipi` (hart masks, mailbox merge/empty accounting, refusals), `smp3_record` (19: population,
+parked/preceded/resident classification, fence matching, crediting, overlap, premature
+settlement), the async-resume coexistence cases. Guards re-derived from their purpose: the RISC-V
+link-2 park guard (the one feature-gated witness line between release and admission), and the
+AArch64/RISC-V "AP is wake-only before online" guard (see §3 (c)); the stale `ArchGateOff` note in
+`yield_txn.rs` is corrected.
+
+**Controls**, from the candidate `05e6a247`, each one exact substitution applied only in its own
+worktree and restored (`mutate.py`; the unmutated candidate seals first in the same worktree):
+
+| control | what failed |
+|---|---|
+| `no_ipi` (publish + fence, never ask the firmware) | S is never woken (CPU 1 has no timer): the boot stops at the first `C_P1_CALL`; the image check also reports the missing `ecall` |
+| `no_ssip_clear` | SSIP stays pending: 19 353 re-entries, no progress past start-up |
+| `no_consume` (read the mailbox, never swap) | progress continues, but the population grading fails: sources consumed with no pending publication, merges with none pending |
+| `no_rfence` (skip the firmware, report success) | the RESIDENT target read the old W: `S_FAIL_STALE_AFTER_INVALIDATION round=1 aux=0xa0a0…a1` |
+| `fail_completion` (firmware answers an error) | fails closed: every round's fence failed, **no** displaced frame settled (`settled=0`), none credited |
+| `substitute_completion` (fence the requester's own hart) | the firmware really fenced and returned `Ok`, yet the target read the old W (round 1) |
+| `corrupt_ctx` (flip x7 on the exact-token resume) | `S_FAIL_P1_CONTEXT round=1 aux=0x80` — exactly x7 |
+| `serialize_ops` (one global lock around NR 3) | all four mutual rounds SERIALIZED; the bounded rendezvous timed out 4× and nothing deadlocked across the firmware fence |
+| `no_wake_fence`, `no_rfence_fence`, `consume_before_clear` | **the boot seals `SMP3_VERDICT result=ok`** — QEMU cannot distinguish them — and only the image check fails each, naming the step |
+
+Verifier controls, separate from those (`vmut.py`: one sealed record edited, checksums
+recomputed, on the candidate's own log) — each rejected for its own reason: a failed fence
+completion, a fence request naming the requester's hart, a phantom IPI source, the IPI's idle
+dispatch relabelled as the timer's, a context step moved to another round, and a settlement moved
+before its completion.
+
+**Candidates kept.** `bb87653d` failed its own control boot (defect 3 above) and was replaced; its
+log is kept with the controls.
+
+**Qualification** is of the frozen commit that carries this text, run from a fresh isolated
+worktree: three consecutive strict two-hart witness boots, each a fresh build, then every gate
+(hosted, integration and census, `fmt`, three freestanding builds with warning classes against a
+fresh base build, the RISC-V core/late-reply-Yield/UART/server-death/demand-COW profiles and the
+`-smp 2` core smoke with the knob off and on, AArch64 SMP2 and CONTEXT1, x86 SMP1, cross-CPU reply
+and user-consume). A document cannot carry the result of runs made on itself; the record — commit,
+tree, features, firmware and image hashes per run — is the delivery report of this package.
+
+## Limits
+
+* Completion of `remote_sfence_vma_asid` on return is OpenSBI v1.3's behaviour, not the SBI 1.0
+  contract; an error fails closed. Two harts, QEMU TCG, one firmware; no real hardware.
+* QEMU cannot distinguish a missing ordering fence; `scripts/check-riscv64-smp3-sequence.sh` checks
+  the built image (and the controls show deleting each required instruction fails it).
+* Live populations of the repairs, in the boots so far: the overtaken receive arm 1–3 per boot, the
+  terminal-idle arm once; the send and FutexWait arms and the reply-race arm none since their
+  repair (the reply race's producer is the recorded failure of `bb87653d`). Those are covered by
+  source guards and the shared owners they call, not by live evidence.
+* No FP/vector state is enabled or preserved on RISC-V (soft-float contract, graded).
