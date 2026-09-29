@@ -24287,6 +24287,44 @@ closed so no failed completion can authorize reclaim.
   is exactly that: no contended path was exercised, so nothing here qualifies behaviour under
   contention. This package measures none of its own.
 
+## 7 — freeze 1 (`a43e90b8`), its two failures, and what each was
+
+Freeze 1 was qualified in full and failed two gates; it is kept as a failed candidate (`wip` history,
+its artifacts and logs preserved), and the qualified tree is a later freeze.
+
+* **Hosted — the status-assignment census.** `every_production_task_status_assignment_site_is_
+  enumerated` counts `.status = ` writes in every source file outside `boot/tests.rs`; the overtaken
+  receiver case wrote `tcb.status` directly. A test-code defect of this package, found by the gate:
+  the case now uses `set_task_status_for_test` like the others, and the census is unchanged.
+* **SMP3 boot 3 — `fence_not_requested_for_the_resident_target` (TLB round 4).** PRE-EXISTING. In
+  the failing round the target (C, ASID 5) was not `current` on hart 0 when the requester's shootdown
+  computed its targets (C's hart took 9 supervisor entries between its PRE and OBSERVED steps), so
+  `live_cpu_bitmap_for_asid_split` named no remote hart, no firmware fence was requested, and the
+  page settled; C then observed the new page correctly. That skip is the kernel's contract, not a
+  missing fence: a hart not running the ASID executes `csrw satp; sfence.vma x0, x0` in every
+  activation before the ASID runs again. The SMP3 grader nevertheless requires a fence for every
+  displaced witness page, so a round whose target is momentarily off-CPU fails it. Fresh artifacts
+  from the true base `8ed21c1c` (its own runner, `-bios default`, the same firmware bytes) reproduce
+  the identical signature: under the qualification's concurrent load base passed 24/30 (2×
+  `fence_not_requested_for_the_resident_target`, 3× `ipi_sepc_outside_window`, 1×
+  `tlb_too_few_credited_rounds_per_direction`) and the candidate 22/30 (3/3/2 of the same three);
+  interleaved one-for-one on an otherwise idle host, base passed 12/15 and the candidate 13/15, the
+  same three signatures only. The candidate adds no failure mode and no measurable rate. The RISC-V
+  kernel differs from base only in witness-gated code (the three SBI Base calls and one identity
+  line at provisioning).
+
+The final candidate's controls also attribute the revert control per port rather than reading a
+witness failure alone: with the settlement reverted, **AArch64** reaches the base defect — CPU 0 is
+sampled through the QEMU monitor halted in the EL0 FP/SIMD return's refusal arm (the sampled `x20`
+equals the address that arm loads, read from the build's own disassembly) — and its fatal lines are
+lost to the printk ring, whose concurrent drain advances past a slot another CPU is still writing
+(pre-existing; the same loss drops an occasional settlement line in passing boots, which is why the
+witness grades its sealed summary, never line counts). **x86_64**'s FutexWait fall-through lands in
+the owner revalidation, which resumes W with the FutexWait result it already had, so W's own checks
+pass and the control fails on the settlement record alone; the x86_64 defect that is a wrong
+RESULT — the overtaken sender resuming without its parked `IpcSend` completion — is shown on the
+base by the deterministic `base_x86_revalidation_resumes_an_overtaken_sender_without_its_completion`.
+
 ## Limits
 
 * One live class per port (FutexWait). D2 send/receive and Yield overtaken settlements are covered
@@ -24296,6 +24334,10 @@ closed so no failed completion can authorize reclaim.
   revalidation, which is NOT exact-incarnation, is unchanged; after this package it no longer
   receives an overtaken deferral, but it remains the landing for other idle outcomes.
 * The witness's hold is a labelled synchronization point; everything around it is production.
+* The SMP3 witness is intermittent on its base (§7): about one boot in five fails a round whose
+  target was momentarily off-CPU or whose IPI landed outside the checked window. Three consecutive
+  strict boots are therefore a sample, not a guarantee; the grading is SMP3's and unchanged here.
+* The printk ring can drop a line under two-CPU logging (§7). No grade here depends on a line count.
 * The two reply-timeout retirement runners (`qemu-ipc-reply-timeout-{x86_64,aarch64}-retirement-smoke.sh`) fail on this package's base `8ed21c1c` exactly as on the candidate (fresh artifacts:
   x86_64 lacks its `IPC_REPLY_BEATS_TIMEOUT_OK` literal; AArch64's reply-wins cell emits none of its
   markers). They are pre-existing, outside this package, and not part of its qualification.
