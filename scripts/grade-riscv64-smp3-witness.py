@@ -240,8 +240,12 @@ def parked(after, src_cpu, dst_cpu, woken):
         return None, why
     if recs[a]["f"][1] & 0xFF == 1:
         d = find(a + 1, lambda r: r["cpu"] == dst_cpu and r["kind"] in ("idle_dispatch", "ipi_arrived"))
-        if d is None or recs[d]["kind"] != "idle_dispatch" or recs[d]["f"][1] != 1 or recs[d]["f"][0] != woken:
-            return None, "idle-boundary arrival seq %d not followed by the IPI-driven dispatch of tid %d" % (recs[a]["seq"], woken)
+        if d is None or recs[d]["kind"] != "idle_dispatch" or recs[d]["f"][1] != 1 or recs[d]["f"][0] == 0:
+            return None, "idle-boundary arrival seq %d not followed by an IPI-driven idle dispatch" % recs[a]["seq"]
+        # The IPI's idle advance selected another runnable task first: counted apart, never
+        # credited; the woken task's own context-checked resume on that hart is still required.
+        if recs[d]["f"][0] != woken:
+            return (d, "preceded"), None
         return (d, "ipi"), None
     ds = [i for i in range(after, a) if recs[i]["kind"] == "idle_dispatch" and recs[i]["cpu"] == dst_cpu
           and recs[i]["f"][1] == 0 and recs[i]["f"][0] == woken]
@@ -253,8 +257,9 @@ def parked(after, src_cpu, dst_cpu, woken):
 
 
 # ── PARKED TARGETS ──
-parked_n, ipi_to_s, ipi_to_c, timer_first, busy, at = 0, 0, 0, 0, 0, 0
-for k in (1, 2, 3, 4):
+parked_n, ipi_to_s, ipi_to_c, timer_first, busy, preceded, at = 0, 0, 0, 0, 0, 0, 0
+P1_ROUNDS = 8
+for k in range(1, P1_ROUNDS + 1):
     c = user(at, C["tid"], "C_P1_CALL", k)
     if c is None:
         fail("P1 round %d: C_P1_CALL missing" % k)
@@ -267,6 +272,7 @@ for k in (1, 2, 3, 4):
     ipi_to_s += route == "ipi"
     timer_first += route == "timer"
     busy += route == "busy"
+    preceded += route == "preceded"
     r = user(d, S["tid"], "S_P1_RESUMED", k)
     if r is None or recs[r]["cpu"] != 1:
         fail("P1 round %d: S did not resume (context-checked) on cpu 1" % k)
@@ -284,33 +290,52 @@ for k in (1, 2, 3, 4):
     ipi_to_c += route == "ipi"
     timer_first += route == "timer"
     busy += route == "busy"
+    preceded += route == "preceded"
     b = user(d, C["tid"], "C_P1_RESUMED", k)
     if b is None or recs[b]["cpu"] != 0:
         fail("P1 round %d: C did not resume (context-checked) on cpu 0" % k)
         break
     parked_n += 1
     at = b
-if ipi_to_s != 4 or ipi_to_c < 2:
-    fail("IPI-driven parked dispatches: %d/4 to CPU 1 (no timer there: all must be), %d/4 to CPU 0 (>= 2 required)" % (ipi_to_s, ipi_to_c))
+if ipi_to_s != P1_ROUNDS or ipi_to_c < 2:
+    fail("IPI-driven parked dispatches: %d/%d to CPU 1 (no timer there: all must be), %d/%d to CPU 0 (>= 2 required)" % (ipi_to_s, P1_ROUNDS, ipi_to_c, P1_ROUNDS))
 
-# ── USER TARGETS ──
-user_n = 0
-c = user(at, C["tid"], "C_P2A_CALL")
-a, why = chain(c, 0, 1, 0, 1) if c is not None else (None, "C_P2A_CALL missing")
-if why:
-    fail("P2A: %s" % why)
-elif recs[a]["f"][3] != S["tid"] or user(a, S["tid"], "S_WIN_A_OK") is None:
-    fail("P2A: arrival not in S, or S's window check missing after it")
-else:
-    user_n += 1
-c = user(at, S["tid"], "S_P2B_CALL")
-a, why = chain(c, 1, 0, 0, 2) if c is not None else (None, "S_P2B_CALL missing")
-if why:
-    fail("P2B: %s" % why)
-elif recs[a]["f"][3] != C["tid"] or user(a, C["tid"], "C_WIN_B_OK") is None:
-    fail("P2B: arrival not in C, or C's window check missing after it")
-else:
-    user_n += 1
+# ── USER TARGETS: P2_ROUNDS attempts per direction ──
+# An arrival from U-mode IN the target must be inside its window (credited). An arrival that found
+# another task resident, or the hart idle with the target displaced, is counted apart. Every
+# attempt's window check must follow on the target's own CPU; each direction needs >= 1 credit.
+P2_ROUNDS = 4
+user_n, displaced = 0, 0
+per_dir = [0, 0]
+for k in range(1, P2_ROUNDS + 1):
+    for d, (waker, src, dst, call, tgt, ok, win) in enumerate([
+            (C, 0, 1, "C_P2A_CALL", S, "S_WIN_A_OK", 1),
+            (S, 1, 0, "S_P2B_CALL", C, "C_WIN_B_OK", 2)]):
+        c = user(at, waker["tid"], call, k)
+        if c is None:
+            fail("P2 attempt %d: %s missing" % (k, call))
+            continue
+        a, why = chain(c, src, dst, None, 0)
+        if why:
+            fail("P2 attempt %d %d->%d: %s" % (k, src, dst, why))
+            continue
+        r = recs[a]
+        if r["f"][1] & 0xFF == 0 and r["f"][3] == tgt["tid"]:
+            if r["f"][1] >> 8 != win:
+                fail("P2 attempt %d: arrival seq %d in the target but sepc 0x%x outside window %d" % (k, r["seq"], r["f"][2], win))
+                continue
+            user_n += 1
+            per_dir[d] += 1
+        else:
+            displaced += 1
+        w = user(a, tgt["tid"], ok, k)
+        if w is None or recs[w]["cpu"] != dst:
+            fail("P2 attempt %d: %s missing after the arrival or on another CPU" % (k, ok))
+            continue
+        if d == 1:
+            at = w
+if per_dir[0] < 1 or per_dir[1] < 1:
+    fail("P2: arrivals inside a resident target's window: %d to S, %d to C (>= 1 each required)" % tuple(per_dir))
 
 
 # ── one production replacement, end to end ──
@@ -454,7 +479,7 @@ for i, r in enumerate(recs):
     settled_ok += 1
 
 # ── CONTEXT ──
-for step, want in {"S_P1_RESUMED": 4, "C_P1_RESUMED": 4, "S_WIN_A_OK": 1, "C_WIN_B_OK": 1,
+for step, want in {"S_P1_RESUMED": P1_ROUNDS, "C_P1_RESUMED": P1_ROUNDS, "S_WIN_A_OK": P2_ROUNDS, "C_WIN_B_OK": P2_ROUNDS,
                    "S_OBSERVED": 4, "C_OBSERVED": 4, "S_MUT_OK": 4, "C_MUT_OK": 4, "S_DONE": 1, "C_DONE": 1}.items():
     n = sum(r["kind"] == "user" and r["step"] == step for r in recs)
     if n != want:
@@ -462,8 +487,8 @@ for step, want in {"S_P1_RESUMED": 4, "C_P1_RESUMED": 4, "S_WIN_A_OK": 1, "C_WIN
 
 # ── the kernel verifier must agree ──
 for want in ["arrivals=%d" % arrivals, "consumed=%d" % consumed, "empty=%d" % empty, "merged=%d" % merged,
-             "user_fp_vs_off=%d" % fpvs, "p1_parked=8", "p1_ipi_to_s=%d" % ipi_to_s, "p1_ipi_to_c=%d" % ipi_to_c,
-             "p1_timer_first=%d" % timer_first, "p1_busy=%d" % busy, "p2_user=2", "tlb_rounds=%d" % tlb,
+             "user_fp_vs_off=%d" % fpvs, "p1_parked=%d" % (2 * P1_ROUNDS), "p1_ipi_to_s=%d" % ipi_to_s, "p1_ipi_to_c=%d" % ipi_to_c,
+             "p1_timer_first=%d" % timer_first, "p1_busy=%d" % busy, "p1_preceded=%d" % preceded, "p2_user=%d" % user_n, "p2_displaced=%d" % displaced, "tlb_rounds=%d" % tlb,
              "credited_s=%d" % credited_s, "credited_c=%d" % credited_c, "interfered=%d" % interfered,
              "mutual_rounds=%d" % mutual, "overlapped=%d" % overlapped, "contended=%d" % contended,
              "settled_after_completion=%d" % settled_ok]:
@@ -473,10 +498,10 @@ if not verdict.startswith("SMP3_VERDICT result=ok "):
     fail("kernel verdict: %s" % verdict)
 
 summary = ("records=%d damaged_lines=%d arrivals=%d consumed=%d empty=%d merged=%d p1=%d ipi_to_s=%d ipi_to_c=%d "
-           "timer_first=%d busy=%d user=%d fence_rounds=%d credited_s=%d credited_c=%d interfered=%d mutual=%d "
+           "timer_first=%d busy=%d preceded=%d user=%d displaced=%d fence_rounds=%d credited_s=%d credited_c=%d interfered=%d mutual=%d "
            "overlapped=%d contended=%d settled=%d") % (
     len(recs), damaged, arrivals, consumed, empty, merged, parked_n, ipi_to_s, ipi_to_c, timer_first, busy,
-    user_n, tlb, credited_s, credited_c, interfered, mutual, overlapped, contended, settled_ok)
+    preceded, user_n, displaced, tlb, credited_s, credited_c, interfered, mutual, overlapped, contended, settled_ok)
 print("[smp3-witness] " + summary)
 print("[smp3-witness] kernel: " + counts + " | " + verdict)
 print("[smp3-witness] " + dump.get("SMP3_SYNC", "SMP3_SYNC missing"))
@@ -490,8 +515,15 @@ if live_damaged:
 # Reported, not graded: present at the same rate in the base boots (it scales with boot length).
 print("[smp3-witness] pre-existing RISCV_ASYNC_RESUME_REFUSED lines: %d" % sum("RISCV_ASYNC_RESUME_REFUSED" in l for l in lines))
 print("[smp3-witness] overtaken-deferral settlements: %d" % sum("RISCV_OVERTAKEN_DEFERRAL_SETTLED" in l for l in lines))
+# The phase totals, each a named failure rather than a silent seal condition.
+for name, got, want in [("parked-target resumes", parked_n, 2 * P1_ROUNDS), ("fence rounds", tlb, 8),
+                        ("mutual rounds", mutual, 4), ("overlapped mutual rounds", overlapped, 4)]:
+    if got != want:
+        fail("%s: %d, want %d" % (name, got, want))
+if user_n < 2:
+    fail("in-window user-target arrivals: %d, want >= 2 (one per direction)" % user_n)
 for f in fails:
     print("[smp3-witness][fail] " + f)
-ok = not fails and parked_n == 8 and user_n == 2 and tlb == 8 and mutual == 4 and overlapped == 4
+ok = not fails
 print("SMP3_WITNESS_SEAL %s result=%s" % (summary, "ok" if ok else "fail"))
 sys.exit(0 if ok else 1)

@@ -15,7 +15,7 @@
 //!
 //! Its own kernel actions are setup, the secondary's one start-up kick (it has no timer, so a task
 //! placed on it outside a trap needs one interrupt to be dispatched), and two labelled witness
-//! synchronizations (`wait_until_cpu1_parked`, `mutual_rendezvous`), both at points where no lock is
+//! synchronizations (`wait_until_parked`, `mutual_rendezvous`), both at points where no lock is
 //! held and neither waiting for anything the other hart needs from this one.
 //!
 //! # Residency, on this port
@@ -124,6 +124,8 @@ const PLACED_KICK_REFUSED: u64 = 2;
 const PLACEMENT_FAILED: u64 = 3;
 /// Supervisor entries per CPU — every trap the bridge takes on that hart, from either origin.
 static ENTRIES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Whether each hart is in its idle wait loop now (set there, cleared by any supervisor entry).
+static AT_IDLE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
@@ -395,10 +397,20 @@ pub fn secondary_admitted(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
     ));
 }
 
-/// One supervisor entry on `cpu` (observation only).
+/// One supervisor entry on `cpu` (observation only). Any entry ends the hart's idle wait.
 pub fn note_supervisor_entry(cpu: CpuId) {
     if let Some(n) = ENTRIES.get(cpu.0 as usize) {
         n.fetch_add(1, Ordering::AcqRel);
+    }
+    if let Some(f) = AT_IDLE.get(cpu.0 as usize) {
+        f.store(false, Ordering::Release);
+    }
+}
+
+/// `cpu` has reached its idle wait loop (observation only; cleared by its next supervisor entry).
+pub fn note_idle_reached(cpu: usize) {
+    if let Some(f) = AT_IDLE.get(cpu) {
+        f.store(true, Ordering::Release);
     }
 }
 
@@ -703,29 +715,44 @@ pub fn note_vm_settled(asid: Asid, va: u64, old: u64) {
 
 // ─────────────────────────────── labelled witness synchronization ───────────────────────────────
 
-static P1_PARK_MET: AtomicU64 = AtomicU64::new(0);
-static P1_PARK_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+/// Park waits per TARGET CPU: met, and timed out.
+static P1_PARK_MET: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static P1_PARK_TIMED_OUT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 const P1_PARK_SPINS: u64 = 50_000_000;
 
-/// WITNESS SYNCHRONIZATION — labelled, not production behaviour. A P1 round is a call to a PARKED
-/// S, but S raises its mailbox flag before its `ecall`, so C could call while S was still on its
-/// way into the receive (the race QEMU-SMP2-ACCEPTANCE measured on AArch64). C's `C_P1_CALL` step,
-/// the DebugLog it issues immediately before its NR 6, therefore waits here, bounded, until CPU 1
-/// has no current task. This is the off-lock DebugLog path — no lock is held — and it waits only
-/// for CPU 1 to go idle, never for anything CPU 1 needs from CPU 0.
-fn wait_until_cpu1_parked() {
+/// WITNESS SYNCHRONIZATION — labelled, not production behaviour. A P1 round wakes a PARKED target,
+/// but the target raises its mailbox flag before its `ecall`, so the waker could act while the
+/// target was still on its way into the receive (the race QEMU-SMP2-ACCEPTANCE measured on
+/// AArch64), or while its hart was still draining that block. `current == None` alone is not
+/// parked: it becomes true at the in-lock block commit, before the post-lock drain has run. So the
+/// waker's last step before its production operation — C's `C_P1_CALL` (target CPU 1) and S's
+/// `S_P1_REPLY` (target CPU 0) — waits here, bounded, until the target hart is PARKED: in its idle
+/// wait loop, with no current task and an empty run queue. The last clause matters on CPU 0, whose
+/// idle timer tick can expire another task's receive deadline and resume the idle wait with that
+/// task queued (it is dispatched at the next trap); an IPI arriving then drives an idle advance
+/// that selects that task first, which is graded apart as `Preceded`, not as a parked wake. This is
+/// the off-lock DebugLog path — no lock is held across the wait, each read is one rank-1 scheduler
+/// acquisition — and it waits only for the other hart to go idle, never for anything that hart
+/// needs from this one. A timeout is counted per target and the round is then graded as whatever
+/// it turned out to be.
+fn wait_until_parked(target: CpuId) {
+    let t = usize::from(target.0 == 1);
     let Some(shared) = crate::arch::riscv64::boot::trap_shared_kernel_riscv() else {
-        P1_PARK_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+        P1_PARK_TIMED_OUT[t].fetch_add(1, Ordering::AcqRel);
         return;
     };
+    let at_idle = &AT_IDLE[target.0 as usize];
     for _ in 0..P1_PARK_SPINS {
-        if shared.current_tid_split_read(CpuId(1)).unwrap_or(0) == 0 {
-            P1_PARK_MET.fetch_add(1, Ordering::AcqRel);
+        if at_idle.load(Ordering::Acquire)
+            && shared.current_tid_split_read(target).unwrap_or(0) == 0
+            && shared.runnable_count_on_cpu_split_read(target) == 0
+        {
+            P1_PARK_MET[t].fetch_add(1, Ordering::AcqRel);
             return;
         }
         core::hint::spin_loop();
     }
-    P1_PARK_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+    P1_PARK_TIMED_OUT[t].fetch_add(1, Ordering::AcqRel);
 }
 
 /// The round each mutual requester (S = 0, C = 1) has announced and not yet entered the VM owner.
@@ -783,9 +810,13 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u6
             aux
         ));
     }
-    // C is about to call a PARKED S: see `wait_until_cpu1_parked`.
+    // The P1 waker is about to wake a PARKED target: see `wait_until_parked`.
     if step == "C_P1_CALL" {
-        wait_until_cpu1_parked();
+        wait_until_parked(CpuId(1));
+        return;
+    }
+    if step == "S_P1_REPLY" {
+        wait_until_parked(CpuId(0));
         return;
     }
     // The mutual requester's announcement arms its next VM operation for the rendezvous.
@@ -919,13 +950,15 @@ fn dump() {
         v.user_fp_vs_off
     ));
     lines.push(alloc::format!(
-        "SMP3_COUNTS_WAKE p1_parked={} p1_ipi_to_s={} p1_ipi_to_c={} p1_timer_first={} p1_busy={} p2_user={}",
+        "SMP3_COUNTS_WAKE p1_parked={} p1_ipi_to_s={} p1_ipi_to_c={} p1_timer_first={} p1_busy={} p1_preceded={} p2_user={} p2_displaced={}",
         v.p1_parked,
         v.p1_ipi_to_s,
         v.p1_ipi_to_c,
         v.p1_timer_first,
         v.p1_busy,
-        v.p2_user
+        v.p1_preceded,
+        v.p2_user,
+        v.p2_displaced
     ));
     lines.push(alloc::format!(
         "SMP3_COUNTS_TLB tlb_rounds={} credited_s={} credited_c={} interfered={} mutual_rounds={} overlapped={} contended={} settled_after_completion={}",
@@ -939,11 +972,13 @@ fn dump() {
         v.settled_after_completion
     ));
     lines.push(alloc::format!(
-        "SMP3_SYNC mutual_rendezvous_met={} mutual_rendezvous_timed_out={} p1_parked_met={} p1_parked_timed_out={}",
+        "SMP3_SYNC mutual_rendezvous_met={} mutual_rendezvous_timed_out={} p1_parked_met_cpu0={} p1_parked_timed_out_cpu0={} p1_parked_met_cpu1={} p1_parked_timed_out_cpu1={}",
         MUT_SYNC_MET.load(Ordering::Acquire),
         MUT_SYNC_TIMED_OUT.load(Ordering::Acquire),
-        P1_PARK_MET.load(Ordering::Acquire),
-        P1_PARK_TIMED_OUT.load(Ordering::Acquire)
+        P1_PARK_MET[0].load(Ordering::Acquire),
+        P1_PARK_TIMED_OUT[0].load(Ordering::Acquire),
+        P1_PARK_MET[1].load(Ordering::Acquire),
+        P1_PARK_TIMED_OUT[1].load(Ordering::Acquire)
     ));
     lines.push(alloc::format!(
         "SMP3_VERDICT result={} reason={} at={}",

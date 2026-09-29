@@ -213,8 +213,9 @@ fn code(name: &str) -> u64 {
 // ─────────────────────────────── the pure verifier ───────────────────────────────
 
 /// Parked-target rounds per direction, and the IPI-driven dispatches CPU 0 must show of them.
-pub const P1_ROUNDS: u64 = 4;
+pub const P1_ROUNDS: u64 = 8;
 pub const P1_MIN_IPI_TO_C: usize = 2;
+pub const P2_ROUNDS: u64 = 4;
 /// Serial remote-invalidation rounds (odd: S is the target; even: C is), and how many of each
 /// direction must be CREDITED — the target hart took no supervisor entry inside its window.
 pub const TLB_ROUNDS: u64 = 8;
@@ -427,7 +428,10 @@ pub struct Verdict {
     pub p1_ipi_to_c: usize,
     pub p1_timer_first: usize,
     pub p1_busy: usize,
+    pub p1_preceded: usize,
     pub p2_user: usize,
+    /// P2 attempts whose arrival found the target displaced (not credited).
+    pub p2_displaced: usize,
     /// Serial rounds whose whole chain verified.
     pub tlb_rounds: usize,
     /// ... of which the target hart took no supervisor entry in its window, per target.
@@ -530,6 +534,13 @@ pub enum ParkedRoute {
     /// The target was running something else when the IPI arrived; the woken task was picked up
     /// at its next scheduling point. Not a parked-target wake; counted apart.
     Busy,
+    /// The IPI was taken at the target's armed idle boundary and its idle advance ran, but the
+    /// scheduler selected ANOTHER runnable task first — one made runnable in that same trap (a
+    /// receive deadline the post-lock collector expired) or already ahead of the woken task. The
+    /// woken task's own context-checked resume on that hart is still required afterwards. The IPI
+    /// did its job — ended the idle wait and drove a queue advance — but it did not dispatch the
+    /// woken task, so this is counted apart and never as an IPI-driven parked dispatch.
+    Preceded,
 }
 
 /// A wake of the blocked `woken` on `to_cpu` by `from`, after step `after`, classified. Pure.
@@ -548,8 +559,13 @@ pub fn parked_wake(
         })
         .ok_or("ipi_dispatch_missing")?;
         let dr = recs[d];
-        if dr.kind != Kind::IdleDispatch || dr.f[1] != 1 || dr.f[0] != woken.tid {
+        // Anything but the IPI's own idle advance after an idle-boundary arrival — a timer's
+        // dispatch, a second arrival, a dispatch of nothing — is a substitution.
+        if dr.kind != Kind::IdleDispatch || dr.f[1] != 1 || dr.f[0] == 0 {
             return Err("ipi_dispatch_substituted");
+        }
+        if dr.f[0] != woken.tid {
+            return Ok((d, ParkedRoute::Preceded));
         }
         return Ok((d, ParkedRoute::Ipi));
     }
@@ -564,6 +580,37 @@ pub fn parked_wake(
         Some(_) => Err("ipi_arrived_in_another_task"),
         None => Ok((after, ParkedRoute::Busy)),
     }
+}
+
+/// Where a wake aimed at a RESIDENT user-mode target actually landed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentRoute {
+    /// Taken from U-mode in the target, with `sepc` inside its register-checked window.
+    InWindow,
+    /// The target was not resident when the IPI arrived: another task was (CPU 0's tick may
+    /// switch in the supervisor), or the hart was at its idle boundary with the displaced target
+    /// queued. Counted apart; the target's own window check is still required afterwards.
+    Displaced,
+}
+
+/// A wake by `from` of the hart `target` is expected to be resident on, after step `after`,
+/// classified. An arrival IN the target from U-mode must be inside `window`. Pure.
+pub fn resident_wake(
+    recs: &[Rec],
+    after: usize,
+    from: Role,
+    target: Role,
+    window: u64,
+) -> Result<(usize, ResidentRoute), &'static str> {
+    let arrived = wake_chain(recs, after, from, target.cpu, u64::MAX, WINDOW_NONE)?;
+    let a = recs[arrived];
+    if a.f[1] & 0xff == ORIGIN_USER && a.f[3] == target.tid {
+        if (a.f[1] >> 8) != window {
+            return Err("ipi_sepc_outside_window");
+        }
+        return Ok((arrived, ResidentRoute::InWindow));
+    }
+    Ok((arrived, ResidentRoute::Displaced))
 }
 
 /// One production replacement of `target`'s W by `req`, verified end to end, starting its search
@@ -734,6 +781,7 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
                         ParkedRoute::Ipi => *ipi += 1,
                         ParkedRoute::TimerFirst => v.p1_timer_first += 1,
                         ParkedRoute::Busy => v.p1_busy += 1,
+                        ParkedRoute::Preceded => v.p1_preceded += 1,
                     }
                 }
                 at = end;
@@ -747,33 +795,47 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
         v.fail("p1_too_few_ipi_driven_parked_dispatches", 0);
     }
 
-    // P2 — user-mode targets inside the checked windows.
-    let p2a = (|| -> Result<usize, &'static str> {
-        let call = user(recs, at, c, "C_P2A_CALL", None).ok_or("p2a_call_missing")?;
-        let arr = wake_chain(recs, call, c, s.cpu, ORIGIN_USER, WINDOW_S_A)?;
-        if recs[arr].f[3] != s.tid {
-            return Err("p2a_arrival_not_in_server");
+    // P2 — user-mode targets inside the checked windows, P2_ROUNDS attempts per direction. Every
+    // attempt's window check must pass; an arrival that found another task resident is counted
+    // apart; each direction needs at least one arrival in the resident target's window.
+    let mut resident = [0usize; 2];
+    for k in 1..=P2_ROUNDS {
+        for (dir, (waker, call_name, target, ok_name, window)) in [
+            (c, "C_P2A_CALL", s, "S_WIN_A_OK", WINDOW_S_A),
+            (s, "S_P2B_CALL", c, "C_WIN_B_OK", WINDOW_C_B),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let attempt = (|| -> Result<(usize, ResidentRoute), &'static str> {
+                let call = user(recs, at, waker, call_name, Some(k)).ok_or("p2_call_missing")?;
+                let (arr, route) = resident_wake(recs, call, waker, target, window)?;
+                let ok =
+                    user(recs, arr, target, ok_name, Some(k)).ok_or("p2_window_check_missing")?;
+                if recs[ok].cpu != target.cpu {
+                    return Err("p2_window_checked_elsewhere");
+                }
+                Ok((ok, route))
+            })();
+            match attempt {
+                Ok((end, route)) => {
+                    match route {
+                        ResidentRoute::InWindow => {
+                            v.p2_user += 1;
+                            resident[dir] += 1;
+                        }
+                        ResidentRoute::Displaced => v.p2_displaced += 1,
+                    }
+                    if dir == 1 {
+                        at = end;
+                    }
+                }
+                Err(why) => v.fail(why, k as u32),
+            }
         }
-        user(recs, arr, s, "S_WIN_A_OK", None).ok_or("p2a_window_check_missing")
-    })();
-    match p2a {
-        Ok(end) => {
-            v.p2_user += 1;
-            at = end;
-        }
-        Err(why) => v.fail(why, 0),
     }
-    let p2b = (|| -> Result<usize, &'static str> {
-        let call = user(recs, at, s, "S_P2B_CALL", None).ok_or("p2b_call_missing")?;
-        let arr = wake_chain(recs, call, s, c.cpu, ORIGIN_USER, WINDOW_C_B)?;
-        if recs[arr].f[3] != c.tid {
-            return Err("p2b_arrival_not_in_client");
-        }
-        user(recs, arr, c, "C_WIN_B_OK", None).ok_or("p2b_window_check_missing")
-    })();
-    match p2b {
-        Ok(_) => v.p2_user += 1,
-        Err(why) => v.fail(why, 0),
+    if resident[0] == 0 || resident[1] == 0 {
+        v.fail("p2_no_arrival_in_a_resident_window", 0);
     }
 
     // P3 — serial remote-invalidation rounds.
@@ -1043,6 +1105,49 @@ mod tests {
     }
 
     #[test]
+    fn a_resident_wake_is_credited_only_inside_the_resident_targets_window() {
+        let ro = roles();
+        let win = |tid: u64, origin: u64, window: u64| {
+            (
+                Kind::IpiArrived,
+                1u8,
+                [0b1, origin | (window << 8), 0x400000, tid, 0],
+            )
+        };
+        let base = |a| seqd(vec![pubrec(0, 1, 0), reqrec(0, 1, 0), a]);
+        assert_eq!(
+            resident_wake(
+                &base(win(9300, USER, WINDOW_S_A)),
+                0,
+                ro.c,
+                ro.s,
+                WINDOW_S_A
+            ),
+            Ok((2, ResidentRoute::InWindow))
+        );
+        // In the target but outside its window: a failure, never a credit.
+        assert_eq!(
+            resident_wake(
+                &base(win(9300, USER, WINDOW_NONE)),
+                0,
+                ro.c,
+                ro.s,
+                WINDOW_S_A
+            ),
+            Err("ipi_sepc_outside_window")
+        );
+        // Another task was resident, or the hart was idle: displaced, not credited.
+        assert_eq!(
+            resident_wake(&base(win(2, USER, WINDOW_NONE)), 0, ro.c, ro.s, WINDOW_S_A),
+            Ok((2, ResidentRoute::Displaced))
+        );
+        assert_eq!(
+            resident_wake(&base(win(0, IDLE, WINDOW_NONE)), 0, ro.c, ro.s, WINDOW_S_A),
+            Ok((2, ResidentRoute::Displaced))
+        );
+    }
+
+    #[test]
     fn a_publication_is_consumed_exactly_once() {
         let r = seqd(vec![pubrec(0, 1, 0), reqrec(0, 1, 0), arr(1, 0b1, IDLE)]);
         assert_eq!(check_ipi_population(&r), Ok((1, 1, 0, 0)));
@@ -1242,9 +1347,16 @@ mod tests {
         v.insert(2, settled);
         let verdict = verify(&seqd(v), &ro, false);
         assert!(verdict.failure.is_some());
+        // The global check itself, read off its own count (the verdict's reported failure is the
+        // FIRST one, which for a record with no P1 phase is the missing call): a settlement with no
+        // completed fence before it is not counted, the same settlement after one is.
         let r = seqd(v_premature());
         let verdict = verify(&r, &ro, false);
-        assert_eq!(verdict.failure, Some("settled_before_fence_completion"));
+        assert!(verdict.failure.is_some());
+        assert_eq!(verdict.settled_after_completion, 0);
+        let mut ok = v_premature();
+        ok.insert(1, (Kind::FenceDone, 0, [11, W, 0, 0, 0]));
+        assert_eq!(verify(&seqd(ok), &ro, false).settled_after_completion, 1);
     }
 
     fn v_premature() -> Vec<(Kind, u8, [u64; 5])> {
@@ -1266,11 +1378,18 @@ mod tests {
             (Kind::IdleDispatch, 1, [9300, 1, 0, 0, 0]),
         ]);
         assert_eq!(parked_wake(&r, 0, ro.c, 1, ro.s), Ok((4, ParkedRoute::Ipi)));
-        // The dispatch resumed another task: substitution.
+        // The IPI's idle advance selected another runnable task first: preceded, not credited.
         let mut s = r.clone();
         s[4].f[0] = 9302;
         assert_eq!(
             parked_wake(&s, 0, ro.c, 1, ro.s),
+            Ok((4, ParkedRoute::Preceded))
+        );
+        // ... but an idle advance that dispatched nothing is a substitution.
+        let mut z = r.clone();
+        z[4].f[0] = 0;
+        assert_eq!(
+            parked_wake(&z, 0, ro.c, 1, ro.s),
             Err("ipi_dispatch_substituted")
         );
         // The dispatch was the timer's, not the IPI's, after an idle arrival: substitution.

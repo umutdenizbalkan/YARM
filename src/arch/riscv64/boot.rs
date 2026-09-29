@@ -1952,6 +1952,9 @@ fn riscv_s_mode_idle_landing(
                     sources
                 ),
             }
+            // QEMU-SMP3 witness: back into the idle wait (observation only).
+            #[cfg(feature = "riscv64-smp3-witness")]
+            crate::arch::riscv64::smp3_witness::note_idle_reached(cpu.0 as usize);
             unsafe {
                 yarm_riscv64_s_mode_timer_return(
                     frame as *const RiscvTrapFrame,
@@ -2103,6 +2106,8 @@ fn riscv_s_mode_external_trap(
         }
         Ok(_) => {
             early_marker!("RISCV_S_MODE_EXTIRQ_RESUME_IDLE sepc=0x{:x}", sepc);
+            #[cfg(feature = "riscv64-smp3-witness")]
+            crate::arch::riscv64::smp3_witness::note_idle_reached(cpu.0 as usize);
             unsafe {
                 yarm_riscv64_s_mode_timer_return(
                     frame as *const RiscvTrapFrame,

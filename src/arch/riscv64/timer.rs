@@ -412,6 +412,10 @@ fn request_idle_unmask(cpu: usize) {
 /// An arrival that requested the unmask waits with `SIE` set by [`set_sstatus_sie_in_wfi_loop`];
 /// one that did not (no wake source) waits masked.
 pub fn idle_wait_loop(cpu: usize) -> ! {
+    // QEMU-SMP3 witness: this hart has reached its idle wait (observation only). Recorded BEFORE
+    // the unmask, because `set_sstatus_sie_in_wfi_loop` is itself the wait and never returns.
+    #[cfg(feature = "riscv64-smp3-witness")]
+    crate::arch::riscv64::smp3_witness::note_idle_reached(cpu);
     if IDLE_UNMASK_REQUESTED
         .get(cpu)
         .is_some_and(|flag| flag.swap(false, Ordering::AcqRel))

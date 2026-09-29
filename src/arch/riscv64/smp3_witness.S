@@ -61,7 +61,8 @@
     .set WIN_MASK, 0x3FFFFFFE
     .set SYS_MASK, 0x3FFD03FE
 
-    .set P1_ROUNDS, 4
+    .set P1_ROUNDS, 8
+    .set P2_ROUNDS, 4
     .set TLB_ROUNDS, 8
     .set MUT_ROUNDS, 4
     .set PARK_TICKS, 60
@@ -69,10 +70,6 @@
     /* MBX words; each per-round array is 16 words, index = round. */
     .set M_S_WAIT, 0x000
     .set M_C_WAIT, 0x080
-    .set M_A_OPEN, 0x100
-    .set M_A_DONE, 0x108
-    .set M_B_OPEN, 0x110
-    .set M_B_DONE, 0x118
     .set M_PRIMED, 0x180
     .set M_DONE, 0x200
     .set M_OBS, 0x280
@@ -82,6 +79,10 @@
     .set M_NR3_C, 0x480
     .set M_CHK_S, 0x500
     .set M_CHK_C, 0x580
+    .set M_A_OPEN, 0x600
+    .set M_A_DONE, 0x680
+    .set M_B_OPEN, 0x700
+    .set M_B_DONE, 0x780
 
     /* Long-range conditional branches (a B-type branch reaches only +-4 KiB). */
     .macro BNEZ_FAR reg, target
@@ -139,6 +140,26 @@
     add t6, t6, t5
 2:  ld t5, 0(t6)
     beqz t5, 2b
+    .endm
+
+    /* Inside a checked window (t5/t6 only): MBX[off + 8 * round] = 1. */
+    .macro WSET_RND off
+    RND_GET t5
+    slli t5, t5, 3
+    li t6, (MBX + \off)
+    add t6, t6, t5
+    li t5, 1
+    sd t5, 0(t6)
+    .endm
+
+    /* Inside a checked window (t5/t6 only): spin until MBX[off + 8 * round] != 0. */
+    .macro WWAIT_RND off
+    RND_GET t5
+    slli t5, t5, 3
+    li t6, (MBX + \off)
+    add t6, t6, t5
+4:  ld t5, 0(t6)
+    beqz t5, 4b
     .endm
 
     .macro DELAY n
@@ -541,7 +562,7 @@ s_p1_loop:
     RND_GET s4
     li t5, P1_ROUNDS
     bleu s4, t5, 1f
-    j s_p2a
+    j s_p2
 1:  ZERO_PAYLOAD
     MSETR M_S_WAIT, s4
     LOAD_CTX
@@ -561,37 +582,50 @@ s_p1_loop:
     REPLY_RETRY s_reply_fail
     j s_p1_loop
 
-    /* ── P2 A: S is RESIDENT in U-mode while C's call wakes H1 on this CPU ── */
-s_p2a:
+    /* ── P2: P2_ROUNDS attempts. A target is RESIDENT only if nothing displaced it, and CPU 0's
+       tick may; each attempt's arrival is graded for what it found, and every window is checked. ── */
+s_p2:
+    RND_SET 0
+s_p2_loop:
+    RND_INC
+    RND_GET s4
+    li t5, P2_ROUNDS
+    bleu s4, t5, 1f
+    j s_p2_end
+1:
+    /* P2 A: S is RESIDENT in U-mode while C's call wakes H1 on this CPU. */
     LOAD_CTX
     .global yarm_smp3_s_win_a_begin
 yarm_smp3_s_win_a_begin:
-    li t6, (MBX + M_A_OPEN)
-    li t5, 1
-    sd t5, 0(t6)
-    li t6, (MBX + M_A_DONE)
-1:  ld t5, 0(t6)
-    beqz t5, 1b
+    WSET_RND M_A_OPEN
+    WWAIT_RND M_A_DONE
     .global yarm_smp3_s_win_a_end
 yarm_smp3_s_win_a_end:
     CAPTURE
     CHECK WIN_MASK, s_win_fail
+    RND_GET a2
     LOG s_m_win_a_ok
     /* Let the woken H1 run; it replies to C and blocks again, then this task resumes. */
     li a7, NR_YIELD
     ecall
 
-    /* ── P2 B: C is RESIDENT in U-mode while this call wakes H0 on CPU 0 ── */
-    MWAIT M_B_OPEN
+    /* P2 B: C is RESIDENT in U-mode while this call wakes H0 on CPU 0. */
+    RND_GET s4
+    MWAITR M_B_OPEN, s4
+    RND_GET a2
     LOG s_m_p2b_call
     CALL_RETRY yarm_smp3_s_cap_eh0, yarm_smp3_s_cap_rs, s_call_fail
     DELAY 0x100000
-    MSET M_B_DONE
+    RND_GET s4
+    MSETR M_B_DONE, s4
     ZERO_PAYLOAD
     RECV_ARGS yarm_smp3_s_cap_rs
     ecall
     EXPECT_PAYLOAD s_reply_lit, s_p2b_payload_fail
+    RND_GET a2
     LOG s_m_p2b_reply_ok
+    j s_p2_loop
+s_p2_end:
 
     ROUNDS s, S_OLD_W, 1, yarm_smp3_s_cap_as, M_READY_S, M_READY_C, M_NR3_S, M_NR3_C, M_CHK_S, M_CHK_C
 s_fin:
@@ -694,7 +728,7 @@ c_p1_loop:
     RND_GET s4
     li t5, P1_ROUNDS
     bleu s4, t5, 1f
-    j c_p2a
+    j c_p2
 1:  MWAITR M_S_WAIT, s4
     DELAY 0x100000
     RND_GET a2
@@ -713,36 +747,48 @@ c_p1_loop:
     LOG c_m_p1_resumed
     j c_p1_loop
 
-    /* ── P2 A: this call wakes H1 on CPU 1 while S is resident there in U-mode ── */
-c_p2a:
-    MWAIT M_A_OPEN
+    /* ── P2: P2_ROUNDS attempts (see S). ── */
+c_p2:
+    RND_SET 0
+c_p2_loop:
+    RND_INC
+    RND_GET s4
+    li t5, P2_ROUNDS
+    bleu s4, t5, 1f
+    j c_p2_end
+1:
+    /* P2 A: this call wakes H1 on CPU 1 while S is resident there in U-mode. */
+    RND_GET s4
+    MWAITR M_A_OPEN, s4
+    RND_GET a2
     LOG c_m_p2a_call
     CALL_RETRY yarm_smp3_c_cap_eh1, yarm_smp3_c_cap_rc, c_call_fail
     DELAY 0x100000
-    MSET M_A_DONE
+    RND_GET s4
+    MSETR M_A_DONE, s4
     ZERO_PAYLOAD
     RECV_ARGS yarm_smp3_c_cap_rc
     ecall
     EXPECT_PAYLOAD c_reply_lit, c_payload_fail
+    RND_GET a2
     LOG c_m_p2a_reply_ok
 
-    /* ── P2 B: C is RESIDENT in U-mode while S's call wakes H0 on this CPU ── */
+    /* P2 B: C is RESIDENT in U-mode while S's call wakes H0 on this CPU. */
     LOAD_CTX
     .global yarm_smp3_c_win_b_begin
 yarm_smp3_c_win_b_begin:
-    li t6, (MBX + M_B_OPEN)
-    li t5, 1
-    sd t5, 0(t6)
-    li t6, (MBX + M_B_DONE)
-1:  ld t5, 0(t6)
-    beqz t5, 1b
+    WSET_RND M_B_OPEN
+    WWAIT_RND M_B_DONE
     .global yarm_smp3_c_win_b_end
 yarm_smp3_c_win_b_end:
     CAPTURE
     CHECK WIN_MASK, c_win_fail
+    RND_GET a2
     LOG c_m_win_b_ok
     li a7, NR_YIELD
     ecall
+    j c_p2_loop
+c_p2_end:
 
     ROUNDS c, C_OLD_W, 0, yarm_smp3_c_cap_as, M_READY_C, M_READY_S, M_NR3_C, M_NR3_S, M_CHK_C, M_CHK_S
 c_fin:

@@ -27,7 +27,7 @@
 #     taken as loss or duplication; no CPU consumed more supervisor software interrupts than the
 #     firmware was successfully asked to raise on it; every firmware request succeeded; no
 #     completion (EOI) is looked for, because none exists on this port.
-#   * PARKED TARGETS (8): C->S and S->C four times each — the call/reply step, the publication,
+#   * PARKED TARGETS (16): C->S and S->C eight times each — the call/reply step, the publication,
 #     the consuming arrival, the idle advance resuming exactly the woken task, and that task's own
 #     context-checked resume step on the target hart. Every wake of S (CPU 1 has no timer) must be
 #     the IPI's at the idle boundary; CPU 0's periodic idle advance may win a race it is entitled
@@ -94,7 +94,7 @@ args = [qemu, "-machine", "virt", "-cpu", "rv64", "-m", "512M", "-smp", "2",
         "-initrd", os.path.join(build, "initramfs-core.cpio"),
         "-append", "console=ttyS0 rdinit=/init yarm.ap_user_dispatch=1"]
 p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-start, seen, buf = time.time(), None, b""
+start, seen, buf, verdicts = time.time(), None, b"", 0
 with open(log, "wb") as out:
     while True:
         r, _, _ = select.select([p.stdout], [], [], 0.5)
@@ -102,8 +102,12 @@ with open(log, "wb") as out:
             chunk = os.read(p.stdout.fileno(), 65536)
             if not chunk:
                 break
-            out.write(chunk); out.flush(); buf = (buf + chunk)[-8192:]
-            if seen is None and buf.count(b"SMP3_VERDICT") >= 2:
+            out.write(chunk); out.flush()
+            # Count across chunk boundaries: the tail keeps the last partial marker only.
+            buf += chunk
+            verdicts += buf.count(b"SMP3_VERDICT")
+            buf = buf[-(len(b"SMP3_VERDICT") - 1):] if not buf.endswith(b"SMP3_VERDICT") else b""
+            if seen is None and verdicts >= 2:
                 seen = time.time()
         now = time.time()
         if (seen is not None and now - seen > 3) or now - start > budget:
