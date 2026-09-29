@@ -3397,12 +3397,21 @@ fn run_x86_ipccall_direct_oracle(init_tid: u64) {
     )
 ))]
 mod ipc_reply_timeout_oracle {
-    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    use core::sync::atomic::{
+        AtomicU32, AtomicU64,
+        Ordering::{Acquire, Relaxed, Release},
+    };
     use yarm_ipc_abi::ipc_reply_liveness_abi::{
         IpcReplyLivenessScenario, ipc_reply_liveness_scenario_for_current_arch,
     };
 
+    /// The server's liveness handshake: `HANDSHAKE_READY` once the server has started. The client
+    /// polls it with `Yield` rather than a futex wake, because FutexWait parks on the caller's own
+    /// `expected == observed` and so cannot notice a wake that ran before it: a timer preemption
+    /// between the client's `spawn_thread` and its wait let the server wake nobody and the client
+    /// park forever.
     pub(super) static HANDSHAKE: AtomicU32 = AtomicU32::new(0x00E0);
+    const HANDSHAKE_READY: u32 = 0x00E2;
     pub(super) static PARK: AtomicU32 = AtomicU32::new(0x00E1);
     pub(super) static CHILD_TID: AtomicU64 = AtomicU64::new(0);
     /// Set by the client once it resumes from the production TIMEOUT wake (Ok(None)).
@@ -3573,8 +3582,7 @@ mod ipc_reply_timeout_oracle {
     /// Runs on a freshly-spawned oracle child sharing init's CSpace/address space.
     pub(super) unsafe fn server_run() {
         yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_SERVER_STARTED");
-        let handshake = HANDSHAKE.as_ptr();
-        let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+        HANDSHAKE.store(HANDSHAKE_READY, Release);
         let (request_ep, _rep) = oracle_caps();
         // SAFETY: shared-CSpace request endpoint cap; a blocking recv-v2.
         let recv = unsafe { yarm_user_rt::syscall::ipc_recv_v2(request_ep) };
@@ -3897,9 +3905,11 @@ mod ipc_reply_timeout_oracle {
     /// `request_ep`/`reply_ep` must be the provisioned oracle caps.
     pub(super) unsafe fn client_run(request_ep: u32, reply_ep: u32) -> ClientOutcome {
         let mut out = ClientOutcome::default();
-        let handshake = HANDSHAKE.as_ptr();
-        let hv = HANDSHAKE.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
+        let mut spun = 0u64;
+        while HANDSHAKE.load(Acquire) != HANDSHAKE_READY && spun < SPIN_CAP {
+            let _ = yarm_user_rt::syscall::yield_now();
+            spun += 1;
+        }
         yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_RESUMED mode={}", mode());
         let request_msg = match yarm_user_rt::ipc::Message::with_header(
             0,
