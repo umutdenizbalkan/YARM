@@ -321,11 +321,13 @@ fn timer_is_armed_at_the_boot_safe_point_not_at_idle() {
         .split("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
         .nth(1)
         .expect("the idle block")
-        .split("riscv_trap_halt(")
+        .split("riscv_idle_halt(")
         .next()
         .expect("up to the halt");
+    // QEMU-SMP3: per CPU — the arriving CPU re-establishes ITS boundary, then halts through the
+    // idle halt (the fatal `riscv_trap_halt` never unmasks).
     assert!(
-        idle_block.contains("timer::reestablish_idle_boundary()"),
+        idle_block.contains("timer::reestablish_idle_boundary(cpu.0 as usize)"),
         "the idle block must still re-establish the S-origin boundary on every arrival"
     );
     assert!(

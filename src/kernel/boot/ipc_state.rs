@@ -3376,16 +3376,40 @@ impl KernelState {
     /// "a late drain must not overwrite a committed result" case can be stepped.
     #[cfg(any(test, feature = "hosted-dev"))]
     pub(crate) fn set_pending_syscall_completion_for_test(&mut self, tid: u64, result: u64) {
+        self.set_pending_syscall_completion_of_class_for_test(
+            tid,
+            crate::kernel::task::BlockedSyscallClass::IpcRecv,
+            result,
+        );
+    }
+
+    /// QEMU-SMP3 — [`Self::set_pending_syscall_completion_for_test`] for an explicit class.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn set_pending_syscall_completion_of_class_for_test(
+        &mut self,
+        tid: u64,
+        class: crate::kernel::task::BlockedSyscallClass,
+        result: u64,
+    ) {
         self.with_tcbs_mut(|tcbs| {
             if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
                 let asid = tcb.asid.unwrap_or(Asid(0));
+                // A send record's generation is the send generation; a receive's, the receive's.
+                let blocked_generation = match class {
+                    crate::kernel::task::BlockedSyscallClass::IpcRecv => {
+                        tcb.blocked_recv_generation
+                    }
+                    crate::kernel::task::BlockedSyscallClass::IpcSend => {
+                        tcb.blocked_send_generation
+                    }
+                };
                 tcb.pending_syscall_completion =
                     Some(crate::kernel::task::BlockedSyscallCompletion {
-                        syscall_class: crate::kernel::task::BlockedSyscallClass::IpcRecv,
+                        syscall_class: class,
                         result,
                         tid,
                         asid,
-                        blocked_generation: tcb.blocked_recv_generation,
+                        blocked_generation,
                     });
             }
         });

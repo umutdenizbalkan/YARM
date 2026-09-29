@@ -764,6 +764,23 @@ pub(crate) fn riscv_trap_stack_top_for_cpu(cpu: usize) -> Option<u64> {
     None
 }
 
+/// QEMU-SMP3 witness — the logical CPU executing this kernel code, from `sscratch`. On every trap
+/// entry the vector leaves `sscratch` at the trapping hart's canonical trap-stack top, and a
+/// released secondary set it to its own before its first trap, so the region lookup names the
+/// hart; before the boot hart's first user entry it resolves to CPU 0, the only hart running then.
+#[cfg(all(
+    feature = "riscv64-smp3-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "riscv64"
+))]
+pub(crate) fn riscv_current_logical_cpu() -> crate::kernel::scheduler::CpuId {
+    let top: usize;
+    unsafe {
+        core::arch::asm!("csrr {0}, sscratch", out(reg) top, options(nostack, nomem, preserves_flags));
+    }
+    riscv_logical_cpu_for_trap_frame(top.wrapping_sub(16))
+}
+
 /// QEMU-SMP3 — the hart id of logical CPU `cpu`: the boot hart for CPU 0, otherwise the slot (=
 /// hart id) whose validated, claimed mapping names `cpu`. A scheduler index is never assumed to be
 /// a hart id.
@@ -876,6 +893,9 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // this bridge while the secondaries park with every interrupt admission disabled and never
     // enter userspace. See `stage199d_riscv_secondary_trap_ready`.
     let cpu = riscv_logical_cpu_for_trap_frame(frame_ptr as usize);
+    // QEMU-SMP3 witness: every supervisor entry on this hart, from either origin.
+    #[cfg(feature = "riscv64-smp3-witness")]
+    crate::arch::riscv64::smp3_witness::note_supervisor_entry(cpu);
     // 199E-R1(B): the same frame pointer names the hart whose trap-stack top this return
     // must restore, so the next trap on THIS hart starts from its own fixed address.
     let canonical_top = riscv_canonical_trap_stack_top_for_frame(frame_ptr as usize);
@@ -1961,8 +1981,10 @@ fn riscv_s_mode_software_trap(
 ) -> ! {
     use crate::arch::riscv64::trap::handle_riscv_trap_entry_shared;
 
-    let arrival =
-        crate::arch::riscv64::ipi::take_arrival(cpu, crate::arch::riscv64::ipi::ArrivalOrigin::Idle);
+    let arrival = crate::arch::riscv64::ipi::take_arrival(
+        cpu,
+        crate::arch::riscv64::ipi::ArrivalOrigin::Idle,
+    );
     #[cfg(feature = "riscv64-smp3-witness")]
     crate::arch::riscv64::smp3_witness::note_arrival(cpu, arrival, sepc, 0, frame.sstatus);
     early_marker!(
@@ -2806,6 +2828,14 @@ pub fn bootstrap_first_user_task(
             None => crate::yarm_log!("IRQ1_WITNESS_PROVISION_FAIL step=dtb_uart_line"),
         }
     }
+    // QEMU-SMP3: the two-hart witness's four kernel-built tasks. Compile-time gated, and armed only
+    // with the AP dispatch knob; init itself is untouched.
+    #[cfg(feature = "riscv64-smp3-witness")]
+    if crate::kernel::boot::ap_user_dispatch_enabled()
+        && let Err(e) = crate::arch::riscv64::smp3_witness::provision(kernel)
+    {
+        crate::yarm_log!("SMP3_WITNESS_PROVISION_FAIL err={:?} result=fail", e);
+    }
     #[cfg(feature = "riscv-exit-current-task-oracle")]
     if crate::kernel::boot::riscv_exit_oracle_enabled() && init_args[5] == 0 {
         init_args[5] = crate::kernel::boot::riscv_exit_current_task_selector();
@@ -2953,7 +2983,8 @@ static mut RISCV64_SECONDARY_HANDOFFS: [SecondaryHartHandoff; QEMU_VIRT_HSM_SECO
     [SecondaryHartHandoff::empty(); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 static mut RISCV64_SECONDARY_STACKS: [SecondaryBootStack; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
-    [SecondaryBootStack([0; RISCV64_SECONDARY_BOOT_STACK_BYTES]); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+    [SecondaryBootStack([0; RISCV64_SECONDARY_BOOT_STACK_BYTES]);
+        QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
 
 /// QEMU-SMP3 — the trap stack of logical CPU 1, the one secondary that may DISPATCH. It runs the
 /// whole syscall dispatch exactly as the boot hart's does, so it gets the boot hart's size and the
@@ -3286,6 +3317,8 @@ extern "C" fn yarm_riscv64_secondary_boot(handoff_ptr: usize) -> ! {
         if let Some(cpu_id) = parked_cpu {
             let cpu = crate::kernel::scheduler::CpuId(cpu_id as u8);
             if crate::arch::riscv64::ipi::take_park_release(cpu) {
+                #[cfg(feature = "riscv64-smp3-witness")]
+                crate::arch::riscv64::smp3_witness::note_park_release(cpu, hart_id);
                 riscv_secondary_dispatch_main(cpu, hart_id);
             }
         }
@@ -3356,7 +3389,11 @@ fn riscv_secondary_dispatch_main(cpu: crate::kernel::scheduler::CpuId, hart_id: 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn riscv_secondary_unadmitted(cpu: crate::kernel::scheduler::CpuId, reason: &str) -> ! {
     unsafe {
-        core::arch::asm!("csrw sie, zero", "csrci sstatus, 2", options(nostack, preserves_flags));
+        core::arch::asm!(
+            "csrw sie, zero",
+            "csrci sstatus, 2",
+            options(nostack, preserves_flags)
+        );
     }
     early_marker!(
         "RISCV_SMP3_SECONDARY_UNADMITTED cpu={} reason={} result=fail",
@@ -3385,7 +3422,10 @@ fn secondary_trap_stack_for(slot: usize, cpu_id: usize) -> (usize, usize) {
         let base = core::ptr::addr_of!(RISCV64_CPU1_TRAP_STACK) as usize;
         ((base + RISCV_TRAP_STACK_SIZE) & !0xf, RISCV_TRAP_STACK_SIZE)
     } else {
-        (secondary_trap_stack_top(slot), RISCV64_SECONDARY_STACK_BYTES)
+        (
+            secondary_trap_stack_top(slot),
+            RISCV64_SECONDARY_STACK_BYTES,
+        )
     }
 }
 

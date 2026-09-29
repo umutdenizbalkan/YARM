@@ -697,6 +697,16 @@ impl AsyncResumeClass {
 ///   completion. Those states are mutually exclusive by construction (a tag is published only
 ///   for a RUNNING task, a completion only for a BLOCKED one), so observing both means the
 ///   record is ambiguous and neither may silently win.
+///
+///   QEMU-SMP3 §4: "by construction" holds only for a completion the resume boundary CONSUMES,
+///   because consuming it is what ends its life when the blocked task resumes. See
+///   [`resume_boundary_consumes`]: RISC-V and x86_64 install a receive's result into the saved
+///   context at publication and never consume the `IpcRecv` record, which stays parked as residue
+///   after the task has resumed, run past that result and been preempted. Counting it here
+///   refused every later preemption of such a task and resumed it through the startup argument
+///   lane instead, zeroing `a0..a3` of a live computation — measured on the supervisor (tid 2)
+///   in every base boot, and on the QEMU-SMP3 witness's own client. That record is not a
+///   continuation on those ports, so only a class the boundary consumes can coexist.
 pub(crate) fn classify_and_take_async_resume(
     tcbs: &mut [Option<ThreadControlBlock>],
     incoming_tid: u64,
@@ -734,12 +744,33 @@ pub(crate) fn classify_and_take_async_resume(
         tcb.async_preempted = None;
         return AsyncResumeClass::Refused("no_saved_context");
     }
-    if tcb.pending_syscall_completion.is_some() {
+    if tcb
+        .pending_syscall_completion
+        .is_some_and(|done| resume_boundary_consumes(done.syscall_class))
+    {
         tcb.async_preempted = None;
         return AsyncResumeClass::Refused("continuation_coexists");
     }
     tcb.async_preempted = None;
     AsyncResumeClass::AsyncPreempted
+}
+
+/// QEMU-SMP3 §4 — does this port's resume boundary CONSUME a parked completion of `class`?
+///
+/// Exactly the classes [`take_thread_restore_facts`] takes: `IpcSend` everywhere, `IpcRecv` only
+/// where [`ThreadRestoreFacts::recv_completion`] is compiled (AArch64, and the reply-timeout oracle
+/// build). Only a consumed record is a continuation that could compete with an async tag; one the
+/// port never consumes has already been encoded into the saved context at publication.
+pub(crate) const fn resume_boundary_consumes(class: BlockedSyscallClass) -> bool {
+    match class {
+        BlockedSyscallClass::IpcSend => true,
+        BlockedSyscallClass::IpcRecv => {
+            cfg!(any(
+                feature = "ipc-reply-timeout-oracle-core",
+                target_arch = "aarch64"
+            ))
+        }
+    }
 }
 
 /// Canonical 199E-R2 — CANCEL a staged snapshot without consuming it as an authorization.

@@ -130,7 +130,11 @@ impl SharedKernel {
         // parameter keeps its contract name at every call site.
         #[cfg(not(all(
             not(feature = "hosted-dev"),
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            )
         )))]
         let _ = executing_cpu;
         let mut lease = AckLease::new_available();
@@ -1206,7 +1210,11 @@ impl SharedKernel {
         // See the NR6 twin: the reverse decision exists on freestanding x86_64 and AArch64 only.
         #[cfg(not(all(
             not(feature = "hosted-dev"),
-            any(target_arch = "x86_64", target_arch = "aarch64")
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            )
         )))]
         let _ = executing_cpu;
         let mut lease = AckLease::new_available();

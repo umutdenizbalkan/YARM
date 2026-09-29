@@ -10,6 +10,18 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[repr(align(64))]
 struct CachePaddedFlag(AtomicBool);
 
+/// QEMU-SMP3 witness only — acquisitions that found the lock HELD and waited for it, all locks,
+/// all CPUs. This is contention actually measured, kept apart from operations that merely
+/// overlapped in time. A spurious weak-CAS failure on a free lock is not counted: only an
+/// observed holder is.
+#[cfg(feature = "riscv64-smp3-witness")]
+static WITNESS_CONTENDED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "riscv64-smp3-witness")]
+pub fn witness_contended_acquisitions() -> u64 {
+    WITNESS_CONTENDED.load(Ordering::Relaxed)
+}
+
 use crate::arch::irq_guard::{self, ArchIrqState};
 
 #[inline]
@@ -54,6 +66,8 @@ impl<T> SpinLock<T> {
 
     #[must_use = "if unused, the lock is immediately released when the guard is dropped"]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        #[cfg(feature = "riscv64-smp3-witness")]
+        let mut waited = false;
         // Use compare_exchange_weak in the retry loop: weak CAS may spuriously
         // fail on LL/SC architectures, but is typically cheaper than strong CAS.
         while self
@@ -63,9 +77,17 @@ impl<T> SpinLock<T> {
             .is_err()
         {
             while self.held.0.load(Ordering::Relaxed) {
+                #[cfg(feature = "riscv64-smp3-witness")]
+                {
+                    waited = true;
+                }
                 spin_loop();
             }
             spin_loop();
+        }
+        #[cfg(feature = "riscv64-smp3-witness")]
+        if waited {
+            WITNESS_CONTENDED.fetch_add(1, Ordering::Relaxed);
         }
         SpinLockGuard {
             lock: self,

@@ -645,8 +645,14 @@ mod tests {
         // arms nothing.
         assert!(!s_mode_timer_boundary_armed(1));
         reestablish_idle_boundary(1);
-        assert!(!s_mode_timer_boundary_armed(1), "no wake source: nothing armed");
-        assert!(!s_mode_timer_boundary_armed(MAX_CPUS), "out of range is never armed");
+        assert!(
+            !s_mode_timer_boundary_armed(1),
+            "no wake source: nothing armed"
+        );
+        assert!(
+            !s_mode_timer_boundary_armed(MAX_CPUS),
+            "out of range is never armed"
+        );
     }
 
     /// QEMU-SMP3 — the boundary is PER CPU: arming one CPU's latch and request leaves every other

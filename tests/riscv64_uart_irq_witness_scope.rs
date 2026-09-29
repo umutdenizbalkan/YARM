@@ -324,6 +324,16 @@ fn the_idle_boundary_window_is_closed() {
         !halt.contains("asm!"),
         "the halt waits only through the audited wait"
     );
+    // QEMU-SMP3: the idle arrival halts through its own per-CPU wait, the one that may unmask.
+    let idle = body_after(
+        RV_BOOT,
+        "fn riscv_idle_halt(cpu: crate::kernel::scheduler::CpuId, reason: &'static str) -> ! {",
+    );
+    assert!(idle.contains("timer::idle_wait_loop(cpu.0 as usize)"));
+    assert!(
+        !idle.contains("asm!"),
+        "the idle halt waits only through the audited wait"
+    );
 }
 
 /// The host driver uses a dedicated serial backend, no monitor, and acknowledgement-driven

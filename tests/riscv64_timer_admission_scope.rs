@@ -140,21 +140,22 @@ fn live_enable_sequence_orders_deadline_stie_then_sie() {
         deadline < stie,
         "the deadline must be programmed before STIE, so the enable bit never stands alone"
     );
+    // QEMU-SMP3: the boundary is per CPU.
     let idle = TIMER
-        .split("pub fn reestablish_idle_boundary() {")
+        .split("pub fn reestablish_idle_boundary(cpu: usize) {")
         .nth(1)
         .expect("the idle boundary")
         .split("\n}")
         .next()
         .expect("its body");
     let scratch = idle
-        .find("set_sscratch_to_trap_stack_top();")
+        .find("set_sscratch_to_trap_stack_top(cpu)")
         .expect("sscratch");
-    let latch = idle.find("arm_s_mode_timer_boundary();").expect("latch");
+    let latch = idle.find("arm_s_mode_timer_boundary(cpu);").expect("latch");
     // QEMU-IRQ1 §2 — the boundary REQUESTS the unmask last; SIE itself is set only inside the
     // stack-free idle `wfi` loop (`set_sstatus_sie_in_wfi_loop`), never before stack-using code.
     let sie = idle
-        .find("request_idle_unmask();")
+        .find("request_idle_unmask(cpu);")
         .expect("the unmask request");
     assert!(
         scratch < latch && latch < sie,
@@ -191,10 +192,11 @@ fn csr_set_helpers_stay_confined_to_two_call_sites() {
         (start, end)
     };
     let arm = span("fn arm_periodic_timer_for_user_delivery()");
-    let idle = span("pub fn reestablish_idle_boundary()");
+    let idle = span("pub fn reestablish_idle_boundary(cpu: usize)");
     // QEMU-IRQ1 §2 — the SIE half now lives in the idle WAIT, reached only on the idle boundary's
-    // one-shot request; the boundary itself sets no CSR.
-    let wait = span("pub fn halt_wait_loop()");
+    // one-shot request; the boundary itself sets no CSR. QEMU-SMP3: that wait is the per-CPU
+    // `idle_wait_loop`; the fatal `halt_wait_loop` it falls into never unmasks.
+    let wait = span("pub fn idle_wait_loop(cpu: usize)");
     assert_eq!(
         TIMER.matches("set_sstatus_sie_in_wfi_loop();").count(),
         1,
@@ -209,14 +211,19 @@ fn csr_set_helpers_stay_confined_to_two_call_sites() {
         );
     }
     assert!(
-        TIMER[wait.0..wait.1].contains("IDLE_UNMASK_REQUESTED.swap(false"),
+        TIMER[wait.0..wait.1].contains("IDLE_UNMASK_REQUESTED")
+            && TIMER[wait.0..wait.1].contains("flag.swap(false, Ordering::AcqRel)"),
         "the wait unmasks only on the idle boundary's request"
     );
     let idle_body = &TIMER[idle.0..idle.1];
+    // QEMU-SMP3: inert without a wake source — on the boot hart that is still the timer the boot
+    // arm enabled, so a deferred arm still leaves the boundary inert.
     assert!(
-        idle_body.contains("if !stie_enabled() {"),
+        idle_body.contains("if !idle_wake_source_enabled(cpu) {"),
         "the idle boundary must be inert if the boot arm deferred"
     );
+    let source = span("fn idle_wake_source_enabled(cpu: usize)");
+    assert!(TIMER[source.0..source.1].contains("BOOTSTRAP_CPU_ID as usize && stie_enabled()"));
 }
 
 /// The exact CSR bits, carried over unchanged.

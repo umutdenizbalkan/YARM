@@ -398,6 +398,74 @@ fn dispatch_resume_refused_fatal(
     );
 }
 
+/// QEMU-SMP3 — settle a blocking-class deferral whose outgoing task was already woken by the
+/// other hart.
+///
+/// The in-lock phase committed the block and cleared `current`; between that commit and this
+/// drain, the other hart's production wake (a reply, a send, a futex wake) made the outgoing
+/// task `Runnable` and queued it here. The class re-verify then fails, and "clear the deferral"
+/// alone is not a settlement: nothing is current, so returning to "current" would `sret`
+/// through the woken task's saved frame while the scheduler holds it on the run queue. With one
+/// dispatching hart this window could not open; with two it does.
+///
+/// The queue advance is still owed, and it is discharged by the SAME owners the idle advance
+/// uses: re-verify that `current` is still clear, select and mark through
+/// `queue_advance_acquire_incoming_split` over the shared step, resume through the exact-token
+/// transaction. If an in-lock fallback DID install a current, nothing is owed and the
+/// established tail resumes it. Every non-resuming outcome is the typed idle terminal. No idle
+/// provenance is published: the outgoing task is no longer blocked, so there is none to give.
+fn settle_overtaken_deferral(
+    shared: &crate::runtime::SharedKernel,
+    trap_path: &crate::arch::trap_entry::TrapPathWindow,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+    site: &'static str,
+) -> RiscvTrapEntryOutcome {
+    if !shared.yield_reverify_ready(cpu) {
+        crate::yarm_log!(
+            "RISCV_OVERTAKEN_DEFERRAL_SETTLED site={} cpu={} incoming=none reason=current_installed settlement=return_to_current",
+            site,
+            cpu.0
+        );
+        return RiscvTrapEntryOutcome::ReturnToCurrent;
+    }
+    let acquired =
+        shared.queue_advance_acquire_incoming_split(trap_path.authority(), site, |k, a| {
+            k.yield_dispatch_step_mut(a)
+        });
+    if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
+        trap_path.retire();
+        dispatch_torn_fatal(cpu, tid, site);
+    }
+    match acquired.token() {
+        Some(token) => {
+            let inc = token.tid();
+            let Some(asid) = direct_dispatch_resume_incoming(shared, token, frame) else {
+                dispatch_resume_refused_fatal(shared, token, cpu, inc, site);
+            };
+            crate::yarm_log!(
+                "RISCV_OVERTAKEN_DEFERRAL_SETTLED site={} cpu={} incoming={} asid={} settlement=switch",
+                site,
+                cpu.0,
+                inc,
+                asid
+            );
+            RiscvTrapEntryOutcome::ReturnToIncoming
+        }
+        None => {
+            crate::yarm_log!(
+                "RISCV_OVERTAKEN_DEFERRAL_SETTLED site={} cpu={} incoming=none reason={} settlement=kernel_idle",
+                site,
+                cpu.0,
+                acquired.marker()
+            );
+            RiscvTrapEntryOutcome::EnterKernelIdle {
+                reason: RiscvIdleReason::QueueAdvanceNoIncoming,
+            }
+        }
+    }
+}
+
 pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
     let is_interrupt = (context.scause & INTERRUPT_BIT) != 0;
     let code = context.scause & SCAUSE_EXCEPTION_MASK;
@@ -2161,7 +2229,9 @@ pub fn handle_riscv_trap_entry_shared(
     if timer_idle_queue_advance || ipi_idle_queue_advance {
         idle_advance_log!(
             "TIMER_IDLE_ADVANCE_DRAIN_BEGIN cpu={}",
-            "IPI_IDLE_ADVANCE_DRAIN_BEGIN cpu={}", cpu.0);
+            "IPI_IDLE_ADVANCE_DRAIN_BEGIN cpu={}",
+            cpu.0
+        );
         // The broad guard is released, so this re-acquires the rank-1 seam freely.
         let reverify_ok = shared.yield_reverify_ready(cpu);
         idle_advance_log!(
@@ -2174,8 +2244,8 @@ pub fn handle_riscv_trap_entry_shared(
             // Something installed a current on this CPU inside this trap. Nothing is owed and
             // nothing was mutated here; the established tail resumes whoever that is.
             idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
-            "IPI_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
+                "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
+                "IPI_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
                 cpu.0
             );
             return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
@@ -2193,20 +2263,22 @@ pub fn handle_riscv_trap_entry_shared(
             Some(token) => {
                 let inc = token.tid();
                 idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
-            "IPI_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
+                    "TIMER_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
+                    "IPI_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
                     inc
                 );
                 idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
-            "IPI_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
+                    "TIMER_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
+                    "IPI_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
                     cpu.0,
                     inc
                 );
                 idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_RUNNING_OK incoming={}",
-            "IPI_IDLE_ADVANCE_RUNNING_OK incoming={}", inc);
+                    "TIMER_IDLE_ADVANCE_RUNNING_OK incoming={}",
+                    "IPI_IDLE_ADVANCE_RUNNING_OK incoming={}",
+                    inc
+                );
                 let Some(asid) = direct_dispatch_resume_incoming(shared, token, &mut *frame) else {
                     // Refused AFTER the scheduler was mutated. The token's own narrowed authority
                     // rolls the dequeue back exactly — a `ContinuedCurrent` mark yields none and
@@ -2226,20 +2298,29 @@ pub fn handle_riscv_trap_entry_shared(
                 // for the same reason it owes the yield count.
                 shared.count_context_switch_split_mut();
                 idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_SATP_OK incoming={} asid={}",
-            "IPI_IDLE_ADVANCE_SATP_OK incoming={} asid={}", inc, asid);
+                    "TIMER_IDLE_ADVANCE_SATP_OK incoming={} asid={}",
+                    "IPI_IDLE_ADVANCE_SATP_OK incoming={} asid={}",
+                    inc,
+                    asid
+                );
                 idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_SFENCE_OK incoming={}",
-            "IPI_IDLE_ADVANCE_SFENCE_OK incoming={}", inc);
+                    "TIMER_IDLE_ADVANCE_SFENCE_OK incoming={}",
+                    "IPI_IDLE_ADVANCE_SFENCE_OK incoming={}",
+                    inc
+                );
                 idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_FRAME_OK incoming={}",
-            "IPI_IDLE_ADVANCE_FRAME_OK incoming={}", inc);
+                    "TIMER_IDLE_ADVANCE_FRAME_OK incoming={}",
+                    "IPI_IDLE_ADVANCE_FRAME_OK incoming={}",
+                    inc
+                );
                 idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_SRET_ARMED incoming={}",
-            "IPI_IDLE_ADVANCE_SRET_ARMED incoming={}", inc);
+                    "TIMER_IDLE_ADVANCE_SRET_ARMED incoming={}",
+                    "IPI_IDLE_ADVANCE_SRET_ARMED incoming={}",
+                    inc
+                );
                 idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
-            "IPI_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
+                    "TIMER_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
+                    "IPI_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
                     cpu.0,
                     inc
                 );
@@ -2257,8 +2338,8 @@ pub fn handle_riscv_trap_entry_shared(
                 // accepted candidate stopped being markable and its dequeue was already undone
                 // exactly. The two authority refusals mutated nothing at all.
                 idle_advance_log!(
-            "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
-            "IPI_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                    "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                    "IPI_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
                     cpu.0,
                     acquired.marker()
                 );
@@ -2492,6 +2573,19 @@ pub fn handle_riscv_trap_entry_shared(
                 cpu.0
             );
             crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
+            // QEMU-SMP3: the other hart released the sender after the block committed; the queue
+            // advance is still owed (see `settle_overtaken_deferral`).
+            match settle_overtaken_deferral(
+                shared,
+                &trap_path,
+                cpu,
+                frame,
+                "riscv_d2_send_overtaken",
+            ) {
+                RiscvTrapEntryOutcome::ReturnToIncoming => switched = true,
+                RiscvTrapEntryOutcome::ReturnToCurrent => {}
+                idle => return Ok(idle),
+            }
         }
     }
 
@@ -2644,6 +2738,19 @@ pub fn handle_riscv_trap_entry_shared(
                 cpu.0
             );
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+            // QEMU-SMP3: the other hart woke the receiver after the block committed; the queue
+            // advance is still owed (see `settle_overtaken_deferral`).
+            match settle_overtaken_deferral(
+                shared,
+                &trap_path,
+                cpu,
+                frame,
+                "riscv_d2_recv_overtaken",
+            ) {
+                RiscvTrapEntryOutcome::ReturnToIncoming => switched = true,
+                RiscvTrapEntryOutcome::ReturnToCurrent => {}
+                idle => return Ok(idle),
+            }
         }
     }
 
@@ -2842,6 +2949,19 @@ pub fn handle_riscv_trap_entry_shared(
                 "RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed cpu={}",
                 cpu.0
             );
+            // QEMU-SMP3: the other hart's FutexWake overtook the drain; the queue advance is
+            // still owed (see `settle_overtaken_deferral`).
+            match settle_overtaken_deferral(
+                shared,
+                &trap_path,
+                cpu,
+                frame,
+                "riscv_futex_wait_overtaken",
+            ) {
+                RiscvTrapEntryOutcome::ReturnToIncoming => switched = true,
+                RiscvTrapEntryOutcome::ReturnToCurrent => {}
+                idle => return Ok(idle),
+            }
         }
     }
 
@@ -3192,6 +3312,31 @@ pub fn handle_riscv_trap_entry_shared(
                 return Err(TrapHandleError::Syscall(
                     crate::kernel::syscall::SyscallError::Internal,
                 ));
+            }
+            (Some((blocked_tid, class)), false) => {
+                // QEMU-SMP3: the block committed and this CPU found nothing to run, and THEN the
+                // other hart's wake made work runnable here (possibly the blocked task itself)
+                // before this terminal check. Not terminal any more — but if nothing is current,
+                // "return to current" would `sret` through the blocked task's stale frame. The
+                // queue advance is still owed; `settle_overtaken_deferral` discharges it, and
+                // returns `ReturnToCurrent` only when a current really is installed.
+                crate::yarm_log!(
+                    "RISCV_BLOCKED_IPC_IDLE_OVERTAKEN tid={} class={} cpu={}",
+                    blocked_tid,
+                    class.as_str(),
+                    cpu.0
+                );
+                match settle_overtaken_deferral(
+                    shared,
+                    &trap_path,
+                    cpu,
+                    frame,
+                    "riscv_blocked_ipc_overtaken",
+                ) {
+                    RiscvTrapEntryOutcome::ReturnToIncoming => switched = true,
+                    RiscvTrapEntryOutcome::ReturnToCurrent => {}
+                    idle => return Ok(idle),
+                }
             }
             _ => {}
         }

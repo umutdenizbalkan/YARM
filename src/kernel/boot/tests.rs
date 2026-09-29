@@ -78226,7 +78226,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     fn idle_reuses_bridge_terminal() {
         assert!(
             RISCV_BOOT_SRC.contains("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
-                && RISCV_BOOT_SRC.contains("riscv_trap_halt(\"kernel_idle_awaiting_io\")"),
+                && RISCV_BOOT_SRC.contains("riscv_idle_halt(cpu, \"kernel_idle_awaiting_io\")"),
             "the bridge's existing idle terminal must be the reused idle policy"
         );
     }
@@ -104481,7 +104481,7 @@ mod stage200d0d1_riscv_exit_prep {
         ));
         assert_eq!(
             RV_BOOT_SRC
-                .matches("riscv_trap_halt(\"kernel_idle_awaiting_io\")")
+                .matches("riscv_idle_halt(cpu, \"kernel_idle_awaiting_io\")")
                 .count(),
             1,
             "exactly one idle terminal serves every typed idle reason"
@@ -111988,11 +111988,34 @@ mod stage199d_aarch64_readiness_audit {
             2,
             "the AArch64 conditionals are the two reschedule-SGI sends"
         );
-        const NEGATION: &str = "#[cfg(not(all(\n            not(feature = \"hosted-dev\"),\n            any(target_arch = \"x86_64\", target_arch = \"aarch64\")\n        )))]";
+        // QEMU-SMP3 — the RISC-V half of the same decision joined them, so each drain now has an
+        // x86_64, an AArch64 and a RISC-V gate, and the one negation names all three ports.
+        assert_eq!(
+            txn.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"riscv64\"))]")
+                .count(),
+            2,
+            "the RISC-V conditionals are the two SBI reschedule-IPI sends"
+        );
+        for send in txn
+            .split("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"riscv64\"))]")
+            .skip(1)
+        {
+            let arm: alloc::string::String = send
+                .lines()
+                .take(6)
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                arm.contains("if success.wake_target_cpu != executing_cpu {")
+                    && arm.contains("crate::arch::riscv64::ipi::send_reschedule("),
+                "a RISC-V arm is only the post-commit remote-wake send"
+            );
+        }
+        const NEGATION: &str = "#[cfg(not(all(\n            not(feature = \"hosted-dev\"),\n            any(\n                target_arch = \"x86_64\",\n                target_arch = \"aarch64\",\n                target_arch = \"riscv64\"\n            )\n        )))]";
         assert_eq!(
             txn.matches(NEGATION).count(),
             2,
-            "each drain has exactly one negation of both ports, for the unused-parameter discard"
+            "each drain has exactly one negation of all three ports, for the unused-parameter discard"
         );
         for negated in txn.split(NEGATION).skip(1) {
             let arm = negated.lines().nth(1).unwrap_or("").trim();
@@ -112018,8 +112041,8 @@ mod stage199d_aarch64_readiness_audit {
         }
         assert_eq!(
             txn.matches("target_arch").count(),
-            8,
-            "and there are no others: four gates plus two negations naming both ports"
+            12,
+            "and there are no others: six gates plus two negations naming all three ports"
         );
     }
 
@@ -115935,31 +115958,39 @@ mod stage199d_riscv_production_readiness_audit {
         }
     }
 
-    /// **Blocker 3, pinned exactly.** The remote wake is `x86_64`-cfg-gated, and RISC-V exposes
-    /// no IPI seam at all — the SBI surface carries HSM (hart start/status) but no IPI
-    /// extension. Latent only because RISC-V is BSP-only today.
+    /// **Blocker 3, as pinned at this audit:** the remote wake was `x86_64`-cfg-gated and RISC-V
+    /// exposed no IPI seam. QEMU-SMP3 re-derivation: the RISC-V wake authority now exists as ONE
+    /// post-commit send per drain through `arch::riscv64::ipi`, refused unless the target published
+    /// itself ready; the transaction still carries no other RISC-V special case.
     #[test]
-    fn remote_wake_authority_is_absent_on_riscv() {
+    fn remote_wake_authority_is_only_the_smp3_send_on_riscv() {
         assert_eq!(
             TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
                 .count(),
             2,
-            "both wake sends are x86_64-only — request and reply"
+            "the x86_64 wake sends are unchanged — request and reply"
         );
-        for l in code_lines(TXN) {
+        let rv: alloc::vec::Vec<_> = code_lines(TXN)
+            .into_iter()
+            .filter(|l| l.contains("riscv"))
+            .collect();
+        assert_eq!(
+            rv.len(),
+            6,
+            "the RISC-V lines are the two gates, the two sends and the discard's port list: {rv:?}"
+        );
+        for l in &rv {
             assert!(
-                !l.contains("riscv"),
-                "the transaction carries no RISC-V special case: `{l}`"
+                l.contains("target_arch = \"riscv64\"")
+                    || l.contains("crate::arch::riscv64::ipi::send_reschedule("),
+                "the transaction carries no other RISC-V special case: `{l}`"
             );
         }
         assert!(
             RISCV_SBI.contains("SBI_EXT_HSM"),
             "the SBI surface has hart start/status"
         );
-        assert!(
-            !RISCV_SBI.contains("SBI_EXT_IPI") && !RISCV_SBI.contains("0x735049"),
-            "and no IPI extension — there is no cross-hart wake authority to call"
-        );
+        crate::kernel::boot::tests::assert_riscv_smp3_wake_scope();
         assert!(
             RISCV_BRIDGE.contains("RISCV_SCHEDULER_BSP_ONLY") || RISCV_BRIDGE.contains("online=0"),
             "latent only because no RISC-V CPU beyond the boot hart is scheduler-online"
@@ -116505,20 +116536,17 @@ mod stage199d_riscv_narrow_trap_snapshots {
         );
     }
 
-    /// Blocker 3 is untouched: no cross-hart wake was added.
+    /// Blocker 3 was untouched by this increment. QEMU-SMP3 later added the cross-hart wake,
+    /// through its own owner only: see `assert_riscv_smp3_wake_scope`.
     #[test]
-    fn blocker_three_remains_open() {
-        const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
-        assert!(
-            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
-            "no IPI extension may be introduced by this increment"
-        );
+    fn blocker_three_is_closed_only_by_the_smp3_owner() {
+        crate::kernel::boot::tests::assert_riscv_smp3_wake_scope();
         const TXN: &str = include_str!("../ipccall_direct_txn.rs");
         assert_eq!(
             TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
                 .count(),
             2,
-            "the wake sends stay x86_64-only"
+            "the x86_64 wake sends are unchanged"
         );
     }
 
@@ -116936,21 +116964,19 @@ mod stage199d_riscv_canonical_admission {
 
     // ── 7. Cross-hart wake blocker 3 remains explicitly open ────────────────────────────────
 
-    /// Blocker 3 is untouched and stays explicitly open — which is why the readiness verdict
-    /// moves to case B rather than case A.
+    /// Blocker 3 stayed open through Stage 199D — which is why the readiness verdict moved to
+    /// case B rather than case A. QEMU-SMP3 closes it with a real owner (the SBI IPI behind the
+    /// knob-gated release), so what this guard protected — no cross-hart wake without its owner —
+    /// is now the positive scope in `assert_riscv_smp3_wake_scope`.
     #[test]
-    fn cross_hart_wake_blocker_three_remains_open() {
-        const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
-        assert!(
-            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
-            "no IPI extension may be introduced by this increment"
-        );
+    fn cross_hart_wake_blocker_three_is_closed_only_by_the_smp3_owner() {
+        crate::kernel::boot::tests::assert_riscv_smp3_wake_scope();
         const TXN: &str = include_str!("../ipccall_direct_txn.rs");
         assert_eq!(
             TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
                 .count(),
             2,
-            "both post-enqueue wake sends stay x86_64-only"
+            "the x86_64 post-enqueue wake sends are unchanged"
         );
         assert!(
             AUDIT.contains("RISCV_199D_READINESS=case_b"),
@@ -117147,26 +117173,28 @@ mod stage199d_riscv_remote_wake_readiness {
                 scope: Scope::Txn,
                 present: true,
             },
+            // QEMU-SMP3 closed links 4, 5, 6, 8 and 10, each through one named owner. The seams
+            // below are those owners' own call sites, so the flags stay computed, not asserted.
             Link {
                 step: 4,
                 what: "an architecture wake seam exists for RISC-V",
-                seam: "riscv64::smp::send_reschedule_ipi_to",
+                seam: "crate::arch::riscv64::ipi::send_reschedule(",
                 scope: Scope::Txn,
-                present: false,
+                present: true,
             },
             Link {
                 step: 5,
                 what: "an SBI IPI transport exists",
-                seam: "SBI_EXT_IPI",
+                seam: "pub const SBI_EXT_IPI: usize = 0x735049;",
                 scope: Scope::Riscv,
-                present: false,
+                present: true,
             },
             Link {
                 step: 6,
                 what: "supervisor software interrupts are enabled in sie (SSIE, bit 1)",
-                seam: "SSIE",
+                seam: "crate::arch::riscv64::ipi::enable_ssie_on_this_hart()",
                 scope: Scope::Riscv,
-                present: false,
+                present: true,
             },
             Link {
                 step: 7,
@@ -117180,9 +117208,9 @@ mod stage199d_riscv_remote_wake_readiness {
             Link {
                 step: 8,
                 what: "the trap decoder recognises the supervisor software interrupt (cause 1)",
-                seam: "IRQ_SUPERVISOR_SOFT",
+                seam: "crate::arch::riscv64::ipi::is_software_interrupt(scause)",
                 scope: Scope::Riscv,
-                present: false,
+                present: true,
             },
             Link {
                 step: 9,
@@ -117194,9 +117222,9 @@ mod stage199d_riscv_remote_wake_readiness {
             Link {
                 step: 10,
                 what: "hart 1 can perform saved user dispatch / user return",
-                seam: "RISCV_SECONDARY_USER_DISPATCH",
+                seam: "shared.admit_ap_pinned_dispatch_split(cpu)",
                 scope: Scope::Riscv,
-                present: false,
+                present: true,
             },
         ]
     }
@@ -117246,11 +117274,14 @@ mod stage199d_riscv_remote_wake_readiness {
             .filter(|l| !l.present)
             .map(|l| l.step)
             .collect();
+        // QEMU-SMP3: only link 1 remains. Production pins no RISC-V task to CPU 1 — only the
+        // compile-gated witness places work there — so a production remote enqueue is still
+        // unreachable, and the verdict is still D, now for affinity alone.
         assert_eq!(
             missing,
-            alloc::vec![1u8, 4, 5, 6, 8, 10],
-            "links 2, 3, 7 and 9 are closed; the earliest missing link is 1 (no RISC-V task is \
-             pinned to a non-boot CPU), so the verdict is still D"
+            alloc::vec![1u8],
+            "links 2..10 are closed; the earliest (and only) missing link is 1 (no production \
+             RISC-V task is pinned to a non-boot CPU), so the verdict is still D"
         );
         assert_ne!(classify(), TransportOnlyMissing);
         assert_ne!(classify(), TransportAndTrapConsumerMissing);
@@ -117377,21 +117408,18 @@ mod stage199d_riscv_remote_wake_readiness {
 
     // ── Q5/Q6: transport and consumer ───────────────────────────────────────────────────────
 
-    /// No SBI IPI transport exists. The SBI surface carries HSM and TIME only.
+    /// No SBI IPI transport existed at this audit. QEMU-SMP3 added exactly one, owned by
+    /// `arch::riscv64::ipi`; the boot and trap sources still call no firmware IPI themselves.
     #[test]
-    fn no_sbi_ipi_transport_exists() {
+    fn the_sbi_ipi_transport_is_only_the_smp3_owner() {
         assert!(
             RISCV_SBI.contains("SBI_EXT_HSM"),
             "HSM is present — that is how the secondaries are started"
         );
+        crate::kernel::boot::tests::assert_riscv_smp3_wake_scope();
         assert!(
-            !RISCV_SBI.contains("SBI_EXT_IPI") && !RISCV_SBI.contains("0x735049"),
-            "the IPI extension is absent"
-        );
-        // And no wake seam calls one.
-        assert!(
-            !probe("send_ipi", RISCV_BOOT) && !probe("send_ipi", RISCV_TRAP),
-            "no RISC-V arch wake seam exists"
+            !probe("sbi::send_ipi", RISCV_BOOT) && !probe("sbi::send_ipi", RISCV_TRAP),
+            "no second RISC-V arch wake seam exists"
         );
     }
 
@@ -117520,23 +117548,19 @@ mod stage199d_riscv_remote_wake_readiness {
         );
         assert_eq!(
             missing_non_transport,
-            alloc::vec![1u8, 6, 8, 10],
-            "affinity, interrupt enablement, decoder arm and AP dispatch are still absent \
-             (links 2 and 7 are closed)"
+            alloc::vec![1u8],
+            "QEMU-SMP3 closed interrupt enablement, the decoder arm and AP dispatch; production \
+             affinity is the one link still absent"
         );
     }
 
-    /// This increment is an audit: nothing was implemented, flipped or re-homed.
+    /// This increment was an audit: nothing was implemented, flipped or re-homed. QEMU-SMP3 later
+    /// implemented the IPI and hart 1's dispatch through their own owners (see
+    /// `assert_riscv_smp3_wake_scope`); what stays pinned is the production predicate below.
     #[test]
     fn the_audit_implemented_nothing() {
-        assert!(
-            !RISCV_SBI.contains("SBI_EXT_IPI"),
-            "no SBI IPI was implemented"
-        );
-        assert!(
-            !RISCV_BOOT.contains("RISCV_SECONDARY_USER_DISPATCH"),
-            "no user work was started on hart 1"
-        );
+        crate::kernel::boot::tests::assert_riscv_smp3_wake_scope();
+        let _ = RISCV_SBI;
         const MOD_SRC: &str = include_str!("mod.rs");
         let production = MOD_SRC
             .split("pub const fn ipccall_direct_production_enabled() -> bool {")
@@ -117840,17 +117864,17 @@ mod stage199d_riscv_secondary_trap_ready {
                 "out of scope for the trap-ready park: `{forbidden}`"
             );
         }
+        // QEMU-SMP3: the IPI transport, its send seam and the software-interrupt consumer now
+        // exist — in their one owner, `arch::riscv64::ipi`, not in the boot or trap sources.
+        crate::kernel::boot::tests::assert_riscv_smp3_wake_scope();
+        let _ = SBI;
         assert!(
-            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
-            "no SBI IPI transport was added"
-        );
-        assert!(
-            !BOOT.contains("send_ipi") && !TRAP.contains("send_ipi"),
-            "no IPI send seam was added"
+            !BOOT.contains("sbi::send_ipi") && !TRAP.contains("sbi::send_ipi"),
+            "no second IPI send seam was added"
         );
         assert!(
             !TRAP.contains("IRQ_SUPERVISOR_SOFT"),
-            "no software-interrupt decoder arm was added"
+            "the software-interrupt cause is decoded by the ipi owner, not a second arm here"
         );
         for src in [BOOT, TRAP] {
             assert!(
@@ -118104,7 +118128,12 @@ mod stage199d_riscv_link2_wake_only_online {
 
     // ── What must NOT have happened ─────────────────────────────────────────────────────────
 
-    /// Link 7 remains present; links 1, 4, 5, 6, 8 and 10 remain absent.
+    /// Link 7 remains present; links 1, 4, 5, 6, 8 and 10 remained absent at this stage.
+    ///
+    /// QEMU-SMP3 re-derivation: links 4/5 (the SBI IPI and its wake seam) and 10 (secondary
+    /// dispatch) now exist, each through ONE owner outside the boot/trap sources this guard reads —
+    /// `arch::riscv64::ipi` for the transport, the scheduler's admission for dispatch — and only
+    /// after the knob-gated release. What stays pinned here is that neither file grew its own.
     #[test]
     fn only_link_two_moved() {
         // Link 7 (trap-ready foundation) still there.
@@ -118113,11 +118142,9 @@ mod stage199d_riscv_link2_wake_only_online {
         for src in [BOOT, TRAP] {
             assert!(!src.contains("set_task_home_cpu"), "no RISC-V task pinning");
         }
-        // 4/5 — no arch wake seam, no SBI IPI probe or implementation.
-        assert!(
-            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
-            "no SBI IPI extension or probe was added"
-        );
+        // 4/5 — the SBI IPI exists only in the SMP3 owner.
+        crate::kernel::boot::tests::assert_riscv_smp3_wake_scope();
+        let _ = SBI;
         assert!(
             !BOOT.contains("send_ipi") && !TRAP.contains("send_ipi"),
             "no arch wake seam was added"
@@ -118141,17 +118168,29 @@ mod stage199d_riscv_link2_wake_only_online {
             .map(|i| sec + i)
             .unwrap_or(BOOT.len());
         let code = code_lines(&BOOT[sec..end]);
-        for forbidden in [
-            "dispatch",
-            "enter_user",
-            "sret",
-            "enqueue",
-            "process_cross_cpu",
-        ] {
-            assert!(
-                !code.iter().any(|l| l.contains(forbidden)),
-                "the secondary must have no dispatch/user-return path: `{forbidden}`"
-            );
+        // QEMU-SMP3: the park's ONE way out is the knob-gated release, into the admission path.
+        let release = code
+            .iter()
+            .position(|l| l.contains("ipi::take_park_release(cpu)"))
+            .expect("the park is left only through the release");
+        let main = code
+            .iter()
+            .position(|l| l.contains("riscv_secondary_dispatch_main(cpu, hart_id);"))
+            .expect("into the admission path");
+        assert_eq!(main, release + 1, "and only under it");
+        for (i, l) in code.iter().enumerate() {
+            for forbidden in [
+                "dispatch",
+                "enter_user",
+                "sret",
+                "enqueue",
+                "process_cross_cpu",
+            ] {
+                assert!(
+                    !l.contains(forbidden) || i == main,
+                    "the secondary boot itself must have no dispatch/user-return path: `{forbidden}`"
+                );
+            }
         }
     }
 
@@ -136819,23 +136858,24 @@ mod riscv64_s_mode_timer_bridge {
             !arm.contains("set_sstatus_sie()"),
             "the boot arm must NOT unmask: U-origin delivery rides on privilege rules"
         );
+        // QEMU-SMP3: the boundary is per CPU — this CPU's top, latch and request.
         let idle = RV_TIMER_SRC
-            .split("pub fn reestablish_idle_boundary() {")
+            .split("pub fn reestablish_idle_boundary(cpu: usize) {")
             .nth(1)
             .expect("the audited idle boundary")
             .split("\n}")
             .next()
             .expect("its body");
         let sscratch = idle
-            .find("set_sscratch_to_trap_stack_top()")
+            .find("set_sscratch_to_trap_stack_top(cpu)")
             .expect("the sscratch re-point");
         let armed = idle
-            .find("arm_s_mode_timer_boundary()")
+            .find("arm_s_mode_timer_boundary(cpu)")
             .expect("the boundary arm");
         // QEMU-IRQ1 §2 — the boundary REQUESTS the unmask as its last step; it never sets SIE and
         // then returns through stack-using code (the window the UART witness measured).
         let sie = idle
-            .find("request_idle_unmask()")
+            .find("request_idle_unmask(cpu)")
             .expect("the unmask request");
         assert!(
             sscratch < armed && armed < sie,
@@ -137204,10 +137244,24 @@ mod riscv64_s_mode_timer_bridge {
             .split("\n/// ")
             .next()
             .expect("its body");
+        // QEMU-SMP3: the region carries its own published size (CPU 1's trap stack is not the
+        // 4 KiB slot stack), read by one helper both resolvers share.
         assert!(
-            resolver.contains("RISCV64_SECONDARY_TRAP_STACK_TOPS[slot]")
+            resolver.contains("secondary_trap_stack_region(slot)")
                 && resolver.contains("frame_ptr >= base && frame_ptr < top"),
             "it matches the frame against the published per-hart regions"
+        );
+        let region = RV_BOOT_SRC
+            .split("fn secondary_trap_stack_region(slot: usize) -> Option<(usize, usize)> {")
+            .nth(1)
+            .expect("the region helper")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        assert!(
+            region.contains("RISCV64_SECONDARY_TRAP_STACK_TOPS[slot]")
+                && region.contains("RISCV64_SECONDARY_TRAP_STACK_SIZES[slot]"),
+            "the region is the published top and its published size"
         );
         assert!(
             resolver.contains("riscv_trap_stack_top()"),
@@ -137222,7 +137276,8 @@ mod riscv64_s_mode_timer_bridge {
             .next()
             .expect("its body");
         assert!(
-            cpu_resolver.contains("frame_ptr >= base && frame_ptr < top"),
+            cpu_resolver.contains("secondary_trap_stack_region(slot)")
+                && cpu_resolver.contains("frame_ptr >= base && frame_ptr < top"),
             "both resolvers key off the identical region predicate"
         );
     }
@@ -137242,10 +137297,19 @@ mod riscv64_s_mode_timer_bridge {
             !halt.contains("sscratch") && !halt.contains("yarm_riscv64_trap_return"),
             "the fail-closed halt touches no stack state and reaches no return tail"
         );
+        // QEMU-SMP3: it parks in the MASKED wait, which is a `wfi` loop consuming no request.
         assert!(
-            halt.contains("wfi"),
+            halt.contains("crate::arch::riscv64::timer::halt_wait_loop()"),
             "it parks, so no later entry can inherit a half-written value"
         );
+        let wait = RV_TIMER_SRC
+            .split("pub fn halt_wait_loop() -> ! {")
+            .nth(1)
+            .expect("the masked wait")
+            .split("\n}")
+            .next()
+            .expect("its body");
+        assert!(wait.contains("\"wfi\"") && !wait.contains("set_sstatus_sie"));
     }
 
     /// This checkpoint adds no broad-lock acquisition, so the Stage 204A census is unchanged.
@@ -137999,9 +138063,15 @@ mod riscv64_async_preemption {
     /// task holding both is ambiguous, and neither may silently win.
     #[test]
     fn async_and_continuation_double_ownership_fails_closed() {
+        // QEMU-SMP3 §4: the class is one every port's resume boundary CONSUMES (`IpcSend`), so the
+        // parked record really is a competing continuation.
         let (mut state, tid) = fixture();
         assert!(state.snapshot_async_preempted_current(&canary_frame(0xBB, 0xCC)));
-        state.set_pending_syscall_completion_for_test(tid, 7);
+        state.set_pending_syscall_completion_of_class_for_test(
+            tid,
+            crate::kernel::task::BlockedSyscallClass::IpcSend,
+            7,
+        );
         assert_eq!(
             resume_as_boundary(&mut state, tid),
             AsyncResumeClass::Refused("continuation_coexists"),
@@ -138011,6 +138081,44 @@ mod riscv64_async_preemption {
             !state.async_preempted_resume_pending(tid),
             "the ambiguous authorization is cleared rather than left to be raced"
         );
+    }
+
+    /// (9h) QEMU-SMP3 §4 — a parked `IpcRecv` record is a continuation only where the resume
+    /// boundary consumes it. Where the port installs the receive result into the saved context at
+    /// publication and never consumes the record (x86_64, RISC-V), it is residue of a block the
+    /// task has already resumed from and run past, so a later async preemption is resumed exactly
+    /// — refusing it resumed the task through the startup argument lane and zeroed `a0..a3`.
+    #[test]
+    fn a_never_consumed_recv_record_is_not_a_competing_continuation() {
+        let (mut state, tid) = fixture();
+        assert!(state.snapshot_async_preempted_current(&canary_frame(0xDD, 0xEE)));
+        state.set_pending_syscall_completion_for_test(tid, 9);
+        let consumed = crate::kernel::task::resume_boundary_consumes(
+            crate::kernel::task::BlockedSyscallClass::IpcRecv,
+        );
+        assert_eq!(
+            consumed,
+            cfg!(any(
+                feature = "ipc-reply-timeout-oracle-core",
+                target_arch = "aarch64"
+            )),
+            "the classes counted are exactly the classes the restore facts take"
+        );
+        assert_eq!(
+            resume_as_boundary(&mut state, tid),
+            if consumed {
+                AsyncResumeClass::Refused("continuation_coexists")
+            } else {
+                AsyncResumeClass::AsyncPreempted
+            },
+        );
+        assert!(
+            !state.async_preempted_resume_pending(tid),
+            "consumed either way"
+        );
+        assert!(crate::kernel::task::resume_boundary_consumes(
+            crate::kernel::task::BlockedSyscallClass::IpcSend
+        ));
     }
 
     /// (10) SOURCE: the snapshot happens on a U-origin timer trap, strictly BEFORE anything that
@@ -138470,8 +138578,10 @@ mod riscv64_async_preemption {
             "five refusals and the one successful consumption all clear the tag"
         );
         assert!(
-            classifier.contains("if tcb.pending_syscall_completion.is_some() {"),
-            "async and D2/startup continuation states must not coexist ambiguously"
+            classifier
+                .contains(".is_some_and(|done| resume_boundary_consumes(done.syscall_class))"),
+            "async and D2/startup continuation states must not coexist ambiguously — counting \
+             exactly the parked classes the resume boundary consumes"
         );
     }
 
@@ -147422,10 +147532,11 @@ mod u9qa_split_dispatch_disposition {
             .collect::<alloc::vec::Vec<_>>()
             .join(" ");
         let riscv_flat: &str = &flattened;
+        // QEMU-SMP3: the RISC-V gate names one more settled family, the reschedule IPI.
         let gate_at = riscv_flat
             .find(
                 "if queue_advance_committed || post_work_committed || cow_recovered \
-                 || demand_recovered || irq_handled || unknown_handled {",
+                 || demand_recovered || irq_handled || unknown_handled || ipi_handled {",
             )
             .expect("the broad-dispatch gate");
         // U9-TERMINAL-FINAL §5: the gate now guards the per-class settlement rather than an
@@ -149143,11 +149254,13 @@ mod u9tm_proof_gate {
                 "if queue_advance_committed || post_work_committed || cow_recovered \
                  || demand_recovered || irq_handled || unknown_handled {",
             ),
+            // QEMU-SMP3: RISC-V enumerates one more committed disposition — the reschedule IPI,
+            // settled from the arrival its entry owner consumed, never from a stash.
             (
                 "riscv",
                 include_str!("../../arch/riscv64/trap.rs"),
                 "if queue_advance_committed || post_work_committed || cow_recovered \
-                 || demand_recovered || irq_handled || unknown_handled {",
+                 || demand_recovered || irq_handled || unknown_handled || ipi_handled {",
             ),
         ] {
             let flattened = flat(raw);
@@ -169270,20 +169383,34 @@ mod u9exit4_post_clear_totality {
             1,
             "and exactly one caller reaches it"
         );
+        // QEMU-SMP3: the idle wait is per CPU and is the only consumer of that CPU's request; the
+        // fatal halt's wait consumes nothing and never unmasks.
         let wait = RISCV_TIMER
+            .split("pub fn idle_wait_loop(cpu: usize) -> ! {")
+            .nth(1)
+            .expect("the idle wait");
+        let wait = &wait[..wait.find("\n}").expect("its end")];
+        assert!(
+            wait.contains("IDLE_UNMASK_REQUESTED")
+                && wait.contains("flag.swap(false, Ordering::AcqRel)"),
+            "it is the idle wait, consuming THIS CPU's one-shot request"
+        );
+        let fatal = RISCV_TIMER
             .split("pub fn halt_wait_loop() -> ! {")
             .nth(1)
-            .expect("the halt wait");
+            .expect("the fatal wait");
+        let fatal = &fatal[..fatal.find("\n}").expect("its end")];
         assert!(
-            wait[..wait.find("\n}").expect("its end")].contains("IDLE_UNMASK_REQUESTED.swap(false"),
-            "it is the idle wait, consuming the idle boundary's one-shot request"
+            !fatal.contains("IDLE_UNMASK_REQUESTED") && !fatal.contains("set_sstatus_sie"),
+            "the fatal wait consumes no request and never unmasks"
         );
         let boundary = RISCV_TIMER
-            .split("pub fn reestablish_idle_boundary() {")
+            .split("pub fn reestablish_idle_boundary(cpu: usize) {")
             .nth(1)
             .expect("the idle boundary");
         assert!(
-            boundary[..boundary.find("\n}").expect("its end")].contains("request_idle_unmask();"),
+            boundary[..boundary.find("\n}").expect("its end")]
+                .contains("request_idle_unmask(cpu);"),
             "and the request comes from the idle boundary, not the trap path"
         );
         for line in code_lines(RISCV_TRAP) {
@@ -173107,7 +173234,7 @@ mod u9dispatchcpu2_recovery {
 /// |---|---|---|---|
 /// | x86_64 | `idle_halt_loop()` in the raw trap tail | IF as the trap left it | LAPIC timer IRQ |
 /// | AArch64 | `idle_no_eret_loop()` — `wfi` | DAIF as the trap left it; `wfi` wakes on an unmasked pending IRQ | GIC PPI 30 |
-/// | RISC-V | `riscv_trap_halt` — `wfi` | **explicitly re-armed**: `reestablish_idle_boundary()` sets `sstatus.SIE`, because hardware clears it on every trap entry and the `wfi` would otherwise loop masked | S-mode timer |
+/// | RISC-V | `riscv_idle_halt` — `wfi` | **explicitly re-armed**: `reestablish_idle_boundary(cpu)` sets `sstatus.SIE`, because hardware clears it on every trap entry and the `wfi` would otherwise loop masked | S-mode timer |
 ///
 /// RISC-V is the one that needs a positive act, and it has one. That is why "the timer will fire"
 /// is a claim about three different mechanisms, not one.
@@ -173359,7 +173486,7 @@ mod u9dispatchcpu3_recovery_chain {
         // `yarm_aarch64_vector_dispatch` masks `DAIF` before calling into Rust and every path to
         // this primitive arrives through it. Measured at base — 14 `irq_lower_a64` exceptions and
         // zero `irq_current_spx` on an AArch64 core boot. The primitive must now UNMASK, which is
-        // the direct analogue of RISC-V's `reestablish_idle_boundary()` asserted below.
+        // the direct analogue of RISC-V's `reestablish_idle_boundary(cpu)` asserted below.
         let idle = A64
             .split_once("extern \"C\" fn aarch64_idle_park_loop(cpu: usize) -> ! {")
             .map(|(_, r)| r.split_once("\n}").map(|(b, _)| b).unwrap_or(r))
@@ -173409,10 +173536,10 @@ mod u9dispatchcpu3_recovery_chain {
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
         let boundary = rv_idle
-            .find("timer::reestablish_idle_boundary()")
+            .find("timer::reestablish_idle_boundary(cpu.0 as usize)")
             .expect("RISC-V must re-establish the S-origin boundary before halting");
         let halt = rv_idle
-            .find("riscv_trap_halt(\"kernel_idle_awaiting_io\")")
+            .find("riscv_idle_halt(cpu, \"kernel_idle_awaiting_io\")")
             .expect("the RISC-V idle halt");
         assert!(
             boundary < halt,
@@ -175029,8 +175156,9 @@ mod u9timer1_preempting_timer {
         );
         // The drain itself adds no convention and encodes no result.
         const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+        // QEMU-SMP3: the same drain, now also discharging the reschedule IPI's idle advance.
         let drain = RISCV_TRAP
-            .split("if timer_idle_queue_advance {")
+            .split("if timer_idle_queue_advance || ipi_idle_queue_advance {")
             .nth(1)
             .and_then(|s| s.split("\n    // ── Stage 196D").next())
             .expect("the idle-boundary drain");
@@ -175112,7 +175240,7 @@ mod u9timer1_preempting_timer {
         // CODE only. The drain's own comments say what it deliberately does NOT reach for — that
         // is the point of them — so a raw scan would match the very prose that states the claim.
         let drain: alloc::string::String = RISCV_TRAP
-            .split("if timer_idle_queue_advance {")
+            .split("if timer_idle_queue_advance || ipi_idle_queue_advance {")
             .nth(1)
             .and_then(|s| s.split("\n    // ── Stage 196D").next())
             .expect("the idle-boundary drain")
@@ -187948,11 +188076,16 @@ mod u9irq1_acknowledgement {
                 .split_whitespace()
                 .collect::<alloc::vec::Vec<_>>()
                 .join(" ");
+            // QEMU-SMP3: the RISC-V gate also names the reschedule IPI's own flag.
+            let gate = if port == "riscv" {
+                "if queue_advance_committed || post_work_committed || cow_recovered \
+                 || demand_recovered || irq_handled || unknown_handled || ipi_handled {"
+            } else {
+                "if queue_advance_committed || post_work_committed || cow_recovered \
+                 || demand_recovered || irq_handled || unknown_handled {"
+            };
             assert!(
-                flat.contains(
-                    "if queue_advance_committed || post_work_committed || cow_recovered \
-                     || demand_recovered || irq_handled || unknown_handled {"
-                ),
+                flat.contains(gate),
                 "{port}: and the gate must admit it, or the flag decides nothing"
             );
         }
@@ -192972,4 +193105,124 @@ mod qemu_context1_user_fpu_ownership {
         assert_eq!(status(&k, ACC_A), Some(TaskStatus::Runnable));
         assert_eq!(k.current_tid_split_read(CPU0), Some(ACC_A));
     }
+}
+
+/// QEMU-SMP3 — the RISC-V remote-wake and remote-fence scope, stated ONCE.
+///
+/// Every Stage 199D readiness guard pinned "RISC-V has no SBI IPI and no remote wake yet", so that
+/// no cross-hart wake could appear without its owner. QEMU-SMP3 adds that owner deliberately; what
+/// those guards protected is re-derived here as the positive property the delivered tree must hold:
+///
+/// * the SBI IPI and RFENCE extensions are declared in `sbi.rs` and CALLED only from
+///   `arch::riscv64::ipi` — no other file raises a firmware IPI or a remote fence;
+/// * the NR6/NR7 drains' only RISC-V conditional is the post-commit remote-wake send, one per drain,
+///   through `ipi::send_reschedule`, which refuses (sending nothing) a target that never published
+///   itself ready — so a boot without `yarm.ap_user_dispatch=1` signals nothing;
+/// * the publication precedes the notification, and the arrival clears `sip.SSIP` before it
+///   consumes the mailbox;
+/// * the whole transport is released only by the boot hart's knob-gated release.
+#[cfg(test)]
+pub(crate) fn assert_riscv_smp3_wake_scope() {
+    const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+    const IPI: &str = include_str!("../../arch/riscv64/ipi.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+    const TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const TIMER: &str = include_str!("../../arch/riscv64/timer.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    assert!(SBI.contains("pub const SBI_EXT_IPI: usize = 0x735049;"));
+    assert!(SBI.contains("pub const SBI_EXT_RFENCE: usize = 0x52464E43;"));
+    let code = |s: &'static str| -> alloc::string::String {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    };
+    for (name, src) in [
+        ("boot.rs", BOOT),
+        ("trap.rs", TRAP),
+        ("timer.rs", TIMER),
+        ("runtime.rs", RUNTIME),
+        ("ipccall_direct_txn.rs", TXN),
+    ] {
+        let c = code(src);
+        assert!(
+            !c.contains("sbi::send_ipi(") && !c.contains("sbi::remote_sfence_vma_asid("),
+            "{name}: the firmware IPI and remote fence are called only by the ipi owner"
+        );
+    }
+    let ipi = code(IPI);
+    assert_eq!(
+        ipi.matches("sbi::send_ipi(").count(),
+        3,
+        "wake, release, and the witness-only self-kick"
+    );
+    let kick = IPI
+        .split("pub fn kick_self(")
+        .next()
+        .expect("before the kick");
+    assert!(
+        kick.trim_end()
+            .ends_with("#[cfg(feature = \"riscv64-smp3-witness\")]"),
+        "the self-kick exists only in witness builds"
+    );
+    assert_eq!(ipi.matches("sbi::remote_sfence_vma_asid(").count(), 1);
+    // The drains' RISC-V arms: exactly the two post-commit sends.
+    const RV_GATE: &str = "#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"riscv64\"))]";
+    assert_eq!(TXN.matches(RV_GATE).count(), 2, "one RISC-V arm per drain");
+    for arm in TXN.split(RV_GATE).skip(1) {
+        let arm: alloc::string::String = arm
+            .lines()
+            .take(5)
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            arm.contains("if success.wake_target_cpu != executing_cpu {")
+                && arm.contains("crate::arch::riscv64::ipi::send_reschedule("),
+            "a RISC-V arm is only the post-commit remote-wake send"
+        );
+    }
+    // Refusal before publication; publication before the firmware call.
+    let send = IPI
+        .split("pub fn send_reschedule(")
+        .nth(1)
+        .expect("the send owner")
+        .split("\n}\n")
+        .next()
+        .expect("its body");
+    let refuse = send.find("if !ready(target) {").expect("ready refusal");
+    let publish = send
+        .find("slot.fetch_or(bit, Ordering::AcqRel)")
+        .expect("publication");
+    let fence = send.find("full_fence();").expect("fence");
+    let notify = send
+        .find("sbi::send_ipi(hart_mask, 0)")
+        .expect("notification");
+    assert!(refuse < publish && publish < fence && fence < notify);
+    // Clear before consume.
+    let take = IPI
+        .split("pub fn take_arrival(")
+        .nth(1)
+        .expect("the consumption owner")
+        .split("\n}\n")
+        .next()
+        .expect("its body");
+    let clear = take.find("clear_ssip();").expect("clear");
+    let swap = take.find(".swap(0, Ordering::AcqRel)").expect("swap");
+    assert!(
+        clear < swap,
+        "SSIP is cleared before the mailbox is consumed"
+    );
+    // The release is knob-gated and is the only thing that ends a secondary's park.
+    let release = IPI
+        .split("pub fn release_secondaries_at_boot_borrow_end(")
+        .nth(1)
+        .expect("the release")
+        .split("\n}\n")
+        .next()
+        .expect("its body");
+    assert!(
+        release
+            .contains("if !crate::kernel::boot::ap_user_dispatch_enabled() {\n        return 0;")
+    );
 }

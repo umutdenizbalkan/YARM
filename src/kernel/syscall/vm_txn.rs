@@ -524,6 +524,12 @@ macro_rules! vm_txn_exit {
             target_arch = "aarch64"
         ))]
         crate::arch::aarch64::smp2_witness::vm_op_end($op, &result);
+        #[cfg(all(
+            feature = "riscv64-smp3-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "riscv64"
+        ))]
+        crate::arch::riscv64::smp3_witness::vm_op_end($op, &result);
         result
     }};
 }
@@ -571,6 +577,14 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
     ))]
     let smp2_op =
         crate::arch::aarch64::smp2_witness::vm_op_begin(tid, asid, args.addr, args.map_len);
+    // QEMU-SMP3: the same lifetime, on the RISC-V witness's page.
+    #[cfg(all(
+        feature = "riscv64-smp3-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "riscv64"
+    ))]
+    let smp2_op =
+        crate::arch::riscv64::smp3_witness::vm_op_begin(tid, asid, args.addr, args.map_len);
 
     let cnode = owners.caller_cnode(tid);
     let pages = args.map_len / PAGE_SIZE;
@@ -810,7 +824,27 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
                 [u64::from(asid.0), records[index].virt.0, old.phys.0, 0, 0],
             );
         }
+        #[cfg(all(
+            feature = "riscv64-smp3-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "riscv64"
+        ))]
+        crate::arch::riscv64::smp3_witness::note_vm_displaced(
+            asid,
+            records[index].virt.0,
+            old.phys.0,
+        );
         let acknowledged = owners.complete_shootdown(asid, records[index].virt);
+        #[cfg(all(
+            feature = "riscv64-smp3-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "riscv64"
+        ))]
+        crate::arch::riscv64::smp3_witness::note_vm_shootdown(
+            asid,
+            records[index].virt.0,
+            acknowledged,
+        );
         #[cfg(all(
             feature = "aarch64-smp2-witness",
             not(feature = "hosted-dev"),
@@ -852,6 +886,16 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             // whatever replaced the object it pinned.
             if let Some(object_id) = records[index].displaced_pinned.take() {
                 owners.settle_displaced_hold(object_id, old.phys);
+                #[cfg(all(
+                    feature = "riscv64-smp3-witness",
+                    not(feature = "hosted-dev"),
+                    target_arch = "riscv64"
+                ))]
+                crate::arch::riscv64::smp3_witness::note_vm_settled(
+                    asid,
+                    records[index].virt.0,
+                    old.phys.0,
+                );
                 #[cfg(all(
                     feature = "aarch64-smp2-witness",
                     not(feature = "hosted-dev"),

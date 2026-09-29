@@ -95,7 +95,11 @@ pub enum IpiRefusal {
 
 /// `true` when this trap is a supervisor software interrupt taken from S-mode at this CPU's armed
 /// idle boundary. Pure; the same shape as the timer's and the external interrupt's predicates.
-pub fn is_accepted_s_mode_software_trap(scause: usize, sstatus: usize, boundary_armed: bool) -> bool {
+pub fn is_accepted_s_mode_software_trap(
+    scause: usize,
+    sstatus: usize,
+    boundary_armed: bool,
+) -> bool {
     const SPP_BIT: usize = 1 << 8;
     (scause & INTERRUPT_BIT) != 0
         && (scause & !INTERRUPT_BIT) == IRQ_SUPERVISOR_SOFTWARE_CODE
@@ -259,6 +263,7 @@ fn hart_of(cpu: usize) -> Option<usize> {
 
 /// Send the reschedule IPI from `sender` to `target`: the remote half of an enqueue the caller
 /// already COMMITTED on `target`'s run queue. Called with no domain lock held.
+#[inline(never)]
 pub fn send_reschedule(sender: CpuId, target: CpuId) -> Result<(), IpiRefusal> {
     if sender == target {
         return Err(IpiRefusal::SelfTarget);
@@ -287,13 +292,54 @@ pub fn send_reschedule(sender: CpuId, target: CpuId) -> Result<(), IpiRefusal> {
         bump(if result.is_ok() { &row[2] } else { &row[3] });
     }
     #[cfg(feature = "riscv64-smp3-witness")]
-    crate::arch::riscv64::smp3_witness::note_ipi_requested(sender, target, hart, &result);
+    crate::arch::riscv64::smp3_witness::note_ipi_requested(
+        sender,
+        target,
+        hart,
+        crate::kernel::boot::smp3_record::PUB_WAKE,
+        &result,
+    );
     result.map_err(IpiRefusal::Firmware)
+}
+
+/// QEMU-SMP3 witness only — raise the reschedule IPI on THIS hart, through the same publication
+/// and firmware call a remote wake uses. For the one case no remote hart can cover: tasks placed
+/// on the secondary by the secondary itself, outside a trap, while it has no timer. The
+/// consumption and dispatch that follow are the same production owners a remote wake reaches.
+#[cfg(feature = "riscv64-smp3-witness")]
+pub fn kick_self(cpu: CpuId) -> bool {
+    if !ready(cpu) {
+        return false;
+    }
+    let Some(hart) = hart_of(cpu.0 as usize) else {
+        return false;
+    };
+    let Some(slot) = PENDING.get(cpu.0 as usize) else {
+        return false;
+    };
+    let bit = 1u64 << (cpu.0 as u64 & 63);
+    let old = slot.fetch_or(bit, Ordering::AcqRel);
+    full_fence();
+    crate::arch::riscv64::smp3_witness::note_kick_published(cpu, hart, old & bit != 0);
+    let result = crate::arch::riscv64::sbi::send_ipi(1usize << hart, 0);
+    if let Some(row) = SENT.get(cpu.0 as usize) {
+        bump(&row[0]);
+        bump(if result.is_ok() { &row[2] } else { &row[3] });
+    }
+    crate::arch::riscv64::smp3_witness::note_ipi_requested(
+        cpu,
+        cpu,
+        hart,
+        crate::kernel::boot::smp3_record::PUB_KICK,
+        &result,
+    );
+    result.is_ok()
 }
 
 /// THE consumption of a supervisor software interrupt, by its entry owner, exactly once per trap:
 /// clear `sip.SSIP`, THEN swap this CPU's mailbox. See the module docs for why the order is the
 /// correctness argument.
+#[inline(never)]
 pub fn take_arrival(cpu: CpuId, origin: ArrivalOrigin) -> IpiArrival {
     clear_ssip();
     let sources = PENDING
@@ -353,6 +399,14 @@ pub fn release_secondaries_at_boot_borrow_end(trap_ready_cpus: u64) -> usize {
         if let Some(row) = SENT.get(boot.0 as usize) {
             bump(if r.is_ok() { &row[2] } else { &row[3] });
         }
+        #[cfg(feature = "riscv64-smp3-witness")]
+        crate::arch::riscv64::smp3_witness::note_ipi_requested(
+            boot,
+            CpuId(cpu as u8),
+            hart,
+            crate::kernel::boot::smp3_record::PUB_RELEASE,
+            &r,
+        );
         if r.is_ok() {
             sent += 1;
         } else {
@@ -388,6 +442,7 @@ pub enum FenceRefusal {
 /// 2. `fence rw, rw` — the store is globally visible before any target is asked to fence, so a
 ///    target's `SFENCE.VMA` cannot be ordered before the write it exists to expose;
 /// 3. `sbi_remote_sfence_vma_asid` — `Ok` on OpenSBI v1.3 means every target executed it.
+#[inline(never)]
 pub fn remote_invalidate_page(
     requester: CpuId,
     targets: u64,
@@ -436,11 +491,26 @@ mod tests {
     #[test]
     fn only_an_idle_boundary_software_interrupt_is_accepted_from_s_mode() {
         assert!(is_accepted_s_mode_software_trap(INT | 1, SPP, true));
-        assert!(!is_accepted_s_mode_software_trap(1, SPP, true), "not an exception");
-        assert!(!is_accepted_s_mode_software_trap(INT | 5, SPP, true), "not the timer");
-        assert!(!is_accepted_s_mode_software_trap(INT | 9, SPP, true), "not external");
-        assert!(!is_accepted_s_mode_software_trap(INT | 1, 0, true), "from U-mode");
-        assert!(!is_accepted_s_mode_software_trap(INT | 1, SPP, false), "unarmed");
+        assert!(
+            !is_accepted_s_mode_software_trap(1, SPP, true),
+            "not an exception"
+        );
+        assert!(
+            !is_accepted_s_mode_software_trap(INT | 5, SPP, true),
+            "not the timer"
+        );
+        assert!(
+            !is_accepted_s_mode_software_trap(INT | 9, SPP, true),
+            "not external"
+        );
+        assert!(
+            !is_accepted_s_mode_software_trap(INT | 1, 0, true),
+            "from U-mode"
+        );
+        assert!(
+            !is_accepted_s_mode_software_trap(INT | 1, SPP, false),
+            "unarmed"
+        );
         assert!(is_software_interrupt(INT | 1));
         assert!(!is_software_interrupt(INT | 5));
     }
@@ -472,7 +542,15 @@ mod tests {
         assert_eq!(m.swap(0, Ordering::AcqRel), 1);
         m.fetch_or(1, Ordering::AcqRel); // a publication after the swap
         m.fetch_or(1, Ordering::AcqRel); // merged: same source before consumption
-        assert_eq!(m.swap(0, Ordering::AcqRel), 1, "merged into one publication");
-        assert_eq!(m.swap(0, Ordering::AcqRel), 0, "an empty arrival, not a loss");
+        assert_eq!(
+            m.swap(0, Ordering::AcqRel),
+            1,
+            "merged into one publication"
+        );
+        assert_eq!(
+            m.swap(0, Ordering::AcqRel),
+            0,
+            "an empty arrival, not a loss"
+        );
     }
 }
