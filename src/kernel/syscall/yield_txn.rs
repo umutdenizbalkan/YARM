@@ -70,6 +70,12 @@
 //!   `d6_genuine_enabled()` is false — and where the Yield DRAIN in `arch/trap_entry.rs` is gated
 //!   off by the same two predicates, so no deferral could be consumed even if one were published.
 //!
+//! QEMU-SMP3 correction: `ArchGateOff` is ALSO reachable on AArch64 and RISC-V under the
+//! default-off `yarm.ap_user_dispatch` knob, whose admitted secondary runs user tasks — an NR 0 on
+//! that CPU declines `not_bsp` (measured live in the SMP3 witness), and the decline is settled off
+//! the broad lock by `settle_declined_yield`'s queue-advance arm. Without the knob no AP ever
+//! enters user mode, and the statement above is the whole story.
+//!
 //! ## U9-TIMER-FINAL §1 CORRECTION — `MultiDispatcher` and `NotDispatchCpu` are no longer live
 //!
 //! The paragraph above used to name `RouteNotAdmitted::MultiDispatcher` as a second reachable

@@ -118177,7 +118177,18 @@ mod stage199d_riscv_link2_wake_only_online {
             .iter()
             .position(|l| l.contains("riscv_secondary_dispatch_main(cpu, hart_id);"))
             .expect("into the admission path");
-        assert_eq!(main, release + 1, "and only under it");
+        // The only line allowed between them is the witness build's own observation of the
+        // release, under its feature gate.
+        let between: Vec<&str> = code[release + 1..main].iter().map(|l| l.trim()).collect();
+        assert!(
+            between.is_empty()
+                || between
+                    == [
+                        "#[cfg(feature = \"riscv64-smp3-witness\")]",
+                        "crate::arch::riscv64::smp3_witness::note_park_release(cpu, hart_id);",
+                    ],
+            "and only under it: {between:?}"
+        );
         for (i, l) in code.iter().enumerate() {
             for forbidden in [
                 "dispatch",
@@ -171550,12 +171561,23 @@ mod u9yield2_family_edge {
         );
     }
 
-    /// **`ArchGateOff` on AArch64 and RISC-V is unreachable for a userspace NR 0**: every AP on
-    /// those two architectures is marked wake-only BEFORE it is onlined, unconditionally and with
-    /// no knob, and their secondary loops never enter user mode. There is no userspace syscall
-    /// from a non-bootstrap CPU to refuse.
+    /// **An AP on AArch64 and RISC-V is wake-only before it is online, and only the knob-gated
+    /// admission ever clears that** — so without `yarm.ap_user_dispatch=1` no AP enters user mode
+    /// and `ArchGateOff` stays unreachable for a userspace NR 0.
+    ///
+    /// Re-derived for QEMU-SMP3 from what this guard exists to protect. It used to assert that no
+    /// knob appears in either boot file at all, which stopped being the property when QEMU-SMP2
+    /// (AArch64, in `smp.rs`) and QEMU-SMP3 (RISC-V) added default-off secondary dispatch: under
+    /// the knob an admitted AP runs user tasks, and its NR 0 DOES decline `ArchGateOff`
+    /// (`YIELD_SPLIT_REFUSED cpu=1 reason=not_bsp`, measured four times in the SMP3 witness).
+    /// What must hold is therefore (a) the wake-only mark still precedes onlining,
+    /// unconditionally; (b) the ONE thing that clears it is the scheduler's admission, reached
+    /// only from each port's knob-gated secondary path; and (c) a declined `ArchGateOff` is
+    /// settled off the broad lock by the existing decline settlement, never handed away.
     #[test]
     fn aarch64_and_riscv_mark_every_ap_wake_only_before_onlining_it() {
+        const A64_SMP: &str = include_str!("../../arch/aarch64/smp.rs");
+        const RV_IPI: &str = include_str!("../../arch/riscv64/ipi.rs");
         for (name, src) in [("aarch64", A64_BOOT), ("riscv64", RV_BOOT)] {
             let c = code(src);
             let mark = c
@@ -171568,11 +171590,48 @@ mod u9yield2_family_edge {
                 mark < online,
                 "{name}: an AP must be wake-only before it is online, or there is a placement window"
             );
-            assert!(
-                !c.contains("ap_user_dispatch_enabled()"),
-                "{name}: no knob may clear an AP's wake-only bit on this architecture"
-            );
+            // A direct clear exists only as the rollback of an onlining that FAILED: after a
+            // failed bring-up (both ports), or — RISC-V, pre-existing — after a state read-back
+            // mismatch, whose arm reports `RISCV_SCHEDULER_SMP_ONLINE_FAIL`.
+            for (i, _) in c.match_indices("mark_cpu_wake_only(cpu, false)") {
+                let failed_bring_up = c[..i].trim_end().ends_with(
+                    "if kernel.bring_up_cpu(cpu).is_err() {\n            let _ = kernel.",
+                );
+                let online_fail = c[i..]
+                    .split("continue;")
+                    .next()
+                    .unwrap_or("")
+                    .contains("_ONLINE_FAIL");
+                assert!(
+                    failed_bring_up || online_fail,
+                    "{name}: the wake-only bit is cleared directly only to roll back a failed onlining"
+                );
+            }
         }
+        // (b) The admission is the only clearer, and each port reaches it only behind the knob.
+        let runtime = code(RUNTIME);
+        assert_eq!(runtime.matches("admit_pinned_dispatch(cpu)").count(), 1);
+        let a64 = code(A64_SMP);
+        assert!(a64.contains("crate::kernel::boot::ap_user_dispatch_enabled()"));
+        assert_eq!(
+            a64.matches("admit_ap_pinned_dispatch_split(cpu)").count(),
+            1
+        );
+        let rv = code(RV_BOOT);
+        assert_eq!(rv.matches("admit_ap_pinned_dispatch_split(cpu)").count(), 1);
+        let release = code(RV_IPI);
+        let rel = release
+            .find("pub fn release_secondaries_at_boot_borrow_end(")
+            .expect("the RISC-V release");
+        assert!(
+            release[rel..].contains(
+                "if !crate::kernel::boot::ap_user_dispatch_enabled() {\n        return 0;"
+            ),
+            "riscv64: no secondary is released, so none is admitted, without the knob"
+        );
+        // (c) The decline is settled by the existing off-lock settlement.
+        let split = code(SPLIT);
+        assert!(split.contains("settlement=queue_advance \\\n                 broad_lock=0"));
     }
 
     /// **The Yield reserve and the Yield DRAIN must agree about when a deferral is admissible**,
