@@ -580,8 +580,8 @@ fn an_overtaken_receiver_resumes_with_the_installed_completion() {
             crate::kernel::boot::ipc_state::publish_blocked_recv_timeout_result_with_identity(
                 tcb, TIMED_OUT, W, fx.w_asid,
             );
-            tcb.status = TaskStatus::Runnable;
         });
+        s.set_task_status_for_test(W, TaskStatus::Runnable);
         s.enqueue_task(W).expect("wake");
     });
     assert!(
