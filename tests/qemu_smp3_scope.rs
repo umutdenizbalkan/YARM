@@ -385,3 +385,24 @@ fn a_reply_racing_its_callers_block_is_retried_not_spent() {
         "the arm claims, copies and wakes nothing"
     );
 }
+
+/// Every `Riscv64TrapContext` built anywhere — including the feature-gated idle-origin landings no
+/// default build compiles — names the software-interrupt arrival explicitly. QEMU-SMP3's first
+/// frozen candidate missed the UART witness's landing, which only its own profile builds.
+#[test]
+fn every_trap_context_initializer_names_the_software_interrupt() {
+    let boot = code(BOOT);
+    let mut n = 0;
+    for (i, _) in boot.match_indices("crate::arch::riscv64::trap::Riscv64TrapContext {") {
+        let body = &boot[i..i + boot[i..].find("};").expect("initializer end")];
+        assert!(
+            body.contains("software_interrupt"),
+            "initializer at byte {i} omits software_interrupt"
+        );
+        n += 1;
+    }
+    assert_eq!(
+        n, 3,
+        "the U-origin entry, the idle IPI landing and the idle external landing"
+    );
+}

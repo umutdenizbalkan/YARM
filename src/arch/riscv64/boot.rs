@@ -2083,6 +2083,8 @@ fn riscv_s_mode_external_trap(
         scause: frame.scause as usize,
         stval: frame.stval as usize,
         external_claim: Some(claim),
+        // QEMU-SMP3: an external interrupt carries no software-interrupt arrival.
+        software_interrupt: None,
     };
     let outcome = handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe);
     let resume_tid = shared.current_tid_split_read(cpu).unwrap_or(0);

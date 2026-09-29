@@ -24082,7 +24082,7 @@ IPI's idle advance selected another runnable task first), `TimerFirst`, `Busy`, 
 
 ## 6 — tests, controls, qualification
 
-**Tests.** 12 source guards (`tests/qemu_smp3_scope.rs`: publication before notification, clear
+**Tests.** 13 source guards (`tests/qemu_smp3_scope.rs`: publication before notification, clear
 before consume, the fence before the RFENCE call and fail-closed on every error, one production
 owner per operation, no CLINT/PLIC traffic on the IPI path, the knob, the overtaken-deferral arms,
 the coexistence classes, the reply-race arm, the witness gates, the image check). Hosted:
@@ -24115,7 +24115,13 @@ dispatch relabelled as the timer's, a context step moved to another round, and a
 before its completion.
 
 **Candidates kept.** `bb87653d` failed its own control boot (defect 3 above) and was replaced; its
-log is kept with the controls.
+log is kept with the controls. The first freeze, `ceb68c5d`, failed qualification: the UART IRQ
+witness profile does not compile, because its feature-gated idle-origin external landing built a
+`Riscv64TrapContext` without the new `software_interrupt` field — no default, witness or core build
+compiles that function. It now names the field (`None`), a guard pins every initializer, and every
+RISC-V, AArch64 and x86 witness/oracle profile was compile-checked before the second freeze. The fix
+touches only that feature-gated function, so the SMP3 witness image the controls ran against is
+unchanged.
 
 **Qualification** is of the frozen commit that carries this text, run from a fresh isolated
 worktree: three consecutive strict two-hart witness boots, each a fresh build, then every gate
