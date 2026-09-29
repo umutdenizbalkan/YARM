@@ -364,3 +364,24 @@ fn the_image_ordering_check_covers_the_three_owners() {
     }
     assert!(SEQ_CHECK.contains("--mattr=+m,+a,+c"));
 }
+
+/// A reply that lands while its caller is still inside its NR 6 commit on the other hart — the
+/// terminal armed for this record and still open, no acknowledgement to claim — answers the
+/// non-mutating `WouldBlock` the replier retries, before and instead of the "spent" refusal.
+#[test]
+fn a_reply_racing_its_callers_block_is_retried_not_spent() {
+    const SPLIT: &str = include_str!("../src/kernel/syscall_split.rs");
+    let c = code(SPLIT);
+    let open = pos(
+        &c,
+        "} else if matches!(\n        facts.terminal,\n        crate::kernel::direct_eligibility::DirectReplyTerminal::AvailableExact\n    ) {",
+    );
+    let retry = pos(&c, "\"caller_not_yet_blocked\",");
+    let spent = pos(&c, "\"mode_indeterminate\",");
+    assert!(open < retry && retry < spent);
+    assert!(c[open..retry].contains("crate::kernel::syscall::SyscallError::WouldBlock,"));
+    assert!(
+        !c[open..retry].contains("claim") || c[open..retry].contains("return nr7_refuse("),
+        "the arm claims, copies and wakes nothing"
+    );
+}

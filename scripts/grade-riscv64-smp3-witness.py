@@ -515,6 +515,7 @@ if live_damaged:
 # Reported, not graded: present at the same rate in the base boots (it scales with boot length).
 print("[smp3-witness] pre-existing RISCV_ASYNC_RESUME_REFUSED lines: %d" % sum("RISCV_ASYNC_RESUME_REFUSED" in l for l in lines))
 print("[smp3-witness] overtaken-deferral settlements: %d" % sum("RISCV_OVERTAKEN_DEFERRAL_SETTLED" in l for l in lines))
+print("[smp3-witness] replies retried while the caller was still blocking: %d" % sum("IPCREPLY_DIRECT_CALLER_NOT_YET_BLOCKED" in l for l in lines))
 # The phase totals, each a named failure rather than a silent seal condition.
 for name, got, want in [("parked-target resumes", parked_n, 2 * P1_ROUNDS), ("fence rounds", tlb, 8),
                         ("mutual rounds", mutual, 4), ("overlapped mutual rounds", overlapped, 4)]:

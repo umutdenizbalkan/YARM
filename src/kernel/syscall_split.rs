@@ -7858,6 +7858,40 @@ fn try_split_ipcreply_direct_into_frame(
         // So the mode is chosen on the terminal alone, and the capability decides only which
         // framing the queued message carries.
         crate::kernel::direct_eligibility::DirectReplyMode::QueueUnblocked
+    } else if matches!(
+        facts.terminal,
+        crate::kernel::direct_eligibility::DirectReplyTerminal::AvailableExact
+    ) {
+        // QEMU-SMP3 — the CALLER is still blocking, on another hart.
+        //
+        // The arm below assumed an armed terminal with no claimable acknowledgement means a
+        // competitor owns the record. That holds only while the replier cannot run inside the
+        // caller's NR 6 commit — true with one dispatching CPU, false with two. The caller arms
+        // THIS record's terminal (a fresh generation per call) before it publishes its blocked
+        // acknowledgement; a replier on the other hart that has already received the call can
+        // land between the two, and measured live it did (`IPC_REPLY_TERMINAL_ARMED_SPLIT`, then
+        // this refusal, then the caller's `IPC_RECV_BLOCK_REGISTER`). A competitor would have
+        // RESERVED or SETTLED the terminal; `AvailableExact` is open and unclaimed, so nothing
+        // owns the record yet and the reply authority is not spent.
+        //
+        // The answer is the one the x86 cross-CPU reply path already gives the same state: a
+        // non-mutating `WouldBlock` — nothing claimed, copied, enqueued or woken — and the
+        // replier retries. `WrongObject` would have told it the one-shot was spent and left the
+        // caller blocked forever.
+        crate::yarm_log!(
+            "IPCREPLY_DIRECT_CALLER_NOT_YET_BLOCKED tid={} record_index={} record_generation={}",
+            tid,
+            rec_idx,
+            rec_gen
+        );
+        return nr7_refuse(
+            frame,
+            tid,
+            rec_idx,
+            rec_gen,
+            crate::kernel::syscall::SyscallError::WouldBlock,
+            "caller_not_yet_blocked",
+        );
     } else {
         // An armed terminal with no claimable acknowledgement is neither delivery mode: the
         // record is mid-transaction or settling. Refuse pre-mutation rather than guess.
