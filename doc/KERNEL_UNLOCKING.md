@@ -24127,8 +24127,18 @@ and are reported with qualification rather than in this text. That freeze failed
 UART IRQ witness placed idle-origin `sepc` inside `timer::halt_wait_loop`, which this package made
 the masked fatal halt only (the interruptible idle wait is `timer::idle_wait_loop`, and the old
 symbol is not even emitted once inlined), so the window was empty and every idle entry "missed" it.
-Regraded against the idle wait, the same boot passes (4/4 idle entries inside it). The final freeze
-changes only that script and this text: its code and witness image are `4677d807`'s.
+Regraded against the idle wait, the same boot passes (4/4 idle entries inside it). The fourth
+freeze, `b7eda499` (that script and this text only), passed every gate but the RISC-V server-death
+cell: a timer tick landed on init's return from `spawn_thread`, the reply-timeout oracle's server
+thread ran first, its handshake `FutexWake` woke nobody (`woke=0`), and init then parked in
+`FutexWait` for good. `FutexWait` parks on the caller's own `expected == observed`, so a wake that
+precedes the wait is lost; the handshake assumed the parent always reached its wait first. The
+defect is base's (the userspace is unchanged by this package): forcing the window with one `Yield`
+after the spawn fails base `80085b6f` exactly so, and passes with the repair. The oracle's server
+now publishes a ready word (Release) and the client polls it with a bounded `Yield` loop (Acquire),
+the idiom the oracle already uses for its other cross-thread waits. That changes init, hence every
+initramfs, so the controls were run again from the final freeze; the kernel code, and the SMP3
+witness kernel image `46ddbf4c…`, are unchanged from `4677d807`.
 
 **Qualification** is of the frozen commit that carries this text, run from a fresh isolated
 worktree: three consecutive strict two-hart witness boots, each a fresh build, then every gate
@@ -24149,3 +24159,6 @@ tree, features, firmware and image hashes per run — is the delivery report of 
   repair (the reply race's producer is the recorded failure of `bb87653d`). Those are covered by
   source guards and the shared owners they call, not by live evidence.
 * No FP/vector state is enabled or preserved on RISC-V (soft-float contract, graded).
+* Four other oracle handshakes in `init/service.rs` (the three ports' FutexWake oracles and the
+  direct-reply round-trip oracle) have the same wake-before-wait shape as the one repaired in §6.
+  None is on a gate of this package, and they are not changed; the repair's idiom applies to each.
