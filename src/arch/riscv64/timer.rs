@@ -54,6 +54,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::kernel::scheduler::MAX_CPUS;
+
 use super::sbi::{SbiError, probe_extension};
 
 /// SBI Timer extension EID (`"TIME"` little-endian).
@@ -100,18 +102,47 @@ pub const IRQ_SUPERVISOR_TIMER_CODE: usize = 5;
 /// `sstatus.SIE` is enabled. The trap bridge accepts an S-mode trap ONLY while
 /// this is set, so "the interrupted context is the idle `wfi` lifecycle" is a
 /// checked precondition rather than an assumption.
-static S_MODE_TIMER_BOUNDARY_ARMED: AtomicBool = AtomicBool::new(false);
+///
+/// QEMU-SMP3: one latch PER CPU. A dispatching secondary parks at its own boundary; a process-wide
+/// latch armed by one hart would let another hart's S-mode interrupt claim an idle origin it never
+/// reached.
+static S_MODE_TIMER_BOUNDARY_ARMED: [AtomicBool; MAX_CPUS] =
+    [const { AtomicBool::new(false) }; MAX_CPUS];
 
-/// Arms the S-mode timer boundary. Callable only from the kernel-idle safe
-/// point, which has already committed to never returning through the
-/// interrupted frame.
-pub fn arm_s_mode_timer_boundary() {
-    S_MODE_TIMER_BOUNDARY_ARMED.store(true, Ordering::Release);
+/// Arms `cpu`'s S-mode idle boundary. Callable only from that CPU's kernel-idle safe point, which
+/// has already committed to never returning through the interrupted frame.
+pub fn arm_s_mode_timer_boundary(cpu: usize) {
+    if let Some(latch) = S_MODE_TIMER_BOUNDARY_ARMED.get(cpu) {
+        latch.store(true, Ordering::Release);
+    }
 }
 
-/// `true` once the audited kernel-idle boundary has been reached and armed.
-pub fn s_mode_timer_boundary_armed() -> bool {
-    S_MODE_TIMER_BOUNDARY_ARMED.load(Ordering::Acquire)
+/// `true` once `cpu` has reached and armed its audited kernel-idle boundary.
+pub fn s_mode_timer_boundary_armed(cpu: usize) -> bool {
+    S_MODE_TIMER_BOUNDARY_ARMED
+        .get(cpu)
+        .is_some_and(|latch| latch.load(Ordering::Acquire))
+}
+
+/// QEMU-SMP3 — CPUs whose idle boundary has a wake source other than the boot hart's timer: an
+/// admitted secondary's `sie.SSIE`. Without one, arming its boundary would park it deaf.
+static IDLE_WAKE_SOURCE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Record that `cpu` has an idle wake source (its reschedule IPI). Called by `cpu` itself once
+/// `sie.SSIE` is on and it has been admitted.
+pub fn mark_idle_wake_source(cpu: usize) {
+    if let Some(flag) = IDLE_WAKE_SOURCE.get(cpu) {
+        flag.store(true, Ordering::Release);
+    }
+}
+
+/// Whether `cpu`'s idle boundary can be woken: the boot hart by the timer it armed, any CPU by a
+/// recorded IPI wake source.
+fn idle_wake_source_enabled(cpu: usize) -> bool {
+    (cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize && stie_enabled())
+        || IDLE_WAKE_SOURCE
+            .get(cpu)
+            .is_some_and(|f| f.load(Ordering::Acquire))
 }
 
 /// `true` when this trap is the supervisor timer interrupt taken from
@@ -350,32 +381,50 @@ fn arm_periodic_timer_for_user_delivery() -> Option<&'static str> {
 /// first act is `csrrw sp, sscratch, sp`, so this decides where an S-mode frame lands), THEN arm
 /// the latch so the bridge can check the origin rather than assume it, and only THEN request the
 /// unmask. It is a strict no-op until the boot arm has actually enabled `sie.STIE`.
-pub fn reestablish_idle_boundary() {
-    if !stie_enabled() {
+///
+/// QEMU-SMP3: all three steps are `cpu`'s own — its canonical trap-stack top, its latch, its unmask
+/// request — and the boundary is established only when `cpu` has a wake source to be woken by
+/// (the boot hart's timer, or an admitted secondary's IPI).
+pub fn reestablish_idle_boundary(cpu: usize) {
+    if !idle_wake_source_enabled(cpu) {
         return;
     }
-    set_sscratch_to_trap_stack_top();
-    arm_s_mode_timer_boundary();
-    request_idle_unmask();
+    if !set_sscratch_to_trap_stack_top(cpu) {
+        return;
+    }
+    arm_s_mode_timer_boundary(cpu);
+    request_idle_unmask(cpu);
 }
 
-/// Set by [`reestablish_idle_boundary`] as its last step and consumed by [`halt_wait_loop`], the
-/// next thing the idle arrival executes. A fatal halt never follows a request, so it waits masked.
-static IDLE_UNMASK_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Set by [`reestablish_idle_boundary`] as its last step and consumed by [`idle_wait_loop`], the
+/// next thing THAT CPU's idle arrival executes. Per CPU (QEMU-SMP3): a fatal halt on one hart must
+/// not consume another hart's request, nor an idle hart another's.
+static IDLE_UNMASK_REQUESTED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
-fn request_idle_unmask() {
-    IDLE_UNMASK_REQUESTED.store(true, Ordering::Release);
+fn request_idle_unmask(cpu: usize) {
+    if let Some(flag) = IDLE_UNMASK_REQUESTED.get(cpu) {
+        flag.store(true, Ordering::Release);
+    }
 }
 
-/// The halt primitive's wait, entered by `riscv_trap_halt` once its marker is written.
+/// The IDLE arrival's wait, entered by `riscv_idle_halt(cpu)` once its marker is written.
 ///
-/// An idle arrival that requested the unmask waits with `SIE` set by [`set_sstatus_sie_in_wfi_loop`];
-/// every other halt (a fatal one) waits masked, exactly as before.
-pub fn halt_wait_loop() -> ! {
-    if IDLE_UNMASK_REQUESTED.swap(false, Ordering::AcqRel) {
+/// An arrival that requested the unmask waits with `SIE` set by [`set_sstatus_sie_in_wfi_loop`];
+/// one that did not (no wake source) waits masked.
+pub fn idle_wait_loop(cpu: usize) -> ! {
+    if IDLE_UNMASK_REQUESTED
+        .get(cpu)
+        .is_some_and(|flag| flag.swap(false, Ordering::AcqRel))
+    {
         mark_sie_enabled();
         set_sstatus_sie_in_wfi_loop();
     }
+    halt_wait_loop()
+}
+
+/// The FATAL halt's wait: masked, always. No halt other than an idle arrival ever waits with
+/// `SIE` set, and an idle arrival goes through [`idle_wait_loop`].
+pub fn halt_wait_loop() -> ! {
     loop {
         #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
         unsafe {
@@ -468,10 +517,15 @@ fn sbi_set_timer(deadline: u64) {
 /// Points `sscratch` at the true kernel trap-stack top, so the next S-mode
 /// trap's `csrrw sp, sscratch, sp` lands its frame at a fixed, known address
 /// instead of inheriting the generic return tail's drifting value.
-fn set_sscratch_to_trap_stack_top() {
+///
+/// QEMU-SMP3: `cpu`'s OWN top. Returns `false` — and the boundary is then not armed — for a CPU
+/// with no published trap stack.
+fn set_sscratch_to_trap_stack_top(cpu: usize) -> bool {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     {
-        let top = super::boot::riscv_trap_stack_top_for_s_mode_timer();
+        let Some(top) = super::boot::riscv_trap_stack_top_for_cpu(cpu) else {
+            return false;
+        };
         unsafe {
             core::arch::asm!(
                 "csrw sscratch, {0}",
@@ -479,6 +533,11 @@ fn set_sscratch_to_trap_stack_top() {
                 options(nostack, nomem, preserves_flags)
             );
         }
+        true
+    }
+    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+    {
+        cpu < MAX_CPUS
     }
 }
 
@@ -505,7 +564,7 @@ fn set_sie_stie() {
 /// leaves the loop for good.
 ///
 /// Must run AFTER `sie.STIE`, the trap vector, the kernel state pointer, `sscratch` and the
-/// boundary latch — which is why only [`halt_wait_loop`] calls it, and only on a request from
+/// boundary latch — which is why only [`idle_wait_loop`] calls it, and only on a request from
 /// [`reestablish_idle_boundary`].
 fn set_sstatus_sie_in_wfi_loop() -> ! {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -581,7 +640,27 @@ mod tests {
     #[test]
     fn defaults_are_safe_until_the_boot_arm_runs() {
         // Before the arm, nothing is enabled and no S-mode trap may be accepted.
-        assert!(!s_mode_timer_boundary_armed() || stie_enabled());
+        assert!(!s_mode_timer_boundary_armed(0) || stie_enabled());
+        // QEMU-SMP3: no CPU's boundary is armed by anyone else, and a CPU with no wake source
+        // arms nothing.
+        assert!(!s_mode_timer_boundary_armed(1));
+        reestablish_idle_boundary(1);
+        assert!(!s_mode_timer_boundary_armed(1), "no wake source: nothing armed");
+        assert!(!s_mode_timer_boundary_armed(MAX_CPUS), "out of range is never armed");
+    }
+
+    /// QEMU-SMP3 — the boundary is PER CPU: arming one CPU's latch and request leaves every other
+    /// CPU's untouched, so one hart can never inherit another's idle origin or unmask.
+    #[test]
+    fn the_idle_boundary_is_per_cpu() {
+        mark_idle_wake_source(3);
+        reestablish_idle_boundary(3);
+        assert!(s_mode_timer_boundary_armed(3));
+        assert!(!s_mode_timer_boundary_armed(2));
+        assert!(IDLE_UNMASK_REQUESTED[3].load(Ordering::Acquire));
+        assert!(!IDLE_UNMASK_REQUESTED[2].load(Ordering::Acquire));
+        // The request is consumed by THAT CPU's idle wait only (modelled by the swap it performs).
+        assert!(IDLE_UNMASK_REQUESTED[3].swap(false, Ordering::AcqRel));
     }
 
     #[test]
@@ -648,7 +727,7 @@ mod tests {
             "the boot arm must never set sstatus.SIE"
         );
         assert!(
-            !body.contains("arm_s_mode_timer_boundary()"),
+            !body.contains("arm_s_mode_timer_boundary("),
             "the S-origin latch belongs to the audited idle boundary, not the boot arm"
         );
         let set_at = body
@@ -666,18 +745,18 @@ mod tests {
     fn the_idle_boundary_owns_the_s_origin_contract() {
         const SRC: &str = include_str!("timer.rs");
         let body = SRC
-            .split("pub fn reestablish_idle_boundary() {")
+            .split("pub fn reestablish_idle_boundary(cpu: usize) {")
             .nth(1)
             .expect("the idle boundary")
             .split("\n}")
             .next()
             .expect("its body");
         let scratch = body
-            .find("set_sscratch_to_trap_stack_top();")
+            .find("set_sscratch_to_trap_stack_top(cpu)")
             .expect("sscratch");
-        let latch = body.find("arm_s_mode_timer_boundary();").expect("latch");
+        let latch = body.find("arm_s_mode_timer_boundary(cpu);").expect("latch");
         let sie = body
-            .find("request_idle_unmask();")
+            .find("request_idle_unmask(cpu);")
             .expect("the unmask request");
         assert!(
             scratch < latch && latch < sie,
@@ -689,9 +768,19 @@ mod tests {
             !body.contains("set_sstatus_sie"),
             "the boundary itself must not unmask"
         );
+        // A boundary arrival with no wake source — before the boot arm on the boot hart, before
+        // admission on a secondary — must be a no-op.
+        assert!(body.contains("if !idle_wake_source_enabled(cpu) {"));
+        let source = SRC
+            .split("fn idle_wake_source_enabled(cpu: usize) -> bool {")
+            .nth(1)
+            .expect("the wake-source predicate")
+            .split("\n}")
+            .next()
+            .expect("its body");
         assert!(
-            body.contains("if !stie_enabled() {"),
-            "a boundary arrival before the boot arm must be a no-op"
+            source.contains("BOOTSTRAP_CPU_ID as usize && stie_enabled()"),
+            "the boot hart's source is the timer it armed, and only the boot hart's"
         );
     }
 

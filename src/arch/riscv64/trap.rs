@@ -41,15 +41,21 @@ pub struct Riscv64TrapContext {
     /// a decoder can produce: reading the claim register dequeues a source and marks it in
     /// flight, and `decode_trap_context` runs several times per trap.
     pub external_claim: Option<crate::arch::external_irq_claim::PlicClaim>,
+    /// QEMU-SMP3 — the supervisor software interrupt this trap's entry owner consumed (SSIP
+    /// cleared, then the mailbox swapped), once. `None` for every other trap. Carried for the same
+    /// reason as the claim: the consumption is destructive and the decoder runs several times.
+    pub software_interrupt: Option<crate::arch::riscv64::ipi::IpiArrival>,
 }
 
 impl Riscv64TrapContext {
-    /// A trap that is not a supervisor external interrupt, so no claim was read.
+    /// A trap that is neither a supervisor external nor a software interrupt, so nothing was
+    /// claimed or consumed.
     pub fn exception(scause: usize, stval: usize) -> Self {
         Self {
             scause,
             stval,
             external_claim: None,
+            software_interrupt: None,
         }
     }
 }
@@ -1045,7 +1051,33 @@ pub fn handle_riscv_trap_entry_shared(
     // tell an observer a device interrupt arrived.
     let mut unknown_handled = false;
     let mut unknown_result: Option<Result<(), TrapHandleError>> = None;
-    {
+    // QEMU-SMP3 — the reschedule IPI's own pair. It is neither the IRQ route's (nothing was
+    // claimed, delivered or completed) nor the Unknown route's (the cause is recognized).
+    let mut ipi_handled = false;
+    // At the armed idle boundary it owes the SAME idle queue advance the timer's queued-work
+    // settlement owes, discharged by the same drain below under its own marker family.
+    let mut ipi_idle_queue_advance = false;
+    if let Some(arrival) = context.software_interrupt {
+        // The entry owner already cleared SSIP and consumed the mailbox; there is no device, no
+        // delivery policy and no completion behind it. Anywhere but the idle boundary the CPU
+        // returns to what it interrupted: the running task keeps running and the committed
+        // enqueue is picked up at this CPU's next scheduling point.
+        ipi_handled = true;
+        if arrival.at_idle_boundary() {
+            ipi_idle_queue_advance = true;
+        }
+        crate::yarm_log!(
+            "RISCV_IPI_SETTLED cpu={} sources=0x{:x} settlement={}",
+            cpu.0,
+            arrival.sources,
+            if ipi_idle_queue_advance {
+                "idle_advance_owed"
+            } else {
+                "return_to_interrupted"
+            }
+        );
+    }
+    if !ipi_handled {
         match context.external_claim {
             Some(claim) => {
                 let (result, reason) = settle_riscv_external_claim(shared, cpu, claim);
@@ -1866,7 +1898,8 @@ pub fn handle_riscv_trap_entry_shared(
         || cow_recovered
         || demand_recovered
         || irq_handled
-        || unknown_handled);
+        || unknown_handled
+        || ipi_handled);
     if non_committed_fall_through {
         riscv_foundation_oracle_publish(cpu, oracle_entering);
     }
@@ -1896,6 +1929,7 @@ pub fn handle_riscv_trap_entry_shared(
         || demand_recovered
         || irq_handled
         || unknown_handled
+        || ipi_handled
     {
         // U9-PAGEFAULT1 §2b: a recovered COW fault carries the SAME result the broad arm would
         // have returned — `Ok(())` on success, the rolled-back failure's error otherwise — so
@@ -2110,20 +2144,38 @@ pub fn handle_riscv_trap_entry_shared(
     // through its startup / syscall-continuation / async-preemption convention and activating the
     // resumed ASID. Every non-resuming outcome is the typed `EnterKernelIdle`, which returns this
     // CPU to the `wfi` it came from.
-    if timer_idle_queue_advance {
-        crate::yarm_log!("TIMER_IDLE_ADVANCE_DRAIN_BEGIN cpu={}", cpu.0);
+    // QEMU-SMP3 — the reschedule IPI's idle advance is discharged by THIS drain: the same
+    // re-verify, selection, exact-token resume and landing. The two triggers are exclusive (one
+    // trap is one interrupt), and `idle_advance_log!` gives each its own marker family, so a
+    // timer-driven advance reads exactly as before and an IPI-driven one never borrows its name.
+    let ipi_trigger = ipi_idle_queue_advance && !timer_idle_queue_advance;
+    macro_rules! idle_advance_log {
+        ($timer:literal, $ipi:literal $(, $arg:expr)* $(,)?) => {
+            if ipi_trigger {
+                crate::yarm_log!($ipi $(, $arg)*)
+            } else {
+                crate::yarm_log!($timer $(, $arg)*)
+            }
+        };
+    }
+    if timer_idle_queue_advance || ipi_idle_queue_advance {
+        idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_DRAIN_BEGIN cpu={}",
+            "IPI_IDLE_ADVANCE_DRAIN_BEGIN cpu={}", cpu.0);
         // The broad guard is released, so this re-acquires the rank-1 seam freely.
         let reverify_ok = shared.yield_reverify_ready(cpu);
-        crate::yarm_log!(
+        idle_advance_log!(
             "TIMER_IDLE_ADVANCE_LOCK_DROPPED_OK cpu={} current_clear={}",
+            "IPI_IDLE_ADVANCE_LOCK_DROPPED_OK cpu={} current_clear={}",
             cpu.0,
             u8::from(reverify_ok)
         );
         if !reverify_ok {
             // Something installed a current on this CPU inside this trap. Nothing is owed and
             // nothing was mutated here; the established tail resumes whoever that is.
-            crate::yarm_log!(
-                "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
+            idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
+            "IPI_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason=current_installed settlement=return_to_current",
                 cpu.0
             );
             return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
@@ -2140,17 +2192,21 @@ pub fn handle_riscv_trap_entry_shared(
         match acquired.token() {
             Some(token) => {
                 let inc = token.tid();
-                crate::yarm_log!(
-                    "TIMER_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
+                idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
+            "IPI_IDLE_ADVANCE_DEQUEUE_OK cpu={} incoming={}",
                     cpu.0,
                     inc
                 );
-                crate::yarm_log!(
-                    "TIMER_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
+                idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
+            "IPI_IDLE_ADVANCE_CURRENT_SET_OK cpu={} incoming={}",
                     cpu.0,
                     inc
                 );
-                crate::yarm_log!("TIMER_IDLE_ADVANCE_RUNNING_OK incoming={}", inc);
+                idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_RUNNING_OK incoming={}",
+            "IPI_IDLE_ADVANCE_RUNNING_OK incoming={}", inc);
                 let Some(asid) = direct_dispatch_resume_incoming(shared, token, &mut *frame) else {
                     // Refused AFTER the scheduler was mutated. The token's own narrowed authority
                     // rolls the dequeue back exactly — a `ContinuedCurrent` mark yields none and
@@ -2169,15 +2225,28 @@ pub fn handle_riscv_trap_entry_shared(
                 // so the comparison is always unequal and the count always happens; this owes it
                 // for the same reason it owes the yield count.
                 shared.count_context_switch_split_mut();
-                crate::yarm_log!("TIMER_IDLE_ADVANCE_SATP_OK incoming={} asid={}", inc, asid);
-                crate::yarm_log!("TIMER_IDLE_ADVANCE_SFENCE_OK incoming={}", inc);
-                crate::yarm_log!("TIMER_IDLE_ADVANCE_FRAME_OK incoming={}", inc);
-                crate::yarm_log!("TIMER_IDLE_ADVANCE_SRET_ARMED incoming={}", inc);
-                crate::yarm_log!(
-                    "TIMER_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
+                idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_SATP_OK incoming={} asid={}",
+            "IPI_IDLE_ADVANCE_SATP_OK incoming={} asid={}", inc, asid);
+                idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_SFENCE_OK incoming={}",
+            "IPI_IDLE_ADVANCE_SFENCE_OK incoming={}", inc);
+                idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_FRAME_OK incoming={}",
+            "IPI_IDLE_ADVANCE_FRAME_OK incoming={}", inc);
+                idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_SRET_ARMED incoming={}",
+            "IPI_IDLE_ADVANCE_SRET_ARMED incoming={}", inc);
+                idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
+            "IPI_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
                     cpu.0,
                     inc
                 );
+                // QEMU-SMP3 §4: the idle dispatch and which trigger drove it, recorded once the
+                // resume is committed.
+                #[cfg(feature = "riscv64-smp3-witness")]
+                crate::arch::riscv64::smp3_witness::note_idle_dispatch(cpu, inc, ipi_trigger);
                 return Ok(RiscvTrapEntryOutcome::ReturnToIncoming);
             }
             None => {
@@ -2187,8 +2256,9 @@ pub fn handle_riscv_trap_entry_shared(
                 // and refused; those entries are still queued, in order. `Contended` means an
                 // accepted candidate stopped being markable and its dequeue was already undone
                 // exactly. The two authority refusals mutated nothing at all.
-                crate::yarm_log!(
-                    "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+                idle_advance_log!(
+            "TIMER_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
+            "IPI_IDLE_ADVANCE_SETTLED cpu={} incoming=none reason={} settlement=kernel_idle",
                     cpu.0,
                     acquired.marker()
                 );

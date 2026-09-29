@@ -209,6 +209,17 @@ impl SharedKernel {
                     success.wake_target_cpu,
                 );
             }
+            // QEMU-SMP3: the RISC-V half. The SBI IPI owner publishes the work before it asks the
+            // firmware to interrupt the target, and refuses (sending nothing) a target that never
+            // published itself ready — so a wake-only secondary outside `yarm.ap_user_dispatch=1`
+            // is never signalled.
+            #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+            if success.wake_target_cpu != executing_cpu {
+                let _ = crate::arch::riscv64::ipi::send_reschedule(
+                    executing_cpu,
+                    success.wake_target_cpu,
+                );
+            }
         }
         result
     }
@@ -1246,6 +1257,17 @@ impl SharedKernel {
             #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
             if success.wake_target_cpu != executing_cpu {
                 let _ = crate::arch::aarch64::smp::send_reschedule_sgi(
+                    executing_cpu,
+                    success.wake_target_cpu,
+                );
+            }
+            // QEMU-SMP3: the RISC-V half. The SBI IPI owner publishes the work before it asks the
+            // firmware to interrupt the target, and refuses (sending nothing) a target that never
+            // published itself ready — so a wake-only secondary outside `yarm.ap_user_dispatch=1`
+            // is never signalled.
+            #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+            if success.wake_target_cpu != executing_cpu {
+                let _ = crate::arch::riscv64::ipi::send_reschedule(
                     executing_cpu,
                     success.wake_target_cpu,
                 );

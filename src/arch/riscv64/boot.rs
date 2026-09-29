@@ -746,12 +746,54 @@ fn riscv_trap_stack_top() -> u64 {
     (base + (RISCV_TRAP_STACK_SIZE as u64)) & !0xf
 }
 
-/// The trap-stack top the 199E-R1 S-mode timer boundary installs into
-/// `sscratch`. Exposed so `timer.rs` can establish the S-mode entry contract
-/// without duplicating the address computation.
+/// The CANONICAL trap-stack top of logical CPU `cpu` — the value its idle boundary installs into
+/// `sscratch`. QEMU-SMP3: per CPU, because a dispatching secondary parks at its own boundary on
+/// its own stack; `None` for a CPU with no published trap stack, which then arms nothing.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-pub(crate) fn riscv_trap_stack_top_for_s_mode_timer() -> u64 {
-    riscv_trap_stack_top()
+pub(crate) fn riscv_trap_stack_top_for_cpu(cpu: usize) -> Option<u64> {
+    use core::sync::atomic::Ordering;
+    if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize {
+        return Some(riscv_trap_stack_top());
+    }
+    for slot in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
+        if RISCV64_SECONDARY_CPU_IDS[slot].load(Ordering::Acquire) == cpu {
+            let top = RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].load(Ordering::Acquire);
+            return (top != 0).then_some((top as u64) & !0xf);
+        }
+    }
+    None
+}
+
+/// QEMU-SMP3 — the hart id of logical CPU `cpu`: the boot hart for CPU 0, otherwise the slot (=
+/// hart id) whose validated, claimed mapping names `cpu`. A scheduler index is never assumed to be
+/// a hart id.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub(crate) fn hart_id_of_logical_cpu(cpu: usize) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize {
+        return Some(boot_hart_id());
+    }
+    (0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT)
+        .find(|&slot| RISCV64_SECONDARY_CPU_IDS[slot].load(Ordering::Acquire) == cpu)
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "riscv64")))]
+pub(crate) fn hart_id_of_logical_cpu(_cpu: usize) -> Option<usize> {
+    None
+}
+
+/// The published trap-stack region `(base, top)` of secondary `slot`, or `None` when unclaimed.
+/// QEMU-SMP3: the region size is published with the top, because the dispatching secondary's
+/// trap stack is not the 4 KiB slot stack.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn secondary_trap_stack_region(slot: usize) -> Option<(usize, usize)> {
+    use core::sync::atomic::Ordering;
+    let top = RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].load(Ordering::Acquire);
+    if top == 0 {
+        return None;
+    }
+    let size = RISCV64_SECONDARY_TRAP_STACK_SIZES[slot].load(Ordering::Acquire);
+    Some((top.saturating_sub(size), top))
 }
 
 /// 199E-R1(B) — the CANONICAL trap-stack top for whichever hart owns `frame_ptr`.
@@ -763,13 +805,10 @@ pub(crate) fn riscv_trap_stack_top_for_s_mode_timer() -> u64 {
 /// boot hart, exactly as that function concludes.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn riscv_canonical_trap_stack_top_for_frame(frame_ptr: usize) -> u64 {
-    use core::sync::atomic::Ordering;
     for slot in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
-        let top = RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].load(Ordering::Acquire);
-        if top == 0 {
+        let Some((base, top)) = secondary_trap_stack_region(slot) else {
             continue;
-        }
-        let base = top.saturating_sub(RISCV64_SECONDARY_STACK_BYTES);
+        };
         if frame_ptr >= base && frame_ptr < top {
             return (top as u64) & !0xf;
         }
@@ -900,12 +939,26 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         // The interrupted context is `riscv_trap_halt`'s `wfi` loop, which is `-> !` and keeps
         // nothing live across the `wfi`. That is what makes it sound to run this handler on the
         // same trap stack: the outer frame it overlays is already dead.
+        // QEMU-SMP3: the latch is THIS CPU's — a secondary parks at its own boundary, and one
+        // hart's arrival there says nothing about where another hart is.
         if crate::arch::riscv64::timer::is_accepted_s_mode_timer_trap(
             scause,
             sstatus,
-            crate::arch::riscv64::timer::s_mode_timer_boundary_armed(),
+            crate::arch::riscv64::timer::s_mode_timer_boundary_armed(cpu.0 as usize),
         ) {
             return riscv_s_mode_timer_trap(shared, cpu, frame, sepc, sstatus);
+        }
+        // ── QEMU-SMP3: the reschedule IPI taken at the same armed idle boundary ─────────────
+        //
+        // A supervisor SOFTWARE interrupt: interrupt bit, code 1, SPP = Supervisor and this CPU's
+        // latch armed — the timer's predicate with the software cause. It is never a claim: the
+        // firmware raised `sip.SSIP` on this hart and the entry owner below clears it.
+        if crate::arch::riscv64::ipi::is_accepted_s_mode_software_trap(
+            scause,
+            sstatus,
+            crate::arch::riscv64::timer::s_mode_timer_boundary_armed(cpu.0 as usize),
+        ) {
+            riscv_s_mode_software_trap(shared, cpu, frame, sepc);
         }
         // ── QEMU-IRQ1 §2: the SECOND accepted S-mode trap, witness builds only ──────────────
         //
@@ -918,7 +971,7 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         if crate::arch::riscv64::plic::is_accepted_s_mode_external_trap(
             scause,
             sstatus,
-            crate::arch::riscv64::timer::s_mode_timer_boundary_armed(),
+            crate::arch::riscv64::timer::s_mode_timer_boundary_armed(cpu.0 as usize),
             crate::arch::riscv64::uart_irq_witness::external_admission_armed(),
         ) {
             riscv_s_mode_external_trap(shared, cpu, frame, sepc);
@@ -1027,10 +1080,34 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     } else {
         None
     };
+    // ── QEMU-SMP3 — THE software-interrupt consumption, taken once, here ────────────────────
+    //
+    // The U-origin twin of the idle-boundary route: this trap's entry owner clears `sip.SSIP`
+    // and THEN swaps this CPU's mailbox, exactly once, and carries what it consumed. The
+    // interrupted task keeps running (the wrapper settles it `return_to_interrupted`); the woken
+    // work is on this CPU's run queue for its next scheduling point.
+    let software_interrupt = if crate::arch::riscv64::ipi::is_software_interrupt(scause) {
+        let arrival = crate::arch::riscv64::ipi::take_arrival(
+            cpu,
+            crate::arch::riscv64::ipi::ArrivalOrigin::User,
+        );
+        #[cfg(feature = "riscv64-smp3-witness")]
+        crate::arch::riscv64::smp3_witness::note_arrival(
+            cpu,
+            arrival,
+            sepc,
+            entering_tid,
+            sstatus as u64,
+        );
+        Some(arrival)
+    } else {
+        None
+    };
     let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {
         scause,
         stval,
         external_claim,
+        software_interrupt,
     };
     // Stage 196A: route through the RISC-V shared trap-entry wrapper. It owns the
     // `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag lifecycle, runs the UNCHANGED
@@ -1115,7 +1192,11 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // kernel-state pointer are installed; the service chain has reached stable idle. Both
             // init paths default to deferred and never enable STIE / external-IRQ delivery until
             // explicitly audited. No frame is restored and no `sret` is armed for idle.
-            let _ = crate::arch::riscv64::plic::init_plic_after_idle_safe_point();
+            // The PLIC's discovery belongs to the boot hart (its S-mode context); a secondary's
+            // idle arrival does not run it.
+            if cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+                let _ = crate::arch::riscv64::plic::init_plic_after_idle_safe_point();
+            }
             // Canonical 199E: the timer is already armed (at the boot safe point, before any user
             // task ran), so this boundary no longer arms it. What it owns is the S-ORIGIN
             // admission contract: re-point `sscratch` at the trap-stack top, arm the boundary
@@ -1123,8 +1204,9 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // each trap entry and without this the idle `wfi` would loop masked and never take
             // the pending timer. Same single audited boundary as before; a strict no-op if the
             // boot arm deferred (no SBI TIME, or not the boot hart).
-            crate::arch::riscv64::timer::reestablish_idle_boundary();
-            riscv_trap_halt("kernel_idle_awaiting_io");
+            // QEMU-SMP3: per CPU — this CPU's own trap-stack top, latch and unmask request.
+            crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
+            riscv_idle_halt(cpu, "kernel_idle_awaiting_io");
         }
         // Genuine internal trap-handling failure — NEVER idle, regardless of `current`.
         Err(err) => {
@@ -1562,7 +1644,7 @@ fn riscv_s_mode_timer_trap(
     sepc: usize,
     sstatus: usize,
 ) -> ! {
-    use crate::arch::riscv64::trap::{RiscvTrapEntryOutcome, handle_riscv_trap_entry_shared};
+    use crate::arch::riscv64::trap::handle_riscv_trap_entry_shared;
 
     let tick = crate::arch::riscv64::timer::record_timer_tick();
     early_marker!(
@@ -1595,6 +1677,51 @@ fn riscv_s_mode_timer_trap(
         tick,
         crate::arch::riscv64::timer::rearm_count()
     );
+    let _ = sstatus;
+    riscv_s_mode_idle_landing(
+        shared,
+        cpu,
+        frame,
+        &tframe,
+        outcome,
+        SModeIdleTrigger::Timer { tick },
+    )
+}
+
+/// QEMU-SMP3 — which accepted idle-boundary interrupt a landing is settling. Only the markers
+/// differ; the landing is one implementation.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[derive(Clone, Copy)]
+enum SModeIdleTrigger {
+    Timer { tick: u64 },
+    Ipi { sources: u64 },
+}
+
+/// The ONE landing of an interrupt accepted at the armed kernel-idle boundary — the periodic
+/// timer's (199E-R1) and, QEMU-SMP3, the reschedule IPI's. Factored out of the timer path
+/// unchanged, so the second trigger reuses the resume conventions, the address-space activation
+/// and the canonical `sscratch` rather than growing a copy of them.
+///
+/// Two outcomes, and only two:
+/// * a task became current during the trap — clear `SPP`, sanitize `sstatus`, write the frame
+///   back through exactly one of the three resume conventions, activate the resumed ASID and
+///   `sret` to U-mode;
+/// * still idle — return to the interrupted `wfi` with `SPP` and `SIE`-from-`SPIE` as saved, and
+///   `sscratch` at THIS hart's canonical top (the boot hart's top here would hand a secondary's
+///   next trap the boot hart's stack).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_s_mode_idle_landing(
+    shared: &'static crate::runtime::SharedKernel,
+    cpu: crate::kernel::scheduler::CpuId,
+    frame: &mut RiscvTrapFrame,
+    tframe: &crate::kernel::trapframe::TrapFrame,
+    outcome: Result<
+        crate::arch::riscv64::trap::RiscvTrapEntryOutcome,
+        crate::kernel::boot::TrapHandleError,
+    >,
+    trigger: SModeIdleTrigger,
+) -> ! {
+    use crate::arch::riscv64::trap::RiscvTrapEntryOutcome;
 
     let resume_tid = shared.current_tid_split_read(cpu).unwrap_or(0);
     match outcome {
@@ -1604,11 +1731,19 @@ fn riscv_s_mode_timer_trap(
         {
             // A task is runnable again. Leave the idle lifecycle: clear SPP so `sret` targets
             // U-mode, and populate the frame from the resumed task's saved context.
-            early_marker!(
-                "RISCV_S_MODE_TIMER_DISPATCH tick={} resume_tid={}",
-                tick,
-                resume_tid
-            );
+            match trigger {
+                SModeIdleTrigger::Timer { tick } => early_marker!(
+                    "RISCV_S_MODE_TIMER_DISPATCH tick={} resume_tid={}",
+                    tick,
+                    resume_tid
+                ),
+                SModeIdleTrigger::Ipi { sources } => early_marker!(
+                    "RISCV_S_MODE_IPI_DISPATCH cpu={} sources=0x{:x} resume_tid={}",
+                    cpu.0,
+                    sources,
+                    resume_tid
+                ),
+            }
             // 199E-R1F: leaving the idle lifecycle for U-mode goes through the SAME sanitizer
             // as every other user return — SPP cleared, FS and VS forced Off — and only then
             // adds this path's own approved bit, SPIE, so the resumed task runs with interrupts
@@ -1766,35 +1901,115 @@ fn riscv_s_mode_timer_trap(
         Err(err) => {
             // A genuine trap-handling failure is NEVER swallowed into idle, exactly as on the
             // user path: report and halt with the named step.
-            early_marker!(
-                "RISCV_TRAP_HANDLE_FAILED reason=s_mode_timer_handle_err err={:?}",
-                err
-            );
-            riscv_trap_halt("s_mode_timer_handle_err");
+            match trigger {
+                SModeIdleTrigger::Timer { .. } => {
+                    early_marker!(
+                        "RISCV_TRAP_HANDLE_FAILED reason=s_mode_timer_handle_err err={:?}",
+                        err
+                    );
+                    riscv_trap_halt("s_mode_timer_handle_err");
+                }
+                SModeIdleTrigger::Ipi { .. } => {
+                    early_marker!(
+                        "RISCV_TRAP_HANDLE_FAILED reason=s_mode_ipi_handle_err err={:?}",
+                        err
+                    );
+                    riscv_trap_halt("s_mode_ipi_handle_err");
+                }
+            }
         }
         Ok(_) => {
             // Still idle: return to the interrupted `wfi`. `sstatus` is restored unchanged, so
             // SPP stays Supervisor and SIE is restored from SPIE — the idle loop resumes
             // interruptible, ready for the next tick.
-            let _ = sstatus;
-            early_marker!("RISCV_S_MODE_TIMER_RESUME_IDLE tick={}", tick);
+            match trigger {
+                SModeIdleTrigger::Timer { tick } => {
+                    early_marker!("RISCV_S_MODE_TIMER_RESUME_IDLE tick={}", tick)
+                }
+                SModeIdleTrigger::Ipi { sources } => early_marker!(
+                    "RISCV_S_MODE_IPI_RESUME_IDLE cpu={} sources=0x{:x}",
+                    cpu.0,
+                    sources
+                ),
+            }
             unsafe {
                 yarm_riscv64_s_mode_timer_return(
                     frame as *const RiscvTrapFrame,
-                    riscv_trap_stack_top(),
+                    riscv_canonical_trap_stack_top_for_frame(frame as *const _ as usize),
                 )
             }
         }
     }
 }
 
+/// QEMU-SMP3 — the reschedule IPI taken at this CPU's armed idle boundary.
+///
+/// Entered only from the bridge's S-mode screen, with
+/// [`crate::arch::riscv64::ipi::is_accepted_s_mode_software_trap`] satisfied: the hart was in the
+/// stack-free `wfi` loop, so the frame this handler overlays is dead — the timer path's argument.
+///
+/// This is the origin's ENTRY OWNER: `sip.SSIP` is cleared and the mailbox consumed here, once.
+/// The trap then goes through `handle_riscv_trap_entry_shared`, which owes the idle queue advance
+/// (the same drain the timer's queued-work settlement uses), and lands through the SAME
+/// [`riscv_s_mode_idle_landing`]. No tick is taken and nothing is re-armed: this is not a timer.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_s_mode_software_trap(
+    shared: &'static crate::runtime::SharedKernel,
+    cpu: crate::kernel::scheduler::CpuId,
+    frame: &mut RiscvTrapFrame,
+    sepc: usize,
+) -> ! {
+    use crate::arch::riscv64::trap::handle_riscv_trap_entry_shared;
+
+    let arrival =
+        crate::arch::riscv64::ipi::take_arrival(cpu, crate::arch::riscv64::ipi::ArrivalOrigin::Idle);
+    #[cfg(feature = "riscv64-smp3-witness")]
+    crate::arch::riscv64::smp3_witness::note_arrival(cpu, arrival, sepc, 0, frame.sstatus);
+    early_marker!(
+        "RISCV_S_MODE_IPI_ACCEPTED cpu={} sources=0x{:x} origin=supervisor sepc=0x{:x} spp=1 boundary=armed",
+        cpu.0,
+        arrival.sources,
+        sepc
+    );
+    let mut tframe = crate::kernel::trapframe::TrapFrame::zeroed();
+    tframe.set_saved_pc(sepc);
+    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {
+        scause: frame.scause as usize,
+        stval: frame.stval as usize,
+        external_claim: None,
+        software_interrupt: Some(arrival),
+    };
+    let outcome = handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe);
+    riscv_s_mode_idle_landing(
+        shared,
+        cpu,
+        frame,
+        &tframe,
+        outcome,
+        SModeIdleTrigger::Ipi {
+            sources: arrival.sources,
+        },
+    )
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn riscv_trap_halt(reason: &'static str) -> ! {
     early_marker!("RISCV_TRAP_HALTED reason={}", reason);
-    // QEMU-IRQ1 §2 — the marker above is written with `SIE` still clear. Only an idle arrival that
-    // re-established the boundary a moment ago waits with `SIE` set, and it is set inside the
-    // stack-free `wfi` loop itself; every other halt waits masked, as before.
+    // A fatal halt waits MASKED. QEMU-SMP3: structurally now — the idle arrival no longer comes
+    // through here, so no halt can consume another hart's (or its own) unmask request.
     crate::arch::riscv64::timer::halt_wait_loop()
+}
+
+/// The IDLE arrival's halt: the same marker, then THIS CPU's idle wait, which sets `SIE` inside the
+/// stack-free `wfi` loop only if `reestablish_idle_boundary(cpu)` requested it a moment ago.
+///
+/// QEMU-IRQ1 §2 — the marker is written with `SIE` still clear. QEMU-SMP3 — the request is per
+/// CPU: with one process-wide request a second hart's fatal halt could consume this hart's unmask
+/// (leaving it idle and deaf) or this hart could consume another's.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_idle_halt(cpu: crate::kernel::scheduler::CpuId, reason: &'static str) -> ! {
+    early_marker!("RISCV_TRAP_HALTED reason={}", reason);
+    crate::arch::riscv64::timer::idle_wait_loop(cpu.0 as usize)
 }
 
 /// QEMU-IRQ1 §2 — the idle-origin supervisor EXTERNAL interrupt, witness builds only.
@@ -1869,7 +2084,7 @@ fn riscv_s_mode_external_trap(
             unsafe {
                 yarm_riscv64_s_mode_timer_return(
                     frame as *const RiscvTrapFrame,
-                    riscv_trap_stack_top(),
+                    riscv_canonical_trap_stack_top_for_frame(frame as *const _ as usize),
                 )
             }
         }
@@ -2664,8 +2879,15 @@ pub fn bootstrap_first_user_task(
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 const QEMU_VIRT_HSM_SECONDARY_HART_LIMIT: usize = 8;
+/// The trap stack of a secondary that never dispatches (logical CPU ≥ 2): it can only ever take
+/// the park's own traps.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 const RISCV64_SECONDARY_STACK_BYTES: usize = 4096;
+/// QEMU-SMP3 — a secondary's EXECUTION stack. It runs the release, the scheduler admission and
+/// the first idle entry (formatting markers on the way), so it is sized for that rather than for
+/// the old park loop alone.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+const RISCV64_SECONDARY_BOOT_STACK_BYTES: usize = 64 * 1024;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 const RISCV64_SECONDARY_ACK_EMPTY: usize = 0;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -2722,11 +2944,30 @@ impl SecondaryHartHandoff {
 struct SecondaryHartStack([u8; RISCV64_SECONDARY_STACK_BYTES]);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[repr(align(16))]
+#[derive(Clone, Copy)]
+struct SecondaryBootStack([u8; RISCV64_SECONDARY_BOOT_STACK_BYTES]);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 static mut RISCV64_SECONDARY_HANDOFFS: [SecondaryHartHandoff; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
     [SecondaryHartHandoff::empty(); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-static mut RISCV64_SECONDARY_STACKS: [SecondaryHartStack; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
-    [SecondaryHartStack([0; RISCV64_SECONDARY_STACK_BYTES]); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+static mut RISCV64_SECONDARY_STACKS: [SecondaryBootStack; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
+    [SecondaryBootStack([0; RISCV64_SECONDARY_BOOT_STACK_BYTES]); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+
+/// QEMU-SMP3 — the trap stack of logical CPU 1, the one secondary that may DISPATCH. It runs the
+/// whole syscall dispatch exactly as the boot hart's does, so it gets the boot hart's size and the
+/// same `.bss` placement (RAM only, not image size). Only CPU 1: the package is two harts, and the
+/// `riscv-trap-stack-debt` TODO on `RISCV_TRAP_STACK_SIZE` still stands for every further one.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static mut RISCV64_CPU1_TRAP_STACK: RiscvTrapStack = RiscvTrapStack([0; RISCV_TRAP_STACK_SIZE]);
+
+/// QEMU-SMP3 — the size of each published secondary trap-stack region (index = slot), stored
+/// BEFORE its top, so a reader that sees the top sees the size.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static RISCV64_SECONDARY_TRAP_STACK_SIZES: [core::sync::atomic::AtomicUsize;
+    QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
 
 /// Stage 199D link 7: per-hart TRAP stacks. `sscratch` must point at a stack the trap vector can
 /// swap `sp` with; reusing `RISCV64_SECONDARY_STACKS` would let a trap clobber the very stack the
@@ -2838,11 +3079,9 @@ fn claim_logical_cpu_id_for_hart(hart_id: usize) -> Option<usize> {
 fn riscv_logical_cpu_for_trap_frame(frame_ptr: usize) -> crate::kernel::scheduler::CpuId {
     use core::sync::atomic::Ordering;
     for slot in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
-        let top = RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].load(Ordering::Acquire);
-        if top == 0 {
+        let Some((base, top)) = secondary_trap_stack_region(slot) else {
             continue;
-        }
-        let base = top.saturating_sub(RISCV64_SECONDARY_STACK_BYTES);
+        };
         if frame_ptr >= base && frame_ptr < top {
             let cpu = RISCV64_SECONDARY_CPU_IDS[slot].load(Ordering::Acquire);
             if cpu != usize::MAX && cpu <= u8::MAX as usize {
@@ -2862,6 +3101,8 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 extern "C" fn yarm_riscv64_secondary_boot(handoff_ptr: usize) -> ! {
     let mut hart_id = usize::MAX;
+    // QEMU-SMP3: the logical CPU this hart parks as, once link 7 completed on it.
+    let mut parked_cpu: Option<usize> = None;
     if handoff_ptr != 0 {
         let handoff = handoff_ptr as *const SecondaryHartHandoff;
         unsafe {
@@ -2995,12 +3236,32 @@ extern "C" fn yarm_riscv64_secondary_boot(handoff_ptr: usize) -> ! {
                 (sie_readback >> 5) & 1,
                 (sie_readback >> 9) & 1
             );
+            // (5b) QEMU-SMP3 — `sie.SSIE` as a WAKE SOURCE ONLY. With `sstatus.SIE` still 0 no
+            //      trap can be taken here; a pending supervisor software interrupt merely ends
+            //      the park's `wfi` (QEMU resumes `wfi` only for a pending interrupt enabled in
+            //      `sie`, and the old park, with `sie = 0`, could never be released at all). Only
+            //      the boot hart's release — sent under `yarm.ap_user_dispatch=1` — ever raises it.
+            let wake_sie = crate::arch::riscv64::ipi::enable_ssie_on_this_hart();
+            let wake_sstatus: usize;
+            unsafe {
+                core::arch::asm!("csrr {0}, sstatus", out(reg) wake_sstatus,
+                    options(nostack, nomem, preserves_flags));
+            }
+            early_marker!(
+                "RISCV_SECONDARY_PARK_WAKE_SOURCE hart={} cpu={} sie=0x{:x} ssie={} sstatus_sie={} delivery=wfi_wake_only",
+                hart_id,
+                cpu_id,
+                wake_sie,
+                (wake_sie >> 1) & 1,
+                (wake_sstatus >> 1) & 1
+            );
             // (6) trap-ready, and parked. Nothing below this point runs any kernel work.
             early_marker!(
                 "RISCV_SECONDARY_TRAP_READY_PARKED hart={} cpu={} online=0 user=0 scheduler=0",
                 hart_id,
                 cpu_id
             );
+            parked_cpu = Some(cpu_id);
         }
     }
 
@@ -3016,21 +3277,115 @@ extern "C" fn yarm_riscv64_secondary_boot(handoff_ptr: usize) -> ! {
         }
     }
 
+    // The park. QEMU-SMP3: a trap-ready hart leaves it only through the boot hart's release —
+    // its flag, announced by an IPI that ends this `wfi`. Every other wake re-parks.
     loop {
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
         }
+        if let Some(cpu_id) = parked_cpu {
+            let cpu = crate::kernel::scheduler::CpuId(cpu_id as u8);
+            if crate::arch::riscv64::ipi::take_park_release(cpu) {
+                riscv_secondary_dispatch_main(cpu, hart_id);
+            }
+        }
     }
+}
+
+/// QEMU-SMP3 — a released secondary's life, from the park to its first idle boundary.
+///
+/// Order is the contract:
+/// 1. the release is the END of the boot hart's `&mut KernelState` window, so nothing shared was
+///    touched before it;
+/// 2. `sstatus.SUM`, which the boot hart's first user entry sets for itself: this hart's trap path
+///    reaches its users' memory the same way;
+/// 3. the scheduler's ONE admission transition (`admit_pinned_dispatch`: wake-only → dispatching,
+///    placeholder cleared, balanced placement never chooses it) — the same owner AArch64 uses;
+/// 4. this hart's idle wake source, then its publication as an IPI target, last;
+/// 5. the same authenticated idle boundary the boot hart parks at: `sscratch` at its own trap-stack
+///    top, its own latch armed, `SIE` set only inside the stack-free `wfi` loop.
+///
+/// Any refusal leaves the CPU wake-only and masked.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_secondary_dispatch_main(cpu: crate::kernel::scheduler::CpuId, hart_id: usize) -> ! {
+    const SSTATUS_SUM: usize = 1 << 18;
+    let sstatus: usize;
+    unsafe {
+        core::arch::asm!(
+            "csrs sstatus, {sum}",
+            "csrr {out}, sstatus",
+            sum = in(reg) SSTATUS_SUM,
+            out = out(reg) sstatus,
+            options(nostack, preserves_flags)
+        );
+    }
+    early_marker!(
+        "RISCV_SMP3_SECONDARY_RELEASED hart={} cpu={} sum={} sstatus_sie={}",
+        hart_id,
+        cpu.0,
+        (sstatus >> 18) & 1,
+        (sstatus >> 1) & 1
+    );
+    let Some(shared) = trap_shared_kernel_riscv() else {
+        riscv_secondary_unadmitted(cpu, "no_shared_kernel");
+    };
+    if let Err(e) = shared.admit_ap_pinned_dispatch_split(cpu) {
+        early_marker!(
+            "RISCV_SMP3_SECONDARY_ADMISSION_REFUSED cpu={} reason={:?} result=fail",
+            cpu.0,
+            e
+        );
+        riscv_secondary_unadmitted(cpu, "scheduler_refused");
+    }
+    crate::arch::riscv64::timer::mark_idle_wake_source(cpu.0 as usize);
+    crate::arch::riscv64::ipi::mark_ready(cpu);
+    early_marker!(
+        "RISCV_SMP3_SECONDARY_ADMITTED hart={} cpu={} wake_only=0 balance_excluded=1 idle_placeholder=cleared ipi_ready=1 trap_stack_top=0x{:x} result=ok",
+        hart_id,
+        cpu.0,
+        riscv_trap_stack_top_for_cpu(cpu.0 as usize).unwrap_or(0)
+    );
+    #[cfg(feature = "riscv64-smp3-witness")]
+    crate::arch::riscv64::smp3_witness::secondary_admitted(shared, cpu);
+    crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
+    riscv_idle_halt(cpu, "secondary_idle_awaiting_ipi")
+}
+
+/// A released secondary the scheduler would not admit: nothing is ever placed on it (it stays
+/// wake-only), and it waits with every interrupt source disabled.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_secondary_unadmitted(cpu: crate::kernel::scheduler::CpuId, reason: &str) -> ! {
+    unsafe {
+        core::arch::asm!("csrw sie, zero", "csrci sstatus, 2", options(nostack, preserves_flags));
+    }
+    early_marker!(
+        "RISCV_SMP3_SECONDARY_UNADMITTED cpu={} reason={} result=fail",
+        cpu.0,
+        reason
+    );
+    crate::arch::riscv64::timer::halt_wait_loop()
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn secondary_stack_top(slot: usize) -> usize {
-    let stacks = core::ptr::addr_of_mut!(RISCV64_SECONDARY_STACKS) as *mut SecondaryHartStack;
+    let stacks = core::ptr::addr_of_mut!(RISCV64_SECONDARY_STACKS) as *mut SecondaryBootStack;
     unsafe {
         stacks
             .add(slot)
             .cast::<u8>()
-            .add(RISCV64_SECONDARY_STACK_BYTES) as usize
+            .add(RISCV64_SECONDARY_BOOT_STACK_BYTES) as usize
+    }
+}
+
+/// QEMU-SMP3 — the trap-stack region `(top, size)` a claimed logical CPU gets: CPU 1 the
+/// dispatch-sized stack, any other the slot's park-sized one.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn secondary_trap_stack_for(slot: usize, cpu_id: usize) -> (usize, usize) {
+    if cpu_id == 1 {
+        let base = core::ptr::addr_of!(RISCV64_CPU1_TRAP_STACK) as usize;
+        ((base + RISCV_TRAP_STACK_SIZE) & !0xf, RISCV_TRAP_STACK_SIZE)
+    } else {
+        (secondary_trap_stack_top(slot), RISCV64_SECONDARY_STACK_BYTES)
     }
 }
 
@@ -3045,10 +3400,10 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
     // trapping CpuId from a frame pointer. A rejected mapping leaves `cpu_id = usize::MAX` and
     // the secondary fails closed into its pre-existing safe park.
     let cpu_id = claim_logical_cpu_id_for_hart(hart_id).unwrap_or(usize::MAX);
-    let trap_stack_top = if cpu_id == usize::MAX {
-        0
+    let (trap_stack_top, trap_stack_size) = if cpu_id == usize::MAX {
+        (0, 0)
     } else {
-        secondary_trap_stack_top(slot)
+        secondary_trap_stack_for(slot, cpu_id)
     };
     let boot_hart_satp: usize;
     unsafe {
@@ -3057,6 +3412,7 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
     }
     if cpu_id != usize::MAX {
         RISCV64_SECONDARY_CPU_IDS[slot].store(cpu_id, Ordering::Release);
+        RISCV64_SECONDARY_TRAP_STACK_SIZES[slot].store(trap_stack_size, Ordering::Release);
         RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].store(trap_stack_top, Ordering::Release);
     } else {
         early_marker!(
@@ -3396,6 +3752,12 @@ pub fn enter_dispatched_user_task_if_available(
         ctx.user_sp
     );
     early_marker!("RISCV_ENTER_USER_ATTEMPT tid={}", tid);
+    // QEMU-SMP3 — the END of this hart's boot `&mut KernelState` window: nothing between here and
+    // the `sret` touches shared kernel state. Under `yarm.ap_user_dispatch=1` (and only then) this
+    // hart becomes an IPI target and releases every trap-ready secondary; otherwise a no-op.
+    crate::arch::riscv64::ipi::release_secondaries_at_boot_borrow_end(
+        riscv_trap_ready_acked_bitmap(),
+    );
     early_marker!("RISCV_ENTER_USER_SRET tid={}", tid);
     unsafe {
         yarm_riscv64_enter_user(&ctx as *const RiscvEnterUserCtx);

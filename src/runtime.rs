@@ -14754,13 +14754,15 @@ impl SharedKernel {
     ///   invalidation every remote observer needs has therefore already happened, architecturally,
     ///   inside the `unmap_page`/`map_page` that removed the translation. No IPI exists on this
     ///   port because none is required.
-    /// * **RISC-V** — `sfence.vma` is hart-local and the ISA offers no broadcast, so a remote
-    ///   holder would need an IPI this port does not have. It does not need one: secondary harts
-    ///   are brought online WAKE-ONLY (`riscv_bring_trap_ready_secondaries_online_wake_only`,
-    ///   "no AP dispatcher yet; a placed task would strand"), nothing anywhere clears that bit,
-    ///   and `live_cpu_bitmap_for_asid_split` computes its candidates as `online & !wake_only`.
-    ///   A remote holder of a user ASID is therefore unreachable by the port's own dispatch rules
-    ///   — not merely absent at some CPU count — so the local fence is the whole shootdown.
+    /// * **RISC-V** — `sfence.vma` is hart-local and the ISA offers no broadcast. By default the
+    ///   secondaries stay WAKE-ONLY, `live_cpu_bitmap_for_asid_split` computes its candidates as
+    ///   `online & !wake_only`, and so the target set is empty and the requester's local fence is
+    ///   the whole shootdown. QEMU-SMP3: under `yarm.ap_user_dispatch=1` an admitted secondary CAN
+    ///   hold the ASID, and the required mechanism is the FIRMWARE's remote fence
+    ///   (`ipi::remote_invalidate_page` → `sbi_remote_sfence_vma_asid`), which on OpenSBI v1.3
+    ///   returns only after every target hart executed `SFENCE.VMA va, asid`. `Ok` is the
+    ///   acknowledgement; ANY error — including a target with no known hart id — answers `false`,
+    ///   so the displaced backing stays pinned rather than being reused under a live translation.
     ///
     /// Returns `true` only when the invalidation every observer needs is complete. A `false`
     /// return means the caller must NOT reclaim.
@@ -14796,15 +14798,22 @@ impl SharedKernel {
             let _ = want;
             true
         }
+        #[cfg(all(target_arch = "riscv64", not(test), not(feature = "hosted-dev")))]
+        {
+            // The firmware is the coordinator: one request naming every target hart, completed
+            // before it returns. Its error is never read as completion.
+            let _ = want;
+            crate::arch::riscv64::ipi::remote_invalidate_page(requester, targets, asid.0, virt.0)
+                .is_ok()
+        }
         #[cfg(not(any(
             all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")),
-            all(target_arch = "aarch64", not(test), not(feature = "hosted-dev"))
+            all(target_arch = "aarch64", not(test), not(feature = "hosted-dev")),
+            all(target_arch = "riscv64", not(test), not(feature = "hosted-dev"))
         )))]
         {
-            // RISC-V and the hosted build: no cross-CPU coordinator, so a non-empty remote target
-            // set cannot be acknowledged and must NOT be reported as completed. On RISC-V that set
-            // is unreachable by the port's dispatch rules (see above), so this arm is a
-            // fail-closed backstop rather than an expected outcome.
+            // The hosted build: no cross-CPU coordinator, so a non-empty remote target set cannot
+            // be acknowledged and must NOT be reported as completed.
             let _ = want;
             false
         }

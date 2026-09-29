@@ -85,6 +85,10 @@ x86-smp1-witness = ["x86-ipccall-direct-smp-oracle"]
 # each CPU, the bounded SGI / invalidation / context transaction record, and its synchronous dump.
 # Armed only together with `yarm.ap_user_dispatch=1` on a `-smp 2` boot.
 aarch64-smp2-witness = []
+# QEMU-SMP3: the RISC-V two-hart IPI / remote-fence / context witness — kernel-built tasks pinned
+# to each hart, the bounded IPI / fence / context transaction record, and its synchronous dump.
+# Armed only together with `yarm.ap_user_dispatch=1` on a `-smp 2` boot.
+riscv64-smp3-witness = []
 
 # Stage 200C2B core: the ARCH-NEUTRAL reply-timeout retirement machinery (the reversible NR7
 # reply-win reserve/commit/rollback, the `ClaimedByReply` deadline lease, the NARROW off-lock
