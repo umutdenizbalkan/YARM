@@ -798,3 +798,200 @@ fn an_overtaken_receiver_resumes_with_the_installed_completion() {
     assert!(queued(&fx.k, CPU0).is_empty());
     clear_cells();
 }
+
+// ── QEMU-SMP3-SEAL §2 — the RISC-V overtaken settlement ───────────────────────────────────────
+//
+// RISC-V's `settle_overtaken_deferral` used to answer `ReturnToCurrent` whenever ANY task was
+// current, without asking whether the frame it was about to `sret` through held that task's
+// continuation. It now applies the same shared policy as the x86_64/AArch64 bridge, with the
+// frame's own `resume_owner`. The RISC-V frame starts every trap `zeroed()` (no owner), and only
+// two owners bind one: the in-lock restore (`apply_current_thread_to_frame`, arch-neutral, driven
+// here through `resume_current_thread_with_frame`) and the exact-token resume.
+
+/// The base predicate, reproduced: "something is current" (`!yield_reverify_ready`) was the whole
+/// test. A frame no restore owned, with another task current — a SYNTHETIC interleaving on the
+/// three drain callers, whose commit cleared `current` and whose CPU alone can re-install it — was
+/// answered `ReturnToCurrent`, and the bridge's `task_switched` write-back would then have `sret`ed
+/// the ENTERING task's live registers under the installed task's identity and address space.
+#[test]
+fn base_riscv_return_to_current_accepted_an_unowned_frame() {
+    let fx = fixture();
+    futex_wait_commit(&fx);
+    fx.k.with(|s| {
+        s.enqueue_task(Q).expect("q");
+        s.dispatch_next_task().expect("q installed");
+    });
+    let frame = TrapFrame::zeroed();
+    assert!(
+        !fx.k.yield_reverify_ready(CPU0),
+        "the base predicate saw a current and answered ReturnToCurrent"
+    );
+    assert_eq!(
+        frame.resume_owner(),
+        None,
+        "yet no restore owned this frame"
+    );
+    assert_eq!(
+        settle(&fx, frame.resume_owner()),
+        OvertakenSettlement::Unauthenticated(FpuHomeRefusal::UnownedContinuation),
+        "the shared policy refuses it"
+    );
+    clear_cells();
+}
+
+/// The REACHABLE installed-current case (the terminal-idle caller): the blocking commit's in-lock
+/// dispatch installed Q and the in-lock restore applied Q's continuation, binding the owner it
+/// applied. That is exactly what the shared policy admits.
+#[test]
+fn an_in_lock_restored_continuation_is_admitted_through_its_bound_owner() {
+    let fx = fixture();
+    futex_wait_commit(&fx);
+    let mut frame = TrapFrame::zeroed();
+    fx.k.with(|s| {
+        s.enqueue_task(Q).expect("q");
+        s.dispatch_next_task().expect("in-lock dispatch");
+        s.resume_current_thread_with_frame(&mut frame)
+            .expect("in-lock restore");
+    });
+    let q_owner = FpuHomeOwner {
+        tid: Q,
+        asid: fx.q_asid,
+    };
+    assert_eq!(
+        frame.resume_owner(),
+        Some(q_owner),
+        "the restore names what it applied"
+    );
+    assert_eq!(
+        settle(&fx, frame.resume_owner()),
+        OvertakenSettlement::ReturnToInstalled { owner: q_owner }
+    );
+    clear_cells();
+}
+
+/// The two-hart race the terminal-idle caller can see: W blocks, the other hart completes its send
+/// and wakes it back here, and the in-lock dispatch re-selects W itself. The in-lock restore applies
+/// W's committed continuation AND consumes its parked send completion into the result lanes, and
+/// binds W's owner — so the return is W's continuation, admitted, with the result present once.
+#[test]
+fn a_reselected_sender_is_admitted_with_its_completion_consumed_in_lock() {
+    let fx = fixture();
+    sender_completed_after_its_drain_settled_idle(&fx);
+    let mut frame = TrapFrame::zeroed();
+    fx.k.with(|s| {
+        s.dispatch_next_task()
+            .expect("in-lock dispatch re-selects W");
+        s.resume_current_thread_with_frame(&mut frame)
+            .expect("in-lock restore");
+        let done = s
+            .take_blocked_syscall_completion_of_class(W, BlockedSyscallClass::IpcSend)
+            .expect("the restore boundary's consume");
+        frame.set_err(done.result as usize);
+    });
+    assert_eq!(fx.k.current_tid_split_read(CPU0), Some(W));
+    assert_eq!(frame.error, SEND_RESULT as usize);
+    assert_eq!(
+        settle(&fx, frame.resume_owner()),
+        OvertakenSettlement::ReturnToInstalled {
+            owner: w_owner(&fx)
+        }
+    );
+    assert!(!fx.k.with(|s| s.has_pending_syscall_completion(W)));
+    clear_cells();
+}
+
+/// An owned frame whose installed current is ANOTHER incarnation of the same TID is refused too:
+/// the owner the restore bound names an address space the TID no longer has.
+#[test]
+fn an_in_lock_restore_of_a_replaced_incarnation_is_refused() {
+    let fx = fixture();
+    futex_wait_commit(&fx);
+    let mut frame = TrapFrame::zeroed();
+    fx.k.with(|s| {
+        s.enqueue_task(Q).expect("q");
+        s.dispatch_next_task().expect("in-lock dispatch");
+        s.resume_current_thread_with_frame(&mut frame)
+            .expect("in-lock restore");
+        let (fresh, _) = s.create_user_address_space().expect("replacement");
+        s.bind_task_asid(Q, fresh).expect("rebind");
+    });
+    assert_eq!(
+        settle(&fx, frame.resume_owner()),
+        OvertakenSettlement::Unauthenticated(FpuHomeRefusal::IncarnationReplaced { tid: Q })
+    );
+    clear_cells();
+}
+
+const RISCV_TRAP: &str = include_str!("../../../arch/riscv64/trap.rs");
+const RISCV_BOOT: &str = include_str!("../../../arch/riscv64/boot.rs");
+
+fn riscv_fn(name: &str) -> &'static str {
+    RISCV_TRAP
+        .split(name)
+        .nth(1)
+        .unwrap_or_else(|| panic!("`{name}` must exist"))
+        .split("\n}\n")
+        .next()
+        .expect("bounded")
+}
+
+/// The RISC-V settlement IS the shared policy, fed the frame's own owner, and its refusals diverge.
+#[test]
+fn the_riscv_settlement_is_the_shared_policy_over_the_frames_owner() {
+    let body = riscv_fn("fn settle_overtaken_deferral(");
+    assert!(
+        body.contains("shared.settle_overtaken_deferral_split(")
+            && body.contains("frame.resume_owner(),"),
+        "the shared policy, with the frame's owner"
+    );
+    assert!(
+        !body.contains("yield_reverify_ready"),
+        "the bare 'something is current' predicate is gone"
+    );
+    let unauth = body
+        .split("S::Unauthenticated(refusal) => {")
+        .nth(1)
+        .expect("the refusal arm");
+    assert!(
+        unauth.contains("panic!(") && !unauth.contains("RiscvTrapEntryOutcome::"),
+        "an unauthenticated continuation diverges; it never returns an outcome"
+    );
+    let torn = body.split("S::Torn { tid } => {").nth(1).expect("torn");
+    assert!(torn.contains("dispatch_torn_fatal("));
+    assert_eq!(
+        body.matches("RiscvTrapEntryOutcome::ReturnToCurrent")
+            .count(),
+        1,
+        "ReturnToCurrent only from the authenticated arm"
+    );
+    let installed = body
+        .find("S::ReturnToInstalled { owner } => {")
+        .expect("installed");
+    let rtc = body
+        .find("RiscvTrapEntryOutcome::ReturnToCurrent")
+        .expect("rtc");
+    let switch = body.find("S::Switch(token) => {").expect("switch");
+    assert!(installed < rtc && rtc < switch);
+}
+
+/// The two owners of a RISC-V frame's `resume_owner`: the trap starts with none, and the exact-token
+/// resume binds the incarnation it applied (the in-lock restore's binding is arch-neutral and
+/// exercised above).
+#[test]
+fn riscv_frames_start_unowned_and_the_exact_resume_names_its_owner() {
+    assert!(
+        RISCV_BOOT.contains("let mut tframe = crate::kernel::trapframe::TrapFrame::zeroed();"),
+        "the bridge builds each trap's frame from zero"
+    );
+    assert_eq!(TrapFrame::zeroed().resume_owner(), None);
+    let resume = riscv_fn("fn direct_dispatch_resume_incoming(");
+    let apply = resume
+        .find("frame.apply_user_context(context);")
+        .expect("apply");
+    let bind = resume.find("frame.bind_resume_owner(").expect("bind");
+    assert!(
+        apply < bind,
+        "the owner is named after the continuation is applied"
+    );
+    assert!(resume.contains("tid: incoming,"));
+}

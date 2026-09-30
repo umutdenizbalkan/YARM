@@ -239,14 +239,19 @@ fn secondary_dispatch_is_behind_the_knob() {
 fn an_overtaken_deferral_is_settled_not_returned_through() {
     let trap = code(TRAP);
     let helper = code(fn_body(TRAP, "fn settle_overtaken_deferral("));
-    let reverify = pos(&helper, "if !shared.yield_reverify_ready(cpu) {");
-    let acquire = pos(&helper, "shared.queue_advance_acquire_incoming_split(");
+    // QEMU-SMP3-SEAL §2: the decision is the shared policy (which re-verifies `current` and owns
+    // the one acquire), fed the frame's own continuation owner; an installed current is returned
+    // to only when it authenticates, and every refusal diverges.
+    let policy = pos(&helper, "shared.settle_overtaken_deferral_split(");
+    let owner = pos(&helper, "frame.resume_owner(),");
     let resume = pos(
         &helper,
         "direct_dispatch_resume_incoming(shared, token, frame)",
     );
-    assert!(reverify < acquire && acquire < resume);
+    assert!(policy < owner && owner < resume);
+    assert!(!helper.contains("yield_reverify_ready"));
     assert!(helper.contains("reason: RiscvIdleReason::QueueAdvanceNoIncoming,"));
+    assert!(helper.contains("S::Unauthenticated(refusal) => {"));
     for (marker, site) in [
         (
             "D2_SEND_GENUINE_FALLBACK reason=state_changed",

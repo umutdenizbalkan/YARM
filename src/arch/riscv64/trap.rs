@@ -294,6 +294,12 @@ fn direct_dispatch_resume_incoming(
     let asid = shared.direct_dispatch_activate_asid_split(token)?;
     let (context, tls) = shared.direct_dispatch_restore_context_split(token)?;
     frame.apply_user_context(context);
+    // QEMU-SMP3-SEAL §2 — name the continuation just applied, as the x86_64 and AArch64 exact-token
+    // resumes do: the token is the selection, and `asid` is the address space activated above.
+    frame.bind_resume_owner(crate::runtime::FpuHomeOwner {
+        tid: incoming,
+        asid: crate::kernel::vm::Asid(asid),
+    });
     // Canonical 199E-R2 — this drain consumes NO async-preemption tag either.
     //
     // Its 199E-R1D form did, through an exact-token seam, and that half was identity-correct.
@@ -408,12 +414,23 @@ fn dispatch_resume_refused_fatal(
 /// through the woken task's saved frame while the scheduler holds it on the run queue. With one
 /// dispatching hart this window could not open; with two it does.
 ///
-/// The queue advance is still owed, and it is discharged by the SAME owners the idle advance
-/// uses: re-verify that `current` is still clear, select and mark through
-/// `queue_advance_acquire_incoming_split` over the shared step, resume through the exact-token
-/// transaction. If an in-lock fallback DID install a current, nothing is owed and the
-/// established tail resumes it. Every non-resuming outcome is the typed idle terminal. No idle
-/// provenance is published: the outgoing task is no longer blocked, so there is none to give.
+/// QEMU-SMP3-SEAL §2 — the decision is the SHARED policy
+/// ([`crate::runtime::SharedKernel::settle_overtaken_deferral_split`]) the x86_64/AArch64 bridge
+/// already applies, so the three ports cannot disagree about when a return is owed:
+///
+/// * `current` installed — this port used to answer `ReturnToCurrent` on the bare fact that
+///   something was current, without asking whether the frame held THAT task's continuation. It
+///   is now admitted only through the frame's own owner: the in-lock restore
+///   (`apply_current_thread_to_frame`) binds `resume_owner` to exactly the `{tid, asid}` whose
+///   context and parked completion it put in the frame, and
+///   `with_current_fpu_home_split(Owner(..))` checks that the installed current is that
+///   incarnation, current nowhere else and resumable. A frame no restore owned (`None`), or one
+///   owned by another task or another address space, is contradictory and fails closed.
+/// * `current` clear — the queue advance is still owed, discharged by the SAME acquire the idle
+///   advance uses over this port's shared step, and resumed through the exact-token transaction.
+///
+/// Every non-resuming outcome is the typed idle terminal. No idle provenance is published: the
+/// outgoing task is no longer blocked, so there is none to give.
 fn settle_overtaken_deferral(
     shared: &crate::runtime::SharedKernel,
     trap_path: &crate::arch::trap_entry::TrapPathWindow,
@@ -421,24 +438,25 @@ fn settle_overtaken_deferral(
     frame: &mut TrapFrame,
     site: &'static str,
 ) -> RiscvTrapEntryOutcome {
-    if !shared.yield_reverify_ready(cpu) {
-        crate::yarm_log!(
-            "RISCV_OVERTAKEN_DEFERRAL_SETTLED site={} cpu={} incoming=none reason=current_installed settlement=return_to_current",
-            site,
-            cpu.0
-        );
-        return RiscvTrapEntryOutcome::ReturnToCurrent;
-    }
-    let acquired =
-        shared.queue_advance_acquire_incoming_split(trap_path.authority(), site, |k, a| {
-            k.yield_dispatch_step_mut(a)
-        });
-    if let crate::runtime::DispatchAcquire::Torn { tid } = acquired {
-        trap_path.retire();
-        dispatch_torn_fatal(cpu, tid, site);
-    }
-    match acquired.token() {
-        Some(token) => {
+    use crate::runtime::OvertakenSettlement as S;
+    let settlement = shared.settle_overtaken_deferral_split(
+        trap_path.authority(),
+        frame.resume_owner(),
+        site,
+        |k, a| k.yield_dispatch_step_mut(a),
+    );
+    match settlement {
+        S::ReturnToInstalled { owner } => {
+            crate::yarm_log!(
+                "RISCV_OVERTAKEN_DEFERRAL_SETTLED site={} cpu={} incoming={} asid={} reason=current_installed settlement=return_to_current",
+                site,
+                cpu.0,
+                owner.tid,
+                owner.asid.0
+            );
+            RiscvTrapEntryOutcome::ReturnToCurrent
+        }
+        S::Switch(token) => {
             let inc = token.tid();
             let Some(asid) = direct_dispatch_resume_incoming(shared, token, frame) else {
                 dispatch_resume_refused_fatal(shared, token, cpu, inc, site);
@@ -452,16 +470,36 @@ fn settle_overtaken_deferral(
             );
             RiscvTrapEntryOutcome::ReturnToIncoming
         }
-        None => {
+        S::Idle { reason } => {
             crate::yarm_log!(
                 "RISCV_OVERTAKEN_DEFERRAL_SETTLED site={} cpu={} incoming=none reason={} settlement=kernel_idle",
                 site,
                 cpu.0,
-                acquired.marker()
+                reason
             );
             RiscvTrapEntryOutcome::EnterKernelIdle {
                 reason: RiscvIdleReason::QueueAdvanceNoIncoming,
             }
+        }
+        S::Torn { tid } => {
+            trap_path.retire();
+            dispatch_torn_fatal(cpu, tid, site);
+        }
+        S::Unauthenticated(refusal) => {
+            crate::yarm_log!(
+                "RISCV_OVERTAKEN_DEFERRAL_UNAUTHENTICATED site={} cpu={} tid={} reason={} action=fatal",
+                site,
+                cpu.0,
+                refusal.tid(),
+                refusal.reason()
+            );
+            trap_path.retire();
+            panic!(
+                "{site}: installed current on cpu={} does not own the frame's continuation ({}) — \
+                 refusing to return through it",
+                cpu.0,
+                refusal.reason()
+            );
         }
     }
 }

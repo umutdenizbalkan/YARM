@@ -1313,7 +1313,11 @@ impl DispatchAcquire {
 /// CPU's `current` are three different states, and only the last may be resumed from this frame —
 /// and only if the frame's continuation IS that incarnation. Each outcome below names the state
 /// that was found and the one settlement it admits.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+))]
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OvertakenSettlement {
@@ -1334,7 +1338,11 @@ pub(crate) enum OvertakenSettlement {
     Torn { tid: u64 },
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+))]
 impl OvertakenSettlement {
     /// A stable slug for markers.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3722,7 +3730,11 @@ impl SharedKernel {
     /// `current` on a CPU is moved only by that CPU, which is running this drain with interrupts
     /// masked, so the observation in (1)/(2) holds until the bridge applies the settlement. No
     /// broad acquisition, no retry, no enqueue and no syscall result is produced here.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn settle_overtaken_deferral_split(
         &self,
