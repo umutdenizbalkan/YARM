@@ -394,7 +394,9 @@ for k in range(1, P2_ATTEMPTS + 1):
             in_target = arr_origin(ar) == 0 and arr_tid(ar) == tgt["tid"] and arr_asid(ar) == tgt["asid"]
             cls = "in_window" if in_target and arr_window(ar) == win else ("outside" if in_target else "displaced")
             switched = any(x["kind"] == "activation" and x["cpu"] == tgt["cpu"] and x["f"][0] != tgt["asid"] for x in recs[c + 1:a])
-            if r["f"][1] != tgt["tid"]:
+            # Readiness is BOTH recorded facts: the bounded wait reported it met, and it saw the
+            # target current. Either alone is not readiness.
+            if not (r["f"][0] >> 16) & 1 or r["f"][1] != tgt["tid"]:
                 reason = "not_ready"
             elif arr_entries(ar) != r["f"][2] + 1:
                 reason = "intervening_entry"
@@ -533,7 +535,7 @@ for rnd in range(1, TLB_ROUNDS + 1):
             return None, "tlb_residency_count_not_monotone"
         if not rep["resident"] and not reactivated(T, rep["disp"], o):
             return None, "off_cpu_target_not_reactivated"
-        if recs[rd]["f"][1] != T["tid"]:
+        if not (recs[rd]["f"][0] >> 16) & 1 or recs[rd]["f"][1] != T["tid"]:
             return "not_ready", None
         if not rep["resident"]:
             return "off_cpu", None

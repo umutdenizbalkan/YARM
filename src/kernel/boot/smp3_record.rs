@@ -821,7 +821,9 @@ pub fn p2_attempt(
     let switched = recs[call_i + 1..arrived]
         .iter()
         .any(|x| x.kind == Kind::Activation && x.cpu == target.cpu && x.f[0] != target.asid);
-    let reason = if r.f[1] != target.tid {
+    // Readiness is BOTH recorded facts: the bounded wait reported it met, and it saw the target
+    // current. Either alone is not readiness.
+    let reason = if !ready_met(&r) || r.f[1] != target.tid {
         "not_ready"
     } else if arr_entries(&a) != r.f[2] + 1 {
         "intervening_entry"
@@ -1015,7 +1017,7 @@ pub fn p3_attempt(
     if !rep.resident && reactivated(recs, t, rep.displaced, observed).is_none() {
         return Err("off_cpu_target_not_reactivated");
     }
-    let reason = if recs[rd].f[1] != t.tid {
+    let reason = if !ready_met(&recs[rd]) || recs[rd].f[1] != t.tid {
         "not_ready"
     } else if !rep.resident {
         "off_cpu"
@@ -1595,6 +1597,22 @@ mod tests {
             WINDOW_S_A,
             1,
         )
+    }
+
+    /// Readiness is both recorded facts. A bounded wait that timed out is not readiness even if its
+    /// last look saw the target current — the attempt is uncredited (`not_ready`), and a failed
+    /// window check is then not an obligation it owed.
+    #[test]
+    fn a_timed_out_readiness_wait_is_not_ready_even_when_it_saw_the_target() {
+        let mut v = p2(9300, (USER, WINDOW_NONE, 41, S_INC));
+        v[1].2[0] &= !(1 << 16);
+        let a = p2a(v).expect("graded, not failed");
+        assert!(!a.eligible);
+        assert_eq!(a.reason, "not_ready");
+        let mut w = p3(9300, repl(0, 9301, 11, 0b01, 0b10, 1), 10, 11);
+        w[3].2[0] &= !(1 << 16);
+        let b = p3a(w).expect("graded");
+        assert_eq!((b.eligible, b.reason), (false, "not_ready"));
     }
 
     #[test]
