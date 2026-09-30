@@ -24515,8 +24515,11 @@ controls were then re-run and the tree re-frozen.
 
 Round 1 ran on `fa7ee42e`; one control PASSED — `all_ineligible` (every `Ready` recorded as timed out,
 its observed `current` untouched) — because both graders read readiness from the observed tid alone.
-That was a candidate defect: readiness now requires both recorded facts (§2), with a unit case. Every
-control was then re-run on `34602065` (tree `3f9e681f…`), the code of the frozen candidate:
+That was a candidate defect: readiness now requires both recorded facts (§2), with a unit case. Round 2
+re-ran every control on `34602065` (tree `3f9e681f…`, the code of freeze 1) and each failed as below.
+After freeze 1's attributed failure (§3b), round 3 re-ran every control, plus one for the helper rule,
+on `7c71cef0` (tree `2c6e8e9e…`), the code of the frozen candidate; each failed with the SAME reason as
+round 2:
 
 | control | mutation | fails with |
 |---|---|---|
@@ -24526,6 +24529,7 @@ control was then re-run on `34602065` (tree `3f9e681f…`), the code of the froz
 | corrupted returned context | one GPR flipped on the exact-token resume of a witness task | `S_FAIL_P1_CONTEXT`, no seal |
 | operations serialized | a global lock around the production NR 3 | `mut_operations_serialized`; 0 of 4 rounds overlapped |
 | every attempt ineligible | `Ready.met` forced to 0 | `p2_too_few_credited_attempts_per_direction`; the grader also reports 0/0 credited fence rounds; 12 P2 attempts retained as uncredited |
+| every helper recorded unparked | `Ready`'s helper bit forced to 0 (the witness still waits for it) | all 12 P2 attempts `helper_not_parked`, retained; `p2_too_few_credited_attempts_per_direction` |
 | substituted generation | each fence completion recorded under `generation ^ 1` | `fence_stale_completion` |
 | substituted identity | each arrival's recorded ASID `^ 1` | `ipi_eligible_arrival_not_in_target` |
 | missing attempt evidence | no `Ready` record pushed | `p2_ready_missing` |
