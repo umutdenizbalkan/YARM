@@ -14794,6 +14794,15 @@ impl SharedKernel {
                 bitmap |= bit;
             }
         }
+        // QEMU-SMP3-SEAL: the witness keeps the snapshot this computation used (observation only),
+        // so the shootdown's record names exactly what production decided from.
+        #[cfg(all(
+            feature = "riscv64-smp3-witness",
+            target_arch = "riscv64",
+            not(test),
+            not(feature = "hosted-dev")
+        ))]
+        crate::arch::riscv64::smp3_witness::note_live_snapshot(asid.0, bitmap, &current);
         bitmap
     }
 
@@ -14871,7 +14880,23 @@ impl SharedKernel {
         unsafe {
             core::arch::asm!("invlpg [{}]", in(reg) virt.0, options(nostack, preserves_flags));
         }
+        // QEMU-SMP3-SEAL (witness only, observation): arm activation history on the witness
+        // target's hart BEFORE the snapshot, then record the snapshot production decided from.
+        #[cfg(all(
+            feature = "riscv64-smp3-witness",
+            target_arch = "riscv64",
+            not(test),
+            not(feature = "hosted-dev")
+        ))]
+        crate::arch::riscv64::smp3_witness::note_shoot_begin(asid.0, virt.0);
         let targets = self.live_cpu_bitmap_for_asid_split(asid) & !(1u64 << requester.0);
+        #[cfg(all(
+            feature = "riscv64-smp3-witness",
+            target_arch = "riscv64",
+            not(test),
+            not(feature = "hosted-dev")
+        ))]
+        crate::arch::riscv64::smp3_witness::note_shoot_targets(requester, asid.0, virt.0, targets);
         if targets == 0 {
             // Zero remote observers: the local invalidation above — and, on AArch64, the
             // broadcast the unmap already completed — is the whole shootdown. Correct, and not a

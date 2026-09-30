@@ -27,7 +27,7 @@
 //! publication nothing consumes, or more arrivals than firmware requests, all fail.
 
 /// Record capacity. Bounded: a witness that overflows it fails rather than truncating quietly.
-pub const SLOTS: usize = 1024;
+pub const SLOTS: usize = 2048;
 
 /// What a record says happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,8 +41,9 @@ pub enum Kind {
     /// `SBI_SUCCESS`, else the error code as `u64`.
     IpiRequested = 2,
     /// `cpu` consumed a supervisor software interrupt: `f[0]` the source CPUs it consumed (0 = an
-    /// empty arrival), `f[1]` origin | window << 8, `f[2]` `sepc`, `f[3]` the task current when it
-    /// was taken (0 = none), `f[4]` the interrupted `sstatus`.
+    /// empty arrival), `f[1]` origin | window << 8 | entries << 16 (the hart's supervisor-entry
+    /// count, this entry included), `f[2]` `sepc`, `f[3]` the task current when it was taken (0 =
+    /// none) | the address space `satp` named then << 32, `f[4]` the interrupted `sstatus`.
     IpiArrived = 3,
     /// `cpu`'s idle advance resumed task `f[0]`; `f[1]` = 1 when the IPI drove it, 0 the timer.
     IdleDispatch = 4,
@@ -74,6 +75,19 @@ pub enum Kind {
     /// Contended spin-lock acquisitions so far, all CPUs: `f[0]` the count, `f[1]` 0 at a watched
     /// operation's entry, 1 at its exit, `f[2]` that operation's generation.
     Contention = 15,
+    /// QEMU-SMP3-SEAL — a waker (P2) or requester (P3) established readiness before its production
+    /// operation: `f[0]` target CPU | phase << 8 | met << 16 (1 = the bounded wait saw the target
+    /// current and not idle), `f[1]` the target CPU's current tid then (0 = none), `f[2]` the
+    /// target hart's supervisor-entry count then, `f[3]` the attempt's round, `f[4]` its
+    /// generation.
+    Ready = 16,
+    /// The shootdown owner's own target computation for the witness page, before any remote
+    /// request: `f[0]` asid, `f[1]` va, `f[2]` the remote target CPU mask it computed, `f[3]` /
+    /// `f[4]` CPU 0's / CPU 1's current tid in that same snapshot (0 = none).
+    ShootTargets = 17,
+    /// `cpu` is about to write `satp` (whose write issues `sfence.vma x0, x0`) while activation
+    /// history is armed on it: `f[0]` the asid that `satp` names, `f[1]` the `satp` value.
+    Activation = 18,
 }
 
 impl Kind {
@@ -94,6 +108,9 @@ impl Kind {
             13 => Kind::VmOpEnd,
             14 => Kind::ParkReleased,
             15 => Kind::Contention,
+            16 => Kind::Ready,
+            17 => Kind::ShootTargets,
+            18 => Kind::Activation,
             _ => return None,
         })
     }
@@ -115,6 +132,9 @@ impl Kind {
             Kind::VmOpEnd => "vm_op_end",
             Kind::ParkReleased => "park_released",
             Kind::Contention => "contention",
+            Kind::Ready => "ready",
+            Kind::ShootTargets => "shoot_targets",
+            Kind::Activation => "activation",
         }
     }
 }
@@ -134,6 +154,37 @@ pub const WINDOW_S_A: u64 = 1;
 pub const WINDOW_C_B: u64 = 2;
 pub const WINDOW_S_TLB: u64 = 3;
 pub const WINDOW_C_TLB: u64 = 4;
+
+/// Readiness phases (`Ready.f[0]` bits 15:8).
+pub const PHASE_P2: u64 = 2;
+pub const PHASE_P3: u64 = 3;
+
+/// `IpiArrived` decoding: origin, window, the hart's entry count, the interrupted tid and asid.
+pub fn arr_origin(r: &Rec) -> u64 {
+    r.f[1] & 0xff
+}
+pub fn arr_window(r: &Rec) -> u64 {
+    (r.f[1] >> 8) & 0xff
+}
+pub fn arr_entries(r: &Rec) -> u64 {
+    r.f[1] >> 16
+}
+pub fn arr_tid(r: &Rec) -> u64 {
+    r.f[3] & 0xffff_ffff
+}
+pub fn arr_asid(r: &Rec) -> u64 {
+    r.f[3] >> 32
+}
+/// `Ready` decoding.
+pub fn ready_target_cpu(r: &Rec) -> u64 {
+    r.f[0] & 0xff
+}
+pub fn ready_phase(r: &Rec) -> u64 {
+    (r.f[0] >> 8) & 0xff
+}
+pub fn ready_met(r: &Rec) -> bool {
+    (r.f[0] >> 16) & 1 == 1
+}
 
 /// `sstatus.FS` (bits 14:13) and `sstatus.VS` (bits 10:9).
 pub const SSTATUS_FS_VS: u64 = (0b11 << 13) | (0b11 << 9);
@@ -163,6 +214,7 @@ pub const STEPS: &[(&str, u64)] = &[
     ("S_MUT_NR3", 11),
     ("S_MUT_OK", 12),
     ("S_DONE", 13),
+    ("S_P2B_SENT", 14),
     ("C_ENTERED", 21),
     ("C_P1_CALL", 22),
     ("C_P1_RESUMED", 23),
@@ -176,6 +228,7 @@ pub const STEPS: &[(&str, u64)] = &[
     ("C_MUT_NR3", 31),
     ("C_MUT_OK", 32),
     ("C_DONE", 33),
+    ("C_P2A_SENT", 34),
     ("H_ENTERED", 41),
     ("H_SERVED", 42),
 ];
@@ -215,10 +268,14 @@ fn code(name: &str) -> u64 {
 /// Parked-target rounds per direction, and the IPI-driven dispatches CPU 0 must show of them.
 pub const P1_ROUNDS: u64 = 8;
 pub const P1_MIN_IPI_TO_C: usize = 2;
-pub const P2_ROUNDS: u64 = 4;
-/// Serial remote-invalidation rounds (odd: S is the target; even: C is), and how many of each
-/// direction must be CREDITED — the target hart took no supervisor entry inside its window.
-pub const TLB_ROUNDS: u64 = 8;
+/// QEMU-SMP3-SEAL — the fixed attempt budgets, chosen before qualification. P2: attempts per
+/// direction at an IPI taken in a resident user target, and the credited attempts each direction
+/// needs (unchanged from SMP3's one). P3: serial remote-invalidation attempts (odd: S is the
+/// target; even: C is), and the credited attempts each direction needs (unchanged from SMP3's
+/// two) — credited meaning the target was resident over the whole interval.
+pub const P2_ATTEMPTS: u64 = 6;
+pub const P2_MIN_CREDITED_PER_DIRECTION: usize = 1;
+pub const TLB_ROUNDS: u64 = 24;
 pub const TLB_MIN_CREDITED_PER_DIRECTION: usize = 2;
 /// Mutual rounds; every one must show its two production operations in flight together.
 pub const MUT_ROUNDS: u64 = 4;
@@ -429,8 +486,15 @@ pub struct Verdict {
     pub p1_timer_first: usize,
     pub p1_busy: usize,
     pub p1_preceded: usize,
-    pub p2_user: usize,
-    /// P2 attempts whose arrival found the target displaced (not credited).
+    /// P2 attempts, and how each was graded: credited per target, uncredited (prerequisites not
+    /// established), and where every arrival landed (inside the window, outside it in the target,
+    /// or displaced).
+    pub p2_attempts: usize,
+    pub p2_credited_s: usize,
+    pub p2_credited_c: usize,
+    pub p2_uncredited: usize,
+    pub p2_in_window: usize,
+    pub p2_outside: usize,
     pub p2_displaced: usize,
     /// Serial rounds whose whole chain verified.
     pub tlb_rounds: usize,
@@ -439,11 +503,20 @@ pub struct Verdict {
     pub tlb_credited_c: usize,
     /// ... of which the target took other entries in its window (not credited).
     pub tlb_interfered: usize,
+    /// ... of which the shootdown found the target off its hart (activation-evidenced).
+    pub tlb_off_cpu: usize,
+    /// ... of which the readiness record did not see the target current.
+    pub tlb_not_ready: usize,
     pub mutual_rounds: usize,
     pub mutual_overlapped: usize,
     /// Contended spin-lock acquisitions inside the mutual rounds' operation windows.
     pub mutual_contended: u64,
     pub settled_after_completion: usize,
+    /// Settlements whose target computation named no remote CPU (the requester's local fence and
+    /// every other hart's next activation are the whole shootdown).
+    pub settled_local_only: usize,
+    /// Mutual operations whose shootdown found the target off its hart.
+    pub mutual_off_cpu: usize,
     pub user_fp_vs_off: usize,
     pub failure: Option<&'static str>,
     pub failure_at: u32,
@@ -509,14 +582,14 @@ fn wake_chain(
     })
     .ok_or("ipi_not_consumed")?;
     let a = recs[arrived];
-    if origin != u64::MAX && a.f[1] & 0xff != origin {
+    if origin != u64::MAX && arr_origin(&a) != origin {
         return Err(if origin == ORIGIN_IDLE {
             "ipi_target_not_parked"
         } else {
             "ipi_target_not_in_user"
         });
     }
-    if window != WINDOW_NONE && (a.f[1] >> 8) != window {
+    if window != WINDOW_NONE && arr_window(&a) != window {
         return Err("ipi_sepc_outside_window");
     }
     Ok(arrived)
@@ -553,7 +626,7 @@ pub fn parked_wake(
 ) -> Result<(usize, ParkedRoute), &'static str> {
     let arrived = wake_chain(recs, after, from, to_cpu, u64::MAX, WINDOW_NONE)?;
     let a = recs[arrived];
-    if a.f[1] & 0xff == ORIGIN_IDLE {
+    if arr_origin(&a) == ORIGIN_IDLE {
         let d = find_from(recs, arrived + 1, |r| {
             r.cpu == to_cpu && (r.kind == Kind::IdleDispatch || r.kind == Kind::IpiArrived)
         })
@@ -576,54 +649,231 @@ pub fn parked_wake(
         })
         .map(|i| after + i);
     match timer {
-        Some(d) if a.f[3] == woken.tid => Ok((d, ParkedRoute::TimerFirst)),
+        Some(d) if arr_tid(&a) == woken.tid => Ok((d, ParkedRoute::TimerFirst)),
         Some(_) => Err("ipi_arrived_in_another_task"),
         None => Ok((after, ParkedRoute::Busy)),
     }
 }
 
-/// Where a wake aimed at a RESIDENT user-mode target actually landed.
+/// The readiness record a waker (P2) or requester (P3) left for attempt `round` against the hart
+/// `target_cpu`, at or after `from`.
+fn ready(
+    recs: &[Rec],
+    from: usize,
+    waker_cpu: u8,
+    target_cpu: u8,
+    phase: u64,
+    round: u64,
+) -> Option<usize> {
+    find_from(recs, from, |r| {
+        r.kind == Kind::Ready
+            && r.cpu == waker_cpu
+            && ready_target_cpu(r) == u64::from(target_cpu)
+            && ready_phase(r) == phase
+            && r.f[3] == round
+    })
+}
+
+/// Where an arrival aimed at a user-mode target landed, as its own record shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResidentRoute {
-    /// Taken from U-mode in the target, with `sepc` inside its register-checked window.
+pub enum ArrivalClass {
+    /// Taken from U-mode in the target's exact incarnation (tid and address space), with `sepc`
+    /// inside its register-checked window.
     InWindow,
-    /// The target was not resident when the IPI arrived: another task was (CPU 0's tick may
-    /// switch in the supervisor), or the hart was at its idle boundary with the displaced target
-    /// queued. Counted apart; the target's own window check is still required afterwards.
+    /// Taken from U-mode in the target, outside the window. Earns no user-context coverage.
+    Outside,
+    /// Taken in another task, or at the hart's idle boundary.
     Displaced,
 }
 
-/// A wake by `from` of the hart `target` is expected to be resident on, after step `after`,
-/// classified. An arrival IN the target from U-mode must be inside `window`. Pure.
-pub fn resident_wake(
-    recs: &[Rec],
-    after: usize,
-    from: Role,
-    target: Role,
-    window: u64,
-) -> Result<(usize, ResidentRoute), &'static str> {
-    let arrived = wake_chain(recs, after, from, target.cpu, u64::MAX, WINDOW_NONE)?;
-    let a = recs[arrived];
-    if a.f[1] & 0xff == ORIGIN_USER && a.f[3] == target.tid {
-        if (a.f[1] >> 8) != window {
-            return Err("ipi_sepc_outside_window");
+/// One graded attempt of a phase whose population may legitimately include uncredited attempts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attempt {
+    /// 2 = IPI to a resident user target, 3 = serial remote fence, 4 = mutual replacement.
+    pub phase: u8,
+    /// The attempt (round) number within its phase.
+    pub n: u8,
+    /// The CPU of the task the attempt targets.
+    pub target_cpu: u8,
+    /// P2: the readiness generation; P3/P4: the production operation's generation.
+    pub generation: u64,
+    /// Whether the witness's prerequisites were established (derived only from independently
+    /// recorded identity, placement, entry and activation history — never from a missing fence or
+    /// a failed check).
+    pub eligible: bool,
+    /// Why not (`none` when eligible), or the failure's reason.
+    pub reason: &'static str,
+    pub outcome: Outcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Eligible, and every obligation held: counts toward coverage.
+    Credited,
+    /// Every obligation held, but the prerequisites were not established: no coverage.
+    Uncredited,
+    /// A mutual round's operation, every obligation held (mutual rounds are not attempts at
+    /// coverage: all of them must verify and overlap).
+    Verified,
+    /// An obligation failed. Never retried into success.
+    Failed,
+}
+
+impl Outcome {
+    pub fn name(self) -> &'static str {
+        match self {
+            Outcome::Credited => "credited",
+            Outcome::Uncredited => "uncredited",
+            Outcome::Verified => "verified",
+            Outcome::Failed => "failed",
         }
-        return Ok((arrived, ResidentRoute::InWindow));
     }
-    Ok((arrived, ResidentRoute::Displaced))
+}
+
+/// Every attempt of one verification, in phase order.
+pub const MAX_ATTEMPTS: usize = 64;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Attempts {
+    pub items: [Option<Attempt>; MAX_ATTEMPTS],
+    pub len: usize,
+}
+
+impl Default for Attempts {
+    fn default() -> Self {
+        Attempts {
+            items: [None; MAX_ATTEMPTS],
+            len: 0,
+        }
+    }
+}
+
+impl Attempts {
+    fn push(&mut self, a: Attempt) {
+        if let Some(slot) = self.items.get_mut(self.len) {
+            *slot = Some(a);
+            self.len += 1;
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &Attempt> {
+        self.items.iter().take(self.len).flatten()
+    }
+}
+
+/// What one P2 attempt showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct P2Attempt {
+    /// The target's window-check step (the next attempt searches from here).
+    pub end: usize,
+    pub generation: u64,
+    pub eligible: bool,
+    pub reason: &'static str,
+    pub class: ArrivalClass,
+}
+
+/// One P2 attempt: `waker` wakes a helper on `target`'s hart while `target` spins in its checked
+/// window. Pure.
+///
+/// Obligations (a failure, never ineligibility): the waker's call step, its readiness record, the
+/// publication and the arrival that consumed it, the waker's post-send step, and the target's own
+/// passing window check on its hart after the arrival.
+///
+/// Eligibility, from independently recorded evidence only: the readiness record saw `target`
+/// current on its hart; the arrival was that hart's very next supervisor entry after readiness
+/// (entry history); and no other address space was activated on that hart between the call step
+/// and the arrival (activation history). An eligible attempt's arrival MUST be in the target's
+/// exact incarnation inside its window — anything else fails. An ineligible attempt is counted by
+/// where its arrival landed and earns no coverage.
+#[allow(clippy::too_many_arguments)]
+pub fn p2_attempt(
+    recs: &[Rec],
+    from: usize,
+    waker: Role,
+    target: Role,
+    call: &str,
+    sent: &str,
+    ok: &str,
+    window: u64,
+    k: u64,
+) -> Result<P2Attempt, &'static str> {
+    let call_i = user(recs, from, waker, call, Some(k)).ok_or("p2_call_missing")?;
+    let rd = ready(recs, call_i, waker.cpu, target.cpu, PHASE_P2, k).ok_or("p2_ready_missing")?;
+    let arrived = wake_chain(recs, rd, waker, target.cpu, u64::MAX, WINDOW_NONE)?;
+    user(recs, rd, waker, sent, Some(k)).ok_or("p2_sent_missing")?;
+    let ok_i = user(recs, arrived, target, ok, Some(k)).ok_or("p2_window_check_missing")?;
+    if recs[ok_i].cpu != target.cpu {
+        return Err("p2_window_checked_elsewhere");
+    }
+    let a = recs[arrived];
+    let r = recs[rd];
+    if arr_entries(&a) <= r.f[2] {
+        return Err("p2_entry_history_inconsistent");
+    }
+    let in_target =
+        arr_origin(&a) == ORIGIN_USER && arr_tid(&a) == target.tid && arr_asid(&a) == target.asid;
+    let class = if in_target && arr_window(&a) == window {
+        ArrivalClass::InWindow
+    } else if in_target {
+        ArrivalClass::Outside
+    } else {
+        ArrivalClass::Displaced
+    };
+    let switched = recs[call_i + 1..arrived]
+        .iter()
+        .any(|x| x.kind == Kind::Activation && x.cpu == target.cpu && x.f[0] != target.asid);
+    let reason = if r.f[1] != target.tid {
+        "not_ready"
+    } else if arr_entries(&a) != r.f[2] + 1 {
+        "intervening_entry"
+    } else if switched {
+        "switched"
+    } else {
+        "none"
+    };
+    let eligible = reason == "none";
+    if eligible && class != ArrivalClass::InWindow {
+        return Err(if in_target {
+            "ipi_sepc_outside_window"
+        } else {
+            "ipi_eligible_arrival_not_in_target"
+        });
+    }
+    Ok(P2Attempt {
+        end: ok_i,
+        generation: r.f[4],
+        eligible,
+        reason,
+        class,
+    })
+}
+
+/// One production replacement of `target`'s W by `req`, as its owners recorded it. Pure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Replacement {
+    pub begin: usize,
+    pub end: usize,
+    pub displaced: usize,
+    /// The shootdown's own target computation.
+    pub shoot: usize,
+    /// The completed firmware fence, when the target was resident at the computation.
+    pub fence_done: Option<usize>,
+    /// Whether the computation saw `target` current on its hart (and so had to fence it).
+    pub resident: bool,
 }
 
 /// One production replacement of `target`'s W by `req`, verified end to end, starting its search
-/// at `from`: the operation's own begin .. completion, and inside it the displacement, the fence
-/// request naming the target's hart, that request's successful completion, the acknowledged
-/// shootdown and the settlement — in that order. Returns `(begin, end, fence_done)`. Pure.
+/// at `from`: the operation's begin .. completion (`Ok`, W), and inside it, in this order, the
+/// displacement, the shootdown's target computation, the fence request naming the target's HART
+/// and its successful completion — required exactly when that computation saw the target current,
+/// which it must have recorded consistently — the acknowledged shootdown and the settlement. An
+/// off-CPU target needs no fence here; the caller requires its activation evidence. Pure.
 pub fn replacement(
     recs: &[Rec],
     roles: &Roles,
     from: usize,
     req: Role,
     target: Role,
-) -> Result<(usize, usize, usize), &'static str> {
+) -> Result<Replacement, &'static str> {
     let begin = find_from(recs, from, |x| {
         x.kind == Kind::VmOpBegin
             && x.cpu == req.cpu
@@ -650,29 +900,135 @@ pub fn replacement(
     };
     let disp =
         inside(Kind::VmDisplaced, begin, &|_| true).ok_or("displacement_outside_operation")?;
-    let hart_bit = 1u64.checked_shl(target.hart as u32).unwrap_or(0);
-    let cpu_bit = 1u64 << (target.cpu & 63);
-    let fence = inside(Kind::FenceRequest, disp, &|x| {
-        x.f[2] & hart_bit != 0 && x.f[4] & cpu_bit != 0
-    })
-    .ok_or("fence_not_requested_for_the_resident_target")?;
-    let done = match match_fence(recs, fence) {
-        Ok(d) => d,
-        Err(FenceRefusal::Failed) => return Err("fence_failed"),
-        Err(FenceRefusal::StaleGeneration) => return Err("fence_stale_completion"),
-        Err(FenceRefusal::Duplicate) => return Err("fence_duplicate_completion"),
-        Err(FenceRefusal::Missing) => return Err("fence_completion_missing"),
-    };
-    if done > end {
-        return Err("fence_completion_outside_operation");
+    let shoot = inside(Kind::ShootTargets, disp, &|_| true).ok_or("shoot_targets_missing")?;
+    let s = recs[shoot];
+    let mask = s.f[2];
+    if mask & (1u64 << (req.cpu & 63)) != 0 {
+        return Err("shoot_targets_named_requester");
     }
-    let sd = inside(Kind::VmShootdown, done, &|_| true).ok_or("shootdown_outside_operation")?;
+    let current = match target.cpu {
+        0 => s.f[3],
+        1 => s.f[4],
+        _ => return Err("shoot_targets_cpu_unrecorded"),
+    };
+    let resident = current == target.tid;
+    if ((mask >> (target.cpu & 63)) & 1 == 1) != resident {
+        return Err("shoot_targets_inconsistent");
+    }
+    let fence_done = if resident {
+        let hart_bit = 1u64.checked_shl(target.hart as u32).unwrap_or(0);
+        let cpu_bit = 1u64 << (target.cpu & 63);
+        let fence = inside(Kind::FenceRequest, shoot, &|x| {
+            x.f[2] & hart_bit != 0 && x.f[4] & cpu_bit != 0
+        })
+        .ok_or("fence_not_requested_for_the_resident_target")?;
+        if recs[fence].f[2] & 1u64.checked_shl(req.hart as u32).unwrap_or(0) != 0 {
+            return Err("requester_fenced_itself");
+        }
+        let done = match match_fence(recs, fence) {
+            Ok(d) => d,
+            Err(FenceRefusal::Failed) => return Err("fence_failed"),
+            Err(FenceRefusal::StaleGeneration) => return Err("fence_stale_completion"),
+            Err(FenceRefusal::Duplicate) => return Err("fence_duplicate_completion"),
+            Err(FenceRefusal::Missing) => return Err("fence_completion_missing"),
+        };
+        if done > end {
+            return Err("fence_completion_outside_operation");
+        }
+        Some(done)
+    } else {
+        None
+    };
+    let sd = inside(Kind::VmShootdown, fence_done.unwrap_or(shoot), &|_| true)
+        .ok_or("shootdown_outside_operation")?;
     if recs[sd].f[2] != 1 {
         return Err("shootdown_not_acknowledged");
     }
     let old = recs[disp].f[2];
     inside(Kind::VmSettled, sd, &|x| x.f[2] == old).ok_or("settlement_outside_operation")?;
-    Ok((begin, end, done))
+    Ok(Replacement {
+        begin,
+        end,
+        displaced: disp,
+        shoot,
+        fence_done,
+        resident,
+    })
+}
+
+/// The activation contract, for a target the shootdown found off its hart: that hart activated
+/// the target's address space (a `satp` write, whose `sfence.vma` retires every stale
+/// translation) after the displacement and before `before` — the target's observation.
+pub fn reactivated(recs: &[Rec], target: Role, displaced: usize, before: usize) -> Option<usize> {
+    find_from(recs, displaced + 1, |x| {
+        x.kind == Kind::Activation && x.cpu == target.cpu && x.f[0] == target.asid
+    })
+    .filter(|&i| i < before)
+}
+
+/// What one serial remote-fence attempt showed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct P3Attempt {
+    pub generation: u64,
+    pub eligible: bool,
+    pub reason: &'static str,
+}
+
+/// Serial attempt `r`: `q` replaces `t`'s W while `t`, primed after its last kernel entry, spins
+/// in its window on its own hart. Pure.
+///
+/// Obligations (a failure, never ineligibility): the PRE / REQ / readiness / observation steps on
+/// their harts in order; the whole production replacement (`replacement`); the observation after
+/// the operation (and the fence) completed; monotone residency counts; and, for a target the
+/// shootdown found off its hart, the activation evidence (`reactivated`).
+///
+/// Eligibility — the target's residency over the whole interval — from independent evidence only:
+/// the readiness record saw `t` current on its hart; the shootdown's own computation saw `t`
+/// current; and `t`'s hart took no supervisor entry between PRE and OBSERVED (its next entry after
+/// priming W is the observation's own), so nothing but the requested firmware fence can have
+/// retired its translation. Eligible attempts are credited.
+pub fn p3_attempt(
+    recs: &[Rec],
+    roles: &Roles,
+    r: u64,
+    t: Role,
+    q: Role,
+    names: (&str, &str, &str),
+) -> Result<P3Attempt, &'static str> {
+    let (pre_name, req_name, obs_name) = names;
+    let pre = user(recs, 0, t, pre_name, Some(r)).ok_or("tlb_pre_missing")?;
+    let req = user(recs, pre, q, req_name, Some(r)).ok_or("tlb_request_step_missing")?;
+    let rd = ready(recs, req, q.cpu, t.cpu, PHASE_P3, r).ok_or("tlb_ready_missing")?;
+    let rep = replacement(recs, roles, rd, q, t)?;
+    let observed = user(recs, pre, t, obs_name, Some(r)).ok_or("tlb_observation_missing")?;
+    if observed < rep.end || rep.fence_done.is_some_and(|d| observed < d) {
+        return Err("tlb_observed_before_completion");
+    }
+    if recs[observed].cpu != t.cpu || recs[pre].cpu != t.cpu || recs[req].cpu != q.cpu {
+        return Err("tlb_roles_off_their_harts");
+    }
+    let (_, c0) = residency(recs, t, pre_name, r).ok_or("tlb_residency_missing")?;
+    let (_, c1) = residency(recs, t, obs_name, r).ok_or("tlb_residency_missing")?;
+    if c1 <= c0 {
+        return Err("tlb_residency_count_not_monotone");
+    }
+    if !rep.resident && reactivated(recs, t, rep.displaced, observed).is_none() {
+        return Err("off_cpu_target_not_reactivated");
+    }
+    let reason = if recs[rd].f[1] != t.tid {
+        "not_ready"
+    } else if !rep.resident {
+        "off_cpu"
+    } else if c1 != c0 + 1 {
+        "interfered"
+    } else {
+        "none"
+    };
+    Ok(P3Attempt {
+        generation: recs[rep.begin].f[3],
+        eligible: reason == "none",
+        reason,
+    })
 }
 
 /// What one fully verified mutual round showed.
@@ -682,21 +1038,33 @@ pub struct MutualRound {
     pub overlapped: bool,
     /// Contended spin-lock acquisitions from the first entry to the last exit.
     pub contended: u64,
+    /// The two operations: S's (target C), then C's (target S).
+    pub s_op: Replacement,
+    pub c_op: Replacement,
 }
 
 /// Mutual round `m`: S's NR 3 on S's hart replaces C's W while C's NR 3 on C's hart replaces S's.
+/// Each operation obeys `replacement`; a target its shootdown found off-CPU must show the
+/// activation evidence before its own observation step.
 pub fn mutual_round(recs: &[Rec], roles: &Roles, m: u64) -> Result<MutualRound, &'static str> {
     let (s, c) = (roles.s, roles.c);
     let sn = user(recs, 0, s, "S_MUT_NR3", Some(m)).ok_or("mut_request_missing")?;
     let cn = user(recs, 0, c, "C_MUT_NR3", Some(m)).ok_or("mut_request_missing")?;
-    let (sb, se, _) = replacement(recs, roles, sn, s, c).map_err(|_| "mut_s_operation_invalid")?;
-    let (cb, ce, _) = replacement(recs, roles, cn, c, s).map_err(|_| "mut_c_operation_invalid")?;
+    let s_op = replacement(recs, roles, sn, s, c).map_err(|_| "mut_s_operation_invalid")?;
+    let c_op = replacement(recs, roles, cn, c, s).map_err(|_| "mut_c_operation_invalid")?;
     let so = user(recs, 0, s, "S_MUT_OK", Some(m)).ok_or("mut_observation_missing")?;
     let co = user(recs, 0, c, "C_MUT_OK", Some(m)).ok_or("mut_observation_missing")?;
-    if so < ce || co < se {
+    if so < c_op.end || co < s_op.end {
         return Err("mut_observed_before_operation_completed");
     }
-    let (first, last) = (sb.min(cb), se.max(ce));
+    // S's operation targets C: C's observation bounds C's reactivation, and vice versa.
+    if !s_op.resident && reactivated(recs, c, s_op.displaced, co).is_none() {
+        return Err("off_cpu_target_not_reactivated");
+    }
+    if !c_op.resident && reactivated(recs, s, c_op.displaced, so).is_none() {
+        return Err("off_cpu_target_not_reactivated");
+    }
+    let (first, last) = (s_op.begin.min(c_op.begin), s_op.end.max(c_op.end));
     let count_at = |i: usize, phase: u64| {
         find_from(recs, i, |x| x.kind == Kind::Contention && x.f[1] == phase).map(|j| recs[j].f[0])
     };
@@ -705,17 +1073,25 @@ pub fn mutual_round(recs: &[Rec], roles: &Roles, m: u64) -> Result<MutualRound, 
         _ => 0,
     };
     Ok(MutualRound {
-        overlapped: ops_overlap((sb, se), (cb, ce)),
+        overlapped: ops_overlap((s_op.begin, s_op.end), (c_op.begin, c_op.end)),
         contended,
+        s_op,
+        c_op,
     })
 }
 
 /// Grade a sealed record. Pure; the kernel runs it at the dump and the grader re-derives it.
 pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
+    verify_attempts(recs, roles, overflowed).0
+}
+
+/// `verify`, with every attempt it graded.
+pub fn verify_attempts(recs: &[Rec], roles: &Roles, overflowed: bool) -> (Verdict, Attempts) {
     let mut v = Verdict {
         records: recs.len(),
         ..Verdict::default()
     };
+    let mut att = Attempts::default();
     if overflowed {
         v.fail("record_overflow", 0);
     }
@@ -743,7 +1119,7 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
     }
     // The soft-float contract, as the interrupted user frames show it: FP and vector Off.
     for r in recs {
-        if r.kind == Kind::IpiArrived && r.f[1] & 0xff == ORIGIN_USER {
+        if r.kind == Kind::IpiArrived && arr_origin(r) == ORIGIN_USER {
             if r.f[4] & SSTATUS_FS_VS != 0 {
                 v.fail("fp_or_vector_on_in_user", r.seq);
             } else {
@@ -795,96 +1171,112 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
         v.fail("p1_too_few_ipi_driven_parked_dispatches", 0);
     }
 
-    // P2 — user-mode targets inside the checked windows, P2_ROUNDS attempts per direction. Every
-    // attempt's window check must pass; an arrival that found another task resident is counted
-    // apart; each direction needs at least one arrival in the resident target's window.
-    let mut resident = [0usize; 2];
-    for k in 1..=P2_ROUNDS {
-        for (dir, (waker, call_name, target, ok_name, window)) in [
-            (c, "C_P2A_CALL", s, "S_WIN_A_OK", WINDOW_S_A),
-            (s, "S_P2B_CALL", c, "C_WIN_B_OK", WINDOW_C_B),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let attempt = (|| -> Result<(usize, ResidentRoute), &'static str> {
-                let call = user(recs, at, waker, call_name, Some(k)).ok_or("p2_call_missing")?;
-                let (arr, route) = resident_wake(recs, call, waker, target, window)?;
-                let ok =
-                    user(recs, arr, target, ok_name, Some(k)).ok_or("p2_window_check_missing")?;
-                if recs[ok].cpu != target.cpu {
-                    return Err("p2_window_checked_elsewhere");
-                }
-                Ok((ok, route))
-            })();
-            match attempt {
-                Ok((end, route)) => {
-                    match route {
-                        ResidentRoute::InWindow => {
-                            v.p2_user += 1;
-                            resident[dir] += 1;
+    // P2 — P2_ATTEMPTS bounded attempts per direction; each is graded for its obligations, then
+    // classified eligible or not from independent evidence (`p2_attempt`). Every direction needs
+    // P2_MIN_CREDITED_PER_DIRECTION credited attempts.
+    for k in 1..=P2_ATTEMPTS {
+        for (waker, call, sent, target, ok, window) in [
+            (c, "C_P2A_CALL", "C_P2A_SENT", s, "S_WIN_A_OK", WINDOW_S_A),
+            (s, "S_P2B_CALL", "S_P2B_SENT", c, "C_WIN_B_OK", WINDOW_C_B),
+        ] {
+            v.p2_attempts += 1;
+            match p2_attempt(recs, at, waker, target, call, sent, ok, window, k) {
+                Ok(a) => {
+                    match a.class {
+                        ArrivalClass::InWindow => v.p2_in_window += 1,
+                        ArrivalClass::Outside => v.p2_outside += 1,
+                        ArrivalClass::Displaced => v.p2_displaced += 1,
+                    }
+                    if a.eligible {
+                        if target.tid == s.tid {
+                            v.p2_credited_s += 1;
+                        } else {
+                            v.p2_credited_c += 1;
                         }
-                        ResidentRoute::Displaced => v.p2_displaced += 1,
+                    } else {
+                        v.p2_uncredited += 1;
                     }
-                    if dir == 1 {
-                        at = end;
+                    att.push(Attempt {
+                        phase: 2,
+                        n: k as u8,
+                        target_cpu: target.cpu,
+                        generation: a.generation,
+                        eligible: a.eligible,
+                        reason: a.reason,
+                        outcome: if a.eligible {
+                            Outcome::Credited
+                        } else {
+                            Outcome::Uncredited
+                        },
+                    });
+                    if target.tid == c.tid {
+                        at = a.end;
                     }
                 }
-                Err(why) => v.fail(why, k as u32),
+                Err(why) => {
+                    att.push(Attempt {
+                        phase: 2,
+                        n: k as u8,
+                        target_cpu: target.cpu,
+                        generation: 0,
+                        eligible: false,
+                        reason: why,
+                        outcome: Outcome::Failed,
+                    });
+                    v.fail(why, k as u32);
+                }
             }
         }
     }
-    if resident[0] == 0 || resident[1] == 0 {
-        v.fail("p2_no_arrival_in_a_resident_window", 0);
+    if v.p2_credited_s < P2_MIN_CREDITED_PER_DIRECTION
+        || v.p2_credited_c < P2_MIN_CREDITED_PER_DIRECTION
+    {
+        v.fail("p2_too_few_credited_attempts_per_direction", 0);
     }
 
-    // P3 — serial remote-invalidation rounds.
+    // P3 — TLB_ROUNDS bounded serial attempts (odd: S is the target; even: C is).
     for r in 1..=TLB_ROUNDS {
-        let (t, q, tp, tq) = if r % 2 == 1 {
-            (s, c, "S", "C")
+        let (t, q, names) = if r % 2 == 1 {
+            (s, c, ("S_PRE", "C_REQ", "S_OBSERVED"))
         } else {
-            (c, s, "C", "S")
+            (c, s, ("C_PRE", "S_REQ", "C_OBSERVED"))
         };
-        let pre_name = if tp == "S" { "S_PRE" } else { "C_PRE" };
-        let obs_name = if tp == "S" {
-            "S_OBSERVED"
-        } else {
-            "C_OBSERVED"
-        };
-        let req_name = if tq == "S" { "S_REQ" } else { "C_REQ" };
-        let round = (|| -> Result<bool, &'static str> {
-            let pre = user(recs, 0, t, pre_name, Some(r)).ok_or("tlb_pre_missing")?;
-            let req = user(recs, pre, q, req_name, Some(r)).ok_or("tlb_request_step_missing")?;
-            let (_, end, done) = replacement(recs, roles, req, q, t)?;
-            let observed =
-                user(recs, pre, t, obs_name, Some(r)).ok_or("tlb_observation_missing")?;
-            if observed < end || observed < done {
-                return Err("tlb_observed_before_completion");
-            }
-            let p = recs[pre];
-            if recs[observed].cpu != p.cpu || p.cpu != t.cpu || recs[req].cpu != q.cpu {
-                return Err("tlb_target_not_resident_remote");
-            }
-            // Residency: the target hart's supervisor entries between its PRE and OBSERVED steps.
-            let (_, c0) = residency(recs, t, pre_name, r).ok_or("tlb_residency_missing")?;
-            let (_, c1) = residency(recs, t, obs_name, r).ok_or("tlb_residency_missing")?;
-            if c1 <= c0 {
-                return Err("tlb_residency_count_not_monotone");
-            }
-            Ok(c1 == c0 + 1)
-        })();
-        match round {
-            Ok(credited) => {
+        match p3_attempt(recs, roles, r, t, q, names) {
+            Ok(a) => {
                 v.tlb_rounds += 1;
-                if !credited {
-                    v.tlb_interfered += 1;
-                } else if t.tid == s.tid {
-                    v.tlb_credited_s += 1;
-                } else {
-                    v.tlb_credited_c += 1;
+                match a.reason {
+                    "none" if t.tid == s.tid => v.tlb_credited_s += 1,
+                    "none" => v.tlb_credited_c += 1,
+                    "interfered" => v.tlb_interfered += 1,
+                    "off_cpu" => v.tlb_off_cpu += 1,
+                    _ => v.tlb_not_ready += 1,
                 }
+                att.push(Attempt {
+                    phase: 3,
+                    n: r as u8,
+                    target_cpu: t.cpu,
+                    generation: a.generation,
+                    eligible: a.eligible,
+                    reason: a.reason,
+                    outcome: if a.eligible {
+                        Outcome::Credited
+                    } else {
+                        Outcome::Uncredited
+                    },
+                });
             }
-            Err(why) => v.fail(why, r as u32),
+            Err(why) => {
+                att.push(Attempt {
+                    phase: 3,
+                    n: r as u8,
+                    target_cpu: t.cpu,
+                    generation: 0,
+                    eligible: false,
+                    reason: why,
+                    outcome: Outcome::Failed,
+                });
+                v.fail(why, r as u32);
+            }
         }
     }
     if v.tlb_credited_s < TLB_MIN_CREDITED_PER_DIRECTION
@@ -893,22 +1285,48 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
         v.fail("tlb_too_few_credited_rounds_per_direction", 0);
     }
 
-    // P4 — mutual rounds, graded on the production operations themselves.
+    // P4 — mutual rounds, graded on the production operations themselves; every one must verify
+    // and overlap (no attempt budget: these are obligations, not coverage).
     for m in 1..=MUT_ROUNDS {
         match mutual_round(recs, roles, m) {
             Ok(round) => {
                 v.mutual_rounds += 1;
                 v.mutual_overlapped += usize::from(round.overlapped);
                 v.mutual_contended += round.contended;
+                for (op, target) in [(round.s_op, c), (round.c_op, s)] {
+                    v.mutual_off_cpu += usize::from(!op.resident);
+                    att.push(Attempt {
+                        phase: 4,
+                        n: m as u8,
+                        target_cpu: target.cpu,
+                        generation: recs[op.begin].f[3],
+                        eligible: true,
+                        reason: if op.resident { "resident" } else { "off_cpu" },
+                        outcome: Outcome::Verified,
+                    });
+                }
                 if !round.overlapped {
                     v.fail("mut_operations_serialized", m as u32);
                 }
             }
-            Err(why) => v.fail(why, m as u32),
+            Err(why) => {
+                att.push(Attempt {
+                    phase: 4,
+                    n: m as u8,
+                    target_cpu: 0,
+                    generation: 0,
+                    eligible: false,
+                    reason: why,
+                    outcome: Outcome::Failed,
+                });
+                v.fail(why, m as u32)
+            }
         }
     }
 
-    // Reclaim only after the firmware completed the fence, exactly once, per displaced page.
+    // Reclaim only after the shootdown the computation owed completed, exactly once, per displaced
+    // page: the target computation, then — when it named any remote CPU — a SUCCESSFUL firmware
+    // fence covering every named CPU's hart, then the acknowledgement, then the one settlement.
     for (i, d) in recs.iter().enumerate() {
         if d.kind != Kind::VmDisplaced || d.f[1] != roles.w_va {
             continue;
@@ -929,26 +1347,55 @@ pub fn verify(recs: &[Rec], roles: &Roles, overflowed: bool) -> Verdict {
             v.fail("settlement_not_exactly_once", d.seq);
             continue;
         }
-        let completed = recs[i..settled[0]].iter().any(|x| {
-            x.kind == Kind::FenceDone
-                && x.cpu == d.cpu
-                && x.f[0] == d.f[0]
-                && x.f[1] == d.f[1]
-                && x.f[4] == 0
+        let st = settled[0];
+        let same = |x: &Rec, k: Kind| {
+            x.kind == k && x.cpu == d.cpu && x.f[0] == d.f[0] && x.f[1] == d.f[1]
+        };
+        let Some(shoot) = (i + 1..st).find(|&j| same(&recs[j], Kind::ShootTargets)) else {
+            v.fail("settled_without_shootdown_targets", d.seq);
+            continue;
+        };
+        let Some(ack) =
+            (shoot + 1..st).find(|&j| same(&recs[j], Kind::VmShootdown) && recs[j].f[2] == 1)
+        else {
+            v.fail("settled_before_shootdown_acknowledged", d.seq);
+            continue;
+        };
+        let mask = recs[shoot].f[2];
+        if mask == 0 {
+            v.settled_local_only += 1;
+            continue;
+        }
+        let mut need = 0u64;
+        for cpu in 0..64u8 {
+            if mask & (1u64 << cpu) == 0 {
+                continue;
+            }
+            let hart = if cpu == s.cpu {
+                s.hart
+            } else if cpu == c.cpu {
+                c.hart
+            } else {
+                u64::MAX
+            };
+            need |= 1u64.checked_shl(hart as u32).unwrap_or(u64::MAX);
+        }
+        let fenced = (shoot + 1..ack).any(|j| {
+            same(&recs[j], Kind::FenceDone) && recs[j].f[4] == 0 && recs[j].f[2] & need == need
         });
-        if completed {
+        if fenced {
             v.settled_after_completion += 1;
         } else {
             v.fail("settled_before_fence_completion", d.seq);
         }
     }
-    if v.tlb_rounds + v.mutual_rounds * 2 > v.settled_after_completion {
+    if v.tlb_rounds + v.mutual_rounds * 2 > v.settled_after_completion + v.settled_local_only {
         v.fail("displaced_pages_unsettled", 0);
     }
     if user(recs, 0, s, "S_DONE", None).is_none() || user(recs, 0, c, "C_DONE", None).is_none() {
         v.fail("witness_not_complete", 0);
     }
-    v
+    (v, att)
 }
 
 // ─────────────────────────────── the recorder ───────────────────────────────
@@ -1104,47 +1551,127 @@ mod tests {
         (Kind::IpiArrived, cpu, [sources, origin, 0, 0, 0])
     }
 
-    #[test]
-    fn a_resident_wake_is_credited_only_inside_the_resident_targets_window() {
-        let ro = roles();
-        let win = |tid: u64, origin: u64, window: u64| {
+    /// One P2 attempt, direction A (C wakes H1 on CPU 1 while S spins in window A), as the owners
+    /// record it: C's call step, C's readiness (S current, CPU 1 at `entries` 40), the publication
+    /// and request, the arrival, C's post-send step, S's window check.
+    fn p2(ready_cur: u64, arrival: (u64, u64, u64, u64)) -> Vec<(Kind, u8, [u64; 5])> {
+        let (origin, window, entries, tid_asid) = arrival;
+        vec![
+            (Kind::User, 0, [9301, 12, code("C_P2A_CALL"), 1, 0]),
+            (
+                Kind::Ready,
+                0,
+                [1 | (PHASE_P2 << 8) | (1 << 16), ready_cur, 40, 1, 77],
+            ),
+            pubrec(0, 1, 0),
+            reqrec(0, 1, 0),
             (
                 Kind::IpiArrived,
-                1u8,
-                [0b1, origin | (window << 8), 0x400000, tid, 0],
-            )
-        };
-        let base = |a| seqd(vec![pubrec(0, 1, 0), reqrec(0, 1, 0), a]);
-        assert_eq!(
-            resident_wake(
-                &base(win(9300, USER, WINDOW_S_A)),
-                0,
-                ro.c,
-                ro.s,
-                WINDOW_S_A
+                1,
+                [
+                    0b1,
+                    origin | (window << 8) | (entries << 16),
+                    0x376,
+                    tid_asid,
+                    0,
+                ],
             ),
-            Ok((2, ResidentRoute::InWindow))
-        );
-        // In the target but outside its window: a failure, never a credit.
+            (Kind::User, 0, [9301, 12, code("C_P2A_SENT"), 1, 0]),
+            (Kind::User, 1, [9300, 11, code("S_WIN_A_OK"), 1, 0]),
+        ]
+    }
+    const S_INC: u64 = 9300 | (11 << 32);
+
+    fn p2a(v: Vec<(Kind, u8, [u64; 5])>) -> Result<P2Attempt, &'static str> {
+        let ro = roles();
+        p2_attempt(
+            &seqd(v),
+            0,
+            ro.c,
+            ro.s,
+            "C_P2A_CALL",
+            "C_P2A_SENT",
+            "S_WIN_A_OK",
+            WINDOW_S_A,
+            1,
+        )
+    }
+
+    #[test]
+    fn an_eligible_p2_attempt_is_credited_only_inside_the_exact_targets_window() {
+        let ok = p2a(p2(9300, (USER, WINDOW_S_A, 41, S_INC))).expect("graded");
+        assert!(ok.eligible && ok.class == ArrivalClass::InWindow && ok.generation == 77);
+        // Eligible (ready, next entry, no switch) but outside the window: a failure, not a skip.
         assert_eq!(
-            resident_wake(
-                &base(win(9300, USER, WINDOW_NONE)),
-                0,
-                ro.c,
-                ro.s,
-                WINDOW_S_A
-            ),
+            p2a(p2(9300, (USER, WINDOW_NONE, 41, S_INC))),
             Err("ipi_sepc_outside_window")
         );
-        // Another task was resident, or the hart was idle: displaced, not credited.
+        // Eligible, and the arrival names the same tid in ANOTHER address space: not the target's
+        // incarnation, so a failure even at a window PC.
         assert_eq!(
-            resident_wake(&base(win(2, USER, WINDOW_NONE)), 0, ro.c, ro.s, WINDOW_S_A),
-            Ok((2, ResidentRoute::Displaced))
+            p2a(p2(9300, (USER, WINDOW_S_A, 41, 9300 | (99 << 32)))),
+            Err("ipi_eligible_arrival_not_in_target")
+        );
+        // Eligible, and the arrival landed in another task or at idle: a failure.
+        assert_eq!(
+            p2a(p2(9300, (USER, WINDOW_NONE, 41, 2 | (2 << 32)))),
+            Err("ipi_eligible_arrival_not_in_target")
         );
         assert_eq!(
-            resident_wake(&base(win(0, IDLE, WINDOW_NONE)), 0, ro.c, ro.s, WINDOW_S_A),
-            Ok((2, ResidentRoute::Displaced))
+            p2a(p2(9300, (IDLE, WINDOW_NONE, 41, 0))),
+            Err("ipi_eligible_arrival_not_in_target")
         );
+    }
+
+    #[test]
+    fn a_p2_attempt_is_ineligible_only_on_independent_evidence_and_earns_nothing() {
+        // Another entry on the target hart between readiness and the arrival (the tick): the
+        // arrival outside the window is COUNTED apart, not failed, and credits nothing.
+        let a = p2a(p2(9300, (USER, WINDOW_NONE, 42, S_INC))).expect("graded");
+        assert!(!a.eligible && a.reason == "intervening_entry" && a.class == ArrivalClass::Outside);
+        // Readiness did not see the target current.
+        let a = p2a(p2(2, (USER, WINDOW_NONE, 41, 2 | (2 << 32)))).expect("graded");
+        assert!(!a.eligible && a.reason == "not_ready" && a.class == ArrivalClass::Displaced);
+        // Another address space was activated on the target hart after the call step.
+        let mut v = p2(9300, (USER, WINDOW_NONE, 41, 2 | (2 << 32)));
+        v.insert(
+            3,
+            (Kind::Activation, 1, [2, 0x8000_2000_0000_0001, 0, 0, 0]),
+        );
+        let a = p2a(v).expect("graded");
+        assert!(!a.eligible && a.reason == "switched");
+        // ... but an activation of the TARGET's own address space is no evidence of displacement.
+        let mut v = p2(9300, (USER, WINDOW_S_A, 41, S_INC));
+        v.insert(
+            3,
+            (Kind::Activation, 1, [11, 0x8000_b000_0000_0001, 0, 0, 0]),
+        );
+        assert!(p2a(v).expect("graded").eligible);
+        // An entry count that went BACKWARDS is not history, it is a contradiction.
+        assert_eq!(
+            p2a(p2(9300, (USER, WINDOW_S_A, 40, S_INC))),
+            Err("p2_entry_history_inconsistent")
+        );
+    }
+
+    #[test]
+    fn a_p2_attempt_fails_on_missing_evidence_or_progress_never_skips_it() {
+        // No readiness record.
+        let mut v = p2(9300, (USER, WINDOW_S_A, 41, S_INC));
+        v.remove(1);
+        assert_eq!(p2a(v), Err("p2_ready_missing"));
+        // The IPI suppressed: published, never consumed.
+        let mut v = p2(9300, (USER, WINDOW_S_A, 41, S_INC));
+        v.remove(4);
+        assert_eq!(p2a(v), Err("ipi_not_consumed"));
+        // No window check after the arrival (a corrupted context reports a FAIL step instead).
+        let mut v = p2(9300, (USER, WINDOW_S_A, 41, S_INC));
+        v.pop();
+        assert_eq!(p2a(v), Err("p2_window_check_missing"));
+        // The waker's post-send step missing.
+        let mut v = p2(9300, (USER, WINDOW_S_A, 41, S_INC));
+        v.remove(5);
+        assert_eq!(p2a(v), Err("p2_sent_missing"));
     }
 
     #[test]
@@ -1273,14 +1800,16 @@ mod tests {
         assert_eq!(match_fence(&r, 0), Err(FenceRefusal::Failed));
     }
 
-    /// One whole replacement of S's W by C, as the owners record it.
-    fn repl(
+    /// One whole replacement of S's W by C, as the owners record it, the shootdown's target
+    /// computation seeing CPU 0 running `cur0` and CPU 1 running `cur1`.
+    fn repl_seen(
         req_cpu: u8,
         req_tid: u64,
         asid: u64,
         hart_mask: u64,
         cpu_mask: u64,
         generation: u64,
+        cur: (u64, u64),
     ) -> Vec<(Kind, u8, [u64; 5])> {
         vec![
             (
@@ -1289,6 +1818,11 @@ mod tests {
                 [asid, W, 0x1000, generation, req_tid],
             ),
             (Kind::VmDisplaced, req_cpu, [asid, W, 0xAAA000, 0, 0]),
+            (
+                Kind::ShootTargets,
+                req_cpu,
+                [asid, W, cpu_mask, cur.0, cur.1],
+            ),
             (
                 Kind::FenceRequest,
                 req_cpu,
@@ -1305,65 +1839,296 @@ mod tests {
         ]
     }
 
+    /// ... with S resident on CPU 1 and C (the requester) on CPU 0.
+    fn repl(
+        req_cpu: u8,
+        req_tid: u64,
+        asid: u64,
+        hart_mask: u64,
+        cpu_mask: u64,
+        generation: u64,
+    ) -> Vec<(Kind, u8, [u64; 5])> {
+        repl_seen(
+            req_cpu,
+            req_tid,
+            asid,
+            hart_mask,
+            cpu_mask,
+            generation,
+            (9301, 9300),
+        )
+    }
+
+    /// ... with S OFF CPU 1 (another task current there): no remote target, no fence.
+    fn repl_off_cpu(generation: u64) -> Vec<(Kind, u8, [u64; 5])> {
+        let mut v = repl_seen(0, 9301, 11, 0, 0, generation, (9301, 2));
+        v.remove(4);
+        v.remove(3);
+        v
+    }
+
     #[test]
     fn a_replacement_needs_the_fence_to_the_resident_hart_completed_before_settlement() {
         let ro = roles();
         // C (cpu 0) replaces S's W; S is on cpu 1 = hart 0.
         let ok = seqd(repl(0, 9301, 11, 0b01, 0b10, 1));
-        assert!(replacement(&ok, &ro, 0, ro.c, ro.s).is_ok());
+        let r = replacement(&ok, &ro, 0, ro.c, ro.s).expect("verified");
+        assert!(r.resident && r.fence_done.is_some());
         // The fence named the wrong hart (a CPU index taken for a hart id): refused.
         let wrong = seqd(repl(0, 9301, 11, 0b10, 0b10, 1));
         assert_eq!(
             replacement(&wrong, &ro, 0, ro.c, ro.s),
             Err("fence_not_requested_for_the_resident_target")
         );
-        // The fence omitted altogether.
+        // The computation saw S resident but the fence was omitted altogether: refused — a
+        // resident target missing its fence is a FAILURE, never an ineligible attempt.
         let mut v = repl(0, 9301, 11, 0b01, 0b10, 1);
+        v.remove(4);
         v.remove(3);
-        v.remove(2);
         assert_eq!(
             replacement(&seqd(v), &ro, 0, ro.c, ro.s),
             Err("fence_not_requested_for_the_resident_target")
         );
         // The completion withheld (firmware error): refused, never settled as complete.
         let mut v = repl(0, 9301, 11, 0b01, 0b10, 1);
-        v[3].2[4] = (-1i64) as u64;
+        v[4].2[4] = (-1i64) as u64;
         assert_eq!(
             replacement(&seqd(v), &ro, 0, ro.c, ro.s),
             Err("fence_failed")
         );
         // Settlement before the fence completed (premature release).
         let mut v = repl(0, 9301, 11, 0b01, 0b10, 1);
-        let settled = v.remove(5);
-        v.insert(2, settled);
+        let settled = v.remove(6);
+        v.insert(3, settled);
         assert!(replacement(&seqd(v), &ro, 0, ro.c, ro.s).is_err());
+    }
+
+    #[test]
+    fn the_shootdown_computation_decides_residency_and_must_be_recorded_consistently() {
+        let ro = roles();
+        // S off CPU 1 at the computation: no remote target, no fence, a verified operation.
+        let r = replacement(&seqd(repl_off_cpu(1)), &ro, 0, ro.c, ro.s).expect("verified");
+        assert!(!r.resident && r.fence_done.is_none());
+        // No record of the computation at all: missing evidence fails.
+        let mut v = repl(0, 9301, 11, 0b01, 0b10, 1);
+        v.remove(2);
+        assert_eq!(
+            replacement(&seqd(v), &ro, 0, ro.c, ro.s),
+            Err("shoot_targets_missing")
+        );
+        // A snapshot that says S was current but a mask that omits CPU 1 (or the reverse): the
+        // record contradicts itself.
+        assert_eq!(
+            replacement(
+                &seqd(repl_seen(0, 9301, 11, 0b01, 0, 1, (9301, 9300))),
+                &ro,
+                0,
+                ro.c,
+                ro.s
+            ),
+            Err("shoot_targets_inconsistent")
+        );
+        assert_eq!(
+            replacement(
+                &seqd(repl_seen(0, 9301, 11, 0b01, 0b10, 1, (9301, 2))),
+                &ro,
+                0,
+                ro.c,
+                ro.s
+            ),
+            Err("shoot_targets_inconsistent")
+        );
+        // A substituted identity: the computation names another tid as S.
+        let mut v = repl_off_cpu(1);
+        v[2].2[4] = 9300 + 7;
+        assert!(
+            replacement(&seqd(v), &ro, 0, ro.c, ro.s)
+                .map(|r| !r.resident)
+                .unwrap_or(true),
+            "a substituted tid is never taken as the target"
+        );
+        // The requester named itself.
+        assert_eq!(
+            replacement(
+                &seqd(repl_seen(0, 9301, 11, 0b11, 0b11, 1, (9301, 9300))),
+                &ro,
+                0,
+                ro.c,
+                ro.s
+            ),
+            Err("shoot_targets_named_requester")
+        );
+    }
+
+    /// One whole serial attempt r = 1 (target S on CPU 1, requester C on CPU 0).
+    fn p3(
+        ready_cur: u64,
+        op: Vec<(Kind, u8, [u64; 5])>,
+        c0: u64,
+        c1: u64,
+    ) -> Vec<(Kind, u8, [u64; 5])> {
+        let mut v = vec![
+            (Kind::User, 1, [9300, 11, code("S_PRE"), 1, 0]),
+            (Kind::Residency, 1, [9300, c0, code("S_PRE"), 1, 0]),
+            (Kind::User, 0, [9301, 12, code("C_REQ"), 1, 0]),
+            (
+                Kind::Ready,
+                0,
+                [1 | (PHASE_P3 << 8) | (1 << 16), ready_cur, c0, 1, 5],
+            ),
+        ];
+        v.extend(op);
+        v.push((Kind::User, 1, [9300, 11, code("S_OBSERVED"), 1, 0]));
+        v.push((Kind::Residency, 1, [9300, c1, code("S_OBSERVED"), 1, 0]));
+        v
+    }
+
+    fn p3a(v: Vec<(Kind, u8, [u64; 5])>) -> Result<P3Attempt, &'static str> {
+        let ro = roles();
+        p3_attempt(
+            &seqd(v),
+            &ro,
+            1,
+            ro.s,
+            ro.c,
+            ("S_PRE", "C_REQ", "S_OBSERVED"),
+        )
+    }
+
+    #[test]
+    fn a_serial_attempt_is_credited_only_with_residency_over_the_whole_interval() {
+        let a = p3a(p3(9300, repl(0, 9301, 11, 0b01, 0b10, 1), 10, 11)).expect("graded");
+        assert!(a.eligible && a.reason == "none" && a.generation == 1);
+        // Resident at the computation and fenced, but the hart entered the kernel in between.
+        let a = p3a(p3(9300, repl(0, 9301, 11, 0b01, 0b10, 1), 10, 14)).expect("graded");
+        assert!(!a.eligible && a.reason == "interfered");
+        // Readiness never saw the target current.
+        let a = p3a(p3(2, repl(0, 9301, 11, 0b01, 0b10, 1), 10, 14)).expect("graded");
+        assert!(!a.eligible && a.reason == "not_ready");
+        // The counts went nowhere: not history.
+        assert_eq!(
+            p3a(p3(9300, repl(0, 9301, 11, 0b01, 0b10, 1), 10, 10)),
+            Err("tlb_residency_count_not_monotone")
+        );
+    }
+
+    #[test]
+    fn an_off_cpu_target_is_uncredited_only_with_positive_activation_evidence() {
+        // Off CPU at the computation, and its hart re-activated S's address space (the satp write
+        // whose sfence retires every stale translation) after the displacement, before OBSERVED.
+        let mut op = repl_off_cpu(1);
+        op.insert(
+            4,
+            (Kind::Activation, 1, [11, 0x8000_b000_0000_0001, 0, 0, 0]),
+        );
+        let a = p3a(p3(9300, op, 10, 15)).expect("graded");
+        assert!(!a.eligible && a.reason == "off_cpu");
+        // ... without that activation: a FAILURE, not an uncredited attempt.
+        assert_eq!(
+            p3a(p3(9300, repl_off_cpu(1), 10, 15)),
+            Err("off_cpu_target_not_reactivated")
+        );
+        // ... an activation of ANOTHER address space is not the target's.
+        let mut op = repl_off_cpu(1);
+        op.insert(
+            4,
+            (Kind::Activation, 1, [2, 0x8000_2000_0000_0001, 0, 0, 0]),
+        );
+        assert_eq!(
+            p3a(p3(9300, op, 10, 15)),
+            Err("off_cpu_target_not_reactivated")
+        );
+        // ... nor is an activation BEFORE the displacement (the new PTE was not yet written).
+        let mut op = repl_off_cpu(1);
+        op.insert(
+            1,
+            (Kind::Activation, 1, [11, 0x8000_b000_0000_0001, 0, 0, 0]),
+        );
+        assert_eq!(
+            p3a(p3(9300, op, 10, 15)),
+            Err("off_cpu_target_not_reactivated")
+        );
+        // ... nor is one on the requester's hart.
+        let mut op = repl_off_cpu(1);
+        op.insert(
+            4,
+            (Kind::Activation, 0, [11, 0x8000_b000_0000_0001, 0, 0, 0]),
+        );
+        assert_eq!(
+            p3a(p3(9300, op, 10, 15)),
+            Err("off_cpu_target_not_reactivated")
+        );
     }
 
     #[test]
     fn the_premature_release_check_is_global() {
         let ro = roles();
         let mut v = repl(0, 9301, 11, 0b01, 0b10, 1);
-        let settled = v.remove(5);
-        v.insert(2, settled);
+        let settled = v.remove(6);
+        v.insert(3, settled);
         let verdict = verify(&seqd(v), &ro, false);
         assert!(verdict.failure.is_some());
-        // The global check itself, read off its own count (the verdict's reported failure is the
-        // FIRST one, which for a record with no P1 phase is the missing call): a settlement with no
-        // completed fence before it is not counted, the same settlement after one is.
-        let r = seqd(v_premature());
-        let verdict = verify(&r, &ro, false);
+        // The global check itself, read off its own counts (the verdict's reported failure is the
+        // FIRST one, which for a record with no P1 phase is the missing call): a settlement with
+        // no completed fence for a computation that named a remote CPU is not counted...
+        let verdict = verify(&seqd(v_premature(0b10)), &ro, false);
         assert!(verdict.failure.is_some());
-        assert_eq!(verdict.settled_after_completion, 0);
-        let mut ok = v_premature();
-        ok.insert(1, (Kind::FenceDone, 0, [11, W, 0, 0, 0]));
+        assert_eq!(
+            verdict.settled_after_completion + verdict.settled_local_only,
+            0
+        );
+        // ... the same settlement after a successful fence covering that CPU's hart is...
+        let mut ok = v_premature(0b10);
+        ok.insert(2, (Kind::FenceDone, 0, [11, W, 0b01, 9, 0]));
         assert_eq!(verify(&seqd(ok), &ro, false).settled_after_completion, 1);
+        // ... a FAILED fence never is...
+        let mut bad = v_premature(0b10);
+        bad.insert(2, (Kind::FenceDone, 0, [11, W, 0b01, 9, (-1i64) as u64]));
+        assert_eq!(verify(&seqd(bad), &ro, false).settled_after_completion, 0);
+        // ... and a computation that named no remote CPU needs none (the local fence and every
+        // other hart's next activation are the whole shootdown).
+        assert_eq!(
+            verify(&seqd(v_premature(0)), &ro, false).settled_local_only,
+            1
+        );
+        // A settlement with no recorded computation at all is never counted.
+        let mut none = v_premature(0);
+        none.remove(1);
+        let verdict = verify(&seqd(none), &ro, false);
+        assert_eq!(
+            verdict.settled_after_completion + verdict.settled_local_only,
+            0
+        );
     }
 
-    fn v_premature() -> Vec<(Kind, u8, [u64; 5])> {
+    fn v_premature(mask: u64) -> Vec<(Kind, u8, [u64; 5])> {
         vec![
             (Kind::VmDisplaced, 0, [11, W, 0xAAA000, 0, 0]),
+            (Kind::ShootTargets, 0, [11, W, mask, 9301, 9300]),
+            (Kind::VmShootdown, 0, [11, W, 1, 0, 0]),
             (Kind::VmSettled, 0, [11, W, 0xAAA000, 0, 0]),
         ]
+    }
+
+    #[test]
+    fn every_attempt_is_retained_and_all_ineligible_attempts_fail_coverage() {
+        // An empty record grades nothing: every attempt fails on missing evidence, and the
+        // coverage obligations fail too — ineligibility can never stand in for coverage.
+        let (v, att) = verify_attempts(&[], &roles(), false);
+        assert!(v.failure.is_some());
+        assert_eq!(
+            att.iter().filter(|a| a.phase == 2).count(),
+            2 * P2_ATTEMPTS as usize
+        );
+        assert_eq!(
+            att.iter().filter(|a| a.phase == 3).count(),
+            TLB_ROUNDS as usize
+        );
+        assert!(att.iter().all(|a| a.outcome == Outcome::Failed));
+        assert_eq!(
+            v.p2_credited_s + v.p2_credited_c + v.tlb_credited_s + v.tlb_credited_c,
+            0
+        );
     }
 
     #[test]

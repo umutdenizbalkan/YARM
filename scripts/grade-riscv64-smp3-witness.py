@@ -116,7 +116,7 @@ def fnv1a(b):
     return h
 
 
-KEYS = r"SMP3_(REC|ROLES|BRINGUP|CPU_IPI|CPU_FENCE|COUNTS_IPI|COUNTS_WAKE|COUNTS_TLB|SYNC|VERDICT) "
+KEYS = r"SMP3_(REC|ATTEMPT|ROLES|BRINGUP|CPU_IPI|CPU_FENCE|COUNTS_IPI|COUNTS_WAKE|COUNTS_P2|COUNTS_TLB|COUNTS_MUT|SYNC|SEAL_SYNC|VERDICT) "
 dump, damaged = {}, 0
 for l in lines:
     i, j = l.find("SMP3_"), l.rfind(" pass=")
@@ -132,6 +132,8 @@ for l in lines:
     key = body.split(" ", 1)[0]
     if key == "SMP3_REC":
         key = "REC " + re.search(r"seq=(\d+)", body).group(1)
+    elif key == "SMP3_ATTEMPT":
+        key = "ATTEMPT " + " ".join(re.search(r"phase=(\d+) n=(\d+) target_cpu=(\d+)", body).groups())
     elif key.startswith("SMP3_CPU_"):
         key = key + " " + body.split(" ", 2)[1]
     dump.setdefault(key, body)
@@ -262,7 +264,7 @@ def chain(after, src_cpu, dst_cpu, origin, window):
         return None, "publication seq %d %d->%d never consumed" % (recs[p]["seq"], src_cpu, dst_cpu)
     if origin is not None and recs[a]["f"][1] & 0xFF != origin:
         return None, "arrival seq %d origin %d, want %d" % (recs[a]["seq"], recs[a]["f"][1] & 0xFF, origin)
-    if window and recs[a]["f"][1] >> 8 != window:
+    if window and (recs[a]["f"][1] >> 8) & 0xFF != window:
         return None, "arrival seq %d sepc 0x%x outside window %d" % (recs[a]["seq"], recs[a]["f"][2], window)
     return a, None
 
@@ -284,8 +286,8 @@ def parked(after, src_cpu, dst_cpu, woken):
           and recs[i]["f"][1] == 0 and recs[i]["f"][0] == woken]
     if not ds:
         return (after, "busy"), None
-    if recs[a]["f"][3] != woken:
-        return None, "arrival seq %d in tid %d, not the resumed tid %d" % (recs[a]["seq"], recs[a]["f"][3], woken)
+    if recs[a]["f"][3] & 0xFFFFFFFF != woken:
+        return None, "arrival seq %d in tid %d, not the resumed tid %d" % (recs[a]["seq"], recs[a]["f"][3] & 0xFFFFFFFF, woken)
     return (ds[-1], "timer"), None
 
 
@@ -333,42 +335,93 @@ for k in range(1, P1_ROUNDS + 1):
 if ipi_to_s != P1_ROUNDS or ipi_to_c < 2:
     fail("IPI-driven parked dispatches: %d/%d to CPU 1 (no timer there: all must be), %d/%d to CPU 0 (>= 2 required)" % (ipi_to_s, P1_ROUNDS, ipi_to_c, P1_ROUNDS))
 
-# ── USER TARGETS: P2_ROUNDS attempts per direction ──
-# An arrival from U-mode IN the target must be inside its window (credited). An arrival that found
-# another task resident, or the hart idle with the target displaced, is counted apart. Every
-# attempt's window check must follow on the target's own CPU; each direction needs >= 1 credit.
-P2_ROUNDS = 4
-user_n, displaced = 0, 0
-per_dir = [0, 0]
-for k in range(1, P2_ROUNDS + 1):
-    for d, (waker, src, dst, call, tgt, ok, win) in enumerate([
-            (C, 0, 1, "C_P2A_CALL", S, "S_WIN_A_OK", 1),
-            (S, 1, 0, "S_P2B_CALL", C, "C_WIN_B_OK", 2)]):
-        c = user(at, waker["tid"], call, k)
-        if c is None:
-            fail("P2 attempt %d: %s missing" % (k, call))
-            continue
-        a, why = chain(c, src, dst, None, 0)
+# ── QEMU-SMP3-SEAL: the attempt contract, re-derived independently of the kernel's verifier ──
+# Every attempt is graded for its OBLIGATIONS first (any failure fails the boot, never retried);
+# then classified eligible or not from independently recorded evidence only — the readiness
+# record, the shootdown's own target computation, the hart's supervisor-entry history and its
+# activation history — never from a missing fence or a failed check. Only eligible attempts
+# earn coverage. The kernel's attempt lines and counts must then agree with this grader's.
+P2_ATTEMPTS, TLB_ROUNDS, MUT_ROUNDS = 6, 24, 4
+attempts = {}   # (phase, n, target_cpu) -> "eligible reason outcome"
+
+
+def arr_origin(r): return r["f"][1] & 0xFF
+def arr_window(r): return (r["f"][1] >> 8) & 0xFF
+def arr_entries(r): return r["f"][1] >> 16
+def arr_tid(r): return r["f"][3] & 0xFFFFFFFF
+def arr_asid(r): return r["f"][3] >> 32
+
+
+def ready(start, waker_cpu, target_cpu, phase, rnd):
+    return find(start, lambda r: r["kind"] == "ready" and r["cpu"] == waker_cpu and r["f"][0] & 0xFF == target_cpu
+                and (r["f"][0] >> 8) & 0xFF == phase and r["f"][3] == rnd)
+
+
+def reactivated(target, disp, before):
+    i = find(disp + 1, lambda r: r["kind"] == "activation" and r["cpu"] == target["cpu"] and r["f"][0] == target["asid"])
+    return i is not None and i < before
+
+
+# ── USER TARGETS (P2) ──
+p2 = dict(attempts=0, credited_s=0, credited_c=0, uncredited=0, in_window=0, outside=0, displaced=0)
+for k in range(1, P2_ATTEMPTS + 1):
+    for waker, call, sent, tgt, ok, win in [
+            (C, "C_P2A_CALL", "C_P2A_SENT", S, "S_WIN_A_OK", 1),
+            (S, "S_P2B_CALL", "S_P2B_SENT", C, "C_WIN_B_OK", 2)]:
+        p2["attempts"] += 1
+        key = (2, k, tgt["cpu"])
+
+        def attempt():
+            c = user(at, waker["tid"], call, k)
+            if c is None:
+                return None, "p2_call_missing"
+            rd = ready(c, waker["cpu"], tgt["cpu"], 2, k)
+            if rd is None:
+                return None, "p2_ready_missing"
+            a, why = chain(rd, waker["cpu"], tgt["cpu"], None, 0)
+            if why:
+                return None, "ipi_not_published" if why.startswith("no publication") else "ipi_not_consumed"
+            if user(rd, waker["tid"], sent, k) is None:
+                return None, "p2_sent_missing"
+            w = user(a, tgt["tid"], ok, k)
+            if w is None:
+                return None, "p2_window_check_missing"
+            if recs[w]["cpu"] != tgt["cpu"]:
+                return None, "p2_window_checked_elsewhere"
+            ar, r = recs[a], recs[rd]
+            if arr_entries(ar) <= r["f"][2]:
+                return None, "p2_entry_history_inconsistent"
+            in_target = arr_origin(ar) == 0 and arr_tid(ar) == tgt["tid"] and arr_asid(ar) == tgt["asid"]
+            cls = "in_window" if in_target and arr_window(ar) == win else ("outside" if in_target else "displaced")
+            switched = any(x["kind"] == "activation" and x["cpu"] == tgt["cpu"] and x["f"][0] != tgt["asid"] for x in recs[c + 1:a])
+            if r["f"][1] != tgt["tid"]:
+                reason = "not_ready"
+            elif arr_entries(ar) != r["f"][2] + 1:
+                reason = "intervening_entry"
+            elif switched:
+                reason = "switched"
+            else:
+                reason = "none"
+            if reason == "none" and cls != "in_window":
+                return None, "ipi_sepc_outside_window" if in_target else "ipi_eligible_arrival_not_in_target"
+            return (w, reason, cls), None
+        res, why = attempt()
         if why:
-            fail("P2 attempt %d %d->%d: %s" % (k, src, dst, why))
+            fail("P2 attempt %d -> cpu %d: %s" % (k, tgt["cpu"], why))
+            attempts[key] = "0 %s failed" % why
             continue
-        r = recs[a]
-        if r["f"][1] & 0xFF == 0 and r["f"][3] == tgt["tid"]:
-            if r["f"][1] >> 8 != win:
-                fail("P2 attempt %d: arrival seq %d in the target but sepc 0x%x outside window %d" % (k, r["seq"], r["f"][2], win))
-                continue
-            user_n += 1
-            per_dir[d] += 1
+        w, reason, cls = res
+        p2[cls] += 1
+        if reason == "none":
+            p2["credited_s" if tgt is S else "credited_c"] += 1
+            attempts[key] = "1 none credited"
         else:
-            displaced += 1
-        w = user(a, tgt["tid"], ok, k)
-        if w is None or recs[w]["cpu"] != dst:
-            fail("P2 attempt %d: %s missing after the arrival or on another CPU" % (k, ok))
-            continue
-        if d == 1:
+            p2["uncredited"] += 1
+            attempts[key] = "0 %s uncredited" % reason
+        if tgt is C:
             at = w
-if per_dir[0] < 1 or per_dir[1] < 1:
-    fail("P2: arrivals inside a resident target's window: %d to S, %d to C (>= 1 each required)" % tuple(per_dir))
+if p2["credited_s"] < 1 or p2["credited_c"] < 1:
+    fail("P2: credited attempts %d to S, %d to C (>= 1 each required of %d each)" % (p2["credited_s"], p2["credited_c"], P2_ATTEMPTS))
 
 
 # ── one production replacement, end to end ──
@@ -376,22 +429,22 @@ def replacement(start, req, target):
     b = find(start, lambda r: r["kind"] == "vm_op_begin" and r["cpu"] == req["cpu"] and r["f"][0] == target["asid"]
              and r["f"][1] == W and r["f"][4] == req["tid"])
     if b is None:
-        return None, "no production operation"
+        return None, "operation_missing"
     e = None
     for i in range(b + 1, len(recs)):
         r = recs[i]
         if r["cpu"] != req["cpu"]:
             continue
         if r["kind"] == "vm_op_begin" and e is None:
-            return None, "operation seq %d never completed" % recs[b]["seq"]
+            return None, "operation_incomplete"
         if r["kind"] == "vm_op_end" and r["f"][:3] == [target["asid"], W, recs[b]["f"][3]]:
             if e is not None:
-                return None, "operation seq %d completed twice" % recs[b]["seq"]
+                return None, "operation_duplicate_completion"
             e = i
     if e is None:
-        return None, "operation seq %d never completed" % recs[b]["seq"]
+        return None, "operation_incomplete"
     if recs[e]["f"][3] != 0 or recs[e]["f"][4] != W:
-        return None, "operation seq %d returned outcome %d addr 0x%x" % (recs[b]["seq"], recs[e]["f"][3], recs[e]["f"][4])
+        return None, "operation_failed"
 
     def inside(kind, after, extra=lambda r: True):
         i = find(after, lambda r: r["kind"] == kind and r["cpu"] == req["cpu"] and r["f"][0] == target["asid"]
@@ -399,31 +452,47 @@ def replacement(start, req, target):
         return i if i is not None and i < e else None
     disp = inside("vm_displaced", b)
     if disp is None:
-        return None, "no displacement inside the operation"
-    fr = inside("fence_request", disp, lambda r: r["f"][2] & (1 << target["hart"]) and r["f"][4] & (1 << target["cpu"]))
-    if fr is None:
-        return None, "no fence request naming the target's hart %d inside the operation" % target["hart"]
-    if recs[fr]["f"][2] & (1 << req["hart"]):
-        return None, "the requester fenced itself through the firmware"
-    dones = [i for i in range(fr + 1, len(recs)) if recs[i]["kind"] == "fence_done" and recs[i]["cpu"] == req["cpu"]
-             and recs[i]["f"][:3] == recs[fr]["f"][:3]]
-    if not dones or recs[dones[0]]["f"][3] != recs[fr]["f"][3]:
-        return None, "the first completion for this fence is not this request's generation"
-    if len([i for i in dones if recs[i]["f"][3] == recs[fr]["f"][3]]) != 1:
-        return None, "the fence completed more than once"
-    d = dones[0]
-    if recs[d]["f"][4] != 0:
-        return None, "the firmware fence failed (0x%x)" % recs[d]["f"][4]
-    if d > e:
-        return None, "the fence completed outside the operation"
-    sd = inside("vm_shootdown", d)
-    if sd is None or recs[sd]["f"][2] != 1:
-        return None, "the shootdown owner did not acknowledge after the fence completed"
+        return None, "displacement_outside_operation"
+    sh = inside("shoot_targets", disp)
+    if sh is None:
+        return None, "shoot_targets_missing"
+    mask = recs[sh]["f"][2]
+    if mask & (1 << req["cpu"]):
+        return None, "shoot_targets_named_requester"
+    if target["cpu"] not in (0, 1):
+        return None, "shoot_targets_cpu_unrecorded"
+    resident = recs[sh]["f"][3 + target["cpu"]] == target["tid"]
+    if bool(mask & (1 << target["cpu"])) != resident:
+        return None, "shoot_targets_inconsistent"
+    d = None
+    if resident:
+        fr = inside("fence_request", sh, lambda r: r["f"][2] & (1 << target["hart"]) and r["f"][4] & (1 << target["cpu"]))
+        if fr is None:
+            return None, "fence_not_requested_for_the_resident_target"
+        if recs[fr]["f"][2] & (1 << req["hart"]):
+            return None, "requester_fenced_itself"
+        dones = [i for i in range(fr + 1, len(recs)) if recs[i]["kind"] == "fence_done" and recs[i]["cpu"] == req["cpu"]
+                 and recs[i]["f"][:3] == recs[fr]["f"][:3]]
+        if not dones:
+            return None, "fence_completion_missing"
+        if recs[dones[0]]["f"][3] != recs[fr]["f"][3]:
+            return None, "fence_stale_completion"
+        if len([i for i in dones if recs[i]["f"][3] == recs[fr]["f"][3]]) != 1:
+            return None, "fence_duplicate_completion"
+        d = dones[0]
+        if recs[d]["f"][4] != 0:
+            return None, "fence_failed"
+        if d > e:
+            return None, "fence_completion_outside_operation"
+    sd = inside("vm_shootdown", d if d is not None else sh)
+    if sd is None:
+        return None, "shootdown_outside_operation"
+    if recs[sd]["f"][2] != 1:
+        return None, "shootdown_not_acknowledged"
     old = recs[disp]["f"][2]
-    st = [i for i, r in enumerate(recs) if r["kind"] == "vm_settled" and r["f"][0] == target["asid"] and r["f"][2] == old]
-    if len(st) != 1 or not (sd < st[0] < e):
-        return None, "displaced frame settled %d time(s), not once between the acknowledgement and the return" % len(st)
-    return (b, e, d), None
+    if inside("vm_settled", sd, lambda r: r["f"][2] == old) is None:
+        return None, "settlement_outside_operation"
+    return dict(b=b, e=e, disp=disp, d=d, resident=resident), None
 
 
 def residency(tid, step, rnd):
@@ -431,73 +500,110 @@ def residency(tid, step, rnd):
     return None if i is None else recs[i]["f"][1]
 
 
-# ── REMOTE FENCE (serial) ──
-tlb, credited_s, credited_c, interfered = 0, 0, 0, 0
-for rnd in range(1, 9):
+# ── REMOTE FENCE (P3, serial) ──
+tlb = dict(rounds=0, credited_s=0, credited_c=0, interfered=0, off_cpu=0, not_ready=0)
+for rnd in range(1, TLB_ROUNDS + 1):
     T, Q, tp, qp = (S, C, "S", "C") if rnd % 2 else (C, S, "C", "S")
-    pre = user(0, T["tid"], tp + "_PRE", rnd)
-    req = user(pre or 0, Q["tid"], qp + "_REQ", rnd) if pre is not None else None
-    if pre is None or req is None:
-        fail("fence round %d: PRE/REQ step missing" % rnd)
-        continue
-    if recs[pre]["cpu"] != T["cpu"] or recs[req]["cpu"] != Q["cpu"]:
-        fail("fence round %d: target/requester not on their harts" % rnd)
-        continue
-    res, why = replacement(req, Q, T)
-    if why:
-        fail("fence round %d: %s" % (rnd, why))
-        continue
-    b, e, d = res
-    o = user(pre, T["tid"], tp + "_OBSERVED", rnd)
-    if o is None or o < e or recs[o]["cpu"] != T["cpu"]:
-        fail("fence round %d: target observation missing, before the operation returned, or on another hart" % rnd)
-        continue
-    c0, c1 = residency(T["tid"], tp + "_PRE", rnd), residency(T["tid"], tp + "_OBSERVED", rnd)
-    if c0 is None or c1 is None or c1 <= c0:
-        fail("fence round %d: residency counts missing or not monotone (%s, %s)" % (rnd, c0, c1))
-        continue
-    tlb += 1
-    if c1 == c0 + 1:
-        credited_s += T is S
-        credited_c += T is C
-    else:
-        interfered += 1
-        print("[smp3-witness] fence round %d: target %s took %d other supervisor entr(ies) in its window — not credited" % (rnd, tp, c1 - c0 - 1))
-if credited_s < 2 or credited_c < 2:
-    fail("credited fence rounds: %d with S resident on CPU 1, %d with C resident on CPU 0 (>= 2 each)" % (credited_s, credited_c))
+    key = (3, rnd, T["cpu"])
 
-# ── MUTUAL PROGRESS ──
-mutual, overlapped, contended = 0, 0, 0
-for mr in (1, 2, 3, 4):
+    def attempt():
+        pre = user(0, T["tid"], tp + "_PRE", rnd)
+        if pre is None:
+            return None, "tlb_pre_missing"
+        req = user(pre, Q["tid"], qp + "_REQ", rnd)
+        if req is None:
+            return None, "tlb_request_step_missing"
+        rd = ready(req, Q["cpu"], T["cpu"], 3, rnd)
+        if rd is None:
+            return None, "tlb_ready_missing"
+        rep, why = replacement(rd, Q, T)
+        if why:
+            return None, why
+        o = user(pre, T["tid"], tp + "_OBSERVED", rnd)
+        if o is None:
+            return None, "tlb_observation_missing"
+        if o < rep["e"] or (rep["d"] is not None and o < rep["d"]):
+            return None, "tlb_observed_before_completion"
+        if recs[o]["cpu"] != T["cpu"] or recs[pre]["cpu"] != T["cpu"] or recs[req]["cpu"] != Q["cpu"]:
+            return None, "tlb_roles_off_their_harts"
+        c0, c1 = residency(T["tid"], tp + "_PRE", rnd), residency(T["tid"], tp + "_OBSERVED", rnd)
+        if c0 is None or c1 is None:
+            return None, "tlb_residency_missing"
+        if c1 <= c0:
+            return None, "tlb_residency_count_not_monotone"
+        if not rep["resident"] and not reactivated(T, rep["disp"], o):
+            return None, "off_cpu_target_not_reactivated"
+        if recs[rd]["f"][1] != T["tid"]:
+            return "not_ready", None
+        if not rep["resident"]:
+            return "off_cpu", None
+        if c1 != c0 + 1:
+            return "interfered", None
+        return "none", None
+    reason, why = attempt()
+    if why:
+        fail("fence attempt %d (target %s): %s" % (rnd, tp, why))
+        attempts[key] = "0 %s failed" % why
+        continue
+    tlb["rounds"] += 1
+    if reason == "none":
+        tlb["credited_s" if T is S else "credited_c"] += 1
+        attempts[key] = "1 none credited"
+    else:
+        tlb[reason] += 1
+        attempts[key] = "0 %s uncredited" % reason
+if tlb["credited_s"] < 2 or tlb["credited_c"] < 2:
+    fail("credited fence attempts: %d with S resident on CPU 1, %d with C resident on CPU 0 (>= 2 each of %d each)" % (
+        tlb["credited_s"], tlb["credited_c"], TLB_ROUNDS // 2))
+
+# ── MUTUAL PROGRESS (P4): obligations, all of them ──
+mutual, overlapped, contended, mutual_off_cpu = 0, 0, 0, 0
+for mr in range(1, MUT_ROUNDS + 1):
     sn, cn = user(0, S["tid"], "S_MUT_NR3", mr), user(0, C["tid"], "C_MUT_NR3", mr)
     if sn is None or cn is None:
         fail("mutual %d: announcement steps missing" % mr)
+        attempts[(4, mr, 0)] = "0 mut_request_missing failed"
         continue
     rs, ws = replacement(sn, S, C)
     rc, wc = replacement(cn, C, S)
     if ws or wc:
         fail("mutual %d: %s" % (mr, " / ".join(w for w in (ws and "S: " + ws, wc and "C: " + wc) if w)))
+        attempts[(4, mr, 0)] = "0 %s failed" % ("mut_s_operation_invalid" if ws else "mut_c_operation_invalid")
         continue
     so, co = user(0, S["tid"], "S_MUT_OK", mr), user(0, C["tid"], "C_MUT_OK", mr)
-    if so is None or co is None or so < rc[1] or co < rs[1]:
-        fail("mutual %d: an observation is missing or precedes the other operation's completion" % mr)
+    if so is None or co is None:
+        fail("mutual %d: an observation is missing" % mr)
+        attempts[(4, mr, 0)] = "0 mut_observation_missing failed"
+        continue
+    if so < rc["e"] or co < rs["e"]:
+        fail("mutual %d: an observation precedes the other operation's completion" % mr)
+        attempts[(4, mr, 0)] = "0 mut_observed_before_operation_completed failed"
+        continue
+    if (not rs["resident"] and not reactivated(C, rs["disp"], co)) or (not rc["resident"] and not reactivated(S, rc["disp"], so)):
+        fail("mutual %d: an off-CPU target was not re-activated before its observation" % mr)
+        attempts[(4, mr, 0)] = "0 off_cpu_target_not_reactivated failed"
         continue
     mutual += 1
-    ov = max(rs[0], rc[0]) < min(rs[1], rc[1])
+    for op, tgt in ((rs, C), (rc, S)):
+        mutual_off_cpu += not op["resident"]
+        attempts[(4, mr, tgt["cpu"])] = "1 %s verified" % ("resident" if op["resident"] else "off_cpu")
+    ov = max(rs["b"], rc["b"]) < min(rs["e"], rc["e"])
     overlapped += int(ov)
-    first, last = min(rs[0], rc[0]), max(rs[1], rc[1])
+    first, last = min(rs["b"], rc["b"]), max(rs["e"], rc["e"])
     c_in = find(first, lambda r: r["kind"] == "contention" and r["f"][1] == 0)
     c_out = find(last, lambda r: r["kind"] == "contention" and r["f"][1] == 1)
     cn_ = (recs[c_out]["f"][0] - recs[c_in]["f"][0]) if c_in is not None and c_out is not None else 0
     contended += cn_
-    print("[smp3-witness] mutual %d: S op seq %d..%d (cpu 1), C op seq %d..%d (cpu 0): %s, contended acquisitions %d" % (
-        mr, recs[rs[0]]["seq"], recs[rs[1]]["seq"], recs[rc[0]]["seq"], recs[rc[1]]["seq"],
+    print("[smp3-witness] mutual %d: S op seq %d..%d (cpu 1, C %s), C op seq %d..%d (cpu 0, S %s): %s, contended acquisitions %d" % (
+        mr, recs[rs["b"]]["seq"], recs[rs["e"]]["seq"], "resident" if rs["resident"] else "off-CPU",
+        recs[rc["b"]]["seq"], recs[rc["e"]]["seq"], "resident" if rc["resident"] else "off-CPU",
         "OVERLAPPED" if ov else "SERIALIZED", cn_))
     if not ov:
         fail("mutual %d: the two production operations did not overlap" % mr)
 
-# ── premature release, globally ──
-settled_ok = 0
+# ── premature release, globally: the owed shootdown completed, then exactly one settlement ──
+settled_ok, settled_local = 0, 0
+hart_of = {S["cpu"]: S["hart"], C["cpu"]: C["hart"]}
 for i, r in enumerate(recs):
     if r["kind"] != "vm_displaced" or r["f"][1] != W:
         continue
@@ -505,39 +611,81 @@ for i, r in enumerate(recs):
     if len(st) != 1:
         fail("seq %d: displaced page settled %d time(s)" % (r["seq"], len(st)))
         continue
-    if not any(x["kind"] == "fence_done" and x["cpu"] == r["cpu"] and x["f"][:2] == r["f"][:2] and x["f"][4] == 0
-               for x in recs[i:st[0]]):
+
+    def same(x, kind):
+        return x["kind"] == kind and x["cpu"] == r["cpu"] and x["f"][:2] == r["f"][:2]
+    sh = next((j for j in range(i + 1, st[0]) if same(recs[j], "shoot_targets")), None)
+    if sh is None:
+        fail("seq %d: displaced page settled with no recorded shootdown target computation" % r["seq"])
+        continue
+    ack = next((j for j in range(sh + 1, st[0]) if same(recs[j], "vm_shootdown") and recs[j]["f"][2] == 1), None)
+    if ack is None:
+        fail("seq %d: displaced page settled before its shootdown was acknowledged" % r["seq"])
+        continue
+    mask = recs[sh]["f"][2]
+    if mask == 0:
+        settled_local += 1
+        continue
+    need = 0
+    for cpu in range(64):
+        if mask & (1 << cpu):
+            need |= (1 << hart_of[cpu]) if cpu in hart_of else (1 << 63)
+    if not any(same(recs[j], "fence_done") and recs[j]["f"][4] == 0 and recs[j]["f"][2] & need == need for j in range(sh + 1, ack)):
         fail("seq %d: displaced page settled before any completed firmware fence" % r["seq"])
         continue
     settled_ok += 1
 
 # ── CONTEXT ──
-for step, want in {"S_P1_RESUMED": P1_ROUNDS, "C_P1_RESUMED": P1_ROUNDS, "S_WIN_A_OK": P2_ROUNDS, "C_WIN_B_OK": P2_ROUNDS,
-                   "S_OBSERVED": 4, "C_OBSERVED": 4, "S_MUT_OK": 4, "C_MUT_OK": 4, "S_DONE": 1, "C_DONE": 1}.items():
+for step, want in {"S_P1_RESUMED": P1_ROUNDS, "C_P1_RESUMED": P1_ROUNDS, "S_WIN_A_OK": P2_ATTEMPTS, "C_WIN_B_OK": P2_ATTEMPTS,
+                   "S_OBSERVED": TLB_ROUNDS // 2, "C_OBSERVED": TLB_ROUNDS // 2, "S_MUT_OK": MUT_ROUNDS, "C_MUT_OK": MUT_ROUNDS,
+                   "S_DONE": 1, "C_DONE": 1}.items():
     n = sum(r["kind"] == "user" and r["step"] == step for r in recs)
     if n != want:
         fail("step %s seen %d time(s), want %d" % (step, n, want))
 
-# ── the kernel verifier must agree ──
+# ── the kernel verifier must agree: every attempt line, then every count ──
+kernel_attempts = {}
+for k, body in dump.items():
+    if not k.startswith("ATTEMPT "):
+        continue
+    m = re.match(r"SMP3_ATTEMPT phase=(\d+) n=(\d+) target_cpu=(\d+) gen=0x[0-9a-f]+ eligible=([01]) reason=(\w+) outcome=(\w+)$", body)
+    if not m:
+        fail("malformed kernel attempt line: %r" % body)
+        continue
+    kernel_attempts[(int(m.group(1)), int(m.group(2)), int(m.group(3)))] = "%s %s %s" % m.group(4, 5, 6)
+for key in sorted(set(attempts) | set(kernel_attempts)):
+    if attempts.get(key) != kernel_attempts.get(key):
+        fail("attempt phase=%d n=%d target_cpu=%d: grader %s, kernel %s" % (key + (attempts.get(key), kernel_attempts.get(key))))
 for want in ["arrivals=%d" % arrivals, "consumed=%d" % consumed, "empty=%d" % empty, "merged=%d" % merged,
              "user_fp_vs_off=%d" % fpvs, "p1_parked=%d" % (2 * P1_ROUNDS), "p1_ipi_to_s=%d" % ipi_to_s, "p1_ipi_to_c=%d" % ipi_to_c,
-             "p1_timer_first=%d" % timer_first, "p1_busy=%d" % busy, "p1_preceded=%d" % preceded, "p2_user=%d" % user_n, "p2_displaced=%d" % displaced, "tlb_rounds=%d" % tlb,
-             "credited_s=%d" % credited_s, "credited_c=%d" % credited_c, "interfered=%d" % interfered,
-             "mutual_rounds=%d" % mutual, "overlapped=%d" % overlapped, "contended=%d" % contended,
-             "settled_after_completion=%d" % settled_ok]:
+             "p1_timer_first=%d" % timer_first, "p1_busy=%d" % busy, "p1_preceded=%d" % preceded,
+             "p2_attempts=%d" % p2["attempts"], "p2_credited_s=%d" % p2["credited_s"], "p2_credited_c=%d" % p2["credited_c"],
+             "p2_uncredited=%d" % p2["uncredited"], "p2_in_window=%d" % p2["in_window"], "p2_outside=%d" % p2["outside"],
+             "p2_displaced=%d" % p2["displaced"], "tlb_rounds=%d" % tlb["rounds"], "credited_s=%d" % tlb["credited_s"],
+             "credited_c=%d" % tlb["credited_c"], "interfered=%d" % tlb["interfered"], "off_cpu=%d" % tlb["off_cpu"],
+             "not_ready=%d" % tlb["not_ready"], "mutual_rounds=%d" % mutual, "overlapped=%d" % overlapped,
+             "contended=%d" % contended, "mutual_off_cpu=%d" % mutual_off_cpu,
+             "settled_after_completion=%d" % settled_ok, "settled_local_only=%d" % settled_local]:
     if want not in counts.split():
         fail("kernel counts disagree on %s: %s" % (want, counts))
 if not verdict.startswith("SMP3_VERDICT result=ok "):
     fail("kernel verdict: %s" % verdict)
 
 summary = ("records=%d damaged_lines=%d arrivals=%d consumed=%d empty=%d merged=%d p1=%d ipi_to_s=%d ipi_to_c=%d "
-           "timer_first=%d busy=%d preceded=%d user=%d displaced=%d fence_rounds=%d credited_s=%d credited_c=%d interfered=%d mutual=%d "
-           "overlapped=%d contended=%d settled=%d") % (
+           "timer_first=%d busy=%d preceded=%d p2_attempts=%d p2_credited_s=%d p2_credited_c=%d p2_uncredited=%d "
+           "p2_outside=%d p2_displaced=%d fence_rounds=%d credited_s=%d credited_c=%d interfered=%d off_cpu=%d not_ready=%d "
+           "mutual=%d overlapped=%d mutual_off_cpu=%d contended=%d settled=%d settled_local=%d") % (
     len(recs), damaged, arrivals, consumed, empty, merged, parked_n, ipi_to_s, ipi_to_c, timer_first, busy,
-    preceded, user_n, displaced, tlb, credited_s, credited_c, interfered, mutual, overlapped, contended, settled_ok)
+    preceded, p2["attempts"], p2["credited_s"], p2["credited_c"], p2["uncredited"], p2["outside"], p2["displaced"],
+    tlb["rounds"], tlb["credited_s"], tlb["credited_c"], tlb["interfered"], tlb["off_cpu"], tlb["not_ready"],
+    mutual, overlapped, mutual_off_cpu, contended, settled_ok, settled_local)
 print("[smp3-witness] " + summary)
 print("[smp3-witness] kernel: " + counts + " | " + verdict)
 print("[smp3-witness] " + dump.get("SMP3_SYNC", "SMP3_SYNC missing"))
+print("[smp3-witness] " + dump.get("SMP3_SEAL_SYNC", "SMP3_SEAL_SYNC missing"))
+for key in sorted(attempts):
+    if attempts[key].split()[2] != "credited":
+        print("[smp3-witness] attempt phase=%d n=%d target_cpu=%d: %s" % (key + (attempts[key],)))
 for k in sorted(dump):
     if k.startswith("SMP3_CPU_"):
         print("[smp3-witness] " + dump[k])
@@ -550,12 +698,11 @@ print("[smp3-witness] pre-existing RISCV_ASYNC_RESUME_REFUSED lines: %d" % sum("
 print("[smp3-witness] overtaken-deferral settlements: %d" % sum("RISCV_OVERTAKEN_DEFERRAL_SETTLED" in l for l in lines))
 print("[smp3-witness] replies retried while the caller was still blocking: %d" % sum("IPCREPLY_DIRECT_CALLER_NOT_YET_BLOCKED" in l for l in lines))
 # The phase totals, each a named failure rather than a silent seal condition.
-for name, got, want in [("parked-target resumes", parked_n, 2 * P1_ROUNDS), ("fence rounds", tlb, 8),
-                        ("mutual rounds", mutual, 4), ("overlapped mutual rounds", overlapped, 4)]:
+for name, got, want in [("parked-target resumes", parked_n, 2 * P1_ROUNDS), ("fence attempts", tlb["rounds"], TLB_ROUNDS),
+                        ("P2 attempts", p2["attempts"], 2 * P2_ATTEMPTS),
+                        ("mutual rounds", mutual, MUT_ROUNDS), ("overlapped mutual rounds", overlapped, MUT_ROUNDS)]:
     if got != want:
         fail("%s: %d, want %d" % (name, got, want))
-if user_n < 2:
-    fail("in-window user-target arrivals: %d, want >= 2 (one per direction)" % user_n)
 for f in fails:
     print("[smp3-witness][fail] " + f)
 ok = not fails

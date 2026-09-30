@@ -24,8 +24,11 @@
  * Phases (the kernel records every step; the programs only drive and check):
  *   P1  parked targets: C NR6 -> blocked S (CPU 1 parked) ; S NR7 -> blocked C (CPU 0 parked)
  *   P2  user targets:   C NR6 -> H1 while S spins in window A on CPU 1 (IPI taken from U-mode);
- *                       S NR6 -> H0 while C spins in window B on CPU 0 (IPI taken from U-mode)
- *   P3  serial remote-fence rounds: odd r C replaces S's W while S is resident; even r the mirror
+ *                       S NR6 -> H0 while C spins in window B on CPU 0 (IPI taken from U-mode);
+ *                       P2_ROUNDS bounded attempts per direction, each window closed only after
+ *                       the waker's post-send step saw the arrival consumed (QEMU-SMP3-SEAL)
+ *   P3  serial remote-fence attempts (TLB_ROUNDS): odd r C replaces S's W while S spins in its
+ *       window; even r the mirror
  *   P4  mutual rounds: both replace each other's W at once
  *
  * Context windows load x1, x3..x29 (P + N) and compare them, and SP, after. t5/t6 (x30/x31) are
@@ -62,27 +65,29 @@
     .set SYS_MASK, 0x3FFD03FE
 
     .set P1_ROUNDS, 8
-    .set P2_ROUNDS, 4
-    .set TLB_ROUNDS, 8
+    /* QEMU-SMP3-SEAL: fixed attempt budgets (P2 per direction; P3 serial, half per direction). */
+    .set P2_ROUNDS, 6
+    .set TLB_ROUNDS, 24
     .set MUT_ROUNDS, 4
     .set PARK_TICKS, 60
 
-    /* MBX words; each per-round array is 16 words, index = round. */
+    /* MBX words; each per-round array is 32 words (index = round, rounds <= 31), and the whole
+       page is zeroed at provisioning. */
     .set M_S_WAIT, 0x000
-    .set M_C_WAIT, 0x080
-    .set M_PRIMED, 0x180
-    .set M_DONE, 0x200
-    .set M_OBS, 0x280
-    .set M_READY_S, 0x300
-    .set M_READY_C, 0x380
-    .set M_NR3_S, 0x400
-    .set M_NR3_C, 0x480
-    .set M_CHK_S, 0x500
-    .set M_CHK_C, 0x580
-    .set M_A_OPEN, 0x600
-    .set M_A_DONE, 0x680
-    .set M_B_OPEN, 0x700
-    .set M_B_DONE, 0x780
+    .set M_C_WAIT, 0x100
+    .set M_PRIMED, 0x200
+    .set M_DONE, 0x300
+    .set M_OBS, 0x400
+    .set M_READY_S, 0x500
+    .set M_READY_C, 0x600
+    .set M_NR3_S, 0x700
+    .set M_NR3_C, 0x800
+    .set M_CHK_S, 0x900
+    .set M_CHK_C, 0xA00
+    .set M_A_OPEN, 0xB00
+    .set M_A_DONE, 0xC00
+    .set M_B_OPEN, 0xD00
+    .set M_B_DONE, 0xE00
 
     /* Long-range conditional branches (a B-type branch reaches only +-4 KiB). */
     .macro BNEZ_FAR reg, target
@@ -615,7 +620,10 @@ yarm_smp3_s_win_a_end:
     RND_GET a2
     LOG s_m_p2b_call
     CALL_RETRY yarm_smp3_s_cap_eh0, yarm_smp3_s_cap_rs, s_call_fail
-    DELAY 0x100000
+    /* QEMU-SMP3-SEAL: C's window closes on the arrival, not on a delay a slow delivery outlasts:
+       this step waits (bounded, in the kernel) until CPU 0 has consumed this CPU's IPI. */
+    RND_GET a2
+    LOG s_m_p2b_sent
     RND_GET s4
     MSETR M_B_DONE, s4
     ZERO_PAYLOAD
@@ -680,6 +688,7 @@ yarm_smp3_s_cap_as: .word 0x54545454
     SMP3STR s_m_p1_reply, "SMP3 S_P1_REPLY"
     SMP3STR s_m_win_a_ok, "SMP3 S_WIN_A_OK"
     SMP3STR s_m_p2b_call, "SMP3 S_P2B_CALL"
+    SMP3STR s_m_p2b_sent, "SMP3 S_P2B_SENT"
     SMP3STR s_m_p2b_reply_ok, "SMP3 S_P2B_REPLY_OK"
     SMP3STR s_m_req, "SMP3 S_REQ"
     SMP3STR s_m_req_done, "SMP3 S_REQ_DONE"
@@ -763,7 +772,9 @@ c_p2_loop:
     RND_GET a2
     LOG c_m_p2a_call
     CALL_RETRY yarm_smp3_c_cap_eh1, yarm_smp3_c_cap_rc, c_call_fail
-    DELAY 0x100000
+    /* QEMU-SMP3-SEAL: S's window closes on the arrival (see S's P2 B). */
+    RND_GET a2
+    LOG c_m_p2a_sent
     RND_GET s4
     MSETR M_A_DONE, s4
     ZERO_PAYLOAD
@@ -838,6 +849,7 @@ yarm_smp3_c_cap_as: .word 0x64646464
     SMP3STR c_m_p1_call, "SMP3 C_P1_CALL"
     SMP3STR c_m_p1_resumed, "SMP3 C_P1_RESUMED"
     SMP3STR c_m_p2a_call, "SMP3 C_P2A_CALL"
+    SMP3STR c_m_p2a_sent, "SMP3 C_P2A_SENT"
     SMP3STR c_m_p2a_reply_ok, "SMP3 C_P2A_REPLY_OK"
     SMP3STR c_m_win_b_ok, "SMP3 C_WIN_B_OK"
     SMP3STR c_m_req, "SMP3 C_REQ"

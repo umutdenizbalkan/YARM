@@ -322,7 +322,7 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
             },
         )?;
     }
-    kernel.copy_to_user(s_asid, VirtAddr(MBX_VA), &[0u8; 0x800])?;
+    kernel.copy_to_user(s_asid, VirtAddr(MBX_VA), &[0u8; 0x1000])?;
     S_ASID.store(u64::from(s_asid.0), Ordering::Release);
     C_ASID.store(u64::from(c_asid.0), Ordering::Release);
     H1_ASID.store(u64::from(h1_asid.0), Ordering::Release);
@@ -552,17 +552,39 @@ pub fn note_arrival(
         }
         crate::arch::riscv64::ipi::ArrivalOrigin::Idle => (rec::ORIGIN_IDLE, rec::WINDOW_NONE),
     };
+    // QEMU-SMP3-SEAL: the hart's supervisor-entry count (this entry included) — its entry history
+    // — and the address space `satp` names as the interrupt is taken (the interrupted task's).
+    let entries = ENTRIES
+        .get(cpu.0 as usize)
+        .map_or(0, |n| n.load(Ordering::Acquire));
+    let satp: u64;
+    // SAFETY: one CSR read.
+    unsafe {
+        core::arch::asm!("csrr {0}, satp", out(reg) satp, options(nomem, nostack, preserves_flags));
+    }
     rec::push(
         Kind::IpiArrived,
         cpu.0,
         [
             arrival.sources,
-            origin | (window << 8),
+            origin | (window << 8) | (entries << 16),
             sepc as u64,
-            tid,
+            (tid & 0xffff_ffff) | (satp_asid(satp) << 32),
             sstatus,
         ],
     );
+    if let Some(row) = CONSUMED.get(cpu.0 as usize) {
+        for (src, n) in row.iter().enumerate() {
+            if arrival.sources & (1u64 << src) != 0 {
+                n.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+/// The asid a `satp` value names (Sv39: bits 59:44).
+fn satp_asid(satp: u64) -> u64 {
+    (satp >> 44) & 0xffff
 }
 
 pub fn note_idle_dispatch(cpu: CpuId, tid: u64, ipi_trigger: bool) {
@@ -793,6 +815,179 @@ fn mutual_rendezvous(me: usize, round: u64) {
     MUT_SYNC_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
 }
 
+// ──────────────────────────── QEMU-SMP3-SEAL: readiness and evidence ────────────────────────────
+
+/// Arrivals each CPU consumed from each source CPU: `[dst][src]` (observation only).
+static CONSUMED: [[AtomicU64; 2]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 2] }; MAX_CPUS];
+/// Activation history is recorded on a hart only while armed: from a P2 attempt's readiness to its
+/// target's window check, and from a shootdown's target computation to its target's observation.
+static ACT_ARMED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+/// Each requesting CPU's last live-ASID snapshot: asid, bitmap, CPU 0's and CPU 1's current tid.
+static SNAP_ASID: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MAX_CPUS];
+static SNAP_CUR: [[AtomicU64; 2]; MAX_CPUS] =
+    [const { [const { AtomicU64::new(0) }; 2] }; MAX_CPUS];
+/// The P2 target hart's consumed-from-waker count at readiness, per target CPU.
+static P2_BASE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Readiness waits (index 0 = P2, 1 = P3) and P2 post-send waits: met, and timed out.
+static READY_MET: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static READY_TIMED_OUT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static SENT_MET: AtomicU64 = AtomicU64::new(0);
+static SENT_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+const READY_SPINS: u64 = 50_000_000;
+const SENT_SPINS: u64 = 50_000_000;
+
+fn cpu_of_asid(asid: u64) -> Option<usize> {
+    if asid == S_ASID.load(Ordering::Acquire) {
+        Some(1)
+    } else if asid == C_ASID.load(Ordering::Acquire) {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// `write_satp` / `activate_asid` are about to install `satp` on this hart (observation only;
+/// recorded before the write, so a recorded activation's fence follows everything before it).
+pub fn note_activation(satp: u64) {
+    if !enabled() {
+        return;
+    }
+    let cpu = this_cpu();
+    if ACT_ARMED
+        .get(cpu as usize)
+        .is_some_and(|a| a.load(Ordering::Acquire))
+    {
+        rec::push(Kind::Activation, cpu, [satp_asid(satp), satp, 0, 0, 0]);
+    }
+}
+
+/// `live_cpu_bitmap_for_asid_split` computed `bitmap` for `asid` from `current` (observation only).
+pub fn note_live_snapshot(asid: u16, _bitmap: u64, current: &[Option<u64>]) {
+    if !enabled() {
+        return;
+    }
+    let cpu = this_cpu() as usize;
+    let (Some(a), Some(cur)) = (SNAP_ASID.get(cpu), SNAP_CUR.get(cpu)) else {
+        return;
+    };
+    for (slot, tid) in cur.iter().zip(current.iter()) {
+        slot.store(tid.unwrap_or(0), Ordering::Release);
+    }
+    a.store(u64::from(asid), Ordering::Release);
+}
+
+/// The shootdown owner is about to compute its targets for the witness page: arm activation
+/// history on the witness target's hart first, so no activation after the snapshot goes unseen.
+pub fn note_shoot_begin(asid: u16, va: u64) {
+    if !watches(va) {
+        return;
+    }
+    if let Some(cpu) = cpu_of_asid(u64::from(asid)) {
+        ACT_ARMED[cpu].store(true, Ordering::Release);
+    }
+    if let Some(a) = SNAP_ASID.get(this_cpu() as usize) {
+        a.store(u64::MAX, Ordering::Release);
+    }
+}
+
+/// ... and computed `targets` from the snapshot it just kept.
+pub fn note_shoot_targets(requester: CpuId, asid: u16, va: u64, targets: u64) {
+    if !watches(va) {
+        return;
+    }
+    let cpu = requester.0 as usize;
+    let fresh = SNAP_ASID
+        .get(cpu)
+        .is_some_and(|a| a.load(Ordering::Acquire) == u64::from(asid));
+    let cur = |i: usize| {
+        if fresh {
+            SNAP_CUR[cpu][i].load(Ordering::Acquire)
+        } else {
+            u64::MAX
+        }
+    };
+    rec::push(
+        Kind::ShootTargets,
+        requester.0,
+        [u64::from(asid), va, targets, cur(0), cur(1)],
+    );
+}
+
+/// WITNESS SYNCHRONIZATION — labelled, not production behaviour. Before a waker (P2) or requester
+/// (P3) issues its production operation against `target`, wait, bounded, until `target` is current
+/// on its hart and not at its idle boundary, and record what was seen — the target's current tid
+/// and its hart's entry count, read as one consistent snapshot (the count unchanged across the
+/// read). The operation itself is never delayed past the bound and nothing is suppressed: an
+/// unmet wait is recorded as such and the attempt is graded for what it then was. This is the
+/// off-lock DebugLog path; each read is one rank-1 scheduler acquisition; it waits only for the
+/// other hart to run its own task.
+fn establish_ready(phase: u64, target_cpu: u8, target_tid: u64, round: u64) {
+    let t = target_cpu as usize;
+    if phase == rec::PHASE_P2 {
+        // Activation history on the target's hart from before the snapshot to its window check.
+        ACT_ARMED[t].store(true, Ordering::Release);
+    }
+    let idx = usize::from(phase == rec::PHASE_P3);
+    let shared = crate::arch::riscv64::boot::trap_shared_kernel_riscv();
+    let (mut cur, mut entries, mut met) = (0u64, 0u64, false);
+    for _ in 0..READY_SPINS {
+        let e0 = ENTRIES[t].load(Ordering::Acquire);
+        cur = shared.map_or(0, |k| {
+            k.current_tid_split_read(CpuId(target_cpu)).unwrap_or(0)
+        });
+        let idle = AT_IDLE[t].load(Ordering::Acquire);
+        let e1 = ENTRIES[t].load(Ordering::Acquire);
+        entries = e1;
+        if e0 == e1 && cur == target_tid && !idle {
+            met = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if met {
+        READY_MET[idx].fetch_add(1, Ordering::AcqRel);
+    } else {
+        READY_TIMED_OUT[idx].fetch_add(1, Ordering::AcqRel);
+    }
+    rec::push(
+        Kind::Ready,
+        this_cpu(),
+        [
+            u64::from(target_cpu) | (phase << 8) | (u64::from(met) << 16),
+            cur,
+            entries,
+            round,
+            rec::next_generation(),
+        ],
+    );
+    if phase == rec::PHASE_P2 {
+        P2_BASE[t].store(
+            CONSUMED[t][usize::from(this_cpu())].load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+}
+
+/// WITNESS SYNCHRONIZATION — labelled, not production behaviour. After a P2 waker's production
+/// send returned, wait, bounded, until the target hart has CONSUMED an arrival from this CPU since
+/// readiness — so the target's window closes on the arrival, never on a fixed delay that a slow
+/// delivery can outlast. A suppressed IPI makes this time out; the attempt then fails on its own
+/// missing arrival (bounded progress), never on this wait.
+fn await_consumed(target_cpu: u8) {
+    let t = target_cpu as usize;
+    let me = usize::from(this_cpu());
+    let base = P2_BASE[t].load(Ordering::Acquire);
+    for _ in 0..SENT_SPINS {
+        if CONSUMED[t][me].load(Ordering::Acquire) > base {
+            SENT_MET.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    SENT_TIMED_OUT.fetch_add(1, Ordering::AcqRel);
+}
+
 // ─────────────────────────────── the user steps and the dump ───────────────────────────────
 
 /// The DebugLog route saw a user step. Every `SMP3 ` step becomes one record; the residency steps
@@ -821,6 +1016,22 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u6
             round,
             aux
         ));
+    }
+    // QEMU-SMP3-SEAL: readiness before the production operation, the P2 post-send wait, and the
+    // end of each armed activation-history interval (the target's own check on its own hart).
+    match step {
+        "C_P2A_CALL" => return establish_ready(rec::PHASE_P2, 1, S_TID, round),
+        "S_P2B_CALL" => return establish_ready(rec::PHASE_P2, 0, C_TID, round),
+        "C_REQ" => return establish_ready(rec::PHASE_P3, 1, S_TID, round),
+        "S_REQ" => return establish_ready(rec::PHASE_P3, 0, C_TID, round),
+        "C_P2A_SENT" => return await_consumed(1),
+        "S_P2B_SENT" => return await_consumed(0),
+        "S_WIN_A_OK" | "C_WIN_B_OK" | "S_OBSERVED" | "C_OBSERVED" | "S_MUT_OK" | "C_MUT_OK" => {
+            if let Some(a) = ACT_ARMED.get(cpu.0 as usize) {
+                a.store(false, Ordering::Release);
+            }
+        }
+        _ => {}
     }
     // The P1 waker is about to wake a PARKED target: see `wait_until_parked`.
     if step == "C_P1_CALL" {
@@ -851,7 +1062,10 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u6
     }
 }
 
-/// Seal, print every record and the verdict — all synchronously, so no line can be lost.
+/// Seal, print every record, every graded attempt and the verdict — all synchronously, so no line
+/// can be lost. Each line is formatted and emitted on its own (twice, each copy with its own
+/// checksum): the console is shared with raw markers another hart may write mid-line, so a grader
+/// takes each line from whichever copy is intact.
 fn dump() {
     let mut out = [None; rec::SLOTS];
     let Some((n, overflowed)) = rec::seal(&mut out, 50_000_000) else {
@@ -863,152 +1077,184 @@ fn dump() {
     let mut recs: alloc::vec::Vec<rec::Rec> = alloc::vec::Vec::with_capacity(n);
     recs.extend(out.iter().take(n).flatten().copied());
     let roles = roles();
-    let v = rec::verify(&recs, &roles, overflowed);
-    let mut lines: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::with_capacity(n + 8);
-    // Every dump line stays inside `printk_emit_sync`'s line with its checksum suffix appended.
-    lines.push(alloc::format!(
-        "SMP3_ROLES s={}:{}:{}:{} c={}:{}:{}:{} h1={}:{} h0={}:{} w_va=0x{:x} dump_cpu={}",
-        roles.s.tid,
-        roles.s.asid,
-        roles.s.cpu,
-        roles.s.hart,
-        roles.c.tid,
-        roles.c.asid,
-        roles.c.cpu,
-        roles.c.hart,
-        roles.h1.tid,
-        roles.h1.asid,
-        roles.h0.tid,
-        roles.h0.asid,
-        roles.w_va,
-        this_cpu()
-    ));
-    for r in &recs {
-        lines.push(alloc::format!(
-            "SMP3_REC seq={} kind={} cpu={} f0=0x{:x} f1=0x{:x} f2=0x{:x} f3=0x{:x} f4=0x{:x}{}{}",
-            r.seq,
-            r.kind.name(),
-            r.cpu,
-            r.f[0],
-            r.f[1],
-            r.f[2],
-            r.f[3],
-            r.f[4],
-            if r.kind == Kind::User || r.kind == Kind::Residency {
-                " step="
-            } else {
-                ""
-            },
-            match r.kind {
-                Kind::User | Kind::Residency => rec::step_name(r.f[2]),
-                _ => "",
-            }
-        ));
-    }
-    let (sie, sstatus) = (
-        BRINGUP_SIE.load(Ordering::Acquire),
-        BRINGUP_SSTATUS.load(Ordering::Acquire),
-    );
-    lines.push(alloc::format!(
-        "SMP3_BRINGUP cpu=1 hart={} sie=0x{:x} sstatus_sie={} sum={} placed={} tids={},{} kick={}",
-        hart(1),
-        sie,
-        (sstatus >> 1) & 1,
-        (sstatus >> 18) & 1,
-        match BRINGUP_PLACED.load(Ordering::Acquire) {
-            PLACED_KICKED | PLACED_KICK_REFUSED => "ok",
-            PLACEMENT_FAILED => "fail",
-            _ => "none",
-        },
-        H1_TID,
-        S_TID,
-        u8::from(BRINGUP_PLACED.load(Ordering::Acquire) == PLACED_KICKED)
-    ));
-    for cpu in [CpuId(0), CpuId(1)] {
-        let (p, m, q, qf) = crate::arch::riscv64::ipi::sent_counters(cpu);
-        let (a, au, ai, ac, ae, ar) = crate::arch::riscv64::ipi::taken_counters(cpu);
-        let (fr, fo, ff) = crate::arch::riscv64::ipi::fence_counters(cpu);
-        lines.push(alloc::format!(
-            "SMP3_CPU_IPI cpu={} hart={} published={} merged={} fw_requests={} fw_refused={} arrivals={} from_user={} at_idle={} consumed={} empty={}",
-            cpu.0,
-            hart(cpu.0),
-            p,
-            m,
-            q,
-            qf,
-            a,
-            au,
-            ai,
-            ac,
-            ae
-        ));
-        lines.push(alloc::format!(
-            "SMP3_CPU_FENCE cpu={} park_releases={} fences={} fences_ok={} fences_refused={} supervisor_entries={}",
-            cpu.0,
-            ar,
-            fr,
-            fo,
-            ff,
-            ENTRIES[cpu.0 as usize].load(Ordering::Acquire)
-        ));
-    }
-    lines.push(alloc::format!(
-        "SMP3_COUNTS_IPI records={} arrivals={} consumed={} empty={} merged={} user_fp_vs_off={}",
-        v.records,
-        v.ipi_arrivals,
-        v.ipi_consumed,
-        v.ipi_empty,
-        v.ipi_merged,
-        v.user_fp_vs_off
-    ));
-    lines.push(alloc::format!(
-        "SMP3_COUNTS_WAKE p1_parked={} p1_ipi_to_s={} p1_ipi_to_c={} p1_timer_first={} p1_busy={} p1_preceded={} p2_user={} p2_displaced={}",
-        v.p1_parked,
-        v.p1_ipi_to_s,
-        v.p1_ipi_to_c,
-        v.p1_timer_first,
-        v.p1_busy,
-        v.p1_preceded,
-        v.p2_user,
-        v.p2_displaced
-    ));
-    lines.push(alloc::format!(
-        "SMP3_COUNTS_TLB tlb_rounds={} credited_s={} credited_c={} interfered={} mutual_rounds={} overlapped={} contended={} settled_after_completion={}",
-        v.tlb_rounds,
-        v.tlb_credited_s,
-        v.tlb_credited_c,
-        v.tlb_interfered,
-        v.mutual_rounds,
-        v.mutual_overlapped,
-        v.mutual_contended,
-        v.settled_after_completion
-    ));
-    lines.push(alloc::format!(
-        "SMP3_SYNC mutual_rendezvous_met={} mutual_rendezvous_timed_out={} p1_parked_met_cpu0={} p1_parked_timed_out_cpu0={} p1_parked_met_cpu1={} p1_parked_timed_out_cpu1={}",
-        MUT_SYNC_MET.load(Ordering::Acquire),
-        MUT_SYNC_TIMED_OUT.load(Ordering::Acquire),
-        P1_PARK_MET[0].load(Ordering::Acquire),
-        P1_PARK_TIMED_OUT[0].load(Ordering::Acquire),
-        P1_PARK_MET[1].load(Ordering::Acquire),
-        P1_PARK_TIMED_OUT[1].load(Ordering::Acquire)
-    ));
-    lines.push(alloc::format!(
-        "SMP3_VERDICT result={} reason={} at={}",
-        if v.ok() { "ok" } else { "fail" },
-        v.failure.unwrap_or("none"),
-        v.failure_at
-    ));
-    // Twice, each line with its own checksum: the console is shared with raw markers another hart
-    // may write mid-line, so a grader takes each line from whichever copy is intact.
-    for pass in 1..=2 {
-        for line in &lines {
+    let (v, attempts) = rec::verify_attempts(&recs, &roles, overflowed);
+    for pass in 1..=2u32 {
+        let emit = |line: alloc::string::String| {
             crate::kernel::printk::printk_emit_sync(format_args!(
                 "{} pass={} crc=0x{:08x}",
                 line,
                 pass,
                 fnv1a(line.as_bytes())
             ));
+        };
+        emit(alloc::format!(
+            "SMP3_ROLES s={}:{}:{}:{} c={}:{}:{}:{} h1={}:{} h0={}:{} w_va=0x{:x} dump_cpu={}",
+            roles.s.tid,
+            roles.s.asid,
+            roles.s.cpu,
+            roles.s.hart,
+            roles.c.tid,
+            roles.c.asid,
+            roles.c.cpu,
+            roles.c.hart,
+            roles.h1.tid,
+            roles.h1.asid,
+            roles.h0.tid,
+            roles.h0.asid,
+            roles.w_va,
+            this_cpu()
+        ));
+        for r in &recs {
+            emit(alloc::format!(
+                "SMP3_REC seq={} kind={} cpu={} f0=0x{:x} f1=0x{:x} f2=0x{:x} f3=0x{:x} f4=0x{:x}{}{}",
+                r.seq,
+                r.kind.name(),
+                r.cpu,
+                r.f[0],
+                r.f[1],
+                r.f[2],
+                r.f[3],
+                r.f[4],
+                if r.kind == Kind::User || r.kind == Kind::Residency {
+                    " step="
+                } else {
+                    ""
+                },
+                match r.kind {
+                    Kind::User | Kind::Residency => rec::step_name(r.f[2]),
+                    _ => "",
+                }
+            ));
         }
+        for a in attempts.iter() {
+            emit(alloc::format!(
+                "SMP3_ATTEMPT phase={} n={} target_cpu={} gen=0x{:x} eligible={} reason={} outcome={}",
+                a.phase,
+                a.n,
+                a.target_cpu,
+                a.generation,
+                u8::from(a.eligible),
+                a.reason,
+                a.outcome.name()
+            ));
+        }
+        let (sie, sstatus) = (
+            BRINGUP_SIE.load(Ordering::Acquire),
+            BRINGUP_SSTATUS.load(Ordering::Acquire),
+        );
+        emit(alloc::format!(
+            "SMP3_BRINGUP cpu=1 hart={} sie=0x{:x} sstatus_sie={} sum={} placed={} tids={},{} kick={}",
+            hart(1),
+            sie,
+            (sstatus >> 1) & 1,
+            (sstatus >> 18) & 1,
+            match BRINGUP_PLACED.load(Ordering::Acquire) {
+                PLACED_KICKED | PLACED_KICK_REFUSED => "ok",
+                PLACEMENT_FAILED => "fail",
+                _ => "none",
+            },
+            H1_TID,
+            S_TID,
+            u8::from(BRINGUP_PLACED.load(Ordering::Acquire) == PLACED_KICKED)
+        ));
+        for cpu in [CpuId(0), CpuId(1)] {
+            let (p, m, q, qf) = crate::arch::riscv64::ipi::sent_counters(cpu);
+            let (a, au, ai, ac, ae, ar) = crate::arch::riscv64::ipi::taken_counters(cpu);
+            let (fr, fo, ff) = crate::arch::riscv64::ipi::fence_counters(cpu);
+            emit(alloc::format!(
+                "SMP3_CPU_IPI cpu={} hart={} published={} merged={} fw_requests={} fw_refused={} arrivals={} from_user={} at_idle={} consumed={} empty={}",
+                cpu.0,
+                hart(cpu.0),
+                p,
+                m,
+                q,
+                qf,
+                a,
+                au,
+                ai,
+                ac,
+                ae
+            ));
+            emit(alloc::format!(
+                "SMP3_CPU_FENCE cpu={} park_releases={} fences={} fences_ok={} fences_refused={} supervisor_entries={}",
+                cpu.0,
+                ar,
+                fr,
+                fo,
+                ff,
+                ENTRIES[cpu.0 as usize].load(Ordering::Acquire)
+            ));
+        }
+        emit(alloc::format!(
+            "SMP3_COUNTS_IPI records={} arrivals={} consumed={} empty={} merged={} user_fp_vs_off={}",
+            v.records,
+            v.ipi_arrivals,
+            v.ipi_consumed,
+            v.ipi_empty,
+            v.ipi_merged,
+            v.user_fp_vs_off
+        ));
+        emit(alloc::format!(
+            "SMP3_COUNTS_WAKE p1_parked={} p1_ipi_to_s={} p1_ipi_to_c={} p1_timer_first={} p1_busy={} p1_preceded={}",
+            v.p1_parked,
+            v.p1_ipi_to_s,
+            v.p1_ipi_to_c,
+            v.p1_timer_first,
+            v.p1_busy,
+            v.p1_preceded
+        ));
+        emit(alloc::format!(
+            "SMP3_COUNTS_P2 p2_attempts={} p2_credited_s={} p2_credited_c={} p2_uncredited={} p2_in_window={} p2_outside={} p2_displaced={}",
+            v.p2_attempts,
+            v.p2_credited_s,
+            v.p2_credited_c,
+            v.p2_uncredited,
+            v.p2_in_window,
+            v.p2_outside,
+            v.p2_displaced
+        ));
+        emit(alloc::format!(
+            "SMP3_COUNTS_TLB tlb_rounds={} credited_s={} credited_c={} interfered={} off_cpu={} not_ready={}",
+            v.tlb_rounds,
+            v.tlb_credited_s,
+            v.tlb_credited_c,
+            v.tlb_interfered,
+            v.tlb_off_cpu,
+            v.tlb_not_ready
+        ));
+        emit(alloc::format!(
+            "SMP3_COUNTS_MUT mutual_rounds={} overlapped={} contended={} mutual_off_cpu={} settled_after_completion={} settled_local_only={}",
+            v.mutual_rounds,
+            v.mutual_overlapped,
+            v.mutual_contended,
+            v.mutual_off_cpu,
+            v.settled_after_completion,
+            v.settled_local_only
+        ));
+        emit(alloc::format!(
+            "SMP3_SYNC mutual_rendezvous_met={} mutual_rendezvous_timed_out={} p1_parked_met_cpu0={} p1_parked_timed_out_cpu0={} p1_parked_met_cpu1={} p1_parked_timed_out_cpu1={}",
+            MUT_SYNC_MET.load(Ordering::Acquire),
+            MUT_SYNC_TIMED_OUT.load(Ordering::Acquire),
+            P1_PARK_MET[0].load(Ordering::Acquire),
+            P1_PARK_TIMED_OUT[0].load(Ordering::Acquire),
+            P1_PARK_MET[1].load(Ordering::Acquire),
+            P1_PARK_TIMED_OUT[1].load(Ordering::Acquire)
+        ));
+        emit(alloc::format!(
+            "SMP3_SEAL_SYNC p2_ready_met={} p2_ready_timed_out={} p2_sent_met={} p2_sent_timed_out={} p3_ready_met={} p3_ready_timed_out={}",
+            READY_MET[0].load(Ordering::Acquire),
+            READY_TIMED_OUT[0].load(Ordering::Acquire),
+            SENT_MET.load(Ordering::Acquire),
+            SENT_TIMED_OUT.load(Ordering::Acquire),
+            READY_MET[1].load(Ordering::Acquire),
+            READY_TIMED_OUT[1].load(Ordering::Acquire)
+        ));
+        emit(alloc::format!(
+            "SMP3_VERDICT result={} reason={} at={}",
+            if v.ok() { "ok" } else { "fail" },
+            v.failure.unwrap_or("none"),
+            v.failure_at
+        ));
     }
 }
 

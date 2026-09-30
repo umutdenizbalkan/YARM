@@ -567,6 +567,10 @@ pub(crate) fn reset_device_window_for_test() {
 /// exact installed value can be logged).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn write_satp(satp: u64) {
+    // QEMU-SMP3-SEAL: activation history for the witness (observation only), recorded BEFORE the
+    // write so a recorded activation's `sfence.vma` is ordered after what the record follows.
+    #[cfg(feature = "riscv64-smp3-witness")]
+    crate::arch::riscv64::smp3_witness::note_activation(satp);
     unsafe {
         core::arch::asm!(
             "csrw satp, {value}",
@@ -579,6 +583,8 @@ pub fn write_satp(satp: u64) {
 
 pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     let satp = cr3_for_asid(asid).ok_or(PageTableError::OutOfMemory)?;
+    #[cfg(all(feature = "riscv64-smp3-witness", not(feature = "hosted-dev")))]
+    crate::arch::riscv64::smp3_witness::note_activation(satp);
     #[cfg(not(feature = "hosted-dev"))]
     unsafe {
         core::arch::asm!(
