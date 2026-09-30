@@ -24341,3 +24341,169 @@ base by the deterministic `base_x86_revalidation_resumes_an_overtaken_sender_wit
 * The two reply-timeout retirement runners (`qemu-ipc-reply-timeout-{x86_64,aarch64}-retirement-smoke.sh`) fail on this package's base `8ed21c1c` exactly as on the candidate (fresh artifacts:
   x86_64 lacks its `IPC_REPLY_BEATS_TIMEOUT_OK` literal; AArch64's reply-wins cell emits none of its
   markers). They are pre-existing, outside this package, and not part of its qualification.
+
+# QEMU-SMP3-SEAL — witness eligibility, bounded attempts, and two return-path assumptions
+
+Base: `efa71dba` (QEMU-SMP3-ACCEPTANCE freeze 2, tree `839962ec…`). U9 stays CLOSED: production
+`with_cpu=0`, `with_broad=0`. This package changes what the SMP3 witness credits and how it retries,
+never what the production send, arrival, invalidation or dispatch owners do; and it resolves the two
+return paths the previous package left as reported limits.
+
+## 1 — the three recorded failures, reproduced and derived
+
+Fresh artifacts of the base, its own runner and the pinned firmware: **27/30** idle (2×
+`fence_not_requested_for_the_resident_target`, 1× `tlb_too_few_credited_rounds_per_direction`) and
+**20/30** under the load below (2× `fence_not_requested…`, 3× `ipi_sepc_outside_window`, 4×
+`tlb_too_few…`, 1× `mut_s_operation_invalid`). None is a failed production operation. Each is an
+attempt that never established the witness's own prerequisite:
+
+* **`ipi_sepc_outside_window`** — the P2 waker set DONE after a fixed `DELAY 0x100000`, not after the
+  arrival (NR 6 returns as soon as the SBI call does). A slow delivery arrived after the target had
+  already left its window, at `sepc = window_end` exactly (C `0x200004d0`, S `0x2000037e`).
+* **`fence_not_requested_for_the_resident_target`** — CPU 0's periodic timer preempted C between its
+  PRE step and the requester's shootdown (`RISCV_YIELD_DISPATCH_SATP_OK incoming=2`), so the
+  shootdown's own target computation correctly saw C off-CPU and requested no fence. The skip is the
+  kernel's contract — every activation writes `satp` and executes `sfence.vma x0, x0` before the ASID
+  runs again — but the old grader required a fence for every displaced page.
+* **`tlb_too_few_credited_rounds_per_direction`** — the same timer interfered with enough of C's
+  fixed 4 rounds that fewer than the required 2 were credited. `mut_s_operation_invalid` is the
+  mutual-round form of the off-CPU case.
+
+## 2 — the attempt contract (kernel verifier and independent grader alike)
+
+**Obligations come first, and any failure fails the boot.** Every attempt must show, in order and on
+their harts, its user steps, the readiness record, the complete production operation (entry,
+displacement, the shootdown's own target computation, the fence request naming the target's hart and
+its successful completion when that computation named the target, the acknowledged shootdown, the
+settlement, the exit), and the observation after completion. Stale data, a failed firmware
+completion, premature settlement, a completion under another generation and an identity mismatch are
+obligation failures: they cannot be retried into success, because a failed attempt is never replaced
+by a later one — it fails the boot.
+
+**Eligibility is derived only from independently recorded evidence**, never from the absence of a
+fence or from a failed assertion:
+
+| record (witness-only, sealed) | written by | fields |
+|---|---|---|
+| `Ready` | the waker/requester's marker hook, after a bounded wait | target hart, phase, met, the target hart's `current` tid, its supervisor-entry count, round, generation |
+| `ShootTargets` | `complete_unmap_shootdown_from_split`, around the unchanged target expression | asid, va, the computed mask, `current` of both harts from the same snapshot |
+| `Activation` | `write_satp` / `activate_asid`, armed per hart for the attempt's interval | asid, satp |
+| `IpiArrived` | the arrival (unchanged owner) | origin, window, the hart's entry count, tid and the ASID `satp` names at the interrupt |
+
+* **Readiness** is both recorded facts of the `Ready` record: its bounded wait reported `met`, and it
+  saw the target current. Either alone is `not_ready` (§4: a control that forced every `met` to 0 while
+  leaving the observed `current` intact passed until this was required of both graders).
+* **P2 (IPI)**: eligible iff ready (`not_ready` otherwise), the arrival is the
+  target hart's very next supervisor entry (`intervening_entry`), and no activation of another address
+  space on the target hart lies between the call and the arrival (`switched`). An eligible arrival must
+  be IN the checked window and in the target incarnation (tid AND asid): outside the window it FAILS
+  (`ipi_sepc_outside_window`), in another incarnation it fails (`ipi_eligible_arrival_not_in_target`).
+  Arrivals of ineligible attempts are counted by class — in-window, outside, displaced — and earn no
+  coverage. An arrival whose entry count does not exceed Ready's is contradictory and fails.
+* **P3 (remote fence)**: eligible iff ready, the shootdown's own computation saw
+  it current (so a fence to its hart was REQUIRED and is checked), and the target hart took exactly one
+  supervisor entry between PRE and OBSERVED. `off_cpu` is uncredited only with positive evidence: the
+  computation saw it off-CPU AND an `Activation` of its ASID on its hart lies after the displacement and
+  before its observation; without that evidence it fails (`off_cpu_target_not_reactivated`). A
+  computation whose mask disagrees with its own snapshot fails (`shoot_targets_inconsistent`), as does
+  one naming the requester.
+* **P4 (mutual)**: unchanged overlap obligation (both operations entered before either completed); an
+  off-CPU target of either operation needs the same activation evidence.
+* **Settlement, every displaced page**: shootdown targets recorded between displacement and settlement,
+  the acknowledgement before settlement, and — for a non-empty mask — a successful fence covering those
+  harts before it (`settled_after_completion`); an empty mask is counted `settled_local_only`.
+
+**Budgets, fixed before qualification**: P2 `P2_ATTEMPTS = 6` per direction (12); P3 `TLB_ROUNDS = 24`
+(12 per direction); P4 `MUT_ROUNDS = 4`. **Coverage, unchanged thresholds**: P2 ≥ 1 credited per
+direction, P3 ≥ 2 credited per direction, P4 all 4 overlapped. Every attempt is retained in the sealed
+dump (`SMP3_ATTEMPT phase n target_cpu gen eligible reason outcome`, two passes, CRC'd); the grader
+re-derives each one from the records and requires the kernel's list to match it line for line.
+
+**Witness synchronization** (default-off, `riscv64-smp3-witness` only, run from the off-lock DebugLog
+marker hook with no domain lock held, bounded at 5×10⁷ spins): before an attempt's request, wait until
+the target hart is current in the target task, not idle, and its entry count is stable, then record
+`Ready` — met or timed out, either way; after a P2 send returns, wait until the target hart has
+CONSUMED an arrival from this hart since readiness, instead of the fixed delay. A suppressed IPI makes
+that wait time out and the attempt then fails on its own missing arrival. The production send,
+arrival, invalidation and dispatch owners are unchanged, the timer is not disabled, and no timeout
+was lengthened.
+
+**Pre-freeze populations** (16 boots of the checkpoint, alternating idle/load, 16/16 pass; attempts
+per direction): P2 S 96/96 credited, C 92 credited + 4 uncredited (`intervening_entry`); P3 S 192/192,
+C 135 credited + 54 `interfered` + 3 `off_cpu` (each with its activation evidence); P4 64/64 overlapped
+with every target resident. Per boot, C's credited P3 rounds ranged 5–10 of 12 against the threshold
+of 2 — legitimate interference leaves attempts uncredited while later attempts of the same boot earn
+the unchanged threshold. The qualification's own populations are counted per boot in its delivery
+report.
+
+## 3 — the two return-path assumptions
+
+### x86_64 `revalidate_idle_owner_after_drains` — a reachable gap, repaired
+
+Reachable interleaving: a sender blocks on CPU 0 and its drain re-verifies it blocked and settles
+idle; a receiver on CPU 1 takes the message, parks the `IpcSend` completion and wakes the sender onto
+CPU 0's queue; this trap's epilogue — `current == None`, ring-3 entry — then runs the revalidation.
+The base selected by bare TID in rank 1, re-resolved the bare TID in a separate rank-2 acquisition, and
+restored the SAVED context only: the sender returned with its pre-block lanes and the completion stayed
+parked (`base_x86_revalidation_resumes_an_overtaken_sender_without_its_completion`, replayed through
+the base's own owners). It also returned through a first-resume startup snapshot without spending its
+one-shot latch, and nothing tied the rank-2 TCB to the task rank 1 dequeued.
+
+Repair, in place, through existing owners: the selection pins the incarnation's ASID with a read-only
+rank-2 lookup nested in the selecting rank-1 acquisition (`OwnerRevalidationSelection::asid`); ONE
+rank-2 claim (`owner_revalidation_claim_split`) of that exact `{tid, asid}` classifies the convention
+through the one classifier, marks `Running`, consumes the startup latch
+(`consume_resume_convention_locked`, now shared with the exact-token resume), reads the context and
+takes the TLS request, and takes the parked send completion through
+`take_parked_send_completion_locked` (the body `direct_dispatch_take_send_completion_split` now
+delegates to). The frame writer applies the completion's lanes after the context, exactly as the
+exact-token resume does, and binds the FP home to the same pair. A reaped or re-bound TID is
+`Missing` → the existing rollback without requeue; a refused convention or transition is `Refused`
+(mutation-free) → the existing rollback with requeue. A task with no address space keeps the settled
+optional semantics (restores; no owner, no completion can match). Tests: the completed sender resumed
+with its result exactly once and its FP home admitted; a stale-generation completion taken but not
+delivered; a TID re-bound between selection and claim takes nothing; a first-resume snapshot consumed
+once and then refused and requeued. Reverting the repair fails them (§4).
+
+### RISC-V `settle_overtaken_deferral` `ReturnToCurrent` — authenticated
+
+The arm returned whenever ANY task was current. Traced: `current[cpu]` is written only by `cpu`
+itself; on the three drain callers the commit cleared it and nothing on this hart installs one before
+the drain, so there the arm is unreachable. On the terminal-idle caller it is REACHABLE and ordinary:
+the in-lock blocking dispatch installed a task (possibly the woken sender itself, re-selected) and the
+in-lock restore applied that task's context and consumed its parked send completion. That restore
+(`apply_current_thread_to_frame`, arch-neutral) already binds `resume_owner` to the `{tid, asid}` it
+applied; every RISC-V trap frame starts `zeroed()` with no owner.
+
+The RISC-V settlement now applies the SAME shared policy as the x86_64/AArch64 bridge
+(`settle_overtaken_deferral_split`, its cfg widened to riscv64), fed `frame.resume_owner()`: an
+installed current is returned to only if the frame's owner authenticates against it
+(`with_current_fpu_home_split`: current here, nowhere else, resumable, same ASID); an unowned or
+mismatched frame diverges (`RISCV_OVERTAKEN_DEFERRAL_UNAUTHENTICATED`); an empty current takes the one
+acquire. The RISC-V exact-token resume now binds its owner too. Deterministic cases through production
+owners: the base predicate accepting an unowned frame with another task installed (SYNTHETIC on the
+drain callers — only reachable if an owner on this hart installed `current` without a restore); the
+reachable in-lock restore admitted; the re-selected sender admitted with its completion consumed once;
+a replaced incarnation refused. The x86_64/AArch64 overtaken policy is unchanged.
+
+## 4 — controls (final candidate, each in its own worktree, then removed)
+
+CONTROLS_TABLE
+
+## Limits
+
+* The load condition is two CPU-bound shell loops (`( while :; do :; done ) &` ×2) for exactly one boot
+  on a 4-CPU host; it is one documented condition, not a stress characterization.
+* Twenty passing boots measure the reliability of this witness under two conditions; they are not a
+  guarantee. The witness's synchronization is labelled and default-off; everything it waits for is
+  produced by the unchanged production owners.
+* QEMU cannot distinguish a removed barrier: the fence/publication/clear ordering is qualified by
+  `check-riscv64-smp3-sequence.sh` on each built image (source/disassembly only), with its control.
+  Completion-on-return remains the pinned OpenSBI's behaviour (QEMU-SMP3-ACCEPTANCE §5).
+* The x86_64 revalidation repair and the RISC-V authentication are qualified deterministically. No
+  boot in this package's matrix produced the x86_64 interleaving (the revalidation needs a ring-3 trap
+  ending with nothing current while a wake is in flight), and no live RISC-V `ReturnToCurrent`
+  settlement was observed; the live boots show that neither change disturbs the paths they did run.
+* Two CPUs, one QEMU version, one firmware; no real hardware. Excluded as directed: general printk
+  repair, the reply-timeout runner cleanup, other oracle handshakes, migration, more CPUs,
+  lock-contention work.
