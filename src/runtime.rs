@@ -309,6 +309,19 @@ pub(crate) struct OwnerRevalidationSelection {
     /// first entry, for the same reason — a dispatch that enters userspace must mark its task
     /// `Running`, and the exact transition depends on how the task was selected.
     pub(crate) selection: crate::kernel::scheduler::DispatchSelection,
+    /// QEMU-SMP3-SEAL §2 — the address space bound to `tid` AT THE INSTANT OF SELECTION, read
+    /// by a rank-2 lookup nested inside the rank-1 acquisition that dequeued it.
+    ///
+    /// The run queue names tasks by TID only, so the dequeue itself cannot say WHICH incarnation
+    /// it selected; the TCB bound to that TID while the scheduler guard is still held can. Every
+    /// later phase resolves the task by this exact `{tid, asid}` pair, so a TID re-bound to a
+    /// different address space between the two acquisitions reads as absent instead of having
+    /// ITS context, completion and FP home returned to under the selected task's name.
+    ///
+    /// `None` keeps the settled optional semantics (U9-DISPATCH-CPU3 §1/§2): a task with no
+    /// address space still restores, it simply has no exact identity, no owner and no
+    /// completion that could match it.
+    pub(crate) asid: Option<crate::kernel::vm::Asid>,
 }
 
 /// U3 (canonical 203C) — everything the arch restore needs, read in ONE rank-2 acquisition.
@@ -323,6 +336,34 @@ pub(crate) struct OwnerRevalidationSnapshot {
     pub(crate) context: crate::kernel::task::UserRegisterContext,
     pub(crate) tls: Option<usize>,
     pub(crate) asid: Option<crate::kernel::vm::Asid>,
+    /// QEMU-SMP3-SEAL §2 — the incarnation's parked `IpcSend` completion, TAKEN in the same
+    /// acquisition as `context`. Once this snapshot exists it is the only remaining copy, so the
+    /// frame writer must encode it or lose it. Always `None` for the post-switch restore, which
+    /// reads the standing `current` and consumes no completion.
+    pub(crate) send_completion: Option<crate::kernel::task::BlockedSyscallCompletion>,
+    /// QEMU-SMP3-SEAL §2 — this return consumed the incarnation's one-shot startup snapshot
+    /// (`IncomingResumeConvention::X86FirstResume`). Recorded for the marker only; the latch was
+    /// set under the task lock.
+    pub(crate) first_resume: bool,
+}
+
+/// QEMU-SMP3-SEAL §2 — the outcome of the revalidation's one rank-2 claim of the selected
+/// incarnation.
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OwnerRevalidationClaim {
+    /// Marked `Running`, convention consumed, context/TLS read and the parked send completion
+    /// taken — all from the exact selected incarnation.
+    Claimed(OwnerRevalidationSnapshot),
+    /// No TCB carries the selected `{tid, asid}`: reaped, or re-bound to another address space
+    /// after the dequeue. Nothing was taken, and there is nothing of the selected incarnation to
+    /// put back on a queue.
+    Missing,
+    /// The selected incarnation exists but may not be returned to — its continuation is not
+    /// returnable (`classify_incoming_resume_convention` refused) or its status transition was
+    /// refused. Refused strictly before any mutation, so it is still a live queued-able task.
+    Refused,
 }
 
 /// What the x86_64 trap epilogue must do with an [`OwnerRevalidation`].
@@ -735,6 +776,67 @@ impl CpuDispatch {
             Self::Refused { .. } => "refused_no_authority",
             Self::NoneAcceptable { .. } => "none_acceptable",
         }
+    }
+}
+
+/// U6 §8 / QEMU-SMP3-SEAL §2 — THE locked take of one exact incarnation's parked `IpcSend`
+/// completion, under a rank-2 task guard the caller already holds.
+///
+/// Extracted from `direct_dispatch_take_send_completion_split` so every return that can resume a
+/// blocked sender consumes its result through ONE definition: the exact-token resume (keyed by
+/// its mark token) and the x86_64 idle-owner revalidation (keyed by the incarnation its selection
+/// pinned). The decision is unchanged: the TCB must carry exactly `{tid, asid}`; a parked entry of
+/// another class is left untouched for its own consumer; an `IpcSend` entry is TAKEN either way (a
+/// stale one must not linger to be seen by a later block) and RETURNED only on an exact
+/// `{tid, asid, blocked_send_generation}` match, which also clears `ipc_timeout_fired`.
+pub(crate) fn take_parked_send_completion_locked(
+    tcbs: &mut [Option<crate::kernel::task::ThreadControlBlock>],
+    tid: u64,
+    asid: crate::kernel::vm::Asid,
+) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+    let tcb = tcbs
+        .iter_mut()
+        .flatten()
+        .find(|t| t.tid.0 == tid && t.asid == Some(asid))?;
+    let pending = tcb.pending_syscall_completion?;
+    if pending.syscall_class != crate::kernel::task::BlockedSyscallClass::IpcSend {
+        return None;
+    }
+    let exact = pending.matches_tcb(tcb);
+    tcb.pending_syscall_completion = None;
+    if !exact {
+        return None;
+    }
+    tcb.ipc_timeout_fired = false;
+    Some(pending)
+}
+
+/// 203C-XFR / QEMU-SMP3-SEAL §2 — THE consume of a classified resume convention, under the task
+/// guard the classification ran under: a first resume spends the incarnation's one-shot startup
+/// latch, so the same seeded snapshot is returned through exactly once whichever return reached
+/// it (the exact-token resume or the x86_64 idle-owner revalidation).
+pub(crate) fn consume_resume_convention_locked(
+    tcb: &mut crate::kernel::task::ThreadControlBlock,
+    convention: crate::kernel::boot::IncomingResumeConvention,
+) {
+    if matches!(
+        convention,
+        crate::kernel::boot::IncomingResumeConvention::X86FirstResume
+    ) {
+        tcb.first_resume_consumed = true;
+    }
+}
+
+/// U7 §3B: THE delivery point for a blocking-send completion. If an off-lock send-timeout settle
+/// armed the class-retirement seal, this is where it becomes true — a resumed sender has now
+/// consumed the exact parked `TimedOut` result. Arming alone never emits, so a
+/// committed-but-undelivered completion cannot claim the class retired. Called with no lock held
+/// by every consumer of [`take_parked_send_completion_locked`].
+pub(crate) fn note_send_completion_delivered(
+    pending: &crate::kernel::task::BlockedSyscallCompletion,
+) {
+    if pending.result == crate::kernel::boot::KernelState::SEND_COMPLETION_TIMED_OUT {
+        crate::kernel::boot::maybe_emit_send_timeout_class_retired();
     }
 }
 
@@ -2173,6 +2275,33 @@ impl SharedKernel {
     /// reachable behavior exactly. The `restorable` requeue arm below is nevertheless kept and
     /// implemented, because the twelve-point contract requires a still-live task to go back on
     /// THIS cpu's queue, and a future fallible restore step must not silently strand it.
+    ///
+    /// **QEMU-SMP3-SEAL §2 — the return must be the selected incarnation's continuation.** Steps
+    /// 1 and 4 above are superseded as follows. The retired body, and this transaction until now,
+    /// resolved the selected task by a bare TID in two separate acquisitions and restored its
+    /// SAVED CONTEXT only. That is not the continuation of every task this owner can select:
+    ///
+    /// * a blocked SENDER on this CPU whose drain settled idle is completed by a receiver on
+    ///   another CPU, which parks the send's result as an `IpcSend` completion and wakes the
+    ///   sender back onto this CPU's queue — then this trap's epilogue runs the revalidation. The
+    ///   saved context is the PRE-BLOCK register file; the result lives only in the parked
+    ///   completion, which the exact-token resume consumes and this owner did not. The sender
+    ///   returned to ring 3 with its argument lanes as its result and the completion stayed parked
+    ///   for a later block to trip over (reproduced by
+    ///   `base_x86_revalidation_resumes_an_overtaken_sender_without_its_completion`);
+    /// * a never-run task's one-shot startup snapshot was returned through without its latch being
+    ///   set, so a later exact-token classification could deliver the startup ABI a second time;
+    /// * nothing tied the TCB read in rank 2 to the task rank 1 dequeued.
+    ///
+    /// The transaction therefore pins the incarnation's ASID inside the selecting acquisition
+    /// ([`OwnerRevalidationSelection::asid`]) and performs ONE rank-2 claim
+    /// ([`Self::owner_revalidation_claim_split`]) of that exact `{tid, asid}`: classify the
+    /// convention through the one classifier, mark `Running`, consume the startup latch, read the
+    /// context and take the TLS request, and take the parked send completion through the same
+    /// locked helper the exact-token resume uses. The frame writer applies the completion's lanes
+    /// after the context, exactly as `x86_post_lock_resume_marked_incoming` does, and binds the FP
+    /// home to the same pair. A missing incarnation rolls back without requeueing; a refused one
+    /// rolls back with requeueing — both through the EXISTING rollback.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn revalidate_idle_owner_after_drains(
         &self,
@@ -2191,83 +2320,51 @@ impl SharedKernel {
         if next == 0 {
             return OwnerRevalidation::Idle;
         }
-        // (4) rank 2, one acquisition. `None` is the legacy `thread_user_context(next).is_none()`
-        // verdict: a task still in a run queue whose TCB has been reaped must be a restore
-        // failure, never a silent return into ring 3 on the previous task's frame.
-        let snapshot = self.owner_revalidation_snapshot_split(next);
-        if let Some(snapshot) = snapshot {
-            // U9-DISPATCH-CPU3 §3 — MARK IT RUNNING, before any frame is written.
-            //
-            // This owner selects a task, loads its saved user context into the trap frame and
-            // reports `Replacement(next)`, on which the x86_64 trap tail `iretq`s into ring 3. It
-            // did all of that without ever moving the task's status: the task entered userspace
-            // still `Runnable`, so the scheduler and the task table disagreed about what was
-            // running on this CPU for the whole of its timeslice. The next `PreemptOutgoing`
-            // (`Running -> Runnable`) would then refuse, because its `expected_from` is `Running`.
-            //
-            // This is the SAME defect U9-DISPATCH-CPU1 D4 repaired at the AP's first userspace
-            // entry, on the second path that reaches userspace without the broad dispatcher — and
-            // it is repaired the same way, through the same owners: the provenance-preserving
-            // selection above, and the one rank-2 mark seam here. No new transition, no second
-            // policy; `d6_genuine_mark_running_via_task_seam` owns all five outcomes and its
-            // refusals are the ones this caller already handles.
-            //
-            // A refusal takes the EXISTING restore-failure path below, which clears `current` and
-            // undoes the queue advance exactly — the same settlement an unrestorable snapshot
-            // takes, because "cannot be marked" and "cannot be restored" have the same remedy:
-            // do not return through a frame this CPU has no right to.
-            // The STATUS transition only. Deliberately `apply_dispatch_transition` rather than
-            // `d6_genuine_mark_running_via_task_seam`: the seam also requires an exact
-            // incarnation, and whether an incarnation is a precondition of BROAD dispatch is a
-            // separate question with a separate answer (U9-DISPATCH-CPU3 §1/§2 — it is not, and
-            // the AArch64 userspace boundary is where that is enforced). Folding both changes into
-            // one would re-litigate a settled contract while repairing a different defect. This is
-            // the SAME transition, through the SAME owner, that
-            // `commit_dispatch_selection_in_lock` applies for `dispatch_next_task`; the provenance
-            // chooses between `DispatchIncoming` and `ContinueCurrent` exactly as it does there.
-            let transition = match selection.selection {
-                crate::kernel::scheduler::DispatchSelection::Dequeued { .. } => {
-                    Some(crate::kernel::task_transition::TaskTransition::DispatchIncoming)
+        // (4) rank 2, ONE acquisition, of the EXACT incarnation the selection pinned.
+        //
+        // U9-DISPATCH-CPU3 §3 — the `Runnable -> Running` mark happens here, before any frame is
+        // written: this owner `iretq`s into ring 3 on `Replacement`, and a task entering
+        // userspace still `Runnable` leaves the scheduler and the task table disagreeing about
+        // what runs on this CPU (the next `PreemptOutgoing` then refuses). It is the SAME
+        // transition, through the SAME owner, that `commit_dispatch_selection_in_lock` applies,
+        // with the provenance choosing between `DispatchIncoming` and `ContinueCurrent`.
+        //
+        // QEMU-SMP3-SEAL §2 — the mark, the convention consume, the context/TLS read and the
+        // parked send completion's take now share that ONE acquisition, keyed by the pinned
+        // `{tid, asid}`. They used to be two acquisitions keyed by the bare TID, with the TLS
+        // request taken BEFORE a mark that could still refuse.
+        match self.owner_revalidation_claim_split(selection) {
+            OwnerRevalidationClaim::Claimed(snapshot) => {
+                if let Some(done) = snapshot.send_completion {
+                    note_send_completion_delivered(&done);
                 }
-                crate::kernel::scheduler::DispatchSelection::ContinuedCurrent { .. } => {
-                    Some(crate::kernel::task_transition::TaskTransition::ContinueCurrent)
-                }
-                crate::kernel::scheduler::DispatchSelection::Idle => None,
-            };
-            if let Some(transition) = transition {
-                let marked = self.with_task_tcbs_split_mut(|tcbs| {
-                    crate::kernel::task_transition::apply_dispatch_transition(
-                        tcbs, next, transition,
-                    )
-                    .map_err(|refusal| {
-                        crate::kernel::task_transition::log_transition_refusal(
-                            "owner_revalidation",
-                            next,
-                            transition,
-                            refusal,
-                        )
-                    })
-                    .is_ok()
-                });
-                if !marked {
-                    crate::yarm_log!(
-                        "EXIT_TASK_OWNER_REVALIDATE_MARK_REFUSED arch=x86_64 cpu={} tid={}",
-                        selection.cpu.0,
-                        next
-                    );
-                    return self.owner_revalidation_rollback_split(selection, true);
-                }
+                // (6) No lock held: frame, completion lanes, FP home, FS base, per-CPU TLS
+                // record, pre-IRET CR3 invariant.
+                crate::arch::x86_64::trap::x86_apply_owner_revalidation_restore(
+                    self, cpu, next, snapshot, frame,
+                );
+                OwnerRevalidation::Replacement(next)
             }
-            // (6) No lock held: frame, FS base, per-CPU TLS record, pre-IRET CR3 invariant.
-            crate::arch::x86_64::trap::x86_apply_owner_revalidation_restore(
-                self, cpu, next, snapshot, frame,
-            );
-            return OwnerRevalidation::Replacement(next);
+            // A refusal is raised before any mutation, so the task is still live: the EXISTING
+            // rollback clears `current` and puts it back on THIS cpu's queue. "Cannot be marked"
+            // and "cannot be returned to" have the same remedy — do not return through a frame
+            // this CPU has no right to.
+            OwnerRevalidationClaim::Refused => {
+                crate::yarm_log!(
+                    "EXIT_TASK_OWNER_REVALIDATE_MARK_REFUSED arch=x86_64 cpu={} tid={}",
+                    selection.cpu.0,
+                    next
+                );
+                self.owner_revalidation_rollback_split(selection, true)
+            }
+            // (7) Undo the queue advance. Clearing `current` is mandatory; re-enqueueing is only
+            // meaningful for the incarnation that was selected — a reaped one has nothing to run,
+            // and a TID now bound to another address space is not the task that was queued, so
+            // neither is resurrected into a run queue.
+            OwnerRevalidationClaim::Missing => {
+                self.owner_revalidation_rollback_split(selection, false)
+            }
         }
-        // (7) Undo the queue advance. Clearing `current` is mandatory; re-enqueueing is only
-        // meaningful for a task that still exists — a reaped one has nothing to run and must
-        // not be resurrected into a run queue.
-        self.owner_revalidation_rollback_split(selection, snapshot.is_some())
     }
 
     /// U3 (203C) — phase 1 of [`Self::revalidate_idle_owner_after_drains`], rank 1 only.
@@ -2277,7 +2374,10 @@ impl SharedKernel {
     /// `dispatch_next_on` selected nothing. The bind happens only after a successful
     /// validation and before the advance, matching `set_current_cpu` followed by the closure.
     #[cfg(target_arch = "x86_64")]
-    fn owner_revalidation_select_split(&self, cpu: CpuId) -> Option<OwnerRevalidationSelection> {
+    pub(crate) fn owner_revalidation_select_split(
+        &self,
+        cpu: CpuId,
+    ) -> Option<OwnerRevalidationSelection> {
         self.with_scheduler_split_mut(|sched| {
             kernel_ref(&sched.scheduler).validate_online_cpu(cpu).ok()?;
             sched.current_cpu = cpu;
@@ -2287,10 +2387,116 @@ impl SharedKernel {
             // userspace with the scheduler and the task table disagreeing about its status.
             let selection = kernel_mut(&mut sched.scheduler).dispatch_next_selection_on(cpu);
             let tid = selection.tid()?.0;
+            // QEMU-SMP3-SEAL §2 — pin the incarnation while the dequeue is still this guard's.
+            // A READ-ONLY rank-2 lookup nested inside rank 1 (ascending, the shape
+            // `post_lock_exit_validation_split` uses); nothing in the task domain is written here.
+            let asid = self.with_task_tcbs_split_mut(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .and_then(|t| t.asid)
+            });
             Some(OwnerRevalidationSelection {
                 cpu,
                 tid,
                 selection,
+                asid,
+            })
+        })
+    }
+
+    /// QEMU-SMP3-SEAL §2 — phase 2 of [`Self::revalidate_idle_owner_after_drains`]: claim the
+    /// EXACT selected incarnation in ONE rank-2 acquisition, or refuse before any mutation.
+    ///
+    /// In order, under one task guard:
+    ///
+    /// 1. resolve the TCB by `{tid, selection.asid}` — a reaped TID, or one now bound to another
+    ///    address space, is `Missing` and nothing is touched;
+    /// 2. for a task with an address space, classify its resume convention through THE one
+    ///    classifier (`classify_incoming_resume_convention`, the exact-token apply). A refusal —
+    ///    a continuation `flush_trap_context_to_iret_frame` would decline to install, or a
+    ///    startup snapshot already consumed — is `Refused`. A task with no address space keeps
+    ///    the settled optional semantics: it has no exact identity and no convention to consume;
+    /// 3. the `Runnable -> Running` mark through `apply_dispatch_transition`; a refusal is
+    ///    `Refused` and, being the transition's own refusal, mutated nothing;
+    /// 4. set the one-shot startup latch when step 2 classified a first resume — what
+    ///    `direct_dispatch_classify_and_consume_convention_split` does for the exact-token resume;
+    /// 5. read the saved context and take the TLS request (`read_user_context_and_take_tls`);
+    /// 6. take the parked `IpcSend` completion through [`take_parked_send_completion_locked`], the
+    ///    helper `direct_dispatch_take_send_completion_split` delegates to, so the two returns
+    ///    cannot disagree about what "exactly this task's result" means.
+    ///
+    /// No lock is taken other than rank 2, and nothing here touches the frame or hardware.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn owner_revalidation_claim_split(
+        &self,
+        selection: OwnerRevalidationSelection,
+    ) -> OwnerRevalidationClaim {
+        use crate::kernel::scheduler::DispatchSelection;
+        use crate::kernel::task_transition::TaskTransition;
+        let tid = selection.tid;
+        let pinned = selection.asid;
+        let transition = match selection.selection {
+            DispatchSelection::Dequeued { .. } => Some(TaskTransition::DispatchIncoming),
+            DispatchSelection::ContinuedCurrent { .. } => Some(TaskTransition::ContinueCurrent),
+            DispatchSelection::Idle => None,
+        };
+        self.with_task_return_split_mut(|tcbs, tls_pending| {
+            let Some(slot) = tcbs.iter().position(|t| {
+                t.as_ref()
+                    .is_some_and(|t| t.tid.0 == tid && t.asid == pinned)
+            }) else {
+                return OwnerRevalidationClaim::Missing;
+            };
+            let convention = match pinned {
+                Some(_) => {
+                    let Some(tcb) = tcbs[slot].as_ref() else {
+                        return OwnerRevalidationClaim::Missing;
+                    };
+                    match crate::kernel::boot::classify_incoming_resume_convention(
+                        tcb,
+                        crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
+                    ) {
+                        Some(convention) => Some(convention),
+                        None => return OwnerRevalidationClaim::Refused,
+                    }
+                }
+                None => None,
+            };
+            if let Some(transition) = transition
+                && let Err(refusal) =
+                    crate::kernel::task_transition::apply_dispatch_transition(tcbs, tid, transition)
+            {
+                crate::kernel::task_transition::log_transition_refusal(
+                    "owner_revalidation",
+                    tid,
+                    transition,
+                    refusal,
+                );
+                return OwnerRevalidationClaim::Refused;
+            }
+            if let Some(convention) = convention
+                && let Some(tcb) = tcbs[slot].as_mut()
+            {
+                consume_resume_convention_locked(tcb, convention);
+            }
+            let first_resume = matches!(
+                convention,
+                Some(crate::kernel::boot::IncomingResumeConvention::X86FirstResume)
+            );
+            let Some((context, tls)) =
+                crate::kernel::task::read_user_context_and_take_tls(tcbs, tls_pending, tid, pinned)
+            else {
+                return OwnerRevalidationClaim::Missing;
+            };
+            let send_completion =
+                pinned.and_then(|asid| take_parked_send_completion_locked(tcbs, tid, asid));
+            OwnerRevalidationClaim::Claimed(OwnerRevalidationSnapshot {
+                context,
+                tls,
+                asid: pinned,
+                send_completion,
+                first_resume,
             })
         })
     }
@@ -2327,7 +2533,13 @@ impl SharedKernel {
                 }
                 None => None,
             };
-            Some(OwnerRevalidationSnapshot { context, tls, asid })
+            Some(OwnerRevalidationSnapshot {
+                context,
+                tls,
+                asid,
+                send_completion: None,
+                first_resume: false,
+            })
         })
     }
 
@@ -4679,7 +4891,6 @@ impl SharedKernel {
         &self,
         token: DispatchMarkToken,
     ) -> Option<crate::kernel::boot::IncomingResumeConvention> {
-        use crate::kernel::boot::IncomingResumeConvention;
         let incoming = token.tid();
         let expected = token.expect_asid()?;
         self.with_task_tcbs_split_mut(|tcbs| {
@@ -4691,9 +4902,7 @@ impl SharedKernel {
                 tcb,
                 crate::kernel::boot::QueueAdvanceApply::ExactTokenResume,
             )?;
-            if matches!(convention, IncomingResumeConvention::X86FirstResume) {
-                tcb.first_resume_consumed = true;
-            }
+            consume_resume_convention_locked(tcb, convention);
             Some(convention)
         })
     }
@@ -4850,32 +5059,9 @@ impl SharedKernel {
         let incoming = token.tid();
         let expected = token.expect_asid()?;
         self.with_task_tcbs_split_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|t| t.tid.0 == incoming && t.asid == Some(expected))?;
-            let pending = tcb.pending_syscall_completion?;
-            if pending.syscall_class != crate::kernel::task::BlockedSyscallClass::IpcSend {
-                return None;
-            }
-            let exact = pending.matches_tcb(tcb);
-            tcb.pending_syscall_completion = None;
-            if !exact {
-                return None;
-            }
-            tcb.ipc_timeout_fired = false;
-            Some(pending)
+            take_parked_send_completion_locked(tcbs, incoming, expected)
         })
-        .inspect(|pending| {
-            // U7 §3B: THE delivery point for a blocking-send completion. If an off-lock
-            // send-timeout settle armed the class-retirement seal, this is where it becomes
-            // true — a resumed sender has now consumed the exact parked `TimedOut` result.
-            // Arming alone never emits, so a committed-but-undelivered completion cannot claim
-            // the class retired.
-            if pending.result == crate::kernel::boot::KernelState::SEND_COMPLETION_TIMED_OUT {
-                crate::kernel::boot::maybe_emit_send_timeout_class_retired();
-            }
-        })
+        .inspect(note_send_completion_delivered)
     }
 
     /// U3 (canonical 203C) — the RISC-V post-lock `CurrentTaskExited` validation snapshot.

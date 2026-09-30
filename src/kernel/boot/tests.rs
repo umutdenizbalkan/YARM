@@ -108479,6 +108479,7 @@ mod stage200d2b1d5a_owner_revalidation {
             one("pub(crate) fn revalidate_idle_owner_after_drains("),
             one("fn owner_revalidation_select_split("),
             one("fn owner_revalidation_snapshot_split("),
+            one("fn owner_revalidation_claim_split("),
             one("fn owner_revalidation_rollback_split("),
         ]
         .join("\n")
@@ -108561,9 +108562,26 @@ mod stage200d2b1d5a_owner_revalidation {
             body.contains("if next == 0 {") && body.contains("return OwnerRevalidation::Idle;"),
             "the idle/supervisor sentinel must report `Idle`"
         );
-        assert!(
-            body.contains("return OwnerRevalidation::Replacement(next);"),
+        // QEMU-SMP3-SEAL §2: `Replacement` is the value of the `Claimed` arm alone — the only arm
+        // holding a snapshot of the exact selected incarnation.
+        assert_eq!(
+            body.matches("OwnerRevalidation::Replacement(next)").count(),
+            1,
             "only a restored task may be reported as a committed replacement"
+        );
+        let claimed = body
+            .find("OwnerRevalidationClaim::Claimed(snapshot) => {")
+            .expect("the claimed arm");
+        let ok = body
+            .find("OwnerRevalidation::Replacement(next)")
+            .expect("the replacement");
+        let next_arm = body[claimed..]
+            .find("OwnerRevalidationClaim::Refused =>")
+            .map(|i| claimed + i)
+            .expect("the refused arm follows");
+        assert!(
+            claimed < ok && ok < next_arm,
+            "the replacement is reported inside the `Claimed` arm and nowhere else"
         );
         // U3 (203C): the arch tail moved to `x86_apply_owner_revalidation_restore`, which
         // applies the snapshot the rank-2 phase captured — with no lock held.
@@ -108843,6 +108861,7 @@ mod stage200d2b1d5b_restore_contract {
             one("pub(crate) fn revalidate_idle_owner_after_drains("),
             one("fn owner_revalidation_select_split("),
             one("fn owner_revalidation_snapshot_split("),
+            one("fn owner_revalidation_claim_split("),
             one("fn owner_revalidation_rollback_split("),
         ]
         .join("\n")
@@ -109113,23 +109132,19 @@ mod stage200d2b1d5b_restore_contract {
     #[test]
     fn h08_seam_establishes_restorability_before_reporting_success() {
         let body = seam();
-        // U3 (203C): restorability is now the rank-2 snapshot's OWN verdict — `None` is
-        // exactly `thread_user_context(next).is_none()`, decided in the same acquisition that
-        // captures the payload, so the two can no longer disagree. `Replacement` is reachable
-        // only through that `Some`, which is a stronger gate than the old ordered pair.
+        // QEMU-SMP3-SEAL §2: restorability is the rank-2 CLAIM's own verdict, decided in the one
+        // acquisition that also marks the task and takes its payload, keyed by the incarnation
+        // the selection pinned. `Replacement` is reachable only through `Claimed`, which is a
+        // stronger gate than U3's bare-TID snapshot (which it supersedes on this path).
         let check = body
-            .find("let snapshot = self.owner_revalidation_snapshot_split(next);")
+            .find("match self.owner_revalidation_claim_split(selection) {")
             .expect("the seam must establish restorability");
         let ok = body
-            .find("return OwnerRevalidation::Replacement(next);")
-            .expect("the success return");
+            .find("OwnerRevalidation::Replacement(next)")
+            .expect("the success value");
         assert!(
             check < ok,
             "restorability must be established before success"
-        );
-        assert!(
-            body.contains("if let Some(snapshot) = snapshot {"),
-            "the success path must be gated on restorability"
         );
         // Restorability alone is not success: the captured context must actually be APPLIED
         // before the commit. Without this, dropping the call would leave the frame holding the
@@ -109141,11 +109156,18 @@ mod stage200d2b1d5b_restore_contract {
             check < restore_call && restore_call < ok,
             "order must be: establish restorability -> apply the restore -> report success"
         );
-        // The snapshot's `None` arm is the ONLY route to the rollback, so an unrestorable
-        // selection can never reach the replacement commit.
+        // A missing incarnation is the ONLY route to the non-requeueing rollback, and a refused
+        // one to the requeueing rollback, so neither can reach the replacement commit.
+        let dense: alloc::string::String = body.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            body.contains("self.owner_revalidation_rollback_split(selection, snapshot.is_some())"),
-            "an unrestorable selection must fall through to the rollback"
+            dense.contains(
+                "OwnerRevalidationClaim::Missing=>{self.owner_revalidation_rollback_split(selection,false)}"
+            ),
+            "an unrestorable selection must fall through to the rollback, not requeued"
+        );
+        assert!(
+            dense.contains("self.owner_revalidation_rollback_split(selection,true)"),
+            "a refused claim takes the existing requeueing rollback"
         );
         // And the swallow it defends against is really there.
         let restore = include_str!("../../arch/x86_64/trap.rs")
@@ -129588,16 +129610,27 @@ mod u3_owner_revalidation_transaction {
             1,
             "rank 1, one acquisition"
         );
-        assert!(
-            !select.contains("split_mut(|tcbs") && !select.contains("with_task_"),
-            "the selection phase takes no task lock"
-        );
         // Validation precedes the bind, which precedes the advance.
         let v = select.find("validate_online_cpu").expect("validate");
         let bind = select.find("current_cpu = cpu").expect("bind");
         let adv = select.find("dispatch_next_selection_on(").expect("advance");
         assert!(v < bind && bind < adv, "validate -> bind -> advance");
+        // QEMU-SMP3-SEAL §2: the ONE task-domain touch in the selection is a read-only lookup of
+        // the selected TID's ASID, nested INSIDE rank 1 (ascending) after the advance — the pin
+        // that lets every later phase name the exact incarnation that was dequeued.
+        assert_eq!(
+            select.matches("with_task_tcbs_split_mut").count(),
+            1,
+            "one nested rank-2 lookup"
+        );
+        assert!(
+            !select.contains("with_task_return_split_mut") && !select.contains("iter_mut"),
+            "the nested lookup is read-only"
+        );
+        let pin = select.find("with_task_tcbs_split_mut").expect("pin");
+        assert!(adv < pin, "the pin reads the task the advance selected");
 
+        // The post-switch gather is unchanged: rank 2 only, one acquisition, no status write.
         let snap = body_of(RUNTIME, "fn owner_revalidation_snapshot_split");
         assert_eq!(
             snap.matches("with_task_return_split_mut").count(),
@@ -129613,52 +129646,72 @@ mod u3_owner_revalidation_transaction {
             "the snapshot writes no TaskStatus"
         );
 
-        // The composed body: rank 1 fully released before rank 2, which is fully released
-        // before the arch application.
+        // The claim: rank 2 only, ONE acquisition, keyed by the pinned incarnation, and ordered
+        // resolve -> classify -> mark -> consume -> context/TLS -> send completion.
+        let claim = body_of(RUNTIME, "fn owner_revalidation_claim_split");
+        assert_eq!(
+            claim.matches("with_task_return_split_mut").count(),
+            1,
+            "rank 2, one acquisition"
+        );
+        assert!(
+            !claim.contains("with_scheduler_split_mut")
+                && !claim.contains("with_task_tcbs_split_mut"),
+            "no second acquisition of either domain"
+        );
+        let at = |needle: &str| {
+            claim
+                .find(needle)
+                .unwrap_or_else(|| panic!("the claim must contain `{needle}`"))
+        };
+        let resolve = at("t.tid.0 == tid && t.asid == pinned");
+        let classify = at("classify_incoming_resume_convention(");
+        let mark = at("apply_dispatch_transition(");
+        let consume = at("consume_resume_convention_locked(");
+        let context = at("read_user_context_and_take_tls(");
+        let send = at("take_parked_send_completion_locked(");
+        assert!(
+            resolve < classify
+                && classify < mark
+                && mark < consume
+                && consume < context
+                && context < send,
+            "resolve -> classify -> mark -> consume -> context -> completion"
+        );
+        assert!(
+            !claim.contains(".status ="),
+            "the mark goes through the typed transition owner, never a raw status write"
+        );
+
+        // The composed body: select, then the claim, then the arch application — and the two
+        // existing rollbacks as the only other settlements.
         let outer = body_of(RUNTIME, "pub(crate) fn revalidate_idle_owner_after_drains");
         let sel = outer
             .find("owner_revalidation_select_split")
             .expect("select");
-        let sn = outer
-            .find("owner_revalidation_snapshot_split")
-            .expect("snapshot");
+        let cl = outer.find("owner_revalidation_claim_split").expect("claim");
         let apply = outer
             .find("x86_apply_owner_revalidation_restore")
             .expect("apply");
-        let rb = outer
-            .find("owner_revalidation_rollback_split")
-            .expect("rollback");
-        // U9-DISPATCH-CPU3 §3: a fourth phase sits between the snapshot and the frame write —
-        // the exact `Runnable -> Running` mark, applied through the task-transition owner BEFORE
-        // any frame is committed, so a refused mark leaves nothing to undo but the queue advance.
-        let mark = outer
-            .find("apply_dispatch_transition(")
-            .expect("the mark phase");
+        assert!(sel < cl && cl < apply, "select -> claim -> apply");
         assert!(
-            sel < sn && sn < mark && mark < apply,
-            "select -> snapshot -> mark -> apply"
-        );
-        // The rollback now appears TWICE, and both are the same existing settlement: once for a
-        // refused mark (before any frame write) and once for an unrestorable snapshot. `rb` is the
-        // first of them, which is the mark's — so the tail rollback is asserted by count.
-        assert!(
-            mark < rb,
-            "a refused mark rolls back before anything is committed"
+            !outer.contains("owner_revalidation_snapshot_split")
+                && !outer.contains("apply_dispatch_transition("),
+            "the bare-TID gather and the separate mark acquisition are retired from this path"
         );
         assert_eq!(
             outer.matches("owner_revalidation_rollback_split(").count(),
             2,
-            "exactly two settlements, both the existing rollback: refused mark, unrestorable \
-             snapshot. A third would mean a new settlement was introduced"
+            "exactly two settlements, both the existing rollback: refused claim (requeue) and \
+             missing incarnation (no requeue). A third would mean a new settlement was introduced"
         );
         assert!(
             outer.contains("owner_revalidation_rollback_split(selection, true)"),
-            "and a refused mark takes the EXISTING rollback, not a new settlement"
+            "and a refused claim takes the EXISTING rollback, not a new settlement"
         );
         assert!(
             !outer.contains(".status ="),
-            "the transaction writes no RAW TaskStatus — the mark goes through the typed \
-             transition owner, exactly as `commit_dispatch_selection_in_lock` does"
+            "the transaction writes no RAW TaskStatus"
         );
     }
 
@@ -135099,9 +135152,29 @@ mod u7_production_timeout_promotion {
             .split("\n    /// ")
             .next()
             .expect("its body");
+        // QEMU-SMP3-SEAL §2: the delivery point is one free function shared by every consumer of
+        // the locked take (the exact-token resume and the x86_64 idle-owner revalidation).
         assert!(
-            delivery.contains("maybe_emit_send_timeout_class_retired();"),
+            delivery.contains(".inspect(note_send_completion_delivered)"),
+            "the exact-token delivery point routes through the shared notifier"
+        );
+        let notifier = RUNTIME_SRC
+            .split("pub(crate) fn note_send_completion_delivered(")
+            .nth(1)
+            .expect("the shared notifier")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            notifier.contains("maybe_emit_send_timeout_class_retired();"),
             "and only the delivery point emits"
+        );
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("crate::kernel::boot::maybe_emit_send_timeout_class_retired();")
+                .count(),
+            1,
+            "exactly one emitter in the runtime"
         );
     }
 }
@@ -146760,6 +146833,17 @@ mod u9qa_apply_convention {
                 .count(),
             1,
             "the one-shot snapshot is consumed in exactly one place"
+        );
+        // QEMU-SMP3-SEAL §2: that one place is a locked helper, and the two returns that can
+        // reach a first resume — the exact-token resume and the x86_64 idle-owner revalidation —
+        // both call it, each after the SAME classifier, so neither can return through a seeded
+        // snapshot without spending its latch.
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("consume_resume_convention_locked(tcb, convention);")
+                .count(),
+            2,
+            "both returns consume through the one helper"
         );
         // No first-resume logic in the trap entry, and no fabricated identity or token: the
         // convention is always derived from the token's exact incarnation.

@@ -486,6 +486,35 @@ pub(crate) fn x86_apply_owner_revalidation_restore(
     if let Some(asid) = snapshot.asid {
         frame.bind_resume_owner(crate::runtime::FpuHomeOwner { tid, asid });
     }
+    if snapshot.first_resume {
+        crate::yarm_log!(
+            "X86_OWNER_REVALIDATION_FIRST_RESUME tid={} cpu={} entry=0x{:x} sp=0x{:x} arg0={} result=ok",
+            tid,
+            cpu.0,
+            snapshot.context.instruction_ptr.0,
+            snapshot.context.stack_ptr.0,
+            snapshot.context.arg0
+        );
+    }
+    // QEMU-SMP3-SEAL §2 — a revalidated SENDER's result, exactly as the exact-token resume
+    // encodes it (`x86_post_lock_resume_marked_incoming`, U6 §8): after `apply_user_context`,
+    // which reloads the pre-block register snapshot and would otherwise restore over it, in the
+    // lanes an ordinary `ipc_send` return uses. RIP is untouched. The completion was taken from
+    // the same incarnation, in the same acquisition, as the context just applied.
+    if let Some(done) = snapshot.send_completion {
+        if done.result == 0 {
+            frame.set_ok(0, 0, 0);
+        } else {
+            frame.set_err(done.result as usize);
+        }
+        crate::yarm_log!(
+            "X86_BLOCKED_SEND_COMPLETION_CONSUMED tid={} class={} result={} blocked_generation={} site=owner_revalidation result=ok",
+            tid,
+            done.syscall_class.slug(),
+            done.result,
+            done.blocked_generation
+        );
+    }
     let tls = snapshot.tls.unwrap_or(0);
     restore_fs_base_if_needed(tls);
     let idx = cpu.0 as usize;

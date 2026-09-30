@@ -200,14 +200,18 @@ fn base_futex_wait_overtaken_leaves_a_queued_task_in_the_frame() {
 }
 
 /// The x86_64 base did not halt: its trap tail found `current == None` and ran the owner
-/// revalidation, which selects from the run queue and restores the selected task's SAVED CONTEXT.
+/// revalidation, which selected from the run queue and restored the selected task's SAVED CONTEXT.
 /// For a blocked SENDER that is not the continuation: the result of the send lives in the parked
-/// `IpcSend` completion the receiver published, which only the exact-token resume consumes. The
-/// revalidated sender resumes with its pre-block lanes and the completion stays parked.
-#[test]
-fn base_x86_revalidation_resumes_an_overtaken_sender_without_its_completion() {
-    let fx = fixture();
-    // The blocking-send commit: W blocked in EndpointSend, `current` cleared, the cell armed.
+/// `IpcSend` completion the receiver published, which only the exact-token resume consumed.
+///
+/// QEMU-SMP3-SEAL §2 — the same shape is reachable WITHOUT the overtaken drain: the sender's drain
+/// re-verifies it `Blocked` and settles idle, and only then does the receiver on CPU 1 complete the
+/// send and wake it back onto CPU 0, before this trap's epilogue runs the revalidation. The base
+/// revalidation's body was exactly the composition replayed here, through the owners it called:
+/// one queue advance, the bare-TID gather `owner_revalidation_snapshot_split` (reached through its
+/// post-switch forwarder), and the frame writer. The sender resumes with its pre-block lanes and
+/// the completion stays parked.
+fn sender_completed_after_its_drain_settled_idle(fx: &Fixture) {
     fx.k.with(|s| {
         s.set_task_status_for_test(
             W,
@@ -217,8 +221,7 @@ fn base_x86_revalidation_resumes_an_overtaken_sender_without_its_completion() {
         );
         assert_eq!(s.block_current_cpu(), Some(W), "the commit clears current");
     });
-    assert!(crate::kernel::boot::d2_send_dispatch_try_defer(0, W));
-    // The overtaking receiver on CPU 1: it parks the sender's result, then wakes it.
+    // The receiver on CPU 1: it parks the sender's result, then wakes it onto its home CPU.
     fx.k.with(|s| {
         s.set_pending_syscall_completion_of_class_for_test(
             W,
@@ -228,15 +231,24 @@ fn base_x86_revalidation_resumes_an_overtaken_sender_without_its_completion() {
         s.set_task_status_for_test(W, TaskStatus::Runnable);
         s.enqueue_task(W).expect("wake");
     });
-    assert!(
-        !fx.k.d2_send_reverify_blocked(W),
-        "the drain's re-verify fails"
-    );
-    crate::kernel::boot::d2_send_dispatch_clear(0);
+}
 
+#[test]
+fn base_x86_revalidation_resumes_an_overtaken_sender_without_its_completion() {
+    let fx = fixture();
+    sender_completed_after_its_drain_settled_idle(&fx);
     let mut frame = owned_entry_frame(W, fx.w_asid);
-    let outcome = fx.k.revalidate_idle_owner_after_drains(CPU0, &mut frame);
-    assert_eq!(outcome, crate::runtime::OwnerRevalidation::Replacement(W));
+    // The base body, owner for owner.
+    let next =
+        fx.k.with(|s| s.dispatch_next_on_cpu(CPU0))
+            .expect("one advance");
+    assert_eq!(next, W);
+    let snapshot =
+        fx.k.post_switch_restore_snapshot_split(next)
+            .expect("bare-TID gather");
+    crate::arch::x86_64::trap::x86_apply_owner_revalidation_restore(
+        &fx.k, CPU0, next, snapshot, &mut frame,
+    );
     assert_eq!(frame.saved_pc(), fx.w_saved.instruction_ptr.0 as usize);
     assert_eq!(
         (frame.ret0, frame.error),
@@ -247,6 +259,171 @@ fn base_x86_revalidation_resumes_an_overtaken_sender_without_its_completion() {
         fx.k.with(|s| s.has_pending_syscall_completion(W)),
         "the sender's completion was never consumed"
     );
+    clear_cells();
+}
+
+/// QEMU-SMP3-SEAL §2 — the repaired revalidation returns the sender through its continuation:
+/// its committed context, then the parked completion's lanes, the FP home bound to the same
+/// incarnation, marked `Running`, the completion consumed exactly once.
+#[test]
+fn revalidation_resumes_a_completed_sender_with_its_parked_result_exactly_once() {
+    let fx = fixture();
+    sender_completed_after_its_drain_settled_idle(&fx);
+    let mut frame = owned_entry_frame(W, fx.w_asid);
+    assert_eq!(
+        fx.k.revalidate_idle_owner_after_drains(CPU0, &mut frame),
+        crate::runtime::OwnerRevalidation::Replacement(W)
+    );
+    assert_eq!(frame.saved_pc(), fx.w_saved.instruction_ptr.0 as usize);
+    assert_eq!(frame.saved_sp(), fx.w_saved.stack_ptr.0 as usize);
+    assert_eq!(
+        frame.error, SEND_RESULT as usize,
+        "the send's result reaches the frame, over the pre-block lanes"
+    );
+    assert_eq!(frame.resume_owner(), Some(w_owner(&fx)));
+    assert!(
+        !fx.k.with(|s| s.has_pending_syscall_completion(W)),
+        "consumed"
+    );
+    assert_eq!(status(&fx.k, W), Some(TaskStatus::Running));
+    assert_eq!(fx.k.current_tid_split_read(CPU0), Some(W));
+    assert!(queued(&fx.k, CPU0).is_empty());
+    assert_eq!(
+        fx.k.settle_user_fpu_return_split(CPU0, frame.resume_owner()),
+        UserFpuReturn::Install {
+            owner: w_owner(&fx),
+            state: crate::kernel::user_fpu::UserFpuState::initial(),
+        },
+        "the return's FP/SIMD home is the resumed incarnation's"
+    );
+    // Exactly once: the same completion cannot be found again by either consumer.
+    let mut again = owned_entry_frame(W, fx.w_asid);
+    fx.k.with(|s| {
+        assert_eq!(s.block_current_cpu(), Some(W));
+        s.set_task_status_for_test(W, TaskStatus::Runnable);
+        s.enqueue_task(W).expect("requeue");
+    });
+    assert_eq!(
+        fx.k.revalidate_idle_owner_after_drains(CPU0, &mut again),
+        crate::runtime::OwnerRevalidation::Replacement(W)
+    );
+    assert_eq!(
+        (again.ret0, again.error),
+        (0, 0),
+        "a second return carries no result"
+    );
+    clear_cells();
+}
+
+/// A parked completion from ANOTHER send cycle (the generation moved on) is taken so it cannot
+/// linger, and is never delivered: the return is the committed context alone.
+#[test]
+fn revalidation_discards_a_stale_send_completion_without_delivering_it() {
+    let fx = fixture();
+    sender_completed_after_its_drain_settled_idle(&fx);
+    fx.k.with(|s| {
+        s.with_tcbs_mut(|tcbs| {
+            let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == W).expect("w");
+            t.blocked_send_generation = t.blocked_send_generation.wrapping_add(1);
+        })
+    });
+    let mut frame = owned_entry_frame(W, fx.w_asid);
+    assert_eq!(
+        fx.k.revalidate_idle_owner_after_drains(CPU0, &mut frame),
+        crate::runtime::OwnerRevalidation::Replacement(W)
+    );
+    assert_eq!((frame.ret0, frame.error), (0, 0));
+    assert!(!fx.k.with(|s| s.has_pending_syscall_completion(W)));
+    clear_cells();
+}
+
+/// The selection pins the incarnation. W's TID re-bound to another address space between the
+/// dequeue and the claim is not the task that was queued: the claim finds nothing, takes nothing
+/// (the completion, the TLS request and the status are all untouched), and the composition's
+/// `Missing` arm rolls back WITHOUT requeueing it.
+#[test]
+fn a_tid_rebound_after_selection_is_missing_and_nothing_is_taken() {
+    let fx = fixture();
+    sender_completed_after_its_drain_settled_idle(&fx);
+    fx.k.with(|s| s.set_thread_tls_base(W, 0x5000).expect("tls"));
+    let selection =
+        fx.k.owner_revalidation_select_split(CPU0)
+            .expect("selected");
+    assert_eq!(selection.tid, W);
+    assert_eq!(
+        selection.asid,
+        Some(fx.w_asid),
+        "pinned under the selecting guard"
+    );
+    fx.k.with(|s| {
+        let (fresh, _) = s.create_user_address_space().expect("replacement");
+        s.bind_task_asid(W, fresh).expect("rebind");
+    });
+    assert!(matches!(
+        fx.k.owner_revalidation_claim_split(selection),
+        crate::runtime::OwnerRevalidationClaim::Missing
+    ));
+    assert!(fx.k.with(|s| s.has_pending_syscall_completion(W)));
+    assert_eq!(fx.k.with(|s| s.tls_restore_pending(W)), Some(true));
+    assert_eq!(status(&fx.k, W), Some(TaskStatus::Runnable), "no mark");
+    clear_cells();
+}
+
+/// A never-run task's one-shot startup snapshot: the revalidation classifies it through the one
+/// classifier and CONSUMES the latch, so the same snapshot can never be returned through again —
+/// neither by this owner nor by the exact-token resume.
+#[test]
+fn revalidation_consumes_a_first_resume_snapshot_exactly_once() {
+    let fx = fixture();
+    fx.k.with(|s| {
+        assert_eq!(s.block_current_cpu(), Some(W));
+        s.set_task_status_for_test(W, TaskStatus::Runnable);
+        s.enqueue_task(Q).expect("q");
+    });
+    let first = |k: &SharedKernel| {
+        k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == Q)
+                    .map(|t| t.first_resume_consumed)
+            })
+        })
+    };
+    assert_eq!(first(&fx.k), Some(false));
+    let mut frame = TrapFrame::new(0, [0; 6]);
+    assert_eq!(
+        fx.k.revalidate_idle_owner_after_drains(CPU0, &mut frame),
+        crate::runtime::OwnerRevalidation::Replacement(Q)
+    );
+    assert_eq!(first(&fx.k), Some(true), "the one-shot latch is set");
+    assert_eq!(frame.args[0], Q as usize, "the startup ABI's task id");
+    assert_eq!(
+        frame.resume_owner(),
+        Some(FpuHomeOwner {
+            tid: Q,
+            asid: fx.q_asid
+        })
+    );
+    // The same snapshot again: refused before any mutation, and put back where it was.
+    fx.k.with(|s| {
+        assert_eq!(s.block_current_cpu(), Some(Q));
+        s.set_task_status_for_test(Q, TaskStatus::Runnable);
+        s.enqueue_task(Q).expect("requeue");
+    });
+    let mut second = TrapFrame::new(0, [0; 6]);
+    let before = second.clone();
+    assert_eq!(
+        fx.k.revalidate_idle_owner_after_drains(CPU0, &mut second),
+        crate::runtime::OwnerRevalidation::RestoreFailed {
+            tid: Q,
+            rolled_back: true
+        }
+    );
+    assert_eq!(second, before, "a refusal never touches the frame");
+    assert_eq!(status(&fx.k, Q), Some(TaskStatus::Runnable));
+    assert_eq!(queued(&fx.k, CPU0), [Q], "requeued on this CPU");
+    assert_eq!(fx.k.current_tid_split_read(CPU0), None);
     clear_cells();
 }
 
