@@ -24488,7 +24488,30 @@ a replaced incarnation refused. The x86_64/AArch64 overtaken policy is unchanged
 
 ## 4 — controls (final candidate, each in its own worktree, then removed)
 
-CONTROLS_TABLE
+Round 1 ran on `fa7ee42e`; one control PASSED — `all_ineligible` (every `Ready` recorded as timed out,
+its observed `current` untouched) — because both graders read readiness from the observed tid alone.
+That was a candidate defect: readiness now requires both recorded facts (§2), with a unit case. Every
+control was then re-run on `34602065` (tree `3f9e681f…`), the code of the frozen candidate:
+
+| control | mutation | fails with |
+|---|---|---|
+| missing remote invalidation, resident target | shootdown returns before the fence for every target set (statically, and — second variant — behind `black_box`, so the fence code stays in the image and the ordering check passes) | the resident target S reads the OLD page: `S_FAIL_STALE_AFTER_INVALIDATION` round 1, the witness stops, no seal. The static variant additionally fails the image check (the fence function is optimized out). The verifier's own rule (`fence_not_requested_for_the_resident_target`) is covered by unit cases |
+| failed completion | the firmware fence result forced to `Failed` | `fence_failed` at the first fence attempt (kernel verdict and grader) |
+| suppressed IPI | the SBI send replaced by `Ok(())` | bounded progress: C stalls at `C_P1_CALL`, the boot times out unsealed; the image check reports the missing `ecall` |
+| corrupted returned context | one GPR flipped on the exact-token resume of a witness task | `S_FAIL_P1_CONTEXT`, no seal |
+| operations serialized | a global lock around the production NR 3 | `mut_operations_serialized`; 0 of 4 rounds overlapped |
+| every attempt ineligible | `Ready.met` forced to 0 | `p2_too_few_credited_attempts_per_direction`; the grader also reports 0/0 credited fence rounds; 12 P2 attempts retained as uncredited |
+| substituted generation | each fence completion recorded under `generation ^ 1` | `fence_stale_completion` |
+| substituted identity | each arrival's recorded ASID `^ 1` | `ipi_eligible_arrival_not_in_target` |
+| missing attempt evidence | no `Ready` record pushed | `p2_ready_missing` |
+| ordering (image only) | the remote fence's store-visibility `fence` removed | the image check (`remote_invalidate_page: fence missing`); the boot itself seals `ok` — QEMU cannot see it |
+| x86_64 revalidation reverted | bare-TID lookup, no latch consume, no completion take, no convention refusal | 4 behavioural cases (completed sender, stale completion, re-bound TID, first resume) and the phase guard |
+| RISC-V settlement reverted | the base function restored verbatim | `the_riscv_settlement_is_the_shared_policy_over_the_frames_owner` and `an_overtaken_deferral_is_settled_not_returned_through`; RISC-V trap code is not hosted-executable, so this revert is caught by source guards, while the shared policy it now calls is exercised behaviourally |
+
+Legitimate interference is demonstrated by the populations of §2 (attempts uncredited as
+`interfered`, `off_cpu` or `intervening_entry` while later attempts of the same boot earn the
+threshold); the control boots above that sealed show the same (e.g. `fail_completion`'s P2: 3 of C's 6
+attempts uncredited, the other 3 credited, before its fence obligation failed).
 
 ## Limits
 
