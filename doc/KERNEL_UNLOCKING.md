@@ -24393,7 +24393,13 @@ fence or from a failed assertion:
 * **Readiness** is both recorded facts of the `Ready` record: its bounded wait reported `met`, and it
   saw the target current. Either alone is `not_ready` (§4: a control that forced every `met` to 0 while
   leaving the observed `current` intact passed until this was required of both graders).
-* **P2 (IPI)**: eligible iff ready (`not_ready` otherwise), the arrival is the
+* **P2 (IPI)**: a P2 call wakes the helper parked on the target's hart, and only a wake owes an IPI —
+  the production send QUEUES a call for a helper that is not blocked in receive. P2 readiness
+  therefore also waits for, and `Ready` records (bit 17), the helper parked. An attempt whose `Ready`
+  recorded it NOT parked is ineligible (`helper_not_parked`) from that record; it still owes its call,
+  readiness, post-send and window-check steps, and no arrival is attributed to it. For a parked helper
+  the wake is an obligation, and its publication must lie at or before the waker's post-send step, so a
+  later attempt's IPI can never be borrowed. P2 is eligible iff ready (`not_ready` otherwise), the arrival is the
   target hart's very next supervisor entry (`intervening_entry`), and no activation of another address
   space on the target hart lies between the call and the arrival (`switched`). An eligible arrival must
   be IN the checked window and in the target incarnation (tid AND asid): outside the window it FAILS
@@ -24485,6 +24491,25 @@ owners: the base predicate accepting an unowned frame with another task installe
 drain callers — only reachable if an owner on this hart installed `current` without a restore); the
 reachable in-lock restore admitted; the re-selected sender admitted with its completion consumed once;
 a replaced incarnation refused. The x86_64/AArch64 overtaken policy is unchanged.
+
+## 3b — freeze 1 (`88fcb50f`), its qualification, and its one failure
+
+Freeze 1 (tree `d011d462…`) was qualified in full on a clean worktree: 19 of the 20 scheduled SMP3 boots
+passed; every other gate passed (three x86_64 overtaken witnesses, three strict RISC-V core boots,
+fmt, hosted, every integration target, the census scanner, warnings against the base, SMP1, reply,
+user-consume, SMP2, the AArch64 overtaken witness, CONTEXT1 on both ports, both cores, server death
+and exit on both ports, AP receive-block, and the default RISC-V core). It is kept as a failed
+candidate.
+
+**Boot 18 (loaded) — `p2_window_check_missing`, P2 attempt 4 toward CPU 0. CANDIDATE-CAUSED.** S's
+round-4 call (`IPCCALL_QUEUED_SPLIT_OK`) found H0 not blocked in receive: the timer had
+async-preempted it between receives, so the production send queued the call, owed no wake, and sent no
+IPI (`p2_sent_timed_out=1`, 38 arrivals where passing boots have 41). C, preempted on CPU 0 at the next
+tick, finished its window about 150 ticks later. The verifier's wake search was not bounded to the
+attempt: it took round 5's publication and arrival, after which round 4's window check could not be
+found. The production path behaved correctly; the witness had not established the attempt's
+prerequisite, and the graders read that as a failed obligation. The rule above is the fix; the
+controls were then re-run and the tree re-frozen.
 
 ## 4 — controls (final candidate, each in its own worktree, then removed)
 
