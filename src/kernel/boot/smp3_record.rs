@@ -77,7 +77,8 @@ pub enum Kind {
     Contention = 15,
     /// QEMU-SMP3-SEAL — a waker (P2) or requester (P3) established readiness before its production
     /// operation: `f[0]` target CPU | phase << 8 | met << 16 (1 = the bounded wait saw the target
-    /// current and not idle), `f[1]` the target CPU's current tid then (0 = none), `f[2]` the
+    /// current and not idle — and, for P2, its hart's helper parked) | helper_parked << 17 (P2: the
+    /// helper the call wakes was blocked in receive, so the send owed a wake and its IPI), `f[1]` the target CPU's current tid then (0 = none), `f[2]` the
     /// target hart's supervisor-entry count then, `f[3]` the attempt's round, `f[4]` its
     /// generation.
     Ready = 16,
@@ -184,6 +185,10 @@ pub fn ready_phase(r: &Rec) -> u64 {
 }
 pub fn ready_met(r: &Rec) -> bool {
     (r.f[0] >> 16) & 1 == 1
+}
+/// P2: the helper on the target's hart was parked in receive when readiness was recorded.
+pub fn ready_helper_parked(r: &Rec) -> bool {
+    (r.f[0] >> 17) & 1 == 1
 }
 
 /// `sstatus.FS` (bits 14:13) and `sstatus.VS` (bits 10:9).
@@ -684,6 +689,10 @@ pub enum ArrivalClass {
     Outside,
     /// Taken in another task, or at the hart's idle boundary.
     Displaced,
+    /// QEMU-SMP3-SEAL — no arrival was owed: readiness recorded the helper on the target's hart NOT
+    /// parked in receive, so the production send queued the call and owed no wake. Nothing is
+    /// attributed to the attempt.
+    NotOwed,
 }
 
 /// One graded attempt of a phase whose population may legitimately include uncredited attempts.
@@ -775,8 +784,12 @@ pub struct P2Attempt {
 /// window. Pure.
 ///
 /// Obligations (a failure, never ineligibility): the waker's call step, its readiness record, the
-/// publication and the arrival that consumed it, the waker's post-send step, and the target's own
-/// passing window check on its hart after the arrival.
+/// waker's post-send step, and the target's own passing window check on its hart. When readiness
+/// recorded the target hart's helper PARKED in receive, the send owed a wake: the publication (at
+/// or before the post-send step, so a later attempt's cannot be borrowed), the arrival that
+/// consumed it, and the window check after that arrival are owed too. When it recorded the helper
+/// NOT parked, no wake was owed — the production send queues — and the attempt is ineligible
+/// (`helper_not_parked`) from that record, never from the absence of an IPI.
 ///
 /// Eligibility, from independently recorded evidence only: the readiness record saw `target`
 /// current on its hart; the arrival was that hart's very next supervisor entry after readiness
@@ -798,8 +811,29 @@ pub fn p2_attempt(
 ) -> Result<P2Attempt, &'static str> {
     let call_i = user(recs, from, waker, call, Some(k)).ok_or("p2_call_missing")?;
     let rd = ready(recs, call_i, waker.cpu, target.cpu, PHASE_P2, k).ok_or("p2_ready_missing")?;
-    let arrived = wake_chain(recs, rd, waker, target.cpu, u64::MAX, WINDOW_NONE)?;
-    user(recs, rd, waker, sent, Some(k)).ok_or("p2_sent_missing")?;
+    let sent_i = user(recs, rd, waker, sent, Some(k)).ok_or("p2_sent_missing")?;
+    if !ready_helper_parked(&recs[rd]) {
+        let ok_i = user(recs, rd, target, ok, Some(k)).ok_or("p2_window_check_missing")?;
+        if recs[ok_i].cpu != target.cpu {
+            return Err("p2_window_checked_elsewhere");
+        }
+        return Ok(P2Attempt {
+            end: ok_i,
+            generation: recs[rd].f[4],
+            eligible: false,
+            reason: "helper_not_parked",
+            class: ArrivalClass::NotOwed,
+        });
+    }
+    let published = find_from(recs, rd, |r| {
+        r.kind == Kind::IpiPublished
+            && r.cpu == waker.cpu
+            && r.f[0] == u64::from(target.cpu)
+            && r.f[2] == PUB_WAKE
+    })
+    .filter(|&p| p < sent_i)
+    .ok_or("ipi_not_published")?;
+    let arrived = wake_chain(recs, published, waker, target.cpu, u64::MAX, WINDOW_NONE)?;
     let ok_i = user(recs, arrived, target, ok, Some(k)).ok_or("p2_window_check_missing")?;
     if recs[ok_i].cpu != target.cpu {
         return Err("p2_window_checked_elsewhere");
@@ -1188,6 +1222,7 @@ pub fn verify_attempts(recs: &[Rec], roles: &Roles, overflowed: bool) -> (Verdic
                         ArrivalClass::InWindow => v.p2_in_window += 1,
                         ArrivalClass::Outside => v.p2_outside += 1,
                         ArrivalClass::Displaced => v.p2_displaced += 1,
+                        ArrivalClass::NotOwed => {}
                     }
                     if a.eligible {
                         if target.tid == s.tid {
@@ -1563,7 +1598,13 @@ mod tests {
             (
                 Kind::Ready,
                 0,
-                [1 | (PHASE_P2 << 8) | (1 << 16), ready_cur, 40, 1, 77],
+                [
+                    1 | (PHASE_P2 << 8) | (1 << 16) | (1 << 17),
+                    ready_cur,
+                    40,
+                    1,
+                    77,
+                ],
             ),
             pubrec(0, 1, 0),
             reqrec(0, 1, 0),
@@ -1597,6 +1638,38 @@ mod tests {
             WINDOW_S_A,
             1,
         )
+    }
+
+    /// The helper on the target's hart was NOT parked when readiness was recorded: the production
+    /// send queued the call and owed no wake. The attempt is ineligible from that record — its
+    /// window check is still owed, no arrival is attributed, and a later attempt's publication is
+    /// never borrowed for it.
+    #[test]
+    fn an_unparked_helper_owes_no_wake_and_the_attempt_is_ineligible() {
+        let mut v = p2(9300, (USER, WINDOW_S_A, 41, S_INC));
+        v[1].2[0] &= !((1 << 16) | (1 << 17));
+        // No wake: drop the publication, the request and the arrival.
+        v.retain(|(kind, _, _)| {
+            !matches!(
+                kind,
+                Kind::IpiPublished | Kind::IpiRequested | Kind::IpiArrived
+            )
+        });
+        let a = p2a(v.clone()).expect("graded, not failed");
+        assert_eq!(
+            (a.eligible, a.reason, a.class),
+            (false, "helper_not_parked", ArrivalClass::NotOwed)
+        );
+        // The window check is still an obligation.
+        let mut w = v.clone();
+        w.pop();
+        assert_eq!(p2a(w), Err("p2_window_check_missing"));
+        // Parked, but the only publication comes AFTER the waker's post-send step (a later
+        // attempt's): not this attempt's wake.
+        let mut late = p2(9300, (USER, WINDOW_S_A, 41, S_INC));
+        let publ = late.remove(2);
+        late.insert(5, publ);
+        assert_eq!(p2a(late), Err("ipi_not_published"));
     }
 
     /// Readiness is both recorded facts. A bounded wait that timed out is not readiness even if its

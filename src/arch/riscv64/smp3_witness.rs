@@ -930,16 +930,32 @@ fn establish_ready(phase: u64, target_cpu: u8, target_tid: u64, round: u64) {
     }
     let idx = usize::from(phase == rec::PHASE_P3);
     let shared = crate::arch::riscv64::boot::trap_shared_kernel_riscv();
-    let (mut cur, mut entries, mut met) = (0u64, 0u64, false);
+    // QEMU-SMP3-SEAL — a P2 call wakes the helper parked on the target's hart, and only a wake
+    // owes an IPI: the production send QUEUES a call for a helper that is not blocked in receive
+    // (the timer can preempt it between receives), and then no notification is due at all. So a
+    // P2 attempt is ready only once that helper is parked too, and whether it was is recorded.
+    let helper = if target_cpu == 0 { H0_TID } else { H1_TID };
+    let parked_now = |k: &crate::runtime::SharedKernel| {
+        let asid = k.task_asid_for_tid_split_read(helper);
+        asid != 0
+            && matches!(
+                k.task_incarnation_status_split_read(helper, crate::kernel::vm::Asid(asid as u16)),
+                Some(crate::kernel::task::TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(_)
+                ))
+            )
+    };
+    let (mut cur, mut entries, mut met, mut parked) = (0u64, 0u64, false, false);
     for _ in 0..READY_SPINS {
         let e0 = ENTRIES[t].load(Ordering::Acquire);
         cur = shared.map_or(0, |k| {
             k.current_tid_split_read(CpuId(target_cpu)).unwrap_or(0)
         });
+        parked = phase == rec::PHASE_P2 && shared.is_some_and(parked_now);
         let idle = AT_IDLE[t].load(Ordering::Acquire);
         let e1 = ENTRIES[t].load(Ordering::Acquire);
         entries = e1;
-        if e0 == e1 && cur == target_tid && !idle {
+        if e0 == e1 && cur == target_tid && !idle && (parked || phase != rec::PHASE_P2) {
             met = true;
             break;
         }
@@ -954,7 +970,10 @@ fn establish_ready(phase: u64, target_cpu: u8, target_tid: u64, round: u64) {
         Kind::Ready,
         this_cpu(),
         [
-            u64::from(target_cpu) | (phase << 8) | (u64::from(met) << 16),
+            u64::from(target_cpu)
+                | (phase << 8)
+                | (u64::from(met) << 16)
+                | (u64::from(parked) << 17),
             cur,
             entries,
             round,

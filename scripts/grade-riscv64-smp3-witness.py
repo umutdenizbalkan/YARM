@@ -378,11 +378,26 @@ for k in range(1, P2_ATTEMPTS + 1):
             rd = ready(c, waker["cpu"], tgt["cpu"], 2, k)
             if rd is None:
                 return None, "p2_ready_missing"
-            a, why = chain(rd, waker["cpu"], tgt["cpu"], None, 0)
+            sn = user(rd, waker["tid"], sent, k)
+            if sn is None:
+                return None, "p2_sent_missing"
+            # The helper on the target's hart was not parked in receive when readiness was
+            # recorded: the send queued the call and owed no wake — ineligible from that record,
+            # its window check still owed, no arrival attributed.
+            if not (recs[rd]["f"][0] >> 17) & 1:
+                w = user(rd, tgt["tid"], ok, k)
+                if w is None:
+                    return None, "p2_window_check_missing"
+                if recs[w]["cpu"] != tgt["cpu"]:
+                    return None, "p2_window_checked_elsewhere"
+                return (w, "helper_not_parked", None), None
+            pb = find(rd, lambda r: r["kind"] == "ipi_published" and r["cpu"] == waker["cpu"]
+                      and r["f"][0] == tgt["cpu"] and r["f"][2] == 0)
+            if pb is None or pb >= sn:
+                return None, "ipi_not_published"
+            a, why = chain(pb, waker["cpu"], tgt["cpu"], None, 0)
             if why:
                 return None, "ipi_not_published" if why.startswith("no publication") else "ipi_not_consumed"
-            if user(rd, waker["tid"], sent, k) is None:
-                return None, "p2_sent_missing"
             w = user(a, tgt["tid"], ok, k)
             if w is None:
                 return None, "p2_window_check_missing"
@@ -413,7 +428,8 @@ for k in range(1, P2_ATTEMPTS + 1):
             attempts[key] = "0 %s failed" % why
             continue
         w, reason, cls = res
-        p2[cls] += 1
+        if cls is not None:
+            p2[cls] += 1
         if reason == "none":
             p2["credited_s" if tgt is S else "credited_c"] += 1
             attempts[key] = "1 none credited"
