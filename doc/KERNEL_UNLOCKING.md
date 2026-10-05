@@ -24563,6 +24563,13 @@ attempts uncredited, the other 3 credited, before its fence obligation failed).
 
 # QEMU-LOCK1 — real contention on one production subdomain lock, and interrupt progress under its mask
 
+> **Correction (QEMU-LOCK1-ACCEPTANCE).** The grader described below qualified this package with a
+> permissive subsequence search: it never checked a lock event's recorded lock id, never ordered a
+> contender's release after its acquire, accepted an IPI anywhere in the round rather than during the
+> ownership interval, and merely dropped (rather than failed) a round whose holder was unmasked. Those
+> four holes were closed and the §3 interrupt chain made causal in **QEMU-LOCK1-ACCEPTANCE** below; the
+> contention contract, the chosen lock and the production owners here are unchanged and still hold.
+
 Base: `cb47d085` (QEMU-SMP3-SEAL freeze 2, tree `2ef77acf…`). U9 stays CLOSED: production `with_cpu=0`,
 `with_broad=0`. This package adds a default-off witness that records the **atomic** acquire / contend /
 release events of ONE production subdomain lock while the SMP3 two-hart VM/IPI workload drives genuine
@@ -24755,3 +24762,143 @@ and any broad lock redesign; no additional defect blocked this contract, so none
   labelled synchronization, not production behaviour.
 * The load condition is the documented QEMU-SMP3-SEAL host-load (two CPU-bound shell loops for exactly
   one boot); it is one condition, not a stress characterization.
+
+
+# QEMU-LOCK1-ACCEPTANCE — the contention/interrupt evidence made load-bearing
+
+Base: `07c1fcd7` (QEMU-LOCK1 delivery, tree `df06a3de…`). U9 stays CLOSED: production `with_cpu=0`,
+`with_broad=0`. This package does not touch the production lock algorithm or ownership; it repairs the
+**independent grader** that qualified LOCK1 and adds the minimum witness instrumentation its new
+obligations need. The live witness workload, the chosen lock (`vm_state_lock`, rank 5) and the masking
+contract are unchanged.
+
+## what the old grader admitted
+
+The delivered LOCK1 grader re-derived each round from the raw records but with a permissive subsequence
+search. Four checksum-valid mutations of its own passing fixture passed it, each a real violation:
+
+* **a different lock.** It never compared a lock event's recorded lock id against the VM lock, so a run
+  in which every lock event named lock **99** (not **1**) still credited every round.
+* **a release before its acquire.** It required a contender release to exist, but never ordered it after
+  the contender's acquire, so a waiter "release → acquire" sequence credited.
+* **an IPI outside the interval.** It required an IPI to exist somewhere in the round, not that it was
+  published while the holder owned the lock, so an IPI published after both releases credited.
+* **an unmasked holder.** A round whose holder recorded `sstatus.SIE = 1` inside the critical section
+  was merely dropped (uncredited) and, because other rounds met the coverage threshold, the boot still
+  passed — a masking-contract violation disappearing behind coverage.
+
+All four are now reproduced as grader self-tests (`--self-test`) and each fails for its specific
+violation; the unmasked-holder case fails the boot even when coverage is otherwise satisfied.
+
+## 1 — complete ownership intervals (not a subsequence)
+
+The grader now validates the **complete relevant history** of every round. A round that recorded any
+contention must present the whole chain, or the boot fails — a broken obligation is never silently
+uncredited:
+
+* every lock event (acquire / contended / release / hold) names the one VM lock (`vm_lock_id = 1`, and
+  the metadata must agree);
+* exactly one holder `hold`, by the designated holder, with `sstatus.SIE = 0`;
+* a holder acquisition that **still owns** the lock at the hold — no holder release between that acquire
+  and the hold — so the hold cannot be pinned to an unrelated earlier acquisition (the mapping
+  transaction legitimately takes `vm_state_lock` more than once per request, e.g. the guard-page query
+  then the install);
+* the contention observed by the waiter, naming this holder, inside that ownership interval;
+* a holder release after the hold — modelled honestly as a release **intent** (it is recorded before
+  the atomic unlock), with the handover established by the contender's own subsequent successful
+  acquisition, not by assuming the marker is the unlock or that any observer runs before the next CPU
+  acquires;
+* the contender acquiring after that release, then releasing after it acquired.
+
+The two copies of each record from the dump's two passes are transport redundancy (deduplicated by
+sequence); two checksum-valid copies of one sequence with different fields are a conflict and fail.
+Missing events, impossible ownership transitions, a wrong lock and contradictory facts all fail. An
+uncontended attempt earns no credit only when its complete, valid history shows no contention.
+
+## 2 — the causal interrupt chain (publish → pending → arrival)
+
+The old grader checked only that *an* IPI existed in the round and that the SMP3 seal said `result=ok`.
+Neither proves the IPI was pending during the chosen ownership interval or consumed afterwards. The
+witness now records one more event through the production arrival owner: when the masked holder has the
+waiter's IPI pending it arms a per-CPU round at the end of its hold (while still masked, so nothing can
+run first), and the production consumer `ipi::take_arrival`, once the holder unmasks, records the
+matching `arrival` for that round and disarms it (coalescing-safe: one arrival discharges the round
+however many sends collapsed into it). The grader links, by round/target identity in the one shared
+record sequence:
+
+* the production reschedule IPI published by the waiter to the designated holder, before the holder left
+  the interval;
+* the holder's masked ownership interval, and — in enough rounds — the pending bit (`sip.SSIP = 1`)
+  observed under the mask;
+* the `arrival` consumed by that holder, after the interval, once delivery became permitted.
+
+Independent per-CPU counters are not used as a clock; the single global record sequence and the
+`(round, holder)` identity are the link. Masking is never lifted inside the lock, no witness wait is
+unbounded, and malformed evidence fails closed. The pinned OpenSBI identity and the production masking
+contract are retained; the SMP3 seal still corroborates progress/results/context but no longer
+substitutes for any obligation above.
+
+## 3 — controls
+
+The four reproductions are kept as self-tests, alongside grader controls for missing/substituted
+publication, arrival and consumption, an IPI or arrival belonging to another round or target,
+conflicting checksum-valid copies, missing acquisition/release, and insufficient genuine contention;
+positive fixtures keep the legitimate two-pass copies, interleavings and coalescing. The five live
+controls were re-run on the final candidate, each failing for its intended reason:
+
+| control | mutation | fails with |
+|---|---|---|
+| operations serialized | a global lock around the whole production NR 3 | SMP3 `mut_operations_serialized` fails the seal the grader requires |
+| substituted owner | the round→holder parity flipped in the witness gate | no round's contention names the designated holder: `credited=0/0` |
+| suppressed IPI | the waiter no longer publishes the reschedule during the window | no round carries its IPI during the interval: `credited=0/0` |
+| owner never releases | the hold hook spins forever holding `vm_state_lock` | the boot budget (external watchdog) ends the run unsealed, no credit |
+| corrupted resumed context | one GPR flipped on every exact-token resume of a witness task | the corrupted task cannot complete; no valid seal, no credit |
+
+## 4 — qualification
+
+Frozen before qualification at **`1012d176`** (tree `6f6906a3…`), from base `07c1fcd7` (tree
+`df06a3de…`); qualified in full on an isolated worktree, every scheduled run retained. Identity:
+QEMU 8.2.2 (Debian `1:8.2.2+ds-0ubuntu1.18`), `-machine virt -cpu rv64 -m 512M -smp 2`,
+`console=ttyS0 rdinit=/init yarm.ap_user_dispatch=1`; the pinned OpenSBI v1.3 (`sha256 171a91cc…`),
+kernel + initramfs hashes recorded per boot. 25 gates, **zero failures**:
+
+* **Six scheduled strict LOCK1 boots — three idle, three under the documented LOCK1 host-load (two
+  CPU-bound shell loops for one boot). All six sealed** with six credited contended rounds in each
+  direction and the full delivery chain in 8–10 rounds: `credited_c_waits=6 credited_s_waits=6` every
+  boot; `delivery_rounds` = 9, 9, 8 (idle) and 10, 8, 8 (loaded); the direct `sip.SSIP` peek landed in
+  2–6 rounds (reported, not gated); `result=ok`.
+* **Preserved pinned SMP3** — three idle SMP3 witness boots, all `result=ok`.
+* **RISC-V gates** — the core smoke (demand paging and fork COW), the UART0→PLIC IRQ witness, and
+  server death — all pass.
+* **Hosted suite single-threaded, every integration target** (including the updated source guards),
+  **`cargo fmt --check`, the broad-lock census scanner** — all pass. **Three freestanding `kernel_boot`
+  builds** (x86_64, aarch64, riscv64, default features) produce warnings **identical to the fresh base**
+  `07c1fcd7` (none).
+* **Regressions touched by the shared `ipi.rs` / `lock.rs` instrumentation** — SMP1 (x86_64), SMP2
+  (aarch64), CONTEXT1 on both ports, and the overtaken-deferral witnesses on both ports — all pass.
+
+The five live controls were re-run on this candidate (§3 table); each failed for its intended reason.
+One earlier freeze was discarded for a candidate-caused failure (a loaded boot saw the `sip.SSIP` peek
+in a single round) and repaired by gating on the reliable delivery chain instead, before this freeze.
+
+## 5 — delivery and scope
+
+Excluded as directed: other architectures' new contention witnesses, general logger repair, new
+devices, migration, additional CPUs, hardware bring-up and lock redesign. Delivered by ordinary
+fast-forward of `main` and `claude/yarm-kernel-unlock-u0-f2zh8p` to the qualified commit after a fresh
+fetch and ancestry check; `14b61286` and every IRQ / context / SMP / LOCK / WIP ref are preserved; no
+force push, rebase, deletion or PR.
+
+The qualified **code** commit is the frozen candidate below; the acceptance claims are recorded here in
+a later **documentation-only** commit, whose code tree is byte-identical to the qualified commit (this
+is the same two-commit shape the LOCK1 delivery used, and is why the LOCK1 grader's gap could be
+documented only after that package shipped).
+
+## Limits
+
+* One lock, one rank, one contract — `vm_state_lock` only. No starvation-freedom, fairness, or
+  hardware-latency claim; only the observed progress of the credited rounds.
+* The masked-pending observation is bounded and covers the firmware's `MSIP → SSIP` reflection, not
+  interrupt delivery; delivery is the holder's ordinary post-unmask arrival, now recorded and linked.
+* Two harts, one QEMU version, one firmware; no real hardware. The default-off hold/arrival
+  instrumentation is labelled synchronization, not production behaviour, and every wait is finite.
