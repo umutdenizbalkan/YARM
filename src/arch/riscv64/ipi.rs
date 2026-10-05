@@ -357,6 +357,11 @@ pub fn take_arrival(cpu: CpuId, origin: ArrivalOrigin) -> IpiArrival {
             row[3].fetch_add(sources.count_ones(), Ordering::AcqRel);
         }
     }
+    // QEMU-LOCK1-ACCEPTANCE §3: the delivery end of the publish → masked-pending → arrival chain.
+    // Records a K_ARRIVAL only when this CPU had a LOCK1 IPI armed as a recent round's holder; a
+    // no-op otherwise. Observes the production consumption, takes nothing from it.
+    #[cfg(feature = "riscv64-lock1-witness")]
+    crate::kernel::lock1_witness::note_arrival(cpu.0);
     IpiArrival { origin, sources }
 }
 

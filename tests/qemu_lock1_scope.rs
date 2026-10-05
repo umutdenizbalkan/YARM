@@ -21,6 +21,7 @@ const SMP3_WITNESS: &str = include_str!("../src/arch/riscv64/smp3_witness.rs");
 const SMP3_RECORD: &str = include_str!("../src/kernel/boot/smp3_record.rs");
 const SMOKE: &str = include_str!("../scripts/qemu-riscv64-lock1-witness-smoke.sh");
 const GRADER: &str = include_str!("../scripts/grade-riscv64-lock1-witness.py");
+const IPI: &str = include_str!("../src/arch/riscv64/ipi.rs");
 
 const GATE: &str = "#[cfg(feature = \"riscv64-lock1-witness\")]";
 
@@ -213,6 +214,7 @@ fn the_lock_path_is_bounded_lock_free_and_console_free() {
         "pub fn note_acquired(id: u32) {",
         "pub fn note_released(id: u32) {",
         "pub fn maybe_hold(id: u32) {",
+        "pub fn note_arrival(cpu: u8) {",
         "pub fn mut_round_gate(cpu: u8, round: u64) {",
         "fn record(kind: u8, hart: u8, f: [u64; 5]) {",
     ] {
@@ -381,12 +383,77 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
         GRADER.contains("fail(\"the SMP3 seal did not pass: \""),
         "the grader requires the SMP3 seal"
     );
-    assert!(GRADER.contains("MIN_PER_DIRECTION = 4") && GRADER.contains("MIN_SSIP_ROUNDS = 2"));
     assert!(
-        GRADER.contains("the acquire/contend/release/acquire chain is not ordered"),
-        "the grader orders the chain"
+        GRADER.contains("MIN_PER_DIRECTION = 4")
+            && GRADER.contains("MIN_SSIP_ROUNDS = 2")
+            && GRADER.contains("MIN_ARRIVAL_ROUNDS = 2"),
+        "the grader keeps the per-direction, masked-pending and arrival thresholds"
     );
+    // The acceptance grader rejects the holes the old subsequence search admitted: a wrong lock, a
+    // waiter release before its acquire, an IPI published after the interval, an unmasked holder, a
+    // hold not covered by an un-released acquisition, and conflicting checksum-valid copies.
+    for check in [
+        "a lock event names lock",
+        "the hold is not covered by an un-released holder acquisition",
+        "no production IPI was published to the holder during the interval",
+        "holder was not masked (sstatus.SIE set) inside the critical section",
+        "the contender never released after it acquired",
+        "conflicting checksum-valid copies of seq",
+        "rounds whose pending IPI was consumed after unmask (arrival)",
+    ] {
+        assert!(GRADER.contains(check), "the grader enforces: {check}");
+    }
     // The smoke builds the feature and hands the boot log to that grader.
     assert!(SMOKE.contains("--features riscv64-lock1-witness"));
     assert!(SMOKE.contains("python3 scripts/grade-riscv64-lock1-witness.py"));
+}
+
+/// §3 — the delivery end of the IPI chain. The holder arms a per-CPU pending-arrival round at the
+/// end of its (still masked) hold; the production arrival owner `take_arrival` records the matching
+/// `K_ARRIVAL` once, after the holder unmasks, linking publish → masked-pending → delivery by round
+/// identity. The hook observes the production consumption and takes nothing from it.
+#[test]
+fn the_arrival_hook_observes_the_production_consumption() {
+    let w = code(WITNESS);
+    assert!(w.contains("pub const K_ARRIVAL: u8 = 6;"));
+    // The stash is armed at the end of the hold hook, while still masked.
+    let hold = code(fn_body(WITNESS, "pub fn maybe_hold(id: u32) {"));
+    assert!(
+        hold.contains("ARRIVAL_ROUND.get(me as usize)") && hold.contains("cell.store(round,"),
+        "the hold hook arms the per-CPU pending-arrival round"
+    );
+    // note_arrival discharges it once (swap to 0) and records K_ARRIVAL; it is bounded and lock-free.
+    let na = code(fn_body(WITNESS, "pub fn note_arrival(cpu: u8) {"));
+    assert!(
+        na.contains("cell.swap(0, Ordering::AcqRel)"),
+        "one-shot discharge of the armed round"
+    );
+    assert!(
+        na.contains("record(K_ARRIVAL, cpu,"),
+        "records the arrival for the armed round"
+    );
+    assert!(
+        na.contains("if round == 0 {"),
+        "a CPU with nothing armed records nothing"
+    );
+    // The production arrival owner calls it, under the feature gate, after it has consumed the
+    // mailbox (the hook observes; it does not alter the production consumption).
+    let ta = code(fn_body(
+        IPI,
+        "pub fn take_arrival(cpu: CpuId, origin: ArrivalOrigin) -> IpiArrival {",
+    ));
+    let swap = pos(&ta, "p.swap(0, Ordering::AcqRel)");
+    let note = pos(&ta, "crate::kernel::lock1_witness::note_arrival(cpu.0);");
+    let ret = pos(&ta, "IpiArrival { origin, sources }");
+    assert!(
+        swap < note && note < ret,
+        "the hook runs after the production consume, before return"
+    );
+    let gate = ta[..note].rfind(GATE);
+    assert!(
+        gate.is_some_and(|g| ta[g..note].matches('\n').count() <= 2),
+        "the arrival hook sits under the feature gate"
+    );
+    // The dump names the new kind.
+    assert!(code(fn_body(WITNESS, "pub fn dump() {")).contains("K_ARRIVAL => \"arrival\","));
 }

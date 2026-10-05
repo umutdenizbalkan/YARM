@@ -50,6 +50,13 @@ pub const K_CONTENDED: u8 = 2;
 pub const K_RELEASE: u8 = 3;
 pub const K_HOLD: u8 = 4;
 pub const K_IPI: u8 = 5;
+/// The holder consumed the pending software interrupt after it unmasked — recorded from the
+/// production arrival owner (`ipi::take_arrival`), linked to the round whose IPI it consumes. This is
+/// the §3 delivery end of the publish → pending → arrival chain.
+pub const K_ARRIVAL: u8 = 6;
+
+/// Small fixed bound on logical CPUs the witness tracks (two harts in this workload).
+const MAX_CPU: usize = 8;
 
 // ── the bounded event ring ──────────────────────────────────────────────────────────────────
 struct Slot {
@@ -92,6 +99,13 @@ static ROUND_OK: AtomicU8 = AtomicU8::new(0);
 /// the hold hook extends only the FIRST acquisition of each round; later ones acquire and release
 /// at production speed.
 static LAST_HELD_ROUND: AtomicU64 = AtomicU64::new(0);
+/// Per-CPU round whose pending software interrupt that CPU, as the round's holder, is about to
+/// consume. Set (while still masked) at the end of the hold hook; consumed once by the production
+/// arrival owner on this CPU after it unmasks, which records the matching `K_ARRIVAL` and clears it.
+/// A plain per-CPU cell: the only writers are this CPU's masked hold hook and its own later arrival.
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO_U64: AtomicU64 = AtomicU64::new(0);
+static ARRIVAL_ROUND: [AtomicU64; MAX_CPU] = [ZERO_U64; MAX_CPU];
 
 pub fn arm() {
     ARMED.store(true, Ordering::Release);
@@ -241,9 +255,10 @@ pub fn maybe_hold(id: u32) {
         core::hint::spin_loop();
     }
     let (sie, _) = sie_ssip();
+    let me = this_cpu();
     record(
         K_HOLD,
-        this_cpu(),
+        me,
         [
             u64::from(id),
             round,
@@ -252,6 +267,31 @@ pub fn maybe_hold(id: u32) {
             u64::from(HOLDER_CPU.load(Ordering::Acquire)),
         ],
     );
+    // Arm the §3 arrival link: this (still masked) holder has the waiter's IPI pending and will
+    // consume it the moment it unmasks. The production arrival owner records the matching K_ARRIVAL
+    // for this round on this CPU. Set while masked, so no arrival can run before it is in place.
+    if let Some(cell) = ARRIVAL_ROUND.get(me as usize) {
+        cell.store(round, Ordering::Release);
+    }
+}
+
+/// The holder consumed a pending software interrupt through the production arrival owner
+/// (`ipi::take_arrival`), after it unmasked. If this CPU had a LOCK1 IPI armed (it was a round's
+/// holder, masked, with the waiter's IPI pending), record the matching `K_ARRIVAL` once and disarm,
+/// linking the publish → masked-pending → delivery chain by round identity. Coalescing-safe: one
+/// arrival discharges the armed round regardless of how many sends collapsed into it.
+pub fn note_arrival(cpu: u8) {
+    if !ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(cell) = ARRIVAL_ROUND.get(cpu as usize) else {
+        return;
+    };
+    let round = cell.swap(0, Ordering::AcqRel);
+    if round == 0 {
+        return;
+    }
+    record(K_ARRIVAL, cpu, [round, u64::from(cpu), 1, 0, 0]);
 }
 
 // ── the per-round direction gate (called from the SMP3 marker hook on `*_MUT_NR3`) ───────────
@@ -378,6 +418,7 @@ pub fn dump() {
                 K_RELEASE => "release",
                 K_HOLD => "hold",
                 K_IPI => "ipi",
+                K_ARRIVAL => "arrival",
                 _ => "unknown",
             };
             emit(alloc::format!(
