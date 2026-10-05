@@ -49,6 +49,12 @@ pub struct SpinLock<T> {
 pub struct SpinLockIrq<T> {
     held: CachePaddedFlag,
     value: UnsafeCell<T>,
+    // QEMU-LOCK1: a stable, non-zero identity for the ONE witnessed subdomain lock (the VM
+    // address-space lock). Every other `SpinLockIrq` keeps id 0 and is never recorded. The field
+    // exists only under the witness feature, so the plain build's layout and acquisition path are
+    // byte-for-byte unchanged.
+    #[cfg(feature = "riscv64-lock1-witness")]
+    witness_id: u32,
 }
 
 unsafe impl<T: Send> Send for SpinLock<T> {}
@@ -127,13 +133,38 @@ impl<T> SpinLockIrq<T> {
         Self {
             held: CachePaddedFlag(AtomicBool::new(false)),
             value: UnsafeCell::new(value),
+            #[cfg(feature = "riscv64-lock1-witness")]
+            witness_id: 0,
+        }
+    }
+
+    /// QEMU-LOCK1: construct the ONE witnessed subdomain lock, tagged with a stable non-zero id.
+    /// The acquisition algorithm is identical to [`Self::new`]'s lock; the id only selects which
+    /// instance the (default-off) witness records.
+    #[cfg(feature = "riscv64-lock1-witness")]
+    pub const fn new_witnessed(value: T, witness_id: u32) -> Self {
+        Self {
+            held: CachePaddedFlag(AtomicBool::new(false)),
+            value: UnsafeCell::new(value),
+            witness_id,
         }
     }
 
     #[must_use = "if unused, the lock is immediately released when the guard is dropped"]
     pub fn lock(&self) -> SpinLockIrqGuard<'_, T> {
+        // QEMU-LOCK1: `observed_held` becomes true the first time this acquisition sees the lock
+        // already HELD by someone else — the actual failed acquisition the contention witness
+        // records, derived from the atomic flag itself, not from elapsed time. Recorded once, and
+        // only for the witnessed instance; the production algorithm below is unchanged.
+        #[cfg(feature = "riscv64-lock1-witness")]
+        let mut observed_held = false;
         loop {
             while self.held.0.load(Ordering::Relaxed) {
+                #[cfg(feature = "riscv64-lock1-witness")]
+                if self.witness_id != 0 && !observed_held {
+                    observed_held = true;
+                    crate::kernel::lock1_witness::note_contended(self.witness_id);
+                }
                 spin_loop();
             }
 
@@ -144,6 +175,13 @@ impl<T> SpinLockIrq<T> {
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                #[cfg(feature = "riscv64-lock1-witness")]
+                if self.witness_id != 0 {
+                    crate::kernel::lock1_witness::note_acquired(self.witness_id);
+                    // The default-off, bounded hold hook runs here — holding the lock, with
+                    // supervisor interrupts masked — before the guard is handed back.
+                    crate::kernel::lock1_witness::maybe_hold(self.witness_id);
+                }
                 return SpinLockIrqGuard {
                     lock: self,
                     irq_state,
@@ -184,6 +222,13 @@ impl<T> core::ops::DerefMut for SpinLockIrqGuard<'_, T> {
 
 impl<T> Drop for SpinLockIrqGuard<'_, T> {
     fn drop(&mut self) {
+        // QEMU-LOCK1: record the release of the witnessed lock BEFORE the atomic store makes it
+        // acquirable, so the holder's "released" event is causally before any waiter's subsequent
+        // acquisition. The store and the IRQ restore below are the unchanged production release.
+        #[cfg(feature = "riscv64-lock1-witness")]
+        if self.lock.witness_id != 0 {
+            crate::kernel::lock1_witness::note_released(self.lock.witness_id);
+        }
         self.lock.held.0.store(false, Ordering::Release);
         irq_restore(self.irq_state);
     }

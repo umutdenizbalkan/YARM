@@ -23,6 +23,9 @@ pub mod ipc;
 pub mod ipccall_direct;
 pub mod ipccall_direct_txn;
 pub mod lock;
+// QEMU-LOCK1: the real subdomain-lock contention / interrupt-progress witness. Default off.
+#[cfg(feature = "riscv64-lock1-witness")]
+pub mod lock1_witness;
 #[cfg(any(
     feature = "aarch64-overtaken-witness",
     feature = "x86-overtaken-witness"

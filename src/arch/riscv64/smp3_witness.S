@@ -68,7 +68,7 @@
     /* QEMU-SMP3-SEAL: fixed attempt budgets (P2 per direction; P3 serial, half per direction). */
     .set P2_ROUNDS, 6
     .set TLB_ROUNDS, 24
-    .set MUT_ROUNDS, 4
+    .set MUT_ROUNDS, YARM_MUT_ROUNDS
     .set PARK_TICKS, 60
 
     /* MBX words; each per-round array is 32 words (index = round, rounds <= 31), and the whole

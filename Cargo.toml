@@ -89,6 +89,14 @@ aarch64-smp2-witness = []
 # to each hart, the bounded IPI / fence / context transaction record, and its synchronous dump.
 # Armed only together with `yarm.ap_user_dispatch=1` on a `-smp 2` boot.
 riscv64-smp3-witness = []
+# QEMU-LOCK1: real subdomain-lock contention on the production VM address-space lock
+# (`vm_state_lock`, rank 5), driven by the SMP3 two-hart VM/IPI workload (which it co-enables). It
+# instruments the chosen lock's atomic acquire/release, a default-off bounded hold hook that makes a
+# contended acquisition reproducible, a per-round direction gate, and its own sealed lock-event
+# record + dump. The mutual-round count rises to `LOCK1_MUT_ROUNDS` under this feature only; the
+# plain SMP3 build is byte-for-byte unchanged. Armed only together with `yarm.ap_user_dispatch=1`
+# on a `-smp 2` boot.
+riscv64-lock1-witness = ["riscv64-smp3-witness"]
 # QEMU-SMP3-ACCEPTANCE: the overtaken-deferral witness — a FutexWait caller on CPU 0 whose drain is
 # held (bounded, no lock held) until the other CPU's production FutexWake has made it Runnable, so
 # the shared bridge's overtaken settlement runs live; one sealed summary. Armed only together with

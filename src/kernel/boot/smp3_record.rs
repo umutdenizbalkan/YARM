@@ -283,7 +283,13 @@ pub const P2_MIN_CREDITED_PER_DIRECTION: usize = 1;
 pub const TLB_ROUNDS: u64 = 24;
 pub const TLB_MIN_CREDITED_PER_DIRECTION: usize = 2;
 /// Mutual rounds; every one must show its two production operations in flight together.
+// QEMU-LOCK1: the LOCK1 build drives twelve mutual rounds (six per contention direction); the plain
+// SMP3 build keeps four. The verifier grades exactly the rounds the workload runs, so the count
+// tracks the assembly's injected `YARM_MUT_ROUNDS`.
+#[cfg(not(feature = "riscv64-lock1-witness"))]
 pub const MUT_ROUNDS: u64 = 4;
+#[cfg(feature = "riscv64-lock1-witness")]
+pub const MUT_ROUNDS: u64 = 12;
 
 /// A witness task: `(tid, asid, cpu, hart)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

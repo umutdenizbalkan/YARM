@@ -39,7 +39,14 @@ use crate::kernel::capabilities::{CapId, CapRights};
 use crate::kernel::scheduler::{CpuId, MAX_CPUS};
 use crate::kernel::vm::{Asid, CachePolicy, Mapping, PageFlags, PhysAddr, VirtAddr};
 
-core::arch::global_asm!(include_str!("smp3_witness.S"));
+// QEMU-LOCK1: the mutual-round count is injected here, not hard-coded in the assembly, so the plain
+// SMP3 build keeps exactly four mutual rounds while the LOCK1 build raises it to twelve (six per
+// direction, comfortably above the four-each the contention contract requires). Nothing else in the
+// assembly changes between the two builds.
+#[cfg(not(feature = "riscv64-lock1-witness"))]
+core::arch::global_asm!(".equ YARM_MUT_ROUNDS, 4\n", include_str!("smp3_witness.S"));
+#[cfg(feature = "riscv64-lock1-witness")]
+core::arch::global_asm!(".equ YARM_MUT_ROUNDS, 12\n", include_str!("smp3_witness.S"));
 
 pub const CODE_VA: u64 = 0x2000_0000;
 pub const STACK_VA: u64 = 0x2001_0000;
@@ -333,6 +340,10 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
     kernel.enqueue_task(C_TID)?;
     ENABLED.store(true, Ordering::Release);
     rec::arm();
+    // QEMU-LOCK1: arm the lock-contention witness alongside the SMP3 record. It is inert on a plain
+    // SMP3 build (this whole call is compiled out there).
+    #[cfg(feature = "riscv64-lock1-witness")]
+    crate::kernel::lock1_witness::arm();
     // QEMU-SMP3-ACCEPTANCE §3: the firmware that will complete the remote fences, as it reports
     // itself. The grader requires it to be the pinned implementation.
     match crate::arch::riscv64::sbi::base_identity() {
@@ -1064,7 +1075,17 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u6
     // The mutual requester's announcement arms its next VM operation for the rendezvous.
     if step == "S_MUT_NR3" || step == "C_MUT_NR3" {
         MUT_ANNOUNCED[usize::from(step == "C_MUT_NR3")].store(round, Ordering::Release);
+        // QEMU-LOCK1: open this round's contention window and order entry so the designated holder
+        // takes `vm_state_lock` first and the other hart contends on it. `S_MUT_NR3` runs on CPU 1,
+        // `C_MUT_NR3` on CPU 0 — the marker's own CPU is the acting hart.
+        #[cfg(feature = "riscv64-lock1-witness")]
+        crate::kernel::lock1_witness::mut_round_gate(cpu.0, round);
         return;
+    }
+    // QEMU-LOCK1: close the round's window once a hart finishes it.
+    #[cfg(feature = "riscv64-lock1-witness")]
+    if step == "S_MUT_OK" || step == "C_MUT_OK" {
+        crate::kernel::lock1_witness::note_round_ok(round);
     }
     if step == "S_DONE" {
         S_DONE.store(true, Ordering::Release);
@@ -1275,6 +1296,10 @@ fn dump() {
             v.failure_at
         ));
     }
+    // QEMU-LOCK1: the lock-contention record follows the SMP3 seal, so one boot carries both the
+    // SMP3 progress/result evidence and the LOCK1 acquire/contend/release evidence.
+    #[cfg(feature = "riscv64-lock1-witness")]
+    crate::kernel::lock1_witness::dump();
 }
 
 /// FNV-1a over a dump line's text (everything before ` pass=`).
