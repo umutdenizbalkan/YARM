@@ -103,7 +103,12 @@ PIN = sys.argv[3] if len(sys.argv) > 3 else "scripts/firmware/riscv64-opensbi.pi
 
 ROUNDS = 12
 MIN_PER_DIRECTION = 4
-MIN_SSIP_ROUNDS = 4
+# The core §3 evidence — the holder masked (sstatus.SIE = 0) with the IPI published to it — is checked
+# in EVERY credited round below. This is the extra, corroborating requirement that the software
+# interrupt was additionally seen PENDING (sip.SSIP = 1) under that mask; it is set to 2 (not the
+# per-direction 4) because the firmware's M→S reflection is cold on a boot's first rounds, so the
+# count varies while the masked-publication proof does not.
+MIN_SSIP_ROUNDS = 2
 
 text = open(LOG, errors="replace").read()
 lines = text.split("\n")

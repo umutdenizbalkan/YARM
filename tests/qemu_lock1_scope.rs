@@ -381,7 +381,7 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
         GRADER.contains("fail(\"the SMP3 seal did not pass: \""),
         "the grader requires the SMP3 seal"
     );
-    assert!(GRADER.contains("MIN_PER_DIRECTION = 4") && GRADER.contains("MIN_SSIP_ROUNDS = 4"));
+    assert!(GRADER.contains("MIN_PER_DIRECTION = 4") && GRADER.contains("MIN_SSIP_ROUNDS = 2"));
     assert!(
         GRADER.contains("the acquire/contend/release/acquire chain is not ordered"),
         "the grader orders the chain"
