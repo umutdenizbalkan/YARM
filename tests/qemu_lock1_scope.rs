@@ -75,7 +75,9 @@ fn the_identity_field_is_feature_gated_and_defaults_to_zero() {
     );
     // `SpinLockIrq::new` — the production constructor every other lock uses — stamps id 0. This
     // pattern (the gate immediately above `witness_id: 0`) occurs only in that constructor.
-    assert!(squash(&c).contains(&squash("#[cfg(feature = \"riscv64-lock1-witness\")]\nwitness_id: 0,")));
+    assert!(squash(&c).contains(&squash(
+        "#[cfg(feature = \"riscv64-lock1-witness\")]\nwitness_id: 0,"
+    )));
 }
 
 /// The contention record is derived from the lock's OWN atomic flag — recorded the first time the
@@ -83,13 +85,25 @@ fn the_identity_field_is_feature_gated_and_defaults_to_zero() {
 /// elapsed time or a global counter. It fires once per `lock()` and only for a non-zero id.
 #[test]
 fn contention_is_observed_from_the_held_flag_once() {
-    let body = code(fn_body(LOCK, "pub fn lock(&self) -> SpinLockIrqGuard<'_, T> {"));
+    let body = code(fn_body(
+        LOCK,
+        "pub fn lock(&self) -> SpinLockIrqGuard<'_, T> {",
+    ));
     // The observation lives inside the inner `while self.held.0.load(...)` spin, i.e. the lock was
     // seen held by someone else.
     let spin = pos(&body, "while self.held.0.load(Ordering::Relaxed) {");
-    let contended = pos(&body, "crate::kernel::lock1_witness::note_contended(self.witness_id);");
-    let cas = pos(&body, "compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)");
-    assert!(spin < contended && contended < cas, "contention is recorded from the held flag, before the CAS");
+    let contended = pos(
+        &body,
+        "crate::kernel::lock1_witness::note_contended(self.witness_id);",
+    );
+    let cas = pos(
+        &body,
+        "compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)",
+    );
+    assert!(
+        spin < contended && contended < cas,
+        "contention is recorded from the held flag, before the CAS"
+    );
     // Guarded on a non-zero id and a once-per-call latch.
     assert!(squash(&body).contains(&squash("if self.witness_id != 0 && !observed_held {")));
     assert!(squash(&body).contains(&squash("observed_held = true;")));
@@ -106,18 +120,39 @@ fn contention_is_observed_from_the_held_flag_once() {
 /// is causally before any waiter's acquire. Every hook is behind the gate and a non-zero id.
 #[test]
 fn acquire_holds_and_releases_in_causal_order() {
-    let body = code(fn_body(LOCK, "pub fn lock(&self) -> SpinLockIrqGuard<'_, T> {"));
+    let body = code(fn_body(
+        LOCK,
+        "pub fn lock(&self) -> SpinLockIrqGuard<'_, T> {",
+    ));
     let cas_ok = pos(&body, ".is_ok()\n            {");
-    let acq = pos(&body, "crate::kernel::lock1_witness::note_acquired(self.witness_id);");
-    let hold = pos(&body, "crate::kernel::lock1_witness::maybe_hold(self.witness_id);");
+    let acq = pos(
+        &body,
+        "crate::kernel::lock1_witness::note_acquired(self.witness_id);",
+    );
+    let hold = pos(
+        &body,
+        "crate::kernel::lock1_witness::maybe_hold(self.witness_id);",
+    );
     let ret = pos(&body, "return SpinLockIrqGuard {");
-    assert!(cas_ok < acq && acq < hold && hold < ret, "acquire then hold, both while held, before the guard returns");
+    assert!(
+        cas_ok < acq && acq < hold && hold < ret,
+        "acquire then hold, both while held, before the guard returns"
+    );
     assert!(squash(&body).contains(&squash("if self.witness_id != 0 {")));
     // The guard's Drop records the release before the releasing store.
-    let drop = code(fn_body(LOCK, "impl<T> Drop for SpinLockIrqGuard<'_, T> {\n    fn drop(&mut self) {"));
-    let rel = pos(&drop, "crate::kernel::lock1_witness::note_released(self.lock.witness_id);");
+    let drop = code(fn_body(
+        LOCK,
+        "impl<T> Drop for SpinLockIrqGuard<'_, T> {\n    fn drop(&mut self) {",
+    ));
+    let rel = pos(
+        &drop,
+        "crate::kernel::lock1_witness::note_released(self.lock.witness_id);",
+    );
     let store = pos(&drop, "self.lock.held.0.store(false, Ordering::Release);");
-    assert!(rel < store, "release is recorded before the lock becomes acquirable");
+    assert!(
+        rel < store,
+        "release is recorded before the lock becomes acquirable"
+    );
     assert!(squash(&drop).contains(&squash("if self.lock.witness_id != 0 {")));
     // Both hooks sit under the feature gate. acquire + hold share one gated `if self.witness_id != 0`
     // block, so maybe_hold sits a few lines below the gate; the threshold allows that block but still
@@ -126,7 +161,10 @@ fn acquire_holds_and_releases_in_causal_order() {
         let c: &str = src;
         for (i, _) in c.match_indices("crate::kernel::lock1_witness::") {
             let g = c[..i].rfind(GATE);
-            assert!(g.is_some_and(|g| c[g..i].matches('\n').count() <= 4), "{hook}: a hook is not gated");
+            assert!(
+                g.is_some_and(|g| c[g..i].matches('\n').count() <= 4),
+                "{hook}: a hook is not gated"
+            );
         }
     }
 }
@@ -135,15 +173,32 @@ fn acquire_holds_and_releases_in_causal_order() {
 /// and that constructor is used exactly once in the whole tree.
 #[test]
 fn exactly_one_lock_is_witnessed() {
-    assert_eq!(code(LOCK).matches("pub const fn new_witnessed(").count(), 1, "one witnessed constructor");
+    assert_eq!(
+        code(LOCK).matches("pub const fn new_witnessed(").count(),
+        1,
+        "one witnessed constructor"
+    );
     // The one call site is the VM address-space lock, under the gate.
     let b = code(BOOTSTRAP);
-    assert_eq!(b.matches("SpinLockIrq::new_witnessed(").count(), 1, "one witnessed instance in the tree");
+    assert_eq!(
+        b.matches("SpinLockIrq::new_witnessed(").count(),
+        1,
+        "one witnessed instance in the tree"
+    );
     let site = pos(&b, "SpinLockIrq::new_witnessed(");
-    assert!(b[site..].contains("crate::kernel::lock1_witness::VM_LOCK_ID"), "it is stamped with VM_LOCK_ID");
-    assert!(b[..site].rfind(GATE).is_some_and(|g| site - g < 200), "the witnessed init is gated");
+    assert!(
+        b[site..].contains("crate::kernel::lock1_witness::VM_LOCK_ID"),
+        "it is stamped with VM_LOCK_ID"
+    );
+    assert!(
+        b[..site].rfind(GATE).is_some_and(|g| site - g < 200),
+        "the witnessed init is gated"
+    );
     // It guards the VM address space; the witness module documents that instance.
-    assert!(b[..site].contains("vm_state_lock"), "the witnessed lock is vm_state_lock");
+    assert!(
+        b[..site].contains("vm_state_lock"),
+        "the witnessed lock is vm_state_lock"
+    );
     assert!(WITNESS.contains("KernelState::vm_state_lock") && WITNESS.contains("rank 5"));
 }
 
@@ -162,13 +217,22 @@ fn the_lock_path_is_bounded_lock_free_and_console_free() {
         "fn record(kind: u8, hart: u8, f: [u64; 5]) {",
     ] {
         let b = code(fn_body(WITNESS, head));
-        for banned in ["printk", "print!", "format!", "alloc::", ".lock()", "Box::", "Vec::"] {
-            assert!(!b.contains(banned), "{head} must not use {banned} on the lock path");
+        for banned in [
+            "printk", "print!", "format!", "alloc::", ".lock()", "Box::", "Vec::",
+        ] {
+            assert!(
+                !b.contains(banned),
+                "{head} must not use {banned} on the lock path"
+            );
         }
     }
     // Console output appears only in dump (twice: the two synchronous emits).
     let c = code(WITNESS);
-    assert_eq!(c.matches("printk_emit_sync(").count(), 1, "one synchronous emit closure, in dump");
+    assert_eq!(
+        c.matches("printk_emit_sync(").count(),
+        1,
+        "one synchronous emit closure, in dump"
+    );
     let emit = pos(&c, "printk_emit_sync(");
     let dump = pos(&c, "pub fn dump() {");
     assert!(dump < emit, "the only console output is inside dump");
@@ -180,7 +244,11 @@ fn the_lock_path_is_bounded_lock_free_and_console_free() {
 #[test]
 fn the_hold_hook_is_bounded_and_releases_regardless() {
     // Finite, named bounds.
-    for bound in ["const HOLD_SPINS: u64", "const GATE_SPINS: u64", "const SSIP_SPINS: u64"] {
+    for bound in [
+        "const HOLD_SPINS: u64",
+        "const GATE_SPINS: u64",
+        "const SSIP_SPINS: u64",
+    ] {
         assert!(WITNESS.contains(bound), "{bound} is a finite constant");
     }
     let b = code(fn_body(WITNESS, "pub fn maybe_hold(id: u32) {"));
@@ -189,16 +257,28 @@ fn the_hold_hook_is_bounded_and_releases_regardless() {
     assert!(b.contains("if LAST_HELD_ROUND.load(Ordering::Acquire) >= round {"));
     // The wait is on CONTENTION_SEQ (the atomic indication the waiter bumps), and it breaks on the
     // bound — it releases even if the contender never arrives.
-    let wait = pos(&b, "while CONTENTION_SEQ.load(Ordering::Acquire) <= baseline {");
+    let wait = pos(
+        &b,
+        "while CONTENTION_SEQ.load(Ordering::Acquire) <= baseline {",
+    );
     let brk = pos(&b[wait..], "if left == 0 {\n            break;");
     assert!(brk < b[wait..].len(), "the hold wait is bounded");
     // It observes sip.SSIP (a pending bit the firmware set) but never clears or waits on delivery:
     // SIE is read, not written, anywhere in the hook.
-    assert!(b.contains("let (_, p) = sie_ssip();"), "the pending bit is only read");
-    assert!(!b.contains("csrw") && !b.contains("csrs ") && !b.contains("csrc "), "no CSR writes in the hold hook");
+    assert!(
+        b.contains("let (_, p) = sie_ssip();"),
+        "the pending bit is only read"
+    );
+    assert!(
+        !b.contains("csrw") && !b.contains("csrs ") && !b.contains("csrc "),
+        "no CSR writes in the hold hook"
+    );
     // Nothing in the hook mentions a syscall completion, ACK or delivery wait.
     for banned in ["ack", "delivery", "complete", "syscall"] {
-        assert!(!b.to_lowercase().contains(banned), "the hold hook must not wait on {banned}");
+        assert!(
+            !b.to_lowercase().contains(banned),
+            "the hold hook must not wait on {banned}"
+        );
     }
 }
 
@@ -207,22 +287,42 @@ fn the_hold_hook_is_bounded_and_releases_regardless() {
 /// production send owner, then waits — bounded — only on the atomic `HELD_ROUND`.
 #[test]
 fn the_waiter_uses_the_production_acquisition_path() {
-    let b = code(fn_body(WITNESS, "pub fn mut_round_gate(cpu: u8, round: u64) {"));
+    let b = code(fn_body(
+        WITNESS,
+        "pub fn mut_round_gate(cpu: u8, round: u64) {",
+    ));
     // The gate must not touch the lock directly — it only sets up the race and publishes the IPI.
     for banned in [".lock()", "vm_state_lock", "held.0", "compare_exchange"] {
-        assert!(!b.contains(banned), "the gate must not touch the lock ({banned})");
+        assert!(
+            !b.contains(banned),
+            "the gate must not touch the lock ({banned})"
+        );
     }
     // Holder returns immediately; waiter publishes then waits on HELD_ROUND.
     let holder_ret = pos(&b, "if cpu == holder {");
     let publish = pos(&b, "publish_ipi_to_holder(cpu, holder, round);");
     let gate_wait = pos(&b, "while HELD_ROUND.load(Ordering::Acquire) < round {");
-    assert!(holder_ret < publish && publish < gate_wait, "holder returns, waiter publishes then waits");
-    assert!(b.contains("if left == 0 {\n            break;"), "the gate wait is bounded");
+    assert!(
+        holder_ret < publish && publish < gate_wait,
+        "holder returns, waiter publishes then waits"
+    );
+    assert!(
+        b.contains("if left == 0 {\n            break;"),
+        "the gate wait is bounded"
+    );
     // The IPI goes through the production reschedule owner (the SMP3 send/mailbox owner), not a
     // bespoke firmware call.
-    let ipi = code(fn_body(WITNESS, "fn publish_ipi_to_holder(waiter_cpu: u8, holder_cpu: u8, round: u64) {"));
-    assert!(ipi.contains("crate::arch::riscv64::ipi::send_reschedule(CpuId(waiter_cpu), CpuId(holder_cpu))"));
-    assert!(!ipi.contains("sbi::") && !ipi.contains("send_ipi("), "the witness never calls the firmware directly");
+    let ipi = code(fn_body(
+        WITNESS,
+        "fn publish_ipi_to_holder(waiter_cpu: u8, holder_cpu: u8, round: u64) {",
+    ));
+    assert!(ipi.contains(
+        "crate::arch::riscv64::ipi::send_reschedule(CpuId(waiter_cpu), CpuId(holder_cpu))"
+    ));
+    assert!(
+        !ipi.contains("sbi::") && !ipi.contains("send_ipi("),
+        "the witness never calls the firmware directly"
+    );
 }
 
 /// The round count is feature-gated so the plain SMP3 build is byte-identical (MUT_ROUNDS stays 4)
@@ -233,8 +333,12 @@ fn the_round_count_is_gated_consistently() {
     assert!(SMP3_WITNESS.contains(".equ YARM_MUT_ROUNDS, 4\\n"));
     assert!(SMP3_WITNESS.contains(".equ YARM_MUT_ROUNDS, 12\\n"));
     let rec = code(SMP3_RECORD);
-    assert!(squash(&rec).contains(&squash("#[cfg(not(feature = \"riscv64-lock1-witness\"))]\npub const MUT_ROUNDS: u64 = 4;")));
-    assert!(squash(&rec).contains(&squash("#[cfg(feature = \"riscv64-lock1-witness\")]\npub const MUT_ROUNDS: u64 = 12;")));
+    assert!(squash(&rec).contains(&squash(
+        "#[cfg(not(feature = \"riscv64-lock1-witness\"))]\npub const MUT_ROUNDS: u64 = 4;"
+    )));
+    assert!(squash(&rec).contains(&squash(
+        "#[cfg(feature = \"riscv64-lock1-witness\")]\npub const MUT_ROUNDS: u64 = 12;"
+    )));
     assert!(WITNESS.contains("pub const LOCK1_ROUNDS: u64 = 12;"));
     // The witness's arm() and dump() hang off the SMP3 provision/dump, under the gate.
     let sw = code(SMP3_WITNESS);
@@ -245,7 +349,12 @@ fn the_round_count_is_gated_consistently() {
         "crate::kernel::lock1_witness::note_round_ok(",
     ] {
         let i = pos(&sw, hook);
-        assert!(sw[..i].rfind(GATE).is_some_and(|g| sw[g..i].matches('\n').count() <= 2), "{hook} is gated");
+        assert!(
+            sw[..i]
+                .rfind(GATE)
+                .is_some_and(|g| sw[g..i].matches('\n').count() <= 2),
+            "{hook} is gated"
+        );
     }
 }
 
@@ -256,15 +365,27 @@ fn the_round_count_is_gated_consistently() {
 fn the_dump_is_sealed_and_the_grader_is_independent() {
     // Two checksummed passes, a per-record crc, and an overflow flag the grader can see.
     let dump = code(fn_body(WITNESS, "pub fn dump() {"));
-    assert!(dump.contains("for pass in 1..=2u32 {"), "every line is emitted twice");
+    assert!(
+        dump.contains("for pass in 1..=2u32 {"),
+        "every line is emitted twice"
+    );
     assert!(dump.contains("crc=0x{:08x}") && dump.contains("fnv1a(line.as_bytes())"));
     assert!(dump.contains("LOCK1_META") && dump.contains("overflow={}"));
     assert!(dump.contains("LOCK1_REC seq=") && dump.contains("LOCK1_DUMP_DONE records="));
     // The grader validates the crc, requires the SMP3 seal, and re-derives the chain per round.
-    assert!(GRADER.contains("if fnv1a(body) != int(mm.group(10), 16):"), "the grader checks the record crc");
-    assert!(GRADER.contains("fail(\"the SMP3 seal did not pass: \""), "the grader requires the SMP3 seal");
+    assert!(
+        GRADER.contains("if fnv1a(body) != int(mm.group(10), 16):"),
+        "the grader checks the record crc"
+    );
+    assert!(
+        GRADER.contains("fail(\"the SMP3 seal did not pass: \""),
+        "the grader requires the SMP3 seal"
+    );
     assert!(GRADER.contains("MIN_PER_DIRECTION = 4") && GRADER.contains("MIN_SSIP_ROUNDS = 4"));
-    assert!(GRADER.contains("the acquire/contend/release/acquire chain is not ordered"), "the grader orders the chain");
+    assert!(
+        GRADER.contains("the acquire/contend/release/acquire chain is not ordered"),
+        "the grader orders the chain"
+    );
     // The smoke builds the feature and hands the boot log to that grader.
     assert!(SMOKE.contains("--features riscv64-lock1-witness"));
     assert!(SMOKE.contains("python3 scripts/grade-riscv64-lock1-witness.py"));

@@ -36,8 +36,11 @@ pub const LOCK1_ROUNDS: u64 = 12;
 const HOLD_SPINS: u64 = 20_000_000;
 const GATE_SPINS: u64 = 40_000_000;
 /// Bounded observation of the waiter's IPI becoming pending (`sip.SSIP`) while the holder stays
-/// masked. Small — it only covers the firmware's M→S reflection latency, never interrupt delivery.
-const SSIP_SPINS: u64 = 5_000_000;
+/// masked. It only covers the firmware's M→S reflection latency (the M-mode software-interrupt trap
+/// that sets `sip.SSIP` fires regardless of the holder's cleared `sstatus.SIE`), never interrupt
+/// delivery — the loop polls a bit and exits the instant it is set, so the bound is reached only when
+/// the reflection has not yet landed. Sized generously so the reflection reliably lands under TCG.
+const SSIP_SPINS: u64 = 60_000_000;
 
 const SLOTS: usize = 1024;
 
