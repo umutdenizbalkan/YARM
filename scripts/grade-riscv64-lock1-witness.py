@@ -14,6 +14,89 @@
 import re
 import sys
 
+
+def _fnv(s):
+    h = 0x811C9DC5
+    for b in s.encode():
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def _rec(seq, kind, hart, f):
+    body = "LOCK1_REC seq=%d kind=%s hart=%d f0=0x%x f1=0x%x f2=0x%x f3=0x%x f4=0x%x" % (
+        seq, kind, hart, f[0], f[1], f[2], f[3], f[4])
+    return "%s pass=1 crc=0x%08x" % (body, _fnv(body))
+
+
+def _synth(rounds=12, drop=None, wrong_holder=False, no_ipi=False, unmasked=False):
+    """Build a synthetic boot log; `drop` names a per-round omission to force a failure."""
+    out = ["OpenSBI v1.3", "SMP3_VERDICT result=ok reason=none at=0 pass=1 crc=0x0",
+           "LOCK1_META vm_lock_id=1 rounds=%d slots_used=0 overflow=0 dump_cpu=0 pass=1 crc=0x0" % rounds]
+    seq = 0
+
+    def emit(kind, hart, f):
+        nonlocal seq
+        out.append(_rec(seq, kind, hart, f))
+        seq += 1
+    for r in range(1, rounds + 1):
+        holder = 0 if r % 2 == 1 else 1
+        waiter = 1 - holder
+        if drop != "ipi" and not no_ipi:
+            emit("ipi", waiter, [r, holder, 1, waiter, 0])
+        emit("acquire", holder, [1, r, holder, 0, 0])
+        if drop != "contended":
+            ch = (holder if wrong_holder else holder)
+            emit("contended", waiter, [1, r, (holder ^ 1) if wrong_holder else holder, r, 0])
+        emit("hold", holder, [1, r, 1 if unmasked else 0, 1, holder])
+        if drop != "release":
+            emit("release", holder, [1, r, 0, 0, 0])
+        emit("acquire", waiter, [1, r, holder, 0, 0])
+        emit("release", waiter, [1, r, 0, 0, 0])
+    return "\n".join(out)
+
+
+def _self_test():
+    import subprocess
+    import tempfile
+    import os
+
+    def run(log):
+        fd, path = tempfile.mkstemp()
+        os.write(fd, log.encode())
+        os.close(fd)
+        idfd, idpath = tempfile.mkstemp()
+        os.write(idfd, b"firmware_sha256=" + b"0" * 64 + b"\n")
+        os.close(idfd)
+        r = subprocess.run(
+            [sys.executable, sys.argv[0], path, idpath, "/dev/null"],
+            capture_output=True, text=True)
+        os.unlink(path)
+        os.unlink(idpath)
+        return r.returncode, r.stdout
+
+    cases = [
+        ("good", _synth(), 0),
+        ("no-contention", _synth(drop="contended"), 1),
+        ("no-release", _synth(drop="release"), 1),
+        ("no-ipi", _synth(no_ipi=True), 1),
+        ("unmasked-holder", _synth(unmasked=True), 1),
+        ("wrong-holder", _synth(wrong_holder=True), 1),
+        ("too-few-rounds", _synth(rounds=6), 1),
+    ]
+    bad = 0
+    for name, log, want in cases:
+        rc, _ = run(log)
+        verdict = "PASS" if rc == want else "FAIL"
+        if rc != want:
+            bad += 1
+        print("[self-test] %-18s rc=%d want=%d %s" % (name, rc, want, verdict))
+    print("[self-test] %s" % ("ALL PASS" if not bad else "FAILURES"))
+    sys.exit(1 if bad else 0)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+    _self_test()
+
 LOG = sys.argv[1]
 IDENT = sys.argv[2] if len(sys.argv) > 2 else None
 PIN = sys.argv[3] if len(sys.argv) > 3 else "scripts/firmware/riscv64-opensbi.pin"
