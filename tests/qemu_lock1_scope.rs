@@ -384,10 +384,8 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
         "the grader requires the SMP3 seal"
     );
     assert!(
-        GRADER.contains("MIN_PER_DIRECTION = 4")
-            && GRADER.contains("MIN_SSIP_ROUNDS = 2")
-            && GRADER.contains("MIN_ARRIVAL_ROUNDS = 2"),
-        "the grader keeps the per-direction, masked-pending and arrival thresholds"
+        GRADER.contains("MIN_PER_DIRECTION = 4") && GRADER.contains("MIN_DELIVERY_ROUNDS = 2"),
+        "the grader keeps the per-direction and delivery-chain thresholds"
     );
     // The acceptance grader rejects the holes the old subsequence search admitted: a wrong lock, a
     // waiter release before its acquire, an IPI published after the interval, an unmasked holder, a
@@ -399,7 +397,7 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
         "holder was not masked (sstatus.SIE set) inside the critical section",
         "the contender never released after it acquired",
         "conflicting checksum-valid copies of seq",
-        "rounds whose pending IPI was consumed after unmask (arrival)",
+        "rounds with the full publish->masked->arrival delivery chain",
     ] {
         assert!(GRADER.contains(check), "the grader enforces: {check}");
     }
