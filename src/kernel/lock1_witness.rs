@@ -35,6 +35,9 @@ pub const LOCK1_ROUNDS: u64 = 12;
 /// reliably arrives under TCG, finite so the hook releases even if it never does.
 const HOLD_SPINS: u64 = 20_000_000;
 const GATE_SPINS: u64 = 40_000_000;
+/// Bounded observation of the waiter's IPI becoming pending (`sip.SSIP`) while the holder stays
+/// masked. Small — it only covers the firmware's M→S reflection latency, never interrupt delivery.
+const SSIP_SPINS: u64 = 5_000_000;
 
 const SLOTS: usize = 1024;
 
@@ -218,7 +221,23 @@ pub fn maybe_hold(id: u32) {
         left -= 1;
         core::hint::spin_loop();
     }
-    let (sie, ssip) = sie_ssip();
+    // Observe the waiter's IPI become PENDING on this (still masked) hart — the atomic `sip.SSIP`
+    // indication, bounded. This reads a bit the firmware set; it never takes the interrupt (SIE
+    // stays 0), so it is not waiting for delivery. If the reflection has not landed inside the
+    // bound the round still credits on SIE being masked and the IPI published; the pending read is
+    // recorded either way.
+    let mut spins = SSIP_SPINS;
+    let mut ssip;
+    loop {
+        let (_, p) = sie_ssip();
+        ssip = p;
+        if ssip != 0 || spins == 0 {
+            break;
+        }
+        spins -= 1;
+        core::hint::spin_loop();
+    }
+    let (sie, _) = sie_ssip();
     record(
         K_HOLD,
         this_cpu(),
