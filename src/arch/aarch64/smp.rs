@@ -222,6 +222,34 @@ pub fn kick_self(cpu: CpuId) -> bool {
     true
 }
 
+/// QEMU-LOCK2 witness only — this CPU's view of the reschedule SGI at the distributor, read without
+/// side effects: `(pending_sources, active, pending)`. `pending_sources` is the banked
+/// `GICD_SPENDSGIR` byte for the SGI — one bit per SOURCE CPU interface whose request is pending for
+/// THIS interface (GICv2 keeps one pending state per source and coalesces repeats from the same
+/// source into it); `active` / `pending` are this CPU's banked `GICD_ISACTIVER0` / `GICD_ISPENDR0`
+/// bits for the INTID. Reads only — the claim register `GICC_IAR` is never touched here, so the
+/// observation can neither acknowledge nor reorder the interrupt. `None` before the controller is
+/// known.
+#[cfg(feature = "aarch64-lock2-witness")]
+pub fn sgi_pending_view() -> Option<(u8, bool, bool)> {
+    const GICD_ISPENDR0: usize = 0x200;
+    const GICD_ISACTIVER0: usize = 0x300;
+    const GICD_SPENDSGIR0: usize = 0xF20;
+    let (dist, _) = gic_bases()?;
+    let intid = usize::from(RESCHEDULE_SGI_INTID);
+    let word = read32(dist, GICD_SPENDSGIR0 + (intid & !3));
+    let sources = ((word >> ((intid & 3) * 8)) & 0xff) as u8;
+    let active = read32(dist, GICD_ISACTIVER0) & (1 << intid) != 0;
+    let pending = read32(dist, GICD_ISPENDR0) & (1 << intid) != 0;
+    Some((sources, active, pending))
+}
+
+/// QEMU-LOCK2 witness only — the GIC CPU-interface bit `cpu` published (0 = never published).
+#[cfg(feature = "aarch64-lock2-witness")]
+pub fn interface_mask(cpu: CpuId) -> u8 {
+    TARGETS.mask_of(cpu.0 as usize)
+}
+
 /// `(total, from_el0, at_idle_boundary, in_other_kernel_code, sent)` for `cpu`.
 pub fn sgi_counters(cpu: CpuId) -> (u32, u32, u32, u32, u32) {
     let idx = cpu.0 as usize;

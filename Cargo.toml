@@ -96,7 +96,16 @@ riscv64-smp3-witness = []
 # record + dump. The mutual-round count rises to `LOCK1_MUT_ROUNDS` under this feature only; the
 # plain SMP3 build is byte-for-byte unchanged. Armed only together with `yarm.ap_user_dispatch=1`
 # on a `-smp 2` boot.
-riscv64-lock1-witness = ["riscv64-smp3-witness"]
+riscv64-lock1-witness = ["riscv64-smp3-witness", "lock-witness"]
+# QEMU-LOCK2: the same production lock (`vm_state_lock`, rank 5) contended in both directions on
+# AArch64, driven by the SMP2 two-CPU VM/SGI workload (which it co-enables), with the reschedule SGI
+# published during the holder's masked hold and attributed at the GICv2's own claim and completion.
+# Twelve mutual rounds under this feature only; the plain SMP2 build is unchanged. Armed only
+# together with `yarm.ap_user_dispatch=1` on a `-smp 2` boot.
+aarch64-lock2-witness = ["aarch64-smp2-witness", "lock-witness"]
+# Internal: the `SpinLockIrq` hooks and witness identity shared by LOCK1 and LOCK2. Enabled only
+# through one of those two features (never on its own); the facade refuses any other combination.
+lock-witness = []
 # QEMU-SMP3-ACCEPTANCE: the overtaken-deferral witness — a FutexWait caller on CPU 0 whose drain is
 # held (bounded, no lock held) until the other CPU's production FutexWake has made it Runnable, so
 # the shared bridge's overtaken settlement runs live; one sealed summary. Armed only together with

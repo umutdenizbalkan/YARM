@@ -21,9 +21,16 @@ const SMP3_WITNESS: &str = include_str!("../src/arch/riscv64/smp3_witness.rs");
 const SMP3_RECORD: &str = include_str!("../src/kernel/boot/smp3_record.rs");
 const SMOKE: &str = include_str!("../scripts/qemu-riscv64-lock1-witness-smoke.sh");
 const GRADER: &str = include_str!("../scripts/grade-riscv64-lock1-witness.py");
+/// The architecture-neutral half every lock-witness grader imports (transport, ownership, contention).
+const CORE: &str = include_str!("../scripts/lock_witness_core.py");
 const IPI: &str = include_str!("../src/arch/riscv64/ipi.rs");
 
-const GATE: &str = "#[cfg(feature = \"riscv64-lock1-witness\")]";
+/// The `SpinLockIrq` hooks are gated on the internal `lock-witness` feature that LOCK1 (and LOCK2)
+/// enable, and reach the building architecture's witness through the `lock_witness` facade.
+const GATE: &str = "#[cfg(feature = \"lock-witness\")]";
+const FACADE: &str = include_str!("../src/kernel/lock_witness.rs");
+/// The RISC-V-only hooks (SMP3 workload, mailbox owners) stay under the LOCK1 feature itself.
+const LOCK1_GATE: &str = "#[cfg(feature = \"riscv64-lock1-witness\")]";
 
 fn code(src: &str) -> String {
     src.lines()
@@ -53,7 +60,19 @@ fn pos(src: &str, needle: &str) -> usize {
 /// witness module compiles only under that feature.
 #[test]
 fn the_witness_is_gated_and_off_by_default() {
-    assert!(ROOT_CARGO.contains("riscv64-lock1-witness = [\"riscv64-smp3-witness\"]"));
+    assert!(
+        ROOT_CARGO.contains("riscv64-lock1-witness = [\"riscv64-smp3-witness\", \"lock-witness\"]")
+    );
+    // The facade hands `SpinLockIrq` THIS module's hooks under the LOCK1 feature, and refuses the
+    // internal feature on its own or together with the AArch64 witness.
+    assert!(squash(&code(FACADE)).contains(&squash(
+        "#[cfg(feature = \"riscv64-lock1-witness\")] pub use crate::kernel::lock1_witness::{ \
+         VM_LOCK_ID, maybe_hold, note_acquired, note_contended, note_released, };"
+    )));
+    assert!(FACADE.contains(
+        "compile_error!(\"riscv64-lock1-witness and aarch64-lock2-witness are mutually exclusive\")"
+    ));
+    assert!(FACADE.contains("compile_error!(\"lock-witness is internal"));
     let default = ROOT_CARGO
         .split_once("default = [")
         .map(|(_, r)| r.split(']').next().unwrap_or(""))
@@ -77,7 +96,7 @@ fn the_identity_field_is_feature_gated_and_defaults_to_zero() {
     // `SpinLockIrq::new` — the production constructor every other lock uses — stamps id 0. This
     // pattern (the gate immediately above `witness_id: 0`) occurs only in that constructor.
     assert!(squash(&c).contains(&squash(
-        "#[cfg(feature = \"riscv64-lock1-witness\")]\nwitness_id: 0,"
+        "#[cfg(feature = \"lock-witness\")]\nwitness_id: 0,"
     )));
 }
 
@@ -95,7 +114,7 @@ fn contention_is_observed_from_the_held_flag_once() {
     let spin = pos(&body, "while self.held.0.load(Ordering::Relaxed) {");
     let contended = pos(
         &body,
-        "crate::kernel::lock1_witness::note_contended(self.witness_id);",
+        "crate::kernel::lock_witness::note_contended(self.witness_id);",
     );
     let cas = pos(
         &body,
@@ -110,10 +129,10 @@ fn contention_is_observed_from_the_held_flag_once() {
     assert!(squash(&body).contains(&squash("observed_held = true;")));
     // Exactly one call site each for the three lock-path hooks in lock.rs.
     let c = code(LOCK);
-    assert_eq!(c.matches("lock1_witness::note_contended(").count(), 1);
-    assert_eq!(c.matches("lock1_witness::note_acquired(").count(), 1);
-    assert_eq!(c.matches("lock1_witness::maybe_hold(").count(), 1);
-    assert_eq!(c.matches("lock1_witness::note_released(").count(), 1);
+    assert_eq!(c.matches("lock_witness::note_contended(").count(), 1);
+    assert_eq!(c.matches("lock_witness::note_acquired(").count(), 1);
+    assert_eq!(c.matches("lock_witness::maybe_hold(").count(), 1);
+    assert_eq!(c.matches("lock_witness::note_released(").count(), 1);
 }
 
 /// Acquire and the (default-off) hold hook run AFTER the successful CAS, while the lock is held;
@@ -128,11 +147,11 @@ fn acquire_holds_and_releases_in_causal_order() {
     let cas_ok = pos(&body, ".is_ok()\n            {");
     let acq = pos(
         &body,
-        "crate::kernel::lock1_witness::note_acquired(self.witness_id);",
+        "crate::kernel::lock_witness::note_acquired(self.witness_id);",
     );
     let hold = pos(
         &body,
-        "crate::kernel::lock1_witness::maybe_hold(self.witness_id, token);",
+        "crate::kernel::lock_witness::maybe_hold(self.witness_id, token);",
     );
     let ret = pos(&body, "return SpinLockIrqGuard {");
     assert!(
@@ -147,7 +166,7 @@ fn acquire_holds_and_releases_in_causal_order() {
     ));
     let rel = pos(
         &drop,
-        "crate::kernel::lock1_witness::note_released(self.lock.witness_id, self.witness_token);",
+        "crate::kernel::lock_witness::note_released(self.lock.witness_id, self.witness_token);",
     );
     let store = pos(&drop, "self.lock.held.0.store(false, Ordering::Release);");
     assert!(
@@ -159,20 +178,20 @@ fn acquire_holds_and_releases_in_causal_order() {
     // release, so each release record names exactly the acquisition it ends; the guard field exists
     // only under the feature.
     assert!(squash(&body).contains(&squash(
-        "let token = crate::kernel::lock1_witness::note_acquired(self.witness_id);"
+        "let token = crate::kernel::lock_witness::note_acquired(self.witness_id);"
     )));
     assert!(squash(&body).contains(&squash(
-        "#[cfg(feature = \"riscv64-lock1-witness\")] witness_token, _not_send: PhantomData,"
+        "#[cfg(feature = \"lock-witness\")] witness_token, _not_send: PhantomData,"
     )));
     assert!(squash(&code(LOCK)).contains(&squash(
-        "#[cfg(feature = \"riscv64-lock1-witness\")] witness_token: u64,"
+        "#[cfg(feature = \"lock-witness\")] witness_token: u64,"
     )));
     // Both hooks sit under the feature gate. acquire + hold share one gated `if self.witness_id != 0`
     // block, so maybe_hold sits a few lines below the gate; the threshold allows that block but still
     // catches a hook with no gate above it.
     for (hook, src) in [("acquire/hold", &body), ("release", &drop)] {
         let c: &str = src;
-        for (i, _) in c.match_indices("crate::kernel::lock1_witness::") {
+        for (i, _) in c.match_indices("crate::kernel::lock_witness::") {
             let g = c[..i].rfind(GATE);
             assert!(
                 g.is_some_and(|g| c[g..i].matches('\n').count() <= 4),
@@ -200,7 +219,7 @@ fn exactly_one_lock_is_witnessed() {
     );
     let site = pos(&b, "SpinLockIrq::new_witnessed(");
     assert!(
-        b[site..].contains("crate::kernel::lock1_witness::VM_LOCK_ID"),
+        b[site..].contains("crate::kernel::lock_witness::VM_LOCK_ID"),
         "it is stamped with VM_LOCK_ID"
     );
     assert!(
@@ -370,7 +389,7 @@ fn the_round_count_is_gated_consistently() {
         let i = pos(&sw, hook);
         assert!(
             sw[..i]
-                .rfind(GATE)
+                .rfind(LOCK1_GATE)
                 .is_some_and(|g| sw[g..i].matches('\n').count() <= 2),
             "{hook} is gated"
         );
@@ -393,29 +412,34 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
     assert!(dump.contains("LOCK1_REC seq=") && dump.contains("LOCK1_DUMP_DONE records="));
     // The grader validates the crc, requires the SMP3 seal, and re-derives the chain per round.
     assert!(
-        GRADER.contains("if not mm or fnv1a(mm.group(1)) != int(mm.group(3), 16):"),
+        CORE.contains("if not mm or fnv1a(mm.group(1)) != int(mm.group(3), 16):"),
         "the grader checks every LOCK1 line's crc (metadata, records, completion)"
     );
     assert!(
-        GRADER.contains("fail(\"the SMP3 seal did not pass: \""),
+        GRADER.contains("corroborating_seal(lines, \"SMP3_VERDICT\", fail)")
+            && CORE.contains("fail(\"the %s seal did not pass: \" % name"),
         "the grader requires the SMP3 seal"
     );
-    // Transport accounting: the declared count, the completion record and the contiguous sequence.
+    assert!(GRADER.contains("from lock_witness_core import"));
+    assert!(GRADER.contains("meta, recs, _ = transport(lines, \"LOCK1\", META_RX, fail)"));
+    // Transport accounting (shared core): the declared count, the completion record, the
+    // contiguous sequence, and the same-boot seal's intact, non-conflicting verdict.
     for check in [
-        "no intact LOCK1_META line",
-        "conflicting checksum-valid LOCK1_META copies",
-        "the dump is incomplete: no intact LOCK1_DUMP_DONE completion record",
-        "conflicting checksum-valid LOCK1_DUMP_DONE copies",
-        "inconsistent counts: LOCK1_META declares %d records, LOCK1_DUMP_DONE %d",
+        "no intact %s_META line",
+        "conflicting checksum-valid %s_META copies",
+        "the dump is incomplete: no intact %s_DUMP_DONE completion record",
+        "conflicting checksum-valid %s_DUMP_DONE copies",
+        "inconsistent counts: %s_META declares %d records, %s_DUMP_DONE %d",
         "missing records: %d of the %d declared have no intact copy",
         "records beyond the declared count",
-        "no intact SMP3 verdict on this boot",
-        "conflicting checksum-valid SMP3 verdicts",
-        // Arrival ordering: after the release record of the acquisition the pending observation named.
-        "precedes the release record (seq %s) of acquisition",
+        "no intact %s verdict on this boot",
+        "conflicting checksum-valid %s verdicts",
+        "conflicting checksum-valid copies of seq",
     ] {
-        assert!(GRADER.contains(check), "the grader enforces: {check}");
+        assert!(CORE.contains(check), "the shared core enforces: {check}");
     }
+    // Arrival ordering: after the release record of the acquisition the pending observation named.
+    assert!(GRADER.contains("precedes the release record (seq %s) of acquisition"));
     // The fixtures go through the same transport validation: genuine metadata and completion.
     assert!(GRADER.contains(
         "meta = \"LOCK1_META vm_lock_id=%d rounds=%d slots_used=%d overflow=0 dump_cpu=0\" % ("
@@ -431,7 +455,7 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
         GRADER.contains("MIN_PER_DIRECTION = 4"),
         "contention and attributed delivery are each required per direction"
     );
-    // The seal grader's ownership model and attributed-delivery obligations.
+    // The ownership model and value-linked contention (shared core) ...
     for check in [
         "a lock event names lock",
         "overlapping owners",
@@ -440,16 +464,27 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
         "does not match the owning acquisition",
         "was never released",
         "recorded contention while it owned the lock",
+        "no waiter contention record produced",
+    ] {
+        assert!(CORE.contains(check), "the shared core enforces: {check}");
+    }
+    for call in [
+        "acqs = ownership(ev, ROUNDS, fail)",
+        "contention_outside_own(ev, acqs, ROUNDS, fail)",
+        "contention_credit(r, W, hold, ev, acqs)",
+    ] {
+        assert!(GRADER.contains(call), "the LOCK1 grader applies {call}");
+    }
+    // ... and LOCK1's own attributed-delivery obligations.
+    for check in [
         "has no complete record",
         "the hold falls outside its acquisition",
         "holder was not masked (sstatus.SIE set) inside the critical section",
-        "no waiter contention record produced",
         "did not swap out the waiter's bit",
         "which was never armed there",
         "the consumption's generation is stale",
         "was never discharged",
         "overwrote round",
-        "conflicting checksum-valid copies of seq",
         "attributed masked deliveries",
     ] {
         assert!(GRADER.contains(check), "the grader enforces: {check}");
@@ -491,7 +526,7 @@ fn the_ipi_work_is_attributed_at_the_production_mailbox() {
     assert!(refusal < genr && genr < publish);
     assert!(
         sr[..genr]
-            .rfind(GATE)
+            .rfind(LOCK1_GATE)
             .is_some_and(|g| sr[g..genr].matches('\n').count() <= 2)
     );
     // The masked positive observation and the arming.
@@ -546,7 +581,7 @@ fn the_ipi_work_is_attributed_at_the_production_mailbox() {
         swap < note && note < ret,
         "after the production consume, before return"
     );
-    let gate = ta[..note].rfind(GATE);
+    let gate = ta[..note].rfind(LOCK1_GATE);
     assert!(gate.is_some_and(|g| ta[g..note].matches('\n').count() <= 2));
     // The dump names the new kinds.
     let dump = code(fn_body(WITNESS, "pub fn dump() {"));

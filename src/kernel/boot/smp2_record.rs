@@ -205,7 +205,12 @@ fn code(name: &str) -> u64 {
 pub const P1_ROUNDS: u64 = 4;
 pub const P1_MIN_SGI_TO_C: usize = 2;
 /// Mutual rounds; every one must show its two production operations in flight together.
+// QEMU-LOCK2: the LOCK2 build drives twelve mutual rounds (six per contention direction); the plain
+// SMP2 build keeps four. The count tracks the assembly's injected `YARM_MUT_ROUNDS`.
+#[cfg(not(feature = "aarch64-lock2-witness"))]
 pub const MUT_ROUNDS: u64 = 4;
+#[cfg(feature = "aarch64-lock2-witness")]
+pub const MUT_ROUNDS: u64 = 12;
 
 /// The four witness tasks: `(tid, asid, home cpu)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

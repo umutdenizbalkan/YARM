@@ -93,6 +93,14 @@ pub fn try_configure_gic_from_description(description: &[u8]) -> bool {
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 fn gic_write_eoir(base: usize, token: u32) {
     gic_write_u32(base, GICC_EOIR_OFFSET, token);
+    // QEMU-LOCK2: the completion the controller was just given — the one `GICC_EOIR` writer, so a
+    // withheld or duplicated completion is visible to the witness. Observes; writes nothing.
+    #[cfg(all(
+        feature = "aarch64-lock2-witness",
+        target_arch = "aarch64",
+        not(feature = "hosted-dev")
+    ))]
+    crate::kernel::lock2_witness::note_completion(token);
 }
 
 #[cfg(any(test, target_arch = "aarch64"))]
@@ -106,7 +114,16 @@ fn gic_write_u32(base: usize, offset: usize, value: u32) {
 #[cfg(any(test, target_arch = "aarch64"))]
 #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
 fn gic_read_iar(base: usize) -> u32 {
-    unsafe { read_volatile((base + GICC_IAR_OFFSET) as *const u32) }
+    let token = unsafe { read_volatile((base + GICC_IAR_OFFSET) as *const u32) };
+    // QEMU-LOCK2: the claim exactly as the controller returned it — the one `GICC_IAR` reader, so
+    // every acknowledgement (SGI source included) reaches the witness. Observes; claims nothing.
+    #[cfg(all(
+        feature = "aarch64-lock2-witness",
+        target_arch = "aarch64",
+        not(feature = "hosted-dev")
+    ))]
+    crate::kernel::lock2_witness::note_claim(token);
+    token
 }
 
 #[cfg(any(test, target_arch = "aarch64"))]

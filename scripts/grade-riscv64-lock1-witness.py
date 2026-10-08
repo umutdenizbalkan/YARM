@@ -43,8 +43,14 @@
 # same boot corroborates progress/results/context; it substitutes for none of the above.
 #
 # Usage: grade-riscv64-lock1-witness.py <boot.log> <artifact-identity> [<firmware.pin>]
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lock_witness_core import (  # noqa: E402  (the shared, architecture-neutral half)
+    check_events, contention_credit, contention_outside_own, corroborating_seal, fnv1a, inside,
+    ownership, transport)
 
 VM_LOCK_ID = 1
 ROUNDS = 12
@@ -53,13 +59,6 @@ MIN_PER_DIRECTION = 4  # credited contended rounds, and attributed masked delive
 KINDS = {"acquire", "contended", "release", "hold", "ipi", "arrival", "pending", "gate", "done",
          "linklost"}
 LOCK_KINDS = {"acquire", "contended", "release", "hold"}
-
-
-def fnv1a(s: str) -> int:
-    h = 0x811C9DC5
-    for b in s.encode():
-        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
-    return h
 
 
 # ── synthetic fixtures (self-test) ───────────────────────────────────────────────────────────
@@ -433,180 +432,27 @@ elif pin and pin.get("banner") and pin["banner"] not in osbi:
     fail("the banner names %r, not the pinned %r" % (osbi.strip(), pin["banner"]))
 
 # ── the SMP3 seal must pass on this same boot (corroboration; intact, non-conflicting copies) ──
-smp3 = {}
-for l in lines:
-    if l.strip().startswith("SMP3_VERDICT "):
-        mm = re.match(r"^(.*) pass=(\d+) crc=0x([0-9a-f]{8})$", l.strip())
-        if mm and fnv1a(mm.group(1)) == int(mm.group(3), 16):
-            smp3.setdefault(mm.group(1), 0)
-if not smp3:
-    fail("no intact SMP3 verdict on this boot")
-elif len(smp3) > 1:
-    fail("conflicting checksum-valid SMP3 verdicts: %s" % sorted(smp3))
-elif not next(iter(smp3)).startswith("SMP3_VERDICT result=ok "):
-    fail("the SMP3 seal did not pass: " + next(iter(smp3))[:120])
+corroborating_seal(lines, "SMP3_VERDICT", fail)
 
-# ── transport accounting ─────────────────────────────────────────────────────────────────────
-# The dump is printed in two passes; each pass is `LOCK1_META`, every record, `LOCK1_DUMP_DONE`, each
-# line carrying `pass=N crc=0x…` over the text before ` pass=`. A copy whose checksum fails (or that
-# is torn) is damaged and ignored; another intact copy of the same line recovers it. Identical intact
-# copies are deduplicated; differing intact copies of one line are a contradiction. The metadata and
-# completion records must be intact and agree on the record count, and the deduplicated records must
-# be exactly the contiguous sequence 0..count-1 that the dump declares — no gap, no extra record.
-TAIL = re.compile(r"^(.*) pass=(\d+) crc=0x([0-9a-f]{8})$")
-META_RX = re.compile(r"^LOCK1_META vm_lock_id=(\d+) rounds=(\d+) slots_used=(\d+) overflow=(\d+) "
-                     r"dump_cpu=(\d+)$")
-DONE_RX = re.compile(r"^LOCK1_DUMP_DONE records=(\d+)$")
-REC_RX = re.compile(r"^LOCK1_REC seq=(\d+) kind=(\w+) hart=(\d+) f0=0x([0-9a-f]+) f1=0x([0-9a-f]+) "
-                    r"f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+)$")
-
-
-def intact(l):
-    """-> (body, pass) for a checksum-valid copy, else None."""
-    mm = TAIL.match(l.strip())
-    if not mm or fnv1a(mm.group(1)) != int(mm.group(3), 16):
-        return None
-    return mm.group(1), int(mm.group(2))
-
-
-metas, dones, recs, damaged = {}, {}, {}, 0
-first_meta = last_done = None
-for i, l in enumerate(lines):
-    s = l.strip()
-    if not s.startswith("LOCK1_"):
-        continue
-    got = intact(s)
-    if got is None:
-        damaged += 1
-        continue
-    body, pass_ = got
-    if pass_ not in (1, 2):
-        fail("line %d: an intact LOCK1 copy names dump pass %d" % (i + 1, pass_))
-    if body.startswith("LOCK1_META "):
-        if not META_RX.match(body):
-            fail("a checksum-valid LOCK1_META line is malformed: %r" % body[:100])
-            continue
-        metas.setdefault(body, []).append(pass_)
-        first_meta = i if first_meta is None else first_meta
-    elif body.startswith("LOCK1_DUMP_DONE "):
-        if not DONE_RX.match(body):
-            fail("a checksum-valid LOCK1_DUMP_DONE line is malformed: %r" % body[:100])
-            continue
-        dones.setdefault(body, []).append(pass_)
-        last_done = i
-    elif body.startswith("LOCK1_REC "):
-        mm = REC_RX.match(body)
-        if not mm:
-            fail("a checksum-valid LOCK1_REC line is malformed: %r" % body[:100])
-            continue
-        seq = int(mm.group(1))
-        rec = dict(seq=seq, kind=mm.group(2), hart=int(mm.group(3)),
-                   f=[int(mm.group(j), 16) for j in range(4, 9)], body=body)
-        if seq in recs:
-            if recs[seq]["body"] != body:
-                fail("conflicting checksum-valid copies of seq %d" % seq)
-        else:
-            recs[seq] = rec
-    else:
-        fail("an intact line of unknown LOCK1 type: %r" % body[:80])
-
-declared = None
-if not metas:
-    fail("no intact LOCK1_META line (the dump's metadata is missing or every copy is damaged)")
-elif len(metas) > 1:
-    fail("conflicting checksum-valid LOCK1_META copies: %s" % sorted(metas))
-else:
-    vm_lock, rounds_m, slots, overflow, dump_cpu = map(int, META_RX.match(next(iter(metas))).groups())
-    if overflow != 0:
-        fail("the LOCK1 record overflowed its ring (overflow=%d)" % overflow)
-    if vm_lock != VM_LOCK_ID:
-        fail("LOCK1_META names vm_lock_id=%d, not %d" % (vm_lock, VM_LOCK_ID))
-    if rounds_m != ROUNDS:
-        fail("LOCK1_META schedules %d rounds, not %d" % (rounds_m, ROUNDS))
-    if dump_cpu not in (0, 1):
-        fail("LOCK1_META names dump CPU %d" % dump_cpu)
-    declared = slots
-if not dones:
-    fail("the dump is incomplete: no intact LOCK1_DUMP_DONE completion record")
-elif len(dones) > 1:
-    fail("conflicting checksum-valid LOCK1_DUMP_DONE copies: %s" % sorted(dones))
-else:
-    done_n = int(DONE_RX.match(next(iter(dones))).group(1))
-    if declared is not None and done_n != declared:
-        fail("inconsistent counts: LOCK1_META declares %d records, LOCK1_DUMP_DONE %d"
-             % (declared, done_n))
-    if first_meta is not None and last_done < first_meta:
-        fail("the dump is incomplete: no completion record follows its metadata")
-    declared = done_n if declared is None else declared
-if declared is not None:
-    missing = [s for s in range(declared) if s not in recs]
-    extra = sorted(s for s in recs if s >= declared)
-    if missing:
-        fail("missing records: %d of the %d declared have no intact copy (seq %s%s)"
-             % (len(missing), declared, ", ".join(map(str, missing[:8])),
-                ", …" if len(missing) > 8 else ""))
-    if extra:
-        fail("records beyond the declared count %d: seq %s" % (declared, extra[:8]))
+# ── transport accounting (shared: lock_witness_core.transport) ──────────────────────────────
+META_RX = re.compile(r"^LOCK1_META vm_lock_id=(?P<lock>\d+) rounds=(?P<rounds>\d+) "
+                     r"slots_used=(?P<slots_used>\d+) overflow=(?P<overflow>\d+) "
+                     r"dump_cpu=(?P<dump_cpu>\d+)$")
+meta, recs, _ = transport(lines, "LOCK1", META_RX, fail)
+if meta is not None:
+    if int(meta.group("lock")) != VM_LOCK_ID:
+        fail("LOCK1_META names vm_lock_id=%s, not %d" % (meta.group("lock"), VM_LOCK_ID))
+    if int(meta.group("rounds")) != ROUNDS:
+        fail("LOCK1_META schedules %s rounds, not %d" % (meta.group("rounds"), ROUNDS))
+    if int(meta.group("dump_cpu")) not in (0, 1):
+        fail("LOCK1_META names dump CPU %s" % meta.group("dump_cpu"))
 ev = [recs[k] for k in sorted(recs)]
-for e in ev:
-    if e["kind"] not in KINDS:
-        fail("unknown event kind %r at seq %d" % (e["kind"], e["seq"]))
-    if e["hart"] not in (0, 1):
-        fail("seq %d recorded by unexpected hart %d" % (e["seq"], e["hart"]))
-    if e["kind"] in LOCK_KINDS and e["f"][0] != VM_LOCK_ID:
-        fail("seq %d: a lock event names lock %d, not the VM lock %d"
-             % (e["seq"], e["f"][0], VM_LOCK_ID))
+check_events(ev, KINDS, (0, 1), VM_LOCK_ID, fail)
 by = lambda kind: [e for e in ev if e["kind"] == kind]
 
-# ── the ownership model (every recorded acquisition and release, in record order) ──
-acqs = {}
-owner = None
-for e in ev:
-    if e["kind"] not in ("acquire", "release"):
-        continue
-    aid, rnd = e["f"][2], e["f"][1]
-    if e["kind"] == "acquire":
-        if aid in acqs:
-            fail("seq %d: duplicate acquisition id %d" % (e["seq"], aid))
-            continue
-        if owner is not None:
-            o = acqs[owner]
-            fail("seq %d: overlapping owners — hart %d acquired (id %d) while hart %d's acquisition "
-                 "%d (seq %d) was unreleased" % (e["seq"], e["hart"], aid, o["cpu"], owner, o["a"]))
-        if not 1 <= rnd <= ROUNDS:
-            fail("seq %d: acquisition tagged with unscheduled round %d" % (e["seq"], rnd))
-        acqs[aid] = dict(cpu=e["hart"], round=rnd, a=e["seq"], r=None)
-        owner = aid
-    else:
-        if owner is None:
-            fail("seq %d: release with no preceding acquisition (names id %d)" % (e["seq"], aid))
-            continue
-        o = acqs[owner]
-        if aid != owner or e["hart"] != o["cpu"] or rnd != o["round"]:
-            fail("seq %d: release (hart %d, id %d, round %d) does not match the owning acquisition "
-                 "(hart %d, id %d, round %d)" % (e["seq"], e["hart"], aid, rnd, o["cpu"], owner,
-                                                 o["round"]))
-        o["r"] = e["seq"]
-        owner = None
-if owner is not None:
-    fail("acquisition %d (hart %d, seq %d) was never released"
-         % (owner, acqs[owner]["cpu"], acqs[owner]["a"]))
-
-
-def inside(e, aid):
-    a = acqs.get(aid)
-    return (a is not None and a["r"] is not None and a["cpu"] == e["hart"]
-            and a["a"] < e["seq"] < a["r"])
-
-
-# A CPU observing the lock held is inside its own lock() call, never inside its own ownership.
-for c in by("contended"):
-    if not 1 <= c["f"][1] <= ROUNDS:
-        fail("seq %d: contention tagged with unscheduled round %d" % (c["seq"], c["f"][1]))
-    for aid, a in acqs.items():
-        if a["cpu"] == c["hart"] and a["r"] is not None and a["a"] < c["seq"] < a["r"]:
-            fail("seq %d: hart %d recorded contention while it owned the lock (acquisition %d)"
-                 % (c["seq"], c["hart"], aid))
+# ── the ownership model (shared) and contention outside the observer's own ownership ──
+acqs = ownership(ev, ROUNDS, fail)
+contention_outside_own(ev, acqs, ROUNDS, fail)
 
 for lk in by("linklost"):
     fail("seq %d: hart %d overwrote round %d's unresolved delivery link"
@@ -646,37 +492,24 @@ for r in range(1, ROUNDS + 1):
     if hold["f"][4] & 1:
         round_fail(r, "holder was not masked (sstatus.SIE set) inside the critical section")
         continue
-    if not inside(hold, aid) or acqs[aid]["round"] != r:
+    if not inside(acqs, hold, aid) or acqs[aid]["round"] != r:
         round_fail(r, "the hold falls outside its acquisition %d" % aid)
         continue
-    if pend["f"][4] != aid or not inside(pend, aid) or pend["f"][1] != W:
+    if pend["f"][4] != aid or not inside(acqs, pend, aid) or pend["f"][1] != W:
         round_fail(r, "the pending observation is not the holder's, inside acquisition %d" % aid)
         continue
     if (hold["f"][4] >> 1) & 1:
         ssip_rounds += 1
 
-    # ── contention, attributed by value ──
-    k_seen, base = hold["f"][3], hold["f"][4] >> 8
+    # ── contention, attributed by value (shared) ──
+    got_credit, why = contention_credit(r, W, hold, ev, acqs)
+    if why:
+        round_fail(r, why)
+        continue
     contended_credit = False
-    if k_seen:
-        con = [c for c in by("contended") if c["hart"] == W and c["f"][1] == r
-               and base < c["f"][2] <= k_seen]
-        if not con:
-            round_fail(r, "the holder saw contention value %d that no waiter contention record "
-                       "produced" % k_seen)
-            continue
-        c = min(con, key=lambda e: e["seq"])
-        nxt = [a for a in acqs.values() if a["cpu"] == W and a["a"] > c["seq"]]
-        if not nxt:
-            round_fail(r, "the contender never acquired after observing the lock held")
-            continue
-        got = min(nxt, key=lambda a: a["a"])
-        if got["round"] != r or got["r"] is None:
-            round_fail(r, "the contender's acquisition is not this round's or never released")
-            continue
-        if g_w[0]["f"][3] == 1:
-            contended_credit = True
-            credited[W] += 1
+    if got_credit and g_w[0]["f"][3] == 1:
+        contended_credit = True
+        credited[W] += 1
 
     # ── delivery, attributed by generation ──
     ipi = [e for e in by("ipi") if e["f"][0] == r and e["hart"] == W]

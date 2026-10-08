@@ -26,6 +26,12 @@ pub mod lock;
 // QEMU-LOCK1: the real subdomain-lock contention / interrupt-progress witness. Default off.
 #[cfg(feature = "riscv64-lock1-witness")]
 pub mod lock1_witness;
+// QEMU-LOCK2: the AArch64 twin — the same lock, SGI work attributed at the GICv2. Default off.
+#[cfg(feature = "aarch64-lock2-witness")]
+pub mod lock2_witness;
+// The facade `SpinLockIrq` calls for the one witnessed lock (LOCK1 or LOCK2, never both).
+#[cfg(feature = "lock-witness")]
+pub mod lock_witness;
 #[cfg(any(
     feature = "aarch64-overtaken-witness",
     feature = "x86-overtaken-witness"

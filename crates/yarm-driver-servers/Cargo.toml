@@ -47,6 +47,8 @@ riscv-uart-irq-witness = []
 aarch64-pl011-irq-witness = []
 # QEMU-SMP2: kernel-only witness; accepted and inert here so one feature list builds every image.
 aarch64-smp2-witness = []
+# QEMU-LOCK2: kernel-only witness; accepted and inert here, as above.
+aarch64-lock2-witness = []
 # QEMU-SMP3-ACCEPTANCE: kernel-only witness; accepted and inert here, as above.
 aarch64-overtaken-witness = []
 x86_64-uart-irq-witness = []

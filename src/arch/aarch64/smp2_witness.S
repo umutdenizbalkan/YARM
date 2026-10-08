@@ -63,7 +63,7 @@
 
     .set P1_ROUNDS, 4
     .set TLB_ROUNDS, 4
-    .set MUT_ROUNDS, 4
+    .set MUT_ROUNDS, YARM_MUT_ROUNDS
     .set PARK_TICKS, 60
 
     /* MBX words */

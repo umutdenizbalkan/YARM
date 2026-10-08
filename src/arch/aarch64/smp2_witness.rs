@@ -30,7 +30,13 @@ use crate::kernel::capabilities::{CapId, CapRights};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::vm::{Asid, CachePolicy, Mapping, PageFlags, PhysAddr, VirtAddr};
 
-core::arch::global_asm!(include_str!("smp2_witness.S"));
+// QEMU-LOCK2: the LOCK2 build drives twelve mutual rounds (six per contention direction); the plain
+// SMP2 build keeps four. The verifier grades exactly the rounds the workload runs
+// (`smp2_record::MUT_ROUNDS` follows the same feature).
+#[cfg(not(feature = "aarch64-lock2-witness"))]
+core::arch::global_asm!(".equ YARM_MUT_ROUNDS, 4\n", include_str!("smp2_witness.S"));
+#[cfg(feature = "aarch64-lock2-witness")]
+core::arch::global_asm!(".equ YARM_MUT_ROUNDS, 12\n", include_str!("smp2_witness.S"));
 
 pub const CODE_VA: u64 = 0x2000_0000;
 pub const STACK_VA: u64 = 0x2001_0000;
@@ -362,6 +368,10 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
     kernel.enqueue_task(C_TID)?;
     ENABLED.store(true, Ordering::Release);
     rec::arm();
+    // QEMU-LOCK2: arm the lock-contention witness alongside the SMP2 record (compiled out on a plain
+    // SMP2 build).
+    #[cfg(feature = "aarch64-lock2-witness")]
+    crate::kernel::lock2_witness::arm();
     crate::kernel::printk::printk_emit_sync(format_args!(
         "SMP2_WITNESS_PROVISIONED s_tid={} s_asid={} c_tid={} c_asid={} h1_tid={} h1_asid={} h0_tid={} h0_asid={} mbx_phys=0x{:x} s_image={} c_image={} h_image={}",
         S_TID,
@@ -651,7 +661,17 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u6
     // The mutual requester's announcement arms its next VM operation for the rendezvous.
     if step == "S_MUT_NR3" || step == "C_MUT_NR3" {
         MUT_ANNOUNCED[usize::from(step == "C_MUT_NR3")].store(round, Ordering::Release);
+        // QEMU-LOCK2: open this round's contention window and order entry so the designated holder
+        // takes `vm_state_lock` first and the other CPU contends on it. `S_MUT_NR3` runs on CPU 1,
+        // `C_MUT_NR3` on CPU 0 — the marker's own CPU is the acting CPU.
+        #[cfg(feature = "aarch64-lock2-witness")]
+        crate::kernel::lock2_witness::mut_round_gate(cpu.0, round);
         return;
+    }
+    // QEMU-LOCK2: close the round's window once a CPU finishes it.
+    #[cfg(feature = "aarch64-lock2-witness")]
+    if step == "S_MUT_OK" || step == "C_MUT_OK" {
+        crate::kernel::lock2_witness::note_round_ok(round);
     }
     if step == "S_DONE" {
         S_DONE.store(true, Ordering::Release);
@@ -772,6 +792,10 @@ fn dump() {
             ));
         }
     }
+    // QEMU-LOCK2: the lock-contention record follows the SMP2 seal, so one boot carries both the
+    // SMP2 progress/result/context evidence and the LOCK2 lock and SGI evidence.
+    #[cfg(feature = "aarch64-lock2-witness")]
+    crate::kernel::lock2_witness::dump();
 }
 
 /// FNV-1a over a dump line's text (everything before ` pass=`).

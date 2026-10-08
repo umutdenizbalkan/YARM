@@ -53,7 +53,7 @@ pub struct SpinLockIrq<T> {
     // address-space lock). Every other `SpinLockIrq` keeps id 0 and is never recorded. The field
     // exists only under the witness feature, so the plain build's layout and acquisition path are
     // byte-for-byte unchanged.
-    #[cfg(feature = "riscv64-lock1-witness")]
+    #[cfg(feature = "lock-witness")]
     witness_id: u32,
 }
 
@@ -133,7 +133,7 @@ impl<T> SpinLockIrq<T> {
         Self {
             held: CachePaddedFlag(AtomicBool::new(false)),
             value: UnsafeCell::new(value),
-            #[cfg(feature = "riscv64-lock1-witness")]
+            #[cfg(feature = "lock-witness")]
             witness_id: 0,
         }
     }
@@ -141,7 +141,7 @@ impl<T> SpinLockIrq<T> {
     /// QEMU-LOCK1: construct the ONE witnessed subdomain lock, tagged with a stable non-zero id.
     /// The acquisition algorithm is identical to [`Self::new`]'s lock; the id only selects which
     /// instance the (default-off) witness records.
-    #[cfg(feature = "riscv64-lock1-witness")]
+    #[cfg(feature = "lock-witness")]
     pub const fn new_witnessed(value: T, witness_id: u32) -> Self {
         Self {
             held: CachePaddedFlag(AtomicBool::new(false)),
@@ -156,14 +156,14 @@ impl<T> SpinLockIrq<T> {
         // already HELD by someone else — the actual failed acquisition the contention witness
         // records, derived from the atomic flag itself, not from elapsed time. Recorded once, and
         // only for the witnessed instance; the production algorithm below is unchanged.
-        #[cfg(feature = "riscv64-lock1-witness")]
+        #[cfg(feature = "lock-witness")]
         let mut observed_held = false;
         loop {
             while self.held.0.load(Ordering::Relaxed) {
-                #[cfg(feature = "riscv64-lock1-witness")]
+                #[cfg(feature = "lock-witness")]
                 if self.witness_id != 0 && !observed_held {
                     observed_held = true;
-                    crate::kernel::lock1_witness::note_contended(self.witness_id);
+                    crate::kernel::lock_witness::note_contended(self.witness_id);
                 }
                 spin_loop();
             }
@@ -177,12 +177,12 @@ impl<T> SpinLockIrq<T> {
             {
                 // QEMU-LOCK1-SEAL: the acquisition's witness token (0 = not recorded) travels in
                 // the guard so the release record names exactly this acquisition.
-                #[cfg(feature = "riscv64-lock1-witness")]
+                #[cfg(feature = "lock-witness")]
                 let witness_token = if self.witness_id != 0 {
-                    let token = crate::kernel::lock1_witness::note_acquired(self.witness_id);
+                    let token = crate::kernel::lock_witness::note_acquired(self.witness_id);
                     // The default-off, bounded hold hook runs here — holding the lock, with
                     // supervisor interrupts masked — before the guard is handed back.
-                    crate::kernel::lock1_witness::maybe_hold(self.witness_id, token);
+                    crate::kernel::lock_witness::maybe_hold(self.witness_id, token);
                     token
                 } else {
                     0
@@ -190,7 +190,7 @@ impl<T> SpinLockIrq<T> {
                 return SpinLockIrqGuard {
                     lock: self,
                     irq_state,
-                    #[cfg(feature = "riscv64-lock1-witness")]
+                    #[cfg(feature = "lock-witness")]
                     witness_token,
                     _not_send: PhantomData,
                 };
@@ -206,7 +206,7 @@ pub struct SpinLockIrqGuard<'a, T> {
     irq_state: ArchIrqState,
     // QEMU-LOCK1-SEAL: witness-only observation metadata (the recorded acquisition's token); absent
     // from the default build.
-    #[cfg(feature = "riscv64-lock1-witness")]
+    #[cfg(feature = "lock-witness")]
     witness_token: u64,
     _not_send: PhantomData<*const UnsafeCell<()>>,
 }
@@ -236,9 +236,9 @@ impl<T> Drop for SpinLockIrqGuard<'_, T> {
         // QEMU-LOCK1: record the release of the witnessed lock BEFORE the atomic store makes it
         // acquirable, so the holder's "released" event is causally before any waiter's subsequent
         // acquisition. The store and the IRQ restore below are the unchanged production release.
-        #[cfg(feature = "riscv64-lock1-witness")]
+        #[cfg(feature = "lock-witness")]
         if self.lock.witness_id != 0 {
-            crate::kernel::lock1_witness::note_released(self.lock.witness_id, self.witness_token);
+            crate::kernel::lock_witness::note_released(self.lock.witness_id, self.witness_token);
         }
         self.lock.held.0.store(false, Ordering::Release);
         irq_restore(self.irq_state);
