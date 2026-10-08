@@ -276,6 +276,10 @@ pub fn send_reschedule(sender: CpuId, target: CpuId) -> Result<(), IpiRefusal> {
     let hart_mask = 1usize.checked_shl(hart as u32).ok_or(IpiRefusal::NoHart)?;
     let slot = PENDING.get(t).ok_or(IpiRefusal::NoHart)?;
     let bit = 1u64 << (sender.0 as u64 & 63);
+    // QEMU-LOCK1-SEAL §3: advance this (target, sender) publication generation BEFORE the bit is
+    // published, so any consumption that swaps the bit out reads a generation at least this new.
+    #[cfg(feature = "riscv64-lock1-witness")]
+    crate::kernel::lock1_witness::note_publication(sender.0, target.0);
     // PUBLICATION, then NOTIFICATION.
     let old = slot.fetch_or(bit, Ordering::AcqRel);
     full_fence();
@@ -318,6 +322,8 @@ pub fn kick_self(cpu: CpuId) -> bool {
         return false;
     };
     let bit = 1u64 << (cpu.0 as u64 & 63);
+    #[cfg(feature = "riscv64-lock1-witness")]
+    crate::kernel::lock1_witness::note_publication(cpu.0, cpu.0);
     let old = slot.fetch_or(bit, Ordering::AcqRel);
     full_fence();
     crate::arch::riscv64::smp3_witness::note_kick_published(cpu, hart, old & bit != 0);
@@ -357,11 +363,11 @@ pub fn take_arrival(cpu: CpuId, origin: ArrivalOrigin) -> IpiArrival {
             row[3].fetch_add(sources.count_ones(), Ordering::AcqRel);
         }
     }
-    // QEMU-LOCK1-ACCEPTANCE §3: the delivery end of the publish → masked-pending → arrival chain.
-    // Records a K_ARRIVAL only when this CPU had a LOCK1 IPI armed as a recent round's holder; a
-    // no-op otherwise. Observes the production consumption, takes nothing from it.
+    // QEMU-LOCK1-SEAL §3: the delivery end of the chain. The witness receives the ACTUAL sources
+    // this consumption swapped out; it records only on a CPU with an armed link, and discharges that
+    // link only when the linked sender's bit is among `sources`. Observes; takes nothing.
     #[cfg(feature = "riscv64-lock1-witness")]
-    crate::kernel::lock1_witness::note_arrival(cpu.0);
+    crate::kernel::lock1_witness::note_arrival(cpu.0, sources);
     IpiArrival { origin, sources }
 }
 

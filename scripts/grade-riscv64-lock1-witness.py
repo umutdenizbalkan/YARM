@@ -1,26 +1,37 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 #
-# QEMU-LOCK1-ACCEPTANCE — the independent grader for the real subdomain-lock contention witness.
+# QEMU-LOCK1-SEAL — the independent grader for the real subdomain-lock contention witness.
 #
-# It re-derives every credited contended round from the raw sealed `LOCK1_REC` lines (never from the
-# kernel's own summary) by validating the COMPLETE relevant event history of each round against the
-# ownership-interval contract, and it establishes the §3 interrupt chain by linked identity in a
-# single shared record sequence:
+# It re-derives every round from the raw sealed `LOCK1_REC` lines (never from the kernel's summary)
+# with an explicit ownership model and a generation-attributed interrupt chain. Every ordering it
+# relies on is justified from the recording semantics, not assumed from record sequence numbers:
 #
-#   * the production IPI was published to the designated holder (`ipi`), before the holder left the
-#     witnessed ownership interval;
-#   * the holder held the one VM lock (`vm_lock_id`) with supervisor interrupts masked (`hold`,
-#     sstatus.SIE = 0) while the contender actually observed it held (`contended`);
-#   * the holder released, the contender then acquired, completed and released (handover established
-#     by the contender's own successful acquisition, not by assuming an observer ordering);
-#   * the holder, once unmasked, consumed that pending software interrupt through the production
-#     arrival owner (`arrival`), after the interval.
+#   * acquire records are taken AFTER the successful CAS and release records BEFORE the unlocking
+#     store (release INTENT). Release-record fetch_add -> Release store -> Acquire CAS -> next
+#     acquire-record fetch_add is a happens-before chain, so for one lock the acquire/release
+#     records must strictly alternate, each release naming (by acquisition id, CPU and round) the
+#     acquisition it ends. Overlapping owners, unmatched or duplicate releases, duplicate acquisition
+#     ids and unreleased acquisitions are contradictions.
+#   * hold / pending observations are made by the owning CPU inside its acquisition (program order),
+#     so they must fall inside that acquisition's [acquire, release] records.
+#   * a contention observation is recorded by a CPU inside its own lock() call, before the CAS that
+#     ends it, so it can never fall inside an interval that CPU owns, and the CPU's next acquisition
+#     is the one that call completed. Its record may land after the owner's release record (an
+#     observer may run after the atomic it describes); contention is therefore attributed BY VALUE:
+#     the holder's hold records the contention-counter value it saw advance while it owned the lock,
+#     the waiter's contended record carries the value it produced, and the waiter's gate record
+#     certifies its lock() call began after the holder's CAS.
+#   * interrupt work is attributed BY GENERATION at the production mailbox: the publication owner
+#     advances the (target, sender) generation before setting the bit; the masked holder positively
+#     reads its own mailbox (bit outstanding? which generation?) inside its ownership; the arrival
+#     hook receives the sources the consumption actually swapped out. An empty arrival, an unrelated
+#     source, a stale generation, a wrong round or target, a never-armed link or an overwritten link
+#     never discharges a round's obligation.
 #
-# Broken obligations FAIL the boot — they never silently become "uncredited" and hide behind the
-# coverage threshold. A round earns no credit only when its complete, valid history shows it was not
-# contended. The SMP3 seal on the same boot corroborates progress/results/context; it does not
-# substitute for any obligation above. It never retries.
+# Every scheduled round must have a complete record establishing its outcome; a valid uncontended
+# round earns no credit, but absent or contradictory evidence fails the boot. The SMP3 seal on the
+# same boot corroborates progress/results/context; it substitutes for none of the above.
 #
 # Usage: grade-riscv64-lock1-witness.py <boot.log> <artifact-identity> [<firmware.pin>]
 import re
@@ -28,17 +39,10 @@ import sys
 
 VM_LOCK_ID = 1
 ROUNDS = 12
-MIN_PER_DIRECTION = 4
-# The gated §3 evidence is the DELIVERY chain: a round whose masked holder had the production IPI
-# published to it during its ownership interval and then CONSUMED that pending interrupt through the
-# production arrival owner after it unmasked (linked by round/target identity). This establishes the
-# "pending under the mask, delivered after" fact causally and is reliable. The direct sip.SSIP CSR
-# reading is reported as corroboration but not gated: the firmware's M→S reflection is cold on a boot's
-# early rounds (more so under load), so the peek lands in a variable number of rounds while the causal
-# delivery does not.
-MIN_DELIVERY_ROUNDS = 2
+MIN_PER_DIRECTION = 4  # credited contended rounds, and attributed masked deliveries, per direction
 
-KINDS = {"acquire", "contended", "release", "hold", "ipi", "arrival"}
+KINDS = {"acquire", "contended", "release", "hold", "ipi", "arrival", "pending", "gate", "done",
+         "linklost"}
 LOCK_KINDS = {"acquire", "contended", "release", "hold"}
 
 
@@ -49,93 +53,125 @@ def fnv1a(s: str) -> int:
     return h
 
 
-# ── synthetic fixtures (self-test / control generation) ──────────────────────────────────────
-def _body(seq, kind, hart, f):
-    return "LOCK1_REC seq=%d kind=%s hart=%d f0=0x%x f1=0x%x f2=0x%x f3=0x%x f4=0x%x" % (
+# ── synthetic fixtures (self-test) ───────────────────────────────────────────────────────────
+def _line(seq, kind, hart, f, pass_):
+    b = "LOCK1_REC seq=%d kind=%s hart=%d f0=0x%x f1=0x%x f2=0x%x f3=0x%x f4=0x%x" % (
         seq, kind, hart, f[0], f[1], f[2], f[3], f[4])
+    return "%s pass=%d crc=0x%08x" % (b, pass_, fnv1a(b))
 
 
-def _line(seq, kind, hart, f, pass_, crc=None):
-    b = _body(seq, kind, hart, f)
-    return "%s pass=%d crc=0x%08x" % (b, pass_, crc if crc is not None else fnv1a(b))
+def _round(r, ids, gen, k, variant):
+    """One realistic round. Returns [(kind, hart, f)]. `variant` names a valid interleaving."""
+    H = 0 if r % 2 == 1 else 1
+    W = 1 - H
+    a, b, c, d = ids
+    hold = ("hold", H, [1, r, a, k, 0 | (1 << 1) | ((k - 1) << 8)])
+    pend = ("pending", H, [r, W, 1, gen, a])
+    con = ("contended", W, [1, r, k, 0, 0])
+    ev = [
+        ("gate", H, [r, H, 0, 1, 0]),
+        ("acquire", H, [1, r, a, 0, 0]),
+        ("gate", W, [r, H, 1, 1, 0]),
+        ("ipi", W, [r, H, 1, gen, 0]),
+    ]
+    if variant == "late_contended":
+        # The waiter's observer callback runs after the holder already recorded hold/pending/release.
+        ev += [hold, pend, ("release", H, [1, r, a, 0, 0]), con]
+    else:
+        ev += [con, hold, pend, ("release", H, [1, r, a, 0, 0])]
+    ev += [("acquire", W, [1, r, b, 0, 0]), ("release", W, [1, r, b, 0, 0])]
+    if variant == "role_swap":
+        # The holder's install contends on the waiter's install acquisition.
+        ev += [("acquire", W, [1, r, d, 0, 0]), ("contended", H, [1, r, k + 1, 0, 0]),
+               ("release", W, [1, r, d, 0, 0]), ("acquire", H, [1, r, c, 0, 0]),
+               ("release", H, [1, r, c, 0, 0])]
+    else:
+        ev += [("acquire", H, [1, r, c, 0, 0]), ("release", H, [1, r, c, 0, 0]),
+               ("acquire", W, [1, r, d, 0, 0]), ("release", W, [1, r, d, 0, 0])]
+    snap = gen + 1 if variant == "coalesced" else gen
+    ev += [("arrival", H, [r, 1 << W, gen, snap, 1 | (W << 8)]),
+           ("done", H, [r, 0, 0, 0, 0]), ("done", W, [r, 0, 0, 0, 0])]
+    return ev
 
 
-def _synth(
-    rounds=12,
-    lock_id=VM_LOCK_ID,
-    event_lock=VM_LOCK_ID,
-    drop=None,            # per-round kind to omit: acquire/contended/release/hold/ipi/arrival/acq_w/rel_w
-    unmasked_round=None,  # round whose holder records SIE=1
-    wrong_holder=False,   # contended names the other CPU
-    ipi_after=False,      # IPI published after both releases
-    rel_w_before_acq=False,  # waiter release emitted before its acquire
-    ipi_wrong_target=False,  # IPI names the wrong holder as target
-    arrival_wrong_round=False,  # arrival names another round
-    conflict_seq=False,   # emit one seq twice with two different crc-valid bodies
-    with_guard_query=True,  # include an extra uncontended holder acquire/release (multiple acquisitions)
-):
-    """Build a synthetic boot log in the acceptance schema, each record emitted in both dump passes."""
+def _synth(rounds=ROUNDS, meta_lock=VM_LOCK_ID, variant=None, mutate=None, conflict=False):
     header = [
         "OpenSBI v1.3",
         "SMP3_VERDICT result=ok reason=none at=0 pass=1 crc=0x0",
         "LOCK1_META vm_lock_id=%d rounds=%d slots_used=0 overflow=0 dump_cpu=0 pass=1 crc=0x0"
-        % (lock_id, rounds),
+        % (meta_lock, ROUNDS),
     ]
-    logical = []  # (kind, hart, f)
+    logical = []
+    nid, k = 1, 0
+    gens = {0: 0, 1: 0}
     for r in range(1, rounds + 1):
-        holder = 0 if r % 2 == 1 else 1
-        waiter = 1 - holder
-        el = event_lock
-        # The waiter publishes its production IPI to the holder before it contends.
-        if drop != "ipi":
-            tgt = (holder ^ 1) if ipi_wrong_target else holder
-            if not ipi_after:
-                logical.append(("ipi", waiter, [r, tgt, 1, waiter, 0]))
-        # An uncontended guard-query acquisition by the holder (a second legitimate acquisition).
-        if with_guard_query:
-            logical.append(("acquire", holder, [el, r, holder, 0, 0]))
-            logical.append(("release", holder, [el, r, 0, 0, 0]))
-        # The contended, extended ownership interval.
-        if drop != "acquire":
-            logical.append(("acquire", holder, [el, r, holder, 0, 0]))
-        if drop != "contended":
-            ch = (holder ^ 1) if wrong_holder else holder
-            logical.append(("contended", waiter, [el, r, ch, r, 0]))
-        if drop != "hold":
-            sie = 1 if unmasked_round == r else 0
-            logical.append(("hold", holder, [el, r, sie, 1, holder]))
-        if drop != "release":
-            logical.append(("release", holder, [el, r, 0, 0, 0]))
-        # Delivery: the holder consumes its pending IPI after the interval.
-        if drop != "arrival":
-            ar = (r + 1) if arrival_wrong_round else r
-            logical.append(("arrival", holder, [ar, holder, 1, 0, 0]))
-        # The contender's handover: acquire then (after) release.
-        if rel_w_before_acq:
-            if drop != "rel_w":
-                logical.append(("release", waiter, [el, r, 0, 0, 0]))
-            if drop != "acq_w":
-                logical.append(("acquire", waiter, [el, r, holder, 0, 0]))
-        else:
-            if drop != "acq_w":
-                logical.append(("acquire", waiter, [el, r, holder, 0, 0]))
-            if drop != "rel_w":
-                logical.append(("release", waiter, [el, r, 0, 0, 0]))
-        if ipi_after and drop != "ipi":
-            tgt = (holder ^ 1) if ipi_wrong_target else holder
-            logical.append(("ipi", waiter, [r, tgt, 1, waiter, 0]))
+        W = 1 - (0 if r % 2 == 1 else 1)
+        gens[W] += 2 if variant == "coalesced" else 1  # a prior SMP3 send may have coalesced
+        k += 2
+        logical += [list(e) for e in _round(r, (nid, nid + 1, nid + 2, nid + 3), gens[W], k,
+                                            variant)]
+        nid += 4
+    if mutate:
+        logical = mutate(logical)
     out = list(header)
-    for pass_ in (1, 2):
+    for p in (1, 2):
         for seq, (kind, hart, f) in enumerate(logical):
-            out.append(_line(seq, kind, hart, f, pass_))
-    if conflict_seq:
-        # A second, checksum-valid copy of seq 0 carrying different fields (a genuine conflict, not a
-        # transport-redundant identical pass copy).
-        k, h, f = logical[0]
+            out.append(_line(seq, kind, hart, f, p))
+    if conflict:
+        kind, hart, f = logical[0]
         bad = list(f)
-        bad[2] ^= 1
-        out.append(_line(0, k, h, bad, 2))
+        bad[3] ^= 1
+        out.append(_line(0, kind, hart, bad, 2))
     return "\n".join(out)
+
+
+def _rnd(e):
+    k, _, f = e
+    return f[1] if k in LOCK_KINDS else f[0]
+
+
+def _at(r, pred, fn):
+    """Apply `fn(list, index)` at the first event of round r matching pred."""
+    def m(ev):
+        for i, e in enumerate(ev):
+            if _rnd(e) == r and pred(e):
+                return fn(ev, i)
+        raise AssertionError("fixture anchor missing")
+    return m
+
+
+def _edit(r, pred, f):
+    def fn(ev, i):
+        ev[i] = f(list(ev[i][:2]) + [list(ev[i][2])])
+        return ev
+    return _at(r, pred, fn)
+
+
+def _drop(r, pred):
+    return _at(r, pred, lambda ev, i: ev[:i] + ev[i + 1:])
+
+
+def _insert_after(r, pred, new):
+    return _at(r, pred, lambda ev, i: ev[:i + 1] + [new] + ev[i + 1:])
+
+
+def _set(i, v):
+    def f(e):
+        e[2][i] = v
+        return e
+    return f
+
+
+def _all_rounds(make):
+    def m(ev):
+        for r in range(1, ROUNDS + 1):
+            ev = make(r)(ev)
+        return ev
+    return m
+
+
+K = lambda kind, hart=None: (lambda e: e[0] == kind and (hart is None or e[1] == hart))
+H5, W5 = 0, 1  # round 5's holder / waiter
 
 
 def _self_test():
@@ -150,44 +186,105 @@ def _self_test():
         idfd, idpath = tempfile.mkstemp()
         os.write(idfd, b"firmware_sha256=" + b"0" * 64 + b"\n")
         os.close(idfd)
-        r = subprocess.run(
-            [sys.executable, sys.argv[0], path, idpath, "/dev/null"],
-            capture_output=True, text=True)
+        r = subprocess.run([sys.executable, sys.argv[0], path, idpath, "/dev/null"],
+                           capture_output=True, text=True)
         os.unlink(path)
         os.unlink(idpath)
         return r.returncode, r.stdout
 
+    def holder(r):
+        return 0 if r % 2 == 1 else 1
+
     cases = [
-        ("good", _synth(), 0),
-        # §1 — the four reproductions, each must now fail for its specific violation.
-        ("lock-99", _synth(event_lock=99), 1),
-        ("waiter-release-before-acquire", _synth(rel_w_before_acq=True), 1),
-        ("ipi-after-releases", _synth(ipi_after=True), 1),
-        ("one-holder-unmasked", _synth(unmasked_round=7), 1),
-        # §2 — ownership-interval obligations.
-        ("no-acquire", _synth(drop="acquire"), 1),
-        ("no-contended", _synth(drop="contended"), 1),
-        ("no-holder-release", _synth(drop="release"), 1),
-        ("no-waiter-acquire", _synth(drop="acq_w"), 1),
-        ("no-waiter-release", _synth(drop="rel_w"), 1),
-        ("no-hold", _synth(drop="hold"), 1),
-        ("wrong-holder", _synth(wrong_holder=True), 1),
-        ("meta-lock-not-1", _synth(lock_id=99), 1),
-        ("too-few-rounds", _synth(rounds=6), 1),
-        ("conflicting-copies", _synth(conflict_seq=True), 1),
-        # §3 — causal IPI chain.
-        ("no-ipi", _synth(drop="ipi"), 1),
-        ("ipi-wrong-target", _synth(ipi_wrong_target=True), 1),
-        ("no-arrival", _synth(drop="arrival"), 1),
-        ("arrival-wrong-round", _synth(arrival_wrong_round=True), 1),
+        # ── positives: valid recordings, interleavings and coalescing ──
+        ("good", _synth(), 0, None),
+        ("valid: coalesced publications", _synth(variant="coalesced"), 0, None),
+        ("valid: late contended observer record", _synth(variant="late_contended"), 0, None),
+        ("valid: role-swapped install contention", _synth(variant="role_swap"), 0, None),
+        ("valid: one uncontended round (no credit)", _synth(mutate=lambda ev: _edit(
+            3, K("pending"), _set(2, 0))(_edit(3, K("hold"), _set(3, 0))(
+            _drop(3, K("arrival"))(ev)))), 0, None),
+        # ── §1 — the three remaining false passes ──
+        ("overlapping owners", _synth(mutate=_insert_after(
+            5, K("hold"), ["acquire", W5, [1, 5, 999, 0, 0]])), 1, "overlapping owners"),
+        ("release without acquisition", _synth(mutate=_at(
+            5, K("gate"), lambda ev, i: ev[:i] + [["release", W5, [1, 5, 998, 0, 0]]] + ev[i:])),
+         1, "release with no preceding acquisition"),
+        ("deleted scheduled round", _synth(mutate=lambda ev: [e for e in ev if _rnd(e) != 7]), 1,
+         "has no complete record"),
+        # ── the four LOCK1-ACCEPTANCE reproductions ──
+        ("lock 99", _synth(mutate=lambda ev: [
+            [k, h, [99] + f[1:]] if k in LOCK_KINDS else [k, h, f] for k, h, f in ev]), 1,
+         "names lock 99"),
+        ("waiter release before acquire", _synth(mutate=_at(
+            5, K("acquire", W5), lambda ev, i: ev[:i] + [ev[i + 1], ev[i]] + ev[i + 2:])), 1,
+         "release with no preceding acquisition"),
+        ("ipi after releases", _synth(mutate=_at(
+            5, K("ipi"), lambda ev, i: ev[:i] + ev[i + 1:i + 6] + [ev[i]] + ev[i + 6:])), 1,
+         "publication is not ordered before the hold"),
+        ("one holder unmasked", _synth(mutate=_edit(7, K("hold"), _set(4, 1))), 1,
+         "not masked"),
+        # ── §2 — ownership-history controls ──
+        ("missing holder acquire", _synth(mutate=_drop(5, K("acquire", H5))), 1,
+         "release with no preceding acquisition"),
+        ("missing holder release", _synth(mutate=_drop(5, K("release", H5))), 1,
+         "overlapping owners"),
+        ("duplicate acquisition id", _synth(mutate=_edit(5, K("acquire", W5), _set(2, 1))), 1,
+         "duplicate acquisition id"),
+        ("release names another acquisition", _synth(mutate=_edit(
+            5, K("release", H5), _set(2, 2))), 1, "does not match the owning acquisition"),
+        ("contention inside own ownership", _synth(mutate=_insert_after(
+            5, K("acquire", W5), ["contended", W5, [1, 5, 500, 0, 0]])), 1,
+         "while it owned the lock"),
+        ("hold outside its acquisition", _synth(mutate=_at(
+            5, K("hold"), lambda ev, i: ev[:i] + ev[i + 1:i + 3] + [ev[i]] + ev[i + 3:])), 1,
+         "outside its acquisition"),
+        ("hold value no waiter produced", _synth(mutate=_edit(5, K("contended", W5),
+                                                              _set(2, 777))), 1,
+         "no waiter contention record produced"),
+        ("insufficient genuine contention", _synth(mutate=_all_rounds(
+            lambda r: _edit(r, K("hold"), _set(3, 0)))), 1, "contended rounds"),
+        ("missing gate", _synth(mutate=_drop(5, K("gate", W5))), 1, "has no complete record"),
+        ("missing done", _synth(mutate=_drop(5, K("done", W5))), 1, "has no complete record"),
+        ("meta lock not 1", _synth(meta_lock=99), 1, "vm_lock_id"),
+        ("conflicting checksum-valid copies", _synth(conflict=True), 1, "conflicting"),
+        # ── §3 — attributed delivery controls ──
+        ("empty arrival while armed", _synth(mutate=_insert_after(
+            5, K("release", W5), ["arrival", H5, [5, 0, 1, 1, 0 | (W5 << 8)]])), 1,
+         "did not swap out"),
+        ("unrelated-source arrival while armed", _synth(mutate=_insert_after(
+            5, K("release", W5), ["arrival", H5, [5, 1 << H5, 1, 1, 0 | (W5 << 8)]])), 1,
+         "did not swap out"),
+        ("wrong-round consumption (other holder's round)", _synth(mutate=_edit(
+            5, K("arrival"), _set(0, 4))), 1, "never armed"),
+        ("wrong-round consumption (later round, same hart)", _synth(mutate=_edit(
+            5, K("arrival"), _set(0, 9))), 1, "precedes the masked observation"),
+        ("wrong-target consumption", _synth(mutate=_edit(5, K("arrival"), lambda e: [
+            e[0], W5, e[2]])), 1, "never armed"),
+        ("stale-generation consumption", _synth(mutate=_edit(5, K("arrival"), _set(3, 0))), 1,
+         "stale"),
+        ("consumed before hold + unrelated arrival", _synth(mutate=_all_rounds(
+            lambda r: (lambda ev: _edit(r, K("arrival"), _set(1, 1 << holder(r)))(
+                _edit(r, K("pending"), _set(2, 0))(ev))))), 1, "never armed"),
+        ("missing consumption", _synth(mutate=_drop(5, K("arrival"))), 1, "never discharged"),
+        ("missing publication", _synth(mutate=_drop(5, K("ipi"))), 1, "no production publication"),
+        ("publication to the wrong target", _synth(mutate=_edit(5, K("ipi"), _set(1, W5))), 1,
+         "no production publication"),
+        ("pending generation is not the round's", _synth(mutate=_edit(5, K("pending"),
+                                                                     _set(3, 99))), 1,
+         "generation"),
+        ("overwritten unresolved link", _synth(mutate=_insert_after(
+            5, K("pending"), ["linklost", H5, [3, 5, 1, 0, 0]])), 1, "overwrote"),
     ]
     bad = 0
-    for name, log, want in cases:
-        rc, _ = run(log)
-        verdict = "PASS" if rc == want else "FAIL"
-        if rc != want:
+    for name, log, want, why in cases:
+        rc, out = run(log)
+        ok = rc == want and (why is None or why in out)
+        if not ok:
             bad += 1
-        print("[self-test] %-30s rc=%d want=%d %s" % (name, rc, want, verdict))
+        print("[self-test] %-44s rc=%d want=%d %s" % (name, rc, want, "PASS" if ok else "FAIL"))
+        if not ok and why is not None:
+            print("            expected reason %r; got:\n%s" % (why, out[-600:]))
     print("[self-test] %s" % ("ALL PASS" if not bad else "FAILURES"))
     sys.exit(1 if bad else 0)
 
@@ -211,11 +308,8 @@ def fail(msg):
 
 # ── firmware identity (same pin the SMP3 gate uses) ──
 try:
-    pin = dict(
-        l.split("=", 1)
-        for l in open(PIN).read().splitlines()
-        if "=" in l and not l.startswith("#")
-    )
+    pin = dict(l.split("=", 1) for l in open(PIN).read().splitlines()
+               if "=" in l and not l.startswith("#"))
 except OSError:
     pin = {}
 ident = ""
@@ -235,7 +329,7 @@ if not osbi:
 elif pin and pin.get("banner") and pin["banner"] not in osbi:
     fail("the banner names %r, not the pinned %r" % (osbi.strip(), pin["banner"]))
 
-# ── the SMP3 seal must pass on this same boot (corroborates progress / results / context) ──
+# ── the SMP3 seal must pass on this same boot (corroboration) ──
 smp3 = [l for l in lines if l.startswith("SMP3_VERDICT ")]
 if not smp3:
     fail("no SMP3 verdict on this boot")
@@ -244,26 +338,25 @@ elif not any("result=ok" in l for l in smp3):
 
 # ── metadata ──
 meta = next((l for l in lines if l.startswith("LOCK1_META ")), None)
-vm_lock_id = None
 if not meta:
     fail("no LOCK1_META line")
 else:
     mo = re.search(r"overflow=(\d+)", meta)
-    if mo and int(mo.group(1)) != 0:
-        fail("the LOCK1 record overflowed its ring")
+    if not mo or int(mo.group(1)) != 0:
+        fail("the LOCK1 record overflowed its ring (or did not say)")
     ml = re.search(r"vm_lock_id=(\d+)", meta)
-    vm_lock_id = int(ml.group(1)) if ml else None
-    if vm_lock_id != VM_LOCK_ID:
-        fail("LOCK1_META names vm_lock_id=%s, not the expected %d" % (vm_lock_id, VM_LOCK_ID))
+    if not ml or int(ml.group(1)) != VM_LOCK_ID:
+        fail("LOCK1_META names vm_lock_id=%s, not %d" % (ml and ml.group(1), VM_LOCK_ID))
+    mr = re.search(r"rounds=(\d+)", meta)
+    if not mr or int(mr.group(1)) != ROUNDS:
+        fail("LOCK1_META schedules %s rounds, not %d" % (mr and mr.group(1), ROUNDS))
 
-# ── parse LOCK1 records; dedup identical dump-pass copies; reject conflicting copies of one seq ──
+# ── records: dedup identical dump-pass copies; reject conflicting copies of one seq ──
 rx = re.compile(
     r"^(LOCK1_REC seq=(\d+) kind=(\w+) hart=(\d+) "
     r"f0=0x([0-9a-f]+) f1=0x([0-9a-f]+) f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+))"
-    r" pass=\d+ crc=0x([0-9a-f]+)$"
-)
+    r" pass=\d+ crc=0x([0-9a-f]+)$")
 recs = {}
-conflict = False
 for l in lines:
     mm = rx.match(l.strip())
     if not mm:
@@ -272,16 +365,10 @@ for l in lines:
     if fnv1a(body) != int(mm.group(10), 16):
         continue  # torn copy; the other pass carries an intact one
     seq = int(mm.group(2))
-    rec = dict(
-        seq=seq,
-        kind=mm.group(3),
-        hart=int(mm.group(4)),
-        f=[int(mm.group(i), 16) for i in range(5, 10)],
-        body=body,
-    )
+    rec = dict(seq=seq, kind=mm.group(3), hart=int(mm.group(4)),
+               f=[int(mm.group(i), 16) for i in range(5, 10)], body=body)
     if seq in recs:
         if recs[seq]["body"] != body:
-            conflict = True
             fail("conflicting checksum-valid copies of seq %d" % seq)
     else:
         recs[seq] = rec
@@ -289,143 +376,198 @@ ev = [recs[k] for k in sorted(recs)]
 for e in ev:
     if e["kind"] not in KINDS:
         fail("unknown event kind %r at seq %d" % (e["kind"], e["seq"]))
+    if e["hart"] not in (0, 1):
+        fail("seq %d recorded by unexpected hart %d" % (e["seq"], e["hart"]))
+    if e["kind"] in LOCK_KINDS and e["f"][0] != VM_LOCK_ID:
+        fail("seq %d: a lock event names lock %d, not the VM lock %d"
+             % (e["seq"], e["f"][0], VM_LOCK_ID))
+by = lambda kind: [e for e in ev if e["kind"] == kind]
+
+# ── the ownership model (every recorded acquisition and release, in record order) ──
+acqs = {}
+owner = None
+for e in ev:
+    if e["kind"] not in ("acquire", "release"):
+        continue
+    aid, rnd = e["f"][2], e["f"][1]
+    if e["kind"] == "acquire":
+        if aid in acqs:
+            fail("seq %d: duplicate acquisition id %d" % (e["seq"], aid))
+            continue
+        if owner is not None:
+            o = acqs[owner]
+            fail("seq %d: overlapping owners — hart %d acquired (id %d) while hart %d's acquisition "
+                 "%d (seq %d) was unreleased" % (e["seq"], e["hart"], aid, o["cpu"], owner, o["a"]))
+        if not 1 <= rnd <= ROUNDS:
+            fail("seq %d: acquisition tagged with unscheduled round %d" % (e["seq"], rnd))
+        acqs[aid] = dict(cpu=e["hart"], round=rnd, a=e["seq"], r=None)
+        owner = aid
+    else:
+        if owner is None:
+            fail("seq %d: release with no preceding acquisition (names id %d)" % (e["seq"], aid))
+            continue
+        o = acqs[owner]
+        if aid != owner or e["hart"] != o["cpu"] or rnd != o["round"]:
+            fail("seq %d: release (hart %d, id %d, round %d) does not match the owning acquisition "
+                 "(hart %d, id %d, round %d)" % (e["seq"], e["hart"], aid, rnd, o["cpu"], owner,
+                                                 o["round"]))
+        o["r"] = e["seq"]
+        owner = None
+if owner is not None:
+    fail("acquisition %d (hart %d, seq %d) was never released"
+         % (owner, acqs[owner]["cpu"], acqs[owner]["a"]))
 
 
-def round_of(e):
-    # Lock events carry (lock_id, round, ...); ipi/arrival carry (round, target, ...).
-    return e["f"][1] if e["kind"] in LOCK_KINDS else e["f"][0]
+def inside(e, aid):
+    a = acqs.get(aid)
+    return (a is not None and a["r"] is not None and a["cpu"] == e["hart"]
+            and a["a"] < e["seq"] < a["r"])
 
 
-# ── per-round validation ───────────────────────────────────────────────────────────────────
+# A CPU observing the lock held is inside its own lock() call, never inside its own ownership.
+for c in by("contended"):
+    if not 1 <= c["f"][1] <= ROUNDS:
+        fail("seq %d: contention tagged with unscheduled round %d" % (c["seq"], c["f"][1]))
+    for aid, a in acqs.items():
+        if a["cpu"] == c["hart"] and a["r"] is not None and a["a"] < c["seq"] < a["r"]:
+            fail("seq %d: hart %d recorded contention while it owned the lock (acquisition %d)"
+                 % (c["seq"], c["hart"], aid))
+
+for lk in by("linklost"):
+    fail("seq %d: hart %d overwrote round %d's unresolved delivery link"
+         % (lk["seq"], lk["hart"], lk["f"][0]))
+
+# ── per-round obligations ────────────────────────────────────────────────────────────────────
 credited = {0: 0, 1: 0}
-ssip_rounds = 0      # direct sip.SSIP=1 peeks under the mask (reported corroboration)
-delivery_rounds = 0  # full causal chain: IPI published during the interval + consumed after unmask
+delivered = {0: 0, 1: 0}
+ssip_rounds = 0
+armed = {}  # (hart, round) -> pending record with outstanding = 1
 
 
-def round_fail(r, holder, msg):
-    fail("round %d (holder hart %d): %s" % (r, holder, msg))
+def round_fail(r, msg):
+    fail("round %d: %s" % (r, msg))
 
 
 for r in range(1, ROUNDS + 1):
-    holder = 0 if r % 2 == 1 else 1
-    waiter = 1 - holder
-    er = [e for e in ev if round_of(e) == r]
-    if not er:
-        continue  # a round with no records at all contributes nothing; coverage is checked below
-
-    # Every lock event of this round must name the one VM lock.
-    wrong = [e for e in er if e["kind"] in LOCK_KINDS and e["f"][0] != VM_LOCK_ID]
-    if wrong:
-        round_fail(r, holder, "a lock event names lock %d, not the VM lock %d"
-                   % (wrong[0]["f"][0], VM_LOCK_ID))
+    H = 0 if r % 2 == 1 else 1
+    W = 1 - H
+    g_h = [e for e in by("gate") if e["f"][0] == r and e["hart"] == H and e["f"][2] == 0]
+    g_w = [e for e in by("gate") if e["f"][0] == r and e["hart"] == W and e["f"][2] == 1]
+    gates = [e for e in by("gate") if e["f"][0] == r]
+    dones = [e for e in by("done") if e["f"][0] == r]
+    holds = [e for e in by("hold") if e["f"][1] == r]
+    pends = [e for e in by("pending") if e["f"][0] == r]
+    if (len(g_h) != 1 or len(g_w) != 1 or len(gates) != 2 or sorted(d["hart"] for d in dones) != [0, 1]
+            or any(g["f"][1] != H for g in gates)):
+        round_fail(r, "has no complete record (gates %d, dones %s)"
+                   % (len(gates), sorted(d["hart"] for d in dones)))
         continue
-
-    holds = [e for e in er if e["kind"] == "hold" and e["hart"] == holder and e["f"][4] == holder]
-    contended = [e for e in er if e["kind"] == "contended"]
-    is_contended = bool(contended)
-
-    if not is_contended:
-        # A legitimately uncontended attempt: require a benign, complete history, else fail.
-        bad_hold = [e for e in er if e["kind"] == "hold" and e["f"][2] != 0]
-        if bad_hold:
-            round_fail(r, holder, "an uncontended round's holder was not masked (SIE set)")
-            continue
-        for h in (holder, waiter):
-            acq = [e for e in er if e["kind"] == "acquire" and e["hart"] == h]
-            rel = [e for e in er if e["kind"] == "release" and e["hart"] == h]
-            for a in acq:
-                if not any(x["seq"] > a["seq"] for x in rel):
-                    round_fail(r, holder, "hart %d acquired without a following release" % h)
-                    break
+    if len(holds) != 1 or holds[0]["hart"] != H or len(pends) != 1 or pends[0]["hart"] != H:
+        round_fail(r, "has no complete record (expected one hold and one pending observation by the "
+                   "designated holder %d, found %d / %d)" % (H, len(holds), len(pends)))
         continue
-
-    # ── a contended round: the complete ownership-interval chain is mandatory ──
-    if len(holds) != 1:
-        round_fail(r, holder, "expected exactly one holder hold record, found %d" % len(holds))
+    hold, pend = holds[0], pends[0]
+    aid = hold["f"][2]
+    if hold["f"][4] & 1:
+        round_fail(r, "holder was not masked (sstatus.SIE set) inside the critical section")
         continue
-    hold = holds[0]
-    if hold["f"][2] != 0:
-        round_fail(r, holder, "holder was not masked (sstatus.SIE set) inside the critical section")
+    if not inside(hold, aid) or acqs[aid]["round"] != r:
+        round_fail(r, "the hold falls outside its acquisition %d" % aid)
         continue
-    # The contention must be the waiter observing THIS holder.
-    con = [e for e in contended if e["hart"] == waiter and e["f"][2] == holder]
-    if not con:
-        round_fail(r, holder, "contention was not recorded by the waiter observing this holder")
+    if pend["f"][4] != aid or not inside(pend, aid) or pend["f"][1] != W:
+        round_fail(r, "the pending observation is not the holder's, inside acquisition %d" % aid)
         continue
-    # Holder acquisition that owns this hold: the holder acquire immediately preceding it.
-    acq_h = [e for e in er if e["kind"] == "acquire" and e["hart"] == holder
-             and e["f"][2] == holder and e["seq"] < hold["seq"]]
-    if not acq_h:
-        round_fail(r, holder, "no holder acquisition precedes the hold")
-        continue
-    a_h = max(acq_h, key=lambda e: e["seq"])
-    # The hold must belong to that acquisition: the holder must still own the lock at the hold, with
-    # no release between — otherwise this is an unrelated earlier acquisition (e.g. the guard-page
-    # query) and the real owning acquire is missing.
-    if any(e["kind"] == "release" and e["hart"] == holder and a_h["seq"] < e["seq"] < hold["seq"]
-           for e in er):
-        round_fail(r, holder, "the hold is not covered by an un-released holder acquisition")
-        continue
-    # The observed contention falls inside this ownership interval (after acquire, up to the hold).
-    c = [e for e in con if a_h["seq"] < e["seq"] <= hold["seq"]]
-    if not c:
-        round_fail(r, holder, "the contention was not observed during this ownership interval")
-        continue
-    c = min(c, key=lambda e: e["seq"])
-    # Holder release-intent after the hold (its actual unlock follows; the handover is proven by the
-    # contender's own successful acquisition below, not by assuming this marker is the atomic unlock).
-    rel_h = [e for e in er if e["kind"] == "release" and e["hart"] == holder and e["seq"] > hold["seq"]]
-    if not rel_h:
-        round_fail(r, holder, "holder never released after the hold")
-        continue
-    r_h = min(rel_h, key=lambda e: e["seq"])
-    # The production IPI was published to this holder, before the holder left the interval.
-    ipi = [e for e in er if e["kind"] == "ipi" and e["f"][1] == holder and e["f"][2] == 1
-           and e["hart"] == waiter and e["seq"] < r_h["seq"]]
-    if not ipi:
-        round_fail(r, holder, "no production IPI was published to the holder during the interval")
-        continue
-    ipi = min(ipi, key=lambda e: e["seq"])
-    # Handover: the contender acquires after the holder's release-intent, then releases after that.
-    acq_w = [e for e in er if e["kind"] == "acquire" and e["hart"] == waiter and e["seq"] > r_h["seq"]]
-    if not acq_w:
-        round_fail(r, holder, "the contender never acquired after the holder released")
-        continue
-    a_w = min(acq_w, key=lambda e: e["seq"])
-    rel_w = [e for e in er if e["kind"] == "release" and e["hart"] == waiter and e["seq"] > a_w["seq"]]
-    if not rel_w:
-        round_fail(r, holder, "the contender never released after it acquired")
-        continue
-
-    credited[waiter] += 1
-
-    # §3 delivery chain: this round's IPI (required above) was published to the masked holder during
-    # the interval, and the holder consumed that pending interrupt — the matching arrival on the
-    # holder, naming this round, after the interval — once it unmasked.
-    arr = [e for e in er if e["kind"] == "arrival" and e["hart"] == holder
-           and e["f"][1] == holder and e["seq"] > r_h["seq"]]
-    if arr:
-        delivery_rounds += 1
-    # The direct pending-bit peek under the mask, reported as corroboration.
-    if hold["f"][3] == 1:
+    if (hold["f"][4] >> 1) & 1:
         ssip_rounds += 1
 
-if credited[1] < MIN_PER_DIRECTION:
-    fail("contended rounds with S (hart 1) waiting: %d, need >= %d"
-         % (credited[1], MIN_PER_DIRECTION))
-if credited[0] < MIN_PER_DIRECTION:
-    fail("contended rounds with C (hart 0) waiting: %d, need >= %d"
-         % (credited[0], MIN_PER_DIRECTION))
-if delivery_rounds < MIN_DELIVERY_ROUNDS:
-    fail("rounds with the full publish->masked->arrival delivery chain: %d, need >= %d"
-         % (delivery_rounds, MIN_DELIVERY_ROUNDS))
+    # ── contention, attributed by value ──
+    k_seen, base = hold["f"][3], hold["f"][4] >> 8
+    contended_credit = False
+    if k_seen:
+        con = [c for c in by("contended") if c["hart"] == W and c["f"][1] == r
+               and base < c["f"][2] <= k_seen]
+        if not con:
+            round_fail(r, "the holder saw contention value %d that no waiter contention record "
+                       "produced" % k_seen)
+            continue
+        c = min(con, key=lambda e: e["seq"])
+        nxt = [a for a in acqs.values() if a["cpu"] == W and a["a"] > c["seq"]]
+        if not nxt:
+            round_fail(r, "the contender never acquired after observing the lock held")
+            continue
+        got = min(nxt, key=lambda a: a["a"])
+        if got["round"] != r or got["r"] is None:
+            round_fail(r, "the contender's acquisition is not this round's or never released")
+            continue
+        if g_w[0]["f"][3] == 1:
+            contended_credit = True
+            credited[W] += 1
+
+    # ── delivery, attributed by generation ──
+    ipi = [e for e in by("ipi") if e["f"][0] == r and e["hart"] == W]
+    if pend["f"][2] == 1:
+        armed[(H, r)] = pend
+        if not contended_credit:
+            continue
+        good = [e for e in ipi if e["f"][1] == H and e["f"][2] == 1 and e["seq"] > g_w[0]["seq"]]
+        if len(good) != 1:
+            round_fail(r, "no production publication by the waiter to the holder after its gate")
+            continue
+        p = good[0]
+        if p["seq"] > hold["seq"]:
+            # The publication record precedes the waiter's contention bump (program order), which
+            # the holder observed before recording its hold: the order is forced.
+            round_fail(r, "the publication is not ordered before the hold that observed its "
+                       "contention")
+            continue
+        if pend["f"][3] != p["f"][3]:
+            round_fail(r, "the mailbox generation seen under the mask (%d) is not the round's "
+                       "publication generation (%d)" % (pend["f"][3], p["f"][3]))
+            continue
+        delivered[W] += 1
+
+# Every arrival must belong to an armed link, and every armed link must be discharged exactly by its
+# first consumption on that CPU after the arming.
+for a in by("arrival"):
+    rnd = a["f"][0]
+    if (a["hart"], rnd) not in armed:
+        fail("seq %d: an arrival on hart %d names round %d's link, which was never armed there"
+             % (a["seq"], a["hart"], rnd))
+for (h, r), pend in sorted(armed.items(), key=lambda kv: kv[1]["seq"]):
+    W = 1 - h
+    arr = sorted([a for a in by("arrival") if a["hart"] == h and a["f"][0] == r],
+                 key=lambda e: e["seq"])
+    if not arr:
+        round_fail(r, "the armed delivery link was never discharged (no consumption)")
+        continue
+    first = arr[0]
+    if first["seq"] < pend["seq"]:
+        round_fail(r, "a consumption precedes the masked observation that armed its link")
+        continue
+    if not (first["f"][4] & 1) or not ((first["f"][1] >> W) & 1) or (first["f"][4] >> 8) != W:
+        round_fail(r, "the first consumption after arming did not swap out the waiter's bit "
+                   "(sources 0x%x)" % first["f"][1])
+        continue
+    if first["f"][2] != pend["f"][3] or first["f"][3] < first["f"][2]:
+        round_fail(r, "the consumption's generation is stale (link %d, snapshot %d, armed at %d)"
+                   % (first["f"][2], first["f"][3], pend["f"][3]))
+        continue
+    if len(arr) > 1:
+        round_fail(r, "the link was discharged more than once")
+
+for d, who in ((1, "S (hart 1)"), (0, "C (hart 0)")):
+    if credited[d] < MIN_PER_DIRECTION:
+        fail("contended rounds with %s waiting: %d, need >= %d"
+             % (who, credited[d], MIN_PER_DIRECTION))
+    if delivered[d] < MIN_PER_DIRECTION:
+        fail("attributed masked deliveries with %s publishing: %d, need >= %d"
+             % (who, delivered[d], MIN_PER_DIRECTION))
 
 for f in fails:
     print("[lock1-witness][fail] " + f)
 ok = not fails
-print(
-    "LOCK1_WITNESS_SEAL rounds=%d credited_c_waits=%d credited_s_waits=%d delivery_rounds=%d "
-    "ssip_rounds=%d result=%s"
-    % (ROUNDS, credited[0], credited[1], delivery_rounds, ssip_rounds, "ok" if ok else "fail")
-)
+print("LOCK1_WITNESS_SEAL rounds=%d credited_c_waits=%d credited_s_waits=%d delivered_c=%d "
+      "delivered_s=%d ssip_rounds=%d result=%s"
+      % (ROUNDS, credited[0], credited[1], delivered[0], delivered[1], ssip_rounds,
+         "ok" if ok else "fail"))
 sys.exit(0 if ok else 1)

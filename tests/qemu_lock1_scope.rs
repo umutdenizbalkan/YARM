@@ -132,7 +132,7 @@ fn acquire_holds_and_releases_in_causal_order() {
     );
     let hold = pos(
         &body,
-        "crate::kernel::lock1_witness::maybe_hold(self.witness_id);",
+        "crate::kernel::lock1_witness::maybe_hold(self.witness_id, token);",
     );
     let ret = pos(&body, "return SpinLockIrqGuard {");
     assert!(
@@ -147,7 +147,7 @@ fn acquire_holds_and_releases_in_causal_order() {
     ));
     let rel = pos(
         &drop,
-        "crate::kernel::lock1_witness::note_released(self.lock.witness_id);",
+        "crate::kernel::lock1_witness::note_released(self.lock.witness_id, self.witness_token);",
     );
     let store = pos(&drop, "self.lock.held.0.store(false, Ordering::Release);");
     assert!(
@@ -155,6 +155,18 @@ fn acquire_holds_and_releases_in_causal_order() {
         "release is recorded before the lock becomes acquirable"
     );
     assert!(squash(&drop).contains(&squash("if self.lock.witness_id != 0 {")));
+    // QEMU-LOCK1-SEAL: the acquisition token note_acquired returned travels in the guard to the
+    // release, so each release record names exactly the acquisition it ends; the guard field exists
+    // only under the feature.
+    assert!(squash(&body).contains(&squash(
+        "let token = crate::kernel::lock1_witness::note_acquired(self.witness_id);"
+    )));
+    assert!(squash(&body).contains(&squash(
+        "#[cfg(feature = \"riscv64-lock1-witness\")] witness_token, _not_send: PhantomData,"
+    )));
+    assert!(squash(&code(LOCK)).contains(&squash(
+        "#[cfg(feature = \"riscv64-lock1-witness\")] witness_token: u64,"
+    )));
     // Both hooks sit under the feature gate. acquire + hold share one gated `if self.witness_id != 0`
     // block, so maybe_hold sits a few lines below the gate; the threshold allows that block but still
     // catches a hook with no gate above it.
@@ -211,10 +223,11 @@ fn the_lock_path_is_bounded_lock_free_and_console_free() {
     // The functions that run on the acquisition / release / gate path.
     for head in [
         "pub fn note_contended(id: u32) {",
-        "pub fn note_acquired(id: u32) {",
-        "pub fn note_released(id: u32) {",
-        "pub fn maybe_hold(id: u32) {",
-        "pub fn note_arrival(cpu: u8) {",
+        "pub fn note_acquired(id: u32) -> u64 {",
+        "pub fn note_released(id: u32, token: u64) {",
+        "pub fn maybe_hold(id: u32, token: u64) {",
+        "pub fn note_arrival(cpu: u8, sources: u64) {",
+        "pub fn note_publication(sender: u8, target: u8) {",
         "pub fn mut_round_gate(cpu: u8, round: u64) {",
         "fn record(kind: u8, hart: u8, f: [u64; 5]) {",
     ] {
@@ -253,16 +266,14 @@ fn the_hold_hook_is_bounded_and_releases_regardless() {
     ] {
         assert!(WITNESS.contains(bound), "{bound} is a finite constant");
     }
-    let b = code(fn_body(WITNESS, "pub fn maybe_hold(id: u32) {"));
-    // It only designates the one holder, once per round.
-    assert!(b.contains("if this_cpu() != HOLDER_CPU.load(Ordering::Acquire) {"));
+    let b = code(fn_body(WITNESS, "pub fn maybe_hold(id: u32, token: u64) {"));
+    // It only designates the one holder, once per round, for a recorded acquisition.
+    assert!(b.contains("if me != HOLDER_CPU.load(Ordering::Acquire) {"));
+    assert!(b.contains("if id != VM_LOCK_ID || token == 0 || !ACTIVE.load(Ordering::Acquire) {"));
     assert!(b.contains("if LAST_HELD_ROUND.load(Ordering::Acquire) >= round {"));
     // The wait is on CONTENTION_SEQ (the atomic indication the waiter bumps), and it breaks on the
     // bound — it releases even if the contender never arrives.
-    let wait = pos(
-        &b,
-        "while CONTENTION_SEQ.load(Ordering::Acquire) <= baseline {",
-    );
+    let wait = pos(&b, "while seen <= baseline {");
     let brk = pos(&b[wait..], "if left == 0 {\n            break;");
     assert!(brk < b[wait..].len(), "the hold wait is bounded");
     // It observes sip.SSIP (a pending bit the firmware set) but never clears or waits on delivery:
@@ -300,13 +311,19 @@ fn the_waiter_uses_the_production_acquisition_path() {
             "the gate must not touch the lock ({banned})"
         );
     }
-    // Holder returns immediately; waiter publishes then waits on HELD_ROUND.
+    // Holder records and returns immediately; the waiter waits on HELD_ROUND (stored after the
+    // holder's CAS), records whether that held, and only THEN publishes — so the published work is
+    // born while the holder owns the lock with interrupts masked.
     let holder_ret = pos(&b, "if cpu == holder {");
-    let publish = pos(&b, "publish_ipi_to_holder(cpu, holder, round);");
     let gate_wait = pos(&b, "while HELD_ROUND.load(Ordering::Acquire) < round {");
+    let gate_rec = pos(
+        &b,
+        "record(K_GATE, cpu, [round, u64::from(holder), 1, ok, 0]);",
+    );
+    let publish = pos(&b, "publish_ipi_to_holder(cpu, holder, round);");
     assert!(
-        holder_ret < publish && publish < gate_wait,
-        "holder returns, waiter publishes then waits"
+        holder_ret < gate_wait && gate_wait < gate_rec && gate_rec < publish,
+        "holder returns; waiter waits, records its gate, then publishes"
     );
     assert!(
         b.contains("if left == 0 {\n            break;"),
@@ -384,20 +401,29 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
         "the grader requires the SMP3 seal"
     );
     assert!(
-        GRADER.contains("MIN_PER_DIRECTION = 4") && GRADER.contains("MIN_DELIVERY_ROUNDS = 2"),
-        "the grader keeps the per-direction and delivery-chain thresholds"
+        GRADER.contains("MIN_PER_DIRECTION = 4"),
+        "contention and attributed delivery are each required per direction"
     );
-    // The acceptance grader rejects the holes the old subsequence search admitted: a wrong lock, a
-    // waiter release before its acquire, an IPI published after the interval, an unmasked holder, a
-    // hold not covered by an un-released acquisition, and conflicting checksum-valid copies.
+    // The seal grader's ownership model and attributed-delivery obligations.
     for check in [
         "a lock event names lock",
-        "the hold is not covered by an un-released holder acquisition",
-        "no production IPI was published to the holder during the interval",
+        "overlapping owners",
+        "release with no preceding acquisition",
+        "duplicate acquisition id",
+        "does not match the owning acquisition",
+        "was never released",
+        "recorded contention while it owned the lock",
+        "has no complete record",
+        "the hold falls outside its acquisition",
         "holder was not masked (sstatus.SIE set) inside the critical section",
-        "the contender never released after it acquired",
+        "no waiter contention record produced",
+        "did not swap out the waiter's bit",
+        "which was never armed there",
+        "the consumption's generation is stale",
+        "was never discharged",
+        "overwrote round",
         "conflicting checksum-valid copies of seq",
-        "rounds with the full publish->masked->arrival delivery chain",
+        "attributed masked deliveries",
     ] {
         assert!(GRADER.contains(check), "the grader enforces: {check}");
     }
@@ -406,52 +432,104 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
     assert!(SMOKE.contains("python3 scripts/grade-riscv64-lock1-witness.py"));
 }
 
-/// §3 — the delivery end of the IPI chain. The holder arms a per-CPU pending-arrival round at the
-/// end of its (still masked) hold; the production arrival owner `take_arrival` records the matching
-/// `K_ARRIVAL` once, after the holder unmasks, linking publish → masked-pending → delivery by round
-/// identity. The hook observes the production consumption and takes nothing from it.
+/// §3 — attributed delivery at the production mailbox. The publication owner advances the
+/// (target, sender) generation BEFORE it sets the bit; the masked holder positively reads its own
+/// mailbox and that generation inside its ownership and arms a link only if the waiter's bit is
+/// outstanding (never silently overwriting an unresolved link); the consumption owner hands the
+/// witness the sources it actually swapped out, and the link is discharged only by a consumption
+/// that removed the linked sender's bit. The hooks observe; they change no mailbox semantics.
 #[test]
-fn the_arrival_hook_observes_the_production_consumption() {
+fn the_ipi_work_is_attributed_at_the_production_mailbox() {
     let w = code(WITNESS);
-    assert!(w.contains("pub const K_ARRIVAL: u8 = 6;"));
-    // The stash is armed at the end of the hold hook, while still masked.
-    let hold = code(fn_body(WITNESS, "pub fn maybe_hold(id: u32) {"));
-    assert!(
-        hold.contains("ARRIVAL_ROUND.get(me as usize)") && hold.contains("cell.store(round,"),
-        "the hold hook arms the per-CPU pending-arrival round"
+    for k in [
+        "pub const K_ARRIVAL: u8 = 6;",
+        "pub const K_PENDING: u8 = 7;",
+        "pub const K_GATE: u8 = 8;",
+        "pub const K_DONE: u8 = 9;",
+        "pub const K_LINKLOST: u8 = 10;",
+    ] {
+        assert!(w.contains(k), "{k}");
+    }
+    // Publication: generation before bit, after every refusal.
+    let sr = code(fn_body(
+        IPI,
+        "pub fn send_reschedule(sender: CpuId, target: CpuId) -> Result<(), IpiRefusal> {",
+    ));
+    let refusal = pos(&sr, "let slot = PENDING.get(t).ok_or(IpiRefusal::NoHart)?;");
+    let genr = pos(
+        &sr,
+        "crate::kernel::lock1_witness::note_publication(sender.0, target.0);",
     );
-    // note_arrival discharges it once (swap to 0) and records K_ARRIVAL; it is bounded and lock-free.
-    let na = code(fn_body(WITNESS, "pub fn note_arrival(cpu: u8) {"));
+    let publish = pos(&sr, "let old = slot.fetch_or(bit, Ordering::AcqRel);");
+    assert!(refusal < genr && genr < publish);
     assert!(
-        na.contains("cell.swap(0, Ordering::AcqRel)"),
-        "one-shot discharge of the armed round"
+        sr[..genr]
+            .rfind(GATE)
+            .is_some_and(|g| sr[g..genr].matches('\n').count() <= 2)
     );
-    assert!(
-        na.contains("record(K_ARRIVAL, cpu,"),
-        "records the arrival for the armed round"
+    // The masked positive observation and the arming.
+    let hold = code(fn_body(WITNESS, "pub fn maybe_hold(id: u32, token: u64) {"));
+    let rec_hold = pos(&hold, "K_HOLD,");
+    let read = pos(
+        &hold,
+        "let outstanding = (mailbox(me) >> (u64::from(sender) & 63)) & 1;",
     );
+    let seen = pos(&hold, "let seen_gen = pub_gen(me, sender);");
+    let rec_pend = pos(&hold, "K_PENDING,");
+    let no_arm = pos(&hold, "if outstanding == 0 {");
+    let arm = pos(
+        &hold,
+        "cell.swap(encode_link(round, sender, seen_gen), Ordering::AcqRel)",
+    );
+    let lost = pos(&hold, "record(K_LINKLOST, me,");
+    assert!(rec_hold < read && read < seen && seen < rec_pend && rec_pend < no_arm);
     assert!(
-        na.contains("if round == 0 {"),
+        no_arm < arm && arm < lost,
+        "arm only when outstanding; record an overwritten link"
+    );
+    // The mailbox read is the production non-consuming observer.
+    assert!(w.contains("crate::arch::riscv64::ipi::pending(crate::kernel::scheduler::CpuId(cpu))"));
+    // Consumption: discharge only on the linked sender's bit in the swapped sources.
+    let na = code(fn_body(
+        WITNESS,
+        "pub fn note_arrival(cpu: u8, sources: u64) {",
+    ));
+    assert!(
+        na.contains("if link == 0 {"),
         "a CPU with nothing armed records nothing"
     );
-    // The production arrival owner calls it, under the feature gate, after it has consumed the
-    // mailbox (the hook observes; it does not alter the production consumption).
+    let disc = pos(
+        &na,
+        "let discharged = (sources >> (u64::from(sender) & 63)) & 1;",
+    );
+    let clear = pos(&na, "if discharged == 1 {");
+    assert!(disc < clear && na.contains("record(\n        K_ARRIVAL,"));
+    // The production consumption owner passes the ACTUAL swapped sources, after the swap.
     let ta = code(fn_body(
         IPI,
         "pub fn take_arrival(cpu: CpuId, origin: ArrivalOrigin) -> IpiArrival {",
     ));
     let swap = pos(&ta, "p.swap(0, Ordering::AcqRel)");
-    let note = pos(&ta, "crate::kernel::lock1_witness::note_arrival(cpu.0);");
+    let note = pos(
+        &ta,
+        "crate::kernel::lock1_witness::note_arrival(cpu.0, sources);",
+    );
     let ret = pos(&ta, "IpiArrival { origin, sources }");
     assert!(
         swap < note && note < ret,
-        "the hook runs after the production consume, before return"
+        "after the production consume, before return"
     );
     let gate = ta[..note].rfind(GATE);
-    assert!(
-        gate.is_some_and(|g| ta[g..note].matches('\n').count() <= 2),
-        "the arrival hook sits under the feature gate"
-    );
-    // The dump names the new kind.
-    assert!(code(fn_body(WITNESS, "pub fn dump() {")).contains("K_ARRIVAL => \"arrival\","));
+    assert!(gate.is_some_and(|g| ta[g..note].matches('\n').count() <= 2));
+    // The dump names the new kinds.
+    let dump = code(fn_body(WITNESS, "pub fn dump() {"));
+    for n in [
+        "\"arrival\"",
+        "\"pending\"",
+        "\"gate\"",
+        "\"done\"",
+        "\"linklost\"",
+    ] {
+        assert!(dump.contains(n), "dump names {n}");
+    }
 }

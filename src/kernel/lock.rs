@@ -175,16 +175,23 @@ impl<T> SpinLockIrq<T> {
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                // QEMU-LOCK1-SEAL: the acquisition's witness token (0 = not recorded) travels in
+                // the guard so the release record names exactly this acquisition.
                 #[cfg(feature = "riscv64-lock1-witness")]
-                if self.witness_id != 0 {
-                    crate::kernel::lock1_witness::note_acquired(self.witness_id);
+                let witness_token = if self.witness_id != 0 {
+                    let token = crate::kernel::lock1_witness::note_acquired(self.witness_id);
                     // The default-off, bounded hold hook runs here — holding the lock, with
                     // supervisor interrupts masked — before the guard is handed back.
-                    crate::kernel::lock1_witness::maybe_hold(self.witness_id);
-                }
+                    crate::kernel::lock1_witness::maybe_hold(self.witness_id, token);
+                    token
+                } else {
+                    0
+                };
                 return SpinLockIrqGuard {
                     lock: self,
                     irq_state,
+                    #[cfg(feature = "riscv64-lock1-witness")]
+                    witness_token,
                     _not_send: PhantomData,
                 };
             }
@@ -197,6 +204,10 @@ impl<T> SpinLockIrq<T> {
 pub struct SpinLockIrqGuard<'a, T> {
     lock: &'a SpinLockIrq<T>,
     irq_state: ArchIrqState,
+    // QEMU-LOCK1-SEAL: witness-only observation metadata (the recorded acquisition's token); absent
+    // from the default build.
+    #[cfg(feature = "riscv64-lock1-witness")]
+    witness_token: u64,
     _not_send: PhantomData<*const UnsafeCell<()>>,
 }
 
@@ -227,7 +238,7 @@ impl<T> Drop for SpinLockIrqGuard<'_, T> {
         // acquisition. The store and the IRQ restore below are the unchanged production release.
         #[cfg(feature = "riscv64-lock1-witness")]
         if self.lock.witness_id != 0 {
-            crate::kernel::lock1_witness::note_released(self.lock.witness_id);
+            crate::kernel::lock1_witness::note_released(self.lock.witness_id, self.witness_token);
         }
         self.lock.held.0.store(false, Ordering::Release);
         irq_restore(self.irq_state);
