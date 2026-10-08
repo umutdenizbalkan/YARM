@@ -525,6 +525,9 @@ fn fnv1a(bytes: &[u8]) -> u32 {
     h
 }
 
+/// `(claims, completions)` for `cpu`. Completions are read FIRST: both counters only grow and a
+/// claim precedes its completion, so `completions(t1) <= claims(t1) <= claims(t2)`; the pair reads
+/// equal only when nothing was in flight at `t1` and nothing new was claimed by `t2`.
 fn counts(cpu: usize) -> ([u64; 3], [u64; 3]) {
     let load = |row: &[AtomicU64; 3]| {
         [
@@ -533,27 +536,33 @@ fn counts(cpu: usize) -> ([u64; 3], [u64; 3]) {
             row[2].load(Ordering::Acquire),
         ]
     };
-    (load(&CLAIMS[cpu]), load(&COMPLETIONS[cpu]))
+    let completions = load(&COMPLETIONS[cpu]);
+    let claims = load(&CLAIMS[cpu]);
+    (claims, completions)
 }
 
 /// Print every event (twice, each line with its own checksum), the per-CPU controller counts and the
-/// completion record. Before printing, waits (bounded) for the other CPU to complete any interrupt
-/// it has claimed, so the counts are a settled snapshot; `settled=0` reports a bound reached.
+/// completion record. The other CPU's counts are the snapshot at which its claims and completions
+/// read balanced — taken by a bounded wait, and printed exactly as observed (`settled=0` reports a
+/// bound reached and prints the last reading). The dumping CPU is inside a syscall, not an interrupt
+/// handler, so its own counts are already settled.
 pub fn dump() {
     let me = this_cpu() as usize;
+    let mut snap = [counts(0), counts(1)];
     let mut settled = [1u64; 2];
-    for (cpu, s) in settled.iter_mut().enumerate() {
+    for cpu in 0..2 {
         if cpu == me {
             continue;
         }
         let mut left = QUIESCE_SPINS;
         loop {
             let (c, d) = counts(cpu);
+            snap[cpu] = (c, d);
             if c[0] == d[0] && c[1] == d[1] {
                 break;
             }
             if left == 0 {
-                *s = 0;
+                settled[cpu] = 0;
                 break;
             }
             left -= 1;
@@ -607,7 +616,7 @@ pub fn dump() {
         ));
     }
     for (cpu, s) in settled.iter().enumerate() {
-        let (c, d) = counts(cpu);
+        let (c, d) = snap[cpu];
         let sent = sgi_sent(cpu as u8);
         lines.push(alloc::format!(
             "LOCK2_COUNTS cpu={} sgi_claim={} other_claim={} special_claim={} sgi_eoi={} other_eoi={} special_eoi={} sgi_sent={} settled={}",
