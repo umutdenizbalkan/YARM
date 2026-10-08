@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 #
-# QEMU-LOCK1-SEAL — the independent grader for the real subdomain-lock contention witness.
+# QEMU-LOCK1 (SEAL + final checks) — the independent grader for the subdomain-lock contention witness.
 #
 # It re-derives every round from the raw sealed `LOCK1_REC` lines (never from the kernel's summary)
 # with an explicit ownership model and a generation-attributed interrupt chain. Every ordering it
@@ -28,6 +28,15 @@
 #     hook receives the sources the consumption actually swapped out. An empty arrival, an unrelated
 #     source, a stale generation, a wrong round or target, a never-armed link or an overwritten link
 #     never discharges a round's obligation.
+#
+#   * TRANSPORT (final checks): the metadata and completion records are checksum-validated and must
+#     agree on the record count; after deduplicating identical redundant copies the records must be
+#     exactly the contiguous sequence the dump declares. A damaged copy is recovered from another
+#     intact copy; a missing record, an extra record, inconsistent counts, conflicting valid copies or
+#     an incomplete dump fails the boot.
+#   * an attributed CONSUMPTION follows the release record of the acquisition its masked-pending
+#     observation named: release record (intent) -> unlocking store -> interrupt restoration -> trap
+#     -> consumption, program order on the holder's CPU. The release record is not the atomic unlock.
 #
 # Every scheduled round must have a complete record establishing its outcome; a valid uncontended
 # round earns no credit, but absent or contradictory evidence fails the boot. The SMP3 seal on the
@@ -94,13 +103,17 @@ def _round(r, ids, gen, k, variant):
     return ev
 
 
-def _synth(rounds=ROUNDS, meta_lock=VM_LOCK_ID, variant=None, mutate=None, conflict=False):
-    header = [
-        "OpenSBI v1.3",
-        "SMP3_VERDICT result=ok reason=none at=0 pass=1 crc=0x0",
-        "LOCK1_META vm_lock_id=%d rounds=%d slots_used=0 overflow=0 dump_cpu=0 pass=1 crc=0x0"
-        % (meta_lock, ROUNDS),
-    ]
+def _emit(body, pass_):
+    return "%s pass=%d crc=0x%08x" % (body, pass_, fnv1a(body))
+
+
+def _synth(rounds=ROUNDS, meta_lock=VM_LOCK_ID, variant=None, mutate=None, conflict=False,
+           omit=None, lines_mut=None, meta_count=None, done_count=None):
+    """A complete, genuine two-pass dump: an intact SMP3 verdict and, per pass, an intact
+    `LOCK1_META`, every record, and an intact `LOCK1_DUMP_DONE`, each with its real checksum and the
+    real record count. `mutate` edits the logical record list (records are renumbered), `omit`
+    names logical indices whose copies are left out WITHOUT renumbering, and `lines_mut` edits the
+    final printed lines; the fixtures go through exactly the production transport validation."""
     logical = []
     nid, k = 1, 0
     gens = {0: 0, 1: 0}
@@ -113,15 +126,25 @@ def _synth(rounds=ROUNDS, meta_lock=VM_LOCK_ID, variant=None, mutate=None, confl
         nid += 4
     if mutate:
         logical = mutate(logical)
-    out = list(header)
+    omitted = omit(logical) if omit else set()
+    n = len(logical)
+    meta = "LOCK1_META vm_lock_id=%d rounds=%d slots_used=%d overflow=0 dump_cpu=0" % (
+        meta_lock, ROUNDS, n if meta_count is None else meta_count)
+    done = "LOCK1_DUMP_DONE records=%d" % (n if done_count is None else done_count)
+    out = ["OpenSBI v1.3"] + [_emit("SMP3_VERDICT result=ok reason=none at=0", p) for p in (1, 2)]
     for p in (1, 2):
+        out.append(_emit(meta, p))
         for seq, (kind, hart, f) in enumerate(logical):
-            out.append(_line(seq, kind, hart, f, p))
+            if seq not in omitted:
+                out.append(_line(seq, kind, hart, f, p))
+        out.append(_emit(done, p))
     if conflict:
         kind, hart, f = logical[0]
         bad = list(f)
         bad[3] ^= 1
         out.append(_line(0, kind, hart, bad, 2))
+    if lines_mut:
+        out = lines_mut(out)
     return "\n".join(out)
 
 
@@ -170,6 +193,50 @@ def _all_rounds(make):
     return m
 
 
+def _last_pair(r):
+    """`omit` for the last complete acquire/release pair of round r (indices in the logical list)."""
+    def o(ev):
+        a = max(i for i, e in enumerate(ev) if e[0] == "acquire" and e[2][1] == r)
+        aid = ev[a][2][2]
+        rel = next(i for i in range(a + 1, len(ev)) if ev[i][0] == "release" and ev[i][2][2] == aid)
+        return {a, rel}
+    return o
+
+
+def _arrival_before_release(r):
+    """Move round r's arrival to just after its pending observation, before the holder's release."""
+    def m(ev):
+        ia = next(i for i, e in enumerate(ev) if e[0] == "arrival" and e[2][0] == r)
+        arr = ev.pop(ia)
+        ip = next(i for i, e in enumerate(ev) if e[0] == "pending" and e[2][0] == r)
+        ev.insert(ip + 1, arr)
+        return ev
+    return m
+
+
+def _arrival_after_done(r):
+    """A legitimately delayed consumption: round r's arrival after both completion records."""
+    def m(ev):
+        ia = next(i for i, e in enumerate(ev) if e[0] == "arrival" and e[2][0] == r)
+        arr = ev.pop(ia)
+        last = max(i for i, e in enumerate(ev) if e[0] == "done" and e[2][0] == r)
+        ev.insert(last + 1, arr)
+        return ev
+    return m
+
+
+def _damage(pred):
+    """Corrupt (checksum no longer matches) every printed line matching pred."""
+    def d(out):
+        return [l[:-1] + ("0" if l[-1] != "0" else "1") if pred(l) else l for l in out]
+    return d
+
+
+def _rec_line(seq, pass_=None):
+    return lambda l: l.startswith("LOCK1_REC seq=%d " % seq) and (
+        pass_ is None or " pass=%d " % pass_ in l)
+
+
 K = lambda kind, hart=None: (lambda e: e[0] == kind and (hart is None or e[1] == hart))
 H5, W5 = 0, 1  # round 5's holder / waiter
 
@@ -195,6 +262,7 @@ def _self_test():
     def holder(r):
         return 0 if r % 2 == 1 else 1
 
+    _FULL = sum(1 for l in _synth().split("\n") if l.startswith("LOCK1_REC") and " pass=1 " in l)
     cases = [
         # ── positives: valid recordings, interleavings and coalescing ──
         ("good", _synth(), 0, None),
@@ -275,6 +343,41 @@ def _self_test():
          "generation"),
         ("overwritten unresolved link", _synth(mutate=_insert_after(
             5, K("pending"), ["linklost", H5, [3, 5, 1, 0, 0]])), 1, "overwrote"),
+        # ── final checks: transport accounting ──
+        ("valid: one damaged copy recovered from the other pass", _synth(
+            lines_mut=_damage(_rec_line(40, 2))), 0, None),
+        ("valid: damaged first-pass metadata, intact second pass", _synth(
+            lines_mut=_damage(lambda l: l.startswith("LOCK1_META ") and " pass=1 " in l)), 0, None),
+        ("valid: second pass cut short, first pass complete", _synth(
+            lines_mut=lambda out: out[:len(out) - 40]), 0, None),
+        ("dropped acquire/release pair (both copies)", _synth(omit=_last_pair(5)), 1,
+         "missing records"),
+        ("both copies of one record damaged", _synth(lines_mut=_damage(_rec_line(40))), 1,
+         "missing records"),
+        ("records renumbered, declared count unchanged", _synth(
+            mutate=lambda ev: ev[:-2], meta_count=_FULL, done_count=_FULL), 1, "missing records"),
+        ("record beyond the declared count", _synth(meta_count=_FULL - 1, done_count=_FULL - 1), 1,
+         "beyond the declared count"),
+        ("metadata and completion counts disagree", _synth(done_count=_FULL + 1), 1,
+         "inconsistent counts"),
+        ("no completion record (incomplete dump)", _synth(
+            lines_mut=lambda out: [l for l in out if not l.startswith("LOCK1_DUMP_DONE")]), 1,
+         "incomplete"),
+        ("every metadata copy damaged", _synth(
+            lines_mut=_damage(lambda l: l.startswith("LOCK1_META "))), 1, "no intact LOCK1_META"),
+        ("conflicting checksum-valid metadata", _synth(lines_mut=lambda out: out + [_emit(
+            "LOCK1_META vm_lock_id=1 rounds=12 slots_used=7 overflow=0 dump_cpu=0", 2)]), 1,
+         "conflicting checksum-valid LOCK1_META"),
+        ("SMP3 verdict copies all damaged", _synth(
+            lines_mut=_damage(lambda l: l.startswith("SMP3_VERDICT "))), 1,
+         "no intact SMP3 verdict"),
+        # ── final checks: arrival ordering ──
+        ("arrival between pending and the holder's release", _synth(
+            mutate=_arrival_before_release(5)), 1, "precedes the release record"),
+        ("valid: consumption delayed past both completions", _synth(
+            mutate=_arrival_after_done(5)), 0, None),
+        ("valid: delayed consumption with coalesced publications", _synth(
+            variant="coalesced", mutate=_arrival_after_done(6)), 0, None),
     ]
     bad = 0
     for name, log, want, why in cases:
@@ -329,49 +432,121 @@ if not osbi:
 elif pin and pin.get("banner") and pin["banner"] not in osbi:
     fail("the banner names %r, not the pinned %r" % (osbi.strip(), pin["banner"]))
 
-# ── the SMP3 seal must pass on this same boot (corroboration) ──
-smp3 = [l for l in lines if l.startswith("SMP3_VERDICT ")]
-if not smp3:
-    fail("no SMP3 verdict on this boot")
-elif not any("result=ok" in l for l in smp3):
-    fail("the SMP3 seal did not pass: " + smp3[-1][:120])
-
-# ── metadata ──
-meta = next((l for l in lines if l.startswith("LOCK1_META ")), None)
-if not meta:
-    fail("no LOCK1_META line")
-else:
-    mo = re.search(r"overflow=(\d+)", meta)
-    if not mo or int(mo.group(1)) != 0:
-        fail("the LOCK1 record overflowed its ring (or did not say)")
-    ml = re.search(r"vm_lock_id=(\d+)", meta)
-    if not ml or int(ml.group(1)) != VM_LOCK_ID:
-        fail("LOCK1_META names vm_lock_id=%s, not %d" % (ml and ml.group(1), VM_LOCK_ID))
-    mr = re.search(r"rounds=(\d+)", meta)
-    if not mr or int(mr.group(1)) != ROUNDS:
-        fail("LOCK1_META schedules %s rounds, not %d" % (mr and mr.group(1), ROUNDS))
-
-# ── records: dedup identical dump-pass copies; reject conflicting copies of one seq ──
-rx = re.compile(
-    r"^(LOCK1_REC seq=(\d+) kind=(\w+) hart=(\d+) "
-    r"f0=0x([0-9a-f]+) f1=0x([0-9a-f]+) f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+))"
-    r" pass=\d+ crc=0x([0-9a-f]+)$")
-recs = {}
+# ── the SMP3 seal must pass on this same boot (corroboration; intact, non-conflicting copies) ──
+smp3 = {}
 for l in lines:
-    mm = rx.match(l.strip())
-    if not mm:
+    if l.strip().startswith("SMP3_VERDICT "):
+        mm = re.match(r"^(.*) pass=(\d+) crc=0x([0-9a-f]{8})$", l.strip())
+        if mm and fnv1a(mm.group(1)) == int(mm.group(3), 16):
+            smp3.setdefault(mm.group(1), 0)
+if not smp3:
+    fail("no intact SMP3 verdict on this boot")
+elif len(smp3) > 1:
+    fail("conflicting checksum-valid SMP3 verdicts: %s" % sorted(smp3))
+elif not next(iter(smp3)).startswith("SMP3_VERDICT result=ok "):
+    fail("the SMP3 seal did not pass: " + next(iter(smp3))[:120])
+
+# ── transport accounting ─────────────────────────────────────────────────────────────────────
+# The dump is printed in two passes; each pass is `LOCK1_META`, every record, `LOCK1_DUMP_DONE`, each
+# line carrying `pass=N crc=0x…` over the text before ` pass=`. A copy whose checksum fails (or that
+# is torn) is damaged and ignored; another intact copy of the same line recovers it. Identical intact
+# copies are deduplicated; differing intact copies of one line are a contradiction. The metadata and
+# completion records must be intact and agree on the record count, and the deduplicated records must
+# be exactly the contiguous sequence 0..count-1 that the dump declares — no gap, no extra record.
+TAIL = re.compile(r"^(.*) pass=(\d+) crc=0x([0-9a-f]{8})$")
+META_RX = re.compile(r"^LOCK1_META vm_lock_id=(\d+) rounds=(\d+) slots_used=(\d+) overflow=(\d+) "
+                     r"dump_cpu=(\d+)$")
+DONE_RX = re.compile(r"^LOCK1_DUMP_DONE records=(\d+)$")
+REC_RX = re.compile(r"^LOCK1_REC seq=(\d+) kind=(\w+) hart=(\d+) f0=0x([0-9a-f]+) f1=0x([0-9a-f]+) "
+                    r"f2=0x([0-9a-f]+) f3=0x([0-9a-f]+) f4=0x([0-9a-f]+)$")
+
+
+def intact(l):
+    """-> (body, pass) for a checksum-valid copy, else None."""
+    mm = TAIL.match(l.strip())
+    if not mm or fnv1a(mm.group(1)) != int(mm.group(3), 16):
+        return None
+    return mm.group(1), int(mm.group(2))
+
+
+metas, dones, recs, damaged = {}, {}, {}, 0
+first_meta = last_done = None
+for i, l in enumerate(lines):
+    s = l.strip()
+    if not s.startswith("LOCK1_"):
         continue
-    body = mm.group(1)
-    if fnv1a(body) != int(mm.group(10), 16):
-        continue  # torn copy; the other pass carries an intact one
-    seq = int(mm.group(2))
-    rec = dict(seq=seq, kind=mm.group(3), hart=int(mm.group(4)),
-               f=[int(mm.group(i), 16) for i in range(5, 10)], body=body)
-    if seq in recs:
-        if recs[seq]["body"] != body:
-            fail("conflicting checksum-valid copies of seq %d" % seq)
+    got = intact(s)
+    if got is None:
+        damaged += 1
+        continue
+    body, pass_ = got
+    if pass_ not in (1, 2):
+        fail("line %d: an intact LOCK1 copy names dump pass %d" % (i + 1, pass_))
+    if body.startswith("LOCK1_META "):
+        if not META_RX.match(body):
+            fail("a checksum-valid LOCK1_META line is malformed: %r" % body[:100])
+            continue
+        metas.setdefault(body, []).append(pass_)
+        first_meta = i if first_meta is None else first_meta
+    elif body.startswith("LOCK1_DUMP_DONE "):
+        if not DONE_RX.match(body):
+            fail("a checksum-valid LOCK1_DUMP_DONE line is malformed: %r" % body[:100])
+            continue
+        dones.setdefault(body, []).append(pass_)
+        last_done = i
+    elif body.startswith("LOCK1_REC "):
+        mm = REC_RX.match(body)
+        if not mm:
+            fail("a checksum-valid LOCK1_REC line is malformed: %r" % body[:100])
+            continue
+        seq = int(mm.group(1))
+        rec = dict(seq=seq, kind=mm.group(2), hart=int(mm.group(3)),
+                   f=[int(mm.group(j), 16) for j in range(4, 9)], body=body)
+        if seq in recs:
+            if recs[seq]["body"] != body:
+                fail("conflicting checksum-valid copies of seq %d" % seq)
+        else:
+            recs[seq] = rec
     else:
-        recs[seq] = rec
+        fail("an intact line of unknown LOCK1 type: %r" % body[:80])
+
+declared = None
+if not metas:
+    fail("no intact LOCK1_META line (the dump's metadata is missing or every copy is damaged)")
+elif len(metas) > 1:
+    fail("conflicting checksum-valid LOCK1_META copies: %s" % sorted(metas))
+else:
+    vm_lock, rounds_m, slots, overflow, dump_cpu = map(int, META_RX.match(next(iter(metas))).groups())
+    if overflow != 0:
+        fail("the LOCK1 record overflowed its ring (overflow=%d)" % overflow)
+    if vm_lock != VM_LOCK_ID:
+        fail("LOCK1_META names vm_lock_id=%d, not %d" % (vm_lock, VM_LOCK_ID))
+    if rounds_m != ROUNDS:
+        fail("LOCK1_META schedules %d rounds, not %d" % (rounds_m, ROUNDS))
+    if dump_cpu not in (0, 1):
+        fail("LOCK1_META names dump CPU %d" % dump_cpu)
+    declared = slots
+if not dones:
+    fail("the dump is incomplete: no intact LOCK1_DUMP_DONE completion record")
+elif len(dones) > 1:
+    fail("conflicting checksum-valid LOCK1_DUMP_DONE copies: %s" % sorted(dones))
+else:
+    done_n = int(DONE_RX.match(next(iter(dones))).group(1))
+    if declared is not None and done_n != declared:
+        fail("inconsistent counts: LOCK1_META declares %d records, LOCK1_DUMP_DONE %d"
+             % (declared, done_n))
+    if first_meta is not None and last_done < first_meta:
+        fail("the dump is incomplete: no completion record follows its metadata")
+    declared = done_n if declared is None else declared
+if declared is not None:
+    missing = [s for s in range(declared) if s not in recs]
+    extra = sorted(s for s in recs if s >= declared)
+    if missing:
+        fail("missing records: %d of the %d declared have no intact copy (seq %s%s)"
+             % (len(missing), declared, ", ".join(map(str, missing[:8])),
+                ", …" if len(missing) > 8 else ""))
+    if extra:
+        fail("records beyond the declared count %d: seq %s" % (declared, extra[:8]))
 ev = [recs[k] for k in sorted(recs)]
 for e in ev:
     if e["kind"] not in KINDS:
@@ -543,6 +718,16 @@ for (h, r), pend in sorted(armed.items(), key=lambda kv: kv[1]["seq"]):
     first = arr[0]
     if first["seq"] < pend["seq"]:
         round_fail(r, "a consumption precedes the masked observation that armed its link")
+        continue
+    # The holder can consume only after it unmasks: its release record (intent, recorded before the
+    # unlocking store) -> the unlocking store -> interrupt restoration -> the trap -> the consumption,
+    # all program order on one CPU, so the consumption's record follows the release record of the
+    # acquisition the pending observation named. Earlier is a contradiction, not a valid race.
+    held = acqs.get(pend["f"][4])
+    if held is None or held["r"] is None or first["seq"] < held["r"]:
+        round_fail(r, "the consumption (seq %d) precedes the release record (seq %s) of acquisition "
+                   "%d, which its pending observation named" % (first["seq"],
+                                                              held and held["r"], pend["f"][4]))
         continue
     if not (first["f"][4] & 1) or not ((first["f"][1] >> W) & 1) or (first["f"][4] >> 8) != W:
         round_fail(r, "the first consumption after arming did not swap out the waiter's bit "

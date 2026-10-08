@@ -393,12 +393,39 @@ fn the_dump_is_sealed_and_the_grader_is_independent() {
     assert!(dump.contains("LOCK1_REC seq=") && dump.contains("LOCK1_DUMP_DONE records="));
     // The grader validates the crc, requires the SMP3 seal, and re-derives the chain per round.
     assert!(
-        GRADER.contains("if fnv1a(body) != int(mm.group(10), 16):"),
-        "the grader checks the record crc"
+        GRADER.contains("if not mm or fnv1a(mm.group(1)) != int(mm.group(3), 16):"),
+        "the grader checks every LOCK1 line's crc (metadata, records, completion)"
     );
     assert!(
         GRADER.contains("fail(\"the SMP3 seal did not pass: \""),
         "the grader requires the SMP3 seal"
+    );
+    // Transport accounting: the declared count, the completion record and the contiguous sequence.
+    for check in [
+        "no intact LOCK1_META line",
+        "conflicting checksum-valid LOCK1_META copies",
+        "the dump is incomplete: no intact LOCK1_DUMP_DONE completion record",
+        "conflicting checksum-valid LOCK1_DUMP_DONE copies",
+        "inconsistent counts: LOCK1_META declares %d records, LOCK1_DUMP_DONE %d",
+        "missing records: %d of the %d declared have no intact copy",
+        "records beyond the declared count",
+        "no intact SMP3 verdict on this boot",
+        "conflicting checksum-valid SMP3 verdicts",
+        // Arrival ordering: after the release record of the acquisition the pending observation named.
+        "precedes the release record (seq %s) of acquisition",
+    ] {
+        assert!(GRADER.contains(check), "the grader enforces: {check}");
+    }
+    // The fixtures go through the same transport validation: genuine metadata and completion.
+    assert!(GRADER.contains(
+        "meta = \"LOCK1_META vm_lock_id=%d rounds=%d slots_used=%d overflow=0 dump_cpu=0\" % ("
+    ));
+    assert!(GRADER.contains(
+        "done = \"LOCK1_DUMP_DONE records=%d\" % (n if done_count is None else done_count)"
+    ));
+    assert!(
+        !GRADER.contains("crc=0x0\""),
+        "no fixture line carries a placeholder checksum"
     );
     assert!(
         GRADER.contains("MIN_PER_DIRECTION = 4"),
