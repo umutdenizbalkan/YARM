@@ -25068,4 +25068,142 @@ record and the correction note in the LOCK1-ACCEPTANCE section arrive in two lat
   waiter is masked while publishing) and on `take_arrival` being the mailbox's only consumer (its
   `swap` is the only mutation of `PENDING` other than the two publishers' `fetch_or`). Both hold by
   inspection of the frozen source; neither is enforced by a source guard.
+
+  > **Update (QEMU-LOCK1 final checks).** Both assumptions are now pinned against the actual writes
+  > and call sites by `tests/qemu_lock1_owner_closure.rs` (comment-stripped source, a call-graph walk
+  > of every sender identity to the executing CPU); and two further checker defects — a dump with a
+  > deleted acquire/release pair under its original declared count, and a consumption recorded
+  > before the holder's release record — are closed. See the section below.
+* One lock, two harts, one QEMU, the pinned firmware; no hardware, fairness or latency claim.
+
+# QEMU-LOCK1 final checks — transport accounting, arrival ordering, owner closure
+
+Base: `0fa9ec96` (QEMU-LOCK1-SEAL delivery, tree `cc67b62e…`). U9 stays CLOSED: production
+`with_cpu=0`, `with_broad=0`; the three wrapper definitions stay a separate census category. This
+stage changes **only the checker, its fixtures and source guards, and this record** — no kernel
+code. Both defects below are **checker** defects: the inputs that exposed them are checksum-valid
+edits of genuine recordings, not behaviour any boot exhibited.
+
+## what the SEAL grader still admitted
+
+`scripts/repro-lock1-final-checks.py` applies two edits to the delivered grader's own passing
+fixture and to a real qualified boot log (SEAL qualification `lock1_1`), and runs a given grader on
+each. Against the unchanged delivered grader (`git show 0fa9ec96:scripts/grade-riscv64-lock1-witness.py`)
+both were accepted with `credited 6+6, delivered 6+6, result=ok`:
+
+| edit | fixture | live log |
+|---|---|---|
+| every dump copy of one complete acquire/release pair deleted, sequence gaps left, the declared count unchanged | seq 80/81 removed → `rc=0` | seq 117/118 removed → `rc=0` |
+| round 5's attributed arrival moved between its masked-pending observation and the holder's release record | `rc=0` | `rc=0` |
+
+The grader read records as an unordered set of intact lines — it never asked whether the dump it was
+given was the dump that was printed — and it ordered the consumption only after the pending
+observation, not after the release that must precede any unmasked consumption.
+
+## 1 — transport accounting
+
+The kernel's dump is two passes, each `LOCK1_META … slots_used=N`, records `seq=0..N-1`, and
+`LOCK1_DUMP_DONE records=N`, every line carrying `pass=P crc=0x…` over the text before ` pass=`. The
+grader now:
+
+* validates the checksum of every `LOCK1_*` line and of the SMP3 verdict it uses as corroboration; a
+  damaged copy (checksum mismatch, torn line) is ignored and **recovered** when another intact copy
+  supplies the same line — the two-pass redundancy is preserved;
+* deduplicates identical intact copies and fails on **conflicting** intact copies of the metadata,
+  the completion record, the SMP3 verdict or any record;
+* requires an intact metadata record and an intact completion record after it, agreeing on the
+  count (`inconsistent counts` otherwise; no completion record is an **incomplete dump**);
+* requires the deduplicated records to be **exactly the contiguous sequence `0..N-1`** — a missing
+  record (`missing records: k of the N declared have no intact copy (seq …)`) or a record beyond the
+  count fails the boot.
+
+The synthetic fixtures now print a genuine SMP3 verdict, metadata and completion record per pass,
+with real checksums and the real count, and go through exactly this validation; nothing exempts
+them (a scope guard rejects a placeholder checksum in the grader).
+
+## 2 — arrival ordering
+
+An attributed consumption is associated with the acquisition its masked-pending observation named,
+and must follow **that acquisition's release record**. The argument is the source's program order on
+the holder's CPU: the release record (release *intent*, taken before the unlocking store) → the
+unlocking `Release` store → interrupt restoration (`SpinLockIrq` guard drop) → the trap → the
+consumption in `take_arrival` → its record. Every step is on one CPU and the record counter is one
+atomic, so a consumption record before the release record is a contradiction, not a valid race. The
+release record is not relabelled as the atomic unlock: the claim is only that the consumption cannot
+be recorded before the release *intent* was.
+
+## 3 — the two assumptions, now pinned against actual writes and callers
+
+`tests/qemu_lock1_owner_closure.rs` reads every non-test source file, **strips comments first**, and
+checks code only:
+
+* **Publication.** `PUB_GEN` is mutated only by `note_publication` (one `fetch_add`) and read only by
+  `pub_gen`; no other file names it. `lock1_witness::note_publication` has exactly two call sites —
+  inside `ipi::send_reschedule` with `(sender.0, target.0)` and inside `ipi::kick_self` with
+  `(cpu.0, cpu.0)` — each before its owner's single `slot.fetch_or(bit…)`, with no exit in between,
+  and the bit derived from that same sender. A **call-graph walk** then follows the sender argument
+  of every RISC-V-reachable call of `send_reschedule` and `kick_self` up through real call sites,
+  parameter by parameter (rejecting any rebinding), until it reaches an executing-CPU root: the trap
+  bridge's `let cpu = riscv_logical_cpu_for_trap_frame(…)` (through the timer, software-interrupt,
+  external and synchronous entries, the split dispatcher and the NR6/NR7 drains or the witness's
+  marker path), or the secondary hart's own claimed slot at bring-up (`kick_self`). Callers in the
+  x86_64/AArch64 trees are not RISC-V-reachable; any other unresolved path fails.
+* **Consumption.** `PENDING` is module-private and used only in `pending` (observer, no mutation),
+  `send_reschedule`/`kick_self` (one `fetch_or` each) and `take_arrival` (one `swap`); no other
+  mutation exists. `take_arrival` has exactly two call sites, the two RISC-V software-interrupt trap
+  entries, and its CPU argument walks to the trap bridge's root. `lock1_witness::note_arrival` is
+  called once, inside `take_arrival`, after the swap, with `(cpu.0, sources)`.
+
+Twelve temporary source mutations were each caught (and reverted): an extra `PUB_GEN` write; the
+NR6 drain passing the wake target as sender; the witness passing another CPU as sender; the gate
+passing `cpu ^ 1`; the hook moved after the publication; the hook naming the target as sender; a
+mailbox clear in `take_park_release`; the observer swapping; a third consumer; the arrival hook
+commented out (comment kept); the hook passed fabricated sources; `PENDING` made public.
+
+## 4 — controls
+
+The grader self-test grows from 36 to **51** cases, every one checked against its own failure
+message. New: the dropped pair, both copies of a record damaged, records renumbered under an
+unchanged count, a record beyond the count, metadata/completion disagreement, no completion record,
+every metadata copy damaged, conflicting valid metadata, every SMP3 verdict copy damaged, and the
+arrival between pending and release — all rejected; and positives for one damaged copy recovered
+from the other pass, damaged first-pass metadata with an intact second pass, a second pass cut short
+after a complete first pass, a consumption delayed past both completion records, and that delay with
+coalesced publications. The earlier 36 cases (the SEAL three, the ACCEPTANCE four, the ownership and
+delivery controls and the late-observer, coalescing and role-swap positives) still pass on fixtures
+that now carry genuine transport records. The six retained SEAL qualification boots re-grade
+`result=ok` (6+6 / 6+6) under the new checks.
+
+## 5 — qualification
+
+Frozen before qualification at **`60fc9891`** (tree `d099f1bb…`), from base `0fa9ec96`; qualified on
+an isolated clean worktree, every scheduled run retained, none replaced or re-run. 13 gates,
+**zero failures**:
+
+* **Grader self-test** — 51 cases, all pass. **Reproduction** — against the delivered grader both
+  edits are accepted on the fixture and on the live log (`rc=0`); against the candidate all four are
+  rejected (`missing records: 2 of the N declared…`, `the consumption (seq …) precedes the release
+  record (seq …)`).
+* **`cargo fmt --check`**, the **two LOCK1 guard targets** (`qemu_lock1_scope` 11, `qemu_lock1_owner_closure`
+  3), **all 28 integration targets** (273 passed, 0 failed) and the **broad-lock census scanner** —
+  all pass.
+* **Six scheduled strict LOCK1 boots** (features `riscv64-lock1-witness`; QEMU 8.2.2, `virt`, `rv64`,
+  `-smp 2`, `yarm.ap_user_dispatch=1`; the pinned OpenSBI v1.3 `sha256 171a91cc…`) — three idle, three
+  under the documented host load (two CPU-bound shell loops for one boot) — **all sealed**
+  `rounds=12 credited_c_waits=6 credited_s_waits=6 delivered_c=6 delivered_s=6 ssip_rounds=12
+  result=ok`, with complete transport accounting (declared and delivered record counts 273, 279,
+  276, 279, 280, 265; no missing, extra or conflicting record). The kernel (`yarm-riscv64-lock1.bin`
+  `sha256 28e527cc…`) and initramfs (`0f34c6be…`) are byte-identical in all six boots and to the
+  SEAL qualification's — this stage changed no kernel code.
+
+## Limits
+
+* The transport check proves the grader saw the complete dump the kernel declared; it cannot prove
+  the kernel declared every event it should have recorded (the record window is the witness's
+  contract, unchanged).
+* The ordering argument gives consumption-after-release-intent, not consumption-after-unlock.
+* The call-graph walk is a source-text analysis over the current tree: it resolves calls by name and
+  module, treats every same-named bare call as a possible caller (conservative), and excludes only
+  the x86_64/AArch64 trees. A call made through a function pointer or generated by a macro would not
+  be seen by it.
 * One lock, two harts, one QEMU, the pinned firmware; no hardware, fairness or latency claim.
