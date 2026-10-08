@@ -2573,6 +2573,147 @@ pub(crate) const AP_IRQ_SMOKE_VECTOR: u8 = 0xF0;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub(crate) const AP_REMOTE_WAKE_VECTOR: u8 = 0xF1;
 
+// QEMU-LOCK3: the remote-wake handler's two witness records — the hardware entry (after the origin
+// is known, before the handler reads its TLB mailbox) and the completion (right after its one EOI
+// write) — appended to `kernel::lock3_witness`'s ring with the same claim-then-publish protocol as
+// its Rust `record`. General registers only (no FP state, no stack beyond two saved registers, no
+// lock, no call); `eax` (the origin) is preserved, `rcx`/`rdx` are scratch the handler reloads.
+// The reschedule vector is 0xF1, so its `ISR`/`IRR` bit is in word 7 (`0x170` / `0x270`, i.e.
+// `{lapic_eoi} + 0xC0` / `+ 0x1C0`). Empty in every other build, so the plain handler is unchanged.
+#[cfg(all(
+    feature = "x86_64-lock3-witness",
+    not(test),
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64"
+))]
+macro_rules! lock3_wake_stub_entry {
+    () => {
+        r#"
+    push rsi
+    push rdi
+    cmp byte ptr [rip + YARM_LOCK3_ARMED], 0
+    je 86f
+    movzx esi, byte ptr gs:[0]
+    cmp esi, 8
+    jae 86f
+    lea rdi, [rip + YARM_LOCK3_ENTRIES]
+    lock add qword ptr [rdi + rsi*8], 1
+    lea rdi, [rip + YARM_LOCK3_INSTUB]
+    mov byte ptr [rdi + rsi], 1
+    mov edi, 1
+    lock xadd dword ptr [rip + YARM_LOCK3_NEXT], edi
+    cmp edi, 1024
+    jb 85f
+    lock add dword ptr [rip + YARM_LOCK3_OVERFLOW], 1
+    jmp 86f
+85:
+    imul rdi, rdi, 48
+    lea rcx, [rip + YARM_LOCK3_SLOT]
+    add rdi, rcx
+    mov byte ptr [rdi + 1], 6
+    mov byte ptr [rdi + 2], sil
+    mov ecx, dword ptr gs:[{tlb_req_gen_off}]
+    xor edx, edx
+    cmp ecx, dword ptr gs:[{tlb_ack_gen_off}]
+    setne dl
+    shl edx, 8
+    or edx, eax
+    mov qword ptr [rdi + 8], rdx
+    mov rdx, qword ptr [rsp + 40]
+    mov qword ptr [rdi + 16], rdx
+    mov edx, dword ptr gs:[{tlb_ack_gen_off}]
+    shl rdx, 32
+    or rdx, rcx
+    mov qword ptr [rdi + 24], rdx
+    movabs rcx, {lapic_eoi}
+    mov edx, dword ptr [rcx + 0x1C0]
+    shl rdx, 32
+    mov ecx, dword ptr [rcx + 0xC0]
+    or rdx, rcx
+    mov qword ptr [rdi + 32], rdx
+    mov edx, dword ptr gs:[{wake_count_off}]
+    mov qword ptr [rdi + 40], rdx
+    mov byte ptr [rdi], 2
+86:
+    pop rdi
+    pop rsi
+"#
+    };
+}
+#[cfg(all(
+    feature = "x86_64-lock3-witness",
+    not(test),
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64"
+))]
+macro_rules! lock3_wake_stub_eoi {
+    () => {
+        r#"
+    push rsi
+    cmp byte ptr [rip + YARM_LOCK3_ARMED], 0
+    je 88f
+    movzx esi, byte ptr gs:[0]
+    cmp esi, 8
+    jae 88f
+    lea rdx, [rip + YARM_LOCK3_INSTUB]
+    cmp byte ptr [rdx + rsi], 0
+    je 88f
+    mov byte ptr [rdx + rsi], 0
+    lea rdx, [rip + YARM_LOCK3_EOIS]
+    lock add qword ptr [rdx + rsi*8], 1
+    mov edx, 1
+    lock xadd dword ptr [rip + YARM_LOCK3_NEXT], edx
+    cmp edx, 1024
+    jb 87f
+    lock add dword ptr [rip + YARM_LOCK3_OVERFLOW], 1
+    jmp 88f
+87:
+    imul rdx, rdx, 48
+    lea rcx, [rip + YARM_LOCK3_SLOT]
+    add rdx, rcx
+    mov byte ptr [rdx + 1], 10
+    mov byte ptr [rdx + 2], sil
+    movabs rcx, {lapic_eoi}
+    mov eax, dword ptr [rcx + 0x1C0]
+    shl rax, 32
+    mov ecx, dword ptr [rcx + 0xC0]
+    or rax, rcx
+    mov qword ptr [rdx + 8], rax
+    mov eax, dword ptr gs:[{wake_count_off}]
+    mov qword ptr [rdx + 16], rax
+    xor eax, eax
+    mov qword ptr [rdx + 24], rax
+    mov qword ptr [rdx + 32], rax
+    mov qword ptr [rdx + 40], rax
+    mov byte ptr [rdx], 2
+88:
+    pop rsi
+"#
+    };
+}
+#[cfg(all(
+    not(feature = "x86_64-lock3-witness"),
+    not(test),
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64"
+))]
+macro_rules! lock3_wake_stub_entry {
+    () => {
+        ""
+    };
+}
+#[cfg(all(
+    not(feature = "x86_64-lock3-witness"),
+    not(test),
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64"
+))]
+macro_rules! lock3_wake_stub_eoi {
+    () => {
+        ""
+    };
+}
+
 #[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
@@ -2673,6 +2814,9 @@ yarm_ap_remote_wake_stub:
 94:
     add dword ptr gs:[{wake_user_off}], 1
 95:
+"#,
+    lock3_wake_stub_entry!(),
+    r#"
     // (4) coherent request read: generation FIRST, then VA — the mirror of the
     //     BSP's publication order (VA written, then gen bumped).
     mov ecx, dword ptr gs:[{tlb_req_gen_off}]
@@ -2698,6 +2842,9 @@ yarm_ap_remote_wake_stub:
     // (10) LAPIC EOI exactly once, on every path.
     movabs rax, {lapic_eoi}
     mov dword ptr [rax], 0
+"#,
+    lock3_wake_stub_eoi!(),
+    r#"
     // (11) restore every register this handler touched.
     pop rdx
     pop rcx

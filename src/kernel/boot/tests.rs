@@ -145993,7 +145993,19 @@ mod u9d3_f1_sole_ack_producer {
     /// impersonation — it is pure per-CPU asm.
     #[test]
     fn u9d3_handler_holds_no_lock_and_runs_no_policy() {
-        let h = code(handler());
+        // QEMU-LOCK3 splices two witness-only records into the handler through macros that are
+        // empty in every other build (their bodies — atomic counters and ring stores, no call, no
+        // acquisition — are pinned by `tests/qemu_lock3_scope.rs`). The handler's own text, with
+        // those two splice points removed, keeps every property below.
+        let spliced = handler()
+            .replace("\"#,\n    lock3_wake_stub_entry!(),\n    r#\"", "")
+            .replace("\"#,\n    lock3_wake_stub_eoi!(),\n    r#\"", "");
+        assert_eq!(
+            handler().matches("lock3_wake_stub_").count(),
+            2,
+            "exactly the two LOCK3 splice points"
+        );
+        let h = code(&spliced);
         for forbidden in [
             "call",
             "with_cpu",

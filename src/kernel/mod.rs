@@ -29,7 +29,10 @@ pub mod lock1_witness;
 // QEMU-LOCK2: the AArch64 twin — the same lock, SGI work attributed at the GICv2. Default off.
 #[cfg(feature = "aarch64-lock2-witness")]
 pub mod lock2_witness;
-// The facade `SpinLockIrq` calls for the one witnessed lock (LOCK1 or LOCK2, never both).
+// QEMU-LOCK3: the x86_64 twin — the same lock, the reschedule IPI attributed at the local APIC.
+#[cfg(feature = "x86_64-lock3-witness")]
+pub mod lock3_witness;
+// The facade `SpinLockIrq` calls for the one witnessed lock (exactly one of LOCK1/2/3).
 #[cfg(feature = "lock-witness")]
 pub mod lock_witness;
 #[cfg(any(

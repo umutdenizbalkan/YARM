@@ -25,8 +25,18 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use crate::kernel::scheduler::CpuId;
 
-#[cfg(not(feature = "hosted-dev"))]
-core::arch::global_asm!(include_str!("smp1_witness.S"));
+// QEMU-LOCK3 raises the mutual-round count to twelve and adds the round gate and the post-NR 3
+// context check (`YARM_LOCK3`); the plain build assembles the unchanged four-round programs.
+#[cfg(all(not(feature = "hosted-dev"), not(feature = "x86_64-lock3-witness")))]
+core::arch::global_asm!(
+    ".equ YARM_SMP1_MUTUAL_ROUNDS, 4\n.equ YARM_LOCK3, 0\n",
+    include_str!("smp1_witness.S")
+);
+#[cfg(all(not(feature = "hosted-dev"), feature = "x86_64-lock3-witness"))]
+core::arch::global_asm!(
+    ".equ YARM_SMP1_MUTUAL_ROUNDS, 12\n.equ YARM_LOCK3, 1\n",
+    include_str!("smp1_witness.S")
+);
 
 /// FXSAVE pattern image (and, at +0x400, the programs' capture area).
 pub const PAT_VA: u64 = 0x2006_0000;
@@ -71,6 +81,29 @@ unsafe extern "C" {
     static yarm_smp1_client_reply_cap_2: u8;
     static yarm_smp1_client_server_as_cap: u8;
     static yarm_smp1_client_server_as_cap_m: u8;
+}
+
+#[cfg(all(not(feature = "hosted-dev"), feature = "x86_64-lock3-witness"))]
+unsafe extern "C" {
+    static smp1s_l3_gate_ret: u8;
+    static smp1s_l3_nr3_ret: u8;
+    static smp1c_l3_gate_ret: u8;
+    static smp1c_l3_nr3_ret: u8;
+}
+
+/// QEMU-LOCK3: the user VAs (the programs run at 0x2000_0000) the round's gate and NR 3 syscalls
+/// return to — `[server gate, server NR 3, client gate, client NR 3]`.
+#[cfg(all(not(feature = "hosted-dev"), feature = "x86_64-lock3-witness"))]
+fn lock3_continuations() -> [u64; 4] {
+    let at = |label: *const u8, start: *const u8| 0x2000_0000 + (label as u64 - start as u64);
+    let s = &raw const yarm_smp1_server_start;
+    let c = &raw const yarm_smp1_client_start;
+    [
+        at(&raw const smp1s_l3_gate_ret, s),
+        at(&raw const smp1s_l3_nr3_ret, s),
+        at(&raw const smp1c_l3_gate_ret, c),
+        at(&raw const smp1c_l3_nr3_ret, c),
+    ]
 }
 
 /// The byte image of one program with every capability placeholder patched.
@@ -173,6 +206,12 @@ pub(crate) fn record_targets(
         SERVER_R_FRAMES[i].store(server_frames[i], Ordering::Release);
         CLIENT_R_FRAMES[i].store(client_frames[i], Ordering::Release);
     }
+    // QEMU-LOCK3: armed with the provisioning, before either task runs a round.
+    #[cfg(all(not(feature = "hosted-dev"), feature = "x86_64-lock3-witness"))]
+    {
+        crate::kernel::lock3_witness::record_continuations(lock3_continuations());
+        crate::kernel::lock3_witness::arm();
+    }
 }
 
 /// The VM-owner witness markers are confined to the one page the witness replaces.
@@ -216,6 +255,18 @@ impl core::fmt::Display for TargetMailbox {
             "requester_cpu={} target_cpu={} target_req_gen={} target_ack_gen={} target_origin={}",
             self.requester.0, self.target.0, self.req_gen, self.ack_gen, self.origin
         )
+    }
+}
+
+/// QEMU-LOCK3: the DebugLog observation point for the two LOCK3 markers — the split route's, after
+/// the copy, with no domain lock held (the broad route never reaches it, so the gate can never spin
+/// under a broad acquisition). `round` is the marker syscall's third argument (rdx).
+#[cfg(all(not(feature = "hosted-dev"), feature = "x86_64-lock3-witness"))]
+pub fn observe_lock3_marker(msg: &str, round: u64) {
+    if msg.starts_with("SMP1_LOCK3_GATE ") {
+        crate::kernel::lock3_witness::mut_round_gate(this_cpu().0, round);
+    } else if msg.starts_with("SMP1_LOCK3_DONE ") {
+        crate::kernel::lock3_witness::note_round_ok(round);
     }
 }
 
@@ -309,4 +360,7 @@ pub fn observe_user_marker(msg: &str) {
         ));
     }
     crate::kernel::printk::printk_emit_sync(format_args!("SMP1_WITNESS_SUMMARY result=ok"));
+    // QEMU-LOCK3: the sealed lock / IPI record, after both tasks finished their rounds.
+    #[cfg(all(not(feature = "hosted-dev"), feature = "x86_64-lock3-witness"))]
+    crate::kernel::lock3_witness::dump();
 }

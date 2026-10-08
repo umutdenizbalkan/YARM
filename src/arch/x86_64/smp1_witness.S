@@ -30,6 +30,13 @@
  *      other's W at the same time, so each CPU waits for the other's ACK while the other is in
  *      the kernel doing the same.
  *
+ * QEMU-LOCK3 (`YARM_LOCK3` = 1, the `x86_64-lock3-witness` build only): twelve mutual rounds
+ * instead of four; before its NR 3 each task issues `SMP1_LOCK3_GATE` (DebugLog, rdx = round —
+ * the kernel's round gate), loads its callee-saved and FXSAVE patterns, and after NR 3 checks
+ * the result, the callee-saved registers and its FXSAVE image on the continuation a deferred
+ * reschedule IPI interrupts, then reports `SMP1_LOCK3_DONE` (rdx = round). The labels
+ * `<pfx>_l3_gate_ret` / `<pfx>_l3_nr3_ret` are the two syscalls' return addresses.
+ *
  * MBX words: serial  +0x00 started  +0x08 primed  +0x10 done  +0x18 observed   (round numbers)
  *            mutual  +0x20/+0x28 ready (server/client)  +0x30/+0x38 nr3 returned
  *                    +0x40/+0x48 own W checked
@@ -45,7 +52,7 @@
     .set SMP1_R, 0x20090000
     .set SMP1_FLAG_MASK, 0xCD5
     .set SMP1_SERIAL_ROUNDS, 8
-    .set SMP1_MUTUAL_ROUNDS, 4
+    .set SMP1_MUTUAL_ROUNDS, YARM_SMP1_MUTUAL_ROUNDS
 
     /* DebugLog of one of this program's own strings (RIP-relative). */
     .macro SMP1_LOG msg
@@ -330,9 +337,40 @@
     mov esi, SMP1_MBX
     mov qword ptr [rsi + \rdy], rbx
     SMP1_WAIT_AT_LEAST \ordy
+.if YARM_LOCK3
+    /* The kernel's round gate (DebugLog, rdx = round), then the context NR 3 must preserve. */
+    mov eax, 15
+    lea rdi, [rip + \pfx\()_m_l3_gate]
+    lea rsi, [rip + \pfx\()_m_l3_gate_end]
+    sub rsi, rdi
+    mov rdx, rbx
+    syscall
+\pfx\()_l3_gate_ret:
+    mov edi, SMP1_PAT
+    mov qword ptr [rdi + 0x318], rbx
+    fxrstor64 [rdi]
+    SMP1_SET_CALLEE \p
+.endif
     SMP1_REPLACE_W \capB
+.if YARM_LOCK3
+\pfx\()_l3_nr3_ret:
+.endif
     test ecx, ecx
     jnz \pfx\()_vmmap_fail
+.if YARM_LOCK3
+    SMP1_CHECK_CALLEE \p, \pfx\()_l3_ctx_fail
+    call \fpcheck
+    test eax, eax
+    jnz \pfx\()_l3_ctx_fail
+    mov edi, SMP1_PAT
+    mov rbx, qword ptr [rdi + 0x318]
+    mov eax, 15
+    lea rdi, [rip + \pfx\()_m_l3_done]
+    lea rsi, [rip + \pfx\()_m_l3_done_end]
+    sub rsi, rdi
+    mov rdx, rbx
+    syscall
+.endif
     mov esi, SMP1_MBX
     mov qword ptr [rsi + \nr3], rbx
     /* The other NR 3 returned only after THIS CPU acknowledged its request. */
@@ -368,6 +406,11 @@
     cld
     SMP1_LOG \pfx\()_m_unexpected
     jmp \pfx\()_park
+.if YARM_LOCK3
+\pfx\()_l3_ctx_fail:
+    SMP1_LOG \pfx\()_m_l3_ctx_fail
+    jmp \pfx\()_park
+.endif
 \pfx\()_vmmap_fail:
     SMP1_LOG \pfx\()_m_vmmap_fail
 \pfx\()_park:
@@ -465,6 +508,11 @@ smp1s_fpcheck:
     SMP1_STR smp1s_m_resident_fail, "SMP1_SERVER_RESIDENT_CONTEXT_FAIL cpu=1 result=fail"
     SMP1_STR smp1s_m_unexpected, "SMP1_SERVER_UNEXPECTED_W cpu=1 result=fail"
     SMP1_STR smp1s_m_vmmap_fail, "SMP1_SERVER_VM_MAP_FAIL cpu=1 result=fail"
+.if YARM_LOCK3
+    SMP1_STR smp1s_m_l3_gate, "SMP1_LOCK3_GATE cpu=1"
+    SMP1_STR smp1s_m_l3_done, "SMP1_LOCK3_DONE cpu=1 nr3=ok gprs=6 fxsave=1 result=ok"
+    SMP1_STR smp1s_m_l3_ctx_fail, "SMP1_LOCK3_CONTEXT_FAIL cpu=1 result=fail"
+.endif
     .balign 16
     .global yarm_smp1_server_end
 yarm_smp1_server_end:
@@ -554,6 +602,11 @@ smp1c_fpcheck:
     SMP1_STR smp1c_m_resident_fail, "SMP1_CLIENT_RESIDENT_CONTEXT_FAIL cpu=0 result=fail"
     SMP1_STR smp1c_m_unexpected, "SMP1_CLIENT_UNEXPECTED_W cpu=0 result=fail"
     SMP1_STR smp1c_m_vmmap_fail, "SMP1_CLIENT_VM_MAP_FAIL cpu=0 result=fail"
+.if YARM_LOCK3
+    SMP1_STR smp1c_m_l3_gate, "SMP1_LOCK3_GATE cpu=0"
+    SMP1_STR smp1c_m_l3_done, "SMP1_LOCK3_DONE cpu=0 nr3=ok gprs=6 fxsave=1 result=ok"
+    SMP1_STR smp1c_m_l3_ctx_fail, "SMP1_LOCK3_CONTEXT_FAIL cpu=0 result=fail"
+.endif
     .balign 16
     .global yarm_smp1_client_end
 yarm_smp1_client_end:
@@ -566,4 +619,10 @@ yarm_smp1_client_end:
     .global yarm_smp1_client_reply_cap_2
     .global yarm_smp1_client_server_as_cap
     .global yarm_smp1_client_server_as_cap_m
+.if YARM_LOCK3
+    .global smp1s_l3_gate_ret
+    .global smp1s_l3_nr3_ret
+    .global smp1c_l3_gate_ret
+    .global smp1c_l3_nr3_ret
+.endif
     .popsection

@@ -7,6 +7,9 @@
 #   SKIP_BUILD=1      reuse $LOGDIR/build
 #   REGRADE=1         grade $LOGDIR/boot.log again without booting (implies SKIP_BUILD)
 #   TIMEOUT_SECS=...  boot ceiling (default 300)
+#   SMP1_MUTUAL_ROUNDS=...   mutual rounds the build runs (default 4; the QEMU-LOCK3 build runs 12)
+#   SMP1_EXTRA_WAKES_01/10=… reschedule IPIs CPU0->CPU1 / CPU1->CPU0 published on top of the two
+#                            wakes (default 0; QEMU-LOCK3 publishes one per round it does not hold)
 #
 # One `-smp 2` boot of the cross-CPU reply profile with the `x86-smp1-witness` build and
 # `yarm.x86_64_smp1_witness=1`. Two kernel-built tasks with distinct context patterns — the
@@ -104,7 +107,7 @@ C_TID=$(field "$PROV" client_tid); C_AS=$(field "$PROV" client_asid)
 # ── Wakes in both directions, the idle target, both resume paths, both context checks. ──────
 S_BLOCK1=$(line_of "X86_SMP_ORACLE_BLOCKED cpu=1 tid=$S_TID endpoint=6 wait_gen=1")
 WAKE01=$(line_of "X86_AP_RESCHEDULE_IPI_SENT sender_cpu=0 receiver_cpu=1")
-[[ "$(count "X86_AP_RESCHEDULE_IPI_SENT sender_cpu=0 receiver_cpu=1")" == 1 ]] || die "CPU0->CPU1 wake requests != 1"
+[[ "$(count "X86_AP_RESCHEDULE_IPI_SENT sender_cpu=0 receiver_cpu=1")" == $((1 + ${SMP1_EXTRA_WAKES_01:-0})) ]] || die "CPU0->CPU1 wake requests != $((1 + ${SMP1_EXTRA_WAKES_01:-0}))"
 before "$S_BLOCK1" "$WAKE01" "the server is blocked (CPU 1 idle) before the CPU0->CPU1 wake"
 AP_RESUME=$(linere "X86_AP_SAVED_DISPATCH_OK cpu=1 mode=saved .* tid=$S_TID ")
 before "$WAKE01" "$AP_RESUME" "the AP saved-frame resume follows the wake"
@@ -112,7 +115,7 @@ S_CTX=$(line_of "SMP1_USER cpu=1 SMP1_SERVER_RESUME_CONTEXT_OK cpu=1 path=ap_sav
 before "$AP_RESUME" "$S_CTX" "the server's context check follows its AP saved-frame resume"
 C_BLOCK1=$(line_of "X86_SMP_ORACLE_BLOCKED cpu=0 tid=$C_TID endpoint=7 wait_gen=1")
 WAKE10=$(line_of "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0")
-[[ "$(count "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0")" == 1 ]] || die "CPU1->CPU0 wake requests != 1"
+[[ "$(count "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0")" == $((1 + ${SMP1_EXTRA_WAKES_10:-0})) ]] || die "CPU1->CPU0 wake requests != $((1 + ${SMP1_EXTRA_WAKES_10:-0}))"
 before "$C_BLOCK1" "$WAKE10" "the client is blocked before the CPU1->CPU0 wake"
 C_CTX=$(line_of "SMP1_USER cpu=0 SMP1_CLIENT_RESUME_CONTEXT_OK cpu=0 path=production_selection gprs=6 fxsave=1 reply=ok result=ok")
 before "$WAKE10" "$C_CTX" "the client's context check follows the wake"
@@ -121,7 +124,7 @@ before "$WAKE10" "$C_CTX" "the client's context check follows the wake"
 # ── TLB rounds. Serial round k: odd k -> the client (CPU 0) replaces the server's W while the
 # server is resident on CPU 1; even k -> the mirror. Then MUTUAL rounds: both replace each
 # other's W at once, so each CPU waits for an ACK while the other is in the kernel doing the same.
-SERIAL=8; MUTUAL=4; PER_TARGET=$((SERIAL / 2))
+SERIAL=8; MUTUAL=${SMP1_MUTUAL_ROUNDS:-4}; PER_TARGET=$((SERIAL / 2))
 lines() { rg -a -n -- "$1" "$NORM" | cut -d: -f1; }
 nth() { sed -n "${2}p" <<<"$1"; }
 for who in server client; do

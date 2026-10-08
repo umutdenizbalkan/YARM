@@ -125,10 +125,42 @@ fn write_icr(apic_id: u8, value: u32) {
         );
         write_volatile((base + LAPIC_ICR_LOW_OFFSET) as *mut u32, value);
     }
+    // QEMU-LOCK3: every IPI any owner sends goes through this one writer; the witness records the
+    // destination and low word after the write (observation only, lock-free, no output).
+    #[cfg(feature = "x86_64-lock3-witness")]
+    crate::kernel::lock3_witness::note_icr(apic_id, value);
 }
 
 #[cfg(any(test, feature = "hosted-dev"))]
 fn write_icr(_apic_id: u8, _value: u32) {}
+
+/// QEMU-LOCK3: this CPU's local-APIC `(ISR, IRR)` words that hold `vector`'s bit. Two MMIO reads;
+/// neither register has a read side effect.
+#[cfg(all(
+    feature = "x86_64-lock3-witness",
+    not(test),
+    not(feature = "hosted-dev")
+))]
+pub(crate) fn lapic_vector_words(vector: u32) -> (u32, u32) {
+    let base = lapic_mmio_base();
+    let word = 0x10 * (vector as usize / 32);
+    unsafe {
+        (
+            read_volatile((base + 0x100 + word) as *const u32),
+            read_volatile((base + 0x200 + word) as *const u32),
+        )
+    }
+}
+
+/// QEMU-LOCK3: this CPU's last ICR write was accepted (delivery status idle), bounded.
+#[cfg(all(
+    feature = "x86_64-lock3-witness",
+    not(test),
+    not(feature = "hosted-dev")
+))]
+pub(crate) fn lock3_icr_accepted() -> bool {
+    icr_delivery_idle()
+}
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 fn wait_for_icr_idle(apic_id: u8, phase: &str) {

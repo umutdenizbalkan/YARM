@@ -654,7 +654,7 @@ impl Bootstrap {
             core::ptr::addr_of_mut!((*state_ptr).telemetry_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).boot_config_state_lock)
                 .write(SpinLockIrq::new(()));
-            // QEMU-LOCK1 / QEMU-LOCK2: the VM address-space lock is the ONE witnessed subdomain
+            // QEMU-LOCK1 / LOCK2 / LOCK3: the VM address-space lock is the ONE witnessed subdomain
             // lock. On a plain build this is the identical `SpinLockIrq::new(())`.
             #[cfg(not(feature = "lock-witness"))]
             core::ptr::addr_of_mut!((*state_ptr).vm_state_lock).write(SpinLockIrq::new(()));

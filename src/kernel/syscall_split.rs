@@ -5970,6 +5970,13 @@ fn try_split_debug_log_into_frame(
                 target_arch = "x86_64"
             ))]
             crate::arch::x86_64::smp1_witness::observe_user_marker(msg);
+            // QEMU-LOCK3: the round gate and the round-done marker (round in the third argument).
+            #[cfg(all(
+                feature = "x86_64-lock3-witness",
+                not(feature = "hosted-dev"),
+                target_arch = "x86_64"
+            ))]
+            crate::arch::x86_64::smp1_witness::observe_lock3_marker(msg, frame.arg(2) as u64);
             // QEMU-SMP2: the AArch64 witness's step record, arm probe and sealed dump.
             #[cfg(all(
                 feature = "aarch64-smp2-witness",
