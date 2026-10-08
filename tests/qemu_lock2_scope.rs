@@ -366,3 +366,39 @@ fn the_smoke_and_grader_are_wired() {
     }
     assert!(CORE.contains("def ownership(ev, rounds, fail):"));
 }
+
+/// Round-indexed mailbox words live at `M_x + round * 8`: every field's stride must hold the most
+/// rounds the build runs, and the last word must stay inside the one mailbox page the kernel clears.
+/// (QEMU-LOCK2's first candidate kept the plain 0x40 stride with twelve rounds; rounds >= 8 then
+/// read their neighbours' words and the handshakes returned early.)
+#[test]
+fn the_mailbox_stride_holds_every_round() {
+    let a = SMP2_ASM;
+    assert!(a.contains(".if YARM_MUT_ROUNDS > 7\n    .set MSTRIDE, 0x100\n    .else\n    .set MSTRIDE, 0x40\n    .endif"));
+    let fields: Vec<u64> = a
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(".set M_"))
+        .filter_map(|l| l.split_once(", ").map(|(_, v)| v.trim()))
+        .filter_map(|v| v.strip_suffix(" * MSTRIDE").and_then(|k| k.parse().ok()))
+        .collect();
+    assert_eq!(
+        fields,
+        (1..=12).collect::<Vec<u64>>(),
+        "one stride per round-indexed field"
+    );
+    for (rounds, stride) in [(12u64, 0x100u64), (4, 0x40)] {
+        assert!(
+            (rounds + 1) * 8 <= stride,
+            "{rounds} rounds fit a 0x{stride:x} stride"
+        );
+        assert!(
+            12 * stride + (rounds + 1) * 8 <= 0x1000,
+            "inside the mailbox page"
+        );
+    }
+    let s = code(SMP2);
+    assert!(squash(&s).contains(&squash(
+        "#[cfg(feature = \"aarch64-lock2-witness\")] \
+         kernel.copy_to_user(s_asid, VirtAddr(MBX_VA), &[0u8; 0x1000])?;"
+    )));
+}

@@ -357,7 +357,13 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
             slot.store(frame, Ordering::Release);
         }
     }
+    // QEMU-LOCK2: twelve mutual rounds need the wider mailbox stride (`MSTRIDE` in the
+    // assembly), whose words reach past 0x400; clear the whole page then. The plain build is
+    // unchanged.
+    #[cfg(not(feature = "aarch64-lock2-witness"))]
     kernel.copy_to_user(s_asid, VirtAddr(MBX_VA), &[0u8; 0x400])?;
+    #[cfg(feature = "aarch64-lock2-witness")]
+    kernel.copy_to_user(s_asid, VirtAddr(MBX_VA), &[0u8; 0x1000])?;
     S_ASID.store(u64::from(s_asid.0), Ordering::Release);
     C_ASID.store(u64::from(c_asid.0), Ordering::Release);
     H1_ASID.store(u64::from(h1_asid.0), Ordering::Release);

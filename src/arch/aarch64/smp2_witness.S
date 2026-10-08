@@ -66,22 +66,29 @@
     .set MUT_ROUNDS, YARM_MUT_ROUNDS
     .set PARK_TICKS, 60
 
-    /* MBX words */
-    .set M_S_WAIT, 0x040
-    .set M_C_WAIT, 0x080
-    .set M_A_OPEN, 0x0C0
-    .set M_A_DONE, 0x0C8
-    .set M_B_OPEN, 0x0D0
-    .set M_B_DONE, 0x0D8
-    .set M_PRIMED, 0x100
-    .set M_DONE, 0x140
-    .set M_OBS, 0x180
-    .set M_READY_S, 0x1C0
-    .set M_READY_C, 0x200
-    .set M_NR3_S, 0x240
-    .set M_NR3_C, 0x280
-    .set M_CHK_S, 0x2C0
-    .set M_CHK_C, 0x300
+    /* MBX words. Round-indexed words live at `M_x + round * 8`, so each field needs room for
+     * the most rounds any phase runs: 0x40 holds eight (the plain build's four), 0x100 holds 32
+     * (QEMU-LOCK2's twelve mutual rounds). The plain build's offsets are unchanged. */
+    .if YARM_MUT_ROUNDS > 7
+    .set MSTRIDE, 0x100
+    .else
+    .set MSTRIDE, 0x40
+    .endif
+    .set M_S_WAIT, 1 * MSTRIDE
+    .set M_C_WAIT, 2 * MSTRIDE
+    .set M_A_OPEN, 3 * MSTRIDE
+    .set M_A_DONE, 3 * MSTRIDE + 0x08
+    .set M_B_OPEN, 3 * MSTRIDE + 0x10
+    .set M_B_DONE, 3 * MSTRIDE + 0x18
+    .set M_PRIMED, 4 * MSTRIDE
+    .set M_DONE, 5 * MSTRIDE
+    .set M_OBS, 6 * MSTRIDE
+    .set M_READY_S, 7 * MSTRIDE
+    .set M_READY_C, 8 * MSTRIDE
+    .set M_NR3_S, 9 * MSTRIDE
+    .set M_NR3_C, 10 * MSTRIDE
+    .set M_CHK_S, 11 * MSTRIDE
+    .set M_CHK_C, 12 * MSTRIDE
 
     .macro LI32 reg, val
     movz \reg, #(((\val) >> 16) & 0xffff), lsl #16
