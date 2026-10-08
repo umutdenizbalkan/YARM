@@ -25413,3 +25413,246 @@ documentation-only commit.
   disassembly; QEMU TCG does not distinguish a missing barrier, and LOCK2 adds no control that would
   be counted for one.
 
+# QEMU-LOCK3 — x86_64 contention on `vm_state_lock` and the reschedule IPI deferred through the masked hold
+
+Base: the accepted QEMU-LOCK2 delivery `2d01c243` (tree `1fb5e721…`). U9 stays CLOSED: production
+`with_cpu=0`, `with_broad=0`; the three wrapper definitions (the raw `self.state.lock()` bodies of
+`SharedKernel::lock` / `with` / `with_cpu`) stay a separate census category. Scope: two CPUs on the
+existing QEMU q35 / qemu64 SMP1 configuration, one production lock — `vm_state_lock`, rank 5,
+`SpinLockIrq` — the production VM operations and the existing LAPIC reschedule owners. Excluded:
+more CPUs, migration, AP timers, x2APIC, other locks, hardware bring-up, unrelated cleanup. LOCK1
+and LOCK2 are not reopened: their witness modules and graders are unchanged.
+
+## 1 — the x86_64 contract, derived from source
+
+| question | what the source says |
+|---|---|
+| both CPUs' acquisitions of this exact lock | the shared mapping transaction `run_vm_map_transaction` (NR 3 with an address-space capability, reached through the split route `try_split_vm_map_into_frame`): the guard-page query (`guard_page_refuses`, a rank-5 read), then the install (`with_vm_then_memory_split_mut`, rank 5 → 6). The split DebugLog route also takes it briefly to copy the message from user memory. One `KernelState::vm_state_lock`, built once (`new_witnessed` appears once in the tree) inside the shared kernel's state (`BOOTSTRAP_SHARED_KERNEL`; the bootstrap copy is moved before any task runs) |
+| the mask and its restoration | `SpinLockIrq::lock` → `irq::irq_save` = `pushfq; cli`; the guard's drop records the release (intent), stores `held = false` (Release), then `irq_restore`, which executes `sti` only if the save found `IF` set. Every kernel entry runs with `IF = 0` (interrupt gates; `FMASK` clears `IF` on `syscall`), so inside a syscall the restore is a no-op and the interrupt window opens only at `sysretq`/`iretq` (user `RFLAGS.IF`) or an idle `sti; hlt`. The other `sti` sites are enumerated by a guard: the idle park loop, the managed AP idle loop, the two pre-scheduler AP idle loops, the boot enable, and the UART witness's restore of the flag it found — none reachable with a kernel guard live |
+| the reschedule vector, sender and entry | vector 0xF1 (`AP_REMOTE_WAKE_VECTOR`), **shared with the TLB shootdown**. Senders: NR6's remote delivery `smp::send_reschedule_ipi_to` (re-arms an AP target's dispatch request) and NR7's `smp::c2c_send_reschedule_ipi_to`; both `wait_for_icr_idle` then `write_icr` (fixed, physical, CPU index = APIC id). Both CPUs take 0xF1 through the same pure-assembly gate `yarm_ap_remote_wake_stub` (the BSP's since SMP1) |
+| completion owner | that stub: it counts the arrival and its origin, services this CPU's TLB mailbox only if `req_gen != ack_gen` (invalidation, origin, ACK last), writes the LAPIC EOI exactly once on every path, and `iretq`s to the interrupted context. It touches no FP state, takes no lock and calls nothing |
+| interrupt-side code that can reach the lock | none on the holder: the critical section is masked from `cli` to the release, and no `sti` is reachable inside it. The 0xF1 stub takes no lock; the BSP timer (0x20) enters the compiled trap path only from ring 3 or the idle window, where this CPU holds no kernel lock — it can contend with the other CPU, never re-acquire a lock its own interrupted context holds |
+| release, invalidation, remote completion | the install's displaced pages are pinned inside the acquisition; Phase W runs **after the release with no domain lock held**: the requester posts the target's mailbox (VA, then generation), sends 0xF1, and polls the ACK with `IF = 0`, answering its own mailbox meanwhile (SMP1 §5); Phase S unpins and reclaims only acknowledged pages. **A 0xF1 arrival therefore can carry TLB work, reschedule work (count + EOI), or both** — the reschedule gets credit only for the arrival and its EOI; TLB work is credited by the SMP1 grader from ACK generations, never by an arrival |
+
+## 2 — the witness
+
+Default off (`x86_64-lock3-witness`, which co-enables `x86-smp1-witness` and the shared
+`lock-witness` hooks) and armed only on the SMP1 witness profile (`yarm.x86_64_smp1_witness=1`). The
+SMP1 programs run twelve mutual rounds under the feature (`YARM_SMP1_MUTUAL_ROUNDS`; the plain build
+keeps four). Holder = CPU 0 in odd rounds, CPU 1 in even rounds.
+
+* **Shared factoring.** The facade gains one hook, `note_instance(id, addr)`: `SpinLockIrq` hands it
+  the acquiring instance's address immediately before each id-only contention/acquisition record. It
+  is an empty inline function for LOCK1 and LOCK2 (their modules and the pinned hook calls are
+  unchanged); LOCK3 records the address in every `acquire` and `contended` record and publishes the
+  live `vm_state_lock`'s address in the dump's metadata. Any two of the three witnesses, or the
+  internal feature alone, refuse to compile. Ownership (acquisition identity carried by the guard;
+  release record = intent, before the unlocking store) and value-linked contention are LOCK1's.
+* **The round gate (witness-only, bounded, recorded).** `SMP1_LOCK3_GATE` (DebugLog, round in rdx,
+  split route only — the broad route never reaches it, so the gate cannot spin under a broad
+  acquisition). The holder waits for the waiter's arrival (its marker copy, which takes the lock, is
+  done), records it, and marks itself gated; the hold can begin only at its next acquisition — its
+  NR 3. The waiter first confirms its own last ICR write was accepted (delivery status idle), marks
+  arrival, waits until the holder is inside its masked ownership, records that, and publishes. Each
+  outcome is in the gate record and graded.
+* **Outstanding under the mask — the local APIC, not a counter.** Inside the acquisition, with
+  `RFLAGS.IF` read clear, the holder reads its own LAPIC `ISR` and `IRR` words for 0xF1 (word 7; reads
+  have no side effect) and its TLB request generation when its hold begins (before opening the
+  waiter's gate), then waits (bounded) for the waiter's contention and polls (bounded) the `IRR` bit.
+  `IRR` clear and not in service at the start, set and not in service after, with no TLB request
+  published to it in between, is the local APIC holding a fixed 0xF1 interrupt accepted during this
+  masked hold. The `IRR` has one bit per vector and no source; attribution is the ICR record.
+* **Publication — the one ICR writer.** The waiter calls the production owner for the direction:
+  NR6's `send_reschedule_ipi_to` towards the AP, NR7's `c2c_send_reschedule_ipi_to` towards the BSP.
+  `write_icr` records every ICR write (destination, low word, the destination's TLB generation) after
+  both register writes, so every IPI either CPU sends is in the record.
+* **Hardware entry and completion — the handler's own records.** Two witness-only splices in the
+  0xF1 stub (macros that expand to nothing in every other build): after the origin is known and before
+  the mailbox read, the entry (origin, interrupted RIP, whether a TLB request was outstanding,
+  `req|ack` generations, `ISR|IRR` words, the production arrival ordinal); right after the one EOI
+  write, the completion (`ISR|IRR` words, ordinal). General registers only, two saved registers, no
+  call, no acquisition — the only `lock`-prefixed instructions are counter increments and the slot
+  claim, written with the ring's claim-then-publish protocol.
+* **Progress and context.** Around its NR 3 each program loads its callee-saved and FXSAVE patterns;
+  on the NR 3 continuation (the instruction a deferred 0xF1 interrupts after `sysretq`) it checks the
+  result (`rcx == 0`), `rbx rbp r12–r15` and FCW, MXCSR, XMM0–15, and only then issues
+  `SMP1_LOCK3_DONE`. The kernel publishes both NR 3 continuation VAs in the metadata.
+* The witness writes no EOI, sends nothing except through the two owners, never runs the handler and
+  synthesizes nothing; all storage is preallocated atomics; the lock path, ICR hook and gate are
+  bounded, lock-free and console-free; the dump is synchronous and after both tasks finished.
+
+## 3 — the grader (`scripts/grade-x86_64-lock3-witness.py`)
+
+On the shared core: transport accounting (checksummed metadata, two per-CPU count lines and the
+completion record; agreement, contiguous sequence, conflicting copies, recovery from one damaged
+copy), ownership, contention by value. Corroboration: the kernel's `SMP1_WITNESS_SUMMARY result=ok`
+and the SMP1 grader's seal on the same boot with twelve mutual rounds. Then:
+
+* **one lock instance** — every acquire/contended record names the published `vm_state_lock`
+  address;
+* **handler obligations, per CPU** — 0xF1 entries and EOIs strictly alternate, each EOI names its
+  entry's ordinal with 0xF1 no longer in service, each entry shows 0xF1 in service, ordinals are
+  contiguous up to the production arrival count, entries = EOIs, and the other CPU settled at the
+  dump;
+* **per round** — a complete record (both gates, both done records, one hold-begin, hold and pending
+  observation by the scheduled holder, all inside one acquisition of the round, the hold after the
+  holder's gate); `IF` clear; no handler entry on the holder anywhere inside the acquisition;
+  contention credited by value with every gate wait satisfied; the kernel's outstanding flag equal to
+  the grader's own reading of the two LAPIC views and TLB generations; the publication's ICR write a
+  fixed 0xF1 IPI to the holder's APIC id leaving its TLB generation unchanged, strictly inside the hold
+  window and after the waiter's gate, and the only 0xF1 write to the holder there; the **delivering
+  entry** = the holder's first 0xF1 entry after the pending observation, after the acquisition's
+  release record, before the holder's round-done record, in ring 3 at exactly the holder's NR 3
+  continuation, 0xF1 in service; its own EOI before the holder's next entry; the round-done record
+  after that EOI.
+
+Absent, contradictory or out-of-order evidence fails the boot. Genuinely ineligible rounds stay
+uncredited with the reason recorded (`no-request-under-mask`, `gate-timeout`, `uncontended`,
+`second-sender-in-window`); ≥ 4 credited contended rounds and ≥ 4 attributed deliveries per direction
+are required. The seal separates publications (`requests`), all ICR writes, handler entries and EOIs,
+entries that did TLB work, 0xF1 sends that coalesced into a pending delivery, and credited deliveries
+that also did TLB work.
+
+## 4 — controls
+
+**Grader fixtures** (`--self-test`, 42 cases, each checked against its own failure message):
+positives for the holder's entry after the waiter's round-done, coalescing (the waiter's TLB send
+merged and the delivering entry doing the TLB work; an extra reschedule send after the observation),
+a damaged copy recovered, and ineligible rounds with their reasons (uncontended, gate timeouts, a TLB
+request in the window); the shared-core controls (dropped pair, missing ownership interval, wrong
+lock id, **wrong lock instance**, **substituted lock**, wrong owner, deleted round, conflicting
+copies, count disagreement, unmasked holder, insufficient contention, a hold value no waiter
+produced, a missing SMP1 summary); and the x86 controls — premature arrival (two placements), wrong
+target, wrong vector (the publication's ICR; the delivering entry not in service), wrong sender, stale
+round, missing, duplicate and withheld EOI, an arrival-ordinal gap, a request already pending when the
+hold began, a TLB request in the window with the kernel still claiming outstanding, publication
+before the hold, refused or missing publication, delivery on another continuation, progress before
+the delivery, suppressed IPIs with contention intact, and gate timeouts on every round.
+
+**Source guards** (`tests/qemu_lock3_scope.rs`, 9), and seventeen temporary source mutations, each
+caught and reverted: the ICR hook before the write; the witness writing an EOI or reading the LAPIC
+directly; the hold not gated on the holder's gate; console output in the hold; an unbounded gate wait;
+the first LAPIC view after the gate release; the waiter's arrival before its ICR check; a new `sti`;
+a call, a backward branch or an EOI store in a splice; the entry splice after the mailbox read; the
+broad DebugLog route calling the gate; a single publication owner for both directions; the instance
+hook removed; an over-long metadata line. The existing u9d3 handler guard is re-derived around the two
+splice points (the handler's own text keeps every property it pinned).
+
+**Live controls** — final candidate `756a52c8`, each a temporary mutation in a throwaway worktree,
+built, booted and graded, logs retained, worktree removed and the main tree verified clean:
+
+| control | mutation | fails with |
+|---|---|---|
+| serialized operations | a global serializer around the whole production NR 3 (taken before its first `vm_state_lock` acquisition; the spin answers this CPU's TLB mailbox, as production waits do) | contention 0 / 0, every round `uncontended`, deliveries 0 / 0; SMP1 independently: "no mutual round overlapped". Each hold spends its full bounded wait (~19 s under TCG), so this control runs with a 600 s budget and sealed after 245 s |
+| substituted owner | the gate's round→holder parity flipped | every round "has no complete record" (gates name a holder other than the scheduled one); SMP1 ok |
+| substituted lock | the witness id stamped on `boot_config_state_lock`, `vm_state_lock` a plain `SpinLockIrq` | "the acquire names lock instance 0x…9c40, not vm_state_lock 0x…9cc0" — in this mutation every round otherwise still graded 6+6, because `boot_config_state_lock` is itself taken and contended on the NR 3 path |
+| suppressed reschedule IPI | the waiter never calls the send owner | contention still 6 + 6; every round `no-request-under-mask`, attributed deliveries 0 / 0 (the SMP1 grader's wake-line count also drops by six) |
+| withheld EOI | from round 12 the holder's handler skips the EOI write for the delivering entry | "unbalanced handler obligations on CPU 1: entries 18 / EOIs 17", "its last 0xF1 entry has no EOI", "round 12: the delivering entry has no EOI of its own" |
+| prevented release | the hold hook spins forever holding `vm_state_lock` with `IF = 0` | the watchdog (90 s) ends the boot: no SMP1 summary, no LOCK3 dump, nothing credited |
+| corrupted returning context | the handler flips `r12` of the continuation it returns to for the delivering entry | the holder's own check: `SMP1_LOCK3_CONTEXT_FAIL cpu=0` at the first delivery; the boot stops, nothing sealed |
+
+**What the first control run (on a development commit) found, repaired before the freeze:**
+
+* *substituted lock* **passed** 6+6 / 6+6: the records carried only the witness id. Lock-instance
+  identity was added (`note_instance`; published live instance; graded).
+* the published instance address was first taken at bootstrap — the copy later moved into the shared
+  kernel — and the longer metadata line was truncated by the printk record limit (192 bytes). The
+  address is now taken from the live state at witness provisioning, and the metadata line is compacted
+  (a guard bounds its widest form).
+* *serialized operations* and *suppressed IPI* exceeded their budgets (90 s / 300 s). Diagnosed with a
+  QEMU monitor (CPU 1 inside `maybe_hold`, CPU 0 on the serializer): bounded waits, not a hang. The
+  pending observation's bound dropped from 10 M to 1 M LAPIC reads (the request is published before
+  the contention it follows; 10 M emulated reads held a suppressed round ~25 s).
+* *withheld EOI* first failed to build: the mutation referenced a witness-only symbol from the
+  handler's base text, which the plain base build also assembles (a control defect, repaired).
+
+## 5 — qualification
+
+Single freeze **`756a52c8`** (tree `e385a79c…`), from the accepted base `2d01c243` (tree
+`1fb5e721…`); the live controls in §4 ran on this commit. Qualified on an isolated clean worktree,
+every scheduled run retained, none replaced: **32 scheduled gates, 29 passed, 3 failed**; all three
+failures were followed by scheduled supplementary gates on both the candidate and the true base
+(14 gates), which show none of them is candidate-caused.
+
+* **Six scheduled strict LOCK3 boots** — features `x86_64-lock3-witness`; QEMU 8.2.2 (Debian
+  `1:8.2.2+ds-0ubuntu1.18`), `q35`, `qemu64`, 512M, `-smp 2`, the SMP1 witness command line; each
+  built into its own directory, kernel `kernel_boot.elf` `sha256 28cec27e…` and initramfs `43ecc9e5…`
+  byte-identical across all six — three idle, three under the documented host load (two CPU-bound
+  shell loops for one boot). **All six sealed** `rounds=12 credited_c_waits=6 credited_s_waits=6
+  delivered_c=6 delivered_s=6 uncredited=none requests=12 icr_writes=47 entries=35 eois=35
+  result=ok`, with `entries_with_tlb_work` 19–20, `coalesced_sends=12` and
+  `deliveries_with_tlb_work` 3–6 (so 3–6 of the twelve delivering 0xF1 entries also performed the
+  waiter's TLB request; the rest found it already answered inside the holder's own ACK wait). Every
+  boot: complete transport (declared and delivered records 380, 377, 377, 374, 387, 373), every
+  acquire/contended record naming the live `vm_state_lock` `0xffffffff818d9cc0`, per-CPU entries =
+  EOIs (CPU 0 17/17, CPU 1 18/18; CPU 1's three earlier arrivals precede arming and its ordinals run
+  contiguously from 4 to the production count 21), and the SMP1 grader sealing the same boot
+  (`mutual_rounds=12 shootdowns=32 settled_after_ack=32 contexts=2+8 result=ok`, 12–13 requests
+  answered inside a wait). The dump was taken by CPU 0 once and CPU 1 five times.
+* **x86_64 regressions** — plain SMP1 (`mutual_rounds=4`, ok), cross-CPU reply, user-consume,
+  CONTEXT1, idle-boundary return, overtaken deferral, server death: pass. Three failed:
+  * *cross-CPU request* — `server-blocked != 1`: the transaction completed
+    (`IPCCALL_DIRECT_SMP_REQUEST_OK`, transaction seal 7/7) but the asynchronous one-shot
+    `IPCCALL_DIRECT_SMP_SERVER_BLOCKED` line was lost in the printk ring — the loss
+    SMP1-ACCEPTANCE §3 recorded at base and head alike. Supplementary: candidate 2/2 and base 3/3
+    pass; the profile's kernel `.text` is **byte-identical** between candidate and base.
+  * *UART IRQ witness* — "no user-origin interrupt landed inside the register-checked spin" (all four
+    user-origin deliveries landed outside the checked spin's symbol range). Supplementary: candidate
+    2/2 pass; base 2/3 — the base's third run failed with the same message. Kernel `.text`
+    byte-identical. A pre-existing timing sensitivity of that witness.
+  * *strict core smoke* — "timer contract witness absent": the gate was mis-invoked. The smoke boots
+    whatever is in `build-x86_64/` and in the qualification worktree that was an earlier gate's
+    default build; its contract (QEMU-BASELINE1 §3) needs a `timer-contract-witness` build.
+    Supplementary, built as the contract requires: candidate and base both pass
+    (`TIMER_CONTRACT_WITNESS_SEAL … context_ok=1 … result=ok`), `.text` byte-identical.
+* **Preserved RISC-V and AArch64** — two LOCK1 boots (`6+6 / 6+6 result=ok`), two SMP3 boots (41/41
+  arrivals consumed), two LOCK2 boots (`6+6 / 6+6 uncredited=none sgi 25/25/25 result=ok`), plain
+  SMP2 (`result=ok`): pass.
+* **Graders, guards and suites** — LOCK3 self-test (42), LOCK2 self-test, LOCK1 self-test, `cargo fmt
+  --check`, the hosted suite single-threaded (5985 passed, 0 failed, 2 ignored), all 30 integration
+  targets (291 passed, 0 failed), the broad-lock census scanner (`with_cpu = 0`, `with_broad = 0`, the
+  three raw `self.state.lock()` wrapper bodies counted separately) — all pass. **Three freestanding
+  `kernel_boot` builds** (x86_64, aarch64, riscv64, default features) produce warning classes
+  **identical to the fresh base `2d01c243`** (219 / 247 / 229).
+
+## 6 — delivery
+
+Delivered by ordinary fast-forward of `main` and `claude/yarm-kernel-unlock-u0-f2zh8p` after a fresh
+fetch and ancestry check; `14b61286` and every IRQ / context / SMP / LOCK / WIP ref preserved; no
+force push, rebase, deletion or PR. The qualified code commit is `756a52c8` (also `wip/qemu-lock3`'s
+first push); this record follows in a documentation-only commit.
+
+## Limits
+
+* **One lock, two CPUs, one QEMU (TCG), xAPIC.** No x2APIC, no third CPU, no hardware, no fairness or
+  latency claim.
+* **The LAPIC observation is QEMU's model.** `IRR`/`ISR` are read as QEMU 8.2's emulated xAPIC
+  presents them; QEMU delivers a fixed IPI into the target's `IRR` synchronously with the ICR write and
+  always reports the delivery status idle. The bounded `IRR` poll only waits for that write to land.
+* **Attribution is by the ICR record.** The `IRR` has no source field. With two CPUs and the waiter
+  inside its own lock() spin during the window, the only possible sender is the waiter; the grader
+  requires the publication to be the only 0xF1 write to the holder in the window and no TLB request
+  bump. Later 0xF1 sends to the holder (the waiter's shootdown) coalesce into the pending bit or arrive
+  separately; the seal counts them, and an entry that found a TLB request did the TLB work, which is
+  credited only through the SMP1 grader's ACK generations.
+* **Masking.** `RFLAGS.IF` is read once, at the hold record; the whole-section claim rests on the
+  source (entry masks, every `sti` enumerated, the restore a no-op inside a syscall) and on the graded
+  absence of any handler entry on the holder inside the acquisition.
+* **Ordering.** Entry-after-release is program order on the holder (release record → store → the
+  no-op restore → `sysretq` → the interrupt at the first user instruction → the handler's slot claim);
+  the release record is release intent, not the unlocking store.
+* **Context coverage.** On the interrupted NR 3 continuation the program checks the result (`rcx`),
+  `rbx rbp r12–r15`, FCW, MXCSR and XMM0–15. Not checked there: `rax` and `rdx` (syscall return values
+  the handler saves and restores), `rsi rdi r8–r11`, `RFLAGS`, the x87 stack. SMP1's resident rounds
+  cover ten GPRs, RFLAGS and the FXSAVE image across 0xF1 arrivals in ring 3 at a different
+  continuation (a dwell loop), through the same handler.
+* **The gate is witness-only synchronization**: bounded, default-off, recorded and graded. The hold
+  waits for the holder's own gate since the first live boot showed the waiter's gate opening the window
+  while the holder was still copying its marker (the hold then fell inside that copy, and the IPI was
+  taken after the DebugLog syscall rather than NR 3). Ordinary scheduling and the lock algorithm are
+  unchanged.
+* **The publication re-arms the AP dispatch request** (NR6's owner does that for an AP target); with
+  nothing enqueued, CPU 1's managed idle finds nothing new. The SMP1 grader is told to expect the six
+  extra reschedule lines per direction.
+* **Coalescing and TCG timing** make `entries_with_tlb_work`, `coalesced_sends` and
+  `deliveries_with_tlb_work` vary between boots; none of them is a credit condition.
