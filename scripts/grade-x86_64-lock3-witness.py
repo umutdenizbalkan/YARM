@@ -295,7 +295,16 @@ def _self_test():
         ("valid: one damaged copy recovered", _synth(lines_mut=_damage(
             lambda l: l.startswith("LOCK3_REC seq=60 ") and " pass=2 " in l)), 0, None, None),
         ("valid: one uncontended round (no credit, reason recorded)", _synth(mutate=_edit(
-            3, K("hold"), _set(3, 0))), 0, "uncredited=3", None),
+            3, K("hold"), _set(3, 0))), 0, "uncredited=3(uncontended)", None),
+        ("valid: a holder gate that timed out waiting for the waiter (no credit, reason recorded)",
+         _synth(mutate=_edit(4, lambda e: e[0] == "gate" and e[2][2] == 0, _set(4, 0))), 0,
+         "uncredited=4(gate-timeout)", None),
+        ("valid: a waiter whose previous ICR write was not accepted (no credit, reason recorded)",
+         _synth(mutate=_edit(6, lambda e: e[0] == "gate" and e[2][2] == 1, _set(4, 0))), 0,
+         "uncredited=6(gate-timeout)", None),
+        ("gate timeouts on every round", _synth(mutate=_all_rounds(lambda r: _edit(
+            r, lambda e: e[0] == "gate" and e[2][2] == 1, _set(3, 0)))), 1, "contended rounds",
+         None),
         # ── the shared core's transport and ownership controls ──
         ("dropped acquire/release pair (both copies)", _synth(omit=_pair_of(5)), 1,
          "missing records", None),
@@ -583,7 +592,12 @@ for r in range(1, ROUNDS + 1):
     if why:
         round_fail(r, why)
         continue
-    contended = bool(got_credit and g_w[0]["f"][3] == 1)
+    # The gates' bounded waits are graded, not assumed: the holder saw the waiter arrive (its marker
+    # copy done) before taking the lock, the waiter saw the holder inside its ownership, and the
+    # waiter's previous ICR write was accepted before it arrived. A gate that timed out leaves the
+    # round ineligible, with its reason recorded.
+    gate_ok = g_h[0]["f"][4] == 1 and g_w[0]["f"][3] == 1 and g_w[0]["f"][4] == 1
+    contended = bool(got_credit and gate_ok)
     if contended:
         credited[W] += 1
 
@@ -600,6 +614,9 @@ for r in range(1, ROUNDS + 1):
         continue
     if not out:
         uncredited.append("%d(no-request-under-mask)" % r)
+        continue
+    if not gate_ok:
+        uncredited.append("%d(gate-timeout)" % r)
         continue
     if not contended:
         uncredited.append("%d(uncontended)" % r)

@@ -518,6 +518,7 @@ fn the_smoke_and_grader_are_wired() {
         "unbalanced handler obligations",
         "had not settled the 0xF1 arrival",
         "second-sender-in-window",
+        "gate-timeout",
         "entries_with_tlb_work",
     ] {
         assert!(GRADER.contains(check), "the grader enforces: {check}");
