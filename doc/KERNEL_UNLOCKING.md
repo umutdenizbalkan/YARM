@@ -24838,6 +24838,13 @@ unbounded, and malformed evidence fails closed. The pinned OpenSBI identity and 
 contract are retained; the SMP3 seal still corroborates progress/results/context but no longer
 substitutes for any obligation above.
 
+> **Correction (QEMU-LOCK1-SEAL).** This chain was weaker than described above. The arrival hook
+> received only the CPU number and discharged the armed round on that CPU's *next* consumption,
+> whatever its swap removed, so an empty arrival or another source's work would have counted; and
+> the waiter published before the holder was inside its ownership, so "pending during the interval"
+> was inferred rather than observed. The grader also never modelled ownership as a whole: overlapping
+> owners, an unmatched release and a deleted round passed it. QEMU-LOCK1-SEAL (below) replaces both.
+
 ## 3 — controls
 
 The four reproductions are kept as self-tests, alongside grader controls for missing/substituted
