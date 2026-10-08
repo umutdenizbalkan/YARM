@@ -24909,3 +24909,163 @@ documented only after that package shipped).
   interrupt delivery; delivery is the holder's ordinary post-unmask arrival, now recorded and linked.
 * Two harts, one QEMU version, one firmware; no real hardware. The default-off hold/arrival
   instrumentation is labelled synchronization, not production behaviour, and every wait is finite.
+
+# QEMU-LOCK1-SEAL — complete ownership history and attributed IPI work
+
+Base: `a828a41a` (QEMU-LOCK1-ACCEPTANCE delivery, tree `71f1e3ce…`). U9 stays CLOSED: production
+`with_cpu=0`, `with_broad=0`. This package closes exactly two acceptance gaps — validation of the
+complete ownership history, and attribution of the consumed IPI work — without changing the
+production lock algorithm, its ownership boundaries, or the mailbox semantics. The changes are the
+default-off witness's observation metadata, two observation hooks at the production publication and
+consumption owners, the witness choreography (publish after the holder is inside its masked
+ownership), and the independent grader.
+
+## what the acceptance grader still admitted
+
+Three checksum-valid mutations of the delivered grader's own passing fixture passed it unchanged
+(`scripts/repro-lock1-delivered-grader.py`, run against `git show a828a41a:scripts/grade-riscv64-lock1-witness.py`):
+
+| mutation | delivered grader |
+|---|---|
+| the waiter acquires the lock while the holder's acquisition is still unreleased (overlapping owners) | `rc=0`, 6+6 credited |
+| a release with no preceding acquisition | `rc=0`, 6+6 credited |
+| an entire scheduled round (7) deleted | `rc=0`, 6+5 credited — coverage still met |
+
+The same harness confirms the four LOCK1-ACCEPTANCE reproductions stay rejected. The delivered
+grader selected a few events around the hold and never modelled ownership as a whole; it skipped a
+round with no records.
+
+The delivered **IPI attribution** was weaker than its documentation said. The arrival hook received
+only a CPU number and discharged the round on that CPU's *next* consumption whatever it swapped out —
+an empty arrival or another source's work would have counted. The waiter also published before the
+holder was inside its ownership, so "outstanding while masked" was inferred rather than observed.
+The LOCK1-ACCEPTANCE section's "coalescing-safe" delivery chain is corrected by this package.
+
+## 1 — the ownership model, and why its orderings hold
+
+Every recorded acquisition has an identity carried in the guard (a witness-only field) from its
+acquire record to its release record. An acquisition is recorded iff it succeeds while the round
+window is open; its release is then recorded unconditionally, so recorded pairs are always complete
+and no release is recorded for an unrecorded acquisition. The grader replays every acquire/release in
+record order and requires them to **strictly alternate**, each release naming the owning acquisition's
+id, CPU and round. That order is derived, not assumed: an acquire is recorded after the successful
+CAS; a release is recorded *before* the unlocking store (release intent); the release record's
+`fetch_add` happens-before the `Release` store, which synchronises with the next owner's `Acquire`
+CAS, which precedes that owner's acquire record — so the record counter, a single atomic, orders them.
+Overlapping owners, a release with no or the wrong owner, duplicate acquisition ids and unreleased
+acquisitions fail the boot. The handover is the next owner's own successful acquisition.
+
+Observations are attributed by the facts that actually order them:
+
+* a **hold** and the masked **pending** observation are made by the owner inside its acquisition
+  (program order), so each must fall inside that acquisition's acquire/release records, by the
+  designated holder, with `sstatus.SIE = 0`;
+* a **contention** record is made inside the observing CPU's own `lock()` call, before the CAS that
+  ends it, so it can never fall inside an interval that CPU owns, and that CPU's next acquisition is
+  the one the call completed. Its record may land after the owner's release record — an observer can
+  run after the atomic it describes — so the credited contention is attributed **by value**: the hold
+  records the contention-counter value it saw rise while it owned the lock, the waiter's contended
+  record carries the value it produced, and the waiter's gate record certifies its `lock()` call
+  began after the holder's CAS (it waited for `HELD_ROUND`, stored after the CAS).
+
+Multiple acquisitions per mapping operation (the guard-page query, then the install; the role-swapped
+contention on the install) are each ordinary intervals of the model. Every scheduled round must carry
+gate records from both designated harts, one hold and one pending observation by the holder, and
+completion records from both; a missing piece fails the boot. A round whose hold saw no contention is
+a valid uncontended outcome and earns no credit.
+
+## 2 — the consumed IPI work, attributed
+
+* **Publication.** The waiter now publishes only after its gate saw the holder inside its masked
+  ownership, through the production `send_reschedule`. That owner advances a per-(target, sender)
+  generation immediately *before* it sets the mailbox bit (after every refusal); only the sender ever
+  advances its own column, so the waiter reads back its publication's generation exactly.
+* **Outstanding while masked — observed, not inferred.** The holder, still owning the lock with
+  interrupts masked and after it saw the waiter's contention (which the waiter produced after
+  publishing), reads its own mailbox through the production non-consuming observer `ipi::pending` and
+  records whether the waiter's bit is outstanding and at which generation. Only then is a link armed;
+  arming over an unresolved link is recorded, never silent.
+* **Consumption.** `ipi::take_arrival` hands the witness the sources its swap actually removed. Only a
+  consumption that removed the linked sender's bit discharges the round; an empty arrival or an
+  unrelated source records and leaves it armed. Because `take_arrival` is the mailbox's only consumer
+  and the holder cannot trap while masked, the first consumption after arming necessarily removes the
+  outstanding bit — so any other first consumption is a contradiction and fails the boot.
+* **Generations and coalescing.** The consumption reads the sender's generation after its swap; it is
+  at least the round's generation (the bump precedes the bit). Later publications from the same sender
+  that coalesce into the same bit are valid; the claim made is only that *this round's* publication,
+  positively outstanding under the mask, was removed by *this* swap. A stale generation, the wrong
+  round, the wrong target, an arrival on a link that was never armed, or an armed link never
+  discharged all fail.
+
+The direct `sip.SSIP` reading remains reported corroboration.
+
+## 3 — controls
+
+The grader's `--self-test` carries the three new reproductions and the four earlier ones as
+regression cases (each failing for its own reason, checked by message), plus: missing holder acquire
+and release, duplicate acquisition id, a release naming another acquisition, contention inside the
+contender's own ownership, a hold outside its acquisition, a hold value no waiter produced,
+insufficient genuine contention, missing gate and completion records, wrong metadata, conflicting
+checksum-valid copies; empty and unrelated arrivals while armed, wrong-round (other holder's and a
+later same-hart round), wrong-target and stale-generation consumption, a publication consumed before
+the hold followed by an unrelated arrival, missing consumption, missing and mis-targeted publication,
+a pending generation that is not the round's, and an overwritten link. Positive fixtures pass with
+both dump passes, coalesced publications, a late contended observer record, role-swapped install
+contention and one valid uncontended round.
+
+The five live controls were re-run on the frozen candidate:
+
+| control | fails with |
+|---|---|
+| operations serialized | SMP3 `mut_operations_serialized` fails the seal the grader requires (contention itself is still genuine: 6+6) |
+| substituted owner (gate parity flipped) | every round's gate records name a holder other than the scheduled one: the round record is rejected, 0+0 credited |
+| suppressed IPI | contention still credits 6+6, but the masked mailbox read finds nothing outstanding: no link, 0+0 attributed deliveries |
+| owner never releases | the boot budget ends the run unsealed (external watchdog); no records, no credit |
+| corrupted resumed context | the corrupted task cannot complete; no valid seal within the budget, no credit |
+
+## 4 — qualification
+
+Frozen before qualification at **`8a0e853f`** (tree `797d10f1…`), from base `a828a41a` (tree
+`71f1e3ce…`); qualified in full on an isolated, clean worktree, every scheduled run retained, none
+replaced or re-run. Identity: features `riscv64-lock1-witness`; QEMU 8.2.2 (Debian
+`1:8.2.2+ds-0ubuntu1.18`), `-machine virt -cpu rv64 -smp 2`, `console=ttyS0 rdinit=/init
+yarm.ap_user_dispatch=1`; the pinned OpenSBI v1.3 generic `fw_dynamic` (`sha256 171a91cc…`); kernel
+`yarm-riscv64-lock1.bin` `sha256 28e527cc…` (ELF `6f62dd79…`) and `initramfs-core.cpio` `0f34c6be…`,
+identical in all six boots. 25 gates, **zero failures**:
+
+* **Six scheduled strict LOCK1 boots — three idle, three under the established LOCK1 host load (two
+  CPU-bound shell loops for one boot) — all sealed identically:** `rounds=12 credited_c_waits=6
+  credited_s_waits=6 delivered_c=6 delivered_s=6 ssip_rounds=12 result=ok`. Every round has a complete
+  ownership record; contention is credited in both directions in every round, and every round's
+  delivery is positively attributed (publication → outstanding under the mask → consumption that
+  removed it).
+* **Preserved pinned SMP3** — three idle SMP3 witness boots, all `result=ok` (`arrivals=41
+  consumed=41 empty=0`, `p2_credited` 6/6, 6/6, 6/5).
+* **RISC-V gates** — the core smoke (strict; demand paging and fork COW), the UART0→PLIC IRQ witness
+  and server death — all pass.
+* **Hosted suite single-threaded** (5985 passed, 0 failed, 2 ignored), **all 27 integration targets**
+  (270 passed, 0 failed, including the updated LOCK1 source guards), **`cargo fmt --check`** and the
+  **broad-lock census scanner** — all pass. **Three freestanding `kernel_boot` builds** (x86_64,
+  aarch64, riscv64) produce warning classes **identical to the fresh base `a828a41a`**.
+* **Regressions touched by the shared `ipi.rs` / `lock.rs` hooks** — SMP1 (x86_64), SMP2 (aarch64),
+  CONTEXT1 on both ports, and the overtaken-deferral witnesses on both ports — all pass.
+
+No freeze was discarded in this package; the five live controls (§3) ran on this candidate.
+
+## 5 — delivery and limits
+
+Delivered by ordinary fast-forward of `main` and `claude/yarm-kernel-unlock-u0-f2zh8p` after a fresh
+fetch and ancestry check; `14b61286` and every IRQ / context / SMP / LOCK / WIP ref are preserved; no
+force push, rebase, deletion or PR. The qualified **code** commit is the frozen candidate above; this
+record and the correction note in the LOCK1-ACCEPTANCE section arrive in two later
+**documentation-only** commits whose combined diff against it touches only this file.
+
+* Only acquisitions that succeed while a round window is open are recorded; the model covers those
+  (complete by construction), not the rest of the boot.
+* Contention records other than the credited one are checked for program-order consistency (never
+  inside the observer's own ownership); which owner each of them observed is not established.
+* The generation argument relies on one-sender-one-writer (sends from one CPU are sequential and the
+  waiter is masked while publishing) and on `take_arrival` being the mailbox's only consumer (its
+  `swap` is the only mutation of `PENDING` other than the two publishers' `fetch_or`). Both hold by
+  inspection of the frozen source; neither is enforced by a source guard.
+* One lock, two harts, one QEMU, the pinned firmware; no hardware, fairness or latency claim.
