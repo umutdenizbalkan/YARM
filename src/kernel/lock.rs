@@ -150,6 +150,13 @@ impl<T> SpinLockIrq<T> {
         }
     }
 
+    /// QEMU-LOCK3: this instance's address — the identity a witness can check against the one
+    /// instance it was told to expect (the id alone cannot tell two stamped instances apart).
+    #[cfg(feature = "lock-witness")]
+    fn instance(&self) -> usize {
+        self as *const Self as usize
+    }
+
     #[must_use = "if unused, the lock is immediately released when the guard is dropped"]
     pub fn lock(&self) -> SpinLockIrqGuard<'_, T> {
         // QEMU-LOCK1: `observed_held` becomes true the first time this acquisition sees the lock
@@ -163,6 +170,7 @@ impl<T> SpinLockIrq<T> {
                 #[cfg(feature = "lock-witness")]
                 if self.witness_id != 0 && !observed_held {
                     observed_held = true;
+                    crate::kernel::lock_witness::note_instance(self.witness_id, self.instance());
                     crate::kernel::lock_witness::note_contended(self.witness_id);
                 }
                 spin_loop();
@@ -179,6 +187,7 @@ impl<T> SpinLockIrq<T> {
                 // the guard so the release record names exactly this acquisition.
                 #[cfg(feature = "lock-witness")]
                 let witness_token = if self.witness_id != 0 {
+                    crate::kernel::lock_witness::note_instance(self.witness_id, self.instance());
                     let token = crate::kernel::lock_witness::note_acquired(self.witness_id);
                     // The default-off, bounded hold hook runs here — holding the lock, with
                     // supervisor interrupts masked — before the guard is handed back.

@@ -29,5 +29,11 @@ pub use crate::kernel::lock2_witness::{
 };
 #[cfg(feature = "x86_64-lock3-witness")]
 pub use crate::kernel::lock3_witness::{
-    VM_LOCK_ID, maybe_hold, note_acquired, note_contended, note_released,
+    VM_LOCK_ID, maybe_hold, note_acquired, note_contended, note_instance, note_released,
 };
+
+/// The acquiring instance's address, just before its contention or acquisition record. LOCK1 and
+/// LOCK2 identify their one instance by id alone and record nothing here.
+#[cfg(any(feature = "riscv64-lock1-witness", feature = "aarch64-lock2-witness"))]
+#[inline(always)]
+pub fn note_instance(_id: u32, _instance: usize) {}

@@ -54,7 +54,9 @@ MIN_PER_DIRECTION = 4  # credited contended rounds, and attributed deliveries, p
 KINDS = {"acquire", "contended", "release", "hold", "ipi", "entry", "pending", "gate", "done",
          "eoi", "begin", "icr"}
 LOCK_KINDS = {"acquire", "contended", "release", "hold"}
-CONT = {"s_gate": 0x200005f7, "s_nr3": 0x2000065f, "c_gate": 0x200005f1, "c_nr3": 0x20000659}
+CONT = {"s_nr3": 0x2000065f, "c_nr3": 0x20000659}
+OTHER_RIP = 0x200005f1  # a fixture continuation that is not the mapping syscall's
+INST = 0xffffffff81600040  # the fixtures' vm_state_lock address (the live one comes from META)
 
 
 # ── synthetic fixtures (self-test) ───────────────────────────────────────────────────────────
@@ -96,23 +98,23 @@ def _round(fx, r, ids, k, variant):
     a, b, c, d = ids
     t = fx.tlb[H]
     fx.add("gate", H, [r, H, 0, 1, 1])
-    fx.add("acquire", H, [1, r, a, 0, 0])
+    fx.add("acquire", H, [1, r, a, INST, 0])
     fx.add("begin", H, [r, a, 0, t, W])
     fx.add("gate", W, [r, H, 1, 1, 1])
     fx.add("icr", W, [H, VECTOR, t, 0, 0])
     fx.add("ipi", W, [r, H, VECTOR, 1, 0])
-    fx.add("contended", W, [1, r, k, 0, 0])
+    fx.add("contended", W, [1, r, k, INST, 0])
     fx.add("hold", H, [1, r, a, k, (k - 1) << 8])
     fx.add("pending", H, [r, W, VBIT << 32, t | (1 << 32), a])
     fx.add("release", H, [1, r, a, 0, 0])
-    fx.add("acquire", W, [1, r, b, 0, 0])
+    fx.add("acquire", W, [1, r, b, INST, 0])
     fx.add("release", W, [1, r, b, 0, 0])
-    fx.add("acquire", W, [1, r, c, 0, 0])
+    fx.add("acquire", W, [1, r, c, INST, 0])
     fx.add("release", W, [1, r, c, 0, 0])
     # The waiter's shootdown to the holder coalesces into the pending 0xF1 (answered in the holder's
     # own ACK wait, or — `tlb_at_entry` — left for the handler entry that delivers the reschedule).
     fx.tlb_send(W, H, serviced_in_wait=variant != "tlb_at_entry")
-    fx.add("acquire", H, [1, r, d, 0, 0])
+    fx.add("acquire", H, [1, r, d, INST, 0])
     fx.add("release", H, [1, r, d, 0, 0])
     fx.tlb_send(H, W)
     if variant == "late_entry":
@@ -146,10 +148,10 @@ def _synth(variant=None, mutate=None, omit=None, lines_mut=None, counts_mut=None
         logical = mutate(logical)
     omitted = omit(logical) if omit else set()
     n = len(logical)
-    meta = ("LOCK3_META vm_lock_id=1 rounds=%d slots_used=%d overflow=0 dump_cpu=1 vector=0xf1 "
-            "apic0=0 apic1=1 s_gate=0x%x s_nr3=0x%x c_gate=0x%x c_nr3=0x%x"
-            % (ROUNDS, n if meta_count is None else meta_count, CONT["s_gate"], CONT["s_nr3"],
-               CONT["c_gate"], CONT["c_nr3"]))
+    meta = ("LOCK3_META vm_lock_id=1 vm_lock=0x%x rounds=%d slots_used=%d overflow=0 dump_cpu=1 "
+            "vector=0xf1 apic=0,1 nr3=0x%08x,0x%08x"
+            % (INST, ROUNDS, n if meta_count is None else meta_count, CONT["s_nr3"],
+               CONT["c_nr3"]))
     ent = {c: sum(1 for e in logical if e[0] == "entry" and e[1] == c) for c in (0, 1)}
     eoi = {c: sum(1 for e in logical if e[0] == "eoi" and e[1] == c) for c in (0, 1)}
     last = {c: max([e[2][4] for e in logical if e[0] == "entry" and e[1] == c] or [0])
@@ -312,6 +314,12 @@ def _self_test():
             5, lambda e: e[0] == "release" and e[1] == H5)), 1, "overlapping owners", None),
         ("wrong lock (an acquisition names another lock)", _synth(mutate=_edit(
             5, lambda e: e[0] == "acquire" and e[1] == H5, _set(0, 2))), 1, "not the VM lock", None),
+        ("wrong lock instance (the hold's acquisition is another instance)", _synth(mutate=_edit(
+            5, lambda e: e[0] == "acquire" and e[1] == H5, _set(3, INST + 0x40))), 1,
+         "not vm_state_lock", None),
+        ("substituted lock (every record names another instance)", _synth(mutate=lambda ev: [
+            [k, h, (f[:3] + [INST + 0x1000] + f[4:]) if k in ("acquire", "contended") else f]
+            for k, h, f in ev]), 1, "not vm_state_lock", None),
         ("wrong owner (the hold recorded by the waiter)", _synth(mutate=_edit(
             5, K("hold"), lambda e: [e[0], W5, e[2]])), 1, "designated holder", None),
         ("deleted scheduled round", _synth(mutate=lambda ev: [
@@ -371,7 +379,7 @@ def _self_test():
             _drop(5, lambda e: e[0] == "icr" and e[1] == W5)(ev))), 1,
          "no production publication", None),
         ("delivery on another continuation (not the mapping syscall's)", _synth(mutate=_edit(
-            5, DELIV5, _set(1, CONT["c_gate"]))), 1, "continuation", None),
+            5, DELIV5, _set(1, OTHER_RIP))), 1, "continuation", None),
         ("progress before the delivery (round-done precedes the entry)", _synth(mutate=_move_after(
             5, lambda e: e[0] == "done" and e[1] == H5, K("pending"))), 1, "stale", None),
         ("suppressed reschedule IPI on every round (contention only)", _synth(mutate=_all_rounds(
@@ -442,19 +450,25 @@ if not (seal.startswith("SMP1_WITNESS_SEAL ") and " mutual_rounds=%d " % ROUNDS 
         and seal.endswith("result=ok")):
     fail("the SMP1 grader did not seal this boot with %d mutual rounds: %r" % (ROUNDS, seal[-160:]))
 
-META_RX = re.compile(r"^LOCK3_META vm_lock_id=(?P<lock>\d+) rounds=(?P<rounds>\d+) "
+META_RX = re.compile(r"^LOCK3_META vm_lock_id=(?P<lock>\d+) vm_lock=0x(?P<instance>[0-9a-f]+) "
+                     r"rounds=(?P<rounds>\d+) "
                      r"slots_used=(?P<slots_used>\d+) overflow=(?P<overflow>\d+) "
                      r"dump_cpu=(?P<dump_cpu>\d+) vector=0x(?P<vector>[0-9a-f]+) "
-                     r"apic0=(?P<apic0>\d+) apic1=(?P<apic1>\d+) s_gate=0x(?P<s_gate>[0-9a-f]+) "
-                     r"s_nr3=0x(?P<s_nr3>[0-9a-f]+) c_gate=0x(?P<c_gate>[0-9a-f]+) "
-                     r"c_nr3=0x(?P<c_nr3>[0-9a-f]+)$")
+                     r"apic=(?P<apic0>\d+),(?P<apic1>\d+) nr3=0x(?P<s_nr3>[0-9a-f]+),"
+                     r"0x(?P<c_nr3>[0-9a-f]+)$")
 COUNTS_RX = re.compile(r"^LOCK3_COUNTS cpu=(?P<cpu>\d+) entries=(?P<entries>\d+) eois=(?P<eois>\d+) "
                        r"arrivals=(?P<arrivals>\d+) tlb_req_gen=(?P<tlb>\d+) "
                        r"settled=(?P<settled>\d+)$")
 meta, recs, sums = transport(lines, "LOCK3", META_RX, fail, summary=(COUNTS_RX, "cpu"))
+if meta is None and any(l.strip().startswith("LOCK3_META ") for l in lines):
+    fail("LOCK3_META copies exist but none is intact (a truncated or damaged line)")
 apic = {0: 0, 1: 1}
 cont = {}
+vm_lock = None
 if meta is not None:
+    vm_lock = int(meta.group("instance"), 16)
+    if not vm_lock:
+        fail("LOCK3_META does not name the vm_state_lock instance")
     if int(meta.group("lock")) != VM_LOCK_ID:
         fail("LOCK3_META names vm_lock_id=%s, not %d" % (meta.group("lock"), VM_LOCK_ID))
     if int(meta.group("rounds")) != ROUNDS:
@@ -467,9 +481,9 @@ if meta is not None:
     apic = {0: int(meta.group("apic0")), 1: int(meta.group("apic1"))}
     if apic != {0: 0, 1: 1}:
         fail("LOCK3_META APIC ids %s: the ICR records assume CPU index = APIC id" % apic)
-    cont = {k: int(meta.group(k), 16) for k in ("s_gate", "s_nr3", "c_gate", "c_nr3")}
-    if len(set(cont.values())) != 4 or not all(cont.values()):
-        fail("LOCK3_META continuation addresses are not four distinct VAs: %s" % cont)
+    cont = {k: int(meta.group(k), 16) for k in ("s_nr3", "c_nr3")}
+    if len(set(cont.values())) != 2 or not all(cont.values()):
+        fail("LOCK3_META continuation addresses are not two distinct VAs: %s" % cont)
 nr3 = {0: cont.get("c_nr3"), 1: cont.get("s_nr3")}
 
 ev = [recs[k] for k in sorted(recs)]
@@ -477,6 +491,13 @@ check_events(ev, KINDS, (0, 1), VM_LOCK_ID, fail)
 by = lambda kind: [e for e in ev if e["kind"] == kind]
 acqs = ownership(ev, ROUNDS, fail)
 contention_outside_own(ev, acqs, ROUNDS, fail)
+# One lock instance: every recorded acquisition and contention names vm_state_lock's own address
+# (published by the bootstrap that built it), not merely the witness id.
+for e in ev:
+    if e["kind"] in ("acquire", "contended") and e["f"][3] != vm_lock:
+        fail("seq %d: the %s names lock instance 0x%x, not vm_state_lock 0x%x"
+             % (e["seq"], e["kind"], e["f"][3], vm_lock or 0))
+        break
 
 # ── the handler's own records, per CPU: entry/EOI strictly paired, ordinals contiguous ─────────
 entries_total = eois_total = tlb_entries = 0

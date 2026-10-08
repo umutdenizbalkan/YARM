@@ -104,7 +104,12 @@ fn the_witness_is_gated_and_off_by_default() {
     )));
     assert!(squash(&code(FACADE)).contains(&squash(
         "#[cfg(feature = \"x86_64-lock3-witness\")] pub use crate::kernel::lock3_witness::{ \
-         VM_LOCK_ID, maybe_hold, note_acquired, note_contended, note_released, };"
+         VM_LOCK_ID, maybe_hold, note_acquired, note_contended, note_instance, note_released, };"
+    )));
+    // LOCK1 and LOCK2 record no instance: the extra hook is an empty inline function for them.
+    assert!(squash(&code(FACADE)).contains(&squash(
+        "#[cfg(any(feature = \"riscv64-lock1-witness\", feature = \"aarch64-lock2-witness\"))] \
+         #[inline(always)] pub fn note_instance(_id: u32, _instance: usize) {}"
     )));
     for pair in [
         "riscv64-lock1-witness and aarch64-lock2-witness are mutually exclusive",
@@ -118,6 +123,48 @@ fn the_witness_is_gated_and_off_by_default() {
     let l = code(LOCK);
     assert!(l.contains("crate::kernel::lock_witness::maybe_hold(self.witness_id, token);"));
     assert!(!l.contains("lock3_witness"));
+    // The instance address is handed over immediately before each id-only record, by the same CPU.
+    assert_eq!(
+        l.matches("lock_witness::note_instance(self.witness_id, self.instance());")
+            .count(),
+        2
+    );
+    let body = code(fn_body(
+        LOCK,
+        "pub fn lock(&self) -> SpinLockIrqGuard<'_, T> {",
+    ));
+    let i1 = pos(&body, "note_instance(self.witness_id, self.instance());");
+    assert!(i1 < pos(&body, "lock_witness::note_contended(self.witness_id);"));
+    let i2 = i1
+        + 1
+        + pos(
+            &body[i1 + 1..],
+            "note_instance(self.witness_id, self.instance());",
+        );
+    assert!(i2 < pos(&body, "lock_witness::note_acquired(self.witness_id);"));
+    assert!(squash(&code(LOCK)).contains(&squash(
+        "#[cfg(feature = \"lock-witness\")] fn instance(&self) -> usize { self as *const Self as usize }"
+    )));
+    // The instance the records must name is the static state's own field, published at its
+    // construction.
+    assert!(WITNESS.contains("pub fn record_vm_lock_instance(addr: usize) {"));
+    // The META line, with its ` pass=N crc=0x…` tail, must fit one printk record (`PRB_MSG_MAX`):
+    // a truncated line is damaged and the dump's metadata lost. Widest values: every decimal field
+    // is at most four digits (slots <= 1024, APIC ids <= 255); the instance is 16 hex digits, the
+    // vector two and the two continuations (user VAs below 4 GiB) eight.
+    let meta = &WITNESS[pos(WITNESS, "\"LOCK3_META ")..];
+    let meta = &meta[1..pos(meta, "\",")];
+    let widest = meta
+        .replace("0x{:x}", "0xffffffffffffffff")
+        .replace("0x{:08x}", "0xffffffff")
+        .replace("0x{:02x}", "0xff")
+        .replace("{}", "9999");
+    assert!(
+        widest.len() + " pass=2 crc=0x00000000".len() <= 192,
+        "META too long: {}",
+        widest.len()
+    );
+    assert!(GRADER.contains("not vm_state_lock"));
 }
 
 /// x86 masking, from source: `irq_save` is `pushfq; cli` and `irq_restore` executes `sti` only if
@@ -214,9 +261,21 @@ fn the_handler_records_entry_and_eoi_without_calls_or_acquisitions() {
                 );
             }
         }
-        // Only the ISR (word 7) and IRR (word 7) are read from the LAPIC page.
+        // Only the ISR (word 7) and IRR (word 7) are read from the LAPIC page: one base load, two
+        // 32-bit loads through it, and no store through the register that holds it.
+        assert_eq!(
+            b.matches("{lapic_eoi}").count(),
+            1,
+            "{name}: one LAPIC base load"
+        );
         assert_eq!(b.matches("[rcx + 0x1C0]").count(), 1);
         assert_eq!(b.matches("[rcx + 0xC0]").count(), 1);
+        for l in b.lines().map(str::trim) {
+            assert!(
+                !(l.starts_with("mov dword ptr [rcx") || l.starts_with("mov qword ptr [rcx")),
+                "{name}: a store through the LAPIC base register: `{l}`"
+            );
+        }
         assert!(b.contains("cmp byte ptr [rip + YARM_LOCK3_ARMED], 0"));
         assert!(b.contains("lock xadd dword ptr [rip + YARM_LOCK3_NEXT]"));
         // The slot is published last.
@@ -452,7 +511,6 @@ fn the_smp1_hooks_and_round_count_are_gated() {
     let l3 = pos(a, ".if YARM_LOCK3\n    /* The kernel's round gate");
     let seq = [
         "lea rdi, [rip + \\pfx\\()_m_l3_gate]",
-        "\\pfx\\()_l3_gate_ret:",
         "SMP1_SET_CALLEE \\p",
         "SMP1_REPLACE_W \\capB",
         "\\pfx\\()_l3_nr3_ret:",

@@ -52,10 +52,13 @@ pub const RESCHED_VECTOR: u32 = 0xF1;
 
 /// Bounds on the hold hook's extension, on the waiter gate, and on the `IRR` observation (which only
 /// covers the ICR write landing at the holder's local APIC — never delivery: the holder stays masked
-/// throughout and the loop exits the instant the bit is seen).
+/// throughout and the loop exits the instant the bit is seen). The waiter publishes before it
+/// returns to ring 3 and contends, so the bit is normally already set when the poll starts; the
+/// bound is spent only when nothing was published (each read is an emulated MMIO access — 10 M of
+/// them held a round for ~25 s under TCG).
 const HOLD_SPINS: u64 = 20_000_000;
 const GATE_SPINS: u64 = 40_000_000;
-const PEND_SPINS: u64 = 10_000_000;
+const PEND_SPINS: u64 = 1_000_000;
 /// Bound on the dump's wait for the other CPU to finish an arrival it has entered.
 const QUIESCE_SPINS: u64 = 50_000_000;
 
@@ -63,10 +66,11 @@ pub const SLOTS: usize = 1024;
 pub const MAX_CPU: usize = 8;
 
 // ── event kinds (`hart` is always the recording CPU) ─────────────────────────────────────────
-/// `[lock_id, round, acq, 0, 0]` — recorded AFTER the successful CAS.
+/// `[lock_id, round, acq, instance, 0]` — recorded AFTER the successful CAS; `instance` is the
+/// acquired lock's address.
 pub const K_ACQUIRE: u8 = 1;
-/// `[lock_id, round, k, 0, 0]` — the acquiring CPU observed the lock HELD; `k` is the contention
-/// counter value this observation produced.
+/// `[lock_id, round, k, instance, 0]` — the acquiring CPU observed the lock HELD; `k` is the
+/// contention counter value this observation produced.
 pub const K_CONTENDED: u8 = 2;
 /// `[lock_id, round_of_acq, acq, 0, 0]` — release INTENT, recorded BEFORE the unlocking store.
 pub const K_RELEASE: u8 = 3;
@@ -161,15 +165,23 @@ static ROUND_OK: AtomicU8 = AtomicU8::new(0);
 static LAST_HELD_ROUND: AtomicU64 = AtomicU64::new(0);
 static ACQ_NEXT: AtomicU64 = AtomicU64::new(0);
 
-/// The continuation VAs the programs return to after the round's two syscalls (META only).
-static CONT: [AtomicU64; 4] = [ZERO_U64; 4];
+/// The continuation VAs the two programs return to after the round's NR 3 (META only).
+static CONT: [AtomicU64; 2] = [ZERO_U64; 2];
+/// The address of the live `KernelState::vm_state_lock`, published at witness provisioning.
+static VM_LOCK_INSTANCE: AtomicU64 = AtomicU64::new(0);
+/// Per CPU: the witnessed instance this CPU is about to record a contention or acquisition of.
+static INSTANCE: [AtomicU64; MAX_CPU] = [ZERO_U64; MAX_CPU];
+
+pub fn record_vm_lock_instance(addr: usize) {
+    VM_LOCK_INSTANCE.store(addr as u64, Ordering::Release);
+}
 
 pub fn arm() {
     YARM_LOCK3_ARMED.store(true, Ordering::Release);
 }
 
-/// `[server gate, server NR3, client gate, client NR3]` return addresses, for the dump's metadata.
-pub fn record_continuations(c: [u64; 4]) {
+/// `[server NR 3, client NR 3]` return addresses, for the dump's metadata.
+pub fn record_continuations(c: [u64; 2]) {
     for (d, v) in CONT.iter().zip(c) {
         d.store(v, Ordering::Release);
     }
@@ -264,6 +276,23 @@ fn apic_id(cpu: u8) -> u64 {
 
 // ── the lock-path hooks (called from `SpinLockIrq` for the witnessed instance only) ──────────
 
+/// The instance about to be recorded (its address), by this CPU — read back by the next contention
+/// or acquisition record on this CPU.
+pub fn note_instance(id: u32, instance: usize) {
+    if id != VM_LOCK_ID {
+        return;
+    }
+    if let Some(cell) = INSTANCE.get(this_cpu() as usize) {
+        cell.store(instance as u64, Ordering::Relaxed);
+    }
+}
+
+fn instance() -> u64 {
+    INSTANCE
+        .get(this_cpu() as usize)
+        .map_or(0, |c| c.load(Ordering::Relaxed))
+}
+
 /// The acquisition observed the lock already HELD. Recorded once per `lock()` call, inside an open
 /// round window.
 pub fn note_contended(id: u32) {
@@ -274,7 +303,13 @@ pub fn note_contended(id: u32) {
     record(
         K_CONTENDED,
         this_cpu(),
-        [u64::from(id), ROUND.load(Ordering::Acquire), k, 0, 0],
+        [
+            u64::from(id),
+            ROUND.load(Ordering::Acquire),
+            k,
+            instance(),
+            0,
+        ],
     );
 }
 
@@ -286,7 +321,11 @@ pub fn note_acquired(id: u32) -> u64 {
     }
     let round = ROUND.load(Ordering::Acquire);
     let acq = ACQ_NEXT.fetch_add(1, Ordering::AcqRel) + 1;
-    record(K_ACQUIRE, this_cpu(), [u64::from(id), round, acq, 0, 0]);
+    record(
+        K_ACQUIRE,
+        this_cpu(),
+        [u64::from(id), round, acq, instance(), 0],
+    );
     (round << 32) | (acq & 0xffff_ffff)
 }
 
@@ -580,19 +619,18 @@ pub fn dump() {
     let mut lines: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::with_capacity(n + 4);
     let cont = |i: usize| CONT[i].load(Ordering::Acquire);
     lines.push(alloc::format!(
-        "LOCK3_META vm_lock_id={} rounds={} slots_used={} overflow={} dump_cpu={} vector=0x{:x} apic0={} apic1={} s_gate=0x{:x} s_nr3=0x{:x} c_gate=0x{:x} c_nr3=0x{:x}",
+        "LOCK3_META vm_lock_id={} vm_lock=0x{:x} rounds={} slots_used={} overflow={} dump_cpu={} vector=0x{:02x} apic={},{} nr3=0x{:08x},0x{:08x}",
         VM_LOCK_ID,
+        VM_LOCK_INSTANCE.load(Ordering::Acquire),
         LOCK3_ROUNDS,
         n,
         u8::from(overflow),
         me,
-        RESCHED_VECTOR,
+        RESCHED_VECTOR as u8,
         apic_id(0),
         apic_id(1),
-        cont(0),
-        cont(1),
-        cont(2),
-        cont(3)
+        cont(0) as u32,
+        cont(1) as u32
     ));
     for (i, slot) in YARM_LOCK3_SLOT.iter().enumerate().take(n) {
         let mut left = 10_000_000u64;

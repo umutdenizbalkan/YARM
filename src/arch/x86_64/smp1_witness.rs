@@ -85,24 +85,24 @@ unsafe extern "C" {
 
 #[cfg(all(not(feature = "hosted-dev"), feature = "x86_64-lock3-witness"))]
 unsafe extern "C" {
-    static smp1s_l3_gate_ret: u8;
     static smp1s_l3_nr3_ret: u8;
-    static smp1c_l3_gate_ret: u8;
     static smp1c_l3_nr3_ret: u8;
 }
 
-/// QEMU-LOCK3: the user VAs (the programs run at 0x2000_0000) the round's gate and NR 3 syscalls
-/// return to — `[server gate, server NR 3, client gate, client NR 3]`.
+/// QEMU-LOCK3: the user VAs (the programs run at 0x2000_0000) the round's NR 3 returns to —
+/// `[server, client]` — the continuation a deferred reschedule IPI must interrupt.
 #[cfg(all(not(feature = "hosted-dev"), feature = "x86_64-lock3-witness"))]
-fn lock3_continuations() -> [u64; 4] {
+fn lock3_continuations() -> [u64; 2] {
     let at = |label: *const u8, start: *const u8| 0x2000_0000 + (label as u64 - start as u64);
-    let s = &raw const yarm_smp1_server_start;
-    let c = &raw const yarm_smp1_client_start;
     [
-        at(&raw const smp1s_l3_gate_ret, s),
-        at(&raw const smp1s_l3_nr3_ret, s),
-        at(&raw const smp1c_l3_gate_ret, c),
-        at(&raw const smp1c_l3_nr3_ret, c),
+        at(
+            &raw const smp1s_l3_nr3_ret,
+            &raw const yarm_smp1_server_start,
+        ),
+        at(
+            &raw const smp1c_l3_nr3_ret,
+            &raw const yarm_smp1_client_start,
+        ),
     ]
 }
 

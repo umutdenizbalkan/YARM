@@ -34,8 +34,8 @@
  * instead of four; before its NR 3 each task issues `SMP1_LOCK3_GATE` (DebugLog, rdx = round —
  * the kernel's round gate), loads its callee-saved and FXSAVE patterns, and after NR 3 checks
  * the result, the callee-saved registers and its FXSAVE image on the continuation a deferred
- * reschedule IPI interrupts, then reports `SMP1_LOCK3_DONE` (rdx = round). The labels
- * `<pfx>_l3_gate_ret` / `<pfx>_l3_nr3_ret` are the two syscalls' return addresses.
+ * reschedule IPI interrupts, then reports `SMP1_LOCK3_DONE` (rdx = round). `<pfx>_l3_nr3_ret` is
+ * the NR 3 return address the kernel publishes to the grader.
  *
  * MBX words: serial  +0x00 started  +0x08 primed  +0x10 done  +0x18 observed   (round numbers)
  *            mutual  +0x20/+0x28 ready (server/client)  +0x30/+0x38 nr3 returned
@@ -345,7 +345,6 @@
     sub rsi, rdi
     mov rdx, rbx
     syscall
-\pfx\()_l3_gate_ret:
     mov edi, SMP1_PAT
     mov qword ptr [rdi + 0x318], rbx
     fxrstor64 [rdi]
@@ -620,9 +619,7 @@ yarm_smp1_client_end:
     .global yarm_smp1_client_server_as_cap
     .global yarm_smp1_client_server_as_cap_m
 .if YARM_LOCK3
-    .global smp1s_l3_gate_ret
     .global smp1s_l3_nr3_ret
-    .global smp1c_l3_gate_ret
     .global smp1c_l3_nr3_ret
 .endif
     .popsection

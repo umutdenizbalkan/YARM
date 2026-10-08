@@ -2247,6 +2247,12 @@ impl KernelState {
             }
         }
         self.copy_to_user(server_asid, VirtAddr(w::MBX_VA), &[0u8; 0x100])?;
+        // QEMU-LOCK3: the one instance the records must name — this live state's own field (the
+        // bootstrap copy is moved into the shared kernel before any task runs).
+        #[cfg(feature = "x86_64-lock3-witness")]
+        crate::kernel::lock3_witness::record_vm_lock_instance(core::ptr::addr_of!(
+            self.vm_state_lock
+        ) as usize);
         w::record_targets(server_asid.0, r_frames[0], client_asid.0, r_frames[1]);
         crate::yarm_log!(
             "SMP1_WITNESS_PROVISIONED server_tid={} server_asid={} client_tid={} client_asid={} mbx_phys=0x{:x} server_image={} client_image={}",
