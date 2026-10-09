@@ -25678,7 +25678,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL3b — futex check-and-park contract | fixed and delivered (qualified `4c50a864`) | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed); revert control fails the park-window case |
 | BL3c — hosted ack-lease intermittent failure | fixed and delivered (qualified `031f6b32` + `69d2746f`) | classified PRODUCTION: a stale `release` / entitled `consume` decided on the endpoint generation, then the state, then exchanged the state alone, so a slot recycled for the same index's next incarnation in between was retired or consumed; forced deterministically with `race_hook`, three regressions fail on the unrepaired store |
 | BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | fixed and delivered (qualified `53a5b112` + `bcf5e1d2` rustfmt) | the non-preempting idle advance was compiled out on RISC-V, so a deadline that expired on an idle tick readied a task the same trap then left queued until the next PREEMPTING tick; the unrepaired kernel with only the observer leaves 5,094 idle settlements with a runnable task queued, the repaired one 0 (about 2,800 non-preempting advances per boot); two strict witnesses that leaned on the defect corrected at the witness, no floor lowered |
-| BL4b — scheduler quantum / hardware deadline coupling | to verify | |
+| BL4b — scheduler quantum / hardware deadline coupling | fixed and delivered (qualified `b5138562`; AArch64 core cells re-qualified on `8e7c12eb`) | the shipped quantum (timer interrupts per slice) WAS the hardware-deadline constant in each port's timer units, so a preempting tick came after 50M interrupts on x86_64 and 3.1M on AArch64; the true base gives no preempting tick within 1,024 interrupts. Separated into two documented constants per port, quantum about 100 ms; time-slice preemption is now live on x86_64 and AArch64 |
 | BL5a — reply-timeout retirement checker count/scope failures | to verify | |
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | to verify | |
 | BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
@@ -25687,6 +25687,8 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open — intermittent | failed on true base `c44e9b46` (2/2) and on the first BL4a freeze `9b5838c4`; passed on `e2f4e52b` and `53a5b112` (`RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok`), so boot-order dependent, not closed by BL4a |
 | BL6c — AArch64 timer5 witness capture is stopped early by the core smoke | confirmed open (found in BL4a qualification) | `qemu-aarch64-core-smoke.sh` stops QEMU 2 s after the FIRST `SCHED_ENTER_IDLE_HLT`; the timer5 summary arrives 6,962 lines later on base and candidate alike, so whether it is captured is host speed alone: true base `af24e403` 1 pass / 3 fail, candidate 2 pass / 2 fail. The runner must stop on the witness's own completion instead |
 | BL6d — RISC-V UART idle-origin items race a deadline dispatch | bounded (found in BL4a qualification) | after BL4a the idle tick dispatches the core supervisor whose one- to three-tick receive deadline it expires; a host byte delivered two or three ticks after injection lands on it (`idle_origin=3 user_origin=5`). With the quiet-window acknowledgement: 7 of 8 boots pass (31 of 32 idle items). Base hides it (the tick stranded the supervisor). Removing it needs the kernel to hold the source until a quiet idle boundary |
+| BL6e — the x86_64 and AArch64 overtaken-deferral witnesses assume an unconditional futex park | confirmed open (found in BL4b qualification) | both user programs say `FutexWait(addr, expected = observed = r15/x20): the kernel parks unconditionally`; since BL3b the kernel parks only while the word still holds `expected`, so every W wait returns at once (`not_blocked`, 336,852 times in one boot), K never wakes anyone (`k_woke=0`), and the DONE park that emits the sealed summary never happens. Fails identically on true base `d3012203` (both ports). The programs must store the expected value before waiting |
+| BL6f — the x86_64 and RISC-V terminal-fault witnesses still assume a replacement exists | latent (found in BL4b qualification) | the AArch64 checker was corrected (see BL4b); the other two still require the drain after init's fault to select a replacement and would misreport a genuinely empty queue. They pass today; no empty-queue sample exists to derive their exact chain from |
 
 ### BL1 — multi-page shared-region mapping
 
@@ -26162,3 +26164,85 @@ corrected at the witness, with no floor lowered:
 * *Format:* failed on the frozen tree, on rustfmt line-wrapping of the new witness function.
   `bcf5e1d2` applies it (whitespace and one trailing comma).
 * *Delivery:* `53a5b112`, then `bcf5e1d2`, then this documentation commit.
+
+### BL4b — the scheduling quantum and the hardware deadline are two constants
+
+**Defect (verified on `d3012203`).** `sched_quantum_ticks()` returned `BOOTSTRAP_TIMER_DEADLINE_TICKS`
+when no override was set, and `Timer::new(quantum)` counts TIMER INTERRUPTS (`tick_and_check`
+decrements once per interrupt). The same constant is the HARDWARE deadline the timer route programs,
+in the port's own timer units, so a running task was preempted only after:
+
+| port | constant | its hardware meaning | interrupts per quantum |
+|---|---|---|---|
+| x86_64 | 50_000_000 | LAPIC initial count at divide-by-16, 62.5 MHz on QEMU: 0.8 s | 50,000,000 (about 1.3 years) |
+| AArch64 | 3_125_000 | `CNTP_TVAL` at 62.5 MHz: 50 ms | 3,125,000 (about 43 hours) |
+| RISC-V | 10 | none: the hardware path ignored the argument and re-armed `DEFAULT_TICK_INTERVAL` (100_000, 10 ms) | 10 |
+
+Time-slice preemption was therefore off on x86_64 and AArch64. U9-TIMER1 recorded the coupling and
+added the `yarm.sched_quantum_ticks` override as a test lever, without separating the default. One
+code comment (`≈ 3 ms/tick`) was also wrong by about 250×.
+
+**Repair.** Each port's layout now carries two constants in two units, each documented with what it
+counts and what it means on QEMU:
+
+* `BOOTSTRAP_TIMER_DEADLINE_TICKS` is the hardware deadline, in timer units: x86_64 50_000_000,
+  AArch64 3_125_000, and RISC-V 100_000. RISC-V's value is now the period it really programs, held
+  equal to `timer::DEFAULT_TICK_INTERVAL` by a compile-time assertion.
+* `SCHED_QUANTUM_TICKS` is the quantum, in interrupts. The contract is about 100 ms and never less
+  than one interrupt: x86_64 1 (one 0.8 s period), AArch64 2, RISC-V 10 (unchanged).
+
+`sched_quantum_ticks()` resolves the quantum constant and never reads the deadline. The hardware
+deadline is still programmed by the timer route alone, from its own constant, and the override still
+reaches only the quantum. Tick, claim/ack, re-arm and task-state accounting are untouched; only the
+number of interrupts that make a slice changed.
+
+**Evidence.**
+
+* *Regression:* `bl4b_an_unconfigured_kernel_preempts_after_its_quantum_of_interrupts` drives the real
+  tick seam on a freshly booted kernel. The preempting tick must be exactly the `SCHED_QUANTUM_TICKS`-th
+  interrupt. The same probe on the true base fails: no preempting tick within 1,024 interrupts.
+* *Guards:* `the_quantum_and_the_hardware_deadline_are_the_same_constant` pinned the coupling and is
+  re-derived as `…_are_separate_constants`. It pins both constants per port, the owner, the RISC-V
+  equality and the deadline's independence from any quantum, and weakens nothing.
+* *One hosted test* (`trap_entry_restores_tls_for_resumed_thread`) took a timer trap expecting the same
+  thread back. That held only while the tick never preempted. It now installs a long quantum through
+  the existing seam, because its subject is the TLS restore.
+
+**Witnesses that assumed a never-preempting schedule**, corrected at the checker with every obligation
+kept exact:
+
+* *U9-RX4 (x86_64 and AArch64 core smokes).* Both pinned the witnessed one-shot reply cap as the literal
+  `65538`. The value is PM's local cap slot at its reuse generation: 0x1_0002 when tid 2's query is
+  PM's first reply, 0x4_0002 once init's calls reach PM first, which happens as soon as the quantum
+  preempts. The x86_64 strict core failed with every piece of evidence present and consistent. The cap
+  is now read from the single receive of tid 2's query. It must be minted for PM exactly once and
+  before that receive, resolved once and revoked once. Seven mutated logs (each piece missing,
+  duplicated, reordered or substituted) are all rejected. The AArch64 evaluator's self-test now
+  accepts 4 cases and rejects 12.
+* *U9-FT4 (AArch64 terminal fault).* It required the drain after init's fault to select a replacement.
+  With preemption the other boot tasks can have run and blocked first, so the queue is genuinely
+  empty. The selection step says so itself (`DECLINED reason=idle`, never `NoneAcceptable`) and the
+  drain settles post-lock idle. The ending is read from the first selection after the terminal commit,
+  and each ending is held to its own exact chain with the other ending's markers absent. A real
+  replacement-ending log (BL2 qualification, and true base) is accepted. Six mutations are rejected:
+  queue not empty, settlement missing, duplicated step, idle drain that also selects, ownerless
+  re-fault, and the faulted task as replacement. The lookup no longer dies silently under `pipefail`.
+  The x86_64 and RISC-V twins are recorded as BL6f.
+
+**Qualification (frozen `b5138562`, base `d3012203`, fresh worktrees).**
+
+* *Base probe:* fails on the true base, as intended.
+* *Strict cores:* x86_64 2/2 (timer-contract witness sealed, U9-RX4 on cap 262146), AArch64 2/2,
+  RISC-V.
+* *Timer5:* all three ports. *CONTEXT1:* x86_64 and AArch64. *SMP:* x86_64 SMP1 and LOCK3, AArch64
+  SMP2 and LOCK2, RISC-V SMP3 (`ipi_to_c=8`) and LOCK1.
+* *Device and IPC:* x86_64 UART (4/4) and AP cross-CPU reply; AArch64 PL011 (4/4) and exit;
+  xfer2 x86_64 and AArch64; ipccall x86_64 and AArch64.
+* *Oracle cells:* x86_64 terminal fault; AArch64 futex wake and wait.
+* *Suites:* hosted 6,002 passed; integration 292/292; census 9/9; ABI. Freestanding warnings are
+  identical to base on all three ports (219 / 247 / 229).
+* *AArch64 terminal fault* failed on `b5138562` (U9-FT4 above). After `8e7c12eb` (script only) all five
+  AArch64 core cells were re-run: strict 2/2, futex wake and wait, terminal fault 2/2, each through the
+  empty-queue ending; true base takes the replacement ending (tid 2).
+* *Overtaken witnesses* (x86_64, AArch64) fail identically on true base: BL6e, not this change.
+
