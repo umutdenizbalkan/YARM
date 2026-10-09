@@ -25672,7 +25672,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 |---|---|---|
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | confirmed open — blocked on an ABI decision | see BL1 "Not changed"; every in-tree sender passes offset 0 |
-| BL2 — x86 user port-I/O fault containment | fixed (this section, BL2) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
+| BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | confirmed open (from source) | `EXC_ILLEGAL_INSTRUCTION` decodes to `Unknown`; the pre-lock bridge settles `Unknown` fatally; the per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad `handle_trap_entry`, unreachable since U9 closed. Not reproduced live; the BL2 route is the owner it should reach |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | to verify | |
 | BL3b — futex check-and-park contract | to verify | |
@@ -25814,6 +25814,16 @@ region); and a composition guard (bridge route under the trap authority, one sha
 body, no page-fault owner on the instruction route, the Unknown route still `unknown_trap_fatal`).
 Seven existing source guards were re-derived against the extracted body, each with its reason in
 place; none was weakened.
+
+**Qualification** (frozen `f9096ff7`, tree `367b44f5`; fresh isolated worktrees and artifacts;
+base `adc37ab7`). Every scheduled gate passed, none re-run: the five BL2 hosted cases; the port-I/O
+witness twice on the candidate, and once on `adc37ab7` with only the witness plumbing applied, which
+panics (`strict unknown trap policy: cpu=0 arch_code=0xd`); the preserved terminal-fault cells —
+x86_64 read, fetch and waiter, AArch64 U9-FT4, RISC-V — over the moved settlement body; strict core
+smokes on all three ports (x86_64 in its timer-contract-witness profile); the x86_64 IRQ3 UART,
+CONTEXT1 and SMP1 seals; `cargo fmt --check`; the full hosted suite (5994); the integration suite;
+the ABI crate (211); the census scanner (U9 unchanged); freestanding warnings identical to main on
+every port (219 / 247 / 229).
 
 **Not changed.** RISC-V (BL2-a above) and the other x86 exception classes (`#UD`, `#DE`, …), which
 still decode as `Unknown`; widening them is outside this item.
