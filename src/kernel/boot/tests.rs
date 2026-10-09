@@ -73099,7 +73099,18 @@ mod stage198e3c1_direct_live_policy {
         // Liveness handshake (futex), not a timing/delay loop. Stage 198E3C1B-H renamed it to a
         // CHILD_STARTED liveness signal — the authoritative blocked proof is the kernel ack.
         assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_CHILD_STARTED"));
-        assert!(scaffold.contains("futex_wait(started, sv, sv)"));
+        // BL3a re-derivation: the bare `futex_wait(started, sv, sv)` this pinned is the lost-wake
+        // hand-off (the child's wake could run first and the parent then parked forever on an
+        // unchanged word). The futex hand-off is still the coordination — through the publish /
+        // await pair, which changes the word before waking and parks only on the unpublished value.
+        assert!(
+            scaffold
+                .contains("super::oracle_handshake_publish(&CHILD_STARTED, CHILD_STARTED_READY)")
+        );
+        assert!(
+            scaffold.contains("super::oracle_handshake_await(&CHILD_STARTED, CHILD_STARTED_READY)")
+        );
+        assert!(!scaffold.contains("futex_wait(started, sv, sv)"));
         // Topology marker present; NO live retirement/attestation literal is emitted from the
         // userspace scaffold (those are kernel-only).
         assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_TOPOLOGY_OK"));
