@@ -25675,7 +25675,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | confirmed open (from source) | `EXC_ILLEGAL_INSTRUCTION` decodes to `Unknown`; the pre-lock bridge settles `Unknown` fatally; the per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad `handle_trap_entry`, unreachable since U9 closed. Not reproduced live; the BL2 route is the owner it should reach |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | to verify | |
-| BL3b — futex check-and-park contract | fixed — qualification pending | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed) |
+| BL3b — futex check-and-park contract | fixed and delivered (qualified `4c50a864`) | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed); revert control fails the park-window case |
 | BL3c — hosted ack-lease intermittent failure | to verify | |
 | BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | to verify | |
 | BL4b — scheduler quantum / hardware deadline coupling | to verify | |
@@ -25683,6 +25683,8 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | to verify | |
 | BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
 | BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
+| BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate. The checker requires broad-path markers the split NR 9 route no longer emits (`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, `…DISPATCH_DEFER_BEGIN`, `…HANDLER_BYPASS_BEGIN/DONE`, `…DISPATCH_DONE result=idle`), while the kernel's own idle chain (`…NO_INCOMING`, `…POST_LOCK_IDLE_*`, `…IDLE_ORACLE_DONE result=ok`) is present; in one base boot another task was runnable, so the cell's no-incoming premise is also boot-order dependent |
+| BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate: init parks (`FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK`) and none of the `RISCV_FUTEX_WAIT_*IDLE*` / `…DISPATCH_DONE result=idle` markers follow; to be examined with BL4a |
 
 ### BL1 — multi-page shared-region mapping
 
@@ -25894,3 +25896,18 @@ new non-parking outcomes beside the three existing ones).
 
 **Not changed.** The default-off oracles' own handshakes (BL3a) — a correct futex cannot rescue a
 handshake whose waiter waits on a word nobody changes.
+
+**Qualification** (frozen `4c50a864`, tree `4619d2e6`; fresh isolated worktrees and artifacts; base
+`c44e9b46`). Every scheduled gate was run once and kept. Passed: the BL3b / `u9fw_` / FutexWait hosted
+cases (66) and the overtaken-deferral cases (21); the first-window regression inserted verbatim into
+the true base FAILS there (`left: Ok(Park) right: Ok(Proceed)`); the revert control (only the
+post-registration re-read disabled) FAILS the park-window case (`right: ValueChanged`); live — the
+x86_64 FutexWake oracle (`first_wake=1 second_wake=0 waiter_resumes=1`), the x86_64 terminal-fault
+waiter cell, the strict x86_64 core in its timer-contract-witness profile, the strict AArch64 core,
+the AArch64 FutexWake and FutexWait oracles, the strict RISC-V core, the RISC-V FutexWake and
+FutexWait oracles — with positive NR 9 traffic in every futex cell (`FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK`
+4 / 4 / 3 times on x86_64 / AArch64 / RISC-V; no park refusals, as no live race was forced);
+`cargo fmt --check`; the full hosted suite (5995); the integration suite; the ABI crate (211); the
+census scanner (U9 unchanged); freestanding warnings identical to `f9096ff7` on every port (219 / 247
+/ 229). Red: the AArch64 and RISC-V FutexWait idle-oracle cells, which fail identically on fresh
+true-base artifacts (2/2 each) — recorded as BL6a / BL6b, not caused by this change.
