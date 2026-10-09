@@ -2436,25 +2436,43 @@ u9rx4_require_zero() {
 # The receive itself: the EXACT one-shot reply cap the kernel minted, and the
 # receiver-visible framing (application opcode 12, 8 payload bytes) -- not the raw wire
 # opcode 0 with its two-byte inline prefix still attached.
-u9rx4_require_one "PM receives the exact minted reply cap with receiver-visible framing" \
-  'PM_RECV_GOT_MSG opcode=12 len=8 reply_cap=Some(65538)'
+#
+# BL4b: the cap's VALUE is an allocation detail, like the reply slot below. It is PM's local cap
+# slot at its current reuse generation (65538 = 0x1_0002 when tid 2's query is PM's first reply,
+# 262146 = 0x4_0002 when init's three calls reuse the slot first, as they do once the quantum
+# actually preempts). So it is READ from the one receive of tid 2's query, and every assertion
+# below is then exact on that cap: minted for PM once, BEFORE the receive delivered it, resolved
+# once, revoked once.
+u9rx4_require_one_re "PM receives tid 2's query once, with a minted reply cap and receiver-visible framing" \
+  'PM_RECV_GOT_MSG opcode=12 len=8 reply_cap=Some\([0-9]+\) transferred_cap=None sender_tid=2( |$)'
+u9rx4_got_line="$(printf '%s\n' "$u9rx4_log" | rg -a -n -m1 -e 'PM_RECV_GOT_MSG opcode=12 len=8 reply_cap=Some\([0-9]+\) transferred_cap=None sender_tid=2( |$)' || true)"
+u9rx4_cap="$(printf '%s' "$u9rx4_got_line" | rg -o -m1 -e 'reply_cap=Some\([0-9]+\)' | tr -dc '0-9')"
+u9rx4_cap="${u9rx4_cap:-NONE}"
 u9rx4_require_one "the reply cap is materialized exactly once" \
-  'IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=65538'
+  "IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${u9rx4_cap}"
+u9rx4_mint_at="$(printf '%s\n' "$u9rx4_log" | rg -a -n -m1 -F -- "IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${u9rx4_cap}" | cut -d: -f1 || true)"
+u9rx4_got_at="$(printf '%s' "$u9rx4_got_line" | cut -d: -f1)"
+if [[ -z "$u9rx4_mint_at" || -z "$u9rx4_got_at" ]] || (( u9rx4_mint_at >= u9rx4_got_at )); then
+  echo "[error] U9-RX4: the reply cap must be minted before the receive delivers it (mint_line=${u9rx4_mint_at:-none} receive_line=${u9rx4_got_at:-none} cap=${u9rx4_cap})"
+  u9rx4_fail=1
+else
+  echo "[ok] U9-RX4: reply cap ${u9rx4_cap} minted before the receive delivered it"
+fi
 # PM can now decode and answer.
 u9rx4_require_one "PM decodes the lifecycle query" 'PM_LIFECYCLE_QUERY_RECV tid=2'
 u9rx4_require_one "PM replies successfully" 'PM_LIFECYCLE_QUERY_REPLY tid=2 found=1'
 # Stage 199D-DW2 (COMPOSITION): the subject here is that PM's reply RESOLVES against the LIVE
-# one-shot object -- witnessed caller (tid=3), witnessed cap (65538), live generation (1). The
+# one-shot object -- witnessed caller (tid=3), witnessed cap (read above), live generation (1). The
 # `reply_index` is the slot the allocator happened to hand out, not part of that subject, and any
 # co-armed proof that provisions an extra reply cap first (the 193D send-reply-cap oracle does
 # exactly that) shifts it. Anchoring on it made this assertion satisfiable only in the default
 # cell; matching tid + cap + generation and tolerating the slot keeps every part of the subject
 # and holds in every cell.
 u9rx4_require_one_re "the reply resolves against the live one-shot object" \
-  '^IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=[0-9]+ generation=1'
+  "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=1( |\$)"
 # The one-shot is CONSUMED exactly once, on both sides, and the caller resumes once.
 u9rx4_require_one "the replier side of the one-shot is revoked once" \
-  'IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538'
+  "IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=${u9rx4_cap} "
 u9rx4_require_one "the caller side of the one-shot is revoked once" \
   'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2'
 # Stage 199G-B §2: the caller's reply-wait is an NR 5 receive, so it now parks through the

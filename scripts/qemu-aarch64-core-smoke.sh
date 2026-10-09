@@ -513,10 +513,8 @@ u9rx4_require_zero() {
 # The receive itself: the EXACT one-shot reply cap the kernel minted, and the
 # receiver-visible framing (application opcode 12, 8 payload bytes) -- not the raw wire
 # opcode 0 with its two-byte inline prefix still attached.
-u9rx4_require_one "PM receives the exact minted reply cap with receiver-visible framing" \
-  'PM_RECV_GOT_MSG opcode=12 len=8 reply_cap=Some(65538)'
-u9rx4_require_one "the reply cap is materialized exactly once" \
-  'IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=65538'
+# BL4b: which cap that is, and its mint before the receive, are checked by the terminal-outcome
+# evaluator below, which READS the cap from this receive rather than assuming it.
 # PM can now decode and answer.
 u9rx4_require_one "PM decodes the lifecycle query" 'PM_LIFECYCLE_QUERY_RECV tid=2'
 u9rx4_require_one "PM replies successfully" 'PM_LIFECYCLE_QUERY_REPLY tid=2 found=1'
@@ -543,8 +541,12 @@ u9rx4_require_one "PM replies successfully" 'PM_LIFECYCLE_QUERY_REPLY tid=2 foun
 # reply that succeeds after a timeout, and a leaked alias/record/link — none of which the old
 # form could see. The four-tick deadline is preserved; the race is arbitrated, not suppressed.
 #
-# Every anchor is scoped to the witnessed identities — caller tid 2, replier tid 3, one-shot cap
-# 65538, record generation 1 — never to boot-global counts that other replies also satisfy.
+# Every anchor is scoped to the witnessed identities — caller tid 2, replier tid 3, the one-shot
+# cap PM received, record generation 1 — never to boot-global counts that other replies also
+# satisfy. BL4b: the cap's VALUE is an allocation detail (PM's local cap slot at its reuse
+# generation: 65538 = 0x1_0002 when tid 2's query is PM's first reply, 262146 = 0x4_0002 when
+# init's calls reuse the slot first, as they can once the quantum preempts), so it is READ from
+# the one receive of tid 2's query and every cap-scoped anchor is exact on it.
 
 _u9_c()   { printf '%s\n' "$_U9_LOG" | rg -a -F -c -- "$1" 2>/dev/null || printf '0'; }
 _u9_cre() { printf '%s\n' "$_U9_LOG" | rg -a -c -e "$1" 2>/dev/null || printf '0'; }
@@ -557,6 +559,25 @@ _u9_field() {
 u9rx4_eval_terminal() {
   _U9_LOG="$1"
   local tag="${2:-U9-RX4}" bad=0
+
+  # The witnessed receive and its cap: exactly one receive of tid 2's query, carrying a reply cap
+  # minted for PM exactly once and BEFORE that receive delivered it.
+  local got_re='PM_RECV_GOT_MSG opcode=12 len=8 reply_cap=Some\([0-9]+\) transferred_cap=None sender_tid=2( |$)'
+  local got_n got_line cap mint_n mint_at got_at
+  got_n="$(_u9_cre "$got_re")"
+  got_line="$(printf '%s\n' "$_U9_LOG" | rg -a -n -m1 -e "$got_re" 2>/dev/null || true)"
+  cap="$(printf '%s' "$got_line" | rg -o -m1 -e 'reply_cap=Some\([0-9]+\)' 2>/dev/null | tr -dc '0-9')"
+  if [[ "$got_n" != "1" || -z "$cap" ]]; then
+    echo "[error] $tag: PM receives tid 2's query exactly once, with a reply cap -- got ${got_n}"
+    return 1
+  fi
+  mint_n="$(_u9_c "IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${cap}")"
+  mint_at="$(printf '%s\n' "$_U9_LOG" | rg -a -n -m1 -F -- "IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${cap}" 2>/dev/null | cut -d: -f1)"
+  got_at="$(printf '%s' "$got_line" | cut -d: -f1)"
+  if [[ "$mint_n" != "1" || -z "$mint_at" ]] || (( mint_at >= got_at )); then
+    echo "[error] $tag: reply cap ${cap} must be minted for PM exactly once, before the receive -- mints=${mint_n} mint_line=${mint_at:-none} receive_line=${got_at}"
+    return 1
+  fi
 
   # The scenario's own terminal, named by the caller the witness is about. Its record slot is
   # an allocation detail, so it is READ from the arming rather than assumed, and every
@@ -589,10 +610,10 @@ u9rx4_eval_terminal() {
 
   # ── the two winners, each discriminated by its own exact claim ──
   local reply_resolve reply_commit reply_resume replier_revoke caller_revoke
-  reply_resolve="$(_u9_cre '^IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=[0-9]+ generation=1')"
+  reply_resolve="$(_u9_cre "^IPC_REPLY_OBJECT_OK tid=3 cap=${cap} reply_index=[0-9]+ generation=1( |\$)")"
   reply_commit="$(_u9_cre "^IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=${rec} record_generation=1 replier_tid=3 terminal=Reply resolution=commit settled=1")"
   reply_resume="$(_u9_c 'IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 ')"
-  replier_revoke="$(_u9_c 'IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=65538')"
+  replier_revoke="$(_u9_c "IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=${cap} ")"
   caller_revoke="$(_u9_c 'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2')"
 
   local timeout_ok timeout_commit timeout_wake aliases late_ok
@@ -613,7 +634,7 @@ u9rx4_eval_terminal() {
   # about, so counting only the legacy spelling made a timeout win look like an unrefused late
   # reply. Both are scoped to the witnessed record and replier; neither is a wildcard.
   local late_refused_legacy late_refused_prelock prelock_inert
-  late_refused_legacy="$(_u9_c 'IPC_REPLY_FAIL tid=3 reply_cap=65538 err=WrongObject')"
+  late_refused_legacy="$(_u9_c "IPC_REPLY_FAIL tid=3 reply_cap=${cap} err=WrongObject")"
   late_refused_prelock="$(_u9_cre "^IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=${rec} record_generation=1 replier_tid=3 .*err=WrongObject")"
   # The pre-lock refusal must be INERT -- it is a refusal, not a partial reply.
   prelock_inert="$(_u9_cre "^IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=${rec} record_generation=1 replier_tid=3 terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject")"
@@ -687,7 +708,9 @@ u9rx4_eval_terminal() {
 # Run before the real log is judged, so a witness that has stopped discriminating fails here
 # rather than silently passing everything.
 _u9_arm='IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=2 caller_asid=2 record_index=0 record_generation=1 replier_tid=0 blocked_recv_generation=1 finite_deadline=1 deadline_reserved=1 result=ok
-IPC_REPLY_TIMEOUT_ARMED arch=aarch64 caller_tid=2 caller_asid=2 record_index=0 record_generation=1 terminal_epoch=1 token_slot=0 token_generation=1 deadline=9 result=ok'
+IPC_REPLY_TIMEOUT_ARMED arch=aarch64 caller_tid=2 caller_asid=2 record_index=0 record_generation=1 terminal_epoch=1 token_slot=0 token_generation=1 deadline=9 result=ok
+IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=65538
+USER_LOG tid=3 msg=PM_RECV_GOT_MSG opcode=12 len=8 reply_cap=Some(65538) transferred_cap=None sender_tid=2'
 _u9_replywin="${_u9_arm}
 IPC_REPLY_OBJECT_OK tid=3 cap=65538 reply_index=0 generation=1 target_endpoint=5
 IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=0 record_generation=1 replier_tid=3 terminal=Reply resolution=commit settled=1 result=ok
@@ -751,11 +774,22 @@ _u9_expect 1 "pre-lock refusal on another record" "${_u9_arm}
 IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok
 IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok
 IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=7 record_generation=1 replier_tid=3 terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok"
+# BL4b: the cap is READ from the receive, so a renumbered allocation is the same valid outcome...
+_u9_expect 0 "reply-win accepted with a renumbered cap" "${_u9_replywin//65538/262146}"
+# ...but a resolve/revoke naming another cap than the one PM received is a substitution...
+_u9_expect 1 "reply-win whose resolve and revoke name another cap" "${_u9_arm}
+IPC_REPLY_OBJECT_OK tid=3 cap=131074 reply_index=0 generation=1 target_endpoint=5
+IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=0 record_generation=1 replier_tid=3 terminal=Reply resolution=commit settled=1 result=ok
+IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=131074 waiter_cap=131074 ok=true
+IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2 cap=65541 ok=true
+IPC_RECV_V2_META_BLOCKED_WAITER_OK tid=2 len=40"
+# ...and a cap delivered before it was minted is reordered evidence.
+_u9_expect 1 "reply cap minted after the receive delivered it" "$(printf '%s\n' "$_u9_replywin" | awk '/IPC_REPLY_CAP_ONESHOT_OK/{held=$0; next} /PM_RECV_GOT_MSG/{print; print held; next}1')"
 if (( _u9_selftest_fail )); then
   echo "[error] U9-RX4 terminal-outcome evaluator self-test FAILED"
   exit 1
 fi
-echo "[ok] U9-RX4: terminal-outcome evaluator self-test passed (3 accepted, 10 rejected)"
+echo "[ok] U9-RX4: terminal-outcome evaluator self-test passed (4 accepted, 12 rejected)"
 
 if ! u9rx4_eval_terminal "$u9rx4_log" "U9-RX4"; then
   u9rx4_fail=1
