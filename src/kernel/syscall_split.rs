@@ -2422,7 +2422,25 @@ pub(crate) fn try_split_timer_dispatch(
     cpu: CpuId,
     is_timer: bool,
 ) -> SplitDispatchDisposition {
-    try_split_timer_into_frame(shared, cpu, is_timer)
+    // The shared x86_64/AArch64 bridge authenticates the idle boundary AFTER this route, against
+    // the trap it is about to return through (U9-TIMER5), so the queued-work settlement is
+    // admitted here and an unauthenticated trap is settled by the bridge under its own name.
+    try_split_timer_into_frame(shared, cpu, is_timer, true)
+}
+
+/// BL4a — the RISC-V entry. Its bridge cannot authenticate after the fact: an S-origin timer
+/// CONSTRUCTS a user return rather than redirecting a kernel frame, so the authentication has to
+/// come in with the trap. `idle_boundary` is that authentication — `Riscv64TrapContext::
+/// idle_boundary`, set only by the entry owners that accepted the trap through this CPU's armed
+/// idle latch.
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+pub(crate) fn try_split_timer_dispatch_at_boundary(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    is_timer: bool,
+    idle_boundary: bool,
+) -> SplitDispatchDisposition {
+    try_split_timer_into_frame(shared, cpu, is_timer, idle_boundary)
 }
 
 pub(crate) fn try_split_dispatch_into_frame(
@@ -5103,7 +5121,11 @@ impl TimerSettlement {
 /// acquisition, in ANY supported configuration, including both diagnostic profiles and their
 /// combined-knob precedence. The settlement enum has no `NotHandled` disposition left.
 #[cfg(not(feature = "hosted-dev"))]
-fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement {
+fn settle_recognized_timer(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    idle_advance_admitted: bool,
+) -> TimerSettlement {
     // ── (0b) THE ENTERING INCARNATION, captured once, before anything is decided ─────────────
     //
     // U9-PAGEFAULT1 §0. The frame this trap will return through belongs to whoever was executing
@@ -5144,10 +5166,17 @@ fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement
         // U9-TIMER5 §2 — a parked CPU is examined on every tick, not once per quantum. The
         // quantum decides whether to cut a RUNNING task short; with `current` empty it has no
         // subject, which is why the broad arm's own `yield_current` takes `NoCurrent` and
-        // dispatches for this state. Scoped to the two ports whose bridge authenticates the idle
-        // boundary — see the U9-TIMER5 record for the RISC-V derivation.
-        #[cfg(not(target_arch = "riscv64"))]
-        if !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0) {
+        // dispatches for this state.
+        //
+        // BL4a — on EVERY port now, admitted by the authentication each bridge owns. x86_64 and
+        // AArch64 authenticate after this route and pass `true`. RISC-V was excluded outright,
+        // so a deadline that expired on one of its ~1 in 9 non-preempting idle ticks readied a
+        // task that then sat undispatched until the next PREEMPTING tick. Its bridge now passes
+        // the trap's own `idle_boundary` — true only for an S-origin trap accepted through this
+        // CPU's armed idle latch — so the same settlement is reached for exactly that origin.
+        if idle_advance_admitted
+            && !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0)
+        {
             crate::yarm_log!(
                 "TIMER_SPLIT_IDLE_ADVANCE_COMMITTED cpu={} tick={} observed_runnable={} preempt=0 rearm=1 broad_lock=0",
                 cpu.0,
@@ -5304,13 +5333,14 @@ fn try_split_timer_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
     is_timer: bool,
+    idle_advance_admitted: bool,
 ) -> SplitDispatchDisposition {
     // THE FAMILY FILTER, and the only `NotHandled` a timer trap can produce. It says "this event
     // is not a TimerInterrupt", never "this timer is someone else's problem".
     if !is_timer {
         return SplitDispatchDisposition::NotHandled;
     }
-    settle_recognized_timer(shared, cpu).disposition()
+    settle_recognized_timer(shared, cpu, idle_advance_admitted).disposition()
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -5318,6 +5348,7 @@ fn try_split_timer_into_frame(
     _shared: &SharedKernel,
     _cpu: CpuId,
     _is_timer: bool,
+    _idle_advance_admitted: bool,
 ) -> SplitDispatchDisposition {
     SplitDispatchDisposition::NotHandled
 }

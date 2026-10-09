@@ -45,17 +45,33 @@ pub struct Riscv64TrapContext {
     /// cleared, then the mailbox swapped), once. `None` for every other trap. Carried for the same
     /// reason as the claim: the consumption is destructive and the decoder runs several times.
     pub software_interrupt: Option<crate::arch::riscv64::ipi::IpiArrival>,
+    /// BL4a — this trap's entry owner accepted it at this CPU's ARMED IDLE BOUNDARY: an S-origin
+    /// interrupt whose acceptance predicate required the per-CPU latch that only an idle arrival
+    /// (`reestablish_idle_boundary`) arms. It is the authentication the timer route's queued-work
+    /// settlement needs, carried in with the trap because an S-origin timer constructs its user
+    /// return rather than redirecting a kernel frame the bridge could authenticate afterwards.
+    /// `false` for every U-origin trap.
+    pub idle_boundary: bool,
 }
 
 impl Riscv64TrapContext {
     /// A trap that is neither a supervisor external nor a software interrupt, so nothing was
-    /// claimed or consumed.
+    /// claimed or consumed, and that was not taken at the idle boundary.
     pub fn exception(scause: usize, stval: usize) -> Self {
         Self {
             scause,
             stval,
             external_claim: None,
             software_interrupt: None,
+            idle_boundary: false,
+        }
+    }
+
+    /// BL4a — the S-origin supervisor TIMER accepted at the armed idle boundary.
+    pub fn idle_boundary_timer(scause: usize, stval: usize) -> Self {
+        Self {
+            idle_boundary: true,
+            ..Self::exception(scause, stval)
         }
     }
 }
@@ -1241,7 +1257,12 @@ pub fn handle_riscv_trap_entry_shared(
     let mut post_work_committed = false;
     {
         let is_timer = matches!(decode_trap_context(context), TrapEvent::TimerInterrupt);
-        match crate::kernel::syscall_split::try_split_timer_dispatch(shared, cpu, is_timer) {
+        match crate::kernel::syscall_split::try_split_timer_dispatch_at_boundary(
+            shared,
+            cpu,
+            is_timer,
+            context.idle_boundary,
+        ) {
             crate::kernel::syscall_split::SplitDispatchDisposition::PostWorkCommitted {
                 ..
             } => {

@@ -3,9 +3,9 @@
 #
 # U9-TIMER5 §3 — the IDLE-BOUNDARY RETURN witness, per architecture.
 #
-# Usage: scripts/qemu-timer5-idle-return-witness-smoke.sh [x86_64|aarch64]
+# Usage: scripts/qemu-timer5-idle-return-witness-smoke.sh [x86_64|aarch64|riscv64]
 #
-# The two CHANGED ports only. RISC-V is refused with its reason at the arch switch below.
+# All three ports. RISC-V joined in BL4a; its arm below records why it was refused before.
 #
 # The population under test is one timer interrupt taken while the CPU is parked at its kernel
 # idle boundary AND the run queue is not empty. No ordinary boot produces it, and that was
@@ -86,29 +86,40 @@ case "$ARCH" in
     SMP=2
     ;;
   riscv64)
-    # NOT SUPPORTED, and the refusal is the finding rather than a gap.
+    # BL4a — RISC-V is witnessed too. U9-TIMER5 refused it because only a PREEMPTING tick
+    # examined a parked RISC-V CPU (~36 of ~1540 ticks per core boot), so a task whose deadline
+    # expired while the CPU was parked waited for a preempting tick that mostly did not come
+    # (measured then: 0 of 3 runs completed). Its idle boundary is the per-CPU latch QEMU-SMP3
+    # rebuilt: armed only by an idle arrival (`reestablish_idle_boundary`) and required by every
+    # accepted S-mode timer trap, so an S-origin timer IS the authenticated boundary.
     #
-    # RISC-V is not a changed port: its S-mode timer entry CONSTRUCTS a user return instead of
-    # converting a kernel frame, so it has neither an authenticated boundary nor a need for one,
-    # and U9-TIMER5 leaves it exactly as U9-TIMER2 left it. What it also keeps is U9-TIMER2's
-    # limitation — only a PREEMPTING tick examines a parked CPU — and this witness's shape walks
-    # straight into it: an ordinary RISC-V core boot takes ~1540 ticks of which ~36 preempt, so a
-    # task whose deadline expires while the CPU is parked waits for a preempting tick that mostly
-    # does not come, and the profile stalls in `RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io`.
-    #
-    # Widening the advance to non-preempting ticks is what fixes that, and it is exactly what the
-    # two changed ports got — but there it is gated on the authenticated boundary, and applying it
-    # to RISC-V without one let a boot-time tick dispatch through an unauthorized drain (measured:
-    # the boot hung at `tick=2`). Giving RISC-V the same authenticated boundary is the next step
-    # and is deliberately outside this package.
-    #
-    # RISC-V's coverage is its ORDINARY core boot, which is unchanged from base and green.
-    echo "[timer5-witness][fail] riscv64 has no authenticated idle boundary — see the U9-TIMER5"
-    echo "[timer5-witness][fail] record; its coverage is the ordinary core smoke, not this witness"
-    exit 1
+    # Its S-mode timer entry CONSTRUCTS the user return rather than converting a kernel frame:
+    # the resume is `RISCV_S_MODE_TIMER_DISPATCH`, the park is the idle arrival's own marker, and
+    # the wait is the stack-free `wfi` loop re-based through `sscratch` on every arrival, so there
+    # is no low-water telemetry to assert and no stack to accumulate. Registers are not checked
+    # on this port (`checked=0`, see init's cell).
+    FEATURE=riscv-shared-region-direct-oracle
+    KTARGET=riscv64gc-unknown-none-elf
+    KPROFILE=release
+    KELF=target/riscv64gc-unknown-none-elf/${KPROFILE}/kernel_boot
+    BUILD_SCRIPT=scripts/build-qemu-riscv64-artifacts.sh
+    SMOKE=scripts/qemu-riscv64-core-smoke.sh
+    INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio
+    DEST=build-riscv64/yarm-riscv64.bin
+    NEEDS_OBJCOPY=1
+    RETURN_MARKER=RISCV_S_MODE_TIMER_DISPATCH
+    PARK_MARKER='RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io'
+    STACK_ANCHOR=0
+    REGS_CHECKED=0
+    SMP=1
     ;;
   *) echo "[timer5-witness][fail] unknown arch: $ARCH"; exit 1 ;;
 esac
+
+# The converted ports park through the idle-boundary anchor, which reports each new low-water
+# mark; RISC-V overrides both (see its arm above).
+PARK_MARKER=${PARK_MARKER:-IDLE_BOUNDARY_PARK cpu=}
+STACK_ANCHOR=${STACK_ANCHOR:-1}
 
 BUILD_STD=${BUILD_STD:-core,alloc,compiler_builtins,panic_abort}
 LOGDIR=${LOGDIR:-/tmp/timer5-idle-return-witness-$ARCH}
@@ -203,7 +214,7 @@ done
 # CONSTRUCTS a user return rather than converting a kernel frame, so there is no kernel frame whose
 # redirection would have to be authorized. The RISC-V arm of this script is a regression check that
 # the shared route still behaves, not the changed-port evidence.
-parks=$(count 'IDLE_BOUNDARY_PARK cpu=')
+parks=$(count "$PARK_MARKER")
 if [[ -n "$RETURN_MARKER" ]]; then
   (( parks >= 1 )) || die "the CPU never reached its idle boundary"
 fi
@@ -224,10 +235,45 @@ if [[ -n "$RETURN_MARKER" ]]; then
   [[ "$dequeues" == "$advances" ]] \
     || die "every advance must dequeue exactly one task ($dequeues vs $advances)"
   returns=$(count "$RETURN_MARKER")
-  [[ "$returns" == "$advances" ]] \
-    || die "advances and frame conversions must agree ($advances vs $returns)"
+  # BL4a: the boot keeps running until the smoke's timeout stops QEMU, so its final record can be
+  # cut mid-line. A trailing advance is discounted ONLY when the log ends in a strict prefix of its
+  # own return marker after the last advance — evidence lost to the capture, not a missing
+  # conversion — and the discount is reported. Every other advance must still match exactly.
+  truncated_tail=$(python3 -I - "$NORM" "$RETURN_MARKER" <<'PY'
+import sys
+lines=[l for l in open(sys.argv[1],errors='replace').read().split('\n')]
+while lines and not lines[-1].strip(): lines.pop()
+marker=sys.argv[2]
+last=lines[-1] if lines else ''
+tail_done=max((i for i,l in enumerate(lines) if 'TIMER_IDLE_ADVANCE_DRAIN_DONE' in l), default=-1)
+after=lines[tail_done+1:] if tail_done>=0 else []
+cut=bool(after) and after[-1] is last and marker.startswith(last.strip()) and last.strip()!=marker \
+    and not any(marker in l for l in after)
+print(1 if cut else 0)
+PY
+)
+  [[ "$returns" == "$(( advances - truncated_tail ))" ]] \
+    || die "advances and frame conversions must agree ($advances vs $returns, truncated_tail=$truncated_tail)"
+  (( truncated_tail == 0 )) || note "the capture ended inside the last advance's return marker (discounted 1)"
   refused=$(count 'IDLE_BOUNDARY_RETURN_REFUSED')
   [[ "$refused" == "0" ]] || die "a committed user return was refused at the frame ($refused)"
+fi
+
+# ── BL4a: no idle settlement strands a runnable task (RISC-V) ────────────────────────────────
+#
+# The S-mode timer path settles every non-dispatching tick as RISCV_S_MODE_TIMER_RESUME_IDLE and
+# goes back to `wfi`; that marker records the queue depth it leaves behind. Before BL4a a deadline
+# that expired on a NON-preempting idle tick left its task queued right there, waiting for the next
+# preempting tick. Any such settlement with work queued is that stranded task.
+if [[ "$ARCH" == "riscv64" ]]; then
+  resume_idle=$(count 'RISCV_S_MODE_TIMER_RESUME_IDLE tick=')
+  stranded=$(grep -a -E -- 'RISCV_S_MODE_TIMER_RESUME_IDLE tick=[0-9]+ runnable=[1-9]' "$NORM" | wc -l | tr -d ' ')
+  untagged=$(grep -a -E -- 'RISCV_S_MODE_TIMER_RESUME_IDLE tick=[0-9]+$' "$NORM" | wc -l | tr -d ' ')
+  nonpre=$(grep -a -F -- 'TIMER_SPLIT_IDLE_ADVANCE_COMMITTED' "$NORM" | grep -a -c -F -- 'preempt=0' || true)
+  note "idle settlements: resume_idle=$resume_idle stranded=$stranded untagged=$untagged non_preempting_advances=$nonpre"
+  [[ "$untagged" == "0" ]] || die "RISCV_S_MODE_TIMER_RESUME_IDLE lacks its queue depth ($untagged lines): wrong build"
+  [[ "$stranded" == "0" ]] || die "an idle tick returned to wfi with a runnable task queued ($stranded times)"
+  (( nonpre >= 1 )) || die "no non-preempting idle tick committed the advance"
 fi
 
 # ── Nothing reached broad dispatch ───────────────────────────────────────────────────────────
@@ -242,11 +288,14 @@ done
 # One IDLE_BOUNDARY_PARK line per NEW low-water mark. A cycle that leaked a vector frame per turn
 # would report one per round; a flat cycle settles almost immediately. The bound is deliberately
 # generous — a handful of distinct entry depths is normal, ROUNDS of them is the defect.
-(( parks < ROUNDS )) \
-  || die "the idle boundary kept arriving deeper: $parks new low-water marks over $ROUNDS rounds"
-
-note "stack anchor: $parks distinct low-water marks over $ROUNDS rounds"
-grep -a -m3 -- 'IDLE_BOUNDARY_PARK cpu=' "$NORM" || true
+if (( STACK_ANCHOR )); then
+  (( parks < ROUNDS )) \
+    || die "the idle boundary kept arriving deeper: $parks new low-water marks over $ROUNDS rounds"
+  note "stack anchor: $parks distinct low-water marks over $ROUNDS rounds"
+  grep -a -m3 -- 'IDLE_BOUNDARY_PARK cpu=' "$NORM" || true
+else
+  note "idle arrivals: $parks (stack-free wait; no low-water telemetry on $ARCH)"
+fi
 
 # ── No fatal trap ────────────────────────────────────────────────────────────────────────────
 for bad in 'KERNEL PANIC' 'panicked at' 'DISPATCH_FATAL' 'TERMINAL_FAULT_UNEXPECTED_DISPOSITION' \
@@ -256,7 +305,7 @@ for bad in 'KERNEL PANIC' 'panicked at' 'DISPATCH_FATAL' 'TERMINAL_FAULT_UNEXPEC
 done
 
 if (( fail )); then
-  echo "TIMER5_IDLE_RETURN_WITNESS_SEAL arch=$ARCH result=fail"
+  echo "TIMER5_IDLE_RETURN_WITNESS_SEAL arch=$ARCH result=fail${stranded:+ stranded=$stranded}"
   exit 1
 fi
 echo "TIMER5_IDLE_RETURN_WITNESS_SEAL arch=$ARCH rounds=$ROUNDS advances=$advances parks=$parks result=ok"

@@ -1128,6 +1128,8 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         stval,
         external_claim,
         software_interrupt,
+        // BL4a: a U-origin trap interrupted a running task, not the idle boundary.
+        idle_boundary: false,
     };
     // Stage 196A: route through the RISC-V shared trap-entry wrapper. It owns the
     // `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag lifecycle, runs the UNCHANGED
@@ -1679,7 +1681,9 @@ fn riscv_s_mode_timer_trap(
     tframe.set_saved_pc(sepc);
     // U9-IRQ-FINAL §1 — the audited S-mode timer boundary is, by its own admission predicate, a
     // supervisor TIMER interrupt. It is not an external interrupt and claims nothing.
-    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext::exception(
+    // BL4a — and it was accepted through the armed idle latch, which the context now carries so the
+    // timer route may commit the idle advance on a non-preempting tick too.
+    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext::idle_boundary_timer(
         frame.scause as usize,
         frame.stval as usize,
     );
@@ -1943,9 +1947,14 @@ fn riscv_s_mode_idle_landing(
             // SPP stays Supervisor and SIE is restored from SPIE — the idle loop resumes
             // interruptible, ready for the next tick.
             match trigger {
-                SModeIdleTrigger::Timer { tick } => {
-                    early_marker!("RISCV_S_MODE_TIMER_RESUME_IDLE tick={}", tick)
-                }
+                // BL4a: the queue depth this settlement leaves behind. Returning to `wfi` with a
+                // runnable task queued is the stranded-task state — observation only, through the
+                // rank-1 scheduler seam the drain itself asks.
+                SModeIdleTrigger::Timer { tick } => early_marker!(
+                    "RISCV_S_MODE_TIMER_RESUME_IDLE tick={} runnable={}",
+                    tick,
+                    shared.runnable_count_on_cpu_split_read(cpu)
+                ),
                 SModeIdleTrigger::Ipi { sources } => early_marker!(
                     "RISCV_S_MODE_IPI_RESUME_IDLE cpu={} sources=0x{:x}",
                     cpu.0,
@@ -2003,6 +2012,8 @@ fn riscv_s_mode_software_trap(
         stval: frame.stval as usize,
         external_claim: None,
         software_interrupt: Some(arrival),
+        // BL4a: accepted through this CPU's armed idle latch (`is_accepted_s_mode_software_trap`).
+        idle_boundary: true,
     };
     let outcome = handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe);
     riscv_s_mode_idle_landing(
@@ -2085,6 +2096,8 @@ fn riscv_s_mode_external_trap(
         external_claim: Some(claim),
         // QEMU-SMP3: an external interrupt carries no software-interrupt arrival.
         software_interrupt: None,
+        // BL4a: accepted through this CPU's armed idle latch (`is_accepted_s_mode_external_trap`).
+        idle_boundary: true,
     };
     let outcome = handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe);
     let resume_tid = shared.current_tid_split_read(cpu).unwrap_or(0);

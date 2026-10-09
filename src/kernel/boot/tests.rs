@@ -149519,9 +149519,8 @@ mod u9tm_proof_gate {
     /// would order the wrong things or report a retired marker as live.
     fn route_code() -> alloc::string::String {
         SPLIT
-            .split(
-                "fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement {",
-            )
+            // BL4a: the route takes the bridge's idle-boundary admission as an argument.
+            .split("fn settle_recognized_timer(\n    shared: &SharedKernel,\n    cpu: CpuId,\n    idle_advance_admitted: bool,\n) -> TimerSettlement {")
             .nth(1)
             .and_then(|s| {
                 s.split("\n#[cfg(not(feature = \"hosted-dev\"))]\nfn try_split_timer_into_frame(")
@@ -149741,9 +149740,12 @@ mod u9tm_proof_gate {
         let advance_at = tail
             .find("TimerSettlement::IdleQueueAdvance")
             .expect("the parked-CPU exit");
+        // BL4a re-derivation: the guard is now the bridge's admission AND the parked-CPU test —
+        // the same test, no longer compiled out on RISC-V, admitted by each bridge's own
+        // authentication of the idle boundary.
         let guard_at = tail
-            .find("if !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0) {")
-            .expect("and it must be guarded on nothing being current");
+            .find("if idle_advance_admitted\n            && !matches!(shared.current_tid_split_read(cpu), Some(tid) if tid != 0)")
+            .expect("and it must be guarded on the admission and on nothing being current");
         assert!(
             guard_at < advance_at,
             "the parked-CPU test precedes the advance it authorizes"
@@ -174426,7 +174428,8 @@ mod u9timer1_preempting_timer {
         // slice follows it there. `try_split_timer_into_frame` is the family filter and nothing
         // else — slicing THAT would test three lines and miss the route entirely.
         SPLIT
-            .split("fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement {")
+            // BL4a: the route takes the bridge's idle-boundary admission as an argument.
+            .split("fn settle_recognized_timer(\n    shared: &SharedKernel,\n    cpu: CpuId,\n    idle_advance_admitted: bool,\n) -> TimerSettlement {")
             .nth(1)
             .and_then(|s| s.split("\n#[cfg(not(feature = \"hosted-dev\"))]\nfn try_split_timer_into_frame(").next())
             .expect("the timer route")
@@ -175936,7 +175939,8 @@ mod u9pf1_not_running {
     /// The recognized timer body, CODE only — same slice and same reason as `u9timer1`'s.
     fn route() -> alloc::string::String {
         SPLIT
-            .split("fn settle_recognized_timer(shared: &SharedKernel, cpu: CpuId) -> TimerSettlement {")
+            // BL4a: the route takes the bridge's idle-boundary admission as an argument.
+            .split("fn settle_recognized_timer(\n    shared: &SharedKernel,\n    cpu: CpuId,\n    idle_advance_admitted: bool,\n) -> TimerSettlement {")
             .nth(1)
             .and_then(|s| {
                 s.split("\n#[cfg(not(feature = \"hosted-dev\"))]\nfn try_split_timer_into_frame(")
@@ -194285,5 +194289,109 @@ mod bl2_user_instruction_fault {
             .nth(1)
             .expect("the Unknown route");
         assert!(unknown.contains("crate::kernel::boot::unknown_trap_fatal(cpu, arch_code);"));
+    }
+}
+
+// ── BL4a — the RISC-V idle tick dispatches through the authenticated boundary ───────────────
+//
+// The recognized timer body is freestanding-only, so its behaviour is witnessed live
+// (`qemu-timer5-idle-return-witness-smoke.sh riscv64`: zero idle settlements leave a runnable task
+// queued, against thousands on the unrepaired route). These pin the composition from the source.
+#[cfg(test)]
+mod bl4a_riscv_idle_tick {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const RV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    fn code(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The non-preempting idle advance is no longer compiled out on RISC-V: it is ADMITTED by the
+    /// bridge's own authentication, and the shared bridge's entry still admits it unconditionally
+    /// (it authenticates after the route, U9-TIMER5).
+    #[test]
+    fn the_non_preempting_idle_advance_is_admitted_by_the_bridge_not_by_the_port() {
+        let split = code(SPLIT);
+        let body = split
+            .split("fn settle_recognized_timer(")
+            .nth(1)
+            .and_then(|b| b.split("\nfn try_split_timer_into_frame(").next())
+            .expect("the recognized timer body");
+        let non_preempting = body
+            .split("if !preempting {")
+            .nth(1)
+            .and_then(|b| b.split("return TimerSettlement::ContinueCurrent;").next())
+            .expect("the non-preempting arm");
+        assert!(
+            !non_preempting.contains("target_arch"),
+            "the non-preempting idle advance may not be port-excluded again"
+        );
+        assert!(
+            non_preempting.contains("if idle_advance_admitted")
+                && non_preempting.contains("return TimerSettlement::IdleQueueAdvance;"),
+            "it is gated on the bridge's admission"
+        );
+        let shared_entry = split
+            .split("pub(crate) fn try_split_timer_dispatch(")
+            .nth(1)
+            .and_then(|b| b.split("\n}\n").next())
+            .expect("the shared entry");
+        assert!(shared_entry.contains("try_split_timer_into_frame(shared, cpu, is_timer, true)"));
+        let rv_entry = split
+            .split("pub(crate) fn try_split_timer_dispatch_at_boundary(")
+            .nth(1)
+            .and_then(|b| b.split("\n}\n").next())
+            .expect("the RISC-V entry");
+        assert!(
+            rv_entry.contains("try_split_timer_into_frame(shared, cpu, is_timer, idle_boundary)")
+        );
+    }
+
+    /// The RISC-V bridge passes the trap's own carried authentication, and only the S-origin entry
+    /// owners — each accepted through the armed idle latch — set it.
+    #[test]
+    fn only_the_latched_s_origin_owners_authenticate_the_idle_boundary() {
+        let trap = code(RV_TRAP);
+        assert!(trap.contains("try_split_timer_dispatch_at_boundary("));
+        assert!(trap.contains("context.idle_boundary,"));
+        assert!(
+            !trap.contains("try_split_timer_dispatch(shared, cpu, is_timer)"),
+            "the RISC-V bridge does not take the shared bridge's unconditional admission"
+        );
+        let boot = code(RV_BOOT);
+        assert_eq!(
+            boot.matches("idle_boundary: true,").count(),
+            2,
+            "the IPI and external owners"
+        );
+        assert_eq!(
+            boot.matches("idle_boundary: false,").count(),
+            1,
+            "the U-origin trap"
+        );
+        assert_eq!(
+            boot.matches("Riscv64TrapContext::idle_boundary_timer(")
+                .count(),
+            1,
+            "the S-origin timer owner"
+        );
+        // Each of those owners is reached only through a predicate that requires the latch.
+        for pred in [
+            "is_accepted_s_mode_timer_trap(",
+            "is_accepted_s_mode_software_trap(",
+            "is_accepted_s_mode_external_trap(",
+        ] {
+            let at = boot.find(pred).expect(pred);
+            assert!(
+                boot[at..at + 400].contains("s_mode_timer_boundary_armed(cpu.0 as usize)"),
+                "{pred} admits only through this CPU's armed idle latch"
+            );
+        }
+        // The resume-idle settlement reports what it leaves queued.
+        assert!(boot.contains("\"RISCV_S_MODE_TIMER_RESUME_IDLE tick={} runnable={}\""));
     }
 }

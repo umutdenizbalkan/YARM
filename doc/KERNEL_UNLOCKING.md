@@ -25677,7 +25677,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
 | BL3b — futex check-and-park contract | fixed and delivered (qualified `4c50a864`) | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed); revert control fails the park-window case |
 | BL3c — hosted ack-lease intermittent failure | fixed and delivered (qualified `031f6b32` + `69d2746f`) | classified PRODUCTION: a stale `release` / entitled `consume` decided on the endpoint generation, then the state, then exchanged the state alone, so a slot recycled for the same index's next incarnation in between was retired or consumed; forced deterministically with `race_hook`, three regressions fail on the unrepaired store |
-| BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | to verify | |
+| BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | fixed — qualification pending | the non-preempting idle advance was compiled out on RISC-V, so a deadline that expired on an idle tick readied a task the same trap then left queued until the next PREEMPTING tick; on the unrepaired kernel the extended timer5 witness counts 5151 idle settlements that returned to `wfi` with a runnable task queued, against 0 repaired |
 | BL4b — scheduler quantum / hardware deadline coupling | to verify | |
 | BL5a — reply-timeout retirement checker count/scope failures | to verify | |
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | to verify | |
@@ -26059,3 +26059,48 @@ image changes and the live results stand. On `69d2746f`, from a fresh worktree: 
 the full hosted suite (5999), the integration suite (30 suites, 291 passed), the census scanner (U9
 unchanged: `with_cpu=0`, `with_broad=0`) and freestanding warnings (identical) pass, and the
 hook-only base still fails all three regressions with the updated hook.
+
+### BL4a — the RISC-V idle tick dispatches what it readies
+
+**Defect (verified on `af24e403`).** `settle_recognized_timer`'s non-preempting arm — U9-TIMER5's
+"a parked CPU is examined on every tick, not once per quantum" — was `#[cfg(not(target_arch =
+"riscv64"))]`. On RISC-V a non-preempting tick taken at the idle boundary therefore settled
+`ContinueCurrent`: the tail's timeout pipeline (`run_due_ipc_timeout_work`, ahead of the idle-advance
+drain in the same trap) expired the deadline and queued the task, and the S-mode timer path then
+returned to `wfi` (`RISCV_S_MODE_TIMER_RESUME_IDLE`) with it still queued. It ran only when a
+PREEMPTING tick came round. U9-TIMER5 measured this as a stall (0 of 3 witness runs) and excluded
+RISC-V because "applying it without an authenticated boundary hung the boot at `tick=2`"; since then
+the quantum advances while idle, so the defect now shows as a quantum's worth of latency on every
+deadline that expires on one of the ~8 in 9 non-preempting idle ticks, and the witness's
+completion check alone no longer sees it. Measured on the unrepaired kernel with only an observer
+added (the resume-idle marker's queue depth): 5,151 idle settlements returned to `wfi` with a runnable
+task queued in one boot; every one of the 734 idle advances came through a preempting tick.
+
+**The authenticated boundary.** QEMU-SMP3 rebuilt RISC-V's idle boundary per CPU: the latch is armed
+only by an idle arrival (`reestablish_idle_boundary`, called by the boot hart's
+`kernel_idle_awaiting_io` and a secondary's `secondary_idle_awaiting_ipi`), and every accepted S-origin
+trap — timer, software, external — requires it (`s_mode_timer_boundary_armed(cpu)` in each
+acceptance predicate). The IPI idle advance already discharges through it.
+
+**Repair.** The arm is admitted, not port-excluded. `settle_recognized_timer` takes
+`idle_advance_admitted`; the shared x86_64/AArch64 entry passes `true` (that bridge authenticates
+after the route, unchanged), and the new RISC-V entry `try_split_timer_dispatch_at_boundary` passes
+the trap's own `Riscv64TrapContext::idle_boundary`. That field is set only by the three S-origin entry
+owners above, each reachable only through the latch (the S-mode timer through
+`Riscv64TrapContext::idle_boundary_timer`); U-origin traps carry `false`. The settlement is the
+existing `TimerIdleQueueAdvance`, discharged by the existing idle-advance drain (re-verify, the shared
+selection step, the exact-token resume) and landed by the existing S-mode `RISCV_S_MODE_TIMER_DISPATCH`.
+Tick, claim/ack and re-arm stay once per interrupt; no yield is counted on this arm (as on the other
+two ports); the context switch is counted by the drain. The resume-idle marker now records the queue
+depth it leaves behind (observation only, the rank-1 seam).
+
+**Evidence.** `qemu-timer5-idle-return-witness-smoke.sh` gains a RISC-V arm (idle arrivals as the park
+marker; no low-water telemetry, because the RISC-V wait is stack-free and re-based on every arrival)
+and a RISC-V obligation: no `RISCV_S_MODE_TIMER_RESUME_IDLE` may leave a runnable task queued, and at
+least one non-preempting tick must commit the advance. Repaired: `stranded=0`, 3,007 non-preempting
+advances, 24/24 rounds. Unrepaired with only the observer: `stranded=5151`, no non-preempting
+advance. Advances must still equal frame conversions exactly; a trailing advance is discounted only
+when the capture ends inside its own return marker (reported as `truncated_tail`). Hosted guards pin
+that the arm is admitted by the bridge rather than excluded by port, the two entries' admissions, and
+that only the latched S-origin owners set the field; four timer-route guards were re-derived for the
+new signature and guard, none weakened.
