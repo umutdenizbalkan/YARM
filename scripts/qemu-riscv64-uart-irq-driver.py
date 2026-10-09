@@ -16,8 +16,10 @@ Synchronisation is by the guest's own acknowledgements, never by sleeping:
 * `IRQ1_UART_READY seq=N mode=user` -> inject byte `0x40+N` at once: the receiver is spinning in
   U-mode, so the interrupt lands on user code.
 * `IRQ1_UART_READY seq=N mode=idle` -> wait until the kernel reports the hart idle AFTER that line
-  (`RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io` or `RISCV_S_MODE_TIMER_RESUME_IDLE`), then
-  inject `0x40+N`, so the interrupt lands on the idle `wfi`.
+  (`RISCV_S_MODE_TIMER_RESUME_IDLE tick=T runnable=0`: an idle tick that settled back to the `wfi`
+  with nothing runnable), then inject `0x40+N`, so the interrupt lands on the idle `wfi`. Not the
+  idle ENTRY line: since BL4a the idle tick dispatches a task whose deadline it expired, so a byte
+  injected on a stale "entered idle" can land on that task — the AArch64 reason below.
 * `IRQ1_UART_POSTDISABLE_READY` (after `IRQ1_UART_SOURCE_DISABLED`) -> inject one more byte, `Z`,
   which a disabled source must NOT deliver.
 
@@ -56,7 +58,7 @@ import tempfile
 import time
 
 READY_RE = re.compile(rb"IRQ1_UART_READY seq=(\d+) mode=(idle|user) expect=0x([0-9a-f]{2})")
-IDLE_RE = re.compile(rb"RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io|RISCV_S_MODE_TIMER_RESUME_IDLE")
+IDLE_RE = re.compile(rb"RISCV_S_MODE_TIMER_RESUME_IDLE tick=\d+ runnable=0(?!\d)")
 IDLE_RE_AARCH64 = re.compile(rb"TIMER_IDLE_ADVANCE_SETTLED cpu=0 incoming=none reason=idle settlement=kernel_idle")
 DISABLED_RE_AARCH64 = re.compile(rb"IRQ2_PL011_SOURCE_DISABLED ")
 DISABLED_RE_X86_64 = re.compile(rb"IRQ3_UART_SOURCE_DISABLED ")

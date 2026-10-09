@@ -26099,8 +26099,33 @@ marker; no low-water telemetry, because the RISC-V wait is stack-free and re-bas
 and a RISC-V obligation: no `RISCV_S_MODE_TIMER_RESUME_IDLE` may leave a runnable task queued, and at
 least one non-preempting tick must commit the advance. Repaired: `stranded=0`, 3,007 non-preempting
 advances, 24/24 rounds. Unrepaired with only the observer: `stranded=5151`, no non-preempting
-advance. Advances must still equal frame conversions exactly; a trailing advance is discounted only
-when the capture ends inside its own return marker (reported as `truncated_tail`). Hosted guards pin
+advance. Dequeues and frame conversions must each equal advances exactly. The boot runs until the
+smoke's timeout stops QEMU, so one trailing advance may be discounted, reported, in exactly two shapes
+of lost capture: `in_flight` (the last dequeue follows the last drain and only that advance's own
+steps follow it, the final one possibly cut mid-line) and `cut_tail` (the log ends in a strict prefix
+of the return marker after the last drain). Hosted guards pin
 that the arm is admitted by the bridge rather than excluded by port, the two entries' admissions, and
 that only the latched S-origin owners set the field; four timer-route guards were re-derived for the
 new signature and guard, none weakened.
+
+**Witnesses that leaned on the defect.** Two strict RISC-V witnesses passed on base partly *because*
+the idle tick stranded work, and failed on the first candidate freeze; both pass on base. Each is
+corrected at the witness, with no floor lowered:
+
+* *QEMU-SMP3 P1 (and LOCK1, which inherits the SMP3 verdict).* CPU 0's path into idle after
+  `C_P1_CALL` is long (it logs), so its tick is nearly always already pending when it reaches the
+  wait. Every base trap on CPU 0 in P1 has `sepc` at the `wfi` itself (taken as `SIE` unmasked, never
+  woken from sleep), whereas CPU 1's are one instruction later (woken). On base that pending tick
+  returned to `wfi` with the queue untouched and the IPI that followed was credited with the
+  dispatch (`ipi_to_c=3 preceded=4`). Repaired, the tick dispatches first (`ipi_to_c=1 timer_first=4
+  busy=3`, under the floor of 2). The fault was the witness's notion of *parked*: `note_idle_reached`
+  marked the hart idle before its wait unmasked, so the waker's `wait_until_parked` released on a hart
+  that was about to take an interrupt. It now marks a hart parked only when no enabled interrupt is
+  pending (`sip & sie == 0`, read on that hart). The tick's still-idle return marks it once the
+  settlement has left it idle. The floors (`ipi_to_s = 8`, `ipi_to_c >= 2`) and the grading are
+  unchanged.
+* *IRQ1 UART.* The host driver injected an idle-mode byte on the idle ENTRY line, which the idle
+  tick's own queue advance can now overtake (`idle_origin=3 user_origin=5`). The RISC-V
+  acknowledgement becomes the AArch64/x86_64 one: an idle tick that settled back to `wfi` with
+  nothing runnable (`RISCV_S_MODE_TIMER_RESUME_IDLE tick=T runnable=0`). Pinned by
+  `the_riscv_idle_acknowledgement_is_a_settled_idle_tick`.

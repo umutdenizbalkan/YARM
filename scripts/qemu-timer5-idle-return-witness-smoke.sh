@@ -232,29 +232,49 @@ dequeues=$(count 'TIMER_IDLE_ADVANCE_DEQUEUE_OK')
 if [[ -n "$RETURN_MARKER" ]]; then
   (( advances >= MIN_ADVANCES )) \
     || die "expected at least $MIN_ADVANCES idle-boundary advances over $ROUNDS rounds (got $advances)"
-  [[ "$dequeues" == "$advances" ]] \
-    || die "every advance must dequeue exactly one task ($dequeues vs $advances)"
   returns=$(count "$RETURN_MARKER")
-  # BL4a: the boot keeps running until the smoke's timeout stops QEMU, so its final record can be
-  # cut mid-line. A trailing advance is discounted ONLY when the log ends in a strict prefix of its
-  # own return marker after the last advance — evidence lost to the capture, not a missing
-  # conversion — and the discount is reported. Every other advance must still match exactly.
-  truncated_tail=$(python3 -I - "$NORM" "$RETURN_MARKER" <<'PY'
-import sys
+  # BL4a: the boot keeps running until the smoke's timeout stops QEMU, so its final transaction can
+  # be cut short. Exactly two shapes are evidence lost to the capture, and each discounts ONE
+  # trailing advance, reported; every other advance must still match exactly:
+  #   in_flight — the log's last dequeue follows the last DRAIN_DONE and nothing after it but that
+  #               same advance's own TIMER_IDLE_ADVANCE_* steps (the final one possibly cut
+  #               mid-line): the capture ended inside the advance, before its drain completed;
+  #   cut_tail  — the log ends in a strict prefix of the return marker after the last DRAIN_DONE.
+  read -r in_flight cut_tail < <(python3 -I - "$NORM" "$RETURN_MARKER" <<'PY'
+import re, sys
 lines=[l for l in open(sys.argv[1],errors='replace').read().split('\n')]
 while lines and not lines[-1].strip(): lines.pop()
 marker=sys.argv[2]
-last=lines[-1] if lines else ''
-tail_done=max((i for i,l in enumerate(lines) if 'TIMER_IDLE_ADVANCE_DRAIN_DONE' in l), default=-1)
-after=lines[tail_done+1:] if tail_done>=0 else []
-cut=bool(after) and after[-1] is last and marker.startswith(last.strip()) and last.strip()!=marker \
-    and not any(marker in l for l in after)
-print(1 if cut else 0)
+last=lines[-1].strip() if lines else ''
+def last_index(pat):
+    return max((i for i,l in enumerate(lines) if pat in l), default=-1)
+dd=last_index('TIMER_IDLE_ADVANCE_DRAIN_DONE')
+dq=last_index('TIMER_IDLE_ADVANCE_DEQUEUE_OK')
+in_flight=0
+if dq>dd and dq>=0:
+    m=re.search(r'incoming=(\d+)', lines[dq])
+    tid=m.group(1) if m else None
+    rest=[l.strip() for l in lines[dq+1:] if l.strip()]
+    def own(l, final):
+        if final and 'TIMER_IDLE_ADVANCE_'.startswith(l):
+            return True
+        if not l.startswith('TIMER_IDLE_ADVANCE_') or 'DRAIN_DONE' in l or 'SETTLED' in l:
+            return False
+        return final or (tid is not None and re.search(r'incoming=%s(?!\d)' % tid, l) is not None)
+    # The dequeue line itself may be the one the capture cut.
+    in_flight=int(dq==len(lines)-1 or (tid is not None and all(own(l, i==len(rest)-1) for i,l in enumerate(rest))))
+after=lines[dd+1:] if dd>=0 else []
+cut=(not in_flight) and bool(after) and after[-1].strip()==last and marker.startswith(last) \
+    and last!=marker and not any(marker in l for l in after)
+print(in_flight, int(cut))
 PY
 )
-  [[ "$returns" == "$(( advances - truncated_tail ))" ]] \
-    || die "advances and frame conversions must agree ($advances vs $returns, truncated_tail=$truncated_tail)"
-  (( truncated_tail == 0 )) || note "the capture ended inside the last advance's return marker (discounted 1)"
+  [[ "$dequeues" == "$(( advances + in_flight ))" ]] \
+    || die "every advance must dequeue exactly one task ($dequeues vs $advances, in_flight=$in_flight)"
+  [[ "$returns" == "$(( advances - cut_tail ))" ]] \
+    || die "advances and frame conversions must agree ($advances vs $returns, cut_tail=$cut_tail)"
+  (( in_flight == 0 )) || note "the capture ended inside the last advance, before its drain completed (discounted 1)"
+  (( cut_tail == 0 )) || note "the capture ended inside the last advance's return marker (discounted 1)"
   refused=$(count 'IDLE_BOUNDARY_RETURN_REFUSED')
   [[ "$refused" == "0" ]] || die "a committed user return was refused at the frame ($refused)"
 fi

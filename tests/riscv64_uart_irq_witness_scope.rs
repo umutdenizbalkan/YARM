@@ -348,3 +348,19 @@ fn the_driver_uses_a_dedicated_backend_and_acknowledgements() {
     // The only sleep is waiting for QEMU's listening socket before the guest has started.
     assert_eq!(DRIVER.matches("time.sleep(").count(), 1);
 }
+
+/// BL4a: the RISC-V idle acknowledgement is an idle tick that settled back to the `wfi` with
+/// nothing runnable — never the idle ENTRY line, which the idle tick's own queue advance can
+/// overtake by dispatching a task whose deadline it expired.
+#[test]
+fn the_riscv_idle_acknowledgement_is_a_settled_idle_tick() {
+    assert!(DRIVER.contains(
+        "IDLE_RE = re.compile(rb\"RISCV_S_MODE_TIMER_RESUME_IDLE tick=\\d+ runnable=0(?!\\d)\")"
+    ));
+    let idle_re = DRIVER
+        .lines()
+        .find(|l| l.starts_with("IDLE_RE = "))
+        .expect("the RISC-V idle acknowledgement");
+    assert!(!idle_re.contains("RISCV_TRAP_HALTED"), "{idle_re}");
+    assert!(!idle_re.contains('|'), "{idle_re}");
+}

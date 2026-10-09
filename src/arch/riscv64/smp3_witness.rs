@@ -431,7 +431,22 @@ pub fn note_supervisor_entry(cpu: CpuId) {
 }
 
 /// `cpu` has reached its idle wait loop (observation only; cleared by its next supervisor entry).
+///
+/// Called on `cpu` itself, immediately before its wait unmasks. A hart with an enabled interrupt
+/// already pending (`sip & sie`) is not parked: it takes that interrupt the instant `SIE` is set,
+/// before it ever sleeps, and the interrupt's settlement — an idle tick's queue advance, since
+/// BL4a — may dispatch. Such an arrival is not marked; its still-idle return marks the hart once
+/// the settlement has left it idle.
 pub fn note_idle_reached(cpu: usize) {
+    let (sip, sie): (usize, usize);
+    // SAFETY: two CSR reads on this hart.
+    unsafe {
+        core::arch::asm!("csrr {0}, sip", "csrr {1}, sie", out(reg) sip, out(reg) sie,
+            options(nomem, nostack, preserves_flags));
+    }
+    if sip & sie != 0 {
+        return;
+    }
     if let Some(f) = AT_IDLE.get(cpu) {
         f.store(true, Ordering::Release);
     }
@@ -772,10 +787,13 @@ const P1_PARK_SPINS: u64 = 50_000_000;
 /// parked: it becomes true at the in-lock block commit, before the post-lock drain has run. So the
 /// waker's last step before its production operation — C's `C_P1_CALL` (target CPU 1) and S's
 /// `S_P1_REPLY` (target CPU 0) — waits here, bounded, until the target hart is PARKED: in its idle
-/// wait loop, with no current task and an empty run queue. The last clause matters on CPU 0, whose
-/// idle timer tick can expire another task's receive deadline and resume the idle wait with that
-/// task queued (it is dispatched at the next trap); an IPI arriving then drives an idle advance
-/// that selects that task first, which is graded apart as `Preceded`, not as a parked wake. This is
+/// wait loop with nothing pending, with no current task and an empty run queue. The first clause
+/// matters on CPU 0, whose path into idle is long enough that its timer tick is often already
+/// pending when it arrives: that tick is taken the instant the wait unmasks and (BL4a) its queue
+/// advance dispatches whatever it finds — the task this waker's operation is readying, or another
+/// task whose receive deadline the tick expired. Not yet parked, so `note_idle_reached` does not
+/// mark such an arrival; the tick's still-idle return does. An idle advance that still selects
+/// another task first is graded apart as `Preceded`, not as a parked wake. This is
 /// the off-lock DebugLog path — no lock is held across the wait, each read is one rank-1 scheduler
 /// acquisition — and it waits only for the other hart to go idle, never for anything that hart
 /// needs from this one. A timeout is counted per target and the round is then graded as whatever
