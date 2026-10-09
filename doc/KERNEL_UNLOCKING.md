@@ -25674,7 +25674,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | confirmed open — blocked on an ABI decision | see BL1 "Not changed"; every in-tree sender passes offset 0 |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | confirmed open (from source) | `EXC_ILLEGAL_INSTRUCTION` decodes to `Unknown`; the pre-lock bridge settles `Unknown` fatally; the per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad `handle_trap_entry`, unreachable since U9 closed. Not reproduced live; the BL2 route is the owner it should reach |
-| BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed — qualification pending | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
+| BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
 | BL3b — futex check-and-park contract | fixed and delivered (qualified `4c50a864`) | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed); revert control fails the park-window case |
 | BL3c — hosted ack-lease intermittent failure | to verify | |
 | BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | to verify | |
@@ -25965,3 +25965,27 @@ the five hand-offs and four wake-until-parked claims, and that every forcer call
 
 **Not changed.** The reply-timeout oracle (already repaired; its comment still describes the
 pre-BL3b FutexWait), and the kernel.
+
+**Qualification** (frozen `f948cc35`, tree `e04388dd`; fresh isolated worktrees and artifacts; base
+`7a8154d8`; graded on each oracle's own verdict marker, never a runner's exit code — the non-strict
+core smokes exit 0 on a missing marker). **Base, forcer only** (`witness_only.patch`: the feature,
+the forcer and its step marks, the runner plumbing — no hand-off change): every hand-off class fails
+— the x86_64, AArch64 and RISC-V FutexWake oracles park the parent on the unchanged handshake for
+good (`…HANDSHAKE_WAIT hv=192`; the child's own forcer then waits out its bound for a parent wake that
+never comes), the RISC-V FutexWait oracle never completes, and the x86_64 direct-reply and
+shared-region runners fail; the BL3a source guard inserted into the base fails on
+`futex_wait(handshake, hv, hv)`. **Candidate, forced**: every affected oracle passes with every
+forcer window reached — FutexWake on three ports, AArch64 FutexWait, RISC-V FutexWait, and the
+direct-reply and shared-region runners on three ports (seals `result=ok`). **Candidate, unforced**:
+the same oracles and runners, the XFER2 grant witnesses in both profiles on three ports (init's
+mapping headroom), strict cores on three ports (x86_64 in its timer-contract-witness profile); the
+integration suite, ABI crate and census scanner; freestanding warnings identical to `4c50a864`
+(219 / 247 / 229).
+
+One gate failed and was candidate-caused: the full hosted suite (5995 / 1), where
+`direct_path_selected_excluded_paths_absent` still pinned the bare `futex_wait(started, sv, sv)` this
+package replaces. It was re-derived (pin the publish / await pair, forbid the bare wait) and
+re-frozen as `adb90643`, tree `784d6edc`, which differs from `f948cc35` only in `src/kernel/boot/
+tests.rs` — compiled into no kernel or init image, so every live result above stands for it. On
+`adb90643`, from a fresh worktree: `cargo fmt --check`, the full hosted suite (5996, 0 failed), the
+integration suite (30 suites, 291 passed) and the census scanner pass.
