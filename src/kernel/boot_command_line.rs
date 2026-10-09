@@ -1049,14 +1049,13 @@ pub struct YarmBootOptions<'a> {
     /// U9-TIMER1 §3: `yarm.sched_quantum_ticks=N` DEFAULT-OFF override for the number of TIMER
     /// INTERRUPTS in a scheduling quantum.
     ///
-    /// It exists because the quantum and the hardware interval are the same constant
-    /// (`BOOTSTRAP_TIMER_DEADLINE_TICKS`), measured in incompatible units: the hardware deadline is
-    /// in timer units, while `SchedulerTimer` decrements once per INTERRUPT. At the shipped values
-    /// a preempting tick arrives after 50M interrupts on x86_64 and 3.1M on AArch64, so a live
-    /// preemption cannot be witnessed inside any qualification run.
+    /// It was added while the quantum and the hardware interval were the same constant
+    /// (`BOOTSTRAP_TIMER_DEADLINE_TICKS`) in incompatible units — a preempting tick arrived after
+    /// 50M interrupts on x86_64 and 3.1M on AArch64. Since BL4b the shipped quantum is its own
+    /// constant (`SCHED_QUANTUM_TICKS`, about 100 ms of interrupts per port).
     ///
-    /// This separates the two WITHOUT changing the hardware interval, the production cadence or any
-    /// IPC timeout unit: unset (the default) leaves the quantum exactly as it shipped. It is not a
+    /// The knob changes neither the hardware interval nor any IPC timeout unit: unset (the
+    /// default) leaves the quantum exactly as it shipped. It is not a
     /// tuning knob and it is not a test harness — the hardware timer still fires on its normal
     /// deadline and the interrupt is serviced by the production route; only the number of those
     /// interrupts that make a quantum changes.

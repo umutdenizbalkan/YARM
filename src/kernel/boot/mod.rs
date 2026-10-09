@@ -3035,15 +3035,14 @@ pub fn ap_user_dispatch_enabled() -> bool {
 
 /// U9-TIMER1 §3 — the DEFAULT-OFF scheduling-quantum override, in TIMER INTERRUPTS.
 ///
-/// `0` means unset: the scheduler timer keeps the shipped quantum
-/// (`BOOTSTRAP_TIMER_DEADLINE_TICKS`) and nothing about production cadence changes. A non-zero
-/// value replaces ONLY the interrupt count that makes a quantum — the hardware deadline the timer
-/// is programmed with is untouched, so every interrupt still arrives on its normal schedule and is
-/// serviced by the production route.
+/// `0` means unset: the scheduler timer keeps the shipped quantum (`SCHED_QUANTUM_TICKS`). A
+/// non-zero value replaces ONLY the interrupt count that makes a quantum — the hardware deadline
+/// the timer is programmed with (`BOOTSTRAP_TIMER_DEADLINE_TICKS`) is untouched, so every interrupt
+/// still arrives on its normal schedule and is serviced by the production route.
 ///
-/// This exists because the two are the same constant in incompatible units, which makes a live
-/// preempting tick unobservable inside a qualification run on x86_64 (50M interrupts) and AArch64
-/// (3.1M). Separating them is what §3 authorises; tuning the cadence is not.
+/// U9-TIMER1 added this while the shipped quantum WAS the hardware-deadline constant in
+/// incompatible units — 50M interrupts on x86_64, 3.1M on AArch64 — so no preempting tick could be
+/// observed there. BL4b gave the quantum its own constant; the knob remains a test lever.
 pub(crate) static SCHED_QUANTUM_TICKS_OVERRIDE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -3052,11 +3051,15 @@ pub fn set_sched_quantum_ticks_override(ticks: u64) {
 }
 
 /// The quantum the scheduler timer should be built with: the override when one was requested,
-/// otherwise the shipped constant. One reader, so the two cannot disagree.
+/// otherwise the shipped quantum. One reader, so the two cannot disagree.
+///
+/// BL4b — the shipped quantum is `SCHED_QUANTUM_TICKS`, counted in timer INTERRUPTS (about
+/// 100 ms on every port), and never the hardware deadline, which is in each port's own timer
+/// units and is programmed by the timer route alone.
 pub fn sched_quantum_ticks() -> u64 {
     let override_ticks = SCHED_QUANTUM_TICKS_OVERRIDE.load(core::sync::atomic::Ordering::Acquire);
     if override_ticks == 0 {
-        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS
+        crate::arch::platform_constants::SCHED_QUANTUM_TICKS
     } else {
         override_ticks
     }

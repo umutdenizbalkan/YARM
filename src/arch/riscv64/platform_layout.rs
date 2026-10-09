@@ -22,7 +22,16 @@ pub const MAX_IRQ_LINES: usize = 64;
 pub const MAX_CPUS: usize = 64;
 
 pub const BOOTSTRAP_CPU_ID: u8 = 0;
-pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 10;
+/// BL4b — the HARDWARE timer deadline, in this port's own timer units: a `time` CSR delta on
+/// QEMU `virt`'s 10 MHz timebase, so one interrupt period is 100_000 / 10 MHz = 10 ms. The re-arm
+/// owner (`timer::rearm_periodic_deadline`) programs `timer::DEFAULT_TICK_INTERVAL`, and the two are
+/// held equal at compile time there. Never a scheduling quantum (it was, as `10`, until BL4b).
+pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 100_000;
+/// BL4b — the scheduling QUANTUM, in TIMER INTERRUPTS: the number of periodic interrupts a
+/// running task may consume before a tick preempts it (`Timer::new` decrements once per
+/// interrupt). The contract on every port is about 100 ms, and never less than one interrupt: ten
+/// 10 ms periods — the value this port already ran with.
+pub const SCHED_QUANTUM_TICKS: u64 = 10;
 pub const PROFILE_IS_PLACEHOLDER: bool = false;
 
 pub const PLIC_MMIO_BASE: usize = 0x0C00_0000;

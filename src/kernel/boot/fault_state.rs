@@ -2323,8 +2323,8 @@ impl KernelState {
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.
-                // (BOOTSTRAP_TIMER_DEADLINE_TICKS / 16 ≈ 3 ms/tick on QEMU;
-                //  at 90 s we would get ~30 000 ticks — far too many to log.)
+                // (BL4b: one interrupt per hardware deadline — 0.8 s on x86_64, 50 ms on
+                //  AArch64 — so a long boot still produces far too many ticks to log.)
                 // Canonical 199E: AArch64 now delivers this same production tick, so it
                 // shares the identical bounded emission rather than gaining a marker family of
                 // its own. x86_64 keeps the exact code and bound it already had.

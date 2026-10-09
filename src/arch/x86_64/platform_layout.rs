@@ -30,7 +30,16 @@ pub const MAX_IRQ_LINES: usize = 64;
 pub const MAX_CPUS: usize = 64;
 
 pub const BOOTSTRAP_CPU_ID: u8 = 0;
+/// BL4b — the HARDWARE timer deadline, in this port's own timer units: the LAPIC timer's initial
+/// count at divide-by-16 (`lapic_program_timer_deadline`). On QEMU the LAPIC counts at 1 GHz / 16
+/// = 62.5 MHz, so one interrupt period is 50_000_000 / 62.5 MHz = 0.8 s. Programmed by the
+/// timer route's single re-arm; never a scheduling quantum.
 pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 50_000_000;
+/// BL4b — the scheduling QUANTUM, in TIMER INTERRUPTS: the number of periodic interrupts a
+/// running task may consume before a tick preempts it (`Timer::new` decrements once per
+/// interrupt). The contract on every port is about 100 ms, and never less than one interrupt; one
+/// x86_64 period (0.8 s) already exceeds that, so the quantum is a single interrupt.
+pub const SCHED_QUANTUM_TICKS: u64 = 1;
 pub const PROFILE_IS_PLACEHOLDER: bool = false;
 
 // MMIO is reached through the higher-half PML4[511]/PDPT[511] window backed

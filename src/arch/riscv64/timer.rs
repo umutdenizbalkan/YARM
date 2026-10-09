@@ -68,9 +68,14 @@ pub const SBI_EXT_TIME: usize = 0x5449_4D45;
 ///
 /// QEMU virt reports `timebase-frequency = 10000000`, so this is 10 ms. The initial arm and every
 /// re-arm use this same value, which is what makes the timer periodic rather than one-shot. It is
-/// the RISC-V timer module's own wall period and is independent of the scheduler's tick quantum
-/// (`BOOTSTRAP_TIMER_DEADLINE_TICKS`), which is counted in scheduler ticks and is unchanged.
+/// the RISC-V timer module's own wall period and is independent of the scheduler's quantum
+/// (`SCHED_QUANTUM_TICKS`, counted in interrupts). BL4b: the platform's hardware-deadline constant
+/// is this same value, in these same units, and is held equal below.
 pub const DEFAULT_TICK_INTERVAL: u64 = 100_000;
+const _: () = assert!(
+    DEFAULT_TICK_INTERVAL == crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    "the RISC-V hardware deadline is one value in one unit"
+);
 
 static TIMER_INIT_FIRED: AtomicBool = AtomicBool::new(false);
 static TIMER_TICK_COUNT: AtomicU64 = AtomicU64::new(0);

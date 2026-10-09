@@ -173932,13 +173932,10 @@ mod u9dispatchcpu3_recovery_chain {
         with_continuation(&k, ELIGIBLE, 9, 0x9999_0000, 0x999A_0000);
         k.with(|s| s.enqueue_on_cpu(CPU, ELIGIBLE).expect("queued"));
 
-        // A SHORT quantum, installed through the existing test seam. The production quantum is
-        // `BOOTSTRAP_TIMER_DEADLINE_TICKS` — 50_000_000 on x86_64, 3_125_000 on AArch64, 10 on
-        // RISC-V — counted in TIMER INTERRUPTS, because `Timer::new` receives the same constant
-        // that `program_timer_deadline` receives as a HARDWARE deadline. Ticking 50 million times
-        // in a unit test would measure the constant, not the contract; the discriminator under
-        // test is `would_preempt_next`, which is quantum-length-independent. The consequence of
-        // that constant is recorded as a residual finding rather than exercised here.
+        // A known quantum, installed through the existing test seam, so the count below does not
+        // depend on the port. The production quantum is `SCHED_QUANTUM_TICKS` (BL4b), counted in
+        // TIMER INTERRUPTS; the discriminator under test is `would_preempt_next`, which is
+        // quantum-length-independent.
         k.with(|s| s.set_timer_for_test(crate::kernel::scheduler_timer::Timer::new(4)));
 
         // Tick until the seam declines — that decline IS the preempting tick, and it is the only
@@ -173980,37 +173977,25 @@ mod u9dispatchcpu3_recovery_chain {
         );
     }
 
-    /// **RESIDUAL, measured: the quantum and the hardware deadline are one constant — and
-    /// U9-TIMER1 §3 separates them WITHOUT changing production cadence.**
+    /// **BL4b: the quantum and the hardware deadline are two constants in two units.**
     ///
-    /// `Timer::new(N)` sets the quantum in units of TIMER INTERRUPTS — `tick_and_check` is called
-    /// once per interrupt and decrements `ticks_remaining` by one. The same constant is passed to
-    /// `program_timer_deadline` as a HARDWARE deadline. One constant, two incompatible units, and
-    /// the values are not interchangeable:
+    /// `Timer::new(N)` sets the quantum in TIMER INTERRUPTS — `tick_and_check` runs once per
+    /// interrupt and decrements by one. `program_timer_deadline` takes a HARDWARE deadline in the
+    /// port's own timer units. Until BL4b the shipped quantum WAS the hardware constant, so a
+    /// preempting tick came after 50M interrupts on x86_64 and 3.1M on AArch64 (10 on RISC-V,
+    /// whose hardware path ignored the value). Now:
     ///
-    /// | | constant | preempting tick arrives after |
-    /// |---|---|---|
-    /// | RISC-V | 10 | 10 timer interrupts |
-    /// | AArch64 | 3_125_000 | 3.1 million timer interrupts |
-    /// | x86_64 | 50_000_000 | 50 million timer interrupts |
+    /// | | hardware deadline (timer units) | period | quantum (interrupts) |
+    /// |---|---|---|---|
+    /// | x86_64 | 50_000_000 LAPIC counts, ÷16 | 0.8 s | 1 |
+    /// | AArch64 | 3_125_000 `CNTP_TVAL` | 50 ms | 2 |
+    /// | RISC-V | 100_000 `time` | 10 ms | 10 |
     ///
-    /// This does not stall ordinary operation, which advances through syscalls, IPC and wakes
-    /// rather than through quantum preemption. What it bounds is precisely a live preemption
-    /// witness: "the next preempting tick will re-dispatch" is a usable claim on RISC-V and, at
-    /// these values, not one that can be OBSERVED inside a qualification run on x86_64 or AArch64.
-    ///
-    /// U9-TIMER1 needs that witness on all three ports, and §3 authorises exactly one repair for
-    /// it: separate the interrupt-count quantum from the hardware interval, default-off. What this
-    /// guard now pins is that the separation is the ONLY change:
-    ///
-    /// * the quantum reads through ONE owner, `boot::sched_quantum_ticks()`;
-    /// * with no override that owner returns the shipped constant verbatim, so an unconfigured
-    ///   boot has the delivered cadence — the residual above is unrepaired, not hidden;
-    /// * the hardware deadline still uses the constant directly and is NOT routed through the
-    ///   override, so every interrupt keeps arriving on its normal schedule;
-    /// * and the override defaults to `0`/unset, so it can only be turned on by a boot argument.
+    /// Pinned: the quantum reads through ONE owner whose unset value is `SCHED_QUANTUM_TICKS`,
+    /// never the hardware constant; the hardware deadline is programmed from its own constant and
+    /// the quantum (or its override) never reaches it; the override stays default-off.
     #[test]
-    fn the_quantum_and_the_hardware_deadline_are_the_same_constant() {
+    fn the_quantum_and_the_hardware_deadline_are_separate_constants() {
         const BOOTSTRAP: &str = include_str!("bootstrap_state.rs");
         assert!(
             BOOTSTRAP.contains("timer: Timer::new(crate::kernel::boot::sched_quantum_ticks())"),
@@ -174018,15 +174003,14 @@ mod u9dispatchcpu3_recovery_chain {
         );
         assert!(
             !BOOTSTRAP.contains("Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS)"),
-            "and no longer reads the hardware-deadline constant directly"
+            "and never from the hardware-deadline constant"
         );
         const SPLIT: &str = include_str!("../syscall_split.rs");
         assert!(
             SPLIT.contains("crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,"),
-            "and the hardware deadline is still programmed from the constant itself"
+            "the hardware deadline is programmed from its own constant"
         );
-        // Code only: the timer route CITES the knob when recording what it measured, and prose
-        // naming the knob is not the knob reaching a deadline.
+        // Code only: prose naming the knob is not the knob reaching a deadline.
         let split_code: alloc::string::String = SPLIT
             .lines()
             .filter(|l| {
@@ -174036,11 +174020,10 @@ mod u9dispatchcpu3_recovery_chain {
             .collect::<alloc::vec::Vec<_>>()
             .join("\n");
         assert!(
-            !split_code.contains("sched_quantum_ticks"),
-            "the override must never reach a hardware deadline — separating the units is the \
-             whole point, and routing the interval through it would tune the live cadence"
+            !split_code.contains("sched_quantum_ticks")
+                && !split_code.contains("SCHED_QUANTUM_TICKS"),
+            "a quantum must never reach a hardware deadline — the units are incompatible"
         );
-        // The owner: unset means the shipped constant, so production cadence is untouched.
         const BOOT_MOD: &str = include_str!("mod.rs");
         let owner = BOOT_MOD
             .split("pub fn sched_quantum_ticks() -> u64 {")
@@ -174049,18 +174032,47 @@ mod u9dispatchcpu3_recovery_chain {
             .expect("the quantum owner");
         assert!(
             owner.contains("if override_ticks == 0 {")
-                && owner
-                    .contains("crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS"),
-            "unset must resolve to the shipped constant"
+                && owner.contains("crate::arch::platform_constants::SCHED_QUANTUM_TICKS")
+                && !owner.contains("BOOTSTRAP_TIMER_DEADLINE_TICKS"),
+            "unset resolves to the quantum constant, and the owner never reads the deadline"
         );
         assert!(
             BOOT_MOD.contains("SCHED_QUANTUM_TICKS_OVERRIDE: core::sync::atomic::AtomicU64 =\n    core::sync::atomic::AtomicU64::new(0);"),
-            "and the override must be default-off"
+            "and the override stays default-off"
         );
+        // Each port's pair, read from its layout — two constants, each with its stated value.
+        for (layout, deadline, quantum) in [
+            (
+                include_str!("../../arch/x86_64/platform_layout.rs"),
+                "pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 50_000_000;",
+                "pub const SCHED_QUANTUM_TICKS: u64 = 1;",
+            ),
+            (
+                include_str!("../../arch/aarch64/platform_layout.rs"),
+                "pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 3_125_000;",
+                "pub const SCHED_QUANTUM_TICKS: u64 = 2;",
+            ),
+            (
+                include_str!("../../arch/riscv64/platform_layout.rs"),
+                "pub const BOOTSTRAP_TIMER_DEADLINE_TICKS: u64 = 100_000;",
+                "pub const SCHED_QUANTUM_TICKS: u64 = 10;",
+            ),
+        ] {
+            assert!(layout.contains(deadline), "{deadline}");
+            assert!(layout.contains(quantum), "{quantum}");
+        }
+        // RISC-V's re-arm owner programs its own period; it is held equal to the constant.
+        assert!(include_str!("../../arch/riscv64/timer.rs").contains(
+            "DEFAULT_TICK_INTERVAL == crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS"
+        ));
+        // Executed on this build: the owner returns the quantum, not the deadline.
         assert_eq!(
             crate::kernel::boot::sched_quantum_ticks(),
-            crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
-            "executed, not just read: an unconfigured kernel gets the delivered quantum"
+            crate::arch::platform_constants::SCHED_QUANTUM_TICKS
+        );
+        assert_ne!(
+            crate::arch::platform_constants::SCHED_QUANTUM_TICKS,
+            crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS
         );
         // The quantum is counted in calls, i.e. in interrupts — measured, not asserted.
         let mut t = crate::kernel::scheduler_timer::Timer::new(5);
@@ -174073,14 +174085,43 @@ mod u9dispatchcpu3_recovery_chain {
         }
         assert_eq!(
             ticks_to_preempt, 5,
-            "one interrupt consumes one unit of quantum, so the constant's value IS the number \
-             of interrupts between preemptions"
+            "one interrupt consumes one unit of quantum"
+        );
+    }
+
+    /// **BL4b regression: an unconfigured kernel preempts after its quantum of interrupts.**
+    ///
+    /// Behavioural, over the real tick seam on a freshly booted kernel with no override: the
+    /// preempting tick must arrive after exactly `SCHED_QUANTUM_TICKS` interrupts. On the unrepaired
+    /// kernel the quantum is the hardware constant (50_000_000 on this build), so no preempting
+    /// tick arrives inside the bound and this fails.
+    #[test]
+    fn bl4b_an_unconfigured_kernel_preempts_after_its_quantum_of_interrupts() {
+        assert_eq!(
+            crate::kernel::boot::SCHED_QUANTUM_TICKS_OVERRIDE
+                .load(core::sync::atomic::Ordering::Acquire),
+            0,
+            "fixture: no override"
+        );
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| s.set_current_cpu(CPU).expect("cpu"));
+        let mut interrupts = 0u64;
+        let mut preempted = false;
+        for _ in 0..1024 {
+            interrupts += 1;
+            if k.scheduler_tick_if_no_switch_split_mut(CPU).is_none() {
+                preempted = true;
+                break;
+            }
+        }
+        assert!(
+            preempted,
+            "no preempting tick within 1024 interrupts — the quantum is not a quantum"
         );
         assert_eq!(
-            crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
-            50_000_000,
-            "on this build that is fifty million interrupts between preempting ticks — if this \
-             value changes, the observability consequence recorded above changes with it"
+            interrupts,
+            crate::arch::platform_constants::SCHED_QUANTUM_TICKS,
+            "the preempting tick is the quantum's last interrupt"
         );
     }
 

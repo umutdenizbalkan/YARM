@@ -1278,6 +1278,10 @@ mod tests {
                     state.yield_current().expect("switch");
                 }
                 assert_eq!(state.current_tid(), Some(tid));
+                // BL4b: the shipped x86_64 quantum is ONE interrupt, so the timer trap below would
+                // preempt the thread and resume another task. This test is about the TLS restore of
+                // the thread the trap resumes, so the trap must not preempt: a long quantum.
+                state.set_timer_for_test(crate::kernel::scheduler_timer::Timer::new(1_000_000));
 
                 let mut frame = TrapFrame::new(0, [0; 6]);
                 handle_trap_entry(

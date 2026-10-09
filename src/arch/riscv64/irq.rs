@@ -250,12 +250,12 @@ pub(crate) fn write_claim_completion(context: PlicContext, source: u32) {
 /// re-arm here therefore makes it periodic across both origins while keeping it exactly once per
 /// accepted interrupt — there is no second, S-mode-local re-arm.
 ///
-/// `ticks_from_now` is deliberately unused. It carries the SCHEDULER's tick quantum
-/// (`BOOTSTRAP_TIMER_DEADLINE_TICKS`, 10 on this port), which is a count of scheduler ticks and not
-/// a `rdtime` counter delta; using it raw would program a ~1 microsecond deadline on QEMU virt's
-/// 10 MHz timebase and storm. The wall period is owned by the timer module's own
-/// `DEFAULT_TICK_INTERVAL`, which the initial arm also uses, so the initial arm and every re-arm
-/// are identical by construction and cannot drift apart.
+/// `ticks_from_now` is deliberately unused. Since BL4b it is the hardware deadline in `rdtime`
+/// units (`BOOTSTRAP_TIMER_DEADLINE_TICKS`, 100_000), which the timer module holds equal to its own
+/// `DEFAULT_TICK_INTERVAL` at compile time; the period stays owned by that module, which the
+/// initial arm also uses, so the initial arm and every re-arm are identical by construction and
+/// cannot drift apart. (Before BL4b the argument was the scheduler quantum, `10`, which used raw
+/// would have programmed a ~1 microsecond deadline and stormed.)
 ///
 /// Boot hart only, and a complete no-op unless the opt-in feature actually armed the timer: SBI
 /// `set_timer` both clears the pending timer condition and programs the next deadline, so calling
