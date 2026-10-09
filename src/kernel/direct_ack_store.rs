@@ -159,12 +159,11 @@ pub(crate) mod race_hook {
 
     /// Run `f` the next time this thread's store operation reaches `site`.
     pub(crate) fn arm(site: &'static str, f: impl FnOnce() + 'static) {
-        HOOK.with(|h| *h.borrow_mut() = Some((site, Box::new(f))));
+        HOOK.with_borrow_mut(|slot| *slot = Some((site, Box::new(f))));
     }
 
     pub(crate) fn fire(site: &'static str) {
-        let armed = HOOK.with(|h| {
-            let mut slot = h.borrow_mut();
+        let armed = HOOK.with_borrow_mut(|slot| {
             if matches!(&*slot, Some((s, _)) if *s == site) {
                 slot.take().map(|(_, f)| f)
             } else {
