@@ -25676,7 +25676,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | confirmed open (from source) | `EXC_ILLEGAL_INSTRUCTION` decodes to `Unknown`; the pre-lock bridge settles `Unknown` fatally; the per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad `handle_trap_entry`, unreachable since U9 closed. Not reproduced live; the BL2 route is the owner it should reach |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
 | BL3b — futex check-and-park contract | fixed and delivered (qualified `4c50a864`) | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed); revert control fails the park-window case |
-| BL3c — hosted ack-lease intermittent failure | to verify | |
+| BL3c — hosted ack-lease intermittent failure | fixed — qualification pending | classified PRODUCTION: a stale `release` / entitled `consume` decided on the endpoint generation, then the state, then exchanged the state alone, so a slot recycled for the same index's next incarnation in between was retired or consumed; forced deterministically with `race_hook`, three regressions fail on the unrepaired store |
 | BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | to verify | |
 | BL4b — scheduler quantum / hardware deadline coupling | to verify | |
 | BL5a — reply-timeout retirement checker count/scope failures | to verify | |
@@ -25989,3 +25989,51 @@ re-frozen as `adb90643`, tree `784d6edc`, which differs from `f948cc35` only in 
 tests.rs` — compiled into no kernel or init image, so every live result above stands for it. On
 `adb90643`, from a fresh worktree: `cargo fmt --check`, the full hosted suite (5996, 0 failed), the
 integration suite (30 suites, 291 passed) and the census scanner pass.
+
+### BL3c — the acknowledgement store's terminal edges and the next incarnation
+
+**Classification: a production defect**, not test synchronization and not an observer. The
+intermittent hosted failure was `g_release_never_retires_a_recycled_pair`:
+`run 32: the fresh lease survived the stale release`, so `is_claimable(new)` was false after both
+threads joined. The publish thread had succeeded (its `expect` would have panicked the join), so the
+new pair was committed and then retired by the stale release.
+
+**First causal failure.** `DirectAckStore::release` read the endpoint generation, then the state,
+then the waiter, then compare-exchanged the STATE word alone from `Committed` to `Released`. The
+slot's reservation generation lived in a separate atomic. One slot per endpoint index stops a
+different endpoint from taking a slot over, which is the guarantee the code's own comment relied on
+when it dropped the admission guard — but it does not stop the SAME index's next incarnation:
+`Consumed`/`Released` → `Reserved` → `Committed` with a new endpoint generation and, routinely, the
+same waiter. A release that had already passed its generation check then found `Committed`, matched
+the waiter, and won the exchange — on the new pair. `consume` had the identical shape: an entitled
+consumer of an ended lease could take the next incarnation's acknowledgement, a duplicate-consume /
+ownership violation. A third, related window: `release` wiped the waiter identity and destination
+pointers AFTER its exchange, and a `Released` slot can be re-reserved the instant the exchange
+lands, so the wipe could erase the next incarnation's freshly stamped waiter (its entitled consumer
+then reads `ForeignWaiter`).
+
+**Repair (`src/kernel/direct_ack_store.rs`).** The slot's state and reservation generation are one
+word, `pack(slot_generation, state)`; entering `Reserved` bumps the generation in the same
+compare-exchange. `consume`, `release` and `restore` each decide on ONE observed word and
+compare-exchange exactly that word; when the slot moved in between, the exchange fails and the
+decision is re-made against what it holds now (`StaleGeneration`, `AlreadyConsumed`, …). `consume`
+reads the fields and sequence before its exchange, because the spent slot may be re-reserved at once
+afterwards. `release` writes nothing after its exchange; a released slot's fields are inert
+(`consume`, `snapshot` and `restore` all refuse `Released`) and the next reservation overwrites
+them, so `waiter_is_absent` treats `Released` like `Vacant`. `commit` and `cancel` move only their
+own exact `Reserved` word. Every rejection keeps its classification and counter; genuine duplicate
+consumes and releases and foreign waiters stay refused and counted. The store stays lock-free; no
+guard, capacity or consumer changed.
+
+**Deterministic regressions (hosted, the production owners driving the interleaving).** A
+`cfg(test)` hook, `race_hook`, runs one armed closure when an owner reaches a named site, so the race
+is executed rather than sampled: `bl3c_a_stale_release_never_retires_the_next_incarnation` (publish
+the next incarnation at `release_observed`), `bl3c_a_stale_consume_never_takes_the_next_incarnation`
+(at `consume_observed`), and `bl3c_a_finished_release_never_writes_into_the_next_incarnation` (at
+`release_transitioned`). With only the hook added at the equivalent points of the unrepaired store,
+all three fail. The sampled test is kept unchanged as a supplementary stress, not as proof.
+Three memory-ordering source guards (`stage199a2d1_memory_ordering`) pinned the two-atomic shape and
+were re-derived, none weakened: commit's publication is now the owner's AcqRel exchange of its own
+`Reserved` word, still the last slot write after every Relaxed field store; the three readers gate
+through `slot.state()`, whose single load of the word is pinned `Acquire`; reserve, consume and
+restore are pinned as AcqRel/Acquire exchanges, the last two of exactly the observed word.

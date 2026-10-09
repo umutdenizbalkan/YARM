@@ -86415,22 +86415,31 @@ mod stage199a2d1_memory_ordering {
             body.contains("slot.seq.store(seq, Ordering::Relaxed);"),
             "the publication sequence is stored Relaxed before the Release"
         );
+        // BL3c re-derivation: state and reservation generation are one word, so the publication
+        // is the owner's exchange of exactly its own `Reserved` word for `Committed` — AcqRel on
+        // success, which carries the Release this guard has always required.
+        let publish = "            .compare_exchange(\n                pack(reservation.slot_generation, SLOT_RESERVED),\n                pack(reservation.slot_generation, SLOT_COMMITTED),\n                Ordering::AcqRel,\n                Ordering::Acquire,\n            )";
         assert!(
-            body.contains("slot.state.store(SLOT_COMMITTED, Ordering::Release);"),
-            "the COMMITTED state must be published with Release"
+            body.contains(publish),
+            "the COMMITTED state must be published with a Release-carrying exchange"
         );
         assert!(
-            !body.contains("slot.state.store(SLOT_COMMITTED, Ordering::Relaxed)"),
+            !body.contains("Ordering::Relaxed,\n                Ordering::"),
             "the publication must not be Relaxed"
         );
-        // The Release is the LAST slot store in commit — only the counter and the Ok follow.
+        // The publication is the LAST slot store in commit — only the counter and the Ok follow.
         let tail = body
-            .split("slot.state.store(SLOT_COMMITTED, Ordering::Release);")
+            .split(publish)
             .nth(1)
             .expect("commit publishes the state");
         assert!(
             !tail.contains("slot."),
             "no slot field is written after the Release publication (tail={tail:?})"
+        );
+        let before = body.split(publish).next().expect("the field stores");
+        assert!(
+            before.contains("slot.payload_user_ptr") && before.contains("slot.meta_user_len"),
+            "every field is stored before the publication"
         );
     }
 
@@ -86449,15 +86458,25 @@ mod stage199a2d1_memory_ordering {
                 .split("\n    /// ")
                 .next()
                 .expect("reader body bounded");
+            // BL3c re-derivation: the state lives in the slot word now, and every reader gates
+            // through `slot.state()`, whose one load of that word is pinned Acquire below.
             assert!(
-                f.contains("state.load(Ordering::Acquire)"),
-                "{reader}: the state gate must be an Acquire load"
+                f.contains("slot.state()"),
+                "{reader}: the state gate must go through the Acquire word load"
             );
             assert!(
-                !f.contains("state.load(Ordering::Relaxed)"),
+                !f.contains("load(Ordering::Relaxed) == SLOT_")
+                    && !f.contains("word.load(Ordering::Relaxed)"),
                 "{reader}: the state gate must never be a Relaxed load"
             );
         }
+        assert!(
+            body.contains(
+                "    fn word(&self) -> u64 {\n        self.word.load(Ordering::Acquire)\n    }"
+            ) && body
+                .contains("    fn state(&self) -> u8 {\n        word_state(self.word())\n    }"),
+            "the one state gate is an Acquire load of the slot word"
+        );
     }
 
     #[test]
@@ -86465,19 +86484,21 @@ mod stage199a2d1_memory_ordering {
         let body = store_src();
         // Reserving this endpoint's slot is the CAS that makes two racing CPUs resolve to one
         // winner. It moves from whatever non-live state the slot is in (`Vacant`, or either
-        // spent terminal) to `Reserved` — one word, one decision, no allocation policy.
+        // spent terminal) to `Reserved` — one word, one decision, no allocation policy. BL3c: the
+        // same exchange bumps the reservation generation, which is what makes every word a stale
+        // terminal edge observed before it unmatchable.
         assert!(
             body.contains(
-                "                .compare_exchange(current, SLOT_RESERVED, Ordering::AcqRel, Ordering::Acquire)"
+                "                .compare_exchange(\n                    current,\n                    pack(next, SLOT_RESERVED),\n                    Ordering::AcqRel,\n                    Ordering::Acquire,\n                )"
             ),
             "the reserve CAS must be AcqRel success / Acquire failure"
         );
-        // Consuming is the exactly-once ownership transfer.
+        // Consuming is the exactly-once ownership transfer — of exactly the observed word (BL3c).
         assert!(
             body.contains(
-                "                SLOT_COMMITTED,\n                SLOT_CONSUMED,\n                Ordering::AcqRel,\n                Ordering::Acquire,"
+                "                    observed,\n                    pack(word_generation(observed), SLOT_CONSUMED),\n                    Ordering::AcqRel,\n                    Ordering::Acquire,"
             ),
-            "the consume CAS must be AcqRel success / Acquire failure"
+            "the consume CAS must be AcqRel success / Acquire failure, on the observed word"
         );
         // Restore re-arms only a CONSUMED slot whose publication sequence matches exactly.
         let restore = body
@@ -86488,15 +86509,16 @@ mod stage199a2d1_memory_ordering {
             .next()
             .expect("restore body bounded");
         assert!(
-            restore.contains("slot.state.load(Ordering::Acquire) == SLOT_CONSUMED")
+            restore.contains("let observed = slot.word();")
+                && restore.contains("word_state(observed) == SLOT_CONSUMED")
                 && restore.contains("slot.seq.load(Ordering::Relaxed) == seq"),
             "restore must gate on a CONSUMED slot with an exact sequence match"
         );
         assert!(
             restore.contains(
-                "                        SLOT_CONSUMED,\n                        SLOT_COMMITTED,\n                        Ordering::AcqRel,\n                        Ordering::Acquire,"
+                "                        observed,\n                        pack(word_generation(observed), SLOT_COMMITTED),\n                        Ordering::AcqRel,\n                        Ordering::Acquire,"
             ),
-            "restore must re-arm through an AcqRel CAS, not a blind store"
+            "restore must re-arm through an AcqRel CAS of the observed word, not a blind store"
         );
     }
 
@@ -89895,6 +89917,93 @@ mod stage199d_multi_pair_races {
                 "run {run}: and the fresh acknowledgement is still deliverable"
             );
         }
+    }
+
+    // ── BL3c — the same windows, forced: a stale terminal edge against the NEXT incarnation ──
+    //
+    // `g_release_never_retires_a_recycled_pair` above samples this race with two threads and
+    // failed intermittently: a stale `release` checked the endpoint generation, the slot was then
+    // recycled for the same index's next incarnation with the same waiter, and the release's
+    // compare-exchange out of `Committed` retired the new pair. These drive the production owners
+    // through exactly that interleaving with `race_hook`, so it is reproduced on every run.
+
+    /// A stale RELEASE that observed the slot, then lost it to the next incarnation's publish.
+    #[test]
+    fn bl3c_a_stale_release_never_retires_the_next_incarnation() {
+        use crate::kernel::direct_ack_store::race_hook;
+        let store = Arc::new(DirectAckStore::new());
+        let (old_e, old_w) = (ep(1, 5), waiter(41, 1));
+        publish(&store, old_e, old_w);
+        assert!(store.consume(old_e, Some(old_w)).ok().is_some());
+        let (new_e, new_w) = (ep(1, 6), waiter(41, 1));
+        let publisher = Arc::clone(&store);
+        race_hook::arm("release_observed", move || {
+            publish(&publisher, new_e, new_w);
+        });
+        let stale = store.release(old_e, old_w);
+        assert!(
+            stale.released_seq().is_none(),
+            "the stale release retired something: {stale:?}"
+        );
+        assert_eq!(store.release_count(), 0, "it retired nothing");
+        assert!(
+            store.is_claimable(new_e),
+            "the next incarnation's lease is intact"
+        );
+        assert!(
+            store.consume(new_e, Some(new_w)).ok().is_some(),
+            "and its acknowledgement is still deliverable"
+        );
+    }
+
+    /// A stale ENTITLED CONSUME that observed the slot, then lost it to the next incarnation.
+    /// Taking the new pair would hand one waiter's acknowledgement to a consumer entitled only
+    /// to an ended lease — the duplicate-consume / ownership violation.
+    #[test]
+    fn bl3c_a_stale_consume_never_takes_the_next_incarnation() {
+        use crate::kernel::direct_ack_store::race_hook;
+        let store = Arc::new(DirectAckStore::new());
+        let (old_e, old_w) = (ep(2, 7), waiter(42, 2));
+        publish(&store, old_e, old_w);
+        assert!(store.release(old_e, old_w).released_seq().is_some());
+        let (new_e, new_w) = (ep(2, 8), waiter(42, 2));
+        let publisher = Arc::clone(&store);
+        race_hook::arm("consume_observed", move || {
+            publish(&publisher, new_e, new_w);
+        });
+        let stale = store.consume(old_e, Some(old_w));
+        assert!(
+            stale.ok().is_none(),
+            "the stale consumer took the next incarnation's acknowledgement"
+        );
+        assert_eq!(store.consume_count(), 0, "nothing was consumed");
+        assert!(store.is_claimable(new_e));
+        assert!(store.consume(new_e, Some(new_w)).ok().is_some());
+    }
+
+    /// A release that WON its own pair, and then the slot was recycled before the release had
+    /// finished: nothing the release does after its exchange may land in the next incarnation.
+    #[test]
+    fn bl3c_a_finished_release_never_writes_into_the_next_incarnation() {
+        use crate::kernel::direct_ack_store::race_hook;
+        let store = Arc::new(DirectAckStore::new());
+        let (old_e, old_w) = (ep(3, 1), waiter(43, 3));
+        publish(&store, old_e, old_w);
+        let (new_e, new_w) = (ep(3, 2), waiter(43, 3));
+        let publisher = Arc::clone(&store);
+        race_hook::arm("release_transitioned", move || {
+            publish(&publisher, new_e, new_w);
+        });
+        assert!(
+            store.release(old_e, old_w).released_seq().is_some(),
+            "the release ends its own lease"
+        );
+        let next = store.consume(new_e, Some(new_w)).ok();
+        assert_eq!(
+            next.map(|(f, _)| f),
+            Some(fields(new_e, new_w)),
+            "the next incarnation keeps its own waiter and destinations"
+        );
     }
 
     fn spawn_all<F>(threads: usize, barrier: Arc<Barrier>, body: F)
