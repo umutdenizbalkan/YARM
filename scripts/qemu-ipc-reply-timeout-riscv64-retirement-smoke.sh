@@ -352,8 +352,16 @@ verify_no_duplicate_completion_delivery() {
 # they are strictly stronger than the global `count == 1` they replace:
 #   (a) POSITIONAL — exactly one commit lies inside the oracle's own window, delimited by two
 #       INDEPENDENTLY identity-scoped lines: the oracle's ARMED and the oracle's DELIVERED;
-#   (b) CARDINAL — the commit count equals the number of DISTINCT settled caller identities, so a
-#       genuine duplicate commit fails while N legitimate unrelated callers pass.
+#   (b) PAIRED — every reply-timeout SETTLEMENT (`IPC_REPLY_TIMEOUT_OK`) is followed by exactly one
+#       commit before the next settlement, and no commit appears without one. A duplicate, an
+#       orphan, a missing or a reordered commit fails while N legitimate settlements pass.
+#
+# BL5a: (b) used to tie the commit count to the number of distinct DELIVERED identities. That
+# marker is the resume boundary of EVERY blocked-syscall completion, and an ordinary receive
+# timeout delivers through it with the same `class=IpcRecv result=TimedOut` — the supervisor's
+# periodic receive timeouts alone produced 1,185 and then 2,625 of them against two reply-timeout
+# commits, so the check failed on every correct boot. The settlement is the reply-timeout class's
+# own event, emitted once per settled terminal, so it is the population a commit belongs to.
 verify_oracle_completion_committed_once() {
   local norm="$1" arch="$2" tid="$3" a d inwin total distinct
   a=$(rg -a -n -F "IPC_REPLY_TIMEOUT_ARMED arch=${arch} caller_tid=${tid} " "$norm" 2>/dev/null | head -1 | cut -d: -f1)
@@ -362,9 +370,16 @@ verify_oracle_completion_committed_once() {
   (( a < d )) || { die "the oracle's registration must precede its completion delivery ($a,$d)"; return; }
   inwin=$(rg -a -n -F "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=${arch} terminal=Timeout result=ok" "$norm" 2>/dev/null           | cut -d: -f1 | awk -v lo="$a" -v hi="$d" '$1 > lo && $1 < hi' | wc -l | tr -d ' ')
   [[ "$inwin" == "1" ]]     || die "oracle-window COMPLETION_COMMITTED count != 1 (got $inwin) between lines $a and $d"
-  total=$(rg -a -c -F "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=${arch} terminal=Timeout result=ok" "$norm" 2>/dev/null || echo 0)
-  distinct=$(delivered_identities "$norm" | sort -u | wc -l | tr -d ' ')
-  [[ "$total" == "$distinct" ]]     || die "COMPLETION_COMMITTED count ($total) != distinct settled caller identities ($distinct) — duplicate or orphan commit"
+  local pairing
+  pairing=$(rg -a -n -e "IPC_REPLY_TIMEOUT_OK arch=${arch} terminal=Timeout" \
+              -e "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=${arch} terminal=Timeout result=ok" "$norm" 2>/dev/null \
+    | awk '/IPC_REPLY_TIMEOUT_OK/ { if (open) { print "missing commit before line " $0; bad=1 } open=1; s++; next }
+           /IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED/ { if (!open) { print "orphan or duplicate commit at line " $0; bad=1 } open=0; c++; next }
+           END { if (open) { print "the last settlement was never committed"; bad=1 }
+                 if (s != c) { print "settlements=" s " commits=" c; bad=1 }
+                 if (s == 0) { print "no settlement at all"; bad=1 }
+                 exit bad }' | cut -d: -f1,2 | head -3 | tr '\n' ' ')
+  [[ -z "$pairing" ]] || die "reply-timeout settlements and COMPLETION_COMMITTED do not pair one-to-one: ${pairing}"
 }
 
 # The ORACLE's OWN ordered chain. Every position is selected by the oracle's identity, so an
@@ -385,6 +400,42 @@ verify_oracle_ordered_chain() {
   else
     die "oracle-scoped marker sequence incomplete (oa=$oa oc=$oc od=$od ou=$ou)"
   fi
+}
+
+# BL5a — the late reply after a timeout win is refused by ONE of TWO owners:
+#   * the LEGACY reserve decline inside the broad handler — `IPC_REPLY_WIN_RESERVE ... outcome=decline
+#     reason=TimeoutAlreadyClaimed` (no other decline reason is acceptable, and in particular none
+#     may mention deadline bookkeeping);
+#   * the PRE-LOCK refusal DIRECT3-CAP-FINAL §7 added, which answers the same typed error at the
+#     verdict without entering the broad dispatcher — `IPCREPLY_DIRECT_REFUSED_PRE_LOCK`, scoped to
+#     the ORACLE's record and generation and INERT (no copy, no wake, no mutation).
+# Exactly one refusal in total, and it must lie after the oracle's committed completion and before
+# its userspace completion, followed by the server observing the rejection.
+verify_late_reply_refused_once() {
+  local norm="$1" arch="$2" tid="$3" legacy declines prelock_any prelock inert at oc ou
+  legacy=$(rg -a -c -F "IPC_REPLY_WIN_RESERVE arch=${arch} outcome=decline reason=TimeoutAlreadyClaimed result=ok" "$norm" 2>/dev/null || echo 0)
+  declines=$(rg -a -c -F "IPC_REPLY_WIN_RESERVE arch=${arch} outcome=decline" "$norm" 2>/dev/null || echo 0)
+  prelock_any=$(rg -a -c -F "IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} " "$norm" 2>/dev/null || echo 0)
+  prelock=$(rg -a -c -e "^IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} replier_tid=[0-9]+ .*err=WrongObject" "$norm" 2>/dev/null || echo 0)
+  inert=$(rg -a -c -e "^IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} replier_tid=[0-9]+ terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok" "$norm" 2>/dev/null || echo 0)
+  (( declines == legacy )) || { die "a reply-win reserve declined for another reason (${declines} declines, ${legacy} TimeoutAlreadyClaimed)"; return; }
+  (( legacy + prelock_any == 1 )) || { die "the late reply must be refused exactly once (legacy=${legacy} pre_lock=${prelock_any})"; return; }
+  (( prelock_any == prelock && prelock == inert )) || { die "the pre-lock refusal is not an inert WrongObject refusal (lines=${prelock_any} wrong_object=${prelock} inert=${inert})"; return; }
+  if (( legacy == 1 )); then
+    at=$(rg -a -n -F "IPC_REPLY_WIN_RESERVE arch=${arch} outcome=decline reason=TimeoutAlreadyClaimed" "$norm" | head -1 | cut -d: -f1)
+  else
+    at=$(rg -a -n -F "IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} " "$norm" | head -1 | cut -d: -f1)
+  fi
+  oc=$(rg -a -n -F "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=${tid} " "$norm" 2>/dev/null | head -1 | cut -d: -f1)
+  oc=$(rg -a -n -F "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=${arch} terminal=Timeout result=ok" "$norm" 2>/dev/null \
+       | cut -d: -f1 | awk -v hi="${oc:-0}" '$1 < hi' | tail -1)
+  ou=$(rg -a -n -F "USER_LOG tid=${tid} msg=RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut" "$norm" 2>/dev/null | head -1 | cut -d: -f1)
+  if [[ -z "$at" || -z "$oc" || -z "$ou" ]] || (( at <= oc || at >= ou )); then
+    die "the late-reply refusal must lie after the oracle's committed completion and before its userspace completion (commit=${oc:-none} refusal=${at:-none} done=${ou:-none})"
+    return
+  fi
+  rg -a -q -e "IPC_REPLY_TIMEOUT_ORACLE_SERVER_LATE_REPLY rejected=1" "$norm" \
+    || die "the oracle server never observed its late reply being rejected"
 }
 
 forbid_log() {
@@ -411,6 +462,7 @@ fixture_log() {
     *)
       # An unrelated production caller settles first, in full.
       echo "IPC_REPLY_TIMEOUT_ARMED arch=riscv64 caller_tid=2 caller_asid=2 record_index=0 record_generation=1 terminal_epoch=1 token_slot=0 token_generation=1 deadline=7 result=ok"
+      echo "$FIXTURE_OK"
       echo "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64 terminal=Timeout result=ok"
       echo "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=2 class=IpcRecv result=TimedOut code=9 blocked_generation=1 sepc=0x4027fa final_a0=9 final_a1=0 result=ok"
       if [[ "$kind" == "unrelated_duplicate" ]]; then
@@ -427,16 +479,42 @@ fixture_log() {
   case "$kind" in
     oracle_missing_delivery) ;;   # oracle registers, never settles
     *)
-      echo "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64 terminal=Timeout result=ok"
+      [[ "$kind" == "commit_without_settlement" ]] || echo "$FIXTURE_OK"
+      [[ "$kind" == "settlement_without_commit" ]] \
+        || echo "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64 terminal=Timeout result=ok"
       echo "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=1 class=IpcRecv result=TimedOut code=9 blocked_generation=18 sepc=0x406a7e final_a0=9 final_a1=0 result=ok"
       if [[ "$kind" == "oracle_duplicate" ]]; then
         echo "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64 terminal=Timeout result=ok"
         echo "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=1 class=IpcRecv result=TimedOut code=9 blocked_generation=18 sepc=0x406a7e final_a0=9 final_a1=0 result=ok"
       fi
+      # BL5a: the late reply's refusal, by one owner or the other (or a malformed one).
+      case "$kind" in
+        refusal_none) ;;
+        refusal_legacy) echo "IPC_REPLY_WIN_RESERVE arch=riscv64 outcome=decline reason=TimeoutAlreadyClaimed result=ok" ;;
+        refusal_both)
+          echo "IPC_REPLY_WIN_RESERVE arch=riscv64 outcome=decline reason=TimeoutAlreadyClaimed result=ok"
+          echo "$FIXTURE_PRELOCK" ;;
+        refusal_not_inert) echo "${FIXTURE_PRELOCK/reply_copies=0 caller_wakes=0 mutations=0/reply_copies=1 caller_wakes=0 mutations=1}" ;;
+        refusal_other_record) echo "${FIXTURE_PRELOCK/record_index=1 record_generation=17/record_index=7 record_generation=17}" ;;
+        refusal_other_reason) echo "IPC_REPLY_WIN_RESERVE arch=riscv64 outcome=decline reason=DeadlineBookkeeping result=ok"
+                              echo "$FIXTURE_PRELOCK" ;;
+        *) echo "$FIXTURE_PRELOCK" ;;
+      esac
+      [[ "$kind" == "refusal_none" ]] || echo "USER_LOG tid=10008 msg=IPC_REPLY_TIMEOUT_ORACLE_SERVER_LATE_REPLY rejected=1 err=true"
       echo "USER_LOG tid=1 msg=RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok"
       ;;
   esac
+  # BL5a: the boot also holds the supervisor's ordinary receive timeouts, which deliver through the
+  # same resume-boundary marker with the same class and result — hundreds per boot, each its own
+  # blocked generation, none of them a reply-timeout completion.
+  if [[ "$kind" == "with_ordinary_receive_timeouts" ]]; then
+    for g in 40 41 42 43 44 45 46 47; do
+      echo "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=2 class=IpcRecv result=TimedOut code=9 blocked_generation=${g} sepc=0x402758 final_a0=9 final_a1=0 result=ok"
+    done
+  fi
 }
+FIXTURE_OK="IPC_REPLY_TIMEOUT_OK arch=riscv64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok"
+FIXTURE_PRELOCK="IPCREPLY_DIRECT_REFUSED_PRE_LOCK record_index=1 record_generation=17 replier_tid=10008 terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject result=ok"
 
 # Run every scoped check against one fixture. Returns 0 when all pass, 1 when any died.
 self_test_checks() {
@@ -447,6 +525,7 @@ self_test_checks() {
     verify_oracle_completion_delivered_once "$f" "$ORACLE_TID"
     verify_oracle_completion_committed_once "$f" riscv64 "$ORACLE_TID"
     verify_oracle_ordered_chain "$f" riscv64 "$ORACLE_TID"
+    verify_late_reply_refused_once "$f" riscv64 "$ORACLE_TID"
   fi
   verify_no_duplicate_completion_delivery "$f"
   return "$fail"
@@ -463,7 +542,16 @@ self_test() {
       "oracle_duplicate:fail" \
       "unrelated_duplicate:fail" \
       "no_provision:fail" \
-      "malformed_armed:fail"; do
+      "malformed_armed:fail" \
+      "with_ordinary_receive_timeouts:pass" \
+      "commit_without_settlement:fail" \
+      "settlement_without_commit:fail" \
+      "refusal_legacy:pass" \
+      "refusal_none:fail" \
+      "refusal_both:fail" \
+      "refusal_not_inert:fail" \
+      "refusal_other_record:fail" \
+      "refusal_other_reason:fail"; do
     kind="${spec%%:*}"; expect="${spec##*:}"
     fixture_log "$kind" >"$dir/$kind.log"
     rc=0; ( self_test_checks "$dir/$kind.log" ) >"$dir/$kind.out" 2>&1 || rc=1
@@ -480,7 +568,7 @@ self_test() {
     echo "STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST result=fail"
     return 1
   fi
-  echo "STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST cases=7 result=ok"
+  echo "STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST cases=16 result=ok"
   return 0
 }
 
@@ -543,11 +631,10 @@ if (( ! fail )); then
   # gate is armed only in reply-wins mode, so no gate marker may appear here at all and the
   # production collector must have published + drained its work normally (asserted above).
   forbid_log "$TW" "IPC_REPLY_TIMEOUT_COLLECTOR_GATE"
-  # The reply-win reserve must have DECLINED for the single legitimate reason: the timeout
-  # already owned the terminal. No other decline reason is acceptable, and in particular none
-  # may mention deadline bookkeeping.
-  verify_log "$TW" \
-    "IPC_REPLY_WIN_RESERVE arch=riscv64 outcome=decline reason=TimeoutAlreadyClaimed result=ok"
+  # The late reply must be REFUSED exactly once, for the single legitimate reason: the timeout
+  # already owned the terminal. BL5a: that refusal has TWO owners since DIRECT3-CAP-FINAL §7 (the
+  # AArch64 evaluator already knows both), and this cell only knew the legacy one.
+  [[ -n "$ORACLE_TID" ]] && verify_late_reply_refused_once "$TW" riscv64 "$ORACLE_TID"
   forbid_log "$TW" "IPC_REPLY_WIN_RESERVE arch=riscv64 outcome=ok"
   assert_single_boot_instance "$TW" "$LOGDIR/core-timeout-wins.log" timeout-wins
   recheck_sha_clean
