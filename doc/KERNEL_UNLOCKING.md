@@ -25670,7 +25670,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 
 | Issue | Status | Evidence / prerequisite |
 |---|---|---|
-| BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed (this section, BL1) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
+| BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | confirmed open — blocked on an ABI decision | see BL1 "Not changed"; every in-tree sender passes offset 0 |
 | BL2 — x86 user port-I/O fault containment | confirmed open | IRQ3 omitted its live isolation probe |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | to verify | |
@@ -25738,6 +25738,16 @@ until release.
   `USER_MAP_PA_CHECK` records inside each delivery — page 1's frame equal to page 0's plus `0x1000`.
   The unrepaired kernel with the same userspace fails every port (`page1=0`, e.g. x86_64 installing
   `0x1031d000` for both pages); the repaired kernel passes every port.
+
+**Qualification** (frozen `bb231093`, tree `bcb9bb0c`, fresh isolated worktree and artifacts;
+base `bdd0028e`). Every scheduled gate passed, none re-run: the 19 hosted `u9_recv_queue1_parity`
+cases; the ordinary-route two-page witness, the NR 30 grant witness and the direct shared-region
+cell on x86_64, AArch64 and RISC-V; strict core smokes on all three ports (x86_64 in its
+timer-contract-witness profile, from artifacts built for that run); `cargo fmt --check`; the full
+hosted suite; the integration suite; the census scanner (U9 unchanged); freestanding warnings
+identical to base on every port (219 / 247 / 229, identical classes). Revert control: with only the
+two mapping loops restored to `bdd0028e`, `every_page_of_a_multi_page_region_is_backed_by_its_own_frame`
+fails at page 1 (`0x10180000` where `0x10181000` was required) while release and rollback pass.
 
 **Not changed (BL1-a, open).** The descriptor's `offset` (`IpcSend` arg 1) is documented in
 `doc/IPC.md` §8.2 as a byte offset into the source object, but no receive path applies it: the
