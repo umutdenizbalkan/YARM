@@ -411,9 +411,53 @@ u9ft4_require_one "broad dispatcher skipped for the terminal fault" \
 # What the route actually owes is asserted instead, and it is stricter than the literal was: a
 # replacement is selected exactly once, it is NOT the task that just faulted, and every step
 # that follows names that SAME task.
-u9ft4_replacement="$(printf '%s\n' "$u9ft4_log" \
-  | rg -a -o -N 'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=([0-9]+)' -r '$1' \
-  | head -n1)"
+#
+# BL4b — and the route owes it ONLY when there is one to select. With the quantum preempting,
+# the other boot tasks can already have run and blocked by the time init faults, so the queue the
+# drain reads is genuinely empty. Then the correct ending is the drain's idle settlement, and
+# the selection step says so itself: `DEQUEUE_OK tid=idle` with `DECLINED reason=idle` (an EMPTY
+# queue — never `NoneAcceptable`, which would mean refused queued work). Which ending applies is
+# read from the FIRST selection after the terminal commit, and each ending is then held to its
+# own exact chain; the other ending's markers must be absent from that drain.
+u9ft4_after="$(printf '%s\n' "$u9ft4_log" | sed -n '/TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred/,$p')"
+u9ft4_first_pick="$(printf '%s\n' "$u9ft4_after" \
+  | rg -a -o -N -m1 'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=([0-9]+|idle)' -r '$1' || true)"
+u9ft4_first_pick="$(printf '%s' "$u9ft4_first_pick" | head -n1)"
+if [[ "$u9ft4_first_pick" == "idle" ]]; then
+  # The drain segment: from the commit to the idle landing it ends in.
+  u9ft4_drain="$(printf '%s\n' "$u9ft4_after" | sed -n '1,/AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0/p')"
+  u9ft4_seg_count() { printf '%s\n' "$u9ft4_drain" | rg -a -F -c -- "$1" || printf '0'; }
+  u9ft4_idle_bad=0
+  for m in \
+    'AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid=1' \
+    'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=idle' \
+    'AARCH64_FUTEX_WAIT_DISPATCH_DECLINED cpu=0 reason=idle' \
+    'AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=0' \
+    'AARCH64_FUTEX_WAIT_DISPATCH_SETTLED cpu=0 incoming=none reason=idle settlement=post_lock_idle' \
+    'AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle' \
+    'AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0'; do
+    n="$(u9ft4_seg_count "$m")"
+    if [[ "$n" != "1" ]]; then
+      echo "[error] U9-FT4: empty-queue drain step expected exactly once after the fault, got ${n}: $m"
+      u9ft4_idle_bad=1
+    fi
+  done
+  for m in 'reason=none_acceptable' 'AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK' \
+    'AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK' 'AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok'; do
+    n="$(u9ft4_seg_count "$m")"
+    if [[ "$n" != "0" ]]; then
+      echo "[error] U9-FT4: the empty-queue drain must not also select: ${n} x $m"
+      u9ft4_idle_bad=1
+    fi
+  done
+  if (( u9ft4_idle_bad )); then
+    u9ft4_fail=1
+  else
+    echo "[ok] U9-FT4: the queue was EMPTY when the fault landed (DECLINED reason=idle); the drain settled post-lock idle exactly once and selected nothing"
+  fi
+else
+u9ft4_replacement="$(printf '%s\n' "$u9ft4_log" \  | rg -a -o -N 'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=([0-9]+)' -r '$1' \
+  | head -n1 || true)"
 if [[ -z "$u9ft4_replacement" ]]; then
   echo "[error] U9-FT4: no replacement task was selected after the terminal fault"
   u9ft4_fail=1
@@ -433,15 +477,16 @@ u9ft4_require_one "the SAME replacement gets its exact EL0 frame" \
   "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid=${u9ft4_replacement}"
 u9ft4_require_one "the drain completes once" \
   'AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok'
-# The faulting PC must NEVER resume: a second entry at the same rip, or a fault with no
-# current task, is exactly the FT3 defect.
+u9ft4_require_zero "the drain never idles instead of selecting" \
+  'AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING'
+fi
+# Both endings: the faulting PC must NEVER resume — a second entry at the same rip, or a fault
+# with no current task, is exactly the FT3 defect — and nothing refuses or fails closed.
 u9ft4_require_zero "the faulting PC never resumes (no ownerless re-fault)" \
   'PAGE_FAULT_ENTRY tid=18446744073709551615'
 u9ft4_require_zero "no split refusal on the witnessed path" 'TERMINAL_FAULT_SPLIT_REFUSED'
 u9ft4_require_zero "no fail-closed settlement on the witnessed path" \
   'TERMINAL_FAULT_SPLIT_FAILED_CLOSED'
-u9ft4_require_zero "the drain never idles instead of selecting" \
-  'AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING'
 # The OLD in-lock route must not run: the broad arm's own dispatch for this fault is gone.
 u9ft4_require_zero "the old in-lock terminal route does not run" \
   'TERMINAL_FAULT_UNEXPECTED_DISPOSITION'
