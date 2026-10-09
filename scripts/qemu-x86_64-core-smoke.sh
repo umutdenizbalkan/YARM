@@ -55,6 +55,8 @@ CAP_CNODE=${CAP_CNODE:-0}
 TERMINAL_FAULT_ORACLE=${TERMINAL_FAULT_ORACLE:-0}
 TERMINAL_FAULT_FETCH_ORACLE=${TERMINAL_FAULT_FETCH_ORACLE:-0}
 TERMINAL_FAULT_WAITER_ORACLE=${TERMINAL_FAULT_WAITER_ORACLE:-0}
+# BL2: the PORT-I/O scenario -- init issues one forbidden ring-3 `in`. Its own cell below.
+TERMINAL_FAULT_PORTIO_ORACLE=${TERMINAL_FAULT_PORTIO_ORACLE:-0}
 FAULT_DELIVERY=${FAULT_DELIVERY:-0}
 SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
 GLOBAL_STATE=${GLOBAL_STATE:-0}
@@ -124,6 +126,11 @@ if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$TERMINAL_FAULT_FETCH_ORACLE" != "1" \
       && "$TERMINAL_FAULT_WAITER_ORACLE" != "1" \
       && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_oracle="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.terminal_fault_oracle=1"
+fi
+# BL2: the port-I/O scenario takes slot 5 on its own; it is not combined with the page-fault
+# scenarios, whose cell asserts a page-fault chain this one never produces.
+if [[ "$TERMINAL_FAULT_PORTIO_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_portio_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.terminal_fault_portio_oracle=1"
 fi
 if [[ "$D6_SWITCH_A" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_a="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_a=1"
@@ -2710,6 +2717,92 @@ if [[ "$pf1t_fail" -eq 1 ]]; then
   exit 1
 fi
 echo "[ok] U9-PF1-TERM: x86_64 terminal PageFault route witness chain complete"
+fi
+
+# BL2 (x86_64 USER PORT-I/O FAULT CONTAINMENT): one forbidden ring-3 `in al, dx` from init.
+# With IOPL 0 and no TSS I/O bitmap the CPU raises #GP in ring 3. Before BL2 that decoded as
+# Unknown and the strict policy panicked the kernel; now it is the task's fault, settled off the
+# broad lock by the terminal user-fault owners: report, terminal transition, replacement. The
+# access never executes, init is taken down, and another task and the kernel run on.
+if [[ "$TERMINAL_FAULT_PORTIO_ORACLE" == "1" ]]; then
+pio_fail=0
+pio_log="$(tr '\r' '\n' <"$LOGFILE")"
+pio_count() {
+  local n
+  n="$(printf '%s\n' "$pio_log" | rg -a -F -c -- "$1" || true)"
+  printf '%s' "${n:-0}"
+}
+pio_require() { # desc want pattern
+  local n
+  n="$(pio_count "$3")"
+  if [[ "$n" != "$2" ]]; then
+    echo "[error] BL2-PORTIO: $1 -- expected $2, got ${n:-0}: $3"
+    pio_fail=1
+  else
+    echo "[ok] BL2-PORTIO: $1"
+  fi
+}
+pio_require "the port-I/O oracle is provisioned once" 1 \
+  'TERMINAL_FAULT_PORTIO_ORACLE_PROVISION_OK arch=x86_64 slot5=26 caps=none result=ok'
+pio_require "init issues exactly one forbidden port read" 1 \
+  'TERMINAL_FAULT_ORACLE_BEGIN arch=x86_64 init_tid=1 port=0x3f8 access=portio'
+pio_require "the access is DENIED: the instruction never completes" 0 \
+  'TERMINAL_FAULT_PORTIO_EXECUTED'
+pio_require "the #GP is decoded as the task's fault, off the broad lock, once" 1 \
+  'USER_INSTRUCTION_FAULT tid=1 pc=0x'
+
+pio_require "never as a broad arrival" 0 'route=broad'
+pio_require "it is not reported as a page fault" 0 'PAGE_FAULT_ENTRY tid=1'
+pio_require "the kernel does NOT take the Unknown path" 0 'unknown trap event'
+pio_require "and does not panic" 0 'strict unknown trap policy'
+pio_require "the faulting task is identified once" 1 'TASK_FAULT_CURRENT tid=1'
+pio_require "the report delivery owner runs once" 1 'TASK_FAULT_REPORT_BEGIN tid=1'
+pio_require "the report is delivered, off the broad lock" 1 \
+  'TERMINAL_FAULT_SPLIT_REPORT cpu=0 tid=1 outcome=buffered terminates=1 broad_lock=0'
+pio_require "the terminal transition commits once" 1 \
+  'TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred'
+pio_require "the queue-advance deferral is published once" 1 \
+  'QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid=1 cpu=0'
+pio_require "the broad dispatcher is skipped for this reason" 1 \
+  'QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=user_instruction_fault_committed'
+for bad in 'TERMINAL_FAULT_SPLIT_REFUSED' 'TERMINAL_FAULT_SPLIT_FAILED_CLOSED' \
+  'USER_INSTRUCTION_FAULT_REFUSED' 'PF3_SUPERVISOR_FAULT' 'USER_INSTRUCTION_FAULT_UNEXPECTED_DISPOSITION' \
+  'x86 shared trap dispatch failed'; do
+  pio_require "no $bad on the witnessed path" 0 "$bad"
+done
+# ANOTHER TASK PROGRESSES: a replacement that is not init is selected, made current, given its
+# exact frame -- and then actually runs: it issues a syscall of its own after the fault.
+pio_repl="$(printf '%s\n' "$pio_log" \
+  | rg -a -o -N 'QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=([0-9]+)' -r '$1' | head -n1)"
+if [[ -z "$pio_repl" || "$pio_repl" == "1" ]]; then
+  echo "[error] BL2-PORTIO: no replacement other than the faulted init was selected (got '${pio_repl}')"
+  pio_fail=1
+else
+  echo "[ok] BL2-PORTIO: replacement tid=${pio_repl} selected"
+  pio_require "the SAME replacement is made current" 1 \
+    "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu=0 tid=${pio_repl}"
+  pio_require "the SAME replacement gets its exact frame" 1 \
+    "QUEUE_ADVANCING_DISPATCH_FRAME_OK cpu=0 tid=${pio_repl}"
+  # It RUNS: user-visible output from that task after its frame was installed, and the kernel
+  # reaches its own idle afterwards rather than stopping at the fault.
+  pio_after="$(printf '%s\n' "$pio_log" \
+    | awk -v t="QUEUE_ADVANCING_DISPATCH_FRAME_OK cpu=0 tid=${pio_repl}" 'f{print} index($0,t){f=1}' \
+    | rg -a -c -F "USER_LOG tid=${pio_repl} " || true)"
+  pio_idle="$(printf '%s\n' "$pio_log" \
+    | awk -v t="QUEUE_ADVANCING_DISPATCH_FRAME_OK cpu=0 tid=${pio_repl}" 'f{print} index($0,t){f=1}' \
+    | rg -a -c -F 'SCHED_ENTER_IDLE_HLT' || true)"
+  if [[ "${pio_after:-0}" -lt 1 || "${pio_idle:-0}" -lt 1 ]]; then
+    echo "[error] BL2-PORTIO: after the fault the replacement logged ${pio_after:-0} line(s) and the kernel idled ${pio_idle:-0} time(s)"
+    pio_fail=1
+  else
+    echo "[ok] BL2-PORTIO: the replacement ran (${pio_after} user line(s)) and the kernel reached idle after the fault"
+  fi
+fi
+if [[ "$pio_fail" -eq 1 ]]; then
+  echo "[error] BL2 x86_64 user port-I/O containment witness FAILED"
+  exit 1
+fi
+echo "[ok] BL2-PORTIO: x86_64 user port-I/O fault contained (denied, reported, task terminated, system continued)"
 fi
 
 # Stage 197A (X86 FUTEXWAKE LIVE ORACLE): when armed, the parent/child split-FutexWake proof must

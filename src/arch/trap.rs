@@ -85,6 +85,8 @@ pub enum Trap {
     PageFault,
     TimerInterrupt,
     ExternalInterrupt,
+    /// BL2 — see [`TrapEvent::UserInstructionFault`].
+    UserInstructionFault,
     Unknown,
 }
 
@@ -94,6 +96,8 @@ pub enum TrapAction {
     HandlePageFault,
     TickScheduler,
     RouteIrq,
+    /// BL2 — the faulting user task is reported and handled by the per-task fault policy.
+    FaultTask,
     Unhandled,
 }
 
@@ -103,7 +107,23 @@ pub enum TrapEvent {
     PageFault(FaultInfo),
     TimerInterrupt,
     ExternalInterrupt(IrqNumber),
-    Unknown { arch_code: u64 },
+    /// BL2 — an instruction a USER task issued that the CPU refused to execute at the user
+    /// privilege level, with the privilege origin read from the architectural source.
+    ///
+    /// x86_64 decodes it from `#GP` taken with a ring-3 `CS` (a port access with IOPL 0 and no
+    /// TSS I/O bitmap, a privileged instruction, a non-canonical user address). It is a fault of
+    /// the task, not of the kernel, so it is handled by the per-task fault owners — report,
+    /// `FaultPolicy`, terminal transition — exactly as an unhandled user page fault is. It is
+    /// NOT a page fault: no mapping is involved, so it never reaches the COW, demand or
+    /// page-fault classification owners. `addr` is the faulting instruction's address and
+    /// `access` is `Execute`, because the instruction at that address could not be executed.
+    ///
+    /// A `#GP` taken in ring 0 is never this event: it stays [`TrapEvent::Unknown`] and keeps
+    /// the kernel-fatal policy.
+    UserInstructionFault(FaultInfo),
+    Unknown {
+        arch_code: u64,
+    },
 }
 
 impl TrapEvent {
@@ -113,6 +133,7 @@ impl TrapEvent {
             Self::PageFault(_) => Trap::PageFault,
             Self::TimerInterrupt => Trap::TimerInterrupt,
             Self::ExternalInterrupt(_) => Trap::ExternalInterrupt,
+            Self::UserInstructionFault(_) => Trap::UserInstructionFault,
             Self::Unknown { .. } => Trap::Unknown,
         }
     }
@@ -147,6 +168,7 @@ pub fn route_trap(event: &TrapEvent) -> TrapAction {
         TrapEvent::PageFault(_) => TrapAction::HandlePageFault,
         TrapEvent::TimerInterrupt => TrapAction::TickScheduler,
         TrapEvent::ExternalInterrupt(_) => TrapAction::RouteIrq,
+        TrapEvent::UserInstructionFault(_) => TrapAction::FaultTask,
         TrapEvent::Unknown { .. } => TrapAction::Unhandled,
     }
 }

@@ -1224,6 +1224,16 @@ pub fn bootstrap_first_user_task(
             init_args[5]
         );
     }
+    // BL2: the PORT-I/O scenario. Same guard, no caps: the fault is init's own forbidden
+    // `in`, refused by the CPU with `#GP` in ring 3 and settled by the terminal user-fault
+    // owners.
+    if crate::kernel::boot::terminal_fault_portio_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::TERMINAL_FAULT_PORTIO_ORACLE_SELECTOR;
+        crate::yarm_log!(
+            "TERMINAL_FAULT_PORTIO_ORACLE_PROVISION_OK arch=x86_64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

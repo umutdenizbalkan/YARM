@@ -16,6 +16,9 @@ const VEC_NMI: usize = 2;
 const VEC_DOUBLE_FAULT: usize = 8;
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const VEC_PAGE_FAULT: usize = 14;
+/// BL2 — `#GP`, decoded by origin: a ring-3 one is the task's fault.
+#[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+const VEC_GENERAL_PROTECTION: usize = 13;
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 #[allow(dead_code)]
 const VEC_TIMER: usize = 0x20;
@@ -967,6 +970,35 @@ fn write_task_gprs_to_saved_regs(
     }
 }
 
+/// BL2 — the decoded context of one hardware trap, from the values the stub and the CPU supplied.
+///
+/// The privilege origin is the frame's `CS` RPL — the one architectural source for `#GP`, whose
+/// error code carries no origin. The fault address is `CR2` for `#PF` and, for a ring-3 `#GP`
+/// (which has no fault address of its own), the faulting instruction's `RIP`; 0 otherwise.
+#[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+fn x86_trap_context(
+    vector: u64,
+    error_code: u64,
+    cr2: u64,
+    cs: u64,
+    rip: u64,
+) -> crate::arch::x86_64::trap::X86TrapContext {
+    let entered_from_user = cs & 0x3 == 0x3;
+    let fault_addr = if vector as usize == VEC_PAGE_FAULT {
+        cr2
+    } else if vector as usize == VEC_GENERAL_PROTECTION && entered_from_user {
+        rip
+    } else {
+        0
+    };
+    crate::arch::x86_64::trap::X86TrapContext {
+        vector: vector as u8,
+        error_code,
+        fault_addr,
+        entered_from_user,
+    }
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 fn dispatch_trap_from_stub_for_test(
     kernel: &mut crate::kernel::boot::KernelState,
@@ -979,11 +1011,13 @@ fn dispatch_trap_from_stub_for_test(
     if vector as usize == VEC_PAGE_FAULT {
         fault_addr = 0xDEAD_BEEF;
     }
-    let context = crate::arch::x86_64::trap::X86TrapContext {
-        vector: vector as u8,
+    let context = x86_trap_context(
+        vector,
         error_code,
         fault_addr,
-    };
+        interrupt_frame.cs,
+        interrupt_frame.rip,
+    );
     let mut trap_frame = unsafe {
         build_trap_frame_from_saved_regs(
             regs as *const X86SavedRegs,
@@ -1446,11 +1480,8 @@ fn x86_trap_dispatch_body(
         debug_uart_trap_breadcrumb(b'N', vector, error_code, fault_addr, frame.rip, cpu_apic);
         halt_forever();
     }
-    let context = crate::arch::x86_64::trap::X86TrapContext {
-        vector: vector as u8,
-        error_code,
-        fault_addr,
-    };
+    // BL2 — the privilege origin and the fault address, from the hardware frame.
+    let context = x86_trap_context(vector, error_code, fault_addr, frame.cs, frame.rip);
     let cpu = current_cpu_id();
 
     // QEMU-SMP1 §1: vector 0xF1 never reaches this compiled dispatch on ANY CPU. The BSP gate, like
@@ -3369,6 +3400,35 @@ mod tests {
         entry.offset_low as u64
             | ((entry.offset_mid as u64) << 16)
             | ((entry.offset_high as u64) << 32)
+    }
+
+    /// BL2 — the origin is the frame's `CS` RPL, and a ring-3 `#GP` carries its instruction as
+    /// the fault address; a ring-0 `#GP` carries neither, and `#PF` keeps `CR2`.
+    #[test]
+    fn the_trap_context_takes_the_origin_from_cs_and_the_gp_address_from_rip() {
+        let user_cs = 0x23u64; // the ring-3 code selector (RPL 3)
+        let kernel_cs = KERNEL_CODE_SELECTOR as u64;
+        let user_gp = x86_trap_context(VEC_GENERAL_PROTECTION as u64, 0, 0, user_cs, 0x40_1234);
+        assert!(user_gp.entered_from_user);
+        assert_eq!(user_gp.fault_addr, 0x40_1234);
+        let kernel_gp = x86_trap_context(
+            VEC_GENERAL_PROTECTION as u64,
+            0,
+            0,
+            kernel_cs,
+            0xFFFF_8000_0000_1000,
+        );
+        assert!(!kernel_gp.entered_from_user);
+        assert_eq!(kernel_gp.fault_addr, 0, "a ring-0 #GP reports no address");
+        let pf = x86_trap_context(
+            VEC_PAGE_FAULT as u64,
+            0b110,
+            0xDEAD_0000,
+            user_cs,
+            0x40_0000,
+        );
+        assert_eq!(pf.fault_addr, 0xDEAD_0000, "#PF keeps CR2, not RIP");
+        assert!(pf.entered_from_user);
     }
 
     #[test]

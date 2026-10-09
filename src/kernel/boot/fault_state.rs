@@ -2410,6 +2410,8 @@ impl KernelState {
                 Ok(())
             }
             Trap::PageFault | Trap::ExternalInterrupt | Trap::Unknown => Ok(()),
+            // BL2 — settled by `handle_trap_event`'s own arm before this point, like a page fault.
+            Trap::UserInstructionFault => Ok(()),
         }
     }
 
@@ -2726,6 +2728,22 @@ impl KernelState {
             }
             TrapEvent::Syscall => self.handle_trap(Trap::Syscall, frame),
             TrapEvent::TimerInterrupt => self.handle_trap(Trap::TimerInterrupt, frame),
+            // BL2 — a user instruction the CPU refused at the user privilege level. The task's
+            // fault, handled by the EXISTING per-task user-fault policy verbatim — report,
+            // `FaultPolicy`, terminal transition, replacement — exactly as
+            // `fault_current_task_unsupported_instruction` handles a refused RISC-V instruction.
+            // It is not a page fault and never reaches the page-fault owners.
+            TrapEvent::UserInstructionFault(fault) => {
+                crate::yarm_log!(
+                    "USER_INSTRUCTION_FAULT tid={} pc=0x{:x} origin={} route=broad",
+                    self.current_tid().unwrap_or(u64::MAX),
+                    fault.addr.0,
+                    fault.origin.marker()
+                );
+                self.fault_current_task_for_fault(fault)
+                    .map_err(SyscallError::from)
+                    .map_err(TrapHandleError::Syscall)
+            }
             TrapEvent::Unknown { arch_code } => {
                 crate::yarm_log!(
                     "unknown trap event cpu={} arch_code=0x{:x}",

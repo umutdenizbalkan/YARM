@@ -889,7 +889,43 @@ fn run_terminal_fault_oracle(
     let access = match scenario {
         S::DeliberateUnhandledRead | S::DeliberateUnhandledReadAfterWaiter => "read",
         S::DeliberateUnhandledFetch => "fetch",
+        S::DeliberatePortIo => "portio",
     };
+    // BL2 — the PORT-I/O scenario (x86_64; the kernel provisions it on no other port). One
+    // `in al, dx` from COM1's data port. With IOPL 0 and no TSS I/O bitmap the CPU refuses it
+    // with `#GP` in ring 3, before the access happens; the kernel reports the fault and takes
+    // init down while the rest of the system runs on. Should the access ever execute, the line
+    // after it says so, and the cell fails on it.
+    #[cfg(target_arch = "x86_64")]
+    if matches!(scenario, S::DeliberatePortIo) {
+        const COM1_DATA: u16 = 0x3F8;
+        yarm_user_rt::user_log!(
+            "TERMINAL_FAULT_ORACLE_BEGIN arch={} init_tid={} port=0x{:x} access={}",
+            ARCH,
+            init_tid,
+            COM1_DATA,
+            access
+        );
+        let value: u8;
+        // SAFETY: this instruction is INTENDED to fault. A ring-3 port read with IOPL 0 and no
+        // I/O bitmap raises `#GP` without touching the port, and the kernel does not resume it.
+        unsafe {
+            core::arch::asm!(
+                "in al, dx",
+                in("dx") COM1_DATA,
+                out("al") value,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        yarm_user_rt::user_log!(
+            "TERMINAL_FAULT_PORTIO_EXECUTED init_tid={} value={}",
+            init_tid,
+            value
+        );
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     yarm_user_rt::user_log!(
         "TERMINAL_FAULT_ORACLE_BEGIN arch={} init_tid={} addr=0x0 access={}",
         ARCH,

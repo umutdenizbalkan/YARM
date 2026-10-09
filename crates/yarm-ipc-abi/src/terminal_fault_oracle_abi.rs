@@ -77,6 +77,15 @@ pub enum TerminalFaultScenario {
     /// the endpoint the report is routed to, which is exactly the coordinate that selects the
     /// delivery ending.
     DeliberateUnhandledReadAfterWaiter,
+    /// BL2 — one forbidden user PORT access, x86_64 only: init reads COM1's data port with
+    /// `in al, dx`. With IOPL 0 and no TSS I/O bitmap the CPU raises `#GP` in ring 3 and the
+    /// access never happens.
+    ///
+    /// A fourth scenario rather than a variation, because it reaches the terminal owners through
+    /// a different fault class entirely: not a page fault, but a user instruction the CPU refused
+    /// (`TrapEvent::UserInstructionFault`). Before BL2 that decoded as `Unknown` and the strict
+    /// production policy panicked the kernel for one task's forbidden access.
+    DeliberatePortIo,
 }
 
 /// The slot-5 terminal-fault selector. Distinct from every value in the reserved
@@ -103,6 +112,10 @@ pub const TERMINAL_FAULT_FETCH_SELECTOR: usize = 24;
 /// of the reserved `ExitCurrentTask` block and the `1..=9` range.
 pub const TERMINAL_FAULT_WAITER_SELECTOR: usize = 25;
 
+/// BL2 — the port-I/O scenario's selector. The next free value, still clear of the reserved
+/// `ExitCurrentTask` block and the `1..=9` range.
+pub const TERMINAL_FAULT_PORTIO_SELECTOR: usize = 26;
+
 /// The selector to write into init's startup slot 5 for `scenario`.
 #[must_use]
 pub const fn terminal_fault_selector(scenario: TerminalFaultScenario) -> usize {
@@ -110,6 +123,7 @@ pub const fn terminal_fault_selector(scenario: TerminalFaultScenario) -> usize {
         TerminalFaultScenario::DeliberateUnhandledRead => TERMINAL_FAULT_SELECTOR,
         TerminalFaultScenario::DeliberateUnhandledFetch => TERMINAL_FAULT_FETCH_SELECTOR,
         TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter => TERMINAL_FAULT_WAITER_SELECTOR,
+        TerminalFaultScenario::DeliberatePortIo => TERMINAL_FAULT_PORTIO_SELECTOR,
     }
 }
 
@@ -123,6 +137,8 @@ pub const fn terminal_fault_scenario_for(slot5: usize) -> Option<TerminalFaultSc
         Some(TerminalFaultScenario::DeliberateUnhandledFetch)
     } else if slot5 == TERMINAL_FAULT_WAITER_SELECTOR {
         Some(TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter)
+    } else if slot5 == TERMINAL_FAULT_PORTIO_SELECTOR {
+        Some(TerminalFaultScenario::DeliberatePortIo)
     } else {
         None
     }
@@ -140,6 +156,7 @@ mod tests {
             TerminalFaultScenario::DeliberateUnhandledRead,
             TerminalFaultScenario::DeliberateUnhandledFetch,
             TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter,
+            TerminalFaultScenario::DeliberatePortIo,
         ] {
             assert_eq!(
                 terminal_fault_scenario_for(terminal_fault_selector(s)),
@@ -169,6 +186,11 @@ mod tests {
             exit::AARCH64_EXIT_SELECTOR,
             exit::RISCV64_EXIT_SELECTOR,
         ] {
+            assert_ne!(
+                TERMINAL_FAULT_PORTIO_SELECTOR, taken,
+                "the port-I/O scenario's selector may not share a value with a reserved \
+                 ExitCurrentTask selector either"
+            );
             assert_ne!(
                 TERMINAL_FAULT_WAITER_SELECTOR, taken,
                 "the waiter scenario's selector may not share a value with a reserved \

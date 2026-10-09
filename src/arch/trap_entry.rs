@@ -438,6 +438,12 @@ pub(crate) fn settle_unowned_trap(
         ),
         TrapEvent::TimerInterrupt => ("timer_unsettled", SyscallError::Internal),
         TrapEvent::ExternalInterrupt(_) => ("interrupt_unsettled", SyscallError::Internal),
+        // BL2 — the same answer an unclaimed page fault gets: the user-fault owner that should
+        // have settled it names no victim here.
+        TrapEvent::UserInstructionFault(_) => (
+            "user_instruction_fault_unclaimed",
+            SyscallError::from(crate::kernel::boot::KernelError::TaskMissing),
+        ),
         TrapEvent::Unknown { .. } => ("unknown_unsettled", SyscallError::Internal),
         // Settled above, on the userspace channel.
         TrapEvent::Syscall => unreachable!("the Syscall class returns above"),
@@ -1187,6 +1193,45 @@ pub fn handle_trap_entry_shared(
                     debug_assert!(
                         false,
                         "the terminal PageFault route yields NotHandled, QueueAdvanceCommitted or Complete"
+                    );
+                }
+            }
+        }
+        // BL2 — a USER instruction the CPU refused (x86_64 `#GP` in ring 3). The task's fault,
+        // settled by the same terminal owners and the same disposition handling as a terminal
+        // page fault: a committed transition skips the broad dispatcher and is drained by the
+        // queue advance below; a `Complete` carries its result — including the fatal for an
+        // unnameable victim — through `terminal_result`. Mutually exclusive with the page-fault
+        // routes by decode. It used to decode as `Unknown`, whose production policy panics.
+        if let TrapEvent::UserInstructionFault(fault) = decode_trap_context(context) {
+            match crate::kernel::syscall_split::try_split_user_instruction_fault_dispatch(
+                shared,
+                cpu,
+                Some(fault),
+                frame.as_deref(),
+                trap_path.authority(),
+            ) {
+                SplitDispatchDisposition::NotHandled => {}
+                SplitDispatchDisposition::QueueAdvanceCommitted => {
+                    crate::yarm_log!(
+                        "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=user_instruction_fault_committed",
+                        cpu.0
+                    );
+                    queue_advance_committed = true;
+                }
+                SplitDispatchDisposition::Complete(result) => {
+                    terminal_result = Some(result);
+                    queue_advance_committed = true;
+                }
+                other => {
+                    crate::yarm_log!(
+                        "USER_INSTRUCTION_FAULT_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(
+                        false,
+                        "the user instruction-fault route yields NotHandled, QueueAdvanceCommitted or Complete"
                     );
                 }
             }

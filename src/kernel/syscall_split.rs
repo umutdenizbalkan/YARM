@@ -622,10 +622,7 @@ fn try_split_terminal_page_fault_into_frame(
     frame: Option<&crate::kernel::trapframe::TrapFrame>,
     authority: crate::runtime::DispatchAuthority,
 ) -> SplitDispatchDisposition {
-    use crate::kernel::boot::{
-        FaultReportOutcome as R, PageFaultRoute, TerminalFaultPolicyRefusal as PR,
-        TerminalFaultTransition as T, page_fault_route_for,
-    };
+    use crate::kernel::boot::{PageFaultRoute, page_fault_route_for};
     use SplitDispatchDisposition as D;
 
     // U9-PAGEFAULT3 §3 — the two canonical endings, and `retry` is now AUTHENTICATED.
@@ -764,6 +761,59 @@ fn try_split_terminal_page_fault_into_frame(
             entering.tid,
         );
     }
+    settle_terminal_user_fault(
+        shared,
+        cpu,
+        cpu_idx,
+        entering,
+        facts.tid,
+        facts.asid,
+        fault,
+        frame,
+        authority,
+        TerminalUserFaultKind::PageFault,
+    )
+}
+
+/// BL2 — which user fault [`settle_terminal_user_fault`] is settling. It decides only the entry
+/// lines each class has always printed for itself; every owner after them is the same.
+#[cfg(not(feature = "hosted-dev"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalUserFaultKind {
+    /// A user page fault the classifier routed `SplitTerminal`.
+    PageFault,
+    /// A user instruction the CPU refused at the user privilege level
+    /// (`TrapEvent::UserInstructionFault`).
+    Instruction,
+}
+
+/// BL2 — **the terminal settlement of a user fault**: policy, report delivery, deferral, capture,
+/// terminal transition. Steps (2)–(8) of the terminal PageFault route, moved here unchanged so a
+/// second fault class reaches the SAME owners in the SAME order rather than a copy of them.
+///
+/// The caller owns everything before it: the structural checks, the supervisor-origin guard, the
+/// entering incarnation and the `{tid, asid}` victim coordinate. Every outcome below is the one
+/// the terminal PageFault route has produced since U9-PAGEFAULT3; see that route for why each
+/// refusal settles as it does.
+#[cfg(not(feature = "hosted-dev"))]
+#[allow(clippy::too_many_arguments)]
+fn settle_terminal_user_fault(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    cpu_idx: usize,
+    entering: EnteringFaultIncarnation,
+    tid: u64,
+    asid: crate::kernel::vm::Asid,
+    fault: crate::kernel::trap::FaultInfo,
+    frame: &crate::kernel::trapframe::TrapFrame,
+    authority: crate::runtime::DispatchAuthority,
+    kind: TerminalUserFaultKind,
+) -> SplitDispatchDisposition {
+    use crate::kernel::boot::{
+        FaultReportOutcome as R, TerminalFaultPolicyRefusal as PR, TerminalFaultTransition as T,
+    };
+    use SplitDispatchDisposition as D;
+
     // (2) Terminal policy, against the EXACT coordinate we classified with.
     //
     // U9-PAGEFAULT1 §1e — `NotifyAndContinue` is no longer a decline. The broad arm's order is
@@ -772,7 +822,7 @@ fn try_split_terminal_page_fault_into_frame(
     // notify-and-continue fault is a published report with no transition and no deferral, and
     // this route can produce exactly that. The policy still decides everything below, it just no
     // longer decides whether this route participates.
-    let snapshot = match shared.read_terminal_fault_policy_shared(cpu, facts.tid, facts.asid) {
+    let snapshot = match shared.read_terminal_fault_policy_shared(cpu, tid, asid) {
         Ok(snapshot) => snapshot,
         // U9-PAGEFAULT2 §3 — the policy read's three refusals, each settled as the broad arm
         // settles the same condition. They were ONE decline; they are not one outcome.
@@ -780,7 +830,7 @@ fn try_split_terminal_page_fault_into_frame(
             crate::yarm_log!(
                 "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=policy reason={:?} settlement={} broad_lock=0",
                 cpu.0,
-                facts.tid,
+                tid,
                 refusal,
                 refusal.settlement_marker()
             );
@@ -817,7 +867,7 @@ fn try_split_terminal_page_fault_into_frame(
                     cpu,
                     "TERMINAL_FAULT_SPLIT_REFUSED",
                     "policy_victim_unnameable",
-                    facts.tid,
+                    tid,
                 ),
             };
         }
@@ -862,7 +912,7 @@ fn try_split_terminal_page_fault_into_frame(
             crate::yarm_log!(
                 "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=queue_admit reason={:?} broad_lock=0",
                 cpu.0,
-                facts.tid,
+                tid,
                 refusal
             );
             // U9-PAGEFAULT3 §3 — INVALID TRAP AUTHORITY IS NOT ORDINARY CONTENTION, and the two
@@ -888,7 +938,7 @@ fn try_split_terminal_page_fault_into_frame(
                         cpu,
                         "TERMINAL_FAULT_SPLIT_REFUSED",
                         "trap_authority_invalid",
-                        facts.tid,
+                        tid,
                     )
                 }
                 _ => settle_via_entering_frame(
@@ -902,7 +952,7 @@ fn try_split_terminal_page_fault_into_frame(
         }
         // RESERVE THE DEFERRAL BEFORE ANY PUBLICATION. Holding it is what guarantees the drain
         // will apply an incoming context.
-        if !crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, facts.tid) {
+        if !crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid) {
             // U9-PAGEFAULT3 §3 — ORDINARY CONTENTION, with the INCUMBENT NAMED.
             //
             // The CAS fails only when a deferral is already armed for this CPU. PAGEFAULT2
@@ -925,7 +975,7 @@ fn try_split_terminal_page_fault_into_frame(
                 "TERMINAL_FAULT_SPLIT_REFUSED cpu={} tid={} phase=defer reason=defer_unavailable \
                  incumbent_outgoing={:?} consumer=futex_wait_drain broad_lock=0",
                 cpu.0,
-                facts.tid,
+                tid,
                 crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
             );
             return settle_via_entering_frame(
@@ -940,30 +990,44 @@ fn try_split_terminal_page_fault_into_frame(
     // (5) Capture the outgoing context while the reservation is held and nothing is published.
     // Only a terminating fault has an outgoing context: the other task keeps running in its own.
     let captured = if terminates {
-        shared.capture_outgoing_user_context_split(facts.tid, frame)
+        shared.capture_outgoing_user_context_split(tid, frame)
     } else {
         false
     };
     // The exact facts the broad arm prints, in the broad arm's order. `PAGE_FAULT_ENTRY` is
     // emitted here because this route intercepts BEFORE the broad arm that would have printed
     // it, and the marker stream must stay faithful to what an observer sees today.
-    crate::yarm_log!(
-        "PAGE_FAULT_ENTRY tid={} addr=0x{:x} access={:?} rip=0x{:x}",
-        facts.tid,
-        fault.addr.0,
-        fault.access,
-        frame.saved_pc
-    );
-    crate::yarm_log!(
-        "PAGE_FAULT_UNHANDLED tid={} addr=0x{:x} access={:?} rip=0x{:x}",
-        facts.tid,
-        fault.addr.0,
-        fault.access,
-        frame.saved_pc
-    );
+    match kind {
+        TerminalUserFaultKind::PageFault => {
+            crate::yarm_log!(
+                "PAGE_FAULT_ENTRY tid={} addr=0x{:x} access={:?} rip=0x{:x}",
+                tid,
+                fault.addr.0,
+                fault.access,
+                frame.saved_pc
+            );
+            crate::yarm_log!(
+                "PAGE_FAULT_UNHANDLED tid={} addr=0x{:x} access={:?} rip=0x{:x}",
+                tid,
+                fault.addr.0,
+                fault.access,
+                frame.saved_pc
+            );
+        }
+        // BL2 — the instruction fault's own entry line. It is not a page fault, so it does not
+        // print the page-fault lines; everything from `TASK_FAULT_CURRENT` on is shared.
+        TerminalUserFaultKind::Instruction => {
+            crate::yarm_log!(
+                "USER_INSTRUCTION_FAULT tid={} pc=0x{:x} origin={} route=split",
+                tid,
+                fault.addr.0,
+                fault.origin.marker()
+            );
+        }
+    }
     crate::yarm_log!(
         "TASK_FAULT_CURRENT tid={} fault_addr=0x{:x} access={:?}",
-        facts.tid,
+        tid,
         fault.addr.0,
         Some(fault.access)
     );
@@ -972,11 +1036,11 @@ fn try_split_terminal_page_fault_into_frame(
     // `deliver_fault_report_split` owns `TASK_FAULT_REPORT_BEGIN` and everything below it,
     // because the emitter it reproduces owns them. It publishes to a blocked waiter, publishes
     // to the buffer, or records that reporting could not succeed.
-    let report = shared.deliver_fault_report_split(cpu, facts.tid, fault, &snapshot);
+    let report = shared.deliver_fault_report_split(cpu, tid, fault, &snapshot);
     crate::yarm_log!(
         "TERMINAL_FAULT_SPLIT_REPORT cpu={} tid={} outcome={} terminates={} broad_lock=0",
         cpu.0,
-        facts.tid,
+        tid,
         match report {
             R::DeliveredToWaiter { .. } => "delivered_to_waiter",
             R::Buffered { .. } => "buffered",
@@ -995,7 +1059,7 @@ fn try_split_terminal_page_fault_into_frame(
         crate::yarm_log!(
             "TERMINAL_FAULT_SPLIT_NOTIFY_CONTINUE cpu={} tid={} published={} broad_lock=0",
             cpu.0,
-            facts.tid,
+            tid,
             u8::from(!matches!(report, R::Failed(_)))
         );
         // U9-PAGEFAULT3 §3 — the POLICY is preserved and the RETURN is authenticated.
@@ -1019,7 +1083,7 @@ fn try_split_terminal_page_fault_into_frame(
         );
     }
     // (8) The terminal task transition. Fail-closed from here.
-    match shared.commit_terminal_fault_transition_shared(cpu, facts.tid, facts.asid, frame) {
+    match shared.commit_terminal_fault_transition_shared(cpu, tid, asid, frame) {
         T::Committed { .. } => {}
         refusal => {
             // U9-PAGEFAULT3 §1/§3 — **THE ONE REACHABLE UNVERIFIED RESUME, and it was here.**
@@ -1054,7 +1118,7 @@ fn try_split_terminal_page_fault_into_frame(
                 "TERMINAL_FAULT_SPLIT_FAILED_CLOSED cpu={} tid={} captured={} refusal={:?} \
                  deferral=cleared_own broad_lock=0",
                 cpu.0,
-                facts.tid,
+                tid,
                 u8::from(captured),
                 refusal
             );
@@ -1069,10 +1133,98 @@ fn try_split_terminal_page_fault_into_frame(
     }
     crate::yarm_log!(
         "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid={} cpu={}",
-        facts.tid,
+        tid,
         cpu_idx
     );
     D::QueueAdvanceCommitted
+}
+
+/// BL2 — **the pre-lock route for a user instruction the CPU refused**
+/// (`TrapEvent::UserInstructionFault`: x86_64 `#GP` taken in ring 3).
+///
+/// The fault is the task's, so it is settled by the per-task terminal owners — the report, the
+/// task's `FaultPolicy`, the terminal transition and the queue advance — through
+/// [`settle_terminal_user_fault`], the same body the terminal PageFault route uses. It is not a
+/// page fault and is never offered to the COW, demand or page-fault classification owners: there
+/// is no mapping to recover. The victim is the incarnation this trap entered from.
+///
+/// Before BL2 this trap decoded as `Unknown`, whose production policy panics the kernel, so one
+/// task's forbidden port access took the whole system down.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_user_instruction_fault_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    fault: Option<crate::kernel::trap::FaultInfo>,
+    frame: Option<&crate::kernel::trapframe::TrapFrame>,
+    authority: crate::runtime::DispatchAuthority,
+) -> SplitDispatchDisposition {
+    let (Some(fault), Some(frame)) = (fault, frame) else {
+        crate::yarm_log!(
+            "USER_INSTRUCTION_FAULT_REFUSED cpu={} reason=no_fault_or_frame \
+             settlement=missing_trap_frame broad_lock=0",
+            cpu.0
+        );
+        return SplitDispatchDisposition::Complete(Err(TrapHandleError::MissingTrapFrame));
+    };
+    // The decoder only produces this event for a ring-3 origin; a supervisor origin reaching
+    // here would be a decoder break, and it fails closed exactly as a supervisor page fault does.
+    if let Some(fatal) = guard_supervisor_origin(cpu, fault, "user_instruction") {
+        return fatal;
+    }
+    let entering = entering_fault_incarnation(shared, cpu);
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return settle_fault_kernel_fatal(
+            cpu,
+            "USER_INSTRUCTION_FAULT_REFUSED",
+            "cpu_out_of_range",
+            entering.tid,
+        );
+    }
+    // A ring-3 trap always enters from a user task. tid 0 is the kernel's own identity, so a
+    // ring-3 fault naming it has no victim a report could name.
+    if entering.tid == 0 {
+        return settle_fault_kernel_fatal(
+            cpu,
+            "USER_INSTRUCTION_FAULT_REFUSED",
+            "no_user_task",
+            entering.tid,
+        );
+    }
+    settle_terminal_user_fault(
+        shared,
+        cpu,
+        cpu_idx,
+        entering,
+        entering.tid,
+        entering.asid,
+        fault,
+        frame,
+        authority,
+        TerminalUserFaultKind::Instruction,
+    )
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_user_instruction_fault_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _fault: Option<crate::kernel::trap::FaultInfo>,
+    _frame: Option<&crate::kernel::trapframe::TrapFrame>,
+    _authority: crate::runtime::DispatchAuthority,
+) -> SplitDispatchDisposition {
+    SplitDispatchDisposition::NotHandled
+}
+
+/// BL2 — the bridge entry for the user instruction-fault route.
+pub(crate) fn try_split_user_instruction_fault_dispatch(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    fault: Option<crate::kernel::trap::FaultInfo>,
+    frame: Option<&crate::kernel::trapframe::TrapFrame>,
+    authority: crate::runtime::DispatchAuthority,
+) -> SplitDispatchDisposition {
+    try_split_user_instruction_fault_into_frame(shared, cpu, fault, frame, authority)
 }
 
 #[cfg(feature = "hosted-dev")]

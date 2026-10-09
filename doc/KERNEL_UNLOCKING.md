@@ -25672,7 +25672,8 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 |---|---|---|
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | confirmed open — blocked on an ABI decision | see BL1 "Not changed"; every in-tree sender passes offset 0 |
-| BL2 — x86 user port-I/O fault containment | confirmed open | IRQ3 omitted its live isolation probe |
+| BL2 — x86 user port-I/O fault containment | fixed (this section, BL2) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
+| BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | confirmed open (from source) | `EXC_ILLEGAL_INSTRUCTION` decodes to `Unknown`; the pre-lock bridge settles `Unknown` fatally; the per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad `handle_trap_entry`, unreachable since U9 closed. Not reproduced live; the BL2 route is the owner it should reach |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | to verify | |
 | BL3b — futex check-and-park contract | to verify | |
 | BL3c — hosted ack-lease intermittent failure | to verify | |
@@ -25756,3 +25757,64 @@ direct transaction, NR 30 and both queued loops all map from the capability wind
 `DmaRegion` the send side requires `[offset, offset + len)` inside the window. Honouring it needs an
 ABI decision (page alignment, or a lane reporting the intra-page offset) across four receive paths,
 so it is recorded rather than changed here. Every in-tree sender passes 0.
+
+### BL2 — x86 user port-I/O fault containment
+
+**Defect (verified on `adc37ab7`).** A ring-3 `in`/`out` with IOPL 0 and no TSS I/O bitmap raises
+`#GP`. The x86 decoder mapped every vector it did not name — `#GP` included — to
+`TrapEvent::Unknown`, and the pre-lock Unknown route's production policy is `unknown_trap_fatal`:
+one task's forbidden port access panicked the kernel. IRQ3 recorded this and omitted its live
+isolation probe because of it. Reproduced live with the witness below on the unrepaired kernel:
+`TERMINAL_FAULT_ORACLE_BEGIN … port=0x3f8 access=portio`, then `unknown trap event cpu=0
+arch_code=0xd` and `PANIC … strict unknown trap policy`.
+
+**Repair.**
+
+* **Origin.** `X86TrapContext` carries `entered_from_user`, the hardware frame's `CS` RPL — the one
+  architectural origin source for `#GP`, whose error code carries none. Both dispatch sites build
+  the context through one helper (`x86_trap_context`), which also gives a ring-3 `#GP` its
+  instruction pointer as the fault address.
+* **Decode.** `#GP` with a ring-3 origin is `TrapEvent::UserInstructionFault(FaultInfo::user(rip,
+  Execute))`: a user instruction the CPU refused. It is not a page fault and never reaches the COW,
+  demand or page-fault classification owners. `#GP` from ring 0 still decodes as `Unknown` and
+  keeps the kernel-fatal policy unchanged; every other unrecognized vector is untouched.
+* **Settlement.** The terminal PageFault route's steps (2)–(8) — policy read, report delivery,
+  queue-advance admission and deferral reservation, outgoing-context capture, terminal transition —
+  moved unchanged into one body, `settle_terminal_user_fault`, which the PageFault route now calls.
+  The new `try_split_user_instruction_fault_into_frame` guards the supervisor origin, takes the
+  entering `{tid, asid}` incarnation as the victim and calls the same body, so the fault reaches the
+  same owners in the same order and no second way for a task to die exists. The shared bridge
+  invokes it after the page-fault routes, under the trap's own authority, with the terminal route's
+  disposition handling (`QueueAdvanceCommitted` drained by the post-lock queue advance; `Complete`
+  carried through `terminal_result`). The broad `handle_trap_event` arm (hosted, and the raw x86
+  path) routes the event to `fault_current_task_for_fault`, as the RISC-V unsupported-instruction
+  precedent does.
+* **Unchanged:** the Unknown policy and its route, the page-fault routes' behaviour, scheduler and
+  frame ownership, and the census (`with_cpu=0`, `with_broad=0`).
+
+**Witness (default-off).** `yarm.terminal_fault_portio_oracle=1` (x86_64) provisions init's slot 5
+with the new `DeliberatePortIo` scenario (selector 26, `terminal_fault_oracle_abi`); init issues one
+`in al, dx` from COM1 and logs a line that can only appear if the access executed. The core-smoke
+cell (`TERMINAL_FAULT_PORTIO_ORACLE=1`) requires: the provision and the attempt once; the access
+never completing; the fault decoded once as `USER_INSTRUCTION_FAULT … route=split`, never as a page
+fault, never through the Unknown path or a panic; the report delivered, the terminal transition
+committed and the deferral published once, the broad dispatcher skipped for
+`user_instruction_fault_committed`; no refusal or fail-closed settlement; and a replacement other
+than init made current, given its frame, then logging from user space while the kernel reaches its
+own idle afterwards.
+
+**Evidence.** Live on the candidate: every assertion passes (`replacement tid=2`, five supervisor
+user lines and a kernel idle after the fault). Live on the unrepaired kernel with the same witness:
+kernel panic, as above. Hosted: `decode_general_protection_by_privilege_origin` (ring 3 →
+`UserInstructionFault`, ring 0 → `Unknown{13}`, other vectors unchanged);
+`the_trap_context_takes_the_origin_from_cs_and_the_gp_address_from_rip`;
+`a_user_instruction_fault_faults_only_the_offending_task_and_another_runs`;
+`a_user_instruction_fault_never_reaches_the_page_fault_owners` (no demand mapping inside a demand
+region); and a composition guard (bridge route under the trap authority, one shared settlement
+body, no page-fault owner on the instruction route, the Unknown route still `unknown_trap_fatal`).
+Seven existing source guards were re-derived against the extracted body, each with its reason in
+place; none was weakened.
+
+**Not changed.** RISC-V (BL2-a above) and the other x86 exception classes (`#UD`, `#DE`, …), which
+still decode as `Unknown`; widening them is outside this item.
+

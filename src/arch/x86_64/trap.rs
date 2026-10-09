@@ -14,6 +14,8 @@ const VEC_EXTERNAL_BASE: u8 = 0x20;
 const VEC_EXTERNAL_LIMIT: u8 =
     VEC_EXTERNAL_BASE + crate::arch::platform_constants::MAX_IRQ_LINES as u8;
 const VEC_PAGE_FAULT: u8 = 14;
+/// BL2 — `#GP`.
+const VEC_GENERAL_PROTECTION: u8 = 13;
 #[cfg(not(feature = "hosted-dev"))]
 const MSR_FS_BASE: u32 = 0xC000_0100;
 
@@ -21,7 +23,15 @@ const MSR_FS_BASE: u32 = 0xC000_0100;
 pub struct X86TrapContext {
     pub vector: u8,
     pub error_code: u64,
+    /// `CR2` for `#PF`; the faulting instruction's `RIP` for a user-origin `#GP` (BL2), which
+    /// has no fault address of its own; 0 otherwise.
     pub fault_addr: u64,
+    /// BL2 — the privilege origin, from the hardware frame's `CS` RPL (ring 3 ⇒ `true`).
+    ///
+    /// `#PF` carries its origin in error-code bit 2 and is decoded from that, as before. `#GP`
+    /// carries none — its error code is a selector index or 0 — so for it the frame's `CS` is the
+    /// only architectural source, and it is the one this field reports.
+    pub entered_from_user: bool,
 }
 
 static LAST_RESTORED_TLS_BASE: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
@@ -657,6 +667,13 @@ pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
         v if (VEC_EXTERNAL_BASE..VEC_EXTERNAL_LIMIT).contains(&v) => {
             TrapEvent::ExternalInterrupt((v - VEC_EXTERNAL_BASE) as u16)
         }
+        // BL2 — a `#GP` taken in RING 3 is the task's fault: a port access with IOPL 0 and no
+        // TSS I/O bitmap, a privileged instruction, a non-canonical user address. It goes to the
+        // per-task fault owners. A `#GP` taken in ring 0 falls through to `Unknown` below and
+        // keeps the kernel-fatal policy unchanged.
+        VEC_GENERAL_PROTECTION if context.entered_from_user => TrapEvent::UserInstructionFault(
+            FaultInfo::user(VirtAddr(context.fault_addr), FaultAccess::Execute),
+        ),
         _ => TrapEvent::Unknown {
             arch_code: context.vector as u64,
         },
@@ -1036,6 +1053,7 @@ mod tests {
             vector: VEC_SYSCALL,
             error_code: 0,
             fault_addr: 0,
+            entered_from_user: false,
         });
         assert_eq!(ev.trap(), Trap::Syscall);
     }
@@ -1046,6 +1064,7 @@ mod tests {
             vector: VEC_TIMER,
             error_code: 0,
             fault_addr: 0,
+            entered_from_user: false,
         });
         assert_eq!(ev.trap(), Trap::TimerInterrupt);
     }
@@ -1056,6 +1075,7 @@ mod tests {
             vector: VEC_EXTERNAL_BASE + 7,
             error_code: 0,
             fault_addr: 0,
+            entered_from_user: false,
         });
         assert_eq!(ev.trap(), Trap::ExternalInterrupt);
         assert_eq!(ev.irq(), Some(7));
@@ -1067,6 +1087,7 @@ mod tests {
             vector: VEC_EXTERNAL_LIMIT,
             error_code: 0,
             fault_addr: 0,
+            entered_from_user: false,
         });
         assert_eq!(ev.trap(), Trap::Unknown);
     }
@@ -1078,6 +1099,7 @@ mod tests {
             vector: VEC_EXTERNAL_BASE + highest,
             error_code: 0,
             fault_addr: 0,
+            entered_from_user: false,
         });
         assert_eq!(ev.trap(), Trap::ExternalInterrupt);
         assert_eq!(ev.irq(), Some(highest as u16));
@@ -1093,6 +1115,7 @@ mod tests {
             vector: VEC_PAGE_FAULT,
             error_code: 0b10,
             fault_addr: 0xFACE_1000,
+            entered_from_user: false,
         });
         assert_eq!(ev.trap(), Trap::PageFault);
         assert_eq!(
@@ -1120,6 +1143,7 @@ mod tests {
                 vector: VEC_PAGE_FAULT,
                 error_code: bits,
                 fault_addr: 0x1000,
+                entered_from_user: false,
             });
             assert_eq!(
                 kernel.fault(),
@@ -1130,6 +1154,7 @@ mod tests {
                 vector: VEC_PAGE_FAULT,
                 error_code: bits | US,
                 fault_addr: 0x1000,
+                entered_from_user: false,
             });
             assert_eq!(
                 user.fault(),
@@ -1139,12 +1164,53 @@ mod tests {
         }
     }
 
+    /// BL2 — `#GP` is decoded by ORIGIN. Taken in ring 3 it is the task's fault, a
+    /// `UserInstructionFault` at the faulting instruction; taken in ring 0 it stays `Unknown` and
+    /// keeps the kernel-fatal policy. The error code is irrelevant to the decision either way.
+    #[test]
+    fn decode_general_protection_by_privilege_origin() {
+        for error_code in [0u64, 0x18] {
+            let user = decode_trap_context(X86TrapContext {
+                vector: VEC_GENERAL_PROTECTION,
+                error_code,
+                fault_addr: 0x40_1234,
+                entered_from_user: true,
+            });
+            assert_eq!(user.trap(), Trap::UserInstructionFault);
+            assert_eq!(
+                user,
+                TrapEvent::UserInstructionFault(FaultInfo::user(
+                    VirtAddr(0x40_1234),
+                    FaultAccess::Execute
+                ))
+            );
+            assert_eq!(user.fault(), None, "it is not a page fault");
+            let kernel = decode_trap_context(X86TrapContext {
+                vector: VEC_GENERAL_PROTECTION,
+                error_code,
+                fault_addr: 0,
+                entered_from_user: false,
+            });
+            assert_eq!(kernel, TrapEvent::Unknown { arch_code: 13 });
+        }
+        // The origin flag only reroutes #GP: every other unrecognized vector from ring 3 is still
+        // Unknown.
+        let other = decode_trap_context(X86TrapContext {
+            vector: 0x7F,
+            error_code: 0,
+            fault_addr: 0,
+            entered_from_user: true,
+        });
+        assert_eq!(other.trap(), Trap::Unknown);
+    }
+
     #[test]
     fn decode_unknown_vector_is_unknown_event() {
         let ev = decode_trap_context(X86TrapContext {
             vector: 0x7F,
             error_code: 0,
             fault_addr: 0,
+            entered_from_user: false,
         });
         assert_eq!(ev.trap(), Trap::Unknown);
     }
@@ -1167,6 +1233,7 @@ mod tests {
                         vector: VEC_TIMER,
                         error_code: 0,
                         fault_addr: 0,
+                        entered_from_user: false,
                     },
                     None,
                 )
@@ -1220,6 +1287,7 @@ mod tests {
                         vector: VEC_TIMER,
                         error_code: 0,
                         fault_addr: 0,
+                        entered_from_user: false,
                     },
                     Some(&mut frame),
                 )
@@ -1262,6 +1330,7 @@ mod tests {
                         vector: VEC_TIMER,
                         error_code: 0,
                         fault_addr: 0,
+                        entered_from_user: false,
                     },
                     Some(&mut frame_a),
                 )
@@ -1279,6 +1348,7 @@ mod tests {
                         vector: VEC_TIMER,
                         error_code: 0,
                         fault_addr: 0,
+                        entered_from_user: false,
                     },
                     Some(&mut frame_b),
                 )

@@ -60,6 +60,7 @@ fn selected_arch_trap_entry_routes_timer() {
         vector: 0x20,
         error_code: 0,
         fault_addr: 0,
+        entered_from_user: false,
     };
     #[cfg(target_arch = "aarch64")]
     let ctx = crate::arch::trap_entry::ArchTrapContext {
@@ -96,6 +97,7 @@ fn selected_arch_trap_entry_routes_external_irq_notification() {
         vector: 0x21, // external IRQ line 1
         error_code: 0,
         fault_addr: 0,
+        entered_from_user: false,
     };
 
     state
@@ -116,6 +118,7 @@ fn selected_arch_trap_entry_external_irq_without_route_is_noop() {
         vector: 0x21, // external IRQ line 1
         error_code: 0,
         fault_addr: 0,
+        entered_from_user: false,
     };
 
     state
@@ -140,6 +143,7 @@ fn selected_arch_trap_entry_routes_highest_external_irq_notification() {
         vector,
         error_code: 0,
         fault_addr: 0,
+        entered_from_user: false,
     };
 
     state
@@ -163,6 +167,7 @@ fn selected_arch_trap_entry_external_limit_vector_is_not_routed_as_irq() {
         vector: 0x20 + first_unmapped_irq as u8,
         error_code: 0,
         fault_addr: 0,
+        entered_from_user: false,
     };
 
     state
@@ -147389,12 +147394,18 @@ mod u9qa_split_dispatch_disposition {
         // acked and re-armed, so entering the broad dispatcher would tick a SECOND time, and the
         // authoritative advance it would perform is the one the post-lock drain now owns. Like the
         // other five it is an explicit disposition arm and infers nothing from a stash.
+        // BL2 re-derivation: EIGHT. The user instruction-fault route adds two arms, the exact
+        // mirrors of the terminal-fault pair: its committed transition (a reserved deferral the
+        // post-lock drain owes) and its `Complete` (a carried settlement, including the fatal for
+        // an unnameable victim). Both are explicit disposition arms of a route that settles the
+        // trap, and neither infers anything from a stash.
         assert_eq!(
             code.matches("queue_advance_committed = true;").count(),
-            6,
-            "exactly six disposition arms may declare the broad dispatcher skipped: \
-             FutexWait publication, terminal-fault commit, terminal-fault fail-closed, \
-             the preempting-timer commit, the unsettled block, and the idle-boundary advance"
+            8,
+            "exactly eight disposition arms may declare the broad dispatcher skipped: \
+             FutexWait publication, terminal-fault commit, terminal-fault fail-closed, the \
+             preempting-timer commit, the unsettled block, the idle-boundary advance, and the \
+             user instruction-fault commit and settlement"
         );
         // And the fourth is reached from the TIMER route's own arm, not smuggled into another
         // one: the setter and its distinct skip reason both sit between that arm's head and the
@@ -149476,10 +149487,16 @@ mod u9tm_proof_gate {
                 "{name} bridge: the IRQ arm must report its own skip reason rather than borrow \
                  a fault route's"
             );
+            // BL2 re-derivation: the shared bridge carries TWO terminal results — the terminal
+            // PageFault route's and the user instruction-fault route's. They are exclusive by
+            // decode (a trap is one event) and both carry a settlement of the same terminal
+            // owners, so either one's result must reach the tail. RISC-V has no instruction-fault
+            // route and keeps one.
+            let terminal_carriers = if name == "riscv" { 1 } else { 2 };
             assert_eq!(
                 src.matches("terminal_result = Some(result);").count(),
-                1,
-                "{name} bridge: exactly one place may carry the terminal route's result"
+                terminal_carriers,
+                "{name} bridge: exactly the terminal routes may carry a terminal result"
             );
             // Each route declares its own recovery exactly once.
             assert_eq!(
@@ -150824,7 +150841,7 @@ mod u9ft3_transition {
             .nth(1)
             .expect("the terminal route");
         let capture = r
-            .find("capture_outgoing_user_context_split(facts.tid, frame)")
+            .find("capture_outgoing_user_context_split(tid, frame)")
             .expect("capture");
         // U9-PAGEFAULT2 §2: the publication moved into `deliver_fault_report_split`, which is
         // the emitter's totality made explicit. The ORDER this case pins is unchanged — capture
@@ -151018,7 +151035,7 @@ mod u9ft4_route {
     fn queue_advance_committed_requires_a_reserved_deferral() {
         let r = route();
         let reserve = r
-            .find("futex_wait_dispatch_try_defer(cpu_idx, facts.tid)")
+            .find("futex_wait_dispatch_try_defer(cpu_idx, tid)")
             .expect("the reservation");
         let commit = r
             .rfind("D::QueueAdvanceCommitted")
@@ -152477,7 +152494,7 @@ mod u9pagefault3_interleavings {
             .nth(1)
             .expect("the terminal route");
         let arm = route
-            .find("futex_wait_dispatch_try_defer(cpu_idx, facts.tid)")
+            .find("futex_wait_dispatch_try_defer(cpu_idx, tid)")
             .expect("the route's own reservation");
         let clear = route
             .find("futex_wait_dispatch_clear(cpu_idx)")
@@ -152495,7 +152512,7 @@ mod u9pagefault3_interleavings {
         );
         assert_eq!(
             route
-                .matches("futex_wait_dispatch_try_defer(cpu_idx, facts.tid)")
+                .matches("futex_wait_dispatch_try_defer(cpu_idx, tid)")
                 .count(),
             1,
             "exactly one reservation, for the same reason"
@@ -152948,7 +152965,10 @@ mod u9pagefault2_closure {
     /// a recovery class arriving there means a competing owner committed while we classified.
     #[test]
     fn the_end_of_the_route_order_is_settled() {
-        let r = body("fn try_split_terminal_page_fault_into_frame(", 1);
+        // BL2 re-derivation: the route and the terminal settlement it delegates to, as above.
+        let route = body("fn try_split_terminal_page_fault_into_frame(", 1);
+        assert!(route.contains("settle_terminal_user_fault("));
+        let r = route + "\n" + &body("fn settle_terminal_user_fault(", 1);
         assert!(
             r.contains("PageFaultClass::CowCandidate")
                 && r.contains("PageFaultClass::DemandCandidate")
@@ -152995,7 +153015,11 @@ mod u9pagefault2_closure {
     /// canonical outcomes are not one answer, so the route must produce more than one shape.
     #[test]
     fn the_four_refusals_produce_their_own_outcomes() {
-        let r = body("fn try_split_terminal_page_fault_into_frame(", 1);
+        // BL2 re-derivation: the route's steps (2)-(8) moved, unchanged, into the one terminal
+        // settlement body both terminal fault classes reach; the route is that body's caller.
+        let route = body("fn try_split_terminal_page_fault_into_frame(", 1);
+        assert!(route.contains("settle_terminal_user_fault("));
+        let r = route + "\n" + &body("fn settle_terminal_user_fault(", 1);
         // U9-PAGEFAULT3 §3: both settlement shapes are OWNERS now, not inline closures —
         // `settle_via_entering_frame` for every return through the frame, and
         // `settle_fault_kernel_fatal` for every state that may not return at all.
@@ -193748,4 +193772,115 @@ pub(crate) fn assert_riscv_smp3_wake_scope() {
         release
             .contains("if !crate::kernel::boot::ap_user_dispatch_enabled() {\n        return 0;")
     );
+}
+
+// ── BL2: a user instruction the CPU refused is the task's fault, not the kernel's ───────────
+mod bl2_user_instruction_fault {
+    use super::*;
+    use crate::arch::trap::{FaultAccess, FaultInfo, TrapEvent};
+
+    /// **Only the offending task is faulted, and another task runs.** The broad arm settles the
+    /// event through the per-task fault owner — report, policy, terminal transition — and
+    /// dispatches a replacement; the kernel neither panics nor resumes the faulting instruction.
+    #[test]
+    fn a_user_instruction_fault_faults_only_the_offending_task_and_another_runs() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(40).expect("task");
+        state.enqueue_current_cpu(40).expect("enqueue");
+        assert_eq!(state.current_tid(), Some(0));
+        let fault = FaultInfo::user(VirtAddr(0x40_1000), FaultAccess::Execute);
+        state
+            .handle_trap_event(TrapEvent::UserInstructionFault(fault), None)
+            .expect("the task's fault is settled, not fatal");
+        assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
+        assert_eq!(state.current_tid(), Some(40), "a replacement is dispatched");
+        assert_eq!(state.task_status(40), Some(TaskStatus::Running));
+        // And the system keeps scheduling.
+        state.yield_current().expect("the kernel continues");
+    }
+
+    /// **It is not a page fault.** At an address inside the task's demand region, a page fault
+    /// would be recovered by mapping a page; an instruction fault there maps nothing and is not
+    /// recorded as a page fault — the page-fault owners never see it.
+    #[test]
+    fn a_user_instruction_fault_never_reaches_the_page_fault_owners() {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+        state
+            .set_task_brk_bounds(0, 0x4000, 0x8000)
+            .expect("brk bounds");
+        let fault = FaultInfo::user(VirtAddr(0x5000), FaultAccess::Execute);
+        state
+            .handle_trap_event(TrapEvent::UserInstructionFault(fault), None)
+            .expect("settled");
+        assert!(
+            state
+                .user_spaces
+                .get(asid)
+                .expect("aspace")
+                .resolve(VirtAddr(0x5000))
+                .is_none(),
+            "the demand owner did not run"
+        );
+        assert_eq!(state.last_fault(), None, "not recorded as a page fault");
+        assert_eq!(state.task_status(0), Some(TaskStatus::Faulted));
+    }
+
+    /// The off-lock composition: the bridge settles the event through the user instruction-fault
+    /// route under THIS trap's authority; that route and the terminal PageFault route share ONE
+    /// settlement body; the instruction route offers the fault to no page-fault owner; and the
+    /// Unknown policy — still the destination of a ring-0 `#GP` — is unchanged.
+    #[test]
+    fn the_off_lock_route_shares_the_terminal_settlement_and_leaves_unknown_fatal() {
+        const BRIDGE: &str = include_str!("../../arch/trap_entry.rs");
+        let block = BRIDGE
+            .split("if let TrapEvent::UserInstructionFault(fault) = decode_trap_context(context)")
+            .nth(1)
+            .expect("the bridge routes the event");
+        let block = &block[..block.find("// 199D-DW2").unwrap_or(block.len())];
+        assert!(block.contains("try_split_user_instruction_fault_dispatch("));
+        assert!(block.contains("trap_path.authority()"));
+        assert!(block.contains("terminal_result = Some(result);"));
+
+        const SPLIT: &str = include_str!("../syscall_split.rs");
+        assert_eq!(SPLIT.matches("fn settle_terminal_user_fault(").count(), 1);
+        let route = |name: &str| {
+            let start = SPLIT
+                .find(&alloc::format!(
+                    "#[cfg(not(feature = \"hosted-dev\"))]\nfn {name}("
+                ))
+                .unwrap_or_else(|| panic!("{name} (production)"));
+            let rest = &SPLIT[start + 10..];
+            &rest[..rest.find("\n#[cfg(").unwrap_or(rest.len())]
+        };
+        let pf = route("try_split_terminal_page_fault_into_frame");
+        let gp = route("try_split_user_instruction_fault_into_frame");
+        assert!(
+            pf.contains("settle_terminal_user_fault(")
+                && pf.contains("TerminalUserFaultKind::PageFault")
+        );
+        assert!(
+            gp.contains("settle_terminal_user_fault(")
+                && gp.contains("TerminalUserFaultKind::Instruction")
+        );
+        for owner in [
+            "classify_for_split",
+            "cow",
+            "demand",
+            "page_fault_route_for",
+        ] {
+            assert!(
+                !gp.contains(owner),
+                "the instruction route must not reach {owner}"
+            );
+        }
+        assert!(gp.contains("guard_supervisor_origin(cpu, fault, \"user_instruction\")"));
+
+        let unknown = SPLIT
+            .split("fn try_split_unknown_trap_into_frame(")
+            .nth(1)
+            .expect("the Unknown route");
+        assert!(unknown.contains("crate::kernel::boot::unknown_trap_fatal(cpu, arch_code);"));
+    }
 }
