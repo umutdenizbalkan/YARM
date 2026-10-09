@@ -288,7 +288,7 @@ verify_settlements_within_registrations() {
 # within one boot would be indistinguishable there — the registration bound, which DOES carry the
 # ASID, is what closes that gap for the oracle's own caller. The COMMITTED marker carries no
 # identity whatsoever and cannot be field-scoped at all; it is bound positionally inside the
-# oracle's own identity-scoped window plus a cardinality tie to the distinct settled callers.
+# oracle's own identity-scoped window plus a one-to-one pairing with the settlements.
 # Widening either marker is a kernel change and is out of scope for this repair.
 
 # Extract a numeric `key=value` field from one marker line. The leading space is required so

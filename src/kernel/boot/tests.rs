@@ -137999,7 +137999,12 @@ mod riscv64_retirement_oracle_scoped_accounting {
     }
 
     /// (4) The COMMITTED family carries no identity, so it is bound positionally INSIDE the
-    /// oracle's identity-scoped window plus a cardinality tie — and the limitation is documented.
+    /// oracle's identity-scoped window plus a one-to-one pairing with the reply-timeout
+    /// SETTLEMENTS — and the limitation is documented.
+    ///
+    /// BL5a re-derived the second bound. It used to tie the commit count to the distinct callers
+    /// on the DELIVERED family, but that marker is the resume boundary of every blocked-syscall
+    /// completion, ordinary receive timeouts included, so the tie failed on every correct boot.
     #[test]
     fn the_identityless_committed_family_is_bound_two_independent_ways() {
         let c = SMOKE
@@ -138019,8 +138024,21 @@ mod riscv64_retirement_oracle_scoped_accounting {
             "exactly one commit inside the oracle's own window"
         );
         assert!(
-            c.contains("distinct settled caller identities"),
-            "a cardinality tie must catch a duplicate commit for any caller"
+            c.contains("IPC_REPLY_TIMEOUT_OK arch=${arch} terminal=Timeout")
+                && c.contains("do not pair one-to-one"),
+            "every settlement must pair with exactly one commit, for any caller"
+        );
+        for refused in [
+            "missing commit before line",
+            "orphan or duplicate commit at line",
+            "the last settlement was never committed",
+            "no settlement at all",
+        ] {
+            assert!(c.contains(refused), "the pairing must refuse: {refused}");
+        }
+        assert!(
+            !c.contains("delivered_identities"),
+            "the commit count must not be tied to the resume-boundary population"
         );
         assert!(
             SMOKE.contains("NO identity at all") && SMOKE.contains("LIMITATION"),
@@ -138081,7 +138099,7 @@ mod riscv64_retirement_oracle_scoped_accounting {
             "the fixtures must run without building or booting anything"
         );
         assert!(
-            SMOKE.contains("STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST cases=7 result=ok"),
+            SMOKE.contains("STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST cases=16 result=ok"),
             "the fixture run must emit a countable seal"
         );
     }
@@ -138161,6 +138179,240 @@ mod riscv64_retirement_oracle_scoped_accounting {
             SMOKE.contains("\"KERNEL PANIC\" \"RUST PANIC\" \"panicked at\""),
             "the fatal-pattern guard must be unchanged"
         );
+    }
+
+    /// (9) BL5a — the late reply after a timeout win has TWO refusing owners since
+    /// DIRECT3-CAP-FINAL §7, and the cell accepts exactly one refusal from either, scoped to the
+    /// ORACLE's own record and positioned inside the oracle's window. It used to require the
+    /// legacy decline alone, so the pre-lock refusal — the one the live route actually takes —
+    /// failed the cell on correct behaviour.
+    #[test]
+    fn the_late_reply_refusal_is_one_scoped_inert_refusal_from_either_owner() {
+        let r = SMOKE
+            .split("verify_late_reply_refused_once() {")
+            .nth(1)
+            .expect("the refusal check")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(
+            r.contains(
+                "record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} "
+            ),
+            "the pre-lock refusal must be selected by the oracle's own record coordinates"
+        );
+        assert!(
+            r.contains("legacy + prelock_any == 1"),
+            "exactly one refusal in total, from either owner"
+        );
+        assert!(
+            r.contains(
+                "terminal=Settled reply_copies=0 caller_wakes=0 mutations=0 err=WrongObject"
+            ),
+            "the pre-lock refusal must be inert"
+        );
+        assert!(
+            r.contains("declines == legacy"),
+            "no reserve decline may carry any reason but TimeoutAlreadyClaimed"
+        );
+        assert!(
+            r.contains("at <= oc || at >= ou"),
+            "the refusal must lie after the oracle's commit and before its userspace completion"
+        );
+        let tw = SMOKE
+            .split("# ── 3. Scenario A — timeout-wins, feature enabled (fresh boot) ──")
+            .nth(1)
+            .expect("the timeout-wins block")
+            .split("# ── 4. Scenario B")
+            .next()
+            .expect("its body");
+        assert!(tw.contains("verify_late_reply_refused_once \"$TW\" riscv64 \"$ORACLE_TID\""));
+        for case in [
+            "\"refusal_legacy:pass\"",
+            "\"refusal_none:fail\"",
+            "\"refusal_both:fail\"",
+            "\"refusal_not_inert:fail\"",
+            "\"refusal_other_record:fail\"",
+            "\"refusal_other_reason:fail\"",
+            "\"commit_without_settlement:fail\"",
+            "\"settlement_without_commit:fail\"",
+            "\"with_ordinary_receive_timeouts:pass\"",
+        ] {
+            assert!(SMOKE.contains(case), "missing self-test case {case}");
+        }
+    }
+}
+
+/// BL5a — the AArch64 retirement runner accounts for completions PER ORACLE IDENTITY, the same
+/// way the RISC-V runner has since 199E-R3.
+///
+/// Its timeout-wins cell asserted `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` as a global singleton
+/// and `AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED` by a bare boot-wide count, and took every
+/// ordered position by family-first occurrence. That held only while no other caller completed in
+/// the same boot: CONSUMED is the production resume boundary of EVERY blocked receive
+/// (199E-A64RC made it ungated), and tid 2 arms a production reply deadline of its own on every
+/// boot. These cases pin the scoped accounting, the retained global duplicate bound, and the
+/// runner's own fixtures in both directions.
+mod aarch64_retirement_oracle_scoped_accounting {
+    const SMOKE: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-aarch64-retirement-smoke.sh");
+
+    fn body_of(f: &str) -> &'static str {
+        SMOKE
+            .split(f)
+            .nth(1)
+            .expect("the helper")
+            .split("\n}\n")
+            .next()
+            .expect("its body")
+    }
+
+    fn timeout_wins() -> &'static str {
+        SMOKE
+            .split("# ── 3. Scenario A — timeout-wins, feature enabled (fresh boot) ──")
+            .nth(1)
+            .expect("the timeout-wins block")
+            .split("# ── 4. Scenario B")
+            .next()
+            .expect("its body")
+    }
+
+    /// The runner MINUS its own synthetic fixtures, which necessarily write literal identities.
+    fn assertion_regions() -> [&'static str; 2] {
+        let (head, rest) = SMOKE
+            .split_once("fixture_log() {")
+            .expect("the fixture generator");
+        let (_fixtures, tail) = rest
+            .split_once("# Run every scoped check against one fixture.")
+            .expect("the end of the fixture generator");
+        [head, tail]
+    }
+
+    #[test]
+    fn the_oracle_identity_is_derived_and_nothing_hardcodes_it() {
+        let f = body_of("derive_oracle_identity() {");
+        assert!(f.contains("IPC_REPLY_TIMEOUT_ORACLE_PROVISION_OK init_tid="));
+        assert!(f.contains("oracle provisioning marker count != 1"));
+        assert!(
+            f.contains("caller_asid")
+                && f.contains("record_index")
+                && f.contains("record_generation")
+        );
+        assert!(timeout_wins().contains("derive_oracle_identity \"$TW\" aarch64"));
+        for r in assertion_regions() {
+            assert!(
+                !r.contains("caller_tid=1 ") && !r.contains("tid=1 class=IpcRecv"),
+                "no assertion may hardcode the oracle's numeric TID"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_completion_family_is_a_global_singleton_any_more() {
+        let tw = timeout_wins();
+        let verify_args = tw
+            .split("verify_log \"$TW\" \\")
+            .nth(1)
+            .expect("the verify_log call")
+            .split("\n  if [[")
+            .next()
+            .expect("its arguments");
+        assert!(
+            !verify_args.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED"),
+            "COMMITTED must not be asserted as a boot-wide singleton"
+        );
+        assert!(
+            !verify_args.contains("AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED"),
+            "CONSUMED must not be asserted as a boot-wide singleton"
+        );
+        assert!(
+            !tw.contains("completion consumed more than once"),
+            "the boot-wide CONSUMED count must be gone"
+        );
+        assert!(tw.contains("verify_oracle_completion_delivered_once \"$TW\" \"$ORACLE_TID\""));
+        assert!(
+            tw.contains("verify_oracle_completion_committed_once \"$TW\" aarch64 \"$ORACLE_TID\"")
+        );
+        assert!(tw.contains("verify_no_duplicate_completion_delivery \"$TW\""));
+        assert!(tw.contains("verify_oracle_ordered_chain \"$TW\" aarch64 \"$ORACLE_TID\""));
+        assert!(tw.contains("verify_late_reply_refused_once \"$TW\" aarch64 \"$ORACLE_TID\""));
+    }
+
+    #[test]
+    fn exact_one_pairing_and_global_duplicates_are_retained() {
+        let d = body_of("verify_oracle_completion_delivered_once() {");
+        assert!(d.contains("!= 1 (got $n) for tid="));
+        assert!(!d.contains("-ge 1") && !d.contains(">= 1"));
+        assert!(
+            d.contains(
+                "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid=${tid} class=IpcRecv result=9 "
+            ),
+            "the oracle's consumption must carry the canonical TimedOut (9)"
+        );
+        assert!(body_of("verify_no_duplicate_completion_delivery() {").contains("uniq -d"));
+        let c = body_of("verify_oracle_completion_committed_once() {");
+        assert!(c.contains("oracle-window COMPLETION_COMMITTED count != 1"));
+        assert!(c.contains("do not pair one-to-one"));
+        assert!(!c.contains("delivered_identities"));
+        let ch = body_of("verify_oracle_ordered_chain() {");
+        for scoped in [
+            "IPC_REPLY_TIMEOUT_ARMED arch=${arch} caller_tid=${tid} ",
+            "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid=${tid} ",
+            "USER_LOG tid=${tid} msg=AARCH64_IPC_REPLY_TIMEOUT_DONE",
+        ] {
+            assert!(
+                ch.contains(scoped),
+                "the oracle chain must select `{scoped}` by identity"
+            );
+        }
+    }
+
+    #[test]
+    fn the_runner_carries_self_test_fixtures_for_both_directions() {
+        assert!(SMOKE.contains(r#"[[ "${1:-}" == "--self-test" ]]"#));
+        assert!(SMOKE.contains("if (( ! fail && ! SELF_TEST )); then"));
+        for case in [
+            "\"oracle_only:pass\"",
+            "\"oracle_plus_unrelated:pass\"",
+            "\"with_ordinary_receive_timeouts:pass\"",
+            "\"refusal_legacy:pass\"",
+            "\"oracle_missing_delivery:fail\"",
+            "\"oracle_duplicate:fail\"",
+            "\"unrelated_duplicate:fail\"",
+            "\"no_provision:fail\"",
+            "\"malformed_armed:fail\"",
+            "\"commit_without_settlement:fail\"",
+            "\"settlement_without_commit:fail\"",
+            "\"refusal_none:fail\"",
+            "\"refusal_both:fail\"",
+            "\"refusal_not_inert:fail\"",
+            "\"refusal_other_record:fail\"",
+            "\"refusal_other_reason:fail\"",
+        ] {
+            assert!(SMOKE.contains(case), "missing self-test case {case}");
+        }
+        assert!(SMOKE.contains(
+            "STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST arch=aarch64 cases=16 result=ok"
+        ));
+    }
+
+    /// The surrounding cell is unchanged: settlement bounds, lock status, the global one-shots,
+    /// the userspace verdict and the fatal patterns are all still asserted.
+    #[test]
+    fn the_surrounding_contract_is_untouched() {
+        let tw = timeout_wins();
+        for kept in [
+            "verify_oracle_armed_once \"$TW\" aarch64",
+            "verify_no_duplicate_settlement \"$TW\" aarch64",
+            "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=aarch64 scan_broad_lock=0",
+            "IPC_REPLY_TIMEOUT_DEFERRED arch=aarch64 published=1 drained=1 result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcReplyTimeout result=ok",
+            "AARCH64_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok",
+            "\"KERNEL PANIC\" \"RUST PANIC\" \"panicked at\" \"SYNCHRONOUS EXCEPTION\"",
+            "recheck_sha_clean",
+        ] {
+            assert!(tw.contains(kept), "the cell must still assert `{kept}`");
+        }
     }
 }
 
