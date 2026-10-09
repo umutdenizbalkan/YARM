@@ -2366,20 +2366,17 @@ pub(super) mod xfer2_grant_witness {
     #[cfg(feature = "recv-queue1-ordinary-grant")]
     fn ordinary_route_grants(mem_cap: u32, ep_cap: u32) -> (bool, bool) {
         const VA: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
-        // ONE page, not the oracle's full two.
+        // The oracle's FULL two pages (BL1).
         //
-        // The broad NR 2 / NR 5 mapping loop resolves the memory object's physical base ONCE PER
-        // PAGE from the capability — `map_user_page_in_asid_with_caps` → `resolve_memory_object_phys`,
-        // which takes no virtual address and no page index — so every page of a multi-page region
-        // is mapped to the object's FIRST frame. Observed live at
-        // `USER_MAP_PA_CHECK va=0x40000000 pa=0x1021c000` followed by
-        // `va=0x40001000 pa=0x1021c000`. That is a pre-existing defect of the BROAD path, latent
-        // because production only ever sends single-page regions through these two syscalls, and
-        // this package reproduces it rather than silently diverging (see
-        // `the_shared_region_mapping_loop_resolves_one_phys_per_page`). So the live cell exercises
-        // the production shape, where the defect cannot be reached; a 2-page grant here would be
-        // testing the bug, not the route.
-        const LEN: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_PAGE_SIZE;
+        // This cell used to send ONE page, because the NR 2 / NR 5 mapping loop resolved every
+        // page through `resolve_memory_object_phys`, which takes no page index and returns the
+        // memory object's BASE frame: page 1 of a two-page grant was mapped to page 0's frame
+        // (observed live as `USER_MAP_PA_CHECK va=0x40000000 pa=0x1021c000` followed by
+        // `va=0x40001000 pa=0x1021c000`). Both loops now resolve each page through the
+        // offset-aware owner, so the cell transfers the whole region and checks the two pages
+        // INDEPENDENTLY against the per-page pattern — a page swap, an aliased page or a
+        // single-page mapping each fail a different half.
+        const LEN: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN;
 
         // `timeout` is NR 5's only. A non-zero value with the message ALREADY queued is the
         // finite-timeout immediate delivery this package added: the immediate engine must take it
@@ -2424,21 +2421,12 @@ pub(super) mod xfer2_grant_witness {
             let cap = got.ret2 as u32;
             let meta_ok = got.ret1 as usize == LEN && cap != 0 && got.ret2 != u64::MAX;
 
-            // BACKING: every byte of the mapped page against the deterministic oracle pattern —
-            // the only check that can tell a real mapping from a frame that merely claims one.
-            let mut p0 = true;
-            let mut off = 0usize;
-            while off < LEN {
-                // SAFETY: the recv mapped this whole window readable.
-                let got = unsafe { core::ptr::read_volatile((VA + off) as *const u8) };
-                if got != yarm_user_rt::syscall::shared_region_oracle_pattern_byte(off) {
-                    p0 = false;
-                }
-                off += 1;
-            }
-            // One page is mapped, so there is no second page to prove; reported as `1` so the
-            // marker's shape matches the NR 30 profile's rather than inventing a new one.
-            let p1 = true;
+            // BACKING: every byte of BOTH pages against the deterministic oracle pattern, each
+            // page judged on its own — the only check that can tell a real mapping from a frame
+            // that merely claims one, and the one the NR 30 profile applies.
+            // SAFETY: the recv mapped this whole window readable.
+            let (p0, p1) =
+                unsafe { super::shared_region_oracle_core::validate_pages_split(VA, LEN) };
 
             // The same three-part teardown A and B check: release, prove the window is free
             // again, and prove the cleanup capability is revoked.

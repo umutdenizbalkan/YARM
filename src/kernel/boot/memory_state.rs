@@ -1305,6 +1305,40 @@ impl KernelState {
         })
     }
 
+    /// BL1 — the per-page twin of [`Self::resolve_memory_object_phys`] for a shared region: the
+    /// same capability resolution, the same object-kind check and the same READ-then-WRITE rights
+    /// checks in the same order, then the frame `page_offset` bytes into the capability's window
+    /// through [`Self::shared_region_page_phys_locked`].
+    ///
+    /// `resolve_memory_object_phys` answers "the object's base frame", which is right for every
+    /// single-page object its other callers map; a multi-page region needs the frame of EACH page.
+    pub(crate) fn resolve_shared_region_page_phys(
+        &self,
+        mem_cap: CapId,
+        flags: PageFlags,
+        page_offset: usize,
+    ) -> Result<PhysAddr, KernelError> {
+        let capability = self
+            .capability_service()
+            .resolve_current_task_capability(mem_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        if !matches!(
+            capability.object,
+            CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. }
+        ) {
+            return Err(KernelError::WrongObject);
+        }
+        if flags.read && !capability.has_right(CapRights::READ) {
+            return Err(KernelError::MissingRight);
+        }
+        if flags.write && !capability.has_right(CapRights::WRITE) {
+            return Err(KernelError::MissingRight);
+        }
+        self.with_memory_state(|memory| {
+            Self::shared_region_page_phys_locked(memory, capability.object, page_offset)
+        })
+    }
+
     /// Install one page in one address space with exactly the permissions given.
     /// Body: [`vm_image_locked::map_user_page_in_asid_raw_locked`].
     pub(crate) fn map_user_page_in_asid_raw(

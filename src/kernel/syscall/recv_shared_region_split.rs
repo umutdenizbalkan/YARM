@@ -36,10 +36,10 @@
 //!   different capability and rewrite the return lane. The metadata therefore names the
 //!   pre-attenuation capability. Same order here, same bytes.
 //!
-//! A third is noted where it happens: the per-page mapping loop resolves the memory object's
-//! physical base once per page from the capability, which is the object's base every time. For a
-//! region of one page — the only shape production sends — that is exactly right; the broad owner
-//! has the same shape and this module reproduces it rather than silently diverging.
+//! The per-page mapping loop resolves EACH page's frame — `va - requested_va` bytes into the
+//! capability's window — through the owner the broad loop also uses
+//! (`KernelState::shared_region_page_phys_locked`). Both loops used to resolve the object's base
+//! frame for every page, so every page of a multi-page region aliased page 0 (BL1).
 
 use crate::kernel::boot::TrapHandleError;
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
@@ -437,10 +437,15 @@ impl crate::runtime::SharedKernel {
         let mut va = requested_va;
         while va < end {
             // Resolved per page, as the broad loop resolves it per page through
-            // `map_user_page_in_asid_with_caps` → `resolve_memory_object_phys`: the rights check
-            // and the object's physical base, in that order, with that error precedence.
-            let phys =
-                self.resolve_shared_region_phys_split(receiver_tid, receiver_mem_cap, map_flags)?;
+            // `resolve_shared_region_page_phys`: the rights check, then the frame `va -
+            // requested_va` bytes into the capability's window, in that order, with that error
+            // precedence.
+            let phys = self.resolve_shared_region_phys_split(
+                receiver_tid,
+                receiver_mem_cap,
+                map_flags,
+                va - requested_va,
+            )?;
             let installed = self.map_user_page_raw_split(
                 asid,
                 VirtAddr(va as u64),
@@ -475,32 +480,34 @@ impl crate::runtime::SharedKernel {
         Ok((requested_va, mapped_len))
     }
 
-    /// The split twin of `resolve_memory_object_phys`, scoped to the receiver's cspace: resolve,
-    /// require the object kind, check READ then WRITE against the requested flags, then read the
-    /// object's physical base. Same order, same errors.
+    /// The split twin of `resolve_shared_region_page_phys`, scoped to the receiver's cspace:
+    /// resolve, require the object kind, check READ then WRITE against the requested flags, then
+    /// read the frame `page_offset` bytes into the capability's window through the shared owner.
+    /// Same order, same errors.
     fn resolve_shared_region_phys_split(
         &self,
         receiver_tid: u64,
         mem_cap: CapId,
         flags: PageFlags,
+        page_offset: usize,
     ) -> Result<PhysAddr, SyscallError> {
         let capability = self
             .resolve_capability_for_task_split(receiver_tid, mem_cap)
             .map_err(|_| SyscallError::InvalidCapability)?;
-        let id = match capability.object {
-            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
-            _ => return Err(SyscallError::WrongObject),
-        };
+        if !matches!(
+            capability.object,
+            CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. }
+        ) {
+            return Err(SyscallError::WrongObject);
+        }
         if flags.read && !capability.has_right(CapRights::READ) {
             return Err(SyscallError::MissingRight);
         }
         if flags.write && !capability.has_right(CapRights::WRITE) {
             return Err(SyscallError::MissingRight);
         }
-        self.memory_object_phys_by_id_split(id)
-            .ok_or(SyscallError::from(
-                crate::kernel::boot::KernelError::MemoryObjectMissing,
-            ))
+        self.shared_region_page_phys_split(capability.object, page_offset)
+            .map_err(SyscallError::from)
     }
 
     /// rank 3 — the mapping accounting, the split twin of `KernelState::note_shared_mem_mapped`:

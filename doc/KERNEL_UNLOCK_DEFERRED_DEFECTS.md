@@ -13,3 +13,4 @@ known failure cannot quietly become invisible between increments.
 Format: `date | defect | where | found during`
 
 - 2026-08-11 | AArch64 strict optional-FS smoke stalls at steady-state idle before RAMFS/EXT4 markers; reproduced identically at U1 parent 03f6e5b and U1 26364834, therefore not a U1 regression | scripts/qemu-aarch64-optional-fs-smoke.sh | found during U1
+- 2026-10-09 | shared-region descriptor `offset` is documented as an object offset but applied by no receive path (direct, NR 30, queued NR 2 / NR 5 all map from the capability window's start); needs an ABI decision | src/kernel/syscall/ipc.rs, src/kernel/boot/shared_region_txn.rs, src/kernel/syscall/recv_v3_txn.rs | found during BL1 (doc/KERNEL_UNLOCKING.md, backlog ledger BL1-a)

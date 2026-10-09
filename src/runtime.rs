@@ -9993,6 +9993,19 @@ impl SharedKernel {
         })
     }
 
+    /// rank 6 — BL1: the frame behind one page of a shared region, through the SAME owner the
+    /// broad `resolve_shared_region_page_phys` reads,
+    /// [`KernelState::shared_region_page_phys_locked`].
+    pub(crate) fn shared_region_page_phys_split(
+        &self,
+        object: crate::kernel::capabilities::CapObject,
+        page_offset: usize,
+    ) -> Result<crate::kernel::vm::PhysAddr, crate::kernel::boot::KernelError> {
+        self.with_memory_split_mut(|memory| {
+            KernelState::shared_region_page_phys_locked(memory, object, page_offset)
+        })
+    }
+
     /// rank 6 — a memory object's physical base.
     pub(crate) fn memory_object_phys_by_id_split(
         &self,

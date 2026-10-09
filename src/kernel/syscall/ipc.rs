@@ -43,7 +43,7 @@ use crate::kernel::ipc::{
 use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
 use crate::kernel::trap::FaultAccess;
 use crate::kernel::trapframe::TrapFrame;
-use crate::kernel::vm::{PAGE_SIZE, PageFlags, VirtAddr};
+use crate::kernel::vm::{Mapping, PAGE_SIZE, PageFlags, VirtAddr};
 
 /// Stage 198D-S — DIRECT-ONLY REPLY CAPS (authoritative policy).
 ///
@@ -250,12 +250,23 @@ fn map_shared_region_into_receiver(
         .task_asid(tid)
         .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
     while va < end {
-        if let Err(err) = kernel.map_user_page_in_asid_with_caps(
-            asid,
-            receiver_mem_cap,
-            VirtAddr(va as u64),
-            map_flags,
-        ) {
+        // BL1: page `va - requested_va` of the region is backed by the frame that far into the
+        // capability's window — resolved per page, with the rights checks first, by the
+        // offset-aware owner. (Resolving through `resolve_memory_object_phys` here mapped every
+        // page to the object's base frame.)
+        let installed = kernel
+            .resolve_shared_region_page_phys(receiver_mem_cap, map_flags, va - requested_va)
+            .and_then(|phys| {
+                kernel.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr(va as u64),
+                    Mapping {
+                        phys,
+                        flags: map_flags,
+                    },
+                )
+            });
+        if let Err(err) = installed {
             // Stage 7: two-phase rollback — reclaim only after shootdown wait/fast path.
             let mut rollback = requested_va;
             while rollback < va {

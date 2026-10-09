@@ -288,6 +288,7 @@ supplied by userspace.
 | source object forms | `CapObject::MemoryObject` or `CapObject::DmaRegion` only; anything else → `WrongObject`. `validate_shared_mem_transfer_rights` gates required rights. |
 | region validation | `validate_user_region(offset, len)`: `offset < KERNEL_SPACE_BASE`, no overflow, `offset + len ≤ KERNEL_SPACE_BASE` |
 | **descriptor layout** | `SharedMemoryRegion::ENCODED_LEN` = **16 bytes**, little-endian: `offset: u64` at bytes 0..8, `len: u64` at bytes 8..16 |
+| receive backing | page *i* of the mapped region is the frame *i* pages into the transferred capability's window — the object's start for a `MemoryObject`, the window's start for a `DmaRegion` — on every receive path (direct, NR 30, queued NR 2 / NR 5). The descriptor `offset` is **not** applied to backing by any of them (open: `doc/KERNEL_UNLOCKING.md`, backlog ledger BL1-a). |
 | envelope | exactly **one** `TransferEnvelope`; the source cap is delegated/duplicated, **not moved** — it stays valid in the sender's CNode |
 | pre-ack behavior | if the receiver is not yet an authoritatively-committed recv-v2 waiter the direct producer fails closed with retryable `SyscallError::WouldBlock` — no mutation, source cap and envelope preserved, parent retries |
 

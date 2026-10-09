@@ -25656,3 +25656,93 @@ first push); this record follows in a documentation-only commit.
   extra reschedule lines per direction.
 * **Coalescing and TCG timing** make `entries_with_tlb_work`, `coalesced_sends` and
   `deliveries_with_tlb_work` vary between boots; none of them is a credit condition.
+
+---
+
+## Correctness and regression backlog (post-LOCK3)
+
+The backlog programme that follows QEMU-LOCK3 (`bdd0028e`). Each issue is verified against the
+current source before anything changes, reproduced, repaired at its owning operation, qualified
+on a frozen tree with fresh artifacts, and delivered to `main` on its own. U9 stays closed
+throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separately).
+
+### Ledger
+
+| Issue | Status | Evidence / prerequisite |
+|---|---|---|
+| BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed (this section, BL1) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
+| BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | confirmed open — blocked on an ABI decision | see BL1 "Not changed"; every in-tree sender passes offset 0 |
+| BL2 — x86 user port-I/O fault containment | confirmed open | IRQ3 omitted its live isolation probe |
+| BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | to verify | |
+| BL3b — futex check-and-park contract | to verify | |
+| BL3c — hosted ack-lease intermittent failure | to verify | |
+| BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | to verify | |
+| BL4b — scheduler quantum / hardware deadline coupling | to verify | |
+| BL5a — reply-timeout retirement checker count/scope failures | to verify | |
+| BL5b — x86 terminal-fault oracle held to ordinary service counts | to verify | |
+| BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
+| BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
+
+### BL1 — multi-page shared-region mapping
+
+**Defect (verified on `bdd0028e`).** The queued shared-region receive of NR 2 / NR 5 maps the
+region page by page. The broad loop (`map_shared_region_into_receiver`) installed each page through
+`map_user_page_in_asid_with_caps` → `resolve_memory_object_phys(cap, flags)`, which takes neither an
+address nor a page index and returns the memory object's **base** frame; the split twin
+(`map_shared_region_into_receiver_split` → `resolve_shared_region_phys_split` →
+`memory_object_phys_by_id_split`) reproduced it deliberately. Every page of a multi-page region was
+therefore mapped to page 0's frame, and a `DmaRegion` capability's window offset was ignored as
+well. A source guard (`the_shared_region_mapping_loop_resolves_one_phys_per_page`) pinned the
+behaviour and the live ordinary-route grant was cut to one page to avoid it. The direct
+shared-region transaction and NR 30 already advanced the frame per page.
+
+**Repair.** One owner, `KernelState::shared_region_page_phys_locked(memory, object, page_offset)`
+(rank 6, next to `shared_region_phys_base_locked`), returns the frame `page_offset` bytes into the
+window the capability names — the whole object for a `MemoryObject`, `[offset, offset + len)` for a
+`DmaRegion`. It relies on the representation guarantee that a memory object is one physical range
+`[phys, phys + len)` (single base and length, no frame list; anonymous objects come from
+`alloc_contiguous`, initramfs objects are slices of the contiguous initrd), and it refuses an
+unaligned offset, a page at or past the window's end, a window that leaves its object, a stale
+object and any other class rather than compute a frame outside the capability's authority. The
+send-side bound (`transfer_shared_region_bounds_ok`) already keeps every queued region inside its
+window, so the refusal is defensive. The broad loop resolves each page through
+`resolve_shared_region_page_phys` (same capability resolution, kind check and READ-then-WRITE
+precedence as `resolve_memory_object_phys`) and installs it with `map_user_page_in_asid_raw`; the
+split resolver takes the page offset and reads the same owner through
+`shared_region_page_phys_split`. `resolve_memory_object_phys` is unchanged: its remaining callers map
+page 0 of single-page anonymous objects.
+
+**Lifecycle.** Unchanged and covered: the per-page rights check precedes the install; a later-page
+failure unmaps the installed prefix through the two-phase owner (shootdown before reclaim), revokes
+the minted capability and clears the return lane; release unmaps the whole range before revoking;
+the object's `map_refcount` is keyed on its base frame, as for the direct and NR 30 mappings, and the
+receiver's capability plus the active-transfer registration hold the object across the whole range
+until release.
+
+**Evidence.**
+
+* Hosted (`u9_recv_queue1_parity`): `every_page_of_a_multi_page_region_is_backed_by_its_own_frame`
+  (both routes × NR 2 / NR 5 × RW / read intent × a whole 3-page object, a `2·PAGE + 1` region and a
+  `DmaRegion` window starting one page in: each page's installed frame is `window base + i·PAGE`, the
+  permissions are the intent's, nothing past the region is mapped, the registration covers the whole
+  range); `a_multi_page_region_is_released_then_reclaimed_after_its_last_reference`;
+  `a_later_page_map_failure_rolls_back_the_installed_prefix`;
+  `the_shared_region_page_owner_refuses_everything_outside_the_window`; a source guard that both
+  loops reach the offset-aware owner. On `bdd0028e` the first fails at page 1
+  (`PhysAddr(0x10180000)` where `0x10181000` was required); release and rollback pass there too and
+  are kept as coverage.
+* Live, all three ports (`ORDINARY_ROUTES=1 scripts/qemu-xfer2-grant-witness-smoke.sh <arch>`): the
+  NR 2 and NR 5 grants now transfer the oracle's full two pages, userspace checks each page against
+  its own pattern, and the grader also requires two whole two-page split mappings, two
+  `XFER_RELEASE_OK route=split pages=2 len=8192`, and — from the address-space owner's
+  `USER_MAP_PA_CHECK` records inside each delivery — page 1's frame equal to page 0's plus `0x1000`.
+  The unrepaired kernel with the same userspace fails every port (`page1=0`, e.g. x86_64 installing
+  `0x1031d000` for both pages); the repaired kernel passes every port.
+
+**Not changed (BL1-a, open).** The descriptor's `offset` (`IpcSend` arg 1) is documented in
+`doc/IPC.md` §8.2 as a byte offset into the source object, but no receive path applies it: the
+direct transaction, NR 30 and both queued loops all map from the capability window's start. For a
+`MemoryObject` the send side validates it only as a user range and bounds `len` alone; for a
+`DmaRegion` the send side requires `[offset, offset + len)` inside the window. Honouring it needs an
+ABI decision (page alignment, or a lane reporting the intra-page offset) across four receive paths,
+so it is recorded rather than changed here. Every in-tree sender passes 0.

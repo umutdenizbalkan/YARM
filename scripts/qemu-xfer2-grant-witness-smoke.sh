@@ -223,19 +223,12 @@ fi
 
 # ── Kernel side: two successful releases, both through the SPLIT route ──
 #
-# The ordinary-receive profile grants ONE page, not the oracle's two: the broad NR 2 / NR 5
-# mapping loop resolves the memory object's physical base once per PAGE (it has no virtual
-# address to vary on), so every page of a multi-page region maps to the object's first frame.
-# That is a pre-existing defect of the broad path which this package reproduces rather than
-# silently diverging from, and a 2-page grant here would be testing the bug instead of the
-# route. Production only ever sends single-page regions through these two syscalls.
-if (( ORDINARY_ROUTES )); then
-  rel=$(count 'XFER_RELEASE_OK route=split pages=1 len=4096')
-  [[ "$rel" == "2" ]] || die "expected two split-route releases of the one-page grant (got $rel)"
-else
-  rel=$(count 'XFER_RELEASE_OK route=split pages=2 len=8192')
-  [[ "$rel" == "2" ]] || die "expected two split-route releases of the two-page grant (got $rel)"
-fi
+# Both profiles grant the oracle's full two pages. The ordinary-receive profile used to grant ONE:
+# the NR 2 / NR 5 mapping loop resolved every page to the memory object's first frame, so a
+# two-page grant could not pass there (BL1). Both queued loops now resolve each page through the
+# offset-aware owner.
+rel=$(count 'XFER_RELEASE_OK route=split pages=2 len=8192')
+[[ "$rel" == "2" ]] || die "expected two split-route releases of the two-page grant (got $rel)"
 have 'XFER_RELEASE_OK route=broad' && die "a release fell to the broad route: the family is not closed"
 
 # ── The receive side must have delivered through the split route too, twice, mapped ──
@@ -245,6 +238,31 @@ if (( ORDINARY_ROUTES )); then
     || die "expected two split-boundary shared-region deliveries (got $sr)"
   ok=$(count 'IPC_RECV_SHARED_REGION_SPLIT_DONE cpu=0 receiver_tid=1 result=ok')
   [[ "$ok" == "2" ]] || die "expected both shared-region deliveries to report ok (got $ok)"
+  mapped=$(count 'IPC_RECV_SHARED_REGION_SPLIT_MAPPED receiver_tid=1 va=')
+  whole=$(grep -a -c -E 'IPC_RECV_SHARED_REGION_SPLIT_MAPPED receiver_tid=1 va=0x[0-9a-f]+ mapped_len=8192 region_len=8192 ' "$NORM" || true)
+  [[ "$mapped" == "2" && "$whole" == "2" ]] \
+    || die "expected two whole two-page split mappings (mapped=$mapped whole=$whole)"
+  # BACKING, kernel side and independent of the userspace byte check: within each delivery the
+  # frame installed for page 1 is page 0's frame plus one page. Read from the address-space
+  # owner's own per-install record, between the delivery's BEGIN and its MAPPED line.
+  frames=$(python3 -I - "$NORM" <<'PY'
+import re, sys
+out, rx, pages = [], False, []
+for line in open(sys.argv[1], errors="replace"):
+    if "IPC_RECV_SHARED_REGION_SPLIT_BEGIN" in line:
+        rx, pages = True, []
+    elif rx and "USER_MAP_PA_CHECK" in line:
+        m = re.search(r" va=0x([0-9a-f]+) pa=0x([0-9a-f]+)", line)
+        pages.append((int(m.group(1), 16), int(m.group(2), 16)) if m else (-1, -1))
+    elif rx and "IPC_RECV_SHARED_REGION_SPLIT_MAPPED" in line:
+        ok = len(pages) == 2 and pages[1][0] == pages[0][0] + 4096 and pages[1][1] == pages[0][1] + 4096
+        out.append("1" if ok else "0")
+        rx = False
+print("".join(out))
+PY
+)
+  [[ "$frames" == "11" ]] \
+    || die "a delivery did not install page 1 at page 0's frame + 0x1000 (per-delivery verdicts: '$frames')"
 else
   v3=$(count 'RECV_V3_LIVE_MAPPED route=split')
   [[ "$v3" == "2" ]] || die "expected two split-route mapped NR 30 deliveries (got $v3)"
@@ -273,7 +291,7 @@ note "NR 30 received+mapped and NR 4 released two disposable grants, both shapes
 # so an ordinary-routes pass was indistinguishable from an NR 30 pass in the transcript — and the
 # two are complementary cells of one witness, not interchangeable.
 if (( ORDINARY_ROUTES )); then
-  echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=ordinary_routes grants=2 shapes=nr2,nr5_timed releases=2 route=split unrouted=0 result=ok"
+  echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=ordinary_routes grants=2 pages=2 shapes=nr2,nr5_timed releases=2 route=split unrouted=0 result=ok"
 else
   echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=nr30 grants=2 shapes=registered_range,explicit_range releases=2 route=split result=ok"
 fi

@@ -66970,9 +66970,16 @@ mod stage193g_remaining_shapes_audit {
     // RecvSharedV3/VM territory, not an IpcSend enqueue slice.
     #[test]
     fn shared_region_recv_is_vm_mapping_coupled() {
+        // BL1: the loop installs each page through the VM owner's raw install with the frame the
+        // offset-aware resolver chose, so it is that call — inside the mapping helper itself —
+        // that proves the receive is VM-coupled.
+        let map_body = IPC_SRC
+            .split("fn map_shared_region_into_receiver(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .unwrap_or("");
         assert!(
-            IPC_SRC.contains("fn map_shared_region_into_receiver(")
-                && IPC_SRC.contains("map_user_page_in_asid_with_caps("),
+            map_body.contains(".map_user_page_in_asid_raw("),
             "shared-region recv must still map pages into the receiver ASID via VM"
         );
         assert!(
@@ -184115,73 +184122,413 @@ mod u9_recv_queue1_parity {
         );
     }
 
-    /// **A pre-existing BROAD defect, reproduced rather than silently diverged from: the
-    /// shared-region mapping loop resolves ONE physical base for every page.**
+    // ── BL1: multi-page shared regions — every page backed by its own frame ──────────────────
+    //
+    // The queued NR 2 / NR 5 mapping loop used to resolve each page through
+    // `resolve_memory_object_phys`, which takes neither an address nor a page index and returns
+    // the object's BASE frame — so every page of a multi-page region aliased page 0. These cases
+    // drive the real send, the real receive on BOTH routes and the real release, and read the
+    // receiver's address space back, so the answer is the installed translation rather than a
+    // frame field that merely claims one.
+
+    const PAGE: usize = crate::kernel::vm::PAGE_SIZE;
+
+    /// A queued shared-region transfer of `region_len` bytes over an `object_pages`-page
+    /// anonymous object, named either by the object's own `MemoryObject` capability (`window`
+    /// `None`) or by a `DmaRegion` capability over `[off, off + len)` of it.
+    struct MultiPage {
+        kernel: SharedKernel,
+        recv_cap: CapId,
+        object_id: u64,
+        source_cap: CapId,
+        /// The physical frame the region's FIRST page must resolve to.
+        window_phys: PhysAddr,
+        /// Pages the receiver must see.
+        pages: usize,
+    }
+
+    fn multipage_fixture(
+        object_pages: usize,
+        window: Option<(usize, usize)>,
+        region_len: usize,
+    ) -> MultiPage {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, object_id, source_cap, window_phys) = kernel.with(|state| {
+            // Bound FIRST: only a user sender may name a region longer than
+            // `Message::MAX_PAYLOAD`, which every multi-page region is. Sender and receiver are
+            // the same task, exactly as in init's own grant witness.
+            let _asid = bind_receiver(state);
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            let (object_id, mem_cap) = state
+                .alloc_anonymous_memory_object_with_len(object_pages * PAGE)
+                .expect("multi-page object");
+            let base = state
+                .with_memory_state(|m| {
+                    m.memory_objects
+                        .iter()
+                        .flatten()
+                        .find(|e| e.id == object_id)
+                        .map(|e| e.phys)
+                })
+                .expect("object phys");
+            let (source_cap, offset, window_phys) = match window {
+                None => (mem_cap, 0, base),
+                Some((off, len)) => (
+                    state.mint_dma_region_cap(mem_cap, off, len).expect("dma"),
+                    off,
+                    PhysAddr(base.0 + off as u64),
+                ),
+            };
+            let mut send = TrapFrame::new(
+                Syscall::IpcSend as usize,
+                [
+                    send_cap.0 as usize,
+                    offset,
+                    region_len,
+                    0,
+                    0,
+                    source_cap.0 as usize,
+                ],
+            );
+            dispatch(state, &mut send).expect("multi-page shared-region send");
+            assert_eq!(send.error_code(), None, "the region is queued");
+            (recv_cap, object_id, source_cap, window_phys)
+        });
+        MultiPage {
+            kernel,
+            recv_cap,
+            object_id,
+            source_cap,
+            window_phys,
+            pages: region_len.div_ceil(PAGE),
+        }
+    }
+
+    /// The receiver's installed translation for `va`, read from its address space.
+    fn receiver_mapping(kernel: &SharedKernel, va: usize) -> Option<crate::kernel::vm::Mapping> {
+        kernel.with(|s| {
+            let asid = s.task_asid(0).expect("receiver asid");
+            s.with_user_spaces(|spaces| {
+                spaces
+                    .get(asid)
+                    .and_then(|a| a.resolve(VirtAddr(va as u64)))
+            })
+        })
+    }
+
+    fn receive_multipage(
+        fx: &MultiPage,
+        nr: usize,
+        split: bool,
+        base: usize,
+        intent: usize,
+    ) -> (Option<SyscallError>, TrapFrame) {
+        let mut f = recv_frame(nr, fx.recv_cap, base, fx.pages * PAGE);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, intent);
+        let err = if split {
+            err_of(split_lane(&fx.kernel, &mut f).expect("the lane serves the transfer"))
+        } else {
+            fx.kernel.with(|s| dispatch(s, &mut f)).err()
+        };
+        (err, f)
+    }
+
+    /// **Every page of a multi-page region is backed by ITS OWN frame**, on both routes and both
+    /// receive syscalls, for a whole object, a region whose length is not a page multiple, and a
+    /// `DmaRegion` window that starts one page into its object.
     ///
-    /// `map_shared_region_into_receiver` calls `map_user_page_in_asid_with_caps` once per page,
-    /// and that resolves the frame through `resolve_memory_object_phys(mem_cap, flags)` — which
-    /// takes no virtual address and no page index and returns the memory object's BASE. So every
-    /// page of a multi-page region is mapped to the object's first frame. Observed live at
-    /// `USER_MAP_PA_CHECK va=0x40000000 pa=0x1021c000` followed by `va=0x40001000 pa=0x1021c000`.
-    ///
-    /// It is latent in production because only single-page regions are ever sent through NR 2 and
-    /// NR 5; NR 30 has its own mapping planner and advances the physical base per page correctly.
-    /// This package PRESERVES the behaviour — a split route that silently mapped correctly would
-    /// be a divergence, and repairing the broad path is a different change with its own blast
-    /// radius. The test exists so the defect is recorded, attributed, and cannot be "fixed" on one
-    /// route only without a deliberate decision.
+    /// For each page the receiver's translation must be `window base + i * PAGE`, carry exactly
+    /// the permissions the map intent asked for, and be shared with the object rather than a
+    /// copy of it; the page after the region must stay unmapped. On the unrepaired code page 1
+    /// resolves to page 0's frame and this fails at the first `i == 1`.
     #[test]
-    fn the_shared_region_mapping_loop_resolves_one_phys_per_page() {
+    fn every_page_of_a_multi_page_region_is_backed_by_its_own_frame() {
+        use crate::kernel::syscall::SYSCALL_RECV_MAP_INTENT_READ;
+        let cases: [(&str, usize, Option<(usize, usize)>, usize); 3] = [
+            ("whole_object", 3, None, 3 * PAGE),
+            ("partial_last_page", 3, None, 2 * PAGE + 1),
+            ("dma_window_at_page_1", 4, Some((PAGE, 2 * PAGE)), 2 * PAGE),
+        ];
+        for (name, object_pages, window, region_len) in cases {
+            for nr in [SYSCALL_IPC_RECV_NR, SYSCALL_IPC_RECV_TIMEOUT_NR] {
+                for split in [false, true] {
+                    for intent in [0, SYSCALL_RECV_MAP_INTENT_READ] {
+                        let route = if split { "split" } else { "broad" };
+                        let ctx = alloc::format!("{name} nr={nr} {route} intent={intent}");
+                        let fx = multipage_fixture(object_pages, window, region_len);
+                        let (err, f) = receive_multipage(&fx, nr, split, MAP_TARGET, intent);
+                        assert_eq!(err, None, "{ctx}: delivered");
+                        assert_eq!(f.ret1(), fx.pages * PAGE, "{ctx}: mapped_len");
+                        assert_eq!(f.arg(SYSCALL_ARG_INLINE_PAYLOAD0), MAP_TARGET, "{ctx}");
+                        assert_eq!(f.arg(SYSCALL_ARG_INLINE_PAYLOAD1), region_len, "{ctx}");
+                        for i in 0..fx.pages {
+                            let m = receiver_mapping(&fx.kernel, MAP_TARGET + i * PAGE)
+                                .unwrap_or_else(|| panic!("{ctx}: page {i} must be mapped"));
+                            assert_eq!(
+                                m.phys,
+                                PhysAddr(fx.window_phys.0 + (i * PAGE) as u64),
+                                "{ctx}: page {i} must be backed by the window's page {i}"
+                            );
+                            assert!(m.flags.read && m.flags.user && !m.flags.execute, "{ctx}");
+                            assert_eq!(
+                                m.flags.write,
+                                intent == 0,
+                                "{ctx}: page {i} carries exactly the intent's permissions"
+                            );
+                        }
+                        assert!(
+                            receiver_mapping(&fx.kernel, MAP_TARGET + fx.pages * PAGE).is_none(),
+                            "{ctx}: nothing past the region is mapped"
+                        );
+                        let cap = CapId(f.ret2() as u64);
+                        assert_eq!(
+                            fx.kernel
+                                .active_transfer_mapping_for_split(ThreadId(0), cap),
+                            Some((VirtAddr(MAP_TARGET as u64), fx.pages * PAGE)),
+                            "{ctx}: the registration covers the whole mapping"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Release unmaps every page, revokes the cleanup capability, and the object is reclaimed
+    /// only after its last reference goes** — the source capability, which the shared-region
+    /// send delegates rather than moves.
+    #[test]
+    fn a_multi_page_region_is_released_then_reclaimed_after_its_last_reference() {
+        use crate::kernel::syscall::SYSCALL_TRANSFER_RELEASE_NR;
+        for split in [false, true] {
+            let route = if split { "split" } else { "broad" };
+            let fx = multipage_fixture(2, None, 2 * PAGE);
+            let before = fx
+                .kernel
+                .with(|s| s.memory_object_refcounts_by_id(fx.object_id))
+                .expect("object live before the receive");
+            assert_eq!(
+                before.2, 1,
+                "{route}: the queued envelope holds the object's one pin"
+            );
+            let (err, f) = receive_multipage(&fx, SYSCALL_IPC_RECV_NR, split, MAP_TARGET, 0);
+            assert_eq!(err, None, "{route}: delivered");
+            let cap = CapId(f.ret2() as u64);
+            let mapped = fx
+                .kernel
+                .with(|s| s.memory_object_refcounts_by_id(fx.object_id))
+                .expect("object live while mapped");
+            assert!(
+                mapped.0 > before.0,
+                "{route}: the receiver holds a capability reference"
+            );
+            assert!(
+                mapped.1 > before.1,
+                "{route}: the mapping holds a map reference"
+            );
+
+            let mut rel =
+                TrapFrame::new(SYSCALL_TRANSFER_RELEASE_NR, [cap.0 as usize, 0, 0, 0, 0, 0]);
+            fx.kernel.with(|s| dispatch(s, &mut rel)).expect("release");
+            assert_eq!(
+                rel.ret0(),
+                2 * PAGE,
+                "{route}: the whole region is released"
+            );
+            for i in 0..2 {
+                assert!(
+                    receiver_mapping(&fx.kernel, MAP_TARGET + i * PAGE).is_none(),
+                    "{route}: page {i} is unmapped by the release"
+                );
+            }
+            let mut dup =
+                TrapFrame::new(SYSCALL_TRANSFER_RELEASE_NR, [cap.0 as usize, 0, 0, 0, 0, 0]);
+            assert!(
+                fx.kernel.with(|s| dispatch(s, &mut dup)).is_err(),
+                "{route}: the cleanup capability is revoked"
+            );
+            assert_eq!(
+                fx.kernel
+                    .with(|s| s.memory_object_refcounts_by_id(fx.object_id)),
+                Some((before.0, before.1, 0)),
+                "{route}: every reference the transfer took is returned, and the object survives \
+                 while the source capability still names it"
+            );
+
+            fx.kernel.with(|s| {
+                let cnode = s.task_cnode(0).expect("cnode");
+                s.revoke_capability_in_cnode(cnode, fx.source_cap)
+                    .expect("revoke the source capability");
+            });
+            assert_eq!(
+                fx.kernel
+                    .with(|s| s.memory_object_refcounts_by_id(fx.object_id)),
+                None,
+                "{route}: with no capability and no mapping left, the object is reclaimed"
+            );
+        }
+    }
+
+    /// **A map failure on a later page rolls back every page already installed**, revokes the
+    /// minted capability, clears the return lane and returns every reference — on both routes.
+    ///
+    /// The region is placed on the last canonical user page of the hosted x86_64 address space,
+    /// so page 0 installs and page 1 is refused by the address-space owner itself.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_later_page_map_failure_rolls_back_the_installed_prefix() {
+        use crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP;
+        let last_user_page = (1usize << 47) - PAGE;
+        for split in [false, true] {
+            let route = if split { "split" } else { "broad" };
+            let fx = multipage_fixture(2, None, 2 * PAGE);
+            let before = fx
+                .kernel
+                .with(|s| s.memory_object_refcounts_by_id(fx.object_id))
+                .expect("object live");
+            let (err, f) = receive_multipage(&fx, SYSCALL_IPC_RECV_NR, split, last_user_page, 0);
+            assert!(
+                err.is_some(),
+                "{route}: the second page cannot be installed"
+            );
+            assert_eq!(
+                f.ret2() as u64,
+                SYSCALL_NO_TRANSFER_CAP,
+                "{route}: lane cleared"
+            );
+            assert!(
+                receiver_mapping(&fx.kernel, last_user_page).is_none(),
+                "{route}: the installed first page is rolled back"
+            );
+            assert_eq!(
+                live_envelopes(&fx.kernel),
+                0,
+                "{route}: envelope consumed once"
+            );
+            assert_eq!(
+                fx.kernel
+                    .with(|s| s.memory_object_refcounts_by_id(fx.object_id)),
+                Some((before.0, before.1, 0)),
+                "{route}: the minted capability, the map reference and the envelope's pin are \
+                 all returned"
+            );
+        }
+    }
+
+    /// **The page owner's boundaries**: every page inside the window resolves to its own frame,
+    /// the first page past the window, an unaligned offset, a window reaching past its object,
+    /// a stale object and a non-memory capability are all refused rather than computed.
+    #[test]
+    fn the_shared_region_page_owner_refuses_everything_outside_the_window() {
+        use crate::kernel::boot::{KernelError, KernelState};
+        use crate::kernel::vm::VmError;
+        let mut state = Bootstrap::init().expect("init");
+        let (id, _cap) = state
+            .alloc_anonymous_memory_object_with_len(4 * PAGE)
+            .expect("object");
+        let base = state
+            .with_memory_state(|m| {
+                m.memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|e| e.id == id)
+                    .map(|e| e.phys)
+            })
+            .expect("phys");
+        let at = |object: CapObject, off: usize| {
+            state.with_memory_state(|m| KernelState::shared_region_page_phys_locked(m, object, off))
+        };
+        let whole = CapObject::MemoryObject { id };
+        for i in 0..4 {
+            assert_eq!(
+                at(whole, i * PAGE),
+                Ok(PhysAddr(base.0 + (i * PAGE) as u64))
+            );
+        }
+        assert_eq!(
+            at(whole, 4 * PAGE),
+            Err(KernelError::WrongObject),
+            "past the object"
+        );
+        assert_eq!(
+            at(whole, PAGE + 8),
+            Err(KernelError::Vm(VmError::Misaligned)),
+            "an unaligned page offset"
+        );
+        let window = CapObject::DmaRegion {
+            id,
+            offset: PAGE as u64,
+            len: 2 * PAGE as u64,
+        };
+        assert_eq!(
+            at(window, 0),
+            Ok(PhysAddr(base.0 + PAGE as u64)),
+            "window page 0"
+        );
+        assert_eq!(
+            at(window, PAGE),
+            Ok(PhysAddr(base.0 + 2 * PAGE as u64)),
+            "window page 1"
+        );
+        assert_eq!(
+            at(window, 2 * PAGE),
+            Err(KernelError::WrongObject),
+            "past the window"
+        );
+        let overhang = CapObject::DmaRegion {
+            id,
+            offset: 3 * PAGE as u64,
+            len: 2 * PAGE as u64,
+        };
+        assert_eq!(
+            at(overhang, 0),
+            Err(KernelError::WrongObject),
+            "window outside its object"
+        );
+        assert_eq!(
+            at(CapObject::MemoryObject { id: id + 1000 }, 0),
+            Err(KernelError::MemoryObjectMissing),
+            "a stale object"
+        );
+        assert_eq!(
+            at(
+                CapObject::Notification {
+                    index: 0,
+                    generation: 0
+                },
+                0
+            ),
+            Err(KernelError::WrongObject),
+            "not a memory capability"
+        );
+    }
+
+    /// The two queued mapping loops resolve each page through the offset-aware owner, and
+    /// neither reaches the single-page resolver that returns an object's base frame.
+    #[test]
+    fn both_queued_mapping_loops_resolve_each_page_through_the_offset_aware_owner() {
         const IPC: &str = include_str!("../syscall/ipc.rs");
-        let body = IPC
+        let broad = IPC
             .split("fn map_shared_region_into_receiver(")
             .nth(1)
             .and_then(|s| s.split("\nfn ").next())
             .expect("the broad mapping loop");
-        assert!(
-            body.contains("kernel.map_user_page_in_asid_with_caps(")
-                && body.contains("receiver_mem_cap"),
-            "the loop maps through the capability, once per page"
-        );
-        // The capability is passed unchanged on every iteration — no offset, no page index.
-        assert!(
-            !body.contains("receiver_mem_cap + ") && !body.contains("phys.0 +"),
-            "no per-page physical advance exists in the broad loop"
-        );
-        // And the resolver it reaches really is address-blind.
-        const MEM: &str = include_str!("memory_state.rs");
-        let resolve = MEM
-            .split("pub(crate) fn resolve_memory_object_phys(")
-            .nth(1)
-            .and_then(|s| s.split("\n    pub").next())
-            .expect("the resolver");
-        assert!(
-            resolve.contains("mem_cap: CapId") && !resolve.contains("virt"),
-            "the resolver takes no virtual address, so it cannot vary per page"
-        );
-        assert!(
-            resolve.contains(".map(|entry| entry.phys)"),
-            "it returns the object's BASE frame"
-        );
-
-        // The SPLIT route reproduces exactly that, and says so where it does it.
+        assert!(broad.contains(".resolve_shared_region_page_phys("));
+        assert!(!broad.contains("map_user_page_in_asid_with_caps"));
         const SR: &str = include_str!("../syscall/recv_shared_region_split.rs");
         let split = SR
             .split("fn map_shared_region_into_receiver_split(")
             .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
             .expect("the split mapping loop");
-        assert!(
-            split.contains("self.resolve_shared_region_phys_split("),
-            "the split loop resolves per page through its own twin of the same resolver"
-        );
+        assert!(split.contains("self.resolve_shared_region_phys_split("));
+        assert!(split.contains("va - requested_va"));
         let resolver = SR
             .split("fn resolve_shared_region_phys_split(")
             .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
             .expect("the split resolver");
-        assert!(
-            !resolver.contains("virt") && !resolver.contains("+ offset"),
-            "and that twin is address-blind too, exactly as the broad one is"
-        );
+        assert!(resolver.contains(".shared_region_page_phys_split("));
+        assert!(!resolver.contains("memory_object_phys_by_id_split"));
     }
 
     // ── population 2: sparse sender-waiter queues ────────────────────────────────────────────
