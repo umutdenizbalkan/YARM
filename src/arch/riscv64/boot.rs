@@ -1228,6 +1228,11 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // boot arm deferred (no SBI TIME, or not the boot hart).
             // QEMU-SMP3: per CPU — this CPU's own trap-stack top, latch and unmask request.
             crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
+            // QEMU-IRQ1 witness (BL4a): an idle ARRIVAL is the other quiet point the host driver
+            // can inject on — the one right after a deadline task re-blocks, mid-period
+            // (observation only; written only with nothing runnable).
+            #[cfg(feature = "riscv-uart-irq-witness")]
+            crate::arch::riscv64::uart_irq_witness::note_idle_quiet(shared, cpu);
             riscv_idle_halt(cpu, "kernel_idle_awaiting_io");
         }
         // Genuine internal trap-handling failure — NEVER idle, regardless of `current`.
@@ -1965,7 +1970,7 @@ fn riscv_s_mode_idle_landing(
             // idle acknowledgement (observation only).
             #[cfg(feature = "riscv-uart-irq-witness")]
             if matches!(trigger, SModeIdleTrigger::Timer { .. }) {
-                crate::arch::riscv64::uart_irq_witness::note_idle_quiet(shared);
+                crate::arch::riscv64::uart_irq_witness::note_idle_quiet(shared, cpu);
             }
             // QEMU-SMP3 witness: back into the idle wait (observation only).
             #[cfg(feature = "riscv64-smp3-witness")]

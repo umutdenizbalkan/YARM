@@ -26132,9 +26132,11 @@ corrected at the witness, with no floor lowered:
   can land after it, while the advance dispatches the supervisor, and the byte lands on it. On base
   that tick stranded the supervisor, so the byte still found the hart idle. The other two ports'
   periods (50 ms, 0.8 s) leave the slack RISC-V lacks. The precondition the driver needs is "idle
-  and staying idle". The witness build now reports it on every still-idle timer return
-  (`IRQ1_UART_IDLE_QUIET now=T next_deadline=D`: the scheduler tick and the earliest pending IPC
-  deadline, one rank-2 task-table read, observation only). The driver injects only when no deadline
+  and staying idle". The witness build now reports it at both quiet points, an idle arrival and
+  an idle tick's still-idle return, whenever the run queue is empty (`IRQ1_UART_IDLE_QUIET now=T
+  next_deadline=D`: the scheduler tick and the earliest pending IPC deadline, observation only).
+  The arrival point matters because a deadline task that has just re-blocked leaves the widest
+  quiet window. The driver injects only when no deadline
   is due before `T+3`, so the hart stays in its wait for at least two full periods after the next
   tick. One period proved too short: in four boots, 15 of 16 idle-mode bytes arrived before the next
   tick, and one arrived 10–20 ms after injection. The cell therefore still assumes host

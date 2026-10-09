@@ -372,11 +372,24 @@ fn the_riscv_idle_acknowledgement_is_a_quiet_idle_tick() {
     assert!(!idle_re.contains("RISCV_TRAP_HALTED"), "{idle_re}");
     // The kernel side: written only on a still-idle TIMER return, from the witness module.
     let boot = code(RV_BOOT);
-    let at = boot
-        .find("uart_irq_witness::note_idle_quiet(shared)")
-        .expect("the observation call");
-    assert!(boot[at.saturating_sub(300)..at].contains("SModeIdleTrigger::Timer"));
+    // Two quiet points: the still-idle TIMER return and the idle arrival — nowhere else.
+    let call = "uart_irq_witness::note_idle_quiet(shared, cpu)";
+    assert_eq!(boot.matches(call).count(), 2);
+    for (at, _) in boot.match_indices(call) {
+        let before = &boot[at.saturating_sub(300)..at];
+        let after = &boot[at..(at + 200).min(boot.len())];
+        assert!(
+            before.contains("SModeIdleTrigger::Timer")
+                || after.contains("riscv_idle_halt(cpu, \"kernel_idle_awaiting_io\")"),
+            "the observation sits only at the two quiet points"
+        );
+    }
+    assert!(witness_has_empty_queue_check());
     let witness = include_str!("../src/arch/riscv64/uart_irq_witness.rs");
     assert!(witness.contains("\"IRQ1_UART_IDLE_QUIET now={} next_deadline={}\""));
+    fn witness_has_empty_queue_check() -> bool {
+        include_str!("../src/arch/riscv64/uart_irq_witness.rs")
+            .contains("if shared.runnable_count_on_cpu_split_read(cpu) != 0 {\n        return;")
+    }
     assert!(witness.contains("\"IRQ1_UART_IDLE_QUIET now={} next_deadline=none\""));
 }

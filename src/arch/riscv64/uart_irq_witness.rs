@@ -350,16 +350,20 @@ pub fn enable_source_after_plic_ready(
     None
 }
 
-/// BL4a — an idle tick settled back to the `wfi` with nothing runnable: report the scheduler tick
-/// it ran at and the earliest IPC deadline still pending (observation only; one rank-2 task-table
-/// read, after the settlement, nothing held across it).
+/// BL4a — the hart is entering, or returning to, its idle wait with nothing runnable: report the
+/// scheduler tick and the earliest IPC deadline still pending (observation only; a rank-1 and a
+/// rank-2 read, nothing held across either). Written from the two quiet points — an idle ARRIVAL
+/// and an idle tick's still-idle return — and only when the run queue is empty.
 ///
 /// The host driver injects an idle-mode byte on this line, and only when no deadline is due before
 /// tick `now + 3`. The idle tick dispatches the task whose deadline it expires, so "nothing
 /// runnable now" alone does not keep the hart idle: on a single CPU a deadline is the only other
 /// wake source, and with none due before `now + 3` the hart stays in its wait for at least two full
 /// periods after the next tick — the slack the host's injection needs to land on the `wfi`.
-pub fn note_idle_quiet(shared: &crate::runtime::SharedKernel) {
+pub fn note_idle_quiet(shared: &crate::runtime::SharedKernel, cpu: crate::kernel::scheduler::CpuId) {
+    if shared.runnable_count_on_cpu_split_read(cpu) != 0 {
+        return;
+    }
     let now = shared.scheduler_tick_now_split_read();
     let next = shared.with_task_tcbs_split_mut(|tcbs| {
         tcbs.iter()
