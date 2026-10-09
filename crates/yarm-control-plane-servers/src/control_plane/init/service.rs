@@ -706,6 +706,100 @@ fn nr9_nonblocking_probe(word: *const u32) {
     );
 }
 
+// ─── BL3a: oracle handshakes that cannot lose a wake ─────────────────────────────────
+//
+// Every parent/child oracle below used to hand off with a bare wake on one side and a bare wait on
+// the other, over a word nobody changed. A wake that ran before the wait — the child scheduled
+// first after `spawn_thread`, by a tick, a second CPU or a yield — woke nobody, and the waiter then
+// parked forever on a word still holding the value it read. A futex hand-off has to change the word
+// and THEN wake; the waiter has to look at the word and park only while it is unchanged. Since BL3b
+// the kernel parks only while the word still holds `expected`, so this cannot lose the wake.
+
+/// BL3a — publish a hand-off: store `ready` (Release), then wake the one waiter, if any.
+#[cfg(not(feature = "hosted-dev"))]
+fn oracle_handshake_publish(word: &core::sync::atomic::AtomicU32, ready: u32) {
+    word.store(ready, core::sync::atomic::Ordering::Release);
+    let _ = yarm_user_rt::syscall::futex_wake(word.as_ptr(), 1);
+}
+
+/// BL3a — wait for a hand-off published by `oracle_handshake_publish`. Parks only while the word
+/// still holds a value other than `ready`; returns how many times it parked (0 when the publish
+/// came first).
+#[cfg(not(feature = "hosted-dev"))]
+fn oracle_handshake_await(word: &core::sync::atomic::AtomicU32, ready: u32) -> u32 {
+    let mut parked = 0u32;
+    loop {
+        let v = word.load(core::sync::atomic::Ordering::Acquire);
+        if v == ready {
+            return parked;
+        }
+        parked += 1;
+        let _ = yarm_user_rt::syscall::futex_wait(word.as_ptr(), v, v);
+    }
+}
+
+/// BL3a — wake the one waiter on `word` once it has parked. A count of 0 means it has not reached
+/// its FutexWait yet (it was preempted between its hand-off and its wait), which is not a lost wake:
+/// yield it the CPU and ask again, up to `max` times. The first non-zero count is the answer, and
+/// the number of asks is reported with it so the oracle records how often the window was hit.
+#[cfg(not(feature = "hosted-dev"))]
+fn oracle_wake_once_parked(word: *const u32, max: u32) -> (u32, u32) {
+    let mut asks = 0u32;
+    loop {
+        asks += 1;
+        let woke = yarm_user_rt::syscall::futex_wake(word, 1).unwrap_or(0);
+        #[cfg(feature = "oracle-handshake-race")]
+        if asks == 1 {
+            oracle_race_mark_step();
+        }
+        if woke != 0 || asks >= max {
+            return (woke, asks);
+        }
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
+}
+
+/// BL3a — the bound on `oracle_wake_once_parked` for every oracle: generous against a scheduler
+/// that needs several turns, finite so a waiter that never parks fails the oracle instead of
+/// hanging it.
+#[cfg(not(feature = "hosted-dev"))]
+const ORACLE_WAKE_ASKS: u32 = 64;
+
+/// BL3a — the default-off race forcer (`--features oracle-handshake-race`), witness only.
+///
+/// Each side of a hand-off marks its step here (`oracle_race_mark_step`), and at its window each
+/// side yields until the other has reached the step that opens the race (`oracle_force_race_until`):
+/// the parent after `spawn_thread` until the child has handed off, the child after its hand-off until
+/// the parent has made its first wake. A bare yield is not enough — a timer tick can hand the CPU
+/// straight back before the other side has run a single instruction — so the forcer waits on the
+/// step itself, bounded so a side that never arrives cannot hang the forcer. Only one oracle runs per
+/// boot (slot 5 is one selector), so one counter serves them all. It changes no hand-off and no
+/// oracle verdict.
+#[cfg(all(not(feature = "hosted-dev"), feature = "oracle-handshake-race"))]
+static ORACLE_RACE_STEP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(not(feature = "hosted-dev"), feature = "oracle-handshake-race"))]
+fn oracle_race_mark_step() {
+    ORACLE_RACE_STEP.fetch_add(1, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), feature = "oracle-handshake-race"))]
+fn oracle_force_race_until(site: &str, step: u32) {
+    const TURNS: u32 = 256;
+    let mut turns = 0u32;
+    while ORACLE_RACE_STEP.load(core::sync::atomic::Ordering::Acquire) < step && turns < TURNS {
+        let _ = yarm_user_rt::syscall::yield_now();
+        turns += 1;
+    }
+    yarm_user_rt::user_log!(
+        "ORACLE_HANDSHAKE_RACE_FORCED site={} step={} reached={} turns={}",
+        site,
+        step,
+        (ORACLE_RACE_STEP.load(core::sync::atomic::Ordering::Acquire) >= step) as u32,
+        turns
+    );
+}
+
 // ─── Stage 195C: AArch64 FutexWake live oracle ────────────────────────────────────────
 // A controlled parent/child proof of the AArch64 split FutexWake (NR 10). The child thread
 // blocks through the LEGACY global-lock FutexWait; the parent (init) wakes it through the
@@ -736,6 +830,9 @@ static FUTEX_ORACLE_PARK: core::sync::atomic::AtomicU32 =
 ))]
 static FUTEX_ORACLE_HANDSHAKE: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0x00C0);
+/// BL3a — the value the child publishes into `FUTEX_ORACLE_HANDSHAKE` (and `X86_FW_HANDSHAKE`).
+#[cfg(not(feature = "hosted-dev"))]
+const FUTEX_ORACLE_HANDSHAKE_READY: u32 = 0x00C1;
 // Stage 195F: never-woken word for the NO-INCOMING idle oracle. The final runnable user task
 // blocks here; nothing ever wakes it, so the default-on post-lock drain takes the Idle outcome.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -767,9 +864,13 @@ extern "C" fn futex_oracle_child() -> ! {
     // Runnable + enqueues it (FutexWake does not context-switch); we keep the CPU and fall
     // straight into our own FutexWait below, so init is only dispatched once we are provably
     // Blocked(Futex) on the oracle word.
-    let handshake = FUTEX_ORACLE_HANDSHAKE.as_ptr();
     yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_CHILD_WAKE_PARENT");
-    let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+    oracle_handshake_publish(&FUTEX_ORACLE_HANDSHAKE, FUTEX_ORACLE_HANDSHAKE_READY);
+    #[cfg(feature = "oracle-handshake-race")]
+    {
+        oracle_race_mark_step();
+        oracle_force_race_until("child_between_handoff_and_wait", 2);
+    }
     let addr = FUTEX_ORACLE_WORD.as_ptr();
     let observed = FUTEX_ORACLE_WORD.load(Relaxed);
     yarm_user_rt::user_log!(
@@ -1057,19 +1158,26 @@ fn run_aarch64_futex_wake_oracle(init_tid: u64, futex_wait_mode: bool) {
         }
     };
     yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_CHILD_SPAWNED child_tid={}", child_tid);
+    #[cfg(feature = "oracle-handshake-race")]
+    oracle_force_race_until("parent_after_spawn", 1);
     // Authoritative coordination (NOT timing): block on the handshake futex to hand the CPU
     // to the freshly-spawned child. AArch64 fresh-dispatches the never-run child through this
     // block/dispatch path (the same one that first enters the control-plane servers into user
     // mode). The child wakes us, then blocks on the oracle word; when THIS FutexWait returns,
     // the child is provably Blocked(Futex) on the oracle word.
-    let handshake = FUTEX_ORACLE_HANDSHAKE.as_ptr();
     let hv = FUTEX_ORACLE_HANDSHAKE.load(core::sync::atomic::Ordering::Relaxed);
     yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_PARENT_HANDSHAKE_WAIT hv={}", hv);
-    let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
-    yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_PARENT_RESUMED");
-    // The child is now Blocked(Futex) on the oracle word. Wake exactly once through the SPLIT
-    // path — the kernel's returned wake COUNT must be 1 (waiter → Runnable, enqueued once).
-    let first_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0);
+    let parked = oracle_handshake_await(&FUTEX_ORACLE_HANDSHAKE, FUTEX_ORACLE_HANDSHAKE_READY);
+    yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_PARENT_RESUMED parked={}", parked);
+    // Wake the child once it is Blocked(Futex) on the oracle word, through the SPLIT path — the
+    // kernel's returned wake COUNT must be 1 (waiter → Runnable, enqueued once). BL3a: the hand-off
+    // above proves only that the child ran; a 0 means it has not parked yet, and is asked again.
+    let (first_wake, asks) = oracle_wake_once_parked(addr, ORACLE_WAKE_ASKS);
+    yarm_user_rt::user_log!(
+        "AARCH64_FUTEX_ORACLE_FIRST_WAKE woke={} asks={}",
+        first_wake,
+        asks
+    );
     // Second wake: the child is now Runnable (no longer Blocked) and does not re-block on the
     // oracle word, so no waiter remains → count must be 0.
     let second_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0xFFFF);
@@ -1149,9 +1257,13 @@ extern "C" fn x86_futex_wake_oracle_child() -> ! {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 extern "C" fn x86_futex_wake_oracle_child_body() -> ! {
     use core::sync::atomic::Ordering::Relaxed;
-    let handshake = X86_FW_HANDSHAKE.as_ptr();
     yarm_user_rt::user_log!("X86_FUTEX_ORACLE_CHILD_WAKE_PARENT");
-    let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+    oracle_handshake_publish(&X86_FW_HANDSHAKE, FUTEX_ORACLE_HANDSHAKE_READY);
+    #[cfg(feature = "oracle-handshake-race")]
+    {
+        oracle_race_mark_step();
+        oracle_force_race_until("child_between_handoff_and_wait", 2);
+    }
     let addr = X86_FW_WORD.as_ptr();
     let observed = X86_FW_WORD.load(Relaxed);
     yarm_user_rt::user_log!("X86_FUTEX_ORACLE_CHILD_WAIT_BEGIN observed={}", observed);
@@ -1198,15 +1310,22 @@ fn run_x86_futex_wake_oracle(init_tid: u64) {
     };
     X86_FW_CHILD_TID.store(child_tid, Relaxed);
     yarm_user_rt::user_log!("X86_FUTEX_ORACLE_CHILD_SPAWNED child_tid={}", child_tid);
+    #[cfg(feature = "oracle-handshake-race")]
+    oracle_force_race_until("parent_after_spawn", 1);
     // Authoritative handshake: hand the CPU to the freshly-spawned child; when this returns the
     // child has woken us and is provably Blocked(Futex) on the target word.
-    let handshake = X86_FW_HANDSHAKE.as_ptr();
     let hv = X86_FW_HANDSHAKE.load(Relaxed);
     yarm_user_rt::user_log!("X86_FUTEX_ORACLE_PARENT_HANDSHAKE_WAIT hv={}", hv);
-    let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
-    yarm_user_rt::user_log!("X86_FUTEX_ORACLE_PARENT_RESUMED");
-    // Wake B once through the SPLIT path — count must be 1 (waiter → Runnable, enqueued once).
-    let first_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0);
+    let parked = oracle_handshake_await(&X86_FW_HANDSHAKE, FUTEX_ORACLE_HANDSHAKE_READY);
+    yarm_user_rt::user_log!("X86_FUTEX_ORACLE_PARENT_RESUMED parked={}", parked);
+    // Wake B once it is Blocked(Futex) on the target, through the SPLIT path — count must be 1
+    // (waiter → Runnable, enqueued once). BL3a: a 0 means B has not parked yet, and is asked again.
+    let (first_wake, asks) = oracle_wake_once_parked(addr, ORACLE_WAKE_ASKS);
+    yarm_user_rt::user_log!(
+        "X86_FUTEX_ORACLE_FIRST_WAKE woke={} asks={}",
+        first_wake,
+        asks
+    );
     // Second wake: B is no longer Blocked on the target word → count must be 0.
     let second_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0xFFFF);
     yarm_user_rt::user_log!(
@@ -2554,6 +2673,8 @@ mod shared_region_oracle_core {
     // LIVENESS signal only (child reached its recv preamble) — NOT proof the child is blocked. The
     // authoritative blocked proof is the KERNEL's `SHARED_REGION_BLOCKED_RECV_ACK`.
     pub(super) static CHILD_STARTED: AtomicU32 = AtomicU32::new(0x00E0);
+    /// BL3a — the value the child publishes into `CHILD_STARTED`.
+    const CHILD_STARTED_READY: u32 = 0x00E2;
     pub(super) static PARK: AtomicU32 = AtomicU32::new(0x00E1);
     pub(super) static CHILD_TID: AtomicU64 = AtomicU64::new(0);
     // Cap the parent hands the child through the shared address space (both share init's CSpace).
@@ -2646,8 +2767,9 @@ mod shared_region_oracle_core {
         yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_CHILD_STARTED");
         // Liveness only: signal that B reached its recv preamble. This does NOT prove B is blocked —
         // the KERNEL's post-commit ack is the authoritative proof.
-        let started = CHILD_STARTED.as_ptr();
-        let _ = yarm_user_rt::syscall::futex_wake(started, 1);
+        super::oracle_handshake_publish(&CHILD_STARTED, CHILD_STARTED_READY);
+        #[cfg(feature = "oracle-handshake-race")]
+        super::oracle_race_mark_step();
         let endpoint_cap = ENDPOINT_CAP.load(Relaxed);
         // Read the sender's source cap straight from the startup slot (shared CSpace) — independent of
         // any parent-side store ordering — so the "receiver-local cap differs from sender cap" check
@@ -2761,10 +2883,13 @@ mod shared_region_oracle_core {
         // B's waiter is fully committed at the oracle VA) is what gates A's DIRECT delivery — a
         // too-early send finds no ack and declines the direct path (detectable), never a silent
         // immediate delivery.
-        let started = CHILD_STARTED.as_ptr();
-        let sv = CHILD_STARTED.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(started, sv, sv);
-        yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_PARENT_RESUMED");
+        #[cfg(feature = "oracle-handshake-race")]
+        super::oracle_force_race_until("parent_after_spawn", 1);
+        let parked = super::oracle_handshake_await(&CHILD_STARTED, CHILD_STARTED_READY);
+        yarm_user_rt::user_log!(
+            "SHARED_REGION_DIRECT_ORACLE_PARENT_RESUMED parked={}",
+            parked
+        );
         const MAX_SEND_ATTEMPTS: u32 = 64;
         let mut attempts: u32 = 0;
         let mut succeeded = false;
@@ -2953,6 +3078,8 @@ mod ipccall_direct_oracle_core {
 
     /// Parent↔server liveness handshake word (server wakes the parent, then recv-blocks).
     pub(super) static HANDSHAKE: AtomicU32 = AtomicU32::new(0x00D0);
+    /// BL3a — the value the server publishes into `HANDSHAKE`.
+    const HANDSHAKE_READY: u32 = 0x00D2;
     /// Terminal park word.
     pub(super) static PARK: AtomicU32 = AtomicU32::new(0x00D1);
     pub(super) static CHILD_TID: AtomicU64 = AtomicU64::new(0);
@@ -3015,8 +3142,9 @@ mod ipccall_direct_oracle_core {
         yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_SERVER_STARTED");
         // Handshake: wake the parent, then recv-block. On a single CPU the parent resumes only after
         // we are committed-blocked here (the wake enqueues the parent but does not preempt us).
-        let handshake = HANDSHAKE.as_ptr();
-        let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+        super::oracle_handshake_publish(&HANDSHAKE, HANDSHAKE_READY);
+        #[cfg(feature = "oracle-handshake-race")]
+        super::oracle_race_mark_step();
         let (request_ep, _rep) = oracle_caps();
         let mut out = ServerOutcome {
             request_ok: false,
@@ -3163,10 +3291,13 @@ mod ipccall_direct_oracle_core {
         };
         // Authoritative liveness handshake: block until the server wakes us. On a single CPU the
         // server then commits its blocked recv before we resume (its wake enqueues us, no preempt).
-        let handshake = HANDSHAKE.as_ptr();
-        let hv = HANDSHAKE.load(Relaxed);
-        let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
-        yarm_user_rt::user_log!("IPCCALL_DIRECT_ROUNDTRIP_ORACLE_PARENT_RESUMED");
+        #[cfg(feature = "oracle-handshake-race")]
+        super::oracle_force_race_until("parent_after_spawn", 1);
+        let parked = super::oracle_handshake_await(&HANDSHAKE, HANDSHAKE_READY);
+        yarm_user_rt::user_log!(
+            "IPCCALL_DIRECT_ROUNDTRIP_ORACLE_PARENT_RESUMED parked={}",
+            parked
+        );
         // NR6 IpcCall — bounded retry on WouldBlock (deterministically succeeds on attempt 1 because
         // the server is a committed waiter; the retry only fires if the ordering ever slipped).
         let request_msg = match yarm_user_rt::ipc::Message::with_header(
@@ -5281,9 +5412,13 @@ extern "C" fn riscv_futex_oracle_child() -> ! {
     // Wake the parent (init), blocked on the handshake futex. FutexWake does NOT context-switch,
     // so we keep the CPU and fall straight into our own FutexWait below; init is only dispatched
     // once we are provably Blocked(Futex) on the oracle word.
-    let handshake = FUTEX_ORACLE_HANDSHAKE.as_ptr();
     yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_CHILD_WAKE_PARENT");
-    let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+    oracle_handshake_publish(&FUTEX_ORACLE_HANDSHAKE, FUTEX_ORACLE_HANDSHAKE_READY);
+    #[cfg(feature = "oracle-handshake-race")]
+    {
+        oracle_race_mark_step();
+        oracle_force_race_until("child_between_handoff_and_wait", 2);
+    }
     let addr = FUTEX_ORACLE_WORD.as_ptr();
     let observed = FUTEX_ORACLE_WORD.load(Relaxed);
     yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_CHILD_WAIT_BEGIN observed={}", observed);
@@ -5322,19 +5457,25 @@ fn run_riscv_futex_wake_oracle(init_tid: u64) {
         }
     };
     yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_CHILD_SPAWNED child_tid={}", child_tid);
+    #[cfg(feature = "oracle-handshake-race")]
+    oracle_force_race_until("parent_after_spawn", 1);
     // Authoritative coordination (NOT timing): block on the handshake futex to hand the CPU to the
     // freshly-spawned child. RISC-V fresh-dispatches the never-run child through this block/dispatch
     // path (the same one that first enters the control-plane servers into user mode). The child
     // wakes us, then blocks on the oracle word; when THIS FutexWait returns, the child is provably
     // Blocked(Futex) on the oracle word.
-    let handshake = FUTEX_ORACLE_HANDSHAKE.as_ptr();
     let hv = FUTEX_ORACLE_HANDSHAKE.load(core::sync::atomic::Ordering::Relaxed);
     yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_PARENT_HANDSHAKE_WAIT hv={}", hv);
-    let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
-    yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_PARENT_RESUMED");
-    // The child is now Blocked(Futex) on the oracle word. Wake exactly once through the SPLIT path
-    // (NR 10) — the kernel's returned wake COUNT must be 1 (waiter → Runnable, enqueued once).
-    let first_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0);
+    let parked = oracle_handshake_await(&FUTEX_ORACLE_HANDSHAKE, FUTEX_ORACLE_HANDSHAKE_READY);
+    yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_PARENT_RESUMED parked={}", parked);
+    // Wake the child once it is Blocked(Futex) on the oracle word, through the SPLIT path (NR 10) —
+    // the kernel's returned wake COUNT must be 1. BL3a: a 0 means it has not parked yet.
+    let (first_wake, asks) = oracle_wake_once_parked(addr, ORACLE_WAKE_ASKS);
+    yarm_user_rt::user_log!(
+        "RISCV_FUTEX_ORACLE_FIRST_WAKE woke={} asks={}",
+        first_wake,
+        asks
+    );
     // Second wake: the child is now Runnable (no longer Blocked) and parks on an unrelated futex,
     // so no waiter remains on the oracle word → count must be 0.
     let second_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0xFFFF);
@@ -5476,10 +5617,16 @@ extern "C" fn riscv_futex_wait_oracle_child() -> ! {
     // Wake A through the already-retired split FutexWake (NR 10). A is Blocked(Futex) on the
     // oracle word, so the returned wake COUNT must be exactly 1. FutexWake does NOT context-switch,
     // so B keeps the CPU and falls into its own park below.
+    // BL3a: B may run before A has parked (A preempted between `spawn_thread` and its FutexWait);
+    // a 0 is then not a lost wake but an early one, so B yields A the CPU and asks again.
     let word = FUTEX_ORACLE_WORD.as_ptr();
-    let woke = yarm_user_rt::syscall::futex_wake(word, 1).unwrap_or(0);
+    let (woke, asks) = oracle_wake_once_parked(word, ORACLE_WAKE_ASKS);
     FUTEX_WAIT_ORACLE_WAKE_COUNT.store(woke, Relaxed);
-    yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_CHILD_WOKE_PARENT woke={}", woke);
+    yarm_user_rt::user_log!(
+        "RISCV_FUTEX_WAIT_CHILD_WOKE_PARENT woke={} asks={}",
+        woke,
+        asks
+    );
     // Park on an unrelated futex through the LEGACY global-lock path (the one-shot retirement was
     // consumed by A). Legacy FutexWait blocks B and dispatches the now-Runnable A.
     let park = FUTEX_ORACLE_PARK.as_ptr();
@@ -5520,6 +5667,8 @@ fn run_riscv_futex_wait_oracle(init_tid: u64) {
         "RISCV_FUTEX_WAIT_ORACLE_CHILD_SPAWNED child_tid={}",
         child_tid
     );
+    #[cfg(feature = "oracle-handshake-race")]
+    oracle_force_race_until("parent_after_spawn", 1);
     // A blocks on the oracle word. B is now runnable (the mandatory incoming-task-exists gate), so
     // this FutexWait is RETIRED: A → Blocked(Futex), the post-lock drain switches to B via a real
     // SATP/sfence/frame/sret. A resumes here ONLY after B wakes it (split FutexWake) and parks

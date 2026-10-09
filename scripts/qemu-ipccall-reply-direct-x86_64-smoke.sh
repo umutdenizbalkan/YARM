@@ -50,7 +50,10 @@ die()  { echo "[ipccall-reply-direct-smoke][fail] $*"; fail=1; }
 
 # ── 1. Base artifacts: servers + initramfs (no feature; the scaffold is arch-gated) ──
 note "building base x86_64 artifacts (servers + initramfs)"
-BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
+# BL3a: ORACLE_SERVER_FEATURE_ARGS lets a qualification run build the servers with a default-off
+# witness feature (e.g. `--no-default-features --features oracle-handshake-race`); unset, the
+# build is exactly what it was.
+BOOTSTRAP_FEATURE_ARGS="${ORACLE_SERVER_FEATURE_ARGS:---no-default-features}" \
   scripts/build-qemu-x86_64-artifacts.sh >"$LOGDIR/build.log" 2>&1 \
   || die "base artifact build failed (see $LOGDIR/build.log)"
 

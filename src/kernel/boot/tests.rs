@@ -64334,6 +64334,108 @@ mod stage191d_futex_wait_block_publish {
     /// map its pair of pages. Feature-off, the image carries none of the probe's literals. That
     /// headroom is deferred work this package does not touch, which is exactly why the gate has to
     /// hold. `ipc-send-final-fault-witness` exists for the same reason and is pinned the same way.
+    /// **BL3a — every oracle hand-off changes the word before it wakes, and waits on the word.**
+    ///
+    /// The oracles handed off with a bare wake on one side and a bare wait on an unchanged word on
+    /// the other, so a wake that ran first was lost and the waiter parked for good — reproduced live
+    /// on the unrepaired tree with the default-off race forcer. Pinned here from the source: no bare
+    /// hand-off wait or wake survives, each hand-off goes through the publish / await pair, every
+    /// "the child is parked" claim goes through the bounded wake-until-parked owner, and the forcer
+    /// is witness-only — every call to it carries the feature gate.
+    #[test]
+    fn bl3a_oracle_hand_offs_cannot_lose_a_wake() {
+        const SERVICE: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        for bare in [
+            "futex_wait(handshake, hv, hv)",
+            "futex_wait(started, sv, sv)",
+            "futex_wake(handshake, 1)",
+            "futex_wake(started, 1)",
+            "let first_wake = yarm_user_rt::syscall::futex_wake(addr, 1)",
+        ] {
+            assert!(
+                !SERVICE.contains(bare),
+                "a bare oracle hand-off survives: {bare}"
+            );
+        }
+        // The one remaining single-shot wake is the bounded owner's own ask.
+        let ask = "let woke = yarm_user_rt::syscall::futex_wake(word, 1)";
+        assert_eq!(SERVICE.matches(ask).count(), 1, "only the owner asks bare");
+        let owner = SERVICE
+            .find("fn oracle_wake_once_parked(")
+            .expect("the owner");
+        let at = SERVICE.find(ask).expect("its ask");
+        assert!(
+            at > owner && !SERVICE[owner..at].contains("\n}\n"),
+            "and it is inside `oracle_wake_once_parked`"
+        );
+        // Publish stores then wakes; await parks only while the word is unpublished.
+        let publish = SERVICE
+            .split("fn oracle_handshake_publish(")
+            .nth(1)
+            .and_then(|b| b.split("\n}\n").next())
+            .expect("the publish half");
+        let store = publish.find("word.store(ready").expect("store");
+        let wake = publish.find("futex_wake(word.as_ptr(), 1)").expect("wake");
+        assert!(store < wake, "the word changes BEFORE the wake");
+        let await_body = SERVICE
+            .split("fn oracle_handshake_await(")
+            .nth(1)
+            .and_then(|b| b.split("\n}\n").next())
+            .expect("the await half");
+        assert!(
+            await_body.contains("if v == ready {")
+                && await_body.contains("futex_wait(word.as_ptr(), v, v)"),
+            "the waiter parks only on the value it just saw unpublished"
+        );
+        // Five hand-offs (three FutexWake oracles, shared-region, direct-reply) on each side, and
+        // four wake-until-parked claims (three FutexWake parents, the RISC-V FutexWait child).
+        assert_eq!(SERVICE.matches("oracle_handshake_publish(&").count(), 5);
+        assert_eq!(SERVICE.matches("oracle_handshake_await(&").count(), 5);
+        assert_eq!(
+            SERVICE
+                .matches("oracle_wake_once_parked(addr, ORACLE_WAKE_ASKS)")
+                .count()
+                + SERVICE
+                    .matches("oracle_wake_once_parked(word, ORACLE_WAKE_ASKS)")
+                    .count(),
+            4
+        );
+        // The forcer is witness-only: defined behind the feature, and every call gated.
+        for (call, n) in [
+            ("oracle_force_race_until(\"", 9usize),
+            ("oracle_race_mark_step();", 6usize),
+        ] {
+            let mut gated = 0usize;
+            let mut total = 0usize;
+            for (i, _) in SERVICE.match_indices(call) {
+                if SERVICE[..i].ends_with("fn ") {
+                    continue;
+                }
+                total += 1;
+                let before = &SERVICE[..i];
+                let window = &before[before.len().saturating_sub(160)..];
+                if window.contains("#[cfg(feature = \"oracle-handshake-race\")]") {
+                    gated += 1;
+                }
+            }
+            assert_eq!(
+                (gated, total),
+                (n, n),
+                "every `{call}` call is feature-gated"
+            );
+        }
+        for manifest in [
+            include_str!("../../../Cargo.toml"),
+            include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml"),
+            include_str!("../../../crates/yarm-driver-servers/Cargo.toml"),
+            include_str!("../../../crates/yarm-fs-servers/Cargo.toml"),
+        ] {
+            assert!(manifest.contains("oracle-handshake-race = []"));
+        }
+    }
+
     #[test]
     fn u9fw_the_nonblocking_probe_is_gated_so_it_costs_no_other_profile() {
         const SERVICE: &str = include_str!(

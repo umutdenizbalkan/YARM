@@ -50,6 +50,10 @@ timer-contract-witness = ["yarm-user-rt/timer-contract-witness"]
 # carry none of its literals and are byte-identical to a build without it, so every other slot-5
 # profile keeps the headroom it had.
 futex-wait-nonblock-probe = []
+# BL3a: yields at each oracle hand-off window so the other side runs first — the deterministic form
+# of the preemption the hand-offs must survive. Default-off; accepted by every package the artifact
+# build passes `--features` to. Only yarm-control-plane-servers acts on it.
+oracle-handshake-race = []
 # U9-TIMER5 §3: gates the IDLE-BOUNDARY RETURN witness cell in init.
 #
 # Same reason as `ipc-send-final-fault-witness`, measured the same way: init's address space runs

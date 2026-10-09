@@ -25674,7 +25674,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | confirmed open — blocked on an ABI decision | see BL1 "Not changed"; every in-tree sender passes offset 0 |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | confirmed open (from source) | `EXC_ILLEGAL_INSTRUCTION` decodes to `Unknown`; the pre-lock bridge settles `Unknown` fatally; the per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad `handle_trap_entry`, unreachable since U9 closed. Not reproduced live; the BL2 route is the owner it should reach |
-| BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | to verify | |
+| BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed — qualification pending | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
 | BL3b — futex check-and-park contract | fixed and delivered (qualified `4c50a864`) | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed); revert control fails the park-window case |
 | BL3c — hosted ack-lease intermittent failure | to verify | |
 | BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | to verify | |
@@ -25911,3 +25911,57 @@ FutexWait oracles — with positive NR 9 traffic in every futex cell (`FUTEX_WAI
 census scanner (U9 unchanged); freestanding warnings identical to `f9096ff7` on every port (219 / 247
 / 229). Red: the AArch64 and RISC-V FutexWait idle-oracle cells, which fail identically on fresh
 true-base artifacts (2/2 each) — recorded as BL6a / BL6b, not caused by this change.
+
+### BL3a — oracle hand-offs that cannot lose a wake
+
+**Defect (verified on `7a8154d8`).** Five default-off oracles in `init/service.rs` handed off over a
+futex word that nobody changed: the AArch64, x86_64 and RISC-V FutexWake oracles (child wakes the
+parent's handshake, then blocks on the target), the direct IpcCall/IpcReply round-trip oracle
+(server wakes the client's handshake, then receives) and the shared-region direct oracle (child
+wakes `CHILD_STARTED`, then receives). Each waiter read the word and called
+`FutexWait(word, v, v)`. If the waker ran first — the child is scheduled right after
+`spawn_thread`, by a tick, a second CPU or a yield — its wake found no waiter, and the waiter then
+parked on a word still holding `v`: forever, with or without BL3b, because nothing had changed. Two
+claims were also only true on an uninterrupted single CPU: the FutexWake parents' first wake must
+return 1 ("the child is provably `Blocked(Futex)`"), and the RISC-V FutexWait oracle's child wake
+must return 1 ("the parent is parked"). A preemption between the child's hand-off and its own wait,
+or between the parent's spawn and its wait, makes that wake return 0. The reply-timeout oracle had
+the same shape and was repaired in QEMU-SMP3 §6; it is not changed here.
+
+**Reproduction.** The default-off `oracle-handshake-race` feature (accepted by every package the
+artifact build passes `--features` to; only init acts on it) forces both windows on every boot. Each
+side marks its step, and at its window yields until the other side has reached the step that opens
+the race: the parent after `spawn_thread` until the child has handed off; the child after its
+hand-off until the parent has made its first wake. A bare yield was measured to be insufficient — on
+RISC-V a timer tick handed the CPU straight back before the child ran an instruction — so the forcer
+waits on the step itself, bounded at 256 turns. It changes no hand-off and no verdict. With only the
+forcer applied to `7a8154d8`, the x86_64 FutexWake oracle parks the parent for good
+(`…PARENT_HANDSHAKE_WAIT hv=192`, never resumed; the oracle's completion markers are missing).
+
+**Repair (userspace only; the kernel is unchanged).**
+
+* **Hand-off.** `oracle_handshake_publish` stores a ready value (Release) and then wakes;
+  `oracle_handshake_await` loads the word (Acquire), returns once it holds the ready value, and
+  otherwise parks on exactly the value it saw. A publish that came first is seen, not lost; one that
+  comes later changes the word before it wakes, so BL3b's park-time re-check catches it. All five
+  hand-offs use the pair, and report how often the waiter parked (`parked=`).
+* **"It is parked" claims.** `oracle_wake_once_parked` asks `FutexWake(word, 1)`, and on 0 — the other
+  side has not reached its wait yet, which is not a lost wake — yields it the CPU and asks again, up
+  to `ORACLE_WAKE_ASKS` (64) times. The first non-zero count remains the authoritative answer and is
+  reported with the number of asks. The three FutexWake parents and the RISC-V FutexWait child use
+  it; the verdicts (`first_wake=1 second_wake=0`, `wake_count=1`, `waiter_resumes=1`) are unchanged.
+* **Runner plumbing.** The six direct-oracle runners (`qemu-ipccall-reply-direct-<arch>-smoke.sh`,
+  `qemu-shared-region-direct-<arch>-smoke.sh`) build their servers with
+  `${ORACLE_SERVER_FEATURE_ARGS:---no-default-features}`, so a qualification run can pass the
+  forcer; unset, the build is unchanged.
+
+**Evidence.** Live, forced, on the candidate: both windows are hit and the oracle passes — on x86_64
+`parked=0` (the child published first) and `woke=1 asks=2` (the parent's first wake found the child
+not yet parked); likewise on AArch64 and RISC-V; and on the RISC-V FutexWait oracle the parent waits
+for the child's first wake (`reached=1`), which finds nobody (`woke=1 asks=2`). Hosted:
+`bl3a_oracle_hand_offs_cannot_lose_a_wake` pins from the source that no bare hand-off wait or wake
+survives, that publish stores before it wakes and await parks only on the unpublished value it saw,
+the five hand-offs and four wake-until-parked claims, and that every forcer call is feature-gated.
+
+**Not changed.** The reply-timeout oracle (already repaired; its comment still describes the
+pre-BL3b FutexWait), and the kernel.
