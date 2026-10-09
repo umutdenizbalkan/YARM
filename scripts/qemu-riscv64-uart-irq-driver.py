@@ -19,7 +19,8 @@ Synchronisation is by the guest's own acknowledgements, never by sleeping:
   and staying idle, then inject `0x40+N`, so the interrupt lands on the idle `wfi`. The
   acknowledgement is `IRQ1_UART_IDLE_QUIET now=T next_deadline=D`, written when an idle tick settled
   back to the `wfi` with nothing runnable, and accepted only when no deadline is due before tick
-  `T+2` (`D >= T+2`, or `none`). Since BL4a the idle tick dispatches the task whose deadline it
+  `T+3` (`D >= T+3`, or `none`): two full periods of quiet after the next tick. One period was
+  measured too short — one of 16 idle-mode bytes arrived 10-20 ms after injection. Since BL4a the idle tick dispatches the task whose deadline it
   expires, so neither the idle ENTRY line nor "nothing runnable now" keeps the hart idle: a byte
   injected then can land on that task when the very next tick is a deadline (one of the core
   supervisors waits in one- to three-tick receives) and the injection lands after it.
@@ -73,15 +74,15 @@ POST_BYTE = ord("Z")
 
 
 def idle_ack(idle_re, line: bytes) -> bool:
-    """Whether `line` is the port's idle acknowledgement. On RISC-V it must also leave a full
-    period of quiet: no deadline due before tick `now + 2`."""
+    """Whether `line` is the port's idle acknowledgement. On RISC-V it must also leave two full
+    periods of quiet: no deadline due before tick `now + 3`."""
     m = idle_re.search(line)
     if not m:
         return False
     if idle_re is not IDLE_RE:
         return True
     now, nxt = int(m.group(1)), m.group(2)
-    return nxt == b"none" or int(nxt) >= now + 2
+    return nxt == b"none" or int(nxt) >= now + 3
 
 
 def main() -> int:

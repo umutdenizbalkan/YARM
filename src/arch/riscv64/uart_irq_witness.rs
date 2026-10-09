@@ -355,10 +355,10 @@ pub fn enable_source_after_plic_ready(
 /// read, after the settlement, nothing held across it).
 ///
 /// The host driver injects an idle-mode byte on this line, and only when no deadline is due before
-/// tick `now + 2`. The idle tick dispatches the task whose deadline it expires, so "nothing
+/// tick `now + 3`. The idle tick dispatches the task whose deadline it expires, so "nothing
 /// runnable now" alone does not keep the hart idle: on a single CPU a deadline is the only other
-/// wake source, and with none due at the next tick the hart stays in its wait for at least a full
-/// period after it — the slack the byte needs to land on the `wfi`.
+/// wake source, and with none due before `now + 3` the hart stays in its wait for at least two full
+/// periods after the next tick — the slack the host's injection needs to land on the `wfi`.
 pub fn note_idle_quiet(shared: &crate::runtime::SharedKernel) {
     let now = shared.scheduler_tick_now_split_read();
     let next = shared.with_task_tcbs_split_mut(|tcbs| {

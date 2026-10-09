@@ -355,7 +355,7 @@ fn the_driver_uses_a_dedicated_backend_and_acknowledgements() {
 }
 
 /// BL4a: the RISC-V idle acknowledgement is an idle tick that settled back to the `wfi` with
-/// nothing runnable AND no deadline due before tick `now + 2` — never the idle ENTRY line, and
+/// nothing runnable AND no deadline due before tick `now + 3` — never the idle ENTRY line, and
 /// never "nothing runnable" alone: the idle tick's own queue advance dispatches the task whose
 /// deadline it expires, so a byte that lands after a deadline tick lands on that task.
 #[test]
@@ -363,7 +363,7 @@ fn the_riscv_idle_acknowledgement_is_a_quiet_idle_tick() {
     assert!(DRIVER.contains(
         "IDLE_RE = re.compile(rb\"IRQ1_UART_IDLE_QUIET now=(\\d+) next_deadline=(\\d+|none)(?!\\S)\")"
     ));
-    assert!(DRIVER.contains("return nxt == b\"none\" or int(nxt) >= now + 2"));
+    assert!(DRIVER.contains("return nxt == b\"none\" or int(nxt) >= now + 3"));
     assert!(DRIVER.contains("idle_ack(idle_re, line)"));
     let idle_re = DRIVER
         .lines()

@@ -26135,6 +26135,9 @@ corrected at the witness, with no floor lowered:
   and staying idle". The witness build now reports it on every still-idle timer return
   (`IRQ1_UART_IDLE_QUIET now=T next_deadline=D`: the scheduler tick and the earliest pending IPC
   deadline, one rank-2 task-table read, observation only). The driver injects only when no deadline
-  is due before `T+2`, so the hart stays in its wait for at least a full period after the next
-  tick. Pinned by `the_riscv_idle_acknowledgement_is_a_quiet_idle_tick` and the feature-gate
-  guard.
+  is due before `T+3`, so the hart stays in its wait for at least two full periods after the next
+  tick. One period proved too short: in four boots, 15 of 16 idle-mode bytes arrived before the next
+  tick, and one arrived 10–20 ms after injection. The cell therefore still assumes host
+  injection latency stays under about two RISC-V periods (20 ms). That residual is bounded, not
+  removed; removing it would need the kernel to hold the source until a quiet idle boundary.
+  Pinned by `the_riscv_idle_acknowledgement_is_a_quiet_idle_tick` and the feature-gate guard.
