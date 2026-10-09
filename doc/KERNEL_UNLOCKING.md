@@ -25676,7 +25676,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | confirmed open (from source) | `EXC_ILLEGAL_INSTRUCTION` decodes to `Unknown`; the pre-lock bridge settles `Unknown` fatally; the per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad `handle_trap_entry`, unreachable since U9 closed. Not reproduced live; the BL2 route is the owner it should reach |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
 | BL3b — futex check-and-park contract | fixed and delivered (qualified `4c50a864`) | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed); revert control fails the park-window case |
-| BL3c — hosted ack-lease intermittent failure | fixed — qualification pending | classified PRODUCTION: a stale `release` / entitled `consume` decided on the endpoint generation, then the state, then exchanged the state alone, so a slot recycled for the same index's next incarnation in between was retired or consumed; forced deterministically with `race_hook`, three regressions fail on the unrepaired store |
+| BL3c — hosted ack-lease intermittent failure | fixed and delivered (qualified `031f6b32` + `69d2746f`) | classified PRODUCTION: a stale `release` / entitled `consume` decided on the endpoint generation, then the state, then exchanged the state alone, so a slot recycled for the same index's next incarnation in between was retired or consumed; forced deterministically with `race_hook`, three regressions fail on the unrepaired store |
 | BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | to verify | |
 | BL4b — scheduler quantum / hardware deadline coupling | to verify | |
 | BL5a — reply-timeout retirement checker count/scope failures | to verify | |
@@ -26037,3 +26037,25 @@ were re-derived, none weakened: commit's publication is now the owner's AcqRel e
 `Reserved` word, still the last slot write after every Relaxed field store; the three readers gate
 through `slot.state()`, whose single load of the word is pinned `Acquire`; reserve, consume and
 restore are pinned as AcqRel/Acquire exchanges, the last two of exactly the observed word.
+
+**Qualification** (frozen `031f6b32`, tree `873f14ca`; fresh isolated worktrees and artifacts; base
+`c22db449`). Passed: the BL3c regressions with the store's own, race, and memory-ordering tests (54);
+the true base with ONLY the hook added at the equivalent points fails all three regressions — the
+stale release retires the next incarnation (`Released(2)`), the stale consumer takes its
+acknowledgement, and the finished release erases its waiter; live traffic through the store — the
+direct IpcCall/IpcReply and shared-region direct runners and the XFER2 ordinary-routes witness on
+three ports (all seals `result=ok`), and the x86_64 SMP direct-reply runner, whose seal is its
+designed `result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired` (a clean `-smp 2` boot plus the
+BSP round trip; the cross-CPU oracle is not wired, independent of this change); strict cores on three
+ports; the full hosted suite (5999), the ABI crate, `cargo fmt --check`, and freestanding warnings
+identical to `f948cc35` (219 / 247 / 229). Supplementary, not proof: the original two-thread sample
+(300 invocations × 200 runs) failed 0 times on the candidate and 151 times on the hook-only base.
+
+Two gates failed and were candidate-caused: the census scanner and three integration tests read the
+test-only hook's `LocalKey::with(|h| …)` as two broad `.with(|…|)` acquisitions. The hook now uses
+`LocalKey::with_borrow_mut` — the exact API for a `RefCell` thread-local — re-frozen as `69d2746f`,
+tree `581a6482`, which differs from `031f6b32` only inside `#[cfg(test)] mod race_hook`, so no kernel
+image changes and the live results stand. On `69d2746f`, from a fresh worktree: `cargo fmt --check`,
+the full hosted suite (5999), the integration suite (30 suites, 291 passed), the census scanner (U9
+unchanged: `with_cpu=0`, `with_broad=0`) and freestanding warnings (identical) pass, and the
+hook-only base still fails all three regressions with the updated hook.
