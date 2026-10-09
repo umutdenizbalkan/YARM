@@ -45,9 +45,26 @@ pub(crate) fn futex_word_range_check(addr: usize) -> Result<(), crate::kernel::b
 /// the comparison from the CALLER — `expected` and `observed` are both arguments — so the kernel
 /// validates that the futex word is readable and then compares the two values it was given. It
 /// reads no word to make this decision, and there is no bitset, timeout, requeue or PI here.
+/// BL3b — the futex word's value, from the 4 bytes the kernel itself read out of the caller's
+/// address space. Native byte order, because the word is the caller's own `u32` in memory.
+pub(crate) fn futex_word_value(bytes: &[u8]) -> u32 {
+    u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// BL3b — THE check of check-and-park: does the caller's `expected` still describe the word?
+///
+/// `observed` is the value the caller read; an `expected` that differs from it means the
+/// caller already knows the word moved, and the wait returns at once, exactly as it always has.
+/// But a caller's read is not the word: it can be stale by the time the kernel parks, which is
+/// the lost-wake window. So the decision also requires `expected` to equal the value the
+/// KERNEL read, and the park transaction repeats that read after the waiter is registered.
+pub(crate) fn futex_should_park(expected: u32, observed: u32, word: u32) -> bool {
+    expected == observed && word == expected
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FutexWaitDecision {
-    /// `expected == observed`: the caller's view still holds, so it parks.
+    /// `expected` matches both the caller's `observed` and the word the kernel read: park.
     Park,
     /// The futex word already moved out from under the caller. Nothing is published and the
     /// syscall answers `0` — the canonical `set_ok(usize::from(false), 0, 0)`.
@@ -80,6 +97,14 @@ pub(crate) enum FutexParkOutcome {
         entering: crate::kernel::recv_waiter_split::RecvEnteringIncarnation,
         recovered: crate::kernel::recv_waiter_split::RecvUnwindOutcome,
     },
+    /// BL3b — the word no longer equals `expected` when re-read AFTER the waiter was registered.
+    /// A waker that stored the new value before scanning for waiters missed this registration,
+    /// so parking would lose its wake. The registration is undone exactly, the caller is still
+    /// this CPU's current, and the wait returns without blocking.
+    ValueChanged,
+    /// BL3b — the word could not be re-read after registration (its page went away). The
+    /// registration is undone exactly and the read's error is the answer.
+    WordUnreadable(crate::kernel::boot::KernelError),
     /// The rank-1 compare-and-clear found a DIFFERENT task current. The rank-2 registration is
     /// undone exactly, so nothing is left published.
     VictimChanged,

@@ -193,6 +193,7 @@ reserved holes from implemented privileged paths.
 
 - `FutexWait`/`FutexWake` validate the futex address as a userspace `u32` word (4 bytes) before acting.
 - Kernel/high-half, non-user, and unmapped addresses are rejected with user-memory fault/error mapping rather than being treated as trusted kernel pointers.
+- `FutexWait(addr, expected, observed)` returns `0` without blocking when `expected != observed`, and otherwise blocks only while the word at `addr` still holds `expected`: the kernel reads the word itself, and checks it again after the waiter is registered, so a `FutexWake` issued after a store to the word can never be lost. A word that no longer holds `expected` returns `0` (not blocked); `1` means the caller blocked and was woken.
 
 ## Fork contract (current behavior)
 

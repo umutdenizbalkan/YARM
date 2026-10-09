@@ -28,6 +28,9 @@ const W: u64 = 7101;
 /// Another task, queued on CPU 0 ahead of it.
 const Q: u64 = 7102;
 const FUTEX_ADDR: usize = 0x4_2000;
+/// The value W's futex word holds when it parks (BL3b: the park transaction re-reads the word
+/// after registering the waiter, so W needs a readable word holding exactly its `expected`).
+const FUTEX_VALUE: u32 = 0x0BAD_F00D;
 /// A send result a resumed sender can only have received from its parked completion.
 const SEND_RESULT: u64 = 7;
 const CPU0: CpuId = CpuId(0);
@@ -57,8 +60,18 @@ fn fixture() -> Fixture {
         s.bring_up_cpu(CPU1).expect("cpu 1");
         s.register_task(W).expect("w");
         s.register_task(Q).expect("q");
-        let (a, _) = s.create_user_address_space().expect("w asid");
+        let (a, w_aspace) = s.create_user_address_space().expect("w asid");
         s.bind_task_asid(W, a).expect("bind w");
+        let (_mem, w_mem) = s.alloc_anonymous_memory_object().expect("w futex page");
+        s.map_user_page_with_caps(
+            w_aspace,
+            w_mem,
+            VirtAddr(FUTEX_ADDR as u64),
+            crate::kernel::vm::PageFlags::USER_RW,
+        )
+        .expect("map w futex page");
+        s.write_user_memory(W, FUTEX_ADDR, &FUTEX_VALUE.to_ne_bytes())
+            .expect("w futex word");
         let (b, _) = s.create_user_address_space().expect("q asid");
         s.bind_task_asid(Q, b).expect("bind q");
         for t in [W, Q] {
@@ -129,7 +142,7 @@ fn queued(k: &SharedKernel, cpu: CpuId) -> alloc::vec::Vec<u64> {
 /// compare-and-cleared) and the class's drain cell is armed with W as the outgoing task.
 fn futex_wait_commit(fx: &Fixture) {
     let parked =
-        fx.k.futex_wait_park_exact_split(CPU0, W, fx.w_asid, FUTEX_ADDR);
+        fx.k.futex_wait_park_exact_split(CPU0, W, fx.w_asid, FUTEX_ADDR, FUTEX_VALUE);
     assert!(
         matches!(
             parked,

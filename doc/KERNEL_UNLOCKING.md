@@ -25675,7 +25675,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | confirmed open (from source) | `EXC_ILLEGAL_INSTRUCTION` decodes to `Unknown`; the pre-lock bridge settles `Unknown` fatally; the per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad `handle_trap_entry`, unreachable since U9 closed. Not reproduced live; the BL2 route is the owner it should reach |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | to verify | |
-| BL3b — futex check-and-park contract | to verify | |
+| BL3b — futex check-and-park contract | fixed — qualification pending | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed) |
 | BL3c — hosted ack-lease intermittent failure | to verify | |
 | BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | to verify | |
 | BL4b — scheduler quantum / hardware deadline coupling | to verify | |
@@ -25828,3 +25828,69 @@ every port (219 / 247 / 229).
 **Not changed.** RISC-V (BL2-a above) and the other x86 exception classes (`#UD`, `#DE`, …), which
 still decode as `Unknown`; widening them is outside this item.
 
+### BL3b — futex check-and-park contract
+
+**Documented ABI.** `FutexWait(addr = arg0, expected = arg1, observed = arg2)` (`SYSCALL_ABI.md`).
+The only callers in tree read the word themselves and pass that value as `observed`, with
+`expected` either the same value (a real wait) or a different one (`init`'s word probe, which must
+never block). Nothing in the ABI says the kernel may park on a word that no longer holds `expected`,
+and that is the only property a futex exists to give: a waker that stores and then wakes cannot
+lose its wake.
+
+**Defect (verified on `c44e9b46`).** Both owners decided on the caller's two copies. The broad
+`futex_wait_current` validated the word's readability and then returned `Ok(false)` only when
+`expected != observed`; the split `futex_wait_decide_split_read` read the word and discarded its
+value, answering `Park` whenever `expected == observed`. A guard
+(`futex_wait_value_check_seam_mirrors_legacy`) pinned exactly that comparison. The race is the
+canonical one: the waiter reads 9 and decides to wait; the waker stores 10 and calls `FutexWake`,
+which finds no `Blocked(Futex(addr))` and wakes nobody; the waiter's `FutexWait(addr, 9, 9)`
+arrives and parks on a word that already holds 10. Nothing is left to wake it. Reproduced in
+hosted, through the production owners (`futex_wake_on_exit` as the waker), on the unrepaired tree:
+`left: Ok(Park) right: Ok(Proceed)`.
+
+**The window is two windows.** Comparing the word at the decision closes the first (wake before the
+syscall). A second remains inside the park transaction: the decision read precedes the rank-2
+registration, so a waker that stores and scans between them also finds nobody. It is closed in the
+owner that registers.
+
+**Repair.**
+
+* **One predicate.** `sched::futex_should_park(expected, observed, word)` —
+  `expected == observed && word == expected` — called by both the broad `futex_wait_current` and
+  the split decision, over the word each reads (`validate_current_user_futex_word` now returns it).
+  The caller's own fast path is kept inside it: `expected != observed` still returns at once,
+  whatever the word holds, so `init`'s probe is unchanged.
+* **Check after publication.** `futex_wait_park_exact_split` takes `expected` and re-reads the word
+  immediately after the rank-2 registration. `futex_wake_inner` scans for waiters under rank 2 and a
+  waker stores before it scans, so either its scan follows the registration and finds the waiter,
+  or its store precedes the re-read and the re-read sees the new value. On a changed word the
+  registration is undone — from exactly the `Blocked(Futex(addr))` this transaction wrote, through
+  the one undo closure the clear-refusal path already used, so the status-writer census is
+  unchanged — and the transaction answers `ValueChanged` (or `WordUnreadable(err)` if the page went
+  away). If a waker already moved the TCB the undo declines and the existing read-back and placement
+  recovery settle it, as before.
+* **Route.** `try_split_futex_wait_recognized` passes the caller's `expected`, releases the per-CPU
+  deferral it reserved for both new outcomes, and answers `ValueChanged` with the not-blocked
+  result (`set_ok(0, 0, 0)`, `Complete(Ok)`) and `WordUnreadable` with the canonical error — the same
+  answers the decision gives for the same word one step earlier.
+* **Unchanged:** the ABI's registers and result encoding, `FutexWake`, the park transaction's
+  registration / compare-and-clear / read-back order and refusals, scheduler and deferral
+  ownership, and the census (`with_cpu=0`, `with_broad=0`). No witness polls or retries.
+
+**Evidence (hosted, through production owners).**
+`bl3b_a_wake_before_the_wait_is_never_lost` forces the first window (read, store-and-wake with no
+waiter, then both the split decision and the broad owner must decline; the caller is still
+`Running`) and fails on the unrepaired tree. `bl3b_a_wake_between_the_decision_and_the_park_is_never_lost`
+forces the second (decision `Park`, then store-and-wake with no waiter, then the park transaction
+must answer `ValueChanged` with the caller still current and `Running` and no registration left for
+a later wake to find; an unmapped word answers `WordUnreadable`) and pins the route's settlement of
+`ValueChanged`. Every existing park-transaction case now gives its task a readable word holding the
+`expected` it passes (`futex_caller` backs a second page; the `make_current` cases and the overtaken
+fixture map one through the production `map_user_page_with_caps`). Four guards were re-derived, each
+with its reason in place: the decision guard now pins the shared predicate and forbids the
+caller-copy comparison; the undo/read-back count stays 2 because the undo is shared; the two
+route-order guards match the five-argument park call; the reservation-release count is 5 (the two
+new non-parking outcomes beside the three existing ones).
+
+**Not changed.** The default-off oracles' own handshakes (BL3a) — a correct futex cannot rescue a
+handshake whose waiter waits on a word nobody changes.

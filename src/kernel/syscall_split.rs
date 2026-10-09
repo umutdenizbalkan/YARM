@@ -5520,7 +5520,7 @@ fn try_split_futex_wait_recognized(
     // its TCB cannot be reclaimed — so what the transaction authenticates against is the
     // incarnation this trap entered from and not whatever later answers to the number.
     let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
-    match shared.futex_wait_park_exact_split(cpu, tid, asid, addr) {
+    match shared.futex_wait_park_exact_split(cpu, tid, asid, addr, expected) {
         FutexParkOutcome::Parked { .. } => {
             crate::yarm_log!(
                 "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid={} cpu={}",
@@ -5565,6 +5565,30 @@ fn try_split_futex_wait_recognized(
         FutexParkOutcome::VictimChanged => {
             crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
             settle_futex_cannot_park(cpu, tid, "phase_a_victim_changed")
+        }
+        // BL3b — the word moved between the decision and the registration. Nothing is parked, the
+        // registration was undone exactly and the caller is still current: release the
+        // reservation and answer what a word that had already moved answers.
+        FutexParkOutcome::ValueChanged => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            frame.set_ok(0, 0, 0);
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=value_changed_at_park",
+                tid,
+                addr
+            );
+            D::Complete(Ok(()))
+        }
+        FutexParkOutcome::WordUnreadable(err) => {
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "FUTEX_WAIT_SPLIT_DONE tid={} addr={} result=value_check err={:?} cpu={}",
+                tid,
+                addr,
+                err,
+                cpu.0
+            );
+            D::Complete(Err(TrapHandleError::Syscall(SyscallError::from(err))))
         }
         FutexParkOutcome::IncarnationMoved => {
             crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);

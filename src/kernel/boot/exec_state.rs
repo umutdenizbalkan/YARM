@@ -996,8 +996,10 @@ impl KernelState {
         expected: u32,
         observed: u32,
     ) -> Result<bool, KernelError> {
-        self.validate_current_user_futex_word(addr)?;
-        if expected != observed {
+        // BL3b: compare against the word THIS owner read, not only the caller's copy of it.
+        // The broad acquisition is held from the read to the park, so no waker can interleave.
+        let word = self.validate_current_user_futex_word(addr)?;
+        if !crate::kernel::syscall::sched::futex_should_park(expected, observed, word) {
             return Ok(false);
         }
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
@@ -1221,7 +1223,8 @@ impl KernelState {
         Ok(wake_count as u32)
     }
 
-    fn validate_current_user_futex_word(&self, addr: usize) -> Result<(), KernelError> {
+    /// Validates the futex word and returns its current value (BL3b: the value is the check).
+    fn validate_current_user_futex_word(&self, addr: usize) -> Result<u32, KernelError> {
         // U9-FUTEX-WAIT-FINAL §2 — the BROAD acquisition adapter over the one range policy. The
         // two checks it used to spell out inline are `futex_word_range_check`, which the off-lock
         // reader also calls, so the split route can no longer answer a different error (or no
@@ -1229,8 +1232,9 @@ impl KernelState {
         crate::kernel::syscall::sched::futex_word_range_check(addr)?;
         let tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
-        let _ = self.copy_from_user(asid, VirtAddr(addr as u64), core::mem::size_of::<u32>())?;
-        Ok(())
+        let bytes =
+            self.copy_from_user(asid, VirtAddr(addr as u64), core::mem::size_of::<u32>())?;
+        Ok(crate::kernel::syscall::sched::futex_word_value(&bytes))
     }
 
     /// Stage 190B (CONTROLLED AP WORKLOAD): build a small, deterministic SEQUENCE of

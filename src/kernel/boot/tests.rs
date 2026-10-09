@@ -63352,12 +63352,28 @@ mod stage191d_futex_wait_block_publish {
                 && RUNTIME_SRC.contains("FutexWaitDecision::Proceed"),
             "the split adapter must answer typed canonical errors and a typed decision"
         );
-        // And the ABI is unchanged: the comparison is the CALLER'S two arguments, not a word the
-        // kernel reads to decide with.
+        // BL3b re-derivation. This pinned the decision as the caller's two arguments compared
+        // with each other, which is exactly the lost wake: a waker that stores and wakes between
+        // the caller's read and its `FutexWait` finds no waiter, and the kernel then parks the
+        // caller on a word that has already moved. The decision is now the ONE predicate both
+        // owners call — the word the kernel reads must still hold `expected` — and the caller's
+        // own fast path (`expected != observed` returns at once) is kept inside it.
         assert!(
-            RUNTIME_SRC.contains("Ok(if expected == observed {"),
-            "the decision must be the caller-provided expected/observed comparison"
+            SCHED_SRC.contains(
+                "pub(crate) fn futex_should_park(expected: u32, observed: u32, word: u32) -> bool {"
+            ) && SCHED_SRC.contains("expected == observed && word == expected"),
+            "the one park predicate compares the word the kernel read against `expected`"
         );
+        for (name, src) in [("runtime.rs", RUNTIME_SRC), ("exec_state.rs", EXEC_SRC)] {
+            assert!(
+                src.contains("futex_should_park(expected, observed, word)"),
+                "{name}: the decision must be the shared predicate over the word read"
+            );
+            assert!(
+                !src.contains("if expected == observed {"),
+                "{name}: the caller-copy comparison may not come back"
+            );
+        }
     }
 
     // Phase B block-publish seam uses ONLY the task (rank 2) + scheduler (rank 1) split-mut
@@ -63410,6 +63426,8 @@ mod stage191d_futex_wait_block_publish {
             ) && park.contains("tcb.status = blocked;"),
             "the park transaction's transition must match legacy futex_wait_current"
         );
+        // BL3b: the undo is now ONE closure shared by the clear refusal and the value re-check,
+        // so the count is unchanged — the undo and the read-back.
         assert_eq!(
             park.matches("status == blocked").count(),
             2,
@@ -63455,6 +63473,7 @@ mod stage191d_futex_wait_block_publish {
         let tid = 20001u64;
         let mut state = Bootstrap::init().expect("init");
         make_current(&mut state, tid, CpuId(0));
+        give_futex_word(&mut state, tid, addr, PARK_WORD);
         let shared = SharedKernel::new(state);
 
         // U9-FUTEX-WAIT-FINAL §3 — through the EXACT park transaction. It answers a typed
@@ -63462,7 +63481,7 @@ mod stage191d_futex_wait_block_publish {
         // a compare-and-clear rather than an unconditional one.
         let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
         assert_eq!(
-            shared.futex_wait_park_exact_split(CpuId(0), tid, asid, addr),
+            shared.futex_wait_park_exact_split(CpuId(0), tid, asid, addr, PARK_WORD),
             crate::kernel::syscall::sched::FutexParkOutcome::Parked {
                 priority: crate::kernel::scheduler::TaskPriority::Normal
             },
@@ -63513,11 +63532,12 @@ mod stage191d_futex_wait_block_publish {
         let mut state = Bootstrap::init().expect("init");
         state.bring_up_cpu(CpuId(1)).expect("cpu1");
         make_current(&mut state, tid, CpuId(0));
+        give_futex_word(&mut state, tid, addr, PARK_WORD);
         let shared = SharedKernel::new(state);
 
         let asid = crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16);
         assert!(matches!(
-            shared.futex_wait_park_exact_split(CpuId(0), tid, asid, addr),
+            shared.futex_wait_park_exact_split(CpuId(0), tid, asid, addr, PARK_WORD),
             crate::kernel::syscall::sched::FutexParkOutcome::Parked { .. }
         ));
         shared.with(|k| {
@@ -63561,6 +63581,53 @@ mod stage191d_futex_wait_block_publish {
     /// argument under test and never from an unmapped page.
     const FUTEX_WORD: usize = 0x4000;
 
+    /// BL3b — the page of the park-window words (0x5000..0x6000) and the value they hold when a
+    /// case parks. The park transaction re-reads the word after registering the waiter, so every
+    /// case that parks gives it a readable word holding exactly the `expected` it passes.
+    const PARK_PAGE: usize = 0x5000;
+    const PARK_WORD: u32 = 0x5A5A_0001;
+
+    fn futex_rw() -> PageFlags {
+        PageFlags {
+            read: true,
+            write: true,
+            execute: false,
+            user: true,
+            cache_policy: CachePolicy::WriteBack,
+        }
+    }
+
+    /// Store `value` in `tid`'s futex word at `addr`.
+    fn set_futex_word(kernel: &SharedKernel, tid: u64, addr: usize, value: u32) {
+        kernel
+            .with(|s| s.write_user_memory(tid, addr, &value.to_ne_bytes()))
+            .expect("store futex word");
+    }
+
+    /// BL3b — give a task that has no address space yet (the `make_current` cases) a real one,
+    /// with the page holding `addr` backed by an anonymous object and the word set to `value`.
+    fn give_futex_word(
+        state: &mut crate::kernel::boot::KernelState,
+        tid: u64,
+        addr: usize,
+        value: u32,
+    ) {
+        let (asid, aspace_cap) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(tid, asid).expect("bind");
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_with_caps(
+                aspace_cap,
+                mem_cap,
+                VirtAddr((addr & !0xFFF) as u64),
+                futex_rw(),
+            )
+            .expect("map futex page");
+        state
+            .write_user_memory(tid, addr, &value.to_ne_bytes())
+            .expect("store futex word");
+    }
+
     /// A user task bound to a real address space, current on `cpu`, with a readable futex word —
     /// the state a live NR 9 caller is in.
     ///
@@ -63573,20 +63640,13 @@ mod stage191d_futex_wait_block_publish {
                 .expect("reg");
             let (asid, aspace_cap) = s.create_user_address_space().expect("aspace");
             s.bind_task_asid(tid, asid).expect("bind");
-            let (_mem_id, mem_cap) = s.alloc_anonymous_memory_object().expect("mem");
-            s.map_user_page_with_caps(
-                aspace_cap,
-                mem_cap,
-                VirtAddr(FUTEX_WORD as u64),
-                PageFlags {
-                    read: true,
-                    write: true,
-                    execute: false,
-                    user: true,
-                    cache_policy: CachePolicy::WriteBack,
-                },
-            )
-            .expect("map futex page");
+            // BL3b: the park transaction re-reads the word, so the page the park-window cases use
+            // (`PARK_PAGE`) is backed the same production way as `FUTEX_WORD`'s.
+            for page in [FUTEX_WORD, PARK_PAGE] {
+                let (_mem_id, mem_cap) = s.alloc_anonymous_memory_object().expect("mem");
+                s.map_user_page_with_caps(aspace_cap, mem_cap, VirtAddr(page as u64), futex_rw())
+                    .expect("map futex page");
+            }
             s.enqueue_on_cpu(cpu, tid).expect("enqueue");
             s.set_current_cpu(cpu).expect("cpu");
             s.dispatch_next_task().expect("dispatch");
@@ -63662,33 +63722,143 @@ mod stage191d_futex_wait_block_publish {
         }
     }
 
-    /// **The ABI is the caller's comparison, and the decision is typed.**
+    /// **BL3b — the lost wake, forced, through the production owners.**
     ///
-    /// YARM's NR 9 takes `expected` and `observed` as arguments; the kernel compares those two and
-    /// reads the word only to prove it is readable. Equal parks, unequal proceeds — and no other
-    /// flag, timeout or bitset participates.
+    /// The canonical futex race: the waiter reads the word (9) and decides to wait; before its
+    /// `FutexWait` reaches the kernel, a waker stores 10 and calls `FutexWake`, which finds no
+    /// waiter and wakes nobody; then the waiter's `FutexWait(addr, expected=9, observed=9)`
+    /// arrives. Comparing the caller's two copies parks it forever — the wake was spent. The
+    /// kernel must compare `expected` against the word it reads and return without blocking.
+    /// Both owners are driven: the broad `futex_wait_current` and the split decision.
     #[test]
-    fn u9fw_the_decision_is_the_caller_provided_comparison() {
+    fn bl3b_a_wake_before_the_wait_is_never_lost() {
         use crate::kernel::syscall::sched::FutexWaitDecision;
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let tid = 30002u64;
         futex_caller(&kernel, tid, CpuId(0));
-        // A word the caller can read. Its CONTENTS are irrelevant to the decision.
         let addr = FUTEX_WORD;
+        // (1) The waiter's own read: 9.
+        let observed = kernel.with(|s| {
+            let b = s.read_user_memory(tid, addr, 4).expect("read word");
+            u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+        });
+        assert_eq!(observed, 9);
+        // (2) The waker: store, then wake — through the production owner. Nobody is waiting yet.
+        kernel
+            .with(|s| s.write_user_memory(tid, addr, &10u32.to_ne_bytes()))
+            .expect("waker store");
         assert_eq!(
-            kernel.futex_wait_decide_split_read(tid, addr, 9, 9),
-            Ok(FutexWaitDecision::Park),
-            "equal expected/observed parks"
+            kernel.with(|s| s.futex_wake_on_exit(addr)),
+            Ok(0),
+            "no waiter to wake yet"
         );
+        // (3) The waiter's FutexWait, with the value it read.
         assert_eq!(
-            kernel.futex_wait_decide_split_read(tid, addr, 9, 10),
+            kernel.futex_wait_decide_split_read(tid, addr, observed, observed),
             Ok(FutexWaitDecision::Proceed),
-            "unequal expected/observed proceeds"
+            "the split decision must see the word moved, not trust the caller's copy"
         );
-        // And the broad owner agrees, for the same two argument pairs.
         assert_eq!(
-            kernel.with(|s| s.futex_wait_current(addr, 9, 10)),
-            Ok(false)
+            kernel.with(|s| s.futex_wait_current(addr, observed, observed)),
+            Ok(false),
+            "the broad owner must not park on a word that no longer holds the expected value"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Running),
+            "nothing parked: the caller is still running, so no wake can be owed to it"
+        );
+        // And the caller's own fast path is unchanged: an `expected` that differs from what it
+        // observed still returns at once, whatever the word holds.
+        assert_eq!(
+            kernel.futex_wait_decide_split_read(tid, addr, 10, 9),
+            Ok(FutexWaitDecision::Proceed)
+        );
+        assert_eq!(
+            kernel.futex_wait_decide_split_read(tid, addr, 10, 10),
+            Ok(FutexWaitDecision::Park),
+            "a word that still holds `expected` parks"
+        );
+    }
+
+    /// **BL3b — the same race, one window later: between the decision and the registration.**
+    ///
+    /// The decision read 9 and said park. Before the park transaction registers the waiter, the
+    /// waker stores and scans — and finds nobody, because nobody is registered yet. A park that
+    /// trusted the earlier read would lose that wake exactly as the caller-copy comparison did.
+    /// The transaction re-reads the word AFTER the registration, refuses with `ValueChanged`,
+    /// and undoes the registration exactly: the caller is still current and still `Running`.
+    #[test]
+    fn bl3b_a_wake_between_the_decision_and_the_park_is_never_lost() {
+        use crate::kernel::syscall::sched::{FutexParkOutcome, FutexWaitDecision};
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        let tid = 30012u64;
+        let asid = futex_caller(&kernel, tid, cpu);
+        let addr = PARK_PAGE + 0x600;
+        set_futex_word(&kernel, tid, addr, PARK_WORD);
+
+        // (1) The decision, on a word that still holds `expected`.
+        assert_eq!(
+            kernel.futex_wait_decide_split_read(tid, addr, PARK_WORD, PARK_WORD),
+            Ok(FutexWaitDecision::Park)
+        );
+        // (2) The waker, in the window: store, then scan — nobody is registered yet.
+        set_futex_word(&kernel, tid, addr, PARK_WORD + 1);
+        assert_eq!(kernel.with(|s| s.futex_wake_on_exit(addr)), Ok(0));
+        // (3) The park transaction.
+        assert_eq!(
+            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr, PARK_WORD),
+            FutexParkOutcome::ValueChanged,
+            "the word moved before the waiter was visible: parking now loses the wake"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Running),
+            "the registration is undone exactly"
+        );
+        assert_eq!(
+            kernel.with(|s| s.current_tid_on_cpu(cpu)),
+            Some(tid),
+            "and the caller keeps its placement, answering through its own frame"
+        );
+        assert_eq!(
+            kernel.with(|s| s.futex_wake_on_exit(addr)),
+            Ok(0),
+            "no stale registration is left for a later wake to find"
+        );
+
+        // A word that has become unreadable by the re-read is refused the same exact way, with
+        // the canonical error the readability probe answers.
+        let unmapped = 0x7000usize;
+        let outcome = kernel.futex_wait_park_exact_split(cpu, tid, asid, unmapped, PARK_WORD);
+        assert!(
+            matches!(outcome, FutexParkOutcome::WordUnreadable(_)),
+            "an unreadable word never parks: {outcome:?}"
+        );
+        assert_eq!(
+            kernel.with(|s| s.task_status(tid)),
+            Some(TaskStatus::Running)
+        );
+        assert_eq!(kernel.with(|s| s.current_tid_on_cpu(cpu)), Some(tid));
+
+        // The route settles `ValueChanged` as the not-blocked answer it is: the deferral it
+        // reserved is released and the caller's own frame answers `set_ok(0, 0, 0)`.
+        let body = SPLIT_SRC
+            .split("fn try_split_futex_wait_recognized(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("the recognized NR 9 body");
+        let arm = body
+            .split("FutexParkOutcome::ValueChanged => {")
+            .nth(1)
+            .and_then(|s| s.split("\n        }\n").next())
+            .expect("the ValueChanged arm");
+        assert!(
+            arm.contains("futex_wait_dispatch_clear(cpu_idx)")
+                && arm.contains("frame.set_ok(0, 0, 0)")
+                && arm.contains("D::Complete(Ok(()))"),
+            "ValueChanged releases the reservation and answers not-blocked: {arm}"
         );
     }
 
@@ -63712,6 +63882,7 @@ mod stage191d_futex_wait_block_publish {
         let tid = 30003u64;
         let asid = futex_caller(&kernel, tid, cpu);
         let addr = 0x5100usize;
+        set_futex_word(&kernel, tid, addr, PARK_WORD);
 
         // Register, exactly as the park transaction's first step does.
         kernel.with(|s| {
@@ -63740,7 +63911,7 @@ mod stage191d_futex_wait_block_publish {
                 tcb.status = TaskStatus::Running;
             });
         });
-        let outcome = kernel.futex_wait_park_exact_split(cpu, tid, asid, addr);
+        let outcome = kernel.futex_wait_park_exact_split(cpu, tid, asid, addr, PARK_WORD);
         assert!(
             matches!(outcome, FutexParkOutcome::Parked { .. }),
             "with no waker in the window the transaction parks: {outcome:?}"
@@ -63776,12 +63947,14 @@ mod stage191d_futex_wait_block_publish {
         let tid = 30004u64;
         let asid = futex_caller(&kernel, tid, cpu);
         let addr = 0x5200usize;
+        set_futex_word(&kernel, tid, addr, PARK_WORD);
 
         let outcome = kernel.futex_wait_park_exact_split(
             cpu,
             tid,
             crate::kernel::vm::Asid(asid.0 + 13),
             addr,
+            PARK_WORD,
         );
         assert_eq!(
             outcome,
@@ -63812,6 +63985,7 @@ mod stage191d_futex_wait_block_publish {
         let other = 30006u64;
         let asid = futex_caller(&kernel, caller, cpu);
         let addr = 0x5300usize;
+        set_futex_word(&kernel, caller, addr, PARK_WORD);
         // Somebody else takes this CPU's current slot.
         kernel.with(|s| {
             s.register_task_with_class(other, TaskClass::App)
@@ -63822,7 +63996,7 @@ mod stage191d_futex_wait_block_publish {
             assert_eq!(s.current_tid_on_cpu(cpu), Some(other));
         });
 
-        let outcome = kernel.futex_wait_park_exact_split(cpu, caller, asid, addr);
+        let outcome = kernel.futex_wait_park_exact_split(cpu, caller, asid, addr, PARK_WORD);
         assert_eq!(outcome, FutexParkOutcome::VictimChanged);
         assert_eq!(
             kernel.with(|s| s.task_status(caller)),
@@ -63848,6 +64022,7 @@ mod stage191d_futex_wait_block_publish {
         let tid = 30007u64;
         let asid = futex_caller(&kernel, tid, cpu);
         let addr = 0x5400usize;
+        set_futex_word(&kernel, tid, addr, PARK_WORD);
 
         // The entering frame, carrying NR 9's own answer — `set_ok(usize::from(blocked), 0, 0)`,
         // written before the switch so the caller observes it when it is later resumed.
@@ -63868,7 +64043,7 @@ mod stage191d_futex_wait_block_publish {
         );
 
         assert!(matches!(
-            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr),
+            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr, PARK_WORD),
             FutexParkOutcome::Parked { .. }
         ));
         // The production wake owner finds it and makes it runnable + queued.
@@ -63960,7 +64135,8 @@ mod stage191d_futex_wait_block_publish {
             .find("settle_futex_cannot_park(cpu, tid, \"defer_unavailable\")")
             .expect("the defer-unavailable settlement");
         let park = body
-            .find("futex_wait_park_exact_split(cpu, tid, asid, addr)")
+            // BL3b: the park transaction re-checks the word against the caller's `expected`.
+            .find("futex_wait_park_exact_split(cpu, tid, asid, addr, expected)")
             .expect("the park transaction");
         assert!(
             already < unavailable && unavailable < park,
@@ -63990,6 +64166,7 @@ mod stage191d_futex_wait_block_publish {
         let tid = 30009u64;
         let asid = futex_caller(&kernel, tid, cpu);
         let addr = 0x5500usize;
+        set_futex_word(&kernel, tid, addr, PARK_WORD);
 
         // The trap-path window is open, exactly as `TrapPathWindow::establish` leaves it for a live
         // NR 9 — without it the admission's answer would be `NoTrapDrainer` and the case under test
@@ -64039,7 +64216,7 @@ mod stage191d_futex_wait_block_publish {
 
         // And the park still happens, on the caller's own decision.
         assert!(matches!(
-            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr),
+            kernel.futex_wait_park_exact_split(cpu, tid, asid, addr, PARK_WORD),
             FutexParkOutcome::Parked { .. }
         ));
         assert_eq!(
@@ -147313,10 +147490,13 @@ mod u9qa_split_dispatch_disposition {
             .find("futex_wait_dispatch_try_defer(cpu_idx, tid)")
             .expect("the reservation");
         let after = &recognized[reserve..];
+        // BL3b: five, not three — the value re-check adds `ValueChanged` and `WordUnreadable`
+        // beside `WokenDuringPublication`, `VictimChanged` and `IncarnationMoved`, and each is a
+        // non-parking outcome that must release what it reserved.
         assert_eq!(
             after.matches("futex_wait_dispatch_clear(cpu_idx)").count(),
-            3,
-            "the three non-parking park outcomes each release the reservation"
+            5,
+            "the five non-parking park outcomes each release the reservation"
         );
     }
 
@@ -147344,7 +147524,8 @@ mod u9qa_split_dispatch_disposition {
             .find("futex_wait_dispatch_try_defer(cpu_idx, tid)")
             .expect("the deferral reservation");
         let publish = route
-            .find("futex_wait_park_exact_split(cpu, tid, asid, addr)")
+            // BL3b: the park transaction re-checks the word against the caller's `expected`.
+            .find("futex_wait_park_exact_split(cpu, tid, asid, addr, expected)")
             .expect("the park transaction");
         assert!(
             admit < reserve && reserve < publish,

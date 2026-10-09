@@ -17241,16 +17241,20 @@ impl SharedKernel {
         // adapters differ only in acquisition. (The DebugLog-shaped `copy_from_user_asid_split_read`
         // is the wrong owner here: it answers `Option`, which is the erasure §2 is removing, and it
         // carries a 192-byte clamp that has nothing to do with a futex word.)
-        self.copy_from_user_split(
+        let bytes = self.copy_from_user_split(
             crate::kernel::vm::Asid(asid as u16),
             crate::kernel::vm::VirtAddr(addr as u64),
             core::mem::size_of::<u32>(),
         )?;
-        Ok(if expected == observed {
-            FutexWaitDecision::Park
-        } else {
-            FutexWaitDecision::Proceed
-        })
+        // BL3b: the word's VALUE takes part in the decision, not only its readability.
+        let word = crate::kernel::syscall::sched::futex_word_value(&bytes);
+        Ok(
+            if crate::kernel::syscall::sched::futex_should_park(expected, observed, word) {
+                FutexWaitDecision::Park
+            } else {
+                FutexWaitDecision::Proceed
+            },
+        )
     }
 
     /// U9-FUTEX-WAIT-FINAL §3 — THE exact `FutexWait` park transaction.
@@ -17307,6 +17311,7 @@ impl SharedKernel {
         tid: u64,
         asid: crate::kernel::vm::Asid,
         addr: usize,
+        expected: u32,
     ) -> crate::kernel::syscall::sched::FutexParkOutcome {
         use crate::kernel::syscall::sched::FutexParkOutcome as O;
         use crate::kernel::task::{TaskStatus, WaitReason};
@@ -17338,6 +17343,54 @@ impl SharedKernel {
             );
             return O::IncarnationMoved;
         }
+        // The ONE undo of that registration, shared by every refusal after it: back to `Running`
+        // from exactly the `Blocked(Futex(addr))` this transaction wrote, and from nothing else —
+        // a TCB a waker already moved is the waker's.
+        let undo_registration = || {
+            self.with_task_tcbs_split_mut(|tcbs| {
+                match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                    Some(tcb) if tcb.status == blocked => {
+                        tcb.status = TaskStatus::Running;
+                        true
+                    }
+                    _ => false,
+                }
+            })
+        };
+
+        // (1b) BL3b — RE-READ THE WORD, NOW THAT THE WAITER IS VISIBLE.
+        //
+        // The decision read happened before the registration, and a waker that stored a new value
+        // and scanned for waiters in between found none: its wake is spent. Reading again AFTER
+        // the rank-2 registration closes that window. `futex_wake_inner` scans for waiters under
+        // rank 2, and a waker stores the word before it scans; so either its scan follows this
+        // registration and it finds the waiter, or its store precedes this read and the value
+        // below is the new one. Parking on a changed word is exactly the lost wake.
+        let reread = self
+            .copy_from_user_split(asid, VirtAddr(addr as u64), core::mem::size_of::<u32>())
+            .map(|b| crate::kernel::syscall::sched::futex_word_value(&b));
+        if reread != Ok(expected) {
+            // Undo exactly — from `Blocked(Futex(addr))` only. If a waker already moved the TCB,
+            // it won; the steps below detect and settle that through the existing recovery.
+            if undo_registration() {
+                crate::yarm_log!(
+                    "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason={} expected={}",
+                    tid,
+                    asid.0,
+                    addr,
+                    if reread.is_err() {
+                        "word_unreadable"
+                    } else {
+                        "value_changed"
+                    },
+                    expected
+                );
+                return match reread {
+                    Err(err) => O::WordUnreadable(err),
+                    Ok(_) => O::ValueChanged,
+                };
+            }
+        }
 
         // (2) rank 1 — COMPARE-AND-CLEAR. `block_current_exact_on` mutates nothing unless the slot
         // names exactly this task, so a mismatch costs no other task its placement. The quantum
@@ -17354,15 +17407,7 @@ impl SharedKernel {
             // Undo the registration exactly: this transaction published a block it could not
             // complete, and leaving the TCB `Blocked` would strand a task the scheduler still
             // believes is elsewhere.
-            let restored = self.with_task_tcbs_split_mut(|tcbs| {
-                match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
-                    Some(tcb) if tcb.status == blocked => {
-                        tcb.status = TaskStatus::Running;
-                        true
-                    }
-                    _ => false,
-                }
-            });
+            let restored = undo_registration();
             crate::yarm_log!(
                 "FUTEX_WAIT_PARK_REFUSED tid={} asid={} addr={} reason=victim_changed undone={}",
                 tid,
