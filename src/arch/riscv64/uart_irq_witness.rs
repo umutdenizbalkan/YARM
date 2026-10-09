@@ -360,7 +360,10 @@ pub fn enable_source_after_plic_ready(
 /// runnable now" alone does not keep the hart idle: on a single CPU a deadline is the only other
 /// wake source, and with none due before `now + 3` the hart stays in its wait for at least two full
 /// periods after the next tick — the slack the host's injection needs to land on the `wfi`.
-pub fn note_idle_quiet(shared: &crate::runtime::SharedKernel, cpu: crate::kernel::scheduler::CpuId) {
+pub fn note_idle_quiet(
+    shared: &crate::runtime::SharedKernel,
+    cpu: crate::kernel::scheduler::CpuId,
+) {
     if shared.runnable_count_on_cpu_split_read(cpu) != 0 {
         return;
     }
@@ -372,8 +375,14 @@ pub fn note_idle_quiet(shared: &crate::runtime::SharedKernel, cpu: crate::kernel
             .min()
     });
     match next {
-        Some(d) => marker(format_args!("IRQ1_UART_IDLE_QUIET now={} next_deadline={}", now, d)),
-        None => marker(format_args!("IRQ1_UART_IDLE_QUIET now={} next_deadline=none", now)),
+        Some(d) => marker(format_args!(
+            "IRQ1_UART_IDLE_QUIET now={} next_deadline={}",
+            now, d
+        )),
+        None => marker(format_args!(
+            "IRQ1_UART_IDLE_QUIET now={} next_deadline=none",
+            now
+        )),
     }
 }
 
