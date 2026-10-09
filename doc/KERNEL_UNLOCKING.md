@@ -25677,14 +25677,16 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
 | BL3b — futex check-and-park contract | fixed and delivered (qualified `4c50a864`) | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed); revert control fails the park-window case |
 | BL3c — hosted ack-lease intermittent failure | fixed and delivered (qualified `031f6b32` + `69d2746f`) | classified PRODUCTION: a stale `release` / entitled `consume` decided on the endpoint generation, then the state, then exchanged the state alone, so a slot recycled for the same index's next incarnation in between was retired or consumed; forced deterministically with `race_hook`, three regressions fail on the unrepaired store |
-| BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | fixed — qualification pending | the non-preempting idle advance was compiled out on RISC-V, so a deadline that expired on an idle tick readied a task the same trap then left queued until the next PREEMPTING tick; on the unrepaired kernel the extended timer5 witness counts 5151 idle settlements that returned to `wfi` with a runnable task queued, against 0 repaired |
+| BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | fixed and delivered (qualified `53a5b112` + `bcf5e1d2` rustfmt) | the non-preempting idle advance was compiled out on RISC-V, so a deadline that expired on an idle tick readied a task the same trap then left queued until the next PREEMPTING tick; the unrepaired kernel with only the observer leaves 5,094 idle settlements with a runnable task queued, the repaired one 0 (about 2,800 non-preempting advances per boot); two strict witnesses that leaned on the defect corrected at the witness, no floor lowered |
 | BL4b — scheduler quantum / hardware deadline coupling | to verify | |
 | BL5a — reply-timeout retirement checker count/scope failures | to verify | |
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | to verify | |
 | BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
 | BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
 | BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate. The checker requires broad-path markers the split NR 9 route no longer emits (`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, `…DISPATCH_DEFER_BEGIN`, `…HANDLER_BYPASS_BEGIN/DONE`, `…DISPATCH_DONE result=idle`), while the kernel's own idle chain (`…NO_INCOMING`, `…POST_LOCK_IDLE_*`, `…IDLE_ORACLE_DONE result=ok`) is present; in one base boot another task was runnable, so the cell's no-incoming premise is also boot-order dependent |
-| BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate: init parks (`FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK`) and none of the `RISCV_FUTEX_WAIT_*IDLE*` / `…DISPATCH_DONE result=idle` markers follow; to be examined with BL4a |
+| BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open — intermittent | failed on true base `c44e9b46` (2/2) and on the first BL4a freeze `9b5838c4`; passed on `e2f4e52b` and `53a5b112` (`RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok`), so boot-order dependent, not closed by BL4a |
+| BL6c — AArch64 timer5 witness capture is stopped early by the core smoke | confirmed open (found in BL4a qualification) | `qemu-aarch64-core-smoke.sh` stops QEMU 2 s after the FIRST `SCHED_ENTER_IDLE_HLT`; the timer5 summary arrives 6,962 lines later on base and candidate alike, so whether it is captured is host speed alone: true base `af24e403` 1 pass / 3 fail, candidate 2 pass / 2 fail. The runner must stop on the witness's own completion instead |
+| BL6d — RISC-V UART idle-origin items race a deadline dispatch | bounded (found in BL4a qualification) | after BL4a the idle tick dispatches the core supervisor whose one- to three-tick receive deadline it expires; a host byte delivered two or three ticks after injection lands on it (`idle_origin=3 user_origin=5`). With the quiet-window acknowledgement: 7 of 8 boots pass (31 of 32 idle items). Base hides it (the tick stranded the supervisor). Removing it needs the kernel to hold the source until a quiet idle boundary |
 
 ### BL1 — multi-page shared-region mapping
 
@@ -26143,3 +26145,20 @@ corrected at the witness, with no floor lowered:
   injection latency stays under about two RISC-V periods (20 ms). That residual is bounded, not
   removed; removing it would need the kernel to hold the source until a quiet idle boundary.
   Pinned by `the_riscv_idle_acknowledgement_is_a_quiet_idle_tick` and the feature-gate guard.
+
+**Qualification (frozen `53a5b112`, fresh worktrees, base `af24e403`).**
+
+* *Base control:* the unrepaired kernel with only the observer fails as intended: 5,094 stranded
+  settlements and no non-preempting advance.
+* *Timer5 witness:* RISC-V 2/2 (`stranded=0`, 2,822 and 2,859 non-preempting advances); x86_64
+  passes. AArch64 passed 1/2; the failure is BL6c, which fails on true base too.
+* *Other RISC-V cells:* strict core; futex wake / wait / idle; terminal fault; exit; ipccall; xfer2.
+  The reply-timeout cell fails identically on base: BL5a.
+* *SMP3 2/2* (`ipi_to_c=8` and `7`, floor 2). *LOCK1* passes. *UART 1/2*: BL6d, bounded, 7/8 boots
+  across the final acknowledgement.
+* *Other ports:* x86_64 strict core and AArch64 strict core pass.
+* *Suites:* hosted 6,001 passed; integration 292/292; census 9/9; ABI passes. Freestanding warnings
+  are identical to main on all three ports (219 / 247 / 229).
+* *Format:* failed on the frozen tree, on rustfmt line-wrapping of the new witness function.
+  `bcf5e1d2` applies it (whitespace and one trailing comma).
+* *Delivery:* `53a5b112`, then `bcf5e1d2`, then this documentation commit.
