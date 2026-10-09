@@ -26124,8 +26124,17 @@ corrected at the witness, with no floor lowered:
   pending (`sip & sie == 0`, read on that hart). The tick's still-idle return marks it once the
   settlement has left it idle. The floors (`ipi_to_s = 8`, `ipi_to_c >= 2`) and the grading are
   unchanged.
-* *IRQ1 UART.* The host driver injected an idle-mode byte on the idle ENTRY line, which the idle
-  tick's own queue advance can now overtake (`idle_origin=3 user_origin=5`). The RISC-V
-  acknowledgement becomes the AArch64/x86_64 one: an idle tick that settled back to `wfi` with
-  nothing runnable (`RISCV_S_MODE_TIMER_RESUME_IDLE tick=T runnable=0`). Pinned by
-  `the_riscv_idle_acknowledgement_is_a_settled_idle_tick`.
+* *IRQ1 UART.* The host driver injected an idle-mode byte on the idle ENTRY line
+  (`idle_origin=3 user_origin=5`). Taking the AArch64/x86_64 acknowledgement instead (an idle
+  tick that settled back to `wfi` with nothing runnable) was not enough either; it failed once in
+  qualification. A core supervisor waits in one- to three-tick receives, so the tick after a
+  settled idle tick is often that supervisor's deadline. With a 10 ms period the host's injection
+  can land after it, while the advance dispatches the supervisor, and the byte lands on it. On base
+  that tick stranded the supervisor, so the byte still found the hart idle. The other two ports'
+  periods (50 ms, 0.8 s) leave the slack RISC-V lacks. The precondition the driver needs is "idle
+  and staying idle". The witness build now reports it on every still-idle timer return
+  (`IRQ1_UART_IDLE_QUIET now=T next_deadline=D`: the scheduler tick and the earliest pending IPC
+  deadline, one rank-2 task-table read, observation only). The driver injects only when no deadline
+  is due before `T+2`, so the hart stays in its wait for at least a full period after the next
+  tick. Pinned by `the_riscv_idle_acknowledgement_is_a_quiet_idle_tick` and the feature-gate
+  guard.

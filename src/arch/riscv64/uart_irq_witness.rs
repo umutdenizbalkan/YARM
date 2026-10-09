@@ -350,6 +350,29 @@ pub fn enable_source_after_plic_ready(
     None
 }
 
+/// BL4a — an idle tick settled back to the `wfi` with nothing runnable: report the scheduler tick
+/// it ran at and the earliest IPC deadline still pending (observation only; one rank-2 task-table
+/// read, after the settlement, nothing held across it).
+///
+/// The host driver injects an idle-mode byte on this line, and only when no deadline is due before
+/// tick `now + 2`. The idle tick dispatches the task whose deadline it expires, so "nothing
+/// runnable now" alone does not keep the hart idle: on a single CPU a deadline is the only other
+/// wake source, and with none due at the next tick the hart stays in its wait for at least a full
+/// period after it — the slack the byte needs to land on the `wfi`.
+pub fn note_idle_quiet(shared: &crate::runtime::SharedKernel) {
+    let now = shared.scheduler_tick_now_split_read();
+    let next = shared.with_task_tcbs_split_mut(|tcbs| {
+        tcbs.iter()
+            .flatten()
+            .filter_map(|tcb| tcb.ipc_timeout_deadline)
+            .min()
+    });
+    match next {
+        Some(d) => marker(format_args!("IRQ1_UART_IDLE_QUIET now={} next_deadline={}", now, d)),
+        None => marker(format_args!("IRQ1_UART_IDLE_QUIET now={} next_deadline=none", now)),
+    }
+}
+
 /// Record where a claimed witness interrupt was taken from. Called by the entry owner, which
 /// alone knows the origin; the claim itself is not touched.
 pub fn note_claim_origin(idle: bool, sepc: usize, tid: u64) {

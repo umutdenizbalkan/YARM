@@ -1961,6 +1961,12 @@ fn riscv_s_mode_idle_landing(
                     sources
                 ),
             }
+            // QEMU-IRQ1 witness (BL4a): the earliest pending deadline, for the host driver's
+            // idle acknowledgement (observation only).
+            #[cfg(feature = "riscv-uart-irq-witness")]
+            if matches!(trigger, SModeIdleTrigger::Timer { .. }) {
+                crate::arch::riscv64::uart_irq_witness::note_idle_quiet(shared);
+            }
             // QEMU-SMP3 witness: back into the idle wait (observation only).
             #[cfg(feature = "riscv64-smp3-witness")]
             crate::arch::riscv64::smp3_witness::note_idle_reached(cpu.0 as usize);

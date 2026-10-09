@@ -16,10 +16,13 @@ Synchronisation is by the guest's own acknowledgements, never by sleeping:
 * `IRQ1_UART_READY seq=N mode=user` -> inject byte `0x40+N` at once: the receiver is spinning in
   U-mode, so the interrupt lands on user code.
 * `IRQ1_UART_READY seq=N mode=idle` -> wait until the kernel reports the hart idle AFTER that line
-  (`RISCV_S_MODE_TIMER_RESUME_IDLE tick=T runnable=0`: an idle tick that settled back to the `wfi`
-  with nothing runnable), then inject `0x40+N`, so the interrupt lands on the idle `wfi`. Not the
-  idle ENTRY line: since BL4a the idle tick dispatches a task whose deadline it expired, so a byte
-  injected on a stale "entered idle" can land on that task — the AArch64 reason below.
+  and staying idle, then inject `0x40+N`, so the interrupt lands on the idle `wfi`. The
+  acknowledgement is `IRQ1_UART_IDLE_QUIET now=T next_deadline=D`, written when an idle tick settled
+  back to the `wfi` with nothing runnable, and accepted only when no deadline is due before tick
+  `T+2` (`D >= T+2`, or `none`). Since BL4a the idle tick dispatches the task whose deadline it
+  expires, so neither the idle ENTRY line nor "nothing runnable now" keeps the hart idle: a byte
+  injected then can land on that task when the very next tick is a deadline (one of the core
+  supervisors waits in one- to three-tick receives) and the injection lands after it.
 * `IRQ1_UART_POSTDISABLE_READY` (after `IRQ1_UART_SOURCE_DISABLED`) -> inject one more byte, `Z`,
   which a disabled source must NOT deliver.
 
@@ -58,7 +61,7 @@ import tempfile
 import time
 
 READY_RE = re.compile(rb"IRQ1_UART_READY seq=(\d+) mode=(idle|user) expect=0x([0-9a-f]{2})")
-IDLE_RE = re.compile(rb"RISCV_S_MODE_TIMER_RESUME_IDLE tick=\d+ runnable=0(?!\d)")
+IDLE_RE = re.compile(rb"IRQ1_UART_IDLE_QUIET now=(\d+) next_deadline=(\d+|none)(?!\S)")
 IDLE_RE_AARCH64 = re.compile(rb"TIMER_IDLE_ADVANCE_SETTLED cpu=0 incoming=none reason=idle settlement=kernel_idle")
 DISABLED_RE_AARCH64 = re.compile(rb"IRQ2_PL011_SOURCE_DISABLED ")
 DISABLED_RE_X86_64 = re.compile(rb"IRQ3_UART_SOURCE_DISABLED ")
@@ -67,6 +70,18 @@ DISABLED_RE = re.compile(rb"IRQ1_UART_SOURCE_DISABLED ")
 POST_RE = re.compile(rb"IRQ1_UART_POSTDISABLE_READY")
 BYTE_BASE = 0x40
 POST_BYTE = ord("Z")
+
+
+def idle_ack(idle_re, line: bytes) -> bool:
+    """Whether `line` is the port's idle acknowledgement. On RISC-V it must also leave a full
+    period of quiet: no deadline due before tick `now + 2`."""
+    m = idle_re.search(line)
+    if not m:
+        return False
+    if idle_re is not IDLE_RE:
+        return True
+    now, nxt = int(m.group(1)), m.group(2)
+    return nxt == b"none" or int(nxt) >= now + 2
 
 
 def main() -> int:
@@ -192,7 +207,7 @@ def main() -> int:
                 else:
                     pending_idle = (seq, byte)
                 continue
-            if pending_idle is not None and idle_re.search(line):
+            if pending_idle is not None and idle_ack(idle_re, line):
                 seq, byte = pending_idle
                 pending_idle = None
                 inject(byte, f"seq={seq} mode=idle ack=ready+idle")

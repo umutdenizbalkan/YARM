@@ -110,6 +110,11 @@ fn every_witness_entry_point_is_feature_gated() {
             "self.witness_notification_probe_into_frame(",
         ),
         ("provisioning", RV_BOOT, "provision_init_uart_irq_witness("),
+        (
+            "idle quiet observation",
+            RV_BOOT,
+            "uart_irq_witness::note_idle_quiet(",
+        ),
     ] {
         let at = src
             .find(call)
@@ -350,17 +355,28 @@ fn the_driver_uses_a_dedicated_backend_and_acknowledgements() {
 }
 
 /// BL4a: the RISC-V idle acknowledgement is an idle tick that settled back to the `wfi` with
-/// nothing runnable — never the idle ENTRY line, which the idle tick's own queue advance can
-/// overtake by dispatching a task whose deadline it expired.
+/// nothing runnable AND no deadline due before tick `now + 2` — never the idle ENTRY line, and
+/// never "nothing runnable" alone: the idle tick's own queue advance dispatches the task whose
+/// deadline it expires, so a byte that lands after a deadline tick lands on that task.
 #[test]
-fn the_riscv_idle_acknowledgement_is_a_settled_idle_tick() {
+fn the_riscv_idle_acknowledgement_is_a_quiet_idle_tick() {
     assert!(DRIVER.contains(
-        "IDLE_RE = re.compile(rb\"RISCV_S_MODE_TIMER_RESUME_IDLE tick=\\d+ runnable=0(?!\\d)\")"
+        "IDLE_RE = re.compile(rb\"IRQ1_UART_IDLE_QUIET now=(\\d+) next_deadline=(\\d+|none)(?!\\S)\")"
     ));
+    assert!(DRIVER.contains("return nxt == b\"none\" or int(nxt) >= now + 2"));
+    assert!(DRIVER.contains("idle_ack(idle_re, line)"));
     let idle_re = DRIVER
         .lines()
         .find(|l| l.starts_with("IDLE_RE = "))
         .expect("the RISC-V idle acknowledgement");
     assert!(!idle_re.contains("RISCV_TRAP_HALTED"), "{idle_re}");
-    assert!(!idle_re.contains('|'), "{idle_re}");
+    // The kernel side: written only on a still-idle TIMER return, from the witness module.
+    let boot = code(RV_BOOT);
+    let at = boot
+        .find("uart_irq_witness::note_idle_quiet(shared)")
+        .expect("the observation call");
+    assert!(boot[at.saturating_sub(300)..at].contains("SModeIdleTrigger::Timer"));
+    let witness = include_str!("../src/arch/riscv64/uart_irq_witness.rs");
+    assert!(witness.contains("\"IRQ1_UART_IDLE_QUIET now={} next_deadline={}\""));
+    assert!(witness.contains("\"IRQ1_UART_IDLE_QUIET now={} next_deadline=none\""));
 }
