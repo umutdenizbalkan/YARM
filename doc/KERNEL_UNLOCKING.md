@@ -25679,7 +25679,8 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL3c — hosted ack-lease intermittent failure | fixed and delivered (qualified `031f6b32` + `69d2746f`) | classified PRODUCTION: a stale `release` / entitled `consume` decided on the endpoint generation, then the state, then exchanged the state alone, so a slot recycled for the same index's next incarnation in between was retired or consumed; forced deterministically with `race_hook`, three regressions fail on the unrepaired store |
 | BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | fixed and delivered (qualified `53a5b112` + `bcf5e1d2` rustfmt) | the non-preempting idle advance was compiled out on RISC-V, so a deadline that expired on an idle tick readied a task the same trap then left queued until the next PREEMPTING tick; the unrepaired kernel with only the observer leaves 5,094 idle settlements with a runnable task queued, the repaired one 0 (about 2,800 non-preempting advances per boot); two strict witnesses that leaned on the defect corrected at the witness, no floor lowered |
 | BL4b — scheduler quantum / hardware deadline coupling | fixed and delivered (qualified `b5138562`; AArch64 core cells re-qualified on `8e7c12eb`) | the shipped quantum (timer interrupts per slice) WAS the hardware-deadline constant in each port's timer units, so a preempting tick came after 50M interrupts on x86_64 and 3.1M on AArch64; the true base gives no preempting tick within 1,024 interrupts. Separated into two documented constants per port, quantum about 100 ms; time-slice preemption is now live on x86_64 and AArch64 |
-| BL5a — reply-timeout retirement checker count/scope failures | to verify | |
+| BL5a — reply-timeout retirement checker count/scope failures | fixed and delivered (qualified `605958f5`) | the RISC-V timeout-wins cell failed every correct boot: it tied its two commits to 2,652 resume-boundary deliveries (ordinary receive timeouts) and accepted only the legacy late-reply decline, while the live route refuses pre-lock. The AArch64 cell asserted both completion families as boot-wide singletons and passed only while no other caller completed. Both now account per oracle identity; the true-base RISC-V runner fails, the candidate passes, and base AArch64 rejects a correct boot in which tid 2 also settles |
+| BL5a-2 — the reply-wins scenario is unreachable on all three ports | confirmed open (found in BL5a) | the oracle's reply-wins attestation (deadline injection, causal collector gate, `IPC_REPLY_WIN_RESERVE`, `IPC_REPLY_BEATS_TIMEOUT_OK`) lives only on the broad NR 2 / NR 7 paths, which the split routes replaced. The oracle caller now blocks with no deadline (`finite_deadline=0`), so no gate is held and nothing races; on x86_64 the broad emitter is dead code and the runner stops at its build-literal gate. Identical on true base `455c9520` |
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | to verify | |
 | BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
 | BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
@@ -26246,3 +26247,79 @@ kept exact:
   empty-queue ending; true base takes the replacement ending (tid 2).
 * *Overtaken witnesses* (x86_64, AArch64) fail identically on true base: BL6e, not this change.
 
+### BL5a — the reply-timeout retirement checkers account per oracle identity
+
+**Defect (verified on `455c9520`).** Two retirement runners asserted evidence that belongs to
+populations wider than the oracle's own reply, so they either failed correct boots or passed
+without checking the oracle at all.
+
+* *RISC-V, timeout-wins.* The fresh true-base runner fails every boot:
+
+  * The cell tied the number of `IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED` lines (2: the oracle's and
+    tid 2's) to the distinct callers on `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED` (2,652). That
+    marker is the resume boundary of every blocked-syscall completion, so the supervisor's ordinary
+    receive timeouts also pass through it with the same class and result.
+  * It required the late reply to be refused by the legacy reserve decline
+    (`IPC_REPLY_WIN_RESERVE … reason=TimeoutAlreadyClaimed`). The live route refuses it pre-lock
+    instead (`IPCREPLY_DIRECT_REFUSED_PRE_LOCK`, DIRECT3-CAP-FINAL §7).
+
+* *AArch64, timeout-wins.* The cell had never received 199E-R3's scoping:
+
+  * `COMPLETION_COMMITTED` was asserted as a boot-wide singleton through `verify_log`.
+  * `AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED` was held to a boot-wide count of one. That
+    consumer is production-live for every blocked receive (199E-A64RC).
+  * Every ordered position was the family's first line.
+  * The late reply's kernel-side refusal was not checked at all.
+
+  It passed only because tid 2's production deadline happened not to settle by timeout in the
+  boot.
+
+**Repair (checker only).**
+
+* *Obligations derived from production events.* Both cells derive the oracle's identity from the
+  provisioning marker and the oracle's own registration: tid, ASID, record index and generation.
+  Within that identity they require:
+  * exactly one delivery or consumption carrying the canonical TimedOut (`9` on AArch64);
+  * exactly one commit inside the oracle's own window, bounded by its registration and its
+    delivery;
+  * every reply-timeout settlement paired one-to-one with a commit, for every caller;
+  * no repeated identity+generation on the resume boundary anywhere in the boot;
+  * the oracle's own ordered chain;
+  * exactly one late-reply refusal, from either owner, for the oracle's record. A pre-lock
+    refusal must be inert. The refusal must lie after the oracle's commit and before its
+    userspace completion.
+* *Unchanged.* The global one-shots stay family-first and say why: the class retirement and the
+  deferred-work attestation carry no identity and are earned by the first completion of the
+  class.
+* *Fixtures.* Both runners carry `--self-test`: 16 fixtures each, 4 accept and 12 reject, using
+  each port's own markers.
+* *Guards.* The RISC-V source guards still pinned the replaced cardinality tie and the old 7-case
+  seal; they are re-derived, and the late-reply refusal gets its own guard. A matching AArch64
+  module is added.
+
+**Evidence.** The runner's own timeout-wins block was run verbatim against each log, with only
+build and boot stubbed:
+
+| log | base checker | candidate checker |
+|---|---|---|
+| RISC-V live timeout-wins (correct boot) | rejected (both defects) | accepted |
+| AArch64 live timeout-wins | accepted | accepted |
+| …plus tid 2 legitimately settling first | **rejected** (commit 2, consumed 2) | accepted |
+| …oracle's commit removed, tid 2's left | rejected (only incidentally, on the consumed count) | rejected (no commit in the oracle's window) |
+| …oracle's consumption duplicated | rejected | rejected (identity, generation and global) |
+| …late-reply refusal names another record | **accepted** | rejected |
+
+**Qualification (frozen `605958f5`, base `455c9520`, fresh worktrees).**
+
+* *Live runners:*
+  * RISC-V: true base `timeout_wins=0`, candidate `timeout_wins=1`. Two settlements and two
+    commits, against 2,655 resume-boundary deliveries.
+  * AArch64: base and candidate both `timeout_wins=1`.
+  * Reply-wins is red on both ports and the x86_64 runner stops at its build gate, identically on
+    base. Recorded as BL5a-2.
+* *Fixtures:* both self-tests 16/16.
+* *Suites:* fmt; hosted 6,008 passed (the six new guards included); integration 292/292; census
+  scanner 9/9.
+* *Production code:* untouched. The diff is two scripts and `#[cfg(test)]` guards. The freestanding
+  `kernel_boot` images are byte-identical to base on all three ports, with identical warnings
+  (219 / 247 / 229).
