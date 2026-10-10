@@ -5218,21 +5218,27 @@ pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
 
 /// The recorded reply-wins deadline is in the PRODUCTION tick domain (split route) rather than
 /// the oracle hardware domain the broad injector used.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static IPC_REPLY_TIMEOUT_RW_PRODUCTION_CLOCK: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 /// The oracle's own registration, recorded where production armed it: `token_index + 1` (0 =
 /// none), `token_generation` and `epoch`, so the late scan names exactly one token.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static IPC_REPLY_TIMEOUT_RW_TOKEN_INDEX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static IPC_REPLY_TIMEOUT_RW_TOKEN_GENERATION: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static IPC_REPLY_TIMEOUT_RW_TOKEN_EPOCH: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 /// Set when the drain met the oracle's registration as a LATE timeout item — the token outlived
 /// the reply that settled its terminal.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static IPC_REPLY_TIMEOUT_RW_FIRED_LATE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn ipc_reply_timeout_rw_deadline_is_production() -> bool {
     IPC_REPLY_TIMEOUT_RW_PRODUCTION_CLOCK.load(core::sync::atomic::Ordering::Acquire)
 }
