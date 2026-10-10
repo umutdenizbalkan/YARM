@@ -745,10 +745,10 @@ run_reply_wins() {
   # settles its own reply deadline long before the oracle runs.
   assert_order "$rw" \
     "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=riscv64 outcome=held" \
-    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${ORACLE_TID} caller_asid=${ORACLE_ASID} record_index=${ORACLE_RECORD_INDEX} " \
+    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${ORACLE_TID} caller_asid=${ORACLE_ASID} record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} " \
     "the collector must be held BEFORE the oracle's terminal is armed"
   assert_order "$rw" \
-    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${ORACLE_TID} caller_asid=${ORACLE_ASID} record_index=${ORACLE_RECORD_INDEX} " \
+    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${ORACLE_TID} caller_asid=${ORACLE_ASID} record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} " \
     "IPC_REPLY_TIMEOUT_ARMED arch=riscv64 caller_tid=${ORACLE_TID} " \
     "the terminal is armed before its deadline token is published"
   assert_order "$rw" \

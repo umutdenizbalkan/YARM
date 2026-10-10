@@ -286,7 +286,7 @@ verify_reply_won_chain() {
   local rw="$1" arch="$2" done_marker="$3"
   assert_order "$rw" \
     "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=${arch} outcome=held" \
-    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${ORACLE_TID} caller_asid=${ORACLE_ASID} record_index=${ORACLE_RECORD_INDEX} " \
+    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${ORACLE_TID} caller_asid=${ORACLE_ASID} record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} " \
     "the collector must be held BEFORE the oracle's terminal is armed"
   assert_order "$rw" \
     "IPC_REPLY_TIMEOUT_ARMED arch=${arch} caller_tid=${ORACLE_TID} " \
