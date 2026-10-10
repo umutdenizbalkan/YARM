@@ -577,6 +577,32 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit $?
 fi
 
+# BL5a-2 — the class-retirement one-shot, positioned by the reply-timeout delivery it belongs to.
+reply_timeout_delivery_pairs() {
+  sed -n 's/.*IPC_REPLY_TIMEOUT_ARMED arch=[a-z0-9_]* caller_tid=\([0-9][0-9]*\) .* token_generation=\([0-9][0-9]*\) .*/\1:\2/p' "$1" | sort -u
+}
+verify_class_retirement_order() {
+  local norm="$1" arch="$2" done_marker="$3" ci cn rt ud pairs
+  ci=$(rg -a -n -F "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=${arch}" "$norm" | head -1 | cut -d: -f1)
+  pairs=$(reply_timeout_delivery_pairs "$norm" | tr '\n' ' ')
+  cn=$(rg -a -n "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid=[0-9]+ .*blocked_generation=[0-9]+ " "$norm" 2>/dev/null \
+       | awk -v lo="${ci:-0}" -v pairs="$pairs" '
+           BEGIN { n = split(pairs, p, " "); for (i = 1; i <= n; i++) want[p[i]] = 1 }
+           { split($0, a, ":"); line = a[1]
+             t = $0; sub(/.* tid=/, "", t); sub(/ .*/, "", t)
+             g = $0; sub(/.*blocked_generation=/, "", g); sub(/ .*/, "", g)
+             if (line + 0 > lo + 0 && ((t ":" g) in want)) { print line; exit } }')
+  rt=$(rg -a -n -F "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcReplyTimeout" "$norm" | head -1 | cut -d: -f1)
+  ud=$(rg -a -n -F "$done_marker" "$norm" | head -1 | cut -d: -f1)
+  if [[ -n "$ci" && -n "$cn" && -n "$rt" && -n "$ud" ]]; then
+    (( ci < cn )) || die "completion committed must precede the resume-boundary consumption"
+    (( cn <= rt )) || die "retirement marker must follow the completion consumption"
+    (( rt < ud )) || die "retirement marker must precede the userspace completion"
+  else
+    die "ordered marker sequence incomplete (ci=$ci cn=$cn rt=$rt ud=$ud)"
+  fi
+}
+
 # ── 3. Scenario A — timeout-wins, feature enabled (fresh boot) ──
 TW_OK=0
 if (( ! fail )); then
@@ -604,22 +630,15 @@ if (( ! fail )); then
   # just the oracle's: exactly one delivery per identity+generation ⇒ one timeout encoding, one
   # resume boundary, no duplicate wake.
   verify_no_duplicate_completion_delivery "$TW"
-  # ORDERED sequence, part 1 — the GLOBAL one-shot. `GLOBAL_LOCK_RETIRE_CLASS_DONE` is a one-shot
-  # latch authorized by the FIRST completion consumption in the boot, whichever caller earns it,
-  # so these three positions are deliberately family-first rather than oracle-scoped. The
-  # invariant is unchanged: a committed-but-undelivered completion must never claim the class
-  # retired. `ud` IS the oracle's, and is scoped by the oracle's own USER_LOG tid.
-  ci=$(rg -a -n -F "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64" "$TW" | head -1 | cut -d: -f1)
-  cn=$(rg -a -n -F "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED" "$TW" | head -1 | cut -d: -f1)
-  rt=$(rg -a -n -F "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReplyTimeout" "$TW" | head -1 | cut -d: -f1)
-  ud=$(rg -a -n -F "USER_LOG tid=${ORACLE_TID} msg=RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut" "$TW" | head -1 | cut -d: -f1)
-  if [[ -n "$ci" && -n "$cn" && -n "$rt" && -n "$ud" ]]; then
-    (( ci < cn )) || die "completion committed must precede the resume-boundary consumption"
-    (( cn <= rt )) || die "retirement marker must follow the completion consumption"
-    (( rt < ud )) || die "retirement marker must precede the userspace completion"
-  else
-    die "ordered marker sequence incomplete (ci=$ci cn=$cn rt=$rt ud=$ud)"
-  fi
+  # ORDERED sequence, part 1 — the GLOBAL one-shot. `GLOBAL_LOCK_RETIRE_CLASS_DONE` carries no
+  # identity: it is earned by the first reply-timeout completion DELIVERED in the boot, whichever
+  # caller owns it. BL5a-2: that delivery is derived from production events, not taken as the
+  # family's first line. The resume boundary serves every blocked-receive completion, ordinary
+  # receive timeouts included, so the family's first line is only the reply-timeout delivery
+  # while ordinary timeouts never fire — which is what a stale reply registration used to cause.
+  # A reply-timeout delivery is the one whose `(tid, blocked_generation)` is a registration's
+  # `(caller_tid, token_generation)`. `ud` IS the oracle's, scoped by its own USER_LOG tid.
+  verify_class_retirement_order "$TW" riscv64 "USER_LOG tid=${ORACLE_TID} msg=RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut"
   # ORDERED sequence, part 2 — the ORACLE's OWN chain.
   [[ -n "$ORACLE_TID" ]] && verify_oracle_ordered_chain "$TW" riscv64 "$ORACLE_TID"
   forbid_log "$TW" \

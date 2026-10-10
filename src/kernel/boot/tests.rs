@@ -138078,11 +138078,21 @@ mod riscv64_retirement_oracle_scoped_accounting {
             ch.contains("$1 > lo && $1 < hi"),
             "the commit position must be the one inside the oracle's window"
         );
-        // The GLOBAL one-shot chain is deliberately family-first and says so.
-        assert!(
-            SMOKE.contains("latch authorized by the FIRST completion consumption in the boot"),
-            "the family-first positions must be justified as the global one-shot they guard"
-        );
+        // BL5a-2: the GLOBAL one-shot is positioned by the reply-timeout delivery it belongs to —
+        // a delivery whose `(tid, blocked_generation)` is a registration's `(caller_tid,
+        // token_generation)` — never by the resume-boundary family's first line, which ordinary
+        // receive timeouts share.
+        let o = SMOKE
+            .split("verify_class_retirement_order() {")
+            .nth(1)
+            .expect("the class-retirement order")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(o.contains("reply_timeout_delivery_pairs \"$norm\""));
+        assert!(o.contains("line + 0 > lo + 0 && ((t \":\" g) in want)"));
+        assert!(SMOKE.contains("token_generation=\\([0-9][0-9]*\\)"));
+        assert!(SMOKE.contains("verify_class_retirement_order \"$TW\" riscv64"));
     }
 
     /// (6) The runner ships its own fixtures, covering both directions, and they need no build.
@@ -138399,6 +138409,25 @@ mod aarch64_retirement_oracle_scoped_accounting {
         }
         assert!(SMOKE.contains(
             "STAGE_199E_R3_ORACLE_SCOPED_ACCOUNTING_SELFTEST arch=aarch64 cases=16 result=ok"
+        ));
+    }
+
+    /// BL5a-2: the class-retirement one-shot is positioned by the reply-timeout delivery, not by
+    /// the resume-boundary family's first line — ordinary receive timeouts consume there too.
+    #[test]
+    fn the_class_retirement_is_positioned_by_the_reply_timeout_delivery() {
+        let tw = timeout_wins();
+        assert!(tw.contains("verify_class_retirement_order \"$TW\" aarch64"));
+        assert!(
+            !tw.contains(
+                "cn=$(rg -a -n -F \"AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED\" \"$TW\" | head -1"
+            ),
+            "the family's first consumption no longer stands in for the class's"
+        );
+        let o = body_of("verify_class_retirement_order() {");
+        assert!(o.contains("reply_timeout_delivery_pairs \"$norm\""));
+        assert!(o.contains(
+            "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid=[0-9]+ .*blocked_generation=[0-9]+ "
         ));
     }
 
