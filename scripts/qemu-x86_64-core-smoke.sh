@@ -343,6 +343,18 @@ if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
   exit 0
 fi
 
+# BL5c: bind this run to the artifacts it boots, before booting them. A strict run grades the
+# timer-contract witness, which only an initramfs built with `timer-contract-witness` can produce
+# (the feature lives in the supervisor), so it refuses any other initramfs here rather than booting
+# it and failing on the witness's absence.
+# shellcheck source=lib/artifact-binding.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/artifact-binding.sh"
+artifact_required=()
+if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
+  artifact_required+=("initramfs:timer-contract-witness")
+fi
+artifact_binding_check x86_64 "$QEMU_SMOKE_STRICT" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" "${artifact_required[@]}" || exit 1
+
 # ---------------------------------------------------------------------------
 # Verify the kernel ELF has a PVH note so QEMU can direct-boot it.
 # ---------------------------------------------------------------------------

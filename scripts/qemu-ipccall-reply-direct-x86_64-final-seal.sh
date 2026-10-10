@@ -60,12 +60,16 @@ have_in()  { tr '\r' '\n' <"$1" | rg -a -F "$2" >/dev/null 2>&1; }
 run_a() {
   note "RUN_A: feature-off core smoke (SMP=1)"
   local d="$SEAL_LOGDIR/A-feature-off"; mkdir -p "$d"
-  BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
+  # BL5c: a strict x86_64 core run grades the timer-contract witness, so the feature-off
+  # (direct-oracle-off) build still carries `timer-contract-witness`, and the copied kernel is bound
+  # to the manifest of the build that produced it.
+  BOOTSTRAP_FEATURE_ARGS="--no-default-features --features timer-contract-witness" \
     scripts/build-qemu-x86_64-artifacts.sh >"$d/build.log" 2>&1 || fail A_build
   cp target/x86_64-yarm-none/x86-none/kernel_boot "$d/kernel_boot.elf"
   env \
     KERNEL_IMAGE="$d/kernel_boot.elf" \
     INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
+    ARTIFACT_MANIFEST=build-x86_64/artifact-manifest.txt \
     KERNEL_CMDLINE="console=ttyS0 rdinit=/init" \
     QEMU_SMP=1 \
     LOGFILE="$d/boot.log" \

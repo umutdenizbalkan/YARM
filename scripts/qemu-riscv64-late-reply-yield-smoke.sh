@@ -46,6 +46,14 @@ llvm-objcopy -O binary "$KELF" "$KBIN" || { seal "result=fail reason=objcopy"; e
   sha256sum "$KBIN" "$BUILD/initramfs-core.cpio"
 } >"$LOGDIR/artifact-identity.txt"
 
+# BL5c: the oracle kernel is built outside the artifact build, so the run binds it explicitly: the
+# kernel with the feature it was built with, the initramfs carried over from its build's manifest.
+source scripts/lib/artifact-binding.sh
+artifact_write_run_manifest "$LOGDIR/artifact-binding.txt" riscv64 "$KBIN" \
+  "--no-default-features --features $FEATURE" "$BUILD/initramfs-core.cpio" "$BUILD/artifact-manifest.txt" \
+  || { seal "result=fail reason=artifact_binding"; exit 1; }
+
+ARTIFACT_MANIFEST="$LOGDIR/artifact-binding.txt" \
 KERNEL_IMAGE="$KBIN" INITRAMFS_IMAGE="$BUILD/initramfs-core.cpio" \
 KERNEL_CMDLINE="yarm.riscv_ipc_reply_timeout_oracle=timeout-wins" QEMU_SINGLE_BOOT=1 \
 TIMEOUT_SECS="$TIMEOUT_SECS" QEMU_SMOKE_STRICT=1 LOGFILE="$BOOT_LOG" \

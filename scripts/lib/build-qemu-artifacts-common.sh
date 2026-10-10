@@ -129,18 +129,23 @@ common_verify_kernel_markers() {
 }
 
 # Record commit + per-artifact hash/size/mtime to the manifest.
+#
+# BL5c: each artifact also records its ROLE and the cargo features it was built with, so a run can
+# be bound to the exact kernel and initramfs it boots and to the features its mode requires
+# (`artifact_binding_check` in `artifact-binding.sh`). Both are built from the same
+# `BOOTSTRAP_FEATURE_ARGS`.
+# shellcheck source=artifact-binding.sh
+source "$(dirname "${BASH_SOURCE[0]}")/artifact-binding.sh"
 common_write_manifest() {
-  local arch="$1"; shift
+  local arch="$1" kernel="$2" initramfs="$3" feat
+  feat="$(artifact_features_record "${BOOTSTRAP_FEATURE_ARGS:-}")"
   {
     echo "commit=$BUILD_COMMIT"
     echo "arch=$arch"
     echo "build_start=$BUILD_START_HUMAN epoch=$BUILD_START_EPOCH"
-    local f
-    for f in "$@"; do
-      [[ -f "$f" ]] || continue
-      printf 'artifact %s sha256=%s size=%s mtime=%s\n' \
-        "$f" "$(sha256sum "$f" | cut -d' ' -f1)" "$(stat -c '%s' "$f")" "$(stat -c '%Y' "$f")"
-    done
+    echo "build_feature_args=${BOOTSTRAP_FEATURE_ARGS:-}"
+    artifact_manifest_line "$kernel" kernel "$feat"
+    artifact_manifest_line "$initramfs" initramfs "$feat"
   } | tee "$ARTIFACT_MANIFEST"
 }
 

@@ -154,6 +154,12 @@ if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
 fi
 require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 
+# BL5c: bind this run to the artifacts it boots, before booting them. No feature is required of a
+# aarch64 core run, but a strict run still refuses a kernel or initramfs its manifest does not record.
+# shellcheck source=lib/artifact-binding.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/artifact-binding.sh"
+artifact_binding_check aarch64 "$QEMU_SMOKE_STRICT" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" || exit 1
+
 LOGFILE=${LOGFILE:-qemu-aarch64-core.log}
 rm -f "$LOGFILE"
 

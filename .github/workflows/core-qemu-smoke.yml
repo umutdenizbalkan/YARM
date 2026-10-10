@@ -35,6 +35,9 @@ jobs:
       - name: Build staged artifacts (strict)
         env:
           ARTIFACTS_STRICT: "1"
+          # BL5c: the strict smoke grades the timer-contract witness, which only an initramfs
+          # built with this feature carries; the smoke refuses any other artifact before booting.
+          BOOTSTRAP_FEATURE_ARGS: "--no-default-features --features timer-contract-witness"
         run: scripts/build-qemu-x86_64-artifacts.sh
       - name: Core-marker QEMU smoke (strict)
         env:
