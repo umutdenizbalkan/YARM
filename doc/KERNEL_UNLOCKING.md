@@ -25682,7 +25682,8 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL5a — reply-timeout retirement checker count/scope failures | fixed and delivered (qualified `605958f5`) | the RISC-V timeout-wins cell failed every correct boot: it tied its two commits to 2,652 resume-boundary deliveries (ordinary receive timeouts) and accepted only the legacy late-reply decline, while the live route refuses pre-lock. The AArch64 cell asserted both completion families as boot-wide singletons and passed only while no other caller completed. Both now account per oracle identity; the true-base RISC-V runner fails, the candidate passes, and base AArch64 rejects a correct boot in which tid 2 also settles |
 | BL5a-2 — a direct reply that beats a finite deadline leaves the registration armed | fixed and delivered (qualified `23da30f8` + `13797fa`) | the direct wake never retired the caller's reply-deadline token: it fired late on every x86_64 boot (`LostToTerminal`), and the stale handle captured the caller's next ORDINARY timed receive, which then never timed out — tid 2 settled 0 ordinary timeouts per boot on base x86_64 and AArch64, 34–39 repaired. The commit now takes the registration with the Runnable transition; every exit retires it or, on undo, restores it |
 | BL5a-2b — the reply-wins scenario is unreachable on all three ports | fixed and delivered (qualified `5e734219`) | the scenario's arm point and attestations lived only on the broad NR 2 / NR 7 arms; the oracle now blocks with its own finite deadline, the split lane holds the causal gate before Phase C, and all three cells are derived from production events. All three retirement seals pass live for the first time since the split routes; with BL5a-2 reverted the cell reports `registration_outlived_reply` and fails |
-| BL5b — x86 terminal-fault oracle held to ordinary service counts | to verify | |
+| BL5b — x86 terminal-fault oracle held to ordinary service counts | fixed and delivered (qualified `bb9da703`) | init faults before its SpawnV5 chain, yet the cell required one entry of each of nine services: base strict fails every correct terminal-fault boot on the four families, and base non-strict accepts a service entry no spawn produced. The obligation is now derived from init's own spawn calls and enforced in every strictness; both mutations are rejected by name |
+| BL5b-2 — the x86_64 U9-RX4 reply-cap witness assumes the queued route | confirmed open (found in BL5b qualification) | with the timer-contract witness, tid 2's PM query reaches an idle PM in every terminal-fault boot, so it takes the direct NR 6 route: one server-local reply cap, no caller alias, no `IPC_REPLY_CAP_ONESHOT_OK`. The witness requires the queued route's markers and fails all four strict terminal-fault families; the direct commit emits no per-transaction attestation to derive the route from |
 | BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
 | BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
 | BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate. The checker requires broad-path markers the split NR 9 route no longer emits (`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, `…DISPATCH_DEFER_BEGIN`, `…HANDLER_BYPASS_BEGIN/DONE`, `…DISPATCH_DONE result=idle`), while the kernel's own idle chain (`…NO_INCOMING`, `…POST_LOCK_IDLE_*`, `…IDLE_ORACLE_DONE result=ok`) is present; in one base boot another task was runnable, so the cell's no-incoming premise is also boot-order dependent |
@@ -26472,3 +26473,64 @@ All new kernel items are behind the oracle feature.
   and `.data` are byte-identical to base on all three ports. `.rodata` differs by seven bytes on
   each, which are the panic locations the inserted source lines shift.
 
+### BL5b — the x86_64 terminal-fault cell owes the services init actually spawned
+
+**Defect (verified on `288e8339`).** In the terminal-fault cell init takes its deliberate fault
+before it issues a single `SpawnV5` call, so no service is ever started. The core smoke still
+required one `*_SRV_ENTRY` / `*_READY` marker of each of nine services, and Phase 3B one
+zero-copy record of each, as on an ordinary boot. The consequences were:
+
+* every correct terminal-fault boot failed the strict smoke on the service counts (all four
+  families: read, fetch, waiter delivery, port I/O);
+* non-strict runs downgraded the same nine failures to warnings. The cell therefore accepted a
+  boot in which a service entered without being spawned: the defect class it can never have
+  seen.
+
+The port-I/O cell does not set `TERMINAL_FAULT_ORACLE`, so it was held to the ordinary counts
+even after the page-fault families were considered.
+
+**Repair (checker only).** The service section derives its obligation from production evidence.
+
+* In either terminal-fault family it requires init's own fault (`TERMINAL_FAULT_ORACLE_BEGIN
+  arch=x86_64 init_tid=1`) and zero `INIT_SPAWN_V5_CALL_BEGIN`. Each service then owes exactly
+  zero entries, and the obligation is enforced whatever the strictness.
+* If the premise does not hold (no fault of init, or any spawn call), the cell fails by name
+  rather than guessing which services a spawn owes.
+* A non-zero count where zero is owed is reported as a service entry without a spawn. Phase 3B
+  takes the same derived count.
+* Ordinary boots keep exactly one of each, enforced under strict as before.
+
+**Evidence.**
+
+* *Live, fresh artifacts.* On the candidate, the four families derive the zero obligation from
+  init's fault at log lines 1,898–2,052 with zero spawn calls. The strict ordinary core (witness
+  artifact) still requires and finds one of each, 73 serviced ticks.
+* *Base strict, same artifacts.* All four families fail on `service entry MISSING`.
+* *Replayed fixtures (base vs candidate), both families, built from the fresh live logs:*
+
+  | Fixture | Base non-strict | Candidate |
+  |---|---|---|
+  | correct boot | accepted | accepted |
+  | an unspawned service entry | accepted | rejected: `service entry WITHOUT a spawn` |
+  | a spawn call before the fault | accepted | rejected: `init issued 1 SpawnV5 call(s)` |
+  | no fault of init | rejected by the family's own witness | rejected: `no fault of init to derive its service obligation from` |
+
+  On every fixture base strict stops at the service counts. Candidate strict on the correct
+  default-artifact boot fails only at the timer-contract witness, which that artifact was not
+  built to carry (BL5c).
+
+**Not changed.** Strict terminal-fault runs on the witness artifact still fail, at the U9-RX4
+reply-cap witness: tid 2's query takes the direct route there. Recorded as BL5b-2.
+
+**Qualification (frozen `bb9da703`, base `288e8339`, fresh worktrees and artifacts).**
+
+* *Live:*
+  * the four strict terminal-fault families on the candidate and on base, as above;
+  * non-strict page-fault and port-I/O cells on the default artifact: pass;
+  * strict ordinary cores on candidate and base: pass.
+* *Fixtures:* 16 replays per tree, as tabulated.
+* *Suites:* fmt clean; hosted 6,022 passed (including `bl5b_terminal_fault_service_obligation`,
+  2 tests); integration 292/292; census 9/9.
+* *Freestanding build:* warnings identical to base (180 / 208 / 190, same classes). The default
+  kernels are byte-identical to base on all three ports; the change is the x86_64 core smoke and
+  its hosted guard.
