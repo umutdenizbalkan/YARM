@@ -195245,3 +195245,73 @@ mod bl5a2b_reply_wins_on_the_split_route {
         );
     }
 }
+
+/// BL5b — the x86_64 terminal-fault cell is graded by what production owes IT.
+///
+/// Init takes its deliberate fault before the SpawnV5 chain, so none of the six services is ever
+/// spawned. The core smoke still required each to enter exactly once and the three late images to
+/// load once: run strict the cell failed on obligations the fault makes unreachable, and run
+/// non-strict (as it is) those lines were warnings, so a service entering WITHOUT a spawn passed.
+mod bl5b_terminal_fault_service_obligation {
+    const SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    fn section() -> &'static str {
+        SMOKE
+            .split("# Service entry count check.")
+            .nth(1)
+            .expect("the service section")
+            .split("# Timer / scheduler progression")
+            .next()
+            .expect("through Phase 3B")
+    }
+
+    #[test]
+    fn the_obligation_is_derived_from_inits_spawn_calls() {
+        let s = section();
+        assert!(
+            s.contains("svc_expected=1"),
+            "an ordinary boot owes each service once"
+        );
+        assert!(
+            s.contains("svc_expected=0"),
+            "the terminal-fault cell owes each service zero"
+        );
+        assert!(s.contains("log_count_pattern \"INIT_SPAWN_V5_CALL_BEGIN\""));
+        assert!(s.contains("TERMINAL_FAULT_ORACLE_BEGIN arch=x86_64 init_tid=1 "));
+        assert!(
+            s.contains("has no fault of init to derive its service obligation from")
+                && s.contains("SpawnV5 call(s) in the terminal-fault cell"),
+            "the derivation fails closed when its premise does not hold"
+        );
+        for marker in [
+            "INITRAMFS_SRV_ENTRY",
+            "DEVFS_SRV_ENTRY",
+            "VFS_SRV_ENTRY",
+            "DRIVER_MANAGER_ENTRY",
+            "BLKCACHE_SRV_ENTRY",
+            "VIRTIO_BLK_SRV_ENTRY",
+            "DRIVER_MANAGER_READY",
+            "BLKCACHE_SRV_READY",
+            "VIRTIO_BLK_SRV_READY",
+        ] {
+            let row = alloc::format!("[{marker}]=$svc_expected");
+            assert!(s.contains(&row), "{marker} must take the derived count");
+        }
+    }
+
+    #[test]
+    fn the_cell_enforces_it_whatever_the_strictness_and_rejects_unspawned_entries() {
+        let s = section();
+        assert!(s.contains("svc_enforce=\"$QEMU_SMOKE_STRICT\""));
+        assert!(
+            s.contains("svc_enforce=1"),
+            "the terminal-fault cell always enforces"
+        );
+        assert!(s.contains("if [[ \"$svc_enforce\" == \"1\" ]]; then"));
+        assert!(s.contains("[[ \"$svc_enforce\" == \"1\" ]] && exit 1"));
+        assert!(s.contains("service entry WITHOUT a spawn"));
+        assert!(s.contains("expected=${svc_expected} got=${zc_count}"));
+        // Nothing is skipped: the counts are checked, not exempted.
+        assert!(!s.contains("not asserted in the terminal-fault cell"));
+    }
+}

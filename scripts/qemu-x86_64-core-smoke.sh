@@ -557,19 +557,47 @@ fi
 
 # ---------------------------------------------------------------------------
 # Service entry count check.
-# Each of the six services must appear EXACTLY ONCE in the log.
+# Each of the six services must appear EXACTLY as often as init spawned it: once on an
+# ordinary boot.
+#
+# BL5b — the terminal-fault cell is held to what production owes IT, not to an ordinary boot's
+# totals. There init takes its deliberate fault BEFORE the SpawnV5 chain (the chain is init's
+# own transaction), so none of these services is ever spawned and each owes ZERO entries and
+# ZERO zero-copy loads. The cell used to be graded against `=1` and pass only because it runs
+# non-strict, where these lines are warnings: run strict it failed on obligations the fault makes
+# unreachable, and run non-strict a service that entered WITHOUT being spawned went unseen. The
+# count is now derived from init's spawn calls and enforced in the cell whatever the strictness.
+# If init ever issues a spawn in this cell the derivation no longer holds, and the cell says so
+# rather than guessing which services that spawn owes.
 # ---------------------------------------------------------------------------
+svc_expected=1
+svc_enforce="$QEMU_SMOKE_STRICT"
+if [[ "$TERMINAL_FAULT_ORACLE" == "1" ]]; then
+  svc_enforce=1
+  tf_begin_line=$(tr '\r' '\n' <"$LOGFILE" | rg -a -n -F "TERMINAL_FAULT_ORACLE_BEGIN arch=x86_64 init_tid=1 " | head -1 | cut -d: -f1 || true)
+  tf_spawn_calls=$(log_count_pattern "INIT_SPAWN_V5_CALL_BEGIN")
+  if [[ -z "$tf_begin_line" ]]; then
+    echo "[error] BL5b: the terminal-fault cell has no fault of init to derive its service obligation from"
+    exit 1
+  fi
+  if [[ "$tf_spawn_calls" -ne 0 ]]; then
+    echo "[error] BL5b: init issued ${tf_spawn_calls} SpawnV5 call(s) in the terminal-fault cell; its service obligation is derived from init faulting before the chain"
+    exit 1
+  fi
+  svc_expected=0
+  echo "[ok] BL5b: init faulted before the SpawnV5 chain (fault at log line ${tf_begin_line}, 0 spawn calls) — each service owes 0 entries"
+fi
 declare -A REQUIRED_SERVICE_ENTRIES
 REQUIRED_SERVICE_ENTRIES=(
-  [INITRAMFS_SRV_ENTRY]=1
-  [DEVFS_SRV_ENTRY]=1
-  [VFS_SRV_ENTRY]=1
-  [DRIVER_MANAGER_ENTRY]=1
-  [BLKCACHE_SRV_ENTRY]=1
-  [VIRTIO_BLK_SRV_ENTRY]=1
-  [DRIVER_MANAGER_READY]=1
-  [BLKCACHE_SRV_READY]=1
-  [VIRTIO_BLK_SRV_READY]=1
+  [INITRAMFS_SRV_ENTRY]=$svc_expected
+  [DEVFS_SRV_ENTRY]=$svc_expected
+  [VFS_SRV_ENTRY]=$svc_expected
+  [DRIVER_MANAGER_ENTRY]=$svc_expected
+  [BLKCACHE_SRV_ENTRY]=$svc_expected
+  [VIRTIO_BLK_SRV_ENTRY]=$svc_expected
+  [DRIVER_MANAGER_READY]=$svc_expected
+  [BLKCACHE_SRV_READY]=$svc_expected
+  [VIRTIO_BLK_SRV_READY]=$svc_expected
 )
 
 service_count_fail=0
@@ -581,6 +609,9 @@ for marker in "${!REQUIRED_SERVICE_ENTRIES[@]}"; do
   elif [[ "$actual" -eq 0 ]]; then
     echo "[warn] service entry MISSING: ${marker} (expected=${expected} got=0)"
     service_count_fail=1
+  elif [[ "$expected" -eq 0 ]]; then
+    echo "[warn] service entry WITHOUT a spawn: ${marker} (expected=0 got=${actual})"
+    service_count_fail=1
   else
     echo "[warn] service entry count wrong: ${marker} expected=${expected} got=${actual}"
     service_count_fail=1
@@ -589,7 +620,7 @@ done
 
 if [[ "$service_count_fail" -eq 1 ]]; then
   echo "[warn] one or more service entry counts wrong"
-  if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
+  if [[ "$svc_enforce" == "1" ]]; then
     echo "[error] strict x86_64 smoke: service entry count check failed"
     exit 1
   fi
@@ -604,17 +635,20 @@ fi
 if [[ -f "$LOGFILE" ]]; then
   phase3b_fail=0
 
-  # PM_ELF_ZC_DONE must appear exactly once per image_id, with zc_pages > 0.
+  # PM_ELF_ZC_DONE must appear once per image_id that init spawned, with zc_pages > 0 — so once
+  # on an ordinary boot and never in the terminal-fault cell (BL5b, above).
   for img_id in 7 8 9; do
     zc_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b" 2>/dev/null || echo 0)
     zc_nonzero=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_ELF_ZC_DONE image_id=${img_id}\\b.*zc_pages=[1-9]" 2>/dev/null || echo 0)
-    if [[ "$zc_count" -eq 1 && "$zc_nonzero" -eq 1 ]]; then
+    if [[ "$svc_expected" -eq 0 && "$zc_count" -eq 0 ]]; then
+      echo "[ok] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} count=0 (never spawned in this cell)"
+    elif [[ "$svc_expected" -eq 1 && "$zc_count" -eq 1 && "$zc_nonzero" -eq 1 ]]; then
       echo "[ok] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} count=1 zc_pages>0"
     elif [[ "$zc_count" -eq 1 && "$zc_nonzero" -eq 0 ]]; then
       echo "[warn] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} count=1 but zc_pages=0 (CPIO or ELF alignment regression)"
       phase3b_fail=1
     else
-      echo "[warn] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} expected=1 got=${zc_count}"
+      echo "[warn] Phase 3B: PM_ELF_ZC_DONE image_id=${img_id} expected=${svc_expected} got=${zc_count}"
       phase3b_fail=1
     fi
   done
@@ -655,7 +689,7 @@ if [[ -f "$LOGFILE" ]]; then
 
   if [[ "$phase3b_fail" -eq 1 ]]; then
     echo "[warn] Phase 3B x86_64 (-smp 1) checks did not all pass"
-    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    [[ "$svc_enforce" == "1" ]] && exit 1
   fi
 fi
 
