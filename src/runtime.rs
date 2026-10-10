@@ -15534,11 +15534,11 @@ impl SharedKernel {
                             TaskStatus::Blocked(WaitReason::EndpointReceive(_))
                         ) =>
                 {
-                    ReceiverCommit::Committed(None)
+                    ReceiverCommit::Committed(None, None)
                 }
                 Some(_) => ReceiverCommit::Replaced,
             };
-            if !matches!(class, ReceiverCommit::Committed(_)) {
+            if !matches!(class, ReceiverCommit::Committed(..)) {
                 return class;
             }
             // Infallible commit for a still-live matching blocked receiver: clear the blocked-return
@@ -15550,7 +15550,39 @@ impl SharedKernel {
                 .find(|t| t.tid.0 == tid)
                 .expect("prevalidated present");
             tcb.status = TaskStatus::Runnable;
-            ReceiverCommit::Committed(tcb.cpu_affinity)
+            // BL5a-2 — a delivery ends the wait, so it ends the wait's reply-deadline
+            // registration too, exactly as the wake owner (`wake_tid_to_runnable`) does for every
+            // other wake. Taken HERE, in the acquisition that makes the receiver Runnable, so the
+            // collector can never reach a registration whose wait is already over: its reply
+            // class is entered on `reply_timeout_token` alone, with no status check, and a stale
+            // handle left behind was fired late (`LostToTerminal`), orphaned when the receiver
+            // armed a new reply wait (the bounded store is four slots), or — if it next blocked
+            // in an ordinary timed receive — made the drain's stale-registration cleanup clear
+            // THAT receive's deadline. The token is not disarmed yet: the commit can still be
+            // undone, and the undo puts it back.
+            let reply_deadline = tcb.reply_timeout_token.take();
+            ReceiverCommit::Committed(tcb.cpu_affinity, reply_deadline)
+        })
+    }
+
+    /// BL5a-2 — settle a reply-deadline registration that `sr_commit_blocked_receiver_split` took
+    /// off a receiver whose wait has ended: `Armed → Disarmed`, exact by identity and epoch, so the
+    /// bounded store gets the slot back. Rank 3 only, after every rank-2 step has released.
+    ///
+    /// A token the collector already claimed for fire is left to that owner: its terminal claim
+    /// loses to the winner of this wait and disarms the token itself. `true` iff this call
+    /// disarmed it.
+    pub(crate) fn retire_taken_reply_deadline_split(
+        &self,
+        taken: Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
+    ) -> bool {
+        let Some(handle) = taken else {
+            return false;
+        };
+        self.with_ipc_split_mut(|ipc| {
+            ipc.reply_deadline_tokens
+                .get(handle.token_index())
+                .is_some_and(|t| t.cancel_exact(&handle))
         })
     }
 
@@ -16015,27 +16047,41 @@ impl SharedKernel {
     /// by whichever delivery or timeout eventually completes it. `blocked_recv_state` is likewise
     /// untouched — it was consumed into the snapshot at ack production, *before* this transaction
     /// began, so it is already `None` in the state this restores to.
+    ///
+    /// BL5a-2 — `reply_deadline` is the registration the commit took. A receiver restored to its
+    /// wait gets it back, so the wait keeps the deadline it was armed with; one that cannot be
+    /// restored never waits on it again, so it is retired here instead.
     pub(crate) fn sr_uncommit_blocked_receiver_split(
         &self,
         tid: u64,
         asid: crate::kernel::vm::Asid,
         recv_cap: CapId,
+        reply_deadline: Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
     ) -> bool {
         use crate::kernel::task::{TaskStatus, WaitReason};
-        self.with_task_tcbs_split_mut(|tcbs| {
+        let (restored, unreturned) = self.with_task_tcbs_split_mut(|tcbs| {
             let Some(tcb) = tcbs
                 .iter_mut()
                 .flatten()
                 .find(|t| t.tid.0 == tid && t.asid == Some(asid))
             else {
-                return false;
+                return (false, reply_deadline);
             };
             if !matches!(tcb.status, TaskStatus::Runnable) {
-                return false;
+                return (false, reply_deadline);
             }
             tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
-            true
-        })
+            // The receiver was Runnable but in no run queue, so it cannot have armed another
+            // registration in between; a TCB that somehow holds one keeps it.
+            if tcb.reply_timeout_token.is_none() {
+                tcb.reply_timeout_token = reply_deadline;
+                (true, None)
+            } else {
+                (true, reply_deadline)
+            }
+        });
+        let _ = self.retire_taken_reply_deadline_split(unreturned);
+        restored
     }
 
     /// rank 2 (task lock) — Stage 199D: read the endpoint-receive capability an exactly-blocked
@@ -17039,7 +17085,7 @@ impl SharedKernel {
         let recv_cap = self.blocked_recv_cap_split_read(snap.receiver_tid, snap.receiver_asid);
         // Phase 3 (rank 2): commit — registers cleared ONLY here, strictly after the claim.
         match self.sr_commit_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid, result) {
-            ReceiverCommit::Committed(affinity) => {
+            ReceiverCommit::Committed(affinity, reply_deadline) => {
                 // Phase 4 (rank 1): the single enqueue — the last externally visible act.
                 //
                 // Stage 199D: a refused placement is no longer swallowed, and no longer reported
@@ -17058,6 +17104,8 @@ impl SharedKernel {
                         // incarnation is DELIVERED. Consume + retire, so the endpoint's
                         // ownership slot returns to `Vacant` and the next receiver may publish.
                         let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);
+                        // BL5a-2: the wait is over, so is its reply-deadline registration.
+                        let _ = self.retire_taken_reply_deadline_split(reply_deadline);
                         Some(true)
                     }
                     ReceiverEnqueue::Rejected { cpu, error, .. } => {
@@ -17065,15 +17113,21 @@ impl SharedKernel {
                             error,
                             crate::kernel::scheduler::SchedulerError::AlreadyQueued
                         );
-                        let restored = unplaced
-                            && recv_cap.is_some_and(|cap| {
-                                self.sr_uncommit_blocked_receiver_split(
-                                    snap.receiver_tid,
-                                    snap.receiver_asid,
-                                    cap,
-                                )
-                            })
-                            && self.sr_restore_endpoint_waiter_split(&claim);
+                        // BL5a-2: the uncommit settles the taken registration (back onto the
+                        // restored wait, or retired); a receiver that is never offered to the
+                        // uncommit does not wait on it again, so it is retired here.
+                        let uncommit_cap = recv_cap.filter(|_| unplaced);
+                        if uncommit_cap.is_none() {
+                            let _ = self.retire_taken_reply_deadline_split(reply_deadline);
+                        }
+                        let restored = uncommit_cap.is_some_and(|cap| {
+                            self.sr_uncommit_blocked_receiver_split(
+                                snap.receiver_tid,
+                                snap.receiver_asid,
+                                cap,
+                                reply_deadline,
+                            )
+                        }) && self.sr_restore_endpoint_waiter_split(&claim);
                         // Stage 199D-WA3C2: a successful restore already settled the claim
                         // (`Claimed → Available`, waiter republished). Every other shape leaves
                         // it LIVE, and a live claim wedges the endpoint index against all future
@@ -18347,7 +18401,16 @@ impl ReceiverEnqueue {
 pub(crate) enum ReceiverCommit {
     /// Still-live matching blocked receiver: its blocked-return register state was cleared and it was
     /// transitioned Runnable; the captured affinity is carried for the single Phase-4 enqueue.
-    Committed(Option<CpuId>),
+    ///
+    /// BL5a-2 — the second field is the receiver's reply-deadline registration, TAKEN off its TCB
+    /// in the same rank-2 step that made it Runnable, exactly as the wake owner takes it. The
+    /// caller owes it one settlement: `retire_taken_reply_deadline_split` once the receiver is
+    /// placed (or abandoned), or `sr_uncommit_blocked_receiver_split`, which puts it back when
+    /// the receiver is restored to the wait it belongs to.
+    Committed(
+        Option<CpuId>,
+        Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
+    ),
     /// The receiver exited / was removed after the claim: the claimed waiter is correctly stale and
     /// MUST NOT be restored (there is no live task to strand). No register was mutated.
     GoneDead,

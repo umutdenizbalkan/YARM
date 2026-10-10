@@ -273,12 +273,17 @@ impl SharedKernel {
     /// Returns `true` iff the server is exactly blocked again with its waiter reinstalled — the
     /// condition under which the acknowledgement may be RESTORED for a later retry rather than
     /// discarded. The caller settles the lease; this never touches it.
+    ///
+    /// BL5a-2 — `server_reply_deadline` is the registration the commit took off the server. The
+    /// uncommit puts it back on the restored wait; a server that cannot be restored never waits
+    /// on it again, so it is retired.
     #[allow(clippy::too_many_arguments)]
     fn rollback_direct_request_after_commit(
         &self,
         ack: &BlockedServerAck,
         claim: &crate::runtime::WaiterClaim,
         server_recv_cap: Option<CapId>,
+        server_reply_deadline: Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
         server_cnode: crate::kernel::capabilities::CNodeId,
         server_cap: CapId,
         reply_object: CapObject,
@@ -290,6 +295,7 @@ impl SharedKernel {
         let _ = self.cancel_direct_reply_record_split(idx, rgen);
         self.sr_revoke_split(server_cnode, server_cap, reply_object);
         let Some(recv_cap) = server_recv_cap else {
+            let _ = self.retire_taken_reply_deadline_split(server_reply_deadline);
             // The wait reason was not captured, so the exact blocked state cannot be
             // reconstructed. Everything externally visible is still reclaimed above; the
             // acknowledgement will be discarded rather than restored.
@@ -300,7 +306,12 @@ impl SharedKernel {
             let _ = self.sr_cancel_endpoint_waiter_claim_split(claim);
             return false;
         };
-        if !self.sr_uncommit_blocked_receiver_split(ack.server.tid.0, ack.server.asid, recv_cap) {
+        if !self.sr_uncommit_blocked_receiver_split(
+            ack.server.tid.0,
+            ack.server.asid,
+            recv_cap,
+            server_reply_deadline,
+        ) {
             let _ = self.sr_cancel_endpoint_waiter_claim_split(claim);
             return false;
         }
@@ -562,7 +573,7 @@ impl SharedKernel {
             ack.server.asid,
             crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
         ) {
-            ReceiverCommit::Committed(affinity) => {
+            ReceiverCommit::Committed(affinity, server_reply_deadline) => {
                 // (11) record Reserved → Available — INFALLIBLE for our exact live
                 // reservation. Runs before the rank-1 enqueue, so the record is
                 // Available before the server can dispatch.
@@ -572,6 +583,7 @@ impl SharedKernel {
                     self.sr_revoke_split(server_cnode, server_cap, reply_object);
                     let _ = self.cancel_direct_reply_record_split(idx, rgen);
                     lease.discard();
+                    let _ = self.retire_taken_reply_deadline_split(server_reply_deadline);
                     return Err(IpcCallDirectError::RecordCommitFailed);
                 }
                 // Stage 200D (11b) — register the BOUNDED reverse link from the exact
@@ -603,6 +615,7 @@ impl SharedKernel {
                         ack,
                         &claim,
                         server_recv_cap,
+                        server_reply_deadline,
                         server_cnode,
                         server_cap,
                         reply_object,
@@ -658,6 +671,7 @@ impl SharedKernel {
                         // here — hence CANCEL, not RESTORE — but the slot still returns to
                         // `Vacant` so the endpoint index is not wedged forever.
                         let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
+                        let _ = self.retire_taken_reply_deadline_split(server_reply_deadline);
                         crate::yarm_log!(
                             "IPC_DIRECT_REQUEST_ENQUEUE_UNRECONCILED server_tid={} record_index={} error={:?} membership={:?} restored=0 result=failed_closed",
                             ack.server.tid.0,
@@ -678,6 +692,7 @@ impl SharedKernel {
                         ack,
                         &claim,
                         server_recv_cap,
+                        server_reply_deadline,
                         server_cnode,
                         server_cap,
                         reply_object,
@@ -712,6 +727,9 @@ impl SharedKernel {
                 // ownership slot to `Vacant`, which is what makes quiescent occupancy zero and
                 // lets the server's NEXT receive publish here.
                 let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);
+                // (13c) BL5a-2: the server's wait is over, so is any reply-deadline registration
+                // it carried — the same retirement the wake owner performs.
+                let _ = self.retire_taken_reply_deadline_split(server_reply_deadline);
                 Ok(IpcCallDirectSuccess {
                     record_index: idx,
                     record_generation: rgen,
@@ -972,7 +990,7 @@ impl SharedKernel {
             ack.caller.asid,
             crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
         ) {
-            ReceiverCommit::Committed(affinity) => {
+            ReceiverCommit::Committed(affinity, caller_reply_deadline) => {
                 // The resolved one-shot object, attested exactly as the broad path attests it.
                 crate::yarm_log!(
                     "IPC_REPLY_OBJECT_OK tid={} cap={} reply_index={} generation={} target_endpoint={}",
@@ -997,6 +1015,7 @@ impl SharedKernel {
                     // Stage 199D-WA3C2: settle the ownership claim even on the defensive arm.
                     // Nothing is restored, so CANCEL — but the slot must not stay wedged.
                     let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
+                    let _ = self.retire_taken_reply_deadline_split(caller_reply_deadline);
                     return Err(IpcReplyDirectError::RecordConsumeFailed);
                 }
                 // DIRECT3-CAP §2 — reclaim the physical one-shot slots, on the same edge the
@@ -1050,13 +1069,13 @@ impl SharedKernel {
                 else {
                     // Stage 199D — the placement was REFUSED after the record was consumed.
                     //
-                    // There is NO reply-timeout owner to fall back on. A direct-eligible reply
-                    // is by construction one whose record is NOT terminal-arbitrated —
-                    // `classify_direct_reply` declines `terminal_arbitrated` before any
-                    // mutation — and the arbitration flag is exactly "a reply timeout is armed
-                    // for this record incarnation". So the whole direct-eligible population is
-                    // untimed, and leaving the caller `Blocked` with the record spent would
-                    // strand it with no terminal owner at all.
+                    // The terminal cannot rescue the caller: this reply holds it `Reserved`, so
+                    // no other claimant can settle the wait, and leaving the caller `Blocked`
+                    // with the record spent would strand it. (The note here used to add that
+                    // the direct-eligible population is untimed. It is not, since 199D-TRC
+                    // admitted an armed, open terminal as `AvailableExact`: a timed reply wait
+                    // is served here too. BL5a-2 — that is why the uncommit below hands the
+                    // wait back its deadline registration.)
                     //
                     // Route A: restore the EXACT one-shot authority so the same reply retries.
                     // Admissible only when the caller provably holds no scheduler membership —
@@ -1073,6 +1092,7 @@ impl SharedKernel {
                         // Stage 199D-WA3C2: fail-closed on the CALLER's placement still settles
                         // the ownership claim — CANCEL, since nothing is restored here.
                         let _ = self.sr_cancel_endpoint_waiter_claim_split(&claim);
+                        let _ = self.retire_taken_reply_deadline_split(caller_reply_deadline);
                         crate::yarm_log!(
                             "IPC_DIRECT_REPLY_ENQUEUE_UNRECONCILED caller_tid={} record_index={} error={:?} membership={:?} authority_restored=0 result=failed_closed",
                             ack.caller.tid.0,
@@ -1085,11 +1105,18 @@ impl SharedKernel {
                                 .unwrap_or(crate::kernel::scheduler::WithdrawOutcome::NotQueued),
                         ));
                     }
+                    // BL5a-2: the uncommit settles the taken registration — back onto the restored
+                    // wait, whose deadline must still be able to win if the reply is not re-sent,
+                    // or retired. Without a captured wait reason there is no uncommit, so retire.
+                    if caller_recv_cap.is_none() {
+                        let _ = self.retire_taken_reply_deadline_split(caller_reply_deadline);
+                    }
                     let caller_restored = caller_recv_cap.is_some_and(|cap| {
                         self.sr_uncommit_blocked_receiver_split(
                             ack.caller.tid.0,
                             ack.caller.asid,
                             cap,
+                            caller_reply_deadline,
                         )
                     }) && self.sr_restore_endpoint_waiter_split(&claim);
                     // Stage 199D-WA3C2: a successful restore settled the claim itself. Every
@@ -1126,6 +1153,13 @@ impl SharedKernel {
                 // `Vacant`, so quiescent occupancy is zero and the caller's next receive on it
                 // can publish.
                 let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);
+                // BL5a-2 — the reply beat the caller's deadline, so the deadline's registration
+                // is retired here, on the same edge the wake owner retires it for every other
+                // wake. A timed reply wait IS direct-eligible since 199D-TRC classifies an armed,
+                // open terminal as `AvailableExact` (the enqueue-refusal note below predates
+                // that), and without this its token stayed armed until it fired late against
+                // the terminal the reply had already settled.
+                let _ = self.retire_taken_reply_deadline_split(caller_reply_deadline);
                 // DIRECT3-QUEUE3 — RELEASE THE REPLY-RECORD SLOT, exactly as legacy
                 // `ipc_reply` releases it (`ipc.reply_caps[slot] = None`).
                 //

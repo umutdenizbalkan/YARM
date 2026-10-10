@@ -86297,7 +86297,7 @@ mod stage199a2d1_races {
                                     server.asid,
                                     crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
                                 ) {
-                                    ReceiverCommit::Committed(affinity) => {
+                                    ReceiverCommit::Committed(affinity, _) => {
                                         rn.fetch_add(1, O::Relaxed);
                                         k.sr_enqueue_committed_receiver_split(
                                             server.tid.0,
@@ -95253,7 +95253,7 @@ mod stage200c_reply_timeout_transaction {
             )
             .is_some()
         {
-            if let ReceiverCommit::Committed(aff) = fx.k.sr_commit_blocked_receiver_split(
+            if let ReceiverCommit::Committed(aff, _) = fx.k.sr_commit_blocked_receiver_split(
                 1,
                 fx.caller_asid,
                 crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
@@ -95895,7 +95895,7 @@ mod stage200c_reply_timeout_transaction {
                                     caller_id, crate::kernel::boot::waiter_ownership::WaiterOwner::LegacyDelivery,)
                                 .is_some()
                                 {
-                                    if let ReceiverCommit::Committed(aff) =
+                                    if let ReceiverCommit::Committed(aff, _) =
                                         k.sr_commit_blocked_receiver_split(1, asid, crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2)
                                     {
                                         k.sr_enqueue_committed_receiver_split(1, aff);
@@ -117930,7 +117930,10 @@ mod stage199d_riscv_remote_wake_readiness {
             "the enqueue target is the captured affinity, else the enqueueing CPU"
         );
         assert!(
-            probe("ReceiverCommit::Committed(tcb.cpu_affinity)", RUNTIME),
+            probe(
+                "ReceiverCommit::Committed(tcb.cpu_affinity, reply_deadline)",
+                RUNTIME
+            ),
             "the affinity is the receiver's own captured cpu_affinity"
         );
         // The only assignment of a non-zero home CPU is the x86 AP workload builder.
@@ -123396,7 +123399,9 @@ mod stage199d_wa2b_wake_owner_census {
             "tcb.status",
             "TaskStatus::Runnable",
             ".expect(\"prevalidated present\");",
-            "ReceiverCommit::Committed(tcb.cpu_affinity)",
+            // BL5a-2: the commit now takes the wait's reply-deadline registration in the same
+            // acquisition, so its following line is that take.
+            "let reply_deadline = tcb.reply_timeout_token.take();",
         ),
         (
             "src/runtime.rs",
@@ -123404,7 +123409,8 @@ mod stage199d_wa2b_wake_owner_census {
             "tcb.status",
             "TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap))",
             "}",
-            "true",
+            // BL5a-2: the restored wait gets back the reply-deadline registration the commit took.
+            "if tcb.reply_timeout_token.is_none() {",
         ),
         // U7 (199E): the blocking-SEND timeout wake, moved off the broad lock. The previous
         // line is the close of the `if let Some(asid)` arm that parks the `TimedOut`
@@ -194686,5 +194692,385 @@ mod bl4a_riscv_idle_tick {
         }
         // The resume-idle settlement reports what it leaves queued.
         assert!(boot.contains("\"RISCV_S_MODE_TIMER_RESUME_IDLE tick={} runnable={}\""));
+    }
+}
+
+/// BL5a-2 — a DIRECT reply that beats a finite reply deadline retires that deadline's
+/// registration, on the same edge the wake owner retires it for every other wake.
+///
+/// 199D-TRC made an armed, open terminal `AvailableExact`, so a timed reply wait (NR 5 with a
+/// metadata buffer, which is what `ipc_recv_with_deadline` always passes) is direct-eligible.
+/// The direct transaction's commit made the caller Runnable and never touched its
+/// `reply_timeout_token`: the token stayed `Armed` in the four-slot store and the TCB kept naming
+/// it. Every default x86_64 boot shows the result — tid 2's three-tick reply wait is answered by
+/// direct NR 7 and its token fires ~13,000 log lines later as `outcome=LostToTerminal`. These
+/// cases drive the production owners the split route composes (terminal claim, the real
+/// transaction, terminal commit, the real collector and drains) and fail on the unrepaired kernel.
+mod bl5a2_direct_reply_retires_its_deadline {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use super::*;
+    use crate::kernel::boot::{
+        DirectReplyTerminalClaim, ReplyWaitArm, arm_reply_terminal_for_committed_block_locked,
+        ipcreply_direct_ack,
+    };
+    use crate::kernel::deadline_token::ReplyDeadlineClock;
+    use crate::kernel::ipccall_direct::IpcReplyDirectSnapshot;
+    use crate::kernel::ipccall_direct_txn::DirectReplyPostWork;
+    use crate::kernel::task::TaskStatus;
+    use crate::runtime::{ReceiverCommit, SharedKernel};
+
+    const PAYLOAD_VA: usize = super::stage199a2d1_races::CALLER_PAYLOAD_VA;
+
+    fn armed_tokens(k: &SharedKernel) -> usize {
+        k.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.reply_deadline_tokens
+                    .iter()
+                    .filter(|t| t.is_armed() || t.is_fire_claimed())
+                    .count()
+            })
+        })
+    }
+
+    /// Turn the fixture's blocked recv-v2 reply wait into a TIMED one, exactly as the split
+    /// receive lane does for NR 5: arm the terminal with a finite deadline in the rank-3 scope,
+    /// publish the token on the TCB, and carry the deadline on the receive.
+    fn make_timed(
+        fx: &CallerFx,
+        deadline: u64,
+    ) -> crate::kernel::deadline_token::DeadlineTokenHandle {
+        let wait_gen =
+            fx.k.with(|s| s.tcb_mut(1).expect("caller").blocked_recv_generation);
+        let arm = fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                arm_reply_terminal_for_committed_block_locked(
+                    ipc,
+                    fx.caller,
+                    fx.reply_eidx,
+                    wait_gen,
+                    true,
+                )
+            })
+        });
+        let ReplyWaitArm::Armed {
+            token: Some(handle),
+            ..
+        } = arm
+        else {
+            panic!("a finite reply wait must arm its terminal and reserve a deadline: {arm:?}");
+        };
+        assert!(fx.k.publish_reply_timeout_token_split(
+            1,
+            fx.caller_asid,
+            wait_gen,
+            handle,
+            ReplyDeadlineClock::ProductionTick,
+        ));
+        fx.k.with(|s| s.tcb_mut(1).expect("caller").ipc_timeout_deadline = Some(deadline));
+        assert_eq!(armed_tokens(&fx.k), 1, "one live registration");
+        handle
+    }
+
+    /// The direct NR 7 route, in its own order: exclusive terminal claim, the real transaction,
+    /// then the terminal commit on success.
+    fn direct_reply(fx: &CallerFx) {
+        let owner = match fx.k.claim_direct_reply_terminal_split(
+            fx.record_index,
+            fx.record_generation,
+            fx.replier,
+            fx.reply_eidx,
+            fx.reply_egen,
+        ) {
+            DirectReplyTerminalClaim::Won(owner) => owner,
+            other => panic!("the reply must win the open terminal: {other:?}"),
+        };
+        let (ack, ack_seq) = ipcreply_direct_ack::sole_claim().expect("the caller's ack");
+        let work = DirectReplyPostWork {
+            snapshot: IpcReplyDirectSnapshot::build(fx.replier, fx.reply_cap_t2, b"replyOK!")
+                .expect("snapshot"),
+            ack,
+            ack_seq,
+        };
+        fx.k.drain_direct_reply_post_work(CpuId(0), &work)
+            .expect("the direct reply delivers");
+        assert!(
+            fx.k.commit_direct_reply_terminal_split(fx.record_index, &owner),
+            "the reply commits the terminal"
+        );
+        // …and, last, releases the consumed record's slot, exactly as the route does on success.
+        fx.k.release_consumed_reply_record_split(fx.record_index, fx.record_generation);
+    }
+
+    #[test]
+    fn the_direct_reply_retires_the_deadline_it_beat() {
+        let fx = caller_fixture();
+        let now = fx.k.with(|s| s.scheduler_tick_now());
+        let handle = make_timed(&fx, now + 50);
+        direct_reply(&fx);
+        assert_eq!(
+            fx.k.with(|s| s.task_status(1)),
+            Some(TaskStatus::Runnable),
+            "the reply woke the caller"
+        );
+        assert_eq!(
+            armed_tokens(&fx.k),
+            0,
+            "the slot goes back to the four-slot store when the reply wins"
+        );
+        assert!(
+            fx.k.with(|s| s.reply_timeout_token_for_caller(1, fx.caller_asid))
+                .is_none(),
+            "the TCB no longer names a registration whose wait is over"
+        );
+        assert!(
+            fx.k.with(|s| s.with_ipc_state(
+                |ipc| ipc.reply_deadline_tokens[handle.token_index()].is_disarmed()
+            )),
+            "the exact token is disarmed, not fired"
+        );
+        // Past the deadline the collector finds nothing to publish for this caller.
+        let published = crate::kernel::boot::reply_timeout_work_published_count();
+        drive_production_timeouts(&fx.k, CpuId(0), now + 51);
+        assert_eq!(
+            crate::kernel::boot::reply_timeout_work_published_count(),
+            published,
+            "no late timeout work for a deadline the reply already beat"
+        );
+        teardown();
+    }
+
+    /// The consequence that is not benign. The caller, answered, next parks in an ORDINARY timed
+    /// receive. A stale handle on its TCB sent that receive's deadline into the reply class,
+    /// whose late claim lost to the settled terminal and then cleared the ordinary deadline, and
+    /// the ordinary drain refuses any token-bearing receiver — so the receive never timed out.
+    #[test]
+    fn the_callers_next_ordinary_timed_receive_still_times_out() {
+        let fx = caller_fixture();
+        let now = fx.k.with(|s| s.scheduler_tick_now());
+        let _ = make_timed(&fx, now + 1_000);
+        // The caller's own reply endpoint. Once the reply is delivered and its record released,
+        // no reply record names this caller there, so a receive on it is an ORDINARY receive.
+        let recv_cap =
+            fx.k.blocked_recv_cap_split_read(1, fx.caller_asid)
+                .expect("the caller's wait reason");
+        direct_reply(&fx);
+        let deadline = fx.k.with(|s| {
+            s.dispatch_next_task().expect("dispatch");
+            let mut guard = 0;
+            while s.current_tid() != Some(1) {
+                s.yield_current().expect("switch to the caller");
+                guard += 1;
+                assert!(guard < 64, "could not make the caller current");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecvTimeout as usize,
+                [recv_cap.0 as usize, PAYLOAD_VA, 8, 20, 0, 0],
+            );
+            let _ = s.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(s.task_status(1), Some(TaskStatus::Blocked(_))),
+                "the caller parks on its ordinary timed receive"
+            );
+            s.tcb_mut(1)
+                .expect("caller")
+                .ipc_timeout_deadline
+                .expect("an ordinary timed receive carries a deadline")
+        });
+        drive_production_timeouts(&fx.k, CpuId(0), deadline);
+        fx.k.with(|s| {
+            assert!(
+                matches!(
+                    s.task_status(1),
+                    Some(TaskStatus::Runnable | TaskStatus::Running)
+                ),
+                "the ordinary receive times out at its own deadline"
+            );
+            assert!(
+                s.consume_ipc_timeout_fired_for_tid(1).expect("consume"),
+                "and is completed as a timeout"
+            );
+        });
+        teardown();
+    }
+
+    /// The commit is undoable, so the registration it takes must survive the undo: a caller
+    /// returned to its wait keeps the deadline it was armed with.
+    #[test]
+    fn an_undone_commit_gives_the_wait_its_deadline_back() {
+        let fx = caller_fixture();
+        let now = fx.k.with(|s| s.scheduler_tick_now());
+        let handle = make_timed(&fx, now + 50);
+        let recv_cap =
+            fx.k.blocked_recv_cap_split_read(1, fx.caller_asid)
+                .expect("the caller's wait reason");
+        let commit = fx.k.sr_commit_blocked_receiver_split(
+            1,
+            fx.caller_asid,
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        );
+        let ReceiverCommit::Committed(_, taken) = commit else {
+            panic!("the blocked caller commits: {commit:?}");
+        };
+        assert_eq!(
+            taken,
+            Some(handle),
+            "the commit takes exactly this wait's registration"
+        );
+        assert!(
+            fx.k.with(|s| s.reply_timeout_token_for_caller(1, fx.caller_asid))
+                .is_none(),
+            "a committed receiver is unreachable by the collector"
+        );
+        assert!(fx.k.sr_uncommit_blocked_receiver_split(1, fx.caller_asid, recv_cap, taken));
+        assert_eq!(
+            fx.k.with(|s| s.reply_timeout_token_for_caller(1, fx.caller_asid)),
+            Some(handle),
+            "the restored wait names its registration again"
+        );
+        assert_eq!(armed_tokens(&fx.k), 1, "and the token was never disarmed");
+        teardown();
+    }
+
+    /// A receiver that cannot be restored never waits on the registration again, so the undo
+    /// retires it instead of leaking the slot.
+    #[test]
+    fn an_unrestorable_undo_retires_the_registration() {
+        let fx = caller_fixture();
+        let now = fx.k.with(|s| s.scheduler_tick_now());
+        let handle = make_timed(&fx, now + 50);
+        let recv_cap =
+            fx.k.blocked_recv_cap_split_read(1, fx.caller_asid)
+                .expect("the caller's wait reason");
+        let ReceiverCommit::Committed(_, taken) = fx.k.sr_commit_blocked_receiver_split(
+            1,
+            fx.caller_asid,
+            crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+        ) else {
+            panic!("the blocked caller commits");
+        };
+        fx.k.with(|s| s.mark_task_dead(1).expect("the caller dies"));
+        assert!(
+            !fx.k
+                .sr_uncommit_blocked_receiver_split(1, fx.caller_asid, recv_cap, taken)
+        );
+        assert_eq!(armed_tokens(&fx.k), 0, "the slot is returned");
+        assert!(fx.k.with(|s| {
+            s.with_ipc_state(|ipc| ipc.reply_deadline_tokens[handle.token_index()].is_disarmed())
+        }));
+        teardown();
+    }
+}
+
+/// BL5a-2 — the wiring: every direct wake settles the reply-deadline registration its commit
+/// took, on every exit, and the commit takes it in the acquisition that makes the receiver
+/// Runnable.
+mod bl5a2_direct_wake_settles_the_taken_registration {
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    fn body<'a>(src: &'a str, header: &str) -> &'a str {
+        src.split(header)
+            .nth(1)
+            .expect("the function")
+            .split("\n    }\n")
+            .next()
+            .expect("its body")
+    }
+
+    #[test]
+    fn the_commit_takes_the_registration_with_the_runnable_transition() {
+        let c = body(RUNTIME, "pub(crate) fn sr_commit_blocked_receiver_split(");
+        let runnable = c
+            .find("tcb.status = TaskStatus::Runnable;")
+            .expect("the transition");
+        let take = c
+            .find("let reply_deadline = tcb.reply_timeout_token.take();")
+            .expect("the take");
+        assert!(
+            runnable < take,
+            "taken after the transition, in the same acquisition"
+        );
+        assert!(
+            !c[runnable..take].contains("});"),
+            "no acquisition boundary between the transition and the take"
+        );
+        assert!(c.contains("ReceiverCommit::Committed(tcb.cpu_affinity, reply_deadline)"));
+        // The token is NOT disarmed at the commit: the commit can still be undone.
+        assert!(!c.contains(".cancel_exact(") && !c.contains("disarm_after_terminal_completion("));
+    }
+
+    #[test]
+    fn every_committed_arm_settles_the_registration_on_every_exit() {
+        // Three direct wakes compose the commit: NR 6, NR 7 and the shared-region finalizer.
+        let sites = [
+            (
+                "NR6",
+                TXN,
+                "ReceiverCommit::Committed(affinity, server_reply_deadline) =>",
+                "server_reply_deadline",
+            ),
+            (
+                "NR7",
+                TXN,
+                "ReceiverCommit::Committed(affinity, caller_reply_deadline) =>",
+                "caller_reply_deadline",
+            ),
+            (
+                "shared-region",
+                RUNTIME,
+                "ReceiverCommit::Committed(affinity, reply_deadline) =>",
+                "reply_deadline",
+            ),
+        ];
+        for (name, src, arm, var) in sites {
+            let a = src
+                .split(arm)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}: the committed arm"));
+            let a = a
+                .split("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
+                .next()
+                .expect("the arm");
+            let retire = alloc::format!("self.retire_taken_reply_deadline_split({var})");
+            assert!(
+                a.contains(&retire),
+                "{name}: the success exit retires the registration"
+            );
+            // Every placement-refused exit either hands the registration to the uncommit or
+            // retires it — none drops it.
+            let enqueue = a.find("Enqueued").expect("the enqueue decision");
+            let success = a[enqueue..]
+                .rfind(&retire)
+                .expect("a retirement after the enqueue");
+            assert!(success > 0, "{name}: the retirement follows the placement");
+        }
+        // The uncommit owner restores or retires; it never drops.
+        let u = body(RUNTIME, "pub(crate) fn sr_uncommit_blocked_receiver_split(");
+        assert!(u.contains("tcb.reply_timeout_token = reply_deadline;"));
+        assert!(u.contains("self.retire_taken_reply_deadline_split(unreturned)"));
+        // Each uncommit call site passes the registration along.
+        for src in [TXN, RUNTIME] {
+            for call in src
+                .split("self.sr_uncommit_blocked_receiver_split(")
+                .skip(1)
+            {
+                let args = call.split(')').next().expect("args");
+                assert!(
+                    args.contains("reply_deadline"),
+                    "an uncommit call drops the taken registration: ({args})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_retirement_is_exact_and_rank_three_only() {
+        let r = body(RUNTIME, "pub(crate) fn retire_taken_reply_deadline_split(");
+        assert!(
+            r.contains("t.cancel_exact(&handle)"),
+            "exact by identity and epoch"
+        );
+        assert!(r.contains("with_ipc_split_mut"));
+        assert!(!r.contains("with_task_tcbs_split_mut") && !r.contains(".with(|"));
     }
 }
