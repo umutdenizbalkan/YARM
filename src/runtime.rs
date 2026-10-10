@@ -16508,6 +16508,9 @@ impl SharedKernel {
                     crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
                 }
                 other => {
+                    // BL5a-2b: the reply-wins oracle's registration must never get here.
+                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                    crate::kernel::boot::note_reply_wins_oracle_late_fire(&work.handle);
                     // Harmless late expiry (the reply disarmed/completed the token, or the
                     // caller already resumed): no timeout claim, no wake.
                     crate::yarm_log!(
@@ -16557,19 +16560,49 @@ impl SharedKernel {
             // attestation can only be made by a drain whose collector was genuinely free to
             // publish timeout work — and still claimed none. While held the collector is
             // suppressed, and a "late scan claimed nothing" claim would be vacuous.
-            // `rw` is the ORACLE's own reply-wins deadline, so it is measured in the
-            // `OracleHardware` domain — canonical 199E makes that explicit here rather than
-            // inheriting whichever item happened to drain last (production items now drain
-            // through this same loop, in the scheduler-tick domain).
+            // `rw` is the ORACLE's own reply-wins deadline, measured in the domain it was
+            // registered in — canonical 199E makes that explicit here rather than inheriting
+            // whichever item happened to drain last. BL5a-2b: the split route registers the
+            // caller's own PRODUCTION deadline (scheduler tick); the retired broad injector
+            // used the `OracleHardware` counter.
+            let rw_now = if crate::kernel::boot::ipc_reply_timeout_rw_deadline_is_production() {
+                production_now
+            } else {
+                oracle_now
+            };
             if rw != 0
-                && oracle_now >= rw
+                && rw_now >= rw
                 && !crate::kernel::boot::reply_timeout_collector_held()
                 && crate::kernel::boot::ipc_reply_timeout_rw_late_scan_once()
             {
-                crate::yarm_log!(
-                    "IPC_REPLY_TIMEOUT_LATE_SCAN arch={} outcome=reply_won late_timeout_claims=0 result=ok",
-                    crate::kernel::boot::REPLY_TIMEOUT_ARCH
-                );
+                // BL5a-2b: the attestation is a fact about the oracle's OWN registration, not
+                // the absence of a wake. Past its deadline, with collection free, the token the
+                // production owner armed for this reply wait must already be retired by the
+                // reply, and must never have reached the drain as a late item.
+                let retired = match crate::kernel::boot::reply_wins_oracle_registration() {
+                    None => true,
+                    Some((idx, generation, epoch)) => {
+                        let armed = self.with_ipc_split_mut(|ipc| {
+                            ipc.reply_deadline_tokens.get(idx).is_some_and(|t| {
+                                (t.is_armed() || t.is_fire_claimed())
+                                    && t.identity().token_generation == generation
+                                    && t.current_epoch() == epoch
+                            })
+                        });
+                        !armed && !crate::kernel::boot::reply_wins_oracle_fired_late()
+                    }
+                };
+                if retired {
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_LATE_SCAN arch={} outcome=reply_won late_timeout_claims=0 result=ok",
+                        crate::kernel::boot::REPLY_TIMEOUT_ARCH
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_LATE_SCAN arch={} outcome=registration_outlived_reply late_timeout_claims=0 result=fail",
+                        crate::kernel::boot::REPLY_TIMEOUT_ARCH
+                    );
+                }
             }
         }
     }

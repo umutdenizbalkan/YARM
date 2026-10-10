@@ -3599,7 +3599,13 @@ mod ipc_reply_timeout_oracle {
     /// timeout-wins: short deadline so the production scan fires BEFORE the (delayed) reply.
     const TIMEOUT_WINS_TICKS: u64 = 3;
     /// reply-wins: later deadline so the prompt reply wins, then the scan passes it harmlessly.
+    /// Still the ServerDies bound.
     const REPLY_WINS_TICKS: u64 = 30;
+    /// BL5a-2b — the reply-wins caller's OWN finite deadline, in scheduler ticks. It exists so the
+    /// production owner arms a real terminal and token for the wait; the reply's win is decided by
+    /// the kernel's causal collector gate, not by this number. It is short so the production scan
+    /// passes it inside the boot on every port (an x86_64 tick is 0.8 s on QEMU).
+    const REPLY_WINS_PRODUCTION_TICKS: u64 = 3;
     /// Bounded cross-thread spin cap (deterministic termination, never wall-clock correctness).
     const SPIN_CAP: u64 = 2_000_000;
     /// 199E-R1(A): bounded U-mode dwell length. Sized only to give the periodic timer a generous
@@ -4105,10 +4111,11 @@ mod ipc_reply_timeout_oracle {
             "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_CALL_OK attempts={}",
             attempts
         );
-        // Both scenarios BLOCK on the reply endpoint; the kernel arms a reply-timeout deadline on
-        // the block path. timeout-wins blocks with an explicit finite recv-timeout deadline;
-        // reply-wins blocks with an INFINITE recv-v2 so the server's prompt reply delivers through
-        // the recv-v2 waiter path. The completion is arch-appropriate: x86_64 resumes via
+        // Both scenarios BLOCK on the reply endpoint with a FINITE deadline, and the production
+        // block path arms the reply terminal and its deadline token. BL5a-2b: reply-wins used to
+        // block with an INFINITE recv-v2 and rely on the kernel injecting a deadline, but the
+        // injector sat on the broad receive arm, which no blocking receive has reached since the
+        // split route took them over — so the oracle's wait was untimed and nothing raced. The completion is arch-appropriate: x86_64 resumes via
         // saved-frame return (RCX=TimedOut), AArch64 re-runs the recv handler which observes the
         // `ipc_timeout_fired` flag and returns the canonical TimedOut itself. Either way,
         // Ok(None) ⇒ the production scan timed the caller out; Ok(Some) ⇒ the reply won.
@@ -4126,7 +4133,9 @@ mod ipc_reply_timeout_oracle {
             unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_ep, REPLY_WINS_TICKS) }
         } else {
             // SAFETY: `reply_ep` carries RECEIVE.
-            unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_ep) }.map(|o| o.map(|rm| rm.message))
+            unsafe {
+                yarm_user_rt::syscall::ipc_recv_with_deadline(reply_ep, REPLY_WINS_PRODUCTION_TICKS)
+            }
         };
         let _ = REPLY_WINS_TICKS;
         match reply {
