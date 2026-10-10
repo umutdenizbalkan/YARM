@@ -570,9 +570,11 @@ fi
 # If init ever issues a spawn in this cell the derivation no longer holds, and the cell says so
 # rather than guessing which services that spawn owes.
 # ---------------------------------------------------------------------------
+# Both terminal-fault families qualify: the page-fault cell (`TERMINAL_FAULT_ORACLE`, armed by its
+# fetch and waiter variants too) and BL2's port-I/O cell, whose init is terminated just as early.
 svc_expected=1
 svc_enforce="$QEMU_SMOKE_STRICT"
-if [[ "$TERMINAL_FAULT_ORACLE" == "1" ]]; then
+if [[ "$TERMINAL_FAULT_ORACLE" == "1" || "$TERMINAL_FAULT_PORTIO_ORACLE" == "1" ]]; then
   svc_enforce=1
   tf_begin_line=$(tr '\r' '\n' <"$LOGFILE" | rg -a -n -F "TERMINAL_FAULT_ORACLE_BEGIN arch=x86_64 init_tid=1 " | head -1 | cut -d: -f1 || true)
   tf_spawn_calls=$(log_count_pattern "INIT_SPAWN_V5_CALL_BEGIN")
