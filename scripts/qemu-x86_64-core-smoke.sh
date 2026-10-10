@@ -2499,8 +2499,8 @@ u9rx4_cap="${u9rx4_cap:-NONE}"
 # by their absence would miss a lost one. So the record PM's reply resolves names the request, and
 # exactly ONE route must attest that record and PM's cap; that route's own obligations then apply.
 u9rx4_obj_line="$(printf '%s\n' "$u9rx4_log" | rg -a -m1 -e "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=1( |\$)" || true)"
-u9rx4_rec_index="$(printf '%s' "$u9rx4_obj_line" | rg -o -m1 -e 'reply_index=[0-9]+' | tr -dc '0-9')"
-u9rx4_rec_gen="$(printf '%s' "$u9rx4_obj_line" | rg -o -m1 -e ' generation=[0-9]+' | tr -dc '0-9')"
+u9rx4_rec_index="$(rg -o -m1 -e 'reply_index=[0-9]+' <<<"$u9rx4_obj_line" | tr -dc '0-9' || true)"
+u9rx4_rec_gen="$(rg -o -m1 -e ' generation=[0-9]+' <<<"$u9rx4_obj_line" | tr -dc '0-9' || true)"
 u9rx4_rec="record_index=${u9rx4_rec_index:-NONE} record_generation=${u9rx4_rec_gen:-NONE}"
 u9rx4_queued_re="^IPCCALL_QUEUED_SPLIT_OK tid=2 endpoint=[0-9]+ endpoint_generation=[0-9]+ reply_cap=[0-9]+ ${u9rx4_rec} "
 u9rx4_direct_re="^IPCCALL_DIRECT_SPLIT_OK caller_tid=2 server_tid=3 endpoint=[0-9]+ endpoint_generation=[0-9]+ server_reply_cap=${u9rx4_cap} ${u9rx4_rec} "
@@ -2518,7 +2518,8 @@ if [[ "$u9rx4_queued_n" == "1" && "$u9rx4_direct_n" == "0" ]]; then
   else
     echo "[ok] U9-RX4: reply cap ${u9rx4_cap} minted before the receive delivered it"
   fi
-  u9rx4_alias="$(printf '%s\n' "$u9rx4_log" | rg -a -m1 -e "$u9rx4_queued_re" | rg -o -m1 -e 'reply_cap=[0-9]+' | tr -dc '0-9')"
+  # Here-strings, not `printf | rg -m1`: under pipefail an early-exiting `rg` SIGPIPEs the writer.
+  u9rx4_alias="$(rg -a -m1 -e "$u9rx4_queued_re" <<<"$u9rx4_log" | rg -o -m1 -e 'reply_cap=[0-9]+' | tr -dc '0-9' || true)"
   u9rx4_require_one "the caller's alias of the one-shot is revoked once" \
     "IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2 cap=${u9rx4_alias:-NONE} expected=Reply { index: ${u9rx4_rec_index}, generation: ${u9rx4_rec_gen} } ok=true"
 elif [[ "$u9rx4_direct_n" == "1" && "$u9rx4_queued_n" == "0" ]]; then
