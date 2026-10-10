@@ -138150,6 +138150,8 @@ mod riscv64_retirement_oracle_scoped_accounting {
             // the defect this guards.
             assert!(
                 args[1].trim_start().starts_with("\"IPC_")
+                    // BL5a-2b: the reply's claim is the production direct-NR7 marker family.
+                    || args[1].trim_start().starts_with("\"IPCREPLY_")
                     || args[1].trim_start().starts_with("\"USER_LOG")
                     || args[1].trim_start().starts_with("\"RISCV_")
                     || args[1].trim_start().starts_with("\"GLOBAL_"),
@@ -195101,5 +195103,145 @@ mod bl5a2_direct_wake_settles_the_taken_registration {
         );
         assert!(r.contains("with_ipc_split_mut"));
         assert!(!r.contains("with_task_tcbs_split_mut") && !r.contains(".with(|"));
+    }
+}
+
+/// BL5a-2b — the reply-wins oracle is armed where its caller actually blocks, and its cells are
+/// derived from production events.
+///
+/// The scenario's arm point (`maybe_arm_reply_timeout_oracle`) and its reply-win attestations
+/// (`IPC_REPLY_WIN_RESERVE`, `IPC_REPLY_BEATS_TIMEOUT_OK`) live on the broad receive and reply
+/// arms, which no blocking receive and no reply has reached since the split routes took them
+/// over. The oracle caller therefore blocked untimed (`finite_deadline=0`), no gate was held,
+/// nothing raced, and all three reply-wins cells failed on every boot — x86_64 at its build gate,
+/// because the linker dropped the dead emitter.
+mod bl5a2b_reply_wins_on_the_split_route {
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const MOD: &str = include_str!("mod.rs");
+    const SERVICE: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RUNNERS: [(&str, &str); 3] = [
+        (
+            "x86_64",
+            include_str!("../../../scripts/qemu-ipc-reply-timeout-x86_64-retirement-smoke.sh"),
+        ),
+        (
+            "aarch64",
+            include_str!("../../../scripts/qemu-ipc-reply-timeout-aarch64-retirement-smoke.sh"),
+        ),
+        (
+            "riscv64",
+            include_str!("../../../scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh"),
+        ),
+    ];
+
+    fn reply_wins(src: &str) -> &str {
+        src.split("# ── 4. Scenario B")
+            .nth(1)
+            .expect("the reply-wins block")
+            .split("# ── 5.")
+            .next()
+            .expect("its body")
+    }
+
+    #[test]
+    fn the_gate_is_held_on_the_split_lane_before_phase_c_arms_the_terminal() {
+        let lane = SPLIT
+            .split("fn try_split_blocking_ipc_recv_into_frame(")
+            .nth(1)
+            .expect("the blocking lane");
+        let hold = lane
+            .find("crate::kernel::boot::reply_wins_oracle_before_terminal_arm(endpoint_idx, deadline);")
+            .expect("the arm point");
+        let phase_c = lane
+            .find("shared.recv_block_phase_c_split(")
+            .expect("Phase C");
+        assert!(hold < phase_c, "held strictly before the terminal is armed");
+        let note = lane
+            .find("crate::kernel::boot::note_reply_wins_oracle_registration(endpoint_idx, handle);")
+            .expect("the registration is recorded");
+        assert!(phase_c < note, "recorded where production published it");
+        let f = MOD
+            .split("pub(crate) fn reply_wins_oracle_before_terminal_arm(")
+            .nth(1)
+            .expect("the hook")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(f.contains("IPC_REPLY_TIMEOUT_MODE_REPLY_WINS"));
+        assert!(f.contains("ipc_reply_timeout_oracle_reply_endpoint_is(reply_eidx)"));
+        assert!(
+            f.contains("let Some(d) = deadline else"),
+            "a finite wait only"
+        );
+        assert!(f.contains("hold_reply_timeout_collector();"));
+    }
+
+    #[test]
+    fn the_late_scan_attests_the_oracles_own_registration_on_its_own_clock() {
+        let tail = RUNTIME
+            .split("let rw = crate::kernel::boot::ipc_reply_timeout_rw_deadline();")
+            .nth(1)
+            .expect("the late-scan tail");
+        assert!(tail.contains("ipc_reply_timeout_rw_deadline_is_production()"));
+        assert!(tail.contains("production_now"));
+        assert!(tail.contains("reply_wins_oracle_registration()"));
+        assert!(tail.contains("reply_wins_oracle_fired_late()"));
+        assert!(tail.contains("outcome=registration_outlived_reply"));
+        assert!(
+            RUNTIME
+                .contains("crate::kernel::boot::note_reply_wins_oracle_late_fire(&work.handle);")
+        );
+    }
+
+    #[test]
+    fn the_reply_wins_client_blocks_with_its_own_finite_deadline() {
+        assert!(SERVICE.contains("const REPLY_WINS_PRODUCTION_TICKS: u64 = 3;"));
+        assert!(SERVICE.contains(
+            "yarm_user_rt::syscall::ipc_recv_with_deadline(reply_ep, REPLY_WINS_PRODUCTION_TICKS)"
+        ));
+        let client = SERVICE
+            .split("pub(super) unsafe fn client_run(")
+            .nth(1)
+            .expect("the client")
+            .split("\n    }\n")
+            .next()
+            .expect("its body");
+        assert!(
+            !client.contains("ipc_recv_v2(reply_ep)"),
+            "no untimed reply wait remains in the oracle client"
+        );
+    }
+
+    #[test]
+    fn every_reply_wins_cell_is_derived_from_production_events() {
+        for (arch, runner) in RUNNERS {
+            let rw = reply_wins(runner);
+            for broad_only in [
+                alloc::format!("\"IPC_REPLY_BEATS_TIMEOUT_OK arch={arch}"),
+                alloc::format!("\"IPC_REPLY_WIN_RESERVE arch={arch} outcome=ok"),
+            ] {
+                assert!(
+                    !rw.contains(&broad_only),
+                    "{arch}: still requires {broad_only}"
+                );
+            }
+            for required in [
+                "verify_reply_won_terminal",
+                "verify_nothing_settled_while_held",
+                "outcome=registration_outlived_reply",
+            ] {
+                assert!(rw.contains(required), "{arch}: missing {required}");
+            }
+            assert!(runner.contains("finite_deadline=1 deadline_reserved=1 result=ok"));
+            assert!(runner.contains("terminal=Reply resolution=commit settled=1 result=ok"));
+        }
+        let (_, x86) = RUNNERS[0];
+        assert!(
+            !x86.contains("for lit in IPC_REPLY_TIMEOUT_OK IPC_REPLY_BEATS_TIMEOUT_OK"),
+            "the x86_64 build gate no longer requires the dead broad literal"
+        );
     }
 }

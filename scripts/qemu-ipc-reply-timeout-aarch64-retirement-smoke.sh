@@ -560,6 +560,81 @@ verify_class_retirement_order() {
   fi
 }
 
+# BL5a-2b — the reply-wins cell, derived from PRODUCTION events on the route the caller takes.
+# It used to require the broad receive arm's deadline injector and the broad NR 7 reply-win
+# markers (`IPC_REPLY_WIN_RESERVE ... outcome=ok`, `IPC_REPLY_BEATS_TIMEOUT_OK`); no blocking
+# receive and no reply has reached the broad arms since the split routes took them over, so the
+# oracle blocked UNTIMED, nothing raced, and the cell could never pass. The client now blocks with
+# its own finite deadline; the split lane holds the causal gate before the production owner arms
+# the terminal and token; the reply is production direct NR 7 settling exactly the oracle's
+# record; and the late scan attests that the reply retired the oracle's registration.
+verify_reply_won_terminal() {
+  local norm="$1" tid="$2" rec="record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} " n
+  n=$(rg -a -c -F "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${tid} caller_asid=${ORACLE_ASID} ${rec}" "$norm" 2>/dev/null || echo 0)
+  [[ "$n" == "1" ]] || { die "the oracle's terminal must be armed exactly once (got $n)"; return; }
+  rg -a -q -e "^IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${tid} caller_asid=${ORACLE_ASID} ${rec}.* finite_deadline=1 deadline_reserved=1 result=ok" "$norm" \
+    || die "the oracle's reply wait was not a finite, token-bearing wait"
+  n=$(rg -a -c -F "IPCREPLY_DIRECT_TERMINAL_CLAIM ${rec}" "$norm" 2>/dev/null || echo 0)
+  [[ "$n" == "1" ]] || { die "the oracle's record must see exactly one direct terminal claim (got $n)"; return; }
+  rg -a -q -e "^IPCREPLY_DIRECT_TERMINAL_CLAIM ${rec}replier_tid=[0-9]+ terminal=Reply resolution=commit settled=1 result=ok" "$norm" \
+    || die "the oracle's reply did not commit its terminal"
+  for m in "IPCREPLY_DIRECT_TERMINAL_LOST ${rec}" "IPCREPLY_DIRECT_REFUSED_PRE_LOCK ${rec}"; do
+    rg -a -q -F "$m" "$norm" && die "another claimant touched the oracle's record: $m"
+  done
+}
+
+# The gate suppresses ALL reply-class publication, so a settlement inside [held, released] means
+# it did not hold.
+verify_nothing_settled_while_held() {
+  local norm="$1" arch="$2" held rel n
+  held=$(rg -a -n -F "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=${arch} outcome=held" "$norm" | head -1 | cut -d: -f1)
+  rel=$(rg -a -n -F "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=${arch} outcome=released" "$norm" | head -1 | cut -d: -f1)
+  [[ -n "$held" && -n "$rel" ]] || { die "the gate window is incomplete (held=$held released=$rel)"; return; }
+  n=$(rg -a -n -F "IPC_REPLY_TIMEOUT_OK arch=${arch}" "$norm" | cut -d: -f1 \
+      | awk -v lo="$held" -v hi="$rel" '$1 > lo && $1 < hi' | wc -l | tr -d ' ')
+  [[ "$n" == "0" ]] || die "$n reply-timeout settlement(s) inside the held gate window"
+}
+
+# Assert marker A strictly precedes marker B (first occurrence of each).
+assert_order() {
+  local norm="$1" a="$2" b="$3" why="$4"
+  local la lb
+  la=$(rg -a -n -F "$a" "$norm" | head -1 | cut -d: -f1)
+  lb=$(rg -a -n -F "$b" "$norm" | head -1 | cut -d: -f1)
+  if [[ -z "$la" || -z "$lb" ]]; then
+    die "ordering evidence missing ($a=$la $b=$lb)"
+    return
+  fi
+  (( la < lb )) || die "$why ($a@$la must precede $b@$lb)"
+}
+
+# The causal chain, every registration and claim line scoped to the oracle.
+verify_reply_won_chain() {
+  local rw="$1" arch="$2" done_marker="$3"
+  assert_order "$rw" \
+    "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=${arch} outcome=held" \
+    "IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=${ORACLE_TID} caller_asid=${ORACLE_ASID} record_index=${ORACLE_RECORD_INDEX} " \
+    "the collector must be held BEFORE the oracle's terminal is armed"
+  assert_order "$rw" \
+    "IPC_REPLY_TIMEOUT_ARMED arch=${arch} caller_tid=${ORACLE_TID} " \
+    "IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} " \
+    "the reply must claim against a genuinely armed deadline"
+  assert_order "$rw" \
+    "IPCREPLY_DIRECT_TERMINAL_CLAIM record_index=${ORACLE_RECORD_INDEX} record_generation=${ORACLE_RECORD_GEN} " \
+    "USER_LOG tid=${ORACLE_TID} msg=IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=8 reply_ok=1" \
+    "userspace must validate the payload only after the reply committed its terminal"
+  assert_order "$rw" \
+    "USER_LOG tid=${ORACLE_TID} msg=IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=8 reply_ok=1" \
+    "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=${arch} outcome=released" \
+    "the gate must be released by the userspace validation, not before it"
+  assert_order "$rw" \
+    "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=${arch} outcome=released" \
+    "IPC_REPLY_TIMEOUT_LATE_SCAN arch=${arch} outcome=reply_won" \
+    "the late scan must run with collection ENABLED (otherwise it claims nothing vacuously)"
+  rg -a -q -F "USER_LOG tid=${ORACLE_TID} msg=${done_marker}" "$rw" \
+    || die "the oracle's own reply-wins verdict is missing"
+}
+
 # ── 3. Scenario A — timeout-wins, feature enabled (fresh boot) ──
 TW_OK=0
 if (( ! fail )); then
@@ -620,15 +695,25 @@ if (( ! fail )); then
   boot_mode reply-wins "$LOGDIR/boot-reply-wins.log"
   RW="$LOGDIR/rw.norm.log"; tr '\r' '\n' <"$LOGDIR/boot-reply-wins.log" >"$RW"
   [[ -s "$RW" ]] || die "no reply-wins boot log"
+  derive_oracle_identity "$RW" aarch64 || true
   verify_log "$RW" \
-    "IPC_REPLY_BEATS_TIMEOUT_OK arch=aarch64 terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok" \
+    "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=aarch64 outcome=held phase=before_terminal_claim result=ok" \
+    "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=aarch64 outcome=released trigger=userspace_reply_validated result=ok" \
     "IPC_REPLY_TIMEOUT_LATE_SCAN arch=aarch64 outcome=reply_won late_timeout_claims=0 result=ok" \
     "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=aarch64 scan_broad_lock=0 completion_transaction_narrow=1 classes=IpcReplyTimeout+IpcSendTimeout production=1 result=ok" \
     "AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok" \
     "IPC_REPLY_TIMEOUT_ORACLE_SERVER_DUP_REPLY rejected=1"
   verify_oracle_armed_once "$RW" aarch64
+  if [[ -n "$ORACLE_TID" && -n "$ORACLE_RECORD_INDEX" ]]; then
+    verify_reply_won_terminal "$RW" "$ORACLE_TID"
+    verify_reply_won_chain "$RW" aarch64 AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE
+  fi
+  verify_nothing_settled_while_held "$RW" aarch64
   verify_settlements_within_registrations "$RW" aarch64
   forbid_log "$RW" \
+    "IPC_REPLY_TIMEOUT_LATE_SCAN arch=aarch64 outcome=registration_outlived_reply" \
+    "IPC_REPLY_WIN_RESERVE arch=aarch64 outcome=decline" \
+    "IPC_REPLY_WIN_ROLLBACK" \
     "scan_broad_lock=1" \
     "KERNEL PANIC" "RUST PANIC" "panicked at" "SYNCHRONOUS EXCEPTION" "Unhandled"
   recheck_sha_clean

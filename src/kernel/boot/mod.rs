@@ -5206,6 +5206,108 @@ pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
     !IPC_REPLY_TIMEOUT_RW_LATE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
 }
 
+// ── BL5a-2b: the reply-wins oracle on the SPLIT receive route ──────────────────────────
+//
+// The scenario's arm point used to be `maybe_arm_reply_timeout_oracle`, called from the broad
+// blocked-receive arm only. Blocking receives have been served by the split lane since U9-RX3,
+// so the oracle caller blocked with no deadline, no gate was ever held and nothing raced: the
+// cell was unreachable on all three ports. It is now armed where the caller actually blocks,
+// and only the scenario's own bookkeeping lives here — the deadline is the caller's own finite
+// PRODUCTION deadline, the terminal and its token are armed by the production owner, the reply
+// is the production direct NR 7, and the registration is retired by the production wake.
+
+/// The recorded reply-wins deadline is in the PRODUCTION tick domain (split route) rather than
+/// the oracle hardware domain the broad injector used.
+static IPC_REPLY_TIMEOUT_RW_PRODUCTION_CLOCK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// The oracle's own registration, recorded where production armed it: `token_index + 1` (0 =
+/// none), `token_generation` and `epoch`, so the late scan names exactly one token.
+static IPC_REPLY_TIMEOUT_RW_TOKEN_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static IPC_REPLY_TIMEOUT_RW_TOKEN_GENERATION: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static IPC_REPLY_TIMEOUT_RW_TOKEN_EPOCH: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Set when the drain met the oracle's registration as a LATE timeout item — the token outlived
+/// the reply that settled its terminal.
+static IPC_REPLY_TIMEOUT_RW_FIRED_LATE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn ipc_reply_timeout_rw_deadline_is_production() -> bool {
+    IPC_REPLY_TIMEOUT_RW_PRODUCTION_CLOCK.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// BL5a-2b — at the split lane's committed reply-receive point, strictly BEFORE Phase C arms the
+/// terminal: record the caller's production deadline and hold the causal collector gate.
+/// Reply-wins only, the oracle's confined reply endpoint only, a finite wait only.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn reply_wins_oracle_before_terminal_arm(reply_eidx: usize, deadline: Option<u64>) {
+    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_REPLY_WINS
+        || !ipc_reply_timeout_oracle_reply_endpoint_is(reply_eidx)
+    {
+        return;
+    }
+    let Some(d) = deadline else {
+        return;
+    };
+    IPC_REPLY_TIMEOUT_RW_PRODUCTION_CLOCK.store(true, core::sync::atomic::Ordering::Release);
+    set_ipc_reply_timeout_rw_deadline(d);
+    hold_reply_timeout_collector();
+}
+
+/// BL5a-2b — record the registration production just armed for the oracle's reply wait.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn note_reply_wins_oracle_registration(
+    reply_eidx: usize,
+    handle: crate::kernel::deadline_token::DeadlineTokenHandle,
+) {
+    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_REPLY_WINS
+        || !ipc_reply_timeout_oracle_reply_endpoint_is(reply_eidx)
+        || !ipc_reply_timeout_rw_deadline_is_production()
+    {
+        return;
+    }
+    use core::sync::atomic::Ordering::Release;
+    IPC_REPLY_TIMEOUT_RW_TOKEN_GENERATION.store(handle.token_generation(), Release);
+    IPC_REPLY_TIMEOUT_RW_TOKEN_EPOCH.store(handle.epoch(), Release);
+    IPC_REPLY_TIMEOUT_RW_TOKEN_INDEX.store(handle.token_index() + 1, Release);
+}
+
+/// `(token_index, token_generation, epoch)` of the recorded oracle registration.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn reply_wins_oracle_registration() -> Option<(usize, u64, u64)> {
+    use core::sync::atomic::Ordering::Acquire;
+    let idx = IPC_REPLY_TIMEOUT_RW_TOKEN_INDEX.load(Acquire);
+    (idx != 0).then(|| {
+        (
+            idx - 1,
+            IPC_REPLY_TIMEOUT_RW_TOKEN_GENERATION.load(Acquire),
+            IPC_REPLY_TIMEOUT_RW_TOKEN_EPOCH.load(Acquire),
+        )
+    })
+}
+
+/// BL5a-2b — the drain met a late (non-`Woken`) timeout item; note it if it is the oracle's.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn note_reply_wins_oracle_late_fire(
+    handle: &crate::kernel::deadline_token::DeadlineTokenHandle,
+) {
+    if reply_wins_oracle_registration()
+        == Some((
+            handle.token_index(),
+            handle.token_generation(),
+            handle.epoch(),
+        ))
+    {
+        IPC_REPLY_TIMEOUT_RW_FIRED_LATE.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn reply_wins_oracle_fired_late() -> bool {
+    IPC_REPLY_TIMEOUT_RW_FIRED_LATE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 // ── Stage 200C2C2C-R2B: the CAUSAL reply-wins collector gate ────────────────────────
 //
 // The reply-wins scenario must prove that a REPLY wins terminal ownership over a

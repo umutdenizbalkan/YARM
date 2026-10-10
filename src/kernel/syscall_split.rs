@@ -4456,6 +4456,11 @@ fn try_split_blocking_ipc_recv_into_frame(
         };
     // `IPC_RECV_BLOCKED_STATE_SAVE` is NOT emitted here: `recv_block_phase_b_split` is the owner
     // of that write and already prints it, so printing it again would double the marker.
+    // BL5a-2b — the reply-wins oracle's arm point on this route: record the caller's deadline
+    // and hold the causal collector gate strictly BEFORE Phase C arms the terminal. A strict
+    // no-op off the oracle, off its confined reply endpoint, and for an untimed wait.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    crate::kernel::boot::reply_wins_oracle_before_terminal_arm(endpoint_idx, deadline);
     // Phase C — ipc rank 3. The atomic recheck-and-publish, through the ONE policy owner both
     // routes share.
     let (outcome, reply_wait_arm) = shared.recv_block_phase_c_split(
@@ -4683,6 +4688,8 @@ fn try_split_blocking_ipc_recv_into_frame(
                 crate::kernel::deadline_token::ReplyDeadlineClock::ProductionTick,
             );
             if published {
+                #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                crate::kernel::boot::note_reply_wins_oracle_registration(endpoint_idx, handle);
                 crate::yarm_log!(
                     "IPC_REPLY_TIMEOUT_ARMED arch={} caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
                     crate::kernel::boot::REPLY_TIMEOUT_ARCH,
