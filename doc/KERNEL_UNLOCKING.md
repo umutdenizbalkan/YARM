@@ -25680,7 +25680,8 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL4a — RISC-V CPU 0 idle tick leaves a readied task undispatched | fixed and delivered (qualified `53a5b112` + `bcf5e1d2` rustfmt) | the non-preempting idle advance was compiled out on RISC-V, so a deadline that expired on an idle tick readied a task the same trap then left queued until the next PREEMPTING tick; the unrepaired kernel with only the observer leaves 5,094 idle settlements with a runnable task queued, the repaired one 0 (about 2,800 non-preempting advances per boot); two strict witnesses that leaned on the defect corrected at the witness, no floor lowered |
 | BL4b — scheduler quantum / hardware deadline coupling | fixed and delivered (qualified `b5138562`; AArch64 core cells re-qualified on `8e7c12eb`) | the shipped quantum (timer interrupts per slice) WAS the hardware-deadline constant in each port's timer units, so a preempting tick came after 50M interrupts on x86_64 and 3.1M on AArch64; the true base gives no preempting tick within 1,024 interrupts. Separated into two documented constants per port, quantum about 100 ms; time-slice preemption is now live on x86_64 and AArch64 |
 | BL5a — reply-timeout retirement checker count/scope failures | fixed and delivered (qualified `605958f5`) | the RISC-V timeout-wins cell failed every correct boot: it tied its two commits to 2,652 resume-boundary deliveries (ordinary receive timeouts) and accepted only the legacy late-reply decline, while the live route refuses pre-lock. The AArch64 cell asserted both completion families as boot-wide singletons and passed only while no other caller completed. Both now account per oracle identity; the true-base RISC-V runner fails, the candidate passes, and base AArch64 rejects a correct boot in which tid 2 also settles |
-| BL5a-2 — the reply-wins scenario is unreachable on all three ports | confirmed open (found in BL5a) | the oracle's reply-wins attestation (deadline injection, causal collector gate, `IPC_REPLY_WIN_RESERVE`, `IPC_REPLY_BEATS_TIMEOUT_OK`) lives only on the broad NR 2 / NR 7 paths, which the split routes replaced. The oracle caller now blocks with no deadline (`finite_deadline=0`), so no gate is held and nothing races; on x86_64 the broad emitter is dead code and the runner stops at its build-literal gate. Identical on true base `455c9520` |
+| BL5a-2 — a direct reply that beats a finite deadline leaves the registration armed | fixed and delivered (qualified `23da30f8` + `13797fa`) | the direct wake never retired the caller's reply-deadline token: it fired late on every x86_64 boot (`LostToTerminal`), and the stale handle captured the caller's next ORDINARY timed receive, which then never timed out — tid 2 settled 0 ordinary timeouts per boot on base x86_64 and AArch64, 34–39 repaired. The commit now takes the registration with the Runnable transition; every exit retires it or, on undo, restores it |
+| BL5a-2b — the reply-wins scenario is unreachable on all three ports | confirmed open (found in BL5a) | the oracle's reply-wins arm point and attestations live only on the broad NR 2 / NR 7 arms the split routes replaced; the oracle caller blocks untimed (`finite_deadline=0`), no gate is held and nothing races; on x86_64 the broad emitter is dead code and the runner stops at its build-literal gate |
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | to verify | |
 | BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
 | BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
@@ -26323,3 +26324,92 @@ build and boot stubbed:
 * *Production code:* untouched. The diff is two scripts and `#[cfg(test)]` guards. The freestanding
   `kernel_boot` images are byte-identical to base on all three ports, with identical warnings
   (219 / 247 / 229).
+
+### BL5a-2 — a direct wake retires the reply-deadline registration of the wait it ends
+
+**Defect (found while re-deriving the reply-wins cell; verified on `c2d40f5c`).** 199D-TRC classifies
+an armed, open reply terminal as `AvailableExact`, so a TIMED reply wait is direct-eligible. A timed
+reply wait is NR 5 with a metadata buffer, which `ipc_recv_with_deadline` always passes. The direct
+NR 7 transaction makes the caller Runnable through `sr_commit_blocked_receiver_split` and never
+touched its `reply_timeout_token`. The token stayed `Armed` in the four-slot store, and the TCB kept
+naming it. The note at the NR 7 enqueue-refusal arm still said the direct-eligible population is
+untimed. Three consequences:
+
+* *Late fire, every default x86_64 boot.* tid 2's three-tick reply wait (record 0/1) is answered by
+  direct NR 7. Its token fires later anyway and loses to the settled terminal: one
+  `IPC_REPLY_TIMEOUT_LATE_SCAN outcome=LostToTerminal` per boot.
+* *A lost ordinary timeout.* The collector's reply class is entered on `reply_timeout_token` alone,
+  with no status check. If the answered caller next parks in an ORDINARY timed receive:
+  1. that receive's deadline is judged in the reply class;
+  2. the late claim loses to the settled terminal;
+  3. the stale-registration cleanup clears the ordinary deadline;
+  4. the ordinary drain refuses any token-bearing receiver.
+
+  The receive never times out. On AArch64 this was every boot: tid 2's supervisor control waits
+  never timed out until a message came.
+* *A leaked slot.* A caller that arms a new reply wait instead overwrites the TCB reference and
+  orphans the old token for good.
+
+**Repair (production owner).** `sr_commit_blocked_receiver_split` takes the registration in the
+same rank-2 acquisition that makes the receiver Runnable, exactly as the wake owner does, and
+returns it in `ReceiverCommit::Committed`. Every direct wake settles it on every exit: NR 6, NR 7
+and the shared-region finalizer.
+
+* A placed or abandoned receiver retires it: an exact `cancel_exact`, rank 3 only.
+* `sr_uncommit_blocked_receiver_split` puts it back on a receiver restored to its wait, so the wait
+  keeps its deadline. It retires the token only when the receiver cannot be restored.
+
+**Checker correction the repair required.** The AArch64 retirement cell (BL5a) positioned the
+class-retirement one-shot at the resume boundary's FIRST consumption. That was the reply-timeout
+delivery only while ordinary timeouts never fired. Both runners now take the delivery whose
+`(tid, blocked_generation)` is a registration's `(caller_tid, token_generation)`. A retirement
+moved before the delivery, or a delivery with an unregistered generation, is rejected.
+
+**Evidence.**
+
+* *Hosted, through the production owners* (terminal claim, the real transaction, terminal commit,
+  the real collector and drains). The two behavioural cases fail on true base:
+  * the slot stays armed (`left: 1, right: 0`);
+  * the caller's next ordinary timed receive never times out.
+
+  Two owner cases cover the undo, which restores the registration or retires it, and three wiring
+  guards cover the take, every exit, and the exact rank-3 retirement. Two status-writer census rows
+  and one affinity probe are re-derived for the new neighbouring lines.
+* *Live discriminator, fresh artifacts:*
+
+  | run | base `c2d40f5c` | candidate |
+  |---|---|---|
+  | x86_64 strict core: `LostToTerminal` | 1 | 0 |
+  | timer5, 21 x86_64 boots: `LostToTerminal` | 21 | 0 |
+
+  The candidate shows 0 in every x86_64, AArch64 and RISC-V boot of the qualification, while each
+  boot still arms tid 2's reply deadline once and answers it by direct NR 7.
+* *The lost ordinary timeout, live.* tid 2's ordinary timed receives settled by timeout in one
+  strict core boot:
+
+  | port | base | candidate |
+  |---|---|---|
+  | x86_64 | 0 | 34 |
+  | AArch64 | 0 | 38 and 39 |
+
+  On base the supervisor's timed control waits never expired.
+
+**Qualification (frozen `23da30f8`, then `13797fa` for the checker correction; base `c2d40f5c`;
+fresh worktrees).** The container restarted before qualification, and every artifact was rebuilt
+from clean clones with a newer nightly (`1.101.0-nightly`, 2026-10-09) and QEMU 8.2.2.
+
+* *Strict cores:* x86_64 2/2 (timer-contract witness sealed), AArch64 2/2, RISC-V.
+* *Witnesses:*
+  * timer5 on all three ports; CONTEXT1 on x86_64 and AArch64;
+  * x86_64 SMP1, LOCK3, UART and AP cross-CPU reply;
+  * AArch64 SMP2, LOCK2, PL011 and exit;
+  * RISC-V SMP3, LOCK1 and UART;
+  * xfer2 and ipccall on x86_64 and AArch64.
+* *Oracle cells:* the x86_64 and AArch64 terminal-fault cells and AArch64 futex wake/wait pass; the
+  server-death runners pass on all three ports.
+* *Retirement runners:* AArch64 and RISC-V timeout-wins pass on `13797fa`. All three reply-wins
+  cells and the x86_64 build gate fail exactly as on base: BL5a-2b.
+* *Suites:*
+  * hosted 6,016 passed; integration 292/292; census 9/9; ABI.
+  * Freestanding warnings are identical to base (180 / 208 / 190 under the new toolchain).
+  * The `13797fa` images are byte-identical to `23da30f8`.
