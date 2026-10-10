@@ -2484,15 +2484,64 @@ u9rx4_require_one_re "PM receives tid 2's query once, with a minted reply cap an
 u9rx4_got_line="$(printf '%s\n' "$u9rx4_log" | rg -a -n -m1 -e 'PM_RECV_GOT_MSG opcode=12 len=8 reply_cap=Some\([0-9]+\) transferred_cap=None sender_tid=2( |$)' || true)"
 u9rx4_cap="$(printf '%s' "$u9rx4_got_line" | rg -o -m1 -e 'reply_cap=Some\([0-9]+\)' | tr -dc '0-9')"
 u9rx4_cap="${u9rx4_cap:-NONE}"
-u9rx4_require_one "the reply cap is materialized exactly once" \
-  "IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${u9rx4_cap}"
-u9rx4_mint_at="$(printf '%s\n' "$u9rx4_log" | rg -a -n -m1 -F -- "IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${u9rx4_cap}" | cut -d: -f1 || true)"
+# BL5b-2: the ROUTE that carried tid 2's query is derived, not assumed. Two production routes
+# deliver a call to a server, and which one runs depends only on whether PM is already blocked in
+# its receive when tid 2 calls:
+#
+#   * queued (`IPCCALL_QUEUED_SPLIT_OK`): the request is buffered, a caller alias is minted, and PM's
+#     one-shot is materialized when its receive takes the message (`IPC_REPLY_CAP_ONESHOT_OK`);
+#   * direct NR 6 (`IPCCALL_DIRECT_SPLIT_OK`): the request is copied straight into the blocked PM,
+#     which receives exactly one server-local reply cap; no alias is minted for the caller.
+#
+# An ordinary boot keeps PM busy with init's spawn chain, so the query queues. In the terminal-fault
+# cell with the timer-contract witness, init is gone before tid 2 calls and PM is idle, so it goes
+# direct. Requiring the queued route's markers there failed a correct boot; accepting either route
+# by their absence would miss a lost one. So the record PM's reply resolves names the request, and
+# exactly ONE route must attest that record and PM's cap; that route's own obligations then apply.
+u9rx4_obj_line="$(printf '%s\n' "$u9rx4_log" | rg -a -m1 -e "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=1( |\$)" || true)"
+u9rx4_rec_index="$(printf '%s' "$u9rx4_obj_line" | rg -o -m1 -e 'reply_index=[0-9]+' | tr -dc '0-9')"
+u9rx4_rec_gen="$(printf '%s' "$u9rx4_obj_line" | rg -o -m1 -e ' generation=[0-9]+' | tr -dc '0-9')"
+u9rx4_rec="record_index=${u9rx4_rec_index:-NONE} record_generation=${u9rx4_rec_gen:-NONE}"
+u9rx4_queued_re="^IPCCALL_QUEUED_SPLIT_OK tid=2 endpoint=[0-9]+ endpoint_generation=[0-9]+ reply_cap=[0-9]+ ${u9rx4_rec} "
+u9rx4_direct_re="^IPCCALL_DIRECT_SPLIT_OK caller_tid=2 server_tid=3 endpoint=[0-9]+ endpoint_generation=[0-9]+ server_reply_cap=${u9rx4_cap} ${u9rx4_rec} "
+u9rx4_queued_n="$(u9rx4_count_re "$u9rx4_queued_re")"
+u9rx4_direct_n="$(u9rx4_count_re "$u9rx4_direct_re")"
 u9rx4_got_at="$(printf '%s' "$u9rx4_got_line" | cut -d: -f1)"
-if [[ -z "$u9rx4_mint_at" || -z "$u9rx4_got_at" ]] || (( u9rx4_mint_at >= u9rx4_got_at )); then
-  echo "[error] U9-RX4: the reply cap must be minted before the receive delivers it (mint_line=${u9rx4_mint_at:-none} receive_line=${u9rx4_got_at:-none} cap=${u9rx4_cap})"
-  u9rx4_fail=1
+if [[ "$u9rx4_queued_n" == "1" && "$u9rx4_direct_n" == "0" ]]; then
+  echo "[ok] U9-RX4: tid 2's query (${u9rx4_rec}) was carried by the queued route"
+  u9rx4_require_one "the reply cap is materialized exactly once" \
+    "IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${u9rx4_cap}"
+  u9rx4_mint_at="$(printf '%s\n' "$u9rx4_log" | rg -a -n -m1 -F -- "IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${u9rx4_cap}" | cut -d: -f1 || true)"
+  if [[ -z "$u9rx4_mint_at" || -z "$u9rx4_got_at" ]] || (( u9rx4_mint_at >= u9rx4_got_at )); then
+    echo "[error] U9-RX4: the reply cap must be minted before the receive delivers it (mint_line=${u9rx4_mint_at:-none} receive_line=${u9rx4_got_at:-none} cap=${u9rx4_cap})"
+    u9rx4_fail=1
+  else
+    echo "[ok] U9-RX4: reply cap ${u9rx4_cap} minted before the receive delivered it"
+  fi
+  u9rx4_alias="$(printf '%s\n' "$u9rx4_log" | rg -a -m1 -e "$u9rx4_queued_re" | rg -o -m1 -e 'reply_cap=[0-9]+' | tr -dc '0-9')"
+  u9rx4_require_one "the caller's alias of the one-shot is revoked once" \
+    "IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2 cap=${u9rx4_alias:-NONE} expected=Reply { index: ${u9rx4_rec_index}, generation: ${u9rx4_rec_gen} } ok=true"
+elif [[ "$u9rx4_direct_n" == "1" && "$u9rx4_queued_n" == "0" ]]; then
+  echo "[ok] U9-RX4: tid 2's query (${u9rx4_rec}) was carried by the direct NR 6 route"
+  u9rx4_direct_at="$(printf '%s\n' "$u9rx4_log" | rg -a -n -m1 -e "$u9rx4_direct_re" | cut -d: -f1 || true)"
+  if [[ -z "$u9rx4_direct_at" || -z "$u9rx4_got_at" ]] || (( u9rx4_direct_at >= u9rx4_got_at )); then
+    echo "[error] U9-RX4: the direct request must commit before PM's receive returns it (commit_line=${u9rx4_direct_at:-none} receive_line=${u9rx4_got_at:-none} cap=${u9rx4_cap})"
+    u9rx4_fail=1
+  else
+    echo "[ok] U9-RX4: reply cap ${u9rx4_cap} minted by the direct commit before the receive returned it"
+  fi
+  u9rx4_require_zero "the direct route's cap is not materialized a second time by a receive" \
+    "IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${u9rx4_cap}"
+  u9rx4_direct_alias_n="$(u9rx4_count_re "IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2 cap=[0-9]+ expected=Reply \\{ index: ${u9rx4_rec_index}, generation: ${u9rx4_rec_gen} \\}")"
+  if [[ "$u9rx4_direct_alias_n" != "0" ]]; then
+    echo "[error] U9-RX4: the direct route mints no caller alias, yet ${u9rx4_direct_alias_n} caller-side revoke(s) name ${u9rx4_rec}"
+    u9rx4_fail=1
+  else
+    echo "[ok] U9-RX4: no caller alias exists to revoke on the direct route"
+  fi
 else
-  echo "[ok] U9-RX4: reply cap ${u9rx4_cap} minted before the receive delivered it"
+  echo "[error] U9-RX4: tid 2's query must be attested by exactly one route for PM's cap ${u9rx4_cap} and ${u9rx4_rec} -- queued=${u9rx4_queued_n} direct=${u9rx4_direct_n}"
+  u9rx4_fail=1
 fi
 # PM can now decode and answer.
 u9rx4_require_one "PM decodes the lifecycle query" 'PM_LIFECYCLE_QUERY_RECV tid=2'
@@ -2509,8 +2558,6 @@ u9rx4_require_one_re "the reply resolves against the live one-shot object" \
 # The one-shot is CONSUMED exactly once, on both sides, and the caller resumes once.
 u9rx4_require_one "the replier side of the one-shot is revoked once" \
   "IPC_REPLY_REPLIER_CAP_FAST_REVOKE caller_tid=2 replier_tid=3 cap=${u9rx4_cap} "
-u9rx4_require_one "the caller side of the one-shot is revoked once" \
-  'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2'
 # Stage 199G-B §2: the caller's reply-wait is an NR 5 receive, so it now parks through the
 # pre-lock route and saves a real blocked-receive record. That makes the reply-boundary producer
 # ACCEPT, and the wake moves from the legacy in-lock `IPC_REPLY_WAKE_CALLER` to the deferred

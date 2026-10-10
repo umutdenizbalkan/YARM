@@ -730,6 +730,23 @@ impl SharedKernel {
                 // (13c) BL5a-2: the server's wait is over, so is any reply-deadline registration
                 // it carried — the same retirement the wake owner performs.
                 let _ = self.retire_taken_reply_deadline_split(server_reply_deadline);
+                // BL5b-2: the direct request's own attestation, the twin of the queued route's
+                // `IPCCALL_QUEUED_SPLIT_OK`. Emitted only once the request is delivered — server
+                // enqueued, record Available — and naming the exact record and the one
+                // server-local cap it minted, so a witness can tell WHICH route carried a
+                // given request rather than inferring it from the queued route's markers being
+                // absent. This route mints no caller alias.
+                crate::yarm_log!(
+                    "IPCCALL_DIRECT_SPLIT_OK caller_tid={} server_tid={} endpoint={} endpoint_generation={} server_reply_cap={} record_index={} record_generation={} len={} result=ok",
+                    snapshot.caller.tid.0,
+                    ack.server.tid.0,
+                    ack.endpoint_index,
+                    ack.endpoint_generation,
+                    server_cap.0,
+                    idx,
+                    rgen,
+                    snapshot.payload_len
+                );
                 Ok(IpcCallDirectSuccess {
                     record_index: idx,
                     record_generation: rgen,

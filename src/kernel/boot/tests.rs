@@ -195321,3 +195321,94 @@ mod bl5b_terminal_fault_service_obligation {
         assert!(!s.contains("not asserted in the terminal-fault cell"));
     }
 }
+
+// BL5b-2: the x86_64 U9-RX4 witness derives the route that carried tid 2's query from a
+// production attestation of that exact record, instead of assuming the queued route.
+mod bl5b2_rx4_route_is_derived {
+    const SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    fn rx4() -> &'static str {
+        SMOKE
+            .split("# U9-RX4: the Stage-32B queued-plain split receive")
+            .nth(1)
+            .expect("the U9-RX4 section")
+            .split("# U9-PAGEFAULT1 §2")
+            .next()
+            .expect("through the U9-RX4 verdict")
+    }
+
+    #[test]
+    fn the_direct_request_attests_its_record_and_cap_once_delivered() {
+        let ok = TXN
+            .find("\"IPCCALL_DIRECT_SPLIT_OK caller_tid={} server_tid={} endpoint={} endpoint_generation={} server_reply_cap={} record_index={} record_generation={} len={} result=ok\"")
+            .expect("the direct request's attestation");
+        let consume = TXN
+            .find("let _ = self.sr_consume_endpoint_waiter_claim_split(&claim);")
+            .expect("the delivered claim");
+        let success = TXN
+            .find("Ok(IpcCallDirectSuccess {")
+            .expect("the success return");
+        assert!(
+            consume < ok && ok < success,
+            "attested only once the request is delivered, on the success return"
+        );
+        assert_eq!(TXN.matches("IPCCALL_DIRECT_SPLIT_OK").count(), 1);
+    }
+
+    #[test]
+    fn exactly_one_route_must_attest_the_record_pm_replies_to() {
+        let s = rx4();
+        assert!(s.contains(
+            "^IPC_REPLY_OBJECT_OK tid=3 cap=${u9rx4_cap} reply_index=[0-9]+ generation=1"
+        ));
+        assert!(s.contains(
+            "u9rx4_queued_re=\"^IPCCALL_QUEUED_SPLIT_OK tid=2 endpoint=[0-9]+ endpoint_generation=[0-9]+ reply_cap=[0-9]+ ${u9rx4_rec} \""
+        ));
+        assert!(s.contains(
+            "u9rx4_direct_re=\"^IPCCALL_DIRECT_SPLIT_OK caller_tid=2 server_tid=3 endpoint=[0-9]+ endpoint_generation=[0-9]+ server_reply_cap=${u9rx4_cap} ${u9rx4_rec} \""
+        ));
+        assert!(s.contains(
+            "if [[ \"$u9rx4_queued_n\" == \"1\" && \"$u9rx4_direct_n\" == \"0\" ]]; then"
+        ));
+        assert!(s.contains(
+            "elif [[ \"$u9rx4_direct_n\" == \"1\" && \"$u9rx4_queued_n\" == \"0\" ]]; then"
+        ));
+        assert!(s.contains("must be attested by exactly one route"));
+    }
+
+    #[test]
+    fn each_route_keeps_its_own_obligations() {
+        let s = rx4();
+        let queued = s
+            .split("was carried by the queued route")
+            .nth(1)
+            .unwrap()
+            .split("elif [[")
+            .next()
+            .unwrap();
+        assert!(
+            queued.contains(
+                "\"IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 local_reply_cap=${u9rx4_cap}\""
+            )
+        );
+        assert!(queued.contains("(( u9rx4_mint_at >= u9rx4_got_at ))"));
+        assert!(queued.contains(
+            "\"IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2 cap=${u9rx4_alias:-NONE} expected=Reply { index: ${u9rx4_rec_index}, generation: ${u9rx4_rec_gen} } ok=true\""
+        ));
+        let direct = s
+            .split("was carried by the direct NR 6 route")
+            .nth(1)
+            .unwrap()
+            .split("\nelse\n")
+            .next()
+            .unwrap();
+        assert!(direct.contains("(( u9rx4_direct_at >= u9rx4_got_at ))"));
+        assert!(direct.contains(
+            "u9rx4_require_zero \"the direct route's cap is not materialized a second time by a receive\""
+        ));
+        assert!(direct.contains("the direct route mints no caller alias"));
+        // The unscoped, route-blind caller-revoke count is gone.
+        assert!(!s.contains("'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2'"));
+    }
+}
