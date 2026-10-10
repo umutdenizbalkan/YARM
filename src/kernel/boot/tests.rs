@@ -195307,6 +195307,12 @@ mod bl5b_terminal_fault_service_obligation {
             s.contains("svc_enforce=1"),
             "the terminal-fault cell always enforces"
         );
+        assert!(
+            s.contains(
+                "if [[ \"$TERMINAL_FAULT_ORACLE\" == \"1\" || \"$TERMINAL_FAULT_PORTIO_ORACLE\" == \"1\" ]]; then"
+            ),
+            "both terminal-fault families — page fault and port I/O — take the derivation"
+        );
         assert!(s.contains("if [[ \"$svc_enforce\" == \"1\" ]]; then"));
         assert!(s.contains("[[ \"$svc_enforce\" == \"1\" ]] && exit 1"));
         assert!(s.contains("service entry WITHOUT a spawn"));
