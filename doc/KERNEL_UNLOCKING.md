@@ -25681,7 +25681,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL4b — scheduler quantum / hardware deadline coupling | fixed and delivered (qualified `b5138562`; AArch64 core cells re-qualified on `8e7c12eb`) | the shipped quantum (timer interrupts per slice) WAS the hardware-deadline constant in each port's timer units, so a preempting tick came after 50M interrupts on x86_64 and 3.1M on AArch64; the true base gives no preempting tick within 1,024 interrupts. Separated into two documented constants per port, quantum about 100 ms; time-slice preemption is now live on x86_64 and AArch64 |
 | BL5a — reply-timeout retirement checker count/scope failures | fixed and delivered (qualified `605958f5`) | the RISC-V timeout-wins cell failed every correct boot: it tied its two commits to 2,652 resume-boundary deliveries (ordinary receive timeouts) and accepted only the legacy late-reply decline, while the live route refuses pre-lock. The AArch64 cell asserted both completion families as boot-wide singletons and passed only while no other caller completed. Both now account per oracle identity; the true-base RISC-V runner fails, the candidate passes, and base AArch64 rejects a correct boot in which tid 2 also settles |
 | BL5a-2 — a direct reply that beats a finite deadline leaves the registration armed | fixed and delivered (qualified `23da30f8` + `13797fa`) | the direct wake never retired the caller's reply-deadline token: it fired late on every x86_64 boot (`LostToTerminal`), and the stale handle captured the caller's next ORDINARY timed receive, which then never timed out — tid 2 settled 0 ordinary timeouts per boot on base x86_64 and AArch64, 34–39 repaired. The commit now takes the registration with the Runnable transition; every exit retires it or, on undo, restores it |
-| BL5a-2b — the reply-wins scenario is unreachable on all three ports | confirmed open (found in BL5a) | the oracle's reply-wins arm point and attestations live only on the broad NR 2 / NR 7 arms the split routes replaced; the oracle caller blocks untimed (`finite_deadline=0`), no gate is held and nothing races; on x86_64 the broad emitter is dead code and the runner stops at its build-literal gate |
+| BL5a-2b — the reply-wins scenario is unreachable on all three ports | fixed and delivered (qualified `5e734219`) | the scenario's arm point and attestations lived only on the broad NR 2 / NR 7 arms; the oracle now blocks with its own finite deadline, the split lane holds the causal gate before Phase C, and all three cells are derived from production events. All three retirement seals pass live for the first time since the split routes; with BL5a-2 reverted the cell reports `registration_outlived_reply` and fails |
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | to verify | |
 | BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
 | BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
@@ -26413,3 +26413,62 @@ from clean clones with a newer nightly (`1.101.0-nightly`, 2026-10-09) and QEMU 
   * hosted 6,016 passed; integration 292/292; census 9/9; ABI.
   * Freestanding warnings are identical to base (180 / 208 / 190 under the new toolchain).
   * The `13797fa` images are byte-identical to `23da30f8`.
+
+### BL5a-2b — the reply-wins oracle armed where its caller blocks, its cells derived from production
+
+**Defect (verified on `455c9520` and every later base).** The reply-wins scenario's arm point
+(`maybe_arm_reply_timeout_oracle`: deadline injection and the causal collector gate) and its
+reply-win attestations (`IPC_REPLY_WIN_RESERVE … outcome=ok`, `IPC_REPLY_BEATS_TIMEOUT_OK`) live on
+the broad receive and reply arms. No blocking receive has reached those arms since U9-RX3, and no
+reply since the direct route took NR 7 over. So:
+
+* the oracle caller blocked untimed (`finite_deadline=0`);
+* no gate was held and nothing raced;
+* all three reply-wins cells failed on every boot;
+* on x86_64 the linker dropped the dead emitter, so the runner stopped at its build-literal gate
+  before booting anything.
+
+**Repair (witness and checkers only).**
+
+* *Client.* It blocks with its own finite production deadline (`REPLY_WINS_PRODUCTION_TICKS`), and
+  the production owner arms the terminal and its token.
+* *Split blocking lane.* Strictly before Phase C arms the terminal, it holds the causal gate and
+  records the deadline in the production clock. It also records the oracle's registration where
+  production published it.
+* *Late-scan attestation.* It is judged on the deadline's own clock, and it states a fact about the
+  oracle's registration: retired by the reply, and never met by the drain as a late item. Otherwise
+  it reports `outcome=registration_outlived_reply`.
+* *Cells, on all three ports.* They require:
+  * the oracle's finite registration;
+  * exactly one production direct-NR7 commit of exactly its record;
+  * no settlement while the gate is held;
+  * the oracle-scoped causal chain, generation-exact.
+
+  The broad-only markers are no longer required. x86_64 gains the identity derivation, and its
+  build gate names the live gate literal.
+
+All new kernel items are behind the oracle feature.
+
+**Evidence.**
+
+* *Live.* All three retirement seals pass for the first time since the split routes: x86_64,
+  AArch64, and RISC-V with its reply-wins repeat. The RISC-V chain reads, in order: gate held,
+  terminal armed with `finite_deadline=1 deadline_reserved=1`, token armed, direct-NR7 commit of
+  record 1/17, userspace validation, gate released, late scan `reply_won`.
+* *Revert control.* With BL5a-2's retirement removed, the same witness meets the oracle's token as
+  a late item (`LostToTerminal`), reports `registration_outlived_reply`, and fails on RISC-V and
+  AArch64. The cell discriminates the production repair; it does not pass vacuously.
+
+**Qualification (frozen `5e734219`, base `a0bd13a`, fresh worktrees).**
+
+* *Live retirement runners on the frozen tree:*
+  * x86_64, AArch64 and RISC-V (with the reply-wins repeat): all three seals pass;
+  * RISC-V once more inside the qualification run: pass.
+* *Other live gates:* strict cores on all three ports (x86_64 timer-contract witness sealed); the
+  three server-death runners (ServerDies is untouched by the split-lane hook).
+* *Fixtures and suites:* both self-tests 16/16; hosted 6,020 passed; integration 292/292; census
+  9/9.
+* *Freestanding build:* warnings identical to base (180 / 208 / 190). The default kernels' `.text`
+  and `.data` are byte-identical to base on all three ports. `.rodata` differs by seven bytes on
+  each, which are the panic locations the inserted source lines shift.
+
