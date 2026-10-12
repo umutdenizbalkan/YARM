@@ -92,6 +92,14 @@ if [[ ! -s "$BOOT_LOG" ]]; then die "no boot log"; echo "STAGE_199_IPCCALL_REPLY
 NORM="$LOGDIR/boot.norm.log"; tr '\r' '\n' <"$BOOT_LOG" >"$NORM"
 count() { rg -a -c -F "$1" "$NORM" 2>/dev/null || echo 0; }
 have()  { rg -a -q -F "$1" "$NORM"; }
+# BL5d: the printk ring no longer skips a record another CPU is still writing; a record is lost
+# only when the ring laps it, and the drain then announces the loss in place
+# (`PRINTK_RECORDS_LOST`). So a one-shot line counted below that is absent WITHOUT an announcement
+# was never written — its transaction did not happen — and an announced loss is reported as
+# incomplete evidence, never mistaken for a missing transaction.
+ring_lost="$(count "PRINTK_RECORDS_LOST first_seq=")"
+[[ "$ring_lost" == "0" ]] \
+  || die "the printk ring announced ${ring_lost} lost-record run(s): this boot's one-shot evidence is incomplete ($(rg -a -m1 -o 'PRINTK_RECORDS_LOST [^\r]*' "$NORM"))"
 
 # ── Forward (request) direction must still hold (the sealed B2/B3 round trip). ────────────────
 [[ "$(count "X86_BSP_NR6_REQUEST_SENT cpu=0")" == "1" ]] || die "client NR6 sent != 1"
