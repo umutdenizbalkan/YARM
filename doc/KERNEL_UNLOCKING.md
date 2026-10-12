@@ -25671,7 +25671,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | Issue | Status | Evidence / prerequisite |
 |---|---|---|
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
-| BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | confirmed open — blocked on an ABI decision | see BL1 "Not changed"; every in-tree sender passes offset 0 |
+| BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | bounded — awaiting an owner ABI decision | see BL1 "Not changed". Every in-tree sender passes offset 0, so no current path is wrong in effect. Whether `offset` selects a page or byte offset into the backing (and how a non-page-aligned offset is refused) is an ABI choice the code cannot make; the repair is mechanical once it is made |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | fixed and delivered (qualified `1d7be22c`) | reproduced live with a new default-off witness: base stops the whole system at `IRQ1_UNKNOWN_SETTLED … strict=1`. A U-mode illegal instruction now decodes as the task's `UserInstructionFault` at `sepc`, and the RISC-V bridge settles it through BL2's route and the same terminal owners; init is reported and terminated, and a replacement runs |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
@@ -25684,7 +25684,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL5a-2b — the reply-wins scenario is unreachable on all three ports | fixed and delivered (qualified `5e734219`) | the scenario's arm point and attestations lived only on the broad NR 2 / NR 7 arms; the oracle now blocks with its own finite deadline, the split lane holds the causal gate before Phase C, and all three cells are derived from production events. All three retirement seals pass live for the first time since the split routes; with BL5a-2 reverted the cell reports `registration_outlived_reply` and fails |
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | fixed and delivered (qualified `bb9da703`) | init faults before its SpawnV5 chain, yet the cell required one entry of each of nine services: base strict fails every correct terminal-fault boot on the four families, and base non-strict accepts a service entry no spawn produced. The obligation is now derived from init's own spawn calls and enforced in every strictness; both mutations are rejected by name |
 | BL5b-2 — the x86_64 U9-RX4 reply-cap witness assumes the queued route | fixed and delivered (qualified `e3a3e1f3`) | with the timer-contract witness, tid 2's PM query reaches an idle PM in every terminal-fault boot and takes the direct NR 6 route, so all four strict families failed a correct transaction. The direct commit now attests its record and cap; the witness requires exactly one route to attest the record PM replies to and applies that route's obligations. Base also accepted a removed queued attestation and a substituted alias revoke |
-| BL5b-3 — the AArch64 U9-RX4 evaluator assumes the queued route | latent (found in BL5b-2) | AArch64 runs the direct request route, but no AArch64 cell has been observed sending tid 2's query direct; the attestation the x86_64 derivation uses is emitted there too |
+| BL5b-3 — the AArch64 U9-RX4 evaluator assumes the queued route | bounded (latent, no failing sample) | the evaluator would fail a correct boot only if tid 2's PM query took the direct NR 6 route on AArch64. Every AArch64 core and terminal-fault boot run in this backlog (more than twenty) queued it. Since BL5b-2 the direct route attests itself (`IPCCALL_DIRECT_SPLIT_OK`) on every port, so the x86_64 derivation ports unchanged the first time a direct sample exists. Until then it fails closed (a missing one-shot), never open |
 | BL5c — strict-core runners boot artifacts lacking required witness features | fixed and delivered (qualified `876869ed`) | a strict run booted whatever its paths held: an x86_64 default artifact ran 60 s and failed `witness absent`, and base strict passed a RISC-V oracle kernel copied over the recorded one and an x86_64 kernel/initramfs pair from two builds. The manifest records role and features per artifact; each core smoke binds both artifacts and the mode's required features before booting and a strict run refuses by name; the CI strict job and the final seal's RUN_A build the witness artifact |
 | BL5d — SMP log loss failing one-shot asynchronous checks | fixed and delivered (qualified `0346b8f6`) | the printk drain skipped a slot another CPU had reserved but not finished writing and advanced past it, so the record was never drained; the counter that should have shown it was never incremented. Base failed a completed cross-CPU request (record sealed 7/7, two one-shot lines lost). The drain now holds an in-flight record for its writer's own flush and counts and announces only genuine overwrite losses (`PRINTK_RECORDS_LOST`); the SMP graders report an announced loss as incomplete evidence |
 | BL5b-4 — the RISC-V terminal-fault cell exempts its required markers instead of deriving them | fixed and delivered (qualified `d953f8d9`) | the cell now owes the eleven spawn-chain markers and the spawn census zero, given init's own fault and no SpawnV5 call, and keeps every other required marker; base accepted five mutated terminal-fault boots (a lost kernel marker, a lost cross-arch marker, an unspawned service, a spawn before the fault, a stray spawn dispatch) that the candidate rejects by name |
@@ -25693,7 +25693,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL6c — AArch64 timer5 witness capture is stopped early by the core smoke | fixed and delivered (qualified `a8e1161e`) | the runner now stops the AArch64 boot on the witness's own summary line instead of the first terminal idle; candidate 4/4, base 3/4 (base's failing log ends ~850 lines before the summary, and its passes end only 178–1,054 lines after it) |
 | BL6d — RISC-V UART idle-origin items race a deadline dispatch | bounded (found in BL4a qualification) | after BL4a the idle tick dispatches the core supervisor whose one- to three-tick receive deadline it expires; a host byte delivered two or three ticks after injection lands on it (`idle_origin=3 user_origin=5`). With the quiet-window acknowledgement: 7 of 8 boots pass (31 of 32 idle items). Base hides it (the tick stranded the supervisor). Removing it needs the kernel to hold the source until a quiet idle boundary |
 | BL6e — the x86_64 and AArch64 overtaken-deferral witnesses assume an unconditional futex park | fixed and delivered (qualified `6d537bc0`) | both user programs waited on a word nobody wrote; since BL3b the kernel parks only while the word holds `expected`, so no round ever parked and neither witness sealed. Each wait now stores its expected value first; both seal live 2/2 with four overtaken rounds, base fails on both ports |
-| BL6f — the x86_64 and RISC-V terminal-fault witnesses still assume a replacement exists | latent (found in BL4b qualification) | the AArch64 checker was corrected (see BL4b); the other two still require the drain after init's fault to select a replacement and would misreport a genuinely empty queue. They pass today; no empty-queue sample exists to derive their exact chain from |
+| BL6f — the x86_64 and RISC-V terminal-fault witnesses still assume a replacement exists | bounded (latent, no failing sample) | both cells require the drain after init's fault to select a replacement. Every terminal-fault boot run in this backlog (x86_64 four families, RISC-V read, fetch and illegal) had one, because the supervisor is runnable when init faults. A genuinely empty queue would fail by name (`no replacement … selected`), never pass vacuously. Deriving its exact idle chain needs an empty-queue sample, which no current profile produces |
 
 ### BL1 — multi-page shared-region mapping
 
@@ -27028,3 +27028,37 @@ the in-lock attestation BL6a removes, and it now requires the idle cell to forbi
 * *Suites:* fmt clean; hosted 6,040 passed; integration 300/300; census 9/9.
 * *Freestanding build:* warnings identical to base, and the kernels are byte-identical to base on
   all three ports.
+
+### Backlog closure — state at the end of the BL5 / BL6 programme
+
+Every row of the table above is resolved or explicitly bounded.
+
+* *Fixed and delivered:* BL1, BL2, BL2-a, BL3a–c, BL4a–b, BL5a, BL5a-2, BL5a-2b, BL5b, BL5b-2, BL5b-4,
+  BL5c, BL5d, BL6a, BL6c, BL6e. Each has its own section above: defect, repair, evidence, and the
+  frozen commit it was qualified on.
+* *Bounded with a stated condition:*
+  * BL1-a: awaiting an owner ABI decision;
+  * BL5b-3: latent, no failing sample;
+  * BL6b and BL6a's premise: boot-order dependent, now named;
+  * BL6d: needs the kernel to hold a source until a quiet idle boundary;
+  * BL6f: latent, no failing sample.
+* *U9 stays closed:* production census `with_cpu=0`, `with_broad=0`, with the three wrapper
+  definitions counted separately (`tests/broad_lock_census_guard.rs`, 9/9 on every delivery).
+
+**Remaining feature roadmap.** This is §0.3, unchanged by this backlog, which repaired correctness
+and checker defects rather than advancing a canonical stage.
+
+| Phase | Stages | Status |
+|---|---|---|
+| Phase 2 — IPC | 199C, 199E | delivered / closed |
+| | 199D (call / reply lifecycle) | open: hosted foundation and knob-gated live proof |
+| | 199F (notifications), 199G (IPC seal) | open |
+| Phase 3 — capabilities | 200A–200D | open; partial foundations for 200A–200C |
+| Phase 4 — VM | 201A–201G | open; 201B narrow foundation, 201F x86_64 mechanism landed |
+| Phase 5 — task lifecycle | 202A–202F | open; 202D partial |
+| Phase 6 — timer, IRQ, scheduler | 203A–203D | open; 203C partial, 203D x86_64 live-proven and knob-gated |
+| Phase 7 — remove the monolithic path | 204A | complete (the census) |
+| | 204B–204E (decompose `KernelState`, remove fallbacks and scaffolding, delete the runtime `SpinLock`) | open |
+| Phase 8 — full-unlock seal | 205A–205D (syscall matrix, fault-injection matrix, concurrency torture, cross-architecture seal) | open |
+
+Not started here, by instruction: production notifications (199F), broader SMP, hardware bring-up.
