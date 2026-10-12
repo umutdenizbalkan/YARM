@@ -25690,7 +25690,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL5b-4 — the RISC-V terminal-fault cell exempts its required markers instead of deriving them | confirmed open (found while drafting BL2-a) | with `TERMINAL_FAULT_ORACLE=1` the RISC-V core smoke skips EVERY required marker and the spawn census, including kernel boot, timer, PLIC and cross-arch markers that do not depend on init's spawn chain; the x86_64 cell derives its obligation since BL5b |
 | BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate. The checker requires broad-path markers the split NR 9 route no longer emits (`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, `…DISPATCH_DEFER_BEGIN`, `…HANDLER_BYPASS_BEGIN/DONE`, `…DISPATCH_DONE result=idle`), while the kernel's own idle chain (`…NO_INCOMING`, `…POST_LOCK_IDLE_*`, `…IDLE_ORACLE_DONE result=ok`) is present; in one base boot another task was runnable, so the cell's no-incoming premise is also boot-order dependent |
 | BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open — intermittent | failed on true base `c44e9b46` (2/2) and on the first BL4a freeze `9b5838c4`; passed on `e2f4e52b` and `53a5b112` (`RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok`), so boot-order dependent, not closed by BL4a |
-| BL6c — AArch64 timer5 witness capture is stopped early by the core smoke | confirmed open (found in BL4a qualification) | `qemu-aarch64-core-smoke.sh` stops QEMU 2 s after the FIRST `SCHED_ENTER_IDLE_HLT`; the timer5 summary arrives 6,962 lines later on base and candidate alike, so whether it is captured is host speed alone: true base `af24e403` 1 pass / 3 fail, candidate 2 pass / 2 fail. The runner must stop on the witness's own completion instead |
+| BL6c — AArch64 timer5 witness capture is stopped early by the core smoke | fixed and delivered (qualified `a8e1161e`) | the runner now stops the AArch64 boot on the witness's own summary line instead of the first terminal idle; candidate 4/4, base 3/4 (base's failing log ends ~850 lines before the summary, and its passes end only 178–1,054 lines after it) |
 | BL6d — RISC-V UART idle-origin items race a deadline dispatch | bounded (found in BL4a qualification) | after BL4a the idle tick dispatches the core supervisor whose one- to three-tick receive deadline it expires; a host byte delivered two or three ticks after injection lands on it (`idle_origin=3 user_origin=5`). With the quiet-window acknowledgement: 7 of 8 boots pass (31 of 32 idle items). Base hides it (the tick stranded the supervisor). Removing it needs the kernel to hold the source until a quiet idle boundary |
 | BL6e — the x86_64 and AArch64 overtaken-deferral witnesses assume an unconditional futex park | fixed and delivered (qualified `6d537bc0`) | both user programs waited on a word nobody wrote; since BL3b the kernel parks only while the word holds `expected`, so no round ever parked and neither witness sealed. Each wait now stores its expected value first; both seal live 2/2 with four overtaken rounds, base fails on both ports |
 | BL6f — the x86_64 and RISC-V terminal-fault witnesses still assume a replacement exists | latent (found in BL4b qualification) | the AArch64 checker was corrected (see BL4b); the other two still require the drain after init's fault to select a replacement and would misreport a genuinely empty queue. They pass today; no empty-queue sample exists to derive their exact chain from |
@@ -26798,4 +26798,38 @@ programs are built only with `x86-overtaken-witness` / `aarch64-overtaken-witnes
 * *Live:* as above.
 * *Suites:* fmt clean; hosted 6,030 passed; integration 300/300; census 9/9.
 * *Freestanding build:* warnings identical to base (180 / 208 / 190). The default kernels are
+  byte-identical to base on all three ports.
+
+### BL6c — the AArch64 timer5 witness boot stops on the witness's own summary
+
+**Defect (verified on `34b5ae4f`).** The timer5 runner boots each port through its core smoke. The
+AArch64 smoke stops QEMU 2 s after its terminal-idle marker, by default the first
+`SCHED_ENTER_IDLE_HLT`, about line 31,000. Init's timer5 cell emits its one summary line about 7,000
+lines later. Whether the summary was captured therefore depended on host speed alone.
+
+* *Fresh base runs:* one of four failed `expected exactly one witness summary (got 0)`; its log
+  ended at line 37,547, before the summary.
+* In the three base passes the log ended 178 to 1,054 lines after the summary.
+
+**Repair (runner only).** The AArch64 arm hands its core smoke the summary line itself as the
+terminal marker (`TERMINAL_IDLE_MARKER='TIMER5_IDLE_RETURN_WITNESS rounds='`). The smoke already
+honours the override.
+
+* Init's cell emits the line once, on either outcome.
+* A cell that never completes still meets the smoke's own hang bound and is graded as missing.
+* The x86_64 and RISC-V arms are unchanged.
+* Guard: `bl6c_timer5_boot_stops_on_its_own_summary`.
+
+**Evidence (fresh artifacts, same host, interleaved).**
+
+* *Candidate AArch64 4/4:* every log runs past its summary to the stop, ending 5,000 to 6,200
+  lines after it.
+* *Base 3/4*, as above.
+* The candidate's x86_64 and RISC-V timer5 runs pass unchanged.
+
+**Qualification (frozen `a8e1161e`, base `34b5ae4f`).**
+
+* *Live:* as above.
+* *Suites:* fmt clean; hosted 6,031 passed; integration 300/300; census 9/9.
+* *Freestanding build:* warnings identical to base (180 / 208 / 190), and the kernels are
   byte-identical to base on all three ports.
