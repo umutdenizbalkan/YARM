@@ -25692,7 +25692,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open — intermittent | failed on true base `c44e9b46` (2/2) and on the first BL4a freeze `9b5838c4`; passed on `e2f4e52b` and `53a5b112` (`RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok`), so boot-order dependent, not closed by BL4a |
 | BL6c — AArch64 timer5 witness capture is stopped early by the core smoke | confirmed open (found in BL4a qualification) | `qemu-aarch64-core-smoke.sh` stops QEMU 2 s after the FIRST `SCHED_ENTER_IDLE_HLT`; the timer5 summary arrives 6,962 lines later on base and candidate alike, so whether it is captured is host speed alone: true base `af24e403` 1 pass / 3 fail, candidate 2 pass / 2 fail. The runner must stop on the witness's own completion instead |
 | BL6d — RISC-V UART idle-origin items race a deadline dispatch | bounded (found in BL4a qualification) | after BL4a the idle tick dispatches the core supervisor whose one- to three-tick receive deadline it expires; a host byte delivered two or three ticks after injection lands on it (`idle_origin=3 user_origin=5`). With the quiet-window acknowledgement: 7 of 8 boots pass (31 of 32 idle items). Base hides it (the tick stranded the supervisor). Removing it needs the kernel to hold the source until a quiet idle boundary |
-| BL6e — the x86_64 and AArch64 overtaken-deferral witnesses assume an unconditional futex park | confirmed open (found in BL4b qualification) | both user programs say `FutexWait(addr, expected = observed = r15/x20): the kernel parks unconditionally`; since BL3b the kernel parks only while the word still holds `expected`, so every W wait returns at once (`not_blocked`, 336,852 times in one boot), K never wakes anyone (`k_woke=0`), and the DONE park that emits the sealed summary never happens. Fails identically on true base `d3012203` (both ports). The programs must store the expected value before waiting |
+| BL6e — the x86_64 and AArch64 overtaken-deferral witnesses assume an unconditional futex park | fixed and delivered (qualified `6d537bc0`) | both user programs waited on a word nobody wrote; since BL3b the kernel parks only while the word holds `expected`, so no round ever parked and neither witness sealed. Each wait now stores its expected value first; both seal live 2/2 with four overtaken rounds, base fails on both ports |
 | BL6f — the x86_64 and RISC-V terminal-fault witnesses still assume a replacement exists | latent (found in BL4b qualification) | the AArch64 checker was corrected (see BL4b); the other two still require the drain after init's fault to select a replacement and would misreport a genuinely empty queue. They pass today; no empty-queue sample exists to derive their exact chain from |
 
 ### BL1 — multi-page shared-region mapping
@@ -26763,3 +26763,39 @@ own flush then began beyond its record. Nothing drained that sequence number aga
   (2 tests); census 9/9.
 * *Freestanding build:* warnings identical to base (180 / 208 / 190, same classes). The kernel
   images differ, by the drain.
+
+### BL6e — the overtaken-deferral witness programs store the value they wait on
+
+**Defect (verified on `9aaf685c`).** The x86_64 and AArch64 witness programs
+(`overtaken_witness.S`) issue `FutexWait(addr, expected = observed = round)` on mailbox words that
+nothing ever writes. Their comment said the kernel parks unconditionally. Since BL3b the kernel parks
+only while the 32-bit word still holds `expected`, so:
+
+* every W wait returned at once (`not_blocked`);
+* K never woke anyone;
+* the `DONE` park that emits the sealed summary never happened.
+
+Both runners fail `no complete intact OVT_SUM pass` on every boot.
+
+**Repair (witness programs only).** The one wait macro per port (`OVT_WAIT_ON`, `OWAIT`) stores
+`expected` into the word before the syscall: `mov dword ptr [rdi], r15d` on x86_64, `str w20, [x0]`
+on AArch64. It covers the round waits and the `DONE` / `FAIL` / `KPARK` parks alike. Nothing else
+writes these words, and only K's `FutexWake` on `WAIT` ends a park. The kernel is unchanged; the
+programs are built only with `x86-overtaken-witness` / `aarch64-overtaken-witness`.
+
+**Evidence.**
+
+* *Candidate:*
+  * x86_64 2/2: each sealed four rounds, all overtaken and switched to W, three synchronized and one
+    natural, no timeouts; `k_woke=4 w_round_ok=4`.
+  * AArch64 2/2: likewise four overtaken rounds each.
+* *Base:* both ports fail.
+* *Guard:* `bl6e_overtaken_witness_stores_what_it_waits_on` pins the store, before the arguments and
+  the trap, in the only wait site per port.
+
+**Qualification (frozen `6d537bc0`, base `9aaf685c`).**
+
+* *Live:* as above.
+* *Suites:* fmt clean; hosted 6,030 passed; integration 300/300; census 9/9.
+* *Freestanding build:* warnings identical to base (180 / 208 / 190). The default kernels are
+  byte-identical to base on all three ports.
