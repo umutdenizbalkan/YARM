@@ -3,6 +3,32 @@
 
 use super::*;
 
+/// SHARED-REGION-LIFETIME1 — the shared-region oracle object's id, published once at provisioning
+/// so the live lifetime witness can read that ONE object's counters back from the kernel's own
+/// accounting. `u64::MAX` until provisioned. Witness-only: compiled solely into the oracle kernel
+/// feature, and it only reports — no counter is read from it.
+#[cfg(all(feature = "shared-region-direct-oracle", not(feature = "hosted-dev")))]
+pub(crate) static SHARED_REGION_ORACLE_OBJECT_ID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Report the oracle object's counters after `op` changed them at `phys`. A no-op for every other
+/// object and in every build without the oracle feature.
+#[inline]
+pub(crate) fn trace_oracle_object_refs(_object: &MemoryObject, _op: &str, _phys: PhysAddr) {
+    #[cfg(all(feature = "shared-region-direct-oracle", not(feature = "hosted-dev")))]
+    if _object.id == SHARED_REGION_ORACLE_OBJECT_ID.load(core::sync::atomic::Ordering::Relaxed) {
+        crate::yarm_log!(
+            "SHARED_REGION_ORACLE_REFS op={} obj_id={} off=0x{:x} cap={} map={} pin={}",
+            _op,
+            _object.id,
+            _phys.0.wrapping_sub(_object.phys.0),
+            _object.cap_refcount,
+            _object.map_refcount,
+            _object.pin_refcount
+        );
+    }
+}
+
 /// 199G-C §2 — proof that ONE transfer-object pin was acquired, and the authority to release
 /// exactly that one.
 ///
@@ -192,30 +218,78 @@ impl KernelState {
         });
     }
 
+    /// SHARED-REGION-LIFETIME1 — THE owner of a mapped frame: the slot of the live
+    /// ALLOCATOR-OWNED MemoryObject whose extent `[phys, phys + len)` contains the frame.
+    ///
+    /// Every mapping reference, every displaced-page hold and every reclaim-by-address asks
+    /// this, and nothing else, so the acquire, the release and the reclaim of one page always
+    /// name the same object.
+    ///
+    /// * **Containment, not the base address.** A mapping may name any page of an object — a
+    ///   shared-region selection starts wherever its object-relative offset says, and a
+    ///   multi-page grant's pages 1.. are interior at offset 0 too. Before this, every owner asked
+    ///   `object.phys == phys`, so an interior page's mapping took no reference, a teardown
+    ///   freed it as if nobody owned it, and its displacement could not be held.
+    /// * **Unique.** An allocator-owned extent is one `alloc_contiguous` run, and the frame
+    ///   allocator never issues a frame that is still charged to a live extent, so live
+    ///   allocator-owned extents are disjoint and at most one contains a frame. Object ids are
+    ///   never reused (`next_memory_object_id` only advances), so a hold that names an id can
+    ///   never be mistaken for a later object at the same address.
+    /// * **Borrowed backing is not owned here.** An initramfs file slice borrows the boot
+    ///   initrd: nothing frees it, so no mapping needs a reference to keep it, and the address
+    ///   alone cannot name ONE slice — two slices over the same file, or adjacent files that share
+    ///   a page, overlap, and the zero-copy loader maps initrd pages that may predate any slice
+    ///   over them. A borrowed slice's registry slot therefore lives by its capabilities and pins
+    ///   only.
+    pub(crate) fn frame_owner_slot_locked(
+        memory: &MemorySubsystem,
+        phys: PhysAddr,
+    ) -> Option<usize> {
+        memory.memory_objects.iter().position(|entry| {
+            entry.is_some_and(|object| {
+                matches!(
+                    object.kind.backing(),
+                    crate::kernel::boot::MemoryBacking::AllocatorOwned
+                ) && Self::object_extent_contains(&object, phys)
+            })
+        })
+    }
+
+    /// Whether `phys` lies inside `object`'s backing extent.
+    pub(crate) fn object_extent_contains(object: &MemoryObject, phys: PhysAddr) -> bool {
+        phys.0
+            .checked_sub(object.phys.0)
+            .is_some_and(|off| off < object.len as u64)
+    }
+
+    /// Whether ANY live object — allocator-owned or borrowed — describes the frame at `phys`.
+    /// Teardown's "nobody owns this, return it to the allocator" decision asks this: a frame
+    /// inside any object's extent belongs to that object's lifecycle, never to the drained
+    /// address space.
+    pub(crate) fn frame_described_by_object_locked(
+        memory: &MemorySubsystem,
+        phys: PhysAddr,
+    ) -> bool {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .any(|object| Self::object_extent_contains(object, phys))
+    }
+
     pub(crate) fn note_mapping_inserted(&mut self, phys: PhysAddr) {
-        self.with_memory_state_mut(|memory| {
-            if let Some(slot) = memory
-                .memory_objects
-                .iter()
-                .position(|entry| entry.is_some_and(|mem| mem.phys == phys))
-                && let Some(memory_object) = memory.memory_objects[slot].as_mut()
-            {
-                memory_object.map_refcount = memory_object.map_refcount.saturating_add(1);
-            }
-        });
+        self.with_memory_state_mut(|memory| Self::note_mapping_inserted_locked(memory, phys));
     }
 
     /// Stage 198E3B2A: `&mut MemorySubsystem` sibling of [`Self::note_mapping_inserted`] for use
-    /// inside `SharedKernel::with_memory_split_mut` (rank 6 only). Byte-identical semantics;
-    /// `note_mapping_inserted` is left unmodified.
+    /// inside `SharedKernel::with_memory_split_mut` (rank 6 only). SHARED-REGION-LIFETIME1: one
+    /// reference per mapped PAGE, taken on the page's owner ([`Self::frame_owner_slot_locked`]).
     pub(crate) fn note_mapping_inserted_locked(memory: &mut MemorySubsystem, phys: PhysAddr) {
-        if let Some(slot) = memory
-            .memory_objects
-            .iter()
-            .position(|entry| entry.is_some_and(|mem| mem.phys == phys))
+        if let Some(slot) = Self::frame_owner_slot_locked(memory, phys)
             && let Some(memory_object) = memory.memory_objects[slot].as_mut()
         {
             memory_object.map_refcount = memory_object.map_refcount.saturating_add(1);
+            trace_oracle_object_refs(memory_object, "map", phys);
         }
     }
 
@@ -432,30 +506,19 @@ impl KernelState {
     }
 
     pub(crate) fn note_mapping_removed(&mut self, phys: PhysAddr) {
-        self.with_memory_state_mut(|memory| {
-            if let Some(slot) = memory
-                .memory_objects
-                .iter()
-                .position(|entry| entry.is_some_and(|mem| mem.phys == phys))
-                && let Some(memory_object) = memory.memory_objects[slot].as_mut()
-            {
-                memory_object.map_refcount = memory_object.map_refcount.saturating_sub(1);
-            }
-        });
+        self.with_memory_state_mut(|memory| Self::note_mapping_removed_locked(memory, phys));
     }
 
-    /// Stage 114 / D-NEXT-2: byte-identical sibling of [`Self::note_mapping_removed`]
-    /// taking `&mut MemorySubsystem` directly for use inside
-    /// `SharedKernel::with_memory_split_mut`'s closure. `note_mapping_removed`
-    /// is left unmodified.
+    /// Stage 114 / D-NEXT-2: sibling of [`Self::note_mapping_removed`] taking
+    /// `&mut MemorySubsystem` directly for use inside `SharedKernel::with_memory_split_mut`'s
+    /// closure. SHARED-REGION-LIFETIME1: returns exactly the reference
+    /// [`Self::note_mapping_inserted_locked`] took for this page, on the same owner.
     pub(crate) fn note_mapping_removed_locked(memory: &mut MemorySubsystem, phys: PhysAddr) {
-        if let Some(slot) = memory
-            .memory_objects
-            .iter()
-            .position(|entry| entry.is_some_and(|mem| mem.phys == phys))
+        if let Some(slot) = Self::frame_owner_slot_locked(memory, phys)
             && let Some(memory_object) = memory.memory_objects[slot].as_mut()
         {
             memory_object.map_refcount = memory_object.map_refcount.saturating_sub(1);
+            trace_oracle_object_refs(memory_object, "unmap", phys);
         }
     }
 
@@ -483,38 +546,21 @@ impl KernelState {
     }
 
     pub(crate) fn reclaim_memory_object_for_phys(&mut self, phys: PhysAddr) {
-        let maybe_id = self.with_memory_state(|memory| {
-            memory
-                .memory_objects
-                .iter()
-                .flatten()
-                .find(|entry| entry.phys == phys)
-                .map(|obj| obj.id)
+        self.with_memory_state_mut(|memory| {
+            Self::reclaim_memory_object_for_phys_locked(memory, phys);
         });
-        if let Some(id) = maybe_id {
-            self.reclaim_memory_object_if_unreferenced(CapObject::MemoryObject { id });
-        }
     }
 
-    /// Stage 114 / D-NEXT-2: sibling of [`Self::reclaim_memory_object_for_phys`]
-    /// taking `&mut MemorySubsystem` directly for use inside
-    /// `SharedKernel::with_memory_split_mut`'s closure. The global-lock version
-    /// composes find-by-phys → id → `reclaim_memory_object_if_unreferenced`
-    /// (find-by-id → slot) as three separate `with_memory_state(_mut)` cycles;
-    /// since this helper already holds the one memory-domain lock acquisition
-    /// the seam took, it fuses straight to a single find-by-phys → mutate pass.
-    /// Same refcount/free-frame semantics, strictly fewer redundant scans — not
-    /// a behavior change. `reclaim_memory_object_for_phys` itself is left
-    /// unmodified.
+    /// Stage 114 / D-NEXT-2: sibling of [`Self::reclaim_memory_object_for_phys`] taking
+    /// `&mut MemorySubsystem` directly for use inside `SharedKernel::with_memory_split_mut`'s
+    /// closure: reclaim the page's owner ([`Self::frame_owner_slot_locked`]) if it is
+    /// unreferenced — its WHOLE extent, once, through the backing-aware release. A borrowed
+    /// frame has no owner here and is never reclaimed by address.
     pub(crate) fn reclaim_memory_object_for_phys_locked(
         memory: &mut MemorySubsystem,
         phys: PhysAddr,
     ) {
-        let Some(slot_index) = memory
-            .memory_objects
-            .iter()
-            .position(|entry| entry.is_some_and(|mem| mem.phys == phys))
-        else {
+        let Some(slot_index) = Self::frame_owner_slot_locked(memory, phys) else {
             return;
         };
         let Some(memory_object) = memory.memory_objects[slot_index] else {

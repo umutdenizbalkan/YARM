@@ -225,12 +225,10 @@ pub(crate) fn release_unreferenced_user_frame_locked(
     memory: &mut MemorySubsystem,
     phys: PhysAddr,
 ) {
-    let described_by_memory_object = memory
-        .memory_objects
-        .iter()
-        .flatten()
-        .any(|object| object.phys == phys);
-    if described_by_memory_object {
+    // SHARED-REGION-LIFETIME1: ANY page inside an object's extent is that object's, not the
+    // drained address space's. Asking only whether an object STARTS here returned every interior
+    // page of a live multi-page object to the allocator.
+    if KernelState::frame_described_by_object_locked(memory, phys) {
         return;
     }
     if vm.any_mapping_for_phys(phys) {
@@ -304,6 +302,40 @@ pub(crate) fn map_user_page_in_asid_raw_locked(
     }
     KernelState::note_mapping_inserted_locked(memory, mapping.phys);
     Ok(old)
+}
+
+/// SHARED-REGION-LIFETIME1 — install one page into an address space that may be RESIDENT
+/// elsewhere, holding whatever it displaces.
+///
+/// [`map_user_page_in_asid_raw_locked`] reclaims a displaced page's object at once, which is only
+/// sound where no other CPU can hold a translation to it — an address space nobody has run yet.
+/// A receive maps into a live address space, so here the displaced page's mapping reference is
+/// converted into an identity hold ([`crate::kernel::syscall::vm::retire_mapping_to_hold_locked`])
+/// and returned with the displaced mapping: the caller completes the invalidation with no lock
+/// held and only then settles the hold, or keeps it if the invalidation never completes.
+pub(crate) fn map_user_page_holding_displaced_locked(
+    vm: &mut AddressSpaceManager,
+    memory: &mut MemorySubsystem,
+    asid: Asid,
+    virt: VirtAddr,
+    mapping: Mapping,
+) -> Result<Option<(Mapping, Option<u64>)>, KernelError> {
+    let old = vm
+        .get_mut(asid)
+        .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+        .map_page(virt, mapping)
+        .map_err(KernelError::Vm)?;
+    let displaced = old.map(|old_mapping| {
+        KernelState::clear_cow_page_locked(memory, asid, virt);
+        let hold =
+            crate::kernel::syscall::vm::retire_mapping_to_hold_locked(memory, old_mapping.phys);
+        (old_mapping, hold)
+    });
+    if mapping.flags.write {
+        KernelState::clear_cow_page_locked(memory, asid, virt);
+    }
+    KernelState::note_mapping_inserted_locked(memory, mapping.phys);
+    Ok(displaced)
 }
 
 /// Resolve a user virtual address to its physical address, checking the access is permitted.

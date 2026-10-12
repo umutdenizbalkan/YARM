@@ -8231,23 +8231,34 @@ impl SharedKernel {
         };
 
         // (8) rank 6 — the refcount transition and the COW-mark clear, in ONE acquisition.
+        // SHARED-REGION-LIFETIME1: the old frame's reference becomes an identity hold here, so
+        // its owner — any page of it, interior pages included — survives until (10).
         let old_phys = old_entry.map(|m| m.phys).unwrap_or(old_mapping.phys);
-        self.with_memory_split_mut(|memory| {
-            if old_entry.is_some() {
-                KS::note_mapping_removed_locked(memory, old_phys);
-            }
+        let hold = self.with_memory_split_mut(|memory| {
+            let hold = if old_entry.is_some() {
+                crate::kernel::syscall::vm::retire_mapping_to_hold_locked(memory, old_phys)
+            } else {
+                None
+            };
             KS::clear_cow_page_locked(memory, asid, page);
             KS::note_mapping_inserted_locked(memory, new_phys);
+            hold
         });
 
         // (9) The shootdown, with NO domain lock held.
         let shootdown_acked = self.complete_unmap_shootdown_split(asid, page);
 
-        // (10) rank 6 — reclaim the OLD frame, only after the acknowledgement. Guarded, so the
-        // ordinary COW case (the frame is still mapped elsewhere) is a no-op.
-        if old_entry.is_some() && shootdown_acked {
+        // (10) rank 6 — settle the OLD frame's hold, only after the acknowledgement: release it
+        // and reclaim its object if that was the last reference, by identity. Guarded, so the
+        // ordinary COW case (the frame is still mapped elsewhere) reclaims nothing; an
+        // unacknowledged shootdown keeps the hold and the backing.
+        if let Some(object_id) = hold
+            && shootdown_acked
+        {
             self.with_memory_split_mut(|memory| {
-                KS::reclaim_memory_object_for_phys_locked(memory, old_phys)
+                crate::kernel::syscall::vm::settle_displaced_hold_locked(
+                    memory, object_id, old_phys,
+                )
             });
         }
 
@@ -10034,20 +10045,61 @@ impl SharedKernel {
         })
     }
 
-    /// rank 5 → rank 6 — install one page, through the SAME rank-local body the broad
-    /// `map_user_page_in_asid_raw` uses.
+    /// rank 5 → rank 6 — install one page into a LIVE address space (the receive paths).
+    ///
+    /// SHARED-REGION-LIFETIME1: a page this install displaces keeps its backing until its
+    /// invalidation completes. The install converts the displaced page's mapping reference into
+    /// an identity hold ([`crate::kernel::boot::vm_image_locked::map_user_page_holding_displaced_locked`]);
+    /// with no lock held, the requester-stating shootdown then retires every remote translation,
+    /// and only an acknowledged shootdown settles the hold.
     pub(crate) fn map_user_page_raw_split(
         &self,
+        requester: CpuId,
         asid: crate::kernel::vm::Asid,
         virt: crate::kernel::vm::VirtAddr,
         mapping: crate::kernel::vm::Mapping,
     ) -> bool {
-        self.with_vm_then_memory_split_mut(|vm, memory| {
-            crate::kernel::boot::vm_image_locked::map_user_page_in_asid_raw_locked(
+        let installed = self.with_vm_then_memory_split_mut(|vm, memory| {
+            crate::kernel::boot::vm_image_locked::map_user_page_holding_displaced_locked(
                 vm, memory, asid, virt, mapping,
             )
-            .is_ok()
-        })
+        });
+        match installed {
+            Ok(displaced) => {
+                if let Some((old, hold)) = displaced {
+                    let acked = self.complete_unmap_shootdown_from_split(requester, asid, virt);
+                    self.settle_displaced_after_invalidation_split(hold, old.phys, acked);
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// rank 6 — SHARED-REGION-LIFETIME1: the one settlement of a displaced page's hold. An
+    /// acknowledged invalidation releases the hold and reclaims the held object if that was its
+    /// last reference, by identity; an unacknowledged one keeps the hold, so the backing stays
+    /// quarantined instead of being reissued while a remote translation may survive.
+    pub(crate) fn settle_displaced_after_invalidation_split(
+        &self,
+        hold: Option<u64>,
+        phys: crate::kernel::vm::PhysAddr,
+        acknowledged: bool,
+    ) {
+        let Some(object_id) = hold else {
+            return;
+        };
+        if acknowledged {
+            self.with_memory_split_mut(|memory| {
+                crate::kernel::syscall::vm::settle_displaced_hold_locked(memory, object_id, phys)
+            });
+        } else {
+            crate::yarm_log!(
+                "VM_DISPLACED_HOLD_RETAINED object={} phys=0x{:x} reason=invalidation_incomplete",
+                object_id,
+                phys.0
+            );
+        }
     }
 
     /// rank 3 — register the active-transfer entry, through the existing locked body.
@@ -14961,16 +15013,29 @@ impl SharedKernel {
     }
 
     /// rank 6: apply the map follow-up AFTER the VM lock dropped (map_refcount bookkeeping). A fresh
-    /// shared-region page has no replaced mapping; a replaced page's old frame is accounted/reclaimed
-    /// here (memory rank 6 only — never under the VM lock).
-    pub(crate) fn sr_apply_map_followup_split(&self, follow: SharedRegionMapFollowup) {
-        self.with_memory_split_mut(|m| {
-            if let Some(old) = follow.replaced {
-                KernelState::note_mapping_removed_locked(m, old.phys);
-                KernelState::reclaim_memory_object_for_phys_locked(m, old.phys);
-            }
+    /// shared-region page has no replaced mapping. SHARED-REGION-LIFETIME1: a replaced page's
+    /// reference becomes an identity hold here (memory rank 6 only — never under the VM lock), the
+    /// shootdown then runs with no lock held, and only an acknowledged one settles the hold.
+    pub(crate) fn sr_apply_map_followup_split(
+        &self,
+        asid: crate::kernel::vm::Asid,
+        virt: crate::kernel::vm::VirtAddr,
+        follow: SharedRegionMapFollowup,
+    ) {
+        let displaced = self.with_memory_split_mut(|m| {
+            let displaced = follow.replaced.map(|old| {
+                (
+                    old.phys,
+                    crate::kernel::syscall::vm::retire_mapping_to_hold_locked(m, old.phys),
+                )
+            });
             KernelState::note_mapping_inserted_locked(m, follow.inserted_phys);
+            displaced
         });
+        if let Some((phys, hold)) = displaced {
+            let acked = self.complete_unmap_shootdown_split(asid, virt);
+            self.settle_displaced_after_invalidation_split(hold, phys, acked);
+        }
     }
 
     /// U9-D3 §5 — the shootdown target set for `asid`, computed with NO broad lock.
@@ -15197,9 +15262,13 @@ impl SharedKernel {
                     .and_then(|a| a.unmap_page(VirtAddr(va as u64)).ok().flatten())
             });
             if let Some(mapping) = removed {
-                // Phase A' (rank 6): map_refcount-- (mirrors `unmap_page_phase1`'s note_mapping_removed).
-                self.with_memory_split_mut(|m| {
-                    KernelState::note_mapping_removed_locked(m, mapping.phys)
+                // Phase A' (rank 6): map_refcount-- (mirrors `unmap_page_phase1`'s
+                // note_mapping_removed). SHARED-REGION-LIFETIME1: the reference is CONVERTED into
+                // an identity hold in the same acquisition, so the page's owner cannot become
+                // unreferenced — and be reclaimed by a competing final release — while a remote
+                // TLB may still hold the translation this phase removed.
+                let hold = self.with_memory_split_mut(|m| {
+                    crate::kernel::syscall::vm::retire_mapping_to_hold_locked(m, mapping.phys)
                 });
                 // Phase B: the REAL TLB shootdown — NO domain lock held. U9-D3 replaces the
                 // comment that used to stand here with the generation-matched coordinator: local
@@ -15208,15 +15277,21 @@ impl SharedKernel {
                 // released and the memory lock is not yet taken, so nothing is held while waiting.
                 let shootdown_ok =
                     self.complete_unmap_shootdown_from_split(requester, asid, VirtAddr(va as u64));
-                // Phase C (rank 6): reclaim the frame — only AFTER a COMPLETED shootdown. Guarded
-                // (a still-pinned or still-cap-referenced object is not freed), so a rollback
-                // prefix-unmap is a no-op. A timeout skips the reclaim entirely: the frame stays
-                // unavailable for reuse rather than being recycled while a remote CPU may still
-                // hold a translation for it.
+                // Phase C (rank 6): reclaim the frame — only AFTER a COMPLETED shootdown. The
+                // hold is released and its object reclaimed if that was its last reference, in
+                // ONE acquisition, by identity. A timeout skips the settlement entirely: the hold
+                // stays, so the backing is quarantined rather than recycled while a remote CPU may
+                // still hold a translation for it.
                 if shootdown_ok {
-                    self.with_memory_split_mut(|m| {
-                        KernelState::reclaim_memory_object_for_phys_locked(m, mapping.phys)
-                    });
+                    if let Some(object_id) = hold {
+                        self.with_memory_split_mut(|m| {
+                            crate::kernel::syscall::vm::settle_displaced_hold_locked(
+                                m,
+                                object_id,
+                                mapping.phys,
+                            )
+                        });
+                    }
                 } else {
                     all_acked = false;
                     // The EXISTING X86_TLB_SHOOTDOWN_FAIL text, spelled literally because the
@@ -18558,7 +18633,7 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
     ) -> bool {
         match self.0.map_user_page_in_asid_split(asid, virt, mapping) {
             Ok(follow) => {
-                self.0.sr_apply_map_followup_split(follow);
+                self.0.sr_apply_map_followup_split(asid, virt, follow);
                 true
             }
             Err(_) => false,

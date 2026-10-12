@@ -140,6 +140,7 @@ impl RecvV3Owners for SplitRecvV3Owners<'_> {
     fn map_page(&mut self, asid: Asid, virt: VirtAddr, phys: PhysAddr, writable: bool) -> bool {
         use crate::kernel::vm::{CachePolicy, Mapping, PageFlags};
         self.shared.map_user_page_raw_split(
+            self.cpu,
             asid,
             virt,
             Mapping {

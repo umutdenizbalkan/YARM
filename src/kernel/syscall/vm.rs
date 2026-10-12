@@ -312,17 +312,34 @@ pub(crate) fn unpin_object_locked(
 /// rank 6 — the same hold, keyed by physical address, for a DISPLACED page whose object this
 /// transaction did not create and has no id for. Returns the IDENTITY it pinned, so the release
 /// can name the same object rather than looking it up by address again.
+///
+/// SHARED-REGION-LIFETIME1: the page's owner is the object whose extent CONTAINS it
+/// ([`KernelState::frame_owner_slot_locked`]), so an interior page is held like a first page.
+/// A frame with no allocator-owned owner — borrowed initrd backing, or a frame no object
+/// describes — needs no hold: nothing that a hold prevents can happen to it.
 pub(crate) fn pin_object_for_phys_locked(
     memory: &mut crate::kernel::boot::MemorySubsystem,
     phys: PhysAddr,
 ) -> Option<u64> {
-    let object_id = memory
-        .memory_objects
-        .iter()
-        .flatten()
-        .find(|object| object.phys == phys)
-        .map(|object| object.id)?;
+    let slot = KernelState::frame_owner_slot_locked(memory, phys)?;
+    let object_id = memory.memory_objects[slot].map(|object| object.id)?;
     pin_object_locked(memory, object_id).then_some(object_id)
+}
+
+/// rank 6 — SHARED-REGION-LIFETIME1: retire ONE mapping reference whose translation has been
+/// removed from the page table but is not yet invalidated everywhere. The identity hold is taken
+/// FIRST and the mapping reference dropped SECOND, in this one acquisition, so there is no
+/// instant at which the page's owner is unreferenced while a translation to it may survive in
+/// a remote TLB. The caller settles the returned hold with [`settle_displaced_hold_locked`]
+/// once the invalidation is acknowledged, and keeps it — quarantining the backing — if it never
+/// is.
+pub(crate) fn retire_mapping_to_hold_locked(
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    phys: PhysAddr,
+) -> Option<u64> {
+    let hold = pin_object_for_phys_locked(memory, phys);
+    KernelState::note_mapping_removed_locked(memory, phys);
+    hold
 }
 
 /// ONE rank-6 acquisition: release the hold taken by [`pin_object_for_phys_locked`] AND reclaim
@@ -347,11 +364,13 @@ pub(crate) fn settle_displaced_hold_locked(
     // Reclaim the object this transaction pinned, and only if the frame at `phys` is still its
     // own. A mismatch means it was already retired and something else took the address, so there
     // is nothing here for this transaction to do.
+    // SHARED-REGION-LIFETIME1: "its own" is the extent, not the base address — the held page
+    // may be any page of the object.
     let still_ours = memory
         .memory_objects
         .iter()
         .flatten()
-        .any(|entry| entry.id == object_id && entry.phys == phys);
+        .any(|entry| entry.id == object_id && KernelState::object_extent_contains(entry, phys));
     if !still_ours {
         crate::yarm_log!(
             "VM_DISPLACED_SETTLE_IDENTITY_MISMATCH object={} phys=0x{:x}",
@@ -359,6 +378,16 @@ pub(crate) fn settle_displaced_hold_locked(
             phys.0
         );
         return false;
+    }
+    if let Some(entry) = memory
+        .memory_objects
+        .iter()
+        .flatten()
+        .find(|e| e.id == object_id)
+    {
+        crate::kernel::boot::memory_lifecycle_state::trace_oracle_object_refs(
+            entry, "settle", phys,
+        );
     }
     KernelState::reclaim_memory_object_if_unreferenced_locked(memory, object);
     memory

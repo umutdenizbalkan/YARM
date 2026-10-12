@@ -78,6 +78,9 @@ recv-queue1-ordinary-grant = []
 # SHARED-REGION-OFFSET1: init's shared-region oracle cells send the middle two pages of the
 # four-page oracle object and check the receiver reads exactly those bytes.
 shared-region-offset-witness = []
+# SHARED-REGION-LIFETIME1: the NR 30 cell's first grant is held across a fork; the child
+# validates the inherited interior mapping and exits, then the parent re-validates and releases.
+shared-region-lifetime-witness = ["shared-region-offset-witness"]
 
 [dependencies]
 yarm = { package = "yarm-server-runtime", path = "../yarm-server-runtime", default-features = false }

@@ -469,6 +469,7 @@ impl crate::runtime::SharedKernel {
                 }
             };
             let installed = self.map_user_page_raw_split(
+                cpu,
                 asid,
                 VirtAddr(va as u64),
                 Mapping {

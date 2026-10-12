@@ -2457,6 +2457,127 @@ pub(super) mod xfer2_grant_witness {
         all
     }
 
+    /// SHARED-REGION-LIFETIME1 — an interior mapping outlives another owner's release of it.
+    ///
+    /// 1. Receive the interior grant `[PAGE, 3 * PAGE)` through NR 30, mapped read-only, and
+    ///    validate both pages.
+    /// 2. Fork. The clone maps the CHILD onto the same two interior frames: a second, independent
+    ///    mapping of them, with no transfer registration of its own.
+    /// 3. The parent — the other owner — releases its grant through NR 4 at once: its mapping is
+    ///    unmapped and invalidated, its registration retired and its cleanup capability revoked.
+    ///    It proves the window unmapped and the capability gone.
+    /// 4. Only then does the child run: it validates its inherited mapping — kept alive by the
+    ///    child's own mapping references, not by the grant the parent just released — and exits
+    ///    through NR 16.
+    ///
+    /// The witness only COORDINATES: the clone, the release, the invalidation and the accounting
+    /// are all the kernel's production paths. The order is YIELD-SEQUENCED on `-smp 1`: the parent
+    /// releases without yielding, and the child yields a bounded number of times before it looks —
+    /// which ever of the two the scheduler runs first after the fork (x86_64 and RISC-V keep the
+    /// parent, AArch64 was observed to run the child). The smoke reads the order from the
+    /// kernel's log rather than assuming it, and fails a run in which the child looked first.
+    #[cfg(feature = "shared-region-lifetime-witness")]
+    fn lifetime_grant(mem_cap: u32, ep_cap: u32) -> bool {
+        use yarm_ipc_abi::recv_shared_v3_abi::RecvSharedV3Output;
+        const VA: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
+        const LEN: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN;
+        // Bounded on both sides; the smoke judges the order itself.
+        const CHILD_WAIT_YIELDS: u32 = 64;
+        const PARENT_YIELDS: u32 = 256;
+
+        // SAFETY: `ep_cap` carries SEND; `mem_cap` is init's disposable source cap.
+        if unsafe { super::shared_region_oracle_core::send_grant(ep_cap, mem_cap) }.is_err() {
+            yarm_user_rt::user_log!("SHARED_REGION_LIFETIME_WITNESS step=send result=fail");
+            return false;
+        }
+        let mut out = RecvSharedV3Output::new_zeroed();
+        // SAFETY: `out` is a live stack record; the window is init's own unmapped range.
+        let got = unsafe {
+            yarm_user_rt::syscall::recv_v3::ipc_recv_shared_v3_mapped_readonly_nonblocking(
+                ep_cap as u64,
+                VA as u64,
+                LEN as u64,
+                &mut out,
+            )
+        };
+        if !matches!(got, Ok(Some(_))) || out.mapped_base as usize != VA {
+            yarm_user_rt::user_log!("SHARED_REGION_LIFETIME_WITNESS step=recv result=fail");
+            return false;
+        }
+        let cap = out.transferred_cap as u32;
+        // SAFETY: the recv mapped the whole window readable.
+        let (h0, h1) = unsafe { super::shared_region_oracle_core::validate_pages_split(VA, LEN) };
+
+        // SAFETY: the existing NR 12 wrapper; the child never returns into init's flow.
+        let fr = unsafe { yarm_user_rt::syscall::fork_raw() };
+        if fr.ret0 == 0 && fr.err != 0 && fr.err < 0x100 {
+            yarm_user_rt::user_log!(
+                "SHARED_REGION_LIFETIME_WITNESS step=fork err={} result=fail",
+                fr.err
+            );
+            // SAFETY: the cleanup cap the recv returned.
+            let _ = unsafe { yarm_user_rt::syscall::release_shared_region_mapping(cap) };
+            return false;
+        }
+        if fr.ret0 == 0 {
+            // ── CHILD: the inherited mapping of the same interior frames. ──
+            // Let the parent's release run first.
+            let mut n = 0;
+            while n < CHILD_WAIT_YIELDS {
+                let _ = yarm_user_rt::syscall::yield_now();
+                n += 1;
+            }
+            // SAFETY: the clone mapped the parent's readable window into this address space.
+            let (c0, c1) =
+                unsafe { super::shared_region_oracle_core::validate_pages_split(VA, LEN) };
+            yarm_user_rt::user_log!(
+                "SHARED_REGION_LIFETIME_CHILD page0={} page1={} result={}",
+                c0 as u32,
+                c1 as u32,
+                (c0 && c1) as u32
+            );
+            // SAFETY: no pointer arguments; this does not return on success.
+            let _ = unsafe { yarm_user_rt::syscall::exit_current_task() };
+            yarm_user_rt::user_log!("SHARED_REGION_LIFETIME_CHILD_EXIT_DECLINED");
+            loop {
+                let _ = yarm_user_rt::syscall::yield_now();
+            }
+        }
+
+        // ── PARENT: the other owner releases first. ──
+        // SAFETY: the registered-range release of the parent's own grant.
+        let released = unsafe { yarm_user_rt::syscall::release_shared_region_mapping(cap) };
+        let release_ok = matches!(released, Ok(l) if l == LEN);
+        // SAFETY: the window is this task's own, and is expected to be unmapped now.
+        let unmapped_ok = unsafe {
+            yarm_user_rt::syscall::vm_anon_map(
+                VA,
+                yarm_user_rt::syscall::SHARED_REGION_ORACLE_PAGE_SIZE,
+                0x1,
+            )
+        }
+        .is_ok();
+        // SAFETY: intentional duplicate to observe the canonical refusal.
+        let revoked_ok =
+            unsafe { yarm_user_rt::syscall::release_shared_region_mapping(cap) }.is_err();
+        yarm_user_rt::user_log!("SHARED_REGION_LIFETIME_PARENT_RELEASED child={}", fr.ret0);
+        let mut n = 0;
+        while n < PARENT_YIELDS {
+            let _ = yarm_user_rt::syscall::yield_now();
+            n += 1;
+        }
+        let all = h0 && h1 && release_ok && unmapped_ok && revoked_ok;
+        yarm_user_rt::user_log!(
+            "SHARED_REGION_LIFETIME_WITNESS held={} release={} unmapped={} revoked={} result={}",
+            (h0 && h1) as u32,
+            release_ok as u32,
+            unmapped_ok as u32,
+            revoked_ok as u32,
+            all as u32
+        );
+        all
+    }
+
     /// Run the whole witness once. Never asserts: a failure is reported through the markers.
     pub(super) fn run_once() {
         let (mem_cap, ep_cap) = super::shared_region_oracle_core::oracle_caps();
@@ -2500,9 +2621,23 @@ pub(super) mod xfer2_grant_witness {
         // pressure as deferred and this package does not widen into it. Gated off, this file's
         // contribution to the image is unchanged — measured byte-identical `init_server` text.
         // The two profiles are complementary runs of one witness, and the matrix runs both.
-        #[cfg(not(feature = "recv-queue1-ordinary-grant"))]
+        #[cfg(all(
+            not(feature = "recv-queue1-ordinary-grant"),
+            not(feature = "shared-region-lifetime-witness")
+        ))]
         let (a, b) = (
             one_grant(mem_cap, ep_cap, false, "A"),
+            one_grant(mem_cap, ep_cap, true, "B"),
+        );
+        // SHARED-REGION-LIFETIME1: grant A becomes the lifetime cycle, and grant B — the same
+        // interior pages, granted afresh after A's complete cleanup — is the re-grant that proves
+        // the backing survived intact and the accounting let it be mapped again.
+        #[cfg(all(
+            not(feature = "recv-queue1-ordinary-grant"),
+            feature = "shared-region-lifetime-witness"
+        ))]
+        let (a, b) = (
+            lifetime_grant(mem_cap, ep_cap),
             one_grant(mem_cap, ep_cap, true, "B"),
         );
         #[cfg(feature = "recv-queue1-ordinary-grant")]

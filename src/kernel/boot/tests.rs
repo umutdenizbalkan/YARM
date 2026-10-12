@@ -71288,8 +71288,10 @@ mod stage198e3b2a_offlock_ctx {
         let vm_pos = unmap
             .find("with_vm_user_spaces_split_mut")
             .expect("vm phase");
+        // SHARED-REGION-LIFETIME1: the rank-6 reclaim is the settlement of the identity hold the
+        // unmap took (`settle_displaced_hold_locked` releases it and reclaims the object).
         let reclaim_pos = unmap
-            .find("reclaim_memory_object_for_phys_locked")
+            .find("settle_displaced_hold_locked")
             .expect("reclaim phase");
         assert!(
             vm_pos < reclaim_pos,
@@ -146903,9 +146905,8 @@ mod u9d3_split_unmap_drives_real_d3 {
             !b.contains("current_cpu"),
             "the seam takes its requester as a parameter, never from the ambient field"
         );
-        let reclaim = b
-            .find("reclaim_memory_object_for_phys_locked")
-            .expect("Phase C");
+        // SHARED-REGION-LIFETIME1: Phase C is the settlement of the hold Phase A' took.
+        let reclaim = b.find("settle_displaced_hold_locked").expect("Phase C");
         assert!(unmap < shoot, "the PTE is removed before the shootdown");
         assert!(
             shoot < reclaim,
@@ -154105,11 +154106,14 @@ mod u9cow2_route {
     fn reclaim_follows_a_completed_shootdown_and_never_precedes_it() {
         let t = txn();
         let map = at(&t, "space.map_page(");
-        let book = at(&t, "note_mapping_removed_locked");
+        // SHARED-REGION-LIFETIME1: the bookkeeping converts the old reference into an identity
+        // hold, and the reclaim is that hold's settlement.
+        let book = at(&t, "retire_mapping_to_hold_locked");
         let shoot = at(&t, "complete_unmap_shootdown_split(asid, page)");
-        let reclaim = at(
-            &t,
-            "reclaim_memory_object_for_phys_locked(memory, old_phys)",
+        let reclaim = at(&t, "settle_displaced_hold_locked(");
+        assert!(
+            t[reclaim..].contains("memory, object_id, old_phys"),
+            "the settlement names the held object and the old frame"
         );
         assert!(
             map < book && book < shoot && shoot < reclaim,
@@ -161517,7 +161521,14 @@ mod u9aspace1_teardown_frame_reclaim {
             .nth(1)
             .and_then(|s| s.split("\n}\n").next())
             .expect("the release owner");
-        for authority in ["memory_objects", "any_mapping_for_phys", "free_frame"] {
+        // SHARED-REGION-LIFETIME1: the object question is asked through the ONE extent-aware
+        // owner (`frame_described_by_object_locked`, which reads `memory_objects`), so an interior
+        // page of a live object is never released — re-derived from the inline base-address scan.
+        for authority in [
+            "frame_described_by_object_locked",
+            "any_mapping_for_phys",
+            "free_frame",
+        ] {
             assert!(
                 body.contains(authority),
                 "the release must consult {authority} before returning a frame"
@@ -165721,8 +165732,11 @@ mod u9a64cow2_split_route {
             .split("self.with_memory_split_mut(|memory| {")
             .find(|block| block.contains("note_mapping_inserted_locked"))
             .expect("the refcount acquisition");
+        // SHARED-REGION-LIFETIME1: the old mapping's reference comes down as an identity HOLD
+        // (`retire_mapping_to_hold_locked`), and the old-frame reclaim is the settlement of that
+        // hold — re-derived from the bare decrement and the by-address reclaim.
         for step in [
-            "note_mapping_removed_locked(memory, old_phys)",
+            "retire_mapping_to_hold_locked(memory, old_phys)",
             "clear_cow_page_locked(memory, asid, page)",
             "note_mapping_inserted_locked(memory, new_phys)",
         ] {
@@ -165735,14 +165749,20 @@ mod u9a64cow2_split_route {
             .find("self.complete_unmap_shootdown_split(asid, page)")
             .expect("the shootdown");
         let reclaim = txn
-            .find("reclaim_memory_object_for_phys_locked(memory, old_phys)")
+            .find("settle_displaced_hold_locked(")
             .expect("the old-frame reclaim");
+        assert!(
+            txn[reclaim..].contains("memory, object_id, old_phys"),
+            "the settlement names the held object and the old frame"
+        );
         assert!(
             shootdown < reclaim,
             "the old frame may only be reclaimed after the shootdown"
         );
         assert!(
-            txn.contains("if old_entry.is_some() && shootdown_acked {"),
+            txn.contains(
+                "if let Some(object_id) = hold\n            && shootdown_acked\n        {"
+            ),
             "an unacknowledged shootdown must leave the old frame unreclaimed"
         );
     }
@@ -197111,5 +197131,876 @@ mod shared_region_offset1 {
             }
         }
         assert!(!RUNTIME.contains("sr_phys_base_split"));
+    }
+}
+
+// ── SHARED-REGION-LIFETIME1: who owns a mapped page, and when its backing may be reused ─────────
+//
+// Every case drives production owners — the NR 1 / NR 2 shared-region grant, NR 4, the fork
+// clone, address-space teardown, capability revocation and the VmMap transaction — over a
+// multi-page allocator-owned object whose pages are mapped only through their INTERIOR frames,
+// and reads back the object's counters, the translations and the frame allocator's own charge on
+// each frame. A retained registry slot alone proves nothing; the allocator's charge does.
+mod shared_region_lifetime1 {
+    use super::*;
+    use crate::kernel::capabilities::{CNodeId, CapId, CapObject};
+    use crate::kernel::syscall::vm_txn::{
+        MapTarget, PageRecord, ProvisionalFrame, ProvisionalReleaseOutcome, VmMapOwners,
+        VmTxnEvent, run_vm_map_transaction,
+    };
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
+        SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP, SYSCALL_IPC_RECV_NR,
+        SYSCALL_RECV_MAP_INTENT_READ, SYSCALL_TRANSFER_RELEASE_NR, SYSCALL_VM_MAP_PROT_READ,
+        Syscall, SyscallError, dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const PAGE: usize = PAGE_SIZE;
+    const CPU: crate::kernel::scheduler::CpuId = crate::kernel::scheduler::CpuId(0);
+    const META: usize = 0x1_0000;
+    /// The receive windows. Unmapped until a delivery installs them.
+    const WINDOW_A: usize = 0x20_0000;
+    const WINDOW_B: usize = 0x40_0000;
+
+    struct Fx {
+        kernel: SharedKernel,
+        send_cap: CapId,
+        recv_cap: CapId,
+        object_id: u64,
+        base: PhysAddr,
+        pages: usize,
+        /// The sender's own (and, until a grant, the only) capability to the object.
+        source_cap: CapId,
+        /// Task 0's address space: sender and receiver, as init is in the live witness.
+        asid: Asid,
+        cnode: CNodeId,
+    }
+
+    /// Task 0 with a user address space, an endpoint, and an `pages`-page allocator-owned object.
+    fn fixture(pages: usize) -> Fx {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (send_cap, recv_cap, object_id, base, source_cap, asid, cnode) = kernel.with(|s| {
+            let (asid, _cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(0, asid).expect("bind");
+            let (_, page_cap) = s.alloc_anonymous_memory_object().expect("meta page");
+            s.map_user_page_in_asid_with_caps(
+                asid,
+                page_cap,
+                VirtAddr(META as u64),
+                PageFlags::USER_RW,
+            )
+            .expect("meta");
+            let (_eid, send_cap, recv_cap) = s.create_endpoint(8).expect("endpoint");
+            let (object_id, source_cap) = s
+                .alloc_anonymous_memory_object_with_len(pages * PAGE)
+                .expect("object");
+            let base = s
+                .with_memory_state(|m| {
+                    m.memory_objects
+                        .iter()
+                        .flatten()
+                        .find(|e| e.id == object_id)
+                        .map(|e| e.phys)
+                })
+                .expect("phys");
+            let cnode = s.task_cnode(0).expect("cnode");
+            (send_cap, recv_cap, object_id, base, source_cap, asid, cnode)
+        });
+        Fx {
+            kernel,
+            send_cap,
+            recv_cap,
+            object_id,
+            base,
+            pages,
+            source_cap,
+            asid,
+            cnode,
+        }
+    }
+
+    fn page_phys(fx: &Fx, page: usize) -> PhysAddr {
+        PhysAddr(fx.base.0 + (page * PAGE) as u64)
+    }
+
+    fn err_of(r: Result<(), crate::kernel::boot::TrapHandleError>) -> Option<SyscallError> {
+        match r {
+            Ok(()) => None,
+            Err(crate::kernel::boot::TrapHandleError::Syscall(s)) => Some(s),
+            Err(other) => panic!("unexpected error channel: {other:?}"),
+        }
+    }
+
+    /// One real grant: NR 1 sends `[offset, offset + len)` of the object, and NR 2 (the broad
+    /// dispatcher, or the split lane) maps it read-only at `window`. Returns the receiver-local
+    /// cleanup capability.
+    fn grant(fx: &Fx, offset: usize, len: usize, window: usize, split: bool) -> u64 {
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                fx.send_cap.0 as usize,
+                offset,
+                len,
+                0,
+                0,
+                fx.source_cap.0 as usize,
+            ],
+        );
+        assert_eq!(
+            fx.kernel.with(|s| dispatch(s, &mut send)).err(),
+            None,
+            "send"
+        );
+        let mut f = TrapFrame::new(SYSCALL_IPC_RECV_NR, [0; 6]);
+        f.set_arg(SYSCALL_ARG_CAP, fx.recv_cap.0 as usize);
+        f.set_arg(SYSCALL_ARG_PTR, window);
+        f.set_arg(SYSCALL_ARG_LEN, len.div_ceil(PAGE) * PAGE);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, 0);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_RECV_MAP_INTENT_READ);
+        f.set_arg(SYSCALL_ARG_TRANSFER_CAP, 0);
+        let err = if split {
+            err_of(
+                fx.kernel
+                    .try_split_ipc_recv_queued_plain_into_frame(CPU, &mut f)
+                    .into_legacy_option()
+                    .expect("the split lane serves it"),
+            )
+        } else {
+            fx.kernel.with(|s| dispatch(s, &mut f)).err()
+        };
+        assert_eq!(err, None, "receive");
+        f.ret2() as u64
+    }
+
+    fn release(fx: &Fx, cap: u64, base: usize, len: usize) -> Result<usize, SyscallError> {
+        let mut f = TrapFrame::new(
+            SYSCALL_TRANSFER_RELEASE_NR,
+            [cap as usize, base, len, 0, 0, 0],
+        );
+        fx.kernel.with(|s| dispatch(s, &mut f)).map(|()| f.ret0())
+    }
+
+    /// The sender gives up its authority: the production revocation owner, on its own slot.
+    fn revoke_source(fx: &Fx) {
+        fx.kernel.with(|s| {
+            s.revoke_capability_in_cnode(fx.cnode, fx.source_cap)
+                .expect("revoke the source capability")
+        });
+    }
+
+    /// `(cap_refcount, map_refcount, pin_refcount)`, or `None` once the object is reclaimed.
+    fn refs(fx: &Fx) -> Option<(u32, u32, u32)> {
+        fx.kernel
+            .with(|s| s.memory_object_refcounts_by_id(fx.object_id))
+    }
+
+    /// The allocator's own answer: is this frame charged to anybody?
+    fn tracked(fx: &Fx, phys: PhysAddr) -> bool {
+        fx.kernel.with(|s| {
+            s.with_memory_state(|m| m.frame_allocator.frame_refcount(phys.0).unwrap_or(0) > 0)
+        })
+    }
+
+    fn translation(fx: &Fx, asid: Asid, va: usize) -> Option<Mapping> {
+        fx.kernel.with(|s| {
+            s.with_user_spaces(|spaces| {
+                spaces
+                    .get(asid)
+                    .and_then(|a| a.resolve(VirtAddr(va as u64)))
+            })
+        })
+    }
+
+    /// The production fork clone of task 0's address space.
+    fn fork(fx: &Fx) -> Asid {
+        fx.kernel
+            .with(|s| s.clone_user_address_space_cow(fx.asid))
+            .expect("clone")
+    }
+
+    /// The production address-space teardown.
+    fn teardown(fx: &Fx, asid: Asid) {
+        fx.kernel.with(|s| {
+            s.destroy_user_address_space_by_asid(asid)
+                .expect("teardown")
+        });
+    }
+
+    /// Every frame of the object is still charged by the allocator.
+    fn all_tracked(fx: &Fx) -> bool {
+        (0..fx.pages).all(|p| tracked(fx, page_phys(fx, p)))
+    }
+
+    /// The whole extent is free again: no frame of it is charged, and a fresh allocation of the
+    /// same size can take exactly that extent back.
+    fn extent_returned(fx: &Fx) -> bool {
+        if (0..fx.pages).any(|p| tracked(fx, page_phys(fx, p))) {
+            return false;
+        }
+        fx.kernel.with(|s| {
+            s.with_memory_state_mut(|m| {
+                let a = crate::kernel::boot::kernel_mut(&mut m.frame_allocator);
+                let mut taken = alloc::vec::Vec::new();
+                let mut found = false;
+                for _ in 0..64 {
+                    match a.alloc_contiguous(fx.pages) {
+                        Ok(p) => {
+                            found |= p == fx.base.0;
+                            taken.push(p);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for p in taken {
+                    let _ = a.free_contiguous(p, fx.pages);
+                }
+                found
+            })
+        })
+    }
+
+    // ── accounting ────────────────────────────────────────────────────────────────────────────
+
+    /// **Every mapped page of an object takes one mapping reference, whichever page it is**, and
+    /// removal returns exactly those — on both receive routes, at a zero and a non-zero offset.
+    /// The unrepaired kernel counted only a mapping of the object's FIRST frame, so an interior
+    /// mapping took nothing.
+    #[test]
+    fn every_mapped_page_takes_and_returns_exactly_one_reference() {
+        for (offset, len) in [(0, 2 * PAGE), (PAGE, 2 * PAGE), (2 * PAGE, PAGE + 9)] {
+            for split in [false, true] {
+                let ctx = alloc::format!("offset={offset} len={len} split={split}");
+                let fx = fixture(4);
+                let (c0, m0, p0) = refs(&fx).expect("live");
+                let cap = grant(&fx, offset, len, WINDOW_A, split);
+                let pages = len.div_ceil(PAGE) as u32;
+                assert_eq!(
+                    refs(&fx),
+                    Some((c0 + 1, m0 + pages, p0)),
+                    "{ctx}: one reference per mapped page, plus the receiver's capability"
+                );
+                assert_eq!(release(&fx, cap, 0, 0), Ok(pages as usize * PAGE), "{ctx}");
+                assert_eq!(refs(&fx), Some((c0, m0, p0)), "{ctx}: returned exactly");
+            }
+        }
+    }
+
+    /// **Two mappings of the same interior pages have independent lifetimes**: each holds its own
+    /// references, releasing one leaves the other mapped and counted, and after the last the
+    /// object is reclaimed exactly once and its whole extent is reusable.
+    #[test]
+    fn two_aliases_of_interior_pages_have_independent_lifetimes() {
+        let fx = fixture(4);
+        let (c0, m0, _) = refs(&fx).expect("live");
+        let a = grant(&fx, PAGE, 2 * PAGE, WINDOW_A, true);
+        let b = grant(&fx, PAGE, 2 * PAGE, WINDOW_B, false);
+        assert_eq!(refs(&fx).map(|r| (r.0, r.1)), Some((c0 + 2, m0 + 4)));
+        assert_eq!(release(&fx, a, 0, 0), Ok(2 * PAGE));
+        assert_eq!(refs(&fx).map(|r| (r.0, r.1)), Some((c0 + 1, m0 + 2)));
+        for i in 0..2 {
+            assert_eq!(
+                translation(&fx, fx.asid, WINDOW_B + i * PAGE).map(|m| m.phys),
+                Some(page_phys(&fx, 1 + i)),
+                "the surviving alias still maps its pages"
+            );
+        }
+        assert_eq!(release(&fx, b, 0, 0), Ok(2 * PAGE));
+        assert_eq!(refs(&fx).map(|r| (r.0, r.1)), Some((c0, m0)));
+        revoke_source(&fx);
+        assert_eq!(refs(&fx), None, "the last reference reclaims the object");
+        assert!(extent_returned(&fx), "and returns its whole extent, once");
+    }
+
+    /// **A partial unmap releases exactly its own pages' references.** NR 4's explicit-range
+    /// shape unmaps the one page it names; the capability's revocation then removes the rest of
+    /// the registered range.
+    #[test]
+    fn a_partial_unmap_releases_exactly_its_own_references() {
+        let fx = fixture(4);
+        let (c0, m0, _) = refs(&fx).expect("live");
+        let cap = grant(&fx, PAGE, 2 * PAGE, WINDOW_A, true);
+        assert_eq!(release(&fx, cap, WINDOW_A + PAGE, PAGE), Ok(PAGE));
+        assert!(translation(&fx, fx.asid, WINDOW_A + PAGE).is_none());
+        assert_eq!(
+            refs(&fx).map(|r| (r.0, r.1)),
+            Some((c0, m0)),
+            "the named page's reference, then the revocation's unmap of the rest"
+        );
+        assert!(translation(&fx, fx.asid, WINDOW_A).is_none());
+        assert!(all_tracked(&fx), "the sender's object keeps every frame");
+    }
+
+    // ── teardown, fork and revocation ─────────────────────────────────────────────────────────
+
+    /// **Address-space teardown never returns a live object's frames to the allocator.** The
+    /// unrepaired drain asked "does an object START at this frame?" and freed every frame for
+    /// which none did — every interior page of a multi-page grant, even at offset 0 — while the
+    /// sender's object still owned it.
+    #[test]
+    fn teardown_never_frees_a_live_objects_interior_frames() {
+        for (offset, len) in [(0, 2 * PAGE), (PAGE, 2 * PAGE)] {
+            let ctx = alloc::format!("offset={offset}");
+            let fx = fixture(4);
+            let (c0, m0, _) = refs(&fx).expect("live");
+            let _cap = grant(&fx, offset, len, WINDOW_A, true);
+            teardown(&fx, fx.asid);
+            assert!(all_tracked(&fx), "{ctx}: every frame is still the object's");
+            assert_eq!(
+                refs(&fx).map(|r| r.1),
+                Some(m0),
+                "{ctx}: the drained mappings returned their references"
+            );
+            assert!(
+                refs(&fx).map(|r| r.0) >= Some(c0),
+                "{ctx}: the object is still live"
+            );
+        }
+    }
+
+    /// **A forked mapping of interior pages outlives the parent's release and the sender's
+    /// revocation**, and the child's teardown then reclaims the object exactly once.
+    ///
+    /// The unrepaired kernel reclaimed the object — and freed its frames — the moment the last
+    /// capability went, while the child still mapped them.
+    #[test]
+    fn a_forked_interior_mapping_outlives_release_and_revocation() {
+        let fx = fixture(4);
+        let cap = grant(&fx, PAGE, 2 * PAGE, WINDOW_A, true);
+        let child = fork(&fx);
+        for i in 0..2 {
+            assert_eq!(
+                translation(&fx, child, WINDOW_A + i * PAGE).map(|m| m.phys),
+                Some(page_phys(&fx, 1 + i)),
+                "the child maps the parent's exact interior frames"
+            );
+        }
+        assert_eq!(release(&fx, cap, 0, 0), Ok(2 * PAGE), "the parent releases");
+        revoke_source(&fx);
+        assert_eq!(
+            refs(&fx),
+            Some((0, 2, 0)),
+            "the child's two mappings are now the object's only references"
+        );
+        assert!(all_tracked(&fx), "and they keep every frame charged");
+        for i in 0..2 {
+            assert_eq!(
+                translation(&fx, child, WINDOW_A + i * PAGE).map(|m| m.phys),
+                Some(page_phys(&fx, 1 + i)),
+                "the child's mapping is still valid"
+            );
+        }
+        teardown(&fx, child);
+        assert_eq!(refs(&fx), None, "the child's teardown reclaims the object");
+        assert!(extent_returned(&fx), "and its whole extent, exactly once");
+    }
+
+    /// **The same lifetime through the production process owners**: the fork TRANSACTION (not
+    /// only its address-space clone) and the NR 31 reap TRANSACTION, whose drain and reclaim are
+    /// the teardown a dead process actually gets.
+    ///
+    /// The child's exit is the broad exit owner (`exit_task`, NR 16's writes) after withdrawing it
+    /// from the runqueue, the shape the reap requires; neither touches a counter.
+    #[test]
+    fn a_reaped_fork_child_releases_its_interior_mapping_through_the_reap_transaction() {
+        let fx = fixture(4);
+        let cap = grant(&fx, PAGE, 2 * PAGE, WINDOW_A, true);
+        let (_, m0, _) = refs(&fx).expect("live");
+        let child_tid = fx
+            .kernel
+            .with(|s| s.fork_user_process_cow(0, None))
+            .expect("fork");
+        let child_asid = fx.kernel.with(|s| s.task_asid(child_tid)).expect("asid");
+        assert_eq!(
+            refs(&fx).map(|r| r.1),
+            Some(m0 + 2),
+            "the fork's clone takes its own reference per interior page"
+        );
+        assert_eq!(release(&fx, cap, 0, 0), Ok(2 * PAGE), "the parent releases");
+        revoke_source(&fx);
+        assert_eq!(
+            refs(&fx).map(|r| (r.1, r.2)),
+            Some((2, 0)),
+            "the child's mappings keep the object"
+        );
+        assert!(all_tracked(&fx));
+        for i in 0..2 {
+            assert_eq!(
+                translation(&fx, child_asid, WINDOW_A + i * PAGE).map(|m| m.phys),
+                Some(page_phys(&fx, 1 + i)),
+                "the child's mapping is still valid"
+            );
+        }
+        // The child leaves the runqueue (as a dispatch would take it) and exits through the
+        // broad exit owner, then PM's reap runs.
+        fx.kernel.with(|s| {
+            let _ = s.withdraw_queued_tid_on(CPU, child_tid);
+            s.exit_task(child_tid, 0).expect("exit");
+        });
+        fx.kernel
+            .with(|s| s.reap_faulted_task_noalloc_cleanup(child_tid))
+            .expect("reap");
+        assert_eq!(refs(&fx), None, "the reap's teardown reclaims the object");
+        assert!(extent_returned(&fx), "and its whole extent, exactly once");
+    }
+
+    /// **A later-page failure rolls back the installed prefix of an interior selection and
+    /// returns every reference** (hosted x86_64: the second page lands past the last canonical
+    /// user page and the VM owner refuses it).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_later_page_failure_returns_every_interior_reference() {
+        let last_user_page = (1usize << 47) - PAGE;
+        let fx = fixture(4);
+        let before = refs(&fx).expect("live");
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                fx.send_cap.0 as usize,
+                PAGE,
+                2 * PAGE,
+                0,
+                0,
+                fx.source_cap.0 as usize,
+            ],
+        );
+        assert_eq!(fx.kernel.with(|s| dispatch(s, &mut send)).err(), None);
+        let mut f = TrapFrame::new(SYSCALL_IPC_RECV_NR, [0; 6]);
+        f.set_arg(SYSCALL_ARG_CAP, fx.recv_cap.0 as usize);
+        f.set_arg(SYSCALL_ARG_PTR, last_user_page);
+        f.set_arg(SYSCALL_ARG_LEN, 2 * PAGE);
+        let err = err_of(
+            fx.kernel
+                .try_split_ipc_recv_queued_plain_into_frame(CPU, &mut f)
+                .into_legacy_option()
+                .expect("served"),
+        );
+        assert!(err.is_some(), "page 1 cannot be installed");
+        assert!(translation(&fx, fx.asid, last_user_page).is_none());
+        assert_eq!(refs(&fx), Some(before), "every reference returned");
+        assert!(all_tracked(&fx));
+    }
+
+    // ── displaced pages ───────────────────────────────────────────────────────────────────────
+
+    /// **Displacing an interior page holds its backing until the displacement's invalidation
+    /// settles.** The child's mapping of interior page 1 is the object's last reference when the
+    /// VmMap install displaces it; the install must take a hold on the object BY IDENTITY before
+    /// it drops that reference, a competing reclaimer must then find nothing to free, and only the
+    /// settlement — after the acknowledgement — reclaims the object.
+    ///
+    /// The unrepaired install could not pin an interior page (`pin_object_for_phys_locked`
+    /// matched only the first frame), so it recorded no hold at all.
+    #[test]
+    fn displacing_an_interior_page_holds_its_backing_until_settled() {
+        let fx = fixture(4);
+        let cap = grant(&fx, PAGE, PAGE, WINDOW_A, true);
+        let child = fork(&fx);
+        let interior = page_phys(&fx, 1);
+        // The child displaces its interior page through the production install.
+        let (object_id, phys) = fx
+            .kernel
+            .with(|s| s.alloc_anonymous_object_without_cap())
+            .expect("replacement object");
+        let mut records = [PageRecord {
+            virt: VirtAddr(WINDOW_A as u64),
+            object_id,
+            phys,
+            cap: None,
+            installed: false,
+            pinned: false,
+            displaced_pinned: None,
+            replaced: None,
+        }];
+        fx.kernel
+            .with(|s| {
+                s.with_vm_then_memory_mut(|spaces, memory| {
+                    crate::kernel::syscall::vm::install_and_account_locked(
+                        spaces,
+                        memory,
+                        child,
+                        PageFlags::USER_RX,
+                        &mut records,
+                    )
+                })
+            })
+            .expect("install");
+        assert_eq!(records[0].replaced.map(|m| m.phys), Some(interior));
+        assert_eq!(
+            records[0].displaced_pinned,
+            Some(fx.object_id),
+            "the displaced interior page is held, by the object's identity"
+        );
+        // Every other reference goes: the parent releases, the sender revokes.
+        assert_eq!(release(&fx, cap, 0, 0), Ok(PAGE));
+        revoke_source(&fx);
+        assert_eq!(
+            refs(&fx),
+            Some((0, 0, 1)),
+            "the hold is the only thing keeping the object"
+        );
+        // Before the acknowledgement a competing reclaimer runs. It must free nothing.
+        fx.kernel.with(|s| {
+            s.with_memory_state_mut(|m| {
+                KernelState::reclaim_memory_object_for_phys_locked(m, interior);
+                KernelState::reclaim_memory_object_if_unreferenced_locked(
+                    m,
+                    CapObject::MemoryObject { id: fx.object_id },
+                );
+            })
+        });
+        assert!(
+            refs(&fx).is_some() && all_tracked(&fx),
+            "nothing reclaimed early"
+        );
+        // The settlement, after the acknowledgement, is the one reclaim.
+        let reclaimed = fx.kernel.with(|s| {
+            s.with_memory_state_mut(|m| {
+                crate::kernel::syscall::vm::settle_displaced_hold_locked(m, fx.object_id, interior)
+            })
+        });
+        assert!(reclaimed, "the settlement reclaims the object it held");
+        assert_eq!(refs(&fx), None);
+        assert!(extent_returned(&fx), "and returns its whole extent");
+    }
+
+    /// The broad VmMap owners, with the remote invalidation of a displaced page made to FAIL —
+    /// the only injected behaviour. Everything else is the production adapter.
+    struct FailedAck<'a>(crate::kernel::syscall::vm::BroadVmOwners<'a>);
+
+    impl VmMapOwners for FailedAck<'_> {
+        fn caller_tid(&self) -> Option<u64> {
+            self.0.caller_tid()
+        }
+        fn caller_asid(&self, tid: u64) -> Option<Asid> {
+            self.0.caller_asid(tid)
+        }
+        fn resolve_address_space_cap(&self, tid: u64, cap: CapId) -> Result<Asid, KernelError> {
+            self.0.resolve_address_space_cap(tid, cap)
+        }
+        fn caller_cnode(&self, tid: u64) -> Option<CNodeId> {
+            self.0.caller_cnode(tid)
+        }
+        fn is_page_mapped(&self, asid: Asid, virt: VirtAddr) -> Result<bool, KernelError> {
+            self.0.is_page_mapped(asid, virt)
+        }
+        fn acquire_object(&mut self, flags: PageFlags) -> Result<(u64, PhysAddr), KernelError> {
+            self.0.acquire_object(flags)
+        }
+        fn pin_object(&mut self, object_id: u64) -> bool {
+            self.0.pin_object(object_id)
+        }
+        fn unpin_object(&mut self, object_id: u64) {
+            self.0.unpin_object(object_id)
+        }
+        fn settle_displaced_hold(&mut self, object_id: u64, phys: PhysAddr) -> bool {
+            self.0.settle_displaced_hold(object_id, phys)
+        }
+        fn release_unminted_object(&mut self, object_id: u64) {
+            self.0.release_unminted_object(object_id)
+        }
+        fn mint_frame_cap(&mut self, object_id: u64, phys: PhysAddr) -> Result<CapId, KernelError> {
+            self.0.mint_frame_cap(object_id, phys)
+        }
+        fn install_and_account(
+            &mut self,
+            asid: Asid,
+            flags: PageFlags,
+            records: &mut [PageRecord],
+        ) -> Result<(), (usize, KernelError)> {
+            self.0.install_and_account(asid, flags, records)
+        }
+        fn complete_shootdown(&mut self, _asid: Asid, _virt: VirtAddr) -> bool {
+            false
+        }
+        fn release_provisional_cap(
+            &mut self,
+            cnode: CNodeId,
+            frame: ProvisionalFrame,
+        ) -> ProvisionalReleaseOutcome {
+            self.0.release_provisional_cap(cnode, frame)
+        }
+        fn account_released_cap(&mut self, frame: ProvisionalFrame) {
+            self.0.account_released_cap(frame)
+        }
+        fn note(&mut self, event: VmTxnEvent) {
+            self.0.note(event)
+        }
+    }
+
+    /// **A displaced interior page whose remote invalidation FAILS keeps its backing for good**
+    /// (hosted-only failure injection: the acknowledgement is refused). The VmMap transaction
+    /// leaves its hold unsettled, so after every other reference is gone the object is still
+    /// held and its frames are still charged — quarantined, never reissued.
+    #[test]
+    fn a_failed_invalidation_quarantines_a_displaced_interior_page() {
+        let fx = fixture(4);
+        let cap = grant(&fx, PAGE, PAGE, WINDOW_A, true);
+        let got = fx.kernel.with(|s| {
+            let mut owners = FailedAck(crate::kernel::syscall::vm::BroadVmOwners { kernel: s });
+            run_vm_map_transaction(
+                &mut owners,
+                MapTarget::CallerAddressSpace,
+                WINDOW_A,
+                PAGE,
+                SYSCALL_VM_MAP_PROT_READ,
+            )
+        });
+        assert!(got.is_ok(), "the mapping itself succeeds: {got:?}");
+        assert_ne!(
+            translation(&fx, fx.asid, WINDOW_A).map(|m| m.phys),
+            Some(page_phys(&fx, 1)),
+            "the interior page was displaced"
+        );
+        assert_eq!(
+            refs(&fx).map(|r| r.2),
+            Some(1),
+            "the unacknowledged displacement still holds the object"
+        );
+        assert!(release(&fx, cap, 0, 0).is_ok());
+        revoke_source(&fx);
+        assert_eq!(
+            refs(&fx).map(|r| (r.0, r.2)),
+            Some((0, 1)),
+            "held, not reclaimed"
+        );
+        assert!(all_tracked(&fx), "and no frame of it reaches the allocator");
+    }
+
+    /// **A stale settlement cannot touch a replacement object at a reused address.** After the
+    /// first object is settled and reclaimed, a new object takes the same extent; settling the old
+    /// identity again changes nothing about the new one.
+    #[test]
+    fn a_stale_settlement_cannot_reach_a_replacement_at_a_reused_address() {
+        let fx = fixture(4);
+        let cap = grant(&fx, PAGE, PAGE, WINDOW_A, true);
+        let child = fork(&fx);
+        let interior = page_phys(&fx, 1);
+        let (object_id, phys) = fx
+            .kernel
+            .with(|s| s.alloc_anonymous_object_without_cap())
+            .expect("replacement");
+        let mut records = [PageRecord {
+            virt: VirtAddr(WINDOW_A as u64),
+            object_id,
+            phys,
+            cap: None,
+            installed: false,
+            pinned: false,
+            displaced_pinned: None,
+            replaced: None,
+        }];
+        fx.kernel
+            .with(|s| {
+                s.with_vm_then_memory_mut(|spaces, memory| {
+                    crate::kernel::syscall::vm::install_and_account_locked(
+                        spaces,
+                        memory,
+                        child,
+                        PageFlags::USER_RX,
+                        &mut records,
+                    )
+                })
+            })
+            .expect("install");
+        assert_eq!(release(&fx, cap, 0, 0), Ok(PAGE));
+        revoke_source(&fx);
+        let settle = |id: u64| {
+            fx.kernel.with(|s| {
+                s.with_memory_state_mut(|m| {
+                    crate::kernel::syscall::vm::settle_displaced_hold_locked(m, id, interior)
+                })
+            })
+        };
+        assert!(settle(fx.object_id), "the real settlement reclaims");
+        assert!(extent_returned(&fx));
+        // A replacement takes the same extent.
+        let (new_id, new_cap) = fx
+            .kernel
+            .with(|s| s.alloc_anonymous_memory_object_with_len(4 * PAGE))
+            .expect("replacement object");
+        let new_base = fx.kernel.with(|s| {
+            s.with_memory_state(|m| {
+                m.memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|e| e.id == new_id)
+                    .map(|e| e.phys)
+            })
+        });
+        assert_eq!(new_base, Some(fx.base), "the extent really is reused");
+        let before = fx.kernel.with(|s| s.memory_object_refcounts_by_id(new_id));
+        assert!(
+            !settle(fx.object_id),
+            "the stale settlement reclaims nothing"
+        );
+        assert_eq!(
+            fx.kernel.with(|s| s.memory_object_refcounts_by_id(new_id)),
+            before,
+            "and the replacement's counts are untouched"
+        );
+        let _ = new_cap;
+    }
+
+    // ── copy-on-write and borrowed backing ────────────────────────────────────────────────────
+
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let rest = src
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("missing `{signature}`"))
+            .1;
+        rest.split_once("\n    }\n").map_or(rest, |(b, _)| b)
+    }
+
+    /// **Every split path that drops a mapping reference before its invalidation completes holds
+    /// the page's owner until it does.** The COW private copy, the two-phase unmap, the receive
+    /// install and the direct transaction's map follow-up are compiled only into freestanding
+    /// kernels, so this is their hosted evidence (the live witness drives the receive paths):
+    /// each converts the reference into an identity hold BEFORE its shootdown, and settles it only
+    /// AFTER an acknowledged one.
+    #[test]
+    fn every_split_displacement_holds_its_page_until_the_invalidation_completes() {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        for (name, sig, shoot) in [
+            (
+                "COW private copy",
+                "pub(crate) fn cow_recover_private_copy_split(",
+                "self.complete_unmap_shootdown_split(asid, page)",
+            ),
+            (
+                "two-phase unmap",
+                "pub(crate) fn unmap_range_two_phase_from_split(",
+                "self.complete_unmap_shootdown_from_split(requester, asid, VirtAddr(va as u64))",
+            ),
+            (
+                "receive install",
+                "pub(crate) fn map_user_page_raw_split(",
+                "self.complete_unmap_shootdown_from_split(requester, asid, virt)",
+            ),
+            (
+                "direct map follow-up",
+                "pub(crate) fn sr_apply_map_followup_split(",
+                "self.complete_unmap_shootdown_split(asid, virt)",
+            ),
+        ] {
+            let body = body_of(RUNTIME, sig);
+            let shoot_at = body
+                .find(shoot)
+                .unwrap_or_else(|| panic!("{name}: the shootdown"));
+            let settle_at = body
+                .find("settle_displaced_hold_locked")
+                .or_else(|| body.find("settle_displaced_after_invalidation_split("))
+                .unwrap_or_else(|| panic!("{name}: the settlement"));
+            assert!(
+                shoot_at < settle_at,
+                "{name}: settled only after the shootdown"
+            );
+            if name != "receive install" {
+                let hold_at = body
+                    .find("retire_mapping_to_hold_locked")
+                    .unwrap_or_else(|| panic!("{name}: the hold"));
+                assert!(hold_at < shoot_at, "{name}: held before the shootdown");
+            }
+            for by_address in [
+                "reclaim_memory_object_for_phys_locked(memory, old_phys)",
+                "reclaim_memory_object_for_phys_locked(m, mapping.phys)",
+                "reclaim_memory_object_for_phys_locked(m, old.phys)",
+            ] {
+                assert!(
+                    !body.contains(by_address),
+                    "{name}: the displaced page is never reclaimed by address"
+                );
+            }
+        }
+        // The receive install takes its hold inside the one VM→memory acquisition.
+        const VM_LOCKED: &str = include_str!("vm_image_locked.rs");
+        let install = VM_LOCKED
+            .split_once("pub(crate) fn map_user_page_holding_displaced_locked(")
+            .map(|(_, r)| r.split_once("\n}\n").map_or(r, |(b, _)| b))
+            .expect("the holding install");
+        assert!(install.contains("retire_mapping_to_hold_locked(memory, old_mapping.phys)"));
+        assert!(!install.contains("reclaim_memory_object_for_phys_locked"));
+        // The settlement keeps an unacknowledged hold.
+        let settle = body_of(
+            RUNTIME,
+            "pub(crate) fn settle_displaced_after_invalidation_split(",
+        );
+        assert!(
+            settle.contains("if acknowledged {") && settle.contains("VM_DISPLACED_HOLD_RETAINED")
+        );
+    }
+
+    #[repr(C, align(4096))]
+    struct Initrd([u8; 4 * PAGE]);
+
+    /// **Borrowed backing takes no address-keyed reference and is never freed**, even when two
+    /// file slices overlap: an interior page of one slice is granted, mapped, and torn down, and
+    /// neither slice's counters move, the allocator's inventory does not change, and each slot
+    /// lives exactly as long as its own capabilities.
+    #[test]
+    fn borrowed_overlapping_slices_are_never_freed_and_live_by_their_capabilities() {
+        let fx = fixture(1);
+        let initrd = alloc::boxed::Box::new(Initrd([0u8; 4 * PAGE]));
+        let (a_id, a_cap) = fx
+            .kernel
+            .with(|s| s.create_initramfs_file_slice_mo(&initrd.0[..], 0, 3 * PAGE))
+            .expect("slice A");
+        let (b_id, b_cap) = fx
+            .kernel
+            .with(|s| s.create_initramfs_file_slice_mo(&initrd.0[..], PAGE, 2 * PAGE))
+            .expect("slice B, overlapping A's last two pages");
+        let a_refs = || fx.kernel.with(|s| s.memory_object_refcounts_by_id(a_id));
+        let b_refs = || fx.kernel.with(|s| s.memory_object_refcounts_by_id(b_id));
+        let free = || {
+            fx.kernel
+                .with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()))
+        };
+        let (a0, b0, free0) = (a_refs(), b_refs(), free());
+
+        // Grant A's interior page 1 — a page B also covers.
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [fx.send_cap.0 as usize, PAGE, PAGE, 0, 0, a_cap.0 as usize],
+        );
+        assert_eq!(fx.kernel.with(|s| dispatch(s, &mut send)).err(), None);
+        let mut f = TrapFrame::new(SYSCALL_IPC_RECV_NR, [0; 6]);
+        f.set_arg(SYSCALL_ARG_CAP, fx.recv_cap.0 as usize);
+        f.set_arg(SYSCALL_ARG_PTR, WINDOW_A);
+        f.set_arg(SYSCALL_ARG_LEN, PAGE);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_RECV_MAP_INTENT_READ);
+        assert_eq!(fx.kernel.with(|s| dispatch(s, &mut f)).err(), None);
+        assert!(translation(&fx, fx.asid, WINDOW_A).is_some(), "mapped");
+        assert_eq!(
+            a_refs().map(|r| r.1),
+            a0.map(|r| r.1),
+            "a borrowed page takes no mapping reference"
+        );
+        assert_eq!(b_refs(), b0, "and the overlapping slice is untouched");
+
+        teardown(&fx, fx.asid);
+        assert_eq!(
+            free(),
+            free0,
+            "teardown hands no initrd page to the allocator"
+        );
+        assert!(
+            a_refs().is_some() && b_refs().is_some(),
+            "both slots live by their caps"
+        );
+
+        fx.kernel.with(|s| {
+            s.revoke_capability_in_cnode(fx.cnode, a_cap)
+                .expect("revoke A");
+        });
+        // The receiver's cleanup capability for A is still held, so A lives on; B is unaffected.
+        assert!(b_refs().is_some());
+        fx.kernel.with(|s| {
+            s.revoke_capability_in_cnode(fx.cnode, b_cap)
+                .expect("revoke B");
+        });
+        assert!(b_refs().is_none(), "B's slot goes with its last capability");
+        assert_eq!(free(), free0, "and no release ever touched the allocator");
     }
 }

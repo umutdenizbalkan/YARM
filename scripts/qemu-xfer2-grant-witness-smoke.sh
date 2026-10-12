@@ -103,9 +103,23 @@ ORDINARY_ROUTES=${ORDINARY_ROUTES:-0}
 # Composes with ORDINARY_ROUTES: the four runs together cover NR 30, NR 2 and NR 5 at a zero and
 # at a non-zero object offset.
 OFFSET_SELECTION=${OFFSET_SELECTION:-0}
+# SHARED-REGION-LIFETIME1 — grant A becomes the lifetime cycle (userspace feature
+# `shared-region-lifetime-witness`, NR 30 profile only): the interior grant is held across a fork,
+# the child validates its inherited mapping and exits, and the parent re-validates its own mapping
+# after the child's teardown before releasing it. Implies OFFSET_SELECTION=1, so the mapping is
+# interior to the object.
+LIFETIME=${LIFETIME:-0}
+if (( LIFETIME )); then
+  (( ORDINARY_ROUTES )) && { echo "[xfer2-witness][fail] LIFETIME=1 is an NR 30 profile"; exit 1; }
+  OFFSET_SELECTION=1
+fi
 CELL_FEATURES=()
 (( ORDINARY_ROUTES )) && CELL_FEATURES+=(recv-queue1-ordinary-grant)
-(( OFFSET_SELECTION )) && CELL_FEATURES+=(shared-region-offset-witness)
+if (( LIFETIME )); then
+  CELL_FEATURES+=(shared-region-lifetime-witness)
+elif (( OFFSET_SELECTION )); then
+  CELL_FEATURES+=(shared-region-offset-witness)
+fi
 USERSPACE_FEATURES="--no-default-features"
 if (( ${#CELL_FEATURES[@]} )); then
   USERSPACE_FEATURES="--no-default-features --features $(IFS=,; echo "${CELL_FEATURES[*]}")"
@@ -117,7 +131,7 @@ case "$ARCH" in
   *)      ORACLE_VA=0x20000000 ;;
 esac
 
-note "building base $ARCH artifacts (ordinary_routes=$ORDINARY_ROUTES offset_selection=$OFFSET_SELECTION)"
+note "building base $ARCH artifacts (ordinary_routes=$ORDINARY_ROUTES offset_selection=$OFFSET_SELECTION lifetime=$LIFETIME)"
 BOOTSTRAP_FEATURE_ARGS="$USERSPACE_FEATURES" \
   "$BUILD_SCRIPT" >"$LOGDIR/build.log" 2>&1 || die "base artifact build failed"
 
@@ -235,7 +249,10 @@ if (( ORDINARY_ROUTES )); then
   [[ "$unrouted" == "0" ]] \
     || die "with the shared-region oracle ARMED, $unrouted recognized receive(s) still reached the terminal acquisition"
 else
-  for shape in registered_range explicit_range; do
+  # The lifetime profile's grant A is the lifetime cycle, judged below; grant B is unchanged.
+  SHAPES="registered_range explicit_range"
+  (( LIFETIME )) && SHAPES="explicit_range"
+  for shape in $SHAPES; do
     # The VERDICT line only — `XFER2_GRANT_DETAIL` carries the observed values on its own line
     # and also names the shape, so an unqualified `shape=` match would count two lines per grant.
     m="XFER2_GRANT_WITNESS shape=$shape"
@@ -316,9 +333,43 @@ if (( OFFSET_SELECTION )); then
 else
   [[ "$offset_marker" == "0" ]] || die "the zero-offset profile carries the offset cell"
 fi
+# The lifetime profile installs the interior pages three times: grant A, the forked child's
+# clone of it, and grant B.
+INSTALLS=4
+(( LIFETIME )) && INSTALLS=6
 frames=$(python3 -I scripts/lib/shared-region-frames.py "$NORM" "$GRANT_OFFSET" "$ORACLE_VA")
-[[ "$frames" == "installs=4 misplaced=0" ]] \
+[[ "$frames" == "installs=$INSTALLS misplaced=0" ]] \
   || die "the oracle object's frames were not installed at the granted object offset ($frames)"
+
+# ── SHARED-REGION-LIFETIME1: the interior mapping outlives the other owner's release ──
+#
+# Userspace: the parent released grant A (unmapped, revoked) and only THEN did the forked child
+# read every byte of its inherited mapping of the same interior frames.
+#
+# Kernel side, from the object's own accounting (`SHARED_REGION_ORACLE_REFS`, reported after each
+# change by the operation that made it), the exact transition sequence the ownership contract
+# requires — `<op><page>:<map_refcount>/<pin_refcount>`:
+#
+#   m1:1/0,m2:2/0   grant A maps object pages 1 and 2: one reference each
+#   m1:3/0,m2:4/0   the fork's clone maps them again in the child: independent references
+#   u1:3/1,s1:3/0   the parent's release: each removed reference becomes an identity hold, and
+#   u2:2/1,s2:2/0   the hold settles only after the page's invalidation completed
+#   (the same four transitions for grant B, from map=2 — the child's two surviving references)
+#
+# and no frame of the object's extent is ever handed back to the allocator. The base kernel keyed
+# this accounting on the object's FIRST frame, so an interior page produced no record at all.
+if (( LIFETIME )); then
+  lt_line="SHARED_REGION_LIFETIME_WITNESS held=1 release=1 unmapped=1 revoked=1 result=1"
+  [[ "$(count "$lt_line")" == "1" ]] || die "the lifetime cycle's parent half did not pass"
+  [[ "$(count 'SHARED_REGION_LIFETIME_CHILD page0=1 page1=1 result=1')" == "1" ]] \
+    || die "the forked child did not read its inherited interior mapping intact"
+  have 'SHARED_REGION_LIFETIME_CHILD_EXIT_DECLINED' && die "the forked child's exit was declined"
+  lt=$(python3 -I scripts/lib/shared-region-lifetime.py "$NORM")
+  a_cycle="m1:1/0,m2:2/0,m1:3/0,m2:4/0,u1:3/1,s1:3/0,u2:2/1,s2:2/0"
+  b_cycle="m1:3/0,m2:4/0,u1:3/1,s1:3/0,u2:2/1,s2:2/0"
+  want="refs=$a_cycle,$b_cycle frees_in_extent=0 order=ok"
+  [[ "$lt" == "$want" ]] || die "the oracle object's accounting diverged from the contract ($lt)"
+fi
 
 # ── Nothing may have gone wrong on the way ──
 for bad in \
@@ -337,12 +388,20 @@ if (( fail )); then
   echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH result=fail"
   exit 1
 fi
-note "NR 30 received+mapped and NR 4 released two disposable grants, both shapes, split route only"
+if (( LIFETIME )); then
+  note "an interior mapping outlived the other owner's NR 4 release; no frame of the object was freed"
+else
+  note "NR 30 received+mapped and NR 4 released two disposable grants, both shapes, split route only"
+fi
 # The seal names WHICH profile passed. It used to hardcode the NR 30 shape names on both runs,
 # so an ordinary-routes pass was indistinguishable from an NR 30 pass in the transcript — and the
 # two are complementary cells of one witness, not interchangeable.
 if (( ORDINARY_ROUTES )); then
   echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=ordinary_routes grants=2 pages=2 object_offset=$GRANT_OFFSET shapes=nr2,nr5_timed releases=2 route=split unrouted=0 result=ok"
 else
-  echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=nr30 grants=2 object_offset=$GRANT_OFFSET shapes=registered_range,explicit_range releases=2 route=split result=ok"
+  if (( LIFETIME )); then
+    echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=nr30_lifetime grants=2 object_offset=$GRANT_OFFSET shapes=lifetime_fork,explicit_range releases=2 route=split interior_frames_freed=0 result=ok"
+  else
+    echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=nr30 grants=2 object_offset=$GRANT_OFFSET shapes=registered_range,explicit_range releases=2 route=split result=ok"
+  fi
 fi

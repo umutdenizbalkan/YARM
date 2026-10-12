@@ -25677,6 +25677,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 |---|---|---|
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | fixed and delivered (SHARED-REGION-OFFSET1, qualified `9d991d0c`) | owner ABI decision: byte offset relative to the `MemoryObject`, page-aligned, a `DmaRegion` bounds without rebasing. On `a91632ba` a non-zero offset maps the wrong pages on the queued, direct and NR 30 paths, NR 30 maps the whole window, a `MemoryObject` descriptor whose `len` fits but whose `offset + len` does not is accepted, and a misaligned offset is accepted — nine hosted regressions fail. One range policy now admits and resolves on every path; live: every receive family maps a middle two-page range on all three ports |
+| BL1-b — shared-region backing lifetime: mapping references, displaced-page holds and reclamation keyed on an object's first frame | fixed and delivered (SHARED-REGION-LIFETIME1, qualified `TBD-SRL1-COMMIT`) | on `96114d69` a mapped interior page took no mapping reference, a displaced or unmapped interior page took no hold, teardown handed live interior frames to the allocator, and an object whose capabilities were gone was reclaimed while a forked child still mapped it — ten of twelve hosted regressions fail. The owner of a page is now the live allocator-owned extent that contains it; a removed or displaced reference becomes an identity hold settled after its invalidation; live: an interior mapping survives the other owner's release on all three ports, read back from the kernel's own counters |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | fixed and delivered (qualified `1d7be22c`) | reproduced live with a new default-off witness: base stops the whole system at `IRQ1_UNKNOWN_SETTLED … strict=1`. A U-mode illegal instruction now decodes as the task's `UserInstructionFault` at `sepc`, and the RISC-V bridge settles it through BL2's route and the same terminal owners; init is reported and terminated, and a replacement runs |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
@@ -25732,9 +25733,10 @@ page 0 of single-page anonymous objects.
 **Lifecycle.** Unchanged and covered: the per-page rights check precedes the install; a later-page
 failure unmaps the installed prefix through the two-phase owner (shootdown before reclaim), revokes
 the minted capability and clears the return lane; release unmaps the whole range before revoking;
-the object's `map_refcount` is keyed on its base frame, as for the direct and NR 30 mappings, and the
-receiver's capability plus the active-transfer registration hold the object across the whole range
-until release.
+the receiver's capability plus the active-transfer registration hold the object across the whole
+range until release. (This section said the object's `map_refcount` was "keyed on its base frame";
+that was the defect SHARED-REGION-LIFETIME1 (BL1-b) repaired — every mapped page of the object now
+counts.)
 
 **Evidence.**
 
@@ -25839,10 +25841,15 @@ The three that pass on the base are preservation guards (NR 30 still refuses a b
 * The final page: mapped whole, admissible because every object and window is page-granular and
   the whole page-rounded selection must lie inside the window. No byte-level isolation of the tail
   is claimed.
-* Liveness is unchanged: the receiver-local capability plus the active-transfer registration keep
-  the object alive, and revoke unmaps the registered range two-phase before dropping
-  `cap_refcount`. `map_refcount` stays keyed on the object's base frame, which a non-zero-offset
-  selection does not map — exactly as pages 1+ of a zero-offset selection never counted.
+* Liveness was left as it was: the receiver-local capability plus the active-transfer registration
+  keep the object alive, and revoke unmaps the registered range two-phase before dropping
+  `cap_refcount`. This section then claimed that liveness did not depend on mapping accounting,
+  because `map_refcount` stayed keyed on the object's base frame. **That claim was wrong**
+  (corrected by SHARED-REGION-LIFETIME1, below): the receiver's capability bounds only its own
+  grant, while a mapping can outlive it — a forked child's clone, an alias, an address space
+  being torn down, a displaced page whose invalidation has not completed — and only the mapping
+  accounting kept the object, and its frames, alive for those. Keyed on the first frame, it did
+  not count an interior page at all.
 
 **Newly refused inputs** (all `IpcSend` → `InvalidArgs`, before publication): a misaligned offset;
 a `MemoryObject` selection reaching past its object; a page-rounded end that overflows. Changed
@@ -25906,6 +25913,187 @@ passed and none was re-run.
 * *Pre-existing, not changed:* the hosted tests gated on `x86-shared-region-direct-oracle` do not
   compile on `a91632ba` either. The five errors are the same, all a `publish_recv_waiter_live`
   argument type.
+
+### BL1-b — SHARED-REGION-LIFETIME1: who owns a mapped or displaced page
+
+**The contract.** A `MemoryObject` is one physical range `[phys, phys + len)`. Its slot lives while
+any of three counts is non-zero, and is reclaimed — once, by identity — when all three reach zero:
+
+* `cap_refcount`: one per capability naming the object (the sender's source capability, every
+  receiver-local cleanup capability, every fork-inherited copy);
+* `map_refcount`: one per installed page of the object, **whichever page it is**, in any address
+  space;
+* `pin_refcount`: one per in-flight obligation — a queued transfer envelope, a VmMap provisional
+  frame, and an **identity hold** on a page whose translation was removed but whose invalidation
+  has not yet completed.
+
+The receiver's capability bounds its own grant and nothing else. A mapping outlives it whenever
+the address space that holds the mapping outlives the grant: a forked child's clone of a received
+window, a second alias, an address space being drained, or a page displaced by a new mapping on
+another CPU's TLB. For all of those only the mapping accounting (and, across the invalidation
+window, the hold) keeps the object — and its frames — alive.
+
+**Defect (reproduced on `96114d69`, through production owners).** Every accounting operation
+identified the object by `object.phys == phys`, so only a mapping of an object's FIRST frame
+counted:
+
+* `note_mapping_inserted[_locked]` / `note_mapping_removed[_locked]` and
+  `reclaim_memory_object_for_phys[_locked]` matched the base frame only. An interior page took no
+  reference — pages 1+ of every zero-offset multi-page grant, and every page of a non-zero-offset
+  grant (BL1-a).
+* `pin_object_for_phys_locked` could not pin an interior page, so a displaced or two-phase-unmapped
+  interior page took no hold; `settle_displaced_hold_locked` authenticated against the base frame.
+* The drain's free gate (`release_unreferenced_user_frame_locked`) asked whether an object STARTED
+  at the frame and otherwise returned it to the allocator — so tearing down an address space that
+  mapped an interior page freed a frame its live object still owned, at offset 0 as well.
+* Reclamation compared the three counts with interior mappings missing from `map_refcount`, so
+  an object whose capabilities were gone was reclaimed (and its whole extent freed) while a child
+  still mapped its interior pages.
+
+`shared_region_lifetime1` drives these through the broad dispatcher, the split receive lane, NR 4,
+the production revocation, the fork clone and fork transaction, address-space teardown, the NR 31
+reap transaction and the VmMap transaction, and reads back translations, the three counts, the
+object's identity and the frame allocator's own state (a frame is charged; the exact extent comes
+back from `alloc_contiguous`). On the base ten of the twelve fail:
+
+* *Incorrect accounting.* A two-page grant at offset 0 counts one mapping, not two (`(2, 1, 0)`
+  where `(2, 2, 0)`); two aliases of the interior pages count none (`(3, 0)` where `(3, 4)`); the
+  fork transaction's clone of an interior mapping counts none (`0` where `2`); and a grant of an
+  interior page of one initramfs slice charges the OVERLAPPING slice that happens to start at that
+  page (`(1, 1, 0)` where `(1, 0, 0)`) — the address named the wrong object.
+* *Missing displaced-page protection.* Displacing an interior page records no hold (`None` where
+  the object's id); a failed remote invalidation leaves the object unpinned (`0` where `1`); the
+  settlement of a real hold does not reclaim (it authenticated against the base frame), which
+  also leaves the stale-settlement case unreachable; and the source contract finds no hold
+  taken before, or settled after, the shootdown in the split displacement paths.
+* *Premature reclamation.* After the parent's release and the sender's revocation, a forked child
+  still maps both interior pages, and the object is already gone (`None` where `(0, 2, 0)`) — its
+  extent back in the allocator while mapped.
+* *Frames freed under a live object.* Tearing down an address space that maps the object at
+  offset 0 returns the object's page 1 to the allocator while the object is live.
+* *Leaked backing after the final unmap* was not separately reproduced. On the repaired kernel
+  every case that ends the object's life also proves the exact extent comes back
+  (`extent_returned`), so a leak would fail them.
+
+The two that pass on the base are kept as coverage: the partial NR 4 unmap and the later-page
+rollback. Both compare counts before and after, and the base neither takes nor returns an
+interior page's reference, so they agree there for the wrong reason.
+
+**Repair — one owner, one hold.**
+
+* *Owner identity.* `KernelState::frame_owner_slot_locked(memory, phys)` is THE answer: the live
+  **allocator-owned** object whose extent contains `phys`. Live allocator extents are disjoint
+  (`alloc_contiguous` never hands out a charged frame), so containment is unique — not "the first
+  containing range". Borrowed (initramfs file-slice) objects are excluded deliberately: slices of
+  the one initrd may overlap and a pre-existing zero-copy mapping of the same page exists, so an
+  address cannot name one of them; and they are never freed, so they need no address-keyed
+  reference — a borrowed slot lives exactly as long as its capabilities and pins. `note_mapping_*`,
+  `reclaim_memory_object_for_phys` and `pin_object_for_phys_locked` all ask it; the broad
+  `note_mapping_*` wrappers now delegate to the `_locked` owners instead of keeping a second copy.
+* *Teardown.* The drain's free gate refuses any frame inside ANY object's extent
+  (`frame_described_by_object_locked`); such a frame is its object's, reclaimed with it.
+* *Removal before invalidation becomes a hold.* `retire_mapping_to_hold_locked` pins the page's
+  owner by identity and drops the mapping reference in ONE memory acquisition. The holder completes
+  the invalidation with no lock held, then `settle_displaced_hold_locked(object_id, phys)` unpins
+  and reclaims if that was the last reference — authenticated by id AND extent containment. An
+  unacknowledged invalidation keeps the hold (`VM_DISPLACED_HOLD_RETAINED … reason=
+  invalidation_incomplete`, or the existing `X86_TLB_SHOOTDOWN_FAIL`): the backing is quarantined,
+  never recycled. Object ids are never reused, so a stale settlement cannot reach a replacement at
+  a reused address.
+* *Every split path that removed a live mapping before its shootdown now holds:* the two-phase
+  unmap (NR 4 and revocation), the COW private copy, the receive install
+  (`map_user_page_raw_split` → `map_user_page_holding_displaced_locked`) and the direct
+  transaction's map follow-up. VmMap's pass B already pinned; it now pins interior pages too.
+* Unchanged: the offset ABI, capability rights and the revocation contract (revoke unmaps the
+  registered range two-phase before dropping `cap_refcount`), lock ranks, and the transaction
+  owners. No capacity grew; no new acquisition.
+
+**Behaviour change.** A mapped page of a borrowed slice no longer takes a mapping reference — not
+even the slice's first page, which used to. Borrowed backing was never freed by any path, so no
+lifetime depended on it.
+
+**Evidence — hosted (`shared_region_lifetime1`, twelve cases).**
+
+* Accounting: every mapped page takes and returns exactly one reference, on both receive routes, at
+  object offsets 0, `PAGE` and `2·PAGE` (partial final page included); two aliases of the same
+  interior pages keep independent lifetimes, and after the last the extent is reused exactly; a
+  partial NR 4 unmap returns exactly its own page's reference and the revocation the rest; a
+  later-page failure returns every interior reference (x86_64 hosted).
+* Teardown, fork, revocation: teardown frees no frame of a live object; a forked interior mapping
+  outlives the parent's release AND the sender's revocation, keeps every frame charged, and its
+  teardown reclaims the object once; the same through the fork TRANSACTION and the NR 31 reap
+  TRANSACTION (the child is withdrawn from the runqueue and exits through the broad exit owner,
+  `exit_task`, which is the shape the reap requires; neither touches a counter).
+* Displacement: displacing an interior page holds the object by identity, a competing reclaimer
+  frees nothing, and only the settlement reclaims; a **failed** remote invalidation (hosted-only
+  injection: the VmMap owners refuse the acknowledgement) leaves the object held with every frame
+  charged after all other references are gone; a stale settlement after the extent is reused by a
+  new object reclaims nothing and leaves the replacement's counts untouched; a source contract
+  that each split displacement holds before and settles after its shootdown (those bodies are
+  compiled only into freestanding kernels).
+* Borrowed: two overlapping initramfs slices, an interior page of one granted, mapped and torn
+  down — no counter moves, the allocator's free count is unchanged, each slot lives by its own
+  capabilities.
+
+Five existing source guards that pinned the by-address reclaim were re-derived to the hold and
+settle they now require (`stage198e3b2a_offlock_ctx`, `u9a64cow2_split_route`,
+`u9aspace1_teardown_frame_reclaim`, `u9cow2_route`, `u9d3_split_unmap_drives_real_d3`), each still
+checking its original ordering.
+
+**Evidence — live (`LIFETIME=1 scripts/qemu-xfer2-grant-witness-smoke.sh <arch>`).** The default-off
+userspace feature `shared-region-lifetime-witness` (implies `shared-region-offset-witness`) turns
+init's NR 30 grant A into the lifetime cycle: receive the interior selection `[PAGE, 3·PAGE)` of the
+four differently patterned oracle pages, `fork`, and the parent — the other owner — releases its
+grant through NR 4 at once (window unmapped, cleanup capability revoked); the child then reads every
+byte of its inherited mapping of the same frames and exits. Grant B re-grants the same pages after
+A's complete release. The witness only coordinates: the clone, release, invalidation and accounting
+are production paths. The order is **yield-sequenced** on `-smp 1` (the child yields 64 times before
+it looks; after the fork AArch64 ran the child first, x86_64 and RISC-V the parent) and is read from
+the kernel log, never assumed — a first AArch64 run without the child's wait failed
+`order=bad:child_before_release` rather than passing. Kernel side, the oracle kernel feature
+reports the oracle object's counts after each change (`SHARED_REGION_ORACLE_REFS`), and the smoke
+requires exactly:
+
+```text
+m1:1/0,m2:2/0                 grant A maps object pages 1 and 2           (<op><page>:<map>/<pin>)
+m1:3/0,m2:4/0                 the fork's clone maps them again
+u1:3/1,s1:3/0,u2:2/1,s2:2/0   the parent's release: hold, invalidate, settle — per page
+m1:3/0,m2:4/0,u1:3/1,s1:3/0,u2:2/1,s2:2/0   grant B, from the child's two surviving references
+```
+
+with the clone's references inside the fork, the release before the child's check, no
+`ASPACE_FRAME_RELEASED` inside the object's extent, six installs all at the granted offset, and
+both grants' userspace verdicts. Live on all three ports the cell seals
+`profile=nr30_lifetime … interior_frames_freed=0 result=ok`. **The unrepaired kernel** (`96114d69`
+with only the counter report added, same userspace) **passes every userspace check on every port**
+— the child's bytes are intact, because init's source capability keeps the object and no teardown
+runs live — **and fails every port on the accounting**: no reference was ever recorded for any of
+the six interior installs (`refs=` empty). The live cell therefore discriminates through the
+kernel's own counters, not through the bytes; the premature reclamation and the frees are hosted
+evidence.
+
+**Final-candidate controls.** TBD-SRL1-CONTROLS
+
+**Remaining limitations.**
+
+* *An exited fork child is not torn down live.* NR 16 retires the task, but the address space and
+  capabilities are released only by the NR 31 reap, which only PM issues, and only for a restart
+  replacement. The live child's mapping therefore survives to the end of the boot (the final
+  `map=2`), and teardown's release of interior references is hosted evidence (address-space
+  teardown and the reap transaction). The object cannot be reclaimed live either: init keeps the
+  oracle's source capability.
+* *Hosted-only failure coverage.* A failed remote invalidation is injected only in hosted tests;
+  live SMP invalidation is exercised by SMP1/2/3 and always acknowledges.
+* *The broad immediate reclaim.* `map_user_page_in_asid_raw_locked` still reclaims a displaced page
+  at once. That is admissible only where no CPU can hold a translation — unpublished or
+  never-resident address spaces (spawn provisioning, the fork clone's child) and the hosted broad
+  routes; every route into a live address space uses the holding install.
+* *Equality left where it is harmless.* `find_current_task_cap_for_memory_object_phys` (no caller)
+  and the hosted test accessors keyed on an object's base address still use equality.
+* Only allocator-owned and borrowed objects exist; a future object kind that is neither must
+  choose one of the two disciplines explicitly.
+
+**Qualification.** TBD-SRL1-QUAL
 
 ### BL2 — x86 user port-I/O fault containment
 
@@ -27172,9 +27360,10 @@ the in-lock attestation BL6a removes, and it now requires the idle cell to forbi
 Every row of the table above is fixed or explicitly bounded. A bounded row is still OPEN: it names
 the condition under which it stays harmless and what would remove it; it is not a closure.
 
-* *Fixed and delivered:* BL1, BL1-a (SHARED-REGION-OFFSET1), BL2, BL2-a, BL3a–c, BL4a–b, BL5a,
-  BL5a-2, BL5a-2b, BL5b, BL5b-2, BL5b-4, BL5c, BL5d, BL6a, BL6c, BL6e. Each has its own section
-  above: defect, repair, evidence, and the frozen commit it was qualified on.
+* *Fixed and delivered:* BL1, BL1-a (SHARED-REGION-OFFSET1), BL1-b (SHARED-REGION-LIFETIME1),
+  BL2, BL2-a, BL3a–c, BL4a–b, BL5a, BL5a-2, BL5a-2b, BL5b, BL5b-2, BL5b-4, BL5c, BL5d, BL6a, BL6c,
+  BL6e. Each has its own section above: defect, repair, evidence, and the frozen commit it was
+  qualified on.
 * *Bounded with a stated condition (open):*
   * BL5b-3: latent, no failing sample;
   * BL6b and BL6a's premise: boot-order dependent, now named;

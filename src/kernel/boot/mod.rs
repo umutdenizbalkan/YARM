@@ -73,7 +73,7 @@ pub(crate) use ipc_state::{
 };
 pub(crate) mod cleared_current;
 pub(crate) mod exit_claim;
-mod memory_lifecycle_state;
+pub(crate) mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;
 // U9-RECV-BLOCK1 §6 — the one-shot SMP-unlock audit's latch, readable lock-free from the trap
@@ -9362,6 +9362,9 @@ pub fn provision_init_shared_region_oracle(
             phys,
             len
         );
+        // SHARED-REGION-LIFETIME1: name the object whose counters the lifetime witness reads back.
+        memory_lifecycle_state::SHARED_REGION_ORACLE_OBJECT_ID
+            .store(obj_id, core::sync::atomic::Ordering::Relaxed);
         for off in 0..len {
             match KernelState::phys_to_direct_map_ptr(phys + off as u64) {
                 Some(ptr) => unsafe {

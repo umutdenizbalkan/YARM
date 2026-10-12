@@ -216,6 +216,12 @@ recv-queue1-ordinary-grant = []
 # offset profile and the zero-offset profile are complementary runs of one witness, and gated off
 # the init image carries none of it. Accepted and inert outside yarm-control-plane-servers.
 shared-region-offset-witness = []
+# SHARED-REGION-LIFETIME1: the NR 30 cell's first grant becomes the lifetime cycle — the interior
+# grant is received, init forks, the child validates its inherited mapping and exits (its
+# address-space teardown is the other owner's release), and the parent re-validates its own
+# mapping before releasing it. Implies the offset profile, so the mapping is interior. Accepted
+# and inert outside yarm-control-plane-servers.
+shared-region-lifetime-witness = ["shared-region-offset-witness"]
 # Stage 200D-0D1: the RISC-V disposable-task ExitCurrentTask live oracle — the third and final
 # arch cell. Selector, marker and gate literals compile ONLY with this feature; the production
 # NR16 syscall, the disposition publication and the RISC-V post-lock consumer are
