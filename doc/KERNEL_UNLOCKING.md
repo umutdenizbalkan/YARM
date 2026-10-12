@@ -25687,7 +25687,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL5b-3 — the AArch64 U9-RX4 evaluator assumes the queued route | latent (found in BL5b-2) | AArch64 runs the direct request route, but no AArch64 cell has been observed sending tid 2's query direct; the attestation the x86_64 derivation uses is emitted there too |
 | BL5c — strict-core runners boot artifacts lacking required witness features | fixed and delivered (qualified `876869ed`) | a strict run booted whatever its paths held: an x86_64 default artifact ran 60 s and failed `witness absent`, and base strict passed a RISC-V oracle kernel copied over the recorded one and an x86_64 kernel/initramfs pair from two builds. The manifest records role and features per artifact; each core smoke binds both artifacts and the mode's required features before booting and a strict run refuses by name; the CI strict job and the final seal's RUN_A build the witness artifact |
 | BL5d — SMP log loss failing one-shot asynchronous checks | fixed and delivered (qualified `0346b8f6`) | the printk drain skipped a slot another CPU had reserved but not finished writing and advanced past it, so the record was never drained; the counter that should have shown it was never incremented. Base failed a completed cross-CPU request (record sealed 7/7, two one-shot lines lost). The drain now holds an in-flight record for its writer's own flush and counts and announces only genuine overwrite losses (`PRINTK_RECORDS_LOST`); the SMP graders report an announced loss as incomplete evidence |
-| BL5b-4 — the RISC-V terminal-fault cell exempts its required markers instead of deriving them | confirmed open (found while drafting BL2-a) | with `TERMINAL_FAULT_ORACLE=1` the RISC-V core smoke skips EVERY required marker and the spawn census, including kernel boot, timer, PLIC and cross-arch markers that do not depend on init's spawn chain; the x86_64 cell derives its obligation since BL5b |
+| BL5b-4 — the RISC-V terminal-fault cell exempts its required markers instead of deriving them | fixed and delivered (qualified `d953f8d9`) | the cell now owes the eleven spawn-chain markers and the spawn census zero, given init's own fault and no SpawnV5 call, and keeps every other required marker; base accepted five mutated terminal-fault boots (a lost kernel marker, a lost cross-arch marker, an unspawned service, a spawn before the fault, a stray spawn dispatch) that the candidate rejects by name |
 | BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate. The checker requires broad-path markers the split NR 9 route no longer emits (`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, `…DISPATCH_DEFER_BEGIN`, `…HANDLER_BYPASS_BEGIN/DONE`, `…DISPATCH_DONE result=idle`), while the kernel's own idle chain (`…NO_INCOMING`, `…POST_LOCK_IDLE_*`, `…IDLE_ORACLE_DONE result=ok`) is present; in one base boot another task was runnable, so the cell's no-incoming premise is also boot-order dependent |
 | BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open — intermittent | failed on true base `c44e9b46` (2/2) and on the first BL4a freeze `9b5838c4`; passed on `e2f4e52b` and `53a5b112` (`RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok`), so boot-order dependent, not closed by BL4a |
 | BL6c — AArch64 timer5 witness capture is stopped early by the core smoke | fixed and delivered (qualified `a8e1161e`) | the runner now stops the AArch64 boot on the witness's own summary line instead of the first terminal idle; candidate 4/4, base 3/4 (base's failing log ends ~850 lines before the summary, and its passes end only 178–1,054 lines after it) |
@@ -26904,3 +26904,66 @@ requires:
 * *Suites:* fmt clean; hosted 6,035 passed; integration 300/300; census 9/9.
 * *Freestanding build:* warnings identical to base (180 / 208 / 190, same classes). The kernel
   images differ on all three ports (the boot-knob owner is shared).
+
+### BL5b-4 — the RISC-V terminal-fault cell derives its service obligation
+
+**Defect (verified on `d43940f2`).** BL5b's defect on the other port. With `TERMINAL_FAULT_ORACLE=1`
+the RISC-V core smoke skipped every required marker ("not asserted in the terminal-fault cell") and
+the spawn census. Only 11 of those markers depend on init's spawn chain, which a terminal-fault boot
+never runs. The other ~45 are produced without it in every terminal-fault boot:
+
+* kernel boot and hart topology;
+* timer audit and PLIC;
+* the trap path and post-lock drain;
+* the cross-arch audit;
+* PM's own start-up.
+
+The cell therefore accepted a terminal-fault boot that had lost any of them. It also accepted
+service markers no spawn produced, and spawn traffic init never issued.
+
+**Repair (checker only).** As the x86_64 cell since BL5b, the obligation is derived:
+
+* given init's own fault (`TERMINAL_FAULT_ORACLE_BEGIN arch=riscv64 init_tid=1`) once and zero
+  `INIT_SPAWN_V5_CALL_BEGIN`:
+  * the eleven markers of the servers init's chain starts are owed zero; one appearing is reported
+    as a service-chain marker without a spawn;
+  * every other required marker stays required;
+  * the spawn census owes 0 SpawnProcess / 0 SpawnFromMemoryObject dispatches instead of 3 / 5.
+* if that premise does not hold, the cell fails by name.
+
+The read, fetch and illegal-instruction cells all take it.
+
+**Evidence.**
+
+* *Live, candidate (strict):* the read, fetch and illegal-instruction terminal-fault cells and the
+  ordinary core pass, each terminal cell deriving the zero obligation.
+* *Replayed fixtures from fresh live logs, strict:*
+
+  | Fixture | Base | Candidate |
+  |---|---|---|
+  | terminal-fault boot, correct | accepted | accepted |
+  | illegal-instruction boot, correct | accepted | accepted |
+  | ordinary boot, correct | accepted | accepted |
+  | terminal-fault boot that lost `RISCV_TIMER_AUDIT_DONE` | **accepted** | rejected: required marker missing |
+  | terminal-fault boot that lost `CROSS_ARCH_LIVE_DONE` | **accepted** | rejected: required marker missing |
+  | plus an unspawned `VFS_SRV_ENTRY` | **accepted** | rejected: service-chain marker without a spawn |
+  | plus a SpawnV5 call before the fault | **accepted** | rejected: init issued 1 SpawnV5 call |
+  | plus a SpawnProcess dispatch | **accepted** | rejected: SpawnProcess count 1, expected 0 |
+  | no fault of init | rejected (page-fault chain) | rejected: no fault to derive from |
+
+* *Guard:* `bl5b4_riscv_terminal_fault_service_obligation` (2 tests) pins the chain set, the kept
+  kernel markers and the named derivation.
+
+**Found in qualification (candidate-caused, fixed and re-frozen).** The first freeze (`25d92baa`)
+failed three tests of `riscv_split_census.rs`. That test extracts the census function and runs it on
+its own under `set -u`, where the derived variable had no value. It is now defaulted to the ordinary
+obligation. The full qualification was re-run on the new freeze. Its suites were re-run once more after the qualification host ran out of
+scratch disk mid-build (the failed compiles left no result); the cleanup removed only delivered items'
+worktrees.
+
+**Qualification (frozen `d953f8d9`, base `d43940f2`).**
+
+* *Live and fixtures:* as above.
+* *Suites:* fmt clean; hosted 6,037 passed; integration 300/300; census 9/9.
+* *Freestanding build:* warnings identical to base, and the kernels are byte-identical to base on
+  all three ports.
