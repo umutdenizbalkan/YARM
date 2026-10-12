@@ -25685,7 +25685,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | fixed and delivered (qualified `bb9da703`) | init faults before its SpawnV5 chain, yet the cell required one entry of each of nine services: base strict fails every correct terminal-fault boot on the four families, and base non-strict accepts a service entry no spawn produced. The obligation is now derived from init's own spawn calls and enforced in every strictness; both mutations are rejected by name |
 | BL5b-2 — the x86_64 U9-RX4 reply-cap witness assumes the queued route | fixed and delivered (qualified `e3a3e1f3`) | with the timer-contract witness, tid 2's PM query reaches an idle PM in every terminal-fault boot and takes the direct NR 6 route, so all four strict families failed a correct transaction. The direct commit now attests its record and cap; the witness requires exactly one route to attest the record PM replies to and applies that route's obligations. Base also accepted a removed queued attestation and a substituted alias revoke |
 | BL5b-3 — the AArch64 U9-RX4 evaluator assumes the queued route | latent (found in BL5b-2) | AArch64 runs the direct request route, but no AArch64 cell has been observed sending tid 2's query direct; the attestation the x86_64 derivation uses is emitted there too |
-| BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
+| BL5c — strict-core runners boot artifacts lacking required witness features | fixed and delivered (qualified `876869ed`) | a strict run booted whatever its paths held: an x86_64 default artifact ran 60 s and failed `witness absent`, and base strict passed a RISC-V oracle kernel copied over the recorded one and an x86_64 kernel/initramfs pair from two builds. The manifest records role and features per artifact; each core smoke binds both artifacts and the mode's required features before booting and a strict run refuses by name; the CI strict job and the final seal's RUN_A build the witness artifact |
 | BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
 | BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate. The checker requires broad-path markers the split NR 9 route no longer emits (`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, `…DISPATCH_DEFER_BEGIN`, `…HANDLER_BYPASS_BEGIN/DONE`, `…DISPATCH_DONE result=idle`), while the kernel's own idle chain (`…NO_INCOMING`, `…POST_LOCK_IDLE_*`, `…IDLE_ORACLE_DONE result=ok`) is present; in one base boot another task was runnable, so the cell's no-incoming premise is also boot-order dependent |
 | BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open — intermittent | failed on true base `c44e9b46` (2/2) and on the first BL4a freeze `9b5838c4`; passed on `e2f4e52b` and `53a5b112` (`RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok`), so boot-order dependent, not closed by BL4a |
@@ -26627,3 +26627,79 @@ it does.
   images differ by the new attestation, on all three ports.
 * The container restarted during the base warning build; the remaining steps resumed on the same
   frozen worktrees.
+
+### BL5c — each core run is bound to the artifacts it boots
+
+**Defect (verified on `a3daae9f`).** A core smoke booted whatever its `KERNEL_IMAGE` /
+`INITRAMFS_IMAGE` paths held. The artifact manifest recorded the commit and per-file hashes, but
+nothing read it, and it recorded no features. So:
+
+* *An incompatible artifact booted and failed late.* The x86_64 strict smoke grades the
+  timer-contract witness, which only an initramfs built with `timer-contract-witness` carries (the
+  feature lives in the supervisor). On the default artifact the run booted for 60 s and failed on
+  `timer contract witness absent`, the same message a witness regression in a correct artifact
+  produces. The CI strict job and the x86_64 direct-IPC final seal's RUN_A built exactly that
+  artifact; RUN_A has failed `A_core_smoke` on it since the witness was introduced.
+* *A strict pass was not bound to what it judged.*
+  * Base strict RISC-V passed a boot of the reply-timeout oracle kernel copied over the recorded
+    kernel, grading it as the recorded build (that boot even printed a `result=fail` witness line
+    the smoke does not read).
+  * Base strict x86_64 passed a default kernel paired with a witness initramfs from another build
+    directory.
+
+**Repair.**
+
+* *Manifest.* Each artifact record now carries its role and the cargo features it was built with
+  (`role=kernel|initramfs default_features=… features=…`), and the manifest records the build's
+  feature arguments.
+* *Pre-boot binding.* Before QEMU starts, each core smoke binds the kernel and the initramfs, by
+  basename and sha256, to one manifest for its arch. It then checks the features its mode requires
+  on the artifact that must carry them; a strict x86_64 run requires
+  `initramfs:timer-contract-witness`. Every run prints one `ARTIFACT_BINDING` line naming the
+  manifest, commit, both hashes and both feature sets.
+  * A strict run that cannot be bound, or whose artifacts lack a required feature, refuses to boot
+    and names the reason.
+  * A non-strict run reports the same problems as warnings and continues; nothing is required of
+    it.
+* *Runners.*
+  * A runner that boots a separately built kernel binds it explicitly (`artifact_write_run_manifest`):
+    the kernel's own features are recorded, and the initramfs record is copied from the manifest of
+    the build that produced it, never asserted.
+  * The RISC-V late-reply-yield runner now binds this way.
+  * The CI x86_64 strict job and the final seal's RUN_A build the witness artifact; RUN_A binds its
+    copied kernel to that build's manifest.
+
+The live witness check itself is unchanged. A bound witness artifact whose witness does not run is
+a regression, not an artifact mismatch.
+
+**Evidence (fresh artifacts, candidate vs base).**
+
+| Run (strict unless noted) | Base | Candidate |
+|---|---|---|
+| x86_64 witness artifact | pass | bound, pass |
+| x86_64 terminal-fault cell, witness artifact | — | bound, pass |
+| AArch64 / RISC-V cores | — | bound, pass |
+| x86_64 default artifact | boots 60 s, fails `witness absent` | refused in 0 s: the initramfs was built with `features=none` |
+| x86_64 witness kernel + default initramfs | boots 60 s, fails `witness absent` | refused: the initramfs is not the one the manifest records |
+| x86_64 default kernel + witness initramfs (another build) | **pass** | refused: the initramfs is not the one the manifest records |
+| RISC-V with the oracle kernel copied over the recorded one | **pass** | refused: the kernel is not the one the manifest records |
+| the same, non-strict | — | warned, boots, pass |
+| x86_64 default artifact, non-strict | — | bound, pass |
+| RISC-V late-reply-yield runner (run-bound oracle kernel) | pass | bound through its run manifest, pass |
+| x86_64 final seal RUN_A | fail `A_core_smoke` (witness absent) | bound, pass |
+
+**Found in qualification (candidate-caused, fixed and re-frozen).** The first freeze (`2610cc0b`)
+failed one integration test. `riscv64_regular_smoke_scope` pinned the artifact-size record to the
+shared build library, and that record moved into the binding library the shared library now sources.
+The contract now follows it, and also requires the shared library to write both records through it.
+
+**Qualification (frozen `876869ed`; live and build gates on `2610cc0b`, which differs only in that
+test; base `a3daae9f`).**
+
+* *Live:* as tabulated.
+* *Self-test:* the binding library's self-test passes 7 accepted, 11 refused, 4 feature records.
+* *Suites:* CI-workflow enforcement passes; fmt clean; hosted 6,025 passed; integration 298/298,
+  including `artifact_binding_scope` (6 tests) and the corrected `riscv64_regular_smoke_scope`;
+  census 9/9.
+* *Freestanding build:* warnings identical to base (180 / 208 / 190). The kernels are
+  byte-identical to base on all three ports.
