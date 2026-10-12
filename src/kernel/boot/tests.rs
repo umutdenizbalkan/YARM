@@ -195412,3 +195412,37 @@ mod bl5b2_rx4_route_is_derived {
         assert!(!s.contains("'IPC_REPLY_CALLER_CAP_FAST_REVOKE caller_tid=2'"));
     }
 }
+
+// BL6e: the overtaken-deferral witness programs store the value they wait on before every
+// FutexWait, since the kernel parks only while the 32-bit word still holds `expected` (BL3b).
+mod bl6e_overtaken_witness_stores_what_it_waits_on {
+    const X86: &str = include_str!("../../arch/x86_64/overtaken_witness.S");
+    const A64: &str = include_str!("../../arch/aarch64/overtaken_witness.S");
+
+    fn between<'a>(s: &'a str, from: &str, to: &str) -> &'a str {
+        s.split(from)
+            .nth(1)
+            .expect(from)
+            .split(to)
+            .next()
+            .expect(to)
+    }
+
+    #[test]
+    fn every_wait_stores_expected_into_the_word_first() {
+        let x = between(X86, ".macro OVT_WAIT_ON addr", ".endm");
+        let store = x
+            .find("mov dword ptr [rdi], r15d")
+            .expect("x86_64 stores r15d");
+        assert!(x.find("mov edi, \\addr").unwrap() < store);
+        assert!(store < x.find("mov rsi, r15").unwrap() && store < x.find("syscall").unwrap());
+        let a = between(A64, ".macro OWAIT addr", ".endm");
+        let store = a.find("str w20, [x0]").expect("AArch64 stores w20");
+        assert!(a.find("OLI32 x0, \\addr").unwrap() < store);
+        assert!(store < a.find("mov x1, x20").unwrap() && store < a.find("svc #0").unwrap());
+        // No wait bypasses the macro.
+        assert!(!X86.contains("parks unconditionally") && !A64.contains("parks unconditionally"));
+        assert_eq!(X86.matches("    mov eax, 9\n").count(), 1);
+        assert_eq!(A64.matches("mov x8, #NR_FUTEX_WAIT").count(), 1);
+    }
+}
