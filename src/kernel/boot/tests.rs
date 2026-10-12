@@ -76504,9 +76504,27 @@ mod stage195f_aarch64_futex_wait_default_on {
                 ),
             "the smoke must expose + accept the no-incoming idle oracle"
         );
+        // BL6a re-derivation: since U9-QA §2 FutexWait publishes pre-lock and never reaches the
+        // in-lock emitter of the default-on attestation, so the idle cell FORBIDS it (as the
+        // switch cell forbids the other in-lock attestations) instead of requiring it.
+        let idle_cell = A64_SMOKE
+            .split("if [[ -f \"$LOGFILE\" && \"$FUTEX_WAIT_IDLE_ORACLE\" == \"1\" ]]; then")
+            .nth(1)
+            .expect("the idle cell")
+            .split("\nfi\n")
+            .next()
+            .expect("its body");
         assert!(
-            A64_SMOKE.contains("AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"),
-            "the smoke must require the default-on attestation"
+            idle_cell
+                .split("for a64_idle_forbidden in")
+                .nth(1)
+                .expect("the forbidden list")
+                .contains("\"AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON\""),
+            "the idle cell must forbid the in-lock default-on attestation"
+        );
+        assert!(
+            !A64_SMOKE.contains("\"AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok\""),
+            "nothing may require the in-lock default-on attestation"
         );
         // class=FutexWait is no longer forbidden on a default boot (mechanism is default-on).
         assert!(
@@ -195674,5 +195692,26 @@ mod bl6a_aarch64_futex_idle_cell_follows_the_pre_lock_route {
             );
         }
         assert!(!c.contains("check_required_patterns"));
+    }
+
+    /// BL6b: the RISC-V idle cell names a boot whose premise did not hold (its drain switched).
+    #[test]
+    fn the_riscv_idle_cell_names_an_unmet_premise() {
+        const RV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+        let c = RV_SMOKE
+            .split(
+                "if [[ \"$FUTEX_WAIT_IDLE_ORACLE\" == \"1\" ]]; then\n  FUTEX_WAIT_IDLE_PATTERNS=(",
+            )
+            .nth(1)
+            .expect("the RISC-V idle cell");
+        let premise = c
+            .find("futex-wait idle oracle premise not met")
+            .expect("named");
+        assert!(
+            premise
+                < c.find("RISCV_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN")
+                    .unwrap()
+        );
+        assert!(c.contains("RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu=0 incoming=[0-9]+"));
     }
 }

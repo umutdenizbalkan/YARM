@@ -1170,6 +1170,15 @@ if [[ "$FUTEX_WAIT_IDLE_ORACLE" == "1" ]]; then
     echo "[fail] futex-wait idle oracle did not reach the canonical RISC-V idle terminal"
     failures=$((failures + 1))
   fi
+  # BL6b: name the boot whose PREMISE did not hold. Init's wait can find another task runnable
+  # (a service whose timed receive just expired), and the drain then switches to it: correct
+  # production behaviour, but no idle outcome to grade. It still fails (the idle markers above are
+  # missing), and says why, instead of reading like a broken idle path.
+  if ! rg -a -q -F "RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING" "$LOGFILE" 2>/dev/null \
+      && rv_idle_switch="$(rg -a -o -m1 'RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu=0 incoming=[0-9]+' "$LOGFILE" 2>/dev/null)"; then
+    echo "[fail] futex-wait idle oracle premise not met -- init's wait found another runnable task and the drain switched (${rv_idle_switch}); this boot exercised no idle outcome"
+    failures=$((failures + 1))
+  fi
   # Forbidden: the blocked caller must NOT be resumed (no sret into it), and no switch markers.
   if rg -n "RISCV_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN|RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED|RISCV_FUTEX_WAIT_DISPATCH_FAIL|RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] futex-wait idle oracle took a switch/return/fail path instead of idle"
