@@ -195615,3 +195615,64 @@ mod bl5b4_riscv_terminal_fault_service_obligation {
         assert!(SMOKE.contains("rv_nr23_owed=3; rv_nr29_owed=5"));
     }
 }
+
+// BL6a: the AArch64 FutexWait idle-oracle cell is derived from the pre-lock route's production
+// events (the switch cell already forbids the in-lock attestations it used to require).
+mod bl6a_aarch64_futex_idle_cell_follows_the_pre_lock_route {
+    const SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+
+    fn cell() -> &'static str {
+        SMOKE
+            .split("if [[ -f \"$LOGFILE\" && \"$FUTEX_WAIT_IDLE_ORACLE\" == \"1\" ]]; then")
+            .nth(1)
+            .unwrap()
+            .split("\nfi\n")
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_chain_is_the_oracles_own_wait_exactly_once_and_in_order() {
+        let c = cell();
+        let chain = [
+            "\"FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid=1 \"",
+            "\"QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid=1 cpu=0\"",
+            "\"AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid=1\"",
+            "\"AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=0\"",
+            "\"AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle\"",
+            "\"AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1\"",
+            "\"AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0\"",
+        ];
+        let mut at = 0;
+        for m in chain {
+            let p = c[at..].find(m).unwrap_or_else(|| panic!("{m} in order")) + at;
+            at = p;
+        }
+        assert!(c.contains("if [[ \"${n:-0}\" != \"1\" ]]; then"));
+        assert!(c.contains("elif (( at <= a64_idle_prev )); then"));
+        assert!(c.contains("premise not met"));
+    }
+
+    #[test]
+    fn the_in_lock_attestations_are_forbidden_not_required() {
+        let c = cell();
+        let forbidden = c.split("for a64_idle_forbidden in").nth(1).unwrap();
+        for m in [
+            "AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN",
+            "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN",
+        ] {
+            assert!(forbidden.contains(m), "{m} is forbidden");
+            assert!(
+                !c.split("a64_idle_chain=(")
+                    .nth(1)
+                    .unwrap()
+                    .split(')')
+                    .next()
+                    .unwrap()
+                    .contains(m)
+            );
+        }
+        assert!(!c.contains("check_required_patterns"));
+    }
+}

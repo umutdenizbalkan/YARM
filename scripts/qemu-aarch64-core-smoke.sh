@@ -1048,36 +1048,75 @@ if [[ -f "$LOGFILE" && "$FUTEX_WAIT_ORACLE" == "1" ]]; then
 fi
 
 # Stage 195F (AARCH64 FUTEXWAIT DEFAULT-ON — NO-INCOMING IDLE): when booted with the idle-oracle
-# knob, require the full default-on + no-incoming + post-lock idle marker set, and forbid any
-# drain failure, a restored blocked-caller frame, or an in-lock idle for the deferred trap.
+# knob, init (the last runnable user task) blocks on a never-woken futex, and the production drain
+# must take its post-lock Idle outcome.
+#
+# BL6a: since U9-QA §2 FutexWait publishes its block PRE-LOCK, and the switch cell above already
+# FORBIDS the in-lock attestations this cell still required (`…RETIRE_DEFAULT_ON`, `…DEFER_BEGIN`,
+# `…HANDLER_BYPASS_BEGIN/DONE`), so every correct boot failed here. The cell is re-derived from the
+# production events of the oracle's own wait, as the RISC-V idle cell was: init's block published
+# pre-lock, the broad dispatcher skipped, the drain re-verifying init and finding no incoming task,
+# then the idle settlement chain -- each exactly once and in this order. A drain that selected
+# another task instead fails by name: the cell's premise did not hold, which is not an idle result.
 if [[ -f "$LOGFILE" && "$FUTEX_WAIT_IDLE_ORACLE" == "1" ]]; then
-  if ! check_required_patterns "$LOGFILE" \
-      "AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok" \
-      "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0" \
-      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0" \
-      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu=0" \
-      "AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=0" \
-      "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu=0" \
-      "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu=0" \
-      "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle" \
-      "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0" \
-      "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok" \
-      "AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1"; then
-    echo "[error] aarch64 Stage 195F FutexWait no-incoming idle-oracle markers missing"
-    exit 1
-  fi
-  for a64_idle_bad in \
-      "AARCH64_FUTEX_WAIT_DISPATCH_FAIL" \
-      "AARCH64_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN" \
-      "AARCH64_BAD_USER_ELR"; do
-    if cad_has "$a64_idle_bad"; then
-      echo "[error] aarch64 Stage 195F: forbidden idle-oracle marker: $a64_idle_bad"
-      exit 1
+  a64_idle_chain=(
+    "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid=1 "
+    "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid=1 cpu=0"
+    "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=9 cpu=0 result=queue_advance_committed outgoing=1 "
+    "AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid=1"
+    "AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=0"
+    "AARCH64_FUTEX_WAIT_DISPATCH_SETTLED cpu=0 incoming=none reason=idle settlement=post_lock_idle"
+    "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu=0"
+    "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu=0"
+    "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle"
+    "AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1"
+    "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0"
+  )
+  a64_idle_log="$(tr '\r' '\n' <"$LOGFILE")"
+  a64_idle_bad=0
+  a64_idle_prev=0
+  for m in "${a64_idle_chain[@]}"; do
+    n="$(rg -a -c -F -- "$m" <<<"$a64_idle_log" || true)"
+    at="$(rg -a -n -m1 -F -- "$m" <<<"$a64_idle_log" | cut -d: -f1 || true)"
+    if [[ "${n:-0}" != "1" ]]; then
+      echo "[error] aarch64 BL6a idle oracle: expected exactly 1, got ${n:-0}: $m"
+      a64_idle_bad=1
+    elif (( at <= a64_idle_prev )); then
+      echo "[error] aarch64 BL6a idle oracle: out of order (line ${at} not after ${a64_idle_prev}): $m"
+      a64_idle_bad=1
+    else
+      a64_idle_prev=$at
     fi
   done
-  # The idle outcome must NOT restore the blocked caller's frame (no FRAME_OK for the idle trap)
-  # and must clear the deferral (idle is a genuine retirement, not a stale decline).
-  echo "[ok] aarch64 Stage 195F: FutexWait no-incoming post-lock idle proven (default-on, lock_dropped, current_none)"
+  if ! rg -a -q -F "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok" <<<"$a64_idle_log"; then
+    echo "[error] aarch64 BL6a idle oracle: FutexWait retirement attestation missing"
+    a64_idle_bad=1
+  fi
+  if [[ "$(rg -a -c -F 'AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING' <<<"$a64_idle_log" || true)" == "" ]] \
+      && a64_idle_sel="$(rg -a -o -m1 'AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok' <<<"$a64_idle_log")"; then
+    echo "[error] aarch64 BL6a idle oracle: premise not met -- init's wait found another runnable task and the drain switched (${a64_idle_sel}); this boot exercised no idle outcome"
+    a64_idle_bad=1
+  fi
+  for a64_idle_forbidden in \
+      "AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN" \
+      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_FAIL" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=" \
+      "AARCH64_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN" \
+      "AARCH64_BAD_USER_ELR"; do
+    if rg -a -q -F -- "$a64_idle_forbidden" <<<"$a64_idle_log"; then
+      echo "[error] aarch64 BL6a idle oracle: forbidden marker: $a64_idle_forbidden"
+      a64_idle_bad=1
+    fi
+  done
+  if (( a64_idle_bad )); then
+    echo "[error] aarch64 Stage 195F FutexWait no-incoming idle oracle FAILED"
+    exit 1
+  fi
+  # The idle outcome restores NO frame for the blocked caller and clears the deferral (idle is a
+  # genuine retirement, not a stale decline).
+  echo "[ok] aarch64 Stage 195F: FutexWait no-incoming post-lock idle proven (pre-lock block, lock_dropped, current_none)"
 fi
 
 # Stage 195G (AARCH64 YIELD OUT-OF-LOCK DISPATCH): two-task oracle — require the default-on
