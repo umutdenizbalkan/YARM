@@ -25673,7 +25673,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | confirmed open — blocked on an ABI decision | see BL1 "Not changed"; every in-tree sender passes offset 0 |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
-| BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | confirmed open (from source) | `EXC_ILLEGAL_INSTRUCTION` decodes to `Unknown`; the pre-lock bridge settles `Unknown` fatally; the per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad `handle_trap_entry`, unreachable since U9 closed. Not reproduced live; the BL2 route is the owner it should reach |
+| BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | fixed and delivered (qualified `1d7be22c`) | reproduced live with a new default-off witness: base stops the whole system at `IRQ1_UNKNOWN_SETTLED … strict=1`. A U-mode illegal instruction now decodes as the task's `UserInstructionFault` at `sepc`, and the RISC-V bridge settles it through BL2's route and the same terminal owners; init is reported and terminated, and a replacement runs |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
 | BL3b — futex check-and-park contract | fixed and delivered (qualified `4c50a864`) | the kernel parked on the caller's `expected == observed` without comparing the word it read, so a store-and-wake between the caller's read and its `FutexWait` was lost; hosted regression fails on `c44e9b46` (`Park` where `Proceed` is owed); revert control fails the park-window case |
 | BL3c — hosted ack-lease intermittent failure | fixed and delivered (qualified `031f6b32` + `69d2746f`) | classified PRODUCTION: a stale `release` / entitled `consume` decided on the endpoint generation, then the state, then exchanged the state alone, so a slot recycled for the same index's next incarnation in between was retired or consumed; forced deterministically with `race_hook`, three regressions fail on the unrepaired store |
@@ -26833,3 +26833,74 @@ honours the override.
 * *Suites:* fmt clean; hosted 6,031 passed; integration 300/300; census 9/9.
 * *Freestanding build:* warnings identical to base (180 / 208 / 190), and the kernels are
   byte-identical to base on all three ports.
+
+### BL2-a — a RISC-V user illegal instruction is the task's fault
+
+**Defect (verified on `7955e7a3`).** RISC-V decoded `EXC_ILLEGAL_INSTRUCTION` (scause 2) to
+`TrapEvent::Unknown`. The RISC-V bridge settles `Unknown` under the strict production policy, which
+stops the kernel. The per-task arm (`fault_current_task_unsupported_instruction`) sits in the broad
+`handle_trap_entry`, which no user trap has reached since U9 closed. One task's illegal instruction
+therefore halted the whole system.
+
+Reproduced live with the witness below on base plus the witness alone: `TERMINAL_FAULT_ORACLE_BEGIN …
+insn=unimp`, then `unknown trap event cpu=0 arch_code=0x2` and
+`IRQ1_UNKNOWN_SETTLED cpu=0 arch_code=0x2 strict=1`. That was the last line the system printed; no
+replacement ran and the boot's other markers never appeared.
+
+**Repair.**
+
+* *Decode.* A U-mode illegal instruction is `TrapEvent::UserInstructionFault(FaultInfo::user(epc,
+  Execute))`, BL2's event for a user instruction the CPU refused. Only that exception code moves;
+  every other unnamed exception still decodes `Unknown`. Privilege origin is screened upstream, as for
+  the page faults (only U-origin exceptions reach this decode).
+* *The address.* `Riscv64TrapContext` carries `epc`, set from `sepc` at all three entry sites,
+  because an illegal instruction's `stval` holds its bits, not its address.
+* *Settlement.* The RISC-V bridge runs BL2's user-instruction route
+  (`try_split_user_instruction_fault_dispatch`) right after its terminal page-fault route, with the
+  same disposition handling. The same terminal owners report the fault, commit the transition and
+  reserve the deferral, which this bridge's own FutexWait drain consumes to dispatch a replacement.
+  There is no second way for a task to die.
+* *Unchanged:* the Unknown policy and its route, the page-fault routes, the broad per-task arm, and
+  the census.
+
+**Witness (default-off).** `yarm.terminal_fault_illegal_oracle=1` provisions init's slot 5 with the
+new `DeliberateIllegalInstruction` scenario (selector 27). Init executes one `unimp` and logs a line
+that can only appear if it completed. The RISC-V core smoke's `TERMINAL_FAULT_ILLEGAL_ORACLE=1` cell
+requires:
+
+* the provision and the attempt, once each, and the instruction never completing;
+* the fault decoded once as `USER_INSTRUCTION_FAULT tid=1`, never as a page fault, a broad arrival,
+  the Unknown path or a panic;
+* the report delivered and the transition committed off the broad lock, the deferral published once,
+  and the broad dispatcher skipped for `user_instruction_fault_committed`;
+* no refusal or fail-closed settlement;
+* a replacement other than init selected, marked Running and given its frame, which then logs from
+  user space.
+
+**Found in qualification (candidate-caused, fixed and re-frozen).**
+
+* The first attempt decoded the fault but the RISC-V bridge never offered it to the instruction route
+  (`TRAP_UNOWNED … user_instruction_fault_unclaimed`, halt). The route had been wired into the shared
+  bridge only, so the RISC-V bridge now runs it too.
+* The first freeze (`d38f641d`) failed one hosted guard. `u9tm_proof_gate` pinned one
+  terminal-result carrier on the RISC-V bridge because it had no instruction route. It is
+  re-derived: both bridges carry the same two, exclusive by decode.
+
+**Evidence.**
+
+* *Candidate:* the strict illegal-instruction cell passes 2/2 (`replacement tid=2`, which then logged
+  about 1,900 user lines).
+* *Base plus the witness:* the kernel stops, as above.
+* *Guards:* `bl2a_riscv_illegal_instruction_is_the_tasks_fault` (4 tests) pins the decode arm, `epc`
+  at all three entry sites, and the route on both bridges.
+
+**Qualification (frozen `1d7be22c`; live and build gates on `d38f641d`, which differs only in
+`tests.rs`; base `7955e7a3`; witness-only control `3d6d8b6e`).**
+
+* *Preserved live cells (strict unless noted):*
+  * RISC-V core, read and fetch terminal-fault cells, and server death;
+  * x86_64 port-I/O cell and core;
+  * AArch64 core, and its terminal-fault cell (non-strict).
+* *Suites:* fmt clean; hosted 6,035 passed; integration 300/300; census 9/9.
+* *Freestanding build:* warnings identical to base (180 / 208 / 190, same classes). The kernel
+  images differ on all three ports (the boot-knob owner is shared).
