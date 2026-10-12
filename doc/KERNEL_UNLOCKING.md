@@ -25676,7 +25676,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | Issue | Status | Evidence / prerequisite |
 |---|---|---|
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
-| BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | fixed (SHARED-REGION-OFFSET1) | owner ABI decision: byte offset relative to the `MemoryObject`, page-aligned, a `DmaRegion` bounds without rebasing. On `a91632ba` a non-zero offset maps the wrong pages on the queued, direct and NR 30 paths, NR 30 maps the whole window, a `MemoryObject` descriptor whose `len` fits but whose `offset + len` does not is accepted, and a misaligned offset is accepted — nine hosted regressions fail. One range policy now admits and resolves on every path; live: every receive family maps a middle two-page range on all three ports |
+| BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | fixed and delivered (SHARED-REGION-OFFSET1, qualified `9d991d0c`) | owner ABI decision: byte offset relative to the `MemoryObject`, page-aligned, a `DmaRegion` bounds without rebasing. On `a91632ba` a non-zero offset maps the wrong pages on the queued, direct and NR 30 paths, NR 30 maps the whole window, a `MemoryObject` descriptor whose `len` fits but whose `offset + len` does not is accepted, and a misaligned offset is accepted — nine hosted regressions fail. One range policy now admits and resolves on every path; live: every receive family maps a middle two-page range on all three ports |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | fixed and delivered (qualified `1d7be22c`) | reproduced live with a new default-off witness: base stops the whole system at `IRQ1_UNKNOWN_SETTLED … strict=1`. A U-mode illegal instruction now decodes as the task's `UserInstructionFault` at `sepc`, and the RISC-V bridge settles it through BL2's route and the same terminal owners; init is reported and terminated, and a replacement runs |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
@@ -25861,6 +25861,51 @@ are checked as before. Each smoke takes `OFFSET_SELECTION=1`, proves the feature
 object sits at `ORACLE_VA + (pa - base - offset)` (`scripts/lib/shared-region-frames.py` over
 `SHARED_REGION_ORACLE_PROVISION_PHYS` and `USER_MAP_PA_CHECK`), and binds its run to the kernel and
 initramfs it boots.
+
+**Negative controls (on the final candidate).**
+
+* *The offset ignored again.* The per-page owner is mutated to map from the window base. Six hosted
+  cases fail for exactly that reason: `page 0 must be backed by object page 1` on the queued,
+  direct and NR 30 paths and on window reuse, the partial-page tail reads `190` where `15` was
+  owed, and the policy contract. Live on x86_64, the NR 30, NR 2 / NR 5 and direct offset cells
+  each fail: `page0=0 page1=0`, and frames `installs=4 misplaced=4` (direct `installs=2
+  misplaced=2`).
+* *The complete-range bound omitted.* The policy keeps only `offset >= window start`. Three hosted
+  cases fail for exactly that reason: `object_offset_past_end` is accepted, the direct
+  transaction maps a selection past its object, and the policy table returns `Ok` for `past the
+  object`. No live cell can show this: every live grant is in range.
+
+**Found in qualification (candidate-caused, fixed and re-frozen).** The first freeze (`7837c60f`)
+left `shared_region_phys_base_locked` and `SHARED_REGION_ORACLE_OBJECT_PAGES` without a
+default-build user, which added one freestanding warning per port. Hosted builds also gained an
+unused re-export and an unused loop index. All of these are now compiled only where they are used
+(`9d991d0c`).
+
+**Qualification (frozen `9d991d0c`, tree `834f1c8b`, base `a91632ba`).** Every scheduled gate
+passed and none was re-run.
+
+* *Hosted:*
+  * focused `shared_region_offset1`: 14/14;
+  * related shared-region, transfer-release, COW and invalidation groups: 344/344;
+  * full hosted suite: 6,054 passed;
+  * integration: 300/300;
+  * census: 9/9 (U9 unchanged: `with_cpu=0`, `with_broad=0`);
+  * `cargo fmt --check` clean.
+* *Warnings:*
+  * Freestanding warnings equal the base's less one on every port (179 / 207 / 189). The one is
+    the base's unused `end` in the rewritten stash bound.
+  * The same holds for the three oracle-feature kernels and the hosted library and tests.
+  * Userspace server warnings are identical.
+* *Live, artifact-bound:*
+  * x86_64, AArch64 and RISC-V, at object offset 0 and 4096: the NR 30 cell (both release shapes),
+    the NR 2 / NR 5 cell and the direct cell. That is 18 runs, all `result=ok`, every one
+    `misplaced=0`.
+* *Strict cores and SMP:*
+  * strict core smokes on the three ports, x86_64 in its timer-contract-witness profile;
+  * the cross-CPU TLB shootdown witnesses `SMP1` / `SMP2` / `SMP3`, all `result=ok`.
+* *Pre-existing, not changed:* the hosted tests gated on `x86-shared-region-direct-oracle` do not
+  compile on `a91632ba` either. The five errors are the same, all a `publish_recv_waiter_live`
+  argument type.
 
 ### BL2 — x86 user port-I/O fault containment
 
