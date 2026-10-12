@@ -12,6 +12,7 @@ const MATRIX_SCRIPT: &str = include_str!("../scripts/qemu-riscv64-smoke-matrix.s
 /// Stage 198B1 Part A moved the fail-closed reporting the build script used to inline
 /// into this shared library, which every per-arch build script sources.
 const BUILD_COMMON: &str = include_str!("../scripts/lib/build-qemu-artifacts-common.sh");
+const ARTIFACT_BINDING: &str = include_str!("../scripts/lib/artifact-binding.sh");
 
 #[test]
 fn build_script_produces_canonical_artifacts() {
@@ -57,9 +58,17 @@ fn build_script_fails_clearly_when_artifacts_missing() {
             && BUILD_COMMON.contains("exit 1"),
         "a failed build/stage step must fail closed with a nonzero exit"
     );
-    // Artifact sizes are still recorded for diagnostic transparency.
+    // Artifact sizes are still recorded for diagnostic transparency. BL5c: each manifest record is
+    // written by `artifact_manifest_line` in the artifact-binding library, which the shared build
+    // library sources and calls for both artifacts.
     assert!(
-        BUILD_COMMON.contains("size=%s") && BUILD_COMMON.contains("stat -c '%s'"),
+        BUILD_COMMON.contains("source \"$(dirname \"${BASH_SOURCE[0]}\")/artifact-binding.sh\"")
+            && BUILD_COMMON.contains("artifact_manifest_line \"$kernel\" kernel \"$feat\"")
+            && BUILD_COMMON.contains("artifact_manifest_line \"$initramfs\" initramfs \"$feat\""),
+        "the shared build library must write each manifest record through the binding library"
+    );
+    assert!(
+        ARTIFACT_BINDING.contains("size=%s") && ARTIFACT_BINDING.contains("stat -c '%s'"),
         "the manifest must report artifact sizes for diagnostic transparency"
     );
 }
