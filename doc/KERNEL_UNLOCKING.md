@@ -25688,8 +25688,8 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL5c — strict-core runners boot artifacts lacking required witness features | fixed and delivered (qualified `876869ed`) | a strict run booted whatever its paths held: an x86_64 default artifact ran 60 s and failed `witness absent`, and base strict passed a RISC-V oracle kernel copied over the recorded one and an x86_64 kernel/initramfs pair from two builds. The manifest records role and features per artifact; each core smoke binds both artifacts and the mode's required features before booting and a strict run refuses by name; the CI strict job and the final seal's RUN_A build the witness artifact |
 | BL5d — SMP log loss failing one-shot asynchronous checks | fixed and delivered (qualified `0346b8f6`) | the printk drain skipped a slot another CPU had reserved but not finished writing and advanced past it, so the record was never drained; the counter that should have shown it was never incremented. Base failed a completed cross-CPU request (record sealed 7/7, two one-shot lines lost). The drain now holds an in-flight record for its writer's own flush and counts and announces only genuine overwrite losses (`PRINTK_RECORDS_LOST`); the SMP graders report an announced loss as incomplete evidence |
 | BL5b-4 — the RISC-V terminal-fault cell exempts its required markers instead of deriving them | fixed and delivered (qualified `d953f8d9`) | the cell now owes the eleven spawn-chain markers and the spawn census zero, given init's own fault and no SpawnV5 call, and keeps every other required marker; base accepted five mutated terminal-fault boots (a lost kernel marker, a lost cross-arch marker, an unspawned service, a spawn before the fault, a stray spawn dispatch) that the candidate rejects by name |
-| BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate. The checker requires broad-path markers the split NR 9 route no longer emits (`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, `…DISPATCH_DEFER_BEGIN`, `…HANDLER_BYPASS_BEGIN/DONE`, `…DISPATCH_DONE result=idle`), while the kernel's own idle chain (`…NO_INCOMING`, `…POST_LOCK_IDLE_*`, `…IDLE_ORACLE_DONE result=ok`) is present; in one base boot another task was runnable, so the cell's no-incoming premise is also boot-order dependent |
-| BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open — intermittent | failed on true base `c44e9b46` (2/2) and on the first BL4a freeze `9b5838c4`; passed on `e2f4e52b` and `53a5b112` (`RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok`), so boot-order dependent, not closed by BL4a |
+| BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | fixed and delivered (qualified `4b39380d`); premise bounded with BL6b | the cell required in-lock attestations the pre-lock route no longer emits (and the switch cell forbids): base failed 8/8 boots with the idle chain complete. It now requires the oracle's own wait chain exactly once and in order; candidate 9/10 idle, the tenth named `premise not met` |
+| BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | bounded (named; delivered with BL6a) | not a kernel or checker defect: init's wait finds another task runnable in about half the boots (9 of 18; a service whose timed receive just expired), the drain correctly switches, and no idle outcome exists to grade. The cell now says `premise not met` and names the incoming task. Removing it needs a witness that can hold the system quiescent, which this profile's periodic timed receives do not allow |
 | BL6c — AArch64 timer5 witness capture is stopped early by the core smoke | fixed and delivered (qualified `a8e1161e`) | the runner now stops the AArch64 boot on the witness's own summary line instead of the first terminal idle; candidate 4/4, base 3/4 (base's failing log ends ~850 lines before the summary, and its passes end only 178–1,054 lines after it) |
 | BL6d — RISC-V UART idle-origin items race a deadline dispatch | bounded (found in BL4a qualification) | after BL4a the idle tick dispatches the core supervisor whose one- to three-tick receive deadline it expires; a host byte delivered two or three ticks after injection lands on it (`idle_origin=3 user_origin=5`). With the quiet-window acknowledgement: 7 of 8 boots pass (31 of 32 idle items). Base hides it (the tick stranded the supervisor). Removing it needs the kernel to hold the source until a quiet idle boundary |
 | BL6e — the x86_64 and AArch64 overtaken-deferral witnesses assume an unconditional futex park | fixed and delivered (qualified `6d537bc0`) | both user programs waited on a word nobody wrote; since BL3b the kernel parks only while the word holds `expected`, so no round ever parked and neither witness sealed. Each wait now stores its expected value first; both seal live 2/2 with four overtaken rounds, base fails on both ports |
@@ -26965,5 +26965,66 @@ worktrees.
 
 * *Live and fixtures:* as above.
 * *Suites:* fmt clean; hosted 6,037 passed; integration 300/300; census 9/9.
+* *Freestanding build:* warnings identical to base, and the kernels are byte-identical to base on
+  all three ports.
+
+### BL6a / BL6b — the FutexWait idle-oracle cells follow the pre-lock route and name their premise
+
+**BL6a defect (verified on `2ed1a6fd`).** Since U9-QA §2, FutexWait publishes its block pre-lock. The
+AArch64 switch cell was re-derived then, and it forbids the in-lock attestations:
+
+* `AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, whose emitter no longer has a caller;
+* `…DISPATCH_DEFER_BEGIN`;
+* `…HANDLER_BYPASS_BEGIN/DONE`.
+
+The idle cell still required them. Every boot failed, base 8 of 8, although the kernel's own idle chain
+was complete in each. A Stage 195F guard pinned the stale requirement.
+
+**BL6a repair (checker only).** The cell requires the oracle's own wait, each step exactly once and in
+this order:
+
+1. init's block published pre-lock (`FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid=1`) and deferred;
+2. the pre-lock dispatch committed;
+3. the drain re-verifying init and finding no incoming task;
+4. the idle settlement, the lock-dropped proof and `DISPATCH_DONE result=idle`;
+5. the oracle attestation (`lock_dropped=1 current_none=1`) and the idle loop.
+
+The retirement attestation must be present. The in-lock attestations are forbidden, as in the switch
+cell, and the Stage 195F guard is re-derived to match.
+
+**The premise (BL6a and BL6b).** Both cells rest on init being the last runnable task when it waits.
+In this profile a service's timed receive can expire at that moment: the supervisor (tid 2), or tid
+10002. The drain then correctly switches to it, and there is no idle outcome to grade.
+
+* *AArch64:* 1 of 10 candidate boots.
+* *RISC-V:* 9 of 18 boots. This is BL6b's intermittency; the RISC-V cell already followed the
+  pre-lock route.
+
+Both cells now report it by name and fail: `premise not met — init's wait found another runnable task
+and the drain switched (… incoming=N)`. A broken idle path has no such message. Removing the premise
+needs a witness that can hold the system quiescent, which this profile's periodic timed receives do
+not allow without changing production behaviour. It is bounded here.
+
+**Evidence.**
+
+* *AArch64 idle cell:*
+  * candidate: 9 of 10 pass; the tenth is named `premise not met`;
+  * base: fails all 8 boots.
+* *Replayed fixtures (AArch64), each rejected by name:* a lost `NO_INCOMING`, a duplicated oracle
+  attestation, a reordered attestation, init's publication substituted by another tid, an in-lock
+  marker, and a switched drain.
+* *RISC-V:* the strict cell passes the idle boots. Replaying the eight earlier logs, the switched four
+  now read `premise not met … incoming=2` / `incoming=10002`; base reported them as `took a
+  switch/return/fail path`.
+* *Unchanged cells:* AArch64 switch cell (FutexWait oracle), AArch64 and RISC-V strict cores.
+
+**Found in qualification (candidate-caused, fixed and re-frozen).** The first freeze (`fb5a0015`)
+failed the hosted guard `stage195f…::smoke_accepts_default_on_and_idle_oracle`. That guard required
+the in-lock attestation BL6a removes, and it now requires the idle cell to forbid it.
+
+**Qualification (frozen `4b39380d`, base `2ed1a6fd`).**
+
+* *Live and fixtures:* as above.
+* *Suites:* fmt clean; hosted 6,040 passed; integration 300/300; census 9/9.
 * *Freestanding build:* warnings identical to base, and the kernels are byte-identical to base on
   all three ports.
