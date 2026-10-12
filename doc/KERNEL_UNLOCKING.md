@@ -25683,7 +25683,8 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL5a-2 — a direct reply that beats a finite deadline leaves the registration armed | fixed and delivered (qualified `23da30f8` + `13797fa`) | the direct wake never retired the caller's reply-deadline token: it fired late on every x86_64 boot (`LostToTerminal`), and the stale handle captured the caller's next ORDINARY timed receive, which then never timed out — tid 2 settled 0 ordinary timeouts per boot on base x86_64 and AArch64, 34–39 repaired. The commit now takes the registration with the Runnable transition; every exit retires it or, on undo, restores it |
 | BL5a-2b — the reply-wins scenario is unreachable on all three ports | fixed and delivered (qualified `5e734219`) | the scenario's arm point and attestations lived only on the broad NR 2 / NR 7 arms; the oracle now blocks with its own finite deadline, the split lane holds the causal gate before Phase C, and all three cells are derived from production events. All three retirement seals pass live for the first time since the split routes; with BL5a-2 reverted the cell reports `registration_outlived_reply` and fails |
 | BL5b — x86 terminal-fault oracle held to ordinary service counts | fixed and delivered (qualified `bb9da703`) | init faults before its SpawnV5 chain, yet the cell required one entry of each of nine services: base strict fails every correct terminal-fault boot on the four families, and base non-strict accepts a service entry no spawn produced. The obligation is now derived from init's own spawn calls and enforced in every strictness; both mutations are rejected by name |
-| BL5b-2 — the x86_64 U9-RX4 reply-cap witness assumes the queued route | confirmed open (found in BL5b qualification) | with the timer-contract witness, tid 2's PM query reaches an idle PM in every terminal-fault boot, so it takes the direct NR 6 route: one server-local reply cap, no caller alias, no `IPC_REPLY_CAP_ONESHOT_OK`. The witness requires the queued route's markers and fails all four strict terminal-fault families; the direct commit emits no per-transaction attestation to derive the route from |
+| BL5b-2 — the x86_64 U9-RX4 reply-cap witness assumes the queued route | fixed and delivered (qualified `e3a3e1f3`) | with the timer-contract witness, tid 2's PM query reaches an idle PM in every terminal-fault boot and takes the direct NR 6 route, so all four strict families failed a correct transaction. The direct commit now attests its record and cap; the witness requires exactly one route to attest the record PM replies to and applies that route's obligations. Base also accepted a removed queued attestation and a substituted alias revoke |
+| BL5b-3 — the AArch64 U9-RX4 evaluator assumes the queued route | latent (found in BL5b-2) | AArch64 runs the direct request route, but no AArch64 cell has been observed sending tid 2's query direct; the attestation the x86_64 derivation uses is emitted there too |
 | BL5c — strict-core runners boot artifacts lacking required witness features | confirmed open | seen during LOCK3 qualification (`qemu-x86_64-core-smoke.sh` boots whatever `build-x86_64/` holds) |
 | BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
 | BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate. The checker requires broad-path markers the split NR 9 route no longer emits (`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, `…DISPATCH_DEFER_BEGIN`, `…HANDLER_BYPASS_BEGIN/DONE`, `…DISPATCH_DONE result=idle`), while the kernel's own idle chain (`…NO_INCOMING`, `…POST_LOCK_IDLE_*`, `…IDLE_ORACLE_DONE result=ok`) is present; in one base boot another task was runnable, so the cell's no-incoming premise is also boot-order dependent |
@@ -26534,3 +26535,95 @@ reply-cap witness: tid 2's query takes the direct route there. Recorded as BL5b-
 * *Freestanding build:* warnings identical to base (180 / 208 / 190, same classes). The default
   kernels are byte-identical to base on all three ports; the change is the x86_64 core smoke and
   its hosted guard.
+
+### BL5b-2 — the x86_64 U9-RX4 witness derives the route that carried its query
+
+**Defect (verified on `73fb18bd`).** U9-RX4 grades the reply-cap transaction of tid 2's PM
+lifecycle query, and it required the queued route's markers:
+
+* PM's one-shot materialized by its receive (`IPC_REPLY_CAP_ONESHOT_OK receiver_tid=3 …`);
+* one caller-alias revoke for tid 2, counted boot-wide without naming a record.
+
+Which route carries the query depends only on whether PM is already blocked in its receive when
+tid 2 calls. On an ordinary boot PM is busy with init's spawn chain, so the request queues. In the
+terminal-fault cell built with the timer-contract witness, init has died before tid 2 calls and PM
+is idle, so the query takes the direct NR 6 route. That route copies the request straight into the
+blocked PM and mints exactly one server-local reply cap; no alias is minted for the caller. Every
+strict terminal-fault boot (all four families) therefore failed U9-RX4 on a correct transaction.
+The direct request commit emitted no per-transaction attestation, so the route could only have been
+inferred from the queued markers' absence, which a lost record would also produce.
+
+**Repair.**
+
+* *Production attestation.* The direct request commit emits `IPCCALL_DIRECT_SPLIT_OK` once the
+  request is delivered (server enqueued, record Available). It names the caller, server, endpoint
+  incarnation, the one server-local cap and the record. It is the twin of the queued route's
+  `IPCCALL_QUEUED_SPLIT_OK` and changes no behaviour.
+* *Witness.*
+  1. The request is named by the record PM's reply resolves (`IPC_REPLY_OBJECT_OK tid=3 cap=<PM's
+     cap> reply_index=R generation=1`).
+  2. Exactly one route must attest that record: the queued line for tid 2, or the direct line for
+     tid 2 → PM naming PM's cap. Neither, or both, fails by name.
+  3. That route's own obligations then apply:
+     * *queued:* the one-shot materialized once, before the receive; the caller alias the queued
+       line names revoked once, for exactly that record;
+     * *direct:* the commit before PM's receive returns; no receive-time materialization of the
+       cap; no caller-side revoke for the record.
+
+  The route-blind, boot-wide caller-revoke count is removed.
+
+**Evidence.**
+
+* *Live, fresh artifacts.*
+  * Strict terminal-fault boots on the candidate pass all four families, the first strict
+    terminal-fault passes on x86_64. Each attests tid 2's query on the direct route
+    (`record_index=0 record_generation=1`).
+  * Strict ordinary cores pass on the queued route (`record_index=1 record_generation=1`).
+* *Base, same features.* All four strict terminal-fault families fail at U9-RX4 (`the reply cap is
+  materialized exactly once -- expected exactly 1, got 0`).
+* *Replayed fixtures from the fresh live logs, strict:*
+
+  | Fixture | Base | Candidate |
+  |---|---|---|
+  | direct route, correct boot | rejected: requires the queued markers | accepted |
+  | direct attestation removed | rejected (same) | rejected: `queued=0 direct=0` |
+  | direct attestation duplicated | rejected (same) | rejected: `queued=0 direct=2` |
+  | direct attestation names another cap | rejected (same) | rejected: `queued=0 direct=0` |
+  | direct attestation names another record generation | rejected (same) | rejected: `queued=0 direct=0` |
+  | direct attestation after PM's receive | rejected (same) | rejected: the commit must precede the receive |
+  | plus a receive-time materialization of PM's cap | rejected: caller revoke absent | rejected: materialized a second time |
+  | plus a caller-side revoke for the record | rejected (queued markers) | rejected: the direct route mints no caller alias |
+  | plus a queued attestation of the same record | rejected (queued markers) | rejected: `queued=1 direct=1` |
+  | queued route, correct boot | accepted | accepted |
+  | queued attestation removed | **accepted** | rejected: `queued=0 direct=0` |
+  | caller-alias revoke names another cap | **accepted** | rejected: the alias is revoked once |
+  | caller-alias revoke removed | rejected | rejected |
+  | one-shot materialized after the receive | rejected | rejected |
+
+**Found in qualification (candidate-caused, fixed and re-frozen).** The first freeze
+(`46d7832f`) read the queued route's caller alias with `printf | rg -m1` over the whole log. Under
+`pipefail` the early-exiting `rg` SIGPIPEs the writer, and both strict ordinary cores exited 141.
+The terminal-fault cells take the direct branch and passed. The extraction now uses here-strings,
+as the smoke's other extractions do; both failed logs pass on replay.
+
+**Latent, not changed: BL5b-3.** The AArch64 core smoke's U9-RX4 evaluator makes the same
+queued-route assumption (`IPC_REPLY_CAP_ONESHOT_OK`, an unscoped caller-revoke count), and AArch64
+runs the direct request route. No AArch64 cell has been observed sending tid 2's query direct, and
+`IPCCALL_DIRECT_SPLIT_OK` is now emitted on every port, so the same derivation applies there when
+it does.
+
+**Qualification (frozen `e3a3e1f3`, base `73fb18bd`, fresh worktrees and artifacts).**
+
+* *Live x86_64:*
+  * strict terminal-fault boots, four families: candidate pass, base fail at U9-RX4;
+  * non-strict page-fault and port-I/O cells on the default artifact: pass (queued route there);
+  * strict ordinary cores: candidate 2/2 and base pass.
+* *Other ports:* AArch64 and RISC-V strict cores pass (the attestation is emitted on every port);
+  the AArch64 U9-RX4 evaluator self-test passes 4/12.
+* *Fixtures:* 14 replays per tree, as tabulated.
+* *Suites:* fmt clean; hosted 6,025 passed (including `bl5b2_rx4_route_is_derived`, 3 tests);
+  integration 292/292; census 9/9.
+* *Freestanding build:* warnings identical to base (180 / 208 / 190, same classes). The kernel
+  images differ by the new attestation, on all three ports.
+* The container restarted during the base warning build; the remaining steps resumed on the same
+  frozen worktrees.
