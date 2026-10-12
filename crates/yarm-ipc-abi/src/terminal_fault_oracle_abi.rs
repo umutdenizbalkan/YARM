@@ -86,6 +86,13 @@ pub enum TerminalFaultScenario {
     /// (`TrapEvent::UserInstructionFault`). Before BL2 that decoded as `Unknown` and the strict
     /// production policy panicked the kernel for one task's forbidden access.
     DeliberatePortIo,
+    /// BL2-a — one ILLEGAL user instruction, RISC-V only: init executes `unimp`. The CPU raises an
+    /// illegal-instruction exception in U-mode and the instruction never completes.
+    ///
+    /// The RISC-V counterpart of the port-I/O scenario: a user instruction the CPU refused
+    /// (`TrapEvent::UserInstructionFault`), not a page fault. Before BL2-a it decoded as `Unknown`
+    /// and the strict production policy panicked the kernel for one task's bad instruction.
+    DeliberateIllegalInstruction,
 }
 
 /// The slot-5 terminal-fault selector. Distinct from every value in the reserved
@@ -116,6 +123,10 @@ pub const TERMINAL_FAULT_WAITER_SELECTOR: usize = 25;
 /// `ExitCurrentTask` block and the `1..=9` range.
 pub const TERMINAL_FAULT_PORTIO_SELECTOR: usize = 26;
 
+/// BL2-a — the illegal-instruction scenario's selector. The next free value, still clear of the
+/// reserved `ExitCurrentTask` block and the `1..=9` range.
+pub const TERMINAL_FAULT_ILLEGAL_SELECTOR: usize = 27;
+
 /// The selector to write into init's startup slot 5 for `scenario`.
 #[must_use]
 pub const fn terminal_fault_selector(scenario: TerminalFaultScenario) -> usize {
@@ -124,6 +135,7 @@ pub const fn terminal_fault_selector(scenario: TerminalFaultScenario) -> usize {
         TerminalFaultScenario::DeliberateUnhandledFetch => TERMINAL_FAULT_FETCH_SELECTOR,
         TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter => TERMINAL_FAULT_WAITER_SELECTOR,
         TerminalFaultScenario::DeliberatePortIo => TERMINAL_FAULT_PORTIO_SELECTOR,
+        TerminalFaultScenario::DeliberateIllegalInstruction => TERMINAL_FAULT_ILLEGAL_SELECTOR,
     }
 }
 
@@ -139,6 +151,8 @@ pub const fn terminal_fault_scenario_for(slot5: usize) -> Option<TerminalFaultSc
         Some(TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter)
     } else if slot5 == TERMINAL_FAULT_PORTIO_SELECTOR {
         Some(TerminalFaultScenario::DeliberatePortIo)
+    } else if slot5 == TERMINAL_FAULT_ILLEGAL_SELECTOR {
+        Some(TerminalFaultScenario::DeliberateIllegalInstruction)
     } else {
         None
     }
@@ -157,6 +171,7 @@ mod tests {
             TerminalFaultScenario::DeliberateUnhandledFetch,
             TerminalFaultScenario::DeliberateUnhandledReadAfterWaiter,
             TerminalFaultScenario::DeliberatePortIo,
+            TerminalFaultScenario::DeliberateIllegalInstruction,
         ] {
             assert_eq!(
                 terminal_fault_scenario_for(terminal_fault_selector(s)),

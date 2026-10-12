@@ -2896,6 +2896,15 @@ pub fn bootstrap_first_user_task(
             init_args[5]
         );
     }
+    // BL2-a: the ILLEGAL-INSTRUCTION scenario — init executes one illegal instruction. Mutually
+    // exclusive with the scenarios above by the same guard.
+    if crate::kernel::boot::terminal_fault_illegal_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::TERMINAL_FAULT_ILLEGAL_ORACLE_SELECTOR;
+        crate::yarm_log!(
+            "TERMINAL_FAULT_ILLEGAL_ORACLE_PROVISION_OK arch=riscv64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,
