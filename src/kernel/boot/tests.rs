@@ -195485,3 +195485,77 @@ mod bl6c_timer5_boot_stops_on_its_own_summary {
         assert_eq!(RUNNER.matches("STOP_MARKER=").count(), 1);
     }
 }
+
+// BL2-a: a RISC-V user illegal instruction is the task's fault, settled by the shared bridge's
+// user-instruction route, not the fatal Unknown policy. (The RISC-V trap module compiles only for
+// its own target, so these pin the decode and its inputs at source; the live witness is the
+// `TERMINAL_FAULT_ILLEGAL_ORACLE` cell of the RISC-V core smoke.)
+mod bl2a_riscv_illegal_instruction_is_the_tasks_fault {
+    const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const BRIDGE_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    fn decode() -> &'static str {
+        RV_TRAP_SRC
+            .split("pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {")
+            .nth(1)
+            .expect("the decoder")
+            .split("\n}\n")
+            .next()
+            .expect("its body")
+    }
+
+    #[test]
+    fn the_illegal_instruction_decodes_as_a_user_instruction_fault_at_epc() {
+        let d = decode();
+        assert!(d.contains(
+            "EXC_ILLEGAL_INSTRUCTION => TrapEvent::UserInstructionFault(FaultInfo::user(\n            VirtAddr(context.epc as u64),\n            FaultAccess::Execute,\n        )),"
+        ));
+        // Only that one code moves: the catch-all still answers Unknown.
+        assert!(
+            d.contains("_ => TrapEvent::Unknown {\n            arch_code: context.scause as u64,")
+        );
+        // Never the instruction BITS as an address.
+        assert!(!d.contains("EXC_ILLEGAL_INSTRUCTION => TrapEvent::UserInstructionFault(FaultInfo::user(\n            VirtAddr(context.stval"));
+    }
+
+    #[test]
+    fn every_production_context_carries_the_trapping_pc() {
+        assert!(RV_TRAP_SRC.contains("    pub epc: usize,\n"));
+        // The U-origin entry and both S-origin boundary entries.
+        assert_eq!(RV_BOOT_SRC.matches("epc: sepc,").count(), 3);
+        assert_eq!(
+            RV_BOOT_SRC
+                .matches("let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn the_riscv_bridge_settles_it_through_the_user_instruction_route() {
+        // The RISC-V bridge runs its own fault routes; the instruction route follows the terminal
+        // page-fault route there, with the same disposition handling.
+        let rv = RV_TRAP_SRC
+            .split("pub fn handle_riscv_trap_entry_shared(")
+            .nth(1)
+            .expect("the RISC-V bridge");
+        let terminal = rv
+            .find("try_split_terminal_page_fault_dispatch(")
+            .expect("terminal route");
+        let instruction = rv
+            .find("if let TrapEvent::UserInstructionFault(fault) = decode_trap_context(context) {\n            match crate::kernel::syscall_split::try_split_user_instruction_fault_dispatch(")
+            .expect("instruction route");
+        assert!(terminal < instruction);
+        let arm = &rv[instruction..];
+        assert!(arm.contains("reason=user_instruction_fault_committed"));
+        assert!(arm.contains("terminal_result = Some(result);"));
+    }
+
+    #[test]
+    fn the_shared_bridge_settles_it_through_the_user_instruction_route() {
+        assert!(BRIDGE_SRC.contains(
+            "if let TrapEvent::UserInstructionFault(fault) = decode_trap_context(context) {\n            match crate::kernel::syscall_split::try_split_user_instruction_fault_dispatch("
+        ));
+    }
+}
