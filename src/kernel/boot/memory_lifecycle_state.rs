@@ -342,55 +342,77 @@ impl KernelState {
             .map(|e| PhysAddr(e.phys.0 + offset))
     }
 
-    /// BL1 — THE frame behind one page of a shared region: the page `page_offset` bytes into the
-    /// window a `MemoryObject` or `DmaRegion` capability names.
+    /// SHARED-REGION-OFFSET1 — the byte length of the object a `MemoryObject` or `DmaRegion`
+    /// capability is backed by, or `None` for a stale object or any other capability class. The
+    /// one lookup the range policy needs that a caller cannot compute.
+    pub(crate) fn shared_region_object_len_locked(
+        memory: &MemorySubsystem,
+        object: CapObject,
+    ) -> Option<usize> {
+        let id = match object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return None,
+        };
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|e| e.id == id)
+            .map(|e| e.len)
+    }
+
+    /// BL1 / SHARED-REGION-OFFSET1 — THE frame behind one page of a shared region: the page
+    /// `page_offset` bytes into the selection `region` names, resolved against the backing of the
+    /// `MemoryObject` or `DmaRegion` capability `object`.
     ///
     /// A `MemoryObject` is ONE physical range, `[phys, phys + len)`: the record carries a single
     /// base and a single length and no per-page frame list, and every constructor produces such a
     /// range (`alloc_contiguous(pages)` for anonymous objects, one slice of the physically
     /// contiguous initrd for initramfs objects, a single frame for a COW private copy). That is
-    /// the representation guarantee this offset arithmetic relies on, and the same one the direct
-    /// shared-region transaction and NR 30 already map by. A `MemoryObject` capability's window
-    /// is the whole object; a `DmaRegion` capability's is its own `[offset, offset + len)`.
+    /// the representation guarantee this offset arithmetic relies on. `region.offset` is
+    /// OBJECT-relative, so the frame is `phys + region.offset + page_offset` for both capability
+    /// classes — a `DmaRegion` window bounds the selection, it does not rebase it.
     ///
-    /// Refuses, rather than computing a frame outside the authority the capability conveys: a
-    /// page offset that is not page-aligned, one at or past the window's end, a window that does
-    /// not lie inside its object, a stale object, or any other capability class. The send-side
-    /// bound (`transfer_shared_region_bounds_ok`) already keeps every queued region inside its
-    /// window, so the receive loops never reach the window refusal; it is here so this owner
-    /// cannot be the place a frame outside the object gets mapped.
+    /// Every call re-applies the WHOLE range policy ([`shared_region_selection`]) to the WHOLE
+    /// selection, not just to this page, so a receive loop's first page already refuses a
+    /// selection any later page of which would fall outside the authorized backing — nothing is
+    /// installed for a selection that cannot be installed completely. Refuses, rather than
+    /// computing a frame outside the authority the capability conveys: a page offset that is not
+    /// page-aligned or lies at or past the page-rounded selection's end, a selection the range
+    /// policy refuses, a stale object, or any other capability class.
     pub(crate) fn shared_region_page_phys_locked(
         memory: &MemorySubsystem,
         object: CapObject,
+        region: TransferSharedRegion,
         page_offset: usize,
     ) -> Result<PhysAddr, KernelError> {
+        let id = match object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return Err(KernelError::WrongObject),
+        };
         if !page_offset.is_multiple_of(crate::kernel::vm::PAGE_SIZE) {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
-        let entry = |id: u64| {
-            memory
-                .memory_objects
-                .iter()
-                .flatten()
-                .find(|e| e.id == id)
-                .copied()
-                .ok_or(KernelError::MemoryObjectMissing)
-        };
-        let (entry, window_offset, window_len) = match object {
-            CapObject::MemoryObject { id } => {
-                let e = entry(id)?;
-                (e, 0u64, e.len as u64)
-            }
-            CapObject::DmaRegion { id, offset, len } => (entry(id)?, offset, len),
-            _ => return Err(KernelError::WrongObject),
-        };
-        let window_end = window_offset
-            .checked_add(window_len)
-            .ok_or(KernelError::WrongObject)?;
-        if window_end > entry.len as u64 || page_offset as u64 >= window_len {
+        let entry = memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|e| e.id == id)
+            .copied()
+            .ok_or(KernelError::MemoryObjectMissing)?;
+        let object_len = u64::try_from(entry.len).map_err(|_| KernelError::WrongObject)?;
+        let selection = super::shared_region_selection(object, region, object_len)
+            .map_err(super::shared_region_refusal_error)?;
+        let page_offset = page_offset as u64;
+        if page_offset >= selection.mapped_len {
             return Err(KernelError::WrongObject);
         }
-        Ok(PhysAddr(entry.phys.0 + window_offset + page_offset as u64))
+        selection
+            .object_offset
+            .checked_add(page_offset)
+            .and_then(|off| entry.phys.0.checked_add(off))
+            .map(PhysAddr)
+            .ok_or(KernelError::WrongObject)
     }
 
     pub(crate) fn note_mapping_removed(&mut self, phys: PhysAddr) {

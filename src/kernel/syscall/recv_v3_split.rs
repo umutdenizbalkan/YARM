@@ -122,19 +122,19 @@ impl RecvV3Owners for SplitRecvV3Owners<'_> {
         }
     }
 
-    fn region_phys_start(&mut self, cap: CapId) -> Option<PhysAddr> {
+    fn region_page_phys(
+        &mut self,
+        cap: CapId,
+        region: crate::kernel::boot::TransferSharedRegion,
+        page_offset: usize,
+    ) -> Option<PhysAddr> {
         let capability = self
             .shared
             .resolve_capability_for_task_split(self.tid, cap)
             .ok()?;
-        let (mo_id, offset) = match capability.object {
-            CapObject::DmaRegion { id, offset, .. } => (id, offset),
-            CapObject::MemoryObject { id } => (id, 0u64),
-            _ => return None,
-        };
         self.shared
-            .memory_object_phys_by_id_split(mo_id)
-            .map(|phys| PhysAddr(phys.0 + offset))
+            .shared_region_page_phys_split(capability.object, region, page_offset)
+            .ok()
     }
 
     fn map_page(&mut self, asid: Asid, virt: VirtAddr, phys: PhysAddr, writable: bool) -> bool {

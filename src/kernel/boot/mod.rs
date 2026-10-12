@@ -97,7 +97,9 @@ mod task_policy_state;
 pub(crate) mod thread_state;
 mod tid_allocation_policy;
 mod transfer_state;
-pub(crate) use transfer_state::transfer_shared_region_bounds_ok;
+pub(crate) use transfer_state::{
+    shared_region_refusal_error, shared_region_selection, transfer_shared_region_bounds_ok,
+};
 mod types;
 mod user_memory_state;
 /// U9-SPAWN-VM2: the rank-local VM(5)/memory(6) bodies the image path is built out of.
@@ -8399,8 +8401,16 @@ pub fn provision_init_ipc_send_cap_oracle_coord(
 }
 
 /// Stage 198E3C1: the DIRECT shared-region oracle's fixed region size (two pages, so the live path
-/// exercises multi-page mapping progress).
+/// exercises multi-page mapping progress). This is the size of every grant the oracle cells send
+/// and of the receive window they map it into.
 pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
+
+/// SHARED-REGION-OFFSET1: the size of the disposable object BACKING the oracle grants — four
+/// pages, each holding a different pattern, so a two-page grant can name a MIDDLE range
+/// (`[PAGE, 3 * PAGE)`) of it and the receiver can tell, byte by byte, which pages it was given.
+/// The ordinary cells still send `[0, 2 * PAGE)`, exactly what they sent from the two-page
+/// object; only the `shared-region-offset-witness` userspace profile sends the middle range.
+pub(crate) const SHARED_REGION_ORACLE_OBJECT_PAGES: usize = 4;
 
 /// Stage 198E3C1B-H / 198E3C2C: the dedicated unmapped two-page oracle receive window VA, mirroring
 /// `yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA` EXACTLY (same per-arch value). The authoritative
@@ -9290,7 +9300,7 @@ pub fn provision_init_shared_region_oracle(
     }
     use crate::kernel::capabilities::{CapObject, CapRights, Capability};
     let inject = shared_region_oracle_fault_inject();
-    let len = SHARED_REGION_ORACLE_PAGES * crate::kernel::vm::PAGE_SIZE;
+    let len = SHARED_REGION_ORACLE_OBJECT_PAGES * crate::kernel::vm::PAGE_SIZE;
     let mut scratch = SharedRegionProvisionScratch::default();
 
     // Step 1: allocate the source object.
@@ -9325,7 +9335,7 @@ pub fn provision_init_shared_region_oracle(
             return None;
         }
     };
-    // Initialize both pages with the deterministic pattern through the kernel direct map (bare-metal
+    // Initialize every page with the deterministic pattern through the kernel direct map (bare-metal
     // only; a normal boot never reaches this, and no userspace WRITE authority is created).
     #[cfg(not(feature = "hosted-dev"))]
     {
@@ -9342,6 +9352,15 @@ pub fn provision_init_shared_region_oracle(
                 return None;
             }
         };
+        // SHARED-REGION-OFFSET1: the object's physical base, so a smoke can check the frame each
+        // receive path installed against the object offset the grant named — independently of
+        // the userspace byte check.
+        crate::yarm_log!(
+            "SHARED_REGION_ORACLE_PROVISION_PHYS obj_id={} base=0x{:x} len={}",
+            obj_id,
+            phys,
+            len
+        );
         for off in 0..len {
             match KernelState::phys_to_direct_map_ptr(phys + off as u64) {
                 Some(ptr) => unsafe {
@@ -9378,17 +9397,18 @@ pub fn provision_init_shared_region_oracle(
 
     // Step 3b (U9-XFER2 §4, witness only): the SOURCE CAP THE WITNESS SENDS.
     //
-    // NR 30's mapped delivery takes the region span off the RECEIVER-side capability, through
-    // `recv_v3_exact_region_len`, which is non-zero only for `CapObject::DmaRegion`. That is the
-    // EXISTING NR 30 ABI and both adapters apply it identically — the broad route reads the same
-    // helper — so a bare `MemoryObject` grant is not a shape NR 30 maps, on either route. (The
-    // DIRECT oracle never asks NR 30: it maps from the ENVELOPE's own descriptor, which is why a
-    // `MemoryObject` cap is the right source there and not here.)
+    // NR 30's mapped delivery requires the RECEIVER-side capability to be a `DmaRegion` —
+    // `recv_v3_exact_region_len` is non-zero only for one. That is the EXISTING NR 30 ABI and
+    // both adapters apply it identically, so a bare `MemoryObject` grant is not a shape NR 30
+    // maps, on either route. (Since SHARED-REGION-OFFSET1 the bytes it maps are the descriptor's
+    // object-relative selection, as on every other receive path, not the whole window. The
+    // DIRECT oracle never asks NR 30, which is why a `MemoryObject` cap is the right source there
+    // and not here.)
     //
     // So when — and only when — the witness is armed, the SAME disposable object is additionally
-    // named by a `READ | MAP` `DmaRegion` cap over its whole two-page span, and that is what goes
+    // named by a `READ | MAP` `DmaRegion` cap over its whole span, and that is what goes
     // into startup slot 13. Rights are identical to the MemoryObject grant (no WRITE, no execute),
-    // the backing is the same two pages already filled with the pattern, and nothing about the
+    // the backing is the same pages already filled with the pattern, and nothing about the
     // direct oracle's provisioning changes when the knob is off.
     let init_source_cap = if xfer2_grant_witness_enabled() {
         let init_cnode_early = match kernel.task_cnode(init_tid) {
@@ -9504,10 +9524,11 @@ pub fn provision_init_shared_region_oracle(
     scratch.init_ep_cap = Some(init_ep_cap);
 
     crate::yarm_log!(
-        "SHARED_REGION_ORACLE_PROVISION_OK init_tid={} obj_id={} pages={} mem_cap={} endpoint_cap={} eidx={}",
+        "SHARED_REGION_ORACLE_PROVISION_OK init_tid={} obj_id={} pages={} object_pages={} mem_cap={} endpoint_cap={} eidx={}",
         init_tid,
         obj_id,
         SHARED_REGION_ORACLE_PAGES,
+        SHARED_REGION_ORACLE_OBJECT_PAGES,
         init_source_cap.0,
         init_ep_cap.0,
         endpoint_idx

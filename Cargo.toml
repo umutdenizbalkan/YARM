@@ -209,6 +209,13 @@ context1-clobber = ["context1-witness"]
 # and the oracle window can no longer be mapped. Gated off, the image is byte-identical to one
 # without the cell. Accepted and inert outside yarm-control-plane-servers.
 recv-queue1-ordinary-grant = []
+# SHARED-REGION-OFFSET1: the shared-region oracle cells — the NR 30 grants, the NR 2 / NR 5
+# grants and the DIRECT oracle — send the MIDDLE two pages `[PAGE, 3 * PAGE)` of the four-page
+# oracle object instead of `[0, 2 * PAGE)`, and check that the receiver reads exactly those
+# pages' bytes. A userspace feature for the same reason `recv-queue1-ordinary-grant` is one: the
+# offset profile and the zero-offset profile are complementary runs of one witness, and gated off
+# the init image carries none of it. Accepted and inert outside yarm-control-plane-servers.
+shared-region-offset-witness = []
 # Stage 200D-0D1: the RISC-V disposable-task ExitCurrentTask live oracle — the third and final
 # arch cell. Selector, marker and gate literals compile ONLY with this feature; the production
 # NR16 syscall, the disposition publication and the RISC-V post-lock consumer are

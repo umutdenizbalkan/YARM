@@ -51,7 +51,21 @@ note "building base x86_64 artifacts (servers + initramfs)"
 # BL3a: ORACLE_SERVER_FEATURE_ARGS lets a qualification run build the servers with a default-off
 # witness feature (e.g. `--no-default-features --features oracle-handshake-race`); unset, the
 # build is exactly what it was.
-BOOTSTRAP_FEATURE_ARGS="${ORACLE_SERVER_FEATURE_ARGS:---no-default-features}" \
+# SHARED-REGION-OFFSET1: OFFSET_SELECTION=1 builds init with `shared-region-offset-witness`, so
+# the parent grants the MIDDLE two pages `[PAGE, 3 * PAGE)` of the four-page oracle object and the
+# child checks that it reads exactly those pages' bytes. Composes with ORACLE_SERVER_FEATURE_ARGS.
+OFFSET_SELECTION=${OFFSET_SELECTION:-0}
+SERVER_FEATURE_ARGS="${ORACLE_SERVER_FEATURE_ARGS:---no-default-features}"
+GRANT_OFFSET=0
+if (( OFFSET_SELECTION )); then
+  GRANT_OFFSET=4096
+  if [[ "$SERVER_FEATURE_ARGS" == *"--features "* ]]; then
+    SERVER_FEATURE_ARGS="${SERVER_FEATURE_ARGS/--features /--features shared-region-offset-witness,}"
+  else
+    SERVER_FEATURE_ARGS="$SERVER_FEATURE_ARGS --features shared-region-offset-witness"
+  fi
+fi
+BOOTSTRAP_FEATURE_ARGS="$SERVER_FEATURE_ARGS" \
   scripts/build-qemu-x86_64-artifacts.sh >"$LOGDIR/build.log" 2>&1 \
   || die "base artifact build failed (see $LOGDIR/build.log)"
 
@@ -81,9 +95,22 @@ if (( fail )); then
   exit 1
 fi
 
+# BL5c: the feature kernel is built outside the artifact build, so the run binds it explicitly and
+# records the identities it judged.
+{
+  echo "tree=$(git rev-parse HEAD^{tree}) head=$(git rev-parse HEAD) dirty=$(git status --porcelain | wc -l) kernel_feature=$FEATURE server_features=$SERVER_FEATURE_ARGS"
+  sha256sum "build-x86_64/kernel_boot.elf" build-x86_64/initramfs-core.cpio
+} >"$LOGDIR/artifact-identity.txt"
+source scripts/lib/artifact-binding.sh
+artifact_write_run_manifest "$LOGDIR/artifact-binding.txt" x86_64 "build-x86_64/kernel_boot.elf" \
+  "--no-default-features --features $FEATURE" build-x86_64/initramfs-core.cpio \
+  build-x86_64/artifact-manifest.txt \
+  || { echo "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=x86_64 classes=1 result=fail reason=artifact_binding"; exit 1; }
+
 # ── 3. Boot ONE -smp 1 QEMU with the oracle knob ──
 note "booting QEMU -smp 1 with yarm.x86_64_shared_region_direct_oracle=1"
 env \
+  ARTIFACT_MANIFEST="$LOGDIR/artifact-binding.txt" \
   KERNEL_IMAGE=build-x86_64/kernel_boot.elf \
   INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
   KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.x86_64_shared_region_direct_oracle=1" \
@@ -152,6 +179,23 @@ done
 # A too-early send must NOT have run legacy/immediate delivery: assert the child observed the DIRECT
 # mapping (a WouldBlock decline never maps). At least one DECLINE is fine (a retry); a legacy
 # delivery would show the child mapped WITHOUT the kernel direct markers, already caught above.
+
+# ── SHARED-REGION-OFFSET1: the selection the direct delivery mapped ──
+#
+# The child already read every byte of both pages against the pattern at the grant's object
+# offset (page0=1 page1=1). Kernel side, independently: each page installed from the oracle object
+# sits at `ORACLE_VA + (pa - base - GRANT_OFFSET)`, one install per granted page.
+offset_marker=$(count 'SHARED_REGION_OFFSET_WITNESS cell=direct ')
+if (( OFFSET_SELECTION )); then
+  [[ "$offset_marker" == "1" && "$(count "SHARED_REGION_OFFSET_WITNESS cell=direct offset=$GRANT_OFFSET len=8192")" == "1" ]] \
+    || die "the offset profile did not reach the init image (markers=$offset_marker)"
+else
+  [[ "$offset_marker" == "0" ]] || die "the zero-offset profile carries the offset cell"
+fi
+frames=$(python3 -I scripts/lib/shared-region-frames.py "$NORM" "$GRANT_OFFSET" 0x40000000)
+[[ "$frames" == "installs=2 misplaced=0" ]] \
+  || die "the oracle object's frames were not installed at the granted object offset ($frames)"
+(( fail )) || echo "SHARED_REGION_OFFSET_SEAL arch=x86_64 cell=direct object_offset=$GRANT_OFFSET $frames result=ok"
 
 if (( fail )); then
   echo "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=x86_64 classes=1 live_cells=0 result=fail (see $BOOT_LOG)"

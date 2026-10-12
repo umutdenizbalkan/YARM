@@ -1307,8 +1307,9 @@ impl KernelState {
 
     /// BL1 — the per-page twin of [`Self::resolve_memory_object_phys`] for a shared region: the
     /// same capability resolution, the same object-kind check and the same READ-then-WRITE rights
-    /// checks in the same order, then the frame `page_offset` bytes into the capability's window
-    /// through [`Self::shared_region_page_phys_locked`].
+    /// checks in the same order, then the frame `page_offset` bytes into the selection `region`
+    /// names (object-relative, SHARED-REGION-OFFSET1) through
+    /// [`Self::shared_region_page_phys_locked`].
     ///
     /// `resolve_memory_object_phys` answers "the object's base frame", which is right for every
     /// single-page object its other callers map; a multi-page region needs the frame of EACH page.
@@ -1316,6 +1317,7 @@ impl KernelState {
         &self,
         mem_cap: CapId,
         flags: PageFlags,
+        region: super::TransferSharedRegion,
         page_offset: usize,
     ) -> Result<PhysAddr, KernelError> {
         let capability = self
@@ -1335,7 +1337,7 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
         self.with_memory_state(|memory| {
-            Self::shared_region_page_phys_locked(memory, capability.object, page_offset)
+            Self::shared_region_page_phys_locked(memory, capability.object, region, page_offset)
         })
     }
 

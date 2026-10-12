@@ -47,6 +47,11 @@ This file has exactly one status page: §0.3.
 **Baseline:** commit `757993b` + this repair branch, tree audited at
 `1118b61b74588e73b0dc235dc96086ec7488257c`.
 
+> **Read §0.1 and §0.3 with the framing corrections recorded at the end of the backlog
+> (*Backlog closure*):** their broad-lock wording predates U9 and is historical where U9's
+> delivered census (`with_cpu=0`, `with_broad=0`) contradicts it, and that census completes no
+> stage other than 204A.
+
 ### 0.1 The one measurable definition of "unlocked"
 
 `SharedKernel` (`src/runtime.rs:231`) owns one broad lock, `state: SpinLock<KernelState>`.
@@ -25671,7 +25676,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | Issue | Status | Evidence / prerequisite |
 |---|---|---|
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
-| BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | bounded — awaiting an owner ABI decision | see BL1 "Not changed". Every in-tree sender passes offset 0, so no current path is wrong in effect. Whether `offset` selects a page or byte offset into the backing (and how a non-page-aligned offset is refused) is an ABI choice the code cannot make; the repair is mechanical once it is made |
+| BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | fixed (SHARED-REGION-OFFSET1) | owner ABI decision: byte offset relative to the `MemoryObject`, page-aligned, a `DmaRegion` bounds without rebasing. On `a91632ba` a non-zero offset maps the wrong pages on the queued, direct and NR 30 paths, NR 30 maps the whole window, a `MemoryObject` descriptor whose `len` fits but whose `offset + len` does not is accepted, and a misaligned offset is accepted — nine hosted regressions fail. One range policy now admits and resolves on every path; live: every receive family maps a middle two-page range on all three ports |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | fixed and delivered (qualified `1d7be22c`) | reproduced live with a new default-off witness: base stops the whole system at `IRQ1_UNKNOWN_SETTLED … strict=1`. A U-mode illegal instruction now decodes as the task's `UserInstructionFault` at `sepc`, and the RISC-V bridge settles it through BL2's route and the same terminal owners; init is reported and terminated, and a replacement runs |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
@@ -25761,13 +25766,101 @@ identical to base on every port (219 / 247 / 229, identical classes). Revert con
 two mapping loops restored to `bdd0028e`, `every_page_of_a_multi_page_region_is_backed_by_its_own_frame`
 fails at page 1 (`0x10180000` where `0x10181000` was required) while release and rollback pass.
 
-**Not changed (BL1-a, open).** The descriptor's `offset` (`IpcSend` arg 1) is documented in
-`doc/IPC.md` §8.2 as a byte offset into the source object, but no receive path applies it: the
-direct transaction, NR 30 and both queued loops all map from the capability window's start. For a
-`MemoryObject` the send side validates it only as a user range and bounds `len` alone; for a
-`DmaRegion` the send side requires `[offset, offset + len)` inside the window. Honouring it needs an
-ABI decision (page alignment, or a lane reporting the intra-page offset) across four receive paths,
-so it is recorded rather than changed here. Every in-tree sender passes 0.
+**Not changed here (BL1-a; since fixed by SHARED-REGION-OFFSET1, below).** The descriptor's
+`offset` (`IpcSend` arg 1) was documented in `doc/IPC.md` §8.2 as a byte offset into the source
+object, but no receive path applied it: the direct transaction, NR 30 and both queued loops all
+mapped from the capability window's start. For a `MemoryObject` the send side validated it only as
+a user range and bounded `len` alone; for a `DmaRegion` the send side required `[offset, offset +
+len)` inside the window. Honouring it needed an ABI decision, so BL1 recorded it rather than
+changing it.
+
+### BL1-a — SHARED-REGION-OFFSET1: the shared-region descriptor offset
+
+**ABI decision (owner-supplied).**
+
+* `offset` and `len` are bytes. `offset` is relative to the underlying `MemoryObject` — not a page
+  index, not a sender or receiver virtual address. It is not the VFS
+  `VfsSharedBufferDescriptor.buffer_offset` and not a file offset; VFS is not enabled by this.
+* A `DmaRegion` capability restricts that object-relative interval to its window. Its base is never
+  added to `offset`.
+* A mapped grant requires a page-aligned `offset`; a misaligned one is refused with `InvalidArgs`,
+  never rounded down.
+* `len` stays the exact logical length. `mapped_len = round_up(len, PAGE)` is the mapping,
+  registration and release length, as before.
+* Every end and every rounding is checked. The 16-byte descriptor layout and valid zero-offset
+  behaviour are unchanged.
+
+Checked against the public declarations and every callsite: `SharedMemoryRegion` (`offset: u64,
+len: u64`), `doc/IPC.md` §8.2 and `doc/SYSCALL_ABI.md` already called `offset` a byte offset into
+the source object. No supported caller conflicts: every in-tree sender (init's oracle cells,
+`send_shared_region`) passed 0. Twenty hosted tests passed offsets of `0x1000`–`0x5000` (and one
+misaligned `0x1200`) into one-page objects; they did so only because the offset was ignored, and
+are re-derived to `0` with their assertions unchanged otherwise.
+
+**Defect (reproduced on `a91632ba`, through production owners).** Twelve hosted cases in
+`shared_region_offset1` drive the broad dispatcher, the split NR 2 / NR 5 lanes, both NR 30
+adapters, the direct transaction under its broad and off-lock contexts, and NR 4, over objects
+whose every page holds a different pattern, and read back both the installed translation and the
+bytes the receiver's address space reads. Nine fail on the base:
+
+* a non-zero offset maps the wrong pages — queued (`object_middle_range nr=2 broad: page 0 must be
+  backed by object page 1`, it was page 0), direct (same, both contexts), and the window reuse
+  case;
+* the partial final page reads another page's bytes (`190` where `15`);
+* NR 30 maps the whole capability window whatever the descriptor names (`16384` where `8192`);
+* a `MemoryObject` descriptor whose `len` fits but whose `offset + len` does not is accepted
+  (`object_offset_past_end`), as is a misaligned offset and a kernel sender's offset whose
+  page-rounded end overflows;
+* the direct transaction maps a selection outside its object's backing.
+
+The three that pass on the base are preservation guards (NR 30 still refuses a bare
+`MemoryObject`; the queued and direct later-page rollbacks).
+
+**Repair — one range policy, one per-page owner.**
+
+* `shared_region_selection` (`transfer_state.rs`) is THE policy: kind, `len > 0`, page-aligned
+  offset, checked `round_up(len)`, checked `offset + mapped_len`, checked window end, the window
+  inside its object, the page-rounded selection inside the window. It returns the
+  `(object_offset, len, mapped_len)` triple.
+* Admission: both NR 1 arms (`handle_ipc_send` and the pre-lock route) ask it through
+  `validate_shared_region_send_descriptor` after the kind, rights and user-region checks and before
+  the stash, so nothing is pinned, published or queued for a refused descriptor. Both stashes keep
+  asking it (`transfer_shared_region_bounds_ok`), now with the backing object's length for a
+  `DmaRegion` too.
+* Resolution: `KernelState::shared_region_page_phys_locked(memory, object, region, page_offset)`
+  re-applies the policy to the whole selection on every call and returns `phys + offset +
+  page_offset`. Every receive family resolves every page through it: both queued loops, the direct
+  transaction (`ctx_region_page_phys`, replacing `ctx_phys_base`, with page 0 resolved before the
+  mint so a selection the backing cannot hold is `BadRegion` before anything is minted or mapped),
+  and NR 30 (`region_page_phys`, replacing the window-base `region_phys_start`; the length mapped
+  is the descriptor's, decoded from the kernel-framed payload; the `DmaRegion` requirement stays).
+  The split queued loop now rolls back its installed prefix on a resolve refusal as the broad one
+  always did. The direct transaction's page rounding is checked.
+* The final page: mapped whole, admissible because every object and window is page-granular and
+  the whole page-rounded selection must lie inside the window. No byte-level isolation of the tail
+  is claimed.
+* Liveness is unchanged: the receiver-local capability plus the active-transfer registration keep
+  the object alive, and revoke unmaps the registered range two-phase before dropping
+  `cap_refcount`. `map_refcount` stays keyed on the object's base frame, which a non-zero-offset
+  selection does not map — exactly as pages 1+ of a zero-offset selection never counted.
+
+**Newly refused inputs** (all `IpcSend` → `InvalidArgs`, before publication): a misaligned offset;
+a `MemoryObject` selection reaching past its object; a page-rounded end that overflows. Changed
+error class: a `DmaRegion` selection outside its window used to be `QueueFull` on the broad route (the stash's answer to every refusal, including a full table)
+and `InvalidCapability` on the split route; both now answer `InvalidArgs`. NR 30's mapped receive
+maps the descriptor's selection instead of the whole window — identical for every in-tree caller,
+which grants the whole window.
+
+**Live witness.** The oracle object is now four differently patterned pages
+(`SHARED_REGION_ORACLE_OBJECT_PAGES`); every grant is still two. The default-off userspace feature
+`shared-region-offset-witness` makes init's NR 30 grants, NR 2 / NR 5 grants and the direct oracle
+send the middle range `[PAGE, 3 * PAGE)` and check every byte against the pattern at that object
+offset; release, reuse of the window, duplicate-release refusal and the essential capabilities
+are checked as before. Each smoke takes `OFFSET_SELECTION=1`, proves the feature reached the image
+(`SHARED_REGION_OFFSET_WITNESS cell=…`), checks kernel-side that every install from the oracle
+object sits at `ORACLE_VA + (pa - base - offset)` (`scripts/lib/shared-region-frames.py` over
+`SHARED_REGION_ORACLE_PROVISION_PHYS` and `USER_MAP_PA_CHECK`), and binds its run to the kernel and
+initramfs it boots.
 
 ### BL2 — x86 user port-I/O fault containment
 
@@ -27031,13 +27124,13 @@ the in-lock attestation BL6a removes, and it now requires the idle cell to forbi
 
 ### Backlog closure — state at the end of the BL5 / BL6 programme
 
-Every row of the table above is resolved or explicitly bounded.
+Every row of the table above is fixed or explicitly bounded. A bounded row is still OPEN: it names
+the condition under which it stays harmless and what would remove it; it is not a closure.
 
-* *Fixed and delivered:* BL1, BL2, BL2-a, BL3a–c, BL4a–b, BL5a, BL5a-2, BL5a-2b, BL5b, BL5b-2, BL5b-4,
-  BL5c, BL5d, BL6a, BL6c, BL6e. Each has its own section above: defect, repair, evidence, and the
-  frozen commit it was qualified on.
-* *Bounded with a stated condition:*
-  * BL1-a: awaiting an owner ABI decision;
+* *Fixed and delivered:* BL1, BL1-a (SHARED-REGION-OFFSET1), BL2, BL2-a, BL3a–c, BL4a–b, BL5a,
+  BL5a-2, BL5a-2b, BL5b, BL5b-2, BL5b-4, BL5c, BL5d, BL6a, BL6c, BL6e. Each has its own section
+  above: defect, repair, evidence, and the frozen commit it was qualified on.
+* *Bounded with a stated condition (open):*
   * BL5b-3: latent, no failing sample;
   * BL6b and BL6a's premise: boot-order dependent, now named;
   * BL6d: needs the kernel to hold a source until a quiet idle boundary;
@@ -27045,8 +27138,19 @@ Every row of the table above is resolved or explicitly bounded.
 * *U9 stays closed:* production census `with_cpu=0`, `with_broad=0`, with the three wrapper
   definitions counted separately (`tests/broad_lock_census_guard.rs`, 9/9 on every delivery).
 
-**Remaining feature roadmap.** This is §0.3, unchanged by this backlog, which repaired correctness
-and checker defects rather than advancing a canonical stage.
+**Remaining feature roadmap.** This is §0.3's stage table, unchanged by this backlog, which repaired
+correctness and checker defects rather than advancing a canonical stage. Two framing corrections
+apply to reading it:
+
+* §0.1 and §0.3 predate U9 in their broad-lock wording. Where they say production work still runs
+  under `with_cpu` (the census "**6** production callsites", "runs inside
+  `handle_trap_entry_shared`'s `with_cpu`", "the authoritative trap dispatch still serves every
+  non-split IPC syscall"), they are historical: the delivered U9 work leaves the production census
+  at `with_cpu=0`, `with_broad=0`, recomputed from source by `tests/broad_lock_census_guard.rs`.
+* That census does not complete a stage. 204A IS the census and is complete; every other stage
+  closes only by its own definition (full scope on the production path, every required
+  architecture). A zero census says no runtime broad acquisition remains, not that a subsystem's
+  definition is met.
 
 | Phase | Stages | Status |
 |---|---|---|

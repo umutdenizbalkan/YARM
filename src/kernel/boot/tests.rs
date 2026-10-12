@@ -331,7 +331,7 @@ fn shared_transfer_pins_memory_object_until_materialized() {
             endpoint,
             None,
             Some(TransferSharedRegion {
-                offset: 0x2000,
+                offset: 0,
                 len: PAGE_SIZE as u64,
             }),
         )
@@ -377,7 +377,7 @@ fn process_cleanup_purges_transfer_envelopes_and_unpins_memory() {
             endpoint,
             Some(ThreadId(1)),
             Some(TransferSharedRegion {
-                offset: 0x4000,
+                offset: 0,
                 len: PAGE_SIZE as u64,
             }),
         )
@@ -428,7 +428,7 @@ fn process_cleanup_repeated_transfer_envelope_purge_keeps_telemetry_balanced() {
                 endpoint,
                 Some(ThreadId(1)),
                 Some(TransferSharedRegion {
-                    offset: 0x4000 + (i * PAGE_SIZE) as u64,
+                    offset: 0,
                     len: PAGE_SIZE as u64,
                 }),
             )
@@ -632,7 +632,7 @@ fn phase5_mixed_teardown_paths_keep_transfer_and_mapping_telemetry_balanced() {
                 endpoint,
                 Some(ThreadId(1)),
                 Some(TransferSharedRegion {
-                    offset: 0x5000 + (i * PAGE_SIZE) as u64,
+                    offset: 0,
                     len: PAGE_SIZE as u64,
                 }),
             )
@@ -4605,7 +4605,7 @@ fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() 
         crate::kernel::syscall::Syscall::IpcSend as usize,
         [
             send_cap.0 as usize,
-            0x2000,
+            0,
             Message::MAX_PAYLOAD + 16,
             0,
             0,
@@ -4621,7 +4621,7 @@ fn syscall_send_large_payload_uses_shared_region_descriptor_with_cap_transfer() 
     let msg = state.ipc_recv(recv_cap_task1).expect("recv").expect("msg");
     assert!(msg.transferred_cap().is_some());
     let region = crate::kernel::ipc::SharedMemoryRegion::decode(msg.as_slice()).expect("region");
-    assert_eq!(region.offset, 0x2000);
+    assert_eq!(region.offset, 0);
     assert_eq!(region.len as usize, Message::MAX_PAYLOAD + 16);
 }
 
@@ -21074,7 +21074,7 @@ fn stage20_transfer_envelope_double_take_is_harmless() {
             endpoint,
             None,
             Some(TransferSharedRegion {
-                offset: 0x2000,
+                offset: 0,
                 len: PAGE_SIZE as u64,
             }),
         )
@@ -72745,7 +72745,8 @@ mod stage198e3c1_direct_live_policy {
             ),
             "the source cap is a MemoryObject"
         );
-        // Exactly two pages of backing.
+        // SHARED-REGION-OFFSET1: four pages of backing, so a two-page grant can name a middle
+        // range of it (it was exactly two pages before).
         let base = s
             .with_memory_state(|m| {
                 crate::kernel::boot::KernelState::shared_region_phys_base_locked(m, view.object)
@@ -72753,9 +72754,10 @@ mod stage198e3c1_direct_live_policy {
             .expect("phys base");
         assert_eq!(
             s.memory_object_len_for_test(base),
-            Some(2 * PAGE_SIZE),
-            "the provisioned object spans exactly two pages"
+            Some(crate::kernel::boot::SHARED_REGION_ORACLE_OBJECT_PAGES * PAGE_SIZE),
+            "the provisioned object spans exactly the oracle's object pages"
         );
+        assert_eq!(crate::kernel::boot::SHARED_REGION_ORACLE_OBJECT_PAGES, 4);
         // Receiver rights are read-only READ|MAP — no WRITE, no execute.
         assert!(view.has_right(CapRights::READ) && view.has_right(CapRights::MAP));
         assert!(
@@ -73088,8 +73090,11 @@ mod stage198e3c1_direct_live_policy {
             .split_once("mod shared_region_oracle_core {")
             .and_then(|(_, r)| r.split_once("// ─── Stage 196C:").map(|(b, _)| b))
             .expect("shared-region core present");
-        // DIRECT send + ordinary recv are used.
-        assert!(scaffold.contains("send_shared_region(endpoint_cap, mem_cap"));
+        // DIRECT send + ordinary recv are used. (SHARED-REGION-OFFSET1: the parent sends through
+        // the core's `send_grant`, which names the grant's object offset — the same canonical
+        // `send_shared_region_large` IpcSend, re-derived from `send_shared_region`.)
+        assert!(scaffold.contains("send_grant(endpoint_cap, mem_cap"));
+        assert!(scaffold.contains("yarm_user_rt::syscall::send_shared_region_large("));
         assert!(scaffold.contains("recv_shared_region_v2(endpoint_cap, va, len)"));
         // No RecvSharedV3 / enqueue-path helper is CALLED on this path (a comment may name them to
         // document the exclusion, but no invocation exists).
@@ -73968,7 +73973,11 @@ mod stage198e3c1_direct_live_policy {
         ));
         // The x86 wrapper drives the arch-neutral core (the send encoding is the common helper).
         assert!(SERVICE_SRC.contains("core_oracle::parent_wait_and_send(endpoint_cap, mem_cap)"));
-        assert!(SERVICE_SRC.contains("send_shared_region(endpoint_cap, mem_cap)"));
+        // SHARED-REGION-OFFSET1: the parent sends through the core's `send_grant`, which names the
+        // grant's object offset over the same canonical `send_shared_region_large` encoding
+        // (re-derived from `send_shared_region`).
+        assert!(SERVICE_SRC.contains("send_grant(endpoint_cap, mem_cap)"));
+        assert!(SERVICE_SRC.contains("yarm_user_rt::syscall::send_shared_region_large("));
     }
 
     // Portable oracle core: the arch-neutral module exists, is `not(hosted-dev)`-gated (all arches),
@@ -144878,25 +144887,37 @@ mod u9f_split_capability_revocation {
                  must be re-derived before this test is updated"
             );
         }
-        // THE re-derivation. A Notification still cannot reach a registration, because NR 30's
-        // split route registers only after `region_phys_start` resolved a physical base — and
-        // that owner matches `DmaRegion` and `MemoryObject` and nothing else.
+        // THE re-derivation (re-derived again for SHARED-REGION-OFFSET1, which replaced the
+        // window-base resolver `region_phys_start` with the per-page `region_page_phys`). A
+        // Notification still cannot reach a registration, because NR 30's split route registers
+        // only after every page resolved through `region_page_phys` — and that owner asks the
+        // shared per-page owner, whose range policy admits `DmaRegion` and `MemoryObject` and
+        // nothing else.
         const V3_SPLIT: &str = include_str!("../syscall/recv_v3_split.rs");
         let phys = V3_SPLIT
-            .split_once("fn region_phys_start(")
+            .split_once("fn region_page_phys(")
             .map(|(_, r)| r.split_once("\n    fn ").map_or(r, |(b, _)| b))
-            .expect("the split route must resolve a region base");
+            .expect("the split route must resolve each page");
         assert!(
-            phys.contains("CapObject::DmaRegion { id, offset, .. } => (id, offset)")
-                && phys.contains("CapObject::MemoryObject { id } => (id, 0u64)")
-                && phys.contains("_ => return None"),
-            "the split route's region resolver must admit only DmaRegion and MemoryObject"
+            phys.contains(".shared_region_page_phys_split(capability.object, region, page_offset)"),
+            "the split route's page resolver must be the shared per-page owner"
+        );
+        const POLICY: &str = include_str!("transfer_state.rs");
+        let policy = POLICY
+            .split_once("pub(crate) fn shared_region_selection(")
+            .map(|(_, r)| r.split_once("\n}\n").map_or(r, |(b, _)| b))
+            .expect("the range policy");
+        assert!(
+            policy.contains("CapObject::MemoryObject { .. } => (0, object_len)")
+                && policy.contains("CapObject::DmaRegion { offset, len, .. } => (offset, len)")
+                && policy.contains("_ => return Err(SharedRegionRangeRefusal::NotARegion)"),
+            "the range policy must admit only DmaRegion and MemoryObject"
         );
         // …and the transaction registers only on the path that resolved one.
         const V3_TXN: &str = include_str!("../syscall/recv_v3_txn.rs");
         let txn = code_of(V3_TXN);
         let resolve = txn
-            .find("owners.region_phys_start(cap_id)")
+            .find(".region_page_phys(cap_id, region, page_idx * PAGE_SIZE)")
             .expect("the resolve must precede the register");
         let register = txn
             .find("owners.register_transfer(")
@@ -180947,8 +180968,13 @@ mod u9xfer2_transaction_cases {
                 exact_region_len: 2 * PAGE_SIZE as u64,
             }
         }
-        fn region_phys_start(&mut self, _cap: CapId) -> Option<PhysAddr> {
-            Some(PhysAddr(0x10_0000))
+        fn region_page_phys(
+            &mut self,
+            _cap: CapId,
+            _region: crate::kernel::boot::TransferSharedRegion,
+            page_offset: usize,
+        ) -> Option<PhysAddr> {
+            Some(PhysAddr(0x10_0000 + page_offset as u64))
         }
         fn map_page(
             &mut self,
@@ -180986,13 +181012,20 @@ mod u9xfer2_transaction_cases {
         }
     }
 
+    /// SHARED-REGION-OFFSET1: the payload is a real two-page descriptor. NR 30 now maps the
+    /// descriptor's selection, so the all-zero payload this used to carry (offset 0, len 0, which
+    /// the transaction ignored in favour of the capability window) would map nothing.
     fn mapped_grant_message() -> Message {
         Message::with_header(
             1,
             crate::kernel::recv_core::recv_shared_v3::OPCODE_SHARED_MEM_VALUE,
             Message::FLAG_CAP_TRANSFER,
             Some(0x2_0001),
-            &[0u8; 16],
+            &crate::kernel::ipc::SharedMemoryRegion {
+                offset: 0,
+                len: 2 * PAGE_SIZE as u64,
+            }
+            .encode(),
         )
         .expect("message")
     }
@@ -185193,12 +185226,16 @@ mod u9_recv_queue1_parity {
         }
     }
 
-    /// **The page owner's boundaries**: every page inside the window resolves to its own frame,
-    /// the first page past the window, an unaligned offset, a window reaching past its object,
-    /// a stale object and a non-memory capability are all refused rather than computed.
+    /// **The page owner's boundaries** (re-derived for SHARED-REGION-OFFSET1: the owner now takes
+    /// the descriptor's object-relative selection, not a window-relative page offset): every page
+    /// of an admissible selection resolves to its own frame — for a `DmaRegion`, from the
+    /// OBJECT offset the descriptor names, never the window base plus it — and a page past the
+    /// selection, an unaligned page offset, a selection outside its window or object, a window
+    /// reaching past its object, a stale object and a non-memory capability are all refused
+    /// rather than computed.
     #[test]
     fn the_shared_region_page_owner_refuses_everything_outside_the_window() {
-        use crate::kernel::boot::{KernelError, KernelState};
+        use crate::kernel::boot::{KernelError, KernelState, TransferSharedRegion};
         use crate::kernel::vm::VmError;
         let mut state = Bootstrap::init().expect("init");
         let (id, _cap) = state
@@ -185213,25 +185250,46 @@ mod u9_recv_queue1_parity {
                     .map(|e| e.phys)
             })
             .expect("phys");
-        let at = |object: CapObject, off: usize| {
-            state.with_memory_state(|m| KernelState::shared_region_page_phys_locked(m, object, off))
+        let sel = |offset: usize, len: usize| TransferSharedRegion {
+            offset: offset as u64,
+            len: len as u64,
+        };
+        let at = |object: CapObject, region: TransferSharedRegion, off: usize| {
+            state.with_memory_state(|m| {
+                KernelState::shared_region_page_phys_locked(m, object, region, off)
+            })
         };
         let whole = CapObject::MemoryObject { id };
         for i in 0..4 {
             assert_eq!(
-                at(whole, i * PAGE),
+                at(whole, sel(0, 4 * PAGE), i * PAGE),
                 Ok(PhysAddr(base.0 + (i * PAGE) as u64))
             );
         }
         assert_eq!(
-            at(whole, 4 * PAGE),
-            Err(KernelError::WrongObject),
-            "past the object"
+            at(whole, sel(PAGE, 2 * PAGE), PAGE),
+            Ok(PhysAddr(base.0 + 2 * PAGE as u64)),
+            "an object-relative middle selection"
         );
         assert_eq!(
-            at(whole, PAGE + 8),
+            at(whole, sel(0, 4 * PAGE), 4 * PAGE),
+            Err(KernelError::WrongObject),
+            "past the selection"
+        );
+        assert_eq!(
+            at(whole, sel(2 * PAGE, 3 * PAGE), 0),
+            Err(KernelError::WrongObject),
+            "a selection past the object refuses even its first page"
+        );
+        assert_eq!(
+            at(whole, sel(0, 4 * PAGE), PAGE + 8),
             Err(KernelError::Vm(VmError::Misaligned)),
             "an unaligned page offset"
+        );
+        assert_eq!(
+            at(whole, sel(8, PAGE), 0),
+            Err(KernelError::Vm(VmError::Misaligned)),
+            "an unaligned descriptor offset"
         );
         let window = CapObject::DmaRegion {
             id,
@@ -185239,19 +185297,29 @@ mod u9_recv_queue1_parity {
             len: 2 * PAGE as u64,
         };
         assert_eq!(
-            at(window, 0),
+            at(window, sel(PAGE, 2 * PAGE), 0),
             Ok(PhysAddr(base.0 + PAGE as u64)),
-            "window page 0"
+            "window page 0, named by its object offset"
         );
         assert_eq!(
-            at(window, PAGE),
+            at(window, sel(PAGE, 2 * PAGE), PAGE),
             Ok(PhysAddr(base.0 + 2 * PAGE as u64)),
             "window page 1"
         );
         assert_eq!(
-            at(window, 2 * PAGE),
+            at(window, sel(2 * PAGE, PAGE), 0),
+            Ok(PhysAddr(base.0 + 2 * PAGE as u64)),
+            "a further offset inside the window is not added to the window base"
+        );
+        assert_eq!(
+            at(window, sel(0, PAGE), 0),
             Err(KernelError::WrongObject),
-            "past the window"
+            "below the window"
+        );
+        assert_eq!(
+            at(window, sel(2 * PAGE, PAGE + 1), 0),
+            Err(KernelError::WrongObject),
+            "a final page past the window"
         );
         let overhang = CapObject::DmaRegion {
             id,
@@ -185259,12 +185327,12 @@ mod u9_recv_queue1_parity {
             len: 2 * PAGE as u64,
         };
         assert_eq!(
-            at(overhang, 0),
+            at(overhang, sel(3 * PAGE, PAGE), 0),
             Err(KernelError::WrongObject),
             "window outside its object"
         );
         assert_eq!(
-            at(CapObject::MemoryObject { id: id + 1000 }, 0),
+            at(CapObject::MemoryObject { id: id + 1000 }, sel(0, PAGE), 0),
             Err(KernelError::MemoryObjectMissing),
             "a stale object"
         );
@@ -185274,6 +185342,7 @@ mod u9_recv_queue1_parity {
                     index: 0,
                     generation: 0
                 },
+                sel(0, PAGE),
                 0
             ),
             Err(KernelError::WrongObject),
@@ -195713,5 +195782,1334 @@ mod bl6a_aarch64_futex_idle_cell_follows_the_pre_lock_route {
                     .unwrap()
         );
         assert!(c.contains("RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu=0 incoming=[0-9]+"));
+    }
+}
+
+// ── SHARED-REGION-OFFSET1: the shared-region descriptor offset (BL1-a) ─────────────────────────
+//
+// A shared-region descriptor is `(offset, len)` in BYTES, with `offset` relative to the
+// underlying MemoryObject (a DmaRegion capability restricts that object-relative interval to its
+// window; it does not rebase it). Every receive family used to ignore `offset` and map from the
+// capability window's base, the MemoryObject send bound checked `len` but not `offset + len`, and
+// NR 30 mapped the whole capability window whatever the descriptor named.
+//
+// Every case here drives a PRODUCTION owner — the broad dispatcher, the split lanes, the NR 30
+// adapters, the direct transaction under both its contexts, NR 4 — and reads back what the
+// receiver can actually see: the installed translation of each page AND the bytes the receiver's
+// address space reads there, against a pattern that differs on every page of the object.
+mod shared_region_offset1 {
+    use super::*;
+    use crate::kernel::capabilities::{CapId, CapRights};
+    use crate::kernel::ipc::{Message, ThreadId};
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
+        SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP, SYSCALL_IPC_RECV_NR,
+        SYSCALL_IPC_RECV_TIMEOUT_NR, SYSCALL_NO_TRANSFER_CAP, SYSCALL_RECV_MAP_INTENT_READ,
+        SYSCALL_TRANSFER_RELEASE_NR, Syscall, SyscallError, dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const PAGE: usize = PAGE_SIZE;
+    const CPU: crate::kernel::scheduler::CpuId = crate::kernel::scheduler::CpuId(0);
+    /// The metadata / request page every fixture maps.
+    const META: usize = 0x1_0000;
+    /// The receiver's mapping window — unmapped until a delivery installs it.
+    const MAP_TARGET: usize = 0x20_0000;
+
+    /// The byte the object holds at object offset `off`. Every page differs from every other page
+    /// at every in-page offset, so a translation one page off reads wrong bytes everywhere.
+    fn pattern(off: usize) -> u8 {
+        ((off / PAGE) as u8)
+            .wrapping_mul(0x51)
+            .wrapping_add((off as u8) ^ 0xA5)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Source {
+        /// The object's own `MemoryObject` capability.
+        Object,
+        /// A `DmaRegion` capability over `[offset, offset + len)` of the object.
+        Window(usize, usize),
+    }
+
+    struct Fx {
+        kernel: SharedKernel,
+        send_cap: CapId,
+        recv_cap: CapId,
+        object_id: u64,
+        base: PhysAddr,
+        source_cap: CapId,
+        /// Task 0's ASID: it is both the sender and the queued receiver, exactly as init is in the
+        /// live grant witness.
+        asid: Asid,
+    }
+
+    /// Map a read/write page at `va` of `asid` for request and metadata records.
+    fn map_meta(s: &mut KernelState, asid: Asid, va: usize) {
+        let (_, page_cap) = s.alloc_anonymous_memory_object().expect("meta page");
+        s.map_user_page_in_asid_with_caps(
+            asid,
+            page_cap,
+            VirtAddr(va as u64),
+            PageFlags {
+                read: true,
+                write: true,
+                execute: false,
+                user: true,
+                cache_policy: CachePolicy::WriteBack,
+            },
+        )
+        .expect("map meta page");
+    }
+
+    /// Fill the object's backing with `pattern`, as `asid` reads it.
+    fn fill(s: &mut KernelState, asid: Asid, base: PhysAddr, pages: usize) {
+        s.with_memory_state_mut(|m| {
+            for off in 0..pages * PAGE {
+                m.user_memory
+                    .insert((asid.0, base.0 + off as u64), pattern(off));
+            }
+        });
+    }
+
+    fn object_phys(s: &KernelState, id: u64) -> PhysAddr {
+        s.with_memory_state(|m| {
+            m.memory_objects
+                .iter()
+                .flatten()
+                .find(|e| e.id == id)
+                .map(|e| e.phys)
+        })
+        .expect("object phys")
+    }
+
+    /// A user task 0 (sender and receiver), an endpoint, and an `object_pages`-page patterned
+    /// object named by `source`.
+    fn fixture(object_pages: usize, source: Source) -> Fx {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (send_cap, recv_cap, object_id, base, source_cap, asid) = kernel.with(|s| {
+            let (asid, _cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(0, asid).expect("bind");
+            map_meta(s, asid, META);
+            let (_eid, send_cap, recv_cap) = s.create_endpoint(4).expect("endpoint");
+            let (object_id, mem_cap) = s
+                .alloc_anonymous_memory_object_with_len(object_pages * PAGE)
+                .expect("object");
+            let base = object_phys(s, object_id);
+            fill(s, asid, base, object_pages);
+            let source_cap = match source {
+                Source::Object => mem_cap,
+                Source::Window(off, len) => s.mint_dma_region_cap(mem_cap, off, len).expect("dma"),
+            };
+            (send_cap, recv_cap, object_id, base, source_cap, asid)
+        });
+        Fx {
+            kernel,
+            send_cap,
+            recv_cap,
+            object_id,
+            base,
+            source_cap,
+            asid,
+        }
+    }
+
+    fn err_of(r: Result<(), crate::kernel::boot::TrapHandleError>) -> Option<SyscallError> {
+        match r {
+            Ok(()) => None,
+            Err(crate::kernel::boot::TrapHandleError::Syscall(s)) => Some(s),
+            Err(other) => panic!("unexpected error channel: {other:?}"),
+        }
+    }
+
+    /// The real NR 1 shared-region send through the broad dispatcher. (The split send lane is
+    /// compiled only into freestanding kernels; its descriptor policy is the stash owner driven
+    /// directly below, and the live witness drives the lane itself.)
+    fn send(fx: &Fx, offset: usize, len: usize) -> Option<SyscallError> {
+        let mut f = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                fx.send_cap.0 as usize,
+                offset,
+                len,
+                0,
+                0,
+                fx.source_cap.0 as usize,
+            ],
+        );
+        fx.kernel.with(|s| dispatch(s, &mut f)).err()
+    }
+
+    /// The real NR 2 / NR 5 receive, on the broad dispatcher or the split lane.
+    fn recv_queued(
+        fx: &Fx,
+        nr: usize,
+        split: bool,
+        len: usize,
+        intent: usize,
+    ) -> (Option<SyscallError>, TrapFrame) {
+        let mut f = TrapFrame::new(nr, [0; 6]);
+        f.set_arg(SYSCALL_ARG_CAP, fx.recv_cap.0 as usize);
+        f.set_arg(SYSCALL_ARG_PTR, MAP_TARGET);
+        f.set_arg(SYSCALL_ARG_LEN, len);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, 0);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, intent);
+        f.set_arg(SYSCALL_ARG_TRANSFER_CAP, 0);
+        let err = if split {
+            let r = if nr == SYSCALL_IPC_RECV_NR {
+                fx.kernel
+                    .try_split_ipc_recv_queued_plain_into_frame(CPU, &mut f)
+                    .into_legacy_option()
+            } else {
+                fx.kernel
+                    .try_split_ipc_recv_timeout_immediate_into_frame(CPU, &mut f)
+                    .into_legacy_option()
+            };
+            err_of(r.expect("the lane serves a queued shared-region transfer"))
+        } else {
+            fx.kernel.with(|s| dispatch(s, &mut f)).err()
+        };
+        (err, f)
+    }
+
+    /// NR 4, registered-range shape (`base == 0 && len == 0`) or explicit range.
+    fn release(fx: &Fx, cap: u64, base: usize, len: usize) -> Result<usize, SyscallError> {
+        let mut f = TrapFrame::new(
+            SYSCALL_TRANSFER_RELEASE_NR,
+            [cap as usize, base, len, 0, 0, 0],
+        );
+        fx.kernel.with(|s| dispatch(s, &mut f)).map(|()| f.ret0())
+    }
+
+    fn translation(kernel: &SharedKernel, asid: Asid, va: usize) -> Option<Mapping> {
+        kernel.with(|s| {
+            s.with_user_spaces(|spaces| {
+                spaces
+                    .get(asid)
+                    .and_then(|a| a.resolve(VirtAddr(va as u64)))
+            })
+        })
+    }
+
+    /// `[va, va + pages * PAGE)` is backed page by page by the object's bytes starting at object
+    /// offset `obj_off`, reads that page's own pattern at both ends, and nothing past it is mapped.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_selected(
+        kernel: &SharedKernel,
+        asid: Asid,
+        base: PhysAddr,
+        va: usize,
+        obj_off: usize,
+        pages: usize,
+        ctx: &str,
+    ) {
+        for i in 0..pages {
+            let page_off = obj_off + i * PAGE;
+            let m = translation(kernel, asid, va + i * PAGE)
+                .unwrap_or_else(|| panic!("{ctx}: page {i} must be mapped"));
+            assert_eq!(
+                m.phys,
+                PhysAddr(base.0 + page_off as u64),
+                "{ctx}: page {i} must be backed by object page {}",
+                page_off / PAGE
+            );
+            assert!(m.flags.read && m.flags.user && !m.flags.execute, "{ctx}");
+            for probe in [0usize, PAGE - 64] {
+                let got = kernel
+                    .with(|s| s.read_user_memory_for_asid(asid, va + i * PAGE + probe, 64))
+                    .unwrap_or_else(|e| panic!("{ctx}: page {i} readable: {e:?}"));
+                for (k, b) in got[..64].iter().enumerate() {
+                    assert_eq!(
+                        *b,
+                        pattern(page_off + probe + k),
+                        "{ctx}: page {i} byte {} must be the selected backing's",
+                        probe + k
+                    );
+                }
+            }
+        }
+        assert!(
+            translation(kernel, asid, va + pages * PAGE).is_none(),
+            "{ctx}: nothing past the selection may be mapped"
+        );
+    }
+
+    fn live_envelopes(kernel: &SharedKernel) -> usize {
+        kernel.with(|s| s.with_ipc_state(|ipc| ipc.transfer_envelopes.iter().flatten().count()))
+    }
+
+    fn queued_total(kernel: &SharedKernel) -> usize {
+        kernel.with(|s| {
+            s.with_ipc_state(|ipc| {
+                ipc.endpoints
+                    .iter()
+                    .flatten()
+                    .map(|e| e.queued())
+                    .sum::<usize>()
+            })
+        })
+    }
+
+    fn refcounts(fx: &Fx) -> Option<(u32, u32, u32)> {
+        fx.kernel
+            .with(|s| s.memory_object_refcounts_by_id(fx.object_id))
+    }
+
+    /// `(name, object pages, source, descriptor offset, descriptor len)` — every admissible
+    /// selection shape a queued receive must honour.
+    fn admissible_cases() -> [(&'static str, usize, Source, usize, usize); 6] {
+        [
+            ("object_zero_offset", 4, Source::Object, 0, 2 * PAGE),
+            ("object_middle_range", 4, Source::Object, PAGE, 2 * PAGE),
+            ("object_exact_end", 4, Source::Object, 2 * PAGE, 2 * PAGE),
+            (
+                "object_partial_final_page",
+                4,
+                Source::Object,
+                PAGE,
+                PAGE + 200,
+            ),
+            (
+                "window_base_plus_offset",
+                5,
+                Source::Window(PAGE, 3 * PAGE),
+                2 * PAGE,
+                2 * PAGE,
+            ),
+            (
+                "window_at_its_own_base",
+                5,
+                Source::Window(PAGE, 3 * PAGE),
+                PAGE,
+                PAGE + 1,
+            ),
+        ]
+    }
+
+    /// **Queued delivery (NR 2 and NR 5, broad and split, RW and RO intent) maps exactly the
+    /// object-relative selection the sender named** — zero offset, a middle range, the exact end,
+    /// a non-page-multiple length, and a `DmaRegion` window at a non-zero object offset with a
+    /// further offset inside it.
+    ///
+    /// On the unrepaired kernel every non-zero-offset case maps from the capability window's base
+    /// instead and reads the wrong page's bytes.
+    #[test]
+    fn queued_delivery_maps_exactly_the_object_relative_selection() {
+        for (name, object_pages, source, offset, len) in admissible_cases() {
+            let mapped_len = len.div_ceil(PAGE) * PAGE;
+            for nr in [SYSCALL_IPC_RECV_NR, SYSCALL_IPC_RECV_TIMEOUT_NR] {
+                for split in [false, true] {
+                    for intent in [0, SYSCALL_RECV_MAP_INTENT_READ] {
+                        let route = if split { "split" } else { "broad" };
+                        let ctx = alloc::format!("{name} nr={nr} {route} intent={intent}");
+                        let fx = fixture(object_pages, source);
+                        assert_eq!(send(&fx, offset, len), None, "{ctx}: queued");
+                        let (err, f) = recv_queued(&fx, nr, split, mapped_len, intent);
+                        assert_eq!(err, None, "{ctx}: delivered");
+                        assert_eq!(
+                            f.ret1(),
+                            mapped_len,
+                            "{ctx}: ret1 is the page-rounded length"
+                        );
+                        assert_eq!(f.arg(SYSCALL_ARG_INLINE_PAYLOAD0), MAP_TARGET, "{ctx}");
+                        assert_eq!(
+                            f.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+                            len,
+                            "{ctx}: the logical length is reported exactly"
+                        );
+                        assert_selected(
+                            &fx.kernel,
+                            fx.asid,
+                            fx.base,
+                            MAP_TARGET,
+                            offset,
+                            mapped_len / PAGE,
+                            &ctx,
+                        );
+                        let writable = translation(&fx.kernel, fx.asid, MAP_TARGET)
+                            .expect("mapped")
+                            .flags
+                            .write;
+                        assert_eq!(writable, intent == 0, "{ctx}: the intent's permission");
+                        let cap = CapId(f.ret2() as u64);
+                        let rights = fx
+                            .kernel
+                            .with(|s| s.resolve_capability_for_task(0, cap))
+                            .expect("receiver-local capability")
+                            .rights();
+                        assert_eq!(
+                            rights.contains(CapRights::WRITE),
+                            intent == 0,
+                            "{ctx}: a read-only intent attenuates the receiver's capability"
+                        );
+                        assert_eq!(
+                            fx.kernel
+                                .active_transfer_mapping_for_split(ThreadId(0), cap),
+                            Some((VirtAddr(MAP_TARGET as u64), mapped_len)),
+                            "{ctx}: the registration is the page-rounded mapping"
+                        );
+                        assert_eq!(live_envelopes(&fx.kernel), 0, "{ctx}: envelope consumed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The partial final page is mapped whole, and only because it lies wholly inside the
+    /// authorized backing.** The receiver can read the bytes between `len` and the page end —
+    /// they are the object's own bytes, not another object's — so no byte-level isolation of the
+    /// tail is claimed.
+    #[test]
+    fn the_partial_final_page_exposes_only_the_objects_own_bytes() {
+        let len = PAGE + 200;
+        for split in [false, true] {
+            let fx = fixture(4, Source::Object);
+            assert_eq!(send(&fx, PAGE, len), None);
+            let (err, _f) = recv_queued(
+                &fx,
+                SYSCALL_IPC_RECV_NR,
+                split,
+                2 * PAGE,
+                SYSCALL_RECV_MAP_INTENT_READ,
+            );
+            assert_eq!(err, None);
+            let tail = fx
+                .kernel
+                .with(|s| s.read_user_memory_for_asid(fx.asid, MAP_TARGET + len, 16))
+                .expect("the tail of the final page is mapped");
+            for (k, b) in tail[..16].iter().enumerate() {
+                assert_eq!(
+                    *b,
+                    pattern(PAGE + len + k),
+                    "the tail is the object's own backing"
+                );
+            }
+        }
+    }
+
+    /// `(name, object pages, source, offset, len)` — descriptors their source cannot back. The
+    /// MemoryObject cases fit by `len` alone; only the complete-range bound
+    /// `offset + round_up(len) <= object length` refuses them, and the unrepaired send did not
+    /// apply it.
+    fn out_of_range_cases() -> [(&'static str, usize, Source, usize, usize); 6] {
+        [
+            ("object_offset_past_end", 2, Source::Object, PAGE, 2 * PAGE),
+            (
+                "object_final_page_past_end",
+                2,
+                Source::Object,
+                PAGE,
+                PAGE + 1,
+            ),
+            ("object_offset_at_end", 2, Source::Object, 2 * PAGE, PAGE),
+            (
+                "window_below_its_base",
+                4,
+                Source::Window(PAGE, 2 * PAGE),
+                0,
+                2 * PAGE,
+            ),
+            (
+                "window_final_page_past_end",
+                4,
+                Source::Window(PAGE, 2 * PAGE),
+                2 * PAGE,
+                PAGE + 1,
+            ),
+            (
+                "window_entirely_past_end",
+                4,
+                Source::Window(PAGE, 2 * PAGE),
+                3 * PAGE,
+                PAGE,
+            ),
+        ]
+    }
+
+    fn endpoint_object(fx: &Fx) -> crate::kernel::capabilities::CapObject {
+        fx.kernel
+            .with(|s| s.current_task_capability(fx.send_cap))
+            .expect("endpoint")
+            .object
+    }
+
+    /// **A descriptor outside its authority is refused at the send with `InvalidArgs`, before
+    /// anything is published** — and the split route's stash owner refuses it too, so no other
+    /// caller can publish one. Nothing is left behind: no envelope, no queued message, no pin.
+    ///
+    /// (The unrepaired broad send accepted the MemoryObject cases, and refused the window cases
+    /// as `QueueFull` — the stash's answer for every refusal, including a full table.)
+    #[test]
+    fn an_out_of_range_descriptor_is_refused_before_publication() {
+        use crate::runtime::TransferStashRefusal;
+        for (name, object_pages, source, offset, len) in out_of_range_cases() {
+            let fx = fixture(object_pages, source);
+            let before = refcounts(&fx);
+            assert_eq!(
+                send(&fx, offset, len),
+                Some(SyscallError::InvalidArgs),
+                "{name}: refused as a descriptor its source cannot back"
+            );
+            assert_eq!(live_envelopes(&fx.kernel), 0, "{name}: no envelope");
+            assert_eq!(queued_total(&fx.kernel), 0, "{name}: nothing queued");
+            assert_eq!(refcounts(&fx), before, "{name}: no pin taken");
+
+            let region = TransferSharedRegion {
+                offset: offset as u64,
+                len: len as u64,
+            };
+            assert_eq!(
+                fx.kernel
+                    .stash_transfer_envelope_split(
+                        ThreadId(0),
+                        fx.source_cap,
+                        endpoint_object(&fx),
+                        None,
+                        Some(region),
+                    )
+                    .err(),
+                Some(TransferStashRefusal::DescriptorRejected),
+                "{name}: the split stash applies the same bound"
+            );
+            assert_eq!(live_envelopes(&fx.kernel), 0, "{name}: split: no envelope");
+            assert_eq!(refcounts(&fx), before, "{name}: split: no pin taken");
+        }
+    }
+
+    /// **A misaligned offset is `InvalidArgs`** — refused, never rounded down to the page that
+    /// contains it — and the stash owner refuses it too, so no other caller can publish one.
+    #[test]
+    fn a_misaligned_offset_is_invalid_args_and_never_rounded() {
+        use crate::runtime::TransferStashRefusal;
+        for offset in [8, PAGE + 1, 2 * PAGE - 1] {
+            let fx = fixture(4, Source::Object);
+            let before = refcounts(&fx);
+            assert_eq!(
+                send(&fx, offset, PAGE),
+                Some(SyscallError::InvalidArgs),
+                "offset={offset}"
+            );
+            assert_eq!(
+                live_envelopes(&fx.kernel),
+                0,
+                "offset={offset}: no envelope"
+            );
+            assert_eq!(
+                queued_total(&fx.kernel),
+                0,
+                "offset={offset}: nothing queued"
+            );
+            assert_eq!(refcounts(&fx), before, "offset={offset}: no pin taken");
+            let region = TransferSharedRegion {
+                offset: offset as u64,
+                len: PAGE as u64,
+            };
+            let endpoint = endpoint_object(&fx);
+            assert_eq!(
+                fx.kernel.with(|s| s.stash_transfer_envelope(
+                    ThreadId(0),
+                    fx.source_cap,
+                    endpoint,
+                    None,
+                    Some(region),
+                )),
+                None,
+                "offset={offset}: the broad stash"
+            );
+            assert_eq!(
+                fx.kernel
+                    .stash_transfer_envelope_split(
+                        ThreadId(0),
+                        fx.source_cap,
+                        endpoint,
+                        None,
+                        Some(region),
+                    )
+                    .err(),
+                Some(TransferStashRefusal::DescriptorRejected),
+                "offset={offset}: the split stash"
+            );
+            assert_eq!(refcounts(&fx), before, "offset={offset}: still no pin");
+        }
+    }
+
+    /// **Range arithmetic is checked.** A kernel-task sender — whose offset is not a user address,
+    /// so no user-region check stands in front of the bound — naming an offset whose page-rounded
+    /// end overflows is refused by NR 1; and both stash owners refuse every overflow shape: the
+    /// byte end, the page rounding of the length, and the rounded end.
+    #[test]
+    fn an_overflowing_range_is_refused() {
+        use crate::runtime::TransferStashRefusal;
+        let top = usize::MAX & !(PAGE - 1);
+        let mut s = Bootstrap::init().expect("init");
+        let (_eid, send_cap, _recv) = s.create_endpoint(4).expect("endpoint");
+        let (id, mem_cap) = s
+            .alloc_anonymous_memory_object_with_len(PAGE)
+            .expect("object");
+        // A kernel sender's shared-region shape is `IPC_REGISTER_BYTES < len <= MAX_PAYLOAD`.
+        let mut f = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [send_cap.0 as usize, top, 100, 0, 0, mem_cap.0 as usize],
+        );
+        assert_eq!(
+            dispatch(&mut s, &mut f).err(),
+            Some(SyscallError::InvalidArgs),
+            "a byte end that fits but a rounded end that overflows"
+        );
+        assert_eq!(s.memory_object_refcounts_by_id(id).map(|r| r.2), Some(0));
+
+        let fx = fixture(1, Source::Object);
+        let endpoint = endpoint_object(&fx);
+        let top = top as u64;
+        for (name, offset, len) in [
+            ("byte_end_overflows", top, PAGE as u64),
+            ("length_rounding_overflows", 0, u64::MAX - 10),
+            ("rounded_end_overflows", top, 100),
+        ] {
+            let region = TransferSharedRegion { offset, len };
+            assert!(
+                fx.kernel
+                    .with(|s| s.stash_transfer_envelope(
+                        ThreadId(0),
+                        fx.source_cap,
+                        endpoint,
+                        None,
+                        Some(region)
+                    ))
+                    .is_none(),
+                "{name}: the broad stash"
+            );
+            assert_eq!(
+                fx.kernel
+                    .stash_transfer_envelope_split(
+                        ThreadId(0),
+                        fx.source_cap,
+                        endpoint,
+                        None,
+                        Some(region)
+                    )
+                    .err(),
+                Some(TransferStashRefusal::DescriptorRejected),
+                "{name}: the split stash"
+            );
+        }
+        assert_eq!(live_envelopes(&fx.kernel), 0, "nothing published");
+        assert_eq!(refcounts(&fx).map(|r| r.2), Some(0), "no pin taken");
+    }
+
+    /// **Release, reuse, duplicate and stale release, and the sender's authority** — for a
+    /// non-zero-offset selection, on both routes:
+    ///
+    /// * NR 4 releases exactly the registered page-rounded range and refuses any other;
+    /// * the released window is reusable by the next delivery, which maps ITS selection;
+    /// * the first delivery's capability can no longer release anything — not even the
+    ///   replacement now mapped at the same address;
+    /// * the sender's source capability is untouched throughout, sends again, and is the last
+    ///   reference: every count returns to its baseline and revoking it reclaims the object.
+    #[test]
+    fn release_reuse_stale_release_and_sender_authority_for_an_offset_selection() {
+        for split in [false, true] {
+            let route = if split { "split" } else { "broad" };
+            let fx = fixture(4, Source::Object);
+            let baseline = refcounts(&fx).expect("object live");
+            let source_rights = fx
+                .kernel
+                .with(|s| s.resolve_capability_for_task(0, fx.source_cap))
+                .expect("source cap")
+                .rights();
+
+            // First grant: object pages 1..3.
+            assert_eq!(send(&fx, PAGE, 2 * PAGE), None, "{route}");
+            let (err, f) = recv_queued(&fx, SYSCALL_IPC_RECV_NR, split, 2 * PAGE, 0);
+            assert_eq!(err, None, "{route}: first delivery");
+            let first = f.ret2() as u64;
+            assert_eq!(
+                release(&fx, first, MAP_TARGET, 2 * PAGE),
+                Ok(2 * PAGE),
+                "{route}: the exact registered range is released"
+            );
+            for i in 0..2 {
+                assert!(
+                    translation(&fx.kernel, fx.asid, MAP_TARGET + i * PAGE).is_none(),
+                    "{route}: page {i} unmapped"
+                );
+            }
+            assert!(
+                release(&fx, first, 0, 0).is_err(),
+                "{route}: a duplicate release is refused"
+            );
+
+            // Second grant into the SAME window: object pages 2..4.
+            assert_eq!(send(&fx, 2 * PAGE, 2 * PAGE), None, "{route}");
+            let (err, f2) = recv_queued(&fx, SYSCALL_IPC_RECV_NR, split, 2 * PAGE, 0);
+            assert_eq!(err, None, "{route}: the window is reusable");
+            assert_selected(
+                &fx.kernel,
+                fx.asid,
+                fx.base,
+                MAP_TARGET,
+                2 * PAGE,
+                2,
+                &alloc::format!("{route} reuse"),
+            );
+            let second = f2.ret2() as u64;
+            assert_ne!(
+                second, first,
+                "{route}: the replacement's capability is not the released one's"
+            );
+            assert!(
+                release(&fx, first, 0, 0).is_err(),
+                "{route}: the stale capability cannot release the replacement"
+            );
+            assert!(
+                translation(&fx.kernel, fx.asid, MAP_TARGET).is_some(),
+                "{route}: the replacement survives a stale release"
+            );
+            assert_eq!(release(&fx, second, 0, 0), Ok(2 * PAGE), "{route}");
+
+            // The sender's authority is intact and is now the object's only reference.
+            let after = fx
+                .kernel
+                .with(|s| s.resolve_capability_for_task(0, fx.source_cap))
+                .expect("the source capability survives every grant");
+            assert_eq!(after.rights(), source_rights, "{route}: rights unchanged");
+            assert_eq!(
+                refcounts(&fx),
+                Some(baseline),
+                "{route}: every count returned"
+            );
+            assert_eq!(
+                send(&fx, PAGE, PAGE),
+                None,
+                "{route}: the sender sends again"
+            );
+            let (err, f3) = recv_queued(&fx, SYSCALL_IPC_RECV_NR, split, PAGE, 0);
+            assert_eq!(err, None, "{route}");
+            assert_eq!(release(&fx, f3.ret2() as u64, 0, 0), Ok(PAGE), "{route}");
+            fx.kernel.with(|s| {
+                let cnode = s.task_cnode(0).expect("cnode");
+                s.revoke_capability_in_cnode(cnode, fx.source_cap)
+                    .expect("revoke the source capability");
+            });
+            assert_eq!(
+                refcounts(&fx),
+                None,
+                "{route}: with no capability and no mapping left, the object is reclaimed"
+            );
+        }
+    }
+
+    /// **A later-page map failure rolls back the installed prefix of an offset selection** and
+    /// returns every reference — on both routes. The window is the last canonical user page of the
+    /// hosted x86_64 address space, so page 0 installs and page 1 is refused by the VM owner.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_later_page_failure_rolls_back_an_offset_selection() {
+        let last_user_page = (1usize << 47) - PAGE;
+        for split in [false, true] {
+            let route = if split { "split" } else { "broad" };
+            let fx = fixture(4, Source::Object);
+            let before = refcounts(&fx).expect("live");
+            assert_eq!(send(&fx, PAGE, 2 * PAGE), None, "{route}");
+            let mut f = TrapFrame::new(SYSCALL_IPC_RECV_NR, [0; 6]);
+            f.set_arg(SYSCALL_ARG_CAP, fx.recv_cap.0 as usize);
+            f.set_arg(SYSCALL_ARG_PTR, last_user_page);
+            f.set_arg(SYSCALL_ARG_LEN, 2 * PAGE);
+            let err = if split {
+                err_of(
+                    fx.kernel
+                        .try_split_ipc_recv_queued_plain_into_frame(CPU, &mut f)
+                        .into_legacy_option()
+                        .expect("served"),
+                )
+            } else {
+                fx.kernel.with(|s| dispatch(s, &mut f)).err()
+            };
+            assert!(err.is_some(), "{route}: page 1 cannot be installed");
+            assert_eq!(
+                f.ret2() as u64,
+                SYSCALL_NO_TRANSFER_CAP,
+                "{route}: lane cleared"
+            );
+            assert!(
+                translation(&fx.kernel, fx.asid, last_user_page).is_none(),
+                "{route}: the installed page is rolled back"
+            );
+            assert_eq!(
+                live_envelopes(&fx.kernel),
+                0,
+                "{route}: envelope consumed once"
+            );
+            assert_eq!(
+                refcounts(&fx),
+                Some(before),
+                "{route}: every reference returned"
+            );
+        }
+    }
+
+    // ── NR 30 ────────────────────────────────────────────────────────────────────────────────
+
+    /// The real NR 30 request record at `META`, asking for a read-only mapping at `MAP_TARGET`.
+    fn nr30(fx: &Fx, split: bool, window: usize) -> (Option<SyscallError>, TrapFrame) {
+        use crate::kernel::recv_core::recv_shared_v3::{MAP_READ, V3_LIVE_OUTPUT_LEN};
+        let mut req = [0u8; 80];
+        req[0..4].copy_from_slice(&3u32.to_le_bytes());
+        req[4..8].copy_from_slice(&64u32.to_le_bytes());
+        req[8..16].copy_from_slice(&fx.recv_cap.0.to_le_bytes());
+        req[16..24].copy_from_slice(&(MAP_TARGET as u64).to_le_bytes());
+        req[24..32].copy_from_slice(&(window as u64).to_le_bytes());
+        req[32..40].copy_from_slice(&((META + 0x200) as u64).to_le_bytes());
+        req[40..48].copy_from_slice(&u64::from(V3_LIVE_OUTPUT_LEN).to_le_bytes());
+        req[48..52].copy_from_slice(&MAP_READ.to_le_bytes());
+        fx.kernel
+            .with(|s| s.write_user_memory_for_asid(fx.asid, META, &req))
+            .expect("request record");
+        let mut f = TrapFrame::zeroed();
+        f.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        f.set_arg(0, META);
+        f.set_arg(1, 80);
+        let err = if split {
+            err_of(
+                crate::kernel::syscall_split::try_split_dispatch_into_frame(
+                    &fx.kernel, CPU, &mut f,
+                )
+                .legacy()
+                .expect("the split NR 30 route serves the receive"),
+            )
+        } else {
+            fx.kernel.with(|s| dispatch(s, &mut f)).err()
+        };
+        (err, f)
+    }
+
+    /// The output record's `(mapped_base, page_rounded_mapped_len, cleanup_token)`.
+    fn nr30_output(fx: &Fx) -> (u64, u64, u64) {
+        let out = fx
+            .kernel
+            .with(|s| s.read_user_memory_for_asid(fx.asid, META + 0x200, 120))
+            .expect("output record");
+        let word = |at: usize| u64::from_le_bytes(out[at..at + 8].try_into().unwrap());
+        (word(88), word(96), word(112))
+    }
+
+    /// **NR 30 maps exactly the descriptor's selection**, on both adapters: from the object
+    /// offset the descriptor names, for the page-rounded length it names — not the capability
+    /// window's base, and not the whole window. Then NR 4 releases exactly that.
+    #[test]
+    fn nr30_maps_exactly_the_descriptors_selection() {
+        // (name, object pages, window, offset, len)
+        let cases: [(&str, usize, (usize, usize), usize, usize); 4] = [
+            ("zero_offset_partial_window", 4, (0, 4 * PAGE), 0, 2 * PAGE),
+            ("middle_range", 4, (0, 4 * PAGE), PAGE, 2 * PAGE),
+            (
+                "window_base_plus_offset",
+                5,
+                (PAGE, 3 * PAGE),
+                2 * PAGE,
+                2 * PAGE,
+            ),
+            ("partial_final_page", 4, (0, 4 * PAGE), 2 * PAGE, PAGE + 9),
+        ];
+        for (name, object_pages, (w_off, w_len), offset, len) in cases {
+            let mapped_len = len.div_ceil(PAGE) * PAGE;
+            for split in [false, true] {
+                let route = if split { "split" } else { "broad" };
+                let ctx = alloc::format!("nr30 {name} {route}");
+                let fx = fixture(object_pages, Source::Window(w_off, w_len));
+                assert_eq!(send(&fx, offset, len), None, "{ctx}: queued");
+                let (err, _f) = nr30(&fx, split, 4 * PAGE);
+                assert_eq!(err, None, "{ctx}: delivered");
+                let (base, rounded, token) = nr30_output(&fx);
+                assert_eq!(base, MAP_TARGET as u64, "{ctx}");
+                assert_eq!(
+                    rounded, mapped_len as u64,
+                    "{ctx}: the selection's page-rounded length"
+                );
+                assert_selected(
+                    &fx.kernel,
+                    fx.asid,
+                    fx.base,
+                    MAP_TARGET,
+                    offset,
+                    mapped_len / PAGE,
+                    &ctx,
+                );
+                assert_eq!(
+                    fx.kernel
+                        .active_transfer_mapping_for_split(ThreadId(0), CapId(token)),
+                    Some((VirtAddr(MAP_TARGET as u64), mapped_len)),
+                    "{ctx}: the registration is the selection"
+                );
+                assert_eq!(release(&fx, token, 0, 0), Ok(mapped_len), "{ctx}: released");
+                assert!(
+                    translation(&fx.kernel, fx.asid, MAP_TARGET).is_none(),
+                    "{ctx}: unmapped"
+                );
+                assert!(
+                    release(&fx, token, 0, 0).is_err(),
+                    "{ctx}: duplicate refused"
+                );
+            }
+        }
+    }
+
+    /// NR 30's existing refusal of a bare `MemoryObject` grant is preserved: its mapped delivery
+    /// still requires a `DmaRegion`, and the refusal leaves the message for another receive.
+    #[test]
+    fn nr30_still_refuses_to_map_a_bare_memory_object() {
+        for split in [false, true] {
+            let fx = fixture(4, Source::Object);
+            assert_eq!(send(&fx, PAGE, PAGE), None);
+            let (err, _f) = nr30(&fx, split, 4 * PAGE);
+            assert_eq!(err, Some(SyscallError::InvalidArgs), "split={split}");
+            assert!(translation(&fx.kernel, fx.asid, MAP_TARGET).is_none());
+            assert_eq!(
+                queued_total(&fx.kernel),
+                1,
+                "split={split}: nothing consumed"
+            );
+        }
+    }
+
+    // ── the direct transaction ───────────────────────────────────────────────────────────────
+
+    const DIRECT_VA: u64 = 0x30_0000;
+    const DIRECT_META: u64 = 0x40_0000;
+
+    struct DirectFx {
+        shared: SharedKernel,
+        snap: crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+        base: PhysAddr,
+        asid: Asid,
+        object_id: u64,
+    }
+
+    /// Receiver task 2 with its own ASID; sender task 0 stashes the descriptor through the
+    /// production broad stash; Phase A takes the snapshot the producers take.
+    fn direct(object_pages: usize, source: Source, offset: u64, len: u64) -> DirectFx {
+        use crate::kernel::syscall::OPCODE_SHARED_MEM;
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("task2");
+        s.enqueue_current_cpu(2).expect("enqueue");
+        let (_eidx, send_cap, _r) = s.create_endpoint(4).expect("endpoint");
+        let endpoint = s.current_task_capability(send_cap).expect("send").object;
+        let (object_id, mem_cap) = s
+            .alloc_anonymous_memory_object_with_len(object_pages * PAGE)
+            .expect("object");
+        let base = object_phys(&s, object_id);
+        let src = match source {
+            Source::Object => mem_cap,
+            Source::Window(off, l) => s.mint_dma_region_cap(mem_cap, off, l).expect("dma"),
+        };
+        let (asid, _aspace) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(2, asid).expect("bind");
+        map_meta(&mut s, asid, DIRECT_META as usize);
+        fill(&mut s, asid, base, object_pages);
+        let handle = s
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(TransferSharedRegion { offset, len }),
+            )
+            .expect("stash");
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        let snap = s
+            .shared_region_phase_a(
+                handle,
+                endpoint,
+                2,
+                DIRECT_VA,
+                false,
+                DIRECT_META,
+                msg,
+                true,
+                crate::kernel::task::RecvAbiVariant::RecvV2,
+            )
+            .expect("phase A");
+        DirectFx {
+            shared: SharedKernel::new(s),
+            snap,
+            base,
+            asid,
+            object_id,
+        }
+    }
+
+    fn run_direct(
+        fx: &DirectFx,
+        offlock: bool,
+    ) -> Result<
+        crate::kernel::boot::shared_region_txn::SharedRegionDirectPublish,
+        crate::kernel::boot::shared_region_txn::SharedRegionTxnError,
+    > {
+        if offlock {
+            let mut ctx = crate::runtime::SharedRegionOffLockCtx(&fx.shared);
+            crate::kernel::boot::shared_region_txn::run_shared_region_txn(&mut ctx, fx.snap)
+        } else {
+            fx.shared.with(|s| s.shared_region_execute(fx.snap))
+        }
+    }
+
+    /// **The direct transaction maps exactly the selection its snapshot carries**, under both the
+    /// broad and the off-lock context.
+    #[test]
+    fn the_direct_transaction_maps_exactly_the_snapshot_selection() {
+        for (name, object_pages, source, offset, len) in admissible_cases() {
+            let mapped_len = len.div_ceil(PAGE) * PAGE;
+            for offlock in [false, true] {
+                let ctx = alloc::format!("direct {name} offlock={offlock}");
+                let fx = direct(object_pages, source, offset as u64, len as u64);
+                let publish = run_direct(&fx, offlock).unwrap_or_else(|e| panic!("{ctx}: {e:?}"));
+                assert_eq!(publish.mapped_len, mapped_len, "{ctx}");
+                assert_selected(
+                    &fx.shared,
+                    fx.asid,
+                    fx.base,
+                    DIRECT_VA as usize,
+                    offset,
+                    mapped_len / PAGE,
+                    &ctx,
+                );
+                assert_eq!(
+                    fx.shared
+                        .active_transfer_mapping_for_split(ThreadId(2), publish.receiver_local_cap),
+                    Some((VirtAddr(DIRECT_VA), mapped_len)),
+                    "{ctx}"
+                );
+            }
+        }
+    }
+
+    /// **A later-page failure in the direct transaction unmaps exactly the installed prefix of an
+    /// offset selection and returns every reference** — registration, capability and pin.
+    #[test]
+    fn a_direct_later_page_failure_rolls_back_an_offset_selection() {
+        use crate::kernel::boot::shared_region_txn::{
+            SHARED_REGION_TXN_MAP_FAULT_AT_PAGE, SharedRegionTxnError,
+        };
+        use core::sync::atomic::Ordering;
+        for offlock in [false, true] {
+            let fx = direct(4, Source::Object, PAGE as u64, 2 * PAGE as u64);
+            let before = fx
+                .shared
+                .with(|s| s.memory_object_refcounts_by_id(fx.object_id))
+                .expect("live");
+            SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(1, Ordering::SeqCst);
+            let got = run_direct(&fx, offlock);
+            SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+            assert_eq!(
+                got.err(),
+                Some(SharedRegionTxnError::MapFault),
+                "offlock={offlock}"
+            );
+            for i in 0..2 {
+                assert!(
+                    translation(&fx.shared, fx.asid, DIRECT_VA as usize + i * PAGE).is_none(),
+                    "offlock={offlock}: page {i} is not left mapped"
+                );
+            }
+            assert_eq!(
+                fx.shared.with(|s| s.with_ipc_state(|ipc| ipc
+                    .active_transfer_mappings
+                    .iter()
+                    .flatten()
+                    .count())),
+                0,
+                "offlock={offlock}: registration removed"
+            );
+            let after = fx
+                .shared
+                .with(|s| s.memory_object_refcounts_by_id(fx.object_id))
+                .expect("live");
+            assert_eq!(
+                (after.0, after.1, after.2),
+                (before.0, before.1, before.2 - 1),
+                "offlock={offlock}: the minted capability is revoked and the snapshot's pin released"
+            );
+        }
+    }
+
+    /// **A snapshot whose selection its source cannot back is refused before anything is
+    /// minted or mapped** — the receive-side owner applies the same complete-range bound, so a
+    /// descriptor that reached it any other way still cannot map outside the object.
+    #[test]
+    fn the_direct_transaction_refuses_a_selection_outside_the_backing() {
+        use crate::kernel::boot::shared_region_txn::SharedRegionTxnError;
+        for offlock in [false, true] {
+            let mut fx = direct(4, Source::Object, PAGE as u64, PAGE as u64);
+            fx.snap.descriptor = TransferSharedRegion {
+                offset: 3 * PAGE as u64,
+                len: 2 * PAGE as u64,
+            };
+            let before = fx
+                .shared
+                .with(|s| s.memory_object_refcounts_by_id(fx.object_id))
+                .expect("live");
+            assert_eq!(
+                run_direct(&fx, offlock).err(),
+                Some(SharedRegionTxnError::BadRegion),
+                "offlock={offlock}"
+            );
+            assert!(translation(&fx.shared, fx.asid, DIRECT_VA as usize).is_none());
+            let after = fx
+                .shared
+                .with(|s| s.memory_object_refcounts_by_id(fx.object_id))
+                .expect("live");
+            assert_eq!(after.0, before.0, "offlock={offlock}: nothing minted");
+            assert_eq!(
+                after.2,
+                before.2 - 1,
+                "offlock={offlock}: the pin is released once"
+            );
+        }
+    }
+
+    // ── the policy itself, and who asks it ───────────────────────────────────────────────────
+
+    /// **THE range policy, case by case**: byte units, object-relative offsets, a `DmaRegion`
+    /// that bounds without rebasing, page-aligned offsets only, checked ends, and the exact /
+    /// page-rounded length pair.
+    #[test]
+    fn the_range_policy_decides_every_shape() {
+        use crate::kernel::boot::shared_region_selection;
+        use crate::kernel::boot::transfer_state::{
+            SharedRegionRangeRefusal as R, SharedRegionSelection,
+        };
+        use crate::kernel::capabilities::CapObject;
+        let p = PAGE as u64;
+        let mo = CapObject::MemoryObject { id: 1 };
+        let dma = |offset: u64, len: u64| CapObject::DmaRegion { id: 1, offset, len };
+        let r = |offset: u64, len: u64| TransferSharedRegion { offset, len };
+        let ok = |object_offset: u64, len: u64, mapped_len: u64| {
+            Ok(SharedRegionSelection {
+                object_offset,
+                len,
+                mapped_len,
+            })
+        };
+        let cases = [
+            ("whole object", mo, r(0, 4 * p), 4 * p, ok(0, 4 * p, 4 * p)),
+            ("middle range", mo, r(p, 2 * p), 4 * p, ok(p, 2 * p, 2 * p)),
+            (
+                "exact end",
+                mo,
+                r(2 * p, 2 * p),
+                4 * p,
+                ok(2 * p, 2 * p, 2 * p),
+            ),
+            (
+                "partial final page",
+                mo,
+                r(p, p + 1),
+                4 * p,
+                ok(p, p + 1, 2 * p),
+            ),
+            (
+                "past the object",
+                mo,
+                r(3 * p, 2 * p),
+                4 * p,
+                Err(R::OutsideWindow),
+            ),
+            (
+                "final page past the object",
+                mo,
+                r(3 * p, p + 1),
+                4 * p,
+                Err(R::OutsideWindow),
+            ),
+            (
+                "at the object end",
+                mo,
+                r(4 * p, 1),
+                4 * p,
+                Err(R::OutsideWindow),
+            ),
+            ("empty", mo, r(0, 0), 4 * p, Err(R::Empty)),
+            ("misaligned", mo, r(8, p), 4 * p, Err(R::Misaligned)),
+            (
+                "misaligned by one",
+                mo,
+                r(p + 1, p),
+                4 * p,
+                Err(R::Misaligned),
+            ),
+            (
+                "length rounding overflows",
+                mo,
+                r(0, u64::MAX),
+                4 * p,
+                Err(R::Overflow),
+            ),
+            (
+                "end overflows",
+                mo,
+                r(u64::MAX & !(p - 1), p),
+                4 * p,
+                Err(R::Overflow),
+            ),
+            (
+                "window at its base",
+                dma(p, 2 * p),
+                r(p, 2 * p),
+                4 * p,
+                ok(p, 2 * p, 2 * p),
+            ),
+            (
+                "further offset in a window",
+                dma(p, 2 * p),
+                r(2 * p, p),
+                4 * p,
+                ok(2 * p, p, p),
+            ),
+            (
+                "below the window",
+                dma(p, 2 * p),
+                r(0, p),
+                4 * p,
+                Err(R::OutsideWindow),
+            ),
+            (
+                "past the window",
+                dma(p, 2 * p),
+                r(2 * p, p + 1),
+                4 * p,
+                Err(R::OutsideWindow),
+            ),
+            (
+                "window outside its object",
+                dma(3 * p, 2 * p),
+                r(3 * p, p),
+                4 * p,
+                Err(R::WindowOutsideObject),
+            ),
+            (
+                "window end overflows",
+                dma(u64::MAX & !(p - 1), 2 * p),
+                r(0, p),
+                4 * p,
+                Err(R::Overflow),
+            ),
+            (
+                "not a region",
+                CapObject::Notification {
+                    index: 0,
+                    generation: 0,
+                },
+                r(0, p),
+                4 * p,
+                Err(R::NotARegion),
+            ),
+        ];
+        for (name, object, region, object_len, want) in cases {
+            assert_eq!(
+                shared_region_selection(object, region, object_len),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let rest = src
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("missing `{signature}`"))
+            .1;
+        rest.split_once("\n}\n").map_or(rest, |(b, _)| b)
+    }
+
+    /// **Every owner asks the one policy**: both NR 1 send arms (the split one is compiled only
+    /// into freestanding kernels, so this contract is its hosted evidence) check the descriptor
+    /// through the shared send-side owner BEFORE the stash; both stashes and the per-page frame
+    /// owner apply `shared_region_selection`; and no receive family resolves a frame from a
+    /// capability window's base any more.
+    #[test]
+    fn every_owner_asks_the_one_range_policy() {
+        const SPLIT: &str = include_str!("../syscall_split.rs");
+        const IPC: &str = include_str!("../syscall/ipc.rs");
+        const TRANSFER: &str = include_str!("transfer_state.rs");
+        const LIFECYCLE: &str = include_str!("memory_lifecycle_state.rs");
+        const TXN: &str = include_str!("shared_region_txn.rs");
+        const V3_TXN: &str = include_str!("../syscall/recv_v3_txn.rs");
+        const V3_BROAD: &str = include_str!("../syscall/recv_shared_v3.rs");
+        const V3_SPLIT: &str = include_str!("../syscall/recv_v3_split.rs");
+        const SR_SPLIT: &str = include_str!("../syscall/recv_shared_region_split.rs");
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+
+        let split_send = body_of(SPLIT, "fn try_split_ipc_send_recognized(");
+        let check = split_send
+            .find("crate::kernel::syscall::validate_shared_region_send_descriptor(")
+            .expect("the split NR 1 arm checks the descriptor");
+        let stash = split_send
+            .find("shared.stash_transfer_envelope_split(")
+            .expect("the split NR 1 arm stashes");
+        assert!(check < stash, "the split arm checks BEFORE it stashes");
+        assert!(split_send.contains("shared.shared_region_object_len_split(grant.object)"));
+
+        let broad_send = body_of(IPC, "pub(super) fn handle_ipc_send(");
+        let check = broad_send
+            .find("validate_shared_region_send_descriptor(")
+            .expect("the broad NR 1 arm checks the descriptor");
+        let stash = broad_send
+            .find("stash_transfer_handle(")
+            .expect("the broad NR 1 arm stashes");
+        assert!(check < stash, "the broad arm checks BEFORE it stashes");
+
+        let send_check = body_of(IPC, "pub(crate) fn validate_shared_region_send_descriptor(");
+        assert!(
+            send_check.contains("transfer_shared_region_bounds_ok(object, region, object_len)")
+        );
+        let bounds = body_of(TRANSFER, "pub(crate) fn transfer_shared_region_bounds_ok(");
+        assert!(bounds.contains("shared_region_selection(object, region, object_len)"));
+        let page = body_of(LIFECYCLE, "pub(crate) fn shared_region_page_phys_locked(");
+        assert!(page.contains("super::shared_region_selection(object, region, object_len)"));
+        assert!(page.contains(".object_offset"));
+
+        // The receive families resolve per page through the per-page owner, with the descriptor.
+        assert!(TXN.contains(
+            "ctx.ctx_region_page_phys(txn.snapshot.object, txn.snapshot.descriptor, i * PAGE_SIZE)"
+        ));
+        assert!(V3_TXN.contains(".region_page_phys(cap_id, region, page_idx * PAGE_SIZE)"));
+        assert!(V3_BROAD.contains(
+            "KernelState::shared_region_page_phys_locked(m, object, region, page_offset)"
+        ));
+        assert!(
+            V3_SPLIT
+                .contains(".shared_region_page_phys_split(capability.object, region, page_offset)")
+        );
+        assert!(
+            SR_SPLIT
+                .contains(".shared_region_page_phys_split(capability.object, region, page_offset)")
+        );
+        assert!(RUNTIME.contains(".shared_region_page_phys_split(object, region, page_offset)"));
+        // …and none resolves from a window base.
+        for (name, src) in [
+            ("shared_region_txn.rs", TXN),
+            ("recv_v3_txn.rs", V3_TXN),
+            ("recv_shared_v3.rs", V3_BROAD),
+            ("recv_v3_split.rs", V3_SPLIT),
+            ("recv_shared_region_split.rs", SR_SPLIT),
+        ] {
+            for gone in [
+                "region_phys_start",
+                "ctx_phys_base",
+                "shared_region_phys_base",
+            ] {
+                assert!(!src.contains(gone), "{name} still names `{gone}`");
+            }
+        }
+        assert!(!RUNTIME.contains("sr_phys_base_split"));
     }
 }

@@ -93,12 +93,31 @@ die()  { echo "[xfer2-witness][fail] $*"; fail=1; }
 # The cell REPLACES rather than adds because init runs at MAX_MAPPINGS and has no page of
 # headroom; the two settings are complementary runs of one witness over one transfer.
 ORDINARY_ROUTES=${ORDINARY_ROUTES:-0}
+# SHARED-REGION-OFFSET1 — WHICH two pages of the four-page oracle object every grant names.
+#
+#   OFFSET_SELECTION=0 (default): `[0, 2 * PAGE)`, what the cells always sent.
+#   OFFSET_SELECTION=1          : `[PAGE, 3 * PAGE)` — userspace feature
+#                                 `shared-region-offset-witness`. Every receive family must map
+#                                 the middle pages, and the userspace byte checks read them.
+#
+# Composes with ORDINARY_ROUTES: the four runs together cover NR 30, NR 2 and NR 5 at a zero and
+# at a non-zero object offset.
+OFFSET_SELECTION=${OFFSET_SELECTION:-0}
+CELL_FEATURES=()
+(( ORDINARY_ROUTES )) && CELL_FEATURES+=(recv-queue1-ordinary-grant)
+(( OFFSET_SELECTION )) && CELL_FEATURES+=(shared-region-offset-witness)
 USERSPACE_FEATURES="--no-default-features"
-if (( ORDINARY_ROUTES )); then
-  USERSPACE_FEATURES="--no-default-features --features recv-queue1-ordinary-grant"
+if (( ${#CELL_FEATURES[@]} )); then
+  USERSPACE_FEATURES="--no-default-features --features $(IFS=,; echo "${CELL_FEATURES[*]}")"
 fi
+GRANT_OFFSET=0
+(( OFFSET_SELECTION )) && GRANT_OFFSET=4096
+case "$ARCH" in
+  x86_64) ORACLE_VA=0x40000000 ;;
+  *)      ORACLE_VA=0x20000000 ;;
+esac
 
-note "building base $ARCH artifacts (ordinary_routes=$ORDINARY_ROUTES)"
+note "building base $ARCH artifacts (ordinary_routes=$ORDINARY_ROUTES offset_selection=$OFFSET_SELECTION)"
 BOOTSTRAP_FEATURE_ARGS="$USERSPACE_FEATURES" \
   "$BUILD_SCRIPT" >"$LOGDIR/build.log" 2>&1 || die "base artifact build failed"
 
@@ -129,8 +148,22 @@ if (( fail )); then
   exit 1
 fi
 
+# BL5c: the feature kernel is built outside the artifact build, so the run binds it explicitly —
+# the kernel with the feature it was built with, the initramfs (and the userspace features it
+# carries) from its build's own manifest — and records the identities it judged.
+BUILD_DIR=$(dirname "$INITRAMFS_IMAGE")
+{
+  echo "tree=$(git rev-parse HEAD^{tree}) head=$(git rev-parse HEAD) dirty=$(git status --porcelain | wc -l) kernel_feature=$FEATURE userspace_features=$USERSPACE_FEATURES"
+  sha256sum "$KERNEL_IMAGE" "$INITRAMFS_IMAGE"
+} >"$LOGDIR/artifact-identity.txt"
+source scripts/lib/artifact-binding.sh
+artifact_write_run_manifest "$LOGDIR/artifact-binding.txt" "$ARCH" "$KERNEL_IMAGE" \
+  "--no-default-features --features $FEATURE" "$INITRAMFS_IMAGE" "$BUILD_DIR/artifact-manifest.txt" \
+  || { echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH result=fail reason=artifact_binding"; exit 1; }
+
 note "booting QEMU -smp 1 with yarm.xfer2_grant_witness=1"
 env \
+  ARTIFACT_MANIFEST="$LOGDIR/artifact-binding.txt" \
   KERNEL_IMAGE="$KERNEL_IMAGE" \
   INITRAMFS_IMAGE="$INITRAMFS_IMAGE" \
   KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.xfer2_grant_witness=1" \
@@ -269,6 +302,24 @@ else
   have 'RECV_V3_LIVE_MAPPED route=broad' && die "an NR 30 delivery fell to the broad route"
 fi
 
+# ── SHARED-REGION-OFFSET1: the selection, proven twice ──
+#
+# Userspace already read every byte of both pages against the pattern AT THE GRANT'S OBJECT
+# OFFSET (page0=1 page1=1 above). Kernel side, independently: every page the address-space owner
+# installed from the oracle object must sit at `ORACLE_VA + (pa - base - GRANT_OFFSET)` — the
+# frame the object offset names, never the window base — and there must be one such install per
+# granted page.
+offset_marker=$(count 'SHARED_REGION_OFFSET_WITNESS cell=xfer2 ')
+if (( OFFSET_SELECTION )); then
+  [[ "$offset_marker" == "1" && "$(count "SHARED_REGION_OFFSET_WITNESS cell=xfer2 offset=$GRANT_OFFSET len=8192")" == "1" ]] \
+    || die "the offset profile did not reach the init image (markers=$offset_marker)"
+else
+  [[ "$offset_marker" == "0" ]] || die "the zero-offset profile carries the offset cell"
+fi
+frames=$(python3 -I scripts/lib/shared-region-frames.py "$NORM" "$GRANT_OFFSET" "$ORACLE_VA")
+[[ "$frames" == "installs=4 misplaced=0" ]] \
+  || die "the oracle object's frames were not installed at the granted object offset ($frames)"
+
 # ── Nothing may have gone wrong on the way ──
 for bad in \
   'RECV_V3_COMMIT_LOST_RACE' \
@@ -291,7 +342,7 @@ note "NR 30 received+mapped and NR 4 released two disposable grants, both shapes
 # so an ordinary-routes pass was indistinguishable from an NR 30 pass in the transcript — and the
 # two are complementary cells of one witness, not interchangeable.
 if (( ORDINARY_ROUTES )); then
-  echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=ordinary_routes grants=2 pages=2 shapes=nr2,nr5_timed releases=2 route=split unrouted=0 result=ok"
+  echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=ordinary_routes grants=2 pages=2 object_offset=$GRANT_OFFSET shapes=nr2,nr5_timed releases=2 route=split unrouted=0 result=ok"
 else
-  echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=nr30 grants=2 shapes=registered_range,explicit_range releases=2 route=split result=ok"
+  echo "XFER2_GRANT_WITNESS_SEAL arch=$ARCH profile=nr30 grants=2 object_offset=$GRANT_OFFSET shapes=registered_range,explicit_range releases=2 route=split result=ok"
 fi

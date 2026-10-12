@@ -450,24 +450,22 @@ impl crate::kernel::syscall::recv_v3_txn::RecvV3Owners for BroadRecvV3Owners<'_>
         }
     }
 
-    fn region_phys_start(&mut self, cap: CapId) -> Option<crate::kernel::vm::PhysAddr> {
-        use crate::kernel::capabilities::CapObject;
-        let (mo_id, offset) = self
+    fn region_page_phys(
+        &mut self,
+        cap: CapId,
+        region: crate::kernel::boot::TransferSharedRegion,
+        page_offset: usize,
+    ) -> Option<crate::kernel::vm::PhysAddr> {
+        let object = self
             .kernel
             .capability_service()
-            .resolve_current_task_capability(cap)
-            .and_then(|c| match c.object {
-                CapObject::DmaRegion { id, offset, .. } => Some((id, offset)),
-                CapObject::MemoryObject { id } => Some((id, 0u64)),
-                _ => None,
-            })?;
-        self.kernel.with_memory_state(|m| {
-            m.memory_objects
-                .iter()
-                .flatten()
-                .find(|e| e.id == mo_id)
-                .map(|e| crate::kernel::vm::PhysAddr(e.phys.0 + offset))
-        })
+            .resolve_current_task_capability(cap)?
+            .object;
+        self.kernel
+            .with_memory_state(|m| {
+                KernelState::shared_region_page_phys_locked(m, object, region, page_offset)
+            })
+            .ok()
     }
 
     fn map_page(

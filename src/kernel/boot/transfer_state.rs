@@ -297,33 +297,15 @@ impl KernelState {
         let Some(region) = shared_region else {
             return Ok(());
         };
-        if region.len == 0 {
-            return Err(KernelError::WrongObject);
-        }
-        let end = region
-            .offset
-            .checked_add(region.len)
-            .ok_or(KernelError::WrongObject)?;
         // 199G-C4 §2: the bound check itself is THE shared policy — the split envelope stash asks
         // the same function with the same inputs, so the two stashes cannot drift on what a
-        // shared-region descriptor is allowed to name. Only the LOOKUP of a `MemoryObject`'s
+        // shared-region descriptor is allowed to name. Only the LOOKUP of the backing object's
         // length differs between them (broad `with_memory_state` here, the rank-6 split seam
         // there), which is why it is passed in rather than performed inside.
-        let memory_object_len = match capability.object {
-            CapObject::MemoryObject { id } => Some(
-                self.with_memory_state(|memory| {
-                    memory
-                        .memory_objects
-                        .iter()
-                        .flatten()
-                        .find(|entry| entry.id == id)
-                        .map(|entry| entry.len)
-                })
-                .ok_or(KernelError::MemoryObjectMissing)?,
-            ),
-            _ => None,
-        };
-        transfer_shared_region_bounds_ok(capability.object, region, memory_object_len)
+        let object_len = self.with_memory_state(|memory| {
+            KernelState::shared_region_object_len_locked(memory, capability.object)
+        });
+        transfer_shared_region_bounds_ok(capability.object, region, object_len)
     }
 
     pub fn endpoint_waiter_tid(&self, endpoint: CapObject) -> Option<ThreadId> {
@@ -494,48 +476,130 @@ impl KernelState {
     }
 }
 
-/// 199G-C4 §2 — THE shared-region bound policy, shared by the broad and split envelope stashes.
+/// SHARED-REGION-OFFSET1 — what a shared-region descriptor selects, once its source admits it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct SharedRegionSelection {
+    /// The object-relative byte offset of the first selected byte. Page-aligned by construction.
+    pub(crate) object_offset: u64,
+    /// The exact LOGICAL length the descriptor names, in bytes. What the receiver is told.
+    pub(crate) len: u64,
+    /// The page-rounded length that is mapped, registered and released. Never smaller than
+    /// `len`, never more than one page short of a page beyond it.
+    pub(crate) mapped_len: u64,
+}
+
+/// Why a descriptor names nothing its source can back. Each is a distinct fact so a caller can
+/// choose its own error class; none is a partial answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SharedRegionRangeRefusal {
+    /// Not a `MemoryObject` or `DmaRegion` capability.
+    NotARegion,
+    /// `len == 0`.
+    Empty,
+    /// `offset` is not page-aligned. Refused, never rounded down.
+    Misaligned,
+    /// Rounding `len` up to a page, `offset + mapped_len`, or the window's end overflows `u64`.
+    Overflow,
+    /// A `DmaRegion` window that does not lie inside its object.
+    WindowOutsideObject,
+    /// The page-rounded selection reaches outside the capability's window.
+    OutsideWindow,
+}
+
+/// SHARED-REGION-OFFSET1 — THE shared-region range policy. Every owner that admits, maps or
+/// releases a shared region asks this one function: both envelope stashes and both NR 1 send
+/// arms (admission), and the per-page frame owner every receive family maps through
+/// ([`KernelState::shared_region_page_phys_locked`]).
 ///
-/// Given the resolved source object, the descriptor the sender named, and (for a `MemoryObject`)
-/// that object's length as read by whichever rank-6 owner the caller had available, decide whether
-/// the descriptor is admissible. Pure: it reads no kernel state, so both callers reach the same
-/// verdict from the same facts.
+/// * `offset` and `len` are BYTES. `offset` is relative to the underlying `MemoryObject` — not a
+///   page index, and not a sender or receiver virtual address.
+/// * The capability's WINDOW is what the selection must lie inside: the whole object,
+///   `[0, object_len)`, for a `MemoryObject`; `[window.offset, window.offset + window.len)` for a
+///   `DmaRegion`, which must itself lie inside its object. A `DmaRegion` restricts the
+///   object-relative interval; it does not rebase it, so its base is never added to `offset`.
+/// * `offset` must be page-aligned: a mapping starts on a frame boundary, and rounding a
+///   misaligned offset down would expose bytes before the ones the sender named.
+/// * The final page. A mapping is page-granular, so a `len` that is not a page multiple is mapped
+///   as `mapped_len = round_up(len)`, and the receiver can read the bytes between `offset + len`
+///   and the end of that page. That is admissible only because the WHOLE page-rounded selection
+///   must lie inside the window: every object and every `DmaRegion` window is page-granular, so
+///   the page holding the last selected byte belongs to the same authorized backing. No
+///   byte-level isolation of that tail is claimed.
 ///
-/// The rules are exactly the ones `validate_transfer_record_metadata` has always applied:
-/// a zero length is refused, `offset + len` may not overflow, a `MemoryObject` descriptor may not
-/// exceed the object's length, a `DmaRegion` descriptor must lie inside the capability's own
-/// `[offset, offset + len)` window, and no other object class may carry a shared region at all.
+/// Every end and every rounding is checked arithmetic. `object_len` is the backing object's
+/// length in bytes, read by whichever owner the caller holds.
+pub(crate) fn shared_region_selection(
+    object: CapObject,
+    region: TransferSharedRegion,
+    object_len: u64,
+) -> Result<SharedRegionSelection, SharedRegionRangeRefusal> {
+    let (window_start, window_len) = match object {
+        CapObject::MemoryObject { .. } => (0, object_len),
+        CapObject::DmaRegion { offset, len, .. } => (offset, len),
+        _ => return Err(SharedRegionRangeRefusal::NotARegion),
+    };
+    if region.len == 0 {
+        return Err(SharedRegionRangeRefusal::Empty);
+    }
+    let page = crate::kernel::vm::PAGE_SIZE as u64;
+    if !region.offset.is_multiple_of(page) {
+        return Err(SharedRegionRangeRefusal::Misaligned);
+    }
+    let mapped_len = region
+        .len
+        .checked_next_multiple_of(page)
+        .ok_or(SharedRegionRangeRefusal::Overflow)?;
+    let mapped_end = region
+        .offset
+        .checked_add(mapped_len)
+        .ok_or(SharedRegionRangeRefusal::Overflow)?;
+    let window_end = window_start
+        .checked_add(window_len)
+        .ok_or(SharedRegionRangeRefusal::Overflow)?;
+    if window_end > object_len {
+        return Err(SharedRegionRangeRefusal::WindowOutsideObject);
+    }
+    if region.offset < window_start || mapped_end > window_end {
+        return Err(SharedRegionRangeRefusal::OutsideWindow);
+    }
+    Ok(SharedRegionSelection {
+        object_offset: region.offset,
+        len: region.len,
+        mapped_len,
+    })
+}
+
+/// The `KernelError` each range refusal is reported as by the kernel-internal owners: a
+/// misaligned offset is `Vm(Misaligned)`, anything else is a descriptor its source cannot back.
+pub(crate) const fn shared_region_refusal_error(refusal: SharedRegionRangeRefusal) -> KernelError {
+    match refusal {
+        SharedRegionRangeRefusal::Misaligned => KernelError::Vm(VmError::Misaligned),
+        _ => KernelError::WrongObject,
+    }
+}
+
+/// 199G-C4 §2 — THE shared-region admission check, shared by the broad and split envelope stashes
+/// and by both NR 1 send arms.
+///
+/// Given the resolved source object, the descriptor the sender named, and the backing object's
+/// length as read by whichever rank-6 owner the caller had available, decide whether the
+/// descriptor is admissible. Pure: it reads no kernel state, so every caller reaches the same
+/// verdict from the same facts. The rules are [`shared_region_selection`]'s; a stale object
+/// (`object_len == None`) is `MemoryObjectMissing`.
 pub(crate) fn transfer_shared_region_bounds_ok(
     object: CapObject,
     region: TransferSharedRegion,
-    memory_object_len: Option<usize>,
+    object_len: Option<usize>,
 ) -> Result<(), KernelError> {
-    if region.len == 0 {
+    if !matches!(
+        object,
+        CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. }
+    ) {
         return Err(KernelError::WrongObject);
     }
-    let end = region
-        .offset
-        .checked_add(region.len)
-        .ok_or(KernelError::WrongObject)?;
-    match object {
-        CapObject::MemoryObject { .. } => {
-            let len = memory_object_len.ok_or(KernelError::MemoryObjectMissing)?;
-            let max_len = u64::try_from(len).map_err(|_| KernelError::WrongObject)?;
-            if region.len > max_len || end < region.offset {
-                return Err(KernelError::WrongObject);
-            }
-        }
-        CapObject::DmaRegion {
-            offset: base,
-            len: span,
-            ..
-        } => {
-            let cap_end = base.checked_add(span).ok_or(KernelError::WrongObject)?;
-            if region.offset < base || end > cap_end {
-                return Err(KernelError::WrongObject);
-            }
-        }
-        _ => return Err(KernelError::WrongObject),
-    }
-    Ok(())
+    let object_len = object_len.ok_or(KernelError::MemoryObjectMissing)?;
+    let object_len = u64::try_from(object_len).map_err(|_| KernelError::WrongObject)?;
+    shared_region_selection(object, region, object_len)
+        .map(|_| ())
+        .map_err(shared_region_refusal_error)
 }

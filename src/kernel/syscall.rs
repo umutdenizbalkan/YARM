@@ -324,6 +324,7 @@ pub(crate) use self::ipc_abi::transfer_cap_arg_present;
 pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;
 
 pub(crate) use ipc::split_inline_payload_from_frame;
+pub(crate) use ipc::validate_shared_region_send_descriptor;
 pub(crate) mod ipc_abi;
 // Stage 154: D1/D5 cap-boundary landing zone. Holds the pure recv-v2 meta
 // codec today; the stateful cap/materialization seams stay in syscall.rs until
@@ -4006,7 +4007,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -4072,7 +4073,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -4129,7 +4130,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -4180,7 +4181,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -4230,7 +4231,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -4298,7 +4299,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -4341,7 +4342,7 @@ mod tests {
                 Syscall::IpcSend as usize,
                 [
                     send_cap.0 as usize,
-                    0x2000,
+                    0,
                     Message::MAX_PAYLOAD + 16,
                     0,
                     0,
@@ -4394,7 +4395,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -4457,7 +4458,7 @@ mod tests {
                 Syscall::IpcSend as usize,
                 [
                     send_cap.0 as usize,
-                    0x3000,
+                    0,
                     Message::MAX_PAYLOAD + 32,
                     0,
                     0,
@@ -4535,7 +4536,7 @@ mod tests {
                 Syscall::IpcSend as usize,
                 [
                     send_cap.0 as usize,
-                    0x3000,
+                    0,
                     Message::MAX_PAYLOAD + 32,
                     0,
                     0,
@@ -4598,7 +4599,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -4662,7 +4663,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -4752,7 +4753,7 @@ mod tests {
                 Syscall::IpcSend as usize,
                 [
                     send_cap.0 as usize,
-                    0x2000,
+                    0,
                     Message::MAX_PAYLOAD + 16,
                     0,
                     0,
@@ -4820,7 +4821,7 @@ mod tests {
                 Syscall::IpcSend as usize,
                 [
                     send_cap.0 as usize,
-                    0x2000,
+                    0,
                     Message::MAX_PAYLOAD + 16,
                     0,
                     0,
@@ -4882,7 +4883,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x2000,
+                0,
                 Message::MAX_PAYLOAD + 16,
                 0,
                 0,
@@ -5176,7 +5177,7 @@ mod tests {
             Syscall::IpcSend as usize,
             [
                 send_cap.0 as usize,
-                0x1200,
+                0,
                 IPC_REGISTER_BYTES + 1,
                 0,
                 0,
@@ -5190,7 +5191,7 @@ mod tests {
         assert_eq!(msg.opcode, OPCODE_SHARED_MEM);
         assert!(msg.flags & Message::FLAG_CAP_TRANSFER != 0);
         let region = SharedMemoryRegion::decode(msg.as_slice()).expect("region");
-        assert_eq!(region.offset, 0x1200);
+        assert_eq!(region.offset, 0);
         assert_eq!(region.len as usize, IPC_REGISTER_BYTES + 1);
     }
 

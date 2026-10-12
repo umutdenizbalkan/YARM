@@ -2348,7 +2348,7 @@ pub(super) mod xfer2_grant_witness {
         use yarm_ipc_abi::recv_shared_v3_abi::RecvSharedV3Output;
 
         // SAFETY: `ep_cap` carries SEND; `mem_cap` is init's disposable source cap.
-        let sent = unsafe { yarm_user_rt::syscall::send_shared_region(ep_cap, mem_cap) };
+        let sent = unsafe { super::shared_region_oracle_core::send_grant(ep_cap, mem_cap) };
         if sent.is_err() {
             yarm_user_rt::user_log!("XFER2_GRANT_WITNESS phase={} step=send result=fail", label);
             return false;
@@ -2470,6 +2470,14 @@ pub(super) mod xfer2_grant_witness {
             mem_cap,
             ep_cap
         );
+        // SHARED-REGION-OFFSET1: present only in the offset profile, so the smoke can prove the
+        // feature reached this image rather than infer it from the grants passing.
+        #[cfg(feature = "shared-region-offset-witness")]
+        yarm_user_rt::user_log!(
+            "SHARED_REGION_OFFSET_WITNESS cell=xfer2 offset={} len={}",
+            super::shared_region_oracle_core::GRANT_OFFSET,
+            yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN
+        );
 
         // TWO grant cycles, and which RECEIVE syscall takes them is the profile's choice.
         //
@@ -2564,9 +2572,7 @@ pub(super) mod xfer2_grant_witness {
         let one = |nr: usize, timeout: u64, label: &str| -> bool {
             // The explicit-length send, so the descriptor the receiver acts on names ONE page.
             // SAFETY: `ep_cap` carries SEND; `mem_cap` is init's disposable source cap.
-            if unsafe { yarm_user_rt::syscall::send_shared_region_large(ep_cap, mem_cap, 0, LEN) }
-                .is_err()
-            {
+            if unsafe { super::shared_region_oracle_core::send_grant(ep_cap, mem_cap) }.is_err() {
                 yarm_user_rt::user_log!(
                     "XFER2_ORDINARY_GRANT phase={} step=send result=fail",
                     label
@@ -2710,8 +2716,39 @@ mod shared_region_oracle_core {
     // Exact count of times the child's post-delivery validation body runs — must be exactly one.
     pub(super) static CONTINUATIONS: AtomicU32 = AtomicU32::new(0);
 
+    /// SHARED-REGION-OFFSET1 — the OBJECT offset every oracle grant names. The oracle object is
+    /// four differently patterned pages; a grant is always two of them. Gated off it is `0` — the
+    /// first two pages, exactly what the cells always sent — and under
+    /// `shared-region-offset-witness` it is one page, so every receive family (NR 30, NR 2, NR 5,
+    /// the direct delivery) must map the MIDDLE pages `[PAGE, 3 * PAGE)` and the validators below
+    /// must read their bytes, not page 0's.
+    pub(super) const GRANT_OFFSET: usize = if cfg!(feature = "shared-region-offset-witness") {
+        yarm_user_rt::syscall::SHARED_REGION_ORACLE_PAGE_SIZE
+    } else {
+        0
+    };
+
+    /// Send THE oracle grant: `[GRANT_OFFSET, GRANT_OFFSET + LEN)` of the oracle object.
+    ///
+    /// # Safety
+    /// `ep_cap` must carry SEND and `mem_cap` must be the oracle's read-only source cap.
+    pub(super) unsafe fn send_grant(
+        ep_cap: u32,
+        mem_cap: u32,
+    ) -> core::result::Result<(), yarm_user_rt::syscall::SyscallError> {
+        // SAFETY: forwarded verbatim; the caller upholds the capability contract.
+        unsafe {
+            yarm_user_rt::syscall::send_shared_region_large(
+                ep_cap,
+                mem_cap,
+                GRANT_OFFSET,
+                yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN,
+            )
+        }
+    }
+
     /// Validate the two mapped pages against the deterministic oracle pattern (every byte across BOTH
-    /// pages). Returns `true` iff every byte matches.
+    /// pages) at the grant's object offset. Returns `true` iff every byte matches.
     ///
     /// # Safety
     /// `base..base+len` must be the readable two-page mapping returned by the recv.
@@ -2724,7 +2761,7 @@ mod shared_region_oracle_core {
         while off < len {
             // SAFETY: caller guarantees the whole window is mapped readable.
             let got = unsafe { core::ptr::read_volatile((base + off) as *const u8) };
-            if got != yarm_user_rt::syscall::shared_region_oracle_pattern_byte(off) {
+            if got != yarm_user_rt::syscall::shared_region_oracle_pattern_byte(GRANT_OFFSET + off) {
                 return false;
             }
             off += 1;
@@ -2733,7 +2770,9 @@ mod shared_region_oracle_core {
     }
 
     /// Validate each page independently so page 0 and page 1 are proven separately (a page swap or a
-    /// single-page mapping is detected). Returns `(page0_ok, page1_ok)`.
+    /// single-page mapping is detected), against the bytes at the grant's object offset — so a
+    /// receive path that ignored the offset reads the wrong pages and fails both halves. Returns
+    /// `(page0_ok, page1_ok)`.
     ///
     /// # Safety
     /// `base..base+len` must be the readable two-page mapping returned by the recv.
@@ -2747,7 +2786,7 @@ mod shared_region_oracle_core {
         while off < len {
             // SAFETY: caller guarantees the whole window is mapped readable.
             let got = unsafe { core::ptr::read_volatile((base + off) as *const u8) };
-            if got != yarm_user_rt::syscall::shared_region_oracle_pattern_byte(off) {
+            if got != yarm_user_rt::syscall::shared_region_oracle_pattern_byte(GRANT_OFFSET + off) {
                 ok[off / PAGE] = false;
             }
             off += 1;
@@ -2789,6 +2828,12 @@ mod shared_region_oracle_core {
     /// Must run on a freshly-spawned oracle child thread sharing init's CSpace/address space.
     pub(super) unsafe fn child_recv_and_validate() -> RecvOutcome {
         yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_CHILD_STARTED");
+        #[cfg(feature = "shared-region-offset-witness")]
+        yarm_user_rt::user_log!(
+            "SHARED_REGION_OFFSET_WITNESS cell=direct offset={} len={}",
+            GRANT_OFFSET,
+            yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN
+        );
         // Liveness only: signal that B reached its recv preamble. This does NOT prove B is blocked —
         // the KERNEL's post-commit ack is the authoritative proof.
         super::oracle_handshake_publish(&CHILD_STARTED, CHILD_STARTED_READY);
@@ -2921,7 +2966,7 @@ mod shared_region_oracle_core {
         while attempts < MAX_SEND_ATTEMPTS {
             attempts += 1;
             // SAFETY: `endpoint_cap` is the SEND|RECEIVE oracle cap; `mem_cap` the read-only source.
-            match unsafe { yarm_user_rt::syscall::send_shared_region(endpoint_cap, mem_cap) } {
+            match unsafe { send_grant(endpoint_cap, mem_cap) } {
                 Ok(()) => {
                     succeeded = true;
                     break;

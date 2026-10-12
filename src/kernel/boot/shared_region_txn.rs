@@ -465,25 +465,11 @@ impl KernelState {
         // numeric TID receives a different ASID).
         self.task_asid(snap.receiver_tid) == Some(snap.receiver_asid)
     }
-
-    fn shared_region_phys_base(&self, object: CapObject) -> Option<crate::kernel::vm::PhysAddr> {
-        let (id, offset) = match object {
-            CapObject::MemoryObject { id } => (id, 0u64),
-            CapObject::DmaRegion { id, offset, .. } => (id, offset),
-            _ => return None,
-        };
-        self.with_memory_state(|m| {
-            m.memory_objects
-                .iter()
-                .flatten()
-                .find(|e| e.id == id)
-                .map(|e| crate::kernel::vm::PhysAddr(e.phys.0 + offset))
-        })
-    }
 }
 
-fn page_round_up(len: usize) -> usize {
-    (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+/// The page-rounded mapping length of a `len`-byte region, or `None` if rounding overflows.
+fn page_round_up(len: usize) -> Option<usize> {
+    len.checked_next_multiple_of(PAGE_SIZE)
 }
 
 /// 199G-C4 §3 — THE shared-region source-object admission rule.
@@ -562,8 +548,15 @@ pub(crate) trait SharedRegionExecCtx {
     ) -> Result<CapId, ()>;
     /// rank 3: register the provisional active-mapping entry BEFORE the first page maps.
     fn ctx_register_active_mapping(&mut self, tid: u64, cap: CapId, va: u64, len: usize) -> bool;
-    /// rank 6: physical base of the shared region.
-    fn ctx_phys_base(&self, object: CapObject) -> Option<PhysAddr>;
+    /// rank 6: the frame `page_offset` bytes into the selection `region` names, through THE
+    /// per-page owner (`KernelState::shared_region_page_phys_locked`), which re-applies the whole
+    /// range policy to the whole selection on every call. `None` = the backing cannot hold it.
+    fn ctx_region_page_phys(
+        &self,
+        object: CapObject,
+        region: TransferSharedRegion,
+        page_offset: usize,
+    ) -> Option<PhysAddr>;
     /// rank 5 (+6): map exactly ONE user page (NX enforced by the caller's flags).
     fn ctx_map_page(
         &mut self,
@@ -656,13 +649,17 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
         return Err(SharedRegionTxnError::Cancelled);
     }
 
-    // Bounds check (DmaRegion / region len) up front.
+    // Bounds check (region len, checked page rounding) up front.
     let region_len = match usize::try_from(txn.snapshot.descriptor.len) {
         Ok(v) if v > 0 => v,
         _ => {
             rollback_shared_region_txn(ctx, &mut txn);
             return Err(SharedRegionTxnError::BadRegion);
         }
+    };
+    let Some(mapped_len) = page_round_up(region_len) else {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::BadRegion);
     };
     if txn.snapshot.map_va == 0 || !txn.snapshot.map_va.is_multiple_of(PAGE_SIZE as u64) {
         rollback_shared_region_txn(ctx, &mut txn);
@@ -676,6 +673,19 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
     if txn.snapshot.map_write && !txn.snapshot.rights.contains(CapRights::WRITE) {
         rollback_shared_region_txn(ctx, &mut txn);
         return Err(SharedRegionTxnError::MissingWriteRight);
+    }
+    // SHARED-REGION-OFFSET1 — the selection, after every earlier gate so their errors keep their
+    // precedence, and before the mint: the descriptor's object-relative selection, page-rounded,
+    // must lie wholly inside the snapshot object's window and backing. Resolving page 0 through
+    // THE per-page owner applies the whole range policy to the whole selection, so a selection
+    // the backing cannot hold is refused here — before the mint, the registration or any page —
+    // and every later page resolves inside it.
+    if ctx
+        .ctx_region_page_phys(txn.snapshot.object, txn.snapshot.descriptor, 0)
+        .is_none()
+    {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::BadRegion);
     }
 
     // Phase 3: mint ONE fresh receiver-local cap with the attenuated rights.
@@ -694,7 +704,6 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
 
     // Phase 4: register the provisional active mapping BEFORE the first page maps, so process-exit
     // cleanup owns any partial mapping (no untracked window). NX enforced; writable only with WRITE.
-    let mapped_len = page_round_up(region_len);
     if !ctx.ctx_register_active_mapping(
         txn.snapshot.receiver_tid,
         minted,
@@ -707,13 +716,6 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
     txn.mapped = Some((txn.snapshot.map_va, mapped_len));
     txn.state = SharedRegionTxnState::Mapping;
 
-    let phys_start = match ctx.ctx_phys_base(txn.snapshot.object) {
-        Some(p) => p,
-        None => {
-            rollback_shared_region_txn(ctx, &mut txn);
-            return Err(SharedRegionTxnError::BadRegion);
-        }
-    };
     let map_flags = PageFlags {
         read: true,
         write: txn.snapshot.map_write,
@@ -739,18 +741,26 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
             return Err(SharedRegionTxnError::Cancelled);
         }
         let virt = VirtAddr(txn.snapshot.map_va + (i * PAGE_SIZE) as u64);
-        let phys = PhysAddr(phys_start.0 + (i * PAGE_SIZE) as u64);
         let fault = hook_force_map_fault() || hook_map_fault_at_page(i);
-        if fault
-            || !ctx.ctx_map_page(
-                txn.snapshot.receiver_asid,
-                virt,
-                Mapping {
-                    phys,
-                    flags: map_flags,
-                },
-            )
-        {
+        let phys = if fault {
+            None
+        } else {
+            ctx.ctx_region_page_phys(txn.snapshot.object, txn.snapshot.descriptor, i * PAGE_SIZE)
+        };
+        let Some(phys) = phys else {
+            // Page `i` could not be resolved after pages 0..i mapped: rollback unmaps exactly
+            // that prefix.
+            rollback_shared_region_txn(ctx, &mut txn);
+            return Err(SharedRegionTxnError::MapFault);
+        };
+        if !ctx.ctx_map_page(
+            txn.snapshot.receiver_asid,
+            virt,
+            Mapping {
+                phys,
+                flags: map_flags,
+            },
+        ) {
             // Page `i` failed after pages 0..i succeeded: rollback unmaps exactly that prefix.
             rollback_shared_region_txn(ctx, &mut txn);
             return Err(SharedRegionTxnError::MapFault);
@@ -925,8 +935,15 @@ impl SharedRegionExecCtx for KernelState {
         self.register_active_transfer_mapping(ThreadId(tid), cap, VirtAddr(va), len)
             .is_ok()
     }
-    fn ctx_phys_base(&self, object: CapObject) -> Option<PhysAddr> {
-        self.shared_region_phys_base(object)
+    fn ctx_region_page_phys(
+        &self,
+        object: CapObject,
+        region: TransferSharedRegion,
+        page_offset: usize,
+    ) -> Option<PhysAddr> {
+        self.with_memory_state(|m| {
+            KernelState::shared_region_page_phys_locked(m, object, region, page_offset).ok()
+        })
     }
     fn ctx_map_page(
         &mut self,

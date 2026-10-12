@@ -9993,16 +9993,29 @@ impl SharedKernel {
         })
     }
 
-    /// rank 6 — BL1: the frame behind one page of a shared region, through the SAME owner the
-    /// broad `resolve_shared_region_page_phys` reads,
-    /// [`KernelState::shared_region_page_phys_locked`].
+    /// rank 6 — BL1 / SHARED-REGION-OFFSET1: the frame behind one page of the selection a
+    /// shared-region descriptor names, through the SAME owner the broad
+    /// `resolve_shared_region_page_phys` reads, [`KernelState::shared_region_page_phys_locked`].
     pub(crate) fn shared_region_page_phys_split(
         &self,
         object: crate::kernel::capabilities::CapObject,
+        region: crate::kernel::boot::TransferSharedRegion,
         page_offset: usize,
     ) -> Result<crate::kernel::vm::PhysAddr, crate::kernel::boot::KernelError> {
         self.with_memory_split_mut(|memory| {
-            KernelState::shared_region_page_phys_locked(memory, object, page_offset)
+            KernelState::shared_region_page_phys_locked(memory, object, region, page_offset)
+        })
+    }
+
+    /// rank 6 — SHARED-REGION-OFFSET1: the length of the object backing a `MemoryObject` or
+    /// `DmaRegion` capability, through the SAME owner the broad stash reads,
+    /// [`KernelState::shared_region_object_len_locked`].
+    pub(crate) fn shared_region_object_len_split(
+        &self,
+        object: crate::kernel::capabilities::CapObject,
+    ) -> Option<usize> {
+        self.with_memory_split_mut(|memory| {
+            KernelState::shared_region_object_len_locked(memory, object)
         })
     }
 
@@ -13235,13 +13248,6 @@ impl SharedKernel {
             )
         })
     }
-    /// rank 6: physical base of the frozen shared object.
-    pub(crate) fn sr_phys_base_split(
-        &self,
-        object: CapObject,
-    ) -> Option<crate::kernel::vm::PhysAddr> {
-        self.with_memory_split_mut(|m| KernelState::shared_region_phys_base_locked(m, object))
-    }
     /// rank 6: release the transferred object pin (once).
     pub(crate) fn sr_release_pin_split(&self, object: CapObject) {
         self.with_memory_split_mut(|m| {
@@ -14057,8 +14063,9 @@ impl SharedKernel {
     /// 1. **rank 2 → 4** — resolve the sender's source capability, giving the frozen
     ///    `source_object` the envelope will carry. A stale or missing capability refuses here,
     ///    before anything is pinned or published.
-    /// 2. **rank 6 (read)** — for a `MemoryObject`, its length, which is the only fact the bound
-    ///    policy needs that the caller cannot compute.
+    /// 2. **rank 6 (read)** — the backing object's length (a `MemoryObject`'s own, a
+    ///    `DmaRegion`'s parent's), which is the only fact the bound policy needs that the caller
+    ///    cannot compute.
     /// 3. **pure** — `transfer_shared_region_bounds_ok`, THE shared descriptor policy, identical
     ///    to the one the broad stash applies.
     /// 4. **rank 6 (write)** — acquire the pin, and ONLY when `transfer_envelope_owes_pin` says
@@ -14093,24 +14100,19 @@ impl SharedKernel {
 
         // (2)+(3) the descriptor policy, for a shared-region envelope only.
         if let Some(region) = shared_region {
-            // rank 6 read, released immediately.
-            let memory_object_len = match source_object {
-                CapObject::MemoryObject { id } => Some(
-                    self.with_memory_split_mut(|m| {
-                        m.memory_objects
-                            .iter()
-                            .flatten()
-                            .find(|entry| entry.id == id)
-                            .map(|entry| entry.len)
-                    })
-                    .ok_or(TransferStashRefusal::ObjectStale)?,
+            // rank 6 read, released immediately. A shared region's backing object — a
+            // `MemoryObject`'s own, or a `DmaRegion`'s parent — must still exist.
+            let object_len = match source_object {
+                CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => Some(
+                    self.shared_region_object_len_split(source_object)
+                        .ok_or(TransferStashRefusal::ObjectStale)?,
                 ),
                 _ => None,
             };
             crate::kernel::boot::transfer_shared_region_bounds_ok(
                 source_object,
                 region,
-                memory_object_len,
+                object_len,
             )
             .map_err(|_| TransferStashRefusal::DescriptorRejected)?;
         }
@@ -18538,8 +18540,15 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
     fn ctx_register_active_mapping(&mut self, tid: u64, cap: CapId, va: u64, len: usize) -> bool {
         self.0.sr_register_active_mapping_split(tid, cap, va, len)
     }
-    fn ctx_phys_base(&self, object: CapObject) -> Option<crate::kernel::vm::PhysAddr> {
-        self.0.sr_phys_base_split(object)
+    fn ctx_region_page_phys(
+        &self,
+        object: CapObject,
+        region: crate::kernel::boot::TransferSharedRegion,
+        page_offset: usize,
+    ) -> Option<crate::kernel::vm::PhysAddr> {
+        self.0
+            .shared_region_page_phys_split(object, region, page_offset)
+            .ok()
     }
     fn ctx_map_page(
         &mut self,

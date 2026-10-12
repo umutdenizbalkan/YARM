@@ -2846,6 +2846,19 @@ fn try_split_ipc_send_recognized(
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
             };
+            // SHARED-REGION-OFFSET1: the broad arm's descriptor check, the same owner, at the
+            // same step — after kind, rights and the user-region check, before the stash. Still
+            // consuming nothing, so a refusal here leaves no envelope, pin or message.
+            if let Err(e) = crate::kernel::syscall::validate_shared_region_send_descriptor(
+                grant.object,
+                crate::kernel::boot::TransferSharedRegion {
+                    offset: region.offset,
+                    len: region.len,
+                },
+                shared.shared_region_object_len_split(grant.object),
+            ) {
+                return D::Complete(Err(TrapHandleError::Syscall(e)));
+            }
             let encoded = region.encode();
             payload_buf[..encoded.len()].copy_from_slice(&encoded);
             Some((

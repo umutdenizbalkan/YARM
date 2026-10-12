@@ -37,9 +37,10 @@
 //!   pre-attenuation capability. Same order here, same bytes.
 //!
 //! The per-page mapping loop resolves EACH page's frame — `va - requested_va` bytes into the
-//! capability's window — through the owner the broad loop also uses
+//! descriptor's object-relative selection — through the owner the broad loop also uses
 //! (`KernelState::shared_region_page_phys_locked`). Both loops used to resolve the object's base
-//! frame for every page, so every page of a multi-page region aliased page 0 (BL1).
+//! frame for every page, so every page of a multi-page region aliased page 0 (BL1), and then the
+//! capability window's base, ignoring the descriptor's offset (BL1-a, SHARED-REGION-OFFSET1).
 
 use crate::kernel::boot::TrapHandleError;
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
@@ -304,7 +305,10 @@ impl crate::runtime::SharedKernel {
             receiver_tid,
             transfer_cap,
             pending.user_ptr,
-            region_len,
+            crate::kernel::boot::TransferSharedRegion {
+                offset: desc.offset,
+                len: desc.len,
+            },
             recv_map_flags,
         ) {
             Ok(mapped) => mapped,
@@ -424,9 +428,10 @@ impl crate::runtime::SharedKernel {
         receiver_tid: u64,
         receiver_mem_cap: CapId,
         requested_va: usize,
-        region_len: usize,
+        region: crate::kernel::boot::TransferSharedRegion,
         map_flags: PageFlags,
     ) -> Result<(usize, usize), SyscallError> {
+        let region_len = usize::try_from(region.len).map_err(|_| SyscallError::InvalidArgs)?;
         if requested_va == 0 || region_len == 0 || !requested_va.is_multiple_of(PAGE_SIZE) {
             return Err(SyscallError::InvalidArgs);
         }
@@ -438,14 +443,31 @@ impl crate::runtime::SharedKernel {
         while va < end {
             // Resolved per page, as the broad loop resolves it per page through
             // `resolve_shared_region_page_phys`: the rights check, then the frame `va -
-            // requested_va` bytes into the capability's window, in that order, with that error
-            // precedence.
-            let phys = self.resolve_shared_region_phys_split(
+            // requested_va` bytes into the descriptor's object-relative selection, in that
+            // order, with that error precedence. Page 0 already refuses a selection the backing
+            // cannot hold, so nothing is installed for one.
+            let phys = match self.resolve_shared_region_phys_split(
                 receiver_tid,
                 receiver_mem_cap,
                 map_flags,
+                region,
                 va - requested_va,
-            )?;
+            ) {
+                Ok(phys) => phys,
+                Err(err) => {
+                    // The broad loop rolls back its installed prefix on a resolve refusal as on a
+                    // map refusal; so does this one.
+                    if va > requested_va {
+                        let _ = self.unmap_range_two_phase_from_split(
+                            cpu,
+                            asid,
+                            requested_va,
+                            va - requested_va,
+                        );
+                    }
+                    return Err(err);
+                }
+            };
             let installed = self.map_user_page_raw_split(
                 asid,
                 VirtAddr(va as u64),
@@ -482,13 +504,14 @@ impl crate::runtime::SharedKernel {
 
     /// The split twin of `resolve_shared_region_page_phys`, scoped to the receiver's cspace:
     /// resolve, require the object kind, check READ then WRITE against the requested flags, then
-    /// read the frame `page_offset` bytes into the capability's window through the shared owner.
-    /// Same order, same errors.
+    /// read the frame `page_offset` bytes into the selection `region` names through the shared
+    /// owner. Same order, same errors.
     fn resolve_shared_region_phys_split(
         &self,
         receiver_tid: u64,
         mem_cap: CapId,
         flags: PageFlags,
+        region: crate::kernel::boot::TransferSharedRegion,
         page_offset: usize,
     ) -> Result<PhysAddr, SyscallError> {
         let capability = self
@@ -506,7 +529,7 @@ impl crate::runtime::SharedKernel {
         if flags.write && !capability.has_right(CapRights::WRITE) {
             return Err(SyscallError::MissingRight);
         }
-        self.shared_region_page_phys_split(capability.object, page_offset)
+        self.shared_region_page_phys_split(capability.object, region, page_offset)
             .map_err(SyscallError::from)
     }
 

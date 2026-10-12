@@ -60,7 +60,21 @@ note "building base riscv64 artifacts (servers + initramfs)"
 # BL3a: ORACLE_SERVER_FEATURE_ARGS lets a qualification run build the servers with a default-off
 # witness feature (e.g. `--no-default-features --features oracle-handshake-race`); unset, the
 # build is exactly what it was.
-BOOTSTRAP_FEATURE_ARGS="${ORACLE_SERVER_FEATURE_ARGS:---no-default-features}" \
+# SHARED-REGION-OFFSET1: OFFSET_SELECTION=1 builds init with `shared-region-offset-witness`, so
+# the parent grants the MIDDLE two pages `[PAGE, 3 * PAGE)` of the four-page oracle object and the
+# child checks that it reads exactly those pages' bytes. Composes with ORACLE_SERVER_FEATURE_ARGS.
+OFFSET_SELECTION=${OFFSET_SELECTION:-0}
+SERVER_FEATURE_ARGS="${ORACLE_SERVER_FEATURE_ARGS:---no-default-features}"
+GRANT_OFFSET=0
+if (( OFFSET_SELECTION )); then
+  GRANT_OFFSET=4096
+  if [[ "$SERVER_FEATURE_ARGS" == *"--features "* ]]; then
+    SERVER_FEATURE_ARGS="${SERVER_FEATURE_ARGS/--features /--features shared-region-offset-witness,}"
+  else
+    SERVER_FEATURE_ARGS="$SERVER_FEATURE_ARGS --features shared-region-offset-witness"
+  fi
+fi
+BOOTSTRAP_FEATURE_ARGS="$SERVER_FEATURE_ARGS" \
   scripts/build-qemu-riscv64-artifacts.sh >"$LOGDIR/build.log" 2>&1 \
   || die "base artifact build failed (see $LOGDIR/build.log)"
 
@@ -109,9 +123,22 @@ if (( fail )); then
   exit 1
 fi
 
+# BL5c: the feature kernel is built outside the artifact build, so the run binds it explicitly and
+# records the identities it judged.
+{
+  echo "tree=$(git rev-parse HEAD^{tree}) head=$(git rev-parse HEAD) dirty=$(git status --porcelain | wc -l) kernel_feature=$FEATURE server_features=$SERVER_FEATURE_ARGS"
+  sha256sum "$KBIN" build-riscv64/initramfs-core.cpio
+} >"$LOGDIR/artifact-identity.txt"
+source scripts/lib/artifact-binding.sh
+artifact_write_run_manifest "$LOGDIR/artifact-binding.txt" riscv64 "$KBIN" \
+  "--no-default-features --features $FEATURE" build-riscv64/initramfs-core.cpio \
+  build-riscv64/artifact-manifest.txt \
+  || { echo "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=riscv64 classes=1 result=fail reason=artifact_binding"; exit 1; }
+
 # ── 3. Boot ONE -smp 1 QEMU-virt with the oracle knob ──
 note "booting QEMU-virt -smp 1 with yarm.riscv_shared_region_direct_oracle=1"
 env \
+  ARTIFACT_MANIFEST="$LOGDIR/artifact-binding.txt" \
   KERNEL_IMAGE="$KBIN" \
   INITRAMFS_IMAGE=build-riscv64/initramfs-core.cpio \
   KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.riscv_shared_region_direct_oracle=1" \
@@ -183,6 +210,23 @@ have "RISCV_TRAP_HANDLE_FAILED" && die "RISC-V trap handling failed (Err(Interna
 for bad in "KERNEL PANIC" "RUST PANIC" "panicked at" "CPU EXCEPTION" "DOUBLE FAULT" "Unhandled" "BOOTSTRAP_ERROR" "RISCV_TRAP_ENTER scause=0x2 " ; do
   have "$bad" && die "fatal condition in boot log: $bad"
 done
+
+# ── SHARED-REGION-OFFSET1: the selection the direct delivery mapped ──
+#
+# The child already read every byte of both pages against the pattern at the grant's object
+# offset (page0=1 page1=1). Kernel side, independently: each page installed from the oracle object
+# sits at `ORACLE_VA + (pa - base - GRANT_OFFSET)`, one install per granted page.
+offset_marker=$(count 'SHARED_REGION_OFFSET_WITNESS cell=direct ')
+if (( OFFSET_SELECTION )); then
+  [[ "$offset_marker" == "1" && "$(count "SHARED_REGION_OFFSET_WITNESS cell=direct offset=$GRANT_OFFSET len=8192")" == "1" ]] \
+    || die "the offset profile did not reach the init image (markers=$offset_marker)"
+else
+  [[ "$offset_marker" == "0" ]] || die "the zero-offset profile carries the offset cell"
+fi
+frames=$(python3 -I scripts/lib/shared-region-frames.py "$NORM" "$GRANT_OFFSET" 0x20000000)
+[[ "$frames" == "installs=2 misplaced=0" ]] \
+  || die "the oracle object's frames were not installed at the granted object offset ($frames)"
+(( fail )) || echo "SHARED_REGION_OFFSET_SEAL arch=riscv64 cell=direct object_offset=$GRANT_OFFSET $frames result=ok"
 
 if (( fail )); then
   echo "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=riscv64 classes=1 live_cells=0 result=fail (see $BOOT_LOG)"

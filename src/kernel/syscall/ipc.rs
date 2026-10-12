@@ -136,6 +136,30 @@ fn stash_transfer_handle(
     ))
 }
 
+/// SHARED-REGION-OFFSET1 — THE send-side descriptor check, asked by both NR 1 arms (this
+/// handler and the pre-lock route) after the source object's kind and rights and before the
+/// envelope is stashed, so an inadmissible descriptor is refused before anything is pinned,
+/// published or queued.
+///
+/// The rule is the one range policy (`shared_region_selection`, via
+/// `transfer_shared_region_bounds_ok`): a page-aligned object-relative offset, a non-zero length,
+/// and a page-rounded selection that lies wholly inside the capability's window and its object,
+/// with every end checked. Every refusal is `InvalidArgs` — the descriptor names bytes its source
+/// cannot back. A misaligned offset is refused, never rounded down. A source whose backing object
+/// has gone keeps the stale-object answer the broad resolver gives it.
+pub(crate) fn validate_shared_region_send_descriptor(
+    object: CapObject,
+    region: TransferSharedRegion,
+    object_len: Option<usize>,
+) -> Result<(), SyscallError> {
+    crate::kernel::boot::transfer_shared_region_bounds_ok(object, region, object_len).map_err(|e| {
+        match e {
+            KernelError::MemoryObjectMissing => SyscallError::from(e),
+            _ => SyscallError::InvalidArgs,
+        }
+    })
+}
+
 /// 199G-C4 §1 — THE `IpcSend` payload SHAPE, decided from the sender's class and length alone.
 ///
 /// Three thresholds live here and nowhere else: a user-ASID sender frames a shared region once
@@ -231,9 +255,10 @@ fn map_shared_region_into_receiver(
     kernel: &mut KernelState,
     receiver_mem_cap: CapId,
     requested_va: usize,
-    region_len: usize,
+    region: TransferSharedRegion,
     map_flags: PageFlags,
 ) -> Result<(usize, usize), SyscallError> {
+    let region_len = usize::try_from(region.len).map_err(|_| SyscallError::InvalidArgs)?;
     if requested_va == 0 || region_len == 0 || !requested_va.is_multiple_of(PAGE_SIZE) {
         return Err(SyscallError::InvalidArgs);
     }
@@ -250,12 +275,12 @@ fn map_shared_region_into_receiver(
         .task_asid(tid)
         .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
     while va < end {
-        // BL1: page `va - requested_va` of the region is backed by the frame that far into the
-        // capability's window — resolved per page, with the rights checks first, by the
-        // offset-aware owner. (Resolving through `resolve_memory_object_phys` here mapped every
-        // page to the object's base frame.)
+        // BL1 / SHARED-REGION-OFFSET1: page `va - requested_va` of the region is backed by the
+        // frame that far into the descriptor's OBJECT-RELATIVE selection — resolved per page,
+        // with the rights checks first, by the owner that applies the whole range policy on
+        // every call, so page 0 already refuses a selection the backing cannot hold.
         let installed = kernel
-            .resolve_shared_region_page_phys(receiver_mem_cap, map_flags, va - requested_va)
+            .resolve_shared_region_page_phys(receiver_mem_cap, map_flags, region, va - requested_va)
             .and_then(|phys| {
                 kernel.map_user_page_in_asid_raw(
                     asid,
@@ -447,6 +472,17 @@ pub(super) fn handle_ipc_send(
                 offset: user_ptr_or_offset as u64,
                 len: len as u64,
             };
+            let object_len = kernel.with_memory_state(|memory| {
+                KernelState::shared_region_object_len_locked(memory, grant.object)
+            });
+            validate_shared_region_send_descriptor(
+                grant.object,
+                TransferSharedRegion {
+                    offset: region.offset,
+                    len: region.len,
+                },
+                object_len,
+            )?;
             let (transfer_handle, bound_tid) = stash_transfer_handle(
                 kernel,
                 transfer_cap,
@@ -1703,7 +1739,10 @@ fn handle_ipc_recv_result_with_empty_error(
                         kernel,
                         transfer_cap,
                         user_ptr,
-                        region_len,
+                        TransferSharedRegion {
+                            offset: desc.offset,
+                            len: desc.len,
+                        },
                         recv_map_flags,
                     ) {
                         Ok(mapped) => mapped,

@@ -75,6 +75,9 @@ x86_64-uart-irq-witness = []
 context1-witness = []
 context1-clobber = ["context1-witness"]
 recv-queue1-ordinary-grant = []
+# SHARED-REGION-OFFSET1: init's shared-region oracle cells send the middle two pages of the
+# four-page oracle object and check the receiver reads exactly those bytes.
+shared-region-offset-witness = []
 
 [dependencies]
 yarm = { package = "yarm-server-runtime", path = "../yarm-server-runtime", default-features = false }

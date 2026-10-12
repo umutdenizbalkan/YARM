@@ -106,8 +106,17 @@ pub(crate) trait RecvV3Owners {
     /// rank 4 / rank 6 reads — the output record's object fields.
     fn object_meta(&mut self, cap: CapId) -> V3ObjectMeta;
 
-    /// rank 4 / rank 6 reads — the region's physical base (`mo.phys + dma.offset`).
-    fn region_phys_start(&mut self, cap: CapId) -> Option<PhysAddr>;
+    /// rank 4 / rank 6 reads — the frame `page_offset` bytes into the selection `region` names,
+    /// resolved against the minted capability's object through THE per-page owner
+    /// (`KernelState::shared_region_page_phys_locked`), which re-applies the whole range policy
+    /// to the whole selection on every call. `None` = the capability names no region, or its
+    /// backing cannot hold the selection.
+    fn region_page_phys(
+        &mut self,
+        cap: CapId,
+        region: crate::kernel::boot::TransferSharedRegion,
+        page_offset: usize,
+    ) -> Option<PhysAddr>;
 
     /// rank 5 — install one page. `false` is a refusal the caller compensates.
     fn map_page(&mut self, asid: Asid, virt: VirtAddr, phys: PhysAddr, writable: bool) -> bool;
@@ -247,13 +256,29 @@ pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(
             return Err(SyscallError::InvalidArgs);
         };
         let cap_id = CapId(cap_raw);
+        // SHARED-REGION-OFFSET1: the selection is the SENDER's descriptor — its object-relative
+        // offset and its length — decoded from the message payload the kernel itself framed. A
+        // payload that is not a descriptor maps nothing.
+        let region = crate::kernel::ipc::SharedMemoryRegion::decode(msg.as_slice()).map(|d| {
+            crate::kernel::boot::TransferSharedRegion {
+                offset: d.offset,
+                len: d.len,
+            }
+        });
+        // NR 30's mapped delivery still requires a `DmaRegion` grant — `exact_region_len` is
+        // non-zero only for one — exactly as before; what changed is that the length mapped is
+        // the descriptor's, not the whole capability window's.
+        let region_len = match region {
+            Some(r) if meta.exact_region_len != 0 => r.len,
+            _ => 0,
+        };
         let plan = compute_recv_v3_mapping_plan(
             msg.opcode,
             req.map_intent,
             req.payload_ptr,
             req.payload_len,
             meta.effective_rights as u8,
-            meta.exact_region_len,
+            region_len,
             PAGE_SIZE as u64,
         );
         let RecvV3MappingPlan::Map {
@@ -266,7 +291,8 @@ pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(
             owners.note(V3TxnEvent::Refused);
             return Err(SyscallError::InvalidArgs);
         };
-        let Some(phys_start) = owners.region_phys_start(cap_id) else {
+        // A `Map` plan implies a decoded descriptor (`region_len != 0`).
+        let Some(region) = region else {
             rollback_owned(owners, None, Some((cap_id, is_reply_cap)), is_reply_cap);
             owners.note(V3TxnEvent::Refused);
             return Err(SyscallError::InvalidArgs);
@@ -274,8 +300,12 @@ pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(
         let num_pages = (mapped_len / PAGE_SIZE as u64) as usize;
         for page_idx in 0..num_pages {
             let virt = VirtAddr(map_va + page_idx as u64 * PAGE_SIZE as u64);
-            let phys = PhysAddr(phys_start.0 + page_idx as u64 * PAGE_SIZE as u64);
-            if !owners.map_page(asid, virt, phys, !read_only) {
+            // Page 0's resolution applies the range policy to the WHOLE selection, so a
+            // selection the backing cannot hold is refused before anything is installed.
+            let installed = owners
+                .region_page_phys(cap_id, region, page_idx * PAGE_SIZE)
+                .is_some_and(|phys| owners.map_page(asid, virt, phys, !read_only));
+            if !installed {
                 // Undo exactly the prefix this transaction installed — no more.
                 let installed = page_idx * PAGE_SIZE;
                 if installed > 0 {
