@@ -150184,12 +150184,12 @@ mod u9tm_proof_gate {
             // BL2 re-derivation: the shared bridge carries TWO terminal results — the terminal
             // PageFault route's and the user instruction-fault route's. They are exclusive by
             // decode (a trap is one event) and both carry a settlement of the same terminal
-            // owners, so either one's result must reach the tail. RISC-V has no instruction-fault
-            // route and keeps one.
-            let terminal_carriers = if name == "riscv" { 1 } else { 2 };
+            // owners, so either one's result must reach the tail. BL2-a re-derivation: the
+            // RISC-V bridge now runs the same instruction-fault route (a U-mode illegal
+            // instruction), so it carries the same two.
             assert_eq!(
                 src.matches("terminal_result = Some(result);").count(),
-                terminal_carriers,
+                2,
                 "{name} bridge: exactly the terminal routes may carry a terminal result"
             );
             // Each route declares its own recovery exactly once.
