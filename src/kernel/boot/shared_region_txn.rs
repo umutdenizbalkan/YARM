@@ -139,6 +139,10 @@ pub(crate) enum SharedRegionTxnError {
     MissingWriteRight,
     BadRegion,
     MapFault,
+    /// SHARED-REGION-LIFETIME2: a page was installed but the invalidation of the translation it
+    /// replaced did not complete. Settled like a map fault — the transaction unmaps every page it
+    /// installed, this one included, and publishes nothing — while the replaced page stays held.
+    InvalidationIncomplete,
     CopyFault,
     StalePublish,
     /// Cancellation became authoritative at a checkpoint (teardown request or dead receiver); the
@@ -557,13 +561,15 @@ pub(crate) trait SharedRegionExecCtx {
         region: TransferSharedRegion,
         page_offset: usize,
     ) -> Option<PhysAddr>;
-    /// rank 5 (+6): map exactly ONE user page (NX enforced by the caller's flags).
+    /// rank 5 (+6): map exactly ONE user page (NX enforced by the caller's flags). The outcome
+    /// is typed: `InvalidationIncomplete` means the page IS installed but what it replaced may
+    /// still be translated elsewhere, so it is not a successful installation.
     fn ctx_map_page(
         &mut self,
         asid: crate::kernel::vm::Asid,
         virt: VirtAddr,
         mapping: Mapping,
-    ) -> bool;
+    ) -> crate::kernel::boot::vm_image_locked::PageInstall;
     /// OFF-LOCK: copy the recv-v2 meta to user memory with NO kernel lock held.
     fn ctx_copy_meta(&mut self, asid: crate::kernel::vm::Asid, va: VirtAddr, bytes: &[u8]) -> bool;
     /// Origin-neutral final delivery. `None` = STALE finalization (a blocked endpoint waiter that is
@@ -753,7 +759,7 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
             rollback_shared_region_txn(ctx, &mut txn);
             return Err(SharedRegionTxnError::MapFault);
         };
-        if !ctx.ctx_map_page(
+        match ctx.ctx_map_page(
             txn.snapshot.receiver_asid,
             virt,
             Mapping {
@@ -761,14 +767,33 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
                 flags: map_flags,
             },
         ) {
-            // Page `i` failed after pages 0..i succeeded: rollback unmaps exactly that prefix.
-            rollback_shared_region_txn(ctx, &mut txn);
-            return Err(SharedRegionTxnError::MapFault);
+            crate::kernel::boot::vm_image_locked::PageInstall::Complete => {}
+            crate::kernel::boot::vm_image_locked::PageInstall::Refused => {
+                // Page `i` failed after pages 0..i succeeded: rollback unmaps exactly that prefix.
+                rollback_shared_region_txn(ctx, &mut txn);
+                return Err(SharedRegionTxnError::MapFault);
+            }
+            crate::kernel::boot::vm_image_locked::PageInstall::InvalidationIncomplete => {
+                // SHARED-REGION-LIFETIME2: page `i` IS installed and counted, but the translation
+                // it replaced may survive on a remote CPU, so nothing may be published. The
+                // prefix the rollback owns therefore INCLUDES page `i`; the replaced page stays
+                // held by the install, and each unmapped page is held until its own
+                // invalidation is acknowledged.
+                txn.mapped_prefix_len = (i + 1) * PAGE_SIZE;
+                crate::yarm_log!(
+                    "SHARED_REGION_MAP_INVALIDATION_INCOMPLETE route=direct receiver_tid={} va=0x{:x}",
+                    txn.snapshot.receiver_tid,
+                    virt.0
+                );
+                rollback_shared_region_txn(ctx, &mut txn);
+                return Err(SharedRegionTxnError::InvalidationIncomplete);
+            }
         }
         // AUTHORITATIVE progress update AFTER each successful page, BEFORE the next.
         txn.mapped_prefix_len = (i + 1) * PAGE_SIZE;
     }
-    // Phase 5/6: mapping complete (fresh maps need no TLB shootdown; only rollback unmaps do).
+    // Phase 5/6: mapping complete. A fresh page needs no shootdown; a page that replaced another
+    // reached here only once its install's invalidation completed (SHARED-REGION-LIFETIME2).
     txn.state = SharedRegionTxnState::Mapped;
 
     // Checkpoint 4 — after mapping, before writeback.
@@ -950,8 +975,13 @@ impl SharedRegionExecCtx for KernelState {
         asid: crate::kernel::vm::Asid,
         virt: VirtAddr,
         mapping: Mapping,
-    ) -> bool {
-        self.map_user_page_in_asid_raw(asid, virt, mapping).is_ok()
+    ) -> crate::kernel::boot::vm_image_locked::PageInstall {
+        // SHARED-REGION-LIFETIME2: the broad reference context keeps the split context's policy —
+        // a replaced page is held until its invalidation completes, and the verdict is typed.
+        self.map_user_page_in_live_asid(asid, virt, mapping).map_or(
+            crate::kernel::boot::vm_image_locked::PageInstall::Refused,
+            |(o, _)| o,
+        )
     }
     fn ctx_copy_meta(&mut self, asid: crate::kernel::vm::Asid, va: VirtAddr, bytes: &[u8]) -> bool {
         self.copy_to_user(asid, va, bytes).is_ok()

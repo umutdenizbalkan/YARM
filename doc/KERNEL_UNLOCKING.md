@@ -25678,6 +25678,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | fixed and delivered (SHARED-REGION-OFFSET1, qualified `9d991d0c`) | owner ABI decision: byte offset relative to the `MemoryObject`, page-aligned, a `DmaRegion` bounds without rebasing. On `a91632ba` a non-zero offset maps the wrong pages on the queued, direct and NR 30 paths, NR 30 maps the whole window, a `MemoryObject` descriptor whose `len` fits but whose `offset + len` does not is accepted, and a misaligned offset is accepted — nine hosted regressions fail. One range policy now admits and resolves on every path; live: every receive family maps a middle two-page range on all three ports |
 | BL1-b — shared-region backing lifetime: mapping references, displaced-page holds and reclamation keyed on an object's first frame | fixed and delivered (SHARED-REGION-LIFETIME1, qualified `7c2da86c`) | on `96114d69` a mapped interior page took no mapping reference, a displaced or unmapped interior page took no hold, teardown handed live interior frames to the allocator, and an object whose capabilities were gone was reclaimed while a forked child still mapped it — ten of twelve hosted regressions fail. The owner of a page is now the live allocator-owned extent that contains it; a removed or displaced reference becomes an identity hold settled after its invalidation; live: an interior mapping survives the other owner's release on all three ports, read back from the kernel's own counters |
+| BL1-c — a shared-region replacement reported complete before its invalidation was | fixed and delivered (SHARED-REGION-LIFETIME2, qualified `TBD-SRL2-COMMIT`) | on `89273030` the queued, NR 30 and direct installs reported success after an unacknowledged invalidation (receive returned, message committed, receiver woken), the direct follow-up excluded the ambient CPU instead of the executing one, and the general mapper reclaimed a displaced page at once in a live space — TBD-SRL2-BASEFAIL hosted regressions fail. The install outcome is typed and an incomplete one is settled as a failure that unmaps the current page and keeps every hold; the direct context carries its requester; immediate reclaim needs an explicit construction contract. Live (RISC-V): a receive replaces a page a remote hart is reading — targets include that hart, the fence completes, the hold settles, and the observer reads the new bytes |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | fixed and delivered (qualified `1d7be22c`) | reproduced live with a new default-off witness: base stops the whole system at `IRQ1_UNKNOWN_SETTLED … strict=1`. A U-mode illegal instruction now decodes as the task's `UserInstructionFault` at `sepc`, and the RISC-V bridge settles it through BL2's route and the same terminal owners; init is reported and terminated, and a replacement runs |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
@@ -26111,7 +26112,9 @@ run through the twelve hosted cases and the x86_64 lifetime cell.
 * *The broad immediate reclaim.* `map_user_page_in_asid_raw_locked` still reclaims a displaced page
   at once. That is admissible only where no CPU can hold a translation — unpublished or
   never-resident address spaces (spawn provisioning, the fork clone's child) and the hosted broad
-  routes; every route into a live address space uses the holding install.
+  routes; every route into a live address space uses the holding install. (Closed by
+  SHARED-REGION-LIFETIME2, BL1-c below: the immediate reclaim now requires an explicit
+  construction contract, and the hosted broad routes use the holding install.)
 * *Equality left where it is harmless.* `find_current_task_cap_for_memory_object_phys` (no caller)
   and the hosted test accessors keyed on an object's base address still use equality.
 * Only allocator-owned and borrowed objects exist; a future object kind that is neither must
@@ -26161,6 +26164,204 @@ Firmware is QEMU 8.2.2's bundled default; on RISC-V that is OpenSBI `fw_dynamic`
 
 The live lifetime interleaving is yield-sequenced on `-smp 1`, and the order is verified from the
 log. The failed-invalidation case is hosted-only.
+
+### BL1-c — SHARED-REGION-LIFETIME2: a replacement is complete only when its invalidation is
+
+SHARED-REGION-LIFETIME1 made a displaced page's backing survive until its invalidation completed.
+That protects the old backing. It does not make the replacement mapping visible: until every CPU
+that may cache the old translation has invalidated it, a remote thread of the receiver can still
+read the old page through the new mapping's address. This package settles that outcome as a
+failure, makes the direct transaction name the CPU that is really executing it, and closes the
+legacy mapper's immediate reclaim.
+
+**Defects (reproduced on `89273030`, through production owners).** The cases are in
+`shared_region_lifetime2`. Each fixture makes a task bound to the receiver's address space current
+on CPU 1, so CPU 1 is a genuine remote holder of the receiver's translations. The failure
+injection is the hosted build's own invalidation owner: with no cross-CPU coordinator, a non-empty
+remote target set cannot be acknowledged and `complete_unmap_shootdown_from_split` answers `false`.
+That failure is **hosted-only**. On the base TBD-SRL2-BASEFAIL of TBD-SRL2-TOTAL cases fail:
+
+* *An incomplete invalidation became a successful delivery.* `map_user_page_raw_split` returned
+  `true` after an unacknowledged shootdown, and the direct adapter reported success after
+  `sr_apply_map_followup_split`, whose return carried no verdict. So:
+  * a queued NR 2 / NR 5 receive returned success, both when the replaced page was the first
+    installed and when it was a later one;
+  * NR 30 committed the message and wrote an OK output record;
+  * the direct transaction published, minted the receiver's capability and woke the receiver.
+  In every case CPU 1's old translation was never retired.
+* *The direct follow-up took its requester from the ambient field.* It called
+  `complete_unmap_shootdown_split`, which reads `sched.current_cpu`, and that value decides which
+  CPU is excluded from the remote targets.
+  * With the transaction executing on CPU 0, the ambient field naming CPU 1 and the space resident
+    on CPU 1, CPU 1 was excluded: the transaction published with CPU 1's translation alive.
+  * In the reverse case (executing on CPU 1, where the space is resident, ambient field naming
+    CPU 0), the requester targeted itself. Its displaced page stayed held for an acknowledgement it
+    can never give itself.
+  * The rollback's prefix unmap (`ctx_unmap_prefix`) used the same ambient helper.
+* *The general mapper reclaimed a displaced page at once.* `map_user_page_in_asid_raw` (and every
+  caller of `map_user_page_in_asid_raw_locked`) retired a displaced page and reclaimed its object
+  immediately, whatever the space. With the space resident on CPU 1 and the old object living by
+  that mapping alone, the object was freed while CPU 1 could still translate to it.
+* *The competing release case could not even be reached.* The failed receive "succeeded", so there
+  was no failure settlement for a final release to compete with.
+
+The two cases that pass on the base are a local-only replacement and a completed replacement with
+its cleanup. They are kept as coverage of the success path.
+
+**Repair.**
+
+* *A typed install outcome.* `PageInstall` has three values:
+  * `Refused` — the page table did not change;
+  * `Complete` — installed, and whatever it displaced is invalidated everywhere and its hold
+    settled;
+  * `InvalidationIncomplete` — the page table names the new page and its mapping reference is
+    taken, but the displaced translation may survive on another CPU. The displaced page stays held.
+
+  `map_user_page_raw_split`, `sr_apply_map_followup_split`, `SharedRegionExecCtx::ctx_map_page`,
+  `RecvV3Owners::map_page` and the broad live-space install all return it.
+* *Every route settles `InvalidationIncomplete` as a failure that owns the current page.* The
+  rollback prefix now includes the page just installed. The routes:
+  * the queued split and broad loops (prefix `va + PAGE`, then the loop's existing map-failure
+    error);
+  * NR 30 (prefix `(page + 1) * PAGE`, nothing committed, so the message stays the sender's);
+  * the direct transaction (`mapped_prefix_len = (i + 1) * PAGE`, the new typed
+    `SharedRegionTxnError::InvalidationIncomplete`, rollback, no finalize and no wake).
+
+  Each rollback unmap converts every removed page's reference into an identity hold, settled only
+  on an acknowledged shootdown. The granted object's installed pages are therefore quarantined too
+  if their own invalidation cannot complete. A competing final release — the old object's last
+  capability, or the sender's — frees nothing. Every incomplete route logs
+  `SHARED_REGION_MAP_INVALIDATION_INCOMPLETE route=…`.
+
+  Retaining the hold does NOT restore the old mapping: after the failure the window holds neither
+  page. It does not complete a revocation either.
+* *The requester is carried.* `SharedRegionOffLockCtx` now holds `{ shared, requester }`, built by
+  the drain as `SharedRegionOffLockCtx::new(self, cpu)` for the CPU whose trap it serves. Its map
+  follow-up and its rollback unmap both pass that CPU to the requester-explicit owners
+  (`complete_unmap_shootdown_from_split`, `unmap_range_two_phase_from_split`). The other cleanup
+  this chain reaches was audited:
+  * `sr_revoke_split` / `rollback_minted_cap_split` perform no VM work;
+  * the queued route's `revoke_shared_region_transfer_cap` reaches
+    `revoke_active_transfer_mappings_for_cap_split`, which still uses the ambient unmap. It runs
+    only for a capability this transaction minted and never registered, so it finds no
+    registration and unmaps nothing.
+* *The legacy mapper states a contract.* `map_user_page_in_asid_raw_locked` takes a
+  `DisplacementContract`:
+  * `Fresh` refuses an existing translation before the page table changes
+    (`VM_MAP_DISPLACEMENT_REFUSED`, `InvalidAddress`).
+  * `Constructing` keeps the immediate reclaim. It is claimed only by the ELF image loaders'
+    install and finalize passes, which re-install each page with its final permissions.
+
+  The caller proof is pinned by `the_construction_contract_names_only_never_activated_spaces`:
+  * the loaders are reached only from the spawn provisioner, which creates the space, loads it and
+    binds it only at the commit;
+  * and from the boot builders, which create, load and then bind init, the supervisor and PM on all
+    three ports.
+
+  "No CPU runs this space now" is not accepted as a proof. Every other locked caller — spawn's
+  initrd window, the fork clone's child, thread stacks — and the broad `map_user_page_in_asid_raw`
+  state `Fresh`. The unused broad `load_elf_with_mo_zero_copy` entry into a construction site is
+  deleted.
+* *The hosted reference routes keep the same policy.*
+  * `KernelState::map_user_page_in_live_asid` is the broad holding install: hold, then the broad
+    route's shootdown plan, then settle or retain, typed. It serves the broad queued loop, the
+    broad NR 30 and direct contexts, the broad COW fault and `map_user_page`.
+  * `KernelState::unmap_range_two_phase` now converts each removed reference into a hold and
+    settles only on an acknowledged shootdown. It used to note the removal and reclaim by address
+    afterwards.
+* Unchanged: the offset ABI, rights, the page-rounded lifetime rules, and the revocation contract.
+  The census is still `with_cpu=0`, `with_broad=0`.
+
+**Evidence — hosted (`shared_region_lifetime2`, TBD-SRL2-TOTAL cases).**
+
+* Incomplete invalidation, at the first installed page and at a later one:
+  * queued NR 2 and NR 5: not a success, no mapping length published, no receiver-local capability,
+    no registration, the window empty;
+  * NR 30: not a delivery, the message still queued, no OK output record;
+  * direct: the drain fails, the receiver stays blocked, no receiver capability.
+
+  On every route the granted object's mapping references are back where they started. Every page
+  the delivery installed is a hold, every displaced page is still held, and its frames are still
+  charged.
+* A competing final release after the failure: the old object's last capability and the sender's
+  window capability are revoked. The old object keeps its hold (and the mapping the receive never
+  reached), the granted object keeps its holds, and every frame stays charged.
+* The requester, through the production drain on the CPU that executes it:
+  * requester CPU 0, ambient CPU 1, resident on CPU 1 → the remote target is included and nothing
+    is published;
+  * requester CPU 1, ambient CPU 0, resident on CPU 1 → complete, published, hold settled;
+  * local-only under either ambient value → complete.
+
+  Each expectation comes from the fixture's explicit residency, not from the target helper.
+* A completed replacement on NR 2, NR 30 and the direct route: the displaced object (last
+  capability released first) is reclaimed by its settlement and only by it. NR 4 returns the
+  granted object to its exact starting counts.
+* The general mapper refuses a replacement in a space resident on CPU 1. The page table, the old
+  object's reference and its frame are unchanged.
+* Source contracts: the direct context reaches no ambient helper, and the construction contract's
+  callers are pinned.
+
+Existing guards re-derived to the new owners:
+`stage198e3b2a_offlock_ctx::offlock_ctx_source_contracts` (the context's shape and constructor),
+`stage193g_remaining_shapes_audit::shared_region_recv_is_vm_mapping_coupled` (the broad loop's
+live-space install), and the SRL1 split-displacement contract (the follow-up's requester-explicit
+shootdown). Two COW regression tests re-protect a live page and now use the live-space owner.
+
+**Evidence — live (`scripts/qemu-riscv64-sr-replace-witness-smoke.sh`, RISC-V).** The kernel feature
+`riscv64-sr-replace-witness` reuses the QEMU-SMP3 secondary bring-up (pinned OpenSBI v1.3,
+`-smp 2`, `yarm.ap_user_dispatch=1`) and replaces its tasks with two kernel-built programs in ONE
+address space:
+
+* the observer O on CPU 1 logs `O_READY`, reads W through the old translation and then spins on it
+  with no kernel entry;
+* the receiver R on CPU 0 sends a one-page shared region to its own endpoint and receives it with
+  NR 2 mapped AT W, replacing the page O caches.
+
+The witness performs no lifetime operation. It records the production shootdown's own target set,
+the firmware fence's result, the install's outcome and the settlement. It grades separately:
+
+* *observed bytes*:
+  * R reads the granted byte at both ends of W;
+  * O reads it too (`O_NEW aux=0x5a`). The read is credited only because O's hart took no
+    supervisor entry between `O_READY` and that step (QEMU flushes a hart's TLB on every `satp`
+    write, so an intervening entry would make the observation meaningless).
+* *kernel completion*:
+  * `requester_cpu=0 targets=0x2 fence=1 fence_hart_mask=0x2 outcome=complete`;
+  * the displaced hold settled and reclaimed exactly the provisioned object
+    (`SRR_KERNEL_SETTLE … reclaimed=1`) after the install;
+  * no retained hold, no incomplete invalidation, no refused displacement.
+
+TBD-SRL2-LIVE
+
+Live coverage of the other routes is unchanged and preserved: the NR 30, NR 2 / NR 5, lifetime and
+direct cells at object offsets 0 and 4096, all three ports.
+
+**Final-candidate controls.** TBD-SRL2-CONTROLS
+
+**Remaining limitations.**
+
+* *The live replacement witness is RISC-V only.*
+  * x86_64 has no general AP placement for a kernel-built task pair outside the SMP1 profile's
+    dedicated stubs.
+  * AArch64's `tlbi …is` broadcast completes every invalidation architecturally, so its outcome is
+    always `complete`.
+  * The incomplete-invalidation settlement is hosted-only evidence on every port.
+  * The direct route's requester carriage is hosted evidence. Its live cell is the oracle's
+    blocked-receiver delivery, which has no remote observer.
+* *Quarantine is permanent.* No later completion retries an unacknowledged invalidation, so
+  quarantined backing — the displaced page and the granted pages installed in the failed attempt —
+  is never reclaimed.
+* *Other families keep their own policy.* VmMap (NR 3) and both COW routes report success after an
+  unacknowledged invalidation, keeping the displaced page quarantined. They are outside the
+  shared-region contract and were not changed.
+* *Ambient requesters outside this chain.* The fork write-protect shootdown, the split COW private
+  copy, the reap owners' transfer unmap and `revoke_active_transfer_mappings_for_cap_split` still
+  read `sched.current_cpu` (see the audit above for the one this chain reaches).
+* *Residency is "currently running".* The shootdown targets CPUs whose current task is bound to the
+  space. A CPU that ran the space earlier is not targeted. Only the construction contract — a space
+  never activated — admits an immediate reclaim on that basis.
+
+**Qualification.** TBD-SRL2-QUAL
 
 ### BL2 — x86 user port-I/O fault containment
 
@@ -27428,7 +27629,7 @@ Every row of the table above is fixed or explicitly bounded. A bounded row is st
 the condition under which it stays harmless and what would remove it; it is not a closure.
 
 * *Fixed and delivered:* BL1, BL1-a (SHARED-REGION-OFFSET1), BL1-b (SHARED-REGION-LIFETIME1),
-  BL2, BL2-a, BL3a–c, BL4a–b, BL5a, BL5a-2, BL5a-2b, BL5b, BL5b-2, BL5b-4, BL5c, BL5d, BL6a, BL6c,
+  BL1-c (SHARED-REGION-LIFETIME2), BL2, BL2-a, BL3a–c, BL4a–b, BL5a, BL5a-2, BL5a-2b, BL5b, BL5b-2, BL5b-4, BL5c, BL5d, BL6a, BL6c,
   BL6e. Each has its own section above: defect, repair, evidence, and the frozen commit it was
   qualified on.
 * *Bounded with a stated condition (open):*

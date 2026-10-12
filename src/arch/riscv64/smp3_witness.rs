@@ -245,6 +245,15 @@ fn cap32(c: CapId) -> Result<u32, KernelError> {
 /// Provision the four tasks from the bootstrap window (`&mut KernelState`). CPU 0's two tasks are
 /// enqueued here; CPU 1's are placed by the secondary once it has been admitted.
 pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
+    // SHARED-REGION-LIFETIME2: the replacement witness reuses this bring-up and replaces the tasks.
+    #[cfg(feature = "riscv64-sr-replace-witness")]
+    return crate::arch::riscv64::sr_replace_witness::provision(kernel);
+    #[cfg(not(feature = "riscv64-sr-replace-witness"))]
+    provision_smp3(kernel)
+}
+
+#[cfg_attr(feature = "riscv64-sr-replace-witness", allow(dead_code))]
+fn provision_smp3(kernel: &mut KernelState) -> Result<(), KernelError> {
     let (_, _, es) = kernel.create_endpoint(1)?;
     let (_, _, eh1) = kernel.create_endpoint(1)?;
     let (_, _, eh0) = kernel.create_endpoint(1)?;
@@ -377,6 +386,8 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
 /// The admitted secondary places its two tasks on itself and takes one start-up kick. Nothing else
 /// can wake it: it has no timer, and a remote wake IPI is raised only by an enqueue made elsewhere.
 pub fn secondary_admitted(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
+    #[cfg(feature = "riscv64-sr-replace-witness")]
+    crate::arch::riscv64::sr_replace_witness::secondary_admitted(shared, cpu);
     if !enabled() || cpu.0 != 1 || CPU1_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -422,6 +433,8 @@ pub fn secondary_admitted(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
 
 /// One supervisor entry on `cpu` (observation only). Any entry ends the hart's idle wait.
 pub fn note_supervisor_entry(cpu: CpuId) {
+    #[cfg(feature = "riscv64-sr-replace-witness")]
+    crate::arch::riscv64::sr_replace_witness::note_supervisor_entry(cpu);
     if let Some(n) = ENTRIES.get(cpu.0 as usize) {
         n.fetch_add(1, Ordering::AcqRel);
     }
@@ -652,6 +665,13 @@ pub fn note_fence_done(
     generation: u64,
     result: &Result<(), crate::arch::riscv64::sbi::SbiError>,
 ) {
+    #[cfg(feature = "riscv64-sr-replace-witness")]
+    crate::arch::riscv64::sr_replace_witness::note_fence_done(
+        asid,
+        virt,
+        hart_mask,
+        result.is_ok(),
+    );
     if generation == 0 {
         return;
     }
@@ -922,6 +942,8 @@ pub fn note_shoot_begin(asid: u16, va: u64) {
 
 /// ... and computed `targets` from the snapshot it just kept.
 pub fn note_shoot_targets(requester: CpuId, asid: u16, va: u64, targets: u64) {
+    #[cfg(feature = "riscv64-sr-replace-witness")]
+    crate::arch::riscv64::sr_replace_witness::note_shoot_targets(requester, asid, va, targets);
     if !watches(va) {
         return;
     }
@@ -1041,6 +1063,10 @@ fn await_consumed(target_cpu: u8) {
 /// The DebugLog route saw a user step. Every `SMP3 ` step becomes one record; the residency steps
 /// also record the stepping hart's supervisor-entry count; a failure is echoed at once.
 pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u64, aux: u64) {
+    #[cfg(feature = "riscv64-sr-replace-witness")]
+    if crate::arch::riscv64::sr_replace_witness::observe_user_marker(cpu, tid, msg, round, aux) {
+        return;
+    }
     if !enabled() {
         return;
     }

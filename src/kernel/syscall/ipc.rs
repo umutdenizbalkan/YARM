@@ -279,10 +279,15 @@ fn map_shared_region_into_receiver(
         // frame that far into the descriptor's OBJECT-RELATIVE selection — resolved per page,
         // with the rights checks first, by the owner that applies the whole range policy on
         // every call, so page 0 already refuses a selection the backing cannot hold.
+        //
+        // SHARED-REGION-LIFETIME2: the receiver's space may be live, so the install goes through
+        // the invalidation-aware owner and its verdict is typed — the same policy as the split
+        // loop. A page whose replaced translation could not be invalidated IS installed, so the
+        // rollback below owns it too, and the receive fails with the split loop's error.
         let installed = kernel
             .resolve_shared_region_page_phys(receiver_mem_cap, map_flags, region, va - requested_va)
             .and_then(|phys| {
-                kernel.map_user_page_in_asid_raw(
+                kernel.map_user_page_in_live_asid(
                     asid,
                     VirtAddr(va as u64),
                     Mapping {
@@ -291,14 +296,23 @@ fn map_shared_region_into_receiver(
                     },
                 )
             });
-        if let Err(err) = installed {
-            // Stage 7: two-phase rollback — reclaim only after shootdown wait/fast path.
-            let mut rollback = requested_va;
-            while rollback < va {
-                if let Ok(Some(plan)) = kernel.unmap_page_phase1(asid, VirtAddr(rollback as u64)) {
-                    let _ = kernel.execute_tlb_shootdown_wait_plan(plan);
-                }
-                rollback += PAGE_SIZE;
+        let failed = match installed {
+            Ok((crate::kernel::boot::vm_image_locked::PageInstall::Complete, _)) => None,
+            Ok((outcome, _)) if outcome.installed() => {
+                crate::yarm_log!(
+                    "SHARED_REGION_MAP_INVALIDATION_INCOMPLETE route=queued_broad receiver_tid={} va=0x{:x}",
+                    tid,
+                    va
+                );
+                Some((va + PAGE_SIZE, KernelError::UserMemoryFault))
+            }
+            Ok(_) => Some((va, KernelError::UserMemoryFault)),
+            Err(err) => Some((va, err)),
+        };
+        if let Some((rollback_end, err)) = failed {
+            // Two-phase rollback — each removed page is held until its shootdown completes.
+            if rollback_end > requested_va {
+                kernel.unmap_range_two_phase(asid, requested_va, rollback_end - requested_va);
             }
             return Err(SyscallError::from(err));
         }

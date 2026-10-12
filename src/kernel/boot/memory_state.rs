@@ -745,7 +745,11 @@ impl KernelState {
         }
         let mut flags = mapping.flags;
         flags.write = true;
-        if let Err(e) = self.map_user_page_in_asid_raw(
+        // SHARED-REGION-LIFETIME2: the private copy REPLACES the shared page in a live space, so it
+        // goes through the invalidation-aware owner: the shared page's reference becomes a hold,
+        // settled only once its translation is invalidated, and quarantined otherwise — the
+        // policy the split COW route keeps.
+        if let Err(e) = self.map_user_page_in_live_asid(
             asid,
             page,
             Mapping {
@@ -835,7 +839,12 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
 
-        self.map_user_page_in_asid_raw(asid, virt, mapping)
+        // SHARED-REGION-LIFETIME2: a capability-named space may be live, so a replacement goes
+        // through the invalidation-aware owner. Its displaced page is settled only after the
+        // invalidation completes; this entry has no failure settlement of its own, so an
+        // incomplete invalidation leaves the displaced page quarantined, never reclaimed.
+        self.map_user_page_in_live_asid(asid, virt, mapping)
+            .map(|(_, old)| old)
     }
 
     pub fn create_memory_object(&mut self, phys: PhysAddr) -> Result<(u64, CapId), KernelError> {
@@ -1341,8 +1350,12 @@ impl KernelState {
         })
     }
 
-    /// Install one page in one address space with exactly the permissions given.
-    /// Body: [`vm_image_locked::map_user_page_in_asid_raw_locked`].
+    /// Install one FRESH page in one address space with exactly the permissions given. Body:
+    /// [`vm_image_locked::map_user_page_in_asid_raw_locked`] under the `Fresh` contract.
+    ///
+    /// SHARED-REGION-LIFETIME2: an existing translation at `virt` is refused, never replaced and
+    /// reclaimed — this entry cannot know whether the space has ever run. A caller that must
+    /// replace a page in a space that may be live uses [`Self::map_user_page_in_live_asid`].
     pub(crate) fn map_user_page_in_asid_raw(
         &mut self,
         asid: Asid,
@@ -1351,9 +1364,65 @@ impl KernelState {
     ) -> Result<Option<Mapping>, KernelError> {
         self.with_vm_then_memory_mut(|vm, memory| {
             super::vm_image_locked::map_user_page_in_asid_raw_locked(
-                vm, memory, asid, virt, mapping,
+                vm,
+                memory,
+                asid,
+                virt,
+                mapping,
+                super::vm_image_locked::DisplacementContract::Fresh,
             )
         })
+    }
+
+    /// SHARED-REGION-LIFETIME2 — install one page into a space that may be LIVE, replacing
+    /// whatever is there, on the broad route. The twin of `SharedKernel::map_user_page_raw_split`
+    /// with the broad route's own invalidation owner, so both routes keep one lifetime policy:
+    ///
+    /// 1. install, converting a displaced page's mapping reference into an identity hold
+    ///    ([`vm_image_locked::map_user_page_holding_displaced_locked`]);
+    /// 2. complete the invalidation the displacement owes (the broad shootdown plan, then
+    ///    `request_live_asid_shootdown` when a remote CPU runs the space);
+    /// 3. settle the hold only if it completed, and otherwise keep it — the displaced backing
+    ///    stays quarantined and the outcome is `InvalidationIncomplete`, never `Complete`.
+    pub(crate) fn map_user_page_in_live_asid(
+        &mut self,
+        asid: Asid,
+        virt: VirtAddr,
+        mapping: Mapping,
+    ) -> Result<(super::vm_image_locked::PageInstall, Option<Mapping>), KernelError> {
+        use super::vm_image_locked::PageInstall;
+        let displaced = self.with_vm_then_memory_mut(|vm, memory| {
+            super::vm_image_locked::map_user_page_holding_displaced_locked(
+                vm, memory, asid, virt, mapping,
+            )
+        })?;
+        let Some((old, hold)) = displaced else {
+            return Ok((PageInstall::Complete, None));
+        };
+        let plan = self.compute_tlb_shootdown_request_plan(asid, virt);
+        let acknowledged =
+            plan.target_cpu_bitmap == 0 || self.request_live_asid_shootdown(asid, virt).is_ok();
+        if let Some(object_id) = hold {
+            if acknowledged {
+                self.with_memory_state_mut(|memory| {
+                    crate::kernel::syscall::vm::settle_displaced_hold_locked(
+                        memory, object_id, old.phys,
+                    )
+                });
+            } else {
+                crate::yarm_log!(
+                    "VM_DISPLACED_HOLD_RETAINED object={} phys=0x{:x} reason=invalidation_incomplete",
+                    object_id,
+                    old.phys.0
+                );
+            }
+        }
+        let outcome = if acknowledged {
+            PageInstall::Complete
+        } else {
+            PageInstall::InvalidationIncomplete
+        };
+        Ok((outcome, Some(old)))
     }
 
     pub fn map_user_page_with_caps(
@@ -1601,12 +1670,52 @@ impl KernelState {
     /// Lock-domain flow (each page, no simultaneous acquisition):
     ///   vm (5) → memory (6) → scheduler+task (1+2) [phase 1]
     ///   ipc (3) → memory (6) [phase 2]
+    ///
+    /// SHARED-REGION-LIFETIME2: the broad route keeps the split route's lifetime policy
+    /// (`SharedKernel::unmap_range_two_phase_from_split`). Each removed page's mapping reference
+    /// becomes an identity hold in the same memory acquisition; only an acknowledged shootdown
+    /// settles it, and an unacknowledged one keeps it — so neither this rollback nor a competing
+    /// final release can free backing a stale translation may still reach.
     pub(crate) fn unmap_range_two_phase(&mut self, asid: Asid, base: usize, len: usize) {
         let end = base.saturating_add(len);
         let mut va = base;
         while va < end {
-            if let Ok(Some(wait_plan)) = self.unmap_page_phase1(asid, VirtAddr(va as u64)) {
-                let _ = self.execute_tlb_shootdown_wait_plan(wait_plan);
+            let virt = VirtAddr(va as u64);
+            let removed = self
+                .with_user_spaces_mut(|spaces| {
+                    spaces
+                        .get_mut(asid)
+                        .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                        .unmap_page(virt)
+                        .map_err(KernelError::Vm)
+                })
+                .ok()
+                .flatten();
+            if let Some(mapping) = removed {
+                let hold = self.with_memory_state_mut(|memory| {
+                    Self::clear_cow_page_locked(memory, asid, virt);
+                    crate::kernel::syscall::vm::retire_mapping_to_hold_locked(memory, mapping.phys)
+                });
+                let plan = self.compute_tlb_shootdown_request_plan(asid, virt);
+                let acknowledged = plan.target_cpu_bitmap == 0
+                    || self.request_live_asid_shootdown(asid, virt).is_ok();
+                if let Some(object_id) = hold {
+                    if acknowledged {
+                        self.with_memory_state_mut(|memory| {
+                            crate::kernel::syscall::vm::settle_displaced_hold_locked(
+                                memory,
+                                object_id,
+                                mapping.phys,
+                            )
+                        });
+                    } else {
+                        crate::yarm_log!(
+                            "VM_DISPLACED_HOLD_RETAINED object={} phys=0x{:x} reason=invalidation_incomplete",
+                            object_id,
+                            mapping.phys.0
+                        );
+                    }
+                }
             }
             va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
         }

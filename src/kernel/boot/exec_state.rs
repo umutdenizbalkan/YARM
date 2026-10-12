@@ -533,29 +533,6 @@ impl KernelState {
         Ok(total)
     }
 
-    /// THE zero-copy initramfs loader — broad entry. Body:
-    /// [`load_elf_with_mo_zero_copy_locked`].
-    pub fn load_elf_with_mo_zero_copy(
-        &mut self,
-        image_id: u64,
-        asid: Asid,
-        image: &[u8],
-        initrd_phys_base: u64,
-        file_initrd_offset: u64,
-    ) -> Result<(usize, usize, usize, usize, usize), KernelError> {
-        self.with_vm_then_memory_mut(|vm, memory| {
-            load_elf_with_mo_zero_copy_locked(
-                vm,
-                memory,
-                image_id,
-                asid,
-                image,
-                initrd_phys_base,
-                file_initrd_offset,
-            )
-        })
-    }
-
     fn maybe_switch_kernel_context(
         &mut self,
         outgoing_tid: Option<u64>,
@@ -3433,6 +3410,7 @@ pub(crate) fn load_elf_pt_load_segments_locked(
                     phys: PhysAddr(phys),
                     flags: stage_flags,
                 },
+                crate::kernel::boot::vm_image_locked::DisplacementContract::Constructing,
             )?;
             #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
             crate::yarm_log!(
@@ -3562,6 +3540,7 @@ pub(crate) fn load_elf_pt_load_segments_locked(
                     phys: PhysAddr(phys),
                     flags: final_flags,
                 },
+                crate::kernel::boot::vm_image_locked::DisplacementContract::Constructing,
             )?;
             va += page_size;
         }
@@ -3796,6 +3775,7 @@ pub(crate) fn load_elf_with_mo_zero_copy_locked(
                         phys: PhysAddr(initrd_phys_of_page),
                         flags,
                     },
+                    crate::kernel::boot::vm_image_locked::DisplacementContract::Constructing,
                 )?;
                 zc_pages += 1;
                 seg_zc += 1;
@@ -3813,6 +3793,7 @@ pub(crate) fn load_elf_with_mo_zero_copy_locked(
                         phys: PhysAddr(phys),
                         flags: stage_flags,
                     },
+                    crate::kernel::boot::vm_image_locked::DisplacementContract::Constructing,
                 )?;
                 copied_pages += 1;
                 seg_copied += 1;
@@ -3939,6 +3920,7 @@ pub(crate) fn load_elf_with_mo_zero_copy_locked(
                     phys: PhysAddr(phys),
                     flags: final_flags,
                 },
+                crate::kernel::boot::vm_image_locked::DisplacementContract::Constructing,
             )?;
             va += page_size;
         }

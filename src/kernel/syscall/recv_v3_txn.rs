@@ -118,8 +118,16 @@ pub(crate) trait RecvV3Owners {
         page_offset: usize,
     ) -> Option<PhysAddr>;
 
-    /// rank 5 — install one page. `false` is a refusal the caller compensates.
-    fn map_page(&mut self, asid: Asid, virt: VirtAddr, phys: PhysAddr, writable: bool) -> bool;
+    /// rank 5 — install one page. `Refused` changed nothing; `InvalidationIncomplete` installed
+    /// the page but left what it replaced possibly translated elsewhere — both are refusals the
+    /// caller compensates, the second with this page included in what it unmaps.
+    fn map_page(
+        &mut self,
+        asid: Asid,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        writable: bool,
+    ) -> crate::kernel::boot::vm_image_locked::PageInstall;
 
     /// rank 5 → TLB → rank 6 — remove a range this transaction installed.
     fn unmap_range(&mut self, asid: Asid, base: usize, len: usize);
@@ -302,12 +310,24 @@ pub(crate) fn run_recv_v3_transaction<O: RecvV3Owners>(
             let virt = VirtAddr(map_va + page_idx as u64 * PAGE_SIZE as u64);
             // Page 0's resolution applies the range policy to the WHOLE selection, so a
             // selection the backing cannot hold is refused before anything is installed.
-            let installed = owners
-                .region_page_phys(cap_id, region, page_idx * PAGE_SIZE)
-                .is_some_and(|phys| owners.map_page(asid, virt, phys, !read_only));
-            if !installed {
-                // Undo exactly the prefix this transaction installed — no more.
-                let installed = page_idx * PAGE_SIZE;
+            use crate::kernel::boot::vm_image_locked::PageInstall;
+            let outcome = match owners.region_page_phys(cap_id, region, page_idx * PAGE_SIZE) {
+                Some(phys) => owners.map_page(asid, virt, phys, !read_only),
+                None => PageInstall::Refused,
+            };
+            if outcome != PageInstall::Complete {
+                // Undo exactly the prefix this transaction installed — no more. SHARED-REGION-
+                // LIFETIME2: a page whose replaced translation could not be invalidated IS
+                // installed, so it belongs to that prefix; nothing is committed, so the message
+                // stays the sender's.
+                if outcome == PageInstall::InvalidationIncomplete {
+                    crate::yarm_log!(
+                        "SHARED_REGION_MAP_INVALIDATION_INCOMPLETE route=nr30 receiver_tid={} va=0x{:x}",
+                        caller_tid,
+                        virt.0
+                    );
+                }
+                let installed = (page_idx + usize::from(outcome.installed())) * PAGE_SIZE;
                 if installed > 0 {
                     owners.unmap_range(asid, map_va as usize, installed);
                 }

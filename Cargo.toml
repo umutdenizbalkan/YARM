@@ -89,6 +89,10 @@ aarch64-smp2-witness = []
 # to each hart, the bounded IPI / fence / context transaction record, and its synchronous dump.
 # Armed only together with `yarm.ap_user_dispatch=1` on a `-smp 2` boot.
 riscv64-smp3-witness = []
+# SHARED-REGION-LIFETIME2: the RISC-V shared-region replacement witness — a receive installs over a
+# page whose translation is live on the other hart. Reuses the QEMU-SMP3 secondary bring-up and
+# replaces its tasks; armed by `yarm.ap_user_dispatch=1`.
+riscv64-sr-replace-witness = ["riscv64-smp3-witness"]
 # QEMU-LOCK1: real subdomain-lock contention on the production VM address-space lock
 # (`vm_state_lock`, rank 5), driven by the SMP3 two-hart VM/IPI workload (which it co-enables). It
 # instruments the chosen lock's atomic acquire/release, a default-off bounded hold hook that makes a

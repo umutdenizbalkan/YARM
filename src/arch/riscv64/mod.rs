@@ -18,6 +18,12 @@ pub mod sbi;
     target_arch = "riscv64"
 ))]
 pub mod smp3_witness;
+#[cfg(all(
+    feature = "riscv64-sr-replace-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "riscv64"
+))]
+pub mod sr_replace_witness;
 pub mod syscall_abi;
 pub mod timer;
 pub mod trap;

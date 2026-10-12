@@ -245,18 +245,85 @@ pub(crate) fn release_unreferenced_user_frame_locked(
     }
 }
 
-/// Install one page in one address space, with exactly the permissions given.
+/// SHARED-REGION-LIFETIME2 — what a caller of [`map_user_page_in_asid_raw_locked`] proves about
+/// the address space it installs into, and therefore what the installer may do with a page it
+/// would displace.
 ///
-/// The displaced mapping, if any, is retired through its owners before the new one is counted —
-/// the same sequence `map_user_page_in_asid_raw` always performed, now expressed against the two
-/// subsystems instead of against `self`.
+/// Reclaiming a displaced page at once is sound only if no translation of it can survive
+/// anywhere. "No CPU is running this address space now" does not establish that: a CPU that ran
+/// it earlier may still cache its translations. Only an address space that has NEVER been
+/// activated qualifies, and the one thing that guarantees that is construction: the caller made
+/// the space and has bound no thread to it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplacementContract {
+    /// The page must be FRESH. Displacing an existing translation is refused before the page
+    /// table changes, so nothing is reclaimed. Every caller that installs into a space which may
+    /// have run — or that never means to replace a page — states this.
+    Fresh,
+    /// The caller is CONSTRUCTING a space it created and has not yet bound to any thread: no CPU
+    /// has ever activated it, so a displaced page is retired and reclaimed at once. Admitted for
+    /// the ELF image loaders only, whose finalize pass re-installs each page with its final
+    /// permissions; the caller proof is pinned by
+    /// `the_construction_contract_names_only_never_activated_spaces`.
+    Constructing,
+}
+
+/// SHARED-REGION-LIFETIME2 — the outcome of installing one page into a space that may be live.
+///
+/// Three outcomes, because the page table can change without the replacement being complete: the
+/// translation it displaced may still be cached on another CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageInstall {
+    /// Refused before the page table changed.
+    Refused,
+    /// Installed, and whatever it displaced is invalidated everywhere it could be cached; the
+    /// displaced page's hold is settled.
+    Complete,
+    /// Installed — the page table names the new page and its mapping reference is taken — but
+    /// the displaced translation's invalidation did not complete. The displaced page stays held
+    /// (quarantined). This is NOT a successful installation: the caller's settlement must unmap
+    /// the new page along with everything else it installed, and must publish nothing.
+    InvalidationIncomplete,
+}
+
+impl PageInstall {
+    /// The page table names the new page, so a rollback owes it an unmap — whether or not the
+    /// invalidation of what it displaced completed.
+    pub(crate) const fn installed(self) -> bool {
+        !matches!(self, Self::Refused)
+    }
+}
+
+/// Install one page in one address space, with exactly the permissions given, under the stated
+/// [`DisplacementContract`].
+///
+/// Under `Constructing` a displaced mapping is retired through its owners before the new one is
+/// counted — the sequence `map_user_page_in_asid_raw` always performed. Under `Fresh` an existing
+/// translation at `virt` is refused (`InvalidAddress`) with the page table untouched. A space
+/// that may be live and must accept a replacement uses [`map_user_page_holding_displaced_locked`]
+/// and completes the invalidation before it settles.
 pub(crate) fn map_user_page_in_asid_raw_locked(
     vm: &mut AddressSpaceManager,
     memory: &mut MemorySubsystem,
     asid: Asid,
     virt: VirtAddr,
     mapping: Mapping,
+    contract: DisplacementContract,
 ) -> Result<Option<Mapping>, KernelError> {
+    if contract == DisplacementContract::Fresh
+        && vm
+            .get(asid)
+            .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+            .resolve(virt)
+            .is_some()
+    {
+        crate::yarm_log!(
+            "VM_MAP_DISPLACEMENT_REFUSED asid={} va=0x{:x} reason=fresh_contract",
+            asid.0,
+            virt.0
+        );
+        return Err(KernelError::Vm(VmError::InvalidAddress));
+    }
     if cfg!(all(not(feature = "hosted-dev"), feature = "trace_boot_vm")) {
         crate::yarm_log!(
             "MAP_USER_RAW_BEGIN asid={} virt=0x{:x} phys=0x{:x} user={} rwx={}{}{}",
@@ -307,8 +374,8 @@ pub(crate) fn map_user_page_in_asid_raw_locked(
 /// SHARED-REGION-LIFETIME1 — install one page into an address space that may be RESIDENT
 /// elsewhere, holding whatever it displaces.
 ///
-/// [`map_user_page_in_asid_raw_locked`] reclaims a displaced page's object at once, which is only
-/// sound where no other CPU can hold a translation to it — an address space nobody has run yet.
+/// [`map_user_page_in_asid_raw_locked`] reclaims a displaced page's object at once only under the
+/// `Constructing` contract — an address space nobody has run yet — and otherwise refuses.
 /// A receive maps into a live address space, so here the displaced page's mapping reference is
 /// converted into an identity hold ([`crate::kernel::syscall::vm::retire_mapping_to_hold_locked`])
 /// and returned with the displaced mapping: the caller completes the invalidation with no lock
@@ -568,6 +635,7 @@ pub(crate) fn allocate_user_stack_locked(
                 phys,
                 flags: PageFlags::USER_RW,
             },
+            DisplacementContract::Fresh,
         )?;
         #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
         crate::yarm_log!(
@@ -590,6 +658,7 @@ pub(crate) fn allocate_user_stack_locked(
             phys: guard_phys,
             flags: PageFlags::GUARD,
         },
+        DisplacementContract::Fresh,
     )?;
     if cfg!(not(feature = "hosted-dev")) {
         crate::yarm_log!(

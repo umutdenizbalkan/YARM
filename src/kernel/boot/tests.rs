@@ -8264,8 +8264,9 @@ fn cow_fork_exit_cycles_do_not_grow_metadata() {
             let va = VirtAddr(0x50_0000 + (page * PAGE_SIZE) as u64);
             let _ = state.try_handle_cow_fault(parent_asid, va);
             // Re-protect for next clone.
+            // SHARED-REGION-LIFETIME2: a replacement, so the live-space owner.
             state
-                .map_user_page_in_asid_raw(
+                .map_user_page_in_live_asid(
                     parent_asid,
                     va,
                     Mapping {
@@ -8536,8 +8537,10 @@ fn cow_duplicate_mark_is_idempotent() {
                 .map(|m| m.phys)
         })
         .unwrap_or(phys);
+    // SHARED-REGION-LIFETIME2: re-protecting REPLACES the live page, so it goes through the
+    // live-space owner (the general mapper refuses a replacement).
     state
-        .map_user_page_in_asid_raw(
+        .map_user_page_in_live_asid(
             asid,
             VirtAddr(0x5000),
             Mapping {
@@ -67254,16 +67257,17 @@ mod stage193g_remaining_shapes_audit {
     // RecvSharedV3/VM territory, not an IpcSend enqueue slice.
     #[test]
     fn shared_region_recv_is_vm_mapping_coupled() {
-        // BL1: the loop installs each page through the VM owner's raw install with the frame the
+        // BL1: the loop installs each page through the VM owner's install with the frame the
         // offset-aware resolver chose, so it is that call — inside the mapping helper itself —
-        // that proves the receive is VM-coupled.
+        // that proves the receive is VM-coupled. SHARED-REGION-LIFETIME2: that install is the
+        // live-space owner, which holds a replaced page until its invalidation completes.
         let map_body = IPC_SRC
             .split("fn map_shared_region_into_receiver(")
             .nth(1)
             .and_then(|s| s.split("\nfn ").next())
             .unwrap_or("");
         assert!(
-            map_body.contains(".map_user_page_in_asid_raw("),
+            map_body.contains(".map_user_page_in_live_asid("),
             "shared-region recv must still map pages into the receiver ASID via VM"
         );
         assert!(
@@ -71096,7 +71100,7 @@ mod stage198e3b2a_offlock_ctx {
         crate::kernel::boot::shared_region_txn::SharedRegionDirectPublish,
         SharedRegionTxnError,
     > {
-        let mut ctx = SharedRegionOffLockCtx(&fx.shared);
+        let mut ctx = SharedRegionOffLockCtx::new(&fx.shared, crate::kernel::scheduler::CpuId(0));
         run_shared_region_txn(&mut ctx, fx.snap)
     }
     fn active_mappings(fx: &Fx) -> usize {
@@ -71272,9 +71276,9 @@ mod stage198e3b2a_offlock_ctx {
         // Every seam re-derives from data_ptr()/split seams (no cached projected pointer field).
         assert!(
             RT.contains(
-                "pub(crate) struct SharedRegionOffLockCtx<'a>(pub(crate) &'a SharedKernel);"
+                "pub(crate) struct SharedRegionOffLockCtx<'a> {\n    shared: &'a SharedKernel,\n    requester: CpuId,\n}"
             ),
-            "OffLockCtx wraps only &SharedKernel (no cached domain pointer)"
+            "OffLockCtx wraps only &SharedKernel and the requester's CPU (no cached domain pointer)"
         );
         // The unmap seam releases the VM lock (rank 5) BEFORE the memory reclaim (rank 6) — separate
         // `with_*_split_mut` calls, never nested; the map seam applies memory accounting after VM.
@@ -71302,7 +71306,8 @@ mod stage198e3b2a_offlock_ctx {
             "unmap must not nest the memory lock inside the VM lock"
         );
         // Stage 198E3B2B switched the production drain to the OFF-LOCK context: it now runs
-        // `run_shared_region_txn(&mut SharedRegionOffLockCtx(self), ...)` with no broad re-entry.
+        // `run_shared_region_txn(&mut ctx, ...)` with no broad re-entry, its context built for the
+        // CPU the drain serves (SHARED-REGION-LIFETIME2).
         // Bound the drain body between its own definition and the next executor definition.
         let drain = RT
             .split_once("fn execute_blocked_waiter_shared_region_delivery")
@@ -71313,7 +71318,7 @@ mod stage198e3b2a_offlock_ctx {
             })
             .expect("drain present");
         assert!(
-            drain.contains("SharedRegionOffLockCtx(self)")
+            drain.contains("SharedRegionOffLockCtx::new(self, cpu)")
                 && drain.contains("run_shared_region_txn(&mut ctx"),
             "the drain must execute through SharedRegionOffLockCtx"
         );
@@ -181002,9 +181007,13 @@ mod u9xfer2_transaction_cases {
             _virt: VirtAddr,
             _phys: PhysAddr,
             _writable: bool,
-        ) -> bool {
+        ) -> crate::kernel::boot::vm_image_locked::PageInstall {
             self.log.push("map");
-            self.map_ok
+            if self.map_ok {
+                crate::kernel::boot::vm_image_locked::PageInstall::Complete
+            } else {
+                crate::kernel::boot::vm_image_locked::PageInstall::Refused
+            }
         }
         fn unmap_range(&mut self, _asid: Asid, _base: usize, _len: usize) {
             self.log.push("unmap");
@@ -196775,7 +196784,10 @@ mod shared_region_offset1 {
         crate::kernel::boot::shared_region_txn::SharedRegionTxnError,
     > {
         if offlock {
-            let mut ctx = crate::runtime::SharedRegionOffLockCtx(&fx.shared);
+            let mut ctx = crate::runtime::SharedRegionOffLockCtx::new(
+                &fx.shared,
+                crate::kernel::scheduler::CpuId(0),
+            );
             crate::kernel::boot::shared_region_txn::run_shared_region_txn(&mut ctx, fx.snap)
         } else {
             fx.shared.with(|s| s.shared_region_execute(fx.snap))
@@ -197882,7 +197894,7 @@ mod shared_region_lifetime1 {
             (
                 "direct map follow-up",
                 "pub(crate) fn sr_apply_map_followup_split(",
-                "self.complete_unmap_shootdown_split(asid, virt)",
+                "self.complete_unmap_shootdown_from_split(requester, asid, virt)",
             ),
         ] {
             let body = body_of(RUNTIME, sig);
@@ -198002,5 +198014,959 @@ mod shared_region_lifetime1 {
         });
         assert!(b_refs().is_none(), "B's slot goes with its last capability");
         assert_eq!(free(), free0, "and no release ever touched the allocator");
+    }
+}
+
+// ── SHARED-REGION-LIFETIME2: a replacement is complete only when its invalidation is ─────────
+//
+// Every case drives a production owner — the split NR 2 / NR 5 lane, the split NR 30 route, the
+// post-work drain that executes the direct shared-region transaction on the CPU that entered, the
+// broad dispatcher, NR 4 and the capability revocation — and reads back translations, the three
+// object counters, the allocator's own frame state, the transfer registry, the endpoint queue and
+// the receiver's scheduling state.
+//
+// The failure injection is the hosted build's own invalidation owner: with no cross-CPU
+// coordinator, a non-empty remote target set cannot be acknowledged and reports `false`
+// (`complete_unmap_shootdown_from_split`). A remote target exists exactly when another online CPU
+// is running a task bound to the receiver's address space, which each fixture arranges
+// explicitly. Every "incomplete invalidation" below is that HOSTED-ONLY failure, never a live one.
+mod shared_region_lifetime2 {
+    use super::*;
+    use crate::kernel::capabilities::{CapId, CapObject};
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_LEN,
+        SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP, SYSCALL_IPC_RECV_NR,
+        SYSCALL_IPC_RECV_TIMEOUT_NR, SYSCALL_RECV_MAP_INTENT_READ, SYSCALL_TRANSFER_RELEASE_NR,
+        Syscall, SyscallError, dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const PAGE: usize = PAGE_SIZE;
+    const CPU0: CpuId = CpuId(0);
+    const CPU1: CpuId = CpuId(1);
+    const META: usize = 0x1_0000;
+    /// The receive window. A fixture may pre-map some of its pages, so a delivery REPLACES them.
+    const WINDOW: usize = 0x20_0000;
+    /// The task that keeps the receiver's address space resident on another CPU.
+    const OBSERVER: u64 = 3;
+
+    struct Fx {
+        kernel: SharedKernel,
+        send_cap: CapId,
+        recv_cap: CapId,
+        /// The granted object.
+        object_id: u64,
+        base: PhysAddr,
+        source_cap: CapId,
+        asid: Asid,
+        /// The object whose pages the window held before the delivery, and its capability.
+        old_id: u64,
+        old_base: PhysAddr,
+        old_cap: CapId,
+    }
+
+    fn object_phys(s: &KernelState, id: u64) -> PhysAddr {
+        s.with_memory_state(|m| {
+            m.memory_objects
+                .iter()
+                .flatten()
+                .find(|e| e.id == id)
+                .map(|e| e.phys)
+        })
+        .expect("object phys")
+    }
+
+    /// Task 0 (sender and receiver), an endpoint, a `pages`-page granted object named by a
+    /// `DmaRegion` capability over all of it (NR 30 requires one; NR 2 / NR 5 accept it), and a
+    /// second `pages`-page object of which the window pages listed in `displaced` are already
+    /// mapped — so a delivery replaces exactly those pages.
+    fn fixture(pages: usize, displaced: &[usize]) -> Fx {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let fx = kernel.with(|s| {
+            let (asid, _cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(0, asid).expect("bind");
+            let (_, meta_cap) = s.alloc_anonymous_memory_object().expect("meta page");
+            s.map_user_page_in_asid_with_caps(
+                asid,
+                meta_cap,
+                VirtAddr(META as u64),
+                PageFlags::USER_RW,
+            )
+            .expect("meta");
+            let (_eid, send_cap, recv_cap) = s.create_endpoint(4).expect("endpoint");
+            let (object_id, mem_cap) = s
+                .alloc_anonymous_memory_object_with_len(pages * PAGE)
+                .expect("object");
+            let base = object_phys(s, object_id);
+            let source_cap = s
+                .mint_dma_region_cap(mem_cap, 0, pages * PAGE)
+                .expect("dma window");
+            let (old_id, old_cap) = s
+                .alloc_anonymous_memory_object_with_len(pages * PAGE)
+                .expect("old object");
+            let old_base = object_phys(s, old_id);
+            for &i in displaced {
+                s.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr((WINDOW + i * PAGE) as u64),
+                    Mapping {
+                        phys: PhysAddr(old_base.0 + (i * PAGE) as u64),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("pre-map the window");
+            }
+            (
+                send_cap, recv_cap, object_id, base, source_cap, asid, old_id, old_base, old_cap,
+            )
+        });
+        let (send_cap, recv_cap, object_id, base, source_cap, asid, old_id, old_base, old_cap) = fx;
+        Fx {
+            kernel,
+            send_cap,
+            recv_cap,
+            object_id,
+            base,
+            source_cap,
+            asid,
+            old_id,
+            old_base,
+            old_cap,
+        }
+    }
+
+    /// Make the receiver's address space resident on `cpu`: a second task bound to it is that
+    /// CPU's current task, through the scheduler's own enqueue and dispatch.
+    fn resident_on(fx: &Fx, cpu: CpuId) {
+        fx.kernel.with(|s| {
+            if cpu != CPU0 {
+                s.bring_up_cpu(cpu).expect("online");
+            }
+            s.register_task(OBSERVER).expect("observer");
+            s.bind_task_asid(OBSERVER, fx.asid).expect("bind observer");
+            s.enqueue_on_cpu(cpu, OBSERVER).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(OBSERVER));
+        });
+    }
+
+    /// Point the AMBIENT scheduler field at `cpu` — the shared field any broad acquisition may
+    /// write. It names no requester.
+    fn ambient(fx: &Fx, cpu: CpuId) {
+        fx.kernel.with(|s| s.set_current_cpu(cpu).expect("ambient"));
+    }
+
+    fn err_of(r: Result<(), crate::kernel::boot::TrapHandleError>) -> Option<SyscallError> {
+        match r {
+            Ok(()) => None,
+            Err(crate::kernel::boot::TrapHandleError::Syscall(s)) => Some(s),
+            Err(other) => panic!("unexpected error channel: {other:?}"),
+        }
+    }
+
+    /// The real NR 1 shared-region send of `[0, pages * PAGE)`.
+    fn send(fx: &Fx, pages: usize) {
+        let mut f = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                fx.send_cap.0 as usize,
+                0,
+                pages * PAGE,
+                0,
+                0,
+                fx.source_cap.0 as usize,
+            ],
+        );
+        assert_eq!(fx.kernel.with(|s| dispatch(s, &mut f)).err(), None, "send");
+    }
+
+    /// The real NR 2 / NR 5 receive on the split lane, entered on `cpu`.
+    fn recv_queued(
+        fx: &Fx,
+        nr: usize,
+        cpu: CpuId,
+        pages: usize,
+    ) -> (Option<SyscallError>, TrapFrame) {
+        let mut f = TrapFrame::new(nr, [0; 6]);
+        f.set_arg(SYSCALL_ARG_CAP, fx.recv_cap.0 as usize);
+        f.set_arg(SYSCALL_ARG_PTR, WINDOW);
+        f.set_arg(SYSCALL_ARG_LEN, pages * PAGE);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, 0);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_RECV_MAP_INTENT_READ);
+        f.set_arg(SYSCALL_ARG_TRANSFER_CAP, 0);
+        let r = if nr == SYSCALL_IPC_RECV_NR {
+            fx.kernel
+                .try_split_ipc_recv_queued_plain_into_frame(cpu, &mut f)
+                .into_legacy_option()
+        } else {
+            fx.kernel
+                .try_split_ipc_recv_timeout_immediate_into_frame(cpu, &mut f)
+                .into_legacy_option()
+        };
+        (
+            err_of(r.expect("the lane serves a queued shared-region transfer")),
+            f,
+        )
+    }
+
+    /// The real NR 30 request at `META`, asking for a read-only mapping of the whole window,
+    /// through the split route entered on `cpu` (or the broad dispatcher).
+    fn recv_nr30(fx: &Fx, split: Option<CpuId>, pages: usize) -> Option<SyscallError> {
+        use crate::kernel::recv_core::recv_shared_v3::{MAP_READ, V3_LIVE_OUTPUT_LEN};
+        let mut req = [0u8; 80];
+        req[0..4].copy_from_slice(&3u32.to_le_bytes());
+        req[4..8].copy_from_slice(&64u32.to_le_bytes());
+        req[8..16].copy_from_slice(&fx.recv_cap.0.to_le_bytes());
+        req[16..24].copy_from_slice(&(WINDOW as u64).to_le_bytes());
+        req[24..32].copy_from_slice(&((pages * PAGE) as u64).to_le_bytes());
+        req[32..40].copy_from_slice(&((META + 0x200) as u64).to_le_bytes());
+        req[40..48].copy_from_slice(&u64::from(V3_LIVE_OUTPUT_LEN).to_le_bytes());
+        req[48..52].copy_from_slice(&MAP_READ.to_le_bytes());
+        fx.kernel
+            .with(|s| s.write_user_memory_for_asid(fx.asid, META, &req))
+            .expect("request record");
+        // Poison the output record, so "no record written" cannot read as status OK (0).
+        fx.kernel
+            .with(|s| s.write_user_memory_for_asid(fx.asid, META + 0x200, &[0xFF; 8]))
+            .expect("poison the output record");
+        let mut f = TrapFrame::zeroed();
+        f.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        f.set_arg(0, META);
+        f.set_arg(1, 80);
+        match split {
+            Some(cpu) => err_of(
+                crate::kernel::syscall_split::try_split_dispatch_into_frame(
+                    &fx.kernel, cpu, &mut f,
+                )
+                .legacy()
+                .expect("the split NR 30 route serves the receive"),
+            ),
+            None => fx.kernel.with(|s| dispatch(s, &mut f)).err(),
+        }
+    }
+
+    /// NR 30's output record status word (0 = OK).
+    fn nr30_status(fx: &Fx) -> u32 {
+        let out = fx
+            .kernel
+            .with(|s| s.read_user_memory_for_asid(fx.asid, META + 0x200, 8))
+            .expect("output record");
+        u32::from_le_bytes(out[0..4].try_into().unwrap())
+    }
+
+    fn release(fx: &Fx, cap: u64) -> Result<usize, SyscallError> {
+        let mut f = TrapFrame::new(SYSCALL_TRANSFER_RELEASE_NR, [cap as usize, 0, 0, 0, 0, 0]);
+        fx.kernel.with(|s| dispatch(s, &mut f)).map(|()| f.ret0())
+    }
+
+    fn refs(fx: &Fx, id: u64) -> Option<(u32, u32, u32)> {
+        fx.kernel.with(|s| s.memory_object_refcounts_by_id(id))
+    }
+
+    fn tracked(fx: &Fx, phys: PhysAddr) -> bool {
+        fx.kernel.with(|s| {
+            s.with_memory_state(|m| m.frame_allocator.frame_refcount(phys.0).unwrap_or(0) > 0)
+        })
+    }
+
+    fn translation(fx: &Fx, va: usize) -> Option<PhysAddr> {
+        fx.kernel.with(|s| {
+            s.with_user_spaces(|spaces| {
+                spaces
+                    .get(fx.asid)
+                    .and_then(|a| a.resolve(VirtAddr(va as u64)))
+                    .map(|m| m.phys)
+            })
+        })
+    }
+
+    fn registrations(fx: &Fx) -> usize {
+        fx.kernel
+            .with(|s| s.with_ipc_state(|ipc| ipc.active_transfer_mappings.iter().flatten().count()))
+    }
+
+    fn queued(fx: &Fx) -> usize {
+        fx.kernel.with(|s| {
+            s.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().map(|e| e.queued()).sum())
+        })
+    }
+
+    /// Live capabilities naming the granted object, in task 0's cspace.
+    fn caps_on_object(fx: &Fx) -> usize {
+        fx.kernel.with(|s| {
+            s.snapshot_live_capabilities_for_task(0)
+                .expect("caps")
+                .iter()
+                .filter(|(_, c)| {
+                    matches!(c.object,
+                        CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } if id == fx.object_id)
+                })
+                .count()
+        })
+    }
+
+    /// The settlement every incomplete-invalidation failure owes, read back from the owners:
+    ///
+    /// * no translation of the window survives — neither the new backing nor (it is not
+    ///   restored) the old;
+    /// * no receiver-local capability, no registration;
+    /// * the granted object's mapping references are back where they started, and every page this
+    ///   delivery installed is now an identity hold (its own unmap could not be acknowledged
+    ///   either), so nothing of it can be reclaimed;
+    /// * every displaced page is still held, and its frames are still charged.
+    fn assert_quarantined(
+        fx: &Fx,
+        ctx: &str,
+        before: (u32, u32, u32),
+        installed: usize,
+        displaced: &[usize],
+        pages: usize,
+    ) {
+        for i in 0..pages {
+            assert_eq!(
+                translation(fx, WINDOW + i * PAGE),
+                None,
+                "{ctx}: window page {i} unmapped"
+            );
+        }
+        assert_eq!(registrations(fx), 0, "{ctx}: nothing registered");
+        let after = refs(fx, fx.object_id).expect("the granted object is live");
+        assert_eq!(
+            after.1, before.1,
+            "{ctx}: every new mapping reference returned"
+        );
+        assert_eq!(
+            after.2,
+            before.2 + installed as u32,
+            "{ctx}: every installed page held until its own unmap is acknowledged"
+        );
+        let old = refs(fx, fx.old_id).expect("the displaced object is live");
+        assert_eq!(
+            old.2,
+            displaced.len() as u32,
+            "{ctx}: every displaced page held"
+        );
+        for &i in displaced {
+            assert!(
+                tracked(fx, PhysAddr(fx.old_base.0 + (i * PAGE) as u64)),
+                "{ctx}: displaced frame {i} still charged"
+            );
+        }
+    }
+
+    // ── 1. queued NR 2 / NR 5 ─────────────────────────────────────────────────────────────────
+
+    /// **A queued receive whose replacement could not be invalidated is not a successful
+    /// receive**, whether the failure is at the first installed page or at a later one. The
+    /// unrepaired lane reported success with the remote observer's old translation alive.
+    #[test]
+    fn a_queued_receive_with_an_incomplete_invalidation_fails_and_quarantines() {
+        // (displaced pages, pages installed when the failure is seen)
+        for (displaced, installed) in [(&[0usize][..], 1usize), (&[1usize][..], 2usize)] {
+            for nr in [SYSCALL_IPC_RECV_NR, SYSCALL_IPC_RECV_TIMEOUT_NR] {
+                let ctx = alloc::format!("nr={nr} displaced={displaced:?}");
+                let fx = fixture(2, displaced);
+                resident_on(&fx, CPU1);
+                let before = refs(&fx, fx.object_id).expect("live");
+                let caps = caps_on_object(&fx);
+                send(&fx, 2);
+                let (err, f) = recv_queued(&fx, nr, CPU0, 2);
+                assert!(err.is_some(), "{ctx}: not a successful receive");
+                assert_ne!(f.ret1(), 2 * PAGE, "{ctx}: no mapping length published");
+                assert_eq!(
+                    caps_on_object(&fx),
+                    caps,
+                    "{ctx}: no receiver-local capability"
+                );
+                assert_quarantined(&fx, &ctx, before, installed, displaced, 2);
+            }
+        }
+    }
+
+    // ── 2. NR 30 ──────────────────────────────────────────────────────────────────────────────
+
+    /// **NR 30 does not commit a delivery whose replacement could not be invalidated.** The
+    /// message is still the sender's (NR 30 maps before it commits), no output record reports
+    /// success, and the installed pages are unmapped and held.
+    #[test]
+    fn an_nr30_receive_with_an_incomplete_invalidation_commits_nothing() {
+        for (displaced, installed) in [(&[0usize][..], 1usize), (&[1usize][..], 2usize)] {
+            let ctx = alloc::format!("nr30 displaced={displaced:?}");
+            let fx = fixture(2, displaced);
+            resident_on(&fx, CPU1);
+            let before = refs(&fx, fx.object_id).expect("live");
+            let caps = caps_on_object(&fx);
+            send(&fx, 2);
+            let err = recv_nr30(&fx, Some(CPU0), 2);
+            assert!(err.is_some(), "{ctx}: not a delivery");
+            assert_eq!(queued(&fx), 1, "{ctx}: the message is still queued");
+            assert_ne!(nr30_status(&fx), 0, "{ctx}: no OK output record");
+            assert_eq!(
+                caps_on_object(&fx),
+                caps,
+                "{ctx}: the minted capability was undone"
+            );
+            // The peek-time mint consumed the envelope and the refusal revoked the mint, exactly
+            // as for any other NR 30 map refusal; what is left pinned is the holds alone.
+            let envelopes = fx
+                .kernel
+                .with(|s| s.with_ipc_state(|ipc| ipc.transfer_envelopes.iter().flatten().count()));
+            assert_eq!(
+                envelopes, 0,
+                "{ctx}: the envelope was settled by the refused mint"
+            );
+            assert_quarantined(&fx, &ctx, before, installed, displaced, 2);
+        }
+    }
+
+    // ── 3. the direct transaction, through the post-work drain ───────────────────────────────
+
+    const RECEIVER: u64 = 2;
+
+    struct Direct {
+        fx: Fx,
+        snap: crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    }
+
+    /// The direct delivery's own fixture: receiver task 2 owns the address space (task 0 sends),
+    /// is blocked in a receive, and its window pages in `displaced` are already mapped. The
+    /// Phase-A snapshot is taken through the production producer step.
+    fn direct_fixture(pages: usize, displaced: &[usize]) -> Direct {
+        use crate::kernel::syscall::OPCODE_SHARED_MEM;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (fx, snap) = kernel.with(|s| {
+            s.register_task(RECEIVER).expect("receiver");
+            let (asid, _cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(RECEIVER, asid).expect("bind");
+            let (_, meta_cap) = s.alloc_anonymous_memory_object().expect("meta page");
+            s.map_user_page_in_asid_with_caps(
+                asid,
+                meta_cap,
+                VirtAddr(META as u64),
+                PageFlags::USER_RW,
+            )
+            .expect("meta");
+            let (_eidx, send_cap, recv_cap) = s.create_endpoint(4).expect("endpoint");
+            let endpoint = s.current_task_capability(send_cap).expect("send").object;
+            let (object_id, mem_cap) = s
+                .alloc_anonymous_memory_object_with_len(pages * PAGE)
+                .expect("object");
+            let base = object_phys(s, object_id);
+            let (old_id, old_cap) = s
+                .alloc_anonymous_memory_object_with_len(pages * PAGE)
+                .expect("old object");
+            let old_base = object_phys(s, old_id);
+            for &i in displaced {
+                s.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr((WINDOW + i * PAGE) as u64),
+                    Mapping {
+                        phys: PhysAddr(old_base.0 + (i * PAGE) as u64),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("pre-map the window");
+            }
+            let region = TransferSharedRegion {
+                offset: 0,
+                len: (pages * PAGE) as u64,
+            };
+            let handle = s
+                .stash_transfer_envelope(
+                    ThreadId(0),
+                    mem_cap,
+                    endpoint,
+                    Some(ThreadId(RECEIVER)),
+                    Some(region),
+                )
+                .expect("stash");
+            let msg = Message::with_header(
+                0,
+                OPCODE_SHARED_MEM,
+                Message::FLAG_CAP_TRANSFER,
+                Some(handle),
+                b"sr",
+            )
+            .expect("msg");
+            let snap = s
+                .shared_region_phase_a(
+                    handle,
+                    endpoint,
+                    RECEIVER,
+                    WINDOW as u64,
+                    false,
+                    META as u64,
+                    msg,
+                    true,
+                    crate::kernel::task::RecvAbiVariant::RecvV2,
+                )
+                .expect("phase A");
+            s.set_task_status_for_test(
+                RECEIVER,
+                crate::kernel::task::TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(recv_cap),
+                ),
+            );
+            (
+                (
+                    send_cap, recv_cap, object_id, base, mem_cap, asid, old_id, old_base, old_cap,
+                ),
+                snap,
+            )
+        });
+        let (send_cap, recv_cap, object_id, base, source_cap, asid, old_id, old_base, old_cap) = fx;
+        Direct {
+            fx: Fx {
+                kernel,
+                send_cap,
+                recv_cap,
+                object_id,
+                base,
+                source_cap,
+                asid,
+                old_id,
+                old_base,
+                old_cap,
+            },
+            snap,
+        }
+    }
+
+    /// Run the direct transaction exactly as production does: stash the post-work on the CPU
+    /// that executes it and let that CPU's drain run it.
+    fn drain_direct(d: &Direct, cpu: CpuId) -> bool {
+        use crate::kernel::dispatch_post_work::{
+            BlockedWaiterSharedRegionDeliverySnapshot, DispatchPostWork,
+        };
+        unsafe {
+            crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu.0 as usize].store(
+                DispatchPostWork::BlockedWaiterSharedRegionDelivery(
+                    BlockedWaiterSharedRegionDeliverySnapshot {
+                        snapshot: d.snap,
+                        endpoint_idx: 0,
+                    },
+                ),
+            );
+        }
+        d.fx.kernel.drain_dispatch_post_work(cpu, None).is_ok()
+    }
+
+    fn receiver_blocked(d: &Direct) -> bool {
+        d.fx.kernel.with(|s| {
+            matches!(
+                s.task_status(RECEIVER),
+                Some(crate::kernel::task::TaskStatus::Blocked(_))
+            )
+        })
+    }
+
+    fn receiver_caps(d: &Direct) -> usize {
+        d.fx.kernel.with(|s| {
+            s.snapshot_live_capabilities_for_task(RECEIVER)
+                .map(|v| v.len())
+                .unwrap_or(0)
+        })
+    }
+
+    /// **A direct delivery whose replacement could not be invalidated publishes nothing and
+    /// wakes no one**, at the first page and at a later page. The unrepaired follow-up dropped
+    /// the invalidation verdict, so the transaction published and woke the receiver.
+    #[test]
+    fn a_direct_delivery_with_an_incomplete_invalidation_publishes_nothing() {
+        for (displaced, installed) in [(&[0usize][..], 1usize), (&[1usize][..], 2usize)] {
+            let ctx = alloc::format!("direct displaced={displaced:?}");
+            let d = direct_fixture(2, displaced);
+            resident_on(&d.fx, CPU1);
+            let caps_before = receiver_caps(&d);
+            // The snapshot owns the transferred pin; the delivery's own holds come on top.
+            let before = refs(&d.fx, d.fx.object_id).expect("live");
+            let ok = drain_direct(&d, CPU0);
+            assert!(!ok, "{ctx}: the delivery failed");
+            assert!(receiver_blocked(&d), "{ctx}: the receiver was not woken");
+            assert_eq!(
+                receiver_caps(&d),
+                caps_before,
+                "{ctx}: no receiver capability"
+            );
+            assert_quarantined(
+                &d.fx,
+                &ctx,
+                (before.0, before.1, before.2 - 1),
+                installed,
+                displaced,
+                2,
+            );
+        }
+    }
+
+    // ── 4. the requester is the CPU that executes the transaction ─────────────────────────────
+
+    /// **The direct follow-up excludes the CPU that executes it — not whatever the ambient field
+    /// names.** The requester is CPU 0, the ambient field says CPU 1, and the receiver's address
+    /// space is resident on CPU 1: CPU 1 is a remote target and must be included, so the
+    /// (hosted, unacknowledgeable) invalidation is incomplete and nothing is published. The
+    /// unrepaired follow-up read the ambient field, excluded CPU 1, and published with CPU 1's
+    /// old translation alive.
+    #[test]
+    fn the_requester_not_the_ambient_field_is_excluded_from_the_remote_targets() {
+        let d = direct_fixture(1, &[0]);
+        resident_on(&d.fx, CPU1);
+        ambient(&d.fx, CPU1);
+        assert!(
+            !drain_direct(&d, CPU0),
+            "CPU 1 is a remote target: incomplete"
+        );
+        assert!(receiver_blocked(&d), "not woken");
+        assert_eq!(
+            refs(&d.fx, d.fx.old_id).map(|r| r.2),
+            Some(1),
+            "displaced page held"
+        );
+    }
+
+    /// **The reverse:** the requester is CPU 1, where the receiver's address space is resident,
+    /// and the ambient field says CPU 0. The only resident CPU is the requester itself, whose
+    /// local invalidation is the whole shootdown, so the replacement completes and the displaced
+    /// page's hold is settled. The unrepaired follow-up excluded CPU 0 instead, targeted the
+    /// requester itself, and left the displaced backing held for an acknowledgement it can never
+    /// give itself.
+    #[test]
+    fn the_requester_holding_the_space_is_never_its_own_remote_target() {
+        let d = direct_fixture(1, &[0]);
+        resident_on(&d.fx, CPU1);
+        ambient(&d.fx, CPU0);
+        assert!(drain_direct(&d, CPU1), "published");
+        assert!(!receiver_blocked(&d), "woken once");
+        assert_eq!(
+            refs(&d.fx, d.fx.old_id).map(|r| (r.1, r.2)),
+            Some((0, 0)),
+            "the displaced page's hold settled"
+        );
+        assert_eq!(
+            translation(&d.fx, WINDOW),
+            Some(d.fx.base),
+            "the window now names the granted page"
+        );
+    }
+
+    /// **The legitimate local-only case:** nothing else runs the receiver's address space, so the
+    /// local invalidation is complete whichever CPU the ambient field names.
+    #[test]
+    fn a_local_only_replacement_completes_and_settles() {
+        for amb in [CPU0, CPU1] {
+            let d = direct_fixture(1, &[0]);
+            d.fx.kernel.with(|s| s.bring_up_cpu(CPU1).expect("online"));
+            ambient(&d.fx, amb);
+            assert!(drain_direct(&d, CPU0), "ambient={amb:?}: published");
+            assert!(!receiver_blocked(&d), "ambient={amb:?}: woken");
+            assert_eq!(
+                refs(&d.fx, d.fx.old_id).map(|r| (r.1, r.2)),
+                Some((0, 0)),
+                "ambient={amb:?}: settled"
+            );
+        }
+    }
+
+    // ── 5. competing release, success and cleanup ─────────────────────────────────────────────
+
+    /// **A competing final release cannot free backing a stale translation may still reach.**
+    /// After the failed receive, the displaced object's last capability is released through the
+    /// production revocation: its hold keeps it, and every frame stays charged. The same holds
+    /// for the granted object once the sender releases ITS capability.
+    #[test]
+    fn a_competing_final_release_cannot_free_quarantined_backing() {
+        let fx = fixture(2, &[0, 1]);
+        resident_on(&fx, CPU1);
+        send(&fx, 2);
+        let (err, _f) = recv_queued(&fx, SYSCALL_IPC_RECV_NR, CPU0, 2);
+        assert!(err.is_some());
+        let cnode = fx.kernel.with(|s| s.task_cnode(0)).expect("cnode");
+        fx.kernel.with(|s| {
+            s.revoke_capability_in_cnode(cnode, fx.old_cap)
+                .expect("release old");
+            s.revoke_capability_in_cnode(cnode, fx.source_cap)
+                .expect("release window");
+        });
+        // The failure was seen at page 0, so window page 1 still names the old object's page 1;
+        // page 0's displaced translation is the hold.
+        assert_eq!(
+            refs(&fx, fx.old_id),
+            Some((0, 1, 1)),
+            "held and still mapped once, not reclaimed"
+        );
+        assert_eq!(
+            translation(&fx, WINDOW + PAGE),
+            Some(PhysAddr(fx.old_base.0 + PAGE as u64)),
+            "the page the delivery never reached is untouched"
+        );
+        // The granted object: its source capabilities are gone, its installed page 0 is held.
+        assert_eq!(refs(&fx, fx.object_id).map(|r| (r.1, r.2)), Some((0, 1)));
+        for i in 0..2 {
+            assert!(tracked(&fx, PhysAddr(fx.old_base.0 + (i * PAGE) as u64)));
+            assert!(tracked(&fx, PhysAddr(fx.base.0 + (i * PAGE) as u64)));
+        }
+    }
+
+    /// **A completed replacement is an ordinary delivery, and its cleanup returns exactly what it
+    /// took** — on the queued lane, NR 30 and the direct transaction: the displaced pages' holds
+    /// settle (the old object, its capability released first, is reclaimed by that settlement
+    /// and only by it), the window names the granted pages, and NR 4 returns the granted object
+    /// to its starting counts.
+    #[test]
+    fn a_completed_replacement_settles_once_and_cleans_up_exactly() {
+        for route in ["nr2", "nr30"] {
+            let fx = fixture(2, &[0, 1]);
+            let cnode = fx.kernel.with(|s| s.task_cnode(0)).expect("cnode");
+            fx.kernel
+                .with(|s| s.revoke_capability_in_cnode(cnode, fx.old_cap))
+                .expect("the old object now lives by its mappings only");
+            let before = refs(&fx, fx.object_id).expect("live");
+            send(&fx, 2);
+            let cap = if route == "nr2" {
+                let (err, f) = recv_queued(&fx, SYSCALL_IPC_RECV_NR, CPU0, 2);
+                assert_eq!(err, None, "{route}");
+                f.ret2() as u64
+            } else {
+                assert_eq!(recv_nr30(&fx, Some(CPU0), 2), None, "{route}");
+                let out = fx
+                    .kernel
+                    .with(|s| s.read_user_memory_for_asid(fx.asid, META + 0x200, 120))
+                    .expect("out");
+                u64::from_le_bytes(out[112..120].try_into().unwrap())
+            };
+            assert_eq!(
+                refs(&fx, fx.old_id),
+                None,
+                "{route}: settled and reclaimed once"
+            );
+            for i in 0..2 {
+                assert_eq!(
+                    translation(&fx, WINDOW + i * PAGE),
+                    Some(PhysAddr(fx.base.0 + (i * PAGE) as u64)),
+                    "{route}: page {i}"
+                );
+            }
+            assert_eq!(release(&fx, cap), Ok(2 * PAGE), "{route}: released");
+            assert_eq!(
+                refs(&fx, fx.object_id),
+                Some(before),
+                "{route}: exactly returned"
+            );
+            assert_eq!(registrations(&fx), 0, "{route}");
+        }
+        let d = direct_fixture(2, &[0, 1]);
+        let cnode = d.fx.kernel.with(|s| s.task_cnode(0)).expect("cnode");
+        d.fx.kernel
+            .with(|s| s.revoke_capability_in_cnode(cnode, d.fx.old_cap))
+            .expect("old by its mappings only");
+        assert!(drain_direct(&d, CPU0), "direct: published");
+        assert_eq!(
+            refs(&d.fx, d.fx.old_id),
+            None,
+            "direct: settled and reclaimed once"
+        );
+        let pinned = refs(&d.fx, d.fx.object_id).expect("live").2;
+        assert_eq!(
+            pinned, 0,
+            "direct: the transferred pin released, no hold left"
+        );
+    }
+
+    // ── 7. source contracts: the requester and the construction proof ─────────────────────────
+
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let rest = src
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("missing `{signature}`"))
+            .1;
+        rest.split_once("\n    }\n").map_or(rest, |(b, _)| b)
+    }
+
+    /// **The direct transaction states the CPU executing it, end to end.** The drain builds the
+    /// context for the CPU whose trap it serves; the context's mapping follow-up and its rollback
+    /// unmap hand that CPU to the requester-explicit invalidation owner; neither reaches an
+    /// ambient-requester helper.
+    #[test]
+    fn the_direct_transaction_states_its_requester() {
+        const RT: &str = include_str!("../../runtime.rs");
+        let drain = body_of(RT, "fn execute_blocked_waiter_shared_region_delivery(");
+        assert!(drain.contains("SharedRegionOffLockCtx::new(self, cpu)"));
+        let ctx = RT
+            .split_once(
+                "impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegionOffLockCtx<'_> {",
+            )
+            .map(|(_, r)| r.split_once("\n}\n").map_or(r, |(b, _)| b))
+            .expect("the context impl");
+        assert!(ctx.contains(".sr_apply_map_followup_split(self.requester, asid, virt, follow)"));
+        assert!(ctx.contains(".unmap_range_two_phase_from_split(self.requester, asid, base, len)"));
+        for ambient in [
+            "unmap_range_two_phase_split(",
+            "complete_unmap_shootdown_split(",
+            "current_cpu",
+        ] {
+            assert!(
+                !ctx.contains(ambient),
+                "the context never reaches `{ambient}`"
+            );
+        }
+        let follow = body_of(RT, "pub(crate) fn sr_apply_map_followup_split(");
+        assert!(follow.contains("self.complete_unmap_shootdown_from_split(requester, asid, virt)"));
+        assert!(!follow.contains("complete_unmap_shootdown_split("));
+    }
+
+    /// **Only the image loaders claim the construction contract, and every route into them
+    /// constructs a space no CPU has ever activated.** The immediate reclaim of a displaced page
+    /// is sound only there: each loader is reached with an address space its caller created and
+    /// has not bound to any thread — the spawn provisioner (which creates the space, loads, and
+    /// publishes only at the commit) and the boot builders (create, load, then bind, in that
+    /// order, on all three ports).
+    #[test]
+    fn the_construction_contract_names_only_never_activated_spaces() {
+        const EXEC: &str = include_str!("exec_state.rs");
+        const PROV: &str = include_str!("spawn_image_provision.rs");
+        const SOURCES: [(&str, &str); 10] = [
+            ("cow_clone", include_str!("cow_clone.rs")),
+            ("vm_image_locked", include_str!("vm_image_locked.rs")),
+            ("memory_state", include_str!("memory_state.rs")),
+            (
+                "spawn_image_provision",
+                include_str!("spawn_image_provision.rs"),
+            ),
+            ("mod", include_str!("mod.rs")),
+            ("orchestrator_state", include_str!("orchestrator_state.rs")),
+            ("fault_state", include_str!("fault_state.rs")),
+            ("runtime", include_str!("../../runtime.rs")),
+            ("ipc", include_str!("../syscall/ipc.rs")),
+            (
+                "recv_shared_v3",
+                include_str!("../syscall/recv_shared_v3.rs"),
+            ),
+        ];
+        const CLAIM: &str = "DisplacementContract::Constructing";
+        for (name, src) in SOURCES {
+            assert_eq!(
+                src.split("#[cfg(test)]")
+                    .next()
+                    .unwrap_or(src)
+                    .matches(CLAIM)
+                    .count(),
+                0,
+                "{name} claims the construction contract"
+            );
+        }
+        let production = EXEC
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production half");
+        assert_eq!(
+            production.matches(CLAIM).count(),
+            5,
+            "the loaders' five installs"
+        );
+        for loader in [
+            "pub(crate) fn load_elf_pt_load_segments_locked(",
+            "pub(crate) fn load_elf_with_mo_zero_copy_locked(",
+        ] {
+            let at = production.find(loader).expect("loader");
+            let next = production[at + loader.len()..]
+                .find("\npub")
+                .map_or(production.len(), |n| at + loader.len() + n);
+            assert!(
+                production[at..next].contains(CLAIM),
+                "{loader} is a construction site"
+            );
+        }
+        // Every route into the loaders.
+        assert_eq!(
+            production
+                .matches("load_elf_with_mo_zero_copy_locked(")
+                .count(),
+            1
+        );
+        assert!(
+            !production.contains("pub fn load_elf_with_mo_zero_copy("),
+            "the unused broad entry is gone"
+        );
+        // The provisioner creates the space before it loads, and nothing binds it here.
+        let provision = PROV
+            .split_once("pub(crate) fn provision_image_locked(")
+            .and_then(|(_, r)| r.split_once("\n}\n"))
+            .map(|(b, _)| b)
+            .expect("the provisioner");
+        let created = provision
+            .find("create_address_space_locked(vm)")
+            .expect("create");
+        let loaded = provision
+            .find("load_elf_pt_load_segments_locked(")
+            .expect("load");
+        assert!(created < loaded);
+        assert!(
+            !provision.contains(".asid = Some("),
+            "the provisioner binds no thread"
+        );
+        // The boot builders: create, load, bind — on every port.
+        for (port, boot) in [
+            ("x86_64", include_str!("../../arch/x86_64/boot.rs")),
+            ("aarch64", include_str!("../../arch/aarch64/boot.rs")),
+            ("riscv64", include_str!("../../arch/riscv64/boot.rs")),
+        ] {
+            for who in ["init", "sup", "pm"] {
+                let create = boot
+                    .find(&alloc::format!(
+                        "let ({who}_asid, _) = kernel.create_user_address_space()"
+                    ))
+                    .unwrap_or_else(|| panic!("{port}: {who} created"));
+                let load = boot
+                    .find(&alloc::format!("load_elf_pt_load_segments({who}_asid,"))
+                    .unwrap_or_else(|| panic!("{port}: {who} loaded"));
+                let bind = boot
+                    .find(&alloc::format!("asid: Some({who}_asid)"))
+                    .unwrap_or_else(|| panic!("{port}: {who} bound"));
+                assert!(
+                    create < load && load < bind,
+                    "{port}: {who} is loaded before it is bound"
+                );
+            }
+        }
+    }
+
+    // ── 6. the legacy mapper's boundary ───────────────────────────────────────────────────────
+
+    /// **The general mapper refuses to replace a page instead of silently reclaiming it.** The
+    /// receiver's address space is resident on CPU 1 and the page's object lives by that mapping
+    /// alone: the unrepaired mapper replaced it and reclaimed the object at once, with CPU 1's
+    /// translation of it never invalidated.
+    #[test]
+    fn the_general_mapper_never_reclaims_a_displaced_page() {
+        let fx = fixture(1, &[0]);
+        resident_on(&fx, CPU1);
+        let cnode = fx.kernel.with(|s| s.task_cnode(0)).expect("cnode");
+        fx.kernel
+            .with(|s| s.revoke_capability_in_cnode(cnode, fx.old_cap))
+            .expect("old by its mapping only");
+        let replaced = fx.kernel.with(|s| {
+            s.map_user_page_in_asid_raw(
+                fx.asid,
+                VirtAddr(WINDOW as u64),
+                Mapping {
+                    phys: fx.base,
+                    flags: PageFlags::USER_RW,
+                },
+            )
+        });
+        assert_eq!(
+            translation(&fx, WINDOW),
+            Some(fx.old_base),
+            "the page table is unchanged"
+        );
+        assert_eq!(
+            refs(&fx, fx.old_id).map(|r| r.1),
+            Some(1),
+            "its reference intact"
+        );
+        assert!(tracked(&fx, fx.old_base), "and its frame charged");
+        assert!(replaced.is_err(), "refused");
     }
 }

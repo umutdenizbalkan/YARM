@@ -483,15 +483,31 @@ impl crate::runtime::SharedKernel {
                     },
                 },
             );
-            if !installed {
+            if installed != crate::kernel::boot::vm_image_locked::PageInstall::Complete {
                 // Two-phase rollback of the pages already installed by THIS loop, requester-
                 // stating so the shootdown excludes the CPU this trap entered on.
-                if va > requested_va {
+                //
+                // SHARED-REGION-LIFETIME2: a page whose replaced translation could not be
+                // invalidated IS installed and counted, so the rollback owns it too. The replaced
+                // page stays held by the install; each page this unmap removes is held until its
+                // own invalidation is acknowledged. The receive fails with the loop's existing
+                // map-failure error: it is not a successful receive.
+                let end = if installed.installed() {
+                    crate::yarm_log!(
+                        "SHARED_REGION_MAP_INVALIDATION_INCOMPLETE route=queued receiver_tid={} va=0x{:x}",
+                        receiver_tid,
+                        va
+                    );
+                    va + PAGE_SIZE
+                } else {
+                    va
+                };
+                if end > requested_va {
                     let _ = self.unmap_range_two_phase_from_split(
                         cpu,
                         asid,
                         requested_va,
-                        va - requested_va,
+                        end - requested_va,
                     );
                 }
                 return Err(SyscallError::from(

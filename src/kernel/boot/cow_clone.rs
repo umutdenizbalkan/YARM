@@ -329,6 +329,7 @@ pub(crate) fn clone_address_space_cow_locked(
                     phys: pp,
                     flags: shared_flags,
                 },
+                super::vm_image_locked::DisplacementContract::Fresh,
             ) {
                 // Record the partial run BEFORE unwinding: the pages that did go in took
                 // refcounts, and the unwind reads this list to give them back.

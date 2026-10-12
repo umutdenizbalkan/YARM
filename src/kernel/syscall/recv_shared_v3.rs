@@ -474,10 +474,13 @@ impl crate::kernel::syscall::recv_v3_txn::RecvV3Owners for BroadRecvV3Owners<'_>
         virt: crate::kernel::vm::VirtAddr,
         phys: crate::kernel::vm::PhysAddr,
         writable: bool,
-    ) -> bool {
+    ) -> crate::kernel::boot::vm_image_locked::PageInstall {
         use crate::kernel::vm::{CachePolicy, Mapping, PageFlags};
+        // SHARED-REGION-LIFETIME2: the broad reference adapter keeps the split adapter's lifetime
+        // policy — a replaced page is held until its invalidation completes, and the verdict is
+        // typed rather than folded into "mapped".
         self.kernel
-            .map_user_page_in_asid_raw(
+            .map_user_page_in_live_asid(
                 asid,
                 virt,
                 Mapping {
@@ -491,7 +494,10 @@ impl crate::kernel::syscall::recv_v3_txn::RecvV3Owners for BroadRecvV3Owners<'_>
                     },
                 },
             )
-            .is_ok()
+            .map_or(
+                crate::kernel::boot::vm_image_locked::PageInstall::Refused,
+                |(o, _)| o,
+            )
     }
 
     fn unmap_range(&mut self, asid: crate::kernel::vm::Asid, base: usize, len: usize) {

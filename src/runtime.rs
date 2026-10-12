@@ -10052,27 +10052,46 @@ impl SharedKernel {
     /// an identity hold ([`crate::kernel::boot::vm_image_locked::map_user_page_holding_displaced_locked`]);
     /// with no lock held, the requester-stating shootdown then retires every remote translation,
     /// and only an acknowledged shootdown settles the hold.
+    ///
+    /// SHARED-REGION-LIFETIME2: the outcome is typed, because the page table changes BEFORE the
+    /// invalidation is known. `InvalidationIncomplete` means the new page IS installed (and
+    /// counted) while a remote CPU may still use the translation it replaced: the caller must
+    /// settle it as a failure that unmaps this page too, never as a successful install.
     pub(crate) fn map_user_page_raw_split(
         &self,
         requester: CpuId,
         asid: crate::kernel::vm::Asid,
         virt: crate::kernel::vm::VirtAddr,
         mapping: crate::kernel::vm::Mapping,
-    ) -> bool {
+    ) -> crate::kernel::boot::vm_image_locked::PageInstall {
+        use crate::kernel::boot::vm_image_locked::PageInstall;
         let installed = self.with_vm_then_memory_split_mut(|vm, memory| {
             crate::kernel::boot::vm_image_locked::map_user_page_holding_displaced_locked(
                 vm, memory, asid, virt, mapping,
             )
         });
         match installed {
-            Ok(displaced) => {
-                if let Some((old, hold)) = displaced {
-                    let acked = self.complete_unmap_shootdown_from_split(requester, asid, virt);
-                    self.settle_displaced_after_invalidation_split(hold, old.phys, acked);
+            Ok(None) => PageInstall::Complete,
+            Ok(Some((old, hold))) => {
+                let acked = self.complete_unmap_shootdown_from_split(requester, asid, virt);
+                // SHARED-REGION-LIFETIME2 witness (observation only): the install's outcome.
+                #[cfg(all(
+                    feature = "riscv64-sr-replace-witness",
+                    target_arch = "riscv64",
+                    not(test),
+                    not(feature = "hosted-dev")
+                ))]
+                crate::arch::riscv64::sr_replace_witness::note_install(
+                    requester, asid.0, virt.0, old.phys.0, hold, acked,
+                );
+                self.settle_displaced_after_invalidation_split(hold, old.phys, acked);
+                if acked {
+                    PageInstall::Complete
+                } else {
+                    PageInstall::InvalidationIncomplete
                 }
-                true
             }
-            Err(_) => false,
+            Err(_) => PageInstall::Refused,
         }
     }
 
@@ -10090,9 +10109,17 @@ impl SharedKernel {
             return;
         };
         if acknowledged {
-            self.with_memory_split_mut(|memory| {
+            let _reclaimed = self.with_memory_split_mut(|memory| {
                 crate::kernel::syscall::vm::settle_displaced_hold_locked(memory, object_id, phys)
             });
+            // SHARED-REGION-LIFETIME2 witness (observation only): the settlement's own result.
+            #[cfg(all(
+                feature = "riscv64-sr-replace-witness",
+                target_arch = "riscv64",
+                not(test),
+                not(feature = "hosted-dev")
+            ))]
+            crate::arch::riscv64::sr_replace_witness::note_settle(object_id, phys.0, _reclaimed);
         } else {
             crate::yarm_log!(
                 "VM_DISPLACED_HOLD_RETAINED object={} phys=0x{:x} reason=invalidation_incomplete",
@@ -12025,7 +12052,7 @@ impl SharedKernel {
         // no broad-borrow re-entry and no whole-KernelState borrow. The finalize step inside the
         // runner clears the blocked-return state + the exact endpoint waiter slot and then enqueues
         // the receiver exactly once; the user copy + any TLB completion run with no lock held.
-        let mut ctx = SharedRegionOffLockCtx(self);
+        let mut ctx = SharedRegionOffLockCtx::new(self, cpu);
         let result =
             crate::kernel::boot::shared_region_txn::run_shared_region_txn(&mut ctx, snap.snapshot);
         match result {
@@ -15016,12 +15043,18 @@ impl SharedKernel {
     /// shared-region page has no replaced mapping. SHARED-REGION-LIFETIME1: a replaced page's
     /// reference becomes an identity hold here (memory rank 6 only — never under the VM lock), the
     /// shootdown then runs with no lock held, and only an acknowledged one settles the hold.
+    ///
+    /// SHARED-REGION-LIFETIME2: `requester` is the CPU executing the transaction, stated by the
+    /// caller — the one CPU the shootdown may exclude — and the verdict is returned: the page is
+    /// installed either way, but only `Complete` is a successful installation.
     pub(crate) fn sr_apply_map_followup_split(
         &self,
+        requester: CpuId,
         asid: crate::kernel::vm::Asid,
         virt: crate::kernel::vm::VirtAddr,
         follow: SharedRegionMapFollowup,
-    ) {
+    ) -> crate::kernel::boot::vm_image_locked::PageInstall {
+        use crate::kernel::boot::vm_image_locked::PageInstall;
         let displaced = self.with_memory_split_mut(|m| {
             let displaced = follow.replaced.map(|old| {
                 (
@@ -15032,9 +15065,15 @@ impl SharedKernel {
             KernelState::note_mapping_inserted_locked(m, follow.inserted_phys);
             displaced
         });
-        if let Some((phys, hold)) = displaced {
-            let acked = self.complete_unmap_shootdown_split(asid, virt);
-            self.settle_displaced_after_invalidation_split(hold, phys, acked);
+        let Some((phys, hold)) = displaced else {
+            return PageInstall::Complete;
+        };
+        let acked = self.complete_unmap_shootdown_from_split(requester, asid, virt);
+        self.settle_displaced_after_invalidation_split(hold, phys, acked);
+        if acked {
+            PageInstall::Complete
+        } else {
+            PageInstall::InvalidationIncomplete
         }
     }
 
@@ -18586,34 +18625,51 @@ pub(crate) enum TransferStashRefusal {
 /// seams — it holds no broad borrow: no `with(...)`, no `with_cpu(...)`, no `&mut KernelState`, and
 /// no cached projected pointer (each seam re-derives from `data_ptr()` per call). Not yet used by
 /// the production post-work drain; tests drive it via `run_shared_region_txn(&mut ctx, snapshot)`.
-pub(crate) struct SharedRegionOffLockCtx<'a>(pub(crate) &'a SharedKernel);
+///
+/// SHARED-REGION-LIFETIME2: the context carries the CPU executing the transaction. Its mapping
+/// follow-up and its rollback unmap state that requester to the invalidation owner, which excludes
+/// exactly that CPU from the remote targets — never whichever CPU last wrote the ambient
+/// `sched.current_cpu` field.
+pub(crate) struct SharedRegionOffLockCtx<'a> {
+    shared: &'a SharedKernel,
+    requester: CpuId,
+}
+
+impl<'a> SharedRegionOffLockCtx<'a> {
+    /// The context for the transaction `requester` is executing. The drain constructs it with the
+    /// CPU whose trap it is serving.
+    pub(crate) fn new(shared: &'a SharedKernel, requester: CpuId) -> Self {
+        Self { shared, requester }
+    }
+}
 
 impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegionOffLockCtx<'_> {
     fn ctx_receiver_alive(
         &self,
         snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
     ) -> bool {
-        self.0
+        self.shared
             .sr_receiver_alive_split(snap.receiver_tid, snap.receiver_asid)
     }
     fn ctx_object_live(&self, object: CapObject) -> bool {
-        self.0.sr_object_live_split(object)
+        self.shared.sr_object_live_split(object)
     }
     fn ctx_cancel_overflowed(&self) -> bool {
-        self.0.sr_cancel_overflowed_split()
+        self.shared.sr_cancel_overflowed_split()
     }
     fn ctx_consume_cancel(&mut self, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
-        self.0.sr_consume_cancel_split(tid, asid)
+        self.shared.sr_consume_cancel_split(tid, asid)
     }
     fn ctx_mint(
         &mut self,
         cnode: crate::kernel::capabilities::CNodeId,
         cap: crate::kernel::capabilities::Capability,
     ) -> Result<CapId, ()> {
-        self.0.sr_mint_split(cnode, cap)
+        self.shared.sr_mint_split(cnode, cap)
     }
     fn ctx_register_active_mapping(&mut self, tid: u64, cap: CapId, va: u64, len: usize) -> bool {
-        self.0.sr_register_active_mapping_split(tid, cap, va, len)
+        self.shared
+            .sr_register_active_mapping_split(tid, cap, va, len)
     }
     fn ctx_region_page_phys(
         &self,
@@ -18621,7 +18677,7 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
         region: crate::kernel::boot::TransferSharedRegion,
         page_offset: usize,
     ) -> Option<crate::kernel::vm::PhysAddr> {
-        self.0
+        self.shared
             .shared_region_page_phys_split(object, region, page_offset)
             .ok()
     }
@@ -18630,13 +18686,13 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
         asid: crate::kernel::vm::Asid,
         virt: crate::kernel::vm::VirtAddr,
         mapping: crate::kernel::vm::Mapping,
-    ) -> bool {
-        match self.0.map_user_page_in_asid_split(asid, virt, mapping) {
+    ) -> crate::kernel::boot::vm_image_locked::PageInstall {
+        match self.shared.map_user_page_in_asid_split(asid, virt, mapping) {
             Ok(follow) => {
-                self.0.sr_apply_map_followup_split(asid, virt, follow);
-                true
+                self.shared
+                    .sr_apply_map_followup_split(self.requester, asid, virt, follow)
             }
-            Err(_) => false,
+            Err(_) => crate::kernel::boot::vm_image_locked::PageInstall::Refused,
         }
     }
     fn ctx_copy_meta(
@@ -18645,7 +18701,7 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
         va: crate::kernel::vm::VirtAddr,
         bytes: &[u8],
     ) -> bool {
-        self.0.copy_to_user_split(asid, va, bytes).is_ok()
+        self.shared.copy_to_user_split(asid, va, bytes).is_ok()
     }
     // (`ctx_finalize_and_wake` below carries the Stage 199G-B §1 projection; the runner decides
     // whether a metadata copy happens at all, so this seam stays ABI-agnostic.)
@@ -18654,20 +18710,24 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
         snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
         result: crate::kernel::boot::BlockedRecvDeliveryResult,
     ) -> Option<bool> {
-        self.0
+        self.shared
             .sr_finalize_blocked_receiver_and_wake_split(snap, result)
     }
     fn ctx_release_pin(&mut self, object: CapObject) {
-        self.0.sr_release_pin_split(object)
+        self.shared.sr_release_pin_split(object)
     }
     fn ctx_unmap_prefix(&mut self, asid: crate::kernel::vm::Asid, base: usize, len: usize) {
-        // The shootdown-completion flag is discarded here on purpose: this is the shared-region
-        // ROLLBACK prefix-unmap, where the object stays pinned, so both the per-page reclaim and
-        // any object-level reclaim are guarded no-ops regardless of the ACK outcome.
-        let _ = self.0.unmap_range_two_phase_split(asid, base, len);
+        // The shootdown-completion flag is discarded here on purpose: every page this unmap
+        // removes becomes an identity hold that only an acknowledged shootdown settles, so an
+        // unacknowledged page stays quarantined with no further action owed here.
+        // SHARED-REGION-LIFETIME2: requester-stating, so the shootdown excludes the CPU executing
+        // the transaction rather than the ambient field.
+        let _ = self
+            .shared
+            .unmap_range_two_phase_from_split(self.requester, asid, base, len);
     }
     fn ctx_remove_active_mapping(&mut self, tid: u64, cap: CapId) -> bool {
-        self.0.sr_remove_active_mapping_split(tid, cap)
+        self.shared.sr_remove_active_mapping_split(tid, cap)
     }
     fn ctx_revoke_cap(
         &mut self,
@@ -18675,7 +18735,7 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
         cap: CapId,
         object: CapObject,
     ) {
-        self.0.sr_revoke_split(cnode, cap, object)
+        self.shared.sr_revoke_split(cnode, cap, object)
     }
 }
 

@@ -479,6 +479,7 @@ fn map_boot_initrd_window_locked(
                 phys,
                 flags: initrd_flags,
             },
+            crate::kernel::boot::vm_image_locked::DisplacementContract::Fresh,
         ) {
             crate::yarm_log!(
                 "INITRAMFS_INITRD_MAP_FAIL page={} virt=0x{:x} err={:?}",
