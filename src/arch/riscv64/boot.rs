@@ -1126,6 +1126,7 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {
         scause,
         stval,
+        epc: sepc,
         external_claim,
         software_interrupt,
         // BL4a: a U-origin trap interrupted a running task, not the idle boundary.
@@ -2021,6 +2022,7 @@ fn riscv_s_mode_software_trap(
     let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {
         scause: frame.scause as usize,
         stval: frame.stval as usize,
+        epc: sepc,
         external_claim: None,
         software_interrupt: Some(arrival),
         // BL4a: accepted through this CPU's armed idle latch (`is_accepted_s_mode_software_trap`).
@@ -2104,6 +2106,7 @@ fn riscv_s_mode_external_trap(
     let ctx = crate::arch::riscv64::trap::Riscv64TrapContext {
         scause: frame.scause as usize,
         stval: frame.stval as usize,
+        epc: sepc,
         external_claim: Some(claim),
         // QEMU-SMP3: an external interrupt carries no software-interrupt arrival.
         software_interrupt: None,

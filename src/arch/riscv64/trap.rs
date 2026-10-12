@@ -34,6 +34,12 @@ const IRQ_SUPERVISOR_EXTERNAL: usize = 9;
 pub struct Riscv64TrapContext {
     pub scause: usize,
     pub stval: usize,
+    /// BL2-a — the trapping instruction's address (`sepc`), as the entry owner read it.
+    ///
+    /// An illegal-instruction exception's `stval` holds the instruction BITS (or zero), not its
+    /// address, so the fault address a user-instruction fault reports must come from here. Zero
+    /// where no instruction trapped (the constructors below, used for interrupts and tests).
+    pub epc: usize,
     /// U9-IRQ-FINAL §1 — the PLIC claim this trap read, once, at its entry owner.
     ///
     /// `None` means no claim was attempted, which is the right answer for every trap that is not
@@ -61,6 +67,7 @@ impl Riscv64TrapContext {
         Self {
             scause,
             stval,
+            epc: 0,
             external_claim: None,
             software_interrupt: None,
             idle_boundary: false,
@@ -582,6 +589,15 @@ pub fn decode_trap_context(context: Riscv64TrapContext) -> TrapEvent {
         EXC_STORE_PAGE_FAULT => TrapEvent::PageFault(FaultInfo::user(
             VirtAddr(context.stval as u64),
             FaultAccess::Write,
+        )),
+        // BL2-a — a user instruction the CPU refused: the task's fault, at the instruction's own
+        // address (`epc`; `stval` holds its bits). Safe with respect to privilege origin for the
+        // same reason as the page faults above: only U-origin exceptions reach this decode. It
+        // used to fall to `Unknown`, whose production policy panics the kernel; the shared
+        // bridge now settles it through the terminal user-fault owners, as x86_64's ring-3 `#GP`.
+        EXC_ILLEGAL_INSTRUCTION => TrapEvent::UserInstructionFault(FaultInfo::user(
+            VirtAddr(context.epc as u64),
+            FaultAccess::Execute,
         )),
         _ => TrapEvent::Unknown {
             arch_code: context.scause as u64,
@@ -1491,6 +1507,46 @@ pub fn handle_riscv_trap_entry_shared(
                     debug_assert!(
                         false,
                         "the terminal PageFault route yields NotHandled, QueueAdvanceCommitted or Complete"
+                    );
+                }
+            }
+        }
+        // BL2-a — a USER instruction the CPU refused (an illegal instruction in U-mode). The
+        // task's fault, settled by the same terminal owners, with the same disposition handling
+        // and the same reserved deferral as the terminal page fault above: a committed transition
+        // skips the broad dispatcher and is drained by this bridge's FutexWait drain below; a
+        // `Complete` carries its result through `terminal_result`. Mutually exclusive with the
+        // page-fault routes by decode. It used to decode as `Unknown`, whose production policy
+        // halts the kernel.
+        if let TrapEvent::UserInstructionFault(fault) = decode_trap_context(context) {
+            match crate::kernel::syscall_split::try_split_user_instruction_fault_dispatch(
+                shared,
+                cpu,
+                Some(fault),
+                Some(&*frame),
+                trap_path.authority(),
+            ) {
+                crate::kernel::syscall_split::SplitDispatchDisposition::NotHandled => {}
+                crate::kernel::syscall_split::SplitDispatchDisposition::QueueAdvanceCommitted => {
+                    crate::yarm_log!(
+                        "QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu={} reason=user_instruction_fault_committed",
+                        cpu.0
+                    );
+                    queue_advance_committed = true;
+                }
+                crate::kernel::syscall_split::SplitDispatchDisposition::Complete(result) => {
+                    terminal_result = Some(result);
+                    queue_advance_committed = true;
+                }
+                other => {
+                    crate::yarm_log!(
+                        "USER_INSTRUCTION_FAULT_UNEXPECTED_DISPOSITION cpu={} value={:?}",
+                        cpu.0,
+                        other
+                    );
+                    debug_assert!(
+                        false,
+                        "the user instruction-fault route yields NotHandled, QueueAdvanceCommitted or Complete"
                     );
                 }
             }
