@@ -324,6 +324,9 @@ pub(crate) use self::ipc_abi::transfer_cap_arg_present;
 pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;
 
 pub(crate) use ipc::split_inline_payload_from_frame;
+// SHARED-REGION-OFFSET1: the pre-lock NR 1 route asks the broad arm's descriptor check; that
+// route is compiled only into freestanding kernels.
+#[cfg(not(feature = "hosted-dev"))]
 pub(crate) use ipc::validate_shared_region_send_descriptor;
 pub(crate) mod ipc_abi;
 // Stage 154: D1/D5 cap-boundary landing zone. Holds the pure recv-v2 meta

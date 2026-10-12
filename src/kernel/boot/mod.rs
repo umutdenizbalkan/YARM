@@ -8410,6 +8410,7 @@ pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
 /// (`[PAGE, 3 * PAGE)`) of it and the receiver can tell, byte by byte, which pages it was given.
 /// The ordinary cells still send `[0, 2 * PAGE)`, exactly what they sent from the two-page
 /// object; only the `shared-region-offset-witness` userspace profile sends the middle range.
+#[cfg(feature = "shared-region-direct-oracle")]
 pub(crate) const SHARED_REGION_ORACLE_OBJECT_PAGES: usize = 4;
 
 /// Stage 198E3C1B-H / 198E3C2C: the dedicated unmapped two-page oracle receive window VA, mirroring

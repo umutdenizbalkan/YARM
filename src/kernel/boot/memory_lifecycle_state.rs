@@ -323,8 +323,24 @@ impl KernelState {
     }
 
     /// Stage 198E3B2A: `&MemorySubsystem` physical-base lookup of a frozen shared-region object for
-    /// use inside `SharedKernel::with_memory_split_mut` (rank 6 only). Mirrors
-    /// `KernelState::shared_region_phys_base`.
+    /// use inside `SharedKernel::with_memory_split_mut` (rank 6 only).
+    ///
+    /// SHARED-REGION-OFFSET1: no mapping path asks this any more — every receive family resolves
+    /// each page through [`Self::shared_region_page_phys_locked`], which applies the descriptor's
+    /// object offset. What remains are the witness provisioners that fill or zero an object they
+    /// just created, and the hosted proofs, so it is compiled only where one of them is.
+    #[cfg(any(
+        test,
+        all(
+            not(feature = "hosted-dev"),
+            any(
+                feature = "shared-region-direct-oracle",
+                feature = "riscv-uart-irq-witness",
+                feature = "aarch64-pl011-irq-witness",
+                feature = "x86_64-uart-irq-witness"
+            )
+        )
+    ))]
     pub(crate) fn shared_region_phys_base_locked(
         memory: &MemorySubsystem,
         object: CapObject,

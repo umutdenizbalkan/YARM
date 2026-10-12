@@ -419,7 +419,7 @@ fn process_cleanup_repeated_transfer_envelope_purge_keeps_telemetry_balanced() {
         .expect("send cap")
         .object;
 
-    for i in 0..4 {
+    for _ in 0..4 {
         let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
         state
             .stash_transfer_envelope(
