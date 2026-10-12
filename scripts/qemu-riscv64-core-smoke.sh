@@ -897,7 +897,9 @@ fi
 # this boot is for.
 # BL5b-4: derived, not exempted -- init's spawn chain owes three SpawnProcess and five
 # SpawnFromMemoryObject dispatches, and none where init faulted before it.
-if [[ "$riscv_service_chain_owed" == "0" ]]; then
+# (Defaulted: this census also runs on its own, extracted, where no derivation preceded it; an
+# ordinary boot owes the full chain.)
+if [[ "${riscv_service_chain_owed:-1}" == "0" ]]; then
   rv_nr23_owed=0; rv_nr29_owed=0
 else
   rv_nr23_owed=3; rv_nr29_owed=5
