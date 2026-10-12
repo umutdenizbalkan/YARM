@@ -547,16 +547,57 @@ failures=0
 # happen. The cell replaces these with its own POSITIVE chain — every marker of the fault, the
 # report, the transition, the drain and the replacement task, each exactly once — which is
 # strictly stronger for what this cell exists to prove.
+# BL5b-4: the terminal-fault cell DERIVES its obligation instead of exempting every marker. Init
+# faults before its SpawnV5 chain there, so it owes the markers of the servers that chain starts
+# -- and only those -- zero times; every other required marker (kernel boot, timer, PLIC, trap
+# path, cross-arch audit, PM's own start-up) is produced without init's chain and stays required.
+# The derivation fails by name when its premise does not hold.
+RISCV_SERVICE_CHAIN_PATTERNS=(
+  "INITRAMFS_SRV_ENTRY"
+  "DEVFS_SRV_ENTRY"
+  "VFS_SRV_ENTRY"
+  "DRIVER_MANAGER_ENTRY"
+  "BLKCACHE_SRV_ENTRY"
+  "VIRTIO_BLK_SRV_ENTRY"
+  "VFS_MOUNT_TABLE_READY"
+  "RAMFS_MOUNT_READY"
+  "VFS_MOUNT_REGISTER_RAMFS_OK"
+  "EXT4_SRV_READY"
+  "VFS_MOUNT_REGISTER_EXT4_OK"
+)
+riscv_service_chain_owed=1
 if [[ "$TERMINAL_FAULT_ORACLE" == "1" ]]; then
-  echo "[info] U9-PF1-TERM: service-chain required markers are not asserted in the terminal-fault cell (init faults by design); the cell's own positive chain replaces them"
-else
+  rv_tf_begin=$(rg -a -c -F "TERMINAL_FAULT_ORACLE_BEGIN arch=riscv64 init_tid=1 " "$LOGFILE" 2>/dev/null || echo 0)
+  rv_tf_spawns=$(rg -a -c -F "INIT_SPAWN_V5_CALL_BEGIN" "$LOGFILE" 2>/dev/null || echo 0)
+  if [[ "${rv_tf_begin:-0}" -ne 1 ]]; then
+    echo "[fail] BL5b-4: the terminal-fault cell has ${rv_tf_begin:-0} faults of init to derive its service obligation from (expected 1)"
+    failures=$((failures + 1))
+  elif [[ "${rv_tf_spawns:-0}" -ne 0 ]]; then
+    echo "[fail] BL5b-4: init issued ${rv_tf_spawns} SpawnV5 call(s) in the terminal-fault cell; its service obligation is derived from init faulting before the chain"
+    failures=$((failures + 1))
+  else
+    riscv_service_chain_owed=0
+    echo "[ok] BL5b-4: init faulted before the SpawnV5 chain -- each service-chain marker owes 0, every other required marker stays required"
+  fi
+fi
+rv_is_service_chain() {
+  local p
+  for p in "${RISCV_SERVICE_CHAIN_PATTERNS[@]}"; do [[ "$p" == "$1" ]] && return 0; done
+  return 1
+}
 for pat in "${REQUIRED_PATTERNS[@]}"; do
+  if [[ "$riscv_service_chain_owed" == "0" ]] && rv_is_service_chain "$pat"; then
+    if rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] service-chain marker WITHOUT a spawn in the terminal-fault cell: $pat"
+      failures=$((failures + 1))
+    fi
+    continue
+  fi
   if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] required marker missing: $pat"
     failures=$((failures + 1))
   fi
 done
-fi
 
 for pat in "${OPTIONAL_FS_PATTERNS[@]}"; do
   if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
@@ -854,14 +895,19 @@ fi
 # would be asserting that the deliberate fault did not happen. The equality checks above still
 # run — a switching disposition would still be caught — and the cell's own chain covers what
 # this boot is for.
-if [[ "$TERMINAL_FAULT_ORACLE" == "1" ]]; then
-  echo "[info] U9-PF1-TERM: the spawn census is not asserted in the terminal-fault cell (init faults before the SpawnV5 chain by design)"
-elif (( riscv_split_nr23 != 3 )); then
-  echo "[fail] RISC-V SpawnProcess split count is ${riscv_split_nr23}, expected 3"
+# BL5b-4: derived, not exempted -- init's spawn chain owes three SpawnProcess and five
+# SpawnFromMemoryObject dispatches, and none where init faulted before it.
+if [[ "$riscv_service_chain_owed" == "0" ]]; then
+  rv_nr23_owed=0; rv_nr29_owed=0
+else
+  rv_nr23_owed=3; rv_nr29_owed=5
+fi
+if (( riscv_split_nr23 != rv_nr23_owed )); then
+  echo "[fail] RISC-V SpawnProcess split count is ${riscv_split_nr23}, expected ${rv_nr23_owed}"
   failures=$((failures + 1))
 fi
-if [[ "$TERMINAL_FAULT_ORACLE" != "1" ]] && (( riscv_split_nr29 != 5 )); then
-  echo "[fail] RISC-V SpawnFromMemoryObject split count is ${riscv_split_nr29}, expected 5"
+if (( riscv_split_nr29 != rv_nr29_owed )); then
+  echo "[fail] RISC-V SpawnFromMemoryObject split count is ${riscv_split_nr29}, expected ${rv_nr29_owed}"
   failures=$((failures + 1))
 fi
 # U9-RECV-FINAL §1: NR 2 (`IpcRecv`) joins the retired set. It was the last recognized IPC

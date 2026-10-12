@@ -195559,3 +195559,59 @@ mod bl2a_riscv_illegal_instruction_is_the_tasks_fault {
         ));
     }
 }
+
+// BL5b-4: the RISC-V terminal-fault cell derives its obligation from init's own spawn calls instead
+// of exempting every required marker (the x86_64 cell has done so since BL5b).
+mod bl5b4_riscv_terminal_fault_service_obligation {
+    const SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+
+    fn list(name: &str) -> alloc::vec::Vec<&'static str> {
+        SMOKE
+            .split(&alloc::format!("{name}=(\n"))
+            .nth(1)
+            .unwrap()
+            .split("\n)\n")
+            .next()
+            .unwrap()
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('"'))
+            .map(|l| l.trim_matches('"'))
+            .collect()
+    }
+
+    #[test]
+    fn only_the_spawn_chains_markers_are_owed_zero() {
+        let required = list("REQUIRED_PATTERNS");
+        let chain = list("RISCV_SERVICE_CHAIN_PATTERNS");
+        assert_eq!(chain.len(), 11);
+        for m in &chain {
+            assert!(
+                required.contains(m),
+                "{m} is a required marker the derivation re-owes"
+            );
+        }
+        // Kernel- and PM-produced markers are never in the chain set.
+        for kept in [
+            "YARM_BOOT_OK",
+            "RISCV_TIMER_AUDIT_DONE sbi_time=",
+            "RISCV_PLIC_BASE value=",
+            "CROSS_ARCH_LIVE_DONE arch=riscv64 result=ok",
+            "PM_BLOCKING_RECV_LOOP",
+        ] {
+            assert!(required.contains(&kept) && !chain.contains(&kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn the_cell_derives_and_fails_by_name_rather_than_exempting() {
+        assert!(!SMOKE.contains("not asserted in the terminal-fault cell"));
+        assert!(SMOKE.contains("TERMINAL_FAULT_ORACLE_BEGIN arch=riscv64 init_tid=1 "));
+        assert!(SMOKE.contains("rg -a -c -F \"INIT_SPAWN_V5_CALL_BEGIN\""));
+        assert!(SMOKE.contains("faults of init to derive its service obligation from"));
+        assert!(SMOKE.contains("SpawnV5 call(s) in the terminal-fault cell"));
+        assert!(SMOKE.contains("service-chain marker WITHOUT a spawn in the terminal-fault cell"));
+        assert!(SMOKE.contains("rv_nr23_owed=0; rv_nr29_owed=0"));
+        assert!(SMOKE.contains("rv_nr23_owed=3; rv_nr29_owed=5"));
+    }
+}
