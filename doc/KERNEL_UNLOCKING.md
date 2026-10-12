@@ -25686,7 +25686,8 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL5b-2 — the x86_64 U9-RX4 reply-cap witness assumes the queued route | fixed and delivered (qualified `e3a3e1f3`) | with the timer-contract witness, tid 2's PM query reaches an idle PM in every terminal-fault boot and takes the direct NR 6 route, so all four strict families failed a correct transaction. The direct commit now attests its record and cap; the witness requires exactly one route to attest the record PM replies to and applies that route's obligations. Base also accepted a removed queued attestation and a substituted alias revoke |
 | BL5b-3 — the AArch64 U9-RX4 evaluator assumes the queued route | latent (found in BL5b-2) | AArch64 runs the direct request route, but no AArch64 cell has been observed sending tid 2's query direct; the attestation the x86_64 derivation uses is emitted there too |
 | BL5c — strict-core runners boot artifacts lacking required witness features | fixed and delivered (qualified `876869ed`) | a strict run booted whatever its paths held: an x86_64 default artifact ran 60 s and failed `witness absent`, and base strict passed a RISC-V oracle kernel copied over the recorded one and an x86_64 kernel/initramfs pair from two builds. The manifest records role and features per artifact; each core smoke binds both artifacts and the mode's required features before booting and a strict run refuses by name; the CI strict job and the final seal's RUN_A build the witness artifact |
-| BL5d — SMP log loss failing one-shot asynchronous checks | confirmed open | seen during LOCK3 qualification (`IPCCALL_DIRECT_SMP_SERVER_BLOCKED`) |
+| BL5d — SMP log loss failing one-shot asynchronous checks | fixed and delivered (qualified `0346b8f6`) | the printk drain skipped a slot another CPU had reserved but not finished writing and advanced past it, so the record was never drained; the counter that should have shown it was never incremented. Base failed a completed cross-CPU request (record sealed 7/7, two one-shot lines lost). The drain now holds an in-flight record for its writer's own flush and counts and announces only genuine overwrite losses (`PRINTK_RECORDS_LOST`); the SMP graders report an announced loss as incomplete evidence |
+| BL5b-4 — the RISC-V terminal-fault cell exempts its required markers instead of deriving them | confirmed open (found while drafting BL2-a) | with `TERMINAL_FAULT_ORACLE=1` the RISC-V core smoke skips EVERY required marker and the spawn census, including kernel boot, timer, PLIC and cross-arch markers that do not depend on init's spawn chain; the x86_64 cell derives its obligation since BL5b |
 | BL6a — AArch64 FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open (found in BL3b qualification) | fails identically on true base `c44e9b46` (2/2) and on the candidate. The checker requires broad-path markers the split NR 9 route no longer emits (`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON`, `…DISPATCH_DEFER_BEGIN`, `…HANDLER_BYPASS_BEGIN/DONE`, `…DISPATCH_DONE result=idle`), while the kernel's own idle chain (`…NO_INCOMING`, `…POST_LOCK_IDLE_*`, `…IDLE_ORACLE_DONE result=ok`) is present; in one base boot another task was runnable, so the cell's no-incoming premise is also boot-order dependent |
 | BL6b — RISC-V FutexWait no-incoming idle oracle cell (`FUTEX_WAIT_IDLE_ORACLE=1`) | confirmed open — intermittent | failed on true base `c44e9b46` (2/2) and on the first BL4a freeze `9b5838c4`; passed on `e2f4e52b` and `53a5b112` (`RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok`), so boot-order dependent, not closed by BL4a |
 | BL6c — AArch64 timer5 witness capture is stopped early by the core smoke | confirmed open (found in BL4a qualification) | `qemu-aarch64-core-smoke.sh` stops QEMU 2 s after the FIRST `SCHED_ENTER_IDLE_HLT`; the timer5 summary arrives 6,962 lines later on base and candidate alike, so whether it is captured is host speed alone: true base `af24e403` 1 pass / 3 fail, candidate 2 pass / 2 fail. The runner must stop on the witness's own completion instead |
@@ -26703,3 +26704,62 @@ test; base `a3daae9f`).**
   census 9/9.
 * *Freestanding build:* warnings identical to base (180 / 208 / 190). The kernels are
   byte-identical to base on all three ports.
+
+### BL5d — the printk drain holds an in-flight record; only a real loss is counted, and it is announced
+
+**Defect (verified on `a7f1fcf4`).** `yarm_log!` pushes a record into the shared printk ring and then
+flushes it. `push` reserves a sequence number (`next_seq.fetch_add`) and then copies the bytes, so for
+a moment the slot is reserved but not committed. The console drain (`drain_for_console`) read each
+sequence number from `reader_seq` to the last reserved one. When a slot was not yet committed, the
+read failed, and the drain advanced past it anyway and stored the advanced `reader_seq`. The writer's
+own flush then began beyond its record. Nothing drained that sequence number again: the line vanished.
+
+* The ring's `dropped` counter existed and was never incremented, so the loss left no trace.
+* A one-shot asynchronous marker of a completed SMP transaction read exactly like a transaction that
+  never happened.
+* *Reproduced live on base:* one of three cross-CPU request runs failed `server-blocked != 1` and
+  `IPI received != 1`. That boot's synchronous transaction record held the committed block and sealed
+  all seven steps; both one-shot lines were lost.
+* *Reproduced in hosted, through the drain itself:* the four regressions below all fail on the base
+  drain. In the concurrent one, four writers race a draining thread and about a quarter of 120
+  records vanish silently in the first round.
+
+**Repair (the owner: `PrintkRing::drain_for_console`).**
+
+* A record that is reserved but not committed is *held*. The drain stops in front of it and leaves
+  `reader_seq` there. Its writer's own flush emits it and everything queued behind it, in order.
+* A record is lost only when its slot has been reused: a later sequence number holds the slot, or has
+  been reserved for it (the ring has lapped it). That loss is counted in `dropped` and announced in
+  the console stream, at the place it happened, by one line per contiguous run:
+  `PRINTK_RECORDS_LOST first_seq=… count=… total_dropped=…`.
+* A writer that dies mid-record holds the console back for at most one lap; it is then counted lost.
+  The panic path writes to the console directly and is unaffected.
+* *The graders that count one-shot lines* report an announced loss as incomplete evidence, before
+  counting, and never as a missing transaction. These are the AP recv-v2 block, direct SMP request,
+  cross-CPU request, reply and user-consume runners. An unannounced absence now means the record
+  was never written.
+
+**Evidence.**
+
+* *Hosted regressions* (`kernel::printk::tests::bl5d_*`): on the base drain 0 of 4 pass; on the
+  candidate 4 of 4 pass.
+  * an uncommitted record is held, not skipped, then emitted in order;
+  * an overwritten record is counted and announced where it was lost;
+  * a lapped in-flight record is lost, not waited on;
+  * concurrent writers lose nothing the ring still holds: 200 rounds, each record exactly once.
+* *Live, candidate:*
+  * cross-CPU request 3/3, AP recv-v2 block, direct SMP request, cross-CPU reply, user-consume 2/2;
+  * strict x86_64 core, terminal-fault cell, x86_64 SMP=2;
+  * AArch64 cores SMP=1 and SMP=2, RISC-V strict core;
+  * all three server-death runners.
+
+  Every boot passes, with no `PRINTK_RECORDS_LOST` in any of them.
+* *Live, base:* cross-CPU request 2 of 3 (the failure above); user-consume 2/2.
+
+**Qualification (frozen `0346b8f6`, base `a7f1fcf4`, fresh worktrees and artifacts).**
+
+* *Live:* as above.
+* *Suites:* fmt clean; hosted 6,029 passed; integration 300/300, including `printk_loss_scope`
+  (2 tests); census 9/9.
+* *Freestanding build:* warnings identical to base (180 / 208 / 190, same classes). The kernel
+  images differ, by the drain.
