@@ -78,6 +78,12 @@ case "$ARCH" in
     NEEDS_OBJCOPY=1
     RETURN_MARKER=AARCH64_IDLE_BOUNDARY_USER_RETURN
     REGS_CHECKED=4
+    # BL6c: the AArch64 core smoke stops QEMU 2 s after its terminal-idle marker, by default the
+    # FIRST `SCHED_ENTER_IDLE_HLT` — thousands of lines before init's cell emits this witness's
+    # summary, so whether the summary was captured was host speed alone. The boot is stopped on the
+    # witness's own completion instead: the one summary line init's cell emits on either outcome.
+    # A cell that never completes still times out (IDLE_MAX_SECS) and is graded as missing.
+    STOP_MARKER='TIMER5_IDLE_RETURN_WITNESS rounds='
     # The AArch64 core profile boots -smp 2, and init's spawn chain depends on it: forced to
     # -smp 1 its `SpawnProcess` round trip returns `zero_pid` and `run()` returns before it ever
     # reaches the slot-5 cells, so the witness would silently not run. That is a property of this
@@ -176,6 +182,8 @@ fi
 # preempting, and the witness could not run at all; forcing `yarm.sched_quantum_ticks=1` to make
 # it run instead broke this profile's spawn round trip (`zero_pid`), which is a pre-existing
 # fragility under maximal preemption and outside this package's scope.
+STOP_ENV=()
+[[ -n "${STOP_MARKER:-}" ]] && STOP_ENV=("TERMINAL_IDLE_MARKER=$STOP_MARKER")
 note "booting QEMU -smp $SMP with yarm.timer5_idle_return_witness=1 (shipped quantum)"
 env \
   KERNEL_IMAGE="$KERNEL_IMAGE" \
@@ -186,6 +194,7 @@ env \
   SMOKE_LOG="$LOGDIR/smoke.log" \
   TIMEOUT_SECS="$TIMEOUT_SECS" \
   YARM_MODE_ISOLATION=0 \
+  "${STOP_ENV[@]}" \
   "$SMOKE" >"$LOGDIR/core-smoke.log" 2>&1 || true
 
 [[ -s "$BOOT_LOG" ]] || { echo "TIMER5_IDLE_RETURN_WITNESS_SEAL arch=$ARCH result=fail reason=no_boot_log"; exit 1; }

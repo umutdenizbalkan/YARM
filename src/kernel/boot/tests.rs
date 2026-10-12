@@ -195446,3 +195446,42 @@ mod bl6e_overtaken_witness_stores_what_it_waits_on {
         assert_eq!(A64.matches("mov x8, #NR_FUTEX_WAIT").count(), 1);
     }
 }
+
+// BL6c: the AArch64 timer5 witness boot stops on the witness's own completion, not on the first
+// terminal idle (which precedes the summary by thousands of lines).
+mod bl6c_timer5_boot_stops_on_its_own_summary {
+    const RUNNER: &str = include_str!("../../../scripts/qemu-timer5-idle-return-witness-smoke.sh");
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const SERVICE: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    #[test]
+    fn the_aarch64_arm_stops_on_the_one_summary_line() {
+        let arm = RUNNER
+            .split("  aarch64)\n")
+            .nth(1)
+            .unwrap()
+            .split("    ;;\n")
+            .next()
+            .unwrap();
+        assert!(arm.contains("STOP_MARKER='TIMER5_IDLE_RETURN_WITNESS rounds='"));
+        assert!(RUNNER.contains(
+            "[[ -n \"${STOP_MARKER:-}\" ]] && STOP_ENV=(\"TERMINAL_IDLE_MARKER=$STOP_MARKER\")"
+        ));
+        assert!(RUNNER.contains("  \"${STOP_ENV[@]}\" \\\n  \"$SMOKE\""));
+        // The smoke honours the override, and init emits the line once, on either outcome.
+        assert!(
+            A64_SMOKE
+                .contains("TERMINAL_IDLE_MARKER=\"${TERMINAL_IDLE_MARKER:-SCHED_ENTER_IDLE_HLT}\"")
+        );
+        assert_eq!(
+            SERVICE
+                .matches("\"TIMER5_IDLE_RETURN_WITNESS rounds={}")
+                .count(),
+            1
+        );
+        // Only AArch64 stops early; the other ports keep their own lifecycle.
+        assert_eq!(RUNNER.matches("STOP_MARKER=").count(), 1);
+    }
+}
