@@ -25677,7 +25677,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 |---|---|---|
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | fixed and delivered (SHARED-REGION-OFFSET1, qualified `9d991d0c`) | owner ABI decision: byte offset relative to the `MemoryObject`, page-aligned, a `DmaRegion` bounds without rebasing. On `a91632ba` a non-zero offset maps the wrong pages on the queued, direct and NR 30 paths, NR 30 maps the whole window, a `MemoryObject` descriptor whose `len` fits but whose `offset + len` does not is accepted, and a misaligned offset is accepted — nine hosted regressions fail. One range policy now admits and resolves on every path; live: every receive family maps a middle two-page range on all three ports |
-| BL1-b — shared-region backing lifetime: mapping references, displaced-page holds and reclamation keyed on an object's first frame | fixed and delivered (SHARED-REGION-LIFETIME1, qualified `TBD-SRL1-COMMIT`) | on `96114d69` a mapped interior page took no mapping reference, a displaced or unmapped interior page took no hold, teardown handed live interior frames to the allocator, and an object whose capabilities were gone was reclaimed while a forked child still mapped it — ten of twelve hosted regressions fail. The owner of a page is now the live allocator-owned extent that contains it; a removed or displaced reference becomes an identity hold settled after its invalidation; live: an interior mapping survives the other owner's release on all three ports, read back from the kernel's own counters |
+| BL1-b — shared-region backing lifetime: mapping references, displaced-page holds and reclamation keyed on an object's first frame | fixed and delivered (SHARED-REGION-LIFETIME1, qualified `7c2da86c`) | on `96114d69` a mapped interior page took no mapping reference, a displaced or unmapped interior page took no hold, teardown handed live interior frames to the allocator, and an object whose capabilities were gone was reclaimed while a forked child still mapped it — ten of twelve hosted regressions fail. The owner of a page is now the live allocator-owned extent that contains it; a removed or displaced reference becomes an identity hold settled after its invalidation; live: an interior mapping survives the other owner's release on all three ports, read back from the kernel's own counters |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | fixed and delivered (qualified `1d7be22c`) | reproduced live with a new default-off witness: base stops the whole system at `IRQ1_UNKNOWN_SETTLED … strict=1`. A U-mode illegal instruction now decodes as the task's `UserInstructionFault` at `sepc`, and the RISC-V bridge settles it through BL2's route and the same terminal owners; init is reported and terminated, and a replacement runs |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
@@ -26072,7 +26072,31 @@ the six interior installs (`refs=` empty). The live cell therefore discriminates
 kernel's own counters, not through the bytes; the premature reclamation and the frees are hosted
 evidence.
 
-**Final-candidate controls.** TBD-SRL1-CONTROLS
+**Final-candidate controls.** Each was applied to the frozen candidate `7c2da86c` in its own worktree, then
+run through the twelve hosted cases and the x86_64 lifetime cell.
+
+* *(a) The base's equality restored.* Owner lookup, the teardown free gate and the settlement's
+  identity check go back to `object.phys == phys`; the hold machinery stays. Nine hosted cases fail,
+  each for the base's reason:
+  * accounting: `(2, 1, 0)` where `(2, 2, 0)`, `(3, 0)` where `(3, 4)`, the fork transaction's `0`
+    where `2`, and the overlapping slice charged `(1, 1, 0)`;
+  * holds: no hold (`None`), unpinned after a failed invalidation (`0` where `1`), and the real
+    settlement does not reclaim;
+  * premature reclamation: `None` where `(0, 2, 0)`;
+  * a live object's page 1 freed by teardown.
+
+  The source contract passes, because the structure is intact. Live, it fails on the accounting
+  (`refs=` empty) with every userspace check passing, exactly as the base does.
+* *(b) The displaced-page hold omitted.* The owner lookup no longer pins, so every removal before
+  invalidation drops the reference with nothing held. Three hosted cases fail, each for that reason:
+  * the displaced interior page is not held (`None` where the object's id);
+  * a failed invalidation leaves it unpinned (`0` where `1`);
+  * the object is already reclaimed before its settlement, so the real settlement reclaims
+    nothing.
+
+  The other nine pass: accounting and teardown are intact. Live, the release records
+  `u1:3/0,u2:2/0` — a reference dropped with no hold and no settlement — and the cell fails. Its
+  order verdict also fails, a knock-on effect of the four missing records.
 
 **Remaining limitations.**
 
@@ -26093,7 +26117,50 @@ evidence.
 * Only allocator-owned and borrowed objects exist; a future object kind that is neither must
   choose one of the two disciplines explicitly.
 
-**Qualification.** TBD-SRL1-QUAL
+**Qualification.** Candidate frozen at `7c2da86c` (tree `5b2f1232`); base `96114d69`. Each
+gate ran once, in a fresh isolated worktree, and none was re-run. Each live run is bound to its
+commit, its kernel and userspace features, and the sha256 of the kernel and initramfs it booted (its
+`artifact-binding.txt`). The lifetime cell's kernel and initramfs hashes were:
+
+| Port | Kernel | Initramfs |
+|---|---|---|
+| x86_64 | `f27f4469…` | `3e9da27e…` |
+| AArch64 | `f7448d15…` | `caae0c47…` |
+| RISC-V | `e8cebed1…` | `f8ff5dac…` |
+
+Firmware is QEMU 8.2.2's bundled default; on RISC-V that is OpenSBI `fw_dynamic`, sha256
+`171a91cc…`.
+
+* *Hosted:*
+  * focused (the lifetime and offset modules, plus the five re-derived guards): 65/65;
+  * related shared-region, transfer, COW, fork, reap, teardown, VmMap and invalidation groups:
+    516/516;
+  * full hosted suite: 6,066 passed;
+  * integration: 300/300;
+  * census: 9/9 (U9 unchanged: `with_cpu=0`, `with_broad=0`);
+  * `cargo fmt --check`: clean.
+* *On the base:* the candidate's twelve lifetime cases, transplanted onto `96114d69`, fail 10 and
+  pass 2, as listed above.
+* *Warnings:*
+  * freestanding default kernels match the base exactly on every port (179 / 207 / 189, identical
+    classes);
+  * the three oracle-feature kernels, the hosted library and tests, and the oracle-feature hosted
+    library also match;
+  * the userspace build with `shared-region-lifetime-witness` has exactly the warnings of the
+    offset profile on every port.
+* *Live, all `result=ok`, 21 runs:*
+  * on each of x86_64, AArch64 and RISC-V:
+    * the NR 30 cell and the NR 2 / NR 5 cell, each at object offset 0 and 4096;
+    * the lifetime cell;
+    * the direct cell at 0 and 4096 (every one `misplaced=0`).
+* *Strict cores and SMP:*
+  * strict core smokes on all three ports, x86_64 in its timer-contract-witness profile;
+  * the cross-CPU invalidation witnesses `SMP1` / `SMP2` / `SMP3`, all `result=ok`.
+* *Pre-existing, not changed:* the hosted tests gated on `x86-shared-region-direct-oracle` do not
+  compile on either commit. Both fail with the same five `E0308` errors.
+
+The live lifetime interleaving is yield-sequenced on `-smp 1`, and the order is verified from the
+log. The failed-invalidation case is hosted-only.
 
 ### BL2 — x86 user port-I/O fault containment
 
