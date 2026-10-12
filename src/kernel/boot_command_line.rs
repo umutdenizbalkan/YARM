@@ -348,6 +348,10 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::yarm_log!("YARM_TERMINAL_FAULT_PORTIO_ORACLE_SET enabled={}", enabled);
         crate::kernel::boot::set_terminal_fault_portio_oracle_enabled(enabled);
     }
+    if let Some(enabled) = parsed.terminal_fault_illegal_oracle {
+        crate::yarm_log!("YARM_TERMINAL_FAULT_ILLEGAL_ORACLE_SET enabled={}", enabled);
+        crate::kernel::boot::set_terminal_fault_illegal_oracle_enabled(enabled);
+    }
     if let Some(enabled) = parsed.aarch64_terminal_fault_oracle {
         // 199E-A64CALL: default-off AArch64 TERMINAL-FAULT oracle knob (slot 5 = 23, A64-DEPTH; it
         // was 21 until that collided with the reserved AArch64 ExitCurrentTask selector). Gives the
@@ -872,6 +876,9 @@ pub struct YarmBootOptions<'a> {
     /// BL2: `yarm.terminal_fault_portio_oracle=1` DEFAULT-OFF knob (x86_64) — init issues one
     /// forbidden ring-3 port read, which the CPU refuses with `#GP`.
     pub terminal_fault_portio_oracle: Option<bool>,
+    /// BL2-a: `yarm.terminal_fault_illegal_oracle=1` DEFAULT-OFF knob (RISC-V) — init executes one
+    /// illegal instruction, which the CPU refuses in U-mode.
+    pub terminal_fault_illegal_oracle: Option<bool>,
     /// Stage 196A: `yarm.riscv64_post_lock_foundation_oracle=1` DEFAULT-OFF knob. Arms the RISC-V
     /// shared trap wrapper's one-shot post-lock-drain FOUNDATION oracle (publish token in the
     /// broad-lock phase, consume it after the lock drops via a real `with_cpu` re-acquire). It
@@ -1229,6 +1236,10 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         // BL2: the port-I/O scenario's own knob, armed by name like the others.
         if key == b"yarm.terminal_fault_portio_oracle" {
             options.terminal_fault_portio_oracle = parse_bool_knob(value);
+        }
+        // BL2-a: the illegal-instruction scenario's own knob.
+        if key == b"yarm.terminal_fault_illegal_oracle" {
+            options.terminal_fault_illegal_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.riscv64_post_lock_foundation_oracle" {
             options.riscv64_post_lock_foundation_oracle = parse_bool_knob(value);

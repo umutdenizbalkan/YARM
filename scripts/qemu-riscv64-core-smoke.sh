@@ -60,6 +60,10 @@ fi
 # task through sret). It enables no retirement class and does not alter boot.
 TERMINAL_FAULT_ORACLE=${TERMINAL_FAULT_ORACLE:-0}
 TERMINAL_FAULT_FETCH_ORACLE=${TERMINAL_FAULT_FETCH_ORACLE:-0}
+# BL2-a: the ILLEGAL-INSTRUCTION scenario -- init executes one `unimp`. A terminal-fault cell like
+# the read and fetch ones (init dies before its service chain), but its chain is the user
+# instruction-fault route, not the page-fault route; its own assertions are below.
+TERMINAL_FAULT_ILLEGAL_ORACLE=${TERMINAL_FAULT_ILLEGAL_ORACLE:-0}
 POST_LOCK_FOUNDATION_ORACLE=${POST_LOCK_FOUNDATION_ORACLE:-0}
 # U9-PAGEFAULT1 §2: the RISC-V terminal-fault witness cell, default-off.
 # U9-PAGEFAULT1 §2: the INSTRUCTION-FETCH variant of the same cell. It exercises the
@@ -69,9 +73,14 @@ if [[ "$TERMINAL_FAULT_FETCH_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.termi
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.terminal_fault_fetch_oracle=1"
   TERMINAL_FAULT_ORACLE=1
 fi
-# Slot 5 carries exactly ONE scenario and the kernel writes the read selector first, so the two
+if [[ "$TERMINAL_FAULT_ILLEGAL_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_illegal_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.terminal_fault_illegal_oracle=1"
+  TERMINAL_FAULT_ORACLE=1
+fi
+# Slot 5 carries exactly ONE scenario and the kernel writes the read selector first, so the
 # knobs are mutually exclusive here too.
 if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$TERMINAL_FAULT_FETCH_ORACLE" != "1" \
+      && "$TERMINAL_FAULT_ILLEGAL_ORACLE" != "1" \
       && "$KERNEL_CMDLINE" != *"yarm.terminal_fault_oracle="* ]]; then
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.terminal_fault_oracle=1"
 fi
@@ -601,7 +610,9 @@ for pat in "${REJECT_PATTERNS[@]}"; do
   # U9-PAGEFAULT1 §2: in the terminal-fault cell the unhandled fault is the SUBJECT, not a
   # defect. The cell asserts it appears EXACTLY once, with the exact tid, address and access —
   # which a blanket reject cannot express and a relaxed reject would not check at all.
-  if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$pat" == 'PAGE_FAULT_UNHANDLED' ]]; then
+  # BL2-a: the illegal-instruction cell takes no page fault, so the reject stands there.
+  if [[ "$TERMINAL_FAULT_ORACLE" == "1" && "$TERMINAL_FAULT_ILLEGAL_ORACLE" != "1" \
+        && "$pat" == 'PAGE_FAULT_UNHANDLED' ]]; then
     continue
   fi
   if rg -n "$pat" "$LOGFILE" >/dev/null 2>&1; then
@@ -1206,7 +1217,81 @@ fi
 # unhandled read at address 0, taken by init before the service chain. The BASELINE was measured
 # before the routing row was added — one fault per boot, reaching the broad dispatcher — so the
 # row rests on a fault this port actually produces, not on the other two ports' evidence.
-if [[ "$TERMINAL_FAULT_ORACLE" != "1" ]]; then
+# BL2-a (RISC-V USER ILLEGAL-INSTRUCTION FAULT CONTAINMENT): init executes one `unimp`. The CPU
+# raises an illegal-instruction exception in U-mode. Before BL2-a that decoded as `Unknown` and the
+# strict policy panicked the kernel; now it is the task's fault, settled off the broad lock by the
+# terminal user-fault owners: report, terminal transition, replacement. The instruction never
+# completes, init is taken down, and another task and the kernel run on.
+if [[ "$TERMINAL_FAULT_ILLEGAL_ORACLE" == "1" ]]; then
+ill_fail=0
+ill_log="$(tr '\r' '\n' <"$LOGFILE")"
+ill_count() {
+  local n
+  n="$(rg -a -F -c -- "$1" <<<"$ill_log" || true)"
+  printf '%s' "${n:-0}"
+}
+ill_require() { # desc want pattern
+  local n
+  n="$(ill_count "$3")"
+  if [[ "$n" != "$2" ]]; then
+    echo "[error] BL2a-ILLEGAL: $1 -- expected $2, got ${n:-0}: $3"
+    ill_fail=1
+  else
+    echo "[ok] BL2a-ILLEGAL: $1"
+  fi
+}
+ill_require "the illegal-instruction oracle is provisioned once" 1 \
+  'TERMINAL_FAULT_ILLEGAL_ORACLE_PROVISION_OK arch=riscv64 slot5=27 caps=none result=ok'
+ill_require "init executes exactly one illegal instruction" 1 \
+  'TERMINAL_FAULT_ORACLE_BEGIN arch=riscv64 init_tid=1 insn=unimp access=illegal'
+ill_require "the instruction is REFUSED: it never completes" 0 'TERMINAL_FAULT_ILLEGAL_EXECUTED'
+ill_require "it is decoded as the task's fault, off the broad lock, once" 1 \
+  'USER_INSTRUCTION_FAULT tid=1 pc=0x'
+ill_require "never as a broad arrival" 0 'route=broad'
+ill_require "it is not reported as a page fault" 0 'PAGE_FAULT_ENTRY tid=1'
+ill_require "the kernel does NOT take the Unknown path" 0 'unknown trap event'
+ill_require "and does not panic" 0 'strict unknown trap policy'
+ill_require "the report delivery owner runs once" 1 'TASK_FAULT_REPORT_BEGIN tid=1'
+ill_require "the report is delivered, off the broad lock" 1 \
+  'TERMINAL_FAULT_SPLIT_REPORT cpu=0 tid=1 outcome=buffered terminates=1 broad_lock=0'
+ill_require "the terminal transition commits once" 1 \
+  'TERMINAL_FAULT_SPLIT_COMMITTED cpu=0 tid=1 captured=1 advance=deferred'
+ill_require "the queue-advance deferral is published once" 1 \
+  'QUEUE_ADVANCING_DISPATCH_DEFERRED reason=terminal_fault_switch_required tid=1 cpu=0'
+ill_require "the broad dispatcher is skipped for this reason" 1 \
+  'QUEUE_ADVANCE_BROAD_DISPATCH_SKIPPED cpu=0 reason=user_instruction_fault_committed'
+for bad in 'TERMINAL_FAULT_SPLIT_REFUSED' 'TERMINAL_FAULT_SPLIT_FAILED_CLOSED' \
+  'USER_INSTRUCTION_FAULT_REFUSED' 'PF3_SUPERVISOR_FAULT' 'USER_INSTRUCTION_FAULT_UNEXPECTED_DISPOSITION' \
+  'PANIC' 'panicked at'; do
+  ill_require "no $bad on the witnessed path" 0 "$bad"
+done
+# ANOTHER TASK PROGRESSES: the RISC-V drain selects a replacement that is not init, marks it
+# Running and gives it its exact frame -- and it then runs: user lines of its own after the fault.
+ill_repl="$(rg -a -o -N 'RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu=0 incoming=([0-9]+)' -r '$1' <<<"$ill_log" | head -n1 || true)"
+if [[ -z "$ill_repl" || "$ill_repl" == "1" ]]; then
+  echo "[error] BL2a-ILLEGAL: no replacement other than the faulted init was selected (got '${ill_repl}')"
+  ill_fail=1
+else
+  echo "[ok] BL2a-ILLEGAL: replacement tid=${ill_repl} selected"
+  ill_require "the SAME replacement is marked Running" 1 \
+    "RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming=${ill_repl}"
+  ill_require "the SAME replacement gets its exact frame" 1 \
+    "RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming=${ill_repl}"
+  ill_after="$(awk -v t="RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming=${ill_repl}" 'f{print} index($0,t){f=1}' <<<"$ill_log" \
+    | rg -a -c -F "USER_LOG tid=${ill_repl} " || true)"
+  if [[ "${ill_after:-0}" -lt 1 ]]; then
+    echo "[error] BL2a-ILLEGAL: the replacement logged nothing after the fault"
+    ill_fail=1
+  else
+    echo "[ok] BL2a-ILLEGAL: the replacement ran (${ill_after} user line(s)) after the fault"
+  fi
+fi
+if [[ "$ill_fail" -eq 1 ]]; then
+  echo "[error] BL2a RISC-V user illegal-instruction containment witness FAILED"
+  exit 1
+fi
+echo "[ok] BL2a-ILLEGAL: RISC-V user illegal-instruction containment witness chain complete"
+elif [[ "$TERMINAL_FAULT_ORACLE" != "1" ]]; then
   echo "[info] U9-PF1-TERM: not armed (set TERMINAL_FAULT_ORACLE=1) -- the RISC-V terminal-fault witness runs in its own cell"
 else
 pf1t_fail=0

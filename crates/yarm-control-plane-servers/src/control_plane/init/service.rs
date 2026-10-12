@@ -991,6 +991,7 @@ fn run_terminal_fault_oracle(
         S::DeliberateUnhandledRead | S::DeliberateUnhandledReadAfterWaiter => "read",
         S::DeliberateUnhandledFetch => "fetch",
         S::DeliberatePortIo => "portio",
+        S::DeliberateIllegalInstruction => "illegal",
     };
     // BL2 — the PORT-I/O scenario (x86_64; the kernel provisions it on no other port). One
     // `in al, dx` from COM1's data port. With IOPL 0 and no TSS I/O bitmap the CPU refuses it
@@ -1023,6 +1024,29 @@ fn run_terminal_fault_oracle(
             init_tid,
             value
         );
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    // BL2-a — the ILLEGAL-INSTRUCTION scenario (RISC-V; the kernel provisions it on no other
+    // port). `unimp` is the canonical illegal instruction (a write to the read-only `cycle` CSR).
+    // The CPU raises an illegal-instruction exception in U-mode before it completes; the kernel
+    // reports the fault and takes init down while the rest of the system runs on. Should the
+    // instruction ever complete, the line after it says so, and the cell fails on it.
+    #[cfg(target_arch = "riscv64")]
+    if matches!(scenario, S::DeliberateIllegalInstruction) {
+        yarm_user_rt::user_log!(
+            "TERMINAL_FAULT_ORACLE_BEGIN arch={} init_tid={} insn=unimp access={}",
+            ARCH,
+            init_tid,
+            access
+        );
+        // SAFETY: this instruction is INTENDED to fault. `unimp` raises an illegal-instruction
+        // exception in U-mode without side effects, and the kernel does not resume it.
+        unsafe {
+            core::arch::asm!("unimp", options(nomem, nostack));
+        }
+        yarm_user_rt::user_log!("TERMINAL_FAULT_ILLEGAL_EXECUTED init_tid={}", init_tid);
         loop {
             core::hint::spin_loop();
         }

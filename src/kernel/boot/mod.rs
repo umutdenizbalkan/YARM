@@ -3810,6 +3810,28 @@ pub fn terminal_fault_portio_oracle_enabled() -> bool {
 pub const TERMINAL_FAULT_PORTIO_ORACLE_SELECTOR: u64 =
     yarm_ipc_abi::terminal_fault_oracle_abi::TERMINAL_FAULT_PORTIO_SELECTOR as u64;
 
+/// BL2-a — the ILLEGAL-INSTRUCTION terminal-fault oracle (RISC-V).
+///
+/// Init executes one illegal instruction. The CPU refuses it in U-mode, which is the task's fault
+/// and is settled by the terminal user-fault owners; before BL2-a it decoded as `Unknown` and the
+/// strict production policy panicked the kernel. Default-off, mutually exclusive with the other
+/// scenarios by the shared `init_args[5] == 0` guard; `yarm.terminal_fault_illegal_oracle=1` arms
+/// it.
+pub(crate) static TERMINAL_FAULT_ILLEGAL_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_terminal_fault_illegal_oracle_enabled(enabled: bool) {
+    TERMINAL_FAULT_ILLEGAL_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn terminal_fault_illegal_oracle_enabled() -> bool {
+    TERMINAL_FAULT_ILLEGAL_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The illegal-instruction scenario's slot-5 selector, from the same single owner.
+pub const TERMINAL_FAULT_ILLEGAL_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::terminal_fault_oracle_abi::TERMINAL_FAULT_ILLEGAL_SELECTOR as u64;
+
 /// U9-IRQ-UNKNOWN1 §4 — **the hosted bridge-injection admission, default-off.**
 ///
 /// No production IRQ producer exists on any port: RISC-V enumerates PLIC sources and
