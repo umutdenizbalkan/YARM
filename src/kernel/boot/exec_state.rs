@@ -4255,6 +4255,44 @@ impl crate::runtime::SharedKernel {
         })
     }
 
+    /// AP-SCHED1 §4 — re-apply a receive completion published before its receiver's park
+    /// capture, through the one remote-completion owner. Applies only a parked `IpcRecv` record
+    /// that matches the exact incarnation AND its current receive generation; anything else is
+    /// left exactly as it is. Returns whether a completion was re-applied.
+    ///
+    /// The RISC-V receive park calls this right after its capture (see the bridge): there, and
+    /// only there, a record of the current generation can only have been published for the
+    /// receive being parked, in the window between the waiter's publication and the capture.
+    #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+    pub(crate) fn reapply_parked_recv_completion_split(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) else {
+                return false;
+            };
+            let Some(done) = tcb.pending_syscall_completion else {
+                return false;
+            };
+            if done.syscall_class != crate::kernel::task::BlockedSyscallClass::IpcRecv
+                || !done.matches_tcb(tcb)
+            {
+                return false;
+            }
+            crate::kernel::boot::publish_blocked_recv_timeout_result_with_identity(
+                tcb,
+                done.result,
+                done.tid,
+                done.asid,
+            );
+            crate::yarm_log!(
+                "RECV_COMPLETION_REAPPLIED_AFTER_CAPTURE tid={} code={} blocked_generation={}",
+                tid,
+                done.result,
+                done.blocked_generation
+            );
+            true
+        })
+    }
+
     /// U9-QA — ADMISSION for one queue advance. Makes NO mutation, and is the ONLY place a
     /// refusal can be raised.
     ///

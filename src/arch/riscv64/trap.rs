@@ -1837,7 +1837,8 @@ pub fn handle_riscv_trap_entry_shared(
             // does not: there `finalize_split_handled_syscall` commits the advanced PC separately,
             // so the capture is the register file only. That bridge is deliberately left unchanged;
             // its Yield path is proven live over 4096 yields per boot on both architectures.
-            let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
+            let futex_wait_outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+            let outgoing = futex_wait_outgoing
                 .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx))
                 .or_else(|| crate::kernel::boot::yield_dispatch_outgoing(cpu_idx));
             // U9-EXIT1 §3: never save the exiting frame. This capture exists so a task that will
@@ -1853,6 +1854,21 @@ pub fn handle_riscv_trap_entry_shared(
                     .map(|t| shared.capture_outgoing_user_context_split(t, frame))
                     .unwrap_or(false)
             };
+            // AP-SCHED1 §4 — a RECEIVE's park capture must not erase a completion already
+            // published for that receive. The waiter is visible to other CPUs from its
+            // publication, before this capture; with two dispatching CPUs a remote completion
+            // (a timeout, a server death, an undelivered wake's `WouldBlock`) can land in between
+            // and be overwritten by the live frame's syscall arguments — measured live, a receiver
+            // resuming with its capability number as the result. Only at THIS capture does a
+            // record of the current receive generation necessarily belong to this receive, so the
+            // re-application is scoped to it.
+            if captured
+                && futex_wait_outgoing.is_none()
+                && let Some(t) = outgoing
+                && crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx) == Some(t)
+            {
+                shared.reapply_parked_recv_completion_split(t);
+            }
             crate::yarm_log!(
                 "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu={} result=queue_advance_committed outgoing={} captured={}",
                 nr,

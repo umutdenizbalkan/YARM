@@ -200927,6 +200927,37 @@ mod ap_sched1 {
         );
     }
 
+    /// **A park capture cannot erase a completion already published for that receive.** The
+    /// undelivered wake publishes `WouldBlock` from the other CPU; the receiver's own trap then
+    /// captures its live frame (its syscall arguments) over the saved context. Re-applying the
+    /// parked record of the CURRENT receive generation restores the result; a record of an older
+    /// generation is left alone.
+    #[test]
+    fn a_completion_published_before_the_park_capture_survives_it() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (endpoint_idx, _asid) = blocked_receiver(&k, 82, true);
+        k.wake_waiter_for_endpoint_split(CPU0, endpoint_idx)
+            .expect("wake");
+        let code = crate::kernel::syscall::SyscallError::WouldBlock.code();
+        let rcx = |k: &SharedKernel| {
+            k.with(|s| s.with_tcb_mut(82, |tcb| tcb.user_context.user_gprs[2]))
+                .expect("tcb")
+        };
+        assert_eq!(rcx(&k), code, "published");
+        // The park capture: the live frame still holds the receive's own arguments.
+        let mut frame = crate::kernel::trapframe::TrapFrame::zeroed();
+        frame.set_user_gpr(2, 0x1_0000);
+        assert!(k.capture_outgoing_user_context_split(82, &frame));
+        assert_ne!(rcx(&k), code, "the capture overwrote it");
+        assert!(k.reapply_parked_recv_completion_split(82));
+        assert_eq!(rcx(&k), code, "and the re-application restores it");
+        // A later receive generation makes the record stale: nothing is re-applied.
+        k.with(|s| s.with_tcb_mut(82, |tcb| tcb.blocked_recv_generation += 1));
+        assert!(k.capture_outgoing_user_context_split(82, &frame));
+        assert!(!k.reapply_parked_recv_completion_split(82));
+        assert_ne!(rcx(&k), code);
+    }
+
     /// **A legacy waiter is woken exactly as before**: it re-runs its receive, so nothing is
     /// published into its context.
     #[test]
