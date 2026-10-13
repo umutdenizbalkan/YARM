@@ -42,8 +42,9 @@ const GICC_PMR: usize = 0x004;
 
 /// Each CPU's own GIC CPU-interface bit, published by that CPU.
 static TARGETS: TargetTable<MAX_CPUS> = TargetTable::new();
-/// Set on the BSP immediately before its first return to EL0: the end of the boot window in
-/// which it holds `&mut KernelState` through `borrow_kernel_for_boot`. No AP touches shared kernel
+/// Set on the BSP immediately before its first return to EL0, right after it publishes the boot
+/// state: the end of the boot window in which it holds `&mut KernelState` through the
+/// `BootExclusive` token (BLR1; formerly `borrow_kernel_for_boot`). No AP touches shared kernel
 /// state before it.
 static BSP_BOOT_BORROW_ENDED: AtomicBool = AtomicBool::new(false);
 /// CPUs admitted to pinned dispatch.

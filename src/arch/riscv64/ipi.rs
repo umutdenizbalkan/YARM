@@ -136,8 +136,9 @@ pub fn hart_mask_for(cpus: u64, hart_of: impl Fn(usize) -> Option<usize>) -> Opt
 static PENDING: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// CPUs that can take and service the reschedule IPI. Published by each CPU for itself, last.
 static READY: AtomicU64 = AtomicU64::new(0);
-/// Set by the boot hart immediately before its first user entry: the end of the window in which
-/// it holds `&mut KernelState` through `borrow_kernel_for_boot`. A parked secondary is released
+/// Set by the boot hart immediately before its first user entry, right after it publishes the
+/// boot state: the end of the window in which it holds `&mut KernelState` through the
+/// `BootExclusive` token (BLR1; formerly `borrow_kernel_for_boot`). A parked secondary is released
 /// by this flag and the IPI that announces it; it touches no shared kernel state before.
 static BOOT_BORROW_ENDED: AtomicBool = AtomicBool::new(false);
 

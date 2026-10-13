@@ -773,6 +773,25 @@ fn code_mask(text: &str) -> String {
     String::from_utf8(out).expect("blanking preserves UTF-8")
 }
 
+/// `true` once `prefix` (the attributed text so far) has begun an item that a comma cannot end.
+fn starts_item(prefix: &str) -> bool {
+    prefix
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|w| {
+            matches!(
+                w,
+                "fn" | "impl"
+                    | "struct"
+                    | "enum"
+                    | "trait"
+                    | "type"
+                    | "mod"
+                    | "union"
+                    | "macro_rules"
+            )
+        })
+}
+
 /// `(production, test)`: every item, field, statement or expression attributed with exactly
 /// `#[cfg(test)]` is test; everything else is production (newlines kept, so lines stay true).
 /// A different cfg — `cfg(any(test, ..))`, a feature — is production, deliberately.
@@ -798,7 +817,14 @@ fn split_cfg_test(text: &str) -> (String, String) {
                         break;
                     }
                 }
-                b';' | b',' if depth == 0 => {
+                b';' if depth == 0 => {
+                    k += 1;
+                    break;
+                }
+                // A depth-0 comma ends a field, variant, arm or struct-literal entry — but not an
+                // item whose signature has begun (`fn f() -> Guard<'_, T>`: angle brackets are
+                // not tracked, so its comma is at depth 0).
+                b',' if depth == 0 && !starts_item(&code[start + "#[cfg(test)]".len()..k]) => {
                     k += 1;
                     break;
                 }
@@ -1199,6 +1225,7 @@ fn blr1_trap_installation_is_the_only_pre_publication_handle() {
         );
     }
     let smp = fs::read_to_string(repo_root().join("src/arch/x86_64/smp.rs")).unwrap();
+    let smp = code_mask(&split_cfg_test(&smp).0);
     let live = smp
         .split("fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {")
         .nth(1)
@@ -1207,9 +1234,46 @@ fn blr1_trap_installation_is_the_only_pre_publication_handle() {
         .next()
         .unwrap();
     assert!(
-        !live.contains("set_ap_dispatch_request(cpu, 1)") && !live.contains("write_icr("),
+        live.contains("request_ap_dispatch_at_or_after_publication(cpu);")
+            && !live.contains("set_ap_dispatch_request(cpu, 1)")
+            && !live.contains("write_icr("),
         "x86_64: the in-phase AP dispatcher must not wake the AP; the request is owed until \
          publication"
+    );
+    // Every wake of a first dispatch is publication-ordered: the sender is called only by the
+    // owed-request release (after publication) and by the requester's PUBLISHED branch.
+    for (at, _) in smp.match_indices("send_ap_dispatch_request(") {
+        if smp[..at].ends_with("fn ") {
+            continue; // the definition
+        }
+        let caller = smp[..at]
+            .rsplit("fn ")
+            .next()
+            .and_then(|f| f.split('(').next())
+            .unwrap_or("");
+        assert!(
+            caller == "release_deferred_ap_dispatch_at_publication"
+                || caller == "request_ap_dispatch_at_or_after_publication",
+            "x86_64: `send_ap_dispatch_request` called from `{caller}` — a first dispatch may only \
+             be sent at or after publication"
+        );
+    }
+    let req = smp
+        .split("fn request_ap_dispatch_at_or_after_publication(cpu: CpuId) {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let published = req
+        .find("crate::runtime::boot_state_published()")
+        .expect("gated");
+    let send = req
+        .find("send_ap_dispatch_request(cpu)")
+        .expect("sends when published");
+    assert!(
+        published < send,
+        "x86_64: the direct send is reachable only once published"
     );
 }
 

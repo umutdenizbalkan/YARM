@@ -3575,7 +3575,9 @@ mod tests {
     // The LAPIC timer may fire during bootstrap_first_user_task (ELF loading
     // takes >800 ms; timer deadline is 800 ms). The timer ISR must NOT tick or
     // yield until signal_bootstrap_scheduler_ready() has been called, otherwise
-    // it races with borrow_kernel_for_boot's raw &mut KernelState alias (UB).
+    // it races with the boot path's whole-state `&mut KernelState` (UB). (BLR1: that `&mut` is now
+    // the `BootExclusive` token's loan, and the BSP timer is armed only inside the boot CPU's
+    // interrupt exclusion, so this gate is defence in depth.)
 
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     #[test]
@@ -3607,7 +3609,7 @@ mod tests {
     // run_with_prepared_kernel before STI. This caused the timer ISR to fire
     // 21+ times during bootstrap ELF loading (>800ms in QEMU), each fire
     // creating aliased &mut KernelState via with_cpu while
-    // borrow_kernel_for_boot()'s raw pointer is live — UB that corrupted
+    // the boot raw `&mut` (now the BLR1 `BootExclusive` loan) is live — UB that corrupted
     // bootstrap state and caused it to hang (signal never called).
     //
     // Fix: init_lapic_mmio_base no longer arms the timer; run_with_prepared_kernel

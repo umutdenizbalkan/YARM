@@ -44,8 +44,8 @@ pub fn init_lapic_mmio_base(base: usize) {
     );
     // BT2: do NOT arm the LAPIC timer here. The timer is armed explicitly by
     // start_bsp_periodic_timer() after signal_bootstrap_scheduler_ready(), so
-    // no timer ISR can race with borrow_kernel_for_boot()'s raw &mut alias
-    // during bootstrap ELF loading (which takes >800ms in QEMU).
+    // no timer ISR can race with the boot path's exclusive `&mut KernelState` (the BLR1
+    // `BootExclusive` loan) during bootstrap ELF loading (which takes >800ms in QEMU).
     LAPIC_MMIO_BASE.store(base, Ordering::Relaxed);
     LAPIC_CONFIGURED.store(true, Ordering::Relaxed);
 }
@@ -377,7 +377,7 @@ mod tests {
     fn init_lapic_does_not_arm_timer_before_signal() {
         // BT2: init_lapic_mmio_base must NOT arm the LAPIC timer. The timer is
         // armed explicitly after signal_bootstrap_scheduler_ready() to prevent
-        // ISR aliasing with borrow_kernel_for_boot() during bootstrap ELF load.
+        // ISR aliasing with the boot exclusive `&mut KernelState` during bootstrap ELF load.
         let lapic = LapicTestConfig::acquire();
         init_lapic_mmio_base(lapic.base());
         assert_eq!(

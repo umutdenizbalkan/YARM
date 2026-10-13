@@ -1566,11 +1566,11 @@ impl KernelState {
     /// Stage 114 fix: raw-pointer sibling of the (removed) pre-move
     /// `boot_config_split_read_ptrs(&self)`. That method computed pointers
     /// from the `KernelState` value passed into `SharedKernel::new` *before*
-    /// it was moved into its final `SpinLock<KernelState>` resting place —
+    /// it was moved into its final resting place —
     /// the cached pointers went stale unless the move happened to be elided,
     /// which Rust never guarantees. Like `fault_split_mut_ptrs_from_raw` /
     /// `telemetry_split_mut_ptrs_from_raw`, this takes the *live* address of
-    /// the owning `KernelState` (via `SpinLock::data_ptr()`) and derives
+    /// the owning `KernelState` (via `SharedKernel::state_ptr()`, BLR1) and derives
     /// field pointers with `addr_of!`, so callers must recompute it fresh at
     /// each use rather than caching the result across a move.
     pub(crate) unsafe fn boot_config_split_read_ptrs_from_raw(
@@ -1580,7 +1580,7 @@ impl KernelState {
         *const KernelStorage<BootConfigSubsystem>,
     ) {
         // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s
-        // owning `SpinLock<KernelState>`. `addr_of!` derives raw field
+        // private `state_ptr()` (BLR1: the lock-free state cell). `addr_of!` derives raw field
         // pointers without creating a reference to the whole KernelState.
         unsafe {
             (
@@ -1597,7 +1597,7 @@ impl KernelState {
         *mut KernelStorage<FaultSubsystem>,
     ) {
         // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s
-        // owning `SpinLock<KernelState>`. `addr_of!`/`addr_of_mut!` derive raw
+        // private `state_ptr()` (BLR1: the lock-free state cell). `addr_of!`/`addr_of_mut!` derive raw
         // field pointers without creating references to the whole KernelState.
         unsafe {
             (
@@ -1615,8 +1615,8 @@ impl KernelState {
         *const crate::kernel::lock::SpinLockIrq<()>,
         *mut KernelStorage<RestartSubsystem>,
     ) {
-        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s owning
-        // `SpinLock<KernelState>`. `addr_of!`/`addr_of_mut!` derive raw field pointers without
+        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s private
+        // `state_ptr()` (BLR1: the lock-free state cell). `addr_of!`/`addr_of_mut!` derive raw field pointers without
         // creating references to the whole KernelState.
         unsafe {
             (
@@ -1633,7 +1633,7 @@ impl KernelState {
         *mut KernelStorage<TelemetrySubsystem>,
     ) {
         // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s
-        // owning `SpinLock<KernelState>`. `addr_of!`/`addr_of_mut!` derive raw
+        // private `state_ptr()` (BLR1: the lock-free state cell). `addr_of!`/`addr_of_mut!` derive raw
         // field pointers without creating references to the whole KernelState.
         unsafe {
             (
@@ -2255,8 +2255,8 @@ impl KernelState {
         *const crate::kernel::lock::SpinLockIrq<()>,
         *mut KernelStorage<[Option<RobustFutexRecord>; MAX_TASKS]>,
     ) {
-        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s owning
-        // `SpinLock<KernelState>`; `addr_of!`/`addr_of_mut!` derive raw field pointers without
+        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s private
+        // `state_ptr()` (BLR1); `addr_of!`/`addr_of_mut!` derive raw field pointers without
         // creating references to the whole KernelState.
         unsafe {
             (
