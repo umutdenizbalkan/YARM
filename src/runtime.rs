@@ -10217,7 +10217,13 @@ impl SharedKernel {
                     not(feature = "hosted-dev")
                 ))]
                 crate::arch::riscv64::sr_replace_witness::note_install(
-                    requester, asid.0, virt.0, old.phys.0, hold, acked,
+                    requester,
+                    asid.0,
+                    virt.0,
+                    old.phys.0,
+                    mapping.phys.0,
+                    hold,
+                    acked,
                 );
                 self.settle_displaced_after_invalidation_split(hold, old.phys, acked);
                 if acked {

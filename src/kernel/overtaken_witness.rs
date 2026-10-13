@@ -22,6 +22,22 @@
 //! NATURAL; one the hold waited for as SYNCHRONIZED; one whose bound expired as a TIMEOUT (the
 //! drain then took its ordinary blocked path and the round is not an overtaken one).
 //!
+//! # The premise is established before the wake (AP-SCHED1)
+//!
+//! A FutexWait publishes its block in three steps — register the waiter, clear `current`, read
+//! the registration back — and a wake that lands between the first and the last is settled by
+//! the wait itself (`FUTEX_WAIT_PARK_WOKEN_DURING_PUBLISH`), never reaching the drain. That is a
+//! legitimate production interleaving, and it is NOT an overtaken drain. K used to wake freely, so
+//! a round could take it and W, which cannot tell the two apart, counted it anyway.
+//!
+//! So K no longer issues a round's wake until this hold has proven that round's premise and
+//! published GO: the drain's outgoing task is W, W is `Blocked(Futex(WAIT))` (so its wait
+//! COMMITTED: the read-back passed and `current` is clear), and the word W waits on holds this
+//! round's wait generation (W stores its round number as the futex value it waits for). GO is one
+//! witness-only mailbox word, `GO_MAGIC << 32 | generation`, written through W's address space
+//! with no lock held across anything; K spins on it, bounded and with no kernel entry, and
+//! compares the generation with its own round. Every round's GO generation is recorded and graded.
+//!
 //! W reports its own verdicts by WHERE it parks next: back on the witness word for the next round,
 //! on `FAIL` when its result lane or callee-saved registers did not survive, on `DONE` after the
 //! last round. The `DONE` park emits the sealed summary once K has parked too.
@@ -42,6 +58,12 @@ pub const FAIL_VA: u64 = MBX_VA + 0x40;
 pub const DONE_VA: u64 = MBX_VA + 0x80;
 /// K parks here after its last wake.
 pub const KPARK_VA: u64 = MBX_VA + 0xC0;
+/// AP-SCHED1 — the GO word: `GO_MAGIC << 32 | wait generation`, written by the hold once a round's
+/// premise is proven; K issues that round's wake only after reading it.
+pub const GO_VA: u64 = MBX_VA + 0x100;
+/// K parks here when GO for its round never arrived within its bound.
+pub const KFAIL_VA: u64 = MBX_VA + 0x140;
+pub const GO_MAGIC: u64 = 0x4F56_5447;
 /// Rounds per boot. Must match the programs.
 pub const ROUNDS: usize = 4;
 
@@ -68,6 +90,8 @@ static OBSERVED: [AtomicU64; ROUNDS] = [const { AtomicU64::new(0) }; ROUNDS];
 static SETTLED: [AtomicU64; ROUNDS] = [const { AtomicU64::new(0) }; ROUNDS];
 static INCOMING: [AtomicU64; ROUNDS] = [const { AtomicU64::new(u64::MAX) }; ROUNDS];
 static INCOMING_ASID: [AtomicU64; ROUNDS] = [const { AtomicU64::new(0) }; ROUNDS];
+/// AP-SCHED1 — the wait generation each round's GO published (0 = no GO for the round).
+static GO_GEN: [AtomicU64; ROUNDS] = [const { AtomicU64::new(0) }; ROUNDS];
 
 const SETTLEMENTS: [&str; 5] = [
     "switch",
@@ -141,6 +165,10 @@ pub fn hold_before_futex_drain(
         return;
     }
     HOLD_CPU.store(u64::from(cpu.0), Ordering::Release);
+    // AP-SCHED1 — the premise is proven (W's wait on the witness word committed and this drain
+    // holds it); publish GO for W's exact wait generation, read from the word W is waiting on.
+    // Only a W still blocked there gets a GO, so a round K could have woken early has none.
+    publish_go(shared, round, w);
     let mut spins = 0u64;
     let observed = loop {
         if futex_addr_of(shared, w) != Some(WAIT_VA) {
@@ -166,6 +194,35 @@ pub fn hold_before_futex_drain(
             "timeout"
         }
     );
+}
+
+/// AP-SCHED1 — publish GO for `round`. The generation is the 32-bit value at the witness word,
+/// which is the `expected` value W's FutexWait committed on; it must be this round's number.
+fn publish_go(shared: &crate::runtime::SharedKernel, round: usize, w: u64) {
+    let asid = crate::kernel::vm::Asid(W_ASID.load(Ordering::Acquire) as u16);
+    if futex_addr_of(shared, w) != Some(WAIT_VA) {
+        return;
+    }
+    let generation = match shared.copy_from_user_split(asid, VirtAddr(WAIT_VA), 4) {
+        Ok(b) => u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        Err(_) => return,
+    };
+    if generation != round as u64 + 1 {
+        crate::kernel::printk::printk_emit_sync(format_args!(
+            "OVT_WITNESS_GO_REFUSED round={} tid={} generation={} reason=generation_mismatch",
+            round + 1,
+            w,
+            generation
+        ));
+        return;
+    }
+    let token = (GO_MAGIC << 32) | generation;
+    if shared
+        .copy_to_user_split(asid, VirtAddr(GO_VA), &token.to_le_bytes())
+        .is_ok()
+    {
+        GO_GEN[round].store(generation, Ordering::Release);
+    }
 }
 
 /// The bridge's overtaken settlement, recorded against the round it settles.
@@ -248,6 +305,7 @@ fn dump(_shared: &crate::runtime::SharedKernel, reason: &str) {
         let code = SETTLED[r].load(Ordering::Acquire);
         let inc = INCOMING[r].load(Ordering::Acquire);
         let inc_asid = INCOMING_ASID[r].load(Ordering::Acquire);
+        let go = GO_GEN[r].load(Ordering::Acquire);
         if obs == OBS_OVERTAKEN {
             overtaken += 1;
             if spins > 0 {
@@ -271,7 +329,7 @@ fn dump(_shared: &crate::runtime::SharedKernel, reason: &str) {
         let _ = core::fmt::write(
             &mut parts[1 + r],
             format_args!(
-                "r{}={}/{}/{}/{}/{}",
+                "r{}={}/{}/{}/{}/{}/{}",
                 r + 1,
                 spins,
                 match obs {
@@ -281,21 +339,26 @@ fn dump(_shared: &crate::runtime::SharedKernel, reason: &str) {
                 },
                 name,
                 if inc == u64::MAX { 0 } else { inc },
-                inc_asid
+                inc_asid,
+                go
             ),
         );
     }
-    let ok = reason == "none" && overtaken == ROUNDS && settled == ROUNDS;
+    let gos = (0..ROUNDS)
+        .filter(|&r| GO_GEN[r].load(Ordering::Acquire) == r as u64 + 1)
+        .count();
+    let ok = reason == "none" && overtaken == ROUNDS && settled == ROUNDS && gos == ROUNDS;
     let _ = core::fmt::write(
         &mut parts[ROUNDS + 1],
         format_args!(
-            "overtaken={} synchronized={} natural={} timeouts={} settled={} switched_to_w={} reason={} result={}",
+            "overtaken={} synchronized={} natural={} timeouts={} settled={} switched_to_w={} go={} reason={} result={}",
             overtaken,
             synchronized,
             natural,
             timeouts,
             settled,
             to_w,
+            gos,
             reason,
             if ok { "ok" } else { "fail" }
         ),

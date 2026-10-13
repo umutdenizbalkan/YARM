@@ -23,8 +23,13 @@
 #   * KERNEL COMPLETION — the production install at W: requester CPU 0, the production shootdown's
 #     own target set INCLUDES CPU 1 (`targets=0x2`), the firmware fence succeeded, the outcome is
 #     `complete`, and only then the displaced page's hold settled and reclaimed exactly its own
-#     object (`SRR_KERNEL_SETTLE ... reclaimed=1`, object = the provisioned one), before O's
-#     observation is reported.
+#     object (`SRR_KERNEL_SETTLE ... reclaimed=1`, object = the provisioned one).
+#   * ORDER BY CAUSE, NOT BY CONSOLE (AP-SCHED1) — every ordering obligation is checked on the
+#     witness's `seq=` stamps (scripts/grade-riscv64-sr-replace-witness.py): O primed before the
+#     invalidation was planned, the target set preceded the fence request, the fence completed
+#     before the outcome, O's observation follows the fence request, R's read and the settlement
+#     follow the outcome. O's line may be PRINTED before the install line: that line is printed
+#     only once the outcome is known, after O's hart has already been fenced.
 #   * NOTHING ELSE: no incomplete invalidation, no retained hold, no refused displacement, no
 #     panic.
 set -uo pipefail
@@ -103,52 +108,8 @@ PY
 [[ -s "$BOOT_LOG" ]] || { seal "result=fail reason=no_boot_log"; exit 1; }
 NORM="$LOGDIR/boot.norm.log"
 tr '\r' '\n' <"$BOOT_LOG" >"$NORM"
-python3 -I - "$NORM" <<'PY'
-import re, sys
-lines = open(sys.argv[1], errors="replace").read().split("\n")
-fails = []
-def find(pat):
-    rx = re.compile(pat)
-    return [(i, l) for i, l in enumerate(lines) if rx.search(l)]
-def one(pat, why):
-    hits = find(pat)
-    if len(hits) != 1:
-        fails.append(f"{why} (found {len(hits)})")
-        return None
-    return hits[0]
-prov = one(r"SRR_WITNESS_PROVISIONED ", "provisioned once")
-placed = one(r"SRR_WITNESS_SECONDARY_PLACED cpu=1 tid=9401 kick=1", "observer placed on CPU 1 with a kick")
-old_obj = None
-if prov:
-    m = re.search(r"old_object=(\d+)", prov[1]); old_obj = m and m.group(1)
-# OBSERVED BYTES
-r_ok = one(r"SRR_USER cpu=0 tid=9400 step=R_OK round=0 aux=0x1000 ", "R received at W and read the granted bytes")
-o_ready = one(r"SRR_USER cpu=1 tid=9401 step=O_READY ", "O primed W on CPU 1")
-o_new = one(r"SRR_USER cpu=1 tid=9401 step=O_NEW round=0 aux=0x5a ", "O observed the granted byte on CPU 1")
-# KERNEL COMPLETION
-inst = one(r"SRR_KERNEL_INSTALL route=queued requester_cpu=0 .* targets=0x2 fence=1 .* outcome=complete", "install: requester 0, remote target CPU 1, fence ok, complete")
-settle = one(r"SRR_KERNEL_SETTLE ", "the displaced hold settled once")
-if settle:
-    m = re.search(r"object=(\d+) expected_object=(\d+) phys=\S+ reclaimed=(\d)", settle[1])
-    if not m or m.group(1) != m.group(2) or m.group(3) != "1" or (old_obj and m.group(1) != old_obj):
-        fails.append(f"settlement reclaimed exactly the displaced object [{settle[1].strip()}]")
-verdict = one(r"SRR_VERDICT bytes=1 .* observer_credited=1 kernel=1 .* result=ok", "verdict ok")
-if inst and settle and inst[0] > settle[0]:
-    fails.append("the hold settled before the install's completion was known")
-if inst and o_new and inst[0] > o_new[0]:
-    fails.append("O's observation reported before the install completed")
-if o_ready and inst and o_ready[0] > inst[0]:
-    fails.append("O was not resident before the replacement")
-for bad in ["SHARED_REGION_MAP_INVALIDATION_INCOMPLETE", "VM_DISPLACED_HOLD_RETAINED",
-            "VM_MAP_DISPLACEMENT_REFUSED", "KERNEL PANIC", "panicked at", "SRR_WITNESS_PLACEMENT_FAIL",
-            "SRR_USER cpu=1 tid=9401 step=O_STALE", "R_RECV_FAIL", "R_SEND_FAIL", "R_BYTES_FAIL",
-            "R_NO_OBSERVER", "O_PRIME_FAIL"]:
-    if any(bad in l for l in lines):
-        fails.append(f"forbidden: {bad}")
-for f in fails:
-    print(f"[srr-witness][fail] {f}")
-if fails:
-    print("SRR_WITNESS_SEAL arch=riscv64 result=fail")
-    sys.exit(1)
-print("SRR_WITNESS_SEAL arch=riscv64 requester_cpu=0 remote_target=cpu1 fence=ok install=complete settle=reclaimed observer=credited bytes=granted result=ok")
-PY
+# AP-SCHED1: the grader orders by the witness's causal stamps, not console positions; its own
+# fixture controls run first, so a grader that stopped rejecting a known-bad boot cannot pass one.
+python3 -I scripts/grade-riscv64-sr-replace-witness.py --self-test >"$LOGDIR/grader-self-test.txt" \
+  || { cat "$LOGDIR/grader-self-test.txt"; seal "result=fail reason=grader_self_test"; exit 1; }
+python3 -I scripts/grade-riscv64-sr-replace-witness.py "$NORM"

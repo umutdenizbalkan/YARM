@@ -27,6 +27,18 @@
 //! every return to U-mode — so O's observation is credited only when its hart took NO supervisor
 //! entry between O_READY (after which O primes W) and the O_NEW step itself. Then the only thing
 //! that can have retired O's cached translation of W is the remote fence R's install requested.
+//!
+//! # Causal order, not console order (AP-SCHED1)
+//!
+//! Each record that the grader orders carries `seq=`, drawn from ONE witness-only atomic counter
+//! at the moment the event happens: the target set, the fence request, the fence's completion,
+//! the install's outcome, the settlement, and every user step. One `fetch_add` on one location is
+//! a single total order that every hart agrees on, and each stamp is drawn AFTER the event it
+//! names (a user step's after the task's own load, the fence request's before the firmware call).
+//! So a remote observer's step may legitimately be PRINTED before the requester's install line,
+//! which is only printed once the outcome is known, and yet carry a later stamp than the fence
+//! request it depends on. The grader orders by `seq`, never by line position. Nothing here
+//! waits: a stamp is one `AcqRel` read-modify-write, and the install line keeps its single print.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -81,6 +93,18 @@ static R_RESULT: AtomicU64 = AtomicU64::new(0);
 static O_RESULT: AtomicU64 = AtomicU64::new(0);
 static O_CREDITED: AtomicBool = AtomicBool::new(false);
 static VERDICT: AtomicBool = AtomicBool::new(false);
+/// AP-SCHED1 — the causal stamp source, and the stamps of the kernel events the install line
+/// reports (0 = the event did not happen).
+static SEQ: AtomicU64 = AtomicU64::new(0);
+static TARGETS_SEQ: AtomicU64 = AtomicU64::new(0);
+static FENCE_REQ_SEQ: AtomicU64 = AtomicU64::new(0);
+static FENCE_REQ_MASK: AtomicU64 = AtomicU64::new(0);
+static FENCE_DONE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Draw the next causal stamp (1, 2, ...).
+fn stamp() -> u64 {
+    SEQ.fetch_add(1, Ordering::AcqRel) + 1
+}
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
@@ -199,7 +223,8 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
 
     // The granted object: one page of NEW_BYTE.
     let (new_id, _new_cap) = kernel.alloc_anonymous_memory_object()?;
-    fill(object_phys(kernel, new_id)?, NEW_BYTE)?;
+    let new_phys = object_phys(kernel, new_id)?;
+    fill(new_phys, NEW_BYTE)?;
 
     bind(kernel, R_TID, asid, R_CODE_VA, R_STACK_VA + 0xff0)?;
     bind(kernel, O_TID, asid, O_CODE_VA, O_STACK_VA + 0xff0)?;
@@ -242,7 +267,7 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
     kernel.enqueue_task(R_TID)?;
     ENABLED.store(true, Ordering::Release);
     crate::kernel::printk::printk_emit_sync(format_args!(
-        "SRR_WITNESS_PROVISIONED r_tid={} o_tid={} asid={} w_va=0x{:x} old_object={} old_phys=0x{:x} new_object={} r_image={} o_image={}",
+        "SRR_WITNESS_PROVISIONED r_tid={} o_tid={} asid={} w_va=0x{:x} old_object={} old_phys=0x{:x} new_object={} new_phys=0x{:x} r_image={} o_image={}",
         R_TID,
         O_TID,
         asid.0,
@@ -250,6 +275,7 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
         old_id,
         old_phys,
         new_id,
+        new_phys,
         r_image.len(),
         o_image.len()
     ));
@@ -270,11 +296,15 @@ pub fn secondary_admitted(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
         return;
     }
     let kicked = crate::arch::riscv64::ipi::kick_self(cpu);
+    // The hart this logical CPU really is: the fence's hart mask is graded against it.
+    let hart =
+        crate::arch::riscv64::boot::hart_id_of_logical_cpu(cpu.0 as usize).map_or(-1, |h| h as i64);
     crate::kernel::printk::printk_emit_sync(format_args!(
-        "SRR_WITNESS_SECONDARY_PLACED cpu={} tid={} kick={}",
+        "SRR_WITNESS_SECONDARY_PLACED cpu={} tid={} kick={} hart={}",
         cpu.0,
         O_TID,
-        u8::from(kicked)
+        u8::from(kicked),
+        hart
     ));
 }
 
@@ -290,8 +320,18 @@ pub fn note_shoot_targets(requester: CpuId, asid: u16, va: u64, targets: u64) {
     if !watched(asid, va) {
         return;
     }
+    TARGETS_SEQ.store(stamp(), Ordering::Release);
     TARGETS.store(targets, Ordering::Release);
     REQUESTER.store(u64::from(requester.0), Ordering::Release);
+}
+
+/// The firmware remote fence for W is about to be requested (after the requester's `fence`).
+pub fn note_fence_request(asid: u16, va: u64, hart_mask: usize) {
+    if !watched(asid, va) {
+        return;
+    }
+    FENCE_REQ_MASK.store(hart_mask as u64, Ordering::Release);
+    FENCE_REQ_SEQ.store(stamp(), Ordering::Release);
 }
 
 /// The firmware remote fence's result for W (observation only).
@@ -299,6 +339,7 @@ pub fn note_fence_done(asid: u16, va: u64, hart_mask: usize, ok: bool) {
     if !watched(asid, va) {
         return;
     }
+    FENCE_DONE_SEQ.store(stamp(), Ordering::Release);
     FENCE_MASK.store(hart_mask as u64, Ordering::Release);
     FENCE.store(if ok { 1 } else { 2 }, Ordering::Release);
 }
@@ -309,19 +350,22 @@ pub fn note_install(
     asid: u16,
     va: u64,
     old_phys: u64,
+    new_phys: u64,
     hold: Option<u64>,
     complete: bool,
 ) {
     if !watched(asid, va) {
         return;
     }
+    let seq = stamp();
     INSTALL.store(if complete { 1 } else { 2 }, Ordering::Release);
     crate::kernel::printk::printk_emit_sync(format_args!(
-        "SRR_KERNEL_INSTALL route=queued requester_cpu={} asid={} va=0x{:x} old_phys=0x{:x} hold={} targets=0x{:x} fence={} fence_hart_mask=0x{:x} outcome={}",
+        "SRR_KERNEL_INSTALL route=queued requester_cpu={} asid={} va=0x{:x} old_phys=0x{:x} new_phys=0x{:x} hold={} targets=0x{:x} fence={} fence_hart_mask=0x{:x} outcome={}",
         requester.0,
         asid,
         va,
         old_phys,
+        new_phys,
         hold.map_or(-1, |h| h as i64),
         TARGETS.load(Ordering::Acquire),
         FENCE.load(Ordering::Acquire),
@@ -330,7 +374,16 @@ pub fn note_install(
             "complete"
         } else {
             "invalidation_incomplete"
-        }
+        },
+    ));
+    // A second record: one printk record is bounded, and the stamps do not fit beside the facts.
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "SRR_KERNEL_INSTALL_ORDER seq={} targets_seq={} fence_req_seq={} fence_req_mask=0x{:x} fence_done_seq={}",
+        seq,
+        TARGETS_SEQ.load(Ordering::Acquire),
+        FENCE_REQ_SEQ.load(Ordering::Acquire),
+        FENCE_REQ_MASK.load(Ordering::Acquire),
+        FENCE_DONE_SEQ.load(Ordering::Acquire),
     ));
 }
 
@@ -339,13 +392,15 @@ pub fn note_settle(object: u64, phys: u64, reclaimed: bool) {
     if !enabled() || phys != OLD_PHYS.load(Ordering::Acquire) {
         return;
     }
+    let seq = stamp();
     SETTLE.store(if reclaimed { 1 } else { 2 }, Ordering::Release);
     crate::kernel::printk::printk_emit_sync(format_args!(
-        "SRR_KERNEL_SETTLE object={} expected_object={} phys=0x{:x} reclaimed={}",
+        "SRR_KERNEL_SETTLE object={} expected_object={} phys=0x{:x} reclaimed={} seq={}",
         object,
         OLD_OBJECT.load(Ordering::Acquire),
         phys,
-        u8::from(reclaimed)
+        u8::from(reclaimed),
+        seq
     ));
 }
 
@@ -354,18 +409,21 @@ pub fn observe_user_marker(cpu: CpuId, tid: u64, msg: &str, round: u64, aux: u64
     if !enabled() || !msg.starts_with("SRR ") {
         return false;
     }
+    // Drawn at the step's own supervisor entry, after the task's load it reports.
+    let seq = stamp();
     let entries = ENTRIES
         .get(cpu.0 as usize)
         .map_or(0, |n| n.load(Ordering::Acquire));
     let step = msg.trim_end();
     crate::kernel::printk::printk_emit_sync(format_args!(
-        "SRR_USER cpu={} tid={} step={} round={} aux=0x{:x} entries={}",
+        "SRR_USER cpu={} tid={} step={} round={} aux=0x{:x} entries={} seq={}",
         cpu.0,
         tid,
         step.trim_start_matches("SRR "),
         round,
         aux,
-        entries
+        entries,
+        seq
     ));
     match step {
         "SRR O_READY" => O_READY_ENTRIES.store(entries, Ordering::Release),

@@ -8,8 +8,11 @@
  *   W — the client, CPU 0. Each round: load rbx rbp r12 r13 with a round-specific pattern,
  *       FutexWait on WAIT, and on return require a clear error lane (ecx == 0), the pattern and the
  *       same rsp. Next round on success; park on FAIL on any mismatch; park on DONE after the last.
- *   K — the server, CPU 1. Each round: FutexWake WAIT until one call wakes exactly one waiter
- *       (pausing between attempts), then log it. Park on KPARK after the last round.
+ *   K — the server, CPU 1. Each round: wait (bounded, no kernel entry) until the kernel's hold
+ *       publishes GO for this round's wait generation — W's wait on WAIT has COMMITTED and its
+ *       drain is held — then FutexWake WAIT until one call wakes exactly one waiter (pausing
+ *       between attempts), then log it. Park on KPARK after the last round; log OVT_K_GO_TIMEOUT
+ *       and park on KFAIL if GO never arrives (AP-SCHED1).
  * Everything is position-independent; strings are RIP-relative.
  */
     .pushsection .text.yarm_ovt_witness, "ax", @progbits
@@ -18,6 +21,10 @@
     .set OVT_FAIL, 0x20070040
     .set OVT_DONE, 0x20070080
     .set OVT_KPARK, 0x200700C0
+    .set OVT_GO, 0x20070100
+    .set OVT_KFAIL, 0x20070140
+    .set OVT_GO_MAGIC, 0x4F565447
+    .set OVT_GO_BOUND, 0x40000000
     .set OVT_ROUNDS, 4
 
     /*
@@ -94,6 +101,23 @@ yarm_ovt_x86_k_start:
     xor r15d, r15d
 1:
     inc r15
+    /* GO: high 32 bits the magic, low 32 bits this round's wait generation (= r15). */
+    mov r14d, OVT_GO_BOUND
+6:
+    mov edi, OVT_GO
+    mov rax, qword ptr [rdi]
+    cmp eax, r15d
+    jne 7f
+    shr rax, 32
+    cmp eax, OVT_GO_MAGIC
+    je 2f
+7:
+    pause
+    dec r14d
+    jnz 6b
+    OVT_LOG ovt_x86_k_go_timeout
+    xor r15d, r15d
+    jmp 8f
 2:
     mov eax, 10
     mov edi, OVT_WAIT
@@ -114,8 +138,13 @@ yarm_ovt_x86_k_start:
 4:
     OVT_WAIT_ON OVT_KPARK
     jmp 4b
+8:
+    OVT_WAIT_ON OVT_KFAIL
+    jmp 8b
 ovt_x86_k_woke: .ascii "OVT_K_WOKE_ONE"
 ovt_x86_k_woke_end:
+ovt_x86_k_go_timeout: .ascii "OVT_K_GO_TIMEOUT"
+ovt_x86_k_go_timeout_end:
     .global yarm_ovt_x86_k_end
 yarm_ovt_x86_k_end:
 

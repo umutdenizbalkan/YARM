@@ -7,6 +7,12 @@ Usage: grade-overtaken-witness.py <boot.log> <arch>
 The verdict comes from the kernel's sealed summary (printed twice, FNV-1a checked), cross-checked
 against the provisioning markers; live lines are reported, never trusted over the seal, because two
 CPUs write the console. Exit 0 only for `result=ok` with every required fact.
+
+AP-SCHED1: every round must carry the GO generation the kernel's hold published once that round's
+premise was proven (W's wait committed, its drain held), equal to the round number. A wake that
+lands while W's wait is still being published is settled by the wait itself and is not an
+overtaken drain: `FUTEX_WAIT_PARK_WOKEN_DURING_PUBLISH` for W on the witness word, a refused GO or
+K's GO timeout fails the boot instead of being counted as a round.
 """
 import re
 import sys
@@ -30,7 +36,8 @@ def fnv1a(b):
 
 FATAL = re.compile(
     r"KERNEL PANIC|RUST PANIC|panicked at|OVERTAKEN_DEFERRAL_UNAUTHENTICATED|"
-    r"USER_FPU_HOME_UNAUTHENTICATED|POST_LOCK_DISPATCH_FATAL|OVT_WITNESS_[A-Z_]*FAIL"
+    r"USER_FPU_HOME_UNAUTHENTICATED|POST_LOCK_DISPATCH_FATAL|OVT_WITNESS_[A-Z_]*FAIL|"
+    r"OVT_WITNESS_GO_REFUSED|OVT_K_GO_TIMEOUT"
 )
 for l in lines:
     if FATAL.search(l):
@@ -93,17 +100,22 @@ if body:
     for r in range(1, n + 1):
         v = f.get("r%d" % r, "")
         parts = v.split("/")
-        if len(parts) != 5:
+        if len(parts) != 6:
             fail("round %d record malformed: %r" % (r, v))
             continue
-        spins, obs, settle, inc, inc_asid = int(parts[0]), parts[1], parts[2], int(parts[3]), int(parts[4])
-        per.append((spins, obs, settle, inc, inc_asid))
+        spins, obs, settle, inc, inc_asid, go = (int(parts[0]), parts[1], parts[2], int(parts[3]),
+                                                 int(parts[4]), int(parts[5]))
+        per.append((spins, obs, settle, inc, inc_asid, go))
+        if go != r:
+            fail("round %d: no GO for wait generation %d (premise not established; go=%d)" % (r, r, go))
         if obs != "overtaken":
             fail("round %d: the drain was not overtaken (%s)" % (r, obs))
         if settle not in ("switch", "idle"):
             fail("round %d: settled as %s (only switch or idle are valid for an empty current)" % (r, settle))
         if settle == "switch" and inc == w_tid and inc_asid != w_asid:
             fail("round %d: resumed W under asid %d, not %s" % (r, inc_asid, w_asid))
+    if f.get("go") != str(n):
+        fail("GO published for %s of %d rounds" % (f.get("go"), n))
     if f.get("result") != "ok" or f.get("reason") != "none":
         fail("summary result=%s reason=%s" % (f.get("result"), f.get("reason")))
     sync = sum(1 for p in per if p[0] > 0 and p[1] == "overtaken")
@@ -117,6 +129,14 @@ settled = [l for l in lines if "OVERTAKEN_DEFERRAL_SETTLED arch=%s" % arch in l 
 k_woke = sum(1 for l in lines if re.search(r"tid=%s .*OVT_K_WOKE_ONE" % k_tid, l))
 w_ok = sum(1 for l in lines if re.search(r"tid=%s .*OVT_W_ROUND_OK" % w_tid, l))
 print("[overtaken-witness] live: settled_lines=%d k_woke=%d w_round_ok=%d" % (len(settled), k_woke, w_ok))
+# AP-SCHED1: a round W counted must be a round the hold held.
+if rounds is not None and body:
+    if w_ok != rounds or k_woke != rounds:
+        fail("W counted %d and K woke %d rounds, %d expected" % (w_ok, k_woke, rounds))
+    early = [l for l in lines if "FUTEX_WAIT_PARK_WOKEN_DURING_PUBLISH tid=%s " % w_tid in l
+             and " addr=%d " % 0x20070000 in l]
+    if early:
+        fail("W's wait on the witness word was woken during its publication %d time(s)" % len(early))
 natural_other = [l for l in lines if "OVERTAKEN_DEFERRAL_SETTLED" in l and ("outgoing=%s " % w_tid) not in l]
 print("[overtaken-witness] naturally occurring settlements outside the witness: %d" % len(natural_other))
 

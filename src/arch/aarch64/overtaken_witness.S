@@ -8,8 +8,11 @@
  *   W — CPU 0. Each round: load x19..x28 with a round-specific pattern, FutexWait on WAIT, and on
  *       return require a non-error result lane (x0 <= 1), the pattern in x19..x28 and the same SP.
  *       Next round on success; park on FAIL on any mismatch; park on DONE after the last round.
- *   K — CPU 1. Each round: FutexWake WAIT until one call wakes exactly one waiter (yielding
- *       between attempts), then log it. Park on KPARK after the last round.
+ *   K — CPU 1. Each round: wait (bounded, no kernel entry) until the kernel's hold publishes GO
+ *       for this round's wait generation — W's wait on WAIT has COMMITTED and its drain is held —
+ *       then FutexWake WAIT until one call wakes exactly one waiter (yielding between attempts),
+ *       then log it. Park on KPARK after the last round; log OVT_K_GO_TIMEOUT and park on KFAIL if
+ *       GO never arrives (AP-SCHED1).
  * W's verdict is where it parks: the kernel witness reads it and emits the sealed summary.
  */
     .pushsection .text.yarm_ovt_witness, "ax", %progbits
@@ -18,6 +21,10 @@
     .set FAIL_VA, 0x20070040
     .set DONE_VA, 0x20070080
     .set KPARK_VA, 0x200700C0
+    .set GO_VA, 0x20070100
+    .set KFAIL_VA, 0x20070140
+    .set GO_MAGIC, 0x4F565447
+    .set GO_BOUND, 0x40000000
     .set ROUNDS, 4
 
     .set NR_YIELD, 0
@@ -123,6 +130,28 @@ yarm_ovt_k_start:
     mov x20, #0
 1:
     add x20, x20, #1
+    /* GO: high 32 bits the magic, low 32 bits this round's wait generation (= x20). */
+    OLI32 x11, GO_BOUND
+    OLI32 x12, GO_MAGIC
+6:
+    OLI32 x0, GO_VA
+    ldr x10, [x0]
+    cmp w10, w20
+    b.ne 7f
+    lsr x10, x10, #32
+    cmp x10, x12
+    b.eq 2f
+7:
+    yield
+    subs x11, x11, #1
+    b.ne 6b
+    adr x0, ovt_k_go_timeout
+    adr x1, ovt_k_go_timeout_end
+    sub x1, x1, x0
+    mov x8, #NR_LOG
+    svc #0
+    mov x20, #0
+    b 8f
 2:
     OLI32 x0, WAIT_VA
     mov x1, #1
@@ -144,8 +173,13 @@ yarm_ovt_k_start:
 4:
     OWAIT KPARK_VA
     b 4b
+8:
+    OWAIT KFAIL_VA
+    b 8b
 ovt_k_woke: .ascii "OVT_K_WOKE_ONE"
 ovt_k_woke_end:
+ovt_k_go_timeout: .ascii "OVT_K_GO_TIMEOUT"
+ovt_k_go_timeout_end:
     .balign 4
     .global yarm_ovt_k_end
 yarm_ovt_k_end:

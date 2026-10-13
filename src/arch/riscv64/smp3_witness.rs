@@ -661,6 +661,8 @@ pub fn note_fence_request(
     asid: u16,
     virt: u64,
 ) -> u64 {
+    #[cfg(feature = "riscv64-sr-replace-witness")]
+    crate::arch::riscv64::sr_replace_witness::note_fence_request(asid, virt, hart_mask);
     if !watches(virt) {
         return 0;
     }
