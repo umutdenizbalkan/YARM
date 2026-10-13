@@ -116,7 +116,7 @@ fn every_witness_entry_point_is_feature_gated() {
         (
             "enable",
             BOOT_ENTRY,
-            "pl011_irq_witness::enable_source_before_unmask()",
+            "pl011_irq_witness::enable_source_before_unmask(kernel)",
         ),
     ] {
         let at = pos(src, call);
@@ -184,7 +184,12 @@ fn the_fixture_owns_no_part_of_the_interrupt_path() {
 /// enable runs before the PE unmask the timer bring-up already had last.
 #[test]
 fn the_enable_order_is_readiness_route_controller_uart_source_admission() {
-    let enable = body_after(WITNESS, "pub fn enable_source_before_unmask() -> bool {");
+    let enable = body_after(
+        WITNESS,
+        "pub fn enable_source_before_unmask(kernel: &crate::kernel::boot::KernelState) -> bool {",
+    );
+    // BLR1: the route is read from the boot exclusive state the caller lends.
+    assert!(enable.contains("kernel.with_ipc_state(") && !enable.contains("with_ipc_split_mut("));
     let order = [
         "let f = live_facts(pa);",
         "super::irq::controller_configured()",
@@ -209,16 +214,24 @@ fn the_enable_order_is_readiness_route_controller_uart_source_admission() {
     }
     let hook = pos(
         BOOT_ENTRY,
-        "pl011_irq_witness::enable_source_before_unmask()",
+        "pl011_irq_witness::enable_source_before_unmask(kernel)",
     );
-    let unmask = pos(
-        BOOT_ENTRY,
-        "crate::arch::aarch64::irq::enable_interrupts_for_boot();",
-    );
+    // BLR1: the PE unmask is no longer performed by the timer arm. The arm records it as owed on
+    // the one path where every gate passed; it is discharged after publication, by the `eret` to
+    // EL0 or by `finish_bsp_timer_unmask`. The source is still enabled before it is owed.
+    let unmask = pos(BOOT_ENTRY, "arm = BspTimerArm::UnmaskOwed;");
     let gic = pos(BOOT_ENTRY, "enable_bsp_arch_timer_ppi()");
     assert!(
         gic < hook && hook < unmask,
-        "GIC confirmed -> source enabled -> PE unmask"
+        "GIC confirmed -> source enabled -> PE unmask (owed)"
+    );
+    assert!(
+        pos(BOOT_ENTRY, "pub fn finish_bsp_timer_unmask(")
+            < pos(
+                BOOT_ENTRY,
+                "crate::arch::aarch64::irq::enable_interrupts_for_boot();"
+            ),
+        "the only unmask is the owed one"
     );
 }
 

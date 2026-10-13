@@ -2269,7 +2269,7 @@ impl KernelState {
             Trap::TimerInterrupt => {
                 self.hal.acknowledge_interrupt(self.current_cpu(), 0);
                 // x86_64: During bootstrap, the boot path holds the whole-state
-                // `&mut KernelState` (BLR1: the `BootExclusive` loan; there is no SpinLock any
+                // `&mut KernelState` (BLR1: the boot token's exclusive loan; there is no SpinLock any
                 // more). A timer ISR reaching kernel state then would alias it — UB.
                 // Guard: skip tick/yield until signal_bootstrap_scheduler_ready() is
                 // called (after all user tasks are spawned and enqueued). EOI + re-arm

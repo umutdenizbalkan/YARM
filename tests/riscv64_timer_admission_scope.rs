@@ -92,14 +92,15 @@ fn the_timer_is_armed_before_the_first_user_task() {
     let arm = BOOT
         .find("timer::arm_timer_at_boot_safe_point()")
         .expect("the arm site");
-    let run = BOOT.find("\n    run(kernel);").expect("the boot run call");
+    // BLR1: the workload receives the boot exclusive token, not a raw `&mut KernelState`.
+    let run = BOOT.find("\n    run(boot);").expect("the boot run call");
     assert!(
         arm < run,
         "the timer must be armed BEFORE control passes to the workload"
     );
     // …and after SharedKernel is installed, so the bridge can reach the kernel when it fires.
     let shared = BOOT
-        .find("install_riscv_trap_shared_kernel(shared);")
+        .find("install_riscv_trap_shared_kernel(boot.shared_for_trap_installation());")
         .expect("the SharedKernel install");
     assert!(
         shared < arm,

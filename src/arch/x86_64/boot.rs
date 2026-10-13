@@ -1409,6 +1409,8 @@ pub fn enter_dispatched_user_task_if_available(
         // until the `iretq` below loads the user RFLAGS.
         let _shared = boot.publish();
         crate::arch::x86_64::smp::release_deferred_ap_dispatch_at_publication();
+        #[cfg(feature = "x86_64-uart-irq-witness")]
+        crate::arch::x86_64::uart_irq_witness::note_admission_at_first_user_entry();
         #[allow(unreachable_code)]
         {
             // The stack pointer was pre-adjusted to RSP ≡ 8 (mod 16) at task

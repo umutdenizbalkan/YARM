@@ -117,12 +117,21 @@ dev=$(grep -a -m1 'IRQ3_UART_DEVICE_ENABLED' "$NORM" | sed 's/.*IRQ3_UART_DEVICE
 has_all "$dev" port=0x3f8 cpu_if=0 ier=0x1 stale_drained=0
 [[ $(count 'IRQ3_UART_CPU_ADMISSION vector=0x24 if_restored=1 after=source_enabled') == 1 ]] \
   || die "CPU admission not restored after the source was enabled"
+# BLR1: the source is enabled inside the boot exclusion, so the admission is OWED there and made by
+# the first user `iretq`, after the boot state is published — never inside the exclusive phase.
+[[ $(count 'IRQ3_UART_CPU_ADMISSION_OWED vector=0x24 if_at_call=0 after=source_enabled until=first_user_entry') == 1 ]] \
+  || die "the source was not enabled inside the boot exclusion (admission not owed)"
+[[ $(count 'IRQ3_UART_CPU_ADMISSION vector=0x24 if_restored=1 after=source_enabled by=first_user_iretq') == 1 ]] \
+  || die "CPU admission not made by the first user iretq"
 enabled=$(grep -a -m1 'IRQ3_UART_SOURCE_ENABLED' "$NORM" | sed 's/.*IRQ3_UART_SOURCE_ENABLED/IRQ3_UART_SOURCE_ENABLED/')
 has_all "$enabled" gsi=4 ioapic_pin=4 vector=0x24 line=4 dest_apic=0 redir_low=0x24 redir_high=0x0 ioapic_pins=24 items=8
 [[ $(count 'IRQ1_WITNESS_PROVISION_OK init_tid=1 irq_line=4 ') == 1 ]] || die "route not bound to line 4"
 [[ $(count 'IRQ3_WITNESS_SLOTS slot5=30 ') == 1 ]] || die "receiver slots not provisioned"
 prov=$(line_of 'IRQ1_WITNESS_PROVISION_OK'); tim=$(line_of 'X86_BOOTSTRAP_TIMER_STARTED'); acc=$(line_of 'IRQ3_UART_MMIO_ACCESS page=ioapic')
-dv=$(line_of 'IRQ3_UART_DEVICE_ENABLED'); en=$(line_of 'IRQ3_UART_SOURCE_ENABLED'); adm=$(line_of 'IRQ3_UART_CPU_ADMISSION')
+dv=$(line_of 'IRQ3_UART_DEVICE_ENABLED'); en=$(line_of 'IRQ3_UART_SOURCE_ENABLED'); adm=$(line_of 'IRQ3_UART_CPU_ADMISSION vector')
+owed=$(line_of 'IRQ3_UART_CPU_ADMISSION_OWED'); pub=$(line_of 'YARM_RING3_INIT_TASK')
+[[ -n "$owed" && -n "$pub" ]] && (( en < owed && owed < pub && pub < adm )) \
+  || die "order is not source enabled -> admission owed -> first user entry prepared -> admission ($en/$owed/$pub/$adm)"
 [[ -n "$prov" && -n "$tim" && -n "$acc" && -n "$dv" && -n "$en" && -n "$adm" ]] && (( prov < tim && tim < acc && acc < dv && dv < en && en < adm )) \
   || die "order is not route bound -> timer armed -> access -> device -> source -> CPU admission ($prov/$tim/$acc/$dv/$en/$adm)"
 

@@ -19,6 +19,14 @@ remove implicit global-lock coupling from syscall/trap paths.
 
 ### 0.1 The two-tier architecture
 
+> **BROAD-LOCK-RETIREMENT1: tier 1 is deleted.** There is no `SpinLock<KernelState>`, no
+> production `with()` / `with_cpu()` / `lock()`, and no other whole-state guard. The state is a
+> lock-free cell (`KernelStateCell`) reached only through the private raw `state_ptr()`, which the
+> tier-2 seams project field by field under each field's own authority; the one production
+> whole-state `&mut` is the boot exclusive phase (`BootExclusive`), ended by publication before the
+> first user entry. The diagram below is the pre-BLR1 architecture. See `doc/KERNEL_UNLOCKING.md`
+> §BLR1 for the field-authority table and the boot handoff.
+
 ```
 SharedKernel                       src/runtime.rs:231
 └── state: SpinLock<KernelState>   ← the BROAD lock ("global lock")
@@ -53,7 +61,9 @@ lines excluded.
 |----------|---------------------|
 | `SharedKernel::with_cpu` | **0** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **0** |
-| Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
+| Raw `self.state.lock()` | **0** (BLR1: 3 → 0 — the definitions and the lock are deleted) |
+| Production broad-wrapper definitions | **0** (BLR1) |
+| Production broad-lock storage | **0** (BLR1) |
 | **Total broad-lock acquisition sites** | **0** |
 
 > **U9-D3 — DELIVERED; U9 REMAINS OPEN.** The D3 fence of `AI_AGENT_RULES` §14.4 is discharged:

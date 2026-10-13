@@ -99,7 +99,16 @@ fn every_witness_entry_point_is_feature_gated() {
             X86_BOOT,
             "uart_irq_witness::derive_route()",
         ),
-        ("enable", BOOT_ENTRY, "uart_irq_witness::enable_source()"),
+        (
+            "enable",
+            BOOT_ENTRY,
+            "uart_irq_witness::enable_source(kernel)",
+        ),
+        (
+            "owed admission (BLR1)",
+            X86_BOOT,
+            "uart_irq_witness::note_admission_at_first_user_entry()",
+        ),
         (
             "entry hook",
             X86_DT,
@@ -184,7 +193,7 @@ fn the_route_is_derived_from_the_madt_and_the_decoder() {
 fn the_enable_order_is_readiness_route_controller_device_source_admission() {
     let inner = body_after(
         WITNESS,
-        "fn enable_source_interrupts_off(if_at_call: bool) -> bool {",
+        "fn enable_source_interrupts_off(\n    if_at_call: bool,\n    kernel: &crate::kernel::boot::KernelState,\n) -> bool {",
     );
     let order = [
         "lapic_configured()",
@@ -205,12 +214,48 @@ fn the_enable_order_is_readiness_route_controller_device_source_admission() {
         assert!(at >= last, "{step} is out of order");
         last = at;
     }
-    let outer = body_after(WITNESS, "pub fn enable_source() -> bool {");
-    assert!(pos(outer, "\"cli\"") < pos(outer, "enable_source_interrupts_off(was_enabled)"));
-    assert!(pos(outer, "enable_source_interrupts_off(was_enabled)") < pos(outer, "\"sti\""));
+    // BLR1: the route is read from the boot exclusive state the caller lends, never through the
+    // installed SharedKernel (a second path to the state the boot token owns).
+    let outer = body_after(
+        WITNESS,
+        "pub fn enable_source(kernel: &crate::kernel::boot::KernelState) -> bool {",
+    );
+    assert!(
+        pos(outer, "\"cli\"") < pos(outer, "enable_source_interrupts_off(was_enabled, kernel)")
+    );
+    assert!(
+        pos(outer, "enable_source_interrupts_off(was_enabled, kernel)") < pos(outer, "\"sti\"")
+    );
+    assert!(inner.contains("kernel.with_ipc_state(") && !inner.contains("with_ipc_split_mut("));
+    // BLR1: inside the boot exclusion IF is already clear, so the admission is OWED and made by the
+    // first user `iretq`, after publication.
+    assert!(
+        pos(outer, "ADMISSION_OWED.store(true, Ordering::Release);")
+            > pos(outer, "if ok && was_enabled {")
+    );
+    let owed = body_after(WITNESS, "pub fn note_admission_at_first_user_entry() {");
+    assert!(
+        owed.contains("ADMISSION_OWED.swap(false, Ordering::AcqRel)")
+            && owed.contains("by=first_user_iretq")
+    );
+    let enter = X86_BOOT
+        .split("pub fn enter_dispatched_user_task_if_available(")
+        .nth(1)
+        .expect("the first entry");
+    assert!(
+        pos(enter, "let _shared = boot.publish();")
+            < pos(
+                enter,
+                "uart_irq_witness::note_admission_at_first_user_entry()"
+            )
+            && pos(
+                enter,
+                "uart_irq_witness::note_admission_at_first_user_entry()"
+            ) < pos(enter, "enter_user_mode_iret(")
+    );
     // The enable runs after the tick is armed, from the timer bring-up.
     let timer = pos(BOOT_ENTRY, "X86_BOOTSTRAP_TIMER_STARTED");
-    let hook = pos(BOOT_ENTRY, "uart_irq_witness::enable_source()");
+    let hook = pos(BOOT_ENTRY, "uart_irq_witness::enable_source(kernel)");
     assert!(timer < hook);
 }
 

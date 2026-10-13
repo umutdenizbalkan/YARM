@@ -19,6 +19,12 @@ commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
 Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 `doc/KERNEL_UNLOCKING.md` §0.
 
+**BROAD-LOCK-RETIREMENT1 — the broad lock is deleted.** No production build contains
+`SpinLock<KernelState>`, `SharedKernel::with` or `SharedKernel::with_cpu`; the boot path owns the
+state through the `BootExclusive` token, published before the first user entry, and the census
+guard rejects any reintroduction. No canonical stage is re-classified by it, and VM-INVALIDATION1
+stays open. Details: `doc/KERNEL_UNLOCKING.md` §BLR1.
+
 **U9-SPAWN-IC1 — the spawn's endpoint and capability phases are rank-local and exactly
 reversible, and the stale RISC-V smoke expectation is corrected. Census remains `2 / 0 / 2`.
 U9 remains OPEN.**
@@ -2001,6 +2007,8 @@ function holds no broad acquisition today. Earlier "U8 is next" pointers are rem
 | Production `SharedKernel::with_cpu` callsites | **0** |
 | Production broad `SharedKernel::with` callsites | **0** |
 | **Total production broad-lock acquisition sites** | **0** |
+| Production broad-wrapper definitions / broad-lock storage | **0** / **0** — BROAD-LOCK-RETIREMENT1 deleted `SharedKernel::with`, `with_cpu` and `SpinLock<KernelState>`; boot owns the state through `BootExclusive` until publication |
+| Test-only whole-state support | `with` / `with_cpu` / `lock` under exactly `#[cfg(test)]` (hosted reference tests only) |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **Direct NR6/NR7:** x86_64 (live) + AArch64 (structural, proof-gated) via `offlock_authoritative_dispatch_enabled()`; RISC-V not admitted. **Blocking IpcRecv / IpcSend (U4):** queue-advancing dispatch is authoritative outside the broad lock on **all three** architectures via the canonical `queue_advancing_dispatch_enabled()`. `d6_genuine_enabled()` itself remains compile-time x86_64-only — U4 widened the queue-ADVANCING question only, never the queue-neutral D6 slice. |

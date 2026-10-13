@@ -283,7 +283,7 @@ fn timer_is_armed_at_the_boot_safe_point_not_at_idle() {
     // end of boot.rs while the idle block sits above it, so a raw byte comparison would measure
     // source layout instead of execution order.
     let boot_fn = boot
-        .split("pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {")
+        .split("pub fn run_with_prepared_kernel(run: fn(crate::runtime::BootExclusive)) {")
         .nth(1)
         .expect("the boot entry point")
         .split("\n}")
@@ -292,7 +292,7 @@ fn timer_is_armed_at_the_boot_safe_point_not_at_idle() {
     let arm_pos = boot_fn
         .find("timer::arm_timer_at_boot_safe_point()")
         .expect("the boot arm must be wired into the boot entry point");
-    let run_pos = boot_fn.find("run(kernel);").expect("the workload handoff");
+    let run_pos = boot_fn.find("run(boot);").expect("the workload handoff");
     assert!(
         arm_pos < run_pos,
         "the timer must be armed before control passes to the workload"

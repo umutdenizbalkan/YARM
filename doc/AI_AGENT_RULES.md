@@ -250,6 +250,17 @@ never appear on a live-runtime dispatch path (guarded by
 `stage185_boot_only_global_borrow_confined`). See `doc/KERNEL_LOCKING.md §0` for
 the classified inventory and the deferred per-subsystem retirement plan.
 
+**BROAD-LOCK-RETIREMENT1 status — supersedes the Stage 185 paragraph above.** The global
+`SpinLock<KernelState>`, the production `SharedKernel::with` / `with_cpu` and
+`borrow_kernel_for_boot` are **deleted**. Do not reintroduce a whole-state lock, wrapper,
+closure or accessor under any name: production code reaches kernel state only through a domain
+owner (`*_split_mut` / `*_split_read` and the `KernelState::*_from_raw` projectors, each field
+under its recorded authority), and the only production whole-state `&mut` is the boot exclusive
+phase (`BootExclusive`), which ends by publication before the first user entry. The hosted suite's
+`with` / `with_cpu` / `lock` exist under exactly `#[cfg(test)]` and must stay there.
+`tests/broad_lock_census_guard.rs` enforces all of this. Deleting the lock did NOT complete any of
+204B–205 and did not touch VM-INVALIDATION1; do not describe either as done.
+
 **Stage 186A (SPLIT-MUT-INFRA) status — infrastructure only, DO NOT OVERCLAIM.**
 The per-domain split-mut seam set (`with_*_split_mut`, exposing only
 `&mut <Subsystem>` never `&mut KernelState`) is now complete for ranks 1–6 — Stage

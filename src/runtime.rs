@@ -235,7 +235,8 @@ impl IpcRecvQueuedPlainWritebackPlan {
 ///
 /// What remains is storage, and storage alone carries no permission. Each mutable field is owned
 /// by exactly one authority, recorded in `doc/KERNEL_UNLOCKING.md` §BLR1 and checked by
-/// `blr1_kernel_state_field_authority_is_total` in the hosted suite:
+/// `blr1_kernel_state_field_authority_is_total_and_projections_respect_it` in
+/// `tests/broad_lock_census_guard.rs`:
 ///
 /// * a DOMAIN LOCK stored in the state itself — ranks 1..6 plus the fault, restart, telemetry,
 ///   boot-config and driver locks; the `SharedKernel` seams take the lock, then form a reference
@@ -281,7 +282,7 @@ pub struct SharedKernel {
 //     (see `BootExclusive`) admits no second path, and in `#[cfg(test)]` helpers serialized by
 //     `test_exclusive`.
 // The state itself must be transferable between CPUs, which is what the old
-// `SpinLock<KernelState>: Sync` bound required; `ASSERT_KERNEL_STATE_SEND` keeps that bound.
+// `SpinLock<KernelState>: Sync` bound required; the `assert_send::<KernelState>()` below keeps it.
 unsafe impl Sync for SharedKernel {}
 // SAFETY: moving a `SharedKernel` moves its state; the state is `Send` (asserted below).
 unsafe impl Send for SharedKernel {}
@@ -18564,8 +18565,9 @@ impl BootExclusive {
     ///
     /// Installing it publishes nothing: every trap entry checks
     /// `refuse_shared_entry_during_boot_exclusive` before using it, and every secondary waits for
-    /// publication. Named so the installation sites are the only callers (pinned by the hosted
-    /// guard `blr1_trap_installation_is_the_only_pre_publication_handle`).
+    /// publication. Named so the installation sites are the only callers (pinned by
+    /// `blr1_trap_installation_is_the_only_pre_publication_handle` in
+    /// `tests/broad_lock_census_guard.rs`).
     pub fn shared_for_trap_installation(&self) -> &'static SharedKernel {
         self.shared
     }

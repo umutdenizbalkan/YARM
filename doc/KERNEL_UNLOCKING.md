@@ -152,10 +152,10 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 | Stage | Definition | Status | Evidence / what is missing |
 |-------|-----------|--------|----------------------------|
 | **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 25 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 0 test-only, 0 obsolete, 25 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
-| **204B** | Decompose `KernelState` ownership into per-CPU / task / scheduler / IPC / capability / VM / timer / IRQ / boot components. `SharedKernel` may remain a container but must not serialize the whole kernel. | **OPEN** (partial foundation) | `KernelState` already carries 11 ranked domain locks and a full set of `*_split_mut` / `*_split_read` seams — the substrate exists. But `with_cpu` still forms a broad `&mut KernelState`, so the container still serializes the kernel. |
+| **204B** | Decompose `KernelState` ownership into per-CPU / task / scheduler / IPC / capability / VM / timer / IRQ / boot components. `SharedKernel` may remain a container but must not serialize the whole kernel. | **OPEN** (partial foundation) | `KernelState` already carries 11 ranked domain locks and a full set of `*_split_mut` / `*_split_read` seams — the substrate exists. BLR1: the container no longer serializes anything — there is no broad lock, and every field has one recorded authority (`FIELD_AUTHORITY`, §BLR1) — but the state is still ONE struct reached through one cell, not decomposed into the components the definition names. |
 | **204C** | Remove fallback-to-global handlers. An unsupported configuration must use an explicitly supported localized path or fail with a clear diagnostic — never reacquire the monolithic lock. | **OPEN** | Five fallback families live: the default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, the drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, retirement-enable flags, old fallback dispatch, class-specific one-shot logging, obsolete foundation oracles, compatibility drain branches. Keep validation oracles, but validating production paths rather than enabling them. | **OPEN** | All of the named scaffolding is live. |
-| **204E** | Delete the runtime `SpinLock`: boot may initialize exclusively, runtime has no global `KernelState` guard, with a compile-time/source guard preventing reintroduction. | **OPEN** | `state: SpinLock<KernelState>` (`src/runtime.rs:232`) present; no anti-reintroduction guard exists. |
+| **204E** | Delete the runtime `SpinLock`: boot may initialize exclusively, runtime has no global `KernelState` guard, with a compile-time/source guard preventing reintroduction. | **OPEN** (status not re-classified) | BLR1 (§BLR1): `state: SpinLock<KernelState>` and the production `with` / `with_cpu` are deleted; boot owns the state through the `BootExclusive` token until publication; `tests/broad_lock_census_guard.rs` rejects reintroduction (four-kind census, build probe, negative controls). The stage is not re-classified by that package: stage closure is decided by its own review, and broad-lock deletion does not by itself complete 204B–205. |
 
 #### Phase 8 — Full unlocking seal
 
@@ -27721,6 +27721,8 @@ the condition under which it stays harmless and what would remove it; it is not 
   * BL6f: latent, no failing sample.
 * *U9 stays closed:* production census `with_cpu=0`, `with_broad=0`, with the three wrapper
   definitions counted separately (`tests/broad_lock_census_guard.rs`, 9/9 on every delivery).
+  BLR1 (below) then deleted the wrappers and the lock: the census now has four kinds, the first
+  three of which are absent (17/17).
 
 **Remaining feature roadmap.** This is §0.3's stage table, unchanged by this backlog, which repaired
 correctness and checker defects rather than advancing a canonical stage. Two framing corrections
@@ -27750,3 +27752,309 @@ apply to reading it:
 | Phase 8 — full-unlock seal | 205A–205D (syscall matrix, fault-injection matrix, concurrency torture, cross-architecture seal) | open |
 
 Not started here, by instruction: production notifications (199F), broader SMP, hardware bring-up.
+
+---
+
+## BLR1 — BROAD-LOCK-RETIREMENT1: the broad lock is deleted, not renamed
+
+U9 left no production broad acquisition (`with_cpu=0`, `with_broad=0`), but the mechanism was
+still there: `SharedKernel { state: SpinLock<KernelState> }`, the production wrappers
+`SharedKernel::with` and `with_cpu` and their raw lock bodies, an unchecked boot escape
+(`borrow_kernel_for_boot`), and two never-installed raw trap-state fallbacks that each held a
+`&'static mut KernelState`. Any of them could have brought a broad acquisition back. This package
+removes the mechanism, builds the replacement storage from the ownership model, makes the boot
+handoff a type-level fact, and adds checks that fail when any of it comes back. Base `0d25d699`.
+
+### Inventory (before census, every architecture and feature)
+
+The census reads every `.rs` file under `src/`, `crates/` and `tests/` as text, whatever its
+`cfg`, so every architecture and feature configuration is covered. Test code is cut out
+`#[cfg(test)]` item by `#[cfg(test)]` item, on comment- and literal-blind code. (The old cut-off
+stopped at the first `#[cfg(test)] mod tests` and missed the production `impl SharedKernel` that
+follows `runtime.rs`'s test module.) The compiler then confirmed the result: each freestanding
+port was built with the union of its features, and the hosted suite was built.
+
+| What | Base `0d25d699`, production | Candidate, production | Notes |
+|---|---|---|---|
+| broad acquisitions (`.with_cpu(`, `.with(\|…\|)` on `SharedKernel`, incl. multi-line) | 0 | 0 | the one textual `.with(\|` is the `LOCK_ORDER_LAST_RANK` thread-local |
+| broad-wrapper definitions (`with`, `with_cpu`) | 2 | 0 | `lock` was already `#[cfg(test)]` |
+| raw broad-lock bodies (`self.state.lock()`) | 2 production + 1 test | 0 | |
+| broad-lock storage (`SpinLock<KernelState>`) | 1 | 0 | |
+| `state.data_ptr()` projections in `SharedKernel` seams | 42 | 0 | now `state_ptr()`, the cell's single opening |
+| `borrow_kernel_for_boot` (definition + 3 boot callers) | 4 | 0 | replaced by `BootExclusive` |
+| raw trap-state fallback (`trap_kernel_state_mut`, `install_trap_kernel_state`) | 7 | 0 | x86_64 `.bss` `TRAP_KERNEL_STATE` cell and AArch64 `TRAP_KERNEL_STATE_PTR`; never installed |
+| `&'static mut KernelState` producers | 6 | 0 | includes `Bootstrap::init_static*` over `BOOTSTRAP_KERNEL_STATE` |
+| broad dispatcher calls (`kernel::syscall::dispatch`) | 0 | 0 | 17 test-only calls: the hosted reference path |
+
+The inventory classified each item before anything was deleted:
+
+* *Production runtime.* No broad acquisition existed. But two runtime escape hatches did: the
+  x86_64 and AArch64 raw trap-state fallbacks. Each was an accessor that turned a static pointer
+  into `&'static mut KernelState`. Nothing ever installed either pointer, so both always declined —
+  and their dead branches still drove the whole-state trap handler. The default (non-dispatch)
+  AArch64 secondary waited on that pointer forever. Had anything installed it, the secondary would
+  then have run `set_current_cpu` and a cross-CPU work loop on a second whole-state reference.
+* *Exclusive construction / bootstrap.* `borrow_kernel_for_boot` handed out `&mut KernelState`
+  with an unchecked contract. That `&mut` was never ended: the boot path kept using it after the
+  first interrupt source was armed and while secondaries ran. (See *The handoff* below for the
+  three windows that this opened.) Construction used a second static (`BOOTSTRAP_KERNEL_STATE`):
+  the state was built there, copied out with `ptr::read`, moved into the lock and written into
+  `BOOTSTRAP_SHARED_KERNEL`.
+* *Diagnostics.* The five one-shot first-dispatch proofs, the x86_64 SMP-unlock audit and the
+  cross-arch first-dispatch audit all run on the boot `&mut`. The debug-only
+  `BOOT_RAW_BORROW_ACTIVE` window was set by `borrow_kernel_for_boot` and never cleared, so its
+  trap-entry `debug_assert!`s would have fired on every post-boot trap in a debug build. It
+  checked nothing.
+* *Hosted tests.* 2,394 `.with(|…|)` and 165 `.with_cpu(` uses drive whole-state bodies as the
+  reference path. These include `KernelState::handle_trap`, `kernel::syscall::dispatch` and the
+  `Broad*Owners` transaction adapters.
+* *Dead code.* `install_trap_kernel_state` had no callers on either port. `init_static*`'s only
+  caller was the AArch64 module's non-selected `cfg` branch.
+
+Zero callers of the old wrappers were not taken to prove that ownership was safe. The boot path
+was traced line by line on all three ports (below), and that trace is what found the three
+windows.
+
+### What was deleted
+
+* `SharedKernel::with`, `SharedKernel::with_cpu`, their raw `self.state.lock()` bodies, and the
+  `state: SpinLock<KernelState>` storage.
+* `SharedKernel::borrow_kernel_for_boot` and the debug raw-borrow window (`BOOT_RAW_BORROW_ACTIVE`,
+  `begin_/end_boot_raw_borrow_window`, `BootRawKernelBorrowGuard`).
+* x86_64: the `.bss.kernel_state` `TRAP_KERNEL_STATE` cell, its status byte,
+  `install_trap_kernel_state`, `trap_kernel_state_mut` and the raw fallback in
+  `x86_trap_dispatch_body`. A trap with no shared kernel now does exactly what the empty fallback
+  did: it halts on a fatal vector and is ignored otherwise.
+* AArch64: `TRAP_KERNEL_STATE_PTR`, `install_trap_kernel_state`, `trap_kernel_state_mut`, the
+  vector-entry raw branch, and the default secondary's whole-state wait-and-work loop. That
+  secondary now parks explicitly (`YARM_AARCH64_SMP_WAIT cpu=N state=parked
+  reason=no_user_dispatch`).
+* `Bootstrap::init_static*` and `BOOTSTRAP_KERNEL_STATE`.
+
+Kept, unchanged:
+
+* the rank-specific locks, IRQ masking, transaction owners, deferrals and architecture return
+  paths;
+* the whole-state policy bodies (`KernelState::handle_trap`, the broad dispatcher, the
+  `Broad*Owners`). They are the hosted reference path, and production cannot reach them: after
+  publication no production whole-state reference exists.
+
+The hosted suite keeps `with`, `with_cpu` and `lock` under exactly `#[cfg(test)]`. They serialize
+on a `#[cfg(test)]` `test_exclusive` lock that no production seam consults, just as no production
+seam consulted the retired lock.
+
+### The replacement storage, and who owns each field
+
+`SharedKernel { state: KernelStateCell }`, where `KernelStateCell` is a private
+`#[repr(transparent)]` `UnsafeCell<KernelState>` with no lock, no guard and no accessor. Its only
+opening is `SharedKernel::state_ptr()`. That is a private raw pointer, never a reference, and every
+seam passes it to a field projector. An `UnsafeCell` carries no permission of its own, so the
+argument rests on the authority of each field. That authority is recorded in
+`tests/broad_lock_census_guard.rs` (`FIELD_AUTHORITY`), and the guard fails if a field is added
+without one:
+
+| Field(s) of `KernelState` | Authority |
+|---|---|
+| `scheduler_state` | its own `SpinLockIrq` (rank 1), which contains the data |
+| `tcbs`, `task_classes`, `tls_restore_pending`, `robust_futex`, `tid_allocation_cursor`, `spawn_reservation_generation` | `task_state_lock` (rank 2) |
+| `ipc` | `ipc_state_lock` (rank 3) |
+| `capability` | `capability_state_lock` (rank 4) |
+| `user_spaces` | `vm_state_lock` (rank 5) |
+| `memory` | `memory_state_lock` (rank 6) |
+| `faults`, `restart`, `telemetry`, `boot_config`, `drivers` | `fault_` / `restart_` / `telemetry_` / `boot_config_` / `driver_state_lock` |
+| the eleven `*_state_lock` fields | atomic lock words |
+| `tid_allocation_policy` | construction only: written while exclusive, read by value afterwards |
+| `kernel_aspace`, `hal` | the exclusive phase only. Only whole-state code touches them, and no projector exposes them |
+
+* *Projections.* The guard audits all 32 `KernelState::*_from_raw` projectors against that table.
+  Each projects a data field only together with its own lock, reads the construction-only field
+  only by value, and never projects an exclusive-phase-only field. No projector, and no other
+  production line, reborrows a raw state pointer as a whole.
+* *Send and Sync.* `SharedKernel` has exactly two `unsafe impl`s, `Sync` and `Send`, each with its
+  justification. The old bound (`SpinLock<KernelState>: Sync` needed `KernelState: Send`) is kept
+  as a compile-time assertion. `BootExclusive` stays `!Send + !Sync`. Nothing implements `Send` or
+  `Sync` for `KernelState` or the cell.
+* *Stable addresses.* The boot singleton is constructed in place, inside
+  `BOOTSTRAP_SHARED_KERNEL`'s cell (`SharedKernel::state_ptr_for_construction` +
+  `init_state_into`). The state therefore has its final address from the first byte written, and
+  every pointer derived later (seam projections, switch plans, architecture contexts) is derived
+  from that address. The former construction path built the state in one static, copied it to the
+  stack with `ptr::read`, moved it into the lock and wrote it into a second static. That path is
+  gone, along with its large stack temporary. The hosted transition test proves the address does
+  not change across construction, exclusive use and publication.
+
+### The handoff from exclusive initialization to concurrent execution
+
+`Bootstrap::init_shared_static*` constructs the state and returns a `BootExclusive` token, which
+is the only production owner of a whole-state `&mut`:
+
+* `claim` is `pub(crate) unsafe` and refuses a second claim;
+* `state(&mut self)` lends the state for no longer than the token's own borrow;
+* `publish(self)` consumes the token, so the compiler rejects any use of a loan after it (control
+  (d) below);
+* `Bootstrap::shared_static_ref()` — which any code can call — answers only after publication.
+
+Each architecture hands the token to `run_scheduler_loop`. The token is published inside
+`enter_dispatched_user_task_if_available`, after the last read of the exclusive state and
+immediately before the architectural return. It is also published on every path that declines
+the entry, and on the idle arm.
+
+The phase must be exclusive in fact, not just early. Three things could reach the state while the
+boot `&mut` was live, and the trace found all three:
+
+* **x86_64 AP user dispatch.** The secondaries are started inside the phase (INIT-SIPI). Until
+  their first dispatch request they run only the pure-asm idle loop, the `0xF1` remote-wake/TLB-ACK
+  stub and the IRQ-smoke stub, none of which touches kernel state. But with
+  `yarm.ap_user_dispatch=1`, `live_ap_user_dispatch` sent that request in the middle of the
+  SMP-unlock audit. The AP's first task then entered ring 3 and trapped into the shared kernel
+  while the BSP was still using its `&mut` (the rest of the audit, then
+  `thread_user_context`/`task_asid`/`ensure_user_return_cr3` in the entry). The plan is still built
+  and published inside the audit. The request and its wake are now owed until publication
+  (`X86_AP_DISPATCH_REQUEST_OWED cpu=N until=boot_publication` → `…_RELEASED cpu=N
+  at=boot_publication`) and are sent between `publish` and the `iretq`.
+* **The BSP timer before the boot exclusion.** On x86_64 and AArch64 the timer was armed (and on
+  AArch64 the PE-level `DAIF.I` unmask was performed) a few statements before `irq_save`. A tick in
+  between reached the shared trap path with the `&mut` live. The exclusion now opens before
+  `start_bsp_periodic_timer`. The AArch64 arm records its unmask as owed (`BspTimerArm`), and the
+  debt is discharged by the `eret` to EL0 (whose SPSR has `DAIF.I` clear) or by
+  `finish_bsp_timer_unmask` on the paths that do not enter, both after publication. x86_64's arm
+  does not touch `IF`, and the exclusion's restore keeps its interrupt state.
+* **Witness hooks that re-entered.** The x86_64 COM1 and AArch64 PL011 witness enables run inside
+  the timer arm, and they read the IRQ route through the installed `SharedKernel`: a second path
+  to the state, used while the first was live. They now read it from the exclusive state the
+  caller lends. The RISC-V UART witness enables at the idle safe point, which is after publication.
+
+Per port, what holds the phase exclusive:
+
+* *x86_64.* `IF` is set from early boot, but no interrupt source is armed before the exclusion (the
+  BT2 fix keeps the LAPIC timer unarmed, the I/O APIC entries masked and the 8259 masked). The
+  secondaries are as described above.
+* *AArch64.* `DAIF.I` is masked throughout. Secondaries under `yarm.ap_user_dispatch=1` wait for
+  `BSP_BOOT_BORROW_ENDED`, which is now stored after `publish`. Without the knob a secondary parks
+  for good.
+* *RISC-V.* `sstatus.SIE` is clear on the boot hart until its `sret`. Secondaries park until
+  `BOOT_BORROW_ENDED`, which is stored after `publish`.
+
+On all three ports every trap entry runs `refuse_shared_entry_during_boot_exclusive` before its
+first use of the shared kernel: `x86_trap_dispatch_body`, `yarm_aarch64_vector_entry` and
+`yarm_riscv64_trap_bridge`. A trap that reaches the shared kernel while the token is live logs
+`BOOT_EXCLUSIVE_VIOLATION site=… reason=shared_entry_before_publication` and halts rather than
+proceed on aliased state. It costs one load per trap. It replaces the debug-only Stage 30
+assertion, whose window never closed. Live control (h) shows it firing.
+
+*Diagnostics and scheduler-entry hooks, checked one by one.*
+
+* The five first-dispatch proofs, the x86_64 SMP-unlock audit (AP admission, the remote-wake and
+  TLB-ACK proofs, workload construction and plan publication) and the cross-arch first-dispatch
+  audit all run inside the phase. They therefore run with real whole-state exclusivity: no
+  secondary touches the state, and no interrupt is admitted. None of them needs whole-state
+  exclusivity at runtime, and none runs after publication.
+* The order is unchanged: the proofs, then the SMP-unlock audit, then the first entry. The one
+  observable change is that an x86_64 AP's first user dispatch now starts at publication instead
+  of during the audit.
+* `install_sched_quantum_on_live_timer` cannot reach the state during the phase:
+  `shared_static_ref` answers `None` until publication. On all three ports the command line is
+  captured in `prepare_arch_boot`, before construction, so it takes the construction route anyway.
+* The D6 first-resume trampoline uses `shared_static_ref`, and it runs after publication.
+
+### Making reintroduction fail
+
+The census in `tests/broad_lock_census_guard.rs` now separates four things. It reads production
+text with every `#[cfg(test)]` item removed:
+
+* **Production broad acquisitions: absent.**
+  * The historical spellings are counted on precise production text, including multi-line forms.
+  * Independent of spelling: the cell is opened in exactly one place (`state_ptr`), and a
+    whole-state reference is formed from it in exactly one place (`BootExclusive::state`).
+  * No raw state pointer is reborrowed as a whole.
+* **Production broad-wrapper definitions: absent.** No production function takes a closure or fn
+  pointer over `&mut KernelState`. Exactly one returns a whole-state reference
+  (`BootExclusive::state`). `with`, `with_cpu`, `lock` and `borrow_kernel_for_boot` are not
+  defined in production.
+* **Production broad-lock storage: absent.** There is no lock around `KernelState`, and no static
+  holds one. Exactly one cell holds the state: `KernelStateCell`.
+* **Test-only support: present, and only under exactly `#[cfg(test)]`.** A
+  `cfg(any(test, …))` or a feature gate counts as production.
+
+The same file adds structural guards:
+
+* the field-authority table and the projection audit;
+* the `Send`/`Sync` audit;
+* the pre-publication handle: one trap-target installation per port, a publication check at every
+  port's trap entry, and secondaries released only after `publish`, with x86_64's first dispatch
+  sent only by the two publication-ordered functions.
+
+It also checks the build, not only the source. The integration test links the hosted non-test
+library and compiles a probe. The probe's calls resolve to trait methods only if `SharedKernel`
+has no inherent `with`, `with_cpu`, `lock` or `borrow_kernel_for_boot`, so reintroducing any of
+them, with any signature, stops the guard from compiling. The freestanding images can never
+contain the helpers, because `cfg(test)` is never set when they build.
+
+Hosted behavioural test: `init_shared_static_returns_usable_shared_kernel` drives the real
+singleton through every transition. Before construction no phase is open. After construction the
+phase is exclusive, `shared_static_ref` is `None` and the loan works. After publication the phase
+is published, the static answers with the same object at the same state address, and a domain
+owner reads what the exclusive phase wrote. A second construction panics.
+
+Twenty-one existing source guards pinned the deleted text: 13 hosted and 8 in the integration
+targets.
+
+* Hosted: the stage-185 boot-escape guards, three AArch64 production-tick guards, the TIMER5
+  exclusion, the stage-189d seal, stage-196a, the U3/U9 runtime guards and the exit-ordering
+  guards.
+* Integration: the PL011 and COM1 witness scopes, the CONTEXT1, SMP2 and RISC-V timer scopes.
+
+Each was re-derived against the new structure, not weakened. For example, the AArch64 tick guard
+now requires every readiness gate to precede the owed unmask, requires no unmask inside the arm,
+and requires the discharge only after publication.
+
+The x86_64 COM1 witness changes with the boot. Its source is still enabled with `IF` clear, but
+`IF` is now already clear when it is called, so the CPU's admission is owed:
+`IRQ3_UART_CPU_ADMISSION_OWED … until=first_user_entry`. It is made by the first user `iretq`
+after publication: `IRQ3_UART_CPU_ADMISSION … if_restored=1 … by=first_user_iretq`. The grader
+requires both, in the order source enabled → owed → first entry prepared → admitted.
+
+**Negative controls (temporary, each on a clean worktree of the candidate).**
+
+| Control | Mutation | Result |
+|---|---|---|
+| (a) | a production caller of `with` / `with_cpu` / `lock` (arch-neutral) | x86_64, AArch64 and RISC-V freestanding builds fail: `E0599 no method named with / with_cpu / lock` |
+| (b) | `SpinLock<KernelState>` storage reintroduced as a static | census kind 3 fails |
+| (b2) | an unrestricted production accessor under a new name (`fn …(f: impl FnOnce(&mut KernelState))`) | census kinds 1 and 2 fail |
+| (c) | every `#[cfg(test)]` in `runtime.rs` widened to `cfg(any(test, not(test)))` | the x86_64 freestanding build SUCCEEDS (so the build alone would not catch it), and the census guard stops compiling: the build probe resolves to the inherent methods (`E0277`/`E0308`) |
+| (d) | the exclusive loan used after `publish` | x86_64 build fails: `E0505` |
+| (e) | `shared_static_ref` answers before publication | the hosted transition test fails |
+| (f) | the x86_64 AP woken inside the phase again | first run: the census PASSED. The guard banned only the raw wake calls inside the dispatcher, not a call to the sender helper. The guard was strengthened so that every sender call must sit in the two publication-ordered functions, with the direct send gated on publication. Re-run: `blr1_trap_installation_is_the_only_pre_publication_handle` fails |
+| (g) | the boot exclusion opened after the timer arm | the TIMER5 and AArch64 readiness guards fail |
+| (h) | LIVE, AArch64: the timer admitted inside the phase (the pre-BLR1 window, widened) | the boot halts with `BOOT_EXCLUSIVE_VIOLATION site=aarch64_vector_entry reason=shared_entry_before_publication`, and the strict core smoke fails |
+
+What these controls prove, and what they do not:
+
+* A passing boot does not prove Rust aliasing safety, and none is claimed. The aliasing argument
+  is the source argument above: the authority table, the projection audit, and the trace of every
+  path that could reach the state during the phase.
+* The live runs show that the boot sequence works. They also show that the phase check never
+  fired in any qualified configuration, and that it does fire when the old window is reopened.
+
+**Qualification.** QUALIFICATION-PENDING (recorded after the freeze, in a documentation-only commit).
+
+### Open, and not claimed
+
+* **VM-INVALIDATION1 stays open.** This package does not change the following:
+  * VmMap (NR 3) and both COW routes still report success after an incomplete invalidation (the
+    displaced page stays quarantined);
+  * the remaining ambient-requester dependencies (fork write-protect, split COW private copy, the
+    reap owners' transfer unmap, `revoke_active_transfer_mappings_for_cap_split`);
+  * target-set correctness across activation, idle and ASID reuse.
+
+  Quarantine safety is preserved: nothing here reclaims a quarantined page.
+* **No canonical stage is advanced.** Deleting the broad lock does not discharge 204B–205.
+  * 204E's definition names this mechanism, and its §0.3 evidence column is updated. Its status is
+    not re-classified here: closure is decided by the stage's own review.
+  * 204B–204D and 205A–205D are unchanged.
+* **Scope.** No production AP enablement, no VFS work, no hardware bring-up and no general kernel
+  cleanup. AP user dispatch stays default-off. The rpi5 high-half configuration type-checks but
+  links only with its own linker script, on base and candidate alike.
+* **Historical comments.** Comments elsewhere in the tree still narrate the broad
+  `SpinLock<KernelState>` ("already dropped", "outside the global lock"). They describe the states
+  they were written in. The census reads code, not comments.

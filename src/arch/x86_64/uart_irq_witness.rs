@@ -117,6 +117,9 @@ static REDIR_LOW_ENABLED: AtomicU32 = AtomicU32::new(0);
 static ROUTE_READY: AtomicBool = AtomicBool::new(false);
 static SOURCE_ENABLED: AtomicBool = AtomicBool::new(false);
 static SOURCE_DISABLED: AtomicBool = AtomicBool::new(false);
+/// BLR1: the source was enabled inside the boot exclusion (IF already clear), so the CPU's
+/// admission of its vector is owed to the first user entry, after the boot state is published.
+static ADMISSION_OWED: AtomicBool = AtomicBool::new(false);
 static RING_PA: AtomicU64 = AtomicU64::new(0);
 
 static CLAIMS: AtomicU32 = AtomicU32::new(0);
@@ -420,14 +423,35 @@ pub fn enable_source(kernel: &crate::kernel::boot::KernelState) -> bool {
         // SAFETY: restores the interrupt flag this function found.
         unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
     }
-    if ok {
+    if ok && was_enabled {
         crate::yarm_log!(
             "IRQ3_UART_CPU_ADMISSION vector=0x{:x} if_restored={} after=source_enabled",
             VECTOR.load(Ordering::Acquire),
             was_enabled as u8
         );
+    } else if ok {
+        // BLR1: the boot path arms the timer and this source INSIDE its interrupt exclusion, which
+        // lasts until the boot state is published and the first user task is entered. The CPU's
+        // admission is therefore not restored here; the `iretq` into the first user task restores
+        // it (`note_admission_at_first_user_entry`), still strictly after the source's own enable.
+        ADMISSION_OWED.store(true, Ordering::Release);
+        crate::yarm_log!(
+            "IRQ3_UART_CPU_ADMISSION_OWED vector=0x{:x} if_at_call=0 after=source_enabled until=first_user_entry",
+            VECTOR.load(Ordering::Acquire)
+        );
     }
     ok
+}
+
+/// BLR1: called by the boot CPU between publishing the boot state and its first `iretq` into user
+/// mode — the instruction that restores `IF` and so admits this vector. Reports the owed admission.
+pub fn note_admission_at_first_user_entry() {
+    if ADMISSION_OWED.swap(false, Ordering::AcqRel) {
+        crate::yarm_log!(
+            "IRQ3_UART_CPU_ADMISSION vector=0x{:x} if_restored=1 after=source_enabled by=first_user_iretq",
+            VECTOR.load(Ordering::Acquire)
+        );
+    }
 }
 
 fn enable_source_interrupts_off(

@@ -63,9 +63,11 @@ fn the_default_path_is_behind_the_knob() {
     assert!(ap[knob..].starts_with(
         "if crate::arch::aarch64::smp::requested() {\n        crate::arch::aarch64::smp::ap_dispatch_main(cpu);"
     ));
+    // BLR1: the "old wait" was for a raw `&'static mut KernelState` nothing installed; it is
+    // deleted, and the default secondary parks explicitly, after the knob's branch.
     assert!(
-        knob < pos(&ap, "trap_kernel_state_mut()"),
-        "the knob branches before the old wait"
+        knob < pos(&ap, "state=parked reason=no_user_dispatch") && !ap.contains("kernel."),
+        "the knob branches before the default park, which touches no kernel state"
     );
     assert!(code(SMP).contains("crate::kernel::boot::ap_user_dispatch_enabled()"));
     let bsp = code(BOOT_ENTRY);

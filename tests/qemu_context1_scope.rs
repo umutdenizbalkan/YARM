@@ -281,11 +281,13 @@ fn aarch64_el0_returns_install_the_resuming_tasks_nzcv() {
         2,
         "the ordinary EL0t write-back and the idle-boundary conversion"
     );
+    // BLR1: 2 -> 1. The second was the never-installed raw trap-state fallback, deleted with it;
+    // the one vector path that remains captures the interrupted SPSR.
     assert_eq!(
         code(A64_BOOT)
             .matches("trap_frame.user_status = frame.spsr_el1 as usize;")
             .count(),
-        2
+        1
     );
 }
 

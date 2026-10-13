@@ -92,7 +92,17 @@ but it proves nothing about the kernel and closes no part of the stage. Do not r
 
 ### 1.1 What counts as the broad lock
 
-`SharedKernel` (`src/runtime.rs:231`) owns exactly one broad lock:
+> **BROAD-LOCK-RETIREMENT1 — the broad lock is DELETED.** `state: SpinLock<KernelState>`,
+> `SharedKernel::with` and `SharedKernel::with_cpu` no longer exist in any production build. The
+> state lives in a lock-free cell (`KernelStateCell`) whose only opening is the private raw
+> `SharedKernel::state_ptr()`; boot owns it through the `BootExclusive` token until publication;
+> the hosted suite keeps `with` / `with_cpu` / `lock` under exactly `#[cfg(test)]`. The census
+> below is kept as the historical record it was; its current form has four kinds — production
+> broad acquisitions, production broad-wrapper definitions and production broad-lock storage are
+> all **0**, and test-only support is present only under `#[cfg(test)]`
+> (`doc/KERNEL_UNLOCKING.md` §BLR1, `tests/broad_lock_census_guard.rs`).
+
+Before BLR1, `SharedKernel` (`src/runtime.rs:231`) owned exactly one broad lock:
 
 ```rust
 pub struct SharedKernel {
@@ -129,7 +139,9 @@ lines excluded.
 |----------|---------------------|
 | `SharedKernel::with_cpu` | **0** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **0** |
-| Raw `self.state.lock()` | **3** (all inside the three definitions above) |
+| Raw `self.state.lock()` | **0** (BLR1: 3 → 0 — the three definitions and the lock are deleted) |
+| Production broad-wrapper definitions | **0** (BLR1) |
+| Production broad-lock storage | **0** (BLR1) |
 | **Total broad-lock acquisition sites** | **0** |
 
 > **U9-D3 — DELIVERED; U9 REMAINS OPEN.** The D3 fence of `AI_AGENT_RULES` §14.4 is discharged:
