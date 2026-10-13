@@ -8541,7 +8541,6 @@ pub fn enter_dispatched_user_task_if_available(
                 context.arg5 as u64
             );
         }
-        let bsp_entry = kernel.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
         // BLR1 — END OF THE BOOT EXCLUSIVE PHASE. `kernel` is not used past this line (`publish`
         // consumes the token it was borrowed from). QEMU-SMP2 §2: only now may an AP admitted under
         // `yarm.ap_user_dispatch=1` acquire anything; this CPU stays masked until the `eret`.
@@ -8571,10 +8570,8 @@ pub fn enter_dispatched_user_task_if_available(
                 tls,
             );
         }
-        #[allow(unreachable_code)]
-        if bsp_entry {
-            crate::yarm_log!("BSP_ENTER_RING3_DONE tid={}", tid);
-        }
+        // (BLR1 removed an unreachable `BSP_ENTER_RING3_DONE` line here: the `eret` above never
+        // returns, and the line read the exclusive state after publication.)
     }
     boot.publish()
 }

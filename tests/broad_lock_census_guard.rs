@@ -1096,6 +1096,16 @@ fn blr1_kind3_no_production_broad_lock_storage() {
         statics.is_empty(),
         "a static holding the whole state: {statics:?}"
     );
+    // The lock primitive's unlocked raw accessor existed only so the broad storage could be
+    // projected without its lock; with the storage gone it is deleted, and must stay deleted —
+    // it would let any `SpinLock` be bypassed.
+    let lock = code_mask(
+        &split_cfg_test(&fs::read_to_string(repo_root().join("src/kernel/lock.rs")).unwrap()).0,
+    );
+    assert!(
+        !lock.contains("fn data_ptr("),
+        "an unlocked raw accessor on the lock primitive is back"
+    );
 }
 
 /// KIND 4 — the hosted reference helpers exist, and only under exactly `#[cfg(test)]`.
