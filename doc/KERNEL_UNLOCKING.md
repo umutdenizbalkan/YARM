@@ -27830,6 +27830,8 @@ windows.
   secondary now parks explicitly (`YARM_AARCH64_SMP_WAIT cpu=N state=parked
   reason=no_user_dispatch`).
 * `Bootstrap::init_static*` and `BOOTSTRAP_KERNEL_STATE`.
+* `SpinLock::data_ptr`, the lock primitive's unlocked raw accessor. It existed only so the broad
+  storage could be projected without its lock.
 
 Kept, unchanged:
 
@@ -28014,7 +28016,7 @@ The x86_64 COM1 witness changes with the boot. Its source is still enabled with 
 after publication: `IRQ3_UART_CPU_ADMISSION … if_restored=1 … by=first_user_iretq`. The grader
 requires both, in the order source enabled → owed → first entry prepared → admitted.
 
-**Negative controls (temporary, each on a clean worktree of the candidate).**
+**Negative controls (temporary, each on a clean worktree of the candidate).** Controls (a)–(e) and (g) ran on `c05fd7af`. (f) and (h) were re-run on `2b90df1a`: (f) after its guard was strengthened, (h) with the worktree's own target directory, because the artifact scripts hard-code `target/`. Neither later commit changes what these controls exercise.
 
 | Control | Mutation | Result |
 |---|---|---|
@@ -28028,6 +28030,9 @@ requires both, in the order source enabled → owed → first entry prepared →
 | (g) | the boot exclusion opened after the timer arm | the TIMER5 and AArch64 readiness guards fail |
 | (h) | LIVE, AArch64: the timer admitted inside the phase (the pre-BLR1 window, widened) | the boot halts with `BOOT_EXCLUSIVE_VIOLATION site=aarch64_vector_entry reason=shared_entry_before_publication`, and the strict core smoke fails |
 
+A tenth check came out of qualification and was added after it: the census rejects an unlocked raw
+accessor on the lock primitive (`SpinLock::data_ptr`).
+
 What these controls prove, and what they do not:
 
 * A passing boot does not prove Rust aliasing safety, and none is claimed. The aliasing argument
@@ -28036,7 +28041,84 @@ What these controls prove, and what they do not:
 * The live runs show that the boot sequence works. They also show that the phase check never
   fired in any qualified configuration, and that it does fire when the old window is reopened.
 
-**Qualification.** QUALIFICATION-PENDING (recorded after the freeze, in a documentation-only commit).
+**Qualification.** Base `0d25d699` throughout. Every gate ran in fresh isolated worktrees of the
+frozen commit and of base. Each gate line records its commit and tree, and each live cell records
+the sha256 of the kernel and initramfs it booted. Toolchain: cargo 1.101.0-nightly (2026-10-07).
+QEMU: 8.2.2. Every scheduled result is kept, including the failed freeze.
+
+*First freeze, `e0ba9b3a` (tree `3239714c`): FAILED, and kept on record.*
+
+* *What passed.*
+  * Suites: focused 51, hosted 6,072 passed / 2 ignored, integration 308/308, census 17/17, fmt
+    clean.
+  * Cores: strict x86_64, AArch64 and RISC-V.
+  * x86_64 modes: D6_SWITCH_PROOF, D6_SWITCH_A and SPAWN_LIFECYCLE.
+  * Witnesses: SMP1/2/3, LOCK1/2/3, CONTEXT1 (x86_64, AArch64), overtaken return (x86_64,
+    AArch64), the x86_64 COM1 and AArch64 PL011 IRQ witnesses, and server death on all three ports.
+  * Shared region: the 12 offset/lifetime cells and the RISC-V replacement witness.
+* *Candidate-caused failure: the warning comparison.* Every freestanding, oracle and witness-feature
+  build had one more warning than base. `SpinLock::data_ptr` was now unused: it was the lock's
+  unlocked raw accessor, which existed only for the deleted storage. On AArch64 the first entry
+  also read a variable only from a line after the diverging `eret`. Both were fixed in `619b9625`:
+  the accessor is deleted, the census now rejects its return, and the unreachable line is removed.
+* *RISC-V UART IRQ witness: FAILED once (origins idle 3 / user 5, expected 4/4).* The first
+  idle-mode byte arrived three ticks after the driver's accepted quiet acknowledgement. By then a
+  service's receive deadline had woken it, so the interrupt was taken from user mode. The kernel
+  classified the origin correctly.
+
+  To separate the candidate from the witness, the frozen candidate and base were each re-run, on
+  an otherwise idle host and alternating:
+
+  | | Runs | Runs with an origin miss | Idle-mode bytes | Delivered ≥2 ticks late |
+  |---|---|---|---|---|
+  | candidate | 24 | 8 | 100 | 13 (13%) |
+  | base | 21 | 2 (plus 1 other failure, a torn log line) | 88 | 11 (12.5%) |
+
+  The late tail is the same on both trees. Whether a late byte fails the cell depends only on
+  whether it lands on the next deadline. The cause is the driver's two-period quiet margin, which is
+  shorter than the delivery-latency tail. That timing sensitivity predates this change; the witness
+  and its driver are not changed here. The first run's failure also coincided with a concurrent
+  compile on the host.
+* *x86_64 D6_GENUINE, and the combined CAP_CNODE/FAULT_DELIVERY/GLOBAL_STATE/SMP_READY/CROSS_ARCH_D6
+  cell.* Both failed on candidate and base with identical verdict sets. They are split apart in
+  the second run.
+
+*Second freeze, `619b9625` (tree `e235a28b`): the qualified commit.*
+
+* *Suites.* focused 51, hosted 6,072 passed / 2 ignored, integration 308/308 (32 targets), census
+  17/17, fmt clean. The textual census (§*Inventory*) was re-run on both trees.
+* *Freestanding warnings against a fresh base build.* Each candidate count equals base, or is one
+  lower where the deleted `install_trap_kernel_state` stops warning. No candidate build has a new
+  warning:
+  * default builds: x86_64 178 = 178, RISC-V 188 = 188, AArch64 205 vs 206;
+  * oracle builds: x86_64 179 = 179, RISC-V 189 = 189, AArch64 206 vs 207;
+  * hosted `--tests` 566 vs 567 (an unused test constant is now used);
+  * all 15 witness-feature builds: x86_64 (SMP1, LOCK3, overtaken, COM1, timer-contract,
+    CONTEXT1) and RISC-V (SMP3, LOCK1, UART, replacement) identical; AArch64 (SMP2, LOCK2,
+    overtaken, PL011, CONTEXT1) one lower.
+* *The five hosted shared-region-oracle type errors.* `cargo test --lib --features
+  x86-shared-region-direct-oracle` still fails to compile, with five `E0308` errors in
+  `src/kernel/boot/tests.rs`. They are identical on candidate and base, error site for error site.
+  This change does not touch their cause, and the configuration remains failing, not green.
+* *Strict cores.* x86_64 (timer-contract witness), AArch64 and RISC-V: all pass.
+* *x86_64 modes, candidate and base side by side.* Verdict sets are identical on both trees in all
+  six cells.
+  * Pass on both: D6_SWITCH_PROOF, D6_SWITCH_A, SPAWN_LIFECYCLE, and the four diagnostic proofs
+    (CAP_CNODE, FAULT_DELIVERY, GLOBAL_STATE, SMP_READY).
+  * Fail on both, unchanged: D6_GENUINE (six missing `D6_GENUINE_MUT_DISPATCH_*` markers) and
+    CROSS_ARCH_D6 (four missing proof markers).
+* *Witnesses, all `result=ok`:*
+  * SMP1, SMP2, SMP3; LOCK1, LOCK2, LOCK3;
+  * CONTEXT1 on x86_64 and AArch64; overtaken return on x86_64 and AArch64;
+  * UART IRQ on x86_64 (COM1, with the owed admission), AArch64 (PL011) and RISC-V;
+  * server death on all three ports;
+  * the shared-region cells on every port: the queued receive at an offset, with and without
+    ordinary routes, the backing lifetime, and the direct offset (12 cells);
+  * the RISC-V replacement witness.
+
+  The x86_64 SMP1 boot shows the deferral: `X86_AP_DISPATCH_REQUEST_OWED cpu=1
+  until=boot_publication` → `…_RELEASED cpu=1 at=boot_publication`.
+* *The phase check.* No qualified boot emitted `BOOT_EXCLUSIVE_VIOLATION`.
 
 ### Open, and not claimed
 
