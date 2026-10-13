@@ -25678,7 +25678,7 @@ throughout (`with_cpu=0`, `with_broad=0`, the three wrapper bodies counted separ
 | BL1 — multi-page shared-region mapping (NR 2 / NR 5 queued receive) | fixed and delivered (qualified `bb231093`) | hosted regression fails on `bdd0028e` at page 1; live two-page transfer fails on the unrepaired kernel on all three ports and passes repaired |
 | BL1-a — shared-region descriptor `offset` is not applied to backing by any receive path | fixed and delivered (SHARED-REGION-OFFSET1, qualified `9d991d0c`) | owner ABI decision: byte offset relative to the `MemoryObject`, page-aligned, a `DmaRegion` bounds without rebasing. On `a91632ba` a non-zero offset maps the wrong pages on the queued, direct and NR 30 paths, NR 30 maps the whole window, a `MemoryObject` descriptor whose `len` fits but whose `offset + len` does not is accepted, and a misaligned offset is accepted — nine hosted regressions fail. One range policy now admits and resolves on every path; live: every receive family maps a middle two-page range on all three ports |
 | BL1-b — shared-region backing lifetime: mapping references, displaced-page holds and reclamation keyed on an object's first frame | fixed and delivered (SHARED-REGION-LIFETIME1, qualified `7c2da86c`) | on `96114d69` a mapped interior page took no mapping reference, a displaced or unmapped interior page took no hold, teardown handed live interior frames to the allocator, and an object whose capabilities were gone was reclaimed while a forked child still mapped it — ten of twelve hosted regressions fail. The owner of a page is now the live allocator-owned extent that contains it; a removed or displaced reference becomes an identity hold settled after its invalidation; live: an interior mapping survives the other owner's release on all three ports, read back from the kernel's own counters |
-| BL1-c — a shared-region replacement reported complete before its invalidation was | fixed and delivered (SHARED-REGION-LIFETIME2, qualified `TBD-SRL2-COMMIT`) | on `89273030` the queued, NR 30 and direct installs reported success after an unacknowledged invalidation (receive returned, message committed, receiver woken), the direct follow-up excluded the ambient CPU instead of the executing one, and the general mapper reclaimed a displaced page at once in a live space — TBD-SRL2-BASEFAIL hosted regressions fail. The install outcome is typed and an incomplete one is settled as a failure that unmaps the current page and keeps every hold; the direct context carries its requester; immediate reclaim needs an explicit construction contract. Live (RISC-V): a receive replaces a page a remote hart is reading — targets include that hart, the fence completes, the hold settles, and the observer reads the new bytes |
+| BL1-c — a shared-region replacement reported complete before its invalidation was | fixed and delivered (SHARED-REGION-LIFETIME2, qualified `b84ea3b6`) | on `89273030` the queued, NR 30 and direct installs reported success after an unacknowledged invalidation (receive returned, message committed, receiver woken), the direct follow-up excluded the ambient CPU instead of the executing one, and the general mapper reclaimed a displaced page at once in a live space — nine of eleven hosted regressions fail. The install outcome is typed and an incomplete one is settled as a failure that unmaps the current page and keeps every hold; the direct context carries its requester; immediate reclaim needs an explicit construction contract. Live (RISC-V): a receive replaces a page a remote hart is reading — targets include that hart, the fence completes, the hold settles, and the observer reads the new bytes |
 | BL2 — x86 user port-I/O fault containment | fixed and delivered (qualified `f9096ff7`) | the unrepaired kernel panics on init's one forbidden `in`; repaired, init is reported and terminated while the supervisor and kernel run on |
 | BL2-a — RISC-V user illegal instruction reaches the strict Unknown policy | fixed and delivered (qualified `1d7be22c`) | reproduced live with a new default-off witness: base stops the whole system at `IRQ1_UNKNOWN_SETTLED … strict=1`. A U-mode illegal instruction now decodes as the task's `UserInstructionFault` at `sepc`, and the RISC-V bridge settles it through BL2's route and the same terminal owners; init is reported and terminated, and a replacement runs |
 | BL3a — futex-wake / direct-reply oracle wake-before-wait handshake | fixed and delivered (qualified `f948cc35` + `adb90643`) | five oracle hand-offs woke over an unchanged word, so a wake that ran first was lost and the waiter parked for good; forced deterministically with the default-off `oracle-handshake-race` witness, the unrepaired x86_64 FutexWake oracle parks the parent forever |
@@ -26179,7 +26179,7 @@ legacy mapper's immediate reclaim.
 on CPU 1, so CPU 1 is a genuine remote holder of the receiver's translations. The failure
 injection is the hosted build's own invalidation owner: with no cross-CPU coordinator, a non-empty
 remote target set cannot be acknowledged and `complete_unmap_shootdown_from_split` answers `false`.
-That failure is **hosted-only**. On the base TBD-SRL2-BASEFAIL of TBD-SRL2-TOTAL cases fail:
+That failure is **hosted-only**. On the base nine of the eleven cases fail:
 
 * *An incomplete invalidation became a successful delivery.* `map_user_page_raw_split` returned
   `true` after an unacknowledged shootdown, and the direct adapter reported success after
@@ -26204,6 +26204,8 @@ That failure is **hosted-only**. On the base TBD-SRL2-BASEFAIL of TBD-SRL2-TOTAL
   that mapping alone, the object was freed while CPU 1 could still translate to it.
 * *The competing release case could not even be reached.* The failed receive "succeeded", so there
   was no failure settlement for a final release to compete with.
+* *The two source contracts fail on the base as well.* It has no requester in the direct context,
+  and no construction contract.
 
 The two cases that pass on the base are a local-only replacement and a completed replacement with
 its cleanup. They are kept as coverage of the success path.
@@ -26272,7 +26274,7 @@ its cleanup. They are kept as coverage of the success path.
 * Unchanged: the offset ABI, rights, the page-rounded lifetime rules, and the revocation contract.
   The census is still `with_cpu=0`, `with_broad=0`.
 
-**Evidence — hosted (`shared_region_lifetime2`, TBD-SRL2-TOTAL cases).**
+**Evidence — hosted (`shared_region_lifetime2`, eleven cases).**
 
 * Incomplete invalidation, at the first installed page and at a later one:
   * queued NR 2 and NR 5: not a success, no mapping length published, no receiver-local capability,
@@ -26331,12 +26333,52 @@ the firmware fence's result, the install's outcome and the settlement. It grades
     (`SRR_KERNEL_SETTLE … reclaimed=1`) after the install;
   * no retained hold, no incomplete invalidation, no refused displacement.
 
-TBD-SRL2-LIVE
+Qualified run (`b84ea3b6`):
+
+```text
+SRR_KERNEL_INSTALL route=queued requester_cpu=0 asid=4 va=0x20080000 old_phys=0x865da000 hold=1 targets=0x2 fence=1 fence_hart_mask=0x1 outcome=complete
+SRR_KERNEL_SETTLE object=1 expected_object=1 phys=0x865da000 reclaimed=1
+SRR_VERDICT bytes=1 receiver=1 observer=1 observer_credited=1 kernel=1 requester=0 targets=0x2 fence=1 install=1 settle=1 result=ok
+```
+
+* `targets` is the logical-CPU bitmap production computed. `fence_hart_mask` names the target's
+  HART id: in this run logical CPU 1 was hart 0.
+* What the witness discriminates is shown by control (e) below. With the observer's CPU excluded,
+  the same boot shows `targets=0x1`, the old page reclaimed, and the observer still reading the
+  old byte with no kernel entry in between.
+* On the unrepaired base the queued route already named its requester explicitly, so this path
+  was not defective live there. The base's defects on this route were the success reported after
+  an INCOMPLETE invalidation and the direct route's ambient requester, both hosted evidence above.
 
 Live coverage of the other routes is unchanged and preserved: the NR 30, NR 2 / NR 5, lifetime and
 direct cells at object offsets 0 and 4096, all three ports.
 
-**Final-candidate controls.** TBD-SRL2-CONTROLS
+**Final-candidate controls.** Each was applied alone to the frozen candidate `b84ea3b6`, in its own worktree.
+
+* *(a) Settlement reverted.* An unacknowledged invalidation is reported `Complete` again. Five
+  hosted cases fail, each for that reason:
+  * queued: `not a successful receive`;
+  * NR 30: `not a delivery`;
+  * direct: `the delivery failed`;
+  * the competing release (unreachable again);
+  * the requester case, which relies on the incomplete outcome being reported.
+* *(b) Requester reverted.* The direct follow-up and rollback read the ambient field again. Three
+  cases fail:
+  * requester CPU 0, ambient CPU 1: `CPU 1 is a remote target: incomplete` — it published instead;
+  * requester CPU 1, ambient CPU 0: `published` — it targeted itself and could not complete;
+  * the source contract.
+* *(c) Mapper boundary reverted.* `Fresh` no longer refuses. `the_general_mapper_never_reclaims_a_displaced_page`
+  fails: the page table changed and the live-mapped object was reclaimed.
+* *(d) Live, queued install reading the ambient field.* It PASSED. In that boot the ambient field
+  named CPU 0, the real requester, so the two coincide on this route. The control is recorded as
+  run and is not counted as discriminating.
+* *(e) Live, queued install naming the WRONG requester (CPU 1).* `SRR_WITNESS_SEAL result=fail`:
+  * `targets=0x1` — the observer's CPU was excluded;
+  * the old page's hold settled and its object was reclaimed (`reclaimed=1`);
+  * the observer, with no supervisor entry since priming (`entries` 1112 → 1113), still read the
+    old byte (`O_STALE aux=0x11`).
+
+  That is the exact hazard: backing freed while a remote translation still reached it.
 
 **Remaining limitations.**
 
@@ -26361,7 +26403,47 @@ direct cells at object offsets 0 and 4096, all three ports.
   space. A CPU that ran the space earlier is not targeted. Only the construction contract — a space
   never activated — admits an immediate reclaim on that basis.
 
-**Qualification.** TBD-SRL2-QUAL
+**Qualification.** Candidate frozen at `b84ea3b6` (tree `f8d46133`); base `89273030`. Each gate
+ran once, in a fresh isolated worktree, and none was re-run. Each live run is bound to its commit,
+its kernel and userspace features and the sha256 of what it booted:
+
+* `artifact-binding.txt` for the shared-region cells;
+* `artifact-identity.txt` for the replacement witness: kernel `81b5bc94…`, initramfs `f0c35c57…`,
+  pinned OpenSBI v1.3 `171a91cc…`, QEMU 8.2.2.
+
+The lifetime cell's kernels were x86_64 `9c55c9ab…`, AArch64 `118f2803…`, RISC-V `365fd9e3…`.
+
+* *Hosted:*
+  * focused (lifetime2, lifetime1, offset1, the direct transaction modules and the re-derived
+    guards): 82/82;
+  * related groups (shared-region, transfer, COW, fork, reap, teardown, VmMap, invalidation,
+    NR 30, spawn, ELF): 854/854;
+  * full hosted suite: 6,077 passed;
+  * integration: 300/300;
+  * census: 9/9 (`with_cpu=0`, `with_broad=0`);
+  * `cargo fmt --check`: clean.
+* *On the base:* the eleven cases transplanted onto `89273030` fail 9 and pass 2, as listed above.
+* *Warnings:* every build has exactly the base's warnings less one — the base's unused
+  `caller_tid` in `recv_v3_txn.rs`, now used by the incomplete-invalidation marker. That covers:
+  * the default freestanding kernels (178 / 206 / 188);
+  * the three oracle-feature kernels;
+  * the hosted library and tests, and the oracle-feature hosted library;
+  * the `riscv64-smp3-witness` kernel.
+
+  The new `riscv64-sr-replace-witness` kernel has exactly the candidate SMP3 build's warnings.
+* *Live, all `result=ok`:*
+  * on each of x86_64, AArch64 and RISC-V:
+    * the NR 30 and NR 2 / NR 5 cells at offsets 0 and 4096;
+    * the lifetime cell;
+    * the direct cell at 0 and 4096, every one `misplaced=0`;
+  * the RISC-V replacement witness.
+
+  That is 22 runs.
+* *Strict cores and SMP:*
+  * strict core smokes on all three ports (x86_64 in its timer-contract-witness profile);
+  * `SMP1` / `SMP2` / `SMP3`, all `result=ok`.
+* *Pre-existing, not changed:* the hosted tests gated on `x86-shared-region-direct-oracle` still
+  fail to compile, with the same five `E0308` errors as on the base.
 
 ### BL2 — x86 user port-I/O fault containment
 
