@@ -28568,3 +28568,104 @@ and the sha256 of what it booted.
 * No canonical stage is re-classified.
 * Production AP scheduling stays default-off; it is the next package.
 * The quarantine and live-coverage limits above stand.
+
+## APS1 — AP-SCHED1: the first production AP-scheduling increment
+
+AP-SCHED1 runs in stages, each frozen, qualified and delivered on its own:
+
+1. repair the two witness contracts left red by VM-INVALIDATION1;
+2. derive the first production scheduling boundary;
+3. give idle CPUs a safe kernel address space;
+4. admit the selected configuration.
+
+### §1 — the two red witness contracts
+
+#### The RISC-V shared-region replacement witness orders by cause
+
+**The defect.** The SHARED-REGION-LIFETIME2 grader compared console positions written by two
+harts. In particular it required O's observation line to follow `SRR_KERNEL_INSTALL`. But that
+line is printed only after the install's outcome is known, and the outcome is known only after
+CPU 1's remote fence has completed. Once fenced, O may read the granted byte and print first. The
+VMI1 qualification saw this on the base (3 of 3 diagnostic boots) and on the candidate (2 of 4).
+
+**The repair.**
+
+* *Causal stamps.* The witness draws a stamp from ONE witness-only atomic counter at each event:
+  * the production shootdown's target set;
+  * the fence request (after the requester's `fence`, before the firmware call);
+  * the fence's completion;
+  * the install outcome;
+  * the settlement;
+  * every user step (at the step's own supervisor entry, after the task's load it reports).
+
+  A single `fetch_add` location is one total order all harts agree on. Nothing waits, and nothing
+  is printed on the shootdown path: the stamps travel in the existing install record, now split
+  in two because a printk record is bounded (`SRR_KERNEL_INSTALL_ORDER`). The records now also
+  name the granted page (`new_phys`) and CPU 1's real hart.
+* *The grader* (`scripts/grade-riscv64-sr-replace-witness.py`) checks five obligations
+  independently. The kernel's own verdict must agree, but it is never the proof:
+  * **identity** — the provisioned tasks, address space, window, displaced and granted pages,
+    displaced object, and a fence hart mask that is exactly CPU 1's hart;
+  * **residency** — O primed on CPU 1, took exactly one supervisor entry (its own observation)
+    after priming, and its priming stamp precedes the target set;
+  * **invalidation** — requester CPU 0; a target set with CPU 1 and without the requester; fence
+    requested and successful; outcome `complete`; stamps `targets < fence_req < fence_done <
+    outcome`;
+  * **bytes** — O read the granted byte with a stamp after the fence request, and R read the
+    granted page after the outcome;
+  * **settlement** — once, after the outcome, reclaiming exactly the displaced object and page.
+* *Fixture controls.* `--self-test` runs 27 fixtures before every grading, and a failing self-test
+  fails the boot. Two pass: the legitimate reversed print order and the in-order print. The rest
+  must fail:
+  * missing invalidation (no target, no fence, failed fence, incomplete outcome);
+  * wrong targets (the requester, the wrong requester, the wrong hart);
+  * stale bytes (O_STALE, a wrong byte, a short page);
+  * causal inversions (an observation before the fence request; a fence completion after the
+    outcome);
+  * residency breaks;
+  * missing or premature settlement;
+  * substituted identities (space, displaced page, granted page, settled object, observer task,
+    observer CPU, window);
+  * the kernel's records without the user observations.
+
+A fresh development boot showed the legitimate interleaving live. O's observation (`seq=5`) falls
+between CPU 0's fence request (4) and the fence call's return (6), and its line was printed before
+the install line.
+
+#### The overtaken-deferral witness waits for a committed wait
+
+**The defect, reproduced on the true base.** FutexWait publishes its block in three steps:
+register the waiter, clear `current`, then read the registration back. A wake landing between
+register and read-back is settled by the wait itself (`FUTEX_WAIT_PARK_WOKEN_DURING_PUBLISH …
+recovery=restored`) and never reaches the drain the witness holds. That is legitimate production
+behaviour. But K woke freely, and W cannot tell the two cases apart, so W counted such a round and
+the boot ended with fewer holds than rounds (the VMI1 red cell: `held 3 of 4`, its round 1 woken
+during publication).
+
+The reproduction used a harness that was not committed: a bounded, labelled, witness-only wait in
+the production publication, after W's registration and before the read-back, so K's wake lands
+inside the window. On `a72c69a7` all four rounds were woken during publication
+(`OVT_REPRO_PUBLICATION_WAIT … woken_during_publication=1 polls=19/24/2/44`). The witness held 0
+of 4 rounds, yet W and K each counted four.
+
+**The repair.** K no longer issues a round's wake until the kernel's hold has proven that round's
+premise and published GO:
+
+* the drain's outgoing task is W;
+* W is `Blocked(Futex(WAIT))`, so its wait committed and `current` is clear;
+* the word W waits on holds this round's wait generation (W stores its round number as the futex
+  value it waits for).
+
+GO is one mailbox word, `GO_MAGIC << 32 | generation`, written through W's address space with no
+lock held across anything. A generation mismatch refuses GO (`OVT_WITNESS_GO_REFUSED`). K spins on
+the word with a bound and no kernel entry, comparing the generation with its own round. If GO
+never arrives, K logs `OVT_K_GO_TIMEOUT` and parks on `KFAIL`.
+
+Both ports' K programs follow this. The summary records each round's GO generation, and the
+grader requires all of them, plus as many W rounds and K wakes as rounds held, and no
+woken-during-publication wait on the witness word. Nothing was slept, lengthened or retried, and
+no round was dropped: four rounds, the register, flag and stack checks, and the settlement checks
+all stand.
+
+With the same harness applied to the repaired tree, no wake landed during publication (each
+harness wait expired at its bound), and all four rounds were held with their GO generations.
