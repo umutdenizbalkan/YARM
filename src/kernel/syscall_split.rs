@@ -9248,7 +9248,7 @@ pub(crate) fn try_split_vm_anon_map_into_frame(
 ///
 /// This route services all five shapes at any CPU count. The topology restriction is not ignored:
 /// it was a consequence of the only unmap cascade the old route could reach needing the ipc(3)
-/// domain for its shootdown, and `unmap_range_two_phase_split` — rank 5, then the coordinator
+/// domain for its shootdown, and `unmap_range_two_phase_from_split` — rank 5, then the coordinator
 /// with NO lock held, then rank 6 — is the owner that answered it.
 pub(crate) fn try_split_vm_brk_into_frame(
     shared: &SharedKernel,

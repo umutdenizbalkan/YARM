@@ -887,7 +887,7 @@ pub(crate) fn page_fault_route_for(arch: &str, class: PageFaultClass) -> PageFau
         // `dsb ishst; tlbi vaae1is; dsb ish; isb` — an inner-shareable BROADCAST plus completion
         // plus context synchronization — so by the time the transaction returns the new
         // translation is visible domain-wide and this PE is synchronized, and the `eret` to EL0
-        // is itself context-synchronizing. `complete_unmap_shootdown_split` therefore gates only
+        // is itself context-synchronizing. `complete_unmap_shootdown_from_split` therefore gates only
         // the OLD-frame reclaim on AArch64, which is exactly the fail-safe direction.
         ("aarch64", PageFaultClass::CowCandidate) => PageFaultRoute::SplitCow,
         // U9-PAGEFAULT1 §2 — RISC-V, live-witnessed here for the first time.

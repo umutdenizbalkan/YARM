@@ -28122,7 +28122,8 @@ QEMU: 8.2.2. Every scheduled result is kept, including the failed freeze.
 
 ### Open, and not claimed
 
-* **VM-INVALIDATION1 stays open.** This package does not change the following:
+* **VM-INVALIDATION1 stays open.** This package does not change the following (addressed
+  afterwards by §VMI1):
   * VmMap (NR 3) and both COW routes still report success after an incomplete invalidation (the
     displaced page stays quarantined);
   * the remaining ambient-requester dependencies (fork write-protect, split COW private copy, the
@@ -28140,3 +28141,302 @@ QEMU: 8.2.2. Every scheduled result is kept, including the failed freeze.
 * **Historical comments.** Comments elsewhere in the tree still narrate the broad
   `SpinLock<KernelState>` ("already dropped", "outside the global lock"). They describe the states
   they were written in. The census reads code, not comments.
+
+## VMI1 — VM-INVALIDATION1: a VM change is complete only when its invalidation is
+
+SHARED-REGION-LIFETIME1/2 settled the shared-region family: a displaced page lives until its
+invalidation is acknowledged, and a replacement whose invalidation did not complete is a failure.
+BROAD-LOCK-RETIREMENT1 left the rest of the VM open (§BLR1 "Open, and not claimed"). This package
+closes it for every production VM mutation that owes an invalidation. It covers three things:
+
+* **completion** — what a caller may report after its invalidation is incomplete;
+* **the requester** — which CPU the invalidation is excluded from;
+* **target coverage** — which CPUs can still hold a translation, on each port.
+
+It is not general VM cleanup. The broad lock stays retired, and the domain ownership is unchanged:
+rank 5 owns the page tables, rank 6 the frames and holds, and no lock is held across a wait.
+
+### Inventory (base `a75b1601`)
+
+Each production owner, with its mutation, invalidation, requester, targets, verdict and the
+reclamation or publication the verdict gates:
+
+| Owner | Requester | Verdict on the base | Gates |
+|---|---|---|---|
+| NR 3 / NR 13 `run_vm_map_transaction`, phase W | the trap's CPU | **ignored**: `Ok` after a refused acknowledgement | displaced hold kept |
+| NR 3 phase-I rollback | the trap's CPU | typed: pin kept | correct |
+| split COW `cow_recover_private_copy_split` | **ambient `sched.current_cpu`** | **`Committed { shootdown_acked: false }` reported recovered** | old hold kept |
+| broad COW `try_handle_cow_fault` (hosted reference) | broad current CPU | **`PageInstall` ignored, `Ok(true)`** | hold kept |
+| split fork write-protection | **ambient** | `false` refuses the fork — correct | child unpublished |
+| broad fork write-protection (hosted reference) | none | **`true` with no invalidation (`deferred_broad`)** | child published |
+| NR 4 `unmap_whole_range` | the trap's CPU | typed event, `Ok(len)` | holds kept |
+| transfer revocation (`revoke_active_transfer_mappings_for_cap_split` and its five callers) | **ambient** | `bool` gates the reclaim | reclaim gated |
+| reap transfer unmap | **ambient** | **discarded** | — |
+| reap address-space drain | — | — | **root and frames freed while another CPU may still have the root loaded** |
+
+Activation, per port:
+
+* **x86_64.** Every CR3 load has bit 63 clear, so it flushes the incoming PCID. But
+  `ensure_user_return_cr3_split` writes CR3 only when the hardware root differs from the task's.
+  The owner revalidation can resume, on a CPU that went idle with that same space loaded, a task
+  woken meanwhile. It would return to ring 3 through translations removed in between, while the CPU
+  was nobody's shootdown target.
+* **RISC-V.** Every `satp` write is `csrw satp; sfence.vma zero, zero`, and every trap resume
+  writes `satp`.
+* **AArch64.** Activation skips an unchanged TTBR0 and does not flush. Every invalidation is an
+  inner-shareable broadcast (`tlbi vaae1is`, and `tlbi aside1is` at teardown).
+* The per-CPU activation record (`ACTIVE_ASID`) was written by `switch_address_space` callers
+  only. The x86_64 AP's raw `mov cr3`, `write_cr3_for_asid`, the RISC-V trap-resume `write_satp`
+  and the BSP first entry were not recorded.
+
+The fork was audited separately. Its completion handling was already right — an unacknowledged
+write-protection refuses the fork before the child is published. Its defect was the requester
+alone.
+
+The kernel executes through the user root on every port: the x86_64 kernel half sits in the
+PML4, the RISC-V kernel gigapage in the root, and the AArch64 per-root device leaves in TTBR0. So
+a root still loaded on an idle CPU is in use by that CPU, and freeing it is a use-after-free of a
+page table.
+
+### Defects reproduced on the base, through production owners
+
+Module `vm_invalidation1`. The injection is the hosted invalidation owner itself: with no
+cross-CPU coordinator, a non-empty remote target set cannot be acknowledged, so
+`complete_unmap_shootdown_from_split` answers `false`. Residency is set explicitly per fixture
+(a task bound to the space is made current on the named CPU). Every expected target set is derived
+from that fixture fact, never from the target helper. The broad routes' failure seam is a full
+cross-CPU mailbox.
+
+Fourteen cases were transplanted onto `a75b1601`. Eleven fail and three pass:
+
+* NR 3: an unacknowledged replacement of the first page, and of a later page, returned success.
+* Transfer revocation on CPU 0 with the ambient field naming CPU 1, the space resident on CPU 1:
+  CPU 1 was excluded, and the pages were settled and reclaimed.
+* The revocation's only holder (CPU 1 revoking while the ambient field names CPU 0) targeted
+  itself and could never settle.
+* Fork on CPU 0 with the ambient field naming CPU 1 published the child while CPU 1 still held
+  writable parent translations.
+* The reverse fork (on CPU 1, the only resident CPU) targeted itself and refused.
+* Reap freed an address space CPU 1 still had loaded.
+* COW: an unacknowledged invalidation came back `Committed { shootdown_acked: false }` and
+  reported `committed`, both with the requester CPU 0 / ambient CPU 1 and with requester and
+  ambient both CPU 0.
+* The reverse COW (on the only resident CPU, ambient CPU 0) left the old page's hold unsettled.
+* The broad COW returned `Ok(true)`.
+
+The three that pass on the base are the success paths (local-only NR 3, local-only COW, and a
+reap whose space no other CPU has loaded). They are kept as coverage.
+
+The base COW owner is compiled only for freestanding targets. Its five cases ran with a
+harness-only change: its `#[cfg(not(hosted-dev))]` gates were removed, and a hosted page copy
+returning `Ok(())` was added. The owner's body was untouched.
+
+### Repair
+
+**Typed completion.**
+
+* *NR 3 / NR 13 — failure settlement after the request is installed.* Phase W counts displaced
+  pages whose invalidation was not acknowledged. If any were not, the request is undone in the
+  phase-I rollback's order:
+  1. `remove_committed_pages` takes each of the request's pages back out of the address space,
+     but only where the PTE still names the request's own pinned frame, and drops the mapping
+     reference pass B took;
+  2. each removed page completes its own invalidation, since the new translation may have been
+     cached too;
+  3. settled pages release their pin and then their provisional capability.
+
+  An unsettled page keeps both. Every displaced page whose acknowledgement did not arrive keeps
+  its identity hold. The displaced mapping is not restored, because the acquisition that displaced
+  it is gone. The answer is `SyscallError::Internal`, the code every post-validation kernel
+  failure of NR 3 / NR 13 already returns, with the marker
+  `VM_MAP_INVALIDATION_INCOMPLETE … displaced_unacked= request_unacked= released= retained=` and
+  `VmRollbackReason::InvalidationIncomplete`.
+* *COW, split.* `CowRecovery::Committed` now means acknowledged. An unacknowledged invalidation
+  is `FailedClosedInvalidation { old_phys, new_phys }` (reason `invalidation_incomplete`, no
+  pre-mutation settlement, no broad fallback, error `KernelError::WouldBlock` — the error the
+  fork's incomplete write-protection carries). The bridge settles it through its EXISTING
+  post-allocation fail-closed arm (`VM_COW_SPLIT_FAILED_CLOSED`). That arm never returns through
+  the faulting frame and invents no errno. The private copy stays installed and the old page stays
+  held. Nothing is retried.
+* *COW, broad (hosted reference).* `InvalidationIncomplete` clears the mark and returns
+  `Err(WouldBlock)` with `VM_COW_INVALIDATION_INCOMPLETE route=broad`.
+* *Fork, broad (hosted reference).* The write-protection performs a real per-page broad shootdown
+  and refuses on any failure. It no longer reports `deferred_broad`.
+* *NR 4 and the broad unmap* return their real verdicts. A broad `unmap_range_two_phase` is now
+  `-> bool`.
+
+**The requester is carried; the ambient helpers are deleted.** `complete_unmap_shootdown_split`
+and `unmap_range_two_phase_split` — the forms that read `sched.current_cpu` — no longer exist.
+Every caller names the CPU that executes it:
+
+* fork: `complete_cow_write_protect_shootdown_split(self.cpu, plan)`;
+* split COW: `facts.cpu`;
+* transfer revocation: `requester` through `revoke_active_transfer_mappings_for_cap_split`,
+  `memory_obligations_split(_gated)`, `revoke_capability_no_vm_split`, `commit_revoke_split`,
+  `commit_user_held_capability_split` and `rollback_materialized_recv_cap_no_vm_split`, from
+  NR 2 / NR 5 / xfer / shared-region receive (`self.cpu`);
+* reap: `SharedReapOwners { shared, cpu }`;
+* `kernel_register_v2_meta_write_split` takes its `cpu`.
+
+`every_shootdown_names_a_carried_requester` pins that no production source names the deleted
+forms.
+
+**Coverage — a loaded root is a target fact.**
+
+* *Every activation is recorded after its root load.* That covers the x86_64 BSP first entry and
+  the AP ring-3 entry and saved resume (the AP plan now carries the task's ASID), the RISC-V trap
+  resumes and its enter-user stub, and the direct dispatch. Each is recorded only if
+  `switch_address_space` (now `#[must_use] -> bool`) really loaded the root; the RISC-V deferral
+  answers `false`. `reset_all_active_address_spaces` runs at state initialization.
+  `every_activation_record_follows_its_root_load` pins the order.
+* *x86_64: the owner revalidation performs a FLUSHING activation* before its pre-IRET check, and
+  records it. A woken task resumed on a CPU that kept its space loaded therefore cannot use a
+  translation removed while that CPU was not a target. Pinned by
+  `x86_activation_flushes_and_revalidation_performs_it` and, through the production owner, by
+  `x86_owner_revalidation_activates_and_records_the_resumed_space`.
+* *Teardown is gated on loaded roots.* `address_space_loaded_cpus_split(asid)` is the union of
+  the CPUs whose current task is bound to the space and the CPUs whose last recorded activation is
+  the space. The reap consults it before the drain. A space loaded anywhere is quarantined, with
+  `VM_ASPACE_TEARDOWN_QUARANTINED pid asid loaded_cpus reason=root_still_loaded`: its root, frames
+  and ASID are kept, and `ReapOutcome.address_spaces_quarantined` is counted. Nothing waits for
+  the other CPU.
+
+  The union is sufficient because the reap runs after every thread of the process is gone, so no
+  new activation of the space can begin. A CPU that loaded the space did so for one of its tasks.
+  Between that task becoming current and the record being written the CPU is current-bound. After
+  the task leaves, the record stays until the CPU loads another root.
+
+  Production has no other resident teardown. The split spawn refuses a live destroy
+  (`SPAWN_SPLIT_OWNER_REFUSED op=destroy_live_address_space`), and exec and the spawn rollback use
+  the never-resident inverse.
+
+### Why the target set stays "currently running"
+
+The shootdown still targets CPUs whose current task is bound to the space. No "every CPU that ever
+ran it" bitmap is introduced, because none is needed:
+
+* *A CPU running nothing of the space* executes no user access through it. The kernel reaches
+  user memory only on behalf of the current task.
+* *Before that CPU can run the space again*, its activation retires what it may have cached:
+  * x86_64 — every activation, the revalidation's included, writes CR3 with the no-flush bit
+    clear. PCID-tagged entries of an inactive space are unreachable until that write flushes
+    them.
+  * RISC-V — `sfence.vma zero, zero` follows every `satp` write.
+  * AArch64 — activation does not flush, but every invalidation is an inner-shareable broadcast
+    that reaches every PE whatever the target set.
+* *The snapshot race.* The target set is computed after the PTE is removed under rank 5:
+  * a CPU that becomes current for the space after the snapshot activates after the removal, and
+    walks the new tables;
+  * one that was current before it is targeted;
+  * one that leaves after it receives an unneeded invalidation.
+* *Root and ASID reuse.* A root is freed only through the gated drain. Retired ASIDs are never
+  acknowledged in production (the reap's mailbox work is not drained), so an ASID number is never
+  reused and no TLB entry can alias a later space. This is pre-existing and unchanged.
+
+The image check `scripts/check-vm-invalidation-sequence.sh <arch> <ELF>` enforces the
+instructions this argument relies on, in the built kernel:
+
+* x86_64 — no CR3-loading function composes bit 63, and `invlpg` is present;
+* RISC-V — every `csrw satp` is immediately followed by `sfence.vma zero, zero`;
+* AArch64 — the broadcast TLBI sequence check, plus the presence of both `tlbi vaae1is` and
+  `tlbi aside1is`.
+
+QEMU success alone is not evidence for these instructions.
+
+### Evidence — hosted (`vm_invalidation1`, 21 cases)
+
+* NR 3, incomplete at the first and at a later page: not a mapping. No page of the request stays
+  mapped, its capabilities are released and its frames are back in the allocator, while every
+  displaced page stays held and charged.
+* NR 3, a competing final release after the failure (`nr3_a_final_release_after_the_failure_frees_nothing`):
+  the request's unacknowledged page keeps its pin, so revoking its provisional capability frees
+  nothing.
+* NR 3, local-only success: complete, and exactly the displaced object reclaimed.
+* Requester and ambient field disagree, in both directions, with expectations from fixture
+  residency:
+  * fork on CPU 0 / ambient CPU 1 refuses and publishes no child;
+  * fork on CPU 1 / ambient CPU 0 completes, publishes the child and write-protects every
+    parent page;
+  * revocation on CPU 0 / ambient CPU 1 keeps every page held;
+  * revocation on the only holder settles every hold;
+  * COW on CPU 0 / ambient CPU 1 fails closed and the shared page stays held;
+  * COW on the only resident CPU commits and settles.
+* COW: unacknowledged → fail-closed. Local-only → committed and settled. Broad → `Err(WouldBlock)`
+  with the page held.
+* Broad fork whose write-protection cannot complete refuses.
+* Reap: a space CPU 1 still has loaded is quarantined — the space, its object and its frame all
+  survive. After CPU 1 activates another space, the same reap reclaims all three.
+* x86_64 owner revalidation, through the production owner: CPU 1 idle with the space loaded, a
+  woken task resumed — the activation is recorded for that space.
+* Source contracts: `every_shootdown_names_a_carried_requester`,
+  `every_activation_record_follows_its_root_load`,
+  `x86_activation_flushes_and_revalidation_performs_it` and
+  `teardown_and_nr3_settle_only_on_completion`.
+
+Re-derived to the new owners, none weakened: `shared_region_lifetime1` (2), `stage193c`,
+`u9a64cow2` (2), `u9c`, `u9cow2`, `u9d3`, `u9f` (5), `u9fork1`, `u9reap1`, `u9vment1` finding 3
+and `u9xfer1`. Four negative guards that forbade only the deleted ambient names now also forbid the
+requester-explicit successor (they would otherwise have passed vacuously).
+
+### Evidence — live (`scripts/qemu-riscv64-vmi-witness-smoke.sh`, RISC-V)
+
+The kernel feature `riscv64-vmi-witness` reuses the QEMU-SMP3 secondary bring-up (pinned OpenSBI,
+`-smp 2`, `yarm.ap_user_dispatch=1`) with two kernel-built programs in ONE address space:
+
+* R on CPU 0;
+* O on CPU 1.
+
+Page C is one page of a shared object, read-only and copy-on-write, also mapped by a second
+space. F is writable.
+
+* *COW.* O logs `O_COW_READY`, reads C and spins on it with no kernel entry. R stores into C, so
+  the production split COW on CPU 0 replaces a page whose translation is live on CPU 1.
+* *Fork.* O stores an incrementing counter into F through a cached writable translation with no
+  kernel entry. R waits until the counter visibly advances and forks (NR 12). The child reads F
+  twice across a delay.
+
+The witness performs no VM operation. It grades separately:
+
+* *observed bytes*: R reads its byte back, and O reads R's byte (`O_COW_NEW aux=0x5a`), credited
+  only if O's hart took no supervisor entry since priming. The child sees F frozen (two equal
+  non-zero reads), credited only if O took no supervisor entry from its priming to the fork's FIRST
+  shootdown (QEMU flushes a whole TLB on any fence). O's next store faults afterwards.
+* *kernel completion*, for C and for F:
+  * requester CPU 0, a target set naming CPU 1, and a successful firmware fence;
+  * `VM_COW_SPLIT_COMMITTED cpu=0 tid=9500 … acked=1`;
+  * `FORK_COW_SHOOTDOWN_SPLIT … result=ok` before `FORK_TXN_COMMITTED`, and the child reporting
+    after it;
+  * no incomplete invalidation, no fail-closed COW, no refused fork.
+
+Development run (candidate in progress):
+
+```text
+VMIW_DETAIL_COW cow_bytes=1 cow_credited=1 cow_kernel=1 cow_requester=0 cow_targets=0x2 cow_fence=1
+VMIW_DETAIL_FORK fork_bytes=1 child_f=0x2340cf2/0x2340cf2 fork_credited=1 o_faulted=1 fork_kernel=1 fork_requester=0 fork_targets=0x2 fork_fence=1
+VMIW_VERDICT cow=1 fork=1 o_faulted=1 result=ok
+```
+
+The shared-region replacement witness (`riscv64-sr-replace-witness`) does not qualify COW or fork.
+This witness does not qualify NR 3 or revocation; those stay hosted evidence.
+
+### Limits
+
+* *Quarantine is permanent.* Nothing retries an unacknowledged invalidation. Quarantined backing
+  is never reclaimed: an NR 3 displaced page, an unsettled request page with its capability, the
+  COW old page, a revoked transfer page, and a reaped space still loaded elsewhere.
+  * With AP user dispatch default-off, no qualified boot reaps a space another CPU has loaded.
+  * Under general AP scheduling, an AP that goes idle after its last task exits keeps that root
+    loaded and its reap will quarantine. Switching idle CPUs off user roots, or a deferred retry,
+    belongs to the AP scheduling package.
+* *Live evidence is RISC-V only.*
+  * The incomplete-invalidation settlements and the revocation and NR 3 requester cases are hosted
+    evidence on every port.
+  * AArch64's broadcast completes every invalidation architecturally, so its outcome is always
+    complete.
+  * The x86_64 revalidation's flushing activation is hosted (production owner) and source/image
+    evidence; no x86_64 live cell resumes a woken task on an idle CPU that kept the space loaded.
+* *Retired ASIDs are never acknowledged.* The reap queues fire-and-forget mailbox work that
+  nothing drains after BLR1. ASID numbers are therefore never reused, and the retired table is
+  bounded. This is pre-existing and unchanged.
+* *Hosted reference routes* (the broad COW, fork and unmap) follow the same policy. They are not
+  production routes.

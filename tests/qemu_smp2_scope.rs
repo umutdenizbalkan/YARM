@@ -384,11 +384,13 @@ fn the_vm_operation_is_recorded_by_its_owner_at_every_exit() {
         "every exit after the begin records its completion"
     );
     assert!(!after.contains('?'), "no early exit after the begin");
-    assert_eq!(after.matches("return ").count(), 5, "the five error exits");
-    assert_eq!(after.matches("return vm_txn_exit!(").count(), 5);
+    // VM-INVALIDATION1 added the sixth: the failure settlement after an unacknowledged
+    // displacement, recorded through the same exit.
+    assert_eq!(after.matches("return ").count(), 6, "the six error exits");
+    assert_eq!(after.matches("return vm_txn_exit!(").count(), 6);
     assert_eq!(
         after.matches("vm_txn_exit!(\n").count() + after.matches("vm_txn_exit!(smp2_op,").count(),
-        6
+        7
     );
     assert!(
         after

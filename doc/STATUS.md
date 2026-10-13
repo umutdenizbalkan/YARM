@@ -25,6 +25,15 @@ state through the `BootExclusive` token, published before the first user entry, 
 guard rejects any reintroduction. No canonical stage is re-classified by it, and VM-INVALIDATION1
 stays open. Details: `doc/KERNEL_UNLOCKING.md` §BLR1.
 
+**VM-INVALIDATION1 — a VM change is complete only when its invalidation is.** VmMap (NR 3 / NR 13)
+and both COW routes settle an unacknowledged invalidation as a failure instead of a success; every
+shootdown names the CPU that executes it (the ambient-requester forms are deleted); every
+activation is recorded after its root load; the x86_64 owner revalidation performs a flushing
+activation; and the reap quarantines an address space whose root another CPU still has loaded.
+Quarantine is permanent. Live evidence is the RISC-V COW / fork witness; the settlements are hosted
+evidence on every port. No canonical stage is re-classified, and production AP scheduling stays
+off. Details: `doc/KERNEL_UNLOCKING.md` §VMI1.
+
 **U9-SPAWN-IC1 — the spawn's endpoint and capability phases are rank-local and exactly
 reversible, and the stale RISC-V smoke expectation is corrected. Census remains `2 / 0 / 2`.
 U9 remains OPEN.**

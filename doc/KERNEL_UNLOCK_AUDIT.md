@@ -101,6 +101,11 @@ but it proves nothing about the kernel and closes no part of the stage. Do not r
 > broad acquisitions, production broad-wrapper definitions and production broad-lock storage are
 > all **0**, and test-only support is present only under `#[cfg(test)]`
 > (`doc/KERNEL_UNLOCKING.md` §BLR1, `tests/broad_lock_census_guard.rs`).
+>
+> **VM-INVALIDATION1** leaves the census unchanged and moves no domain lock. It types the
+> completion of every production invalidation (NR 3 / NR 13 and COW now fail on an unacknowledged
+> one), deletes the two ambient-requester shootdown helpers, and gates the reap's address-space
+> drain on loaded roots (`doc/KERNEL_UNLOCKING.md` §VMI1).
 
 Before BLR1, `SharedKernel` (`src/runtime.rs:231`) owned exactly one broad lock:
 

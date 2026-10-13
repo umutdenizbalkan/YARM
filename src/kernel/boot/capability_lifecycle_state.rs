@@ -884,9 +884,10 @@ impl KernelState {
 // `AI_AGENT_RULES` §14.4 fenced `with_vm_split_mut` / `with_memory_split_mut` here "without the
 // lock-free `await_tlb_shootdown_ack` design and multi-CPU smoke". That design is delivered:
 // vector 0xF1 is the sole target-side invalidation and generation-matched ACK producer, earning
-// real ACKs from CPL0 and CPL3, and `SharedKernel::unmap_range_two_phase_split` drives it through
-// `complete_unmap_shootdown_split` with NO domain lock held. So this composition now covers EVERY
-// class the broad function covers except `Reply`, and it performs all six obligations:
+// real ACKs from CPL0 and CPL3, and `SharedKernel::unmap_range_two_phase_from_split` drives it
+// through `complete_unmap_shootdown_from_split`, for the CPU executing the revocation, with NO
+// domain lock held. So this composition now covers EVERY class the broad function covers except
+// `Reply`, and it performs all six obligations:
 //
 // * (4) `revoke_active_transfer_mappings_for_cap_split` — the registry scan, the real two-phase
 //   unmap with a REAL D3 completion, the record clear, both telemetry counters, the supervisor
@@ -897,7 +898,7 @@ impl KernelState {
 //
 // **Unmap before ACK before reclaim.** The frame is reclaimed only after every target CPU has
 // published `ack_gen == req_gen` for it. A shootdown that does not complete leaves the frame
-// UNAVAILABLE for reuse: `unmap_range_two_phase_split` skips its per-page reclaim, and this
+// UNAVAILABLE for reuse: `unmap_range_two_phase_from_split` skips its per-page reclaim, and this
 // composition skips the object-level reclaim too, so a refcount that reached zero without an ACK
 // never returns a frame to the allocator that a remote CPU may still translate. That is strictly
 // safer than leaking it back.
@@ -1570,7 +1571,7 @@ impl crate::runtime::SharedKernel {
     /// `note_transfer_record_revoked`, supervisor report, `YARM_TRANSFER_REVOKE` — with each step
     /// taken through its own single-rank seam and no two locks ever held at once.
     ///
-    /// The unmap is the REAL one: `unmap_range_two_phase_split` removes each PTE under rank 5,
+    /// The unmap is the REAL one: `unmap_range_two_phase_from_split` removes each PTE under rank 5,
     /// releases it, completes a generation-matched cross-CPU shootdown with NOTHING held, and only
     /// then reclaims under rank 6. Returns `false` if any page's shootdown did not complete, which
     /// tells the caller to skip the object-level reclaim as well — the frame stays unavailable for

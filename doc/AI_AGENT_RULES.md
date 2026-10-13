@@ -1038,6 +1038,13 @@ acceptance table. Declaring without smoke is a hard violation of §13.
     impersonates the requester onto each target (`set_current_cpu`), drains the
     targets' mailboxes from the requester, and calls `yield_current` — none of
     which is permissible off the broad lock.
+  - **VM-INVALIDATION1:** the coordinator is reached only through the
+    requester-explicit forms (`complete_unmap_shootdown_from_split`,
+    `unmap_range_two_phase_from_split`); the ambient forms that read
+    `sched.current_cpu` are deleted and must not return. An unacknowledged
+    invalidation is a failure settlement for its caller, never a success, and a
+    page-table root may be freed only when no CPU has it loaded
+    (`doc/KERNEL_UNLOCKING.md` §VMI1).
 - D6: no per-CPU scheduler lock types until the x86_64 SMP trampoline split
   lands and D2/D3 are smoke-stable. `entering_tid`/`exiting_tid` remain
   Class F (authoritative read only).

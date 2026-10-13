@@ -144521,6 +144521,7 @@ mod u9f_split_capability_revocation {
             "memory_obligations_split",
             "revoke_active_transfer_mappings_for_cap_split",
             "unmap_range_two_phase_split",
+            "unmap_range_two_phase_from_split",
         ] {
             assert!(
                 !plan.contains(mutation),
@@ -146128,6 +146129,7 @@ mod u9d3_d6_cleanup_split {
         // No shootdown is owed, and none is attempted: the frame was never in a page table.
         for forbidden in [
             "complete_unmap_shootdown_split",
+            "complete_unmap_shootdown_from_split",
             "smp_tlb_shootdown_cpus",
             "invlpg",
         ] {
@@ -165144,6 +165146,7 @@ mod u9fork1_cow_fork_transaction {
         // The locked body plans, and cannot reach the coordinator.
         for forbidden in [
             "complete_unmap_shootdown_split",
+            "complete_unmap_shootdown_from_split",
             "submit_cross_cpu_work",
             "request_live_asid_shootdown",
             "await_tlb_shootdown_ack",
@@ -187904,6 +187907,7 @@ mod u9pf1_demand_route {
         // No shootdown, no copy, no refcount removal: there was no old frame.
         for absent in [
             "complete_unmap_shootdown_split",
+            "complete_unmap_shootdown_from_split",
             "copy_cow_frame_contents_split",
             "note_mapping_removed_locked",
             "clear_cow_page_locked",

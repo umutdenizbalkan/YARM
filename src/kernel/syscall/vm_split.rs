@@ -273,7 +273,7 @@ impl crate::kernel::syscall::vm_txn::VmBrkOwners for SplitVmOwners<'_> {
         //
         // The delivered split shrink refused whenever more than one CPU was online, because the
         // only unmap cascade it could reach needed `request_live_asid_shootdown` and the ipc(3)
-        // domain. `unmap_range_two_phase_split` is the owner that answered that: rank 5 removes
+        // domain. `unmap_range_two_phase_from_split` is the owner that answered that: rank 5 removes
         // the PTE, the shootdown completes with NO lock held through the generation-matched
         // coordinator, and rank 6 reclaims only after the acknowledgement. It is correct at any
         // CPU count, so the shrink is too.
