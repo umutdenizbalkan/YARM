@@ -79,8 +79,13 @@ pub fn window_va_for(pages: &[u64], base: u64, pa: u64) -> Option<u64> {
 /// and names exactly `pa`'s page. The range must lie within one page.
 ///
 /// Every fact is read from the tables the hardware would walk; the layout only says WHICH virtual
-/// address to walk. An uninstalled window, a root that never received it, bare translation, or a
-/// user-accessible leaf all answer `None` — and none of them is answered by touching the device.
+/// address to walk. An uninstalled window, a root that never received it, or a user-accessible
+/// leaf all answer `None` — and none of them is answered by touching the device.
+///
+/// AP-SCHED1 §3 — **Bare translation** (`satp` mode 0) is the kernel's own address space, which an
+/// idle CPU now runs in: there is nothing to walk and every address is physical, so a device page
+/// the window registered is reached at its own physical address. An unregistered address is still
+/// refused — Bare makes everything addressable, not everything a device this kernel audited.
 pub fn device_pa_reachable(
     satp: u64,
     pages: &[u64],
@@ -97,6 +102,9 @@ pub fn device_pa_reachable(
         return None;
     }
     let va = window_va_for(pages, base, pa)?;
+    if satp >> 60 == 0 {
+        return Some(pa);
+    }
     let leaf = walk_sv39_leaf(satp, va, read)?;
     let want = PTE_VALID | PTE_READ | PTE_WRITE;
     if leaf & want != want || leaf & (PTE_USER | PTE_EXECUTE) != 0 || pte_addr(leaf) != page {
@@ -203,10 +211,16 @@ mod tests {
             device_pa_reachable(satp(ROOT), &PAGES, BASE, claim, 4, reader(&empty)),
             None
         );
-        // Bare translation.
+        // AP-SCHED1 §3: Bare translation reaches a REGISTERED device page at its physical
+        // address, without walking anything, and still refuses everything else.
         assert_eq!(
-            device_pa_reachable(0, &PAGES, BASE, claim, 4, reader(&good)),
-            None
+            device_pa_reachable(0, &PAGES, BASE, claim, 4, reader(&empty)),
+            Some(claim)
+        );
+        assert_eq!(
+            device_pa_reachable(0, &PAGES, BASE, 0x8020_0000, 4, reader(&empty)),
+            None,
+            "Bare does not make RAM a device"
         );
         // A USER-accessible leaf is NOT ready: the window must be kernel-only.
         let user = tables(&[leaf(PLIC_CTX, LEAF | PTE_USER)]);

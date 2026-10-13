@@ -562,6 +562,26 @@ pub(crate) fn reset_device_window_for_test() {
     }
 }
 
+/// AP-SCHED1 §3 — leave every user root for the kernel's own address space: Bare translation.
+///
+/// The kernel is linked and run at its physical addresses (the boot hart runs Bare until its first
+/// user entry; every secondary from bring-up), so kernel text, data, trap stacks, the trap vector,
+/// the direct map (`phys_to_direct_map_ptr` is identity here) and the platform devices are all
+/// reached at the same addresses with translation off. `sfence.vma zero, zero` follows the write,
+/// so no translation of the space being left survives on this hart. One function in the image, so
+/// `scripts/check-vm-invalidation-sequence.sh` grades its sequence.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[inline(never)]
+pub fn enter_bare_kernel_space() {
+    unsafe {
+        core::arch::asm!(
+            "csrw satp, zero",
+            "sfence.vma zero, zero",
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 /// Writes `satp` and flushes the TLB. Unlike [`activate_asid`] this takes a
 /// pre-computed satp value (used by the userspace entry/probe paths so the
 /// exact installed value can be logged).

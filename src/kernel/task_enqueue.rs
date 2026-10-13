@@ -169,6 +169,27 @@ pub(crate) fn plan_balanced_enqueue_locked(
     })
 }
 
+/// AP-SCHED1 — rank 2: **THE home rule.** A task's first placement fixes the CPU it runs on for
+/// the rest of its life; every later enqueue of it — a wake, a requeue, a timeout — targets that
+/// home. Records `chosen` as `tid`'s home if it has none and returns the home either way. There is
+/// no migration in this increment, and this is what rules it out: no enqueue path can pick a CPU
+/// for a task that already has one.
+///
+/// `chosen` is the caller's placement decision — the CPU an explicit placement names, or the
+/// scheduler's balanced choice read beforehand under rank 1. A stale balanced choice only picks a
+/// less-than-ideal home; it can never move a task that already has one. TID 0 (no TCB) has no home
+/// and gets `chosen`.
+pub(crate) fn fix_home_locked(
+    tcbs: &mut [Option<ThreadControlBlock>],
+    tid: u64,
+    chosen: CpuId,
+) -> CpuId {
+    match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+        Some(tcb) => *tcb.cpu_affinity.get_or_insert(chosen),
+        None => chosen,
+    }
+}
+
 /// rank 1 — **THE** commit. The only place a task-lifecycle transition touches a run queue.
 ///
 /// Delegates to the `SmpScheduler` primitives unchanged, so wake-only rejection, CPU-online
@@ -246,6 +267,19 @@ mod tests {
             plan_balanced_enqueue_locked(&mut tcbs, &classes, 7, CpuId(0)).unwrap_err(),
             KernelError::TaskMissing
         );
+    }
+
+    /// AP-SCHED1 — the home rule: the first placement is recorded, and only the first.
+    #[test]
+    fn the_first_placement_fixes_the_home_and_nothing_moves_it() {
+        let mut tcbs = [Some(tcb(9, None, TaskStatus::Runnable))];
+        assert_eq!(fix_home_locked(&mut tcbs, 9, CpuId(1)), CpuId(1));
+        assert_eq!(tcbs[0].as_ref().unwrap().cpu_affinity, Some(CpuId(1)));
+        // A later placement decision — balanced or explicit — returns the home, unchanged.
+        assert_eq!(fix_home_locked(&mut tcbs, 9, CpuId(0)), CpuId(1));
+        assert_eq!(tcbs[0].as_ref().unwrap().cpu_affinity, Some(CpuId(1)));
+        // TID 0 has no TCB and no home.
+        assert_eq!(fix_home_locked(&mut tcbs, 0, CpuId(0)), CpuId(0));
     }
 
     /// The driver pin happens before the affinity is read, and only when unpinned.

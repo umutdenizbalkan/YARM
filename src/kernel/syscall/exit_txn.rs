@@ -105,6 +105,10 @@ pub(crate) trait ExitOwners: ClearedCurrentOwners {
     /// Enqueue a woken task. Used only for joiners and robust-futex waiters — never for the
     /// exiting task, which this transaction must never make runnable again.
     fn enqueue_woken(&mut self, tid: u64);
+    /// AP-SCHED1 §3 — this CPU leaves the exiting task's address space for the kernel's own
+    /// (`crate::arch::hal::leave_user_root`). Called after `current` is cleared and BEFORE the
+    /// claim, so no reaper can ever observe the exit while this CPU still has the root loaded.
+    fn leave_user_root(&mut self, cpu: CpuId);
 
     // ── rank 2 — tasks ──────────────────────────────────────────────────────────────────────
     /// The exiting thread's own facts, read-only.
@@ -247,18 +251,17 @@ pub(crate) trait ExitOwners: ClearedCurrentOwners {
 ///   `IA32_FMASK = RFLAGS.IF`; AArch64 hardware `DAIF` masking with no `daifclr` on the trap path;
 ///   RISC-V hardware `sstatus.SIE` clear with the one re-enable confined to the terminal-idle tail.
 ///   Unchanged, and still a topology-independent fact.
-/// * *on another dispatching CPU* — U9-EXIT4 asserted "there is exactly one", citing a Stage-189B
-///   note that Stage 189C6 had already invalidated: the default-off `yarm.ap_user_dispatch` knob
-///   can clear an AP's wake-only bit, producing a second dispatcher. The correct ground is the
-///   ADMISSION, not the topology. `exit_route_admitted_split` refuses at step (1), before any
-///   mutation, unless `(online & !wake_only).count_ones() <= 1` **and** that one dispatcher is this
-///   CPU. So the transaction never opens a window in a multi-dispatcher configuration; it declines
-///   to start. And the topology it read cannot shift underneath it, because every writer of either
-///   bitmap takes the broad lock from the boot orchestrator's one-shot SMP bring-up, before
-///   userspace exists.
+/// * *on another dispatching CPU* — U9-RESIDUAL1 §1 grounded this in an admission that refused
+///   whenever more than one CPU dispatched. **AP-SCHED1 §4 retired that ground**: the RISC-V
+///   production configuration admits a second dispatcher, and the route is now authority-bound
+///   (see `exit_route_admitted_split`). What excludes a second CPU's writer is the state the
+///   window starts from, not the topology: the exiting thread is `Running` on THIS CPU, so no other
+///   CPU can dispatch it, no wake owner moves a `Running` task, and every other owner that
+///   addresses it re-checks its exact incarnation under rank 2.
 ///
-/// So `settle_failed_claim` is the typed capability for states that cannot occur, and §4
-/// constructs them by injection in the hosted harness instead.
+/// So a claim refusal is not expected on any configuration — but it is no longer *structurally*
+/// excluded, and `settle_failed_claim` is the typed settlement that answers it if it ever occurs;
+/// §4 constructs those states by injection in the hosted harness.
 fn settle_failed_claim<O: ExitOwners>(
     owners: &mut O,
     token: ClearedCurrentToken,
@@ -346,26 +349,24 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
     // dispatching CPU IS producible in a production build.
     //
     // The refusal is therefore reclassified as REACHABLE, and nothing downstream depends on it
-    // being otherwise. `exit_route_admitted_split` re-derives the topology itself, from scheduler
-    // state, in one rank-1 acquisition, before this transaction mutates anything:
+    // being otherwise.
     //
+    // AP-SCHED1 §4 — the admission is authority-bound. It asks only the route-local facts:
+    //
+    //   * the CPU is in range;
     //   * `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` — this CPU is running a post-lock drainer, so
-    //     the deferral this route publishes will actually be consumed;
-    //   * `(online & !wake_only).count_ones() <= 1` — at most one CPU dispatches. Wake-only APs
-    //     are excluded from the count by construction: they are online for wake/accounting but
-    //     run no dispatcher, so they can neither originate this syscall nor race the settlement;
-    //   * `sched.current_cpu == cpu` — and that one dispatcher is *this* CPU.
+    //     the deferral this route publishes will actually be consumed.
     //
-    // Refusing costs nothing: no reservation is taken, no cell is written and no TCB is touched,
-    // so `RouteNotAdmitted` is settled as `InvalidPreLock` exactly like any other pre-mutation
-    // refusal. Under `yarm.ap_user_dispatch=1` the count is 2, this route never admits, and the
-    // exit is answered by a typed refusal rather than by a transaction running on an assumption
-    // that no longer holds.
+    // It no longer asks "is this the single, ambient-bound dispatcher?", because nothing the
+    // transaction does depends on that answer: the drain that consumes the exit cell selects
+    // through the trap's own `DispatchAuthority`, and every owner operation below — the current
+    // slot, the deferral and server-death cells, the joiners' enqueue — names `cpu` (or the
+    // executing CPU) explicitly. The delivered ambient form refused every exit on a second
+    // dispatching CPU, which is exactly the configuration AP-SCHED1 admits.
     //
-    // The topology the admission reads cannot change while the window is open: every production
-    // writer of the online or wake-only bitmaps (`bring_up_cpu`, `mark_cpu_wake_only`) takes
-    // `&mut KernelState`, and all of them are reached only from the boot orchestrator's one-shot
-    // SMP bring-up, before any userspace task runs. See `u9residual1_terminal_admission`.
+    // Refusing still costs nothing: no reservation is taken, no cell is written and no TCB is
+    // touched, so `RouteNotAdmitted` is settled as `InvalidPreLock` exactly like any other
+    // pre-mutation refusal.
     if !owners.exit_route_admitted(cpu) {
         return Err(refuse(ExitRefusal::RouteNotAdmitted));
     }
@@ -460,6 +461,13 @@ pub(crate) fn run_exit_transaction<O: ExitOwners>(
         owners.release_queue_advance(cpu);
         return Err(refuse(ExitRefusal::VictimChanged));
     };
+
+    // (7b) AP-SCHED1 §3 — leave the exiting task's address space BEFORE the claim publishes the
+    // exit. The claim is what lets a reaper (after the supervisor / PM report below) find this
+    // process; a CPU still translating through its root then would force the reap to quarantine
+    // the space for good. Leaving it here is safe on every refusal below too: a task restored
+    // through the token resumes through a path that reloads its own root.
+    owners.leave_user_root(cpu);
 
     // (8) rank 2 — THE LINEARIZATION POINT. Exactly one of exit / reap / fault / restart wins.
     let restart_token = owners.mint_restart_token();
@@ -703,8 +711,13 @@ impl ExitOwners for SharedExitOwners<'_> {
         self.shared.clear_current_exact_split(cpu, tid, asid)
     }
     fn enqueue_woken(&mut self, tid: u64) {
-        let cpu = self.shared.authoritative_dispatch_cpu_split();
+        // AP-SCHED1 §4: the exiting CPU, not the ambient dispatch binding. An unhomed joiner is
+        // homed here; a homed one goes to its home and that CPU is notified after the commit.
+        let cpu = self.shared.executing_cpu_split();
         let _ = self.shared.enqueue_task_split(cpu, tid);
+    }
+    fn leave_user_root(&mut self, cpu: CpuId) {
+        let _ = crate::arch::hal::leave_user_root(cpu);
     }
 
     fn exit_preflight(&self, tid: u64) -> Result<ExitPreflight, ExitRefusal> {

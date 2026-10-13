@@ -63389,7 +63389,8 @@ mod stage191d_futex_wait_block_publish {
             RUNTIME_SRC.contains("pub(crate) fn futex_wait_park_exact_split(")
                 && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
                 && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
-                && RUNTIME_SRC.contains("sched.timer.reset_quantum();"),
+                // AP-SCHED1: the quantum reset is this CPU's own.
+                && RUNTIME_SRC.contains("sched.reset_quantum_on(cpu);"),
             "the park transaction must use the task + scheduler split-mut seams"
         );
         let park = RUNTIME_SRC
@@ -117985,11 +117986,24 @@ mod stage199d_riscv_remote_wake_readiness {
     /// `set_task_home_cpu`, whose only `CpuId(1)` caller is the **x86_64** AP workload builder. On
     /// RISC-V no task is ever pinned, so the committed target is always the enqueueing CPU and the
     /// remote branch is unreachable.
+    ///
+    /// **Superseded by AP-SCHED1.** The finding held on the base it audited. AP-SCHED1 makes the
+    /// remote branch reachable on purpose: every task's first placement now fixes a HOME
+    /// (`task_enqueue::fix_home_locked`), the admitted RISC-V CPU 1 takes balanced placements, and
+    /// the fallback is no longer the ambient field. What is still pinned here is the shape of the
+    /// target decision — the captured affinity, else the executing CPU recorded as the home.
     #[test]
     fn no_riscv_task_can_be_committed_to_cpu_one() {
         assert!(
-            probe("let cpu = affinity.unwrap_or(sched.current_cpu);", RUNTIME),
-            "the enqueue target is the captured affinity, else the enqueueing CPU"
+            !probe("let cpu = affinity.unwrap_or(sched.current_cpu);", RUNTIME),
+            "AP-SCHED1: the ambient fallback is gone"
+        );
+        assert!(
+            probe(
+                "None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),",
+                RUNTIME
+            ),
+            "the enqueue target is the captured affinity, else the executing CPU fixed as the home"
         );
         assert!(
             probe(
@@ -137364,13 +137378,17 @@ mod riscv64_s_mode_timer_bridge {
             1,
             "exactly one re-arm per accepted interrupt, at one place"
         );
+        // AP-SCHED1 re-derivation: no longer boot hart only. The boot hart re-arms the timer the
+        // boot arm armed; any other CPU only a timer it armed ITSELF at its production admission,
+        // so a wake-only or diagnostic secondary still re-arms nothing.
         assert!(
-            seam.contains("cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID"),
-            "boot hart only"
+            seam.contains("if cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {"),
+            "the boot hart's arm is the boot arm's"
         );
         assert!(
-            seam.contains("!crate::arch::riscv64::timer::stie_enabled()"),
-            "and inert unless the opt-in feature armed the timer"
+            seam.contains("!crate::arch::riscv64::timer::stie_enabled()")
+                && seam.contains("!crate::arch::riscv64::timer::stie_enabled_on(cpu.0 as usize)"),
+            "and inert unless THIS CPU's own timer was armed"
         );
     }
 
@@ -149301,9 +149319,22 @@ mod u9tm_timer_entry {
             .nth(1)
             .and_then(|s| s.split("\n    }").next())
             .expect("the rank-1 tick owner");
+        // AP-SCHED1: through `SchedulerState::tick_on`, which applies the same policy to the
+        // clock owner's timer or to this CPU's own quantum and restates none of it.
         assert!(
-            owner.contains("sched.timer.tick_and_check()"),
+            owner.contains("sched.tick_on(cpu)"),
             "the rank-1 owner reaches the SAME policy — it does not restate it"
+        );
+        const DEFS: &str = include_str!("defs.rs");
+        let tick_on = DEFS
+            .split("pub(crate) fn tick_on(&mut self, cpu: CpuId)")
+            .nth(1)
+            .and_then(|b| b.split("\n    }").next())
+            .expect("tick_on");
+        assert_eq!(
+            tick_on.matches(".tick_and_check()").count(),
+            2,
+            "the clock owner's timer or this CPU's quantum — the one policy either way"
         );
         assert_eq!(
             owner.matches("with_scheduler_split_mut").count(),
@@ -167176,6 +167207,10 @@ mod u9exit1_self_exit_transaction {
             self.inject != Inject::RouteNotAdmitted
         }
 
+        fn leave_user_root(&mut self, _cpu: CpuId) {
+            self.note("leave_user_root");
+        }
+
         fn current_tid_on_cpu(&self, cpu: CpuId) -> Option<u64> {
             self.sched.current_tid_on(cpu).map(|t| t.0)
         }
@@ -167488,6 +167523,28 @@ mod u9exit1_self_exit_transaction {
         assert!(h.at("claim_self_exit") < h.at("publish_advance_for"));
         // And the claim is retired last, after every owed step settled.
         assert_eq!(h.at("retire_exit_claim"), h.log.len() - 1);
+    }
+
+    // ── AP-SCHED1 §3: the CPU leaves the user root before the exit becomes observable ──────────
+
+    /// The exiting CPU leaves the task's address space after `current` is cleared and BEFORE the
+    /// claim. The claim (and the supervisor / PM report after it) is what lets a reaper find the
+    /// process; a CPU still translating through its root at that point would force the reap to
+    /// quarantine the space permanently.
+    #[test]
+    fn ap_sched1_the_cpu_leaves_the_user_root_between_the_clear_and_the_claim() {
+        let mut h = three_task_world();
+        run_exit_transaction(&mut h, CPU, CODE).expect("the exit must commit");
+        assert!(h.at("clear_current_exact") < h.at("leave_user_root"));
+        assert!(h.at("leave_user_root") < h.at("claim_self_exit"));
+        assert_eq!(
+            h.log
+                .iter()
+                .filter(|e| e.as_str() == "leave_user_root")
+                .count(),
+            1,
+            "exactly once"
+        );
     }
 
     // ── §5 property 2: the current/status transition cannot tear ────────────────────────────
@@ -170113,15 +170170,18 @@ mod u9exit4_post_clear_totality {
         let calls: alloc::vec::Vec<&str> = code_lines(window)
             .filter(|line| line.contains("owners."))
             .collect();
+        // AP-SCHED1 §3 adds the fourth: leaving the user root, a per-CPU hardware transition that
+        // writes no TCB and wakes nothing.
         assert_eq!(
             calls.len(),
-            3,
-            "the window's first half must contain only the pre-mutation release pair and the \
-             restart-token mint: {calls:?}"
+            4,
+            "the window's first half must contain only the pre-mutation release pair, the \
+             user-root release and the restart-token mint: {calls:?}"
         );
         for expected in [
             "owners.release_server_death(reservation);",
             "owners.release_queue_advance(cpu);",
+            "owners.leave_user_root(cpu);",
             "let restart_token = owners.mint_restart_token();",
         ] {
             assert!(
@@ -170226,6 +170286,7 @@ mod u9exit4_post_clear_totality {
                     "release_queue_advance",
                     "reserve_server_death",
                     "release_server_death",
+                    "leave_user_root",
                     "note_server_death_reservation",
                     "clear_current_exact",
                     "mint_restart_token",
@@ -170854,10 +170915,11 @@ mod u9residual1_terminal_admission {
         );
     }
 
-    /// **A SECOND dispatching CPU refuses.** This is the configuration U9-EXIT2 §1 and U9-EXIT4 §1
-    /// declared impossible, and `yarm.ap_user_dispatch=1` produces it: the audited transition clears
-    /// the AP's wake-only bit and the count becomes two. The route must decline — and it does,
-    /// which is why the stale claim was harmless in fact even though it was wrong in reason.
+    /// **A SECOND dispatching CPU.** This is the configuration U9-EXIT2 §1 and U9-EXIT4 §1 declared
+    /// impossible; `yarm.ap_user_dispatch=1` produced it, and AP-SCHED1 makes it the RISC-V
+    /// production topology. The AMBIENT admission still refuses it on both CPUs — that is the
+    /// delivered form every unmigrated family keeps. The EXIT route no longer asks it (AP-SCHED1
+    /// §4: authority-bound), so the exit admits on each CPU whose drainer is armed.
     #[test]
     fn a_second_dispatching_cpu_refuses_admission() {
         let (kernel, _drainers) = sole_dispatcher();
@@ -170876,25 +170938,45 @@ mod u9residual1_terminal_admission {
             "the knob must genuinely produce two dispatchers"
         );
         assert!(
-            !kernel.exit_route_admitted_split(BSP),
-            "two dispatchers must refuse the split terminal route, on the BSP..."
+            !kernel.split_terminal_route_admitted(BSP),
+            "two dispatchers must refuse the AMBIENT terminal admission, on the BSP..."
+        );
+        assert!(
+            !kernel.split_terminal_route_admitted(AP),
+            "...and on the AP, which is not even the bound dispatch CPU"
+        );
+        assert!(
+            kernel.exit_route_admitted_split(BSP),
+            "AP-SCHED1: the authority-bound exit route admits on the BSP under two dispatchers"
         );
         assert!(
             !kernel.exit_route_admitted_split(AP),
-            "...and on the AP, which is not even the bound dispatch CPU"
+            "...and still refuses a CPU with no post-lock drainer"
         );
+        set_drainer(AP, true);
+        assert!(
+            kernel.exit_route_admitted_split(AP),
+            "...and admits the AP once its drainer is armed"
+        );
+        set_drainer(AP, false);
     }
 
-    /// **Admission names THIS CPU.** Even in a single-dispatcher topology, a CPU that is not the
-    /// scheduler's bound `current_cpu` is refused: the drain that consumes the deferral this route
-    /// publishes runs on the bound CPU, not the asking one.
+    /// **The AMBIENT admission names the bound CPU; the exit route names the trap's.** A CPU that is
+    /// not the scheduler's bound `current_cpu` is refused by the ambient form, whose drains
+    /// authenticated against that binding. The exit route's drains authenticate the trap's own
+    /// authority (AP-SCHED1 §4), so the asking CPU with an armed drainer is admitted.
     #[test]
     fn admission_requires_the_asking_cpu_to_be_the_bound_dispatcher() {
         let (kernel, _drainers) = sole_dispatcher();
         set_drainer(AP, true);
         assert!(
-            !kernel.exit_route_admitted_split(AP),
-            "a CPU that is not `current_cpu` must be refused even with its drainer armed"
+            !kernel.split_terminal_route_admitted(AP),
+            "a CPU that is not `current_cpu` must be refused by the ambient form even with its \
+             drainer armed"
+        );
+        assert!(
+            kernel.exit_route_admitted_split(AP),
+            "the authority-bound exit route must not ask the ambient binding"
         );
         set_drainer(AP, false);
     }
@@ -170925,12 +171007,14 @@ mod u9residual1_terminal_admission {
                 .expect("second dispatcher");
         });
         let before = topology_of(&kernel);
-        // (1) two dispatchers, (2) wrong CPU, (3) no drainer.
-        assert!(!kernel.exit_route_admitted_split(BSP));
+        // Ambient: (1) two dispatchers, (2) wrong CPU. Exit: (3) no drainer, (4) out of range.
+        assert!(!kernel.split_terminal_route_admitted(BSP));
+        assert!(!kernel.split_terminal_route_admitted(AP));
         assert!(!kernel.exit_route_admitted_split(AP));
         set_drainer(BSP, false);
         assert!(!kernel.exit_route_admitted_split(BSP));
         set_drainer(BSP, true);
+        assert!(!kernel.exit_route_admitted_split(CpuId(u8::MAX)));
         assert_eq!(
             topology_of(&kernel),
             before,
@@ -170955,18 +171039,20 @@ mod u9residual1_terminal_admission {
     /// The admission's three checks, in the order that makes each refusal free.
     #[test]
     fn the_admission_checks_the_drainer_first_and_the_topology_in_one_acquisition() {
-        // U9-RESIDUAL1 §3 extracted the body so NR 0's split route shares it verbatim;
-        // `exit_route_admitted_split` is now a thin alias onto it.
+        // U9-RESIDUAL1 §3 extracted the body so NR 0's split route shares it verbatim; AP-SCHED1
+        // §4 moved the exit route to the authority-bound topology of the SAME owner, named at its
+        // own call site.
         assert!(
             RUNTIME.contains(
-                "pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {\n        self.split_terminal_route_admitted(cpu)\n    }"
+                "pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {\n        self.split_terminal_route_admission(cpu, TerminalRouteTopology::AuthorityBound)\n            .is_ok()\n    }"
             ),
-            "the exit route must delegate to the shared admission, not keep a copy"
+            "the exit route must delegate to the shared admission, naming its topology"
         );
         // U9-DISPATCH-CPU1 §3: the admission takes a TOPOLOGY, because what a route must prove
-        // depends on what its DRAIN authenticates against. The exit route is unmigrated, so its
-        // alias names `AmbientBound` explicitly — the delivered conditions, unchanged. A route
-        // that wanted the weaker topology would have to say so at its own call site.
+        // depends on what its DRAIN authenticates against. The boolean alias names `AmbientBound`
+        // explicitly — the delivered conditions, unchanged, for every caller that has not
+        // migrated. A route that wants the weaker topology says so at its own call site, as the
+        // exit route now does.
         assert!(
             RUNTIME.contains(
                 "pub(crate) fn split_terminal_route_admitted(&self, cpu: CpuId) -> bool {\n        self.split_terminal_route_admission(cpu, TerminalRouteTopology::AmbientBound)\n            .is_ok()\n    }"
@@ -172634,15 +172720,31 @@ mod u9yield2_family_edge {
         );
         let rv = code(RV_BOOT);
         assert_eq!(rv.matches("admit_ap_pinned_dispatch_split(cpu)").count(), 1);
+        // AP-SCHED1: without the knob RISC-V releases logical CPU 1 alone, which admits itself
+        // through the PRODUCTION transition (`admit_dispatch`, one call site) — after its timer
+        // and its IPI publication; with the knob, the pinned diagnostic admission above.
         let release = code(RV_IPI);
         let rel = release
             .find("pub fn release_secondaries_at_boot_borrow_end(")
             .expect("the RISC-V release");
         assert!(
-            release[rel..].contains(
-                "if !crate::kernel::boot::ap_user_dispatch_enabled() {\n        return 0;"
-            ),
-            "riscv64: no secondary is released, so none is admitted, without the knob"
+            release[rel..].contains("let released = release_set(trap_ready_cpus, diagnostic);"),
+            "riscv64: the release names its CPUs"
+        );
+        assert_eq!(runtime.matches("admit_dispatch(cpu)").count(), 1);
+        assert_eq!(rv.matches("admit_ap_dispatch_split(cpu)").count(), 1);
+        let prod = rv
+            .split("fn riscv_secondary_production_admission(")
+            .nth(1)
+            .expect("the production admission");
+        let timer = prod.find("arm_secondary_timer(").expect("own timer");
+        let ready = prod.find("ipi::mark_ready(cpu)").expect("IPI target");
+        let admit = prod
+            .find("admit_ap_dispatch_split(cpu)")
+            .expect("admission");
+        assert!(
+            timer < ready && ready < admit,
+            "riscv64: admission is published last, once the CPU takes work and interrupts"
         );
         // (c) The decline is settled by the existing off-lock settlement.
         let split = code(SPLIT);
@@ -194699,7 +194801,11 @@ mod qemu_context1_user_fpu_ownership {
 ///   itself ready — so a boot without `yarm.ap_user_dispatch=1` signals nothing;
 /// * the publication precedes the notification, and the arrival clears `sip.SSIP` before it
 ///   consumes the mailbox;
-/// * the whole transport is released only by the boot hart's knob-gated release.
+/// * the whole transport is released only by the boot hart's release, and (AP-SCHED1) that
+///   release names its CPUs: under the knob every trap-ready secondary, by default logical CPU 1
+///   alone, a one-hart boot none — and a parked hart leaves the park only on its OWN released bit;
+/// * AP-SCHED1: the enqueue owners' one remote-wake path is `hal::notify_enqueued`, called after
+///   the commit with no lock held, which sends only to a CPU other than the executing one.
 #[cfg(test)]
 pub(crate) fn assert_riscv_smp3_wake_scope() {
     const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
@@ -194792,7 +194898,7 @@ pub(crate) fn assert_riscv_smp3_wake_scope() {
         clear < swap,
         "SSIP is cleared before the mailbox is consumed"
     );
-    // The release is knob-gated and is the only thing that ends a secondary's park.
+    // The release names its CPUs and is the only thing that ends a secondary's park.
     let release = IPI
         .split("pub fn release_secondaries_at_boot_borrow_end(")
         .nth(1)
@@ -194800,10 +194906,43 @@ pub(crate) fn assert_riscv_smp3_wake_scope() {
         .split("\n}\n")
         .next()
         .expect("its body");
+    let set = release
+        .find("let released = release_set(trap_ready_cpus, diagnostic);")
+        .expect("the release set");
+    let empty = release
+        .find("if released == 0 {\n        return 0;")
+        .expect("an empty set releases nothing");
+    let flag = release
+        .find("BOOT_BORROW_ENDED.store(true, Ordering::Release);")
+        .expect("the release flag");
+    let bits = release
+        .find("RELEASED.store(released, Ordering::Release);")
+        .expect("the released bits");
+    assert!(set < empty && empty < bits && bits < flag);
+    assert!(IPI.contains("pub const PRODUCTION_DISPATCH_CPUS: u64 = 1 << 1;"));
+    assert!(IPI.contains("        secondaries & PRODUCTION_DISPATCH_CPUS\n"));
+    let park = IPI
+        .split("pub fn take_park_release(")
+        .nth(1)
+        .expect("the park release")
+        .split("\n}\n")
+        .next()
+        .expect("its body");
     assert!(
-        release
-            .contains("if !crate::kernel::boot::ap_user_dispatch_enabled() {\n        return 0;")
+        park.contains("&& RELEASED.load(Ordering::Acquire) & (1u64 << (cpu.0 as u64 & 63)) != 0"),
+        "a parked hart leaves only on its own released bit"
     );
+    // AP-SCHED1: the enqueue owners' notification.
+    const HAL: &str = include_str!("../../arch/hal.rs");
+    let notify = HAL
+        .split("pub(crate) fn notify_enqueued(")
+        .nth(1)
+        .expect("the notification owner")
+        .split("\n}\n")
+        .next()
+        .expect("its body");
+    assert!(notify.contains("if me != target {"));
+    assert!(notify.contains("crate::arch::riscv64::ipi::send_reschedule(me, target)"));
 }
 
 // ── BL2: a user instruction the CPU refused is the task's fault, not the kernel's ───────────
@@ -200274,5 +200413,473 @@ mod vm_invalidation1 {
             settle < remove && remove < ok,
             "the success exit follows the settlement"
         );
+    }
+}
+
+/// AP-SCHED1 — the first production AP-scheduling increment (RISC-V, CPUs 0 and 1).
+mod ap_sched1 {
+    use super::*;
+    use crate::kernel::capabilities::CapId;
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+    const CPU1: CpuId = CpuId(1);
+    const WINDOW: usize = 0x40_0000;
+
+    fn object_phys(s: &KernelState, id: u64) -> PhysAddr {
+        s.with_memory_state(|m| {
+            m.memory_objects
+                .iter()
+                .flatten()
+                .find(|o| o.id == id)
+                .map(|o| o.phys)
+                .expect("object")
+        })
+    }
+
+    /// Free data frames plus free page-table-pool frames: a reclaimed space returns both.
+    fn free_frames(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()))
+            + crate::kernel::frame_allocator::pt_pool_free_frames()
+    }
+
+    fn quarantined_spaces(k: &SharedKernel) -> usize {
+        k.with(|s| s.with_user_spaces(|spaces| spaces.live_count()))
+    }
+
+    /// One process: its own address space with one data page that lives by its mapping alone.
+    fn spawn_process(k: &SharedKernel, tid: u64) -> (Asid, PhysAddr) {
+        k.with(|s| {
+            let (asid, _cap): (Asid, CapId) = s.create_user_address_space().expect("asid");
+            s.register_task(tid).expect("task");
+            s.bind_task_asid(tid, asid).expect("bind");
+            let (object_id, mem_cap) = s.alloc_anonymous_memory_object().expect("data object");
+            s.map_user_page_in_asid_with_caps(
+                asid,
+                mem_cap,
+                VirtAddr(WINDOW as u64),
+                PageFlags::USER_RW,
+            )
+            .expect("map");
+            let cnode = s.current_task_cnode().expect("cnode");
+            s.revoke_capability_in_cnode(cnode, mem_cap)
+                .expect("the page lives by its mapping alone");
+            (asid, object_phys(s, object_id))
+        })
+    }
+
+    /// `tid` runs on `cpu` (the scheduler's dispatch, then the production activation owner, which
+    /// records the root load), then exits and its CPU goes idle. The idle arrival takes the
+    /// production transition `leave_user_root` when `idle_handoff` is set — what every RISC-V idle
+    /// arrival now does — and is skipped to model the base.
+    fn run_exit_and_idle(k: &SharedKernel, tid: u64, asid: Asid, cpu: CpuId, idle_handoff: bool) {
+        k.with(|s| {
+            s.enqueue_on_cpu(cpu, tid).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
+        });
+        assert_eq!(
+            k.direct_dispatch_activate_asid_split(
+                k.stale_dispatch_mark_token_for_test(cpu, tid, asid)
+            ),
+            Some(asid.0)
+        );
+        assert_eq!(crate::arch::hal::active_address_space(cpu), Some(asid));
+        k.with(|s| {
+            assert_eq!(s.block_current_on_cpu(cpu), Some(tid));
+            s.exit_task(tid, 0).expect("exit");
+        });
+        if idle_handoff {
+            assert!(crate::arch::hal::leave_user_root(cpu));
+            assert_eq!(
+                crate::arch::hal::active_address_space(cpu),
+                None,
+                "an idle CPU holds no user root"
+            );
+        }
+    }
+
+    fn reap_on(
+        k: &SharedKernel,
+        cpu: CpuId,
+        tid: u64,
+    ) -> crate::kernel::syscall::reap_txn::ReapOutcome {
+        let mut owners = crate::kernel::syscall::reap_txn::SharedReapOwners { shared: k, cpu };
+        crate::kernel::syscall::reap_txn::run_reap_transaction(&mut owners, tid).expect("reaped")
+    }
+
+    /// **Healthy churn accumulates no quarantine.** Eight processes in turn run on CPU 1, exit,
+    /// and leave CPU 1 idle; each is reaped from CPU 0 through the production NR 31 transaction.
+    /// Because the idle arrival left the user root, no reap finds its space loaded: every space,
+    /// root and data frame is reclaimed, and the frame count returns exactly to where it began.
+    #[test]
+    fn exit_idle_reap_churn_reclaims_every_space_and_frame() {
+        crate::arch::hal::reset_all_active_address_spaces();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            let _ = s.bring_up_cpu(CPU1);
+        });
+        let spaces_before = quarantined_spaces(&k);
+        let frames_before = free_frames(&k);
+        for round in 0..8u64 {
+            let tid = 30 + round;
+            let (asid, frame) = spawn_process(&k, tid);
+            run_exit_and_idle(&k, tid, asid, CPU1, true);
+            let outcome = reap_on(&k, CPU0, tid);
+            assert_eq!(
+                outcome.address_spaces_quarantined, 0,
+                "round {round}: no quarantine"
+            );
+            assert!(
+                k.with(|s| s.with_user_spaces(|spaces| spaces.get(asid).is_none())),
+                "round {round}: the space and its root are gone"
+            );
+            assert!(
+                k.with(|s| s.with_memory_state(|m| m
+                    .frame_allocator
+                    .frame_refcount(frame.0)
+                    .unwrap_or(0)
+                    == 0)),
+                "round {round}: its data frame is back in the allocator"
+            );
+        }
+        assert_eq!(
+            quarantined_spaces(&k),
+            spaces_before,
+            "no space left behind"
+        );
+        assert_eq!(
+            free_frames(&k),
+            frames_before,
+            "every frame (data and page-table) recovered"
+        );
+    }
+
+    /// **The base, for contrast:** the same churn with the CPU idling on the exited process's root
+    /// (no transition) quarantines every round — VMI1's gate is doing its job, and the leak is the
+    /// idle CPU's root ownership, which is what AP-SCHED1 §3 changes.
+    #[test]
+    fn without_the_idle_handoff_every_round_is_quarantined() {
+        crate::arch::hal::reset_all_active_address_spaces();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            let _ = s.bring_up_cpu(CPU1);
+        });
+        let spaces_before = quarantined_spaces(&k);
+        for round in 0..3u64 {
+            let tid = 40 + round;
+            let (asid, _) = spawn_process(&k, tid);
+            run_exit_and_idle(&k, tid, asid, CPU1, false);
+            assert_eq!(
+                reap_on(&k, CPU0, tid).address_spaces_quarantined,
+                1,
+                "round {round}"
+            );
+        }
+        assert_eq!(quarantined_spaces(&k), spaces_before + 3);
+    }
+
+    /// **The transition never clears the record on its own.** `leave_user_root` is the only
+    /// production writer of "no user root", and on RISC-V it writes the hardware first; the
+    /// record cannot be released by anything that leaves the root loaded.
+    #[test]
+    fn the_record_is_released_only_behind_the_hardware_change() {
+        let hal = include_str!("../../arch/hal.rs");
+        let body = hal
+            .split("pub(crate) fn leave_user_root(cpu: CpuId) -> bool {")
+            .nth(1)
+            .expect("leave_user_root")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let riscv = body
+            .split("target_arch = \"riscv64\"))]")
+            .nth(1)
+            .expect("the RISC-V arm");
+        let hw = riscv
+            .find("enter_bare_kernel_space()")
+            .expect("the hardware change");
+        let rec = riscv
+            .find("note_user_root_released(cpu)")
+            .expect("the record");
+        assert!(hw < rec, "the root is left before the record says so");
+        // The other ports leave their record alone: their roots stay loaded.
+        let other = body
+            .split("not(target_arch = \"riscv64\")))]")
+            .nth(1)
+            .expect("the other ports' arm");
+        assert!(!other.contains("note_user_root_released"));
+        assert_eq!(
+            hal.matches("note_user_root_released(cpu)").count(),
+            2,
+            "two writers: the RISC-V transition and the hosted model of it"
+        );
+        let pt = include_str!("../../arch/riscv64/page_table.rs");
+        let bare = pt
+            .split("pub fn enter_bare_kernel_space() {")
+            .nth(1)
+            .expect("the transition")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let w = bare.find("\"csrw satp, zero\"").expect("satp write");
+        let f = bare.find("\"sfence.vma zero, zero\"").expect("fence");
+        assert!(w < f, "the fence follows the root write");
+    }
+
+    /// A kernel with CPU 1 online and wake-only, as every boot leaves an AP before admission.
+    fn with_wake_only_ap() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.mark_cpu_wake_only(CPU1, true).expect("wake-only first");
+            s.bring_up_cpu(CPU1).expect("then online");
+        });
+        k
+    }
+
+    /// **Adding a CPU never multiplies time.** An AP's timer interrupts consume only its own
+    /// quantum: the scheduler tick every deadline is measured against advances on the clock owner
+    /// alone, once per clock-owner interrupt, however many CPUs tick.
+    #[test]
+    fn an_ap_tick_consumes_its_own_quantum_and_never_advances_the_clock() {
+        let k = with_wake_only_ap();
+        k.with_scheduler_split_mut(|sched| sched.set_quantum_all(3));
+        let t0 = k.scheduler_tick_now_split_read();
+        let ap = |k: &SharedKernel| match k.scheduler_tick_split_mut(CPU1) {
+            crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => (tick, true),
+            crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => (tick, false),
+        };
+        assert_eq!(ap(&k), (t0, false));
+        assert_eq!(ap(&k), (t0, false));
+        assert_eq!(
+            ap(&k),
+            (t0, true),
+            "CPU 1's own third interrupt expires CPU 1's quantum"
+        );
+        assert_eq!(
+            k.scheduler_tick_now_split_read(),
+            t0,
+            "and the clock has not moved"
+        );
+        for i in 1..=5u64 {
+            let (tick, _) = match k.scheduler_tick_split_mut(CPU0) {
+                crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => (tick, true),
+                crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => (tick, false),
+            };
+            assert_eq!(tick, t0 + i, "one clock-owner interrupt, one tick");
+            let _ = ap(&k);
+            let _ = ap(&k);
+        }
+        assert_eq!(
+            k.scheduler_tick_now_split_read(),
+            t0 + 5,
+            "fifteen interrupts across two CPUs, five ticks of time"
+        );
+        // The quanta are independent: a voluntary switch on one resets only that CPU's.
+        k.with_scheduler_split_mut(|sched| {
+            sched.reset_quantum_on(CPU1);
+            assert!(!sched.would_preempt_next_on(CPU1));
+        });
+    }
+
+    /// **Nothing reaches an AP before it can take work.** While CPU 1 is wake-only, balanced
+    /// placement never names it and an explicit enqueue onto it is refused, so no task can be
+    /// homed there before its admission; the production admission is the one transition that
+    /// opens both, and it refuses a CPU that is not wake-only.
+    #[test]
+    fn an_ap_is_placed_on_only_after_its_admission() {
+        let k = with_wake_only_ap();
+        k.with(|s| {
+            s.register_task(60).expect("t60");
+            s.register_task(61).expect("t61");
+            s.enqueue_on_cpu(CPU0, 61).expect("load CPU 0");
+        });
+        assert_eq!(
+            k.balanced_choice_split(CPU0),
+            CPU0,
+            "a wake-only CPU is never chosen"
+        );
+        assert!(
+            k.enqueue_on_cpu_split(CPU1, 60).is_err(),
+            "nor accepts work"
+        );
+        k.admit_ap_dispatch_split(CPU1)
+            .expect("production admission");
+        assert!(
+            k.admit_ap_dispatch_split(CPU1).is_err(),
+            "admission is a transition out of wake-only, once"
+        );
+        assert_eq!(
+            k.balanced_choice_split(CPU0),
+            CPU1,
+            "an admitted AP joins balanced placement"
+        );
+        k.with_scheduler_split_mut(|sched| {
+            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+            assert_eq!(s.wake_only_bitmap() & 0b10, 0);
+            assert_eq!(s.balance_excluded_bitmap() & 0b10, 0);
+        });
+    }
+
+    /// **A wake goes HOME, and the home is told.** A task homed on CPU 1 by its first balanced
+    /// placement, blocked, and then woken by an owner running on CPU 0 is queued on CPU 1 — never
+    /// on the waker's CPU — and the commit is followed by exactly one notification to CPU 1.
+    #[test]
+    fn a_cross_cpu_wake_goes_home_and_notifies_it() {
+        let k = with_wake_only_ap();
+        k.with(|s| {
+            s.register_task(70).expect("t70");
+            s.register_task(71).expect("t71");
+            s.enqueue_on_cpu(CPU0, 71).expect("load CPU 0");
+        });
+        k.admit_ap_dispatch_split(CPU1).expect("admit");
+        let before = crate::arch::hal::enqueues_notified(CPU1);
+        assert_eq!(
+            k.enqueue_task_split(CPU0, 70),
+            Ok(CPU1),
+            "first placement: balanced"
+        );
+        assert_eq!(crate::arch::hal::enqueues_notified(CPU1), before + 1);
+        // Run it on CPU 1 and block it, then wake it from CPU 0.
+        k.with(|s| {
+            assert_eq!(s.dispatch_next_on_cpu(CPU1), Some(70));
+            assert_eq!(s.block_current_on_cpu(CPU1), Some(70));
+        });
+        k.wake_tid_to_runnable_split(CPU0, crate::kernel::ipc::ThreadId(70))
+            .expect("wake");
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(CPU1)),
+            1,
+            "queued on its home, CPU 1"
+        );
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(CPU0)),
+            1,
+            "CPU 0 unchanged"
+        );
+        assert_eq!(
+            crate::arch::hal::enqueues_notified(CPU1),
+            before + 2,
+            "and CPU 1 is notified after the commit"
+        );
+    }
+
+    /// **Wake versus idle entry loses nothing.** The notification is published to the target's
+    /// mailbox before the firmware is asked to interrupt it, and the target consumes the mailbox
+    /// after clearing `SSIP`. So whether the publication lands before the target's idle `wfi`
+    /// (SSIP stays pending: the `wfi` returns at once) or during it (the interrupt ends the
+    /// `wfi`), the target's next arrival carries the source. Modelled with the production order.
+    #[test]
+    fn a_wake_racing_idle_entry_is_never_lost() {
+        use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        for publish_first in [true, false] {
+            let mailbox = AtomicU64::new(0);
+            let ssip = AtomicBool::new(false);
+            let publish = || {
+                mailbox.fetch_or(1, Ordering::AcqRel);
+                ssip.store(true, Ordering::Release);
+            };
+            if publish_first {
+                publish();
+            }
+            // Idle entry: the AP parks its timer and waits; a pending SSIP ends the wait.
+            if !publish_first {
+                publish();
+            }
+            assert!(ssip.swap(false, Ordering::AcqRel), "the wait ends");
+            assert_eq!(
+                mailbox.swap(0, Ordering::AcqRel),
+                1,
+                "and the source is consumed"
+            );
+        }
+        let ipi = include_str!("../../arch/riscv64/ipi.rs");
+        let send = ipi.split("pub fn send_reschedule(").nth(1).unwrap();
+        let publication = send.find("slot.fetch_or(bit, Ordering::AcqRel)").unwrap();
+        let notification = send.find("sbi::send_ipi(hart_mask, 0)").unwrap();
+        assert!(publication < notification);
+    }
+
+    /// **Every production enqueue owner that commits onto a run queue notifies after the commit.**
+    /// Structural, over the split owners: each commit site is followed by `notify_enqueued`
+    /// outside the rank-1 closure. The three exceptions are named: the owner-revalidation
+    /// rollback (restores a task on the CPU it was taken from, by that CPU), the x86-only
+    /// `enqueue_then_dispatch_on_cpu_split` (dispatches what it enqueues, on the same CPU), and
+    /// the bootstrap enqueue (before any AP is released).
+    #[test]
+    fn every_production_enqueue_commit_is_followed_by_its_notification() {
+        let runtime = include_str!("../../runtime.rs");
+        let runtime = runtime.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let cap = include_str!("capability_lifecycle_state.rs");
+        let mut checked = 0;
+        for (name, src) in [
+            ("runtime.rs", runtime),
+            ("capability_lifecycle_state.rs", cap),
+        ] {
+            for pat in [
+                "crate::kernel::task_enqueue::commit_enqueue_locked(",
+                ".enqueue_on_with_priority(",
+            ] {
+                for (i, _) in src.match_indices(pat) {
+                    let head = &src[..i];
+                    let fn_start = head.rfind("fn ").unwrap();
+                    let fn_name = head[fn_start + 3..]
+                        .split('(')
+                        .next()
+                        .unwrap()
+                        .split('<')
+                        .next()
+                        .unwrap();
+                    if matches!(
+                        fn_name,
+                        "owner_revalidation_rollback_split" | "enqueue_then_dispatch_on_cpu_split"
+                    ) {
+                        continue;
+                    }
+                    let tail = &src[i..(i + 1600).min(src.len())];
+                    assert!(
+                        tail.contains("crate::arch::hal::notify_enqueued("),
+                        "{name}::{fn_name}: a committed enqueue must be announced to its target"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 8, "the owners exist: {checked}");
+    }
+
+    /// **Every RISC-V idle arrival leaves the user root before it arms its idle boundary**, and the
+    /// split exit transaction does so between its clear and its claim.
+    #[test]
+    fn every_riscv_idle_arrival_and_the_exit_leave_the_user_root() {
+        let boot = include_str!("../../arch/riscv64/boot.rs");
+        let arrivals = boot
+            .matches("crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);")
+            .count();
+        assert!(arrivals >= 2);
+        for (i, _) in boot.match_indices(
+            "crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);",
+        ) {
+            // The production admission arms the AP's timer and publishes it between the two.
+            let before = &boot[i.saturating_sub(1800)..i];
+            assert!(
+                before.contains("crate::arch::hal::leave_user_root(cpu)"),
+                "an idle arrival arms its boundary only after leaving the user root"
+            );
+        }
+        let exit = include_str!("../syscall/exit_txn.rs");
+        let txn = exit
+            .split("pub(crate) fn run_exit_transaction<O: ExitOwners>(")
+            .nth(1)
+            .unwrap();
+        let clear = txn
+            .find("let Some(token) = owners.clear_current_exact(cpu, tid, preflight.asid) else {")
+            .unwrap();
+        let leave = txn
+            .find("owners.leave_user_root(cpu);")
+            .expect("the exit leaves the root");
+        let claim = txn
+            .find("let claim = match owners.claim_self_exit(")
+            .unwrap();
+        assert!(clear < leave && leave < claim);
     }
 }

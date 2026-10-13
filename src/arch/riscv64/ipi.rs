@@ -3,8 +3,10 @@
 
 //! QEMU-SMP3 — the RISC-V two-hart reschedule IPI and remote translation fence, through the SBI.
 //!
-//! Default off: nothing here sends, enables or consumes anything unless `yarm.ap_user_dispatch=1`
-//! released the secondary and the target published itself ready.
+//! Nothing here sends, enables or consumes anything until the boot hart released a secondary
+//! ([`release_set`]: under `yarm.ap_user_dispatch=1` every trap-ready one, for the witnesses; by
+//! default, AP-SCHED1, logical CPU 1 alone, for production dispatch) and the target published
+//! itself ready. A one-hart boot releases nothing.
 //!
 //! # What the firmware does, and what reaches the supervisor
 //!
@@ -141,6 +143,31 @@ static READY: AtomicU64 = AtomicU64::new(0);
 /// `BootExclusive` token (BLR1; formerly `borrow_kernel_for_boot`). A parked secondary is released
 /// by this flag and the IPI that announces it; it touches no shared kernel state before.
 static BOOT_BORROW_ENDED: AtomicBool = AtomicBool::new(false);
+/// AP-SCHED1 — the secondaries the boot hart RELEASED, one bit per logical CPU, published before
+/// the flag above. A parked hart leaves the park only on its own bit: `wfi` may return for any
+/// reason, and a global flag would let an unreleased hart follow a released one out.
+static RELEASED: AtomicU64 = AtomicU64::new(0);
+
+/// AP-SCHED1 — the secondaries production scheduling admits on RISC-V: logical CPU 1 alone. It is
+/// the one secondary with a dispatch-sized trap stack (`RISCV64_CPU1_TRAP_STACK`); every other
+/// secondary stays parked, wake-only and masked.
+pub const PRODUCTION_DISPATCH_CPUS: u64 = 1 << 1;
+
+/// AP-SCHED1 — which trap-ready secondaries the boot hart releases. Pure.
+///
+/// * diagnostic (`yarm.ap_user_dispatch=1`): every trap-ready secondary, exactly as before — the
+///   witnesses own what they admit;
+/// * production: the trap-ready members of [`PRODUCTION_DISPATCH_CPUS`].
+///
+/// The boot CPU (bit 0) is never in the set.
+pub fn release_set(trap_ready_cpus: u64, diagnostic: bool) -> u64 {
+    let secondaries = trap_ready_cpus & !1;
+    if diagnostic {
+        secondaries
+    } else {
+        secondaries & PRODUCTION_DISPATCH_CPUS
+    }
+}
 
 /// Per-CPU counters: `[publications, merged_publications, firmware_requests, firmware_refusals]`
 /// as SENDER, and `[arrivals, from_user, at_idle, consumed_publications, empty_arrivals,
@@ -376,7 +403,8 @@ pub fn take_arrival(cpu: CpuId, origin: ArrivalOrigin) -> IpiArrival {
 /// clear in the park). Consumed the same way, clear first; the "work" is the release flag.
 pub fn take_park_release(cpu: CpuId) -> bool {
     clear_ssip();
-    let released = boot_borrow_ended();
+    let released = boot_borrow_ended()
+        && RELEASED.load(Ordering::Acquire) & (1u64 << (cpu.0 as u64 & 63)) != 0;
     if released && let Some(row) = TAKEN.get(cpu.0 as usize) {
         bump(&row[5]);
     }
@@ -384,21 +412,36 @@ pub fn take_park_release(cpu: CpuId) -> bool {
 }
 
 /// The boot hart, at the end of its boot borrow (immediately before its first user entry): make
-/// itself a target, publish the release, and interrupt every trap-ready secondary. A strict no-op
-/// unless `yarm.ap_user_dispatch=1`. Returns the harts interrupted.
+/// itself a target, publish the release, and interrupt every released secondary
+/// ([`release_set`]). A strict no-op when that set is empty — a one-hart boot, or a boot whose
+/// only trap-ready secondaries are outside the production set — so one-CPU operation is
+/// byte-for-byte unchanged. Returns the harts interrupted.
 pub fn release_secondaries_at_boot_borrow_end(trap_ready_cpus: u64) -> usize {
-    if !crate::kernel::boot::ap_user_dispatch_enabled() {
+    let diagnostic = crate::kernel::boot::ap_user_dispatch_enabled();
+    let released = release_set(trap_ready_cpus, diagnostic);
+    // Every trap-ready secondary left out stays parked, wake-only and masked. Said once, by name,
+    // so a quiescent CPU is a reported fact rather than an absence.
+    for cpu in 1..MAX_CPUS.min(64) {
+        if trap_ready_cpus & !released & (1u64 << cpu) != 0 {
+            crate::arch::riscv64::boot::early_sbi_marker(format_args!(
+                "RISCV_AP_QUIESCENT cpu={} reason=outside_production_dispatch_set wake_only=1 sie=ssie_park_only",
+                cpu
+            ));
+        }
+    }
+    if released == 0 {
         return 0;
     }
     let boot = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
     let sie = enable_ssie_on_this_hart();
     mark_ready(boot);
+    RELEASED.store(released, Ordering::Release);
     BOOT_BORROW_ENDED.store(true, Ordering::Release);
     full_fence();
     let mut sent = 0usize;
     let mut refused = 0usize;
     for cpu in 1..MAX_CPUS.min(64) {
-        if trap_ready_cpus & (1u64 << cpu) == 0 {
+        if released & (1u64 << cpu) == 0 {
             continue;
         }
         let Some(hart) = hart_of(cpu) else {
@@ -426,11 +469,13 @@ pub fn release_secondaries_at_boot_borrow_end(trap_ready_cpus: u64) -> usize {
         }
     }
     crate::arch::riscv64::boot::early_sbi_marker(format_args!(
-        "RISCV_SMP3_RELEASE boot_cpu=0 sie=0x{:x} ssie={} released_harts={} refused={} knob=1",
+        "RISCV_SMP3_RELEASE boot_cpu=0 sie=0x{:x} ssie={} released_harts={} refused={} knob={} released=0x{:x}",
         sie,
         (sie >> 1) & 1,
         sent,
-        refused
+        refused,
+        u8::from(diagnostic),
+        released
     ));
     sent
 }
@@ -542,6 +587,47 @@ mod tests {
         // A CPU with no hart fails the whole mask closed.
         assert_eq!(hart_mask_for(0b100, swapped), None);
         assert_eq!(hart_mask_for(0b1, |_| Some(64)), None);
+    }
+
+    /// AP-SCHED1 — the production release names logical CPU 1 alone; the diagnostic knob keeps
+    /// every trap-ready secondary; the boot CPU is never released; an empty set releases nothing.
+    #[test]
+    fn production_releases_cpu_one_alone() {
+        assert_eq!(release_set(0b11, false), 0b10);
+        assert_eq!(release_set(0b1111, false), 0b10, "CPU 2+ stay parked");
+        assert_eq!(
+            release_set(0b1101, false),
+            0,
+            "CPU 1 not trap-ready: nothing"
+        );
+        assert_eq!(release_set(0b1, false), 0, "a one-hart boot: nothing");
+        assert_eq!(
+            release_set(0b1111, true),
+            0b1110,
+            "the knob: every secondary"
+        );
+        assert_eq!(release_set(0b1, true), 0);
+    }
+
+    /// AP-SCHED1 — a parked hart leaves only on its OWN released bit: `wfi` returns for any reason,
+    /// and the flag alone would let an unreleased hart follow a released one out.
+    #[test]
+    fn a_park_release_is_per_cpu() {
+        let saved = (
+            RELEASED.load(Ordering::Acquire),
+            BOOT_BORROW_ENDED.load(Ordering::Acquire),
+        );
+        RELEASED.store(0b10, Ordering::Release);
+        BOOT_BORROW_ENDED.store(true, Ordering::Release);
+        assert!(take_park_release(CpuId(1)));
+        assert!(!take_park_release(CpuId(2)), "an unreleased hart re-parks");
+        BOOT_BORROW_ENDED.store(false, Ordering::Release);
+        assert!(
+            !take_park_release(CpuId(1)),
+            "nothing before the boot borrow ends"
+        );
+        RELEASED.store(saved.0, Ordering::Release);
+        BOOT_BORROW_ENDED.store(saved.1, Ordering::Release);
     }
 
     #[test]

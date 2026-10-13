@@ -394,6 +394,9 @@ pub fn reestablish_idle_boundary(cpu: usize) {
     if !idle_wake_source_enabled(cpu) {
         return;
     }
+    // AP-SCHED1 — a production AP idles TICKLESS: work reaches it by IPI, and global time is the
+    // clock owner's, so its own period is parked behind a backstop until it runs a task again.
+    park_ap_timer_for_idle(cpu);
     if !set_sscratch_to_trap_stack_top(cpu) {
         return;
     }
@@ -611,6 +614,113 @@ pub fn record_timer_tick() -> u64 {
 
 pub fn mark_stie_enabled() {
     STIE_ENABLED.store(true, Ordering::Release);
+    if let Some(f) = STIE_ENABLED_ON.get(crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize)
+    {
+        f.store(true, Ordering::Release);
+    }
+}
+
+/// AP-SCHED1 — per CPU: `sie.STIE` is a per-hart register, so "this CPU's timer is armed" is a
+/// per-CPU fact. The boot hart's entry is set by the boot arm; an admitted secondary's by
+/// [`arm_secondary_timer`], on that hart.
+static STIE_ENABLED_ON: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// `true` once `cpu` armed its own periodic timer.
+pub fn stie_enabled_on(cpu: usize) -> bool {
+    STIE_ENABLED_ON
+        .get(cpu)
+        .is_some_and(|f| f.load(Ordering::Acquire))
+}
+
+/// AP-SCHED1 — arm THIS secondary hart's own periodic supervisor timer, at its production
+/// admission, BEFORE it can receive any work.
+///
+/// The same two steps, in the same order, as the boot arm: program the first deadline through
+/// SBI `set_timer` (which acts on the calling hart), then set this hart's `sie.STIE`. `sstatus.SIE`
+/// is not touched, so no S-mode region becomes interruptible: U-origin delivery rides on privilege
+/// and the S-origin one is admitted only inside this CPU's own idle `wfi` loop. Every later
+/// re-arm happens on this hart at the tail of its own timer settlement
+/// (`irq::program_timer_deadline(cpu, …)`), so the deadline is always this hart's own.
+///
+/// This CPU's interrupts consume only ITS quantum; the scheduler tick that every deadline is
+/// measured against is advanced by the clock owner alone (`SchedulerState::tick_on`).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn arm_secondary_timer(cpu: usize) -> bool {
+    if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize || cpu >= MAX_CPUS {
+        return false;
+    }
+    if !init_fired() || !stie_enabled() {
+        // The platform has no SBI TIME (the boot arm deferred): no CPU has a timer.
+        return false;
+    }
+    let deadline = current_time_value().wrapping_add(DEFAULT_TICK_INTERVAL);
+    sbi_set_timer(deadline);
+    set_sie_stie();
+    STIE_ENABLED_ON[cpu].store(true, Ordering::Release);
+    emit_marker(format_args!(
+        "RISCV_AP_TIMER_ARMED cpu={} deadline={} owner=self sie=0 delivery=u_mode_privilege result=ok",
+        cpu, deadline
+    ));
+    true
+}
+
+/// AP-SCHED1 — the period a PARKED AP timer still fires at while that CPU idles: a backstop that
+/// bounds how long an idle AP can miss work whose notification failed, not a tick. 100 periods
+/// (one second at QEMU virt's 10 MHz timebase).
+pub const AP_IDLE_BACKSTOP_INTERVAL: u64 = 100 * DEFAULT_TICK_INTERVAL;
+
+/// AP-SCHED1 — per CPU: its own timer is parked behind the backstop because it is idle.
+static AP_TIMER_PARKED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// AP-SCHED1 — `cpu` is idle with its timer parked.
+pub fn ap_timer_parked(cpu: usize) -> bool {
+    AP_TIMER_PARKED
+        .get(cpu)
+        .is_some_and(|f| f.load(Ordering::Acquire))
+}
+
+/// AP-SCHED1 — park THIS AP's own timer for its idle wait, called at its idle arrival.
+///
+/// An idle AP has no quantum to consume and no clock to advance (the global tick is the clock
+/// owner's, `SchedulerState::tick_on`), and every enqueue another CPU commits to it is followed by
+/// a reschedule IPI. Ticking anyway is not free: each idle tick is a trap, a queue-advance attempt
+/// and its markers, and on QEMU that console traffic contends with the CPU doing the work. So the
+/// next deadline moves out to [`AP_IDLE_BACKSTOP_INTERVAL`] (SBI `set_timer` also clears a pending
+/// tick). `STIE` stays set: the backstop is still delivered and still serviced as an idle tick.
+///
+/// The boot hart never parks: it is the clock owner. A CPU that never armed its own timer has
+/// nothing to park. Returns whether this call parked it.
+pub fn park_ap_timer_for_idle(cpu: usize) -> bool {
+    if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize || !stie_enabled_on(cpu) {
+        return false;
+    }
+    AP_TIMER_PARKED[cpu].store(true, Ordering::Release);
+    sbi_set_timer(current_time_value().wrapping_add(AP_IDLE_BACKSTOP_INTERVAL));
+    true
+}
+
+/// AP-SCHED1 — leave the idle park: THIS AP is about to run a task, so its own period is restored
+/// from a fresh `rdtime` sample — a full quantum period, never a stale one. Called on the one path
+/// an idle AP leaves idle by (the S-mode idle landing that resumes a task). Returns whether the
+/// timer was parked.
+pub fn unpark_ap_timer(cpu: usize) -> bool {
+    if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize || cpu >= MAX_CPUS {
+        return false;
+    }
+    if !AP_TIMER_PARKED[cpu].swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    sbi_set_timer(current_time_value().wrapping_add(DEFAULT_TICK_INTERVAL));
+    true
+}
+
+/// AP-SCHED1 — the completion of an accepted timer interrupt on a PARKED AP: the same one SBI call
+/// and the same count as [`rearm_periodic_deadline`], at the backstop distance.
+pub fn rearm_backstop_deadline() -> u64 {
+    let deadline = current_time_value().wrapping_add(AP_IDLE_BACKSTOP_INTERVAL);
+    sbi_set_timer(deadline);
+    TIMER_REARM_COUNT.fetch_add(1, Ordering::AcqRel);
+    deadline
 }
 
 pub fn stie_enabled() -> bool {
@@ -676,6 +786,71 @@ mod tests {
         assert!(!IDLE_UNMASK_REQUESTED[2].load(Ordering::Acquire));
         // The request is consumed by THAT CPU's idle wait only (modelled by the swap it performs).
         assert!(IDLE_UNMASK_REQUESTED[3].swap(false, Ordering::AcqRel));
+    }
+
+    /// AP-SCHED1 — an idle AP parks its own timer behind the backstop and resumes its period only
+    /// when it leaves idle; a backstop that fires while parked re-arms the backstop and stays
+    /// parked; the clock owner and a CPU with no timer of its own never park.
+    #[test]
+    fn an_idle_ap_parks_its_timer_until_it_runs_a_task() {
+        const AP: usize = 6;
+        assert!(!park_ap_timer_for_idle(0), "the clock owner never parks");
+        assert!(
+            !park_ap_timer_for_idle(AP),
+            "no timer of its own, nothing to park"
+        );
+        assert!(!ap_timer_parked(AP));
+        STIE_ENABLED_ON[AP].store(true, Ordering::Release);
+        assert!(park_ap_timer_for_idle(AP));
+        assert!(ap_timer_parked(AP));
+        let before = rearm_count();
+        crate::arch::riscv64::irq::program_timer_deadline(
+            crate::kernel::scheduler::CpuId(AP as u8),
+            0,
+        );
+        assert_eq!(
+            rearm_count(),
+            before + 1,
+            "the backstop completes the interrupt, counted"
+        );
+        assert!(ap_timer_parked(AP), "and the CPU stays parked while idle");
+        assert!(unpark_ap_timer(AP), "leaving idle restores the period");
+        assert!(!ap_timer_parked(AP));
+        assert!(!unpark_ap_timer(AP), "once");
+        crate::arch::riscv64::irq::program_timer_deadline(
+            crate::kernel::scheduler::CpuId(AP as u8),
+            0,
+        );
+        assert_eq!(rearm_count(), before + 2, "a running AP re-arms its period");
+        assert!(!ap_timer_parked(AP));
+        STIE_ENABLED_ON[AP].store(false, Ordering::Release);
+    }
+
+    /// AP-SCHED1 — every idle arrival on an AP with its own timer parks it; the boot hart's does not.
+    #[test]
+    fn the_idle_boundary_parks_an_ap_timer() {
+        const AP: usize = 7;
+        STIE_ENABLED_ON[AP].store(true, Ordering::Release);
+        mark_idle_wake_source(AP);
+        reestablish_idle_boundary(AP);
+        assert!(ap_timer_parked(AP));
+        assert!(IDLE_UNMASK_REQUESTED[AP].swap(false, Ordering::AcqRel));
+        assert!(unpark_ap_timer(AP));
+        STIE_ENABLED_ON[AP].store(false, Ordering::Release);
+        let src = include_str!("timer.rs");
+        let body = src
+            .split("pub fn reestablish_idle_boundary(cpu: usize) {")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let park = body.find("park_ap_timer_for_idle(cpu);").expect("the park");
+        let unmask = body.find("request_idle_unmask(cpu);").expect("the unmask");
+        assert!(
+            park < unmask,
+            "parked before the wait can take the next tick"
+        );
     }
 
     #[test]

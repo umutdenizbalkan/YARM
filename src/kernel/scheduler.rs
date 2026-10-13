@@ -865,6 +865,44 @@ impl SmpScheduler {
         Ok(())
     }
 
+    /// AP-SCHED1 — admit a wake-only CPU to PRODUCTION dispatch: the same single transition as
+    /// [`Self::admit_pinned_dispatch`] (out of wake-only, idle placeholder cleared, refused unless
+    /// the CPU is online, wake-only, running nothing and holding no work) except that the CPU
+    /// joins balanced placement. It is called only once the CPU can take work AND interrupts: its
+    /// own timer is armed (an unpinned task placed there is preempted and never strands) and it is
+    /// a published reschedule-IPI target (every remote enqueue reaches it).
+    pub fn admit_dispatch(&mut self, cpu: CpuId) -> Result<(), SchedulerError> {
+        let idx = self.check_online_cpu(cpu)?;
+        let bit = 1u64 << idx;
+        if self.wake_only & bit == 0 {
+            return Err(SchedulerError::CpuOffline);
+        }
+        match self.schedulers[idx].current_tid() {
+            None | Some(ThreadId(0)) => {}
+            Some(_) => return Err(SchedulerError::AlreadyQueued),
+        }
+        if self.schedulers[idx].runnable_count() != 0 {
+            return Err(SchedulerError::AlreadyQueued);
+        }
+        self.schedulers[idx].current = None;
+        self.wake_only &= !bit;
+        self.balance_excluded &= !bit;
+        Ok(())
+    }
+
+    /// AP-SCHED1 — the CPU balanced placement WOULD choose now, without enqueueing anything: the
+    /// least-loaded online CPU that is neither wake-only nor balance-excluded. Read-only; the
+    /// caller fixes the choice as the task's home before the task is ever queued.
+    pub fn balanced_choice(&self) -> Result<CpuId, SchedulerError> {
+        self.least_loaded_online_cpu(self.next_balance_cpu)
+    }
+
+    /// AP-SCHED1 — note that a balanced choice was used, so successive placements rotate their
+    /// starting point exactly as [`Self::enqueue_balanced`] does.
+    pub fn note_balanced_choice(&mut self, cpu: CpuId) {
+        self.next_balance_cpu = (cpu.0 as usize + 1) % MAX_CPUS;
+    }
+
     /// QEMU-SMP2: CPUs that dispatch only explicitly placed tasks.
     pub fn balance_excluded_bitmap(&self) -> u64 {
         self.balance_excluded
@@ -1637,6 +1675,36 @@ mod tests {
 
     /// QEMU-SMP2: the wake-only AP exactly as `start_secondary_cpus` leaves it — marked
     /// wake-only before bring-up, then given the tid-0 idle placeholder.
+    /// AP-SCHED1 — production admission is the same single transition, except that the CPU joins
+    /// balanced placement; and it is refused, changing nothing, on the same states.
+    #[test]
+    fn production_admission_joins_balanced_placement() {
+        let mut sched = wake_only_ap();
+        sched.admit_dispatch(CpuId(1)).expect("admitted");
+        assert!(!sched.cpu_wake_only(CpuId(1)));
+        assert_eq!(sched.balance_excluded_bitmap(), 0);
+        assert_eq!(sched.current_tid_on(CpuId(1)), None, "placeholder cleared");
+        // CPU 0 carries one task, so the balanced choice is CPU 1.
+        sched.enqueue_on(CpuId(0), ThreadId(5)).expect("load CPU 0");
+        assert_eq!(sched.balanced_choice(), Ok(CpuId(1)));
+        // A second admission is refused: it is not wake-only any more.
+        assert_eq!(
+            sched.admit_dispatch(CpuId(1)),
+            Err(SchedulerError::CpuOffline)
+        );
+        let mut busy = wake_only_ap();
+        busy.set_cpu_wake_only(CpuId(1), true).expect("wake-only");
+        busy.schedulers[1].current = Some(ScheduledTask {
+            tid: ThreadId(9),
+            priority: TaskPriority::Normal,
+        });
+        assert_eq!(
+            busy.admit_dispatch(CpuId(1)),
+            Err(SchedulerError::AlreadyQueued)
+        );
+        assert!(busy.cpu_wake_only(CpuId(1)), "refusal changed nothing");
+    }
+
     fn wake_only_ap() -> SmpScheduler {
         let mut sched = SmpScheduler::default();
         sched.set_present_cpu_bitmap(0b11);

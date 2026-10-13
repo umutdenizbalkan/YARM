@@ -262,10 +262,18 @@ pub(crate) fn write_claim_completion(context: PlicContext, source: u32) {
 /// it on a hart that never enabled `sie.STIE` would arm a source nothing is prepared to service.
 pub fn program_timer_deadline(cpu: crate::kernel::scheduler::CpuId, ticks_from_now: u64) {
     let _ = ticks_from_now;
-    if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+    // AP-SCHED1: any CPU that armed its OWN timer re-arms it here, at the tail of its own timer
+    // settlement — `cpu` is the CPU this trap runs on, and SBI `set_timer` acts on the calling
+    // hart. A CPU that never armed one (a wake-only or diagnostic secondary) arms nothing.
+    if cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+        if !crate::arch::riscv64::timer::stie_enabled() {
+            return;
+        }
+    } else if !crate::arch::riscv64::timer::stie_enabled_on(cpu.0 as usize) {
         return;
-    }
-    if !crate::arch::riscv64::timer::stie_enabled() {
+    } else if crate::arch::riscv64::timer::ap_timer_parked(cpu.0 as usize) {
+        // An idle AP's backstop fired: it stays parked until it runs a task.
+        crate::arch::riscv64::timer::rearm_backstop_deadline();
         return;
     }
     crate::arch::riscv64::timer::rearm_periodic_deadline();

@@ -781,6 +781,34 @@ pub(crate) fn riscv_current_logical_cpu() -> crate::kernel::scheduler::CpuId {
     riscv_logical_cpu_for_trap_frame(top.wrapping_sub(16))
 }
 
+/// AP-SCHED1 — the logical CPU executing this code, from the stack it runs on. Every kernel path
+/// after boot runs on its hart's own trap stack (the vector switches to it on entry), and the
+/// bridge already derives the trapping CPU the same way from its frame; a stack outside every
+/// secondary region is the boot hart's.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub(crate) fn riscv_executing_cpu() -> crate::kernel::scheduler::CpuId {
+    use core::sync::atomic::Ordering;
+    let sp: usize;
+    unsafe {
+        core::arch::asm!("mv {0}, sp", out(reg) sp, options(nostack, nomem, preserves_flags));
+    }
+    let on_trap_stack = riscv_logical_cpu_for_trap_frame(sp);
+    if on_trap_stack.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+        return on_trap_stack;
+    }
+    // A released secondary runs its admission on its BOOT stack, before its first trap.
+    for slot in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
+        let top = secondary_stack_top(slot);
+        if sp < top && sp >= top - RISCV64_SECONDARY_BOOT_STACK_BYTES {
+            let cpu = RISCV64_SECONDARY_CPU_IDS[slot].load(Ordering::Acquire);
+            if cpu != usize::MAX && cpu <= u8::MAX as usize {
+                return crate::kernel::scheduler::CpuId(cpu as u8);
+            }
+        }
+    }
+    on_trap_stack
+}
+
 /// QEMU-SMP3 — the hart id of logical CPU `cpu`: the boot hart for CPU 0, otherwise the slot (=
 /// hart id) whose validated, claimed mapping names `cpu`. A scheduler index is never assumed to be
 /// a hart id.
@@ -1228,6 +1256,11 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // each trap entry and without this the idle `wfi` would loop masked and never take
             // the pending timer. Same single audited boundary as before; a strict no-op if the
             // boot arm deferred (no SBI TIME, or not the boot hart).
+            // AP-SCHED1 §3: an idle CPU holds no user root. The task that brought it here
+            // blocked or exited; keeping its root loaded would make that process's reap, from
+            // any CPU, quarantine the whole space. Leave it for the kernel's own (Bare) space
+            // first — the resume that ends this idle reloads whichever root it needs.
+            crate::arch::hal::leave_user_root(cpu);
             // QEMU-SMP3: per CPU — this CPU's own trap-stack top, latch and unmask request.
             crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
             // QEMU-IRQ1 witness (BL4a): an idle ARRIVAL is the other quiet point the host driver
@@ -1764,6 +1797,8 @@ fn riscv_s_mode_idle_landing(
         {
             // A task is runnable again. Leave the idle lifecycle: clear SPP so `sret` targets
             // U-mode, and populate the frame from the resumed task's saved context.
+            // AP-SCHED1: this CPU leaves idle to run `resume_tid`; an AP's own period resumes.
+            crate::arch::riscv64::timer::unpark_ap_timer(cpu.0 as usize);
             match trigger {
                 SModeIdleTrigger::Timer { tick } => early_marker!(
                     "RISCV_S_MODE_TIMER_DISPATCH tick={} resume_tid={}",
@@ -3410,6 +3445,9 @@ fn riscv_secondary_dispatch_main(cpu: crate::kernel::scheduler::CpuId, hart_id: 
     let Some(shared) = trap_shared_kernel_riscv() else {
         riscv_secondary_unadmitted(cpu, "no_shared_kernel");
     };
+    if !crate::kernel::boot::ap_user_dispatch_enabled() {
+        riscv_secondary_production_admission(shared, cpu, hart_id);
+    }
     if let Err(e) = shared.admit_ap_pinned_dispatch_split(cpu) {
         early_marker!(
             "RISCV_SMP3_SECONDARY_ADMISSION_REFUSED cpu={} reason={:?} result=fail",
@@ -3428,8 +3466,59 @@ fn riscv_secondary_dispatch_main(cpu: crate::kernel::scheduler::CpuId, hart_id: 
     );
     #[cfg(feature = "riscv64-smp3-witness")]
     crate::arch::riscv64::smp3_witness::secondary_admitted(shared, cpu);
+    // AP-SCHED1 §3: the secondary has run only in the kernel's space so far; the transition is
+    // the same one every idle arrival takes, so its first idle is no exception.
+    crate::arch::hal::leave_user_root(cpu);
     crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
     riscv_idle_halt(cpu, "secondary_idle_awaiting_ipi")
+}
+
+/// AP-SCHED1 §4 — a released secondary's PRODUCTION admission: no knob, no fixed task identities,
+/// no pinning. The CPU joins balanced placement and runs whatever the ordinary owners place on it.
+///
+/// Order is the contract — admission is published LAST, once the CPU can take both work and
+/// interrupts:
+/// 1. the kernel's own address space (`leave_user_root`): the root this CPU's idle holds is never
+///    a user one, so no teardown has to wait on an idle CPU;
+/// 2. its OWN periodic timer (`arm_secondary_timer`): an unpinned, non-yielding task placed here is
+///    preempted by this CPU's quantum, and an idle wait has a periodic wake. It consumes only this
+///    CPU's quantum; the global tick stays the clock owner's;
+/// 3. its idle wake source, then its publication as a reschedule-IPI target: every enqueue another
+///    CPU commits here is followed by a notification that reaches it;
+/// 4. the scheduler's ONE transition (`admit_dispatch`): out of wake-only, idle placeholder
+///    cleared, and — unlike the diagnostic `admit_pinned_dispatch` — eligible for balanced
+///    placement.
+///
+/// A refusal at (2) or (4) leaves the CPU wake-only, with every enable bit cleared.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_secondary_production_admission(
+    shared: &'static crate::runtime::SharedKernel,
+    cpu: crate::kernel::scheduler::CpuId,
+    hart_id: usize,
+) -> ! {
+    let root_released = crate::arch::hal::leave_user_root(cpu);
+    if !crate::arch::riscv64::timer::arm_secondary_timer(cpu.0 as usize) {
+        riscv_secondary_unadmitted(cpu, "no_ap_timer");
+    }
+    crate::arch::riscv64::timer::mark_idle_wake_source(cpu.0 as usize);
+    crate::arch::riscv64::ipi::mark_ready(cpu);
+    if let Err(e) = shared.admit_ap_dispatch_split(cpu) {
+        early_marker!(
+            "RISCV_AP_SCHED_ADMISSION_REFUSED cpu={} reason={:?} result=fail",
+            cpu.0,
+            e
+        );
+        riscv_secondary_unadmitted(cpu, "scheduler_refused");
+    }
+    early_marker!(
+        "RISCV_AP_SCHED_ADMITTED hart={} cpu={} mode=production wake_only=0 balance_excluded=0 timer=own ipi_ready=1 root=kernel root_released={} trap_stack_top=0x{:x} result=ok",
+        hart_id,
+        cpu.0,
+        u8::from(root_released),
+        riscv_trap_stack_top_for_cpu(cpu.0 as usize).unwrap_or(0)
+    );
+    crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
+    riscv_idle_halt(cpu, "secondary_idle_awaiting_work")
 }
 
 /// A released secondary the scheduler would not admit: nothing is ever placed on it (it stays

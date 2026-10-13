@@ -1894,8 +1894,21 @@ impl SharedKernel {
     /// These are the same two admissions `queue_advance_admit_split` makes before it peeks a
     /// candidate; asking them here, before anything is reserved, is what keeps every exit refusal
     /// free.
+    ///
+    /// # AP-SCHED1 §4 — authority-bound
+    ///
+    /// The second fact is no longer the ambient binding. Every drain that consumes an exit
+    /// deferral (the futex-wait drains, which admit the exit cell by its exact `{tid, asid}`)
+    /// selects through `queue_advance_acquire_incoming_split(trap_path.authority(), ..)`, and
+    /// every owner operation the transaction performs names this CPU explicitly: the current
+    /// slot (`clear_current_exact` / `restore_current_exact`), the deferral and server-death cells,
+    /// and — since the same increment — the woken joiners' enqueue, which places by the
+    /// executing CPU rather than by `sched.current_cpu`. So the route is
+    /// [`TerminalRouteTopology::AuthorityBound`], and a second dispatching CPU no longer turns
+    /// every exit away.
     pub(crate) fn exit_route_admitted_split(&self, cpu: CpuId) -> bool {
-        self.split_terminal_route_admitted(cpu)
+        self.split_terminal_route_admission(cpu, TerminalRouteTopology::AuthorityBound)
+            .is_ok()
     }
     /// U9-RESIDUAL1 §3 — count one yield, rank 3.
     ///
@@ -1968,6 +1981,11 @@ impl SharedKernel {
     /// orchestrator's one-shot SMP bring-up, which runs before any userspace task exists.
     ///
     /// Purely a read — a refusal mutates nothing, which is what lets every caller treat it as free.
+    ///
+    /// AP-SCHED1 §4: the exit route, its last production caller, now names its topology at its own
+    /// call site; the boolean ambient form remains as the reference the admission tests compare
+    /// against.
+    #[cfg(test)]
     pub(crate) fn split_terminal_route_admitted(&self, cpu: CpuId) -> bool {
         self.split_terminal_route_admission(cpu, TerminalRouteTopology::AmbientBound)
             .is_ok()
@@ -2030,12 +2048,6 @@ impl SharedKernel {
             return Err(R::NotDispatchCpu);
         }
         Ok(())
-    }
-
-    /// The authoritative dispatch CPU, rank 1. Used only to enqueue a woken joiner onto the run
-    /// queue the drain will select from.
-    pub(crate) fn authoritative_dispatch_cpu_split(&self) -> CpuId {
-        self.with_scheduler_split_mut(|sched| sched.current_cpu)
     }
 
     /// U9-EXIT1 §3 — did this thread publish a robust-futex list?
@@ -3372,8 +3384,8 @@ impl SharedKernel {
     ///
     /// Nothing else ticks this CPU's timer, and interrupts are masked for the whole trap, so the
     /// answer cannot go stale between this read and the tick that follows it.
-    pub(crate) fn timer_would_preempt_split_read(&self, _cpu: CpuId) -> bool {
-        self.with_scheduler_split_mut(|sched| sched.timer.would_preempt_next())
+    pub(crate) fn timer_would_preempt_split_read(&self, cpu: CpuId) -> bool {
+        self.with_scheduler_split_mut(|sched| sched.would_preempt_next_on(cpu))
     }
 
     /// U9-TIMER1 §3 — install a quantum on the LIVE scheduler timer. Rank 1, one acquisition.
@@ -3388,12 +3400,12 @@ impl SharedKernel {
     /// `BOOTSTRAP_TIMER_DEADLINE_TICKS` directly and is not reachable from here, so every timer
     /// interrupt still arrives on its production schedule.
     pub(crate) fn set_scheduler_quantum_split_mut(&self, quantum_ticks: u64) {
-        self.with_scheduler_split_mut(|sched| sched.timer.set_quantum(quantum_ticks));
+        self.with_scheduler_split_mut(|sched| sched.set_quantum_all(quantum_ticks));
     }
 
     pub(crate) fn scheduler_tick_split_mut(&self, cpu: CpuId) -> SchedulerTickOutcome {
-        let (tick, should_preempt) =
-            self.with_scheduler_split_mut(|sched| sched.timer.tick_and_check());
+        // AP-SCHED1: this CPU's own quantum; the scheduler tick advances only on the clock owner.
+        let (tick, should_preempt) = self.with_scheduler_split_mut(|sched| sched.tick_on(cpu));
         if should_preempt {
             SchedulerTickOutcome::Preempt { cpu, tick: tick.0 }
         } else {
@@ -3433,10 +3445,10 @@ impl SharedKernel {
         cpu: CpuId,
     ) -> Option<SchedulerTickOutcome> {
         self.with_scheduler_split_mut(|sched| {
-            if sched.timer.would_preempt_next() {
+            if sched.would_preempt_next_on(cpu) {
                 return None;
             }
-            let (tick, should_preempt) = sched.timer.tick_and_check();
+            let (tick, should_preempt) = sched.tick_on(cpu);
             debug_assert!(
                 !should_preempt,
                 "the lookahead and the tick are one acquisition; they cannot disagree"
@@ -3787,6 +3799,19 @@ impl SharedKernel {
         })
     }
 
+    /// AP-SCHED1 — admit the wake-only AP `cpu` to PRODUCTION dispatch, in ONE rank-1 scheduler
+    /// acquisition ([`crate::kernel::scheduler::SmpScheduler::admit_dispatch`]). Called by the AP
+    /// itself, last, once its own timer is armed and it is a published reschedule-IPI target.
+    #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+    pub(crate) fn admit_ap_dispatch_split(
+        &self,
+        cpu: CpuId,
+    ) -> Result<(), crate::kernel::scheduler::SchedulerError> {
+        self.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_mut(&mut sched.scheduler).admit_dispatch(cpu)
+        })
+    }
+
     pub(crate) fn yield_reverify_ready(&self, cpu: CpuId) -> bool {
         self.with_scheduler_split_mut(|sched| {
             // `cpu` is the trap CPU == the authoritative dispatch CPU under the
@@ -4081,15 +4106,92 @@ impl SharedKernel {
     /// strictly the last lock this transition acquires, which is what lets a caller treat the
     /// enqueue as the commit point of a longer transaction.
     pub(crate) fn enqueue_task_split(&self, cpu: CpuId, tid: u64) -> Result<CpuId, KernelError> {
-        let plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+        let mut plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
             crate::kernel::task_enqueue::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)
         })?;
-        self.with_scheduler_split_mut(|sched| {
+        self.resolve_plan_home_split(&mut plan, cpu);
+        let target = self.with_scheduler_split_mut(|sched| {
             crate::kernel::task_enqueue::commit_enqueue_locked(
                 kernel_mut(&mut sched.scheduler),
                 &plan,
             )
+        })?;
+        crate::arch::hal::notify_enqueued(target);
+        Ok(target)
+    }
+
+    /// AP-SCHED1 — rank 1: the CPU balanced placement chooses now, rotating the next choice's
+    /// starting point exactly as `SmpScheduler::enqueue_balanced` does; `fallback` when none is
+    /// eligible (the commit then refuses exactly as it did before).
+    pub(crate) fn balanced_choice_split(&self, fallback: CpuId) -> CpuId {
+        self.with_scheduler_split_mut(|sched| {
+            let s = kernel_mut(&mut sched.scheduler);
+            match s.balanced_choice() {
+                Ok(cpu) => {
+                    s.note_balanced_choice(cpu);
+                    cpu
+                }
+                Err(_) => fallback,
+            }
         })
+    }
+
+    /// AP-SCHED1 — rank 2: `tid`'s home CPU, fixing `chosen` as it when it has none
+    /// ([`crate::kernel::task_enqueue::fix_home_locked`]).
+    pub(crate) fn fix_home_cpu_split(&self, tid: u64, chosen: CpuId) -> CpuId {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            crate::kernel::task_enqueue::fix_home_locked(tcbs, tid, chosen)
+        })
+    }
+
+    /// AP-SCHED1 — `tid`'s home, fixing the balanced choice as it when it has none. For the wake
+    /// owners that commit straight onto a CPU: they read `cpu_affinity` and fell back to the
+    /// AMBIENT `sched.current_cpu`, which names whichever CPU last bound it.
+    pub(crate) fn home_cpu_split(&self, tid: u64, fallback: CpuId) -> CpuId {
+        let chosen = self.balanced_choice_split(fallback);
+        self.fix_home_cpu_split(tid, chosen)
+    }
+
+    /// AP-SCHED1 — the CPU executing this code, for the wake owners that are handed no CPU. They
+    /// placed a task with no home on "this CPU" through the AMBIENT `sched.current_cpu`, which
+    /// under two dispatchers names whichever CPU last bound it.
+    ///
+    /// * RISC-V (the selected two-dispatcher configuration): derived from the trap stack this code
+    ///   runs on — the trap bridge's own authority.
+    /// * x86_64 / AArch64 / hosted: one dispatcher, so the bound field names exactly the CPU that
+    ///   dispatches and therefore executes; unchanged.
+    ///
+    /// A woken task practically always has a home already (it was enqueued once before it could
+    /// block); this decides only the first placement of one that somehow has none.
+    pub(crate) fn executing_cpu_split(&self) -> CpuId {
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+        {
+            crate::arch::riscv64::boot::riscv_executing_cpu()
+        }
+        #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+        {
+            self.with_scheduler_split_mut(|sched| sched.current_cpu)
+        }
+    }
+
+    /// AP-SCHED1 — resolve `plan` to the CPU its commit will use, recording the task's home FIRST:
+    /// an explicit placement records its CPU (if the task has no home yet) and stays where it was
+    /// told; a balanced plan becomes `Pinned(home)`. Rank 1 (read) and rank 2 (write), released
+    /// in turn; the commit that follows takes rank 1 last.
+    pub(crate) fn resolve_plan_home_split(
+        &self,
+        plan: &mut crate::kernel::task_enqueue::EnqueuePlan,
+        fallback: CpuId,
+    ) {
+        use crate::kernel::task_enqueue::EnqueueTarget;
+        match plan.target {
+            EnqueueTarget::Pinned(cpu) => {
+                let _ = self.fix_home_cpu_split(plan.tid, cpu);
+            }
+            EnqueueTarget::Balanced => {
+                plan.target = EnqueueTarget::Pinned(self.home_cpu_split(plan.tid, fallback));
+            }
+        }
     }
 
     /// U9-SPAWN-TXN2 §3 — the PINNED off-lock task enqueue: the split twin of
@@ -4105,15 +4207,18 @@ impl SharedKernel {
     /// authoritative policy pins to the bootstrap CPU so the supervisor and PM reach their
     /// receives before init runs.
     pub(crate) fn enqueue_on_cpu_split(&self, cpu: CpuId, tid: u64) -> Result<CpuId, KernelError> {
-        let plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+        let mut plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
             crate::kernel::task_enqueue::plan_pinned_enqueue_locked(tcbs, classes, tid, cpu)
         })?;
-        self.with_scheduler_split_mut(|sched| {
+        self.resolve_plan_home_split(&mut plan, cpu);
+        let target = self.with_scheduler_split_mut(|sched| {
             crate::kernel::task_enqueue::commit_enqueue_locked(
                 kernel_mut(&mut sched.scheduler),
                 &plan,
             )
-        })
+        })?;
+        crate::arch::hal::notify_enqueued(target);
+        Ok(target)
     }
 
     /// U9-SPAWN-TXN2 §3 — the split twin of `KernelState::provision_default_kernel_context`.
@@ -5773,12 +5878,17 @@ impl SharedKernel {
         use crate::kernel::ipc::ThreadId;
         use crate::kernel::task::{TaskStatus, WaitReason};
 
+        // AP-SCHED1 §4 — the CPU actually executing this commit, not the ambient binding: the D2-send
+        // drain that consumes what this commit arms selects through the trap's own authority, so
+        // the question is whether the snapshot was produced on THIS CPU. Read before rank 1 (on a
+        // one-dispatcher port it is that binding, through its own acquisition).
+        let executing = self.executing_cpu_split();
         self.with_scheduler_split_mut(|sched| {
             // ── rank 1 preflight ────────────────────────────────────────────────────────────
-            if sched.current_cpu != snap.cpu {
+            if executing != snap.cpu {
                 return BlockingSendCommitOutcome::RefusedCpuMismatch {
                     requested: snap.cpu,
-                    authoritative: sched.current_cpu,
+                    authoritative: executing,
                 };
             }
             let current = kernel_ref(&sched.scheduler)
@@ -5906,7 +6016,7 @@ impl SharedKernel {
                 // runs inside the rank-1 section that validated `current` above, so the
                 // blocked-but-still-current window never exists.
                 let cleared = kernel_mut(&mut sched.scheduler).block_current_on(snap.cpu);
-                sched.timer.reset_quantum();
+                sched.reset_quantum_on(snap.cpu);
                 debug_assert_eq!(
                     cleared.map(|t| t.0),
                     Some(snap.sender_tid),
@@ -6087,24 +6197,36 @@ impl SharedKernel {
         }
         crate::yarm_log!("SCHED_WAKE_SET_RUNNABLE tid={} new_status=Runnable", tid.0);
 
+        // AP-SCHED1 — the task's HOME, fixed before the commit: its affinity, else the balanced
+        // choice recorded as its home now. The in-lock twin fell back to "this CPU" through the
+        // ambient `sched.current_cpu`, which under two dispatchers names whichever CPU last bound
+        // it.
+        let home = match state.affinity {
+            Some(pinned) => pinned,
+            None => self.fix_home_cpu_split(tid.0, cpu),
+        };
         // (5) rank 1 — the placement decision. `current_tid_on(cpu)` is the same fact
         // `current_tid()` read: the in-lock body resolved it through `current_cpu()`, which is
         // this CPU (bound in step 1, and MPIDR-derived to the same value on freestanding
         // AArch64, where `cpu` is the trapping CPU).
-        self.with_scheduler_split_mut(|sched| {
+        let committed = self.with_scheduler_split_mut(|sched| {
             let already_current = kernel_ref(&sched.scheduler)
                 .current_tid_on(cpu)
                 .is_some_and(|c| c.0 == tid.0)
                 && matches!(state.old_status, TaskStatus::Running);
             if already_current {
                 crate::yarm_log!("SCHED_WAKE_ALREADY_RUNNABLE tid={}", tid.0);
-                return Ok(());
+                return Ok(None);
             }
-            // `enqueue_woken_task`: the pinned CPU when the task has an affinity, else this CPU.
-            let (target, reason) = match state.affinity {
-                Some(pinned) => (pinned, "pinned"),
-                None => (sched.current_cpu, "current_cpu"),
-            };
+            // `enqueue_woken_task`: the task's home (AP-SCHED1, resolved above).
+            let (target, reason) = (
+                home,
+                if state.affinity.is_some() {
+                    "pinned"
+                } else {
+                    "home"
+                },
+            );
             // `enqueue_on_cpu`'s refusals, in its order: spawn reservation first, then the queue
             // primitive's own mapped error.
             if state.reserved {
@@ -6145,8 +6267,12 @@ impl SharedKernel {
                 queue_len,
                 reason
             );
-            Ok(())
-        })
+            Ok(Some(target))
+        })?;
+        if let Some(target) = committed {
+            crate::arch::hal::notify_enqueued(target);
+        }
+        Ok(())
     }
 
     /// U3 (canonical 203C) — bind this CPU as the scheduler's current CPU, as ONE rank-1
@@ -13392,17 +13518,22 @@ impl SharedKernel {
         //    Rank 2 is taken and RELEASED per task, then rank 1 is taken to commit: rank 1 is
         //    strictly last, and the two guards never overlap.
         for &(tid, _prior_affinity) in woken.iter().take(count) {
-            let Ok(plan) = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
+            let Ok(mut plan) = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
                 crate::kernel::task_enqueue::plan_balanced_enqueue_locked(tcbs, classes, tid, cpu)
             }) else {
                 continue;
             };
-            self.with_scheduler_split_mut(|sched| {
-                let _ = crate::kernel::task_enqueue::commit_enqueue_locked(
+            // AP-SCHED1: the woken task's home, then the remote half of the commit.
+            self.resolve_plan_home_split(&mut plan, cpu);
+            let committed = self.with_scheduler_split_mut(|sched| {
+                crate::kernel::task_enqueue::commit_enqueue_locked(
                     kernel_mut(&mut sched.scheduler),
                     &plan,
-                );
+                )
             });
+            if let Ok(target) = committed {
+                crate::arch::hal::notify_enqueued(target);
+            }
         }
         count as u32
     }
@@ -15512,11 +15643,19 @@ impl SharedKernel {
             // `TaskMissing` — this is `enqueue_woken_task`'s convention, not `enqueue_task`'s.
             None => TaskPriority::Normal,
         };
-        self.with_scheduler_split_mut(|sched| {
-            let cpu = affinity.unwrap_or(sched.current_cpu);
+        // AP-SCHED1: the task's home, never the ambient `sched.current_cpu`.
+        let cpu = match affinity {
+            Some(cpu) => cpu,
+            None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),
+        };
+        let enqueued = self.with_scheduler_split_mut(|sched| {
             let sm = kernel_mut(&mut sched.scheduler);
-            let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
+            sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority)
+                .is_ok()
         });
+        if enqueued {
+            crate::arch::hal::notify_enqueued(cpu);
+        }
         true
     }
 
@@ -15839,8 +15978,14 @@ impl SharedKernel {
     /// fallback. Comparing the two is therefore an apples-to-apples "was that enqueue remote?"
     /// test: an unpinned receiver enqueues onto this very CPU and compares equal, so it can never
     /// be mistaken for a remote wake.
+    ///
+    /// AP-SCHED1 §4 — "the CPU this drain is running on" is now answered by
+    /// [`Self::executing_cpu_split`]. Its callers stash per-CPU work for THIS CPU's post-lock
+    /// drainer and compare an enqueue target against it; under two dispatchers the ambient binding
+    /// names whichever CPU last bound it, which would stash a snapshot into the other CPU's cell.
+    /// On a one-dispatcher port the two answers are the same value.
     pub(crate) fn current_cpu_split_read(&self) -> CpuId {
-        self.with_scheduler_split_mut(|sched| sched.current_cpu)
+        self.executing_cpu_split()
     }
 
     /// rank 1 (scheduler lock) — how many tasks are waiting in **`cpu`'s** run queue.
@@ -15944,8 +16089,12 @@ impl SharedKernel {
         reconcile: bool,
     ) -> ReceiverEnqueue {
         use crate::kernel::ipc::ThreadId;
-        self.with_scheduler_split_mut(|sched| {
-            let cpu = affinity.unwrap_or(sched.current_cpu);
+        // AP-SCHED1: the task's home, never the ambient `sched.current_cpu`.
+        let cpu = match affinity {
+            Some(cpu) => cpu,
+            None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),
+        };
+        let outcome = self.with_scheduler_split_mut(|sched| {
             let sm = kernel_mut(&mut sched.scheduler);
             match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {
                 Ok(()) => ReceiverEnqueue::Enqueued { cpu },
@@ -15968,7 +16117,11 @@ impl SharedKernel {
                     reconciled: None,
                 },
             }
-        })
+        });
+        if matches!(outcome, ReceiverEnqueue::Enqueued { .. }) {
+            crate::arch::hal::notify_enqueued(cpu);
+        }
+        outcome
     }
 
     /// rank 1 — Stage 199D: does `tid` hold ANY scheduler membership (queued or dispatched) on
@@ -17264,17 +17417,20 @@ impl SharedKernel {
                 .find(|t| t.tid.0 == tid)
                 .and_then(|t| t.cpu_affinity)
         });
-        self.with_scheduler_split_mut(|sched| {
-            let s = kernel_mut(&mut sched.scheduler);
-            match affinity {
-                Some(cpu) => {
-                    let _ = s.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
-                }
-                None => {
-                    let _ = s.enqueue_balanced(ThreadId(tid), priority);
-                }
-            }
+        // AP-SCHED1: the task's home (its affinity, else the balanced choice fixed as its home),
+        // then the remote half of the committed enqueue.
+        let cpu = match affinity {
+            Some(cpu) => cpu,
+            None => self.fix_home_cpu_split(tid, self.executing_cpu_split()),
+        };
+        let enqueued = self.with_scheduler_split_mut(|sched| {
+            kernel_mut(&mut sched.scheduler)
+                .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
+                .is_ok()
         });
+        if enqueued {
+            crate::arch::hal::notify_enqueued(cpu);
+        }
     }
 
     /// Stage 200C1 — the NR7 reply-win deadline-disarm hook. When reply obtains
@@ -17757,7 +17913,7 @@ impl SharedKernel {
             let priority = kernel_mut(&mut sched.scheduler)
                 .block_current_exact_on(cpu, crate::kernel::ipc::ThreadId(tid));
             if priority.is_some() {
-                sched.timer.reset_quantum();
+                sched.reset_quantum_on(cpu);
             }
             priority
         });

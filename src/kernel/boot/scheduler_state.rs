@@ -611,7 +611,7 @@ impl KernelState {
     /// non-dispatching AArch64 AP.
     pub(crate) fn enqueue_task(&mut self, tid: u64) -> Result<CpuId, KernelError> {
         let current_cpu = self.current_cpu();
-        let plan = self.with_task_enqueue_policy_mut(|tcbs, classes| {
+        let mut plan = self.with_task_enqueue_policy_mut(|tcbs, classes| {
             crate::kernel::task_enqueue::plan_balanced_enqueue_locked(
                 tcbs,
                 classes,
@@ -619,6 +619,8 @@ impl KernelState {
                 current_cpu,
             )
         })?;
+        // AP-SCHED1: the same home rule as the split twin — the first placement is the home.
+        self.fix_plan_home(&mut plan, current_cpu);
         let mut sched = self.scheduler_state();
         let cpu = crate::kernel::task_enqueue::commit_enqueue_locked(
             kernel_mut(&mut sched.scheduler),
@@ -633,6 +635,31 @@ impl KernelState {
         #[cfg(target_arch = "aarch64")]
         crate::yarm_log!("AARCH64_USER_TASK_PLACEMENT_OK tid={} cpu={}", tid, cpu.0);
         Ok(cpu)
+    }
+
+    /// AP-SCHED1 — the broad twin of `SharedKernel::resolve_plan_home_split`: record the task's
+    /// home before the commit (its explicit CPU, or the scheduler's balanced choice) and resolve a
+    /// balanced plan to it.
+    fn fix_plan_home(
+        &mut self,
+        plan: &mut crate::kernel::task_enqueue::EnqueuePlan,
+        fallback: CpuId,
+    ) {
+        use crate::kernel::task_enqueue::EnqueueTarget;
+        let chosen = match plan.target {
+            EnqueueTarget::Pinned(cpu) => cpu,
+            EnqueueTarget::Balanced => self.with_scheduler_state(|sched| {
+                kernel_ref(&sched.scheduler)
+                    .balanced_choice()
+                    .unwrap_or(fallback)
+            }),
+        };
+        let tid = plan.tid;
+        let home = self
+            .with_tcbs_mut(|tcbs| crate::kernel::task_enqueue::fix_home_locked(tcbs, tid, chosen));
+        if matches!(plan.target, EnqueueTarget::Balanced) {
+            plan.target = EnqueueTarget::Pinned(home);
+        }
     }
 
     pub(crate) fn enqueue_woken_task(
@@ -652,9 +679,11 @@ impl KernelState {
     /// deliberately does NOT pin driver affinity and does NOT read `cpu_affinity` — it enqueues
     /// where it is told — so it uses `plan_pinned_enqueue_locked`, not the balanced twin.
     pub fn enqueue_on_cpu(&mut self, cpu: CpuId, tid: u64) -> Result<(), KernelError> {
-        let plan = self.with_task_enqueue_policy_mut(|tcbs, classes| {
+        let mut plan = self.with_task_enqueue_policy_mut(|tcbs, classes| {
             crate::kernel::task_enqueue::plan_pinned_enqueue_locked(tcbs, classes, tid, cpu)
         })?;
+        // AP-SCHED1: an explicit placement is the home of a task that has none.
+        self.fix_plan_home(&mut plan, cpu);
         let current_cpu = self.current_cpu();
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(

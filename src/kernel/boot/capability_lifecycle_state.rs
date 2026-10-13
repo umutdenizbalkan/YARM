@@ -1282,9 +1282,12 @@ impl crate::runtime::SharedKernel {
     ) -> bool {
         use crate::kernel::task::{TaskStatus, WaitReason};
         let tid = record.receiver.tid.0;
-        // Phase 1 (rank 1): the CPU the driver pin would use, read and released before the task
-        // domain is entered.
-        let current_cpu = self.with_scheduler_split_mut(|sched| sched.current_cpu);
+        // Phase 1: the CPU the driver pin would use. AP-SCHED1: not the AMBIENT
+        // `sched.current_cpu` (under two dispatchers it names whichever CPU last bound it) — the
+        // boot CPU, the only CPU external interrupts are routed to in this increment, which is the
+        // CPU a driver's device belongs to.
+        let current_cpu =
+            crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
         // Phase 2 (rank 2): the Blocked-only transition and the placement plan, one acquisition.
         let plan = self.with_task_enqueue_policy_split_mut(|tcbs, classes| {
             let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
@@ -1309,16 +1312,21 @@ impl crate::runtime::SharedKernel {
             )
             .ok()
         });
-        let Some(plan) = plan else {
+        let Some(mut plan) = plan else {
             return false;
         };
-        // Phase 3 (rank 1): the shared committer.
-        self.with_scheduler_split_mut(|sched| {
-            let _ = crate::kernel::task_enqueue::commit_enqueue_locked(
+        // AP-SCHED1: the task's home, fixed before the commit.
+        self.resolve_plan_home_split(&mut plan, current_cpu);
+        // Phase 3 (rank 1): the shared committer, then the remote half of the commit.
+        let committed = self.with_scheduler_split_mut(|sched| {
+            crate::kernel::task_enqueue::commit_enqueue_locked(
                 kernel_mut(&mut sched.scheduler),
                 &plan,
-            );
+            )
         });
+        if let Ok(target) = committed {
+            crate::arch::hal::notify_enqueued(target);
+        }
         true
     }
 

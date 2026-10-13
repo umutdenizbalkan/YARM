@@ -87,6 +87,99 @@ pub(crate) fn address_space_loaded_bitmap(asid: Asid) -> u64 {
     bitmap
 }
 
+/// AP-SCHED1 §3 — `cpu` has LEFT every user address space: its hardware now translates through the
+/// kernel's own space, which holds no user root at all. Called only after that change is complete
+/// (the root write AND the invalidation that retires every earlier tenant's translations), so a
+/// teardown that reads this record and sees nothing loaded may free the old root.
+///
+/// The record is never cleared on its own: clearing it while a user root is still loaded would
+/// let a teardown free a root this CPU still translates through. [`leave_user_root`] is the one
+/// caller, and it clears only behind the hardware change.
+fn note_user_root_released(cpu: CpuId) {
+    let idx = cpu.0 as usize;
+    if idx < crate::kernel::scheduler::MAX_CPUS {
+        ACTIVE_ASID[idx].store(u32::MAX, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// AP-SCHED1 §3 — THE architecture-owned transition from a user root to the kernel's own address
+/// space, for an idle arrival and for a self-exit before it becomes observable.
+///
+/// * RISC-V: the kernel space is Bare translation (`satp = 0`) — the space the boot hart runs
+///   before its first user entry and every secondary runs from bring-up. It has no page tables,
+///   so a teardown can free nothing it walks. `csrw satp, zero` then `sfence.vma zero, zero`
+///   retires every translation of the space being left, and only then is the record released.
+///   Every resume to U-mode rewrites `satp` (and fences), so leaving the user root anywhere in
+///   kernel context is safe even when the task later resumes.
+/// * x86_64 / AArch64: no transition (their admitted policy is unchanged: user tasks run on the
+///   boot CPU only), so the record is NOT touched — the root stays loaded and recorded.
+/// * hosted: models the selected configuration's record protocol (no hardware to switch).
+///
+/// Returns `true` when the CPU left its user root.
+pub(crate) fn leave_user_root(cpu: CpuId) -> bool {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    {
+        crate::arch::riscv64::page_table::enter_bare_kernel_space();
+        note_user_root_released(cpu);
+        true
+    }
+    #[cfg(feature = "hosted-dev")]
+    {
+        note_user_root_released(cpu);
+        true
+    }
+    #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "riscv64")))]
+    {
+        let _ = cpu;
+        false
+    }
+}
+
+/// AP-SCHED1 — the REMOTE half of an enqueue already COMMITTED on `target`'s run queue: when the
+/// CPU executing this is not `target`, interrupt `target` so it looks at its queue. Called by every
+/// production enqueue owner after its rank-1 commit, with no domain lock held.
+///
+/// * RISC-V: the executing CPU is derived from the trap stack this code runs on (the trap bridge's
+///   own authority, `riscv_executing_cpu`), and the reschedule IPI is the existing publication-
+///   before-notification owner, which refuses (sending nothing) a target that is not a published
+///   IPI target — a wake-only CPU, or one not yet admitted.
+/// * x86_64 / AArch64: nothing here — their user tasks run on the boot CPU only; their existing
+///   remote senders (the NR 6 / NR 7 direct drains, under the diagnostic knob) are unchanged.
+/// * hosted: counted per target, so the suite can prove every enqueue owner reaches this.
+pub(crate) fn notify_enqueued(target: CpuId) {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    {
+        let me = crate::arch::riscv64::boot::riscv_executing_cpu();
+        if me != target {
+            let _ = crate::arch::riscv64::ipi::send_reschedule(me, target);
+        }
+    }
+    #[cfg(feature = "hosted-dev")]
+    {
+        if let Some(n) = NOTIFIED.get(target.0 as usize) {
+            n.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "riscv64")))]
+    {
+        let _ = target;
+    }
+}
+
+/// Hosted: how many committed enqueues were announced to each target CPU.
+#[cfg(feature = "hosted-dev")]
+static NOTIFIED: [core::sync::atomic::AtomicU64; crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Hosted: the announcement count for `cpu` (see [`notify_enqueued`]).
+#[cfg(feature = "hosted-dev")]
+#[allow(dead_code)]
+pub(crate) fn enqueues_notified(cpu: CpuId) -> u64 {
+    NOTIFIED
+        .get(cpu.0 as usize)
+        .map_or(0, |n| n.load(core::sync::atomic::Ordering::Acquire))
+}
+
 /// Clear one CPU's activation record. Test-support and boot-reset only.
 // Reachable from the tests below and from a boot reset; a plain hosted `lib` build compiles no
 // route to it, exactly like the sibling `*_from_raw` domain projectors.

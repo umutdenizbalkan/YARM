@@ -603,8 +603,66 @@ pub(crate) struct BootConfigSubsystem {
 #[derive(Debug)]
 pub(crate) struct SchedulerState {
     pub(crate) scheduler: KernelStorage<SmpScheduler>,
+    /// The CLOCK OWNER's timer: the monotonic scheduler tick every deadline is armed against and
+    /// compared with, and the clock owner's own quantum. Only the clock owner's timer interrupts
+    /// advance it (AP-SCHED1), so adding a CPU never multiplies timeout progression.
     pub(crate) timer: Timer,
+    /// AP-SCHED1 — every other CPU's own quantum budget. Index [`CLOCK_OWNER_CPU`] is unused (the
+    /// clock owner's quantum is `timer`'s); each entry's own counter is a per-CPU interrupt count
+    /// and is never read as time.
+    pub(crate) ap_quanta: [Timer; crate::kernel::scheduler::MAX_CPUS],
     pub(crate) current_cpu: CpuId,
+}
+
+/// AP-SCHED1 — the one CPU whose timer interrupts advance the scheduler tick: the boot CPU, whose
+/// periodic timer runs from the boot safe point and keeps running through idle on every port.
+pub(crate) const CLOCK_OWNER_CPU: CpuId = CpuId(platform_constants::BOOTSTRAP_CPU_ID);
+
+impl SchedulerState {
+    fn quantum_of(&self, cpu: CpuId) -> &Timer {
+        match self.ap_quanta.get(cpu.0 as usize) {
+            Some(q) if cpu != CLOCK_OWNER_CPU => q,
+            _ => &self.timer,
+        }
+    }
+
+    fn quantum_of_mut(&mut self, cpu: CpuId) -> &mut Timer {
+        if cpu != CLOCK_OWNER_CPU && (cpu.0 as usize) < self.ap_quanta.len() {
+            &mut self.ap_quanta[cpu.0 as usize]
+        } else {
+            &mut self.timer
+        }
+    }
+
+    /// One timer interrupt on `cpu`. The clock owner advances the scheduler tick and consumes its
+    /// own quantum; any other CPU consumes ONLY its own quantum and reads the tick unchanged.
+    /// Returns `(scheduler tick, this CPU's quantum expired)`.
+    pub(crate) fn tick_on(&mut self, cpu: CpuId) -> (crate::kernel::time::Tick, bool) {
+        if cpu == CLOCK_OWNER_CPU || (cpu.0 as usize) >= self.ap_quanta.len() {
+            return self.timer.tick_and_check();
+        }
+        let (_, expired) = self.ap_quanta[cpu.0 as usize].tick_and_check();
+        (self.timer.current_ticks(), expired)
+    }
+
+    /// Would `cpu`'s NEXT timer interrupt expire its quantum? See [`Timer::would_preempt_next`].
+    pub(crate) fn would_preempt_next_on(&self, cpu: CpuId) -> bool {
+        self.quantum_of(cpu).would_preempt_next()
+    }
+
+    /// A voluntary switch on `cpu`: the next task there starts with a full quantum.
+    pub(crate) fn reset_quantum_on(&mut self, cpu: CpuId) {
+        self.quantum_of_mut(cpu).reset_quantum();
+    }
+
+    /// Install `quantum_ticks` on every CPU's quantum, the clock owner's included. The clock's
+    /// tick count is untouched (see [`Timer::set_quantum`]).
+    pub(crate) fn set_quantum_all(&mut self, quantum_ticks: u64) {
+        self.timer.set_quantum(quantum_ticks);
+        for q in &mut self.ap_quanta {
+            q.set_quantum(quantum_ticks);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

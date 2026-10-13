@@ -613,6 +613,8 @@ impl Bootstrap {
                 SchedulerState {
                     scheduler: store_kernel_value(scheduler),
                     timer: Timer::new(crate::kernel::boot::sched_quantum_ticks()),
+                    ap_quanta: [Timer::new(crate::kernel::boot::sched_quantum_ticks());
+                        crate::kernel::scheduler::MAX_CPUS],
                     current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
                 },
             ));
