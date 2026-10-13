@@ -206,8 +206,15 @@ pub(crate) trait YieldOwners {
 /// * **AArch64** (Stage 195G) — no knob, bootstrap CPU only, refuses while a Yield deferral is
 ///   already pending.
 /// * **RISC-V** (Stage 196G) — no knob, refuses while a Yield, FutexWait **or** 196D foundation
-///   deferral is pending, because all three are drained by the same tail. AP-SCHED1: on any
-///   dispatching CPU, not only the bootstrap one (see the body).
+///   deferral is pending, because all three are drained by the same tail.
+///
+/// AP-SCHED1 §4 — the bootstrap-CPU requirement is AArch64's alone now. It was RISC-V's too
+/// because only the boot hart ever ran user tasks; RISC-V's logical CPU 1 is now a production
+/// dispatcher, and its timer preemption arrives here. Nothing this transaction or its drain does
+/// is the boot CPU's: the reservation and the collision test are `cpu`'s own deferral cells, the
+/// re-enqueue is `preempt_reenqueue_only_on(cpu)`, and the RISC-V Yield drain selects through the
+/// trap's own `DispatchAuthority`. Keeping the requirement would leave every non-yielding task on
+/// CPU 1 unpreemptible.
 ///
 /// The trap-drainer and single-dispatcher conditions are deliberately NOT here: they belong to the
 /// queue-advance admission, which owns them for every queue-advancing route.
@@ -223,14 +230,7 @@ pub(crate) fn yield_deferral_arch_gate<O: YieldOwners>(
     // the one-shot proof had finished — and could not see an ordinary queue-advance deferral at
     // all. The real ownership token is the switch-plan stash, and `colliding_deferral_pending`
     // below now tests it, which makes the collision a `DeferralHeld` decline about THIS trap.
-    //
-    // AP-SCHED1 §4 — the bootstrap-CPU requirement is AArch64's alone now. It was RISC-V's too
-    // because only the boot hart ever ran user tasks; RISC-V's logical CPU 1 is now a production
-    // dispatcher, and its timer preemption arrives here. Nothing this transaction or its drain
-    // does is the boot CPU's: the reservation and the collision test are `cpu`'s own deferral
-    // cells, the re-enqueue is `preempt_reenqueue_only_on(cpu)`, and the RISC-V Yield drain selects
-    // through the trap's own `DispatchAuthority`. Keeping the requirement would leave every
-    // non-yielding task on CPU 1 unpreemptible.
+    // AP-SCHED1 §4: AArch64's alone (see the doc above).
     #[cfg(target_arch = "aarch64")]
     {
         if !owners.is_bootstrap_cpu(cpu) {
