@@ -28669,3 +28669,46 @@ all stand.
 
 With the same harness applied to the repaired tree, no wake landed during publication (each
 harness wait expired at its bound), and all four rounds were held with their GO generations.
+
+#### §1 final-candidate controls
+
+Applied to the frozen candidate `04f67ce5`, in a reset worktree:
+
+* *Grader fixtures*: 27 of 27 as expected. The self-test runs before every grading, so a grader
+  that stopped rejecting any of these shapes would fail its own boot.
+* *Overtaken witness, the publication-window harness applied to the candidate*: no wake landed
+  during publication (each harness wait expired at its bound), and the boot passed with four held
+  rounds.
+* *The same harness with K's GO wait reverted*: `result=fail`, `held 0 of 4 rounds`,
+  `round 1: no GO for wait generation 1`. The defect returns, and the grader names the missing
+  premise.
+* *SRR witness, the install naming the wrong requester (CPU 1)*: `result=fail`. The grader reports
+  CPU 1 missing from the target set, the requester targeting itself, the fence's hart mask, the
+  observer's stale byte (`O_STALE`), and the kernel's own verdict disagreeing.
+
+#### §1 qualification
+
+**Candidate frozen at `04f67ce5` (tree `fac18ba4`); base `a72c69a7`.** Every gate ran once and
+nothing was replaced. Each live run is bound to its commit, features and artifact hashes; the
+pinned OpenSBI v1.3 was `171a91cc…` and QEMU 8.2.2.
+
+* *Hosted:*
+  * focused (the witness, SMP3, VMI and shared-region groups): 81/81;
+  * full suite: 6,093 passed, 2 ignored;
+  * integration: 308/308 in 32 suites;
+  * broad-lock census guard: 17/17, and every production census count is identical to the base;
+  * `cargo fmt --check`: clean.
+* *Warnings, against a fresh base build:*
+  * the default kernels (178 / 205 / 188) have identical classes;
+  * so do all seven witness-feature kernels: both overtaken witnesses, SMP1, SMP2, SMP3, SRR and
+    VMI.
+* *Strict cores:* x86_64 (timer-contract-witness profile), AArch64 and RISC-V all passed.
+* *The repaired cells, a fixed sample of three idle-host then two loaded-host boots each*
+  (loaded: four busy loops on the host's four CPUs): all 15 boots `result=ok`.
+  * SRR: in both loaded boots O's observation was stamped between CPU 0's fence request and its
+    completion (`seq` 5 or 6, fence 4…5 or 6, outcome 7), and printed first. That is the
+    legitimate reversed order, graded causally.
+  * x86_64 overtaken: four held rounds every time, each with GO generations 1–4.
+  * AArch64 overtaken: four held rounds every time, each with GO generations 1–4.
+* *Witnesses sharing the changed hooks:* SMP3 and VMI (the RISC-V fence-request hook), SMP1 and
+  SMP2 — all `result=ok`.
