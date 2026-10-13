@@ -200169,6 +200169,20 @@ mod vm_invalidation1 {
                 "x86 AP: every user CR3 load is recorded after it"
             );
         }
+        // The RISC-V direct dispatch writes `satp` itself (the HAL switch defers RISC-V paging),
+        // so it records after that write, not after the switch.
+        let runtime = flat_code(include_str!("../../runtime.rs"));
+        let satp = runtime
+            .matches("crate::arch::riscv64::page_table::write_satp(satp);")
+            .count();
+        assert!(satp >= 1, "the RISC-V direct dispatch loads its root");
+        assert_eq!(
+            runtime
+                .matches("crate::arch::riscv64::page_table::write_satp(satp); crate::arch::hal::note_address_space_activated(cpu, asid);")
+                .count(),
+            satp,
+            "runtime.rs: every RISC-V root load is recorded after it"
+        );
         let rv = flat_code(include_str!("../../arch/riscv64/boot.rs"));
         let loads = rv
             .matches("crate::arch::riscv64::page_table::write_satp(satp); crate::arch::hal::note_address_space_activated(cpu, asid);")

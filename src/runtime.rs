@@ -4946,6 +4946,8 @@ impl SharedKernel {
             let _ = crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
             let satp = crate::arch::riscv64::page_table::cr3_for_asid(asid)?;
             crate::arch::riscv64::page_table::write_satp(satp);
+            // VM-INVALIDATION1: recorded after the load, like every activation.
+            crate::arch::hal::note_address_space_activated(cpu, asid);
         }
         #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
         if crate::arch::hal_adapters::switch_address_space(asid) {
