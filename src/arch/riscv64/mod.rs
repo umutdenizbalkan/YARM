@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[cfg(all(
+    feature = "riscv64-apsched-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "riscv64"
+))]
+pub mod apsched_witness;
 pub mod boot;
 pub mod console;
 pub mod context_switch;

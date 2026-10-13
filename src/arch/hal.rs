@@ -119,8 +119,13 @@ fn note_user_root_released(cpu: CpuId) {
 pub(crate) fn leave_user_root(cpu: CpuId) -> bool {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     {
+        // AP-SCHED1 witness: which root this CPU is leaving (observation only).
+        #[cfg(feature = "riscv64-apsched-witness")]
+        let leaving = active_address_space(cpu);
         crate::arch::riscv64::page_table::enter_bare_kernel_space();
         note_user_root_released(cpu);
+        #[cfg(feature = "riscv64-apsched-witness")]
+        crate::arch::riscv64::apsched_witness::note_root_left(cpu, leaving);
         true
     }
     #[cfg(feature = "hosted-dev")]
@@ -165,6 +170,12 @@ pub(crate) fn notify_enqueued(target: CpuId) {
         let _ = target;
     }
 }
+
+/// AP-SCHED1 — does [`notify_enqueued`] announce a remote enqueue on this build? Where it does, an
+/// owner may place a task on another CPU and rely on that CPU being told; where it does not, the
+/// owners that pin to the current CPU for exactly that reason (the fork child) keep doing so.
+pub(crate) const REMOTE_ENQUEUE_NOTIFIED: bool =
+    cfg!(all(not(feature = "hosted-dev"), target_arch = "riscv64"));
 
 /// Hosted: how many committed enqueues were announced to each target CPU.
 #[cfg(feature = "hosted-dev")]

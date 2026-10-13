@@ -28712,3 +28712,188 @@ pinned OpenSBI v1.3 was `171a91cc…` and QEMU 8.2.2.
   * AArch64 overtaken: four held rounds every time, each with GO generations 1–4.
 * *Witnesses sharing the changed hooks:* SMP3 and VMI (the RISC-V fence-request hook), SMP1 and
   SMP2 — all `result=ok`.
+
+### §2 — the first production scheduling boundary
+
+#### Readiness, from the owners
+
+Each row is what the delivered tree's own owner does on each port, for a second CPU that would run
+ordinary user tasks.
+
+| Contract | x86_64 | AArch64 | RISC-V |
+|---|---|---|---|
+| Logical ↔ hardware identity | APIC id table | MPIDR table | hart ↔ CPU claimed and validated at bring-up (`claim_logical_cpu_id_for_hart`); duplicates refused |
+| Private stacks, trap state, return frame | per-AP trap stack | per-CPU exception stack | per-hart trap stack via `sscratch`; CPU 1 alone has a dispatch-sized one (`RISCV64_CPU1_TRAP_STACK`) |
+| FP / SIMD | live XSAVE state with an FPU home per task | live FP/SIMD (CPACR.FPEN) per task | **none to own**: user `FS`/`VS` forced Off (`sanitize_user_sstatus`) |
+| Activation | PCID; no-flush hint never composed | TTBR0 with non-flushing ASID switch | every user resume writes `satp` and fences; the kernel's own space is Bare (`satp = 0`) |
+| Interrupt controller and remote wake | LAPIC IPI; sent only by the NR 6/7 direct drains under the knob | GIC SGI; same | SBI IPI with publication before notification; same senders only |
+| AP timer and preemption | none (BSP timer only) | none ("APs do NOT arm a timer") | none: boot hart only by design |
+| Placement and dispatch authority | knob-gated `try_enable_ap_user_dispatch` | pinned diagnostic admission | pinned diagnostic admission (`balance_excluded`) |
+| Idle root | retains the last user root | same | same |
+| Global time | one `sched.timer`, tick and quantum together | same | same |
+| Exit route | ambient-bound: refuses on a second dispatcher | same | same |
+
+**Selected: RISC-V, logical CPUs 0 and 1** (QEMU virt `-smp 2`, the pinned OpenSBI v1.3). It is
+the port with no FP/SIMD state to own and a flushing activation, and CPU 1 already has a
+dispatch-sized trap stack, validated identity, publication-before-notification IPIs, and a Bare
+kernel space. Its gaps were the same on every port: no AP timer, IPIs from only two drains,
+diagnostic placement, the idle root, one shared timer, and an ambient-bound exit. AP-SCHED1 closes
+those for RISC-V CPU 1 and nothing else. x86_64 and AArch64 keep their admitted policy, user tasks
+on the boot CPU only, with every owner they share unchanged in behavior there. RISC-V CPUs 2 and
+beyond stay parked, wake-only and masked, and are reported quiescent
+(`RISCV_AP_QUIESCENT cpu=N reason=outside_production_dispatch_set`).
+
+#### Execution contexts
+
+* **Admitted: user tasks**, including the kernel work of their syscalls, traps and timer
+  settlements on whichever CPU they run. Every such kernel path runs inside a trap of the task's
+  CPU, with that trap's own authority.
+* **Not admitted: independent kernel threads.** None exists in production. TID 0 is the idle
+  sentinel, not a schedulable thread, and the D6 kernel-switch trampoline is an x86_64 proof. The
+  prerequisite for admitting one is an owner for a kernel-mode schedulable context: its own stack
+  and switch frame, a preemption convention for kernel mode (every RISC-V S-mode region but the
+  idle `wfi` runs with `SIE` clear), and placement rules. No such owner exists, so none is
+  scheduled.
+
+No migration, work stealing, larger topology or driver work is part of this increment.
+
+### §3 — idle CPUs leave the user root
+
+**The defect.** An idle CPU kept the last user root loaded and recorded in the activation record.
+VMI1's loaded-root teardown gate then had to quarantine any exited process whose root an idle CPU
+still held: the healthy path grew quarantine.
+
+**The repair.** `hal::leave_user_root(cpu)` is the arch-owned transition to the kernel's own space:
+
+* *RISC-V:* `enter_bare_kernel_space` writes `satp = 0` and then runs `sfence.vma zero, zero`, and
+  only after that is the CPU's activation record released. No ASID is fabricated.
+* *x86_64 / AArch64:* nothing changes. Their idle CPU is the boot CPU, and it keeps its root
+  exactly as before.
+
+It is called at every RISC-V idle arrival (the typed idle arrival, the secondary's first idle and
+its production admission). The split exit calls it too, between `clear_current_exact` and the
+claim — the point after which a reaper can see the exit — so an exiting task's root is gone from
+its CPU before anything can reap it. The teardown/reactivation exclusion is unchanged: activation
+still records before loading, and VMI1's quarantine still holds a space whose invalidation is
+genuinely incomplete. Nothing is reclaimed on a timeout. Under Bare translation the device-window
+check (`device_pa_reachable`) answers by physical address for a registered window page.
+
+**Evidence.**
+
+* *Hosted, the production NR 31 reap after each exit → idle on CPU 1:*
+  * eight rounds reclaim every space, root and frame, and the frame count returns exactly;
+  * with the idle handoff skipped, every round is quarantined;
+  * the record is released only behind the hardware change.
+* *Image:* `check-vm-invalidation-sequence.sh` requires every `csrw satp, <reg>` — the new
+  `csrw satp, zero` included — to be followed immediately by `sfence.vma zero, zero`.
+
+### §4 — production dispatch on RISC-V CPU 1
+
+#### Admission, last
+
+Without the knob, the boot hart releases only CPU 1 (`release_set`), and the release is per CPU.
+A parked hart leaves the park only on its own released bit: `wfi` may return for any reason, and a
+global flag would let an unreleased hart follow a released one out. CPU 1 then, in order:
+
+1. leaves the user root;
+2. arms its own periodic timer (`arm_secondary_timer`: SBI deadline, then `sie.STIE`; `sstatus.SIE`
+   untouched);
+3. publishes its idle wake source, then itself as a reschedule-IPI target;
+4. takes the scheduler's ONE transition (`admit_dispatch`): out of wake-only, idle placeholder
+   cleared, and — unlike the diagnostic `admit_pinned_dispatch` — eligible for balanced placement.
+
+A refusal at (2) or (4) leaves it wake-only with every enable bit cleared. With the knob, the
+diagnostic pinned path runs unchanged.
+
+#### The owners it needed
+
+* **Placement and home.** A task's first placement fixes its home, and every later enqueue of it —
+  a wake, a requeue, a timeout — targets that home. Nothing migrates. Unhomed wakes take the
+  executing CPU, never the ambient `sched.current_cpu`. Fork children are placed by balance where
+  every remote enqueue is announced (RISC-V), and on the parent's CPU where none is (unchanged).
+* **Remote wake.** Every production enqueue owner commits, then calls `hal::notify_enqueued(target)`
+  with no lock held. That sends the existing reschedule IPI when the executing CPU is not the
+  target, and the IPI owner refuses a target that has not published readiness. The audited owners
+  are:
+  * IPC: send wake, committed receiver, reply-timeout wake;
+  * futex wake;
+  * timeouts;
+  * lifecycle: spawn, the exit's joiners, the capability notification wake.
+* **Time.** The scheduler tick that every deadline is armed against advances on the clock owner
+  (CPU 0) alone. Every other CPU's interrupts consume only its own quantum (`ap_quanta`), so
+  adding a CPU cannot multiply timeout progression.
+* **Preemption on CPU 1.** The yield transaction's bootstrap-CPU gate is AArch64's alone now.
+  Everything the transaction and RISC-V's drain touch is the trapping CPU's own: its deferral
+  cells, `preempt_reenqueue_only_on(cpu)`, and an authority-bound selection.
+* **Tickless idle AP.** An idle AP parks its timer behind a one-second backstop and restores its
+  period when it leaves idle. Without this, CPU 1's idle ticks alone slowed the two-CPU core boot
+  past its 30-second budget (both vCPU threads at ~70% host CPU). The backstop bounds how long an
+  idle AP can miss work whose notification failed.
+* **Authority, not ambience.**
+  * The exit route is authority-bound: its drains authenticate the trap and every owner it calls
+    names its CPU.
+  * The blocking-send commit and the blocked-waiter delivery producers name the executing CPU:
+    they stash per-CPU work for THIS CPU's drain.
+* **A two-CPU IPC race, found live and fixed.** A recv-v2 receiver can publish itself on one CPU
+  between a send's waiter check and its enqueue on the other, after which the send's post-enqueue
+  wake finds it. That wake was built for legacy waiters, which re-run their receive. A recv-v2
+  waiter resumes after its `ecall`, and returned its own capability number as the result; the
+  witness's ping-pong desynchronized and hung. The wake now publishes the canonical `WouldBlock`
+  into such a waiter's saved context first, through the one remote-completion owner, keyed on its
+  exact incarnation. That is the receive's existing "nothing yet" answer, and the user runtime
+  receives again. On one CPU no recv-v2 waiter reaches this wake.
+
+### §5 — evidence
+
+#### Deterministic (hosted)
+
+* *Timer accounting:* fifteen interrupts across two CPUs advance five ticks, and CPU 1 expires its
+  own quantum without moving the clock.
+* *Readiness and publication:* a wake-only AP is never chosen and refuses work; admission opens
+  both, once.
+* *Exact continuation and home:* a cross-CPU wake goes to the task's home and notifies it once.
+* *Wake versus idle entry:* both orders deliver the source.
+* *Notification audit:* every production enqueue commit site is followed by its notification.
+* *Exit/reap versus activation:* the §3 churn tests.
+* *The rest:*
+  * the release set and the per-CPU park release;
+  * the tickless park and its backstop;
+  * the undelivered recv-v2 waiter (`WouldBlock`) and the legacy waiter (untouched);
+  * the re-derived exit-admission and RISC-V release guards.
+
+#### Live: `scripts/qemu-riscv64-apsched-witness-smoke.sh` (feature `riscv64-apsched-witness`)
+
+One App-class process P on a `-smp 2` boot **without** the knob. Its threads (NR 11) and fork
+children (NR 12) are placed by the production policy; the witness pins nothing and fixes no
+identity but P's. The kernel side:
+
+* *keeps* a stamped record, dumped at P's end with every line twice and a CRC. Only verified lines
+  count, because the harts' console output interleaves;
+* *publishes* observation words P waits on instead of delays: CPU 1 admitted, preemptions per CPU,
+  CPU 1 idle;
+* *reaps* each churn child through the production NR 31 transaction, standing in for PM, whose
+  only reaping is supervisor restarts.
+
+The grader (`scripts/grade-riscv64-apsched-witness.py`, with a 21-case `--self-test` that runs
+before every grading) requires:
+
+* **admission** — CPU 1's production admission record, and no diagnostic-path marker;
+* **placement** — P on CPU 0; spinners started on both CPUs; the sleeper, the IPC thread and every
+  churn child on CPU 1;
+* **preemption** — every spinner on CPU 1 preempted there by CPU 1's own timer, at least six such
+  preemptions, and every spinner finishing on the CPU it started on with all 28 patterned
+  registers (x1, x3…x29) intact. There is no flags register on RISC-V and no user FP/SIMD state to
+  preserve: `FS`/`VS` are Off;
+* **time** — a deadline receive on CPU 1 times out (9) with the tick advance over its window
+  EQUAL to CPU 0's timer interrupts in it, while CPU 1 took interrupts of its own;
+* **idle wake** — five rounds, each in stamp order:
+  1. CPU 1 idle;
+  2. P stores the word and wakes;
+  3. an IPI from CPU 0 is taken at CPU 1's idle boundary;
+  4. CPU 1 leaves idle for the sleeper by that IPI;
+  5. the sleeper acknowledges on CPU 1, and exactly one waiter was woken;
+* **IPC** — six ping-pong rounds intact across the CPUs, in order;
+* **exit/reap** — six fork children run on CPU 1. CPU 1 leaves each child's root (recorded from the
+  resulting `satp == 0` and an empty activation record), and only then is the child reaped, with
+  its address space destroyed and none quarantined;
+* **progress** — P's end, no failure step, a complete dump.

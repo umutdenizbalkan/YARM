@@ -424,6 +424,12 @@ pub fn idle_wait_loop(cpu: usize) -> ! {
     // the unmask, because `set_sstatus_sie_in_wfi_loop` is itself the wait and never returns.
     #[cfg(feature = "riscv64-smp3-witness")]
     crate::arch::riscv64::smp3_witness::note_idle_reached(cpu);
+    #[cfg(all(
+        feature = "riscv64-apsched-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "riscv64"
+    ))]
+    crate::arch::riscv64::apsched_witness::note_idle_reached(cpu);
     if IDLE_UNMASK_REQUESTED
         .get(cpu)
         .is_some_and(|flag| flag.swap(false, Ordering::AcqRel))
@@ -824,6 +830,28 @@ mod tests {
         assert_eq!(rearm_count(), before + 2, "a running AP re-arms its period");
         assert!(!ap_timer_parked(AP));
         STIE_ENABLED_ON[AP].store(false, Ordering::Release);
+    }
+
+    /// AP-SCHED1 — the AP's own arm keeps the boot arm's order, which QEMU cannot distinguish: the
+    /// deadline is programmed BEFORE `sie.STIE` is set (so the enable bit is never set with no
+    /// deadline behind it), `sstatus.SIE` is never touched, and the per-CPU fact is published last.
+    #[test]
+    fn the_ap_timer_arm_programs_the_deadline_before_enabling_it() {
+        let src = include_str!("timer.rs");
+        let body = src
+            .split("pub fn arm_secondary_timer(cpu: usize) -> bool {")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let deadline = body.find("sbi_set_timer(deadline);").expect("deadline");
+        let enable = body.find("set_sie_stie();").expect("enable");
+        let publish = body
+            .find("STIE_ENABLED_ON[cpu].store(true, Ordering::Release);")
+            .expect("publish");
+        assert!(deadline < enable && enable < publish);
+        assert!(!body.contains("csrs sstatus") && !body.contains("set_sstatus_sie"));
     }
 
     /// AP-SCHED1 — every idle arrival on an AP with its own timer parks it; the boot hart's does not.

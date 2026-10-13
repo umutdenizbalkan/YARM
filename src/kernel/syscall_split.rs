@@ -5128,12 +5128,14 @@ impl TimerSettlement {
 /// trap the D6 proof published on, and the proof is one-shot: the next tick finds the stash
 /// empty, the transaction is admitted, and the preemption happens one tick later.
 ///
-/// On AArch64 and RISC-V the gate is still `!is_bootstrap_cpu(cpu)`, and it is still UNREACHABLE
-/// for a timer: no AP arms a timer on either port. `start_bsp_periodic_timer` programs only the
-/// bootstrap CPU, `yarm_aarch64_secondary_cpu_boot` records that "APs do NOT arm a timer" because
-/// `SchedulerState.timer` is one shared counter, and RISC-V parks its secondary harts outright.
-/// Measured rather than inferred: in the x86_64 `-smp 2` AP profile every `TIMER_SPLIT_*` marker
-/// carries `cpu=0`.
+/// On AArch64 the gate is still `!is_bootstrap_cpu(cpu)`, and it is still UNREACHABLE for a
+/// timer: no AArch64 AP arms a timer. `start_bsp_periodic_timer` programs only the bootstrap CPU
+/// and `yarm_aarch64_secondary_cpu_boot` records that "APs do NOT arm a timer". Measured rather
+/// than inferred: in the x86_64 `-smp 2` AP profile every `TIMER_SPLIT_*` marker carries `cpu=0`.
+///
+/// AP-SCHED1 §4: RISC-V no longer has the gate. Its production-admitted CPU 1 arms its own timer
+/// and consumes its own quantum (`SchedulerState::tick_on`), and its expiry is a preemption this
+/// settlement commits on CPU 1 exactly as on CPU 0.
 ///
 /// # What is still handed away
 ///
@@ -5168,6 +5170,12 @@ fn settle_recognized_timer(
     //
     // One acquisition, which both advances the quantum and reports whether this interrupt
     // preempts. Nothing else in this body reads the quantum, so nothing can disagree with it.
+    #[cfg(all(
+        feature = "riscv64-apsched-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "riscv64"
+    ))]
+    crate::arch::riscv64::apsched_witness::note_timer_irq(cpu);
     let ticked = shared.scheduler_tick_split_mut(cpu);
     let (tick, preempting) = match ticked {
         crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => (tick, true),
@@ -5251,6 +5259,12 @@ fn settle_recognized_timer(
                 tick,
                 preempted.outgoing
             );
+            #[cfg(all(
+                feature = "riscv64-apsched-witness",
+                not(feature = "hosted-dev"),
+                target_arch = "riscv64"
+            ))]
+            crate::arch::riscv64::apsched_witness::note_preempt(shared, cpu, preempted.outgoing);
             TimerSettlement::QueueAdvanceCommitted
         }
         // A PREEMPTING TICK WITH NOTHING TO PREEMPT — the dominant live population.
@@ -6228,6 +6242,21 @@ fn try_split_debug_log_into_frame(
                 target_arch = "riscv64"
             ))]
             crate::arch::riscv64::smp3_witness::observe_user_marker(
+                cpu,
+                tid,
+                asid,
+                msg,
+                frame.arg(2) as u64,
+                frame.arg(3) as u64,
+            );
+            // AP-SCHED1: the production AP-scheduling witness's steps (and its reaper).
+            #[cfg(all(
+                feature = "riscv64-apsched-witness",
+                not(feature = "hosted-dev"),
+                target_arch = "riscv64"
+            ))]
+            let _ = crate::arch::riscv64::apsched_witness::observe_user_marker(
+                shared,
                 cpu,
                 tid,
                 asid,

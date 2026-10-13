@@ -390,13 +390,26 @@ pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(
 
     // ── 8. The enqueue, rank 1 and last. ───────────────────────────────────────────────
     //
-    // On the CURRENT CPU deliberately: a balanced placement puts the child on the least-loaded
-    // CPU, and when the parent then blocks, the local CPU idles and nothing wakes the child on the
-    // remote one. Same CPU as the parent means the same run queue and the next dispatch picks it
-    // up. This is the one arm whose inverse must undo a PUBLISHED task, which is why the
-    // publication records what it needs to be reversible.
-    let cpu = owners.current_cpu();
-    if let Err(err) = owners.enqueue_on_cpu(cpu, child_tid) {
+    // On the CURRENT CPU deliberately where a remote enqueue is not announced: a balanced
+    // placement puts the child on the least-loaded CPU, and when the parent then blocks, the local
+    // CPU idles and nothing wakes the child on the remote one. Same CPU as the parent means the
+    // same run queue and the next dispatch picks it up.
+    //
+    // AP-SCHED1 §4 — where every committed enqueue IS announced to its target
+    // (`hal::REMOTE_ENQUEUE_NOTIFIED`: RISC-V), that reason is gone, and the child takes the same
+    // balanced placement as any other spawned task. On a one-dispatcher boot the balanced choice
+    // is the current CPU anyway.
+    //
+    // This is the one arm whose inverse must undo a PUBLISHED task, which is why the publication
+    // records what it needs to be reversible.
+    let parent_cpu = owners.current_cpu();
+    let enqueued = if crate::arch::hal::REMOTE_ENQUEUE_NOTIFIED {
+        owners.enqueue_balanced(child_tid)
+    } else {
+        owners.enqueue_on_cpu(parent_cpu, child_tid)
+    };
+    let cpu = enqueued.unwrap_or(parent_cpu);
+    if let Err(err) = enqueued {
         if proof {
             crate::yarm_log!("FORK_PROOF_CHILD_ENQUEUE_FAIL reason={:?}", err);
         }
@@ -409,7 +422,11 @@ pub(crate) fn fork_process_cow<O: SpawnTxnOwners>(
             "FORK_PROOF_CHILD_ENQUEUE_OK child_tid={} cpu={} reason={}",
             child_tid,
             cpu.0,
-            "parent_cpu"
+            if crate::arch::hal::REMOTE_ENQUEUE_NOTIFIED {
+                "balanced"
+            } else {
+                "parent_cpu"
+            }
         );
     }
     crate::yarm_log!(

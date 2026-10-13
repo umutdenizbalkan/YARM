@@ -14343,6 +14343,23 @@ impl SharedKernel {
     /// The two-step shape is the lock-order requirement the broad owner documents, not a
     /// convenience: `wake_tid_to_runnable` takes ranks below IPC, so it must never run while the
     /// IPC lock is held.
+    ///
+    /// # AP-SCHED1 — a recv-v2 waiter woken here is told to receive again
+    ///
+    /// Every caller wakes the waiter WITHOUT a delivery: the message is already queued on the
+    /// endpoint. That is the contract of a legacy (pre-recv-v2) waiter, which re-runs its receive.
+    /// A recv-v2 waiter cannot: it left its frame and resumes AFTER its `ecall` with whatever its
+    /// saved context holds — its own syscall arguments, so `a0` read back as the capability
+    /// number. On one CPU no recv-v2 waiter reaches this wake: a user send finds a published waiter
+    /// and delivers into it directly. With two dispatching CPUs one can — a receiver that
+    /// publishes itself on one CPU between a send's waiter check and its enqueue on the other —
+    /// and was measured live doing so. So before the wake, in one rank-2 acquisition keyed on the
+    /// waiter's exact `{tid, asid}` and only while it is still blocked in that receive, the
+    /// canonical `WouldBlock` is published into its saved context through the one owner every
+    /// remote receive completion uses ([`crate::kernel::boot::publish_blocked_recv_timeout_result`]'s
+    /// identity form). `WouldBlock` with the metadata untouched is the receive's existing
+    /// "nothing yet" answer — the same one the receiver-side half of this race settles with —
+    /// and the user runtime receives again, finding the queued message.
     #[cfg_attr(feature = "hosted-dev", allow(dead_code))]
     pub(crate) fn wake_waiter_for_endpoint_split(
         &self,
@@ -14351,7 +14368,39 @@ impl SharedKernel {
     ) -> Result<(), KernelError> {
         let waiter = self.with_ipc_split_mut(|ipc| ipc.take_endpoint_waiter(endpoint_idx));
         if let Some(waiter) = waiter {
-            crate::yarm_log!("SCHED_WAKE tid={}", waiter.tid.0);
+            let republished = self.with_task_tcbs_split_mut(|tcbs| {
+                let Some(tcb) = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid == waiter.tid && t.asid == Some(waiter.asid))
+                else {
+                    return false;
+                };
+                let receiving = matches!(
+                    tcb.status,
+                    crate::kernel::task::TaskStatus::Blocked(
+                        crate::kernel::task::WaitReason::EndpointReceive(_)
+                    )
+                );
+                let recv_v2 = tcb.blocked_recv_state.as_ref().is_some_and(|state| {
+                    state.recv_abi == crate::kernel::task::RecvAbiVariant::RecvV2
+                });
+                if !(receiving && recv_v2) {
+                    return false;
+                }
+                crate::kernel::boot::publish_blocked_recv_timeout_result_with_identity(
+                    tcb,
+                    crate::kernel::syscall::SyscallError::WouldBlock.code() as u64,
+                    waiter.tid.0,
+                    waiter.asid,
+                );
+                true
+            });
+            crate::yarm_log!(
+                "SCHED_WAKE tid={} undelivered_recv_v2={}",
+                waiter.tid.0,
+                u8::from(republished)
+            );
             self.wake_tid_to_runnable_split(cpu, waiter.tid)?;
         }
         Ok(())

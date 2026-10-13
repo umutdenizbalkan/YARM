@@ -47226,14 +47226,24 @@ mod stage163n_sender_wake_fix {
         // `enqueue_on_cpu(current_cpu())` names the CPU instead of deriving it inside
         // `enqueue_woken_task`, and the balanced placement that would scatter it is provably
         // absent from the fork transaction.
+        // AP-SCHED1 §4: ... unless the build announces every remote enqueue to its target, and
+        // only then does it take the balanced placement.
         assert!(
-            fork_body.contains("let cpu = owners.current_cpu();")
-                && fork_body.contains("owners.enqueue_on_cpu(cpu, child_tid)"),
-            "the fork must enqueue the child on the PARENT's CPU"
+            fork_body.contains("let parent_cpu = owners.current_cpu();")
+                && fork_body.contains("owners.enqueue_on_cpu(parent_cpu, child_tid)"),
+            "the fork must enqueue the child on the PARENT's CPU where enqueues are not announced"
         );
+        assert_eq!(
+            fork_body.matches("enqueue_balanced").count(),
+            1,
+            "and the balanced placement exactly once, behind the announcement"
+        );
+        assert!(fork_body.contains(
+            "if crate::arch::hal::REMOTE_ENQUEUE_NOTIFIED {\n        owners.enqueue_balanced(child_tid)"
+        ));
         assert!(
-            !fork_body.contains("enqueue_balanced"),
-            "the fork must not use enqueue_balanced (would scatter to any online CPU)"
+            !crate::arch::hal::REMOTE_ENQUEUE_NOTIFIED,
+            "hosted: the parent's CPU"
         );
     }
 
@@ -200845,6 +200855,96 @@ mod ap_sched1 {
             }
         }
         assert!(checked >= 8, "the owners exist: {checked}");
+    }
+
+    /// A receiver `tid` in its own space, blocked in a receive on a fresh endpoint and published
+    /// as that endpoint's waiter; `recv_v2` chooses its ABI.
+    fn blocked_receiver(k: &SharedKernel, tid: u64, recv_v2: bool) -> (usize, Asid) {
+        k.with(|s| {
+            let (asid, _cap) = s.create_user_address_space().expect("asid");
+            s.register_task(tid).expect("task");
+            s.bind_task_asid(tid, asid).expect("bind");
+            let (endpoint_idx, _send, recv_cap) = s.create_endpoint(2).expect("endpoint");
+            s.with_ipc_state_mut(|ipc| {
+                let _ = ipc.set_endpoint_waiter(
+                    endpoint_idx,
+                    crate::kernel::boot::EndpointWaiterRecord::new(
+                        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), asid),
+                        1,
+                    ),
+                );
+            });
+            s.with_tcb_mut(tid, |tcb| {
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+                tcb.user_context.arg0 = recv_cap.0 as usize;
+                if recv_v2 {
+                    tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                        recv_cap,
+                        payload_user_ptr: 0x4000,
+                        payload_user_len: crate::kernel::ipc::Message::MAX_PAYLOAD,
+                        meta_user_ptr: 0x4400,
+                        meta_user_len: 40,
+                        recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+                    });
+                }
+            });
+            (endpoint_idx, asid)
+        })
+    }
+
+    /// **A recv-v2 receiver woken WITHOUT a delivery is told to receive again.** With two
+    /// dispatching CPUs, a receiver can publish itself between a send's waiter check and its
+    /// enqueue; the send's post-enqueue wake then finds it. It resumes after its `ecall` on its
+    /// saved context, so the wake publishes the canonical `WouldBlock` there first (and parks the
+    /// arch-neutral completion record) — never the receiver's own arguments as a result.
+    #[test]
+    fn an_undelivered_recv_v2_waiter_is_woken_with_would_block() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (endpoint_idx, asid) = blocked_receiver(&k, 80, true);
+        k.wake_waiter_for_endpoint_split(CPU0, endpoint_idx)
+            .expect("wake");
+        k.with(|s| {
+            s.with_tcb_mut(80, |tcb| {
+                assert_eq!(tcb.status, TaskStatus::Runnable);
+                let done = tcb
+                    .pending_syscall_completion
+                    .expect("a completion is parked");
+                assert_eq!(
+                    done.result,
+                    crate::kernel::syscall::SyscallError::WouldBlock.code() as u64
+                );
+                assert_eq!(
+                    (done.tid, done.asid),
+                    (80, asid),
+                    "for this exact incarnation"
+                );
+            })
+        });
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(CPU0)),
+            1,
+            "and it is woken"
+        );
+    }
+
+    /// **A legacy waiter is woken exactly as before**: it re-runs its receive, so nothing is
+    /// published into its context.
+    #[test]
+    fn a_legacy_waiter_is_woken_unchanged() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (endpoint_idx, _asid) = blocked_receiver(&k, 81, false);
+        let arg0 = k
+            .with(|s| s.with_tcb_mut(81, |tcb| tcb.user_context.arg0))
+            .expect("tcb");
+        k.wake_waiter_for_endpoint_split(CPU0, endpoint_idx)
+            .expect("wake");
+        k.with(|s| {
+            s.with_tcb_mut(81, |tcb| {
+                assert_eq!(tcb.status, TaskStatus::Runnable);
+                assert!(tcb.pending_syscall_completion.is_none());
+                assert_eq!(tcb.user_context.arg0, arg0);
+            })
+        });
     }
 
     /// **Every RISC-V idle arrival leaves the user root before it arms its idle boundary**, and the

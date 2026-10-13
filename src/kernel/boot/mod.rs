@@ -5542,6 +5542,7 @@ pub(crate) use ipc_state::{
 // ordinary receive-timeout drain in `runtime.rs` writes the identical three-architecture result
 // shape the reply-timeout and server-death classes already write.
 pub(crate) use ipc_state::publish_blocked_recv_timeout_result;
+pub(crate) use ipc_state::publish_blocked_recv_timeout_result_with_identity;
 // Stage 199G-B §1: the delivery projection the ONE blocked-receive writeback owner consumes,
 // re-exported for the post-work drains in `runtime.rs` that gather it.
 pub(crate) use thread_state::BlockedRecvDeliveryResult;
