@@ -248,11 +248,23 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
     // SHARED-REGION-LIFETIME2: the replacement witness reuses this bring-up and replaces the tasks.
     #[cfg(feature = "riscv64-sr-replace-witness")]
     return crate::arch::riscv64::sr_replace_witness::provision(kernel);
-    #[cfg(not(feature = "riscv64-sr-replace-witness"))]
+    // VM-INVALIDATION1: so does the COW / fork invalidation witness.
+    #[cfg(feature = "riscv64-vmi-witness")]
+    return crate::arch::riscv64::vmi_witness::provision(kernel);
+    #[cfg(not(any(
+        feature = "riscv64-sr-replace-witness",
+        feature = "riscv64-vmi-witness"
+    )))]
     provision_smp3(kernel)
 }
 
-#[cfg_attr(feature = "riscv64-sr-replace-witness", allow(dead_code))]
+#[cfg_attr(
+    any(
+        feature = "riscv64-sr-replace-witness",
+        feature = "riscv64-vmi-witness"
+    ),
+    allow(dead_code)
+)]
 fn provision_smp3(kernel: &mut KernelState) -> Result<(), KernelError> {
     let (_, _, es) = kernel.create_endpoint(1)?;
     let (_, _, eh1) = kernel.create_endpoint(1)?;
@@ -388,6 +400,8 @@ fn provision_smp3(kernel: &mut KernelState) -> Result<(), KernelError> {
 pub fn secondary_admitted(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
     #[cfg(feature = "riscv64-sr-replace-witness")]
     crate::arch::riscv64::sr_replace_witness::secondary_admitted(shared, cpu);
+    #[cfg(feature = "riscv64-vmi-witness")]
+    crate::arch::riscv64::vmi_witness::secondary_admitted(shared, cpu);
     if !enabled() || cpu.0 != 1 || CPU1_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -435,6 +449,8 @@ pub fn secondary_admitted(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
 pub fn note_supervisor_entry(cpu: CpuId) {
     #[cfg(feature = "riscv64-sr-replace-witness")]
     crate::arch::riscv64::sr_replace_witness::note_supervisor_entry(cpu);
+    #[cfg(feature = "riscv64-vmi-witness")]
+    crate::arch::riscv64::vmi_witness::note_supervisor_entry(cpu);
     if let Some(n) = ENTRIES.get(cpu.0 as usize) {
         n.fetch_add(1, Ordering::AcqRel);
     }
@@ -672,6 +688,8 @@ pub fn note_fence_done(
         hart_mask,
         result.is_ok(),
     );
+    #[cfg(feature = "riscv64-vmi-witness")]
+    crate::arch::riscv64::vmi_witness::note_fence_done(asid, virt, hart_mask, result.is_ok());
     if generation == 0 {
         return;
     }
@@ -944,6 +962,8 @@ pub fn note_shoot_begin(asid: u16, va: u64) {
 pub fn note_shoot_targets(requester: CpuId, asid: u16, va: u64, targets: u64) {
     #[cfg(feature = "riscv64-sr-replace-witness")]
     crate::arch::riscv64::sr_replace_witness::note_shoot_targets(requester, asid, va, targets);
+    #[cfg(feature = "riscv64-vmi-witness")]
+    crate::arch::riscv64::vmi_witness::note_shoot_targets(requester, asid, va, targets);
     if !watches(va) {
         return;
     }
@@ -1065,6 +1085,10 @@ fn await_consumed(target_cpu: u8) {
 pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str, round: u64, aux: u64) {
     #[cfg(feature = "riscv64-sr-replace-witness")]
     if crate::arch::riscv64::sr_replace_witness::observe_user_marker(cpu, tid, msg, round, aux) {
+        return;
+    }
+    #[cfg(feature = "riscv64-vmi-witness")]
+    if crate::arch::riscv64::vmi_witness::observe_user_marker(cpu, tid, msg, round, aux) {
         return;
     }
     if !enabled() {

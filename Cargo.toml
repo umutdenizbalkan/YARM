@@ -93,6 +93,11 @@ riscv64-smp3-witness = []
 # page whose translation is live on the other hart. Reuses the QEMU-SMP3 secondary bring-up and
 # replaces its tasks; armed by `yarm.ap_user_dispatch=1`.
 riscv64-sr-replace-witness = ["riscv64-smp3-witness"]
+# VM-INVALIDATION1: the RISC-V COW / fork invalidation witness — a COW private copy replaces a page,
+# and a fork write-protects a page, whose translation is live on the other hart. Reuses the
+# QEMU-SMP3 secondary bring-up and replaces its tasks; armed by `yarm.ap_user_dispatch=1`.
+# Exclusive with `riscv64-sr-replace-witness`.
+riscv64-vmi-witness = ["riscv64-smp3-witness"]
 # QEMU-LOCK1: real subdomain-lock contention on the production VM address-space lock
 # (`vm_state_lock`, rank 5), driven by the SMP3 two-hart VM/IPI workload (which it co-enables). It
 # instruments the chosen lock's atomic acquire/release, a default-off bounded hold hook that makes a

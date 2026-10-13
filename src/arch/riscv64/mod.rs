@@ -24,6 +24,17 @@ pub mod smp3_witness;
     target_arch = "riscv64"
 ))]
 pub mod sr_replace_witness;
+#[cfg(all(
+    feature = "riscv64-vmi-witness",
+    not(feature = "hosted-dev"),
+    target_arch = "riscv64"
+))]
+pub mod vmi_witness;
+#[cfg(all(
+    feature = "riscv64-vmi-witness",
+    feature = "riscv64-sr-replace-witness"
+))]
+compile_error!("riscv64-vmi-witness and riscv64-sr-replace-witness each replace the SMP3 tasks");
 pub mod syscall_abi;
 pub mod timer;
 pub mod trap;
