@@ -4,29 +4,17 @@
 #[cfg(feature = "hosted-dev")]
 pub fn write_line(_msg: &str) {}
 
-#[cfg(all(
-    not(feature = "hosted-dev"),
-    target_arch = "riscv64",
-    not(feature = "riscv64-smp3-witness")
-))]
-pub fn write_line(msg: &str) {
-    write_line_bytes(msg);
-}
-
-/// QEMU-SMP3 witness build only — one line at a time across both harts.
+/// One line at a time across every hart — THE console line lock, for every writer.
 ///
-/// Two dispatching harts write the SBI console a byte per `ecall` with no shared line lock, so
-/// their lines interleave byte-wise and the witness's sealed dump arrives damaged. The witness
-/// build serializes whole lines here, with this hart's S-mode interrupts masked across the hold
-/// (the same discipline `early_sbi_marker` uses, and for the same reason: a handler on this hart
-/// that prints must never spin on a lock this hart holds). The spin is bounded, so a hart that
-/// stopped while holding the line — a panic mid-line — cannot silence the other one. Default
-/// builds are unchanged.
-#[cfg(all(
-    not(feature = "hosted-dev"),
-    target_arch = "riscv64",
-    feature = "riscv64-smp3-witness"
-))]
+/// Two dispatching harts write the SBI console a byte per `ecall`, so without a shared line lock
+/// their lines interleave byte-wise. QEMU-SMP3 introduced this for its witness build, whose sealed
+/// dump arrived damaged; AP-SCHED1 makes it production, because a production boot now has two
+/// printing harts and a torn marker is a line every log consumer miscounts. `early_sbi_marker`
+/// writes through here too, so the two output paths exclude each other rather than holding two
+/// different locks. The hold is with this hart's S-mode interrupts masked (a handler on this hart
+/// that prints must never spin on a lock this hart holds), and the spin is bounded, so a hart
+/// that stopped while holding the line — a panic mid-line — cannot silence the other one.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn write_line(msg: &str) {
     use core::sync::atomic::{AtomicBool, Ordering};
     static LINE: AtomicBool = AtomicBool::new(false);

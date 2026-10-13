@@ -314,15 +314,31 @@ fn selector_30_is_free() {
 }
 
 /// The S-mode interrupt window is closed: SIE is set only inside the stack-free idle wfi loop, and
-/// the early-marker line lock is held with interrupts masked.
+/// the console line lock is held with interrupts masked. AP-SCHED1: the lock is the console's own
+/// (`console::write_line`), which the early marker writes through.
 #[test]
 fn the_idle_boundary_window_is_closed() {
     let marker = body_after(RV_BOOT, "pub(crate) fn early_sbi_marker(");
     let save = marker.find("irq::irq_save()").expect("mask");
-    let lock = marker.find("early_marker_lock_acquire();").expect("lock");
-    let unlock = marker.find("early_marker_lock_release();").expect("unlock");
+    let write = marker
+        .find("crate::arch::riscv64::console::write_line(text);")
+        .expect("the locked write");
     let restore = marker.find("irq::irq_restore(irq_state)").expect("restore");
-    assert!(save < lock && lock < unlock && unlock < restore);
+    assert!(save < write && write < restore);
+    let console = include_str!("../src/arch/riscv64/console.rs");
+    let line = body_after(console, "pub fn write_line(msg: &str) {");
+    let csave = line.find("irq::irq_save()").expect("console mask");
+    let lock = line
+        .find("LINE\n            .compare_exchange(false, true")
+        .expect("console lock");
+    let bytes = line.find("write_line_bytes(msg);").expect("the bytes");
+    let unlock = line
+        .find("LINE.store(false, Ordering::Release);")
+        .expect("console unlock");
+    let crestore = line
+        .find("irq::irq_restore(irq_state)")
+        .expect("console restore");
+    assert!(csave < lock && lock < bytes && bytes < unlock && unlock < crestore);
     let halt = body_after(RV_BOOT, "fn riscv_trap_halt(reason: &'static str) -> ! {");
     assert!(halt.contains("timer::halt_wait_loop()"));
     assert!(

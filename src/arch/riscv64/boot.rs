@@ -174,30 +174,6 @@ pub fn captured_dtb() -> Option<&'static [u8]> {
 /// the trailing CRLF, so a hart that wins the lock writes a complete line
 /// atomically (from the reader's perspective). Lives in `.bss`, so it is
 /// safe to use before any allocator/bootstrap step.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-static EARLY_MARKER_LOCK: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn early_marker_lock_acquire() {
-    while EARLY_MARKER_LOCK
-        .compare_exchange(
-            false,
-            true,
-            core::sync::atomic::Ordering::Acquire,
-            core::sync::atomic::Ordering::Relaxed,
-        )
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-}
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn early_marker_lock_release() {
-    EARLY_MARKER_LOCK.store(false, core::sync::atomic::Ordering::Release);
-}
-
 /// Early, allocation-free, lock-free marker writer for the RISC-V boot path.
 ///
 /// Writes a formatted line straight to the SBI legacy console (a single
@@ -245,11 +221,9 @@ pub(crate) fn early_sbi_marker(args: core::fmt::Arguments<'_>) {
     // Masking across the hold makes the print atomic with respect to this hart's interrupts; a
     // pending interrupt is taken as soon as the previous `SIE` is restored.
     let irq_state = crate::arch::riscv64::irq::irq_save();
-    // Take the per-line UART lock so concurrent emitters from the boot hart
-    // and HSM-started secondaries cannot interleave bytes mid-line.
-    early_marker_lock_acquire();
+    // The per-line console lock is `console::write_line`'s own (AP-SCHED1: one lock for every
+    // writer, so an early marker and a log line cannot interleave either).
     crate::arch::riscv64::console::write_line(text);
-    early_marker_lock_release();
     crate::arch::riscv64::irq::irq_restore(irq_state);
 }
 

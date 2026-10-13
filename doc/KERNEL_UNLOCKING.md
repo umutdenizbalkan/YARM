@@ -28834,6 +28834,11 @@ diagnostic pinned path runs unchanged.
     names its CPU.
   * The blocking-send commit and the blocked-waiter delivery producers name the executing CPU:
     they stash per-CPU work for THIS CPU's drain.
+* **One console line at a time.** A production boot now has two printing harts. The per-line
+  console lock that only the SMP3 witness build had is now every RISC-V build's
+  (`console::write_line`), and the early marker writes through it instead of holding a second
+  lock. Before this, a log line from CPU 0 torn by CPU 1's marker failed a `-smp 2` core smoke's
+  marker count while the kernel had behaved correctly.
 * **A two-CPU IPC race, found live and fixed.** A recv-v2 receiver can publish itself on one CPU
   between a send's waiter check and its enqueue on the other, after which the send's post-enqueue
   wake finds it. That wake was built for legacy waiters, which re-run their receive. A recv-v2
@@ -28842,6 +28847,15 @@ diagnostic pinned path runs unchanged.
   into such a waiter's saved context first, through the one remote-completion owner, keyed on its
   exact incarnation. That is the receive's existing "nothing yet" answer, and the user runtime
   receives again. On one CPU no recv-v2 waiter reaches this wake.
+
+  A second window followed from the same race. The waiter is visible to other CPUs before its own
+  trap captures its live frame into the TCB, so a completion published remotely in between was
+  overwritten by the frame's syscall arguments. RISC-V's receive park now re-applies a parked
+  receive completion of the current receive generation right after its capture, through the same
+  owner. It does this only at that capture, where such a record can belong only to the receive
+  being parked; a completed receive's lingering record never re-stamps a later syscall.
+  Applying parked completions at every RISC-V resume instead was rejected: the code records that
+  widening that take changed server-death sequencing.
 
 ### §5 — evidence
 

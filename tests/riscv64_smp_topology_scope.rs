@@ -114,19 +114,25 @@ fn park_secondaries_no_longer_uses_bootstrap_cpu_id_constant() {
 
 #[test]
 fn early_marker_takes_uart_line_lock_to_serialize_smp_output() {
+    // AP-SCHED1: ONE console line lock, for every writer and every build. The early marker
+    // writes through it rather than holding a lock of its own, so an early marker and a log line
+    // from the other hart cannot interleave either.
     let boot = include_str!("../src/arch/riscv64/boot.rs");
     assert!(
-        boot.contains("EARLY_MARKER_LOCK"),
-        "early_sbi_marker must serialize multi-hart UART output"
+        boot.contains("crate::arch::riscv64::console::write_line(text);"),
+        "early_sbi_marker must write through the serialized console line"
     );
     assert!(
-        boot.contains("early_marker_lock_acquire();"),
-        "early_sbi_marker must acquire the UART lock per line"
+        !boot.contains("EARLY_MARKER_LOCK"),
+        "and hold no second lock"
     );
-    assert!(
-        boot.contains("early_marker_lock_release();"),
-        "early_sbi_marker must release the UART lock after the line"
+    let console = include_str!("../src/arch/riscv64/console.rs");
+    assert_eq!(
+        console.matches("pub fn write_line(msg: &str) {").count(),
+        1,
+        "one serialized writer for every RISC-V build"
     );
+    assert!(console.contains("static LINE: AtomicBool = AtomicBool::new(false);"));
 }
 
 #[test]
