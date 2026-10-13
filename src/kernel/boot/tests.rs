@@ -35,7 +35,7 @@ fn boot_memory_map_reservation_splits_usable_region() {
 }
 
 #[test]
-fn init_static_with_boot_memory_map_uses_sanitized_ranges() {
+fn init_boxed_with_boot_memory_map_uses_sanitized_ranges() {
     // The PT pool requires 256 pages (1 MiB) and the main allocator needs additional
     // frames for task registration.  Provide 4 MiB so both pools are adequately funded.
     let regions = [MemoryRegion {
@@ -44,7 +44,9 @@ fn init_static_with_boot_memory_map_uses_sanitized_ranges() {
         usable: true,
     }];
     let reserved = [(0x1000_0000u64, 0x1000_1000u64)];
-    let state = Bootstrap::init_static_with_boot_memory_map(
+    // BLR1: the `init_static*` family (a `&'static mut KernelState` into a process-global buffer)
+    // is deleted; the owned constructor runs the same `init_state_into` sanitization.
+    let state = Bootstrap::init_boxed_with_boot_memory_map(
         Bootstrap::default_capacity_profile(),
         &regions,
         &reserved,
@@ -14046,19 +14048,60 @@ fn init_shared_static_returns_usable_shared_kernel() {
             }];
             let reserved = [(0x2000_0000u64, 0x2000_1000u64)];
 
-            let shared = Bootstrap::init_shared_static_with_boot_memory_map(
+            // BLR1 — THE OWNERSHIP TRANSITION, end to end, on the real boot singleton.
+            assert!(
+                !crate::runtime::boot_exclusive_phase_open()
+                    && !crate::runtime::boot_state_published(),
+                "no boot phase may be entered before construction"
+            );
+            let mut boot = Bootstrap::init_shared_static_with_boot_memory_map(
                 Bootstrap::default_capacity_profile(),
                 &regions,
                 &reserved,
             )
             .expect("init_shared_static must succeed");
 
-            // SharedKernel::with must reach a valid KernelState.
-            let online = shared.with(|k| k.online_cpu_count());
+            // EXCLUSIVE: the token is the only path. The static accessor any code can call does
+            // not answer, and the trap-installation handle is the same storage the token owns.
+            assert!(crate::runtime::boot_exclusive_phase_open());
+            assert!(!crate::runtime::boot_state_published());
             assert!(
-                online >= 1,
-                "SharedKernel::with must yield a valid KernelState (online_cpu_count >= 1)"
+                Bootstrap::shared_static_ref().is_none(),
+                "shared_static_ref must not hand out a second path while the token is live"
             );
+            let installed = boot.shared_for_trap_installation() as *const _;
+            let state_addr = boot.state() as *mut crate::kernel::boot::KernelState as usize;
+            // The exclusive loan reaches a constructed state (in place, at its final address).
+            assert!(boot.state().online_cpu_count() >= 1);
+            boot.state()
+                .set_current_cpu(crate::kernel::scheduler::CpuId(0))
+                .expect("bind");
+
+            // PUBLISHED: the token is consumed; every later access is a domain owner on the
+            // returned SharedKernel, which is the same object the static now answers with.
+            let shared = boot.publish();
+            assert!(!crate::runtime::boot_exclusive_phase_open());
+            assert!(crate::runtime::boot_state_published());
+            let via_static = Bootstrap::shared_static_ref().expect("published");
+            assert!(core::ptr::eq(shared, via_static));
+            assert!(core::ptr::eq(shared as *const _, installed));
+            // The state did not move between construction, exclusive use and publication.
+            assert_eq!(shared.state_addr_for_test(), state_addr);
+            // A domain owner reads what the exclusive phase wrote.
+            assert_eq!(
+                shared.current_tid_authoritative(crate::kernel::scheduler::CpuId(0)),
+                Some(0)
+            );
+
+            // One claim per boot: a second construction is refused.
+            let again = std::panic::catch_unwind(|| {
+                let _ = Bootstrap::init_shared_static_with_boot_memory_map(
+                    Bootstrap::default_capacity_profile(),
+                    &regions,
+                    &reserved,
+                );
+            });
+            assert!(again.is_err(), "a second boot construction must panic");
         })
         .expect("spawn")
         .join()
@@ -23122,85 +23165,13 @@ mod stage29a_live_split_dispatch_tests {
     }
 }
 
-// ── Stage 30: borrow_kernel_for_boot debug guard + split-helper validation ──────
+// ── Stage 30: split-helper validation ───────────────────────────────────────────
+//
+// BLR1: the debug-only `borrow_kernel_for_boot` raw-borrow window (and its five tests) is gone
+// with the borrow itself. Its successor is the `BootExclusive` phase, exercised end-to-end by
+// `init_shared_static_returns_usable_shared_kernel` and by `blr1_boot_exclusive` below.
 #[cfg(test)]
 mod stage30_boot_guard_tests {
-    use crate::runtime::{
-        BootRawKernelBorrowGuard, begin_boot_raw_borrow_window, boot_raw_borrow_is_active,
-        end_boot_raw_borrow_window,
-    };
-
-    #[test]
-    fn stage30_boot_raw_borrow_guard_begin_sets_active() {
-        // Ensure the window flag is clear before the test (may be dirty from
-        // a previous test that didn't clean up).
-        end_boot_raw_borrow_window();
-        begin_boot_raw_borrow_window();
-        assert!(
-            boot_raw_borrow_is_active(),
-            "begin_boot_raw_borrow_window must set the active flag"
-        );
-        // Clean up so subsequent tests start clean.
-        end_boot_raw_borrow_window();
-    }
-
-    #[test]
-    fn stage30_boot_raw_borrow_guard_end_clears_active() {
-        end_boot_raw_borrow_window();
-        begin_boot_raw_borrow_window();
-        assert!(boot_raw_borrow_is_active());
-        end_boot_raw_borrow_window();
-        assert!(
-            !boot_raw_borrow_is_active(),
-            "end_boot_raw_borrow_window must clear the active flag"
-        );
-    }
-
-    #[test]
-    #[should_panic]
-    fn stage30_boot_raw_borrow_guard_double_begin_panics() {
-        // The second begin while the window is already open represents a
-        // double-borrow of &mut KernelState — this must panic in debug mode.
-        end_boot_raw_borrow_window();
-        begin_boot_raw_borrow_window();
-        begin_boot_raw_borrow_window(); // must panic
-    }
-
-    #[test]
-    fn stage30_raii_guard_clears_on_drop() {
-        end_boot_raw_borrow_window();
-        begin_boot_raw_borrow_window();
-        assert!(boot_raw_borrow_is_active());
-        {
-            let _guard = BootRawKernelBorrowGuard;
-            assert!(
-                boot_raw_borrow_is_active(),
-                "still active while guard is held"
-            );
-        }
-        assert!(
-            !boot_raw_borrow_is_active(),
-            "BootRawKernelBorrowGuard::drop must clear the flag"
-        );
-    }
-
-    #[test]
-    fn stage30_timer_guard_detects_active_window_in_test() {
-        // Simulate what the arch timer ISR debug_assert checks: if the boot
-        // raw-borrow window is active, boot_raw_borrow_is_active() returns true.
-        end_boot_raw_borrow_window();
-        assert!(
-            !boot_raw_borrow_is_active(),
-            "guard must be inactive before the simulated timer fires"
-        );
-        begin_boot_raw_borrow_window();
-        assert!(
-            boot_raw_borrow_is_active(),
-            "timer ISR debug_assert would trigger: window is active"
-        );
-        end_boot_raw_borrow_window();
-    }
-
     #[test]
     fn stage30_syscall_count_still_30() {
         use crate::kernel::syscall::SYSCALL_COUNT;
@@ -47602,48 +47573,64 @@ mod stage185_boot_only_global_borrow_confined {
         ("thread_state.rs", include_str!("thread_state.rs")),
     ];
 
-    const BOOT_ESCAPE_CALL: &str = ".borrow_kernel_for_boot()";
+    // BLR1: the raw escape (`SharedKernel::borrow_kernel_for_boot`) is deleted. Its successor is
+    // the `BootExclusive` token, and these two tests pin the successor's shape instead.
+    const BOOT_ESCAPE_CALL: &str = "BootExclusive";
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
 
-    // The raw-borrow escape hatch stays crate-private and `unsafe` so it can only
-    // be reached from inside the kernel crate and never without an explicit
-    // `unsafe` block. Loosening it to `pub` or dropping `unsafe` is a regression.
+    // The token is minted only by `pub(crate) unsafe fn claim`, lends the state only through
+    // `&mut self`, and ends only by being consumed. The deleted escape must not return.
     #[test]
     fn stage185_boot_escape_is_crate_private_unsafe() {
         assert!(
-            RUNTIME_SRC.contains("pub(crate) unsafe fn borrow_kernel_for_boot"),
-            "borrow_kernel_for_boot must stay `pub(crate) unsafe` (boot-only escape hatch)"
+            !RUNTIME_SRC.contains("fn borrow_kernel_for_boot"),
+            "BLR1: the unchecked raw boot borrow is deleted and must not return"
         );
         assert!(
-            !RUNTIME_SRC.contains("pub unsafe fn borrow_kernel_for_boot"),
-            "borrow_kernel_for_boot must NOT be exported `pub` — it is a boot-only escape"
+            RUNTIME_SRC
+                .contains("pub(crate) unsafe fn claim(shared: &'static SharedKernel) -> Self"),
+            "the boot token can be minted only inside the crate, and only under `unsafe`"
         );
+        assert!(
+            RUNTIME_SRC.contains("pub fn state(&mut self) -> &mut KernelState")
+                && RUNTIME_SRC.contains("pub fn publish(self) -> &'static SharedKernel"),
+            "the loan is tied to `&mut self`, and the phase ends by consuming the token"
+        );
+        let _ = OWNER_SRC;
     }
 
-    // The boot-only escape must be reachable ONLY from the two arch boot
-    // ELF-load sites (non-vacuous: prove it IS called there).
+    // The token flows from construction to `run` on each port (non-vacuous: prove it IS used).
     #[test]
     fn stage185_boot_escape_present_only_in_boot() {
-        assert!(
-            X86_BOOT_SRC.contains(BOOT_ESCAPE_CALL),
-            "x86_64 boot must call borrow_kernel_for_boot() (bootstrap ELF load)"
-        );
-        assert!(
-            AARCH64_BOOT_SRC.contains(BOOT_ESCAPE_CALL),
-            "aarch64 boot must call borrow_kernel_for_boot() (bootstrap ELF load)"
-        );
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            let body = src
+                .split("pub fn run_with_prepared_kernel(run: fn(crate::runtime::BootExclusive)) {")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{arch}: the boot owner takes the token"));
+            assert!(
+                body.contains("init_shared_static") && body.contains("run(boot);"),
+                "{arch}: the token is constructed by the boot path and handed to `run`"
+            );
+            assert!(
+                src.contains("boot.publish()"),
+                "{arch}: the first-entry path ends the exclusive phase"
+            );
+        }
     }
 
-    // No live-runtime dispatch path may call the boot-only raw `&mut` escape:
-    // live paths must go through the global lock (`with`/`with_cpu`) or a
-    // documented subsystem split helper, never the bootstrap alias.
+    // No live-runtime dispatch path may name the boot token: live paths go through a documented
+    // domain owner, never the boot phase's whole-state loan.
     #[test]
     fn stage185_no_live_runtime_path_uses_boot_escape() {
         for (name, src) in LIVE_RUNTIME_FILES {
             assert!(
                 !src.contains(BOOT_ESCAPE_CALL),
-                "live-runtime file `{name}` must NOT call {BOOT_ESCAPE_CALL} — the raw \
-                 &mut KernelState borrow is boot-only; live paths use the global lock or a \
-                 documented subsystem split helper"
+                "live-runtime file `{name}` must NOT name {BOOT_ESCAPE_CALL} — the whole-state \
+                 loan is boot-only; live paths use a documented domain owner"
             );
         }
     }
@@ -62251,11 +62238,20 @@ mod stage189d_seal {
     // AP emits the seal verdict itself.
     #[test]
     fn seal_does_not_hold_global_lock_awaiting_ap_syscall() {
+        // BLR1: the wake moved into `send_ap_dispatch_request` (owed until the BSP publishes the
+        // boot state); the no-poll contract moved with it.
+        let send = SMP_SRC
+            .split("fn send_ap_dispatch_request(cpu: CpuId) {")
+            .nth(1)
+            .expect("the dispatch-request sender")
+            .split("\n}\n")
+            .next()
+            .expect("bounded");
         assert!(
-            SMP_SRC.contains(
-                "The seal verdict is emitted by the AP's\n    // own syscall (X86_AP_USER_DISPATCH_SEAL_DONE result=ok), not by the BSP."
-            ),
-            "the live dispatcher must not poll under the global lock for the AP's syscall"
+            send.contains("Do NOT poll here.")
+                && send.contains("emitted by the AP's own syscall")
+                && !send.contains("ap_syscall_reentry_ok("),
+            "the live dispatcher must not poll for the AP's syscall"
         );
         // The old UNDER-LOCK re-entry poll must be gone. U9-D3 re-derives this from "nowhere in
         // the file" to "nowhere in the under-lock dispatcher", because U9-D3 legitimately polls
@@ -77087,12 +77083,27 @@ mod stage196a_riscv_shared_trap_foundation {
                 && !RISCV_BOOT_SRC.contains("install_riscv_trap_kernel_state"),
             "raw &'static mut KernelState trap accessor/installer must be retired"
         );
-        // Boot installs the SharedKernel pointer (Stage-2N shared trap path).
+        // Boot installs the SharedKernel pointer (Stage-2N shared trap path). BLR1: it owns the
+        // state through the boot token, installs the trap target from it, and the bridge refuses
+        // to use that target before the token is published.
         assert!(
             RISCV_BOOT_SRC.contains("Bootstrap::init_shared_static()")
-                && RISCV_BOOT_SRC.contains("install_riscv_trap_shared_kernel(shared)")
-                && RISCV_BOOT_SRC.contains("borrow_kernel_for_boot()"),
+                && RISCV_BOOT_SRC.contains(
+                    "install_riscv_trap_shared_kernel(boot.shared_for_trap_installation())"
+                )
+                && RISCV_BOOT_SRC.contains("let kernel = boot.state();"),
             "boot must own KernelState through a SharedKernel like x86_64/AArch64"
+        );
+        let bridge = RISCV_BOOT_SRC
+            .split("extern \"C\" fn yarm_riscv64_trap_bridge(")
+            .nth(1)
+            .expect("the bridge");
+        let refuse = bridge
+            .find("refuse_shared_entry_during_boot_exclusive(\"riscv64_trap_bridge\")")
+            .expect("BLR1: the bridge checks publication");
+        assert!(
+            refuse < bridge.find("trap_shared_kernel_riscv()").expect("acquire"),
+            "the publication check precedes the bridge's first use of the shared kernel"
         );
     }
 
@@ -95065,9 +95076,10 @@ mod stage200c_reply_timeout_transaction {
             0,
             "src/runtime.rs must contain no production broad `.with(|…|)` acquisition"
         );
-        // The three raw `self.state.lock()` sites are the BODIES of `lock` / `with` /
-        // `with_cpu` themselves and must remain — the lock is not being deleted.
-        assert_eq!(code.matches("self.state.lock()").count(), 3);
+        // BLR1: the lock IS deleted now. Its three raw `self.state.lock()` bodies went with it, and
+        // the test-only helpers that kept the names serialize on `test_exclusive`, not on state.
+        assert_eq!(code.matches("self.state.lock()").count(), 0);
+        assert_eq!(code.matches("SpinLock<KernelState>").count(), 0);
     }
 
     #[test]
@@ -102425,10 +102437,16 @@ mod stage200d0b3_x86_exit_corrected {
         );
         // The whole handler body runs inside `with_cpu`, so the consumer is in-lock. This is
         // the fact Stage 200D-0B1 got wrong, so it is asserted against the source of the lock
-        // rather than against any comment.
-        assert!(RUNTIME_SRC.contains(
-            "pub fn with_cpu<R>(\n        &self,\n        cpu: CpuId,\n        f: impl FnOnce(&mut KernelState) -> R,\n    ) -> Result<R, KernelError> {\n        let mut guard = self.state.lock();"
-        ));
+        // rather than against any comment. BLR1: that handler is now reachable only from the
+        // hosted reference tests, through the TEST-ONLY `with_cpu`, which is still one exclusive
+        // whole-state section that binds the CPU first — so the consumer is still inside it.
+        let test_only = RUNTIME_SRC
+            .split("#[cfg(test)]\nimpl SharedKernel {")
+            .nth(1)
+            .expect("BLR1: the whole-state helpers exist only under #[cfg(test)]");
+        assert!(test_only.contains(
+            "pub fn with_cpu<R>(\n        &self,\n        cpu: CpuId,\n        f: impl FnOnce(&mut KernelState) -> R,\n    ) -> Result<R, KernelError> {\n        let _serial = self.test_exclusive.lock();"
+        ) && test_only.contains("state.set_current_cpu(cpu)?;"));
         let entry = TRAP_ENTRY_SRC
             .split("pub fn handle_trap_entry_shared")
             .nth(1)
@@ -104741,10 +104759,14 @@ mod stage200d0d1_riscv_exit_prep {
             .expect("consumer");
         assert!(with_cpu < phase3, "Phase 2 precedes Phase 3");
         assert!(phase3 < consumer, "the consumer is in Phase 3");
-        // The lock is genuinely the broad SpinLock<KernelState>.
+        // BLR1: there is no broad lock left to hold: the state is a lock-free cell, and the raw
+        // acquisition body that used to stand in `with_cpu` is gone.
         const RUNTIME: &str = include_str!("../../runtime.rs");
         const OWNER_SRC: &str = include_str!("../task_enqueue.rs");
-        assert!(RUNTIME.contains("let mut guard = self.state.lock();"));
+        assert!(
+            !RUNTIME.contains("let mut guard = self.state.lock();")
+                && RUNTIME.contains("struct KernelStateCell(core::cell::UnsafeCell<KernelState>);")
+        );
         // The marker states the condition and names the holder.
         assert!(consumer_block().contains(
             // U9-TERMINAL-FINAL §5: see the AArch64 sibling — `holder=with_cpu` named a guard
@@ -127842,7 +127864,9 @@ mod u3_ap_enqueue_dispatch_transaction {
                 .expect("bounded"),
         );
         assert!(
-            seam.contains("task_enqueue_policy_split_mut_ptrs_from_raw(self.state.data_ptr())"),
+            // BLR1: `state_ptr()` is the successor of `state.data_ptr()` — the same raw address of
+            // the same storage, now a lock-free cell instead of the broad lock's interior.
+            seam.contains("task_enqueue_policy_split_mut_ptrs_from_raw(self.state_ptr())"),
             "raw domain pointers are recomputed from the live SharedKernel state, as every \
              sibling seam does"
         );
@@ -140223,13 +140247,24 @@ mod aarch64_production_tick {
     const X86_IRQ_SRC: &str = include_str!("../../arch/x86_64/irq.rs");
     const RISCV_IRQ_SRC: &str = include_str!("../../arch/riscv64/irq.rs");
     const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const KERNEL_BOOT_SRC: &str = include_str!("../../bin/kernel_boot.rs");
 
     fn bsp_timer_arm() -> &'static str {
         BOOT_ENTRY_SRC
             .split("pub fn start_bsp_periodic_timer(")
             .nth(1)
             .expect("the single BSP timer start")
-            .split("\nstruct ")
+            .split("\n/// What the BSP timer arm left owed")
+            .next()
+            .expect("its body")
+    }
+
+    fn finish_unmask() -> &'static str {
+        BOOT_ENTRY_SRC
+            .split("pub fn finish_bsp_timer_unmask(")
+            .nth(1)
+            .expect("the owed-unmask completion")
+            .split("\n}\n")
             .next()
             .expect("its body")
     }
@@ -140256,9 +140291,9 @@ mod aarch64_production_tick {
         );
         // The AP bring-up must not arm a timer of its own.
         let ap = A64_BOOT_SRC
-            .split("YARM_AARCH64_SMP_WAIT cpu={} state=released")
+            .split("extern \"C\" fn yarm_aarch64_secondary_cpu_boot(")
             .nth(1)
-            .expect("the AP release path")
+            .expect("the AP boot path")
             .split("\n#[cfg")
             .next()
             .expect("its body");
@@ -140266,14 +140301,24 @@ mod aarch64_production_tick {
             !ap.contains("program_timer_deadline"),
             "an AP must never arm a timer — it would advance the single shared scheduler counter"
         );
+        // BLR1: the secondary without the user-dispatch knob parks for good and touches no kernel
+        // state. Its old "cross-CPU work" loop ran on a raw `&'static mut KernelState` that was
+        // never installed (so it never ran), and was deleted with that pointer.
         assert!(
-            ap.contains("process_cross_cpu_work_for_cpu"),
-            "APs still service cross-CPU work; only the timer arm was withdrawn"
+            ap.contains("state=parked reason=no_user_dispatch")
+                && !ap.contains("kernel.")
+                && !ap.contains("trap_kernel_state_mut"),
+            "the default AP parks without any whole-state reference"
         );
     }
 
     /// Everything the first interrupt will need is confirmed BEFORE `DAIF` is unmasked, and the
     /// unmask is unconditionally the last thing that happens.
+    ///
+    /// BLR1: the unmask is no longer performed by the arm. The arm records it as OWED
+    /// (`BspTimerArm::UnmaskOwed`) on the one path where every gate passed, and it is discharged
+    /// only after the boot state is published — by the return to EL0, or by
+    /// `finish_bsp_timer_unmask` on the idle arm. The gate order is checked against that record.
     #[test]
     fn readiness_is_confirmed_before_the_daif_unmask() {
         let arm = bsp_timer_arm();
@@ -140281,9 +140326,45 @@ mod aarch64_production_tick {
             .split("target_arch = \"aarch64\"")
             .nth(1)
             .expect("the AArch64 arm");
+        assert!(
+            !aarch64.contains("enable_interrupts_for_boot()"),
+            "BLR1: the arm runs inside the boot exclusion and must not admit interrupts itself"
+        );
         let unmask = aarch64
-            .find("enable_interrupts_for_boot()")
-            .expect("the DAIF unmask");
+            .find("arm = BspTimerArm::UnmaskOwed;")
+            .expect("the DAIF unmask, recorded as owed");
+        assert_eq!(
+            aarch64.matches("BspTimerArm::UnmaskOwed").count(),
+            1,
+            "the unmask is owed on exactly one path"
+        );
+        let finish = finish_unmask();
+        assert!(
+            finish.contains("if arm == BspTimerArm::UnmaskOwed")
+                && finish.matches("enable_interrupts_for_boot()").count() == 1,
+            "the owed unmask is discharged once, and only when it is owed"
+        );
+        // The scheduler entry opens its exclusion BEFORE the arm, and discharges the owed unmask
+        // only after publication, on both arms.
+        let entry = KERNEL_BOOT_SRC;
+        let save = entry
+            .find("let boot_irq_state = yarm::arch::irq_guard::irq_save();")
+            .expect("save");
+        let arm_at = entry.find("start_bsp_periodic_timer(kernel)").expect("arm");
+        assert!(
+            save < arm_at,
+            "the exclusion must open before the first interrupt source is armed"
+        );
+        for (publish, why) in [
+            ("enter_dispatched_user_task_if_available(", "entry arm"),
+            ("let _published = boot.publish();", "idle arm"),
+        ] {
+            let p = entry.find(publish).unwrap_or_else(|| panic!("{why}"));
+            let f = entry[p..]
+                .find("finish_bsp_timer_unmask(timer_arm)")
+                .map(|x| x + p);
+            assert!(f.is_some(), "{why}: the owed unmask follows publication");
+        }
         for (what, needle) in [
             (
                 "the scheduler is past bootstrap",
@@ -140309,11 +140390,6 @@ mod aarch64_production_tick {
                 "{what} must be established BEFORE interrupts are unmasked"
             );
         }
-        assert_eq!(
-            aarch64.matches("enable_interrupts_for_boot()").count(),
-            1,
-            "there is exactly one unmask, on the one path where every gate passed"
-        );
     }
 
     /// Each gate is a readback, and a failing readback leaves the CPU masked with nothing armed.
@@ -141250,9 +141326,11 @@ mod u3_saved_resume_cpu_authority {
         ] {
             assert!(!body.contains(banned), "the seam must not reach `{banned}`");
         }
+        // BLR1: the broad `with_cpu` is deleted from production; its hosted-test-only successor
+        // keeps the legacy ambient binding, so the reference tests still model it faithfully.
         assert!(
-            code_only(RUNTIME_SRC).contains("guard.set_current_cpu(cpu)?;"),
-            "broad with_cpu retains its legacy ambient binding"
+            code_only(RUNTIME_SRC).contains("state.set_current_cpu(cpu)?;"),
+            "the test-only with_cpu retains its legacy ambient binding"
         );
     }
 
@@ -187045,9 +187123,18 @@ mod u9timer5_idle_boundary {
         let select = code
             .find("let initial = kernel.dispatch_ready_task().ok().flatten();")
             .expect("the boot selection");
+        // BLR1: the entry consumes the boot token (`boot`), which is how it ends the exclusive
+        // phase; the mask now opens before the timer arm, earlier still than TIMER5 required.
         let enter = code
-            .find("enter_dispatched_user_task_if_available(kernel, Some(tid));")
+            .find("enter_dispatched_user_task_if_available(boot, Some(tid));")
             .expect("the architectural entry");
+        let arm = code
+            .find("start_bsp_periodic_timer(kernel)")
+            .expect("the timer arm");
+        assert!(
+            save < arm,
+            "BLR1: the mask opens before the first interrupt source is armed"
+        );
         assert!(
             save < select,
             "the mask opens before the selection publishes anything"

@@ -400,7 +400,11 @@ fn deferred(reason: &'static str) -> bool {
 }
 
 /// The whole enable order. Returns `true` once the source is live.
-pub fn enable_source() -> bool {
+///
+/// BLR1: runs inside the boot exclusive phase (from `start_bsp_periodic_timer`), so the route is
+/// read from the exclusive state the caller lends — never through the installed `SharedKernel`,
+/// which would be a second path to the state the token owns.
+pub fn enable_source(kernel: &crate::kernel::boot::KernelState) -> bool {
     // x86_64 boot opens interrupts (`enable_interrupts_for_boot`) before the timer is armed, so IF
     // is normally already 1 here. The whole ordered sequence runs with IF cleared, and the CPU's
     // admission is restored only after the redirection entry is unmasked: the CPU can take this
@@ -411,7 +415,7 @@ pub fn enable_source() -> bool {
         core::arch::asm!("pushfq", "pop {}", "cli", out(reg) rflags);
     }
     let was_enabled = (rflags >> 9) & 1 == 1;
-    let ok = enable_source_interrupts_off(was_enabled);
+    let ok = enable_source_interrupts_off(was_enabled, kernel);
     if was_enabled {
         // SAFETY: restores the interrupt flag this function found.
         unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
@@ -426,7 +430,10 @@ pub fn enable_source() -> bool {
     ok
 }
 
-fn enable_source_interrupts_off(if_at_call: bool) -> bool {
+fn enable_source_interrupts_off(
+    if_at_call: bool,
+    kernel: &crate::kernel::boot::KernelState,
+) -> bool {
     if !ROUTE_READY.load(Ordering::Acquire) {
         return deferred("route_not_derived");
     }
@@ -483,9 +490,7 @@ fn enable_source_interrupts_off(if_at_call: bool) -> bool {
     }
 
     // ── 2. The route must already be bound through the production owner ───────────────────────
-    let route = crate::arch::x86_64::descriptor_tables::trap_shared_kernel().and_then(|shared| {
-        shared.with_ipc_split_mut(|ipc| ipc.irq_routes.get(gsi as usize).copied().flatten())
-    });
+    let route = kernel.with_ipc_state(|ipc| ipc.irq_routes.get(gsi as usize).copied().flatten());
     let Some(notification_idx) = route else {
         return deferred("route_unbound");
     };

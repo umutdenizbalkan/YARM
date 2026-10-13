@@ -364,7 +364,10 @@ fn deferred(reason: &'static str) -> bool {
 
 /// Steps 1–6 of the enable order, run immediately before the PE-level unmask. Returns `true` once
 /// the source is live; any failed step leaves it off and says which.
-pub fn enable_source_before_unmask() -> bool {
+///
+/// BLR1: runs inside the boot exclusive phase, so the route is read from the exclusive state the
+/// caller lends, not through the installed `SharedKernel`.
+pub fn enable_source_before_unmask(kernel: &crate::kernel::boot::KernelState) -> bool {
     let intid = INTID.load(Ordering::Acquire);
     let uart = UART_PA.load(Ordering::Acquire);
     if intid < 32 || uart == 0 {
@@ -423,9 +426,7 @@ pub fn enable_source_before_unmask() -> bool {
     }
 
     // ── 2. The route must already be bound through the production owner ───────────────────────
-    let route = super::boot::trap_shared_kernel().and_then(|shared| {
-        shared.with_ipc_split_mut(|ipc| ipc.irq_routes.get(intid as usize).copied().flatten())
-    });
+    let route = kernel.with_ipc_state(|ipc| ipc.irq_routes.get(intid as usize).copied().flatten());
     let Some(notification_idx) = route else {
         return deferred("route_unbound");
     };

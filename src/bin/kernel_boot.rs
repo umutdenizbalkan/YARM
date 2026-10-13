@@ -9,9 +9,23 @@
 static KERNEL_GLOBAL_ALLOCATOR: yarm::kernel::global_allocator::KernelGlobalAllocator =
     yarm::kernel::global_allocator::KERNEL_GLOBAL_ALLOCATOR;
 
+/// The boot CPU's scheduler entry. Everything here runs in the BOOT EXCLUSIVE PHASE (BLR1): `boot`
+/// is the only path to the kernel state until `enter_dispatched_user_task_if_available` — or the
+/// idle arm below — consumes it with `publish`.
+///
+/// The phase is genuinely exclusive, not merely early:
+///   * secondaries touch no shared state before publication — AArch64 and RISC-V wait for the
+///     boot-borrow-ended release, x86_64 receives its first dispatch request only then, and a
+///     secondary without the user-dispatch knob never touches it at all;
+///   * interrupts are masked from BEFORE the first interrupt source is armed (the exclusion below
+///     opens ahead of `start_bsp_periodic_timer`) until the architectural return to user mode;
+///   * every trap entry refuses to reach the shared kernel while the phase is open.
+/// The one-shot diagnostic proofs and the x86_64 SMP-unlock audit below therefore run with real
+/// whole-state exclusivity; none of them needs it at runtime, and none runs after publication.
 #[cfg(not(test))]
-fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
+fn run_scheduler_loop(mut boot: yarm::runtime::BootExclusive) {
     const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
+    let kernel = boot.state();
     let cpu = kernel.current_cpu();
     if let Err(err) = yarm::arch::boot_entry::bootstrap_first_user_task(kernel) {
         yarm::pr_err!("failed to bootstrap first user task: {:?}", err);
@@ -21,11 +35,17 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     // are spawned and enqueued. Must come after bootstrap_first_user_task and
     // release_secondary_cpus_after_bootstrap complete.
     yarm::arch::boot_entry::signal_bootstrap_scheduler_ready();
+    // BLR1 — THE EXCLUSION OPENS HERE, BEFORE THE FIRST INTERRUPT SOURCE IS ARMED.
+    //
+    // U9-TIMER5 opened it before `dispatch_ready_task()` (see below); that was still after
+    // `start_bsp_periodic_timer`, which on AArch64 ended with the PE-level unmask. Between the two
+    // a timer could be taken with the boot `&mut KernelState` live and reach the same state
+    // through the shared trap path. The arm now runs inside the mask and leaves its unmask owed
+    // (`BspTimerArm`), so no interrupt is admitted on this CPU until the architectural return —
+    // after publication — or `finish_bsp_timer_unmask` on the idle arm, also after publication.
+    let boot_irq_state = yarm::arch::irq_guard::irq_save();
     // x86_64 BT2: arm the BSP LAPIC timer only after bootstrap completes.
-    // The timer was intentionally not armed during LAPIC init or
-    // run_with_prepared_kernel, so no timer ISR could race with
-    // borrow_kernel_for_boot()'s raw &mut alias during ELF loading.
-    yarm::arch::boot_entry::start_bsp_periodic_timer(kernel);
+    let timer_arm = yarm::arch::boot_entry::start_bsp_periodic_timer(kernel);
     if DEBUG_DISPATCH_CONTEXT_LOG {
         yarm::yarm_log!("BSP_POST_RELEASE cpu={}", cpu.0);
         yarm::yarm_log!("BSP_REDISPATCH_BEGIN cpu={}", cpu.0);
@@ -42,7 +62,8 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
         yarm::arch::platform_constants::BOOTSTRAP_CPU_ID
     );
 
-    // U9-TIMER5 §1 — THE EXCLUSION OPENS HERE, BEFORE THE SELECTION.
+    // U9-TIMER5 §1 — THE EXCLUSION COVERS THE SELECTION. (BLR1 opened it earlier still, ahead of
+    // the timer arm above; the TIMER5 reasoning below is why it must not open any later.)
     //
     // U9-TIMER4 established that a trap taken between `dispatch_ready_task()` and the
     // architectural entry corrupts the selected task's saved context, and closed the window with
@@ -62,7 +83,6 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
     // corruption needed a timer to land in a window of a few hundred instructions, and the
     // selection is a handful more. Passing boots distinguish "did not happen this time" from
     // "cannot happen"; only the mask does the latter.
-    let boot_irq_state = yarm::arch::irq_guard::irq_save();
     let initial = kernel.dispatch_ready_task().ok().flatten();
     // U9-RECV-BLOCK2 §3 — the one-shot x86_64 SMP-unlock audit, driven from the BOOT OWNERSHIP
     // POINT that already holds `&mut KernelState`, so it costs no broad acquisition.
@@ -148,12 +168,18 @@ fn run_scheduler_loop(kernel: &mut yarm::kernel::boot::KernelState) {
             );
             yarm::yarm_log!("DISPATCH: before enter_user_call");
         }
-        yarm::arch::boot_entry::enter_dispatched_user_task_if_available(kernel, Some(tid));
-        // Only reached when the entry declined; the architectural return restores the user
-        // interrupt state itself.
+        // Consumes the boot token: published before the architectural return.
+        let _published =
+            yarm::arch::boot_entry::enter_dispatched_user_task_if_available(boot, Some(tid));
+        // Only reached when the entry declined (the token is published either way); the
+        // architectural return restores the user interrupt state itself.
         yarm::arch::irq_guard::irq_restore(boot_irq_state);
+        yarm::arch::boot_entry::finish_bsp_timer_unmask(timer_arm);
     } else {
+        // No task: end the exclusive phase explicitly before anything can be admitted.
+        let _published = boot.publish();
         yarm::arch::irq_guard::irq_restore(boot_irq_state);
+        yarm::arch::boot_entry::finish_bsp_timer_unmask(timer_arm);
         if cpu.0 == yarm::arch::platform_constants::BOOTSTRAP_CPU_ID {
             yarm::yarm_log!("BSP_REDISPATCH_SELECTED tid=None");
         } else {

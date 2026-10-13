@@ -29,14 +29,20 @@ pub fn release_secondary_cpus_after_bootstrap() {
     crate::arch::selected_isa::boot::release_secondary_cpus_after_bootstrap()
 }
 
+/// Enter the first dispatched user task, ENDING the boot exclusive phase (BLR1).
+///
+/// Consumes the boot token: the arch reads everything it needs from the exclusive state, then
+/// publishes it, releases any secondary waiting for publication, and returns to user mode. It
+/// returns — with the published kernel — only when the entry declined; the exclusive phase is
+/// over either way.
 pub fn enter_dispatched_user_task_if_available(
-    kernel: &crate::kernel::boot::KernelState,
+    boot: crate::runtime::BootExclusive,
     dispatched_tid: Option<u64>,
-) {
-    crate::arch::selected_isa::boot::enter_dispatched_user_task_if_available(kernel, dispatched_tid)
+) -> &'static crate::runtime::SharedKernel {
+    crate::arch::selected_isa::boot::enter_dispatched_user_task_if_available(boot, dispatched_tid)
 }
 
-pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
+pub fn run_with_prepared_kernel(run: fn(crate::runtime::BootExclusive)) {
     crate::arch::selected_isa::boot::run_with_prepared_kernel(run)
 }
 
@@ -92,7 +98,17 @@ pub fn signal_bootstrap_scheduler_ready() {
 /// On x86_64 bare metal the timer was intentionally not armed during LAPIC init
 /// or run_with_prepared_kernel (BT2 fix) — this is the single point where the
 /// BSP timer starts. No-op on other architectures and hosted-dev.
-pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
+///
+/// BLR1: this runs INSIDE the boot exclusive phase, with interrupts already masked by the caller
+/// (`run_scheduler_loop` opens its exclusion before this arm). It therefore arms, but never
+/// admits: on AArch64 the PE-level unmask that used to end this function is returned as
+/// [`BspTimerArm::UnmaskOwed`] and performed by the architectural return to EL0 (whose SPSR has
+/// `DAIF.I` clear) or, if no task is entered, by [`finish_bsp_timer_unmask`] after publication.
+/// Before BLR1 the unmask happened here and the caller masked again a few statements later — a
+/// window in which a timer could reach the shared kernel while the boot `&mut` was still live.
+pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) -> BspTimerArm {
+    #[allow(unused_mut)] // only the AArch64 arm assigns it
+    let mut arm = BspTimerArm::NothingOwed;
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     {
         kernel.program_timer_deadline_current_cpu(
@@ -103,7 +119,7 @@ pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
         // the LAPIC and the tick are in place and after `bootstrap_first_user_task` bound its
         // route; the I/O APIC entry is unmasked last.
         #[cfg(feature = "x86_64-uart-irq-witness")]
-        let _ = crate::arch::x86_64::uart_irq_witness::enable_source();
+        let _ = crate::arch::x86_64::uart_irq_witness::enable_source(kernel);
     }
     // Canonical 199E — the AArch64 default production scheduler tick.
     //
@@ -153,7 +169,8 @@ pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
                 // the shared trap state and the GIC are confirmed and after `bootstrap_first_user_task`
                 // bound its route, and before the PE-level unmask below, which stays last.
                 #[cfg(feature = "aarch64-pl011-irq-witness")]
-                let _ = crate::arch::aarch64::pl011_irq_witness::enable_source_before_unmask();
+                let _ =
+                    crate::arch::aarch64::pl011_irq_witness::enable_source_before_unmask(kernel);
                 // QEMU-SMP2 §2: under the default-off knob the BSP's own banked SGI state and
                 // interface bit, published before the unmask for the same reason the PL011 is.
                 if crate::arch::aarch64::smp::requested()
@@ -165,8 +182,10 @@ pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
                         reason
                     );
                 }
-                // Everything the first IRQ will need is confirmed present. Only now.
-                crate::arch::aarch64::irq::enable_interrupts_for_boot();
+                // Everything the first IRQ will need is confirmed present. The PE-level unmask
+                // is owed, and stays last: BLR1 moves it out of this function, to the first return
+                // to EL0 or `finish_bsp_timer_unmask` — both after publication.
+                arm = BspTimerArm::UnmaskOwed;
                 crate::yarm_log!(
                     "AARCH64_BSP_TIMER_STARTED cpu={} intid={} interval_ticks={}",
                     cpu.0,
@@ -181,6 +200,29 @@ pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) {
         not(any(target_arch = "x86_64", target_arch = "aarch64"))
     ))]
     let _ = kernel;
+    arm
+}
+
+/// What the BSP timer arm left owed (BLR1). See [`start_bsp_periodic_timer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "an owed unmask must reach `finish_bsp_timer_unmask` or a return to user mode"]
+pub enum BspTimerArm {
+    /// Nothing to admit: this architecture's arm does not touch the PE mask, or the arm was
+    /// skipped and the CPU is exactly as it was.
+    NothingOwed,
+    /// AArch64: the timer is armed and confirmed; the PE-level IRQ unmask is still owed.
+    UnmaskOwed,
+}
+
+/// Admit the BSP timer interrupt that [`start_bsp_periodic_timer`] armed, when the boot path
+/// leaves the exclusive phase WITHOUT returning to user mode (no task was entered). Must be called
+/// only after publication and after the caller's own interrupt-state restore.
+pub fn finish_bsp_timer_unmask(arm: BspTimerArm) {
+    if arm == BspTimerArm::UnmaskOwed {
+        debug_assert!(crate::runtime::boot_state_published());
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+        crate::arch::aarch64::irq::enable_interrupts_for_boot();
+    }
 }
 
 struct IrqDescriptionLockGuard;

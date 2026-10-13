@@ -2906,7 +2906,6 @@ fn c2b2_request_managed_idle(cpu: CpuId) -> ! {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     use super::ap_dispatch;
-    use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
 
     // Stage 190B: build a small CONTROLLED workload of admitted tasks for this AP
     // (one shared per-AP ASID, distinct TIDs). Sequential single-AP execution.
@@ -3031,7 +3030,6 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     // without the clear every task after the first would take the park arm on its first `0xA9C6`
     // and never reach ring 3 again.
     super::percpu::clear_ap_syscall_reentry_ok(cpu);
-    super::percpu::set_ap_dispatch_request(cpu, 1);
     crate::yarm_log!(
         "X86_AP_LIVE_DISPATCH_ARMED cpu={} tid={} cr3=0x{:x} entry=0x{:x} stack=0x{:x} rsp0=0x{:x}",
         cpu.0,
@@ -3041,16 +3039,62 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
         ustack,
         kernel_rsp0
     );
+    // BLR1: the dispatch REQUEST and its wake are what let this AP touch shared kernel state (its
+    // first workload task enters ring 3 and traps into the shared kernel). This runs inside the
+    // boot exclusive phase — the BSP still holds the only path to the state and will use it again
+    // before its own first user entry — so the request is owed, not sent: the BSP sends it at
+    // publication, after the last use of its exclusive state. The plan above is fully published
+    // either way; only its trigger moves.
+    request_ap_dispatch_at_or_after_publication(cpu);
+}
+
+/// BLR1 — CPUs whose first live dispatch request is owed at the BSP's publication.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static AP_DISPATCH_OWED_AT_PUBLICATION: AtomicU64 = AtomicU64::new(0);
+
+/// BLR1: post `cpu`'s dispatch request now if the boot state is already published, otherwise
+/// record it for [`release_deferred_ap_dispatch_at_publication`].
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn request_ap_dispatch_at_or_after_publication(cpu: CpuId) {
+    if crate::runtime::boot_state_published() {
+        send_ap_dispatch_request(cpu);
+        return;
+    }
+    AP_DISPATCH_OWED_AT_PUBLICATION.fetch_or(1u64 << (cpu.0 as u64 & 63), Ordering::AcqRel);
+    crate::yarm_log!(
+        "X86_AP_DISPATCH_REQUEST_OWED cpu={} until=boot_publication",
+        cpu.0
+    );
+}
+
+/// BLR1: called by the BSP immediately after it publishes the boot state and before its own
+/// `iretq`: post every owed dispatch request. The AP may touch shared kernel state from here on.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn release_deferred_ap_dispatch_at_publication() {
+    debug_assert!(crate::runtime::boot_state_published());
+    let owed = AP_DISPATCH_OWED_AT_PUBLICATION.swap(0, Ordering::AcqRel);
+    for raw in 0..crate::arch::platform_constants::MAX_CPUS.min(64) {
+        if owed & (1u64 << raw) != 0 {
+            crate::yarm_log!(
+                "X86_AP_DISPATCH_REQUEST_RELEASED cpu={} at=boot_publication",
+                raw
+            );
+            send_ap_dispatch_request(CpuId(raw as u8));
+        }
+    }
+}
+
+/// Post `cpu`'s dispatch request and wake it (vector 0xF1).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn send_ap_dispatch_request(cpu: CpuId) {
+    use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+    super::percpu::set_ap_dispatch_request(cpu, 1);
     wait_for_icr_idle(cpu.0, "before_ap_dispatch");
     write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
 
-    // Do NOT poll here. The AP's probe issues a NORMAL syscall that takes the SAME
-    // global lock this audit currently holds — so the BSP must RELEASE it promptly.
-    // We return immediately (a very short settle so the wake IPI is observed but the
-    // lock is not held long); the audit unwinds, its `with_cpu` drops the global lock,
-    // and the armed AP(s) then run their seals concurrently, contending for the lock
-    // exactly as any real SMP syscall would. The seal verdict is emitted by the AP's
-    // own syscall (X86_AP_USER_DISPATCH_SEAL_DONE result=ok), not by the BSP.
+    // Do NOT poll here. The AP's probe issues a NORMAL syscall into the shared kernel, and the
+    // seal verdict is emitted by the AP's own syscall (X86_AP_USER_DISPATCH_SEAL_DONE result=ok),
+    // not by the BSP. A very short settle lets the wake IPI be observed.
     for _ in 0..50_000 {
         cpu_relax();
     }

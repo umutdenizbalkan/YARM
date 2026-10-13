@@ -1291,9 +1291,12 @@ pub fn release_secondary_cpus_after_bootstrap() {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn enter_dispatched_user_task_if_available(
-    kernel: &crate::kernel::boot::KernelState,
+    mut boot: crate::runtime::BootExclusive,
     dispatched_tid: Option<u64>,
-) {
+) -> &'static crate::runtime::SharedKernel {
+    // BLR1: every read below is from the exclusive state; the token is published immediately
+    // before the `iretq`, and every early return publishes it too — the phase ends either way.
+    let kernel = boot.state();
     if let Some(tid) = dispatched_tid {
         // U9-RECV-FINAL — the cross-arch live audit runs HERE, at first dispatch, while
         // `&KernelState` is already held. Read-only, one-shot, shared latch with the trap-path
@@ -1307,7 +1310,7 @@ pub fn enter_dispatched_user_task_if_available(
         if DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid=<none>");
         }
-        return;
+        return boot.publish();
     };
     if DEBUG_DISPATCH_CONTEXT_LOG {
         crate::yarm_log!("ENTER_USER_LOOKUP tid={}", tid);
@@ -1316,19 +1319,19 @@ pub fn enter_dispatched_user_task_if_available(
         if DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("ENTER_USER_REJECT_IDLE tid={}", tid);
         }
-        return;
+        return boot.publish();
     }
     let Some(asid) = kernel.task_asid(tid) else {
         if DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid={} reason=missing_asid", tid);
         }
-        return;
+        return boot.publish();
     };
     let Some(context) = kernel.thread_user_context(tid) else {
         if DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("ENTER_USER_LOOKUP_MISS tid={} reason=missing_context", tid);
         }
-        return;
+        return boot.publish();
     };
     if context.instruction_ptr.0 != 0 && context.stack_ptr.0 != 0 {
         let entry_resolve =
@@ -1346,7 +1349,7 @@ pub fn enter_dispatched_user_task_if_available(
             stack_resolve
         );
         if !entry_resolve || !stack_resolve {
-            return;
+            return boot.publish();
         }
         // The initial stack pointer is pre-adjusted to RSP ≡ 8 (mod 16) for
         // x86-64 SysV ABI compliance (see spawn_user_task_from_image in
@@ -1356,11 +1359,11 @@ pub fn enter_dispatched_user_task_if_available(
                 "ENTER_USER_ABORT reason=stack_unaligned rsp=0x{:x}",
                 context.stack_ptr.0
             );
-            return;
+            return boot.publish();
         }
         crate::yarm_log!("BOOTSTRAP_STAGE: before enter_user_mode");
         let Ok(intended_cr3) = super::page_table::activate_asid(asid) else {
-            return;
+            return boot.publish();
         };
         let mut active_cr3: u64 = 0;
         unsafe {
@@ -1400,6 +1403,12 @@ pub fn enter_dispatched_user_task_if_available(
         }
         // Stage 140: enforce hw CR3 == task_cr3 immediately before IRET.
         super::trap::ensure_user_return_cr3(kernel, tid, asid);
+        // BLR1 — END OF THE BOOT EXCLUSIVE PHASE. `kernel` is not used past this line (the
+        // compiler holds us to it: `publish` consumes the token it was borrowed from). Only now
+        // may a secondary receive its first dispatch request; this CPU's interrupts stay masked
+        // until the `iretq` below loads the user RFLAGS.
+        let _shared = boot.publish();
+        crate::arch::x86_64::smp::release_deferred_ap_dispatch_at_publication();
         #[allow(unreachable_code)]
         {
             // The stack pointer was pre-adjusted to RSP ≡ 8 (mod 16) at task
@@ -1420,13 +1429,15 @@ pub fn enter_dispatched_user_task_if_available(
             crate::yarm_log!("RETURNED_FROM_USER");
         }
     }
+    boot.publish()
 }
 
 #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
 pub fn enter_dispatched_user_task_if_available(
-    _kernel: &crate::kernel::boot::KernelState,
+    boot: crate::runtime::BootExclusive,
     _dispatched_tid: Option<u64>,
-) {
+) -> &'static crate::runtime::SharedKernel {
+    boot.publish()
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -1805,14 +1816,14 @@ fn debug_uart_marker(byte: u8) {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
+pub fn run_with_prepared_kernel(run: fn(crate::runtime::BootExclusive)) {
     use crate::kernel::boot::Bootstrap;
 
     // Descriptor tables are scaffolded during prepare_arch_boot() before run_kernel_boot().
     // Keep the run path free from additional serial-marker calls so boot remains deterministic.
     let prepared_len = PREPARED_PVH_BOOT_MEMMAP_LEN.load(core::sync::atomic::Ordering::Acquire);
     crate::arch::x86_64::console::write_line("KI0");
-    let shared = if prepared_len > 0 {
+    let mut boot = if prepared_len > 0 {
         let boot_regions = unsafe { &PREPARED_PVH_BOOT_MEMMAP[..prepared_len] };
         let reserved_ranges = Bootstrap::default_reserved_ranges_for_arch_boot();
         Bootstrap::init_shared_static_with_boot_memory_map(
@@ -1826,16 +1837,17 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     };
     crate::arch::x86_64::console::write_line("KI1");
     crate::yarm_log!("YARM_BOOT_INIT_READY prepared_pvh_regions={}", prepared_len);
-    // SAFETY: single-CPU boot; interrupts are disabled (STI not yet called);
-    // TRAP_SHARED_KERNEL_PTR is written by install_trap_shared_kernel below,
-    // which happens before STI. The BSP LAPIC timer is NOT armed here (BT2 fix):
-    // init_lapic_mmio_base no longer programs the timer, and the explicit arm
-    // below was removed. The timer is armed by start_bsp_periodic_timer() only
-    // after signal_bootstrap_scheduler_ready() completes, so no timer ISR can
-    // race with borrow_kernel_for_boot()'s raw &mut KernelState alias during
-    // bootstrap ELF loading (which takes >800ms in QEMU on slow hosts).
-    let kernel = unsafe { shared.borrow_kernel_for_boot() };
-    crate::arch::x86_64::descriptor_tables::install_trap_shared_kernel(shared);
+    // BLR1: `boot` is the exclusive owner of the kernel state until the first user entry
+    // publishes it. The trap-entry target is installed now (before STI) but every trap entry
+    // refuses to use it before publication. The BSP LAPIC timer is NOT armed here (BT2 fix):
+    // `start_bsp_periodic_timer` arms it, inside the boot CPU's interrupt exclusion, so no timer
+    // ISR is admitted before publication. The secondaries started below park in their pure-asm
+    // idle loop and touch no kernel state until their first dispatch request, which is sent only
+    // at publication (`release_deferred_ap_dispatch_at_publication`).
+    crate::arch::x86_64::descriptor_tables::install_trap_shared_kernel(
+        boot.shared_for_trap_installation(),
+    );
+    let kernel = boot.state();
     crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=x86_64 shared=1 raw=0");
     crate::arch::irq_guard::configure_external_irq_controller_from_platform_layout();
     crate::yarm_log!("YARM_SMP_LAPIC_READY source=platform_layout");
@@ -1860,13 +1872,16 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.online_cpu_count()
     );
     crate::yarm_log!("YARM_BOOT_STAGE pre_scheduler_bootstrap");
-    run(kernel);
+    run(boot);
 }
 
 #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
-pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
+pub fn run_with_prepared_kernel(run: fn(crate::runtime::BootExclusive)) {
     use crate::kernel::boot::Bootstrap;
-    let mut kernel = Bootstrap::init().expect("kernel init");
+    // BLR1: the hosted boot owns its state through the same exclusive token as the freestanding
+    // ports, so there is one construction and one publication path.
+    let mut boot = Bootstrap::init_shared_static().expect("kernel init");
+    let kernel = boot.state();
     // Stage 200C2C2C-R2C: one-shot boot-instance identifier (see `emit_boot_instance_nonce`).
     crate::kernel::boot::emit_boot_instance_nonce("x86_64");
     crate::yarm_log!(
@@ -1875,7 +1890,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.present_cpu_bitmap(),
         kernel.online_cpu_count()
     );
-    run(&mut kernel);
+    run(boot);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]

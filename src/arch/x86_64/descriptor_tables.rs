@@ -2,8 +2,6 @@
 // Copyright 2026 Umut Deniz Balkan
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-use core::sync::atomic::AtomicU8;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -319,31 +317,14 @@ const UNMAPPED_CPU: usize = usize::MAX;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static APIC_TO_CPU_ID: [AtomicUsize; 256] = [const { AtomicUsize::new(UNMAPPED_CPU) }; 256];
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const TRAP_KERNEL_STATE_UNINITIALIZED: u8 = 0;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const TRAP_KERNEL_STATE_READY: u8 = 1;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-static TRAP_KERNEL_STATE_STATUS: AtomicU8 = AtomicU8::new(TRAP_KERNEL_STATE_UNINITIALIZED);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-struct TrapKernelStateCell(
-    core::cell::UnsafeCell<core::mem::MaybeUninit<crate::kernel::boot::KernelState>>,
-);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-unsafe impl Sync for TrapKernelStateCell {}
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-#[unsafe(link_section = ".bss.kernel_state")]
-static TRAP_KERNEL_STATE: TrapKernelStateCell =
-    TrapKernelStateCell(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_SHARED_KERNEL_PTR: core::sync::atomic::AtomicPtr<crate::runtime::SharedKernel> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static STAGE2N_FIRST_TRAP_LOGGED: AtomicBool = AtomicBool::new(false);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-static STAGE2N_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 /// Set to true after bootstrap_first_user_task completes and all user tasks are
 /// enqueued. The timer ISR checks this flag: if false, it does EOI-only and
-/// re-arms without ticking/yielding, to avoid racing with borrow_kernel_for_boot.
+/// re-arms without ticking/yielding. (BLR1: the boot CPU's own timer is not even admitted before
+/// the boot state is published; this flag remains the ISR's EOI-only gate.)
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static BOOTSTRAP_SCHEDULER_READY: AtomicBool = AtomicBool::new(false);
 
@@ -540,49 +521,12 @@ fn encode_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-pub fn install_trap_kernel_state(
-    kernel: crate::kernel::boot::KernelState,
-) -> &'static mut crate::kernel::boot::KernelState {
-    if TRAP_KERNEL_STATE_STATUS
-        .compare_exchange(
-            TRAP_KERNEL_STATE_UNINITIALIZED,
-            TRAP_KERNEL_STATE_READY,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        panic!("trap kernel state already installed");
-    }
-    let kernel = unsafe {
-        let slot = &mut *TRAP_KERNEL_STATE.0.get();
-        slot.write(kernel)
-    };
-    register_apic_cpu_mapping(
-        raw_current_apic_id() as u8,
-        crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID),
-    );
-    kernel
-}
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn install_trap_shared_kernel(shared: &'static crate::runtime::SharedKernel) {
     register_apic_cpu_mapping(
         raw_current_apic_id() as u8,
         crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID),
     );
     TRAP_SHARED_KERNEL_PTR.store(shared as *const _ as *mut _, Ordering::SeqCst);
-}
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelState> {
-    if TRAP_KERNEL_STATE_STATUS.load(Ordering::Acquire) != TRAP_KERNEL_STATE_READY {
-        return None;
-    }
-    Some(unsafe {
-        let slot = &mut *TRAP_KERNEL_STATE.0.get();
-        &mut *slot.as_mut_ptr()
-    })
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -1455,14 +1399,6 @@ fn x86_trap_dispatch_body(
     interrupt_frame: *mut X86InterruptStackFrame,
     entry_owner: Option<crate::runtime::FpuHomeOwner>,
 ) -> Option<crate::runtime::FpuHomeOwner> {
-    // Stage 30 / Review C1: in debug builds, assert no boot raw-borrow window is
-    // live. A timer/trap reaching with_cpu during that window would alias the boot
-    // &mut KernelState (UB). Compiles to nothing in release; zero ISR overhead.
-    #[cfg(any(debug_assertions, test))]
-    debug_assert!(
-        !crate::runtime::boot_raw_borrow_is_active(),
-        "x86_64 trap/timer ISR fired during boot raw-borrow window — aliasing &mut KernelState risk"
-    );
     let cpu_apic = raw_current_apic_id() as u64;
     // Stage 189D: per-CPU nested-trap guard index (see TRAP_DISPATCH_DEPTH doc).
     let depth_idx =
@@ -1515,6 +1451,8 @@ fn x86_trap_dispatch_body(
 
     // Stage 2N: prefer SharedKernel path when available.
     if let Some(shared) = trap_shared_kernel() {
+        // BLR1: never before the boot state is published (the boot CPU holds it exclusively).
+        crate::runtime::refuse_shared_entry_during_boot_exclusive("x86_64_trap_dispatch");
         if !STAGE2N_FIRST_TRAP_LOGGED.swap(true, Ordering::AcqRel) {
             crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FIRST_SHARED_TRAP arch=x86_64");
         }
@@ -1772,60 +1710,21 @@ fn x86_trap_dispatch_body(
         return trap_frame.resume_owner();
     }
 
-    // Fallback: raw KernelState path (pre-Stage2N or no shared kernel installed).
-    if !STAGE2N_FALLBACK_LOGGED.swap(true, Ordering::AcqRel) {
-        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FALLBACK arch=x86_64 reason=no_shared_kernel");
-    }
-    let Some(kernel) = trap_kernel_state_mut() else {
-        if should_halt_without_kernel_state(vector as usize) {
-            let fault_rip = frame.rip;
-            log_decoded_fatal_trap(None, vector, error_code, frame, fault_addr);
-            debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
-            TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
-            halt_forever();
-        }
+    // No shared kernel installed yet. BLR1 deleted the raw `&'static mut KernelState` fallback
+    // that used to stand here (`TRAP_KERNEL_STATE` / `install_trap_kernel_state` /
+    // `trap_kernel_state_mut`): nothing ever installed it, so it only ever halted or declined —
+    // and as a second whole-state path it could only ever have aliased the boot owner. A trap
+    // with no shared kernel is either fatal or ignored, exactly as the empty fallback was.
+    if should_halt_without_kernel_state(vector as usize) {
+        let fault_rip = frame.rip;
+        log_decoded_fatal_trap(None, vector, error_code, frame, fault_addr);
+        debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
         TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
-        return None;
-    };
-    let fault_rip = frame.rip;
-    let entering_tid = kernel.current_tid();
-    let mut trap_frame = unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
-    if let Err(err) = crate::arch::x86_64::trap::handle_trap_entry(
-        kernel,
-        current_cpu_id(),
-        context,
-        Some(&mut trap_frame),
-    ) {
-        crate::pr_err!(
-            "x86 trap dispatch failed: vector={} error_code=0x{:x} rip=0x{:016x} err={:?}",
-            vector,
-            error_code,
-            fault_rip,
-            err
-        );
-        log_decoded_fatal_trap(Some(kernel), vector, error_code, frame, fault_addr);
-        debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
         halt_forever();
     }
-    let exiting_tid = kernel.current_tid();
-    let task_switched = entering_tid != exiting_tid;
-    if matches!(exiting_tid, None | Some(0)) {
-        // Raw fallback for early boot/tests before the shared kernel pointer is
-        // installed.  TID 0 is idle-only on x86_64 and must not iretq through
-        // the stale user frame that entered the kernel.
-        crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", current_cpu_id().0);
-        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
-        idle_halt_loop();
-    }
-    if task_switched {
-        write_task_gprs_to_saved_regs(regs, &trap_frame);
-    } else if vector as usize == VEC_SYSCALL {
-        write_trap_returns_to_saved_regs(regs, &trap_frame);
-    }
-    unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
+    let _ = (context, regs);
     TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
-    // No shared kernel: neither the entry commit nor the return settlement runs on this path.
-    trap_frame.resume_owner()
+    None
 }
 
 /// QEMU-CONTEXT1 §2 — the MXCSR every kernel entry installs after capturing the user's: all

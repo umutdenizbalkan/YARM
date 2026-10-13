@@ -9,15 +9,13 @@ unsafe extern "C" {
     static __kernel_end: u8;
 }
 
-static mut BOOTSTRAP_KERNEL_STATE: core::mem::MaybeUninit<KernelState> =
-    core::mem::MaybeUninit::uninit();
-
-// Canonical boot-owned SharedKernel; written exactly once by init_shared_static*.
-// After write, only init_shared_static* touches this storage — no &'static mut KernelState
-// alias may be live at the same time (enforced by calling site convention, see §Phase L2A).
+// Canonical boot-owned SharedKernel; constructed IN PLACE exactly once by init_shared_static*,
+// so its state has its final address from the first byte written (BLR1). Its whole state is
+// reachable only through the `BootExclusive` token init_shared_static* returns, until that token
+// is published; afterwards only through the SharedKernel domain owners.
 //
-// Accessed only via addr_of_mut!/addr_of! + raw pointer operations (matching the
-// BOOTSTRAP_KERNEL_STATE pattern) to avoid the static_mut_refs lint.
+// Accessed only via addr_of_mut!/addr_of! + raw pointer operations to avoid the static_mut_refs
+// lint.
 static mut BOOTSTRAP_SHARED_KERNEL: core::mem::MaybeUninit<crate::runtime::SharedKernel> =
     core::mem::MaybeUninit::uninit();
 
@@ -422,22 +420,6 @@ impl Bootstrap {
         Self::init_boxed_with_capacity_profile(Self::default_capacity_profile())
     }
 
-    pub fn init_static() -> Result<&'static mut KernelState, KernelError> {
-        Self::init_static_with_capacity_profile(Self::default_capacity_profile())
-    }
-
-    pub fn init_static_with_capacity_profile(
-        capacity_profile: KernelCapacityProfile,
-    ) -> Result<&'static mut KernelState, KernelError> {
-        let (boot_map, boot_map_len) = Self::default_boot_memory_map();
-        let reserved = Self::default_reserved_ranges();
-        Self::init_static_with_boot_memory_map(
-            capacity_profile,
-            &boot_map[..boot_map_len],
-            &reserved,
-        )
-    }
-
     #[inline(never)]
     pub fn init_with_capacity_profile(
         capacity_profile: KernelCapacityProfile,
@@ -461,13 +443,14 @@ impl Bootstrap {
 
     /// Construct an OWNED `KernelState` directly into freshly allocated storage.
     ///
-    /// This deliberately does NOT route through `BOOTSTRAP_KERNEL_STATE`. That static is a
-    /// single process-global buffer, so building an owned state through it made every
+    /// This deliberately does NOT route through a process-global buffer. The retired
+    /// `BOOTSTRAP_KERNEL_STATE` was one, so building an owned state through it made every
     /// caller share one scratch area: two concurrent constructions would overwrite each
     /// other's heap-owning fields without dropping them, and each would then copy out a
     /// bitwise duplicate of the same `Box`/`Vec`/`BTreeMap` pointers — two owners of one
-    /// allocation, and a double free when both were dropped. The owned path has no reason
-    /// to touch the boot singleton, so it no longer does.
+    /// allocation, and a double free when both were dropped. (BLR1 deleted that static and the
+    /// `init_static*` family that handed out `&'static mut` to it: the boot singleton is now
+    /// constructed in place inside `BOOTSTRAP_SHARED_KERNEL`.)
     #[inline(never)]
     pub fn init_boxed_with_boot_memory_map(
         capacity_profile: KernelCapacityProfile,
@@ -487,23 +470,6 @@ impl Bootstrap {
                 reserved_ranges,
             )?;
             Ok(boxed.assume_init())
-        }
-    }
-
-    #[inline(never)]
-    pub fn init_static_with_boot_memory_map(
-        capacity_profile: KernelCapacityProfile,
-        boot_regions: &[MemoryRegion],
-        reserved_ranges: &[(u64, u64)],
-    ) -> Result<&'static mut KernelState, KernelError> {
-        // SAFETY: `BOOTSTRAP_KERNEL_STATE` is the boot singleton's storage — correctly
-        // aligned and large enough for one `KernelState`. On `Ok` it is fully initialized,
-        // so handing out a `&'static mut` to it is sound; on `Err` it is left
-        // uninitialized and no reference is produced.
-        unsafe {
-            let state_ptr = core::ptr::addr_of_mut!(BOOTSTRAP_KERNEL_STATE).cast::<KernelState>();
-            Self::init_state_into(state_ptr, capacity_profile, boot_regions, reserved_ranges)?;
-            Ok(&mut *state_ptr)
         }
     }
 
@@ -796,36 +762,34 @@ impl Bootstrap {
         }
     }
 
-    // ── Phase L2A: canonical boot-owned SharedKernel construction ──────────────
+    // ── Phase L2A / BLR1: canonical boot-owned SharedKernel construction ──────────
     //
-    // These functions create the boot-time &'static SharedKernel without
-    // installing any trap state pointer.  Trap migration happens in a later
-    // phase.  The ownership contract is:
+    // The ownership contract (BROAD-LOCK-RETIREMENT1):
     //
-    //   1. init_static_with_boot_memory_map writes BOOTSTRAP_KERNEL_STATE and
-    //      returns a &'static mut KernelState aliasing that storage.
-    //   2. We immediately ptr::read the bytes out, consuming the alias.
-    //      After the read, the caller must not use the &'static mut ref again.
-    //   3. The owned KernelState is moved into SharedKernel::new, which stores
-    //      it inside a SpinLock inside BOOTSTRAP_SHARED_KERNEL.
-    //   4. BOOTSTRAP_SHARED_KERNEL is written exactly once; READY flag is set.
-    //   5. Neither install_trap_kernel_state nor install_trap_shared_kernel is
-    //      called here.  Stage 2N remains fallback-active.
+    //   1. READY 0 -> 1 claims construction (a second call panics).
+    //   2. The KernelState is built IN PLACE inside BOOTSTRAP_SHARED_KERNEL's state cell — no
+    //      intermediate static, no `&'static mut KernelState`, no move after construction, so
+    //      every pointer derived from the state later is derived from its final address.
+    //   3. READY 1 -> 2 marks the storage constructed; the returned `BootExclusive` token is the
+    //      ONLY path to the state. `shared_static_ref` still answers `None`: nothing may reach the
+    //      state through the static while the token is live.
+    //   4. `BootExclusive::publish` ends the phase. From then on `shared_static_ref` answers, and
+    //      every access is a domain owner.
+    //   5. No trap state is installed here; each arch installs its trap-entry target from the
+    //      token, and every trap entry refuses to use it before publication.
 
     /// Construct the canonical boot-owned `SharedKernel` using the default
-    /// capacity profile and boot memory map.
+    /// capacity profile and boot memory map, and claim its exclusive phase.
     ///
-    /// # Panics (in hosted-dev / test)
-    /// Panics if called a second time when `BOOTSTRAP_SHARED_KERNEL_READY` is
-    /// already set, matching the existing double-init guard pattern used by the
-    /// x86_64 `install_trap_kernel_state`.
-    pub fn init_shared_static() -> Result<&'static crate::runtime::SharedKernel, KernelError> {
+    /// # Panics
+    /// Panics if called a second time.
+    pub fn init_shared_static() -> Result<crate::runtime::BootExclusive, KernelError> {
         Self::init_shared_static_with_capacity_profile(Self::default_capacity_profile())
     }
 
     pub fn init_shared_static_with_capacity_profile(
         capacity_profile: KernelCapacityProfile,
-    ) -> Result<&'static crate::runtime::SharedKernel, KernelError> {
+    ) -> Result<crate::runtime::BootExclusive, KernelError> {
         let (boot_map, boot_map_len) = Self::default_boot_memory_map();
         let reserved = Self::default_reserved_ranges();
         Self::init_shared_static_with_boot_memory_map(
@@ -839,11 +803,9 @@ impl Bootstrap {
         capacity_profile: KernelCapacityProfile,
         boot_regions: &[MemoryRegion],
         reserved_ranges: &[(u64, u64)],
-    ) -> Result<&'static crate::runtime::SharedKernel, KernelError> {
+    ) -> Result<crate::runtime::BootExclusive, KernelError> {
         use core::sync::atomic::Ordering;
 
-        // Guard against double initialization with the same compare-exchange
-        // pattern used by x86_64's install_trap_kernel_state.
         if BOOTSTRAP_SHARED_KERNEL_READY
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -851,59 +813,41 @@ impl Bootstrap {
             panic!("init_shared_static called more than once");
         }
 
-        // Step 1: initialize KernelState into BOOTSTRAP_KERNEL_STATE.
-        let state_ref = Self::init_static_with_boot_memory_map(
-            capacity_profile,
-            boot_regions,
-            reserved_ranges,
-        )?;
-
-        // Step 2: move the KernelState bytes out of BOOTSTRAP_KERNEL_STATE.
-        // After this ptr::read the &'static mut ref must not be used again;
-        // BOOTSTRAP_KERNEL_STATE holds logically-moved-from bytes.
-        //
-        // SAFETY: init_static_with_boot_memory_map fully initializes the
-        // MaybeUninit storage and returns a valid &'static mut KernelState.
-        // ptr::read produces an owned copy; we drop the reference immediately.
-        let owned: KernelState = unsafe { core::ptr::read(state_ref as *const KernelState) };
-
-        // Step 3: wrap in SharedKernel and write into BOOTSTRAP_SHARED_KERNEL.
-        let shared = crate::runtime::SharedKernel::new(owned);
-        // SAFETY: single-writer guaranteed by the compare_exchange guard above;
-        // READY is still 1 (initializing), so no concurrent reader in
-        // shared_static_ref can yet observe the write target (it gates on == 2).
-        // We use addr_of_mut! + ptr::write to match the BOOTSTRAP_KERNEL_STATE
-        // pattern and avoid the static_mut_refs lint.
-        unsafe {
-            let ptr = core::ptr::addr_of_mut!(BOOTSTRAP_SHARED_KERNEL)
+        // SAFETY: READY == 1 makes this call the storage's only writer, and nothing reads it
+        // before READY == 2 and publication. `init_state_into` fully initializes the state field
+        // on `Ok` and leaves it uninitialized on `Err`, in which case nothing below runs and
+        // READY stays 1 (construction failed; there is no state to publish).
+        let shared: &'static crate::runtime::SharedKernel = unsafe {
+            let shared_ptr = core::ptr::addr_of_mut!(BOOTSTRAP_SHARED_KERNEL)
                 .cast::<crate::runtime::SharedKernel>();
-            core::ptr::write(ptr, shared);
-        }
+            let state_ptr = crate::runtime::SharedKernel::state_ptr_for_construction(shared_ptr);
+            Self::init_state_into(state_ptr, capacity_profile, boot_regions, reserved_ranges)?;
+            crate::runtime::SharedKernel::finish_in_place_construction(shared_ptr);
+            &*shared_ptr
+        };
 
-        // Publish: transition 1 (initializing) → 2 (ready).  The Release store
-        // pairs with the Acquire load in shared_static_ref, ensuring the
-        // ptr::write above is visible to any reader that observes READY == 2.
+        // Constructed. The Release store orders the construction before any later Acquire of
+        // READY; `shared_static_ref` additionally waits for publication.
         BOOTSTRAP_SHARED_KERNEL_READY.store(2, Ordering::Release);
 
-        // SAFETY: ptr::write above fully initialized the storage; the addr_of!
-        // cast to *const yields a pointer to a now-valid SharedKernel.
-        Ok(unsafe {
-            &*core::ptr::addr_of!(BOOTSTRAP_SHARED_KERNEL).cast::<crate::runtime::SharedKernel>()
-        })
+        // SAFETY: fully constructed above; the only reference is `shared`, which the token now
+        // owns.
+        Ok(unsafe { crate::runtime::BootExclusive::claim(shared) })
     }
 
-    /// Return the already-initialized boot `SharedKernel`, or `None` if
-    /// `init_shared_static*` has not been called yet.
+    /// Return the boot `SharedKernel` once its exclusive phase was PUBLISHED, else `None`.
     ///
-    /// This accessor never initializes or mutates the shared kernel.
+    /// Before publication the token is the only path to the state, so this accessor — which any
+    /// code can call — must not hand out a second one (BLR1). It never initializes or mutates.
     pub fn shared_static_ref() -> Option<&'static crate::runtime::SharedKernel> {
         use core::sync::atomic::Ordering;
-        if BOOTSTRAP_SHARED_KERNEL_READY.load(Ordering::Acquire) != 2 {
+        if BOOTSTRAP_SHARED_KERNEL_READY.load(Ordering::Acquire) != 2
+            || !crate::runtime::boot_state_published()
+        {
             return None;
         }
-        // SAFETY: READY == 2 means ptr::write(BOOTSTRAP_SHARED_KERNEL) completed
-        // and the Release store to READY=2 was observed by this Acquire load;
-        // the write is therefore fully visible here.
+        // SAFETY: READY == 2 means the in-place construction completed and its Release store was
+        // observed by this Acquire load.
         Some(unsafe {
             &*core::ptr::addr_of!(BOOTSTRAP_SHARED_KERNEL).cast::<crate::runtime::SharedKernel>()
         })

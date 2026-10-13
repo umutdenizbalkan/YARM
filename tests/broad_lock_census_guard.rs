@@ -259,9 +259,13 @@ const EXPECTED_WITH_BROAD: &[(&str, usize)] = &[
     // sequentially and never nested. `src/runtime.rs` now has NO production broad acquisition.
 ];
 
-/// Per-file count of raw `self.state.lock()` sites. All three are the bodies of
-/// `SharedKernel::lock` / `with` / `with_cpu` themselves.
-const EXPECTED_STATE_LOCK: &[(&str, usize)] = &[("src/runtime.rs", 3)];
+/// Per-file count of raw `self.state.lock()` sites.
+///
+/// BROAD-LOCK-RETIREMENT1: 3 -> 0. The three were the bodies of `SharedKernel::lock` / `with` /
+/// `with_cpu`. The production wrappers are deleted, the `SpinLock<KernelState>` they locked is
+/// deleted, and the hosted-test-only helpers that keep the names serialize on a separate
+/// `#[cfg(test)]` lock — so no raw broad-lock body exists in any build.
+const EXPECTED_STATE_LOCK: &[(&str, usize)] = &[];
 
 /// Textual matches in [`EXPECTED_WITH_BROAD`] that are not broad-lock acquisitions.
 const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
@@ -274,7 +278,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// would double-count the lock.
 const AUDITED_WITH_CPU_TOTAL: usize = 0; // U9-TERMINAL-FINAL §5: 2 -> 0 (both terminal broad trap dispatchers deleted; ZERO production `with_cpu` callsites remain). U9-RECV-BLOCK2 §3: 3 -> 2 (the SMP-unlock audit driver moved to the boot ownership point, which already owns `&mut KernelState`). U9-RECV-BLOCK1 §6: 2 -> 3. U9-D3 §7: 3 -> 2 (the D6 functional broad tail retired; only the two terminal dispatchers remain). U9-D3 §6: 6 -> 3 (all three ordinary rollback fallbacks retired). U9-C: 7 -> 6 (recv Phase-A retired). U3: 38 -> 33 -> 31 -> 30 -> 28 -> 26 -> 23 -> 22 -> 21 -> 20 -> 17 -> 16 -> 14 -> 13 -> 12 -> 11 -> 10 -> 9 -> 8 -> 7 (… the x86_64 BSP saved-resume preempt-and-prefer reacquisition, then the x86_64 ED-2 next-task placement)
 const AUDITED_WITH_BROAD_TOTAL: usize = 0; // U3: 6 -> 2 -> 1 -> 0 (runtime.rs fully drained, then both x86 SMP saved-resume reads retired). ZERO production broad `SharedKernel::with` callsites remain.
-const AUDITED_STATE_LOCK_TOTAL: usize = 3;
+const AUDITED_STATE_LOCK_TOTAL: usize = 0; // BLR1: 3 -> 0 (the broad lock and its wrappers are deleted)
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
 
 /// Stage 204A classification totals, as published in `doc/KERNEL_UNLOCK_AUDIT.md` §1.4a.
@@ -345,10 +349,12 @@ fn census(needle_pred: fn(&str) -> bool) -> BTreeMap<String, usize> {
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
-        let lines: Vec<&str> = text.lines().collect();
-        let cutoff = test_module_cutoff(&lines);
+        // BLR1: production text is the file minus EVERY `#[cfg(test)]` item, found on
+        // comment- and literal-blind code. The previous cut-off at the first `#[cfg(test)] mod
+        // tests` hid production code that follows a test module (`src/runtime.rs` has some).
+        let (production, _) = split_cfg_test(&text);
         let mut n = 0usize;
-        for line in lines.iter().take(cutoff) {
+        for line in production.lines() {
             if !is_comment(line) && needle_pred(line) {
                 n += 1;
             }
@@ -469,8 +475,8 @@ fn census_totals_are_internally_consistent() {
     );
     assert_eq!(
         state_lock, AUDITED_STATE_LOCK_TOTAL,
-        "raw state.lock() total drifted — these are the three `SharedKernel` method bodies; \
-         a fourth means the broad lock grew a new entry point"
+        "raw state.lock() total drifted — BLR1 deleted the broad lock; any raw `state.lock()` \
+         means it, or an equivalent, came back"
     );
     assert_eq!(
         with_cpu + with_broad,
@@ -661,4 +667,806 @@ fn neither_bridge_regrew_a_replacement_for_the_deleted_acquisition() {
         "the unowned `Syscall` settlement must write `InvalidNumber` into the caller's frame \
          and return `Ok(())`, exactly as the deleted broad arm did — not halt the kernel"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// BROAD-LOCK-RETIREMENT1 — the mechanism is deleted, and its reintroduction fails here.
+//
+// The census above counts ACQUISITIONS by their historical spelling. That stopped being enough
+// once the acquisitions reached zero: the remaining risk is the MECHANISM coming back — a
+// wrapper under another name, storage that wraps the whole state in a lock again, or the
+// hosted-test helpers leaking into a production build. These checks separate four things, and
+// the first three must be absent:
+//
+//   1. production broad ACQUISITIONS — any production expression that forms a whole-state
+//      reference from the `SharedKernel` storage, by any spelling;
+//   2. production broad-wrapper DEFINITIONS — any production function that lends, returns or
+//      takes a closure over `&mut KernelState` out of shared storage (only the boot token may);
+//   3. production broad-lock STORAGE — any lock type, cell or static holding a `KernelState`
+//      other than the one lock-free cell;
+//   4. explicitly TEST-ONLY support — present, and present only under exactly `#[cfg(test)]`.
+//
+// They read production text with every `#[cfg(test)]` item removed (comment- and literal-blind),
+// and the compile probe at the bottom checks the hosted non-test BUILD, not the source.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// Same-length copy of `text` with comments and string/char literals blanked, so structural
+/// scans see only code (and line numbers stay true).
+fn code_mask(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = b.to_vec();
+    let n = b.len();
+    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+        for x in out.iter_mut().take(to.min(n)).skip(from) {
+            if *x != b'\n' {
+                *x = b' ';
+            }
+        }
+    };
+    let mut i = 0;
+    while i < n {
+        if b[i] == b'/' && i + 1 < n && b[i + 1] == b'/' {
+            let j = text[i..].find('\n').map_or(n, |j| i + j);
+            blank(&mut out, i, j);
+            i = j;
+        } else if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            let (mut depth, mut j) = (1, i + 2);
+            while j < n && depth > 0 {
+                if b[j] == b'/' && j + 1 < n && b[j + 1] == b'*' {
+                    depth += 1;
+                    j += 2;
+                } else if b[j] == b'*' && j + 1 < n && b[j + 1] == b'/' {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            blank(&mut out, i, j);
+            i = j;
+        } else if b[i] == b'r'
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+            && i + 1 < n
+            && (b[i + 1] == b'"' || b[i + 1] == b'#')
+        {
+            let mut h = i + 1;
+            while h < n && b[h] == b'#' {
+                h += 1;
+            }
+            if h < n && b[h] == b'"' {
+                let hashes = h - (i + 1);
+                let close = format!("\"{}", "#".repeat(hashes));
+                let end = text[h + 1..]
+                    .find(&close)
+                    .map_or(n, |e| h + 1 + e + close.len());
+                blank(&mut out, i, end);
+                i = end;
+            } else {
+                i += 1;
+            }
+        } else if b[i] == b'"' {
+            let mut j = i + 1;
+            while j < n && b[j] != b'"' {
+                j += if b[j] == b'\\' { 2 } else { 1 };
+            }
+            blank(&mut out, i, j + 1);
+            i = j + 1;
+        } else if b[i] == b'\'' {
+            // A char literal, or a lifetime.
+            if i + 1 < n && b[i + 1] == b'\\' {
+                let j = text[i + 2..].find('\'').map_or(n, |e| i + 2 + e);
+                blank(&mut out, i, j + 1);
+                i = j + 1;
+            } else {
+                let ch_len = text[i + 1..].chars().next().map_or(1, char::len_utf8);
+                if i + 1 + ch_len < n && b[i + 1 + ch_len] == b'\'' {
+                    blank(&mut out, i, i + 2 + ch_len);
+                    i += 2 + ch_len;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    String::from_utf8(out).expect("blanking preserves UTF-8")
+}
+
+/// `(production, test)`: every item, field, statement or expression attributed with exactly
+/// `#[cfg(test)]` is test; everything else is production (newlines kept, so lines stay true).
+/// A different cfg — `cfg(any(test, ..))`, a feature — is production, deliberately.
+fn split_cfg_test(text: &str) -> (String, String) {
+    let code = code_mask(text);
+    let cb = code.as_bytes();
+    let (mut prod, mut test, mut i) = (String::new(), String::new(), 0usize);
+    let mut search = 0usize;
+    while let Some(off) = code[search..].find("#[cfg(test)]") {
+        let start = search + off;
+        let mut depth = 0i32;
+        let mut k = start + "#[cfg(test)]".len();
+        while k < cb.len() {
+            match cb[k] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    if depth == 0 {
+                        break; // the enclosing construct closes; the attributed one ended
+                    }
+                    depth -= 1;
+                    if depth == 0 && cb[k] == b'}' {
+                        k += 1;
+                        break;
+                    }
+                }
+                b';' | b',' if depth == 0 => {
+                    k += 1;
+                    break;
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        prod.push_str(&text[i..start]);
+        prod.push_str(&"\n".repeat(text[start..k].matches('\n').count()));
+        test.push_str(&text[start..k]);
+        i = k;
+        search = k;
+    }
+    prod.push_str(&text[i..]);
+    (prod, test)
+}
+
+/// Production code of every kernel-crate file (`src/`), comment- and literal-blind.
+fn kernel_production_code() -> Vec<(String, String)> {
+    let root = repo_root();
+    let mut out = Vec::new();
+    for path in production_rs_files() {
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !rel.starts_with("src/") || rel.contains("/overtaken_tests/") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).expect("readable");
+        out.push((rel, code_mask(&split_cfg_test(&text).0)));
+    }
+    out
+}
+
+/// Every production match of `pattern` (a small regex-free predicate over code), as `file:line`.
+fn find_all(code: &[(String, String)], pred: impl Fn(&str) -> Vec<usize>) -> Vec<String> {
+    let mut hits = Vec::new();
+    for (rel, text) in code {
+        for at in pred(text) {
+            hits.push(format!("{rel}:{}", text[..at].matches('\n').count() + 1));
+        }
+    }
+    hits
+}
+
+/// Offsets where `needle` occurs with arbitrary whitespace between its space-separated tokens.
+fn token_seq(text: &str, needle: &str) -> Vec<usize> {
+    let toks: Vec<&str> = needle.split(' ').collect();
+    let mut hits = Vec::new();
+    let mut from = 0;
+    while let Some(off) = text[from..].find(toks[0]) {
+        let start = from + off;
+        let mut at = start + toks[0].len();
+        let mut ok = true;
+        for t in &toks[1..] {
+            let rest = &text[at..];
+            let trimmed = rest.trim_start();
+            at += rest.len() - trimmed.len();
+            if trimmed.starts_with(t) {
+                at += t.len();
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            hits.push(start);
+        }
+        from = start + toks[0].len();
+    }
+    hits
+}
+
+const KS: [&str; 2] = ["KernelState", "crate::kernel::boot::KernelState"];
+
+/// KIND 1 — no production expression forms a whole-state reference from shared storage.
+#[test]
+fn blr1_kind1_no_production_broad_acquisition_by_any_spelling() {
+    let code = kernel_production_code();
+    // The historical spellings, now on precise production text (multi-line forms included).
+    let with_cpu = find_all(&code, |t| token_seq(t, ". with_cpu ("));
+    assert!(with_cpu.is_empty(), "production `.with_cpu(`: {with_cpu:?}");
+    let with_closure: Vec<String> = find_all(&code, |t| {
+        let mut v = token_seq(t, ". with ( |");
+        v.extend(token_seq(t, ". with ( move |"));
+        v
+    })
+    .into_iter()
+    .filter(|h| !h.starts_with("src/kernel/boot/orchestrator_state.rs:"))
+    .collect();
+    assert!(
+        with_closure.is_empty(),
+        "production `.with(|…|)`: {with_closure:?}"
+    );
+    // The spelling-independent form: the cell is opened in exactly ONE place (`state_ptr`), and
+    // a whole-state reference is formed from it in exactly ONE place (the boot token's loan).
+    let opens = find_all(&code, |t| token_seq(t, ". state . 0 . get ("));
+    assert!(
+        opens.len() == 1 && opens[0].starts_with("src/runtime.rs:"),
+        "the state cell is opened only by `state_ptr`: {opens:?}"
+    );
+    let loans: Vec<String> = find_all(&code, |t| {
+        let mut v = token_seq(t, "& mut * self . shared . state_ptr ( )");
+        v.extend(token_seq(t, "& mut * self . state_ptr ( )"));
+        v.extend(token_seq(t, "& * self . state_ptr ( )"));
+        v.extend(token_seq(t, "& * self . shared . state_ptr ( )"));
+        v
+    });
+    assert_eq!(
+        loans.len(),
+        1,
+        "exactly one production whole-state loan may exist — `BootExclusive::state`: {loans:?}"
+    );
+    let runtime = &code
+        .iter()
+        .find(|(r, _)| r == "src/runtime.rs")
+        .expect("runtime")
+        .1;
+    let loan_at = token_seq(runtime, "& mut * self . shared . state_ptr ( )")[0];
+    let owner = &runtime[..loan_at];
+    assert!(
+        owner.rfind("pub fn state(&mut self) -> &mut KernelState")
+            > owner.rfind("impl BootExclusive {"),
+        "the one loan is `BootExclusive::state`"
+    );
+    // Projectors never reborrow the raw state pointer as a whole.
+    let reborrow = find_all(&code, |t| {
+        let mut v = token_seq(t, "& * state )");
+        v.extend(token_seq(t, "& * state ;"));
+        v.extend(token_seq(t, "& mut * state )"));
+        v.extend(token_seq(t, "& mut * state ;"));
+        v.extend(token_seq(t, "& * state ,"));
+        v.extend(token_seq(t, "& mut * state ,"));
+        v
+    });
+    assert!(
+        reborrow.is_empty(),
+        "a whole-state reborrow of a raw state pointer: {reborrow:?}"
+    );
+}
+
+/// KIND 2 — no production function lends, returns or closes over the whole state, except the
+/// boot token's `state(&mut self)`.
+#[test]
+fn blr1_kind2_no_production_broad_wrapper_definition() {
+    let code = kernel_production_code();
+    let mut closures = Vec::new();
+    let mut returns = Vec::new();
+    for k in KS {
+        for f in ["FnOnce", "FnMut", "Fn"] {
+            closures.extend(find_all(&code, |t| {
+                token_seq(t, &format!("{f} ( & mut {k}"))
+            }));
+            closures.extend(find_all(&code, |t| token_seq(t, &format!("{f} ( & {k}"))));
+        }
+        closures.extend(find_all(&code, |t| {
+            token_seq(t, &format!("fn ( & mut {k} )"))
+        }));
+        for r in [
+            format!("-> & mut {k}"),
+            format!("-> & {k}"),
+            format!("-> & 'static mut {k}"),
+            format!("-> & 'a mut {k}"),
+            format!("-> Option < & mut {k}"),
+            format!("-> Option < & 'static mut {k}"),
+            format!("Guard < '_ , {k} >"),
+            format!("Guard < 'a , {k} >"),
+        ] {
+            returns.extend(find_all(&code, |t| token_seq(t, &r)));
+        }
+    }
+    assert!(
+        closures.is_empty(),
+        "a production closure / fn-pointer over the whole state is a broad wrapper under another \
+         name: {closures:?}"
+    );
+    returns.sort();
+    returns.dedup();
+    assert_eq!(
+        returns.len(),
+        1,
+        "exactly one production function may return a whole-state reference — \
+         `BootExclusive::state`: {returns:?}"
+    );
+    // And the historical names are not defined in production on `SharedKernel`.
+    let runtime = &code
+        .iter()
+        .find(|(r, _)| r == "src/runtime.rs")
+        .expect("runtime")
+        .1;
+    for name in [
+        "pub fn with<R>(",
+        "pub fn with_cpu<R>(",
+        "pub fn lock(&self)",
+        "fn borrow_kernel_for_boot",
+    ] {
+        assert!(!runtime.contains(name), "production `{name}` is back");
+    }
+}
+
+/// KIND 3 — no production storage wraps the whole state in a lock, a second cell or a static.
+#[test]
+fn blr1_kind3_no_production_broad_lock_storage() {
+    let code = kernel_production_code();
+    let mut locks = Vec::new();
+    let mut cells = Vec::new();
+    for k in KS {
+        for l in ["SpinLock", "SpinLockIrq", "Mutex", "RwLock", "TicketLock"] {
+            locks.extend(find_all(&code, |t| token_seq(t, &format!("{l} < {k} >"))));
+        }
+        cells.extend(find_all(&code, |t| {
+            token_seq(t, &format!("UnsafeCell < {k} >"))
+        }));
+        cells.extend(find_all(&code, |t| {
+            token_seq(t, &format!("UnsafeCell < core::mem::MaybeUninit < {k} >"))
+        }));
+        cells.extend(find_all(&code, |t| {
+            token_seq(t, &format!("MaybeUninit < {k} >"))
+        }));
+        cells.extend(find_all(&code, |t| {
+            token_seq(t, &format!("AtomicPtr < {k} >"))
+        }));
+    }
+    assert!(
+        locks.is_empty(),
+        "a lock around the whole state is back: {locks:?}"
+    );
+    assert_eq!(
+        cells.len(),
+        1,
+        "exactly one production cell may hold the state — `KernelStateCell`: {cells:?}"
+    );
+    assert!(cells[0].starts_with("src/runtime.rs:"), "{cells:?}");
+    let runtime = &code
+        .iter()
+        .find(|(r, _)| r == "src/runtime.rs")
+        .expect("runtime")
+        .1;
+    assert!(runtime.contains("struct KernelStateCell(core::cell::UnsafeCell<KernelState>);"));
+    assert!(
+        runtime.contains("pub struct SharedKernel {\n    state: KernelStateCell,"),
+        "the shared kernel's storage is the lock-free cell"
+    );
+    // No static holds a whole state (the boot singleton is a `MaybeUninit<SharedKernel>`).
+    let statics: Vec<String> = find_all(&code, |t| {
+        let mut v = Vec::new();
+        for (i, line) in t.lines().scan(0usize, |o, l| {
+            let s = *o;
+            *o += l.len() + 1;
+            Some((s, l))
+        }) {
+            let l = line.trim_start();
+            if (l.starts_with("static ")
+                || l.starts_with("pub static ")
+                || l.starts_with("pub(crate) static "))
+                && l.split('=').next().is_some_and(|ty| {
+                    ty.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .any(|w| w == "KernelState")
+                })
+            {
+                v.push(i);
+            }
+        }
+        v
+    });
+    assert!(
+        statics.is_empty(),
+        "a static holding the whole state: {statics:?}"
+    );
+}
+
+/// KIND 4 — the hosted reference helpers exist, and only under exactly `#[cfg(test)]`.
+#[test]
+fn blr1_kind4_test_only_support_is_exactly_cfg_test() {
+    let text = fs::read_to_string(repo_root().join("src/runtime.rs")).expect("runtime.rs");
+    let (production, test) = split_cfg_test(&text);
+    let (production, test) = (code_mask(&production), code_mask(&test));
+    for item in [
+        "pub fn with<R>(&self, f: impl FnOnce(&mut KernelState) -> R) -> R {",
+        "pub fn with_cpu<R>(",
+        "pub fn lock(&self) -> TestExclusiveGuard<'_> {",
+        "pub struct TestExclusiveGuard<'a> {",
+        "test_exclusive: SpinLock<()>,",
+    ] {
+        assert!(
+            test.contains(item),
+            "test-only support `{item}` must exist for the hosted suite"
+        );
+        assert!(
+            !production.contains(item),
+            "`{item}` leaked into a production build"
+        );
+    }
+    // Attached to exactly `#[cfg(test)]` — not `cfg(any(test, ..))`, not a feature.
+    assert!(text.contains("#[cfg(test)]\nimpl SharedKernel {\n    /// Test-only: run `f`"));
+    // Informational record of what the hosted suite still drives through them.
+    let mut callers = 0usize;
+    for path in [
+        "src/kernel/boot/tests.rs",
+        "src/kernel/boot/overtaken_tests/tests.rs",
+        "src/runtime.rs",
+        "src/kernel/syscall_split.rs",
+        "src/kernel/syscall.rs",
+        "src/kernel/recv_waiter_split.rs",
+    ] {
+        let t = fs::read_to_string(repo_root().join(path)).expect(path);
+        let t = code_mask(&split_cfg_test(&t).1);
+        callers += token_seq(&t, ". with ( |").len()
+            + token_seq(&t, ". with ( move |").len()
+            + token_seq(&t, ". with_cpu (").len();
+    }
+    assert!(
+        callers > 0,
+        "the hosted reference tests still use the test-only helpers"
+    );
+}
+
+/// The only pre-publication handle on the shared kernel is the trap-entry installation, one per
+/// port, and every port's trap entry refuses it until publication.
+#[test]
+fn blr1_trap_installation_is_the_only_pre_publication_handle() {
+    let code = kernel_production_code();
+    let installs: Vec<String> =
+        find_all(&code, |t| token_seq(t, ". shared_for_trap_installation ("));
+    let mut files: Vec<&str> = installs
+        .iter()
+        .map(|h| h.split(':').next().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            "src/arch/aarch64/boot.rs",
+            "src/arch/riscv64/boot.rs",
+            "src/arch/x86_64/boot.rs"
+        ],
+        "one trap-target installation per port, nowhere else: {installs:?}"
+    );
+    let refusals: Vec<String> = find_all(&code, |t| {
+        token_seq(t, "refuse_shared_entry_during_boot_exclusive (")
+    })
+    .into_iter()
+    .filter(|h| !h.starts_with("src/runtime.rs:"))
+    .collect();
+    let mut rfiles: Vec<&str> = refusals
+        .iter()
+        .map(|h| h.split(':').next().unwrap())
+        .collect();
+    rfiles.sort();
+    assert_eq!(
+        rfiles,
+        [
+            "src/arch/aarch64/boot.rs",
+            "src/arch/riscv64/boot.rs",
+            "src/arch/x86_64/descriptor_tables.rs"
+        ],
+        "every port's trap entry checks publication: {refusals:?}"
+    );
+    // `shared_static_ref` — callable by anyone — answers only after publication.
+    let bootstrap =
+        fs::read_to_string(repo_root().join("src/kernel/boot/bootstrap_state.rs")).unwrap();
+    let ssr = bootstrap
+        .split("pub fn shared_static_ref()")
+        .nth(1)
+        .expect("shared_static_ref")
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    assert!(ssr.contains("!crate::runtime::boot_state_published()"));
+    // Secondaries are released only after publication, on every port.
+    let x86 = fs::read_to_string(repo_root().join("src/arch/x86_64/boot.rs")).unwrap();
+    let a64 = fs::read_to_string(repo_root().join("src/arch/aarch64/boot.rs")).unwrap();
+    let rv = fs::read_to_string(repo_root().join("src/arch/riscv64/boot.rs")).unwrap();
+    for (arch, src, release) in [
+        (
+            "x86_64",
+            &x86,
+            "release_deferred_ap_dispatch_at_publication()",
+        ),
+        ("aarch64", &a64, "note_bsp_boot_borrow_ended()"),
+        ("riscv64", &rv, "release_secondaries_at_boot_borrow_end("),
+    ] {
+        let enter = src
+            .split("pub fn enter_dispatched_user_task_if_available(\n    mut boot: crate::runtime::BootExclusive,")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{arch}: first entry consumes the token"));
+        let p = enter
+            .find("boot.publish();")
+            .unwrap_or_else(|| panic!("{arch}: publish"));
+        let r = enter
+            .find(release)
+            .unwrap_or_else(|| panic!("{arch}: release"));
+        assert!(
+            p < r,
+            "{arch}: secondaries are released only after publication"
+        );
+    }
+    let smp = fs::read_to_string(repo_root().join("src/arch/x86_64/smp.rs")).unwrap();
+    let live = smp
+        .split("fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        !live.contains("set_ap_dispatch_request(cpu, 1)") && !live.contains("write_icr("),
+        "x86_64: the in-phase AP dispatcher must not wake the AP; the request is owed until \
+         publication"
+    );
+}
+
+/// Authority of every `KernelState` field (`doc/KERNEL_UNLOCKING.md` §BLR1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Authority {
+    /// Mutable only under the named lock field of the same state.
+    Lock(&'static str),
+    /// A lock: an atomic protocol in its own right.
+    IsLock,
+    /// A lock that contains its data (`SpinLockIrq<SchedulerState>`).
+    SelfLocked,
+    /// Written during construction, read-only afterwards.
+    ImmutableAfterConstruction,
+    /// Touched only by whole-state code, which runs only in the boot exclusive phase (and in
+    /// hosted tests); never projected for runtime use.
+    ExclusivePhaseOnly,
+}
+
+const FIELD_AUTHORITY: &[(&str, Authority)] = &[
+    ("kernel_aspace", Authority::ExclusivePhaseOnly),
+    ("hal", Authority::ExclusivePhaseOnly),
+    ("user_spaces", Authority::Lock("vm_state_lock")),
+    ("scheduler_state", Authority::SelfLocked),
+    ("ipc_state_lock", Authority::IsLock),
+    ("driver_state_lock", Authority::IsLock),
+    ("fault_state_lock", Authority::IsLock),
+    ("restart_state_lock", Authority::IsLock),
+    ("capability_state_lock", Authority::IsLock),
+    ("telemetry_state_lock", Authority::IsLock),
+    ("boot_config_state_lock", Authority::IsLock),
+    ("vm_state_lock", Authority::IsLock),
+    ("task_state_lock", Authority::IsLock),
+    ("memory_state_lock", Authority::IsLock),
+    ("ipc", Authority::Lock("ipc_state_lock")),
+    ("capability", Authority::Lock("capability_state_lock")),
+    (
+        "tid_allocation_policy",
+        Authority::ImmutableAfterConstruction,
+    ),
+    ("tid_allocation_cursor", Authority::Lock("task_state_lock")),
+    (
+        "spawn_reservation_generation",
+        Authority::Lock("task_state_lock"),
+    ),
+    ("tcbs", Authority::Lock("task_state_lock")),
+    ("task_classes", Authority::Lock("task_state_lock")),
+    ("tls_restore_pending", Authority::Lock("task_state_lock")),
+    ("robust_futex", Authority::Lock("task_state_lock")),
+    ("memory", Authority::Lock("memory_state_lock")),
+    ("drivers", Authority::Lock("driver_state_lock")),
+    ("telemetry", Authority::Lock("telemetry_state_lock")),
+    ("boot_config", Authority::Lock("boot_config_state_lock")),
+    ("faults", Authority::Lock("fault_state_lock")),
+    ("restart", Authority::Lock("restart_state_lock")),
+];
+
+/// Every field has exactly one recorded authority, and every raw projection out of the cell
+/// respects it: a data field is projected only together with its own lock, a construction-only
+/// field only for reading, and a whole-state-only field never.
+#[test]
+fn blr1_kernel_state_field_authority_is_total_and_projections_respect_it() {
+    let boot_mod = fs::read_to_string(repo_root().join("src/kernel/boot/mod.rs")).unwrap();
+    let body = code_mask(
+        boot_mod
+            .split("pub struct KernelState {")
+            .nth(1)
+            .expect("KernelState")
+            .split("\n}\n")
+            .next()
+            .unwrap(),
+    );
+    let mut fields = Vec::new();
+    for line in body.lines() {
+        let l = line.trim();
+        let l = l
+            .strip_prefix("pub(crate) ")
+            .or_else(|| l.strip_prefix("pub "))
+            .unwrap_or(l);
+        if let Some((name, _)) = l.split_once(':')
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            fields.push(name.to_string());
+        }
+    }
+    let table: Vec<String> = FIELD_AUTHORITY
+        .iter()
+        .map(|(f, _)| (*f).to_string())
+        .collect();
+    assert_eq!(
+        fields, table,
+        "every KernelState field needs exactly one recorded authority, in declaration order — a \
+         new field must be classified here and in doc/KERNEL_UNLOCKING.md §BLR1"
+    );
+    for (_, a) in FIELD_AUTHORITY {
+        if let Authority::Lock(l) = a {
+            assert_eq!(
+                FIELD_AUTHORITY
+                    .iter()
+                    .find(|(f, _)| f == l)
+                    .map(|(_, a)| *a),
+                Some(Authority::IsLock),
+                "{l} must be a lock field"
+            );
+        }
+    }
+    let authority = |f: &str| {
+        FIELD_AUTHORITY
+            .iter()
+            .find(|(n, _)| *n == f)
+            .map(|(_, a)| *a)
+    };
+
+    let orch =
+        fs::read_to_string(repo_root().join("src/kernel/boot/orchestrator_state.rs")).unwrap();
+    let orch = code_mask(&split_cfg_test(&orch).0);
+    let mut audited = 0usize;
+    for (at, _) in orch.match_indices("unsafe fn ") {
+        let head = &orch[at + "unsafe fn ".len()..];
+        let name: String = head
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.ends_with("_from_raw") {
+            continue;
+        }
+        let rest = &head[name.len()..];
+        let end = [
+            "\n    pub(crate) unsafe fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub fn ",
+            "\n    fn ",
+            "\n    unsafe fn ",
+            "\n}\n",
+        ]
+        .iter()
+        .filter_map(|m| rest.find(m))
+        .min()
+        .unwrap_or(rest.len());
+        let fbody = &rest[..end];
+        let mut projected: Vec<(String, bool)> = Vec::new();
+        for (macro_, mutable) in [
+            ("addr_of_mut!((*state).", true),
+            ("addr_of!((*state).", false),
+        ] {
+            for (p, _) in fbody.match_indices(macro_) {
+                let f: String = fbody[p + macro_.len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                projected.push((f, mutable));
+            }
+        }
+        assert!(
+            !projected.is_empty() || fbody.contains("_from_raw("),
+            "{name}: projects nothing"
+        );
+        let names: Vec<&str> = projected.iter().map(|(f, _)| f.as_str()).collect();
+        for (f, mutable) in &projected {
+            match authority(f).unwrap_or_else(|| panic!("{name}: unknown field {f}")) {
+                Authority::Lock(l) => assert!(
+                    names.contains(&l),
+                    "{name}: projects `{f}` without its authority `{l}`"
+                ),
+                Authority::ImmutableAfterConstruction => assert!(
+                    !mutable && fbody.contains(".read()"),
+                    "{name}: `{f}` is construction-only and may only be read by value"
+                ),
+                Authority::ExclusivePhaseOnly => {
+                    panic!("{name}: `{f}` is whole-state-only and must never be projected")
+                }
+                Authority::IsLock | Authority::SelfLocked => {}
+            }
+        }
+        audited += 1;
+    }
+    assert!(
+        audited >= 30,
+        "the projection audit must cover the projector family ({audited})"
+    );
+}
+
+/// `Send` / `Sync`: exactly the two justified impls on `SharedKernel`, the state's own `Send`
+/// bound asserted, and nothing that would let the boot token or the cell cross CPUs.
+#[test]
+fn blr1_send_sync_impls_are_the_audited_ones() {
+    let runtime = fs::read_to_string(repo_root().join("src/runtime.rs")).unwrap();
+    let code = code_mask(&split_cfg_test(&runtime).0);
+    assert_eq!(
+        code.matches("unsafe impl Sync for SharedKernel {}").count(),
+        1
+    );
+    assert_eq!(
+        code.matches("unsafe impl Send for SharedKernel {}").count(),
+        1
+    );
+    assert!(code.contains("assert_send::<KernelState>();"));
+    for banned in [
+        "impl Send for BootExclusive",
+        "impl Sync for BootExclusive",
+        "impl Send for KernelStateCell",
+        "impl Sync for KernelStateCell",
+        "impl Send for KernelState",
+        "impl Sync for KernelState",
+    ] {
+        let all = fs::read_to_string(repo_root().join("src/kernel/boot/mod.rs")).unwrap() + &code;
+        assert!(
+            !all.contains(banned),
+            "`{banned}` would let a whole-state path cross CPUs"
+        );
+    }
+    assert!(
+        code.contains("_not_send_sync: core::marker::PhantomData<*mut KernelState>,"),
+        "the boot token stays !Send + !Sync"
+    );
+}
+
+// ── The BUILD check ────────────────────────────────────────────────────────────────────────
+//
+// This file is an integration test: it links the hosted NON-test library, built exactly as a
+// production consumer would see it. The probe below never runs; it only has to COMPILE. Each
+// call resolves to the probe trait's method only if `SharedKernel` has NO inherent method of that
+// name — if one comes back (in any form, with any signature) inherent resolution wins, the
+// closure's `&mut ()` no longer fits, and this whole test binary stops compiling. The freestanding
+// ports cannot do better than the hosted library here: `cfg(test)` is never set when they build.
+mod blr1_build_probe {
+    pub(super) trait Absent {
+        fn with<R>(&self, _f: impl FnOnce(&mut ()) -> R) -> &'static str {
+            "absent"
+        }
+        fn with_cpu<R>(&self, _cpu: (), _f: impl FnOnce(&mut ()) -> R) -> &'static str {
+            "absent"
+        }
+        fn lock(&self, _probe: ()) -> &'static str {
+            "absent"
+        }
+        fn borrow_kernel_for_boot(&self, _probe: ()) -> &'static str {
+            "absent"
+        }
+    }
+    impl Absent for yarm::runtime::SharedKernel {}
+
+    #[allow(dead_code)]
+    pub(super) fn probe(k: &yarm::runtime::SharedKernel) -> [&'static str; 4] {
+        [
+            k.with(|_: &mut ()| ()),
+            k.with_cpu((), |_: &mut ()| ()),
+            k.lock(()),
+            k.borrow_kernel_for_boot(()),
+        ]
+    }
+}
+
+#[test]
+fn blr1_hosted_non_test_library_has_no_whole_state_accessor() {
+    // Reaching here means `blr1_build_probe::probe` compiled: none of the four names exists as an
+    // inherent method of the non-test `SharedKernel`.
+    let _ = blr1_build_probe::probe as fn(&yarm::runtime::SharedKernel) -> [&'static str; 4];
 }

@@ -6934,9 +6934,6 @@ extern "C" fn yarm_aarch64_enable_fp_simd() {
     }
 }
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-static TRAP_KERNEL_STATE_PTR: core::sync::atomic::AtomicPtr<crate::kernel::boot::KernelState> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 static TRAP_SHARED_KERNEL_PTR: core::sync::atomic::AtomicPtr<crate::runtime::SharedKernel> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -6945,11 +6942,7 @@ static BSP_RELEASED_SECONDARIES: AtomicBool = AtomicBool::new(false);
 static BSP_RELEASE_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static SECONDARY_ONLINE_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-static SECONDARY_READY_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 const AARCH64_LOCK_SPLIT_TRACE: bool = false;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-static SECONDARY_JOINED_LOGGED_MASK: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 // QEMU-SMP2 §2 — PER CPU. It was one process-global slot, harmless while one CPU dispatched user
 // tasks and wrong the moment two did: CPU 1 finishing a handled NR 7 read the ELR of the SGI CPU 0
@@ -6973,27 +6966,12 @@ enum PsciConduit {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static PSCI_CONDUIT: AtomicU8 = AtomicU8::new(PsciConduit::Unknown as u8);
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-fn install_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState) {
-    TRAP_KERNEL_STATE_PTR.store(kernel as *mut _, core::sync::atomic::Ordering::SeqCst);
-}
-
 #[allow(dead_code)]
 fn install_trap_shared_kernel(shared: &'static crate::runtime::SharedKernel) {
     TRAP_SHARED_KERNEL_PTR.store(
         shared as *const _ as *mut _,
         core::sync::atomic::Ordering::SeqCst,
     );
-}
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelState> {
-    let ptr = TRAP_KERNEL_STATE_PTR.load(core::sync::atomic::Ordering::SeqCst);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { &mut *ptr })
-    }
 }
 
 #[allow(dead_code)]
@@ -7229,14 +7207,6 @@ fn write_trapframe_back_to_vector_frame(
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFrame) {
-    // Stage 30 / Review C1: in debug builds, assert no boot raw-borrow window is
-    // live. A trap/timer reaching with_cpu during that window would alias the boot
-    // &mut KernelState (UB). Compiles to nothing in release; zero vector overhead.
-    #[cfg(any(debug_assertions, test))]
-    debug_assert!(
-        !crate::runtime::boot_raw_borrow_is_active(),
-        "aarch64 trap/timer vector fired during boot raw-borrow window — aliasing &mut KernelState risk"
-    );
     trap_trace_line("YARM_AARCH64_VECTOR_ENTRY");
     trap_trace_line("YARM_AARCH64_BOOT_MARKER stage=exception");
     let Some(frame) = (unsafe { frame.as_mut() }) else {
@@ -7314,6 +7284,10 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
         Some(intid) if !is_timer_irq => Some(intid),
         _ => None,
     };
+    // BLR1: everything below may reach the shared kernel; never before the boot state is
+    // published. (This replaces the debug-only Stage 30 assertion, whose window was opened and
+    // never closed.)
+    crate::runtime::refuse_shared_entry_during_boot_exclusive("aarch64_vector_entry");
     let trap_cpu =
         crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
     // QEMU-CONTEXT1 §2 — COMMIT. Kinds 9..=16 are lower-EL (EL0) exceptions: the asm prologue
@@ -7438,62 +7412,6 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
                     frame.gprs[2],
                 );
             }
-        } else {
-            crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE failed");
-            crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE halting");
-            loop {
-                unsafe {
-                    core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-                }
-            }
-        }
-    } else if let Some(kernel) = trap_kernel_state_mut() {
-        if AARCH64_LOCK_SPLIT_TRACE {
-            crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N path=aarch64_shared_trap_entry fallback=1");
-        }
-        crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_FALLBACK arch=aarch64 reason=no_shared_kernel");
-        let current_tid = kernel.current_tid();
-        if current_tid == Some(1) {
-            boot_trace!(
-                "AARCH64_HANDOFF_TRAP cpu={} tid={} ESR_EL1=0x{:016x} ELR_EL1=0x{:016x} FAR_EL1=0x{:016x} SPSR_EL1=0x{:016x}",
-                trap_cpu.0,
-                current_tid.unwrap_or(0),
-                frame.esr_el1,
-                crate::arch::aarch64::boot::last_vector_raw_elr(),
-                frame.far_el1,
-                frame.spsr_el1
-            );
-        }
-        let mut trap_frame = crate::kernel::trapframe::TrapFrame::zeroed();
-        trap_frame.set_saved_pc(frame.elr_el1 as usize);
-        trap_frame.set_saved_sp(frame.sp_el0 as usize);
-        for idx in 0..31 {
-            trap_frame.set_user_gpr(idx, frame.gprs[idx] as usize);
-        }
-        // QEMU-CONTEXT1 §2: the interrupted SPSR, whose NZCV is the task's user status word.
-        trap_frame.user_status = frame.spsr_el1 as usize;
-        let context = crate::arch::aarch64::trap::Aarch64TrapContext {
-            esr_el1: frame.esr_el1 as u32,
-            far_el1: frame.far_el1,
-            irq_line: external_irq_line,
-            is_timer_irq,
-        };
-        if crate::arch::aarch64::trap::handle_trap_entry(
-            kernel,
-            trap_cpu,
-            context,
-            Some(&mut trap_frame),
-        )
-        .is_ok()
-        {
-            write_trapframe_back_to_vector_frame(frame, &trap_frame, trap_cpu);
-            boot_trace!(
-                "AARCH64_VECTOR_FRAME_FINAL tid={} x0={} x1={} x2={}",
-                kernel.current_tid().unwrap_or(0),
-                frame.gprs[0],
-                frame.gprs[1],
-                frame.gprs[2],
-            );
         } else {
             crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE failed");
             crate::arch::aarch64::console::write_line("YARM_AARCH64_TRAP_HANDLE halting");
@@ -8559,9 +8477,12 @@ pub fn release_secondary_cpus_after_bootstrap() {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 pub fn enter_dispatched_user_task_if_available(
-    kernel: &crate::kernel::boot::KernelState,
+    mut boot: crate::runtime::BootExclusive,
     dispatched_tid: Option<u64>,
-) {
+) -> &'static crate::runtime::SharedKernel {
+    // BLR1: every read below is from the exclusive state; the token is published immediately
+    // before the release and the `eret`, and handed back published when nothing is entered.
+    let kernel = boot.state();
     if let Some(tid) = dispatched_tid {
         // U9-RECV-FINAL — the cross-arch live audit runs HERE, at first dispatch, while
         // `&KernelState` is already held. Read-only, one-shot, shared latch with the trap-path
@@ -8620,8 +8541,11 @@ pub fn enter_dispatched_user_task_if_available(
                 context.arg5 as u64
             );
         }
-        // QEMU-SMP2 §2: the boot `&mut KernelState` window ends with this return to EL0; an AP
-        // admitted under `yarm.ap_user_dispatch=1` acquires nothing before it.
+        let bsp_entry = kernel.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
+        // BLR1 — END OF THE BOOT EXCLUSIVE PHASE. `kernel` is not used past this line (`publish`
+        // consumes the token it was borrowed from). QEMU-SMP2 §2: only now may an AP admitted under
+        // `yarm.ap_user_dispatch=1` acquire anything; this CPU stays masked until the `eret`.
+        let _shared = boot.publish();
         crate::arch::aarch64::smp::note_bsp_boot_borrow_ended();
         unsafe {
             unsafe extern "C" {
@@ -8648,20 +8572,22 @@ pub fn enter_dispatched_user_task_if_available(
             );
         }
         #[allow(unreachable_code)]
-        if kernel.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+        if bsp_entry {
             crate::yarm_log!("BSP_ENTER_RING3_DONE tid={}", tid);
         }
     }
+    boot.publish()
 }
 
 #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
 pub fn enter_dispatched_user_task_if_available(
-    _kernel: &crate::kernel::boot::KernelState,
+    boot: crate::runtime::BootExclusive,
     _dispatched_tid: Option<u64>,
-) {
+) -> &'static crate::runtime::SharedKernel {
+    boot.publish()
 }
 
-pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
+pub fn run_with_prepared_kernel(run: fn(crate::runtime::BootExclusive)) {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::arch::aarch64::console::write_line(
         "YARM_AARCH64_BOOT_MARKER stage=run_with_prepared_kernel",
@@ -8682,17 +8608,13 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     crate::arch::aarch64::console::write_line(
         "YARM_AARCH64_BOOT_MARKER stage=bootstrap_init_begin",
     );
-    // Hardware AArch64: own KernelState through SharedKernel (Stage-2N shared trap path).
+    // BLR1: own the KernelState through the boot exclusive token until the first EL0 entry
+    // publishes it. The trap-entry target is installed now, but every vector entry refuses to use
+    // it before publication, and every secondary waits for the publication-ordered release.
+    let mut boot = crate::kernel::boot::Bootstrap::init_shared_static().expect("kernel init");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    let shared = crate::kernel::boot::Bootstrap::init_shared_static().expect("kernel init");
-    // SAFETY: single-CPU boot; no trap handler can race before install_trap_shared_kernel
-    // stores the pointer; the reference must not be used after the ERET to user space.
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    let kernel: &mut crate::kernel::boot::KernelState = unsafe { shared.borrow_kernel_for_boot() };
-    #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
-    let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    install_trap_shared_kernel(shared);
+    install_trap_shared_kernel(boot.shared_for_trap_installation());
+    let kernel = boot.state();
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2N_INSTALLED arch=aarch64 shared=1 raw=0");
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -8735,7 +8657,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.present_cpu_bitmap(),
         kernel.online_cpu_count()
     );
-    run(kernel);
+    run(boot);
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -8858,56 +8780,18 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
         crate::arch::aarch64::smp::ap_dispatch_main(cpu);
     }
 
-    let kernel = loop {
-        if let Some(kernel) = trap_kernel_state_mut() {
-            break kernel;
-        }
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-    };
+    // Without the user-dispatch knob a secondary is never admitted: it parks here for the life of
+    // the system and touches no kernel state. BLR1: this used to wait for a raw
+    // `&'static mut KernelState` (`TRAP_KERNEL_STATE_PTR`) that nothing ever installed, and then —
+    // had anything installed it — run `set_current_cpu` and a cross-CPU work loop on that whole-state
+    // reference concurrently with every other CPU. The pointer, its installer and that loop are
+    // deleted; the park is now explicit.
     crate::yarm_log!(
-        "YARM_AARCH64_SMP_WAIT cpu={} state=waiting_for_bsp_release",
+        "YARM_AARCH64_SMP_WAIT cpu={} state=parked reason=no_user_dispatch",
         cpu_id
     );
-    while !BSP_RELEASED_SECONDARIES.load(Ordering::Acquire) {
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-    }
-    crate::yarm_log!("YARM_AARCH64_SMP_WAIT cpu={} state=released", cpu_id);
-    let _ = kernel.set_current_cpu(cpu);
-    let observed_cpu = kernel.current_cpu();
-    if observed_cpu.0 != cpu.0 {
-        crate::yarm_log!(
-            "AP_CPU_IDENTITY_VIOLATION assigned_cpu={} observed_cpu={} mpidr=0x{:x}",
-            cpu.0,
-            observed_cpu.0,
-            crate::arch::aarch64::read_mpidr_el1()
-        );
-    }
-    assert_eq!(observed_cpu.0, cpu.0);
-    let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
-    // Canonical 199E: APs do NOT arm a timer. `SchedulerState.timer` is one shared counter, so a
-    // per-AP timer would make the scheduler's tick rate scale with the CPU count and would let
-    // several CPUs race to advance the same counter. Exactly one CPU — the BSP, in
-    // `start_bsp_periodic_timer` — drives it. APs still service cross-CPU work below.
-    if cpu_bit != 0
-        && (SECONDARY_READY_LOGGED_MASK.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit) == 0
-    {
-        crate::yarm_log!(
-            "YARM_AARCH64_SMP_SECONDARY_READY cpu={} state=local_scheduler_initialized",
-            cpu_id
-        );
-    }
-    if cpu_bit != 0
-        && (SECONDARY_JOINED_LOGGED_MASK.fetch_or(cpu_bit, Ordering::AcqRel) & cpu_bit) == 0
-    {
-        crate::yarm_log!("YARM_AARCH64_SMP_SECONDARY_JOINED cpu={}", cpu_id);
-    }
-
+    let _ = cpu;
     loop {
-        let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
         unsafe {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
         }

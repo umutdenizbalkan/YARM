@@ -874,8 +874,9 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
 
     // Stage 196A: the bridge no longer holds a persistent raw `&'static mut
     // KernelState`. It borrows the boot-owned `SharedKernel` and performs every
-    // kernel interaction through a bounded `with_cpu` (or the shared wrapper),
-    // so no broad `&mut KernelState` escapes a bounded callback.
+    // kernel interaction through its domain owners; no whole-state reference exists (BLR1).
+    // BLR1: and never before the boot state is published.
+    crate::runtime::refuse_shared_entry_during_boot_exclusive("riscv64_trap_bridge");
     let Some(shared) = trap_shared_kernel_riscv() else {
         early_marker!("RISCV_TRAP_HANDLE_FAILED reason=no_trap_shared_kernel");
         riscv_trap_halt("no_trap_shared_kernel");
@@ -3715,9 +3716,12 @@ pub fn release_secondary_cpus_after_bootstrap() {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn enter_dispatched_user_task_if_available(
-    kernel: &crate::kernel::boot::KernelState,
+    mut boot: crate::runtime::BootExclusive,
     dispatched_tid: Option<u64>,
-) {
+) -> &'static crate::runtime::SharedKernel {
+    // BLR1: every read below is from the exclusive state; the token is published immediately
+    // before the secondaries' release and the `sret`, and handed back published otherwise.
+    let kernel = boot.state();
     if let Some(tid) = dispatched_tid {
         // U9-RECV-FINAL — the cross-arch live audit runs HERE, at first dispatch, while
         // `&KernelState` is already held. Read-only, one-shot, shared latch with the trap-path
@@ -3727,7 +3731,7 @@ pub fn enter_dispatched_user_task_if_available(
     }
 
     let Some(tid) = dispatched_tid else {
-        return;
+        return boot.publish();
     };
     early_marker!("RISCV_FIRST_USER_PREP_BEGIN tid={}", tid);
 
@@ -3736,7 +3740,7 @@ pub fn enter_dispatched_user_task_if_available(
             "RISCV_USERSPACE_DEFERRED reason=no_user_context tid={}",
             tid
         );
-        return;
+        return boot.publish();
     };
     if context.instruction_ptr.0 == 0 || context.stack_ptr.0 == 0 {
         early_marker!(
@@ -3745,11 +3749,11 @@ pub fn enter_dispatched_user_task_if_available(
             context.instruction_ptr.0,
             context.stack_ptr.0
         );
-        return;
+        return boot.publish();
     }
     let Some(asid) = kernel.task_asid(tid) else {
         early_marker!("RISCV_USERSPACE_DEFERRED reason=no_asid tid={}", tid);
-        return;
+        return boot.publish();
     };
 
     // Phase 1: Sv39 plan — install the kernel-shared gigapage into the user
@@ -3762,7 +3766,7 @@ pub fn enter_dispatched_user_task_if_available(
                 "RISCV_USERSPACE_DEFERRED reason=gigapage_install_failed err={:?}",
                 err
             );
-            return;
+            return boot.publish();
         }
     };
     early_marker!(
@@ -3790,7 +3794,7 @@ pub fn enter_dispatched_user_task_if_available(
 
     let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid) else {
         early_marker!("RISCV_USERSPACE_DEFERRED reason=no_satp tid={}", tid);
-        return;
+        return boot.publish();
     };
 
     // Phase 1 proof: switch to the user satp, run kernel code, switch back.
@@ -3835,26 +3839,27 @@ pub fn enter_dispatched_user_task_if_available(
         ctx.user_sp
     );
     early_marker!("RISCV_ENTER_USER_ATTEMPT tid={}", tid);
-    // QEMU-SMP3 — the END of this hart's boot `&mut KernelState` window: nothing between here and
-    // the `sret` touches shared kernel state. Under `yarm.ap_user_dispatch=1` (and only then) this
-    // hart becomes an IPI target and releases every trap-ready secondary; otherwise a no-op.
+    // BLR1 — END OF THE BOOT EXCLUSIVE PHASE. `kernel` is not used past this line (`publish`
+    // consumes the token it was borrowed from). QEMU-SMP3: nothing between here and the `sret`
+    // touches shared kernel state. Under `yarm.ap_user_dispatch=1` (and only then) this hart
+    // becomes an IPI target and releases every trap-ready secondary; otherwise a no-op.
+    let _shared = boot.publish();
     crate::arch::riscv64::ipi::release_secondaries_at_boot_borrow_end(
         riscv_trap_ready_acked_bitmap(),
     );
     early_marker!("RISCV_ENTER_USER_SRET tid={}", tid);
-    unsafe {
-        yarm_riscv64_enter_user(&ctx as *const RiscvEnterUserCtx);
-    }
+    unsafe { yarm_riscv64_enter_user(&ctx as *const RiscvEnterUserCtx) }
 }
 
 #[cfg(any(feature = "hosted-dev", not(target_arch = "riscv64")))]
 pub fn enter_dispatched_user_task_if_available(
-    _kernel: &crate::kernel::boot::KernelState,
+    boot: crate::runtime::BootExclusive,
     _dispatched_tid: Option<u64>,
-) {
+) -> &'static crate::runtime::SharedKernel {
+    boot.publish()
 }
 
-pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
+pub fn run_with_prepared_kernel(run: fn(crate::runtime::BootExclusive)) {
     // Stage 196A: own KernelState through a boot-constructed `SharedKernel`
     // (the same Stage-2N shared trap path x86_64/AArch64 use), so the S-mode
     // trap bridge can route through the RISC-V shared wrapper's bounded
@@ -3863,17 +3868,15 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     // canonical `SharedKernel` into BOOTSTRAP_SHARED_KERNEL (.bss, inside the
     // kernel-shared Sv39 gigapage), like `init_static` did for
     // BOOTSTRAP_KERNEL_STATE — the heap-boxing OOM path (§5) is still avoided.
-    let shared = crate::kernel::boot::Bootstrap::init_shared_static().expect("kernel init");
-    // SAFETY: single boot hart; no trap handler can race before
-    // install_riscv_trap_shared_kernel stores the pointer, and this raw boot
-    // borrow is used only for the non-returning boot/dispatch sequence below
-    // (it is never used again after the first `sret` into user space, at which
-    // point the trap bridge takes over via `shared.with_cpu`).
-    let kernel: &mut crate::kernel::boot::KernelState = unsafe { shared.borrow_kernel_for_boot() };
-    // Install the SharedKernel pointer for the S-mode trap bridge before any
-    // user task runs. BOOTSTRAP_SHARED_KERNEL lives in .bss, so the pointer
-    // remains valid for the life of the kernel.
-    install_riscv_trap_shared_kernel(shared);
+    let mut boot = crate::kernel::boot::Bootstrap::init_shared_static().expect("kernel init");
+    // BLR1: `boot` is the exclusive owner of the kernel state until the first `sret` publishes
+    // it. Install the SharedKernel pointer for the S-mode trap bridge before any user task runs
+    // (BOOTSTRAP_SHARED_KERNEL lives in .bss, so the pointer remains valid for the life of the
+    // kernel); the bridge refuses to use it before publication, `sstatus.SIE` stays clear on this
+    // hart until the `sret`, and every secondary waits in its park for the publication-ordered
+    // release (`release_secondaries_at_boot_borrow_end`).
+    install_riscv_trap_shared_kernel(boot.shared_for_trap_installation());
+    let kernel = boot.state();
     crate::yarm_log!("YARM_LOCK_SPLIT_STAGE196A_INSTALLED arch=riscv64 shared=1 raw=0");
     // Stage 200C2C2C-R2C: one-shot boot-instance identifier (see `emit_boot_instance_nonce`).
     crate::kernel::boot::emit_boot_instance_nonce("riscv64");
@@ -3924,7 +3927,7 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         },
         timer_deferral.unwrap_or("none")
     );
-    run(kernel);
+    run(boot);
 }
 
 /// Tracks whether the RISC-V boot command line has already been captured.

@@ -8,65 +8,63 @@ use crate::kernel::boot::{
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights};
 use crate::kernel::ipc::Message;
-use crate::kernel::lock::SpinLock;
 #[cfg(test)]
-use crate::kernel::lock::SpinLockGuard;
+use crate::kernel::lock::{SpinLock, SpinLockGuard};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::task::{FaultPolicy, TaskClass};
 use crate::kernel::trap::FaultInfo;
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::{PAGE_SIZE, VirtAddr, VmError};
-#[cfg(any(debug_assertions, test))]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
-/// Stage 30 / Review-finding C1: debug-only guard for the raw `&mut KernelState`
-/// aliasing window opened by [`SharedKernel::borrow_kernel_for_boot`].
-///
-/// If a timer ISR or trap entry fires and calls `with` / `with_cpu` while the raw
-/// boot borrow is live, the two mutable references alias — undefined behavior.
-/// This flag lets arch trap/timer entry points `debug_assert!` no such race
-/// is in progress. Zero cost in release: the static, helpers, and all
-/// `debug_assert!` callers are `#[cfg(any(debug_assertions, test))]`.
-#[cfg(any(debug_assertions, test))]
-static BOOT_RAW_BORROW_ACTIVE: AtomicBool = AtomicBool::new(false);
+// ── BROAD-LOCK-RETIREMENT1: the boot ownership phase ────────────────────────────────────────
+//
+// There is no broad lock. The boot `KernelState` passes through exactly three phases, and this
+// one byte is their only record:
+//
+//   NONE      — no boot state has been claimed (hosted tests, and every boot before
+//               `Bootstrap::init_shared_static*`).
+//   EXCLUSIVE — one `BootExclusive` token exists. Its holder is the ONLY path to the state: no
+//               other CPU, interrupt handler or reentrant path may reach it, and every arch path
+//               that could is either not yet enabled or gated on `PUBLISHED`.
+//   PUBLISHED — the token was consumed by `BootExclusive::publish`. No whole-state reference can
+//               be formed any more; every access is a domain owner (`SharedKernel`'s seams).
+//
+// The transitions are one-way (NONE -> EXCLUSIVE -> PUBLISHED); a second claim panics.
+const BOOT_PHASE_NONE: u8 = 0;
+const BOOT_PHASE_EXCLUSIVE: u8 = 1;
+const BOOT_PHASE_PUBLISHED: u8 = 2;
+static BOOT_PHASE: AtomicU8 = AtomicU8::new(BOOT_PHASE_NONE);
 
-/// Open the boot raw-borrow window (debug/test only).
-///
-/// Asserts the window was not already open (no double-borrow).
-#[cfg(any(debug_assertions, test))]
-pub fn begin_boot_raw_borrow_window() {
-    let was_active = BOOT_RAW_BORROW_ACTIVE.swap(true, Ordering::SeqCst);
-    debug_assert!(
-        !was_active,
-        "borrow_kernel_for_boot called while a raw boot borrow is already live — aliasing &mut KernelState"
-    );
+/// `true` while a [`BootExclusive`] token is live — the boot CPU holds the only path to the
+/// kernel state, and nothing else may reach it.
+pub fn boot_exclusive_phase_open() -> bool {
+    BOOT_PHASE.load(Ordering::Acquire) == BOOT_PHASE_EXCLUSIVE
 }
 
-/// Close the boot raw-borrow window (debug/test only).
-#[cfg(any(debug_assertions, test))]
-pub fn end_boot_raw_borrow_window() {
-    BOOT_RAW_BORROW_ACTIVE.store(false, Ordering::SeqCst);
+/// `true` once the boot state was published: from here every access is a domain owner.
+pub fn boot_state_published() -> bool {
+    BOOT_PHASE.load(Ordering::Acquire) == BOOT_PHASE_PUBLISHED
 }
 
-/// Report whether the boot raw-borrow window is currently open (debug/test only).
-#[cfg(any(debug_assertions, test))]
-pub fn boot_raw_borrow_is_active() -> bool {
-    BOOT_RAW_BORROW_ACTIVE.load(Ordering::SeqCst)
-}
-
-/// RAII guard that closes the boot raw-borrow window on drop (debug/test only).
+/// The fail-closed check every arch trap entry runs before it touches the shared kernel.
 ///
-/// The live arch boot path never returns (ERET), so the window is intentionally
-/// not closed in production — the flag becomes irrelevant after ERET since all
-/// further KernelState access goes through `with` / `with_cpu`. This guard is
-/// useful in test/returning paths where dropping it restores a clean state.
-#[cfg(any(debug_assertions, test))]
-pub struct BootRawKernelBorrowGuard;
-
-#[cfg(any(debug_assertions, test))]
-impl Drop for BootRawKernelBorrowGuard {
-    fn drop(&mut self) {
-        end_boot_raw_borrow_window();
+/// A trap that reaches `SharedKernel` while the boot exclusive token is live would form domain
+/// references to bytes the boot CPU holds `&mut` to — a second path to state the exclusive
+/// phase promises has exactly one. The boot sequence is built so that cannot happen (no
+/// interrupt source is armed and unmasked before publication, and every secondary waits for
+/// it), so arriving here during the phase is a violated precondition, not a race to tolerate:
+/// it is reported and the CPU halts rather than continue on undefined behaviour.
+#[inline]
+pub fn refuse_shared_entry_during_boot_exclusive(site: &'static str) {
+    if boot_exclusive_phase_open() {
+        crate::kernel::printk::printk_emit_sync(format_args!(
+            "BOOT_EXCLUSIVE_VIOLATION site={} reason=shared_entry_before_publication",
+            site
+        ));
+        loop {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -227,10 +225,71 @@ impl IpcRecvQueuedPlainWritebackPlan {
     }
 }
 
+/// BROAD-LOCK-RETIREMENT1 — the kernel state, with no lock around it.
+///
+/// `SharedKernel` used to own `SpinLock<KernelState>`: one mutex over the whole state, entered by
+/// `SharedKernel::with` / `with_cpu`. Every production acquisition of it was retired (U3 .. U9),
+/// so the lock had become an unused mechanism that could only ever be used to bring a broad
+/// acquisition back. It is gone, and nothing replaces it: there is no global mutex, no renamed
+/// wrapper and no production closure over `&mut KernelState`.
+///
+/// What remains is storage, and storage alone carries no permission. Each mutable field is owned
+/// by exactly one authority, recorded in `doc/KERNEL_UNLOCKING.md` §BLR1 and checked by
+/// `blr1_kernel_state_field_authority_is_total` in the hosted suite:
+///
+/// * a DOMAIN LOCK stored in the state itself — ranks 1..6 plus the fault, restart, telemetry,
+///   boot-config and driver locks; the `SharedKernel` seams take the lock, then form a reference
+///   to that domain's fields only (`KernelState::*_from_raw` projects field pointers with
+///   `addr_of!`, never a reference to the whole);
+/// * CONSTRUCTION ONLY — written while the boot token is exclusive and read-only afterwards
+///   (`tid_allocation_policy`), or touched only by whole-state code (`kernel_aspace`, `hal`),
+///   which can run only while the token is exclusive;
+/// * the EXCLUSIVE BOOT PHASE — the one production whole-state `&mut`, owned by
+///   [`BootExclusive`] and ended by [`BootExclusive::publish`].
+///
+/// Runtime access therefore never manufactures a reference to the whole `KernelState`: the only
+/// projection out of this cell is the raw [`SharedKernel::state_ptr`], private to this file.
+#[repr(transparent)]
+struct KernelStateCell(core::cell::UnsafeCell<KernelState>);
+
+impl core::fmt::Debug for KernelStateCell {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Never formats the state: that would read every domain without its owner.
+        f.write_str("KernelStateCell { .. }")
+    }
+}
+
 #[derive(Debug)]
 pub struct SharedKernel {
-    state: SpinLock<KernelState>,
+    state: KernelStateCell,
+    /// Hosted tests only: serializes the test-only whole-state helpers ([`SharedKernel::with`],
+    /// [`SharedKernel::with_cpu`], [`SharedKernel::lock`]) against each other. It is NOT the
+    /// retired broad lock — no production path can name it, and freestanding images do not
+    /// contain it.
+    #[cfg(test)]
+    test_exclusive: SpinLock<()>,
 }
+
+// SAFETY: `SharedKernel` is shared between CPUs (`&'static` from the boot statics) and between
+// hosted test threads. Sharing it is sound because nothing reaches the state through `&self`
+// except the private `state_ptr` projection, and every caller of that projection dereferences
+// only the fields of ONE authority, under that authority:
+//   * the domain seams take the domain's lock (stored in the state, an atomic) before forming a
+//     reference to the domain's fields, and the reference does not outlive the guard;
+//   * construction-only fields are read, never written, after publication;
+//   * the whole-state `&mut` exists only inside the boot exclusive phase, which by construction
+//     (see `BootExclusive`) admits no second path, and in `#[cfg(test)]` helpers serialized by
+//     `test_exclusive`.
+// The state itself must be transferable between CPUs, which is what the old
+// `SpinLock<KernelState>: Sync` bound required; `ASSERT_KERNEL_STATE_SEND` keeps that bound.
+unsafe impl Sync for SharedKernel {}
+// SAFETY: moving a `SharedKernel` moves its state; the state is `Send` (asserted below).
+unsafe impl Send for SharedKernel {}
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<KernelState>();
+};
 
 /// Stage 200C2B — the OFF-LOCK per-domain access for the reply-timeout completion
 /// transaction. Wraps `&SharedKernel` and implements `ReplyTimeoutDomains` via the
@@ -1509,37 +1568,60 @@ impl D6PublishRefusal {
 impl SharedKernel {
     /// Stage 114 fix: this used to also cache `scheduler_state` /
     /// `boot_config_state_lock` / `boot_config` raw pointers computed from
-    /// the `state` parameter's address *before* `SpinLock::new(state)` moved
-    /// it into `Self`. Rust gives no guarantee that move is elided, so those
-    /// pointers could go stale (reproduced as a SIGSEGV reading through a
-    /// dangling `scheduler_state` in the Stage 114 D3 live-seam tests). The
-    /// split-read helpers below now derive the same pointers fresh from
-    /// `self.state.data_ptr()` at each call, the same pattern the Stage 108
-    /// `with_*_split_mut` seams already use — no caching, no staleness.
+    /// the `state` parameter's address *before* the move into `Self`. Rust gives no guarantee
+    /// that move is elided, so those pointers could go stale (reproduced as a SIGSEGV reading
+    /// through a dangling `scheduler_state` in the Stage 114 D3 live-seam tests). The split-read
+    /// helpers below derive the same pointers fresh from [`Self::state_ptr`] at each call, the
+    /// same pattern the Stage 108 `with_*_split_mut` seams already use — no caching, no
+    /// staleness.
+    ///
+    /// BLR1: moving an OWNED state in is exclusive construction — nothing else can hold a path to
+    /// a value being moved. The boot singleton is not built this way: it is constructed in place
+    /// (`Bootstrap::init_shared_static*`), so its address is stable from birth.
     pub fn new(state: KernelState) -> Self {
         Self {
-            state: SpinLock::new(state),
+            state: KernelStateCell(core::cell::UnsafeCell::new(state)),
+            #[cfg(test)]
+            test_exclusive: SpinLock::new(()),
         }
     }
 
-    #[cfg(test)]
-    pub fn lock(&self) -> SpinLockGuard<'_, KernelState> {
-        self.state.lock()
+    /// BLR1 — THE projection out of the state cell: a raw pointer, never a reference.
+    ///
+    /// Private to this file. Every caller passes it to a `KernelState::*_from_raw` field projector
+    /// (or projects a field itself with `addr_of!`) and dereferences only the fields of the
+    /// authority it holds. It is stable for the `SharedKernel`'s lifetime: the cell is never moved
+    /// out of, and the boot singleton is constructed at its final address.
+    #[inline(always)]
+    fn state_ptr(&self) -> *mut KernelState {
+        self.state.0.get()
     }
 
-    pub fn with<R>(&self, f: impl FnOnce(&mut KernelState) -> R) -> R {
-        let mut guard = self.state.lock();
-        f(&mut guard)
+    /// BLR1 — the boot singleton's state address, for in-place construction.
+    ///
+    /// # Safety
+    /// `shared` must point at storage for one `SharedKernel` that nothing else references; the
+    /// returned pointer is to its (possibly uninitialized) state field.
+    pub(crate) unsafe fn state_ptr_for_construction(shared: *mut SharedKernel) -> *mut KernelState {
+        // SAFETY: field projection on caller-owned storage; `UnsafeCell<T>` is `repr(transparent)`
+        // over `T` and `KernelStateCell` is `repr(transparent)` over the cell, so `raw_get`
+        // yields the state's address without reading or referencing anything.
+        unsafe { core::cell::UnsafeCell::raw_get(core::ptr::addr_of!((*shared).state.0)) }
     }
 
-    pub fn with_cpu<R>(
-        &self,
-        cpu: CpuId,
-        f: impl FnOnce(&mut KernelState) -> R,
-    ) -> Result<R, KernelError> {
-        let mut guard = self.state.lock();
-        guard.set_current_cpu(cpu)?;
-        Ok(f(&mut guard))
+    /// BLR1 — finish in-place construction of a `SharedKernel` whose state was already written
+    /// through [`Self::state_ptr_for_construction`]: initialize the remaining (test-only) fields.
+    ///
+    /// # Safety
+    /// As `state_ptr_for_construction`, and the state field must be fully initialized.
+    pub(crate) unsafe fn finish_in_place_construction(shared: *mut SharedKernel) {
+        #[cfg(test)]
+        // SAFETY: caller-owned storage; the field is written, never read, here.
+        unsafe {
+            core::ptr::addr_of_mut!((*shared).test_exclusive).write(SpinLock::new(()));
+        }
+        #[cfg(not(test))]
+        let _ = shared;
     }
 
     /// # Validation status
@@ -1548,11 +1630,11 @@ impl SharedKernel {
     pub fn scheduler_tick_now_split_read(&self) -> u64 {
         // Stage 2B split: read scheduler tick directly under scheduler lock.
         crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read");
-        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // SAFETY: `self.state_ptr()` is the live address of the
         // `KernelState` owned by this `SharedKernel`; recomputed fresh on
         // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
         let scheduler_state =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
         let scheduler_state = unsafe { &*scheduler_state };
         let sched = scheduler_state.lock();
         sched.timer.current_ticks().0
@@ -1704,11 +1786,11 @@ impl SharedKernel {
         // Phase L5A split: read the scheduler's per-CPU current TID directly
         // under the scheduler lock.  This intentionally avoids the global
         // SharedKernel lock and does not mutate current_cpu or task state.
-        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // SAFETY: `self.state_ptr()` is the live address of the
         // `KernelState` owned by this `SharedKernel`; recomputed fresh on
         // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
         let scheduler_state =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
         let scheduler_state = unsafe { &*scheduler_state };
         let sched = scheduler_state.lock();
         kernel_ref(&sched.scheduler)
@@ -1721,11 +1803,11 @@ impl SharedKernel {
         // Phase L7A split: read scheduler topology through scheduler_state only.
         // This is a read-only staged helper; it does not acquire the global
         // SharedKernel lock, mutate runqueues, or update current_cpu.
-        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // SAFETY: `self.state_ptr()` is the live address of the
         // `KernelState` owned by this `SharedKernel`; recomputed fresh on
         // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
         let scheduler_state =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
         let scheduler_state = unsafe { &*scheduler_state };
         let sched = scheduler_state.lock();
         kernel_ref(&sched.scheduler).online_cpu_count()
@@ -1736,11 +1818,11 @@ impl SharedKernel {
         // Phase L7A split: read scheduler topology through scheduler_state only.
         // This is a read-only staged helper; it does not acquire the global
         // SharedKernel lock, mutate runqueues, or update current_cpu.
-        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // SAFETY: `self.state_ptr()` is the live address of the
         // `KernelState` owned by this `SharedKernel`; recomputed fresh on
         // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
         let scheduler_state =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
         let scheduler_state = unsafe { &*scheduler_state };
         let sched = scheduler_state.lock();
         kernel_ref(&sched.scheduler).present_cpu_count()
@@ -1751,11 +1833,11 @@ impl SharedKernel {
         // Phase L8B split: read immutable boot configuration under only the
         // boot_config lock domain. This intentionally avoids the global
         // SharedKernel lock and does not mutate boot config or runtime state.
-        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // SAFETY: `self.state_ptr()` is the live address of the
         // `KernelState` owned by this `SharedKernel`; recomputed fresh on
         // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
         let (boot_config_state_lock, boot_config) =
-            unsafe { KernelState::boot_config_split_read_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::boot_config_split_read_ptrs_from_raw(self.state_ptr()) };
         let boot_config_state_lock = unsafe { &*boot_config_state_lock };
         let _guard = boot_config_state_lock.lock();
         let boot_config = unsafe { &*boot_config };
@@ -1779,7 +1861,7 @@ impl SharedKernel {
         // pointers without creating a whole-KernelState reference; the fault
         // lock serializes access to the fault subsystem storage.
         let (fault_state_lock, faults) =
-            unsafe { KernelState::fault_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::fault_split_mut_ptrs_from_raw(self.state_ptr()) };
         let fault_state_lock = unsafe { &*fault_state_lock };
         let _guard = fault_state_lock.lock();
         let faults = unsafe { &mut *faults };
@@ -1966,7 +2048,7 @@ impl SharedKernel {
         // reference to the whole KernelState, and `task_state_lock` serializes the task domain.
         let (task_lock, robust) = unsafe {
             crate::kernel::boot::KernelState::task_robust_futex_split_ptrs_from_raw(
-                self.state.data_ptr(),
+                self.state_ptr(),
             )
         };
         let task_lock = unsafe { &*task_lock };
@@ -2073,7 +2155,7 @@ impl SharedKernel {
         // without forming a reference to the whole KernelState; `restart_state_lock` serializes
         // access to the `restart` storage.
         let (restart_lock, restart) =
-            unsafe { KernelState::restart_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::restart_split_mut_ptrs_from_raw(self.state_ptr()) };
         let restart_lock = unsafe { &*restart_lock };
         let _guard = restart_lock.lock();
         let restart = unsafe { &mut *restart };
@@ -2093,7 +2175,7 @@ impl SharedKernel {
         // field pointers without creating a whole-KernelState reference; the
         // telemetry lock serializes access to telemetry storage.
         let (telemetry_state_lock, telemetry) =
-            unsafe { KernelState::telemetry_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::telemetry_split_mut_ptrs_from_raw(self.state_ptr()) };
         let telemetry_state_lock = unsafe { &*telemetry_state_lock };
         let _guard = telemetry_state_lock.lock();
         let telemetry = unsafe { &mut *telemetry };
@@ -2181,7 +2263,7 @@ impl SharedKernel {
         // raw field pointer without creating a whole-KernelState reference;
         // the scheduler lock contains and serializes its own data.
         let scheduler_lock =
-            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state_ptr()) };
         let scheduler_lock = unsafe { &*scheduler_lock };
         let mut guard = scheduler_lock.lock();
         f(&mut guard)
@@ -3846,9 +3928,8 @@ impl SharedKernel {
     ) -> R {
         // SAFETY: same pattern as `with_task_tcbs_split_mut` — the task lock serializes both
         // storages, which live in the same domain.
-        let (task_lock, tcbs, classes) = unsafe {
-            KernelState::task_enqueue_policy_split_mut_ptrs_from_raw(self.state.data_ptr())
-        };
+        let (task_lock, tcbs, classes) =
+            unsafe { KernelState::task_enqueue_policy_split_mut_ptrs_from_raw(self.state_ptr()) };
         let task_lock = unsafe { &*task_lock };
         let _guard = task_lock.lock();
         let tcbs = unsafe { &mut *tcbs };
@@ -3875,9 +3956,8 @@ impl SharedKernel {
         // SAFETY: same pattern as `with_task_enqueue_policy_split_mut` — `tcbs` and
         // `spawn_reservation_generation` are disjoint fields of the same `KernelState`, both
         // serialized by `task_state_lock`, which is held for the whole closure.
-        let (task_lock, tcbs, generation) = unsafe {
-            KernelState::task_spawn_generation_split_mut_ptrs_from_raw(self.state.data_ptr())
-        };
+        let (task_lock, tcbs, generation) =
+            unsafe { KernelState::task_spawn_generation_split_mut_ptrs_from_raw(self.state_ptr()) };
         let task_lock = unsafe { &*task_lock };
         let _guard = task_lock.lock();
         let tcbs = unsafe { &mut *tcbs };
@@ -4526,7 +4606,7 @@ impl SharedKernel {
         // SAFETY: same pattern as `with_task_enqueue_policy_split_mut` — all four storages live
         // in the task domain and are serialized by `task_state_lock`, held for the whole closure.
         let (task_lock, tcbs, classes, cursor, tls) =
-            unsafe { KernelState::spawn_thread_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::spawn_thread_split_mut_ptrs_from_raw(self.state_ptr()) };
         let task_lock = unsafe { &*task_lock };
         let _guard = task_lock.lock();
         let tcbs = unsafe { &mut *tcbs };
@@ -4555,7 +4635,7 @@ impl SharedKernel {
         // SAFETY: same pattern as with_fault_split_mut — the task lock
         // serializes access to the TCB array storage.
         let (task_lock, tcbs) =
-            unsafe { KernelState::task_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::task_split_mut_ptrs_from_raw(self.state_ptr()) };
         let task_lock = unsafe { &*task_lock };
         let _guard = task_lock.lock();
         let tcbs = unsafe { &mut *tcbs };
@@ -4574,7 +4654,7 @@ impl SharedKernel {
         // SAFETY: same pattern as `with_task_tcbs_split_mut` — the task lock serializes both
         // storages, which live in the same domain.
         let (task_lock, tcbs, tls) =
-            unsafe { KernelState::task_return_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::task_return_split_mut_ptrs_from_raw(self.state_ptr()) };
         let task_lock = unsafe { &*task_lock };
         let _guard = task_lock.lock();
         let tcbs = unsafe { &mut *tcbs };
@@ -8723,9 +8803,9 @@ impl SharedKernel {
         // serializes `memory`, and both guards are held for the whole closure. The two fields are
         // disjoint, so the two `&mut` never alias.
         let (vm_lock, user_spaces) =
-            unsafe { KernelState::vm_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::vm_split_mut_ptrs_from_raw(self.state_ptr()) };
         let (memory_lock, memory) =
-            unsafe { KernelState::memory_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::memory_split_mut_ptrs_from_raw(self.state_ptr()) };
         let vm_lock = unsafe { &*vm_lock };
         let _vm_guard = vm_lock.lock();
         let memory_lock = unsafe { &*memory_lock };
@@ -8750,10 +8830,9 @@ impl SharedKernel {
     ) -> R {
         // SAFETY: same pattern. `ipc_state_lock` serializes `ipc`, `capability_state_lock`
         // serializes `capability`; the fields are disjoint and both guards are held throughout.
-        let (ipc_lock, ipc) =
-            unsafe { KernelState::ipc_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let (ipc_lock, ipc) = unsafe { KernelState::ipc_split_mut_ptrs_from_raw(self.state_ptr()) };
         let (capability_lock, capability) =
-            unsafe { KernelState::capability_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::capability_split_mut_ptrs_from_raw(self.state_ptr()) };
         let ipc_lock = unsafe { &*ipc_lock };
         let _ipc_guard = ipc_lock.lock();
         let capability_lock = unsafe { &*capability_lock };
@@ -8769,7 +8848,7 @@ impl SharedKernel {
     ) -> R {
         // SAFETY: same pattern — the vm lock serializes user_spaces storage.
         let (vm_lock, user_spaces) =
-            unsafe { KernelState::vm_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::vm_split_mut_ptrs_from_raw(self.state_ptr()) };
         let vm_lock = unsafe { &*vm_lock };
         let _guard = vm_lock.lock();
         let user_spaces = unsafe { &mut *user_spaces };
@@ -8790,7 +8869,7 @@ impl SharedKernel {
         // SAFETY: same pattern — the memory lock serializes MemorySubsystem
         // storage (memory objects + frame bookkeeping).
         let (memory_lock, memory) =
-            unsafe { KernelState::memory_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::memory_split_mut_ptrs_from_raw(self.state_ptr()) };
         let memory_lock = unsafe { &*memory_lock };
         let _guard = memory_lock.lock();
         let memory = unsafe { &mut *memory };
@@ -8959,8 +9038,7 @@ impl SharedKernel {
         // field pointers via addr_of!/addr_of_mut! without forming a
         // reference to the whole KernelState; `ipc_state_lock` serializes
         // access to the `ipc` storage.
-        let (ipc_lock, ipc) =
-            unsafe { KernelState::ipc_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let (ipc_lock, ipc) = unsafe { KernelState::ipc_split_mut_ptrs_from_raw(self.state_ptr()) };
         let ipc_lock = unsafe { &*ipc_lock };
         let _guard = ipc_lock.lock();
         let ipc = unsafe { &mut *ipc };
@@ -10562,7 +10640,7 @@ impl SharedKernel {
         // `capability` field. `capability` is a direct (non-`KernelStorage`)
         // field, so no `kernel_mut` unwrap is needed.
         let (capability_lock, capability) =
-            unsafe { KernelState::capability_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::capability_split_mut_ptrs_from_raw(self.state_ptr()) };
         let capability_lock = unsafe { &*capability_lock };
         let _guard = capability_lock.lock();
         let capability = unsafe { &mut *capability };
@@ -10579,7 +10657,7 @@ impl SharedKernel {
         // a whole-KernelState reference. The fault lock serializes access; the *mut
         // pointer is downgraded to *const for this read-only use.
         let (fault_state_lock, faults) =
-            unsafe { KernelState::fault_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::fault_split_mut_ptrs_from_raw(self.state_ptr()) };
         let fault_state_lock = unsafe { &*fault_state_lock };
         let _guard = fault_state_lock.lock();
         let faults: &KernelStorage<FaultSubsystem> = unsafe { &*(faults as *const _) };
@@ -10613,7 +10691,7 @@ impl SharedKernel {
         // creating a whole-KernelState reference. The telemetry lock serializes
         // access; the *mut pointer is downgraded to *const for read-only use.
         let (telemetry_state_lock, telemetry) =
-            unsafe { KernelState::telemetry_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+            unsafe { KernelState::telemetry_split_mut_ptrs_from_raw(self.state_ptr()) };
         let telemetry_state_lock = unsafe { &*telemetry_state_lock };
         let _guard = telemetry_state_lock.lock();
         let telemetry: &KernelStorage<TelemetrySubsystem> = unsafe { &*(telemetry as *const _) };
@@ -10984,7 +11062,7 @@ impl SharedKernel {
             SYSCALL_ARG_LEN, SYSCALL_ARG_PTR, SYSCALL_ARG_TRANSFER_CAP, SyscallError,
         };
         let recv_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-        let state = self.state.data_ptr();
+        let state = self.state_ptr();
         let pid = unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }?;
         let object = match unsafe {
             KernelState::resolve_notification_recv_cap_in_pid_from_raw(
@@ -13123,7 +13201,7 @@ impl SharedKernel {
         // this SharedKernel. `task_asid_for_tid_from_raw` derives raw field pointers
         // without creating a whole-KernelState reference; the task lock serializes
         // access to the TCB array.
-        unsafe { KernelState::task_asid_for_tid_from_raw(self.state.data_ptr() as *const _, tid) }
+        unsafe { KernelState::task_asid_for_tid_from_raw(self.state_ptr() as *const _, tid) }
     }
 
     /// Stage 191A (GLOBAL-LOCK-RETIRE class=DebugLog): copy `len` bytes from user VA
@@ -13263,15 +13341,13 @@ impl SharedKernel {
 
     // ── Stage 198E3B2A part 2: shared-region OFF-LOCK seams ─────────────────────────────────────
     //
-    // Each seam re-derives its domain pointer from `self.state.data_ptr()` on EVERY call (no cached
+    // Each seam re-derives its domain pointer from `self.state_ptr()` on EVERY call (no cached
     // projected pointers), acquires ONLY its documented domain lock, and returns owned/copyable data
     // (no domain reference escapes a guard). No seam forms a whole `&mut KernelState`.
 
     /// rank 2: generation-bearing receiver liveness (status not Dead/Exited + captured ASID).
     pub(crate) fn sr_receiver_alive_split(&self, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
-        unsafe {
-            KernelState::shared_region_receiver_alive_from_raw(self.state.data_ptr(), tid, asid)
-        }
+        unsafe { KernelState::shared_region_receiver_alive_from_raw(self.state_ptr(), tid, asid) }
     }
     /// rank 3: the fail-closed cancellation overflow fuse (read).
     pub(crate) fn sr_cancel_overflowed_split(&self) -> bool {
@@ -17706,7 +17782,7 @@ impl SharedKernel {
     pub(crate) fn tid_allocation_policy_split_read(
         &self,
     ) -> crate::kernel::boot::TidAllocationPolicyRef {
-        unsafe { KernelState::tid_allocation_policy_from_raw(self.state.data_ptr() as *const _) }
+        unsafe { KernelState::tid_allocation_policy_from_raw(self.state_ptr() as *const _) }
     }
 
     /// U9-SPAWN1 SP-2: apply one TID allocation's telemetry at rank 10, task lock released.
@@ -17735,7 +17811,7 @@ impl SharedKernel {
         // this SharedKernel. `task_class_from_raw` uses `addr_of!` to derive raw
         // field pointers without creating a whole-KernelState reference; the task
         // lock serializes access to both `tcbs` and `task_classes`.
-        unsafe { KernelState::task_class_from_raw(self.state.data_ptr() as *const _, tid) }
+        unsafe { KernelState::task_class_from_raw(self.state_ptr() as *const _, tid) }
     }
 
     pub fn task_exists_split_read(&self, tid: u64) -> bool {
@@ -17743,7 +17819,7 @@ impl SharedKernel {
         // Does not acquire the outer SharedKernel lock. Does not mutate any state.
         // Lock order: task (rank 2). Forbidden caller-held locks: none with rank ≤ 2.
         // SAFETY: same as `task_class_split_read`.
-        unsafe { KernelState::task_exists_from_raw(self.state.data_ptr() as *const _, tid) }
+        unsafe { KernelState::task_exists_from_raw(self.state_ptr() as *const _, tid) }
     }
 
     /// Stage 199D — live reverse-link count, through the rank-2 task seam only.
@@ -18106,7 +18182,7 @@ impl SharedKernel {
         // this SharedKernel. `cnode_slot_capacity_from_raw` uses `addr_of!` to derive
         // raw field pointers without creating a whole-KernelState reference; the
         // capability lock serializes access to the `capability` field.
-        unsafe { KernelState::cnode_slot_capacity_from_raw(self.state.data_ptr() as *const _, pid) }
+        unsafe { KernelState::cnode_slot_capacity_from_raw(self.state_ptr() as *const _, pid) }
     }
 
     // ── Stage 5B split-read helpers ──────────────────────────────────────────
@@ -18118,7 +18194,7 @@ impl SharedKernel {
         // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
         // this SharedKernel. `process_id_from_raw` uses `addr_of!` to derive raw
         // field pointers; the task lock serializes access to the `tcbs` array.
-        unsafe { KernelState::process_id_from_raw(self.state.data_ptr() as *const _, tid) }
+        unsafe { KernelState::process_id_from_raw(self.state_ptr() as *const _, tid) }
     }
 
     pub fn is_group_leader_split_read(&self, tid: u64) -> bool {
@@ -18126,7 +18202,7 @@ impl SharedKernel {
         // Does not acquire the outer SharedKernel lock. Does not mutate any state.
         // Lock order: task (rank 2). Forbidden caller-held locks: none with rank ≤ 2.
         // SAFETY: same as `process_id_split_read`.
-        unsafe { KernelState::is_group_leader_from_raw(self.state.data_ptr() as *const _, tid) }
+        unsafe { KernelState::is_group_leader_from_raw(self.state_ptr() as *const _, tid) }
     }
 
     // ── Stage 26 split-read helpers ──────────────────────────────────────────
@@ -18144,7 +18220,7 @@ impl SharedKernel {
         // reference; the ipc lock serializes access to the `ipc` field.
         unsafe {
             KernelState::notification_waiter_count_from_raw(
-                self.state.data_ptr() as *const _,
+                self.state_ptr() as *const _,
                 notification_idx,
             )
         }
@@ -18161,7 +18237,7 @@ impl SharedKernel {
         // this SharedKernel. `cnode_registered_from_raw` uses `addr_of!` to derive
         // raw field pointers without creating a whole-KernelState reference; the
         // capability lock serializes access to the `capability` field.
-        unsafe { KernelState::cnode_registered_from_raw(self.state.data_ptr() as *const _, pid) }
+        unsafe { KernelState::cnode_registered_from_raw(self.state_ptr() as *const _, pid) }
     }
 
     // ── Stage 27 / 29 split-mutation helpers ─────────────────────────────────
@@ -18207,7 +18283,7 @@ impl SharedKernel {
         target_pid: u64,
         slot_capacity: usize,
     ) -> Result<(), KernelError> {
-        let state = self.state.data_ptr();
+        let state = self.state_ptr();
         // Phase 1: task-domain snapshot (rank 2), lock released on return.
         let requester_class =
             unsafe { KernelState::task_class_from_raw(state as *const _, requester_tid) }
@@ -18271,7 +18347,7 @@ impl SharedKernel {
         requester_tid: u64,
         cap: CapId,
     ) -> Result<EndpointRecvCapSnapshot, KernelError> {
-        let state = self.state.data_ptr();
+        let state = self.state_ptr();
         // Phase 1: task-domain snapshot (rank 2), lock released on return.
         let requester_pid =
             unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
@@ -18301,7 +18377,7 @@ impl SharedKernel {
         requester_tid: u64,
         cap: CapId,
     ) -> Result<CapObject, KernelError> {
-        let state = self.state.data_ptr();
+        let state = self.state_ptr();
         let requester_pid =
             unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
                 .ok_or(KernelError::InvalidCapability)?;
@@ -18323,7 +18399,7 @@ impl SharedKernel {
         requester_tid: u64,
         cap: CapId,
     ) -> Result<(usize, u64), KernelError> {
-        let state = self.state.data_ptr();
+        let state = self.state_ptr();
         let requester_pid =
             unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
                 .ok_or(KernelError::InvalidCapability)?;
@@ -18341,7 +18417,7 @@ impl SharedKernel {
         &self,
         identity: crate::kernel::boot::ReceiverWaiterIdentity,
     ) -> Option<crate::kernel::capabilities::CNodeId> {
-        let state = self.state.data_ptr();
+        let state = self.state_ptr();
         unsafe {
             KernelState::process_cnode_for_identity_from_raw(
                 state as *const _,
@@ -18350,45 +18426,162 @@ impl SharedKernel {
             )
         }
     }
+}
 
-    /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
-    ///
-    /// # Validation status
-    /// - LIVE_OFF_TRAP — called only from single-CPU arch boot, never from the trap
-    ///   path. Opens a raw `&mut KernelState` aliasing window (Review finding C1).
-    ///
-    /// This exists solely for AArch64/x86_64 boot code that must pass
-    /// `&mut KernelState` to a callback that eventually ERETs into user space and
-    /// never returns. Holding the `SpinLock` across that ERET would leave
-    /// `held = true` permanently, deadlocking all subsequent trap handlers.
-    ///
-    /// # Canonical safety contract (Review finding C1)
-    /// * Must only be called during single-CPU boot before any trap handler can
-    ///   concurrently call `SharedKernel::with` or `with_cpu`. On both archs the
-    ///   raw `TRAP_KERNEL_STATE_PTR` is installed only AFTER this borrow, and
-    ///   external interrupts stay masked until later in boot; the LAPIC/timer
-    ///   deadline is far beyond the boot window, so no timer ISR fires during it.
-    ///   If a timer ISR DID fire and reach `with_cpu`, it would build a second
-    ///   `&mut KernelState` aliasing this one — undefined behavior.
-    /// * The returned reference must not be used after the ERET to user space;
-    ///   from that point all KernelState access must go through `with` / `with_cpu`.
-    /// * `TRAP_KERNEL_STATE_PTR` must remain null while this reference is live so
-    ///   that the trap fallback path cannot also yield `&mut KernelState`.
-    ///
-    /// The debug-only `BOOT_RAW_BORROW_ACTIVE` flag (set here, asserted at arch
-    /// timer/trap entry) enforces the no-concurrent-access contract under
-    /// `debug_assertions`/`test`. The live boot path is non-returning, so the
-    /// window is never explicitly closed in production; the flag becomes
-    /// irrelevant after the ERET (see [`begin_boot_raw_borrow_window`]).
+/// BROAD-LOCK-RETIREMENT1 — hosted-test-only whole-state access.
+///
+/// These are the retired broad wrappers' names, kept ONLY for the hosted suite's reference and
+/// differential tests, which drive whole-state bodies (`KernelState::handle_trap`, the broad
+/// syscall dispatcher, the in-lock owners) directly. They exist under `#[cfg(test)]` and nowhere
+/// else: a freestanding image and the hosted non-test library contain no symbol that yields
+/// `&mut KernelState` from a `SharedKernel`, so a production caller fails to compile rather than
+/// reacquire anything. `test_exclusive` serializes them against each other; it is not consulted by
+/// the production seams, exactly as the retired lock was not.
+#[cfg(test)]
+impl SharedKernel {
+    /// Test-only: run `f` with exclusive access to the whole state.
+    pub fn with<R>(&self, f: impl FnOnce(&mut KernelState) -> R) -> R {
+        let _serial = self.test_exclusive.lock();
+        // SAFETY: test-only; `test_exclusive` serializes every whole-state reference this type
+        // hands out, and a hosted test is the only caller.
+        f(unsafe { &mut *self.state_ptr() })
+    }
+
+    /// Test-only: as [`Self::with`], after binding `cpu` exactly as the retired broad wrapper did.
+    pub fn with_cpu<R>(
+        &self,
+        cpu: CpuId,
+        f: impl FnOnce(&mut KernelState) -> R,
+    ) -> Result<R, KernelError> {
+        let _serial = self.test_exclusive.lock();
+        // SAFETY: as `with`.
+        let state = unsafe { &mut *self.state_ptr() };
+        state.set_current_cpu(cpu)?;
+        Ok(f(state))
+    }
+
+    /// Test-only: the state's address, to prove it never moves.
+    pub fn state_addr_for_test(&self) -> usize {
+        self.state_ptr() as usize
+    }
+
+    /// Test-only: a guard dereferencing to the whole state, serialized like [`Self::with`].
+    pub fn lock(&self) -> TestExclusiveGuard<'_> {
+        TestExclusiveGuard {
+            _serial: self.test_exclusive.lock(),
+            state: self.state_ptr(),
+            _state: core::marker::PhantomData,
+        }
+    }
+}
+
+/// Hosted-test-only guard returned by [`SharedKernel::lock`].
+#[cfg(test)]
+pub struct TestExclusiveGuard<'a> {
+    _serial: SpinLockGuard<'a, ()>,
+    state: *mut KernelState,
+    _state: core::marker::PhantomData<&'a mut KernelState>,
+}
+
+#[cfg(test)]
+impl core::ops::Deref for TestExclusiveGuard<'_> {
+    type Target = KernelState;
+    fn deref(&self) -> &KernelState {
+        // SAFETY: serialized by `_serial` for the guard's lifetime.
+        unsafe { &*self.state }
+    }
+}
+
+#[cfg(test)]
+impl core::ops::DerefMut for TestExclusiveGuard<'_> {
+    fn deref_mut(&mut self) -> &mut KernelState {
+        // SAFETY: as `deref`; `&mut self` makes this the guard's only live reference.
+        unsafe { &mut *self.state }
+    }
+}
+
+/// BROAD-LOCK-RETIREMENT1 — the boot exclusive phase, as a value.
+///
+/// The ONE production owner of a whole-state `&mut KernelState`. It replaces
+/// `SharedKernel::borrow_kernel_for_boot`, whose `&mut` was handed out with an unchecked contract
+/// and never ended: the boot path kept using it while secondaries were released, interrupt
+/// sources were armed and witness hooks reached the same state through `SharedKernel`. Here the
+/// borrow's end is a TYPE fact rather than a convention:
+///
+/// * [`Self::state`] lends `&mut KernelState` tied to `&mut self`, so it cannot outlive the
+///   token and cannot coexist with another loan from it;
+/// * [`Self::publish`] CONSUMES the token, so no loan is live once it returns — the compiler
+///   rejects a use of `state()` after publication — and records the phase change every
+///   cross-CPU and interrupt path is gated on;
+/// * it is `!Send` and `!Sync`: it lives on the boot CPU and cannot be handed to another one;
+/// * there is exactly one per boot: [`Self::claim`] panics on a second claim.
+///
+/// What the phase PROMISES — that no other path reaches the state while the token is live — is
+/// kept by the boot sequence, not by this type, and is stated per architecture in
+/// `doc/KERNEL_UNLOCKING.md` §BLR1: secondaries wait for publication before touching shared
+/// state; the boot CPU holds interrupts masked from before its first interrupt source is armed
+/// until its first user entry; and every trap entry refuses to reach the shared kernel while the
+/// phase is open (`refuse_shared_entry_during_boot_exclusive`). A boot that passes is evidence
+/// that the sequence runs; it is not, by itself, the aliasing argument — that is the source
+/// argument above.
+pub struct BootExclusive {
+    shared: &'static SharedKernel,
+    _not_send_sync: core::marker::PhantomData<*mut KernelState>,
+}
+
+impl BootExclusive {
+    /// Claim the boot state's exclusive phase. Panics if any phase was already entered.
     ///
     /// # Safety
-    /// See canonical safety contract above; delegated to the caller.
-    #[cfg(not(feature = "hosted-dev"))]
-    pub(crate) unsafe fn borrow_kernel_for_boot(&self) -> &mut KernelState {
-        #[cfg(any(debug_assertions, test))]
-        begin_boot_raw_borrow_window();
-        // SAFETY: delegated to caller (see doc comment above).
-        unsafe { &mut *self.state.data_ptr() }
+    /// `shared` must be fully constructed, and nothing else may hold a reference into its state.
+    pub(crate) unsafe fn claim(shared: &'static SharedKernel) -> Self {
+        if BOOT_PHASE
+            .compare_exchange(
+                BOOT_PHASE_NONE,
+                BOOT_PHASE_EXCLUSIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            panic!("BootExclusive::claim: the boot state was already claimed");
+        }
+        Self {
+            shared,
+            _not_send_sync: core::marker::PhantomData,
+        }
+    }
+
+    /// Lend the whole boot state. The loan ends before the next use of the token.
+    pub fn state(&mut self) -> &mut KernelState {
+        // SAFETY: the phase is EXCLUSIVE for as long as this token exists (`claim` set it, only
+        // `publish` — which consumes the token — leaves it), the loan is tied to `&mut self`, and
+        // the boot sequence admits no other path to the state during the phase (type doc).
+        unsafe { &mut *self.shared.state_ptr() }
+    }
+
+    /// The `SharedKernel` an arch installs as its trap-entry target during the exclusive phase.
+    ///
+    /// Installing it publishes nothing: every trap entry checks
+    /// `refuse_shared_entry_during_boot_exclusive` before using it, and every secondary waits for
+    /// publication. Named so the installation sites are the only callers (pinned by the hosted
+    /// guard `blr1_trap_installation_is_the_only_pre_publication_handle`).
+    pub fn shared_for_trap_installation(&self) -> &'static SharedKernel {
+        self.shared
+    }
+
+    /// End the exclusive phase: no whole-state reference exists after this returns, and every
+    /// further access is a domain owner on the returned `SharedKernel`.
+    pub fn publish(self) -> &'static SharedKernel {
+        let previous = BOOT_PHASE.swap(BOOT_PHASE_PUBLISHED, Ordering::AcqRel);
+        debug_assert_eq!(previous, BOOT_PHASE_EXCLUSIVE);
+        self.shared
+    }
+}
+
+impl core::fmt::Debug for BootExclusive {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("BootExclusive { .. }")
     }
 }
 
