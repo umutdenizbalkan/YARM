@@ -28408,11 +28408,14 @@ The witness performs no VM operation. It grades separately:
     after it;
   * no incomplete invalidation, no fail-closed COW, no refused fork.
 
-Development run (candidate in progress):
+Qualified run (`5dc05b20`):
 
 ```text
+VMIW_KERNEL_SHOOT page=C requester_cpu=0 asid=4 va=0x20080000 targets=0x2 cpu1_entries=1028
+VMIW_KERNEL_FORK_FIRST_SHOOT requester_cpu=0 asid=4 va=0x20000000 targets=0x2 cpu1_entries=1030
+VMIW_KERNEL_SHOOT page=F requester_cpu=0 asid=4 va=0x20090000 targets=0x2 cpu1_entries=1031
 VMIW_DETAIL_COW cow_bytes=1 cow_credited=1 cow_kernel=1 cow_requester=0 cow_targets=0x2 cow_fence=1
-VMIW_DETAIL_FORK fork_bytes=1 child_f=0x2340cf2/0x2340cf2 fork_credited=1 o_faulted=1 fork_kernel=1 fork_requester=0 fork_targets=0x2 fork_fence=1
+VMIW_DETAIL_FORK fork_bytes=1 child_f=0xa6b996/0xa6b996 fork_credited=1 o_faulted=1 fork_kernel=1 fork_requester=0 fork_targets=0x2 fork_fence=1
 VMIW_VERDICT cow=1 fork=1 o_faulted=1 result=ok
 ```
 
@@ -28440,3 +28443,128 @@ This witness does not qualify NR 3 or revocation; those stay hosted evidence.
   bounded. This is pre-existing and unchanged.
 * *Hosted reference routes* (the broad COW, fork and unmap) follow the same policy. They are not
   production routes.
+
+### Final-candidate controls
+
+Each control was applied alone to the frozen candidate `5dc05b20`, in a worktree reset between
+controls. The hosted controls were also run on the first frozen candidate `92713255`, with the
+same result.
+
+* *Hosted, the `vm_invalidation1` module plus `u9fork1`, `u9reap1`, `u9cow2` and
+  `shared_region_lifetime2`.* Each revert fails the cases written for it:
+  * *(a) NR 3 settlement reverted* (an unacknowledged displacement reported established) — 4 fail:
+    the first-page and later-page cases, the competing final release, and the settlement source
+    contract.
+  * *(b) COW settlement reverted* (unacknowledged reported `Committed`) — 2 fail: the unacknowledged
+    case and the requester CPU 0 / ambient CPU 1 case.
+  * *(c) Fork requester read from the ambient field* — 4 fail: both fork directions, the carried
+    requester source contract, and `u9fork1`'s shootdown contract.
+  * *(d) COW requester read from the ambient field* — 3 fail: the only-resident-CPU case,
+    the source contract, and `u9cow2`'s reclaim-after-completion case.
+    * The requester CPU 0 / ambient CPU 1 COW case still fails closed under this control: task 0
+      is current on CPU 0, so CPU 0 stays a target either way. The reverse case catches the
+      revert.
+  * *(e) Revocation requester read from the ambient field* — 3 fail: both revocation cases and the
+    source contract.
+  * *(f) x86_64 revalidation activation removed* — 2 fail: the production-owner case and the
+    flush source contract.
+  * *(g) Teardown gate removed* — 2 fail: the loaded-root reap case and the source contract.
+  * *(h) Loaded-root authority reduced to "currently running"* — 1 fails: the loaded-root reap case.
+  * *(i) Broad fork reports `true` without invalidation* — 1 fails.
+  * *(j) Broad COW reports a handled fault after an incomplete invalidation* — 1 fails.
+* *Live, the RISC-V witness:*
+  * *(L1) COW naming the WRONG requester (CPU 1)* — `VMIW_WITNESS_SEAL result=fail`:
+    * C's shootdown targeted `0x1`, so CPU 1 was excluded;
+    * the COW committed `acked=1`;
+    * O, with no supervisor entry since priming (`entries` 1061 → 1062), still read the old byte
+      (`O_COW_STALE aux=0x11`).
+
+    The old page was still allocated (the second space maps it), so retained backing did not let
+    a missing acknowledgement pass.
+  * *(L2) Fork naming the WRONG requester (CPU 1)* — `result=fail`:
+    * both fork shootdowns targeted `0x1`;
+    * the child saw F change across its delay (`0x1b2cbbc/0xac9282b`);
+    * O never faulted.
+  * *(L3) COW reading the ambient field* — PASSED. In that boot the ambient field named CPU 0,
+    the real requester. Recorded as run, not counted as discriminating.
+* *Image:*
+  * *(M1) `sfence.vma` removed after the RISC-V `satp` writes* —
+    `check-vm-invalidation-sequence.sh riscv64` fails and names each site, the direct dispatch
+    included.
+  * *(M2) bit 63 set in x86_64 `write_cr3_for_asid`* — the x86_64 check fails at both
+    `ensure_user_return_cr3` forms, where the value is composed after inlining.
+
+### Qualification
+
+**The first frozen candidate, `92713255` (tree `a0dd9443`), was withdrawn.** Its warning
+comparison found one new RISC-V warning, an unused `cpu` in `direct_dispatch_activate_asid_split`.
+The cause was a real gap: the RISC-V direct dispatch writes `satp` itself, and gating the record
+on the HAL switch left that load unrecorded. It was repaired in `5dc05b20`, and
+`every_activation_record_follows_its_root_load` now requires a record after every RISC-V root
+load in `runtime.rs` (shown failing without the repair). That run was stopped after its build
+gates. Its results are kept and were not counted.
+
+**Candidate frozen at `5dc05b20` (tree `6f991a98`); base `a75b1601`.** Every gate ran once, in a
+fresh worktree. No failed run was replaced. Each live run is bound to its commit, its features
+and the sha256 of what it booted.
+
+* *Hosted:*
+  * focused (`vm_invalidation1`, the re-derived guard modules, and the shared-region, COW, fork,
+    reap, VmMap, invalidation, teardown, revocation and transfer groups): 752/752, all 21
+    `vm_invalidation1` cases ok;
+  * full hosted suite: 6,093 passed, 2 ignored;
+  * integration: 308/308 in 32 suites;
+  * census guard: 17/17;
+  * the textual census: every production count is identical to the base. The test-only `with`
+    count rises 2,394 → 2,429 with the new cases;
+  * `cargo fmt --check`: clean.
+* *On the base:* the fourteen cases transplanted onto `a75b1601` fail 11 and pass 3, as listed
+  above.
+* *Images:* `check-vm-invalidation-sequence.sh` is `result=ok` on the default kernels of both
+  candidate and base (x86_64 12 sites, AArch64 8, RISC-V 7), and `check-riscv64-smp3-sequence.sh`
+  is `result=ok`.
+* *Warnings, against a fresh base build:*
+  * default freestanding kernels: 178 / 205 / 188, classes identical;
+  * the three oracle-feature kernels and the hosted oracle library: identical;
+  * every witness-feature kernel built (six x86_64, five AArch64, four RISC-V): identical;
+  * the new `riscv64-vmi-witness` kernel has exactly the candidate SMP3 build's warnings;
+  * the hosted library and tests have one warning fewer — the base's unused `use super::*` in
+    `stage193c_ipc_send_ordinary_cap`, now used by that re-derived guard.
+* *Strict cores:* x86_64 (timer-contract-witness profile), AArch64 and RISC-V passed.
+  `D6_SWITCH_PROOF`, `D6_SWITCH_A` and `SPAWN_LIFECYCLE` passed on x86_64.
+* *COW / fork, live:* x86_64 `VM_COW=1`, candidate and base alike — 6 COW commits, all
+  `acked=1`, 2 forks committed after `result=ok` write-protections, and no incomplete, failed-closed
+  or quarantined marker. The strict cores, the server-death cells and the VMI witness show no
+  incomplete-invalidation or teardown-quarantine marker either.
+* *VMI witness:* `VMIW_WITNESS_SEAL … result=ok` (above). Kernel `2a9bb2c1…`, initramfs
+  `f0c35c57…`, pinned OpenSBI v1.3 `171a91cc…`, QEMU 8.2.2.
+* *SMP / lock:* `SMP1`, `SMP2`, `SMP3`, `LOCK1`, `LOCK2` and `LOCK3` all `result=ok`.
+* *Context, IRQ, teardown:*
+  * `CONTEXT1` on x86_64 and AArch64 — ok;
+  * the UART IRQ witnesses on all three ports — ok;
+  * server-dies on all three ports — ok;
+  * the AArch64 overtaken witness — ok.
+* *Shared region:* on each port, the NR 30 and NR 2 / NR 5 cells at object offset 4096, the
+  lifetime cell and the direct cell — all `result=ok`, every direct cell `misplaced=0`.
+
+**Two cells are red and stay red:**
+
+* *`qemu-x86_64-overtaken-witness-smoke.sh` — `held 3 of 4 rounds`.* In round 1, W's FutexWait was
+  woken during its own publish (`FUTEX_WAIT_PARK_WOKEN_DURING_PUBLISH … recovery=restored`). That
+  is a legitimate production wait/wake interleaving, but it never enters the drain the witness
+  holds. W's program counted the round and parked on its done word after four rounds, with three
+  holds. No VM-INVALIDATION1 change is on the futex publish path. Three later diagnostic boots of
+  each, recorded alongside and not substituted: base `a75b1601` 3 of 3 ok, candidate 3 of 3 ok.
+* *`qemu-riscv64-sr-replace-witness-smoke.sh` — "O's observation reported before the install
+  completed".* The boot's own verdict was `result=ok`. The grader orders O's `O_NEW` line on
+  CPU 1 against `SRR_KERNEL_INSTALL` on CPU 0. That line is printed only after the outcome is
+  known, which is after CPU 1's fence has completed, so O can legitimately print first. The fresh
+  base fails the same check in 3 of 3 diagnostic boots (O's line three lines ahead each time).
+  The candidate fails it in 1 of 3. This is a pre-existing ordering defect in the SHARED-REGION-
+  LIFETIME2 grader, not repaired here.
+
+**Not claimed.**
+
+* No canonical stage is re-classified.
+* Production AP scheduling stays default-off; it is the next package.
+* The quarantine and live-coverage limits above stand.
