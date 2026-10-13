@@ -2210,6 +2210,9 @@ fn ap_dispatch_kstack_top(cpu: CpuId) -> u64 {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 struct ApDispatchPlan {
     cr3: AtomicU64,
+    /// VM-INVALIDATION1: the address space `cr3` names, so the AP can record the activation it
+    /// performs in the per-CPU activation table (`u64::MAX` = none).
+    asid: AtomicU64,
     entry: AtomicU64,
     user_stack_top: AtomicU64,
     kernel_rsp0: AtomicU64,
@@ -2221,6 +2224,7 @@ impl ApDispatchPlan {
     const fn empty() -> Self {
         Self {
             cr3: AtomicU64::new(0),
+            asid: AtomicU64::new(u64::MAX),
             entry: AtomicU64::new(0),
             user_stack_top: AtomicU64::new(0),
             kernel_rsp0: AtomicU64::new(0),
@@ -2488,6 +2492,7 @@ fn ap_enter_task_ring3(cpu: CpuId, tid: u64) -> ! {
     let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
     let plan = &AP_DISPATCH_PLANS[idx];
     let cr3 = plan.cr3.load(Ordering::Relaxed);
+    let plan_asid = plan.asid.load(Ordering::Relaxed);
     let entry = plan.entry.load(Ordering::Relaxed);
     let user_stack_top = plan.user_stack_top.load(Ordering::Relaxed);
     let kernel_rsp0 = plan.kernel_rsp0.load(Ordering::Relaxed);
@@ -2526,6 +2531,11 @@ fn ap_enter_task_ring3(cpu: CpuId, tid: u64) -> ! {
     // use of the code/stack pages.
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
+    // VM-INVALIDATION1: record the activation AFTER the root load, so a teardown never sees this
+    // CPU as having left a root it still has loaded.
+    if let Ok(asid) = u16::try_from(plan_asid) {
+        crate::arch::hal::note_address_space_activated(cpu, crate::kernel::vm::Asid(asid));
     }
     super::percpu::set_ap_dispatch_stage(cpu, 2);
     crate::yarm_log!(
@@ -2757,6 +2767,11 @@ fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
     let fpu = authenticated.user_fpu;
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
+    // VM-INVALIDATION1: the activation is recorded after the load and before the diverging
+    // return, from the authenticated incarnation's own ASID.
+    crate::arch::hal::note_address_space_activated(cpu, crate::kernel::vm::Asid(asid));
+    unsafe {
         super::descriptor_tables::resume_user_mode_iret(&frame, &fpu);
     }
 }
@@ -3014,6 +3029,13 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     let plan = &AP_DISPATCH_PLANS[idx];
     plan.valid.store(false, Ordering::Relaxed);
     plan.cr3.store(cr3, Ordering::Relaxed);
+    plan.asid.store(
+        kernel
+            .task_asid(first_tid)
+            .map(|asid| u64::from(asid.0))
+            .unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     plan.entry.store(entry, Ordering::Relaxed);
     plan.user_stack_top.store(ustack, Ordering::Relaxed);
     plan.kernel_rsp0.store(kernel_rsp0, Ordering::Relaxed);

@@ -99,8 +99,11 @@ impl crate::kernel::syscall::xfer_txn::XferReleaseOwners for BroadXferOwners<'_>
         // then reclaim. Its per-page errors are swallowed by design — the transaction's phase V
         // already proved every page is mapped, so the `Ok(None)` case this used to refuse on
         // cannot arise here.
-        self.kernel.unmap_range_two_phase(asid, base, map_len);
-        true
+        //
+        // VM-INVALIDATION1: the verdict is the owner's own, no longer a constant `true` — an
+        // unacknowledged invalidation keeps its page held and must quarantine phase R's reclaim
+        // on this route exactly as on the split one.
+        self.kernel.unmap_range_two_phase(asid, base, map_len)
     }
 
     fn revoke_reserved_capability(

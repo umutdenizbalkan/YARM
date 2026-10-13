@@ -1586,6 +1586,8 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         let _ = crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
         if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid) {
             crate::arch::riscv64::page_table::write_satp(satp);
+            // VM-INVALIDATION1: record the activation after the root load.
+            crate::arch::hal::note_address_space_activated(cpu, asid);
         }
     }
 
@@ -1919,6 +1921,8 @@ fn riscv_s_mode_idle_landing(
                 let _ = crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
                 if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid) {
                     crate::arch::riscv64::page_table::write_satp(satp);
+                    // VM-INVALIDATION1: record the activation after the root load.
+                    crate::arch::hal::note_address_space_activated(cpu, asid);
                 }
             }
             let frame_resume: *const RiscvTrapFrame = frame;
@@ -3848,6 +3852,12 @@ pub fn enter_dispatched_user_task_if_available(
         riscv_trap_ready_acked_bitmap(),
     );
     early_marker!("RISCV_ENTER_USER_SRET tid={}", tid);
+    // VM-INVALIDATION1: the first user entry loads `asid`'s root inside the diverging stub, so it
+    // is recorded just before. The root it replaces is the boot root, which no teardown frees.
+    crate::arch::hal::note_address_space_activated(
+        crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID),
+        asid,
+    );
     unsafe { yarm_riscv64_enter_user(&ctx as *const RiscvEnterUserCtx) }
 }
 

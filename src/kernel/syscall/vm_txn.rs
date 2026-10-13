@@ -278,6 +278,20 @@ pub(crate) trait VmMapOwners {
         records: &mut [PageRecord],
     ) -> Result<(), (usize, KernelError)>;
 
+    /// VM-INVALIDATION1 — ONE acquisition, VM rank 5 then memory rank 6: take a COMMITTED
+    /// request back out of the address space, for the failure settlement after phase W.
+    ///
+    /// For every record still `installed`: if the PTE at its address still names the request's
+    /// own frame, remove it and drop the mapping reference pass B took — the transaction's pin
+    /// still holds the object, so nothing becomes reclaimable — and leave the record `installed`,
+    /// because the removed translation owes an invalidation. A page that no longer names the
+    /// request's frame was retired by whoever replaced or unmapped it, which took over its
+    /// reference and its invalidation; the record stops owing either.
+    ///
+    /// Ownership is established by the frame, which cannot be recycled while the transaction
+    /// holds its pin, not by the address alone.
+    fn remove_committed_pages(&mut self, asid: Asid, records: &mut [PageRecord]);
+
     /// NO LOCK — complete the required TLB shootdown for `virt` in `asid`. Returns `false` when a
     /// remote acknowledgement was not obtained, in which case the caller must skip the reclaim.
     fn complete_shootdown(&mut self, asid: Asid, virt: VirtAddr) -> bool;
@@ -332,6 +346,11 @@ pub(crate) enum VmRollbackReason {
     PageTableUpdate,
     /// The journal itself could not be reserved. Nothing was acquired, minted or installed.
     JournalReserve,
+    /// VM-INVALIDATION1 — the request COMMITTED (phase I), but the invalidation of a translation
+    /// it displaced was not acknowledged, so the new mapping is not established everywhere. The
+    /// request's pages are taken back out, each owing its own invalidation; the displaced pages
+    /// stay held.
+    InvalidationIncomplete,
 }
 
 /// Validates the `(addr, len, prot)` triple shared by NR 3 and NR 13, in the delivered order and
@@ -773,6 +792,11 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
     // ── Phase W and S: the request has committed. Retire whatever it displaced — shootdown
     // BEFORE reclaim, with NO domain lock held across the wait — and then let go of this
     // request's own holds, which the map references taken in phase I have now replaced.
+    //
+    // VM-INVALIDATION1: an unacknowledged displacement is counted, not ignored. The request is
+    // complete only when every displaced translation is invalidated everywhere; otherwise it is
+    // settled as a failure below.
+    let mut displaced_unacknowledged = 0usize;
     for index in 0..records.len() {
         let Some(old) = records[index].replaced else {
             continue;
@@ -920,9 +944,57 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
                     ));
                 }
             }
+        } else {
+            // No acknowledgement: the pin stays, and with it the guarantee that no other
+            // reclaimer can hand this frame out while a remote translation may still reach it.
+            displaced_unacknowledged += 1;
         }
-        // No acknowledgement: the pin stays, and with it the guarantee that no other reclaimer
-        // can hand this frame out while a remote translation may still reach it.
+    }
+    if displaced_unacknowledged != 0 {
+        // VM-INVALIDATION1 — THE FAILURE SETTLEMENT AFTER COMMIT.
+        //
+        // Every page of the request is installed and accounted, but at least one CPU may still
+        // translate an address of this request to the page it displaced. The new mapping is
+        // therefore not established, and reporting it would be a false success: a thread on that
+        // CPU keeps reading and writing the old page while every other thread sees the new one.
+        //
+        // The displaced mapping is NOT restored — the acquisition that displaced it is gone, and
+        // a restore could not prove it was putting back what it took. What is undone is
+        // everything this request created, in the order the phase-I rollback uses:
+        //
+        // 1. its pages come back out of the address space (ownership proven by the pinned frame),
+        //    and the mapping references pass B took are dropped;
+        // 2. each removed page completes its OWN invalidation — the new translation may have
+        //    been cached too — and only an acknowledged one is settled;
+        // 3. settled pages release their pin, then their capability (and with it the object and
+        //    frame); an unsettled page keeps its pin AND its capability, exactly as the phase-I
+        //    rollback keeps them — permanent quarantine, with process teardown as the
+        //    capability's cleanup owner.
+        //
+        // Every displaced page whose acknowledgement did not arrive keeps its identity hold. The
+        // request answers the error every post-validation kernel failure of NR 3 / NR 13 already
+        // answers (`SyscallError::Internal`, the conversion of `KernelError::Vm(_)`); no new
+        // user-visible code exists.
+        owners.remove_committed_pages(asid, &mut records);
+        let unacknowledged = settle_rollback_shootdowns(owners, asid, &mut records);
+        release_settled_pins(owners, &mut records);
+        let (released, retained) = release_capabilities(owners, cnode, &records, true);
+        crate::yarm_log!(
+            "VM_MAP_INVALIDATION_INCOMPLETE asid={} addr=0x{:x} len={} displaced_unacked={} request_unacked={} released={} retained={}",
+            asid.0,
+            args.addr,
+            args.map_len,
+            displaced_unacknowledged,
+            unacknowledged,
+            released,
+            retained
+        );
+        owners.note(VmTxnEvent::RolledBack {
+            reason: VmRollbackReason::InvalidationIncomplete,
+            released,
+            retained: retained + unacknowledged,
+        });
+        return vm_txn_exit!(smp2_op, Err(SyscallError::Internal));
     }
     for index in 0..records.len() {
         if records[index].pinned {

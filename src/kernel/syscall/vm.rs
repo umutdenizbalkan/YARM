@@ -104,6 +104,12 @@ impl VmMapOwners for BroadVmOwners<'_> {
         })
     }
 
+    fn remove_committed_pages(&mut self, asid: Asid, records: &mut [PageRecord]) {
+        self.kernel.with_vm_then_memory_mut(|spaces, memory| {
+            remove_committed_pages_locked(spaces, memory, asid, records)
+        });
+    }
+
     fn complete_shootdown(&mut self, asid: Asid, virt: VirtAddr) -> bool {
         // The delivered coordinator, called at the point the delivered replace path never called
         // it at all: `map_user_page_in_asid_raw_locked` reclaimed a displaced frame with no
@@ -165,6 +171,7 @@ impl VmMapOwners for BroadVmOwners<'_> {
                     VmRollbackReason::PageTableUpdate => "pt_update",
                     VmRollbackReason::CapabilityMint => "cap_mint",
                     VmRollbackReason::JournalReserve => "journal_reserve",
+                    VmRollbackReason::InvalidationIncomplete => "invalidation_incomplete",
                 };
                 crate::yarm_log!(
                     "VM_MAP_ROLLBACK_OK reason={} released={} retained={}",
@@ -395,6 +402,50 @@ pub(crate) fn settle_displaced_hold_locked(
         .iter()
         .flatten()
         .all(|entry| entry.id != object_id)
+}
+
+/// VM-INVALIDATION1 — ONE acquisition, VM rank 5 then memory rank 6: the body both adapters run
+/// for [`VmMapOwners::remove_committed_pages`].
+///
+/// A record still `installed` whose PTE still names its own frame is removed, and the mapping
+/// reference pass B took for it is dropped; the record stays `installed` because its removed
+/// translation owes an invalidation. The transaction's pin holds the object throughout, so the
+/// dropped reference cannot make it reclaimable, and the pinned frame cannot have been reissued —
+/// which is what makes "names its own frame" an ownership proof here rather than a byte match.
+///
+/// Anything else is no longer this request's: a page another owner replaced or unmapped was
+/// retired by that owner, together with its reference and its invalidation; an address space that
+/// is gone was drained by its own teardown. Those records stop owing anything. A removal the
+/// address space refuses leaves the page mapped and its reference in place — still consistent
+/// (the object then lives by that mapping) — and the record keeps its invalidation obligation,
+/// which is harmless for a translation that is still valid.
+pub(crate) fn remove_committed_pages_locked(
+    spaces: &mut crate::kernel::vm::AddressSpaceManager,
+    memory: &mut crate::kernel::boot::MemorySubsystem,
+    asid: Asid,
+    records: &mut [PageRecord],
+) {
+    let Some(aspace) = spaces.get_mut(asid) else {
+        for record in records.iter_mut() {
+            record.installed = false;
+        }
+        return;
+    };
+    for record in records.iter_mut() {
+        if !record.installed {
+            continue;
+        }
+        let still_ours = aspace
+            .resolve(record.virt)
+            .is_some_and(|mapping| mapping.phys == record.phys);
+        if !still_ours {
+            record.installed = false;
+            continue;
+        }
+        if let Ok(Some(_)) = aspace.unmap_page(record.virt) {
+            KernelState::note_mapping_removed_locked(memory, record.phys);
+        }
+    }
 }
 
 /// The undo half of pass A, inside the SAME acquisition as the install. A page is returned to

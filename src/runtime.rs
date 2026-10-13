@@ -4410,13 +4410,19 @@ impl SharedKernel {
     /// NO lock — PERFORM the write-protection's owed TLB work.
     ///
     /// This is the half the broad route cannot do. Each downgraded page goes through
-    /// [`Self::complete_unmap_shootdown_split`], which invalidates locally and then waits for
+    /// [`Self::complete_unmap_shootdown_from_split`], which invalidates locally and then waits for
     /// every remote holder of this ASID to publish `ack_gen == req_gen` — with no domain lock
     /// held, which is the whole §14.4 D3 requirement. `false` means at least one target did not
     /// acknowledge, and the caller must refuse the fork: a remote CPU that still holds a writable
     /// translation for a page the child now shares would silently break the copy-on-write.
+    ///
+    /// VM-INVALIDATION1: `requester` is the CPU executing the fork (the trap CPU the spawn owner
+    /// carries), never the ambient scheduler field. With the ambient field naming a remote holder,
+    /// that holder was excluded and the child was published under its live writable translation;
+    /// with it naming another CPU, the requester targeted itself and the fork was refused.
     pub(crate) fn complete_cow_write_protect_shootdown_split(
         &self,
+        requester: CpuId,
         plan: &crate::kernel::boot::cow_clone::CowShootdownPlan,
     ) -> bool {
         if plan.is_empty() {
@@ -4436,7 +4442,7 @@ impl SharedKernel {
         for run in &plan.runs {
             for p in 0..run.pages {
                 let va = crate::kernel::vm::VirtAddr(run.virt.0 + p as u64 * page_sz);
-                if !self.complete_unmap_shootdown_split(plan.asid, va) {
+                if !self.complete_unmap_shootdown_from_split(requester, plan.asid, va) {
                     all_acked = false;
                 }
             }
@@ -4942,8 +4948,9 @@ impl SharedKernel {
             crate::arch::riscv64::page_table::write_satp(satp);
         }
         #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
-        crate::arch::hal_adapters::switch_address_space(asid);
-        crate::arch::hal::note_address_space_activated(cpu, asid);
+        if crate::arch::hal_adapters::switch_address_space(asid) {
+            crate::arch::hal::note_address_space_activated(cpu, asid);
+        }
         Some(asid.0)
     }
 
@@ -8147,7 +8154,9 @@ impl SharedKernel {
     ///      CPU may still translate. That is the fail-safe direction §14.4 requires.
     ///
     /// No two domain locks are ever held at once: every phase acquires and releases its own.
-    #[cfg(not(feature = "hosted-dev"))]
+    ///
+    /// VM-INVALIDATION1: compiled into the hosted build as well, so the deterministic suite drives
+    /// this production transaction rather than a stand-in; only the frame copy has a hosted body.
     pub(crate) fn cow_recover_private_copy_split(
         &self,
         facts: crate::kernel::boot::PageFaultFacts,
@@ -8276,7 +8285,7 @@ impl SharedKernel {
         }
 
         // (6) The page copy. No lock is held: nothing can reach the destination yet.
-        if let Err(e) = self.copy_cow_frame_contents_split(old_mapping.phys, new_phys) {
+        if let Err(e) = self.copy_cow_frame_contents_split(asid, old_mapping.phys, new_phys) {
             rollback(self);
             return R::FailedClosedCopy(e);
         }
@@ -8326,8 +8335,9 @@ impl SharedKernel {
             hold
         });
 
-        // (9) The shootdown, with NO domain lock held.
-        let shootdown_acked = self.complete_unmap_shootdown_split(asid, page);
+        // (9) The shootdown, with NO domain lock held. VM-INVALIDATION1: the requester is the CPU
+        // that took the fault (`facts.cpu`, from the trap), never the ambient scheduler field.
+        let shootdown_acked = self.complete_unmap_shootdown_from_split(facts.cpu, asid, page);
 
         // (10) rank 6 — settle the OLD frame's hold, only after the acknowledgement: release it
         // and reclaim its object if that was the last reference, by identity. Guarded, so the
@@ -8343,10 +8353,22 @@ impl SharedKernel {
             });
         }
 
-        R::Committed {
-            old_phys,
-            new_phys,
-            shootdown_acked,
+        // VM-INVALIDATION1 — a PTE replacement is not a recovered fault. Only an acknowledged
+        // invalidation completes it; otherwise the outcome is the post-mutation failure, settled
+        // fail-closed by the bridge (the old page's hold above was kept).
+        if shootdown_acked {
+            R::Committed { old_phys, new_phys }
+        } else {
+            crate::yarm_log!(
+                "VM_COW_INVALIDATION_INCOMPLETE cpu={} tid={} asid={} va=0x{:x} old_pa=0x{:x} new_pa=0x{:x}",
+                facts.cpu.0,
+                facts.tid,
+                asid.0,
+                page.0,
+                old_phys.0,
+                new_phys.0
+            );
+            R::FailedClosedInvalidation { old_phys, new_phys }
         }
     }
 
@@ -8356,9 +8378,36 @@ impl SharedKernel {
     /// performs on a freestanding target. It is a separate method only because the broad form
     /// takes `&mut self` for its hosted branch; the freestanding body is the identical two
     /// direct-map translations and one page-sized copy.
+    ///
+    /// VM-INVALIDATION1: the hosted body is the broad form's hosted body — the hosted user-memory
+    /// model, keyed by `(asid, phys)`, copied under the memory lock.
+    #[cfg(feature = "hosted-dev")]
+    fn copy_cow_frame_contents_split(
+        &self,
+        asid: crate::kernel::vm::Asid,
+        old_phys: crate::kernel::vm::PhysAddr,
+        new_phys: crate::kernel::vm::PhysAddr,
+    ) -> Result<(), KernelError> {
+        self.with_memory_split_mut(|memory| {
+            for offset in 0..crate::kernel::vm::PAGE_SIZE as u64 {
+                if let Some(value) = memory
+                    .user_memory
+                    .get(&(asid.0, old_phys.0 + offset))
+                    .copied()
+                {
+                    memory
+                        .user_memory
+                        .insert((asid.0, new_phys.0 + offset), value);
+                }
+            }
+        });
+        Ok(())
+    }
+
     #[cfg(not(feature = "hosted-dev"))]
     fn copy_cow_frame_contents_split(
         &self,
+        _asid: crate::kernel::vm::Asid,
         old_phys: crate::kernel::vm::PhysAddr,
         new_phys: crate::kernel::vm::PhysAddr,
     ) -> Result<(), KernelError> {
@@ -8750,9 +8799,10 @@ impl SharedKernel {
     /// U9-VM-ENTRY1 keeps the `#[cfg(not(hosted-dev))]` gate: the mapping transaction mints LAST,
     /// so it holds no capability at the point it needs a frame's rights verdict and asks
     /// `syscall::vm::anonymous_rights_admit` — the same predicate, the same error, the same
-    /// position — instead. This resolver therefore still has exactly one caller, the freestanding
-    /// COW path.
-    #[cfg(not(feature = "hosted-dev"))]
+    /// position — instead. This resolver therefore still has exactly one caller, the COW path.
+    ///
+    /// VM-INVALIDATION1: the COW transaction is compiled into the hosted build too, so its
+    /// resolver is.
     pub(crate) fn resolve_memory_object_phys_for_task_split(
         &self,
         tid: u64,
@@ -9238,6 +9288,7 @@ impl SharedKernel {
     /// means the metadata is written and the ordinary register writeback continues.
     fn kernel_register_v2_meta_write_split(
         &self,
+        cpu: CpuId,
         frame: &mut TrapFrame,
         receiver_tid: u64,
         msg: &crate::kernel::ipc::Message,
@@ -9296,6 +9347,7 @@ impl SharedKernel {
         // emit the marker the broad arm emits at this exact site.
         if let Some(materialized) = materialized_cap {
             let _ = self.rollback_materialized_recv_cap_no_vm_split(
+                cpu,
                 receiver_tid,
                 crate::kernel::capabilities::CapId(materialized),
             );
@@ -9641,6 +9693,7 @@ impl SharedKernel {
                 && let crate::kernel::recv_core::RecvMetaTarget::V2 { ptr, .. } =
                     request.meta_target
                 && let Some(err) = self.kernel_register_v2_meta_write_split(
+                    cpu,
                     frame,
                     receiver_tid,
                     &delivery.msg,
@@ -9742,6 +9795,7 @@ impl SharedKernel {
                     && let crate::kernel::recv_core::RecvMetaTarget::V2 { ptr, .. } =
                         request.meta_target
                     && let Some(err) = self.kernel_register_v2_meta_write_split(
+                        cpu,
                         frame,
                         receiver_tid,
                         &delivery.msg,
@@ -11378,6 +11432,7 @@ impl SharedKernel {
                     );
                 } else {
                     let _ = shared.rollback_materialized_recv_cap_no_vm_split(
+                        cpu,
                         pending.receiver_tid,
                         crate::kernel::capabilities::CapId(cap_id),
                     );
@@ -11738,6 +11793,7 @@ impl SharedKernel {
             // active-transfer-mapping unmap now completes a real generation-matched TLB shootdown
             // before any frame is reclaimed. The broad `with_cpu` fallback is retired.
             let _ = self.rollback_materialized_recv_cap_no_vm_split(
+                cpu,
                 pending.receiver_tid,
                 crate::kernel::capabilities::CapId(local_cap),
             );
@@ -12680,8 +12736,11 @@ impl SharedKernel {
             // lock for every class this site can produce — including the memory-backed cohort,
             // whose active-transfer-mapping unmap now completes a real generation-matched TLB
             // shootdown before any frame is reclaimed. The broad `with_cpu` fallback is retired.
-            let _ =
-                self.rollback_materialized_recv_cap_no_vm_split(snap.waiter_tid, CapId(local_cap));
+            let _ = self.rollback_materialized_recv_cap_no_vm_split(
+                cpu,
+                snap.waiter_tid,
+                CapId(local_cap),
+            );
             crate::yarm_log!(
                 "IPC_RECV_V2_ROLLBACK_OK site=blocked_ordinary_cap tid={} reply=false",
                 snap.waiter_tid
@@ -15213,19 +15272,10 @@ impl SharedKernel {
     /// requester onto each target (`set_current_cpu`), drains the targets' mailboxes from the
     /// requester, and calls `yield_current` — all of which §5 forbids, and all of which are
     /// impossible here because nothing holds a lock to yield under.
-    pub(crate) fn complete_unmap_shootdown_split(
-        &self,
-        asid: crate::kernel::vm::Asid,
-        virt: crate::kernel::vm::VirtAddr,
-    ) -> bool {
-        // The ambient requester, for callers that have no entering-CPU identity to hand over.
-        // U9-VM-ENTRY1-S: prefer `complete_unmap_shootdown_from_split` wherever the trap seam
-        // knows which CPU actually entered — see the note there on why the ambient field is not
-        // an authority.
-        let ambient = self.with_scheduler_split_mut(|sched| sched.current_cpu);
-        self.complete_unmap_shootdown_from_split(ambient, asid, virt)
-    }
-
+    ///
+    /// VM-INVALIDATION1: there is no ambient form any more. The wrapper that read
+    /// `sched.current_cpu` and passed it on as the requester is deleted, and every caller states
+    /// the CPU it executes on.
     /// U9-VM-ENTRY1-S §1 — the same shootdown, with the requester stated by the caller rather
     /// than read from an ambient field.
     ///
@@ -15342,17 +15392,10 @@ impl SharedKernel {
     /// Returns `true` iff every page that was actually removed also completed its shootdown. A
     /// `false` return means at least one frame was deliberately left unreclaimed, and the CALLER's
     /// own reclaim obligation (if it has one) must be skipped for the same reason — see
-    /// [`Self::complete_unmap_shootdown_split`].
-    pub(crate) fn unmap_range_two_phase_split(
-        &self,
-        asid: crate::kernel::vm::Asid,
-        base: usize,
-        len: usize,
-    ) -> bool {
-        let ambient = self.with_scheduler_split_mut(|sched| sched.current_cpu);
-        self.unmap_range_two_phase_from_split(ambient, asid, base, len)
-    }
-
+    /// [`Self::complete_unmap_shootdown_from_split`].
+    ///
+    /// VM-INVALIDATION1: the ambient form (`unmap_range_two_phase_split`, which read
+    /// `sched.current_cpu`) is deleted; the requester is always stated.
     /// U9-VM-ENTRY1-S §1 — the same two-phase unmap, with the requester stated by the caller.
     /// See [`Self::complete_unmap_shootdown_from_split`] for why the ambient field is not an
     /// authority and what completes the invalidation on each architecture.
@@ -15940,6 +15983,33 @@ impl SharedKernel {
             let scheduler = kernel_ref(&sched.scheduler);
             scheduler.online_cpu_bitmap() & !scheduler.wake_only_bitmap()
         })
+    }
+
+    /// VM-INVALIDATION1 — the CPUs on which `asid` may still be LOADED: a CPU whose current task
+    /// is bound to it (rank 1 then rank 2, the residency the shootdown targets) or whose last
+    /// recorded activation is it (the lock-free per-CPU activation table). A teardown may free the
+    /// space's root and frames only when this is empty.
+    pub(crate) fn address_space_loaded_cpus_split(&self, asid: crate::kernel::vm::Asid) -> u64 {
+        let (online, current) = self.with_scheduler_split_mut(|sched| {
+            let s = kernel_ref(&sched.scheduler);
+            let mut current = [None; crate::arch::platform_constants::MAX_CPUS];
+            for (cpu, slot) in current.iter_mut().enumerate() {
+                *slot = s.current_tid_on(CpuId(cpu as u8)).map(|t| t.0);
+            }
+            (s.online_cpu_bitmap(), current)
+        });
+        let mut running = 0u64;
+        for (cpu, tid) in current.iter().enumerate() {
+            if online & (1u64 << cpu) == 0 {
+                continue;
+            }
+            if let Some(tid) = tid
+                && self.task_asid_for_tid_split_read(*tid) == asid.0 as u64
+            {
+                running |= 1u64 << cpu;
+            }
+        }
+        running | crate::arch::hal::address_space_loaded_bitmap(asid)
     }
 
     /// U9-REAP1 §3 — rank 3: queue one fire-and-forget TLB shootdown for a destroyed address

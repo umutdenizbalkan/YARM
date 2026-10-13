@@ -207,12 +207,12 @@ impl RecvV3Owners for SplitRecvV3Owners<'_> {
             // U9-C owns the reply-registry transaction; the ordinary composition declines it.
             let _ = self
                 .shared
-                .rollback_materialized_recv_cap_no_vm_split(self.tid, cap);
+                .rollback_materialized_recv_cap_no_vm_split(self.cpu, self.tid, cap);
             return;
         }
         let _ = self
             .shared
-            .rollback_materialized_recv_cap_no_vm_split(self.tid, cap);
+            .rollback_materialized_recv_cap_no_vm_split(self.cpu, self.tid, cap);
     }
 
     fn note(&mut self, event: V3TxnEvent) {

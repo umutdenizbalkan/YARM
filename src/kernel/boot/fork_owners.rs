@@ -75,23 +75,21 @@ impl KernelState {
         Ok(out)
     }
 
-    /// Account for the TLB work a parent write-protection owes — the BROAD path's half.
+    /// Complete the TLB work a parent write-protection owes — the BROAD (hosted reference /
+    /// boot-exclusive) path's half.
     ///
     /// The local invalidation already happened inside the VM lock: every architecture's
-    /// `map_page` ends in its own `invalidate_page`. What can be left is the remote half, and
-    /// what this path can do about it is bounded by where it runs.
+    /// `map_page` ends in its own `invalidate_page`. What can be left is the remote half.
     ///
     /// * **Nothing owed.** An empty plan (no run was downgraded), or AArch64, whose
     ///   `tlbi vaae1is` is inner-shareable and therefore already broadcast. Both are complete.
-    /// * **Owed, and this path cannot discharge it.** The broad route holds the broad lock for
-    ///   the whole syscall, and §14.4 D3 forbids waiting for an ACK under any lock. It therefore
-    ///   DEFERS, through the same `VM_TLB_SHOOTDOWN_DEFERRED` accounting the broad COW handler
-    ///   already uses, and reports complete — which is exactly the behaviour this route had
-    ///   before U9-FORK1 and no weaker. The split route, which holds no lock, PERFORMS it.
-    ///
-    /// Returning `false` here would refuse every broad fork on a multi-threaded process, which is
-    /// a regression rather than a fix; the fix is the split route, and the deferral is what makes
-    /// the difference between the two visible in a log instead of silent.
+    /// * **Owed.** VM-INVALIDATION1: each downgraded page goes through the broad route's own
+    ///   invalidation owner — the shootdown plan, then `request_live_asid_shootdown` when a
+    ///   remote CPU runs the space — exactly as the broad COW fault and the broad live-space
+    ///   install complete theirs. It used to DEFER here and report complete
+    ///   (`result=deferred_broad`), which published a child while another CPU could still write
+    ///   through a parent translation into the frame the child now shares. A target that does not
+    ///   acknowledge answers `false`, and the transaction refuses the fork.
     pub(crate) fn complete_cow_write_protect_shootdown(
         &mut self,
         plan: &super::cow_clone::CowShootdownPlan,
@@ -108,19 +106,27 @@ impl KernelState {
             );
             return true;
         }
+        let page_sz = crate::kernel::vm::PAGE_SIZE as u64;
+        let mut all_acked = true;
+        for run in &plan.runs {
+            for p in 0..run.pages {
+                let va = crate::kernel::vm::VirtAddr(run.virt.0 + p as u64 * page_sz);
+                let targets = self
+                    .compute_tlb_shootdown_request_plan(plan.asid, va)
+                    .target_cpu_bitmap;
+                if targets != 0 && self.shootdown_replaced_mapping(plan.asid, va).is_err() {
+                    all_acked = false;
+                }
+            }
+        }
         crate::yarm_log!(
-            "VM_TLB_SHOOTDOWN_DEFERRED reason=broad_lock_held asid={} runs={} pages={}",
+            "FORK_COW_SHOOTDOWN asid={} runs={} pages={} result={}",
             plan.asid.0,
             plan.runs.len(),
-            plan.pages()
+            plan.pages(),
+            if all_acked { "ok" } else { "incomplete" }
         );
-        crate::yarm_log!(
-            "FORK_COW_SHOOTDOWN asid={} runs={} pages={} result=deferred_broad",
-            plan.asid.0,
-            plan.runs.len(),
-            plan.pages()
-        );
-        true
+        all_acked
     }
 
     /// rank 2 — THE fork publication: the child's inherited state and the reservation commit,

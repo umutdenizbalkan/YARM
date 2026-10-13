@@ -143,7 +143,7 @@ impl crate::runtime::SharedKernel {
 
         // ── step 2: publish the receiver-local CapId in the return lane ─────────────────────
         if recv_boundary_encode_transfer_cap_ret(frame, Some(transfer_cap.0)).is_err() {
-            self.revoke_shared_region_transfer_cap(receiver_tid, transfer_cap);
+            self.revoke_shared_region_transfer_cap(cpu, receiver_tid, transfer_cap);
             self.settle_shared_region_sender(cpu, pending);
             return Err(TrapHandleError::Syscall(SyscallError::Internal));
         }
@@ -159,7 +159,7 @@ impl crate::runtime::SharedKernel {
             let sender = match usize::try_from(pending.msg.sender_tid.0) {
                 Ok(s) => s,
                 Err(_) => {
-                    self.revoke_shared_region_transfer_cap(receiver_tid, transfer_cap);
+                    self.revoke_shared_region_transfer_cap(cpu, receiver_tid, transfer_cap);
                     self.settle_shared_region_sender(cpu, pending);
                     return Err(TrapHandleError::Syscall(SyscallError::Internal));
                 }
@@ -176,14 +176,14 @@ impl crate::runtime::SharedKernel {
                 pending.msg.sender_tid.0,
             );
             let Some(asid) = pending.asid else {
-                self.revoke_shared_region_transfer_cap(receiver_tid, transfer_cap);
+                self.revoke_shared_region_transfer_cap(cpu, receiver_tid, transfer_cap);
                 self.settle_shared_region_sender(cpu, pending);
                 return Err(TrapHandleError::Syscall(SyscallError::from(
                     crate::kernel::boot::KernelError::UserMemoryFault,
                 )));
             };
             if let Err(copy_err) = self.copy_to_user_split(asid, VirtAddr(meta_ptr as u64), &meta) {
-                self.revoke_shared_region_transfer_cap(receiver_tid, transfer_cap);
+                self.revoke_shared_region_transfer_cap(cpu, receiver_tid, transfer_cap);
                 let _ = recv_boundary_encode_transfer_cap_ret(frame, None);
                 crate::yarm_log!("IPC_RECV_V2_ROLLBACK_OK site=immediate_meta reply=false");
                 self.settle_shared_region_sender(cpu, pending);
@@ -240,7 +240,7 @@ impl crate::runtime::SharedKernel {
         // (7) the receiver's buffer must exist and be big enough. Revokes.
         if pending.user_ptr == 0 || pending.user_len < region_len {
             if frame.ret2() as u64 != SYSCALL_NO_TRANSFER_CAP {
-                self.revoke_shared_region_transfer_cap(receiver_tid, minted);
+                self.revoke_shared_region_transfer_cap(cpu, receiver_tid, minted);
                 recv_boundary_encode_transfer_cap_ret(frame, None)
                     .map_err(|_| SyscallError::Internal)?;
             }
@@ -260,7 +260,7 @@ impl crate::runtime::SharedKernel {
         let recv_map_flags = match recv_shared_mem_map_intent_flags(frame) {
             Ok(flags) => flags,
             Err(err) => {
-                self.revoke_shared_region_transfer_cap(receiver_tid, transfer_cap);
+                self.revoke_shared_region_transfer_cap(cpu, receiver_tid, transfer_cap);
                 recv_boundary_encode_transfer_cap_ret(frame, None)
                     .map_err(|_| SyscallError::Internal)?;
                 return Err(err);
@@ -274,7 +274,7 @@ impl crate::runtime::SharedKernel {
 
         // (11) a write mapping needs WRITE on the capability. Revokes.
         if recv_map_flags.write && !transfer_capability.has_right(CapRights::WRITE) {
-            self.revoke_shared_region_transfer_cap(receiver_tid, transfer_cap);
+            self.revoke_shared_region_transfer_cap(cpu, receiver_tid, transfer_cap);
             recv_boundary_encode_transfer_cap_ret(frame, None)
                 .map_err(|_| SyscallError::Internal)?;
             return Err(SyscallError::MissingRight);
@@ -283,6 +283,7 @@ impl crate::runtime::SharedKernel {
         // (12) read-only intent attenuates the capability. `?`, no revoke — matching the broad
         // arm, whose `attenuate_transfer_cap_for_recv_intent(...)?` also propagates bare.
         let attenuated = self.attenuate_shared_region_cap_split(
+            cpu,
             receiver_tid,
             transfer_cap,
             recv_map_flags.write,
@@ -313,7 +314,7 @@ impl crate::runtime::SharedKernel {
         ) {
             Ok(mapped) => mapped,
             Err(err) => {
-                self.revoke_shared_region_transfer_cap(receiver_tid, transfer_cap);
+                self.revoke_shared_region_transfer_cap(cpu, receiver_tid, transfer_cap);
                 recv_boundary_encode_transfer_cap_ret(frame, None)
                     .map_err(|_| SyscallError::Internal)?;
                 return Err(err);
@@ -329,7 +330,7 @@ impl crate::runtime::SharedKernel {
             mapped_len,
         ) {
             let _ = self.unmap_range_two_phase_from_split(cpu, asid, mapped_va, mapped_len);
-            self.revoke_shared_region_transfer_cap(receiver_tid, transfer_cap);
+            self.revoke_shared_region_transfer_cap(cpu, receiver_tid, transfer_cap);
             let _ = recv_boundary_encode_transfer_cap_ret(frame, None);
             // `EndpointFull` is what the broad `register_active_transfer_mapping` raises when
             // the registry has no free slot, and the broad arm forwards it through
@@ -378,8 +379,16 @@ impl crate::runtime::SharedKernel {
     /// revoke, the delegated descendants, the delegation links, the active-transfer-mapping
     /// revocation, the memory refcount drop and reclaim, and the notification destroy. Its
     /// result is discarded, exactly as the broad helper discards its own.
-    fn revoke_shared_region_transfer_cap(&self, receiver_tid: u64, transfer_cap: CapId) {
-        let _ = self.revoke_capability_no_vm_split(receiver_tid, transfer_cap);
+    ///
+    /// VM-INVALIDATION1: `cpu` is the CPU executing the receive — the requester of any unmap the
+    /// teardown performs, never the ambient scheduler field.
+    fn revoke_shared_region_transfer_cap(
+        &self,
+        cpu: CpuId,
+        receiver_tid: u64,
+        transfer_cap: CapId,
+    ) {
+        let _ = self.revoke_capability_no_vm_split(cpu, receiver_tid, transfer_cap);
     }
 
     /// The split twin of `attenuate_transfer_cap_for_recv_intent`, with the same three outcomes
@@ -388,6 +397,7 @@ impl crate::runtime::SharedKernel {
     /// intersection and the original revoked.
     fn attenuate_shared_region_cap_split(
         &self,
+        cpu: CpuId,
         receiver_tid: u64,
         transfer_cap: CapId,
         allow_write: bool,
@@ -413,7 +423,7 @@ impl crate::runtime::SharedKernel {
         let derived = self
             .sr_mint_split(cnode, Capability::new(capability.object, attenuated_rights))
             .map_err(|()| SyscallError::from(crate::kernel::boot::KernelError::CapabilityFull))?;
-        self.revoke_shared_region_transfer_cap(receiver_tid, transfer_cap);
+        self.revoke_shared_region_transfer_cap(cpu, receiver_tid, transfer_cap);
         Ok(derived)
     }
 

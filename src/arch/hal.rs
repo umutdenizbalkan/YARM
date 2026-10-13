@@ -70,6 +70,23 @@ pub(crate) fn active_address_space(cpu: CpuId) -> Option<Asid> {
     }
 }
 
+/// VM-INVALIDATION1 — every CPU whose last recorded activation is `asid`: the CPUs on which
+/// that address space's page-table root may still be LOADED, whether or not any task of it is
+/// current there. A CPU that ran the space and then went idle keeps its root (no port switches
+/// roots on idle entry), so this is the fact a teardown must consult before it frees the root.
+///
+/// Each activation path records AFTER its root load, so a recorded CPU over-approximates — a CPU
+/// still switching away keeps its old record until the new root is live.
+pub(crate) fn address_space_loaded_bitmap(asid: Asid) -> u64 {
+    let mut bitmap = 0u64;
+    for (cpu, slot) in ACTIVE_ASID.iter().enumerate() {
+        if slot.load(core::sync::atomic::Ordering::Acquire) == asid.0 as u32 {
+            bitmap |= 1u64 << cpu;
+        }
+    }
+    bitmap
+}
+
 /// Clear one CPU's activation record. Test-support and boot-reset only.
 // Reachable from the tests below and from a boot reset; a plain hosted `lib` build compiles no
 // route to it, exactly like the sibling `*_from_raw` domain projectors.
@@ -108,8 +125,9 @@ impl Hal for SelectedIsaHal {
     type TrapContext = crate::arch::hal_adapters::AdapterTrapContext;
 
     fn switch_address_space(&mut self, cpu: CpuId, asid: Asid) {
-        crate::arch::hal_adapters::switch_address_space(asid);
-        note_address_space_activated(cpu, asid);
+        if crate::arch::hal_adapters::switch_address_space(asid) {
+            note_address_space_activated(cpu, asid);
+        }
     }
 
     fn acknowledge_interrupt(&mut self, _cpu: CpuId, irq_line: u16) {

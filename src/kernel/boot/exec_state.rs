@@ -3112,8 +3112,9 @@ impl KernelState {
                 hw_cr3,
                 task_asid.0
             );
-            crate::arch::hal_adapters::switch_address_space(task_asid);
-            crate::arch::hal::note_address_space_activated(cpu, task_asid);
+            if crate::arch::hal_adapters::switch_address_space(task_asid) {
+                crate::arch::hal::note_address_space_activated(cpu, task_asid);
+            }
             crate::yarm_log!("D6_PROOF_CR3_CLEANUP_OK");
         }
     }
@@ -4616,8 +4617,9 @@ impl crate::runtime::SharedKernel {
         // (4) Lock-free: activate the incoming address space — the same two free functions
         // `Hal::switch_address_space` calls, which `dispatch_next_task` uses at this exact point.
         if let Some(asid) = incoming_asid {
-            crate::arch::hal_adapters::switch_address_space(asid);
-            crate::arch::hal::note_address_space_activated(cpu, asid);
+            if crate::arch::hal_adapters::switch_address_space(asid) {
+                crate::arch::hal::note_address_space_activated(cpu, asid);
+            }
         }
         // (5) Lock-free: publish the plan for the arch apply. This is the point of no return.
         unsafe {

@@ -170,6 +170,14 @@ impl KernelState {
         }
     }
 
+    /// VM-INVALIDATION1 — the CPUs on which `asid` may still be loaded: currently running a task
+    /// bound to it, or last recorded as having activated it. See
+    /// [`crate::arch::hal::address_space_loaded_bitmap`]. The broad (hosted reference) twin of
+    /// `SharedKernel::address_space_loaded_cpus_split`.
+    pub(crate) fn address_space_loaded_cpus(&self, asid: Asid) -> CpuBitmap {
+        self.live_cpu_bitmap_for_asid(asid) | crate::arch::hal::address_space_loaded_bitmap(asid)
+    }
+
     fn live_cpu_bitmap_for_asid(&self, asid: Asid) -> CpuBitmap {
         // Stage 183.5: wake-only online APs run no dispatcher, never load a user
         // CR3, and never touch user VAs — they cannot hold translations for any
@@ -749,14 +757,38 @@ impl KernelState {
         // goes through the invalidation-aware owner: the shared page's reference becomes a hold,
         // settled only once its translation is invalidated, and quarantined otherwise — the
         // policy the split COW route keeps.
-        if let Err(e) = self.map_user_page_in_live_asid(
+        let installed = self.map_user_page_in_live_asid(
             asid,
             page,
             Mapping {
                 phys: new_phys,
                 flags,
             },
-        ) {
+        );
+        // VM-INVALIDATION1 — the outcome is typed, and only `Complete` is a recovered fault. With
+        // the private copy installed but the old translation's invalidation unacknowledged, a
+        // thread on the unacknowledged CPU keeps reading the shared page: the fault is settled as
+        // the split route settles it — the mark is cleared with the copy in place, the old page
+        // stays held, and the error leaves through the trap's fail-closed channel. Nothing is
+        // rolled back and the task never resumes through its frame.
+        if let Ok((super::vm_image_locked::PageInstall::InvalidationIncomplete, _)) = installed {
+            self.clear_cow_page(asid, page);
+            crate::yarm_log!(
+                "VM_COW_INVALIDATION_INCOMPLETE route=broad asid={} va=0x{:x} new_pa=0x{:x}",
+                asid.0,
+                page.0,
+                new_phys.0
+            );
+            if vm_cow {
+                crate::yarm_log!(
+                    "VM_COW_FAIL reason=invalidation_incomplete asid={} va=0x{:x}",
+                    asid.0,
+                    page.0
+                );
+            }
+            return Err(KernelError::WouldBlock);
+        }
+        if let Err(e) = installed {
             if vm_cow {
                 crate::yarm_log!(
                     "VM_COW_ROLLBACK_BEGIN asid={} va=0x{:x} reason=remap",
@@ -1676,7 +1708,11 @@ impl KernelState {
     /// becomes an identity hold in the same memory acquisition; only an acknowledged shootdown
     /// settles it, and an unacknowledged one keeps it — so neither this rollback nor a competing
     /// final release can free backing a stale translation may still reach.
-    pub(crate) fn unmap_range_two_phase(&mut self, asid: Asid, base: usize, len: usize) {
+    ///
+    /// VM-INVALIDATION1: returns `true` iff every removed page's invalidation completed, so a
+    /// caller can tell removing a PTE from completing the invalidation that authorizes reclaim.
+    pub(crate) fn unmap_range_two_phase(&mut self, asid: Asid, base: usize, len: usize) -> bool {
+        let mut all_acked = true;
         let end = base.saturating_add(len);
         let mut va = base;
         while va < end {
@@ -1699,6 +1735,7 @@ impl KernelState {
                 let plan = self.compute_tlb_shootdown_request_plan(asid, virt);
                 let acknowledged = plan.target_cpu_bitmap == 0
                     || self.request_live_asid_shootdown(asid, virt).is_ok();
+                all_acked &= acknowledged;
                 if let Some(object_id) = hold {
                     if acknowledged {
                         self.with_memory_state_mut(|memory| {
@@ -1719,6 +1756,7 @@ impl KernelState {
             }
             va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
         }
+        all_acked
     }
 
     /// D-NEXT-1 PR-B Phase A — vm domain, rank 5 (plus the memory rank-6

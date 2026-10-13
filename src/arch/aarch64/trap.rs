@@ -779,8 +779,9 @@ pub(crate) fn post_exit_restore_replacement(
     restore: &crate::runtime::ExitReplacementRestore,
 ) {
     if let Some(asid) = restore.asid {
-        crate::arch::hal_adapters::switch_address_space(asid);
-        crate::arch::hal::note_address_space_activated(cpu, asid);
+        if crate::arch::hal_adapters::switch_address_space(asid) {
+            crate::arch::hal::note_address_space_activated(cpu, asid);
+        }
     }
     if restore.enter_idle {
         crate::yarm_log!("SCHED_ENTER_IDLE");

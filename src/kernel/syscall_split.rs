@@ -1518,11 +1518,7 @@ fn try_split_cow_page_fault_into_frame(
     // mutation, so a `Refused*` outcome is still safe to hand to the broad arm.
     let outcome = shared.cow_recover_private_copy_split(facts);
     match outcome {
-        R::Committed {
-            old_phys,
-            new_phys,
-            shootdown_acked,
-        } => {
+        R::Committed { old_phys, new_phys } => {
             if crate::kernel::boot::vm_cow_enabled() {
                 crate::yarm_log!(
                     "VM_COW_PHASE_METADATA asid={} va=0x{:x} writable=0",
@@ -1556,15 +1552,16 @@ fn try_split_cow_page_fault_into_frame(
                     facts.page.0
                 );
             }
+            // VM-INVALIDATION1: `Committed` now means the invalidation was acknowledged; an
+            // unacknowledged one is `FailedClosedInvalidation`, settled by the fail-closed arm.
             crate::yarm_log!(
-                "VM_COW_SPLIT_COMMITTED cpu={} tid={} asid={} va=0x{:x} old_pa=0x{:x} new_pa=0x{:x} acked={}",
+                "VM_COW_SPLIT_COMMITTED cpu={} tid={} asid={} va=0x{:x} old_pa=0x{:x} new_pa=0x{:x} acked=1",
                 cpu.0,
                 facts.tid,
                 facts.asid.0,
                 facts.page.0,
                 old_phys.0,
-                new_phys.0,
-                u8::from(shootdown_acked)
+                new_phys.0
             );
             crate::yarm_log!("PAGE_FAULT_HANDLED_COW");
             if crate::kernel::boot::fault_delivery_enabled() {
@@ -1611,6 +1608,12 @@ fn try_split_cow_page_fault_into_frame(
         other => {
             // Post-allocation failure. The allocation is rolled back; the broad arm must not
             // run, so this carries the error the broad arm's own failure would have carried.
+            //
+            // VM-INVALIDATION1: `FailedClosedInvalidation` arrives here too — the private copy
+            // was installed, but the old translation's invalidation was not acknowledged, so the
+            // fault is not recovered. Nothing is rolled back for it (the old page stays held); it
+            // takes this same fail-closed settlement, which never returns through the faulting
+            // frame and invents no errno for the task.
             crate::yarm_log!(
                 "VM_COW_SPLIT_FAILED_CLOSED cpu={} tid={} va=0x{:x} reason={}",
                 cpu.0,
@@ -9902,7 +9905,7 @@ fn try_split_reap_faulted_task_into_frame(
         return fail(SyscallError::InvalidArgs);
     }
 
-    let mut owners = SharedReapOwners { shared };
+    let mut owners = SharedReapOwners { shared, cpu };
     match run_reap_transaction(&mut owners, target) {
         Ok(_) => {
             crate::yarm_log!("TASK_REAP_FAULTED_OK target_tid={}", target);

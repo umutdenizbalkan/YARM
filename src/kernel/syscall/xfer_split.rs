@@ -93,10 +93,11 @@ impl XferReleaseOwners for SplitXferOwners<'_> {
         reservation: Self::RevokeReservation,
         backing_is_quarantined: bool,
     ) -> XferRevokeOutcome {
-        match self
-            .shared
-            .commit_user_held_capability_split(reservation, backing_is_quarantined)
-        {
+        match self.shared.commit_user_held_capability_split(
+            self.cpu,
+            reservation,
+            backing_is_quarantined,
+        ) {
             SplitRevokeCommitOutcome::Revoked(_) => XferRevokeOutcome::Revoked,
             SplitRevokeCommitOutcome::RootAlreadyRetired => XferRevokeOutcome::AlreadyRetired,
         }

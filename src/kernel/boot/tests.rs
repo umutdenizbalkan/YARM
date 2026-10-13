@@ -66372,9 +66372,15 @@ mod stage193c_ipc_send_ordinary_cap {
         // U9-D3 §6: the rollback is unchanged in effect but no longer broad — it goes to the
         // phased split composition, which now serves the memory-backed cohort too.
         assert!(
-            RUNTIME_SRC.contains(
-                "rollback_materialized_recv_cap_no_vm_split(snap.waiter_tid, CapId(local_cap))"
-            ) && RUNTIME_SRC.contains("IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL reason=user_copy"),
+            // VM-INVALIDATION1: the rollback names the executing CPU as its requester.
+            RUNTIME_SRC
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(
+                    "rollback_materialized_recv_cap_no_vm_split( cpu, snap.waiter_tid, CapId(local_cap), )"
+                )
+                && RUNTIME_SRC.contains("IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL reason=user_copy"),
             "a user-copy fault must roll the minted cap back and emit the cap FAIL marker"
         );
         assert!(
@@ -71279,8 +71285,8 @@ mod stage198e3b2a_offlock_ctx {
         // The unmap seam releases the VM lock (rank 5) BEFORE the memory reclaim (rank 6) — separate
         // `with_*_split_mut` calls, never nested; the map seam applies memory accounting after VM.
         // U9-VM-ENTRY1-S §1 moved the seam BODY to `..._from_split` (the requester is now a
-        // parameter, not an ambient field); `unmap_range_two_phase_split` is a two-line
-        // ambient-requester delegator. The rank contract lives with the body.
+        // parameter, not an ambient field); VM-INVALIDATION1 deleted the ambient-requester
+        // delegator. The rank contract lives with the body.
         let unmap = RT
             .split_once("pub(crate) fn unmap_range_two_phase_from_split(")
             .map(|(_, r)| r.split_once("\n    }\n").map(|(b, _)| b).unwrap_or(r))
@@ -143084,7 +143090,8 @@ mod u9c_reply_cap_ordered_transaction {
         let split = code_of(include_str!("capability_lifecycle_state.rs"));
         for effect in [
             "fn revoke_active_transfer_mappings_for_cap_split(",
-            "unmap_range_two_phase_split(",
+            // VM-INVALIDATION1: the requester-explicit owner; the ambient form is deleted.
+            "unmap_range_two_phase_from_split(",
             "adjust_memory_object_cap_refcount_locked(",
             "reclaim_memory_object_if_unreferenced_locked(",
             "report_transfer_revoke_to_supervisor_split(",
@@ -143550,7 +143557,7 @@ mod u9f_split_capability_revocation {
         });
 
         let object = k
-            .revoke_capability_no_vm_split(tid, notif_cap)
+            .revoke_capability_no_vm_split(CpuId(0), tid, notif_cap)
             .expect("a Notification cap is admitted by the split composition");
         assert!(matches!(object, CapObject::Notification { .. }));
 
@@ -143592,7 +143599,7 @@ mod u9f_split_capability_revocation {
             );
         });
 
-        k.revoke_capability_no_vm_split(tid, notif_cap)
+        k.revoke_capability_no_vm_split(CpuId(0), tid, notif_cap)
             .expect("admitted");
 
         k.with(|state| {
@@ -143626,7 +143633,7 @@ mod u9f_split_capability_revocation {
             assert!(state.task_is_blocked(2901));
         });
 
-        k.revoke_capability_no_vm_split(tid, notif_cap)
+        k.revoke_capability_no_vm_split(CpuId(0), tid, notif_cap)
             .expect("admitted");
 
         k.with(|state| {
@@ -143669,7 +143676,7 @@ mod u9f_split_capability_revocation {
             (idx, cap, tid)
         });
 
-        k.revoke_capability_no_vm_split(tid, notif_cap)
+        k.revoke_capability_no_vm_split(CpuId(0), tid, notif_cap)
             .expect("admitted");
 
         k.with(|state| {
@@ -143718,7 +143725,7 @@ mod u9f_split_capability_revocation {
             );
         });
 
-        k.revoke_capability_no_vm_split(tid, notif_cap)
+        k.revoke_capability_no_vm_split(CpuId(0), tid, notif_cap)
             .expect("admitted");
 
         k.with(|state| {
@@ -143748,7 +143755,7 @@ mod u9f_split_capability_revocation {
         });
 
         let object = k
-            .revoke_capability_no_vm_split(tid, send_cap)
+            .revoke_capability_no_vm_split(CpuId(0), tid, send_cap)
             .expect("an Endpoint cap is admitted");
         assert!(matches!(object, CapObject::Endpoint { .. }));
 
@@ -143785,7 +143792,7 @@ mod u9f_split_capability_revocation {
             (send_cap, other_cap, tid)
         });
 
-        k.revoke_capability_no_vm_split(tid, send_cap)
+        k.revoke_capability_no_vm_split(CpuId(0), tid, send_cap)
             .expect("admitted");
 
         k.with(|state| {
@@ -143820,7 +143827,7 @@ mod u9f_split_capability_revocation {
                 .expect("endpoint");
             (send, state.current_tid().expect("tid"))
         });
-        k.revoke_capability_no_vm_split(tid, first)
+        k.revoke_capability_no_vm_split(CpuId(0), tid, first)
             .expect("admitted");
         let second = k.with(|state| {
             let (_e, send, _r) = state
@@ -143853,7 +143860,7 @@ mod u9f_split_capability_revocation {
             let (idx, cap, _recv) = state.create_notification(4).expect("notif");
             (idx, cap, state.current_tid().expect("tid"))
         });
-        assert!(k.rollback_materialized_recv_cap_no_vm_split(tid, notif_cap));
+        assert!(k.rollback_materialized_recv_cap_no_vm_split(CpuId(0), tid, notif_cap));
         let gen_after_first =
             k.with(|state| state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]));
 
@@ -143866,7 +143873,7 @@ mod u9f_split_capability_revocation {
 
         // The stale cap rolls back a second time — and must not touch the successor.
         assert!(
-            !k.rollback_materialized_recv_cap_no_vm_split(tid, notif_cap),
+            !k.rollback_materialized_recv_cap_no_vm_split(CpuId(0), tid, notif_cap),
             "the second rollback is refused, not performed"
         );
         k.with(|state| {
@@ -143906,7 +143913,7 @@ mod u9f_split_capability_revocation {
             "the replacement is not blocked"
         );
 
-        k.revoke_capability_no_vm_split(tid, notif_cap)
+        k.revoke_capability_no_vm_split(CpuId(0), tid, notif_cap)
             .expect("admitted");
 
         k.with(|state| {
@@ -143941,7 +143948,7 @@ mod u9f_split_capability_revocation {
             (idx, cap, state.current_tid().expect("tid"))
         });
 
-        k.revoke_capability_no_vm_split(tid, notif_cap)
+        k.revoke_capability_no_vm_split(CpuId(0), tid, notif_cap)
             .expect("admitted");
         let queued_once = k.with(|state| state.runnable_count_on_cpu(CpuId(0)));
         k.with(|state| {
@@ -143955,7 +143962,7 @@ mod u9f_split_capability_revocation {
 
         // A repeated rollback of the same, now-stale cap must wake nothing more.
         assert!(
-            !k.rollback_materialized_recv_cap_no_vm_split(tid, notif_cap),
+            !k.rollback_materialized_recv_cap_no_vm_split(CpuId(0), tid, notif_cap),
             "the repeat is refused"
         );
         k.with(|state| {
@@ -144055,7 +144062,7 @@ mod u9f_split_capability_revocation {
         });
 
         assert_eq!(
-            k.revoke_capability_no_vm_split(tid, mem_cap),
+            k.revoke_capability_no_vm_split(CpuId(0), tid, mem_cap),
             Ok(CapObject::MemoryObject { id: mem_id }),
             "the memory-backed cap is served, not refused"
         );
@@ -144179,7 +144186,7 @@ mod u9f_split_capability_revocation {
         // Split: the production composition, off the broad lock.
         let (split_k, _, split_cap, split_mem, split_asid) = fixture();
         assert_eq!(
-            split_k.revoke_capability_no_vm_split(tid, split_cap),
+            split_k.revoke_capability_no_vm_split(CpuId(0), tid, split_cap),
             Ok(CapObject::MemoryObject { id: split_mem }),
             "the memory-backed cap with a live mapping is served, not refused"
         );
@@ -144242,7 +144249,7 @@ mod u9f_split_capability_revocation {
         });
 
         assert_eq!(
-            k.revoke_capability_no_vm_split(tid, reply_cap),
+            k.revoke_capability_no_vm_split(CpuId(0), tid, reply_cap),
             Err(SplitRevokeRefusal::ReplyObject),
             "a Reply cap is routed to the U9-C transaction, not torn down here"
         );
@@ -144264,11 +144271,11 @@ mod u9f_split_capability_revocation {
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let tid = k.with(|state| state.current_tid().expect("current tid"));
         assert_eq!(
-            k.revoke_capability_no_vm_split(tid, CapId(0xDEAD_BEEF)),
+            k.revoke_capability_no_vm_split(CpuId(0), tid, CapId(0xDEAD_BEEF)),
             Err(SplitRevokeRefusal::Unresolvable)
         );
         assert_eq!(
-            k.revoke_capability_no_vm_split(999_999, CapId(0)),
+            k.revoke_capability_no_vm_split(CpuId(0), 999_999, CapId(0)),
             Err(SplitRevokeRefusal::Unresolvable),
             "an unknown task is refused before anything is resolved"
         );
@@ -144289,15 +144296,15 @@ mod u9f_split_capability_revocation {
             (mem_cap, notif_cap, state.current_tid().expect("tid"))
         });
         assert!(
-            k.rollback_materialized_recv_cap_no_vm_split(tid, mem_cap),
+            k.rollback_materialized_recv_cap_no_vm_split(CpuId(0), tid, mem_cap),
             "memory-backed => served off-lock, with the real D3 completion"
         );
         assert!(
-            k.rollback_materialized_recv_cap_no_vm_split(tid, notif_cap),
+            k.rollback_materialized_recv_cap_no_vm_split(CpuId(0), tid, notif_cap),
             "an already-admitted class => still served off-lock"
         );
         assert!(
-            !k.rollback_materialized_recv_cap_no_vm_split(tid, mem_cap),
+            !k.rollback_materialized_recv_cap_no_vm_split(CpuId(0), tid, mem_cap),
             "the repeat finds nothing: `Unresolvable`, for which the broad path did nothing either"
         );
     }
@@ -144403,7 +144410,8 @@ mod u9f_split_capability_revocation {
     fn the_split_composition_reaches_the_d3_complete_seam_and_nothing_broad() {
         let code = code_of(revoke_split_region());
         for required in [
-            "unmap_range_two_phase_split(",
+            // VM-INVALIDATION1: the requester-explicit owner; the ambient form is deleted.
+            "unmap_range_two_phase_from_split(",
             "with_memory_split_mut(",
             "adjust_memory_object_cap_refcount_locked(",
             "reclaim_memory_object_if_unreferenced_locked(",
@@ -144550,10 +144558,11 @@ mod u9f_split_capability_revocation {
         let order = [
             "cspace_revoke_split(cnode, root.cap)",
             "cspace_read_then_revoke_split(cnode, descendant.cap)",
-            "memory_obligations_split(descendant.pid, descendant.cap, object)",
+            // VM-INVALIDATION1: every obligation names the executing CPU as its requester.
+            "memory_obligations_split(requester, descendant.pid, descendant.cap, object)",
             "destroy_notification_for_revoked_object_split(object)",
             "clear_delegation_links_split(",
-            "memory_obligations_split(root.pid, root.cap, root_object)",
+            "memory_obligations_split(requester, root.pid, root.cap, root_object)",
             "destroy_notification_for_revoked_object_split(root_object)",
         ];
         let mut last = 0usize;
@@ -144568,9 +144577,14 @@ mod u9f_split_capability_revocation {
         // mappings whether or not its slot still held a capability. Dropping that on the empty-slot
         // arm would leak a mapping the broad path unmaps.
         assert!(
-            commit.contains(
-                "} else {\n                self.revoke_active_transfer_mappings_for_cap_split(descendant.pid, descendant.cap);"
-            ),
+            // VM-INVALIDATION1: with the requester stated, rustfmt wraps the call.
+            commit
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ")
+                .contains(
+                    "} else { self.revoke_active_transfer_mappings_for_cap_split( requester, descendant.pid, descendant.cap, );"
+                ),
             "an empty descendant slot must still have its transfer mappings revoked"
         );
         // U9-XFER1 §3: ONE teardown, two reservations. Both entry points must REACH the commit
@@ -144684,7 +144698,8 @@ mod u9f_split_capability_revocation {
         );
         let order = [
             "self.task_asid_opt_split_read(mapping.owner_tid.0)",
-            "self.unmap_range_two_phase_split(",
+            // VM-INVALIDATION1: the requester-explicit owner, with the stated requester.
+            "self.unmap_range_two_phase_from_split(",
             "ipc.active_transfer_mappings[idx] = None",
             "ipc.telemetry.shared_mem_bytes_released",
             "ipc.telemetry.transfer_records_revoked",
@@ -144709,7 +144724,7 @@ mod u9f_split_capability_revocation {
             .collect::<alloc::vec::Vec<_>>()
             .join(" ");
         assert!(
-            flat.contains("all_acked &= self.unmap_range_two_phase_split("),
+            flat.contains("all_acked &= self.unmap_range_two_phase_from_split( requester,"),
             "the ACK verdict must accumulate across records, not be overwritten by the last one"
         );
         // The exact broad text, so the live log is identical on both routes.
@@ -147082,19 +147097,19 @@ mod u9d3_split_unmap_drives_real_d3 {
             ),
             "the requester is an explicit parameter of the owner"
         );
-        // The ambient read survives in exactly one place: the compatibility delegator, for callers
-        // that have no entering-CPU identity to hand over. It computes nothing else.
-        let amb = fn_body(RUNTIME, "pub(crate) fn complete_unmap_shootdown_split(");
-        assert!(
-            amb.contains("let ambient = self.with_scheduler_split_mut(|sched| sched.current_cpu);")
-                && amb.contains("self.complete_unmap_shootdown_from_split(ambient, asid, virt)"),
-            "the ambient reader is a pure delegator onto the requester-stating owner"
-        );
-        assert!(
-            !amb.contains("live_cpu_bitmap_for_asid_split")
-                && !amb.contains("smp_tlb_shootdown_cpus"),
-            "and it holds no shootdown logic of its own"
-        );
+        // VM-INVALIDATION1: the ambient read no longer survives anywhere. The compatibility
+        // delegators — `complete_unmap_shootdown_split` and `unmap_range_two_phase_split`, which
+        // read `sched.current_cpu` and passed it on as the requester — are deleted, so no caller
+        // can reach the coordinator without stating the CPU it executes on.
+        for deleted in [
+            "fn complete_unmap_shootdown_split(",
+            "fn unmap_range_two_phase_split(",
+        ] {
+            assert!(
+                !RUNTIME.contains(deleted),
+                "the ambient-requester delegator `{deleted}` must stay deleted"
+            );
+        }
         // Every VM-entry seam states its own requester rather than taking the ambient default.
         let vm_split = include_str!("../syscall/vm_split.rs");
         assert!(
@@ -154192,7 +154207,11 @@ mod u9cow2_route {
         // SHARED-REGION-LIFETIME1: the bookkeeping converts the old reference into an identity
         // hold, and the reclaim is that hold's settlement.
         let book = at(&t, "retire_mapping_to_hold_locked");
-        let shoot = at(&t, "complete_unmap_shootdown_split(asid, page)");
+        // VM-INVALIDATION1: the requester is the faulting CPU, never the ambient field.
+        let shoot = at(
+            &t,
+            "complete_unmap_shootdown_from_split(facts.cpu, asid, page)",
+        );
         let reclaim = at(&t, "settle_displaced_hold_locked(");
         assert!(
             t[reclaim..].contains("memory, object_id, old_phys"),
@@ -165141,7 +165160,9 @@ mod u9fork1_cow_fork_transaction {
             .and_then(|s| s.split("\n    /// rank 5 → 6, ONE acquisition").next())
             .expect("the split shootdown owner");
         assert!(
-            performer.contains("self.complete_unmap_shootdown_split(plan.asid, va)"),
+            // VM-INVALIDATION1: with the fork's trap CPU as the stated requester.
+            performer
+                .contains("self.complete_unmap_shootdown_from_split(requester, plan.asid, va)"),
             "the split route must drive the existing generation-matched coordinator"
         );
         for forbidden in [
@@ -165828,8 +165849,9 @@ mod u9a64cow2_split_route {
                 "`{step}` must be part of the one refcount acquisition"
             );
         }
+        // VM-INVALIDATION1: the requester is the faulting CPU (`facts.cpu`).
         let shootdown = txn
-            .find("self.complete_unmap_shootdown_split(asid, page)")
+            .find("self.complete_unmap_shootdown_from_split(facts.cpu, asid, page)")
             .expect("the shootdown");
         let reclaim = txn
             .find("settle_displaced_hold_locked(")
@@ -165856,7 +165878,7 @@ mod u9a64cow2_split_route {
         let txn = transaction_body();
         let shootdown_line = txn
             .lines()
-            .find(|l| l.contains("self.complete_unmap_shootdown_split(asid, page)"))
+            .find(|l| l.contains("self.complete_unmap_shootdown_from_split(facts.cpu, asid, page)"))
             .expect("the shootdown line");
         assert!(
             !shootdown_line.contains("with_memory_split_mut")
@@ -166131,6 +166153,10 @@ mod u9reap1_reap_transaction {
     }
 
     impl ReapOwners for Harness {
+        fn address_space_loaded_cpus(&self, _asid: Asid) -> u64 {
+            // The harness models no CPU-loaded roots; teardown always proceeds.
+            0
+        }
         fn target_is_scheduled(&self, tid: u64) -> bool {
             // The injection fires only on the SECOND probe — the one taken under the claim — so
             // the transaction reaches its rollback arm rather than refusing before the claim.
@@ -166276,8 +166302,9 @@ mod u9reap1_reap_transaction {
                 self.reclaimed_asids.push(asid);
             }
         }
-        fn unmap_transfer_range(&mut self, _asid: Asid, _base: usize, _len: usize) {
+        fn unmap_transfer_range(&mut self, _asid: Asid, _base: usize, _len: usize) -> bool {
             self.note("unmap_transfer_range");
+            true
         }
 
         fn snapshot_delegation_links(&self, out: &mut [Option<DelegationEndpoints>]) -> usize {
@@ -166634,7 +166661,8 @@ mod u9reap1_reap_transaction {
         );
         assert!(
             SPLIT.contains("run_reap_transaction(&mut owners, target)")
-                && SPLIT.contains("SharedReapOwners { shared }"),
+                // VM-INVALIDATION1: the owner carries the NR 31 trap's CPU as its requester.
+                && SPLIT.contains("SharedReapOwners { shared, cpu }"),
             "the split NR 31 route must delegate to the same transaction"
         );
         assert_eq!(
@@ -177695,6 +177723,25 @@ mod u9vment1_ownership_cases {
             Ok(())
         }
 
+        fn remove_committed_pages(&mut self, _asid: Asid, records: &mut [PageRecord]) {
+            // VM-INVALIDATION1: the production body's shape, in one acquisition.
+            self.say("remove_committed_begin");
+            self.in_acquisition = true;
+            for record in records.iter_mut() {
+                if !record.installed {
+                    continue;
+                }
+                if self.space.get(&record.virt.0).map(|m| m.phys) == Some(record.phys) {
+                    self.space.remove(&record.virt.0);
+                    *self.map_refs.entry(record.phys.0).or_insert(0) -= 1;
+                } else {
+                    record.installed = false;
+                }
+            }
+            self.in_acquisition = false;
+            self.say("remove_committed_end");
+        }
+
         fn complete_shootdown(&mut self, _asid: Asid, _virt: VirtAddr) -> bool {
             assert!(
                 !self.in_acquisition,
@@ -177922,19 +177969,50 @@ mod u9vment1_ownership_cases {
                 PageFlags::USER_RW,
             );
         }
-        run_mock(&mut owners, 3).expect("the request still commits");
+        // VM-INVALIDATION1: an unacknowledged displacement is not a delivered mapping. The request
+        // fails after commit — it used to report success here.
         assert_eq!(
-            owners
-                .log
+            run_mock(&mut owners, 3),
+            Err(SyscallError::Internal),
+            "the request is settled as a failure"
+        );
+        let removal = owners
+            .log
+            .iter()
+            .position(|e| e == "remove_committed_begin")
+            .expect("the request's own pages are taken back out");
+        assert_eq!(
+            owners.log[..removal]
                 .iter()
                 .filter(|e| *e == "complete_shootdown")
                 .count(),
             3,
             "every displaced page still asks for its acknowledgement"
         );
+        assert_eq!(
+            owners.log[removal..]
+                .iter()
+                .filter(|e| *e == "complete_shootdown")
+                .count(),
+            3,
+            "and every removed page of the request owes its own"
+        );
         assert!(
             owners.reclaimed.is_empty(),
-            "but no frame may be reused until the acknowledgement arrives"
+            "no frame may be reused until the acknowledgement arrives"
+        );
+        for page in 0..3 {
+            assert!(
+                !owners.space.contains_key(&mock_virt(page)),
+                "page {page}: neither the new backing nor the displaced one is installed"
+            );
+        }
+        assert_eq!(
+            owners.live_pins().len(),
+            6,
+            "the three displaced pages and the request's own three unacknowledged pages all stay \
+             held: {:?}",
+            owners.live_pins()
         );
     }
 
@@ -179030,6 +179108,9 @@ mod u9vment1_ownership_cases {
             ) -> Result<(), (usize, KernelError)> {
                 self.inner.install_and_account(asid, flags, records)
             }
+            fn remove_committed_pages(&mut self, asid: Asid, records: &mut [PageRecord]) {
+                self.inner.remove_committed_pages(asid, records)
+            }
             fn complete_shootdown(&mut self, asid: Asid, virt: VirtAddr) -> bool {
                 self.inner.complete_shootdown(asid, virt)
             }
@@ -180061,7 +180142,13 @@ mod u9xfer1_ownership_cases {
     fn nr4_the_split_revoke_is_not_the_provisional_cap_subset() {
         let code = code_only(XFER_SPLIT);
         assert!(
-            code.contains("commit_user_held_capability_split(reservation, backing_is_quarantined)"),
+            // VM-INVALIDATION1: the trap CPU is the revocation's requester.
+            code.split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ")
+                .contains(
+                    "commit_user_held_capability_split( self.cpu, reservation, backing_is_quarantined, )"
+                ),
             "NR 4 must commit the reservation it prepared, carrying the shootdown verdict"
         );
         assert!(
@@ -180501,7 +180588,7 @@ mod u9xfer2_reservation_cases {
                         });
                 });
 
-                let _ = shared.commit_user_held_capability_split(reservation, false);
+                let _ = shared.commit_user_held_capability_split(CpuId(0), reservation, false);
 
                 let survivor = shared.with_capability_state_split_mut(|capability| {
                     capability.delegated_capability_links[idx]
@@ -180543,7 +180630,7 @@ mod u9xfer2_reservation_cases {
                     .plan_revoke_user_held_capability_split(1, mem_cap)
                     .expect("reserve");
                 // Quarantined: phase U reported an incomplete ACK for this backing.
-                let outcome = shared.commit_user_held_capability_split(reservation, true);
+                let outcome = shared.commit_user_held_capability_split(CpuId(0), reservation, true);
                 assert!(
                     matches!(
                         outcome,
@@ -180582,7 +180669,7 @@ mod u9xfer2_reservation_cases {
                 let reservation = shared
                     .plan_revoke_user_held_capability_split(1, mem_cap)
                     .expect("reserve");
-                let _ = shared.commit_user_held_capability_split(reservation, false);
+                let _ = shared.commit_user_held_capability_split(CpuId(0), reservation, false);
                 assert!(
                     shared
                         .with(|state| state.memory_object_slot_by_id(mo_id))
@@ -180615,7 +180702,8 @@ mod u9xfer2_reservation_cases {
                         .revoke_capability_in_cnode(cnode, root)
                         .expect("concurrent revoke");
                 });
-                let outcome = shared.commit_user_held_capability_split(reservation, false);
+                let outcome =
+                    shared.commit_user_held_capability_split(CpuId(0), reservation, false);
                 assert_eq!(
                     outcome,
                     crate::kernel::boot::SplitRevokeCommitOutcome::RootAlreadyRetired,
@@ -197811,6 +197899,9 @@ mod shared_region_lifetime1 {
         ) -> Result<(), (usize, KernelError)> {
             self.0.install_and_account(asid, flags, records)
         }
+        fn remove_committed_pages(&mut self, asid: Asid, records: &mut [PageRecord]) {
+            self.0.remove_committed_pages(asid, records)
+        }
         fn complete_shootdown(&mut self, _asid: Asid, _virt: VirtAddr) -> bool {
             false
         }
@@ -197847,18 +197938,31 @@ mod shared_region_lifetime1 {
                 SYSCALL_VM_MAP_PROT_READ,
             )
         });
-        assert!(got.is_ok(), "the mapping itself succeeds: {got:?}");
-        assert_ne!(
+        // VM-INVALIDATION1: an unacknowledged replacement is not a mapping. The request fails,
+        // takes its own page back out, and the window holds neither page — the displaced mapping
+        // is not restored.
+        assert_eq!(
+            got,
+            Err(SyscallError::Internal),
+            "an unacknowledged replacement is not a delivered mapping"
+        );
+        assert_eq!(
             translation(&fx, fx.asid, WINDOW_A).map(|m| m.phys),
-            Some(page_phys(&fx, 1)),
-            "the interior page was displaced"
+            None,
+            "the interior page was displaced, and the replacement taken back out"
         );
         assert_eq!(
             refs(&fx).map(|r| r.2),
             Some(1),
             "the unacknowledged displacement still holds the object"
         );
-        assert!(release(&fx, cap, 0, 0).is_ok());
+        // The grant's NR 4 release can no longer find its page; its capability is retired
+        // through the production revocation owner instead.
+        let _ = release(&fx, cap, 0, 0);
+        fx.kernel.with(|s| {
+            let cnode = s.current_task_cnode().expect("cnode");
+            let _ = s.revoke_capability_in_cnode(cnode, crate::kernel::capabilities::CapId(cap));
+        });
         revoke_source(&fx);
         assert_eq!(
             refs(&fx).map(|r| (r.0, r.2)),
@@ -197966,7 +198070,8 @@ mod shared_region_lifetime1 {
             (
                 "COW private copy",
                 "pub(crate) fn cow_recover_private_copy_split(",
-                "self.complete_unmap_shootdown_split(asid, page)",
+                // VM-INVALIDATION1: the requester is the faulting CPU, never the ambient field.
+                "self.complete_unmap_shootdown_from_split(facts.cpu, asid, page)",
             ),
             (
                 "two-phase unmap",
@@ -199055,5 +199160,1101 @@ mod shared_region_lifetime2 {
         );
         assert!(tracked(&fx, fx.old_base), "and its frame charged");
         assert!(replaced.is_err(), "refused");
+    }
+}
+
+/// VM-INVALIDATION1 — a PTE mutation and an acknowledged invalidation are different events, the
+/// requester is the CPU really executing the transaction, and the target set covers every CPU
+/// that can still use a translation.
+///
+/// Every fixture keeps the address space genuinely resident on a second CPU through the
+/// scheduler's own owners. The hosted build's invalidation owner has no cross-CPU coordinator, so
+/// a non-empty remote target set cannot be acknowledged: that is the (hosted-only) failure
+/// injection, exactly as in `shared_region_lifetime2`. Every expected target set is derived from
+/// the residency the fixture established, never from the target helper under test.
+#[cfg(test)]
+mod vm_invalidation1 {
+    use super::*;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR,
+        SYSCALL_VM_MAP_PROT_READ, SYSCALL_VM_MAP_PROT_WRITE, Syscall, SyscallError,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const PAGE: usize = PAGE_SIZE;
+    const CPU0: CpuId = CpuId(0);
+    const CPU1: CpuId = CpuId(1);
+    /// The mapping window. The page below it stays unmapped, so NR 3's guard-page rule never
+    /// refuses a writable request.
+    const WINDOW: usize = 0x40_0000;
+    /// A task that keeps an address space resident on another CPU.
+    const OBSERVER: u64 = 3;
+
+    fn object_phys(s: &KernelState, id: u64) -> PhysAddr {
+        s.with_memory_state(|m| {
+            m.memory_objects
+                .iter()
+                .flatten()
+                .find(|e| e.id == id)
+                .map(|e| e.phys)
+        })
+        .expect("object phys")
+    }
+
+    fn tracked(k: &SharedKernel, phys: PhysAddr) -> bool {
+        k.with(|s| {
+            s.with_memory_state(|m| m.frame_allocator.frame_refcount(phys.0).unwrap_or(0) > 0)
+        })
+    }
+
+    fn refs(k: &SharedKernel, id: u64) -> Option<(u32, u32, u32)> {
+        k.with(|s| s.memory_object_refcounts_by_id(id))
+    }
+
+    fn translation(k: &SharedKernel, asid: Asid, va: usize) -> Option<Mapping> {
+        k.with(|s| {
+            s.with_user_spaces(|spaces| {
+                spaces
+                    .get(asid)
+                    .and_then(|a| a.resolve(VirtAddr(va as u64)))
+            })
+        })
+    }
+
+    /// The object (if any) owning the frame `phys`, by extent.
+    fn owner_of(k: &SharedKernel, phys: PhysAddr) -> Option<u64> {
+        k.with(|s| {
+            s.with_memory_state(|m| {
+                m.memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|e| phys.0 >= e.phys.0 && phys.0 < e.phys.0 + e.len as u64)
+                    .map(|e| e.id)
+            })
+        })
+    }
+
+    /// Make `asid` resident on `cpu`: the observer, bound to it, is that CPU's current task —
+    /// through the scheduler's own enqueue and dispatch.
+    fn resident_on(k: &SharedKernel, asid: Asid, cpu: CpuId) {
+        k.with(|s| {
+            if cpu != CPU0 {
+                let _ = s.bring_up_cpu(cpu);
+            }
+            s.register_task(OBSERVER).expect("observer");
+            s.bind_task_asid(OBSERVER, asid).expect("bind observer");
+            s.enqueue_on_cpu(cpu, OBSERVER).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(OBSERVER));
+        });
+    }
+
+    /// Point the AMBIENT scheduler field at `cpu`. It names no requester.
+    fn ambient(k: &SharedKernel, cpu: CpuId) {
+        k.with(|s| {
+            let _ = s.bring_up_cpu(cpu);
+            s.set_current_cpu(cpu).expect("ambient")
+        });
+    }
+
+    /// The production transfer revocation, executed on `cpu`.
+    fn revoke_transfer_on(k: &SharedKernel, cpu: CpuId, cap: CapId) {
+        k.revoke_capability_no_vm_split(cpu, 0, cap)
+            .expect("the revocation runs");
+    }
+
+    /// The production NR 31 reap transaction through the split owner, executed on `cpu`.
+    fn reap_on(k: &SharedKernel, cpu: CpuId, tid: u64) {
+        let mut owners = crate::kernel::syscall::reap_txn::SharedReapOwners { shared: k, cpu };
+        crate::kernel::syscall::reap_txn::run_reap_transaction(&mut owners, tid).expect("reaped");
+    }
+
+    // ── NR 3 ────────────────────────────────────────────────────────────────────────────────
+
+    struct MapFx {
+        kernel: SharedKernel,
+        asid: Asid,
+        aspace_cap: CapId,
+        old_id: u64,
+        old_base: PhysAddr,
+    }
+
+    /// Task 0 owns address space `asid` (and the `AddressSpace` capability naming it), and the
+    /// window pages listed in `displaced` already map pages of a second object, `old`, whose last
+    /// capability is gone: those pages live by their mappings alone.
+    fn map_fixture(pages: usize, displaced: &[usize]) -> MapFx {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, aspace_cap, old_id, old_base) = kernel.with(|s| {
+            let (asid, aspace_cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(0, asid).expect("bind");
+            let (old_id, old_cap) = s
+                .alloc_anonymous_memory_object_with_len(pages * PAGE)
+                .expect("old object");
+            let old_base = object_phys(s, old_id);
+            for &i in displaced {
+                s.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr((WINDOW + i * PAGE) as u64),
+                    Mapping {
+                        phys: PhysAddr(old_base.0 + (i * PAGE) as u64),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("pre-map the window");
+            }
+            let cnode = s.current_task_cnode().expect("cnode");
+            s.revoke_capability_in_cnode(cnode, old_cap)
+                .expect("drop the old object's capability");
+            (asid, aspace_cap, old_id, old_base)
+        });
+        MapFx {
+            kernel,
+            asid,
+            aspace_cap,
+            old_id,
+            old_base,
+        }
+    }
+
+    /// The real split NR 3, entered on `cpu`.
+    fn vm_map(fx: &MapFx, cpu: CpuId, pages: usize) -> (Result<(), SyscallError>, TrapFrame) {
+        let mut f = TrapFrame::zeroed();
+        f.set_syscall_num(Syscall::VmMap as usize);
+        f.set_arg(SYSCALL_ARG_CAP, fx.aspace_cap.0 as usize);
+        f.set_arg(SYSCALL_ARG_PTR, WINDOW);
+        f.set_arg(SYSCALL_ARG_LEN, pages * PAGE);
+        f.set_arg(
+            SYSCALL_ARG_INLINE_PAYLOAD0,
+            SYSCALL_VM_MAP_PROT_READ | SYSCALL_VM_MAP_PROT_WRITE,
+        );
+        let r = crate::kernel::syscall_split::try_split_vm_map_into_frame(&fx.kernel, cpu, &mut f)
+            .expect("the split NR 3 route serves the request");
+        let r = r.map_err(|e| match e {
+            crate::kernel::boot::TrapHandleError::Syscall(s) => s,
+            other => panic!("unexpected error channel: {other:?}"),
+        });
+        (r, f)
+    }
+
+    /// **NR 3 whose replacement could not be invalidated is not a successful mapping — first
+    /// page.** The window's only page displaces an existing mapping while the space is resident
+    /// on CPU 1; the request runs on CPU 0, so CPU 1 is a genuine remote holder.
+    #[test]
+    fn nr3_an_unacknowledged_replacement_of_the_first_page_is_not_a_mapping() {
+        let fx = map_fixture(1, &[0]);
+        resident_on(&fx.kernel, fx.asid, CPU1);
+        let (r, _) = vm_map(&fx, CPU0, 1);
+        assert_eq!(
+            r,
+            Err(SyscallError::Internal),
+            "an incomplete invalidation is not a delivered mapping"
+        );
+        assert_nr3_settled(&fx, &[0], 1);
+    }
+
+    /// **The same at a LATER page**: page 0 displaces nothing (its install needs no invalidation),
+    /// page 1 displaces the old mapping.
+    #[test]
+    fn nr3_an_unacknowledged_replacement_of_a_later_page_is_not_a_mapping() {
+        let fx = map_fixture(2, &[1]);
+        resident_on(&fx.kernel, fx.asid, CPU1);
+        let (r, _) = vm_map(&fx, CPU0, 2);
+        assert_eq!(r, Err(SyscallError::Internal), "not a delivered mapping");
+        assert_nr3_settled(&fx, &[1], 2);
+    }
+
+    /// The settlement an incomplete NR 3 owes, read back from the owners:
+    ///
+    /// * no page of the request remains installed — neither the new backing nor the old (the
+    ///   displaced mapping is not restored);
+    /// * every displaced page is still held by identity, and its frame still charged;
+    /// * every page this request installed and then removed owes its own invalidation to CPU 1
+    ///   too, so it is held (pinned) and its frame charged: nothing of it was reclaimed.
+    fn assert_nr3_settled(fx: &MapFx, displaced: &[usize], pages: usize) {
+        for i in 0..pages {
+            assert_eq!(
+                translation(&fx.kernel, fx.asid, WINDOW + i * PAGE),
+                None,
+                "window page {i} is unmapped"
+            );
+        }
+        let old = refs(&fx.kernel, fx.old_id).expect("the displaced object lives");
+        assert_eq!(old.0, 0, "the displaced object has no capability");
+        assert_eq!(old.1, 0, "and no mapping");
+        assert_eq!(
+            old.2,
+            displaced.len() as u32,
+            "but every displaced page is held"
+        );
+        for &i in displaced {
+            assert!(
+                tracked(&fx.kernel, PhysAddr(fx.old_base.0 + (i * PAGE) as u64)),
+                "displaced frame {i} still charged"
+            );
+        }
+    }
+
+    /// **The success path, local only**: with no remote holder the replacement completes, the
+    /// mapping is installed, and the displaced object — living by that mapping alone — is
+    /// reclaimed by its settlement.
+    #[test]
+    fn nr3_a_local_only_replacement_completes_and_reclaims_exactly_the_displaced_object() {
+        let fx = map_fixture(1, &[0]);
+        let (r, f) = vm_map(&fx, CPU0, 1);
+        assert_eq!(r, Ok(()), "mapped");
+        let _ = f;
+        let new = translation(&fx.kernel, fx.asid, WINDOW).expect("installed");
+        assert_ne!(new.phys, fx.old_base, "the new backing");
+        assert_eq!(
+            refs(&fx.kernel, fx.old_id),
+            None,
+            "the displaced object is reclaimed"
+        );
+        let new_id = owner_of(&fx.kernel, new.phys).expect("the new page has an owner");
+        assert_eq!(
+            refs(&fx.kernel, new_id),
+            Some((1, 1, 0)),
+            "its capability and its mapping, no leftover hold"
+        );
+    }
+
+    // ── transfer revocation ─────────────────────────────────────────────────────────────────
+
+    /// A queued shared-region transfer of a `pages`-page object, received by task 0 at `WINDOW`
+    /// through the split NR 2 lane: the receiver-local capability and its active registration are
+    /// production state. Returns `(kernel, asid, object_id, local transfer cap)`.
+    fn received_window(pages: usize) -> (SharedKernel, Asid, u64, CapId) {
+        use crate::kernel::syscall::{
+            SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_TRANSFER_CAP, SYSCALL_IPC_RECV_NR,
+            SYSCALL_RECV_MAP_INTENT_READ, dispatch,
+        };
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, send_cap, recv_cap, object_id, source_cap) = kernel.with(|s| {
+            let (asid, _cap) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(0, asid).expect("bind");
+            let (_eid, send_cap, recv_cap) = s.create_endpoint(4).expect("endpoint");
+            let (object_id, mem_cap) = s
+                .alloc_anonymous_memory_object_with_len(pages * PAGE)
+                .expect("object");
+            let source_cap = s
+                .mint_dma_region_cap(mem_cap, 0, pages * PAGE)
+                .expect("dma window");
+            (asid, send_cap, recv_cap, object_id, source_cap)
+        });
+        let mut send = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                pages * PAGE,
+                0,
+                0,
+                source_cap.0 as usize,
+            ],
+        );
+        assert_eq!(kernel.with(|s| dispatch(s, &mut send)).err(), None, "send");
+        let mut f = TrapFrame::new(SYSCALL_IPC_RECV_NR, [0; 6]);
+        f.set_arg(SYSCALL_ARG_CAP, recv_cap.0 as usize);
+        f.set_arg(SYSCALL_ARG_PTR, WINDOW);
+        f.set_arg(SYSCALL_ARG_LEN, pages * PAGE);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, 0);
+        f.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_RECV_MAP_INTENT_READ);
+        f.set_arg(SYSCALL_ARG_TRANSFER_CAP, 0);
+        let r = kernel
+            .try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut f)
+            .into_legacy_option()
+            .expect("the lane serves a queued shared-region transfer");
+        assert!(r.is_ok(), "received: {r:?}");
+        let local = kernel
+            .with(|s| {
+                s.with_ipc_state(|ipc| {
+                    ipc.active_transfer_mappings
+                        .iter()
+                        .flatten()
+                        .next()
+                        .map(|m| m.transfer_cap)
+                })
+            })
+            .expect("the receive registered its window");
+        // The receiver leaves CPU 0, so the only CPU a fixture makes resident is the one it names.
+        kernel.with(|s| assert_eq!(s.block_current_on_cpu(CPU0), Some(0)));
+        (kernel, asid, object_id, local)
+    }
+
+    /// **The revocation of a registered transfer names its real requester.** The receiver's
+    /// space is resident on CPU 1; the revocation runs on CPU 0 while the ambient field names
+    /// CPU 1. CPU 1 is a remote holder of the window's translations, so the unmap cannot be
+    /// acknowledged and every removed page stays held — nothing is settled as if it had been.
+    #[test]
+    fn a_transfer_revocation_on_cpu0_with_the_ambient_field_on_cpu1_keeps_every_page_held() {
+        let (k, asid, object_id, local) = received_window(2);
+        resident_on(&k, asid, CPU1);
+        ambient(&k, CPU1);
+        let (_, _, pin_before) = refs(&k, object_id).expect("live");
+        revoke_transfer_on(&k, CPU0, local);
+        for i in 0..2 {
+            assert_eq!(
+                translation(&k, asid, WINDOW + i * PAGE),
+                None,
+                "page {i} removed"
+            );
+        }
+        let (_, map, pin) = refs(&k, object_id).expect("the object lives");
+        assert_eq!(map, 0, "both mapping references retired");
+        assert_eq!(
+            pin,
+            pin_before + 2,
+            "and both are held: CPU 1 never acknowledged the invalidation"
+        );
+    }
+
+    /// The reverse: executing on CPU 1 (the only holder), ambient field naming CPU 0 — the
+    /// requester invalidates its own translations and both holds settle.
+    #[test]
+    fn a_transfer_revocation_on_the_only_holder_settles_every_hold() {
+        let (k, asid, object_id, local) = received_window(2);
+        resident_on(&k, asid, CPU1);
+        ambient(&k, CPU0);
+        let (_, _, pin_before) = refs(&k, object_id).expect("live");
+        revoke_transfer_on(&k, CPU1, local);
+        let (_, map, pin) = refs(&k, object_id).expect("the object lives");
+        assert_eq!(
+            (map, pin),
+            (0, pin_before),
+            "removed, acknowledged and settled"
+        );
+    }
+
+    // ── address-space teardown ──────────────────────────────────────────────────────────────
+
+    const DOOMED: u64 = 20;
+
+    /// A process (task `DOOMED`) with its own address space holding one data page of an object
+    /// that lives by that mapping alone. Returns `(kernel, asid, object_id, frame)`.
+    fn doomed_process() -> (SharedKernel, Asid, u64, PhysAddr) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let fx = kernel.with(|s| {
+            let (asid, _cap) = s.create_user_address_space().expect("asid");
+            s.register_task(DOOMED).expect("task");
+            s.bind_task_asid(DOOMED, asid).expect("bind");
+            let (object_id, mem_cap) = s.alloc_anonymous_memory_object().expect("data object");
+            s.map_user_page_in_asid_with_caps(
+                asid,
+                mem_cap,
+                VirtAddr(WINDOW as u64),
+                PageFlags::USER_RW,
+            )
+            .expect("map");
+            let cnode = s.current_task_cnode().expect("cnode");
+            s.revoke_capability_in_cnode(cnode, mem_cap)
+                .expect("the page lives by its mapping alone");
+            let frame = object_phys(s, object_id);
+            (asid, object_id, frame)
+        });
+        (kernel, fx.0, fx.1, fx.2)
+    }
+
+    /// Run `DOOMED` on `cpu` — the scheduler's dispatch, then the production post-lock
+    /// activation owner, which records the hardware activation — and stop it there: blocked off
+    /// the CPU and exited. The CPU is left exactly as a CPU that ran the task and went idle is
+    /// left: no task is current, and the address space is still the one it last loaded.
+    fn ran_and_exited_on(k: &SharedKernel, asid: Asid, cpu: CpuId) {
+        crate::arch::hal::reset_all_active_address_spaces();
+        k.with(|s| {
+            if cpu != CPU0 {
+                let _ = s.bring_up_cpu(cpu);
+            }
+            for c in 0..crate::kernel::scheduler::MAX_CPUS {
+                let _ = s.withdraw_queued_tid_on(CpuId(c as u8), DOOMED);
+            }
+            s.enqueue_on_cpu(cpu, DOOMED).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(cpu), Some(DOOMED));
+        });
+        assert_eq!(
+            k.direct_dispatch_activate_asid_split(
+                k.stale_dispatch_mark_token_for_test(cpu, DOOMED, asid)
+            ),
+            Some(asid.0),
+            "activated"
+        );
+        k.with(|s| {
+            assert_eq!(s.block_current_on_cpu(cpu), Some(DOOMED));
+            s.exit_task(DOOMED, 0).expect("exit");
+        });
+        assert_eq!(
+            crate::arch::hal::active_address_space(cpu),
+            Some(asid),
+            "the CPU still has the address space loaded"
+        );
+    }
+
+    /// **A torn-down address space is not reclaimed while another CPU still has it loaded.**
+    /// `DOOMED` ran on CPU 1 and exited; CPU 1 went idle with the space still loaded. The reap
+    /// runs on CPU 0. Freeing the space's page-table root and data frames now would hand CPU 1's
+    /// loaded root back to the allocator: the space, its frame and its ASID are quarantined.
+    #[test]
+    fn a_reap_does_not_free_an_address_space_another_cpu_still_has_loaded() {
+        let (k, asid, object_id, frame) = doomed_process();
+        ran_and_exited_on(&k, asid, CPU1);
+        reap_on(&k, CPU0, DOOMED);
+        assert!(
+            k.with(|s| s.with_user_spaces(|spaces| spaces.get(asid).is_some())),
+            "the address space is retained"
+        );
+        assert_eq!(
+            refs(&k, object_id).map(|r| r.1),
+            Some(1),
+            "its page is still mapped and owned"
+        );
+        assert!(tracked(&k, frame), "and its frame charged");
+    }
+
+    /// **The reuse boundary, success side**: the same process ran on CPU 1 and exited, and CPU 1
+    /// then activated a different address space — through the same production activation owner —
+    /// before the reap. No CPU has the dead space loaded any more, so its root, frames and object
+    /// are reclaimed exactly.
+    #[test]
+    fn a_reap_reclaims_an_address_space_once_every_cpu_has_loaded_another() {
+        let (k, asid, object_id, frame) = doomed_process();
+        ran_and_exited_on(&k, asid, CPU1);
+        let other = k.with(|s| {
+            let (other, _) = s.create_user_address_space().expect("another space");
+            s.register_task(OBSERVER).expect("observer");
+            s.bind_task_asid(OBSERVER, other).expect("bind");
+            s.enqueue_on_cpu(CPU1, OBSERVER).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(CPU1), Some(OBSERVER));
+            other
+        });
+        assert_eq!(
+            k.direct_dispatch_activate_asid_split(
+                k.stale_dispatch_mark_token_for_test(CPU1, OBSERVER, other)
+            ),
+            Some(other.0)
+        );
+        assert_eq!(crate::arch::hal::active_address_space(CPU1), Some(other));
+        reap_on(&k, CPU0, DOOMED);
+        assert!(
+            k.with(|s| s.with_user_spaces(|spaces| spaces.get(asid).is_none())),
+            "the address space is gone"
+        );
+        assert_eq!(refs(&k, object_id), None, "its object reclaimed");
+        assert!(!tracked(&k, frame), "and its frame returned");
+    }
+
+    // ── COW ─────────────────────────────────────────────────────────────────────────────────
+
+    const COW_VA: usize = 0x60_0000;
+
+    /// Task 0's space `a` and a second space `b` both map one page of object `shared` read-only at
+    /// `COW_VA`, and the page is copy-on-write in `a`. The object lives by those two mappings.
+    fn cow_fixture() -> (SharedKernel, Asid, u64, PhysAddr) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (a, shared, phys) = kernel.with(|s| {
+            let (a, _) = s.create_user_address_space().expect("a");
+            let (b, _) = s.create_user_address_space().expect("b");
+            s.bind_task_asid(0, a).expect("bind");
+            let (shared, cap) = s.alloc_anonymous_memory_object().expect("shared page");
+            let phys = object_phys(s, shared);
+            let ro = PageFlags {
+                write: false,
+                ..PageFlags::USER_RW
+            };
+            for space in [a, b] {
+                s.map_user_page_in_asid_raw(
+                    space,
+                    VirtAddr(COW_VA as u64),
+                    Mapping { phys, flags: ro },
+                )
+                .expect("map the shared page");
+            }
+            s.with_memory_state_mut(|m| {
+                crate::kernel::boot::cow_clone::mark_cow_page_locked(m, a, VirtAddr(COW_VA as u64))
+            })
+            .expect("mark");
+            let cnode = s.current_task_cnode().expect("cnode");
+            s.revoke_capability_in_cnode(cnode, cap)
+                .expect("drop the cap");
+            (a, shared, phys)
+        });
+        (kernel, a, shared, phys)
+    }
+
+    fn cow_facts(cpu: CpuId, tid: u64, asid: Asid) -> crate::kernel::boot::PageFaultFacts {
+        crate::kernel::boot::PageFaultFacts {
+            cpu,
+            tid,
+            asid,
+            page: VirtAddr(COW_VA as u64),
+            access: crate::kernel::trap::FaultAccess::Write,
+            mapping_present: true,
+            mapping_writable: false,
+            cow_marked: true,
+            demand_region: false,
+        }
+    }
+
+    /// The production split COW transaction's outcome must settle through the bridge's
+    /// fail-closed arm: not a broad fallback, not a pre-mutation settlement, with an error.
+    fn assert_fail_closed(outcome: crate::kernel::boot::CowRecovery) {
+        assert_eq!(outcome.reason(), "invalidation_incomplete", "{outcome:?}");
+        assert!(!outcome.may_fall_back_to_broad());
+        assert!(outcome.pre_mutation_settlement().is_none());
+        assert_eq!(
+            outcome.kernel_error(),
+            Some(crate::kernel::boot::KernelError::WouldBlock),
+            "the fail-closed channel carries the error the fork's incomplete shootdown carries"
+        );
+    }
+
+    /// **COW, requester CPU 0, ambient field naming CPU 1, space resident on CPU 1.** CPU 1 may
+    /// still read the shared page through its read-only translation: the private copy is not a
+    /// recovered fault, and the shared page stays held.
+    #[test]
+    fn cow_with_the_requester_on_cpu0_and_the_ambient_field_on_cpu1_is_not_recovered() {
+        let (k, a, shared, phys) = cow_fixture();
+        resident_on(&k, a, CPU1);
+        ambient(&k, CPU1);
+        let outcome = k.cow_recover_private_copy_split(cow_facts(CPU0, 0, a));
+        assert_fail_closed(outcome);
+        let now = translation(&k, a, COW_VA).expect("the private copy is installed");
+        assert!(now.flags.write && now.phys != phys, "writable private copy");
+        assert_eq!(
+            refs(&k, shared).map(|r| (r.1, r.2)),
+            Some((1, 1)),
+            "the shared page: still mapped by `b`, and held for `a`'s unacknowledged translation"
+        );
+        assert!(tracked(&k, phys));
+    }
+
+    /// **The same with the CORRECT requester**: still not recovered — the unacknowledged
+    /// invalidation used to be reported as `Committed`.
+    #[test]
+    fn cow_whose_invalidation_is_unacknowledged_is_not_recovered() {
+        let (k, a, shared, _) = cow_fixture();
+        resident_on(&k, a, CPU1);
+        ambient(&k, CPU0);
+        assert_fail_closed(k.cow_recover_private_copy_split(cow_facts(CPU0, 0, a)));
+        assert_eq!(refs(&k, shared).map(|r| r.2), Some(1), "held");
+    }
+
+    /// **The reverse: the fault taken on CPU 1, the only CPU running the space, ambient field
+    /// naming CPU 0.** The requester invalidates its own translation: committed, and the shared
+    /// page's hold settled (it lives on by `b`'s mapping).
+    #[test]
+    fn cow_on_the_only_resident_cpu_commits_and_settles() {
+        let (k, a, shared, _) = cow_fixture();
+        k.with(|s| assert_eq!(s.block_current_on_cpu(CPU0), Some(0)));
+        resident_on(&k, a, CPU1);
+        ambient(&k, CPU0);
+        let outcome = k.cow_recover_private_copy_split(cow_facts(CPU1, OBSERVER, a));
+        assert_eq!(outcome.reason(), "committed", "{outcome:?}");
+        assert_eq!(
+            refs(&k, shared).map(|r| (r.1, r.2)),
+            Some((1, 0)),
+            "settled: the shared page lives by `b` alone"
+        );
+    }
+
+    /// **Local-only success**: no other CPU runs the space; committed and settled.
+    #[test]
+    fn cow_local_only_commits_and_settles() {
+        let (k, a, shared, _) = cow_fixture();
+        let outcome = k.cow_recover_private_copy_split(cow_facts(CPU0, 0, a));
+        assert_eq!(outcome.reason(), "committed", "{outcome:?}");
+        assert_eq!(refs(&k, shared).map(|r| (r.1, r.2)), Some((1, 0)));
+    }
+
+    /// Fill `cpu`'s cross-CPU mailbox, so the broad route's invalidation request cannot be
+    /// published: the broad (hosted reference) routes' own failure seam.
+    fn mailbox_full(k: &SharedKernel, cpu: CpuId) {
+        k.with(|s| {
+            while s
+                .submit_cross_cpu_work(cpu, crate::kernel::smp::WorkItem::Reschedule)
+                .is_ok()
+            {}
+        });
+    }
+
+    /// **The broad COW route keeps the same policy**: an incomplete invalidation is an error, not
+    /// a handled fault.
+    #[test]
+    fn broad_cow_whose_invalidation_cannot_complete_is_not_handled() {
+        let (k, a, shared, _) = cow_fixture();
+        resident_on(&k, a, CPU1);
+        mailbox_full(&k, CPU1);
+        let r = k.with(|s| s.try_handle_cow_fault(a, VirtAddr(COW_VA as u64)));
+        assert_eq!(r, Err(crate::kernel::boot::KernelError::WouldBlock));
+        assert_eq!(refs(&k, shared).map(|r| r.2), Some(1), "held");
+    }
+
+    // ── fork ────────────────────────────────────────────────────────────────────────────────
+
+    const PARENT: u64 = 40;
+
+    fn fork_fixture() -> (SharedKernel, Asid) {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state
+            .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
+                tid: PARENT,
+                entry: 0x8000,
+                asid: Some(asid),
+                class: TaskClass::App,
+                startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+                ..Default::default()
+            })
+            .expect("spawn");
+        // Spawning queued the parent somewhere; withdraw it so dispatches below are exact.
+        for c in 0..crate::kernel::scheduler::MAX_CPUS {
+            let _ = state.withdraw_queued_tid_on(CpuId(c as u8), PARENT);
+        }
+        (SharedKernel::new(state), asid)
+    }
+
+    fn split_fork(k: &SharedKernel, cpu: CpuId) -> Result<u64, crate::kernel::boot::KernelError> {
+        let mut owners = crate::kernel::syscall::spawn_txn::SharedSpawnOwners {
+            shared: k,
+            spawner_tid: Some(PARENT),
+            spawner_cnode: k.task_cnode_split(PARENT),
+            cpu,
+        };
+        crate::kernel::syscall::fork_txn::fork_process_cow(&mut owners, PARENT, None)
+    }
+
+    fn task_exists(k: &SharedKernel, tid: u64) -> bool {
+        k.with(|s| s.with_tcbs(|tcbs| tcbs.iter().flatten().any(|t| t.tid.0 == tid)))
+    }
+
+    /// The parent's writable runs, as the parent sees them now.
+    fn writable_pages(k: &SharedKernel, asid: Asid) -> usize {
+        k.with(|s| {
+            s.with_user_spaces(|spaces| {
+                let a = spaces.get(asid).expect("parent space");
+                let mut n = 0usize;
+                let mut i = 0usize;
+                while let Some((_, m, pages)) = a.run_at(i) {
+                    if m.flags.write {
+                        n += pages;
+                    }
+                    i += 1;
+                }
+                n
+            })
+        })
+    }
+
+    /// **Requester CPU 0, ambient field naming CPU 1, parent resident on CPU 1.** CPU 1 still
+    /// holds the parent's writable translations, so the write-protection is not complete until
+    /// CPU 1 has invalidated them: the fork must not publish a child.
+    #[test]
+    fn fork_with_the_requester_on_cpu0_and_the_ambient_field_on_cpu1_refuses() {
+        let (k, asid) = fork_fixture();
+        let writable = writable_pages(&k, asid);
+        assert!(writable > 0, "the parent has writable pages to protect");
+        resident_on(&k, asid, CPU1);
+        ambient(&k, CPU1);
+        let tasks_before = k.with(|s| s.with_tcbs(|t| t.iter().flatten().count()));
+        let r = split_fork(&k, CPU0);
+        assert_eq!(
+            r,
+            Err(crate::kernel::boot::KernelError::WouldBlock),
+            "CPU 1 is a remote holder: the fork is refused, not published"
+        );
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t.iter().flatten().count())),
+            tasks_before,
+            "no child exists"
+        );
+        assert_eq!(
+            writable_pages(&k, asid),
+            writable,
+            "the parent's permissions are restored"
+        );
+    }
+
+    /// **The reverse: requester CPU 1 — where the parent itself is resident — ambient field
+    /// naming CPU 0.** The only CPU holding the translation is the requester, which invalidates
+    /// its own: the fork completes and publishes its child.
+    #[test]
+    fn fork_with_the_requester_on_cpu1_and_the_ambient_field_on_cpu0_completes() {
+        let (k, asid) = fork_fixture();
+        k.with(|s| {
+            let _ = s.bring_up_cpu(CPU1);
+            s.enqueue_on_cpu(CPU1, PARENT).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(CPU1), Some(PARENT));
+        });
+        ambient(&k, CPU0);
+        let child = split_fork(&k, CPU1).expect("the requester owes no acknowledgement to itself");
+        assert!(task_exists(&k, child), "the child is published");
+        assert_eq!(
+            writable_pages(&k, asid),
+            0,
+            "every parent page is write-protected"
+        );
+    }
+
+    /// **The broad fork route no longer defers its owed write-protection invalidation and reports
+    /// it complete**: with a remote holder whose invalidation cannot be published, the fork is
+    /// refused and no child exists.
+    #[test]
+    fn broad_fork_whose_write_protection_cannot_complete_refuses() {
+        let (k, asid) = fork_fixture();
+        resident_on(&k, asid, CPU1);
+        mailbox_full(&k, CPU1);
+        let tasks_before = k.with(|s| s.with_tcbs(|t| t.iter().flatten().count()));
+        let r = k.with(|s| s.fork_user_process_cow(PARENT, None));
+        assert_eq!(r, Err(crate::kernel::boot::KernelError::WouldBlock));
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t.iter().flatten().count())),
+            tasks_before,
+            "no child exists"
+        );
+    }
+
+    // ── NR 3: a competing final release after the failure ──────────────────────────────────
+
+    /// After an incomplete NR 3, the request's own unacknowledged page keeps its pin AND its
+    /// provisional capability. A competing final release of that capability (process teardown is
+    /// its cleanup owner) frees nothing: the frame stays charged, held by the pin.
+    #[test]
+    fn nr3_a_final_release_after_the_failure_frees_nothing() {
+        let fx = map_fixture(1, &[0]);
+        resident_on(&fx.kernel, fx.asid, CPU1);
+        let before: alloc::collections::BTreeSet<u64> = fx.kernel.with(|s| {
+            s.with_memory_state(|m| m.memory_objects.iter().flatten().map(|e| e.id).collect())
+        });
+        let (r, _) = vm_map(&fx, CPU0, 1);
+        assert_eq!(r, Err(SyscallError::Internal));
+        let (new_id, new_phys) = fx
+            .kernel
+            .with(|s| {
+                s.with_memory_state(|m| {
+                    m.memory_objects
+                        .iter()
+                        .flatten()
+                        .find(|e| !before.contains(&e.id))
+                        .map(|e| (e.id, e.phys))
+                })
+            })
+            .expect("the request's object survives, quarantined");
+        assert_eq!(
+            refs(&fx.kernel, new_id),
+            Some((1, 0, 1)),
+            "cap retained, pinned"
+        );
+        // The competing final release: every capability naming the object is revoked.
+        fx.kernel.with(|s| {
+            let cnode = s.current_task_cnode().expect("cnode");
+            let caps: alloc::vec::Vec<CapId> = s
+                .snapshot_live_capabilities_for_task(0)
+                .expect("caps")
+                .iter()
+                .filter(|(_, c)| {
+                    matches!(c.object,
+                        crate::kernel::capabilities::CapObject::MemoryObject { id } if id == new_id)
+                })
+                .map(|(cap, _)| *cap)
+                .collect();
+            assert_eq!(caps.len(), 1, "exactly the provisional capability");
+            for cap in caps {
+                s.revoke_capability_in_cnode(cnode, cap).expect("revoke");
+            }
+        });
+        assert_eq!(
+            refs(&fx.kernel, new_id),
+            Some((0, 0, 1)),
+            "still held by its pin"
+        );
+        assert!(
+            tracked(&fx.kernel, new_phys),
+            "and its frame never reaches the allocator"
+        );
+        let old = refs(&fx.kernel, fx.old_id).expect("the displaced object lives");
+        assert_eq!(old.2, 1, "the displaced page is held too");
+    }
+
+    // ── transitions ─────────────────────────────────────────────────────────────────────────
+
+    /// **A CPU that ran a space and went idle is not a target, so the space's next user entry on
+    /// that CPU must be a flushing activation.** The x86 owner revalidation selects a woken task
+    /// on an idle CPU and returns it to ring 3; it now activates — and records — the resumed
+    /// task's address space itself, rather than relying on a hardware-CR3 comparison that skips
+    /// the write when the CPU kept the space loaded. Driven through the real owners: the CPU's
+    /// previous activation is the production activation owner's, the resume is the production
+    /// revalidation.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_owner_revalidation_activates_and_records_the_resumed_space() {
+        const WOKEN: u64 = 40_301;
+        crate::arch::hal::reset_all_active_address_spaces();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (a, b) = k.with(|s| {
+            let _ = s.bring_up_cpu(CPU1);
+            let (a, _) = s.create_user_address_space().expect("a");
+            let (b, _) = s.create_user_address_space().expect("b");
+            s.register_task(OBSERVER).expect("observer");
+            s.bind_task_asid(OBSERVER, b).expect("bind observer");
+            s.enqueue_on_cpu(CPU1, OBSERVER).expect("enqueue");
+            assert_eq!(s.dispatch_next_on_cpu(CPU1), Some(OBSERVER));
+            (a, b)
+        });
+        // CPU 1 activates `b`, then its task blocks: CPU 1 is idle with `b` loaded.
+        assert_eq!(
+            k.direct_dispatch_activate_asid_split(
+                k.stale_dispatch_mark_token_for_test(CPU1, OBSERVER, b)
+            ),
+            Some(b.0)
+        );
+        k.with(|s| {
+            assert_eq!(s.block_current_on_cpu(CPU1), Some(OBSERVER));
+            s.register_task_with_class(WOKEN, TaskClass::App)
+                .expect("woken task");
+            s.bind_task_asid(WOKEN, a).expect("bind");
+            let mut ctx = crate::kernel::task::UserRegisterContext::default();
+            ctx.instruction_ptr = VirtAddr(0x4000_0000);
+            ctx.stack_ptr = VirtAddr(0x4000_1000);
+            s.set_thread_user_context(WOKEN, ctx).expect("ctx");
+            s.enqueue_on_cpu(CPU1, WOKEN).expect("wake");
+        });
+        assert_eq!(crate::arch::hal::active_address_space(CPU1), Some(b));
+        let mut frame = TrapFrame::zeroed();
+        assert_eq!(
+            k.revalidate_idle_owner_after_drains(CPU1, &mut frame),
+            crate::runtime::OwnerRevalidation::Replacement(WOKEN)
+        );
+        assert_eq!(
+            crate::arch::hal::active_address_space(CPU1),
+            Some(a),
+            "the resume activated and recorded the woken task's address space"
+        );
+    }
+
+    // ── source and per-image contracts ─────────────────────────────────────────────────────
+
+    fn production_sources() -> [(&'static str, &'static str); 12] {
+        [
+            ("runtime.rs", include_str!("../../runtime.rs")),
+            ("syscall_split.rs", include_str!("../syscall_split.rs")),
+            (
+                "capability_lifecycle_state.rs",
+                include_str!("capability_lifecycle_state.rs"),
+            ),
+            ("vm_split.rs", include_str!("../syscall/vm_split.rs")),
+            ("xfer_split.rs", include_str!("../syscall/xfer_split.rs")),
+            (
+                "recv_v3_split.rs",
+                include_str!("../syscall/recv_v3_split.rs"),
+            ),
+            (
+                "recv_shared_region_split.rs",
+                include_str!("../syscall/recv_shared_region_split.rs"),
+            ),
+            ("reap_txn.rs", include_str!("../syscall/reap_txn.rs")),
+            ("spawn_txn.rs", include_str!("../syscall/spawn_txn.rs")),
+            ("shared_region_txn.rs", include_str!("shared_region_txn.rs")),
+            ("recv_v3_txn.rs", include_str!("../syscall/recv_v3_txn.rs")),
+            ("fork_owners.rs", include_str!("fork_owners.rs")),
+        ]
+    }
+
+    fn flat_code(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ")
+    }
+
+    /// **No production shootdown takes its requester from the ambient scheduler field.** The two
+    /// ambient delegators are deleted, and every call of the two requester-explicit owners passes
+    /// one of the CPU identities a transaction carries from its trap — never a value read from
+    /// `sched.current_cpu`.
+    #[test]
+    fn every_shootdown_names_a_carried_requester() {
+        const CARRIED: [&str; 6] = [
+            "requester",
+            "self.cpu",
+            "facts.cpu",
+            "cpu",
+            "self.requester",
+            "self.cpu,",
+        ];
+        let mut calls = 0usize;
+        for (name, src) in production_sources() {
+            let code = flat_code(src);
+            for deleted in [
+                "fn complete_unmap_shootdown_split(",
+                "fn unmap_range_two_phase_split(",
+            ] {
+                assert!(
+                    !code.contains(deleted),
+                    "{name}: `{deleted}` must stay deleted"
+                );
+            }
+            for owner in [
+                "complete_unmap_shootdown_from_split(",
+                "unmap_range_two_phase_from_split(",
+            ] {
+                for (at, _) in code.match_indices(owner) {
+                    if code[..at].ends_with("fn ") {
+                        continue;
+                    }
+                    let arg = code[at + owner.len()..]
+                        .trim_start()
+                        .split([',', ')'])
+                        .next()
+                        .unwrap_or("")
+                        .trim();
+                    calls += 1;
+                    assert!(
+                        CARRIED.contains(&arg),
+                        "{name}: `{owner}` called with requester `{arg}`, not a carried CPU"
+                    );
+                }
+            }
+            assert!(
+                !code.contains(
+                    "let ambient = self.with_scheduler_split_mut(|sched| sched.current_cpu)"
+                ),
+                "{name}: no ambient requester is read"
+            );
+        }
+        assert!(calls >= 12, "the call sites were found ({calls})");
+    }
+
+    /// **An activation is recorded only after the root load it describes.** The arch switch
+    /// reports whether it loaded a root, and every caller records on that answer; the raw loads
+    /// record after their own load.
+    #[test]
+    fn every_activation_record_follows_its_root_load() {
+        let adapters = include_str!("../../arch/hal_adapters.rs");
+        assert!(adapters.contains("pub fn switch_address_space(asid: Asid) -> bool {"));
+        for (name, src) in [
+            ("runtime.rs", include_str!("../../runtime.rs")),
+            ("exec_state.rs", include_str!("exec_state.rs")),
+            (
+                "aarch64/trap.rs",
+                include_str!("../../arch/aarch64/trap.rs"),
+            ),
+            ("x86_64/trap.rs", include_str!("../../arch/x86_64/trap.rs")),
+            ("hal.rs", include_str!("../../arch/hal.rs")),
+        ] {
+            let code = flat_code(src);
+            let calls = code.matches("hal_adapters::switch_address_space(").count();
+            let gated = code
+                .matches("if crate::arch::hal_adapters::switch_address_space(")
+                .count();
+            assert_eq!(
+                calls, gated,
+                "{name}: every switch gates its record on the load"
+            );
+        }
+        let smp = flat_code(include_str!("../../arch/x86_64/smp.rs"));
+        for cr3 in smp
+            .match_indices("core::arch::asm!(\"mov cr3, {}\"")
+            .map(|(i, _)| i)
+        {
+            let after = &smp[cr3..core::cmp::min(cr3 + 700, smp.len())];
+            assert!(
+                after.contains("note_address_space_activated("),
+                "x86 AP: every user CR3 load is recorded after it"
+            );
+        }
+        let rv = flat_code(include_str!("../../arch/riscv64/boot.rs"));
+        let loads = rv
+            .matches("crate::arch::riscv64::page_table::write_satp(satp); crate::arch::hal::note_address_space_activated(cpu, asid);")
+            .count();
+        assert_eq!(
+            loads, 2,
+            "RISC-V: both trap-resume satp loads are recorded after the load"
+        );
+    }
+
+    /// **The x86 activation flushes, and owner revalidation performs it.** The CR3 value the
+    /// activation writes never carries the no-flush bit, so the write invalidates every
+    /// non-global translation of the incoming PCID; the revalidation performs that activation
+    /// before — and independently of — the pre-IRET hardware-CR3 comparison. QEMU cannot tell a
+    /// missing flush apart (its TLB is flushed wholesale on every CR3 write), so this is checked
+    /// in the source and, by `scripts/check-vm-invalidation-sequence.sh`, in the built image.
+    #[test]
+    fn x86_activation_flushes_and_revalidation_performs_it() {
+        let pt = include_str!("../../arch/x86_64/page_table.rs");
+        let activate = pt
+            .split_once("pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {")
+            .and_then(|(_, r)| r.split_once("\n}\n"))
+            .map(|(b, _)| b)
+            .expect("activate_asid");
+        let cr3_for = pt
+            .split_once("pub fn cr3_for_asid(asid: Asid) -> Option<u64> {")
+            .and_then(|(_, r)| r.split_once("\n}\n"))
+            .map(|(b, _)| b)
+            .expect("cr3_for_asid");
+        for body in [activate, cr3_for] {
+            for composed in [
+                "| (1u64 << 63)",
+                "| (1 << 63)",
+                "|= 1u64 << 63",
+                "NOFLUSH",
+                "NO_FLUSH",
+            ] {
+                assert!(
+                    !body.contains(composed),
+                    "no no-flush bit is ever composed into the CR3 value (`{composed}`)"
+                );
+            }
+        }
+        assert!(cr3_for.contains("let cr3 = (root_phys & PAGE_MASK) | pcid;"));
+        let trap = flat_code(include_str!("../../arch/x86_64/trap.rs"));
+        let restore = trap
+            .split_once("pub(crate) fn x86_apply_owner_revalidation_restore(")
+            .map(|(_, r)| r)
+            .expect("the revalidation restore");
+        let activate_at = restore
+            .find("if crate::arch::hal_adapters::switch_address_space(task_asid) {")
+            .expect("the revalidation activates");
+        let check_at = restore
+            .find("ensure_user_return_cr3_split(shared, cpu, tid, task_asid);")
+            .expect("then the pre-IRET check");
+        assert!(activate_at < check_at);
+        assert!(
+            !restore[..activate_at].contains("hw_cr3"),
+            "the activation is not conditional on the hardware CR3"
+        );
+    }
+
+    /// **Teardown consults the loaded set before it frees anything, and an NR 3 request is
+    /// complete only when every displaced translation is.**
+    #[test]
+    fn teardown_and_nr3_settle_only_on_completion() {
+        let reap = flat_code(include_str!("../syscall/reap_txn.rs"));
+        let gate = reap
+            .find("let loaded = owners.address_space_loaded_cpus(asid);")
+            .expect("the gate");
+        let drain = reap
+            .find("owners.drain_address_space(asid, bitmap)")
+            .expect("the drain");
+        assert!(
+            gate < drain,
+            "the loaded set is read before the drain frees the root"
+        );
+        let txn = flat_code(include_str!("../syscall/vm_txn.rs"));
+        let settle = txn
+            .find("if displaced_unacknowledged != 0 {")
+            .expect("the failure settlement");
+        let remove = txn
+            .find("owners.remove_committed_pages(asid, &mut records);")
+            .expect("removal");
+        let ok = txn
+            .rfind("vm_txn_exit!(smp2_op, Ok((args.addr, args.map_len)))")
+            .expect("the success exit");
+        assert!(
+            settle < remove && remove < ok,
+            "the success exit follows the settlement"
+        );
     }
 }

@@ -142,6 +142,17 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
         })
     }
 
+    fn remove_committed_pages(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        records: &mut [crate::kernel::syscall::vm_txn::PageRecord],
+    ) {
+        // ONE acquisition, the same body the broad adapter runs.
+        self.shared.with_vm_then_memory_split_mut(|spaces, memory| {
+            crate::kernel::syscall::vm::remove_committed_pages_locked(spaces, memory, asid, records)
+        });
+    }
+
     fn complete_shootdown(
         &mut self,
         asid: crate::kernel::vm::Asid,
@@ -203,6 +214,7 @@ impl crate::kernel::syscall::vm_txn::VmMapOwners for SplitVmOwners<'_> {
                     VmRollbackReason::PageTableUpdate => "pt_update",
                     VmRollbackReason::CapabilityMint => "cap_mint",
                     VmRollbackReason::JournalReserve => "journal_reserve",
+                    VmRollbackReason::InvalidationIncomplete => "invalidation_incomplete",
                 };
                 crate::yarm_log!(
                     "VM_MAP_SPLIT_ROLLBACK_OK reason={} released={} retained={}",

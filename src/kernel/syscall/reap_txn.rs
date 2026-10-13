@@ -80,8 +80,14 @@ pub(crate) struct ReapOutcome {
     /// correctly skipped.
     pub(crate) process_reaped: bool,
     pub(crate) address_spaces_destroyed: usize,
+    /// VM-INVALIDATION1 — address spaces NOT destroyed because some CPU may still have them
+    /// loaded: their page-table root, frames and ASID are retained (permanent quarantine).
+    pub(crate) address_spaces_quarantined: usize,
     pub(crate) transfer_envelopes_purged: usize,
     pub(crate) transfer_mappings_unmapped: usize,
+    /// VM-INVALIDATION1 — transfer-range unmaps whose invalidation was not acknowledged: the
+    /// PTEs are gone, the removed pages stay held (quarantined), and the record is cleared.
+    pub(crate) transfer_unmaps_incomplete: usize,
     pub(crate) delegation_links_removed: usize,
     pub(crate) cnode_space_removed: bool,
     pub(crate) process_record_removed: bool,
@@ -99,6 +105,12 @@ pub(crate) trait ReapOwners {
     /// wake-only APs, which hold no user translations and would otherwise leak the retired-ASID
     /// slot forever.
     fn shootdown_cpu_bitmap(&self) -> u64;
+    /// VM-INVALIDATION1 — every CPU on which `asid` may still be LOADED: a CPU whose current task
+    /// is bound to it, or whose last recorded address-space activation is it. "No task of the
+    /// space is current" does not prove a CPU has stopped using its page-table root: a CPU that
+    /// ran the space and went idle keeps it loaded, and on every port the kernel itself executes
+    /// through that root. Includes the requester's own CPU.
+    fn address_space_loaded_cpus(&self, asid: Asid) -> u64;
     /// Queue one fire-and-forget TLB shootdown. A full queue is silenced, exactly as at base: the
     /// ASID is already retired and cannot be reused until every CPU acknowledges it.
     fn submit_tlb_shootdown(&mut self, cpu: CpuId, asid: Asid);
@@ -165,8 +177,9 @@ pub(crate) trait ReapOwners {
     ) -> Result<DrainedBatch, KernelError>;
     /// Phase two: return the drained frames.
     fn reclaim_drained(&mut self, drained: DrainedBatch);
-    /// Two-phase unmap of one active transfer mapping's range.
-    fn unmap_transfer_range(&mut self, asid: Asid, base: usize, len: usize);
+    /// Two-phase unmap of one active transfer mapping's range. `false` when a removed page's
+    /// invalidation was not acknowledged (that page stays held).
+    fn unmap_transfer_range(&mut self, asid: Asid, base: usize, len: usize) -> bool;
 
     // ── rank 4 — capabilities ───────────────────────────────────────────────────────────────
     /// Snapshot every live delegation link's endpoints; returns how many.
@@ -227,8 +240,10 @@ pub(crate) fn run_reap_transaction<O: ReapOwners>(
         orphaned_senders_settled: 0,
         process_reaped: false,
         address_spaces_destroyed: 0,
+        address_spaces_quarantined: 0,
         transfer_envelopes_purged: 0,
         transfer_mappings_unmapped: 0,
+        transfer_unmaps_incomplete: 0,
         delegation_links_removed: 0,
         cnode_space_removed: false,
         process_record_removed: false,
@@ -296,8 +311,26 @@ fn reap_process_resources<O: ReapOwners>(owners: &mut O, pid: u64, outcome: &mut
     // shootdown work at rank 3, and only then reclaim the frames under vm(5)→memory(6) again.
     // Reclaiming before the shootdown is queued would be the one ordering that could hand a frame
     // back while a remote CPU still holds a translation for it.
+    //
+    // VM-INVALIDATION1 — the drain frees the space's page-table root and the reclaim its frames,
+    // so neither may run while any CPU still has the root LOADED. The residency proof in (1)
+    // shows no thread of the process is current anywhere; it does not show that the CPU which
+    // last ran one has loaded anything since. Such a space is quarantined instead: root, frames
+    // and ASID retained for the life of the kernel, which is the recorded fail-closed policy —
+    // nothing here waits for another CPU to switch away.
     let bitmap = owners.shootdown_cpu_bitmap();
     for asid in asids.into_iter().take(asid_n).flatten() {
+        let loaded = owners.address_space_loaded_cpus(asid);
+        if loaded != 0 {
+            crate::yarm_log!(
+                "VM_ASPACE_TEARDOWN_QUARANTINED pid={} asid={} loaded_cpus=0x{:x} reason=root_still_loaded",
+                pid,
+                asid.0,
+                loaded
+            );
+            outcome.address_spaces_quarantined += 1;
+            continue;
+        }
         let Ok(drained) = owners.drain_address_space(asid, bitmap) else {
             continue;
         };
@@ -346,8 +379,10 @@ fn reap_process_resources<O: ReapOwners>(owners: &mut O, pid: u64, outcome: &mut
         if owner_pid != pid && mapping.owner_tid.0 != pid {
             continue;
         }
-        if let Some(asid) = owners.task_asid(mapping.owner_tid.0) {
-            owners.unmap_transfer_range(asid, mapping.base.0 as usize, mapping.len);
+        if let Some(asid) = owners.task_asid(mapping.owner_tid.0)
+            && !owners.unmap_transfer_range(asid, mapping.base.0 as usize, mapping.len)
+        {
+            outcome.transfer_unmaps_incomplete += 1;
         }
         owners.clear_active_transfer_mapping(slot, mapping.len);
         outcome.transfer_mappings_unmapped += 1;
@@ -403,6 +438,9 @@ impl ReapOwners for BroadReapOwners<'_> {
         // translation for this ASID, and including it would leave the retired-ASID slot pending
         // forever.
         self.kernel.online_cpu_bitmap() & !self.kernel.wake_only_cpu_bitmap()
+    }
+    fn address_space_loaded_cpus(&self, asid: Asid) -> u64 {
+        self.kernel.address_space_loaded_cpus(asid)
     }
     fn submit_tlb_shootdown(&mut self, cpu: CpuId, asid: Asid) {
         let _ = self.kernel.submit_cross_cpu_work(
@@ -534,8 +572,8 @@ impl ReapOwners for BroadReapOwners<'_> {
             );
         });
     }
-    fn unmap_transfer_range(&mut self, asid: Asid, base: usize, len: usize) {
-        self.kernel.unmap_range_two_phase(asid, base, len);
+    fn unmap_transfer_range(&mut self, asid: Asid, base: usize, len: usize) -> bool {
+        self.kernel.unmap_range_two_phase(asid, base, len)
     }
 
     fn snapshot_delegation_links(&self, out: &mut [Option<DelegationEndpoints>]) -> usize {
@@ -572,6 +610,9 @@ impl ReapOwners for BroadReapOwners<'_> {
 /// existing `with_*_split_mut` seams, with the global `SpinLock<KernelState>` already released.
 pub(crate) struct SharedReapOwners<'a> {
     pub(crate) shared: &'a crate::runtime::SharedKernel,
+    /// VM-INVALIDATION1: the CPU the NR 31 trap entered on — the requester of every shootdown
+    /// this reap performs, never the ambient scheduler field.
+    pub(crate) cpu: CpuId,
 }
 
 impl ReapOwners for SharedReapOwners<'_> {
@@ -581,6 +622,9 @@ impl ReapOwners for SharedReapOwners<'_> {
     }
     fn shootdown_cpu_bitmap(&self) -> u64 {
         self.shared.reap_shootdown_cpu_bitmap_split()
+    }
+    fn address_space_loaded_cpus(&self, asid: Asid) -> u64 {
+        self.shared.address_space_loaded_cpus_split(asid)
     }
     fn submit_tlb_shootdown(&mut self, cpu: CpuId, asid: Asid) {
         self.shared.reap_submit_tlb_shootdown_split(cpu, asid);
@@ -723,8 +767,9 @@ impl ReapOwners for SharedReapOwners<'_> {
             );
         });
     }
-    fn unmap_transfer_range(&mut self, asid: Asid, base: usize, len: usize) {
-        self.shared.unmap_range_two_phase_split(asid, base, len);
+    fn unmap_transfer_range(&mut self, asid: Asid, base: usize, len: usize) -> bool {
+        self.shared
+            .unmap_range_two_phase_from_split(self.cpu, asid, base, len)
     }
 
     fn snapshot_delegation_links(&self, out: &mut [Option<DelegationEndpoints>]) -> usize {

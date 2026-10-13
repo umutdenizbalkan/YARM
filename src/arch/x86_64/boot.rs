@@ -1365,6 +1365,11 @@ pub fn enter_dispatched_user_task_if_available(
         let Ok(intended_cr3) = super::page_table::activate_asid(asid) else {
             return boot.publish();
         };
+        // VM-INVALIDATION1: record the first user activation on the BSP after the root load.
+        crate::arch::hal::note_address_space_activated(
+            crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID),
+            asid,
+        );
         let mut active_cr3: u64 = 0;
         unsafe {
             core::arch::asm!(

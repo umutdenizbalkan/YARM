@@ -489,6 +489,10 @@ impl Bootstrap {
         reserved_ranges: &[(u64, u64)],
     ) -> Result<(), KernelError> {
         crate::arch::boot_entry::bootstrap_step("enter");
+        // VM-INVALIDATION1: the per-CPU address-space activation record describes THIS boot's
+        // hardware state, which a teardown consults before freeing a page-table root. Nothing is
+        // activated before the state exists, so it starts empty.
+        crate::arch::hal::reset_all_active_address_spaces();
         // Register all reserved ranges in the global frame allocator guard and emit
         // PMEM_RESERVE_* diagnostics so boot logs show the full reserved map.
         crate::arch::boot_entry::bootstrap_step("reserved_ranges");

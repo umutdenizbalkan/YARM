@@ -1578,7 +1578,15 @@ impl crate::runtime::SharedKernel {
     ///
     /// Like the broad form, the per-page reclaim inside the unmap is a no-op here because
     /// `cap_refcount` is still 1: the caller drops it AFTER this returns.
-    fn revoke_active_transfer_mappings_for_cap_split(&self, owner_pid: u64, cap: CapId) -> bool {
+    ///
+    /// VM-INVALIDATION1: `requester` is the CPU executing the revocation, stated by the caller —
+    /// the one CPU the unmap's shootdown may exclude. It is never the ambient scheduler field.
+    fn revoke_active_transfer_mappings_for_cap_split(
+        &self,
+        requester: CpuId,
+        owner_pid: u64,
+        cap: CapId,
+    ) -> bool {
         let mut all_acked = true;
         for idx in 0..MAX_TRANSFER_ENVELOPES {
             // rank 3: one record.
@@ -1596,8 +1604,12 @@ impl crate::runtime::SharedKernel {
             // rank 2: the owner's address space — `None` skips the unmap, exactly as the broad
             // form's `if let Some(asid) = self.task_asid(..)` does.
             if let Some(asid) = self.task_asid_opt_split_read(mapping.owner_tid.0) {
-                all_acked &=
-                    self.unmap_range_two_phase_split(asid, mapping.base.0 as usize, mapping.len);
+                all_acked &= self.unmap_range_two_phase_from_split(
+                    requester,
+                    asid,
+                    mapping.base.0 as usize,
+                    mapping.len,
+                );
             }
             // rank 3: retire the record, then both telemetry counters (same subsystem, one seam
             // each — the broad form takes `with_ipc_state_mut` three times here too).
@@ -1658,12 +1670,13 @@ impl crate::runtime::SharedKernel {
     /// safer than one reissued under a translation a remote CPU may still hold.
     fn memory_obligations_split_gated(
         &self,
+        requester: CpuId,
         pid: u64,
         cap: CapId,
         object: CapObject,
         caller_quarantined: bool,
     ) {
-        let acked = self.revoke_active_transfer_mappings_for_cap_split(pid, cap);
+        let acked = self.revoke_active_transfer_mappings_for_cap_split(requester, pid, cap);
         self.with_memory_split_mut(|memory| {
             KernelState::adjust_memory_object_cap_refcount_locked(memory, object, -1)
         });
@@ -1680,8 +1693,8 @@ impl crate::runtime::SharedKernel {
         }
     }
 
-    fn memory_obligations_split(&self, pid: u64, cap: CapId, object: CapObject) {
-        let acked = self.revoke_active_transfer_mappings_for_cap_split(pid, cap);
+    fn memory_obligations_split(&self, requester: CpuId, pid: u64, cap: CapId, object: CapObject) {
+        let acked = self.revoke_active_transfer_mappings_for_cap_split(requester, pid, cap);
         self.with_memory_split_mut(|memory| {
             KernelState::adjust_memory_object_cap_refcount_locked(memory, object, -1)
         });
@@ -1749,11 +1762,13 @@ impl crate::runtime::SharedKernel {
     /// mutation, so a refused cap is left exactly as it was.
     pub(crate) fn revoke_capability_no_vm_split(
         &self,
+        requester: CpuId,
         receiver_tid: u64,
         cap: CapId,
     ) -> Result<CapObject, SplitRevokeRefusal> {
         let plan = self.plan_revoke_capability_no_vm_split(receiver_tid, cap)?;
         self.commit_revoke_split(
+            requester,
             plan.cnode,
             plan.root,
             plan.root_object,
@@ -1781,6 +1796,7 @@ impl crate::runtime::SharedKernel {
     /// between the preflight and the first mutation, at which point nothing has changed yet.
     fn commit_revoke_split(
         &self,
+        requester: CpuId,
         cnode: CNodeId,
         root: SplitRevokeNode,
         root_object: CapObject,
@@ -1803,16 +1819,20 @@ impl crate::runtime::SharedKernel {
             // The broad form revokes the descendant's transfer mappings whether or not its slot
             // still held a capability, and performs the memory obligations only when it did.
             if let Some(object) = object {
-                self.memory_obligations_split(descendant.pid, descendant.cap, object);
+                self.memory_obligations_split(requester, descendant.pid, descendant.cap, object);
                 self.destroy_notification_for_revoked_object_split(object);
             } else {
-                self.revoke_active_transfer_mappings_for_cap_split(descendant.pid, descendant.cap);
+                self.revoke_active_transfer_mappings_for_cap_split(
+                    requester,
+                    descendant.pid,
+                    descendant.cap,
+                );
             }
         }
         // (3) rank 4: delegation-link removal.
         self.clear_delegation_links_split(link_removals);
         // (4) the root's obligations (4) and (5), in the broad order: mappings, refcount, reclaim.
-        self.memory_obligations_split(root.pid, root.cap, root_object);
+        self.memory_obligations_split(requester, root.pid, root.cap, root_object);
         // (5) rank 3 then rank 2 → rank 1: the root's notification obligation.
         self.destroy_notification_for_revoked_object_split(root_object);
         Ok(root_object)
@@ -2000,6 +2020,7 @@ impl crate::runtime::SharedKernel {
     /// mutation.
     pub(crate) fn commit_user_held_capability_split(
         &self,
+        requester: CpuId,
         reservation: SplitRevokeReservation,
         backing_is_quarantined: bool,
     ) -> SplitRevokeCommitOutcome {
@@ -2022,6 +2043,7 @@ impl crate::runtime::SharedKernel {
                 .and_then(|cnode| self.cspace_read_then_revoke_split(cnode, descendant.cap));
             if let Some(object) = object {
                 self.memory_obligations_split_gated(
+                    requester,
                     descendant.pid,
                     descendant.cap,
                     object,
@@ -2029,7 +2051,11 @@ impl crate::runtime::SharedKernel {
                 );
                 self.destroy_notification_for_revoked_object_split(object);
             } else {
-                self.revoke_active_transfer_mappings_for_cap_split(descendant.pid, descendant.cap);
+                self.revoke_active_transfer_mappings_for_cap_split(
+                    requester,
+                    descendant.pid,
+                    descendant.cap,
+                );
             }
         }
         // (3) rank 4: link removal, by CONTENT rather than by index.
@@ -2046,6 +2072,7 @@ impl crate::runtime::SharedKernel {
         }
         // (4) the root's obligations, in the broad order: mappings, refcount, reclaim.
         self.memory_obligations_split_gated(
+            requester,
             reservation.root.pid,
             reservation.root.cap,
             reservation.root_object,
@@ -2077,10 +2104,13 @@ impl crate::runtime::SharedKernel {
     ///   marker, the same text the broad path emits when it cannot clear a slot.
     pub(crate) fn rollback_materialized_recv_cap_no_vm_split(
         &self,
+        requester: CpuId,
         receiver_tid: u64,
         materialized_cap: CapId,
     ) -> bool {
-        if let Err(refusal) = self.revoke_capability_no_vm_split(receiver_tid, materialized_cap) {
+        if let Err(refusal) =
+            self.revoke_capability_no_vm_split(requester, receiver_tid, materialized_cap)
+        {
             if refusal.is_capacity() {
                 crate::yarm_log!(
                     "CAP_CNODE_ROLLBACK_LEAK tid={} slot={} kind=transfer",

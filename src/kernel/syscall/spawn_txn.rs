@@ -2004,7 +2004,10 @@ impl SpawnTxnOwners for SharedSpawnOwners<'_> {
         &mut self,
         plan: &crate::kernel::boot::cow_clone::CowShootdownPlan,
     ) -> bool {
-        self.shared.complete_cow_write_protect_shootdown_split(plan)
+        // VM-INVALIDATION1: the CPU this fork's trap entered on is the requester — the one CPU
+        // the write-protection's shootdown may exclude.
+        self.shared
+            .complete_cow_write_protect_shootdown_split(self.cpu, plan)
     }
 
     fn rollback_cow_clone(&mut self, token: &CowCloneToken) -> CowCloneRollback {

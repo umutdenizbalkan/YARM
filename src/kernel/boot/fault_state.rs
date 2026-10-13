@@ -216,13 +216,21 @@ pub(crate) struct PageFaultFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CowRecovery {
     /// The private copy is mapped writable, the refcounts are transitioned, the stale translation
-    /// is retired, and the faulting task may resume at the same instruction.
+    /// is retired EVERYWHERE — every target acknowledged — and the faulting task may resume at the
+    /// same instruction.
     Committed {
         old_phys: crate::kernel::vm::PhysAddr,
         new_phys: crate::kernel::vm::PhysAddr,
-        /// Whether the old frame's shootdown was acknowledged by every target. `false` means the
-        /// old frame was deliberately left unreclaimed — never that the mapping is incomplete.
-        shootdown_acked: bool,
+    },
+    /// VM-INVALIDATION1 — post-mutation: the private copy IS mapped and accounted, but the
+    /// invalidation of the old read-only translation was not acknowledged by every CPU that may
+    /// cache it. The fault is NOT recovered: a thread on that CPU would keep reading the shared
+    /// page while the faulting thread writes its private copy. The old page's identity hold is
+    /// retained (quarantined) and nothing is rolled back — the translation that was replaced
+    /// cannot be proven to be the one a restore would put back.
+    FailedClosedInvalidation {
+        old_phys: crate::kernel::vm::PhysAddr,
+        new_phys: crate::kernel::vm::PhysAddr,
     },
     /// Pre-mutation: the faulting incarnation is no longer the one that was classified.
     RefusedIdentityChanged,
@@ -282,6 +290,7 @@ impl CowRecovery {
             Self::FailedClosedResolve(_) => "resolve_phys",
             Self::FailedClosedCopy(_) => "copy_frame",
             Self::FailedClosedRemap(_) => "remap",
+            Self::FailedClosedInvalidation { .. } => "invalidation_incomplete",
         }
     }
 
@@ -316,18 +325,28 @@ impl CowRecovery {
             Self::Committed { .. }
             | Self::FailedClosedResolve(_)
             | Self::FailedClosedCopy(_)
-            | Self::FailedClosedRemap(_) => return None,
+            | Self::FailedClosedRemap(_)
+            | Self::FailedClosedInvalidation { .. } => return None,
         })
     }
 
     /// The error a post-allocation failure carries. `None` for every outcome that is not one —
     /// a committed recovery has no error, and a pre-mutation refusal hands the fault to the broad
     /// arm, which produces its own.
+    ///
+    /// VM-INVALIDATION1: an incomplete invalidation carries `KernelError::WouldBlock`, the error
+    /// the fork transaction already returns when its write-protection shootdown cannot complete
+    /// (`fork_process_cow` step 5). It travels the fail-closed channel, which every architecture
+    /// entry turns into a decoded trap dump and a halt — no errno reaches the faulting task, and
+    /// the task never resumes through its frame.
     pub(crate) fn kernel_error(self) -> Option<crate::kernel::boot::KernelError> {
         match self {
             Self::FailedClosedResolve(e)
             | Self::FailedClosedCopy(e)
             | Self::FailedClosedRemap(e) => Some(e),
+            Self::FailedClosedInvalidation { .. } => {
+                Some(crate::kernel::boot::KernelError::WouldBlock)
+            }
             _ => None,
         }
     }

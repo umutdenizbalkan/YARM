@@ -154,7 +154,10 @@ pub(crate) fn ensure_user_return_cr3(
             );
             if ctx_mapped {
                 // Guarded force path: return-context mapping proven, safe to write.
-                crate::arch::x86_64::page_table::write_cr3_for_asid(task_asid);
+                if crate::arch::x86_64::page_table::write_cr3_for_asid(task_asid).is_some() {
+                    // VM-INVALIDATION1: record the activation after the root load.
+                    crate::arch::hal::note_address_space_activated(kernel.current_cpu(), task_asid);
+                }
             } else {
                 // Do not switch into a root that lacks the live kernel stack;
                 // that is the exact #PF Stage 140 caused. Leave hw CR3 as-is.
@@ -191,6 +194,7 @@ pub(crate) fn ensure_user_return_cr3(
 /// the diagnostic is unchanged, not approximated.
 pub(crate) fn ensure_user_return_cr3_split(
     shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
     tid: u64,
     task_asid: crate::kernel::vm::Asid,
 ) {
@@ -245,7 +249,10 @@ pub(crate) fn ensure_user_return_cr3_split(
             );
             if ctx_mapped {
                 // Guarded force path: return-context mapping proven, safe to write.
-                crate::arch::x86_64::page_table::write_cr3_for_asid(task_asid);
+                if crate::arch::x86_64::page_table::write_cr3_for_asid(task_asid).is_some() {
+                    // VM-INVALIDATION1: record the activation after the root load.
+                    crate::arch::hal::note_address_space_activated(cpu, task_asid);
+                }
             } else {
                 // Do not switch into a root that lacks the live kernel stack;
                 // that is the exact #PF Stage 140 caused. Leave hw CR3 as-is.
@@ -263,7 +270,7 @@ pub(crate) fn ensure_user_return_cr3_split(
         );
     }
     #[cfg(feature = "hosted-dev")]
-    let _ = (shared, tid, task_asid);
+    let _ = (shared, cpu, tid, task_asid);
 }
 
 /// U9-QA §4 — the x86_64 post-lock TERMINAL-IDLE landing.
@@ -454,7 +461,7 @@ pub(crate) fn x86_post_lock_resume_marked_incoming(
     // The old guards were `current_tid()` non-zero and the task having an ASID; both are
     // answered by the token, which is strictly more exact than re-reading `current`.
     if incoming != 0 {
-        ensure_user_return_cr3_split(shared, incoming, asid);
+        ensure_user_return_cr3_split(shared, cpu, incoming, asid);
     }
     Ok(())
 }
@@ -531,10 +538,28 @@ pub(crate) fn x86_apply_owner_revalidation_restore(
     if idx < MAX_CPUS {
         LAST_RESTORED_TLS_BASE[idx].store(tls, Ordering::Relaxed);
     }
+    // VM-INVALIDATION1 — the FLUSHING activation, before the pre-IRET check.
+    //
+    // This owner can select a task that was NOT current on this CPU a moment ago — a sender woken
+    // back onto this CPU's queue while the CPU sat idle — and return it to ring 3. An idle CPU
+    // keeps the last address space it ran loaded, and a CPU with no current task bound to a
+    // space is not a target of that space's shootdowns. So if this CPU last ran the same space,
+    // a translation that another CPU's unmap or replacement removed meanwhile can still be in its
+    // TLB: the pre-IRET check below finds `hw_cr3 == task_cr3` and writes nothing, and the task
+    // would resume through the stale entry.
+    //
+    // The activation primitive writes CR3 unconditionally with the no-flush bit clear, which
+    // invalidates every non-global translation tagged with the incoming PCID (all of them when
+    // PCIDE is off). That is the contract the target set relies on: a CPU that is not running a
+    // space holds nothing of it that can be used before such an activation. It is recorded after
+    // the load, like every activation.
     if tid != 0
         && let Some(task_asid) = snapshot.asid
     {
-        ensure_user_return_cr3_split(shared, tid, task_asid);
+        if crate::arch::hal_adapters::switch_address_space(task_asid) {
+            crate::arch::hal::note_address_space_activated(cpu, task_asid);
+        }
+        ensure_user_return_cr3_split(shared, cpu, tid, task_asid);
     }
 }
 

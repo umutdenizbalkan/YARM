@@ -37,13 +37,13 @@
 //! |---|---|---|
 //! | x86_64 | `invlpg` — this core only | yes: the 0xF1 coordinator |
 //! | AArch64 | `tlbi vaae1is` — inner-shareable **broadcast** | none; hardware did it |
-//! | RISC-V | `sfence.vma va, x0` — this hart only | yes, and it cannot be satisfied |
+//! | RISC-V | `sfence.vma va, x0` — this hart only | yes: the firmware's remote fence |
 //!
-//! [`remote_write_protect_work_is_owed`] states that, and it is why a RISC-V fork with a genuinely
-//! remote translation holder must fail closed rather than proceed: a stale writable entry that
-//! nothing can shoot down is a silently broken COW, which is strictly worse than a refused fork. In
-//! every shipped workload the target set is empty — the forking task is the only thread of its
-//! process — so the fast path is taken and nothing is skipped.
+//! [`remote_write_protect_work_is_owed`] states that. A remote half that cannot be completed —
+//! a target that never acknowledges, or a firmware fence that errs — refuses the fork rather than
+//! publishing a child under a stale writable entry: a silently broken COW is strictly worse than a
+//! refused fork. VM-INVALIDATION1: the requester the shootdown excludes is the CPU the fork's trap
+//! entered on, never the ambient scheduler field.
 //!
 //! # No frame is copied here
 //!

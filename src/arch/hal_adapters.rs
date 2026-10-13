@@ -8,8 +8,14 @@ pub type AdapterTrapContext = crate::arch::trap_entry::ArchTrapContext;
 pub type AdapterTrapEvent = crate::arch::trap::TrapEvent;
 const DEBUG_ASID_SWITCH: bool = false;
 
+/// Load `asid`'s page-table root on THIS CPU. Returns whether a root load actually happened.
+///
+/// VM-INVALIDATION1: callers record the activation (`hal::note_address_space_activated`) only on
+/// `true`, after the load. A refused switch leaves the previous root loaded, and recording the
+/// new one anyway would let a teardown believe this CPU had left a root it still uses.
 #[inline]
-pub fn switch_address_space(asid: Asid) {
+#[must_use = "an activation is recorded only when the root load happened"]
+pub fn switch_address_space(asid: Asid) -> bool {
     // RISC-V: defer enabling Sv39 paging. Writing the per-task `satp` here would
     // translate every subsequent kernel instruction fetch through a page table
     // that maps only user pages — not the kernel text or the S-mode trap vector
@@ -29,6 +35,7 @@ pub fn switch_address_space(asid: Asid) {
                 asid.0
             );
         }
+        false
     }
     #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
     {
@@ -72,9 +79,11 @@ pub fn switch_address_space(asid: Asid) {
                         target_root
                     );
                 }
+                true
             }
             Err(err) => {
                 crate::yarm_log!("ADDRESS_SPACE_SWITCH_FAIL asid={} err={:?}", asid.0, err);
+                false
             }
         }
     }
