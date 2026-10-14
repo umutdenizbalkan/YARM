@@ -502,13 +502,27 @@ fn device_window_layout() -> [u64; DEVICE_WINDOW_MAX_PAGES] {
     pages
 }
 
-/// The window VA that WOULD name `pa`, from the recorded page list alone.
+/// The address that WOULD name `pa`, from the recorded page list alone.
 ///
 /// This is a layout translation, not a readiness answer: it says where the window puts `pa`,
 /// never whether the active root actually maps it. Readiness is
 /// [`device_pa_reachable_under_satp`].
-pub fn device_window_va(pa: u64) -> Option<u64> {
-    crate::arch::device_window_rule::window_va_for(&device_window_layout(), DEVICE_WINDOW_BASE, pa)
+///
+/// AP-SCHED1 §3 — read against THIS hart's active translation
+/// ([`crate::arch::device_window_rule::window_address_under`]): an idle CPU runs Bare, where the
+/// window VA is unmapped and the registered page is reached at its physical address.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn device_window_address_under_active_satp(pa: u64) -> Option<u64> {
+    let satp: u64;
+    unsafe {
+        core::arch::asm!("csrr {0}, satp", out(reg) satp, options(nomem, nostack, preserves_flags));
+    }
+    crate::arch::device_window_rule::window_address_under(
+        satp,
+        &device_window_layout(),
+        DEVICE_WINDOW_BASE,
+        pa,
+    )
 }
 
 /// **The readiness rule** (`crate::arch::device_window_rule::device_pa_reachable`) over the

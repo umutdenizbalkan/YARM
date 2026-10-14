@@ -147,7 +147,10 @@ pub fn external_irq_eoi(irq_line: u16) {
     // QEMU-IRQ1 §2 — the controller is reached through the kernel-only device window, never at
     // its physical address, which no root maps. No window, no write: storing to the physical
     // address is exactly the supervisor store fault this refusal exists to avoid.
-    let Some(va) = super::page_table::device_window_va(complete_addr as u64) else {
+    // AP-SCHED1 §3: at the address the CURRENT translation gives it (the physical one on an idle
+    // CPU, which runs Bare).
+    let Some(va) = super::page_table::device_window_address_under_active_satp(complete_addr as u64)
+    else {
         return;
     };
     plic_write_complete(va as usize, irq_line);
@@ -222,11 +225,15 @@ pub(crate) fn read_claim_register_at(va: usize) -> u32 {
 /// the claim register. This is a translation, not a second readiness test: the claim this
 /// completion answers was read through the same window page a moment ago, and the window is never
 /// torn down. A missing translation therefore means no claim could have been read, and the write
-/// is refused with a marker rather than aimed at the unmapped physical address.
+/// is refused with a marker rather than aimed at an address nothing audited.
+///
+/// AP-SCHED1 §3 — the layout is read against the CURRENT translation, as the claim's walk was: an
+/// idle CPU runs Bare, where the window VA is unmapped and the register is at its physical address.
+/// Translating unconditionally to the window VA faulted a completion written from idle.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub(crate) fn write_claim_completion(context: PlicContext, source: u32) {
     let pa = claim_complete_register(context);
-    let Some(va) = super::page_table::device_window_va(pa as u64) else {
+    let Some(va) = super::page_table::device_window_address_under_active_satp(pa as u64) else {
         crate::yarm_log!(
             "IRQFINAL_RISCV_COMPLETION_UNTRANSLATABLE source={} context={} pa=0x{:x} written=0",
             source,

@@ -189667,16 +189667,18 @@ mod u9irq1_acknowledgement {
                 && RISCV_IRQ.contains("pub(crate) fn write_claim_completion("),
             "RISC-V's claim and completion must address the controller through one helper"
         );
-        // QEMU-IRQ1 §2 — the completion reaches the register through the device window's LAYOUT
-        // (`device_window_va`), never through a second readiness walk and never at the physical
-        // address no root maps.
+        // QEMU-IRQ1 §2 — the completion reaches the register through the device window's LAYOUT,
+        // never through a second readiness walk. AP-SCHED1 §3: the layout is read against the
+        // CURRENT translation (`device_window_address_under_active_satp`), which under an idle
+        // CPU's Bare translation is the registered page's physical address — never an address the
+        // window did not register.
         let complete_write = RISCV_IRQ
             .split("pub(crate) fn write_claim_completion(")
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the completion write");
         assert!(
-            complete_write.contains("device_window_va(")
+            complete_write.contains("device_window_address_under_active_satp(")
                 && !complete_write.contains("device_pa_reachable_under")
                 && !complete_write.contains("write_volatile(claim_complete_register("),
             "the completion is written through the window layout, not a second walk"

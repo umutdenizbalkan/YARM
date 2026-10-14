@@ -74,6 +74,19 @@ pub fn window_va_for(pages: &[u64], base: u64, pa: u64) -> Option<u64> {
         .map(|slot| base + (slot as u64) * PAGE_SIZE + (pa - page))
 }
 
+/// The address that reaches window page `pa` under the translation rooted at `satp` — a layout
+/// translation, never a readiness answer: its window VA under Sv39 and, since AP-SCHED1 §3, its own
+/// physical address under Bare translation (`satp` mode 0), the kernel's own space, where every
+/// address is physical. A page the window never registered has no address under either.
+///
+/// Both halves of a claim/complete pair address the controller through this rule, so a completion
+/// written from an idle CPU (Bare) or after a user root was loaded (Sv39) reaches the register the
+/// claim read, at the address the CURRENT translation gives it.
+pub fn window_address_under(satp: u64, pages: &[u64], base: u64, pa: u64) -> Option<u64> {
+    let va = window_va_for(pages, base, pa)?;
+    Some(if satp >> 60 == 0 { pa } else { va })
+}
+
 /// **The readiness rule.** The window VA for `[pa, pa + len)` iff the translation rooted at `satp`
 /// really maps it: a 4 KiB leaf that is VALID, READ and WRITE, carries neither USER nor EXECUTE,
 /// and names exactly `pa`'s page. The range must lie within one page.
@@ -101,16 +114,16 @@ pub fn device_pa_reachable(
     if (pa.checked_add(len - 1)?) & PAGE_MASK != page {
         return None;
     }
-    let va = window_va_for(pages, base, pa)?;
+    let addr = window_address_under(satp, pages, base, pa)?;
     if satp >> 60 == 0 {
-        return Some(pa);
+        return Some(addr);
     }
-    let leaf = walk_sv39_leaf(satp, va, read)?;
+    let leaf = walk_sv39_leaf(satp, addr, read)?;
     let want = PTE_VALID | PTE_READ | PTE_WRITE;
     if leaf & want != want || leaf & (PTE_USER | PTE_EXECUTE) != 0 || pte_addr(leaf) != page {
         return None;
     }
-    Some(va)
+    Some(addr)
 }
 
 /// Supervisor external interrupt cause code (`scause` low bits, with the interrupt bit set).
@@ -271,6 +284,25 @@ mod tests {
         huge.insert((ROOT, 255), leaf(PLIC_CTX & !0x3fff_ffff, LEAF));
         assert_eq!(
             device_pa_reachable(satp(ROOT), &PAGES, BASE, claim, 4, reader(&huge)),
+            None
+        );
+    }
+
+    /// AP-SCHED1 §3 — the completion's address follows the CURRENT translation: the window VA under
+    /// Sv39, the physical address under Bare; nothing for an unregistered page under either.
+    #[test]
+    fn the_window_address_follows_the_translation_mode() {
+        assert_eq!(
+            window_address_under(satp(ROOT), &PAGES, BASE, PLIC_CTX + 4),
+            Some(BASE + 4)
+        );
+        assert_eq!(
+            window_address_under(0, &PAGES, BASE, PLIC_CTX + 4),
+            Some(PLIC_CTX + 4)
+        );
+        assert_eq!(window_address_under(0, &PAGES, BASE, 0x2000_0000), None);
+        assert_eq!(
+            window_address_under(satp(ROOT), &PAGES, BASE, 0x2000_0000),
             None
         );
     }
