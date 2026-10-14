@@ -28919,3 +28919,143 @@ before every grading) requires:
   resulting `satp == 0` and an empty activation record), and only then is the child reaped, with
   its address space destroyed and none quarantined;
 * **progress** — P's end, no failure step, a complete dump.
+
+#### What QEMU cannot distinguish, and what covers it
+
+* *Ordering inside one CPU's trap.* A witness record carries a causal stamp, not a hardware
+  timestamp, so a live boot cannot show that `satp = 0` was written before the activation record
+  was released, or that the AP's deadline was programmed before its `STIE`. The ordering is
+  covered from source and image instead:
+  * `check-vm-invalidation-sequence.sh` requires `sfence.vma zero, zero` immediately after every
+    `csrw satp` in the image, `enter_bare_kernel_space`'s included;
+  * hosted guards pin three orders: the record is released after the switch in `leave_user_root`;
+    in the production admission, own timer, then IPI readiness, then admission; and
+    `riscv64_timer_admission_scope` pins deadline-before-`STIE` in `arm_secondary_timer`;
+  * `riscv64_timer_admission_scope` confines every `sie`/`sstatus` set to the boot arm, the AP's
+    own arm and the audited idle wait.
+* *Remote fences.* QEMU's TLB is coherent across vCPUs, so a missing remote fence cannot fail a
+  boot. That is VMI1's limit and stands unchanged.
+* *Real interrupt latency.* QEMU's timing is the host's. The witness checks causal attribution:
+  which IPI ended which idle wait. It never checks a deadline in wall time.
+* *No FP / flags state.* RISC-V has no flags register, and user `FS`/`VS` are forced Off
+  (`sanitize_user_sstatus`). "Preserved FP" is vacuous on this port, so the witness checks the 28
+  patterned integer registers instead.
+
+#### Final-candidate controls
+
+Each control is a scratch patch on the frozen candidate `a6ae6b0e`, booted by the unmodified witness
+script and grader in a fresh worktree. Every one was rejected:
+
+| Control | Patch | Verdict |
+|---|---|---|
+| missing AP readiness | CPU 1 never publishes itself as an IPI target | fail: no IPI taken at CPU 1's idle boundary; CPU 1 left idle by its backstop timer |
+| suppressed wake | the enqueue owners commit but never notify | fail: same, for every idle wake |
+| missing AP timer | CPU 1 programs a deadline but never sets `STIE` | fail: CPU 1's spinners are never preempted, so P never reaches its end (no verified dump after 300 s) |
+| omitted idle-root handoff | the idle/exit transition keeps the user root loaded and recorded | fail: forbidden `VM_ASPACE_TEARDOWN_QUARANTINED`; CPU 1 never left a churn child's root, and the reap quarantined it |
+| corrupted context | CPU 1 flips bit 8 of x20 in every context it restores | fail: spinner register corruption detected (x20) |
+
+### Qualification
+
+**Candidate frozen at `a6ae6b0e` (tree `e5b6305f`); base `0ee67284`.** Every gate ran once, in a
+fresh worktree. Each live run is bound to its commit, its features and the sha256 of what it booted.
+
+**Three earlier freezes were withdrawn.** Their results are kept and none was counted:
+
+* *`785e345d`:* six integration source guards still pinned the one-timer, no-release policy. They
+  were re-derived in `bfd54b9f`, not relaxed.
+* *`bfd54b9f`:* the warning comparison found five items this increment had left dead on some port.
+  `1c843a55` gates each to where it exists.
+* *`1c843a55`:* the RISC-V UART IRQ witness hit a real fault. An idle-origin PLIC completion
+  faulted under Bare translation (§3). It was fixed in `a6ae6b0e`.
+
+The results below are for `a6ae6b0e`:
+
+* *Hosted:*
+  * focused (`ap_sched1` and the re-derived guard modules): 216/216;
+  * full hosted suite: 6,109 passed, 2 ignored;
+  * integration: 308/308 in 32 suites;
+  * census guard: 17/17, and every textual production count identical to the base;
+  * `cargo fmt --check`: clean.
+* *Graders:* the apsched grader's self-test (21 cases) and the SRR grader's (27) pass.
+* *Images:* `check-vm-invalidation-sequence.sh` passes on every default kernel (x86_64 12 sites,
+  AArch64 8, RISC-V 8). The new RISC-V site is `enter_bare_kernel_space`.
+* *Warnings, against a fresh base build:*
+  * AArch64 and RISC-V default kernels: identical by name and location;
+  * x86_64: one fewer — the base's dead `ArchGateOff`, which no longer exists there;
+  * every witness-feature kernel: identical to its base build, except that the two x86_64 ones also
+    lose `ArchGateOff`;
+  * the new `riscv64-apsched-witness` kernel has exactly the default RISC-V kernel's warnings.
+* *Strict cores:* x86_64 (timer-contract-witness profile), AArch64 and RISC-V `-smp 1` passed.
+  RISC-V also passed at `-smp 2`, `-smp 3` and `-smp 4`, each logging
+  `RISCV_AP_SCHED_ADMITTED cpu=1 mode=production … timer=own ipi_ready=1 root=kernel` and
+  `released=0x2`. At `-smp 3` and `-smp 4`, CPUs 2 and 3 logged
+  `RISCV_AP_QUIESCENT … reason=outside_production_dispatch_set`.
+* *The production witness, a fixed sample of five boots:* three on an idle host, then two with four
+  busy loops on the host's four CPUs. Every boot was `result=ok`, with the same image
+  (`e677c7d0…`), initramfs `f0c35c57…`, pinned OpenSBI v1.3 `171a91cc…` and QEMU 8.2.2:
+
+  | Host | CPU 1 preempted | CPU 0 preempted | tick advance = CPU 0 IRQs | CPU 1 IRQs | idle wakes | IPC | churn |
+  |---|---|---|---|---|---|---|---|
+  | idle 1 | 7 | 4 | 53 = 53 | 63 | 5/5 by IPI | 6/6 | 6/6, 0 quarantined |
+  | idle 2 | 8 | 4 | 55 = 55 | 54 | 5/5 by IPI | 6/6 | 6/6, 0 quarantined |
+  | idle 3 | 8 | 5 | 62 = 62 | 69 | 5/5 by IPI | 6/6 | 6/6, 0 quarantined |
+  | loaded 1 | 9 | 4 | 43 = 43 | 74 | 5/5 by IPI | 6/6 | 6/6, 0 quarantined |
+  | loaded 2 | 10 | 5 | 73 = 73 | 74 | 5/5 by IPI | 6/6 | 6/6, 0 quarantined |
+
+  In every boot the global tick advanced by exactly CPU 0's interrupts while CPU 1 took as many or
+  more of its own: adding a CPU did not multiply timeout progression.
+* *The two repaired witnesses (§1), and the AArch64 overtaken witness beside them, in the same five
+  slots:*
+  * `qemu-riscv64-sr-replace-witness-smoke.sh`: 5/5 `result=ok` (`order=causal`);
+  * `qemu-x86_64-overtaken-witness-smoke.sh`: 5/5 `result=ok`;
+  * the AArch64 overtaken witness: 5/5 `result=ok`.
+* *SMP / lock:* `SMP1`, `SMP2`, `SMP3`, `LOCK1`, `LOCK2` and `LOCK3` — all `result=ok`.
+* *VM:* the VMI witness — `result=ok`.
+* *Context:* `CONTEXT1` on x86_64 and AArch64 — `result=ok`.
+* *IRQ:* the x86_64 and AArch64 UART IRQ witnesses — `result=ok`, 4 idle-origin and 4 user-origin
+  each.
+* *Teardown:*
+  * server-death on all three ports — `result=ok`;
+  * the RISC-V supervisor crash/restart reap chain — `result=ok`;
+  * exit-current-task on all three ports — `result=ok`.
+* *Shared region:* on each port, the NR 30 and ordinary-route cells at object offset 4096, the
+  lifetime cell and the direct cell — all `result=ok`, every direct cell `misplaced=0`.
+
+**One cell is red: `qemu-riscv64-uart-irq-witness-smoke.sh`.** The fault class it caught on
+`1c843a55` is fixed, and claims and completions are 8/8. What fails is the origin split, `idle=3
+user=5` against the required 4/4. One idle-mode byte landed after a deadline had already
+dispatched a task, so it arrived on user code. The driver injects on a quiet acknowledgement that
+leaves two tick periods before the next deadline. On every boot, base and candidate alike, a byte
+is claimed only at the first idle return after a timer tick, never mid-wait, in every boot
+measured. A byte that misses two
+such returns therefore lands on user code. Diagnostic boots, recorded alongside and never
+substituted:
+
+| Tree | Boots | `result=ok` | origin-split failures |
+|---|---|---|---|
+| base `0ee67284` | 7 | 5 | 2 |
+| candidate `a6ae6b0e` | 9 (qualification and diagnostics) | 7 | 2 |
+| candidate with the idle-root handoff reverted | 3 | 1 | 2 |
+| candidate with the base console | 3 | 0 | 3 |
+
+Every failure has the same signature, a byte three ticks late. The rate drifts with the host: the
+base was 4 of 4 in one interleaved series and 1 of 3 in a later one. This is a pre-existing
+timing-margin defect in that witness's idle window, which neither the root handoff nor the console
+lock causes. It is not repaired here.
+
+**Production-scheduled versus diagnostic.**
+
+* *Production:* RISC-V, logical CPUs 0 and 1, on QEMU virt with the pinned OpenSBI. User tasks are
+  scheduled there, including the kernel work of their syscalls, traps and timer settlements. Each
+  task's first placement fixes its home, and nothing migrates.
+* *Not scheduled anywhere:* independent kernel threads (§2).
+* *Quiescent:* RISC-V CPUs 2 and beyond — parked, wake-only, masked and reported.
+* *Diagnostic only:* the `yarm.ap_user_dispatch` knob paths — x86_64's AP dispatch, AArch64's and
+  RISC-V's pinned admission, and the SMP1/SMP2/SMP3 witnesses' fixed placements.
+* *Unchanged:* x86_64 and AArch64 schedule user tasks on the boot CPU only.
+
+**Not claimed.**
+
+* No migration, work stealing, larger topology, hardware bring-up, or driver, VFS or shared-I/O work.
+* No canonical stage is re-classified.
+* VMI1's quarantine and live-coverage limits stand.
