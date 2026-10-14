@@ -208,8 +208,10 @@ fn an_ipi_never_reaches_the_external_claim() {
     );
 }
 
-/// Secondary dispatch is default-off: the boot hart releases no secondary without the knob, and a
-/// parked secondary leaves its park only through that release.
+/// Secondary release is bounded: without the knob the boot hart releases only the production
+/// dispatch set (AP-SCHED1: logical CPU 1, admitted by the production path); the knob widens it to
+/// every trap-ready secondary for the diagnostic pinned path. Nothing outside the computed set is
+/// released, and a parked secondary leaves its park only through its own release bit.
 #[test]
 fn secondary_dispatch_is_behind_the_knob() {
     let rel = code(fn_body(
@@ -217,7 +219,25 @@ fn secondary_dispatch_is_behind_the_knob() {
         "pub fn release_secondaries_at_boot_borrow_end(trap_ready_cpus: u64) -> usize {",
     ));
     assert!(squash(&rel).starts_with(&squash(
-        "if !crate::kernel::boot::ap_user_dispatch_enabled() { return 0;"
+        "let diagnostic = crate::kernel::boot::ap_user_dispatch_enabled(); let released = release_set(trap_ready_cpus, diagnostic);"
+    )));
+    assert!(squash(&rel).contains(&squash("if released == 0 { return 0; }")));
+    let set = squash(&code(fn_body(
+        IPI,
+        "pub fn release_set(trap_ready_cpus: u64, diagnostic: bool) -> u64 {",
+    )));
+    assert!(set.contains(&squash(
+        "if diagnostic { secondaries } else { secondaries & PRODUCTION_DISPATCH_CPUS }"
+    )));
+    assert!(
+        squash(&code(IPI)).contains(&squash("pub const PRODUCTION_DISPATCH_CPUS: u64 = 1 << 1;"))
+    );
+    let take = squash(&code(fn_body(
+        IPI,
+        "pub fn take_park_release(cpu: CpuId) -> bool {",
+    )));
+    assert!(take.contains(&squash(
+        "RELEASED.load(Ordering::Acquire) & (1u64 << (cpu.0 as u64 & 63)) != 0"
     )));
     let boot = code(BOOT);
     let release = pos(
@@ -305,8 +325,9 @@ fn the_coexistence_refusal_counts_only_consumed_classes() {
     assert!(squash(&code(TASK)).contains(&format!("#[cfg({cfg})]pub(crate)recv_completion:")));
 }
 
-/// The witness is feature-gated, off by default, observes rather than performs, and its console
-/// line lock exists only in the witness build.
+/// The witness is feature-gated, off by default, and observes rather than performs. The console
+/// line lock is no longer witness-only: AP-SCHED1 admits a second CPU in production, so every
+/// RISC-V kernel build serializes whole lines through the one lock.
 #[test]
 fn the_witness_is_gated_and_observes() {
     assert!(ROOT_CARGO.contains("riscv64-smp3-witness = []"));
@@ -343,11 +364,14 @@ fn the_witness_is_gated_and_observes() {
     let console = squash(&code(CONSOLE));
     assert_eq!(console.matches("staticLINE:AtomicBool").count(), 1);
     let lock = pos(&console, "staticLINE:AtomicBool");
-    let gated = console[..lock].rfind("feature=\"riscv64-smp3-witness\"))]pubfnwrite_line");
-    assert!(
-        gated.is_some(),
-        "the line lock is compiled only into the witness build"
+    let writer = console[..lock].rfind(
+        "#[cfg(all(not(feature=\"hosted-dev\"),target_arch=\"riscv64\"))]pubfnwrite_line(msg:&str){",
     );
+    assert!(
+        writer.is_some_and(|w| lock - w < 200),
+        "the line lock sits in the one production RISC-V line writer"
+    );
+    assert!(!console.contains("riscv64-smp3-witness"));
     // Labelled synchronization only, at points where no lock is held.
     assert!(WITNESS_RS.contains("WITNESS SYNCHRONIZATION — labelled, not production behaviour."));
 }

@@ -168,7 +168,9 @@ fn live_enable_sequence_orders_deadline_stie_then_sie() {
     );
 }
 
-/// The CSR-set helpers may still be reached from EXACTLY TWO places, and both are bounded.
+/// The CSR-set helpers may be reached from EXACTLY THREE places, all bounded: the boot arm, the
+/// audited idle wait, and (AP-SCHED1) an admitted secondary's arm of its OWN timer — which sets
+/// only that hart's `sie.STIE`, after its own deadline, and never `sstatus.SIE`.
 #[test]
 fn csr_set_helpers_stay_confined_to_two_call_sites() {
     let csr_calls: Vec<_> = TIMER
@@ -198,6 +200,23 @@ fn csr_set_helpers_stay_confined_to_two_call_sites() {
     // one-shot request; the boundary itself sets no CSR. QEMU-SMP3: that wait is the per-CPU
     // `idle_wait_loop`; the fatal `halt_wait_loop` it falls into never unmasks.
     let wait = span("pub fn idle_wait_loop(cpu: usize)");
+    let ap_arm = span("pub fn arm_secondary_timer(cpu: usize) -> bool {");
+    let ap_body = &TIMER[ap_arm.0..ap_arm.1];
+    assert!(
+        ap_body.contains(
+            "if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize || cpu >= MAX_CPUS {"
+        ) && ap_body.contains("if !init_fired() || !stie_enabled() {"),
+        "the AP arm refuses the boot hart and any platform whose boot arm deferred"
+    );
+    let deadline = ap_body
+        .find("sbi_set_timer(deadline);")
+        .expect("AP deadline");
+    let stie = ap_body.find("set_sie_stie();").expect("AP STIE");
+    assert!(
+        deadline < stie,
+        "the AP's deadline is programmed before its STIE"
+    );
+    assert!(!ap_body.contains("sstatus"), "the AP arm never touches SIE");
     assert_eq!(
         TIMER.matches("set_sstatus_sie_in_wfi_loop();").count(),
         1,
@@ -206,9 +225,10 @@ fn csr_set_helpers_stay_confined_to_two_call_sites() {
     for (pos, _) in &csr_calls {
         let in_arm = *pos > arm.0 && *pos < arm.1;
         let in_wait = *pos > wait.0 && *pos < wait.1;
+        let in_ap_arm = *pos > ap_arm.0 && *pos < ap_arm.1;
         assert!(
-            in_arm || in_wait,
-            "a CSR-set helper is called outside the boot arm and the audited idle wait"
+            in_arm || in_wait || in_ap_arm,
+            "a CSR-set helper is called outside the boot arm, the AP's own arm and the audited idle wait"
         );
     }
     assert!(
@@ -269,7 +289,10 @@ fn plic_external_irq_remains_deferred() {
     assert!(!plic.contains("EXTIRQ_ENABLED_SOURCES.fetch_add"));
 }
 
-/// Timer ownership stays boot-hart-only and introduces no SMP scheduler coupling.
+/// Timer ownership introduces no SMP scheduler coupling. The BOOT arm stays boot-hart-only; since
+/// AP-SCHED1 an admitted secondary arms its own timer, and the single re-arm point re-arms only a
+/// CPU that armed its own (the boot hart through the boot arm's flag, any other through its
+/// per-CPU one) — a wake-only or diagnostic secondary arms nothing.
 #[test]
 fn timer_ownership_is_boot_hart_only() {
     for forbidden in [
@@ -287,8 +310,28 @@ fn timer_ownership_is_boot_hart_only() {
         "the arm must refuse on a non-boot hart"
     );
     let irq = include_str!("../src/arch/riscv64/irq.rs");
+    let rearm = irq
+        .split("pub fn program_timer_deadline(cpu: crate::kernel::scheduler::CpuId, ticks_from_now: u64) {")
+        .nth(1)
+        .expect("the re-arm point")
+        .split("\n}\n")
+        .next()
+        .expect("its body");
+    let boot = rearm
+        .find("if cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {")
+        .expect("the boot hart branch");
+    let boot_gate = rearm
+        .find("if !crate::arch::riscv64::timer::stie_enabled() {")
+        .expect("the boot arm's flag");
+    let own = rearm
+        .find("} else if !crate::arch::riscv64::timer::stie_enabled_on(cpu.0 as usize) {")
+        .expect("the per-CPU flag");
+    let rearm_at = rearm
+        .find("crate::arch::riscv64::timer::rearm_periodic_deadline();")
+        .expect("the re-arm");
     assert!(
-        irq.contains("if cpu.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {"),
-        "the single re-arm point must refuse any CPU other than the boot hart"
+        boot < boot_gate && boot_gate < own && own < rearm_at,
+        "the single re-arm point must refuse any CPU that did not arm its own timer"
     );
+    assert_eq!(irq.matches("rearm_periodic_deadline()").count(), 1);
 }

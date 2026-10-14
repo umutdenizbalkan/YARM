@@ -239,6 +239,10 @@ fn is_root(fn_name: &str, before: &str, tok: &str) -> bool {
     };
     bound("riscv_logical_cpu_for_trap_frame(")
         || bound("riscv_current_logical_cpu()")
+        // AP-SCHED1: the enqueue owners' notification derives the executing CPU from the stack
+        // it runs on — the same published trap-stack table `riscv_logical_cpu_for_trap_frame`
+        // reads, plus a released secondary's own boot stack before its first trap.
+        || bound("riscv_executing_cpu()")
         || (fn_name == "yarm_riscv64_secondary_boot"
             && before.contains(&format!(
                 "let {tok} = crate::kernel::scheduler::CpuId(cpu_id as u8);"

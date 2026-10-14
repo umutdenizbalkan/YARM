@@ -851,7 +851,9 @@ mod tests {
             .find("STIE_ENABLED_ON[cpu].store(true, Ordering::Release);")
             .expect("publish");
         assert!(deadline < enable && enable < publish);
-        assert!(!body.contains("csrs sstatus") && !body.contains("set_sstatus_sie"));
+        // The AP's own arm never touches the global interrupt enable: that stays with the audited
+        // idle wait.
+        assert!(!body.contains("sstatus"));
     }
 
     /// AP-SCHED1 — every idle arrival on an AP with its own timer parks it; the boot hart's does not.
