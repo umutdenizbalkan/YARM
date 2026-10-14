@@ -28775,8 +28775,16 @@ its production admission). The split exit calls it too, between `clear_current_e
 claim — the point after which a reaper can see the exit — so an exiting task's root is gone from
 its CPU before anything can reap it. The teardown/reactivation exclusion is unchanged: activation
 still records before loading, and VMI1's quarantine still holds a space whose invalidation is
-genuinely incomplete. Nothing is reclaimed on a timeout. Under Bare translation the device-window
-check (`device_pa_reachable`) answers by physical address for a registered window page.
+genuinely incomplete. Nothing is reclaimed on a timeout.
+
+Under Bare translation a registered device-window page is reached at its physical address; an
+unregistered address is still refused. One layout rule, `device_window_rule::window_address_under`,
+names that address: the window VA under Sv39, and the physical address under Bare. The readiness
+walk and both PLIC completion writers go through it, so the claim and the completion of one
+interrupt always agree on the current translation. A frozen candidate still sent the completion
+to the window VA unconditionally. The RISC-V UART IRQ witness caught it as a supervisor store
+fault on an idle-origin interrupt (see Qualification). Production builds install no window, so
+both writers refuse there before touching anything.
 
 **Evidence.**
 
