@@ -11,9 +11,12 @@
 #
 # One boot of QEMU virt (-smp 1, OpenSBI) built with `riscv-uart-irq-witness`. The host driver
 # (scripts/qemu-riscv64-uart-irq-driver.py) owns UART0's only serial backend — a UNIX socket, no
-# monitor, no multiplexing — and injects one byte per item only after the guest's READY line
-# (and, for idle items, after the kernel reports the hart idle). This script grades what the
-# boot log shows; it never retries.
+# monitor, no multiplexing — and injects one byte per item as soon as it reads the guest's READY
+# line. AP-SCHED2 §1: the kernel fixture's window gate decides WHEN that byte may raise its line —
+# only inside the item's window (odd items: the idle `wfi`; even items: a return into the
+# receiver's register-checked spin), because QEMU's delivery to a hart halted in `wfi` takes
+# anywhere from ~6 to ~70 ms and no host-side timing can aim at a window. This script grades
+# what the boot log shows; it never retries.
 #
 # Graded, each separately:
 #   * RECEIVER: init's own summary — 8 items received exactly once through NR 5 on the bound
@@ -24,10 +27,17 @@
 #     the source is enabled with the DTB id and S-context.
 #   * ACCOUNTING: claims == completions == drains-with-one-byte == deliveries == probes == 8,
 #     no NoPending/Unavailable claim, no foreign source, every drain leaves LSR.DR clear.
-#   * ORIGINS: 4 idle entries whose sepc lies in the kernel's idle wait, 4 user entries of which
-#     at least one lies inside the receiver's register-checked spin.
-#   * ORDER: every injection precedes the interrupt entry it produced; nothing is claimed after
-#     the source is disabled, while ticks and the supervisor loop continue.
+#   * WINDOWS (AP-SCHED2 §1), every item classified separately from independent evidence — the
+#     kernel's entry record (origin, sepc, interrupted TID, gate), the ELF symbol ranges and the
+#     gate record. Item s must be item s of the gate and of the entry. An odd item must be
+#     idle-origin with its sepc in the idle wait. An even item must be user-origin, interrupt
+#     the receiver with its sepc in the register-checked announce block, and the receiver must
+#     report the window held until the claim with every sentinel intact. That is 4 + 4 credited
+#     arrivals, with no retries.
+#   * GATE: exactly one opening per item, in order, each in its item's window; every claim taken
+#     with the gate open (gated=1, ungated_claims=0).
+#   * ORDER: injection -> gate opening -> interrupt entry, for every item; nothing is claimed
+#     after the source is disabled, while ticks and the supervisor loop continue.
 #   * ISOLATION: the child's load from the claim register's window VA took an unhandled page
 #     fault at exactly that address.
 #   * NOTHING FATAL: no unhandled S-mode trap, no handler failure, no panic, no unexpected resume.
@@ -98,15 +108,15 @@ done
   || die "window isolation facts missing"
 [[ $(count 'RISCV_EXTIRQ_CLAIM_READINESS context=1 addr=0xc201004 configured=1 reachable=1 reason=claimable') == 1 ]] \
   || die "claim readiness not derived reachable"
-[[ $(count 'RISCV_EXTIRQ_SMOKE_OK source=10 context=1 priority=1 threshold=0 enable_word=0x400 ier=0x1 seie=1') == 1 ]] \
-  || die "source not enabled as derived"
+[[ $(grep -a -c 'RISCV_EXTIRQ_SMOKE_OK source=10 context=1 priority=1 threshold=0 enable_word=0x400 ier=0x0 seie=1 .* gate=window' "$NORM") == 1 ]] \
+  || die "source not enabled (gated) as derived"
 [[ $(count 'IRQ1_WITNESS_PROVISION_OK init_tid=1 irq_line=10 ') == 1 ]] || die "route not provisioned"
 
 # ── ACCOUNTING ──────────────────────────────────────────────────────────────────────────────
 claims=$(count 'IRQFINAL_RISCV_CLAIMED cpu=0 source=10 context=1 ')
 reads=$(count 'RISCV_EXTIRQ_CLAIM_READ ')
 completes=$(count 'IRQ1_UART_COMPLETE n=')
-drains1=$(grep -a -c 'IRQ1_UART_DRAIN claim=[0-9]* source=10 context=1 bytes=1 .*lsr_dr_after=0 ' "$NORM")
+drains1=$(grep -a -c 'IRQ1_UART_DRAIN claim=[0-9]* source=10 context=1 bytes=1 .*lsr_dr_after=0 .* gated=1' "$NORM")
 drains=$(count 'IRQ1_UART_DRAIN claim=')
 delivered=$(count 'IRQ1_SPLIT_DELIVERY cpu=0 line=10 outcome=delivered')
 probes=$(count 'IRQ1_NOTIFICATION_PROBE_DELIVERED tid=1 notification=0 generation=1 label=10')
@@ -120,47 +130,69 @@ for v in nopend unavail foreign; do
   [[ "${!v}" == "0" ]] || die "$v=${!v}, expected 0"
 done
 
-# ── ORIGINS ─────────────────────────────────────────────────────────────────────────────────
-idle_n=$(count 'IRQ1_UART_IRQ_ENTRY origin=idle')
-user_n=$(count 'IRQ1_UART_IRQ_ENTRY origin=user')
-[[ "$idle_n" == "4" && "$user_n" == "4" ]] || die "origins idle=$idle_n user=$user_n, expected 4/4"
+# ── WINDOWS ─────────────────────────────────────────────────────────────────────────────────
 sym_range() { # elf symbol-substring -> "start end" (decimal)
   local addr size
   read -r addr size _ < <(nm -S -C "$1" 2>/dev/null | grep -F -- "$2" | head -1)
   [[ -n "${addr:-}" && -n "${size:-}" ]] || { echo "0 0"; return; }
   echo "$((16#$addr)) $((16#$addr + 16#$size))"
 }
-in_idle_wait=0; in_spin=0
-if [[ -f "$KELF_COPY" ]]; then
-  # QEMU-SMP3: the interruptible idle wait is `timer::idle_wait_loop` (it contains the stack-free
-  # SIE-set `wfi` loop); `halt_wait_loop` is now the masked fatal halt only and no idle arrival
-  # waits there — it is not even a separate symbol once inlined.
-  read -r ws we < <(sym_range "$KELF_COPY" "timer::idle_wait_loop")
-  (( we > ws )) || die "the idle wait symbol timer::idle_wait_loop is missing from the kernel ELF"
-  while read -r pc; do
-    (( pc >= ws && pc < we )) && in_idle_wait=$((in_idle_wait + 1))
-  done < <(grep -a 'IRQ1_UART_IRQ_ENTRY origin=idle' "$NORM" | sed 's/.*sepc=0x\([0-9a-f]*\).*/\1/' | while read -r h; do echo $((16#$h)); done)
-  [[ "$in_idle_wait" == "$idle_n" ]] || die "idle-origin sepc outside the idle wait ($in_idle_wait/$idle_n)"
-else
-  die "kernel ELF copy missing; cannot place idle sepc"
-fi
-if [[ -f "$UELF_COPY" ]]; then
-  # Either register-checked block: the READY announce+spin, or a later spin round.
-  read -r as ae < <(sym_range "$UELF_COPY" "uart_irq_witness::announce_ready_and_spin")
-  read -r ss se < <(sym_range "$UELF_COPY" "uart_irq_witness::spin_checking_registers")
-  while read -r pc; do
-    if (( (pc >= as && pc < ae) || (pc >= ss && pc < se) )); then in_spin=$((in_spin + 1)); fi
-  done < <(grep -a 'IRQ1_UART_IRQ_ENTRY origin=user' "$NORM" | sed 's/.*sepc=0x\([0-9a-f]*\).*/\1/' | while read -r h; do echo $((16#$h)); done)
-  (( in_spin >= 1 )) || die "no user-origin interrupt landed inside the register-checked spin"
-fi
+receiver=$(grep -a -m1 -o 'IRQ1_WITNESS_PROVISION_OK init_tid=[0-9]*' "$NORM" | sed 's/.*=//')
+[[ -n "$receiver" ]] || die "receiver TID not provisioned"
+ws=0; we=0; as=0; ae=0
+# QEMU-SMP3: the interruptible idle wait is `timer::idle_wait_loop` (it contains the stack-free
+# SIE-set `wfi` loop); `halt_wait_loop` is the masked fatal halt only.
+[[ -f "$KELF_COPY" ]] && read -r ws we < <(sym_range "$KELF_COPY" "timer::idle_wait_loop")
+(( we > ws )) || die "the idle wait symbol timer::idle_wait_loop is missing from the kernel ELF"
+[[ -f "$UELF_COPY" ]] && read -r as ae < <(sym_range "$UELF_COPY" "uart_irq_witness::announce_ready_and_spin")
+(( ae > as )) || die "the register-checked announce block is missing from the receiver ELF"
+idle_n=$(count 'IRQ1_UART_IRQ_ENTRY origin=idle')
+user_n=$(count 'IRQ1_UART_IRQ_ENTRY origin=user')
+idle_ok=0; user_ok=0
+for s in 1 2 3 4 5 6 7 8; do
+  e=$(grep -a 'IRQ1_UART_IRQ_ENTRY ' "$NORM" | sed -n "${s}p")
+  g=$(grep -a 'IRQ1_UART_GATE_OPEN ' "$NORM" | sed -n "${s}p")
+  origin=$(sed -n 's/.*origin=\([a-z]*\).*/\1/p' <<<"$e"); pc=$(sed -n 's/.*sepc=0x\([0-9a-f]*\).*/\1/p' <<<"$e")
+  tid=$(sed -n 's/.* tid=\([0-9]*\).*/\1/p' <<<"$e"); item=$(sed -n 's/.* item=\([0-9]*\).*/\1/p' <<<"$e")
+  gate=$(sed -n 's/.* gate=\([a-z]*\).*/\1/p' <<<"$e")
+  gitem=$(sed -n 's/.* item=\([0-9]*\).*/\1/p' <<<"$g"); gwin=$(sed -n 's/.* window=\([a-z]*\).*/\1/p' <<<"$g")
+  [[ -n "$pc" ]] || { die "item $s: no interrupt entry"; continue; }
+  pc=$((16#$pc))
+  if (( s % 2 == 1 )); then
+    if [[ "$origin" == idle && "$gate" == idle && "$item" == "$s" && "$gitem" == "$s" && "$gwin" == idle ]] \
+       && (( pc >= ws && pc < we )); then
+      idle_ok=$((idle_ok + 1))
+    else
+      die "item $s (idle): origin=$origin gate=$gate item=$item gate_item=$gitem window=$gwin sepc_in_idle_wait=$(( pc >= ws && pc < we ))"
+    fi
+  else
+    held=$(grep -a -c "IRQ1_UART_WINDOW seq=$s mode=user held=1 regs_mask=0x0" "$NORM")
+    if [[ "$origin" == user && "$gate" == user && "$tid" == "$receiver" && "$item" == "$s" && "$gitem" == "$s" \
+          && "$gwin" == user && "$held" == 1 ]] && (( pc >= as && pc < ae )); then
+      user_ok=$((user_ok + 1))
+    else
+      die "item $s (user): origin=$origin gate=$gate tid=$tid item=$item gate_item=$gitem window=$gwin held=$held sepc_in_block=$(( pc >= as && pc < ae ))"
+    fi
+  fi
+done
+[[ "$idle_ok" == 4 && "$user_ok" == 4 ]] || die "credited arrivals idle=$idle_ok user=$user_ok, expected 4/4"
+[[ "$idle_n" == 4 && "$user_n" == 4 ]] || die "origins idle=$idle_n user=$user_n, expected 4/4"
+in_idle_wait=$idle_ok; in_spin=$user_ok
+
+# ── GATE ────────────────────────────────────────────────────────────────────────────────────
+opens=$(count 'IRQ1_UART_GATE_OPEN ')
+[[ "$opens" == 8 ]] || die "gate openings=$opens, expected 8 (one per item)"
+[[ $(grep -a -c 'IRQ1_UART_TOTALS .* gate_opens=8 ungated_claims=0' "$NORM") == 1 ]] || die "gate totals: an ungated claim or a spare opening"
 
 # ── ORDER ───────────────────────────────────────────────────────────────────────────────────
 injects=$(grep -a -c '^#HOST_INJECT byte=0x4[1-8] .* seq=' "$NORM")
 [[ "$injects" == "8" ]] || die "expected 8 item injections (got $injects)"
 for s in 1 2 3 4 5 6 7 8; do
   inj=$(grep -a -n "^#HOST_INJECT .* seq=$s " "$NORM" | head -1 | cut -d: -f1)
+  gat=$(grep -a -n 'IRQ1_UART_GATE_OPEN ' "$NORM" | sed -n "${s}p" | cut -d: -f1)
   entry=$(grep -a -n 'IRQ1_UART_IRQ_ENTRY ' "$NORM" | sed -n "${s}p" | cut -d: -f1)
-  [[ -n "$inj" && -n "$entry" ]] && (( inj < entry )) || die "item $s: injection does not precede its interrupt"
+  [[ -n "$inj" && -n "$gat" && -n "$entry" ]] && (( inj < gat && gat < entry )) \
+    || die "item $s: not injection -> gate -> interrupt"
 done
 dis=$(line_of 'IRQ1_UART_SOURCE_DISABLED source=10 claims=8 data_claims=8 completions=8 bytes=8 enable_word_after=0x0 ier=0')
 if [[ -z "$dis" ]]; then
@@ -195,4 +227,4 @@ if (( fail )); then
   echo "UART_IRQ_WITNESS_SEAL result=fail"
   exit 1
 fi
-echo "UART_IRQ_WITNESS_SEAL items=8 claims=$claims completions=$completes deliveries=$delivered probes=$probes idle=$idle_n user=$user_n idle_in_wait=$in_idle_wait user_in_spin=$in_spin post_ticks=$post_ticks post_service=$post_service result=ok"
+echo "UART_IRQ_WITNESS_SEAL items=8 claims=$claims completions=$completes deliveries=$delivered probes=$probes idle=$idle_n user=$user_n idle_in_wait=$in_idle_wait user_in_spin=$in_spin gate_opens=$opens post_ticks=$post_ticks post_service=$post_service result=ok"

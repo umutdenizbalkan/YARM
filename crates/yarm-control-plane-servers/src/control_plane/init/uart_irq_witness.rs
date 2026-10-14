@@ -50,6 +50,13 @@ const IDLE_PARK_TICKS: u64 = 20;
 const MAX_IDLE_ROUNDS: u32 = 300;
 const MAX_USER_ROUNDS: u32 = 60_000;
 const SPIN_ITERS: u64 = 20_000;
+/// RISC-V (AP-SCHED2 §1): the user item's announce block holds its register-checked window open
+/// until the kernel publishes the item's claim, bounded by this many loop iterations (about five
+/// seconds under QEMU). The kernel fixture lets the item's byte raise its line only on a return
+/// into this receiver, so the claim lands inside the block. Exhausting the bound is a failure
+/// (`held=0`), never a retry.
+#[cfg(target_arch = "riscv64")]
+const HOLD_ITERS: u64 = 100_000_000;
 const POST_ROUNDS: u32 = 10;
 const POST_PARK_TICKS: u64 = 5;
 
@@ -514,8 +521,12 @@ impl core::fmt::Write for LineBuf {
 /// from inside the sentinel block puts that instruction — and the spin after it — under the
 /// register check, instead of in the log formatter. Returns the mask of registers that did not
 /// survive the syscall, the interrupt(s) and the spin.
+///
+/// RISC-V (AP-SCHED2 §1): the loop also ends as soon as the ring's claim word moves past its value
+/// before the READY, so the register-checked window is held exactly until this item is claimed.
+/// The second result is `true` when it ended that way (`false` everywhere else).
 #[inline(never)]
-fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
+fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> (u32, bool) {
     let mut line = LineBuf {
         buf: [0u8; 96],
         len: 0,
@@ -536,16 +547,26 @@ fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
         seed ^ 0x5555_5555,
     ];
     let (mut r0, mut r1, mut r2, mut r3, mut r4, mut r5) = (s[0], s[1], s[2], s[3], s[4], s[5]);
-    // SAFETY: `DebugLog` (a7 = 15, a0/a1 = the line) followed by a pure register loop. Every
-    // argument register is declared clobbered; the sentinels sit in registers the syscall ABI
-    // does not use.
+    #[allow(unused_mut)]
+    let mut held = false;
+    // SAFETY: `DebugLog` (a7 = 15, a0/a1 = the line) followed by a register loop whose only
+    // memory access is a load of the ring's claim word (USER read-only, mapped before this task
+    // ran). Every argument register is declared clobbered; the sentinels sit in registers the
+    // syscall ABI does not use.
+    #[cfg(target_arch = "riscv64")]
+    let claims_before = ring_word(W_CLAIMS) as usize;
+    #[cfg(target_arch = "riscv64")]
+    let mut left = iters;
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!(
             "ecall",
             "2:",
+            "lwu s7, 0(s5)",
+            "bne s7, s6, 3f",
             "addi s4, s4, -1",
             "bnez s4, 2b",
+            "3:",
             inlateout("a0") line.buf.as_ptr() as usize => _,
             inlateout("a1") line.len => _,
             inlateout("a2") 0usize => _,
@@ -553,7 +574,10 @@ fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
             inlateout("a4") 0usize => _,
             inlateout("a5") 0usize => _,
             in("a7") NR_DEBUG_LOG,
-            inout("s4") iters => _,
+            inout("s4") left,
+            in("s5") RING_VA + W_CLAIMS * 4,
+            in("s6") claims_before,
+            out("s7") _,
             inout("t3") r0,
             inout("t4") r1,
             inout("t5") r2,
@@ -562,6 +586,10 @@ fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
             inout("s3") r5,
             options(nostack),
         );
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        held = left != 0;
     }
     // SAFETY: `DebugLog` (x8 = 15, x0/x1 = the line) followed by a pure register loop; the
     // sentinels sit in x9..x14, d0/d1/d16/d17 and the count in x15, none of which the syscall ABI
@@ -667,7 +695,7 @@ fn announce_ready_and_spin(seq: u32, expect: u8, iters: u64, seed: u64) -> u32 {
         }
         mask |= (u32::from(x0 != xs[0]) << 16) | (u32::from(x1 != xs[1]) << 17);
     }
-    mask
+    (mask, held)
 }
 
 static ISO_CHILD_STARTED: AtomicU32 = AtomicU32::new(0);
@@ -791,7 +819,22 @@ pub(super) fn run_once() {
         } else {
             // Round 1 of a USER item: announce and spin under one register check.
             let seed = 0x5EED_0000_0000u64 | ((seq as u64) << 16);
-            bad_mask |= announce_ready_and_spin(seq, expect, SPIN_ITERS, seed);
+            #[cfg(target_arch = "riscv64")]
+            let iters = HOLD_ITERS;
+            #[cfg(not(target_arch = "riscv64"))]
+            let iters = SPIN_ITERS;
+            let (mask, held) = announce_ready_and_spin(seq, expect, iters, seed);
+            bad_mask |= mask;
+            // RISC-V: whether the register-checked window was held until this item's claim.
+            #[cfg(target_arch = "riscv64")]
+            yarm_user_rt::user_log!(
+                "IRQ1_UART_WINDOW seq={} mode=user held={} regs_mask=0x{:x}",
+                seq,
+                held as u8,
+                mask & 0xffff
+            );
+            #[cfg(not(target_arch = "riscv64"))]
+            let _ = held;
         }
         let got = loop {
             rounds += 1;

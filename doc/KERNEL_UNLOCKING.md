@@ -29059,3 +29059,82 @@ lock causes. It is not repaired here.
 * No migration, work stealing, larger topology, hardware bring-up, or driver, VFS or shared-I/O work.
 * No canonical stage is re-classified.
 * VMI1's quarantine and live-coverage limits stand.
+
+## APS2 — AP-SCHED2: production scheduling on every supported RISC-V hart
+
+AP-SCHED2 runs in two stages, each frozen, qualified and delivered on its own:
+
+1. repair the RISC-V UART IRQ witness — the prerequisite;
+2. generalize RISC-V production CPU admission from CPU 1 to every supported hart.
+
+### §1 — the RISC-V UART IRQ witness: a gate tied to the real window
+
+**The recorded failure.** AP-SCHED1 left this cell red: 8 correct claims and completions, but an
+origin split of 3 idle and 5 user against the required 4 and 4. It was pre-existing on the base.
+
+**Reproduced and traced on the true base `e9c8173c`.** A diagnostic copy of the host driver
+timestamped every line the guest emitted and every injection. Across three base boots:
+
+* *User-mode bytes* were claimed about 1 ms after injection, because the hart was executing.
+* *Idle-mode bytes* were claimed 6–70 ms after injection, with the hart halted in `wfi`, and
+  timer ticks kept arriving in between. So the byte had not yet reached the device: QEMU's
+  socket-to-UART path to a halted hart is slow and unbounded.
+* *Losses:* six of the twelve idle items landed on a task that a deadline had dispatched.
+* *Why the driver could not win:* it injected on a "quiet" idle tick that left two ticks before
+  the next deadline. No host-side timing can aim at that window.
+
+**A second, guest-side effect.** A readback added to the first version of the repair showed it.
+When an idle item's line was raised, `sip` showed STIP as well as SEIP. A timer whose deadline
+passed during the kernel's long, console-bound path to idle was already pending.
+
+* *QEMU's selection order:* without the AIA extension, QEMU takes the lowest-numbered pending
+  interrupt first, so STI (5) beats SEI (9).
+* *The consequence:* the timer was taken at the `wfi`, its handler dispatched a task, and the
+  byte landed on that task.
+* *Console cost:* each line of console output costs about a millisecond under TCG. So a timer
+  could also become pending *after* the gate was checked, if anything was printed before the
+  wait.
+
+**The repair — fixture synchronization, kept out of production scheduling.**
+
+* *The host* injects every item's byte as soon as it reads the READY line, for both modes
+  (RISC-V only; the AArch64 and x86_64 acknowledgements are unchanged).
+* *The kernel fixture* holds each byte in the device with `IER.ERBFI` clear (the source is
+  enabled gated, `ier=0x0 … gate=window`). It sets `ERBFI` only when all of these hold:
+  * the byte is present (`LSR.DR`);
+  * no timer or software interrupt is pending, so nothing QEMU would take first;
+  * the hart is in the item's window.
+* *The windows:*
+  * **idle items (odd)** — the window is recognised at the two quiet points (an idle arrival and
+    a still-idle timer return, each with nothing runnable). It is committed as the last step
+    before the hart re-enters `wfi`: after the halt marker, and just before the timer return's
+    `sret`.
+  * **user items (even)** — the gate opens as the last step before an `sret` into the receiver.
+    On RISC-V the receiver stays inside its register-checked announce block until the kernel
+    publishes the item's claim. The bound is about five seconds, and exhausting it reports
+    `held=0`, a failure.
+* *From there* the production entry owner claims, the fixture drains, the route delivers and
+  the completion owner completes, all unchanged. The drain closes the gate before the claim is
+  published or completed, so the line cannot reassert.
+* *Records:* each opening's record — item, window, TID, and `sip`, which shows SEIP alone — is
+  captured silently and printed by the claim's entry owner, so the window is not widened by
+  console output.
+
+**Grading — every item classified from independent evidence, no budget, no retries.**
+
+* *Inputs:* the kernel's entry record (origin, `sepc`, interrupted TID, gate), the ELF symbol
+  ranges, the gate record and the receiver's own report.
+* *Each item must land in its own window:*
+  * **odd items** — idle-origin, with `sepc` inside `timer::idle_wait_loop`;
+  * **even items** — user-origin, interrupting the receiver with `sepc` inside its
+    register-checked block (`announce_ready_and_spin`), with the window reported held and every
+    sentinel intact.
+* *Gate and order:* one gate opening per item, in order; every claim gated (`gated=1`,
+  `ungated_claims=0`); and injection → gate → entry for every item.
+* *Kept from before:*
+  * the byte sequence (`0x41…0x48`, each exactly once);
+  * exactly-once delivery and completion (claims, drains, deliveries, probes and completions all
+    8);
+  * the post-disable byte is never delivered;
+  * timer and service progress continue after the disable;
+  * isolation and nothing fatal.

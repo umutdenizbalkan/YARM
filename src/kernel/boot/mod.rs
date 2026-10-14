@@ -8723,7 +8723,7 @@ pub fn provision_init_uart_irq_witness(
         return None;
     }
     #[cfg(target_arch = "riscv64")]
-    crate::arch::riscv64::uart_irq_witness::set_ring_page(ring_pa, irq_line);
+    crate::arch::riscv64::uart_irq_witness::set_ring_page(ring_pa, irq_line, init_tid as u64);
     #[cfg(target_arch = "aarch64")]
     crate::arch::aarch64::pl011_irq_witness::set_ring_page(ring_pa, irq_line);
     #[cfg(target_arch = "x86_64")]

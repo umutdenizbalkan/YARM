@@ -1237,11 +1237,11 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             crate::arch::hal::leave_user_root(cpu);
             // QEMU-SMP3: per CPU — this CPU's own trap-stack top, latch and unmask request.
             crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
-            // QEMU-IRQ1 witness (BL4a): an idle ARRIVAL is the other quiet point the host driver
-            // can inject on — the one right after a deadline task re-blocks, mid-period
-            // (observation only; written only with nothing runnable).
+            // QEMU-IRQ1 witness (AP-SCHED2 §1): an idle ARRIVAL with nothing runnable is an IDLE
+            // window — the fixture's gate may let an idle item's byte raise its line here, so it
+            // lands on the `wfi` below (fixture synchronization only).
             #[cfg(feature = "riscv-uart-irq-witness")]
-            crate::arch::riscv64::uart_irq_witness::note_idle_quiet(shared, cpu);
+            crate::arch::riscv64::uart_irq_witness::gate_at_idle(shared, cpu);
             riscv_idle_halt(cpu, "kernel_idle_awaiting_io");
         }
         // Genuine internal trap-handling failure — NEVER idle, regardless of `current`.
@@ -1650,6 +1650,11 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // platform carries FS=Dirty inherited from OpenSBI. Restoring it verbatim — as this path
     // did until now — is precisely how a Dirty FS would escape back to U-mode.
     frame.sstatus = crate::arch::riscv64::user_status::sanitize_user_sstatus(frame.sstatus);
+    // QEMU-IRQ1 witness (AP-SCHED2 §1): a return into the receiver is a user item's window — the
+    // fixture's gate may let the item's byte raise its line now, so the interrupt is taken on the
+    // receiver's first U-mode instruction (fixture synchronization only).
+    #[cfg(feature = "riscv-uart-irq-witness")]
+    crate::arch::riscv64::uart_irq_witness::gate_at_user_return(resume_tid);
     let frame_resume: *const RiscvTrapFrame = frame;
     unsafe { yarm_riscv64_trap_return(frame_resume, canonical_top) }
 }
@@ -1988,15 +1993,19 @@ fn riscv_s_mode_idle_landing(
                     sources
                 ),
             }
-            // QEMU-IRQ1 witness (BL4a): the earliest pending deadline, for the host driver's
-            // idle acknowledgement (observation only).
+            // QEMU-IRQ1 witness (AP-SCHED2 §1): a still-idle TIMER return is the other IDLE
+            // window (fixture synchronization only).
             #[cfg(feature = "riscv-uart-irq-witness")]
             if matches!(trigger, SModeIdleTrigger::Timer { .. }) {
-                crate::arch::riscv64::uart_irq_witness::note_idle_quiet(shared, cpu);
+                crate::arch::riscv64::uart_irq_witness::gate_at_idle(shared, cpu);
             }
             // QEMU-SMP3 witness: back into the idle wait (observation only).
             #[cfg(feature = "riscv64-smp3-witness")]
             crate::arch::riscv64::smp3_witness::note_idle_reached(cpu.0 as usize);
+            // QEMU-IRQ1 witness (AP-SCHED2 §1): commit an armed idle gate as the LAST act before
+            // the `sret` into the `wfi` loop — nothing is printed after it.
+            #[cfg(feature = "riscv-uart-irq-witness")]
+            crate::arch::riscv64::uart_irq_witness::commit_idle_gate();
             unsafe {
                 yarm_riscv64_s_mode_timer_return(
                     frame as *const RiscvTrapFrame,
@@ -2081,6 +2090,10 @@ fn riscv_trap_halt(reason: &'static str) -> ! {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn riscv_idle_halt(cpu: crate::kernel::scheduler::CpuId, reason: &'static str) -> ! {
     early_marker!("RISCV_TRAP_HALTED reason={}", reason);
+    // QEMU-IRQ1 witness (AP-SCHED2 §1): commit an armed idle gate as the last act before the wait
+    // unmasks — after the marker, which is the slow part.
+    #[cfg(feature = "riscv-uart-irq-witness")]
+    crate::arch::riscv64::uart_irq_witness::commit_idle_gate();
     crate::arch::riscv64::timer::idle_wait_loop(cpu.0 as usize)
 }
 

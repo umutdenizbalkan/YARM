@@ -33,6 +33,29 @@
 //!
 //! Bytes are not interrupt counts. Drained bytes go to a ring page the receiver maps read-only;
 //! the receiver checks the DATA sequence there and the claim/completion accounting separately.
+//!
+//! # The window gate (AP-SCHED2 §1) — FIXTURE synchronization, not production behaviour
+//!
+//! Each item names the window its interrupt must land in: odd items the idle `wfi`, even items the
+//! receiver's register-checked user spin. The host cannot aim at either. QEMU delivers a socket
+//! byte to a hart halted in `wfi` anywhere from ~6 to ~70 ms after it was written, so the
+//! host's old "two quiet ticks" guess lost idle items to whatever task the next deadline
+//! dispatched. The gate ties the arrival to the real window instead.
+//!
+//! * The host injects each item's byte as soon as it reads the READY line.
+//! * The byte waits in the device with `IER.ERBFI` clear, so the line stays low.
+//! * The fixture sets `ERBFI` only when the byte is present (`LSR.DR`) AND the hart is in the
+//!   item's window:
+//!   * an idle item opens at the idle-quiet point, with nothing runnable and the hart about to
+//!     enter `wfi`;
+//!   * a user item opens on a trap return into the receiver, which stays inside its
+//!     register-checked block until the claim lands.
+//! * The level line then asserts inside that window, and the production entry owner claims,
+//!   drains, delivers and completes exactly as for any interrupt.
+//! * The drain closes the gate again before the completion is written, so nothing can reassert.
+//!
+//! The gate decides only WHEN the device may raise its line. It never touches the claim, the
+//! route, the delivery, the completion or the scheduler.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -41,6 +64,12 @@ use super::page_table;
 
 /// How many data-bearing items the witness exchanges before the source is turned off.
 pub const WITNESS_ITEMS: u32 = 8;
+
+/// The receiver's item protocol (`init/uart_irq_witness.rs`): item `n` (1-based) is an IDLE item
+/// when `n` is odd and a USER item when it is even. The gate opens each item only in that window.
+pub const fn item_is_idle(item: u32) -> bool {
+    item % 2 == 1
+}
 
 /// Upper bound on bytes drained for one claim. The exchange keeps one byte outstanding, so a
 /// drain that reaches this bound is itself a finding.
@@ -85,6 +114,26 @@ static UART_SOURCE: AtomicU32 = AtomicU32::new(0);
 static SOURCE_ENABLED: AtomicBool = AtomicBool::new(false);
 static SOURCE_DISABLED: AtomicBool = AtomicBool::new(false);
 static RING_PA: AtomicU64 = AtomicU64::new(0);
+/// The receiver task the user window belongs to (init's TID, from the provisioning).
+static RECEIVER_TID: AtomicU64 = AtomicU64::new(0);
+/// The window gate: `ERBFI` is set only while an item's window is open (see the module docs).
+static GATE_OPEN: AtomicBool = AtomicBool::new(false);
+/// The item and window the gate was last opened for (`1` idle, `2` user), for the claim's record.
+static GATE_ITEM: AtomicU32 = AtomicU32::new(0);
+static GATE_WINDOW: AtomicU32 = AtomicU32::new(0);
+static GATE_TID: AtomicU64 = AtomicU64::new(0);
+static GATE_OPENS: AtomicU32 = AtomicU32::new(0);
+/// `sip` at the instant the gate opened (published with the claim's record).
+static GATE_SIP: AtomicUsize = AtomicUsize::new(0);
+/// An idle window was recognised (nothing runnable, idle item next); the gate itself is committed
+/// at the last instruction-level step before the wait unmasks ([`commit_idle_gate`]).
+static IDLE_GATE_ARMED: AtomicBool = AtomicBool::new(false);
+/// Set once the opening's record has been printed for the current claim.
+static GATE_RECORDED: AtomicBool = AtomicBool::new(false);
+/// Claims of the witness source taken while the gate was closed. Always 0 in a healthy run.
+static UNGATED_CLAIMS: AtomicU32 = AtomicU32::new(0);
+const WINDOW_IDLE: u32 = 1;
+const WINDOW_USER: u32 = 2;
 
 static CLAIMS: AtomicU32 = AtomicU32::new(0);
 static DATA_CLAIMS: AtomicU32 = AtomicU32::new(0);
@@ -120,9 +169,10 @@ pub fn external_admission_armed() -> bool {
     SOURCE_ENABLED.load(Ordering::Acquire)
 }
 
-/// Record the ring page the provisioning allocated, and the line it bound. Called once, before
-/// the idle safe point.
-pub fn set_ring_page(pa: u64, bound_line: u16) {
+/// Record the ring page the provisioning allocated, the line it bound and the receiver it bound
+/// it to. Called once, before the idle safe point.
+pub fn set_ring_page(pa: u64, bound_line: u16, receiver_tid: u64) {
+    RECEIVER_TID.store(receiver_tid, Ordering::Release);
     RING_PA.store(pa, Ordering::Release);
     ring_store(RING_WORD_BOUND_LINE, bound_line as u32);
     ring_store(RING_WORD_MAGIC, RING_MAGIC);
@@ -326,7 +376,9 @@ pub fn enable_source_after_plic_ready(
     }
     let bit = 1u32 << (source % 32);
     write32(enable_va, read32(enable_va) | bit);
-    write8(ier_va, UART_IER_ERBFI);
+    // The device's receive interrupt stays GATED (`IER = 0`): each item's window sets `ERBFI`
+    // only once its byte is present (see the module docs).
+    write8(ier_va, 0);
     SOURCE_ENABLED.store(true, Ordering::Release);
     // ── CPU admission, last ────────────────────────────────────────────────────────────────────
     unsafe {
@@ -334,7 +386,7 @@ pub fn enable_source_after_plic_ready(
     }
     ring_store(RING_WORD_ARMED, 1);
     marker(format_args!(
-        "RISCV_EXTIRQ_SMOKE_OK source={} context={} priority={} threshold={} enable_word=0x{:x} ier=0x{:x} seie=1 stale_drained={} mode=witness",
+        "RISCV_EXTIRQ_SMOKE_OK source={} context={} priority={} threshold={} enable_word=0x{:x} ier=0x{:x} seie=1 stale_drained={} mode=witness gate=window",
         source,
         ctx.context_index,
         read32(prio_va),
@@ -350,45 +402,136 @@ pub fn enable_source_after_plic_ready(
     None
 }
 
-/// BL4a — the hart is entering, or returning to, its idle wait with nothing runnable: report the
-/// scheduler tick and the earliest IPC deadline still pending (observation only; a rank-1 and a
-/// rank-2 read, nothing held across either). Written from the two quiet points — an idle ARRIVAL
-/// and an idle tick's still-idle return — and only when the run queue is empty.
-///
-/// The host driver injects an idle-mode byte on this line, and only when no deadline is due before
-/// tick `now + 3`. The idle tick dispatches the task whose deadline it expires, so "nothing
-/// runnable now" alone does not keep the hart idle: on a single CPU a deadline is the only other
-/// wake source, and with none due before `now + 3` the hart stays in its wait for at least two full
-/// periods after the next tick — the slack the host's injection needs to land on the `wfi`.
-pub fn note_idle_quiet(
-    shared: &crate::runtime::SharedKernel,
-    cpu: crate::kernel::scheduler::CpuId,
-) {
-    if shared.runnable_count_on_cpu_split_read(cpu) != 0 {
+/// The next data item the receiver is waiting for (1-based).
+fn next_item() -> u32 {
+    DATA_CLAIMS.load(Ordering::Acquire) + 1
+}
+
+/// Open the gate for `item` in `window` iff the item's byte is already in the device. Setting
+/// `ERBFI` with `LSR.DR` set raises the level line at once, so the interrupt is pending before
+/// the caller leaves the window. With no byte yet it does nothing: the next window point asks
+/// again. Never after the source is off, and never twice for one claim.
+fn open_gate(item: u32, window: u32, tid: u64) {
+    if !SOURCE_ENABLED.load(Ordering::Acquire)
+        || SOURCE_DISABLED.load(Ordering::Acquire)
+        || GATE_OPEN.load(Ordering::Acquire)
+        || item > WITNESS_ITEMS
+    {
         return;
     }
-    let now = shared.scheduler_tick_now_split_read();
-    let next = shared.with_task_tcbs_split_mut(|tcbs| {
-        tcbs.iter()
-            .flatten()
-            .filter_map(|tcb| tcb.ipc_timeout_deadline)
-            .min()
-    });
-    match next {
-        Some(d) => marker(format_args!(
-            "IRQ1_UART_IDLE_QUIET now={} next_deadline={}",
-            now, d
-        )),
-        None => marker(format_args!(
-            "IRQ1_UART_IDLE_QUIET now={} next_deadline=none",
-            now
-        )),
+    let uart_pa = UART_PA.load(Ordering::Acquire);
+    let (Some(ier_va), Some(lsr_va)) = (
+        mmio_va(uart_pa + UART_IER, 1),
+        mmio_va(uart_pa + UART_LSR, 1),
+    ) else {
+        return;
+    };
+    if read8(lsr_va) & UART_LSR_DR == 0 {
+        return;
+    }
+    // Nothing the hart would take AHEAD of the external interrupt may be pending. Without the AIA
+    // extension QEMU takes the lowest-numbered pending interrupt first — STI (5) and SSI (1)
+    // before SEI (9) — and a timer whose deadline passed while the kernel was on its way here
+    // would be taken first, and its handler can dispatch a task the byte then lands on.
+    // Measured: every idle opening without this check showed `sip = STIP | SEIP`. The next window
+    // point asks again; the still-idle timer return reaches it with the timer just re-armed.
+    if pending_sip() & (SIP_STIP | SIP_SSIP) != 0 {
+        return;
+    }
+    GATE_ITEM.store(item, Ordering::Release);
+    GATE_WINDOW.store(window, Ordering::Release);
+    GATE_TID.store(tid, Ordering::Release);
+    GATE_RECORDED.store(false, Ordering::Release);
+    GATE_OPEN.store(true, Ordering::Release);
+    GATE_OPENS.fetch_add(1, Ordering::AcqRel);
+    write8(ier_va, UART_IER_ERBFI);
+    // Nothing is printed here: the caller is at its last step before the window's own trap, and
+    // console output is what lets a timer overtake the interrupt. The record (with `sip`, which
+    // should now show SEIP alone) is printed by the claim's entry owner.
+    GATE_SIP.store(pending_sip(), Ordering::Release);
+}
+
+/// Print the record of the current opening, once, ahead of its claim's entry record.
+fn record_gate_opening() {
+    if GATE_RECORDED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    marker(format_args!(
+        "IRQ1_UART_GATE_OPEN item={} window={} tid={} opens={} sip=0x{:x}",
+        GATE_ITEM.load(Ordering::Acquire),
+        if GATE_WINDOW.load(Ordering::Acquire) == WINDOW_IDLE {
+            "idle"
+        } else {
+            "user"
+        },
+        GATE_TID.load(Ordering::Acquire),
+        GATE_OPENS.load(Ordering::Acquire),
+        GATE_SIP.load(Ordering::Acquire)
+    ));
+}
+
+const SIP_SSIP: usize = 1 << 1;
+const SIP_STIP: usize = 1 << 5;
+
+/// This hart's pending supervisor interrupts.
+fn pending_sip() -> usize {
+    let sip: usize;
+    // SAFETY: a CSR read with no side effect.
+    unsafe { core::arch::asm!("csrr {0}, sip", out(reg) sip, options(nomem, nostack)) };
+    sip
+}
+
+/// Close the gate: `ERBFI` off, so the device cannot raise its line until the next window.
+fn close_gate() {
+    let uart_pa = UART_PA.load(Ordering::Acquire);
+    if let Some(ier_va) = mmio_va(uart_pa + UART_IER, 1) {
+        write8(ier_va, 0);
+    }
+    GATE_OPEN.store(false, Ordering::Release);
+}
+
+/// The IDLE window: the hart is arriving at, or returning to, its idle wait with nothing
+/// runnable. Called from the two quiet points (an idle arrival, and an idle tick's still-idle
+/// return). It only RECOGNISES the window; [`commit_idle_gate`] opens the gate at the last step
+/// before the wait, so the external interrupt is the one pending when the wait unmasks and it
+/// lands on the `wfi` itself.
+pub fn gate_at_idle(shared: &crate::runtime::SharedKernel, cpu: crate::kernel::scheduler::CpuId) {
+    let armed = shared.runnable_count_on_cpu_split_read(cpu) == 0 && item_is_idle(next_item());
+    IDLE_GATE_ARMED.store(armed, Ordering::Release);
+}
+
+/// Commit an armed idle window: the last step before the hart re-enters its `wfi` (just before
+/// the timer return's `sret`, or after the idle arrival's halt marker). Opening here leaves only
+/// a few instructions between the `sip` check and the unmask.
+pub fn commit_idle_gate() {
+    if IDLE_GATE_ARMED.swap(false, Ordering::AcqRel) {
+        open_gate(next_item(), WINDOW_IDLE, 0);
+    }
+}
+
+/// The USER window: the last step before `sret` into U-mode for `resume_tid`. Opens only for a
+/// user item and only into the receiver, which by then is inside its register-checked block: the
+/// item's byte can only be present after the receiver's READY, which it issues from inside that
+/// block, and it stays there until the claim lands. A pending, enabled S-mode external interrupt
+/// is taken before the first U-mode instruction, so `sepc` is the receiver's resume point in the
+/// block.
+pub fn gate_at_user_return(resume_tid: u64) {
+    let receiver = RECEIVER_TID.load(Ordering::Acquire);
+    if receiver == 0 || resume_tid != receiver {
+        return;
+    }
+    let item = next_item();
+    if !item_is_idle(item) {
+        open_gate(item, WINDOW_USER, resume_tid);
     }
 }
 
 /// Record where a claimed witness interrupt was taken from. Called by the entry owner, which
 /// alone knows the origin; the claim itself is not touched.
 pub fn note_claim_origin(idle: bool, sepc: usize, tid: u64) {
+    if GATE_OPEN.load(Ordering::Acquire) {
+        record_gate_opening();
+    }
     let n = if idle {
         let n = IDLE_ORIGIN.fetch_add(1, Ordering::AcqRel) + 1;
         ring_store(RING_WORD_IDLE_ORIGIN, n);
@@ -398,12 +541,19 @@ pub fn note_claim_origin(idle: bool, sepc: usize, tid: u64) {
         ring_store(RING_WORD_USER_ORIGIN, n);
         n
     };
+    let gated = GATE_OPEN.load(Ordering::Acquire);
     marker(format_args!(
-        "IRQ1_UART_IRQ_ENTRY origin={} n={} sepc=0x{:x} tid={}",
+        "IRQ1_UART_IRQ_ENTRY origin={} n={} sepc=0x{:x} tid={} item={} gate={}",
         if idle { "idle" } else { "user" },
         n,
         sepc,
-        tid
+        tid,
+        GATE_ITEM.load(Ordering::Acquire),
+        match (gated, GATE_WINDOW.load(Ordering::Acquire)) {
+            (false, _) => "closed",
+            (true, WINDOW_IDLE) => "idle",
+            (true, _) => "user",
+        }
     ));
 }
 
@@ -422,7 +572,10 @@ pub fn drain_before_delivery(source: u32, context_index: usize) {
         return;
     }
     let claim = CLAIMS.fetch_add(1, Ordering::AcqRel) + 1;
-    ring_store(RING_WORD_CLAIMS, claim);
+    let gated = GATE_OPEN.load(Ordering::Acquire);
+    if !gated {
+        UNGATED_CLAIMS.fetch_add(1, Ordering::AcqRel);
+    }
     let uart_pa = UART_PA.load(Ordering::Acquire);
     let (Some(rbr_va), Some(lsr_va)) = (
         mmio_va(uart_pa + UART_RBR, 1),
@@ -448,6 +601,12 @@ pub fn drain_before_delivery(source: u32, context_index: usize) {
         drained += 1;
     }
     let lsr_after = read8(lsr_va);
+    // The device is empty, so its line is already low; closing the gate keeps it low until the
+    // next item's window, before the completion re-arms the PLIC gateway.
+    close_gate();
+    // Published only now, after the drain: the receiver leaves its user window on this word, and
+    // must not do so before the claim's byte is in the ring.
+    ring_store(RING_WORD_CLAIMS, claim);
     if drained == 0 {
         let n = EMPTY_DRAINS.fetch_add(1, Ordering::AcqRel) + 1;
         ring_store(RING_WORD_EMPTY_DRAINS, n);
@@ -456,14 +615,15 @@ pub fn drain_before_delivery(source: u32, context_index: usize) {
         COMPLETION_OWED_FOR_DATA.store(true, Ordering::Release);
     }
     marker(format_args!(
-        "IRQ1_UART_DRAIN claim={} source={} context={} bytes={} first=0x{:02x} lsr_dr_after={} total_bytes={}",
+        "IRQ1_UART_DRAIN claim={} source={} context={} bytes={} first=0x{:02x} lsr_dr_after={} total_bytes={} gated={}",
         claim,
         source,
         context_index,
         drained,
         first,
         lsr_after & UART_LSR_DR,
-        BYTES.load(Ordering::Acquire)
+        BYTES.load(Ordering::Acquire),
+        gated as u8
     ));
 }
 
@@ -521,10 +681,12 @@ fn disable_source() {
         enable_after
     ));
     marker(format_args!(
-        "IRQ1_UART_TOTALS empty_drains={} idle_origin={} user_origin={} foreign_claims={}",
+        "IRQ1_UART_TOTALS empty_drains={} idle_origin={} user_origin={} foreign_claims={} gate_opens={} ungated_claims={}",
         EMPTY_DRAINS.load(Ordering::Acquire),
         IDLE_ORIGIN.load(Ordering::Acquire),
         USER_ORIGIN.load(Ordering::Acquire),
-        OTHER_SOURCE_CLAIMS.load(Ordering::Acquire)
+        OTHER_SOURCE_CLAIMS.load(Ordering::Acquire),
+        GATE_OPENS.load(Ordering::Acquire),
+        UNGATED_CLAIMS.load(Ordering::Acquire)
     ));
 }

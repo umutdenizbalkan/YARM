@@ -110,10 +110,16 @@ fn every_witness_entry_point_is_feature_gated() {
             "self.witness_notification_probe_into_frame(",
         ),
         ("provisioning", RV_BOOT, "provision_init_uart_irq_witness("),
+        ("idle window", RV_BOOT, "uart_irq_witness::gate_at_idle("),
         (
-            "idle quiet observation",
+            "idle gate commit",
             RV_BOOT,
-            "uart_irq_witness::note_idle_quiet(",
+            "uart_irq_witness::commit_idle_gate(",
+        ),
+        (
+            "user window",
+            RV_BOOT,
+            "uart_irq_witness::gate_at_user_return(",
         ),
     ] {
         let at = src
@@ -135,7 +141,8 @@ fn the_feature_off_bring_up_still_defers() {
     assert!(!RV_PLIC.contains("csrs sie") && !RV_PLIC.contains("sie, {"));
 }
 
-/// Enable order: mappings, readiness, route, controller, source, CPU admission.
+/// Enable order: mappings, readiness, route, controller, source, CPU admission. AP-SCHED2 §1: the
+/// device's receive interrupt is enabled GATED (`IER = 0`); each item's window raises it.
 #[test]
 fn the_enable_order_is_mappings_readiness_route_controller_source_cpu() {
     let enable = body_after(WITNESS, "pub fn enable_source_after_plic_ready(");
@@ -149,7 +156,8 @@ fn the_enable_order_is_mappings_readiness_route_controller_source_cpu() {
     let threshold = pos("write32(thresh_va, 0);");
     let priority = pos("write32(prio_va, 1);");
     let enable_bit = pos("write32(enable_va, read32(enable_va) | bit);");
-    let ier = pos("write8(ier_va, UART_IER_ERBFI);");
+    let ier = pos("write8(ier_va, 0);");
+    assert!(!enable.contains("write8(ier_va, UART_IER_ERBFI);"));
     let seie = pos("csrs sie, {0}");
     assert!(readiness < route && route < threshold && threshold < priority);
     assert!(priority < enable_bit && enable_bit < ier && ier < seie);
@@ -370,42 +378,96 @@ fn the_driver_uses_a_dedicated_backend_and_acknowledgements() {
     assert_eq!(DRIVER.matches("time.sleep(").count(), 1);
 }
 
-/// BL4a: the RISC-V idle acknowledgement is an idle tick that settled back to the `wfi` with
-/// nothing runnable AND no deadline due before tick `now + 3` — never the idle ENTRY line, and
-/// never "nothing runnable" alone: the idle tick's own queue advance dispatches the task whose
-/// deadline it expires, so a byte that lands after a deadline tick lands on that task.
+/// AP-SCHED2 §1: the RISC-V host injects every item on its READY line, and the kernel fixture's
+/// gate decides when the device may raise its line. The gate opens only inside the item's window:
+/// * the idle `wfi`, recognised at the two quiet points and committed at the last step before
+///   the wait;
+/// * a return into the receiver, as the last step before `sret`.
+///
+/// It opens only with the byte present and with no timer or software interrupt pending, since
+/// non-AIA QEMU takes the lowest-numbered interrupt first. It closes at the drain, before the
+/// claim is published or completed. The old guessed quiet-tick acknowledgement is gone.
 #[test]
-fn the_riscv_idle_acknowledgement_is_a_quiet_idle_tick() {
-    assert!(DRIVER.contains(
-        "IDLE_RE = re.compile(rb\"IRQ1_UART_IDLE_QUIET now=(\\d+) next_deadline=(\\d+|none)(?!\\S)\")"
-    ));
-    assert!(DRIVER.contains("return nxt == b\"none\" or int(nxt) >= now + 3"));
-    assert!(DRIVER.contains("idle_ack(idle_re, line)"));
-    let idle_re = DRIVER
-        .lines()
-        .find(|l| l.starts_with("IDLE_RE = "))
-        .expect("the RISC-V idle acknowledgement");
-    assert!(!idle_re.contains("RISCV_TRAP_HALTED"), "{idle_re}");
-    // The kernel side: written only on a still-idle TIMER return, from the witness module.
+fn the_riscv_window_gate_ties_each_arrival_to_its_window() {
+    // Driver: no RISC-V idle acknowledgement; both modes inject on READY.
+    assert!(!DRIVER.contains("IRQ1_UART_IDLE_QUIET"));
+    assert!(DRIVER.contains("idle_re, disabled_re = None, DISABLED_RE"));
+    assert!(DRIVER.contains("elif idle_re is None:\n                    inject(byte, f\"seq={seq} mode=idle ack=ready gate=kernel\")"));
     let boot = code(RV_BOOT);
-    // Two quiet points: the still-idle TIMER return and the idle arrival — nowhere else.
-    let call = "uart_irq_witness::note_idle_quiet(shared, cpu)";
+    // Idle window: recognised at the two quiet points only.
+    let call = "uart_irq_witness::gate_at_idle(shared, cpu)";
     assert_eq!(boot.matches(call).count(), 2);
     for (at, _) in boot.match_indices(call) {
         let before = &boot[at.saturating_sub(300)..at];
-        let after = &boot[at..(at + 200).min(boot.len())];
+        let after = &boot[at..(at + 300).min(boot.len())];
         assert!(
             before.contains("SModeIdleTrigger::Timer")
                 || after.contains("riscv_idle_halt(cpu, \"kernel_idle_awaiting_io\")"),
-            "the observation sits only at the two quiet points"
+            "the idle window is recognised only at the two quiet points"
         );
     }
-    assert!(witness_has_empty_queue_check());
-    let witness = include_str!("../src/arch/riscv64/uart_irq_witness.rs");
-    assert!(witness.contains("\"IRQ1_UART_IDLE_QUIET now={} next_deadline={}\""));
-    fn witness_has_empty_queue_check() -> bool {
-        include_str!("../src/arch/riscv64/uart_irq_witness.rs")
-            .contains("if shared.runnable_count_on_cpu_split_read(cpu) != 0 {\n        return;")
-    }
-    assert!(witness.contains("\"IRQ1_UART_IDLE_QUIET now={} next_deadline=none\""));
+    // ...and committed as the last step before the wait: after the halt marker, and right before
+    // the timer return's `sret`.
+    let idle = body_after(
+        RV_BOOT,
+        "fn riscv_idle_halt(cpu: crate::kernel::scheduler::CpuId, reason: &'static str) -> ! {",
+    );
+    let halted = idle.find("RISCV_TRAP_HALTED").expect("marker");
+    let commit = idle
+        .find("uart_irq_witness::commit_idle_gate()")
+        .expect("commit");
+    let wait = idle
+        .find("timer::idle_wait_loop(cpu.0 as usize)")
+        .expect("wait");
+    assert!(halted < commit && commit < wait);
+    let commits: Vec<_> = boot
+        .match_indices("uart_irq_witness::commit_idle_gate()")
+        .collect();
+    assert_eq!(commits.len(), 2);
+    assert!(
+        commits.iter().any(|(at, _)| boot[*at..]
+            .find("yarm_riscv64_s_mode_timer_return(")
+            .is_some_and(|ret| ret < 400)),
+        "the timer-return commit is the last step before its sret"
+    );
+    // User window: the last step before the U-mode `sret`, for the resuming task only.
+    let user = boot
+        .find("uart_irq_witness::gate_at_user_return(resume_tid)")
+        .expect("user gate");
+    let trap_return = boot[user..]
+        .find("yarm_riscv64_trap_return(frame_resume, canonical_top)")
+        .expect("trap return");
+    assert!(trap_return < 300);
+    // The gate itself: byte present, nothing ranked ahead pending, closed at the drain before the
+    // claim word is published.
+    let w = code(WITNESS);
+    let open = body_after(&w, "fn open_gate(item: u32, window: u32, tid: u64) {");
+    let dr = open
+        .find("if read8(lsr_va) & UART_LSR_DR == 0 {")
+        .expect("byte present");
+    let sip = open
+        .find("if pending_sip() & (SIP_STIP | SIP_SSIP) != 0 {")
+        .expect("nothing ahead");
+    let raise = open.find("write8(ier_va, UART_IER_ERBFI);").expect("raise");
+    assert!(dr < sip && sip < raise);
+    assert!(open.contains("SOURCE_DISABLED.load(Ordering::Acquire)"));
+    let user_gate = body_after(&w, "pub fn gate_at_user_return(resume_tid: u64) {");
+    assert!(user_gate.contains("resume_tid != receiver"));
+    assert!(user_gate.contains("if !item_is_idle(item) {"));
+    let drain = body_after(
+        &w,
+        "pub fn drain_before_delivery(source: u32, context_index: usize) {",
+    );
+    let close = drain.find("close_gate();").expect("close");
+    let publish = drain
+        .find("ring_store(RING_WORD_CLAIMS, claim);")
+        .expect("publish");
+    assert!(close < publish);
+    // The receiver's item protocol and the fixture's agree: odd items are idle.
+    assert!(w.contains("pub const fn item_is_idle(item: u32) -> bool {\n    item % 2 == 1\n}"));
+    let receiver = include_str!(
+        "../crates/yarm-control-plane-servers/src/control_plane/init/uart_irq_witness.rs"
+    );
+    assert!(receiver.contains("let idle = seq % 2 == 1;"));
+    assert!(receiver.contains("\"lwu s7, 0(s5)\""));
 }

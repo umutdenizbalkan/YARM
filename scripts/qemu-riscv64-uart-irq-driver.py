@@ -13,17 +13,17 @@ driver is connected and reading.
 
 Synchronisation is by the guest's own acknowledgements, never by sleeping:
 
-* `IRQ1_UART_READY seq=N mode=user` -> inject byte `0x40+N` at once: the receiver is spinning in
-  U-mode, so the interrupt lands on user code.
-* `IRQ1_UART_READY seq=N mode=idle` -> wait until the kernel reports the hart idle AFTER that line
-  and staying idle, then inject `0x40+N`, so the interrupt lands on the idle `wfi`. The
-  acknowledgement is `IRQ1_UART_IDLE_QUIET now=T next_deadline=D`, written when an idle tick settled
-  back to the `wfi` with nothing runnable, and accepted only when no deadline is due before tick
-  `T+3` (`D >= T+3`, or `none`): two full periods of quiet after the next tick. One period was
-  measured too short — one of 16 idle-mode bytes arrived 10-20 ms after injection. Since BL4a the idle tick dispatches the task whose deadline it
-  expires, so neither the idle ENTRY line nor "nothing runnable now" keeps the hart idle: a byte
-  injected then can land on that task when the very next tick is a deadline (one of the core
-  supervisors waits in one- to three-tick receives) and the injection lands after it.
+* RISC-V (AP-SCHED2 §1): `IRQ1_UART_READY seq=N mode=…` -> inject byte `0x40+N` at once, for BOTH
+  modes. The host cannot aim at a window: QEMU delivers a socket byte to a hart halted in `wfi`
+  anywhere from ~6 to ~70 ms after it is written. So the kernel fixture holds the byte in the
+  device with its receive interrupt gated, and lets the line rise only inside the item's window:
+  the idle `wfi` for odd items, a return into the receiver's register-checked spin for even ones.
+  The old acknowledgement (inject on a quiet idle tick with two ticks of slack before the next
+  deadline) lost idle items to whatever task that deadline dispatched whenever the delivery took
+  longer.
+* AArch64 / x86_64: `IRQ1_UART_READY seq=N mode=user` -> inject at once (the receiver is spinning
+  in user mode). `mode=idle` -> wait for the port's idle acknowledgement after that line, then
+  inject.
 * `IRQ1_UART_POSTDISABLE_READY` (after `IRQ1_UART_SOURCE_DISABLED`) -> inject one more byte, `Z`,
   which a disabled source must NOT deliver.
 
@@ -62,7 +62,6 @@ import tempfile
 import time
 
 READY_RE = re.compile(rb"IRQ1_UART_READY seq=(\d+) mode=(idle|user) expect=0x([0-9a-f]{2})")
-IDLE_RE = re.compile(rb"IRQ1_UART_IDLE_QUIET now=(\d+) next_deadline=(\d+|none)(?!\S)")
 IDLE_RE_AARCH64 = re.compile(rb"TIMER_IDLE_ADVANCE_SETTLED cpu=0 incoming=none reason=idle settlement=kernel_idle")
 DISABLED_RE_AARCH64 = re.compile(rb"IRQ2_PL011_SOURCE_DISABLED ")
 DISABLED_RE_X86_64 = re.compile(rb"IRQ3_UART_SOURCE_DISABLED ")
@@ -74,15 +73,8 @@ POST_BYTE = ord("Z")
 
 
 def idle_ack(idle_re, line: bytes) -> bool:
-    """Whether `line` is the port's idle acknowledgement. On RISC-V it must also leave two full
-    periods of quiet: no deadline due before tick `now + 3`."""
-    m = idle_re.search(line)
-    if not m:
-        return False
-    if idle_re is not IDLE_RE:
-        return True
-    now, nxt = int(m.group(1)), m.group(2)
-    return nxt == b"none" or int(nxt) >= now + 3
+    """Whether `line` is the port's idle acknowledgement (AArch64 / x86_64 only)."""
+    return idle_re.search(line) is not None
 
 
 def main() -> int:
@@ -121,7 +113,8 @@ def main() -> int:
                "-kernel", args.kernel, "-initrd", args.initrd,
                "-append", args.cmdline or "console=ttyS0 rdinit=/init"]
     else:
-        idle_re, disabled_re = IDLE_RE, DISABLED_RE
+        # RISC-V: no idle acknowledgement — the kernel fixture gates the window.
+        idle_re, disabled_re = None, DISABLED_RE
         cmd = [args.qemu or "qemu-system-riscv64", "-machine", "virt", "-cpu", "rv64",
                "-m", "512M", "-smp", "1", *serial,
                "-bios", "default", "-kernel", args.kernel, "-initrd", args.initrd,
@@ -205,10 +198,12 @@ def main() -> int:
                 injected[seq] = byte
                 if mode == b"user":
                     inject(byte, f"seq={seq} mode=user ack=ready")
+                elif idle_re is None:
+                    inject(byte, f"seq={seq} mode=idle ack=ready gate=kernel")
                 else:
                     pending_idle = (seq, byte)
                 continue
-            if pending_idle is not None and idle_ack(idle_re, line):
+            if pending_idle is not None and idle_re is not None and idle_ack(idle_re, line):
                 seq, byte = pending_idle
                 pending_idle = None
                 inject(byte, f"seq={seq} mode=idle ack=ready+idle")
