@@ -619,6 +619,10 @@ pub(crate) struct SchedulerState {
 pub(crate) const CLOCK_OWNER_CPU: CpuId = CpuId(platform_constants::BOOTSTRAP_CPU_ID);
 
 impl SchedulerState {
+    // Read only by `would_preempt_next_on`, whose callers (the timer route's lookahead,
+    // `timer_would_preempt_split_read` / `scheduler_tick_if_no_switch_split_mut`) no freestanding
+    // build reaches yet; those callers keep their own dead-code report, as on the base.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn quantum_of(&self, cpu: CpuId) -> &Timer {
         match self.ap_quanta.get(cpu.0 as usize) {
             Some(q) if cpu != CLOCK_OWNER_CPU => q,
@@ -646,6 +650,7 @@ impl SchedulerState {
     }
 
     /// Would `cpu`'s NEXT timer interrupt expire its quantum? See [`Timer::would_preempt_next`].
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn would_preempt_next_on(&self, cpu: CpuId) -> bool {
         self.quantum_of(cpu).would_preempt_next()
     }

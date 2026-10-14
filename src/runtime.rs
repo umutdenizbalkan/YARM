@@ -740,7 +740,10 @@ impl DispatchAuthority {
 pub(crate) enum TerminalRouteTopology {
     /// The drain's selection authenticates against the ambient `sched.current_cpu`, so the route
     /// must prove that binding is this CPU AND that no second dispatcher can rebind it in the
-    /// window. This is the delivered condition and every unmigrated family keeps it.
+    /// window. This was the delivered condition; AP-SCHED1 §4 migrated its last production family
+    /// (the exit route), so it now exists only as the reference the admission tests compare
+    /// against, and a production build cannot construct it.
+    #[cfg(test)]
     AmbientBound,
     /// The drain's selection authenticates against the trap's own [`DispatchAuthority`], so the
     /// route needs a drainer and nothing more.

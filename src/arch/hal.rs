@@ -94,7 +94,9 @@ pub(crate) fn address_space_loaded_bitmap(asid: Asid) -> u64 {
 ///
 /// The record is never cleared on its own: clearing it while a user root is still loaded would
 /// let a teardown free a root this CPU still translates through. [`leave_user_root`] is the one
-/// caller, and it clears only behind the hardware change.
+/// caller, and it clears only behind the hardware change — on the configurations that transition
+/// (RISC-V and the hosted model); x86_64 and AArch64 never release, so it does not exist there.
+#[cfg(any(feature = "hosted-dev", target_arch = "riscv64"))]
 fn note_user_root_released(cpu: CpuId) {
     let idx = cpu.0 as usize;
     if idx < crate::kernel::scheduler::MAX_CPUS {

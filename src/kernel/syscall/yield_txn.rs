@@ -76,6 +76,10 @@
 //! the broad lock by `settle_declined_yield`'s queue-advance arm. Without the knob no AP ever
 //! enters user mode, and the statement above is the whole story.
 //!
+//! AP-SCHED1 §4 correction: the gate is now AArch64's alone, so `ArchGateOff` exists only on
+//! AArch64 (and in tests). RISC-V CPU 1 runs user tasks in production and its NR 0 is admitted;
+//! x86_64's D6 arm had already been removed (U9-D6-FINAL §3).
+//!
 //! ## U9-TIMER-FINAL §1 CORRECTION — `MultiDispatcher` and `NotDispatchCpu` are no longer live
 //!
 //! The paragraph above used to name `RouteNotAdmitted::MultiDispatcher` as a second reachable
@@ -93,8 +97,9 @@
 //! conclusion by calling `terminal_route_admission_authority_bound` directly, which contains
 //! neither check.
 //!
-//! Both variants therefore remain in `TerminalAdmissionRefusal` — `AmbientBound` families still
-//! produce them — while being **unreachable from this transaction**, and so from every route that
+//! Both variants therefore remain in `TerminalAdmissionRefusal` — the `AmbientBound` topology,
+//! which since AP-SCHED1 §4 no production family declares and only tests construct, still
+//! produces them — while being **unreachable from this transaction**, and so from every route that
 //! drives it: userspace NR 0 and the recognized `TimerInterrupt` alike. An enum variant existing,
 //! and `legacy_reason` having a spelling for it, is not evidence that a caller can produce it: the
 //! reachability question is settled by which topology the caller passes, which is exactly one.
@@ -117,7 +122,9 @@ pub(crate) struct YieldOutcome {
 pub(crate) enum YieldDecline {
     /// This CPU has no current task, so there is nothing to yield.
     NoCurrent,
-    /// The per-architecture deferral gate is closed for this build or this CPU.
+    /// The per-architecture deferral gate is closed for this build or this CPU. Since AP-SCHED1 §4
+    /// only AArch64's bootstrap-CPU gate constructs it, so it exists only there (and in tests).
+    #[cfg(any(test, target_arch = "aarch64"))]
     ArchGateOff,
     /// Some route already holds this CPU's one-shot Yield deferral.
     DeferralHeld,
@@ -758,12 +765,13 @@ pub(crate) fn log_yield_declined(_cpu: CpuId, outgoing: u64, decline: YieldDecli
 
 /// [`YieldDecline`] in the delivered blocks' own words.
 ///
-/// `ArchGateOff` maps to the reason each architecture's gate actually is: x86_64's is the
-/// `d6_genuine` predicate, AArch64's and RISC-V's is the bootstrap-CPU requirement, and the
-/// delivered code called the latter `not_bsp`.
+/// `ArchGateOff` maps to the reason each architecture's gate actually is: x86_64's was the
+/// `d6_genuine` predicate, AArch64's is the bootstrap-CPU requirement (RISC-V's too, until
+/// AP-SCHED1 §4), and the delivered code called the latter `not_bsp`.
 pub(crate) const fn legacy_reason(decline: YieldDecline) -> &'static str {
     match decline {
         YieldDecline::NoCurrent => "no_current",
+        #[cfg(any(test, target_arch = "aarch64"))]
         YieldDecline::ArchGateOff => {
             if cfg!(target_arch = "x86_64") {
                 "d6_genuine_off"
