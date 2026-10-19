@@ -113,6 +113,27 @@
     SVC NR_YIELD
     .endm
 
+    /* P's wait step: block for one tick in a timed receive on P's private nap endpoint (nothing
+       ever sends to it), instead of yielding. A yield storm floods the console, and on AArch64
+       the console delays CPU 0's own interrupt handling, and so the very clock (M_CLOCK) every
+       bounded wait measures its deadline on: a 6000-tick wait then took most of a 600 s boot.
+       x1..x5 are preserved; x0 and x8 are clobbered, as by YIELD. */
+    .macro NAP
+    stp x1, x2, [sp, #-48]!
+    stp x3, x4, [sp, #16]
+    str x5, [sp, #32]
+    ldr w0, yarm_apsw_cap_ep_n
+    LI32 x1, (BUF + 0x780)
+    mov x2, #16
+    mov x3, #1
+    mov x4, #0
+    mov x5, #0
+    SVC NR_RECV_TO
+    ldr x5, [sp, #32]
+    ldp x3, x4, [sp, #16]
+    ldp x1, x2, [sp], #48
+    .endm
+
     /* DebugLog of one of this program's strings; x2 = round/aux, x3 = aux. */
     .macro LOG msg
     adr x0, \msg
@@ -179,8 +200,8 @@
 .Lwn_out\@:
     .endm
 
-    /* Bounded: wait until the kernel reports EVERY expected secondary (x30) idle. On timeout carry
-       on — the grader then sees what happened. Clobbers x9..x13. */
+    /* Bounded: wait until the kernel reports EVERY expected secondary (x30) idle. On timeout the
+       run ends (`p_no_idle` names the CPUs that never idled). Clobbers x9..x13. */
     .macro AWAIT_ALL_IDLE
     WAIT_BEGIN
 81: LI32 x10, MBX
@@ -194,21 +215,41 @@
 83: lsr x11, x11, #1
     add x12, x12, #1
     b 82b
-84: YIELD
+84: NAP
     WAIT_NEXT 81b
+    b p_no_idle
 89:
     .endm
 
-    /* Bounded: wait until the u64 at MBX+\off equals register \reg. Clobbers x9, x10. */
-    .macro AWAIT_EQ off, reg
+    /* Bounded: wait until the u64 at MBX+\off equals register \reg; on timeout, x2 = what it
+       held, x3 = \reg, and control goes to \fail. Clobbers x9, x10. */
+    .macro AWAIT_EQ off, reg, fail
     WAIT_BEGIN
 91: LI32 x10, MBX
     ldr x10, [x10, #\off]
     cmp x10, \reg
     b.eq 92f
-    YIELD
+    NAP
     WAIT_NEXT 91b
+    mov x2, x10
+    mov x3, \reg
+    b \fail
 92:
+    .endm
+
+    /* The same, for "at least \reg". */
+    .macro AWAIT_GE off, reg, fail
+    WAIT_BEGIN
+93: LI32 x10, MBX
+    ldr x10, [x10, #\off]
+    cmp x10, \reg
+    b.hs 94f
+    NAP
+    WAIT_NEXT 93b
+    mov x2, x10
+    mov x3, \reg
+    b \fail
+94:
     .endm
 
     /* NR 16, and a report if the kernel declined it. */
@@ -262,7 +303,7 @@ p_ap:
     ldr x11, [x9, #M_AP_READY]
     cmp x10, x11
     b.eq p_ready
-1:  YIELD
+1:  NAP
     WAIT_NEXT p_ap
     LI32 x9, MBX
     ldr x2, [x9, #M_EXPECTED]
@@ -297,7 +338,7 @@ p_ready:
 2:  LI32 x9, MBX
     mov x10, #GATE_D
     str x10, [x9, #M_GATE]
-    AWAIT_EQ M_D_ARMED, x29
+    AWAIT_EQ M_D_ARMED, x29, p_a_timeout
 
     /* ── A: 2N + 2 spinners ── */
     lsl x21, x29, #1
@@ -319,7 +360,7 @@ p_w:
     ldr x10, [x9, #M_W_STARTED]
     cmp x10, x21
     b.eq p_w_cover
-    YIELD
+    NAP
     WAIT_NEXT p_w
     /* Not every spinner ran by the deadline: say so, then grade the preemptions from zero. */
     LI32 x9, MBX
@@ -387,7 +428,7 @@ p_pre:
 2:  lsr x12, x12, #1
     add x13, x13, #1
     b 1b
-3:  YIELD
+3:  NAP
     WAIT_NEXT p_pre
     /* Phase A's deadline: x2 = CPUs (0 and the expected ones) below their minimum since the
        snapshot; x3 = those with no timer preemption at all. Then stop the spinners, let them
@@ -421,14 +462,16 @@ p_pre:
     mov x10, #1
     str x10, [x9, #M_STOP]
     ldr x21, [x9, #M_W_STARTED]
-    AWAIT_EQ M_SPIN_DONE, x21
+    /* At least: a spinner that never got its CPU before the stop can still start, and finish,
+       after it. */
+    AWAIT_GE M_SPIN_DONE, x21, p_end
     b p_end
 p_stop:
     LI32 x9, MBX
     mov x10, #1
     str x10, [x9, #M_STOP]
-    AWAIT_EQ M_SPIN_DONE, x21
-    AWAIT_EQ M_D_DONE, x29
+    AWAIT_EQ M_SPIN_DONE, x21, p_a_timeout
+    AWAIT_EQ M_D_DONE, x29, p_a_timeout
     LI32 x9, MBX
     ldr x2, [x9, #M_SPIN_DONE]
     ldr x3, [x9, #M_SPIN_BAD]
@@ -460,13 +503,13 @@ p_b_one:
     ldr x10, [x9, x24]
     cmp x10, x22
     b.eq 2f
-    YIELD
+    NAP
     WAIT_NEXT 1b
     lsl x2, x20, #8
     orr x2, x2, x22
     mov x3, #0
     LOG m_p_b_timeout
-    b p_c
+    b p_end
 2:  AWAIT_ALL_IDLE
     /* F[x20] = round; wake it. */
     LI32 x25, (MBX + M_F)
@@ -487,13 +530,13 @@ p_b_one:
     ldr x10, [x9, x24]
     cmp x10, x22
     b.eq 4f
-    YIELD
+    NAP
     WAIT_NEXT 3b
     lsl x2, x20, #8
     orr x2, x2, x22
     mov x3, #0
     LOG m_p_no_ack
-    b p_c
+    b p_end
 4:  lsl x2, x20, #8
     orr x2, x2, x22
     mov x3, x23
@@ -523,7 +566,7 @@ p_c:
 p_c_thread:
     /* The previous thread has read its last pong before the next one starts. */
     sub x21, x20, #1
-    AWAIT_EQ M_T_DONE, x21
+    AWAIT_EQ M_T_DONE, x21, p_c_timeout
     LI32 x9, MBX
     str x20, [x9, #M_T_TURN]
     mov x22, #1
@@ -603,7 +646,7 @@ p_c_recv:
     add x20, x20, #1
     cmp x20, x29
     b.le p_c_thread
-    AWAIT_EQ M_T_DONE, x29
+    AWAIT_EQ M_T_DONE, x29, p_c_timeout
 
     /* ── D: per round, fork one child per secondary; reap each ── */
     mov x22, #1
@@ -644,10 +687,7 @@ p_d_reap_one:
     ldr x10, [x9, #M_REAPED]
     cmp x10, x24
     b.eq 2f
-    YIELD
-    YIELD
-    YIELD
-    YIELD
+    NAP
     WAIT_NEXT 1b
     mov x2, x24
     lsl x3, x22, #8
@@ -660,6 +700,34 @@ p_d_reap_one:
     add x22, x22, #1
     cmp x22, #(FORK_ROUNDS + 1)
     b.ne p_d_round
+    b p_end
+/* A bounded wait in phase A or C timed out (x2 = what the word held, x3 = what P waited for), or
+   an expected CPU never idled when P needed it (x2 = those CPUs): say so and end the run, so the
+   dump is complete within the budget instead of every later wait expiring in turn. */
+p_a_timeout:
+    LOG m_p_a_timeout
+    b p_end
+p_c_timeout:
+    LOG m_p_c_timeout
+    b p_end
+p_no_idle:
+    LI32 x10, MBX
+    mov x11, x30
+    mov x12, #0
+    mov x2, #0
+1:  cbz x11, 3f
+    tbz x11, #0, 2f
+    add x13, x10, x12, lsl #3
+    ldr x13, [x13, #M_IDLE]
+    cbnz x13, 2f
+    mov x14, #1
+    lsl x14, x14, x12
+    orr x2, x2, x14
+2:  lsr x11, x11, #1
+    add x12, x12, #1
+    b 1b
+3:  mov x3, #0
+    LOG m_p_no_idle
 p_end:
     mov x2, #0
     mov x3, #0
@@ -1019,6 +1087,8 @@ yarm_apsw_cap_ep_p: .word 0x61616161
 yarm_apsw_cap_ep_t: .word 0x62626262
     .global yarm_apsw_cap_ep_d
 yarm_apsw_cap_ep_d: .word 0x63636363
+    .global yarm_apsw_cap_ep_n
+yarm_apsw_cap_ep_n: .word 0x64646464
 
     STR m_p_start, "APS P_START"
     STR m_p_no_ap, "APS P_NO_AP"
@@ -1028,6 +1098,9 @@ yarm_apsw_cap_ep_d: .word 0x63636363
     STR m_p_w_cover, "APS P_W_COVER"
     STR m_p_a_done, "APS P_A_DONE"
     STR m_p_b_timeout, "APS P_B_TIMEOUT"
+    STR m_p_a_timeout, "APS P_A_TIMEOUT"
+    STR m_p_c_timeout, "APS P_C_TIMEOUT"
+    STR m_p_no_idle, "APS P_NO_IDLE"
     STR m_p_wake, "APS P_WAKE"
     STR m_p_no_ack, "APS P_NO_ACK"
     STR m_p_acked, "APS P_ACKED"

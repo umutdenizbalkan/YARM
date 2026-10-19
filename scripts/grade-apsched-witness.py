@@ -319,6 +319,10 @@ def grade(text, ncpus):
     # the record names the CPUs that fell short, so the failure is per CPU, not a stall.
     for r in user("P_W_TIMEOUT"):
         fails.append(f"placement: phase A's deadline passed with {r['v'][0]} of {r['v'][1]} spinners running")
+    for r in user("P_NO_IDLE"):
+        for c in range(64):
+            if r["v"][0] >> c & 1:
+                fails.append(f"idle: CPU {c} never reached its idle wait when P needed every secondary idle")
     for r in user("P_PRE_TIMEOUT"):
         short, never = r["v"][0], r["v"][1]
         for c in range(64):
@@ -682,6 +686,10 @@ def self_test():
     got = grade(_render(timed), 3)
     assert any("CPU 2 had taken no timer preemption at all" in f for f in got), got
     assert not any("CPU 1 had" in f or "CPU 1 below" in f for f in got), got
+    cases_run += 1
+    got = grade(_render(base[:a_done] + [("USER", 0, 9600, "P_NO_IDLE", 1 << 2, 0)] + base[a_done:]), 3)
+    assert any("CPU 2 never reached its idle wait" in f for f in got), got
+    assert not any("CPU 1 never reached" in f for f in got), got
     cases_run += 1
     got = grade(_render(base[:a_done] + [("USER", 0, 9600, "P_W_TIMEOUT", 5, 6)] + base[a_done:]), 3)
     assert any("5 of 6 spinners running" in f for f in got), got

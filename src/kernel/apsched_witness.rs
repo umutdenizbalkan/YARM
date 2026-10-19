@@ -77,6 +77,9 @@ unsafe extern "C" {
     static yarm_apsw_cap_ep_p: u8;
     static yarm_apsw_cap_ep_t: u8;
     static yarm_apsw_cap_ep_d: u8;
+    /// AArch64 only: P's private nap endpoint (its bounded waits block on it a tick at a time).
+    #[cfg(target_arch = "aarch64")]
+    static yarm_apsw_cap_ep_n: u8;
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -201,8 +204,8 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
         Ok::<_, KernelError>(())
     })?;
 
-    // Three buffered endpoints, each minted into P's own CNode with both rights: P's threads share
-    // it.
+    // Three buffered endpoints (AArch64: four), each minted into P's own CNode with both rights:
+    // P's threads share it.
     let rights = CapRights::SEND | CapRights::RECEIVE;
     let grant = |k: &mut KernelState| -> Result<u32, KernelError> {
         let (_, _, cap) = k.create_endpoint(1)?;
@@ -223,11 +226,16 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
 
     // SAFETY: `start..start + len` is the program's bytes inside this kernel image's text.
     let mut image = unsafe { core::slice::from_raw_parts(start, len) }.to_vec();
-    for (at, value) in [
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+    let mut caps = alloc::vec![
         (&raw const yarm_apsw_cap_ep_p, ep_p),
         (&raw const yarm_apsw_cap_ep_t, ep_t),
         (&raw const yarm_apsw_cap_ep_d, ep_d),
-    ] {
+    ];
+    // AArch64: a fourth endpoint nothing sends to, for P's one-tick naps.
+    #[cfg(target_arch = "aarch64")]
+    caps.push((&raw const yarm_apsw_cap_ep_n, grant(kernel)?));
+    for (at, value) in caps {
         let off = at as usize - start as usize;
         image[off..off + 4].copy_from_slice(&value.to_le_bytes());
     }
