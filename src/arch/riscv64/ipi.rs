@@ -429,6 +429,9 @@ pub fn release_secondaries_at_boot_borrow_end(trap_ready_cpus: u64) -> usize {
             ));
         }
     }
+    // AP-SCHED2 witness: the set the run must cover (observation only).
+    #[cfg(feature = "riscv64-apsched-witness")]
+    crate::arch::riscv64::apsched_witness::note_release_plan(released, trap_ready_cpus);
     crate::arch::riscv64::boot::early_sbi_marker(format_args!(
         "RISCV_AP_RELEASE_PLAN trap_ready=0x{:x} dispatch_capable=0x{:x} released=0x{:x} knob={}",
         trap_ready_cpus,

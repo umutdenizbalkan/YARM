@@ -1,12 +1,19 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Umut Deniz Balkan */
 /*
- * AP-SCHED1 — the RISC-V production AP-scheduling witness user program.
+ * AP-SCHED2 — the RISC-V production SMP-scheduling witness user program, for every admitted CPU.
  *
  * ONE App-class process P, kernel-built at 0x2000_0000. Everything after that is production
  * syscalls: P spawns its workers as threads (NR 11) and forks its churn children (NR 12), and the
  * production balanced placement — not the witness — decides which CPU each lands on and fixes it
  * as that task's home. No task is pinned, and no identity but P's is fixed.
+ *
+ * FIXTURE SYNCHRONIZATION (labelled, not production behaviour): balanced placement counts a CPU's
+ * runnable and running tasks, so a worker that blocks at once leaves its CPU looking empty and the
+ * next spawn lands there too. Each worker set therefore spins on a gate word (no kernel entry)
+ * until P has spawned the whole set: every earlier worker is load when the next is placed, and
+ * the set spreads one per CPU through the ordinary policy. Churn children spin a fixed count
+ * before they exit, for the same reason.
  *
  * User VAs:
  *   0x2001_0000  P's stack (top 0x2001_0ff0)
@@ -15,29 +22,39 @@
  *   0x2008_0000  BUF: IPC buffers and receive metadata
  *
  * MBX (u64 unless noted):
- *   +0x000 AP_READY   kernel: CPU 1 took its production admission
- *   +0x008 STOP       P: spinners stop
- *   +0x010 SPIN_DONE  spinners: amoadd 1 each
- *   +0x018 SPIN_BAD   spinners: amoadd their mismatch count
- *   +0x020 PRE0 / +0x028 PRE1   kernel: timer preemptions of this process's tasks per CPU
- *   +0x030 IDLE1      kernel: CPU 1 idle arrivals
- *   +0x038 REAPED     kernel: the last churn child the reaper reaped
- *   +0x040 F (u32)    the sleeper's futex word
- *   +0x048 S_WAITING  +0x050 S_ACK   +0x058 D_DONE   +0x060 T_DONE   +0x068 D_ARMED
- *   +0x070 CPU1_IDLE  kernel: 1 from CPU 1's idle arrival until it next leaves idle
+ *   +0x000 AP_READY    kernel: bitmap of CPUs that took their production admission
+ *   +0x008 STOP        P: spinners stop
+ *   +0x010 SPIN_DONE   spinners: amoadd 1 each
+ *   +0x018 SPIN_BAD    spinners: amoadd their mismatch count
+ *   +0x020 EXPECTED    kernel: bitmap of the secondaries the boot hart released
+ *   +0x028 GATE        P: the phase whose workers may leave their spawn gate
+ *   +0x030 D_ARMED     deadline threads: amoadd 1 each, just before their receive
+ *   +0x038 REAPED      kernel: the last churn child the reaper reaped
+ *   +0x040 D_DONE      deadline threads: amoadd 1 each
+ *   +0x048 T_TURN      P: the IPC thread whose rounds run now
+ *   +0x050 T_DONE      IPC threads: amoadd 1 each
+ *   +0x100 PRE[c]      kernel: timer preemptions of this process's workers on CPU c (8 CPUs)
+ *   +0x140 IDLE[c]     kernel: 1 from CPU c's idle arrival until it next leaves idle
+ *   +0x180 F[k] (u32)  sleeper k's futex word
+ *   +0x1a0 S_WAITING[k]  +0x1e0 S_ACK[k]
+ *
+ * P never stores to MBX after its first fork: the store would copy-on-write split P's mailbox
+ * onto a new frame while the kernel keeps publishing into the old one (now the child's). The
+ * churn child table therefore lives in BUF: BUF+0x800 CHILD[k].
  *
  * Phases (P drives; the kernel records every step with a causal stamp):
- *   A  a deadline thread D (NR 5, nobody sends) and four non-yielding spinners. Each spinner loads
- *      a per-thread pattern into x1, x3..x29, spins on one MBX word with no kernel entry until P
- *      stops it, and then checks every patterned register. P stops them only once the kernel has
- *      seen enough TIMER preemptions of this process on BOTH CPUs.
- *   B  a sleeper S announces round r and futex-waits; once S has announced r AND the kernel
- *      reports CPU 1 idle (it was not while S ran), P stores F and wakes S (NR 10) — the wake must
- *      reach idle CPU 1 by IPI. WAKE_ROUNDS rounds.
- *   C  a thread T pings P over E_P (NR 1) and receives P's pong on E_T (NR 2): every round is a
- *      remote wake each way. IPC_ROUNDS rounds.
- *   D  FORK_ROUNDS forked children, each running, touching its (copy-on-write) stack and exiting
- *      wherever placement put it; the witness reaps each through the production NR 31 transaction.
+ *   0  one deadline thread per secondary (NR 5 on an endpoint nobody sends to).
+ *   A  2N non-yielding spinners (N = every admitted CPU): each loads a per-thread pattern into
+ *      x1, x3..x29, spins with no kernel entry until P stops it, then checks every patterned
+ *      register. P stops them once the kernel has seen enough TIMER preemptions on EVERY CPU.
+ *   B  one sleeper per secondary; each round, once a sleeper has announced the round AND every
+ *      secondary is idle, P stores its word and wakes it (NR 10): the wake must reach that idle
+ *      CPU by IPI.
+ *   C  one IPC thread per secondary; in turn, each pings P over E_P (NR 1) and receives P's pong
+ *      on E_T (NR 2): every round is a remote wake each way.
+ *   D  FORK_ROUNDS rounds of one forked child per secondary, each running, touching its
+ *      copy-on-write stack and exiting wherever placement put it; the witness reaps each through
+ *      the production NR 31 transaction.
  *
  * Linker relaxation is off; data is reached through absolute VAs built with `li`, strings and
  * entry points through `lla`, capabilities through literal words the kernel patches.
@@ -65,25 +82,36 @@
     .set M_STOP, 0x008
     .set M_SPIN_DONE, 0x010
     .set M_SPIN_BAD, 0x018
-    .set M_PRE0, 0x020
-    .set M_PRE1, 0x028
-    .set M_IDLE1, 0x030
+    .set M_EXPECTED, 0x020
+    .set M_GATE, 0x028
+    .set M_D_ARMED, 0x030
     .set M_REAPED, 0x038
-    .set M_F, 0x040
-    .set M_S_WAITING, 0x048
-    .set M_S_ACK, 0x050
-    .set M_D_DONE, 0x058
-    .set M_T_DONE, 0x060
-    .set M_D_ARMED, 0x068
-    .set M_CPU1_IDLE, 0x070
+    .set M_D_DONE, 0x040
+    .set M_T_TURN, 0x048
+    .set M_T_DONE, 0x050
+    .set M_PRE, 0x100
+    .set M_IDLE, 0x140
+    .set M_F, 0x180
+    .set M_S_WAITING, 0x1a0
+    .set M_S_ACK, 0x1e0
+    .set B_CHILD, 0x800
 
-    .set SPINNERS, 4
+    /* Worker-stack slot bases: deadline 1..7, spinners 8..23, sleepers 25..31, IPC 33..39. */
+    .set D_SLOT0, 0
+    .set SPIN_SLOT0, 8
+    .set SLEEP_SLOT0, 24
+    .set IPC_SLOT0, 32
+
+    .set GATE_D, 1
+    .set GATE_S, 2
+
     .set PRE0_MIN, 3
-    .set PRE1_MIN, 6
+    .set PRE_MIN, 4
     .set DEADLINE_TICKS, 40
-    .set WAKE_ROUNDS, 5
-    .set IPC_ROUNDS, 6
-    .set FORK_ROUNDS, 6
+    .set WAKE_ROUNDS, 3
+    .set IPC_ROUNDS, 4
+    .set FORK_ROUNDS, 4
+    .set CHILD_SPIN, 3000000
 
     /* Bounded waits, in yields. */
     .set WAIT_YIELDS, 400000
@@ -95,7 +123,7 @@
     ecall
     .endm
 
-    /* DebugLog of one of this program's strings; a2 = round, a3 = aux. */
+    /* DebugLog of one of this program's strings; a2 = round/aux, a3 = aux. */
     .macro LOG msg
     lla a0, \msg
     lla a1, \msg\()_end
@@ -109,10 +137,15 @@
 \name\()_end:
     .endm
 
-    /* NR 11: a thread at `entry` on worker stack `slot`; a0 = its TID, 0 on refusal. */
-    .macro SPAWN slot, entry
-    li a0, (MBX + 0x800 + \slot * 0x10)
-    li a1, (WSTK + \slot * 0x1000 + 0xff0)
+    /* NR 11: a thread at `entry` on worker stack slot `\slot` (a register); a0 = its TID, 0 on
+       refusal. Clobbers t0, t1. */
+    .macro SPAWNR slot, entry
+    slli t1, \slot, 4
+    li a0, (MBX + 0x800)
+    add a0, a0, t1
+    slli t1, \slot, 12
+    li a1, (WSTK + 0xff0)
+    add a1, a1, t1
     lla a2, \entry
     li a3, 0
     li a4, 0
@@ -121,18 +154,47 @@
     ecall
     .endm
 
-    /* Bounded: wait until the kernel reports CPU 1 idle, so the balanced placement of the next
-       task sees CPU 1 empty (a previous phase's threads may still be exiting there). On timeout
-       carry on — the grader then sees where placement put the task. */
-    .macro AWAIT_CPU1_IDLE
+    /* This worker's slot, from its own stack, into \reg. */
+    .macro MYSLOT reg
+    li \reg, WSTK
+    sub \reg, sp, \reg
+    srli \reg, \reg, 12
+    .endm
+
+    /* Bounded: wait until the kernel reports EVERY expected secondary (s11) idle, so the next
+       placement sees them empty and a wake has an idle target. On timeout carry on — the grader
+       then sees what happened. Uses s0, t0..t6. */
+    .macro AWAIT_ALL_IDLE
     li s0, WAIT_YIELDS
-8:  li t0, MBX
-    ld t1, M_CPU1_IDLE(t0)
-    bnez t1, 9f
+81: li t0, MBX
+    mv t1, s11
+    li t4, 0
+82: beqz t1, 89f
+    andi t2, t1, 1
+    beqz t2, 83f
+    slli t5, t4, 3
+    add t5, t5, t0
+    ld t6, M_IDLE(t5)
+    beqz t6, 84f
+83: srli t1, t1, 1
+    addi t4, t4, 1
+    j 82b
+84: YIELD
+    addi s0, s0, -1
+    bnez s0, 81b
+89:
+    .endm
+
+    /* Bounded: wait until the u64 at MBX+\off equals register \reg. Uses s0, t0, t1. */
+    .macro AWAIT_EQ off, reg
+    li s0, WAIT_YIELDS
+91: li t0, MBX
+    ld t1, \off(t0)
+    beq t1, \reg, 92f
     YIELD
     addi s0, s0, -1
-    bnez s0, 8b
-9:
+    bnez s0, 91b
+92:
     .endm
 
     /* NR 16, and a report if the kernel declined it. */
@@ -165,143 +227,192 @@ yarm_apsw_start:
     li a2, 0
     li a3, 0
     LOG m_p_start
+    /* Every released secondary admitted: AP_READY == EXPECTED != 0. */
     li s0, WAIT_YIELDS
 p_ap:
     li t0, MBX
-    ld t1, M_AP_READY(t0)
-    bnez t1, p_a
-    YIELD
+    ld t1, M_EXPECTED(t0)
+    beqz t1, 1f
+    ld t2, M_AP_READY(t0)
+    beq t1, t2, p_ready
+1:  YIELD
     addi s0, s0, -1
     bnez s0, p_ap
+    li t0, MBX
+    ld a2, M_EXPECTED(t0)
+    ld a3, M_AP_READY(t0)
     LOG m_p_no_ap
     j p_end
-
-    /* ── A: the deadline thread, then four spinners ── */
-p_a:
-    li a2, 0
-    li a3, 0
+p_ready:
+    /* s11 = the expected secondaries for the whole run; s10 = how many. */
+    li t0, MBX
+    ld s11, M_EXPECTED(t0)
+    mv t1, s11
+    li s10, 0
+1:  beqz t1, 2f
+    andi t2, t1, 1
+    add s10, s10, t2
+    srli t1, t1, 1
+    j 1b
+2:  mv a2, s11
+    mv a3, s10
     LOG m_p_ap
-    SPAWN 0, w_deadline
+
+    /* ── 0: one deadline thread per secondary, spread by the gate ── */
+    li s1, 1
+1:  bgt s1, s10, 2f
+    addi t3, s1, D_SLOT0
+    SPAWNR t3, w_deadline
     beqz a0, p_spawn_fail
-    li s0, WAIT_YIELDS
-1:  li t0, MBX
-    ld t1, M_D_ARMED(t0)
-    bnez t1, 2f
-    YIELD
-    addi s0, s0, -1
-    bnez s0, 1b
-2:  SPAWN 1, w_spin
+    addi s1, s1, 1
+    j 1b
+2:  li t0, MBX
+    li t1, GATE_D
+    sd t1, M_GATE(t0)
+    AWAIT_EQ M_D_ARMED, s10
+
+    /* ── A: 2N spinners ── */
+    slli s2, s10, 1
+    addi s2, s2, 2
+    li s1, 0
+1:  bge s1, s2, 2f
+    addi t3, s1, SPIN_SLOT0
+    SPAWNR t3, w_spin
     beqz a0, p_spawn_fail
-    SPAWN 2, w_spin
-    beqz a0, p_spawn_fail
-    SPAWN 3, w_spin
-    beqz a0, p_spawn_fail
-    SPAWN 4, w_spin
-    beqz a0, p_spawn_fail
-    li s0, WAIT_YIELDS
+    addi s1, s1, 1
+    j 1b
+2:  li s0, WAIT_YIELDS
 p_pre:
     li t0, MBX
-    ld t1, M_PRE1(t0)
-    li t2, PRE1_MIN
-    bltu t1, t2, 1f
-    ld t1, M_PRE0(t0)
+    ld t1, M_PRE(t0)
     li t2, PRE0_MIN
-    bgeu t1, t2, p_stop
-1:  YIELD
+    bltu t1, t2, 3f
+    mv t3, s11
+    li t4, 0
+1:  beqz t3, p_stop
+    andi t5, t3, 1
+    beqz t5, 2f
+    slli t6, t4, 3
+    add t6, t6, t0
+    ld t1, M_PRE(t6)
+    li t2, PRE_MIN
+    bltu t1, t2, 3f
+2:  srli t3, t3, 1
+    addi t4, t4, 1
+    j 1b
+3:  YIELD
     addi s0, s0, -1
     bnez s0, p_pre
     li t0, MBX
-    ld a2, M_PRE0(t0)
-    ld a3, M_PRE1(t0)
+    ld a2, M_PRE(t0)
+    ld a3, 0x108(t0)
     LOG m_p_pre_timeout
 p_stop:
     li t0, MBX
     li t1, 1
     sd t1, M_STOP(t0)
-    li s0, WAIT_YIELDS
-1:  li t0, MBX
-    ld t1, M_SPIN_DONE(t0)
-    li t2, SPINNERS
-    bne t1, t2, 2f
-    ld t1, M_D_DONE(t0)
-    bnez t1, 3f
-2:  YIELD
-    addi s0, s0, -1
-    bnez s0, 1b
-    LOG m_p_a_timeout
-3:  li t0, MBX
+    AWAIT_EQ M_SPIN_DONE, s2
+    AWAIT_EQ M_D_DONE, s10
+    li t0, MBX
     ld a2, M_SPIN_DONE(t0)
     ld a3, M_SPIN_BAD(t0)
     LOG m_p_a_done
 
-    /* ── B: wake the sleeper on an idle CPU ── */
-    AWAIT_CPU1_IDLE
-    SPAWN 5, w_sleep
-    beqz a0, p_spawn_fail
+    /* ── B: one sleeper per secondary, woken on its idle CPU ── */
+    AWAIT_ALL_IDLE
     li s1, 1
+1:  bgt s1, s10, 2f
+    addi t3, s1, SLEEP_SLOT0
+    SPAWNR t3, w_sleep
+    beqz a0, p_spawn_fail
+    addi s1, s1, 1
+    j 1b
+2:  li t0, MBX
+    li t1, GATE_S
+    sd t1, M_GATE(t0)
+    li s3, 1
 p_b_round:
+    li s1, 1
+p_b_one:
+    /* sleeper s1 announced round s3? */
+    slli s5, s1, 3
+    addi s5, s5, M_S_WAITING
     li s0, WAIT_YIELDS
 1:  li t0, MBX
-    ld t1, M_S_WAITING(t0)
-    beq t1, s1, 2f
+    add t1, t0, s5
+    ld t1, 0(t1)
+    beq t1, s3, 2f
     YIELD
     addi s0, s0, -1
     bnez s0, 1b
-    mv a2, s1
+    slli a2, s1, 8
+    or a2, a2, s3
     li a3, 0
     LOG m_p_b_timeout
     j p_c
-2:  li s0, WAIT_YIELDS
-3:  li t0, MBX
-    ld t1, M_CPU1_IDLE(t0)
-    bnez t1, 4f
-    YIELD
-    addi s0, s0, -1
-    bnez s0, 3b
-    mv a2, s1
-    li a3, 0
-    LOG m_p_no_idle
-4:  li t0, MBX
-    sw s1, M_F(t0)
-    mv a2, s1
+2:  AWAIT_ALL_IDLE
+    /* F[s1] = round; wake it. */
+    slli s6, s1, 2
+    li t0, (MBX + M_F)
+    add s6, s6, t0
+    sw s3, 0(s6)
+    slli a2, s1, 8
+    or a2, a2, s3
     li a3, 0
     LOG m_p_wake
-    li a0, (MBX + M_F)
+    mv a0, s6
     li a1, 1
     li a7, NR_FUTEX_WAKE
     ecall
     mv s4, a0
+    slli s5, s1, 3
+    addi s5, s5, M_S_ACK
     li s0, WAIT_YIELDS
-5:  li t0, MBX
-    ld t1, M_S_ACK(t0)
-    beq t1, s1, 6f
+3:  li t0, MBX
+    add t1, t0, s5
+    ld t1, 0(t1)
+    beq t1, s3, 4f
     YIELD
     addi s0, s0, -1
-    bnez s0, 5b
-    mv a2, s1
+    bnez s0, 3b
+    slli a2, s1, 8
+    or a2, a2, s3
     li a3, 0
     LOG m_p_no_ack
     j p_c
-6:  mv a2, s1
+4:  slli a2, s1, 8
+    or a2, a2, s3
     mv a3, s4
     LOG m_p_acked
     addi s1, s1, 1
+    ble s1, s10, p_b_one
+    addi s3, s3, 1
     li t2, (WAKE_ROUNDS + 1)
-    bne s1, t2, p_b_round
+    bne s3, t2, p_b_round
 
-    /* ── C: ping-pong with T ── */
+    /* ── C: ping-pong with each IPC thread in turn ── */
 p_c:
-    AWAIT_CPU1_IDLE
-    SPAWN 6, w_ipc
-    beqz a0, p_spawn_fail
+    AWAIT_ALL_IDLE
+    li t0, MBX
+    sd zero, M_T_TURN(t0)
     li s1, 1
+1:  bgt s1, s10, 2f
+    addi t3, s1, IPC_SLOT0
+    SPAWNR t3, w_ipc
+    beqz a0, p_spawn_fail
+    addi s1, s1, 1
+    j 1b
+2:  li s1, 1
+p_c_thread:
+    li t0, MBX
+    sd s1, M_T_TURN(t0)
+    li s3, 1
 p_c_round:
     li s6, 0
 p_c_recv:
     /* recv-v2 success: a0 == 0, or the kernel wrote the metadata status (the user runtime's own
        decoding); so the status is poisoned first. WouldBlock with the status untouched is the
-       runtime's "nothing yet" — a receive that met a concurrent send while publishing itself is
-       restored with the message still queued — and is received again (bounded). */
+       runtime's "nothing yet" and is received again (bounded). */
     addi s6, s6, 1
     li t0, BUF
     li t1, -1
@@ -314,7 +425,7 @@ p_c_recv:
     li a5, 0
     li a7, NR_RECV
     ecall
-    /* The received frame: the sender's opcode at +0, its round at +2. */
+    /* The received frame: opcode +0, round +2, thread +4. */
     mv s4, a0
     li t0, BUF
     ld s7, 0x40(t0)
@@ -329,27 +440,26 @@ p_c_recv:
 5:  li t0, BUF
     lhu t1, 2(t0)
     lhu t2, 0(t0)
+    lhu t4, 4(t0)
     li s5, 0
     beqz s4, 0f
     li t3, -1
     beq s7, t3, 1f
 0:  li t3, 0x5050
     bne t2, t3, 1f
-    bne t1, s1, 1f
+    bne t1, s3, 1f
+    bne t4, s1, 1f
     li s5, 1
-1:  mv a2, s1
+1:  slli a2, s1, 8
+    or a2, a2, s3
     mv a3, s5
     LOG m_p_ping
-    bnez s5, 2f
-    mv a2, s4
-    mv a3, s7
-    LOG m_p_ping_raw
-2:  li t0, (BUF + 0x200)
+    li t0, (BUF + 0x200)
     li t1, 0x4F50
     sh t1, 0(t0)
-    sh s1, 2(t0)
+    sh s3, 2(t0)
+    sh s1, 4(t0)
     li t1, 0x4B4F
-    sh t1, 4(t0)
     sh t1, 6(t0)
     li s6, 0
 3:  addi s6, s6, 1
@@ -366,23 +476,20 @@ p_c_recv:
     bgeu s6, t2, 4f
     YIELD
     j 3b
-4:  addi s1, s1, 1
+4:  addi s3, s3, 1
     li t2, (IPC_ROUNDS + 1)
-    bne s1, t2, p_c_round
-    li s0, WAIT_YIELDS
-5:  li t0, MBX
-    ld t1, M_T_DONE(t0)
-    bnez t1, p_d
-    YIELD
-    addi s0, s0, -1
-    bnez s0, 5b
-    LOG m_p_c_timeout
+    bne s3, t2, p_c_round
+    addi s1, s1, 1
+    ble s1, s10, p_c_thread
+    AWAIT_EQ M_T_DONE, s10
 
-    /* ── D: fork, let the child run and exit, reap it ── */
-p_d:
-    li s1, 1
+    /* ── D: per round, fork one child per secondary; reap each ── */
+    li s3, 1
 p_d_round:
-    AWAIT_CPU1_IDLE
+    AWAIT_ALL_IDLE
+    li s1, 1
+p_d_fork:
+    bgt s1, s10, p_d_reap
     li a0, 0
     li a1, 0
     li a2, 0
@@ -391,13 +498,27 @@ p_d_round:
     ecall
     bnez a3, p_fork_fail
     beqz a0, c_child
-    mv s5, a0
-    mv a2, s5
-    mv a3, s1
+    slli t1, s1, 3
+    li t0, (BUF + B_CHILD)
+    add t1, t1, t0
+    sd a0, 0(t1)
+    mv a2, a0
+    slli a3, s3, 8
+    or a3, a3, s1
     LOG m_p_forked
+    addi s1, s1, 1
+    j p_d_fork
+p_d_reap:
+    li s1, 1
+p_d_reap_one:
+    slli t1, s1, 3
+    li t0, (BUF + B_CHILD)
+    add t1, t1, t0
+    ld s5, 0(t1)
     li s0, (WAIT_YIELDS / 8)
 1:  mv a2, s5
-    mv a3, s1
+    slli a3, s3, 8
+    or a3, a3, s1
     LOG m_p_reap
     li t0, MBX
     ld t1, M_REAPED(t0)
@@ -409,12 +530,15 @@ p_d_round:
     addi s0, s0, -1
     bnez s0, 1b
     mv a2, s5
-    mv a3, s1
+    slli a3, s3, 8
+    or a3, a3, s1
     LOG m_p_reap_timeout
     j p_end
 2:  addi s1, s1, 1
+    ble s1, s10, p_d_reap_one
+    addi s3, s3, 1
     li t2, (FORK_ROUNDS + 1)
-    bne s1, t2, p_d_round
+    bne s3, t2, p_d_round
 p_end:
     li a2, 0
     li a3, 0
@@ -433,25 +557,34 @@ park:
     YIELD
     j park
 
-/* The churn child: runs wherever it was placed, takes its copy-on-write stack page, reports and
-   exits. */
+/* The churn child (s1 = its index, s3 = the round, both inherited from the fork): spins so the
+   next fork sees its CPU busy, takes its copy-on-write stack page, reports and exits. */
 c_child:
+    li t0, CHILD_SPIN
+1:  addi t0, t0, -1
+    bnez t0, 1b
     sd s1, -64(sp)
     ld t1, -64(sp)
-    mv a2, s1
+    slli a2, s3, 8
+    or a2, a2, s1
     mv a3, t1
     LOG m_c_run
     EXIT
 
 /* ═══════════════════════════════════ workers ══════════════════════════════════════════════ */
-/* D: a deadline receive on an endpoint nobody sends to. */
+/* A deadline receive on an endpoint nobody sends to, after the spawn gate. */
 w_deadline:
+    li t0, MBX
+1:  ld t1, M_GATE(t0)
+    li t2, GATE_D
+    bne t1, t2, 1b
     li a2, 0
     li a3, 0
     LOG m_d_before
     li t0, MBX
     li t1, 1
-    sd t1, M_D_ARMED(t0)
+    addi t2, t0, M_D_ARMED
+    amoadd.d zero, t1, (t2)
     lw a0, yarm_apsw_cap_ep_d
     li a1, (BUF + 0x300)
     li a2, 16
@@ -466,7 +599,8 @@ w_deadline:
     LOG m_d_after
     li t0, MBX
     li t1, 1
-    sd t1, M_D_DONE(t0)
+    addi t2, t0, M_D_DONE
+    amoadd.d zero, t1, (t2)
     EXIT
 
 /* A spinner: patterned registers, no kernel entry until P stops it, then the check. */
@@ -561,26 +695,37 @@ w_spin_loop:
     LOG m_w_done
     EXIT
 
-/* S: announce round r, wait on F until it holds r, acknowledge. */
+/* Sleeper k (= slot - SLEEP_SLOT0): after the spawn gate, announce round r, wait on F[k] until it
+   holds r, acknowledge. */
 w_sleep:
-    li a2, 0
+    MYSLOT s7
+    addi s7, s7, -SLEEP_SLOT0
+    li t0, MBX
+1:  ld t1, M_GATE(t0)
+    li t2, GATE_S
+    bne t1, t2, 1b
+    mv a2, s7
     li a3, 0
     LOG m_s_start
+    slli s8, s7, 3
+    li t0, MBX
+    add s8, s8, t0
+    slli s9, s7, 2
+    li t0, (MBX + M_F)
+    add s9, s9, t0
     li s1, 1
-1:  li t0, MBX
-    sd s1, M_S_WAITING(t0)
-2:  li t0, MBX
-    lwu t1, M_F(t0)
+1:  sd s1, M_S_WAITING(s8)
+2:  lwu t1, 0(s9)
     beq t1, s1, 3f
-    li a0, (MBX + M_F)
+    mv a0, s9
     addi a1, s1, -1
     mv a2, t1
     li a7, NR_FUTEX_WAIT
     ecall
     j 2b
-3:  li t0, MBX
-    sd s1, M_S_ACK(t0)
-    mv a2, s1
+3:  sd s1, M_S_ACK(s8)
+    slli a2, s7, 8
+    or a2, a2, s1
     mv a3, t1
     LOG m_s_woke
     addi s1, s1, 1
@@ -588,9 +733,14 @@ w_sleep:
     bne s1, t2, 1b
     EXIT
 
-/* T: ping P, receive its pong. */
+/* IPC thread k (= slot - IPC_SLOT0): spins until its turn, then pings P and receives its pong. */
 w_ipc:
-    li a2, 0
+    MYSLOT s7
+    addi s7, s7, -IPC_SLOT0
+    li t0, MBX
+1:  ld t1, M_T_TURN(t0)
+    bne t1, s7, 1b
+    mv a2, s7
     li a3, 0
     LOG m_t_start
     li s1, 1
@@ -599,8 +749,8 @@ t_round:
     li t1, 0x5050
     sh t1, 0(t0)
     sh s1, 2(t0)
+    sh s7, 4(t0)
     li t1, 0x4749
-    sh t1, 4(t0)
     sh t1, 6(t0)
     li s6, 0
 1:  addi s6, s6, 1
@@ -633,11 +783,11 @@ t_recv:
     ecall
     mv s4, a0
     li t0, BUF
-    ld s7, 0x140(t0)
+    ld s5, 0x140(t0)
     li t3, 7
     bne s4, t3, 5f
     li t3, -1
-    bne s7, t3, 5f
+    bne s5, t3, 5f
     li t3, 64
     bgeu s6, t3, 5f
     YIELD
@@ -645,23 +795,27 @@ t_recv:
 5:  li t0, BUF
     lhu t1, 0x102(t0)
     lhu t2, 0x100(t0)
-    li s5, 0
+    lhu t4, 0x104(t0)
+    li s8, 0
     beqz s4, 4f
     li t3, -1
-    beq s7, t3, 3f
+    beq s5, t3, 3f
 4:  li t3, 0x4F50
     bne t2, t3, 3f
     bne t1, s1, 3f
-    li s5, 1
-3:  mv a2, s1
-    mv a3, s5
+    bne t4, s7, 3f
+    li s8, 1
+3:  slli a2, s7, 8
+    or a2, a2, s1
+    mv a3, s8
     LOG m_t_pong
     addi s1, s1, 1
     li t2, (IPC_ROUNDS + 1)
     bne s1, t2, t_round
     li t0, MBX
     li t1, 1
-    sd t1, M_T_DONE(t0)
+    addi t2, t0, M_T_DONE
+    amoadd.d zero, t1, (t2)
     EXIT
 
     .balign 8
@@ -676,16 +830,12 @@ yarm_apsw_cap_ep_d: .word 0x63636363
     STR m_p_no_ap, "APS P_NO_AP"
     STR m_p_ap, "APS P_AP_READY"
     STR m_p_pre_timeout, "APS P_PRE_TIMEOUT"
-    STR m_p_a_timeout, "APS P_A_TIMEOUT"
     STR m_p_a_done, "APS P_A_DONE"
     STR m_p_b_timeout, "APS P_B_TIMEOUT"
-    STR m_p_no_idle, "APS P_NO_IDLE"
     STR m_p_wake, "APS P_WAKE"
     STR m_p_no_ack, "APS P_NO_ACK"
     STR m_p_acked, "APS P_ACKED"
     STR m_p_ping, "APS P_PING"
-    STR m_p_ping_raw, "APS P_PING_RAW"
-    STR m_p_c_timeout, "APS P_C_TIMEOUT"
     STR m_p_forked, "APS P_FORKED"
     STR m_p_reap, "APS P_REAP"
     STR m_p_reap_timeout, "APS P_REAP_TIMEOUT"

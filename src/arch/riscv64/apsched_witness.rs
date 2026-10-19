@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! AP-SCHED1 — the RISC-V production AP-scheduling witness. Built only with
+//! AP-SCHED1/AP-SCHED2 — the RISC-V production SMP-scheduling witness. Built only with
 //! `riscv64-apsched-witness`, and armed only WITHOUT `yarm.ap_user_dispatch=1`: it exercises the
-//! production admission of logical CPU 1, never the diagnostic pinned one.
+//! production admission of EVERY released secondary, never the diagnostic pinned one, and runs
+//! ordinary work on each of them (AP-SCHED2 generalized it from CPU 1 alone).
 //!
 //! It provisions ONE App-class process P (`apsched_witness.S`) and nothing else. P's workers are
 //! threads it spawns itself (NR 11) and children it forks (NR 12); the production balanced
@@ -15,8 +16,9 @@
 //! * setup (P's space, pages, three buffered endpoints, P's capabilities) and one ordinary enqueue
 //!   of P, at boot, when CPU 0 is the only CPU placement can choose;
 //! * PUBLICATION of observation words into P's mailbox frame through the direct map, with no lock
-//!   held: CPU 1's admission, this process's timer preemptions per CPU, CPU 1's idle arrivals and
-//!   the last reaped child — so P can wait for a fact instead of guessing with a delay;
+//!   held: the released set, each CPU's admission, this process's timer preemptions per CPU, each
+//!   secondary's idle state and the last reaped child — so P can wait for a fact instead of
+//!   guessing with a delay;
 //! * the REAP of each churn child, through the production NR 31 transaction on the CPU P's
 //!   request trapped on. Production's only reaper is the process manager, for supervisor restarts;
 //!   the witness stands in for it so an App process's exit and reap can be exercised at all.
@@ -38,19 +40,22 @@ pub const CODE_VA: u64 = 0x2000_0000;
 pub const P_STACK_VA: u64 = 0x2001_0000;
 pub const P_SP_TOP: u64 = 0x2001_0ff0;
 pub const WSTK_VA: u64 = 0x2002_0000;
-pub const WSTK_SLOTS: u64 = 8;
+pub const WSTK_SLOTS: u64 = 40;
 pub const MBX_VA: u64 = 0x2007_0000;
 pub const BUF_VA: u64 = 0x2008_0000;
 pub const P_TID: u64 = 9_600;
 
 const M_AP_READY: u64 = 0x000;
-const M_PRE0: u64 = 0x020;
-const M_PRE1: u64 = 0x028;
-const M_IDLE1: u64 = 0x030;
+const M_EXPECTED: u64 = 0x020;
 const M_REAPED: u64 = 0x038;
-const M_CPU1_IDLE: u64 = 0x070;
+const M_PRE: u64 = 0x100;
+const M_IDLE: u64 = 0x140;
+/// The CPUs the mailbox has per-CPU words for (the 8-slot handoff table's maximum).
+const MBX_CPUS: usize = 8;
 
-const MAX_CHILDREN: usize = 16;
+const MAX_CHILDREN: usize = 64;
+/// Concurrent deadline windows (one per secondary).
+const MAX_DEADLINES: usize = 8;
 
 unsafe extern "C" {
     static yarm_apsw_start: u8;
@@ -67,15 +72,18 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// Accepted timer interrupts per CPU, counted at the timer settlement's entry — before, and
 /// independently of, whatever the scheduler does with them.
 static IRQS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-static PRE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-static IDLE1: AtomicU64 = AtomicU64::new(0);
+static PRE: [AtomicU64; MBX_CPUS] = [const { AtomicU64::new(0) }; MBX_CPUS];
+static IDLES: [AtomicU64; MBX_CPUS] = [const { AtomicU64::new(0) }; MBX_CPUS];
 static CHILDREN: [AtomicU64; MAX_CHILDREN] = [const { AtomicU64::new(0) }; MAX_CHILDREN];
 static REAPED: [AtomicBool; MAX_CHILDREN] = [const { AtomicBool::new(false) }; MAX_CHILDREN];
+/// The address spaces churn children reported from (`C_RUN`): only their root departures are
+/// recorded.
+static CHILD_ASIDS: [AtomicU64; MAX_CHILDREN] = [const { AtomicU64::new(0) }; MAX_CHILDREN];
 static REFUSALS: AtomicU64 = AtomicU64::new(0);
-/// The deadline window: (tick, CPU 0 interrupts, CPU 1 interrupts) at D_BEFORE.
-static D_TICK: AtomicU64 = AtomicU64::new(u64::MAX);
-static D_IRQ0: AtomicU64 = AtomicU64::new(0);
-static D_IRQ1: AtomicU64 = AtomicU64::new(0);
+/// Each deadline thread's window: (tid, tick, CPU 0 interrupts, its own CPU's interrupts) at
+/// D_BEFORE.
+static D_WIN: [[AtomicU64; 4]; MAX_DEADLINES] =
+    [const { [const { AtomicU64::new(0) }; 4] }; MAX_DEADLINES];
 static ENDED: AtomicBool = AtomicBool::new(false);
 
 pub fn enabled() -> bool {
@@ -233,7 +241,7 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
 /// character by character, and a record torn by the other hart's marker would be lost evidence.
 /// P's last step dumps it once, every line twice with a CRC, while nothing else of the witness
 /// runs; the grader keeps exactly the lines whose CRC verifies.
-const MAX_RECS: usize = 512;
+const MAX_RECS: usize = 2048;
 
 const K_AP_ADMITTED: u64 = 1;
 const K_PREEMPT: u64 = 2;
@@ -245,8 +253,9 @@ const K_DEADLINE: u64 = 7;
 const K_REAP: u64 = 8;
 const K_REAP_GONE: u64 = 9;
 const K_ROOT_LEFT: u64 = 10;
+const K_RELEASE: u64 = 11;
 
-const KINDS: [&str; 11] = [
+const KINDS: [&str; 12] = [
     "NONE",
     "AP_ADMITTED",
     "PREEMPT",
@@ -258,6 +267,7 @@ const KINDS: [&str; 11] = [
     "REAP",
     "REAP_GONE",
     "ROOT_LEFT",
+    "RELEASE",
 ];
 
 /// The user steps, by code (index + 1); 0 = a step this table does not know.
@@ -339,13 +349,26 @@ fn record(kind: u64, cpu: u64, tid: u64, step: u64, v: [u64; 5]) {
     r.valid.store(true, Ordering::Release);
 }
 
-/// CPU `cpu` completed its production admission (called last, by that CPU).
-pub fn ap_admitted(cpu: CpuId) {
-    if !enabled() || cpu.0 != 1 {
+/// The boot hart released `released` (of the trap-ready `trap_ready`) at the end of its boot
+/// borrow: the set P's run must cover.
+pub fn note_release_plan(released: u64, trap_ready: u64) {
+    if !enabled() {
         return;
     }
-    record(K_AP_ADMITTED, 1, 0, 0, [0; 5]);
-    publish(M_AP_READY, 1);
+    record(K_RELEASE, 0, 0, 0, [released, trap_ready, 0, 0, 0]);
+    publish(M_EXPECTED, released);
+}
+
+static ADMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// CPU `cpu` completed its production admission (called last, by that CPU).
+pub fn ap_admitted(cpu: CpuId) {
+    if !enabled() || cpu.0 as usize >= MBX_CPUS {
+        return;
+    }
+    record(K_AP_ADMITTED, u64::from(cpu.0), 0, 0, [0; 5]);
+    let all = ADMITTED.fetch_or(1u64 << cpu.0, Ordering::AcqRel) | (1u64 << cpu.0);
+    publish(M_AP_READY, all);
 }
 
 /// Every accepted timer interrupt, at the timer settlement's entry.
@@ -361,35 +384,46 @@ pub fn note_timer_irq(cpu: CpuId) {
 /// A timer preemption the settlement COMMITTED, with its outgoing task.
 pub fn note_preempt(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
     // P itself waits in yield loops, so it is running at most ticks; only its workers count.
-    if !enabled() || cpu.0 > 1 || outgoing == P_TID || !is_witness_task(shared, outgoing) {
+    let c = cpu.0 as usize;
+    if !enabled() || c >= MBX_CPUS || outgoing == P_TID || !is_witness_task(shared, outgoing) {
         return;
     }
-    let n = PRE[cpu.0 as usize].fetch_add(1, Ordering::AcqRel) + 1;
-    record(K_PREEMPT, u64::from(cpu.0), outgoing, 0, [n, 0, 0, 0, 0]);
-    publish(if cpu.0 == 0 { M_PRE0 } else { M_PRE1 }, n);
+    let n = PRE[c].fetch_add(1, Ordering::AcqRel) + 1;
+    record(K_PREEMPT, c as u64, outgoing, 0, [n, 0, 0, 0, 0]);
+    publish(M_PRE + 8 * c as u64, n);
 }
 
 /// `cpu` arrived at its idle wait from a task (not a return to an interrupted idle).
+/// Secondaries only: CPU 0 also runs the core services, whose idle arrivals are not this witness's.
 pub fn note_idle_reached(cpu: usize) {
-    if !enabled() || cpu != 1 {
+    if !enabled() || cpu == 0 || cpu >= MBX_CPUS {
         return;
     }
-    let n = IDLE1.fetch_add(1, Ordering::AcqRel) + 1;
+    let n = IDLES[cpu].fetch_add(1, Ordering::AcqRel) + 1;
     record(K_IDLE, cpu as u64, 0, 0, [n, 0, 0, 0, 0]);
-    publish(M_IDLE1, n);
-    publish(M_CPU1_IDLE, 1);
+    publish(M_IDLE + 8 * cpu as u64, 1);
 }
 
 /// `cpu` left a user root for the kernel's own space (`hal::leave_user_root`), after the hardware
-/// change and the record release. CPU 1's only: every task placed there in this boot is the
-/// witness's (the core services are bootstrap-pinned), and a child can run and exit before P has
+/// change and the record release. Secondaries only, and only for a churn child's space (learned
+/// from the child's own `C_RUN`, which precedes its exit): a child can run and exit before P has
 /// even reported forking it, so the grader matches the root against the child's own step.
 ///
 /// Recorded from what the transition LEFT BEHIND, not from the fact that it was called: the live
 /// `satp` (must be Bare, 0) and the activation record (must name no space). A transition that did
 /// not happen records nothing.
 pub fn note_root_left(cpu: CpuId, leaving: Option<crate::kernel::vm::Asid>) {
-    if !enabled() || cpu.0 != 1 {
+    if !enabled() || cpu.0 == 0 {
+        return;
+    }
+    let Some(asid) = leaving else {
+        return;
+    };
+    let asid = u64::from(asid.0);
+    if !CHILD_ASIDS
+        .iter()
+        .any(|a| a.load(Ordering::Acquire) == asid && asid != 0)
+    {
         return;
     }
     let satp: usize;
@@ -400,20 +434,18 @@ pub fn note_root_left(cpu: CpuId, leaving: Option<crate::kernel::vm::Asid>) {
     if satp != 0 || crate::arch::hal::active_address_space(cpu).is_some() {
         return;
     }
-    if let Some(asid) = leaving {
-        record(
-            K_ROOT_LEFT,
-            1,
-            0,
-            0,
-            [u64::from(asid.0), satp as u64, 0, 0, 0],
-        );
-    }
+    record(
+        K_ROOT_LEFT,
+        u64::from(cpu.0),
+        0,
+        0,
+        [asid, satp as u64, 0, 0, 0],
+    );
 }
 
 /// A reschedule IPI taken at `cpu`'s idle boundary, with the sources its consumption swapped out.
 pub fn note_idle_ipi(cpu: CpuId, sources: u64) {
-    if !enabled() {
+    if !enabled() || cpu.0 == 0 {
         return;
     }
     record(K_IDLE_IPI, u64::from(cpu.0), 0, 0, [sources, 0, 0, 0, 0]);
@@ -424,8 +456,8 @@ pub fn note_idle_dispatch(shared: &SharedKernel, cpu: CpuId, tid: u64, by_ipi: b
     if !enabled() {
         return;
     }
-    if cpu.0 == 1 {
-        publish(M_CPU1_IDLE, 0);
+    if cpu.0 != 0 && (cpu.0 as usize) < MBX_CPUS {
+        publish(M_IDLE + 8 * u64::from(cpu.0), 0);
     }
     if !is_witness_task(shared, tid) {
         return;
@@ -468,26 +500,48 @@ pub fn observe_user_marker(
             reap(shared, cpu, a2, a3);
             return true;
         }
+        "C_RUN" => {
+            let _ = (0..MAX_CHILDREN).find(|&i| {
+                CHILD_ASIDS[i]
+                    .compare_exchange(0, asid, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            });
+        }
         "D_BEFORE" => {
-            D_TICK.store(shared.scheduler_tick_now_split_read(), Ordering::Release);
-            D_IRQ0.store(IRQS[0].load(Ordering::Acquire), Ordering::Release);
-            D_IRQ1.store(IRQS[1].load(Ordering::Acquire), Ordering::Release);
+            // One window per deadline thread, keyed by its TID.
+            if let Some(w) = D_WIN.iter().find(|w| {
+                w[0].compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            }) {
+                w[1].store(shared.scheduler_tick_now_split_read(), Ordering::Release);
+                w[2].store(IRQS[0].load(Ordering::Acquire), Ordering::Release);
+                w[3].store(
+                    IRQS.get(c as usize)
+                        .map_or(0, |n| n.load(Ordering::Acquire)),
+                    Ordering::Release,
+                );
+            }
         }
         "D_AFTER" => {
             let tick = shared.scheduler_tick_now_split_read();
-            record(
-                K_DEADLINE,
-                c,
-                tid,
-                0,
-                [
-                    a2,
-                    a3,
-                    tick.wrapping_sub(D_TICK.load(Ordering::Acquire)),
-                    IRQS[0].load(Ordering::Acquire) - D_IRQ0.load(Ordering::Acquire),
-                    IRQS[1].load(Ordering::Acquire) - D_IRQ1.load(Ordering::Acquire),
-                ],
-            );
+            if let Some(w) = D_WIN.iter().find(|w| w[0].load(Ordering::Acquire) == tid) {
+                let own = IRQS
+                    .get(c as usize)
+                    .map_or(0, |n| n.load(Ordering::Acquire));
+                record(
+                    K_DEADLINE,
+                    c,
+                    tid,
+                    0,
+                    [
+                        a2,
+                        a3,
+                        tick.wrapping_sub(w[1].load(Ordering::Acquire)),
+                        IRQS[0].load(Ordering::Acquire) - w[2].load(Ordering::Acquire),
+                        own.wrapping_sub(w[3].load(Ordering::Acquire)),
+                    ],
+                );
+            }
             return true;
         }
         _ => {}
@@ -628,15 +682,29 @@ fn dump() {
             v(4)
         ));
     }
+    let irq = |c: usize| IRQS[c].load(Ordering::Acquire);
+    let pre = |c: usize| PRE[c].load(Ordering::Acquire);
     emit_twice(format_args!(
-        "APSW_DUMP_END count={} overflow={} irq0={} irq1={} pre0={} pre1={} idle1={} reap_retries={}",
+        "APSW_DUMP_END count={} overflow={} irq={},{},{},{},{},{},{},{} pre={},{},{},{},{},{},{},{} admitted=0x{:x} reap_retries={}",
         n,
         u8::from(OVERFLOW.load(Ordering::Acquire)),
-        IRQS[0].load(Ordering::Acquire),
-        IRQS[1].load(Ordering::Acquire),
-        PRE[0].load(Ordering::Acquire),
-        PRE[1].load(Ordering::Acquire),
-        IDLE1.load(Ordering::Acquire),
+        irq(0),
+        irq(1),
+        irq(2),
+        irq(3),
+        irq(4),
+        irq(5),
+        irq(6),
+        irq(7),
+        pre(0),
+        pre(1),
+        pre(2),
+        pre(3),
+        pre(4),
+        pre(5),
+        pre(6),
+        pre(7),
+        ADMITTED.load(Ordering::Acquire),
         REFUSALS.load(Ordering::Acquire)
     ));
 }

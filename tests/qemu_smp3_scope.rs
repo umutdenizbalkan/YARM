@@ -15,6 +15,7 @@ const IPI: &str = include_str!("../src/arch/riscv64/ipi.rs");
 const SBI: &str = include_str!("../src/arch/riscv64/sbi.rs");
 const BOOT: &str = include_str!("../src/arch/riscv64/boot.rs");
 const TRAP: &str = include_str!("../src/arch/riscv64/trap.rs");
+const ADMISSION: &str = include_str!("../src/arch/riscv_hart_admission.rs");
 const TIMER: &str = include_str!("../src/arch/riscv64/timer.rs");
 const CONSOLE: &str = include_str!("../src/arch/riscv64/console.rs");
 const RV_MOD: &str = include_str!("../src/arch/riscv64/mod.rs");
@@ -208,10 +209,11 @@ fn an_ipi_never_reaches_the_external_claim() {
     );
 }
 
-/// Secondary release is bounded: without the knob the boot hart releases only the production
-/// dispatch set (AP-SCHED1: logical CPU 1, admitted by the production path); the knob widens it to
-/// every trap-ready secondary for the diagnostic pinned path. Nothing outside the computed set is
-/// released, and a parked secondary leaves its park only through its own release bit.
+/// Secondary release is bounded: without the knob the boot hart releases every trap-ready
+/// secondary that holds a dispatch-sized trap stack (AP-SCHED2: the production set is computed by
+/// the one hart-admission policy, no longer a fixed CPU 1); the knob widens it to every trap-ready
+/// secondary for the diagnostic pinned path. Nothing outside the computed set is released, and a
+/// parked secondary leaves its park only through its own release bit.
 #[test]
 fn secondary_dispatch_is_behind_the_knob() {
     let rel = code(fn_body(
@@ -219,19 +221,22 @@ fn secondary_dispatch_is_behind_the_knob() {
         "pub fn release_secondaries_at_boot_borrow_end(trap_ready_cpus: u64) -> usize {",
     ));
     assert!(squash(&rel).starts_with(&squash(
-        "let diagnostic = crate::kernel::boot::ap_user_dispatch_enabled(); let released = release_set(trap_ready_cpus, diagnostic);"
+        "let diagnostic = crate::kernel::boot::ap_user_dispatch_enabled(); let capable = crate::arch::riscv64::boot::riscv_dispatch_capable_bitmap(); let released = release_set(trap_ready_cpus, capable, diagnostic);"
     )));
     assert!(squash(&rel).contains(&squash("if released == 0 { return 0; }")));
     let set = squash(&code(fn_body(
         IPI,
-        "pub fn release_set(trap_ready_cpus: u64, diagnostic: bool) -> u64 {",
+        "pub fn release_set(trap_ready_cpus: u64, dispatch_capable_cpus: u64, diagnostic: bool) -> u64 {",
     )));
-    assert!(set.contains(&squash(
-        "if diagnostic { secondaries } else { secondaries & PRODUCTION_DISPATCH_CPUS }"
+    assert!(set.contains(&squash("crate::arch::riscv_hart_admission::release_set(")));
+    let policy = squash(&code(fn_body(
+        ADMISSION,
+        "pub fn release_set(trap_ready: u64, dispatch_capable_cpus: u64, diagnostic: bool) -> u64 {",
     )));
-    assert!(
-        squash(&code(IPI)).contains(&squash("pub const PRODUCTION_DISPATCH_CPUS: u64 = 1 << 1;"))
-    );
+    assert!(policy.contains(&squash(
+        "let secondaries = trap_ready & !1; if diagnostic { secondaries } else { secondaries & dispatch_capable_cpus }"
+    )));
+    assert!(!squash(&code(IPI)).contains("PRODUCTION_DISPATCH_CPUS"));
     let take = squash(&code(fn_body(
         IPI,
         "pub fn take_park_release(cpu: CpuId) -> bool {",

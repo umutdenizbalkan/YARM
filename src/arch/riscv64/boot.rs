@@ -3519,6 +3519,11 @@ fn riscv_secondary_production_admission(
     }
     crate::arch::riscv64::timer::mark_idle_wake_source(cpu.0 as usize);
     crate::arch::riscv64::ipi::mark_ready(cpu);
+    // AP-SCHED2 §2: interrupt readiness is checked from the hart's own state, not assumed from
+    // the calls above — a CPU that cannot take its timer and the reschedule IPI is never admitted.
+    if !riscv_secondary_irq_ready(cpu) {
+        riscv_secondary_unadmitted(cpu, "no_irq_ready");
+    }
     if let Err(e) = shared.admit_ap_dispatch_split(cpu) {
         early_marker!(
             "RISCV_AP_SCHED_ADMISSION_REFUSED cpu={} reason={:?} result=fail",
@@ -3542,6 +3547,21 @@ fn riscv_secondary_production_admission(
     crate::arch::riscv64::apsched_witness::ap_admitted(cpu);
     crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
     riscv_idle_halt(cpu, "secondary_idle_awaiting_work")
+}
+
+/// AP-SCHED2 §2 — the interrupt-ready state of THIS hart: `sie.STIE` and `sie.SSIE` are set, its
+/// timer is recorded as armed, and it is published as a reschedule-IPI target.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_secondary_irq_ready(cpu: crate::kernel::scheduler::CpuId) -> bool {
+    const SIE_SSIE: usize = 1 << 1;
+    const SIE_STIE: usize = 1 << 5;
+    let sie: usize;
+    unsafe {
+        core::arch::asm!("csrr {}, sie", out(reg) sie, options(nostack, preserves_flags));
+    }
+    sie & (SIE_SSIE | SIE_STIE) == (SIE_SSIE | SIE_STIE)
+        && crate::arch::riscv64::timer::stie_enabled_on(cpu.0 as usize)
+        && crate::arch::riscv64::ipi::ready(cpu)
 }
 
 /// A released secondary whose admission failed: nothing is ever placed on it (it stays
