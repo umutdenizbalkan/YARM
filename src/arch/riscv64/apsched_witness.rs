@@ -241,7 +241,10 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
 /// character by character, and a record torn by the other hart's marker would be lost evidence.
 /// P's last step dumps it once, every line twice with a CRC, while nothing else of the witness
 /// runs; the grader keeps exactly the lines whose CRC verifies.
-const MAX_RECS: usize = 2048;
+const MAX_RECS: usize = 4096;
+/// Preemption records kept per CPU beyond each task's first (the full count is in `PRE` and the
+/// dump trailer): at 8 CPUs the spinners take ~300 preemptions each, which would flood the record.
+const PRE_RECS_PER_CPU: u64 = 48;
 
 const K_AP_ADMITTED: u64 = 1;
 const K_PREEMPT: u64 = 2;
@@ -389,9 +392,22 @@ pub fn note_preempt(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
         return;
     }
     let n = PRE[c].fetch_add(1, Ordering::AcqRel) + 1;
-    record(K_PREEMPT, c as u64, outgoing, 0, [n, 0, 0, 0, 0]);
+    // Each task's first preemption is always recorded (the grader needs one per spinner).
+    let first = !PRE_SEEN
+        .iter()
+        .any(|t| t.load(Ordering::Acquire) == outgoing)
+        && PRE_SEEN.iter().any(|t| {
+            t.compare_exchange(0, outgoing, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
+    if first || n <= PRE_RECS_PER_CPU {
+        record(K_PREEMPT, c as u64, outgoing, 0, [n, 0, 0, 0, 0]);
+    }
     publish(M_PRE + 8 * c as u64, n);
 }
+
+/// Tasks whose first preemption has been recorded.
+static PRE_SEEN: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
 
 /// `cpu` arrived at its idle wait from a task (not a return to an interrupted idle).
 /// Secondaries only: CPU 0 also runs the core services, whose idle arrivals are not this witness's.

@@ -463,7 +463,7 @@ def main():
     dl = [r for r in R if r["kind"] == "DEADLINE"]
     dtick = ",".join(f"{r['cpu']}:{r['v2']}={r['v3']}/{r['v4']}" for r in sorted(dl, key=lambda r: int(r["cpu"])))
     print(f"APSW_WITNESS_SEAL arch=riscv64 cpus={ncpus} admission=production per_cpu_work=threads,forks "
-          f"preempt={','.join(map(str, pre))} registers=intact deadlines=timed_out dtick=dirq0/own:{dtick} "
+          f"preempt_recorded={','.join(map(str, pre))} preempt_counted={end.get('pre', '?')} registers=intact deadlines=timed_out dtick=dirq0/own:{dtick} "
           f"idle_wakes={WAKE_ROUNDS * (ncpus - 1)}_ipi ipc={IPC_ROUNDS * (ncpus - 1)} "
           f"churn={FORK_ROUNDS * (ncpus - 1)}_reaped_quarantined=0 records={end['count']} result=ok")
     return 0

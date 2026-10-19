@@ -29190,3 +29190,203 @@ summaries are kept in the session's qualification directories.
 **Open, and not claimed.** This repairs the witness's synchronization. It changes no production
 path. QEMU's slow delivery to a halted hart and its non-AIA interrupt selection order remain facts
 of the platform, now recorded.
+
+### §2 — production CPU admission for every supported hart
+
+**What changed.** AP-SCHED1 admitted logical CPU 1 alone (`PRODUCTION_DISPATCH_CPUS = 1 << 1`).
+That constant is gone. One pure policy, `src/arch/riscv_hart_admission.rs`, decides:
+
+* which hart becomes which logical CPU;
+* which logical CPUs may dispatch;
+* which harts a real limit excludes.
+
+The RISC-V port claims, stages and releases only through it, and the hosted suite runs the same
+functions. Every discovered, supported hart is eligible without the knob or a witness feature.
+
+**Identity.** The hart id is never the logical CPU.
+
+* Logical CPU 0 is whichever hart booted.
+* Each other admissible hart takes the lowest free logical id ≥ 1, claimed with one
+  compare-and-swap. Concurrent claims therefore cannot hand out the same id.
+* A nonzero boot hart and non-contiguous hart ids still produce a dense numbering. The
+  scheduler's present set is that numbering (`logical_present_bitmap`), not the hart bitmap. The
+  boot prints both: `RISCV_LOGICAL_CPUS present= count= excluded_harts= hart_bitmap= boot_hart=`.
+
+**Limits.** Each comes from real storage, and each is reported by name.
+
+| Limit | Value | Source | A hart or CPU beyond it |
+|---|---|---|---|
+| Handoff table (`HANDOFF_SLOTS`) | 8 hart ids | Secondary boot stacks (64 KiB each), park trap stacks (4 KiB each) and HSM start are indexed by hart id | `RISCV_HART_EXCLUDED hart= reason=beyond_hsm_handoff_table dispatch=0`; never started |
+| Dispatch trap stacks (`DISPATCH_TRAP_STACKS`) | 8 × 2 MiB = 16 MiB `.bss` | A dispatching CPU runs the whole syscall, fault and timer settlement on its trap stack, so it needs the boot hart's correctness size (`riscv-trap-stack-debt`) | `RISCV_AP_QUIESCENT cpu= reason=no_dispatch_trap_stack`; parked, wake-only, never released. Unreachable with 8 stacks for 8 slots, but kept as a named refusal |
+| Scheduler tables and masks | `MAX_CPUS` = 64, 64-bit masks | `platform_layout.rs` | `reason=no_free_logical_cpu` |
+
+* *Why 8 stacks, not 7.* The boot hart may lie *outside* the handoff table, because QEMU's
+  OpenSBI picks it by lottery: an `-smp 10` boot started on hart 9. Then all eight slots are
+  secondaries, and a 7-stack pool left logical CPU 8 quiescent. The first stage-2 candidate had
+  exactly that defect. It was seen live and fixed before the freeze, with a hosted case
+  (`a_boot_hart_beyond_the_table_leaves_every_slot_a_dispatching_secondary`).
+* *No stack is shared.* Each dispatching CPU has its own; the boot hart keeps `RISCV_TRAP_STACK`.
+* *Memory cost against the base:* +14 MiB of `.bss` (8 stacks in place of AP-SCHED1's one). This
+  is RAM only, not image bytes. The RAM map prints
+  `RISCV_KERNEL_IMAGE_HEADROOM kernel_end= initrd_start= headroom=` and refuses to boot
+  (`RISCV_KERNEL_IMAGE_OVERLAPS_INITRD`) if the image's end reaches the initrd that QEMU places
+  above it.
+
+**Four states, kept distinct.** Each secondary passes through them in order, and each is
+reported on its own:
+
+1. *Discovered* — in the DTB scan.
+2. *Initialized* — trap-ready parked with its logical id bound.
+3. *Interrupt-ready* — `sie.STIE` and `sie.SSIE` set, its own timer armed, and published as a
+   reschedule-IPI target.
+4. *Dispatch-admitted* — the scheduler's one `admit_dispatch` transition: out of wake-only, idle
+   placeholder cleared, eligible for balanced placement.
+
+Interrupt readiness is now **checked from the hart's own state** before admission
+(`riscv_secondary_irq_ready`), not assumed from the calls that set it. Eligibility is published
+last. Any failed prerequisite takes `riscv_secondary_unadmitted`:
+
+* every enable bit is cleared and the CPU is withdrawn as an IPI target;
+* it stays wake-only, so placement never names it and a pinned enqueue onto it is refused;
+* it reports
+  `RISCV_AP_STATE cpu= discovered=1 initialized=1 irq_ready= admitted=0 dispatching=0 reason=`.
+
+A healthy CPU reports `… admitted=1 dispatching=1 reason=none`.
+
+**Release.** The boot hart releases `trap_ready & dispatch_capable` (minus CPU 0) at the end of its
+boot borrow, and prints `RISCV_AP_RELEASE_PLAN trap_ready= dispatch_capable= released= knob=`. The
+diagnostic knob still widens the set to every trap-ready secondary for the pinned path.
+
+**Kept unchanged:**
+
+* the boot-exclusive publication contract — release happens only at the end of the borrow;
+* the retired broad lock;
+* the RELEASED bit as the only exit from a park.
+
+### §3 — ordinary scheduling on every admitted hart
+
+No new placement or dispatch owner was added. With the knob off, the production owners now act on
+every admitted CPU:
+
+* **Placement.** `least_loaded_online_cpu` (load = runnable count plus current task) skips
+  wake-only and balance-excluded CPUs. New tasks therefore spread across every admitted CPU, with
+  no fixed TIDs and no witness placement.
+* **Affinity.** A task keeps its initial home (`fix_home_locked`). Explicit affinity
+  (`cpu_affinity`) is honoured, and refused when it names a CPU that cannot run it. There is no
+  migration.
+* **Remote runnable publication.** Every owner that commits a task onto another CPU's queue calls
+  `hal::notify_enqueued(target)` after the commit, outside the rank-1 closure:
+
+  | Publication | Owner |
+  |---|---|
+  | spawn | `enqueue_task_split` / `enqueue_on_cpu_split` |
+  | IPC receiver wake | `enqueue_committed_receiver_inner`, `sr_wake_receiver_split` |
+  | futex | `futex_wake_split_mut` |
+  | timeout | `enqueue_reply_timeout_wake_split`; deadline drain through `wake_tid_to_runnable_split` |
+  | cancellation, server death | `wake_tid_to_runnable_split` |
+  | lifecycle replacement | `wake_destroyed_notification_waiter_split` |
+
+  The existing structural guard (`every_production_enqueue_commit_is_followed_by_its_notification`)
+  pins that order.
+* **Enqueue versus idle.** The target clears `SSIP` before it consumes its mailbox, then looks at
+  its queue, then waits. A commit after the look always leaves a notification that ends the wait.
+* **Timers.** Each dispatching CPU arms its own timer, which consumes only that CPU's quantum. The
+  global tick moves only on the clock owner (CPU 0), so there is no time multiplication. An idle
+  secondary parks its timer behind a backstop. A global deadline is drained by the clock owner and
+  wakes the task on its home CPU through the notification.
+* **Idle and teardown.**
+  * Every idle arrival, on every CPU, leaves the user root (`leave_user_root`), so a healthy
+    exit/reap never finds a root loaded on an idle CPU and never quarantines.
+  * Admission never reverses: there is no CPU offlining.
+* **IRQ claim and completion** keep their operation-time MMIO selection, unchanged.
+* **Diagnostics** (markers, witnesses) are observers. None is a prerequisite of admission or
+  dispatch.
+
+### §4 — evidence
+
+**Hosted (`ap_sched2`, 8 cases, plus the policy's 8 in `riscv_hart_admission`):**
+
+| Case | What it shows |
+|---|---|
+| `every_secondary_admits_itself_in_any_order` | Simultaneous admission: any order ends with every CPU dispatching; a second admission is refused |
+| `a_cpu_missing_readiness_receives_no_work` | A CPU that never completes admission: placement, pinned enqueue and explicit affinity are all refused; its neighbours are unaffected |
+| `cpu_identity_and_mask_boundaries_are_refused` | Ids at or beyond the 64-bit masks, and an unregistered CPU, are refused by every owner |
+| `placement_spreads_and_affinity_is_honoured` | Balanced first placement spreads; explicit affinity wins; the home is kept |
+| `a_remote_enqueue_notifies_its_own_target_only` | Each remote enqueue notifies exactly its target |
+| `enqueue_racing_idle_on_every_cpu_loses_nothing` | Real threads for CPUs 0..=3: jittered enqueues through the production owner against three targets running the idle protocol concurrently; no wait outlives its bound with work queued. With CPU 2's notification suppressed the case fails (`no wake was lost`), checked once |
+| `many_cpus_one_clock_and_a_deadline_wakes_any_cpu` | Secondary ticks consume only their own quanta; the clock moves once per clock-owner interrupt; a deadline wakes a receive homed on CPU 3 and notifies CPU 3 |
+| `exit_idle_reap_on_every_cpu_reclaims_everything` | Process churn on CPUs 1..=3 with the production idle transition: no quarantine, and the frame count returns exactly |
+
+The policy cases cover:
+
+* a nonzero boot hart;
+* non-contiguous hart ids;
+* a boot hart beyond the table;
+* the scheduler bound;
+* the stack pool;
+* the release set.
+
+**Live (`scripts/qemu-riscv64-apsched-witness-smoke.sh`, `SMP=N`, default off,
+feature `riscv64-apsched-witness`).** One user process P drives ordinary tasks; the kernel only
+observes. Every observation is a generation-stamped record (`APSW_R seq=`, printed twice, each
+copy CRC-checked) dumped after P ends, and the grader orders by stamp, never by console position.
+
+* *The expected set* comes from `-smp N`, and the kernel's own release plan must equal it.
+* *For every expected secondary, the grader requires:*
+  * its production admission record;
+  * user execution of spinners placed on it by balanced placement;
+  * timer preemptions of those spinners by its own timer, with every patterned register (x1,
+    x3..x29) intact after preemption and no migration;
+  * a deadline that times out on it, with its tick advance bounded by CPU 0's interrupts and its
+    own timer active (one clock);
+  * three wakes of a sleeper while the CPU is recorded idle, each ended by the reschedule IPI at
+    its idle boundary, never by its timer;
+  * four IPC ping/pong round trips with CPU 0, intact both ways;
+  * four rounds of fork/exit/reap: each child runs there, the CPU leaves the child's root before
+    the reap, and the reap reports `process_reaped=1 destroyed=1 quarantined=0`.
+* *Supported topology:* the witness's mailbox and worker-stack layout covers up to 8 CPUs, and the
+  grader refuses a larger `N`.
+* *Mailbox frame check:* the grader also refuses a run in which P's mailbox page was split
+  copy-on-write.
+
+**A witness defect found and fixed before the freeze.** The first N-CPU run hung in churn round 1.
+P stored each forked child's TID into its mailbox page. After a fork that store split the page
+copy-on-write, so P moved to a new frame while the kernel kept publishing into the old one, by then
+the child's. P never saw `REAPED`. The child table now lives in P's buffer page, P never stores to
+the mailbox after its first fork, and the grader enforces that.
+
+**Controls.** Each control breaks only CPU 2 of a 4-hart run, while CPUs 1 and 3 stay healthy. The
+patches and results are kept with the qualification record.
+
+| Control | Patch |
+|---|---|
+| missing readiness | CPU 2 never publishes itself as an IPI target |
+| missing readiness, check removed | the same, and the admission readiness check removed |
+| suppressed wake | enqueues onto CPU 2 commit but never notify |
+| missing secondary timer | every deadline CPU 2 programs lies at the end of time |
+| skipped idle-root handoff | CPU 2's idle and exit transitions keep the user root |
+| corrupted context | CPU 2 flips a bit of x20 in every context it applies |
+| expected CPU left unused | CPU 2 takes the balance-excluded admission while reporting production |
+
+### §5 — evidence classes and their limits
+
+* **Source and image ordering.** Guards check source order: the readiness check before admission,
+  commit before notify, clear before consume, and the policy calls. They show what was written,
+  not what executed.
+* **Deterministic interleavings.** The hosted cases execute the scheduler and policy owners on the
+  host. The race case uses real threads, but host memory ordering is stronger than RISC-V's (RVWMO).
+* **Live evidence.** QEMU TCG runs one host thread per vCPU, with its own memory model and timing.
+  The witness observes what the kernel records at its observation points. It cannot see
+  invalidation or barrier completion inside the hart (`sfence.vma`, fences), only their
+  consequences: no stale root after idle, and no corrupted register after preemption.
+* **Not claimed:**
+  * migration;
+  * independent kernel threads;
+  * CPU offlining;
+  * AArch64 or x86_64 production admission;
+  * VFS;
+  * hardware bring-up;
+  * topologies beyond 8 logical CPUs. At `-smp 10` the hart beyond the table is excluded by name
+    and 8 secondaries are admitted, but the core smoke fails there on the base too (late services
+    do not start within its budget: 21 failed checks on the base, 20 on the candidate), so that
+    topology stays unsupported and open.
