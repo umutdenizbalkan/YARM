@@ -245,6 +245,7 @@ unsafe extern "C" {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 unsafe extern "C" {
     static __kernel_start: u8;
+    static __kernel_end: u8;
 }
 
 /// Rust primary (boot-hart) entry, tail-called from `_start` with the
@@ -2993,9 +2994,10 @@ pub fn bootstrap_first_user_task(
     Ok(())
 }
 
+/// AP-SCHED2 §2 — the secondary handoff table size (slot = hart id); the policy owns the value.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-const QEMU_VIRT_HSM_SECONDARY_HART_LIMIT: usize = 8;
-/// The trap stack of a secondary that never dispatches (logical CPU ≥ 2): it can only ever take
+const QEMU_VIRT_HSM_SECONDARY_HART_LIMIT: usize = crate::arch::riscv_hart_admission::HANDOFF_SLOTS;
+/// The trap stack of a parked secondary that has no dispatch-sized stack: it can only ever take
 /// the park's own traps.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 const RISCV64_SECONDARY_STACK_BYTES: usize = 4096;
@@ -3072,12 +3074,30 @@ static mut RISCV64_SECONDARY_STACKS: [SecondaryBootStack; QEMU_VIRT_HSM_SECONDAR
     [SecondaryBootStack([0; RISCV64_SECONDARY_BOOT_STACK_BYTES]);
         QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
 
-/// QEMU-SMP3 — the trap stack of logical CPU 1, the one secondary that may DISPATCH. It runs the
-/// whole syscall dispatch exactly as the boot hart's does, so it gets the boot hart's size and the
-/// same `.bss` placement (RAM only, not image size). Only CPU 1: the package is two harts, and the
-/// `riscv-trap-stack-debt` TODO on `RISCV_TRAP_STACK_SIZE` still stands for every further one.
+/// AP-SCHED2 §2 — the dispatch-sized trap stacks, one per possible secondary (index = logical CPU
+/// − 1, `riscv_hart_admission::dispatch_stack_index`). A dispatching CPU runs the whole syscall,
+/// fault and timer settlement on its trap stack exactly as the boot hart does, so each gets the
+/// boot hart's size: the `riscv-trap-stack-debt` note on `RISCV_TRAP_STACK_SIZE` is why that is a
+/// correctness size and not a measured bound, and no stack is shared. Cost: 2 MiB each, 14 MiB of
+/// `.bss` for the 8-slot table (RAM only, not image size); `stage_riscv64_ram_map` refuses to boot
+/// if the image's end reaches the initrd QEMU places above it.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-static mut RISCV64_CPU1_TRAP_STACK: RiscvTrapStack = RiscvTrapStack([0; RISCV_TRAP_STACK_SIZE]);
+static mut RISCV64_DISPATCH_TRAP_STACKS: [RiscvTrapStack;
+    crate::arch::riscv_hart_admission::DISPATCH_TRAP_STACKS] =
+    [const { RiscvTrapStack([0; RISCV_TRAP_STACK_SIZE]) };
+        crate::arch::riscv_hart_admission::DISPATCH_TRAP_STACKS];
+
+/// AP-SCHED2 §2 — logical CPUs that hold a dispatch-sized trap stack (bit 0, the boot hart's,
+/// always). Only these are released to dispatch in production.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static RISCV64_DISPATCH_CAPABLE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+/// The logical CPUs that may dispatch: the boot hart and every secondary given a dispatch stack.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn riscv_dispatch_capable_bitmap() -> u64 {
+    RISCV64_DISPATCH_CAPABLE.load(core::sync::atomic::Ordering::Acquire)
+}
 
 /// QEMU-SMP3 — the size of each published secondary trap-stack region (index = slot), stored
 /// BEFORE its top, so a reader that sees the top sees the size.
@@ -3154,33 +3174,27 @@ fn secondary_trap_stack_top(slot: usize) -> usize {
 /// lowest free id ≥ 1, deterministically in hart-id order. Out of range for the scheduler's
 /// `MAX_CPUS`, out of range for the handoff table, the boot hart's own hart id, or no free id all
 /// return `None`. The claim is a compare-and-swap, so no id can be handed to two harts.
+///
+/// AP-SCHED2 §2: both decisions are the policy's (`riscv_hart_admission`), so the hosted suite
+/// executes exactly this rule; a refusal is named by the caller.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn claim_logical_cpu_id_for_hart(hart_id: usize) -> Option<usize> {
+fn claim_logical_cpu_id_for_hart(
+    hart_id: usize,
+) -> Result<usize, crate::arch::riscv_hart_admission::Exclusion> {
+    use crate::arch::riscv_hart_admission as policy;
     use core::sync::atomic::Ordering;
-    if hart_id >= QEMU_VIRT_HSM_SECONDARY_HART_LIMIT || hart_id >= 64 {
-        return None;
-    }
-    if hart_id == boot_hart_id() {
-        return None;
-    }
+    policy::admissible_secondary_hart(hart_id, boot_hart_id())?;
     let mut seen = RISCV64_CPU_ID_CLAIMED.load(Ordering::Acquire);
     loop {
         // Lowest free logical id at or above 1 — id 0 is the boot hart's, always.
-        let mut candidate = None;
-        for id in 1..crate::kernel::scheduler::MAX_CPUS.min(64) {
-            if seen & (1u64 << id) == 0 {
-                candidate = Some(id);
-                break;
-            }
-        }
-        let id = candidate?; // no free logical CPU — fail closed
+        let id = policy::next_logical_cpu(seen, crate::kernel::scheduler::MAX_CPUS)?;
         match RISCV64_CPU_ID_CLAIMED.compare_exchange_weak(
             seen,
             seen | (1u64 << id),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => return Some(id),
+            Ok(_) => return Ok(id),
             Err(observed) => seen = observed,
         }
     }
@@ -3520,14 +3534,20 @@ fn riscv_secondary_production_admission(
         u8::from(root_released),
         riscv_trap_stack_top_for_cpu(cpu.0 as usize).unwrap_or(0)
     );
+    early_marker!(
+        "RISCV_AP_STATE cpu={} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none",
+        cpu.0
+    );
     #[cfg(feature = "riscv64-apsched-witness")]
     crate::arch::riscv64::apsched_witness::ap_admitted(cpu);
     crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
     riscv_idle_halt(cpu, "secondary_idle_awaiting_work")
 }
 
-/// A released secondary the scheduler would not admit: nothing is ever placed on it (it stays
-/// wake-only), and it waits with every interrupt source disabled.
+/// A released secondary whose admission failed: nothing is ever placed on it (it stays
+/// wake-only, so the scheduler refuses every enqueue to it and balanced placement skips it), it
+/// is withdrawn as an IPI target, and it waits with every interrupt source disabled. AP-SCHED2 §2:
+/// named with the states it did reach.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn riscv_secondary_unadmitted(cpu: crate::kernel::scheduler::CpuId, reason: &str) -> ! {
     unsafe {
@@ -3537,9 +3557,18 @@ fn riscv_secondary_unadmitted(cpu: crate::kernel::scheduler::CpuId, reason: &str
             options(nostack, preserves_flags)
         );
     }
+    let irq_ready = crate::arch::riscv64::timer::stie_enabled_on(cpu.0 as usize)
+        && crate::arch::riscv64::ipi::ready(cpu);
+    crate::arch::riscv64::ipi::withdraw_ready(cpu);
     early_marker!(
         "RISCV_SMP3_SECONDARY_UNADMITTED cpu={} reason={} result=fail",
         cpu.0,
+        reason
+    );
+    early_marker!(
+        "RISCV_AP_STATE cpu={} discovered=1 initialized=1 irq_ready={} admitted=0 dispatching=0 reason={}",
+        cpu.0,
+        u8::from(irq_ready),
         reason
     );
     crate::arch::riscv64::timer::halt_wait_loop()
@@ -3556,18 +3585,32 @@ fn secondary_stack_top(slot: usize) -> usize {
     }
 }
 
-/// QEMU-SMP3 — the trap-stack region `(top, size)` a claimed logical CPU gets: CPU 1 the
-/// dispatch-sized stack, any other the slot's park-sized one.
+/// The trap-stack region `(top, size)` a claimed logical CPU gets. AP-SCHED2 §2: every logical
+/// CPU the policy gives a dispatch stack gets its OWN dispatch-sized one, and is published
+/// dispatch-capable; any other keeps the slot's park-sized stack and is never released.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn secondary_trap_stack_for(slot: usize, cpu_id: usize) -> (usize, usize) {
-    if cpu_id == 1 {
-        let base = core::ptr::addr_of!(RISCV64_CPU1_TRAP_STACK) as usize;
-        ((base + RISCV_TRAP_STACK_SIZE) & !0xf, RISCV_TRAP_STACK_SIZE)
-    } else {
-        (
-            secondary_trap_stack_top(slot),
-            RISCV64_SECONDARY_STACK_BYTES,
-        )
+    use crate::arch::riscv_hart_admission as policy;
+    match policy::dispatch_stack_index(cpu_id, policy::DISPATCH_TRAP_STACKS) {
+        Some(index) => {
+            let stacks = core::ptr::addr_of!(RISCV64_DISPATCH_TRAP_STACKS) as *const RiscvTrapStack;
+            // SAFETY: `index < DISPATCH_TRAP_STACKS` by the policy; only the address is taken.
+            let base = unsafe { stacks.add(index) } as usize;
+            RISCV64_DISPATCH_CAPABLE.fetch_or(1u64 << cpu_id, core::sync::atomic::Ordering::AcqRel);
+            ((base + RISCV_TRAP_STACK_SIZE) & !0xf, RISCV_TRAP_STACK_SIZE)
+        }
+        None => {
+            early_marker!(
+                "RISCV_AP_EXCLUDED cpu={} slot={} reason={}",
+                cpu_id,
+                slot,
+                policy::Exclusion::NoDispatchStack.marker()
+            );
+            (
+                secondary_trap_stack_top(slot),
+                RISCV64_SECONDARY_STACK_BYTES,
+            )
+        }
     }
 }
 
@@ -3581,7 +3624,8 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
     // materialised), and publish this hart's trap-stack region so the trap bridge can derive the
     // trapping CpuId from a frame pointer. A rejected mapping leaves `cpu_id = usize::MAX` and
     // the secondary fails closed into its pre-existing safe park.
-    let cpu_id = claim_logical_cpu_id_for_hart(hart_id).unwrap_or(usize::MAX);
+    let claim = claim_logical_cpu_id_for_hart(hart_id);
+    let cpu_id = *claim.as_ref().unwrap_or(&usize::MAX);
     let (trap_stack_top, trap_stack_size) = if cpu_id == usize::MAX {
         (0, 0)
     } else {
@@ -3598,9 +3642,10 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
         RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].store(trap_stack_top, Ordering::Release);
     } else {
         early_marker!(
-            "RISCV_SECONDARY_CPU_ID_REJECTED hart={} slot={} reason=invalid_or_duplicate",
+            "RISCV_SECONDARY_CPU_ID_REJECTED hart={} slot={} reason={}",
             hart_id,
-            slot
+            slot,
+            claim.err().map_or("invalid_or_duplicate", |e| e.marker())
         );
     }
     unsafe {
@@ -4141,8 +4186,35 @@ fn stage_riscv64_present_cpu_bitmap(dtb: &'static [u8]) {
             crate::arch::riscv64::topology::default_present_cpu_bitmap()
         }
     };
-    let _ = crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(bitmap);
     let boot_hart = boot_hart_id();
+    // AP-SCHED2 §2: the scheduler's present set is LOGICAL CPUs — the numbering the claims above
+    // produced — never the hart-id bitmap, which differs whenever hart ids are non-contiguous.
+    // Harts a real limit excludes are named here, once.
+    {
+        use crate::arch::riscv_hart_admission as policy;
+        let max = crate::kernel::scheduler::MAX_CPUS;
+        let logical = policy::logical_present_bitmap(bitmap, boot_hart, max);
+        let excluded = policy::excluded_harts(bitmap, boot_hart, max);
+        let plan = policy::plan(bitmap, boot_hart, max);
+        for (hart, outcome) in plan.iter().enumerate() {
+            if let Err(Some(why)) = outcome {
+                early_marker!(
+                    "RISCV_HART_EXCLUDED hart={} reason={} dispatch=0",
+                    hart,
+                    why.marker()
+                );
+            }
+        }
+        early_marker!(
+            "RISCV_LOGICAL_CPUS present=0x{:x} count={} excluded_harts=0x{:x} hart_bitmap=0x{:x} boot_hart={}",
+            logical,
+            logical.count_ones(),
+            excluded,
+            bitmap,
+            boot_hart
+        );
+        let _ = crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(logical);
+    }
     emit_present_hart_markers(bitmap);
     early_marker!(
         "RISCV_HART_TOPOLOGY present_cpus={} present_bitmap=0x{:x} boot_hart={}",
@@ -4263,6 +4335,26 @@ fn stage_riscv64_boot_memory(dtb: &'static [u8], dtb_ptr: usize) {
             let bytes =
                 unsafe { core::slice::from_raw_parts(initrd_start as *const u8, initrd_len) };
             crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(bytes);
+        }
+        // AP-SCHED2 §2 — a real resource limit, enforced rather than assumed. QEMU's loader places
+        // the initrd at a fixed distance above the kernel's load address, and the image's static
+        // footprint (its `.bss`, which carries one 2 MiB dispatch trap stack per possible
+        // secondary) must end below it. Report the headroom every boot; refuse to continue on an
+        // overlap, which would mean the `.bss` clear already wrote over the initramfs.
+        let kernel_end = core::ptr::addr_of!(__kernel_end) as u64;
+        early_marker!(
+            "RISCV_KERNEL_IMAGE_HEADROOM kernel_end=0x{:x} initrd_start=0x{:x} headroom=0x{:x}",
+            kernel_end,
+            initrd_start,
+            initrd_start.saturating_sub(kernel_end)
+        );
+        if kernel_end > initrd_start {
+            early_marker!(
+                "RISCV_KERNEL_IMAGE_OVERLAPS_INITRD kernel_end=0x{:x} initrd_start=0x{:x} result=fatal",
+                kernel_end,
+                initrd_start
+            );
+            riscv_trap_halt("kernel_image_overlaps_initrd");
         }
         let initrd_pa_start = initrd_start & !(page - 1);
         let initrd_pa_end = (initrd_end + (page - 1)) & !(page - 1);

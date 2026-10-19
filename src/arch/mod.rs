@@ -30,6 +30,10 @@ pub mod irq_description;
 pub mod irq_guard;
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
+/// AP-SCHED2 §2 — the RISC-V hart-admission policy (identity, dispatch capability, real limits,
+/// release set), arch-neutral so the hosted suite executes the rules the RISC-V port applies.
+#[cfg(any(test, target_arch = "riscv64"))]
+pub mod riscv_hart_admission;
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 

@@ -148,25 +148,16 @@ static BOOT_BORROW_ENDED: AtomicBool = AtomicBool::new(false);
 /// reason, and a global flag would let an unreleased hart follow a released one out.
 static RELEASED: AtomicU64 = AtomicU64::new(0);
 
-/// AP-SCHED1 — the secondaries production scheduling admits on RISC-V: logical CPU 1 alone. It is
-/// the one secondary with a dispatch-sized trap stack (`RISCV64_CPU1_TRAP_STACK`); every other
-/// secondary stays parked, wake-only and masked.
-pub const PRODUCTION_DISPATCH_CPUS: u64 = 1 << 1;
-
-/// AP-SCHED1 — which trap-ready secondaries the boot hart releases. Pure.
-///
-/// * diagnostic (`yarm.ap_user_dispatch=1`): every trap-ready secondary, exactly as before — the
-///   witnesses own what they admit;
-/// * production: the trap-ready members of [`PRODUCTION_DISPATCH_CPUS`].
-///
-/// The boot CPU (bit 0) is never in the set.
-pub fn release_set(trap_ready_cpus: u64, diagnostic: bool) -> u64 {
-    let secondaries = trap_ready_cpus & !1;
-    if diagnostic {
-        secondaries
-    } else {
-        secondaries & PRODUCTION_DISPATCH_CPUS
-    }
+/// Which trap-ready secondaries the boot hart releases: the policy's rule
+/// ([`crate::arch::riscv_hart_admission::release_set`]). AP-SCHED2 §2: in production, every
+/// trap-ready secondary that holds a dispatch-sized trap stack; with the diagnostic knob, every
+/// trap-ready secondary. The boot CPU (bit 0) is never in the set.
+pub fn release_set(trap_ready_cpus: u64, dispatch_capable_cpus: u64, diagnostic: bool) -> u64 {
+    crate::arch::riscv_hart_admission::release_set(
+        trap_ready_cpus,
+        dispatch_capable_cpus,
+        diagnostic,
+    )
 }
 
 /// Per-CPU counters: `[publications, merged_publications, firmware_requests, firmware_refusals]`
@@ -191,6 +182,12 @@ pub fn ready(cpu: CpuId) -> bool {
 /// take the interrupt.
 pub fn mark_ready(cpu: CpuId) {
     READY.fetch_or(1u64 << (cpu.0 as u64 & 63), Ordering::AcqRel);
+}
+
+/// AP-SCHED2 §2 — withdraw `cpu` as a target: its admission failed after it had published
+/// readiness, so no sender may treat it as a CPU that will consume a publication.
+pub fn withdraw_ready(cpu: CpuId) {
+    READY.fetch_and(!(1u64 << (cpu.0 as u64 & 63)), Ordering::AcqRel);
 }
 
 pub fn boot_borrow_ended() -> bool {
@@ -414,21 +411,31 @@ pub fn take_park_release(cpu: CpuId) -> bool {
 /// The boot hart, at the end of its boot borrow (immediately before its first user entry): make
 /// itself a target, publish the release, and interrupt every released secondary
 /// ([`release_set`]). A strict no-op when that set is empty — a one-hart boot, or a boot whose
-/// only trap-ready secondaries are outside the production set — so one-CPU operation is
-/// byte-for-byte unchanged. Returns the harts interrupted.
+/// trap-ready secondaries all lack a dispatch stack — so one-CPU operation is unchanged. Returns
+/// the harts interrupted.
 pub fn release_secondaries_at_boot_borrow_end(trap_ready_cpus: u64) -> usize {
     let diagnostic = crate::kernel::boot::ap_user_dispatch_enabled();
-    let released = release_set(trap_ready_cpus, diagnostic);
+    let capable = crate::arch::riscv64::boot::riscv_dispatch_capable_bitmap();
+    let released = release_set(trap_ready_cpus, capable, diagnostic);
     // Every trap-ready secondary left out stays parked, wake-only and masked. Said once, by name,
-    // so a quiescent CPU is a reported fact rather than an absence.
+    // so a quiescent CPU is a reported fact rather than an absence: AP-SCHED2 §2 leaves only a
+    // CPU with no dispatch-sized trap stack (a genuine resource limit) out of production.
     for cpu in 1..MAX_CPUS.min(64) {
         if trap_ready_cpus & !released & (1u64 << cpu) != 0 {
             crate::arch::riscv64::boot::early_sbi_marker(format_args!(
-                "RISCV_AP_QUIESCENT cpu={} reason=outside_production_dispatch_set wake_only=1 sie=ssie_park_only",
-                cpu
+                "RISCV_AP_QUIESCENT cpu={} reason={} wake_only=1 sie=ssie_park_only",
+                cpu,
+                crate::arch::riscv_hart_admission::Exclusion::NoDispatchStack.marker()
             ));
         }
     }
+    crate::arch::riscv64::boot::early_sbi_marker(format_args!(
+        "RISCV_AP_RELEASE_PLAN trap_ready=0x{:x} dispatch_capable=0x{:x} released=0x{:x} knob={}",
+        trap_ready_cpus,
+        capable,
+        released,
+        u8::from(diagnostic)
+    ));
     if released == 0 {
         return 0;
     }
@@ -592,21 +599,19 @@ mod tests {
     /// AP-SCHED1 — the production release names logical CPU 1 alone; the diagnostic knob keeps
     /// every trap-ready secondary; the boot CPU is never released; an empty set releases nothing.
     #[test]
-    fn production_releases_cpu_one_alone() {
-        assert_eq!(release_set(0b11, false), 0b10);
-        assert_eq!(release_set(0b1111, false), 0b10, "CPU 2+ stay parked");
+    fn production_releases_every_dispatch_capable_trap_ready_secondary() {
+        let capable = 0xff;
+        assert_eq!(release_set(0b11, capable, false), 0b10);
+        assert_eq!(release_set(0b1111, capable, false), 0b1110);
+        assert_eq!(release_set(0b1101, capable, false), 0b1100);
         assert_eq!(
-            release_set(0b1101, false),
+            release_set(0b1, capable, false),
             0,
-            "CPU 1 not trap-ready: nothing"
+            "a one-hart boot: nothing"
         );
-        assert_eq!(release_set(0b1, false), 0, "a one-hart boot: nothing");
-        assert_eq!(
-            release_set(0b1111, true),
-            0b1110,
-            "the knob: every secondary"
-        );
-        assert_eq!(release_set(0b1, true), 0);
+        assert_eq!(release_set(0b1111, 0b0011, false), 0b10, "no stack: parked");
+        assert_eq!(release_set(0b1111, 0b0001, true), 0b1110, "the knob");
+        assert_eq!(release_set(0b1, capable, true), 0);
     }
 
     /// AP-SCHED1 — a parked hart leaves only on its OWN released bit: `wfi` returns for any reason,

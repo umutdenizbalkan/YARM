@@ -200450,17 +200450,17 @@ mod ap_sched1 {
     }
 
     /// Free data frames plus free page-table-pool frames: a reclaimed space returns both.
-    fn free_frames(k: &SharedKernel) -> usize {
+    pub(super) fn free_frames(k: &SharedKernel) -> usize {
         k.with(|s| s.with_memory_state(|m| m.frame_allocator.free_frames()))
             + crate::kernel::frame_allocator::pt_pool_free_frames()
     }
 
-    fn quarantined_spaces(k: &SharedKernel) -> usize {
+    pub(super) fn quarantined_spaces(k: &SharedKernel) -> usize {
         k.with(|s| s.with_user_spaces(|spaces| spaces.live_count()))
     }
 
     /// One process: its own address space with one data page that lives by its mapping alone.
-    fn spawn_process(k: &SharedKernel, tid: u64) -> (Asid, PhysAddr) {
+    pub(super) fn spawn_process(k: &SharedKernel, tid: u64) -> (Asid, PhysAddr) {
         k.with(|s| {
             let (asid, _cap): (Asid, CapId) = s.create_user_address_space().expect("asid");
             s.register_task(tid).expect("task");
@@ -200484,7 +200484,13 @@ mod ap_sched1 {
     /// records the root load), then exits and its CPU goes idle. The idle arrival takes the
     /// production transition `leave_user_root` when `idle_handoff` is set — what every RISC-V idle
     /// arrival now does — and is skipped to model the base.
-    fn run_exit_and_idle(k: &SharedKernel, tid: u64, asid: Asid, cpu: CpuId, idle_handoff: bool) {
+    pub(super) fn run_exit_and_idle(
+        k: &SharedKernel,
+        tid: u64,
+        asid: Asid,
+        cpu: CpuId,
+        idle_handoff: bool,
+    ) {
         k.with(|s| {
             s.enqueue_on_cpu(cpu, tid).expect("enqueue");
             assert_eq!(s.dispatch_next_on_cpu(cpu), Some(tid));
@@ -200510,7 +200516,7 @@ mod ap_sched1 {
         }
     }
 
-    fn reap_on(
+    pub(super) fn reap_on(
         k: &SharedKernel,
         cpu: CpuId,
         tid: u64,
@@ -201014,5 +201020,302 @@ mod ap_sched1 {
             .find("let claim = match owners.claim_self_exit(")
             .unwrap();
         assert!(clear < leave && leave < claim);
+    }
+}
+
+/// AP-SCHED2 §4 — production scheduling on every supported RISC-V hart, through the production
+/// owners only: four CPUs, admitted by the same one transition AP-SCHED1 introduced.
+mod ap_sched2 {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+    const CPUS: [CpuId; 3] = [CpuId(1), CpuId(2), CpuId(3)];
+
+    /// CPUs 1..=3 online and WAKE-ONLY, exactly as the boot hart registers trap-ready secondaries.
+    fn with_wake_only_aps() -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            for cpu in CPUS {
+                s.mark_cpu_wake_only(cpu, true).expect("wake-only first");
+                s.bring_up_cpu(cpu).expect("then online");
+            }
+        });
+        k
+    }
+
+    fn masks(k: &SharedKernel) -> (u64, u64, u64) {
+        k.with_scheduler_split_mut(|sched| {
+            let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+            (
+                s.online_cpu_bitmap(),
+                s.wake_only_bitmap(),
+                s.balance_excluded_bitmap(),
+            )
+        })
+    }
+
+    /// **Every secondary admits itself, in any order, through one transition each.** The released
+    /// secondaries run their admissions concurrently on their own harts; each is a single
+    /// transition out of wake-only, so any interleaving ends with all of them dispatching and none
+    /// excluded from placement. A second admission of any CPU is refused.
+    #[test]
+    fn every_secondary_admits_itself_in_any_order() {
+        for order in [[1usize, 2, 3], [3, 1, 2], [2, 3, 1]] {
+            let k = with_wake_only_aps();
+            assert_eq!(masks(&k), (0b1111, 0b1110, 0));
+            for i in order {
+                k.admit_ap_dispatch_split(CpuId(i as u8)).expect("admit");
+            }
+            assert_eq!(masks(&k), (0b1111, 0, 0), "all four dispatching");
+            for cpu in CPUS {
+                assert!(k.admit_ap_dispatch_split(cpu).is_err(), "once each");
+            }
+        }
+    }
+
+    /// **A CPU whose readiness never arrived takes no work.** CPU 2 never completes its admission
+    /// (its timer or readiness failed): it stays wake-only, balanced placement never names it, a
+    /// pinned enqueue onto it is refused, and a task whose explicit affinity names it is refused
+    /// rather than queued where nothing would run it. Its neighbours are unaffected.
+    #[test]
+    fn a_cpu_missing_readiness_receives_no_work() {
+        let k = with_wake_only_aps();
+        k.admit_ap_dispatch_split(CpuId(1)).expect("admit 1");
+        k.admit_ap_dispatch_split(CpuId(3)).expect("admit 3");
+        assert_eq!(masks(&k).1, 0b0100, "CPU 2 alone is wake-only");
+        k.with(|s| {
+            for tid in 80..=86 {
+                s.register_task(tid).expect("task");
+            }
+        });
+        // Spread six ordinary tasks: none may land on CPU 2.
+        for tid in 80..=85 {
+            let landed = k.enqueue_task_split(CPU0, tid).expect("placed");
+            assert_ne!(landed, CpuId(2), "tid {tid} placed on the unready CPU");
+        }
+        assert_eq!(k.with(|s| s.runnable_count_on_cpu(CpuId(2))), 0);
+        assert!(
+            k.enqueue_on_cpu_split(CpuId(2), 86).is_err(),
+            "no pinned enqueue"
+        );
+        k.with(|s| {
+            s.with_tcb_mut(86, |tcb| tcb.cpu_affinity = Some(CpuId(2)))
+                .expect("tcb")
+        });
+        assert!(
+            k.enqueue_task_split(CPU0, 86).is_err(),
+            "explicit affinity to an unready CPU is refused, not queued"
+        );
+        assert_eq!(k.with(|s| s.runnable_count_on_cpu(CpuId(2))), 0);
+    }
+
+    /// **CPU and mask boundaries.** The scheduler's masks are 64-bit: an id at or beyond the limit
+    /// is refused by every owner, and a present-but-never-registered CPU cannot be admitted.
+    #[test]
+    fn cpu_identity_and_mask_boundaries_are_refused() {
+        let k = with_wake_only_aps();
+        assert!(
+            k.admit_ap_dispatch_split(CpuId(4)).is_err(),
+            "never registered"
+        );
+        assert!(k.admit_ap_dispatch_split(CpuId(63)).is_err());
+        assert!(
+            k.admit_ap_dispatch_split(CpuId(64)).is_err(),
+            "beyond the masks"
+        );
+        assert!(k.admit_ap_dispatch_split(CpuId(255)).is_err());
+        assert!(
+            k.admit_ap_dispatch_split(CPU0).is_err(),
+            "the boot CPU is never admitted"
+        );
+        assert_eq!(masks(&k), (0b1111, 0b1110, 0), "nothing changed");
+        // And the RISC-V identity rule: logical ids are dense whatever the hart ids are.
+        use crate::arch::riscv_hart_admission as policy;
+        assert_eq!(policy::logical_present_bitmap(0b1001_0101, 4, 64), 0b1111);
+        assert_eq!(policy::logical_present_bitmap(0b1111, 0, 3), 0b0111);
+    }
+
+    /// **Balanced first placement spreads work; explicit affinity is honoured; a home is kept.**
+    #[test]
+    fn placement_spreads_and_affinity_is_honoured() {
+        let k = with_wake_only_aps();
+        for cpu in CPUS {
+            k.admit_ap_dispatch_split(cpu).expect("admit");
+        }
+        k.with(|s| {
+            for tid in 90..=95 {
+                s.register_task(tid).expect("task");
+            }
+            s.enqueue_on_cpu(CPU0, 95).expect("load CPU 0");
+        });
+        let mut landed = std::collections::BTreeSet::new();
+        for tid in 90..=92 {
+            landed.insert(k.enqueue_task_split(CPU0, tid).expect("placed").0);
+        }
+        assert_eq!(
+            landed,
+            [1u8, 2, 3].into_iter().collect(),
+            "three tasks, three idle secondaries"
+        );
+        // Explicit affinity names a loaded CPU and wins over balance.
+        k.with(|s| {
+            s.with_tcb_mut(93, |tcb| tcb.cpu_affinity = Some(CpuId(2)))
+                .expect("tcb")
+        });
+        assert_eq!(k.enqueue_task_split(CPU0, 93), Ok(CpuId(2)));
+        // A home is kept: block 90 on its CPU and wake it from CPU 0.
+        let home = k
+            .with(|s| s.with_tcb_mut(90, |tcb| tcb.cpu_affinity).flatten())
+            .expect("home fixed by first placement");
+        k.with(|s| {
+            assert_eq!(s.dispatch_next_on_cpu(home), Some(90));
+            assert_eq!(s.block_current_on_cpu(home), Some(90));
+        });
+        k.wake_tid_to_runnable_split(CPU0, crate::kernel::ipc::ThreadId(90))
+            .expect("wake");
+        assert_eq!(
+            k.with(|s| s.with_tcb_mut(90, |tcb| tcb.cpu_affinity).flatten()),
+            Some(home)
+        );
+        assert!(
+            k.with(|s| s.runnable_count_on_cpu(home)) >= 1,
+            "queued at home"
+        );
+    }
+
+    /// **Every remote enqueue notifies exactly its target**, on every CPU, after the commit — the
+    /// half of enqueue-versus-idle the target cannot provide itself.
+    #[test]
+    fn a_remote_enqueue_notifies_its_own_target_only() {
+        let k = with_wake_only_aps();
+        for cpu in CPUS {
+            k.admit_ap_dispatch_split(cpu).expect("admit");
+        }
+        k.with(|s| {
+            for tid in 100..=103 {
+                s.register_task(tid).expect("task");
+            }
+        });
+        for (i, cpu) in CPUS.into_iter().enumerate() {
+            let before: Vec<u64> = (0..4u8)
+                .map(|c| crate::arch::hal::enqueues_notified(CpuId(c)))
+                .collect();
+            k.with(|s| {
+                s.with_tcb_mut(100 + i as u64, |tcb| tcb.cpu_affinity = Some(cpu))
+                    .expect("tcb")
+            });
+            assert_eq!(k.enqueue_task_split(CPU0, 100 + i as u64), Ok(cpu));
+            for c in 0..4u8 {
+                let delta = crate::arch::hal::enqueues_notified(CpuId(c)) - before[c as usize];
+                assert_eq!(
+                    delta,
+                    u64::from(c == cpu.0),
+                    "CPU {c} after an enqueue to {cpu:?}"
+                );
+            }
+        }
+    }
+
+    /// **Healthy churn on every CPU reclaims everything.** Processes run on each of CPUs 1..=3 in
+    /// turn, exit, and leave that CPU idle through the production idle transition; each is reaped
+    /// from CPU 0 through NR 31. No reap finds its root loaded on an idle CPU, so no space is
+    /// quarantined and the frame count returns exactly.
+    #[test]
+    fn exit_idle_reap_on_every_cpu_reclaims_everything() {
+        use super::ap_sched1::{
+            free_frames, quarantined_spaces, reap_on, run_exit_and_idle, spawn_process,
+        };
+        crate::arch::hal::reset_all_active_address_spaces();
+        let k = with_wake_only_aps();
+        for cpu in CPUS {
+            k.admit_ap_dispatch_split(cpu).expect("admit");
+        }
+        let frames_before = free_frames(&k);
+        let spaces_before = quarantined_spaces(&k);
+        for round in 0..3u64 {
+            for (i, cpu) in CPUS.into_iter().enumerate() {
+                let tid = 120 + round * 3 + i as u64;
+                let (asid, _phys) = spawn_process(&k, tid);
+                run_exit_and_idle(&k, tid, asid, cpu, true);
+                let outcome = reap_on(&k, CPU0, tid);
+                assert_eq!(
+                    outcome.address_spaces_quarantined, 0,
+                    "round {round} CPU {cpu:?}: no quarantine"
+                );
+                assert!(
+                    k.with(|s| s.with_user_spaces(|spaces| spaces.get(asid).is_none())),
+                    "round {round} CPU {cpu:?}: the space and its root are gone"
+                );
+            }
+        }
+        assert_eq!(quarantined_spaces(&k), spaces_before);
+        assert_eq!(free_frames(&k), frames_before, "every frame returned");
+    }
+
+    /// **Four CPUs, one clock; a deadline wakes a task on any CPU.** Interrupts on CPUs 1..=3
+    /// consume only their own quanta; the scheduler tick moves once per clock-owner interrupt.
+    /// A receive homed on CPU 3 with a deadline two ticks out is woken by the clock owner's
+    /// timeout drain, queued on CPU 3 and CPU 3 is notified.
+    #[test]
+    fn many_cpus_one_clock_and_a_deadline_wakes_any_cpu() {
+        std::thread::Builder::new()
+            .name("ap_sched2_deadline".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let k = with_wake_only_aps();
+                for cpu in CPUS {
+                    k.admit_ap_dispatch_split(cpu).expect("admit");
+                }
+                let t0 = k.scheduler_tick_now_split_read();
+                for _ in 0..7 {
+                    for cpu in CPUS {
+                        let _ = k.scheduler_tick_split_mut(cpu);
+                    }
+                }
+                assert_eq!(
+                    k.scheduler_tick_now_split_read(),
+                    t0,
+                    "secondaries move no clock"
+                );
+                let target = CpuId(3);
+                let (deadline, tid) = k.with(|s| {
+                    s.register_task(110).expect("task");
+                    s.set_current_cpu(target).expect("on CPU 3");
+                    s.with_tcb_mut(110, |tcb| tcb.cpu_affinity = Some(target))
+                        .expect("tcb");
+                    s.enqueue_on_cpu(target, 110).expect("enqueue");
+                    assert_eq!(s.dispatch_next_on_cpu(target), Some(110));
+                    let (_eid, _send, recv) = s.create_endpoint(2).expect("endpoint");
+                    let deadline = s.scheduler_tick_now().wrapping_add(2);
+                    assert_eq!(
+                        s.ipc_recv_until_deadline(recv, deadline).expect("recv"),
+                        None
+                    );
+                    s.set_current_cpu(CPU0).expect("back");
+                    (deadline, 110u64)
+                });
+                for i in 1..=2u64 {
+                    let _ = k.scheduler_tick_split_mut(CPU0);
+                    assert_eq!(k.scheduler_tick_now_split_read(), t0 + i);
+                }
+                let before = crate::arch::hal::enqueues_notified(target);
+                drive_production_timeouts(&k, CPU0, deadline);
+                k.with(|s| {
+                    assert!(matches!(
+                        s.task_status(tid),
+                        Some(TaskStatus::Runnable | TaskStatus::Running)
+                    ));
+                    assert_eq!(s.runnable_count_on_cpu(target), 1, "woken at home, CPU 3");
+                });
+                assert_eq!(
+                    crate::arch::hal::enqueues_notified(target),
+                    before + 1,
+                    "and CPU 3 is told"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 }
