@@ -40,7 +40,8 @@
  *
  * P never stores to MBX after its first fork: the store would copy-on-write split P's mailbox
  * onto a new frame while the kernel keeps publishing into the old one (now the child's). The
- * churn child table therefore lives in BUF: BUF+0x800 CHILD[k].
+ * churn child table therefore lives in BUF: BUF+0x800 CHILD[k]. IPC thread k's own buffers are at
+ * BUF+0x900+k*0x80.
  *
  * Phases (P drives; the kernel records every step with a causal stamp):
  *   0  one deadline thread per secondary (NR 5 on an endpoint nobody sends to).
@@ -95,6 +96,7 @@
     .set M_S_WAITING, 0x1a0
     .set M_S_ACK, 0x1e0
     .set B_CHILD, 0x800
+    .set B_IPC, 0x900
 
     /* Worker-stack slot bases: deadline 1..7, spinners 8..23, sleepers 25..31, IPC 33..39. */
     .set D_SLOT0, 0
@@ -404,6 +406,9 @@ p_c:
     j 1b
 2:  li s1, 1
 p_c_thread:
+    /* The previous thread has read its last pong before the next one starts. */
+    addi s2, s1, -1
+    AWAIT_EQ M_T_DONE, s2
     li t0, MBX
     sd s1, M_T_TURN(t0)
     li s3, 1
@@ -737,6 +742,12 @@ w_sleep:
 w_ipc:
     MYSLOT s7
     addi s7, s7, -IPC_SLOT0
+    /* s9 = this thread's own buffers (send +0x00, receive +0x20, metadata +0x40): the threads
+       share P's space, so a shared buffer would let the next thread's receive set-up overwrite
+       this one's unread pong. */
+    slli s9, s7, 7
+    li t0, (BUF + B_IPC)
+    add s9, s9, t0
     li t0, MBX
 1:  ld t1, M_T_TURN(t0)
     bne t1, s7, 1b
@@ -745,17 +756,16 @@ w_ipc:
     LOG m_t_start
     li s1, 1
 t_round:
-    li t0, (BUF + 0x280)
     li t1, 0x5050
-    sh t1, 0(t0)
-    sh s1, 2(t0)
-    sh s7, 4(t0)
+    sh t1, 0(s9)
+    sh s1, 2(s9)
+    sh s7, 4(s9)
     li t1, 0x4749
-    sh t1, 6(t0)
+    sh t1, 6(s9)
     li s6, 0
 1:  addi s6, s6, 1
     lw a0, yarm_apsw_cap_ep_p
-    li a1, (BUF + 0x280)
+    mv a1, s9
     li a2, 8
     li a3, 0
     li a4, 0
@@ -770,20 +780,18 @@ t_round:
 2:  li s6, 0
 t_recv:
     addi s6, s6, 1
-    li t0, BUF
     li t1, -1
-    sd t1, 0x140(t0)
+    sd t1, 0x40(s9)
     lw a0, yarm_apsw_cap_ep_t
-    li a1, (BUF + 0x100)
+    addi a1, s9, 0x20
     li a2, 32
-    li a3, (BUF + 0x140)
+    addi a3, s9, 0x40
     li a4, 0x28
     li a5, 0
     li a7, NR_RECV
     ecall
     mv s4, a0
-    li t0, BUF
-    ld s5, 0x140(t0)
+    ld s5, 0x40(s9)
     li t3, 7
     bne s4, t3, 5f
     li t3, -1
@@ -792,10 +800,9 @@ t_recv:
     bgeu s6, t3, 5f
     YIELD
     j t_recv
-5:  li t0, BUF
-    lhu t1, 0x102(t0)
-    lhu t2, 0x100(t0)
-    lhu t4, 0x104(t0)
+5:  lhu t1, 0x22(s9)
+    lhu t2, 0x20(s9)
+    lhu t4, 0x24(s9)
     li s8, 0
     beqz s4, 4f
     li t3, -1

@@ -379,9 +379,43 @@ pub fn note_timer_irq(cpu: CpuId) {
     if !enabled() {
         return;
     }
-    if let Some(n) = IRQS.get(cpu.0 as usize) {
-        n.fetch_add(1, Ordering::AcqRel);
+    if cpu.0 == 0 {
+        CLOCK_TICKING.store(true, Ordering::SeqCst);
     }
+    if let Some(n) = IRQS.get(cpu.0 as usize) {
+        n.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// CPU 0's tick advance for the interrupt [`note_timer_irq`] counted is complete.
+pub fn note_timer_tick_done(cpu: CpuId) {
+    if enabled() && cpu.0 == 0 {
+        CLOCK_TICKING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// CPU 0 is between counting a timer interrupt and advancing the tick for it.
+static CLOCK_TICKING: AtomicBool = AtomicBool::new(false);
+
+/// One consistent `(tick, CPU 0 timer interrupts)` pair, read from any CPU. The two are separate
+/// words, so a plain pair of loads can split one CPU 0 interrupt across a window edge (seen once
+/// at 8 harts: 41 ticks over 42 interrupts). Retried until no CPU 0 interrupt was in flight and
+/// the count did not move; bounded, after which the last pair is returned.
+fn clock_snapshot(shared: &SharedKernel) -> (u64, u64) {
+    let mut pair = (0, 0);
+    for _ in 0..100_000 {
+        let i1 = IRQS[0].load(Ordering::SeqCst);
+        let busy1 = CLOCK_TICKING.load(Ordering::SeqCst);
+        let tick = shared.scheduler_tick_now_split_read();
+        let busy2 = CLOCK_TICKING.load(Ordering::SeqCst);
+        let i2 = IRQS[0].load(Ordering::SeqCst);
+        pair = (tick, i2);
+        if i1 == i2 && !busy1 && !busy2 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    pair
 }
 
 /// A timer preemption the settlement COMMITTED, with its outgoing task.
@@ -529,8 +563,9 @@ pub fn observe_user_marker(
                 w[0].compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             }) {
-                w[1].store(shared.scheduler_tick_now_split_read(), Ordering::Release);
-                w[2].store(IRQS[0].load(Ordering::Acquire), Ordering::Release);
+                let (tick, irq0) = clock_snapshot(shared);
+                w[1].store(tick, Ordering::Release);
+                w[2].store(irq0, Ordering::Release);
                 w[3].store(
                     IRQS.get(c as usize)
                         .map_or(0, |n| n.load(Ordering::Acquire)),
@@ -539,7 +574,7 @@ pub fn observe_user_marker(
             }
         }
         "D_AFTER" => {
-            let tick = shared.scheduler_tick_now_split_read();
+            let (tick, irq0) = clock_snapshot(shared);
             if let Some(w) = D_WIN.iter().find(|w| w[0].load(Ordering::Acquire) == tid) {
                 let own = IRQS
                     .get(c as usize)
@@ -553,7 +588,7 @@ pub fn observe_user_marker(
                         a2,
                         a3,
                         tick.wrapping_sub(w[1].load(Ordering::Acquire)),
-                        IRQS[0].load(Ordering::Acquire) - w[2].load(Ordering::Acquire),
+                        irq0.wrapping_sub(w[2].load(Ordering::Acquire)),
                         own.wrapping_sub(w[3].load(Ordering::Acquire)),
                     ],
                 );

@@ -5177,6 +5177,12 @@ fn settle_recognized_timer(
     ))]
     crate::arch::riscv64::apsched_witness::note_timer_irq(cpu);
     let ticked = shared.scheduler_tick_split_mut(cpu);
+    #[cfg(all(
+        feature = "riscv64-apsched-witness",
+        not(feature = "hosted-dev"),
+        target_arch = "riscv64"
+    ))]
+    crate::arch::riscv64::apsched_witness::note_timer_tick_done(cpu);
     let (tick, preempting) = match ticked {
         crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => (tick, true),
         crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => (tick, false),

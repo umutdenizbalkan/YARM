@@ -93,7 +93,10 @@ def grade(text, ncpus):
     if conflicts:
         fails.append(f"progress: two verified copies disagree for stamps {conflicts[:5]}")
     if end is None:
-        return [f"progress: no verified dump trailer (P never reached its end)"] + fails
+        # Without the record, the console still names any CPU that was refused admission.
+        named = [f"admission: CPU {m.group(1)} refused ({m.group(2)})"
+                 for m in re.finditer(r"RISCV_AP_STATE cpu=(\d+) [^\n]*admitted=0 [^\n]*reason=(\w+)", text)]
+        return [f"progress: no verified dump trailer (P never reached its end)"] + named + fails
     count = int(end["count"])
     if end.get("overflow") != "0":
         fails.append("progress: the record overflowed")
@@ -430,6 +433,8 @@ def self_test():
         "no end": (_render(base[:-1]), 3),
         "a one-CPU boot": (_render(base), 1),
         "a topology beyond the witness layout": (_render(base), 9),
+        "an unadmitted CPU and no trailer": (_render(base[:5]).split("APSW_DUMP_END")[0]
+                                              + "\nRISCV_AP_STATE cpu=2 discovered=1 initialized=1 irq_ready=0 admitted=0 dispatching=0 reason=no_irq_ready", 3),
         "the mailbox split copy-on-write": (_render(base, extra="APSW_PROVISIONED p_tid=9600 asid=4 image=1\n"
                                                      "VM_COW_SPLIT_COMMITTED cpu=0 tid=9600 asid=4 va=0x20070000 old_pa=0x1 new_pa=0x2 acked=1"), 3),
     }

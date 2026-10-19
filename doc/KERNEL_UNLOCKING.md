@@ -29290,6 +29290,9 @@ every admitted CPU:
   pins that order.
 * **Enqueue versus idle.** The target clears `SSIP` before it consumes its mailbox, then looks at
   its queue, then waits. A commit after the look always leaves a notification that ends the wait.
+* **A reschedule IPI to a busy CPU.** It ends an idle wait. A CPU that is running a task returns
+  to it, and picks up the newly queued work at its next scheduling point, normally its own timer
+  quantum. So a secondary's own timer is a prerequisite of dispatch, and admission checks it.
 * **Timers.** Each dispatching CPU arms its own timer, which consumes only that CPU's quantum. The
   global tick moves only on the clock owner (CPU 0), so there is no time multiplication. An idle
   secondary parks its timer behind a backstop. A global deadline is drained by the clock owner and
@@ -29349,11 +29352,28 @@ copy CRC-checked) dumped after P ends, and the grader orders by stamp, never by 
 * *Mailbox frame check:* the grader also refuses a run in which P's mailbox page was split
   copy-on-write.
 
-**A witness defect found and fixed before the freeze.** The first N-CPU run hung in churn round 1.
-P stored each forked child's TID into its mailbox page. After a fork that store split the page
-copy-on-write, so P moved to a new frame while the kernel kept publishing into the old one, by then
-the child's. P never saw `REAPED`. The child table now lives in P's buffer page, P never stores to
-the mailbox after its first fork, and the grader enforces that.
+**Witness defects found and fixed before the freeze.** Each was a fixture defect, not a kernel
+one.
+
+* *Mailbox split.* The first N-CPU run hung in churn round 1. P stored each forked child's TID into
+  its mailbox page. After a fork that store split the page copy-on-write, so P moved to a new frame
+  while the kernel kept publishing into the old one, by then the child's. P never saw `REAPED`. The
+  child table now lives in P's buffer page, P never stores to the mailbox after its first fork, and
+  the grader enforces that.
+* *Record overflow at 8 harts.* An 8-hart run completed every phase but overflowed the 2,048-entry
+  record: 1,689 of its records were preemptions. The record now keeps each task's first preemption
+  and at most 48 per CPU beyond that, in 4,096 entries. The full per-CPU counts are in the dump
+  trailer, and the seal reports both (`preempt_recorded=`, `preempt_counted=`).
+* *Shared IPC buffer.* The next 8-hart run failed one pong and one ordering check. The IPC threads
+  share P's space, and they used one receive buffer. P handed the turn to thread k+1 before thread
+  k had read its last pong, so thread k+1's receive set-up overwrote thread k's metadata word. Each
+  IPC thread now has its own buffers, and P starts thread k+1 only after thread k reports done.
+* *Split clock sample.* The run after that failed one clock check by one: 41 ticks over 42 CPU 0
+  interrupts. The tick and the witness's interrupt count are separate words. CPU 0 counts an
+  interrupt and then advances the tick, and a secondary read the two with plain loads, so one
+  interrupt could straddle a window edge. CPU 0 now brackets the pair (`note_timer_irq`,
+  `note_timer_tick_done`). The sampler retries until no CPU 0 interrupt is in flight and the count
+  is unchanged, so `dtick == dirq0` is exact.
 
 **Controls.** Each control breaks only CPU 2 of a 4-hart run, while CPUs 1 and 3 stay healthy. The
 patches and results are kept with the qualification record.
