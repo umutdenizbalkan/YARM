@@ -12,29 +12,39 @@
 //!   hart id (slot = hart id), and the boot hart starts secondaries through SBI HSM for ids below
 //!   it. A hart with a larger id is never started; it is reported excluded
 //!   ([`Exclusion::BeyondHandoffTable`]), never silently ignored.
+//! * [`PRODUCTION_CPU_CEILING`] — the total number of logical CPUs production admits, the boot
+//!   CPU included: 8. It is a qualification bound, not a storage one — it is the largest
+//!   topology the scheduling witness covers and qualification ran — and it is applied to the
+//!   COUNT, independently of which hart booted. A secondary whose claim would reach logical id 8
+//!   is excluded ([`Exclusion::ProductionCeiling`]) and never started, whether the boot hart lies
+//!   inside the handoff table or not.
 //! * [`DISPATCH_TRAP_STACKS`] — a CPU that dispatches runs the whole syscall, fault and timer
 //!   settlement on its trap stack, so it needs the boot hart's trap-stack size (2 MiB; the
 //!   `riscv-trap-stack-debt` note on it says why that is a correctness size, not a measured
-//!   bound). One such stack per possible secondary. That is `HANDOFF_SLOTS`, not one fewer: the
-//!   boot hart may itself lie outside the table (QEMU's OpenSBI picks the boot hart by lottery, so
-//!   at `-smp 10` it can be hart 9), and then every one of the 8 slots is a secondary. 16 MiB of
-//!   `.bss` on the 8-slot table. A logical CPU without one would be [`Exclusion::NoDispatchStack`]: it
-//!   exists and parks, but is never released to dispatch.
-//! * `max_cpus` — the scheduler's per-CPU tables and 64-bit masks.
+//!   bound). One such stack per secondary the ceiling admits: `PRODUCTION_CPU_CEILING - 1` = 7,
+//!   14 MiB of `.bss`, reserved statically whatever the machine's hart count. (AP-SCHED2 reserved
+//!   8, one per handoff slot, because the boot hart may lie outside the table; under the ceiling
+//!   the 8th could never be used.) A logical CPU without one would be
+//!   [`Exclusion::NoDispatchStack`]: it exists and parks, but is never released to dispatch.
+//! * `max_cpus` — the scheduler's per-CPU tables and 64-bit masks (logical identity capacity,
+//!   distinct from the ceiling).
 //!
 //! # Identity
 //!
-//! The hart id is never the logical CPU. Logical CPU 0 is whichever hart booted, and each other
-//! admissible hart takes the lowest free logical id ≥ 1, in hart-id order (the order the boot hart
-//! starts them). So a nonzero boot hart and non-contiguous hart ids still produce a dense logical
+//! The hart id is never the logical CPU. Logical CPU 0 is whichever hart booted — its real hart id
+//! is kept, whatever it is — and each other admissible hart takes the lowest free logical id ≥ 1,
+//! in ascending hart-id order (the order the boot hart starts them), so which secondaries the
+//! ceiling admits is deterministic: the lowest-numbered eligible ones. So a nonzero boot hart and non-contiguous hart ids still produce a dense logical
 //! numbering, and [`logical_present_bitmap`] is that numbering — not the hart-id bitmap.
 
 /// Secondary handoff table size (slot = hart id).
 pub const HANDOFF_SLOTS: usize = 8;
 
-/// Dispatch-sized trap stacks: one per possible secondary, including the case where the boot hart
-/// lies outside the handoff table and all `HANDOFF_SLOTS` are secondaries.
-pub const DISPATCH_TRAP_STACKS: usize = HANDOFF_SLOTS;
+/// The total number of logical CPUs production admits, the boot CPU included.
+pub const PRODUCTION_CPU_CEILING: usize = 8;
+
+/// Dispatch-sized trap stacks: one per secondary the ceiling admits. The boot CPU keeps its own.
+pub const DISPATCH_TRAP_STACKS: usize = PRODUCTION_CPU_CEILING - 1;
 
 /// Why a hart, or a logical CPU, takes no part in dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +53,8 @@ pub enum Exclusion {
     BeyondHandoffTable,
     /// No free logical CPU id below the scheduler's limit.
     NoLogicalCpu,
+    /// The production ceiling already holds [`PRODUCTION_CPU_CEILING`] logical CPUs.
+    ProductionCeiling,
     /// A logical CPU with no dispatch-sized trap stack: it parks, wake-only, and is never released.
     NoDispatchStack,
 }
@@ -53,6 +65,7 @@ impl Exclusion {
         match self {
             Exclusion::BeyondHandoffTable => "beyond_hsm_handoff_table",
             Exclusion::NoLogicalCpu => "no_free_logical_cpu",
+            Exclusion::ProductionCeiling => "beyond_production_cpu_ceiling",
             Exclusion::NoDispatchStack => "no_dispatch_trap_stack",
         }
     }
@@ -71,11 +84,18 @@ pub fn admissible_secondary_hart(hart: usize, boot_hart: usize) -> Result<(), Ex
 }
 
 /// The logical CPU the next admissible secondary claims, given the ids already `claimed` (bit 0,
-/// the boot hart's, is always claimed): the lowest free id ≥ 1 below `max_cpus`.
+/// the boot hart's, is always claimed): the lowest free id ≥ 1 below `max_cpus`, provided it is
+/// inside the production ceiling. Each refusal names the limit that actually bound: the
+/// scheduler's tables ([`Exclusion::NoLogicalCpu`]) or the ceiling
+/// ([`Exclusion::ProductionCeiling`]).
 pub fn next_logical_cpu(claimed: u64, max_cpus: usize) -> Result<usize, Exclusion> {
-    (1..max_cpus.min(64))
+    let id = (1..max_cpus.min(64))
         .find(|&id| claimed & (1u64 << id) == 0)
-        .ok_or(Exclusion::NoLogicalCpu)
+        .ok_or(Exclusion::NoLogicalCpu)?;
+    if id >= PRODUCTION_CPU_CEILING {
+        return Err(Exclusion::ProductionCeiling);
+    }
+    Ok(id)
 }
 
 /// May logical CPU `cpu` dispatch, given `stacks` dispatch-sized trap stacks for secondaries?
@@ -218,8 +238,8 @@ mod tests {
     }
 
     #[test]
-    fn every_secondary_slot_has_a_dispatch_stack_and_no_more() {
-        assert_eq!(DISPATCH_TRAP_STACKS, HANDOFF_SLOTS);
+    fn every_admissible_secondary_has_a_dispatch_stack_and_no_more() {
+        assert_eq!(DISPATCH_TRAP_STACKS, PRODUCTION_CPU_CEILING - 1);
         assert!(dispatch_capable(0, DISPATCH_TRAP_STACKS));
         for cpu in 1..=DISPATCH_TRAP_STACKS {
             assert!(dispatch_capable(cpu, DISPATCH_TRAP_STACKS));
@@ -239,17 +259,76 @@ mod tests {
     }
 
     #[test]
-    fn a_boot_hart_beyond_the_table_leaves_every_slot_a_dispatching_secondary() {
-        // -smp 10 with boot hart 9: harts 0..=7 take logical CPUs 1..=8, hart 8 has no slot.
+    fn a_boot_hart_beyond_the_table_still_gives_eight_cpus() {
+        // -smp 10 with boot hart 9: harts 0..=6 take logical CPUs 1..=7; hart 7 is in the table
+        // but the ceiling is full; hart 8 has no slot. Eight CPUs, as with any other boot hart.
         let p = plan(0x3ff, 9, 64);
         assert_eq!(p[9], Ok(0));
-        for hart in 0..8 {
+        for hart in 0..7 {
             assert_eq!(p[hart], Ok(hart + 1));
             assert!(dispatch_capable(hart + 1, DISPATCH_TRAP_STACKS));
         }
+        assert_eq!(p[7], Err(Some(Exclusion::ProductionCeiling)));
         assert_eq!(p[8], Err(Some(Exclusion::BeyondHandoffTable)));
-        assert_eq!(logical_present_bitmap(0x3ff, 9, 64), 0x1ff);
-        assert_eq!(excluded_harts(0x3ff, 9, 64), 1 << 8);
+        assert_eq!(logical_present_bitmap(0x3ff, 9, 64), 0xff);
+        assert_eq!(excluded_harts(0x3ff, 9, 64), (1 << 7) | (1 << 8));
+        // -smp 9 with boot hart 8: the whole table is secondaries; the ceiling stops at hart 6.
+        let p = plan(0x1ff, 8, 64);
+        assert_eq!(p[8], Ok(0));
+        assert_eq!(p[7], Err(Some(Exclusion::ProductionCeiling)));
+        assert_eq!(logical_present_bitmap(0x1ff, 8, 64), 0xff);
+    }
+
+    #[test]
+    fn the_ceiling_is_a_count_whatever_hart_boots() {
+        // Every boot hart of a 10-hart board admits exactly 8 CPUs, the boot hart keeping its
+        // real id as logical 0, and the secondaries chosen in ascending hart order.
+        for boot in 0..10 {
+            let p = plan(0x3ff, boot, 64);
+            assert_eq!(p[boot], Ok(0), "boot hart {boot}");
+            assert_eq!(
+                logical_present_bitmap(0x3ff, boot, 64),
+                0xff,
+                "boot hart {boot}"
+            );
+            let admitted: alloc::vec::Vec<usize> =
+                (0..10).filter(|&h| h != boot && p[h].is_ok()).collect();
+            let mut eligible: alloc::vec::Vec<usize> =
+                (0..HANDOFF_SLOTS).filter(|&h| h != boot).collect();
+            eligible.truncate(PRODUCTION_CPU_CEILING - 1);
+            assert_eq!(admitted, eligible, "boot hart {boot}");
+            for h in 0..10 {
+                if let Err(Some(why)) = p[h] {
+                    let named = if h >= HANDOFF_SLOTS {
+                        Exclusion::BeyondHandoffTable
+                    } else {
+                        Exclusion::ProductionCeiling
+                    };
+                    assert_eq!(why, named, "boot hart {boot}, hart {h}");
+                }
+            }
+        }
+        // Sparse ids: harts 1, 3, 4, 5, 6, 7 and 12, 40 present, boot hart 40 (outside the
+        // table). Six table harts are secondaries: logical 1..=6, seven CPUs, nobody excluded by
+        // the ceiling; 12 is beyond the table.
+        let harts = (1u64 << 1) | (0b1111_1000) | (1 << 12) | (1 << 40);
+        let p = plan(harts, 40, 64);
+        assert_eq!(p[40], Ok(0));
+        assert_eq!(
+            (p[1], p[3], p[4], p[5], p[6], p[7]),
+            (Ok(1), Ok(2), Ok(3), Ok(4), Ok(5), Ok(6))
+        );
+        assert_eq!(p[12], Err(Some(Exclusion::BeyondHandoffTable)));
+        assert_eq!(logical_present_bitmap(harts, 40, 64), 0x7f);
+        // Absent harts claim nothing: only the present ones are numbered.
+        assert_eq!(plan(0b1000_0001, 0, 64)[7], Ok(1));
+        assert_eq!(plan(0b1000_0001, 0, 64)[3], Err(None));
+        // A scheduler smaller than the ceiling binds first, and says so.
+        assert_eq!(plan(0xff, 0, 4)[4], Err(Some(Exclusion::NoLogicalCpu)));
+        assert_eq!(
+            Exclusion::ProductionCeiling.marker(),
+            "beyond_production_cpu_ceiling"
+        );
     }
 
     #[test]

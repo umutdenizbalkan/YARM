@@ -201461,3 +201461,63 @@ mod ap_sched2 {
             .expect("join");
     }
 }
+
+/// AP-SCHED3 — closure of AP-SCHED2's contract (§A) and AArch64 production SMP (§B–§D).
+#[cfg(test)]
+mod ap_sched3 {
+    #[allow(unused_imports)]
+    use super::*;
+
+    fn body_of<'a>(src: &'a str, head: &str) -> &'a str {
+        src.split(head)
+            .nth(1)
+            .unwrap_or_else(|| panic!("`{head}` exists"))
+            .split("\n}\n")
+            .next()
+            .expect("its body")
+    }
+
+    /// **A hart the policy refuses is never started.** The production ceiling (8 logical CPUs,
+    /// the boot CPU included) is enforced by the claim; a refused claim returns no handoff, the
+    /// refusal is named with its reason, and the start loop skips the hart before the HSM start —
+    /// so an excluded hart holds no logical identity, no stack and no work, whichever hart booted.
+    #[test]
+    fn a_refused_hart_is_named_and_never_started() {
+        let boot = include_str!("../../arch/riscv64/boot.rs");
+        let prep = body_of(
+            boot,
+            "fn prepare_secondary_handoff(slot: usize, hart_id: usize)",
+        );
+        let refuse = prep
+            .find("if let Err(why) = claim {")
+            .expect("a refused claim is handled first");
+        let named = prep
+            .find("RISCV_SECONDARY_CPU_ID_REJECTED hart={} slot={} reason={} started=0")
+            .expect("and named with its reason");
+        let none = prep.find("return None;").expect("and returns no handoff");
+        let stack = prep
+            .find("secondary_trap_stack_for(slot, cpu_id)")
+            .expect("the stack assignment");
+        assert!(refuse < named && named < none && none < stack);
+        let park = body_of(boot, "fn park_qemu_virt_secondaries_once(context: &str) {");
+        let skip = park
+            .find("let Some(handoff_ptr) = prepare_secondary_handoff(slot, hart_id) else {")
+            .expect("the loop skips a refused hart");
+        let start = park
+            .find("crate::arch::riscv64::sbi::hsm_hart_start(hart_id, entry_addr, handoff_ptr)")
+            .expect("the start");
+        assert!(skip < start, "the refusal precedes the start");
+        use crate::arch::riscv_hart_admission as policy;
+        assert_eq!(policy::PRODUCTION_CPU_CEILING, 8);
+        assert_eq!(
+            policy::DISPATCH_TRAP_STACKS,
+            policy::PRODUCTION_CPU_CEILING - 1,
+            "one dispatch stack per secondary the ceiling admits"
+        );
+        // The claim goes through the policy's ceiling-aware rule.
+        let claim = body_of(boot, "fn claim_logical_cpu_id_for_hart(");
+        assert!(
+            claim.contains("policy::next_logical_cpu(seen, crate::kernel::scheduler::MAX_CPUS)?")
+        );
+    }
+}

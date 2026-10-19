@@ -12,6 +12,13 @@
 #   LOGDIR=...     where the build, the artifact identity and the boot log land
 #   SKIP_BUILD=1   reuse the artifacts already in $LOGDIR/build
 #   TIMEOUT_SECS   boot budget (default 600)
+#   TOPOLOGY_ONLY=1  stop once P has seen every released CPU admitted (`APS P_AP_READY`) and grade
+#                  only the admission/exclusion section (`--topology-only`): the short boundary
+#                  boot for -smp 9 / -smp 10, where the boot hart is OpenSBI's lottery
+#
+# Beyond 8 harts, production admits 8 logical CPUs (the ceiling, the boot CPU included); the
+# grader re-derives the excluded harts from the boot hart the kernel reports and grades them
+# apart from the work.
 #
 # One App-class process P; its threads and fork children are placed by the production balanced
 # placement. The grader (`scripts/grade-riscv64-apsched-witness.py`) orders every witness record by
@@ -70,9 +77,12 @@ fi
 
 echo "boot smp=$SMP" >>"$LOGDIR/artifact-identity.txt"
 echo "[apsched-witness] booting -smp $SMP with no diagnostic knob"
-python3 - "$QEMU_BIN" "$BUILD_DIR" "$BOOT_LOG" "${TIMEOUT_SECS:-600}" "$CMDLINE" "$SMP" <<'PY'
+STOP_AT=APSW_DUMP_END
+[[ "${TOPOLOGY_ONLY:-0}" == "1" ]] && STOP_AT="APS P_AP_READY"
+python3 - "$QEMU_BIN" "$BUILD_DIR" "$BOOT_LOG" "${TIMEOUT_SECS:-600}" "$CMDLINE" "$SMP" "$STOP_AT" <<'PY'
 import subprocess, sys, time, os, select
 qemu, build, log, budget, cmdline, smp = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), sys.argv[5], sys.argv[6]
+stop_at = sys.argv[7].encode()
 args = [qemu, "-machine", "virt", "-cpu", "rv64", "-m", "512M", "-smp", smp,
         "-nographic", "-monitor", "none", "-serial", "stdio",
         "-bios", os.path.join(build, "opensbi-fw_dynamic.bin"), "-no-reboot",
@@ -90,7 +100,7 @@ with open(log, "wb") as out:
                 break
             out.write(chunk); out.flush()
             tail = (tail + chunk)[-4096:]
-            if seen is None and b"APSW_DUMP_END" in tail:
+            if seen is None and stop_at in tail:
                 seen = time.time()
         now = time.time()
         if (seen is not None and now - seen > 3) or now - start > budget:
@@ -102,4 +112,7 @@ PY
 [[ -s "$BOOT_LOG" ]] || { seal "result=fail reason=no_boot_log"; exit 1; }
 NORM="$LOGDIR/boot.norm.log"
 tr '\r' '\n' <"$BOOT_LOG" >"$NORM"
+if [[ "${TOPOLOGY_ONLY:-0}" == "1" ]]; then
+  exec python3 -I scripts/grade-riscv64-apsched-witness.py --topology-only "$SMP" "$NORM"
+fi
 python3 -I scripts/grade-riscv64-apsched-witness.py --expect-cpus "$SMP" "$NORM"

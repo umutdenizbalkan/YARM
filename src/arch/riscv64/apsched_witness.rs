@@ -50,6 +50,9 @@ const M_EXPECTED: u64 = 0x020;
 const M_REAPED: u64 = 0x038;
 const M_PRE: u64 = 0x100;
 const M_IDLE: u64 = 0x140;
+/// CPU 0's timer interrupts — the global tick's source — that P's bounded waits measure their
+/// deadlines against. CPU 0's timer is never the one a control breaks.
+const M_CLOCK: u64 = 0x060;
 /// The CPUs the mailbox has per-CPU words for (the 8-slot handoff table's maximum).
 const MBX_CPUS: usize = 8;
 
@@ -274,7 +277,7 @@ const KINDS: [&str; 12] = [
 ];
 
 /// The user steps, by code (index + 1); 0 = a step this table does not know.
-const STEPS: [&str; 30] = [
+const STEPS: [&str; 31] = [
     "P_START",
     "P_NO_AP",
     "P_AP_READY",
@@ -305,6 +308,7 @@ const STEPS: [&str; 30] = [
     "EXIT_REFUSED",
     "D_AFTER",
     "P_REAP",
+    "P_W_TIMEOUT",
 ];
 
 fn step_code(step: &str) -> u64 {
@@ -383,7 +387,10 @@ pub fn note_timer_irq(cpu: CpuId) {
         CLOCK_TICKING.store(true, Ordering::SeqCst);
     }
     if let Some(n) = IRQS.get(cpu.0 as usize) {
-        n.fetch_add(1, Ordering::SeqCst);
+        let now = n.fetch_add(1, Ordering::SeqCst) + 1;
+        if cpu.0 == 0 {
+            publish(M_CLOCK, now);
+        }
     }
 }
 

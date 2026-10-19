@@ -5,7 +5,15 @@
 # AP-SCHED1/AP-SCHED2 — grade the RISC-V production SMP-scheduling witness, for every expected CPU.
 #
 # Usage: grade-riscv64-apsched-witness.py --expect-cpus N BOOT_LOG
+#        grade-riscv64-apsched-witness.py --topology-only N BOOT_LOG
 #        grade-riscv64-apsched-witness.py --self-test
+#
+# N is the boot's hart count (`-smp N`). Production admits at most PRODUCTION_CPU_CEILING (8)
+# logical CPUs, the boot CPU included, so the expected logical CPUs are 0..min(N, 8)-1. Beyond 8
+# harts, the excluded harts are graded SEPARATELY (the topology section, `APSW_TOPOLOGY_SEAL`):
+# re-derived here from the boot hart the kernel reports, by the policy's own rule, and each must be
+# named with its reason and never started. `--topology-only` grades that section alone (a short
+# boot that stops once P has seen every expected CPU admitted).
 #
 # The witness keeps its records in the kernel and dumps them at P's last step, every line twice
 # with a CRC-32 of its body. Only lines whose CRC verifies are evidence (the harts' console output
@@ -46,11 +54,13 @@ WAKE_ROUNDS = 3
 IPC_ROUNDS = 4
 FORK_ROUNDS = 4
 WITNESS_CPUS = 8
+PRODUCTION_CPU_CEILING = 8
+HANDOFF_SLOTS = 8
 TIMED_OUT = 9
 FAIL_STEPS = {
     "P_NO_AP", "P_PRE_TIMEOUT", "P_A_TIMEOUT", "P_B_TIMEOUT", "P_NO_IDLE", "P_NO_ACK",
     "P_PING_RAW", "P_C_TIMEOUT", "P_REAP_TIMEOUT", "P_SPAWN_FAIL", "P_FORK_FAIL", "EXIT_REFUSED",
-    "?",
+    "P_W_TIMEOUT", "?",
 }
 FORBIDDEN = [
     "panicked at", "KERNEL PANIC", "RISCV_SMP3_SECONDARY_ADMITTED", "RISCV_AP_SCHED_ADMISSION_REFUSED",
@@ -83,8 +93,81 @@ def parse(text):
     return recs, end, conflicts
 
 
+def policy_plan(nharts, boot_hart):
+    """The RISC-V admission policy (`src/arch/riscv_hart_admission.rs`), re-derived: hart -> logical
+    CPU, or the exclusion marker. Ascending hart order; a hart beyond the handoff table is never
+    started; the ceiling counts logical CPUs, the boot CPU included."""
+    plan, nxt = {boot_hart: 0}, 1
+    for h in range(nharts):
+        if h == boot_hart:
+            continue
+        if h >= HANDOFF_SLOTS:
+            plan[h] = "beyond_hsm_handoff_table"
+        elif nxt >= PRODUCTION_CPU_CEILING:
+            plan[h] = "beyond_production_cpu_ceiling"
+        else:
+            plan[h], nxt = nxt, nxt + 1
+    return plan
+
+
+def grade_topology(text, nharts):
+    """Admission and exclusion at the boundary, graded apart from the work: exactly the policy's
+    logical CPUs admitted and dispatching, every other hart named with its reason, never started."""
+    fails = []
+    m = re.search(r"RISCV_LOGICAL_CPUS present=0x([0-9a-f]+) count=(\d+) excluded_harts=0x([0-9a-f]+) "
+                  r"hart_bitmap=0x([0-9a-f]+) boot_hart=(\d+)", text)
+    if not m:
+        return ["topology: no RISCV_LOGICAL_CPUS record"], None
+    present, count, excl, harts, boot = (int(m.group(1), 16), int(m.group(2)), int(m.group(3), 16),
+                                          int(m.group(4), 16), int(m.group(5)))
+    plan = policy_plan(nharts, boot)
+    want_cpus = [c for c in plan.values() if isinstance(c, int)]
+    want_present = sum(1 << c for c in want_cpus)
+    want_excl = {h: r for h, r in plan.items() if isinstance(r, str)}
+    if harts != (1 << nharts) - 1:
+        fails.append(f"topology: hart bitmap 0x{harts:x}, the boot has {nharts} harts")
+    if present != want_present or count != len(want_cpus):
+        fails.append(f"topology: logical CPUs 0x{present:x} ({count}), the policy gives 0x{want_present:x}")
+    if len(want_cpus) > PRODUCTION_CPU_CEILING:
+        fails.append(f"topology: {len(want_cpus)} logical CPUs exceed the ceiling")
+    if excl != sum(1 << h for h in want_excl):
+        fails.append(f"topology: excluded harts 0x{excl:x}, the policy excludes 0x{sum(1 << h for h in want_excl):x}")
+    for h, why in sorted(want_excl.items()):
+        named = re.findall(rf"RISCV_HART_EXCLUDED hart={h} reason=(\w+) dispatch=0", text)
+        if named != [why]:
+            fails.append(f"topology: hart {h} must be excluded once as {why}, named {named}")
+        if why == "beyond_production_cpu_ceiling" and not re.search(
+                rf"RISCV_SECONDARY_CPU_ID_REJECTED hart={h} slot={h} reason={why} started=0", text):
+            fails.append(f"topology: hart {h}'s claim was not refused at the ceiling")
+        if re.search(rf"RISCV_SECONDARY_HART_PARK hart={h}\b", text):
+            fails.append(f"topology: excluded hart {h} was started")
+    for h, c in sorted(plan.items()):
+        if isinstance(c, int) and c and not re.search(
+                rf"RISCV_AP_SCHED_ADMITTED hart={h} cpu={c} mode=production", text):
+            fails.append(f"topology: hart {h} was not admitted as logical CPU {c}")
+    rel = re.search(r"RISCV_AP_RELEASE_PLAN trap_ready=0x[0-9a-f]+ dispatch_capable=0x[0-9a-f]+ released=0x([0-9a-f]+)", text)
+    want_rel = want_present & ~1
+    if not rel or int(rel.group(1), 16) != want_rel:
+        fails.append(f"topology: released {rel.group(1) if rel else None}, the policy releases 0x{want_rel:x}")
+    for c in range(1, 64):
+        if want_present >> c & 1 and not re.search(
+                rf"RISCV_AP_STATE cpu={c} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none", text):
+            fails.append(f"topology: CPU {c} never reported dispatching")
+    summary = (f"harts={nharts} boot_hart={boot} logical=0x{present:x} count={count} "
+               f"excluded={','.join(f'{h}:{r}' for h, r in sorted(want_excl.items())) or 'none'}")
+    return fails, summary
+
+
 def grade(text, ncpus):
     fails = []
+    nharts = ncpus
+    if nharts > PRODUCTION_CPU_CEILING:
+        # Beyond the ceiling the work is owed by the 8 admitted CPUs; the exclusions are graded
+        # in the topology section, not as console failures here.
+        tfails, _ = grade_topology(text, nharts)
+        fails += tfails
+        ncpus = PRODUCTION_CPU_CEILING
+        text = re.sub(r"RISCV_HART_EXCLUDED hart=\d+ reason=\w+ dispatch=0", "", text)
     expected = set(range(1, ncpus))
     if not expected:
         return ["admission: the witness needs at least one secondary (-smp >= 2)"]
@@ -138,6 +221,17 @@ def grade(text, ncpus):
     for r in R:
         if r["kind"] == "USER" and r["step"] in FAIL_STEPS:
             fails.append(f"progress: failure step {r['step']} (stamp {r['seq']})")
+    # Phase A's clock deadline (P's waits are bounded by CPU 0's clock, which no control breaks):
+    # the record names the CPUs that fell short, so the failure is per CPU, not a stall.
+    for r in user("P_W_TIMEOUT"):
+        fails.append(f"placement: phase A's deadline passed with {r['v'][0]} of {r['v'][1]} spinners running")
+    for r in user("P_PRE_TIMEOUT"):
+        short, never = r["v"][0], r["v"][1]
+        for c in range(64):
+            if never >> c & 1:
+                fails.append(f"preemption: phase A's deadline passed and CPU {c} had taken no timer preemption at all")
+            elif short >> c & 1:
+                fails.append(f"preemption: phase A's deadline passed with CPU {c} below its minimum of timer preemptions")
     p_start = user("P_START")
     if not p_start or p_start[0]["cpu"] != 0:
         fails.append("placement: P did not start on CPU 0")
@@ -433,12 +527,60 @@ def self_test():
         "failure step": (_render(base[:-1] + [("USER", 0, 9600, "P_NO_ACK", 3), base[-1]]), 3),
         "no end": (_render(base[:-1]), 3),
         "a one-CPU boot": (_render(base), 1),
-        "a topology beyond the witness layout": (_render(base), 9),
+        "a nine-hart boot with no topology record": (_render(base), 9),
         "an unadmitted CPU and no trailer": (_render(base[:5]).split("APSW_DUMP_END")[0]
                                               + "\nRISCV_AP_STATE cpu=2 discovered=1 initialized=1 irq_ready=0 admitted=0 dispatching=0 reason=no_irq_ready", 3),
         "the mailbox split copy-on-write": (_render(base, extra="APSW_PROVISIONED p_tid=9600 asid=4 image=1\n"
                                                      "VM_COW_SPLIT_COMMITTED cpu=0 tid=9600 asid=4 va=0x20070000 old_pa=0x1 new_pa=0x2 acked=1"), 3),
     }
+    # Phase A's clock deadline: P's record names the CPU, and the grade says which.
+    a_done = idx(lambda e: e[3] == "P_A_DONE")
+    timed = without(lambda e: e[0] == "PREEMPT" and e[1] == 2)
+    timed = timed[:a_done] + [("USER", 0, 9600, "P_PRE_TIMEOUT", 1 << 2, 1 << 2)] + timed[a_done:]
+    got = grade(_render(timed), 3)
+    assert any("CPU 2 had taken no timer preemption at all" in f for f in got), got
+    assert not any("CPU 1 had" in f or "CPU 1 below" in f for f in got), got
+    cases_run += 1
+    got = grade(_render(base[:a_done] + [("USER", 0, 9600, "P_W_TIMEOUT", 5, 6)] + base[a_done:]), 3)
+    assert any("5 of 6 spinners running" in f for f in got), got
+    cases_run += 1
+    # The topology section: -smp 10, the boot hart inside and outside the table.
+    for boot, rejected in ((0, None), (9, 7), (8, 7), (3, None)):
+        plan = policy_plan(10, boot)
+        cpus = sorted(c for c in plan.values() if isinstance(c, int))
+        excl = {h: r for h, r in plan.items() if isinstance(r, str)}
+        assert len(cpus) == 8 and (rejected is None or excl.get(rejected) == "beyond_production_cpu_ceiling")
+        con = [f"RISCV_LOGICAL_CPUS present=0xff count=8 excluded_harts=0x{sum(1 << h for h in excl):x} "
+               f"hart_bitmap=0x3ff boot_hart={boot}"]
+        con += [f"RISCV_HART_EXCLUDED hart={h} reason={r} dispatch=0" for h, r in sorted(excl.items())]
+        con += [f"RISCV_SECONDARY_CPU_ID_REJECTED hart={h} slot={h} reason={r} started=0"
+                for h, r in sorted(excl.items()) if h < HANDOFF_SLOTS]
+        con += [f"RISCV_AP_SCHED_ADMITTED hart={h} cpu={c} mode=production" for h, c in plan.items()
+                if isinstance(c, int) and c]
+        con += ["RISCV_AP_RELEASE_PLAN trap_ready=0xff dispatch_capable=0xff released=0xfe knob=0"]
+        con += [f"RISCV_AP_STATE cpu={c} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none"
+                for c in range(1, 8)]
+        good = "\n".join(con)
+        assert grade_topology(good, 10)[0] == [], (boot, grade_topology(good, 10))
+        cases_run += 1
+        if rejected is not None:
+            bad = good + f"\nRISCV_SECONDARY_HART_PARK hart={rejected}"
+            assert grade_topology(bad, 10)[0], "an excluded hart that was started must fail"
+            bad = good.replace(f"RISCV_HART_EXCLUDED hart={rejected} reason=beyond_production_cpu_ceiling", "")
+            assert grade_topology(bad, 10)[0], "an unnamed exclusion must fail"
+            nine = good.replace("present=0xff count=8", "present=0x1ff count=9")
+            assert grade_topology(nine, 10)[0], "nine logical CPUs must fail"
+            cases_run += 3
+    full = _fixture(8)
+    con = ("RISCV_LOGICAL_CPUS present=0xff count=8 excluded_harts=0x300 hart_bitmap=0x3ff boot_hart=0\n"
+           "RISCV_HART_EXCLUDED hart=8 reason=beyond_hsm_handoff_table dispatch=0\n"
+           "RISCV_HART_EXCLUDED hart=9 reason=beyond_hsm_handoff_table dispatch=0\n"
+           + "\n".join(f"RISCV_AP_SCHED_ADMITTED hart={c} cpu={c} mode=production" for c in range(1, 8)) + "\n"
+           "RISCV_AP_RELEASE_PLAN trap_ready=0xff dispatch_capable=0xff released=0xfe knob=0\n"
+           + "\n".join(f"RISCV_AP_STATE cpu={c} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none"
+                       for c in range(1, 8)))
+    assert grade(_render(full, extra=con), 10) == [], grade(_render(full, extra=con), 10)
+    cases_run += 1
     for name, (text, n) in cases.items():
         got = grade(text, n)
         assert got, f"self-test: the '{name}' control passed"
@@ -450,12 +592,23 @@ def main():
         self_test()
         return 0
     args = sys.argv[1:]
+    if len(args) == 3 and args[0] == "--topology-only":
+        nharts = int(args[1])
+        tfails, summary = grade_topology(open(args[2], errors="replace").read(), nharts)
+        for f in tfails:
+            print(f"[apsched-witness][fail] {f}")
+        print(f"APSW_TOPOLOGY_SEAL arch=riscv64 {summary or ''} result={'fail' if tfails else 'ok'}")
+        return 1 if tfails else 0
     if len(args) != 3 or args[0] != "--expect-cpus":
         print("usage: grade-riscv64-apsched-witness.py --expect-cpus N BOOT_LOG")
         return 2
     ncpus = int(args[1])
     text = open(args[2], errors="replace").read()
+    if ncpus > PRODUCTION_CPU_CEILING:
+        tfails, summary = grade_topology(text, ncpus)
+        print(f"APSW_TOPOLOGY_SEAL arch=riscv64 {summary or ''} result={'fail' if tfails else 'ok'}")
     fails = grade(text, ncpus)
+    ncpus = min(ncpus, PRODUCTION_CPU_CEILING)
     for f in fails:
         print(f"[apsched-witness][fail] {f}")
     if fails:

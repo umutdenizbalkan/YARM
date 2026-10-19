@@ -34,6 +34,7 @@
  *   +0x048 T_TURN      P: the IPC thread whose rounds run now
  *   +0x050 T_DONE      IPC threads: amoadd 1 each
  *   +0x058 W_STARTED   spinners: amoadd 1 each, once running
+ *   +0x060 CLOCK       kernel: CPU 0's timer interrupts (the global tick's source), at each one
  *   +0x100 PRE[c]      kernel: timer preemptions of this process's workers on CPU c (8 CPUs)
  *   +0x140 IDLE[c]     kernel: 1 from CPU c's idle arrival until it next leaves idle
  *   +0x180 F[k] (u32)  sleeper k's futex word
@@ -92,6 +93,7 @@
     .set M_T_TURN, 0x048
     .set M_T_DONE, 0x050
     .set M_W_STARTED, 0x058
+    .set M_CLOCK, 0x060
     .set M_PRE, 0x100
     .set M_IDLE, 0x140
     .set M_F, 0x180
@@ -118,8 +120,14 @@
     .set FORK_ROUNDS, 4
     .set CHILD_SPIN, 3000000
 
-    /* Bounded waits, in yields. */
+    /* Bounded waits: a yield count AND a deadline on the global clock, whichever ends first.
+       The yield count alone could outlast any boot budget: on a contended CPU 0 one yield can
+       cost a whole quantum. The deadline is read from CLOCK, which CPU 0's timer drives, so it
+       still expires when a SECONDARY's timer is the thing that is broken. 6000 ticks (60 s of
+       guest time at 100 Hz) is about five times the longest phase of a healthy 8-CPU run
+       (phase A, ~1200 ticks). */
     .set WAIT_YIELDS, 400000
+    .set WAIT_TICKS, 6000
     /* The spinners' pattern base; slot N adds N << 32. */
     .set PAT_BASE, 0xA5A5000000000000
 
@@ -135,6 +143,26 @@
     sub a1, a1, a0
     li a7, NR_LOG
     ecall
+    .endm
+
+    /* Start a bounded wait: s0 = the yield budget, s9 = the clock deadline. Uses t0. */
+    .macro WAIT_BEGIN
+    li s0, WAIT_YIELDS
+    li t0, MBX
+    ld s9, M_CLOCK(t0)
+    li t0, WAIT_TICKS
+    add s9, s9, t0
+    .endm
+
+    /* One more round of a bounded wait: back to \again unless the yield budget is spent or the
+       clock deadline (s9) has passed; otherwise fall through. Uses s0, t0. */
+    .macro WAIT_NEXT again
+    addi s0, s0, -1
+    beqz s0, .Lwn_out\@
+    li t0, MBX
+    ld t0, M_CLOCK(t0)
+    bltu t0, s9, \again
+.Lwn_out\@:
     .endm
 
     .macro STR name, text
@@ -170,7 +198,7 @@
        placement sees them empty and a wake has an idle target. On timeout carry on — the grader
        then sees what happened. Uses s0, t0..t6. */
     .macro AWAIT_ALL_IDLE
-    li s0, WAIT_YIELDS
+    WAIT_BEGIN
 81: li t0, MBX
     mv t1, s11
     li t4, 0
@@ -185,20 +213,18 @@
     addi t4, t4, 1
     j 82b
 84: YIELD
-    addi s0, s0, -1
-    bnez s0, 81b
+    WAIT_NEXT 81b
 89:
     .endm
 
     /* Bounded: wait until the u64 at MBX+\off equals register \reg. Uses s0, t0, t1. */
     .macro AWAIT_EQ off, reg
-    li s0, WAIT_YIELDS
+    WAIT_BEGIN
 91: li t0, MBX
     ld t1, \off(t0)
     beq t1, \reg, 92f
     YIELD
-    addi s0, s0, -1
-    bnez s0, 91b
+    WAIT_NEXT 91b
 92:
     .endm
 
@@ -233,7 +259,7 @@ yarm_apsw_start:
     li a3, 0
     LOG m_p_start
     /* Every released secondary admitted: AP_READY == EXPECTED != 0. */
-    li s0, WAIT_YIELDS
+    WAIT_BEGIN
 p_ap:
     li t0, MBX
     ld t1, M_EXPECTED(t0)
@@ -241,8 +267,7 @@ p_ap:
     ld t2, M_AP_READY(t0)
     beq t1, t2, p_ready
 1:  YIELD
-    addi s0, s0, -1
-    bnez s0, p_ap
+    WAIT_NEXT p_ap
     li t0, MBX
     ld a2, M_EXPECTED(t0)
     ld a3, M_AP_READY(t0)
@@ -289,8 +314,31 @@ p_ready:
     /* Preemptions count only once EVERY spinner runs: a spinner spawned late onto a CPU whose
        total was already met would otherwise start after the stop and never be preempted. From
        here, round-robin gives each of a CPU's spinners a preemption within that CPU's next
-       PRE_MIN (at most PRE_MIN spinners share a CPU under balanced placement). */
-2:  AWAIT_EQ M_W_STARTED, s2
+       PRE_MIN (at most PRE_MIN spinners share a CPU under balanced placement).
+       ONE deadline covers the whole phase (both waits below): s9 is set here and not reset. */
+2:  WAIT_BEGIN
+p_w:
+    li t0, MBX
+    ld t1, M_W_STARTED(t0)
+    beq t1, s2, p_w_ok
+    YIELD
+    WAIT_NEXT p_w
+    /* Not every spinner ran by the deadline: say so, then grade the preemptions from zero (the
+       snapshot below would be meaningless), against the deadline that has already passed. */
+    li t0, MBX
+    ld a2, M_W_STARTED(t0)
+    mv a3, s2
+    LOG m_p_w_timeout
+    li t1, (BUF + B_PRESNAP)
+    li t4, 0
+1:  slli t6, t4, 3
+    add t5, t6, t1
+    sd zero, 0(t5)
+    addi t4, t4, 1
+    li t2, 8
+    bne t4, t2, 1b
+    j p_pre_begin
+p_w_ok:
     li t0, MBX
     li t1, (BUF + B_PRESNAP)
     li t4, 0
@@ -302,6 +350,7 @@ p_ready:
     addi t4, t4, 1
     li t2, 8
     bne t4, t2, 1b
+p_pre_begin:
     li s0, WAIT_YIELDS
 p_pre:
     li t0, MBX
@@ -328,12 +377,45 @@ p_pre:
     addi t4, t4, 1
     j 1b
 3:  YIELD
-    addi s0, s0, -1
-    bnez s0, p_pre
+    WAIT_NEXT p_pre
+    /* Phase A's deadline: name the CPUs that fell short. a2 = CPUs (0 and the expected ones)
+       below their minimum since the snapshot; a3 = those with no timer preemption at all. Then
+       stop the spinners, let them report, and end: nothing after this phase is meaningful. */
     li t0, MBX
-    ld a2, M_PRE(t0)
-    ld a3, 0x108(t0)
-    LOG m_p_pre_timeout
+    li a6, (BUF + B_PRESNAP)
+    ori t3, s11, 1
+    li t4, 0
+    li a2, 0
+    li a3, 0
+1:  beqz t3, 4f
+    andi t5, t3, 1
+    beqz t5, 2f
+    slli t6, t4, 3
+    add t5, t6, t0
+    ld t1, M_PRE(t5)
+    li t5, 1
+    sll t5, t5, t4
+    bnez t1, 5f
+    or a3, a3, t5
+5:  add t6, t6, a6
+    ld t2, 0(t6)
+    sub t1, t1, t2
+    li t2, PRE_MIN
+    bnez t4, 6f
+    li t2, PRE0_MIN
+6:  bgeu t1, t2, 2f
+    or a2, a2, t5
+2:  srli t3, t3, 1
+    addi t4, t4, 1
+    j 1b
+4:  LOG m_p_pre_timeout
+    li t0, MBX
+    li t1, 1
+    sd t1, M_STOP(t0)
+    li t0, MBX
+    ld s2, M_W_STARTED(t0)
+    AWAIT_EQ M_SPIN_DONE, s2
+    j p_end
 p_stop:
     li t0, MBX
     li t1, 1
@@ -364,14 +446,13 @@ p_b_one:
     /* sleeper s1 announced round s3? */
     slli s5, s1, 3
     addi s5, s5, M_S_WAITING
-    li s0, WAIT_YIELDS
+    WAIT_BEGIN
 1:  li t0, MBX
     add t1, t0, s5
     ld t1, 0(t1)
     beq t1, s3, 2f
     YIELD
-    addi s0, s0, -1
-    bnez s0, 1b
+    WAIT_NEXT 1b
     slli a2, s1, 8
     or a2, a2, s3
     li a3, 0
@@ -394,14 +475,13 @@ p_b_one:
     mv s4, a0
     slli s5, s1, 3
     addi s5, s5, M_S_ACK
-    li s0, WAIT_YIELDS
+    WAIT_BEGIN
 3:  li t0, MBX
     add t1, t0, s5
     ld t1, 0(t1)
     beq t1, s3, 4f
     YIELD
-    addi s0, s0, -1
-    bnez s0, 3b
+    WAIT_NEXT 3b
     slli a2, s1, 8
     or a2, a2, s3
     li a3, 0
@@ -545,6 +625,7 @@ p_d_reap_one:
     li t0, (BUF + B_CHILD)
     add t1, t1, t0
     ld s5, 0(t1)
+    WAIT_BEGIN
     li s0, (WAIT_YIELDS / 8)
 1:  mv a2, s5
     slli a3, s3, 8
@@ -557,8 +638,7 @@ p_d_reap_one:
     YIELD
     YIELD
     YIELD
-    addi s0, s0, -1
-    bnez s0, 1b
+    WAIT_NEXT 1b
     mv a2, s5
     slli a3, s3, 8
     or a3, a3, s1
@@ -866,6 +946,7 @@ yarm_apsw_cap_ep_d: .word 0x63636363
     STR m_p_no_ap, "APS P_NO_AP"
     STR m_p_ap, "APS P_AP_READY"
     STR m_p_pre_timeout, "APS P_PRE_TIMEOUT"
+    STR m_p_w_timeout, "APS P_W_TIMEOUT"
     STR m_p_a_done, "APS P_A_DONE"
     STR m_p_b_timeout, "APS P_B_TIMEOUT"
     STR m_p_wake, "APS P_WAKE"

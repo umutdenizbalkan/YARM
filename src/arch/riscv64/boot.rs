@@ -3074,13 +3074,15 @@ static mut RISCV64_SECONDARY_STACKS: [SecondaryBootStack; QEMU_VIRT_HSM_SECONDAR
     [SecondaryBootStack([0; RISCV64_SECONDARY_BOOT_STACK_BYTES]);
         QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
 
-/// AP-SCHED2 §2 — the dispatch-sized trap stacks, one per possible secondary (index = logical CPU
-/// − 1, `riscv_hart_admission::dispatch_stack_index`). A dispatching CPU runs the whole syscall,
-/// fault and timer settlement on its trap stack exactly as the boot hart does, so each gets the
-/// boot hart's size: the `riscv-trap-stack-debt` note on `RISCV_TRAP_STACK_SIZE` is why that is a
-/// correctness size and not a measured bound, and no stack is shared. Cost: 2 MiB each, 16 MiB of
-/// `.bss` for the 8-slot table (8, because the boot hart may lie outside the table) (RAM only, not image size); `stage_riscv64_ram_map` refuses to boot
-/// if the image's end reaches the initrd QEMU places above it.
+/// AP-SCHED2 §2 / AP-SCHED3 §A — the dispatch-sized trap stacks, one per secondary the production
+/// ceiling admits (index = logical CPU − 1, `riscv_hart_admission::dispatch_stack_index`). A
+/// dispatching CPU runs the whole syscall, fault and timer settlement on its trap stack exactly as
+/// the boot hart does, so each gets the boot hart's size: the `riscv-trap-stack-debt` note on
+/// `RISCV_TRAP_STACK_SIZE` is why that is a correctness size and not a measured bound, and no stack
+/// is shared. Cost: 7 × 2 MiB = 14 MiB of `.bss`, reserved statically on every machine whatever
+/// its hart count (RAM only, not image size), beside the boot hart's own 2 MiB; allocation
+/// proportional to the admitted CPUs is open work. `stage_riscv64_ram_map` refuses to boot if the
+/// image's end reaches the initrd QEMU places above it.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 static mut RISCV64_DISPATCH_TRAP_STACKS: [RiscvTrapStack;
     crate::arch::riscv_hart_admission::DISPATCH_TRAP_STACKS] =
@@ -3634,8 +3636,12 @@ fn secondary_trap_stack_for(slot: usize, cpu_id: usize) -> (usize, usize) {
     }
 }
 
+/// Returns the handoff to start the hart with, or `None` when its claim was refused: such a hart
+/// is named (`RISCV_SECONDARY_CPU_ID_REJECTED … reason=`) and NEVER started, so it cannot hold a
+/// logical identity, a stack or any work (AP-SCHED3 §A: a hart beyond the production ceiling is
+/// excluded exactly like one beyond the handoff table).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
+fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> Option<usize> {
     use core::sync::atomic::Ordering;
     let handoffs = core::ptr::addr_of_mut!(RISCV64_SECONDARY_HANDOFFS) as *mut SecondaryHartHandoff;
     let handoff = unsafe { handoffs.add(slot) };
@@ -3645,6 +3651,15 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
     // trapping CpuId from a frame pointer. A rejected mapping leaves `cpu_id = usize::MAX` and
     // the secondary fails closed into its pre-existing safe park.
     let claim = claim_logical_cpu_id_for_hart(hart_id);
+    if let Err(why) = claim {
+        early_marker!(
+            "RISCV_SECONDARY_CPU_ID_REJECTED hart={} slot={} reason={} started=0",
+            hart_id,
+            slot,
+            why.marker()
+        );
+        return None;
+    }
     let cpu_id = *claim.as_ref().unwrap_or(&usize::MAX);
     let (trap_stack_top, trap_stack_size) = if cpu_id == usize::MAX {
         (0, 0)
@@ -3660,13 +3675,6 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
         RISCV64_SECONDARY_CPU_IDS[slot].store(cpu_id, Ordering::Release);
         RISCV64_SECONDARY_TRAP_STACK_SIZES[slot].store(trap_stack_size, Ordering::Release);
         RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].store(trap_stack_top, Ordering::Release);
-    } else {
-        early_marker!(
-            "RISCV_SECONDARY_CPU_ID_REJECTED hart={} slot={} reason={}",
-            hart_id,
-            slot,
-            claim.err().map_or("invalid_or_duplicate", |e| e.marker())
-        );
     }
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).hart_id), hart_id);
@@ -3688,7 +3696,7 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
             RISCV64_SECONDARY_ACK_START_REQUESTED,
         );
     }
-    handoff as usize
+    Some(handoff as usize)
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -3770,7 +3778,9 @@ fn park_qemu_virt_secondaries_once(context: &str) {
             Err(_) => continue,
         }
         let slot = hart_id;
-        let handoff_ptr = prepare_secondary_handoff(slot, hart_id);
+        let Some(handoff_ptr) = prepare_secondary_handoff(slot, hart_id) else {
+            continue;
+        };
         match crate::arch::riscv64::sbi::hsm_hart_start(hart_id, entry_addr, handoff_ptr) {
             Ok(()) => {
                 let acked = wait_for_secondary_ack(slot);
