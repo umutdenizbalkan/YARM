@@ -329,9 +329,19 @@ pub enum IpiRefusal {
 
 /// Pair every publication with the arrival that consumed it, and bound arrivals by requests. Pure.
 /// Returns `(arrivals, consumed_publications, empty_arrivals, merged_publications)`.
+///
+/// AP-SCHED3: a publication's stamp follows its `fetch_or`, but an arrival's stamp follows its
+/// mailbox `swap` (`ipi::take_arrival` consumes, then the record is pushed). So a second FRESH
+/// publication from the same source can be stamped after the swap that consumed the first and
+/// before that swap's arrival record: two fresh publications in a row, each later consumed by its
+/// own arrival. One such overlap per source/target pair is accepted (the earlier publication then
+/// goes to the earlier arrival); a third fresh one, or any publication left unconsumed at the end,
+/// still fails.
 pub fn check_ipi_population(recs: &[Rec]) -> Result<(usize, usize, usize, usize), IpiRefusal> {
-    // pending[src][dst] = index of the fresh publication not yet consumed.
+    // pending[src][dst] = index of the oldest fresh publication not yet consumed; second[src][dst]
+    // = the one fresh publication stamped before the arrival record that consumed the oldest.
     let mut pending = [[None::<usize>; 64]; 64];
+    let mut second = [[u16::MAX; 64]; 64];
     let mut arrivals = 0usize;
     let mut consumed = 0usize;
     let mut empty = 0usize;
@@ -345,6 +355,9 @@ pub fn check_ipi_population(recs: &[Rec]) -> Result<(usize, usize, usize, usize)
                 let was = pending[src][dst];
                 match (r.f[3], was) {
                     (0, None) => pending[src][dst] = Some(i),
+                    (0, Some(_)) if second[src][dst] == u16::MAX && i < usize::from(u16::MAX) => {
+                        second[src][dst] = i as u16;
+                    }
                     (1, Some(_)) => merged += 1,
                     _ => return Err(IpiRefusal::MergeInconsistent { publication: r.seq }),
                 }
@@ -371,6 +384,10 @@ pub fn check_ipi_population(recs: &[Rec]) -> Result<(usize, usize, usize, usize)
                     }
                     if pending[src][dst].take().is_none() {
                         return Err(IpiRefusal::Unexplained { arrival: r.seq });
+                    }
+                    if second[src][dst] != u16::MAX {
+                        pending[src][dst] = Some(usize::from(second[src][dst]));
+                        second[src][dst] = u16::MAX;
                     }
                     consumed += 1;
                 }
@@ -1846,10 +1863,46 @@ mod tests {
             check_ipi_population(&r),
             Err(IpiRefusal::MergeInconsistent { .. })
         ));
+        // AP-SCHED3: two fresh publications in a row are the one accepted stamp-order overlap,
+        // but each still needs its own arrival; a third fresh one is inconsistent.
         let r = seqd(vec![pubrec(0, 1, 0), pubrec(0, 1, 0)]);
         assert!(matches!(
             check_ipi_population(&r),
+            Err(IpiRefusal::Undelivered { .. })
+        ));
+        let r = seqd(vec![pubrec(0, 1, 0), pubrec(0, 1, 0), pubrec(0, 1, 0)]);
+        assert!(matches!(
+            check_ipi_population(&r),
             Err(IpiRefusal::MergeInconsistent { .. })
+        ));
+    }
+
+    /// AP-SCHED3 — the LOCK1 qualification run of `f20b50b1`: CPU 0 published to CPU 1 (fresh),
+    /// CPU 1's `take_arrival` swapped the mailbox, CPU 0 published again (fresh: the bit was
+    /// clear), and only then did CPU 1 push its arrival record; a second arrival consumed the second
+    /// publication. Both publications are consumed, each by its own arrival.
+    #[test]
+    fn a_publication_stamped_between_a_swap_and_its_record_is_consumed_by_the_next_arrival() {
+        let r = seqd(vec![
+            pubrec(0, 1, 0),
+            reqrec(0, 1, 0),
+            pubrec(0, 1, 0),
+            reqrec(0, 1, 0),
+            arr(1, 0b1, IDLE),
+            arr(1, 0b1, USER),
+        ]);
+        assert_eq!(check_ipi_population(&r), Ok((2, 2, 0, 0)));
+        // Without the second arrival the second publication is undelivered.
+        let r = seqd(vec![
+            pubrec(0, 1, 0),
+            reqrec(0, 1, 0),
+            pubrec(0, 1, 0),
+            reqrec(0, 1, 0),
+            arr(1, 0b1, IDLE),
+        ]);
+        assert!(matches!(
+            check_ipi_population(&r),
+            Err(IpiRefusal::Undelivered { .. })
         ));
     }
 

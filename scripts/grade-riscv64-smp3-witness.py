@@ -211,11 +211,15 @@ for i, r in enumerate(recs):
     if k == "ipi_published" and r["f"][2] in (0, 2):
         key = (r["cpu"], r["f"][0])
         if r["f"][3] == 0:
-            if key in pending:
-                fail("seq %d: fresh publication %d->%d while one was pending" % (r["seq"], key[0], key[1]))
-            pending[key] = i
+            # AP-SCHED3: one fresh publication may be stamped between the swap that consumed the
+            # pending one and that swap's arrival record (`take_arrival` swaps, then records); it
+            # queues behind it and needs its own arrival. A third is inconsistent.
+            q = pending.setdefault(key, [])
+            if len(q) >= 2:
+                fail("seq %d: fresh publication %d->%d while two were pending" % (r["seq"], key[0], key[1]))
+            q.append(i)
         else:
-            if key not in pending:
+            if not pending.get(key):
                 fail("seq %d: merged publication %d->%d with none pending" % (r["seq"], key[0], key[1]))
             merged += 1
         # The target named by hart must be the target's hart.
@@ -236,13 +240,14 @@ for i, r in enumerate(recs):
             empty += 1
         for src in range(64):
             if r["f"][0] & (1 << src):
-                if (src, r["cpu"]) not in pending:
+                if not pending.get((src, r["cpu"])):
                     fail("seq %d: consumed source %d on cpu %d with no pending publication" % (r["seq"], src, r["cpu"]))
                 else:
-                    del pending[(src, r["cpu"])]
+                    pending[(src, r["cpu"])].pop(0)
                     consumed += 1
-for (src, dst), i in pending.items():
-    fail("seq %d: publication %d->%d never consumed" % (recs[i]["seq"], src, dst))
+for (src, dst), q in pending.items():
+    for i in q:
+        fail("seq %d: publication %d->%d never consumed" % (recs[i]["seq"], src, dst))
 for cpu, n in taken.items():
     if n > requests.get(cpu, 0):
         fail("cpu %d consumed %d supervisor software interrupts but the firmware raised at most %d" % (cpu, n, requests.get(cpu, 0)))
