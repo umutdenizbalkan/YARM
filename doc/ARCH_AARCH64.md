@@ -460,6 +460,13 @@ Result: AArch64 `-smp 2` now attests `CROSS_ARCH_TOPOLOGY_OK reason=single_dispa
 Stage 195C FutexWake live oracle passes under **both** `-smp 1` and `-smp 2` (the SMP=1
 requirement is retired).
 
+> **Superseded by AP-SCHED3 (`doc/KERNEL_UNLOCKING.md`, §B–§E).** BSP-only dispatch affinity is no
+> longer the AArch64 policy: every secondary the admission plan accepts (GICv2, at most eight CPU
+> interfaces, the production ceiling of eight logical CPUs) still starts wake-only, but leaves it
+> through its own production admission once its stack, GIC interface, reschedule SGI and timer are
+> proven ready, and then takes ordinary balanced placement. `AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE`
+> is retired; a CPU is identified by its `TPIDR_EL1` logical id, never by `MPIDR_EL1 & 0xff`.
+
 The AArch64 queue-advancing **FutexWait** retirement (moving the dispatch phase out of the broad
 lock, x86_64 192A model) is the next slice; its first blocking return-path invariant is the
 in-lock `idle_no_eret_loop()` (`arch/aarch64/trap.rs`), which fires when the deferred

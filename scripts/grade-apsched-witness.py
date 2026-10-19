@@ -59,6 +59,10 @@ PRE_MIN = 4
 SPIN_SLOTS = 24
 
 
+# Idle wakes whose IPI arrived but lost the race to the CPU's own timer (filled by `grade`).
+RACED = []
+
+
 def mask_of(cpus):
     m = 0
     for c in cpus:
@@ -405,6 +409,7 @@ def grade(text, ncpus):
                      "from secondary ticks went unexercised")
 
     # idle wake — one sleeper per expected secondary
+    RACED.clear()
     sleepers = {r["v"][0]: r for r in user("S_START")}
     s_cpus = sorted(r["cpu"] for r in sleepers.values())
     if s_cpus != sorted(expected):
@@ -430,11 +435,20 @@ def grade(text, ncpus):
                 fails.append(f"{tag}: CPU {c} had left idle before the wake")
             ipi = [r for r in kind("IDLE_IPI", c) if w < r["seq"] < kk and r["v"][0] & 1]
             disp = [r for r in kind("IDLE_DISPATCH", c) if r["tid"] == tid and w < r["seq"] < kk]
-            if not ipi:
+            # The one benign race: the idle CPU's own (backstop) timer fired between the enqueue
+            # and the IPI's arrival, and dispatched the sleeper first; the IPI then arrived outside
+            # the idle boundary. Accepted only when that IPI is on record after the wake (before
+            # the next wake): a wake whose IPI never came still fails.
+            nxt = min([r["seq"] for r in user("P_WAKE") if r["seq"] > w] + [10 ** 9])
+            late = [r for r in kind("SGI", c) if w < r["seq"] < nxt]
+            raced = (not ipi and len(disp) == 1 and disp[0]["v"][0] != 1 and bool(late))
+            if raced:
+                RACED.append((k, rnd, c))
+            elif not ipi:
                 fails.append(f"{tag}: no IPI taken at CPU {c}'s idle boundary after the wake")
             if len(disp) != 1:
                 fails.append(f"{tag}: CPU {c} left idle for the sleeper {len(disp)} times")
-            elif disp[0]["v"][0] != 1:
+            elif disp[0]["v"][0] != 1 and not raced:
                 fails.append(f"{tag}: CPU {c} left idle for the sleeper by its timer, not the IPI")
             elif ipi and not ipi[0]["seq"] < disp[0]["seq"]:
                 fails.append(f"{tag}: the dispatch preceded the IPI")
@@ -730,6 +744,19 @@ def self_test():
         short = base[:a_done] + extra + [("USER", 0, 9600, "P_W_COVER", 7, 0b011)] + base[a_done:]
         assert any("stopped its top-up" in f for f in grade(_render(short), 3))
         cases_run += 1
+        # The backstop-timer race: accepted only with the IPI's late arrival on record.
+        ii = idx(lambda e: e[0] == "IDLE_IPI", wake1)
+        di = idx(lambda e: e[0] == "IDLE_DISPATCH", wake1)
+        cpu = base[ii][1]
+        raced = list(base)
+        raced[di] = base[di][:4] + (0,)
+        raced = raced[:di + 1] + [("SGI", cpu, 0, "-", 1)] + raced[di + 1:]
+        del raced[ii]
+        assert grade(_render(raced), 3) == [], grade(_render(raced), 3)
+        lost = [e for e in raced if e[0] != "SGI"]
+        got = grade(_render(lost), 3)
+        assert any("by its timer, not the IPI" in f for f in got), got
+        cases_run += 2
         got = grade(_render(base, stack=None), 3)
         assert any("no verified APSW_STACK" in f for f in got), got
         got = grade(_render(base, stack="APSW_STACK reserved=0x200000 used=0,0x6000,0,0,0,0,0,0"), 3)
@@ -833,7 +860,7 @@ def main():
     dtick = ",".join(f"{r['cpu']}:{r['v2']}={r['v3']}/{r['v4']}" for r in sorted(dl, key=lambda r: int(r["cpu"])))
     print(f"APSW_WITNESS_SEAL arch={ARCH} cpus={ncpus} admission=production per_cpu_work=threads,forks "
           f"preempt_recorded={','.join(map(str, pre))} preempt_counted={end.get('pre', '?')} registers=intact deadlines=timed_out dtick=dirq0/own:{dtick} "
-          f"idle_wakes={WAKE_ROUNDS * (ncpus - 1)}_ipi ipc={IPC_ROUNDS * (ncpus - 1)} "
+          f"idle_wakes={WAKE_ROUNDS * (ncpus - 1)}_ipi{'(' + str(len(RACED)) + '_timer_won_race)' if RACED else ''} ipc={IPC_ROUNDS * (ncpus - 1)} "
           f"churn={FORK_ROUNDS * (ncpus - 1)}_reaped_quarantined=0 records={end['count']}{stack_summary(text, ncpus)} result=ok")
     return 0
 

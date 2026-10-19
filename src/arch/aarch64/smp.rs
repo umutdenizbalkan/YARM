@@ -207,6 +207,8 @@ pub fn note_sgi_arrival(cpu: CpuId, raw_token: u32, origin: ArrivalOrigin, elr: 
     #[cfg(feature = "aarch64-apsched-witness")]
     if origin == ArrivalOrigin::IdleBoundary {
         crate::kernel::apsched_witness::note_idle_ipi(cpu, 1);
+    } else {
+        crate::kernel::apsched_witness::note_sgi_elsewhere(cpu, lane as u64);
     }
     let source_cpu = TARGETS
         .cpu_of_interface(sgi_source_interface(raw_token))

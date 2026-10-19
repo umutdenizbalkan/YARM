@@ -287,8 +287,10 @@ const K_REAP: u64 = 8;
 const K_REAP_GONE: u64 = 9;
 const K_ROOT_LEFT: u64 = 10;
 const K_RELEASE: u64 = 11;
+/// A reschedule IPI taken on a secondary OUTSIDE its idle boundary (AArch64: in EL0 or kernel code).
+const K_SGI: u64 = 12;
 
-const KINDS: [&str; 12] = [
+const KINDS: [&str; 13] = [
     "NONE",
     "AP_ADMITTED",
     "PREEMPT",
@@ -301,6 +303,7 @@ const KINDS: [&str; 12] = [
     "REAP_GONE",
     "ROOT_LEFT",
     "RELEASE",
+    "SGI",
 ];
 
 /// The user steps, by code (index + 1); 0 = a step this table does not know.
@@ -557,6 +560,16 @@ pub fn note_idle_ipi(cpu: CpuId, sources: u64) {
     record(K_IDLE_IPI, u64::from(cpu.0), 0, 0, [sources, 0, 0, 0, 0]);
 }
 
+/// AArch64: a reschedule SGI `cpu` took outside its idle boundary (`lane` 1 = from EL0, 3 = in
+/// kernel code). Lets the grader tell a wake whose SGI was delivered but lost the race to the idle
+/// CPU's own backstop timer from a wake whose SGI never came.
+pub fn note_sgi_elsewhere(cpu: CpuId, lane: u64) {
+    if !enabled() || cpu.0 == 0 {
+        return;
+    }
+    record(K_SGI, u64::from(cpu.0), 0, 0, [lane, 0, 0, 0, 0]);
+}
+
 /// `cpu` leaves idle to run `tid`, by the trigger that woke it.
 pub fn note_idle_dispatch(shared: &SharedKernel, cpu: CpuId, tid: u64, by_ipi: bool) {
     if !enabled() {
@@ -565,7 +578,9 @@ pub fn note_idle_dispatch(shared: &SharedKernel, cpu: CpuId, tid: u64, by_ipi: b
     if cpu.0 != 0 && (cpu.0 as usize) < MBX_CPUS {
         publish(M_IDLE + 8 * u64::from(cpu.0), 0);
     }
-    if !is_witness_task(shared, tid) {
+    // Secondaries only: CPU 0's idle exits are P's own naps (and the core services'), which no
+    // obligation grades and which would only fill the record.
+    if cpu.0 == 0 || !is_witness_task(shared, tid) {
         return;
     }
     record(
