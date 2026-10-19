@@ -201320,6 +201320,45 @@ mod ap_sched2 {
         }
     }
 
+    /// **Only a hart the firmware reports present takes an identity.** The boot hart starts
+    /// secondaries before the DTB scan, so the firmware's HSM status is the existence check: a
+    /// slot whose hart is absent claims no logical id and no dispatch stack. Once the scan runs,
+    /// every claim is compared with the DTB plan and a disagreement is named.
+    #[test]
+    fn only_firmware_present_harts_claim_an_identity() {
+        let boot = include_str!("../../arch/riscv64/boot.rs");
+        let park = boot
+            .split("fn park_qemu_virt_secondaries_once(context: &str) {")
+            .nth(1)
+            .expect("the start loop")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        let status = park
+            .find("crate::arch::riscv64::sbi::hsm_hart_get_status(hart_id)")
+            .expect("the existence check");
+        let claim = park
+            .find("prepare_secondary_handoff(slot, hart_id)")
+            .expect("the claim");
+        assert!(
+            status < claim,
+            "existence is checked before anything is claimed"
+        );
+        assert!(park.contains("Ok(HSM_STATUS_STOPPED) => {}"));
+        assert!(park.contains("Err(_) => continue,"));
+        assert!(park.contains("RISCV_SECONDARY_START_FAILED"));
+        let stage = boot
+            .split("fn stage_riscv64_present_cpu_bitmap(")
+            .nth(1)
+            .expect("the staging")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(stage.contains("RISCV_LOGICAL_CPU_MISMATCH"));
+        assert!(stage.contains("Ok(cpu) => claimed == *cpu,"));
+        assert!(stage.contains("Err(_) => claimed == usize::MAX,"));
+    }
+
     /// **Healthy churn on every CPU reclaims everything.** Processes run on each of CPUs 1..=3 in
     /// turn, exit, and leave that CPU idle through the production idle transition; each is reaped
     /// from CPU 0 through NR 31. No reap finds its root loaded on an idle CPU, so no space is

@@ -29211,6 +29211,17 @@ functions. Every discovered, supported hart is eligible without the knob or a wi
 * A nonzero boot hart and non-contiguous hart ids still produce a dense numbering. The
   scheduler's present set is that numbering (`logical_present_bitmap`), not the hart bitmap. The
   boot prints both: `RISCV_LOGICAL_CPUS present= count= excluded_harts= hart_bitmap= boot_hart=`.
+* Only a hart the firmware reports present (SBI HSM `hart_get_status` = STOPPED) is given a slot, a
+  logical id and a dispatch stack. The boot hart starts secondaries before the DTB scan, so the
+  firmware is the existence check at that point. Once the scan runs, every claim is compared with
+  the DTB plan, and any hart where the two disagree is named (`RISCV_LOGICAL_CPU_MISMATCH`). A
+  present hart that refuses to start is named too (`RISCV_SECONDARY_START_FAILED`).
+* *Found by qualification.* The first frozen candidate (`39c68d5a`) started blind over every slot,
+  as the base did, so absent harts claimed logical ids and dispatch stacks
+  (`dispatch_capable=0xff` on a 2-hart boot). QEMU's hart ids are contiguous, so the absent harts
+  came after the real ones and nothing visible broke. With a gap in the hart ids, an absent hart
+  would have taken a logical id ahead of a real one. That run was stopped and is kept; the repair
+  was refrozen and requalified from the start.
 
 **Limits.** Each comes from real storage, and each is reported by name.
 
@@ -29307,7 +29318,7 @@ every admitted CPU:
 
 ### §4 — evidence
 
-**Hosted (`ap_sched2`, 8 cases, plus the policy's 8 in `riscv_hart_admission`):**
+**Hosted (`ap_sched2`, 9 cases, plus the policy's 8 in `riscv_hart_admission`):**
 
 | Case | What it shows |
 |---|---|
@@ -29318,6 +29329,7 @@ every admitted CPU:
 | `a_remote_enqueue_notifies_its_own_target_only` | Each remote enqueue notifies exactly its target |
 | `enqueue_racing_idle_on_every_cpu_loses_nothing` | Real threads for CPUs 0..=3: jittered enqueues through the production owner against three targets running the idle protocol concurrently; no wait outlives its bound with work queued. With CPU 2's notification suppressed the case fails (`no wake was lost`), checked once |
 | `many_cpus_one_clock_and_a_deadline_wakes_any_cpu` | Secondary ticks consume only their own quanta; the clock moves once per clock-owner interrupt; a deadline wakes a receive homed on CPU 3 and notifies CPU 3 |
+| `only_firmware_present_harts_claim_an_identity` | Source order: the HSM existence check precedes any claim; the DTB cross-check and the start-failure marker exist |
 | `exit_idle_reap_on_every_cpu_reclaims_everything` | Process churn on CPUs 1..=3 with the production idle transition: no quarantine, and the frame count returns exactly |
 
 The policy cases cover:
@@ -29406,6 +29418,8 @@ patches and results are kept with the qualification record.
   * AArch64 or x86_64 production admission;
   * VFS;
   * hardware bring-up;
+  * live evidence for non-contiguous hart ids. QEMU virt numbers harts contiguously, so that rule
+    rests on the hosted policy cases and the boot-time cross-check;
   * topologies beyond 8 logical CPUs. At `-smp 10` the hart beyond the table is excluded by name
     and 8 secondaries are admitted, but the core smoke fails there on the base too (late services
     do not start within its budget: 21 failed checks on the base, 20 on the candidate), so that

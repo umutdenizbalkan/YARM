@@ -3750,6 +3750,25 @@ fn park_qemu_virt_secondaries_once(context: &str) {
         if hart_id == boot_hart {
             continue;
         }
+        // AP-SCHED2 §2: only a hart the firmware reports present (HSM STOPPED) is given a slot,
+        // a logical CPU id and a dispatch stack. Starting blind over every slot let an absent
+        // hart claim a logical id: harmless with QEMU's contiguous hart ids (the absent ones come
+        // last), but with a gap it would take an id ahead of a real hart and break the dense
+        // numbering the DTB plan stages.
+        const HSM_STATUS_STOPPED: usize = 1;
+        match crate::arch::riscv64::sbi::hsm_hart_get_status(hart_id) {
+            Ok(HSM_STATUS_STOPPED) => {}
+            Ok(status) => {
+                early_marker!(
+                    "RISCV_SECONDARY_NOT_STARTABLE hart={} hsm_status={}",
+                    hart_id,
+                    status
+                );
+                continue;
+            }
+            // Absent (every slot beyond `-smp N` on QEMU): nothing claimed, nothing said.
+            Err(_) => continue,
+        }
         let slot = hart_id;
         let handoff_ptr = prepare_secondary_handoff(slot, hart_id);
         match crate::arch::riscv64::sbi::hsm_hart_start(hart_id, entry_addr, handoff_ptr) {
@@ -3776,9 +3795,15 @@ fn park_qemu_virt_secondaries_once(context: &str) {
                     context
                 );
             }
-            // Absent harts (e.g. all slots beyond `-smp N`) return an HSM
-            // error; that is expected, so stay silent to avoid log spam.
-            Err(_) => {}
+            // The hart was reported present and stopped, so a refusal here is a fact to name: it
+            // keeps its claimed logical id, never becomes trap-ready and is never released.
+            Err(e) => {
+                early_marker!(
+                    "RISCV_SECONDARY_START_FAILED hart={} reason={:?}",
+                    hart_id,
+                    e
+                );
+            }
         }
     }
     early_marker!("RISCV_SECONDARY_HARTS_PARKED count={}", parked_count);
@@ -4222,6 +4247,31 @@ fn stage_riscv64_present_cpu_bitmap(dtb: &'static [u8]) {
                     "RISCV_HART_EXCLUDED hart={} reason={} dispatch=0",
                     hart,
                     why.marker()
+                );
+            }
+        }
+        // The claims the early start made (from the firmware's view) must be this plan (from the
+        // DTB's view); a hart where they differ is named.
+        for (hart, planned) in plan
+            .iter()
+            .enumerate()
+            .take(QEMU_VIRT_HSM_SECONDARY_HART_LIMIT)
+        {
+            if hart == boot_hart {
+                continue;
+            }
+            let claimed =
+                RISCV64_SECONDARY_CPU_IDS[hart].load(core::sync::atomic::Ordering::Acquire);
+            let agrees = match planned {
+                Ok(cpu) => claimed == *cpu,
+                Err(_) => claimed == usize::MAX,
+            };
+            if !agrees {
+                early_marker!(
+                    "RISCV_LOGICAL_CPU_MISMATCH hart={} planned={:?} claimed={}",
+                    hart,
+                    planned,
+                    claimed as isize
                 );
             }
         }
