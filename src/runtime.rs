@@ -14802,6 +14802,11 @@ impl SharedKernel {
                 Some(identity)
             });
             if parked {
+                #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                crate::kernel::boot::server_dies_counters::note_deferred_parked(
+                    work.reply_record_index,
+                    work.reply_record_generation,
+                );
                 crate::yarm_log!(
                     "IPC_SERVER_DEATH_PARKED_UNTIL_WAIT record_index={} record_generation={} server_tid={} server_asid={} caller_wakes=0 result=ok",
                     work.reply_record_index,

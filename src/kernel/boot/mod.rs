@@ -5992,6 +5992,26 @@ pub mod server_dies_counters {
     /// A second increment for the same class in one instance is a defect, not a tolerated
     /// duplicate: it emits the class's canonical hard-fail literal and the count is left
     /// visibly >1 so an assertion cannot miss it.
+    /// AP-SCHED3 — the drain TOOK the armed record's item but PARKED it, because its caller had
+    /// not yet armed the reply wait: that take was not the item's consumption. Undo the count the
+    /// take made, so the one real consumption (after the arming requeues it, uncounted) counts
+    /// exactly once and the transition audit keeps its one-of-each shape.
+    pub fn note_deferred_parked(index: usize, generation: u64) {
+        if matches_armed(index, generation) {
+            let _ = COUNTS[Transition::DeferredConsumed as usize].fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |c| c.checked_sub(1),
+            );
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_PARK_UNCOUNTED class={} record_index={} record_generation={} result=ok",
+                Transition::DeferredConsumed.name(),
+                index,
+                generation
+            );
+        }
+    }
+
     pub fn record(t: Transition) {
         let idx = t as usize;
         let seq = SEQ.fetch_add(1, Ordering::AcqRel) + 1;
@@ -6370,8 +6390,20 @@ pub(crate) fn republish_unclaimed_server_death(
     cpu_idx: usize,
     work: DeferredServerDeathCompletion,
 ) -> bool {
-    let published = server_death_work_reserve(cpu_idx)
-        .is_some_and(|reservation| server_death_work_publish(reservation, work));
+    // The SAME publication, moved: requeued without counting a second one (the oracle's
+    // transition audit sees one reservation, one publication and one consumption).
+    let published = server_death_work_reserve(cpu_idx).is_some_and(|reservation| {
+        let mut q = SERVER_DEATH_POST_WORK[reservation.cpu_idx].lock();
+        let duplicate = q.iter().enumerate().any(|(i, s)| {
+            i != reservation.slot
+                && s.is_some_and(|w| {
+                    w.reply_record_index == work.reply_record_index
+                        && w.reply_record_generation == work.reply_record_generation
+                })
+        });
+        q[reservation.slot] = if duplicate { None } else { Some(work) };
+        !duplicate
+    });
     crate::yarm_log!(
         "IPC_SERVER_DEATH_REPUBLISHED_AT_WAIT cpu={} record_index={} record_generation={} server_tid={} server_asid={} result={}",
         cpu_idx,
