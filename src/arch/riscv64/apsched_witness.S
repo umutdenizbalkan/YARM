@@ -33,6 +33,7 @@
  *   +0x040 D_DONE      deadline threads: amoadd 1 each
  *   +0x048 T_TURN      P: the IPC thread whose rounds run now
  *   +0x050 T_DONE      IPC threads: amoadd 1 each
+ *   +0x058 W_STARTED   spinners: amoadd 1 each, once running
  *   +0x100 PRE[c]      kernel: timer preemptions of this process's workers on CPU c (8 CPUs)
  *   +0x140 IDLE[c]     kernel: 1 from CPU c's idle arrival until it next leaves idle
  *   +0x180 F[k] (u32)  sleeper k's futex word
@@ -41,7 +42,7 @@
  * P never stores to MBX after its first fork: the store would copy-on-write split P's mailbox
  * onto a new frame while the kernel keeps publishing into the old one (now the child's). The
  * churn child table therefore lives in BUF: BUF+0x800 CHILD[k]. IPC thread k's own buffers are at
- * BUF+0x900+k*0x80.
+ * BUF+0x900+k*0x80. P's snapshot of PRE[c] once every spinner runs: BUF+0xE00.
  *
  * Phases (P drives; the kernel records every step with a causal stamp):
  *   0  one deadline thread per secondary (NR 5 on an endpoint nobody sends to).
@@ -90,6 +91,7 @@
     .set M_D_DONE, 0x040
     .set M_T_TURN, 0x048
     .set M_T_DONE, 0x050
+    .set M_W_STARTED, 0x058
     .set M_PRE, 0x100
     .set M_IDLE, 0x140
     .set M_F, 0x180
@@ -97,6 +99,7 @@
     .set M_S_ACK, 0x1e0
     .set B_CHILD, 0x800
     .set B_IPC, 0x900
+    .set B_PRESNAP, 0xE00
 
     /* Worker-stack slot bases: deadline 1..7, spinners 8..23, sleepers 25..31, IPC 33..39. */
     .set D_SLOT0, 0
@@ -283,10 +286,29 @@ p_ready:
     beqz a0, p_spawn_fail
     addi s1, s1, 1
     j 1b
-2:  li s0, WAIT_YIELDS
+    /* Preemptions count only once EVERY spinner runs: a spinner spawned late onto a CPU whose
+       total was already met would otherwise start after the stop and never be preempted. From
+       here, round-robin gives each of a CPU's spinners a preemption within that CPU's next
+       PRE_MIN (at most PRE_MIN spinners share a CPU under balanced placement). */
+2:  AWAIT_EQ M_W_STARTED, s2
+    li t0, MBX
+    li t1, (BUF + B_PRESNAP)
+    li t4, 0
+1:  slli t6, t4, 3
+    add t5, t6, t0
+    ld t2, M_PRE(t5)
+    add t5, t6, t1
+    sd t2, 0(t5)
+    addi t4, t4, 1
+    li t2, 8
+    bne t4, t2, 1b
+    li s0, WAIT_YIELDS
 p_pre:
     li t0, MBX
+    li a6, (BUF + B_PRESNAP)
     ld t1, M_PRE(t0)
+    ld t2, 0(a6)
+    sub t1, t1, t2
     li t2, PRE0_MIN
     bltu t1, t2, 3f
     mv t3, s11
@@ -295,8 +317,11 @@ p_pre:
     andi t5, t3, 1
     beqz t5, 2f
     slli t6, t4, 3
+    add t5, t6, a6
+    ld t2, 0(t5)
     add t6, t6, t0
     ld t1, M_PRE(t6)
+    sub t1, t1, t2
     li t2, PRE_MIN
     bltu t1, t2, 3f
 2:  srli t3, t3, 1
@@ -613,6 +638,10 @@ w_spin:
     li a2, 0
     li a3, 0
     LOG m_w_start
+    li t0, MBX
+    li t1, 1
+    addi t2, t0, M_W_STARTED
+    amoadd.d zero, t1, (t2)
     /* base = PAT_BASE + (slot << 32), slot from this thread's own stack. */
     li t6, WSTK
     sub t6, sp, t6

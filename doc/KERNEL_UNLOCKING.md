@@ -29360,7 +29360,8 @@ copy CRC-checked) dumped after P ends, and the grader orders by stamp, never by 
   * four rounds of fork/exit/reap: each child runs there, the CPU leaves the child's root before
     the reap, and the reap reports `process_reaped=1 destroyed=1 quarantined=0`.
 * *Supported topology:* the witness's mailbox and worker-stack layout covers up to 8 CPUs, and the
-  grader refuses a larger `N`.
+  grader refuses a larger `N`. An 8-hart run takes about nine minutes under TCG on four host CPUs,
+  so it needs `TIMEOUT_SECS=1500`; the 600 s default ran out once, mid-IPC.
 * *Mailbox frame check:* the grader also refuses a run in which P's mailbox page was split
   copy-on-write.
 
@@ -29386,6 +29387,14 @@ one.
   interrupt could straddle a window edge. CPU 0 now brackets the pair (`note_timer_irq`,
   `note_timer_tick_done`). The sampler retries until no CPU 0 interrupt is in flight and the count
   is unchanged, so `dtick == dirq0` is exact.
+* *A late spinner never preempted (found by qualification).* The second frozen candidate
+  (`7c08e808`) failed one scheduled 4-hart boot: a spinner on CPU 3 "was never preempted by its
+  timer". P stopped the spinners once every CPU's *total* reached its minimum. The last spinner was
+  spawned onto CPU 3 after CPU 3's first spinner had already met that total alone, so it started
+  only after the stop. Now P waits until every spinner is running (`W_STARTED`), snapshots the
+  per-CPU counts, and requires `PRE_MIN` new preemptions on each CPU on top of the snapshot.
+  Round-robin then gives every spinner on a CPU a preemption. That run was stopped and is kept;
+  the repair was refrozen and requalified from the start.
 
 **Controls.** Each control breaks only CPU 2 of a 4-hart run, while CPUs 1 and 3 stay healthy. The
 patches and results are kept with the qualification record.
