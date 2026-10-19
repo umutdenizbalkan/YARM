@@ -29406,7 +29406,7 @@ patches and results are kept with the qualification record.
 | suppressed wake | enqueues onto CPU 2 commit but never notify |
 | missing secondary timer | every deadline CPU 2 programs lies at the end of time |
 | skipped idle-root handoff | CPU 2's idle and exit transitions keep the user root |
-| corrupted context | CPU 2 flips a bit of x20 in every context it applies |
+| corrupted context | CPU 2 corrupts x20 in every context it applies: v1 flips a bit, v2 adds 0x100 (v1 is an involution; see the controls record) |
 | expected CPU left unused | CPU 2 takes the balance-excluded admission while reporting production |
 
 ### §5 — evidence classes and their limits
@@ -29433,3 +29433,119 @@ patches and results are kept with the qualification record.
     and 8 secondaries are admitted, but the core smoke fails there on the base too (late services
     do not start within its budget: 21 failed checks on the base, 20 on the candidate), so that
     topology stays unsupported and open.
+
+#### Controls (candidate `9e61c96d`, each a scratch patch graded by the unmodified smoke script, `SMP=4`)
+
+Every control breaks CPU 2 only. Each ran once in a fresh worktree, and every result is kept. The
+boot budget was declared before the run: 1500 s for the three controls whose stall P can only
+bound in yields, and 300 s for the rest.
+
+| Control | Verdict |
+|---|---|
+| missing readiness | fail: `admission: CPU 2 refused (no_irq_ready)`; the console names it `RISCV_AP_STATE cpu=2 … irq_ready=0 admitted=0 dispatching=0 reason=no_irq_ready`; P never ends, because the expected set is never admitted |
+| missing readiness, check removed | fail: CPU 2 is admitted unable to take an IPI (and *reports* `irq_ready=1`), and every idle wake of its sleeper is ended by CPU 2's timer, never an IPI |
+| suppressed wake | fail: the same — `no IPI taken at CPU 2's idle boundary`, `left idle … by its timer, not the IPI` |
+| missing secondary timer | fail: P never ends. Console attribution: CPU 2 took 0 timer ticks and 0 preemptions while CPUs 1 and 3 took about 62,800 ticks and 6,980 preemptions each; P stalled in the spinner phase |
+| skipped idle-root handoff | fail: `VM_ASPACE_TEARDOWN_QUARANTINED`; `CPU 2 never left child …'s root before its reap`; `reap … destroyed=0 quarantined=1` |
+| corrupted context v1 (XOR x20) | **passed — proved nothing.** XOR is its own inverse: each resume re-applies it to a context saved already flipped, so an even number of resumes cancels it. Both CPU 2 spinners had even resume counts (31 resumes between them). AP-SCHED1's control used the same XOR and was caught only by parity. Kept as a record |
+| corrupted context v2 (x20 + 0x100) | fail: `spinner 10012 found 1 corrupted registers (last x20)`, the same for spinner 10015 — exactly CPU 2's two spinners |
+| expected CPU left unused | fail: P never ends. Console attribution: CPU 2 took the balance-excluded admission while *reporting* `balance_excluded=0`; 0 preemptions on CPU 2; P stalled in the spinner phase |
+
+*Limit:* the missing-timer and unused-CPU controls fail through the progress obligation, not a
+named per-CPU one. P's bounded waits count yields, and on a contended CPU 0 one yield can cost a
+full quantum, so the bound outlasts any practical boot budget. The console counts above attribute
+both failures to CPU 2.
+
+#### Qualification
+
+**Base `8c17c899` (stage 1 delivered). Three frozen candidates; every result kept in the
+session's qualification directories.**
+
+| Candidate | Fate |
+|---|---|
+| `39c68d5a` (tree `ad891843`) | Stopped in the core-smoke phase. `dispatch_capable=0xff` on a 2-hart boot exposed the identity defect (absent harts claimed ids and stacks). Repaired: HSM existence check, DTB cross-check |
+| `7c08e808` (tree `22ae5af3`) | Stopped in the witness sample: `apsw-smp4-idle3` failed. A late-spawned spinner was never preempted, a fixture race. Repaired: count preemptions only once every spinner runs |
+| **`9e61c96d` (tree `a63d29a6`)** | **Qualified**, below |
+
+Every gate of the qualified candidate ran on its frozen tree (`dirty=0`). The live runs are bound
+to commit, tree, features and booted-artifact hashes. The firmware is the pinned OpenSBI v1.3 copy,
+and the emulator is QEMU 8.2.2.
+
+* *Hosted and source:*
+  * focused: 137/137 (`ap_sched1`, `ap_sched2`, `riscv_hart_admission`, `stage199d_riscv`,
+    `u9yield2_family_edge`), plus 30/30 in `qemu_smp3_scope` and `riscv64_smp_topology_scope`;
+  * full hosted suite: 6,126 passed, 2 ignored;
+  * integration: 308/308 in 32 suites;
+  * census guard 17/17, with every textual production count identical to the base;
+  * `cargo fmt --check`: clean;
+  * grader self-test: 31 cases.
+* *Warnings and images against a fresh base build:*
+  * default kernels: 177 / 205 / 188 warnings, identical by name and location;
+  * x86_64 and AArch64 default images: `.text` and `.data` byte-identical. In `.rodata`, 2 words
+    differ, each by exactly +6: panic line numbers below the 6 feature-gated lines added to
+    `syscall_split.rs`;
+  * RISC-V default image: differs, as its production code changed;
+  * VM-invalidation image ordering: 12 / 8 / 8 sites, all ok;
+  * eleven witness-feature kernels: identical warnings.
+* *Strict cores:*
+  * x86_64 (timer-contract-witness), AArch64 and RISC-V `-smp 1`: passed;
+  * RISC-V `-smp 2, 3, 4, 8`: passed, with boot harts 0, 1, 1 and 4 and every secondary
+    `admitted=1 dispatching=1`;
+  * headroom: `kernel_end=0x86c41000`, initrd at `0x88200000`, so 21.7 MiB to spare;
+  * RISC-V `-smp 10` (beyond the supported topology): harts 8 and 9 were named
+    `beyond_hsm_handoff_table`, and 8 logical CPUs were admitted. The smoke fails 24 checks (late
+    services absent), as it does on the base. Not claimed.
+* *The production witness, a fixed sample scheduled before the run, on one build.* The first boot
+  built the artifacts and every other boot reused them. All 12 boots were `result=ok`:
+
+  | Topology | Host | Boots | Every boot |
+  |---|---|---|---|
+  | 2 harts | idle | 1 | `idle_wakes=3_ipi ipc=4 churn=4_reaped_quarantined=0` |
+  | 3 harts | idle | 3 | `idle_wakes=6_ipi ipc=8 churn=8_reaped_quarantined=0` |
+  | 3 harts | loaded (4 busy loops on 4 CPUs) | 2 | the same |
+  | 4 harts | idle | 3 | `idle_wakes=9_ipi ipc=12 churn=12_reaped_quarantined=0` |
+  | 4 harts | loaded | 2 | the same |
+  | 8 harts | idle | 1 | `idle_wakes=21_ipi ipc=28 churn=28_reaped_quarantined=0`, preemptions counted 202–530 per secondary, 667 s |
+
+  Each boot also reported `registers=intact`, `deadlines=timed_out` with `dtick == dirq0` on every
+  secondary, and production admission. The loaded-host boots took 23–43 s against 15–69 s idle;
+  the obligations are causal records, not timings.
+* *Regressions:* all passed:
+  * SMP3, VMI and SRR witnesses (RISC-V);
+  * LOCK1 (RISC-V), LOCK2 (AArch64), LOCK3 (x86_64);
+  * SMP1 (x86_64), SMP2 (AArch64);
+  * CONTEXT1 and overtaken (x86_64, AArch64);
+  * the UART/PL011 IRQ witnesses on all three ports;
+  * server death on all three ports;
+  * the XFER2 grant and shared-region direct cells on all three ports;
+  * RISC-V supervisor crash-restart;
+  * exit-current-task on all three ports.
+
+  The supervisor cell's executable/writable PT_LOAD overlap `[error]` lines predate this work: they
+  are in AP-SCHED1's record too.
+* *An infrastructure re-run, declared.* The scratch filesystem filled during
+  `direct-x86_64-off1`: its log ends `tr: write error: No space left on device`. The 12 later
+  gates wrote empty logs in 0 s. None of them executed. After freeing space, exactly those 13
+  gates re-ran once on the same frozen candidate, suffixed `-r2`, and all passed. Both attempts
+  stay in the summary.
+
+**What the evidence does and does not show.**
+
+* *Source and image ordering* (guards, the VMI sequence check) shows what was written and linked.
+* *Deterministic interleavings* (the hosted cases, including the threaded race) execute the
+  owners on the host, whose memory ordering is stronger than RVWMO.
+* *Live evidence* is QEMU TCG with one host thread per vCPU, observed at the kernel's recording
+  points. It cannot see invalidation or barrier completion inside a hart, only their
+  consequences.
+
+**Open, and not claimed:**
+
+* AArch64 and x86_64 production SMP admission;
+* migration;
+* CPU offlining;
+* topologies beyond 8 logical CPUs (`-smp 10` fails the core smoke on the base too);
+* non-contiguous hart ids live (QEMU numbers harts contiguously);
+* a named per-CPU verdict for the two controls that stall P;
+* the older red cells recorded in earlier sections, which stay open.
+
+**Next package: AArch64 production SMP.**
