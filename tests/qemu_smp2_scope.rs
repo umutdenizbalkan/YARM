@@ -20,6 +20,7 @@ const TRAP: &str = include_str!("../src/arch/aarch64/trap.rs");
 const A64_MOD: &str = include_str!("../src/arch/aarch64/mod.rs");
 const BRIDGE: &str = include_str!("../src/arch/trap_entry.rs");
 const BOOT_ENTRY: &str = include_str!("../src/arch/boot_entry.rs");
+const HAL: &str = include_str!("../src/arch/hal.rs");
 const DRAINS: &str = include_str!("../src/kernel/ipccall_direct_txn.rs");
 const PAGE_TABLE: &str = include_str!("../src/arch/aarch64/page_table.rs");
 const VM: &str = include_str!("../src/kernel/vm.rs");
@@ -51,33 +52,27 @@ fn pos(src: &str, needle: &str) -> usize {
         .unwrap_or_else(|| panic!("{needle} missing"))
 }
 
-/// Without `yarm.ap_user_dispatch=1` the AP keeps its wake-only path and the BSP brings up no
-/// SGI: both entries are behind the one knob.
+/// AP-SCHED3 §B: the knob has no authority over admission. A secondary whose identity checks out
+/// takes the production admission with no knob; one that does not parks, named, touching no
+/// kernel state. The BSP brings up its own SGI state unconditionally, before the unmask.
 #[test]
-fn the_default_path_is_behind_the_knob() {
+fn production_admission_needs_no_knob() {
     let ap = code(fn_body(
         BOOT,
         "extern \"C\" fn yarm_aarch64_secondary_cpu_boot(",
     ));
-    let knob = pos(&ap, "if crate::arch::aarch64::smp::requested() {");
-    assert!(ap[knob..].starts_with(
-        "if crate::arch::aarch64::smp::requested() {\n        crate::arch::aarch64::smp::ap_dispatch_main(cpu);"
-    ));
-    // BLR1: the "old wait" was for a raw `&'static mut KernelState` nothing installed; it is
-    // deleted, and the default secondary parks explicitly, after the knob's branch.
-    assert!(
-        knob < pos(&ap, "state=parked reason=no_user_dispatch") && !ap.contains("kernel."),
-        "the knob branches before the default park, which touches no kernel state"
-    );
-    assert!(code(SMP).contains("crate::kernel::boot::ap_user_dispatch_enabled()"));
+    assert!(!ap.contains("requested()") && !ap.contains("ap_dispatch_main"));
+    let admit = pos(&ap, "crate::arch::aarch64::smp::ap_main(cpu)");
+    let park = pos(&ap, "crate::arch::aarch64::smp::park_identity_mismatch(");
+    assert!(admit < park && !ap.contains("kernel."));
+    let main = code(fn_body(SMP, "pub fn ap_main("));
+    assert!(!main.contains("requested()") && !main.contains("ap_user_dispatch_enabled"));
     let bsp = code(BOOT_ENTRY);
     let bring_up = pos(
         &bsp,
         "crate::arch::aarch64::smp::bring_up_sgi_on_this_cpu(cpu)",
     );
-    assert!(bsp[..bring_up].ends_with(
-        "if crate::arch::aarch64::smp::requested()\n                    && let Err(reason) = "
-    ));
+    assert!(bsp[..bring_up].ends_with("if let Err(reason) = "));
     assert!(
         bring_up
             < pos(
@@ -87,25 +82,35 @@ fn the_default_path_is_behind_the_knob() {
     );
 }
 
-/// The AP's order: translation, the end of the BSP's boot borrow, its own interface, the one
-/// scheduler admission, then the shared idle park — and the bit is published only after every
-/// readback agreed.
+/// The AP's order: translation, the end of the BSP's boot borrow, its stack, its own interface,
+/// its own timer, the readiness readback, the idle root, then the ONE production scheduler
+/// admission — published last — and the shared idle park. The interface bit is published only
+/// after every readback agreed; a failed prerequisite parks the CPU unadmitted.
 #[test]
 fn the_ap_is_admitted_only_after_its_interface_is_published() {
-    let main = code(fn_body(SMP, "pub fn ap_dispatch_main("));
+    let main = code(fn_body(SMP, "pub fn ap_main("));
     let order = [
         "enable_ap_translation();",
         "while !bsp_boot_borrow_ended() {",
+        "dispatch_capable(cpu.0 as usize, ap_stack_bytes())",
         "bring_up_sgi_on_this_cpu(cpu)",
-        "admit_this_ap(shared, cpu)",
+        "enable_ap_arch_timer_ppi()",
+        "program_timer_deadline(",
+        "this_ap_irq_ready(cpu)",
+        "crate::arch::hal::leave_user_root(cpu)",
+        "shared.admit_ap_dispatch_split(cpu)",
+        "ADMITTED.fetch_or(",
         "crate::arch::aarch64::trap::enter_ap_idle(cpu)",
     ];
     let at: Vec<usize> = order.iter().map(|n| pos(&main, n)).collect();
     assert!(at.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    assert_eq!(main.matches("park_unadmitted(").count(), 6);
     let bring = code(fn_body(SMP, "pub fn bring_up_sgi_on_this_cpu("));
     assert!(
         pos(&bring, "sgi_priority_readback") < pos(&bring, ".publish(cpu.0 as usize, itargetsr0)")
     );
+    let unadmitted = code(fn_body(SMP, "fn park_unadmitted("));
+    assert!(unadmitted.contains("TARGETS.withdraw(cpu.0 as usize)"));
     let borrow = code(fn_body(
         BOOT,
         "pub fn enter_dispatched_user_task_if_available(",
@@ -115,30 +120,44 @@ fn the_ap_is_admitted_only_after_its_interface_is_published() {
             < pos(&borrow, "yarm_aarch64_enter_user_mode_eret("),
         "the BSP ends its boot borrow before its first EL0 entry"
     );
-    let admit = code(fn_body(SCHED, "pub fn admit_pinned_dispatch("));
+    let admit = code(fn_body(SCHED, "pub fn admit_dispatch("));
     assert!(
         admit.contains("self.wake_only &= !bit;")
-            && admit.contains("self.balance_excluded |= bit;")
+            && admit.contains("self.balance_excluded &= !bit;")
     );
     assert!(code(TRAP).contains("pub(crate) fn enter_ap_idle(cpu: CpuId) -> ! {"));
     assert!(fn_body(TRAP, "pub(crate) fn enter_ap_idle(").contains("idle_no_eret_loop();"));
 }
 
-/// The only production sender is the committed remote enqueue of the NR6/NR7 drains, after the
-/// transaction returned `Ok`, and only when the target is another CPU. The controller write is
-/// preceded by the barrier and never names an unpublished CPU.
+/// The only production senders are committed remote enqueues: the NR6/NR7 drains, after the
+/// transaction returned `Ok`, and (AP-SCHED3 §C) the one enqueue-notification owner every other
+/// enqueue owner calls after its commit — each only when the target is another CPU. The
+/// controller write is preceded by the barrier and never names an unpublished CPU.
 #[test]
 fn the_sgi_is_sent_only_for_a_committed_remote_wake() {
-    let senders: Vec<&str> = [SMP, BRIDGE, BOOT, TRAP, DRAINS, BOOT_ENTRY]
+    let senders: Vec<&str> = [SMP, BRIDGE, BOOT, TRAP, DRAINS, BOOT_ENTRY, HAL]
         .iter()
         .flat_map(|s| s.lines())
         .filter(|l| l.contains("send_reschedule_sgi(") && !l.trim_start().starts_with("//"))
         .collect();
     assert_eq!(
         senders.len(),
-        3,
-        "the definition and the two drains: {senders:?}"
+        4,
+        "the definition, the two drains and the enqueue notification: {senders:?}"
     );
+    let notify = code(fn_body(
+        HAL,
+        "pub(crate) fn notify_enqueued(target: CpuId) {",
+    ));
+    let me = pos(
+        &notify,
+        "let me = CpuId(crate::arch::aarch64::this_cpu_index() as u8);",
+    );
+    let gate = pos(
+        &notify,
+        "if me != target {\n            let _ = crate::arch::aarch64::smp::send_reschedule_sgi(me, target);",
+    );
+    assert!(me < gate);
     let drains = code(DRAINS);
     for head in [
         "fn drain_direct_request_post_work(",

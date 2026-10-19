@@ -1626,7 +1626,7 @@ pub fn handle_trap_entry_shared(
                         cpu,
                         entering,
                         frame,
-                        SplitFinalizeReason::PublishedTransition,
+                        SplitFinalizeReason::RouteFinishedCaller,
                     );
                 }
                 crate::yarm_log!(
@@ -3660,6 +3660,10 @@ pub fn handle_trap_entry_shared(
                                 rolled_back,
                             );
                         }
+                        // AP-SCHED3 §C: an AArch64 secondary leaves idle HERE, and only here, to
+                        // run a task: its own quantum period is restored from now.
+                        #[cfg(target_arch = "aarch64")]
+                        crate::arch::aarch64::smp::unpark_ap_timer(cpu_idx);
                         // The broad arm counts a context switch here, through
                         // `note_context_switch_if_task_changed(None, tid)`. The outgoing side is
                         // `None`, so the comparison is always unequal and the count always
@@ -3686,6 +3690,18 @@ pub fn handle_trap_entry_shared(
                             "SGI_IDLE_ADVANCE_DRAIN_DONE cpu={} incoming={} result=ok",
                             cpu.0,
                             inc
+                        );
+                        // AP-SCHED3 witness: this CPU left idle for `inc`, and by which trigger.
+                        #[cfg(all(
+                            feature = "aarch64-apsched-witness",
+                            target_arch = "aarch64",
+                            not(feature = "hosted-dev")
+                        ))]
+                        crate::kernel::apsched_witness::note_idle_dispatch(
+                            shared,
+                            cpu,
+                            inc,
+                            sgi_trigger,
                         );
                         // QEMU-SMP2 §5: the idle dispatch and which trigger drove it, recorded
                         // once the resume and its debt are committed.
@@ -4231,10 +4247,14 @@ fn split_return_identity(
 enum SplitFinalizeReason {
     /// `Complete(_)` — the split route produced this syscall's final result in this trap.
     CompletedInThisTrap,
-    /// `QueueAdvanceCommitted` / `PostWorkCommitted` — the route published a transition instead
-    /// of a result. Only a class whose caller will NOT trap again to collect its result needs
-    /// the commit now.
+    /// `QueueAdvanceCommitted` — the route published a transition instead of a result. Only a
+    /// class whose caller will NOT trap again to collect its result needs the commit now.
     PublishedTransition,
+    /// `PostWorkCommitted { finalize_syscall: true }` — the route did its work AND declared the
+    /// caller finished (a direct delivery or an enqueue). The result exists now and the caller
+    /// returns through its own frame after the drain, so — like `CompletedInThisTrap` — the
+    /// commit is unconditional. The route's own answer is the authority, not a class list.
+    RouteFinishedCaller,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -4264,7 +4284,17 @@ fn finalize_split_handled_syscall(
     // question is genuinely class-specific: FutexWait's caller will not trap again, so its
     // `set_ok` and advanced `SVC` must land in this incarnation; a blocking recv/send caller is
     // completed by its own D2 drain, which does its own writeback.
-    if matches!(reason, SplitFinalizeReason::CompletedInThisTrap) {
+    //
+    // AP-SCHED3 §C: `RouteFinishedCaller` commits for the same reason. NR 1's direct delivery
+    // returns `PostWorkCommitted { finalize_syscall: true }` after `complete_ok`, but NR 1 was
+    // never on the per-class list below, so on AArch64 its `Ok` was never exported: the sender
+    // resumed with x0 still holding its endpoint cap, and the user runtime read a delivered
+    // send as an error. Single-CPU boots masked it (their senders ignore the result); the
+    // cross-CPU witness retried the "failed" send, duplicated a message and desynchronised.
+    if matches!(
+        reason,
+        SplitFinalizeReason::CompletedInThisTrap | SplitFinalizeReason::RouteFinishedCaller
+    ) {
         super::aarch64::trap::split_finalize_handled_syscall(shared, cpu, entering, frame);
         return;
     }

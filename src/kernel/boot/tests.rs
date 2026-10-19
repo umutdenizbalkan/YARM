@@ -44208,8 +44208,18 @@ mod stage160c_aarch64_trap_abi_bracketing {
             TRAP_ENTRY_SRC
                 .matches("SplitFinalizeReason::PublishedTransition,")
                 .count(),
-            2,
-            "the queue-advance and post-work arms published a transition, not a result"
+            1,
+            "the queue-advance arm published a transition, not a result"
+        );
+        // AP-SCHED3 §C: the post-work arm finalizes only when the route itself declared the
+        // caller finished, and that declaration — not a class list — is what commits. NR 1's
+        // direct delivery was the class the list forgot.
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("SplitFinalizeReason::RouteFinishedCaller,")
+                .count(),
+            1,
+            "the post-work arm finalizes a caller its route declared finished"
         );
         // And the owner must branch on the REASON before it ever consults a syscall number.
         let owner = TRAP_ENTRY_SRC
@@ -44218,7 +44228,7 @@ mod stage160c_aarch64_trap_abi_bracketing {
             .and_then(|s| s.split("\n}\n").next())
             .expect("the aarch64 finalize owner");
         let reason_gate = owner
-            .find("matches!(reason, SplitFinalizeReason::CompletedInThisTrap)")
+            .find("SplitFinalizeReason::CompletedInThisTrap | SplitFinalizeReason::RouteFinishedCaller")
             .expect("the reason gate");
         let nr_gate = owner
             .find("frame.syscall_num() ==")
@@ -76030,10 +76040,13 @@ mod stage195d_aarch64_bsp_dispatch_affinity {
             body.contains("install_ap_idle_current(cpu)"),
             "the AArch64 AP must get the scheduler-owned idle current"
         );
+        // AP-SCHED3 §B retired BSP-only dispatch affinity: a secondary leaves wake-only through
+        // its own production admission, so the bring-up no longer claims that policy.
         assert!(
-            body.contains("AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE result=ok"),
-            "the AArch64 bring-up must emit the BSP-dispatch-affinity marker"
+            !A64_BOOT_SRC.contains("AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE"),
+            "the retired BSP-only affinity marker must not come back"
         );
+        assert!(body.contains("AARCH64_AP_START_PLAN started={} present=0x{:x}"));
     }
 
     // The placement + rejection markers are emitted on AArch64 only, on real placements.
@@ -140344,14 +140357,16 @@ mod aarch64_production_tick {
             !ap.contains("program_timer_deadline"),
             "an AP must never arm a timer — it would advance the single shared scheduler counter"
         );
-        // BLR1: the secondary without the user-dispatch knob parks for good and touches no kernel
-        // state. Its old "cross-CPU work" loop ran on a raw `&'static mut KernelState` that was
-        // never installed (so it never ran), and was deleted with that pointer.
+        // BLR1: no secondary path takes a whole-state reference. AP-SCHED3 §B: a secondary whose
+        // identity checks out takes the production admission (`smp::ap_main`, which arms its OWN
+        // local preemption timer — `tick_on` lets only the clock owner advance the shared tick);
+        // one that does not parks, named, and touches nothing.
         assert!(
-            ap.contains("state=parked reason=no_user_dispatch")
+            ap.contains("crate::arch::aarch64::smp::ap_main(cpu)")
+                && ap.contains("crate::arch::aarch64::smp::park_identity_mismatch(")
                 && !ap.contains("kernel.")
                 && !ap.contains("trap_kernel_state_mut"),
-            "the default AP parks without any whole-state reference"
+            "an AP is admitted or parked, never given a whole-state reference"
         );
     }
 
@@ -160574,7 +160589,7 @@ mod a64depth_writeback_and_selector {
             .and_then(|s| s.split("\n}\n").next())
             .expect("the aarch64 finalize owner");
         let reason = owner
-            .find("matches!(reason, SplitFinalizeReason::CompletedInThisTrap)")
+            .find("SplitFinalizeReason::CompletedInThisTrap | SplitFinalizeReason::RouteFinishedCaller")
             .expect("the reason gate");
         // A completed syscall commits before any syscall-number question is asked.
         match owner.find("frame.syscall_num() ==") {
@@ -172731,12 +172746,22 @@ mod u9yield2_family_edge {
         // (b) The admission is the only clearer, and each port reaches it only behind the knob.
         let runtime = code(RUNTIME);
         assert_eq!(runtime.matches("admit_pinned_dispatch(cpu)").count(), 1);
+        // AP-SCHED3 §B: AArch64 has no pinned admission any more, and the knob has no authority
+        // over admission — every secondary takes the production one, in `ap_main`, last.
         let a64 = code(A64_SMP);
-        assert!(a64.contains("crate::kernel::boot::ap_user_dispatch_enabled()"));
         assert_eq!(
             a64.matches("admit_ap_pinned_dispatch_split(cpu)").count(),
-            1
+            0
         );
+        assert_eq!(a64.matches("admit_ap_dispatch_split(cpu)").count(), 1);
+        let ap_main = a64
+            .split("pub fn ap_main(cpu: CpuId) -> ! {")
+            .nth(1)
+            .expect("the AArch64 production admission")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(!ap_main.contains("requested()") && !ap_main.contains("ap_user_dispatch_enabled"));
         let rv = code(RV_BOOT);
         assert_eq!(rv.matches("admit_ap_pinned_dispatch_split(cpu)").count(), 1);
         // AP-SCHED2: without the knob RISC-V releases every dispatch-capable trap-ready
@@ -179362,14 +179387,23 @@ mod u9vment1_ownership_cases {
             "AArch64 invalidation is an inner-shareable broadcast completed by a DSB, so every PE \
              in the domain is covered without any IPI"
         );
-        // AArch64 secondaries do not dispatch user tasks either, so the target set is empty in
-        // practice; the broadcast is what makes the contract hold regardless.
+        // AP-SCHED3: AArch64 secondaries DO dispatch user tasks now, so remote holders exist; the
+        // broadcast is what covers them, and the reschedule SGI earns no TLB credit — its owner
+        // issues no TLB maintenance at all.
         const A64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
         assert!(
-            A64_BOOT.contains("AArch64 has no AP *user* dispatcher")
-                && A64_BOOT.contains("mark_cpu_wake_only(cpu, true)"),
+            A64_BOOT.contains("mark_cpu_wake_only(cpu, true)"),
             "AArch64 secondaries are marked wake-only before onlining"
         );
+        const A64_SMP: &str = include_str!("../../arch/aarch64/smp.rs");
+        let sgi = A64_SMP
+            .split("pub fn send_reschedule_sgi(")
+            .nth(1)
+            .expect("the SGI owner")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(!sgi.contains("tlbi"), "an SGI carries no invalidation");
 
         // RISC-V: `sfence.vma` is hart-local and there is no broadcast — but a remote holder is
         // unreachable by the port's DISPATCH RULES, not merely absent at some CPU count.
@@ -179618,7 +179652,9 @@ mod u9vment1_reachability_matrix {
             "\n#[cfg(not(target_arch = \"aarch64\"))]",
         ));
         assert!(
-            finalize.contains("if matches!(reason, SplitFinalizeReason::CompletedInThisTrap) {")
+            finalize.contains(
+                "SplitFinalizeReason::CompletedInThisTrap | SplitFinalizeReason::RouteFinishedCaller\n    ) {"
+            )
                 && finalize.contains(
                     "split_finalize_handled_syscall(shared, cpu, entering, frame);\n        return;"
                 ),
@@ -179835,7 +179871,7 @@ mod u9vment1_reachability_matrix {
     /// | port | where the entering-CPU identity comes from |
     /// |---|---|
     /// | x86_64 | `current_cpu_id()` at the IDT entry, from the local APIC id |
-    /// | AArch64 | `read_mpidr_el1() & 0xff` at the vector entry |
+    /// | AArch64 | `this_cpu_index()` (`TPIDR_EL1`, the planned logical id) at the vector entry |
     /// | RISC-V | `token.cpu()` — the per-hart dispatch authority minted at trap entry |
     ///
     /// From there it is a plain parameter the whole way down: arch entry -> the shared trap
@@ -179854,11 +179890,13 @@ mod u9vment1_reachability_matrix {
             "x86_64 passes the APIC-derived entering CPU into the shared trap handler"
         );
         assert!(
-            AARCH64_BOOT.contains("read_mpidr_el1() & 0xff) as u8)")
-                && AARCH64_BOOT.contains(
-                    "dispatch_trap_entry_with_shared_kernel(\n            shared,\n            trap_cpu,"
-                ),
-            "AArch64 passes the MPIDR-derived entering CPU into the shared trap handler"
+            AARCH64_BOOT.contains(
+                "let trap_cpu = crate::kernel::scheduler::CpuId(crate::arch::aarch64::this_cpu_index() as u8);"
+            ) && AARCH64_BOOT.contains(
+                "dispatch_trap_entry_with_shared_kernel(\n            shared,\n            trap_cpu,"
+            ) && !AARCH64_BOOT.contains("read_mpidr_el1() & 0xff"),
+            "AArch64 passes the entering CPU's own logical id (TPIDR_EL1, written once at its \
+             entry and validated against its MPIDR affinity — AP-SCHED3) into the shared trap handler"
         );
         assert!(
             RISCV_TRAP.contains("let cpu = token.cpu();")
@@ -200637,16 +200675,32 @@ mod ap_sched1 {
             .find("note_user_root_released(cpu)")
             .expect("the record");
         assert!(hw < rec, "the root is left before the record says so");
-        // The other ports leave their record alone: their roots stay loaded.
-        let other = body
-            .split("not(target_arch = \"riscv64\")))]")
+        // AP-SCHED3 §C: AArch64 does the same — `TTBR0_EL1` becomes the kernel's root (`isb`
+        // included) first, and a port that could not switch keeps its record.
+        let aarch64 = body
+            .split("target_arch = \"aarch64\"))]")
             .nth(1)
-            .expect("the other ports' arm");
+            .expect("the AArch64 arm")
+            .split("#[cfg(feature = \"hosted-dev\")]")
+            .next()
+            .unwrap();
+        let hw = aarch64
+            .find("if !crate::arch::aarch64::page_table::enter_kernel_root() {\n            return false;")
+            .expect("the hardware change, refusing when it did not happen");
+        let rec = aarch64
+            .find("note_user_root_released(cpu)")
+            .expect("the record");
+        assert!(hw < rec, "the root is left before the record says so");
+        // x86_64 leaves its record alone: its roots stay loaded.
+        let other = body
+            .split("not(target_arch = \"aarch64\")\n    ))]")
+            .nth(1)
+            .expect("the remaining port's arm");
         assert!(!other.contains("note_user_root_released"));
         assert_eq!(
             hal.matches("note_user_root_released(cpu)").count(),
-            2,
-            "two writers: the RISC-V transition and the hosted model of it"
+            3,
+            "three writers: the RISC-V and AArch64 transitions and the hosted model of them"
         );
         let pt = include_str!("../../arch/riscv64/page_table.rs");
         let bare = pt
@@ -201519,5 +201573,579 @@ mod ap_sched3 {
         assert!(
             claim.contains("policy::next_logical_cpu(seen, crate::kernel::scheduler::MAX_CPUS)?")
         );
+    }
+
+    // ── §B–§D: AArch64 production SMP ─────────────────────────────────────────────────────────
+
+    const A64_SMP: &str = include_str!("../../arch/aarch64/smp.rs");
+    const A64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+    const A64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+    const A64_PT: &str = include_str!("../../arch/aarch64/page_table.rs");
+    const A64_MOD: &str = include_str!("../../arch/aarch64/mod.rs");
+    const HAL: &str = include_str!("../../arch/hal.rs");
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const YIELD_TXN: &str = include_str!("../syscall/yield_txn.rs");
+
+    fn order(body: &str, steps: &[&str]) {
+        let mut at = 0;
+        for step in steps {
+            let found = body[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("`{step}` follows the previous step"));
+            at += found + step.len();
+        }
+    }
+
+    /// **Dispatch eligibility is published LAST, and the knob has no authority over it.** A
+    /// secondary's production admission runs translation, the boot-window wait, the stack check,
+    /// its own GIC interface and SGI, its own timer, a readiness check from its own registers and
+    /// its kernel root, and only then the scheduler's one production transition; the idle park
+    /// follows. Nothing in it asks `yarm.ap_user_dispatch`.
+    #[test]
+    fn aarch64_admission_publishes_eligibility_last() {
+        let main = body_of(A64_SMP, "pub fn ap_main(cpu: CpuId) -> ! {");
+        order(
+            main,
+            &[
+                "enable_ap_translation();",
+                "while !bsp_boot_borrow_ended()",
+                "dispatch_capable(cpu.0 as usize, ap_stack_bytes())",
+                "bring_up_sgi_on_this_cpu(cpu)",
+                "enable_ap_arch_timer_ppi()",
+                "program_timer_deadline(",
+                "if !this_ap_irq_ready(cpu)",
+                "crate::arch::hal::leave_user_root(cpu)",
+                "shared.admit_ap_dispatch_split(cpu)",
+                "ADMITTED.fetch_or(",
+                "AARCH64_AP_STATE cpu={} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none",
+                "enter_ap_idle(cpu)",
+            ],
+        );
+        assert!(
+            !main.contains("requested()"),
+            "admission never asks the knob"
+        );
+        assert!(
+            !main.contains("admit_ap_pinned_dispatch_split"),
+            "no pinned admission"
+        );
+        // The readiness check reads the CPU's own state, not the calls that set it.
+        let ready = body_of(A64_SMP, "fn this_ap_irq_ready(cpu: CpuId) -> bool {");
+        for fact in [
+            "this_cpu_irq_readback()",
+            "arch_timer_is_armed()",
+            "TARGETS.mask_of(cpu.0 as usize) != 0",
+        ] {
+            assert!(ready.contains(fact), "readiness reads `{fact}`");
+        }
+        // Within the SGI bring-up the interface bit is published last, after every readback.
+        let sgi = body_of(
+            A64_SMP,
+            "pub fn bring_up_sgi_on_this_cpu(cpu: CpuId) -> Result<u8, &'static str> {",
+        );
+        order(sgi, &["read32(dist, GICD_ISENABLER0)", "TARGETS"]);
+    }
+
+    /// **A missing prerequisite leaves the CPU explicitly non-dispatching.** It is withdrawn as
+    /// an SGI target, its timer and interrupts are disabled, it is named with the states it
+    /// reached, and it never reaches the scheduler's admission (so it stays wake-only: placement
+    /// skips it and a pinned enqueue onto it is refused — `ap_sched2`'s scheduler cases).
+    #[test]
+    fn aarch64_a_failed_prerequisite_is_named_and_takes_no_work() {
+        let park = body_of(
+            A64_SMP,
+            "fn park_unadmitted(cpu: CpuId, state: ApState, reason: &str) -> ! {",
+        );
+        order(
+            park,
+            &[
+                "TARGETS.withdraw(cpu.0 as usize);",
+                "disable_this_cpu_interrupts();",
+                "admitted=0 dispatching=0 reason={}",
+            ],
+        );
+        assert!(!park.contains("admit_ap_dispatch_split"));
+        let mismatch = body_of(A64_SMP, "pub fn park_identity_mismatch(");
+        assert!(mismatch.contains("reason=identity_mismatch"));
+        assert!(!mismatch.contains("TARGETS.publish"));
+    }
+
+    /// **A CPU is named by its logical id, never by `MPIDR_EL1.Aff0`.** Each CPU writes its own
+    /// `TPIDR_EL1` at entry — the boot CPU 0 at `_start`, a secondary the plan's logical id after a
+    /// bounds check against the stack pool — and validates it against its whole MPIDR affinity;
+    /// no production code truncates MPIDR to name a CPU any more.
+    #[test]
+    fn aarch64_identity_is_the_planned_logical_id() {
+        assert!(A64_MOD.contains("mrs {0}, TPIDR_EL1"));
+        assert_eq!(
+            A64_BOOT.matches("msr TPIDR_EL1, xzr").count(),
+            2,
+            "both boot entries name the boot CPU 0"
+        );
+        let entry = A64_BOOT
+            .split("yarm_aarch64_secondary_entry:")
+            .nth(1)
+            .expect("the entry stub")
+            .split("\"#")
+            .next()
+            .expect("its body");
+        order(
+            entry,
+            &[
+                "cbz x0, 1f",
+                "yarm_aarch64_ap_stack_slots",
+                "b.hi 1f",
+                "msr TPIDR_EL1, x0",
+                "sub x3, x0, #1",
+                "sub sp, x1, x3",
+                "bl yarm_aarch64_secondary_cpu_boot",
+            ],
+        );
+        let boot = body_of(
+            A64_BOOT,
+            "extern \"C\" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {",
+        );
+        order(
+            boot,
+            &[
+                "planned_affinity_of(cpu_id as usize)",
+                "Some(planned)\n                if planned == affinity\n                    && crate::arch::aarch64::this_cpu_index() == cpu_id as usize =>",
+                "crate::arch::aarch64::smp::ap_main(cpu)",
+                "park_identity_mismatch(",
+            ],
+        );
+        for (name, src) in [
+            ("boot.rs", A64_BOOT),
+            ("trap.rs", A64_TRAP),
+            ("page_table.rs", A64_PT),
+            ("smp.rs", A64_SMP),
+            ("vm_txn.rs", include_str!("../syscall/vm_txn.rs")),
+            ("lock2_witness.rs", include_str!("../lock2_witness.rs")),
+            ("scheduler_state.rs", include_str!("scheduler_state.rs")),
+            (
+                "smp2_witness.rs",
+                include_str!("../../arch/aarch64/smp2_witness.rs"),
+            ),
+        ] {
+            assert!(
+                !src.contains("read_mpidr_el1() & 0xff"),
+                "{name} names a CPU by Aff0"
+            );
+            assert!(
+                !src.contains("(mpidr & 0xff)"),
+                "{name} names a CPU by Aff0"
+            );
+        }
+        // The PSCI start targets the WHOLE planned affinity and passes the logical id.
+        let start = body_of(
+            A64_BOOT,
+            "fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize {",
+        );
+        assert!(
+            start.contains("psci_cpu_on(conduit, affinity, secondary_entry, u64::from(cpu_id))")
+        );
+        order(
+            start,
+            &[
+                "mark_cpu_wake_only(cpu, true)",
+                "bring_up_cpu(cpu)",
+                "psci_cpu_on(",
+            ],
+        );
+    }
+
+    /// **The stack pool is what the policy says.** Seven slots of the 2 MiB correctness size in
+    /// the QEMU image, indexed by logical CPU − 1; the RPi5 image's 16 KiB stacks admit nothing.
+    #[test]
+    fn aarch64_dispatch_stacks_match_the_policy() {
+        use crate::arch::aarch64_cpu_admission as policy;
+        assert_eq!(policy::DISPATCH_STACK_BYTES, 0x20_0000);
+        assert_eq!(policy::DISPATCH_STACKS, 7);
+        let qemu = A64_BOOT
+            .split("secondary_boot_stacks:")
+            .nth(1)
+            .expect("the QEMU pool");
+        assert!(qemu.contains(".skip 0x00e00000"), "7 x 2 MiB");
+        let stride = qemu
+            .split("yarm_aarch64_ap_stack_stride:")
+            .nth(1)
+            .expect("stride");
+        assert!(stride.trim_start().starts_with(".quad 0x200000"));
+        let slots = qemu
+            .split("yarm_aarch64_ap_stack_slots:")
+            .nth(1)
+            .expect("slots");
+        assert!(slots.trim_start().starts_with(".quad 7"));
+        assert!(
+            !policy::dispatch_capable(1, 0x4000),
+            "the RPi5 stride admits nothing"
+        );
+        let main = body_of(A64_SMP, "pub fn ap_main(cpu: CpuId) -> ! {");
+        assert!(main.contains("Exclusion::NoDispatchStack.marker()"));
+    }
+
+    /// **Every remote runnable publication is announced by the reschedule SGI**, from the
+    /// executing CPU's own logical id, after the commit (`dsb ishst` before the `GICD_SGIR`
+    /// write); a remote enqueue may therefore target an AArch64 secondary (fork children included).
+    #[test]
+    fn aarch64_remote_enqueue_is_announced_by_sgi() {
+        let notify = body_of(HAL, "pub(crate) fn notify_enqueued(target: CpuId) {");
+        let a64 = notify
+            .split("target_arch = \"aarch64\"))]")
+            .nth(1)
+            .expect("an AArch64 arm");
+        order(
+            a64,
+            &[
+                "this_cpu_index()",
+                "if me != target",
+                "send_reschedule_sgi(me, target)",
+            ],
+        );
+        assert!(HAL.contains("any(target_arch = \"riscv64\", target_arch = \"aarch64\")"));
+        let send = body_of(
+            A64_SMP,
+            "pub fn send_reschedule_sgi(sender: CpuId, target: CpuId) -> Result<u32, SgiRefusal> {",
+        );
+        order(
+            send,
+            &[
+                "TARGETS.sgir_for(",
+                "dsb ishst",
+                "write32(dist, GICD_SGIR, sgir)",
+            ],
+        );
+        let runtime = include_str!("../../runtime.rs");
+        let exec = body_of(
+            runtime,
+            "    pub(crate) fn executing_cpu_split(&self) -> CpuId {",
+        );
+        assert!(
+            exec.contains("this_cpu_index()"),
+            "the executing CPU is hardware's, not ambient"
+        );
+    }
+
+    /// **An idle CPU leaves the user root, then releases its record; teardown's broadcast
+    /// retires the rest.** Every AArch64 idle arrival switches `TTBR0_EL1` to the kernel root
+    /// (`isb` after the write) before the activation record is released, and before the park.
+    #[test]
+    fn aarch64_idle_leaves_the_user_root_before_its_record() {
+        let enter = body_of(A64_PT, "pub fn enter_kernel_root() -> bool {");
+        order(
+            enter,
+            &["bootstrap_mmu_registers()", "msr ttbr0_el1, {root}", "isb"],
+        );
+        let leave = body_of(HAL, "pub(crate) fn leave_user_root(cpu: CpuId) -> bool {");
+        let a64 = leave
+            .split("target_arch = \"aarch64\"))]")
+            .nth(1)
+            .expect("an AArch64 arm");
+        order(
+            a64,
+            &[
+                "if !crate::arch::aarch64::page_table::enter_kernel_root() {",
+                "return false;",
+                "note_user_root_released(cpu);",
+            ],
+        );
+        let idle = body_of(A64_TRAP, "fn idle_no_eret_loop() -> ! {");
+        order(
+            idle,
+            &[
+                "leave_user_root(",
+                "park_ap_timer_for_idle(cpu)",
+                "crate::kernel::idle_boundary::park(cpu, sp)",
+            ],
+        );
+        // Teardown invalidates the space by broadcast before its root is freed.
+        let vm = include_str!("../vm.rs");
+        let unreg = body_of(vm, "fn arch_unregister_asid(asid: Asid) {");
+        order(unreg, &["invalidate_asid(asid)", "remove_asid_root(asid)"]);
+        assert!(A64_PT.contains("\"tlbi aside1is, {operand}\""));
+    }
+
+    /// **A secondary's timer preempts there, and an idle secondary parks it.** No bootstrap-CPU
+    /// gate remains on the yield transaction; an idle secondary's timer moves to the backstop at
+    /// its idle arrival and gets its period back exactly where it leaves idle to run a task.
+    #[test]
+    fn aarch64_secondary_timer_preempts_and_parks_when_idle() {
+        let gate = body_of(
+            YIELD_TXN,
+            "pub(crate) fn yield_deferral_arch_gate<O: YieldOwners>(",
+        );
+        assert!(!gate.contains("return Err(YieldDecline::ArchGateOff)"));
+        let advance = TRAP_ENTRY
+            .split("Some(token) => {")
+            .find(|b| b.contains("TIMER_IDLE_ADVANCE_FRAME_OK"))
+            .expect("the idle advance");
+        order(
+            advance,
+            &[
+                "direct_dispatch_resume_incoming_core",
+                "unpark_ap_timer(cpu_idx)",
+                "commit_user_return(cpu_idx)",
+            ],
+        );
+        let park = body_of(
+            A64_SMP,
+            "pub fn park_ap_timer_for_idle(cpu: usize) -> bool {",
+        );
+        assert!(
+            park.contains("BOOTSTRAP_CPU_ID"),
+            "the clock owner never parks"
+        );
+        assert!(
+            park.contains("!admitted("),
+            "nor does a CPU that was never admitted"
+        );
+        let irq = include_str!("../../arch/aarch64/irq.rs");
+        let arm = body_of(
+            irq,
+            "pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, ticks_from_now: u64) {",
+        );
+        assert!(arm.contains("timer_distance_for_this_cpu(ticks_from_now)"));
+    }
+
+    /// **Eight CPUs — the GICv2 maximum — admit concurrently, spread, race idle and keep one
+    /// clock**, through the production owners: seven secondaries admit on their own threads in
+    /// any order; fourteen ordinary tasks spread two per CPU at most over all eight; jittered
+    /// enqueues against seven targets running the idle protocol lose no wake; secondary ticks move
+    /// no clock; and a deadline wakes a receive homed on CPU 7 and tells CPU 7.
+    #[test]
+    fn eight_cpus_admit_spread_race_and_keep_one_clock() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        use std::time::{Duration, Instant};
+        std::thread::Builder::new()
+            .name("ap_sched3_eight".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                const CPU0: CpuId = CpuId(0);
+                let aps: [CpuId; 7] = core::array::from_fn(|i| CpuId(i as u8 + 1));
+                let k = crate::runtime::SharedKernel::new(Bootstrap::init().expect("init"));
+                // The boot CPU publishes the planned logical map (eight present) first, as
+                // `stage_aarch64_cpu_plan` does through the DTB staging.
+                k.with_scheduler_split_mut(|sched| {
+                    crate::kernel::boot::kernel_mut(&mut sched.scheduler)
+                        .set_present_cpu_bitmap(0xff);
+                });
+                k.with(|s| {
+                    for cpu in aps {
+                        s.mark_cpu_wake_only(cpu, true).expect("wake-only first");
+                        s.bring_up_cpu(cpu).expect("then online");
+                    }
+                });
+                // Concurrent admission, one thread per secondary.
+                std::thread::scope(|scope| {
+                    for cpu in aps {
+                        let k = &k;
+                        scope.spawn(move || k.admit_ap_dispatch_split(cpu).expect("admit"));
+                    }
+                });
+                k.with_scheduler_split_mut(|sched| {
+                    let s = crate::kernel::boot::kernel_ref(&sched.scheduler);
+                    assert_eq!(s.online_cpu_bitmap(), 0xff);
+                    assert_eq!(s.wake_only_bitmap(), 0);
+                    assert_eq!(s.balance_excluded_bitmap(), 0);
+                });
+                for cpu in aps {
+                    assert!(k.admit_ap_dispatch_split(cpu).is_err(), "once each");
+                }
+                // Placement: fourteen tasks over eight CPUs, at most two each, every CPU used.
+                k.with(|s| {
+                    for tid in 7000..7014 {
+                        s.register_task(tid).expect("task");
+                    }
+                });
+                let mut per = [0usize; 8];
+                for tid in 7000..7014u64 {
+                    let cpu = k.enqueue_task_split(CPU0, tid).expect("placed");
+                    per[cpu.0 as usize] += 1;
+                }
+                assert!(per.iter().all(|&n| (1..=2).contains(&n)), "spread: {per:?}");
+                // One clock: secondaries' ticks consume their quanta only.
+                let t0 = k.scheduler_tick_now_split_read();
+                for _ in 0..5 {
+                    for cpu in aps {
+                        let _ = k.scheduler_tick_split_mut(cpu);
+                    }
+                }
+                assert_eq!(k.scheduler_tick_now_split_read(), t0);
+                // Enqueue versus idle, seven targets.
+                const ROUNDS: u64 = 24;
+                let tid_of = |i: usize, r: u64| 7100 + r * 7 + i as u64;
+                k.with(|s| {
+                    for (i, cpu) in aps.into_iter().enumerate() {
+                        // Empty each queue of the placement tasks first.
+                        while s.dispatch_next_on_cpu(cpu).is_some() {
+                            s.block_current_on_cpu(cpu);
+                        }
+                        for r in 0..ROUNDS {
+                            s.register_task(tid_of(i, r)).expect("task");
+                            s.with_tcb_mut(tid_of(i, r), |tcb| tcb.cpu_affinity = Some(cpu))
+                                .expect("tcb");
+                        }
+                    }
+                });
+                let lost = AtomicUsize::new(0);
+                let ran: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
+                std::thread::scope(|scope| {
+                    for (i, cpu) in aps.into_iter().enumerate() {
+                        let (k, lost, ran) = (&k, &lost, &ran);
+                        scope.spawn(move || {
+                            while ran[i].load(O::Acquire) < ROUNDS as usize {
+                                let seen = crate::arch::hal::enqueues_notified(cpu);
+                                let next = k.with_scheduler_split_mut(|sched| {
+                                    let s = crate::kernel::boot::kernel_mut(&mut sched.scheduler);
+                                    let next = s.dispatch_next_on(cpu);
+                                    if next.is_some() {
+                                        s.block_current_on(cpu);
+                                    }
+                                    next
+                                });
+                                if next.is_some() {
+                                    ran[i].fetch_add(1, O::AcqRel);
+                                    continue;
+                                }
+                                let deadline = Instant::now() + Duration::from_secs(10);
+                                while crate::arch::hal::enqueues_notified(cpu) == seen {
+                                    if Instant::now() > deadline {
+                                        if k.runnable_count_on_cpu_split_read(cpu) > 0 {
+                                            lost.fetch_add(1, O::AcqRel);
+                                        }
+                                        return;
+                                    }
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        });
+                    }
+                    let k = &k;
+                    scope.spawn(move || {
+                        for r in 0..ROUNDS {
+                            for (i, cpu) in aps.into_iter().enumerate() {
+                                for _ in 0..((r as usize * 5 + i * 3) % 11) * 40 {
+                                    std::hint::spin_loop();
+                                }
+                                assert_eq!(k.enqueue_task_split(CPU0, tid_of(i, r)), Ok(cpu));
+                            }
+                        }
+                    });
+                });
+                assert_eq!(lost.load(O::Acquire), 0, "no wake was lost");
+                for (i, cpu) in aps.into_iter().enumerate() {
+                    assert_eq!(
+                        ran[i].load(O::Acquire),
+                        ROUNDS as usize,
+                        "{cpu:?} ran its tasks"
+                    );
+                }
+                // A deadline on CPU 7 wakes there and tells CPU 7.
+                let target = CpuId(7);
+                let tid = 7300u64;
+                let deadline = k.with(|s| {
+                    s.register_task(tid).expect("task");
+                    s.set_current_cpu(target).expect("on CPU 7");
+                    s.with_tcb_mut(tid, |tcb| tcb.cpu_affinity = Some(target))
+                        .expect("tcb");
+                    s.enqueue_on_cpu(target, tid).expect("enqueue");
+                    assert_eq!(s.dispatch_next_on_cpu(target), Some(tid));
+                    let (_eid, _send, recv) = s.create_endpoint(2).expect("endpoint");
+                    let deadline = s.scheduler_tick_now().wrapping_add(2);
+                    assert_eq!(
+                        s.ipc_recv_until_deadline(recv, deadline).expect("recv"),
+                        None
+                    );
+                    s.set_current_cpu(CPU0).expect("back");
+                    deadline
+                });
+                for _ in 0..2 {
+                    let _ = k.scheduler_tick_split_mut(CPU0);
+                }
+                let before = crate::arch::hal::enqueues_notified(target);
+                // The production scan is windowed (`IPC_TIMEOUT_SCAN_WINDOW` slots per tick) and
+                // this table holds ~200 tasks, so the wake is due within one rotation of the
+                // cursor — successive CPU-0 ticks, never a secondary's.
+                crate::kernel::boot::reset_ipc_timeout_scan_cursor(0);
+                let mut scans = 0;
+                while k.with(|s| s.runnable_count_on_cpu(target)) == 0 {
+                    assert!(scans < 64, "the deadline is found within one rotation");
+                    k.run_due_ipc_timeout_work_at(CPU0, deadline, deadline, deadline);
+                    scans += 1;
+                }
+                assert_eq!(
+                    k.with(|s| s.runnable_count_on_cpu(target)),
+                    1,
+                    "woken at home"
+                );
+                assert_eq!(crate::arch::hal::enqueues_notified(target), before + 1);
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    /// **A send the route delivered is reported as delivered.** NR 1's direct delivery returns
+    /// `PostWorkCommitted { finalize_syscall: true }` after `complete_ok`; the AArch64 bridge must
+    /// export that result whatever the syscall number, because the route — not a class list —
+    /// decides that the caller is finished. Before this, NR 1 was missing from the list and its
+    /// sender read its own endpoint cap from x0 as the "result".
+    #[test]
+    fn aarch64_a_route_finished_caller_is_committed_whatever_its_number() {
+        let post_work = body_of(
+            TRAP_ENTRY,
+            "if let SplitDispatchDisposition::PostWorkCommitted { finalize_syscall } = disposition {",
+        );
+        let post_work = &post_work[..post_work.find("post_work_committed = true;").unwrap()];
+        assert!(post_work.contains("if finalize_syscall {"));
+        assert!(post_work.contains("SplitFinalizeReason::RouteFinishedCaller,"));
+        assert!(!post_work.contains("SplitFinalizeReason::PublishedTransition"));
+        let owner = body_of(
+            TRAP_ENTRY,
+            "fn finalize_split_handled_syscall(\n    shared: &crate::runtime::SharedKernel,",
+        );
+        let gate = owner
+            .find("SplitFinalizeReason::CompletedInThisTrap | SplitFinalizeReason::RouteFinishedCaller")
+            .expect("the unconditional arm names both reasons");
+        let list = owner
+            .find("frame.syscall_num() ==")
+            .expect("the per-class list");
+        assert!(
+            gate < list,
+            "the route's answer is consulted before any class list"
+        );
+        // And the route really does declare NR 1's delivery finished.
+        let split = include_str!("../syscall_split.rs");
+        let done = split
+            .find("result=direct_delivery")
+            .expect("NR 1's direct delivery");
+        let tail = &split[done..done + 400];
+        assert!(
+            tail.contains("return D::PostWorkCommitted {")
+                && tail.contains("finalize_syscall: true,"),
+            "NR 1's direct delivery declares its sender finished"
+        );
+    }
+
+    /// **The kernel root an idle CPU runs on maps devices execute-never and EL1-only.** Every
+    /// idle CPU now parks on the bootstrap root (`enter_kernel_root`) and takes device interrupts
+    /// there, so its device blocks carry PXN and UXN, with AP = 0b00.
+    #[test]
+    fn aarch64_the_kernel_root_maps_devices_execute_never() {
+        let block = body_of(A64_BOOT, "        let device_block = |base: u64| -> u64 {");
+        let block = &block[..block.find("};").expect("the closure")];
+        for bit in [
+            "AARCH64_PTE_PXN",
+            "AARCH64_PTE_UXN",
+            "AARCH64_ATTRIDX_DEVICE_NGNRE",
+        ] {
+            assert!(block.contains(bit), "{bit}");
+        }
+        assert!(
+            !block.contains("AP_EL0") && !block.contains("(1 << 6)"),
+            "EL1-only"
+        );
+        assert!(A64_BOOT.contains("const AARCH64_PTE_PXN: u64 = 1 << 53;"));
+        assert!(A64_BOOT.contains("const AARCH64_PTE_UXN: u64 = 1 << 54;"));
     }
 }

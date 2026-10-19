@@ -26,17 +26,25 @@ exc_stack_aarch64:
 exc_stack_aarch64_end:
     .align 16
 secondary_boot_stacks:
-    .skip 0x00800000
+    .skip 0x00e00000
+    .global secondary_boot_stacks_end
 secondary_boot_stacks_end:
 
-    /* QEMU-SMP2: the per-AP stack stride `yarm_aarch64_secondary_entry` reads. A dispatching AP
-     * takes the whole shared trap path on this stack (the BSP takes it on its 16 MiB boot
-     * stack), so 16 KiB is not enough: 64 slots x 128 KiB = the 8 MiB above. */
+    /* AP-SCHED3 §B: the per-secondary stack pool `yarm_aarch64_secondary_entry` indexes by
+     * LOGICAL CPU - 1 (never by MPIDR). A dispatching CPU takes every exception on this stack and
+     * runs the whole syscall, fault and timer settlement there, as the BSP does on its 16 MiB boot
+     * stack, so each gets the correctness size `aarch64_cpu_admission::DISPATCH_STACK_BYTES`
+     * (2 MiB; RISC-V measured its deepest dispatch between 256 KiB and 1 MiB). One slot per
+     * secondary the production ceiling admits: 7 x 2 MiB = the 14 MiB above. (QEMU-SMP2 had 64
+     * slots x 128 KiB, indexed by Aff0.) */
     .section .rodata.yarm_ap_stack,"a",@progbits
     .balign 8
     .global yarm_aarch64_ap_stack_stride
 yarm_aarch64_ap_stack_stride:
-    .quad 0x20000
+    .quad 0x200000
+    .global yarm_aarch64_ap_stack_slots
+yarm_aarch64_ap_stack_slots:
+    .quad 7
 
     .section .text.boot,"ax",@progbits
     .weak _start
@@ -46,6 +54,8 @@ _start:
     mov x21, x1
     mov x22, x2
     mov x23, x3
+    /* AP-SCHED3 §B: this CPU's logical id (the boot CPU is 0), before any exception can be taken. */
+    msr TPIDR_EL1, xzr
     adrp x9, boot_stack_aarch64_end
     add x9, x9, :lo12:boot_stack_aarch64_end
     mov sp, x9
@@ -168,16 +178,22 @@ secondary_boot_stacks:
     .skip 0x00100000
 secondary_boot_stacks_end:
 
+    /* The RPi5 high-half image keeps 64 x 16 KiB park stacks: smaller than the dispatch
+     * correctness size, so production admits no secondary here (`no_dispatch_stack`). */
     .section .rodata.yarm_ap_stack,"a",@progbits
     .balign 8
     .global yarm_aarch64_ap_stack_stride
 yarm_aarch64_ap_stack_stride:
     .quad 0x4000
+    .global yarm_aarch64_ap_stack_slots
+yarm_aarch64_ap_stack_slots:
+    .quad 64
 
     .section .text.boot,"ax",@progbits
     .global _start
     .type _start,%function
 _start:
+    msr TPIDR_EL1, xzr
     mov x20, x0
     ldr x9, =boot_stack_aarch64_end
     mov sp, x9
@@ -4842,13 +4858,22 @@ yarm_aarch64_secondary_entry:
     mov x1, #(3 << 20)
     msr CPACR_EL1, x1
     isb
-    mrs x0, MPIDR_EL1
-    and x0, x0, #0xff
+    /* AP-SCHED3 §B: x0 is the PSCI context id = the LOGICAL id the boot CPU planned for this CPU
+     * (never MPIDR & 0xff). It indexes the stack pool, so it is bounds-checked first: 0 (the boot
+     * CPU's) or anything beyond the pool parks here, touching nothing. The id is then this CPU's
+     * TPIDR_EL1, before any exception can be taken; Rust validates it against MPIDR_EL1. */
+    cbz x0, 1f
+    adrp x1, yarm_aarch64_ap_stack_slots
+    ldr x1, [x1, :lo12:yarm_aarch64_ap_stack_slots]
+    cmp x0, x1
+    b.hi 1f
+    msr TPIDR_EL1, x0
     adrp x1, secondary_boot_stacks_end
     add x1, x1, :lo12:secondary_boot_stacks_end
     adrp x2, yarm_aarch64_ap_stack_stride
     ldr x2, [x2, :lo12:yarm_aarch64_ap_stack_stride]
-    mul x3, x0, x2
+    sub x3, x0, #1
+    mul x3, x3, x2
     sub sp, x1, x3
     bl yarm_aarch64_secondary_cpu_boot
 1:
@@ -4950,6 +4975,10 @@ const AARCH64_PTE_TABLE: u64 = 1 << 1;
 const AARCH64_PTE_AF: u64 = 1 << 10;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const AARCH64_PTE_SH_INNER: u64 = 0b11 << 8;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_PTE_PXN: u64 = 1 << 53;
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+const AARCH64_PTE_UXN: u64 = 1 << 54;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 const AARCH64_PTE_ATTR_SHIFT: u64 = 2;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -6876,11 +6905,11 @@ extern "C" fn yarm_aarch64_vector_elr_marker(elr: u64) {
     boot_trace!("YARM_AARCH64_VECTOR_ELR_RAW elr=0x{:016x}", elr);
 }
 
-/// THIS CPU's index for the per-CPU vector slots: MPIDR_EL1 Aff0, the same identity the vector
-/// entry derives `trap_cpu` from.
+/// THIS CPU's index for the per-CPU vector slots: its logical id (`TPIDR_EL1`, AP-SCHED3 §B), the
+/// same identity the vector entry derives `trap_cpu` from.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn vector_cpu_index() -> usize {
-    (crate::arch::aarch64::read_mpidr_el1() & 0xff) as usize
+    crate::arch::aarch64::this_cpu_index()
 }
 
 /// The raw `ELR_EL1` of the exception THIS CPU is handling — the resume PC every handled-syscall
@@ -7288,8 +7317,7 @@ extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFram
     // published. (This replaces the debug-only Stage 30 assertion, whose window was opened and
     // never closed.)
     crate::runtime::refuse_shared_entry_during_boot_exclusive("aarch64_vector_entry");
-    let trap_cpu =
-        crate::kernel::scheduler::CpuId((crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8);
+    let trap_cpu = crate::kernel::scheduler::CpuId(crate::arch::aarch64::this_cpu_index() as u8);
     // QEMU-CONTEXT1 §2 — COMMIT. Kinds 9..=16 are lower-EL (EL0) exceptions: the asm prologue
     // captured the interrupted task's q0..q31, FPCR, FPSR and TPIDR_EL0 into this frame before
     // any compiled code ran; before anything can block, switch or diverge into idle, that state
@@ -8314,6 +8342,14 @@ pub fn bootstrap_first_user_task(
             crate::yarm_log!("SMP2_WITNESS_PROVISION_FAIL err={:?} result=fail", e);
         }
     }
+    // AP-SCHED3: the production AP-scheduling witness's one process P. Compile-time gated, and
+    // armed only WITHOUT the knob: it exercises the production admission of every secondary.
+    #[cfg(feature = "aarch64-apsched-witness")]
+    if !crate::arch::aarch64::smp::requested() {
+        if let Err(e) = crate::kernel::apsched_witness::provision(kernel) {
+            crate::yarm_log!("APSW_PROVISION_FAIL err={:?} result=fail", e);
+        }
+    }
     // QEMU-SMP3-ACCEPTANCE §2: the overtaken-deferral witness's two kernel-built tasks. Compile-time
     // gated and armed only with the AP dispatch knob, like the SMP2 witness.
     #[cfg(feature = "aarch64-overtaken-witness")]
@@ -8657,6 +8693,100 @@ pub fn run_with_prepared_kernel(run: fn(crate::runtime::BootExclusive)) {
     run(boot);
 }
 
+/// AP-SCHED3 §B — logical CPU → the MPIDR_EL1 affinity the admission plan gave it
+/// (`u64::MAX` = none). Written once by the boot CPU at its DTB parse, before any secondary is
+/// started; read by each secondary to validate its own identity, and by the PSCI start.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static LOGICAL_AFFINITY: [AtomicU64; crate::arch::aarch64_cpu_admission::PRODUCTION_CPU_CEILING] =
+    [const { AtomicU64::new(u64::MAX) };
+        crate::arch::aarch64_cpu_admission::PRODUCTION_CPU_CEILING];
+
+/// The affinity planned for logical CPU `cpu`, or `None`.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub(crate) fn planned_affinity_of(cpu: usize) -> Option<u64> {
+    LOGICAL_AFFINITY
+        .get(cpu)
+        .map(|a| a.load(Ordering::Acquire))
+        .filter(|&a| a != u64::MAX)
+}
+
+/// AP-SCHED3 §B — plan every DTB `cpu` node through the admission policy (whole MPIDR affinity,
+/// the GICv2 interface count read from `GICD_TYPER`, the production ceiling, the scheduler's
+/// tables), record logical → affinity, name every exclusion once, and return the LOGICAL present
+/// set the scheduler is built over. Runs on the boot CPU at its DTB parse (MMU off, so the
+/// distributor read is a Device access). `None` when the tree lists no `cpu` node.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    not(feature = "rpi5-stage1")
+))]
+fn stage_aarch64_cpu_plan(
+    parsed: &crate::arch::aarch64::dtb::ParsedDtb,
+    max_cpus: usize,
+) -> Option<u64> {
+    use crate::arch::aarch64_cpu_admission as policy;
+    if parsed.cpus.count == 0 {
+        return None;
+    }
+    let boot = crate::arch::aarch64::read_mpidr_el1() & policy::MPIDR_AFFINITY_MASK;
+    let typer = match (parsed.gic_dist_base, parsed.gic_cpu_if_base) {
+        // SAFETY: the DTB-derived GICv2 distributor; GICD_TYPER is a read-only ID register.
+        (Some(dist), Some(_)) => {
+            Some(unsafe { core::ptr::read_volatile((dist + 0x004) as *const u32) })
+        }
+        _ => None,
+    };
+    let interfaces = typer.map_or(0, policy::gic_interfaces_from_typer);
+    let plan = policy::plan(parsed.cpus.as_slice(), boot, interfaces, max_cpus);
+    LOGICAL_AFFINITY[0].store(boot, Ordering::Release);
+    let mut excluded = 0usize;
+    for p in plan.iter().flatten() {
+        match p.outcome {
+            Ok(cpu) => {
+                if let Some(slot) = LOGICAL_AFFINITY.get(cpu) {
+                    slot.store(p.affinity, Ordering::Release);
+                }
+                crate::yarm_log!(
+                    "AARCH64_CPU_PLANNED affinity=0x{:x} logical={}",
+                    p.affinity,
+                    cpu
+                );
+            }
+            Err(why) => {
+                excluded += 1;
+                crate::yarm_log!(
+                    "AARCH64_CPU_EXCLUDED affinity=0x{:x} reason={} dispatch=0",
+                    p.affinity,
+                    why.marker()
+                );
+            }
+        }
+    }
+    if parsed.cpus.overflow != 0 {
+        excluded += parsed.cpus.overflow;
+        crate::yarm_log!(
+            "AARCH64_CPU_EXCLUDED count={} reason=beyond_dtb_cpu_table dispatch=0",
+            parsed.cpus.overflow
+        );
+    }
+    let present = policy::logical_present_bitmap(&plan);
+    crate::yarm_log!(
+        "AARCH64_LOGICAL_CPUS present=0x{:x} count={} excluded={} boot_affinity=0x{:x} gic_interfaces={} gicd_typer=0x{:x} ceiling={}",
+        present,
+        present.count_ones(),
+        excluded,
+        boot,
+        interfaces,
+        typer.unwrap_or(0),
+        policy::PRODUCTION_CPU_CEILING
+    );
+    Some(present)
+}
+
+/// Start every planned secondary through PSCI `CPU_ON`, targeting its WHOLE MPIDR affinity and
+/// passing its logical id as the context id (the entry stub indexes its stack by that id and
+/// makes it the CPU's `TPIDR_EL1`). Each started CPU is registered online and WAKE-ONLY first:
+/// nothing can be placed on it until it completes its own production admission (`smp::ap_main`).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize {
     let mut started = 0usize;
@@ -8671,28 +8801,19 @@ fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize 
         return 0;
     }
     let present = kernel.present_cpu_bitmap();
-    for cpu_id in 0..64u8 {
-        if cpu_id == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
-            continue;
-        }
+    for cpu_id in 1..crate::arch::aarch64_cpu_admission::PRODUCTION_CPU_CEILING as u8 {
         let mask = 1u64 << cpu_id;
         if (present & mask) == 0 {
             continue;
         }
-        let cpu = crate::kernel::scheduler::CpuId(cpu_id);
-        let psci_ret = psci_cpu_on(conduit, cpu.0 as u64, secondary_entry, cpu.0 as u64);
-        crate::yarm_log!("YARM_SMP_PSCI cpu={} ret={}", cpu.0, psci_ret);
-        if psci_ret != 0 {
+        // The RPi5 images plan nothing (their secondaries are hardware bring-up, a later
+        // package), so no secondary is started there.
+        let Some(affinity) = planned_affinity_of(cpu_id as usize) else {
             continue;
-        }
-        // Stage 195D (BSP DISPATCH AFFINITY): AArch64 has no AP *user* dispatcher — the
-        // secondary main loop only drains cross-CPU work and `wfe`s (see
-        // `yarm_aarch64_secondary_cpu_boot`). Mark the AP wake-only BEFORE onlining it (no
-        // placement window), mirroring the x86_64 183.5 AP bring-up. This keeps
-        // `dispatching = online - wake_only == 1` (BSP-only user dispatch, single_dispatcher),
-        // makes balanced/explicit user-task placement avoid the AP (no strand), and preserves
-        // the AP for kernel/interrupt/cross-CPU bootstrap work. We do NOT claim AP user
-        // dispatch is live.
+        };
+        let cpu = crate::kernel::scheduler::CpuId(cpu_id);
+        // Wake-only BEFORE online, so there is no placement window; the CPU leaves wake-only only
+        // through its own admission.
         if kernel.mark_cpu_wake_only(cpu, true).is_err() {
             crate::yarm_log!("YARM_SMP_AP_WAKE_ONLY_MARK_FAIL cpu={}", cpu.0);
             continue;
@@ -8701,16 +8822,36 @@ fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize 
             let _ = kernel.mark_cpu_wake_only(cpu, false);
             continue;
         }
-        // Install the scheduler-owned idle current (tid 0) on the now-online wake-only AP, so
-        // it is a valid online-but-non-dispatching CPU (same convention as x86_64 183.5).
         if kernel.install_ap_idle_current(cpu).is_err() {
             crate::yarm_log!("YARM_SMP_AP_IDLE_INSTALL_FAIL cpu={}", cpu.0);
         }
+        #[cfg(feature = "aarch64-apsched-witness")]
+        crate::kernel::apsched_witness::ap_stack::paint(cpu_id as usize);
+        let psci_ret = psci_cpu_on(conduit, affinity, secondary_entry, u64::from(cpu_id));
+        crate::yarm_log!(
+            "YARM_SMP_PSCI cpu={} affinity=0x{:x} ret={}",
+            cpu.0,
+            affinity,
+            psci_ret
+        );
+        if psci_ret == 0 {
+            crate::arch::aarch64::smp::note_started(cpu);
+        }
+        if psci_ret != 0 {
+            // Registered wake-only and never admitted: nothing is placed on it. Named.
+            crate::yarm_log!(
+                "AARCH64_AP_STATE cpu={} discovered=1 initialized=0 irq_ready=0 admitted=0 dispatching=0 reason=psci_cpu_on_failed",
+                cpu.0
+            );
+            continue;
+        }
         started += 1;
     }
-    // BSP-only user-dispatch affinity is the active AArch64 policy: every AP that came online
-    // above is wake-only, so all runnable user-task placement routes to the BSP dispatcher.
-    crate::yarm_log!("AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE result=ok");
+    crate::yarm_log!(
+        "AARCH64_AP_START_PLAN started={} present=0x{:x}",
+        started,
+        present
+    );
     started
 }
 
@@ -8771,26 +8912,42 @@ extern "C" fn yarm_aarch64_secondary_cpu_boot(cpu_id: u64) -> ! {
         core::arch::asm!("msr VBAR_EL1, {0}", in(reg) vector_base, options(nomem, preserves_flags));
         core::arch::asm!("isb", options(nomem, preserves_flags));
     }
-    // QEMU-SMP2 §2: under the default-off knob the AP becomes a pinned dispatcher; otherwise the
-    // wake-only path below is unchanged.
-    if crate::arch::aarch64::smp::requested() {
-        crate::arch::aarch64::smp::ap_dispatch_main(cpu);
+    // AP-SCHED3 §B — identity first. The entry stub took the logical id from the PSCI context id
+    // and made it this CPU's TPIDR_EL1; it is accepted only if this CPU's own MPIDR_EL1 affinity
+    // is the one the boot CPU planned for that id. A mismatch publishes nothing and parks.
+    #[cfg(not(feature = "rpi5-stage1"))]
+    {
+        let mpidr = crate::arch::aarch64::read_mpidr_el1();
+        let affinity = mpidr & crate::arch::aarch64_cpu_admission::MPIDR_AFFINITY_MASK;
+        match planned_affinity_of(cpu_id as usize) {
+            Some(planned)
+                if planned == affinity
+                    && crate::arch::aarch64::this_cpu_index() == cpu_id as usize =>
+            {
+                // AP-SCHED3 §B: PRODUCTION admission, with no knob.
+                crate::arch::aarch64::smp::ap_main(cpu)
+            }
+            planned => crate::arch::aarch64::smp::park_identity_mismatch(
+                cpu,
+                mpidr,
+                planned.unwrap_or(u64::MAX),
+            ),
+        }
     }
 
-    // Without the user-dispatch knob a secondary is never admitted: it parks here for the life of
-    // the system and touches no kernel state. BLR1: this used to wait for a raw
-    // `&'static mut KernelState` (`TRAP_KERNEL_STATE_PTR`) that nothing ever installed, and then —
-    // had anything installed it — run `set_current_cpu` and a cross-CPU work loop on that whole-state
-    // reference concurrently with every other CPU. The pointer, its installer and that loop are
-    // deleted; the park is now explicit.
-    crate::yarm_log!(
-        "YARM_AARCH64_SMP_WAIT cpu={} state=parked reason=no_user_dispatch",
-        cpu_id
-    );
-    let _ = cpu;
-    loop {
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+    // The RPi5 images (hardware bring-up, a later package) start no secondary through the plan;
+    // one that runs anyway parks here for the life of the system and touches no kernel state.
+    #[cfg(feature = "rpi5-stage1")]
+    {
+        crate::yarm_log!(
+            "YARM_AARCH64_SMP_WAIT cpu={} state=parked reason=platform_not_admitted",
+            cpu_id
+        );
+        let _ = cpu;
+        loop {
+            unsafe {
+                core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+            }
         }
     }
 }
@@ -8907,7 +9064,22 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     // Reported only — this checkpoint performs no distributor MMIO.
                     parsed.gic_dist_base.unwrap_or(0),
                 );
-                if let Some(bitmap) = parsed.present_cpu_bitmap {
+                // AP-SCHED3 §B: the scheduler's present set is the LOGICAL numbering the
+                // admission plan produces, never the `cpu@N` unit-address bitmap.
+                #[cfg(not(feature = "rpi5-stage1"))]
+                let planned = stage_aarch64_cpu_plan(
+                    &parsed,
+                    options
+                        .max_cpus
+                        .unwrap_or(u64::BITS as usize)
+                        .min(u64::BITS as usize),
+                );
+                #[cfg(feature = "rpi5-stage1")]
+                let planned: Option<u64> = None;
+                if let Some(present) = planned {
+                    let _ =
+                        crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(present);
+                } else if let Some(bitmap) = parsed.present_cpu_bitmap {
                     let max_cpus = options
                         .max_cpus
                         .unwrap_or(u64::BITS as usize)
@@ -9223,9 +9395,14 @@ fn setup_bootstrap_mmu() {
             );
         }
 
+        // Device blocks are execute-never at both levels (AP-SCHED3: every idle CPU now runs on
+        // this root, and takes device interrupts on it; a Device region must never be fetchable)
+        // and EL1-only (AP = 0b00).
         let device_block = |base: u64| -> u64 {
             base | AARCH64_PTE_VALID
                 | AARCH64_PTE_AF
+                | AARCH64_PTE_PXN
+                | AARCH64_PTE_UXN
                 | (AARCH64_ATTRIDX_DEVICE_NGNRE << AARCH64_PTE_ATTR_SHIFT)
         };
         let gic_l2_index = (0x0800_0000u64 / AARCH64_BLOCK_2M) as usize;

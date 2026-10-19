@@ -102,7 +102,13 @@ riscv64-vmi-witness = ["riscv64-smp3-witness"]
 # fork children the PRODUCTION balanced placement puts on CPU 0 and CPU 1 (timer preemption with
 # register checks, an idle wake by IPI, a deadline, cross-CPU IPC, exit/reap churn). Armed only
 # WITHOUT `yarm.ap_user_dispatch=1`, on a `-smp 2` boot: it exercises the production admission.
-riscv64-apsched-witness = []
+riscv64-apsched-witness = ["apsched-witness"]
+# AP-SCHED3: the same production AP-scheduling witness on AArch64 (every admitted secondary, the
+# GICv2 reschedule SGI, AArch64's full user context: x0-x30 but x18, SP, q0-q31, FPCR, FPSR, NZCV,
+# TPIDR_EL0). Armed only WITHOUT `yarm.ap_user_dispatch=1`.
+aarch64-apsched-witness = ["apsched-witness"]
+# The port-neutral half of both witnesses (`kernel::apsched_witness`): never enabled on its own.
+apsched-witness = []
 # QEMU-LOCK1: real subdomain-lock contention on the production VM address-space lock
 # (`vm_state_lock`, rank 5), driven by the SMP3 two-hart VM/IPI workload (which it co-enables). It
 # instruments the chosen lock's atomic acquire/release, a default-off bounded hold hook that makes a

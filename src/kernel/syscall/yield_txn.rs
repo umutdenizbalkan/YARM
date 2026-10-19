@@ -122,9 +122,10 @@ pub(crate) struct YieldOutcome {
 pub(crate) enum YieldDecline {
     /// This CPU has no current task, so there is nothing to yield.
     NoCurrent,
-    /// The per-architecture deferral gate is closed for this build or this CPU. Since AP-SCHED1 §4
-    /// only AArch64's bootstrap-CPU gate constructs it, so it exists only there (and in tests).
-    #[cfg(any(test, target_arch = "aarch64"))]
+    /// The per-architecture deferral gate is closed for this build or this CPU. AP-SCHED1 §4
+    /// removed RISC-V's bootstrap-CPU gate and AP-SCHED3 §C removed AArch64's, the last one, so no
+    /// production build constructs it; it exists only for the tests that pin its settlement.
+    #[cfg(test)]
     ArchGateOff,
     /// Some route already holds this CPU's one-shot Yield deferral.
     DeferralHeld,
@@ -237,14 +238,11 @@ pub(crate) fn yield_deferral_arch_gate<O: YieldOwners>(
     // the one-shot proof had finished — and could not see an ordinary queue-advance deferral at
     // all. The real ownership token is the switch-plan stash, and `colliding_deferral_pending`
     // below now tests it, which makes the collision a `DeferralHeld` decline about THIS trap.
-    // AP-SCHED1 §4: AArch64's alone (see the doc above).
-    #[cfg(target_arch = "aarch64")]
-    {
-        if !owners.is_bootstrap_cpu(cpu) {
-            return Err(YieldDecline::ArchGateOff);
-        }
-    }
-    // Referenced on every architecture so the signature is not conditionally unused.
+    // AP-SCHED1 §4 removed this gate on RISC-V; AP-SCHED3 §C removes it on AArch64, the last port
+    // that had it. An admitted AArch64 secondary arms its own timer and consumes its own quantum
+    // (`SchedulerState::tick_on`), and its expiry — or its task's NR 0 — is a transaction committed
+    // on that CPU, by that trap's own authority, exactly as on CPU 0. Referenced on every
+    // architecture so the owner method stays one shared signature.
     let _ = owners.is_bootstrap_cpu(cpu);
     if owners.colliding_deferral_pending(cpu) {
         return Err(YieldDecline::DeferralHeld);
@@ -771,7 +769,7 @@ pub(crate) fn log_yield_declined(_cpu: CpuId, outgoing: u64, decline: YieldDecli
 pub(crate) const fn legacy_reason(decline: YieldDecline) -> &'static str {
     match decline {
         YieldDecline::NoCurrent => "no_current",
-        #[cfg(any(test, target_arch = "aarch64"))]
+        #[cfg(test)]
         YieldDecline::ArchGateOff => {
             if cfg!(target_arch = "x86_64") {
                 "d6_genuine_off"

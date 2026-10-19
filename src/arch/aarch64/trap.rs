@@ -156,11 +156,24 @@ fn idle_no_eret_loop() -> ! {
         target_arch = "aarch64"
     ))]
     crate::arch::aarch64::context_witness::note_idle_divergence(
-        (crate::arch::aarch64::read_mpidr_el1() & 0xff) as usize,
+        crate::arch::aarch64::this_cpu_index(),
     );
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     {
-        let cpu = (crate::arch::aarch64::read_mpidr_el1() & 0xff) as usize;
+        let cpu = crate::arch::aarch64::this_cpu_index();
+        // AP-SCHED3 §C — every idle ARRIVAL, on every CPU, leaves the user root before the park:
+        // `TTBR0_EL1` becomes the kernel's own root and only then is this CPU's activation record
+        // released, so a healthy exit/reap never finds a root held by an idle CPU and never
+        // quarantines it. An idle-boundary interrupt that dispatches nothing returns to the park
+        // loop below, not here, so this runs once per arrival; every resume re-activates its own
+        // root through the exact-token transaction.
+        crate::arch::hal::leave_user_root(crate::kernel::scheduler::CpuId(cpu as u8));
+        // An admitted secondary's own timer is parked behind the backstop while it idles; the boot
+        // CPU, the clock owner, never parks.
+        crate::arch::aarch64::smp::park_ap_timer_for_idle(cpu);
+        // AP-SCHED3 witness: this CPU arrived at its idle wait (observation only).
+        #[cfg(feature = "aarch64-apsched-witness")]
+        crate::kernel::apsched_witness::note_idle_reached(cpu);
         let sp: u64;
         unsafe {
             core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));

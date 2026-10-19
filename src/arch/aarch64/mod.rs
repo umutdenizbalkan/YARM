@@ -65,3 +65,29 @@ pub fn read_mpidr_el1() -> u64 {
 pub fn read_mpidr_el1() -> u64 {
     0
 }
+
+/// AP-SCHED3 §B — THIS CPU's LOGICAL id, the scheduler's `CpuId`.
+///
+/// Read from `TPIDR_EL1`, which each CPU writes exactly once at its own entry, before any
+/// exception can be taken there: the boot CPU writes 0 at `_start`, and a secondary writes the
+/// logical id the boot CPU planned for it (`aarch64_cpu_admission::plan`), which it then
+/// validates against its own MPIDR_EL1 affinity before it touches shared state. The register is
+/// EL1-only, so no task can change it, and it survives every exception and `eret`.
+///
+/// This replaces `MPIDR_EL1 & 0xff`, which named a CPU by `Aff0` alone: it assumed logical =
+/// hardware identity and would alias `0x000` and `0x100` (two CPUs in two clusters) onto one id.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[inline]
+pub fn this_cpu_index() -> usize {
+    let id: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, TPIDR_EL1", out(reg) id, options(nomem, nostack, preserves_flags));
+    }
+    id as usize
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
+#[inline]
+pub fn this_cpu_index() -> usize {
+    0
+}

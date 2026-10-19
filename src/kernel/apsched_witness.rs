@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! AP-SCHED1/AP-SCHED2 — the RISC-V production SMP-scheduling witness. Built only with
-//! `riscv64-apsched-witness`, and armed only WITHOUT `yarm.ap_user_dispatch=1`: it exercises the
-//! production admission of EVERY released secondary, never the diagnostic pinned one, and runs
-//! ordinary work on each of them (AP-SCHED2 generalized it from CPU 1 alone).
+//! AP-SCHED1/2/3 — the production SMP-scheduling witness, for RISC-V and AArch64. Built only with
+//! `riscv64-apsched-witness` / `aarch64-apsched-witness`, and armed only WITHOUT
+//! `yarm.ap_user_dispatch=1`: it exercises the production admission of EVERY admitted secondary,
+//! never a diagnostic pinned one, and runs ordinary work on each of them (AP-SCHED2 generalized it
+//! from CPU 1 alone; AP-SCHED3 moved this port-neutral half here from `arch::riscv64` and gave
+//! AArch64 its own program). The hooks that differ by port are the program
+//! (`arch/<port>/apsched_witness.S`) and what a root departure leaves behind
+//! ([`note_root_left`]).
 //!
 //! It provisions ONE App-class process P (`apsched_witness.S`) and nothing else. P's workers are
 //! threads it spawns itself (NR 11) and children it forks (NR 12); the production balanced
@@ -34,13 +38,16 @@ use crate::kernel::scheduler::{CpuId, MAX_CPUS};
 use crate::kernel::vm::{Asid, CachePolicy, Mapping, PageFlags, PhysAddr, VirtAddr};
 use crate::runtime::SharedKernel;
 
-core::arch::global_asm!(include_str!("apsched_witness.S"));
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(include_str!("../arch/riscv64/apsched_witness.S"));
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(include_str!("../arch/aarch64/apsched_witness.S"));
 
 pub const CODE_VA: u64 = 0x2000_0000;
 pub const P_STACK_VA: u64 = 0x2001_0000;
 pub const P_SP_TOP: u64 = 0x2001_0ff0;
 pub const WSTK_VA: u64 = 0x2002_0000;
-pub const WSTK_SLOTS: u64 = 40;
+pub const WSTK_SLOTS: u64 = 48;
 pub const MBX_VA: u64 = 0x2007_0000;
 pub const BUF_VA: u64 = 0x2008_0000;
 pub const P_TID: u64 = 9_600;
@@ -53,6 +60,10 @@ const M_IDLE: u64 = 0x140;
 /// CPU 0's timer interrupts — the global tick's source — that P's bounded waits measure their
 /// deadlines against. CPU 0's timer is never the one a control breaks.
 const M_CLOCK: u64 = 0x060;
+/// The CPUs a spinner has started on, as the kernel observed each `W_START` (AArch64 P tops its
+/// spinners up from it; the RISC-V program does not read it).
+const M_W_CPUS: u64 = 0x068;
+static W_CPUS: AtomicU64 = AtomicU64::new(0);
 /// The CPUs the mailbox has per-CPU words for (the 8-slot handoff table's maximum).
 const MBX_CPUS: usize = 8;
 
@@ -285,7 +296,7 @@ const KINDS: [&str; 12] = [
 ];
 
 /// The user steps, by code (index + 1); 0 = a step this table does not know.
-const STEPS: [&str; 31] = [
+const STEPS: [&str; 32] = [
     "P_START",
     "P_NO_AP",
     "P_AP_READY",
@@ -317,6 +328,7 @@ const STEPS: [&str; 31] = [
     "D_AFTER",
     "P_REAP",
     "P_W_TIMEOUT",
+    "P_W_COVER",
 ];
 
 fn step_code(step: &str) -> u64 {
@@ -487,8 +499,9 @@ pub fn note_idle_reached(cpu: usize) {
 /// even reported forking it, so the grader matches the root against the child's own step.
 ///
 /// Recorded from what the transition LEFT BEHIND, not from the fact that it was called: the live
-/// `satp` (must be Bare, 0) and the activation record (must name no space). A transition that did
-/// not happen records nothing.
+/// translation root (RISC-V: `satp` must be Bare, 0; AArch64: `TTBR0_EL1` must be the kernel's
+/// own root, ASID 0) and the activation record (must name no space). A transition that did not
+/// happen records nothing.
 pub fn note_root_left(cpu: CpuId, leaving: Option<crate::kernel::vm::Asid>) {
     if !enabled() || cpu.0 == 0 {
         return;
@@ -503,21 +516,29 @@ pub fn note_root_left(cpu: CpuId, leaving: Option<crate::kernel::vm::Asid>) {
     {
         return;
     }
-    let satp: usize;
-    // SAFETY: a CSR read.
-    unsafe {
-        core::arch::asm!("csrr {0}, satp", out(reg) satp, options(nomem, nostack, preserves_flags))
+    #[cfg(target_arch = "riscv64")]
+    let (root, left) = {
+        let satp: usize;
+        // SAFETY: a CSR read.
+        unsafe {
+            core::arch::asm!("csrr {0}, satp", out(reg) satp, options(nomem, nostack, preserves_flags))
+        };
+        (satp as u64, satp == 0)
     };
-    if satp != 0 || crate::arch::hal::active_address_space(cpu).is_some() {
+    #[cfg(target_arch = "aarch64")]
+    let (root, left) = {
+        let ttbr0: u64;
+        // SAFETY: a system-register read.
+        unsafe {
+            core::arch::asm!("mrs {0}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags))
+        };
+        let (_, _, kernel_root) = crate::arch::aarch64::boot::bootstrap_mmu_registers();
+        (ttbr0, ttbr0 == kernel_root)
+    };
+    if !left || crate::arch::hal::active_address_space(cpu).is_some() {
         return;
     }
-    record(
-        K_ROOT_LEFT,
-        u64::from(cpu.0),
-        0,
-        0,
-        [asid, satp as u64, 0, 0, 0],
-    );
+    record(K_ROOT_LEFT, u64::from(cpu.0), 0, 0, [asid, root, 0, 0, 0]);
 }
 
 /// A reschedule IPI taken at `cpu`'s idle boundary, with the sources its consumption swapped out.
@@ -583,6 +604,10 @@ pub fn observe_user_marker(
                     .compare_exchange(0, asid, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             });
+        }
+        "W_START" => {
+            let bit = 1u64 << (c & 63);
+            publish(M_W_CPUS, W_CPUS.fetch_or(bit, Ordering::AcqRel) | bit);
         }
         "D_BEFORE" => {
             // One window per deadline thread, keyed by its TID.
@@ -760,6 +785,21 @@ fn dump() {
             v(4)
         ));
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let used = |c: usize| ap_stack::deepest_use(c).unwrap_or(0);
+        emit_twice(format_args!(
+            "APSW_STACK reserved=0x{:x} used=0,0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x}",
+            ap_stack::reserved(),
+            used(1),
+            used(2),
+            used(3),
+            used(4),
+            used(5),
+            used(6),
+            used(7)
+        ));
+    }
     let irq = |c: usize| IRQS[c].load(Ordering::Acquire);
     let pre = |c: usize| PRE[c].load(Ordering::Acquire);
     emit_twice(format_args!(
@@ -785,4 +825,68 @@ fn dump() {
         ADMITTED.load(Ordering::Acquire),
         REFUSALS.load(Ordering::Acquire)
     ));
+}
+
+/// AP-SCHED3 §C — stack headroom, where it is measurable: each secondary's dispatch stack is
+/// painted with a pattern just before the boot CPU starts it (nothing has used it yet), and the
+/// dump reports, per CPU, how far down from the top the pattern was ever overwritten — the deepest
+/// any exception, syscall, fault or settlement on that CPU reached during the run. The boot CPU's
+/// stack is in use from `_start` and cannot be painted, so it is not measured.
+#[cfg(target_arch = "aarch64")]
+pub mod ap_stack {
+    const PAINT: u64 = 0x5359_4e43_5354_4b50;
+
+    /// The pool slot `cpu` (1..=slots) runs on, as `[bottom, top)`.
+    fn range(cpu: usize) -> Option<(usize, usize)> {
+        let (end, stride, slots) = crate::arch::aarch64::smp::ap_stack_pool();
+        if cpu == 0 || cpu > slots {
+            return None;
+        }
+        let top = end - (cpu - 1) * stride;
+        Some((top - stride, top))
+    }
+
+    pub fn reserved() -> usize {
+        crate::arch::aarch64::smp::ap_stack_pool().1
+    }
+
+    /// Paint `cpu`'s stack. Called by the boot CPU before that CPU is started.
+    pub fn paint(cpu: usize) {
+        let Some((bottom, top)) = range(cpu) else {
+            return;
+        };
+        let mut a = bottom;
+        while a < top {
+            // SAFETY: an aligned word of the reserved stack slot of a CPU not yet started.
+            unsafe { core::ptr::write_volatile(a as *mut u64, PAINT) };
+            a += 8;
+        }
+        // The secondary's first instructions run with its MMU off, so its stack writes are not
+        // cacheable: clean AND invalidate the painted lines to the point of coherency, so no dirty
+        // line of this CPU's can later be written back over them, and no clean one read instead.
+        let ctr: u64;
+        // SAFETY: a read of the cache type register.
+        unsafe { core::arch::asm!("mrs {0}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+        let line = 4usize << ((ctr >> 16) & 0xf);
+        let mut a = bottom;
+        while a < top {
+            // SAFETY: data-cache maintenance by VA over the slot just painted.
+            unsafe { core::arch::asm!("dc civac, {0}", in(reg) a, options(nostack)) };
+            a += line;
+        }
+        // SAFETY: completes the maintenance before the CPU_ON that follows.
+        unsafe { core::arch::asm!("dsb sy", options(nostack)) };
+    }
+
+    /// Bytes below the top that were ever written, or `None` for a CPU with no slot.
+    pub fn deepest_use(cpu: usize) -> Option<usize> {
+        let (bottom, top) = range(cpu)?;
+        let mut a = bottom;
+        // SAFETY: aligned reads inside the slot; only the owning CPU writes it, and a stale read
+        // only under-reports.
+        while a < top && unsafe { core::ptr::read_volatile(a as *const u64) } == PAINT {
+            a += 8;
+        }
+        Some(top - a)
+    }
 }

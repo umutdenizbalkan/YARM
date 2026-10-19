@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! QEMU-SMP2 — AArch64 two-CPU wiring on the existing GICv2.
+//! QEMU-SMP2 / AP-SCHED3 — AArch64 secondary CPUs on the existing GICv2.
 //!
-//! Default off: nothing here runs unless `yarm.ap_user_dispatch=1`. With it, an AP that PSCI
-//! started brings up the translation regime, the exception state and its own GIC CPU interface,
-//! publishes its interface bit, and is admitted — by the scheduler, in one transition — to
-//! dispatch the tasks explicitly placed on it. It then idles in the SAME authenticated park the
-//! BSP uses (`trap::enter_ap_idle`).
+//! AP-SCHED3 §B: PRODUCTION, with no knob. Every secondary the admission policy planned
+//! (`arch::aarch64_cpu_admission`) and PSCI started brings up its translation regime, its own GIC
+//! CPU interface and reschedule SGI, its own timer, proves that readiness from its own registers,
+//! and only then takes the scheduler's one production admission (`admit_dispatch`: out of
+//! wake-only, eligible for balanced placement). It then idles in the SAME authenticated park the
+//! boot CPU uses (`trap::enter_ap_idle`). Any failed prerequisite leaves it explicitly
+//! non-dispatching: wake-only (nothing is placed on it), withdrawn as an SGI target, its interrupts
+//! disabled, and named. `yarm.ap_user_dispatch` no longer has any authority over admission; it only
+//! still arms the SMP2 / overtaken witnesses' provisioning.
+//!
+//! (QEMU-SMP2 had admitted CPU 1 only under that knob, to PINNED dispatch, with no timer.)
 //!
 //! # Owners
 //!
@@ -47,8 +53,30 @@ static TARGETS: TargetTable<MAX_CPUS> = TargetTable::new();
 /// `BootExclusive` token (BLR1; formerly `borrow_kernel_for_boot`). No AP touches shared kernel
 /// state before it.
 static BSP_BOOT_BORROW_ENDED: AtomicBool = AtomicBool::new(false);
-/// CPUs admitted to pinned dispatch.
+/// CPUs admitted to production dispatch.
 static ADMITTED: AtomicU64 = AtomicU64::new(0);
+/// AP-SCHED3 §B — the secondaries the boot CPU started through PSCI (the set every one of which
+/// must complete its admission).
+static STARTED: AtomicU64 = AtomicU64::new(0);
+
+/// Record that the boot CPU started logical CPU `cpu`.
+pub fn note_started(cpu: CpuId) {
+    STARTED.fetch_or(1u64 << (cpu.0 as u64 & 63), Ordering::AcqRel);
+}
+
+/// The secondaries the boot CPU started.
+pub fn started_bitmap() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// AP-SCHED3 §C — per CPU: its own timer is parked behind the idle backstop because it is idle.
+static AP_TIMER_PARKED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// AP-SCHED3 §C — an idle secondary's timer fires at this many quantum periods (one second at the
+/// 10 ms quantum): a backstop that bounds how long an idle CPU can miss work whose notification
+/// failed, not a tick. An idle CPU has no quantum to consume and no clock to advance (the global
+/// tick is the clock owner's), and every enqueue committed onto it is followed by an SGI.
+pub const AP_IDLE_BACKSTOP_PERIODS: u64 = 100;
 
 /// Per-CPU hardware arrivals of the reschedule SGI, as the claim returned them:
 /// `[total, from_el0, at_idle_boundary, in_other_kernel_code]`.
@@ -72,7 +100,8 @@ fn gic_bases() -> Option<(usize, usize)> {
     (dist != 0 && cpu_if != 0).then_some((dist as usize, cpu_if as usize))
 }
 
-/// `true` when the default-off AP user-dispatch knob is set.
+/// `true` when the default-off `yarm.ap_user_dispatch` knob is set. AP-SCHED3 §B: it arms the
+/// SMP2 / overtaken witnesses' provisioning and nothing else; admission never asks it.
 pub fn requested() -> bool {
     crate::kernel::boot::ap_user_dispatch_enabled()
 }
@@ -174,6 +203,11 @@ pub fn note_sgi_arrival(cpu: CpuId, raw_token: u32, origin: ArrivalOrigin, elr: 
         ArrivalOrigin::Kernel => 3,
     };
     row[lane].fetch_add(1, Ordering::AcqRel);
+    // AP-SCHED3 witness: a reschedule SGI taken at this CPU's authenticated idle boundary.
+    #[cfg(feature = "aarch64-apsched-witness")]
+    if origin == ArrivalOrigin::IdleBoundary {
+        crate::kernel::apsched_witness::note_idle_ipi(cpu, 1);
+    }
     let source_cpu = TARGETS
         .cpu_of_interface(sgi_source_interface(raw_token))
         .map_or(u64::MAX, |c| c as u64);
@@ -269,6 +303,10 @@ pub fn sgi_counters(cpu: CpuId) -> (u32, u32, u32, u32, u32) {
 /// The BSP's boot `&mut KernelState` window is over (called immediately before its first EL0
 /// entry). An AP waits for this before it acquires anything.
 pub fn note_bsp_boot_borrow_ended() {
+    // AP-SCHED3 witness: the set P's run must cover — every secondary the boot CPU started — named
+    // once, at the moment those CPUs may begin their admissions (observation only).
+    #[cfg(feature = "aarch64-apsched-witness")]
+    crate::kernel::apsched_witness::note_release_plan(started_bitmap(), started_bitmap());
     BSP_BOOT_BORROW_ENDED.store(true, Ordering::Release);
     // SAFETY: wake any AP waiting in `wfe`.
     unsafe { core::arch::asm!("sev", options(nomem, nostack, preserves_flags)) };
@@ -278,30 +316,66 @@ pub fn bsp_boot_borrow_ended() -> bool {
     BSP_BOOT_BORROW_ENDED.load(Ordering::Acquire)
 }
 
-/// `true` once `cpu` has been admitted to pinned dispatch.
+/// `true` once `cpu` has been admitted to production dispatch.
 pub fn admitted(cpu: CpuId) -> bool {
     ADMITTED.load(Ordering::Acquire) & (1u64 << (cpu.0 as u64 & 63)) != 0
 }
 
-/// Admit this AP to pinned dispatch through the scheduler's one transition, after its interface
-/// is up. Returns `false` — the AP then stays out of dispatch — on any refusal.
-pub fn admit_this_ap(shared: &crate::runtime::SharedKernel, cpu: CpuId) -> bool {
-    match shared.admit_ap_pinned_dispatch_split(cpu) {
-        Ok(()) => {
-            ADMITTED.fetch_or(1u64 << (cpu.0 as u64 & 63), Ordering::AcqRel);
-            crate::kernel::printk::printk_emit_sync(format_args!(
-                "AARCH64_SMP2_AP_ADMITTED cpu={} wake_only=0 balance_excluded=1 idle_placeholder=cleared result=ok",
-                cpu.0
-            ));
-            true
-        }
-        Err(e) => {
-            crate::kernel::printk::printk_emit_sync(format_args!(
-                "AARCH64_SMP2_AP_ADMISSION_REFUSED cpu={} reason={:?} result=fail",
-                cpu.0, e
-            ));
-            false
-        }
+/// The CPUs admitted to production dispatch (bit 0, the boot CPU, is not recorded here).
+pub fn admitted_bitmap() -> u64 {
+    ADMITTED.load(Ordering::Acquire)
+}
+
+/// AP-SCHED3 §C — park THIS secondary's own timer for its idle wait (called at every idle
+/// arrival): the next deadline moves out to the backstop. The boot CPU never parks — it is the
+/// clock owner — and a CPU that never armed its timer has nothing to park. Returns whether this
+/// call parked it.
+pub fn park_ap_timer_for_idle(cpu: usize) -> bool {
+    if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize
+        || cpu >= MAX_CPUS
+        || !admitted(CpuId(cpu as u8))
+    {
+        return false;
+    }
+    AP_TIMER_PARKED[cpu].store(true, Ordering::Release);
+    crate::arch::aarch64::irq::program_timer_deadline(
+        CpuId(cpu as u8),
+        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    );
+    true
+}
+
+/// AP-SCHED3 §C — leave the idle park: THIS secondary is about to run a task, so its own quantum
+/// period is restored from now. Called on the one path an idle CPU leaves idle by (the idle queue
+/// advance that resumes a task). Returns whether the timer was parked.
+pub fn unpark_ap_timer(cpu: usize) -> bool {
+    if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize || cpu >= MAX_CPUS {
+        return false;
+    }
+    if !AP_TIMER_PARKED[cpu].swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    crate::arch::aarch64::irq::program_timer_deadline(
+        CpuId(cpu as u8),
+        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    );
+    true
+}
+
+/// `cpu`'s timer is parked behind the idle backstop.
+pub fn ap_timer_parked(cpu: usize) -> bool {
+    AP_TIMER_PARKED
+        .get(cpu)
+        .is_some_and(|f| f.load(Ordering::Acquire))
+}
+
+/// The distance THIS CPU's next timer deadline is armed at: the requested quantum period, or the
+/// idle backstop while its timer is parked.
+pub fn timer_distance_for_this_cpu(period: u64) -> u64 {
+    if ap_timer_parked(crate::arch::aarch64::this_cpu_index()) {
+        period.saturating_mul(AP_IDLE_BACKSTOP_PERIODS)
+    } else {
+        period
     }
 }
 
@@ -343,12 +417,29 @@ fn enable_ap_translation() {
     }
 }
 
-/// An AP that could not be admitted: it stays wake-only (nothing is ever placed on it) and waits
-/// with every interrupt masked.
-fn park_unadmitted(cpu: CpuId, reason: &str) -> ! {
+/// AP-SCHED3 §B — how far a secondary got, for its one state record.
+#[derive(Clone, Copy)]
+struct ApState {
+    initialized: bool,
+    irq_ready: bool,
+}
+
+/// A secondary that could not be admitted: it stays wake-only (the scheduler refuses every enqueue
+/// to it and balanced placement skips it), it is withdrawn as an SGI target and its own timer and
+/// interrupts are disabled, and it waits masked. Named with the states it did reach.
+fn park_unadmitted(cpu: CpuId, state: ApState, reason: &str) -> ! {
+    TARGETS.withdraw(cpu.0 as usize);
+    crate::arch::aarch64::irq::disable_this_cpu_interrupts();
     crate::kernel::printk::printk_emit_sync(format_args!(
-        "AARCH64_SMP2_AP_UNADMITTED cpu={} reason={} result=fail",
+        "AARCH64_AP_UNADMITTED cpu={} reason={} result=fail",
         cpu.0, reason
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "AARCH64_AP_STATE cpu={} discovered=1 initialized={} irq_ready={} admitted=0 dispatching=0 reason={}",
+        cpu.0,
+        u8::from(state.initialized),
+        u8::from(state.irq_ready),
+        reason
     ));
     loop {
         // SAFETY: a wait instruction.
@@ -356,33 +447,138 @@ fn park_unadmitted(cpu: CpuId, reason: &str) -> ! {
     }
 }
 
-/// The AP's life under `yarm.ap_user_dispatch=1`, from its vector base to its first park.
+/// The dispatch-stack size this image gave each secondary (`yarm_aarch64_ap_stack_stride`).
+/// The secondary stack pool: (its end, the per-slot stride, the slot count). Slot `cpu - 1`'s top
+/// is `end - (cpu - 1) * stride`, as `yarm_aarch64_secondary_entry` computes it.
+#[cfg(not(feature = "rpi5-stage1"))]
+pub fn ap_stack_pool() -> (usize, usize, usize) {
+    unsafe extern "C" {
+        static secondary_boot_stacks_end: u8;
+        static yarm_aarch64_ap_stack_slots: u64;
+    }
+    // SAFETY: the pool's end symbol and two read-only constants the image defines.
+    unsafe {
+        (
+            &raw const secondary_boot_stacks_end as usize,
+            ap_stack_bytes(),
+            core::ptr::read_volatile(&raw const yarm_aarch64_ap_stack_slots) as usize,
+        )
+    }
+}
+
+fn ap_stack_bytes() -> usize {
+    unsafe extern "C" {
+        static yarm_aarch64_ap_stack_stride: u64;
+    }
+    // SAFETY: a read-only constant the image defines.
+    unsafe { core::ptr::read_volatile(&raw const yarm_aarch64_ap_stack_stride) as usize }
+}
+
+/// AP-SCHED3 §B — THIS secondary's interrupt readiness, checked from its own state rather than
+/// assumed from the calls that set it: its banked timer PPI and reschedule SGI enabled, its CPU
+/// interface enabled with an unmasked priority, its own timer armed, and its SGI interface bit
+/// published.
+fn this_ap_irq_ready(cpu: CpuId) -> bool {
+    let (ppi, sgi, cpu_if) = crate::arch::aarch64::irq::this_cpu_irq_readback();
+    ppi && sgi
+        && cpu_if
+        && crate::arch::aarch64::irq::arch_timer_is_armed()
+        && TARGETS.mask_of(cpu.0 as usize) != 0
+}
+
+/// AP-SCHED3 §B — a secondary's life, from its vector base to its first park. Production: no knob.
 ///
-/// Order is the contract:
+/// Order is the contract, and dispatch eligibility is published LAST:
 /// 1. translation on, before any shared Normal-memory synchronization;
-/// 2. wait for the BSP's boot `&mut KernelState` window to END — the release flag alone is set
+/// 2. wait for the boot CPU's boot `&mut KernelState` window to END — the release flag alone is set
 ///    inside that window;
-/// 3. bring up and publish this CPU's GIC interface, so it can be named as a target;
-/// 4. the scheduler's one admission transition, which only then lets a pinned task land here;
-/// 5. the same authenticated idle park the BSP uses.
-pub fn ap_dispatch_main(cpu: CpuId) -> ! {
+/// 3. a dispatch-sized stack, or no admission (`no_dispatch_stack`);
+/// 4. its own GIC CPU interface and reschedule SGI, its interface bit published LAST within that,
+///    so it is never named a target before it can take the interrupt;
+/// 5. its own timer: the banked PPI, then `CNTP` armed and read back;
+/// 6. readiness checked from its own registers;
+/// 7. its kernel root, recorded (it holds no user root);
+/// 8. the scheduler's ONE production transition (`admit_dispatch`): out of wake-only, idle
+///    placeholder cleared, eligible for balanced placement — only now can a task land here;
+/// 9. the same authenticated idle park the boot CPU uses (IRQs open only there).
+pub fn ap_main(cpu: CpuId) -> ! {
     enable_ap_translation();
     while !bsp_boot_borrow_ended() {
         // SAFETY: a wait instruction; `note_bsp_boot_borrow_ended` issues the matching `sev`.
         unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
     }
-    let Some(shared) = crate::arch::aarch64::boot::trap_shared_kernel() else {
-        park_unadmitted(cpu, "no_shared_kernel");
+    let mut state = ApState {
+        initialized: true,
+        irq_ready: false,
     };
+    let Some(shared) = crate::arch::aarch64::boot::trap_shared_kernel() else {
+        park_unadmitted(cpu, state, "no_shared_kernel");
+    };
+    if !crate::arch::aarch64_cpu_admission::dispatch_capable(cpu.0 as usize, ap_stack_bytes()) {
+        park_unadmitted(
+            cpu,
+            state,
+            crate::arch::aarch64_cpu_admission::Exclusion::NoDispatchStack.marker(),
+        );
+    }
     if let Err(reason) = bring_up_sgi_on_this_cpu(cpu) {
-        park_unadmitted(cpu, reason);
+        park_unadmitted(cpu, state, reason);
     }
-    if !admit_this_ap(shared, cpu) {
-        park_unadmitted(cpu, "scheduler_refused");
+    if !crate::arch::aarch64::irq::enable_ap_arch_timer_ppi() {
+        park_unadmitted(cpu, state, "timer_ppi_readback");
     }
+    crate::arch::aarch64::irq::program_timer_deadline(
+        cpu,
+        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    );
+    if !this_ap_irq_ready(cpu) {
+        park_unadmitted(cpu, state, "no_irq_ready");
+    }
+    state.irq_ready = true;
+    let root_released = crate::arch::hal::leave_user_root(cpu);
+    if let Err(e) = shared.admit_ap_dispatch_split(cpu) {
+        crate::kernel::printk::printk_emit_sync(format_args!(
+            "AARCH64_AP_SCHED_ADMISSION_REFUSED cpu={} reason={:?} result=fail",
+            cpu.0, e
+        ));
+        park_unadmitted(cpu, state, "scheduler_refused");
+    }
+    ADMITTED.fetch_or(1u64 << (cpu.0 as u64 & 63), Ordering::AcqRel);
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "AARCH64_AP_SCHED_ADMITTED cpu={} mpidr=0x{:x} mode=production wake_only=0 balance_excluded=0 timer=own sgi_ready=1 interface_mask=0x{:x} root=kernel root_released={} stack_bytes=0x{:x} result=ok",
+        cpu.0,
+        crate::arch::aarch64::read_mpidr_el1(),
+        TARGETS.mask_of(cpu.0 as usize),
+        u8::from(root_released),
+        ap_stack_bytes()
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "AARCH64_AP_STATE cpu={} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none",
+        cpu.0
+    ));
     #[cfg(feature = "aarch64-smp2-witness")]
     crate::arch::aarch64::smp2_witness::ap_admitted(shared, cpu);
     #[cfg(feature = "aarch64-overtaken-witness")]
     crate::arch::aarch64::overtaken_witness::ap_admitted(shared, cpu);
+    #[cfg(feature = "aarch64-apsched-witness")]
+    crate::kernel::apsched_witness::ap_admitted(cpu);
     crate::arch::aarch64::trap::enter_ap_idle(cpu)
+}
+
+/// AP-SCHED3 §B — a secondary whose identity did not validate (its MPIDR_EL1 affinity is not the
+/// one the boot CPU planned for the logical id it was started with). It has published nothing and
+/// touches no shared state; it is named and waits, masked, for ever.
+pub fn park_identity_mismatch(cpu: CpuId, mpidr: u64, planned: u64) -> ! {
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "AARCH64_AP_IDENTITY_MISMATCH cpu={} mpidr=0x{:x} planned_affinity=0x{:x} result=fail",
+        cpu.0, mpidr, planned
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "AARCH64_AP_STATE cpu={} discovered=1 initialized=0 irq_ready=0 admitted=0 dispatching=0 reason=identity_mismatch",
+        cpu.0
+    ));
+    loop {
+        // SAFETY: a wait instruction.
+        unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) };
+    }
 }

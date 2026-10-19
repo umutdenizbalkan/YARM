@@ -4,9 +4,14 @@
 #
 # AP-SCHED1/AP-SCHED2 — grade the RISC-V production SMP-scheduling witness, for every expected CPU.
 #
-# Usage: grade-riscv64-apsched-witness.py --expect-cpus N BOOT_LOG
-#        grade-riscv64-apsched-witness.py --topology-only N BOOT_LOG
-#        grade-riscv64-apsched-witness.py --self-test
+# Usage: grade-apsched-witness.py [--arch riscv64|aarch64] --expect-cpus N BOOT_LOG
+#        grade-apsched-witness.py [--arch riscv64|aarch64] --topology-only N BOOT_LOG
+#        grade-apsched-witness.py [--arch riscv64|aarch64] --self-test
+#
+# AP-SCHED3: one grader for both ports' witnesses (default riscv64). The record format, the
+# obligations and the thresholds are the same; a port contributes only its console marker names,
+# its register-index names and — RISC-V only — the beyond-the-ceiling topology section (QEMU virt
+# with GICv2 has at most 8 AArch64 CPUs, so the AArch64 run is never larger than the ceiling).
 #
 # N is the boot's hart count (`-smp N`). Production admits at most PRODUCTION_CPU_CEILING (8)
 # logical CPUs, the boot CPU included, so the expected logical CPUs are 0..min(N, 8)-1. Beyond 8
@@ -50,6 +55,17 @@ import zlib
 
 PRE0_MIN = 3
 PRE_MIN = 4
+# The AArch64 program's spinner slots (its top-up's ceiling).
+SPIN_SLOTS = 24
+
+
+def mask_of(cpus):
+    m = 0
+    for c in cpus:
+        m |= 1 << c
+    return m
+
+
 WAKE_ROUNDS = 3
 IPC_ROUNDS = 4
 FORK_ROUNDS = 4
@@ -62,14 +78,72 @@ FAIL_STEPS = {
     "P_PING_RAW", "P_C_TIMEOUT", "P_REAP_TIMEOUT", "P_SPAWN_FAIL", "P_FORK_FAIL", "EXIT_REFUSED",
     "P_W_TIMEOUT", "?",
 }
-FORBIDDEN = [
-    "panicked at", "KERNEL PANIC", "RISCV_SMP3_SECONDARY_ADMITTED", "RISCV_AP_SCHED_ADMISSION_REFUSED",
-    "RISCV_SMP3_SECONDARY_UNADMITTED", "TIMER_SPLIT_CURRENT_NOT_RUNNING",
-    "VM_ASPACE_TEARDOWN_QUARANTINED", "RISCV_AP_QUIESCENT", "RISCV_HART_EXCLUDED",
-    "RISCV_LOGICAL_CPU_MISMATCH", "RISCV_SECONDARY_START_FAILED", "RISCV_SECONDARY_NOT_STARTABLE",
-]
+PORTS = {
+    "riscv64": {
+        "forbidden": [
+            "panicked at", "KERNEL PANIC", "RISCV_SMP3_SECONDARY_ADMITTED", "RISCV_AP_SCHED_ADMISSION_REFUSED",
+            "RISCV_SMP3_SECONDARY_UNADMITTED", "TIMER_SPLIT_CURRENT_NOT_RUNNING",
+            "VM_ASPACE_TEARDOWN_QUARANTINED", "RISCV_AP_QUIESCENT", "RISCV_HART_EXCLUDED",
+            "RISCV_LOGICAL_CPU_MISMATCH", "RISCV_SECONDARY_START_FAILED", "RISCV_SECONDARY_NOT_STARTABLE",
+        ],
+        "state": "RISCV_AP_STATE",
+        "admitted_line": "RISCV_AP_SCHED_ADMITTED hart=1 cpu=1 mode=production",
+        "pinned": "RISCV_SMP3_SECONDARY_ADMITTED hart=1 cpu=1",
+        "quiescent": "RISCV_AP_QUIESCENT cpu=2 reason=x",
+        "max_harts": None,
+        "stack": False,
+    },
+    "aarch64": {
+        "forbidden": [
+            "panicked at", "KERNEL PANIC", "AARCH64_SMP2_AP_ADMITTED", "AARCH64_AP_SCHED_ADMISSION_REFUSED",
+            "AARCH64_AP_UNADMITTED", "AARCH64_AP_IDENTITY_MISMATCH", "TIMER_SPLIT_CURRENT_NOT_RUNNING",
+            "VM_ASPACE_TEARDOWN_QUARANTINED", "AARCH64_CPU_EXCLUDED", "reason=psci_cpu_on_failed",
+            "_DISPATCH_FATAL",
+        ],
+        "state": "AARCH64_AP_STATE",
+        "admitted_line": "AARCH64_AP_SCHED_ADMITTED cpu=1 mpidr=0x80000001 mode=production",
+        "pinned": "AARCH64_SMP2_AP_ADMITTED cpu=1 wake_only=0 balance_excluded=1",
+        "quiescent": "AARCH64_CPU_EXCLUDED affinity=0x2 reason=x dispatch=0",
+        # QEMU virt with GICv2: at most 8 CPU interfaces, so never more CPUs than the ceiling.
+        "max_harts": 8,
+        # Each secondary's dispatch stack is painted before it starts; the dump reports its depth.
+        "stack": True,
+    },
+}
+ARCH = "riscv64"
 
-LINE = re.compile(r"(APSW_(?:R|DUMP_END) [^\n]*?) crc=([0-9a-f]{8})\s*$")
+
+def P():
+    return PORTS[ARCH]
+
+
+def reg_name(idx):
+    """The register a spinner's mismatch index names, per port."""
+    if ARCH == "aarch64":
+        named = {31: "sp", 32: "nzcv", 33: "fpcr", 34: "fpsr", 35: "tpidr_el0"}
+        if idx in named:
+            return named[idx]
+        if 64 <= idx < 96:
+            return f"q{idx - 64}.lo"
+        if 96 <= idx < 128:
+            return f"q{idx - 96}.hi"
+    return f"x{idx}"
+
+LINE = re.compile(r"(APSW_(?:R|DUMP_END|STACK) [^\n]*?) crc=([0-9a-f]{8})\s*$")
+
+
+def parse_stack(text):
+    """The verified per-CPU dispatch-stack depths (AArch64), or None: (reserved, [used per CPU])."""
+    for raw in text.split("\n"):
+        m = LINE.search(raw)
+        if not m or not m.group(1).startswith("APSW_STACK"):
+            continue
+        body = m.group(1)
+        if zlib.crc32(body.encode()) != int(m.group(2), 16):
+            continue
+        f = dict(kv.split("=", 1) for kv in body.split()[1:])
+        return int(f["reserved"], 16), [int(u, 16) for u in f["used"].split(",")]
+    return None
 
 
 def parse(text):
@@ -85,6 +159,8 @@ def parse(text):
         fields = dict(kv.split("=", 1) for kv in body.split()[1:] if "=" in kv)
         if body.startswith("APSW_DUMP_END"):
             end = fields
+            continue
+        if body.startswith("APSW_STACK"):
             continue
         seq = int(fields["seq"])
         if seq in recs and recs[seq] != fields:
@@ -161,6 +237,8 @@ def grade_topology(text, nharts):
 def grade(text, ncpus):
     fails = []
     nharts = ncpus
+    if P()["max_harts"] is not None and nharts > P()["max_harts"]:
+        return [f"admission: this port's supported configuration has at most {P()['max_harts']} CPUs"]
     if nharts > PRODUCTION_CPU_CEILING:
         # Beyond the ceiling the work is owed by the 8 admitted CPUs; the exclusions are graded
         # in the topology section, not as console failures here.
@@ -176,10 +254,22 @@ def grade(text, ncpus):
     recs, end, conflicts = parse(text)
     if conflicts:
         fails.append(f"progress: two verified copies disagree for stamps {conflicts[:5]}")
+    if P()["stack"] and end is not None:
+        st = parse_stack(text)
+        if st is None:
+            fails.append("stack: no verified APSW_STACK record")
+        else:
+            reserved, used = st
+            for c in sorted(expected):
+                u = used[c] if c < len(used) else 0
+                if u == 0:
+                    fails.append(f"stack: CPU {c}'s dispatch stack was never used (not painted, or never run)")
+                elif u >= reserved:
+                    fails.append(f"stack: CPU {c} used all {reserved:#x} bytes of its dispatch stack")
     if end is None:
         # Without the record, the console still names any CPU that was refused admission.
         named = [f"admission: CPU {m.group(1)} refused ({m.group(2)})"
-                 for m in re.finditer(r"RISCV_AP_STATE cpu=(\d+) [^\n]*admitted=0 [^\n]*reason=(\w+)", text)]
+                 for m in re.finditer(P()["state"] + r" cpu=(\d+) [^\n]*admitted=0 [^\n]*reason=(\w+)", text)]
         return [f"progress: no verified dump trailer (P never reached its end)"] + named + fails
     count = int(end["count"])
     if end.get("overflow") != "0":
@@ -196,7 +286,7 @@ def grade(text, ncpus):
     def kind(k, cpu=None):
         return [r for r in R if r["kind"] == k and (cpu is None or r["cpu"] == cpu)]
 
-    for bad in FORBIDDEN:
+    for bad in P()["forbidden"]:
         if bad in text:
             fails.append(f"forbidden console marker: {bad}")
     # The kernel publishes into the mailbox frame it captured at provisioning: a copy-on-write
@@ -239,6 +329,18 @@ def grade(text, ncpus):
     # placement + preemption + registers
     starts = user("W_START")
     want_spinners = 2 * ncpus
+    # AArch64 P tops its spinners up, through the same placement, until one has started on CPU 0
+    # and on every expected secondary (P_W_COVER: v0 = spinners placed, v1 = CPUs covered).
+    cover = user("P_W_COVER")
+    if len(cover) > 1:
+        fails.append(f"placement: {len(cover)} P_W_COVER records")
+    if cover:
+        placed, covered = cover[0]["v"][0], cover[0]["v"][1]
+        if not want_spinners <= placed <= SPIN_SLOTS:
+            fails.append(f"placement: P placed {placed} spinners, outside {want_spinners}..{SPIN_SLOTS}")
+        if placed > want_spinners and placed < SPIN_SLOTS and covered & mask_of(expected | {0}) != mask_of(expected | {0}):
+            fails.append(f"placement: P stopped its top-up at {placed} spinners with CPUs {hex(covered)} covered")
+        want_spinners = placed
     if len(starts) != want_spinners:
         fails.append(f"placement: {len(starts)} spinners started, expected {want_spinners}")
     cpus = {r["cpu"] for r in starts}
@@ -259,7 +361,7 @@ def grade(text, ncpus):
             continue
         d = done[0]
         if d["v"][0] != 0:
-            fails.append(f"registers: spinner {s['tid']} found {d['v'][0]} corrupted registers (last x{d['v'][1]})")
+            fails.append(f"registers: spinner {s['tid']} found {d['v'][0]} corrupted registers (last {reg_name(d['v'][1])})")
         if d["cpu"] != s["cpu"]:
             fails.append(f"placement: spinner {s['tid']} started on CPU {s['cpu']} and finished on CPU {d['cpu']}")
         if d["seq"] < s["seq"]:
@@ -352,6 +454,7 @@ def grade(text, ncpus):
 
     # churn
     child_cpus = set()
+    child_on = {}
     for rnd in range(1, FORK_ROUNDS + 1):
         for k in range(1, ncpus):
             code = (rnd << 8) | k
@@ -368,6 +471,7 @@ def grade(text, ncpus):
                 continue
             c = run[0]["cpu"]
             child_cpus.add(c)
+            child_on.setdefault(c, set()).add(run[0]["tid"])
             if c == 0:
                 fails.append(f"{tag}: child {child} ran on CPU 0")
             if not run[0]["seq"] < reap[0]["seq"]:
@@ -382,6 +486,13 @@ def grade(text, ncpus):
                 fails.append(f"{tag}: reap process_reaped={reaped} destroyed={destroyed} quarantined={quarantined}")
     for c in sorted(expected - child_cpus):
         fails.append(f"churn: no child ever ran on CPU {c}")
+    # Faults: each child's first write to its copy-on-write stack is a user fault, handled on the
+    # CPU it runs on (the kernel's own settlement line names the CPU and the task).
+    cow = {(int(m.group(1)), int(m.group(2))) for m in
+           re.finditer(r"PAGE_FAULT_HANDLED_COW cpu=(\d+) tid=(\d+) ", text)}
+    for c in sorted(expected & child_cpus):
+        if not any((c, t) in cow for t in child_on.get(c, ())):
+            fails.append(f"faults: no child's copy-on-write fault was handled on CPU {c}")
     return fails
 
 
@@ -449,8 +560,14 @@ def _fixture(ncpus=3):
     return ev
 
 
-def _render(ev, *, tear=(), drop_both=(), extra=""):
-    out = ["RISCV_AP_SCHED_ADMITTED hart=1 cpu=1 mode=production"]
+STACK_OK = "APSW_STACK reserved=0x200000 used=0,0x6000,0x6000,0x6000,0x6000,0x6000,0x6000,0x6000"
+
+
+def _render(ev, *, tear=(), drop_both=(), extra="", stack=STACK_OK, cow=True):
+    out = [P()["admitted_line"]]
+    if cow:
+        out += [f"PAGE_FAULT_HANDLED_COW cpu={e[1]} tid={e[2]} asid=9 reason=recovered" for e in ev
+                if e[0] == "USER" and e[3] == "C_RUN"]
     for i, e in enumerate(ev, 1):
         kind, cpu, tid, step, *v = e
         v = (list(v) + [0] * 5)[:5]
@@ -462,8 +579,20 @@ def _render(ev, *, tear=(), drop_both=(), extra=""):
             copies = [c[:25] + "Z" + c[26:] for c in copies]
         out += copies
     end = f"APSW_DUMP_END count={len(ev)} overflow=0 irq=1,1,1,1,0,0,0,0 pre=4,4,4,4,0,0,0,0 admitted=0x6 reap_retries=0"
+    if P()["stack"] and stack is not None:
+        out += [_line(stack), _line(stack)]
     out += [_line(end), _line(end), extra]
     return "\n".join(out)
+
+
+def stack_summary(text, ncpus):
+    st = parse_stack(text) if P()["stack"] else None
+    if st is None:
+        return ""
+    reserved, used = st
+    deepest = max(used[1:ncpus])
+    return (f" stack_reserved={reserved:#x} stack_used={','.join(hex(u) for u in used[1:ncpus])}"
+            f" stack_headroom_min={reserved - deepest:#x}")
 
 
 def self_test():
@@ -497,13 +626,14 @@ def self_test():
     w2 = idx(lambda e: e[3] == "W_DONE" and e[1] == 2)
     cases = {
         "both copies torn": (_render(base, drop_both={12}), 3),
-        "pinned diagnostic admission": (_render(base, extra="RISCV_SMP3_SECONDARY_ADMITTED hart=1 cpu=1"), 3),
+        "pinned diagnostic admission": (_render(base, extra=P()["pinned"]), 3),
         "an expected CPU never admitted": (_render(without(lambda e: e[0] == "AP_ADMITTED" and e[1] == 2)), 3),
         "a released CPU missing from the plan": (_render(mutate(0, ("RELEASE", 0, 0, "-", 0b10, 0b110))), 3),
-        "a CPU quiescent on the console": (_render(base, extra="RISCV_AP_QUIESCENT cpu=2 reason=x"), 3),
+        "a CPU quiescent on the console": (_render(base, extra=P()["quiescent"]), 3),
         "the boot had more CPUs than the run covered": (_render(base), 4),
         "an expected CPU ran no spinner": (_render([e if not (e[3] == "W_START" and e[1] == 2) else
                                                    ("USER", 1, e[2], "W_START", 0) for e in base]), 3),
+        "no copy-on-write fault on any child's CPU": (_render(base, cow=False), 3),
         "quarantined teardown on console": (_render(base, extra="VM_ASPACE_TEARDOWN_QUARANTINED pid=1 asid=5"), 3),
         "corrupted register": (_render(mutate(w2, ("USER", 2, base[w2][2], "W_DONE", 1, 17))), 3),
         "spinner migrated": (_render(mutate(w2, ("USER", 1, base[w2][2], "W_DONE", 0, 0))), 3),
@@ -529,7 +659,7 @@ def self_test():
         "a one-CPU boot": (_render(base), 1),
         "a nine-hart boot with no topology record": (_render(base), 9),
         "an unadmitted CPU and no trailer": (_render(base[:5]).split("APSW_DUMP_END")[0]
-                                              + "\nRISCV_AP_STATE cpu=2 discovered=1 initialized=1 irq_ready=0 admitted=0 dispatching=0 reason=no_irq_ready", 3),
+                                              + "\n" + P()["state"] + " cpu=2 discovered=1 initialized=1 irq_ready=0 admitted=0 dispatching=0 reason=no_irq_ready", 3),
         "the mailbox split copy-on-write": (_render(base, extra="APSW_PROVISIONED p_tid=9600 asid=4 image=1\n"
                                                      "VM_COW_SPLIT_COMMITTED cpu=0 tid=9600 asid=4 va=0x20070000 old_pa=0x1 new_pa=0x2 acked=1"), 3),
     }
@@ -544,6 +674,36 @@ def self_test():
     got = grade(_render(base[:a_done] + [("USER", 0, 9600, "P_W_TIMEOUT", 5, 6)] + base[a_done:]), 3)
     assert any("5 of 6 spinners running" in f for f in got), got
     cases_run += 1
+    # The register names a mismatch is reported under, per port.
+    if ARCH == "aarch64":
+        assert [reg_name(i) for i in (20, 31, 32, 33, 34, 35, 64, 127)] == \
+            ["x20", "sp", "nzcv", "fpcr", "fpsr", "tpidr_el0", "q0.lo", "q31.hi"]
+        got = grade(_render(mutate(w2, ("USER", 2, base[w2][2], "W_DONE", 1, 96 + 7))), 3)
+        assert any("last q7.hi" in f for f in got), got
+        cases_run += 1
+        # The spinner top-up: one more spinner, placed and graded like the rest, counted from
+        # P_W_COVER; a count the starts do not match fails, as does a top-up that stopped short.
+        w1 = idx(lambda e: e[3] == "W_START" and e[1] == 1)
+        tid = base[w1][2]
+        extra = [(e[0], e[1], tid + 500) + tuple(e[3:]) for e in base
+                 if e[2] == tid and e[0] in ("USER", "PREEMPT") and e[3] in ("W_START", "W_DONE", "-")]
+        topped = base[:a_done] + extra + [("USER", 0, 9600, "P_W_COVER", 7, 0b111)] + base[a_done:]
+        assert grade(_render(topped), 3) == [], grade(_render(topped), 3)
+        cases_run += 1
+        miscount = base[:a_done] + extra + [("USER", 0, 9600, "P_W_COVER", 8, 0b111)] + base[a_done:]
+        assert any("spinners started, expected 8" in f for f in grade(_render(miscount), 3))
+        cases_run += 1
+        short = base[:a_done] + extra + [("USER", 0, 9600, "P_W_COVER", 7, 0b011)] + base[a_done:]
+        assert any("stopped its top-up" in f for f in grade(_render(short), 3))
+        cases_run += 1
+        got = grade(_render(base, stack=None), 3)
+        assert any("no verified APSW_STACK" in f for f in got), got
+        got = grade(_render(base, stack="APSW_STACK reserved=0x200000 used=0,0x6000,0,0,0,0,0,0"), 3)
+        assert any("CPU 2's dispatch stack was never used" in f for f in got), got
+        got = grade(_render(base, stack="APSW_STACK reserved=0x200000 used=0,0x200000,0x6000,0,0,0,0,0"), 3)
+        assert any("CPU 1 used all" in f for f in got), got
+        cases_run += 3
+        return _finish_self_test(cases, cases_run)
     # The topology section: -smp 10, the boot hart inside and outside the table.
     for boot, rejected in ((0, 8), (9, 7), (8, 7), (3, 8)):
         plan = policy_plan(10, boot)
@@ -583,38 +743,52 @@ def self_test():
                        for c in range(1, 8)))
     assert grade(_render(full, extra=con), 10) == [], grade(_render(full, extra=con), 10)
     cases_run += 1
+    return _finish_self_test(cases, cases_run)
+
+
+def _finish_self_test(cases, cases_run):
     for name, (text, n) in cases.items():
         got = grade(text, n)
         assert got, f"self-test: the '{name}' control passed"
-    print(f"APSW_GRADER_SELF_TEST cases={len(cases) + cases_run} result=ok")
+    print(f"APSW_GRADER_SELF_TEST arch={ARCH} cases={len(cases) + cases_run} result=ok")
 
 
 def main():
-    if sys.argv[1:] == ["--self-test"]:
+    global ARCH
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "--arch":
+        if args[1] not in PORTS:
+            print(f"unknown --arch {args[1]}")
+            return 2
+        ARCH = args[1]
+        args = args[2:]
+    if args == ["--self-test"]:
         self_test()
         return 0
-    args = sys.argv[1:]
     if len(args) == 3 and args[0] == "--topology-only":
+        if ARCH != "riscv64":
+            print("usage: --topology-only is the RISC-V beyond-the-ceiling section")
+            return 2
         nharts = int(args[1])
         tfails, summary = grade_topology(open(args[2], errors="replace").read(), nharts)
         for f in tfails:
             print(f"[apsched-witness][fail] {f}")
-        print(f"APSW_TOPOLOGY_SEAL arch=riscv64 {summary or ''} result={'fail' if tfails else 'ok'}")
+        print(f"APSW_TOPOLOGY_SEAL arch={ARCH} {summary or ''} result={'fail' if tfails else 'ok'}")
         return 1 if tfails else 0
     if len(args) != 3 or args[0] != "--expect-cpus":
-        print("usage: grade-riscv64-apsched-witness.py --expect-cpus N BOOT_LOG")
+        print("usage: grade-apsched-witness.py [--arch riscv64|aarch64] --expect-cpus N BOOT_LOG")
         return 2
     ncpus = int(args[1])
     text = open(args[2], errors="replace").read()
-    if ncpus > PRODUCTION_CPU_CEILING:
+    if ARCH == "riscv64" and ncpus > PRODUCTION_CPU_CEILING:
         tfails, summary = grade_topology(text, ncpus)
-        print(f"APSW_TOPOLOGY_SEAL arch=riscv64 {summary or ''} result={'fail' if tfails else 'ok'}")
+        print(f"APSW_TOPOLOGY_SEAL arch={ARCH} {summary or ''} result={'fail' if tfails else 'ok'}")
     fails = grade(text, ncpus)
     ncpus = min(ncpus, PRODUCTION_CPU_CEILING)
     for f in fails:
         print(f"[apsched-witness][fail] {f}")
     if fails:
-        print(f"APSW_WITNESS_SEAL arch=riscv64 cpus={ncpus} result=fail")
+        print(f"APSW_WITNESS_SEAL arch={ARCH} cpus={ncpus} result=fail")
         return 1
     recs, end, _ = parse(text)
     R = sorted(recs.values(), key=lambda r: int(r["seq"]))
@@ -623,10 +797,10 @@ def main():
            for c in range(ncpus)]
     dl = [r for r in R if r["kind"] == "DEADLINE"]
     dtick = ",".join(f"{r['cpu']}:{r['v2']}={r['v3']}/{r['v4']}" for r in sorted(dl, key=lambda r: int(r["cpu"])))
-    print(f"APSW_WITNESS_SEAL arch=riscv64 cpus={ncpus} admission=production per_cpu_work=threads,forks "
+    print(f"APSW_WITNESS_SEAL arch={ARCH} cpus={ncpus} admission=production per_cpu_work=threads,forks "
           f"preempt_recorded={','.join(map(str, pre))} preempt_counted={end.get('pre', '?')} registers=intact deadlines=timed_out dtick=dirq0/own:{dtick} "
           f"idle_wakes={WAKE_ROUNDS * (ncpus - 1)}_ipi ipc={IPC_ROUNDS * (ncpus - 1)} "
-          f"churn={FORK_ROUNDS * (ncpus - 1)}_reaped_quarantined=0 records={end['count']} result=ok")
+          f"churn={FORK_ROUNDS * (ncpus - 1)}_reaped_quarantined=0 records={end['count']}{stack_summary(text, ncpus)} result=ok")
     return 0
 
 

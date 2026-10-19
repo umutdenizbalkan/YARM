@@ -120,6 +120,15 @@ impl<const N: usize> TargetTable<N> {
         Some(mask)
     }
 
+    /// AP-SCHED3 §B — withdraw `cpu` as a target: from here on every send to it is refused
+    /// (`TargetNotPublished`) and writes nothing. Used when a CPU's admission fails after it had
+    /// published its bit.
+    pub fn withdraw(&self, cpu: usize) {
+        if let Some(m) = self.masks.get(cpu) {
+            m.store(0, Ordering::Release);
+        }
+    }
+
     /// The published bit of `cpu`, or 0.
     pub fn mask_of(&self, cpu: usize) -> u8 {
         self.masks
@@ -190,6 +199,24 @@ mod tests {
         assert_eq!(t.sgir_for(0, 1, RESCHEDULE_SGI_INTID), Ok(0x0004_0001));
         assert_eq!(t.cpu_of_interface(2), Some(1));
         assert_eq!(t.cpu_of_interface(1), None, "no CPU owns interface 1");
+    }
+
+    /// AP-SCHED3 §B — a CPU whose admission fails after it published its bit is withdrawn: every
+    /// later send to it is refused and writes nothing, and its neighbours are unaffected.
+    #[test]
+    fn a_withdrawn_target_is_refused_from_then_on() {
+        let t: TargetTable<4> = TargetTable::new();
+        assert_eq!(t.publish(1, 0x02), Some(0b10));
+        assert_eq!(t.publish(2, 0x04), Some(0b100));
+        assert!(t.sgir_for(0, 2, RESCHEDULE_SGI_INTID).is_ok());
+        t.withdraw(2);
+        assert_eq!(
+            t.sgir_for(0, 2, RESCHEDULE_SGI_INTID),
+            Err(SgiRefusal::TargetNotPublished)
+        );
+        assert_eq!(t.mask_of(2), 0);
+        assert_eq!(t.sgir_for(0, 1, RESCHEDULE_SGI_INTID), Ok(0x0002_0001));
+        t.withdraw(9);
     }
 
     #[test]

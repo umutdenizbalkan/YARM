@@ -171,11 +171,10 @@ pub fn start_bsp_periodic_timer(kernel: &mut crate::kernel::boot::KernelState) -
                 #[cfg(feature = "aarch64-pl011-irq-witness")]
                 let _ =
                     crate::arch::aarch64::pl011_irq_witness::enable_source_before_unmask(kernel);
-                // QEMU-SMP2 §2: under the default-off knob the BSP's own banked SGI state and
-                // interface bit, published before the unmask for the same reason the PL011 is.
-                if crate::arch::aarch64::smp::requested()
-                    && let Err(reason) = crate::arch::aarch64::smp::bring_up_sgi_on_this_cpu(cpu)
-                {
+                // QEMU-SMP2 §2 / AP-SCHED3 §B: the BSP's own banked SGI state and interface bit,
+                // published before the unmask for the same reason the PL011 is. Production, with
+                // no knob: an admitted secondary notifies CPU 0 of every enqueue it commits there.
+                if let Err(reason) = crate::arch::aarch64::smp::bring_up_sgi_on_this_cpu(cpu) {
                     crate::yarm_log!(
                         "AARCH64_SMP2_SGI_READY cpu={} result=fail reason={}",
                         cpu.0,

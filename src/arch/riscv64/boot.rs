@@ -1785,7 +1785,7 @@ fn riscv_s_mode_idle_landing(
             // AP-SCHED1: this CPU leaves idle to run `resume_tid`; an AP's own period resumes.
             crate::arch::riscv64::timer::unpark_ap_timer(cpu.0 as usize);
             #[cfg(feature = "riscv64-apsched-witness")]
-            crate::arch::riscv64::apsched_witness::note_idle_dispatch(
+            crate::kernel::apsched_witness::note_idle_dispatch(
                 shared,
                 cpu,
                 resume_tid,
@@ -2048,7 +2048,7 @@ fn riscv_s_mode_software_trap(
     #[cfg(feature = "riscv64-smp3-witness")]
     crate::arch::riscv64::smp3_witness::note_arrival(cpu, arrival, sepc, 0, frame.sstatus);
     #[cfg(feature = "riscv64-apsched-witness")]
-    crate::arch::riscv64::apsched_witness::note_idle_ipi(cpu, arrival.sources);
+    crate::kernel::apsched_witness::note_idle_ipi(cpu, arrival.sources);
     early_marker!(
         "RISCV_S_MODE_IPI_ACCEPTED cpu={} sources=0x{:x} origin=supervisor sepc=0x{:x} spp=1 boundary=armed",
         cpu.0,
@@ -2915,7 +2915,7 @@ pub fn bootstrap_first_user_task(
     // AP-SCHED1: the production AP-scheduling witness — armed only WITHOUT the diagnostic knob.
     #[cfg(feature = "riscv64-apsched-witness")]
     if !crate::kernel::boot::ap_user_dispatch_enabled()
-        && let Err(e) = crate::arch::riscv64::apsched_witness::provision(kernel)
+        && let Err(e) = crate::kernel::apsched_witness::provision(kernel)
     {
         crate::yarm_log!("APSW_PROVISION_FAIL err={:?} result=fail", e);
     }
@@ -3567,7 +3567,7 @@ fn riscv_secondary_production_admission(
         cpu.0
     );
     #[cfg(feature = "riscv64-apsched-witness")]
-    crate::arch::riscv64::apsched_witness::ap_admitted(cpu);
+    crate::kernel::apsched_witness::ap_admitted(cpu);
     crate::arch::riscv64::timer::reestablish_idle_boundary(cpu.0 as usize);
     riscv_idle_halt(cpu, "secondary_idle_awaiting_work")
 }

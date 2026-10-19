@@ -610,6 +610,42 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     Ok(ttbr0)
 }
 
+/// AP-SCHED3 §C — leave every user address space: `TTBR0_EL1` becomes the bootstrap identity
+/// root (ASID 0, kernel image, RAM and the GIC/UART device blocks; no user mapping), the space
+/// every CPU ran before its first user entry. `isb` makes the switch effective before anything
+/// after it, so no translation of the departing space is started on this CPU once it returns.
+/// The departing space's cached entries are retired by the teardown's broadcast
+/// `tlbi aside1is; dsb ish` (`invalidate_asid`), which precedes any root reclaim; and every resume
+/// writes `TTBR0_EL1` again through [`activate_asid`].
+///
+/// Returns whether the CPU switched. The RPi5 images (a later hardware package) run the kernel in
+/// a different regime and keep their pre-AP-SCHED3 behaviour: no switch, so the caller must not
+/// release the activation record.
+///
+/// Never inlined, so the image check (`check-vm-invalidation-sequence.sh aarch64`) can find the
+/// switch by name and grade its `msr ttbr0_el1; isb` pair — QEMU TCG cannot tell a missing `isb`.
+#[cfg(not(feature = "hosted-dev"))]
+#[inline(never)]
+pub fn enter_kernel_root() -> bool {
+    #[cfg(not(feature = "rpi5-stage1"))]
+    {
+        let (_, _, root) = crate::arch::aarch64::boot::bootstrap_mmu_registers();
+        unsafe {
+            core::arch::asm!(
+                "msr ttbr0_el1, {root}",
+                "isb",
+                root = in(reg) root,
+                options(nostack, preserves_flags)
+            );
+        }
+        true
+    }
+    #[cfg(feature = "rpi5-stage1")]
+    {
+        false
+    }
+}
+
 pub fn map_page(
     asid: Asid,
     virt: VirtAddr,
@@ -737,7 +773,7 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
             0,
             crate::kernel::boot::smp2_record::next_generation(),
         ];
-        let cpu = (crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8;
+        let cpu = crate::arch::aarch64::this_cpu_index() as u8;
         crate::kernel::boot::smp2_record::push(
             crate::kernel::boot::smp2_record::Kind::InvalBegin,
             cpu,

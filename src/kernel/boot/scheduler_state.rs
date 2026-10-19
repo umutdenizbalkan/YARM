@@ -88,10 +88,10 @@ impl KernelState {
     }
 
     pub fn current_cpu(&self) -> CpuId {
+        // AP-SCHED3 §B: this CPU's logical id (`TPIDR_EL1`), never `MPIDR_EL1.Aff0`.
         #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
         {
-            let mpidr = crate::arch::aarch64::read_mpidr_el1();
-            return CpuId((mpidr & 0xff) as u8);
+            return CpuId(crate::arch::aarch64::this_cpu_index() as u8);
         }
         #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
         {

@@ -163,7 +163,7 @@ fn record(kind: u8, hart: u8, f: [u64; 5]) {
 
 #[cfg(all(target_arch = "aarch64", not(feature = "hosted-dev")))]
 fn this_cpu() -> u8 {
-    (crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8
+    crate::arch::aarch64::this_cpu_index() as u8
 }
 #[cfg(not(all(target_arch = "aarch64", not(feature = "hosted-dev"))))]
 fn this_cpu() -> u8 {

@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # QEMU-SMP2 — the AArch64 two-CPU interrupt / TLB / context witness, on QEMU virt / cortex-a72 /
-# 1024M / -smp 2 with `yarm.ap_user_dispatch=1` and the existing GICv2.
+# 1024M / -smp 2 with the existing GICv2. `yarm.ap_user_dispatch=1` only arms the witness's
+# provisioning (AP-SCHED3: it has no authority over admission).
 #
 # Usage: scripts/qemu-aarch64-smp2-witness-smoke.sh
 #   LOGDIR=...     where the build, the artifact identity and the boot log land
@@ -129,7 +130,9 @@ for l in lines:
 if sorted(ready) != [0, 1] or ready[0] == ready[1]:
     fail("both CPUs must publish distinct interface bits: %r" % ready)
 iface_cpu = {m.bit_length() - 1: c for c, m in ready.items()}
-for pat in ["AARCH64_SMP2_AP_ADMITTED cpu=1 wake_only=0 balance_excluded=1",
+# AP-SCHED3: the secondary takes the PRODUCTION admission (balanced, no knob); the knob only arms
+# this witness's provisioning.
+for pat in ["AARCH64_AP_SCHED_ADMITTED cpu=1 mpidr=0x80000001 mode=production wake_only=0 balance_excluded=0",
             "SMP2_WITNESS_AP_PLACED cpu=1 tids=9202,9200 kick=1",
             "SMP2_WITNESS_PROVISIONED"]:
     if sum(pat in l for l in lines) != 1:
@@ -137,7 +140,8 @@ for pat in ["AARCH64_SMP2_AP_ADMITTED cpu=1 wake_only=0 balance_excluded=1",
 
 # ── NOTHING FATAL ──
 for bad in ["PANIC", "SMP2_USER_FAIL", "SMP2_WITNESS_PROVISION_FAIL", "AARCH64_SMP2_AP_UNADMITTED",
-            "AARCH64_SMP2_AP_ADMISSION_REFUSED", "_BROAD_ENTRY", "_UNROUTED", "IRQ1_UNKNOWN_SETTLED",
+            "AARCH64_SMP2_AP_ADMISSION_REFUSED", "AARCH64_AP_UNADMITTED", "AARCH64_AP_SCHED_ADMISSION_REFUSED",
+            "AARCH64_AP_IDENTITY_MISMATCH", "_BROAD_ENTRY", "_UNROUTED", "IRQ1_UNKNOWN_SETTLED",
             "AP_CPU_IDENTITY_VIOLATION", "SMP2_WITNESS_R_EXHAUSTED"]:
     n = sum(bad in l for l in lines)
     if n:

@@ -5171,18 +5171,18 @@ fn settle_recognized_timer(
     // One acquisition, which both advances the quantum and reports whether this interrupt
     // preempts. Nothing else in this body reads the quantum, so nothing can disagree with it.
     #[cfg(all(
-        feature = "riscv64-apsched-witness",
+        feature = "apsched-witness",
         not(feature = "hosted-dev"),
-        target_arch = "riscv64"
+        any(target_arch = "riscv64", target_arch = "aarch64")
     ))]
-    crate::arch::riscv64::apsched_witness::note_timer_irq(cpu);
+    crate::kernel::apsched_witness::note_timer_irq(cpu);
     let ticked = shared.scheduler_tick_split_mut(cpu);
     #[cfg(all(
-        feature = "riscv64-apsched-witness",
+        feature = "apsched-witness",
         not(feature = "hosted-dev"),
-        target_arch = "riscv64"
+        any(target_arch = "riscv64", target_arch = "aarch64")
     ))]
-    crate::arch::riscv64::apsched_witness::note_timer_tick_done(cpu);
+    crate::kernel::apsched_witness::note_timer_tick_done(cpu);
     let (tick, preempting) = match ticked {
         crate::runtime::SchedulerTickOutcome::Preempt { tick, .. } => (tick, true),
         crate::runtime::SchedulerTickOutcome::NoSwitch { tick, .. } => (tick, false),
@@ -5266,11 +5266,11 @@ fn settle_recognized_timer(
                 preempted.outgoing
             );
             #[cfg(all(
-                feature = "riscv64-apsched-witness",
+                feature = "apsched-witness",
                 not(feature = "hosted-dev"),
-                target_arch = "riscv64"
+                any(target_arch = "riscv64", target_arch = "aarch64")
             ))]
-            crate::arch::riscv64::apsched_witness::note_preempt(shared, cpu, preempted.outgoing);
+            crate::kernel::apsched_witness::note_preempt(shared, cpu, preempted.outgoing);
             TimerSettlement::QueueAdvanceCommitted
         }
         // A PREEMPTING TICK WITH NOTHING TO PREEMPT — the dominant live population.
@@ -6257,11 +6257,11 @@ fn try_split_debug_log_into_frame(
             );
             // AP-SCHED1: the production AP-scheduling witness's steps (and its reaper).
             #[cfg(all(
-                feature = "riscv64-apsched-witness",
+                feature = "apsched-witness",
                 not(feature = "hosted-dev"),
-                target_arch = "riscv64"
+                any(target_arch = "riscv64", target_arch = "aarch64")
             ))]
-            let _ = crate::arch::riscv64::apsched_witness::observe_user_marker(
+            let _ = crate::kernel::apsched_witness::observe_user_marker(
                 shared,
                 cpu,
                 tid,

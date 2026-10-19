@@ -3790,9 +3790,10 @@ impl SharedKernel {
         target_arch = "riscv64"
     ))]
     /// QEMU-SMP2 — admit the wake-only AP `cpu` to dispatch its explicitly placed tasks, in ONE
-    /// rank-1 scheduler acquisition (`SmpScheduler::admit_pinned_dispatch`). Called by the AP
-    /// itself once its translation regime, exception state and interrupt interface are up.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    /// rank-1 scheduler acquisition (`SmpScheduler::admit_pinned_dispatch`). AP-SCHED3 §B: AArch64
+    /// no longer takes it (its secondaries take the production admission); only RISC-V's
+    /// default-off diagnostic path still does.
+    #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
     pub(crate) fn admit_ap_pinned_dispatch_split(
         &self,
         cpu: CpuId,
@@ -3805,7 +3806,11 @@ impl SharedKernel {
     /// AP-SCHED1 — admit the wake-only AP `cpu` to PRODUCTION dispatch, in ONE rank-1 scheduler
     /// acquisition ([`crate::kernel::scheduler::SmpScheduler::admit_dispatch`]). Called by the AP
     /// itself, last, once its own timer is armed and it is a published reschedule-IPI target.
-    #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+    /// AP-SCHED3 §B: AArch64's secondaries take it too.
+    #[cfg_attr(
+        not(any(target_arch = "riscv64", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
     pub(crate) fn admit_ap_dispatch_split(
         &self,
         cpu: CpuId,
@@ -4171,7 +4176,15 @@ impl SharedKernel {
         {
             crate::arch::riscv64::boot::riscv_executing_cpu()
         }
-        #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+        // AP-SCHED3 §C: the executing CPU's own `TPIDR_EL1` logical id, never the ambient one.
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+        {
+            CpuId(crate::arch::aarch64::this_cpu_index() as u8)
+        }
+        #[cfg(not(all(
+            not(feature = "hosted-dev"),
+            any(target_arch = "riscv64", target_arch = "aarch64")
+        )))]
         {
             self.with_scheduler_split_mut(|sched| sched.current_cpu)
         }

@@ -19,6 +19,7 @@
 #   aarch64  Every broadcast TLBI is `dsb ishst; tlbi *is; dsb ish; isb`
 #            (check-aarch64-tlbi-sequence.sh), and the image contains both the per-page broadcast
 #            (`tlbi vaae1is`) and the whole-ASID broadcast (`tlbi aside1is`) the teardown uses.
+#            The idle-root switch (`enter_kernel_root`) is `msr ttbr0_el1, x; isb` (AP-SCHED3).
 #
 # Exits non-zero and names the site when a required instruction is missing or misplaced.
 set -uo pipefail
@@ -86,6 +87,25 @@ elif arch == "aarch64":
             fails.append("no tlbi %s in the image" % op)
         for f, a in hits:
             print("VMI_SEQUENCE aarch64 tlbi_%s 0x%x %s" % (op, a, short(f)))
+    # AP-SCHED3: the idle-root transition. `enter_kernel_root` writes TTBR0_EL1 and makes the
+    # switch effective with an immediately following `isb`, before the caller releases the
+    # departing space's activation record.
+    owners = [f for f in funcs if re.search(r"(^|::)enter_kernel_root(::h[0-9a-f]+)?$", f)]
+    if not owners:
+        fails.append("no enter_kernel_root in the image")
+    for f in owners:
+        body = funcs[f]
+        writes = [k for k, (a, i) in enumerate(body) if re.match(r"^msr ttbr0_el1, x\d+$", i, re.I)]
+        if not writes:
+            fails.append("%s writes no TTBR0_EL1" % short(f))
+        for k in writes:
+            sites += 1
+            a = body[k][0]
+            nxt = body[k + 1][1] if k + 1 < len(body) else "<end>"
+            if nxt != "isb":
+                fails.append("0x%x in %s: msr ttbr0_el1 followed by '%s', want isb" % (a, short(f), nxt))
+            else:
+                print("VMI_SEQUENCE aarch64 idle_root_switch 0x%x %s" % (a, short(f)))
 if sites == 0:
     fails.append("no graded sites found")
 for f in fails:

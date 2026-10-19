@@ -181,7 +181,7 @@ fn roles() -> Roles {
 }
 
 fn this_cpu() -> u8 {
-    (crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8
+    crate::arch::aarch64::this_cpu_index() as u8
 }
 
 /// Map `count` fresh frames from `va` with `flags`; returns the first frame.

@@ -243,6 +243,62 @@ pub fn enable_bsp_arch_timer_ppi() -> bool {
     true
 }
 
+/// AP-SCHED3 §B — bring up THIS secondary's banked arch-timer PPI with the same register
+/// contract the boot CPU's [`enable_bsp_arch_timer_ppi`] uses, every write read back. The GICD
+/// registers covering INTIDs 0..=31 and the whole CPU interface are banked per CPU, so this
+/// programs only the calling CPU's copy (the distributor enable it ORs in is already set). Refused
+/// (`false`) before the boot CPU configured the controller.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub fn enable_ap_arch_timer_ppi() -> bool {
+    if !GIC_CONFIGURED.load(Ordering::Acquire) {
+        return false;
+    }
+    let (dist_pa, cpu_if_pa) = crate::arch::aarch64::page_table::gic_mmio_bases();
+    if dist_pa == 0 || cpu_if_pa == 0 {
+        return false;
+    }
+    program_arch_timer_ppi(dist_pa as usize, cpu_if_pa as usize)
+}
+
+/// AP-SCHED3 §B — THIS CPU's interrupt readiness, read from its own banked state:
+/// `(timer PPI enabled, reschedule SGI enabled, CPU interface enabled with an unmasked priority)`.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub fn this_cpu_irq_readback() -> (bool, bool, bool) {
+    let (dist_pa, cpu_if_pa) = crate::arch::aarch64::page_table::gic_mmio_bases();
+    if dist_pa == 0 || cpu_if_pa == 0 {
+        return (false, false, false);
+    }
+    let enabled = gic_read_u32(dist_pa as usize, GICD_ISENABLER0_OFFSET);
+    let ppi = enabled & (1u32 << (ARCH_TIMER_PPI_INTID as u32)) != 0;
+    let sgi = enabled & (1u32 << u32::from(crate::arch::gicv2_sgi::RESCHEDULE_SGI_INTID)) != 0;
+    let cpu_if = gic_read_u32(cpu_if_pa as usize, GICC_CTLR_OFFSET) & GICC_CTLR_ENABLE_GROUP0 != 0
+        && gic_read_u32(cpu_if_pa as usize, GICC_PMR_OFFSET) != 0;
+    (ppi, sgi, cpu_if)
+}
+
+/// AP-SCHED3 §B — disable THIS CPU's timer and its banked timer PPI and reschedule SGI (an
+/// unadmitted secondary takes no interrupt). `GICD_ICENABLER0` is write-1-to-clear and banked.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+pub fn disable_this_cpu_interrupts() {
+    const GICD_ICENABLER0_OFFSET: usize = 0x180;
+    unsafe {
+        core::arch::asm!(
+            "msr cntp_ctl_el0, xzr",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+    let (dist_pa, _) = crate::arch::aarch64::page_table::gic_mmio_bases();
+    if dist_pa != 0 {
+        gic_write_u32(
+            dist_pa as usize,
+            GICD_ICENABLER0_OFFSET,
+            (1u32 << (ARCH_TIMER_PPI_INTID as u32))
+                | (1u32 << u32::from(crate::arch::gicv2_sgi::RESCHEDULE_SGI_INTID)),
+        );
+    }
+}
+
 #[cfg(all(not(feature = "hosted-dev"), not(target_arch = "aarch64")))]
 pub fn enable_bsp_arch_timer_ppi() -> bool {
     false
@@ -422,6 +478,11 @@ pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, _ticks_from
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, ticks_from_now: u64) {
+    // AP-SCHED3 §C: an IDLE secondary's timer is parked behind the backstop (`smp`), so every
+    // re-arm it takes while parked — the timer route re-arms each tick it services — keeps the
+    // backstop distance instead of restoring the quantum period. The timer is always THIS PE's
+    // own (`CNTP_*_EL0` is per PE), so the executing CPU is the one asked.
+    let ticks_from_now = crate::arch::aarch64::smp::timer_distance_for_this_cpu(ticks_from_now);
     let clamped = ticks_from_now.clamp(1, u32::MAX as u64);
     unsafe {
         core::arch::asm!("msr cntp_tval_el0, {0}", in(reg) clamped, options(nostack, preserves_flags));

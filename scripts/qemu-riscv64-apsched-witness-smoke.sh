@@ -21,7 +21,7 @@
 # apart from the work.
 #
 # One App-class process P; its threads and fork children are placed by the production balanced
-# placement. The grader (`scripts/grade-riscv64-apsched-witness.py`) orders every witness record by
+# placement. The grader (`scripts/grade-apsched-witness.py --arch riscv64`) orders every witness record by
 # its causal stamp, never by console position, and requires, on EVERY expected secondary: the
 # production admission; ordinary user work; timer preemption of non-yielding spinners with every
 # patterned register intact; a deadline whose global-tick advance equals CPU 0's timer interrupts
@@ -48,7 +48,7 @@ CMDLINE="console=ttyS0 rdinit=/init"
 
 seal() { echo "APSW_WITNESS_SEAL arch=riscv64 $*"; }
 
-python3 -I scripts/grade-riscv64-apsched-witness.py --self-test || { seal "result=fail reason=grader_self_test"; exit 1; }
+python3 -I scripts/grade-apsched-witness.py --arch riscv64 --self-test || { seal "result=fail reason=grader_self_test"; exit 1; }
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   echo "[apsched-witness] building riscv64 artifacts, then the kernel with $FEATURE, into $BUILD_DIR"
@@ -113,6 +113,6 @@ PY
 NORM="$LOGDIR/boot.norm.log"
 tr '\r' '\n' <"$BOOT_LOG" >"$NORM"
 if [[ "${TOPOLOGY_ONLY:-0}" == "1" ]]; then
-  exec python3 -I scripts/grade-riscv64-apsched-witness.py --topology-only "$SMP" "$NORM"
+  exec python3 -I scripts/grade-apsched-witness.py --arch riscv64 --topology-only "$SMP" "$NORM"
 fi
-python3 -I scripts/grade-riscv64-apsched-witness.py --expect-cpus "$SMP" "$NORM"
+python3 -I scripts/grade-apsched-witness.py --arch riscv64 --expect-cpus "$SMP" "$NORM"

@@ -835,7 +835,7 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             not(feature = "hosted-dev"),
             target_arch = "aarch64"
         ))]
-        let smp2_cpu = (crate::arch::aarch64::read_mpidr_el1() & 0xff) as u8;
+        let smp2_cpu = crate::arch::aarch64::this_cpu_index() as u8;
         #[cfg(all(
             feature = "aarch64-smp2-witness",
             not(feature = "hosted-dev"),

@@ -104,9 +104,14 @@ for page in uart gicd gicc; do
     || die "$page page not proven EL1-Device / EL0-denied under the enable-time TTBR0"
 done
 # Every claim re-derives the regime it was taken under: all three pages kernel-only Device-nGnRE
-# and execute-never at both levels, the PL011 through a 4 KiB level-3 leaf of that root.
-regime=$(grep -a -c 'IRQ2_PL011_IRQ_ENTRY .* regime_ok=1 uart_level=3 ' "$NORM")
-[[ "$regime" == "8" ]] || die "only $regime/8 claims ran under a proven kernel-only execute-never regime"
+# and execute-never at both levels. A claim taken from a user task reads the user root, which
+# maps the PL011 through a 4 KiB level-3 leaf; a claim taken in the idle park (AP-SCHED3: an idle
+# CPU leaves every user root for the kernel's own, ASID 0) reads the kernel root, which maps it
+# through a 2 MiB level-2 device block.
+regime_user=$(grep -a -c 'IRQ2_PL011_IRQ_ENTRY origin=user .* asid=[1-9][0-9]* regime_ok=1 uart_level=3 ' "$NORM")
+regime_idle=$(grep -a -c 'IRQ2_PL011_IRQ_ENTRY origin=idle .* asid=0 regime_ok=1 uart_level=2 ' "$NORM")
+regime=$((regime_user + regime_idle))
+[[ "$regime" == "8" ]] || die "only $regime/8 claims ran under a proven kernel-only execute-never regime (user $regime_user, idle $regime_idle)"
 enabled=$(grep -a -m1 'IRQ2_PL011_SOURCE_ENABLED' "$NORM" | sed 's/.*IRQ2_PL011_SOURCE_ENABLED/IRQ2_PL011_SOURCE_ENABLED/')
 has_all "$enabled" intid=33 spi=1 group=0 priority=0x80 trigger=level imsc=0x10 isenabler=1 items=8
 [[ $(count 'IRQ1_WITNESS_PROVISION_OK init_tid=1 irq_line=33 ') == 1 ]] || die "route not bound to INTID 33"

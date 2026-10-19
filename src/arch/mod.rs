@@ -5,6 +5,11 @@
 pub mod aarch64;
 #[cfg(any(test, target_arch = "aarch64"))]
 pub mod aarch64_boot_policy;
+/// AP-SCHED3 §B — the AArch64 CPU-admission policy (hardware / logical / GIC identities, the
+/// GICv2 interface limit, the production ceiling, dispatch stacks), arch-neutral so the hosted
+/// suite executes the rules the AArch64 port applies.
+#[cfg(any(test, target_arch = "aarch64"))]
+pub mod aarch64_cpu_admission;
 /// QEMU-IRQ3 §1 — the MADT facts one ISA interrupt needs (ISA IRQ -> GSI with overrides, GSI ->
 /// I/O APIC), arch-neutral so the hosted suite executes the rule the x86_64 witness applies.
 #[cfg_attr(not(feature = "x86_64-uart-irq-witness"), allow(dead_code))]

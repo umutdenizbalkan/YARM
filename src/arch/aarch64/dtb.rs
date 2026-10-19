@@ -30,7 +30,49 @@ pub struct ParsedDtb {
     /// no distributor MMIO.
     pub gic_dist_base: Option<usize>,
     pub present_cpu_bitmap: Option<u64>,
+    /// AP-SCHED3 §B — every `cpu@<affinity>` node's WHOLE MPIDR affinity, in device-tree order
+    /// (the unit address of a `cpu` node is its `reg`, which is the MPIDR affinity PSCI targets).
+    /// Unlike `present_cpu_bitmap`, nothing is dropped for being ≥ 64 or aliased by `Aff0`.
+    pub cpus: CpuNodes,
     pub psci_conduit: PsciConduit,
+}
+
+/// The `cpu` nodes' MPIDR affinities, fixed-size (no allocation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuNodes {
+    pub affinity: [u64; Self::CAPACITY],
+    /// How many entries of `affinity` are valid.
+    pub count: usize,
+    /// `cpu` nodes beyond the capacity (named by the caller, never planned).
+    pub overflow: usize,
+}
+
+impl CpuNodes {
+    pub const CAPACITY: usize = 64;
+
+    fn push(&mut self, affinity: u64) {
+        if self.count < Self::CAPACITY {
+            self.affinity[self.count] = affinity;
+            self.count += 1;
+        } else {
+            self.overflow += 1;
+        }
+    }
+
+    /// The valid affinities.
+    pub fn as_slice(&self) -> &[u64] {
+        &self.affinity[..self.count]
+    }
+}
+
+impl Default for CpuNodes {
+    fn default() -> Self {
+        Self {
+            affinity: [0; Self::CAPACITY],
+            count: 0,
+            overflow: 0,
+        }
+    }
 }
 
 /// Node-local scratch for ONE candidate interrupt-controller node.
@@ -124,6 +166,9 @@ pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
                 }
                 if let Some(cpu_id) = parse_cpu_id_from_node_name(name) {
                     present_cpu_bitmap |= 1u64 << cpu_id;
+                }
+                if let Some(affinity) = parse_cpu_affinity_from_node_name(name) {
+                    out.cpus.push(affinity);
                 }
             }
             FDT_END_NODE => {
@@ -226,6 +271,27 @@ pub fn parse_boot_dtb(bytes: &[u8]) -> Option<ParsedDtb> {
         out.present_cpu_bitmap = Some(present_cpu_bitmap);
     }
     Some(out)
+}
+
+/// The whole unit address of a `cpu@<hex>` node (its MPIDR affinity), however large.
+fn parse_cpu_affinity_from_node_name(name: &[u8]) -> Option<u64> {
+    let suffix = name.strip_prefix(b"cpu@")?;
+    let mut value = 0u64;
+    let mut consumed = 0usize;
+    for byte in suffix.iter().copied() {
+        let nibble = match byte {
+            b'0'..=b'9' => (byte - b'0') as u64,
+            b'a'..=b'f' => (byte - b'a' + 10) as u64,
+            b'A'..=b'F' => (byte - b'A' + 10) as u64,
+            _ => break,
+        };
+        if consumed == 16 {
+            return None;
+        }
+        value = (value << 4) | nibble;
+        consumed += 1;
+    }
+    (consumed != 0).then_some(value)
 }
 
 fn parse_cpu_id_from_node_name(name: &[u8]) -> Option<u8> {
@@ -735,6 +801,10 @@ mod tests {
         push_be_u32(&mut struct_block, FDT_END_NODE);
         push_begin_node(&mut struct_block, "cpu@3");
         push_be_u32(&mut struct_block, FDT_END_NODE);
+        // AP-SCHED3 §B: a second-cluster CPU (MPIDR Aff1 = 1). The legacy bitmap drops it (its
+        // unit address is ≥ 64); the affinity list keeps it whole, never aliased onto `Aff0`.
+        push_begin_node(&mut struct_block, "cpu@100");
+        push_be_u32(&mut struct_block, FDT_END_NODE);
         push_be_u32(&mut struct_block, FDT_END_NODE);
         push_be_u32(&mut struct_block, FDT_END_NODE);
         push_be_u32(&mut struct_block, FDT_END);
@@ -758,6 +828,8 @@ mod tests {
 
         let parsed = parse_boot_dtb(&dtb).expect("parsed");
         assert_eq!(parsed.present_cpu_bitmap, Some(0b1001));
+        assert_eq!(parsed.cpus.as_slice(), &[0, 3, 0x100]);
+        assert_eq!(parsed.cpus.overflow, 0);
         assert_eq!(parsed.psci_conduit, PsciConduit::Unknown);
     }
 }

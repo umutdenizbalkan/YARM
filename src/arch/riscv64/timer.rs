@@ -429,7 +429,7 @@ pub fn idle_wait_loop(cpu: usize) -> ! {
         not(feature = "hosted-dev"),
         target_arch = "riscv64"
     ))]
-    crate::arch::riscv64::apsched_witness::note_idle_reached(cpu);
+    crate::kernel::apsched_witness::note_idle_reached(cpu);
     if IDLE_UNMASK_REQUESTED
         .get(cpu)
         .is_some_and(|flag| flag.swap(false, Ordering::AcqRel))
