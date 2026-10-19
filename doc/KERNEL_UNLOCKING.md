@@ -29673,3 +29673,80 @@ Development runs, on the pre-freeze revision `faba0c6c`, with a 600 s budget:
 | expected CPU left unused | 401 s | `P_PRE_TIMEOUT`: the same, plus "no spinner ran on CPU 2" and "0 timer preemptions of spinners on CPU 2" |
 
 The qualified results follow below.
+
+#### 4. The first frozen candidate failed, and why (§A2)
+
+`901b5161`, the first §A freeze, failed one scheduled gate: the full witness boot at `-smp 10`
+graded CPU 1 and CPU 2 below the preemption minimum (3 and 2 recorded spinner preemptions, need 4)
+while the kernel had counted 270 and 186 preemptions there. The kernel was right and the record was
+short. The witness kept at most 48 preemption records per CPU, and under ten emulated harts a
+deadline thread spun on its start gate long enough (P was still spawning) to spend all 48 of CPU 1's;
+the spinners that followed it kept only their first record each. §A2 (`7aec0fe3`) records each
+task's first six preemptions, wherever they happen, over a 128-task table. It is witness-only: no
+default or other-feature image changes. The failed run and the whole `901b5161` qualification are
+kept.
+
+#### Qualification
+
+**Candidate** `7aec0fe31b35e99122c8663911af8b2c541efc0a` (tree `ce6f51a0…`), against the base
+`7a76f789`, from a fresh isolated worktree, every gate once. The witness and default artifacts are
+bound by hash in the run record (`yarm-riscv64-apsw.bin 722f35f6…`, `yarm-riscv64.bin 34c5f5ae…`,
+`initramfs-core.cpio f0c35c57…`, OpenSBI `171a91cc…`).
+
+| Gate | Result |
+|---|---|
+| focused tests / scope suites | 126 / 30 passed |
+| hosted / integration / census scanner | 6128 / 308 / 17 passed |
+| `cargo fmt --check`; ownership census | clean; production lines identical to the base |
+| freestanding warnings, three ports | identical named classes and counts (177 / 205 / 188) |
+| x86_64 and AArch64 default kernels | byte-identical to the base |
+| RISC-V image sequence (`satp` → `sfence.vma`) | ok, 8 sites |
+| RISC-V feature builds (5 witnesses) | warnings identical to the base |
+| strict cores: x86_64, AArch64, RISC-V at 1, 2, 3, 4 and 8 harts | ok |
+| strict core at `-smp 10` | **fails** (recorded, not graded): QEMU's 31 s core budget ends before the user services start at 10 harts; `901b5161` failed it the same way |
+
+**The witness sample, scheduled in advance** (one build; idle host unless marked):
+
+| Boot | Time | Recorded spinner preemptions per CPU | Result |
+|---|---|---|---|
+| `-smp 4` idle 1/2/3 | 44 / 58 / 48 s | 6,18,12,12 · 6,18,12,12 · 6,12,18,12 | ok |
+| `-smp 2` / `-smp 3` | 15 / 41 s | 5,9 · 6,12,18 | ok |
+| `-smp 8` | 764 s | 6,18,12,12,12,12,12,12 | ok |
+| `-smp 4` loaded 1/2 (4 busy loops on 4 host CPUs) | 34 / 33 s | 5,14,11,11 · 6,12,11,8 | ok |
+| `-smp 10` full (boot hart 5) | 1137 s | 12 on each of the 8 admitted CPUs; harts 8, 9 `beyond_production_cpu_ceiling` | ok |
+
+Every boot: registers intact, deadlines timed out on the global tick (`dtick == dirq0`), every idle
+wake by IPI, every IPC round, every fork/exit/reap reaped with nothing quarantined.
+
+**Topology boots** (admission and exclusion alone): `-smp 9` with boot harts 0 and 1, `-smp 10`
+with boot harts 1 and 7, `-smp 17` with boot hart 14 — each exactly 8 logical CPUs, every other hart
+named `beyond_production_cpu_ceiling` (or `beyond_hsm_handoff_table` at 17) and never started.
+
+**The two bounded controls**, on this candidate (`-smp 4`, 600 s boot budget declared before the
+run):
+
+| Control | Boot / total | Verdict |
+|---|---|---|
+| missing secondary timer | 321 s / 413 s | `P_W_TIMEOUT` (7 of 8 spinners), `P_PRE_TIMEOUT`: "CPU 2 had taken no timer preemption at all" |
+| expected CPU left unused | 328 s / 418 s | `P_PRE_TIMEOUT`, "no spinner ran on CPU 2", "0 timer preemptions of spinners on CPU 2" |
+
+**RISC-V regressions:** SMP3, VM-invalidation, shared-region replacement, LOCK1, UART IRQ,
+XFER2 (three profiles), shared-region direct, supervisor restart and exit-current-task — ok.
+
+**One regression failed: the RISC-V server-death cell**, `RUN_B expected exactly one committed
+completion, saw 0`. Its image is byte-identical (`14386019…`) to the one that passed in the
+`901b5161` run; the difference was timing. The cell ran while development boots shared the host, and the server
+took the call and exited before its caller blocked for the reply. The post-lock death drain found the caller's terminal not yet armed, classified the item
+stale and discarded it; the caller then waited for its deadline (`Timeout`, not `PeerDeath`). The
+defect is the base's, not §A's:
+
+* a hosted test that lets the server die before the caller waits fails on `7a76f789` (the caller
+  never observes `ServerDied`);
+* the live server-death cell with a scratch patch that makes the client yield between its call and
+  its wait fails on `7a76f789` on RISC-V and AArch64 alike.
+
+With no deadline the caller would wait for ever, and on SMP the window is wide (the server on
+another CPU), so the repair belongs to the AArch64 scheduling stage, which carries the server-death
+publications: §B–§E below. This failure is recorded against this candidate, not retried away.
+
+**Delivered** as §A: the candidate above plus this record.
