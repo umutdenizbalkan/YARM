@@ -247,7 +247,15 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
 const MAX_RECS: usize = 4096;
 /// Preemption records kept per CPU beyond each task's first (the full count is in `PRE` and the
 /// dump trailer): at 8 CPUs the spinners take ~300 preemptions each, which would flood the record.
-const PRE_RECS_PER_CPU: u64 = 48;
+/// Each witness task's first this-many timer preemptions are recorded, on whichever CPU (the
+/// per-CPU totals still reach the mailbox, unbounded). The budget is per TASK: a per-CPU budget (48)
+/// let one task that was preempted many times before the spinners started — a deadline thread
+/// spinning on its gate while P was still spawning, slow under ten emulated harts — use up a CPU's
+/// records, so the spinners that followed it there kept only their first, and the grade read the
+/// missing records as missing preemptions.
+const PRE_RECS_PER_TASK: u64 = 6;
+/// Witness tasks the budget can track (P's workers and its churn children over a full run).
+const PRE_TASKS: usize = 128;
 
 const K_AP_ADMITTED: u64 = 1;
 const K_PREEMPT: u64 = 2;
@@ -433,22 +441,34 @@ pub fn note_preempt(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
         return;
     }
     let n = PRE[c].fetch_add(1, Ordering::AcqRel) + 1;
-    // Each task's first preemption is always recorded (the grader needs one per spinner).
-    let first = !PRE_SEEN
-        .iter()
-        .any(|t| t.load(Ordering::Acquire) == outgoing)
-        && PRE_SEEN.iter().any(|t| {
-            t.compare_exchange(0, outgoing, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        });
-    if first || n <= PRE_RECS_PER_CPU {
+    // Each task's first PRE_RECS_PER_TASK preemptions are recorded (the grader needs one per
+    // spinner, and PRE_MIN per CPU across its spinners).
+    if task_preemptions(outgoing) <= PRE_RECS_PER_TASK {
         record(K_PREEMPT, c as u64, outgoing, 0, [n, 0, 0, 0, 0]);
     }
     publish(M_PRE + 8 * c as u64, n);
 }
 
-/// Tasks whose first preemption has been recorded.
-static PRE_SEEN: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+/// The tasks preempted so far, and how many times each (index-paired).
+static PRE_SEEN: [AtomicU64; PRE_TASKS] = [const { AtomicU64::new(0) }; PRE_TASKS];
+static PRE_COUNT: [AtomicU64; PRE_TASKS] = [const { AtomicU64::new(0) }; PRE_TASKS];
+
+/// This preemption's ordinal for `tid` (1 for its first), or `u64::MAX` once the table is full.
+/// Only the tick path of the CPU running `tid` calls it, so a task never races itself for a slot.
+fn task_preemptions(tid: u64) -> u64 {
+    let slot = PRE_SEEN
+        .iter()
+        .position(|t| t.load(Ordering::Acquire) == tid)
+        .or_else(|| {
+            PRE_SEEN.iter().position(|t| {
+                t.compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            })
+        });
+    slot.map_or(u64::MAX, |i| {
+        PRE_COUNT[i].fetch_add(1, Ordering::AcqRel) + 1
+    })
+}
 
 /// `cpu` arrived at its idle wait from a task (not a return to an interrupted idle).
 /// Secondaries only: CPU 0 also runs the core services, whose idle arrivals are not this witness's.
