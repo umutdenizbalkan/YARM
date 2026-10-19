@@ -29750,3 +29750,192 @@ another CPU), so the repair belongs to the AArch64 scheduling stage, which carri
 publications: §B–§E below. This failure is recorded against this candidate, not retried away.
 
 **Delivered** as §A: the candidate above plus this record.
+
+### §B — AArch64 production admission
+
+**The contract, from the existing owners.** One plan decides which hardware CPU becomes which
+logical CPU and which logical CPUs may dispatch (`src/arch/aarch64_cpu_admission.rs`, pure, so the
+hosted suite runs the rules the port applies). Three identities stay distinct:
+
+| Identity | Source | Holder |
+|---|---|---|
+| Hardware | MPIDR_EL1 affinity (Aff3:Aff2:Aff1:Aff0, mask `0xff_00ff_ffff`), from the DTB `cpu@` node; compared whole | `LOGICAL_AFFINITY[logical]`, the PSCI `CPU_ON` target |
+| Logical | boot CPU = 0; every other admissible CPU the next id in ascending affinity order (dense) | `TPIDR_EL1`, written once at the CPU's entry; `this_cpu_index()` |
+| GIC CPU interface | the CPU's own banked `GICD_ITARGETSR0` | `gicv2_sgi::TargetTable`, published by the CPU itself |
+
+`MPIDR_EL1 & 0xff` is gone from every production path (trap entry, vector slots, scheduler
+`current_cpu`, VM shootdown requester, witnesses). It named a CPU by Aff0 alone, so it assumed
+logical = hardware identity and would alias `0x000` and `0x100`.
+
+**Limits, each named when it binds:**
+
+| Limit | Value | Exclusion marker |
+|---|---|---|
+| GICv2 CPU interfaces (`GICD_TYPER.CPUNumber + 1`, at most 8) | 8 on QEMU virt | `beyond_gicv2_interfaces` |
+| Production ceiling, boot CPU included | 8 | `beyond_production_cpu_ceiling` |
+| Scheduler tables (`MAX_CPUS`) | 64 — table capacity, not a wake guarantee | `no_free_logical_cpu` |
+| Duplicate affinity in the DTB | — | `duplicate_mpidr_affinity` |
+| Dispatch stack (the build's secondary stack < 2 MiB: the RPi5 image) | — | `no_dispatch_stack` |
+| No GICv2 distributor | — | `no_gicv2_distributor` |
+
+An excluded CPU is never started (`AARCH64_CPU_EXCLUDED affinity= reason= dispatch=0`) and is
+not in the scheduler's present set, so no placement can reach it. QEMU's `virt` refuses more than
+eight CPUs with GICv2, so the interface and ceiling limits are exercised by the hosted plan tests;
+live, a GICv3 machine is refused by name (`reason=no_gicv2_distributor`, the secondary never
+started).
+
+**The secondary's path, in order** (`yarm_aarch64_secondary_entry` → `smp::ap_main`):
+
+1. The entry stub bounds-checks the PSCI context id (the planned logical id) against the stack
+   pool, writes it to `TPIDR_EL1` and takes its own 2 MiB stack, indexed by logical id − 1.
+2. Rust validates the CPU's own MPIDR affinity against the plan. A mismatch publishes nothing and
+   parks (`AARCH64_AP_IDENTITY_MISMATCH`, `reason=identity_mismatch`).
+3. Translation (the bootstrap kernel root), then the wait for the boot CPU's boot borrow to end.
+4. Dispatch stack size, SGI bring-up (priority/enable readback, then publish the interface bit),
+   its own timer PPI and first deadline, and an interrupt-readiness readback of its own state.
+5. The idle root (`hal::leave_user_root`: kernel root, then the record).
+6. **Last:** the one production scheduler transition (`admit_ap_dispatch_split` →
+   `admit_dispatch`: wake-only and balance-excluded cleared together), then
+   `AARCH64_AP_SCHED_ADMITTED ... mode=production` and the idle park.
+
+Any failed prerequisite withdraws the interface bit, masks the CPU's timer and SGI, and parks it
+wake-only and named (`AARCH64_AP_UNADMITTED`, `AARCH64_AP_STATE ... admitted=0 dispatching=0
+reason=`). A wake-only CPU accepts no queued work (scheduler-enforced since 183.5).
+
+**No knob.** `yarm.ap_user_dispatch` no longer has any authority over admission: the pinned
+diagnostic admission (`admit_this_ap`, balance-excluded) and its separate AP loop are deleted,
+and the BSP's own SGI bring-up is unconditional. The knob now only arms the SMP2, LOCK2 and
+overtaken witnesses' provisioning; those witnesses observe the production admission (their
+graders were updated to require `mode=production`). The retired claim
+`AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE` is guarded against returning.
+
+**Boot exclusivity and the first interrupt.** Secondaries start before the boot borrow ends and
+wait for it (`wfe`/`sev`), exactly as SMP2 established; a secondary unmasks only in the idle
+park, after admission. The BSP's SGI state is published before its own unmask.
+
+### §C — the scheduler lifecycle on every admitted CPU
+
+* **Placement.** Ordinary balanced placement (least loaded, rotating start) over every admitted
+  CPU; explicit affinity honoured; no migration. Fork children are placed by the same owner now
+  that AArch64 announces remote enqueues (`hal::REMOTE_ENQUEUE_NOTIFIED`).
+* **Remote wake.** `hal::notify_enqueued`, called by every production enqueue owner after its
+  commit (structural test `every_production_enqueue_commit_is_followed_by_its_notification`),
+  sends the existing QEMU-SMP2 reschedule SGI when the target is another CPU: `dsb ishst` before
+  the `GICD_SGIR` write; an unpublished target is refused. That covers spawn, fork, IPC delivery,
+  futex wake, timeout expiry, cancellation, server death and replacement dispatch, which all
+  commit through those owners; the NR 6/NR 7 direct drains keep their own committed-wake send.
+  The idle race: the SGI is sent after the enqueue commits, and the target's interrupts are
+  masked everywhere except the one take point of the authenticated idle window
+  (`yarm_aarch64_idle_wfi_window`: `wfi` masked, then `daifclr`). An SGI that arrives while the
+  target is still on its way to the park stays pending at the GIC; the masked `wfi` still wakes on
+  it, and it is taken at the take point, where the bridge's idle advance dispatches the queued
+  task. So no wake waits for a tick.
+* **Time.** Each secondary arms its own timer (`program_timer_deadline` per CPU) for
+  preemption; only the clock owner advances the scheduler tick (`tick_on`), so N CPUs never
+  multiply time. An idle secondary parks its timer at a 100-period backstop
+  (`AP_IDLE_BACKSTOP_PERIODS`) and re-arms it on dispatch. Deadlines are scanned on CPU 0 and wake
+  their task on its home CPU through the same notification.
+* **Idle root.** On idle entry the CPU switches `TTBR0_EL1` to the bootstrap kernel root
+  (`page_table::enter_kernel_root`: `msr ttbr0_el1; isb`, never inlined so the image check can
+  find it) and only then releases its `ACTIVE_ASID` record. Teardown's broadcast
+  `tlbi aside1is; dsb ish` retires the departing space's TLB entries; the SGI carries no TLB
+  credit. Exit/reap therefore no longer quarantines a space an idle CPU merely last ran.
+  The kernel root's device blocks are now PXN|UXN (they were executable), since every idle CPU
+  takes device interrupts there.
+* **Context.** The vector prologue saves GPRs, PC/SP, NZCV, q0–q31, FPCR, FPSR and TPIDR_EL0 per
+  exception, on the CPU's own stack; the FP home commit/load is per task (CONTEXT1), unchanged.
+* **Stacks.** 7 secondary dispatch stacks × 2 MiB = 14 MiB of `.bss` (QEMU-SMP2 had 64 × 128 KiB
+  indexed by Aff0, 8 MiB), plus the boot CPU's 16 MiB boot stack and 64 KiB exception stack,
+  unchanged. Static, whatever the CPU count.
+
+**Repaired defect found on the way (pre-existing).** NR 1's direct delivery returns
+`PostWorkCommitted { finalize_syscall: true }` after `complete_ok`, but the AArch64 finalize gate
+committed published transitions only for a hand-kept NR list without NR 1. The sender resumed
+with x0 still holding its endpoint cap, and the user runtime read a delivered send as an error.
+Single-CPU boots never noticed (their senders ignore the result); the cross-CPU witness retried
+the "failed" send and desynchronised. The gate now commits whenever the route itself declares the
+caller finished (`SplitFinalizeReason::RouteFinishedCaller`), whatever the syscall number.
+
+**Repaired defect: a server death that precedes its caller's wait was lost (pre-existing,
+found in §A's qualification).** When a server takes a call and exits before its caller blocks
+for the reply, the post-lock death drain found the caller's terminal cell not yet armed for that
+record incarnation, classified the item stale and discarded it; the caller then armed and waited
+for its deadline (`Timeout` instead of `PeerDeath`), or for ever with none. On SMP the window is
+wide: the server runs on another CPU. Now the drain parks such an item on the record
+(`IpcSubsystem::reply_death_unclaimed`), in the same rank-3 scope that read the cell, so no arming
+can slip between; the arming of that exact incarnation — the split route in
+`recv_block_phase_c_split`, the in-lock route in `arm_production_reply_deadline` — takes it back in
+its own scope and requeues it onto the executing CPU, whose trap-tail drain then claims `PeerDeath`
+through the cell like any other terminal. The requeue is the same publication moved, so the
+oracle's transition audit still sees one reservation, one publication and one consumption. A
+full queue is named (`IPC_SERVER_DEATH_REPUBLISHED_AT_WAIT ... result=queue_full`); the caller then
+keeps its own deadline.
+
+Evidence: `stage199a2d1_races::ap_sched3_a_death_before_the_reply_wait_reaches_the_caller` fails on
+`7a76f789` and passes here; the live server-death cell with a scratch patch that makes the client
+yield 400 times between its call and its wait (so the server always dies first) fails on
+`7a76f789` on RISC-V and AArch64 and passes here on both.
+
+### §D — evidence
+
+**Hosted** (`ap_sched3`, `aarch64_cpu_admission`, `gicv2_sgi`): the admission plan over
+contiguous, sparse, multi-cluster and duplicate affinities, more CPUs than interfaces, a boot CPU
+outside the listed nodes and a small scheduler; eligibility published last and every failed
+prerequisite parking the CPU withdrawn; identity from `TPIDR_EL1` everywhere; eight CPUs admitted
+concurrently, fourteen tasks placed over all eight at most two each, enqueue-versus-idle on seven
+targets with jitter losing no wake, secondary ticks moving no clock, and a deadline homed on CPU 7
+waking there and telling CPU 7; the idle-root transition before its record; the route-finished
+NR 1 commit; the kernel root's execute-never devices.
+
+**The witness** (`aarch64-apsched-witness`, default off) is the RISC-V AP-SCHED program ported
+(`src/arch/aarch64/apsched_witness.S`; the kernel half, `src/kernel/apsched_witness.rs`, is shared).
+One process P on CPU 0 drives ordinary production mechanisms and every worker is placed by the
+production scheduler. Per expected CPU it requires, from causal records: user execution; timer
+preemption of non-yielding spinners whose whole context (x0–x30 but x18, SP, NZCV, q0–q31, FPCR,
+FPSR, TPIDR_EL0) is a per-slot pattern checked on exit; a deadline receive timing out on the global
+clock; idle wakes attributed to the reschedule SGI at the authenticated idle boundary; cross-CPU
+IPC ping-pong; fork/exit/reap churn reaped with nothing quarantined and the CPU leaving the child's
+root first; a handled copy-on-write fault per CPU; and its dispatch stack's measured depth.
+AArch64-specific choices:
+
+* *Spinner top-up.* Placement balances by load, and the supervisor's one-tick control poll is
+  homed on CPU 0, so 2N + 2 spinners do not always reach CPU 0. P adds spinners, through the same
+  placement, until one has started on CPU 0 and on every secondary as the kernel observed
+  (`P_W_COVER`), up to 24.
+* *Waits nap.* P's bounded waits block a tick at a time on a private endpoint: a yield storm
+  floods the console, which on this port delays CPU 0's own interrupt handling and so the clock the
+  deadlines are measured on. The first timeout of any phase ends the run, naming its CPU.
+* *Idle timers park,* so the deadline windows' own-tick check is a per-run requirement here.
+* *Stack depth.* Each secondary's 2 MiB stack is painted (and cleaned to the point of coherency)
+  before `CPU_ON`; the dump reports the deepest use.
+* *The one benign idle-wake race.* An idle secondary's backstop timer can fire between an enqueue
+  and the SGI's arrival and dispatch the woken task first; the SGI then arrives outside the idle
+  boundary. The kernel records such arrivals (`SGI`), and the grader accepts the wake only when the
+  SGI is on record after it (reported as `_timer_won_race`); a wake whose SGI never came fails.
+
+**Controls** (each a scratch patch breaking CPU 2 only, in a fresh worktree, graded by the
+unmodified smoke script at `-smp 4`, 600 s boot budget): missing AP readiness (checked and
+unchecked), suppressed SGI wake, missing AP timer, skipped idle-root handoff, corrupted returning
+GPR (x20 += 0x100, additive, so it accumulates instead of cancelling) and FP register (q7.lo +=
+0x100), and an expected CPU left unused (pinned instead of balanced admission). Each must fail
+naming CPU 2 and the obligation.
+
+**Barrier evidence.** QEMU TCG cannot tell a missing `isb`, `dsb` or broadcast TLBI, so the live
+witnesses claim none of them. The source guards and the built-image checks do:
+`check-aarch64-tlbi-sequence.sh` (every broadcast TLBI is `dsb ishst; tlbi *is; dsb ish; isb`) and
+`check-vm-invalidation-sequence.sh aarch64`, which now also requires the idle-root switch
+`enter_kernel_root` to be `msr ttbr0_el1; isb`. An image control removes that `isb` and must fail
+the check.
+
+### Limits
+
+* Supported: GICv2 with at most eight CPU interfaces, eight logical CPUs including the boot CPU,
+  on QEMU `virt`. GICv3 and more than eight CPUs are refused by name; RPi5 images admit no
+  secondary (`no_dispatch_stack`), as before.
+* The dispatch stacks are a static 14 MiB whatever the CPU count, at the RISC-V correctness size
+  (2 MiB), not a measured AArch64 bound. The witness's deepest measured secondary use is reported
+  per run; the boot CPU's stack, in use from `_start`, is not measured. Allocation proportional to
+  admitted CPUs remains open.
+* No migration: a task keeps its first CPU (or its affinity).
+
+The qualification of the frozen §B–§E candidate follows below.
