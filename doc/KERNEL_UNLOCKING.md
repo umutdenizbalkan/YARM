@@ -29549,3 +29549,127 @@ and the emulator is QEMU 8.2.2.
 * the older red cells recorded in earlier sections, which stay open.
 
 **Next package: AArch64 production SMP.**
+
+## APS3 — AP-SCHED3: default production user scheduling on AArch64
+
+AP-SCHED3 runs in stages, each frozen, qualified and delivered on its own:
+
+* **§A** — close the three contract issues AP-SCHED2 left on RISC-V;
+* **§B–§E** — AArch64 production admission, the scheduler lifecycle on every admitted CPU,
+  evidence, and qualification.
+
+### §A — AP-SCHED2's remaining contract issues (RISC-V)
+
+#### 1. A production CPU ceiling, independent of which hart boots
+
+**The defect.** AP-SCHED2's policy bounded admission only by the hart-indexed handoff table
+(8 slots). When the boot hart lay outside the table, all 8 slots were secondaries, so the boot
+CPU plus 8 secondaries gave **nine** logical CPUs. The policy's own test expected that
+(`logical_present_bitmap(0x3ff, 9, 64) == 0x1ff`). The report and the qualification covered at
+most eight.
+
+**The repair** (`src/arch/riscv_hart_admission.rs`). Four limits, each distinct and each named
+when it binds:
+
+| Limit | Value | Indexed by | Exclusion marker |
+|---|---|---|---|
+| Hart-id table (`HANDOFF_SLOTS`): handoff record, claimed id, published trap-stack region | 16 | hart id | `beyond_hsm_handoff_table` — never started |
+| Production ceiling (`PRODUCTION_CPU_CEILING`) | **8 logical CPUs, the boot CPU included** | count | `beyond_production_cpu_ceiling` — claim refused, never started |
+| Scheduler tables (`MAX_CPUS`) | 64 | logical id | `no_free_logical_cpu` |
+| Stack pools (`SECONDARY_STACK_SLOTS`, `DISPATCH_TRAP_STACKS`) | 7 each | logical CPU − 1 | `no_dispatch_trap_stack` (unreachable: pool = ceiling − 1) |
+
+* *The ceiling counts logical CPUs.* `next_logical_cpu` refuses an id ≥ 8, so every topology
+  admits at most 8, whichever hart boots. The boot hart keeps its real hart id as logical CPU 0,
+  and the secondaries are the lowest-numbered eligible harts, ascending.
+* *A refused hart is never started.* `prepare_secondary_handoff` returns no handoff and names it
+  (`RISCV_SECONDARY_CPU_ID_REJECTED hart= slot= reason= started=0`). The start loop skips it
+  before the HSM start. So an excluded hart holds no logical identity, no stack and no work.
+  (AP-SCHED2 started such a hart and let it park with no id.)
+* *The table is wider than the ceiling, on purpose.* With an 8-slot table, the ceiling could bind
+  only when OpenSBI's lottery booted hart 8 or 9, which 21 sampled `-smp 10` development boots
+  never did. At 16 slots the ceiling binds on every boot beyond 8 harts, so its effect is
+  observable live. The stacks moved from hart-id indexing to logical-CPU indexing, which keeps
+  their cost bound to the ceiling, not to the table.
+
+**Tests.** Policy cases:
+
+* contiguous and sparse ids;
+* nonzero boot harts;
+* a boot hart outside the table (hart 17 of 18);
+* every boot hart of a 10-hart board admitting exactly 8, ascending;
+* absent harts claiming nothing;
+* a scheduler smaller than the ceiling naming itself.
+
+Source guard: `ap_sched3::a_refused_hart_is_named_and_never_started`.
+
+**Grading.** The witness grader now accepts `--expect-cpus N` for `N > 8`:
+
+* It re-derives the plan from the boot hart the kernel reports, by the policy's own rule.
+* It grades admission and exclusion in a separate section (`APSW_TOPOLOGY_SEAL`): exactly the
+  planned logical CPUs dispatching, every excluded hart named once with its reason, a
+  ceiling-excluded hart refused at its claim, and no excluded hart started.
+* The supported work is graded on the 8 admitted CPUs.
+
+`TOPOLOGY_ONLY=1` grades that section alone, from a short boot. Development boots at `-smp 10`
+(boot hart 9: harts 7 and 8 named `beyond_production_cpu_ceiling`) and at `-smp 17` (boot hart
+14: harts 7–13 and 15 at the ceiling, hart 16 beyond the table) both graded ok. A `-smp 17`
+QEMU boot is slow: its user workload had not started within 500 s. That is a whole-boot property
+graded apart, not an admission failure.
+
+#### 2. Memory accounting, corrected
+
+AP-SCHED2's report said its dispatch stacks took "16 MiB of RAM in total, 14 MiB more than
+AP-SCHED1". The source reserved the boot hart's 2 MiB trap stack plus **eight** 2 MiB dispatch
+trap stacks: **18 MiB in total**, a **14 MiB increase** over AP-SCHED1's 4 MiB (boot hart + CPU 1).
+
+All static RISC-V stack reservations, before and after the ceiling:
+
+| Stack | AP-SCHED2 | AP-SCHED3 §A |
+|---|---|---|
+| Boot hart: execution (`boot_stack_riscv64`) | 16 MiB | 16 MiB |
+| Boot hart: trap (`RISCV_TRAP_STACK`) | 2 MiB | 2 MiB |
+| Secondaries: dispatch trap, 2 MiB each | 8 → 16 MiB | 7 → 14 MiB |
+| Secondaries: execution (boot/park), 64 KiB each | 8 → 512 KiB | 7 → 448 KiB |
+| Secondaries: park trap, 4 KiB each | 8 → 32 KiB | 7 → 28 KiB |
+| **Trap stacks total** (boot hart + dispatch) | **18 MiB** | **16 MiB** |
+
+Under the ceiling the eighth dispatch stack could never be used, so it is removed: trap stacks are
+16 MiB, +12 MiB over AP-SCHED1.
+
+These are **static reservations** in `.bss`, made on every machine whatever its hart count: a
+`-smp 2` boot reserves all seven secondaries' stacks. Two things remain open work:
+
+* allocation proportional to the admitted CPUs;
+* a measured trap-stack bound. 2 MiB is still the `riscv-trap-stack-debt` correctness size, and
+  it is not lowered speculatively.
+
+#### 3. The two stalled controls, bounded
+
+**The defect.** P's waits were bounded in yields. On a contended CPU 0 a single yield can cost a
+whole quantum, so a broken secondary made P wait far beyond any boot budget. AP-SCHED2's
+missing-secondary-timer and unused-CPU controls therefore failed only as "no dump trailer". The
+console attributed them to CPU 2, but the record did not.
+
+**The repair.**
+
+* *A clock deadline on every wait.* Every bounded wait in P also ends on a deadline, measured on
+  a clock word the kernel publishes at each of CPU 0's timer interrupts (`M_CLOCK`, the global
+  tick's own source). No control breaks CPU 0's timer, so the deadline expires even when the
+  tested secondary's timer is absent. The budget is 6,000 ticks (60 s of guest time), about five
+  times the longest phase of a healthy 8-CPU run (phase A, ~1,200 ticks).
+* *One deadline for phase A,* covering both of its waits. If it passes, P records which CPUs fell
+  short (`P_PRE_TIMEOUT`: below the minimum since the snapshot / no timer preemption at all;
+  `P_W_TIMEOUT`: how many spinners ever ran). Then P stops the spinners, lets them report, and
+  ends with a complete dump.
+* *The grader* names each short CPU from that record.
+* *Unchanged:* the coverage thresholds (`PRE0_MIN`, `PRE_MIN`, rounds) and the host watchdog,
+  which stays as the final backstop.
+
+Development runs, on the pre-freeze revision `faba0c6c`, with a 600 s budget:
+
+| Control | Time | Verdict |
+|---|---|---|
+| missing secondary timer | 313 s | `P_W_TIMEOUT` (7 of 8 spinners ran) and `P_PRE_TIMEOUT`: "phase A's deadline passed and CPU 2 had taken no timer preemption at all" |
+| expected CPU left unused | 401 s | `P_PRE_TIMEOUT`: the same, plus "no spinner ran on CPU 2" and "0 timer preemptions of spinners on CPU 2" |
+
+The qualified results follow below.

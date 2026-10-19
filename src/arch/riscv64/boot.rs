@@ -771,12 +771,17 @@ pub(crate) fn riscv_executing_cpu() -> crate::kernel::scheduler::CpuId {
     if on_trap_stack.0 != crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
         return on_trap_stack;
     }
-    // A released secondary runs its admission on its BOOT stack, before its first trap.
-    for slot in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
-        let top = secondary_stack_top(slot);
+    // A released secondary runs its admission on its BOOT stack, before its first trap. The boot
+    // stacks are indexed by logical CPU (AP-SCHED3 §A), so the CPU is the stack's own index.
+    for cpu in 1..=crate::arch::riscv_hart_admission::SECONDARY_STACK_SLOTS {
+        let Some(top) = secondary_boot_stack_top_for_cpu(cpu) else {
+            continue;
+        };
         if sp < top && sp >= top - RISCV64_SECONDARY_BOOT_STACK_BYTES {
-            let cpu = RISCV64_SECONDARY_CPU_IDS[slot].load(Ordering::Acquire);
-            if cpu != usize::MAX && cpu <= u8::MAX as usize {
+            // Only a CPU some hart actually claimed runs on its stack.
+            let claimed = (0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT)
+                .any(|slot| RISCV64_SECONDARY_CPU_IDS[slot].load(Ordering::Acquire) == cpu);
+            if claimed {
                 return crate::kernel::scheduler::CpuId(cpu as u8);
             }
         }
@@ -3069,10 +3074,14 @@ struct SecondaryBootStack([u8; RISCV64_SECONDARY_BOOT_STACK_BYTES]);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 static mut RISCV64_SECONDARY_HANDOFFS: [SecondaryHartHandoff; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
     [SecondaryHartHandoff::empty(); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+/// AP-SCHED3 §A — the secondaries' EXECUTION stacks, indexed by LOGICAL CPU − 1 (never by hart
+/// id): only a hart that claimed a logical CPU is ever started, and the ceiling bounds those, so
+/// the pool is sized to the ceiling rather than to the hart-id table.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-static mut RISCV64_SECONDARY_STACKS: [SecondaryBootStack; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
+static mut RISCV64_SECONDARY_STACKS: [SecondaryBootStack;
+    crate::arch::riscv_hart_admission::SECONDARY_STACK_SLOTS] =
     [SecondaryBootStack([0; RISCV64_SECONDARY_BOOT_STACK_BYTES]);
-        QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+        crate::arch::riscv_hart_admission::SECONDARY_STACK_SLOTS];
 
 /// AP-SCHED2 §2 / AP-SCHED3 §A — the dispatch-sized trap stacks, one per secondary the production
 /// ceiling admits (index = logical CPU − 1, `riscv_hart_admission::dispatch_stack_index`). A
@@ -3111,9 +3120,13 @@ static RISCV64_SECONDARY_TRAP_STACK_SIZES: [core::sync::atomic::AtomicUsize;
 /// Stage 199D link 7: per-hart TRAP stacks. `sscratch` must point at a stack the trap vector can
 /// swap `sp` with; reusing `RISCV64_SECONDARY_STACKS` would let a trap clobber the very stack the
 /// parked hart is running on, and sharing the boot hart's `RISCV_TRAP_STACK` would corrupt it.
+///
+/// AP-SCHED3 §A: indexed by logical CPU − 1, like the execution stacks.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-static mut RISCV64_SECONDARY_TRAP_STACKS: [SecondaryHartStack; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
-    [SecondaryHartStack([0; RISCV64_SECONDARY_STACK_BYTES]); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+static mut RISCV64_SECONDARY_TRAP_STACKS: [SecondaryHartStack;
+    crate::arch::riscv_hart_admission::SECONDARY_STACK_SLOTS] =
+    [SecondaryHartStack([0; RISCV64_SECONDARY_STACK_BYTES]);
+        crate::arch::riscv_hart_admission::SECONDARY_STACK_SLOTS];
 
 /// Stage 199D link 7: which logical CpuIds have been claimed, so a duplicate mapping fails closed.
 /// Bit N set ⇒ `CpuId(N)` is already owned. Bit 0 is pre-claimed for the boot hart.
@@ -3153,15 +3166,23 @@ static RISCV64_SECONDARY_CPU_IDS: [core::sync::atomic::AtomicUsize;
     QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] = [const { core::sync::atomic::AtomicUsize::new(usize::MAX) };
     QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
 
+/// The park trap-stack top of logical CPU `cpu`, or `None` outside the secondary pool.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn secondary_trap_stack_top(slot: usize) -> usize {
+fn secondary_park_trap_stack_top_for_cpu(cpu: usize) -> Option<usize> {
+    let index = crate::arch::riscv_hart_admission::dispatch_stack_index(
+        cpu,
+        crate::arch::riscv_hart_admission::SECONDARY_STACK_SLOTS,
+    )?;
     let stacks = core::ptr::addr_of_mut!(RISCV64_SECONDARY_TRAP_STACKS) as *mut SecondaryHartStack;
-    (unsafe {
-        stacks
-            .add(slot)
-            .cast::<u8>()
-            .add(RISCV64_SECONDARY_STACK_BYTES) as usize
-    }) & !0xf
+    // SAFETY: `index < SECONDARY_STACK_SLOTS` by the policy; only the address is taken.
+    Some(
+        (unsafe {
+            stacks
+                .add(index)
+                .cast::<u8>()
+                .add(RISCV64_SECONDARY_STACK_BYTES) as usize
+        }) & !0xf,
+    )
 }
 
 /// Validate and CLAIM a logical CpuId for `hart_id`, or fail closed.
@@ -3596,15 +3617,21 @@ fn riscv_secondary_unadmitted(cpu: crate::kernel::scheduler::CpuId, reason: &str
     crate::arch::riscv64::timer::halt_wait_loop()
 }
 
+/// The execution-stack top of logical CPU `cpu`, or `None` outside the secondary pool.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn secondary_stack_top(slot: usize) -> usize {
+fn secondary_boot_stack_top_for_cpu(cpu: usize) -> Option<usize> {
+    let index = crate::arch::riscv_hart_admission::dispatch_stack_index(
+        cpu,
+        crate::arch::riscv_hart_admission::SECONDARY_STACK_SLOTS,
+    )?;
     let stacks = core::ptr::addr_of_mut!(RISCV64_SECONDARY_STACKS) as *mut SecondaryBootStack;
-    unsafe {
+    // SAFETY: `index < SECONDARY_STACK_SLOTS` by the policy; only the address is taken.
+    Some(unsafe {
         stacks
-            .add(slot)
+            .add(index)
             .cast::<u8>()
             .add(RISCV64_SECONDARY_BOOT_STACK_BYTES) as usize
-    }
+    })
 }
 
 /// The trap-stack region `(top, size)` a claimed logical CPU gets. AP-SCHED2 §2: every logical
@@ -3628,10 +3655,10 @@ fn secondary_trap_stack_for(slot: usize, cpu_id: usize) -> (usize, usize) {
                 slot,
                 policy::Exclusion::NoDispatchStack.marker()
             );
-            (
-                secondary_trap_stack_top(slot),
-                RISCV64_SECONDARY_STACK_BYTES,
-            )
+            match secondary_park_trap_stack_top_for_cpu(cpu_id) {
+                Some(top) => (top, RISCV64_SECONDARY_STACK_BYTES),
+                None => (0, 0),
+            }
         }
     }
 }
@@ -3661,6 +3688,17 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> Option<usize> {
         return None;
     }
     let cpu_id = *claim.as_ref().unwrap_or(&usize::MAX);
+    // The execution stack is the claimed logical CPU's own (AP-SCHED3 §A). A claim always lies
+    // inside the pool (the ceiling bounds both); one that did not would be refused here, by name.
+    let Some(boot_stack_top) = secondary_boot_stack_top_for_cpu(cpu_id) else {
+        early_marker!(
+            "RISCV_SECONDARY_CPU_ID_REJECTED hart={} slot={} reason={} started=0",
+            hart_id,
+            slot,
+            crate::arch::riscv_hart_admission::Exclusion::NoDispatchStack.marker()
+        );
+        return None;
+    };
     let (trap_stack_top, trap_stack_size) = if cpu_id == usize::MAX {
         (0, 0)
     } else {
@@ -3680,7 +3718,7 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> Option<usize> {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).hart_id), hart_id);
         core::ptr::write_volatile(
             core::ptr::addr_of_mut!((*handoff).stack_top),
-            secondary_stack_top(slot),
+            boot_stack_top,
         );
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).cpu_id), cpu_id);
         core::ptr::write_volatile(

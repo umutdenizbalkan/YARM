@@ -55,7 +55,7 @@ IPC_ROUNDS = 4
 FORK_ROUNDS = 4
 WITNESS_CPUS = 8
 PRODUCTION_CPU_CEILING = 8
-HANDOFF_SLOTS = 8
+HANDOFF_SLOTS = 16
 TIMED_OUT = 9
 FAIL_STEPS = {
     "P_NO_AP", "P_PRE_TIMEOUT", "P_A_TIMEOUT", "P_B_TIMEOUT", "P_NO_IDLE", "P_NO_ACK",
@@ -545,7 +545,7 @@ def self_test():
     assert any("5 of 6 spinners running" in f for f in got), got
     cases_run += 1
     # The topology section: -smp 10, the boot hart inside and outside the table.
-    for boot, rejected in ((0, None), (9, 7), (8, 7), (3, None)):
+    for boot, rejected in ((0, 8), (9, 7), (8, 7), (3, 8)):
         plan = policy_plan(10, boot)
         cpus = sorted(c for c in plan.values() if isinstance(c, int))
         excl = {h: r for h, r in plan.items() if isinstance(r, str)}
@@ -573,8 +573,10 @@ def self_test():
             cases_run += 3
     full = _fixture(8)
     con = ("RISCV_LOGICAL_CPUS present=0xff count=8 excluded_harts=0x300 hart_bitmap=0x3ff boot_hart=0\n"
-           "RISCV_HART_EXCLUDED hart=8 reason=beyond_hsm_handoff_table dispatch=0\n"
-           "RISCV_HART_EXCLUDED hart=9 reason=beyond_hsm_handoff_table dispatch=0\n"
+           "RISCV_HART_EXCLUDED hart=8 reason=beyond_production_cpu_ceiling dispatch=0\n"
+           "RISCV_HART_EXCLUDED hart=9 reason=beyond_production_cpu_ceiling dispatch=0\n"
+           "RISCV_SECONDARY_CPU_ID_REJECTED hart=8 slot=8 reason=beyond_production_cpu_ceiling started=0\n"
+           "RISCV_SECONDARY_CPU_ID_REJECTED hart=9 slot=9 reason=beyond_production_cpu_ceiling started=0\n"
            + "\n".join(f"RISCV_AP_SCHED_ADMITTED hart={c} cpu={c} mode=production" for c in range(1, 8)) + "\n"
            "RISCV_AP_RELEASE_PLAN trap_ready=0xff dispatch_capable=0xff released=0xfe knob=0\n"
            + "\n".join(f"RISCV_AP_STATE cpu={c} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none"

@@ -8,10 +8,14 @@
 //!
 //! # The limits, and where each comes from
 //!
-//! * [`HANDOFF_SLOTS`] — the secondary handoff, boot-stack and park-stack tables are indexed by
-//!   hart id (slot = hart id), and the boot hart starts secondaries through SBI HSM for ids below
-//!   it. A hart with a larger id is never started; it is reported excluded
-//!   ([`Exclusion::BeyondHandoffTable`]), never silently ignored.
+//! * [`HANDOFF_SLOTS`] — the secondary handoff table (the handoff record, the claimed logical id
+//!   and the published trap-stack region) is indexed by hart id (slot = hart id), and the boot
+//!   hart probes and starts secondaries through SBI HSM for ids below it: 16. A hart with a larger
+//!   id is never started; it is reported excluded ([`Exclusion::BeyondHandoffTable`]), never
+//!   silently ignored. The table is deliberately WIDER than the ceiling, so the two limits are
+//!   distinct: every stack is indexed by logical CPU and sized to the ceiling
+//!   ([`SECONDARY_STACK_SLOTS`]), and a hart inside the table but beyond the ceiling costs one
+//!   handoff record, nothing more.
 //! * [`PRODUCTION_CPU_CEILING`] — the total number of logical CPUs production admits, the boot
 //!   CPU included: 8. It is a qualification bound, not a storage one — it is the largest
 //!   topology the scheduling witness covers and qualification ran — and it is applied to the
@@ -24,7 +28,8 @@
 //!   bound). One such stack per secondary the ceiling admits: `PRODUCTION_CPU_CEILING - 1` = 7,
 //!   14 MiB of `.bss`, reserved statically whatever the machine's hart count. (AP-SCHED2 reserved
 //!   8, one per handoff slot, because the boot hart may lie outside the table; under the ceiling
-//!   the 8th could never be used.) A logical CPU without one would be
+//!   the 8th could never be used.) Each secondary also has a 64 KiB execution stack and a 4 KiB
+//!   park trap stack, likewise one per secondary the ceiling admits. A logical CPU without one would be
 //!   [`Exclusion::NoDispatchStack`]: it exists and parks, but is never released to dispatch.
 //! * `max_cpus` — the scheduler's per-CPU tables and 64-bit masks (logical identity capacity,
 //!   distinct from the ceiling).
@@ -38,13 +43,17 @@
 //! numbering, and [`logical_present_bitmap`] is that numbering — not the hart-id bitmap.
 
 /// Secondary handoff table size (slot = hart id).
-pub const HANDOFF_SLOTS: usize = 8;
+pub const HANDOFF_SLOTS: usize = 16;
 
 /// The total number of logical CPUs production admits, the boot CPU included.
 pub const PRODUCTION_CPU_CEILING: usize = 8;
 
 /// Dispatch-sized trap stacks: one per secondary the ceiling admits. The boot CPU keeps its own.
 pub const DISPATCH_TRAP_STACKS: usize = PRODUCTION_CPU_CEILING - 1;
+
+/// Every per-secondary stack pool (execution, park trap, dispatch trap) is indexed by logical
+/// CPU − 1 and has one slot per secondary the ceiling admits.
+pub const SECONDARY_STACK_SLOTS: usize = PRODUCTION_CPU_CEILING - 1;
 
 /// Why a hart, or a logical CPU, takes no part in dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,22 +217,30 @@ mod tests {
 
     #[test]
     fn harts_beyond_the_handoff_table_are_excluded_by_name() {
-        // A 10-hart board: ids 8 and 9 have no slot.
-        let harts = (1u64 << 10) - 1;
+        // An 18-hart board: ids 16 and 17 have no slot; 8..=15 have one but the ceiling is full.
+        let harts = (1u64 << 18) - 1;
         let p = plan(harts, 0, 64);
         assert_eq!(p[7], Ok(7));
-        assert_eq!(p[8], Err(Some(Exclusion::BeyondHandoffTable)));
-        assert_eq!(p[9], Err(Some(Exclusion::BeyondHandoffTable)));
-        assert_eq!(excluded_harts(harts, 0, 64), 0b11_0000_0000);
+        for hart in 8..16 {
+            assert_eq!(
+                p[hart],
+                Err(Some(Exclusion::ProductionCeiling)),
+                "hart {hart}"
+            );
+        }
+        assert_eq!(p[16], Err(Some(Exclusion::BeyondHandoffTable)));
+        assert_eq!(p[17], Err(Some(Exclusion::BeyondHandoffTable)));
+        assert_eq!(excluded_harts(harts, 0, 64), harts & !0xff);
         assert_eq!(logical_present_bitmap(harts, 0, 64), 0xff);
         assert_eq!(
             Exclusion::BeyondHandoffTable.marker(),
             "beyond_hsm_handoff_table"
         );
         assert_eq!(
-            admissible_secondary_hart(8, 0),
+            admissible_secondary_hart(16, 0),
             Err(Exclusion::BeyondHandoffTable)
         );
+        assert_eq!(admissible_secondary_hart(15, 0), Ok(()));
     }
 
     #[test]
@@ -240,6 +257,11 @@ mod tests {
     #[test]
     fn every_admissible_secondary_has_a_dispatch_stack_and_no_more() {
         assert_eq!(DISPATCH_TRAP_STACKS, PRODUCTION_CPU_CEILING - 1);
+        assert_eq!(SECONDARY_STACK_SLOTS, PRODUCTION_CPU_CEILING - 1);
+        assert!(
+            HANDOFF_SLOTS > PRODUCTION_CPU_CEILING,
+            "the hart table and the ceiling are distinct limits"
+        );
         assert!(dispatch_capable(0, DISPATCH_TRAP_STACKS));
         for cpu in 1..=DISPATCH_TRAP_STACKS {
             assert!(dispatch_capable(cpu, DISPATCH_TRAP_STACKS));
@@ -260,23 +282,34 @@ mod tests {
 
     #[test]
     fn a_boot_hart_beyond_the_table_still_gives_eight_cpus() {
-        // -smp 10 with boot hart 9: harts 0..=6 take logical CPUs 1..=7; hart 7 is in the table
-        // but the ceiling is full; hart 8 has no slot. Eight CPUs, as with any other boot hart.
-        let p = plan(0x3ff, 9, 64);
-        assert_eq!(p[9], Ok(0));
+        // -smp 18 with boot hart 17: harts 0..=6 take logical CPUs 1..=7; harts 7..=15 are in
+        // the table but the ceiling is full; hart 16 has no slot. Eight CPUs, as with any other
+        // boot hart, and the boot hart keeps its real id.
+        let harts = (1u64 << 18) - 1;
+        let p = plan(harts, 17, 64);
+        assert_eq!(p[17], Ok(0));
         for hart in 0..7 {
             assert_eq!(p[hart], Ok(hart + 1));
             assert!(dispatch_capable(hart + 1, DISPATCH_TRAP_STACKS));
         }
+        for hart in 7..16 {
+            assert_eq!(
+                p[hart],
+                Err(Some(Exclusion::ProductionCeiling)),
+                "hart {hart}"
+            );
+        }
+        assert_eq!(p[16], Err(Some(Exclusion::BeyondHandoffTable)));
+        assert_eq!(logical_present_bitmap(harts, 17, 64), 0xff);
+        assert_eq!(excluded_harts(harts, 17, 64), harts & !0x7f & !(1 << 17));
+        // -smp 10 with boot hart 9: every other hart is a table secondary; the ceiling stops at
+        // hart 6, by name, whatever hart booted.
+        let p = plan(0x3ff, 9, 64);
+        assert_eq!(p[9], Ok(0));
+        assert_eq!(p[6], Ok(7));
         assert_eq!(p[7], Err(Some(Exclusion::ProductionCeiling)));
-        assert_eq!(p[8], Err(Some(Exclusion::BeyondHandoffTable)));
+        assert_eq!(p[8], Err(Some(Exclusion::ProductionCeiling)));
         assert_eq!(logical_present_bitmap(0x3ff, 9, 64), 0xff);
-        assert_eq!(excluded_harts(0x3ff, 9, 64), (1 << 7) | (1 << 8));
-        // -smp 9 with boot hart 8: the whole table is secondaries; the ceiling stops at hart 6.
-        let p = plan(0x1ff, 8, 64);
-        assert_eq!(p[8], Ok(0));
-        assert_eq!(p[7], Err(Some(Exclusion::ProductionCeiling)));
-        assert_eq!(logical_present_bitmap(0x1ff, 8, 64), 0xff);
     }
 
     #[test]
@@ -293,8 +326,9 @@ mod tests {
             );
             let admitted: alloc::vec::Vec<usize> =
                 (0..10).filter(|&h| h != boot && p[h].is_ok()).collect();
-            let mut eligible: alloc::vec::Vec<usize> =
-                (0..HANDOFF_SLOTS).filter(|&h| h != boot).collect();
+            let mut eligible: alloc::vec::Vec<usize> = (0..10)
+                .filter(|&h| h < HANDOFF_SLOTS && h != boot)
+                .collect();
             eligible.truncate(PRODUCTION_CPU_CEILING - 1);
             assert_eq!(admitted, eligible, "boot hart {boot}");
             for h in 0..10 {
@@ -308,18 +342,19 @@ mod tests {
                 }
             }
         }
-        // Sparse ids: harts 1, 3, 4, 5, 6, 7 and 12, 40 present, boot hart 40 (outside the
-        // table). Six table harts are secondaries: logical 1..=6, seven CPUs, nobody excluded by
-        // the ceiling; 12 is beyond the table.
-        let harts = (1u64 << 1) | (0b1111_1000) | (1 << 12) | (1 << 40);
+        // Sparse ids: harts 1, 3..=7, 12, 14, 20 and 40 present, boot hart 40 (outside the
+        // table). Ascending: 1, 3, 4, 5, 6, 7, 12 take logical 1..=7; 14 meets the ceiling; 20 is
+        // beyond the table.
+        let harts = (1u64 << 1) | 0b1111_1000 | (1 << 12) | (1 << 14) | (1 << 20) | (1 << 40);
         let p = plan(harts, 40, 64);
         assert_eq!(p[40], Ok(0));
         assert_eq!(
-            (p[1], p[3], p[4], p[5], p[6], p[7]),
-            (Ok(1), Ok(2), Ok(3), Ok(4), Ok(5), Ok(6))
+            (p[1], p[3], p[4], p[5], p[6], p[7], p[12]),
+            (Ok(1), Ok(2), Ok(3), Ok(4), Ok(5), Ok(6), Ok(7))
         );
-        assert_eq!(p[12], Err(Some(Exclusion::BeyondHandoffTable)));
-        assert_eq!(logical_present_bitmap(harts, 40, 64), 0x7f);
+        assert_eq!(p[14], Err(Some(Exclusion::ProductionCeiling)));
+        assert_eq!(p[20], Err(Some(Exclusion::BeyondHandoffTable)));
+        assert_eq!(logical_present_bitmap(harts, 40, 64), 0xff);
         // Absent harts claim nothing: only the present ones are numbered.
         assert_eq!(plan(0b1000_0001, 0, 64)[7], Ok(1));
         assert_eq!(plan(0b1000_0001, 0, 64)[3], Err(None));

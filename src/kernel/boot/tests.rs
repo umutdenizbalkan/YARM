@@ -118262,8 +118262,8 @@ mod stage199d_riscv_secondary_trap_ready {
             "the one frame convention: the vector swaps sp with sscratch"
         );
         assert!(
-            BOOT.contains("fn secondary_trap_stack_top"),
-            "secondaries get their own trap stack"
+            BOOT.contains("fn secondary_park_trap_stack_top_for_cpu"),
+            "secondaries get their own trap stack (AP-SCHED3 §A: indexed by logical CPU)"
         );
         assert!(
             BOOT.contains("RISCV64_SECONDARY_TRAP_STACKS"),
