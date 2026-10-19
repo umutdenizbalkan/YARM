@@ -3078,8 +3078,8 @@ static mut RISCV64_SECONDARY_STACKS: [SecondaryBootStack; QEMU_VIRT_HSM_SECONDAR
 /// − 1, `riscv_hart_admission::dispatch_stack_index`). A dispatching CPU runs the whole syscall,
 /// fault and timer settlement on its trap stack exactly as the boot hart does, so each gets the
 /// boot hart's size: the `riscv-trap-stack-debt` note on `RISCV_TRAP_STACK_SIZE` is why that is a
-/// correctness size and not a measured bound, and no stack is shared. Cost: 2 MiB each, 14 MiB of
-/// `.bss` for the 8-slot table (RAM only, not image size); `stage_riscv64_ram_map` refuses to boot
+/// correctness size and not a measured bound, and no stack is shared. Cost: 2 MiB each, 16 MiB of
+/// `.bss` for the 8-slot table (8, because the boot hart may lie outside the table) (RAM only, not image size); `stage_riscv64_ram_map` refuses to boot
 /// if the image's end reaches the initrd QEMU places above it.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 static mut RISCV64_DISPATCH_TRAP_STACKS: [RiscvTrapStack;

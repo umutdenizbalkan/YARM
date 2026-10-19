@@ -15,8 +15,10 @@
 //! * [`DISPATCH_TRAP_STACKS`] — a CPU that dispatches runs the whole syscall, fault and timer
 //!   settlement on its trap stack, so it needs the boot hart's trap-stack size (2 MiB; the
 //!   `riscv-trap-stack-debt` note on it says why that is a correctness size, not a measured
-//!   bound). One such stack per possible secondary (`HANDOFF_SLOTS - 1`): 14 MiB of `.bss` on
-//!   the 8-slot table. A logical CPU without one would be [`Exclusion::NoDispatchStack`]: it
+//!   bound). One such stack per possible secondary. That is `HANDOFF_SLOTS`, not one fewer: the
+//!   boot hart may itself lie outside the table (QEMU's OpenSBI picks the boot hart by lottery, so
+//!   at `-smp 10` it can be hart 9), and then every one of the 8 slots is a secondary. 16 MiB of
+//!   `.bss` on the 8-slot table. A logical CPU without one would be [`Exclusion::NoDispatchStack`]: it
 //!   exists and parks, but is never released to dispatch.
 //! * `max_cpus` — the scheduler's per-CPU tables and 64-bit masks.
 //!
@@ -30,8 +32,9 @@
 /// Secondary handoff table size (slot = hart id).
 pub const HANDOFF_SLOTS: usize = 8;
 
-/// Dispatch-sized trap stacks: one per possible secondary.
-pub const DISPATCH_TRAP_STACKS: usize = HANDOFF_SLOTS - 1;
+/// Dispatch-sized trap stacks: one per possible secondary, including the case where the boot hart
+/// lies outside the handoff table and all `HANDOFF_SLOTS` are secondaries.
+pub const DISPATCH_TRAP_STACKS: usize = HANDOFF_SLOTS;
 
 /// Why a hart, or a logical CPU, takes no part in dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,7 +219,7 @@ mod tests {
 
     #[test]
     fn every_secondary_slot_has_a_dispatch_stack_and_no_more() {
-        assert_eq!(DISPATCH_TRAP_STACKS, HANDOFF_SLOTS - 1);
+        assert_eq!(DISPATCH_TRAP_STACKS, HANDOFF_SLOTS);
         assert!(dispatch_capable(0, DISPATCH_TRAP_STACKS));
         for cpu in 1..=DISPATCH_TRAP_STACKS {
             assert!(dispatch_capable(cpu, DISPATCH_TRAP_STACKS));
@@ -233,6 +236,20 @@ mod tests {
         // A smaller pool would leave the excess logical CPUs parked, by name.
         assert!(!dispatch_capable(3, 2));
         assert_eq!(dispatch_stack_index(3, 2), None);
+    }
+
+    #[test]
+    fn a_boot_hart_beyond_the_table_leaves_every_slot_a_dispatching_secondary() {
+        // -smp 10 with boot hart 9: harts 0..=7 take logical CPUs 1..=8, hart 8 has no slot.
+        let p = plan(0x3ff, 9, 64);
+        assert_eq!(p[9], Ok(0));
+        for hart in 0..8 {
+            assert_eq!(p[hart], Ok(hart + 1));
+            assert!(dispatch_capable(hart + 1, DISPATCH_TRAP_STACKS));
+        }
+        assert_eq!(p[8], Err(Some(Exclusion::BeyondHandoffTable)));
+        assert_eq!(logical_present_bitmap(0x3ff, 9, 64), 0x1ff);
+        assert_eq!(excluded_harts(0x3ff, 9, 64), 1 << 8);
     }
 
     #[test]

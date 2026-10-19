@@ -45,6 +45,7 @@ PRE_MIN = 4
 WAKE_ROUNDS = 3
 IPC_ROUNDS = 4
 FORK_ROUNDS = 4
+WITNESS_CPUS = 8
 TIMED_OUT = 9
 FAIL_STEPS = {
     "P_NO_AP", "P_PRE_TIMEOUT", "P_A_TIMEOUT", "P_B_TIMEOUT", "P_NO_IDLE", "P_NO_ACK",
@@ -86,6 +87,8 @@ def grade(text, ncpus):
     expected = set(range(1, ncpus))
     if not expected:
         return ["admission: the witness needs at least one secondary (-smp >= 2)"]
+    if ncpus > WITNESS_CPUS:
+        return [f"admission: the witness's mailbox and worker-stack layout covers at most {WITNESS_CPUS} CPUs"]
     recs, end, conflicts = parse(text)
     if conflicts:
         fails.append(f"progress: two verified copies disagree for stamps {conflicts[:5]}")
@@ -426,6 +429,7 @@ def self_test():
         "failure step": (_render(base[:-1] + [("USER", 0, 9600, "P_NO_ACK", 3), base[-1]]), 3),
         "no end": (_render(base[:-1]), 3),
         "a one-CPU boot": (_render(base), 1),
+        "a topology beyond the witness layout": (_render(base), 9),
         "the mailbox split copy-on-write": (_render(base, extra="APSW_PROVISIONED p_tid=9600 asid=4 image=1\n"
                                                      "VM_COW_SPLIT_COMMITTED cpu=0 tid=9600 asid=4 va=0x20070000 old_pa=0x1 new_pa=0x2 acked=1"), 3),
     }

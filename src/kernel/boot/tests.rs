@@ -118286,20 +118286,26 @@ mod stage199d_riscv_secondary_trap_ready {
             .expect("the claim fn");
         // The scheduler bound now constrains the ALLOCATED logical id, not the hart id — the
         // two are not the same, since the boot hart may be any hart and always owns logical 0.
+        // AP-SCHED2: the bound lives in the one hart-admission policy the claim calls.
         assert!(
-            claim.contains("for id in 1..crate::kernel::scheduler::MAX_CPUS.min(64)"),
+            claim.contains("policy::next_logical_cpu(seen, crate::kernel::scheduler::MAX_CPUS)?")
+                && include_str!("../../arch/riscv_hart_admission.rs")
+                    .contains("(1..max_cpus.min(64))"),
             "the allocated logical id must be bounded by the scheduler's MAX_CPUS"
         );
+        // AP-SCHED2: the refusals are the policy's, each a named exclusion the claim returns.
+        let policy = include_str!("../../arch/riscv_hart_admission.rs");
         assert!(
-            claim.contains("let id = candidate?;"),
+            policy.contains(".ok_or(Exclusion::NoLogicalCpu)"),
             "exhausting the logical CPU space must fail closed"
         );
         assert!(
-            claim.contains("hart_id >= QEMU_VIRT_HSM_SECONDARY_HART_LIMIT"),
+            claim.contains("policy::admissible_secondary_hart(hart_id, boot_hart_id())?;")
+                && policy.contains("if hart >= HANDOFF_SLOTS || hart >= 64 {\n        return Err(Exclusion::BeyondHandoffTable);"),
             "a hart outside the handoff table must be refused"
         );
         assert!(
-            claim.contains("hart_id == boot_hart_id()"),
+            policy.contains("if hart == boot_hart {\n        return Err(Exclusion::NoLogicalCpu);"),
             "the boot hart's own id must be refused"
         );
         assert!(
@@ -118310,7 +118316,8 @@ mod stage199d_riscv_secondary_trap_ready {
         // from the free set and claimed with a compare-and-swap, so two harts cannot be handed
         // the same logical CPU even under a concurrent claim.
         assert!(
-            claim.contains("if seen & (1u64 << id) == 0 {"),
+            include_str!("../../arch/riscv_hart_admission.rs")
+                .contains(".find(|&id| claimed & (1u64 << id) == 0)"),
             "the id must be chosen from the FREE set"
         );
         assert!(
@@ -118639,7 +118646,9 @@ mod stage199d_riscv_link2_wake_only_online {
             .nth(1)
             .expect("the claim fn");
         assert!(
-            claim.contains("for id in 1..crate::kernel::scheduler::MAX_CPUS.min(64)"),
+            claim.contains("policy::next_logical_cpu(seen, crate::kernel::scheduler::MAX_CPUS)?")
+                && include_str!("../../arch/riscv_hart_admission.rs")
+                    .contains("(1..max_cpus.min(64))"),
             "secondaries are allocated the lowest free id at or above 1"
         );
         assert!(
@@ -172730,15 +172739,17 @@ mod u9yield2_family_edge {
         );
         let rv = code(RV_BOOT);
         assert_eq!(rv.matches("admit_ap_pinned_dispatch_split(cpu)").count(), 1);
-        // AP-SCHED1: without the knob RISC-V releases logical CPU 1 alone, which admits itself
-        // through the PRODUCTION transition (`admit_dispatch`, one call site) — after its timer
-        // and its IPI publication; with the knob, the pinned diagnostic admission above.
+        // AP-SCHED2: without the knob RISC-V releases every dispatch-capable trap-ready
+        // secondary, each admitting itself through the PRODUCTION transition (`admit_dispatch`,
+        // one call site) — after its timer, its IPI publication and its readiness check; with the
+        // knob, the pinned diagnostic admission above.
         let release = code(RV_IPI);
         let rel = release
             .find("pub fn release_secondaries_at_boot_borrow_end(")
             .expect("the RISC-V release");
         assert!(
-            release[rel..].contains("let released = release_set(trap_ready_cpus, diagnostic);"),
+            release[rel..]
+                .contains("let released = release_set(trap_ready_cpus, capable, diagnostic);"),
             "riscv64: the release names its CPUs"
         );
         assert_eq!(runtime.matches("admit_dispatch(cpu)").count(), 1);
@@ -194919,7 +194930,7 @@ pub(crate) fn assert_riscv_smp3_wake_scope() {
         .next()
         .expect("its body");
     let set = release
-        .find("let released = release_set(trap_ready_cpus, diagnostic);")
+        .find("let released = release_set(trap_ready_cpus, capable, diagnostic);")
         .expect("the release set");
     let empty = release
         .find("if released == 0 {\n        return 0;")
@@ -194931,8 +194942,14 @@ pub(crate) fn assert_riscv_smp3_wake_scope() {
         .find("RELEASED.store(released, Ordering::Release);")
         .expect("the released bits");
     assert!(set < empty && empty < bits && bits < flag);
-    assert!(IPI.contains("pub const PRODUCTION_DISPATCH_CPUS: u64 = 1 << 1;"));
-    assert!(IPI.contains("        secondaries & PRODUCTION_DISPATCH_CPUS\n"));
+    // AP-SCHED2: the production set is the one hart-admission policy's — every trap-ready
+    // secondary holding a dispatch-sized trap stack — no longer a fixed CPU 1.
+    assert!(!IPI.contains("PRODUCTION_DISPATCH_CPUS"));
+    assert!(
+        release
+            .contains("let capable = crate::arch::riscv64::boot::riscv_dispatch_capable_bitmap();")
+    );
+    assert!(IPI.contains("crate::arch::riscv_hart_admission::release_set("));
     let park = IPI
         .split("pub fn take_park_release(")
         .nth(1)
@@ -201214,6 +201231,92 @@ mod ap_sched2 {
                     "CPU {c} after an enqueue to {cpu:?}"
                 );
             }
+        }
+    }
+
+    /// **Enqueue racing idle, on every CPU at once, loses nothing.** Real threads stand in for
+    /// the harts. CPU 0 enqueues fresh tasks homed on CPUs 1..=3 through the production owner
+    /// (`enqueue_task_split`, which commits and THEN notifies), with jitter between commits. Each
+    /// target runs the idle protocol in the production order: consume its pending notification,
+    /// look at its own queue, and only if that is empty wait for the next notification. A task
+    /// committed after the look always brings a notification the wait sees; one committed before
+    /// it is found by the look. A wait that outlives its bound with work queued would be a lost
+    /// wake. The race runs on all three targets concurrently, so no CPU's notification is
+    /// mistaken for another's.
+    #[test]
+    fn enqueue_racing_idle_on_every_cpu_loses_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        use std::time::{Duration, Instant};
+        const ROUNDS: u64 = 40;
+        let k = with_wake_only_aps();
+        for cpu in CPUS {
+            k.admit_ap_dispatch_split(cpu).expect("admit");
+        }
+        let tid_of = |i: usize, r: u64| 3000 + r * 3 + i as u64;
+        k.with(|s| {
+            for (i, cpu) in CPUS.into_iter().enumerate() {
+                for r in 0..ROUNDS {
+                    s.register_task(tid_of(i, r)).expect("task");
+                    s.with_tcb_mut(tid_of(i, r), |tcb| tcb.cpu_affinity = Some(cpu))
+                        .expect("tcb");
+                }
+            }
+        });
+        let lost = AtomicUsize::new(0);
+        let ran: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+        std::thread::scope(|scope| {
+            for (i, cpu) in CPUS.into_iter().enumerate() {
+                let (k, lost, ran) = (&k, &lost, &ran);
+                scope.spawn(move || {
+                    while ran[i].load(O::Acquire) < ROUNDS as usize {
+                        // 1. consume the pending notification (clear SSIP, drain the mailbox);
+                        let seen = crate::arch::hal::enqueues_notified(cpu);
+                        // 2. look at this CPU's own queue;
+                        let next = k.with_scheduler_split_mut(|sched| {
+                            let s = crate::kernel::boot::kernel_mut(&mut sched.scheduler);
+                            let next = s.dispatch_next_on(cpu);
+                            if next.is_some() {
+                                s.block_current_on(cpu);
+                            }
+                            next
+                        });
+                        if next.is_some() {
+                            ran[i].fetch_add(1, O::AcqRel);
+                            continue;
+                        }
+                        // 3. empty: wait for the next notification, bounded.
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while crate::arch::hal::enqueues_notified(cpu) == seen {
+                            if Instant::now() > deadline {
+                                if k.runnable_count_on_cpu_split_read(cpu) > 0 {
+                                    lost.fetch_add(1, O::AcqRel);
+                                }
+                                return;
+                            }
+                            std::hint::spin_loop();
+                        }
+                    }
+                });
+            }
+            let k = &k;
+            scope.spawn(move || {
+                for r in 0..ROUNDS {
+                    for (i, cpu) in CPUS.into_iter().enumerate() {
+                        for _ in 0..((r as usize * 7 + i * 5) % 13) * 40 {
+                            std::hint::spin_loop();
+                        }
+                        assert_eq!(k.enqueue_task_split(CPU0, tid_of(i, r)), Ok(cpu));
+                    }
+                }
+            });
+        });
+        assert_eq!(lost.load(O::Acquire), 0, "no wake was lost");
+        for (i, cpu) in CPUS.into_iter().enumerate() {
+            assert_eq!(
+                ran[i].load(O::Acquire),
+                ROUNDS as usize,
+                "{cpu:?} ran every task homed on it"
+            );
         }
     }
 
