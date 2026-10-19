@@ -29138,3 +29138,55 @@ passed during the kernel's long, console-bound path to idle was already pending.
   * the post-disable byte is never delivered;
   * timer and service progress continue after the disable;
   * isolation and nothing fatal.
+
+#### Controls (candidate `2f596dd4`, each a scratch patch graded by the unmodified smoke script)
+
+| Control | Patch | Verdict |
+|---|---|---|
+| missing idle coverage | idle items never open at the idle window; they open on a return into the receiver | fail: all eight arrivals user-origin (`idle_origin=0`); every odd item `origin=user gate=user` outside the idle wait |
+| missing user coverage | the receiver announces a user item with an ordinary log line, outside its register-checked block | fail: every even item `held=0 sepc_in_block=0`; credited `idle=4 user=0` (delivery itself intact) |
+| incorrect delivery | the fixture records each drained byte XOR 1 | fail: `data_ok=0`; no item received with its byte |
+| missing completion | the completion owner skips the third completion write | fail: `received=3`; the source is never re-signalled |
+
+A first version of the missing-user-coverage control only cut the receiver's hold bound to one
+loop iteration, and it passed. That version is kept as a record, but it proved nothing about the
+grader. The host injects while the kernel is still printing the READY line, so the byte is already
+present when that `ecall` returns. The interrupt was therefore taken on the first instruction of
+the checked loop, inside the window, before a one-iteration bound could expire.
+
+#### Qualification
+
+**Candidate `2f596dd4` (tree `6791d473`); base `e9c8173c`.** Every gate ran once in a fresh
+worktree. The live runs are bound to commit, features and booted-artifact hashes. The raw
+summaries are kept in the session's qualification directories.
+
+* *Hosted and source:*
+  * focused (the three ports' UART-witness scope suites): 36/36;
+  * full hosted suite: 6,109 passed, 2 ignored;
+  * integration: 308/308 in 32 suites;
+  * census guard 17/17, with every textual production count identical to the base;
+  * `cargo fmt --check`: clean.
+* *Warnings and images against a fresh base build:*
+  * default kernels: 177 / 205 / 188, identical by name and location;
+  * x86_64 and AArch64 default images: byte-identical;
+  * RISC-V default image: `.text` and `.data` byte-identical. In `.rodata` seven 32-bit words
+    differ, each by exactly +13. They are panic-location line numbers below the 13 feature-gated
+    lines added to `riscv64/boot.rs`;
+  * every witness-feature kernel built (`riscv-uart-irq-witness`, `riscv64-smp3-witness`,
+    `riscv64-apsched-witness`, the AArch64 PL011 and overtaken witnesses, the x86_64 UART and
+    overtaken witnesses): identical warnings.
+* *Strict cores:* x86_64 (timer-contract-witness profile), AArch64 and RISC-V — passed.
+* *The repaired witness, a fixed sample of five boots on one build:* the first boot built the
+  artifacts and the other four booted the same ones; three on an idle host, then two with four
+  busy loops on the host's four CPUs. All five were `items=8 claims=8 completions=8 idle=4
+  user=4 idle_in_wait=4 user_in_spin=4 gate_opens=8 result=ok`.
+* *The other ports' witnesses* (shared receiver and driver): x86_64 `X86_UART_IRQ_WITNESS_SEAL …
+  result=ok` and AArch64 `PL011_IRQ_WITNESS_SEAL … result=ok`.
+* *Before the freeze,* on the same fixture: 11 of 11 green — one boot, then six idle-host and four
+  loaded-host boots of one image. An earlier version of the fixture opened the gate without the
+  `sip` check and printed before the wait. It failed 2 of 8 boots, which is how both guest-side
+  effects above were found.
+
+**Open, and not claimed.** This repairs the witness's synchronization. It changes no production
+path. QEMU's slow delivery to a halted hart and its non-AIA interrupt selection order remain facts
+of the platform, now recorded.
