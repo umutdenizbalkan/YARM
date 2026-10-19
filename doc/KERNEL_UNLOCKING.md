@@ -29939,3 +29939,75 @@ the check.
 * No migration: a task keeps its first CPU (or its affinity).
 
 The qualification of the frozen §B–§E candidate follows below.
+
+### §E — qualification
+
+**The first freeze failed one gate.** `f20b50b1` passed every gate but the RISC-V LOCK1
+regression: `SMP3_VERDICT result=fail reason=ipi_merge_inconsistent at=51`. It is a checker race,
+not a kernel defect. CPU 0 published a reschedule IPI to CPU 1 twice for one call (the NR 6 direct
+drain's own send and the enqueue notification). CPU 1's `ipi::take_arrival` swapped its mailbox
+between the two, so the second publication found the bit clear and was fresh. But
+`take_arrival` pushes its arrival record after the swap, and that record was stamped after the
+second publication. Both publications were consumed, each by its own arrival (stamps 53 and 55).
+The SMP3 pairing check (in-kernel `smp3_record`, and the Python grader) assumed one pending
+publication per source/target pair. It now accepts one fresh publication queued behind a pending
+one; every publication still needs its own later arrival, and a third fresh one still fails
+(hosted: `a_publication_stamped_between_a_swap_and_its_record_is_consumed_by_the_next_arrival`).
+The failed run and the `f20b50b1` qualification are kept.
+
+**The candidate**: `727972bbe87662e1e182e60b708dca87b6ebed3f` (tree `be13cd78…`), descending from
+the delivered §A head `12c687d3`. Its qualification is the `f20b50b1` run, plus a re-freeze run
+that re-ran the suites and proved byte identity for every image `f20b50b1`'s gates used: the
+three default kernels (x86_64 `7b199c88…`, AArch64 `54a58c91…`, RISC-V `8f7738eb…`) and the
+AArch64 AP-scheduling (`3348c60d…`), SMP2, LOCK2, PL011, overtaken and CONTEXT1 witness images, the
+RISC-V AP-scheduling and UART images, and the x86 CONTEXT1 image. Only the RISC-V SMP3 and VMI
+witness images (which link the changed check) differ; those gates were re-run.
+
+| Gate | Result |
+|---|---|
+| hosted / integration / census scanner | 6149 / 308 / 17 passed (6148 on `f20b50b1`) |
+| `cargo fmt --check`; ownership census | clean; production lines identical to the base |
+| freestanding warnings, three ports | identical named classes and counts to `12c687d3` (177 / 205 / 188) |
+| image checks | AArch64: 9 sites, idle-root switch `msr ttbr0_el1; isb` ok; RISC-V 8; x86_64 12 |
+| witness feature builds | warnings identical to the base for every existing feature |
+| strict cores: AArch64 at 1, 2, 3, 4 and 8 CPUs | ok; at 8, all seven secondaries `admitted=1 dispatching=1` |
+| strict cores: RISC-V at 1, 2, 4 and 8 harts; x86_64 | ok |
+
+**The AArch64 witness sample, scheduled in advance** (one build, image `3348c60d…`):
+
+| Boots | Time | Recorded spinner preemptions per CPU | Idle wakes | Deepest secondary stack |
+|---|---|---|---|---|
+| `-smp 2` idle ×3 | 45 / 21 / 22 s | 6,6 · 7,6 · 7,6 | 3 by SGI each | 0x13550 (77 KiB) |
+| `-smp 2` loaded ×2 | 28 / 28 s | 7,6 · 6,6 | 3 by SGI each | 0x13550 |
+| `-smp 4` idle ×3 | 25 / 24 / 24 s | 6,6,6,6 · 7,6,6,6 · 8,8,8,8 | 9 by SGI each | 0x13550 on each |
+| `-smp 4` loaded ×2 | 68 / 62 s | 7,7,6,7 · 8,7,7,6 | 9 by SGI each | 0x13550 on each |
+| `-smp 3` | 23 s | 6,6,6 | 6 by SGI | 0x13550 on each |
+| `-smp 8` | 40 s | 6,11,10,10,10,9,9,8 | 21 by SGI | 0x13550 on each |
+
+Loaded host: four busy loops on the four host CPUs. Every boot: registers intact, deadlines timed
+out on the global tick, every IPC round, fork/exit/reap churn reaped with nothing quarantined, a
+handled copy-on-write fault per secondary, and no idle wake left to the backstop timer.
+The deepest measured secondary stack use is 77 KiB of the 2 MiB reservation in every run; the
+workload included syscalls, IPC, faults and fork/exit/reap, but a shallow workload does not
+establish a bound.
+
+**Controls** (on `f20b50b1`, whose witness image is identical to the candidate's; `-smp 4`, 600 s
+boot budget):
+
+| Control | Boot | Verdict (all name CPU 2) |
+|---|---|---|
+| missing AP readiness | 312 s | `AARCH64_AP_UNADMITTED cpu=2 reason=no_irq_ready`; "CPU 2 never took the production admission"; `P_NO_AP` |
+| readiness unchecked (admitted unable to take the SGI) | 102 s | every CPU 2 sleeper wake "by its timer, not the IPI" |
+| suppressed SGI wake | 97 s | the same |
+| missing AP timer | 310 s | `P_W_TIMEOUT`, `P_PRE_TIMEOUT`: "CPU 2 had taken no timer preemption at all" |
+| skipped idle-root handoff | 21 s | `VM_ASPACE_TEARDOWN_QUARANTINED`; "CPU 2 never left child …'s root before its reap", `quarantined=1` |
+| corrupted returning GPR | 315 s | "spinner … found 1 corrupted registers (last x20)", on CPU 2's spinners; `P_NO_ACK` |
+| corrupted returning FP register | 28 s | "… (last q7.lo)" on CPU 2's spinners |
+| expected CPU unused | 310 s | `P_PRE_TIMEOUT`; "no spinner ran on CPU 2" |
+| image: idle-root switch without its `isb` | — | `VMI_SEQUENCE [fail] … enter_kernel_root: msr ttbr0_el1 followed by 'nop', want isb` |
+| GICv3 machine (unsupported) | — | `AARCH64_CPU_EXCLUDED affinity=0x1 reason=no_gicv2_distributor`; one logical CPU |
+
+**Regressions.** AArch64: SMP2, LOCK2, CONTEXT1, PL011 IRQ, idle-return, overtaken,
+server-death, exit-current-task, supervisor restart, shared-region direct and ipccall direct — ok.
+RISC-V: AP-scheduling witness at 4 and 8 harts, UART IRQ, SMP3, LOCK1 (re-freeze), VM
+invalidation (re-freeze), server-death — ok. x86_64: SMP1, LOCK3, CONTEXT1, server-death — ok.
