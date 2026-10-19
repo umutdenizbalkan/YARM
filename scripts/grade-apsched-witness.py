@@ -92,6 +92,7 @@ PORTS = {
         "quiescent": "RISCV_AP_QUIESCENT cpu=2 reason=x",
         "max_harts": None,
         "stack": False,
+        "idle_timer_parked": False,
     },
     "aarch64": {
         "forbidden": [
@@ -108,6 +109,9 @@ PORTS = {
         "max_harts": 8,
         # Each secondary's dispatch stack is painted before it starts; the dump reports its depth.
         "stack": True,
+        # An idle secondary parks its own timer behind a 100-period backstop (`smp`), so a
+        # deadline window spent idle can legitimately see none of its CPU's ticks.
+        "idle_timer_parked": True,
     },
 }
 ARCH = "riscv64"
@@ -382,11 +386,19 @@ def grade(text, ncpus):
             fails.append(f"{tag} woke after {dtick} ticks, before its {timeout}-tick deadline")
         if dtick != dirq0:
             fails.append(f"{tag}: the tick advanced {dtick} over a window of {dirq0} CPU 0 interrupts")
-        if dirq_own < 1:
+        # Non-vacuity of the no-multiplication check above: the deadline's own CPU ticked in the
+        # window and those ticks did not advance the clock. Where an idle secondary parks its
+        # timer the window may be spent idle, so there the run as a whole must show it (below);
+        # per-CPU timer liveness is the preemption obligation's.
+        if dirq_own < 1 and not P()["idle_timer_parked"]:
             fails.append(f"{tag}: its CPU took no timer interrupt in the window")
         b = before.get(r["tid"])
         if b is None or b["cpu"] != r["cpu"]:
             fails.append(f"{tag}: armed on another CPU (no migration)")
+
+    if P()["idle_timer_parked"] and dl and not any(r["v"][4] >= 1 for r in dl):
+        fails.append("time: no deadline window saw its CPU's own timer, so the clock's independence "
+                     "from secondary ticks went unexercised")
 
     # idle wake — one sleeper per expected secondary
     sleepers = {r["v"][0]: r for r in user("S_START")}
@@ -674,6 +686,20 @@ def self_test():
     got = grade(_render(base[:a_done] + [("USER", 0, 9600, "P_W_TIMEOUT", 5, 6)] + base[a_done:]), 3)
     assert any("5 of 6 spinners running" in f for f in got), got
     cases_run += 1
+    # A deadline window with none of its own CPU's ticks: a failure where idle timers run, and
+    # allowed where they park, as long as some window in the run shows them.
+    d1 = idx(lambda e: e[0] == "DEADLINE")
+    quiet = mutate(d1, base[d1][:8] + (0,))
+    got = grade(_render(quiet), 3)
+    if P()["idle_timer_parked"]:
+        assert got == [], got
+        all_quiet = [e[:8] + (0,) if e[0] == "DEADLINE" else e for e in base]
+        got = grade(_render(all_quiet), 3)
+        assert any("went unexercised" in f for f in got), got
+        cases_run += 2
+    else:
+        assert any("took no timer interrupt in the window" in f for f in got), got
+        cases_run += 1
     # The register names a mismatch is reported under, per port.
     if ARCH == "aarch64":
         assert [reg_name(i) for i in (20, 31, 32, 33, 34, 35, 64, 127)] == \

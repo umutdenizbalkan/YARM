@@ -7071,6 +7071,7 @@ impl SharedKernel {
         crate::kernel::recv_waiter_split::PublishWaiterOutcome,
         crate::kernel::boot::ReplyWaitArm,
     ) {
+        let mut unclaimed_death = None;
         let (outcome, armed) = self.with_ipc_split_mut(|ipc| {
             let outcome = crate::kernel::boot::publish_recv_waiter_locked(
                 ipc,
@@ -7098,8 +7099,23 @@ impl SharedKernel {
             } else {
                 crate::kernel::boot::ReplyWaitArm::NotAReplyWait
             };
+            // AP-SCHED3: in the SAME rank-3 scope as the arm, take back a server death the drain
+            // parked because this wait had not armed yet. Only a wait that stays blocked (Armed,
+            // not DeadlineRefused, which unwinds) takes it.
+            if let crate::kernel::boot::ReplyWaitArm::Armed { identity, .. } = &armed {
+                unclaimed_death =
+                    crate::kernel::boot::take_unclaimed_server_death_locked(ipc, identity);
+            }
             (outcome, armed)
         });
+        // ...and republish it, after the scope, onto the executing CPU's queue: the drain at this
+        // trap's tail then claims `PeerDeath` through the cell just armed, and wakes the caller.
+        if let Some(work) = unclaimed_death {
+            crate::kernel::boot::republish_unclaimed_server_death(
+                self.executing_cpu_split().0 as usize,
+                work,
+            );
+        }
         if matches!(
             outcome,
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
@@ -14751,6 +14767,15 @@ impl SharedKernel {
             // Resolve the identity the terminal cell was ARMED with. A record slot that was
             // reclaimed and reused since publication yields no matching identity, so a
             // stale item claims nothing.
+            //
+            // AP-SCHED3: a LIVE record whose cell is not yet armed for this incarnation is not
+            // stale — the server took the call and exited before its caller blocked for the
+            // reply. Discarding the item there lost the death: the caller then armed, and waited
+            // for its deadline (`Timeout` instead of `PeerDeath`), or for ever with none. The item
+            // is parked on the record instead, in the SAME rank-3 scope that read the cell, so an
+            // arming cannot slip between the read and the park; that arming takes it back and
+            // republishes it (`take_unclaimed_server_death_locked`).
+            let mut parked = false;
             let armed = self.with_ipc_split_mut(|ipc| {
                 if ipc
                     .reply_cap_generations
@@ -14760,10 +14785,32 @@ impl SharedKernel {
                 {
                     return None;
                 }
-                ipc.reply_terminal_ownership
+                let identity = ipc
+                    .reply_terminal_ownership
                     .get(work.reply_record_index)
-                    .map(|cell| *cell.identity())
+                    .map(|cell| *cell.identity())?;
+                let record_live = ipc
+                    .reply_caps
+                    .get(work.reply_record_index)
+                    .is_some_and(|r| r.is_some());
+                if record_live && identity.reply_record_generation != work.reply_record_generation {
+                    if let Some(slot) = ipc.reply_death_unclaimed.get_mut(work.reply_record_index) {
+                        *slot = Some(work);
+                        parked = true;
+                    }
+                }
+                Some(identity)
             });
+            if parked {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_PARKED_UNTIL_WAIT record_index={} record_generation={} server_tid={} server_asid={} caller_wakes=0 result=ok",
+                    work.reply_record_index,
+                    work.reply_record_generation,
+                    work.exiting_server.tid.0,
+                    work.exiting_server.asid.0
+                );
+                continue;
+            }
             let Some(identity) = armed else {
                 crate::yarm_log!(
                     "IPC_SERVER_DEATH_DRAIN outcome=stale_record record_index={} record_generation={} caller_wakes=0 result=ok",

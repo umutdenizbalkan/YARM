@@ -447,7 +447,6 @@ fn park_unadmitted(cpu: CpuId, state: ApState, reason: &str) -> ! {
     }
 }
 
-/// The dispatch-stack size this image gave each secondary (`yarm_aarch64_ap_stack_stride`).
 /// The secondary stack pool: (its end, the per-slot stride, the slot count). Slot `cpu - 1`'s top
 /// is `end - (cpu - 1) * stride`, as `yarm_aarch64_secondary_entry` computes it.
 #[cfg(not(feature = "rpi5-stage1"))]
@@ -466,6 +465,7 @@ pub fn ap_stack_pool() -> (usize, usize, usize) {
     }
 }
 
+/// The dispatch-stack size this image gave each secondary (`yarm_aarch64_ap_stack_stride`).
 fn ap_stack_bytes() -> usize {
     unsafe extern "C" {
         static yarm_aarch64_ap_stack_stride: u64;

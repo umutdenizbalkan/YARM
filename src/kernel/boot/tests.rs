@@ -85638,6 +85638,109 @@ mod stage199a2d1_races {
         pub(super) published_ack: BlockedCallerAck,
     }
 
+    /// AP-SCHED3 — the server dies BEFORE its caller waits for the reply. Live (RISC-V
+    /// server-dies cell, qualification of `7aec0fe3`): the call was delivered, the server ran
+    /// first, took the request and exited; the exit published the death, and the drain found the
+    /// caller's terminal not yet armed and discarded the item (`outcome=stale_identity`). The
+    /// caller then blocked for the reply, armed, and waited until its deadline: `Timeout` instead
+    /// of `PeerDeath`; with no deadline it would wait for ever.
+    #[test]
+    fn ap_sched3_a_death_before_the_reply_wait_reaches_the_caller() {
+        crate::kernel::boot::server_death_work_clear(0);
+        ipcreply_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid1, asid2, reply_recv_cap_t1, reply_cap_t2) = k.with(|state| {
+            state.register_task(1).expect("t1 caller");
+            state.register_task(2).expect("t2 replier");
+            let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+            let (asid2, _aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("bind1");
+            state.bind_task_asid(2, asid2).expect("bind2");
+            state
+                .map_user_page(
+                    aspace1,
+                    VirtAddr(CALLER_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xC000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map caller buffers");
+            let (_reply_eid, _reply_send, reply_recv_global) =
+                state.create_endpoint(4).expect("reply ep");
+            let reply_recv_cap_t1 = state
+                .grant_capability_task_to_task(0, reply_recv_global, 1)
+                .expect("dup reply recv to caller");
+            let t2_cnode = state.task_cnode(2).expect("t2 cnode");
+            let reply_cap_t2 = state
+                .create_reply_cap_for_caller_in_cnode(
+                    ThreadId(1),
+                    reply_recv_cap_t1,
+                    Some(ThreadId(2)),
+                    Some(t2_cnode),
+                )
+                .expect("reply record + replier-local cap");
+            state.enqueue_current_cpu(1).expect("enqueue1");
+            state.dispatch_next_task().expect("dispatch");
+            while state.current_tid() != Some(1) {
+                state.yield_current().expect("switch to caller");
+            }
+            (asid1, asid2, reply_recv_cap_t1, reply_cap_t2)
+        });
+        let (record_index, record_generation) = k
+            .resolve_reply_cap_split_read(2, reply_cap_t2)
+            .expect("resolve replier reply cap");
+        if k.with(|s| s.live_server_reply_link_count()) == 0 {
+            assert!(k.with(|s| s.register_server_reply_link(
+                2,
+                asid2,
+                record_index,
+                record_generation
+            )));
+        }
+        // The server exits while its caller is still runnable: reserve, detach, publish, drain.
+        let reservation = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        let l = k
+            .with(|s| s.take_server_reply_link(2, asid2))
+            .expect("the link");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            reservation,
+            crate::kernel::boot::DeferredServerDeathCompletion {
+                exiting_server: id(2, asid2),
+                reply_record_index: l.reply_record_index,
+                reply_record_generation: l.reply_record_generation,
+            },
+        ));
+        assert_eq!(k.drain_server_death_post_work(CpuId(0)), 1);
+        assert_eq!(k.with(|s| s.pending_syscall_completion_result(1)), None);
+        // Only now does the caller wait for the reply.
+        k.with(|state| {
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    reply_recv_cap_t1.0 as usize,
+                    CALLER_PAYLOAD_VA,
+                    8,
+                    CALLER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+        });
+        let _ = k.drain_server_death_post_work(CpuId(0));
+        let _ = asid1;
+        assert_eq!(
+            k.with(|s| s.pending_syscall_completion_result(1)),
+            Some(10),
+            "the caller must observe ServerDied once it waits, not a timeout or nothing"
+        );
+        crate::kernel::boot::server_death_work_clear(0);
+        set_ipccall_direct_proof_enabled(false);
+        ipccall_direct_ack::reset();
+    }
+
     /// task1 caller committed-blocked on recv-v2 of its reply endpoint; task2 replier
     /// holds the bound one-shot Reply cap. Mirrors `stage199a2b3::blocked_caller_fixture`.
     pub(super) fn caller_fixture() -> CallerFx {
@@ -202147,5 +202250,47 @@ mod ap_sched3 {
         );
         assert!(A64_BOOT.contains("const AARCH64_PTE_PXN: u64 = 1 << 53;"));
         assert!(A64_BOOT.contains("const AARCH64_PTE_UXN: u64 = 1 << 54;"));
+    }
+
+    /// **A server death drained before its caller waits is parked, not discarded, and the
+    /// caller's arming takes it back.** The drain parks in the SAME rank-3 scope that read the
+    /// cell; the split arm takes it in the SAME rank-3 scope that armed, and republishes after
+    /// that scope; the in-lock arm does the same after its arm. (Behaviour:
+    /// `stage199a2d1_races::ap_sched3_a_death_before_the_reply_wait_reaches_the_caller`.)
+    #[test]
+    fn a_death_before_the_wait_is_parked_and_taken_back_by_the_arm() {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        let drain = body_of(RUNTIME, "    pub(crate) fn drain_server_death_post_work(");
+        let scope = drain
+            .find("let armed = self.with_ipc_split_mut(|ipc| {")
+            .expect("one scope");
+        let park = drain.find("*slot = Some(work);").expect("the park");
+        let scope_end = drain[scope..].find("\n            });").expect("scope end") + scope;
+        assert!(
+            scope < park && park < scope_end,
+            "parked inside the scope that read the cell"
+        );
+        assert!(drain.find("IPC_SERVER_DEATH_PARKED_UNTIL_WAIT").unwrap() > scope_end);
+        let phase_c = body_of(RUNTIME, "    pub(crate) fn recv_block_phase_c_split(");
+        let arm = phase_c
+            .find("arm_reply_terminal_for_committed_block_locked(")
+            .unwrap();
+        let take = phase_c
+            .find("take_unclaimed_server_death_locked(ipc, identity)")
+            .unwrap();
+        let end = phase_c.find("(outcome, armed)\n        });").unwrap();
+        let republish = phase_c.find("republish_unclaimed_server_death(").unwrap();
+        assert!(arm < take && take < end && end < republish);
+        let in_lock = body_of(
+            include_str!("ipc_state.rs"),
+            "    pub(crate) fn arm_production_reply_deadline(",
+        );
+        let arm = in_lock
+            .find("self.arm_reply_terminal(record_index, identity);")
+            .unwrap();
+        let take = in_lock
+            .find("take_unclaimed_server_death_locked(ipc, &identity)")
+            .unwrap();
+        assert!(arm < take);
     }
 }

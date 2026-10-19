@@ -70,6 +70,7 @@ pub(crate) use ipc_state::{
     commit_reply_terminal_locked, complete_reply_timeout_over, complete_server_death_over,
     enqueue_reply_into_endpoint_locked, publish_recv_waiter_locked, reclaim_reply_authority_with,
     release_reply_terminal_locked, reserve_direct_reply_record_locked,
+    take_unclaimed_server_death_locked,
 };
 pub(crate) mod cleared_current;
 pub(crate) mod exit_claim;
@@ -6359,6 +6360,28 @@ pub(crate) fn server_death_work_publish(
         work.reply_record_generation,
     );
     true
+}
+
+/// AP-SCHED3 — republish a server death the drain parked because its caller had not yet armed
+/// its reply wait, onto `cpu_idx`'s queue (the CPU whose trap armed it, which drains it at that
+/// trap's tail). A full queue parks nothing and loses nothing silently: it is named, and the
+/// caller keeps its own deadline (or, with none, is the bounded failure this names).
+pub(crate) fn republish_unclaimed_server_death(
+    cpu_idx: usize,
+    work: DeferredServerDeathCompletion,
+) -> bool {
+    let published = server_death_work_reserve(cpu_idx)
+        .is_some_and(|reservation| server_death_work_publish(reservation, work));
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_REPUBLISHED_AT_WAIT cpu={} record_index={} record_generation={} server_tid={} server_asid={} result={}",
+        cpu_idx,
+        work.reply_record_index,
+        work.reply_record_generation,
+        work.exiting_server.tid.0,
+        work.exiting_server.asid.0,
+        if published { "ok" } else { "queue_full" }
+    );
+    published
 }
 
 /// Release a reservation without publishing (a failpoint or an aborted handoff).

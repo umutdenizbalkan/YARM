@@ -469,6 +469,13 @@ pub(crate) struct IpcSubsystem {
     /// later stages wire the live reserve/reply/timeout/exit paths onto it.
     pub(crate) reply_terminal_ownership:
         [crate::kernel::terminal_ownership::TerminalCell; MAX_REPLY_CAPS],
+    /// AP-SCHED3 — a server death whose post-lock drain ran BEFORE the caller's reply wait armed
+    /// this record's terminal cell, indexed like `reply_caps`. The drain parks the exact item here
+    /// instead of discarding it, and the arming of that same record incarnation takes it back and
+    /// republishes it, so the death is claimed through the cell like every other terminal. It is
+    /// generation-bearing: a reused slot never inherits it, and it confers no authority by itself.
+    pub(crate) reply_death_unclaimed:
+        [Option<crate::kernel::boot::DeferredServerDeathCompletion>; MAX_REPLY_CAPS],
     /// Stage 200B — the SINGLE bounded deadline-registration store
     /// (`deadline_registration_stores = 1`). It tracks registration ownership for a
     /// blocked reply receive and mints generation-bearing fire tokens, but it is NOT

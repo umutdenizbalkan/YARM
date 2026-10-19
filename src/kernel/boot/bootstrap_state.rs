@@ -659,6 +659,7 @@ impl Bootstrap {
                 reply_terminal_ownership: [const {
                     crate::kernel::terminal_ownership::TerminalCell::vacant()
                 }; MAX_REPLY_CAPS],
+                reply_death_unclaimed: [None; MAX_REPLY_CAPS],
                 reply_deadline_tokens: [const {
                     crate::kernel::deadline_token::DeadlineTokenCell::vacant()
                 }; MAX_DEADLINE_TOKENS],

@@ -1303,6 +1303,33 @@ pub(crate) fn arm_reply_terminal_for_committed_block_locked(
     ReplyWaitArm::Armed { identity, token }
 }
 
+/// AP-SCHED3 — take back a server death that was drained before this wait armed (rank 3).
+///
+/// The post-lock drain parks an item in `reply_death_unclaimed` when the record it names is
+/// live at its generation but the record's terminal cell is not yet armed for that incarnation:
+/// the server took the call and exited before its caller blocked for the reply. The arming of
+/// that exact incarnation hands it back here, matched on record slot, record generation and the
+/// exact exiting replier incarnation the armed identity names, so the caller republishes it and
+/// the ordinary drain claims `PeerDeath` through the cell. Anything else stays put.
+pub(crate) fn take_unclaimed_server_death_locked(
+    ipc: &mut IpcSubsystem,
+    identity: &crate::kernel::terminal_ownership::TerminalIdentity,
+) -> Option<crate::kernel::boot::DeferredServerDeathCompletion> {
+    let slot = ipc
+        .reply_death_unclaimed
+        .get_mut(identity.reply_record_index)?;
+    let work = (*slot)?;
+    if work.reply_record_index != identity.reply_record_index
+        || work.reply_record_generation != identity.reply_record_generation
+        || work.exiting_server.tid != identity.replier_tid
+        || work.exiting_server.asid != identity.replier_asid
+    {
+        return None;
+    }
+    *slot = None;
+    Some(work)
+}
+
 /// 199D-TRC — the ONE terminal-arbitration policy for a direct (NR7) reply, rank 3 only.
 ///
 /// ## Why this exists
@@ -3574,6 +3601,16 @@ impl KernelState {
             return;
         };
         self.arm_reply_terminal(record_index, identity);
+        // AP-SCHED3: a server death already drained before this wait armed is handed back now,
+        // for the ordinary drain at this trap's tail to claim through the cell just armed.
+        if let Some(work) =
+            self.with_ipc_state_mut(|ipc| take_unclaimed_server_death_locked(ipc, &identity))
+        {
+            crate::kernel::boot::republish_unclaimed_server_death(
+                self.current_cpu().0 as usize,
+                work,
+            );
+        }
         // Armed. Everything below is the DEADLINE half and runs only for a caller that asked.
         let Some(deadline_tick) = finite_deadline else {
             return;
