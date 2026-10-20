@@ -202253,44 +202253,711 @@ mod ap_sched3 {
     }
 
     /// **A server death drained before its caller waits is parked, not discarded, and the
-    /// caller's arming takes it back.** The drain parks in the SAME rank-3 scope that read the
-    /// cell; the split arm takes it in the SAME rank-3 scope that armed, and republishes after
-    /// that scope; the in-lock arm does the same after its arm. (Behaviour:
-    /// `stage199a2d1_races::ap_sched3_a_death_before_the_reply_wait_reaches_the_caller`.)
+    /// caller's arming hands it back.** The drain parks in the SAME rank-3 scope that read the
+    /// cell; the split arm and the in-lock arm (`arm_reply_terminal`) each hand it back in the SAME
+    /// rank-3 scope that armed. AP-SCHED4 §A1: handed back IN PLACE — nothing takes it out of the
+    /// park to republish it, so no reservation can be refused after it left its owner.
+    /// (Behaviour: `stage199a2d1_races::ap_sched3_a_death_before_the_reply_wait_reaches_the_caller`
+    /// and `ap_sched4_a`.)
     #[test]
     fn a_death_before_the_wait_is_parked_and_taken_back_by_the_arm() {
         const RUNTIME: &str = include_str!("../../runtime.rs");
-        let drain = body_of(RUNTIME, "    pub(crate) fn drain_server_death_post_work(");
-        let scope = drain
+        const IPC_STATE: &str = include_str!("ipc_state.rs");
+        const MOD: &str = include_str!("mod.rs");
+        let settle = body_of(RUNTIME, "    fn settle_deferred_server_death(");
+        let scope = settle
             .find("let armed = self.with_ipc_split_mut(|ipc| {")
             .expect("one scope");
-        let park = drain.find("*slot = Some(work);").expect("the park");
-        let scope_end = drain[scope..].find("\n            });").expect("scope end") + scope;
+        let park = settle
+            .find("*slot = Some(crate::kernel::boot::ParkedServerDeath {")
+            .expect("the park");
+        let scope_end = settle[scope..]
+            .find("\n            });")
+            .expect("scope end")
+            + scope;
         assert!(
             scope < park && park < scope_end,
             "parked inside the scope that read the cell"
         );
-        assert!(drain.find("IPC_SERVER_DEATH_PARKED_UNTIL_WAIT").unwrap() > scope_end);
+        assert!(settle.find("IPC_SERVER_DEATH_PARKED_UNTIL_WAIT").unwrap() > scope_end);
         let phase_c = body_of(RUNTIME, "    pub(crate) fn recv_block_phase_c_split(");
         let arm = phase_c
             .find("arm_reply_terminal_for_committed_block_locked(")
             .unwrap();
-        let take = phase_c
-            .find("take_unclaimed_server_death_locked(ipc, identity)")
+        let claim = phase_c
+            .find("claim_parked_server_death_on_arm_locked(ipc, identity)")
             .unwrap();
         let end = phase_c.find("(outcome, armed)\n        });").unwrap();
-        let republish = phase_c.find("republish_unclaimed_server_death(").unwrap();
-        assert!(arm < take && take < end && end < republish);
-        let in_lock = body_of(
-            include_str!("ipc_state.rs"),
-            "    pub(crate) fn arm_production_reply_deadline(",
+        assert!(arm < claim && claim < end);
+        let in_lock = body_of(IPC_STATE, "    pub(crate) fn arm_reply_terminal(");
+        let arm = in_lock.find("cell.arm(identity);").unwrap();
+        let claim = in_lock
+            .find("claim_parked_server_death_on_arm_locked(ipc, &identity)")
+            .unwrap();
+        let scope_end = in_lock.find("\n        });").unwrap();
+        assert!(
+            arm < claim && claim < scope_end,
+            "claimed in the arming scope"
         );
-        let arm = in_lock
-            .find("self.arm_reply_terminal(record_index, identity);")
+        // Nothing moves a parked item into a queue slot any more.
+        for src in [RUNTIME, IPC_STATE, MOD] {
+            assert!(!src.contains("republish_unclaimed_server_death("));
+            assert!(!src.contains("take_unclaimed_server_death_locked("));
+        }
+    }
+}
+
+/// AP-SCHED4 Stage A — the server-death handoff keeps an exact owner (§A1), and x86_64 names the
+/// executing CPU from its own APIC ID (§A2).
+#[cfg(test)]
+mod ap_sched4_a {
+    use super::*;
+    use crate::arch::x86_cpu_identity::hosted::execute_as;
+    use crate::kernel::boot::{
+        DeferredServerDeathCompletion, EndpointWaiterRecord, ParkedDeathHandoff, ParkedServerDeath,
+        ReceiverWaiterIdentity, ReplyWaitArm, SD_POST_WORK_SLOTS, ipccall_direct_ack,
+        ipcreply_direct_ack, set_ipccall_direct_proof_enabled,
+    };
+    use crate::kernel::capabilities::CapObject;
+    use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
+    use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskStatus};
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const PAYLOAD_VA: usize = 0x4000;
+    const META_VA: usize = 0x4080;
+    const SERVER_DIED: u64 = 10;
+    const CPU0: CpuId = CpuId(0);
+    const CPU1: CpuId = CpuId(1);
+
+    struct Fx {
+        k: SharedKernel,
+        caller_asid: Asid,
+        server_asid: Asid,
+        reply_recv_cap: CapId,
+        reply_eidx: usize,
+        record_index: usize,
+        record_generation: u64,
+    }
+
+    fn reset_globals() {
+        for cpu in 0..crate::kernel::scheduler::MAX_CPUS {
+            crate::kernel::boot::server_death_work_clear(cpu);
+        }
+        crate::kernel::boot::server_death_claimable_clear();
+        ipcreply_direct_ack::reset();
+        ipccall_direct_ack::reset();
+    }
+
+    /// Task 1 (caller) runnable and current on CPU 0, owning a live reply record whose replier is
+    /// task 2 (server), with the server's reverse link attached. Nobody is blocked yet. With
+    /// `second_cpu`, CPU 1 is online too.
+    fn fixture(second_cpu: bool) -> Fx {
+        reset_globals();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (caller_asid, server_asid, reply_recv_cap) = k.with(|state| {
+            if second_cpu {
+                state.bring_up_cpu(CPU1).expect("cpu 1 online");
+            }
+            state.register_task(1).expect("t1 caller");
+            state.register_task(2).expect("t2 server");
+            let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+            let (asid2, _aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("bind1");
+            state.bind_task_asid(2, asid2).expect("bind2");
+            state
+                .map_user_page(
+                    aspace1,
+                    VirtAddr(PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xC000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map caller buffers");
+            let (_eid, _send, recv_global) = state.create_endpoint(4).expect("reply ep");
+            let reply_recv_cap = state
+                .grant_capability_task_to_task(0, recv_global, 1)
+                .expect("reply recv cap to the caller");
+            let t2_cnode = state.task_cnode(2).expect("t2 cnode");
+            state
+                .create_reply_cap_for_caller_in_cnode(
+                    ThreadId(1),
+                    reply_recv_cap,
+                    Some(ThreadId(2)),
+                    Some(t2_cnode),
+                )
+                .expect("reply record + server-local cap");
+            state.enqueue_current_cpu(1).expect("enqueue caller");
+            state.dispatch_next_task().expect("dispatch");
+            while state.current_tid() != Some(1) {
+                state.yield_current().expect("switch to caller");
+            }
+            (asid1, asid2, reply_recv_cap)
+        });
+        let (record_index, record_generation, reply_eidx) = k.with_ipc_split_mut(|ipc| {
+            let (idx, record) = ipc
+                .reply_caps
+                .iter()
+                .enumerate()
+                .find_map(|(i, r)| r.map(|r| (i, r)))
+                .expect("the reply record");
+            let CapObject::Endpoint { index, .. } = record.reply_endpoint else {
+                panic!("reply endpoint")
+            };
+            (idx, ipc.reply_cap_generations[idx], index)
+        });
+        if k.with(|s| s.live_server_reply_link_count()) == 0 {
+            assert!(k.with(|s| s.register_server_reply_link(
+                2,
+                server_asid,
+                record_index,
+                record_generation
+            )));
+        }
+        Fx {
+            k,
+            caller_asid,
+            server_asid,
+            reply_recv_cap,
+            reply_eidx,
+            record_index,
+            record_generation,
+        }
+    }
+
+    fn teardown() {
+        reset_globals();
+        set_ipccall_direct_proof_enabled(false);
+    }
+
+    fn park_slot(fx: &Fx) -> Option<ParkedServerDeath> {
+        fx.k.with_ipc_split_mut(|ipc| ipc.reply_death_unclaimed[fx.record_index])
+    }
+
+    fn result(fx: &Fx) -> Option<u64> {
+        fx.k.with(|s| s.pending_syscall_completion_result(1))
+    }
+
+    /// The server exits through the production teardown (`exit_task`: reserve, detach, publish on
+    /// the executing CPU) while its caller is still runnable, and that CPU's drain runs.
+    fn early_death(fx: &Fx) {
+        fx.k.with(|s| s.exit_task(2, 0)).expect("server exit");
+        assert_eq!(
+            crate::kernel::boot::server_death_work_len(0),
+            1,
+            "published on CPU 0"
+        );
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        assert_eq!(result(fx), None, "nobody is waiting yet");
+        assert_eq!(
+            park_slot(fx),
+            Some(ParkedServerDeath {
+                work: DeferredServerDeathCompletion {
+                    exiting_server: ReceiverWaiterIdentity::new(ThreadId(2), fx.server_asid),
+                    reply_record_index: fx.record_index,
+                    reply_record_generation: fx.record_generation,
+                },
+                claimable: false,
+            }),
+            "parked on its record, owned there"
+        );
+    }
+
+    /// The caller blocks for the reply through the IN-LOCK receive (`arm_reply_terminal`).
+    fn wait_in_lock(fx: &Fx, timeout_ticks: usize) {
+        fx.k.with(|state| {
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    fx.reply_recv_cap.0 as usize,
+                    PAYLOAD_VA,
+                    8,
+                    META_VA,
+                    40,
+                    timeout_ticks,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(matches!(state.task_status(1), Some(TaskStatus::Blocked(_))));
+        });
+    }
+
+    /// The caller blocks for the reply through the SPLIT receive's three phases (phase C arms).
+    fn wait_split(fx: &Fx, deadline: Option<u64>) -> ReplyWaitArm {
+        let (asid, _prio) =
+            fx.k.recv_block_phase_a_split(CPU0, 1)
+                .expect("phase A blocks the caller");
+        assert_eq!(asid, fx.caller_asid);
+        let wait_generation =
+            fx.k.recv_block_phase_b_split(
+                1,
+                asid,
+                fx.reply_recv_cap,
+                deadline,
+                Some(BlockedRecvState {
+                    recv_cap: fx.reply_recv_cap,
+                    payload_user_ptr: PAYLOAD_VA,
+                    payload_user_len: 8,
+                    meta_user_ptr: META_VA,
+                    meta_user_len: 40,
+                    recv_abi: RecvAbiVariant::RecvV2,
+                }),
+            )
+            .expect("phase B");
+        let (outcome, arm) = fx.k.recv_block_phase_c_split(
+            fx.reply_eidx,
+            EndpointWaiterRecord::new(
+                ReceiverWaiterIdentity::new(ThreadId(1), asid),
+                wait_generation,
+            ),
+            fx.reply_recv_cap,
+            deadline.is_some_and(|t| t != 0),
+        );
+        assert_eq!(outcome, PublishWaiterOutcome::Published);
+        assert!(matches!(arm, ReplyWaitArm::Armed { .. }), "{arm:?}");
+        arm
+    }
+
+    fn assert_handed_back_in_place(fx: &Fx) {
+        let parked = park_slot(fx).expect("still owned by the park until a drain accepts it");
+        assert!(parked.claimable, "made claimable by the arming");
+        assert_eq!(crate::kernel::boot::server_death_claimable_pending(), 1);
+    }
+
+    fn assert_settled_once(fx: &Fx) {
+        assert_eq!(
+            result(fx),
+            Some(SERVER_DIED),
+            "the caller observes ServerDied"
+        );
+        assert_eq!(park_slot(fx), None, "the drain took it");
+        assert_eq!(crate::kernel::boot::server_death_claimable_pending(), 0);
+        assert_eq!(
+            fx.k.drain_server_death_post_work(CPU0),
+            0,
+            "nothing is left to settle a second time"
+        );
+        assert_eq!(result(fx), Some(SERVER_DIED));
+    }
+
+    // ── §A1: early death, every caller shape ─────────────────────────────────────────────
+
+    #[test]
+    fn early_death_reaches_an_untimed_in_lock_caller() {
+        let fx = fixture(false);
+        early_death(&fx);
+        wait_in_lock(&fx, 0);
+        assert_handed_back_in_place(&fx);
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    #[test]
+    fn early_death_reaches_a_timed_in_lock_caller() {
+        let fx = fixture(false);
+        early_death(&fx);
+        wait_in_lock(&fx, 5_000);
+        assert_handed_back_in_place(&fx);
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    #[test]
+    fn early_death_reaches_an_untimed_split_caller() {
+        let fx = fixture(false);
+        early_death(&fx);
+        wait_split(&fx, None);
+        assert_handed_back_in_place(&fx);
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    #[test]
+    fn early_death_reaches_a_timed_split_caller() {
+        let fx = fixture(false);
+        early_death(&fx);
+        let deadline = fx.k.scheduler_tick_now_split_read() + 5_000;
+        wait_split(&fx, Some(deadline));
+        assert_handed_back_in_place(&fx);
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    /// The drain that accepts a claimable death need not be the arming CPU's: any CPU's trap tail
+    /// may take it, and exactly one does.
+    #[test]
+    fn any_cpus_drain_accepts_it_and_only_one_does() {
+        let fx = fixture(true);
+        early_death(&fx);
+        wait_in_lock(&fx, 0);
+        assert_handed_back_in_place(&fx);
+        assert_eq!(
+            fx.k.drain_server_death_post_work(CPU1),
+            1,
+            "CPU 1's tail took it"
+        );
+        assert_eq!(
+            fx.k.drain_server_death_post_work(CPU0),
+            0,
+            "CPU 0's finds nothing"
+        );
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    // ── §A1: the capacity boundary ──────────────────────────────────────────────────────
+
+    /// THE AP-SCHED3 LOSS. Every slot of the arming CPU's queue is held when the caller arms. The
+    /// AP-SCHED3 arm took the item out of the park and then failed to reserve a slot: the item had
+    /// no owner, and the caller — untimed — waited for ever. (Fails on `8cb30dd1`: the result stays
+    /// `None` after the queue frees and every drain runs, and the park is empty.) Now the arming
+    /// needs no slot at all, so a full queue changes nothing.
+    #[test]
+    fn a_full_queue_at_the_arm_cannot_strand_a_parked_death() {
+        let fx = fixture(false);
+        early_death(&fx);
+        let mut held = alloc::vec::Vec::new();
+        while let Some(r) = crate::kernel::boot::server_death_work_reserve(0) {
+            held.push(r);
+        }
+        assert_eq!(held.len(), SD_POST_WORK_SLOTS, "the queue is exactly full");
+        wait_in_lock(&fx, 0);
+        assert_handed_back_in_place(&fx);
+        // Settled while the queue is still full: the claim path never needed a slot.
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        assert_eq!(result(fx_ref(&fx)), Some(SERVER_DIED));
+        for r in held {
+            crate::kernel::boot::server_death_work_release(r);
+        }
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    fn fx_ref(fx: &Fx) -> &Fx {
+        fx
+    }
+
+    /// The same boundary on the split route, with a timed caller: the death, not the deadline,
+    /// settles it.
+    #[test]
+    fn a_full_queue_at_a_split_arm_cannot_strand_a_parked_death() {
+        let fx = fixture(false);
+        early_death(&fx);
+        let mut held = alloc::vec::Vec::new();
+        while let Some(r) = crate::kernel::boot::server_death_work_reserve(0) {
+            held.push(r);
+        }
+        let deadline = fx.k.scheduler_tick_now_split_read() + 5_000;
+        wait_split(&fx, Some(deadline));
+        assert_handed_back_in_place(&fx);
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        for r in held {
+            crate::kernel::boot::server_death_work_release(r);
+        }
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    // ── §A1: duplicates, distinguished from refusal ─────────────────────────────────────
+
+    /// "Already handed back exactly" is its own answer, not a refusal and not a second handoff.
+    #[test]
+    fn a_second_arming_is_already_claimable_not_a_second_owner() {
+        let fx = fixture(false);
+        early_death(&fx);
+        wait_in_lock(&fx, 0);
+        let identity = fx
+            .k
+            .with_ipc_split_mut(|ipc| *ipc.reply_terminal_ownership[fx.record_index].identity());
+        assert_eq!(
+            fx.k.with_ipc_split_mut(|ipc| {
+                crate::kernel::boot::claim_parked_server_death_on_arm_locked(ipc, &identity)
+            }),
+            ParkedDeathHandoff::AlreadyClaimable
+        );
+        assert_handed_back_in_place(&fx);
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    /// A duplicate publication of the SAME death (a repeated exit notification) arriving after
+    /// the hand-back: the cell is armed for it, so that copy settles directly, and the claimable
+    /// one then loses the single terminal arbitration. One wake, never two.
+    #[test]
+    fn a_duplicate_publication_after_the_hand_back_wakes_once() {
+        let fx = fixture(false);
+        early_death(&fx);
+        wait_in_lock(&fx, 0);
+        assert_handed_back_in_place(&fx);
+        let work = park_slot(&fx).unwrap().work;
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert!(crate::kernel::boot::server_death_work_publish(r, work));
+        assert_eq!(
+            fx.k.drain_server_death_post_work(CPU0),
+            2,
+            "the copy and the claim"
+        );
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    /// A duplicate publication BEFORE the arming parks the identical item again; the arming hands
+    /// back one item and the caller is woken once.
+    #[test]
+    fn a_duplicate_publication_before_the_arm_parks_one_item() {
+        let fx = fixture(false);
+        early_death(&fx);
+        let work = park_slot(&fx).unwrap().work;
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert!(crate::kernel::boot::server_death_work_publish(r, work));
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        assert_eq!(
+            park_slot(&fx).map(|p| (p.work, p.claimable)),
+            Some((work, false))
+        );
+        wait_in_lock(&fx, 0);
+        assert_handed_back_in_place(&fx);
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1);
+        assert_settled_once(&fx);
+        teardown();
+    }
+
+    // ── §A1: stale generations and record reuse ────────────────────────────────────────
+
+    /// A park for an EARLIER incarnation of the record slot is discarded by the arming of the new
+    /// one, and confers nothing on it.
+    #[test]
+    fn a_new_incarnations_arm_discards_a_stale_park() {
+        let fx = fixture(false);
+        early_death(&fx);
+        let stale = park_slot(&fx).unwrap().work;
+        let new_generation =
+            fx.k.with(|s| s.bump_reply_cap_generation_for_test(fx.record_index));
+        let mut identity = fx
+            .k
+            .with_ipc_split_mut(|ipc| *ipc.reply_terminal_ownership[fx.record_index].identity());
+        identity.reply_record_index = fx.record_index;
+        identity.reply_record_generation = new_generation;
+        identity.replier_tid = ThreadId(2);
+        identity.replier_asid = fx.server_asid;
+        assert_eq!(
+            fx.k.with_ipc_split_mut(|ipc| {
+                crate::kernel::boot::claim_parked_server_death_on_arm_locked(ipc, &identity)
+            }),
+            ParkedDeathHandoff::StaleDiscarded {
+                generation: stale.reply_record_generation
+            }
+        );
+        assert_eq!(park_slot(&fx), None);
+        assert_eq!(crate::kernel::boot::server_death_claimable_pending(), 0);
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 0);
+        assert_eq!(result(&fx), None);
+        teardown();
+    }
+
+    /// The record is reclaimed and reused AFTER the hand-back and before any drain: the drain
+    /// accepts the item (it still owns it) and finds it stale — no wake, no completion on the new
+    /// incarnation.
+    #[test]
+    fn a_record_reused_after_the_hand_back_settles_the_item_as_stale() {
+        let fx = fixture(false);
+        early_death(&fx);
+        wait_in_lock(&fx, 0);
+        assert_handed_back_in_place(&fx);
+        let _ =
+            fx.k.with(|s| s.bump_reply_cap_generation_for_test(fx.record_index));
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 1, "accepted");
+        assert_eq!(park_slot(&fx), None);
+        assert_eq!(result(&fx), None, "a stale item wakes nobody");
+        teardown();
+    }
+
+    /// A different replier at the same record incarnation is not this wait's death.
+    #[test]
+    fn a_park_for_another_replier_is_not_handed_back() {
+        let fx = fixture(false);
+        early_death(&fx);
+        let mut identity = fx
+            .k
+            .with_ipc_split_mut(|ipc| *ipc.reply_terminal_ownership[fx.record_index].identity());
+        identity.reply_record_index = fx.record_index;
+        identity.reply_record_generation = fx.record_generation;
+        identity.replier_tid = ThreadId(2);
+        identity.replier_asid = Asid(fx.server_asid.0 + 7);
+        assert_eq!(
+            fx.k.with_ipc_split_mut(|ipc| {
+                crate::kernel::boot::claim_parked_server_death_on_arm_locked(ipc, &identity)
+            }),
+            ParkedDeathHandoff::NothingParked
+        );
+        assert!(park_slot(&fx).is_some_and(|p| !p.claimable));
+        teardown();
+    }
+
+    /// The claim bit is a hint: one with nothing claimable behind it is cleared and ignored, and
+    /// an unclaimed park is never taken by it.
+    #[test]
+    fn a_claim_bit_without_a_claimable_item_settles_nothing() {
+        let fx = fixture(false);
+        early_death(&fx);
+        crate::kernel::boot::server_death_claimable_note(fx.record_index);
+        assert_eq!(fx.k.drain_server_death_post_work(CPU0), 0);
+        assert!(
+            park_slot(&fx).is_some_and(|p| !p.claimable),
+            "still parked for its caller"
+        );
+        assert_eq!(crate::kernel::boot::server_death_claimable_pending(), 0);
+        teardown();
+    }
+
+    // ── §A2: the executing CPU is the CPU's own identity, not the ambient field ──────────
+
+    /// x86_64 numbering for every case below: the boot CPU has APIC ID 0x20, CPU 1 has 0x07 —
+    /// sparse, and neither equals its logical id.
+    const MAP: [(u32, u8); 2] = [(0x20, 0), (0x07, 1)];
+
+    /// The ambient field names CPU 1 (CPU 1's trap entry rebound it), while CPU 0 executes.
+    /// Every identity query answers CPU 0.
+    #[test]
+    fn the_executing_cpu_ignores_an_ambient_field_naming_another_cpu() {
+        let fx = fixture(true);
+        fx.k.with(|s| s.set_current_cpu(CPU1))
+            .expect("ambient → CPU 1");
+        assert_eq!(fx.k.with_scheduler_split_mut(|s| s.current_cpu), CPU1);
+        let _cpu0 = execute_as(&MAP, 0x20);
+        assert_eq!(fx.k.executing_cpu_split(), CPU0);
+        assert_eq!(fx.k.current_cpu_split_read(), CPU0);
+        assert_eq!(fx.k.with(|s| s.current_cpu()), CPU0);
+        drop(_cpu0);
+        let _cpu1 = execute_as(&MAP, 0x07);
+        assert_eq!(fx.k.executing_cpu_split(), CPU1);
+        teardown();
+    }
+
+    /// THE DETERMINISTIC PUBLICATION CASE. The caller is blocked for the reply on CPU 0. CPU 1's
+    /// trap entry has rebound the ambient field to CPU 1. CPU 0 then runs the server's exit, and
+    /// CPU 0's trap tail drains CPU 0's queue. The deferred work must be in THAT queue.
+    /// (Fails on `8cb30dd1`: published on CPU 1's queue, CPU 0's drain finds nothing and the
+    /// caller is not woken.)
+    #[test]
+    fn deferred_work_reaches_the_queue_whose_trap_drains_it() {
+        let fx = fixture(true);
+        let _cpu0 = execute_as(&MAP, 0x20);
+        wait_in_lock(&fx, 0);
+        fx.k.with(|s| s.set_current_cpu(CPU1))
+            .expect("ambient → CPU 1");
+        fx.k.with(|s| s.exit_task(2, 0))
+            .expect("server exit on CPU 0");
+        assert_eq!(
+            crate::kernel::boot::server_death_work_len(0),
+            1,
+            "CPU 0's queue"
+        );
+        assert_eq!(
+            crate::kernel::boot::server_death_work_len(1),
+            0,
+            "not CPU 1's"
+        );
+        assert_eq!(
+            fx.k.drain_server_death_post_work(CPU0),
+            1,
+            "CPU 0's tail drains it"
+        );
+        assert_eq!(result(&fx), Some(SERVER_DIED));
+        teardown();
+    }
+
+    /// The same, read through the split seam a wake owner uses to home an unhomed task.
+    #[test]
+    fn an_unhomed_wake_is_homed_on_the_executing_cpu() {
+        let fx = fixture(true);
+        let _cpu0 = execute_as(&MAP, 0x20);
+        fx.k.with(|s| s.set_current_cpu(CPU1))
+            .expect("ambient → CPU 1");
+        let home = fx.k.fix_home_cpu_split(2, fx.k.executing_cpu_split());
+        assert_eq!(home, CPU0);
+        teardown();
+    }
+
+    /// A CPU whose APIC ID was never bound has no identity: the target halts
+    /// (`X86_EXECUTING_CPU_UNMAPPED`); the hosted model panics with the same name.
+    #[test]
+    #[should_panic(expected = "X86_EXECUTING_CPU_UNMAPPED")]
+    fn an_unbound_apic_id_is_no_cpu() {
+        let fx = fixture(true);
+        let _ghost = execute_as(&MAP, 0x01);
+        let _ = fx.k.executing_cpu_split();
+    }
+
+    /// Source: the x86_64 identity is the APIC map's answer with no fallback, the conflating
+    /// `apic == logical` registration is gone, and both executing-CPU seams use it.
+    #[test]
+    fn the_x86_identity_has_one_source_and_no_fallback() {
+        const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        const RT: &str = include_str!("../../runtime.rs");
+        const SCHED: &str = include_str!("scheduler_state.rs");
+        const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+        const BOOT: &str = include_str!("../../arch/x86_64/boot.rs");
+        let f = DT
+            .split("pub(crate) fn current_cpu_id() -> crate::kernel::scheduler::CpuId {")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
             .unwrap();
-        let take = in_lock
-            .find("take_unclaimed_server_death_locked(ipc, &identity)")
+        assert!(f.contains("executing_logical_cpu("));
+        assert!(f.contains("X86_EXECUTING_CPU_UNMAPPED"));
+        assert!(f.contains("halt_forever()"));
+        for fallback in [
+            "BOOTSTRAP_CPU_ID",
+            "MAX_CPUS",
+            "apic as u8",
+            "current_cpu\n",
+        ] {
+            assert!(!f.contains(fallback), "no fallback: {fallback}");
+        }
+        assert!(!DT.contains("APIC_TO_CPU_ID"));
+        assert!(!SCHED.contains("register_cpu_mapping"));
+        let ex = RT
+            .split("pub(crate) fn executing_cpu_split(&self) -> CpuId {")
+            .nth(1)
+            .unwrap()
+            .split("\n    }\n")
+            .next()
             .unwrap();
-        assert!(arm < take);
+        assert!(ex.contains(
+            "#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]\n        {\n            crate::arch::x86_64::descriptor_tables::current_cpu_id()"
+        ));
+        let cc = SCHED
+            .split("pub fn current_cpu(&self) -> CpuId {")
+            .nth(1)
+            .unwrap()
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        assert!(cc.contains("return crate::arch::x86_64::descriptor_tables::current_cpu_id();"));
+        // Bound before anything can ask; secondaries bound before their start-up IPI.
+        let prep = BOOT
+            .split("pub fn prepare_arch_boot(start_info_ptr: usize) {")
+            .nth(1)
+            .unwrap();
+        assert!(
+            prep.find("bind_bootstrap_cpu()").unwrap()
+                < prep
+                    .find("ensure_boot_descriptor_tables_scaffolded()")
+                    .unwrap()
+        );
+        let start = SMP.split("pub fn start_secondary_cpus(").nth(1).unwrap();
+        assert!(
+            start.find("bind_secondary_apic(apic_id, cpu)").unwrap()
+                < start.find("send_init_sipi_sipi(apic_id as u8)").unwrap()
+        );
     }
 }

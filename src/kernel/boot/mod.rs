@@ -63,14 +63,14 @@ mod ipc_state;
 // body are re-exported so the OFF-LOCK drain in `crate::runtime` can run the SAME body
 // through the `SharedKernel` split-mut seams (no duplicated transaction).
 pub(crate) use ipc_state::{
-    BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ReplyAuthorityReclaim,
-    ReplyAuthoritySlots, ReplyTimeoutDomains, ReplyWaitArm,
+    BlockingSendProducerOutcome, DetachOutcome, DirectReplyTerminalClaim, ParkedDeathHandoff,
+    ReplyAuthorityReclaim, ReplyAuthoritySlots, ReplyTimeoutDomains, ReplyWaitArm,
     arm_reply_terminal_for_committed_block_locked, claim_direct_reply_terminal_locked,
-    classify_direct_reply_terminal_locked, commit_queued_reply_locked,
-    commit_reply_terminal_locked, complete_reply_timeout_over, complete_server_death_over,
-    enqueue_reply_into_endpoint_locked, publish_recv_waiter_locked, reclaim_reply_authority_with,
-    release_reply_terminal_locked, reserve_direct_reply_record_locked,
-    take_unclaimed_server_death_locked,
+    claim_parked_server_death_on_arm_locked, classify_direct_reply_terminal_locked,
+    commit_queued_reply_locked, commit_reply_terminal_locked, complete_reply_timeout_over,
+    complete_server_death_over, enqueue_reply_into_endpoint_locked, log_parked_death_handoff,
+    publish_recv_waiter_locked, reclaim_reply_authority_with, release_reply_terminal_locked,
+    reserve_direct_reply_record_locked, take_claimable_server_death_locked,
 };
 pub(crate) mod cleared_current;
 pub(crate) mod exit_claim;
@@ -5994,8 +5994,9 @@ pub mod server_dies_counters {
     /// visibly >1 so an assertion cannot miss it.
     /// AP-SCHED3 — the drain TOOK the armed record's item but PARKED it, because its caller had
     /// not yet armed the reply wait: that take was not the item's consumption. Undo the count the
-    /// take made, so the one real consumption (after the arming requeues it, uncounted) counts
-    /// exactly once and the transition audit keeps its one-of-each shape.
+    /// take made, so the one real consumption (AP-SCHED4 §A1: the drain that takes it back from
+    /// the park, [`note_deferred_consumed`]) counts exactly once and the transition audit keeps
+    /// its one-of-each shape.
     pub fn note_deferred_parked(index: usize, generation: u64) {
         if matches_armed(index, generation) {
             let _ = COUNTS[Transition::DeferredConsumed as usize].fetch_update(
@@ -6288,6 +6289,81 @@ pub(crate) struct DeferredServerDeathCompletion {
     pub reply_record_generation: u64,
 }
 
+/// AP-SCHED3 / AP-SCHED4 §A1 — a server death parked on its reply record because its caller had
+/// not armed the reply wait yet. `claimable` is set, exactly once, by the arming of that exact
+/// record incarnation; from then on a post-lock drain may take it (see
+/// [`SERVER_DEATH_CLAIMABLE`]). Until a drain takes it, the record's park slot owns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ParkedServerDeath {
+    pub work: DeferredServerDeathCompletion,
+    pub claimable: bool,
+}
+
+/// AP-SCHED4 §A1 — one bit per reply-record slot: "this slot's parked death has been made
+/// claimable by its caller's arming; a drain should take it".
+///
+/// # Why a bitmap and not the per-CPU queue
+///
+/// AP-SCHED3 took the parked item OUT of the record and then reserved a slot on the executing
+/// CPU's queue for it. A refused reservation left the item owned by nobody: the park was already
+/// empty, and the caller — armed and blocked — waited for a deadline it may not have had. Whether
+/// a reservation could be refused depended on how many items other producers had queued on that
+/// CPU since its last drain, which no local argument bounds (an item published through an ambient
+/// CPU binding can sit on an idle CPU's queue).
+///
+/// Here the item never moves until it is accepted. The arming sets its `claimable` flag and this
+/// bit in the same rank-3 scope; setting a bit cannot fail and setting it twice is the same
+/// handoff. Every post-lock drain on every CPU — the arming CPU's own trap tail first among them —
+/// clears a set bit and, in one rank-3 scope, takes the slot's item if it is still claimable. So
+/// the item always has exactly one owner: the park slot, then the drain that took it.
+///
+/// It is a HINT, never an authority. A bit with no claimable item behind it (taken already by
+/// another drain, or never parked in this kernel instance) is cleared and ignored; the item, its
+/// generation and the terminal cell decide everything.
+pub(crate) const SD_CLAIM_WORDS: usize = MAX_REPLY_CAPS.div_ceil(64);
+static SERVER_DEATH_CLAIMABLE: [core::sync::atomic::AtomicU64; SD_CLAIM_WORDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; SD_CLAIM_WORDS];
+
+/// Set slot `index`'s claim bit. Called only inside the rank-3 scope that set its `claimable`.
+pub(crate) fn server_death_claimable_note(index: usize) {
+    if let Some(word) = SERVER_DEATH_CLAIMABLE.get(index / 64) {
+        word.fetch_or(1u64 << (index % 64), core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Clear and return the lowest set claim bit, if any. The caller owns the check of the slot it
+/// names: a cleared bit is acted on by exactly the drain that cleared it.
+pub(crate) fn server_death_claimable_take_next() -> Option<usize> {
+    for (w, word) in SERVER_DEATH_CLAIMABLE.iter().enumerate() {
+        let mut bits = word.load(core::sync::atomic::Ordering::Acquire);
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            let mask = 1u64 << bit;
+            let prev = word.fetch_and(!mask, core::sync::atomic::Ordering::AcqRel);
+            if prev & mask != 0 {
+                return Some(w * 64 + bit);
+            }
+            bits = prev & !mask;
+        }
+    }
+    None
+}
+
+/// Number of set claim bits (tests and diagnostics).
+pub(crate) fn server_death_claimable_pending() -> usize {
+    SERVER_DEATH_CLAIMABLE
+        .iter()
+        .map(|w| w.load(core::sync::atomic::Ordering::Acquire).count_ones() as usize)
+        .sum()
+}
+
+/// Clear every claim bit (hosted test isolation only).
+pub(crate) fn server_death_claimable_clear() {
+    for w in SERVER_DEATH_CLAIMABLE.iter() {
+        w.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Per-CPU deferred server-death slots, bounded by the reply-record store itself: there
 /// cannot be more outstanding records than slots, so the queue cannot overflow through
 /// legitimate use. No allocation happens on the teardown path.
@@ -6380,40 +6456,6 @@ pub(crate) fn server_death_work_publish(
         work.reply_record_generation,
     );
     true
-}
-
-/// AP-SCHED3 — republish a server death the drain parked because its caller had not yet armed
-/// its reply wait, onto `cpu_idx`'s queue (the CPU whose trap armed it, which drains it at that
-/// trap's tail). A full queue parks nothing and loses nothing silently: it is named, and the
-/// caller keeps its own deadline (or, with none, is the bounded failure this names).
-pub(crate) fn republish_unclaimed_server_death(
-    cpu_idx: usize,
-    work: DeferredServerDeathCompletion,
-) -> bool {
-    // The SAME publication, moved: requeued without counting a second one (the oracle's
-    // transition audit sees one reservation, one publication and one consumption).
-    let published = server_death_work_reserve(cpu_idx).is_some_and(|reservation| {
-        let mut q = SERVER_DEATH_POST_WORK[reservation.cpu_idx].lock();
-        let duplicate = q.iter().enumerate().any(|(i, s)| {
-            i != reservation.slot
-                && s.is_some_and(|w| {
-                    w.reply_record_index == work.reply_record_index
-                        && w.reply_record_generation == work.reply_record_generation
-                })
-        });
-        q[reservation.slot] = if duplicate { None } else { Some(work) };
-        !duplicate
-    });
-    crate::yarm_log!(
-        "IPC_SERVER_DEATH_REPUBLISHED_AT_WAIT cpu={} record_index={} record_generation={} server_tid={} server_asid={} result={}",
-        cpu_idx,
-        work.reply_record_index,
-        work.reply_record_generation,
-        work.exiting_server.tid.0,
-        work.exiting_server.asid.0,
-        if published { "ok" } else { "queue_full" }
-    );
-    published
 }
 
 /// Release a reservation without publishing (a failpoint or an aborted handoff).

@@ -27,7 +27,9 @@ impl KernelState {
                 .bring_up_cpu(cpu)
                 .map_err(map_scheduler_error)
         })?;
-        crate::arch::cpu_mapping::register_cpu_mapping(cpu);
+        // AP-SCHED4 §A2: no hardware-identity binding here. This used to bind APIC ID `cpu.0` to
+        // logical `cpu` on x86_64 — the assumption that the two numberings coincide. The binding is
+        // now made explicitly, from the CPU's real APIC ID, before that CPU is started.
         Ok(())
     }
 
@@ -93,7 +95,21 @@ impl KernelState {
         {
             return CpuId(crate::arch::aarch64::this_cpu_index() as u8);
         }
-        #[cfg(any(feature = "hosted-dev", not(target_arch = "aarch64")))]
+        // AP-SCHED4 §A2: this CPU's logical id from its own APIC ID, through the explicit map.
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+        {
+            return crate::arch::x86_64::descriptor_tables::current_cpu_id();
+        }
+        #[cfg(feature = "hosted-dev")]
+        {
+            if let Some(cpu) = crate::arch::x86_cpu_identity::hosted::executing_cpu_id() {
+                return cpu;
+            }
+        }
+        #[cfg(any(
+            feature = "hosted-dev",
+            not(any(target_arch = "aarch64", target_arch = "x86_64"))
+        ))]
         {
             self.with_scheduler_state(|sched| sched.current_cpu)
         }

@@ -15,7 +15,6 @@ pub mod aarch64_cpu_admission;
 #[cfg_attr(not(feature = "x86_64-uart-irq-witness"), allow(dead_code))]
 pub mod acpi_madt_rule;
 pub mod boot_entry;
-pub mod cpu_mapping;
 /// QEMU-IRQ1 §2 — the device-window readiness rule and the idle-origin external admission rule,
 /// arch-neutral so the hosted suite executes the rule the RISC-V port executes.
 pub mod device_window_rule;
@@ -41,6 +40,10 @@ pub mod riscv64;
 pub mod riscv_hart_admission;
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
+/// AP-SCHED4 §A2 — the x86_64 APIC-ID ↔ logical-CPU map and the executing-CPU lookup, arch-neutral
+/// so the hosted suite executes the lookup the x86_64 port performs on every trap.
+#[cfg(any(test, feature = "hosted-dev", target_arch = "x86_64"))]
+pub mod x86_cpu_identity;
 
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64 as selected_isa;

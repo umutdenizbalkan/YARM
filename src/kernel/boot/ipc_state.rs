@@ -1303,31 +1303,117 @@ pub(crate) fn arm_reply_terminal_for_committed_block_locked(
     ReplyWaitArm::Armed { identity, token }
 }
 
-/// AP-SCHED3 — take back a server death that was drained before this wait armed (rank 3).
+/// AP-SCHED4 §A1 — what an arming did with a server death parked on its record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParkedDeathHandoff {
+    /// Nothing parked for this record incarnation.
+    NothingParked,
+    /// The parked item is now claimable; it stays owned by the park until a drain takes it.
+    MarkedClaimable,
+    /// It was already claimable — this is the same handoff again, not a second one.
+    AlreadyClaimable,
+    /// The park held an item for an EARLIER incarnation of this record slot (the record was
+    /// reclaimed and reused before its caller ever armed). It names a record that no longer
+    /// exists, so it is discarded here, where the new incarnation proves it stale.
+    StaleDiscarded { generation: u64 },
+}
+
+impl ParkedDeathHandoff {
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::NothingParked => "nothing_parked",
+            Self::MarkedClaimable => "marked_claimable",
+            Self::AlreadyClaimable => "already_claimable",
+            Self::StaleDiscarded { .. } => "stale_discarded",
+        }
+    }
+}
+
+/// AP-SCHED3 / AP-SCHED4 §A1 — hand back a server death that was drained before this wait armed
+/// (rank 3, inside the scope that armed the cell).
 ///
-/// The post-lock drain parks an item in `reply_death_unclaimed` when the record it names is
-/// live at its generation but the record's terminal cell is not yet armed for that incarnation:
-/// the server took the call and exited before its caller blocked for the reply. The arming of
-/// that exact incarnation hands it back here, matched on record slot, record generation and the
-/// exact exiting replier incarnation the armed identity names, so the caller republishes it and
-/// the ordinary drain claims `PeerDeath` through the cell. Anything else stays put.
-pub(crate) fn take_unclaimed_server_death_locked(
+/// The post-lock drain parks an item in `reply_death_unclaimed` when the record it names is live
+/// at its generation but the record's terminal cell is not yet armed for that incarnation: the
+/// server took the call and exited before its caller blocked for the reply. The arming of that
+/// exact incarnation — matched on record slot, record generation and the exact exiting replier
+/// incarnation the armed identity names — marks it claimable IN PLACE and sets its claim bit, so
+/// the next post-lock drain (this CPU's own trap tail at the latest) takes it and claims
+/// `PeerDeath` through the cell. Nothing here can be refused: the item never leaves the slot until
+/// a drain accepts it.
+pub(crate) fn claim_parked_server_death_on_arm_locked(
     ipc: &mut IpcSubsystem,
     identity: &crate::kernel::terminal_ownership::TerminalIdentity,
-) -> Option<crate::kernel::boot::DeferredServerDeathCompletion> {
-    let slot = ipc
+) -> ParkedDeathHandoff {
+    let Some(slot) = ipc
         .reply_death_unclaimed
-        .get_mut(identity.reply_record_index)?;
-    let work = (*slot)?;
-    if work.reply_record_index != identity.reply_record_index
-        || work.reply_record_generation != identity.reply_record_generation
-        || work.exiting_server.tid != identity.replier_tid
+        .get_mut(identity.reply_record_index)
+    else {
+        return ParkedDeathHandoff::NothingParked;
+    };
+    let Some(parked) = slot.as_mut() else {
+        return ParkedDeathHandoff::NothingParked;
+    };
+    let work = parked.work;
+    if work.reply_record_index != identity.reply_record_index {
+        return ParkedDeathHandoff::NothingParked;
+    }
+    if work.reply_record_generation != identity.reply_record_generation {
+        // The arming names the slot's CURRENT generation; an item for any other is stale.
+        *slot = None;
+        return ParkedDeathHandoff::StaleDiscarded {
+            generation: work.reply_record_generation,
+        };
+    }
+    if work.exiting_server.tid != identity.replier_tid
         || work.exiting_server.asid != identity.replier_asid
     {
+        // Same record incarnation, different replier: not this wait's death. It stays parked;
+        // the drain's identity check would refuse it anyway.
+        return ParkedDeathHandoff::NothingParked;
+    }
+    if parked.claimable {
+        return ParkedDeathHandoff::AlreadyClaimable;
+    }
+    parked.claimable = true;
+    crate::kernel::boot::server_death_claimable_note(identity.reply_record_index);
+    ParkedDeathHandoff::MarkedClaimable
+}
+
+/// AP-SCHED4 §A1 — a drain accepting a claimable parked death (rank 3). `None` when the slot holds
+/// nothing claimable: another drain took it, or it is still waiting for its caller to arm.
+pub(crate) fn take_claimable_server_death_locked(
+    ipc: &mut IpcSubsystem,
+    index: usize,
+) -> Option<crate::kernel::boot::DeferredServerDeathCompletion> {
+    let slot = ipc.reply_death_unclaimed.get_mut(index)?;
+    if !slot.is_some_and(|p| p.claimable) {
         return None;
     }
-    *slot = None;
-    Some(work)
+    slot.take().map(|p| p.work)
+}
+
+/// AP-SCHED4 §A1 — the arming's handoff marker. Silent when nothing was parked, which is every
+/// ordinary reply wait.
+pub(crate) fn log_parked_death_handoff(
+    identity: &crate::kernel::terminal_ownership::TerminalIdentity,
+    handoff: ParkedDeathHandoff,
+) {
+    if handoff == ParkedDeathHandoff::NothingParked {
+        return;
+    }
+    let stale_generation = match handoff {
+        ParkedDeathHandoff::StaleDiscarded { generation } => generation,
+        _ => 0,
+    };
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_HANDED_BACK_AT_WAIT record_index={} record_generation={} server_tid={} server_asid={} handoff={} stale_generation={} result=ok",
+        identity.reply_record_index,
+        identity.reply_record_generation,
+        identity.replier_tid.0,
+        identity.replier_asid.0,
+        handoff.marker(),
+        stale_generation
+    );
 }
 
 /// 199D-TRC — the ONE terminal-arbitration policy for a direct (NR7) reply, rank 3 only.
@@ -2620,16 +2706,24 @@ impl KernelState {
 
     /// Arm the terminal-ownership cell co-located with reply-record slot `index`
     /// for the given identity (bumps the cell's internal epoch, publishes `Open`).
+    ///
+    /// AP-SCHED4 §A1: every arming through here — the production in-lock arm and the oracle's
+    /// confined arm alike — hands back a server death parked on this exact incarnation, in the
+    /// same rank-3 scope that armed the cell.
     pub(crate) fn arm_reply_terminal(
         &mut self,
         index: usize,
         identity: crate::kernel::terminal_ownership::TerminalIdentity,
-    ) {
-        self.with_ipc_state_mut(|ipc| {
-            if let Some(cell) = ipc.reply_terminal_ownership.get_mut(index) {
-                cell.arm(identity);
-            }
+    ) -> ParkedDeathHandoff {
+        let handoff = self.with_ipc_state_mut(|ipc| {
+            let Some(cell) = ipc.reply_terminal_ownership.get_mut(index) else {
+                return ParkedDeathHandoff::NothingParked;
+            };
+            cell.arm(identity);
+            claim_parked_server_death_on_arm_locked(ipc, &identity)
         });
+        log_parked_death_handoff(&identity, handoff);
+        handoff
     }
 
     /// Stage 200B — re-arm the terminal cell of reply-record slot `index` for a
@@ -3600,17 +3694,9 @@ impl KernelState {
         ) else {
             return;
         };
-        self.arm_reply_terminal(record_index, identity);
-        // AP-SCHED3: a server death already drained before this wait armed is handed back now,
-        // for the ordinary drain at this trap's tail to claim through the cell just armed.
-        if let Some(work) =
-            self.with_ipc_state_mut(|ipc| take_unclaimed_server_death_locked(ipc, &identity))
-        {
-            crate::kernel::boot::republish_unclaimed_server_death(
-                self.current_cpu().0 as usize,
-                work,
-            );
-        }
+        // AP-SCHED4 §A1: the arming also hands back a server death already drained before this
+        // wait armed; the post-lock drain at this trap's tail (or any earlier one) claims it.
+        let _ = self.arm_reply_terminal(record_index, identity);
         // Armed. Everything below is the DEADLINE half and runs only for a caller that asked.
         let Some(deadline_tick) = finite_deadline else {
             return;
@@ -3809,7 +3895,7 @@ impl KernelState {
         else {
             return;
         };
-        self.arm_reply_terminal(record_index, identity);
+        let _ = self.arm_reply_terminal(record_index, identity);
         let epoch = self.reply_terminal_epoch(record_index).unwrap_or(0);
         match self.register_reply_receive_deadline(
             record_index,

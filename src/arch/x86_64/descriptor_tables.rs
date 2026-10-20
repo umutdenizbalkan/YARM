@@ -313,10 +313,6 @@ fn maybe_attest_exit_common_epilogue(cpu: crate::kernel::scheduler::CpuId, owner
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static FATAL_LOG_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const UNMAPPED_CPU: usize = usize::MAX;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-static APIC_TO_CPU_ID: [AtomicUsize; 256] = [const { AtomicUsize::new(UNMAPPED_CPU) }; 256];
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_SHARED_KERNEL_PTR: core::sync::atomic::AtomicPtr<crate::runtime::SharedKernel> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -522,10 +518,9 @@ fn encode_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn install_trap_shared_kernel(shared: &'static crate::runtime::SharedKernel) {
-    register_apic_cpu_mapping(
-        raw_current_apic_id() as u8,
-        crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID),
-    );
+    // AP-SCHED4 §A2: the boot CPU bound itself in `prepare_arch_boot`; re-binding the identical
+    // pair is the check that nothing rebound it since.
+    bind_bootstrap_cpu();
     TRAP_SHARED_KERNEL_PTR.store(shared as *const _ as *mut _, Ordering::SeqCst);
 }
 
@@ -552,25 +547,71 @@ fn raw_current_apic_id() -> u32 {
     core::arch::x86_64::__cpuid(1).ebx >> 24
 }
 
+/// AP-SCHED4 §A2 — bind `apic_id` ↔ `cpu` in the port's one APIC map
+/// ([`crate::arch::x86_cpu_identity::X86_APIC_MAP`]). Made on the boot CPU, before the bound CPU
+/// executes anything that asks who it is. A refusal binds nothing and is reported to the caller,
+/// which must not start that CPU.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-pub fn register_apic_cpu_mapping(apic_id: u8, cpu: crate::kernel::scheduler::CpuId) {
-    APIC_TO_CPU_ID[apic_id as usize].store(cpu.0 as usize, Ordering::Release);
+pub fn register_apic_cpu_mapping(
+    apic_id: u32,
+    cpu: crate::kernel::scheduler::CpuId,
+) -> Result<(), crate::arch::x86_cpu_identity::BindError> {
+    match crate::arch::x86_cpu_identity::X86_APIC_MAP.bind(apic_id, cpu.0) {
+        Ok(bound) => {
+            crate::yarm_log!(
+                "X86_APIC_CPU_BOUND apic_id={} cpu={} new={} result=ok",
+                apic_id,
+                cpu.0,
+                u8::from(bound == crate::arch::x86_cpu_identity::Bound::New)
+            );
+            Ok(())
+        }
+        Err(why) => {
+            crate::yarm_log!(
+                "X86_APIC_CPU_BIND_REFUSED apic_id={} cpu={} reason={} result=fail",
+                apic_id,
+                cpu.0,
+                why.marker()
+            );
+            Err(why)
+        }
+    }
 }
 
+/// AP-SCHED4 §A2 — bind the boot CPU's own APIC ID to the boot logical CPU. Runs first in
+/// `prepare_arch_boot`, before any code can ask which CPU is executing, and again (idempotently) at
+/// trap installation. The boot CPU's APIC ID is whatever firmware gave it; it is never assumed 0.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub fn bind_bootstrap_cpu() {
+    // Silent on success: this runs before the console is known to be usable. The boot CPU's
+    // binding is reported by `X86_APIC_CPU_MAP` once SMP start-up has bound every secondary.
+    let apic = raw_current_apic_id();
+    if crate::arch::x86_cpu_identity::X86_APIC_MAP
+        .bind(apic, crate::arch::platform_layout::BOOTSTRAP_CPU_ID)
+        .is_err()
+    {
+        debug_uart_trap_breadcrumb(b'B', 0, 0, 0, 0, u64::from(apic));
+        halt_forever();
+    }
+}
+
+/// AP-SCHED4 §A2 — the logical CPU executing this code, authenticated: this CPU's own APIC ID
+/// (`CPUID.01H`, which software cannot rewrite) resolved through the explicit map, and nothing
+/// else. An APIC ID with no binding is a CPU the kernel never admitted executing kernel code; that
+/// is fatal, because any answer would publish per-CPU work into a queue no trap of THIS CPU drains.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub(crate) fn current_cpu_id() -> crate::kernel::scheduler::CpuId {
-    let apic = raw_current_apic_id() as usize;
-    if let Some(mapped) = APIC_TO_CPU_ID
-        .get(apic)
-        .map(|slot| slot.load(Ordering::Acquire))
-        .filter(|mapped| *mapped != UNMAPPED_CPU && *mapped < crate::kernel::scheduler::MAX_CPUS)
-    {
-        return crate::kernel::scheduler::CpuId(mapped as u8);
-    }
-    if apic < crate::kernel::scheduler::MAX_CPUS {
-        crate::kernel::scheduler::CpuId(apic as u8)
-    } else {
-        crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID)
+    let apic = raw_current_apic_id();
+    match crate::arch::x86_cpu_identity::executing_logical_cpu(
+        &crate::arch::x86_cpu_identity::X86_APIC_MAP,
+        apic,
+    ) {
+        Some(logical) => crate::kernel::scheduler::CpuId(logical),
+        None => {
+            debug_uart_trap_breadcrumb(b'U', 0, 0, 0, 0, u64::from(apic));
+            crate::yarm_log!("X86_EXECUTING_CPU_UNMAPPED apic_id={} result=fatal", apic);
+            halt_forever();
+        }
     }
 }
 

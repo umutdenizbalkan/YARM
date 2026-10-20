@@ -1902,6 +1902,8 @@ pub fn run_with_prepared_kernel(run: fn(crate::runtime::BootExclusive)) {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn prepare_arch_boot(start_info_ptr: usize) {
+    // AP-SCHED4 §A2: before anything can ask which CPU is executing.
+    crate::arch::x86_64::descriptor_tables::bind_bootstrap_cpu();
     crate::arch::x86_64::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
     crate::arch::x86_64::console::write_line("KM0");
     crate::arch::x86_64::console::write_line("KM1");

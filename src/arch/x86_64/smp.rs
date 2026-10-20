@@ -653,6 +653,32 @@ pub fn set_ap_rust_entry_enabled(enabled: bool) {
     AP_RUST_ENTRY_ENABLE.store(enabled, core::sync::atomic::Ordering::Release);
 }
 
+/// AP-SCHED4 §A2 — bind a secondary's APIC ID to its logical id; `false` binds nothing.
+fn bind_secondary_apic(apic_id: u32, cpu: CpuId) -> bool {
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        super::descriptor_tables::register_apic_cpu_mapping(apic_id, cpu).is_ok()
+    }
+    #[cfg(feature = "hosted-dev")]
+    {
+        crate::arch::x86_cpu_identity::hosted::map()
+            .bind(apic_id, cpu.0)
+            .is_ok()
+    }
+}
+
+/// AP-SCHED4 §A2 — the APIC ID `cpu` was bound to before it was started, if any.
+fn bound_apic_id(cpu: CpuId) -> Option<u32> {
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        crate::arch::x86_cpu_identity::X86_APIC_MAP.apic_for(cpu.0)
+    }
+    #[cfg(feature = "hosted-dev")]
+    {
+        crate::arch::x86_cpu_identity::hosted::map().apic_for(cpu.0)
+    }
+}
+
 pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelError> {
     let present = kernel.present_cpu_bitmap();
     let mut rust_online_aps = 0usize;
@@ -700,9 +726,18 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             AP_READY_POLL_ITERS
         );
 
+        // AP-SCHED4 §A2: bind this CPU's hardware identity to its logical id BEFORE it can run
+        // anything that asks which CPU is executing. Today's present set is numbered by APIC ID
+        // (the platform layout's `-smp` model), so the APIC ID targeted below is `cpu.0`; that
+        // assumption lives here and in the start-up IPI target only, never in the lookup.
+        let apic_id = u32::from(cpu.0);
+        if !bind_secondary_apic(apic_id, cpu) {
+            crate::yarm_log!("YARM_SMP_AP_BIND_REFUSED cpu={} apic_id={}", cpu.0, apic_id);
+            continue;
+        }
         crate::yarm_log!("X86_AP_INIT_SENT cpu={}", cpu.0);
         crate::yarm_log!("X86_AP_STARTUP_SENT cpu={}", cpu.0);
-        send_init_sipi_sipi(cpu.0);
+        send_init_sipi_sipi(apic_id as u8);
 
         #[cfg(any(test, feature = "hosted-dev"))]
         AP_READY_FLAGS[cpu.0 as usize].store(true, Ordering::Release);
@@ -958,7 +993,8 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
 
                     // 4. LAPIC access: the AP read ITS OWN LAPIC ID register over MMIO
                     //    under the kernel CR3; the id must match this cpu's APIC id.
-                    let lapic_ok = (env & ap_env::LAPIC_READ) != 0 && lapic_id == cpu.0 as u32;
+                    let want_apic = bound_apic_id(cpu);
+                    let lapic_ok = (env & ap_env::LAPIC_READ) != 0 && Some(lapic_id) == want_apic;
                     if lapic_ok {
                         crate::yarm_log!("X86_AP_LAPIC_OK cpu={} apic_id={}", cpu.0, lapic_id);
                     } else if (env & ap_env::LAPIC_READ) == 0 {
@@ -968,10 +1004,10 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                         );
                     } else {
                         crate::yarm_log!(
-                            "X86_AP_LAPIC_BAD cpu={} reason=id_mismatch got={} want={}",
+                            "X86_AP_LAPIC_BAD cpu={} reason=id_mismatch got={} want={:?}",
                             cpu.0,
                             lapic_id,
-                            cpu.0
+                            want_apic
                         );
                     }
 

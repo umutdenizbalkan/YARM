@@ -4166,8 +4166,13 @@ impl SharedKernel {
     ///
     /// * RISC-V (the selected two-dispatcher configuration): derived from the trap stack this code
     ///   runs on — the trap bridge's own authority.
-    /// * x86_64 / AArch64 / hosted: one dispatcher, so the bound field names exactly the CPU that
-    ///   dispatches and therefore executes; unchanged.
+    /// * AArch64: the CPU's own `TPIDR_EL1` logical id (AP-SCHED3 §C).
+    /// * x86_64: the CPU's own APIC ID resolved through the explicit APIC map (AP-SCHED4 §A2). It
+    ///   used to fall back to the ambient field, which another CPU's trap entry rebinds at any time
+    ///   once two CPUs trap concurrently, so per-CPU work published here could land in a queue
+    ///   whose CPU is idle rather than the one whose trap tail drains next.
+    /// * hosted: the same x86_64 lookup when a test simulates a hardware read
+    ///   ([`crate::arch::x86_cpu_identity::hosted`]); otherwise the single-CPU bound field.
     ///
     /// A woken task practically always has a home already (it was enqueued once before it could
     /// block); this decides only the first placement of one that somehow has none.
@@ -4181,12 +4186,15 @@ impl SharedKernel {
         {
             CpuId(crate::arch::aarch64::this_cpu_index() as u8)
         }
-        #[cfg(not(all(
-            not(feature = "hosted-dev"),
-            any(target_arch = "riscv64", target_arch = "aarch64")
-        )))]
+        // AP-SCHED4 §A2: the executing CPU's own APIC ID, through the map; never the ambient one.
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
         {
-            self.with_scheduler_split_mut(|sched| sched.current_cpu)
+            crate::arch::x86_64::descriptor_tables::current_cpu_id()
+        }
+        #[cfg(feature = "hosted-dev")]
+        {
+            crate::arch::x86_cpu_identity::hosted::executing_cpu_id()
+                .unwrap_or_else(|| self.with_scheduler_split_mut(|sched| sched.current_cpu))
         }
     }
 
@@ -7071,7 +7079,7 @@ impl SharedKernel {
         crate::kernel::recv_waiter_split::PublishWaiterOutcome,
         crate::kernel::boot::ReplyWaitArm,
     ) {
-        let mut unclaimed_death = None;
+        let mut death_handoff = crate::kernel::boot::ParkedDeathHandoff::NothingParked;
         let (outcome, armed) = self.with_ipc_split_mut(|ipc| {
             let outcome = crate::kernel::boot::publish_recv_waiter_locked(
                 ipc,
@@ -7099,22 +7107,21 @@ impl SharedKernel {
             } else {
                 crate::kernel::boot::ReplyWaitArm::NotAReplyWait
             };
-            // AP-SCHED3: in the SAME rank-3 scope as the arm, take back a server death the drain
+            // AP-SCHED3: in the SAME rank-3 scope as the arm, hand back a server death the drain
             // parked because this wait had not armed yet. Only a wait that stays blocked (Armed,
             // not DeadlineRefused, which unwinds) takes it.
+            //
+            // AP-SCHED4 §A1: handed back IN PLACE — the park keeps the item and marks it
+            // claimable, so no queue slot has to be won after the item has left its owner. The
+            // post-lock drain at this trap's tail (or any CPU's earlier one) takes it from there.
             if let crate::kernel::boot::ReplyWaitArm::Armed { identity, .. } = &armed {
-                unclaimed_death =
-                    crate::kernel::boot::take_unclaimed_server_death_locked(ipc, identity);
+                death_handoff =
+                    crate::kernel::boot::claim_parked_server_death_on_arm_locked(ipc, identity);
             }
             (outcome, armed)
         });
-        // ...and republish it, after the scope, onto the executing CPU's queue: the drain at this
-        // trap's tail then claims `PeerDeath` through the cell just armed, and wakes the caller.
-        if let Some(work) = unclaimed_death {
-            crate::kernel::boot::republish_unclaimed_server_death(
-                self.executing_cpu_split().0 as usize,
-                work,
-            );
+        if let crate::kernel::boot::ReplyWaitArm::Armed { identity, .. } = &armed {
+            crate::kernel::boot::log_parked_death_handoff(identity, death_handoff);
         }
         if matches!(
             outcome,
@@ -14738,11 +14745,55 @@ impl SharedKernel {
     /// A LOSING item (reply, timeout, caller exit or endpoint destruction already won) is
     /// still consumed exactly once: it is removed from the queue before the transaction
     /// runs, so it can never loop or remain queued.
+    ///
+    /// AP-SCHED4 §A1: it then accepts every parked death its caller's arming has made claimable
+    /// (`SERVER_DEATH_CLAIMABLE`), from any CPU — the arming CPU's own trap tail reaches here after
+    /// the arm, so a claimable item always has a drain coming. Each is taken from its park slot in
+    /// one rank-3 scope and settled exactly as a queued item is.
     pub(crate) fn drain_server_death_post_work(&self, cpu: CpuId) -> usize {
         let cpu_idx = cpu.0 as usize;
         let mut drained = 0usize;
         while let Some(work) = crate::kernel::boot::server_death_work_drain_next(cpu_idx) {
             drained += 1;
+            self.settle_deferred_server_death(cpu_idx, work);
+        }
+        while let Some(index) = crate::kernel::boot::server_death_claimable_take_next() {
+            let Some(work) = self.with_ipc_split_mut(|ipc| {
+                crate::kernel::boot::take_claimable_server_death_locked(ipc, index)
+            }) else {
+                // A hint with nothing claimable behind it: another drain took the item first.
+                continue;
+            };
+            drained += 1;
+            // The one real consumption of a parked item (its first take was un-counted when it
+            // was parked).
+            #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+            crate::kernel::boot::server_dies_counters::note_deferred_consumed(
+                work.reply_record_index,
+                work.reply_record_generation,
+            );
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_CLAIMED_FROM_PARK cpu={} record_index={} record_generation={} server_tid={} server_asid={} result=ok",
+                cpu_idx,
+                work.reply_record_index,
+                work.reply_record_generation,
+                work.exiting_server.tid.0,
+                work.exiting_server.asid.0
+            );
+            self.settle_deferred_server_death(cpu_idx, work);
+        }
+        drained
+    }
+
+    /// One deferred server-death item, owned by this drain: revalidate it against the record and
+    /// its armed terminal identity, then complete it through the single terminal arbitration —
+    /// or park it on its record when its caller has not armed yet.
+    fn settle_deferred_server_death(
+        &self,
+        cpu_idx: usize,
+        work: crate::kernel::boot::DeferredServerDeathCompletion,
+    ) {
+        {
             // ── Stage 200D-2B1A (§2/§4): the post-lock boundary attestation ──────────────
             //
             // Every caller of this drain reaches it only after its architecture's broad
@@ -14795,7 +14846,12 @@ impl SharedKernel {
                     .is_some_and(|r| r.is_some());
                 if record_live && identity.reply_record_generation != work.reply_record_generation {
                     if let Some(slot) = ipc.reply_death_unclaimed.get_mut(work.reply_record_index) {
-                        *slot = Some(work);
+                        // A slot already holding an item for another generation holds a stale
+                        // one: this item's generation is the record's current one (checked above).
+                        *slot = Some(crate::kernel::boot::ParkedServerDeath {
+                            work,
+                            claimable: false,
+                        });
                         parked = true;
                     }
                 }
@@ -14814,7 +14870,7 @@ impl SharedKernel {
                     work.exiting_server.tid.0,
                     work.exiting_server.asid.0
                 );
-                continue;
+                return;
             }
             let Some(identity) = armed else {
                 crate::yarm_log!(
@@ -14822,7 +14878,7 @@ impl SharedKernel {
                     work.reply_record_index,
                     work.reply_record_generation
                 );
-                continue;
+                return;
             };
             // The item must still describe the record it was published for, and that record
             // must still name the exact exiting incarnation — numeric TID alone never
@@ -14855,7 +14911,7 @@ impl SharedKernel {
                     "IPC_SERVER_DEATH_DRAIN outcome=stale_identity record_index={} caller_wakes=0 result=ok",
                     work.reply_record_index
                 );
-                continue;
+                return;
             }
             let mut d = OffLockReplyTimeout(self);
             let outcome = crate::kernel::boot::complete_server_death_over(&mut d, &identity);
@@ -14866,7 +14922,6 @@ impl SharedKernel {
                 work.reply_record_generation
             );
         }
-        drained
     }
 
     /// Stage 200D — register the bounded reverse link through the rank-2 TASK seam (never
