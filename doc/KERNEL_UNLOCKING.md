@@ -30011,3 +30011,159 @@ boot budget):
 server-death, exit-current-task, supervisor restart, shared-region direct and ipccall direct — ok.
 RISC-V: AP-scheduling witness at 4 and 8 harts, UART IRQ, SMP3, LOCK1 (re-freeze), VM
 invalidation (re-freeze), server-death — ok. x86_64: SMP1, LOCK3, CONTEXT1, server-death — ok.
+
+## APS4 — AP-SCHED4: x86_64 production SMP
+
+AP-SCHED4 runs in two stages, each frozen, qualified and delivered on its own:
+
+* **§A** — the correctness repairs production SMP needs first: a lossless server-death handoff,
+  and the x86_64 executing CPU taken from the CPU's own APIC ID;
+* **§B** — x86_64 production admission (up to 8 logical CPUs), scheduling, timers, IPIs,
+  evidence and qualification.
+
+### §A — server-death handoff and the authenticated executing CPU
+
+#### 1. The parked server death could be lost
+
+**Reachability.** A server that dies after its caller's call commits but before the caller's
+wait is armed leaves a deferred completion that cannot be applied yet. AP-SCHED3 parked it in
+`reply_death_unclaimed[record]`; arming the wait took it back and republished it to the arming
+CPU's post-work queue. A refused republish (a full queue) logged and dropped the item, and nothing
+ever revisited it: the caller waited for good (untimed), or until its timeout (timed), which
+reports the wrong terminal. The refusal is reachable. Items are routed by the CPU that produced
+them, so one idle CPU's queue can hold work no trap drains, and the queue bound alone does not
+bound occupancy. The base reproduction (`8cb30dd1` plus the adapted module) shows it
+deterministically. `base_the_refused_republish_loses_the_death_for_good` passes on the base (the
+loss is real), and the full-queue in-lock and split arm cases fail there.
+
+**The repair: the park owns the item until a drain takes it.** The park slot holds
+`ParkedServerDeath { work, claimable }`. Arming a wait no longer moves the item: in the same
+acquisition that arms the reply terminal, `claim_parked_server_death_on_arm_locked` marks it
+claimable in place and sets its bit in the global claim bitmap `SERVER_DEATH_CLAIMABLE`. The
+arm reports one of four outcomes:
+
+* `NothingParked`;
+* `MarkedClaimable`;
+* `AlreadyClaimable` — a second arming; not a second owner;
+* `StaleDiscarded { generation }` — a park from an older record generation, cleared.
+
+Every CPU's trap-tail drain (x86_64 and AArch64 in `handle_trap_entry_shared`, RISC-V in its
+phase 3) is one loop:
+
+1. take queued work;
+2. otherwise take one claimable park through `take_claimable_server_death_locked`;
+3. settle it through the unchanged `complete_server_death_over`.
+
+So the terminal is still arbitrated by one owner. The arming CPU's own trap tail always runs
+after the arm, so a consumer is guaranteed to revisit the item. A bit with no claimable item
+settles nothing. "Already queued exactly" (the item stays in its queue) and "could not queue"
+(no longer a state) are distinct by construction.
+
+**Tests** (`ap_sched4_a`, 19 cases; production owners throughout):
+
+* early death against timed and untimed callers, in-lock and split;
+* any CPU's drain accepting the item, and only one doing so;
+* a full queue at the in-lock and at the split arm;
+* a second arming;
+* duplicate publication before and after the hand-back;
+* a stale park, and record reuse after the hand-back;
+* another replier;
+* a claim bit with no item.
+
+#### 2. x86_64's executing CPU is the CPU's own identity
+
+`executing_cpu_split` read the ambient `sched.current_cpu`, which on x86_64 names whichever CPU
+last wrote it. The repair:
+
+* `KernelState::current_cpu()` and `executing_cpu_split` take the logical CPU from the executing
+  CPU's APIC ID, through an explicit APIC-to-logical map (`arch::x86_cpu_identity::ApicCpuMap`: a
+  partial bijection with typed refusals);
+* an unmapped APIC ID halts (`X86_EXECUTING_CPU_UNMAPPED`);
+* the logical id and the APIC ID are never assumed equal, and the boot CPU is bound first, at its
+  own APIC ID.
+
+Consumers traced:
+
+* the blocking-send commit;
+* the three wake-homing sites;
+* `current_cpu_split_read`;
+* the exit transaction;
+* every in-lock `current_cpu()`.
+
+The remaining direct ambient reads are D6-genuine diagnostics, and the one-dispatcher
+authentication that refuses multi-dispatcher states. Hosted builds simulate the hardware read
+(`execute_as`). `the_executing_cpu_ignores_an_ambient_field_naming_another_cpu` and
+`deferred_work_reaches_the_queue_whose_trap_drains_it` set the ambient field to another CPU, and
+the publication still reaches the queue the executing CPU's trap drains. The second case fails
+on the base.
+
+#### Controls (hosted, on the frozen candidate)
+
+| Control | Verdict |
+|---|---|
+| the arm does not hand the park back | 11 of 19 fail |
+| the drain ignores claimable parks | 12 of 19 fail |
+| the executing CPU is the ambient field | 4 of 19 fail, including the wrong-queue case |
+
+#### Qualification
+
+**Failed and superseded candidates, kept.**
+
+* `585cb56b` (qa2) failed four gates:
+  * the oracle gate (`i10` and `w02` counted the drain markers in a helper, and a second
+    consumption site);
+  * the census scanner;
+  * the integration suite (thread-local `.with` read as a broad acquisition);
+  * two new never-used warnings.
+
+  These were repaired in `a36a041b` (one drain loop, the count at the real take) and `045eae46`
+  (`LocalKey::with`; test-only helpers).
+* `045eae46` (qa3) passed every gate but LOCK3. That failure was one SMP1 ordering check: the
+  client's context check printed before CPU 1's `X86_BSP_RESCHEDULE_IPI_SENT`.
+
+  **The mechanism.** The reply commits the client's enqueue and only then prints the request. In
+  the failing boot, CPU 0 was still in the kernel finishing an idle dispatch. It revalidated
+  (`EXIT_TASK_OWNER_REVALIDATED … committed=replacement next_tid=21205`) and ran the client before
+  CPU 1's line reached the console.
+
+  **The incidence.** 1 of 19 candidate boots and 0 of 18 base boots (3+15 repeats each; the
+  repeat loop's LOCK3 artifact check was misconfigured, so only its SMP1 verdicts count). Stage A
+  does not change that path.
+
+  **The repair** (`8a7cfe08`, a script-only commit). The grader now grades the causal edges:
+  * the reply starts after the server's check;
+  * the request follows the reply's start;
+  * the client (no deadline, `reply=ok`) checks after the reply started.
+
+  The one-request count is unchanged. Regraded: the failing boot passes, a passing boot passes,
+  and a control that moves the client's check before the reply fails.
+
+**The candidate**: `8a7cfe08ddcfcc2031d5ca00bd92c1a2a4f0d52a` (tree `44a84422…`). Its
+qualification is qa3 on `045eae46` plus a re-freeze run. The re-freeze re-ran every gate whose
+inputs include the changed script (the SMP1 and LOCK3 scope suites, SMP1 and LOCK3) and proved
+byte identity of the three default kernels: x86_64 `18c591a9…`, AArch64 `0c632fa1…`, RISC-V
+`d5e7f730…`.
+
+| Gate | Result |
+|---|---|
+| focused / hosted / integration / census scanner | 67 / 6170 / 308 / 17 passed |
+| oracle feature | 341 passed; `w01_every_drain_caller_is_post_lock` fails, as on the base (same test, same failure) |
+| `cargo fmt --check`; ownership census | clean; production lines identical to the base |
+| freestanding warnings, three ports | identical named classes and counts to the base (177 / 205 / 188) |
+| image checks | x86_64 12 sites, AArch64 9, RISC-V 8: ok |
+| strict cores | x86_64 at 1, 2, 3, 4 and 8 CPUs; AArch64; RISC-V: ok |
+| server-death, three ports | ok (one live cell, one caller wake, one peer-death winner each) |
+| x86_64: SMP1, LOCK3 (re-freeze), CONTEXT1, overtaken, UART IRQ, ipccall direct, shared region, XFER2 | ok |
+| x86_64 D6: D6_SWITCH_PROOF, D6_SWITCH_A, SPAWN_LIFECYCLE | ok |
+| x86_64 D6_GENUINE | fails: `D6_GENUINE_MUT_DISPATCH_{STEP_SPLIT,DONE,COUNT}` missing; the fresh base fails identically |
+| RISC-V AP-SCHED2 and AArch64 AP-SCHED3 witnesses at 4 CPUs | ok |
+| x86_64 ipccall direct SMP | `result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired`, exit 0, as before |
+
+**Interrupted, not failed.** The container restarted during qa3's shared-region gate; the run was
+resumed and the gate re-run (its partial log kept). The resume's first attempt at the D6 profiles
+booted against non-strict artifacts and was refused by the artifact binding; the re-freeze run
+built the strict core's artifacts and ran them.
+
+**Delivered** `8a7cfe08` to `main`, `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/ap-sched4` by
+fast-forward from `8cb30dd1`. The remote commit and tree are equal on all three. The ref diff is
+exactly those three refs (one of them new).
