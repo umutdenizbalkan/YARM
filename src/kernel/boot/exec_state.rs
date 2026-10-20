@@ -4717,8 +4717,14 @@ impl crate::runtime::SharedKernel {
         };
         // (4) Lock-free: activate the incoming address space — the same two free functions
         // `Hal::switch_address_space` calls, which `dispatch_next_task` uses at this exact point.
+        // AP-SCHED4 §B: on x86_64 a root this CPU already holds is not reloaded (the rule and its
+        // argument are at `direct_dispatch_activate_asid_split`).
         if let Some(asid) = incoming_asid {
-            if crate::arch::hal_adapters::switch_address_space(asid) {
+            #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+            let resident = crate::arch::hal::x86_user_root_resident(cpu, asid);
+            #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+            let resident = false;
+            if !resident && crate::arch::hal_adapters::switch_address_space(asid) {
                 crate::arch::hal::note_address_space_activated(cpu, asid);
             }
         }

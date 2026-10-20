@@ -203425,6 +203425,59 @@ mod ap_sched4_b {
         assert!(cap < gate && gate < fw && fw < d2 && d2 < re && re < log);
     }
 
+    /// x86_64's exact-token resume loads no CR3 for a root the executing CPU already holds: the
+    /// check comes before the activation, needs BOTH this CPU's record and the hardware CR3, and
+    /// is x86_64-only (RISC-V keeps its own `satp` write, AArch64 its activation).
+    #[test]
+    fn the_x86_resume_into_a_resident_root_loads_no_cr3() {
+        let rt = include_str!("../../runtime.rs");
+        let body = rt
+            .split("pub(crate) fn direct_dispatch_activate_asid_split(")
+            .nth(1)
+            .expect("the activation")
+            .split("\n    }\n")
+            .next()
+            .expect("its body");
+        let gate = body
+            .find("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]\n        if crate::arch::hal::x86_user_root_resident(cpu, asid) {\n            return Some(asid.0);")
+            .expect("the x86 resident gate");
+        let tcb = body
+            .find(".filter(|asid| *asid == expected)")
+            .expect("the token's ASID");
+        let switch = body
+            .find("crate::arch::hal_adapters::switch_address_space(asid)")
+            .expect("the activation");
+        assert!(
+            tcb < gate && gate < switch,
+            "token check, then the gate, then the load"
+        );
+        let hal = include_str!("../../arch/hal.rs");
+        let helper = hal
+            .split("pub(crate) fn x86_user_root_resident(cpu: CpuId, asid: Asid) -> bool {")
+            .nth(1)
+            .expect("the helper")
+            .split("\n}\n")
+            .next()
+            .expect("its body");
+        assert!(helper.contains("active_address_space(cpu) == Some(asid)\n        &&"));
+        assert!(helper.contains("cr3 == crate::arch::x86_64::page_table::read_hw_cr3()"));
+        assert!(!helper.contains("||"));
+        // The queue-advance commit's activation keeps the same rule.
+        let ex = include_str!("exec_state.rs");
+        let commit = ex
+            .split("pub(crate) fn queue_advance_commit_split(")
+            .nth(1)
+            .expect("the commit");
+        let res = commit
+            .find("let resident = crate::arch::hal::x86_user_root_resident(cpu, asid);")
+            .expect("the x86 resident check");
+        let load = commit
+            .find("if !resident && crate::arch::hal_adapters::switch_address_space(asid) {")
+            .expect("the gated load");
+        assert!(res < load);
+        assert!(commit[res..load].contains("let resident = false;"));
+    }
+
     /// The lane rule itself, per port.
     #[test]
     fn the_resume_tls_lane_rule() {

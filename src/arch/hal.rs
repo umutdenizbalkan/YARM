@@ -58,6 +58,18 @@ pub(crate) fn note_address_space_activated(cpu: CpuId, asid: Asid) {
     }
 }
 
+/// AP-SCHED4 §B — x86_64: is `asid`'s root loaded on `cpu` right now, with `cpu`'s record naming
+/// `asid`? Both, or the answer is no. Every path that changes the record loads CR3 first
+/// (activation, the kernel-root transition), so a record that names `asid` while the hardware
+/// holds `asid`'s CR3 has named it continuously since that CR3's last load — and that load
+/// flushed the PCID. `cpu` must be the executing CPU.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn x86_user_root_resident(cpu: CpuId, asid: Asid) -> bool {
+    active_address_space(cpu) == Some(asid)
+        && crate::arch::x86_64::page_table::cr3_for_asid(asid)
+            .is_some_and(|cr3| cr3 == crate::arch::x86_64::page_table::read_hw_cr3())
+}
+
 /// The address space currently activated on `cpu`, or `None` if none has been.
 pub(crate) fn active_address_space(cpu: CpuId) -> Option<Asid> {
     let idx = cpu.0 as usize;

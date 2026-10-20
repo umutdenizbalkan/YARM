@@ -5075,6 +5075,19 @@ impl SharedKernel {
             // VM-INVALIDATION1: recorded after the load, like every activation.
             crate::arch::hal::note_address_space_activated(cpu, asid);
         }
+        // AP-SCHED4 §B: x86_64 — a resume into the root this CPU already holds, under a record
+        // that has named it since that root's last load, loads nothing. Every CR3 load is a full
+        // flush of the PCID (no load composes the no-flush bit), and a timer preemption that
+        // resumes the same task re-entered here and reloaded CR3, flushing translations the
+        // task's own CPU was entitled to keep. The QEMU-SMP1 residency probe caught it once
+        // production SMP moved the timer into its window; the base fails the same way with a
+        // shorter quantum. Nothing is lost by skipping the load: while the record names this
+        // ASID every remote invalidation of it targets this CPU, and the requester's own CPU
+        // retires its translation locally (`complete_unmap_shootdown_from_split`).
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+        if crate::arch::hal::x86_user_root_resident(cpu, asid) {
+            return Some(asid.0);
+        }
         #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
         if crate::arch::hal_adapters::switch_address_space(asid) {
             crate::arch::hal::note_address_space_activated(cpu, asid);
