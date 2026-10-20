@@ -3616,7 +3616,13 @@ mod ipccall_direct_oracle_core {
         // `VM_FULL reason=mapping_bookkeeping_full`, which is exactly what it did. That pressure
         // is deferred by directive; confining the fix to the port that needs it keeps the other
         // two images byte-identical rather than spending the headroom on them.
-        #[cfg(target_arch = "riscv64")]
+        //
+        // AP-SCHED4 §B: x86_64 now needs it too. With production SMP the server child can be
+        // placed on CPU 1, and the reply wake then resumes this client on CPU 0 while the server
+        // is still before its duplicate attempt — a Stage B qualification boot reported
+        // `duplicate_reply=0` with the reply itself intact. The NR 30 grant witness (XFER2) is
+        // re-run against the grown x86 init image.
+        #[cfg(any(target_arch = "riscv64", target_arch = "x86_64"))]
         {
             let mut dup_waits = 0;
             while SERVER_DUP_REJECTED.load(Relaxed) == 0 && dup_waits < MAX_ATTEMPTS {
