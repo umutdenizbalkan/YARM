@@ -203339,7 +203339,7 @@ mod ap_sched4_b {
             .nth(1)
             .expect("the committed disposition");
         let recv_cap = cell
-            .find("return shared.capture_outgoing_recv_user_context_split(t, frame);")
+            .find("shared.capture_outgoing_recv_user_context_split(t, frame)")
             .expect("the receive-park capture");
         let cap = cell
             .find("shared.capture_outgoing_user_context_split(t, frame)")

@@ -1614,15 +1614,21 @@ pub fn handle_trap_entry_shared(
                     crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx).is_none()
                         && crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx) == Some(t)
                 };
+                #[cfg(target_arch = "x86_64")]
                 let captured = outgoing
                     .filter(|_| !exiting)
                     .map(|t| {
-                        #[cfg(target_arch = "x86_64")]
                         if recv_park(t) {
-                            return shared.capture_outgoing_recv_user_context_split(t, frame);
+                            shared.capture_outgoing_recv_user_context_split(t, frame)
+                        } else {
+                            shared.capture_outgoing_user_context_split(t, frame)
                         }
-                        shared.capture_outgoing_user_context_split(t, frame)
                     })
+                    .unwrap_or(false);
+                #[cfg(not(target_arch = "x86_64"))]
+                let captured = outgoing
+                    .filter(|_| !exiting)
+                    .map(|t| shared.capture_outgoing_user_context_split(t, frame))
                     .unwrap_or(false);
                 // AP-SCHED4 §B — x86_64 takes AP-SCHED1 §4's RISC-V rule: a RECEIVE's park
                 // capture must not erase a completion already published for that receive. The
