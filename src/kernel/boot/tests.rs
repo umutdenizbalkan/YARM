@@ -201204,6 +201204,77 @@ mod ap_sched1 {
         assert_ne!(rcx(&k), code);
     }
 
+    /// **AP-SCHED4 §B — x86_64: a park capture cannot erase a delivery made before it.** A
+    /// delivery from another CPU takes the receive's blocked state and publishes the result lanes;
+    /// the receiver's own trap then captures its live frame (its syscall arguments, `r10` in the
+    /// error lane's slot). The receive-park capture keeps the delivered lanes and captures every
+    /// other register; with the blocked state still present it captures everything.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_delivery_made_before_the_x86_park_capture_survives_it() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (_endpoint_idx, _asid) = blocked_receiver(&k, 83, true);
+        let lanes = |k: &SharedKernel| {
+            k.with(|s| {
+                s.with_tcb_mut(83, |tcb| {
+                    let c = tcb.user_context;
+                    (
+                        c.user_gprs[0],
+                        c.user_gprs[2],
+                        c.user_gprs[3],
+                        c.user_gprs[7],
+                        c.arg0,
+                        c.user_gprs[11],
+                    )
+                })
+            })
+            .expect("tcb")
+        };
+        let mut frame = crate::kernel::trapframe::TrapFrame::zeroed();
+        frame.set_user_gpr(2, 0x2008_0a40); // RCX's slot: the receive's own `r10`
+        frame.set_user_gpr(11, 0x1212); // R12: an ordinary register
+        // Still blocked, nothing delivered: the whole frame is captured.
+        assert!(k.capture_outgoing_recv_user_context_split(83, &frame));
+        assert_eq!(lanes(&k).1, 0x2008_0a40);
+        // The delivery: the blocked state is taken, then the recv-v2 result is published.
+        k.with(|s| {
+            s.with_tcb_mut(83, |tcb| {
+                assert!(tcb.blocked_recv_state.take().is_some());
+            })
+        });
+        k.with_task_tcbs_split_mut(|tcbs| {
+            KernelState::publish_blocked_recv_delivery_result_locked(
+                tcbs,
+                83,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+            )
+        });
+        let delivered = lanes(&k);
+        assert_eq!(
+            (
+                delivered.0,
+                delivered.1,
+                delivered.2,
+                delivered.3,
+                delivered.4
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        // The park capture after it keeps the delivered result and takes everything else.
+        frame.set_user_gpr(11, 0x3434);
+        assert!(k.capture_outgoing_recv_user_context_split(83, &frame));
+        let after = lanes(&k);
+        assert_eq!(
+            (after.0, after.1, after.2, after.3, after.4),
+            (0, 0, 0, 0, 0),
+            "the delivery survives"
+        );
+        assert_eq!(after.5, 0x3434, "every other register is the frame's");
+        // The ordinary capture would have erased it (what x86_64 did before).
+        assert!(k.capture_outgoing_user_context_split(83, &frame));
+        assert_eq!(lanes(&k).1, 0x2008_0a40);
+    }
+
     /// **A legacy waiter is woken exactly as before**: it re-runs its receive, so nothing is
     /// published into its context.
     #[test]
@@ -203267,18 +203338,27 @@ mod ap_sched4_b {
             .split("if matches!(disposition, SplitDispatchDisposition::QueueAdvanceCommitted) {")
             .nth(1)
             .expect("the committed disposition");
+        let recv_cap = cell
+            .find("return shared.capture_outgoing_recv_user_context_split(t, frame);")
+            .expect("the receive-park capture");
         let cap = cell
             .find("shared.capture_outgoing_user_context_split(t, frame)")
             .expect("the capture");
+        assert!(
+            recv_cap < cap,
+            "a receive park takes the receive-park capture"
+        );
         let gate = cell
             .find("#[cfg(target_arch = \"x86_64\")]\n                if captured")
             .expect("x86 gate");
-        let fw = cell
-            .find("futex_wait_dispatch_outgoing(cpu_idx).is_none()")
-            .expect("not a futex wait");
-        let d2 = cell
-            .find("d2_recv_dispatch_outgoing(cpu_idx) == Some(t)")
-            .expect("the receive's own outgoing");
+        let fw = gate
+            + cell[gate..]
+                .find("futex_wait_dispatch_outgoing(cpu_idx).is_none()")
+                .expect("not a futex wait");
+        let d2 = gate
+            + cell[gate..]
+                .find("d2_recv_dispatch_outgoing(cpu_idx) == Some(t)")
+                .expect("the receive's own outgoing");
         let re = cell
             .find("shared.reapply_parked_recv_completion_split(t);")
             .expect("the re-application");

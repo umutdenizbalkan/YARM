@@ -4255,6 +4255,45 @@ impl crate::runtime::SharedKernel {
         })
     }
 
+    /// AP-SCHED4 §B — x86_64's RECEIVE-park capture. Like
+    /// [`Self::capture_outgoing_user_context_split`], except that it never erases a delivery's
+    /// result. A blocked receiver is visible to other CPUs from its waiter publication, before
+    /// this capture, and a delivery from another CPU first TAKES the receive's blocked state and
+    /// then publishes the result lanes (`publish_blocked_recv_delivery_result_locked`: `arg0`,
+    /// RAX, RCX = error, RDX, R8). So when the blocked state is already gone, the result lanes
+    /// belong to that delivery (published, or about to be), and the capture keeps the saved ones
+    /// instead of the live frame's — which hold the syscall's own arguments (RCX's slot holds
+    /// `r10`). Every other register is captured as usual. While the state is still present no
+    /// delivery has begun, and a published non-delivery completion is restored by
+    /// [`Self::reapply_parked_recv_completion_split`].
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn capture_outgoing_recv_user_context_split(
+        &self,
+        outgoing_tid: u64,
+        frame: &crate::kernel::trapframe::TrapFrame,
+    ) -> bool {
+        let mut captured = frame.capture_user_context();
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == outgoing_tid) else {
+                return false;
+            };
+            if tcb.blocked_recv_state.is_none() {
+                let held = &tcb.user_context;
+                captured.arg0 = held.arg0;
+                for lane in [0usize, 2, 3, 7] {
+                    captured.user_gprs[lane] = held.user_gprs[lane];
+                }
+                crate::yarm_log!(
+                    "X86_RECV_PARK_CAPTURE_KEPT_DELIVERY tid={} rcx={} result=ok",
+                    outgoing_tid,
+                    captured.user_gprs[2]
+                );
+            }
+            tcb.user_context = captured;
+            true
+        })
+    }
+
     /// AP-SCHED1 §4 — re-apply a receive completion published before its receiver's park
     /// capture, through the one remote-completion owner. Applies only a parked `IpcRecv` record
     /// that matches the exact incarnation AND its current receive generation; anything else is

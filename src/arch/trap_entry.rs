@@ -1606,9 +1606,23 @@ pub fn handle_trap_entry_shared(
                 let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx)
                     .or_else(|| crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx))
                     .or_else(|| crate::kernel::boot::d2_send_dispatch_outgoing(cpu_idx));
+                // AP-SCHED4 §B: x86_64 captures a RECEIVE's park so that a delivery another CPU
+                // already made into it keeps its result (see
+                // `capture_outgoing_recv_user_context_split`).
+                #[cfg(target_arch = "x86_64")]
+                let recv_park = |t: u64| {
+                    crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx).is_none()
+                        && crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx) == Some(t)
+                };
                 let captured = outgoing
                     .filter(|_| !exiting)
-                    .map(|t| shared.capture_outgoing_user_context_split(t, frame))
+                    .map(|t| {
+                        #[cfg(target_arch = "x86_64")]
+                        if recv_park(t) {
+                            return shared.capture_outgoing_recv_user_context_split(t, frame);
+                        }
+                        shared.capture_outgoing_user_context_split(t, frame)
+                    })
                     .unwrap_or(false);
                 // AP-SCHED4 §B — x86_64 takes AP-SCHED1 §4's RISC-V rule: a RECEIVE's park
                 // capture must not erase a completion already published for that receive. The
