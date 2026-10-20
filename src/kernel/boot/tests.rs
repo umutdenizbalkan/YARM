@@ -203469,13 +203469,12 @@ mod ap_sched4_b {
             .nth(1)
             .expect("the commit");
         let res = commit
-            .find("let resident = crate::arch::hal::x86_user_root_resident(cpu, asid);")
-            .expect("the x86 resident check");
+            .find("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]\n        let to_load = to_load.filter(|asid| !crate::arch::hal::x86_user_root_resident(cpu, *asid));")
+            .expect("the x86 resident filter");
         let load = commit
-            .find("if !resident && crate::arch::hal_adapters::switch_address_space(asid) {")
+            .find("if let Some(asid) = to_load {\n            if crate::arch::hal_adapters::switch_address_space(asid) {")
             .expect("the gated load");
         assert!(res < load);
-        assert!(commit[res..load].contains("let resident = false;"));
     }
 
     /// The lane rule itself, per port.

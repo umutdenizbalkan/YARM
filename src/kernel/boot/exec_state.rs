@@ -4719,12 +4719,11 @@ impl crate::runtime::SharedKernel {
         // `Hal::switch_address_space` calls, which `dispatch_next_task` uses at this exact point.
         // AP-SCHED4 §B: on x86_64 a root this CPU already holds is not reloaded (the rule and its
         // argument are at `direct_dispatch_activate_asid_split`).
-        if let Some(asid) = incoming_asid {
-            #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-            let resident = crate::arch::hal::x86_user_root_resident(cpu, asid);
-            #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
-            let resident = false;
-            if !resident && crate::arch::hal_adapters::switch_address_space(asid) {
+        let to_load = incoming_asid;
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+        let to_load = to_load.filter(|asid| !crate::arch::hal::x86_user_root_resident(cpu, *asid));
+        if let Some(asid) = to_load {
+            if crate::arch::hal_adapters::switch_address_space(asid) {
                 crate::arch::hal::note_address_space_activated(cpu, asid);
             }
         }
