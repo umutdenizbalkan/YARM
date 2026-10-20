@@ -6350,6 +6350,7 @@ pub(crate) fn server_death_claimable_take_next() -> Option<usize> {
 }
 
 /// Number of set claim bits (tests and diagnostics).
+#[cfg(test)]
 pub(crate) fn server_death_claimable_pending() -> usize {
     SERVER_DEATH_CLAIMABLE
         .iter()
@@ -6358,6 +6359,7 @@ pub(crate) fn server_death_claimable_pending() -> usize {
 }
 
 /// Clear every claim bit (hosted test isolation only).
+#[cfg(test)]
 pub(crate) fn server_death_claimable_clear() {
     for w in SERVER_DEATH_CLAIMABLE.iter() {
         w.store(0, core::sync::atomic::Ordering::Release);

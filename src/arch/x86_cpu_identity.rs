@@ -166,6 +166,9 @@ pub fn executing_logical_cpu(map: &ApicCpuMap, own_apic_id: u32) -> Option<u8> {
 pub mod hosted {
     use super::{ApicCpuMap, executing_logical_cpu};
     use crate::std::cell::Cell;
+    // The thread-local accessor is spelled `LocalKey::with(&KEY, ..)`: these are per-thread test
+    // cells, not kernel state, and must not read as a whole-state acquisition to the census.
+    use crate::std::thread::LocalKey;
 
     fn fresh_map() -> &'static ApicCpuMap {
         crate::std::boxed::Box::leak(crate::std::boxed::Box::new(ApicCpuMap::new()))
@@ -183,7 +186,7 @@ pub mod hosted {
         SIMULATED
             .with(Cell::get)
             .map(|(m, _)| m)
-            .unwrap_or_else(|| DEFAULT_MAP.with(|m| *m))
+            .unwrap_or_else(|| LocalKey::with(&DEFAULT_MAP, |m| *m))
     }
 
     /// Simulate, until the guard drops, a machine whose APIC map holds exactly `bindings`
@@ -193,7 +196,7 @@ pub mod hosted {
         for &(a, l) in bindings {
             m.bind(a, l).expect("simulated binding");
         }
-        let previous = SIMULATED.with(|c| c.replace(Some((m, apic))));
+        let previous = LocalKey::with(&SIMULATED, |c| c.replace(Some((m, apic))));
         SimulatedCpu { previous }
     }
 
@@ -221,7 +224,7 @@ pub mod hosted {
 
     impl Drop for SimulatedCpu {
         fn drop(&mut self) {
-            SIMULATED.with(|c| c.set(self.previous));
+            LocalKey::with(&SIMULATED, |c| c.set(self.previous));
         }
     }
 }
