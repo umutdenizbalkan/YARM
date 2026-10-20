@@ -203257,6 +203257,37 @@ mod ap_sched4_b {
         assert!(park.contains("yarm_x86_idle_sti_hlt()"));
     }
 
+    /// x86_64's receive-park capture in the shared trap cell re-applies a completion published
+    /// for that receive before the capture (the AP-SCHED1 §4 rule RISC-V already has): after the
+    /// capture, keyed to the D2-RECV outgoing alone, and never for a futex wait.
+    #[test]
+    fn the_x86_receive_park_capture_reapplies_a_published_completion() {
+        let te = include_str!("../../arch/trap_entry.rs");
+        let cell = te
+            .split("if matches!(disposition, SplitDispatchDisposition::QueueAdvanceCommitted) {")
+            .nth(1)
+            .expect("the committed disposition");
+        let cap = cell
+            .find("shared.capture_outgoing_user_context_split(t, frame)")
+            .expect("the capture");
+        let gate = cell
+            .find("#[cfg(target_arch = \"x86_64\")]\n                if captured")
+            .expect("x86 gate");
+        let fw = cell
+            .find("futex_wait_dispatch_outgoing(cpu_idx).is_none()")
+            .expect("not a futex wait");
+        let d2 = cell
+            .find("d2_recv_dispatch_outgoing(cpu_idx) == Some(t)")
+            .expect("the receive's own outgoing");
+        let re = cell
+            .find("shared.reapply_parked_recv_completion_split(t);")
+            .expect("the re-application");
+        let log = cell
+            .find("result=queue_advance_committed")
+            .expect("the commit marker");
+        assert!(cap < gate && gate < fw && fw < d2 && d2 < re && re < log);
+    }
+
     /// The lane rule itself, per port.
     #[test]
     fn the_resume_tls_lane_rule() {

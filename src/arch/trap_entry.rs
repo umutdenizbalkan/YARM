@@ -1610,6 +1610,24 @@ pub fn handle_trap_entry_shared(
                     .filter(|_| !exiting)
                     .map(|t| shared.capture_outgoing_user_context_split(t, frame))
                     .unwrap_or(false);
+                // AP-SCHED4 §B — x86_64 takes AP-SCHED1 §4's RISC-V rule: a RECEIVE's park
+                // capture must not erase a completion already published for that receive. The
+                // waiter is visible to other CPUs from its publication, before this capture, and
+                // x86_64 publishes a remote receive completion (a timeout, a server death, an
+                // undelivered wake's `WouldBlock`) into the saved context's result lanes. Measured
+                // live with production SMP: a receiver resumed with its own metadata pointer (its
+                // `r10`, saved in the error lane's slot) as the error. Only at THIS capture does a
+                // record of the current receive generation necessarily belong to this receive, so
+                // the re-application is scoped to it. (AArch64 publishes only the record and
+                // consumes it at resume, so a capture cannot erase it there.)
+                #[cfg(target_arch = "x86_64")]
+                if captured
+                    && let Some(t) = outgoing
+                    && crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx).is_none()
+                    && crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx) == Some(t)
+                {
+                    shared.reapply_parked_recv_completion_split(t);
+                }
                 crate::yarm_log!(
                     "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=queue_advance_committed outgoing={} captured={}",
                     SPLIT_DISPATCH_ARCH_TAG,

@@ -4263,7 +4263,11 @@ impl crate::runtime::SharedKernel {
     /// The RISC-V receive park calls this right after its capture (see the bridge): there, and
     /// only there, a record of the current generation can only have been published for the
     /// receive being parked, in the window between the waiter's publication and the capture.
-    #[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+    /// AP-SCHED4 §B: x86_64's shared trap cell calls it after its receive-park capture too.
+    #[cfg_attr(
+        not(any(target_arch = "riscv64", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn reapply_parked_recv_completion_split(&self, tid: u64) -> bool {
         self.with_task_tcbs_split_mut(|tcbs| {
             let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) else {
