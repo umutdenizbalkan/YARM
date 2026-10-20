@@ -191,11 +191,18 @@ if [[ -f "$KELF_COPY" ]]; then
   (( pe > ps )) || die "x86_idle_park_loop not found in the kernel ELF"
   # The loop's only halt is `sti; hlt`: `sti` defers interrupts by one instruction, so a wake is
   # taken at the `hlt` and its saved RIP is the instruction after it.
-  # The compiler may duplicate the loop body; every `hlt` in it must directly follow a `sti`, and
-  # every idle RIP must be the instruction after one of them.
+  # AP-SCHED4 §B: the pair is the global-asm routine `yarm_x86_idle_sti_hlt` (its resume address is
+  # what the 0xF1 stub recognises as an idle CPU); the loop calls it and halts nowhere else. Every
+  # `hlt` in the routine must directly follow a `sti`, and every idle RIP must be the instruction
+  # after one of them.
   dis_park=$(objdump -d --no-show-raw-insn --start-address="$ps" --stop-address="$pe" "$KELF_COPY")
-  hlt_total=$(grep -c -P ':\thlt' <<<"$dis_park")
-  hlt_nexts=$(awk '/:\t*sti/{s=1;next} s&&/:\t*hlt/{sub(":","",$1); print $1} {s=0}' <<<"$dis_park" \
+  grep -q -P 'call.*<yarm_x86_idle_sti_hlt>' <<<"$dis_park" || die "idle loop does not halt through yarm_x86_idle_sti_hlt"
+  (( $(grep -c -P ':\thlt' <<<"$dis_park") == 0 )) || die "idle loop halts outside yarm_x86_idle_sti_hlt"
+  read -r hs he < <(sym_range "$KELF_COPY" "yarm_x86_idle_sti_hlt")
+  (( he > hs )) || die "yarm_x86_idle_sti_hlt not found (with its size) in the kernel ELF"
+  dis_halt=$(objdump -d --no-show-raw-insn --start-address="$hs" --stop-address="$he" "$KELF_COPY")
+  hlt_total=$(grep -c -P ':\thlt' <<<"$dis_halt")
+  hlt_nexts=$(awk '/:\t*sti/{s=1;next} s&&/:\t*hlt/{sub(":","",$1); print $1} {s=0}' <<<"$dis_halt" \
     | while read -r h; do echo $((16#$h + 1)); done | tr '\n' ' ')
   n_pairs=$(wc -w <<<"$hlt_nexts")
   (( n_pairs >= 1 && n_pairs == hlt_total )) || die "idle loop halts: $hlt_total hlt, $n_pairs directly after sti"

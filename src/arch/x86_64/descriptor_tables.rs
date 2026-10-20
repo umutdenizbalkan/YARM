@@ -187,6 +187,201 @@ static mut IST_DOUBLE_FAULT: IstStack<IST_DOUBLE_FAULT_STACK_BYTES> =
 static mut IST_PAGE_FAULT: IstStack<IST_PAGE_FAULT_STACK_BYTES> =
     IstStack([0; IST_PAGE_FAULT_STACK_BYTES]);
 
+/// AP-SCHED4 §B — the correctness size of one admitted secondary's kernel stack: every trap it takes
+/// from user mode (TSS `rsp0` and the per-CPU SYSCALL `rsp0`) and every trap at its idle boundary
+/// runs the whole syscall, fault and timer settlement on it. 2 MiB, the size the other production
+/// ports reserve; not a measured x86_64 bound.
+pub(crate) const AP_DISPATCH_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+/// AP-SCHED4 §B — one dispatch stack per secondary the production ceiling admits, in `.bss` (so the
+/// kernel image's reserved range covers it and every root's kernel half maps it).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut AP_DISPATCH_STACKS: [IstStack<AP_DISPATCH_STACK_BYTES>;
+    crate::arch::x86_cpu_admission::DISPATCH_STACKS] = [const { IstStack([0; AP_DISPATCH_STACK_BYTES]) };
+    crate::arch::x86_cpu_admission::DISPATCH_STACKS];
+
+/// AP-SCHED4 §B — each admitted secondary's own NMI / double-fault / page-fault IST stacks: the
+/// production IDT's gates name IST slots 1–3, and the TSS of the CPU taking the trap supplies them.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[repr(C)]
+struct ApIstStacks {
+    nmi: IstStack<IST_NMI_STACK_BYTES>,
+    double_fault: IstStack<IST_DOUBLE_FAULT_STACK_BYTES>,
+    page_fault: IstStack<IST_PAGE_FAULT_STACK_BYTES>,
+}
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut AP_IST_STACKS: [ApIstStacks; crate::arch::x86_cpu_admission::DISPATCH_STACKS] = [const {
+    ApIstStacks {
+        nmi: IstStack([0; IST_NMI_STACK_BYTES]),
+        double_fault: IstStack([0; IST_DOUBLE_FAULT_STACK_BYTES]),
+        page_fault: IstStack([0; IST_PAGE_FAULT_STACK_BYTES]),
+    }
+};
+    crate::arch::x86_cpu_admission::DISPATCH_STACKS];
+
+/// AP-SCHED4 §B — the top of logical CPU `cpu`'s dispatch stack, or `None` for the boot CPU (its
+/// own boot stack) and for any CPU beyond the pool.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_dispatch_stack_top(cpu: usize) -> Option<u64> {
+    let slot = crate::arch::x86_cpu_admission::stack_slot(cpu)?;
+    // SAFETY: address-of a static; nothing is read or written here.
+    let base = unsafe { core::ptr::addr_of!(AP_DISPATCH_STACKS[slot]) } as u64;
+    Some(base + AP_DISPATCH_STACK_BYTES as u64)
+}
+
+/// AP-SCHED4 §B — the dispatch stack's base (lowest address) for `cpu`, for the witness's
+/// stack-use measurement.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64",
+    feature = "x86-apsched-witness"
+))]
+pub(crate) fn ap_dispatch_stack_base(cpu: usize) -> Option<u64> {
+    ap_dispatch_stack_top(cpu).map(|top| top - AP_DISPATCH_STACK_BYTES as u64)
+}
+
+/// `cpu`'s three IST stack tops `(nmi, double_fault, page_fault)`.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn ap_ist_tops(cpu: usize) -> Option<(u64, u64, u64)> {
+    let slot = crate::arch::x86_cpu_admission::stack_slot(cpu)?;
+    // SAFETY: address-of statics; nothing is read or written here.
+    unsafe {
+        let s = core::ptr::addr_of!(AP_IST_STACKS[slot]);
+        Some((
+            core::ptr::addr_of!((*s).nmi) as u64 + IST_NMI_STACK_BYTES as u64,
+            core::ptr::addr_of!((*s).double_fault) as u64 + IST_DOUBLE_FAULT_STACK_BYTES as u64,
+            core::ptr::addr_of!((*s).page_fault) as u64 + IST_PAGE_FAULT_STACK_BYTES as u64,
+        ))
+    }
+}
+
+/// AP-SCHED4 §B — the kernel's own address space on x86_64: the boot root the boot CPU ran before
+/// its first user entry (the kernel image, the direct map, the LAPIC/IOAPIC window and the low
+/// identity; no user mapping). Recorded once, at the first secondary's preparation.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static KERNEL_ROOT_CR3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record the kernel root (idempotent: the first value wins).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn record_kernel_root_cr3(cr3: u64) {
+    let _ = KERNEL_ROOT_CR3.compare_exchange(
+        0,
+        cr3 & !0xfff_u64 & !(1u64 << 63),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// AP-SCHED4 §B — leave every user address space: CR3 becomes the kernel root (PCID 0, bit 63
+/// clear, so the load also flushes PCID 0's non-global entries — VM-INVALIDATION1's rule that no
+/// CR3 load composes the no-flush bit). Returns whether the CPU switched (no root recorded yet:
+/// no switch, and the caller must not release the activation record).
+///
+/// AP-SCHED4 witness: is `cr3` the kernel root, loaded with PCID 0?
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64",
+    feature = "x86-apsched-witness"
+))]
+pub(crate) fn is_kernel_root_cr3(cr3: u64) -> bool {
+    let root = KERNEL_ROOT_CR3.load(Ordering::Acquire);
+    root != 0 && cr3 & 0xfff == 0 && cr3 & !0xfff_u64 & !(1u64 << 63) == root
+}
+
+/// Never inlined, so the image check finds the switch by name.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[inline(never)]
+pub(crate) fn enter_kernel_root() -> bool {
+    let root = KERNEL_ROOT_CR3.load(Ordering::Acquire);
+    if root == 0 {
+        return false;
+    }
+    // SAFETY: the boot root maps the kernel half every CPU executes from, including this stack.
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+    }
+    true
+}
+
+/// AP-SCHED4 §B — on a secondary, switch from the AP-safe diagnostic IDT to the production IDT the
+/// boot CPU runs: the same compiled entry stubs, the same syscall gate, the same 0xF1 stub. Its IST
+/// gates are served by this CPU's own TSS (prepared before SIPI). Returns the IDTR base loaded.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn load_production_idt_on_this_cpu() -> u64 {
+    // SAFETY: BOOT_IDT is populated once, before any secondary starts, and never rewritten.
+    unsafe {
+        let idtr = X86IdtPointer::from_ptr(core::ptr::addr_of!(BOOT_IDT).cast::<X86IdtEntry>());
+        core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
+        let mut out = [0u8; 10];
+        core::arch::asm!("sidt [{}]", in(reg) out.as_mut_ptr(), options(nostack, preserves_flags));
+        u64::from_le_bytes(out[2..10].try_into().unwrap_or([0; 8]))
+    }
+}
+
+/// AP-SCHED4 §B — this CPU's FP/SIMD control state for the eager per-task FXSAVE policy
+/// (`kernel::user_fpu`): `CR0.EM=0` (no x87 emulation), `CR0.TS=0` (no lazy #NM), `CR0.MP=1`,
+/// `CR0.NE=1` (native x87 errors), and `CR4.OSFXSR | OSXMMEXCPT` (synced from the boot CPU before
+/// SIPI). Then the kernel baseline: `fninit` and the kernel MXCSR. Returns whether the readback
+/// agrees.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn establish_fpu_control_on_this_cpu() -> bool {
+    const CR0_MP: u64 = 1 << 1;
+    const CR0_EM: u64 = 1 << 2;
+    const CR0_TS: u64 = 1 << 3;
+    const CR0_NE: u64 = 1 << 5;
+    const CR4_OSFXSR: u64 = 1 << 9;
+    const CR4_OSXMMEXCPT: u64 = 1 << 10;
+    // SAFETY: control-register writes that only enable native FP/SSE on this CPU.
+    unsafe {
+        let mut cr0: u64;
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        cr0 = (cr0 & !(CR0_EM | CR0_TS)) | CR0_MP | CR0_NE;
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        if cr4 & (CR4_OSFXSR | CR4_OSXMMEXCPT) != (CR4_OSFXSR | CR4_OSXMMEXCPT) {
+            cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
+            core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+        }
+        core::arch::asm!(
+            "fninit",
+            "ldmxcsr [rip + YARM_X86_KERNEL_MXCSR]",
+            options(nostack, preserves_flags)
+        );
+        let (back0, back4): (u64, u64);
+        core::arch::asm!("mov {}, cr0", out(reg) back0, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mov {}, cr4", out(reg) back4, options(nomem, nostack, preserves_flags));
+        back0 & (CR0_EM | CR0_TS) == 0
+            && back0 & (CR0_MP | CR0_NE) == (CR0_MP | CR0_NE)
+            && back4 & (CR4_OSFXSR | CR4_OSXMMEXCPT) == (CR4_OSFXSR | CR4_OSXMMEXCPT)
+    }
+}
+
+/// The production IDT's base (for the readback comparison).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn production_idt_base() -> u64 {
+    core::ptr::addr_of!(BOOT_IDT) as u64
+}
+
+/// AP-SCHED4 §B — `cpu`'s TSS as loaded: `(rsp0, ist1, ist2, ist3)`.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn tss_stacks(cpu: usize) -> (u64, u64, u64, u64) {
+    // SAFETY: plain reads of the CPU's own TSS fields.
+    unsafe {
+        let t = if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize {
+            core::ptr::addr_of!(BOOT_TSS)
+        } else {
+            core::ptr::addr_of!(AP_TSSS[cpu.min(crate::arch::platform_constants::MAX_CPUS - 1)])
+        };
+        (
+            core::ptr::addr_of!((*t).rsp0).read_unaligned(),
+            core::ptr::addr_of!((*t).ist1).read_unaligned(),
+            core::ptr::addr_of!((*t).ist2).read_unaligned(),
+            core::ptr::addr_of!((*t).ist3).read_unaligned(),
+        )
+    }
+}
+
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
@@ -542,8 +737,9 @@ pub(crate) fn ap_trap_shared_kernel() -> Option<&'static crate::runtime::SharedK
     trap_shared_kernel()
 }
 
+/// The executing CPU's initial APIC ID (`CPUID.01H:EBX[31:24]`).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn raw_current_apic_id() -> u32 {
+pub(crate) fn raw_current_apic_id() -> u32 {
     core::arch::x86_64::__cpuid(1).ebx >> 24
 }
 
@@ -662,15 +858,29 @@ extern "C" fn x86_idle_park_loop(cpu: usize) -> ! {
                 crate::kernel::idle_boundary::park_count(cpu)
             );
         }
-        unsafe {
-            core::arch::asm!("sti", "hlt", options(nomem, nostack));
-        }
+        // SAFETY: `sti; hlt` as one unit (see `yarm_x86_idle_sti_hlt`).
+        unsafe { yarm_x86_idle_sti_hlt() };
     }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+unsafe extern "C" {
+    fn yarm_x86_idle_sti_hlt();
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub(crate) fn idle_halt_loop() -> ! {
     let cpu = current_cpu_id().0 as usize;
+    // AP-SCHED4 §B — every idle ARRIVAL, on every CPU, leaves the user root before the park: CR3
+    // becomes the kernel's own root and only then is this CPU's activation record released, so a
+    // healthy exit/reap never finds a root held by an idle CPU and never quarantines it. An
+    // idle-boundary interrupt that dispatches nothing returns to the park loop, not here, so this
+    // runs once per arrival; every resume re-activates its own root through the exact-token
+    // transaction.
+    let _ = crate::arch::hal::leave_user_root(crate::kernel::scheduler::CpuId(cpu as u8));
+    // AP-SCHED4 witness: this CPU arrived at its idle wait from a task.
+    #[cfg(feature = "x86-apsched-witness")]
+    crate::kernel::apsched_witness::note_idle_reached(cpu);
     let rsp: u64;
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
@@ -2452,7 +2662,18 @@ pub(crate) fn prepare_ap_descriptor_tables(cpu: usize, rsp0: u64) -> (u16, u64, 
     unsafe {
         let tss = core::ptr::addr_of_mut!(AP_TSSS[idx]);
         let mut t = X86TaskStateSegment::new();
-        t.rsp0 = rsp0;
+        // AP-SCHED4 §B: an admissible secondary's TSS names its own dispatch stack and its own IST
+        // stacks (the production IDT's IST gates use slots 1–3). Beyond the pool it keeps the
+        // pre-admission layout and is never admitted.
+        match (ap_dispatch_stack_top(idx), ap_ist_tops(idx)) {
+            (Some(top), Some((nmi, df, pf))) => {
+                t.rsp0 = top;
+                t.ist1 = nmi;
+                t.ist2 = df;
+                t.ist3 = pf;
+            }
+            _ => t.rsp0 = rsp0,
+        }
         core::ptr::write_volatile(tss, t);
 
         let tss_base = tss as u64;
@@ -2816,12 +3037,35 @@ yarm_ap_remote_wake_stub:
 "#,
     lock3_wake_stub_eoi!(),
     r#"
-    // (11) restore every register this handler touched.
+    // (10b) AP-SCHED4 §B — a wake that interrupted THIS CPU's idle park (its `hlt`, whose resume
+    //      address is `yarm_x86_idle_hlt_resume`) is a reschedule request: once acknowledged
+    //      above, it is handed to the compiled entry as vector 0xF1 with the hardware frame
+    //      untouched, and the shared bridge settles it as the idle queue advance (no second EOI).
+    //      Anywhere else — kernel code, a TLB wait, ring 3 — it returns to what it interrupted.
+    lea rax, [rip + yarm_x86_idle_hlt_resume]
+    cmp qword ptr [rsp + 24], rax
+    // (11) restore every register this handler touched (flags survive the pops).
     pop rdx
     pop rcx
     pop rax
+    je yarm_x86_isr_241
     // (12) back to the exact interrupted context, at either CPL.
     iretq
+
+    .align 16
+    // AP-SCHED4 §B — the idle park's interruptible wait. `sti` defers recognition until after the
+    // `hlt` has begun, so an interrupt cannot slip between them; any interrupt that ends the wait
+    // returns to `yarm_x86_idle_hlt_resume`, the one address the 0xF1 stub recognises as "this CPU
+    // was idle".
+    .global yarm_x86_idle_sti_hlt
+    .global yarm_x86_idle_hlt_resume
+    .type yarm_x86_idle_sti_hlt, @function
+yarm_x86_idle_sti_hlt:
+    sti
+    hlt
+yarm_x86_idle_hlt_resume:
+    ret
+    .size yarm_x86_idle_sti_hlt, . - yarm_x86_idle_sti_hlt
 
     .align 16
     .global yarm_ap_page_fault_stub
@@ -3083,8 +3327,16 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub fn refresh_boot_tss_rsp0(rsp0: u64) {
     ensure_boot_descriptor_tables_scaffolded();
+    // AP-SCHED4 §B: the EXECUTING CPU's TSS — the boot CPU's `BOOT_TSS`, a secondary's own
+    // `AP_TSSS` entry. Writing `BOOT_TSS` from a secondary would retarget the boot CPU's next
+    // ring-3 trap onto another CPU's stack.
+    let cpu = current_cpu_id().0 as usize;
     unsafe {
-        BOOT_TSS.rsp0 = rsp0;
+        if cpu == crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize {
+            BOOT_TSS.rsp0 = rsp0;
+        } else if cpu < crate::arch::platform_constants::MAX_CPUS {
+            core::ptr::addr_of_mut!(AP_TSSS[cpu].rsp0).write_unaligned(rsp0);
+        }
     }
     // Stage 189C4: update the EXECUTING CPU's per-CPU SYSCALL kernel RSP0 (the
     // gs-relative slot the LSTAR entry reads), not a global. On the BSP path this

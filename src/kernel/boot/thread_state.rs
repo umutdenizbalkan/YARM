@@ -2336,11 +2336,13 @@ impl KernelState {
             .tls_restore_pending
             .iter()
             .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == tid));
-        let Some(idx) = idx else {
-            return Ok(None);
-        };
-        self.tls_restore_pending[idx] = None;
-        Ok(self.thread_tls_base(tid))
+        if let Some(idx) = idx {
+            self.tls_restore_pending[idx] = None;
+        }
+        Ok(crate::kernel::task::resume_tls_lane(
+            self.thread_tls_base(tid),
+            idx.is_some(),
+        ))
     }
 
     /// U9-EXIT2 §2 — the ONLY writer of `ThreadDetachState::Detached`, and it has no production

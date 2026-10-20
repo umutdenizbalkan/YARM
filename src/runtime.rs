@@ -2632,13 +2632,10 @@ impl SharedKernel {
             let pending = tls_pending
                 .iter()
                 .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == tid));
-            let tls = match pending {
-                Some(idx) => {
-                    tls_pending[idx] = None;
-                    tls_base
-                }
-                None => None,
-            };
+            if let Some(idx) = pending {
+                tls_pending[idx] = None;
+            }
+            let tls = crate::kernel::task::resume_tls_lane(tls_base, pending.is_some());
             Some(OwnerRevalidationSnapshot {
                 context,
                 tls,
@@ -4826,13 +4823,13 @@ impl SharedKernel {
             let pending = tls_pending
                 .iter()
                 .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == id.tid));
-            match pending {
-                Some(idx) => {
-                    tls_pending[idx] = None;
-                    Some(tls_base)
-                }
-                None => Some(None),
+            if let Some(idx) = pending {
+                tls_pending[idx] = None;
             }
+            Some(crate::kernel::task::resume_tls_lane(
+                tls_base,
+                pending.is_some(),
+            ))
         })
     }
 

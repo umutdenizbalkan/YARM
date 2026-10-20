@@ -2380,7 +2380,36 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     echo "[error] SMP-LIVE: legacy X86_SMP_APS_ADMITTED marker must not be emitted"
     exit 1
   fi
-  echo "[ok] SMP-LIVE: APs scheduler-online (wake-only) + remote-wake proven under -smp $QEMU_SMP"
+  echo "[ok] SMP-LIVE: APs scheduler-online (wake-only at boot) + remote-wake proven under -smp $QEMU_SMP"
+  # AP-SCHED4 §B: after boot publication every planned secondary (at most 7: the production
+  # ceiling is 8 logical CPUs, the boot CPU included) is released and admits ITSELF to production
+  # dispatch — no knob. Each must report its own production admission at its bound APIC ID and
+  # reach the dispatching state; nothing is left unadmitted.
+  {
+    want_aps=$(( QEMU_SMP > 8 ? 7 : QEMU_SMP - 1 ))
+    want_mask=$(( (1 << (want_aps + 1)) - 2 ))
+    if ! log_has_pattern "X86_AP_RELEASE_PLAN planned=0x$(printf %x $want_mask) released=0x$(printf %x $want_mask) knob=0"; then
+      echo "[error] SMP-LIVE: expected X86_AP_RELEASE_PLAN planned=released=0x$(printf %x $want_mask) knob=0"
+      exit 1
+    fi
+    for ((c = 1; c <= want_aps; c++)); do
+      if ! log_has_pattern "X86_AP_SCHED_ADMITTED cpu=$c apic_id=[0-9]* mode=production wake_only=0 balance_excluded=0"; then
+        echo "[error] SMP-LIVE: CPU $c did not take the production admission"
+        exit 1
+      fi
+      if ! log_has_pattern "X86_AP_STATE cpu=$c discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none"; then
+        echo "[error] SMP-LIVE: CPU $c never reported dispatching"
+        exit 1
+      fi
+    done
+    for f in "X86_AP_UNADMITTED" "X86_AP_SCHED_ADMISSION_REFUSED" "X86_EXECUTING_CPU_UNMAPPED" "X86_APIC_CPU_BIND_REFUSED"; do
+      if log_has_pattern "$f"; then
+        echo "[error] SMP-LIVE: forbidden production-admission marker: $f"
+        exit 1
+      fi
+    done
+    echo "[ok] SMP-LIVE: $want_aps secondaries admitted to production dispatch under -smp $QEMU_SMP"
+  }
 fi
 
 # Stage 184 (CROSS-ARCH-LIVE): the default-on cross-arch live audit runs on x86_64

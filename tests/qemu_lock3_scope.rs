@@ -191,9 +191,17 @@ fn the_held_lock_is_masked_and_every_sti_is_enumerated() {
         count(IRQ.split("#[cfg(test)]\nmod tests").next().unwrap()),
         2
     );
-    // descriptor_tables.rs: the idle park loop's `sti; hlt`.
-    assert_eq!(count(DESC), 1);
-    assert!(code(DESC).contains("core::arch::asm!(\"sti\", \"hlt\", options(nomem, nostack));"));
+    // descriptor_tables.rs: the idle park loop's `sti; hlt` — since AP-SCHED4 §B the one global-asm
+    // routine `yarm_x86_idle_sti_hlt` (its resume address is what the 0xF1 stub recognises as an
+    // idle CPU), and no inline `sti` at all.
+    assert_eq!(count(DESC), 0);
+    assert_eq!(code(DESC).matches("\n    sti\n").count(), 1);
+    assert!(
+        code(DESC).contains(
+            "yarm_x86_idle_sti_hlt:\n    sti\n    hlt\nyarm_x86_idle_hlt_resume:\n    ret"
+        )
+    );
+    assert!(code(DESC).contains("unsafe { yarm_x86_idle_sti_hlt() };"));
     // smp.rs: the managed AP idle loop's `sti; hlt; cli`.
     assert_eq!(count(SMP), 1);
     assert!(

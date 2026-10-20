@@ -107,7 +107,10 @@ riscv64-apsched-witness = ["apsched-witness"]
 # GICv2 reschedule SGI, AArch64's full user context: x0-x30 but x18, SP, q0-q31, FPCR, FPSR, NZCV,
 # TPIDR_EL0). Armed only WITHOUT `yarm.ap_user_dispatch=1`.
 aarch64-apsched-witness = ["apsched-witness"]
-# The port-neutral half of both witnesses (`kernel::apsched_witness`): never enabled on its own.
+# AP-SCHED4: the same production AP-scheduling witness on x86_64 (every admitted secondary, the
+# 0xF1 reschedule IPI, x86_64's full user context). Armed only WITHOUT `yarm.ap_user_dispatch=1`.
+x86-apsched-witness = ["apsched-witness"]
+# The port-neutral half of the witnesses (`kernel::apsched_witness`): never enabled on its own.
 apsched-witness = []
 # QEMU-LOCK1: real subdomain-lock contention on the production VM address-space lock
 # (`vm_state_lock`, rank 5), driven by the SMP3 two-hart VM/IPI workload (which it co-enables). It

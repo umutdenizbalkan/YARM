@@ -879,6 +879,24 @@ pub(crate) fn publish_async_preempt_snapshot(
 ///
 /// Returns `None` when no such incarnation exists (nothing is taken). The TLS request is taken at
 /// most once: the slot is emptied here, exactly as `take_tls_restore_request` empties it.
+/// AP-SCHED4 §B — the TLS lane one resume applies, from the thread's recorded base and whether a
+/// restore request was pending (the request is consumed either way).
+///
+/// x86_64 keeps NO FS base in the saved user context: GS.base is the kernel's per-CPU record in
+/// every ring and FSGSBASE is off, so ring 3 cannot change its FS base, and the trap path never
+/// saves it. The recorded base IS the thread's TLS there, and EVERY resume installs it: a resume
+/// that installed nothing would run the thread on the FS base of whichever thread this CPU ran
+/// last (or 0). On the other ports the TLS register travels with the saved context (RISC-V `tp`
+/// is a GPR; AArch64 saves `TPIDR_EL0`), and only a pending request — spawn, fork — installs the
+/// recorded base.
+pub(crate) const fn resume_tls_lane(recorded: Option<usize>, pending: bool) -> Option<usize> {
+    if pending || cfg!(target_arch = "x86_64") {
+        recorded
+    } else {
+        None
+    }
+}
+
 pub(crate) fn read_user_context_and_take_tls(
     tcbs: &[Option<ThreadControlBlock>],
     tls_pending: &mut [Option<ThreadId>],
@@ -897,13 +915,10 @@ pub(crate) fn read_user_context_and_take_tls(
     let pending = tls_pending
         .iter()
         .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == tid));
-    let tls = match pending {
-        Some(idx) => {
-            tls_pending[idx] = None;
-            tls_base
-        }
-        None => None,
-    };
+    if let Some(idx) = pending {
+        tls_pending[idx] = None;
+    }
+    let tls = resume_tls_lane(tls_base, pending.is_some());
     Some((context, tls))
 }
 

@@ -216,11 +216,31 @@ fn ap_path_does_not_enable_lapic_timer() {
         "init_lapic_timer",
         "LVT_TIMER",
     ] {
-        assert!(
-            !smp.contains(forbidden),
+        // AP-SCHED4 §B: the one exception is the production admission, which arms the CPU's own
+        // timer after its production IDT is loaded and before the scheduler admits it; nothing
+        // before admission (the trampoline, the scaffold, the pre-admission idle) arms it.
+        let allowed = usize::from(forbidden == "program_timer_deadline");
+        assert_eq!(
+            smp.matches(forbidden).count(),
+            allowed,
             "AP path must not arm the LAPIC timer: {forbidden}"
         );
     }
+    let main = smp
+        .split("extern \"C\" fn yarm_x86_ap_production_main(")
+        .nth(1)
+        .expect("the production admission")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let idt = main
+        .find("load_production_idt_on_this_cpu()")
+        .expect("the IDT first");
+    let arm = main.find("program_timer_deadline(").expect("the arm");
+    let admit = main
+        .find("admit_ap_dispatch_split(cpu)")
+        .expect("then the admission");
+    assert!(idt < arm && arm < admit);
 }
 
 #[test]

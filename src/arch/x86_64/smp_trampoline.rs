@@ -1242,3 +1242,21 @@ pub(super) fn ap_ready_word_directmap_virt(handoff_off: usize) -> *const u32 {
 
     (trampoline_virt + handoff_off + AP_HANDOFF_READY_WORD_OFFSET) as *const u32
 }
+
+// AP-SCHED4 §B — the stack switch into the production admission (`smp::yarm_x86_ap_production_main`):
+// `rdi` = this CPU's dispatch stack top, `rsi` = its logical id. The pre-admission stack is
+// abandoned for good; interrupts stay masked until the production idle park opens them.
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .section .text.ap_production,"ax",@progbits
+    .global yarm_x86_ap_production_switch
+yarm_x86_ap_production_switch:
+    cli
+    mov rsp, rdi
+    xor ebp, ebp
+    mov rdi, rsi
+    call yarm_x86_ap_production_main
+    ud2
+"#
+);

@@ -4,9 +4,19 @@
 #
 # AP-SCHED1/AP-SCHED2 — grade the RISC-V production SMP-scheduling witness, for every expected CPU.
 #
-# Usage: grade-apsched-witness.py [--arch riscv64|aarch64] --expect-cpus N BOOT_LOG
+# Usage: grade-apsched-witness.py [--arch riscv64|aarch64|x86_64] [--topo T] --expect-cpus N BOOT_LOG
 #        grade-apsched-witness.py [--arch riscv64|aarch64] --topology-only N BOOT_LOG
-#        grade-apsched-witness.py [--arch riscv64|aarch64] --self-test
+#        grade-apsched-witness.py [--arch riscv64|aarch64|x86_64] --self-test
+#
+# AP-SCHED4: the x86_64 port. Its CPUs come from the firmware's MADT and are bound by APIC ID, so
+# the run is graded against an INDEPENDENT derivation of the APIC IDs QEMU gives `-smp N[,T]` (T =
+# the `--topo` topology, e.g. `sockets=2,cores=3,threads=1`, which makes them sparse) and of the
+# plan's own rule (the boot CPU is logical 0; the rest ascending by APIC ID; at most 8 logical CPUs,
+# the others named `beyond_production_cpu_ceiling` and never started) — on every run, not only
+# beyond the ceiling. Each admission record carries the APIC ID the CPU read from its own LAPIC,
+# graded separately from the logical id. And every expected CPU must show at least one idle wake
+# delivered BY ITS IPI: x86_64 has no record of an IPI that lost to the CPU's timer, so no wake is
+# ever credited to a timer race there.
 #
 # AP-SCHED3: one grader for both ports' witnesses (default riscv64). The record format, the
 # obligations and the thresholds are the same; a port contributes only its console marker names,
@@ -118,7 +128,32 @@ PORTS = {
         "idle_timer_parked": True,
     },
 }
+PORTS["x86_64"] = {
+    "forbidden": [
+        "panicked at", "KERNEL PANIC", "PANIC src/", "X86_AP_UNADMITTED", "X86_AP_SCHED_ADMISSION_REFUSED",
+        "X86_EXECUTING_CPU_UNMAPPED", "X86_APIC_CPU_BIND_REFUSED", "YARM_SMP_AP_UNPLANNED",
+        "TIMER_SPLIT_CURRENT_NOT_RUNNING", "VM_ASPACE_TEARDOWN_QUARANTINED", "unknown trap event",
+        "X86_AP_WORKLOAD_PLACEMENT_READY", "X86_AP_SAVED_DISPATCH_OK", "X86_TLB_SHOOTDOWN_FAIL",
+        "DOUBLE FAULT", "YARM_SMP_AP_STACK_OVERLAPS_IMAGE",
+    ],
+    "state": "X86_AP_STATE",
+    "admitted_line": "X86_AP_SCHED_ADMITTED cpu=1 apic_id=1 mode=production",
+    "pinned": "X86_AP_WORKLOAD_PLACEMENT_READY cpu=1 base_tid=20000 count=4",
+    "quiescent": "X86_AP_UNADMITTED cpu=2 reason=x admitted=0 dispatching=0 result=fail",
+    "max_harts": None,
+    "stack": True,
+    "idle_timer_parked": False,
+    # Every expected CPU must show an idle wake delivered by its IPI (never a timer-won one).
+    "ipi_wake_per_cpu": True,
+    # The admission record carries the APIC ID (v0) under v1 = 1.
+    "hw_identity": True,
+}
+for _p in ("riscv64", "aarch64"):
+    PORTS[_p]["ipi_wake_per_cpu"] = False
+    PORTS[_p]["hw_identity"] = False
 ARCH = "riscv64"
+# x86_64: the `-smp` topology beside the count (`--topo`), e.g. "sockets=2,cores=3,threads=1".
+TOPO = ""
 
 
 def P():
@@ -127,6 +162,21 @@ def P():
 
 def reg_name(idx):
     """The register a spinner's mismatch index names, per port."""
+    if ARCH == "x86_64":
+        gprs = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+        named = {31: "rsp", 32: "rflags", 33: "fcw", 34: "mxcsr", 35: "tls(fs:0)"}
+        if idx in named:
+            return named[idx]
+        if idx < 16:
+            return gprs[idx]
+        if 40 <= idx < 48:
+            return f"st{idx - 40}"
+        if 64 <= idx < 80:
+            return f"xmm{idx - 64}.lo"
+        if 96 <= idx < 112:
+            return f"xmm{idx - 96}.hi"
+        return f"index{idx}"
     if ARCH == "aarch64":
         named = {31: "sp", 32: "nzcv", 33: "fpcr", 34: "fpsr", 35: "tpidr_el0"}
         if idx in named:
@@ -242,12 +292,101 @@ def grade_topology(text, nharts):
     return fails, summary
 
 
+def _clog2(n):
+    b = 0
+    while (1 << b) < n:
+        b += 1
+    return b
+
+
+def qemu_x86_apic_ids(n, topo):
+    """The APIC IDs QEMU gives `-smp n[,topo]`, by CPU index (index 0 is the boot CPU): each level's
+    field is the power-of-two width of its count. Without a topology every CPU is its own core of
+    one socket (8.x machine types prefer cores), which numbers them 0..n-1 either way."""
+    t = dict(kv.split("=", 1) for kv in topo.split(",") if "=" in kv) if topo else {}
+    threads, cores, dies = int(t.get("threads", 1)), int(t.get("cores", 0) or 0), int(t.get("dies", 1))
+    sockets = int(t.get("sockets", 0) or 0)
+    if not cores:
+        cores = max(1, n // (max(sockets, 1) * dies * threads))
+    tb, cb, db = _clog2(threads), _clog2(cores), _clog2(dies)
+    ids = []
+    for i in range(n):
+        thread, core = i % threads, (i // threads) % cores
+        die, socket = (i // (threads * cores)) % dies, i // (threads * cores * dies)
+        ids.append((socket << (db + cb + tb)) | (die << (cb + tb)) | (core << tb) | thread)
+    return ids
+
+
+def x86_plan(n, topo):
+    """The x86 admission rule (`src/arch/x86_cpu_admission.rs`), re-derived: APIC ID -> logical CPU,
+    or the exclusion marker. The boot CPU is logical 0; the rest ascending by APIC ID; the ceiling
+    counts logical CPUs, the boot CPU included."""
+    ids = qemu_x86_apic_ids(n, topo)
+    plan, nxt = {ids[0]: 0}, 1
+    for a in sorted(ids[1:]):
+        if nxt >= PRODUCTION_CPU_CEILING:
+            plan[a] = "beyond_production_cpu_ceiling"
+        else:
+            plan[a], nxt = nxt, nxt + 1
+    return plan, ids[0]
+
+
+def grade_topology_x86(text, n, topo):
+    """Discovery, identity, admission and exclusion, against the independent derivation: exactly
+    the plan's logical CPUs bound, admitted under their own APIC ID and dispatching; every other
+    listed processor named with its reason and never started."""
+    fails = []
+    plan, boot = x86_plan(n, topo)
+    want = {a: c for a, c in plan.items() if isinstance(c, int)}
+    excl = {a: r for a, r in plan.items() if isinstance(r, str)}
+    want_present = sum(1 << c for c in want.values())
+    m = re.search(r"X86_CPU_DISCOVERY source=(\w+) listed=(\d+) beyond_table=(\d+) boot_apic_id=(\d+) boot_listed=(\d)", text)
+    if not m:
+        return ["topology: no X86_CPU_DISCOVERY record"], None
+    if m.group(1) != "madt" or int(m.group(2)) != n or int(m.group(4)) != boot or m.group(5) != "1":
+        fails.append(f"topology: discovery {m.group(0)!r}, the boot has {n} processors, boot APIC {boot}")
+    planned = {(int(a), int(c)) for a, c in re.findall(r"X86_CPU_PLANNED apic_id=(\d+) cpu=(\d+)", text)}
+    if planned != set(want.items()):
+        fails.append(f"topology: planned {sorted(planned)}, the rule plans {sorted(want.items())}")
+    lc = re.search(r"X86_LOGICAL_CPUS count=(\d+) bitmap=0x([0-9a-f]+)", text)
+    if not lc or int(lc.group(2), 16) != want_present or int(lc.group(1)) != len(want):
+        fails.append(f"topology: logical CPUs {lc.group(0) if lc else None}, the rule gives 0x{want_present:x}")
+    for a, why in sorted(excl.items()):
+        named = re.findall(rf"X86_CPU_EXCLUDED apic_id={a} reason=(\w+) started=0", text)
+        if named != [why]:
+            fails.append(f"topology: APIC {a} must be excluded once as {why}, named {named}")
+        if re.search(rf"X86_APIC_CPU_BOUND apic_id={a} ", text) or re.search(rf"X86_AP_LAPIC_OK cpu=\d+ apic_id={a}\b", text):
+            fails.append(f"topology: excluded APIC {a} was bound or started")
+    for a, c in sorted(want.items()):
+        if not c:
+            continue
+        if not re.search(rf"X86_APIC_CPU_BOUND apic_id={a} cpu={c} new=1 result=ok", text):
+            fails.append(f"topology: APIC {a} was not bound to logical CPU {c}")
+        if not re.search(rf"X86_AP_SCHED_ADMITTED cpu={c} apic_id={a} mode=production", text):
+            fails.append(f"topology: logical CPU {c} was not admitted at APIC {a}")
+        if not re.search(rf"X86_AP_STATE cpu={c} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none", text):
+            fails.append(f"topology: CPU {c} never reported dispatching")
+    rel = re.search(r"X86_AP_RELEASE_PLAN planned=0x([0-9a-f]+) released=0x([0-9a-f]+) knob=(\d)", text)
+    want_rel = want_present & ~1
+    if not rel or int(rel.group(1), 16) != want_rel or int(rel.group(2), 16) != want_rel or rel.group(3) != "0":
+        fails.append(f"topology: release plan {rel.group(0) if rel else None}, the rule releases 0x{want_rel:x} with no knob")
+    summary = (f"cpus={n} topo={topo or 'default'} boot_apic={boot} "
+               f"apic_to_cpu={','.join(f'{a}:{c}' for a, c in sorted(want.items()))} "
+               f"excluded={','.join(f'{a}:{r}' for a, r in sorted(excl.items())) or 'none'}")
+    return fails, summary
+
+
 def grade(text, ncpus):
     fails = []
     nharts = ncpus
     if P()["max_harts"] is not None and nharts > P()["max_harts"]:
         return [f"admission: this port's supported configuration has at most {P()['max_harts']} CPUs"]
-    if nharts > PRODUCTION_CPU_CEILING:
+    if ARCH == "x86_64":
+        # Every run: the firmware plan and the identities, against the independent derivation.
+        tfails, _ = grade_topology_x86(text, nharts, TOPO)
+        fails += tfails
+        ncpus = min(nharts, PRODUCTION_CPU_CEILING)
+    elif nharts > PRODUCTION_CPU_CEILING:
         # Beyond the ceiling the work is owed by the 8 admitted CPUs; the exclusions are graded
         # in the topology section, not as console failures here.
         tfails, _ = grade_topology(text, nharts)
@@ -312,6 +451,14 @@ def grade(text, ncpus):
     admitted = {r["cpu"] for r in kind("AP_ADMITTED")}
     for c in sorted(expected - admitted):
         fails.append(f"admission: CPU {c} never took the production admission")
+    # The hardware identity each CPU was admitted under, apart from its logical id.
+    if P()["hw_identity"]:
+        plan, _ = x86_plan(nharts, TOPO)
+        apic_of = {c: a for a, c in plan.items() if isinstance(c, int)}
+        for r in kind("AP_ADMITTED"):
+            if r["v"][1] != 1 or r["v"][0] != apic_of.get(r["cpu"]):
+                fails.append(f"identity: CPU {r['cpu']} admitted at APIC {r['v'][0]} (recorded={r['v'][1]}), "
+                             f"the plan gives APIC {apic_of.get(r['cpu'])}")
 
     # progress
     if not user("P_END"):
@@ -410,6 +557,7 @@ def grade(text, ncpus):
 
     # idle wake — one sleeper per expected secondary
     RACED.clear()
+    ipi_woken = set()
     sleepers = {r["v"][0]: r for r in user("S_START")}
     s_cpus = sorted(r["cpu"] for r in sleepers.values())
     if s_cpus != sorted(expected):
@@ -457,6 +605,11 @@ def grade(text, ncpus):
             if acked[0]["v"][1] != 1:
                 fails.append(f"{tag}: the wake woke {acked[0]['v'][1]} waiters")
             prev[k] = kk
+            if ipi and len(disp) == 1 and disp[0]["v"][0] == 1:
+                ipi_woken.add(c)
+    if P()["ipi_wake_per_cpu"]:
+        for c in sorted(expected - ipi_woken):
+            fails.append(f"idle wake: CPU {c} never left idle by its IPI")
 
     # ipc — one IPC thread per expected secondary, in turn
     threads = {r["v"][0]: r for r in user("T_START")}
@@ -477,7 +630,10 @@ def grade(text, ncpus):
             if ping[0]["v"][1] != 1 or ping[0]["cpu"] != 0:
                 fails.append(f"{tag}: the ping did not arrive intact on CPU 0")
             if pong[0]["v"][1] != 1 or pong[0]["cpu"] != t["cpu"]:
-                fails.append(f"{tag}: the pong did not arrive intact on the thread's CPU {t['cpu']}")
+                got = pong[0]["v"][1]
+                why = (f" (receive error {got >> 8}, metadata {'written' if got & 0x80 else 'untouched'})"
+                       if ARCH == "x86_64" and got != 1 else "")
+                fails.append(f"{tag}: the pong did not arrive intact on the thread's CPU {t['cpu']}{why}")
             if not last < ping[0]["seq"] < pong[0]["seq"]:
                 fails.append(f"{tag}: out of order")
             last = pong[0]["seq"]
@@ -537,7 +693,11 @@ def _fixture(ncpus=3):
     sec = list(range(1, ncpus))
     mask = sum(1 << c for c in sec)
     ev = [("RELEASE", 0, 0, "-", mask, mask)]
-    ev += [("AP_ADMITTED", c, 0, "-", 0) for c in sec]
+    if P()["hw_identity"]:
+        apic_of = {c: a for a, c in x86_plan(ncpus, TOPO)[0].items() if isinstance(c, int)}
+        ev += [("AP_ADMITTED", c, 0, "-", apic_of[c], 1) for c in sec]
+    else:
+        ev += [("AP_ADMITTED", c, 0, "-", 0) for c in sec]
     ev += [("USER", 0, 9600, "P_START", 0), ("USER", 0, 9600, "P_AP_READY", mask, len(sec))]
     tid = 10000
     dls = []
@@ -593,8 +753,30 @@ def _fixture(ncpus=3):
 STACK_OK = "APSW_STACK reserved=0x200000 used=0,0x6000,0x6000,0x6000,0x6000,0x6000,0x6000,0x6000"
 
 
-def _render(ev, *, tear=(), drop_both=(), extra="", stack=STACK_OK, cow=True):
+def x86_console(n, topo=""):
+    """The x86 boot console a passing run prints for the plan of `-smp n[,topo]`."""
+    plan, boot = x86_plan(n, topo)
+    want = {a: c for a, c in plan.items() if isinstance(c, int)}
+    present = sum(1 << c for c in want.values())
+    con = [f"X86_CPU_DISCOVERY source=madt listed={n} beyond_table=0 boot_apic_id={boot} boot_listed=1"]
+    con += [f"X86_CPU_PLANNED apic_id={a} cpu={c}" for a, c in sorted(want.items(), key=lambda x: x[1])]
+    con += [f"X86_CPU_EXCLUDED apic_id={a} reason={r} started=0" for a, r in sorted(plan.items()) if isinstance(r, str)]
+    con += [f"X86_LOGICAL_CPUS count={len(want)} bitmap=0x{present:x} ceiling=8"]
+    con += [f"X86_APIC_CPU_BOUND apic_id={a} cpu={c} new=1 result=ok" for a, c in sorted(want.items()) if c]
+    con += [f"X86_AP_LAPIC_OK cpu={c} apic_id={a}" for a, c in sorted(want.items()) if c]
+    con += [f"X86_AP_RELEASE_PLAN planned=0x{present & ~1:x} released=0x{present & ~1:x} knob=0"]
+    for a, c in sorted(want.items()):
+        if c:
+            con += [f"X86_AP_SCHED_ADMITTED cpu={c} apic_id={a} mode=production wake_only=0 result=ok",
+                    f"X86_AP_STATE cpu={c} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none"]
+    return con
+
+
+def _render(ev, *, tear=(), drop_both=(), extra="", stack=STACK_OK, cow=True, x86n=None):
     out = [P()["admitted_line"]]
+    if ARCH == "x86_64":
+        n = x86n or (max([e[1] for e in ev if e[0] == "AP_ADMITTED"] + [0]) + 1)
+        out = x86_console(n, TOPO)
     if cow:
         out += [f"PAGE_FAULT_HANDLED_COW cpu={e[1]} tid={e[2]} asid=9 reason=recovered" for e in ev
                 if e[0] == "USER" and e[3] == "C_RUN"]
@@ -722,6 +904,52 @@ def self_test():
     else:
         assert any("took no timer interrupt in the window" in f for f in got), got
         cases_run += 1
+    if ARCH == "x86_64":
+        global TOPO
+        assert [reg_name(i) for i in (0, 3, 15, 31, 32, 33, 34, 35, 47, 64, 111)] == \
+            ["rax", "rbx", "r15", "rsp", "rflags", "fcw", "mxcsr", "tls(fs:0)", "st7", "xmm0.lo", "xmm15.hi"]
+        got = grade(_render(mutate(w2, ("USER", 2, base[w2][2], "W_DONE", 1, 96 + 7))), 3)
+        assert any("last xmm7.hi" in f for f in got), got
+        cases_run += 1
+        # QEMU's sparse numbering: sockets=2,cores=3 -> APIC IDs 0,1,2,4,5,6.
+        assert qemu_x86_apic_ids(6, "sockets=2,cores=3,threads=1") == [0, 1, 2, 4, 5, 6]
+        assert qemu_x86_apic_ids(4, "") == [0, 1, 2, 3]
+        assert qemu_x86_apic_ids(8, "sockets=2,cores=2,threads=2") == [0, 1, 2, 3, 4, 5, 6, 7]
+        assert qemu_x86_apic_ids(6, "sockets=3,cores=1,threads=2") == [0, 1, 2, 3, 4, 5]
+        assert qemu_x86_apic_ids(6, "sockets=2,cores=1,threads=3") == [0, 1, 2, 4, 5, 6]
+        TOPO = "sockets=2,cores=3,threads=1"
+        sparse = _fixture(6)
+        assert grade(_render(sparse, x86n=6), 6) == [], grade(_render(sparse, x86n=6), 6)
+        cases_run += 1
+        # The admission record names another APIC than the plan gives (logical 3 is APIC 4 here).
+        ai = next(i for i, e in enumerate(sparse) if e[0] == "AP_ADMITTED" and e[1] == 3)
+        wrong = list(sparse)
+        wrong[ai] = ("AP_ADMITTED", 3, 0, "-", 3, 1)
+        assert any("identity: CPU 3" in f for f in grade(_render(wrong, x86n=6), 6))
+        # The console plan numbering the sparse IDs as if contiguous.
+        bad = _render(sparse, x86n=6).replace("X86_CPU_PLANNED apic_id=4 cpu=3", "X86_CPU_PLANNED apic_id=3 cpu=3")
+        assert any("topology: planned" in f for f in grade(bad, 6))
+        cases_run += 2
+        TOPO = ""
+        # Ten processors: eight logical CPUs, APIC 8 and 9 excluded at the ceiling, never started.
+        ten = _fixture(8)
+        good = _render(ten, x86n=10)
+        assert grade(good, 10) == [], grade(good, 10)
+        assert any("excluded APIC 9 was bound or started" in f
+                   for f in grade(good + "\nX86_AP_LAPIC_OK cpu=8 apic_id=9", 10))
+        assert any("APIC 8 must be excluded" in f
+                   for f in grade(good.replace("X86_CPU_EXCLUDED apic_id=8 reason=beyond_production_cpu_ceiling started=0", ""), 10))
+        cases_run += 3
+        # A released set that leaves a planned CPU out, or a release under the diagnostic knob.
+        assert any("release plan" in f for f in grade(_render(base).replace("released=0x6 knob=0", "released=0x2 knob=0"), 3))
+        assert any("release plan" in f for f in grade(_render(base).replace("released=0x6 knob=0", "released=0x6 knob=1"), 3))
+        cases_run += 2
+        # No raced wake is accepted, and a CPU whose wakes all came by timer fails per CPU.
+        timered = [e[:4] + (0,) if e[0] == "IDLE_DISPATCH" and e[1] == 2 else e for e in base]
+        got = grade(_render(timered), 3)
+        assert any("CPU 2 never left idle by its IPI" in f for f in got), got
+        cases_run += 1
+        return _finish_self_test(cases, cases_run)
     # The register names a mismatch is reported under, per port.
     if ARCH == "aarch64":
         assert [reg_name(i) for i in (20, 31, 32, 33, 34, 35, 64, 127)] == \
@@ -823,6 +1051,10 @@ def main():
             return 2
         ARCH = args[1]
         args = args[2:]
+    global TOPO
+    if len(args) >= 2 and args[0] == "--topo":
+        TOPO = args[1]
+        args = args[2:]
     if args == ["--self-test"]:
         self_test()
         return 0
@@ -837,12 +1069,15 @@ def main():
         print(f"APSW_TOPOLOGY_SEAL arch={ARCH} {summary or ''} result={'fail' if tfails else 'ok'}")
         return 1 if tfails else 0
     if len(args) != 3 or args[0] != "--expect-cpus":
-        print("usage: grade-apsched-witness.py [--arch riscv64|aarch64] --expect-cpus N BOOT_LOG")
+        print("usage: grade-apsched-witness.py [--arch riscv64|aarch64|x86_64] [--topo T] --expect-cpus N BOOT_LOG")
         return 2
     ncpus = int(args[1])
     text = open(args[2], errors="replace").read()
     if ARCH == "riscv64" and ncpus > PRODUCTION_CPU_CEILING:
         tfails, summary = grade_topology(text, ncpus)
+        print(f"APSW_TOPOLOGY_SEAL arch={ARCH} {summary or ''} result={'fail' if tfails else 'ok'}")
+    if ARCH == "x86_64":
+        tfails, summary = grade_topology_x86(text, ncpus, TOPO)
         print(f"APSW_TOPOLOGY_SEAL arch={ARCH} {summary or ''} result={'fail' if tfails else 'ok'}")
     fails = grade(text, ncpus)
     ncpus = min(ncpus, PRODUCTION_CPU_CEILING)

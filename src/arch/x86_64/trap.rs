@@ -660,9 +660,16 @@ fn write_msr(msr: u32, value: u64) {
     }
 }
 
+/// AP-SCHED4 §B — the reschedule IPI's line as the shared bridge sees it. Vector 0xF1 reaches the
+/// compiled entry ONLY from the 0xF1 stub's idle-boundary hand-off, already acknowledged there, so
+/// the bridge settles it without a completion (as AArch64 settles its reschedule SGI).
+pub const X86_RESCHEDULE_VECTOR: u8 = 0xF1;
+pub const X86_RESCHEDULE_IRQ_LINE: u16 = (X86_RESCHEDULE_VECTOR - VEC_EXTERNAL_BASE) as u16;
+
 pub fn decode_trap_context(context: X86TrapContext) -> TrapEvent {
     match context.vector {
         VEC_SYSCALL => TrapEvent::Syscall,
+        X86_RESCHEDULE_VECTOR => TrapEvent::ExternalInterrupt(X86_RESCHEDULE_IRQ_LINE),
         VEC_TIMER => TrapEvent::TimerInterrupt,
         VEC_PAGE_FAULT => {
             let access = if (context.error_code & (1 << 1)) != 0 {

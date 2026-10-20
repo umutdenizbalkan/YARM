@@ -95,12 +95,12 @@ pub(crate) fn address_space_loaded_bitmap(asid: Asid) -> u64 {
 /// The record is never cleared on its own: clearing it while a user root is still loaded would
 /// let a teardown free a root this CPU still translates through. [`leave_user_root`] is the one
 /// caller, and it clears only behind the hardware change — on the configurations that transition
-/// (RISC-V, AArch64 since AP-SCHED3, and the hosted model); x86_64 never releases, so it does not
-/// exist there.
+/// (RISC-V, AArch64 since AP-SCHED3, x86_64 since AP-SCHED4, and the hosted model).
 #[cfg(any(
     feature = "hosted-dev",
     target_arch = "riscv64",
-    target_arch = "aarch64"
+    target_arch = "aarch64",
+    target_arch = "x86_64"
 ))]
 fn note_user_root_released(cpu: CpuId) {
     let idx = cpu.0 as usize;
@@ -125,8 +125,11 @@ fn note_user_root_released(cpu: CpuId) {
 ///   entries are retired by the teardown's own broadcast `tlbi aside1is; dsb ish`, which runs
 ///   before any root is freed (`vm::arch_unregister_asid`), so this transition needs no TLBI of its
 ///   own; every resume rewrites `TTBR0_EL1` through `activate_asid`.
-/// * x86_64: no transition (its admitted policy is unchanged: user tasks run on the boot CPU
-///   only), so the record is NOT touched — the root stays loaded and recorded.
+/// * x86_64 (AP-SCHED4): CR3 becomes the kernel's own root (the boot root, PCID 0, the no-flush
+///   bit clear, so the load also flushes PCID 0's non-global entries) and only then is the record
+///   released. No CR3 load composes the no-flush bit (VM-INVALIDATION1), so the next load of a
+///   departed root's PCID — its own resume, or a reuse after teardown — flushes that PCID's
+///   entries; every resume re-activates its root through `activate_asid`.
 /// * hosted: models the selected configuration's record protocol (no hardware to switch).
 ///
 /// Returns `true` when the CPU left its user root.
@@ -155,19 +158,24 @@ pub(crate) fn leave_user_root(cpu: CpuId) -> bool {
         crate::kernel::apsched_witness::note_root_left(cpu, leaving);
         true
     }
+    // AP-SCHED4 §B: x86_64 — CR3 becomes the kernel's own root (the boot root: no user mapping,
+    // PCID 0, no-flush bit clear), and only then is the activation record released.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    {
+        #[cfg(feature = "x86-apsched-witness")]
+        let leaving = active_address_space(cpu);
+        if !crate::arch::x86_64::descriptor_tables::enter_kernel_root() {
+            return false;
+        }
+        note_user_root_released(cpu);
+        #[cfg(feature = "x86-apsched-witness")]
+        crate::kernel::apsched_witness::note_root_left(cpu, leaving);
+        true
+    }
     #[cfg(feature = "hosted-dev")]
     {
         note_user_root_released(cpu);
         true
-    }
-    #[cfg(all(
-        not(feature = "hosted-dev"),
-        not(target_arch = "riscv64"),
-        not(target_arch = "aarch64")
-    ))]
-    {
-        let _ = cpu;
-        false
     }
 }
 
@@ -202,28 +210,35 @@ pub(crate) fn notify_enqueued(target: CpuId) {
             let _ = crate::arch::aarch64::smp::send_reschedule_sgi(me, target);
         }
     }
+    // AP-SCHED4 §B: x86_64 — the executing CPU is its own APIC ID through the map, and the
+    // reschedule IPI is the 0xF1 owner (`smp::send_reschedule_ipi`), which refuses (sending
+    // nothing) a target that has not admitted itself to production dispatch.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    {
+        let me = crate::arch::x86_64::descriptor_tables::current_cpu_id();
+        if me != target {
+            let _ = crate::arch::x86_64::smp::send_reschedule_ipi(me, target);
+        }
+    }
     #[cfg(feature = "hosted-dev")]
     {
         if let Some(n) = NOTIFIED.get(target.0 as usize) {
             n.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         }
     }
-    #[cfg(all(
-        not(feature = "hosted-dev"),
-        not(target_arch = "riscv64"),
-        not(target_arch = "aarch64")
-    ))]
-    {
-        let _ = target;
-    }
 }
 
 /// AP-SCHED1 — does [`notify_enqueued`] announce a remote enqueue on this build? Where it does, an
 /// owner may place a task on another CPU and rely on that CPU being told; where it does not, the
 /// owners that pin to the current CPU for exactly that reason (the fork child) keep doing so.
+/// AP-SCHED4 §B: x86_64 announces too.
 pub(crate) const REMOTE_ENQUEUE_NOTIFIED: bool = cfg!(all(
     not(feature = "hosted-dev"),
-    any(target_arch = "riscv64", target_arch = "aarch64")
+    any(
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "x86_64"
+    )
 ));
 
 /// Hosted: how many committed enqueues were announced to each target CPU.

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! AP-SCHED1/2/3 — the production SMP-scheduling witness, for RISC-V and AArch64. Built only with
-//! `riscv64-apsched-witness` / `aarch64-apsched-witness`, and armed only WITHOUT
+//! AP-SCHED1/2/3/4 — the production SMP-scheduling witness, for RISC-V, AArch64 and x86_64. Built
+//! only with `riscv64-apsched-witness` / `aarch64-apsched-witness` / `x86-apsched-witness`, and
+//! armed only WITHOUT
 //! `yarm.ap_user_dispatch=1`: it exercises the production admission of EVERY admitted secondary,
 //! never a diagnostic pinned one, and runs ordinary work on each of them (AP-SCHED2 generalized it
 //! from CPU 1 alone; AP-SCHED3 moved this port-neutral half here from `arch::riscv64` and gave
-//! AArch64 its own program). The hooks that differ by port are the program
+//! AArch64 its own program; AP-SCHED4 gave x86_64 its own, and the APIC ID each CPU was admitted
+//! under). The hooks that differ by port are the program
 //! (`arch/<port>/apsched_witness.S`) and what a root departure leaves behind
 //! ([`note_root_left`]).
 //!
@@ -42,6 +44,8 @@ use crate::runtime::SharedKernel;
 core::arch::global_asm!(include_str!("../arch/riscv64/apsched_witness.S"));
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(include_str!("../arch/aarch64/apsched_witness.S"));
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(include_str!("../arch/x86_64/apsched_witness.S"));
 
 pub const CODE_VA: u64 = 0x2000_0000;
 pub const P_STACK_VA: u64 = 0x2001_0000;
@@ -77,8 +81,9 @@ unsafe extern "C" {
     static yarm_apsw_cap_ep_p: u8;
     static yarm_apsw_cap_ep_t: u8;
     static yarm_apsw_cap_ep_d: u8;
-    /// AArch64 only: P's private nap endpoint (its bounded waits block on it a tick at a time).
-    #[cfg(target_arch = "aarch64")]
+    /// AArch64 and x86_64: P's private nap endpoint (its bounded waits block on it a tick at a
+    /// time).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     static yarm_apsw_cap_ep_n: u8;
 }
 
@@ -226,14 +231,14 @@ pub fn provision(kernel: &mut KernelState) -> Result<(), KernelError> {
 
     // SAFETY: `start..start + len` is the program's bytes inside this kernel image's text.
     let mut image = unsafe { core::slice::from_raw_parts(start, len) }.to_vec();
-    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
+    #[cfg_attr(target_arch = "riscv64", allow(unused_mut))]
     let mut caps = alloc::vec![
         (&raw const yarm_apsw_cap_ep_p, ep_p),
         (&raw const yarm_apsw_cap_ep_t, ep_t),
         (&raw const yarm_apsw_cap_ep_d, ep_d),
     ];
-    // AArch64: a fourth endpoint nothing sends to, for P's one-tick naps.
-    #[cfg(target_arch = "aarch64")]
+    // AArch64 and x86_64: a fourth endpoint nothing sends to, for P's one-tick naps.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     caps.push((&raw const yarm_apsw_cap_ep_n, grant(kernel)?));
     for (at, value) in caps {
         let off = at as usize - start as usize;
@@ -401,10 +406,22 @@ static ADMITTED: AtomicU64 = AtomicU64::new(0);
 
 /// CPU `cpu` completed its production admission (called last, by that CPU).
 pub fn ap_admitted(cpu: CpuId) {
+    admitted_record(cpu, [0; 5]);
+}
+
+/// x86_64: as [`ap_admitted`], with the hardware identity (the APIC ID the CPU read from its own
+/// LAPIC) it was admitted under, so the grader can check it against the firmware plan separately
+/// from the logical id: `v0` = APIC ID, `v1` = 1 (identity recorded).
+#[cfg(target_arch = "x86_64")]
+pub fn ap_admitted_as(cpu: CpuId, hw_id: u64) {
+    admitted_record(cpu, [hw_id, 1, 0, 0, 0]);
+}
+
+fn admitted_record(cpu: CpuId, v: [u64; 5]) {
     if !enabled() || cpu.0 as usize >= MBX_CPUS {
         return;
     }
-    record(K_AP_ADMITTED, u64::from(cpu.0), 0, 0, [0; 5]);
+    record(K_AP_ADMITTED, u64::from(cpu.0), 0, 0, v);
     let all = ADMITTED.fetch_or(1u64 << cpu.0, Ordering::AcqRel) | (1u64 << cpu.0);
     publish(M_AP_READY, all);
 }
@@ -545,6 +562,18 @@ pub fn note_root_left(cpu: CpuId, leaving: Option<crate::kernel::vm::Asid>) {
         };
         let (_, _, kernel_root) = crate::arch::aarch64::boot::bootstrap_mmu_registers();
         (ttbr0, ttbr0 == kernel_root)
+    };
+    #[cfg(target_arch = "x86_64")]
+    let (root, left) = {
+        let cr3: u64;
+        // SAFETY: a control-register read.
+        unsafe {
+            core::arch::asm!("mov {0}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags))
+        };
+        (
+            cr3,
+            crate::arch::x86_64::descriptor_tables::is_kernel_root_cr3(cr3),
+        )
     };
     if !left || crate::arch::hal::active_address_space(cpu).is_some() {
         return;
@@ -808,6 +837,25 @@ fn dump() {
             v(4)
         ));
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let used = |c: usize| ap_stack::deepest_use(c).unwrap_or(0);
+        let (bsp_reserved, bsp_painted_from, bsp_used) = ap_stack::boot_cpu();
+        emit_twice(format_args!(
+            "APSW_STACK reserved=0x{:x} used=0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x},0x{:x} bsp_reserved=0x{:x} bsp_unpainted_top=0x{:x}",
+            ap_stack::reserved(),
+            bsp_used,
+            used(1),
+            used(2),
+            used(3),
+            used(4),
+            used(5),
+            used(6),
+            used(7),
+            bsp_reserved,
+            bsp_painted_from
+        ));
+    }
     #[cfg(target_arch = "aarch64")]
     {
         let used = |c: usize| ap_stack::deepest_use(c).unwrap_or(0);
@@ -911,5 +959,101 @@ pub mod ap_stack {
             a += 8;
         }
         Some(top - a)
+    }
+}
+
+/// AP-SCHED4 — stack use on x86_64, measured (not a bound). Each secondary's dispatch stack (its
+/// TSS `rsp0` and SYSCALL `rsp0`: every trap it takes from user mode and at its idle boundary) is
+/// painted at provisioning, before boot publication — no secondary has switched to it yet — and
+/// the dump reports how far below the top it was ever written. The boot CPU's trap stack is the
+/// boot stack, in use since `_start`: everything below the provisioning frame (less a margin) is
+/// painted then, so its figure is the deepest use AFTER provisioning, floored at the unpainted top.
+#[cfg(target_arch = "x86_64")]
+pub mod ap_stack {
+    const PAINT: u64 = 0x5359_4e43_5354_4b50;
+    /// Left unpainted below the painting frame (interrupts may nest beneath it meanwhile).
+    const MARGIN: u64 = 64 * 1024;
+    const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+
+    unsafe extern "C" {
+        static boot_stack: u8;
+        static boot_stack_end: u8;
+    }
+
+    static BSP_PAINT_TOP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    fn range(cpu: usize) -> Option<(u64, u64)> {
+        let bottom = crate::arch::x86_64::descriptor_tables::ap_dispatch_stack_base(cpu)?;
+        let top = crate::arch::x86_64::descriptor_tables::ap_dispatch_stack_top(cpu)?;
+        Some((bottom, top))
+    }
+
+    fn boot_range() -> (u64, u64) {
+        // SAFETY: addresses of linker-placed symbols; nothing is read. They are low-VA symbols,
+        // run through their high alias (`long_mode_entry`).
+        let lo = (&raw const boot_stack) as u64 | KERNEL_VIRT_BASE;
+        let hi = (&raw const boot_stack_end) as u64 | KERNEL_VIRT_BASE;
+        (lo, hi)
+    }
+
+    pub fn reserved() -> usize {
+        crate::arch::x86_64::descriptor_tables::AP_DISPATCH_STACK_BYTES
+    }
+
+    fn paint_words(bottom: u64, top: u64) {
+        let mut a = bottom;
+        while a < top {
+            // SAFETY: an aligned word of a stack range nothing is using (see the callers).
+            unsafe { core::ptr::write_volatile(a as *mut u64, PAINT) };
+            a += 8;
+        }
+    }
+
+    /// Paint every secondary's dispatch stack, and the boot stack below this frame. Called once,
+    /// by the boot CPU, at provisioning (before publication: no secondary is on its dispatch
+    /// stack yet).
+    pub fn paint_all() {
+        for cpu in 1..crate::kernel::scheduler::MAX_CPUS {
+            if let Some((bottom, top)) = range(cpu) {
+                paint_words(bottom, top);
+            }
+        }
+        let rsp: u64;
+        // SAFETY: reads the stack pointer.
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags))
+        };
+        let (lo, hi) = boot_range();
+        if lo < rsp && rsp <= hi {
+            let top = (rsp - MARGIN.min(rsp - lo)) & !7;
+            paint_words(lo, top);
+            BSP_PAINT_TOP.store(top, core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn deepest(bottom: u64, top: u64) -> u64 {
+        let mut a = bottom;
+        // SAFETY: aligned reads inside the range; a stale read only under-reports.
+        while a < top && unsafe { core::ptr::read_volatile(a as *const u64) } == PAINT {
+            a += 8;
+        }
+        a
+    }
+
+    /// Bytes below the top that were ever written, or `None` for a CPU with no slot.
+    pub fn deepest_use(cpu: usize) -> Option<usize> {
+        let (bottom, top) = range(cpu)?;
+        Some((top - deepest(bottom, top)) as usize)
+    }
+
+    /// The boot CPU: `(reserved, unpainted top distance, deepest use)`, in bytes below the boot
+    /// stack's top (0s when it was not painted).
+    pub fn boot_cpu() -> (u64, u64, u64) {
+        let (lo, hi) = boot_range();
+        let painted = BSP_PAINT_TOP.load(core::sync::atomic::Ordering::Acquire);
+        if painted == 0 {
+            return (hi - lo, 0, 0);
+        }
+        (hi - lo, hi - painted, hi - deepest(lo, painted))
     }
 }

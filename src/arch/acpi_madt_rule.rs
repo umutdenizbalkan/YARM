@@ -127,6 +127,52 @@ pub fn ioapic_for_gsi(madt: &[u8], gsi: u32) -> Option<IoApicEntry> {
     best
 }
 
+/// AP-SCHED4 §B — MADT processor entries: type 0 (Processor Local APIC) and type 9 (Processor Local
+/// x2APIC).
+const MADT_TYPE_LOCAL_APIC: u8 = 0;
+const MADT_TYPE_LOCAL_X2APIC: u8 = 9;
+/// Processor flags: bit 0 Enabled, bit 1 Online Capable (ACPI 6.3+).
+const PROC_ENABLED: u32 = 1 << 0;
+const PROC_ONLINE_CAPABLE: u32 = 1 << 1;
+
+/// One processor the firmware lists, as its MADT entry states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessorEntry {
+    /// The local APIC ID (8 bits for a type-0 entry, 32 for a type-9 one).
+    pub apic_id: u32,
+    /// The firmware says it is usable now.
+    pub enabled: bool,
+    /// Disabled, but the firmware says it could be brought online later (hot-add).
+    pub online_capable: bool,
+    /// Listed by an x2APIC (type 9) entry.
+    pub x2apic: bool,
+}
+
+/// Every processor entry in table order (types 0 and 9). `None` for a table that is not a
+/// well-formed MADT.
+pub fn processors(madt: &[u8]) -> Option<impl Iterator<Item = ProcessorEntry> + '_> {
+    sdt_len(madt, b"APIC")?;
+    Some(entries(madt).filter_map(|(kind, body)| {
+        // LAPIC: type, len(8), acpi_uid (u8), apic_id (u8), flags (u32).
+        // x2APIC: type, len(16), reserved (u16), x2apic_id (u32), flags (u32), acpi_uid (u32).
+        let (apic_id, flags, x2apic) = match kind {
+            MADT_TYPE_LOCAL_APIC if body.len() >= 8 => {
+                (u32::from(body[3]), u32_at(body, 4)?, false)
+            }
+            MADT_TYPE_LOCAL_X2APIC if body.len() >= 16 => {
+                (u32_at(body, 4)?, u32_at(body, 8)?, true)
+            }
+            _ => return None,
+        };
+        Some(ProcessorEntry {
+            apic_id,
+            enabled: flags & PROC_ENABLED != 0,
+            online_capable: flags & PROC_ONLINE_CAPABLE != 0,
+            x2apic,
+        })
+    }))
+}
+
 /// Every Interrupt Source Override, as `(isa_irq, gsi, flags)`, for the record.
 pub fn overrides(madt: &[u8]) -> impl Iterator<Item = (u8, u32, u16)> + '_ {
     entries(madt).filter_map(|(kind, body)| {
@@ -170,6 +216,42 @@ mod tests {
         let sum = t.iter().fold(0u8, |a, b| a.wrapping_add(*b));
         t[9] = 0u8.wrapping_sub(sum);
         t
+    }
+
+    #[test]
+    fn processor_entries_of_both_types_are_listed_with_their_flags() {
+        let mut e = Vec::new();
+        e.extend_from_slice(&[0, 8, 0, 4, 1, 0, 0, 0]); // LAPIC uid 0 apic 4 enabled
+        e.extend_from_slice(&[0, 8, 1, 0x22, 0, 0, 0, 0]); // LAPIC apic 0x22 disabled
+        e.extend_from_slice(&[0, 8, 2, 7, 2, 0, 0, 0]); // LAPIC apic 7 online-capable only
+        e.extend_from_slice(&[9, 16, 0, 0]); // x2APIC
+        e.extend_from_slice(&0x1_0000u32.to_le_bytes());
+        e.extend_from_slice(&1u32.to_le_bytes());
+        e.extend_from_slice(&3u32.to_le_bytes());
+        e.extend_from_slice(&[1, 12, 0, 0, 0, 0, 0xC0, 0xFE, 0, 0, 0, 0]); // I/O APIC: ignored
+        let len = (MADT_ENTRIES_OFFSET + e.len()) as u32;
+        let mut t = Vec::new();
+        t.extend_from_slice(b"APIC");
+        t.extend_from_slice(&len.to_le_bytes());
+        t.resize(SDT_HEADER_LEN + 8, 0);
+        t.extend_from_slice(&e);
+        let got: Vec<ProcessorEntry> = processors(&t).expect("madt").collect();
+        let p = |apic_id, enabled, online_capable, x2apic| ProcessorEntry {
+            apic_id,
+            enabled,
+            online_capable,
+            x2apic,
+        };
+        assert_eq!(
+            got,
+            [
+                p(4, true, false, false),
+                p(0x22, false, false, false),
+                p(7, false, true, false),
+                p(0x1_0000, true, false, true)
+            ]
+        );
+        assert!(processors(b"FACP").is_none());
     }
 
     #[test]

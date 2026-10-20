@@ -5173,14 +5173,22 @@ fn settle_recognized_timer(
     #[cfg(all(
         feature = "apsched-witness",
         not(feature = "hosted-dev"),
-        any(target_arch = "riscv64", target_arch = "aarch64")
+        any(
+            target_arch = "riscv64",
+            target_arch = "aarch64",
+            target_arch = "x86_64"
+        )
     ))]
     crate::kernel::apsched_witness::note_timer_irq(cpu);
     let ticked = shared.scheduler_tick_split_mut(cpu);
     #[cfg(all(
         feature = "apsched-witness",
         not(feature = "hosted-dev"),
-        any(target_arch = "riscv64", target_arch = "aarch64")
+        any(
+            target_arch = "riscv64",
+            target_arch = "aarch64",
+            target_arch = "x86_64"
+        )
     ))]
     crate::kernel::apsched_witness::note_timer_tick_done(cpu);
     let (tick, preempting) = match ticked {
@@ -5268,7 +5276,11 @@ fn settle_recognized_timer(
             #[cfg(all(
                 feature = "apsched-witness",
                 not(feature = "hosted-dev"),
-                any(target_arch = "riscv64", target_arch = "aarch64")
+                any(
+                    target_arch = "riscv64",
+                    target_arch = "aarch64",
+                    target_arch = "x86_64"
+                )
             ))]
             crate::kernel::apsched_witness::note_preempt(shared, cpu, preempted.outgoing);
             TimerSettlement::QueueAdvanceCommitted
@@ -6259,7 +6271,11 @@ fn try_split_debug_log_into_frame(
             #[cfg(all(
                 feature = "apsched-witness",
                 not(feature = "hosted-dev"),
-                any(target_arch = "riscv64", target_arch = "aarch64")
+                any(
+                    target_arch = "riscv64",
+                    target_arch = "aarch64",
+                    target_arch = "x86_64"
+                )
             ))]
             let _ = crate::kernel::apsched_witness::observe_user_marker(
                 shared,

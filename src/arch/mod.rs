@@ -40,6 +40,11 @@ pub mod riscv64;
 pub mod riscv_hart_admission;
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
+/// AP-SCHED4 §B — the x86_64 CPU-admission policy (MADT processors → logical CPUs, named
+/// exclusions, the production ceiling, dispatch stacks), arch-neutral so the hosted suite executes
+/// the rules the x86_64 port applies.
+#[cfg(any(test, target_arch = "x86_64"))]
+pub mod x86_cpu_admission;
 /// AP-SCHED4 §A2 — the x86_64 APIC-ID ↔ logical-CPU map and the executing-CPU lookup, arch-neutral
 /// so the hosted suite executes the lookup the x86_64 port performs on every trap.
 #[cfg(any(test, feature = "hosted-dev", target_arch = "x86_64"))]

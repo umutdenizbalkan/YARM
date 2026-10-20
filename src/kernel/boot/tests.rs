@@ -55870,10 +55870,11 @@ mod stage169_d2_send_genuine {
         // Taken exactly once: a second resume finds no pending request.
         let mut frame2 = u3_frame();
         let _ = x86_post_lock_resume_marked_incoming(&k, token, Some(&mut frame2));
+        // AP-SCHED4 §B: the request was taken; a later resume installs the lane rule's value.
         assert_eq!(
             k.direct_dispatch_restore_context_split(token)
                 .map(|(_, t)| t),
-            Some(None),
+            Some(crate::kernel::task::resume_tls_lane(Some(0x7F00), false)),
             "no TLS-restore request remains pending"
         );
     }
@@ -62402,7 +62403,9 @@ mod stage190a_ap_sched_loop {
     fn probe_no_longer_parks_as_only_success_path() {
         assert!(
             DESC_SRC.contains("fn idle_halt_loop() -> ! {")
-                && DESC_SRC.contains("\"sti\", \"hlt\""),
+                && DESC_SRC.contains(
+                    "yarm_x86_idle_sti_hlt:\n    sti\n    hlt\nyarm_x86_idle_hlt_resume:\n    ret"
+                ),
             "the AP idle loop must be interruptible (sti;hlt), a real return-to-idle not a park"
         );
         // The seal-loop readiness is emitted before ring3 entry.
@@ -92474,7 +92477,10 @@ mod stage199a2d2c2c_reply_guards {
             .nth(1)
             .unwrap();
         let body = &f[..f.find("\n}\n").unwrap()];
-        assert!(body.contains("write_icr(target.0, AP_REMOTE_WAKE_VECTOR as u32)"));
+        // AP-SCHED4 §B: the target's APIC ID comes from its binding, never from `target.0`.
+        assert!(body.contains("let Some(apic) = apic_of(target) else { return };"));
+        assert!(body.contains("write_icr(apic, AP_REMOTE_WAKE_VECTOR as u32)"));
+        assert!(!body.contains("write_icr(target.0"));
         // Still never re-arms an AP dispatch request: the BSP dispatches on its timer tick.
         assert!(!body.contains("set_ap_dispatch_request"));
     }
@@ -113044,9 +113050,12 @@ mod stage199d_split_return_without_broad_lock {
             Some(Some(0x7FF0)),
             "the pending restore yields the TLS base"
         );
+        // AP-SCHED4 §B: the REQUEST is taken exactly once; what a later resume installs is the
+        // lane rule's — on x86_64 the recorded base on every resume (FS base is never saved with
+        // the context), elsewhere nothing.
         assert_eq!(
             k.split_return_take_tls_split(id(asid)),
-            Some(None),
+            Some(crate::kernel::task::resume_tls_lane(Some(0x7FF0), false)),
             "and it is taken exactly once"
         );
     }
@@ -113940,7 +113949,16 @@ mod stage199d_aarch64_offlock_dispatch {
         let (_, again) = k
             .direct_dispatch_restore_context_split(incoming_token(&k, in_asid))
             .expect("context");
-        assert_eq!(again, None, "the TLS restore request is taken once");
+        assert_eq!(
+            k.with(|s| s.tls_restore_pending(INCOMING)),
+            Some(false),
+            "the TLS restore request is taken once"
+        );
+        assert_eq!(
+            again,
+            crate::kernel::task::resume_tls_lane(Some(0x7000), false),
+            "a later resume installs the lane rule's value (x86_64: the recorded base)"
+        );
         dd::reset();
     }
 
@@ -141218,7 +141236,11 @@ mod u3_post_exit_replacement_restore_transaction {
             .expect("accepted")
             .facts
             .expect("facts");
-        assert_eq!(second.tls, None, "a second call sees no pending request");
+        assert_eq!(
+            second.tls,
+            crate::kernel::task::resume_tls_lane(Some(0x7000), false),
+            "a second call sees no pending request (x86_64 still installs the recorded base)"
+        );
     }
 
     /// A blocked `IpcSend` completion is consumed exactly once and carried out for encoding.
@@ -148787,19 +148809,25 @@ mod u9qa_x86_terminal_idle_landing {
             .expect("the anchored halt loop must exist");
         let end = body.find("\n}").unwrap_or(body.len());
         let body = &body[..end];
+        // AP-SCHED4 §B: the halt is the one global-asm `sti; hlt` routine (its resume address is
+        // what the 0xF1 stub recognises as an idle CPU).
         assert!(
-            body.contains("\"sti\", \"hlt\""),
+            body.contains("yarm_x86_idle_sti_hlt()")
+                && DESC.contains(
+                    "yarm_x86_idle_sti_hlt:\n    sti\n    hlt\nyarm_x86_idle_hlt_resume:\n    ret"
+                ),
             "the terminal-idle landing must be interruptible (sti; hlt), not a masked halt"
         );
         assert_eq!(
-            DESC.matches("\"sti\", \"hlt\"").count(),
+            DESC.matches("yarm_x86_idle_sti_hlt:").count()
+                + DESC.matches("\"sti\", \"hlt\"").count(),
             1,
             "exactly one halt primitive exists — no second idle policy"
         );
         let park_at = body
             .find("idle_boundary::park(cpu, rsp)")
             .expect("the boundary publication");
-        let halt_at = body.find("\"sti\", \"hlt\"").expect("the halt");
+        let halt_at = body.find("yarm_x86_idle_sti_hlt()").expect("the halt");
         assert!(
             park_at < halt_at,
             "the boundary is published before the CPU halts, and inside the loop so every \
@@ -187387,7 +187415,8 @@ mod u9timer5_idle_boundary {
                 "x86_64",
                 DESC_SRC,
                 "extern \"C\" fn x86_idle_park_loop(cpu: usize) -> ! {",
-                "\"sti\", \"hlt\"",
+                // AP-SCHED4 §B: the halt is the global-asm `sti; hlt` routine.
+                "yarm_x86_idle_sti_hlt()",
             ),
             (
                 "aarch64",
@@ -200819,16 +200848,26 @@ mod ap_sched1 {
             .find("note_user_root_released(cpu)")
             .expect("the record");
         assert!(hw < rec, "the root is left before the record says so");
-        // x86_64 leaves its record alone: its roots stay loaded.
-        let other = body
-            .split("not(target_arch = \"aarch64\")\n    ))]")
+        // AP-SCHED4 §B: x86_64 does the same — CR3 becomes the kernel's root first, and a port
+        // that could not switch keeps its record.
+        let x86 = body
+            .split("target_arch = \"x86_64\"))]")
             .nth(1)
-            .expect("the remaining port's arm");
-        assert!(!other.contains("note_user_root_released"));
+            .expect("the x86_64 arm")
+            .split("#[cfg(feature = \"hosted-dev\")]")
+            .next()
+            .unwrap();
+        let hw = x86
+            .find("if !crate::arch::x86_64::descriptor_tables::enter_kernel_root() {\n            return false;")
+            .expect("the hardware change, refusing when it did not happen");
+        let rec = x86
+            .find("note_user_root_released(cpu)")
+            .expect("the record");
+        assert!(hw < rec, "the root is left before the record says so");
         assert_eq!(
             hal.matches("note_user_root_released(cpu)").count(),
-            3,
-            "three writers: the RISC-V and AArch64 transitions and the hosted model of them"
+            4,
+            "four writers: the RISC-V, AArch64 and x86_64 transitions and the hosted model of them"
         );
         let pt = include_str!("../../arch/riscv64/page_table.rs");
         let bare = pt
@@ -201930,7 +201969,22 @@ mod ap_sched3 {
                 "send_reschedule_sgi(me, target)",
             ],
         );
-        assert!(HAL.contains("any(target_arch = \"riscv64\", target_arch = \"aarch64\")"));
+        // AP-SCHED4 §B: x86_64 announces too, through its 0xF1 owner, to any CPU but its own.
+        let x86 = notify
+            .split("target_arch = \"x86_64\"))]")
+            .nth(1)
+            .expect("an x86_64 arm");
+        order(
+            x86,
+            &[
+                "descriptor_tables::current_cpu_id()",
+                "if me != target",
+                "send_reschedule_ipi(me, target)",
+            ],
+        );
+        assert!(HAL.contains(
+            "any(\n        target_arch = \"riscv64\",\n        target_arch = \"aarch64\",\n        target_arch = \"x86_64\"\n    )"
+        ));
         let send = body_of(
             A64_SMP,
             "pub fn send_reschedule_sgi(sender: CpuId, target: CpuId) -> Result<u32, SgiRefusal> {",
@@ -202983,6 +203037,240 @@ mod ap_sched4_a {
         assert!(
             start.find("bind_secondary_apic(apic_id, cpu)").unwrap()
                 < start.find("send_init_sipi_sipi(apic_id as u8)").unwrap()
+        );
+    }
+}
+
+/// AP-SCHED4 §B — x86_64 production SMP: context the scheduler must carry across CPUs and switches.
+#[cfg(test)]
+mod ap_sched4_b {
+    use super::*;
+
+    fn two_threads() -> KernelState {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        for (tid, entry) in [(41u64, 0x8200usize), (42, 0x8300), (43, 0x8400)] {
+            state
+                .reserve_and_spawn_user_task_from_image_for_test(UserImageSpec {
+                    tid,
+                    entry,
+                    asid: Some(asid),
+                    class: TaskClass::App,
+                    startup_args: UserImageSpec::DEFAULT_STARTUP_ARGS,
+                    ..Default::default()
+                })
+                .expect("task");
+        }
+        state.set_thread_tls_base(41, 0xA000_0000).expect("tls a");
+        state.set_thread_tls_base(42, 0xB000_0000).expect("tls b");
+        state
+    }
+
+    /// x86_64 keeps no FS base in the saved context, so a thread that resumes AFTER another thread
+    /// ran on its CPU must get its OWN recorded base back — not the other thread's, and not 0. The
+    /// spawn-time request is still consumed exactly once.
+    #[test]
+    fn every_x86_resume_installs_the_threads_own_tls() {
+        let mut k = two_threads();
+        assert_eq!(k.take_tls_restore_request(41), Ok(Some(0xA000_0000)));
+        assert_eq!(k.take_tls_restore_request(42), Ok(Some(0xB000_0000)));
+        assert_eq!(
+            k.tls_restore_pending(41),
+            Some(false),
+            "the request was taken"
+        );
+        // A resumes after B ran here: its own base.
+        let again = k.take_tls_restore_request(41);
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(again, Ok(Some(0xA000_0000)));
+        } else {
+            assert_eq!(
+                again,
+                Ok(None),
+                "other ports carry TLS in the saved context"
+            );
+        }
+        // A thread with no TLS resumes with none (FS base 0 on x86_64), never the last thread's.
+        assert_eq!(k.take_tls_restore_request(43), Ok(None));
+    }
+
+    /// The firmware plan, the APIC map and the executing-CPU read compose: QEMU's sparse
+    /// `sockets=2,cores=3` numbering (APIC 0,1,2,4,5,6) and a firmware whose boot CPU is NOT
+    /// APIC 0 both resolve each planned APIC ID to its planned logical CPU through the one lookup
+    /// the target uses, and an excluded processor's APIC ID resolves to no CPU at all.
+    #[test]
+    fn planned_sparse_cpus_resolve_through_the_map_and_excluded_ones_do_not() {
+        use crate::arch::x86_cpu_admission::{Exclusion, Listed, plan};
+        use crate::arch::x86_cpu_identity::hosted::execute_as;
+        let l = |apic_id| Listed {
+            apic_id,
+            enabled: true,
+        };
+        for (listed, boot) in [
+            (alloc::vec![l(0), l(1), l(2), l(4), l(5), l(6)], 0u32),
+            (alloc::vec![l(9), l(3), l(0x21), l(7), l(0x40)], 7),
+            // Ten processors: two beyond the ceiling.
+            (
+                (0..10u32).map(|i| l(i * 2)).collect::<alloc::vec::Vec<_>>(),
+                0,
+            ),
+        ] {
+            let (p, _) = plan(&listed, boot, crate::kernel::scheduler::MAX_CPUS);
+            let bindings: alloc::vec::Vec<(u32, u8)> = p
+                .iter()
+                .flatten()
+                .filter_map(|e| e.outcome.ok().map(|c| (e.apic_id, c)))
+                .collect();
+            for &(apic, logical) in &bindings {
+                let _cpu = execute_as(&bindings, apic);
+                assert_eq!(
+                    crate::arch::x86_cpu_identity::hosted::executing_cpu_id(),
+                    Some(CpuId(logical)),
+                    "APIC {apic} runs as its planned logical CPU"
+                );
+            }
+            assert_eq!(
+                bindings.iter().find(|(a, _)| *a == boot).map(|b| b.1),
+                Some(0),
+                "the boot CPU is logical 0 whatever its APIC ID"
+            );
+            for e in p.iter().flatten().filter(|e| e.outcome.is_err()) {
+                assert_eq!(e.outcome, Err(Exclusion::ProductionCeiling));
+                let _cpu = execute_as(&bindings, e.apic_id);
+                let r = std::panic::catch_unwind(|| {
+                    crate::arch::x86_cpu_identity::hosted::executing_cpu_id()
+                });
+                assert!(r.is_err(), "an excluded APIC {} is no CPU", e.apic_id);
+            }
+        }
+    }
+
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const DT_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const HAL_SRC: &str = include_str!("../../arch/hal.rs");
+
+    fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src.find(sig).unwrap_or_else(|| panic!("{sig} present"));
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("function end");
+        &rest[..end]
+    }
+
+    /// Production admission depends on no knob, publishes dispatch eligibility only after every
+    /// self-check, and ends in the shared idle park; the diagnostic knob's branch owes no
+    /// production admission (one scheduling owner per CPU).
+    #[test]
+    fn production_admission_is_knob_free_ordered_and_single_owner() {
+        let main = body(SMP_SRC, "extern \"C\" fn yarm_x86_ap_production_main(");
+        assert!(
+            !main.contains("ap_user_dispatch_enabled"),
+            "no knob in production admission"
+        );
+        let order = [
+            "current_cpu_id()",
+            "boot_state_published()",
+            "load_production_idt_on_this_cpu()",
+            "tss_stacks(",
+            "configure_syscall_msrs_for_self()",
+            "establish_fpu_control_on_this_cpu()",
+            "program_timer_deadline(",
+            "this_cpu_lapic_readback()",
+            "leave_user_root(cpu)",
+            "admit_ap_dispatch_split(cpu)",
+            "PRODUCTION_ADMITTED.fetch_or",
+            "X86_AP_SCHED_ADMITTED",
+            "idle_halt_loop()",
+        ];
+        let mut at = 0;
+        for step in order {
+            let i = main[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("{step} after the previous step"));
+            at += i + step.len();
+        }
+        let audit = body(SMP_SRC, "pub fn run_ap_dispatch_scaffold_audit(kernel");
+        let knob = audit
+            .find("if crate::kernel::boot::ap_user_dispatch_enabled() {")
+            .expect("the diagnostic branch");
+        let owe = audit
+            .find("owe_production_admission(cpu)")
+            .expect("production owes");
+        let cont = audit[knob..]
+            .find("continue;")
+            .expect("the knob branch ends the CPU")
+            + knob;
+        assert!(
+            cont < owe,
+            "the knob branch never reaches the production owe"
+        );
+        assert!(
+            !SMP_SRC.contains("fn try_enable_ap_user_dispatch_production"),
+            "no second transition"
+        );
+    }
+
+    /// The reschedule IPI for a committed remote enqueue: no IPI beside the diagnostic oracle's,
+    /// none to a CPU that is not dispatching, and sent through the target's APIC binding.
+    #[test]
+    fn the_production_reschedule_ipi_is_gated_and_bound() {
+        let send = body(SMP_SRC, "pub(crate) fn send_reschedule_ipi(");
+        let knob = send
+            .find("ap_user_dispatch_enabled()")
+            .expect("knob refusal");
+        let gate = send
+            .find("production_admitted(target)")
+            .expect("dispatching gate");
+        let icr = send.find("write_icr(apic,").expect("the write");
+        assert!(knob < icr && gate < icr && send.contains("apic_of(target)"));
+        let hal = body(HAL_SRC, "pub(crate) fn notify_enqueued(");
+        assert!(
+            hal.contains("send_reschedule_ipi("),
+            "remote enqueues notify through it"
+        );
+    }
+
+    /// The 0xF1 stub: one EOI, and only an interrupted idle `hlt` enters the scheduler path.
+    #[test]
+    fn the_reschedule_stub_eois_once_and_hands_off_only_at_the_idle_hlt() {
+        let from = DT_SRC
+            .find("// (2) existing wake accounting")
+            .expect("stub start");
+        let to = DT_SRC[from..].find("\n    iretq\n").expect("stub end") + from;
+        let stub = &DT_SRC[from..to];
+        assert_eq!(
+            stub.matches("movabs rax, {lapic_eoi}").count(),
+            1,
+            "one EOI site"
+        );
+        let eoi = stub.find("mov dword ptr [rax], 0").expect("the EOI write");
+        let cmp = stub
+            .find("lea rax, [rip + yarm_x86_idle_hlt_resume]")
+            .expect("idle test");
+        let hand = stub.find("je yarm_x86_isr_241").expect("hand-off");
+        assert!(
+            eoi < cmp && cmp < hand,
+            "EOI, then the idle test, then the hand-off"
+        );
+        // Only the park's own `hlt` returns to the address the stub tests for.
+        assert_eq!(DT_SRC.matches("yarm_x86_idle_hlt_resume:").count(), 1);
+        let park = body(DT_SRC, "extern \"C\" fn x86_idle_park_loop(");
+        assert!(park.contains("yarm_x86_idle_sti_hlt()"));
+    }
+
+    /// The lane rule itself, per port.
+    #[test]
+    fn the_resume_tls_lane_rule() {
+        use crate::kernel::task::resume_tls_lane;
+        assert_eq!(resume_tls_lane(Some(7), true), Some(7));
+        assert_eq!(resume_tls_lane(None, true), None);
+        assert_eq!(resume_tls_lane(None, false), None);
+        assert_eq!(
+            resume_tls_lane(Some(7), false),
+            if cfg!(target_arch = "x86_64") {
+                Some(7)
+            } else {
+                None
+            }
         );
     }
 }

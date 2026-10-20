@@ -964,9 +964,11 @@ pub fn handle_trap_entry_shared(
     // QEMU-SMP2 §2 — a reschedule SGI taken at the authenticated idle boundary. It owes the SAME
     // idle queue advance the timer's queued-work settlement owes, and is discharged by the same
     // drain below; only the trigger — and so the marker family the drain emits — differs.
-    #[cfg(target_arch = "aarch64")]
+    // AP-SCHED4 §B: x86_64's reschedule IPI (vector 0xF1, handed off by its stub at the idle
+    // boundary) owes the same advance.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let mut sgi_idle_queue_advance = false;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let sgi_idle_queue_advance = false;
     // U9-IRQ-FINAL §3 — the Unknown route's own pair. Hosted now settles pre-lock instead of
     // reaching the broad arm for its `Ok(())`; production still diverges. It is not the IRQ
@@ -1020,16 +1022,26 @@ pub fn handle_trap_entry_shared(
             // running and the committed enqueue is picked up at its next scheduling point.
             #[cfg(target_arch = "aarch64")]
             let sgi = irq == crate::arch::gicv2_sgi::RESCHEDULE_SGI_INTID;
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
+            let sgi = irq == crate::arch::x86_64::trap::X86_RESCHEDULE_IRQ_LINE;
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             let sgi = false;
             let routed = if sgi {
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
                 if idle_boundary_authenticated {
                     sgi_idle_queue_advance = true;
                     crate::yarm_log!(
                         "SGI_RESCHEDULE_SETTLED cpu={} settlement=idle_advance_owed",
                         cpu.0
                     );
+                    // AP-SCHED4 witness: x86_64's stub hands the IPI to this path only when it
+                    // interrupted the idle wait's `hlt`, so this is the idle-boundary arrival.
+                    #[cfg(all(
+                        feature = "x86-apsched-witness",
+                        target_arch = "x86_64",
+                        not(feature = "hosted-dev")
+                    ))]
+                    crate::kernel::apsched_witness::note_idle_ipi(cpu, 1);
                 } else {
                     crate::yarm_log!(
                         "SGI_RESCHEDULE_SETTLED cpu={} settlement=return_to_interrupted",
@@ -3691,10 +3703,12 @@ pub fn handle_trap_entry_shared(
                             cpu.0,
                             inc
                         );
-                        // AP-SCHED3 witness: this CPU left idle for `inc`, and by which trigger.
+                        // AP-SCHED3/4 witness: this CPU left idle for `inc`, and by which trigger.
                         #[cfg(all(
-                            feature = "aarch64-apsched-witness",
-                            target_arch = "aarch64",
+                            any(
+                                all(feature = "aarch64-apsched-witness", target_arch = "aarch64"),
+                                all(feature = "x86-apsched-witness", target_arch = "x86_64")
+                            ),
                             not(feature = "hosted-dev")
                         ))]
                         crate::kernel::apsched_witness::note_idle_dispatch(

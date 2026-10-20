@@ -3,12 +3,16 @@
 
 /// AP-SCHED1/2/3 — the production AP-scheduling witness's port-neutral half (provisioning,
 /// observation words, the causal record, the reaper, the dump). Compiled only with a port's
-/// witness feature (`riscv64-apsched-witness` / `aarch64-apsched-witness`); no default or
+/// witness feature (`riscv64-` / `aarch64-` / `x86-apsched-witness`); no default or
 /// production profile carries it.
 #[cfg(all(
     feature = "apsched-witness",
     not(feature = "hosted-dev"),
-    any(target_arch = "riscv64", target_arch = "aarch64")
+    any(
+        target_arch = "riscv64",
+        target_arch = "aarch64",
+        target_arch = "x86_64"
+    )
 ))]
 pub mod apsched_witness;
 pub mod boot;

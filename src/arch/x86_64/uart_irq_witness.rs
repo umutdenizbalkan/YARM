@@ -109,7 +109,6 @@ const TIMER_TOGETHER_CLAIMS: [u32; 2] = [3, 4];
 /// Bound on LAPIC IRR polls while holding; about three ticks at the QEMU q35 tick rate.
 const TOGETHER_POLL_LIMIT: u32 = 40_000_000;
 
-static RSDP_PADDR: AtomicU64 = AtomicU64::new(0);
 static GSI: AtomicU32 = AtomicU32::new(0);
 static VECTOR: AtomicU32 = AtomicU32::new(0);
 static PIN: AtomicU32 = AtomicU32::new(0);
@@ -263,56 +262,8 @@ fn ring_store_byte(index: usize, value: u8) {
 
 // ── Firmware tables ────────────────────────────────────────────────────────────────────────────
 
-/// Record the PVH start_info's RSDP address. Called once from the PVH boot-data capture.
-pub fn capture_rsdp(paddr: u64) {
-    RSDP_PADDR.store(paddr, Ordering::Release);
-}
-
-fn phys_slice(pa: u64, len: usize) -> Option<&'static [u8]> {
-    if pa == 0 || len == 0 || len > 64 * 1024 {
-        return None;
-    }
-    let p = crate::kernel::boot::KernelState::phys_to_direct_map_ptr(pa)?;
-    crate::kernel::boot::KernelState::phys_to_direct_map_ptr(pa + len as u64 - 1)?;
-    // SAFETY: firmware tables live in RAM the direct map covers; they are read-only to us.
-    Some(unsafe { core::slice::from_raw_parts(p as *const u8, len) })
-}
-
-fn sdt_at(pa: u64, signature: &[u8; 4]) -> Option<&'static [u8]> {
-    let head = phys_slice(pa, crate::arch::acpi_madt_rule::SDT_HEADER_LEN)?;
-    let len = crate::arch::acpi_madt_rule::sdt_len(head, signature)?;
-    let table = phys_slice(pa, len)?;
-    crate::arch::acpi_madt_rule::checksum_ok(table).then_some(table)
-}
-
-/// RSDP → XSDT (revision ≥ 2) or RSDT → the table signed `APIC`.
-fn find_madt() -> Option<&'static [u8]> {
-    let rsdp = phys_slice(RSDP_PADDR.load(Ordering::Acquire), 36)?;
-    if &rsdp[0..8] != b"RSD PTR " {
-        return None;
-    }
-    let revision = rsdp[15];
-    if revision >= 2 {
-        let xsdt_pa = u64::from_le_bytes(rsdp[24..32].try_into().ok()?);
-        if let Some(xsdt) = sdt_at(xsdt_pa, b"XSDT") {
-            for chunk in xsdt[crate::arch::acpi_madt_rule::SDT_HEADER_LEN..].chunks_exact(8) {
-                let pa = u64::from_le_bytes(chunk.try_into().ok()?);
-                if let Some(madt) = sdt_at(pa, b"APIC") {
-                    return Some(madt);
-                }
-            }
-        }
-    }
-    let rsdt_pa = u32::from_le_bytes(rsdp[16..20].try_into().ok()?) as u64;
-    let rsdt = sdt_at(rsdt_pa, b"RSDT")?;
-    for chunk in rsdt[crate::arch::acpi_madt_rule::SDT_HEADER_LEN..].chunks_exact(4) {
-        let pa = u32::from_le_bytes(chunk.try_into().ok()?) as u64;
-        if let Some(madt) = sdt_at(pa, b"APIC") {
-            return Some(madt);
-        }
-    }
-    None
-}
+// AP-SCHED4 §B: the RSDP capture and the MADT walk moved to production (`x86_64::acpi`).
+use crate::arch::x86_64::acpi::find_madt;
 
 /// Derive COM1's route from the executed machine's MADT and publish the line the provisioning
 /// binds: the GSI, which the production decoder receives at vector 0x20 + GSI. Returns the line,

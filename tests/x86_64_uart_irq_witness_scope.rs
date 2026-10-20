@@ -92,8 +92,11 @@ fn every_witness_entry_point_is_feature_gated() {
     assert!(attr_before(X86_IRQ, "pub fn lapic_eoi_writes() -> u32 {").contains(GATE));
     assert!(attr_before(X86_IRQ, "pub fn lapic_configured() -> bool {").contains(GATE));
     assert!(attr_before(X86_DT, "pub(crate) fn boot_tss_io_map_facts()").contains(GATE));
+    // AP-SCHED4 §B: the RSDP capture is production now (the MADT names the processors to admit);
+    // the witness reads the table through `x86_64::acpi`, and nothing of it remains witness-only.
+    assert!(X86_BOOT.contains("crate::arch::x86_64::acpi::capture_rsdp(start_info._rsdp_paddr);"));
+    assert!(!X86_BOOT.contains("uart_irq_witness::capture_rsdp("));
     for (name, src, call) in [
-        ("rsdp capture", X86_BOOT, "uart_irq_witness::capture_rsdp("),
         (
             "route + provisioning",
             X86_BOOT,
@@ -321,8 +324,15 @@ fn return_contracts_are_ring3_only_revalidation_and_preserved_flags() {
         X86_DT,
         "extern \"C\" fn x86_idle_park_loop(cpu: usize) -> ! {",
     );
-    assert!(park.contains("core::arch::asm!(\"sti\", \"hlt\""));
-    assert!(pos(park, "idle_boundary::park(cpu, rsp)") < pos(park, "\"sti\", \"hlt\""));
+    // AP-SCHED4 §B: the `sti; hlt` pair is the global-asm routine whose resume address the 0xF1
+    // stub recognises as an idle CPU; it is still one `sti` shadow over one `hlt`.
+    assert!(park.contains("unsafe { yarm_x86_idle_sti_hlt() };"));
+    assert!(
+        X86_DT.contains(
+            "yarm_x86_idle_sti_hlt:\n    sti\n    hlt\nyarm_x86_idle_hlt_resume:\n    ret"
+        )
+    );
+    assert!(pos(park, "idle_boundary::park(cpu, rsp)") < pos(park, "yarm_x86_idle_sti_hlt()"));
 }
 
 /// One receiver, one ring layout, one selector for all three ports.

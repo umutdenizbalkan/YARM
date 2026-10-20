@@ -35,7 +35,10 @@ const ICR_TRIGGER_MODE_LEVEL: u32 = 1 << 15;
 // AP stack backing is low physical memory, but AP receives a higher-half
 // direct-map stack VA after paging is enabled.
 const AP_STACK_BYTES: usize = 16 * 1024;
-const AP_STACK_PHYS_BASE: u64 = 0x0200_0000;
+// AP-SCHED4 §B: 63 MiB — the last MiB below the 64 MiB low identity, above a kernel image that now
+// carries the secondaries' dispatch and IST stacks in `.bss` (checked at preparation:
+// `YARM_SMP_AP_STACK_OVERLAPS_IMAGE`). 64 CPUs x 16 KiB = 1 MiB.
+pub(crate) const AP_STACK_PHYS_BASE: u64 = 0x03F0_0000;
 const BOOTSTRAP_LOW_IDENTITY_BYTES: u64 = 64 * 1024 * 1024;
 const AP_STACK_TOP_BASE: u64 =
     crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_STACK_PHYS_BASE;
@@ -112,6 +115,12 @@ static AP_SCHED_ONLINE_ADMISSION_DONE: AtomicBool = AtomicBool::new(false);
 
 fn lapic_mmio_base() -> usize {
     super::platform_layout::LAPIC_MMIO_BASE
+}
+
+/// AP-SCHED4 §B — the APIC ID an IPI to logical CPU `cpu` must name: the explicit binding made
+/// before that CPU was started, never `cpu.0`. `None` for a CPU that was never bound.
+pub(crate) fn apic_of(cpu: CpuId) -> Option<u8> {
+    bound_apic_id(cpu).and_then(|a| u8::try_from(a).ok())
 }
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -436,8 +445,28 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
         return None;
     }
 
+    // AP-SCHED4 §B: the boot stacks live at a fixed physical range the APs write before paging is
+    // theirs; the kernel image (with its `.bss`) must end below it.
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    {
+        let image_end_phys =
+            crate::kernel::boot::Bootstrap::default_reserved_ranges_for_arch_boot()[0].1;
+        if image_end_phys > AP_STACK_PHYS_BASE {
+            crate::yarm_log!(
+                "YARM_SMP_AP_STACK_OVERLAPS_IMAGE cpu={} image_end=0x{:x} ap_stack_base=0x{:x} started=0",
+                cpu.0,
+                image_end_phys,
+                AP_STACK_PHYS_BASE
+            );
+            return None;
+        }
+    }
+
     #[cfg(all(not(test), not(feature = "hosted-dev")))]
     let cr3_or_kernel_ptr = current_cr3();
+    // AP-SCHED4 §B: this boot root is the kernel's own address space (`enter_kernel_root`).
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    super::descriptor_tables::record_kernel_root_cr3(cr3_or_kernel_ptr);
 
     #[cfg(any(test, feature = "hosted-dev"))]
     let cr3_or_kernel_ptr = kernel as *const KernelState as usize as u64;
@@ -653,6 +682,107 @@ pub fn set_ap_rust_entry_enabled(enabled: bool) {
     AP_RUST_ENTRY_ENABLE.store(enabled, core::sync::atomic::Ordering::Release);
 }
 
+/// AP-SCHED4 §B — the APIC ID each logical CPU was planned at from the firmware's MADT (index =
+/// logical id; `u32::MAX` = none). Written once, by the boot CPU, before the kernel state exists.
+static PLANNED_APIC: [core::sync::atomic::AtomicU32;
+    crate::arch::x86_cpu_admission::PRODUCTION_CPU_CEILING] =
+    [const { core::sync::atomic::AtomicU32::new(u32::MAX) };
+        crate::arch::x86_cpu_admission::PRODUCTION_CPU_CEILING];
+
+/// The APIC ID logical CPU `cpu` was planned at, if it was.
+pub(crate) fn planned_apic(cpu: CpuId) -> Option<u32> {
+    PLANNED_APIC
+        .get(cpu.0 as usize)
+        .map(|a| a.load(Ordering::Acquire))
+        .filter(|a| *a != u32::MAX)
+}
+
+/// The secondaries (logical CPUs other than 0) the firmware plan placed.
+pub(crate) fn planned_secondaries_bitmap() -> u64 {
+    (1..PLANNED_APIC.len())
+        .filter(|&c| planned_apic(CpuId(c as u8)).is_some())
+        .fold(0u64, |m, c| m | (1u64 << c))
+}
+
+/// AP-SCHED4 §B — discover the processors the firmware lists and plan their logical CPUs.
+///
+/// Source: the MADT through the PVH RSDP (types 0 and 9). The boot CPU is logical 0 at its own
+/// APIC ID (`CPUID`), listed or not. Every other entry is planned by
+/// [`crate::arch::x86_cpu_admission::plan`]; each exclusion is named here, before anything is
+/// started, and the plan's logical set is staged as the scheduler's present set. Without a MADT
+/// the boot CPU is the only CPU (named). No `-smp`-style count is trusted.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn plan_cpus_from_firmware() {
+    use crate::arch::x86_cpu_admission::{Listed, MAX_PLANNED_CPUS, logical_present_bitmap, plan};
+    let boot_apic = super::descriptor_tables::raw_current_apic_id();
+    PLANNED_APIC[0].store(boot_apic, Ordering::Release);
+    let mut listed = [Listed {
+        apic_id: 0,
+        enabled: false,
+    }; MAX_PLANNED_CPUS];
+    let mut n = 0usize;
+    let mut beyond = 0usize;
+    let madt = super::acpi::find_madt();
+    if let Some(entries) = madt.and_then(crate::arch::acpi_madt_rule::processors) {
+        for e in entries {
+            if n < MAX_PLANNED_CPUS {
+                listed[n] = Listed {
+                    apic_id: e.apic_id,
+                    enabled: e.enabled,
+                };
+                n += 1;
+            } else {
+                beyond += 1;
+                crate::yarm_log!(
+                    "X86_CPU_EXCLUDED apic_id={} reason={} started=0",
+                    e.apic_id,
+                    crate::arch::x86_cpu_admission::Exclusion::BeyondPlanTable.marker()
+                );
+            }
+        }
+    }
+    let (planned, boot_listed) = plan(
+        &listed[..n],
+        boot_apic,
+        crate::arch::platform_constants::MAX_CPUS,
+    );
+    crate::yarm_log!(
+        "X86_CPU_DISCOVERY source={} listed={} beyond_table={} boot_apic_id={} boot_listed={}",
+        if madt.is_some() {
+            "madt"
+        } else {
+            "none_boot_cpu_only"
+        },
+        n,
+        beyond,
+        boot_apic,
+        u8::from(boot_listed)
+    );
+    for p in planned.iter().flatten() {
+        match p.outcome {
+            Ok(cpu) => {
+                if let Some(slot) = PLANNED_APIC.get(cpu as usize) {
+                    slot.store(p.apic_id, Ordering::Release);
+                }
+                crate::yarm_log!("X86_CPU_PLANNED apic_id={} cpu={}", p.apic_id, cpu);
+            }
+            Err(why) => crate::yarm_log!(
+                "X86_CPU_EXCLUDED apic_id={} reason={} started=0",
+                p.apic_id,
+                why.marker()
+            ),
+        }
+    }
+    let present = logical_present_bitmap(&planned);
+    let _ = crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(present);
+    crate::yarm_log!(
+        "X86_LOGICAL_CPUS count={} bitmap=0x{:x} ceiling={}",
+        present.count_ones(),
+        present,
+        crate::arch::x86_cpu_admission::PRODUCTION_CPU_CEILING
+    );
+}
+
 /// AP-SCHED4 §A2 — bind a secondary's APIC ID to its logical id; `false` binds nothing.
 fn bind_secondary_apic(apic_id: u32, cpu: CpuId) -> bool {
     #[cfg(not(feature = "hosted-dev"))]
@@ -726,11 +856,13 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             AP_READY_POLL_ITERS
         );
 
-        // AP-SCHED4 §A2: bind this CPU's hardware identity to its logical id BEFORE it can run
-        // anything that asks which CPU is executing. Today's present set is numbered by APIC ID
-        // (the platform layout's `-smp` model), so the APIC ID targeted below is `cpu.0`; that
-        // assumption lives here and in the start-up IPI target only, never in the lookup.
-        let apic_id = u32::from(cpu.0);
+        // AP-SCHED4 §A2/§B: bind this CPU's hardware identity — the APIC ID the firmware's MADT
+        // listed and the plan gave this logical id — BEFORE it can run anything that asks which
+        // CPU is executing. The start-up IPI below names that same APIC ID.
+        let Some(apic_id) = planned_apic(cpu) else {
+            crate::yarm_log!("YARM_SMP_AP_UNPLANNED cpu={} started=0", cpu.0);
+            continue;
+        };
         if !bind_secondary_apic(apic_id, cpu) {
             crate::yarm_log!("YARM_SMP_AP_BIND_REFUSED cpu={} apic_id={}", cpu.0, apic_id);
             continue;
@@ -1205,7 +1337,8 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                             AP_IRQ_SMOKE_VECTOR
                         );
                         let esr_before = bsp_lapic_esr_read();
-                        wait_for_icr_idle(cpu.0, "before_irq_smoke");
+                        let Some(apic) = apic_of(cpu) else { continue };
+                        wait_for_icr_idle(apic, "before_irq_smoke");
                         crate::yarm_log!(
                             "X86_IPI_REMOTE_WAKE_SEND from=0 to={} vector=0x{:x}",
                             cpu.0,
@@ -1213,7 +1346,7 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                         );
                         let icr_high = (cpu.0 as u32) << 24;
                         let icr_low = AP_IRQ_SMOKE_VECTOR as u32; // fixed, physical, edge
-                        write_icr(cpu.0, icr_low);
+                        write_icr(apic, icr_low);
                         crate::yarm_log!(
                             "X86_IPI_FIXED_ICR_WRITTEN to={} high=0x{:08x} low=0x{:08x}",
                             cpu.0,
@@ -1598,13 +1731,14 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
             // 4. Remote-wake proof: exactly one wake, observed, re-idled.
             let wake_before = super::percpu::read_record(cpu).remote_wake_count;
             let reenter_before = super::percpu::read_record(cpu).wake_reenter_mirror;
-            wait_for_icr_idle(cpu.0, "before_remote_wake");
+            let Some(apic) = apic_of(cpu) else { continue };
+            wait_for_icr_idle(apic, "before_remote_wake");
             crate::yarm_log!(
                 "X86_IPI_REMOTE_WAKE_SEND from=0 to={} vector=0x{:x}",
                 cpu.0,
                 AP_REMOTE_WAKE_VECTOR
             );
-            write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
+            write_icr(apic, AP_REMOTE_WAKE_VECTOR as u32);
 
             let mut recv = false;
             for _ in 0..AP_READY_POLL_ITERS {
@@ -1721,6 +1855,16 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
             continue;
         }
         let cpu = CpuId(raw as u8);
+        // AP-SCHED4 §B: an online target always has its APIC binding (it was bound before it was
+        // started); a target without one is named and gets no request it could never acknowledge.
+        let Some(apic) = apic_of(cpu) else {
+            crate::yarm_log!(
+                "{} target_cpu={} reason=no_apic_binding",
+                tlb_shootdown::MARK_SEND,
+                cpu.0
+            );
+            continue;
+        };
         // Post the request FIRST (writes req_va then bumps req_gen), then IPI. The
         // returned `want` is the generation the target must publish into its own
         // ack_gen; the BSP never writes ack_gen.
@@ -1732,8 +1876,8 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
             want,
             va
         );
-        wait_for_icr_idle(cpu.0, "before_tlb_shootdown");
-        write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
+        wait_for_icr_idle(apic, "before_tlb_shootdown");
+        write_icr(apic, AP_REMOTE_WAKE_VECTOR as u32);
         let mut got = false;
         for _ in 0..AP_READY_POLL_ITERS {
             // Read-only observation of the AP-owned ack generation.
@@ -2200,23 +2344,32 @@ pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool)
             tlb_ready,
             trap_return_ready: usermode_entry_ready,
         };
-        // Drive the REAL audited transition. It refuses (usermode entry not ready),
-        // logs `X86_AP_WAKE_ONLY_CLEAR_DEFERRED reason=trap_return_not_ready`, and
-        // does NOT clear wake-only. This exercises the exact production gate.
-        let cleared = try_enable_ap_user_dispatch(kernel, cpu, readiness).is_ok();
-        // Stage 189C6: when the live dispatch knob is ARMED and the audited
-        // transition cleared this AP's wake-only bit, drive the FIRST live AP user
-        // dispatch on it now. When the knob is OFF this is skipped entirely and the
-        // honest deferral marker is emitted (unchanged baseline).
-        if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {
-            live_ap_user_dispatch(kernel, cpu);
-        } else {
-            crate::yarm_log!(
-                "{} cpu={} reason=ap_ring3_live_dispatcher_hook_gated",
-                ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
-                cpu.0
-            );
+        // AP-SCHED4 §B: ONE scheduling owner per secondary. In production (no knob) dispatch
+        // eligibility is not this audit's to grant: the secondary admits ITSELF, after boot
+        // publication, once it has verified its own production state
+        // (`yarm_x86_ap_production_main`). Only the diagnostic `yarm.ap_user_dispatch=1` profiles
+        // keep the audited diagnostic transition and its BSP-built plans — and then no secondary
+        // is owed the production admission at all.
+        if crate::kernel::boot::ap_user_dispatch_enabled() {
+            let cleared = try_enable_ap_user_dispatch(kernel, cpu, readiness).is_ok();
+            if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {
+                live_ap_user_dispatch(kernel, cpu);
+            } else {
+                crate::yarm_log!(
+                    "{} cpu={} reason=ap_ring3_live_dispatcher_hook_gated",
+                    ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
+                    cpu.0
+                );
+            }
+            continue;
         }
+        let _ = readiness;
+        crate::yarm_log!(
+            "{} cpu={} reason=production_admission_owns_dispatch",
+            ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
+            cpu.0
+        );
+        owe_production_admission(cpu);
     }
 }
 
@@ -2436,6 +2589,202 @@ pub(crate) fn ap_sched_return_to_idle_markers(cpu: CpuId) {
     ));
 }
 
+/// AP-SCHED4 §B — the per-CPU request value that asks a secondary, in its pre-admission idle loop,
+/// to take the PRODUCTION admission (as opposed to `1`, the retired diagnostic dispatch request).
+pub(crate) const AP_PRODUCTION_ADMISSION_REQUEST: u32 = 2;
+
+/// AP-SCHED4 §B — secondaries owed the production admission request: scheduler-online (wake-only,
+/// idle installed) and interrupt-verified during boot, released at boot publication.
+static PRODUCTION_ADMISSION_OWED: AtomicU64 = AtomicU64::new(0);
+/// AP-SCHED4 §B — secondaries that admitted themselves to production dispatch.
+static PRODUCTION_ADMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// `true` once `cpu` admitted itself to production dispatch (the boot CPU is not recorded here).
+pub fn production_admitted(cpu: CpuId) -> bool {
+    PRODUCTION_ADMITTED.load(Ordering::Acquire) & (1u64 << (cpu.0 as u64 & 63)) != 0
+}
+
+/// The secondaries admitted to production dispatch.
+pub fn production_admitted_bitmap() -> u64 {
+    PRODUCTION_ADMITTED.load(Ordering::Acquire)
+}
+
+/// AP-SCHED4 §B — `cpu` is scheduler-online (wake-only) and its pre-admission checks passed: owe it
+/// the production admission request. Posted now if the boot state is already published, otherwise
+/// at publication ([`release_deferred_ap_dispatch_at_publication`]). BLR1: no AP touches shared
+/// kernel state before publication.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn owe_production_admission(cpu: CpuId) {
+    if crate::runtime::boot_state_published() {
+        send_production_admission_request(cpu);
+        return;
+    }
+    PRODUCTION_ADMISSION_OWED.fetch_or(1u64 << (cpu.0 as u64 & 63), Ordering::AcqRel);
+    crate::yarm_log!("X86_AP_ADMISSION_OWED cpu={} until=boot_publication", cpu.0);
+}
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn send_production_admission_request(cpu: CpuId) {
+    use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+    super::percpu::set_ap_dispatch_request(cpu, AP_PRODUCTION_ADMISSION_REQUEST);
+    let Some(apic) = apic_of(cpu) else { return };
+    crate::yarm_log!("X86_AP_ADMISSION_REQUESTED cpu={} apic_id={}", cpu.0, apic);
+    wait_for_icr_idle(apic, "before_production_admission");
+    write_icr(apic, AP_REMOTE_WAKE_VECTOR as u32);
+}
+
+/// AP-SCHED4 §B — the reschedule IPI for a COMMITTED remote enqueue: vector 0xF1 to `target`'s
+/// bound APIC ID. Refused (sending nothing) for a target that is not dispatching — not the boot
+/// CPU and not production-admitted — or has no APIC binding. Called by the enqueue owners after
+/// their commit, with no domain lock held and interrupts masked (a trap), so this CPU's ICR pair
+/// is written without an interrupt between its halves. x86-TSO keeps the committed enqueue
+/// visible before the ICR write that announces it.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn send_reschedule_ipi(sender: CpuId, target: CpuId) -> bool {
+    use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+    // The diagnostic profiles send their own oracle IPIs; production sends none beside them.
+    if crate::kernel::boot::ap_user_dispatch_enabled() {
+        return false;
+    }
+    let dispatching = target.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID
+        || production_admitted(target);
+    if !dispatching || sender == target {
+        return false;
+    }
+    let Some(apic) = apic_of(target) else {
+        return false;
+    };
+    wait_for_icr_idle(apic, "before_reschedule");
+    write_icr(apic, AP_REMOTE_WAKE_VECTOR as u32);
+    RESCHEDULE_IPI_SENT[sender.0 as usize & 63].fetch_add(1, Ordering::AcqRel);
+    true
+}
+
+/// Per-sender count of reschedule IPIs written.
+static RESCHEDULE_IPI_SENT: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+/// Reschedule IPIs `cpu` has sent.
+pub fn reschedule_ipis_sent(cpu: CpuId) -> u64 {
+    RESCHEDULE_IPI_SENT[cpu.0 as usize & 63].load(Ordering::Acquire)
+}
+
+/// AP-SCHED4 §B — a secondary that could not take the production admission: it stays wake-only
+/// (the scheduler refuses every enqueue to it and balanced placement skips it), its timer is never
+/// armed, and it waits masked for ever. Named with the step it failed.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn park_unadmitted(cpu: CpuId, reason: &str) -> ! {
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "X86_AP_UNADMITTED cpu={} reason={} admitted=0 dispatching=0 result=fail",
+        cpu.0, reason
+    ));
+    loop {
+        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
+    }
+}
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+unsafe extern "C" {
+    fn yarm_x86_ap_production_switch(stack_top: u64, cpu: u64) -> !;
+}
+
+/// AP-SCHED4 §B — a secondary's production admission. Production: no knob. Runs on the secondary,
+/// on its own dispatch stack, with interrupts masked, after boot publication.
+///
+/// Order is the contract, and dispatch eligibility is published LAST:
+/// 1. its identity: the APIC ID it reads resolves, through the map, to the logical CPU it was
+///    started as;
+/// 2. the production IDT (the boot CPU's gates), served by its own TSS — `rsp0` its dispatch
+///    stack, IST 1–3 its own IST stacks — read back;
+/// 3. its SYSCALL entry: the per-CPU kernel `rsp0` and its own EFER/STAR/LSTAR/FMASK, read back;
+/// 4. its FP/SIMD control state: `CR0.EM=0 TS=0 MP=1 NE=1`, `CR4.OSFXSR/OSXMMEXCPT`, then the
+///    kernel's x87 and MXCSR baseline;
+/// 5. its own timer: the LAPIC enabled, TPR 0, the timer vector unmasked and armed — read back;
+/// 6. its kernel root, recorded (it holds no user root);
+/// 7. the scheduler's ONE production transition (`admit_dispatch`): out of wake-only, idle
+///    placeholder cleared, eligible for balanced placement — only now can a task land here;
+/// 8. the same authenticated idle park the boot CPU uses (interrupts open only there).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_x86_ap_production_main(cpu_raw: u64) -> ! {
+    let cpu = CpuId(cpu_raw as u8);
+    // 1. identity.
+    let me = super::descriptor_tables::current_cpu_id();
+    if me != cpu {
+        park_unadmitted(cpu, "identity_mismatch");
+    }
+    let Some(shared) = super::descriptor_tables::trap_shared_kernel() else {
+        park_unadmitted(cpu, "no_shared_kernel");
+    };
+    if !crate::runtime::boot_state_published() {
+        park_unadmitted(cpu, "before_boot_publication");
+    }
+    // 2. the production IDT and this CPU's own TSS stacks.
+    let Some(stack_top) = super::descriptor_tables::ap_dispatch_stack_top(cpu.0 as usize) else {
+        park_unadmitted(
+            cpu,
+            crate::arch::x86_cpu_admission::Exclusion::ProductionCeiling.marker(),
+        );
+    };
+    let idt = super::descriptor_tables::load_production_idt_on_this_cpu();
+    if idt != super::descriptor_tables::production_idt_base() {
+        park_unadmitted(cpu, "production_idt_readback");
+    }
+    let (rsp0, ist1, ist2, ist3) = super::descriptor_tables::tss_stacks(cpu.0 as usize);
+    if rsp0 != stack_top || ist1 == 0 || ist2 == 0 || ist3 == 0 {
+        park_unadmitted(cpu, "tss_stacks_readback");
+    }
+    // 3. the SYSCALL entry (per-CPU rsp0 first, then the MSRs; the MSR owner verifies EFER).
+    super::percpu::set_syscall_kernel_rsp0(cpu, stack_top);
+    super::descriptor_tables::configure_syscall_msrs_for_self();
+    if super::percpu::syscall_kernel_rsp0(cpu) != stack_top {
+        park_unadmitted(cpu, "syscall_rsp0_readback");
+    }
+    // 4. FP/SIMD control state.
+    if !super::descriptor_tables::establish_fpu_control_on_this_cpu() {
+        park_unadmitted(cpu, "fpu_control_readback");
+    }
+    // 5. this CPU's own timer.
+    super::irq::program_timer_deadline(
+        cpu,
+        crate::arch::platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+    );
+    let (svr_on, tpr, timer_unmasked, initial) = super::irq::this_cpu_lapic_readback();
+    if !(svr_on && tpr == 0 && timer_unmasked && initial != 0) {
+        park_unadmitted(cpu, "lapic_timer_readback");
+    }
+    // 6. the kernel root.
+    let root_released = crate::arch::hal::leave_user_root(cpu);
+    // 7. the scheduler's production admission.
+    if let Err(e) = shared.admit_ap_dispatch_split(cpu) {
+        crate::kernel::printk::printk_emit_sync(format_args!(
+            "X86_AP_SCHED_ADMISSION_REFUSED cpu={} reason={:?} result=fail",
+            cpu.0, e
+        ));
+        park_unadmitted(cpu, "scheduler_refused");
+    }
+    PRODUCTION_ADMITTED.fetch_or(1u64 << (cpu.0 as u64 & 63), Ordering::AcqRel);
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "X86_AP_SCHED_ADMITTED cpu={} apic_id={} mode=production wake_only=0 balance_excluded=0 timer=own ipi_target=1 idt=production root=kernel root_released={} stack_top=0x{:x} stack_bytes=0x{:x} result=ok",
+        cpu.0,
+        super::descriptor_tables::raw_current_apic_id(),
+        u8::from(root_released),
+        stack_top,
+        super::descriptor_tables::AP_DISPATCH_STACK_BYTES
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "X86_AP_STATE cpu={} discovered=1 initialized=1 irq_ready=1 admitted=1 dispatching=1 reason=none",
+        cpu.0
+    ));
+    // AP-SCHED4 witness: admitted, with the hardware identity it was admitted under.
+    #[cfg(feature = "x86-apsched-witness")]
+    crate::kernel::apsched_witness::ap_admitted_as(
+        cpu,
+        u64::from(super::descriptor_tables::raw_current_apic_id()),
+    );
+    // 8. the production idle park.
+    super::descriptor_tables::idle_halt_loop()
+}
+
 /// Stage 189C6: the LIVE AP user-dispatch entry — called from the AP idle-loop hook
 /// (`smp_trampoline.rs` label `76:`) when the BSP set this AP's per-CPU
 /// `ap_dispatch_request`. It runs ON THE AP, lock-free: the task SELECTION and plan
@@ -2454,6 +2803,17 @@ pub extern "C" fn yarm_x86_ap_user_dispatch_entry() {
     use super::ap_dispatch;
     let cpu = super::descriptor_tables::current_cpu_id();
     let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+
+    // AP-SCHED4 §B: the production admission. Switches to this CPU's dispatch stack and never
+    // returns here.
+    if super::percpu::ap_dispatch_request(cpu) == AP_PRODUCTION_ADMISSION_REQUEST {
+        super::percpu::set_ap_dispatch_request(cpu, 0);
+        let Some(top) = super::descriptor_tables::ap_dispatch_stack_top(cpu.0 as usize) else {
+            park_unadmitted(cpu, "no_dispatch_stack");
+        };
+        // SAFETY: a fresh, unused stack this CPU alone owns; the call never returns.
+        unsafe { yarm_x86_ap_production_switch(top, u64::from(cpu.0)) }
+    }
 
     super::percpu::set_ap_dispatch_stage(cpu, 1);
     // One-shot: clear the request so a later spurious wake cannot re-enter.
@@ -2621,8 +2981,9 @@ pub(crate) fn send_reschedule_ipi_to(sender: CpuId, target: CpuId) {
         "X86_AP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok",
         sender.0, target.0, n
     ));
-    wait_for_icr_idle(target.0, "before_remote_wake_reschedule");
-    write_icr(target.0, AP_REMOTE_WAKE_VECTOR as u32);
+    let Some(apic) = apic_of(target) else { return };
+    wait_for_icr_idle(apic, "before_remote_wake_reschedule");
+    write_icr(apic, AP_REMOTE_WAKE_VECTOR as u32);
 }
 
 #[cfg(any(test, feature = "hosted-dev"))]
@@ -2648,8 +3009,9 @@ pub(crate) fn c2c_send_reschedule_ipi_to(sender: CpuId, target: CpuId) {
         "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok",
         sender.0, target.0, n
     ));
-    wait_for_icr_idle(target.0, "before_c2c_reschedule");
-    write_icr(target.0, AP_REMOTE_WAKE_VECTOR as u32);
+    let Some(apic) = apic_of(target) else { return };
+    wait_for_icr_idle(apic, "before_c2c_reschedule");
+    write_icr(apic, AP_REMOTE_WAKE_VECTOR as u32);
 }
 
 #[cfg(any(test, feature = "hosted-dev"))]
@@ -3130,6 +3492,27 @@ fn request_ap_dispatch_at_or_after_publication(cpu: CpuId) {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(crate) fn release_deferred_ap_dispatch_at_publication() {
     debug_assert!(crate::runtime::boot_state_published());
+    // AP-SCHED4 §B: the production admission requests owed since boot.
+    let admissions = PRODUCTION_ADMISSION_OWED.swap(0, Ordering::AcqRel);
+    // The firmware plan's secondaries, and those of them that passed their pre-admission checks
+    // (scheduler-online, interrupt-verified) and are released now. A planned CPU not released is
+    // named by its own failure marker at boot.
+    let planned = planned_secondaries_bitmap();
+    crate::yarm_log!(
+        "X86_AP_RELEASE_PLAN planned=0x{:x} released=0x{:x} knob={}",
+        planned,
+        admissions,
+        u8::from(crate::kernel::boot::ap_user_dispatch_enabled())
+    );
+    // AP-SCHED4 witness: the set released here is the set the run must cover.
+    #[cfg(feature = "x86-apsched-witness")]
+    crate::kernel::apsched_witness::note_release_plan(admissions, planned);
+    for raw in 0..crate::arch::platform_constants::MAX_CPUS.min(64) {
+        if admissions & (1u64 << raw) != 0 {
+            crate::yarm_log!("X86_AP_ADMISSION_RELEASED cpu={} at=boot_publication", raw);
+            send_production_admission_request(CpuId(raw as u8));
+        }
+    }
     let owed = AP_DISPATCH_OWED_AT_PUBLICATION.swap(0, Ordering::AcqRel);
     for raw in 0..crate::arch::platform_constants::MAX_CPUS.min(64) {
         if owed & (1u64 << raw) != 0 {
@@ -3147,8 +3530,9 @@ pub(crate) fn release_deferred_ap_dispatch_at_publication() {
 fn send_ap_dispatch_request(cpu: CpuId) {
     use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
     super::percpu::set_ap_dispatch_request(cpu, 1);
-    wait_for_icr_idle(cpu.0, "before_ap_dispatch");
-    write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
+    let Some(apic) = apic_of(cpu) else { return };
+    wait_for_icr_idle(apic, "before_ap_dispatch");
+    write_icr(apic, AP_REMOTE_WAKE_VECTOR as u32);
 
     // Do NOT poll here. The AP's probe issues a NORMAL syscall into the shared kernel, and the
     // seal verdict is emitted by the AP's own syscall (X86_AP_USER_DISPATCH_SEAL_DONE result=ok),

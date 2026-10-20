@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+/// AP-SCHED4 §B — the RSDP and MADT, read in production.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub mod acpi;
 pub mod ap_dispatch;
 pub mod ap_sched;
 pub mod boot;

@@ -250,6 +250,25 @@ pub fn acknowledge_interrupt(_irq_line: u16) {
     }
 }
 
+/// AP-SCHED4 §B — THIS CPU's local-APIC readiness as its own registers report it:
+/// `(svr_enabled, tpr, lvt_timer_vector_unmasked, timer_initial_count)`. Reads only.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn this_cpu_lapic_readback() -> (bool, u32, bool, u32) {
+    let base = LAPIC_MMIO_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return (false, u32::MAX, false, 0);
+    }
+    let rd = |off: usize| unsafe { core::ptr::read_volatile((base + off) as *const u32) };
+    let svr = rd(LAPIC_SVR_OFFSET);
+    let lvt = rd(LAPIC_LVT_TIMER_OFFSET);
+    (
+        svr & LAPIC_SVR_ENABLE != 0,
+        rd(0x80),
+        lvt & 0xFF == LAPIC_TIMER_VECTOR && lvt & (1 << 16) == 0,
+        rd(LAPIC_TIMER_INITIAL_COUNT_OFFSET),
+    )
+}
+
 pub fn program_timer_deadline(_cpu: crate::kernel::scheduler::CpuId, _ticks_from_now: u64) {
     #[cfg(any(test, not(feature = "hosted-dev")))]
     {

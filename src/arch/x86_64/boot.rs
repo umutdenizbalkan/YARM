@@ -128,6 +128,8 @@ pmode_boot_stack_end:
 
     .section .bss.bootstack,"aw",@nobits
     .align 16
+    .global boot_stack
+    .global boot_stack_end
 boot_stack:
     .skip 0x01000000
 boot_stack_end:
@@ -453,7 +455,8 @@ const RING3_PM_SERVER_TID: u64 = 3;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const INITRAMFS_HELLO_WORLD_IMAGE_ID: u64 = 0x494E_4954_5848_454C; // "INITXHEL"
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-const AP_STACK_PHYS_BASE: u64 = 0x0200_0000; // 32 MiB, above kernel image+BSS, below 64 MiB identity limit.
+// AP-SCHED4 §B: must equal `smp::AP_STACK_PHYS_BASE` (63 MiB, above the kernel image + BSS).
+const AP_STACK_PHYS_BASE: u64 = crate::arch::x86_64::smp::AP_STACK_PHYS_BASE;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const AP_STACK_BYTES: u64 = 16 * 1024;
 
@@ -1185,6 +1188,16 @@ pub fn bootstrap_first_user_task(
             );
         }
     }
+    // AP-SCHED4: the production AP-scheduling witness's one process P. Compile-time gated, and
+    // armed only WITHOUT the diagnostic dispatch knob: it exercises the production admission of
+    // every secondary. Its stack paint runs first, before any secondary leaves its boot stack.
+    #[cfg(feature = "x86-apsched-witness")]
+    if !crate::kernel::boot::ap_user_dispatch_enabled() {
+        crate::kernel::apsched_witness::ap_stack::paint_all();
+        if let Err(e) = crate::kernel::apsched_witness::provision(kernel) {
+            crate::yarm_log!("APSW_PROVISION_FAIL err={:?} result=fail", e);
+        }
+    }
     // U9-PAGEFAULT1 §2 — the x86_64 TERMINAL-FAULT oracle slot-5 write.
     //
     // The same scenario, selector and knob AArch64 has used since 199E-A64CALL: init takes one
@@ -1520,10 +1533,10 @@ fn capture_pvh_command_line(start_info_ptr: usize) {
         return;
     }
     let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
-    // QEMU-IRQ3 §1: the witness reads the MADT through the RSDP the PVH boot protocol hands over.
-    #[cfg(feature = "x86_64-uart-irq-witness")]
+    // AP-SCHED4 §B: production reads the MADT (the processors to admit) through the RSDP the PVH
+    // boot protocol hands over; the QEMU-IRQ3 witness reads the same table through it.
     if start_info._magic == PVH_MAGIC {
-        crate::arch::x86_64::uart_irq_witness::capture_rsdp(start_info._rsdp_paddr);
+        crate::arch::x86_64::acpi::capture_rsdp(start_info._rsdp_paddr);
     }
     let physical = start_info.cmdline_paddr;
     let read_len = BOOT_COMMAND_LINE_MAX_BYTES + 1;
@@ -1909,6 +1922,9 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
     crate::arch::x86_64::console::write_line("KM1");
     log_pvh_boot_metadata(start_info_ptr);
     capture_pvh_command_line(start_info_ptr);
+    // AP-SCHED4 §B: the processors to admit, from the MADT the RSDP above names; staged as the
+    // scheduler's present set before the kernel state is built.
+    crate::arch::x86_64::smp::plan_cpus_from_firmware();
     crate::arch::x86_64::console::write_line("KM2");
     let (regions, used) = collect_pvh_usable_regions(start_info_ptr);
     store_prepared_boot_memory_map(&regions[..used]);
