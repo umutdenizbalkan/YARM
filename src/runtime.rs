@@ -14753,47 +14753,18 @@ impl SharedKernel {
     pub(crate) fn drain_server_death_post_work(&self, cpu: CpuId) -> usize {
         let cpu_idx = cpu.0 as usize;
         let mut drained = 0usize;
-        while let Some(work) = crate::kernel::boot::server_death_work_drain_next(cpu_idx) {
-            drained += 1;
-            self.settle_deferred_server_death(cpu_idx, work);
-        }
-        while let Some(index) = crate::kernel::boot::server_death_claimable_take_next() {
-            let Some(work) = self.with_ipc_split_mut(|ipc| {
-                crate::kernel::boot::take_claimable_server_death_locked(ipc, index)
-            }) else {
-                // A hint with nothing claimable behind it: another drain took the item first.
-                continue;
+        // AP-SCHED4 §A1: queued items first, then every parked item an arming made claimable.
+        // Both are owned by this drain from the moment they are taken, and both are settled by
+        // the one body below.
+        loop {
+            let work = match crate::kernel::boot::server_death_work_drain_next(cpu_idx) {
+                Some(work) => work,
+                None => match self.accept_next_claimable_server_death(cpu_idx) {
+                    Some(work) => work,
+                    None => break,
+                },
             };
             drained += 1;
-            // The one real consumption of a parked item (its first take was un-counted when it
-            // was parked).
-            #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-            crate::kernel::boot::server_dies_counters::note_deferred_consumed(
-                work.reply_record_index,
-                work.reply_record_generation,
-            );
-            crate::yarm_log!(
-                "IPC_SERVER_DEATH_CLAIMED_FROM_PARK cpu={} record_index={} record_generation={} server_tid={} server_asid={} result=ok",
-                cpu_idx,
-                work.reply_record_index,
-                work.reply_record_generation,
-                work.exiting_server.tid.0,
-                work.exiting_server.asid.0
-            );
-            self.settle_deferred_server_death(cpu_idx, work);
-        }
-        drained
-    }
-
-    /// One deferred server-death item, owned by this drain: revalidate it against the record and
-    /// its armed terminal identity, then complete it through the single terminal arbitration —
-    /// or park it on its record when its caller has not armed yet.
-    fn settle_deferred_server_death(
-        &self,
-        cpu_idx: usize,
-        work: crate::kernel::boot::DeferredServerDeathCompletion,
-    ) {
-        {
             // ── Stage 200D-2B1A (§2/§4): the post-lock boundary attestation ──────────────
             //
             // Every caller of this drain reaches it only after its architecture's broad
@@ -14870,7 +14841,7 @@ impl SharedKernel {
                     work.exiting_server.tid.0,
                     work.exiting_server.asid.0
                 );
-                return;
+                continue;
             }
             let Some(identity) = armed else {
                 crate::yarm_log!(
@@ -14878,7 +14849,7 @@ impl SharedKernel {
                     work.reply_record_index,
                     work.reply_record_generation
                 );
-                return;
+                continue;
             };
             // The item must still describe the record it was published for, and that record
             // must still name the exact exiting incarnation — numeric TID alone never
@@ -14911,7 +14882,7 @@ impl SharedKernel {
                     "IPC_SERVER_DEATH_DRAIN outcome=stale_identity record_index={} caller_wakes=0 result=ok",
                     work.reply_record_index
                 );
-                return;
+                continue;
             }
             let mut d = OffLockReplyTimeout(self);
             let outcome = crate::kernel::boot::complete_server_death_over(&mut d, &identity);
@@ -14922,6 +14893,35 @@ impl SharedKernel {
                 work.reply_record_generation
             );
         }
+        drained
+    }
+
+    /// AP-SCHED4 §A1 — accept the next parked server death an arming made claimable, if any.
+    ///
+    /// Clears one claim bit and, in one rank-3 scope, takes the record's parked item if it is
+    /// still claimable; from then on this drain owns it. A bit with nothing claimable behind it
+    /// (another drain took the item first) is spent and the search goes on.
+    fn accept_next_claimable_server_death(
+        &self,
+        cpu_idx: usize,
+    ) -> Option<crate::kernel::boot::DeferredServerDeathCompletion> {
+        while let Some(index) = crate::kernel::boot::server_death_claimable_take_next() {
+            let Some(work) = self.with_ipc_split_mut(|ipc| {
+                crate::kernel::boot::take_claimable_server_death_locked(ipc, index)
+            }) else {
+                continue;
+            };
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_CLAIMED_FROM_PARK cpu={} record_index={} record_generation={} server_tid={} server_asid={} result=ok",
+                cpu_idx,
+                work.reply_record_index,
+                work.reply_record_generation,
+                work.exiting_server.tid.0,
+                work.exiting_server.asid.0
+            );
+            return Some(work);
+        }
+        None
     }
 
     /// Stage 200D — register the bounded reverse link through the rank-2 TASK seam (never

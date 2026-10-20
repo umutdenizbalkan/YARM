@@ -106411,7 +106411,32 @@ mod stage200d2b1bi_counters {
                         .count()
             })
             .sum();
-        assert_eq!(deferred, 3, "three scoped deferred edges, one per class");
+        // AP-SCHED4 §A1: four — the consumption class has two real operations, the queue drain
+        // and a drain's acceptance of a claimable PARKED item (`take_claimable_server_death_locked`,
+        // whose take from the queue was un-counted when it was parked). Each sits at its own
+        // real take, below.
+        assert_eq!(
+            deferred, 4,
+            "four scoped deferred edges: reserve, publish, two consumptions"
+        );
+        let accept = IPC_SRC
+            .split("pub(crate) fn take_claimable_server_death_locked(")
+            .nth(1)
+            .expect("the parked acceptance")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let take = accept
+            .find("let work = slot.take()?.work;")
+            .expect("the real take");
+        let counted = accept
+            .find("server_dies_counters::note_deferred_consumed(")
+            .expect("counted there");
+        assert!(take < counted, "counted after the real take");
+        assert!(
+            accept.contains("work.reply_record_index")
+                && accept.contains("work.reply_record_generation")
+        );
         // The scoped helpers are the ONLY way the deferred classes are reached.
         for f in files {
             assert!(
@@ -202264,7 +202289,7 @@ mod ap_sched3 {
         const RUNTIME: &str = include_str!("../../runtime.rs");
         const IPC_STATE: &str = include_str!("ipc_state.rs");
         const MOD: &str = include_str!("mod.rs");
-        let settle = body_of(RUNTIME, "    fn settle_deferred_server_death(");
+        let settle = body_of(RUNTIME, "    pub(crate) fn drain_server_death_post_work(");
         let scope = settle
             .find("let armed = self.with_ipc_split_mut(|ipc| {")
             .expect("one scope");

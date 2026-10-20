@@ -1389,7 +1389,15 @@ pub(crate) fn take_claimable_server_death_locked(
     if !slot.is_some_and(|p| p.claimable) {
         return None;
     }
-    slot.take().map(|p| p.work)
+    let work = slot.take()?.work;
+    // The item's one real consumption: a drain now owns it (its take from the queue was
+    // un-counted when it was parked). Scoped by the item's own record identity.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    crate::kernel::boot::server_dies_counters::note_deferred_consumed(
+        work.reply_record_index,
+        work.reply_record_generation,
+    );
+    Some(work)
 }
 
 /// AP-SCHED4 §A1 — the arming's handoff marker. Silent when nothing was parked, which is every
