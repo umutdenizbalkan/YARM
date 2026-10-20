@@ -201275,6 +201275,63 @@ mod ap_sched1 {
         assert_eq!(lanes(&k).1, 0x2008_0a40);
     }
 
+    /// **AP-SCHED4 §B — x86_64: the reply-direct delivery commit, which leaves the blocked state
+    /// in place, survives the park capture too.** It publishes the recv-v2 lanes and makes the
+    /// receiver runnable in one acquisition; a recv-v2 receive no longer blocked in its receive
+    /// has been resolved, so the capture keeps its lanes. A LEGACY receiver woken to re-run its
+    /// receive (nothing published) is captured whole.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_reply_direct_commit_before_the_x86_park_capture_survives_it() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (_endpoint_idx, asid) = blocked_receiver(&k, 84, true);
+        let rcx = |k: &SharedKernel| {
+            k.with(|s| s.with_tcb_mut(84, |tcb| tcb.user_context.user_gprs[2]))
+                .expect("tcb")
+        };
+        let mut frame = crate::kernel::trapframe::TrapFrame::zeroed();
+        frame.set_user_gpr(2, 0x2008_0a40);
+        assert!(matches!(
+            k.sr_commit_blocked_receiver_split(
+                84,
+                asid,
+                crate::kernel::boot::BlockedRecvDeliveryResult::RECV_V2,
+            ),
+            crate::runtime::ReceiverCommit::Committed(..)
+        ));
+        assert!(
+            k.with(|s| s.with_tcb_mut(84, |tcb| tcb.blocked_recv_state.is_some()))
+                .expect("tcb"),
+            "this commit leaves the blocked state in place"
+        );
+        assert_eq!(rcx(&k), 0, "published");
+        assert!(k.capture_outgoing_recv_user_context_split(84, &frame));
+        assert_eq!(rcx(&k), 0, "the delivery survives the capture");
+        // A legacy waiter woken without a delivery: its capture is whole.
+        let (endpoint_idx, _) = blocked_receiver(&k, 85, false);
+        k.with(|s| {
+            s.with_tcb_mut(85, |tcb| {
+                tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                    recv_cap: crate::kernel::capabilities::CapId(1),
+                    payload_user_ptr: 0x4000,
+                    payload_user_len: 8,
+                    meta_user_ptr: 0,
+                    meta_user_len: 0,
+                    recv_abi: crate::kernel::task::RecvAbiVariant::LegacyTimeout,
+                });
+            })
+        });
+        k.wake_waiter_for_endpoint_split(CPU0, endpoint_idx)
+            .expect("wake");
+        assert!(k.capture_outgoing_recv_user_context_split(85, &frame));
+        assert_eq!(
+            k.with(|s| s.with_tcb_mut(85, |tcb| tcb.user_context.user_gprs[2]))
+                .expect("tcb"),
+            0x2008_0a40,
+            "a legacy receiver is never inferred resolved from its status"
+        );
+    }
+
     /// **A legacy waiter is woken exactly as before**: it re-runs its receive, so nothing is
     /// published into its context.
     #[test]

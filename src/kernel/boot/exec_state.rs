@@ -4263,9 +4263,11 @@ impl crate::runtime::SharedKernel {
     /// RAX, RCX = error, RDX, R8). So when the blocked state is already gone, the result lanes
     /// belong to that delivery (published, or about to be), and the capture keeps the saved ones
     /// instead of the live frame's — which hold the syscall's own arguments (RCX's slot holds
-    /// `r10`). Every other register is captured as usual. While the state is still present no
-    /// delivery has begun, and a published non-delivery completion is restored by
-    /// [`Self::reapply_parked_recv_completion_split`].
+    /// `r10`). The same holds for a recv-v2 receive that is no longer blocked in its receive: the
+    /// reply-direct delivery commit publishes the lanes and makes the receiver runnable in one
+    /// acquisition without taking the state. Every other register is captured as usual. While
+    /// a receive is unresolved nothing is kept, and a published non-delivery completion is
+    /// restored by [`Self::reapply_parked_recv_completion_split`].
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn capture_outgoing_recv_user_context_split(
         &self,
@@ -4277,7 +4279,25 @@ impl crate::runtime::SharedKernel {
             let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == outgoing_tid) else {
                 return false;
             };
-            if tcb.blocked_recv_state.is_none() {
+            // A completer has resolved this receive, and the saved result lanes are its:
+            // * the blocked state is gone — a delivery took it before publishing; or
+            // * a recv-v2 receive is no longer blocked in its receive — the delivery commit
+            //   (`sr_commit_blocked_receiver_split`, which leaves the state in place), a
+            //   timeout, a server death and an undelivered wake all publish the lanes before, or
+            //   in the same acquisition as, the receiver leaves `Blocked(EndpointReceive)`.
+            // A LEGACY receive still blocked-state-present is never inferred resolved from its
+            // status: a legacy waiter can be woken to re-run its receive with nothing published.
+            let recv_v2 = tcb
+                .blocked_recv_state
+                .as_ref()
+                .is_some_and(|st| st.recv_abi == crate::kernel::task::RecvAbiVariant::RecvV2);
+            let still_receiving = matches!(
+                tcb.status,
+                crate::kernel::task::TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(_)
+                )
+            );
+            if tcb.blocked_recv_state.is_none() || (recv_v2 && !still_receiving) {
                 let held = &tcb.user_context;
                 captured.arg0 = held.arg0;
                 for lane in [0usize, 2, 3, 7] {
