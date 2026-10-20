@@ -118,7 +118,18 @@ WAKE10=$(line_of "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0")
 [[ "$(count "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0")" == $((1 + ${SMP1_EXTRA_WAKES_10:-0})) ]] || die "CPU1->CPU0 wake requests != $((1 + ${SMP1_EXTRA_WAKES_10:-0}))"
 before "$C_BLOCK1" "$WAKE10" "the client is blocked before the CPU1->CPU0 wake"
 C_CTX=$(line_of "SMP1_USER cpu=0 SMP1_CLIENT_RESUME_CONTEXT_OK cpu=0 path=production_selection gprs=6 fxsave=1 reply=ok result=ok")
-before "$WAKE10" "$C_CTX" "the client's context check follows the wake"
+# The CPU1->CPU0 wake is the server's REPLY (NR 7 on CPU 1): it commits the client's enqueue and
+# only then prints the IPI request above. A CPU 0 still in the kernel when the enqueue commits picks
+# the client up at its own next scheduling point, so it can run — and print its check — before
+# CPU 1's request line reaches the console (AP-SCHED4 §A: seen once in 19 LOCK3 boots, never on
+# the base in 18, mechanism unchanged by the candidate). Console order between the two CPUs is not
+# causal; the causal edges are: the reply starts after the server's own check, the request follows
+# the reply's start, and the client — which has no deadline, so only the reply can resume it, and
+# which reports `reply=ok` — checks its context after the reply started.
+REPLY=$(rg -a -n -F -- "X86_AP_NORMAL_SYSCALL_BEGIN cpu=1 tid=$S_TID nr=7" "$NORM" | cut -d: -f1 | awk -v s="${S_CTX:-0}" '$1 > s' | head -1)
+before "$S_CTX" "$REPLY" "the server's reply starts after its own context check"
+before "$REPLY" "$WAKE10" "the CPU1->CPU0 wake request follows the server's reply"
+before "$REPLY" "$C_CTX" "the client's context check follows the server's reply"
 [[ "$(count "X86_BSP_SAVED_DISPATCH_OK")" == 0 ]] || die "the retired oracle BSP resume ran"
 
 # ── TLB rounds. Serial round k: odd k -> the client (CPU 0) replaces the server's W while the
