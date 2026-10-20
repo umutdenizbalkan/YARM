@@ -49,6 +49,16 @@ const IDLE_PARK_TICKS: u64 = 20;
 /// Upper bound on waiting for one item — about 60 s of parks, or 60 000 spin/probe rounds.
 const MAX_IDLE_ROUNDS: u32 = 300;
 const MAX_USER_ROUNDS: u32 = 60_000;
+/// One register-checked spin round, between two probes of the notification. AP-SCHED4 §B: on
+/// x86_64 the probe's kernel path takes about as long as a 20 000-iteration spin, so half the
+/// user items' interrupts were taken on the return from a probe instead of inside the check, and
+/// a run whose four landed there failed (as often on the base as with production SMP). A longer
+/// round keeps the check holding for nearly all of a user item's window; the obligation (at least
+/// one user-origin interrupt inside the check, every register intact) is unchanged. AArch64
+/// keeps its value (its image is unchanged).
+#[cfg(target_arch = "x86_64")]
+const SPIN_ITERS: u64 = 1_000_000;
+#[cfg(not(target_arch = "x86_64"))]
 const SPIN_ITERS: u64 = 20_000;
 /// RISC-V (AP-SCHED2 §1): the user item's announce block holds its register-checked window open
 /// until the kernel publishes the item's claim, bounded by this many loop iterations (about five
