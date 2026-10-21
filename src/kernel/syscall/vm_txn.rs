@@ -799,6 +799,18 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
     let mut displaced_unacknowledged = 0usize;
     for index in 0..records.len() {
         let Some(old) = records[index].replaced else {
+            // VM-INVALIDATION2 witness: OBS was installed but displaced nothing — recorded so the
+            // grader distinguishes a genuine replacement from a fresh install changing no backing.
+            #[cfg(all(
+                feature = "x86-vmi2-witness",
+                not(feature = "hosted-dev"),
+                target_arch = "x86_64"
+            ))]
+            crate::arch::x86_64::vmi2_witness::owner_no_displacement(
+                asid,
+                records[index].virt,
+                records[index].phys.0,
+            );
             continue;
         };
         #[cfg(all(
@@ -949,6 +961,22 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             // reclaimer can hand this frame out while a remote translation may still reach it.
             displaced_unacknowledged += 1;
         }
+        // VM-INVALIDATION2 witness: the production map transaction's own record for the witness
+        // OBS — the backing replaced (old), the backing installed, the completion, and whether the
+        // displaced backing was settled (reclaimed after an acknowledged shootdown) or quarantined.
+        #[cfg(all(
+            feature = "x86-vmi2-witness",
+            not(feature = "hosted-dev"),
+            target_arch = "x86_64"
+        ))]
+        crate::arch::x86_64::vmi2_witness::owner_displaced(
+            asid,
+            records[index].virt,
+            old.phys.0,
+            records[index].phys.0,
+            acknowledged,
+            records[index].displaced_pinned.is_none(),
+        );
     }
     if displaced_unacknowledged != 0 {
         // VM-INVALIDATION1 — THE FAILURE SETTLEMENT AFTER COMMIT.

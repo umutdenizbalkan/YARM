@@ -15685,6 +15685,16 @@ impl SharedKernel {
             not(feature = "hosted-dev")
         ))]
         crate::arch::riscv64::smp3_witness::note_shoot_targets(requester, asid.0, virt.0, targets);
+        // VM-INVALIDATION2 witness (default-off): record the shootdown owner's OWN target set — the
+        // operation's actual decision, which the grader requires in place of the observer's
+        // separate diagnostic snapshot.
+        #[cfg(all(
+            feature = "x86-vmi2-witness",
+            target_arch = "x86_64",
+            not(test),
+            not(feature = "hosted-dev")
+        ))]
+        crate::arch::x86_64::vmi2_witness::owner_target_select(requester, asid, virt, targets);
         if targets == 0 {
             // Zero remote observers: the local invalidation above — and, on AArch64, the
             // broadcast the unmap already completed — is the whole shootdown. Correct, and not a
