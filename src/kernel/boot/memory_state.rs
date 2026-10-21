@@ -201,7 +201,18 @@ impl KernelState {
                 bitmap |= cpu_bit;
             }
         }
-        bitmap
+        // VM-INVALIDATION2: a shootdown targets a CPU by HARDWARE ROOT RESIDENCY, not by scheduler
+        // placement — a CPU in the dispatch gap (yield/preempt cleared its `current` while the root
+        // stays loaded, which AP-SCHED4 then re-selects through without reloading CR3) is a genuine
+        // remote holder with an empty `current` slot. This owner feeds every broad shootdown target
+        // set (`compute_tlb_shootdown_request_plan`, `request_live_asid_shootdown`) and the teardown
+        // loaded-set, so folding residency in here is the ONE place that keeps the whole contract
+        // coherent with the split owner `live_cpu_bitmap_for_asid_split`. The record names only a
+        // CPU that may hold a cached translation (set after the CR3 load, before any user return;
+        // cleared only at the idle-root handoff after the kernel root is loaded and flushed), and a
+        // named-but-departed CPU only services a harmless `invlpg` — it is online and non-wake-only,
+        // hence running, so it cannot wedge the acknowledgement wait.
+        bitmap | (crate::arch::hal::address_space_loaded_bitmap(asid) & online)
     }
 
     /// Stage 5D: Compute the TLB shootdown target set for a single-page unmap

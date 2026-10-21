@@ -200758,6 +200758,50 @@ mod vm_invalidation1 {
             "a current-bound CPU is still named"
         );
     }
+
+    /// **The BROAD target set names the gap CPU too.** Fork copy-on-write, the broad VmMap
+    /// displacement reclaim and brk-unmap all compute their target set through
+    /// `compute_tlb_shootdown_request_plan` (the broad twin of the split owner). It must reach the
+    /// identical residency contract, or the same dispatch-gap hole stays open on the broad path.
+    #[test]
+    fn the_broad_target_set_names_a_root_resident_cpu_with_empty_current() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = kernel.with(|s| s.create_user_address_space().expect("asid").0);
+        root_resident_gap_on(&kernel, asid, CPU1);
+        let plan = kernel.with(|s| {
+            s.set_current_cpu(CPU0).expect("requester cpu 0");
+            s.compute_tlb_shootdown_request_plan(asid, VirtAddr(WINDOW as u64))
+        });
+        assert_ne!(
+            plan.target_cpu_bitmap & (1 << CPU1.0),
+            0,
+            "the broad plan must name the root-resident gap CPU, as the split owner does"
+        );
+    }
+
+    /// **One coherent contract: both target-set owners union the residency bitmap.** The source
+    /// guard the placement-only controls reverse.
+    #[test]
+    fn both_target_set_owners_union_the_residency_bitmap() {
+        let runtime = include_str!("../../runtime.rs");
+        let split = &runtime[runtime
+            .find("pub(crate) fn live_cpu_bitmap_for_asid_split(")
+            .expect("the split owner")..];
+        let split = &split[..split.find("\n    /// ").unwrap_or(split.len())];
+        assert!(
+            split.contains("crate::arch::hal::address_space_loaded_bitmap(asid) & candidates"),
+            "the split owner must OR the residency set, masked to candidates"
+        );
+        let broad = include_str!("memory_state.rs");
+        let b = &broad[broad
+            .find("fn live_cpu_bitmap_for_asid(&self, asid: Asid) -> CpuBitmap {")
+            .expect("the broad owner")..];
+        let end = b.find("\n    fn ").unwrap_or(b.len());
+        assert!(
+            b[..end].contains("crate::arch::hal::address_space_loaded_bitmap(asid) & online"),
+            "the broad owner must OR the residency set, masked to online CPUs"
+        );
+    }
 }
 
 /// AP-SCHED1 — the first production AP-scheduling increment (RISC-V, CPUs 0 and 1).
