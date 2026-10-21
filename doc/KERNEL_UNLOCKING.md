@@ -30167,3 +30167,261 @@ built the strict core's artifacts and ran them.
 **Delivered** `8a7cfe08` to `main`, `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/ap-sched4` by
 fast-forward from `8cb30dd1`. The remote commit and tree are equal on all three. The ref diff is
 exactly those three refs (one of them new).
+
+### §B — x86_64 production SMP
+
+x86_64 user tasks now run on every admitted CPU. Before §B, the secondaries came up wake-only and
+only the diagnostic `yarm.ap_user_dispatch` profiles ever dispatched on one. Admission is the
+production path, with no knob. The diagnostic profiles keep their own dispatcher, and a CPU is
+owned by exactly one of the two.
+
+#### Inventory
+
+| Concern | Owner | Established |
+|---|---|---|
+| discovery | `acpi::find_madt` (the PVH RSDP) → `acpi_madt_rule::processors` (types 0 and 9) | boot CPU, before the kernel state exists |
+| planning | `x86_cpu_admission::plan` | the boot CPU is logical 0 at its own APIC ID, the rest ascending by APIC ID, at most 8 logical CPUs; every exclusion is named before anything starts |
+| identity | `x86_cpu_identity::ApicCpuMap` (§A) | each started CPU is bound before INIT-SIPI-SIPI; `current_cpu_id()` resolves the executing CPU's own APIC ID, and an unmapped one halts |
+| startup | the unchanged INIT-SIPI-SIPI trampoline, addressed by the planned APIC ID | pre-admission stack: 16 KiB per CPU at 63 MiB; the AP self-check compares its LAPIC ID with its binding |
+| readiness | `run_ap_dispatch_scaffold_audit` (scheduler-online, wake-only, interrupt-verified at first dispatch, BootExclusive) | the AP is owed the production admission (`X86_AP_ADMISSION_OWED`); it touches no shared state before publication |
+| admission | `yarm_x86_ap_production_main`, on the AP, after publication (`X86_AP_RELEASE_PLAN`) | identity, production IDT plus its own TSS stacks, SYSCALL `rsp0` and MSRs, FP/SIMD control, its own LAPIC timer, and the kernel root, each read back; then `admit_ap_dispatch_split`, the scheduler's one production transition; then the idle park |
+| placement | the unchanged balanced placement | an admitted CPU leaves `wake_only`, and balancing may choose it from then on |
+| local timer | each CPU's own LAPIC one-shot (vector 0x20, 0.8 s, quantum = 1 interrupt) | armed at admission and re-armed by the shared timer settlement |
+| global timebase | CPU 0's tick (`tick_on`) | secondaries' interrupts preempt, but do not advance time |
+| reschedule IPI | `smp::send_reschedule_ipi`, called by `hal::notify_enqueued` for every committed remote enqueue | vector 0xF1 to the target's bound APIC ID; only to a dispatching CPU, and never beside the diagnostic oracle's own IPIs |
+| 0xF1 owner | the pure-asm stub | wake count, TLB request plus ACK, exactly one EOI; when it interrupted the idle `hlt` it hands off to the compiled entry, and otherwise returns |
+| syscall/trap entry | the shared compiled stubs (production IDT); TSS `rsp0` and gs:[144] are this CPU's dispatch stack | GS.base is the per-CPU record in every ring (no SWAPGS); FSGSBASE stays off |
+| context return | the shared exact-token and owner-revalidation resumes | GPRs, RIP/RSP, sanitized RFLAGS, the FXSAVE image (x87, control word, MXCSR, XMM), and now TLS on every resume |
+| idle root | `hal::leave_user_root` at every idle arrival | CR3 becomes the kernel root, and only then is the activation record released |
+
+#### Limits, derived
+
+| Limit | Value | Why |
+|---|---|---|
+| Production ceiling | **8 logical CPUs, the boot CPU included** | the same ceiling as RISC-V and AArch64. The witness mailbox, the stack pools and the qualification cover 8 |
+| xAPIC IDs | < 0xFF | xAPIC ICR addressing; a higher (x2APIC-only) ID is excluded as `apic_id_beyond_xapic` |
+| Plan table | 64 firmware entries | entries beyond it are named `beyond_plan_table` |
+| Scheduler tables (`MAX_CPUS`) | 64, unchanged | not raised |
+| Dispatch and IST stack pools | 7 each (ceiling − 1) | indexed by logical CPU − 1 |
+
+Excluded before dispatch, each named once with `started=0`:
+
+* `not_enabled_by_firmware`;
+* `apic_id_beyond_xapic`;
+* `duplicate_apic_id`;
+* `beyond_production_cpu_ceiling`;
+* `no_free_logical_cpu`;
+* `beyond_plan_table`.
+
+#### The defects found on the way
+
+* **TLS was lost on resume** (pre-existing on one CPU too). x86_64 keeps no FS base in the saved
+  context, but every resume restored the TLS lane only from a one-shot "pending" request (spawn,
+  fork). A thread resumed after another thread ran on its CPU came back with FS base 0. The
+  witness found it: its spinners faulted on `fs:[0]`. Every x86_64 resume now installs the
+  thread's recorded base (`task::resume_tls_lane`). The base reproduction fails on `798ec87d`.
+* **The idle IPI never reached the scheduler.** The 0xF1 stub always `iretq`'d, so an idle CPU
+  woken by a remote enqueue stayed idle until its timer. The stub now hands an interrupted idle
+  `hlt` to the compiled entry, which settles it as the idle queue advance. The idle `sti; hlt` is
+  one global-asm routine so the stub can recognise its resume address, and the EOI stays single.
+* **A receiver's park capture erased what another CPU had already given it.** A blocked
+  receiver is visible to other CPUs from its waiter publication, but its trap captures the live
+  frame into its saved context only later, at its queue advance. On x86_64 the result of a
+  receive lives in the saved context's lanes (RAX, RCX = error, RDX, R8, `arg0`), and the live
+  frame holds the syscall's own arguments there (RCX's slot holds `r10`). Two qualification
+  failures showed it:
+  * `-smp 3` witness, IPC thread 2: a published `WouldBlock` was overwritten, and the receiver
+    saw its own metadata pointer as the error;
+  * the ipccall-direct SMP regression, once its server was placed on CPU 1: a delivered reply
+    was overwritten, so the client saw "nothing yet" for a reply already consumed. Before the
+    fix this was reported as a failure; with a user-side retry (tried, and reverted) it hung.
+
+  Two repairs, both scoped to x86_64:
+  * a non-delivery completion (timeout, server death, undelivered wake) leaves a record of the
+    current receive generation. It is re-applied right after the capture, AP-SCHED1 §4's RISC-V
+    rule;
+  * a delivery first takes the receive's blocked state, then publishes the lanes, so a capture
+    that finds the state gone keeps the saved result lanes and captures everything else
+    (`capture_outgoing_recv_user_context_split`).
+
+  AArch64 publishes only the record and consumes it at resume, so a capture cannot erase it there.
+* **A timer self-resume reloaded CR3** (pre-existing). When a timer preemption found nothing
+  else runnable, the same task came back through the exact-token activation, which loaded CR3
+  unconditionally. A load is a full flush of the PCID, so the task lost translations its own CPU
+  was entitled to keep. QEMU-SMP1's residency probe depends on keeping them: it failed with
+  `r=reloaded` in 2 of 10 boots of `1d25523f`, each time with a timer preempt of the target in
+  its dwell. The base passed all 10, because its second tick landed about 50 log lines before
+  the first dwell. With the quantum shortened to 5e6 ticks the base fails the same way: in 1 of 3
+  boots, with the same signature. Both activation sites (the exact-token resume and the
+  queue-advance commit) now skip the load when this CPU's record names the ASID and CR3 already
+  holds its root (`hal::x86_user_root_resident`). The skip is sound for two reasons:
+  * every path that changes the record loads CR3 first, so the record has named the ASID since
+    that load, and every remote invalidation in that time targeted this CPU;
+  * the requester's own CPU retires its translation with a local `invlpg`.
+* **The duplicate-reply witness raced its server** (x86_64 had the RISC-V race). Once the server
+  child can run on CPU 1, the reply wake can resume the client on CPU 0 before the server tries
+  its duplicate reply. One boot reported `duplicate_reply=0` with the reply itself intact. The
+  client now waits, bounded, for the server's attempt, as on RISC-V. The NR 30 grant witness
+  (XFER2) passes against the larger x86 init image.
+* **A receive park resumed on its own trap returned its provisional result.** The x86_64 vector
+  epilogue writes the applied context's GPRs only when the trap returns to a different task. For
+  a return to the task that trapped, it writes the syscall's return fields. With production SMP
+  a receiver can park on CPU 1, take a delivery from CPU 0 before CPU 1's queue advance, and be
+  picked by that same advance, through the overtaken settlement. Its capture kept the delivered
+  lanes, but the epilogue then wrote the receive's provisional return over them, so the server
+  saw `WouldBlock` for a message already delivered. Seen once, in qb8's ipccall-direct SMP
+  regression (1 of 6 boots), with `X86_RECV_PARK_CAPTURE_KEPT_DELIVERY rcx=0` followed by
+  `OVERTAKEN_DEFERRAL_SETTLED … outgoing=10008 incoming=10008`. The receive site's self-resume
+  now adopts the applied context's result lanes as the trap's return
+  (`TrapFrame::adopt_restored_syscall_returns`, `X86_RECV_PARK_SELF_RESUME`). Other classes
+  are unchanged: only a receive publishes its result into the saved lanes.
+
+#### Production and diagnostic behavior
+
+* **Production (no knob).** Every planned CPU is started, self-checks, publishes readiness, and is
+  admitted on itself by `yarm_x86_ap_production_main`. Balanced placement then uses it like CPU
+  0. Remote enqueues send the 0xF1 reschedule IPI. Each CPU preempts on its own LAPIC timer, and
+  only CPU 0 advances the timebase.
+* **Diagnostic (`yarm.ap_user_dispatch=1` and the profiles built on it).** The release loop
+  hands each cleared secondary to the existing `live_ap_user_dispatch` and continues, so no
+  production admission is owed. `send_reschedule_ipi` refuses, which leaves the oracles' own
+  IPIs as the only ones (`X86_AP_RELEASE_PLAN … knob=1`). A CPU therefore has exactly one
+  scheduling owner. The SMP1, LOCK3, overtaken and ipccall-direct SMP regressions run this way
+  and are unchanged.
+
+#### Memory
+
+Measured with the witness build: stacks are painted at boot, and the deepest overwritten word is
+read at the end of the run.
+
+| Item | Size | Used (deepest) |
+|---|---|---|
+| AP dispatch stack (`AP_DISPATCH_STACKS`, 7 × 2 MiB = 14 MiB) | 2 MiB each | 0x12f48 (~76 KiB) on every AP, at 2, 3, 4, 6 and 8 CPUs; minimum headroom 0x1ed0b8 |
+| BSP boot stack | 16 MiB | 0x75be8 (~471 KiB, after provisioning) |
+| AP IST stacks (`AP_IST_STACKS`) | 672 KiB in all | — |
+| per-CPU records, TSSs, GDTs | 12 KiB, 6.5 KiB, 4 KiB | — |
+| pre-admission stacks | 64 × 16 KiB at 63 MiB (trampoline region) | — |
+
+The static reservation is the same at 1 CPU and at 8. There are no per-CPU page tables: every CPU
+runs on the shared kernel root and the user roots.
+
+#### Evidence
+
+**Deterministic (hosted).** The `ap_sched4_b` module covers:
+
+* every x86 resume's TLS lane;
+* the plan and APIC-map composition, including a sparse plan, an excluded CPU and the ceiling;
+* knob-free admission order and a single owner;
+* the reschedule IPI's gate and binding;
+* the 0xF1 stub: one EOI, and hand-off only at the idle `hlt`;
+* the receive-park capture, its re-application and its lane rule;
+* the resident-root rule at both activation sites;
+* the receive park's self-resume.
+
+The `ap_sched1` tests cover a delivery and a reply-direct commit made before the park capture.
+
+**Image.** `check-vm-invalidation-sequence.sh` passes on all three default kernels (x86_64 13
+sites, AArch64 9, RISC-V 8). The witness build adds no warning class (177 and 177).
+
+**Live witness** (`scripts/qemu-x86_64-apsched-witness-smoke.sh`, default off, its own feature
+build). On every expected CPU, the grader requires:
+
+* production admission under the firmware plan's APIC ID;
+* threads and fork children placed there;
+* timer preemption of non-yielding spinners, with 13 GPRs, RSP, the RFLAGS bits, x87 and FCW,
+  MXCSR, XMM0–15 and the FS-based TLS intact;
+* a deadline whose global tick counts only CPU 0's interrupts;
+* an idle wake taken by the IPI;
+* IPC in both directions with CPU 0;
+* copy-on-write faults, exit and reap, with no space quarantined.
+
+The 8-CPU boot sealed `preempt_recorded=9×8 registers=intact idle_wakes=21_ipi ipc=28 churn=28_reaped_quarantined=0 records=903`.
+The sparse boot (`sockets=2,cores=3`) mapped APIC 0,1,2,4,5,6 to CPUs 0–5. At `-smp 10`, APIC 8
+and 9 were excluded as `beyond_production_cpu_ceiling started=0`, and CPUs 0–7 were exercised.
+
+**Controls.** Eight live controls at `-smp 4` each break one property on CPU 2, and every one
+fails the witness:
+
+| Control | Fails on |
+|---|---|
+| `ap_readiness_missing`, `readiness_without_admission` | admission and CPU 2's work |
+| `remote_wake_suppressed` | CPU 2's idle wakes (7 of 7 lines) |
+| `ap_timer_stops` | CPU 2's preemptions |
+| `idle_root_handoff_skipped` | the root left at idle, and reap |
+| `context_gpr_corrupted`, `context_fp_corrupted` | the spinners' registers (r13, xmm7) |
+| `cpu2_unused` | an otherwise ready CPU 2 with no work |
+
+The hosted controls also fail their guards:
+
+* §A's three controls: the arm does not hand back, the drain ignores claimables, the executing
+  CPU is the ambient field;
+* `tls_lane_pending_only`, `park_capture_no_reapply`, `resident_root_reload` and
+  `recv_self_resume_provisional`.
+
+The base reproduction of the TLS defect fails on `798ec87d`, as intended.
+
+#### Qualification
+
+**Failed and superseded candidates, kept.**
+
+| Run | Candidate | Failed | Disposition |
+|---|---|---|---|
+| qb1 | `1a670a6f` | every witness boot and live control exit 126 | the witness smoke was not executable; `72c45201` |
+| qb2 | `72c45201` | `-smp 3` witness, IPC thread 2 | the park capture erased a published `WouldBlock`; `202eb62d` |
+| qb3 | `202eb62d` | ipccall-direct SMP | the capture erased a delivered reply; `e274e6ec` |
+| qb4 | `e274e6ec` | hosted `u9qa` guard | guard updated to the new disposition; `c7ee68da` |
+| qb5 | `c7ee68da` | UART IRQ witness; ipccall-direct SMP rep 6 | the reply-direct commit's lanes; `27556ec9` (lane rule) |
+| qb6 | `27556ec9` | UART IRQ witness, first boot | its interrupt landed outside the checked spin (base 7 of 16, candidate 10 of 20); the x86 spin lengthened, `1d25523f` |
+| qb7 | `1d25523f` | SMP1 `RESIDENCY_LOST`; ipccall-direct SMP rep 5 `duplicate_reply=0` | the CR3 reload on a timer self-resume; the duplicate-reply wait, `daed3132`, `a4891c11` |
+| qb8 | `a4891c11` | hosted `every_activation_record_follows_its_root_load`; ipccall-direct SMP rep 5 | the gated-load form, `047f4243`; the receive self-resume, `16aa5176` |
+| qb9 | `16aa5176` | strict RISC-V core | a log line cut by the boot timeout; the census reads complete lines, `8ebac194` |
+
+Failures constant across runs, and kept:
+
+* `D6_GENUINE` fails as on the base: `D6_GENUINE_MUT_DISPATCH_{STEP_SPLIT,DONE,COUNT}` are
+  missing.
+* The ipccall-direct SMP regression reports `result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired`,
+  exit 0, as before.
+
+**The SMP1 diagnosis.** In 10 alternating boots, `1d25523f` failed 2 and the base 0. In every
+failure the target was timer-preempted inside its dwell. The base's second tick landed about 50
+log lines before the first dwell. With the quantum cut to 5e6 ticks, the base failed 1 of 3,
+with the same signature. The fixed candidate then passed 6 of 6, 3 of them with a preempt in the
+dwell. In qb9, at the same short quantum, it passed 3 of 3 (1 in-dwell preempt, kept) and the
+base passed 3 of 3 (no in-dwell preempt in those three).
+
+**The candidate**: `8ebac194` (tree `de90db0b…`). Its qualification is qb9 on `16aa5176`, plus
+the qb10 re-freeze. `8ebac194` changes only the RISC-V core smoke's census and its fixture test.
+qb10 re-ran fmt, the hosted, integration, census-scanner and RISC-V census suites, and the strict
+RISC-V core three times. It also proved the three default kernels byte-identical to `16aa5176`'s.
+
+| Gate (qb9 unless noted) | Result |
+|---|---|
+| focused / hosted / integration / census scanner | 59 / 6190 / 308 / 17 passed (qb10: 6190 / 309 / 17, and the RISC-V census fixtures 5 of 5) |
+| `cargo fmt --check`; ownership census | clean; production lines identical to the base |
+| freestanding warnings, three ports | identical classes and counts to the base (177 / 205 / 188) |
+| image checks | x86_64 13 sites, AArch64 9, RISC-V 8: ok |
+| strict cores | x86_64 at 1, 2, 3, 4 and 8 CPUs, all secondaries admitted to production; AArch64 ok; RISC-V ok 3 of 3 in qb10, two of them on logs cut mid-line |
+| x86_64 D6: `D6_SWITCH_PROOF`, `D6_SWITCH_A`, `SPAWN_LIFECYCLE` | ok |
+| witness | 5 at `-smp 2` (3 idle host, 2 loaded), 5 at `-smp 4` (3 idle, 2 loaded), 1 at 3, 1 at 8, sparse 6, `-smp 10`: all `result=ok` |
+| live controls, 8 | all fail the witness |
+| hosted controls, 7, and the base reproduction | all fail |
+| server death, three ports | ok |
+| x86_64: SMP1 ×6, LOCK3, CONTEXT1, overtaken, UART IRQ ×5 (base ×4), ipccall direct, ipccall direct SMP ×12, shared region, XFER2 | ok; the UART IRQ caught a user interrupt in the spin 4 of 4 times in every candidate boot (base 1–2) |
+| RISC-V AP-SCHED2 and AArch64 AP-SCHED3 witnesses at 4 CPUs | ok |
+
+#### Open conditions
+
+* The receive self-resume fix is proved by hosted tests and a control, not live. Across the 12
+  ipccall-direct SMP boots and the witness boots of qb9, no receiver was resumed on its own trap
+  (`X86_RECV_PARK_SELF_RESUME` count 0). The failure it repairs was seen once, in 6 boots of
+  `a4891c11` (qb8).
+* The SMP1 short-quantum A/B is statistical. It depends on a preempt landing inside a dwell,
+  which happened in 6 of 21 short-quantum boots (one of them, on the base, lost its probe).
+* `D6_GENUINE` stays failing, as on the base.
+* The ceiling is 8 logical CPUs, and xAPIC IDs only. x2APIC-only IDs are excluded by name.
+
+**Delivered** `8ebac194` to `main`, `claude/yarm-kernel-unlock-u0-f2zh8p` and `wip/ap-sched4` by
+fast-forward from `798ec87d` (the WIP branch already carried it). The remote commit and tree
+(`de90db0b…`) are equal on all three. The ref diff is exactly `main` (and the remote `HEAD` that
+names it) and the designated branch. The WIP refs and `14b61286` are preserved.
