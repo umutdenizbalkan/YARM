@@ -798,7 +798,16 @@ fi
 # log, so `tests/riscv_split_census.rs` can execute exactly this code on fixture logs. It reads
 # `$1` and `TERMINAL_FAULT_ORACLE`, and adds to the global `failures`.
 riscv64_split_census() {
-LOGFILE=$1
+# AP-SCHED4 §B: a boot ended by its timeout can cut the log mid-record (qb9's strict core ended on
+# `… nr=5 cpu=0 result=queue_advance_committ`). The census counts COMPLETE lines only, so a cut
+# final record is neither a disposition nor a violation; every complete line is counted as before.
+local LOGFILE
+LOGFILE=$(mktemp)
+if [[ -s "$1" && -n "$(tail -c1 "$1")" ]]; then
+  sed '$d' "$1" >"$LOGFILE"
+else
+  cat "$1" >"$LOGFILE"
+fi
 # Stage 196C + U9-QA §2 + 199G-B §2 + U9-SPAWN-IC1 §5: the RISC-V split dispatcher may service
 # DebugLog (NR 15), FutexWake (NR 10), FutexWait (NR 9), IpcRecvTimeout (NR 5) and IpcSend (NR 1)
 # ONLY. NR 15 and NR 10 are NON-SWITCHING and return early; NR 9 and NR 5 are the SWITCHING
@@ -968,6 +977,7 @@ if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 + riscv_split_nr9
   echo "[fail] RISC-V split-dispatch serviced a syscall outside the retired set (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10} nr9=${riscv_split_nr9} nr5=${riscv_split_nr5} nr2=${riscv_split_nr2} nr1=${riscv_split_nr1} nr23=${riscv_split_nr23} nr29=${riscv_split_nr29} nr0=${riscv_split_nr0})"
   failures=$((failures + 1))
 fi
+rm -f "$LOGFILE"
 }
 # END riscv64_split_census
 riscv64_split_census "$LOGFILE"

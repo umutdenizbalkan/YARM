@@ -178,3 +178,24 @@ fn the_sum_is_widened_by_exactly_nr0() {
         1
     );
 }
+
+/// AP-SCHED4 §B: a log cut mid-record by the boot's timeout. The cut final record is not counted;
+/// every complete record still is, so a complete non-committed record before the cut still fails.
+#[test]
+fn a_record_cut_by_the_timeout_is_not_counted() {
+    let cut = format!("{D} nr=5 cpu=0 result=queue_advance_committ");
+    let (n, out) = census(&(healthy() + &yield_of(1) + &cut));
+    assert_eq!(n, 0, "{out}");
+    // The same record, complete, is counted (and passes as the committed disposition).
+    let whole = format!("{D} nr=5 cpu=0 result=queue_advance_committed outgoing=2 captured=1\n");
+    let (n, out) = census(&(healthy() + &whole));
+    assert_eq!(n, 0, "{out}");
+    // A complete early-returned NR 5 before the cut still fails, cut or not.
+    let bad = format!("{D} nr=5 cpu=0 result=ok\n");
+    let (n, out) = census(&(healthy() + &bad + &cut));
+    assert_eq!(n, 1, "{out}");
+    assert!(out.contains("IpcRecvTimeout split did not commit"), "{out}");
+    // A cut line that is not even a complete class name is not an unexpected class either.
+    let (n, out) = census(&(healthy() + &format!("{D} nr=")));
+    assert_eq!(n, 0, "{out}");
+}
