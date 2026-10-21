@@ -68,8 +68,10 @@ static ASID: AtomicU64 = AtomicU64::new(u64::MAX);
 static MBX_PHYS: AtomicU64 = AtomicU64::new(0);
 
 /// Per-round records. Index is `round - 1` (rounds are 1..=ROUNDS).
-static GAP_SEEN: [AtomicBool; ROUNDS as usize] = [const { AtomicBool::new(false) }; ROUNDS as usize];
-static GAP_NAMED: [AtomicBool; ROUNDS as usize] = [const { AtomicBool::new(false) }; ROUNDS as usize];
+static GAP_SEEN: [AtomicBool; ROUNDS as usize] =
+    [const { AtomicBool::new(false) }; ROUNDS as usize];
+static GAP_NAMED: [AtomicBool; ROUNDS as usize] =
+    [const { AtomicBool::new(false) }; ROUNDS as usize];
 static GAP_TARGETS: [AtomicU64; ROUNDS as usize] = [const { AtomicU64::new(0) }; ROUNDS as usize];
 static GAP_CR3: [AtomicU64; ROUNDS as usize] = [const { AtomicU64::new(0) }; ROUNDS as usize];
 static POST_VAL: [AtomicU64; ROUNDS as usize] = [const { AtomicU64::new(0) }; ROUNDS as usize];
@@ -217,7 +219,10 @@ pub fn gap_hold(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
     // The production target set, computed exactly as a concurrent unmap on CPU 0 would.
     let targets = shared.live_cpu_bitmap_for_asid_split(asid);
     GAP_TARGETS[idx].store(targets, Ordering::Release);
-    GAP_CR3[idx].store(crate::arch::x86_64::page_table::read_hw_cr3(), Ordering::Release);
+    GAP_CR3[idx].store(
+        crate::arch::x86_64::page_table::read_hw_cr3(),
+        Ordering::Release,
+    );
     GAP_NAMED[idx].store(targets & (1u64 << cpu.0) != 0, Ordering::Release);
     GAP_SEEN[idx].store(true, Ordering::Release);
     crate::kernel::printk::printk_emit_sync(format_args!(
@@ -341,7 +346,11 @@ fn dump() {
         named,
         post_rounds,
         coherent,
-        if gaps >= 1 && named == gaps { "ok" } else { "fail" }
+        if gaps >= 1 && named == gaps {
+            "ok"
+        } else {
+            "fail"
+        }
     ));
     crate::kernel::printk::printk_emit_sync(format_args!("VMI2_DUMP_END"));
 }
