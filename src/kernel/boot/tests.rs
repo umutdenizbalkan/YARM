@@ -199619,6 +199619,24 @@ mod vm_invalidation1 {
         });
     }
 
+    /// VM-INVALIDATION2 — put `cpu` in the DISPATCH GAP for `asid`: online and non-wake-only, with
+    /// `asid`'s root recorded as LOADED (the authoritative active-root record, set after a CR3
+    /// load on the real path) but NO task current there. This is the state a yield/preempt leaves
+    /// a CPU in between clearing `current` and the drain re-selecting a task — the window
+    /// AP-SCHED4's resident-root suppression then resumes through without reloading CR3.
+    fn root_resident_gap_on(k: &SharedKernel, asid: Asid, cpu: CpuId) {
+        k.with(|s| {
+            let _ = s.bring_up_cpu(cpu);
+            assert_eq!(
+                s.current_tid_on_cpu(cpu),
+                None,
+                "the gap means NO task is current on this CPU"
+            );
+        });
+        // The record is the HAL's, set exactly as a real activation sets it (after the CR3 load).
+        crate::arch::hal::note_address_space_activated(cpu, asid);
+    }
+
     /// Point the AMBIENT scheduler field at `cpu`. It names no requester.
     fn ambient(k: &SharedKernel, cpu: CpuId) {
         k.with(|s| {
@@ -200636,6 +200654,108 @@ mod vm_invalidation1 {
         assert!(
             settle < remove && remove < ok,
             "the success exit follows the settlement"
+        );
+    }
+
+    // ── VM-INVALIDATION2: the dispatch-gap hole ──────────────────────────────────────────────
+
+    /// **The reproduced counterexample, end to end.** The window's page displaces an existing
+    /// mapping while `asid`'s root is LOADED on CPU 1 but CPU 1's `current` slot is empty — the
+    /// dispatch gap. The unmap runs on CPU 0, so CPU 1 is a genuine remote holder that the
+    /// scheduler-placement scan omits. On the unrepaired base the shootdown finds no remote target
+    /// and reports a COMPLETED, reclaimed mapping; with the residency-based target set the request
+    /// is incomplete (hosted has no coordinator to acknowledge a real remote target), so it is not
+    /// a mapping and the displaced backing stays quarantined.
+    #[test]
+    fn nr3_into_a_root_resident_dispatch_gap_is_not_a_mapping() {
+        let fx = map_fixture(1, &[0]);
+        root_resident_gap_on(&fx.kernel, fx.asid, CPU1);
+        let old_phys = fx.old_base;
+        let (r, _) = vm_map(&fx, CPU0, 1);
+        assert_eq!(
+            r,
+            Err(SyscallError::Internal),
+            "a CPU holds the root across the dispatch gap, so the invalidation is incomplete and \
+             the request is not a delivered mapping"
+        );
+        assert!(
+            tracked(&fx.kernel, old_phys),
+            "the displaced backing is quarantined, never reclaimed while CPU 1 may translate it"
+        );
+        assert!(
+            owner_of(&fx.kernel, old_phys).is_some(),
+            "and its object is retained, not freed"
+        );
+    }
+
+    /// **Once the remote holder departs, the backing becomes reclaimable.** The same unmap, but
+    /// CPU 1 has left the root (its active record cleared at the idle-root handoff): no remote
+    /// holder remains, the local invalidation is the whole shootdown, and the request completes.
+    #[test]
+    fn nr3_completes_once_the_root_resident_cpu_departs() {
+        let fx = map_fixture(1, &[0]);
+        root_resident_gap_on(&fx.kernel, fx.asid, CPU1);
+        // Departure: leave_user_root clears the record (it loads the kernel root first, which
+        // flushes). Modelled by the record clear the HAL performs there.
+        crate::arch::hal::reset_all_active_address_spaces();
+        let (r, _) = vm_map(&fx, CPU0, 1);
+        assert_eq!(
+            r,
+            Ok(()),
+            "no CPU holds the root, so the requester's local invalidation completes the shootdown"
+        );
+    }
+
+    /// **The target set names the root-resident CPU in the gap — the unit of the repair.** Driven
+    /// directly on the production owner `live_cpu_bitmap_for_asid_split`: CPU 1 is online,
+    /// non-wake-only, `current` empty, root recorded. The repaired owner names it; the base omits
+    /// it. The requester-CPU exclusion still happens in the shootdown, not here.
+    #[test]
+    fn the_target_set_names_a_root_resident_cpu_with_empty_current() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = kernel.with(|s| s.create_user_address_space().expect("asid").0);
+        root_resident_gap_on(&kernel, asid, CPU1);
+        let targets = kernel.live_cpu_bitmap_for_asid_split(asid);
+        assert_ne!(
+            targets & (1 << CPU1.0),
+            0,
+            "a CPU that holds the root with an empty current slot owes the invalidation"
+        );
+    }
+
+    /// **A CPU that holds a DIFFERENT root is not named.** Over-inclusion would be unsound in the
+    /// other direction (wasted IPIs, and a wrong quarantine basis); residency is per-ASID.
+    #[test]
+    fn the_target_set_excludes_a_cpu_holding_another_root() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (a, b) = kernel.with(|s| {
+            (
+                s.create_user_address_space().expect("a").0,
+                s.create_user_address_space().expect("b").0,
+            )
+        });
+        root_resident_gap_on(&kernel, b, CPU1);
+        let targets = kernel.live_cpu_bitmap_for_asid_split(a);
+        assert_eq!(
+            targets & (1 << CPU1.0),
+            0,
+            "CPU 1 holds B's root, so it owes nothing for an unmap in A"
+        );
+    }
+
+    /// **The current-bound case is unchanged.** A CPU whose current task is bound to `asid` is
+    /// named whether or not its residency record agrees — this is the signal the scan always used,
+    /// and VM-INVALIDATION2 only ADDS the residency union, so no correct target is lost.
+    #[test]
+    fn the_target_set_still_names_the_current_bound_cpu() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = kernel.with(|s| s.create_user_address_space().expect("asid").0);
+        resident_on(&kernel, asid, CPU1);
+        let targets = kernel.live_cpu_bitmap_for_asid_split(asid);
+        assert_ne!(
+            targets & (1 << CPU1.0),
+            0,
+            "a current-bound CPU is still named"
         );
     }
 }

@@ -15568,6 +15568,29 @@ impl SharedKernel {
                 bitmap |= bit;
             }
         }
+        // VM-INVALIDATION2: the scan above names a CPU by its SCHEDULER PLACEMENT (its current task
+        // is bound to `asid`). That is not the fact a shootdown needs. A CPU owes this invalidation
+        // when it may hold a CACHED TRANSLATION for `asid` — a fact about its HARDWARE ROOT
+        // RESIDENCY, recorded in the authoritative active-root table and read here through the SAME
+        // helper the address-space teardown already consults (`address_space_loaded_cpus_split`).
+        //
+        // The two differ exactly across the DISPATCH GAP: a yield or preemption clears a CPU's
+        // `current` slot while `asid`'s root stays loaded, and AP-SCHED4's resident-root
+        // suppression then re-selects the same task WITHOUT reloading CR3. Such a CPU is a genuine
+        // remote holder with an empty `current` slot; the placement scan omits it, the residency
+        // record names it. Before VM-INVALIDATION2 only the placement scan was consulted here, and
+        // the omission was masked because every re-selection used to reload CR3 and flush — the
+        // suppression removed that incidental flush and exposed the gap, which this OR closes.
+        //
+        // The active-root record is set, at every activation site, before the task reaches ring 3
+        // and before the kernel touches that ASID's user mappings (kernel reads go through the
+        // physical direct map, not a CR3 switch), and it is cleared only at the idle-root handoff
+        // AFTER the kernel root is loaded and flushed. So a CPU holding a cached user translation
+        // for `asid` is always named, and a CPU named but no longer resident merely services a
+        // harmless `invlpg` and acknowledges — it is online and non-wake-only, hence running, so it
+        // cannot wedge the acknowledgement wait. Teardown reaches the identical union; a per-page
+        // unmap must not name a narrower set than the whole-space free does.
+        bitmap |= crate::arch::hal::address_space_loaded_bitmap(asid) & candidates;
         // QEMU-SMP3-SEAL: the witness keeps the snapshot this computation used (observation only),
         // so the shootdown's record names exactly what production decided from.
         #[cfg(all(
