@@ -81,6 +81,11 @@ x86-ipccall-direct-smp-oracle = ["ipccall-direct-oracle"]
 # while the other is resident in ring 3, a residency probe, and the VM owner's witness markers.
 # Armed only by `yarm.x86_64_smp1_witness=1`. Implies the SMP oracle it runs on.
 x86-smp1-witness = ["x86-ipccall-direct-smp-oracle"]
+# VM-INVALIDATION2: the x86_64 dispatch-gap TLB witness. One shared address space, an observer task
+# (CPU 1) that yields to open the empty-current/root-loaded gap and a mutator (CPU 0) that replaces
+# a page of it, with a bounded gap-hold recording the production target set. Default-off; armed by
+# `yarm.x86_64_vmi2_witness=1`.
+x86-vmi2-witness = []
 # QEMU-SMP2: the AArch64 two-CPU interrupt / TLB / context witness — kernel-built tasks pinned to
 # each CPU, the bounded SGI / invalidation / context transaction record, and its synchronous dump.
 # Armed only together with `yarm.ap_user_dispatch=1` on a `-smp 2` boot.

@@ -3297,6 +3297,16 @@ pub fn handle_trap_entry_shared(
         crate::yarm_log!("YIELD_DISPATCH_DEFER_BEGIN cpu={} drain=1", cpu.0);
         let reverify_ok = shared.yield_reverify_ready(cpu);
         if reverify_ok {
+            // VM-INVALIDATION2 witness (default-off): the observer's `current` is cleared here and
+            // its root is still loaded — the exact dispatch gap — and the re-selection below has
+            // not run yet. The hold records the production target set at this window and lets a
+            // concurrent production replace race it; it is a no-op in every other build and boot.
+            #[cfg(feature = "x86-vmi2-witness")]
+            crate::arch::x86_64::vmi2_witness::gap_hold(
+                shared,
+                cpu,
+                crate::kernel::boot::yield_dispatch_outgoing(cpu_idx).unwrap_or(u64::MAX),
+            );
             // U9-DISPATCH-CPU1 §2: ONE acquire, which settles the obligation instead of folding
             // three different refusals into "no incoming". The caller was re-enqueued and
             // `current` cleared by the publisher, so nothing is current here — every non-resumable

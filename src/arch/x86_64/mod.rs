@@ -40,4 +40,6 @@ pub mod overtaken_witness;
 /// QEMU-SMP1 §3 — the two-CPU IPI / TLB witness. Built only with `x86-smp1-witness`.
 #[cfg(all(feature = "x86-smp1-witness", not(feature = "hosted-dev")))]
 pub mod smp1_witness;
+#[cfg(feature = "x86-vmi2-witness")]
+pub mod vmi2_witness;
 pub mod topology;

@@ -1198,6 +1198,15 @@ pub fn bootstrap_first_user_task(
             crate::yarm_log!("APSW_PROVISION_FAIL err={:?} result=fail", e);
         }
     }
+    // VM-INVALIDATION2: the dispatch-gap TLB witness's two tasks (observer on CPU 1, mutator on
+    // CPU 0, one shared address space). Compile-time gated and armed only by its own knob; it
+    // reaches the real empty-current/root-loaded window and races a production replace against it.
+    #[cfg(feature = "x86-vmi2-witness")]
+    if crate::arch::x86_64::vmi2_witness::enabled() {
+        if let Err(e) = crate::arch::x86_64::vmi2_witness::provision(kernel) {
+            crate::yarm_log!("VMI2_PROVISION_FAIL err={:?} result=fail", e);
+        }
+    }
     // U9-PAGEFAULT1 §2 — the x86_64 TERMINAL-FAULT oracle slot-5 write.
     //
     // The same scenario, selector and knob AArch64 has used since 199E-A64CALL: init takes one
