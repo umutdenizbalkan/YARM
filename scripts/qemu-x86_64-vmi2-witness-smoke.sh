@@ -11,11 +11,14 @@
 #   TIMEOUT_SECS=...  boot ceiling (default 420)
 #
 # Built with `x86-vmi2-witness`, armed by `yarm.x86_64_vmi2_witness=1`. The verdict is the standalone
-# grader's (`scripts/grade-vmi2-witness.py`), which derives rounds, eligible gap rounds, identities,
-# the shootdown owner's OWN target set, a genuine+completed replacement and the post-completion
-# bytes from the COMPLETE per-round records — never a trusted summary. This smoke claims only that
-# the production target-set decision is correct at the real window with the owner's completion and
-# reclamation ordering; the architectural retention of a stale entry is QEMU's model, not silicon's.
+# grader's (`scripts/grade-vmi2-witness.py`): against its PINNED contract (8 complete rounds, >= 4
+# credited gaps — never the log's own declaration) it validates every round from the COMPLETE
+# per-round records — the recorded observer identity, the shootdown owner's OWN target set naming
+# that observer CPU whenever residency obliges it, a genuine acknowledged replacement, and the
+# recorded event order — before deciding gap credit. This smoke claims only that the production
+# target-set decision is correct at the real window; the witness observes the final ACK and hold
+# disposition, while reclaim-after-ACK ordering rests on source and hosted tests, and the
+# architectural retention of a stale entry is QEMU's model, not silicon's.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

@@ -30578,17 +30578,22 @@ runtime.
   DIAGNOSTIC and can never substitute for the owner's decision.
 
 **The owner's real decision is recorded.** `complete_unmap_shootdown_from_split` and the VmMap
-displacement loop now stamp, from inside the production path, the round, caller, CPU, ASID, virtual
-page, the mapping actually replaced and the backing installed, the operation's actual result, its
-actual shootdown target set and completion, and the displaced backing's disposition (settled or
-quarantined). These owner fields — not the observer's diagnostic snapshot — are the graded authority.
+displacement loop record, from inside the production path, the round, the requester CPU, ASID,
+virtual page, the mapping actually replaced and the backing installed, the operation's actual
+result, its actual shootdown target set, whether it was acknowledged, and the displaced backing's
+final disposition (settled or quarantined). These owner fields — not the observer's diagnostic
+snapshot — are the graded authority. (Corrected by VM-INVALIDATION2-SEAL: no caller identity was
+ever emitted; SEAL adds the observer identity and the residency record, below.)
 
-**Gap overlap is proven by sequence, not log order.** A shared monotonic `SEQ` stamps every event, so
-the grader can require, by exact ASID/address/round identity, that `gap_enter < own_select <
-gap_release`, `own_select ≤ own_complete`, and `own_complete < post_seq`: the owner selected its
-target set and completed the required invalidation *while the gap was open*, before the observer's
-post-read. An operation that lands outside the gap earns no gap credit. The hold's one-shot,
-no-interrupt-state discipline (above) is what keeps that ordering trustworthy.
+**Gap overlap is bound by recorded sequence, not log order.** A shared monotonic `SEQ` stamps every
+recorded event. `gap_enter < own_select < gap_release` establishes that the owner SELECTED its target
+set while the observer's gap was open. Completion is a separate fact: it must precede the observer's
+post-read (`own_select < own_complete < post_seq`) but need not, and in every live run does not,
+occur before gap release — the shootdown completes after the hold lets the gap CPU go. An operation
+that lands outside the gap earns no gap credit. The stamps order the events the instrumentation
+RECORDED; they do not establish architectural memory-barrier or TLB-ordering correctness, which rests
+on the production source and its deterministic tests. (Corrected by VM-INVALIDATION2-SEAL: this
+paragraph previously claimed the invalidation completed while the gap was open.)
 
 **The grader derives from complete records.** `scripts/grade-vmi2-witness.py` reads the per-field
 `VMI2_F r= k= v= crc=` lines (each emitted twice; `PRB_MSG_MAX` truncates a whole-record line, so
@@ -30596,11 +30601,10 @@ records are carried field-by-field), drops bad-CRC copies, and fails on any miss
 conflicting, substituted or partial record. Redundant valid copies recover transport loss; two
 *conflicting* valid copies fail. It independently rederives completed/eligible rounds, the
 participants, ASID, address and generations, actual target inclusion, a genuine completed replacement,
-and the post-completion bytes, requires `gaps_credited ≥ 4` of 8, and fails the boot on any genuine
-failure regardless of coverage. Sixteen self-test fixtures (healthy, the three false-pass shapes, a
-dropped round, stale/premature/not-acknowledged variants, outside-gap, placement-only target,
-conflicting copies, counters-without-records, wrong ASID, a tolerated torn copy, and a positive with
-explicitly-uncredited interference) all grade as intended.
+and the post-completion bytes, and fails the boot on any genuine failure regardless of coverage.
+(Corrected by VM-INVALIDATION2-SEAL: this grader took its threshold from the seal, accepted ANY
+non-requester target bit, and checked event order only for credited rounds; its positive
+`some_uncredited_still_passes` and `healthy` fixtures encoded impossible timelines. See below.)
 
 **Evidence, by kind.**
 
@@ -30614,10 +30618,83 @@ explicitly-uncredited interference) all grade as intended.
   target omits the gap CPU), `false_completion` (stale post), `replace_outside_gap` (no gap credit),
   `skip_replace` (owner writes absent), `drop_round` (a scheduled round's record missing), `wrong_asid`
   (owner identity mismatch). All six failed as intended.
-* *Architectural ordering:* the sequence-stamped `gap_enter < own_select < gap_release ⋯ post` chain
-  above, which the log print order is never allowed to stand in for.
+* *Recorded event order:* the sequence-stamped `gap_enter < own_select < gap_release` and
+  `own_select < own_complete < post_seq` relations above, which the log print order is never allowed
+  to stand in for. They are not architectural-ordering evidence.
 
 **Honesty.** As with VMI2, the architectural retention of a stale entry is QEMU's model, not silicon's;
 the graded authority is the production owner's target-set and completion decision at the real window.
 No production invalidation policy, no target-set owner and no broad-lock retirement from VMI2 is
 changed here.
+
+### VM-INVALIDATION2-SEAL — closing three grader holes
+
+Delivered on `9e4d3c49`. Again a witness/grader repair only: the production invalidation policy, both
+target-set owners, the AP-SCHED4 CR3 suppression, quarantine and broad-lock retirement are unchanged.
+
+**The false passes, reproduced on the delivered grader (checker reproductions, not kernel failures).**
+Checksum-valid mutations of the delivered grader's own positive fixtures, run through its real CLI,
+all exited `result=ok`:
+
+* *A wrong-but-valid target.* Observer on CPU 1, requester CPU 0, every owner target set naming CPU 2
+  instead: 8/8 credited. The grader accepted ANY non-requester bit; the observer CPU never entered the
+  per-round record (it was scraped from the first unprotected `VMI2_GAP` console line, then unused).
+* *An impossible uncredited round.* One outside-gap round whose completion preceded its target
+  selection, or whose post-read preceded completion: 7/8 credited. Order was checked only for rounds
+  that would earn credit, so coverage hid an invalid operation.
+* *A self-chosen threshold.* All eight operations outside their gaps, with the seal's threshold lowered
+  from 4 to 0 while provisioning still declared 4: 0 credited, pass. The threshold came from the log.
+
+The delivered positive fixture `some_uncredited_still_passes` encoded the same impossibility
+(selection moved past gap release, completion and post-read left before it), and even the delivered
+`healthy` fixture placed the observer's post-read inside its own gap. The same three mutations applied
+to a REAL witness boot log are also accepted by the delivered grader and rejected by the new one.
+
+**Repairs.**
+
+* *Observer identity from its real producer.* The gap owner (the yield drain) now records the observer
+  CPU and the outgoing task's `{tid, asid}` incarnation in each round's complete record; the DebugLog
+  path records the post producer's own `{tid, asid}` and CPU; the shootdown owner records the requester
+  CPU and the residency record (`hal::address_space_loaded_bitmap`) read immediately after its own
+  decision. The grader requires one observer incarnation across all rounds (never the boot task), the
+  post producer to be that incarnation, the requester to be a different CPU, and the owner's target to
+  exclude the requester. No CPU number is hard-coded.
+* *Target inclusion bound to the actual observer.* For a credited gap the owner's ACTUAL target set
+  must contain the recorded observer CPU's bit, and the residency record must show that CPU resident
+  (it is spinning there with A loaded — a contradiction is an inconsistent record). Outside the gap the
+  obligation is derived from residency: a CPU still recorded as having A loaded must be targeted; one
+  that left A (its record is cleared only behind the idle-root load and its flush) owes nothing. The
+  residency read sits beside, not inside, the owner's decision, so a CPU that ACTIVATES A between the
+  two would be demanded too — the grader fails closed there, never open.
+* *Validity before coverage.* Every scheduled round is validated in full — identities, exactly one
+  genuine replacement, an acknowledged completion with no hold left, `gap_enter < gap_release <
+  post_seq`, `own_select < own_complete < post_seq`, each round's stamps after the previous round's
+  (both programs are sequential), globally unique stamps, the pre/post values, and the target
+  obligation. Only a VALID round may then be "completed but uncredited" because its selection missed
+  the gap; any invalid round fails the boot.
+* *Pinned contract.* Eight complete rounds and at least four credited gaps are constants of the grader.
+  Every provisioning and seal declaration (including fragments of torn lines) must state exactly that,
+  copies must agree, and provisioning and seal must agree with each other; a missing, conflicting,
+  raised or lowered declaration fails. The log can no longer choose its own passing threshold.
+* *Fixtures.* The positive outside-gap fixtures now use timelines the live witness actually produces
+  (selection before the gap opens with the observer still resident and targeted; selection after
+  release with the observer departed and untargeted). The self-test (49 cases) grades every case both
+  through `evaluate()` and through the real CLI entry point in a fresh `python3 -I`, and requires them
+  to agree.
+
+**What each ordering claim rests on.**
+
+* `gap_enter < own_select < gap_release`: the owner's selection was recorded inside the gap. The gap
+  stamps are taken after the drain saw `current` empty with A's root loaded, and before re-selection;
+  the selection stamp is taken immediately after the owner computed its target set.
+* `own_select < own_complete < post_seq`: the required invalidation's outcome was recorded before the
+  observer's post-read. `own_complete` is stamped after the acknowledgement AND after the settlement
+  decision, so it bounds the real acknowledgement from above. Completion is not required — and in
+  every live run is not — before gap release.
+* `own_acked` and `own_disp` are FINAL observations (the shootdown's result; whether a hold remains),
+  not a timestamped reclamation. That the displaced backing is reclaimed only after an acknowledged
+  shootdown rests on the production source (`settle_displaced_hold` is reachable only inside
+  `if acknowledged` in `run_vm_map_transaction`) and on the deterministic hosted test
+  `nr3_into_a_root_resident_dispatch_gap_is_not_a_mapping`, not on a witness timestamp.
+* None of the stamps is memory-barrier or TLB-architecture evidence; they order recorded events
+  through one atomic counter.

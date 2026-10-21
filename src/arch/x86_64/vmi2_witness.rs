@@ -10,21 +10,27 @@
 //!
 //! Per round the witness records, from three authorities:
 //!
-//! * the observer, on its own CPU: the value it read from OBS before the gap (`pre`), the gap's
-//!   open/close sequence stamps while its `current` is empty and A's root loaded, and the value it
-//!   read after the mutator published the round done (`post`), with a sequence stamp;
-//! * the shootdown owner (`complete_unmap_shootdown_from_split`): the ACTUAL target set it computed
-//!   and a sequence stamp at that selection — the operation's own decision, never the observer's
-//!   separate diagnostic snapshot;
+//! * the gap owner (the x86 yield drain, on the observer's CPU): the value the observer read from OBS
+//!   before the gap (`pre`), the gap's open/close sequence stamps while its `current` is empty and
+//!   A's root loaded, and the OBSERVER IDENTITY — that CPU and the outgoing task's `{tid, asid}`
+//!   incarnation — taken from the drain itself, never from a diagnostic console line;
+//! * the post producer (the DebugLog path): the value the observer read after the mutator published
+//!   the round done (`post`), a sequence stamp, and the posting task's own `{tid, asid}` and CPU;
+//! * the shootdown owner (`complete_unmap_shootdown_from_split`): the ACTUAL target set it computed,
+//!   the requester CPU, the residency record (`hal::address_space_loaded_bitmap`) read immediately
+//!   after that decision, and a sequence stamp at the selection — the operation's own decision,
+//!   never the observer's separate diagnostic snapshot;
 //! * the map transaction (`run_vm_map_transaction`): the mapping actually replaced (old backing),
 //!   the backing installed, the completion (acknowledged), and the displaced backing's disposition.
 //!
 //! The hold is a FIXED, bounded spin inside the yield drain that changes NO interrupt state and
 //! never waits on the mutator; it only widens the window so the mutator's replacement overlaps it.
-//! The grader (`scripts/grade-vmi2-witness.py`) derives rounds, eligible gap rounds, identities,
-//! target inclusion, genuine replacement, required completion and the post-completion bytes from
-//! the complete per-round records, and rejects a trusted summary, a missing/duplicated/conflicting
-//! record, a refused replacement, stale bytes after completion or a premature reclaim.
+//! The grader (`scripts/grade-vmi2-witness.py`) VALIDATES every scheduled round first — identities,
+//! one genuine replacement, an acknowledged completion and its disposition, selection before
+//! completion before the post-read, the pre/post values and a target set naming the recorded
+//! observer CPU whenever residency obliges it — and only then decides gap credit
+//! (`gap_enter < own_select < gap_release`). The stamps order RECORDED events; they say nothing
+//! about architectural memory ordering, and completion legitimately follows gap release.
 
 #![cfg(feature = "x86-vmi2-witness")]
 
@@ -92,13 +98,13 @@ macro_rules! round_arrays {
 }
 // Observer-side.
 round_arrays!(
-    DECLARED, PRE_VAL, GAP_ENTER, GAP_REL, OBS_TARGET, OBS_CR3, POST_VAL, POST_SEQ
+    DECLARED, PRE_VAL, GAP_ENTER, GAP_REL, OBS_TARGET, OBS_CR3, OBS_CPU, OBS_TID, OBS_ASID,
+    POST_VAL, POST_SEQ, POST_CPU, POST_TID, POST_ASID
 );
 // Owner-side (the production mapping/shootdown decision).
 round_arrays!(
     OWN_SELECT_SEQ,
     OWN_COMPLETE_SEQ,
-    OWN_CALLER,
     OWN_CPU,
     OWN_ASID,
     OWN_VA,
@@ -106,6 +112,7 @@ round_arrays!(
     OWN_NEW,
     OWN_RESULT,
     OWN_TARGET,
+    OWN_RESIDENT,
     OWN_ACKED,
     OWN_DISP
 );
@@ -267,6 +274,15 @@ pub fn gap_hold(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
     }
     DECLARED[idx].store(1, Ordering::Release);
     PRE_VAL[idx].store(mbx_read(M_T1_PRE), Ordering::Release);
+    // The observer identity, from THIS drain: the CPU whose `current` is empty with A's root
+    // loaded, and the outgoing task's `{tid, asid}` incarnation. The grader binds target inclusion
+    // to this CPU, not to any non-requester bit and not to a diagnostic console line.
+    OBS_CPU[idx].store(u64::from(cpu.0), Ordering::Release);
+    OBS_TID[idx].store(outgoing, Ordering::Release);
+    OBS_ASID[idx].store(
+        shared.task_asid_for_tid_split_read(outgoing),
+        Ordering::Release,
+    );
     // Observer-side DIAGNOSTIC snapshot of the target set — never the graded authority.
     let diag = shared.live_cpu_bitmap_for_asid_split(asid);
     OBS_TARGET[idx].store(diag, Ordering::Release);
@@ -313,8 +329,15 @@ pub fn owner_target_select(requester: CpuId, asid: Asid, virt: VirtAddr, targets
     }
     let idx = (round - 1) as usize;
     OWN_SELECT_SEQ[idx].store(stamp(), Ordering::Release);
-    OWN_CALLER[idx].store(mbx_read(M_OBS_TID).wrapping_add(0), Ordering::Release);
-    let _ = requester;
+    // The residency record read right after the owner's own decision. It is what obliges a
+    // remote target: a CPU still recorded as having A's root loaded may hold a translation, while
+    // one that left A (the record is cleared only behind the idle-root load and its flush) owes
+    // nothing. This is an adjacent read, not the owner's internal one, so a CPU that ACTIVATES A
+    // between the two would be demanded too — the grader then fails closed, never open.
+    OWN_RESIDENT[idx].store(
+        crate::arch::hal::address_space_loaded_bitmap(asid),
+        Ordering::Release,
+    );
     OWN_CPU[idx].store(u64::from(requester.0), Ordering::Release);
     OWN_ASID[idx].store(u64::from(asid.0), Ordering::Release);
     OWN_VA[idx].store(virt.0, Ordering::Release);
@@ -322,9 +345,11 @@ pub fn owner_target_select(requester: CpuId, asid: Asid, virt: VirtAddr, targets
 }
 
 /// The map transaction's displaced-page outcome for the witness OBS: the backing actually replaced,
-/// the backing installed, whether the shootdown acknowledged, and the displaced backing's
-/// disposition. The authoritative "a genuine replacement occurred and completed" record. A second
-/// write for the same round marks it conflicting (the grader fails a conflicting record).
+/// the backing installed, the shootdown's FINAL acknowledgement result, and whether a hold on the
+/// displaced backing remains. These are final observations, not a timestamped reclamation: that the
+/// backing is reclaimed only after an acknowledgement rests on `run_vm_map_transaction`'s source and
+/// its hosted tests. The completion stamp is taken here, after the acknowledgement and the
+/// settlement decision. A second write for the same round marks it conflicting.
 #[cfg(not(feature = "hosted-dev"))]
 pub fn owner_displaced(
     asid: Asid,
@@ -395,9 +420,10 @@ pub fn owner_no_displacement(asid: Asid, virt: VirtAddr, new_phys: u64) {
     ));
 }
 
-/// The DebugLog observation point. Records the observer's post-resume byte per round with a stamp,
-/// a refusal the program reports, and — once both tasks are done — dumps.
-pub fn observe_user_marker(cpu: CpuId, msg: &str) {
+/// The DebugLog observation point. Records the observer's post-resume byte per round with a stamp
+/// and the posting task's own `{tid, asid}` and CPU, a refusal the program reports, and — once both
+/// tasks are done — dumps. `tid`/`asid` are the split caller identity the DebugLog path resolved.
+pub fn observe_user_marker(cpu: CpuId, tid: u64, asid: u64, msg: &str) {
     if !enabled() || !msg.starts_with("VMI2_") {
         return;
     }
@@ -407,6 +433,9 @@ pub fn observe_user_marker(cpu: CpuId, msg: &str) {
     if msg.starts_with("VMI2_T1_POST") {
         if let Some(idx) = round_from_ready() {
             POST_VAL[idx].store(mbx_read(M_T1_POST), Ordering::Release);
+            POST_CPU[idx].store(u64::from(cpu.0), Ordering::Release);
+            POST_TID[idx].store(tid, Ordering::Release);
+            POST_ASID[idx].store(asid, Ordering::Release);
             POST_SEQ[idx].store(stamp(), Ordering::Release);
             crate::kernel::printk::printk_emit_sync(format_args!(
                 "VMI2_POST round={} cpu={} post=0x{:x} post_seq={}",
@@ -456,6 +485,9 @@ fn dump() {
             ("gap_enter", GAP_ENTER[i].load(Ordering::Acquire)),
             ("gap_release", GAP_REL[i].load(Ordering::Acquire)),
             ("diag_target", OBS_TARGET[i].load(Ordering::Acquire)),
+            ("obs_cpu", OBS_CPU[i].load(Ordering::Acquire)),
+            ("obs_tid", OBS_TID[i].load(Ordering::Acquire)),
+            ("obs_asid", OBS_ASID[i].load(Ordering::Acquire)),
             ("own_cpu", OWN_CPU[i].load(Ordering::Acquire)),
             ("own_asid", OWN_ASID[i].load(Ordering::Acquire)),
             ("own_va", OWN_VA[i].load(Ordering::Acquire)),
@@ -463,6 +495,7 @@ fn dump() {
             ("own_new", OWN_NEW[i].load(Ordering::Acquire)),
             ("own_result", OWN_RESULT[i].load(Ordering::Acquire)),
             ("own_target", OWN_TARGET[i].load(Ordering::Acquire)),
+            ("own_resident", OWN_RESIDENT[i].load(Ordering::Acquire)),
             ("own_acked", OWN_ACKED[i].load(Ordering::Acquire)),
             ("own_disp", OWN_DISP[i].load(Ordering::Acquire)),
             ("own_select", OWN_SELECT_SEQ[i].load(Ordering::Acquire)),
@@ -471,6 +504,9 @@ fn dump() {
             ("refused", REFUSED[i].load(Ordering::Acquire)),
             ("post", POST_VAL[i].load(Ordering::Acquire)),
             ("post_seq", POST_SEQ[i].load(Ordering::Acquire)),
+            ("post_cpu", POST_CPU[i].load(Ordering::Acquire)),
+            ("post_tid", POST_TID[i].load(Ordering::Acquire)),
+            ("post_asid", POST_ASID[i].load(Ordering::Acquire)),
         ];
         for (k, v) in fields {
             let mut payload = RecLine::new();

@@ -962,8 +962,8 @@ pub(crate) fn run_vm_map_transaction<O: VmMapOwners>(
             displaced_unacknowledged += 1;
         }
         // VM-INVALIDATION2 witness: the production map transaction's own record for the witness
-        // OBS — the backing replaced (old), the backing installed, the completion, and whether the
-        // displaced backing was settled (reclaimed after an acknowledged shootdown) or quarantined.
+        // OBS — the backing replaced (old), the backing installed, the final ACK result, and
+        // whether a hold on the displaced backing remains (final observations, not a reclaim stamp).
         #[cfg(all(
             feature = "x86-vmi2-witness",
             not(feature = "hosted-dev"),

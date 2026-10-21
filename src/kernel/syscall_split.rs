@@ -6238,7 +6238,7 @@ fn try_split_debug_log_into_frame(
                 not(feature = "hosted-dev"),
                 target_arch = "x86_64"
             ))]
-            crate::arch::x86_64::vmi2_witness::observe_user_marker(cpu, msg);
+            crate::arch::x86_64::vmi2_witness::observe_user_marker(cpu, tid, asid, msg);
             // QEMU-LOCK3: the round gate and the round-done marker (round in the third argument).
             #[cfg(all(
                 feature = "x86_64-lock3-witness",
