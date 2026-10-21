@@ -30698,3 +30698,35 @@ to a REAL witness boot log are also accepted by the delivered grader and rejecte
   `nr3_into_a_root_resident_dispatch_gap_is_not_a_mapping`, not on a witness timestamp.
 * None of the stamps is memory-barrier or TLB-architecture evidence; they order recorded events
   through one atomic counter.
+
+**Qualification (frozen `00bd04e8` against fresh base `9e4d3c49`; every gate run once, none replaced).**
+
+* *Grader:* 49/49 self-test cases, each agreeing through `evaluate()` and the real CLI.
+* *Grader controls on this qualification's own real logs* (two-CPU and four-CPU): the three
+  reproductions plus the lowered seal are ACCEPTED by the delivered grader (exit 0) and REJECTED by
+  the new one, each for its named reason — target omits the observer CPU; completion does not follow
+  selection; post-read does not follow completion; `gap_threshold=0` differs from the pinned contract.
+  With the contract intact and all eight operations moved outside their gaps, both graders fail on
+  coverage alone (8 valid rounds, 0 credited).
+* *Live witness:* three strict two-CPU boots and one strict four-CPU boot, all `result=ok`, each 8/8
+  valid rounds and 7 credited (≥ 4), observer `{tid, asid}` from the gap owner on CPU 1, each bound
+  to `00bd04e8`, `--features x86-vmi2-witness` and its kernel/initramfs hashes.
+* *The six earlier live controls* all fail. `placement_only` (owner target omits the observer CPU in
+  its gap), `false_completion` (stale bytes), `skip_replace` (owner record absent), `drop_round`
+  (round 4 missing) and `wrong_asid` (owner ASID) fail for their own reasons. `replace_outside_gap`
+  now fails as INVALID before coverage — with no wait the mutator runs ahead and every round's
+  pre/post values are out of step — so it no longer isolates "valid but uncredited"; the coverage-only
+  path is exercised by the contract-intact grader control above and the positive uncredited fixtures.
+* *Hosted and source:* 28 focused `vm_invalidation`, 6197 hosted, 309 integration, 17 census-guard
+  tests green; `cargo fmt --check` clean; broad-lock census production lines identical to base.
+* *Images and warnings:* the default (`--no-default-features`) kernels are BITWISE identical to the
+  base on x86_64, aarch64 and riscv64 — every production-file edit is inside a feature-gated block or
+  replaces lines one-for-one, so no `panic!` location moves — and per-port warning classes match.
+* *Regressions:* strict core smokes x86_64 `-smp 2/4/8`, aarch64 and riscv64; x86 AP-scheduling
+  witness at two and four CPUs; SMP1 residency witness — all pass.
+
+**Limits.** The residency obligation is read beside, not inside, the owner's decision (fails closed on
+a CPU that activates A between the two). The witness grades the target decision, the final ACK and
+the remaining-hold observation; reclaim-after-ACK ordering is a source-and-hosted-test fact. Stale
+retention is QEMU's TLB model. One observer and one mutator in one address space; no new VM
+mechanism.
