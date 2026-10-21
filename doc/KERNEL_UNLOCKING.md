@@ -30512,11 +30512,16 @@ invalidation for any unmap that completed.
 `scripts/qemu-x86_64-vmi2-witness-smoke.sh` (default-off: feature `x86-vmi2-witness`, knob
 `yarm.x86_64_vmi2_witness=1`). One address space A; a boot task on CPU 0 spawns the observer as a
 thread the balancer places on CPU 1, and runs a mutator loop that replaces OBS in A each round. The
-observer yields to open the real empty-`current`/root-loaded gap; a bounded, interrupts-enabled
-gap-hold in the yield drain records the production target set at the window and keeps it open while
-the mutator's production replace races it, servicing the shootdown IPI from inside the hold and
-releasing on the mutator's done signal — never awaiting an ACK with interrupts masked, so no
-deadlock is manufactured.
+observer yields to open the real empty-`current`/root-loaded gap; the yield drain then runs a
+**fixed, bounded spin that changes no interrupt state** (`gap_hold`), entered exactly once per round
+— a `compare_exchange` on the round's gap-enter stamp makes every later re-entry, including a LAPIC
+timer preempt of the observer, return at once, so the observer is never starved and the recorded
+window is never overwritten. The hold neither masks nor enables interrupts and never waits on the
+mutator; it simply records the window's sequence stamps and spins a fixed budget while the mutator's
+production replace on CPU 0 races it. Because it touches no interrupt state and runs once, no tick
+re-enters the suspended drain and no ACK-under-mask deadlock can be manufactured. (The earlier
+`da591ee8` record described an interrupts-enabled hold that serviced the IPI and released on the
+mutator's done signal; that draft was corrected to the fixed spin actually delivered at `e5329a19`.)
 
 **Eligibility and grading.** The regression qualifies only on POSITIVE window evidence:
 `gaps_observed ≥ 1` and the production target set named the root-resident CPU at every observed gap
@@ -30545,3 +30550,74 @@ the target set — so no such control applies, and both concrete controls above 
 * The gap is held open deliberately to make the window reliable; production never holds it, and the
   hold is compiled out of every non-witness build.
 * The ceiling, ASID model and the AP-SCHED4 suppression it validates are unchanged.
+
+### VM-INVALIDATION2-ACCEPTANCE — the evidence repair
+
+The VMI2 production policy above is unchanged. This follow-up is a bounded repair of the *witness and
+grader*, not of the kernel: the delivered evidence could pass without proving what it claimed. Three
+false-pass paths were reproduced on `da591ee8` and closed, and the verdict was moved onto complete,
+independently-graded per-round records. The default production image is byte-identical for code and
+data — `.text`, `.data` and `.data.boot` hash equal to base on x86_64 and aarch64; the only residual
+difference is a handful of `.rodata` bytes (7 on aarch64) that decode as `panic!`/`#[track_caller]`
+source line numbers shifted by inserting the feature-gated hooks into two shared files, inert at
+runtime.
+
+**The three false-pass paths (reproduced, then closed).**
+
+* *Declared-but-not-observed rounds.* The summary counted eight rounds while only one gap was ever
+  observed; summary counters stood in for per-transaction evidence. Closed: every scheduled round now
+  emits a COMPLETE record and the grader derives the counts itself — a missing round fails, it is not
+  silently treated as an uncredited attempt.
+* *A replacement that never happened.* The delivered assembly ignored NR 13's error lane and wrote
+  the sentinel regardless, so a refused mapping could read as success over unchanged backing. Closed:
+  the mutator now checks NR 13's error register AND that the returned base is OBS before it writes the
+  sentinel or publishes the round; a refusal logs `VMI2_MUT_REFUSED` and the round fails.
+* *Coherent bytes mistaken for a completed shootdown.* A coherent post-byte was read as proof. Closed:
+  the grader requires the production owner's OWN completed replacement and shootdown record; a coherent
+  byte alone earns nothing, and the observer-side `live_cpu_bitmap_for_asid_split` snapshot is marked
+  DIAGNOSTIC and can never substitute for the owner's decision.
+
+**The owner's real decision is recorded.** `complete_unmap_shootdown_from_split` and the VmMap
+displacement loop now stamp, from inside the production path, the round, caller, CPU, ASID, virtual
+page, the mapping actually replaced and the backing installed, the operation's actual result, its
+actual shootdown target set and completion, and the displaced backing's disposition (settled or
+quarantined). These owner fields — not the observer's diagnostic snapshot — are the graded authority.
+
+**Gap overlap is proven by sequence, not log order.** A shared monotonic `SEQ` stamps every event, so
+the grader can require, by exact ASID/address/round identity, that `gap_enter < own_select <
+gap_release`, `own_select ≤ own_complete`, and `own_complete < post_seq`: the owner selected its
+target set and completed the required invalidation *while the gap was open*, before the observer's
+post-read. An operation that lands outside the gap earns no gap credit. The hold's one-shot,
+no-interrupt-state discipline (above) is what keeps that ordering trustworthy.
+
+**The grader derives from complete records.** `scripts/grade-vmi2-witness.py` reads the per-field
+`VMI2_F r= k= v= crc=` lines (each emitted twice; `PRB_MSG_MAX` truncates a whole-record line, so
+records are carried field-by-field), drops bad-CRC copies, and fails on any missing, duplicated,
+conflicting, substituted or partial record. Redundant valid copies recover transport loss; two
+*conflicting* valid copies fail. It independently rederives completed/eligible rounds, the
+participants, ASID, address and generations, actual target inclusion, a genuine completed replacement,
+and the post-completion bytes, requires `gaps_credited ≥ 4` of 8, and fails the boot on any genuine
+failure regardless of coverage. Sixteen self-test fixtures (healthy, the three false-pass shapes, a
+dropped round, stale/premature/not-acknowledged variants, outside-gap, placement-only target,
+conflicting copies, counters-without-records, wrong ASID, a tolerated torn copy, and a positive with
+explicitly-uncredited interference) all grade as intended.
+
+**Evidence, by kind.**
+
+* *Source (hosted, deterministic):* the `vm_invalidation1` tests still reproduce the base
+  counterexample and pin the repaired target set, completion and quarantine contracts through the
+  production owners (28 focused, 6197 hosted, 309 integration, all green).
+* *Live (QEMU, default-off):* three strict two-CPU witness boots and one four-CPU boot, each graded
+  from complete records (8/8 rounds, `gap_credited` 6–7 ≥ 4), with the production owner's target set
+  naming the root-resident observer CPU at the credited gaps.
+* *Controls (against the frozen candidate):* each fails for its own reason — `placement_only` (owner
+  target omits the gap CPU), `false_completion` (stale post), `replace_outside_gap` (no gap credit),
+  `skip_replace` (owner writes absent), `drop_round` (a scheduled round's record missing), `wrong_asid`
+  (owner identity mismatch). All six failed as intended.
+* *Architectural ordering:* the sequence-stamped `gap_enter < own_select < gap_release ⋯ post` chain
+  above, which the log print order is never allowed to stand in for.
+
+**Honesty.** As with VMI2, the architectural retention of a stale entry is QEMU's model, not silicon's;
+the graded authority is the production owner's target-set and completion decision at the real window.
+No production invalidation policy, no target-set owner and no broad-lock retirement from VMI2 is
+changed here.
