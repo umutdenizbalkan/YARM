@@ -183,6 +183,23 @@ impl TrapFrame {
         self.args[5] = context.arg5;
     }
 
+    /// AP-SCHED4 §B — x86_64: make this trap's syscall return the result lanes of the
+    /// continuation just applied (RAX = ret0, R8 = ret1, RDX = ret2, RCX = error).
+    ///
+    /// The vector epilogue writes the context's GPRs only when the trap returns to a DIFFERENT
+    /// task; returning to the task that trapped, it writes the syscall's return fields instead.
+    /// A receive that parked and is resumed on its own trap — a delivery from another CPU made it
+    /// runnable before this CPU's queue advance picked a task, and the advance picked it — must
+    /// return what that delivery published into its saved lanes, not the receive's provisional
+    /// return. Called for exactly that self-resume.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn adopt_restored_syscall_returns(&mut self) {
+        self.ret0 = self.user_gprs[0];
+        self.error = self.user_gprs[2];
+        self.ret2 = self.user_gprs[3];
+        self.ret1 = self.user_gprs[7];
+    }
+
     /// QEMU-SMP1-ACCEPTANCE §1 — name the incarnation whose continuation this frame now holds.
     /// Called only by an owner that has just put that continuation here from that incarnation.
     pub(crate) fn bind_resume_owner(&mut self, owner: crate::runtime::FpuHomeOwner) {

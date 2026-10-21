@@ -2124,6 +2124,29 @@ pub fn handle_trap_entry_shared(
         );
     }
 
+    /// AP-SCHED4 §B — x86_64: a receive park that the queue advance resumed on its own trap
+    /// returns its saved result lanes. Only a self-resume needs this: returning to another task,
+    /// the epilogue already writes the applied context's GPRs.
+    #[cfg(target_arch = "x86_64")]
+    fn x86_recv_park_self_resume(
+        cpu: CpuId,
+        frame: Option<&mut TrapFrame>,
+        outgoing: Option<u64>,
+        incoming: u64,
+    ) {
+        if outgoing == Some(incoming)
+            && let Some(frame) = frame
+        {
+            frame.adopt_restored_syscall_returns();
+            crate::yarm_log!(
+                "X86_RECV_PARK_SELF_RESUME cpu={} tid={} error={} result=ok",
+                cpu.0,
+                incoming,
+                frame.error_code().unwrap_or(0)
+            );
+        }
+    }
+
     /// QEMU-SMP3-ACCEPTANCE §1 — the ONE application of [`crate::runtime::OvertakenSettlement`]
     /// for every blocking-class drain on this bridge whose class re-verify failed.
     ///
@@ -2145,7 +2168,7 @@ pub fn handle_trap_entry_shared(
         shared: &crate::runtime::SharedKernel,
         trap_path: &TrapPathWindow,
         cpu: CpuId,
-        frame: Option<&mut TrapFrame>,
+        mut frame: Option<&mut TrapFrame>,
         outgoing: Option<u64>,
         site: &'static str,
         step: impl Fn(
@@ -2195,12 +2218,16 @@ pub fn handle_trap_entry_shared(
             S::Switch(token) => {
                 let inc = token.tid();
                 let asid = token.expect_asid().map(|a| a.0).unwrap_or(0);
-                if !d2_resume_marked_incoming(shared, token, frame) {
+                if !d2_resume_marked_incoming(shared, token, frame.as_deref_mut()) {
                     let rolled_back = token
                         .into_dequeued_authority()
                         .is_some_and(|a| shared.direct_dispatch_rollback_split(a));
                     trap_path.retire();
                     d2_resume_refused_fatal(cpu, inc, rolled_back);
+                }
+                #[cfg(target_arch = "x86_64")]
+                if site == "d2_recv_overtaken" {
+                    x86_recv_park_self_resume(cpu, frame.as_deref_mut(), Some(outgoing), inc);
                 }
                 crate::yarm_log!(
                     "OVERTAKEN_DEFERRAL_SETTLED arch={} site={} cpu={} outgoing={} incoming={} asid={} settlement=switch",
@@ -2481,6 +2508,10 @@ pub fn handle_trap_entry_shared(
                 // implementation rather than two copies that could drift.
                 let resumed = d2_resume_marked_incoming(shared, token, frame.as_deref_mut());
                 crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+                #[cfg(target_arch = "x86_64")]
+                if resumed {
+                    x86_recv_park_self_resume(cpu, frame.as_deref_mut(), outgoing, inc);
+                }
                 if !resumed {
                     let rolled_back = token
                         .into_dequeued_authority()

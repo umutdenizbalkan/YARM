@@ -203477,6 +203477,78 @@ mod ap_sched4_b {
         assert!(res < load);
     }
 
+    /// A receive park resumed on its own trap returns the result lanes its applied context holds:
+    /// a delivery's success (RCX = 0, RAX/RDX/R8 = 0 for recv-v2) replaces the receive's
+    /// provisional error in the syscall return fields the epilogue writes for a self-return.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn an_x86_receive_park_resumed_on_its_own_trap_returns_its_saved_lanes() {
+        let mut frame = TrapFrame::new(2, [65539, 0x46ed10, 130, 0x46ede0, 40, 0]);
+        frame.set_err(11);
+        let mut context = frame.capture_user_context();
+        context.user_gprs[0] = 0;
+        context.user_gprs[2] = 0;
+        context.user_gprs[3] = 0;
+        context.user_gprs[7] = 0;
+        frame.apply_user_context(context);
+        assert_eq!(
+            frame.error_code(),
+            Some(11),
+            "applying alone keeps the provisional return"
+        );
+        frame.adopt_restored_syscall_returns();
+        assert_eq!(frame.error_code(), None);
+        assert_eq!((frame.ret0(), frame.ret1(), frame.ret2()), (0, 0, 0));
+        // A legacy delivery's lanes reach the same fields.
+        let mut legacy = frame.capture_user_context();
+        legacy.user_gprs[0] = 21205; // RAX = sender
+        legacy.user_gprs[7] = 10; // R8 = payload length
+        legacy.user_gprs[3] = 7; // RDX = transferred cap
+        frame.set_err(11);
+        frame.apply_user_context(legacy);
+        frame.adopt_restored_syscall_returns();
+        assert_eq!(frame.error_code(), None);
+        assert_eq!((frame.ret0(), frame.ret1(), frame.ret2()), (21205, 10, 7));
+    }
+
+    /// The bridge applies it to a receive park's self-resume only: the overtaken settlement's
+    /// `Switch` arm for the receive site, after the resume, and the genuine receive switch; the
+    /// helper does nothing unless the incoming task is the outgoing one.
+    #[test]
+    fn only_an_x86_receive_park_self_resume_adopts_its_saved_lanes() {
+        let te = include_str!("../../arch/trap_entry.rs");
+        let helper = te
+            .split("fn x86_recv_park_self_resume(")
+            .nth(1)
+            .expect("the helper")
+            .split("\n    }\n")
+            .next()
+            .expect("its body");
+        let gate = helper
+            .find("if outgoing == Some(incoming)")
+            .expect("the self-resume gate");
+        let adopt = helper
+            .find("frame.adopt_restored_syscall_returns();")
+            .expect("the adoption");
+        assert!(gate < adopt);
+        let settle = te
+            .split("fn settle_overtaken_at_bridge(")
+            .nth(1)
+            .expect("the settlement");
+        let resume = settle
+            .find("if !d2_resume_marked_incoming(shared, token, frame.as_deref_mut()) {")
+            .expect("the resume");
+        let site = settle
+            .find("if site == \"d2_recv_overtaken\" {\n                    x86_recv_park_self_resume(cpu, frame.as_deref_mut(), Some(outgoing), inc);")
+            .expect("the receive site only");
+        let marker = settle.find("settlement=switch").expect("the switch marker");
+        assert!(resume < site && site < marker);
+        assert_eq!(te.matches("x86_recv_park_self_resume(cpu,").count(), 2);
+        assert!(te.contains(
+            "if resumed {\n                    x86_recv_park_self_resume(cpu, frame.as_deref_mut(), outgoing, inc);"
+        ));
+    }
+
     /// The lane rule itself, per port.
     #[test]
     fn the_resume_tls_lane_rule() {

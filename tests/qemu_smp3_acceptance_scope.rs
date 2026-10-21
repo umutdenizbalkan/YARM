@@ -132,7 +132,7 @@ fn the_bridge_applies_every_settlement_and_fails_closed_on_contradiction() {
     }
     let switch = &adapter[adapter.find("S::Switch(token) =>").unwrap()..];
     assert!(
-        switch.contains("d2_resume_marked_incoming(shared, token, frame)")
+        switch.contains("d2_resume_marked_incoming(shared, token, frame.as_deref_mut())")
             && switch.contains("direct_dispatch_rollback_split")
             && switch.contains("d2_resume_refused_fatal("),
         "a switch resumes by exact token, and a refused resume rolls back and diverges"
