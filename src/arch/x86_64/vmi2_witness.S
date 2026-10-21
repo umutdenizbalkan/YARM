@@ -127,6 +127,16 @@ obs_loop:
     mov qword ptr [rdi + M_T1_READY], r14
     xor eax, eax                      /* NR_YIELD: clears current; the kernel gap-hold runs here */
     syscall
+    /* wait (userspace, interrupts on) until the mutator has published this round's replace, so the
+     * re-read observes the replaced page rather than racing ahead of it */
+    mov esi, MBX
+obs_wait:
+    mov rax, qword ptr [rsi + M_MUT_DONE]
+    cmp rax, r14
+    jae obs_read
+    pause
+    jmp obs_wait
+obs_read:
     mov esi, OBS
     mov rax, qword ptr [rsi]          /* re-read after resume (same root, suppression) */
     mov edi, MBX

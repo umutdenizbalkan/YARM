@@ -58,10 +58,10 @@ const M_T1_DONE: u64 = 0x20;
 const M_T0_DONE: u64 = 0x28;
 const M_OBS_TID: u64 = 0x30;
 
-/// How long the gap-hold keeps the window open, in `pause`-spin iterations, before releasing on a
-/// budget. Bounded so a stuck mutator can never wedge the boot; the smoke's timeout is the
-/// backstop. Interrupts are enabled throughout the spin.
-const HOLD_SPIN_BUDGET: u64 = 20_000_000;
+/// The FIXED number of spin iterations the gap-hold keeps the window open, so the mutator's replace
+/// on CPU 0 overlaps it. It is a fixed widen, not a wait on the mutator — the hold never blocks on
+/// another CPU, so it cannot deadlock, and it touches no interrupt state.
+const HOLD_SPIN_BUDGET: u64 = 3_000_000;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static ASID: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -216,7 +216,16 @@ pub fn gap_hold(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
         return;
     }
     let idx = (round - 1) as usize;
-    // The production target set, computed exactly as a concurrent unmap on CPU 0 would.
+    // Hold ONCE per round. The observer reaches this drain not only on its own cooperative NR 0 but
+    // also when the LAPIC timer preempts it (the quantum expiry runs the same yield drain); without
+    // this guard every such preempt would re-open and re-widen the window for the same round and
+    // the observer would never advance through its userspace loop. The first drain entry at an
+    // empty `current` for this round records the gap; later ones for the same round return at once.
+    if GAP_SEEN[idx].swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // The production target set, computed exactly as a concurrent unmap on CPU 0 would — the
+    // graded, architecture-faithful evidence, taken at the instant `current` is empty here.
     let targets = shared.live_cpu_bitmap_for_asid_split(asid);
     GAP_TARGETS[idx].store(targets, Ordering::Release);
     GAP_CR3[idx].store(
@@ -224,7 +233,6 @@ pub fn gap_hold(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
         Ordering::Release,
     );
     GAP_NAMED[idx].store(targets & (1u64 << cpu.0) != 0, Ordering::Release);
-    GAP_SEEN[idx].store(true, Ordering::Release);
     crate::kernel::printk::printk_emit_sync(format_args!(
         "VMI2_GAP round={} cpu={} asid={} current=empty root=loaded target_set=0x{:x} named={}",
         round,
@@ -233,25 +241,19 @@ pub fn gap_hold(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
         targets,
         u8::from(targets & (1u64 << cpu.0) != 0)
     ));
-    // Hold the window open with interrupts ENABLED so the mutator's shootdown IPI is serviced and
-    // acknowledged here; release on the mutator's done signal or the bounded budget. Never wait
-    // for an acknowledgement with interrupts masked — that would stall the very owner we need.
-    let saved_if = read_rflags() & (1 << 9) != 0;
-    // SAFETY: enabling interrupts here is the same discipline the idle loop uses; we restore the
-    // caller's IF before returning, and the spin body makes no memory claims.
-    unsafe {
-        core::arch::asm!("sti", options(nomem, nostack));
-    }
+    // Hold the window open for a bounded, FIXED spin so the mutator's production replace on CPU 0
+    // overlaps it (its shootdown then computes its own target set while `current` is still empty
+    // here). This runs inside the yield drain with interrupts in their entry state (masked): it
+    // touches NO interrupt state and never waits on the mutator, so there is no mutual wait to
+    // deadlock and no tick can re-enter the suspended drain. The mutator's shootdown IPI pends and
+    // is serviced the moment the observer is re-selected and resumes (IF restored by the iret);
+    // the mutator's ACK-wait is thus bounded by this fixed spin plus the resume latency. The
+    // observer waits in USERSPACE for the replace to be published before it re-reads OBS, so the
+    // byte record is meaningful without this hold having to await the mutator.
     let mut spins = 0u64;
-    while mbx_read(M_MUT_DONE) < round && spins < HOLD_SPIN_BUDGET {
+    while spins < HOLD_SPIN_BUDGET {
         spins += 1;
         core::hint::spin_loop();
-    }
-    if !saved_if {
-        // SAFETY: restoring the caller's masked-interrupt state.
-        unsafe {
-            core::arch::asm!("cli", options(nomem, nostack));
-        }
     }
     crate::kernel::printk::printk_emit_sync(format_args!(
         "VMI2_GAP_RELEASED round={} cpu={} mut_done={} spins={}",
@@ -260,15 +262,6 @@ pub fn gap_hold(shared: &SharedKernel, cpu: CpuId, outgoing: u64) {
         mbx_read(M_MUT_DONE),
         spins
     ));
-}
-
-fn read_rflags() -> u64 {
-    let mut f: u64;
-    // SAFETY: pushfq/pop reads RFLAGS with no side effects.
-    unsafe {
-        core::arch::asm!("pushfq; pop {}", out(reg) f, options(nomem));
-    }
-    f
 }
 
 /// The DebugLog observation point (both tasks reach it). Records the observer's post-resume byte
