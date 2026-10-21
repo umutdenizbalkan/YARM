@@ -30425,3 +30425,123 @@ RISC-V core three times. It also proved the three default kernels byte-identical
 fast-forward from `798ec87d` (the WIP branch already carried it). The remote commit and tree
 (`de90db0b…`) are equal on all three. The ref diff is exactly `main` (and the remote `HEAD` that
 names it) and the designated branch. The WIP refs and `14b61286` are preserved.
+
+
+## VM-INVALIDATION2 — closing the x86 dispatch-gap invalidation hole
+
+Delivered on AP-SCHED4's `df5ee7b6`. A focused correctness package: the per-page TLB shootdown
+target set keyed on scheduler PLACEMENT, not hardware ROOT RESIDENCY, and so omitted a CPU in the
+dispatch gap — a hole AP-SCHED4's resident-root suppression exposed.
+
+### The counterexample, reproduced
+
+The interleaving the review derived from source:
+
+1. CPU 1 runs address space A and caches a translation for a page of it.
+2. A yield or preemption clears CPU 1's scheduler `current` slot while A's root stays loaded.
+3. CPU 0 replaces or unmaps that page in A.
+4. `live_cpu_bitmap_for_asid_split` — the shootdown target set — scanned only each CPU's current
+   task, so with CPU 1's `current` empty it omitted CPU 1.
+5. CPU 1 is re-selected for the SAME task; AP-SCHED4's `x86_user_root_resident` sees matching
+   active-ASID and CR3 and skips the CR3 reload.
+6. The pre-IRET check also sees equality and does nothing.
+
+So the displaced backing was reported invalidated-everywhere and reclaimed while CPU 1 still held
+the stale translation. **No intervening flush excludes it:** the kernel touches user memory through
+the physical direct map (never a transient CR3 switch), and the one flush that used to save this
+case — the CR3 reload on every re-selection — is exactly what AP-SCHED4's suppression removed.
+
+**Reproduced through the production owners**, deterministically. In the hosted tests
+(`kernel::boot::tests::vm_invalidation1`), with CPU 1 placed in the gap (online, non-wake-only,
+`current` empty, A's active-root record set):
+
+* `nr3_into_a_root_resident_dispatch_gap_is_not_a_mapping` — a real split NR 3 on CPU 0 reports
+  `Ok(())` and reclaims the displaced backing on the unrepaired base; repaired it reports
+  `Err(Internal)` and quarantines it.
+* `the_target_set_names_a_root_resident_cpu_with_empty_current` and its broad twin
+  (`compute_tlb_shootdown_request_plan`) — the base omits CPU 1 from the target set; repaired both
+  owners name it.
+
+**Reproduced live** by the dispatch-gap witness's own controls (below): restoring the placement-only
+scan left the observer reading a STALE byte in 8 of 8 gap rounds on QEMU.
+
+### The repaired invariant
+
+A CPU owes a shootdown when it may hold a cached translation for the ASID — its HARDWARE ROOT
+RESIDENCY, which is a different fact from scheduler placement, cached translations and invalidation
+completion. The target set is now `placement ∪ residency`, where residency is the authoritative
+active-root record (`hal::address_space_loaded_bitmap`) the address-space teardown
+(`address_space_loaded_cpus_split`) already consulted. Both shootdown owners fold it in — the split
+`live_cpu_bitmap_for_asid_split` (masked to candidates) and the broad `live_cpu_bitmap_for_asid`
+(masked to online CPUs, since only an online CPU can acknowledge an IPI) — so a per-page unmap can
+never name a narrower set than a whole-space free, and fork copy-on-write, the broad VmMap
+displacement reclaim and brk-unmap are covered along with the split NR 3 / NR 13 / NR 14 routes.
+
+**Why matching ASID and CR3 is now sufficient to suppress the reload.** The record is set, at every
+activation site, after the CR3 load and before the task reaches ring 3, and cleared only at the
+idle-root handoff after the kernel root is loaded (which flushes). Between a CR3 load and its record
+the kernel accesses no user mapping of that ASID (direct-map reads only), so a CPU holding a cached
+user translation is ALWAYS named, and a CPU named but no longer resident only services a harmless
+`invlpg`. The overlap the review warned of — a transition straddling the snapshot — therefore
+leaves no stale entry unnamed.
+
+Preserved unchanged: explicit executing-CPU identity (the requester excludes only its own bit),
+generation-matched acknowledgement, failure-after-incomplete-invalidation, quarantine until the
+required invalidation completes, the lock order and progress while CPUs await acknowledgements (no
+wait under a domain lock, no new broad lock, no second shootdown owner, no reclaim on an empty
+`current`). AP-SCHED4's receive-result repairs and Stage A's server-death handoff are untouched.
+
+### Reclamation ordering
+
+Unchanged and now sound: unmap the PTE (rank 5) → convert the displaced mapping's reference to an
+identity hold (rank 6) → complete the shootdown with NO lock held, targeting every root-resident
+CPU and waiting for each one's generation-matched ACK → reclaim ONLY on a completed shootdown, else
+keep the hold (quarantine). The gap CPU is now in that target set, so its ACK gates the reclaim.
+
+### Was the CR3 suppression the cause?
+
+It **exposed an older latent narrowness**, and is sound under the invariant VM-INVALIDATION2 adds.
+The placement-only target set was always narrow, but harmless before AP-SCHED4 because every
+re-selection reloaded CR3 and flushed; the resident-root suppression removed that incidental flush,
+turning the narrow scan into a reachable stale-translation hole. With the residency-based target
+set the suppression is sound: a CPU whose ASID and CR3 match is guaranteed to have received the
+invalidation for any unmap that completed.
+
+### The live witness and its residency grading
+
+`scripts/qemu-x86_64-vmi2-witness-smoke.sh` (default-off: feature `x86-vmi2-witness`, knob
+`yarm.x86_64_vmi2_witness=1`). One address space A; a boot task on CPU 0 spawns the observer as a
+thread the balancer places on CPU 1, and runs a mutator loop that replaces OBS in A each round. The
+observer yields to open the real empty-`current`/root-loaded gap; a bounded, interrupts-enabled
+gap-hold in the yield drain records the production target set at the window and keeps it open while
+the mutator's production replace races it, servicing the shootdown IPI from inside the hold and
+releasing on the mutator's done signal — never awaiting an ACK with interrupts masked, so no
+deadlock is manufactured.
+
+**Eligibility and grading.** The regression qualifies only on POSITIVE window evidence:
+`gaps_observed ≥ 1` and the production target set named the root-resident CPU at every observed gap
+(`gaps_named == gaps_observed`). Zero gaps cannot qualify. The observer's post-resume bytes are
+recorded and checked separately. The primary, architecture-faithful evidence is the production
+target-set decision at the real window; the observer bytes corroborate it. A QEMU TLB model need
+not retain a stale entry in general, so a coherent read is not claimed as architectural proof —
+though in these runs QEMU DID retain the stale entry, and the controls below show the bytes going
+stale the moment the repair is reverted.
+
+### Controls (final candidate, against the frozen witness)
+
+| Control | What it removes | Witness result | QEMU distinguishes? |
+|---|---|---|---|
+| `placement_only` | the residency union in BOTH target-set owners (the original defective decision; the gap CPU gets no IPI) | `gaps_named=0`, `coherent=0` → fail | yes, by target set AND by stale bytes |
+| `false_completion` | the per-page shootdown's ACK check (reports completion with no IPI sent) | `gaps_named=8`, `coherent=0` → fail | by stale bytes; the target-set record is unaffected, and the hosted `nr3_into_…` test is what pins the completion/quarantine contract |
+
+A control that removed a flush redundant only under QEMU's functional (stronger-than-spec) TLB
+coherence is the class QEMU cannot distinguish; VM-INVALIDATION2 removes no flush — it only widens
+the target set — so no such control applies, and both concrete controls above were distinguishable.
+
+### Limits
+
+* The live witness runs under QEMU; the target-set decision it grades is the production owner's, but
+  the architectural retention of a stale entry is QEMU's model, not silicon's.
+* The gap is held open deliberately to make the window reliable; production never holds it, and the
+  hold is compiled out of every non-witness build.
+* The ceiling, ASID model and the AP-SCHED4 suppression it validates are unchanged.
