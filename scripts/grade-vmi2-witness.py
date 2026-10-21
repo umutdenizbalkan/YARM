@@ -369,6 +369,14 @@ def self_test():
     torn = ["VMI2_F r=2 k=post v=999 crc=deadbeef"]  # wrong crc → dropped
     cases.append(("torn_copy_tolerated", wrap(recs, extra_lines=torn), True))
 
+    # 16. Explicitly uncredited interference: half the rounds' owner ops fall outside the gap, but
+    # the credited rounds still meet the threshold → PASS. A completed-but-uncredited round is not
+    # a failure; it simply earns no gap credit.
+    recs = healthy()
+    for r in (5, 6, 7, 8):  # 4 credited (1-4), 4 uncredited, threshold 4
+        recs[r - 1]["own_select"] = recs[r - 1]["gap_release"] + 5
+    cases.append(("some_uncredited_still_passes", wrap(recs), True))
+
     npass = 0
     for name, log, want in cases:
         try:
