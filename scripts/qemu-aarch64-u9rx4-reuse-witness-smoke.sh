@@ -59,17 +59,23 @@ arm="$(grep -a -m1 -E '^IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=2 caller_asid=
 rec="$(grep -o -E 'record_index=[0-9]+' <<<"$arm" | cut -d= -f2)"
 gen="$(grep -o -E 'record_generation=[0-9]+' <<<"$arm" | cut -d= -f2)"
 yielded="$(grep -a -o -m1 -E 'U9RX4_REUSE_WITNESS_YIELDED yields=[0-9]+' <<<"$norm")"
-earlier=0
+earlier=0 own_earlier=0
 if [[ -n "$rec" && -n "$gen" ]] && (( gen > 1 )); then
-  # The earlier generations of that slot belonged to other callers' transactions.
-  earlier="$(grep -a -c -E "^IPC_REPLY_TERMINAL_ARMED_SPLIT caller_tid=[013-9][0-9]* caller_asid=[0-9]+ record_index=${rec} record_generation=([1-9]|[1-9][0-9]+) " <<<"$norm" || true)"
+  # Earlier generations of the same slot: armed by OTHER callers, never by tid 2 itself.
+  read -r earlier own_earlier < <(awk -v r="$rec" -v g="$gen" '
+    /^IPC_REPLY_TERMINAL_ARMED_SPLIT / {
+      c=""; i=""; n="";
+      for (k = 2; k <= NF; k++) { split($k, kv, "="); if (kv[1]=="caller_tid") c=kv[2]; if (kv[1]=="record_index") i=kv[2]; if (kv[1]=="record_generation") n=kv[2] }
+      if (i == r && n + 0 < g + 0) { if (c == "2") own++; else other++ }
+    }
+    END { print other + 0, own + 0 }' <<<"$norm")
 fi
-echo "[u9rx4-reuse] ${yielded:-U9RX4_REUSE_WITNESS_YIELDED missing} tid2_record=(${rec:-?}, ${gen:-?}) earlier_other_caller_arms_on_slot=${earlier}"
+echo "[u9rx4-reuse] ${yielded:-U9RX4_REUSE_WITNESS_YIELDED missing} tid2_record=(${rec:-?}, ${gen:-?}) earlier_arms_on_slot_by_other_callers=${earlier} by_tid2=${own_earlier}"
 if [[ -z "$yielded" ]]; then
   seal "result=fail reason=premise detail=witness-not-armed"
   exit 1
 fi
-if [[ -z "$gen" ]] || (( gen <= 1 )) || (( earlier < gen - 1 )); then
+if [[ -z "$gen" ]] || (( gen <= 1 )) || (( earlier < 1 )) || (( own_earlier != 0 )); then
   seal "result=fail reason=premise detail=no-reuse record=(${rec:-?},${gen:-?}) earlier=${earlier}"
   exit 1
 fi
