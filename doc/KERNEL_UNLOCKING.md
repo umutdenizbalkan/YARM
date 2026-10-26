@@ -791,6 +791,31 @@ becoming budget.
 
 Contract §15 has the record.
 
+**Qualification of SCHED-OVERFLOW1** (frozen `adaad66e`, tree `c738e675`, against fresh base
+`04b94fc0`; every gate run once):
+
+* *Scope:* only the two docs and `tests/scheduling_contract.rs` differ from the base. 0
+  production paths changed against the base, and 0 against `00bd04e8`.
+* *Controls, on the frozen tests:*
+  * unmodified model: 29/2, failing exactly the two constructed regressions;
+  * eligibility refusal reverted: 29/2;
+  * replenishment freeze reverted: 29/2;
+  * both reverted: 28/3.
+
+  Each revert failed its own regression or regressions, plus the mutation self-check.
+* *Tests:*
+  * contract suite 31/31, run twice;
+  * documentation guard 7/7;
+  * `cargo fmt --check` clean;
+  * hosted 6197 passed;
+  * integration 33 suites, 340 passed, 0 failed;
+  * broad-lock census 17/17, production census identical to base.
+* *Images:* the default x86_64, aarch64 and riscv64 kernels are bitwise identical to base and to
+  the recorded hashes (`5d1a576b…`, `1a008d72…`, `d8abb10a…`). Warning classes are identical,
+  and the VMI sequence checks pass.
+* *Live evidence:* because the kernels are identical, the bound live evidence remains
+  VM-INVALIDATION2-SEAL's qualification of `00bd04e8`.
+
 ---
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION

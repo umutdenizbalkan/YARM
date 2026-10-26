@@ -1175,6 +1175,11 @@ run the context.
 | replenishment freeze only | 29/2 | `…survives_replenishment_constructed` ("remaining 2", context *not* running because the eligibility latch still refuses), mutation self-check |
 | both | 28/3 | both constructed tests, mutation self-check |
 
+**Qualification.** Frozen `adaad66e` (tree `c738e675`) was qualified against `04b94fc0`. The
+controls above were rerun on the frozen tests with the same results, and the contract suite
+passed 31/31 twice. No production path changed, and the default kernels are bitwise identical to
+base on all three ports. The record is in `doc/KERNEL_UNLOCKING.md` §0.8.
+
 **Unchanged.** Debt conservation, FIFO and exhausted-set membership, same-instant ordering, and
 the production general-purpose differential are untouched, and every earlier test passes. These
 remain **model tests**: SC-CTX-5 stays SPECIFIED → RT-SCHED1, with recovery owned by PARTITION1.
