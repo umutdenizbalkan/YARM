@@ -35,6 +35,7 @@ fragment files unless the canonical owner explicitly does not exist.
 | Service manifest format | `doc/SERVICE_MANIFEST.md` |
 | Project history (closed phases / milestones / checklists) | **`doc/PROJECT_HISTORY.md`** |
 | Roadmap (current direction) | `doc/KERNEL_UNLOCKING.md` §0 |
+| Scheduling contract (normative requirements for kernel threads, the real-time scheduler and partition windows; current scheduling baseline; timing audit; KTHREAD1 prerequisites) | **`doc/SCHEDULING_CONTRACT.md`** (linked from `doc/KERNEL_UNLOCKING.md` §0.8) |
 | Project status / maturity | **`doc/STATUS.md`** |
 | Agent rules (capability/spawn/zero-copy/smoke policy + source-licensing header + server-runtime boundary) | **`doc/AI_AGENT_RULES.md`** |
 | Agent-facing entry point (short pointer for tools that look for `AGENTS.md` by convention) | `doc/AGENTS.md` (points at `doc/AI_AGENT_RULES.md`) |

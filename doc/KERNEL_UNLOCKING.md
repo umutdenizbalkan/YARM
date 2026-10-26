@@ -603,6 +603,83 @@ unchanged at **2 complete / 11 partial / 22 open**. Direct production remains **
 > 22 open" statements above were true at the U3 checkpoint. U6-FRAME closes 199C and moves the
 > arithmetic to **3 complete / 11 partial / 21 open**; §0.3 and §0.4 carry the current values.
 
+### 0.8 Scheduling contract and the post-unlock roadmap (SCHED-CONTRACT1)
+
+The normative scheduling contract is **`doc/SCHEDULING_CONTRACT.md`**. It governs the next three
+packages and labels every requirement **ENFORCED**, **SPECIFIED → package** or **UNRESOLVED**
+(with the missing fact and its owner). SCHED-CONTRACT1 defined and tested the contract. It enabled
+no kernel thread, changed no production scheduling policy, and claims no safety-standard
+conformance (contract §11).
+
+**Architectural decisions (contract §3).** The first real-time profile, RT-P1, is:
+
+* static CPU assignment with no migration after the INITIALIZATION → OPERATIONAL transition;
+* 32 fixed priorities with FIFO among equals. A higher-priority preemption leaves the preempted
+  thread at the head of its level; Yield and wake go to the tail; budget exhaustion rejoins the
+  tail at replenishment;
+* one cyclic schedule of half-open windows over a major frame, from an epoch fixed at OPERATIONAL.
+  Boundaries are instants of time, empty windows idle, and there is no slack donation;
+* **a partition is bound to one CPU**, so no window or budget is ever consumed in parallel;
+* one budgeted scheduling context per thread, `{cpu, partition, priority, B, T}`, with periodic
+  replenishment and overrun carried as debt and reported;
+* priority, criticality, partition eligibility, budget eligibility and CPU affinity are separate
+  attributes. Priority never overrides a window or an exhausted budget;
+* handoff is not donation, and donation stays disabled;
+* every category of kernel execution has an owner: the caller, a budgeted worker, or a per-CPU
+  system allowance with recorded overrun.
+
+General-purpose behaviour is that same mechanism set configured as one always-active partition
+per CPU, three levels and quantum round-robin. A differential test pins this GP configuration to
+the production `PriorityScheduler`.
+
+**Source findings (contract §1).** Each was derived from code, not from comments:
+
+* Scheduler queues are per-CPU storage behind ONE rank-1 lock. That lock is an unfair TTAS
+  spinlock, waited on with interrupts masked inside traps.
+* The kernel is non-preemptive on all three ISAs.
+* A wake never preempts a running task. A reschedule IPI that lands on a running CPU settles
+  `return_to_interrupted`, so GP applies priority only at selection points.
+* "No migration" holds for Balanced plans structurally but for Pinned plans only by caller
+  discipline.
+* Time is a count of clock-owner timer interrupts, re-armed relative to now on every port, so it
+  is monotonic but drifting and uncalibrated.
+* `yarm_log!` flushes the printk ring to the UART synchronously, inside masked traps, including
+  on every tick.
+* The default kernels themselves use FP/SIMD registers: 22 755 XMM instructions on x86_64 and
+  2 429 q/v instructions on AArch64, by disassembly. RISC-V uses none.
+* Every port treats interrupted or faulting kernel-mode execution as idle or fatal.
+* Two source comments disagree with the code; both are recorded in contract §1.12.
+
+**Next packages, in order:**
+
+| Package | Scope | Contract requirements |
+|---|---|---|
+| **KTHREAD1** | independent kernel threads: owned stacks, entry ABI, kernel-mode preemption, kernel FP/TLS policy, guard check, stack residency and reclamation, trap classifiers | SC-KT-1…12, SC-BND-2, SC-EXEC-3 |
+| **RT-SCHED1** | 32-level fixed-priority preemptive selection, scheduling contexts and budgets, calibrated time and earliest-deadline programming, structural no-migration, a fair kernel lock or contention bound, buffered diagnostics | SC-PRI-10…13, SC-CTX-*, SC-TIME-3…6, SC-CPU-2, SC-SEP-*, SC-INV-*, SC-WCET-*, SC-EXEC-* |
+| **PARTITION1** | cyclic schedule, epoch, windows and boundaries, the OPERATIONAL transition, system allowance and health monitoring, configuration validation | SC-PART-*, SC-POOL-2/4, SC-EXEC-5, SC-IPC-3, SC-BND-3 |
+
+**Roadmap, not started:** VFS work (owner doc `doc/VFS.md`) and hardware bring-up (owner doc
+`doc/RPI5_BRINGUP.md` and the per-ISA architecture docs) remain on the roadmap and were not
+started by SCHED-CONTRACT1. Hardware in the loop is the prerequisite for every timing bound of
+kind **N** in contract §6.
+
+**Mutation evidence (contract §9).**
+
+* *Model:* eleven model mutations are killed in-test by
+  `model::every_mutation_is_killed_by_its_targeted_check`.
+* *Production:* seven source mutations of `src/kernel/scheduler.rs` were applied one at a time
+  against the frozen tests, and each was killed by its targeted `production` test:
+  * reversed priority order → `sc_pri_1` (also `sc_pri_3`, `sc_pri_4`, `sc_elig_1`,
+    `sc_pool_1`, `sc_gp_1`);
+  * LIFO ring → `sc_pri_2` (also `sc_pri_1`, `sc_pri_3`, `sc_pri_4`, `sc_pool_1`, `sc_gp_1`);
+  * a quantum preemption that keeps `current` → `sc_pri_3` (also `sc_pri_4`, `sc_gp_1`);
+  * a wake that preempts → `sc_pri_4` (also `sc_gp_1`);
+  * enqueue on the wrong CPU → `sc_cpu_1`;
+  * `QueueFull` removed → `sc_pool_1`;
+  * an acceptance filter that drops refused entries → `sc_elig_1`.
+
+  Every mutated tree compiled; each kill is a test failure, not a build failure.
+
 ---
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
