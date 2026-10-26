@@ -837,8 +837,10 @@ record is contract §8.2.
   * The eager user preservation, the kernel's control environment and owner authentication are
     unchanged.
 * **Enforcement:** `scripts/check-kernel-nofp.py` decodes every executable byte of the image that
-  boots and fails on any classified instruction outside its exception's exact list. All three
-  artifact builds run it and fail closed.
+  boots except the anchored exclusions of its reviewed inventory (embedded data, embedded user
+  programs, AArch64 literal pools; corrected by KERNEL-NOFP1-ACCEPTANCE below), and fails on any
+  classified instruction outside its exception's exact list. All three artifact builds run it
+  and fail closed.
 * **Cost** (static, default kernels):
   * x86 `.text` −7.3%, AArch64 −2.2%;
   * largest per-function frame unchanged on x86, −64 B on AArch64;
@@ -962,6 +964,97 @@ not changed.
 
 *Not measured:* hardware execution time, WCET, a stack bound. QEMU timings are not reported as
 performance.
+
+#### KERNEL-NOFP1-ACCEPTANCE (from delivered `fec063af`)
+
+**Scope correction.** KERNEL-NOFP1 said the checker "decodes every executable byte". It decoded
+every byte **not covered by a map region**, and it accepted any `DATA`, `CODE16` or `CODE32`
+record, and any `USER_PROGRAM` whose name was on a list, on the image's own word. The exact
+statement is now:
+
+* every byte of an executable section is decoded, except bytes covered by an exclusion the
+  checker authenticates against its reviewed inventory, plus AArch64 literal-pool words;
+* an exclusion is authenticated by its exact name and its anchors (owner symbols or section
+  bounds), the owning source, its section, its feature, linker elimination, ownership and boot
+  mode — never by the record alone;
+* it does not prove control-flow safety or disassembler correctness (doc/SCHEDULING_CONTRACT.md
+  §8.2).
+
+**Reproduction (the delivered checker, unmodified, real CLI, synthetic images).** The fixture
+builder `tests/fixtures/nofp/mkfixture.py` writes small ELF images byte by byte. They carry the
+whole x86 exception inventory with the real instruction sequences, the boot32 and trampoline
+regions, and a symbol table. Results:
+
+| Fixture | Delivered checker |
+|---|---|
+| baseline | pass |
+| ordinary `fninit` (`db e3`) | rejected (`FORBIDDEN fp … kernel_main+0x4: fninit`) |
+| ordinary `49 db e3` = `rex.WB fninit` | **pass** (false pass) |
+| ordinary `fninit` under a new `DATA arbitrary` record | **pass** (false pass) |
+
+These are verifier reproductions on synthetic images. They are not defects demonstrated in the
+delivered kernel images, and every qualified kernel image passes the repaired checker too. The
+same run found further synthetic false passes:
+
+* `{rex2 0x0} fninit`;
+* `rex.WB mov %r8,%cr0`;
+* `rex.WR ldmxcsr`;
+* a `USER_PROGRAM vmi2_witness` record over kernel code in a build without that feature.
+
+Across the final 80-fixture set, the delivered checker passes 47 fixtures: the 12 valid ones and
+35 it should reject.
+
+**Repairs** (`scripts/check-kernel-nofp.py`; doc/SCHEDULING_CONTRACT.md §8.2):
+
+* the x86 prefix grammar of the decoder, per mode, failing closed on any form it cannot
+  interpret;
+* strict disassembler-output parsing;
+* the closed, anchored exclusion inventory;
+* literal-pool justification of data directives;
+* metadata checks (ELF machine, Cargo features, map format);
+* an obligation code on every failure.
+
+No production source, linker script, target or annotation changed.
+
+**Behavioural tests** (`tests/kernel_nofp_cli.rs`, in `cargo test`). It runs 80 synthetic fixtures
+through `scripts/check-kernel-nofp.sh`, the CLI the artifact builds use, and asserts exit status,
+verdict and the **exact** set of obligation codes. The fixtures cover:
+
+* both original false passes;
+* 23 other REX/REX2/stacked-prefix forms of FP, FP-state and FP-enable operations;
+* legitimately prefixed integer code (must pass);
+* six malformed-decoder-output cases, through a stub `objdump` that rewrites the real output,
+  plus its passthrough control;
+* a trailing partial instruction, a truncated ELF, and a missing image;
+* enlarged DATA and USER_PROGRAM exclusions, a shifted DATA exclusion, and ordinary code
+  mislabelled with a recognised name (both by record and by anchors around a kernel function);
+* missing, duplicate, feature-inconsistent and wrongly eliminated records, an exception inside
+  data, boot32 off identity, and an oversized trampoline;
+* malformed metadata;
+* valid data, user-program (one- and multi-segment, feature-implied, linker-eliminated) and
+  boot-mode images on all three ports.
+
+`tests/kernel_nofp_scope.rs` adds a cross-check: the region records the sources emit equal the
+checker's `--list-inventory`, and each anchor is a label of its owning source.
+
+**Independent revert controls.** A scratch worktree undid one repair at a time and ran the
+repository's own `cargo test --test kernel_nofp_cli` (never committed):
+
+| Repair undone | Fixtures that became false passes | Fixtures whose obligations changed (still failing) | Valid fixtures failing |
+|---|---|---|---|
+| none | 0 | 0 | 0 |
+| prefix grammar | 0 | 18: the prefixed FP forms are still refused, as `NOFP-DECODE`, because the fail-closed layer rejects the unknown `rex.wb` token | 1: `x86_prefixed_integer_ok`, the grammar's own positive control |
+| prefix grammar **and** fail-closed interpretation (the delivered parser) | 14: `rex.WB fninit` and 11 other prefixed FP forms, plus 2 stub-output cases | 0 | 0 |
+| fail-closed interpretation | 2 (stub unknown prefix, extra tokens) | 0 | 0 |
+| strict output lines | 1 (stub garbage line) | 0 | 0 |
+| exclusion authentication | 15, including `DATA arbitrary` | 8 | 0 |
+| data-directive justification | 3 (x86 trailing partial instruction, two AArch64 data cases) | 3 | 0 |
+| feature/machine binding | 1 (unknown feature) | 1 | 0 |
+| map-format strictness | 2 (bad map word, truncated record) | 1 | 0 |
+
+In every row, the test fails, and only the reverted repair's own fixtures change.
+
+SCHED-LOCK1 remains OPEN and next; KTHREAD1 is not started; broad-lock retirement stays closed.
 
 ---
 

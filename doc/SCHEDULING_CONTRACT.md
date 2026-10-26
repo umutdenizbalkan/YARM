@@ -843,8 +843,10 @@ never by adding an alternative dispatcher selected by profile.
     lists them. A range is narrower than a symbol: it names the instructions, not the routine.
 * **SC-FP-2 — Qualification inspects the final linked images.** **ENFORCED** (KERNEL-NOFP1).
   * Qualification disassembles the final linked kernel image of every port.
-  * Every instruction that reads or writes an FP/SIMD register must lie inside an audited
-    exception range.
+  * Every **decoded** instruction that reads or writes an FP/SIMD register must lie inside an
+    audited exception range. The only bytes left undecoded are those of a reviewed, anchored
+    exclusion (embedded data, embedded user programs, AArch64 literal pools); an annotation in
+    the image cannot create one on its own (§8.2, KERNEL-NOFP1-ACCEPTANCE).
   * A blanket "zero FP/SIMD instructions anywhere" check is **wrong**: it would reject the
     required context routines. A source-level or flag-level check is **insufficient**: it would
     miss compiler-generated helpers.
@@ -928,38 +930,50 @@ else fails to build.
 
 RISC-V has **no** exception: any FP or vector instruction anywhere in its kernel fails.
 
-**Regions** (also in the map, so every byte is decoded or accounted):
+**Decoded and excluded bytes.** Every byte of every executable section is either decoded or
+excluded, and the accounting line proves the two add up. The map records which ranges are not
+ordinary 64-bit/native code, but a record only *names* a candidate range; the checker accepts it
+only against its own reviewed inventory (KERNEL-NOFP1-ACCEPTANCE, below):
 
-* x86 `.text.boot32` is decoded as 32-bit code. The AP trampoline is decoded as 16-bit code,
-  then data (GDTR/GDT), then 32-bit code, then 64-bit code, then data (the handoff block).
-* Witness **user programs** embedded in the kernel's text (`smp1`, `apsched`, `overtaken`, `vmi2`
-  on x86; `smp2`, `apsched`, `overtaken` on AArch64; `smp3`, `apsched`, `sr_replace`, `vmi` on
-  RISC-V) are `USER_PROGRAM` regions. The kernel copies them into user address spaces and never
-  executes them; they may use FP/SIMD as user code. Only the names in the checker's list are
-  accepted.
+* **Decoded in another mode** (never excluded): x86 `.text.boot32` as 32-bit code; the AP
+  trampoline's real-mode part as 16-bit code and its protected-mode part as 32-bit code.
+* **Excluded as data:** the AP trampoline's GDTR/GDT image and its handoff block (x86 only), and
+  AArch64 literal-pool words.
+* **Excluded as embedded user programs:** the witness programs in the kernel's text (`smp1`,
+  `apsched`, `overtaken`, `vmi2` on x86; `smp2`, `apsched`, `overtaken` on AArch64; `smp3`,
+  `apsched`, `sr_replace`, `vmi` on RISC-V). The kernel copies them into user address spaces and
+  never executes them; they may use FP/SIMD as user code, which is not banned.
+* Everything else is decoded as native code.
 
 **The check** (`scripts/check-kernel-nofp.py`, run by `scripts/check-kernel-nofp.sh`):
 
 * It reads the ELF that boots. For AArch64 and RISC-V it also proves that the raw image QEMU
   loads equals that ELF's loadable bytes.
-* It decodes **every** executable byte in its mode, zero blocks included: GNU objdump for x86,
-  LLVM objdump for AArch64 and RISC-V, with F/D/V/Zfh decoding enabled. The instructions must
-  tile each region exactly.
-* AArch64 literal pools are accounted as data through the assembler's mapping symbols. Data
-  sections inside executable segments (`.rodata`) are reported, not decoded.
+* It decodes every executable byte **that no authenticated exclusion covers**, in its mode, zero
+  blocks included: GNU objdump for x86, LLVM objdump for AArch64 and RISC-V, with F/D/V/Zfh
+  decoding enabled. The instructions must tile each decoded range exactly.
+* A data directive the disassembler prints inside decoded code is accepted only as an AArch64
+  literal-pool word: inside a `$d` mapping span **and** covered by the target of a PC-relative
+  literal load in decoded code. On x86 and RISC-V it is a failure. Data sections inside
+  executable segments (`.rodata`) are reported, not decoded.
 * Classification covers:
   * FP/SIMD/vector register operands;
   * x87/FP/vector mnemonics;
   * implicit-state instructions (`fxsave`, `ldmxcsr`, `xsave*`, `emms`, `vzeroupper`, …);
   * FP control state (MXCSR, FCW, FPCR/FPSR, `fcsr`/`frm`/`fflags`, vector CSRs);
   * FP-enable writes (CR0, CR4, XCR0, `clts`, `lmsw`; CPACR_EL1/CPTR_ELx).
-* An undecodable byte, a gap, an unknown record, a missing disassembler, a wrong instance count
-  or an instruction outside its exception's exact list is a **failure**, never a pass.
-* The result line binds the verdict to the image SHA-256, the features, the toolchain and the
-  disassembler.
+* An undecodable byte, a gap, an unknown record, a missing disassembler, an output line or
+  prefix it cannot interpret, a wrong instance count or an instruction outside its exception's
+  exact list is a **failure**, never a pass.
+* Every failure carries an obligation code (`NOFP-ORDINARY`, `NOFP-DECODE`, `NOFP-DATA`,
+  `NOFP-EXCL-*`, `NOFP-EXCEPTION`, `NOFP-INVENTORY`, `NOFP-METADATA`, `NOFP-BOOT-IMAGE`). The
+  result line lists them and binds the verdict to the image SHA-256, the features, the toolchain
+  and the disassembler.
 * It runs at the end of all three QEMU artifact builds (`common_verify_kernel_nofp`), which fail
   closed. `tests/kernel_nofp_scope.rs` pins the target configuration, the build gate, the
-  agreement between recorded kinds and the policy, and the AArch64 brackets.
+  agreement between recorded kinds and the policy, the agreement between recorded regions and
+  the exclusion inventory, and the AArch64 brackets. `tests/kernel_nofp_cli.rs` runs the
+  checker's CLI on 80 synthetic images (KERNEL-NOFP1-ACCEPTANCE).
 
 **What is unchanged:**
 
@@ -1004,19 +1018,71 @@ allocation; those belong to FP-POLICY1 and KTHREAD1.
 * Two x86 strict-core runs failed on a grader assumption (a fixed reply-record generation). They
   were repaired and rerun on the final commit.
 
-**Remaining limits:**
+**KERNEL-NOFP1-ACCEPTANCE: two false passes closed.** Run unmodified through its real CLI on
+synthetic ELF images that carry the whole legitimate exception inventory, the delivered checker
+(`fec063af`) passed two images it should have rejected: bytes `49 db e3` in ordinary code, which
+GNU objdump 2.42 prints as `rex.WB fninit` (its prefix list held only single-letter REX forms),
+and an ordinary `fninit` covered by a newly added `DATA arbitrary` map record (any `DATA` record
+was accepted on its word). These are verifier defects shown on synthetic images, not defects
+found in the delivered kernels: every qualified kernel image also passes the repaired checker.
+The repairs:
 
+* **x86 prefixes** are parsed with the decoder's own closed prefix grammar, taken from GNU objdump
+  2.42 / libopcodes, per decoding mode: all 16 REX spellings, `{rex2 0xNN}`, `data16`/`data32`,
+  `addr16`/`addr32`, segment overrides, `lock`, `rep`/`repz`/`repnz`, `xacquire`/`xrelease`,
+  `bnd`, `notrack`, `{vex}`/`{vex3}`/`{evex}`, in any combination, and branch-hint suffixes.
+  Classification reaches the instruction after them. Anything else in prefix position, a token
+  after the operands, a malformed mnemonic or operand list, or an output line that is neither
+  an instruction nor a known header fails as `inspection incomplete`.
+* **Exclusions are authenticated.** The checker holds a closed, reviewed inventory keyed by the
+  exact record name. Each entry fixes the decoding mode, its purpose, the owning source, the
+  output section, and its **anchors**: the symbols or section bounds the owner defines. For a
+  user program these are the copy-out symbols the kernel itself uses (`yarm_vmi2_start` …), and
+  multi-segment programs must tile exactly. Each entry also fixes the cargo feature that compiles
+  it, read through Cargo.toml's feature graph, whether the linker may eliminate it, and its boot
+  mode. 32-bit boot code must be identity-loaded below 4 GiB. Trampoline parts must lie inside
+  the one-page real-mode blob.
+  * A record is refused, and then excludes **nothing**, when its name is unknown, its bounds
+    differ from its anchors (shifted, enlarged), or an anchor is missing or defined twice.
+  * It is also refused when it is duplicated, present without its feature, missing although its
+    feature compiles it, or linker-eliminated while its anchors are still linked (or when it is
+    never eliminable).
+  * It is also refused when a sized kernel function or object, or an unlisted entry point, lies
+    inside it, or when it contradicts its architecture or boot mode.
+  * An exception record that overlaps excluded data or a user program is a conflict.
+  * The anchors are structural (named symbols and section bounds), never whole-image hashes or
+    symbol-prefix rules.
+* **Disassembler data directives** are justified as above (literal-pool words only), so an
+  undecodable or hand-encoded instruction cannot turn itself into data.
+* **Metadata** is checked: the ELF machine must match the port, every feature named must exist
+  in Cargo.toml, and a malformed map table (unknown word, truncated record, malformed name,
+  trailing bytes) fails.
+
+What this establishes is exact. For the decoded bytes, the disassembler's linear decoding has no
+FP/SIMD or FP-enable instruction outside an audited exception. The undecoded bytes are exactly the
+reviewed inventory's anchored ranges and the justified literal-pool words. It is **not** a proof
+of control-flow safety: nothing shows that execution never jumps into an excluded range or into
+the middle of a decoded instruction. It is **not** a proof that the disassembler decodes what the
+CPU executes.
+
+**Remaining limits (OPEN):**
+
+* **OPEN — the AArch64 core grader's fresh-record assumption.** It still pins the U9-RX4 reply
+  record to generation 1. It passed every scheduled run, but it would misjudge a reused-slot
+  boot, as the x86 grader did.
+* **OPEN — smoke build paths outside automatic enforcement.** Smoke scripts that build a kernel
+  directly with `cargo` rather than through the artifact scripts are not gated at build time.
+  The qualification runner checks every kernel it boots.
+* **OPEN — the RPi5 bring-up targets (`aarch64-rpi5-*`) keep `+neon`.** Hardware work is outside
+  this package; their asm carries the same bracketing.
+* None of the above, and nothing in KERNEL-NOFP1 or its acceptance, is a qualification for
+  future kernel-mode preemption: that stays gated by SCHED-LOCK1 and KTHREAD1 (SC-KT-4).
 * RISC-V enforcement is by the image only (hard-float target, kept for ABI stability). Its
   `sstatus` writes are not classified, because FS/VS share the register with SIE; with no FP
   instruction present, FS has nothing to enable.
-* Smoke scripts that build a kernel directly with `cargo` rather than through the artifact
-  scripts are not gated at build time. The qualification runner checks every kernel it boots.
-* The RPi5 bring-up targets (`aarch64-rpi5-*`) keep `+neon`. Hardware work is outside this
-  package, and their asm now carries the same bracketing.
-* The AArch64 core grader still pins the U9-RX4 reply record to generation 1. It passed every
-  scheduled run, but it would misjudge a reused-slot boot, as the x86 grader did.
 * The checker trusts the system disassemblers (binutils 2.42, LLVM 18) to decode correctly. Its
-  self-test and negative controls exercise them, but do not prove them.
+  self-test, CLI fixtures and negative controls exercise them, but do not prove them. The CLI
+  fixture test needs both disassemblers, as the artifact builds do; a missing one fails it.
 
 ## 9. Evidence index
 
