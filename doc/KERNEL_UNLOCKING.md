@@ -847,6 +847,122 @@ record is contract §8.2.
 
 SCHED-LOCK1 is OPEN and next; FP-POLICY1 stays separate; broad-lock retirement stays closed.
 
+**Qualification of KERNEL-NOFP1.** The final commit is `13cf33f0` (tree `9dc5adaf`); the base is
+`91030225`. Every scheduled result is kept below, failures included.
+
+*Candidates, in order:*
+
+* `97867bc5` was frozen, then replaced before qualification by `a79978eb`, so that an inspection
+  which cannot finish prints a clean `fail` verdict.
+* Phases 1–3 ran on `a79978eb`.
+* `982e07ac` repaired the U9-RX4 grader (below). Its hosted gate failed, because a source guard
+  still pinned the old grader text. It was superseded; its remaining gates were cancelled before
+  they ran.
+* `13cf33f0` updates that guard. It differs from `a79978eb` only in
+  `scripts/qemu-x86_64-core-smoke.sh` and the test-only `src/kernel/boot/tests.rs`.
+
+*Phase 1 — static (`a79978eb`):*
+
+* checker self-test 48 cases, 0 mismatches;
+* `kernel_nofp_scope` 6/6, documentation guard 7/7, `cargo fmt --check` clean;
+* hosted 6197 passed;
+* integration 34 suites, 346 passed;
+* broad-lock census 17/17, production lines identical.
+
+Warnings:
+
+* The only delta is the inherited `core` future-incompatibility note (x86 177 → 178, AArch64
+  205 → 206).
+* RISC-V is identical (188).
+
+Default kernels:
+
+* x86: 24 classified instructions, all inside exceptions; 0 in ordinary code.
+* AArch64: 83, all inside exceptions; 0 in ordinary code.
+* RISC-V: 0.
+* The VMI sequence checks pass.
+
+All 20 variants pass the check, and the six RISC-V booted binaries are byte-identical to base.
+
+*Phase 2 — negative controls* (frozen checker, scratch worktree, never committed; the scratch tree
+was verified clean):
+
+| Control | Result |
+|---|---|
+| SSE in ordinary x86 code | rejected at `x86_trap_dispatch_body+0x2b: pxor %xmm0,%xmm0` |
+| NEON in ordinary AArch64 code (assembler bracket opened locally) | rejected at `yarm_aarch64_write_return_elr_marker+0x0` |
+| the same without the bracket | refused at build (`instruction requires: neon`) |
+| D-extension instruction in ordinary RISC-V code | rejected at `configure_plic_from_platform_layout+0x0: fmv.d.x ft0,zero` |
+| linked helpers rebuilt with SIMD: x86 / AArch64 old targets | 22 811 / 2 464 violations, 461 / 418 in `core`/`compiler_builtins` symbols |
+| linked helpers: RISC-V `core` float formatting linked in | 3 violations, all in `core::fmt::float` / `flt2dec` |
+| unrelated SSE op inside the x86 trap-capture exception | 4 instructions where exactly 3 are permitted |
+| restore from the wrong area | instruction not the permitted form |
+| unrelated FP op inside the AArch64 vector capture | 20 where 19 are permitted |
+| one q-pair save omitted | 18 where 19 are permitted |
+| undecodable byte in ordinary code | `inspection incomplete` |
+| no disassembler; a disassembler that drops a line (x86, AArch64) | fail / gap |
+| exception table stripped (x86, AArch64) | fail |
+| truncated image; missing image | `inspection_incomplete` |
+| raw boot image differs from the ELF by one byte | fail |
+| CONTEXT1 omitted load (x86, AArch64) | witness `result=fail` |
+| CONTEXT1 one XMM0 / q0 bit flipped on load | witness `result=fail` |
+
+*Phase 3 — live (`a79978eb`, QEMU 8.2.2):*
+
+* CONTEXT1, three consecutive strict boots per port: all `fresh=1 block=3/6 preempt=3 same=6/6
+  env_bad=0 result=ok` on x86_64 and on AArch64.
+* Strict cores:
+  * x86 `-smp 1`, `-smp 2` and VM-COW: pass;
+  * **x86 `-smp 4` and `-smp 8`: FAILED** (U9-RX4, below);
+  * AArch64 `-smp 1/2`, RISC-V `-smp 1/2`: pass.
+* AP scheduling: x86 `-smp 2/4`, AArch64 `-smp 2/4`, RISC-V `-smp 4` all pass with
+  `registers=intact`.
+* Interrupts:
+  * x86 UART IRQ: `xmm_user_loss=0`;
+  * AArch64 PL011: pass.
+* SMP and lock witnesses: SMP1, LOCK3, SMP2, LOCK2 pass.
+* VMI2 `-smp 2`, overtaken return (both ports), direct IPC call/reply (both), shared-region
+  direct (both), exit-current-task (both) and server-dies (both): pass.
+* Every kernel image a run produced was checked after it (the checker passed every one). Images
+  the per-run binding missed were covered by a sweep of every staged image. Witness images pass
+  with their features, and fail without them: the checker refuses witness-only exceptions in a
+  build it is told is not a witness build.
+
+*The two strict-core failures.* Every behavioural U9-RX4 assertion held:
+
+* the reply resolved, it was revoked once, and the caller resumed once;
+* SMP admission, TLB shootdown and the timer contract passed.
+
+On these boots PM was already blocked when tid 2 called. The request therefore took the direct
+route and reused direct record slot 0 after init's two calls, at generation 3. Every base log
+graded before (2/4/8 CPUs) took the queued route at generation 1. The grader accepts the direct
+route but pinned the resolved object to `generation=1`.
+
+The repair reads the generation and binds it to the request's own committed record (index and
+generation exact), and it requires exactly one resolution of PM's cap. Offline controls on real
+logs:
+
+* the old rule fails the two logs, and the new rule passes them;
+* base logs pass under both rules;
+* the new rule rejects a stale generation, a missing route, a second resolution and a wrong record
+  index.
+
+The failing runs stay in the record; they were not replaced. The AArch64 core grader carries the
+same fresh-slot literal. It passed every scheduled run, and it is recorded as a latent limitation,
+not changed.
+
+*Phase 4 — final (`13cf33f0`):*
+
+* fmt clean; hosted 6197; integration 34 suites, 346 passed;
+* all 20 kernel images bitwise identical to phase 1 and passing the check, so the phase-3 live
+  evidence applies to these exact artifacts;
+* fresh strict x86 cores under the repaired grader: `-smp 1/2` pass (queued route, generation
+  1), and `-smp 4/8` pass (direct route, generation 3);
+* worktree clean.
+
+*Not measured:* hardware execution time, WCET, a stack bound. QEMU timings are not reported as
+performance.
+
 ---
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION

@@ -991,6 +991,19 @@ allocation; those belong to FP-POLICY1 and KTHREAD1.
 * Removing compiler SIMD makes bulk copies use integer code; nothing here shows that is faster or
   slower on hardware.
 
+**Qualification.**
+
+* Final commit `13cf33f0` (tree `9dc5adaf`), against base `91030225`. The full record, with every
+  failure kept, is in `doc/KERNEL_UNLOCKING.md` §0.8.
+* 20/20 kernel variants pass the image check, and 29 negative controls fail as intended.
+* Six strict CONTEXT1 boots pass, three on x86_64 and three on AArch64.
+* Strict cores pass on all three ports, and the production AP-scheduling witnesses pass on all
+  three.
+* The IRQ, SMP/lock, overtaken-return, IPC, shared-region, VMI/COW and lifecycle regressions
+  pass.
+* Two x86 strict-core runs failed on a grader assumption (a fixed reply-record generation). They
+  were repaired and rerun on the final commit.
+
 **Remaining limits:**
 
 * RISC-V enforcement is by the image only (hard-float target, kept for ABI stability). Its
@@ -1000,6 +1013,8 @@ allocation; those belong to FP-POLICY1 and KTHREAD1.
   scripts are not gated at build time. The qualification runner checks every kernel it boots.
 * The RPi5 bring-up targets (`aarch64-rpi5-*`) keep `+neon`. Hardware work is outside this
   package, and their asm now carries the same bracketing.
+* The AArch64 core grader still pins the U9-RX4 reply record to generation 1. It passed every
+  scheduled run, but it would misjudge a reused-slot boot, as the x86 grader did.
 * The checker trusts the system disassemblers (binutils 2.42, LLVM 18) to decode correctly. Its
   self-test and negative controls exercise them, but do not prove them.
 
