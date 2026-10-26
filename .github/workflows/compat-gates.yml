@@ -174,18 +174,35 @@ jobs:
           cargo test -q services::fs::ext4::fs::framing_tests::ext4_response_frame_golden_vector_matches_contract
           cargo test -q services::fs::fat::fs::tests::bpb_parsing_reads_core_fields
 
-  core-profile:
-    runs-on: ubuntu-latest
+  # BUILD-GATES1 §2: the KERNEL-NOFP1 checker's fixtures, the artifact-provenance controls and the
+  # AArch64 reply-grader corpus, on explicitly provisioned and selected disassemblers. A missing or
+  # unsupported tool fails by name (NOFP-TOOLS); nothing is skipped or stubbed.
+  kernel-nofp-gates:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Provision and select the no-FP checker's disassemblers (BUILD-GATES1)
+        run: scripts/ci/provision-nofp-tools.sh
+      - name: no-FP checker fixtures, provenance controls, reply-grader corpus
+        run: cargo test -q --test kernel_nofp_cli --test kernel_nofp_scope --test artifact_binding_scope --test aarch64_reply_grader
+
+  core-profile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Provision and select the no-FP checker's disassemblers (BUILD-GATES1)
+        run: scripts/ci/provision-nofp-tools.sh
       - name: core profile tests
         run: cargo test -q
 
   posix-compat-profile:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Provision and select the no-FP checker's disassemblers (BUILD-GATES1)
+        run: scripts/ci/provision-nofp-tools.sh
       - name: posix-compat profile tests
         run: cargo test -q --features posix-compat

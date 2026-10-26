@@ -388,3 +388,66 @@ fn final_image_checker_self_test_passes() {
     assert!(out.status.success(), "{text}");
     assert!(text.contains("mismatches=0 result=ok"), "{text}");
 }
+
+/// BUILD-GATES1 §2: every CI job that runs the checker — through its fixtures (`cargo test`) or
+/// through a kernel build — first provisions and explicitly selects the supported disassemblers,
+/// on a pinned runner image, before any step that needs them.
+#[test]
+fn every_ci_job_that_runs_the_checker_provisions_its_tools() {
+    const PROVISION: &str = "run: scripts/ci/provision-nofp-tools.sh";
+    let mut seen = 0;
+    for wf in [
+        include_str!("../.github/workflows/compat-gates.yml"),
+        include_str!("../.github/workflows/core-qemu-smoke.yml"),
+    ] {
+        let mut jobs: Vec<(String, String)> = Vec::new();
+        for line in wf.lines() {
+            let is_header = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && line.ends_with(':')
+                && !line.trim_start().starts_with('#');
+            if is_header {
+                jobs.push((line.trim().to_string(), String::new()));
+            } else if let Some((_, body)) = jobs.last_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        for (header, job) in &jobs {
+            let job = job.as_str();
+            let builds = job.contains("scripts/build-qemu-");
+            let fixtures = job.contains("run: cargo test -q\n")
+                || job.contains("run: cargo test -q --features")
+                || job.contains("--test kernel_nofp_cli");
+            if !(builds || fixtures) {
+                continue;
+            }
+            seen += 1;
+            let at = job
+                .find(PROVISION)
+                .unwrap_or_else(|| panic!("job {header} runs the checker without provisioning"));
+            let first_use = [
+                "scripts/build-qemu-",
+                "run: cargo test",
+                "--test kernel_nofp_cli",
+            ]
+            .iter()
+            .filter_map(|n| job.find(n))
+            .min()
+            .unwrap();
+            assert!(at < first_use, "job {header} provisions after first use");
+            assert!(
+                job.contains("runs-on: ubuntu-24.04"),
+                "job {header} pins its image"
+            );
+        }
+    }
+    assert_eq!(
+        seen, 9,
+        "core-profile, posix-compat, kernel-nofp-gates and six QEMU jobs"
+    );
+    let script = include_str!("../scripts/ci/provision-nofp-tools.sh");
+    assert!(script.contains("python3 -I scripts/check-kernel-nofp.py --check-tools"));
+    assert!(script.contains("echo \"YARM_OBJDUMP=$OBJDUMP\""));
+    assert!(script.contains("echo \"YARM_LLVM_OBJDUMP=$LLVM_OBJDUMP\""));
+}

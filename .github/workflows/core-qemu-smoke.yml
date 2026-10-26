@@ -8,10 +8,12 @@ on:
 
 jobs:
   x86_64-core-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Provision and select the no-FP checker's disassemblers (BUILD-GATES1)
+        run: scripts/ci/provision-nofp-tools.sh
       - name: Install build + qemu tools
         run: |
           sudo apt-get update
@@ -24,10 +26,12 @@ jobs:
         run: scripts/qemu-x86_64-core-smoke.sh
 
   x86_64-core-smoke-strict:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Provision and select the no-FP checker's disassemblers (BUILD-GATES1)
+        run: scripts/ci/provision-nofp-tools.sh
       - name: Install build + qemu tools
         run: |
           sudo apt-get update
@@ -51,10 +55,12 @@ jobs:
           rg -n "YARM_SCHED_TICK" qemu-x86_64-core.log
 
   aarch64-core-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Provision and select the no-FP checker's disassemblers (BUILD-GATES1)
+        run: scripts/ci/provision-nofp-tools.sh
       - name: Install build + qemu tools
         run: |
           sudo apt-get update
@@ -67,10 +73,12 @@ jobs:
         run: scripts/qemu-aarch64-core-smoke.sh
 
   riscv64-core-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Provision and select the no-FP checker's disassemblers (BUILD-GATES1)
+        run: scripts/ci/provision-nofp-tools.sh
       - name: Install build + qemu tools
         run: |
           sudo apt-get update
@@ -84,10 +92,12 @@ jobs:
 
   aarch64-core-smoke-strict:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Provision and select the no-FP checker's disassemblers (BUILD-GATES1)
+        run: scripts/ci/provision-nofp-tools.sh
       - name: Install build + qemu tools
         run: |
           sudo apt-get update
@@ -108,10 +118,12 @@ jobs:
 
   riscv64-core-smoke-strict:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Provision and select the no-FP checker's disassemblers (BUILD-GATES1)
+        run: scripts/ci/provision-nofp-tools.sh
       - name: Install build + qemu tools
         run: |
           sudo apt-get update
