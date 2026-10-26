@@ -1054,6 +1054,73 @@ repository's own `cargo test --test kernel_nofp_cli` (never committed):
 
 In every row, the test fails, and only the reverted repair's own fixtures change.
 
+**Qualification of KERNEL-NOFP1-ACCEPTANCE.**
+
+*Binding:*
+
+* Frozen candidate `870d9126` (tree `fd5f081f`), base `fec063af` (tree `53d334ec`).
+* Commit `10b00e3f` accidentally included a `tests/fixtures/nofp/__pycache__` bytecode file;
+  `870d9126` removed it and ignores it.
+* Tools: toolchain `rustc 1.101.0-nightly (32dba69d6 2026-10-09)`, GNU objdump 2.42 (Ubuntu),
+  Ubuntu LLVM 18.1.3 `llvm-objdump`, Python 3.11.17.
+
+*What changed:* the checker, its tests and fixtures, the documentation and `.gitignore`.
+Production paths changed: **0** (`src/`, `targets/`, `Cargo.*`, `build.rs`, `.cargo/`, and
+every script other than the checker).
+
+*Static gates (all on the frozen tree, worktree clean):*
+
+* checker self-test 101 cases, 0 mismatches;
+* `kernel_nofp_cli` 2/2 (80 fixtures and the missing-image case);
+* `kernel_nofp_scope` 7/7;
+* documentation guard 7/7;
+* `cargo fmt --check` clean;
+* hosted 6197 passed;
+* integration 35 suites, 349 passed: the earlier 34 suites / 346 tests, plus the new suite
+  (2 tests) and the new scope test;
+* broad-lock census 17/17, production census lines identical to base;
+* kernel-build warnings 178 / 206 / 188, with classes identical to base.
+
+*Fresh default kernels:* the x86_64, AArch64 and RISC-V default kernels built from the candidate
+are byte-identical to those built from the base and to the KERNEL-NOFP1 phase-4 images
+(`33c00b48…`, `a9fffbfd…`, `d8abb10a…`). The repaired checker passes all three:
+
+| Port | Decoded code | Excluded data | Classified instructions |
+|---|---|---|---|
+| x86 | 1 220 602 B | 188 B: GDT 52 + handoff 136 | 24, all in exceptions |
+| AArch64 | 885 732 B | 8 B: one literal-pool doubleword, justified by its `ldr` | 83, all in exceptions |
+| RISC-V | 689 852 B | 0 | 0 |
+
+*Variants:*
+
+* 24 kernels were built from the candidate and checked with their features: the 20 previously
+  qualified variants, plus the x86 UART-IRQ, AArch64 PL011-IRQ, RISC-V UART-IRQ and
+  x86 direct-IPC SMP oracle images. **24/24 pass.**
+* The 20 previously qualified variants are byte-identical to the KERNEL-NOFP1 phase-4 images.
+* The four IRQ/oracle images have no stored phase-4 image to compare. They are built from
+  production source identical to the base.
+
+*Feature binding:* every non-default variant was re-checked with **no** features.
+
+* 16 fail with `NOFP-EXCL-PRESENCE` or `NOFP-INVENTORY`: every witness that carries a user
+  program, plus the two CONTEXT1 builds.
+* 5 pass: timer-contract, the three IRQ witnesses and the oracle. Those features add no exclusion
+  and no exception, so the check is the same with or without them.
+
+*Live evidence is reused, not rerun:*
+
+* Executable and loadable bytes are unchanged: identical ELFs, and so identical loadable bytes.
+* All 32 kernel images staged by the KERNEL-NOFP1 live runs are byte-identical to a fresh
+  variant. Each passes the repaired checker with that variant's features.
+* Six further staged images do not match any variant. They are the deliberately mutated CONTEXT1
+  negative-control kernels, which are not qualified images.
+* The witness smoke scripts build their kernels outside the artifact gate (the OPEN item in
+  doc/SCHEDULING_CONTRACT.md §8.2). Their manifests therefore record `features=none` for witness
+  images. This sweep binds each image to its features through its bytes instead.
+
+*Failed candidates:* none were scheduled and failed. The revert controls ran on scratch copies,
+never committed.
+
 SCHED-LOCK1 remains OPEN and next; KTHREAD1 is not started; broad-lock retirement stays closed.
 
 ---

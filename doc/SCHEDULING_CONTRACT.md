@@ -1058,6 +1058,10 @@ The repairs:
   in Cargo.toml, and a malformed map table (unknown word, truncated record, malformed name,
   trailing bytes) fails.
 
+Qualified on `870d9126` (record in doc/KERNEL_UNLOCKING.md §0.8). The fresh default kernels and
+all 24 checked variants pass, and they are byte-identical to the KERNEL-NOFP1 images where one
+exists. No production byte changed.
+
 What this establishes is exact. For the decoded bytes, the disassembler's linear decoding has no
 FP/SIMD or FP-enable instruction outside an audited exception. The undecoded bytes are exactly the
 reviewed inventory's anchored ranges and the justified literal-pool words. It is **not** a proof
