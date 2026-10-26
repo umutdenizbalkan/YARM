@@ -41,6 +41,11 @@ pagefault1-demand-witness = ["yarm-user-rt/pagefault1-demand-witness"]
 # QEMU-BASELINE1 §3: runs the timer-contract witness in the supervisor. Default-off for the same
 # reason as the demand witness: it deliberately spends time in the path of the profile it is in.
 timer-contract-witness = ["yarm-user-rt/timer-contract-witness"]
+# BUILD-GATES1 §4: a labeled WITNESS, not production policy. The supervisor yields before its PM
+# lifecycle query so that init's calls to PM take and release the shared reply-record slot first,
+# and the query then runs on a REUSED record (a later generation). It exists to exercise the
+# AArch64 U9-RX4 grader on reuse live; default-off, and no other behaviour changes.
+u9rx4-reuse-witness = []
 # U9-FUTEX-WAIT-FINAL §4: gates the NR 9 NONBLOCKING-completion probe in the futex oracles.
 #
 # Same reason as `ipc-send-final-fault-witness`, measured the same way: init's address space runs
