@@ -26,6 +26,10 @@
 //! conserved, SC-CTX-4/5), and an exhausted thread kept a FIFO position while ineligible (now it
 //! holds none until a replenishment leaves it budget, SC-PRI-12f, SC-CTX-7/8). These remain model
 //! tests: they do not implement or qualify production RT scheduling.
+//!
+//! SCHED-OVERFLOW1 made the SC-CTX-5 debt overflow a LATCHED eligibility refusal. Two of its
+//! regressions assign `remaining`/`debt` directly and are named `…_constructed`: the counter
+//! horizon (more than 2^64 ticks of replenishment) cannot be traversed to reach those states.
 
 use yarm::kernel::ipc::ThreadId;
 use yarm::kernel::scheduler::{
@@ -282,6 +286,9 @@ mod model {
         QueueOnExhaustion,
         /// Debt accumulation wraps silently instead of saturating with a report.
         WrappingDebt,
+        /// The delivered SCHED-CONTRACT1-CORRECTION behaviour: the overflow is recorded, but
+        /// neither eligibility nor replenishment consults it.
+        IgnoreOverflowLatch,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,7 +473,9 @@ mod model {
         allowance_frame: Vec<Option<Tick>>,
         pub overrun: Vec<Tick>,
         pub essential_total: Vec<Tick>,
-        /// SC-CTX-5: per-context record that debt accumulation saturated.
+        /// SC-CTX-5: per-context LATCHED fault — debt accumulation saturated. While set, the
+        /// context is refused eligibility and is not replenished. Nothing in the model clears it:
+        /// clearing belongs to an explicit recovery owner that does not exist yet.
         pub debt_overflow: Vec<bool>,
         mutation: Option<Mutation>,
     }
@@ -531,7 +540,16 @@ mod model {
             (c.cpu, c.priority, c.partition)
         }
 
+        /// SC-CTX-5: the latched overflow refusal. Independent of `remaining` and `debt`.
+        pub fn overflow_latched(&self, t: usize) -> bool {
+            self.debt_overflow[t] && !self.mutated(Mutation::IgnoreOverflowLatch)
+        }
+
+        /// Budget eligibility: the context is not overflow-latched AND has budget left.
         pub fn budget_ok(&self, t: usize) -> bool {
+            if self.overflow_latched(t) {
+                return false;
+            }
             if self.mutated(Mutation::IgnoreBudget) {
                 return true;
             }
@@ -546,8 +564,8 @@ mod model {
                 || self.schedule.active_partition(cpu, self.now) == Some(self.ctx[t].partition)
         }
 
-        /// SC-SEP-1: the ONE eligibility predicate — affinity, partition window, budget and
-        /// readiness. Priority is consulted only among eligible threads, and criticality never.
+        /// SC-SEP-1: the ONE eligibility predicate — affinity, partition window, budget (including
+        /// the SC-CTX-5 overflow latch) and readiness. Priority is consulted only among eligible threads, and criticality never.
         pub fn eligible(&self, t: usize, cpu: usize) -> bool {
             self.ctx[t].cpu == cpu
                 && self.state[t] != State::Blocked
@@ -767,6 +785,17 @@ mod model {
                 if let Budget::Limited { budget, period } = self.ctx[t].budget
                     && self.now >= self.ctx[t].next_release
                 {
+                    if self.overflow_latched(t) {
+                        // SC-CTX-5: an overflowed context is neither repaid nor credited. Its
+                        // release instants still advance; the latch, the zero remaining budget
+                        // and the saturated debt stay until an explicit recovery owner acts.
+                        let c = &mut self.ctx[t];
+                        c.next_release = c
+                            .next_release
+                            .checked_add(period)
+                            .expect("release overflow");
+                        continue;
+                    }
                     let forgive = self.mutation == Some(Mutation::ForgiveDebtAtReplenish);
                     let no_debt = self.mutation == Some(Mutation::NoOverrunDebt);
                     let c = &mut self.ctx[t];
@@ -1373,6 +1402,134 @@ mod model {
             m.ctx[0].debt
         );
         ensure!(m.debt_overflow[0], "the saturation was not reported");
+        ensure!(!m.eligible(0, 0), "an overflowed context is eligible");
+        Ok(())
+    }
+
+    /// Overflow a context's debt the only way the model can: budget spent, then debt driven past
+    /// `Tick::MAX` by charges. Returns with the latch set.
+    fn overflow_ctx0(m: &mut Model) -> Result<(), String> {
+        m.charge(0, Tick::MAX);
+        m.charge(0, 10);
+        ensure!(
+            m.debt_overflow[0] && m.ctx[0].debt == Tick::MAX && m.ctx[0].remaining == 0,
+            "setup: overflow not latched (debt {}, remaining {})",
+            m.ctx[0].debt,
+            m.ctx[0].remaining
+        );
+        Ok(())
+    }
+
+    /// SC-CTX-5 (behavioural, reached ORGANICALLY): after a debt overflow the context stays
+    /// ineligible, with no queue position, through wake, ordinary replenishments, other threads'
+    /// yields and blocks, and window changes. Other contexts keep being scheduled.
+    pub fn check_overflow_latch_holds(mu: Option<Mutation>) -> Result<(), String> {
+        // Partition 0 owns [0,5), partition 1 owns [5,10) of a 10-tick frame.
+        let s = one_cpu(&[w(0, 0, 0, 5), w(0, 1, 5, 5)], 10, 2, mu);
+        let ctxs = [
+            (0, 0, 0, lim(3, 10)),  // the overflowed context: the highest priority
+            (0, 0, 5, lim(10, 10)), // an ordinary context in the same partition
+            (0, 1, 5, lim(10, 10)), // an ordinary context in the other partition
+        ];
+        let mut m = Model::new(s, &ctxs, 1, 0, mu);
+        overflow_ctx0(&mut m)?; // while Blocked
+        m.wake(0, 0);
+        m.wake(1, 0);
+        m.wake(2, 0);
+        let mut ran = [false; 3];
+        for step in 0..120u64 {
+            match step % 7 {
+                3 => m.yield_now(0),
+                5 => {
+                    let r = m.running[0];
+                    m.block(0);
+                    if let Some(t) = r {
+                        m.wake(t, 0);
+                    }
+                }
+                _ => m.tick(),
+            }
+            m.wake(0, 0); // a repeated wake of a Ready thread changes nothing
+            if let Some(t) = m.running[0] {
+                ran[t] = true;
+            }
+            ensure!(
+                m.running[0] != Some(0),
+                "t={} the overflowed context ran (remaining {}, debt {})",
+                m.now,
+                m.ctx[0].remaining,
+                m.ctx[0].debt
+            );
+            ensure!(
+                !m.eligible(0, 0),
+                "t={} the overflowed context is eligible",
+                m.now
+            );
+            ensure!(
+                m.debt_overflow[0],
+                "t={} the overflow latch was cleared",
+                m.now
+            );
+            membership(&m)?;
+        }
+        ensure!(
+            ran[1] && ran[2],
+            "other contexts were not scheduled: {ran:?}"
+        );
+        Ok(())
+    }
+
+    /// SC-CTX-5 (CONSTRUCTED state): the refusal is the latch, not the size of the debt. The
+    /// counter horizon cannot be traversed (repaying a saturated debt takes more than `Tick::MAX`
+    /// ticks of replenishment), so the test assigns `remaining` and `debt` directly, standing for
+    /// any path that would restore budget to an overflowed context: a repayment beyond the
+    /// horizon, a narrower counter, or a recovery the model does not have.
+    pub fn check_overflow_latch_refuses_restored_budget(
+        mu: Option<Mutation>,
+    ) -> Result<(), String> {
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let mut m = Model::new(s, &[(0, 0, 0, lim(3, 10))], 1, 0, mu);
+        overflow_ctx0(&mut m)?;
+        m.ctx[0].remaining = 3; // CONSTRUCTED
+        m.ctx[0].debt = 0; // CONSTRUCTED
+        m.wake(0, 0);
+        for _ in 0..25 {
+            ensure!(
+                m.running[0] != Some(0),
+                "t={} an overflowed context with restored budget ran",
+                m.now
+            );
+            ensure!(
+                !m.eligible(0, 0),
+                "t={} the overflowed context is eligible",
+                m.now
+            );
+            membership(&m)?;
+            m.tick();
+        }
+        Ok(())
+    }
+
+    /// SC-CTX-5 (CONSTRUCTED state): ordinary replenishment neither clears the latch nor credits
+    /// budget to an overflowed context. The debt is assigned 1, standing for the last period of a
+    /// repayment the counter horizon prevents the model from reaching.
+    pub fn check_overflow_latch_survives_replenishment(mu: Option<Mutation>) -> Result<(), String> {
+        let s = one_cpu(&[w(0, 0, 0, 100)], 100, 1, mu);
+        let mut m = Model::new(s, &[(0, 0, 0, lim(3, 10))], 1, 0, mu);
+        overflow_ctx0(&mut m)?;
+        m.ctx[0].debt = 1; // CONSTRUCTED
+        m.wake(0, 0);
+        for release in [10, 20, 30] {
+            advance(&mut m, release);
+            ensure!(
+                m.running[0] != Some(0) && m.ctx[0].remaining == 0,
+                "the replenishment at t={release} restored an overflowed context: running {:?}, remaining {}",
+                m.running[0],
+                m.ctx[0].remaining
+            );
+            ensure!(m.debt_overflow[0], "t={release}: the latch was cleared");
+            membership(&m)?;
+        }
         Ok(())
     }
 
@@ -1544,6 +1701,21 @@ mod model {
     }
 
     #[test]
+    fn model_overflow_latch_holds_across_scheduling_events() {
+        check_overflow_latch_holds(None).unwrap();
+    }
+
+    #[test]
+    fn model_overflow_latch_refuses_restored_budget_constructed() {
+        check_overflow_latch_refuses_restored_budget(None).unwrap();
+    }
+
+    #[test]
+    fn model_overflow_latch_survives_replenishment_constructed() {
+        check_overflow_latch_survives_replenishment(None).unwrap();
+    }
+
+    #[test]
     fn model_exhausted_thread_rejoins_the_tail_only_at_replenishment() {
         check_exhausted_rejoins_tail(None).unwrap();
     }
@@ -1594,6 +1766,15 @@ mod model {
             check_simultaneous_replenishments,
         ),
         ("membership_soak", check_membership_soak),
+        ("overflow_latch_holds", check_overflow_latch_holds),
+        (
+            "overflow_latch_restored_budget",
+            check_overflow_latch_refuses_restored_budget,
+        ),
+        (
+            "overflow_latch_replenishment",
+            check_overflow_latch_survives_replenishment,
+        ),
     ];
 
     #[test]
@@ -1674,6 +1855,13 @@ mod model {
                 &["debt_conservation", "debt_cases"],
             ),
             (M::WrappingDebt, &["debt_overflow"]),
+            (
+                M::IgnoreOverflowLatch,
+                &[
+                    "overflow_latch_restored_budget",
+                    "overflow_latch_replenishment",
+                ],
+            ),
             (
                 M::QueueOnExhaustion,
                 &[

@@ -766,6 +766,31 @@ restriction to `KERNEL_LOCKING.md`'s rank table. Details are in contract §8.1, 
   * **unresolved:** SC-FP-5, the KERNEL-NOFP1 mechanism and its cost, plus the earlier UNRESOLVED
     items in contract §14.
 
+#### SCHED-OVERFLOW1 (from delivered `04b94fc0`)
+
+Model, tests and documentation only. SC-CTX-5's debt overflow is now a **latched eligibility
+refusal**:
+
+* eligibility refuses a latched context regardless of its `remaining` and `debt`;
+* replenishment neither repays nor credits it;
+* wake, yield, block and window changes cannot clear it;
+* nothing clears it until an explicit recovery owner exists (PARTITION1).
+
+The exact numeric excess lost by saturation is documented, and the latch keeps that loss from
+becoming budget.
+
+**Evidence on the unmodified model.** It is a source finding, made precise:
+
+* An organically overflowed context stayed ineligible, but only because the 64-bit counter
+  horizon makes its repayment unreachable. A scratch experiment at the largest admissible budget
+  hit `release overflow` before any repayment finished.
+* Two constructed-state regressions failed: a restored budget ran the context, and a
+  replenishment credited it.
+* The in-test mutation `IgnoreOverflowLatch` and three source revert controls (eligibility
+  only, replenishment only, both) each fail the intended regressions.
+
+Contract §15 has the record.
+
 ---
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION

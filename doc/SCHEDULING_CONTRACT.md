@@ -1,6 +1,7 @@
 # YARM Scheduling Contract
 
-**Package:** SCHED-CONTRACT1, corrected by SCHED-CONTRACT1-CORRECTION (§13). **Baseline:** commit
+**Package:** SCHED-CONTRACT1, corrected by SCHED-CONTRACT1-CORRECTION (§13), with the overflow
+latch closed by SCHED-OVERFLOW1 (§15). **Baseline:** commit
 `635374140c59586b11ce1d3456fb77dffe1b059f` (tree `127827ce276d1a7038f61690e1a96141c40f5d2d`); the
 correction changes no production source. **Linked from:** `doc/KERNEL_UNLOCKING.md` §0.8.
 
@@ -450,8 +451,31 @@ The first real-time profile is the **smallest analysable configuration**:
     `model_overrun_debt_is_repaid_at_replenishment`.
   * Debt accumulation uses checked arithmetic. It **never wraps and is never forgiven**. At the
     limit it saturates at `Tick::MAX` and is **reported** as a `DebtOverflow` health event for
-    that context. A saturated context stays ineligible until the recovery policy acts. M
-    `model_debt_overflow_saturates_and_is_reported`.
+    that context. M `model_debt_overflow_saturates_and_is_reported`.
+  * **The overflow is a latched eligibility refusal** (SCHED-OVERFLOW1). Saturation sets a
+    per-context fault latch.
+    * While the latch is set, the eligibility predicate refuses the context **independently of
+      its `remaining` and `debt` values**. It holds no queue position (SC-CTX-8).
+    * Ordinary replenishment neither repays nor credits a latched context. Its release instants
+      advance, but `remaining` stays 0.
+    * Wake, yield, block, window changes and other contexts' scheduling never clear or bypass
+      the latch.
+    * Only an explicit recovery owner may clear it, and none exists yet. Until one is specified
+      (PARTITION1's health monitor), a latched context stays ineligible for good.
+  * **Saturation loses the exact numeric excess.** The debt reads `Tick::MAX`, and the amount
+    beyond it is unknown. The latch is what stops that loss from becoming usable budget: the
+    context cannot run on the saturated value, nor on any later value of its counters.
+  * The refusal does not rely on the counter horizon. In the 64-bit model, repaying a saturated
+    debt needs more than 2^64 ticks of replenishment, and the model's own time overflows first.
+    That incidental bound would not survive a narrower counter or a recovery path, so the
+    contract states the latch explicitly.
+  * M:
+    * `model_overflow_latch_holds_across_scheduling_events` (reached organically);
+    * `model_overflow_latch_refuses_restored_budget_constructed`;
+    * `model_overflow_latch_survives_replenishment_constructed`.
+
+    The last two set `remaining` and `debt` directly, and are labelled as constructed state
+    (§15).
   * Recovery policy is configuration (PARTITION1's health monitor). It is selected per context
     and never inferred from priority.
 * **SC-CTX-6 — Enforcement granularity.** **UNRESOLVED.**
@@ -862,12 +886,15 @@ never by adding an alternative dispatcher selected by profile.
 | `model::model_debt_beyond_one_replenishment_is_conserved` | M | SC-CTX-4 |
 | `model::model_debt_repayment_cases_and_no_budget_accumulation` | M | SC-CTX-4 |
 | `model::model_debt_overflow_saturates_and_is_reported` | M | SC-CTX-5 |
+| `model::model_overflow_latch_holds_across_scheduling_events` | M | SC-CTX-5 latch: organic overflow, then wake, replenishment, yield, block and window changes |
+| `model::model_overflow_latch_refuses_restored_budget_constructed` | M (constructed state) | SC-CTX-5 latch: refusal independent of `remaining`/`debt` |
+| `model::model_overflow_latch_survives_replenishment_constructed` | M (constructed state) | SC-CTX-5 latch: replenishment neither repays nor credits |
 | `model::model_exhausted_thread_rejoins_the_tail_only_at_replenishment` | M | SC-PRI-12f |
 | `model::model_debt_consumed_replenishment_grants_no_position` | M | SC-PRI-12f, SC-CTX-4, SC-CTX-8 |
 | `model::model_wake_while_exhausted_takes_no_position` | M | SC-PRI-12c/d/f, SC-CTX-8 |
 | `model::model_simultaneous_replenishments_rejoin_in_context_order` | M | SC-CTX-7 |
 | `model::model_queue_membership_has_no_duplicates_or_stale_positions` | M | SC-CTX-8 |
-| `model::every_mutation_is_killed_by_its_targeted_check` | M (mutation) | the model predicates above, now including `ForgiveDebtAtReplenish`, `QueueOnExhaustion` and `WrappingDebt` |
+| `model::every_mutation_is_killed_by_its_targeted_check` | M (mutation) | the model predicates above, now including `ForgiveDebtAtReplenish`, `QueueOnExhaustion`, `WrappingDebt` and `IgnoreOverflowLatch` |
 
 **Mutation checks (§5 of the package brief).**
 
@@ -1103,3 +1130,51 @@ do not implement or qualify production RT scheduling, which remains SPECIFIED �
   * SC-TIME-3, SC-TIME-4, SC-TIME-6;
   * SC-KT-6;
   * SC-FP-5.
+
+---
+
+## 15. Correction record: SCHED-OVERFLOW1
+
+**Source finding.** In the model delivered at `04b94fc0`, SC-CTX-5 said an overflowed context
+stays ineligible until recovery. The model **recorded** `debt_overflow`, but neither eligibility
+nor replenishment consulted it. Its test checked saturation and the report only.
+
+**What was executed on the unmodified model** (the three new regressions added, the model
+unchanged; 0 lines removed):
+
+| Test | Result on `04b94fc0`'s model | What it shows |
+|---|---|---|
+| `model_overflow_latch_holds_across_scheduling_events` (organic) | **passes** | organically overflowed, the context stayed ineligible — but only because its `remaining` stays 0 |
+| `model_overflow_latch_refuses_restored_budget_constructed` | **fails**: "t=0 an overflowed context with restored budget ran" | eligibility ignores the overflow record |
+| `model_overflow_latch_survives_replenishment_constructed` | **fails**: "the replenishment at t=10 restored an overflowed context: running Some(0), remaining 2" | replenishment repays and credits an overflowed context |
+
+A scratch horizon experiment, not delivered, used the largest budget the model admits
+(B = P = 2^63) and jumped time directly to just before each release. Its first replenishment
+reached `release overflow`: the model's own time ended before any repayment of a saturated debt
+could finish.
+
+**Conclusion.** No *organically reached* overflowed context was observed to resume. The 64-bit
+horizon makes that unreachable in this model. The defect is that ineligibility was **incidental
+to the debt's magnitude** rather than enforced. The two constructed tests show that any restored
+budget — from a narrower counter, a repayment past the horizon, or a recovery path — would have
+run the context.
+
+**Repair.**
+
+* `overflow_latched(t)` is consulted by the budget-eligibility predicate before `remaining`.
+* Replenishment skips a latched context; only its release instant advances.
+* Nothing in the model clears the latch.
+* The in-test mutation `IgnoreOverflowLatch` restores the delivered behaviour. It is killed by
+  both constructed tests.
+
+**Independent revert controls** (frozen tests, model source reverted one part at a time):
+
+| Revert | Result | Failing |
+|---|---|---|
+| eligibility refusal only | 29/2 | `…refuses_restored_budget_constructed` ("ran"), mutation self-check |
+| replenishment freeze only | 29/2 | `…survives_replenishment_constructed` ("remaining 2", context *not* running because the eligibility latch still refuses), mutation self-check |
+| both | 28/3 | both constructed tests, mutation self-check |
+
+**Unchanged.** Debt conservation, FIFO and exhausted-set membership, same-instant ordering, and
+the production general-purpose differential are untouched, and every earlier test passes. These
+remain **model tests**: SC-CTX-5 stays SPECIFIED → RT-SCHED1, with recovery owned by PARTITION1.
