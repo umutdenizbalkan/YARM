@@ -353,6 +353,10 @@ artifact_required=()
 if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
   artifact_required+=("initramfs:timer-contract-witness")
 fi
+# BUILD-GATES1: a runner that built its own kernel names the features it built it with
+# (`ARTIFACT_REQUIRE="kernel=<features>"`); provenance itself is checked in every mode.
+# shellcheck disable=SC2206
+artifact_required+=(${ARTIFACT_REQUIRE:-})
 artifact_binding_check x86_64 "$QEMU_SMOKE_STRICT" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" "${artifact_required[@]}" || exit 1
 
 # ---------------------------------------------------------------------------

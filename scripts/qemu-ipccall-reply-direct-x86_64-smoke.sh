@@ -60,14 +60,13 @@ BOOTSTRAP_FEATURE_ARGS="${ORACLE_SERVER_FEATURE_ARGS:---no-default-features}" \
 # ── 2. Overlay: rebuild kernel_boot WITH the ipccall-direct-oracle feature ──
 if (( ! fail )); then
   note "rebuilding kernel_boot with --features $FEATURE"
-  cargo build -Z "build-std=${BUILD_STD}" -Z json-target-spec \
-    --target "$KTARGET" --profile "$KPROFILE" \
-    --no-default-features --features "$FEATURE" \
-    -p yarm --bin kernel_boot >"$LOGDIR/kbuild.log" 2>&1 \
+  # BUILD-GATES1: build and publish the feature kernel (no-FP checked, recorded) in one step.
+  source scripts/lib/artifact-binding.sh
+  artifact_build_kernel x86_64 "--no-default-features --features $FEATURE" build-x86_64/kernel_boot.elf \
+    >"$LOGDIR/kbuild.log" 2>&1 \
     || die "feature kernel_boot build failed (see $LOGDIR/kbuild.log)"
 fi
 if (( ! fail )); then
-  cp "$KELF" build-x86_64/kernel_boot.elf
   # Artifact integrity: the feature kernel MUST carry BOTH direct class literals.
   if ! rg -a -q "class=IpcCallDirectRequest" build-x86_64/kernel_boot.elf; then
     die "feature kernel missing IpcCallDirectRequest literal (wrong build)"
@@ -100,6 +99,7 @@ fi
 note "booting QEMU -smp 1 with yarm.x86_64_ipccall_direct_oracle=1"
 env \
   KERNEL_IMAGE=build-x86_64/kernel_boot.elf \
+  ARTIFACT_REQUIRE="kernel=$FEATURE" \
   INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
   KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.x86_64_ipccall_direct_oracle=1" \
   QEMU_SMP=1 \

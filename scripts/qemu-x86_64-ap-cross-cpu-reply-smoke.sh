@@ -38,13 +38,12 @@ BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
   || die "base artifact build failed (see $LOGDIR/build.log)"
 if (( ! fail )); then
   note "rebuilding kernel_boot with --features $FEATURE"
-  cargo build -Z "build-std=${BUILD_STD}" -Z json-target-spec \
-    --target "$KTARGET" --profile "$KPROFILE" \
-    --no-default-features --features "$FEATURE" \
-    -p yarm --bin kernel_boot >"$LOGDIR/kbuild.log" 2>&1 \
+  # BUILD-GATES1: build and publish the feature kernel (no-FP checked, recorded) in one step.
+  source scripts/lib/artifact-binding.sh
+  artifact_build_kernel x86_64 "--no-default-features --features $FEATURE" build-x86_64/kernel_boot.elf \
+    >"$LOGDIR/kbuild.log" 2>&1 \
     || die "feature kernel_boot build failed (see $LOGDIR/kbuild.log)"
 fi
-if (( ! fail )); then cp "$KELF" build-x86_64/kernel_boot.elf; fi
 if (( fail )); then echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=build"; exit 1; fi
 fi
 
@@ -58,6 +57,13 @@ if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
   die "qemu-system-x86_64 not installed"
   echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=no_qemu"; exit 1
 fi
+# BUILD-GATES1: boot only the recorded, no-FP-checked artifacts this run expects (refuses before
+# QEMU on a missing record, a replaced or cached image from other source, failed check or features).
+source scripts/lib/artifact-binding.sh
+artifact_boot_guard x86_64 build-x86_64/kernel_boot.elf build-x86_64/initramfs-core.cpio "kernel=$FEATURE" "initramfs=none" >"$LOGDIR/artifact-binding.txt" 2>&1
+_ab_rc=$?
+cat "$LOGDIR/artifact-binding.txt"
+(( _ab_rc == 0 )) || { echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=artifact_binding"; exit 1; }
 
 QEMU_ARGV=(
   qemu-system-x86_64

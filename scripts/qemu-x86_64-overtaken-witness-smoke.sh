@@ -28,16 +28,22 @@ if [[ "${REGRADE:-0}" != "1" ]]; then
   OUT_DIR="$BUILD_DIR" BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
     scripts/build-qemu-x86_64-artifacts.sh >"$LOGDIR/build.log" 2>&1 || seal_fail build
   echo "[overtaken-witness] building kernel_boot with --features $FEATURE"
-  cargo build -Z "build-std=$BUILD_STD" -Z json-target-spec --target "$KTARGET" \
-    --profile "$KPROFILE" --no-default-features --features "$FEATURE" \
-    -p yarm --bin kernel_boot >"$LOGDIR/kbuild.log" 2>&1 || seal_fail kernel_build
-  cp "target/x86_64-yarm-none/$KPROFILE/kernel_boot" "$BUILD_DIR/kernel_boot.elf" || seal_fail copy
+  source scripts/lib/artifact-binding.sh
+  artifact_build_kernel x86_64 "--no-default-features --features $FEATURE" \
+    "$BUILD_DIR/kernel_boot.elf" >"$LOGDIR/kbuild.log" 2>&1 || seal_fail kernel_build
   {
     echo "tree=$(git rev-parse HEAD^{tree} 2>/dev/null) head=$(git rev-parse HEAD 2>/dev/null) dirty=$(git status --porcelain | wc -l) features=$FEATURE cmdline=$CMDLINE"
     echo "qemu=$(qemu-system-x86_64 --version | head -1) machine=q35 cpu=qemu64 smp=2"
     sha256sum "$BUILD_DIR/kernel_boot.elf" "$BUILD_DIR/initramfs-core.cpio"
   } >"$LOGDIR/artifact-identity.txt"
 
+  # BUILD-GATES1: boot only the recorded, no-FP-checked artifacts this run expects (refuses before
+  # QEMU on a missing record, a replaced or cached image from other source, failed check or features).
+  source scripts/lib/artifact-binding.sh
+  artifact_boot_guard x86_64 "$BUILD_DIR/kernel_boot.elf" "$BUILD_DIR/initramfs-core.cpio" "kernel=$FEATURE" "initramfs=none" >"$LOGDIR/artifact-binding.txt" 2>&1
+  _ab_rc=$?
+  cat "$LOGDIR/artifact-binding.txt"
+  (( _ab_rc == 0 )) || seal_fail artifact_binding
   source scripts/lib/qemu-x86-deterministic.sh
   QEMU_ARGV=(
     qemu-system-x86_64 -machine q35 -cpu qemu64 -m 512M -smp 2

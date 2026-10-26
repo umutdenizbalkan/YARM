@@ -203,7 +203,10 @@ require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 # riscv64 core run, but a strict run still refuses a kernel or initramfs its manifest does not record.
 # shellcheck source=lib/artifact-binding.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/artifact-binding.sh"
-artifact_binding_check riscv64 "$QEMU_SMOKE_STRICT" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" || exit 1
+# BUILD-GATES1: provenance is checked in every mode; a runner that built its own kernel names the
+# features it built it with (`ARTIFACT_REQUIRE="kernel=<features>"`).
+# shellcheck disable=SC2086
+artifact_binding_check riscv64 "$QEMU_SMOKE_STRICT" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" ${ARTIFACT_REQUIRE:-} || exit 1
 
 LOGFILE=${LOGFILE:-qemu-riscv64-core.log}
 rm -f "$LOGFILE"

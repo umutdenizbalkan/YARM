@@ -41,6 +41,13 @@ if [[ "${SKIP_BUILD:-0}" != "1" && "${REGRADE:-0}" != "1" ]]; then
 fi
 
 if [[ "${REGRADE:-0}" != "1" ]]; then
+  # BUILD-GATES1: boot only the recorded, no-FP-checked artifacts this run expects (refuses before
+  # QEMU on a missing record, a replaced or cached image from other source, failed check or features).
+  source scripts/lib/artifact-binding.sh
+  artifact_boot_guard aarch64 "$BUILD_DIR/yarm-aarch64.bin" "$BUILD_DIR/initramfs-core.cpio" "kernel=$FEATURES" "initramfs=$FEATURES" >"$LOGDIR/artifact-binding.txt" 2>&1
+  _ab_rc=$?
+  cat "$LOGDIR/artifact-binding.txt"
+  (( _ab_rc == 0 )) || { echo "LOCK2_WITNESS_SEAL result=fail reason=artifact_binding"; exit 1; }
   echo "[lock2-witness] booting -smp 2 yarm.ap_user_dispatch=1"
   python3 - "$QEMU_BIN" "$BUILD_DIR" "$BOOT_LOG" "${TIMEOUT_SECS:-240}" "$CMDLINE" <<'PY'
 import subprocess, sys, time, os, select

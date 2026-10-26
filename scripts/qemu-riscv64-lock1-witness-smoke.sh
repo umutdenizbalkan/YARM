@@ -22,7 +22,6 @@ mkdir -p "$LOGDIR"
 BUILD_DIR="$LOGDIR/build"
 BOOT_LOG="$LOGDIR/boot.log"
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
-KELF=target/riscv64gc-unknown-none-elf/release/kernel_boot
 PIN=scripts/firmware/riscv64-opensbi.pin
 pin() { sed -n "s/^$1=//p" "$PIN"; }
 FIRMWARE=${FIRMWARE:-$(pin path)}
@@ -34,18 +33,17 @@ if [[ "${SKIP_BUILD:-0}" != "1" && "${REGRADE:-0}" != "1" ]]; then
   OUT_DIR="$BUILD_DIR" BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
     scripts/build-qemu-riscv64-artifacts.sh >"$LOGDIR/build.log" 2>&1 \
     || { echo "LOCK1_WITNESS_SEAL result=fail reason=base_build"; exit 1; }
-  cargo build -Z build-std=core,alloc,compiler_builtins,panic_abort \
-    --target riscv64gc-unknown-none-elf --profile release \
-    --no-default-features --features riscv64-lock1-witness -p yarm --bin kernel_boot \
+  # The kernel with the witness feature, published as ELF + raw image with its no-FP check and
+  # provenance (BUILD-GATES1).
+  source scripts/lib/artifact-binding.sh
+  artifact_build_kernel riscv64 "--no-default-features --features riscv64-lock1-witness" \
+    "$BUILD_DIR/yarm-riscv64-lock1.elf" "$BUILD_DIR/yarm-riscv64-lock1.bin" \
     >"$LOGDIR/kbuild.log" 2>&1 || { echo "LOCK1_WITNESS_SEAL result=fail reason=kernel_build"; exit 1; }
   [[ -f "$FIRMWARE" ]] || { echo "LOCK1_WITNESS_SEAL result=fail reason=firmware_missing path=$FIRMWARE"; exit 1; }
   FW_SHA=$(sha256sum "$FIRMWARE" | cut -d' ' -f1)
   [[ "$FW_SHA" == "$(pin sha256)" ]] \
     || { echo "LOCK1_WITNESS_SEAL result=fail reason=firmware_substituted sha256=$FW_SHA pinned=$(pin sha256)"; exit 1; }
   cp "$FIRMWARE" "$BOOT_FW"
-  cp "$KELF" "$BUILD_DIR/yarm-riscv64-lock1.elf"
-  llvm-objcopy -O binary "$KELF" "$BUILD_DIR/yarm-riscv64-lock1.bin" \
-    || { echo "LOCK1_WITNESS_SEAL result=fail reason=objcopy"; exit 1; }
   {
     echo "tree=$(git rev-parse HEAD^{tree} 2>/dev/null) head=$(git rev-parse HEAD 2>/dev/null) dirty=$(git status --porcelain | wc -l) features=riscv64-lock1-witness"
     echo "qemu=$($QEMU_BIN --version | head -n1) machine=virt cpu=rv64 smp=2 cmdline=console=ttyS0 rdinit=/init yarm.ap_user_dispatch=1"
@@ -58,6 +56,13 @@ if [[ "${SKIP_BUILD:-0}" != "1" && "${REGRADE:-0}" != "1" ]]; then
 fi
 
 if [[ "${REGRADE:-0}" != "1" ]]; then
+  # BUILD-GATES1: boot only the recorded, no-FP-checked artifacts this run expects (refuses before
+  # QEMU on a missing record, a replaced or cached image from other source, failed check or features).
+  source scripts/lib/artifact-binding.sh
+  artifact_boot_guard riscv64 "$BUILD_DIR/yarm-riscv64-lock1.bin" "$BUILD_DIR/initramfs-core.cpio" "kernel=riscv64-lock1-witness" "initramfs=none" >"$LOGDIR/artifact-binding.txt" 2>&1
+  _ab_rc=$?
+  cat "$LOGDIR/artifact-binding.txt"
+  (( _ab_rc == 0 )) || { echo "LOCK1_WITNESS_SEAL result=fail reason=artifact_binding"; exit 1; }
   echo "[lock1-witness] booting -smp 2 yarm.ap_user_dispatch=1"
   python3 - "$QEMU_BIN" "$BUILD_DIR" "$BOOT_LOG" "${TIMEOUT_SECS:-300}" <<'PY'
 import subprocess, sys, time, os, select

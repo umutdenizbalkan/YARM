@@ -137,7 +137,7 @@ def nofp_from_report(report):
     field = lambda k: (re.search(rf"\b{k}=(\S+)", line) or [None, ""])[1]
     return dict(nofp_result=field("result"), nofp_image_sha256=field("image_sha256"),
                 nofp_obligations=field("obligations"), nofp_line=line,
-                nofp_report=os.path.abspath(report), nofp_report_sha256=sha256(report))
+                nofp_report=report, nofp_report_sha256=sha256(report))
 
 
 def common(arch, role, feature_args, target, profile, built_by):
@@ -155,19 +155,22 @@ def cmd_record_kernel(a):
     if nofp["nofp_image_sha256"] != elf_sha:
         raise SystemExit(f"[provenance] the no-FP report checked {nofp['nofp_image_sha256']}, "
                          f"not this ELF {elf_sha}")
-    elf_rec = dict(base, artifact=os.path.abspath(a.elf), format="elf", sha256=elf_sha,
-                   elf=os.path.abspath(a.elf), elf_sha256=elf_sha, **nofp)
+    rel = lambda p, art: os.path.relpath(os.path.abspath(p), os.path.dirname(os.path.abspath(art)))
+    elf_rec = dict(base, artifact=os.path.basename(a.elf), format="elf", sha256=elf_sha,
+                   elf=rel(a.elf, a.elf), elf_sha256=elf_sha, **nofp)
+    elf_rec["nofp_report"] = rel(a.nofp_report, a.elf)
     write_record(a.elf, elf_rec)
     if a.boot:
-        boot_rec = dict(elf_rec, artifact=os.path.abspath(a.boot), format="raw",
-                        sha256=sha256(a.boot))
+        boot_rec = dict(elf_rec, artifact=os.path.basename(a.boot), format="raw",
+                        sha256=sha256(a.boot), elf=rel(a.elf, a.boot),
+                        nofp_report=rel(a.nofp_report, a.boot))
         write_record(a.boot, boot_rec)
     return 0
 
 
 def cmd_record_initramfs(a):
     rec = common(a.arch, "initramfs", a.feature_args, a.target, a.profile, a.built_by)
-    rec.update(artifact=os.path.abspath(a.cpio), format="cpio", sha256=sha256(a.cpio))
+    rec.update(artifact=os.path.basename(a.cpio), format="cpio", sha256=sha256(a.cpio))
     write_record(a.cpio, rec)
     return 0
 
@@ -203,17 +206,19 @@ def verify(arch, kernel, initramfs, requires):
             problems.append(f"{role} {path} was built from source {rec.get('source_state')}, the "
                             f"checkout is {now}: a cached artifact from another source")
         if role == "kernel":
-            elf = rec.get("elf", "")
+            here = os.path.dirname(os.path.abspath(path))
+            elf = os.path.join(here, rec.get("elf", "")) if rec.get("elf") else ""
             if rec.get("nofp_result") != "pass":
                 problems.append(f"kernel {path} has no passing no-FP check "
                                 f"(nofp_result={rec.get('nofp_result') or 'missing'})")
             elif not os.path.isfile(elf) or sha256(elf) != rec.get("elf_sha256"):
-                problems.append(f"kernel ELF {elf or '?'} the no-FP check judged is missing or changed")
+                problems.append(f"kernel ELF {elf or '?'} the no-FP check judged is missing or "
+                                f"changed")
             elif rec.get("nofp_image_sha256") != rec.get("elf_sha256"):
                 problems.append(f"the recorded no-FP check judged {rec.get('nofp_image_sha256')}, "
                                 f"not this kernel's ELF {rec.get('elf_sha256')}")
             else:
-                rpt = rec.get("nofp_report", "")
+                rpt = os.path.join(here, rec["nofp_report"]) if rec.get("nofp_report") else ""
                 if not os.path.isfile(rpt) or sha256(rpt) != rec.get("nofp_report_sha256"):
                     problems.append(f"the no-FP report {rpt or '?'} is missing or changed")
                 elif rec.get("nofp_line", "") not in open(rpt).read():

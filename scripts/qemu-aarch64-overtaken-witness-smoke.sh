@@ -28,6 +28,13 @@ if [[ "${REGRADE:-0}" != "1" ]]; then
     sha256sum "$BUILD_DIR/yarm-aarch64.bin" "$BUILD_DIR/initramfs-core.cpio"
   } >"$LOGDIR/artifact-identity.txt"
 
+  # BUILD-GATES1: boot only the recorded, no-FP-checked artifacts this run expects (refuses before
+  # QEMU on a missing record, a replaced or cached image from other source, failed check or features).
+  source scripts/lib/artifact-binding.sh
+  artifact_boot_guard aarch64 "$BUILD_DIR/yarm-aarch64.bin" "$BUILD_DIR/initramfs-core.cpio" "kernel=aarch64-overtaken-witness" "initramfs=aarch64-overtaken-witness" >"$LOGDIR/artifact-binding.txt" 2>&1
+  _ab_rc=$?
+  cat "$LOGDIR/artifact-binding.txt"
+  (( _ab_rc == 0 )) || { echo "OVT_WITNESS_SEAL arch=aarch64 result=fail reason=artifact_binding"; exit 1; }
   echo "[overtaken-witness] booting -smp 2 $CMDLINE"
   python3 - "$QEMU_BIN" "$BUILD_DIR" "$BOOT_LOG" "${TIMEOUT_SECS:-240}" "$CMDLINE" <<'PY'
 import subprocess, sys, time, os, select, re

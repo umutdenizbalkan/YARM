@@ -70,6 +70,12 @@ artifact_publish_kernel() {
   profile="${ARTIFACT_KERNEL_PROFILE:-$profile}"
   by="${ARTIFACT_BUILT_BY:-$(basename "$0")}"
   _ab_invalidate "$out_elf" "$out_boot"
+  feats="$(_ab_py features --feature-args="$fargs" | sed -n 's/.* features=//p')" || feats=""
+  if [[ -z "$feats" ]]; then
+    echo "[error] ARTIFACT-PUBLISH: cannot read the feature arguments '$fargs'"
+    return 1
+  fi
+  if [[ "$feats" == "none" ]]; then feats=""; fi
   if [[ ! -s "$linked" ]]; then
     echo "[error] ARTIFACT-PUBLISH: the linked kernel $linked does not exist"
     return 1
@@ -88,8 +94,6 @@ artifact_publish_kernel() {
       return 1
     fi
   fi
-  feats="$(_ab_py features --feature-args="$fargs" | sed -n 's/.* features=//p')"
-  if [[ "$feats" == "none" ]]; then feats=""; fi
   if ! "$repo/scripts/check-kernel-nofp.sh" "$arch" "$stage_elf" "$feats" ${stage_boot:+"$stage_boot"} >"$report" 2>&1; then
     cat "$report"
     echo "[error][integrity] KERNEL-NOFP1: the $arch kernel failed the final-image FP/SIMD check; nothing was published"

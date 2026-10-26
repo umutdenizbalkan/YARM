@@ -53,13 +53,11 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   OUT_DIR="$BUILD_DIR" BOOTSTRAP_FEATURE_ARGS="--no-default-features" \
     scripts/build-qemu-x86_64-artifacts.sh >"$LOGDIR/build.log" 2>&1 \
     || { seal "result=fail reason=base_build"; exit 1; }
-  # The feature is the kernel's alone (the servers carry no witness code): rebuild only the kernel.
-  cargo build -Z build-std=core,alloc,compiler_builtins,panic_abort -Z json-target-spec \
-    --target "$KTARGET" --profile "$KPROFILE" \
-    --no-default-features --features "$FEATURE" -p yarm --bin kernel_boot \
+  # The feature is the kernel's alone (the servers carry no witness code): rebuild only the kernel,
+  # published with its no-FP check and provenance (BUILD-GATES1).
+  source scripts/lib/artifact-binding.sh
+  artifact_build_kernel x86_64 "--no-default-features --features $FEATURE" "$BUILD_DIR/kernel_boot.elf" \
     >"$LOGDIR/kbuild.log" 2>&1 || { seal "result=fail reason=kernel_build"; exit 1; }
-  cp "target/x86_64-yarm-none/$KPROFILE/kernel_boot" "$BUILD_DIR/kernel_boot.elf" \
-    || { seal "result=fail reason=copy"; exit 1; }
   {
     echo "tree=$(git rev-parse HEAD^{tree} 2>/dev/null) head=$(git rev-parse HEAD 2>/dev/null) dirty=$(git status --porcelain | wc -l) kernel_features=--no-default-features --features $FEATURE"
     echo "qemu=$($QEMU_BIN --version | head -n1) machine=q35 cpu=qemu64 m=512M"
@@ -67,6 +65,13 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   } >"$LOGDIR/artifact-identity.txt"
 fi
 [[ -s "$BUILD_DIR/kernel_boot.elf" && -s "$BUILD_DIR/initramfs-core.cpio" ]] || { seal "result=fail reason=no_artifacts"; exit 1; }
+# BUILD-GATES1: boot only the recorded, no-FP-checked artifacts this run expects (refuses before
+# QEMU on a missing record, a replaced or cached image from other source, failed check or features).
+source scripts/lib/artifact-binding.sh
+artifact_boot_guard x86_64 "$BUILD_DIR/kernel_boot.elf" "$BUILD_DIR/initramfs-core.cpio" "kernel=$FEATURE" "initramfs=none" >"$LOGDIR/artifact-binding.txt" 2>&1
+_ab_rc=$?
+cat "$LOGDIR/artifact-binding.txt"
+(( _ab_rc == 0 )) || { seal "result=fail reason=artifact_binding"; exit 1; }
 
 echo "boot smp=$SMP_ARG append=$APPEND" >>"$LOGDIR/artifact-identity.txt"
 echo "[apsched-witness] booting -smp $SMP_ARG with no diagnostic knob"

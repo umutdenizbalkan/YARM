@@ -56,7 +56,8 @@ if [[ "${SKIP_BUILD:-0}" != "1" && "${REGRADE:-0}" != "1" ]]; then
   OUT_DIR="$BUILD_DIR" BOOTSTRAP_FEATURE_ARGS="--no-default-features --features aarch64-pl011-irq-witness" \
     scripts/build-qemu-aarch64-artifacts.sh >"$LOGDIR/build.log" 2>&1 \
     || { echo "PL011_IRQ_WITNESS_SEAL result=fail reason=build"; exit 1; }
-  cp "$(ls target/aarch64-yarm-none/*/kernel_boot | head -1)" "$KELF_COPY"
+  # The analysis copy is the published ELF the raw image was converted from (BUILD-GATES1).
+  cp "$BUILD_DIR/yarm-aarch64.elf" "$KELF_COPY"
   cp "$(ls target/aarch64-yarm-user-none/*/init_server | head -1)" "$UELF_COPY"
 fi
 
@@ -65,6 +66,13 @@ if [[ "${REGRADE:-0}" == "1" ]]; then
   driver_status=$(grep -a -o '#HOST_SUMMARY .* status=[0-9]*' "$BOOT_LOG" | sed 's/.*status=//' | tail -1)
   driver_status=${driver_status:-9}
 else
+  # BUILD-GATES1: boot only the recorded, no-FP-checked artifacts this run expects (refuses before
+  # QEMU on a missing record, a replaced or cached image from other source, failed check or features).
+  source scripts/lib/artifact-binding.sh
+  artifact_boot_guard aarch64 "$BUILD_DIR/yarm-aarch64.bin" "$BUILD_DIR/initramfs-core.cpio" "kernel=aarch64-pl011-irq-witness" "initramfs=aarch64-pl011-irq-witness" >"$LOGDIR/artifact-binding.txt" 2>&1
+  _ab_rc=$?
+  cat "$LOGDIR/artifact-binding.txt"
+  (( _ab_rc == 0 )) || { echo "PL011_IRQ_WITNESS_SEAL result=fail reason=artifact_binding"; exit 1; }
   note "booting (dedicated socket serial, host injection on READY)"
   # shellcheck disable=SC2086
   python3 scripts/qemu-riscv64-uart-irq-driver.py --arch aarch64 \
