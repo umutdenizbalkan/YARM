@@ -136,8 +136,19 @@ mkdir -p "$d/norpt"; cp "$d/plain/"* "$d/norpt/"; rm "$d/norpt/kernel_boot.elf.n
 guard missing_nofp_report "$d/norpt"
 mkdir -p "$d/nofp"; cp "$d/plain/"* "$d/nofp/"; sed -i 's/^nofp_result=pass$/nofp_result=fail/' "$d/nofp/kernel_boot.elf.provenance"
 guard failed_nofp_record "$d/nofp"
+# Relabeling at three depths: the selected features only; the feature arguments too; and the
+# Cargo-resolved set as well. Each is caught by the next independent derivation.
 mkdir -p "$d/relabel"; cp "$d/plain/"* "$d/relabel/"; sed -i 's/^features=none$/features=x86-vmi2-witness/' "$d/relabel/kernel_boot.elf.provenance"
 guard relabeled "$d/relabel" kernel=x86-vmi2-witness
+mkdir -p "$d/relabel2"; cp "$d/plain/"* "$d/relabel2/"; sed -i -e 's/^features=none$/features=x86-vmi2-witness/' -e 's/^cargo_feature_args=.*/cargo_feature_args=--no-default-features --features x86-vmi2-witness/' "$d/relabel2/kernel_boot.elf.provenance"
+guard relabeled_args "$d/relabel2" kernel=x86-vmi2-witness
+mkdir -p "$d/relabel3"; cp "$d/plain/"* "$d/relabel3/"; sed -i -e 's/^features=none$/features=x86-vmi2-witness/' -e 's/^resolved_features=none$/resolved_features=x86-vmi2-witness/' -e 's/^cargo_feature_args=.*/cargo_feature_args=--no-default-features --features x86-vmi2-witness/' "$d/relabel3/kernel_boot.elf.provenance"
+guard relabeled_resolved "$d/relabel3" kernel=x86-vmi2-witness
+# A feature that enables others: recorded as selected, resolved and judged consistently.
+pubk x86_baseline "$d/imp" "--no-default-features --features x86-ipccall-direct-smp-oracle"; echo "PUBLISH_imp=$?"
+initrd "$d/imp" "--no-default-features"
+grep '^resolved_features=' "$d/imp/kernel_boot.elf.provenance" | sed 's/^/IMP_/'
+guard implied "$d/imp" kernel=x86-ipccall-direct-smp-oracle initramfs=none
 mkdir -p "$d/oldsrc"; cp "$d/plain/"* "$d/oldsrc/"; sed -i 's/^source_state=.*/source_state=clean:0000000000000000000000000000000000000000/' "$d/oldsrc/kernel_boot.elf.provenance"
 guard other_source "$d/oldsrc"
 # Another architecture's guard.
@@ -174,7 +185,12 @@ guard over "$d/over"
     assert!(text.contains("\ncommit="), "{text}");
     assert!(text.contains("\ntree="), "{text}");
 
-    for ok in ["plain", "wit", "wit_contains"] {
+    assert!(text.contains("PUBLISH_imp=0"), "{text}");
+    assert!(
+        text.contains("IMP_resolved_features=ipccall-direct-oracle,x86-ipccall-direct-smp-oracle"),
+        "{text}"
+    );
+    for ok in ["plain", "wit", "wit_contains", "implied"] {
         assert_eq!(verdict(&text, ok), "accept", "{ok}:\n{text}");
     }
     for (label, why) in [
@@ -192,7 +208,15 @@ guard over "$d/over"
         ("missing_initramfs_record", "has no provenance record"),
         ("missing_nofp_report", "is missing or changed"),
         ("failed_nofp_record", "has no passing no-FP check"),
-        ("relabeled", "but its no-FP check judged features=none"),
+        ("relabeled", "but its feature arguments"),
+        (
+            "relabeled_args",
+            "which is not among its Cargo-resolved features none",
+        ),
+        (
+            "relabeled_resolved",
+            "but its no-FP check judged features=none",
+        ),
         ("other_source", "a cached artifact from another source"),
         ("over", "does not exist"),
     ] {

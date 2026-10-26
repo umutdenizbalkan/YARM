@@ -238,16 +238,34 @@ def verify(arch, kernel, initramfs, requires):
                 elif rec.get("nofp_line", "") not in open(rpt).read():
                     problems.append(f"the no-FP report {rpt} does not hold the recorded result")
                 else:
-                    # The check judged the image under the features its build was given; a
-                    # record whose features differ from the ones the check used is relabeled.
+                    # The check judged the image under the features its build resolved to (it
+                    # expands the requested ones through the crate's feature graph, as Cargo
+                    # does). A record whose Cargo-resolved features differ from the set the check
+                    # judged, or whose selected features are not what its own feature arguments
+                    # select, has been relabeled.
                     m = re.search(r" features=(\S+) ", rec.get("nofp_line", ""))
                     judged = m.group(1) if m else "?"
                     if judged == "-":
                         judged = "none"
-                    if judged != rec.get("features"):
-                        problems.append(f"kernel {path} is recorded with features="
-                                        f"{rec.get('features')}, but its no-FP check judged "
-                                        f"features={judged}")
+                    if judged != rec.get("resolved_features"):
+                        problems.append(f"kernel {path} is recorded with resolved features="
+                                        f"{rec.get('resolved_features')}, but its no-FP check "
+                                        f"judged features={judged}")
+        try:
+            default, selected = feature_record(rec.get("cargo_feature_args", ""))
+        except Exception:  # noqa: BLE001 — an unreadable record is a refusal, not a crash
+            default, selected = "?", "?"
+        if role == "kernel" and selected not in ("?", "none", "all"):
+            resolved = set(rec.get("resolved_features", "").split(","))
+            missing = sorted(set(selected.split(",")) - resolved)
+            if missing:
+                problems.append(f"kernel {path} selects {','.join(missing)}, which is not among "
+                                f"its Cargo-resolved features {rec.get('resolved_features')}")
+        if (str(default), selected) != (rec.get("default_features"), rec.get("features")):
+            problems.append(f"{role} {path} is recorded with default_features="
+                            f"{rec.get('default_features')} features={rec.get('features')},"
+                            f" but its feature arguments `{rec.get('cargo_feature_args')}`"
+                            f" select default_features={default} features={selected}")
     env_want = {"kernel": [], "initramfs": []}
     exact = set()
     for req in requires:

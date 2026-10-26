@@ -1189,8 +1189,13 @@ ownership or ABI change: the production diff is a default-off witness feature (b
   * an artifact without a record, or of another role or architecture;
   * a hash that no longer matches (replaced, stale or swapped);
   * a record from another source state (a cached artifact);
-  * a kernel whose check did not pass, whose judged ELF or report is missing or changed, or whose
-    recorded features differ from those the check judged (a relabeled record);
+  * a kernel whose check did not pass, or whose judged ELF or report is missing or changed;
+  * a relabeled record, caught by independent derivations: the selected features must be what
+    the recorded feature arguments select, must appear among the Cargo-resolved features, and
+    the resolved set must equal the set the no-FP check judged (the checker expands features
+    through the crate's feature graph itself). Records are plain text, not signed: a forgery that
+    rewrites the record, the report and its hash consistently is not detected. The guard catches
+    stale, swapped, mislabeled and unchecked artifacts, not an adversary on the build machine;
   * a feature requirement the pair does not meet: `kernel=FEATS` exact, `kernel:FEAT` contains,
     `initramfs@NAME=V` for compile-time environment, and likewise for the other role.
   Every witness, overlay, server-dies, boot-only and skip-build launcher calls it directly or
@@ -1203,13 +1208,16 @@ ownership or ABI change: the production diff is a default-off witness feature (b
   * wrong kernel features; wrong initramfs features;
   * a swapped kernel; a stale initramfs;
   * a missing kernel record; a missing initramfs record;
-  * a missing no-FP report; a failed no-FP record; a relabeled record;
+  * a missing no-FP report; a failed no-FP record;
+  * a relabeled record at three depths (selected features; plus feature arguments; plus the
+    resolved set);
   * another source state; another architecture;
   * a cached kernel copied away from its record;
   * a core-smoke run requiring a witness kernel but given the default one;
   * skip-build CONTEXT1 and VMI2 runs over incompatible cached artifacts.
   A kernel that fails the check is never published, and a failed publish removes the previous
-  image. Positive controls show an accepted pair reaching the stub QEMU.
+  image. Positive controls show an accepted pair reaching the stub QEMU, and a kernel built with
+  a feature that enables others (`x86-ipccall-direct-smp-oracle`) being accepted.
 * Not in scope: the RPi5 bring-up builder (`build-rpi5-highhalf-artifact.sh`) is hardware work and
   boots no QEMU. Its `+neon` exception stays OPEN.
 
