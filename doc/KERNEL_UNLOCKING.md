@@ -733,6 +733,39 @@ restriction to `KERNEL_LOCKING.md`'s rank table. Details are in contract §8.1, 
   alone fails exactly that repair's regressions.
 * **Model tests only:** none of this implements or qualifies production RT scheduling.
 
+**Qualification of the correction** (frozen `00e7788b`, tree `4b920962`, against fresh base
+`e41b3be9`; every gate run once):
+
+* *Scope of change:* only `doc/KERNEL_UNLOCKING.md`, `doc/SCHEDULING_CONTRACT.md` and
+  `tests/scheduling_contract.rs` differ from the base. 0 production paths changed against the
+  base, and 0 against `00bd04e8`.
+* *Controls, on the frozen tests:*
+  * unmodified model: 20 passed, 8 failed, exactly the eight new regressions;
+  * repayment reverted: 25/3, failing the two repayment regressions and the mutation self-check;
+  * overflow handling reverted: 26/2, failing the overflow regression and the mutation
+    self-check;
+  * queue membership reverted: 22/6, failing the five queue regressions and the mutation
+    self-check.
+* *Tests:*
+  * contract suite 28/28, run twice;
+  * documentation guard 7/7;
+  * `cargo fmt --check` clean;
+  * hosted 6197 passed, 0 failed;
+  * integration 33 suites, 337 passed, 0 failed (329 plus the eight new model tests);
+  * broad-lock census guard 17/17, 0 production `with_cpu`, production census lines identical to
+    base.
+* *Images:* the default x86_64, aarch64 and riscv64 kernels are **bitwise identical** to the
+  fresh base and to the recorded hashes (`5d1a576b…`, `1a008d72…`, `d8abb10a…`). Warning classes
+  are identical (177/205/188), and the VMI sequence checks pass (13/9/8 sites).
+* *Live evidence:* no live matrix was rerun, because the kernels are identical. The bound live
+  evidence remains VM-INVALIDATION2-SEAL's qualification of `00bd04e8`.
+* *Status after this package:*
+  * **implemented:** the model repairs, as specification evidence only;
+  * **specified:** SC-CTX-4/5/7/8 and SC-PRI-12f (RT-SCHED1), SC-FP-1…3 (KERNEL-NOFP1), SC-FP-4
+    (FP-POLICY1), SC-LOCK-1…8 (SCHED-LOCK1);
+  * **unresolved:** SC-FP-5, the KERNEL-NOFP1 mechanism and its cost, plus the earlier UNRESOLVED
+    items in contract §14.
+
 ---
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION

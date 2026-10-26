@@ -1048,6 +1048,12 @@ also failed, because its unmutated baseline no longer held. The in-test mutation
 `ForgiveDebtAtReplenish`, `WrappingDebt` and `QueueOnExhaustion` now keep each defect killed
 permanently.
 
+**Qualification.** The frozen candidate `00e7788b` (tree `4b920962`) was qualified against
+`e41b3be9`. The unmodified-model and revert controls above were rerun on the frozen tests with
+the same results. The contract suite passed 28/28 twice. No production path changed, and the
+default kernels are bitwise identical to base on all three ports. The full record is in
+`doc/KERNEL_UNLOCKING.md` §0.8.
+
 **These are model tests.** They make the specification executable and check its predicates. They
 do not implement or qualify production RT scheduling, which remains SPECIFIED → RT-SCHED1.
 
