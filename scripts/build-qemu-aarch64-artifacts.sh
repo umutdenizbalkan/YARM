@@ -142,31 +142,22 @@ common_verify_initramfs_stage_paths
 # Phase 3B: use 4096-byte-aligned packer so late-service ELFs can be zero-copy loaded.
 common_create_initramfs_aligned
 
-# Stage 198B1 Part A: publish kernel ELF + objcopy'd binary atomically; a failed
-# objcopy/cp aborts (no `|| true`). The .bin is the booted artifact.
+# Stage 198B1 Part A / BUILD-GATES1: the ELF and its objcopy'd raw binary (the booted artifact) are
+# published together through the one provenance path: staged, no-FP checked (the raw image proven
+# to be the ELF's loadable bytes), moved into place atomically and recorded. A failure publishes
+# nothing and removes any earlier image at the destination.
 if [[ ! -f "$KERNEL_ELF" ]]; then
   echo "[error][integrity] kernel ELF not produced by the build: $KERNEL_ELF"
   exit 1
 fi
-cp "$KERNEL_ELF" "${KERNEL_IMAGE}.staging.$$"
-mv -f "${KERNEL_IMAGE}.staging.$$" "$KERNEL_IMAGE"
-if command -v llvm-objcopy >/dev/null 2>&1; then
-  llvm-objcopy -O binary "$KERNEL_ELF" "${KERNEL_BIN_IMAGE}.staging.$$"
-elif command -v rust-objcopy >/dev/null 2>&1; then
-  rust-objcopy -O binary "$KERNEL_ELF" "${KERNEL_BIN_IMAGE}.staging.$$"
-else
-  echo "[error][integrity] no objcopy available to produce raw kernel binary: $KERNEL_BIN_IMAGE"
-  exit 1
-fi
-mv -f "${KERNEL_BIN_IMAGE}.staging.$$" "$KERNEL_BIN_IMAGE"
+common_verify_kernel_markers "$KERNEL_ELF" "aarch64"
+ARTIFACT_KERNEL_TARGET="$KERNEL_RUST_TARGET" ARTIFACT_KERNEL_PROFILE="$SERVER_BUILD_PROFILE" \
+  artifact_publish_kernel "aarch64" "$KERNEL_ELF" "${BOOTSTRAP_FEATURE_ARGS}" "$KERNEL_IMAGE" "$KERNEL_BIN_IMAGE"
 
-# Freshness + marker + manifest gates (fail closed). Markers verified on the
-# BOOTED raw binary ($KERNEL_BIN_IMAGE).
+# Freshness gates (fail closed), then the initramfs record.
 common_verify_artifact_fresh "$KERNEL_BIN_IMAGE" "kernel binary image"
 common_verify_artifact_fresh "$INITRAMFS_IMAGE_ABS" "initramfs image"
-common_verify_kernel_markers "$KERNEL_BIN_IMAGE" "aarch64"
-common_verify_kernel_nofp "aarch64" "$KERNEL_ELF" "$KERNEL_BIN_IMAGE"
-common_write_manifest "aarch64" "$KERNEL_BIN_IMAGE" "$INITRAMFS_IMAGE_ABS"
+common_record_artifacts "aarch64" "$KERNEL_BIN_IMAGE" "$INITRAMFS_IMAGE_ABS"
 common_emit_build_integrity_line "aarch64"
 
 echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"

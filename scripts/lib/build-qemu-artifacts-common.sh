@@ -30,9 +30,14 @@ common_build_integrity_init() {
   BUILD_START_EPOCH="$(date +%s)"
   BUILD_START_HUMAN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   BUILD_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-  ARTIFACT_MANIFEST="${ARTIFACT_MANIFEST:-$OUT_DIR/artifact-manifest.txt}"
-  export BUILD_START_EPOCH BUILD_START_HUMAN BUILD_COMMIT ARTIFACT_MANIFEST
-  rm -f "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" "$INITRAMFS_IMAGE_ABS" "$ARTIFACT_MANIFEST" 2>/dev/null || true
+  export BUILD_START_EPOCH BUILD_START_HUMAN BUILD_COMMIT
+  # Every output and its provenance record goes, including the pre-BUILD-GATES1 manifest.
+  local p
+  for p in "$KERNEL_IMAGE" "${KERNEL_BIN_IMAGE:-}" "${KERNEL_ELF_IMAGE:-}" "$INITRAMFS_IMAGE" \
+           "$INITRAMFS_IMAGE_ABS"; do
+    [[ -n "$p" ]] && rm -f "$p" "$p.provenance" "$p.nofp.txt" 2>/dev/null
+  done
+  rm -f "$OUT_DIR/artifact-manifest.txt" "$OUT_DIR/nofp-check.txt" 2>/dev/null || true
   [[ -n "${KERNEL_DEBUG_ELF:-}" ]] && rm -f "$KERNEL_DEBUG_ELF" 2>/dev/null || true
   echo "[integrity] build-start=$BUILD_START_HUMAN epoch=$BUILD_START_EPOCH commit=$BUILD_COMMIT out_dir=$OUT_DIR"
 }
@@ -128,44 +133,23 @@ common_verify_kernel_markers() {
   return "$rc"
 }
 
-# KERNEL-NOFP1: the final linked kernel must pass the final-image FP/SIMD check — ordinary kernel
-# code and its linked helpers use no FP/SIMD register or FP control state, and every audited
-# exception matches its policy (doc/SCHEDULING_CONTRACT.md §8.1). Fail closed: a violation, or any
-# inspection the checker could not complete, aborts the build with no published artifact. The
-# result line is kept next to the artifacts as `nofp-check.txt`.
-common_verify_kernel_nofp() {
-  local arch="$1" elf="$2" boot_image="${3:-}" feats out
-  feats="$(artifact_features_record "${BOOTSTRAP_FEATURE_ARGS:-}" | sed -n 's/.* features=//p')"
-  [[ "$feats" == "none" ]] && feats=""
-  out="${OUT_DIR:-.}/nofp-check.txt"
-  if scripts/check-kernel-nofp.sh "$arch" "$elf" "$feats" "$boot_image" >"$out" 2>&1; then
-    grep -a "^NOFP_CHECK " "$out"
-    return 0
-  fi
-  cat "$out"
-  echo "[error][integrity] KERNEL-NOFP1: the $arch kernel failed the final-image FP/SIMD check"
-  return 1
-}
-
-# Record commit + per-artifact hash/size/mtime to the manifest.
+# KERNEL-NOFP1 / BUILD-GATES1: the final linked kernel's no-FP check and its record are part of
+# publishing it (`artifact_publish_kernel` in artifact-binding.sh), so no build can publish an
+# unchecked kernel and nothing can replace a checked one without invalidating its record.
 #
-# BL5c: each artifact also records its ROLE and the cargo features it was built with, so a run can
-# be bound to the exact kernel and initramfs it boots and to the features its mode requires
-# (`artifact_binding_check` in `artifact-binding.sh`). Both are built from the same
-# `BOOTSTRAP_FEATURE_ARGS`.
+# BL5c / BUILD-GATES1: every artifact carries its own provenance record (`<artifact>.provenance`),
+# written by the command that produced it: role, target and profile, the exact Cargo feature
+# arguments, the requested and Cargo-resolved features, source commit/tree, hash and — for the
+# kernel — the no-FP result bound to that image. QEMU launchers verify the set with
+# `artifact_boot_guard` before booting.
 # shellcheck source=artifact-binding.sh
 source "$(dirname "${BASH_SOURCE[0]}")/artifact-binding.sh"
-common_write_manifest() {
-  local arch="$1" kernel="$2" initramfs="$3" feat
-  feat="$(artifact_features_record "${BOOTSTRAP_FEATURE_ARGS:-}")"
-  {
-    echo "commit=$BUILD_COMMIT"
-    echo "arch=$arch"
-    echo "build_start=$BUILD_START_HUMAN epoch=$BUILD_START_EPOCH"
-    echo "build_feature_args=${BOOTSTRAP_FEATURE_ARGS:-}"
-    artifact_manifest_line "$kernel" kernel "$feat"
-    artifact_manifest_line "$initramfs" initramfs "$feat"
-  } | tee "$ARTIFACT_MANIFEST"
+common_record_artifacts() {
+  local arch="$1" kernel="$2" initramfs="$3"
+  artifact_record_initramfs "$arch" "$initramfs" "${BOOTSTRAP_FEATURE_ARGS:-}" \
+    "$SERVER_RUST_TARGET" "$SERVER_BUILD_PROFILE"
+  echo "[ok] ARTIFACT-RECORD $arch: kernel $(basename "$kernel") $(sed -n 's/^features=/features=/p' "$kernel.provenance") nofp=$(sed -n 's/^nofp_result=//p' "$kernel.provenance"); initramfs $(basename "$initramfs") $(sed -n 's/^features=/features=/p' "$initramfs.provenance")"
+  artifact_boot_guard "$arch" "$kernel" "$initramfs"
 }
 
 # Emit the per-arch build-integrity line (aggregated by the seal runner).

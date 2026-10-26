@@ -646,6 +646,11 @@ for _m in ["passthrough", "unknown-prefix", "extra-tokens", "bad-pseudo-prefix",
            "dropped-line", "fails"]:
     x86_case(f"x86_stub_{_m.replace('-', '_')}", stub=_m)
 x86_case("x86_trailing_partial_insn", text_end="0f")
+# The disassembler itself: missing, an unsupported version, or decoding the checker's probe
+# differently from the grammar it was written against (BUILD-GATES1).
+x86_case("x86_tools_missing_objdump", stub="missing-objdump")
+x86_case("x86_tools_unsupported_version", stub="old-version")
+x86_case("x86_tools_probe_misdecoded", stub="garble-probe")
 case("x86_truncated_elf", "x86_64")(lambda: Truncated(x86_image({})))
 
 # Exclusions: boundaries, presence, ownership, overlaps, boot mode.
@@ -731,6 +736,7 @@ def a64_case(name, features="", **o):
 
 
 a64_case("a64_baseline")
+case("a64_tools_missing_llvm_objdump", "aarch64", stub="missing-llvm-objdump")(lambda: a64_image({}))
 a64_case("a64_ordinary_fmov", ordinary=words(A64["fmov_d0_x1"]))
 
 

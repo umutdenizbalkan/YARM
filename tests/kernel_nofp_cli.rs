@@ -18,8 +18,10 @@
 //! These are verifier fixtures on synthetic images: they test what the checker accepts and
 //! rejects, not the kernel. The built kernels are checked by the artifact builds themselves.
 //!
-//! Needs `python3`, GNU `objdump` and `llvm-objdump` (a versioned `llvm-objdump-N` is accepted),
-//! the same tools the artifact builds need; a missing tool fails the test, it never skips it.
+//! Needs `python3` and the disassemblers the checker supports (GNU objdump 2.42, LLVM 18
+//! `llvm-objdump`), resolved by the checker itself (`--check-tools`: `YARM_OBJDUMP` /
+//! `YARM_LLVM_OBJDUMP`, else PATH), exactly as the artifact builds resolve them. A missing or
+//! unsupported tool fails the test with the checker's NOFP-TOOLS diagnostic; it never skips it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -44,6 +46,7 @@ const MODE: &str = "NOFP-EXCL-MODE";
 const META: &str = "NOFP-METADATA";
 const EXC: &str = "NOFP-EXCEPTION";
 const INV: &str = "NOFP-INVENTORY";
+const TOOLS: &str = "NOFP-TOOLS";
 
 const CASES: &[(&str, Expect)] = &[
     // The baseline and the two reproduced false passes.
@@ -84,7 +87,13 @@ const CASES: &[(&str, Expect)] = &[
     ("x86_stub_bad_pseudo_prefix", Fail(&[DECODE])),
     ("x86_stub_garbage_line", Fail(&[DECODE])),
     ("x86_stub_dropped_line", Fail(&[DECODE])),
-    ("x86_stub_fails", Fail(&[DECODE])),
+    // A disassembler that fails, is missing, reports an unsupported version or mis-decodes the
+    // checker's probe is refused as NOFP-TOOLS before any image byte is judged.
+    ("x86_stub_fails", Fail(&[TOOLS])),
+    ("x86_tools_missing_objdump", Fail(&[TOOLS])),
+    ("x86_tools_unsupported_version", Fail(&[TOOLS])),
+    ("x86_tools_probe_misdecoded", Fail(&[TOOLS])),
+    ("a64_tools_missing_llvm_objdump", Fail(&[TOOLS])),
     ("x86_trailing_partial_insn", Fail(&[DECODE])),
     ("x86_truncated_elf", Fail(&[DECODE])),
     // Exclusions: the boot-mode regions.
@@ -153,51 +162,38 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn on_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|p| {
-        std::env::split_paths(&p)
-            .map(|d| d.join(name))
-            .find(|f| f.is_file())
-    })
+/// The disassemblers every case uses: exactly the ones the checker itself resolves, version-gates
+/// and probes (`--check-tools`), pinned for each run through `YARM_OBJDUMP` / `YARM_LLVM_OBJDUMP`
+/// so fixtures and real kernel checks share one resolution. An unusable tool fails the test with
+/// the checker's own NOFP-TOOLS diagnostic; nothing is skipped and nothing else is searched for.
+struct Tools {
+    objdump: String,
+    llvm_objdump: String,
 }
 
-/// A PATH under which `objdump` and `llvm-objdump` resolve. A versioned `llvm-objdump-N` (or an
-/// `/usr/lib/llvm-N` install) is linked in as `llvm-objdump`. Panics when a tool is missing.
-fn tool_path(work: &Path) -> std::ffi::OsString {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    for t in ["python3", "objdump"] {
-        assert!(
-            on_path(t).is_some(),
-            "KERNEL-NOFP1 checker fixtures need `{t}` on PATH (the artifact builds need it too)"
-        );
+fn selected_tools() -> Tools {
+    let out = Command::new("python3")
+        .args(["-I", "scripts/check-kernel-nofp.py", "--check-tools"])
+        .current_dir(repo())
+        .output()
+        .expect("python3 is required to run the KERNEL-NOFP1 checker (the artifact builds need it too)");
+    let text = String::from_utf8_lossy(&out.stdout).to_string()
+        + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the no-FP checker's disassemblers are not usable here:\n{text}"
+    );
+    let path_of = |tool: &str| {
+        text.lines()
+            .filter(|l| l.contains(&format!(" tool={tool} ")))
+            .find_map(|l| l.split(' ').find_map(|w| w.strip_prefix("path=")))
+            .unwrap_or_else(|| panic!("--check-tools did not report {tool}:\n{text}"))
+            .to_string()
+    };
+    Tools {
+        objdump: path_of("objdump"),
+        llvm_objdump: path_of("llvm-objdump"),
     }
-    if on_path("llvm-objdump").is_none() {
-        let mut found = None;
-        for v in (14..=30).rev() {
-            if let Some(p) = on_path(&format!("llvm-objdump-{v}")) {
-                found = Some(p);
-                break;
-            }
-            let p = PathBuf::from(format!("/usr/lib/llvm-{v}/bin/llvm-objdump"));
-            if p.is_file() {
-                found = Some(p);
-                break;
-            }
-        }
-        let real = found.expect(
-            "KERNEL-NOFP1 checker fixtures need `llvm-objdump` on PATH (the AArch64 and RISC-V \
-             artifact builds need it too)",
-        );
-        let shim = work.join("llvm-bin");
-        std::fs::create_dir_all(&shim).unwrap();
-        let link = shim.join("llvm-objdump");
-        let _ = std::fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        dirs.insert(0, shim);
-    }
-    std::env::join_paths(dirs).unwrap()
 }
 
 fn build_fixtures(out: &Path) -> Vec<(String, String, String, String)> {
@@ -236,22 +232,32 @@ struct Outcome {
     text: String,
 }
 
-fn run_cli(
-    arch: &str,
-    elf: &Path,
-    features: &str,
-    stub: &str,
-    path: &std::ffi::OsString,
-) -> Outcome {
+fn run_cli(arch: &str, elf: &Path, features: &str, stub: &str, tools: &Tools) -> Outcome {
     let mut cmd = Command::new("scripts/check-kernel-nofp.sh");
-    cmd.arg(arch).arg(elf).arg(features).current_dir(repo());
-    if stub.is_empty() {
-        cmd.env("PATH", path);
-    } else {
-        let mut dirs = vec![repo().join("tests/fixtures/nofp/stub-bin")];
-        dirs.extend(std::env::split_paths(path));
-        cmd.env("PATH", std::env::join_paths(dirs).unwrap())
-            .env("YARM_NOFP_STUB", stub);
+    cmd.arg(arch)
+        .arg(elf)
+        .arg(features)
+        .current_dir(repo())
+        .env("YARM_OBJDUMP", &tools.objdump)
+        .env("YARM_LLVM_OBJDUMP", &tools.llvm_objdump);
+    match stub {
+        "" => {}
+        // An explicitly selected disassembler that does not exist.
+        "missing-objdump" => {
+            cmd.env("YARM_OBJDUMP", "/nonexistent/objdump");
+        }
+        "missing-llvm-objdump" => {
+            cmd.env("YARM_LLVM_OBJDUMP", "/nonexistent/llvm-objdump");
+        }
+        // The stub stands in for objdump and rewrites the real one's output.
+        mode => {
+            cmd.env(
+                "YARM_OBJDUMP",
+                repo().join("tests/fixtures/nofp/stub-bin/objdump"),
+            )
+            .env("YARM_NOFP_STUB_REAL", &tools.objdump)
+            .env("YARM_NOFP_STUB", mode);
+        }
     }
     let out = cmd.output().expect("run scripts/check-kernel-nofp.sh");
     let text =
@@ -286,7 +292,7 @@ fn run_cli(
 fn checker_cli_fixture_regressions() {
     let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel-nofp-cli");
     std::fs::create_dir_all(&work).unwrap();
-    let path = tool_path(&work);
+    let tools = selected_tools();
     let fixtures = build_fixtures(&work.join("fixtures"));
     let expect: BTreeMap<&str, &Expect> = CASES.iter().map(|(n, e)| (*n, e)).collect();
     assert_eq!(expect.len(), CASES.len(), "duplicate case in CASES");
@@ -302,13 +308,13 @@ fn checker_cli_fixture_regressions() {
         let handles: Vec<_> = chunks
             .into_iter()
             .map(|chunk| {
-                let (path, work) = (&path, &work);
+                let (tools, work) = (&tools, &work);
                 s.spawn(move || {
                     chunk
                         .iter()
                         .map(|(name, arch, feats, stub)| {
                             let elf = work.join("fixtures").join(format!("{name}.elf"));
-                            (name.clone(), run_cli(arch, &elf, feats, stub, path))
+                            (name.clone(), run_cli(arch, &elf, feats, stub, tools))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -354,8 +360,8 @@ fn checker_cli_fixture_regressions() {
 fn checker_cli_missing_image_fails() {
     let work = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel-nofp-cli-missing");
     std::fs::create_dir_all(&work).unwrap();
-    let path = tool_path(&work);
-    let got = run_cli("x86_64", &work.join("no-such.elf"), "", "", &path);
+    let tools = selected_tools();
+    let got = run_cli("x86_64", &work.join("no-such.elf"), "", "", &tools);
     assert!(!got.success && got.result == "fail", "{}", got.text);
     assert_eq!(
         got.obligations,

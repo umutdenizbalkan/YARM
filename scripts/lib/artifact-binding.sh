@@ -1,276 +1,149 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# BL5c: bind a QEMU run to the exact artifacts it boots.
+# BL5c / BUILD-GATES1: bind a QEMU run to the exact, checked artifacts it boots.
 #
-# A core smoke used to boot whatever its KERNEL_IMAGE / INITRAMFS_IMAGE paths held. A strict run
-# whose artifacts lacked a witness feature therefore booted, ran to its timeout, and failed late
-# on the witness's absence (`timer contract witness absent`) — indistinguishable from the witness
-# REGRESSING in an artifact that does carry it. And nothing tied a strict pass to the artifacts it
-# judged: a kernel swapped in after the build, or an initramfs from a different build directory,
-# was graded as if it were the recorded build.
+# One implementation (`scripts/artifact-provenance.py`) records what each artifact is and verifies
+# a boot set; this library is the shell surface every build and every QEMU launcher uses:
 #
-# The build now records, per artifact, its role, its hash and the cargo features it was built
-# with (`common_write_manifest`). Before booting, each core smoke calls `artifact_binding_check`:
+#   artifact_build_kernel   ARCH "FEATURE_ARGS" OUT_ELF [OUT_BOOT]
+#       Runs THE kernel build (`cargo build -p yarm --bin kernel_boot` for the port's kernel
+#       target and profile, with FEATURE_ARGS verbatim), then `artifact_publish_kernel`.
+#   artifact_publish_kernel ARCH LINKED_ELF "FEATURE_ARGS" OUT_ELF [OUT_BOOT]
+#       Stages a copy of the linked ELF (and its raw boot image, via objcopy, when OUT_BOOT is
+#       given), runs the no-FP check on exactly those staged bytes, and only on a pass publishes
+#       them atomically with a provenance record derived from FEATURE_ARGS. On any failure the
+#       destination and its record are REMOVED, so no stale image stays bootable.
+#   artifact_record_initramfs ARCH CPIO "FEATURE_ARGS" TARGET PROFILE
+#       Records an initramfs the caller just packed, with the feature arguments its servers were
+#       built with.
+#   artifact_boot_guard ARCH KERNEL INITRAMFS [REQ ...]
+#       Verifies the set before QEMU starts and refuses (non-zero) on any mismatch: an artifact
+#       without a record, a replaced/stale/swapped image, another arch or source state, a missing
+#       or failed no-FP check, or a feature requirement (`kernel=FEATS` exact, `kernel:FEAT`
+#       contains; likewise for `initramfs`). Prints one ARTIFACT_BINDING line.
+#   artifact_binding_check ARCH STRICT KERNEL INITRAMFS [REQ ...]
+#       The core smokes' entry point (BL5c). Since BUILD-GATES1 provenance is mandatory in every
+#       mode: STRICT no longer turns a refusal into a warning; it only decides which feature
+#       requirements the caller passes.
 #
-#   * the kernel and the initramfs must both be the artifacts ONE manifest records, by basename and
-#     sha256, and the manifest must be for the smoke's arch;
-#   * every feature the run's mode requires must be recorded on the artifact that carries it.
-#
-# A strict run REFUSES before QEMU starts and says why. A non-strict run reports the same binding
-# and continues (no feature is required of it). Either way the run prints one ARTIFACT_BINDING line
-# naming the kernel, initramfs, hashes, features and manifest it was bound to.
-#
-# A runner that boots a kernel it built outside the artifact build (an oracle feature kernel) binds
-# that set explicitly with `artifact_write_run_manifest`, recording the kernel's own features and
-# carrying the initramfs record over from the build that produced it.
+# No function here relabels an artifact: a mismatch is refused, and the only way to a valid
+# record is to build the artifact.
 
-# artifact_features_record ARGS... — normalize cargo feature arguments.
-# Prints `default_features=<0|1> features=<a,b,…|none|all>`, the list sorted and de-duplicated.
-artifact_features_record() {
-  local default=1 all=0 want_list=0 tok item
-  local -a feats=() more=()
-  # Word-split exactly as the build scripts' unquoted `${BOOTSTRAP_FEATURE_ARGS}` is.
-  # shellcheck disable=SC2048
-  for tok in $*; do
-    if (( want_list )); then
-      IFS=',' read -r -a more <<<"$tok"
-      feats+=("${more[@]}")
-      want_list=0
-      continue
-    fi
-    case "$tok" in
-      --no-default-features) default=0 ;;
-      --all-features) all=1 ;;
-      --features|-F) want_list=1 ;;
-      --features=*)
-        IFS=',' read -r -a more <<<"${tok#--features=}"
-        feats+=("${more[@]}")
-        ;;
-    esac
-  done
-  local list="none"
-  if (( all )); then
-    list="all"
-  elif (( ${#feats[@]} )); then
-    list="$(for item in "${feats[@]}"; do [[ -n "$item" ]] && printf '%s\n' "${item#*/}"; done | sort -u | paste -sd, -)"
-    [[ -n "$list" ]] || list="none"
-  fi
-  printf 'default_features=%s features=%s\n' "$default" "$list"
+_ab_repo() { (cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd); }
+_ab_py() { python3 -I "$(_ab_repo)/scripts/artifact-provenance.py" "$@"; }
+
+# artifact_features_record ARGS... — `default_features=<0|1> features=<a,b,…|none|all>`.
+artifact_features_record() { _ab_py features --feature-args "$*"; }
+
+# The kernel target and profile of each port (the artifact builders' defaults).
+_ab_kernel_target() {
+  case "$1" in
+    x86_64) echo "targets/x86_64-yarm-none.json x86-none x86_64-yarm-none 1" ;;
+    aarch64) echo "targets/aarch64-yarm-none.json aarch64-none aarch64-yarm-none 1" ;;
+    riscv64) echo "riscv64gc-unknown-none-elf release riscv64gc-unknown-none-elf 0" ;;
+    *) return 1 ;;
+  esac
 }
 
-# artifact_manifest_line PATH ROLE FEATURE_RECORD — one manifest artifact record.
-artifact_manifest_line() {
-  local f="$1" role="$2" feat="$3"
-  printf 'artifact %s sha256=%s size=%s mtime=%s role=%s %s\n' \
-    "$f" "$(sha256sum "$f" | cut -d' ' -f1)" "$(stat -c '%s' "$f")" "$(stat -c '%Y' "$f")" "$role" "$feat"
+_ab_objcopy() {
+  if command -v llvm-objcopy >/dev/null 2>&1; then echo llvm-objcopy
+  elif command -v rust-objcopy >/dev/null 2>&1; then echo rust-objcopy
+  else return 1; fi
 }
 
-# artifact_write_run_manifest OUT ARCH KERNEL KERNEL_FEATURE_ARGS INITRAMFS BUILD_MANIFEST
-#
-# Bind a run that boots a separately built kernel. The kernel is recorded with the features it was
-# built with; the initramfs record is carried over VERBATIM from the manifest of the build that
-# produced it, so its hash and features are the build's own and not a claim made here. Fails if
-# that manifest does not record this exact initramfs.
-artifact_write_run_manifest() {
-  local out="$1" arch="$2" kernel="$3" kfeat_args="$4" initramfs="$5" build_manifest="$6"
-  local i_sha i_rec
-  [[ -f "$kernel" && -f "$initramfs" && -f "$build_manifest" ]] || {
-    echo "[error] ARTIFACT-BINDING: cannot bind run: kernel=$kernel initramfs=$initramfs manifest=$build_manifest"
-    return 1
-  }
-  i_sha="$(sha256sum "$initramfs" | cut -d' ' -f1)"
-  i_rec="$(_ab_record_for "$build_manifest" "$(basename "$initramfs")" "$i_sha" initramfs)"
-  if [[ -z "$i_rec" ]]; then
-    echo "[error] ARTIFACT-BINDING: $build_manifest does not record initramfs $(basename "$initramfs") sha256=${i_sha}"
-    return 1
-  fi
-  {
-    echo "commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-    echo "arch=$arch"
-    echo "bound_from=$build_manifest"
-    artifact_manifest_line "$kernel" kernel "$(artifact_features_record "$kfeat_args")"
-    printf '%s\n' "$i_rec"
-  } >"$out"
-}
-
-# _ab_record_for MANIFEST BASENAME SHA ROLE — print the one artifact record with that basename, hash
-# and role (empty if there is none or more than one).
-_ab_record_for() {
-  local manifest="$1" base="$2" sha="$3" role="$4" line n=0 hit=""
-  while IFS= read -r line; do
-    [[ "$line" == artifact\ * ]] || continue
-    local p rest
-    p="$(printf '%s' "$line" | awk '{print $2}')"
-    rest="${line#artifact "$p" }"
-    [[ "$(basename "$p")" == "$base" ]] || continue
-    [[ " $rest " == *" sha256=${sha} "* ]] || continue
-    [[ " $rest " == *" role=${role} "* ]] || continue
-    hit="$line"
-    n=$((n + 1))
-  done <"$manifest"
-  (( n == 1 )) && printf '%s\n' "$hit"
-  return 0
-}
-
-# _ab_field RECORD KEY — the value of KEY=… in a record.
-_ab_field() {
-  printf '%s\n' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1
-}
-
-# artifact_binding_check ARCH STRICT KERNEL INITRAMFS [ROLE:FEATURE ...]
-#
-# ROLE:FEATURE names a feature the run requires and the artifact that must carry it, e.g.
-# `initramfs:timer-contract-witness`. Returns non-zero only for a strict run that cannot be bound.
-artifact_binding_check() {
-  local arch="$1" strict="$2" kernel="$3" initramfs="$4"
-  shift 4
-  local manifest="${ARTIFACT_MANIFEST:-$(dirname "$kernel")/artifact-manifest.txt}"
-  local -a problems=()
-  local k_sha="none" i_sha="none" m_arch="" m_commit="unknown" k_rec="" i_rec="" req role feat rec have
-  [[ -f "$kernel" ]] && k_sha="$(sha256sum "$kernel" | cut -d' ' -f1)"
-  [[ -f "$initramfs" ]] && i_sha="$(sha256sum "$initramfs" | cut -d' ' -f1)"
-  if [[ ! -f "$manifest" ]]; then
-    problems+=("no artifact manifest at $manifest: the kernel was not produced by an artifact build, or the run did not bind it")
-  else
-    m_arch="$(sed -n 's/^arch=//p' "$manifest" | head -1)"
-    m_commit="$(sed -n 's/^commit=//p' "$manifest" | head -1)"
-    [[ "$m_arch" == "$arch" ]] || problems+=("manifest $manifest is for arch '${m_arch:-none}', not $arch")
-    k_rec="$(_ab_record_for "$manifest" "$(basename "$kernel")" "$k_sha" kernel)"
-    i_rec="$(_ab_record_for "$manifest" "$(basename "$initramfs")" "$i_sha" initramfs)"
-    [[ -n "$k_rec" ]] || problems+=("kernel $kernel (sha256=${k_sha}) is not the kernel $manifest records")
-    [[ -n "$i_rec" ]] || problems+=("initramfs $initramfs (sha256=${i_sha}) is not the initramfs $manifest records")
-  fi
-  for req in "$@"; do
-    role="${req%%:*}"
-    feat="${req#*:}"
-    case "$role" in
-      kernel) rec="$k_rec" ;;
-      initramfs) rec="$i_rec" ;;
-      *) problems+=("unknown artifact role in requirement '$req'"); continue ;;
-    esac
-    [[ -n "$rec" ]] || continue # already reported: the artifact itself is unbound
-    have="$(_ab_field "$rec" features)"
-    if [[ -z "$have" ]]; then
-      problems+=("the $role record carries no feature list (built before BL5c); this run requires '$feat'")
-    elif [[ "$have" != "all" && ",${have}," != *",${feat},"* ]]; then
-      problems+=("this run requires the $role to be built with '$feat'; it was built with features=${have}")
-    fi
-  done
-  local result="ok"
-  if (( ${#problems[@]} )); then
-    if [[ "$strict" == "1" ]]; then result="refused"; else result="unbound"; fi
-  fi
-  echo "ARTIFACT_BINDING arch=${arch} strict=${strict} manifest=${manifest} commit=${m_commit} kernel=${kernel} kernel_sha256=${k_sha} kernel_features=$(_ab_field "$k_rec" features) initramfs=${initramfs} initramfs_sha256=${i_sha} initramfs_features=$(_ab_field "$i_rec" features) required=$(IFS=,; echo "${*:-none}") result=${result}"
+_ab_invalidate() { # PATH... — remove artifacts and their records
   local p
-  for p in "${problems[@]}"; do
-    if [[ "$strict" == "1" ]]; then
-      echo "[error] ARTIFACT-BINDING: $p"
-    else
-      echo "[warn] ARTIFACT-BINDING: $p"
-    fi
+  for p in "$@"; do
+    [[ -n "$p" ]] && rm -f "$p" "$p.provenance" "$p.nofp.txt"
   done
-  if [[ "$result" == "refused" ]]; then
-    echo "[error] ARTIFACT-BINDING: refusing to boot: this strict run cannot be bound to compatible artifacts"
-    return 1
-  fi
-  return 0
 }
 
-# ── Self-test ────────────────────────────────────────────────────────────────────────────────────
-# `bash scripts/lib/artifact-binding.sh --self-test`: every malformed binding must be refused by a
-# strict run, and every well-formed one accepted.
-_ab_self_test() {
-  local t pass=0 fail=0 accepted=0 refused=0
-  t="$(mktemp -d)"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$t'" RETURN
-  mk_build() { # DIR FEATURE_ARGS ARCH
-    mkdir -p "$1"
-    printf 'kernel %s %s\n' "$1" "$2" >"$1/kernel_boot.elf"
-    printf 'initramfs %s %s\n' "$1" "$2" >"$1/initramfs-core.cpio"
-    {
-      echo "commit=selftest"
-      echo "arch=$3"
-      artifact_manifest_line "$1/kernel_boot.elf" kernel "$(artifact_features_record "$2")"
-      artifact_manifest_line "$1/initramfs-core.cpio" initramfs "$(artifact_features_record "$2")"
-    } >"$1/artifact-manifest.txt"
-  }
-  expect() { # DESC WANT(accept|refuse) ARGS…
-    local desc="$1" want="$2" got out
-    shift 2
-    if out="$(artifact_binding_check "$@" 2>&1)"; then got=accept; else got=refuse; fi
-    if [[ "$got" == "$want" ]]; then
-      pass=$((pass + 1))
-      [[ "$want" == accept ]] && accepted=$((accepted + 1)) || refused=$((refused + 1))
-    else
-      fail=$((fail + 1))
-      echo "[error] ARTIFACT-BINDING self-test: '$desc' expected $want, got $got"
-      printf '%s\n' "$out" | sed 's/^/    /'
-    fi
-  }
-  local W="initramfs:timer-contract-witness"
-  mk_build "$t/tcw" "--no-default-features --features timer-contract-witness" x86_64
-  mk_build "$t/def" "--no-default-features" x86_64
-  mk_build "$t/arm" "--no-default-features" aarch64
-
-  expect "a bound witness build, strict" accept x86_64 1 "$t/tcw/kernel_boot.elf" "$t/tcw/initramfs-core.cpio" "$W"
-  expect "a bound default build, strict, nothing required" accept x86_64 1 "$t/def/kernel_boot.elf" "$t/def/initramfs-core.cpio"
-  expect "a default build where the witness is required" refuse x86_64 1 "$t/def/kernel_boot.elf" "$t/def/initramfs-core.cpio" "$W"
-  expect "the same default build, non-strict, nothing required" accept x86_64 0 "$t/def/kernel_boot.elf" "$t/def/initramfs-core.cpio"
-  expect "the witness kernel with the default initramfs" refuse x86_64 1 "$t/tcw/kernel_boot.elf" "$t/def/initramfs-core.cpio" "$W"
-  expect "the default kernel with the witness initramfs" refuse x86_64 1 "$t/def/kernel_boot.elf" "$t/tcw/initramfs-core.cpio" "$W"
-  expect "a manifest for another arch" refuse x86_64 1 "$t/arm/kernel_boot.elf" "$t/arm/initramfs-core.cpio"
-  ARTIFACT_MANIFEST="$t/none.txt" expect "no manifest" refuse x86_64 1 "$t/tcw/kernel_boot.elf" "$t/tcw/initramfs-core.cpio" "$W"
-  ARTIFACT_MANIFEST="$t/none.txt" expect "no manifest, non-strict" accept x86_64 0 "$t/tcw/kernel_boot.elf" "$t/tcw/initramfs-core.cpio"
-
-  cp -r "$t/tcw" "$t/swapped"
-  printf 'a kernel swapped in after the build\n' >"$t/swapped/kernel_boot.elf"
-  expect "a kernel replaced after its build" refuse x86_64 1 "$t/swapped/kernel_boot.elf" "$t/swapped/initramfs-core.cpio" "$W"
-  expect "the replaced kernel, non-strict" accept x86_64 0 "$t/swapped/kernel_boot.elf" "$t/swapped/initramfs-core.cpio"
-
-  cp -r "$t/tcw" "$t/dup"
-  grep '^artifact .*role=kernel' "$t/tcw/artifact-manifest.txt" >>"$t/dup/artifact-manifest.txt"
-  expect "a manifest recording the kernel twice" refuse x86_64 1 "$t/dup/kernel_boot.elf" "$t/dup/initramfs-core.cpio" "$W"
-
-  cp -r "$t/tcw" "$t/legacy"
-  sed -i 's/ role=[a-z]* default_features=[01] features=[^ ]*$//' "$t/legacy/artifact-manifest.txt"
-  expect "a manifest from before BL5c (no roles)" refuse x86_64 1 "$t/legacy/kernel_boot.elf" "$t/legacy/initramfs-core.cpio" "$W"
-
-  cp -r "$t/tcw" "$t/kfeat"
-  expect "the witness required of the kernel record too" accept x86_64 1 "$t/kfeat/kernel_boot.elf" "$t/kfeat/initramfs-core.cpio" "kernel:timer-contract-witness" "$W"
-  expect "an unknown role" refuse x86_64 1 "$t/kfeat/kernel_boot.elf" "$t/kfeat/initramfs-core.cpio" "bootloader:x"
-
-  mkdir -p "$t/oracle"
-  printf 'an oracle feature kernel\n' >"$t/oracle/kernel_boot.elf"
-  artifact_write_run_manifest "$t/oracle/run.txt" x86_64 "$t/oracle/kernel_boot.elf" "--no-default-features --features ipc-reply-timeout-oracle-core" "$t/tcw/initramfs-core.cpio" "$t/tcw/artifact-manifest.txt" >/dev/null
-  ARTIFACT_MANIFEST="$t/oracle/run.txt" expect "a run-bound oracle kernel with the witness initramfs" accept x86_64 1 "$t/oracle/kernel_boot.elf" "$t/tcw/initramfs-core.cpio" "$W" "kernel:ipc-reply-timeout-oracle-core"
-  ARTIFACT_MANIFEST="$t/oracle/run.txt" expect "the run manifest with a different initramfs" refuse x86_64 1 "$t/oracle/kernel_boot.elf" "$t/def/initramfs-core.cpio" "$W"
-  if artifact_write_run_manifest "$t/oracle/bad.txt" x86_64 "$t/oracle/kernel_boot.elf" "--no-default-features" "$t/def/initramfs-core.cpio" "$t/tcw/artifact-manifest.txt" >/dev/null; then
-    fail=$((fail + 1)); echo "[error] ARTIFACT-BINDING self-test: a run manifest claimed an initramfs its build manifest does not record"
-  else
-    pass=$((pass + 1)); refused=$((refused + 1))
+artifact_publish_kernel() {
+  local arch="$1" linked="$2" fargs="$3" out_elf="$4" out_boot="${5:-}"
+  local repo spec target profile feats stage_elf stage_boot report oc by
+  repo="$(_ab_repo)"
+  spec="$(_ab_kernel_target "$arch")" || { echo "[error] ARTIFACT-PUBLISH: unknown arch $arch"; return 1; }
+  read -r target profile _ _ <<<"$spec"
+  target="${ARTIFACT_KERNEL_TARGET:-$target}"
+  profile="${ARTIFACT_KERNEL_PROFILE:-$profile}"
+  by="${ARTIFACT_BUILT_BY:-$(basename "$0")}"
+  _ab_invalidate "$out_elf" "$out_boot"
+  if [[ ! -s "$linked" ]]; then
+    echo "[error] ARTIFACT-PUBLISH: the linked kernel $linked does not exist"
+    return 1
   fi
+  mkdir -p "$(dirname "$out_elf")"
+  [[ -n "$out_boot" ]] && mkdir -p "$(dirname "$out_boot")"
+  stage_elf="${out_elf}.staging.$$"
+  stage_boot="${out_boot:+${out_boot}.staging.$$}"
+  report="${out_elf}.nofp.txt.staging.$$"
+  cp "$linked" "$stage_elf" || { _ab_invalidate "$stage_elf"; return 1; }
+  if [[ -n "$out_boot" ]]; then
+    oc="$(_ab_objcopy)" || { echo "[error] ARTIFACT-PUBLISH: no llvm-objcopy/rust-objcopy for the raw image"; rm -f "$stage_elf"; return 1; }
+    if ! "$oc" -O binary "$stage_elf" "$stage_boot"; then
+      echo "[error] ARTIFACT-PUBLISH: $oc failed on $linked"
+      rm -f "$stage_elf" "$stage_boot"
+      return 1
+    fi
+  fi
+  feats="$(_ab_py features --feature-args "$fargs" | sed -n 's/.* features=//p')"
+  [[ "$feats" == "none" ]] && feats=""
+  if ! "$repo/scripts/check-kernel-nofp.sh" "$arch" "$stage_elf" "$feats" ${stage_boot:+"$stage_boot"} >"$report" 2>&1; then
+    cat "$report"
+    echo "[error][integrity] KERNEL-NOFP1: the $arch kernel failed the final-image FP/SIMD check; nothing was published"
+    rm -f "$stage_elf" "$stage_boot" "$report"
+    return 1
+  fi
+  grep -a "^NOFP_CHECK " "$report"
+  mv -f "$stage_elf" "$out_elf"
+  [[ -n "$out_boot" ]] && mv -f "$stage_boot" "$out_boot"
+  mv -f "$report" "${out_elf}.nofp.txt"
+  if ! _ab_py record-kernel --arch "$arch" --elf "$out_elf" ${out_boot:+--boot "$out_boot"} \
+      --feature-args "$fargs" --target "$target" --profile "$profile" \
+      --nofp-report "${out_elf}.nofp.txt" --built-by "$by"; then
+    _ab_invalidate "$out_elf" "$out_boot"
+    return 1
+  fi
+  echo "[ok] ARTIFACT-PUBLISH: $arch kernel $(basename "$out_elf")${out_boot:+ + $(basename "$out_boot")} published with provenance ($(_ab_py features --feature-args "$fargs"))"
+}
 
+artifact_build_kernel() {
+  local arch="$1" fargs="$2" out_elf="$3" out_boot="${4:-}"
+  local spec target profile tdir json repo
+  repo="$(_ab_repo)"
+  spec="$(_ab_kernel_target "$arch")" || { echo "[error] ARTIFACT-BUILD: unknown arch $arch"; return 1; }
+  read -r target profile tdir json <<<"$spec"
+  local -a z=(-Z "build-std=core,alloc,compiler_builtins,panic_abort")
+  [[ "$json" == 1 ]] && z+=(-Z json-target-spec)
+  # shellcheck disable=SC2086
+  if ! (cd "$repo" && cargo build "${z[@]}" --target "$target" --profile "$profile" \
+        $fargs -p yarm --bin kernel_boot); then
+    echo "[error] ARTIFACT-BUILD: the $arch kernel build failed ($fargs)"
+    _ab_invalidate "$out_elf" "$out_boot"
+    return 1
+  fi
+  ARTIFACT_KERNEL_TARGET="$target" ARTIFACT_KERNEL_PROFILE="$profile" \
+    artifact_publish_kernel "$arch" "$repo/target/$tdir/$profile/kernel_boot" "$fargs" "$out_elf" "$out_boot"
+}
+
+artifact_record_initramfs() {
+  local arch="$1" cpio="$2" fargs="$3" target="$4" profile="$5"
+  _ab_py record-initramfs --arch "$arch" --cpio "$cpio" --feature-args "$fargs" \
+    --target "$target" --profile "$profile" --built-by "${ARTIFACT_BUILT_BY:-$(basename "$0")}"
+}
+
+artifact_boot_guard() {
+  local arch="$1" kernel="$2" initramfs="$3"
+  shift 3
+  local -a req=()
   local r
-  for r in "--no-default-features|default_features=0 features=none" \
-           "--no-default-features --features b,a|default_features=0 features=a,b" \
-           "--features=yarm/x,y --features y|default_features=1 features=x,y" \
-           "--all-features|default_features=1 features=all"; do
-    if [[ "$(artifact_features_record "${r%%|*}")" == "${r#*|}" ]]; then
-      pass=$((pass + 1))
-    else
-      fail=$((fail + 1)); echo "[error] ARTIFACT-BINDING self-test: features of '${r%%|*}' = '$(artifact_features_record "${r%%|*}")', want '${r#*|}'"
-    fi
-  done
-
-  if (( fail )); then
-    echo "[error] ARTIFACT-BINDING self-test FAILED (${fail} of $((pass + fail)))"
-    return 1
-  fi
-  echo "[ok] ARTIFACT-BINDING self-test passed (${accepted} accepted, ${refused} refused, 4 feature records)"
+  for r in "$@"; do req+=(--require "$r"); done
+  _ab_py verify --arch "$arch" --kernel "$kernel" --initramfs "$initramfs" "${req[@]}"
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == "--self-test" ]]; then
-  _ab_self_test
-fi
+artifact_binding_check() {
+  local arch="$1" _strict="$2" kernel="$3" initramfs="$4"
+  shift 4
+  artifact_boot_guard "$arch" "$kernel" "$initramfs" "$@"
+}

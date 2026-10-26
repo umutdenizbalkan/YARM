@@ -205,23 +205,24 @@ common_verify_initramfs_stage_paths
 # Phase 3B: use 4096-byte-aligned packer so late-service ELFs can be zero-copy loaded.
 common_create_initramfs_aligned
 
-# Stage 198B1 Part A: publish the kernel image atomically (stage to a temp
-# sibling, then mv). `set -e` guarantees a failed cp aborts.
+# Stage 198B1 Part A / BUILD-GATES1: the kernel's markers are checked on the linked ELF, then it is
+# published through the one provenance path: staged, no-FP checked on exactly those bytes, moved
+# into place atomically and recorded (`artifact_publish_kernel`). A failure publishes nothing and
+# removes any earlier image at the destination. `set -e` makes every step fatal.
 if [[ ! -f "$KERNEL_ELF" ]]; then
   echo "[error][integrity] kernel ELF not produced by the build: $KERNEL_ELF"
   exit 1
 fi
-cp "$KERNEL_ELF" "${KERNEL_IMAGE}.staging.$$"
-mv -f "${KERNEL_IMAGE}.staging.$$" "$KERNEL_IMAGE"
+common_verify_kernel_markers "$KERNEL_ELF" "x86_64"
+ARTIFACT_KERNEL_TARGET="$KERNEL_RUST_TARGET" ARTIFACT_KERNEL_PROFILE="$SERVER_BUILD_PROFILE" \
+  artifact_publish_kernel "x86_64" "$KERNEL_ELF" "${BOOTSTRAP_FEATURE_ARGS}" "$KERNEL_IMAGE"
 cp "$KERNEL_ELF" "${KERNEL_DEBUG_ELF}.staging.$$"
 mv -f "${KERNEL_DEBUG_ELF}.staging.$$" "$KERNEL_DEBUG_ELF"
 
-# Freshness + marker + manifest gates (fail closed on any violation).
+# Freshness gates (fail closed), then the initramfs record.
 common_verify_artifact_fresh "$KERNEL_IMAGE" "kernel image"
 common_verify_artifact_fresh "$INITRAMFS_IMAGE_ABS" "initramfs image"
-common_verify_kernel_markers "$KERNEL_IMAGE" "x86_64"
-common_verify_kernel_nofp "x86_64" "$KERNEL_IMAGE"
-common_write_manifest "x86_64" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE_ABS"
+common_record_artifacts "x86_64" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE_ABS"
 common_emit_build_integrity_line "x86_64"
 
 echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"

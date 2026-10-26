@@ -86,6 +86,7 @@ OBLIGATIONS = {
     "NOFP-EXCL-MODE": "an exclusion is inconsistent with its architecture or boot mode",
     "NOFP-METADATA": "the image, its map table or the feature list is malformed",
     "NOFP-BOOT-IMAGE": "the raw boot image is not exactly the ELF's loadable bytes",
+    "NOFP-TOOLS": "the required disassembler is missing, unselectable, unsupported or mis-decodes",
 }
 
 # ── ELF ─────────────────────────────────────────────────────────────────────────────────────────
@@ -210,16 +211,146 @@ class Uninterpretable(Exception):
     pass
 
 
+# ── the disassemblers: one resolution, one support gate, used by every caller ───────────────────
+#
+# BUILD-GATES1: the CLI fixtures, the artifact builds and CI all resolve the disassemblers HERE.
+#
+#   * Explicit selection wins: `YARM_OBJDUMP` (GNU objdump, x86) and `YARM_LLVM_OBJDUMP` (LLVM
+#     objdump, AArch64 and RISC-V) name the binaries; CI sets both. Otherwise `objdump` and
+#     `llvm-objdump` are taken from PATH. Nothing else is guessed (no versioned-name search).
+#   * Only the versions this checker's grammar was derived from are supported: GNU objdump 2.42
+#     (its x86 prefix table is the grammar `x86_is_prefix` enforces) and LLVM 18 objdump.
+#   * Before an image is inspected, the selected binary must decode a built-in probe image for
+#     the arch exactly as expected (x86-64/i386/i8086 for x86, the FP/SIMD forms the policy names
+#     for AArch64, F/D/V and FP-CSR forms for RISC-V).
+#
+# A missing, unselectable, unsupported or mis-decoding disassembler is a NOFP-TOOLS failure with
+# the reason and the remedy; it is never skipped and never replaced by another binary.
+
+TOOL_ENV = {"objdump": "YARM_OBJDUMP", "llvm-objdump": "YARM_LLVM_OBJDUMP"}
+TOOL_FOR_ARCH = {"x86_64": "objdump", "aarch64": "llvm-objdump", "riscv64": "llvm-objdump"}
+TOOL_SUPPORTED = {
+    "objdump": (re.compile(r"^GNU objdump .*\b2\.42(?:\.\d+)?$"), "GNU objdump 2.42 (binutils 2.42)"),
+    "llvm-objdump": (re.compile(r"\bLLVM version 18\.\d+\.\d+\b"), "LLVM 18 llvm-objdump"),
+}
+TOOL_REMEDY = ("install binutils 2.42 and LLVM 18 (Ubuntu 24.04: `apt-get install binutils "
+               "llvm-18`), then put `objdump`/`llvm-objdump` on PATH or select them explicitly "
+               "with YARM_OBJDUMP=/usr/bin/objdump YARM_LLVM_OBJDUMP=/usr/lib/llvm-18/bin/"
+               "llvm-objdump")
+
+
+class ToolError(Exception):
+    pass
+
+
+_TOOLS = {}
+
+
 def tool(name):
-    p = shutil.which(name)
-    if not p:
-        raise SystemExit(f"[nofp] inspection incomplete: required disassembler `{name}` not found")
-    return p
+    """The selected binary for `name` (path only; `require_tool` also gates support)."""
+    if name in _TOOLS:
+        return _TOOLS[name]["path"]
+    env = TOOL_ENV[name]
+    sel = os.environ.get(env)
+    if sel:
+        p = sel if os.path.sep in sel else shutil.which(sel)
+        if not p or not (os.path.isfile(p) and os.access(p, os.X_OK)):
+            raise ToolError(f"{env}={sel} does not name an executable disassembler; {TOOL_REMEDY}")
+        how = env
+    else:
+        p = shutil.which(name)
+        if not p:
+            raise ToolError(f"required disassembler `{name}` is not on PATH and {env} is not set; "
+                            f"{TOOL_REMEDY}")
+        how = "PATH"
+    return os.path.abspath(p) if os.path.sep in p else p
+
+
+def tool_version_of(path):
+    r = subprocess.run([path, "--version"], capture_output=True, text=True)
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or not lines:
+        raise ToolError(f"`{path} --version` failed (exit {r.returncode}); {TOOL_REMEDY}")
+    rx, _ = TOOL_SUPPORTED["llvm-objdump" if "LLVM" in r.stdout else "objdump"]
+    for l in lines:  # LLVM prints its version on the second line
+        if rx.search(l):
+            return l
+    return lines[0]
+
+
+def _probe_elf(machine, eflags, code):
+    """A minimal ELF64 with one executable `.text` at 0x1000 holding `code`."""
+    shstr = b"\0.text\0.shstrtab\0"
+    text_off, shstr_off = 0x100, 0x100 + len(code)
+    shoff = (shstr_off + len(shstr) + 7) & ~7
+    hdr = (b"\x7fELF\x02\x01\x01\0" + b"\0" * 8 +
+           struct.pack("<HHIQQQIHHHHHH", 2, machine, 1, 0x1000, 0, shoff, eflags, 64, 56, 0, 64,
+                       3, 2))
+    out = bytearray(shoff + 3 * 64)
+    out[:64] = hdr
+    out[text_off:text_off + len(code)] = code
+    out[shstr_off:shstr_off + len(shstr)] = shstr
+    out[shoff + 64:shoff + 128] = struct.pack("<IIQQQQIIQQ", 1, 1, 6, 0x1000, text_off, len(code),
+                                              0, 0, 4, 0)
+    out[shoff + 128:shoff + 192] = struct.pack("<IIQQQQIIQQ", 7, 3, 0, 0, shstr_off, len(shstr),
+                                               0, 0, 1, 0)
+    return bytes(out)
+
+
+# arch -> [(decoding mode, code bytes, expected normalised instruction texts)]
+TOOL_PROBES = {
+    "x86_64": [("code64", bytes.fromhex("49dbe3d50090480fae10"),
+                ["rex.wb fninit", "{rex2 0x0} nop", "rex.w ldmxcsr (%rax)"]),
+               ("code32", bytes.fromhex("0f22c0dbe3"), ["mov %eax,%cr0", "fninit"]),
+               ("code16", bytes.fromhex("66b8100000000f22c0"), ["mov $0x10,%eax", "mov %eax,%cr0"])],
+    "aarch64": [("native", struct.pack("<III", 0xAD0907E0, 0xD5181041, 0x9E670020),
+                 ["stp q0,q1,[sp,#288]", "msr cpacr_el1,x1", "fmov d0,x1"])],
+    "riscv64": [("native", struct.pack("<III", 0x00053007, 0x0C0572D7, 0x00302573),
+                 ["fld ft0,0(a0)", "vsetvli t0,a0,e8,m1,ta,ma", "frcsr a0"])],
+}
+PROBE_MACHINE = {"x86_64": (62, 0), "aarch64": (183, 0), "riscv64": (243, 0x5)}
+
+
+def require_tool(arch):
+    """Resolve, version-gate and probe the disassembler `arch` needs. Returns its record."""
+    name = TOOL_FOR_ARCH[arch]
+    rec = _TOOLS.get(name)
+    if rec is None:
+        path = tool(name)
+        version = tool_version_of(path)
+        rx, supported = TOOL_SUPPORTED[name]
+        if not rx.search(version):
+            raise ToolError(f"{path} reports `{version}`; the supported disassembler is "
+                            f"{supported}; {TOOL_REMEDY}")
+        rec = dict(name=name, path=path, version=version,
+                   selected_by=TOOL_ENV[name] if os.environ.get(TOOL_ENV[name]) else "PATH",
+                   probed=set())
+        _TOOLS[name] = rec
+    if arch not in rec["probed"]:
+        import tempfile
+        machine, eflags = PROBE_MACHINE[arch]
+        for mode, code, want in TOOL_PROBES[arch]:
+            fd, p = tempfile.mkstemp(prefix="nofp-probe-", suffix=".elf")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(_probe_elf(machine, eflags, code))
+                try:
+                    got = [normalise(arch, t) for _, _, t, _ in
+                           disassemble(arch, p, ".text", 0x1000, 0x1000 + len(code), mode)]
+                except SystemExit as e:
+                    raise ToolError(f"{rec['path']} cannot decode the {arch} {mode} probe: {e}; "
+                                    f"{TOOL_REMEDY}")
+            finally:
+                os.unlink(p)
+            if got != want:
+                raise ToolError(f"{rec['path']} decodes the {arch} {mode} probe as {got}, expected "
+                                f"{want}; this checker's grammar does not fit it; {TOOL_REMEDY}")
+        rec["probed"].add(arch)
+    return rec
 
 
 def tool_version(name):
-    out = subprocess.run([tool(name), "--version"], capture_output=True, text=True).stdout
-    return out.strip().splitlines()[0] if out.strip() else name
+    return _TOOLS[name]["version"] if name in _TOOLS else tool_version_of(tool(name))
 
 
 def disassemble(arch, elf_path, section, lo, hi, mode):
@@ -811,6 +942,7 @@ def authenticate(arch, elf, records, feats, fails):
 
 
 def check(arch, elf_path, features, census=False, boot_image=None, cargo_toml=None):
+    require_tool(arch)
     elf = Elf(elf_path)
     fails = Failures()
     if elf.e_machine != E_MACHINE[arch]:
@@ -1161,6 +1293,22 @@ def self_test():
     return 1 if bad else 0
 
 
+def check_tools(arches):
+    """`--check-tools`: one NOFP_TOOLS line per arch; exit 1 on the first unusable tool."""
+    bad = 0
+    for arch in arches:
+        try:
+            rec = require_tool(arch)
+            print(f"NOFP_TOOLS arch={arch} tool={rec['name']} path={rec['path']} "
+                  f"selected_by={rec['selected_by']} version=\"{rec['version']}\" "
+                  f"probe=ok result=ok")
+        except ToolError as e:
+            bad = 1
+            print(f"  FAIL [NOFP-TOOLS] {e}")
+            print(f"NOFP_TOOLS arch={arch} tool={TOOL_FOR_ARCH[arch]} result=fail")
+    return bad
+
+
 def list_inventory():
     for arch, inv in EXCLUSIONS.items():
         for name, ent in inv.items():
@@ -1182,12 +1330,16 @@ def main():
     ap.add_argument("--census", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--list-inventory", action="store_true")
+    ap.add_argument("--check-tools", action="store_true",
+                    help="resolve, version-gate and probe the disassemblers (all arches, or --arch)")
     ap.add_argument("--max-lines", type=int, default=40)
     a = ap.parse_args()
     if a.self_test:
         return self_test()
     if a.list_inventory:
         return list_inventory()
+    if a.check_tools:
+        return check_tools([a.arch] if a.arch else ["x86_64", "aarch64", "riscv64"])
     if not a.arch or not a.elf:
         ap.error("--arch and --elf are required")
     if not os.path.isfile(a.elf):
@@ -1198,7 +1350,13 @@ def main():
         digest = hashlib.sha256(f.read()).hexdigest()
     try:
         res = check(a.arch, a.elf, a.features, a.census, a.boot_image)
-        dis = tool_version("objdump" if a.arch == "x86_64" else "llvm-objdump")
+        trec = _TOOLS[TOOL_FOR_ARCH[a.arch]]
+        dis = f"{trec['version']}\" disassembler_path=\"{trec['path']}"
+    except ToolError as e:
+        print(f"  FAIL [NOFP-TOOLS] {e}")
+        print(f"NOFP_CHECK arch={a.arch} image_sha256={digest} obligations=NOFP-TOOLS result=fail "
+              f"reason=tools")
+        return 1
     except (SystemExit, Exception) as e:  # an inspection that could not finish is a failure
         why = str(e).replace("\n", " ")[:200] or type(e).__name__
         print(f"  FAIL [NOFP-DECODE] inspection incomplete: {why}")

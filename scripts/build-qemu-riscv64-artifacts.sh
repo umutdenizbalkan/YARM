@@ -45,6 +45,8 @@ CRASH_TEST_SERVER_ELF=${CRASH_TEST_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/
 KERNEL_ELF=${KERNEL_ELF:-target/${KERNEL_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-riscv64.bin}
+# BUILD-GATES1: the ELF the no-FP check judged, kept next to the booted raw image.
+KERNEL_ELF_IMAGE=${KERNEL_ELF_IMAGE:-${KERNEL_IMAGE%.bin}.elf}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
 BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
 BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
@@ -129,29 +131,22 @@ common_stage_crash_test_server_elf || true
 common_verify_initramfs_stage_paths
 common_create_initramfs_aligned
 
-# Stage 198B1 Part A: objcopy the kernel to the booted raw binary atomically; a
-# failed objcopy aborts (no `|| true`).
+# Stage 198B1 Part A / BUILD-GATES1: the ELF (kept next to it as the record of what the no-FP check
+# judged) and its objcopy'd raw binary — $KERNEL_IMAGE, the booted artifact on riscv64 — are
+# published together through the one provenance path: staged, no-FP checked, moved into place
+# atomically and recorded. A failure publishes nothing and removes any earlier image.
 if [[ ! -f "$KERNEL_ELF" ]]; then
   echo "[error][integrity] kernel ELF not produced by the build: $KERNEL_ELF"
   exit 1
 fi
-if command -v llvm-objcopy >/dev/null 2>&1; then
-  llvm-objcopy -O binary "$KERNEL_ELF" "${KERNEL_IMAGE}.staging.$$"
-elif command -v rust-objcopy >/dev/null 2>&1; then
-  rust-objcopy -O binary "$KERNEL_ELF" "${KERNEL_IMAGE}.staging.$$"
-else
-  echo "[error][integrity] no objcopy available to produce raw kernel binary: $KERNEL_IMAGE"
-  exit 1
-fi
-mv -f "${KERNEL_IMAGE}.staging.$$" "$KERNEL_IMAGE"
+common_verify_kernel_markers "$KERNEL_ELF" "riscv64"
+ARTIFACT_KERNEL_TARGET="$KERNEL_RUST_TARGET" ARTIFACT_KERNEL_PROFILE="$SERVER_BUILD_PROFILE" \
+  artifact_publish_kernel "riscv64" "$KERNEL_ELF" "${BOOTSTRAP_FEATURE_ARGS}" "$KERNEL_ELF_IMAGE" "$KERNEL_IMAGE"
 
-# Freshness + marker + manifest gates (fail closed). $KERNEL_IMAGE IS the booted
-# raw binary on riscv64.
+# Freshness gates (fail closed), then the initramfs record.
 common_verify_artifact_fresh "$KERNEL_IMAGE" "kernel image"
 common_verify_artifact_fresh "$INITRAMFS_IMAGE_ABS" "initramfs image"
-common_verify_kernel_markers "$KERNEL_IMAGE" "riscv64"
-common_verify_kernel_nofp "riscv64" "$KERNEL_ELF" "$KERNEL_IMAGE"
-common_write_manifest "riscv64" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE_ABS"
+common_record_artifacts "riscv64" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE_ABS"
 common_emit_build_integrity_line "riscv64"
 
 echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"
