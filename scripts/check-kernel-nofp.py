@@ -661,7 +661,14 @@ def main():
         return 1
     with open(a.elf, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
-    res = check(a.arch, a.elf, a.features, a.census, a.boot_image)
+    try:
+        res = check(a.arch, a.elf, a.features, a.census, a.boot_image)
+    except (SystemExit, Exception) as e:  # an inspection that could not finish is a failure
+        why = str(e).replace("\n", " ")[:200] or type(e).__name__
+        print(f"  FAIL inspection incomplete: {why}")
+        print(f"NOFP_CHECK arch={a.arch} image_sha256={digest} result=fail "
+              f"reason=inspection_incomplete")
+        return 1
     dis = tool_version("objdump" if a.arch == "x86_64" else "llvm-objdump")
     sym = res["sym"]
     for e in res["exceptions"]:
