@@ -680,6 +680,31 @@ kind **N** in contract §6.
 
   Every mutated tree compiled; each kill is a test failure, not a build failure.
 
+**Qualification (frozen `40b005c9` against fresh base `63537414`; every gate run once).**
+
+* *Scope of change:* no production path changed. Against the base, only `doc/` and
+  `tests/scheduling_contract.rs` differ. Against `00bd04e8`, the tree VM-INVALIDATION2-SEAL
+  qualified live, the same holds.
+* *Tests:*
+  * contract suite 20/20, run twice;
+  * documentation guard 7/7;
+  * `cargo fmt --check` clean;
+  * hosted 6197 passed, 0 failed;
+  * integration 33 suites, 329 passed, 0 failed (previously 32 and 309, plus this package's 20);
+  * broad-lock census guard 17/17; the census text shows 0 production `with_cpu`, and its
+    production lines are identical to base.
+* *Images:* the default kernels on x86_64, aarch64 and riscv64 are **bitwise identical** to the
+  fresh base and to the hashes recorded before any edit (`5d1a576b…`, `1a008d72…`, `d8abb10a…`).
+  Per-port warning classes are identical, and the VMI sequence checks pass on all three ports.
+* *Live evidence:* because the artifacts are identical, no live matrix was rerun. The bound live
+  evidence for these artifacts is VM-INVALIDATION2-SEAL's qualification of `00bd04e8`:
+  * strict cores, x86_64 `-smp 2/4/8`, AArch64 and RISC-V;
+  * x86_64 AP-scheduling witnesses at 2 and 4 CPUs;
+  * the SMP1 residency witness;
+  * four strict VMI2 witness boots.
+
+  Production broad-lock retirement is intact.
+
 ---
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
