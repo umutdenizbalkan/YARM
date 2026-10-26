@@ -1071,12 +1071,14 @@ CPU executes.
 
 **Remaining limits (OPEN):**
 
-* **OPEN — the AArch64 core grader's fresh-record assumption.** It still pins the U9-RX4 reply
-  record to generation 1. It passed every scheduled run, but it would misjudge a reused-slot
-  boot, as the x86 grader did.
-* **OPEN — smoke build paths outside automatic enforcement.** Smoke scripts that build a kernel
-  directly with `cargo` rather than through the artifact scripts are not gated at build time.
-  The qualification runner checks every kernel it boots.
+* **CLOSED by BUILD-GATES1 — the AArch64 core grader's fresh-record assumption.** The grader reads
+  the reply record's index and generation from the production records and binds them to the one
+  request route, like the x86 check. A labeled live witness exercises reuse (doc/KERNEL_UNLOCKING.md,
+  BUILD-GATES1).
+* **CLOSED by BUILD-GATES1 — smoke build paths outside automatic enforcement.** Every kernel any
+  QEMU path boots is published through one path that runs the no-FP check on the final bytes and
+  records provenance. Every launcher refuses, before QEMU, a kernel or initramfs without a
+  matching record and a passed check.
 * **OPEN — the RPi5 bring-up targets (`aarch64-rpi5-*`) keep `+neon`.** Hardware work is outside
   this package; their asm carries the same bracketing.
 * None of the above, and nothing in KERNEL-NOFP1 or its acceptance, is a qualification for

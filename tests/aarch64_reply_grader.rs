@@ -197,3 +197,35 @@ fn the_aarch64_core_smoke_grades_with_the_shared_library() {
     assert!(!SMOKE.contains("u9rx4_eval_terminal() {"));
     assert!(!SMOKE.contains("record_generation=1 "));
 }
+
+/// The live reuse witness is labeled and default-off: the feature is inert outside the supervisor,
+/// the supervisor's yield is compiled only under it, and the witness run boots only the checked
+/// witness build and grades premise and outcome separately.
+#[test]
+fn the_reuse_witness_is_labeled_default_off_and_separately_graded() {
+    let sup = include_str!(
+        "../crates/yarm-control-plane-servers/src/control_plane/supervisor/service.rs"
+    );
+    let gate = sup
+        .find("#[cfg(feature = \"u9rx4-reuse-witness\")]\n            {")
+        .expect("the yield is compiled only under the witness feature");
+    let query = sup
+        .find("yarm_user_rt::user_log!(\"SUPERVISOR_LIFECYCLE_QUERY tid={}\", supervisor_tid);")
+        .unwrap();
+    assert!(gate < query);
+    assert_eq!(sup.matches("u9rx4-reuse-witness").count(), 2);
+    for toml in [
+        include_str!("../Cargo.toml"),
+        include_str!("../crates/yarm-driver-servers/Cargo.toml"),
+        include_str!("../crates/yarm-fs-servers/Cargo.toml"),
+        include_str!("../crates/yarm-control-plane-servers/Cargo.toml"),
+    ] {
+        assert!(toml.contains("\nu9rx4-reuse-witness = []\n"));
+        assert!(!toml.contains("default = [\"u9rx4-reuse-witness"));
+    }
+    let w = include_str!("../scripts/qemu-aarch64-u9rx4-reuse-witness-smoke.sh");
+    assert!(w.contains("ARTIFACT_REQUIRE=\"kernel=$FEATURE initramfs=$FEATURE\""));
+    assert!(w.contains("seal \"result=fail reason=premise detail=no-reuse"));
+    assert!(w.contains("(( gen <= 1 )) || (( earlier < 1 )) || (( own_earlier != 0 ))"));
+    assert!(w.contains("seal \"result=fail reason=grade"));
+}

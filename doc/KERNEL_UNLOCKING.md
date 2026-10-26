@@ -1123,6 +1123,140 @@ never committed.
 
 SCHED-LOCK1 remains OPEN and next; KTHREAD1 is not started; broad-lock retirement stays closed.
 
+#### BUILD-GATES1 (from delivered `9b6c889b`)
+
+Three build-verification gaps closed before SCHED-LOCK1. No production scheduling, FP handling,
+ownership or ABI change: the production diff is a default-off witness feature (below).
+
+**1. Checker dependencies are provisioned and selected, not assumed.**
+
+* The checker resolves its disassemblers in one place (`scripts/check-kernel-nofp.py`):
+  `YARM_OBJDUMP` / `YARM_LLVM_OBJDUMP` when set, otherwise `objdump` / `llvm-objdump` on `PATH`.
+  It then version-gates them (GNU objdump 2.42; LLVM 18) and probes each architecture's decoding
+  on known encodings (x86 64/32/16-bit, AArch64, RISC-V). A missing, unsupported or misdecoding
+  tool fails with `NOFP-TOOLS` and names the tool, the version it reported and the remedy;
+  nothing is skipped or stubbed. `--check-tools` prints one `NOFP_TOOLS` line per architecture
+  (path, how it was selected, version, probe result), and every `NOFP_CHECK` line records the
+  disassembler path and version it used.
+* The CLI fixture test asks the checker for its selected tools and runs every fixture with them
+  selected explicitly; the fixture builds and the kernel builds therefore resolve the same tools
+  the same way. Fixtures cover a missing objdump, a missing llvm-objdump, an unsupported version
+  and a misdecoded probe.
+* **Local prerequisites:** GNU binutils 2.42 and LLVM 18 (Ubuntu 24.04:
+  `apt-get install binutils llvm-18`), plus `llvm-objcopy` or `rust-objcopy` for the raw AArch64
+  and RISC-V images. Put `objdump`/`llvm-objdump` on `PATH` or select them explicitly:
+  `YARM_OBJDUMP=/usr/bin/objdump YARM_LLVM_OBJDUMP=/usr/lib/llvm-18/bin/llvm-objdump`.
+  `python3 -I scripts/check-kernel-nofp.py --check-tools` verifies the selection.
+* **CI:** `scripts/ci/provision-nofp-tools.sh` installs `binutils` and `llvm-18`, selects the two
+  tools by absolute path (exported to later steps), puts LLVM 18 on `PATH` for `llvm-objcopy`, and
+  runs `--check-tools`. Every job that runs the fixtures (`core-profile`, `posix-compat-profile`)
+  or builds a kernel (the six `core-qemu-smoke` jobs) calls it before first use, on a pinned
+  `ubuntu-24.04` image. A new push-triggered `kernel-nofp-gates` job runs the checker fixtures,
+  the provenance controls and the reply-grader corpus. `kernel_nofp_scope` pins this wiring.
+
+**2. Every booted kernel carries checked provenance; every launcher refuses anything else.**
+
+* Inventory (source-derived, at `9b6c889b`; list in the qualification record): three artifact
+  builders; 43 other scripts that build, copy or objcopy a kernel; the three core smokes; and
+  nine boot-only launchers. Of the 43:
+  * 37 now build through the checked path;
+  * the three exit-current-task runners now boot the builder's own feature-on publication;
+  * three are compile-only `build-*-none-bootstrap.sh` helpers. They publish nothing, so no
+    launcher can boot their output. The old `artifact-manifest.txt` was
+  written by the builder, so a script that rebuilt the kernel afterwards booted bytes the manifest
+  did not describe. Witness images were labelled `features=none`, and nothing recorded a no-FP
+  result. AArch64 and RISC-V checked the target-dir ELF, not the published copy.
+* **One publish path** (`artifact_publish_kernel`, `scripts/lib/artifact-binding.sh`). It stages
+  the linked ELF and, for AArch64/RISC-V, the objcopied raw image, then runs the no-FP check on
+  exactly those staged bytes. Only on a pass does it move them into place and write a
+  `<artifact>.provenance` record. On any failure the destination and its record are **removed**,
+  so an earlier image cannot stay bootable under a failed publish. `artifact_build_kernel` is
+  the same path preceded by the one kernel `cargo build`. The three builders and the 37 custom
+  paths use it. The kernel copies that remain are feature-off strings audits that are never
+  booted, plus the RPi5 hardware builder.
+* **Records** (`scripts/artifact-provenance.py`), separately for each kernel and initramfs:
+  * role, architecture, target and profile;
+  * the Cargo feature arguments as given, the default-feature setting and the selected features,
+    taken from the arguments the producing command ran with. For kernels, the features Cargo
+    actually resolved (`cargo tree -e normal -p yarm`);
+  * the compile-time environment the crates read through `option_env!` (only the server crates
+    do; a hosted test pins the list);
+  * source commit, tree and source state (a dirty checkout records the hash of its diff);
+  * the artifact's SHA-256;
+  * for kernels: the ELF the check judged, the full `NOFP_CHECK` line and the report's hash.
+* **One guard** (`artifact_boot_guard`; the core smokes' `artifact_binding_check` wraps it, and
+  provenance is now mandatory in every mode). It runs before QEMU and refuses:
+  * an artifact without a record, or of another role or architecture;
+  * a hash that no longer matches (replaced, stale or swapped);
+  * a record from another source state (a cached artifact);
+  * a kernel whose check did not pass, whose judged ELF or report is missing or changed, or whose
+    recorded features differ from those the check judged (a relabeled record);
+  * a feature requirement the pair does not meet: `kernel=FEATS` exact, `kernel:FEAT` contains,
+    `initramfs@NAME=V` for compile-time environment, and likewise for the other role.
+  Every witness, overlay, server-dies, boot-only and skip-build launcher calls it directly or
+  through a core smoke (`ARTIFACT_REQUIRE`) with the exact features it needs. Feature-free builds
+  are accepted as `kernel=none`. `artifact_binding_scope` fails if a launcher in `scripts/` boots
+  a kernel without reaching the guard.
+* **Controls** (`artifact_binding_scope`). They use the real library, the real checker on
+  synthetic kernels and real smoke scripts against a stub QEMU that records whether it started.
+  All of these are refused before QEMU starts:
+  * wrong kernel features; wrong initramfs features;
+  * a swapped kernel; a stale initramfs;
+  * a missing kernel record; a missing initramfs record;
+  * a missing no-FP report; a failed no-FP record; a relabeled record;
+  * another source state; another architecture;
+  * a cached kernel copied away from its record;
+  * a core-smoke run requiring a witness kernel but given the default one;
+  * skip-build CONTEXT1 and VMI2 runs over incompatible cached artifacts.
+  A kernel that fails the check is never published, and a failed publish removes the previous
+  image. Positive controls show an accepted pair reaching the stub QEMU.
+* Not in scope: the RPi5 bring-up builder (`build-rpi5-highhalf-artifact.sh`) is hardware work and
+  boots no QEMU. Its `+neon` exception stays OPEN.
+
+**3. The AArch64 U9-RX4 grader judges the exact transaction.**
+
+* The evaluator pinned generation 1 on the arming, the reply resolution, the terminal commit and
+  the refusals, and it rejected the direct route because there is no receive-time mint. Its
+  resolution and revoke checks accepted **any** record index. On valid reuse it therefore reported
+  "never armed" or "minted 0 times". It also accepted a gen-1 reply resolved against another
+  record, and a revoke naming another record. A 35-case corpus showed this before the repair. The
+  old evaluator got 6 cases wrong:
+  * rejected valid reuse on the queued route, the direct route, a timeout win, and alongside a
+    later transaction on the slot;
+  * accepted a gen-1 substituted reply index and a gen-1 wrong revoke identity.
+* The repair (`scripts/lib/u9rx4-terminal-eval.sh`, shared by the AArch64 core smoke and
+  `tests/aarch64_reply_grader.rs`) derives the identity the way the repaired x86 check does:
+  * `(record_index, record_generation)` comes from the one arming of tid 2's terminal with a
+    finite deadline;
+  * exactly one route — queued, or direct NR 6 — must have committed that exact record;
+  * PM's cap must be the one the kernel bound to it (`IPC_RECV_REPLY_CAP_WAITER_CAP_SET`, or the
+    direct route's `server_reply_cap`);
+  * resolution, commit, both revokes and both refusals must name that pair, and PM's cap may
+    resolve against no other record.
+  Duplicate, stale-generation and missing-completion checks are unchanged or stricter.
+* The corpus (`tests/fixtures/u9rx4/mkcases.py`) is shaped on real AArch64 boots. It covers:
+  fresh reply and timeout wins; reuse at a later generation on both routes; a stale generation in
+  the reply and in the route; another transaction on the same slot; substituted request, reply and
+  direct-route identities; duplicate commit, two winners, duplicate resolution, missing
+  completion; and the evaluator's 16 original self-test cases. Every rejection must carry its
+  named reason. The smoke runs the same corpus before judging a boot. Mutation controls
+  re-introduce the generation pin, the index wildcard and an unbound revoke, and the corpus
+  catches each.
+* Over all 141 AArch64 boot logs kept from earlier packages, old and new graders give identical
+  verdicts (133 accept, 8 reject for the same reasons). None of those boots reused the slot.
+* **Live reuse witness (labeled; not production).** Existing controls never reused the slot on
+  AArch64: eight core boots at `-smp` 1/2/4/8 and a timer-contract boot all ran tid 2's query on
+  record (0, 1). The default-off `u9rx4-reuse-witness` feature makes the supervisor yield before
+  its query (4096 yields), so init's calls take the slot first. It is declared inert in the other
+  packages the build touches. `scripts/qemu-aarch64-u9rx4-reuse-witness-smoke.sh` builds it
+  through the checked path and runs the unmodified strict core smoke. It grades two things
+  separately:
+  * the **premise**: tid 2's record has generation > 1, earlier generations were armed by other
+    callers, and none by tid 2;
+  * the **grade**: the core smoke's verdict and its U9-RX4 line on that record.
+  A development boot ran the query on record (0, 17), direct route; the repaired grader accepted
+  it and the old grader rejected it.
+
 ---
 
 ## U6-FRAME (canonical 199C) — EXACT BLOCKED-SEND ENVELOPE PRESERVATION
