@@ -34,7 +34,7 @@ _ab_repo() { (cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd); }
 _ab_py() { python3 -I "$(_ab_repo)/scripts/artifact-provenance.py" "$@"; }
 
 # artifact_features_record ARGS... — `default_features=<0|1> features=<a,b,…|none|all>`.
-artifact_features_record() { _ab_py features --feature-args "$*"; }
+artifact_features_record() { _ab_py features --feature-args="$*"; }
 
 # The kernel target and profile of each port (the artifact builders' defaults).
 _ab_kernel_target() {
@@ -88,7 +88,7 @@ artifact_publish_kernel() {
       return 1
     fi
   fi
-  feats="$(_ab_py features --feature-args "$fargs" | sed -n 's/.* features=//p')"
+  feats="$(_ab_py features --feature-args="$fargs" | sed -n 's/.* features=//p')"
   if [[ "$feats" == "none" ]]; then feats=""; fi
   if ! "$repo/scripts/check-kernel-nofp.sh" "$arch" "$stage_elf" "$feats" ${stage_boot:+"$stage_boot"} >"$report" 2>&1; then
     cat "$report"
@@ -101,12 +101,12 @@ artifact_publish_kernel() {
   if [[ -n "$out_boot" ]]; then mv -f "$stage_boot" "$out_boot"; fi
   mv -f "$report" "${out_elf}.nofp.txt"
   if ! _ab_py record-kernel --arch "$arch" --elf "$out_elf" ${out_boot:+--boot "$out_boot"} \
-      --feature-args "$fargs" --target "$target" --profile "$profile" \
+      --feature-args="$fargs" --target "$target" --profile "$profile" \
       --nofp-report "${out_elf}.nofp.txt" --built-by "$by"; then
     _ab_invalidate "$out_elf" "$out_boot"
     return 1
   fi
-  echo "[ok] ARTIFACT-PUBLISH: $arch kernel $(basename "$out_elf")${out_boot:+ + $(basename "$out_boot")} published with provenance ($(_ab_py features --feature-args "$fargs"))"
+  echo "[ok] ARTIFACT-PUBLISH: $arch kernel $(basename "$out_elf")${out_boot:+ + $(basename "$out_boot")} published with provenance ($(_ab_py features --feature-args="$fargs"))"
 }
 
 artifact_build_kernel() {
@@ -130,7 +130,7 @@ artifact_build_kernel() {
 
 artifact_record_initramfs() {
   local arch="$1" cpio="$2" fargs="$3" target="$4" profile="$5"
-  _ab_py record-initramfs --arch "$arch" --cpio "$cpio" --feature-args "$fargs" \
+  _ab_py record-initramfs --arch "$arch" --cpio "$cpio" --feature-args="$fargs" \
     --target "$target" --profile "$profile" --built-by "${ARTIFACT_BUILT_BY:-$(basename "$0")}"
 }
 
