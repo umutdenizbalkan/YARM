@@ -21,7 +21,10 @@
 #
 #   LOGDIR=...   build + boot logs (default /tmp/qemu-aarch64-u9rx4-reuse-witness)
 #   SKIP_BUILD=1 reuse $LOGDIR/build (still refused before boot unless provenance binds it)
-#   QEMU_SMP=N   CPUs (default 1)
+#   QEMU_SMP=1   the only supported value. With more CPUs another CPU idles while the supervisor
+#                is still yielding, and the strict core smoke stops QEMU at that terminal idle before
+#                tid 2's query runs (observed in BUILD-GATES1 qualification run Q7.7), so the premise
+#                cannot be established; any other value is refused by name.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -32,6 +35,10 @@ BOOT_LOG="$LOGDIR/boot.log"
 SMP=${QEMU_SMP:-1}
 mkdir -p "$LOGDIR"
 seal() { echo "U9RX4_REUSE_WITNESS_SEAL arch=aarch64 smp=$SMP $*"; }
+if [[ "$SMP" != "1" ]]; then
+  seal "result=fail reason=unsupported-smp detail=the-yield-premise-holds-only-at-smp-1"
+  exit 2
+fi
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   echo "[u9rx4-reuse] building aarch64 artifacts with --features $FEATURE into $BUILD_DIR"

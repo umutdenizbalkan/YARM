@@ -235,4 +235,9 @@ fn the_reuse_witness_is_labeled_default_off_and_separately_graded() {
     assert!(w.contains("seal \"result=fail reason=premise detail=no-reuse"));
     assert!(w.contains("(( gen <= 1 )) || (( earlier < 1 )) || (( own_earlier != 0 ))"));
     assert!(w.contains("seal \"result=fail reason=grade"));
+    // The yield premise holds only on one CPU; any other count is refused by name, before a build.
+    let refuse = w
+        .find("seal \"result=fail reason=unsupported-smp")
+        .expect("refusal");
+    assert!(refuse < w.find("scripts/build-qemu-aarch64-artifacts.sh").unwrap());
 }

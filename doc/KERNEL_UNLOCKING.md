@@ -1268,6 +1268,9 @@ ownership or ABI change: the production diff is a default-off witness feature (b
   * the **grade**: the core smoke's verdict and its U9-RX4 line on that record.
   A development boot ran the query on record (0, 17), direct route; the repaired grader accepted
   it and the old grader rejected it.
+  The witness supports `-smp 1` only. With a second CPU, that CPU idles while the supervisor is
+  still yielding, and the strict core smoke stops at that terminal idle before the query runs.
+  The script refuses any other CPU count by name.
 
 ---
 
