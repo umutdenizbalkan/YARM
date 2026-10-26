@@ -365,7 +365,8 @@ POLICY = {
             [r"mrs x\d+,fpcr"], 1, if_feature("context1-witness")),
         "A64_CTX1_CLOBBER": (
             "CONTEXT1 clobber witness: overwrite q0..q31, FPCR and FPSR with junk after dispatch",
-            [rf"ldp q{i},q{i+1},\[x\d+,#{16 * i}\]" for i in range(0, 32, 2)]
+            [rf"ldp q{i},q{i+1},\[x\d+(?:,#{16 * i})?\]" if i == 0 else
+             rf"ldp q{i},q{i+1},\[x\d+,#{16 * i}\]" for i in range(0, 32, 2)]
             + [r"msr fpcr,x\d+", r"msr fpsr,x\d+"], 24, if_feature("context1-clobber")),
     },
     "riscv64": {},
